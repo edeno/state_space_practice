@@ -1,0 +1,23 @@
+name: non_local_detector
+channels:
+- conda-forge
+- franklab
+- edeno
+dependencies:
+- python >=3.8,<3.11
+- numpy
+- scipy
+- jax
+- pandas
+- networkx
+- xarray
+- scikit-learn
+- patsy
+- tqdm
+- track_linearization
+- matplotlib
+- seaborn
+- ipython
+- black
+- pytest
+- pytest-cov

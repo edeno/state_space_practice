@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "state_space_practice"
+description = ""
+readme = "README.md"
+requires-python = ">=3.8,<3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Eric Denovellis", email = "eric.denovellis@ucsf.edu" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "jax",
+    "jaxlib",
+    "pandas",
+    "networkx",
+    "xarray",
+    "scikit-learn",
+    "patsy",
+    "tqdm",
+    "track_linearization",
+    "matplotlib",
+    "seaborn",
+]
+dynamic = ["version"]
+
+[project.urls]
+"Homepage" = "https://github.com/LorenFrankLab/non_local_detector"
+"Bug Tracker" = "https://github.com/LorenFrankLab/non_local_detector/issues"
+
+[project.optional-dependencies]
+test = ["black", "pytest", "pytest-cov"]
+gpu = ["jax[cuda]"]
+viz = ["sortingview"]
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/non_local_detector/_version.py"
+
+[tool.hatch.build.targets.sdist]
+exclude = [".git_archival.txt"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/non_local_detector"]

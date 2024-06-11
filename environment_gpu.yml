@@ -1,0 +1,26 @@
+name: non_local_detector_gpu
+channels:
+- conda-forge
+- nvidia
+- franklab
+- edeno
+dependencies:
+- python >=3.8,<3.11
+- numpy
+- scipy
+- jaxlib=*=*cuda*
+- jax
+- pandas
+- cuda-nvcc
+- networkx
+- xarray
+- scikit-learn
+- patsy
+- tqdm
+- track_linearization
+- matplotlib
+- seaborn
+- ipython
+- black
+- pytest
+- pytest-cov
