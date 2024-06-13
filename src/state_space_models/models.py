@@ -2,7 +2,9 @@ import jax
 import jax.numpy as jnp
 
 
-def log_receptive_field_model(position: jnp.ndarray, params: jnp.ndarray) -> jnp.ndarray:
+def log_receptive_field_model(
+    position: jnp.ndarray, params: jnp.ndarray
+) -> jnp.ndarray:
     log_max_rate, place_field_center, scale = params
     return log_max_rate - (position - place_field_center) ** 2 / (2 * scale**2)
 
@@ -76,7 +78,8 @@ def stochastic_point_process_filter(
         # One-step prediction
         one_step_mean = transition_matrix @ mode_prev
         one_step_variance = (
-            transition_matrix @ covariance_prev @ transition_matrix.T + latent_state_covariance
+            transition_matrix @ covariance_prev @ transition_matrix.T
+            + latent_state_covariance
         )
 
         # Compute the conditional intensity and innovation
@@ -108,6 +111,26 @@ def stochastic_point_process_filter(
     return jax.lax.scan(
         _update, (init_mode_params, init_covariance_params), (x, spike_indicator)
     )[1]
+
+
+def get_confidence_interval(
+    posterior_mode: jnp.ndarray, posterior_covariance: jnp.ndarray, alpha: float = 0.01
+) -> jnp.ndarray:
+    """Get the confidence interval from the posterior covariance
+
+    Parameters
+    ----------
+    posterior_mode : jnp.ndarray, shape (n_time, n_params)
+    posterior_covariance : jnp.ndarray, shape (n_time, n_params, n_params)
+    alpha : float, optional
+        Confidence level, by default 0.01
+    """
+    z = jax.scipy.stats.norm.ppf(1 - alpha / 2)
+    ci = z * jnp.sqrt(
+        jnp.diagonal(posterior_covariance, axis1=-2, axis2=-1)
+    )  # shape (n_time, n_params)
+
+    return jnp.stack((posterior_mode - ci, posterior_mode + ci), axis=-1)
 
 
 def steepest_descent_point_process_filter(

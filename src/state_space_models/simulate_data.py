@@ -8,8 +8,9 @@ def receptive_field_model(position: np.ndarray, params: np.ndarray) -> np.ndarra
     return np.exp(log_max_rate - (position - place_field_center) ** 2 / (2 * scale**2))
 
 
-
-def simulate_eden_brown_2004_jump() -> tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]:
+def simulate_eden_brown_2004_jump() -> (
+    tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]
+):
     dt = 0.020  # seconds
     total_time = 8000.0  # seconds
     n_total_steps = int(total_time / dt)
