@@ -92,12 +92,17 @@ def stochastic_point_process_filter(
         one_step_grad = grad_log_receptive_field_model(x_t, one_step_mean)[None]
         one_step_hess = hess_log_receptive_field_model(x_t, one_step_mean)
 
+        # sum over:
+        # (one_step_grad.T * conditional_intensity @ one_step_grad) - innovation * one_step_hess
+        # if multiple neurons
         inverse_posterior_covariance = (
             jnp.linalg.pinv(one_step_variance)
             + (one_step_grad.T * conditional_intensity @ one_step_grad)
             - innovation * one_step_hess
         )
         posterior_covariance = jnp.linalg.pinv(inverse_posterior_covariance)
+
+        # sum over one_step_grad.squeeze() * innovation if multiple neurons
         posterior_mode = one_step_mean + posterior_covariance @ (
             one_step_grad.squeeze() * innovation
         )

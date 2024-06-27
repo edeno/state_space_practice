@@ -1,4 +1,4 @@
-name: non_local_detector
+name: state_space_practice
 channels:
 - conda-forge
 - franklab
@@ -8,6 +8,7 @@ dependencies:
 - numpy
 - scipy
 - jax
+- optax
 - pandas
 - networkx
 - xarray
