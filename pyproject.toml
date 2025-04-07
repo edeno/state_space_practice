@@ -32,8 +32,8 @@ dependencies = [
 dynamic = ["version"]
 
 [project.urls]
-"Homepage" = "https://github.com/LorenFrankLab/non_local_detector"
-"Bug Tracker" = "https://github.com/LorenFrankLab/non_local_detector/issues"
+"Homepage" = "https://github.com/edeno/state_space_practice"
+"Bug Tracker" = "https://github.com/edeno/state_space_practice/issues"
 
 [project.optional-dependencies]
 test = ["black", "pytest", "pytest-cov"]
@@ -44,10 +44,10 @@ viz = ["sortingview"]
 source = "vcs"
 
 [tool.hatch.build.hooks.vcs]
-version-file = "src/non_local_detector/_version.py"
+version-file = "src/state_space_practice/_version.py"
 
 [tool.hatch.build.targets.sdist]
 exclude = [".git_archival.txt"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/non_local_detector"]
+packages = ["src/state_space_practice"]
