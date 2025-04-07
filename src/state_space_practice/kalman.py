@@ -1,8 +1,27 @@
-from typing import Optional
+"""Kalman filter and smoother.
+
+
+References
+----------
+1. Sarkka, S. (2013). Bayesian Filtering and Smoothing (Cambridge University Press) https://doi.org/10.1017/CBO9781139344203.
+
+"""
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg
+
+
+def symmetrize(A):
+    """Symmetrize one or more matrices."""
+    return 0.5 * (A + jnp.swapaxes(A, -1, -2))
+
+
+def psd_solve(A, b, diagonal_boost=1e-9):
+    """A wrapper for coordinating the linalg solvers used in the library for psd matrices."""
+    return jax.scipy.linalg.solve(
+        symmetrize(A) + diagonal_boost * jnp.eye(A.shape[-1]), b, assume_a="pos"
+    )
 
 
 def _kalman_filter_update(
@@ -39,8 +58,6 @@ def _kalman_filter_update(
         Posterior state mean.
     posterior_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
         Posterior state covariance.
-    kalman_gain : jnp.ndarray, shape (n_cont_states, n_obs_dim)
-        Kalman gain.
     marginal_log_likelihood : float
         Probability of the observation given the state.
     """
@@ -129,13 +146,27 @@ def _kalman_smoother_update(
     process_cov,
     transition_matrix,
 ):
+    """
+
+    Parameters
+    ----------
+    next_smoother_mean : jnp.ndarray, shape (n_cont_states,)
+    next_smoother_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    filter_mean : jnp.ndarray, shape (n_cont_states,)
+    filter_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    process_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    transition_matrix : jnp.ndarray, shape (n_cont_states, n_cont_states)
+
+    Returns
+    -------
+    smoother_mean : jnp.ndarray, shape (n_cont_states,)
+    smoother_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    smoother_cross_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    """
     one_step_mean = transition_matrix @ filter_mean
     one_step_cov = transition_matrix @ filter_cov @ transition_matrix.T + process_cov
 
     smoother_kalman_gain = psd_solve(one_step_cov, transition_matrix @ filter_cov).T
-    # smoother_kalman_gain = jax.scipy.linalg.solve(
-    #     one_step_cov, transition_matrix @ filter_cov, assume_a="pos"
-    # ).T
 
     smoother_mean = filter_mean + smoother_kalman_gain @ (
         next_smoother_mean - one_step_mean
@@ -149,8 +180,7 @@ def _kalman_smoother_update(
 
     smoother_cross_cov = smoother_kalman_gain @ next_smoother_cov + jnp.outer(
         smoother_mean, next_smoother_mean
-    )
-
+    )  # lag one cross covariance
     return smoother_mean, smoother_cov, smoother_cross_cov
 
 
@@ -211,26 +241,18 @@ def kalman_smoother(
     return smoother_mean, smoother_cov, smoother_cross_cov, marginal_log_likelihood
 
 
-def symmetrize(A):
-    """Symmetrize one or more matrices."""
-    return 0.5 * (A + jnp.swapaxes(A, -1, -2))
+def outer_sum(x, y):
+    """Compute the sum of outer products.
+    \sum_{t} x_t y_t.T
+    """
+    return x.T @ y
 
 
-def psd_solve(A, b, diagonal_boost=1e-9):
-    """A wrapper for coordinating the linalg solvers used in the library for psd matrices."""
-    A = symmetrize(A) + diagonal_boost * jnp.eye(A.shape[-1])
-    L, lower = jax.scipy.linalg.cho_factor(A, lower=True)
-    x = jax.scipy.linalg.cho_solve((L, lower), b)
-    return x
-
-
-# @jax.jit
 def kalman_maximization_step(
     obs: jnp.ndarray,
     smoother_mean: jnp.ndarray,
     smoother_cov: jnp.ndarray,
     smoother_cross_cov: jnp.ndarray,
-    outer_obs: Optional[jnp.ndarray] = None,
 ):
     """Maximization step for the Kalman filter.
 
@@ -244,8 +266,6 @@ def kalman_maximization_step(
         smoother covariance.
     smoother_cross_cov : jnp.ndarray, shape (n_time - 1, n_cont_states, n_cont_states)
         smoother cross-covariance.
-    outer_obs : jnp.ndarray, shape (n_obs_dim, n_obs_dim)
-        Outer product of the observations. Default is None.
 
     Returns
     -------
@@ -267,52 +287,38 @@ def kalman_maximization_step(
     ... [1] Roweis, S. T., Ghahramani, Z., & Hinton, G. E. (1999). A unifying review of
     linear Gaussian models. Neural computation, 11(2), 305-345.
     """
-    if outer_obs is None:
-        outer_obs = obs.T @ obs
 
     n_time = obs.shape[0]
 
-    # outer products
-    delta = obs.T @ smoother_mean
-    # P_t = E[x_t, x_t]
-    gamma = smoother_mean.T @ smoother_mean + jnp.sum(smoother_cov, axis=0)
-    # P_{t, t-1} = E[x_t, x_{t-1}]
-    beta = jnp.sum(smoother_cross_cov, axis=0)
-
+    # Compute intermediate expectation terms
+    gamma = jnp.sum(smoother_cov, axis=0) + outer_sum(smoother_mean, smoother_mean)
+    delta = outer_sum(obs, smoother_mean)
+    alpha = outer_sum(obs, obs)
     gamma1 = gamma - jnp.outer(smoother_mean[-1], smoother_mean[-1]) - smoother_cov[-1]
     gamma2 = gamma - jnp.outer(smoother_mean[0], smoother_mean[0]) - smoother_cov[0]
+    beta = smoother_cross_cov.sum(axis=0).T
 
-    # B = delta * gamma^-1 also sometimes C = delta * gamma^-1
-    # measurement_matrix = delta @ jnp.linalg.inv(gamma)
-    # measurement_matrix = jax.scipy.linalg.solve(gamma, delta.T).T
+    # Measurement matrix and covariance
     measurement_matrix = psd_solve(gamma, delta.T).T
+    measurement_cov = (alpha - measurement_matrix @ delta.T) / n_time
+    measurement_cov = symmetrize(measurement_cov)
 
-    # R = E[y_t, y_t] - C @ delta.T
-    measurement_cov = (outer_obs - measurement_matrix @ delta.T) / n_time
+    # Transition matrix
+    transition_matrix = psd_solve(gamma1, beta.T).T
 
-    # A = beta * gamma1^-1
-    # transition_matrix = beta @ jnp.linalg.inv(gamma1)
-    # transition_matrix = jax.scipy.linalg.solve(gamma1, beta.T).T
-    # transition_matrix = psd_solve(gamma1, beta.T).T
+    # Process covariance
+    process_cov = (gamma2 - transition_matrix @ beta.T) / (n_time - 1)
+    process_cov = symmetrize(process_cov)
 
-    # this matches the dynamax implementation
-    transition_matrix = psd_solve(gamma1, beta).T
-    # transition_matrix = jax.scipy.linalg.solve(gamma1.T, beta, assume_a="pos").T
-
-    # Q = gamma2 - A @ beta.T
-    # process_cov = (gamma2 - transition_matrix @ beta.T) / (n_time - 1)
-    process_cov = (gamma2 - transition_matrix @ beta) / (
-        n_time - 1
-    )  # this matches the dynamax implementation
-
-    mean_init = smoother_mean[0]
-    cov_init = smoother_cov[0]
+    # Initial mean and covariance
+    init_mean = smoother_mean[0]
+    init_cov = smoother_cov[0]
 
     return (
         transition_matrix,
         measurement_matrix,
         process_cov,
         measurement_cov,
-        mean_init,
-        cov_init,
+        init_mean,
+        init_cov,
     )
