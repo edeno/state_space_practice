@@ -111,7 +111,7 @@ def collapse_gaussian_mixture_cross_covariance(
 collapse_gaussian_mixture_per_discrete_state = jax.vmap(
     collapse_gaussian_mixture, in_axes=(-1, -1, -1), out_axes=(-1, -1)
 )
-collapse_gaussian_mixture_per_previous_discrete_state = jax.vmap(
+collapse_gaussian_mixture_over_next_discrete_state = jax.vmap(
     collapse_gaussian_mixture, in_axes=(1, 2, 0), out_axes=(-1, -1)
 )
 collapse_cross_gaussian_mixture_across_states = jax.vmap(
@@ -362,33 +362,60 @@ _kalman_smoother_update_per_discrete_state_pair = jax.vmap(
 
 
 def _update_smoother_discrete_probabilities(
-    filter_discrete_state_prob,
-    discrete_state_transition_matrix,
-    next_discrete_state_prob,
-):
+    filter_discrete_prob: jnp.ndarray,
+    discrete_state_transition_matrix: jnp.ndarray,
+    next_smoother_discrete_prob: jnp.ndarray,
+) -> tuple[
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]:
+    """
+
+    Parameters
+    ----------
+    filter_discrete_prob : jnp.ndarray, shape (n_discrete_states,)
+        Pr(S_t=j | y_{1:t}), shape (n_discrete_states,), M_{t | t}(j)
+    discrete_state_transition_matrix : jnp.ndarray, shape (n_discrete_states, n_discrete_states)
+        Pr(S_t=j | S_{t-1}=k), shape (n_discrete_states, n_discrete_states), Z(j, k)
+    next_smoother_discrete_prob : jnp.ndarray, shape (n_discrete_states,)
+        Pr(S_{t+1}=k | y_{1:T}), shape (n_discrete_states,) M_{t+1 | T}(k)
+
+    Returns
+    -------
+    smoother_discrete_state_prob : jnp.ndarray, shape (n_discrete_states,)
+        Pr(S_t=j | y_{1:T}), shape (n_discrete_states,),  M_{t | T}(j)
+    smoother_backward_cond_prob : jnp.ndarray, shape (n_discrete_states, n_discrete_states)
+        Pr(S_t=j | S_{t+1}=k, y_{1:T}), shape (n_discrete_states, n_discrete_states), U^{j | k}_t
+    joint_smoother_discrete_prob : jnp.ndarray, shape (n_discrete_states, n_discrete_states)
+        Pr(S_t=j, S_{t+1}=k | y_{1:T}), shape (n_discrete_states, n_discrete_states)
+    smoother_forward_cond_prob : jnp.ndarray, shape (n_discrete_states, n_discrete_states)
+        Pr(S_{t+1}=k | S{t}=j, y_{1:T}), shape (n_discrete_states, n_discrete_states), W^{k | j}_t
+
+    """
     # Discrete smoother prob
     # P(S_t = j, S_{t+1} = k | y_{1:T})
-    smoother_conditional_discrete_state_prob = (
-        filter_discrete_state_prob[:, None] * discrete_state_transition_matrix
+    smoother_backward_cond_prob = (
+        filter_discrete_prob[:, None] * discrete_state_transition_matrix
     )
-    smoother_conditional_discrete_state_prob /= jnp.sum(
-        smoother_conditional_discrete_state_prob, axis=0
-    )
-    smoother_joint_discrete_state_prob = (
-        smoother_conditional_discrete_state_prob * next_discrete_state_prob
+    smoother_backward_cond_prob /= jnp.sum(smoother_backward_cond_prob, axis=0)
+
+    joint_smoother_discrete_prob = (
+        smoother_backward_cond_prob * next_smoother_discrete_prob
     )
     # P(S_t = j | y_{1:T})
-    smoother_discrete_state_prob = jnp.sum(smoother_joint_discrete_state_prob, axis=1)
+    smoother_discrete_state_prob = jnp.sum(joint_smoother_discrete_prob, axis=1)
     # P(S_{t+1} = k | S_t = j, y_{1:T})
-    discrete_state_weights = (
-        smoother_joint_discrete_state_prob / smoother_discrete_state_prob[:, None]
+    smoother_forward_cond_prob = (
+        joint_smoother_discrete_prob / smoother_discrete_state_prob[:, None]
     )
 
     return (
         smoother_discrete_state_prob,
-        smoother_conditional_discrete_state_prob,
-        smoother_joint_discrete_state_prob,
-        discrete_state_weights,
+        smoother_backward_cond_prob,
+        joint_smoother_discrete_prob,
+        smoother_forward_cond_prob,
     )
 
 
@@ -415,74 +442,21 @@ def switching_kalman_smoother(
 
     Returns
     -------
-    smoother_mean : jnp.ndarray, shape (n_time, n_cont_states)
-    smoother_cov : jnp.ndarray, shape (n_time, n_cont_states, n_cont_states)
+    overall_smoother_mean : jnp.ndarray, shape (n_time, n_cont_states)
+    overall_smoother_cov : jnp.ndarray, shape (n_time, n_cont_states, n_cont_states)
     smoother_discrete_state_prob : jnp.ndarray, shape (n_time, n_discrete_states)
     smoother_joint_discrete_state_prob : jnp.ndarray, shape (n_time - 1, n_discrete_states, n_discrete_states)
-    smoother_cross_cov : jnp.ndarray, shape (n_time - 1, n_cont_states, n_cont_states)
+    overall_smoother_cross_cov : jnp.ndarray, shape (n_time - 1, n_cont_states, n_cont_states)
     """
 
-    def _step(carry, args):
+    def _step(
+        carry: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+        args: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    ) -> tuple[
+        tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+        tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    ]:
         """
-        1. Smooth for each discrete state
-            - x^k_{t+1 | T}: next state-conditional smoother mean, E[X_{t+1} | y_{1:T}, S_{t+1}=k]
-            - V^k_{t+1 | T}: next state-conditional smoother covariance, Cov[X_{t+1} | y_{1:T}, S_{t+1}=k]
-            - x^j_{t | t}: state-conditional filter mean, E[X_t | y_{1:t}, S_t=j]
-            - V^j_{t | t}: state-conditional filter covariance, Cov[X_t | y_{1:t}, S_t=j]
-            - V^k_{t+1 | t+1}: next state-conditional filter covariance
-            - V^{jk}_{t+1,t | t+ 1}: next pair-conditional cross covariance, Cov[X_{t+1}, X_t | y_{1:t}, S_{t+1}=j, S_{t}=k]
-            - F_k : transition matrix, E[X_{t+1} | X_t, S=k]
-            - Q_k : process covariance
-
-            - x^{jk}_{t | T}: pair-conditional smoother mean, E[X_t | y_{1:T}, S_t=j, S_{t+1}=k]
-            - V^{jk}_{t | T}: pair-conditional smoother covariance, Cov[X_t | y_{1:T}, S_t=j, S_{t+1}=k]
-            - V^{jk}_{t+1, t | T}: pair-conditional smoother cross covariance
-        2. Compute discrete state intermediates
-            - M_{t | t}(j): filter discrete prob, Pr(S_t = j | y_{1_t})
-            - Z(j, k): discrete transition matrix, Pr(S_t = j | S_{t-1} = k)
-
-            - U^{j | k}_t: Pr(S_t = j | S_{t+1} = k, y_{1:T}): smoother backward conditional probability
-
-            - M_{t+1 | T}(k): next smoother discrete prob, Pr(S_{t+1} = k | y_{1:T})
-            - M_{t, t+1|T}(j, k): joint smoother discrete prob, Pr(S_t = j, S_{t+1} = k | y_{1:T})
-
-            - M_{t | T}(j): smoother discrete prob, Pr(S_t = j | y_{1:T})
-
-            - W^{k | j}_t: smoother forward conditional probability, Pr(S_{t+1} = k | S{t} = j, y_{1:T})
-
-        3. Collapse conditional mean and covariance (n_states x n_states -> n_states)
-            - x^{jk}_{t | T}: pair-conditional smoother mean, E[X_t | y_{1:T}, S_t=j, S_{t+1}=k]
-            - V^{jk}_{t | T}: pair-conditional smoother covariance, Cov[X_t | y_{1:T}, S_t=j, S_{t+1}=k]
-            - W^{k | j}_t: smoother forward conditional probability, Pr(S_{t+1} = k | S{t} = j, y_{1:T})
-
-            - x^j_{t|T}: state-conditional smoother mean, E[X_t | y_{1:T}, S_{t}=j]
-            - V^j_{t|T}: state-conditional smoother covariance, Cov[X_t | y_{1:T}, S_{t} = j]
-        4. Collapse to single mean and covariance (n_states -> 1)
-            - x_{t|T}: overall smoother mean, E[X_t | y_{1:T}]
-            - V_{t|T}: overall smoother covariance, Cov[X_t | y_{1:T}]
-        5. Collapse cross covariance
-            - x^k_{t+1 | T}: next state-conditional smoother mean
-
-            - x^{jk}_{t+1 | T}: next pair-conditional smoother mean, E[X_{t+1} | y_{1:T}, S_{t+1}=k, S_{t}=j], why is this approx equal to above and why not just use the former
-
-            - x^{jk}_{t+1 | T}: next pair-conditional smoother mean
-            - x^{jk}_{t | T}: pair-conditional smoother mean
-            - V^{jk}_{t+1, t | t+ 1}: next pair-conditional cross covariance, Cov[X_{t+1}, X_t | y_{1:t}, S_{t+1}=j, S_{t}=k]
-            - U^{j | k}_t: Pr(S_t = j | S_{t+1} = k, y_{1:T}): smoother backward conditional probability
-
-            - V^k_{t+1, t | T}: state-conditional smoother cross covariance
-
-            - x^{jk}_{t | T}: pair-conditional smoother mean
-            - U^{j | k}_t: Pr(S_t = j | S_{t+1} = k, y_{1:T}): smoother backward conditional probability
-
-            - x^k_{t | T}: state-conditional smoother mean, E[X_t | y_{1:T}, S_{t+1}]
-
-            - x^{jk}_{t+1 | T}: next pair-conditional smoother mean
-            - x^k_{t | T}: state-conditional smoother mean, E[X_t | y_{1:T}, S_{t+1}]
-            - V^k_{t+1, t | T}: state-conditional smoother cross covariance
-            - M^k_{t+1 | T}: next smoother discrete prob, Pr(S_{t+1} = k | y_{1:T})
-
-            - V_{t+1, t | T}: Overall smoother cross covariance
 
         Parameters
         ----------
@@ -491,140 +465,118 @@ def switching_kalman_smoother(
             next_smoother_cov : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
             next_discrete_state_prob : jnp.ndarray, shape (n_discrete_states,)
             next_conditional_cont_means : jnp.ndarray, shape (n_cont_states, n_discrete_states, n_discrete_states)
-        args : _type_
-            filter_mean_t : jnp.ndarray, shape (n_cont_states, n_discrete_states)
-            filter_cov_t : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
-            filter_discrete_state_prob_t : jnp.ndarray, shape (n_discrete_states,)
+        args : tuple
+            state_cond_filter_mean : jnp.ndarray, shape (n_cont_states, n_discrete_states)
+            state_cond_filter_cov : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
+            filter_discrete_prob : jnp.ndarray, shape (n_discrete_states,)
 
         Returns
         -------
         carry : tuple
-            smoother_mean : jnp.ndarray, shape (n_cont_states, n_discrete_states)
-            smoother_cov : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
-            smoother_discrete_state_prob : jnp.ndarray, shape (n_discrete_states,)
-            conditional_cont_means : jnp.ndarray, shape (n_cont_states, n_discrete_states, n_discrete_states)
+            next_state_cond_smoother_mean : jnp.ndarray, shape (n_cont_states, n_discrete_states)
+            next_state_cond_smoother_cov : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
+            next_smoother_discrete_prob : jnp.ndarray, shape (n_discrete_states,)
+            next_pair_cond_smoother_mean : jnp.ndarray, shape (n_cont_states, n_discrete_states, n_discrete_states)
         args : tuple
-            single_collapsed_means : jnp.ndarray, shape (n_cont_states,)
-            single_collapsed_covs : jnp.ndarray, shape (n_cont_states, n_cont_states)
-            smoother_discrete_state_prob : jnp.ndarray, shape (n_discrete_states,)
-            smoother_joint_discrete_state_prob : jnp.ndarray, shape (n_discrete_states, n_discrete_states)
-            smoother_cross_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+            state_cond_filter_mean : jnp.ndarray, shape (n_cont_states, n_discrete_states)
+            state_cond_filter_cov : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
+            filter_discrete_prob : jnp.ndarray, shape (n_discrete_states,)
         """
         (
-            next_smoother_mean,
-            next_smoother_cov,
-            next_discrete_state_prob,
-            next_conditional_cont_means,
+            next_state_cond_smoother_mean,
+            next_state_cond_smoother_cov,
+            next_smoother_discrete_prob,
+            next_pair_cond_smoother_mean,
         ) = carry
 
-        filter_mean_t, filter_cov_t, filter_discrete_state_prob_t = args
-        # filter_mean_t, shape (n_cont_states, n_discrete_states)
-        # filter_cov_t, shape (n_cont_states, n_cont_states, n_discrete_states)
-        # filter_discrete_state_prob_t, shape (n_discrete_states,)
+        state_cond_filter_mean, state_cond_filter_cov, filter_discrete_prob = args
 
-        conditional_cont_means, conditional_cont_covs, conditional_cont_cross_covs = (
-            _kalman_smoother_update_per_discrete_state_pair(
-                next_smoother_mean,  # E[X_{t+1} | y_{1:T}], shape (n_cont_states, n_discrete_states)
-                next_smoother_cov,  # Cov[X_{t+1} | y_{1:T}], shape (n_cont_states, n_cont_states, n_discrete_states)
-                filter_mean_t,  # E[X_t | y_{1:T}], shape (n_cont_states, n_discrete_states)
-                filter_cov_t,  # Cov[X_t | y_{1:T}], shape (n_cont_states, n_cont_states, n_discrete_states)
-                process_cov,  # Cov[X_{t+1} | X_t], shape (n_cont_states, n_cont_states, n_discrete_states)
-                continuous_transition_matrix,  # E[X_{t+1} | X_t], shape (n_cont_states, n_cont_states, n_discrete_states)
-            )
-        )
-        # conditional_cont_means, shape (n_cont_states, n_discrete_states, n_discrete_states)
-        # conditional_cont_covs, shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
-        # conditional_cont_cross_covs, shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
-
+        # 1. Smooth for each discrete state pair
         (
-            smoother_discrete_state_prob,  # p(S_t | y_{1:T})
-            smoother_conditional_discrete_state_prob,  # p(S_{t+1} | S_t, y_{1:T})
-            smoother_joint_discrete_state_prob,  # p(S_t, S_{t+1} | y_{1:T})
-            discrete_state_weights,  # p(S_{t+1} | S_t, y_{1:T})
+            pair_cond_smoother_mean,  # E[X_t | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_discrete_states, n_discrete_states)
+            pair_cond_smoother_covs,  # Cov[X_t | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+            pair_cond_smoother_cross_covs,  # Cov[X_{t+1}, X_t | y_{1:T}, S_{t+1}=j, S_{t}=k], shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+        ) = _kalman_smoother_update_per_discrete_state_pair(
+            next_state_cond_smoother_mean,  # E[X_{t+1} | y_{1:T}, S_t=k], shape (n_cont_states, n_discrete_states)
+            next_state_cond_smoother_cov,  # Cov[X_{t+1} | y_{1:T}, S_t=k], shape (n_cont_states, n_cont_states, n_discrete_states)
+            state_cond_filter_mean,  # E[X_t | y_{1:t}, S_t=j], shape (n_cont_states, n_discrete_states)
+            state_cond_filter_cov,  # Cov[X_t | y_{1:t}, S_t=j], shape (n_cont_states, n_cont_states, n_discrete_states)
+            process_cov,  # Cov[X_{t+1} | X_t], shape (n_cont_states, n_cont_states, n_discrete_states)
+            continuous_transition_matrix,  # E[X_{t+1} | X_t], shape (n_cont_states, n_cont_states, n_discrete_states)
+        )
+
+        # 2. Compute discrete state intermediates
+        (
+            smoother_discrete_state_prob,  # Pr(S_t=j | y_{1:T}), shape (n_discrete_states,),  M_{t | T}(j)
+            smoother_backward_cond_prob,  # Pr(S_t=j | S_{t+1}=k, y_{1:T}), shape (n_discrete_states, n_discrete_states), U^{j | k}_t
+            joint_smoother_discrete_prob,  # Pr(S_t=j, S_{t+1}=k | y_{1:T}), shape (n_discrete_states, n_discrete_states)
+            smoother_forward_cond_prob,  # Pr(S_{t+1}=k | S{t}=j, y_{1:T}), shape (n_discrete_states, n_discrete_states), W^{k | j}_t
         ) = _update_smoother_discrete_probabilities(
-            filter_discrete_state_prob_t,  # p(S_t | y_{1:t})
-            discrete_state_transition_matrix,  # p(S_{t+1} | S_t)
-            next_discrete_state_prob,  # p(S_{t+1})
+            filter_discrete_prob,  # Pr(S_t=j | y_{1:t}), shape (n_discrete_states,), M_{t | t}(j)
+            discrete_state_transition_matrix,  # Pr(S_t=j | S_{t-1}=k), shape (n_discrete_states, n_discrete_states), Z(j, k)
+            next_smoother_discrete_prob,  # Pr(S_{t+1}=k | y_{1:T}), shape (n_discrete_states,) M_{t+1 | T}(k)
         )
 
-        # smoother_discrete_state_prob, shape (n_discrete_states,)
-        # smoother_conditional_discrete_state_prob, shape (n_discrete_states, n_discrete_states)
-        # smoother_joint_discrete_state_prob, shape (n_discrete_states, n_discrete_states)
-        # discrete_state_weights, shape (n_discrete_states, n_discrete_states)
-
-        # Collapse `n_discrete_states` x `n_discrete_states` Gaussians
-        # to `n_discrete_states` Gaussians
-        collapsed_means, collapsed_covs = (
-            collapse_gaussian_mixture_per_previous_discrete_state(
-                conditional_cont_means,
-                conditional_cont_covs,
-                discrete_state_weights,
-            )
-        )
-
-        # collapsed_means, shape (n_cont_states, n_discrete_states)
-        # collapsed_covs, shape (n_cont_states, n_cont_states, n_discrete_states)
-
-        # Collapse to a single Gaussian
-        single_collapsed_means, single_collapsed_covs = collapse_gaussian_mixture(
-            collapsed_means, collapsed_covs, smoother_discrete_state_prob
-        )
-
-        # single_collapsed_means, shape (n_cont_states,)
-        # single_collapsed_covs, shape (n_cont_states, n_cont_states)
-
-        # Collapse `n_discrete_states` x `n_discrete_states` Gaussians to `n_discrete_states` Gaussians
+        # 3. Collapse conditional mean and covariance (n_states x n_states -> n_states)
         (
-            next_conditional_cont_cross_means,
-            conditional_cont_cross_means,
-            conditional_cont_cross_covs,
-        ) = collapse_cross_gaussian_mixture_across_states(
-            next_conditional_cont_means,  # Mean at time t+1
-            conditional_cont_means,  # Mean at time t
-            conditional_cont_cross_covs,  # Cross-covariance between time t and t+1
-            smoother_conditional_discrete_state_prob,  # Weights at time t
+            state_cond_smoother_means,  # E[X_t | y_{1:T}, S_{t}=j], shape (n_cont_states, n_discrete_states)
+            state_cond_smoother_covs,  # Cov[X_t | y_{1:T}, S_{t}=j], shape (n_cont_states, n_cont_states, n_discrete_states)
+        ) = collapse_gaussian_mixture_over_next_discrete_state(
+            pair_cond_smoother_mean,  # E[X_t | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_discrete_states, n_discrete_states)
+            pair_cond_smoother_covs,  # Cov[X_t | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+            smoother_forward_cond_prob,  # Pr(S_{t+1} = k | S{t} = j, y_{1:T}), shape (n_discrete_states, n_discrete_states), W^{k | j}_t
         )
 
-        # next_conditional_cont_means, shape (n_cont_states, n_discrete_states, n_discrete_states)
-        # conditional_cont_means, shape (n_cont_states, n_discrete_states, n_discrete_states)
-        # conditional_cont_cross_covs, shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
-        # smoother_conditional_discrete_state_prob, shape (n_discrete_states, n_discrete_states)f
+        # 4. Collapse to single mean and covariance (n_states -> 1)
+        (
+            overall_smoother_mean,  # E[X_t | y_{1:T}], shape (n_cont_states,), x_{t|T}
+            overall_smoother_covs,  # Cov[X_t | y_{1:T}], shape (n_cont_states, n_cont_states)
+        ) = collapse_gaussian_mixture(
+            state_cond_smoother_means,  # E[X_t | y_{1:T}, S_{t}=j], shape (n_cont_states, n_discrete_states)
+            state_cond_smoother_covs,  # Cov[X_t | y_{1:T}, S_{t}=j], shape (n_cont_states, n_cont_states, n_discrete_states)
+            smoother_discrete_state_prob,  # Pr(S_t = j | y_{1:T}), shape (n_discrete_states,),  M_{t | T}(j)
+        )
 
-        # conditional_cont_cross_covs, shape (n_cont_states, n_cont_states, n_discrete_states)
+        # 5. Collapse cross covariance
+        (
+            state_cond_smoother_mean_tplus1,  # E[X_{t+1} | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t+1 | T}
+            smoother_mean_t_cond_Stplus1,  # E[X_t | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t | T}
+            state_cond_smoother_cross_cov,  # Cov(X_{t+1}, X_t | y_{1:T}, S_{t+1}=k), shape (n_cont_states, n_cont_states, n_discrete_states), V^k_{t+1, t | T}:
+        ) = collapse_cross_gaussian_mixture_across_states(
+            next_pair_cond_smoother_mean,  # E[X_{t+1} | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_discrete_states, n_discrete_states), x^{j(k)}_{t+1 | T}
+            pair_cond_smoother_mean,  # E[X_t | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_discrete_states, n_discrete_states), x^{(j)k}_{t | T}
+            pair_cond_smoother_cross_covs,  # Cov(X_{t+1}, X_t | y_{1:T}, S_t=j, S_{t+1}=k), shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states), V^{j(k)}_{t+1,t | T}
+            smoother_backward_cond_prob,  # Pr(S_t=j | S_{t+1}=k, y_{1:T}), shape (n_discrete_states, n_discrete_states), U^{j | k}_t
+        )
 
         # Cross collapse to a single Gaussian
-        _, _, smoother_cross_cov = collapse_gaussian_mixture_cross_covariance(
-            next_conditional_cont_cross_means,  # Mean at time t+1
-            conditional_cont_cross_means,  # Mean at time t
-            conditional_cont_cross_covs,  # Cross-covariance between time t and t+1
-            next_discrete_state_prob,  # Weights at time t
+        # overall_smoother_cross_cov, shape (n_cont_states, n_cont_states)
+        _, _, overall_smoother_cross_cov = collapse_gaussian_mixture_cross_covariance(
+            state_cond_smoother_mean_tplus1,  # E[X_{t+1} | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t+1 | T}
+            smoother_mean_t_cond_Stplus1,  # E[X_t | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t | T}
+            state_cond_smoother_cross_cov,  # V^k_{t+1, t | T}: state-conditional smoother cross covariance
+            next_smoother_discrete_prob,  # Pr(S_{t+1} = k | y_{1:T}), M_{t+1 | T}(k)
         )
-
-        # next_conditional_cont_means, shape (n_cont_states, n_discrete_states, n_discrete_states)
-        # conditional_cont_means, shape (n_cont_states, n_discrete_states, n_discrete_states)
-        # conditional_cont_cross_covs, shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
-        # smoother_conditional_discrete_state_prob, shape (n_discrete_states, n_discrete_states)
-        # smoother_cross_cov, shape (n_cont_states, n_cont_states)
 
         return (
-            collapsed_means,
-            collapsed_covs,
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
             smoother_discrete_state_prob,
-            conditional_cont_means,
+            pair_cond_smoother_mean,
         ), (
-            single_collapsed_means,
-            single_collapsed_covs,
+            overall_smoother_mean,
+            overall_smoother_covs,
             smoother_discrete_state_prob,
-            smoother_joint_discrete_state_prob,
-            smoother_cross_cov,
+            joint_smoother_discrete_prob,
+            overall_smoother_cross_cov,
         )
 
-    (
-        smoother_means,
-        smoother_covs,
+    _, (
+        overall_smoother_mean,
+        overall_smoother_covs,
         smoother_discrete_state_prob,
         smoother_joint_discrete_state_prob,
-        smoother_cross_cov,
+        overall_smoother_cross_cov,
     ) = jax.lax.scan(
         _step,
         (
@@ -639,25 +591,27 @@ def switching_kalman_smoother(
             filter_discrete_state_prob[:-1],
         ),
         reverse=True,
-    )[
-        1
-    ]
+    )
 
     last_smoother_mean, last_smoother_cov = collapse_gaussian_mixture(
         filter_mean[-1], filter_cov[-1], filter_discrete_state_prob[-1]
     )
-    smoother_means = jnp.concatenate([smoother_means, last_smoother_mean[None]], axis=0)
-    smoother_covs = jnp.concatenate([smoother_covs, last_smoother_cov[None]], axis=0)
+    overall_smoother_mean = jnp.concatenate(
+        [overall_smoother_mean, last_smoother_mean[None]], axis=0
+    )
+    overall_smoother_covs = jnp.concatenate(
+        [overall_smoother_covs, last_smoother_cov[None]], axis=0
+    )
     smoother_discrete_state_prob = jnp.concatenate(
         [smoother_discrete_state_prob, filter_discrete_state_prob[-1][None]], axis=0
     )
 
     return (
-        smoother_means,
-        smoother_covs,
+        overall_smoother_mean,
+        overall_smoother_covs,
         smoother_discrete_state_prob,
         smoother_joint_discrete_state_prob,
-        smoother_cross_cov,
+        overall_smoother_cross_cov,
     )
 
 
