@@ -177,10 +177,9 @@ def _kalman_smoother_update(
         @ (next_smoother_cov - one_step_cov)
         @ smoother_kalman_gain.T
     )
+    # lag one cross covariance
+    smoother_cross_cov = smoother_kalman_gain @ next_smoother_cov
 
-    smoother_cross_cov = smoother_kalman_gain @ next_smoother_cov + jnp.outer(
-        smoother_mean, next_smoother_mean
-    )  # lag one cross covariance
     return smoother_mean, smoother_cov, smoother_cross_cov
 
 
@@ -296,7 +295,10 @@ def kalman_maximization_step(
     alpha = outer_sum(obs, obs)
     gamma1 = gamma - jnp.outer(smoother_mean[-1], smoother_mean[-1]) - smoother_cov[-1]
     gamma2 = gamma - jnp.outer(smoother_mean[0], smoother_mean[0]) - smoother_cov[0]
-    beta = smoother_cross_cov.sum(axis=0).T
+    beta = (
+        smoother_cross_cov.sum(axis=0)
+        + outer_sum(smoother_mean[:-1], smoother_mean[1:])
+    ).T
 
     # Measurement matrix and covariance
     measurement_matrix = psd_solve(gamma, delta.T).T
