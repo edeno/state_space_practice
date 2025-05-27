@@ -133,7 +133,7 @@ def _kalman_filter_update(
     )
 
     marginal_log_likelihood = jax.scipy.stats.multivariate_normal.logpdf(
-        x=residual_error, mean=jnp.zeros_like(residual_error), cov=obs_cov
+        x=obs_mean, mean=obs, cov=obs_cov
     )
 
     return posterior_mean, posterior_cov, marginal_log_likelihood
