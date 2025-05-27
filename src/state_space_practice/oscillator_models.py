@@ -65,12 +65,12 @@ class BaseModel:
     # measurement_matrix: jnp.ndarray,
     # measurement_cov: jnp.ndarray,
 
-    def initialize_discrete_state_prob(self):
+    def _initialize_discrete_state_prob(self):
         self.init_discrete_state_prob = (
             jnp.ones(self.n_discrete_states) / self.n_discrete_states
         )
 
-    def initialize_discrete_transition_matrix(self):
+    def _initialize_discrete_transition_matrix(self):
         diag = self.discrete_transition_diag
         transition_matrix = diag * jnp.identity(self.n_discrete_states)
         if self.n_discrete_states == 1:
@@ -84,7 +84,7 @@ class BaseModel:
 
         self.discrete_transition_matrix = transition_matrix
 
-    def initialize_continuous_state(self, key: jax.random.PRNGKey):
+    def _initialize_continuous_state(self, key: jax.random.PRNGKey):
         self.continuous_state_mean = jax.random.multivariate_normal(
             key=key,
             mean=jnp.zeros((2 * self.n_oscillators,)),
@@ -153,50 +153,6 @@ class BaseModel:
             update_init_cov=self.update_init_cov,
         )
 
-    # def fit(self, observations: jnp.ndarray):
-    # log_likelihoods = []
-    # is_converged = False
-
-    # for i in range(self.n_iter):
-    #     # E-step
-    #     (
-    #         smoother_means,
-    #         smoother_covs,
-    #         smoother_discrete_state_prob,
-    #         smoother_joint_discrete_state_prob,
-    #         smoother_cross_cov,
-    #     ) = self._e_step(observations)
-    #     print(f"Iteration {i}: log-likelihood = {marginal_log_likelihood:.2f}")
-    #     log_likelihoods.append(marginal_log_likelihood)
-    #     # M-step
-    #     (
-    #         transition_matrix,
-    #         _,
-    #         process_cov,
-    #         measurement_cov,
-    #         init_mean,
-    #         init_cov,
-    #     ) = kalman_maximization_step(
-    #         obs=observations,
-    #         smoother_mean=smoother_means,
-    #         smoother_cov=smoother_covs,
-    #         smoother_cross_cov=smoother_cross_cov,
-    #     )
-
-    #     is_converged, _ = check_converged(
-    #         log_likelihoods[-1],
-    #         log_likelihoods[-2] if len(log_likelihoods) > 1 else 0,
-    #     )
-    #     print(
-    #         f"Diff: {log_likelihoods[-1] - log_likelihoods[-2] if len(log_likelihoods) > 1 else 0:.2f}"
-    #     )
-
-    #     if is_converged:
-    #         print(
-    #             f"Converged at iteration {i} with log-likelihood = {log_likelihoods[-1]:.2f}"
-    #         )
-    #         break
-
 
 class CommonOscillatorModel(BaseModel):
     """Common Oscillator Model (COM)
@@ -207,7 +163,7 @@ class CommonOscillatorModel(BaseModel):
     def __init__(self):
         super().__init__()
 
-    def initialize__measurement_matrix(self, key: jax.random.PRNGKey):
+    def _initialize__measurement_matrix(self, key: jax.random.PRNGKey):
         self.measurement_matrix = jax.random.uniform(
             key,
             (self.n_sources, 2 * self.n_oscillators, self.n_discrete_states),
@@ -216,13 +172,13 @@ class CommonOscillatorModel(BaseModel):
             maxval=0.1,
         )
 
-    def initialize_measurement_covariance(self):
+    def _initialize_measurement_covariance(self):
         measurement_cov = jnp.identity(self.n_sources) * self.measurement_variance
         self.measurement_cov = jnp.stack(
             [measurement_cov] * self.n_discrete_states, axis=2
         )
 
-    def initialize_continuous_transition_matrix(self):
+    def _initialize_continuous_transition_matrix(self):
         transition_matrix = construct_common_oscillator_transition_matrix(
             freqs=self.freqs,
             auto_regressive_coef=self.auto_regressive_coef,
@@ -232,7 +188,7 @@ class CommonOscillatorModel(BaseModel):
             [transition_matrix] * self.n_discrete_states, axis=2
         )
 
-    def initialize_process_covariance(self):
+    def _initialize_process_covariance(self):
         process_cov = construct_common_oscillator_process_covariance(
             variance=self.process_variance,
         )
@@ -291,7 +247,7 @@ class CorrelatedNoiseModel(BaseModel):
     def __init__(self):
         super().__init__()
 
-    def initialize_measurement_matrix(self):
+    def _initialize_measurement_matrix(self):
         measurement_matrix = construct_correlated_noise_measurement_matrix(
             self.n_sources,
         )
@@ -299,13 +255,13 @@ class CorrelatedNoiseModel(BaseModel):
             [measurement_matrix] * self.n_discrete_states, axis=2
         )
 
-    def initialize_measurement_covariance(self):
+    def _initialize_measurement_covariance(self):
         measurement_cov = jnp.identity(self.n_sources) * self.measurement_variance
         self.measurement_cov = jnp.stack(
             [measurement_cov] * self.n_discrete_states, axis=2
         )
 
-    def initialize_continuous_transition_matrix(self):
+    def _initialize_continuous_transition_matrix(self):
         transition_matrix = construct_common_oscillator_transition_matrix(
             freqs=self.freqs,
             auto_regressive_coef=self.auto_regressive_coef,
@@ -315,7 +271,7 @@ class CorrelatedNoiseModel(BaseModel):
             [transition_matrix] * self.n_discrete_states, axis=2
         )
 
-    def initialize_process_covariance(self):
+    def _initialize_process_covariance(self):
         self.process_cov = jnp.stack(
             [
                 construct_correlated_noise_process_covariance(
@@ -339,7 +295,7 @@ class DirectedInfluenceModel(BaseModel):
     def __init__(self):
         super().__init__()
 
-    def initialize_measurement_matrix(self):
+    def _initialize_measurement_matrix(self):
         measurement_matrix = construct_directed_influence_measurement_matrix(
             self.n_sources,
         )
@@ -347,7 +303,7 @@ class DirectedInfluenceModel(BaseModel):
             [measurement_matrix] * self.n_discrete_states, axis=2
         )
 
-    def initialize_continuous_transition_matrix(self):
+    def _initialize_continuous_transition_matrix(self):
         self.continuous_transition_matrix = jnp.stack(
             [
                 construct_directed_influence_transition_matrix(
