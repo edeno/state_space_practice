@@ -1,5 +1,48 @@
+"""Bayesian State-Space Model for Learning using Laplace Approximation.
+
+This module implements a Bayesian filter and smoother designed to track a
+latent learning state over trials, based on binomial (correct/incorrect)
+observation data. It uses the approach described by:
+
+    Smith, A. C., Frank, L. M., Wirth, S., Yanike, M., Hu, D., Kubota, Y.,
+    Graybiel, A. M., Suzuki, W. A., & Brown, E. N. (2004).
+    Dynamic analysis of learning in behavioral experiments.
+    Journal of Neuroscience, 24(2), 447-461.
+
+The model assumes:
+1.  **Latent Learning State (x_k)**: Follows a Gaussian random walk, representing
+    the underlying ability or knowledge at trial 'k'.
+    $$ x_k = x_{k-1} + w_k, \quad w_k \sim N(0, \sigma_\epsilon^2) $$
+2.  **Observation Model**: The probability of a correct response ($p_k$) is
+    linked to the latent state via a sigmoid (logit) function. The number
+    of correct responses ($y_k$) in a trial follows a Binomial distribution.
+    $$ p_k = \frac{1}{1 + \exp(-(\mu + x_k))} $$
+    $$ y_k \sim \text{Binomial}(N_k, p_k) $$
+    where $\mu$ is a bias term (often related to chance performance) and
+    $N_k$ is the maximum possible correct responses in trial 'k'.
+
+Due to the non-linear sigmoid link and non-Gaussian Binomial likelihood, the
+posterior distribution is not Gaussian, and the standard Kalman filter cannot
+be applied directly. This implementation addresses this by using the
+**Laplace approximation** within the filter's update step. It approximates
+the posterior at each step with a Gaussian distribution by finding its mode
+and calculating the curvature (Hessian) at the mode.
+
+The module provides:
+- `approximate_gaussian`: Computes the Laplace approximation.
+- `log_posterior_objective`: Defines the log-posterior for a single step.
+- `smith_learning_filter`: Implements the forward-pass filter using
+  `jax.lax.scan` and `approximate_gaussian`.
+- `smith_learning_smoother`: Implements a backward-pass Rauch-Tung-Striebel
+  (RTS) smoother using the Gaussian approximations from the filter.
+
+This implementation leverages JAX for automatic differentiation (Hessian),
+optimization (BFGS), and efficient vectorized/scanned operations.
+
+"""
+
 from functools import partial
-from typing import Callable
+from typing import Callable, Optional
 
 import jax
 import jax.numpy as jnp
@@ -7,7 +50,9 @@ import jax.scipy.optimize
 import numpy as np
 
 
-def approximate_gaussian(log_posterior_func: Callable, x0: jnp.ndarray) -> jnp.ndarray:
+def approximate_gaussian(
+    log_posterior_func: Callable, x0: jnp.ndarray
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Approximate the posterior distribution using Laplace approximation
     to find the mode and covariance matrix.
 
@@ -51,7 +96,7 @@ def log_posterior_objective(
     learning_state: float,
     learning_state_prev: float,
     sig_sq_old: float,
-    n_correct_in_trial: bool,
+    n_correct_in_trial: jnp.ndarray,
     max_possible_correct: int,
     bias: float,
 ):
@@ -65,7 +110,7 @@ def log_posterior_objective(
         Previous latent learning state estimate vector, x_{k-1}
     sig_sq_old : float
         Previous state variance, \sigma_{k-1}^2
-    n_correct_in_trial : bool
+    n_correct_in_trial : jnp.ndarray, shape (n,)
         Number of correct responses in the trial
     max_possible_correct : int
         Maximum number of correct responses in the trial
@@ -95,62 +140,84 @@ def log_posterior_objective(
 def smith_learning_filter(
     n_correct_responses: jnp.ndarray,
     init_learning_state: float = 0.0,
-    init_learning_variance: float = None,
+    init_learning_variance: Optional[float] = None,
     sigma_epsilon: float = jnp.sqrt(0.05),
     prob_correct_by_chance: float = 0.5,
-    max_possible_correct: int = None,
+    max_possible_correct: Optional[int] = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """
+    """Applies a non-linear Bayesian filter (Laplace approximation) for learning.
+
+    Assumes a random walk model for the latent learning state ($x_k$) and
+    a Binomial observation model with a sigmoid link function.
+
+    $$ x_k = x_{k-1} + w_k, \quad w_k \sim N(0, \sigma_\epsilon^2) $$
+    $$ p_k = \frac{1}{1 + \exp(-(\mu + x_k))} $$
+    $$ y_k \sim \text{Binomial}(N_k, p_k) $$
 
     Parameters
     ----------
     n_correct_responses : jnp.ndarray, shape (n_trials,)
-        Number of correct responses in each trial
+        Number of correct responses in each trial ($y_k$).
     init_learning_state : float, optional
-        The subject's learning state at the beginning of the experiment.
+        The subject's learning state at the beginning of the experiment ($x_0$).
         When None, it is set to 0.
     init_learning_variance : float
-        Initial variance of the learning state.
+        Initial learning state variance ($P_0$). Defaults to $\sigma_\epsilon^2$.
         Controls how fast the learning state is updated.
-        When None, it is set to `sigma_epsilon`.
     sigma_epsilon : float, optional
-        Standard deviation of the noise in the observation model.
+        Standard deviation of the process noise ($\sigma_\epsilon$),
     prob_correct_by_chance : float, optional
         The probability of a correct response by chance in absence of any
-        learning or experience.
+        learning or experience, used to set the bias.
+        Default is 0.5.
     max_possible_correct : float, optional
-        Maximum number of correct responses in each trial.
+        Maximum number of correct responses in each trial ($N_k$).
         When None, it is set to the maximum value in `n_correct`.
 
     Returns
     -------
     prob_correct_response : jnp.ndarray, shape (n_trials,)
-        Probability of a correct response in each trial
+        Posterior probability of a correct response ($p_k$).
     learning_state_mode : jnp.ndarray, shape (n_trials,)
-        Posterior mode of the learning state in each trial
+        Posterior mode of the learning state ($x_{k|k}$).
     learning_state_variance : jnp.ndarray, shape (n_trials,)
-        Posterior variance of the learning state in each trial
+        Posterior variance of the learning state ($P_{k|k}$).
     one_step_mode : jnp.ndarray, shape (n_trials,)
-        One-step prediction of the learning state in each trial
+        One-step prediction of the learning state in each trial ($x_{k|k-1}$).
     one_step_variance : jnp.ndarray, shape (n_trials,)
-        One-step prediction of the variance of the learning state in each trial
+        One-step prediction of the variance of the learning state in each trial ($P_{k|k-1}$).
     """
-    # Initial mode and variance
-    mu = jnp.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
-    sigma_squared_epsilon = sigma_epsilon**2
+    # Bias term based on chance probability of correct response
+    mu: float = jnp.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
+    sigma_squared_epsilon: float = sigma_epsilon**2
+
+    # Set initial variance if not provided
+    if init_learning_variance is None:
+        init_learning_variance = sigma_squared_epsilon
+
+    if isinstance(max_possible_correct, (int, float)):
+        max_possible_correct = jnp.array(
+            [max_possible_correct] * len(n_correct_responses), dtype=int
+        )
+
+    if max_possible_correct is None:
+        max_possible_correct = (
+            jnp.ones_like(n_correct_responses, dtype=int) * n_correct_responses.max()
+        )
 
     # @jax.jit
     def _step(
         params_prev: tuple[float, float], args: tuple[jnp.ndarray, jnp.ndarray]
     ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray]]:
-
+        """A single step of the non-linear filter."""
         mode_prev, variance_prev = params_prev
         n_correct_trial_k, max_possible_correct_trial_k = args
 
-        # one step prediction
+        # 1. Prediction Step
         one_step_mode = mode_prev  # no transition matrix
         one_step_variance = variance_prev + sigma_squared_epsilon
 
+        # 2. Update Step (using Laplace Approximation)
         log_objective_func = partial(
             log_posterior_objective,
             learning_state_prev=one_step_mode,
@@ -159,6 +226,7 @@ def smith_learning_filter(
             max_possible_correct=max_possible_correct_trial_k,
             bias=mu,
         )
+        # Find mode and covariance (variance)
         posterior_mode, posterior_variance = approximate_gaussian(
             log_objective_func, x0=jnp.array([one_step_mode])
         )
@@ -172,12 +240,7 @@ def smith_learning_filter(
             one_step_variance,
         )
 
-    if max_possible_correct is None:
-        max_possible_correct = jnp.ones_like(n_correct) * n_correct.max()
-
-    if init_learning_variance is None:
-        init_learning_variance = sigma_squared_epsilon
-
+    # Run the filter over all trials
     learning_state_mode, learning_state_variance, one_step_mode, one_step_variance = (
         jax.lax.scan(
             _step,
@@ -186,6 +249,7 @@ def smith_learning_filter(
         )[1]
     )
 
+    # Compute probability of correct response
     prob_correct_response = jax.nn.sigmoid(mu + learning_state_mode)
 
     return (
