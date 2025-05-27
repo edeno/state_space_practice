@@ -135,7 +135,7 @@ def _kalman_filter_update(
     )
 
     marginal_log_likelihood = jax.scipy.stats.multivariate_normal.logpdf(
-        x=obs_mean, mean=obs, cov=obs_cov
+        x=obs, mean=obs_mean, cov=obs_cov
     )
 
     return posterior_mean, posterior_cov, marginal_log_likelihood
