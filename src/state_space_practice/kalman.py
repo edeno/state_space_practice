@@ -4,6 +4,7 @@
 References
 ----------
 1. Sarkka, S. (2013). Bayesian Filtering and Smoothing
+  (Cambridge University Press) https://doi.org/10.1017/CBO9781139344203.
 
 """
 
@@ -115,21 +116,22 @@ def _kalman_filter_update(
     # obs_cross_cov = one_step_cov @ measurement_matrix.T
 
     # project system uncertainty into measurement space
-    obs_cov = measurement_matrix @ one_step_cov @ measurement_matrix.T + measurement_cov
+    obs_cov = symmetrize(
+        measurement_matrix @ one_step_cov @ measurement_matrix.T + measurement_cov
+    )
 
     residual_error = obs - obs_mean  # innovation
-    kalman_gain = jax.scipy.linalg.solve(
-        obs_cov, measurement_matrix @ one_step_cov, assume_a="pos"
-    ).T
+    kalman_gain = psd_solve(obs_cov, measurement_matrix @ one_step_cov).T
 
     posterior_mean = one_step_mean + kalman_gain @ residual_error
     # posterior_cov = one_step_cov - kalman_gain @ obs_cov @ kalman_gain.T
     # subtraction could result in the diagonal matrix with negative values
     # More stable solution is P = (I-KH)P(I-KH)' + KRK' to ensure positive semidefinite
     # This is known as the Joseph form covariance update
-    I_KH = jnp.eye(len(mean_prev)) - kalman_gain @ measurement_matrix
-    posterior_cov = I_KH @ one_step_cov @ I_KH.T + kalman_gain @ (
-        measurement_cov @ kalman_gain.T
+    n_cont = mean_prev.shape[0]
+    I_KH = jnp.eye(n_cont) - kalman_gain @ measurement_matrix
+    posterior_cov = symmetrize(
+        I_KH @ one_step_cov @ I_KH.T + kalman_gain @ (measurement_cov @ kalman_gain.T)
     )
 
     marginal_log_likelihood = jax.scipy.stats.multivariate_normal.logpdf(
@@ -228,14 +230,16 @@ def _kalman_smoother_update(
     smoother_cross_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
     """
     one_step_mean = transition_matrix @ filter_mean
-    one_step_cov = transition_matrix @ filter_cov @ transition_matrix.T + process_cov
+    one_step_cov = symmetrize(
+        transition_matrix @ filter_cov @ transition_matrix.T + process_cov
+    )
 
     smoother_kalman_gain = psd_solve(one_step_cov, transition_matrix @ filter_cov).T
 
     smoother_mean = filter_mean + smoother_kalman_gain @ (
         next_smoother_mean - one_step_mean
     )
-    smoother_cov = (
+    smoother_cov = symmetrize(
         filter_cov
         + smoother_kalman_gain
         @ (next_smoother_cov - one_step_cov)
