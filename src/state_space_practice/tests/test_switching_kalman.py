@@ -649,7 +649,6 @@ def test_update_discrete_state_probabilities_zero_sum_check() -> None:
         likelihood, transitions, prev_probs
     )
 
-    # Assert that NO NaNs are produced if the fix is working
     assert not jnp.any(jnp.isnan(m_t)), "m_t contains NaN - NaN fix failed!"
     assert not jnp.any(jnp.isnan(w)), "w contains NaN - NaN fix failed!"
 
