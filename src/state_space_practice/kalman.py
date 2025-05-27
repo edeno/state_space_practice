@@ -3,7 +3,7 @@
 
 References
 ----------
-1. Sarkka, S. (2013). Bayesian Filtering and Smoothing (Cambridge University Press) https://doi.org/10.1017/CBO9781139344203.
+1. Sarkka, S. (2013). Bayesian Filtering and Smoothing
 
 """
 
@@ -13,11 +13,55 @@ import jax.scipy.linalg
 
 
 def symmetrize(A):
+    """
+    Symmetrize one or more matrices by averaging each matrix with its transpose.
+
+    Parameters
+    ----------
+    A : array_like
+        A matrix or a batch of matrices to be symmetrized. The last two dimensions
+        should be square matrices.
+
+    Returns
+    -------
+    array_like
+        The symmetrized matrix or batch of matrices, where each output matrix is
+        (A + A.T) / 2.
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> A = jnp.array([[1, 2], [3, 4]])
+    >>> symmetrize(A)
+    DeviceArray([[1., 2.5],
+                 [2.5, 4.]], dtype=float32)
+    """
     """Symmetrize one or more matrices."""
     return 0.5 * (A + jnp.swapaxes(A, -1, -2))
 
 
 def psd_solve(A, b, diagonal_boost=1e-9):
+    """
+    Solves a linear system Ax = b for positive semi-definite (PSD) matrices A.
+
+    This function wraps a linear algebra solver, ensuring numerical stability by symmetrizing
+    the input matrix A and adding a small value to its diagonal (diagonal_boost). It is intended
+    for use with PSD matrices, where 'assume_a="pos"' can be safely set for performance.
+
+    Parameters
+    ----------
+    A : jnp.ndarray
+        The coefficient matrix, expected to be positive semi-definite.
+    b : jnp.ndarray
+        The right-hand side vector or matrix.
+    diagonal_boost : float, optional
+        Small value added to the diagonal of A to improve numerical stability. Default is 1e-9.
+
+    Returns
+    -------
+    jnp.ndarray
+        The solution x to the linear system Ax = b.
+    """
     """A wrapper for coordinating the linalg solvers used in the library for psd matrices."""
     return jax.scipy.linalg.solve(
         symmetrize(A) + diagonal_boost * jnp.eye(A.shape[-1]), b, assume_a="pos"
@@ -32,7 +76,7 @@ def _kalman_filter_update(
     process_cov: jnp.ndarray,
     measurement_matrix: jnp.ndarray,
     measurement_cov: jnp.ndarray,
-):
+) -> tuple[jnp.ndarray, jnp.ndarray, float]:
     """
 
     Parameters
@@ -96,14 +140,34 @@ def _kalman_filter_update(
 
 
 def kalman_filter(
-    init_mean,
-    init_cov,
-    obs,
-    transition_matrix,
-    process_cov,
-    measurement_matrix,
-    measurement_cov,
-):
+    init_mean: jnp.ndarray,
+    init_cov: jnp.ndarray,
+    obs: jnp.ndarray,
+    transition_matrix: jnp.ndarray,
+    process_cov: jnp.ndarray,
+    measurement_matrix: jnp.ndarray,
+    measurement_cov: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, float]:
+    """
+
+    Parameters
+    ----------
+    init_mean : jnp.ndarray, shape (n_cont_states,)
+    init_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    obs : jnp.ndarray, shape (n_time, n_obs_dim)
+    transition_matrix : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    process_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    measurement_matrix : jnp.ndarray, shape (n_obs_dim, n_cont_states)
+    measurement_cov : jnp.ndarray, shape (n_obs_dim, n_obs_dim)
+
+    Returns
+    -------
+    filtered_mean : jnp.ndarray, shape (n_time, n_cont_states)
+    filtered_cov : jnp.ndarray, shape (n_time, n_cont_states, n_cont_states)
+    marginal_log_likelihood : float
+        The log likelihood of the observations given the model parameters.
+    """
+
     def _step(carry, obs_t):
         mean_prev, cov_prev, marginal_log_likelihood = carry
         posterior_mean, posterior_cov, marginal_log_likelihood_t = (
@@ -139,13 +203,13 @@ def kalman_filter(
 
 
 def _kalman_smoother_update(
-    next_smoother_mean,
-    next_smoother_cov,
-    filter_mean,
-    filter_cov,
-    process_cov,
-    transition_matrix,
-):
+    next_smoother_mean: jnp.ndarray,
+    next_smoother_cov: jnp.ndarray,
+    filter_mean: jnp.ndarray,
+    filter_cov: jnp.ndarray,
+    process_cov: jnp.ndarray,
+    transition_matrix: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
 
     Parameters
@@ -184,14 +248,37 @@ def _kalman_smoother_update(
 
 
 def kalman_smoother(
-    init_mean,
-    init_cov,
-    obs,
-    transition_matrix,
-    process_cov,
-    measurement_matrix,
-    measurement_cov,
-):
+    init_mean: jnp.ndarray,
+    init_cov: jnp.ndarray,
+    obs: jnp.ndarray,
+    transition_matrix: jnp.ndarray,
+    process_cov: jnp.ndarray,
+    measurement_matrix: jnp.ndarray,
+    measurement_cov: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, float]:
+    """
+
+    Parameters
+    ----------
+    init_mean : jnp.ndarray, shape (n_cont_states,)
+    init_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    obs : jnp.ndarray, shape (n_time, n_obs_dim)
+    transition_matrix : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    process_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    measurement_matrix : jnp.ndarray, shape (n_obs_dim, n_cont_states)
+    measurement_cov : jnp.ndarray, shape (n_obs_dim, n_obs_dim)
+
+    Returns
+    -------
+    smoother_mean : jnp.ndarray, shape (n_time, n_cont_states)
+        Smoothed state mean.
+    smoother_cov : jnp.ndarray, shape (n_time, n_cont_states, n_cont_states)
+        Smoothed state covariance.
+    smoother_cross_cov : jnp.ndarray, shape (n_time - 1, n_cont_states, n_cont_states)
+        Smoothed cross-covariance between states at time t and t+1.
+    marginal_log_likelihood : float
+        The log likelihood of the observations given the model parameters.
+    """
     filtered_mean, filtered_cov, marginal_log_likelihood = kalman_filter(
         init_mean,
         init_cov,
@@ -241,8 +328,21 @@ def kalman_smoother(
 
 
 def outer_sum(x, y):
-    """Compute the sum of outer products.
-    \sum_{t} x_t y_t.T
+    """
+    Compute the sum of outer products between corresponding vectors in two sequences.
+
+    Given two arrays `x` and `y` of shape (T, N) and (T, M) respectively, this function computes:
+        S = sum_{t=1}^T x_t y_t^T
+    where x_t and y_t are the t-th rows of `x` and `y`.
+
+    Parameters
+    ----------
+    x : np.ndarray, shape (T, N)
+    y : np.ndarray, shape (T, M)
+
+    Returns
+    -------
+    outer_sum : np.ndarray, shape (N, M)
     """
     return x.T @ y
 
