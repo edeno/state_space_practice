@@ -83,6 +83,7 @@ def psd_solve(
     )
 
 
+@jax.jit
 def _kalman_filter_update(
     mean_prev: jnp.ndarray,
     cov_prev: jnp.ndarray,
@@ -156,6 +157,7 @@ def _kalman_filter_update(
     return posterior_mean, posterior_cov, marginal_log_likelihood
 
 
+@jax.jit
 def kalman_filter(
     init_mean: jnp.ndarray,
     init_cov: jnp.ndarray,
@@ -229,6 +231,7 @@ def kalman_filter(
     return filtered_mean, filtered_cov, marginal_log_likelihood
 
 
+@jax.jit
 def _kalman_smoother_update(
     next_smoother_mean: jnp.ndarray,
     next_smoother_cov: jnp.ndarray,
@@ -291,6 +294,7 @@ def _kalman_smoother_update(
     return smoother_mean, smoother_cov, smoother_cross_cov
 
 
+@jax.jit
 def kalman_smoother(
     init_mean: jnp.ndarray,
     init_cov: jnp.ndarray,
