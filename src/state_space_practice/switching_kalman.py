@@ -221,7 +221,7 @@ def switching_kalman_filter(
     continuous_transition_matrix : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
         Transition matrix for the continuous states $A$
     process_cov : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
-        Process noise covariance matrix. $\Sigma$
+        Process noise covariance matrix. $\\Sigma$
     measurement_matrix : jnp.ndarray, shape (n_obs_dim, n_cont_states, n_discrete_states)
         Map observations to the continuous states $H$
     measurement_cov : jnp.ndarray, shape (n_obs_dim, n_obs_dim, n_discrete_states)
