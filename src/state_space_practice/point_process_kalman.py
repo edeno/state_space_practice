@@ -1,15 +1,33 @@
+from typing import Callable
+
 import jax
 import jax.numpy as jnp
 
 from state_space_practice.kalman import (
     _kalman_smoother_update,
-    outer_sum,
     psd_solve,
+    sum_of_outer_products,
     symmetrize,
 )
 
 
-def log_conditional_intensity(design_matrix, params):
+def log_conditional_intensity(
+    design_matrix: jnp.ndarray, params: jnp.ndarray
+) -> jnp.ndarray:
+    """Computes the log conditional intensity for a point process.
+
+    Parameters
+    ----------
+    design_matrix : jnp.ndarray, shape (n_time, n_params)
+        Design matrix (Z_k) used in the intensity function.
+    params : jnp.ndarray, shape (n_params,)
+        Parameters for the intensity function.
+
+    Returns
+    -------
+    jnp.ndarray, shape (n_time,)
+        Log conditional intensity (log(λ_k)).
+    """
     return design_matrix @ params
 
 
@@ -21,34 +39,56 @@ def stochastic_point_process_filter(
     dt: float,
     transition_matrix: jnp.ndarray,
     process_cov: jnp.ndarray,
-    log_conditional_intensity: callable,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Stochastic State Point Process Filter (SSPPF)
+    log_conditional_intensity: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray],
+) -> tuple[jnp.ndarray, jnp.ndarray, float]:
+    """Applies a Stochastic State Point Process Filter (SSPPF).
+
+    This filter estimates a time-varying latent state ($x_k$) based on
+    point process observations ($y_k$). It assumes a linear Gaussian state
+    transition and a point process observation model where the conditional
+    intensity $\lambda_k$ depends on the state.
+
+    $$ x_k = A x_{k-1} + w_k, \quad w_k \sim N(0, Q) $$
+    $$ \lambda_k = f(x_k, Z_k) $$
+    $$ y_k \sim \text{Poisson}(\lambda_k \Delta t) \quad (\text{or Bernoulli}) $$
+
+    The filter uses a local Gaussian approximation (Laplace-EKF approach)
+    at each update step, utilizing the gradient and Hessian of the
+    log-likelihood. It implements a single Newton-Raphson like step
+    per time bin.
 
     Parameters
     ----------
     init_mean_params : jnp.ndarray, shape (n_params,)
-        Initial mean parameters
+        Initial mean of the latent state ($x_0$).
     init_covariance_params : jnp.ndarray, shape (n_params, n_params)
-        Initial variance parameters
+        Initial covariance of the latent state ($P_0$).
     design_matrix : jnp.ndarray, shape (n_time, n_params)
+        Design matrix ($Z_k$) used in the intensity function.
     spike_indicator : jnp.ndarray, shape (n_time,)
-        Spike count
+        Observed spike counts or indicators ($y_k$).
     dt : float
-        Time step
+        Time step size ($\Delta t$).
     transition_matrix : jnp.ndarray, shape (n_params, n_params)
+        State transition matrix ($A$).
     process_cov : jnp.ndarray, shape (n_params, n_params)
+        Process noise covariance ($Q$).
     log_conditional_intensity : callable
-        Function that takes in `design_matrix` and parameters and returns the log spike rate
+        Function `log_lambda(Z_k, x_k)` returning the log conditional
+        intensity.
 
     Returns
     -------
     posterior_mean : jnp.ndarray, shape (n_time, n_params)
+        Filtered posterior means ($x_{k|k}$).
     posterior_variance : jnp.ndarray, shape (n_time, n_params, n_params)
+        Filtered posterior covariances ($P_{k|k}$).
+    marginal_log_likelihood : float
+        Total log-likelihood of the observations given the model.
 
     References
     ----------
-    ...[1] Eden, U. T., Frank, L. M., Barbieri, R., Solo, V. & Brown, E. N.
+    [1] Eden, U. T., Frank, L. M., Barbieri, R., Solo, V. & Brown, E. N.
       Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
       Neural Computation 16, 971-998 (2004).
 
@@ -58,7 +98,7 @@ def stochastic_point_process_filter(
     hess_log_conditional_intensity = jax.hessian(log_conditional_intensity, argnums=1)
 
     def _step(
-        params_prev: tuple[jnp.ndarray, jnp.ndarray],
+        params_prev: tuple[jnp.ndarray, jnp.ndarray, float],
         args: tuple[jnp.ndarray, jnp.ndarray],
     ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray]]:
         """Point Process Adaptive Filter update step
@@ -96,7 +136,7 @@ def stochastic_point_process_filter(
 
         inverse_posterior_covariance = (
             jnp.linalg.pinv(one_step_covariance)
-            + (one_step_grad.T * conditional_intensity @ one_step_grad)
+            + ((one_step_grad.T * conditional_intensity) @ one_step_grad)
             - innovation * one_step_hess
         )
         posterior_covariance = jnp.linalg.pinv(inverse_posterior_covariance)
@@ -112,7 +152,7 @@ def stochastic_point_process_filter(
             posterior_covariance,
         )
 
-    marginal_log_likelihood = 0.0
+    marginal_log_likelihood = jnp.array(0.0)
     (_, _, marginal_log_likelihood), (
         filtered_mean,
         filtered_cov,
@@ -135,6 +175,56 @@ def stochastic_point_process_smoother(
     process_cov: jnp.ndarray,
     log_conditional_intensity: callable,
 ):
+    """
+    Applies a Stochastic State Point Process Smoother (SSPPS).
+
+    This smoother estimates a time-varying latent state ($x_k$) based on
+    point process observations ($y_k$) using a Kalman smoother approach.
+    It first applies a stochastic point process filter to obtain the filtered
+    means and covariances, and then applies a Kalman smoother to refine these estimates.
+    The smoother uses the filtered means and covariances to compute the smoothed
+    means, covariances, and cross-covariances.
+    $$ x_k = A x_{k-1} + w_k, \quad w_k \sim N(0, Q) $$
+    $$ \lambda_k = f(x_k, Z_k) $$
+    $$ y_k \sim \text{Poisson}(\lambda_k \Delta t) \quad (\text{or Bernoulli}) $$
+    The smoother uses a Kalman smoother update step to refine the filtered estimates.
+    Parameters
+    ----------
+    init_mean_params : jnp.ndarray, shape (n_params,)
+        Initial mean of the latent state ($x_0$).
+    init_covariance_params : jnp.ndarray, shape (n_params, n_params)
+        Initial covariance of the latent state ($P_0$).
+    design_matrix : jnp.ndarray, shape (n_time, n_params)
+        Design matrix ($Z_k$) used in the intensity function.
+    spike_indicator : jnp.ndarray, shape (n_time,)
+        Observed spike counts or indicators ($y_k$).
+    dt : float
+        Time step size ($\Delta t$).
+    transition_matrix : jnp.ndarray, shape (n_params, n_params)
+        State transition matrix ($A$).
+    process_cov : jnp.ndarray, shape (n_params, n_params)
+        Process noise covariance ($Q$).
+    log_conditional_intensity : callable
+        Function `log_lambda(Z_k, x_k)` returning the log conditional
+        intensity.
+
+    Returns
+    -------
+    smoother_mean : jnp.ndarray, shape (n_time, n_params)
+        Smoothed posterior means ($x_{k|T}$).
+    smoother_cov : jnp.ndarray, shape (n_time, n_params, n_params)
+        Smoothed posterior covariances ($P_{k|T}$).
+    smoother_cross_cov : jnp.ndarray, shape (n_time - 1, n_params, n_params)
+        Smoothed cross-covariances ($P_{k|T, k-1}$).
+    marginal_log_likelihood : float
+        Total log-likelihood of the observations given the model.
+
+    References
+    ----------
+    [1] Eden, U. T., Frank, L. M., Barbieri, R., Solo, V. & Brown, E. N.
+        Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
+        Neural Computation 16, 971-998 (2004).
+    """
     filtered_mean, filtered_cov, marginal_log_likelihood = (
         stochastic_point_process_filter(
             init_mean_params,
@@ -222,7 +312,9 @@ def kalman_maximization_step(
     n_time = smoother_mean.shape[0]
 
     # Compute intermediate expectation terms
-    gamma = jnp.sum(smoother_cov, axis=0) + outer_sum(smoother_mean, smoother_mean)
+    gamma = jnp.sum(smoother_cov, axis=0) + sum_of_outer_products(
+        smoother_mean, smoother_mean
+    )
     gamma1 = gamma - jnp.outer(smoother_mean[-1], smoother_mean[-1]) - smoother_cov[-1]
     gamma2 = gamma - jnp.outer(smoother_mean[0], smoother_mean[0]) - smoother_cov[0]
     beta = smoother_cross_cov.sum(axis=0).T
