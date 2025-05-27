@@ -42,7 +42,7 @@ IDENTITY_2x2 = jnp.identity(2)
 ZEROS_2x2 = jnp.zeros((2, 2))
 
 
-def get_block_slice(from_oscillator, to_oscillator) -> tuple:
+def get_block_slice(from_oscillator: int, to_oscillator: int) -> tuple:
     """Get the indices for a 2x2 block in a 2n_oscillator matrix
 
     Parameters
@@ -90,7 +90,7 @@ def _get_rotation_matrix(rotation_frequency: float) -> jnp.ndarray:
 
 
 def _compute_intrinsic_oscillation_block(
-    oscillation_freq: float, auto_regressive_coef: float, sampling_freq: float = 1
+    oscillation_freq: float, auto_regressive_coef: float, sampling_freq: float = 1.0
 ) -> jnp.ndarray:
     """Compute the rotation matrix for a given frequency and auto-regressive coefficient
 
@@ -127,7 +127,7 @@ def _compute_coupled_oscillator_block(
     freq: float,
     auto_regressive_coef: float,
     sum_incoming_coupling_strength: float,
-    sampling_freq: float = 1,
+    sampling_freq: float = 1.0,
 ) -> jnp.ndarray:
     """Compute the diagonal block of the transition matrix for the coupled model
 
