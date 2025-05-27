@@ -72,7 +72,7 @@ def collapse_gaussian_mixture_cross_covariance(
     conditional_cross_cov: jnp.ndarray,
     mixing_weights: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Collapse a mixture of Gaussians.
+    """Compute cross-covariance when collapsing a Gaussian mixture.
 
     Parameters
     ----------
@@ -120,43 +120,51 @@ collapse_cross_gaussian_mixture_across_states = jax.vmap(
 
 
 def _update_discrete_state_probabilities(
-    conditional_marginal_likelihood: jnp.ndarray,
+    pair_cond_marginal_likelihood_scaled: jnp.ndarray,
     discrete_transition_matrix: jnp.ndarray,
-    discrete_state_prob_prev: jnp.ndarray,
+    prev_filter_discrete_prob: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray, float]:
     """Update the discrete state probabilities using the discrete transition matrix.
 
     Parameters
     ----------
-    conditional_marginal_likelihood : jnp.ndarray, shape (n_discrete_states, n_discrete_states)
+    pair_cond_marginal_likelihood_scaled : jnp.ndarray, shape (n_discrete_states, n_discrete_states)
     discrete_transition_matrix : jnp.ndarray, shape (n_discrete_states, n_discrete_states)
-    discrete_state_prob_prev : jnp.ndarray, shape (n_discrete_states,)
+        Z(i, j) = P(S_t=j | S_{t-1}=i)
+    prev_filter_discrete_prob : jnp.ndarray, shape (n_discrete_states,)
+        M_{t-1|t-1}(i) = Pr(S_{t-1}=i | y_{1:t-1})
 
     Returns
     -------
-    discrete_state_prob : jnp.ndarray, shape (n_discrete_states,)
-        Updated discrete state probabilities, P(S_t)
-    discrete_state_weights : jnp.ndarray, shape (n_discrete_states, n_discrete_states)
-        Mixing weights for the discrete states, P(S_{t-1} | S_t)
+    filter_discrete_prob : jnp.ndarray, shape (n_discrete_states,)
+        Updated discrete state probabilities, M_{t|t}(j) = Pr(S_t=j | y_{1:t})
+    filter_backward_cond_prob : jnp.ndarray, shape (n_discrete_states, n_discrete_states)
+        Mixing weights for the discrete states, W^{i|j} = Pr(S_{t-1}=i | S_t=j, y_{1:t})
     predictive_likelihood_term_sum : float
         Scaled predictive likelihood sum
     """
     # joint discrete state prob between time steps
-    # p(S_t, S_{t-1}) = p(y_t | S_t) * p(S_t | S_{t-1}) * p(S_{t-1})
+    # M_{t-1,t | t}(i, j) = P(S_{t-1}=i, S_t=j | y_{1:t})
     joint_discrete_state_prob = (
-        conditional_marginal_likelihood
-        * discrete_transition_matrix
-        * discrete_state_prob_prev[:, None]
+        pair_cond_marginal_likelihood_scaled  # L(i, j)
+        * discrete_transition_matrix  # Z(i, j)
+        * prev_filter_discrete_prob[:, None]  # M_{t-1|t-1}(i)
     )
     predictive_likelihood_term_sum = jnp.sum(joint_discrete_state_prob)
     joint_discrete_state_prob /= jnp.sum(joint_discrete_state_prob)
 
-    # p(S_t)
-    discrete_state_prob = jnp.sum(joint_discrete_state_prob, axis=0)
-    # p(S_{t-1} | S_t) = p(S_t, S_{t-1}) / p(S_t)
-    discrete_state_weights = joint_discrete_state_prob / discrete_state_prob[None, :]
+    # M_{t|t}(j) = Pr(S_t=j | y_{1:t})
+    filter_discrete_prob = jnp.sum(joint_discrete_state_prob, axis=0)
+    # W^{i|j} = Pr(S_{t-1}=i | S_t=j, y_{1:t})
+    filter_backward_cond_prob = (
+        joint_discrete_state_prob / filter_discrete_prob[None, :]
+    )
 
-    return discrete_state_prob, discrete_state_weights, predictive_likelihood_term_sum
+    return (
+        filter_discrete_prob,
+        filter_backward_cond_prob,
+        predictive_likelihood_term_sum,
+    )
 
 
 def _scale_likelihood(log_likelihood: jnp.ndarray) -> tuple[jnp.ndarray, float]:
@@ -180,8 +188,8 @@ def _scale_likelihood(log_likelihood: jnp.ndarray) -> tuple[jnp.ndarray, float]:
 
 
 def switching_kalman_filter(
-    init_mean: jnp.ndarray,
-    init_cov: jnp.ndarray,
+    init_state_cond_mean: jnp.ndarray,
+    init_state_cond_cov: jnp.ndarray,
     init_discrete_state_prob: jnp.ndarray,
     obs: jnp.ndarray,
     discrete_transition_matrix: jnp.ndarray,
@@ -190,19 +198,19 @@ def switching_kalman_filter(
     measurement_matrix: jnp.ndarray,
     measurement_cov: jnp.ndarray,
 ) -> tuple[
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-    jnp.ndarray,
-    float,
+    jnp.ndarray,  # Filtered mean of the continuous latent state
+    jnp.ndarray,  # Filtered covariance of the continuous latent state
+    jnp.ndarray,  # Filtered probability of the discrete states
+    jnp.ndarray,  # Last filtered conditional mean of the continuous latent state
+    float,  # Marginal log likelihood of the observations
 ]:
     """Switching Kalman filter for a linear Gaussian state space model with discrete states.
 
     Parameters
     ----------
-    init_mean : jnp.ndarray, shape (n_cont_states, n_discrete_states)
+    init_state_cond_mean : jnp.ndarray, shape (n_cont_states, n_discrete_states)
         Initial value of the continuous latent state $x_1$
-    init_cov : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
+    init_state_cond_cov : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
         Initial covariance of the continuous latent state $P_1$
     init_discrete_state_prob : jnp.ndarray, shape (n_discrete_states,)
         Initial probability of the discrete states $p(S_1)$
@@ -221,37 +229,37 @@ def switching_kalman_filter(
 
     Returns
     -------
-    filter_mean : jnp.ndarray, shape (n_time, n_cont_states, n_discrete_states)
+    state_cond_filter_mean : jnp.ndarray, shape (n_time, n_cont_states, n_discrete_states)
         Filtered mean of the continuous latent state
-    filter_cov : jnp.ndarray, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
+    state_cond_filter_cov : jnp.ndarray, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
         Filtered covariance of the continuous latent state
     filter_discrete_state_prob : jnp.ndarray, shape (n_time, n_discrete_states)
         Filtered probability of the discrete states
-    last_filter_conditional_cont_mean : jnp.ndarray, shape (n_cont_states, n_discrete_states, n_discrete_states)
-        Filtered conditional mean of the continuous latent state
+    last_pair_cond_filter_mean : jnp.ndarray, shape (n_cont_states, n_discrete_states, n_discrete_states)
+        Last filtered conditional mean of the continuous latent state
     marginal_log_likelihood : float
         Marginal log likelihood of the observations
 
     """
 
     def _step(
-        carry: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray], obs_t: jnp.ndarray
+        carry: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, float], obs_t: jnp.ndarray
     ) -> tuple[
-        tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, float],
-        tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+        tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, float],  # Next carry
+        tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],  # Stacked output
     ]:
         """One step of the switching Kalman filter.
 
         Parameters
         ----------
         carry : tuple
-            mean_prev : jnp.ndarray, shape (n_cont_states, n_discrete_states)
+            prev_state_cond_filter_mean : jnp.ndarray, shape (n_cont_states, n_discrete_states)
                 Previous state mean.
-            cov_prev : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
+            prev_state_cond_filter_cov : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
                 Previous state covariance.
-            discrete_state_prob_prev : jnp.ndarray, shape (n_discrete_states,)
+            prev_filter_discrete_prob : jnp.ndarray, shape (n_discrete_states,)
                 Previous discrete state probabilities
-            marginal_log_likelihood : float
+            pair_cond_marginal_log_likelihood : float
                 Previous marginal log likelihood
         obs_t : jnp.ndarray, shape (n_obs_dim,)
             Observation at time t
@@ -259,95 +267,110 @@ def switching_kalman_filter(
         Returns
         -------
         carry : tuple
-            mean_prev : jnp.ndarray, shape (n_cont_states, n_discrete_states)
+            prev_state_cond_filter_mean : jnp.ndarray, shape (n_cont_states, n_discrete_states)
                 Posterior state mean.
-            cov_prev : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
+            prev_state_cond_filter_cov : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
                 Posterior state covariance.
-            discrete_state_prob_prev : jnp.ndarray, shape (n_discrete_states,)
+            prev_filter_discrete_prob : jnp.ndarray, shape (n_discrete_states,)
                 Posterior discrete state probabilities
             marginal_log_likelihood : float
                 Posterior marginal log likelihood
         stack : tuple
-            collapsed_means : jnp.ndarray, shape (n_cont_states, n_discrete_states)
+            state_cond_filter_mean : jnp.ndarray, shape (n_cont_states, n_discrete_states)
                 Posterior state mean.
-            collapsed_covs : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
+            state_cond_filter_cov : jnp.ndarray, shape (n_cont_states, n_cont_states, n_discrete_states)
                 Posterior state covariance.
-            discrete_state_prob : jnp.ndarray, shape (n_discrete_states,)
+            filter_discrete_prob : jnp.ndarray, shape (n_discrete_states,)
                 Posterior discrete state probabilities
-            conditional_cont_means : jnp.ndarray, shape (n_cont_states, n_discrete_states, n_discrete_states)
+            pair_cond_filter_mean : jnp.ndarray, shape (n_cont_states, n_discrete_states, n_discrete_states)
                 Conditional means of the continuous latent state
         """
-        mean_prev, cov_prev, discrete_state_prob_prev, marginal_log_likelihood = carry
+        (
+            prev_state_cond_filter_mean,
+            prev_state_cond_filter_cov,
+            prev_filter_discrete_prob,
+            marginal_log_likelihood,
+        ) = carry
 
         # Kalman update for each pair of discrete states
         # P(x_t | y_{1:t}, S_t = j, S_{t-1} = i)
         # vmap twice over the discrete states
         (
-            conditional_cont_means,
-            conditional_cont_covs,
-            conditional_marginal_log_likelihood,
+            pair_cond_filter_mean,  # x^{ij}_{t|t}
+            pair_cond_filter_cov,  # V^{ij}_{t|t}
+            pair_cond_marginal_log_likelihood,  # log p(y_t | y_{1:t-1}, S_{t-1}=i, S_t=j)
         ) = _kalman_filter_update_per_discrete_state_pair(
-            mean_prev,
-            cov_prev,
-            obs_t,
-            continuous_transition_matrix,
-            process_cov,
-            measurement_matrix,
-            measurement_cov,
+            prev_state_cond_filter_mean,  # x^i_{t-1|t-1}
+            prev_state_cond_filter_cov,  # V^i_{t-1|t-1}
+            obs_t,  # y_t
+            continuous_transition_matrix,  # A
+            process_cov,  # Sigma
+            measurement_matrix,  # H
+            measurement_cov,  # R
         )
 
         # Make sure the likelihood is normalized to max 1 for numerical stability
-        conditional_marginal_likelihood, ll_max = _scale_likelihood(
-            conditional_marginal_log_likelihood
+        pair_cond_marginal_likelihood_scaled, ll_max = _scale_likelihood(
+            pair_cond_marginal_log_likelihood
         )
 
-        discrete_state_prob, discrete_state_weights, predictive_likelihood_term_sum = (
-            _update_discrete_state_probabilities(
-                conditional_marginal_likelihood,  # shape (n_discrete_states, n_discrete_states)
-                discrete_transition_matrix,  # shape (n_discrete_states, n_discrete_states)
-                discrete_state_prob_prev,  # shape (n_discrete_states,)
-            )
+        (
+            filter_discrete_prob,  # M_{t|t}(j) = P(S_t=j | y_{1:t})
+            filter_backward_cond_prob,  # P(S_{t-1}=i | S_t=j, y_{1:t})
+            predictive_likelihood_term_sum,  # Sum over i,j of unnormalized joint prob
+        ) = _update_discrete_state_probabilities(
+            pair_cond_marginal_likelihood_scaled,  # shape (n_discrete_states, n_discrete_states)
+            discrete_transition_matrix,  # P(S_t=j | S_{t-1}=i)
+            prev_filter_discrete_prob,  # M_{t-1|t-1}(i)
         )
 
         marginal_log_likelihood += ll_max + jnp.log(predictive_likelihood_term_sum)
 
-        # Collapse `n_discrete_states` x `n_discrete_states` Gaussians
-        # to `n_discrete_states` Gaussians
-        collapsed_means, collapsed_covs = collapse_gaussian_mixture_per_discrete_state(
-            conditional_cont_means,  # shape (n_cont_states, n_discrete_states, n_discrete_states)
-            conditional_cont_covs,  # shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
-            discrete_state_weights,  # shape (n_discrete_states, n_discrete_states)
+        # Collapse pair-conditional Gaussians P(x_t | ..., S_t=j, S_{t-1}=i)
+        # over S_{t-1}=i using weights P(S_{t-1}=i | S_t=j, y_{1:t})
+        # to get state-conditional Gaussians P(x_t | ..., S_t=j)
+        state_cond_filter_mean, state_cond_filter_cov = (
+            collapse_gaussian_mixture_per_discrete_state(
+                pair_cond_filter_mean,  # x^{ij}_{t|t}
+                pair_cond_filter_cov,  # V^{ij}_{t|t}
+                filter_backward_cond_prob,  # P(S_{t-1}=i | S_t=j, y_{1:t})
+            )
         )
 
         return (
-            collapsed_means,
-            collapsed_covs,
-            discrete_state_prob,
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_prob,
             marginal_log_likelihood,
         ), (
-            collapsed_means,
-            collapsed_covs,
-            discrete_state_prob,
-            conditional_cont_means,
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_prob,
+            pair_cond_filter_mean,
         )
 
-    marginal_log_likelihood = 0.0
+    marginal_log_likelihood = jnp.array(0.0)
     (_, _, _, marginal_log_likelihood), (
-        filter_mean,
-        filter_cov,
+        state_cond_filter_mean,
+        state_cond_filter_cov,
         filter_discrete_state_prob,
-        filter_conditional_cont_mean,
+        pair_cond_filter_mean,
     ) = jax.lax.scan(
         _step,
-        (init_mean, init_cov, init_discrete_state_prob, marginal_log_likelihood),
+        (
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            marginal_log_likelihood,
+        ),
         obs,
     )
 
     return (
-        filter_mean,
-        filter_cov,
+        state_cond_filter_mean,
+        state_cond_filter_cov,
         filter_discrete_state_prob,
-        filter_conditional_cont_mean[-1],
+        pair_cond_filter_mean[-1],
         marginal_log_likelihood,
     )
 
@@ -615,7 +638,9 @@ def switching_kalman_smoother(
     )
 
 
-def weighted_outer_sum(x: jnp.ndarray, y: jnp.ndarray, weights: jnp.ndarray):
+def weighted_sum_of_outer_products(
+    x: jnp.ndarray, y: jnp.ndarray, weights: jnp.ndarray
+) -> jnp.ndarray:
     """Compute the weighted outer sum of two arrays.
     Parameters
     ----------
@@ -628,7 +653,7 @@ def weighted_outer_sum(x: jnp.ndarray, y: jnp.ndarray, weights: jnp.ndarray):
 
     Returns
     -------
-    weighted_outer_sum: jnp.ndarray, shape (x_dims, y_dims, n_discrete_states)
+    weighted_sum_of_outer_products: jnp.ndarray, shape (x_dims, y_dims, n_discrete_states)
         Weighted outer sum of x and y.
     """
     return jnp.einsum("tcm, tdm, tm -> cdm", x, y, weights)
@@ -647,27 +672,36 @@ cov_solve_per_discrete_state = jax.vmap(
 
 def switching_kalman_maximization_step(
     obs: jnp.ndarray,
-    smoother_means,
-    smoother_covs,
-    smoother_discrete_state_prob,
-    smoother_joint_discrete_state_prob,
-    smoother_cross_cov,
-):
-    """Maximization step for the Kalman filter.
+    state_cond_smoother_means: jnp.ndarray,
+    state_cond_smoother_covs: jnp.ndarray,
+    smoother_discrete_state_prob: jnp.ndarray,
+    smoother_joint_discrete_state_prob: jnp.ndarray,
+    pair_cond_smoother_cross_cov: jnp.ndarray,
+) -> tuple[
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]:
+    """Maximization step for the switching Kalman filter.
 
     Parameters
     ----------
     obs : jnp.ndarray, shape (n_time, n_obs_dim)
         Observations.
-    smoother_means : jnp.ndarray, shape (n_time, n_cont_states, n_discrete_states)
+    state_cond_smoother_means : jnp.ndarray, shape (n_time, n_cont_states, n_discrete_states)
         smoother mean.
-    smoother_covs : jnp.ndarray, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
+    state_cond_smoother_covs : jnp.ndarray, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
         smoother covariance.
     smoother_discrete_state_prob : jnp.ndarray, shape (n_time, n_discrete_states)
         smoother discrete state probabilities.
     smoother_joint_discrete_state_prob : jnp.ndarray, shape (n_time - 1, n_discrete_states, n_discrete_states)
         smoother joint discrete state probabilities.
-    smoother_cross_cov : jnp.ndarray, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states)
+    pair_cond_smoother_cross_cov : jnp.ndarray, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         smoother cross-covariance.
 
     Returns
@@ -701,32 +735,48 @@ def switching_kalman_maximization_step(
 
     # Compute intermediate expectation terms
     gamma = jnp.sum(
-        smoother_covs * smoother_discrete_state_prob[:, None, None], axis=0
-    ) + weighted_outer_sum(smoother_means, smoother_means, smoother_discrete_state_prob)
-
-    delta = weighted_outer_sum(
-        obs[..., None], smoother_means, smoother_discrete_state_prob
+        state_cond_smoother_covs * smoother_discrete_state_prob[:, None, None], axis=0
+    ) + weighted_sum_of_outer_products(
+        state_cond_smoother_means,
+        state_cond_smoother_means,
+        smoother_discrete_state_prob,
     )
-    alpha = weighted_outer_sum(
+
+    delta = weighted_sum_of_outer_products(
+        obs[..., None], state_cond_smoother_means, smoother_discrete_state_prob
+    )
+    alpha = weighted_sum_of_outer_products(
         obs[..., None], obs[..., None], smoother_discrete_state_prob
     )
 
     last_gamma = (
-        smoother_covs[-1] * smoother_discrete_state_prob[-1, None, None]
-    ) + weighted_outer_sum(
-        smoother_means[[-1]], smoother_means[[-1]], smoother_discrete_state_prob[[-1]]
+        state_cond_smoother_covs[-1] * smoother_discrete_state_prob[-1, None, None]
+    ) + weighted_sum_of_outer_products(
+        state_cond_smoother_means[[-1]],
+        state_cond_smoother_means[[-1]],
+        smoother_discrete_state_prob[[-1]],
     )
     first_gamma = (
-        smoother_covs[0] * smoother_discrete_state_prob[0, None, None]
-    ) + weighted_outer_sum(
-        smoother_means[[0]], smoother_means[[0]], smoother_discrete_state_prob[[0]]
+        state_cond_smoother_covs[0] * smoother_discrete_state_prob[0, None, None]
+    ) + weighted_sum_of_outer_products(
+        state_cond_smoother_means[[0]],
+        state_cond_smoother_means[[0]],
+        smoother_discrete_state_prob[[0]],
     )
     gamma1 = gamma - last_gamma
     gamma2 = gamma - first_gamma
 
-    beta = jnp.swapaxes(
-        smoother_cross_cov * smoother_discrete_state_prob[1:, None, None], 1, 2
-    ).sum(axis=0)
+    # beta = jnp.swapaxes(
+    #     pair_cond_smoother_cross_cov * smoother_discrete_state_prob[1:, None, None],
+    #     1,
+    #     2,
+    # ).sum(axis=0)
+
+    beta = jnp.einsum(
+        "tij,tcdij->cdi",
+        smoother_joint_discrete_state_prob,
+        pair_cond_smoother_cross_cov,
+    )
 
     # gamma: (n_cont_states, n_cont_states, n_discrete_states)
     # beta: (n_cont_states, n_cont_states, n_discrete_states)
@@ -748,23 +798,30 @@ def switching_kalman_maximization_step(
         gamma2, continuous_transition_matrix, beta, n_time_1
     )
     # Initial mean and covariance
-    init_mean = smoother_means[0]
-    init_cov = smoother_covs[0]
+    init_state_cond_mean = state_cond_smoother_means[0]
+    init_state_cond_cov = state_cond_smoother_covs[0]
 
     # Discrete transition matrix
-    discrete_state_transition = smoother_joint_discrete_state_prob.sum(
-        axis=0
-    ) / smoother_discrete_state_prob[:-1].sum(axis=0)
+    discrete_state_transition = (
+        smoother_joint_discrete_state_prob.sum(
+            axis=0,
+        )
+        / smoother_discrete_state_prob[:-1].sum(axis=0)[:, None]
+    )
+    # Ensure the discrete transition matrix is normalized
+    # so that each row sums to 1
+    discrete_state_transition /= discrete_state_transition.sum(axis=1, keepdims=True)
 
     init_discrete_state_prob = smoother_discrete_state_prob[0]
+    init_discrete_state_prob /= jnp.sum(init_discrete_state_prob)
 
     return (
         continuous_transition_matrix,
         measurement_matrix,
         process_cov,
         measurement_cov,
-        init_mean,
-        init_cov,
+        init_state_cond_mean,
+        init_state_cond_cov,
         discrete_state_transition,
         init_discrete_state_prob,
     )
