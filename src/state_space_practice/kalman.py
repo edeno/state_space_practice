@@ -37,7 +37,6 @@ def symmetrize(A):
     DeviceArray([[1., 2.5],
                  [2.5, 4.]], dtype=float32)
     """
-    """Symmetrize one or more matrices."""
     return 0.5 * (A + jnp.swapaxes(A, -1, -2))
 
 
@@ -331,7 +330,7 @@ def kalman_smoother(
     return smoother_mean, smoother_cov, smoother_cross_cov, marginal_log_likelihood
 
 
-def outer_sum(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+def sum_of_outer_products(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
     """
     Compute the sum of outer products between corresponding vectors in two sequences.
 
@@ -346,7 +345,7 @@ def outer_sum(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
 
     Returns
     -------
-    outer_sum : np.ndarray, shape (N, M)
+    sum_of_outer_products : np.ndarray, shape (N, M)
     """
     return x.T @ y
 
@@ -396,14 +395,16 @@ def kalman_maximization_step(
     n_time = obs.shape[0]
 
     # Compute intermediate expectation terms
-    gamma = jnp.sum(smoother_cov, axis=0) + outer_sum(smoother_mean, smoother_mean)
-    delta = outer_sum(obs, smoother_mean)
-    alpha = outer_sum(obs, obs)
+    gamma = jnp.sum(smoother_cov, axis=0) + sum_of_outer_products(
+        smoother_mean, smoother_mean
+    )
+    delta = sum_of_outer_products(obs, smoother_mean)
+    alpha = sum_of_outer_products(obs, obs)
     gamma1 = gamma - jnp.outer(smoother_mean[-1], smoother_mean[-1]) - smoother_cov[-1]
     gamma2 = gamma - jnp.outer(smoother_mean[0], smoother_mean[0]) - smoother_cov[0]
     beta = (
         smoother_cross_cov.sum(axis=0)
-        + outer_sum(smoother_mean[:-1], smoother_mean[1:])
+        + sum_of_outer_products(smoother_mean[:-1], smoother_mean[1:])
     ).T
 
     # Measurement matrix and covariance
