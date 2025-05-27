@@ -331,7 +331,7 @@ def kalman_smoother(
     return smoother_mean, smoother_cov, smoother_cross_cov, marginal_log_likelihood
 
 
-def outer_sum(x, y):
+def outer_sum(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
     """
     Compute the sum of outer products between corresponding vectors in two sequences.
 
@@ -356,7 +356,9 @@ def kalman_maximization_step(
     smoother_mean: jnp.ndarray,
     smoother_cov: jnp.ndarray,
     smoother_cross_cov: jnp.ndarray,
-):
+) -> tuple[
+    jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray
+]:
     """Maximization step for the Kalman filter.
 
     Parameters
