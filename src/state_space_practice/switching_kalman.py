@@ -119,6 +119,18 @@ collapse_cross_gaussian_mixture_across_states = jax.vmap(
 )
 
 
+def _divide_safe(numerator: jnp.ndarray, denominator: jnp.ndarray) -> jnp.ndarray:
+    """Divides two arrays, while setting the result to 0.0
+    if the denominator is 0.0.
+
+    Parameters
+    ----------
+    numerator : jnp.ndarray
+    denominator : jnp.ndarray
+    """
+    return jnp.where(denominator == 0.0, 0.0, numerator / denominator)
+
+
 def _update_discrete_state_probabilities(
     pair_cond_marginal_likelihood_scaled: jnp.ndarray,
     discrete_transition_matrix: jnp.ndarray,
@@ -151,13 +163,16 @@ def _update_discrete_state_probabilities(
         * prev_filter_discrete_prob[:, None]  # M_{t-1|t-1}(i)
     )
     predictive_likelihood_term_sum = jnp.sum(joint_discrete_state_prob)
-    joint_discrete_state_prob /= jnp.sum(joint_discrete_state_prob)
+
+    joint_discrete_state_prob = _divide_safe(
+        joint_discrete_state_prob, predictive_likelihood_term_sum
+    )
 
     # M_{t|t}(j) = Pr(S_t=j | y_{1:t})
     filter_discrete_prob = jnp.sum(joint_discrete_state_prob, axis=0)
     # W^{i|j} = Pr(S_{t-1}=i | S_t=j, y_{1:t})
-    filter_backward_cond_prob = (
-        joint_discrete_state_prob / filter_discrete_prob[None, :]
+    filter_backward_cond_prob = _divide_safe(
+        joint_discrete_state_prob, filter_discrete_prob[None, :]
     )
 
     return (
