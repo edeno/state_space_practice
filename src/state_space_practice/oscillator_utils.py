@@ -89,7 +89,12 @@ def _compute_coupled_oscillator_block(
     sum_incoming_coupling_strength: float,
     sampling_freq: float = 1.0,
 ) -> jax.Array:
-    """Compute the diagonal block of the transition matrix for the coupled model
+    """Compute the diagonal block of the transition matrix for the coupled model.
+
+    This block represents the intrinsic oscillation of an oscillator,
+    adjusted by the sum of incoming coupling strengths from other oscillators.
+
+    This is similar to partial directed coherence.
 
     Parameters
     ----------
@@ -178,6 +183,9 @@ def construct_common_oscillator_transition_matrix(
         raise ValueError(
             "auto_regressive_coef must be a 1D array of shape (n_oscillators,)"
         )
+    if jnp.any(jnp.logical_or(auto_regressive_coef > 1, auto_regressive_coef < 0)):
+        raise ValueError("Auto-regressive coefficients must be between 0 and 1")
+
     diag_blocks = [
         _compute_intrinsic_oscillation_block(
             oscillation_freq=freqs[k],
@@ -193,7 +201,6 @@ def construct_common_oscillator_transition_matrix(
 def construct_common_oscillator_process_covariance(
     variance: jax.Array,
 ) -> jax.Array:
-    pass
     """Constructs the process covariance matrix for a common oscillator model.
 
     The process covariance matrix ($$ \\Sigma $$) is a block diagonal matrix with each block
@@ -548,7 +555,6 @@ def project_coupled_transition_matrix(transition_matrix: jax.Array) -> jax.Array
                     + row_sum_scaling[from_oscillator] * IDENTITY_2x2
                 )
                 # Subtract the adjustment term
-                # Need to double check!
                 projected_block = (
                     projected_modified_block
                     - row_sum_scaling[from_oscillator] * IDENTITY_2x2
