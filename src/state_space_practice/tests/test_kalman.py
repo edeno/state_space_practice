@@ -268,19 +268,19 @@ def multi_dim_model() -> Tuple[
 
     Returns
     -------
-    init_mean : jnp.ndarray
+    init_mean : jax.Array
         Initial state mean (N,).
-    init_cov : jnp.ndarray
+    init_cov : jax.Array
         Initial state covariance (N, N).
-    obs : jnp.ndarray
+    obs : jax.Array
         Simulated observations (T, O).
-    A : jnp.ndarray
+    A : jax.Array
         Transition matrix (N, N).
-    Q : jnp.ndarray
+    Q : jax.Array
         Process noise covariance (N, N).
-    H : jnp.ndarray
+    H : jax.Array
         Observation matrix (O, N).
-    R : jnp.ndarray
+    R : jax.Array
         Observation noise covariance (O, O).
     """
     key = random.PRNGKey(123)

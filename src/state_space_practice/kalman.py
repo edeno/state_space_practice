@@ -23,18 +23,18 @@ import jax.scipy.stats.multivariate_normal
 from jax import typing
 
 
-def symmetrize(A: jnp.ndarray) -> jnp.ndarray:
+def symmetrize(A: jax.Array) -> jax.Array:
     """Symmetrize one or more matrices by averaging each matrix with its transpose.
 
     Parameters
     ----------
-    A : jnp.ndarray
+    A : jax.Array
         A matrix or a batch of matrices to be symmetrized. The last two
         dimensions should be square matrices.
 
     Returns
     -------
-    jnp.ndarray
+    jax.Array
         The symmetrized matrix or batch of matrices, where each output matrix
         is (A + A.T) / 2.
 
@@ -50,9 +50,7 @@ def symmetrize(A: jnp.ndarray) -> jnp.ndarray:
     return 0.5 * (A + jnp.swapaxes(A, -1, -2))
 
 
-def psd_solve(
-    A: jnp.ndarray, b: jnp.ndarray, diagonal_boost: float = 1e-9
-) -> jnp.ndarray:
+def psd_solve(A: jax.Array, b: jax.Array, diagonal_boost: float = 1e-9) -> jax.Array:
     """Solves a linear system Ax = b for positive semi-definite (PSD) matrices A.
 
     This function wraps a linear algebra solver, ensuring numerical stability
@@ -62,9 +60,9 @@ def psd_solve(
 
     Parameters
     ----------
-    A : jnp.ndarray
+    A : jax.Array
         The coefficient matrix, expected to be positive semi-definite.
-    b : jnp.ndarray
+    b : jax.Array
         The right-hand side vector or matrix.
     diagonal_boost : float, optional
         Small value added to the diagonal of A to improve numerical
@@ -72,7 +70,7 @@ def psd_solve(
 
     Returns
     -------
-    jnp.ndarray
+    jax.Array
         The solution x to the linear system Ax = b.
 
     """
@@ -85,38 +83,38 @@ def psd_solve(
 
 @jax.jit
 def _kalman_filter_update(
-    mean_prev: jnp.ndarray,
-    cov_prev: jnp.ndarray,
-    obs: jnp.ndarray,
-    transition_matrix: jnp.ndarray,
-    process_cov: jnp.ndarray,
-    measurement_matrix: jnp.ndarray,
-    measurement_cov: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, float]:
+    mean_prev: jax.Array,
+    cov_prev: jax.Array,
+    obs: jax.Array,
+    transition_matrix: jax.Array,
+    process_cov: jax.Array,
+    measurement_matrix: jax.Array,
+    measurement_cov: jax.Array,
+) -> tuple[jax.Array, jax.Array, float]:
     """Performs a single update step of the Kalman filter.
 
     Parameters
     ----------
-    mean_prev : jnp.ndarray, shape (n_cont_states,)
+    mean_prev : jax.Array, shape (n_cont_states,)
         Previous state mean, $$ m_{t-1} $$.
-    cov_prev : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    cov_prev : jax.Array, shape (n_cont_states, n_cont_states)
         Previous state covariance, $$ P_{t-1} $$.
-    obs : jnp.ndarray, shape (n_obs_dim,)
+    obs : jax.Array, shape (n_obs_dim,)
         Data observation, $$ y_t $$.
-    transition_matrix : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    transition_matrix : jax.Array, shape (n_cont_states, n_cont_states)
         State transition matrix, $$ A $$.
-    process_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    process_cov : jax.Array, shape (n_cont_states, n_cont_states)
         State noise covariance, $$ \Sigma $$.
-    measurement_matrix : jnp.ndarray, shape (n_obs_dim, n_cont_states)
+    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
         Observation matrix, $$ H $$.
-    measurement_cov : jnp.ndarray, shape (n_obs_dim, n_obs_dim)
+    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
         Observation noise covariance, $$ R $$.
 
     Returns
     -------
-    posterior_mean : jnp.ndarray, shape (n_cont_states,)
+    posterior_mean : jax.Array, shape (n_cont_states,)
         Posterior state mean, $$ m_t $$.
-    posterior_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    posterior_cov : jax.Array, shape (n_cont_states, n_cont_states)
         Posterior state covariance, $$ P_t $$.
     marginal_log_likelihood : float
         Log-likelihood of the observation, $$ \log p(y_t | y_{1:t-1}) $$.
@@ -159,38 +157,38 @@ def _kalman_filter_update(
 
 @jax.jit
 def kalman_filter(
-    init_mean: jnp.ndarray,
-    init_cov: jnp.ndarray,
-    obs: jnp.ndarray,
-    transition_matrix: jnp.ndarray,
-    process_cov: jnp.ndarray,
-    measurement_matrix: jnp.ndarray,
-    measurement_cov: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, float]:
+    init_mean: jax.Array,
+    init_cov: jax.Array,
+    obs: jax.Array,
+    transition_matrix: jax.Array,
+    process_cov: jax.Array,
+    measurement_matrix: jax.Array,
+    measurement_cov: jax.Array,
+) -> tuple[jax.Array, jax.Array, float]:
     """Applies the Kalman filter to a sequence of observations.
 
     Parameters
     ----------
-    init_mean : jnp.ndarray, shape (n_cont_states,)
+    init_mean : jax.Array, shape (n_cont_states,)
         Initial state mean, $$ m_0 $$.
-    init_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    init_cov : jax.Array, shape (n_cont_states, n_cont_states)
         Initial state covariance, $$ P_0 $$.
-    obs : jnp.ndarray, shape (n_time, n_obs_dim)
+    obs : jax.Array, shape (n_time, n_obs_dim)
         Sequence of observations, $$ y_{1:T} $$.
-    transition_matrix : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    transition_matrix : jax.Array, shape (n_cont_states, n_cont_states)
         State transition matrix, $$ A $$.
-    process_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    process_cov : jax.Array, shape (n_cont_states, n_cont_states)
         State noise covariance, $$ \Sigma $$.
-    measurement_matrix : jnp.ndarray, shape (n_obs_dim, n_cont_states)
+    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
         Observation matrix, $$ H $$.
-    measurement_cov : jnp.ndarray, shape (n_obs_dim, n_obs_dim)
+    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
         Observation noise covariance, $$ R $$.
 
     Returns
     -------
-    filtered_mean : jnp.ndarray, shape (n_time, n_cont_states)
+    filtered_mean : jax.Array, shape (n_time, n_cont_states)
         Filtered state means, $$ m_{1:T} $$.
-    filtered_cov : jnp.ndarray, shape (n_time, n_cont_states, n_cont_states)
+    filtered_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states)
         Filtered state covariances, $$ P_{1:T} $$.
     marginal_log_likelihood : float
         Total log likelihood of the observations, $$ \sum_{t=1}^T \log p(y_t | y_{1:t-1}) $$.
@@ -233,37 +231,37 @@ def kalman_filter(
 
 @jax.jit
 def _kalman_smoother_update(
-    next_smoother_mean: jnp.ndarray,
-    next_smoother_cov: jnp.ndarray,
-    filter_mean: jnp.ndarray,
-    filter_cov: jnp.ndarray,
-    process_cov: jnp.ndarray,
-    transition_matrix: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    next_smoother_mean: jax.Array,
+    next_smoother_cov: jax.Array,
+    filter_mean: jax.Array,
+    filter_cov: jax.Array,
+    process_cov: jax.Array,
+    transition_matrix: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Performs a single backward update step of the RTS smoother.
 
     Parameters
     ----------
-    next_smoother_mean : jnp.ndarray, shape (n_cont_states,)
+    next_smoother_mean : jax.Array, shape (n_cont_states,)
         Smoothed mean from the next time step, $$ m_{t+1|T} $$.
-    next_smoother_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    next_smoother_cov : jax.Array, shape (n_cont_states, n_cont_states)
         Smoothed covariance from the next time step, $$ P_{t+1|T} $$.
-    filter_mean : jnp.ndarray, shape (n_cont_states,)
+    filter_mean : jax.Array, shape (n_cont_states,)
         Filtered mean from the current time step, $$ m_{t|t} $$.
-    filter_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    filter_cov : jax.Array, shape (n_cont_states, n_cont_states)
         Filtered covariance from the current time step, $$ P_{t|t} $$.
-    process_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    process_cov : jax.Array, shape (n_cont_states, n_cont_states)
         State noise covariance, $$ \Sigma $$.
-    transition_matrix : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    transition_matrix : jax.Array, shape (n_cont_states, n_cont_states)
         State transition matrix, $$ A $$.
 
     Returns
     -------
-    smoother_mean : jnp.ndarray, shape (n_cont_states,)
+    smoother_mean : jax.Array, shape (n_cont_states,)
         Smoothed state mean, $$ m_{t|T} $$.
-    smoother_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    smoother_cov : jax.Array, shape (n_cont_states, n_cont_states)
         Smoothed state covariance, $$ P_{t|T} $$.
-    smoother_cross_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    smoother_cross_cov : jax.Array, shape (n_cont_states, n_cont_states)
         Smoothed cross-covariance, $$ P_{t, t+1|T} $$.
 
     """
@@ -296,40 +294,40 @@ def _kalman_smoother_update(
 
 @jax.jit
 def kalman_smoother(
-    init_mean: jnp.ndarray,
-    init_cov: jnp.ndarray,
-    obs: jnp.ndarray,
-    transition_matrix: jnp.ndarray,
-    process_cov: jnp.ndarray,
-    measurement_matrix: jnp.ndarray,
-    measurement_cov: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, float]:
+    init_mean: jax.Array,
+    init_cov: jax.Array,
+    obs: jax.Array,
+    transition_matrix: jax.Array,
+    process_cov: jax.Array,
+    measurement_matrix: jax.Array,
+    measurement_cov: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, float]:
     """Applies the Rauch-Tung-Striebel (RTS) smoother.
 
     Parameters
     ----------
-    init_mean : jnp.ndarray, shape (n_cont_states,)
+    init_mean : jax.Array, shape (n_cont_states,)
         Initial state mean, $$ m_0 $$.
-    init_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    init_cov : jax.Array, shape (n_cont_states, n_cont_states)
         Initial state covariance, $$ P_0 $$.
-    obs : jnp.ndarray, shape (n_time, n_obs_dim)
+    obs : jax.Array, shape (n_time, n_obs_dim)
         Sequence of observations, $$ y_{1:T} $$.
-    transition_matrix : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    transition_matrix : jax.Array, shape (n_cont_states, n_cont_states)
         State transition matrix, $$ A $$.
-    process_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    process_cov : jax.Array, shape (n_cont_states, n_cont_states)
         State noise covariance, $$ \Sigma $$.
-    measurement_matrix : jnp.ndarray, shape (n_obs_dim, n_cont_states)
+    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
         Observation matrix, $$ H $$.
-    measurement_cov : jnp.ndarray, shape (n_obs_dim, n_obs_dim)
+    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
         Observation noise covariance, $$ R $$.
 
     Returns
     -------
-    smoother_mean : jnp.ndarray, shape (n_time, n_cont_states)
+    smoother_mean : jax.Array, shape (n_time, n_cont_states)
         Smoothed state means, $$ m_{1:T|T} $$.
-    smoother_cov : jnp.ndarray, shape (n_time, n_cont_states, n_cont_states)
+    smoother_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states)
         Smoothed state covariances, $$ P_{1:T|T} $$.
-    smoother_cross_cov : jnp.ndarray, shape (n_time - 1, n_cont_states, n_cont_states)
+    smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states)
         Smoothed cross-covariances, $$ P_{t, t+1|T} $$.
     marginal_log_likelihood : float
         Total log likelihood of the observations.
@@ -346,11 +344,9 @@ def kalman_smoother(
     )
 
     def _step(
-        carry: tuple[jnp.ndarray, jnp.ndarray],
-        args: tuple[jnp.ndarray, jnp.ndarray],
-    ) -> tuple[
-        tuple[jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
-    ]:
+        carry: tuple[jax.Array, jax.Array],
+        args: tuple[jax.Array, jax.Array],
+    ) -> tuple[tuple[jax.Array, jax.Array], tuple[jax.Array, jax.Array, jax.Array]]:
         """Helper function for `jax.lax.scan` backward pass."""
         (
             next_smoother_mean,
@@ -390,21 +386,21 @@ def kalman_smoother(
     return smoother_mean, smoother_cov, smoother_cross_cov, marginal_log_likelihood
 
 
-def sum_of_outer_products(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+def sum_of_outer_products(x: jax.Array, y: jax.Array) -> jax.Array:
     """Compute the sum of outer products between corresponding vectors.
 
     Computes $$ S = \sum_{t=1}^T x_t y_t^T $$.
 
     Parameters
     ----------
-    x : jnp.ndarray, shape (T, N)
+    x : jax.Array, shape (T, N)
         First sequence of vectors.
-    y : jnp.ndarray, shape (T, M)
+    y : jax.Array, shape (T, M)
         Second sequence of vectors.
 
     Returns
     -------
-    jnp.ndarray, shape (N, M)
+    jax.Array, shape (N, M)
         The sum of outer products.
 
     """
@@ -412,13 +408,11 @@ def sum_of_outer_products(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
 
 
 def kalman_maximization_step(
-    obs: jnp.ndarray,
-    smoother_mean: jnp.ndarray,
-    smoother_cov: jnp.ndarray,
-    smoother_cross_cov: jnp.ndarray,
-) -> tuple[
-    jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray
-]:
+    obs: jax.Array,
+    smoother_mean: jax.Array,
+    smoother_cov: jax.Array,
+    smoother_cross_cov: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Performs the Maximization (M) step of the EM algorithm for Kalman filters.
 
     Updates the model parameters based on the expected sufficient statistics
@@ -426,28 +420,28 @@ def kalman_maximization_step(
 
     Parameters
     ----------
-    obs : jnp.ndarray, shape (n_time, n_obs_dim)
+    obs : jax.Array, shape (n_time, n_obs_dim)
         Observations, $$ y_{1:T} $$.
-    smoother_mean : jnp.ndarray, shape (n_time, n_cont_states)
+    smoother_mean : jax.Array, shape (n_time, n_cont_states)
         Smoothed means, $$ m_{1:T|T} $$.
-    smoother_cov : jnp.ndarray, shape (n_time, n_cont_states, n_cont_states)
+    smoother_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states)
         Smoothed covariances, $$ P_{1:T|T} $$.
-    smoother_cross_cov : jnp.ndarray, shape (n_time - 1, n_cont_states, n_cont_states)
+    smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states)
         Smoothed cross-covariances, $$ P_{t, t+1|T} $$.
 
     Returns
     -------
-    transition_matrix : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    transition_matrix : jax.Array, shape (n_cont_states, n_cont_states)
         Updated transition matrix, $$ A $$.
-    measurement_matrix : jnp.ndarray, shape (n_obs_dim, n_cont_states)
+    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
         Updated measurement matrix, $$ H $$.
-    process_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    process_cov : jax.Array, shape (n_cont_states, n_cont_states)
         Updated process covariance, $$ \Sigma $$.
-    measurement_cov : jnp.ndarray, shape (n_obs_dim, n_obs_dim)
+    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
         Updated measurement covariance, $$ R $$.
-    init_mean : jnp.ndarray, shape (n_cont_states,)
+    init_mean : jax.Array, shape (n_cont_states,)
         Updated initial mean, $$ m_1 $$.
-    init_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    init_cov : jax.Array, shape (n_cont_states, n_cont_states)
         Updated initial covariance, $$ P_1 $$.
 
     References
