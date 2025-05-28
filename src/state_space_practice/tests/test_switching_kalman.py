@@ -362,6 +362,13 @@ def test_weighted_sum_of_outer_products() -> None:
     assert result.shape == (N, N, M)
     np.testing.assert_allclose(result, expected, rtol=1e-6)
 
+    expected = jnp.zeros((N, N, M))
+    for t in range(T):
+        for s in range(M):
+            outer_prod = weights[t, s] * jnp.outer(x[t, :, s], y[t, :, s])
+            expected = expected.at[:, :, s].add(outer_prod)
+    np.testing.assert_allclose(result, expected, rtol=1e-6, atol=1e-6)
+
 
 # --- Integration Tests: Filter and Smoother ---
 

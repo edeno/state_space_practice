@@ -141,6 +141,11 @@ def test_sum_of_outer_products() -> None:
     out = sum_of_outer_products(x, y)
     np.testing.assert_allclose(out, expected, rtol=1e-6)
 
+    expected = jnp.zeros((x.shape[1], y.shape[1]))
+    for i in range(x.shape[0]):
+        expected += jnp.outer(x[i], y[i])
+    np.testing.assert_allclose(out, expected, rtol=1e-6)
+
 
 def test_kalman_filter_values() -> None:
     """Tests Kalman filter output values against a hand-calculated example."""
