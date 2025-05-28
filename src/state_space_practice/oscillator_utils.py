@@ -358,7 +358,7 @@ def construct_directed_influence_transition_matrix(
                     _compute_coupled_oscillator_block(
                         freq=freqs[from_oscillator],
                         auto_regressive_coef=damping_coeffs[from_oscillator],
-                        sum_incoming_coupling=sum_incoming_coupling,
+                        sum_incoming_coupling_strength=sum_incoming_coupling,
                         sampling_freq=sampling_freq,
                     )
                 )
