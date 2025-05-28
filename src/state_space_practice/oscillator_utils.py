@@ -344,21 +344,17 @@ def construct_directed_influence_transition_matrix(
 
     # 2. Vmap _compute_coupling_transition_block for off-diagonals
     # We create a function that computes A_j^{n1, n2}
-    vmap_coupling_row = jax.vmap(
+    coupling_row = jax.vmap(
         _compute_coupling_transition_block, in_axes=(0, 0)
     )  # Vmap over columns (n2)
-    vmap_coupling_all = jax.vmap(
-        vmap_coupling_row, in_axes=(0, 0)
-    )  # Vmap over rows (n1)
+    coupling_all = jax.vmap(coupling_row, in_axes=(0, 0))  # Vmap over rows (n1)
 
-    all_coupling_blocks = vmap_coupling_all(phase_diffs, coupling_strengths)
+    all_coupling_blocks = coupling_all(phase_diffs, coupling_strengths)
     # Shape: (n_oscillators, n_oscillators, 2, 2)
 
     # 3. Vmap _compute_coupled_oscillator_block for diagonals
-    vmap_diag = jax.vmap(_compute_coupled_oscillator_block, in_axes=(0, 0, 0, None))
-    all_diag_blocks = vmap_diag(
-        freqs, damping_coeffs, sum_incoming_coupling, sampling_freq
-    )
+    diag = jax.vmap(_compute_coupled_oscillator_block, in_axes=(0, 0, 0, None))
+    all_diag_blocks = diag(freqs, damping_coeffs, sum_incoming_coupling, sampling_freq)
     # Shape: (n_oscillators, 2, 2)
 
     # 4. Combine: Replace diagonal blocks in all_coupling_blocks
