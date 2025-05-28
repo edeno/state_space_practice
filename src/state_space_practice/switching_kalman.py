@@ -465,7 +465,16 @@ def switching_kalman_smoother(
     process_cov: jax.Array,
     continuous_transition_matrix: jax.Array,
     discrete_state_transition_matrix: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[
+    jax.Array,  # Overall smoother mean
+    jax.Array,  # Overall smoother covariance
+    jax.Array,  # Smoother discrete state probabilities
+    jax.Array,  # Smoother joint discrete state probabilities
+    jax.Array,  # Overall smoother cross covariance
+    jax.Array,  # State conditional smoother means
+    jax.Array,  # State conditional smoother covariances
+    jax.Array,  # Pair conditional smoother cross covariances
+]:
     """Switching Kalman smoother for a linear Gaussian state space model with discrete states.
 
     Parameters
@@ -485,6 +494,9 @@ def switching_kalman_smoother(
     smoother_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
     smoother_joint_discrete_state_prob : jax.Array, shape (n_time - 1, n_discrete_states, n_discrete_states)
     overall_smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states)
+    state_cond_smoother_means : jax.Array, shape (n_time, n_cont_states, n_discrete_states)
+    state_cond_smoother_covs : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
+    pair_cond_smoother_cross_covs : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
     """
 
     def _step(
@@ -657,9 +669,6 @@ def switching_kalman_smoother(
     state_cond_smoother_covs = jnp.concatenate(
         [state_cond_smoother_covs, filter_cov[-1][None]], axis=0
     )
-    smoother_discrete_state_prob = jnp.concatenate(
-        [smoother_discrete_state_prob, filter_discrete_state_prob[-1][None]], axis=0
-    )
 
     return (
         overall_smoother_mean,
@@ -787,31 +796,19 @@ def switching_kalman_maximization_step(
     last_gamma = (
         state_cond_smoother_covs[-1] * smoother_discrete_state_prob[-1, None, None]
     ) + weighted_sum_of_outer_products(
-        state_cond_smoother_means[[-1]],
-        state_cond_smoother_means[[-1]],
-        smoother_discrete_state_prob[[-1]],
+        state_cond_smoother_means[-1:],
+        state_cond_smoother_means[-1:],
+        smoother_discrete_state_prob[-1:],
     )
     first_gamma = (
         state_cond_smoother_covs[0] * smoother_discrete_state_prob[0, None, None]
     ) + weighted_sum_of_outer_products(
-        state_cond_smoother_means[[0]],
-        state_cond_smoother_means[[0]],
-        smoother_discrete_state_prob[[0]],
+        state_cond_smoother_means[:1],
+        state_cond_smoother_means[:1],
+        smoother_discrete_state_prob[:1],
     )
     gamma1 = gamma - last_gamma
     gamma2 = gamma - first_gamma
-
-    # beta = jnp.swapaxes(
-    #     pair_cond_smoother_cross_cov * smoother_discrete_state_prob[1:, None, None],
-    #     1,
-    #     2,
-    # ).sum(axis=0)
-
-    beta = jnp.einsum(
-        "tij,tcdij->cdi",
-        smoother_joint_discrete_state_prob,
-        pair_cond_smoother_cross_cov,
-    )
 
     # gamma: (n_cont_states, n_cont_states, n_discrete_states)
     # beta: (n_cont_states, n_cont_states, n_discrete_states)
@@ -825,6 +822,26 @@ def switching_kalman_maximization_step(
         alpha, measurement_matrix, delta, n_time
     )
 
+    # beta = jnp.einsum(
+    #     "tij,tcdij->cdi",
+    #     smoother_joint_discrete_state_prob,
+    #     pair_cond_smoother_cross_cov,
+    # ).T + weighted_sum_of_outer_products(
+    #     state_cond_smoother_means[:-1],
+    #     state_cond_smoother_means[1:],
+    #     smoother_discrete_state_prob[:-1],
+    # )
+    beta = jnp.einsum(
+        "tij,tcdij->cdi",  # c,d are cont_dims, i is S_k state
+        smoother_joint_discrete_state_prob,  # P(S_k=i, S_{k+1}=j)
+        pair_cond_smoother_cross_cov,  # E[x_k x_{k+1}^T | S_k=i, S_{k+1}=j]
+    )
+    beta = jnp.swapaxes(beta, 0, 1)
+    beta += weighted_sum_of_outer_products(
+        state_cond_smoother_means[:-1],  # E[x_k | S_k=i]
+        state_cond_smoother_means[1:],  # E[x_{k+1} | S_{k+1}=j]
+        smoother_discrete_state_prob[:-1],  # P(S_k=i)
+    )
     # Transition matrix
     continuous_transition_matrix = psd_solve_per_discrete_state(gamma1, beta)
 
@@ -832,6 +849,7 @@ def switching_kalman_maximization_step(
     process_cov = cov_solve_per_discrete_state(
         gamma2, continuous_transition_matrix, beta, n_time_1
     )
+
     # Initial mean and covariance
     init_state_cond_mean = state_cond_smoother_means[0]
     init_state_cond_cov = state_cond_smoother_covs[0]

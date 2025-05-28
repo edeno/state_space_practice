@@ -14,7 +14,11 @@ import pytest
 from jax import Array, random
 from jax.nn import one_hot
 
-from state_space_practice.kalman import kalman_filter, kalman_smoother
+from state_space_practice.kalman import (
+    kalman_filter,
+    kalman_maximization_step,
+    kalman_smoother,
+)
 from state_space_practice.switching_kalman import (
     _kalman_filter_update_per_discrete_state_pair,
     _kalman_smoother_update_per_discrete_state_pair,
@@ -26,6 +30,7 @@ from state_space_practice.switching_kalman import (
     collapse_gaussian_mixture_over_next_discrete_state,
     collapse_gaussian_mixture_per_discrete_state,
     switching_kalman_filter,
+    switching_kalman_maximization_step,
     switching_kalman_smoother,
     weighted_sum_of_outer_products,
 )
@@ -504,7 +509,6 @@ def test_skf_smoother_reduces_to_kf_smoother_single_state(
         skf_H,
         skf_R,
     )
-
     (
         skf_sm,
         skf_sc,
@@ -513,7 +517,7 @@ def test_skf_smoother_reduces_to_kf_smoother_single_state(
         skf_scc,
         skf_scsm,
         skf_sccs,
-        _,
+        skf_pcscc,
     ) = switching_kalman_smoother(
         filter_mean=skf_fm,
         filter_cov=skf_fc,
@@ -532,6 +536,7 @@ def test_skf_smoother_reduces_to_kf_smoother_single_state(
     np.testing.assert_allclose(skf_sjp, 1.0, rtol=1e-5)
     np.testing.assert_allclose(skf_scsm.squeeze(), skf_sm.squeeze(), rtol=1e-5)
     np.testing.assert_allclose(skf_sccs.squeeze(), skf_sc.squeeze(), rtol=1e-5)
+    np.testing.assert_allclose(skf_pcscc.squeeze(), skf_scc.squeeze(), rtol=1e-5)
 
 
 def test_skf_deterministic_stay(simple_skf_model: tuple) -> None:
@@ -590,3 +595,243 @@ def test_skf_deterministic_switch(simple_skf_model: tuple) -> None:
     expected_p = one_hot(indices, 2, dtype=filt_p.dtype)
 
     np.testing.assert_allclose(filt_p, expected_p, atol=1e-2, rtol=1e-2)
+
+
+def test_m_step_one_state(
+    simple_1d_model: tuple,
+) -> None:
+    """Tests the M-step of the EM algorithm for a single-state model
+    matches the standard KF M-step."""
+    (
+        init_mean,
+        init_cov,
+        obs,
+        A,
+        Q,
+        H,
+        R,
+    ) = simple_1d_model
+
+    kf_sm, kf_sc, kf_scc, kf_mll = kalman_smoother(init_mean, init_cov, obs, A, Q, H, R)
+
+    (
+        kf_new_A,
+        kf_new_H,
+        kf_new_Q,
+        kf_new_R,
+        kf_new_init_mean,
+        kf_new_init_cov,
+    ) = kalman_maximization_step(
+        obs,
+        kf_sm,
+        kf_sc,
+        kf_scc,
+    )
+
+    skf_init_mean = init_mean[:, None]
+    skf_init_cov = init_cov[..., None]
+    skf_init_prob = jnp.array([1.0])
+    skf_A = A[..., None]
+    skf_Q = Q[..., None]
+    skf_H = H[..., None]
+    skf_R = R[..., None]
+    skf_Z = jnp.array([[1.0]])
+
+    (
+        skf_fm,
+        skf_fc,
+        skf_fp,
+        last_pair_m,
+        skf_mll,
+    ) = switching_kalman_filter(
+        skf_init_mean,
+        skf_init_cov,
+        skf_init_prob,
+        obs,
+        skf_Z,
+        skf_A,
+        skf_Q,
+        skf_H,
+        skf_R,
+    )
+    (
+        skf_sm,
+        skf_sc,
+        skf_sdsp,
+        skf_sjdsp,
+        skf_scc,
+        skf_scsm,
+        skf_scsc,
+        skf_pcscc,
+    ) = switching_kalman_smoother(
+        filter_mean=skf_fm,
+        filter_cov=skf_fc,
+        filter_discrete_state_prob=skf_fp,
+        last_filter_conditional_cont_mean=last_pair_m,
+        process_cov=skf_Q,
+        continuous_transition_matrix=skf_A,
+        discrete_state_transition_matrix=skf_Z,
+    )
+
+    (
+        skf_new_A,
+        skf_new_H,
+        skf_new_Q,
+        skf_new_R,
+        skf_new_init_mean,
+        skf_new_init_cov,
+        _,
+        _,
+    ) = switching_kalman_maximization_step(
+        obs,
+        skf_scsm,
+        skf_scsc,
+        skf_sdsp,
+        skf_sjdsp,
+        skf_pcscc,
+    )
+
+    np.testing.assert_allclose(kf_new_A, skf_new_A.squeeze(), rtol=1e-5)
+    np.testing.assert_allclose(kf_new_H, skf_new_H.squeeze(), rtol=1e-5)
+    np.testing.assert_allclose(kf_new_Q, skf_new_Q.squeeze(), rtol=1e-5)
+    np.testing.assert_allclose(kf_new_R, skf_new_R.squeeze(), rtol=1e-5)
+    np.testing.assert_allclose(kf_new_init_mean, skf_new_init_mean.squeeze(), rtol=1e-5)
+    np.testing.assert_allclose(kf_new_init_cov, skf_new_init_cov.squeeze(), rtol=1e-5)
+
+
+def test_m_step_two_identical_states(
+    simple_1d_model: tuple,
+) -> None:
+    """Tests the SKF M-step with two identical discrete states
+    against the standard KF M-step."""
+    (
+        init_mean_kf,
+        init_cov_kf,
+        obs,
+        A_kf,
+        Q_kf,
+        H_kf,
+        R_kf,
+    ) = simple_1d_model
+
+    # 1. Run standard KF E-step and M-step
+    kf_sm, kf_sc, kf_scc, _ = kalman_smoother(
+        init_mean_kf, init_cov_kf, obs, A_kf, Q_kf, H_kf, R_kf
+    )
+    (
+        kf_new_A,
+        kf_new_H,
+        kf_new_Q,
+        kf_new_R,
+        kf_new_init_mean,
+        kf_new_init_cov,
+    ) = kalman_maximization_step(
+        obs,
+        kf_sm,
+        kf_sc,
+        kf_scc,
+    )
+
+    # 2. Setup SKF parameters for two identical states
+    n_discrete_states = 2
+    n_cont_states = init_mean_kf.shape[0]
+    n_obs_dim = H_kf.shape[0]  # Assuming H_kf is (n_obs_dim, n_cont_states)
+
+    # Initial continuous states (mean and cov are identical for both discrete states)
+    skf_init_mean = jnp.stack([init_mean_kf] * n_discrete_states, axis=-1)
+    skf_init_cov = jnp.stack([init_cov_kf] * n_discrete_states, axis=-1)
+
+    # Initial discrete state probabilities (e.g., equal)
+    skf_init_prob = jnp.ones(n_discrete_states) / n_discrete_states
+
+    # Continuous parameters (A, Q, H, R are identical for both discrete states)
+    skf_A = jnp.stack([A_kf] * n_discrete_states, axis=-1)
+    skf_Q = jnp.stack([Q_kf] * n_discrete_states, axis=-1)
+    skf_H = jnp.stack([H_kf] * n_discrete_states, axis=-1)
+    skf_R = jnp.stack([R_kf] * n_discrete_states, axis=-1)
+
+    # Discrete state transition matrix (e.g., some mixing but could be anything)
+    skf_Z = jnp.full((n_discrete_states, n_discrete_states), 1.0 / n_discrete_states)
+    # A more robust Z might be one that allows staying or switching with some probability
+    # For example: skf_Z = jnp.array([[0.9, 0.1], [0.1, 0.9]]) if n_discrete_states == 2
+
+    # 3. Run SKF E-step (Filter and Smoother)
+    (
+        skf_fm,  # state_cond_filter_mean
+        skf_fc,  # state_cond_filter_cov
+        skf_fp,  # filter_discrete_state_prob
+        last_pair_m,  # last_filter_conditional_cont_mean
+        _,  # mll
+    ) = switching_kalman_filter(
+        skf_init_mean,
+        skf_init_cov,
+        skf_init_prob,
+        obs,
+        skf_Z,
+        skf_A,
+        skf_Q,
+        skf_H,
+        skf_R,
+    )
+
+    # Assuming your switching_kalman_smoother now returns these specific ESS
+    # Adjust the unpack based on your smoother's actual return signature
+    (
+        skf_sm,
+        skf_sc,
+        skf_sdsp,
+        skf_sjdsp,
+        skf_scc,
+        skf_scsm,
+        skf_scsc,
+        skf_pcscc,
+    ) = switching_kalman_smoother(  # Unpack only the necessary outputs for M-step
+        filter_mean=skf_fm,
+        filter_cov=skf_fc,
+        filter_discrete_state_prob=skf_fp,
+        last_filter_conditional_cont_mean=last_pair_m,
+        process_cov=skf_Q,
+        continuous_transition_matrix=skf_A,
+        discrete_state_transition_matrix=skf_Z,
+    )
+
+    # 4. Run SKF M-step
+    (
+        skf_new_A,  # Shape (N,N,M)
+        skf_new_H,  # Shape (O,N,M)
+        skf_new_Q,  # Shape (N,N,M)
+        skf_new_R,  # Shape (O,O,M)
+        skf_new_init_mean,  # Shape (N,M)
+        skf_new_init_cov,  # Shape (N,N,M)
+        _,  # skf_new_Z
+        _,  # skf_new_init_prob
+    ) = switching_kalman_maximization_step(
+        obs,
+        skf_scsm,
+        skf_scsc,
+        skf_sdsp,
+        skf_sjdsp,
+        skf_pcscc,
+    )
+
+    # 5. Compare parameters
+    rtol = 1e-5
+    # Compare parameters for the first discrete state of SKF with KF
+    np.testing.assert_allclose(kf_new_A, skf_new_A[..., 0], rtol=rtol)
+    np.testing.assert_allclose(kf_new_H, skf_new_H[..., 0], rtol=rtol)
+    np.testing.assert_allclose(kf_new_Q, skf_new_Q[..., 0], rtol=rtol)
+    np.testing.assert_allclose(kf_new_R, skf_new_R[..., 0], rtol=rtol)
+    np.testing.assert_allclose(kf_new_init_mean, skf_new_init_mean[..., 0], rtol=rtol)
+    np.testing.assert_allclose(kf_new_init_cov, skf_new_init_cov[..., 0], rtol=rtol)
+
+    # Compare parameters for the second discrete state of SKF with KF
+    np.testing.assert_allclose(kf_new_A, skf_new_A[..., 1], rtol=rtol)
+    np.testing.assert_allclose(kf_new_H, skf_new_H[..., 1], rtol=rtol)
+    np.testing.assert_allclose(kf_new_Q, skf_new_Q[..., 1], rtol=rtol)
+    np.testing.assert_allclose(kf_new_R, skf_new_R[..., 1], rtol=rtol)
+    np.testing.assert_allclose(kf_new_init_mean, skf_new_init_mean[..., 1], rtol=rtol)
+    np.testing.assert_allclose(kf_new_init_cov, skf_new_init_cov[..., 1], rtol=rtol)
+
+    # Optionally, check that parameters for state 0 and state 1 of SKF are close
+    np.testing.assert_allclose(skf_new_A[..., 0], skf_new_A[..., 1], rtol=rtol)
+    np.testing.assert_allclose(skf_new_H[..., 0], skf_new_H[..., 1], rtol=rtol)
