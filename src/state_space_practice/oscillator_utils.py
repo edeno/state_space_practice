@@ -147,7 +147,10 @@ def construct_common_oscillator_transition_matrix(
 ) -> jax.Array:
     """Constructs the transition matrix for a common oscillator model.
 
-    The transition matrix is a block diagonal matrix with each block
+    The "common oscillator" model represents a set of independent (uncoupled)
+    oscillators, each with its own frequency and damping.
+
+    Accordingly, the transition matrix is a block diagonal matrix with each block
     corresponding to a single oscillator.
 
     Also used for the correlated noise model.
@@ -218,7 +221,9 @@ def construct_correlated_noise_process_covariance(
     phase_difference: jax.Array,
     coupling_strength: jax.Array,
 ) -> jax.Array:
-    """
+    """This allows the noise driving different oscillators to be correlated,
+    representing shared unobserved inputs or influences, distinct
+    from direct dynamic coupling in the transition matrix.
 
     Parameters
     ----------
@@ -298,6 +303,9 @@ def construct_directed_influence_transition_matrix(
 
     Based on Equation 2.11 for coupled oscillators. The final matrix will
     have shape (2 * n_oscillators, 2 * n_oscillators).
+
+    The "directed influence" model represents a system where oscillators
+    directly affect each other's dynamics with specific phase lags and strengths.
 
     Parameters
     ----------
@@ -381,6 +389,12 @@ def construct_directed_influence_measurement_matrix(
     and 'y' components of each oscillator's state, scaled by 1/sqrt(2).
     It has a shape of (n_sources, 2 * n_oscillators).
 
+    Setting the real and imaginary parts to 1/sqrt(2) ensures that the signal
+    at each node is determined equally by the real and imaginary components
+    of the oscillator. A measurement matrix that takes only the real parts
+    allows the imaginary component of each oscillator to be unconstrained.
+    Equal parts allows a mixing of oscillators in the measurement space.
+
     Parameters
     ----------
     n_sources : int
@@ -414,7 +428,10 @@ def construct_directed_influence_measurement_matrix(
 
 
 def _get_scaling_factor(s: jax.Array, eps: float = 1e-12) -> jax.Array:
-    """Get the scaling factor for the singular values
+    """Get the scaling factor for the singular values.
+
+    This avoids shearing in the rotation matrix by scaling both directions
+    by the geometric mean of the singular values.
 
     Parameters
     ----------
@@ -433,7 +450,11 @@ def _get_scaling_factor(s: jax.Array, eps: float = 1e-12) -> jax.Array:
 
 
 def _project_to_closest_rotation(matrix: jax.Array) -> jax.Array:
-    """Project a matrix to the closest rotation matrix using SVD
+    """Project a matrix to the closest rotation matrix using SVD.
+
+    Instead of scaling each direction by the singular value,
+    scale both directions of the matrix by the same geometric mean
+    to prevent shearing in the rotation matrix.
 
     Parameters
     ----------
@@ -473,10 +494,7 @@ def _project_to_closest_rotation(matrix: jax.Array) -> jax.Array:
 
 def project_coupled_transition_matrix(transition_matrix: jax.Array) -> jax.Array:
     """Projects each 2x2 oscillator block of the transition matrix to the closest
-    rotation matrix.
-
-    The diagonal blocks are adjusted to ensure the projected transition matrix
-    is a valid transition matrix.
+    rotation matrix. This preserves the oscillatory structure of the transition matrix.
 
     Parameters
     ----------
