@@ -437,7 +437,9 @@ def _update_smoother_discrete_probabilities(
     smoother_backward_cond_prob = (
         filter_discrete_prob[:, None] * discrete_state_transition_matrix
     )
-    smoother_backward_cond_prob /= jnp.sum(smoother_backward_cond_prob, axis=0)
+    smoother_backward_cond_prob = _divide_safe(
+        smoother_backward_cond_prob, jnp.sum(smoother_backward_cond_prob, axis=0)
+    )
 
     joint_smoother_discrete_prob = (
         smoother_backward_cond_prob * next_smoother_discrete_prob
@@ -445,8 +447,8 @@ def _update_smoother_discrete_probabilities(
     # P(S_t = j | y_{1:T})
     smoother_discrete_state_prob = jnp.sum(joint_smoother_discrete_prob, axis=1)
     # P(S_{t+1} = k | S_t = j, y_{1:T})
-    smoother_forward_cond_prob = (
-        joint_smoother_discrete_prob / smoother_discrete_state_prob[:, None]
+    smoother_forward_cond_prob = _divide_safe(
+        joint_smoother_discrete_prob, smoother_discrete_state_prob[:, None]
     )
 
     return (
@@ -817,18 +819,21 @@ def switching_kalman_maximization_step(
     init_state_cond_cov = state_cond_smoother_covs[0]
 
     # Discrete transition matrix
-    discrete_state_transition = (
-        smoother_joint_discrete_state_prob.sum(
-            axis=0,
-        )
-        / smoother_discrete_state_prob[:-1].sum(axis=0)[:, None]
+    discrete_state_transition = _divide_safe(
+        smoother_joint_discrete_state_prob.sum(axis=0),
+        smoother_discrete_state_prob[:-1].sum(axis=0)[:, None],
     )
-    # Ensure the discrete transition matrix is normalized
-    # so that each row sums to 1
-    discrete_state_transition /= discrete_state_transition.sum(axis=1, keepdims=True)
+    # Ensure rows sum to 1
+    discrete_state_transition = _divide_safe(
+        discrete_state_transition,
+        jnp.sum(discrete_state_transition, axis=1, keepdims=True),
+    )
 
+    # Ensure the initial discrete state probabilities sum to 1
     init_discrete_state_prob = smoother_discrete_state_prob[0]
-    init_discrete_state_prob /= jnp.sum(init_discrete_state_prob)
+    init_discrete_state_prob = _divide_safe(
+        init_discrete_state_prob, jnp.sum(init_discrete_state_prob)
+    )
 
     return (
         continuous_transition_matrix,
