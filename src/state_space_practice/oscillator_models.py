@@ -918,11 +918,46 @@ class DirectedInfluenceModel(BaseModel):
         )
         if n_oscillators != self.n_sources:
             raise ValueError("For DIM, n_sources must equal n_oscillators.")
+
+        if freqs.shape != (n_oscillators,):
+            raise ValueError(
+                f"Shape mismatch: freqs {freqs.shape} vs n_oscillators {n_oscillators}"
+            )
         self.freqs = freqs
+        if auto_regressive_coef.shape != (n_oscillators,):
+            raise ValueError(
+                f"Shape mismatch: auto_regressive_coef {auto_regressive_coef.shape} vs n_oscillators {n_oscillators}"
+            )
         self.auto_regressive_coef = auto_regressive_coef
+        if process_variance.shape != (n_oscillators,):
+            raise ValueError(
+                f"Shape mismatch: process_variance {process_variance.shape} vs n_oscillators {n_oscillators}"
+            )
         self.process_variance = process_variance
+
+        if not isinstance(measurement_variance, (float, int)):
+            raise ValueError(
+                "measurement_variance must be a scalar (float or int)."
+                f" Got {type(measurement_variance)}."
+            )
+        if measurement_variance <= 0:
+            raise ValueError(
+                "measurement_variance must be positive. " f"Got {measurement_variance}."
+            )
         self.measurement_variance = measurement_variance
+
+        if phase_difference.shape != (n_oscillators, n_oscillators, n_discrete_states):
+            raise ValueError(
+                "phase_difference must have shape (n_oscillators, n_oscillators, n_discrete_states)."
+                f" Got {phase_difference.shape}."
+            )
         self.phase_difference = phase_difference
+
+        if coupling_strength.shape != (n_oscillators, n_oscillators, n_discrete_states):
+            raise ValueError(
+                "coupling_strength must have shape (n_oscillators, n_oscillators, n_discrete_states)."
+                f" Got {coupling_strength.shape}."
+            )
         self.coupling_strength = coupling_strength
 
         # DIM specific M-step update flags
