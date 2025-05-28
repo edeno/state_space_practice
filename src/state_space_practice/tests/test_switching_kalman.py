@@ -835,3 +835,133 @@ def test_m_step_two_identical_states(
     # Optionally, check that parameters for state 0 and state 1 of SKF are close
     np.testing.assert_allclose(skf_new_A[..., 0], skf_new_A[..., 1], rtol=rtol)
     np.testing.assert_allclose(skf_new_H[..., 0], skf_new_H[..., 1], rtol=rtol)
+
+
+def test_m_step_two_distinct_states_equal_weights() -> None:
+    """
+    Tests switching_kalman_maximization_step with synthesized ESS
+    for two distinct states, assuming equal smoothed probabilities for each state.
+    Focuses on recovery of A_j, Q_j, Z, and init_prob.
+    H_j and R_j will be trivial due to zero observations.
+    """
+    # 1. Define True Parameters for Two Distinct 1D States
+    n_cont_states = 1
+    n_obs_dim = 1
+    n_discrete_states = 2
+    T = 200  # Number of time steps for synthetic statistics
+
+    A0_true = jnp.array([[0.95]])
+    Q0_true = jnp.array([[0.1]])
+    H0_true = jnp.array([[1.0]])  # Will be estimated as ~0 due to zero obs
+    R0_true = jnp.array([[0.5]])  # Will be estimated as ~0 due to zero obs
+
+    A1_true = jnp.array([[0.6]])
+    Q1_true = jnp.array([[0.3]])
+    H1_true = jnp.array([[1.0]])  # Will be estimated as ~0
+    R1_true = jnp.array([[1.2]])  # Will be estimated as ~0
+
+    # True initial conditions for continuous state (per discrete state)
+    # For simplicity in synthesizing ESS, we'll assume zero mean for x_k
+    init_mean_true_cond = jnp.zeros((n_cont_states, n_discrete_states))
+    # Steady-state covariances (assuming zero mean)
+    P_ss_0 = Q0_true / (1 - A0_true[0, 0] ** 2)
+    P_ss_1 = Q1_true / (1 - A1_true[0, 0] ** 2)
+    init_cov_true_cond = jnp.stack([P_ss_0, P_ss_1], axis=-1)
+
+    # True discrete parameters
+    Z_true = jnp.array([[0.8, 0.2], [0.3, 0.7]])
+    init_prob_true = jnp.array([0.5, 0.5])
+
+    # 2. Synthesize Expected Sufficient Statistics (ESS)
+    obs_input = jnp.zeros((T, n_obs_dim))
+
+    # Smoothed discrete state probabilities P(S_t=j | Y)
+    skf_sdsp_manual = jnp.full((T, n_discrete_states), 1.0 / n_discrete_states)
+
+    # Smoothed joint discrete state probabilities P(S_t=i, S_{t+1}=j | Y)
+    # For this test, let's make it consistent with Z_true and equal marginals for S_t
+    # P(S_t=i, S_{t+1}=j | Y) = P(S_{t+1}=j | S_t=i, Y) * P(S_t=i | Y)
+    # Approximating P(S_{t+1}=j | S_t=i, Y) with Z_true[i,j]
+    skf_sjdsp_manual = jnp.zeros((T - 1, n_discrete_states, n_discrete_states))
+    for i in range(n_discrete_states):
+        for j_prime in range(n_discrete_states):
+            # P(S_t=i|Y) is 0.5. Z_true[i, j_prime] is P(S_{t+1}=j_prime | S_t=i)
+            skf_sjdsp_manual = skf_sjdsp_manual.at[:, i, j_prime].set(
+                (1.0 / n_discrete_states) * Z_true[i, j_prime]
+            )
+
+    # State conditional smoother means E[x_t | S_t=j, Y]
+    skf_scsm_manual = jnp.zeros((T, n_cont_states, n_discrete_states))
+
+    # State conditional smoother covariances Cov[x_t | S_t=j, Y]
+    # Using steady-state covariances
+    skf_scsc_manual = jnp.zeros((T, n_cont_states, n_cont_states, n_discrete_states))
+    skf_scsc_manual = skf_scsc_manual.at[:, :, :, 0].set(P_ss_0)
+    skf_scsc_manual = skf_scsc_manual.at[:, :, :, 1].set(P_ss_1)
+
+    # Pair conditional smoother cross-cov E[x_t x_{t+1}^T | S_t=i, S_{t+1}=j, Y]
+    # Assuming zero means, this is Cov(x_t, x_{t+1} | S_t=i, S_{t+1}=j, Y)
+    # And E[x_t x_{t+1}^T | S_t=i, S_{t+1}=j] = E[x_t (A_i x_t + w_{t+1})^T | S_t=i]
+    #                                       = E[x_t x_t^T A_i^T | S_t=i]
+    #                                       = (P_ss_i + m_i m_i^T) A_i^T
+    # Since m_i = 0, this is P_ss_i @ A_i_true.T
+    skf_pcscc_manual = jnp.zeros(
+        (T - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+    )
+    # This term depends on S_t = i (the first discrete index)
+    skf_pcscc_manual = skf_pcscc_manual.at[:, :, :, 0, :].set(P_ss_0 @ A0_true.T)
+    skf_pcscc_manual = skf_pcscc_manual.at[:, :, :, 1, :].set(P_ss_1 @ A1_true.T)
+
+    # 3. Run switching_kalman_maximization_step
+    (
+        skf_new_A,
+        skf_new_H,
+        skf_new_Q,
+        skf_new_R,
+        skf_new_init_mean,
+        skf_new_init_cov,
+        skf_new_Z,
+        skf_new_init_prob,
+    ) = switching_kalman_maximization_step(
+        obs_input,
+        skf_scsm_manual,
+        skf_scsc_manual,
+        skf_sdsp_manual,
+        skf_sjdsp_manual,
+        skf_pcscc_manual,
+    )
+
+    # 4. Assert Expected Outcomes
+    rtol = 1e-4  # May need adjustment
+    atol = 1e-5  # May need adjustment
+
+    # Check A_j
+    np.testing.assert_allclose(skf_new_A[..., 0], A0_true, rtol=rtol, atol=atol)
+    np.testing.assert_allclose(skf_new_A[..., 1], A1_true, rtol=rtol, atol=atol)
+
+    # Check Q_j
+    np.testing.assert_allclose(skf_new_Q[..., 0], Q0_true, rtol=rtol, atol=atol)
+    np.testing.assert_allclose(skf_new_Q[..., 1], Q1_true, rtol=rtol, atol=atol)
+
+    # Check H_j (should be close to zero due to zero obs)
+    np.testing.assert_allclose(skf_new_H[..., 0], jnp.zeros_like(H0_true), atol=1e-3)
+    np.testing.assert_allclose(skf_new_H[..., 1], jnp.zeros_like(H1_true), atol=1e-3)
+
+    # Check R_j (should be close to zero due to zero obs and H being zero)
+    np.testing.assert_allclose(skf_new_R[..., 0], jnp.zeros_like(R0_true), atol=1e-3)
+    np.testing.assert_allclose(skf_new_R[..., 1], jnp.zeros_like(R1_true), atol=1e-3)
+
+    # Check Z
+    np.testing.assert_allclose(skf_new_Z, Z_true, rtol=rtol, atol=atol)
+
+    # Check initial discrete probability
+    np.testing.assert_allclose(skf_new_init_prob, init_prob_true, rtol=rtol, atol=atol)
+
+    # Check initial continuous mean (should be close to the synthetic zero means)
+    np.testing.assert_allclose(
+        skf_new_init_mean, init_mean_true_cond, rtol=rtol, atol=atol
+    )
+
+    # Check initial continuous covariance
+    np.testing.assert_allclose(skf_new_init_cov[..., 0], P_ss_0, rtol=rtol, atol=atol)
+    np.testing.assert_allclose(skf_new_init_cov[..., 1], P_ss_1, rtol=rtol, atol=atol)
