@@ -4,8 +4,8 @@ Implements the Kalman filter, Rauch-Tung-Striebel (RTS) smoother, and
 the Expectation-Maximization (EM) algorithm's M-step for parameter estimation.
 
 The assumed state-space model is:
-$$ x_t = A x_{t-1} + w_t, \quad w_t \sim N(0, \Sigma) $$
-$$ y_t = H x_t + v_t, \quad v_t \sim N(0, R) $$
+$$ x_t = A x_{t-1} + w_t, \\quad w_t \\sim N(0, \\Sigma) $$
+$$ y_t = H x_t + v_t, \\quad v_t \\sim N(0, R) $$
 
 References
 ----------
@@ -20,7 +20,6 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg
 import jax.scipy.stats.multivariate_normal
-from jax import typing
 
 
 def symmetrize(A: jax.Array) -> jax.Array:
@@ -104,7 +103,7 @@ def _kalman_filter_update(
     transition_matrix : jax.Array, shape (n_cont_states, n_cont_states)
         State transition matrix, $$ A $$.
     process_cov : jax.Array, shape (n_cont_states, n_cont_states)
-        State noise covariance, $$ \Sigma $$.
+        State noise covariance, $$ \\Sigma $$.
     measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
         Observation matrix, $$ H $$.
     measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
@@ -117,7 +116,7 @@ def _kalman_filter_update(
     posterior_cov : jax.Array, shape (n_cont_states, n_cont_states)
         Posterior state covariance, $$ P_t $$.
     marginal_log_likelihood : float
-        Log-likelihood of the observation, $$ \log p(y_t | y_{1:t-1}) $$.
+        Log-likelihood of the observation, $$ \\log p(y_t | y_{1:t-1}) $$.
 
     """
 
@@ -178,7 +177,7 @@ def kalman_filter(
     transition_matrix : jax.Array, shape (n_cont_states, n_cont_states)
         State transition matrix, $$ A $$.
     process_cov : jax.Array, shape (n_cont_states, n_cont_states)
-        State noise covariance, $$ \Sigma $$.
+        State noise covariance, $$ \\Sigma $$.
     measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
         Observation matrix, $$ H $$.
     measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
@@ -191,7 +190,7 @@ def kalman_filter(
     filtered_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states)
         Filtered state covariances, $$ P_{1:T} $$.
     marginal_log_likelihood : float
-        Total log likelihood of the observations, $$ \sum_{t=1}^T \log p(y_t | y_{1:t-1}) $$.
+        Total log likelihood of the observations, $$ \\sum_{t=1}^T \\log p(y_t | y_{1:t-1}) $$.
 
     """
 
@@ -251,7 +250,7 @@ def _kalman_smoother_update(
     filter_cov : jax.Array, shape (n_cont_states, n_cont_states)
         Filtered covariance from the current time step, $$ P_{t|t} $$.
     process_cov : jax.Array, shape (n_cont_states, n_cont_states)
-        State noise covariance, $$ \Sigma $$.
+        State noise covariance, $$ \\Sigma $$.
     transition_matrix : jax.Array, shape (n_cont_states, n_cont_states)
         State transition matrix, $$ A $$.
 
@@ -315,7 +314,7 @@ def kalman_smoother(
     transition_matrix : jax.Array, shape (n_cont_states, n_cont_states)
         State transition matrix, $$ A $$.
     process_cov : jax.Array, shape (n_cont_states, n_cont_states)
-        State noise covariance, $$ \Sigma $$.
+        State noise covariance, $$ \\Sigma $$.
     measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
         Observation matrix, $$ H $$.
     measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
@@ -389,7 +388,7 @@ def kalman_smoother(
 def sum_of_outer_products(x: jax.Array, y: jax.Array) -> jax.Array:
     """Compute the sum of outer products between corresponding vectors.
 
-    Computes $$ S = \sum_{t=1}^T x_t y_t^T $$.
+    Computes $$ S = \\sum_{t=1}^T x_t y_t^T $$.
 
     Parameters
     ----------
@@ -436,7 +435,7 @@ def kalman_maximization_step(
     measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
         Updated measurement matrix, $$ H $$.
     process_cov : jax.Array, shape (n_cont_states, n_cont_states)
-        Updated process covariance, $$ \Sigma $$.
+        Updated process covariance, $$ \\Sigma $$.
     measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
         Updated measurement covariance, $$ R $$.
     init_mean : jax.Array, shape (n_cont_states,)
