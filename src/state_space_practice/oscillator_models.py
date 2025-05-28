@@ -305,6 +305,70 @@ class BaseModel(ABC):
         self._initialize_continuous_transition_matrix()
         self._initialize_process_covariance()
 
+        if self.init_mean.shape != (self.n_cont_states, self.n_discrete_states):
+            raise ValueError(
+                f"init_mean shape mismatch: expected ({self.n_cont_states}, {self.n_discrete_states}), "
+                f"got {self.init_mean.shape}."
+            )
+        if self.init_cov.shape != (
+            self.n_cont_states,
+            self.n_cont_states,
+            self.n_discrete_states,
+        ):
+            raise ValueError(
+                f"init_cov shape mismatch: expected ({self.n_cont_states}, {self.n_cont_states}, {self.n_discrete_states}), "
+                f"got {self.init_cov.shape}."
+            )
+        if self.init_discrete_state_prob.shape != (self.n_discrete_states,):
+            raise ValueError(
+                f"init_discrete_state_prob shape mismatch: expected ({self.n_discrete_states},), "
+                f"got {self.init_discrete_state_prob.shape}."
+            )
+        if self.discrete_transition_matrix.shape != (
+            self.n_discrete_states,
+            self.n_discrete_states,
+        ):
+            raise ValueError(
+                f"discrete_transition_matrix shape mismatch: expected ({self.n_discrete_states}, {self.n_discrete_states}), "
+                f"got {self.discrete_transition_matrix.shape}."
+            )
+        if self.continuous_transition_matrix.shape != (
+            self.n_cont_states,
+            self.n_cont_states,
+            self.n_discrete_states,
+        ):
+            raise ValueError(
+                f"continuous_transition_matrix shape mismatch: expected ({self.n_cont_states}, {self.n_cont_states}, {self.n_discrete_states}), "
+                f"got {self.continuous_transition_matrix.shape}."
+            )
+        if self.process_cov.shape != (
+            self.n_cont_states,
+            self.n_cont_states,
+            self.n_discrete_states,
+        ):
+            raise ValueError(
+                f"process_cov shape mismatch: expected ({self.n_cont_states}, {self.n_cont_states}, {self.n_discrete_states}), "
+                f"got {self.process_cov.shape}."
+            )
+        if self.measurement_matrix.shape != (
+            self.n_sources,
+            self.n_cont_states,
+            self.n_discrete_states,
+        ):
+            raise ValueError(
+                f"measurement_matrix shape mismatch: expected ({self.n_sources}, {self.n_cont_states}, {self.n_discrete_states}), "
+                f"got {self.measurement_matrix.shape}."
+            )
+        if self.measurement_cov.shape != (
+            self.n_sources,
+            self.n_sources,
+            self.n_discrete_states,
+        ):
+            raise ValueError(
+                f"measurement_cov shape mismatch: expected ({self.n_sources}, {self.n_sources}, {self.n_discrete_states}), "
+                f"got {self.measurement_cov.shape}."
+            )
+
     def _e_step(self, observations: jnp.ndarray) -> float:
         """Performs the Expectation (E) step of the EM algorithm.
 
@@ -464,11 +528,12 @@ class BaseModel(ABC):
             # Projection step
             self._project_parameters()
 
-            previous_log_likelihood = current_log_likelihood
             logger.info(
-                f"Iteration {iteration + 1}/{max_iter}, "
-                f"Log-Likelihood: {current_log_likelihood:.4f}"
+                f"Iteration {iteration + 1}/{max_iter}\t"
+                f"Log-Likelihood: {current_log_likelihood:.4f}\t"
+                f"Change: {(current_log_likelihood - previous_log_likelihood):.4f}"
             )
+            previous_log_likelihood = current_log_likelihood
 
         if len(log_likelihoods) == max_iter:
             logger.warning("Reached maximum iterations without converging.")
@@ -755,6 +820,7 @@ class CorrelatedNoiseModel(BaseModel):
             ],
             axis=2,
         )
+        # Needs shape (n_cont_states, n_cont_states, n_discrete_states)
 
     def _project_parameters(self):
         """Projects each Q_j to preserve its oscillatory/coupling structure.
@@ -769,6 +835,41 @@ class CorrelatedNoiseModel(BaseModel):
             ],
             axis=-1,
         )
+
+    def fit(
+        self,
+        observations: jnp.ndarray,
+        key: jax.random.PRNGKey,
+        max_iter: int = 100,
+        tolerance: float = 1e-4,
+    ) -> list[float]:
+        """Fits the model to observations using the EM algorithm.
+
+        Iteratively performs E-steps and M-steps until convergence or
+        the maximum number of iterations is reached.
+
+        Parameters
+        ----------
+        observations : jnp.ndarray, shape (n_time, n_sources)
+            The sequence of observations.
+        key : jax.random.PRNGKey
+            JAX random number generator key for initialization.
+        max_iter : int, optional
+            Maximum number of EM iterations, by default 100.
+        tolerance : float, optional
+            Convergence tolerance for log-likelihood, by default 1e-4.
+
+        Returns
+        -------
+        log_likelihoods : list[float]
+            A list of marginal log-likelihoods at each iteration.
+        """
+        if observations.shape[1] != self.n_sources:
+            raise ValueError(
+                f"observations must have {self.n_sources} sources, "
+                f"got {observations.shape[1]}."
+            )
+        return super().fit(observations, key, max_iter, tolerance)
 
 
 class DirectedInfluenceModel(BaseModel):
@@ -883,3 +984,38 @@ class DirectedInfluenceModel(BaseModel):
             ],
             axis=-1,
         )
+
+    def fit(
+        self,
+        observations: jnp.ndarray,
+        key: jax.random.PRNGKey,
+        max_iter: int = 100,
+        tolerance: float = 1e-4,
+    ) -> list[float]:
+        """Fits the model to observations using the EM algorithm.
+
+        Iteratively performs E-steps and M-steps until convergence or
+        the maximum number of iterations is reached.
+
+        Parameters
+        ----------
+        observations : jnp.ndarray, shape (n_time, n_sources)
+            The sequence of observations.
+        key : jax.random.PRNGKey
+            JAX random number generator key for initialization.
+        max_iter : int, optional
+            Maximum number of EM iterations, by default 100.
+        tolerance : float, optional
+            Convergence tolerance for log-likelihood, by default 1e-4.
+
+        Returns
+        -------
+        log_likelihoods : list[float]
+            A list of marginal log-likelihoods at each iteration.
+        """
+        if observations.shape[1] != self.n_sources:
+            raise ValueError(
+                f"observations must have {self.n_sources} sources, "
+                f"got {observations.shape[1]}."
+            )
+        return super().fit(observations, key, max_iter, tolerance)
