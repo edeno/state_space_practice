@@ -816,6 +816,7 @@ def switching_kalman_maximization_step(
     # delta: (n_obs_dim, n_cont_states, n_discrete_states)
 
     # Measurement matrix and covariance
+
     measurement_matrix = psd_solve_per_discrete_state(gamma, delta)
     # measurement_matrix: shape (n_obs_dim, n_cont_states, n_discrete_states)
     measurement_cov = cov_solve_per_discrete_state(
@@ -827,10 +828,11 @@ def switching_kalman_maximization_step(
         smoother_joint_discrete_state_prob,  # P(S_k=i, S_{k+1}=j)
         pair_cond_smoother_cross_cov,  # E[x_k x_{k+1}^T | S_k=i, S_{k+1}=j]
     )
-    beta += weighted_sum_of_outer_products(
-        state_cond_smoother_means[:-1],  # E[x_k | S_k=i]
-        state_cond_smoother_means[1:],  # E[x_{k+1} | S_{k+1}=j]
-        smoother_discrete_state_prob[:-1],  # P(S_k=i)
+    beta += jnp.einsum(
+        "tci,tdj,tij->cdi",  # Sum over t, j; keep c, d, i
+        state_cond_smoother_means[:-1],  # m_t^i (Shape T-1, c, i)
+        state_cond_smoother_means[1:],  # m_{t+1}^j (Shape T-1, d, j)
+        smoother_joint_discrete_state_prob,  # P(S_t=i, S_{t+1}=j) (Shape T-1, i, j)
     )
     # Transition matrix
     continuous_transition_matrix = psd_solve_per_discrete_state(gamma1, beta)
