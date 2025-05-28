@@ -293,8 +293,8 @@ class BaseModel(ABC):
             last_cond_cont_mean,
             marginal_log_likelihood,
         ) = switching_kalman_filter(
-            init_mean=self.init_mean,
-            init_cov=self.init_cov,
+            init_state_cond_mean=self.init_mean,
+            init_state_cond_cov=self.init_cov,
             init_discrete_state_prob=self.init_discrete_state_prob,
             obs=observations,
             discrete_transition_matrix=self.discrete_transition_matrix,
@@ -347,8 +347,8 @@ class BaseModel(ABC):
             pi0,
         ) = switching_kalman_maximization_step(
             obs=observations,
-            state_cond_smoother_mean=self.smoother_state_cond_mean,
-            state_cond_smoother_cov=self.smoother_state_cond_cov,
+            state_cond_smoother_means=self.smoother_state_cond_mean,
+            state_cond_smoother_covs=self.smoother_state_cond_cov,
             smoother_discrete_state_prob=self.smoother_discrete_state_prob,
             smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
             pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
