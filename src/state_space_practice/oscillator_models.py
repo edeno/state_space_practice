@@ -176,6 +176,41 @@ class BaseModel(ABC):
         self.smoother_joint_discrete_state_prob: jax.Array
         self.smoother_pair_cond_cross_cov: jax.Array
 
+    def __repr__(self) -> str:
+        """Returns an unambiguous string representation of the model.
+
+        Returns
+        -------
+        str
+            A string showing the model class name and its core parameters.
+        """
+        # Collect the core parameters
+        params = [
+            f"n_oscillators={self.n_oscillators}",
+            f"n_discrete_states={self.n_discrete_states}",
+            f"n_sources={self.n_sources}",
+            f"sampling_freq={self.sampling_freq}",
+        ]
+
+        # Add update flags for clarity
+        update_flags = {
+            "Z": self.update_discrete_transition_matrix,
+            "A": self.update_continuous_transition_matrix,
+            "H": self.update_measurement_matrix,
+            "Q": self.update_process_cov,
+            "R": self.update_measurement_cov,
+            "m0": self.update_init_mean,
+            "P0": self.update_init_cov,
+        }
+
+        # Filter for flags that are False (since True is default/expected)
+        # Or show all for full clarity - let's show all for now.
+        flags_str = ", ".join(f"Update({k})={v}" for k, v in update_flags.items())
+
+        return (
+            f"<{self.__class__.__name__}: " f"{', '.join(params)}, " f"[{flags_str}]>"
+        )
+
     def _initialize_discrete_state_prob(self) -> None:
         """Initializes the starting probability for each discrete state."""
         self.init_discrete_state_prob = (
@@ -476,9 +511,24 @@ class CommonOscillatorModel(BaseModel):
         super().__init__(
             n_oscillators, n_discrete_states, n_sources, sampling_freq, **kwargs
         )
+        if freqs.shape != (n_oscillators,):
+            raise ValueError(
+                f"Shape mismatch: freqs {freqs.shape} vs n_oscillators {n_oscillators}"
+            )
         self.freqs = freqs
+
+        if auto_regressive_coef.shape != (n_oscillators,):
+            raise ValueError(
+                f"Shape mismatch: auto_regressive_coef {auto_regressive_coef.shape} vs n_oscillators {n_oscillators}"
+            )
         self.auto_regressive_coef = auto_regressive_coef
+
+        if process_variance.shape != (n_oscillators,):
+            raise ValueError(
+                f"Shape mismatch: process_variance {process_variance.shape} vs n_oscillators {n_oscillators}"
+            )
         self.process_variance = process_variance
+
         self.measurement_variance = measurement_variance
 
         # COM specific M-step update flags
@@ -627,6 +677,32 @@ class CorrelatedNoiseModel(BaseModel):
         )
         if n_oscillators != self.n_sources:
             raise ValueError("For CNM, n_sources must equal n_oscillators.")
+        if process_variance.shape != (n_oscillators, n_discrete_states):
+            raise ValueError(
+                "process_variance must have shape (n_oscillators, n_discrete_states)."
+                f" Got {process_variance.shape}."
+            )
+        if phase_difference.shape != (n_oscillators, n_oscillators, n_discrete_states):
+            raise ValueError(
+                "phase_difference must have shape (n_oscillators, n_oscillators, n_discrete_states)."
+                f" Got {phase_difference.shape}."
+            )
+        if coupling_strength.shape != (n_oscillators, n_oscillators, n_discrete_states):
+            raise ValueError(
+                "coupling_strength must have shape (n_oscillators, n_oscillators, n_discrete_states)."
+                f" Got {coupling_strength.shape}."
+            )
+        if not isinstance(measurement_variance, (float, int)):
+            raise ValueError(
+                "measurement_variance must be a scalar (float or int)."
+                f" Got {type(measurement_variance)}."
+            )
+        if measurement_variance <= 0:
+            raise ValueError(
+                "measurement_variance must be positive. " f"Got {measurement_variance}."
+            )
+        if sampling_freq <= 0:
+            raise ValueError("sampling_freq must be positive. " f"Got {sampling_freq}.")
         self.freqs = freqs
         self.auto_regressive_coef = auto_regressive_coef
         self.process_variance = process_variance
