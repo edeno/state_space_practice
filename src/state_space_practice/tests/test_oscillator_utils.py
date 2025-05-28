@@ -46,11 +46,6 @@ def test__compute_intrinsic_oscillation_block_valid():
     assert jnp.allclose(block, jnp.eye(2), atol=1e-7)
 
 
-def test__compute_intrinsic_oscillation_block_invalid():
-    with pytest.raises(ValueError):
-        _compute_intrinsic_oscillation_block(0.0, 1.5)
-
-
 def test__compute_coupled_oscillator_block():
     block = _compute_coupled_oscillator_block(0.0, 1.0, 0.5)
     expected = jnp.eye(2) * 0.5

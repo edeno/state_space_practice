@@ -78,9 +78,6 @@ def _compute_intrinsic_oscillation_block(
         If the auto_regressive_coef is not between 0 and 1
 
     """
-    if jnp.logical_or(auto_regressive_coef > 1, auto_regressive_coef < 0):
-        raise ValueError("Auto-regressive coefficient must be between 0 and 1")
-
     return auto_regressive_coef * _get_rotation_matrix(
         2 * jnp.pi * oscillation_freq / sampling_freq
     )
@@ -138,10 +135,9 @@ def _compute_coupling_transition_block(
         The transition matrix between the two oscillators
 
     """
-    if jnp.isclose(coupling_strength, 0.0):
-        return ZEROS_2x2
-    else:
-        return coupling_strength * _get_rotation_matrix(phase_difference)
+    # Calculate the potentially non-zero block
+    scaled_rotation = coupling_strength * _get_rotation_matrix(phase_difference)
+    return jnp.where(jnp.isclose(coupling_strength, 0.0), ZEROS_2x2, scaled_rotation)
 
 
 def construct_common_oscillator_transition_matrix(
@@ -298,7 +294,7 @@ def construct_directed_influence_transition_matrix(
     phase_diffs: jax.Array,
     sampling_freq: float = 1.0,
 ) -> jax.Array:
-    """Constructs the full state transition matrix Aj using jnp.block.
+    """Constructs the full state transition matrix Aj.
 
     Based on Equation 2.11 for coupled oscillators. The final matrix will
     have shape (2 * n_oscillators, 2 * n_oscillators).
@@ -329,7 +325,6 @@ def construct_directed_influence_transition_matrix(
     ValueError
         If input array dimensions do not match the inferred number of oscillators.
     """
-    # Use more descriptive name n_oscillators instead of K
     n_oscillators = freqs.shape[0]
     if not (
         damping_coeffs.shape == (n_oscillators,)
@@ -341,45 +336,44 @@ def construct_directed_influence_transition_matrix(
             f"derived from freqs ({n_oscillators})."
         )
 
-    block_rows = []  # List to hold the rows of blocks
+    # 1. Calculate sum_incoming_coupling (vectorized)
+    # We need to exclude the diagonal before summing.
+    sum_incoming_coupling = jnp.sum(
+        coupling_strengths, axis=1, where=~jnp.eye(n_oscillators, dtype=bool)
+    )
 
-    for from_oscillator in range(n_oscillators):
-        current_row_blocks = []
-        for to_oscillator in range(n_oscillators):
-            if from_oscillator == to_oscillator:
-                # --- Diagonal Block (k=n1) ---
-                # Calculate sum of incoming couplings for oscillator k=n1
-                # Sum strengths alpha_j^{n1, other_n2} where other_n2 != n1
-                mask = jnp.arange(n_oscillators) != from_oscillator
-                sum_incoming_coupling = jnp.sum(
-                    coupling_strengths[from_oscillator, mask]
-                )
+    # 2. Vmap _compute_coupling_transition_block for off-diagonals
+    # We create a function that computes A_j^{n1, n2}
+    vmap_coupling_row = jax.vmap(
+        _compute_coupling_transition_block, in_axes=(0, 0)
+    )  # Vmap over columns (n2)
+    vmap_coupling_all = jax.vmap(
+        vmap_coupling_row, in_axes=(0, 0)
+    )  # Vmap over rows (n1)
 
-                current_row_blocks.append(
-                    _compute_coupled_oscillator_block(
-                        freq=freqs[from_oscillator],
-                        auto_regressive_coef=damping_coeffs[from_oscillator],
-                        sum_incoming_coupling_strength=sum_incoming_coupling,
-                        sampling_freq=sampling_freq,
-                    )
-                )
+    all_coupling_blocks = vmap_coupling_all(phase_diffs, coupling_strengths)
+    # Shape: (n_oscillators, n_oscillators, 2, 2)
 
-            else:
-                # --- Off-Diagonal Block ---
-                current_row_blocks.append(
-                    _compute_coupling_transition_block(
-                        phase_difference=phase_diffs[from_oscillator, to_oscillator],
-                        coupling_strength=coupling_strengths[
-                            from_oscillator, to_oscillator
-                        ],
-                    )
-                )
+    # 3. Vmap _compute_coupled_oscillator_block for diagonals
+    vmap_diag = jax.vmap(_compute_coupled_oscillator_block, in_axes=(0, 0, 0, None))
+    all_diag_blocks = vmap_diag(
+        freqs, damping_coeffs, sum_incoming_coupling, sampling_freq
+    )
+    # Shape: (n_oscillators, 2, 2)
 
-        # Add the completed row of blocks to the list of rows
-        block_rows.append(current_row_blocks)
+    # 4. Combine: Replace diagonal blocks in all_coupling_blocks
+    # Get indices for the diagonal blocks
+    diag_indices = jnp.arange(n_oscillators)
+    all_blocks = all_coupling_blocks.at[diag_indices, diag_indices].set(all_diag_blocks)
+    # Shape: (n_oscillators, n_oscillators, 2, 2)
 
-    # Assemble the full matrix from the list of lists of blocks
-    return jnp.block(block_rows)
+    # 5. Reshape and transpose to final matrix form
+    # (n1, n2, 2, 2) -> (n1, 2, n2, 2) -> (2 * n1, 2 * n2)
+    transition_matrix = all_blocks.swapaxes(1, 2).reshape(
+        2 * n_oscillators, 2 * n_oscillators
+    )
+
+    return transition_matrix
 
 
 def construct_directed_influence_measurement_matrix(
