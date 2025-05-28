@@ -607,7 +607,17 @@ def switching_kalman_smoother(
             smoother_discrete_state_prob,
             joint_smoother_discrete_prob,
             overall_smoother_cross_cov,
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+            pair_cond_smoother_cross_covs,
         )
+
+    init_carry = (
+        filter_mean[-1],  # shape (n_cont_states, n_discrete_states)
+        filter_cov[-1],  # shape (n_cont_states, n_cont_states, n_discrete_states)
+        filter_discrete_state_prob[-1],  # shape (n_discrete_states,)
+        last_filter_conditional_cont_mean,  # shape (n_cont_states, n_discrete_states, n_discrete_states)
+    )
 
     _, (
         overall_smoother_mean,
@@ -615,14 +625,12 @@ def switching_kalman_smoother(
         smoother_discrete_state_prob,
         smoother_joint_discrete_state_prob,
         overall_smoother_cross_cov,
+        state_cond_smoother_means,
+        state_cond_smoother_covs,
+        pair_cond_smoother_cross_covs,
     ) = jax.lax.scan(
         _step,
-        (
-            filter_mean[-1],  # shape (n_cont_states, n_discrete_states)
-            filter_cov[-1],  # shape (n_cont_states, n_cont_states, n_discrete_states)
-            filter_discrete_state_prob[-1],  # shape (n_discrete_states,)
-            last_filter_conditional_cont_mean,  # shape (n_cont_states, n_discrete_states, n_discrete_states)
-        ),
+        init_carry,
         (
             filter_mean[:-1],
             filter_cov[:-1],
@@ -643,6 +651,15 @@ def switching_kalman_smoother(
     smoother_discrete_state_prob = jnp.concatenate(
         [smoother_discrete_state_prob, filter_discrete_state_prob[-1][None]], axis=0
     )
+    state_cond_smoother_means = jnp.concatenate(
+        [state_cond_smoother_means, filter_mean[-1][None]], axis=0
+    )
+    state_cond_smoother_covs = jnp.concatenate(
+        [state_cond_smoother_covs, filter_cov[-1][None]], axis=0
+    )
+    smoother_discrete_state_prob = jnp.concatenate(
+        [smoother_discrete_state_prob, filter_discrete_state_prob[-1][None]], axis=0
+    )
 
     return (
         overall_smoother_mean,
@@ -650,6 +667,9 @@ def switching_kalman_smoother(
         smoother_discrete_state_prob,
         smoother_joint_discrete_state_prob,
         overall_smoother_cross_cov,
+        state_cond_smoother_means,
+        state_cond_smoother_covs,
+        pair_cond_smoother_cross_covs,
     )
 
 

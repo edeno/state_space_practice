@@ -511,6 +511,9 @@ def test_skf_smoother_reduces_to_kf_smoother_single_state(
         skf_sp,
         skf_sjp,
         skf_scc,
+        skf_scsm,
+        skf_sccs,
+        _,
     ) = switching_kalman_smoother(
         filter_mean=skf_fm,
         filter_cov=skf_fc,
@@ -527,6 +530,8 @@ def test_skf_smoother_reduces_to_kf_smoother_single_state(
     np.testing.assert_allclose(kf_scc, skf_scc, rtol=1e-5)
     np.testing.assert_allclose(skf_sp, 1.0, rtol=1e-5)
     np.testing.assert_allclose(skf_sjp, 1.0, rtol=1e-5)
+    np.testing.assert_allclose(skf_scsm.squeeze(), skf_sm.squeeze(), rtol=1e-5)
+    np.testing.assert_allclose(skf_sccs.squeeze(), skf_sc.squeeze(), rtol=1e-5)
 
 
 def test_skf_deterministic_stay(simple_skf_model: tuple) -> None:
