@@ -352,13 +352,6 @@ class BaseModel(ABC):
             smoother_discrete_state_prob=self.smoother_discrete_state_prob,
             smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
             pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
-            update_discrete_transition_matrix=self.update_discrete_transition_matrix,
-            update_continuous_transition_matrix=self.update_continuous_transition_matrix,
-            update_measurement_matrix=self.update_measurement_matrix,
-            update_process_cov=self.update_process_cov,
-            update_measurement_cov=self.update_measurement_cov,
-            update_init_mean=self.update_init_mean,
-            update_init_cov=self.update_init_cov,
         )
 
         # Update parameters based on flags
