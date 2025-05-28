@@ -26,7 +26,7 @@ def get_block_slice(from_oscillator: int, to_oscillator: int) -> tuple:
     return row_slice, col_slice
 
 
-def _get_rotation_matrix(rotation_frequency: float) -> jnp.ndarray:
+def _get_rotation_matrix(rotation_frequency: float) -> jax.Array:
     """Get the rotation matrix for a given frequency
 
     The rotation matrix is a 2x2 matrix that rotates a vector.
@@ -38,13 +38,13 @@ def _get_rotation_matrix(rotation_frequency: float) -> jnp.ndarray:
 
     Returns
     -------
-    rotation_matrix : jnp.ndarray
+    rotation_matrix : jax.Array
         The rotation matrix
     """
     cos_rot = jnp.cos(rotation_frequency)
     sin_rot = jnp.sin(rotation_frequency)
 
-    return jnp.ndarray(
+    return jnp.array(
         [
             [cos_rot, -sin_rot],
             [sin_rot, cos_rot],
@@ -54,7 +54,7 @@ def _get_rotation_matrix(rotation_frequency: float) -> jnp.ndarray:
 
 def _compute_intrinsic_oscillation_block(
     oscillation_freq: float, auto_regressive_coef: float, sampling_freq: float = 1.0
-) -> jnp.ndarray:
+) -> jax.Array:
     """Compute the rotation matrix for a given frequency and auto-regressive coefficient
 
     Parameters
@@ -69,7 +69,7 @@ def _compute_intrinsic_oscillation_block(
 
     Returns
     -------
-    jnp.ndarray, shape (2, 2)
+    jax.Array, shape (2, 2)
         The transition matrix at the specified frequency
 
     Raises
@@ -91,7 +91,7 @@ def _compute_coupled_oscillator_block(
     auto_regressive_coef: float,
     sum_incoming_coupling_strength: float,
     sampling_freq: float = 1.0,
-) -> jnp.ndarray:
+) -> jax.Array:
     """Compute the diagonal block of the transition matrix for the coupled model
 
     Parameters
@@ -109,7 +109,7 @@ def _compute_coupled_oscillator_block(
 
     Returns
     -------
-    diagonal_block : jnp.ndarray, shape (2, 2)
+    diagonal_block : jax.Array, shape (2, 2)
         The transition matrix at the specified frequency
 
     """
@@ -122,7 +122,7 @@ def _compute_coupled_oscillator_block(
 def _compute_coupling_transition_block(
     phase_difference: float,
     coupling_strength: float,
-) -> jnp.ndarray:
+) -> jax.Array:
     """Compute the off-diagonal block transition matrix for a coupling model
 
     Parameters
@@ -134,7 +134,7 @@ def _compute_coupling_transition_block(
 
     Returns
     -------
-    jnp.ndarray, shape (2, 2)
+    jax.Array, shape (2, 2)
         The transition matrix between the two oscillators
 
     """
@@ -145,10 +145,10 @@ def _compute_coupling_transition_block(
 
 
 def construct_common_oscillator_transition_matrix(
-    freqs: jnp.ndarray,
-    auto_regressive_coef: jnp.ndarray,
+    freqs: jax.Array,
+    auto_regressive_coef: jax.Array,
     sampling_freq: float = 1.0,
-) -> jnp.ndarray:
+) -> jax.Array:
     """Constructs the transition matrix for a common oscillator model.
 
     The transition matrix is a block diagonal matrix with each block
@@ -158,16 +158,16 @@ def construct_common_oscillator_transition_matrix(
 
     Parameters
     ----------
-    freqs : jnp.ndarray, shape (n_oscillators,)
+    freqs : jax.Array, shape (n_oscillators,)
         Array of oscillation frequencies (fk) for each oscillator.
-    auto_regressive_coef : jnp.ndarray, shape (n_oscillators,)
+    auto_regressive_coef : jax.Array, shape (n_oscillators,)
         Array of auto-regressive coefficients (alpha_j^k) for each oscillator k.
     sampling_freq : float, optional
         Sampling frequency (Fs) in Hz, by default 1.0.
 
     Returns
     -------
-    transition_matrix : jnp.ndarray, shape (2 * n_oscillators, 2 * n_oscillators)
+    transition_matrix : jax.Array, shape (2 * n_oscillators, 2 * n_oscillators)
 
     Raises
     ------
@@ -181,7 +181,7 @@ def construct_common_oscillator_transition_matrix(
         )
     diag_blocks = [
         _compute_intrinsic_oscillation_block(
-            freq=freqs[k],
+            oscillation_freq=freqs[k],
             auto_regressive_coef=auto_regressive_coef[k],
             sampling_freq=sampling_freq,
         )
@@ -192,22 +192,22 @@ def construct_common_oscillator_transition_matrix(
 
 
 def construct_common_oscillator_process_covariance(
-    variance: jnp.ndarray,
-) -> jnp.ndarray:
+    variance: jax.Array,
+) -> jax.Array:
     pass
     """Constructs the process covariance matrix for a common oscillator model.
 
-    The process covariance matrix (\Sigma) is a block diagonal matrix with each block
+    The process covariance matrix ($$ \\Sigma $$) is a block diagonal matrix with each block
     corresponding to a single oscillator.
 
     Parameters
     ----------
-    variance : jnp.ndarray, shape (n_oscillators,)
+    variance : jax.Array, shape (n_oscillators,)
         Array of process noise variances (sigma_j) for each oscillator.
 
     Returns
     -------
-    process_covariance : jnp.ndarray, shape (2 * n_oscillators, 2 * n_oscillators)
+    process_covariance : jax.Array, shape (2 * n_oscillators, 2 * n_oscillators)
         The process covariance matrix for the common oscillator model.
 
     """
@@ -218,25 +218,25 @@ def construct_common_oscillator_process_covariance(
 
 
 def construct_correlated_noise_process_covariance(
-    variance: jnp.ndarray,
-    phase_difference: jnp.ndarray,
-    coupling_strength: jnp.ndarray,
-) -> jnp.ndarray:
+    variance: jax.Array,
+    phase_difference: jax.Array,
+    coupling_strength: jax.Array,
+) -> jax.Array:
     """
 
     Parameters
     ----------
-    variance : jnp.ndarray, shape (n_oscillators,)
+    variance : jax.Array, shape (n_oscillators,)
         Array of process noise variances (sigma_j) for each oscillator.
-    phase_difference : jnp.ndarray, shape (n_oscillators, n_oscillators)
+    phase_difference : jax.Array, shape (n_oscillators, n_oscillators)
         Matrix where phase_diffs[n1, n2] is the phase difference for
         coupling from oscillator n2 to oscillator n1 (phi_j^{n1,n2}).
-    coupling_strength : jnp.ndarray, shape (n_oscillators, n_oscillators)
+    coupling_strength : jax.Array, shape (n_oscillators, n_oscillators)
         Matrix where coupling_strengths[n1, n2] is the coupling strength
 
     Returns
     -------
-    process_covariance : jnp.ndarray, shape (2 * n_oscillators, 2 * n_oscillators)
+    process_covariance : jax.Array, shape (2 * n_oscillators, 2 * n_oscillators)
         The process covariance matrix for the correlated noise model.
     """
     n_oscillators = variance.shape[0]
@@ -261,7 +261,7 @@ def construct_correlated_noise_process_covariance(
 
 def construct_correlated_noise_measurement_matrix(
     n_sources: int,
-) -> jnp.ndarray:
+) -> jax.Array:
     """Constructs the measurement matrix for a correlated noise model.
 
     The measurement matrix is a block diagonal matrix
@@ -273,7 +273,7 @@ def construct_correlated_noise_measurement_matrix(
 
     Returns
     -------
-    measurement_matrix : jnp.ndarray, shape (n_sources, 2 * n_oscillators)
+    measurement_matrix : jax.Array, shape (n_sources, 2 * n_oscillators)
         The measurement matrix for the correlated noise model.
     """
     n_oscillators = n_sources  # Each node is influenced by one oscillator
@@ -291,12 +291,12 @@ def construct_correlated_noise_measurement_matrix(
 
 
 def construct_directed_influence_transition_matrix(
-    freqs: jnp.ndarray,
-    damping_coeffs: jnp.ndarray,
-    coupling_strengths: jnp.ndarray,
-    phase_diffs: jnp.ndarray,
+    freqs: jax.Array,
+    damping_coeffs: jax.Array,
+    coupling_strengths: jax.Array,
+    phase_diffs: jax.Array,
     sampling_freq: float = 1.0,
-) -> jnp.ndarray:
+) -> jax.Array:
     """Constructs the full state transition matrix Aj using jnp.block.
 
     Based on Equation 2.11 for coupled oscillators. The final matrix will
@@ -304,15 +304,15 @@ def construct_directed_influence_transition_matrix(
 
     Parameters
     ----------
-    freqs : jnp.ndarray, shape (n_oscillators,)
+    freqs : jax.Array, shape (n_oscillators,)
         Array of oscillation frequencies (fk) for each oscillator.
-    damping_coeffs : jnp.ndarray, shape (n_oscillators,)
+    damping_coeffs : jax.Array, shape (n_oscillators,)
         Array of damping coefficients (alpha_j^k) for each oscillator k.
-    coupling_strengths : jnp.ndarray, shape (n_oscillators, n_oscillators)
+    coupling_strengths : jax.Array, shape (n_oscillators, n_oscillators)
         Matrix where coupling_strengths[n1, n2] is the coupling strength
         from oscillator n2 to oscillator n1 (alpha_j^{n1,n2}).
         Diagonal elements are ignored. A value of 0 indicates no direct coupling.
-    phase_diffs : jnp.ndarray, shape (n_oscillators, n_oscillators)
+    phase_diffs : jax.Array, shape (n_oscillators, n_oscillators)
         Matrix where phase_diffs[n1, n2] is the phase difference for
         coupling from oscillator n2 to oscillator n1 (phi_j^{n1,n2}).
         Diagonal elements are ignored.
@@ -321,7 +321,7 @@ def construct_directed_influence_transition_matrix(
 
     Returns
     -------
-    transition_matrix : jnp.ndarray, shape (2 * n_oscillators, 2 * n_oscillators)
+    transition_matrix : jax.Array, shape (2 * n_oscillators, 2 * n_oscillators)
 
     Raises
     ------
@@ -383,7 +383,7 @@ def construct_directed_influence_transition_matrix(
 
 def construct_directed_influence_measurement_matrix(
     n_sources: int,
-) -> jnp.ndarray:
+) -> jax.Array:
     n_oscillators = n_sources  # Each node is influenced by one oscillator
     measurement_matrix = jnp.zeros((n_sources, 2 * n_oscillators))
     block_coefficients = 1 / jnp.sqrt(2)
@@ -399,12 +399,12 @@ def construct_directed_influence_measurement_matrix(
     return measurement_matrix
 
 
-def _get_scaling_factor(s: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
+def _get_scaling_factor(s: jax.Array, eps: float = 1e-12) -> jax.Array:
     """Get the scaling factor for the singular values
 
     Parameters
     ----------
-    s : jnp.ndarray, shape (2,)
+    s : jax.Array, shape (2,)
         The singular values of the matrix
     eps : float, optional
         The tolerance for the singular values, by default 1e-12
@@ -418,17 +418,17 @@ def _get_scaling_factor(s: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
     return jnp.sqrt(s[0] * s[1])  # geometric mean
 
 
-def _project_to_closest_rotation(matrix: jnp.ndarray) -> jnp.ndarray:
+def _project_to_closest_rotation(matrix: jax.Array) -> jax.Array:
     """Project a matrix to the closest rotation matrix using SVD
 
     Parameters
     ----------
-    matrix : jnp.ndarray, shape (2, 2)
+    matrix : jax.Array, shape (2, 2)
         The matrix to project, must be square and 2D
 
     Returns
     -------
-    jnp.ndarray, shape (2, 2)
+    jax.Array, shape (2, 2)
         The closest rotation matrix to the input matrix
 
     Raises
@@ -457,7 +457,7 @@ def _project_to_closest_rotation(matrix: jnp.ndarray) -> jnp.ndarray:
     return projected
 
 
-def project_coupled_transition_matrix(transition_matrix: jnp.ndarray) -> jnp.ndarray:
+def project_coupled_transition_matrix(transition_matrix: jax.Array) -> jax.Array:
     """Projects each 2x2 oscillator block of the transition matrix to the closest
     rotation matrix.
 
@@ -466,11 +466,11 @@ def project_coupled_transition_matrix(transition_matrix: jnp.ndarray) -> jnp.nda
 
     Parameters
     ----------
-    transition_matrix : jnp.ndarray, shape (2 * n_oscillators, 2 * n_oscillators)
+    transition_matrix : jax.Array, shape (2 * n_oscillators, 2 * n_oscillators)
 
     Returns
     -------
-    projected_transition_matrix : jnp.ndarray, shape (2 * n_oscillators, 2 * n_oscillators)
+    projected_transition_matrix : jax.Array, shape (2 * n_oscillators, 2 * n_oscillators)
 
     Raises
     ------
@@ -536,17 +536,17 @@ def project_coupled_transition_matrix(transition_matrix: jnp.ndarray) -> jnp.nda
     return jnp.block(projected_block_rows)
 
 
-def project_matrix_blockwise(transition_matrix: jnp.ndarray) -> jnp.ndarray:
+def project_matrix_blockwise(transition_matrix: jax.Array) -> jax.Array:
     """Projects each 2x2 oscillator block of the transition matrix to the closest
     rotation matrix.
 
     Parameters
     ----------
-    transition_matrix : jnp.ndarray, shape (2 * n_oscillators, 2 * n_oscillators)
+    transition_matrix : jax.Array, shape (2 * n_oscillators, 2 * n_oscillators)
 
     Returns
     -------
-    projected_transition_matrix, jnp.ndarray, shape (2 * n_oscillators, 2 * n_oscillators)
+    projected_transition_matrix, jax.Array, shape (2 * n_oscillators, 2 * n_oscillators)
 
     Raises
     ------
@@ -562,7 +562,7 @@ def project_matrix_blockwise(transition_matrix: jnp.ndarray) -> jnp.ndarray:
         [
             [
                 _project_to_closest_rotation(
-                    transition_matrix[*get_block_slice(from_oscillator, to_oscillator)]
+                    transition_matrix[get_block_slice(from_oscillator, to_oscillator)]
                 )
                 for to_oscillator in range(n_oscillators)
             ]
