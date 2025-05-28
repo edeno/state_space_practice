@@ -278,14 +278,15 @@ def construct_correlated_noise_measurement_matrix(
     """
     n_oscillators = n_sources  # Each node is influenced by one oscillator
 
-    measurement_matrix = jnp.zeros((n_oscillators, 2 * n_oscillators))
-    for node_ind in range(n_sources):
-        for oscillator_ind in range(n_oscillators):
-            if node_ind == oscillator_ind:
-                _, col = get_block_slice(oscillator_ind, oscillator_ind)
-                measurement_matrix = measurement_matrix.at[node_ind, col].set(
-                    [1.0, 0.0]
-                )
+    measurement_matrix = jnp.zeros((n_sources, 2 * n_oscillators))
+
+    # Get the row indices (0 to n_sources-1)
+    row_indices = jnp.arange(n_sources)
+    # Get the column indices (0, 2, 4, ...)
+    col_indices = jnp.arange(0, 2 * n_oscillators, 2)
+
+    # Set the [1, 0] blocks
+    measurement_matrix = measurement_matrix.at[row_indices, col_indices].set(1.0)
 
     return measurement_matrix
 
@@ -384,17 +385,40 @@ def construct_directed_influence_transition_matrix(
 def construct_directed_influence_measurement_matrix(
     n_sources: int,
 ) -> jax.Array:
-    n_oscillators = n_sources  # Each node is influenced by one oscillator
-    measurement_matrix = jnp.zeros((n_sources, 2 * n_oscillators))
-    block_coefficients = 1 / jnp.sqrt(2)
+    """Constructs the measurement matrix for a directed influence model.
 
-    for node_ind in range(n_sources):
-        for oscillator_ind in range(n_oscillators):
-            if node_ind == oscillator_ind:
-                _, col = get_block_slice(oscillator_ind, oscillator_ind)
-                measurement_matrix = measurement_matrix.at[node_ind, col].set(
-                    block_coefficients
-                )
+    The measurement matrix ($$ H $$) creates an observation by averaging the 'x'
+    and 'y' components of each oscillator's state, scaled by 1/sqrt(2).
+    It has a shape of (n_sources, 2 * n_oscillators).
+
+    Parameters
+    ----------
+    n_sources : int
+        Number of sources, equal to the number of oscillators.
+
+    Returns
+    -------
+    measurement_matrix : jax.Array
+        The measurement matrix, shape (n_sources, 2 * n_sources).
+    """
+    n_oscillators = n_sources
+    measurement_matrix = jnp.zeros((n_sources, 2 * n_oscillators))
+    block_coefficient = 1.0 / jnp.sqrt(2.0)
+
+    # Get the row indices (0 to n_sources-1)
+    row_indices = jnp.arange(n_sources)
+    # Get the 'x' column indices (0, 2, 4, ...)
+    col_indices_x = jnp.arange(0, 2 * n_oscillators, 2)
+    # Get the 'y' column indices (1, 3, 5, ...)
+    col_indices_y = jnp.arange(1, 2 * n_oscillators, 2)
+
+    # Set the [coeff, coeff] blocks
+    measurement_matrix = measurement_matrix.at[row_indices, col_indices_x].set(
+        block_coefficient
+    )
+    measurement_matrix = measurement_matrix.at[row_indices, col_indices_y].set(
+        block_coefficient
+    )
 
     return measurement_matrix
 
