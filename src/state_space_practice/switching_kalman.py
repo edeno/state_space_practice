@@ -832,11 +832,10 @@ def switching_kalman_maximization_step(
     #     smoother_discrete_state_prob[:-1],
     # )
     beta = jnp.einsum(
-        "tij,tcdij->cdi",  # c,d are cont_dims, i is S_k state
+        "tij,tcdij->dci",  # c,d are cont_dims, i is S_k state
         smoother_joint_discrete_state_prob,  # P(S_k=i, S_{k+1}=j)
         pair_cond_smoother_cross_cov,  # E[x_k x_{k+1}^T | S_k=i, S_{k+1}=j]
     )
-    beta = jnp.swapaxes(beta, 0, 1)
     beta += weighted_sum_of_outer_products(
         state_cond_smoother_means[:-1],  # E[x_k | S_k=i]
         state_cond_smoother_means[1:],  # E[x_{k+1} | S_{k+1}=j]
