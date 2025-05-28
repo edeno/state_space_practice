@@ -822,15 +822,6 @@ def switching_kalman_maximization_step(
         alpha, measurement_matrix, delta, n_time
     )
 
-    # beta = jnp.einsum(
-    #     "tij,tcdij->cdi",
-    #     smoother_joint_discrete_state_prob,
-    #     pair_cond_smoother_cross_cov,
-    # ).T + weighted_sum_of_outer_products(
-    #     state_cond_smoother_means[:-1],
-    #     state_cond_smoother_means[1:],
-    #     smoother_discrete_state_prob[:-1],
-    # )
     beta = jnp.einsum(
         "tij,tcdij->dci",  # c,d are cont_dims, i is S_k state
         smoother_joint_discrete_state_prob,  # P(S_k=i, S_{k+1}=j)
