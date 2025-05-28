@@ -246,3 +246,167 @@ def test_kalman_maximization_step_recovery(kalman_m_step_test_data: tuple) -> No
     assert jnp.allclose(Q_est, Q_est.T)
     assert jnp.allclose(R_est, R_est.T)
     assert jnp.allclose(init_cov_est, init_cov_est.T)
+
+
+@pytest.fixture(scope="module")
+def multi_dim_model() -> Tuple[
+    Array,
+    Array,
+    Array,
+    Array,
+    Array,
+    Array,
+    Array,
+]:
+    """
+    Provides parameters and data for a 2D state, 2D observation model.
+
+    Returns
+    -------
+    init_mean : jnp.ndarray
+        Initial state mean (N,).
+    init_cov : jnp.ndarray
+        Initial state covariance (N, N).
+    obs : jnp.ndarray
+        Simulated observations (T, O).
+    A : jnp.ndarray
+        Transition matrix (N, N).
+    Q : jnp.ndarray
+        Process noise covariance (N, N).
+    H : jnp.ndarray
+        Observation matrix (O, N).
+    R : jnp.ndarray
+        Observation noise covariance (O, O).
+    """
+    key = random.PRNGKey(123)
+    n_time = 15
+    n_cont_states = 2
+    n_obs_dim = 2
+
+    init_mean = jnp.array([0.0, 0.0])
+    init_cov = jnp.eye(n_cont_states) * 1.0
+
+    # Slightly damped system with some cross-coupling
+    transition_matrix = jnp.array([[0.95, 0.1], [-0.05, 0.9]])
+    process_cov = jnp.eye(n_cont_states) * 0.2
+
+    # Observe both states, but maybe with different scaling/noise
+    measurement_matrix = jnp.array([[1.0, 0.0], [0.0, 1.0]])
+    measurement_cov = jnp.eye(n_obs_dim) * 0.8
+
+    # Simulate data
+    true_states = [init_mean]
+    obs = []
+    k1, k2 = random.split(key)
+
+    for t in range(1, n_time):
+        w = random.multivariate_normal(
+            random.fold_in(k1, t), jnp.zeros(n_cont_states), process_cov
+        )
+        true_states.append(transition_matrix @ true_states[-1] + w)
+
+    for t in range(n_time):
+        v = random.multivariate_normal(
+            random.fold_in(k2, t), jnp.zeros(n_obs_dim), measurement_cov
+        )
+        obs.append(measurement_matrix @ true_states[t] + v)
+
+    return (
+        init_mean,
+        init_cov,
+        jnp.array(obs),
+        transition_matrix,
+        process_cov,
+        measurement_matrix,
+        measurement_cov,
+    )
+
+
+def test_kalman_smoother_values() -> None:
+    """Tests Kalman smoother output values against a known example."""
+    # Use the same simple 1D model as test_kalman_filter_values
+    init_mean = jnp.array([0.0])
+    init_cov = jnp.eye(1) * 1.0
+    A = jnp.eye(1) * 1.0
+    Q = jnp.eye(1) * 0.1
+    H = jnp.eye(1)
+    R = jnp.eye(1) * 1.0
+    obs = jnp.array([[0.5], [0.6]])
+
+    # Expected values calculated manually or via a reference implementation.
+    # Filtered: m_0|0=0.2619, P_0|0=0.5238; m_1|1=0.3919, P_1|1=0.3845
+    # Smoothed (t=1): m_1|1=0.3919, P_1|1=0.3845 (last step is same as filter)
+    # Smoothed (t=0): m_0|1=0.3711, P_0|1=0.3551
+    expected_means = jnp.array([[0.3711], [0.3919]])
+    expected_covs = jnp.array([[[0.3551]], [[0.3845]]])
+    # FIX: P_0,1|1 = P_1|1 * J_0^T = 0.3845 * 0.8397 = 0.32286
+    expected_cross_cov = jnp.array([[[0.3229]]])  # Use 4dp for comparison
+
+    smoother_mean, smoother_cov, smoother_cross_cov, _ = kalman_smoother(
+        init_mean, init_cov, obs, A, Q, H, R
+    )
+
+    np.testing.assert_allclose(smoother_mean, expected_means, rtol=1e-3)
+    np.testing.assert_allclose(smoother_cov, expected_covs, rtol=1e-3)
+    np.testing.assert_allclose(smoother_cross_cov, expected_cross_cov, rtol=1e-3)
+
+
+def test_kalman_filter_multi_dim(multi_dim_model: tuple) -> None:
+    """Tests Kalman filter shapes and stability with multi-dimensional data."""
+    (
+        init_mean,
+        init_cov,
+        obs,
+        A,
+        Q,
+        H,
+        R,
+    ) = multi_dim_model
+    n_time, n_obs_dim = obs.shape
+    n_cont_states = init_mean.shape[0]
+
+    assert n_cont_states == 2
+    assert n_obs_dim == 2
+
+    filtered_mean, filtered_cov, mll = kalman_filter(
+        init_mean, init_cov, obs, A, Q, H, R
+    )
+
+    assert filtered_mean.shape == (n_time, n_cont_states)
+    assert filtered_cov.shape == (n_time, n_cont_states, n_cont_states)
+    assert not jnp.isnan(mll)
+    assert not jnp.any(jnp.isnan(filtered_mean))
+    assert not jnp.any(jnp.isnan(filtered_cov))
+
+
+def test_kalman_smoother_multi_dim(multi_dim_model: tuple) -> None:
+    """Tests Kalman smoother shapes and stability with multi-dimensional data."""
+    (
+        init_mean,
+        init_cov,
+        obs,
+        A,
+        Q,
+        H,
+        R,
+    ) = multi_dim_model
+    n_time, n_obs_dim = obs.shape
+    n_cont_states = init_mean.shape[0]
+
+    assert n_cont_states == 2
+    assert n_obs_dim == 2
+
+    smoother_mean, smoother_cov, smoother_cross_cov, _ = kalman_smoother(
+        init_mean, init_cov, obs, A, Q, H, R
+    )
+
+    assert smoother_mean.shape == (n_time, n_cont_states)
+    assert smoother_cov.shape == (n_time, n_cont_states, n_cont_states)
+    assert smoother_cross_cov.shape == (
+        n_time - 1,
+        n_cont_states,
+        n_cont_states,
+    )
+    assert not jnp.any(jnp.isnan(smoother_mean))
+    assert not jnp.any(jnp.isnan(smoother_cov))
+    assert not jnp.any(jnp.isnan(smoother_cross_cov))
