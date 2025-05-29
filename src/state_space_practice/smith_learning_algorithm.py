@@ -413,3 +413,229 @@ def maximization_step(
     init_learning_variance = smoothed_variance[0]
 
     return sigma_epsilon, init_learning_state, init_learning_variance
+
+
+def calculate_probability_confidence_limits(
+    key: jax.random.PRNGKey,
+    smoothed_mode: jnp.ndarray,  # shape: (n_trials,)
+    smoothed_variance: jnp.ndarray,  # shape: (n_trials,)
+    mu_bias: float,
+    n_samples: int = 10000,
+    percentiles: jnp.ndarray = None,
+    prob_correct_by_chance: Optional[float] = None,
+) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
+    """Calculates confidence limits for the probability of a correct response.
+
+    This is achieved by sampling from the smoothed posterior distribution of
+    the learning state for each trial and transforming these samples through
+    the sigmoid link function.
+
+    Parameters
+    ----------
+    key : jax.random.PRNGKey
+        JAX PRNG key for random number generation.
+    smoothed_mode : jnp.ndarray, shape (n_trials,)
+        Smoothed learning state means (x_{k|T}).
+    smoothed_variance : jnp.ndarray, shape (n_trials,)
+        Smoothed learning state variances (P_{k|T}).
+    mu_bias : float
+        Bias term (mu) in the sigmoid function: p_k = sigmoid(mu + x_k).
+    n_samples : int, optional
+        Number of Monte Carlo samples to draw per trial. Default is 10000.
+    percentiles : jnp.ndarray, optional
+        Array of percentiles to compute (e.g., jnp.array([5, 50, 95])).
+        If None, defaults to jnp.array([5.0, 50.0, 95.0]).
+    prob_correct_by_chance : Optional[float], optional
+        If provided, computes the certainty (pcert) that the true probability
+        of a correct response is greater than this chance level. Default is None.
+
+    Returns
+    -------
+    probability_percentiles : jnp.ndarray, shape (n_percentiles, n_trials)
+        The computed percentile values for the probability of correct response
+        for each trial.
+    pcert : Optional[jnp.ndarray], shape (n_trials,)
+        The certainty that p_k > prob_correct_by_chance for each trial.
+        Returned if prob_correct_by_chance is not None.
+    """
+    if percentiles is None:
+        percentiles = jnp.array([5.0, 50.0, 95.0])
+
+    n_trials = smoothed_mode.shape[0]
+
+    epsilon = 1e-9
+    smoothed_std_dev = jnp.sqrt(jnp.maximum(smoothed_variance, epsilon))
+
+    # Function to process a single trial
+    def process_trial(key_trial, mode_k, std_dev_k):
+        # Generate samples from the Gaussian posterior of the learning state x_k
+        # latent_state_samples will have shape (n_samples,)
+        latent_state_samples = mode_k + std_dev_k * jax.random.normal(
+            key_trial, shape=(n_samples,)
+        )
+
+        # Transform samples to probability of correct response
+        # prob_samples will have shape (n_samples,)
+        prob_samples = jax.nn.sigmoid(mu_bias + latent_state_samples)
+
+        # Calculate requested percentiles for this trial
+        trial_percentiles = jnp.percentile(prob_samples, percentiles)
+
+        # Calculate pcert if requested
+        if prob_correct_by_chance is not None:
+            trial_pcert = jnp.mean(prob_samples > prob_correct_by_chance)
+            return trial_percentiles, trial_pcert
+        else:
+            return trial_percentiles, None  # Or jnp.nan if a consistent shape is needed
+
+    # Generate per-trial PRNG keys
+    trial_keys = jax.random.split(key, n_trials)
+    mapped_results = jax.vmap(process_trial)(
+        trial_keys, smoothed_mode, smoothed_std_dev
+    )
+
+    # Transpose percentiles to get (n_percentiles, n_trials)
+    # which is often a more convenient shape for plotting
+    all_probability_percentiles = mapped_results[0].T
+
+    if prob_correct_by_chance is not None:
+        all_pcert = mapped_results[1]
+        return all_probability_percentiles, all_pcert
+    else:
+        return all_probability_percentiles, None
+
+
+def find_min_consecutive_successes(
+    prob_success_null: float,
+    critical_probability_threshold: float,
+    sequence_length: int,
+    min_run_length: int = 2,
+    max_run_length: int = 35,
+) -> Optional[int]:
+    """
+    Finds the minimum number of consecutive successes (run_length) in a sequence of
+    `sequence_length` Bernoulli trials (with success probability `prob_success_null`)
+    such that the probability of observing at least one such run is less
+    than `critical_probability_threshold`.
+
+    This logic closely follows the MATLAB findj.m implementation, which is
+    based on methods for calculating run probabilities.
+
+    Parameters
+    ----------
+    prob_success_null : float
+        Probability of a correct response under the null hypothesis (e.g., 0.5).
+    critical_probability_threshold : float
+        The critical p-value (e.g., 0.01 or 0.05).
+    sequence_length : int
+        The length of the trial sequence to consider.
+    min_run_length : int, optional
+        Minimum run length to test. Default is 2.
+    max_run_length : int, optional
+        Maximum run length to test. Default is 35 (based on findj.m).
+
+    Returns
+    -------
+    Optional[int]
+        The minimum number of consecutive successes (`final_run_length`) that meets
+        the criterion. Returns None if no run_length in the range
+        [min_run_length, max_run_length] satisfies the condition.
+    """
+    if not (0 < prob_success_null < 1):
+        raise ValueError("prob_success_null must be between 0 and 1.")
+    if not (0 < critical_probability_threshold < 1):
+        raise ValueError("critical_probability_threshold must be between 0 and 1.")
+    if sequence_length <= 0:
+        raise ValueError("sequence_length must be positive.")
+    if min_run_length < 1 or max_run_length < min_run_length:
+        raise ValueError(
+            "Invalid min_run_length or max_run_length. "
+            "Ensure min_run_length >= 1 and max_run_length >= min_run_length."
+        )
+
+    for current_run_length in range(min_run_length, max_run_length + 1):
+        total_prob_at_least_one_run: float
+        if current_run_length > sequence_length:
+            # A run of current_run_length cannot occur in sequence_length trials
+            total_prob_at_least_one_run = 0.0
+        else:
+            # prob_first_run_ends_at_idx[i] stores P(first run of length `current_run_length`
+            # ends at a trial corresponding to index i in this array).
+            # The length of this array is `sequence_length - current_run_length + 1`,
+            # representing the number of possible ending positions for the *first* run.
+            num_possible_ending_positions = sequence_length - current_run_length + 1
+            prob_first_run_ends_at_idx = jnp.zeros(num_possible_ending_positions)
+
+            # Probability of run of length `current_run_length`
+            prob_run_occurs = prob_success_null**current_run_length
+
+            # Base case: first run ends at trial `current_run_length`
+            # (corresponds to index 0 in prob_first_run_ends_at_idx)
+            prob_first_run_ends_at_idx = prob_first_run_ends_at_idx.at[0].set(
+                prob_run_occurs
+            )
+
+            # Case 1: Short sequence (sequence_length <= 2 * current_run_length)
+            if sequence_length <= 2 * current_run_length:
+                if num_possible_ending_positions > 1:
+                    # For runs ending at trial k > current_run_length,
+                    # they must be preceded by a failure.
+                    # P(F S...S) = (1-p)p^j
+                    prob_first_run_ends_at_idx = prob_first_run_ends_at_idx.at[1:].set(
+                        prob_run_occurs * (1 - prob_success_null)
+                    )
+            # Case 2: Longer sequence (sequence_length > 2 * current_run_length)
+            else:
+                # For runs ending at trials > current_run_length and <= 2*current_run_length
+                # (indices 1 to current_run_length in prob_first_run_ends_at_idx)
+                # Example: if current_run_length is 3:
+                # f[0] for run ending at trial 3 (SSS)
+                # f[1] for run ending at trial 4 (FSSS)
+                # f[2] for run ending at trial 5 (XFSSS)
+                # f[current_run_length] for run ending at trial 2*current_run_length
+
+                # Max index for this simple assignment part:
+                # min(current_run_length, num_possible_ending_positions - 1)
+                # This covers indices 1 up to current_run_length
+                idx_simple_end = min(
+                    current_run_length, num_possible_ending_positions - 1
+                )
+                if idx_simple_end >= 1:  # Ensure slice is valid
+                    prob_first_run_ends_at_idx = prob_first_run_ends_at_idx.at[
+                        1 : idx_simple_end + 1
+                    ].set(prob_run_occurs * (1 - prob_success_null))
+
+                # Recursive part for runs ending at trials > 2*current_run_length
+                # Loop for current_f_idx from current_run_length + 1
+                # up to num_possible_ending_positions - 1
+                # This corresponds to runs ending at actual trial numbers > 2*current_run_length
+                for current_f_idx in range(
+                    current_run_length + 1, num_possible_ending_positions
+                ):
+                    # Sum P(first run ends at k) for k from current_run_length up to
+                    # trial_index_of_current_f - current_run_length - 1.
+                    # In terms of prob_first_run_ends_at_idx indices:
+                    # Sum f[0]...f[current_f_idx - current_run_length - 1]
+                    sum_limit_exclusive = current_f_idx - current_run_length
+
+                    # Ensure sum_limit_exclusive is not negative for slicing
+                    # Though sum of empty slice is 0.
+                    sum_prev_f_values = jnp.sum(
+                        prob_first_run_ends_at_idx[0:sum_limit_exclusive]
+                    )
+
+                    new_f_value = (
+                        prob_run_occurs
+                        * (1 - prob_success_null)
+                        * (1 - sum_prev_f_values)
+                    )
+                    prob_first_run_ends_at_idx = prob_first_run_ends_at_idx.at[
+                        current_f_idx
+                    ].set(new_f_value)
+
+            total_prob_at_least_one_run = jnp.sum(prob_first_run_ends_at_idx)
+
+        if total_prob_at_least_one_run < critical_probability_threshold:
+            return current_run_length
+
+    return None  # No run_length in the specified range met the criterion
