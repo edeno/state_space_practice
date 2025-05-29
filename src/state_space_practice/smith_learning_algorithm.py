@@ -45,52 +45,62 @@ optimization (BFGS), and efficient vectorized/scanned operations.
 
 """
 
+import warnings
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.optimize
-import numpy as np
 
 
 def approximate_gaussian(
     log_posterior_func: Callable, x0: jnp.ndarray
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Approximate the posterior distribution using Laplace approximation
-    to find the mode and covariance matrix.
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Approximate the posterior using Laplace approximation.
 
-    This function finds the mode of the posterior distribution and
-    computes the covariance matrix using the Hessian of the negative
-    log posterior.
+    Finds the mode and covariance matrix using the Hessian of the
+    negative log posterior. Adds regularization to the Hessian before
+    inversion for numerical stability.
 
     Parameters
     ----------
     log_posterior_func : Callable
-        A function that computes the log posterior distribution.
-        It should take a single argument x and return a scalar value
-    x0 : jnp.ndarray, shape (n,)
-        Initial guess for the mode of the posterior distribution.
+        Function computing the log posterior distribution.
+        Takes one argument (state) and returns a scalar.
+    x0 : jnp.ndarray, shape (1,)
+        Initial guess for the mode.
 
     Returns
     -------
-    mode: jnp.ndarray, shape (n,)
+    mode : jnp.ndarray, shape (1,)
         The mode of the posterior distribution.
-    covariance: jnp.ndarray, shape (n, n)
-        The covariance matrix of the posterior distribution.
+    covariance : jnp.ndarray, shape (1, 1)
+        The covariance matrix (approximated) of the posterior distribution.
 
+    Raises
+    ------
+    RuntimeError
+        If the optimization fails to converge.
     """
-    # neg_log_posterior = lambda x: -log_posterior_func(x) / len(x)
     neg_log_posterior = lambda x: -log_posterior_func(x)
-    mode = jax.scipy.optimize.minimize(fun=neg_log_posterior, x0=x0, method="BFGS").x
+
+    # Find the mode using BFGS optimization
+    result = jax.scipy.optimize.minimize(fun=neg_log_posterior, x0=x0, method="BFGS")
+
+    if not result.success:
+        raise RuntimeError(f"Optimization failed: {result.message}")
+
+    mode = result.x
     hessian = jax.hessian(neg_log_posterior)(mode)
+
+    # Add regularization for numerical stability
+    reg = 1e-6
     try:
-        covariance = jnp.linalg.inv(hessian)
-    except np.linalg.LinAlgError:
-        try:
-            covariance = jnp.linalg.pinv(hessian)
-        except np.linalg.LinAlgError:
-            return None, None
+        covariance = jnp.linalg.inv(hessian + jnp.eye(hessian.shape[0]) * reg)
+    except jnp.linalg.LinAlgError:
+        warnings.warn("Hessian inversion failed, using pseudo-inverse.", RuntimeWarning)
+        covariance = jnp.linalg.pinv(hessian + jnp.eye(hessian.shape[0]) * reg)
 
     return mode, covariance
 
