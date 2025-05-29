@@ -499,19 +499,14 @@ def calculate_probability_confidence_limits(
 
     # Generate per-trial PRNG keys
     trial_keys = jax.random.split(key, n_trials)
-    mapped_results = jax.vmap(process_trial)(
+    probability_percentiles = jax.vmap(process_trial)(
         trial_keys, smoothed_mode, smoothed_std_dev
     )
 
-    # Transpose percentiles to get (n_percentiles, n_trials)
-    # which is often a more convenient shape for plotting
-    all_probability_percentiles = mapped_results[0].T
-
     if prob_correct_by_chance is not None:
-        all_pcert = mapped_results[1]
-        return all_probability_percentiles, all_pcert
+        return probability_percentiles[0].T, probability_percentiles[1]
     else:
-        return all_probability_percentiles, None
+        return probability_percentiles[0].T, None
 
 
 def find_min_consecutive_successes(
@@ -572,8 +567,8 @@ def find_min_consecutive_successes(
             # ends at a trial corresponding to index i in this array).
             # The length of this array is `sequence_length - current_run_length + 1`,
             # representing the number of possible ending positions for the *first* run.
-            num_possible_ending_positions = sequence_length - current_run_length + 1
-            prob_first_run_ends_at_idx = jnp.zeros(num_possible_ending_positions)
+            n_possible_ending_positions = sequence_length - current_run_length + 1
+            prob_first_run_ends_at_idx = jnp.zeros(n_possible_ending_positions)
 
             # Probability of run of length `current_run_length`
             prob_run_occurs = prob_success_null**current_run_length
@@ -586,7 +581,7 @@ def find_min_consecutive_successes(
 
             # Case 1: Short sequence (sequence_length <= 2 * current_run_length)
             if sequence_length <= 2 * current_run_length:
-                if num_possible_ending_positions > 1:
+                if n_possible_ending_positions > 1:
                     # For runs ending at trial k > current_run_length,
                     # they must be preceded by a failure.
                     # P(F S...S) = (1-p)p^j
@@ -604,10 +599,10 @@ def find_min_consecutive_successes(
                 # f[current_run_length] for run ending at trial 2*current_run_length
 
                 # Max index for this simple assignment part:
-                # min(current_run_length, num_possible_ending_positions - 1)
+                # min(current_run_length, n_possible_ending_positions - 1)
                 # This covers indices 1 up to current_run_length
                 idx_simple_end = min(
-                    current_run_length, num_possible_ending_positions - 1
+                    current_run_length, n_possible_ending_positions - 1
                 )
                 if idx_simple_end >= 1:  # Ensure slice is valid
                     prob_first_run_ends_at_idx = prob_first_run_ends_at_idx.at[
@@ -616,10 +611,10 @@ def find_min_consecutive_successes(
 
                 # Recursive part for runs ending at trials > 2*current_run_length
                 # Loop for current_f_idx from current_run_length + 1
-                # up to num_possible_ending_positions - 1
+                # up to n_possible_ending_positions - 1
                 # This corresponds to runs ending at actual trial numbers > 2*current_run_length
                 for current_f_idx in range(
-                    current_run_length + 1, num_possible_ending_positions
+                    current_run_length + 1, n_possible_ending_positions
                 ):
                     # Sum P(first run ends at k) for k from current_run_length up to
                     # trial_index_of_current_f - current_run_length - 1.
@@ -893,7 +888,7 @@ class SmithLearningAlgorithm:
         self.max_possible_correct = max_possible_correct
         self.mu_bias = self._calculate_mu_bias(self.prob_correct_by_chance)
 
-        self.initial_state_handling_mode = initial_state_mode
+        self.init_state_method = initial_state_mode
 
         # Attributes to store filter/smoother outputs
         self.filtered_prob_correct_response: Optional[jax.Array] = None
@@ -975,7 +970,9 @@ class SmithLearningAlgorithm:
         log_likelihood : float
             The marginal log-likelihood of the observed data.
         """
-        n_k = self._resolve_max_possible_correct(n_correct_responses)
+        resolved_trial_max_correct = self._resolve_max_possible_correct(
+            n_correct_responses
+        )
         (
             self.prob_correct_response,
             self.filtered_learning_state_mode,
@@ -988,7 +985,7 @@ class SmithLearningAlgorithm:
             init_learning_variance=self.init_learning_variance,
             sigma_epsilon=self.sigma_epsilon,
             prob_correct_by_chance=self.prob_correct_by_chance,
-            max_possible_correct=n_k,
+            max_possible_correct=resolved_trial_max_correct,
         )
 
         prob_pred_success = jax.nn.sigmoid(self.mu_bias + self.filtered_one_step_mode)
@@ -998,7 +995,7 @@ class SmithLearningAlgorithm:
 
         log_likelihood_terms = jax.scipy.stats.binom.logpmf(
             k=n_correct_responses,
-            n=n_k,
+            n=resolved_trial_max_correct,
             p=prob_pred_success,
         )
         log_likelihood = jnp.sum(log_likelihood_terms)
@@ -1040,16 +1037,16 @@ class SmithLearningAlgorithm:
             self.smoother_gain,
         )
 
-        # --- Apply initial_state_handling_mode for initial states ---
-        if self.initial_state_handling_mode == "estimate_t0":
+        # --- Apply init_state_method for initial states ---
+        if self.init_state_method == "estimate_t0":
             self.init_learning_state = float(new_init_learning_state)
             self.init_learning_variance = float(new_init_learning_variance)
-        elif self.initial_state_handling_mode == "fixed_zero":
+        elif self.init_state_method == "fixed_zero":
             self.init_learning_state = 0.0
             self.init_learning_variance = (
                 self.sigma_epsilon**2
             )  # Use updated sigma_epsilon
-        elif self.initial_state_handling_mode == "estimate_t1_conservative":
+        elif self.init_state_method == "estimate_t1_conservative":
             if len(self.smoothed_learning_state_mode) > 1:
                 self.init_learning_state = (
                     0.5 * self.smoothed_learning_state_mode[1]
@@ -1063,7 +1060,7 @@ class SmithLearningAlgorithm:
             self.init_learning_variance = (
                 self.sigma_epsilon**2
             )  # Use updated sigma_epsilon
-        elif self.initial_state_handling_mode == "estimate_t1_direct":
+        elif self.init_state_method == "estimate_t1_direct":
             if (
                 len(self.smoothed_learning_state_mode) > 1
                 and len(self.smoothed_learning_state_variance) > 1
