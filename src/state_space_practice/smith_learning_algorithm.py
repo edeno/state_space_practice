@@ -53,6 +53,7 @@ from typing import Callable, List, Optional, Tuple
 import jax
 import jax.numpy as jnp
 import jax.scipy.optimize
+import matplotlib.pyplot as plt
 import numpy as np
 import scipy.special
 
@@ -1517,3 +1518,196 @@ class SmithLearningAlgorithm:
             return None  # Or last_trial_below_chance if definition differs slightly
 
         return int(last_trial_below_chance)
+
+    def plot_learning_process(
+        self,
+        key: jax.random.PRNGKey,
+        plot_type: str = "probability",
+        observed_n_correct: Optional[jax.Array] = None,
+        observed_max_possible: Optional[jax.Array] = None,
+        confidence_bounds: Tuple[float, float] = (5.0, 95.0),
+        n_samples_ci: int = 10000,
+        title: Optional[str] = None,
+        xlabel: str = "Trial",
+        ylabel_override: Optional[str] = None,
+    ) -> None:
+        """Plots the smoothed learning process with confidence intervals.
+
+        This method visualizes either the probability of a correct response or
+        the latent learning state over trials. Optionally, observed performance
+        can be overlaid.
+
+        Parameters
+        ----------
+        key : jax.random.PRNGKey
+            JAX PRNG key for random number generation, required for computing
+            confidence intervals if they haven't been implicitly computed by
+            prior calls that populate necessary attributes.
+        plot_type : str, optional
+            Type of plot to generate. Options are:
+            - "probability": Plots the probability of a correct response (default).
+            - "latent_state": Plots the latent learning state.
+        observed_n_correct : Optional[jax.Array], shape (n_trials,), optional
+            Observed number of correct responses per trial to overlay on the plot.
+            Default is None.
+        observed_max_possible : Optional[jax.Array], shape (n_trials,), optional
+            Maximum possible correct responses for each trial corresponding to
+            `observed_n_correct`. Required if `observed_n_correct` is provided
+            and represents counts from multiple sub-trials. If `observed_n_correct`
+            represents binary (0/1) outcomes, this can be omitted or set to ones.
+            Default is None.
+        confidence_bounds : Tuple[float, float], optional
+            Tuple of two floats representing the lower and upper percentile bounds
+            for the confidence interval (e.g., (5.0, 95.0) for a 90% CI).
+            Default is (5.0, 95.0).
+        n_samples_ci : int, optional
+            Number of Monte Carlo samples used to compute confidence intervals.
+            Default is 10000.
+        title : Optional[str], optional
+            Custom title for the plot. If None, a default title is generated.
+            Default is None.
+        xlabel : str, optional
+            Label for the x-axis. Default is "Trial".
+        ylabel_override : Optional[str], optional
+            Custom label for the y-axis. If None, a default label is generated
+            based on `plot_type`. Default is None.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted yet (i.e., smoothed estimates
+            are not available).
+        ValueError
+            If `plot_type` is invalid, or if `observed_n_correct` and
+            `observed_max_possible` have inconsistent lengths.
+        """
+        if self.smoothed_learning_state_mode is None:
+            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+
+        n_trials = len(self.smoothed_learning_state_mode)
+        trials_axis = jnp.arange(n_trials)
+
+        lower_b, upper_b = sorted(confidence_bounds)
+        # Percentiles for CI: lower, median (50th), upper
+        plot_percentiles = jnp.array([lower_b, 50.0, upper_b])
+
+        fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+        current_ylabel: str
+
+        if plot_type == "probability":
+            prob_percentiles, _ = self.get_learning_curve(
+                key=key,
+                n_samples=n_samples_ci,
+                percentiles=plot_percentiles,
+                calculate_pcert=False,
+            )
+            lower_ci = prob_percentiles[0, :]
+            median_curve = prob_percentiles[1, :]
+            upper_ci = prob_percentiles[2, :]
+            current_ylabel = (
+                ylabel_override if ylabel_override else "Probability Correct"
+            )
+            if title is None:
+                title = "Learning Curve (Probability Correct)"
+            ax.set_ylim([0, 1.05])  # Give a little space above 1.0
+        elif plot_type == "latent_state":
+            state_percentiles = self.get_latent_state_percentiles(
+                key=key, n_samples=n_samples_ci, percentiles=plot_percentiles
+            )
+            lower_ci = state_percentiles[0, :]
+            median_curve = state_percentiles[1, :]
+            upper_ci = state_percentiles[2, :]
+            current_ylabel = (
+                ylabel_override if ylabel_override else "Latent Learning State"
+            )
+            if title is None:
+                title = "Learning Curve (Latent State)"
+        else:
+            plt.close(fig)  # Close figure if erroring out
+            raise ValueError("plot_type must be 'probability' or 'latent_state'")
+
+        ax.plot(
+            trials_axis,
+            median_curve,
+            label=f"Smoothed Median ({plot_type.capitalize()})",
+            color="blue",
+            linewidth=2,
+        )
+        ax.fill_between(
+            trials_axis,
+            lower_ci,
+            upper_ci,
+            color="blue",
+            alpha=0.2,
+            label=f"{lower_b:.1f}-{upper_b:.1f}% Confidence Interval",
+        )
+
+        if observed_n_correct is not None:
+            observed_n_correct = jnp.asarray(observed_n_correct)
+            if len(observed_n_correct) != n_trials:
+                plt.close(fig)
+                raise ValueError(
+                    f"observed_n_correct length ({len(observed_n_correct)}) "
+                    f"must match number of trials ({n_trials})."
+                )
+
+            if observed_max_possible is not None:
+                observed_max_possible = jnp.asarray(observed_max_possible)
+                if len(observed_max_possible) != n_trials:
+                    plt.close(fig)
+                    raise ValueError(
+                        f"observed_max_possible length ({len(observed_max_possible)}) "
+                        f"must match number of trials ({n_trials})."
+                    )
+                # Avoid division by zero and ensure non-negative results
+                fraction_correct = jnp.where(
+                    observed_max_possible > 0,
+                    jnp.clip(observed_n_correct / observed_max_possible, 0, 1),
+                    jnp.nan,  # Represent invalid points as NaN
+                )
+                if plot_type == "probability":
+                    ax.scatter(
+                        trials_axis,
+                        fraction_correct,
+                        color="gray",
+                        alpha=0.6,
+                        label="Observed Fraction Correct",
+                        s=20,  # size of scatter points
+                        edgecolors="k",  # black edge color for points
+                        linewidths=0.5,
+                    )
+                else:
+                    warnings.warn(
+                        "Observed fraction correct overlay is typically used with plot_type='probability'.",
+                        UserWarning,
+                    )
+            # If only observed_n_correct is given, assume binary if all are 0 or 1
+            elif jnp.all((observed_n_correct == 0) | (observed_n_correct == 1)):
+                if plot_type == "probability":
+                    ax.scatter(
+                        trials_axis,
+                        observed_n_correct,
+                        color="lightgray",  # Lighter for binary
+                        alpha=0.7,
+                        label="Observed Success (0/1)",
+                        s=15,
+                        marker="|",  # Use a different marker for binary
+                    )
+                else:
+                    warnings.warn(
+                        "Observed binary success overlay is typically used with plot_type='probability'.",
+                        UserWarning,
+                    )
+            else:
+                warnings.warn(
+                    "observed_n_correct provided without observed_max_possible, "
+                    "and data is not strictly binary. Skipping observed data plot.",
+                    UserWarning,
+                )
+
+        ax.set_xlabel(xlabel, fontsize=12)
+        ax.set_ylabel(current_ylabel, fontsize=12)
+        ax.set_title(title, fontsize=14, fontweight="bold")
+        ax.legend(fontsize=10)
+        ax.grid(True, linestyle="--", alpha=0.6)
+        ax.tick_params(axis="both", which="major", labelsize=10)
