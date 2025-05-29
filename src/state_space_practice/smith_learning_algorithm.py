@@ -48,7 +48,7 @@ optimization (BFGS), and efficient vectorized/scanned operations.
 import logging
 import warnings
 from functools import partial
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -749,27 +749,103 @@ class SmithLearningAlgorithm:
             Maximum number of correct responses in each trial (N_k). Default is None.
         """
         if not isinstance(init_learning_state, (int, float)):
-            raise TypeError("init_learning_state must be an int or float.")
-        if 0.0 > init_learning_state or init_learning_state > 1.0:
-            raise ValueError("init_learning_state must be between 0 and 1.")
-        if not isinstance(init_learning_variance, (int, float, type(None))):
-            raise TypeError("init_learning_variance must be an int, float, or None.")
-        if init_learning_variance < 0.0:
-            raise ValueError("init_learning_variance must be non-negative.")
-        if init_learning_variance is None:
-            init_learning_variance = sigma_epsilon**2
+            raise TypeError("init_learning_state must be a float.")
+        # init_learning_state (x_0) is in logit space, not a probability, so no [0,1] bound.
+
         if sigma_epsilon <= 0.0:
             raise ValueError("sigma_epsilon must be positive.")
+
+        if init_learning_variance is None:
+            self.init_learning_variance = sigma_epsilon**2
+        elif (
+            isinstance(init_learning_variance, (int, float))
+            and init_learning_variance >= 0.0
+        ):
+            self.init_learning_variance = float(init_learning_variance)
+        else:
+            raise TypeError(
+                "init_learning_variance must be a non-negative float or None."
+            )
+
         if not (0.0 < prob_correct_by_chance < 1.0):
-            raise ValueError("prob_correct_by_chance must be between 0 and 1.")
-        if max_possible_correct is not None and max_possible_correct <= 0:
-            raise ValueError("max_possible_correct must be positive if provided.")
+            raise ValueError(
+                "prob_correct_by_chance must be between 0 and 1 (exclusive)."
+            )
+        if max_possible_correct is not None:
+            if not isinstance(max_possible_correct, (int, np.ndarray, jax.Array)):
+                raise TypeError(
+                    "max_possible_correct must be an int, NumPy array, or JAX array if provided."
+                )
+            if isinstance(max_possible_correct, int) and max_possible_correct <= 0:
+                raise ValueError(
+                    "max_possible_correct must be a positive integer if provided as scalar."
+                )
 
         self.init_learning_state = init_learning_state
         self.init_learning_variance = init_learning_variance
         self.sigma_epsilon = sigma_epsilon
         self.prob_correct_by_chance = prob_correct_by_chance
         self.max_possible_correct = max_possible_correct
+        self.mu_bias = self._calculate_mu_bias(self.prob_correct_by_chance)
+
+        # Attributes to store filter/smoother outputs
+        self.filtered_prob_correct_response: Optional[jax.Array] = None
+        self.filtered_learning_state_mode: Optional[jax.Array] = None
+        self.filtered_learning_state_variance: Optional[jax.Array] = None
+        self.filtered_one_step_mode: Optional[jax.Array] = None
+        self.filtered_one_step_variance: Optional[jax.Array] = None
+
+        self.smoothed_learning_state_mode: Optional[jax.Array] = None
+        self.smoothed_learning_state_variance: Optional[jax.Array] = None
+        self.smoothed_prob_correct_response: Optional[jax.Array] = None
+        self.smoother_gain: Optional[jax.Array] = None  # Has shape (n_trials-1,)
+
+    def _calculate_mu_bias(self, prob_chance: float) -> float:
+        """Converts probability of chance performance to mu bias term."""
+        # Ensure prob_chance is not exactly 0 or 1 to avoid log(0) or division by zero
+        epsilon = 1e-9  # Small epsilon
+        prob_chance_clipped = jnp.clip(prob_chance, epsilon, 1.0 - epsilon)
+        return jnp.log(prob_chance_clipped / (1.0 - prob_chance_clipped))
+
+    def _resolve_max_possible_correct(
+        self, n_correct_responses: jax.Array
+    ) -> jax.Array:
+        """
+        Resolves max_possible_correct to an array if it's None or scalar.
+        Stores it in self._max_possible_correct_val.
+        """
+        if (
+            self._is_max_possible_correct_resolved
+            and self._max_possible_correct_val is not None
+        ):
+            if isinstance(self._max_possible_correct_val, int):
+                return jnp.array(
+                    [self._max_possible_correct_val] * len(n_correct_responses),
+                    dtype=jnp.int32,
+                )
+            # If already an array (checked in init or resolved before)
+            if isinstance(self._max_possible_correct_val, (np.ndarray, jax.Array)):
+                if len(self._max_possible_correct_val) != len(n_correct_responses):
+                    raise ValueError(
+                        "Provided max_possible_correct array has inconsistent length with n_correct_responses."
+                    )
+                return jnp.asarray(self._max_possible_correct_val, dtype=jnp.int32)
+
+        # If None, infer from data (assuming constant N_k)
+        val = jnp.max(n_correct_responses)
+        if val <= 0:  # handle case where all n_correct_responses are 0
+            logger.warning(
+                "All n_correct_responses are 0 or less; max_possible_correct inferred as 1."
+            )
+            val = 1
+        resolved_array = jnp.full_like(n_correct_responses, val, dtype=jnp.int32)
+        self._max_possible_correct_val = resolved_array  # Store the array version
+        self._is_max_possible_correct_resolved = True
+        logger.info(
+            f"max_possible_correct was not provided or was scalar; "
+            f"resolved to constant value {val} for all trials."
+        )
+        return resolved_array
 
     def _e_step(self, n_correct_responses: jax.Array) -> float:
         """E-step of the EM algorithm.
@@ -787,6 +863,7 @@ class SmithLearningAlgorithm:
         log_likelihood : float
             The marginal log-likelihood of the observed data.
         """
+        n_k = self._resolve_max_possible_correct(n_correct_responses)
         (
             self.prob_correct_response,
             self.filtered_learning_state_mode,
@@ -799,18 +876,20 @@ class SmithLearningAlgorithm:
             init_learning_variance=self.init_learning_variance,
             sigma_epsilon=self.sigma_epsilon,
             prob_correct_by_chance=self.prob_correct_by_chance,
-            max_possible_correct=self.max_possible_correct,
+            max_possible_correct=n_k,
         )
 
-        # Compute log-likelihood from the probabilities
-        # log_likelihood = jnp.sum(
-        #     jax.scipy.stats.binom.logpmf(
-        #         k=n_correct_responses,
-        #         n=self.max_possible_correct or n_correct_responses.max(),
-        #         p=self.prob_correct_response,
-        #     )
-        # )
-        log_likelihood = None
+        prob_pred_success = jax.nn.sigmoid(self.mu_bias + self.filtered_one_step_mode)
+        # Clip probabilities to avoid logpmf errors with values exactly 0 or 1
+        epsilon = 1e-9
+        prob_pred_success = jnp.clip(prob_pred_success, epsilon, 1.0 - epsilon)
+
+        log_likelihood_terms = jax.scipy.stats.binom.logpmf(
+            k=n_correct_responses,
+            n=n_k,
+            p=prob_pred_success,
+        )
+        log_likelihood = jnp.sum(log_likelihood_terms)
 
         (
             self.smoothed_learning_state,
@@ -825,7 +904,7 @@ class SmithLearningAlgorithm:
             prob_correct_by_chance=self.prob_correct_by_chance,
         )
 
-        return log_likelihood
+        return float(log_likelihood) if log_likelihood is not None else None
 
     def _m_step(self, n_correct_responses: jax.Array) -> None:
         """M-step of the EM algorithm.
@@ -874,8 +953,8 @@ class SmithLearningAlgorithm:
         log_likelihoods : list[float]
             A list of marginal log-likelihoods at each iteration.
         """
-        log_likelihoods = []
-        previous_log_likelihood = -jnp.inf
+        log_likelihoods: List[Optional[float]] = []
+        previous_log_likelihood: float = -jnp.inf
 
         for iteration in range(max_iter):
             # E-step
@@ -910,3 +989,62 @@ class SmithLearningAlgorithm:
             logger.warning("Reached maximum iterations without converging.")
 
         return log_likelihoods
+
+    def get_learning_curve(
+        self,
+        key: jax.random.PRNGKey,
+        n_samples: int = 10000,
+        percentiles: Optional[jax.Array] = None,
+        calculate_pcert: bool = False,
+    ) -> Tuple[jax.Array, Optional[jax.Array]]:
+        """
+        Calculates the smoothed learning curve (probability of correct response)
+        and its confidence limits.
+
+        Must be called after `fit`.
+
+        Parameters
+        ----------
+        key : jax.random.PRNGKey
+            JAX PRNG key for random number generation (for sampling).
+        n_samples : int, optional
+            Number of Monte Carlo samples to draw per trial for confidence limits.
+            Default is 10000.
+        percentiles : jax.Array, optional
+            Array of percentiles to compute for the probability (e.g., jnp.array([5, 50, 95])).
+            If None, defaults to jnp.array([5.0, 50.0, 95.0]).
+        calculate_pcert : bool, optional
+            If True, also calculates and returns the certainty (pcert) that the true
+            probability of a correct response is greater than `self.current_prob_correct_by_chance`.
+            Default is False.
+
+        Returns
+        -------
+        probability_percentiles : jnp.ndarray
+            Shape (n_percentiles, n_trials). Computed percentile values for the
+            probability of correct response for each trial.
+        pcert : Optional[jnp.ndarray]
+            Shape (n_trials,). Certainty p_k > p_chance. Returned if `calculate_pcert` is True.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted yet (i.e., smoothed estimates are not available).
+        """
+        if (
+            self.smoothed_learning_state_mode is None
+            or self.smoothed_learning_state_variance is None
+        ):
+            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+
+        prob_chance_for_pcert = self.prob_correct_by_chance if calculate_pcert else None
+
+        return calculate_probability_confidence_limits(
+            key=key,
+            smoothed_mode=self.smoothed_learning_state_mode,
+            smoothed_variance=self.smoothed_learning_state_variance,
+            mu_bias=self.mu_bias,
+            n_samples=n_samples,
+            percentiles=percentiles,
+            prob_correct_by_chance=prob_chance_for_pcert,
+        )
