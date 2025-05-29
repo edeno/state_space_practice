@@ -723,6 +723,107 @@ def simulate_learning_data(
     return simulated_outcomes, true_prob_success
 
 
+def _find_runs_of_value(
+    data: jax.Array, value_to_find: int, min_length: int
+) -> List[Tuple[int, int]]:
+    """
+    Finds start and end indices of runs of a specific value of at least a minimum length.
+
+    Parameters
+    ----------
+    data : jax.Array, 1D
+        The input sequence of data.
+    value_to_find : int
+        The value for which to find runs (e.g., 1 for successes).
+    min_length : int
+        The minimum length of a run to be identified.
+
+    Returns
+    -------
+    List[Tuple[int, int]]
+        A list of (start_index, end_index) tuples for each qualifying run.
+        Indices are 0-based, and end_index is inclusive.
+    """
+    if min_length <= 0:
+        return []
+
+    # Create a boolean array where True indicates the presence of value_to_find
+    is_value = data == value_to_find
+
+    # Pad with False at both ends to correctly identify runs at the start/end
+    padded_is_value = jnp.concatenate(
+        [jnp.array([False]), is_value, jnp.array([False])]
+    )
+
+    # Find changes: 0 to 1 (run start), 1 to 0 (run end)
+    diffs = jnp.diff(padded_is_value.astype(jnp.int32))
+
+    # Start indices are where diff goes from 0 to 1 (original index)
+    run_starts = jnp.where(diffs == 1)[0]
+    # End indices are where diff goes from 1 to 0 (original index is one less)
+    run_ends = jnp.where(diffs == -1)[0] - 1
+
+    runs = []
+    for start, end in zip(run_starts.tolist(), run_ends.tolist()):
+        if (end - start + 1) >= min_length:
+            runs.append((start, end))
+    return runs
+
+
+def calculate_latent_state_percentiles(
+    key: jax.random.PRNGKey,
+    smoothed_mode: jnp.ndarray,  # shape: (n_trials,)
+    smoothed_variance: jnp.ndarray,  # shape: (n_trials,)
+    n_samples: int = 10000,
+    percentiles: Optional[jnp.ndarray] = None,
+) -> jnp.ndarray:
+    """Calculates confidence percentiles for the smoothed latent state.
+
+    Samples from the smoothed posterior distribution of the learning state
+    N(x_k|T, P_k|T) for each trial.
+
+    Parameters
+    ----------
+    key : jax.random.PRNGKey
+        JAX PRNG key for random number generation.
+    smoothed_mode : jnp.ndarray, shape (n_trials,)
+        Smoothed learning state means (x_{k|T}).
+    smoothed_variance : jnp.ndarray, shape (n_trials,)
+        Smoothed learning state variances (P_{k|T}).
+    n_samples : int, optional
+        Number of Monte Carlo samples to draw per trial. Default is 10000.
+    percentiles : jnp.ndarray, optional
+        Array of percentiles to compute (e.g., jnp.array([5, 50, 95])).
+        If None, defaults to jnp.array([5.0, 50.0, 95.0]).
+
+    Returns
+    -------
+    latent_state_percentiles : jnp.ndarray, shape (n_percentiles, n_trials)
+        The computed percentile values for the latent state for each trial.
+    """
+    if percentiles is None:
+        percentiles = jnp.array([5.0, 50.0, 95.0])
+
+    n_trials = smoothed_mode.shape[0]
+    epsilon = 1e-9  # For numerical stability if variance is tiny
+    smoothed_std_dev = jnp.sqrt(jnp.maximum(smoothed_variance, epsilon))
+
+    def process_trial_state(key_trial, mode_k, std_dev_k):
+        latent_state_samples = mode_k + std_dev_k * jax.random.normal(
+            key_trial, shape=(n_samples,)
+        )
+        return jnp.percentile(latent_state_samples, percentiles)
+
+    trial_keys = jax.random.split(key, n_trials)
+    # Use vmap for efficient per-trial processing
+    # mapped_results will have shape (n_trials, n_percentiles)
+    mapped_results = jax.vmap(process_trial_state)(
+        trial_keys, smoothed_mode, smoothed_std_dev
+    )
+    # Transpose to get (n_percentiles, n_trials)
+    return mapped_results.T
+
+
 class SmithLearningAlgorithm:
 
     def __init__(
@@ -732,6 +833,7 @@ class SmithLearningAlgorithm:
         sigma_epsilon: float = jnp.sqrt(0.05),
         prob_correct_by_chance: float = 0.5,
         max_possible_correct: Optional[int] = None,
+        initial_state_mode: str = "estimate",
     ):
         """Initializes the Smith Learning Algorithm parameters.
 
@@ -747,6 +849,12 @@ class SmithLearningAlgorithm:
             Probability of a correct response by chance (p_chance). Default is 0.5.
         max_possible_correct : int, optional
             Maximum number of correct responses in each trial (N_k). Default is None.
+        initial_state_mode : str, optional
+            Mode for initializing the learning state. Options are:
+            - "fixed_zero": Sets initial state to 0.0 and variance to sigma_epsilon^2.
+            - "estimate_from_t1_conservative": Estimates initial state from the second trial's mode.
+            - "estimate_from_t1_direct": Uses the second trial's mode and variance directly.
+            - "estimate": Uses the provided init_learning_state and init_learning_variance.
         """
         if not isinstance(init_learning_state, (int, float)):
             raise TypeError("init_learning_state must be a float.")
@@ -780,6 +888,36 @@ class SmithLearningAlgorithm:
                 raise ValueError(
                     "max_possible_correct must be a positive integer if provided as scalar."
                 )
+
+        if initial_state_mode == "fixed_zero":
+            self.init_learning_state = 0.0
+            self.init_learning_variance = self.sigma_epsilon**2
+        elif initial_state_mode == "estimate_from_t1_conservative":
+            if (
+                self.smoothed_learning_state_mode is not None
+                and len(self.smoothed_learning_state_mode) > 1
+            ):
+                self.init_learning_state = 0.5 * self.smoothed_learning_state_mode[1]
+            else:  # Fallback or warning if not enough data for x_1|T
+                self.init_learning_state = 0.0  # Or use x_0|T
+            self.init_learning_variance = self.sigma_epsilon**2
+        elif initial_state_mode == "estimate_from_t1_direct":
+            if (
+                self.smoothed_learning_state_mode is not None
+                and self.smoothed_learning_state_variance is not None
+                and len(self.smoothed_learning_state_mode) > 1
+            ):
+                self.init_learning_state = self.smoothed_learning_state_mode[1]
+                self.init_learning_variance = self.smoothed_learning_state_variance[1]
+            else:  # Fallback
+                # Use standard x_0|T, P_0|T
+                self.init_learning_state = float(init_learning_state)
+                self.init_learning_variance = float(init_learning_variance)
+        elif initial_state_mode == "estimate":
+            self.init_learning_state = float(init_learning_state)
+            self.init_learning_variance = float(init_learning_variance)
+        else:
+            raise ValueError(f"Unknown initial_state_mode: {initial_state_mode}")
 
         self.init_learning_state = init_learning_state
         self.init_learning_variance = init_learning_variance
@@ -1048,3 +1186,318 @@ class SmithLearningAlgorithm:
             percentiles=percentiles,
             prob_correct_by_chance=prob_chance_for_pcert,
         )
+
+    def get_latent_state_percentiles(
+        self,
+        key: jax.random.PRNGKey,
+        n_samples: int = 10000,
+        percentiles: Optional[jax.Array] = None,
+    ) -> jax.Array:
+        """
+        Calculates confidence percentiles for the smoothed latent learning state x_k|T.
+
+        Must be called after `fit`.
+
+        Parameters
+        ----------
+        key : jax.random.PRNGKey
+            JAX PRNG key for random number generation.
+        n_samples : int, optional
+            Number of Monte Carlo samples per trial. Default is 10000.
+        percentiles : jax.Array, optional
+            Percentiles to compute (e.g., jnp.array([5, 50, 95])).
+            Defaults to [5.0, 50.0, 95.0].
+
+        Returns
+        -------
+        jax.Array, shape (n_percentiles, n_trials)
+            Computed percentile values for the latent state.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+        """
+        if (
+            self.smoothed_learning_state_mode is None
+            or self.smoothed_learning_state_variance is None
+        ):
+            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+
+        return calculate_latent_state_percentiles(
+            key=key,
+            smoothed_mode=self.smoothed_learning_state_mode,
+            smoothed_variance=self.smoothed_learning_state_variance,
+            n_samples=n_samples,
+            percentiles=percentiles,
+        )
+
+    def determine_learning_criterion_run_length(
+        self,
+        sequence_length: int,
+        prob_success_null: Optional[float] = None,
+        critical_probability_threshold: float = 0.05,
+        min_run_length: int = 2,
+        max_run_length: int = 35,
+    ) -> Optional[int]:
+        """Determines the minimum length of a run of consecutive successes
+        that would be statistically significant under a null hypothesis.
+
+        This utilizes the module-level `find_min_consecutive_successes` function.
+
+        Parameters
+        ----------
+        sequence_length : int
+            The length of the trial sequence to consider for the criterion
+            (e.g., total number of trials in an experiment block).
+        prob_success_null : Optional[float], optional
+            Probability of success under the null hypothesis (e.g., chance performance).
+            If None, this method attempts to use the model's fitted
+            `self.current_prob_correct_by_chance`. Default is None.
+        critical_probability_threshold : float, optional
+            The critical p-value (alpha) for determining significance.
+            Default is 0.05.
+        min_run_length : int, optional
+            Minimum run length to test. Default is 2.
+        max_run_length : int, optional
+            Maximum run length to test. Default is 35.
+
+        Returns
+        -------
+        Optional[int]
+            The minimum number of consecutive successes (`j_crit`) considered
+            statistically significant. Returns None if no such run length is
+            found within the specified range that meets the criterion.
+
+        Raises
+        ------
+        RuntimeError
+            If `prob_success_null` is None and the model has not been fitted yet
+            (so `self.current_prob_correct_by_chance` is not available/fitted).
+        """
+        prob_success_null_to_use: float
+        if prob_success_null is None:
+            # Check if model has been fitted by looking at one of the E-step results
+            if self.filtered_learning_state_mode is None:
+                raise RuntimeError(
+                    "Model must be fitted to use its estimate of "
+                    "prob_correct_by_chance as prob_success_null. "
+                    "Alternatively, provide prob_success_null directly."
+                )
+            prob_success_null_to_use = self.current_prob_correct_by_chance
+            logger.info(
+                f"Using fitted prob_correct_by_chance "
+                f"({prob_success_null_to_use:.3f}) as prob_success_null."
+            )
+        else:
+            prob_success_null_to_use = prob_success_null
+
+        return find_min_consecutive_successes(
+            prob_success_null=prob_success_null_to_use,
+            critical_probability_threshold=critical_probability_threshold,
+            sequence_length=sequence_length,
+            min_run_length=min_run_length,
+            max_run_length=max_run_length,
+        )
+
+    def identify_significant_runs_in_data(
+        self,
+        observed_binary_responses: jax.Array,  # Ensure this is a JAX or NumPy array
+        prob_success_null: Optional[float] = None,
+        critical_probability_threshold: float = 0.05,
+        min_run_length_for_j_crit: int = 2,  # Parameter for j_crit calculation
+        max_run_length_for_j_crit: int = 35,  # Parameter for j_crit calculation
+    ) -> Tuple[Optional[int], List[Tuple[int, int]]]:
+        """
+        Identifies significant runs of successes in observed binary data.
+
+        This method first determines a critical run length (`j_crit`) that
+        is statistically unlikely to occur by chance (or a given null probability).
+        It then scans the `observed_binary_responses` for all runs of successes
+        (value 1) that meet or exceed this `j_crit`.
+
+        Parameters
+        ----------
+        observed_binary_responses : jax.Array, shape (n_trials,)
+            A 1D sequence of binary outcomes (1 for success, 0 for failure).
+        prob_success_null : Optional[float], optional
+            Probability of success under the null hypothesis used for determining `j_crit`.
+            If None, defaults to the model's fitted `self.current_prob_correct_by_chance`.
+        critical_probability_threshold : float, optional
+            The critical p-value (alpha) for determining `j_crit`. Default is 0.05.
+        min_run_length_for_j_crit : int, optional
+            Minimum run length to test when calculating `j_crit`. Default is 2.
+        max_run_length_for_j_crit : int, optional
+            Maximum run length to test when calculating `j_crit`. Default is 35.
+
+        Returns
+        -------
+        Tuple[Optional[int], List[Tuple[int, int]]]
+            - j_crit (Optional[int]): The determined critical run length.
+            - significant_runs (List[Tuple[int, int]]): A list of (start_index, end_index)
+              tuples for each identified significant run of successes in the
+              `observed_binary_responses`. Indices are 0-based and end_index is inclusive.
+
+        Raises
+        ------
+        RuntimeError
+            If `prob_success_null` is None and the model has not been fitted.
+        TypeError
+            If `observed_binary_responses` is not a JAX or NumPy array.
+        ValueError
+            If `observed_binary_responses` is not 1D.
+        """
+        if not isinstance(observed_binary_responses, (jax.Array, np.ndarray)):
+            raise TypeError("observed_binary_responses must be a JAX or NumPy array.")
+        if observed_binary_responses.ndim != 1:
+            raise ValueError("observed_binary_responses must be a 1D array.")
+        # It's assumed observed_binary_responses contains 0s and 1s.
+
+        sequence_length = len(observed_binary_responses)
+        if sequence_length == 0:
+            return None, []
+
+        j_crit = self.determine_learning_criterion_run_length(
+            sequence_length=sequence_length,
+            prob_success_null=prob_success_null,
+            critical_probability_threshold=critical_probability_threshold,
+            min_run_length=min_run_length_for_j_crit,
+            max_run_length=max_run_length_for_j_crit,
+        )
+
+        significant_runs: List[Tuple[int, int]] = []
+        if j_crit is None:
+            logger.info(
+                "No critical run length (j_crit) could be determined "
+                "with the given parameters. Cannot identify significant runs."
+            )
+            return None, significant_runs
+
+        if j_crit > sequence_length:
+            logger.info(
+                f"Critical run length (j_crit={j_crit}) exceeds sequence length "
+                f"({sequence_length}). No such runs possible."
+            )
+            return j_crit, significant_runs
+
+        logger.info(f"Critical run length (j_crit) determined to be: {j_crit}")
+
+        # Find all runs of successes (value 1) of length >= j_crit
+        # Use the helper function _find_runs_of_value
+        # Ensure observed_binary_responses is a JAX array for the helper
+        observed_binary_responses_jnp = jnp.asarray(observed_binary_responses)
+        significant_runs = _find_runs_of_value(
+            data=observed_binary_responses_jnp,
+            value_to_find=1,  # Assuming 1 represents success
+            min_length=j_crit,
+        )
+
+        return j_crit, significant_runs
+
+    def determine_learning_criterion_trial(
+        self,
+        key: jax.random.PRNGKey,  # Needed if get_learning_curve not yet called
+        lower_percentile_for_criterion: float = 5.0,  # e.g., for p05
+        chance_level_override: Optional[float] = None,
+        n_samples_for_ci: int = 10000,  # if CIs need to be recomputed
+    ) -> Optional[int]:
+        """Determines a trial index indicating when learning is reliably above chance.
+
+        This method finds the last trial where the lower confidence bound
+        (e.g., 5th percentile) of the estimated probability of a correct response
+        is below a specified chance level. The trial *after* this index
+        can be considered a point where performance is consistently above chance.
+
+        Parameters
+        ----------
+        key : jax.random.PRNGKey
+            JAX PRNGKey, required if confidence intervals need to be (re)computed.
+        lower_percentile_for_criterion : float, optional
+            The lower percentile to use from the probability confidence interval
+            (e.g., 5.0 for the 5th percentile, p05). Default is 5.0.
+        chance_level_override : Optional[float], optional
+            The probability of success considered as chance level.
+            If None, uses the model's fitted `self.current_prob_correct_by_chance`.
+            Default is None.
+        n_samples_for_ci : int, optional
+            Number of Monte Carlo samples if confidence intervals need to be recomputed.
+            Default is 10000.
+
+        Returns
+        -------
+        Optional[int]
+            The 0-indexed trial number representing the last point where the lower
+            confidence bound of success probability was below the chance level.
+            Returns None if this condition is never met, or always met, or if
+            the model is not fitted.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+        ValueError
+            If `lower_percentile_for_criterion` is not found in computed CIs.
+        """
+        if self.smoothed_learning_state_mode is None:
+            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+
+        chance_p = (
+            chance_level_override
+            if chance_level_override is not None
+            else self.prob_correct_by_chance
+        )
+
+        # Get the confidence intervals for the probability of correct response
+        # Ensure percentiles passed to get_learning_curve includes the desired one
+        target_percentiles = jnp.array(
+            [
+                lower_percentile_for_criterion,
+                50.0,
+                100.0 - lower_percentile_for_criterion,
+            ]
+        )
+
+        prob_percentiles, _ = self.get_learning_curve(
+            key=key,
+            n_samples=n_samples_for_ci,
+            percentiles=target_percentiles,
+            calculate_pcert=False,  # pcert not needed for this specific calculation
+        )
+
+        # Assuming prob_percentiles is (n_percentiles, n_trials)
+        # and the first row corresponds to lower_percentile_for_criterion
+        # This requires knowing the order or finding the correct row.
+        # If target_percentiles are sorted, prob_percentiles[0] is p_lower.
+        p_lower_bound = prob_percentiles[0, :]
+
+        # Find indices where the lower bound is less than chance_p
+        # Note: MATLAB's find gives 1-based indices. Python gives 0-based.
+        below_chance_indices = jnp.where(p_lower_bound < chance_p)[0]
+
+        if below_chance_indices.shape[0] == 0:
+            # Lower bound is never below chance (e.g., starts above chance or chance is very low)
+            # Or, if learning is immediate, this might also be empty.
+            # Consider what this means: performance is always reliably above chance from trial 0.
+            # Smith et al. would return NaN, here maybe None or -1.
+            logger.info(
+                f"The {lower_percentile_for_criterion}th percentile of success probability "
+                f"is never below the chance level of {chance_p:.3f}."
+            )
+            return None  # Or -1 to indicate learning from the start
+
+        # `cback` in MATLAB is the last such trial.
+        last_trial_below_chance = below_chance_indices[-1]
+
+        # The MATLAB code has a check: if(cback(end) < size(I,2) ).
+        # This means if the very last trial's p05 is still below chance,
+        # it considers learning not "fully" established by this criterion.
+        # Here, n_trials = len(p_lower_bound)
+        if int(last_trial_below_chance) == (len(p_lower_bound) - 1):
+            logger.info(
+                f"The {lower_percentile_for_criterion}th percentile of success probability "
+                f"is still below chance ({chance_p:.3f}) at the last trial. "
+                f"Learning criterion not met within the observed trials."
+            )
+            return None  # Or last_trial_below_chance if definition differs slightly
+
+        return int(last_trial_below_chance)
