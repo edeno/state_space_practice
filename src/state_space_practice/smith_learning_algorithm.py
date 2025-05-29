@@ -851,6 +851,7 @@ class SmithLearningAlgorithm:
             - "set_initial_to_zero": Initial state is always 0.0 and initial variance is learned.
             - "set_initial_conservative_from_second_trial": Estimates initial state from the second trial's mode.
             - "set_initial_direct_from_second_trial": Uses the second trial's mode and variance directly.
+            - "user_provided": Uses user-provided initial state and variance. No re-estimation.
 
         """
         if not isinstance(init_learning_state, (int, float)):
@@ -1078,6 +1079,8 @@ class SmithLearningAlgorithm:
                 )
                 self.init_learning_state = float(new_init_learning_state)
                 self.init_learning_variance = float(new_init_learning_variance)
+        elif self.init_state_method == "user_provided":
+            pass  # No change to initial state, user must set it externally
 
     def fit(
         self,
