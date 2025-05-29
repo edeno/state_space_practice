@@ -828,7 +828,7 @@ class SmithLearningAlgorithm:
         sigma_epsilon: float = jnp.sqrt(0.05),
         prob_correct_by_chance: float = 0.5,
         max_possible_correct: Optional[int] = None,
-        initial_state_mode: str = "estimate",
+        initial_state_method: str = "estimate",
     ):
         """Initializes the Smith Learning Algorithm parameters.
 
@@ -844,7 +844,7 @@ class SmithLearningAlgorithm:
             Probability of a correct response by chance (p_chance). Default is 0.5.
         max_possible_correct : int, optional
             Maximum number of correct responses in each trial (N_k). Default is None.
-        initial_state_mode : str, optional
+        initial_state_method : str, optional
             Mode for initializing the learning state. Options are:
             - "fixed_zero": Sets initial state to 0.0 and variance to sigma_epsilon^2.
             - "estimate_from_t1_conservative": Estimates initial state from the second trial's mode.
@@ -888,7 +888,7 @@ class SmithLearningAlgorithm:
         self.max_possible_correct = max_possible_correct
         self.mu_bias = self._calculate_mu_bias(self.prob_correct_by_chance)
 
-        self.init_state_method = initial_state_mode
+        self.init_state_method = initial_state_method
 
         # Attributes to store filter/smoother outputs
         self.filtered_prob_correct_response: Optional[jax.Array] = None
@@ -1245,7 +1245,7 @@ class SmithLearningAlgorithm:
             percentiles=percentiles,
         )
 
-    def determine_learning_criterion_run_length(
+    def find_critical_run_length(
         self,
         sequence_length: int,
         prob_success_null: Optional[float] = None,
@@ -1370,7 +1370,7 @@ class SmithLearningAlgorithm:
         if sequence_length == 0:
             return None, []
 
-        j_crit = self.determine_learning_criterion_run_length(
+        j_crit = self.find_critical_run_length(
             sequence_length=sequence_length,
             prob_success_null=prob_success_null,
             critical_probability_threshold=critical_probability_threshold,
@@ -1407,7 +1407,7 @@ class SmithLearningAlgorithm:
 
         return j_crit, significant_runs
 
-    def determine_learning_criterion_trial(
+    def find_criterion_trial(
         self,
         key: jax.random.PRNGKey,  # Needed if get_learning_curve not yet called
         lower_percentile_for_criterion: float = 5.0,  # e.g., for p05
