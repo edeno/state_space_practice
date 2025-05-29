@@ -317,7 +317,7 @@ def smith_learning_smoother(
         Smoothed learning state variance estimates
     prob_correct_response : jax.Array, shape (n_trials,)
         Smoothed probability of a correct response
-    smoother_gain : jax.Array, shape (n_trials,)
+    smoother_gain : jax.Array, shape (n_trials - 1,)
         Smoother gain estimates
     """
     n_trials: int = len(filtered_learning_state_mode)
@@ -865,11 +865,7 @@ class SmithLearningAlgorithm:
 
         if init_learning_variance is None:
             self.init_learning_variance = sigma_epsilon**2
-        elif (
-            isinstance(init_learning_variance, (int, float))
-            and init_learning_variance >= 0.0
-        ):
-            self.init_learning_variance = float(init_learning_variance)
+
         else:
             raise TypeError(
                 "init_learning_variance must be a non-negative float or None."
@@ -889,42 +885,15 @@ class SmithLearningAlgorithm:
                     "max_possible_correct must be a positive integer if provided as scalar."
                 )
 
-        if initial_state_mode == "fixed_zero":
-            self.init_learning_state = 0.0
-            self.init_learning_variance = self.sigma_epsilon**2
-        elif initial_state_mode == "estimate_from_t1_conservative":
-            if (
-                self.smoothed_learning_state_mode is not None
-                and len(self.smoothed_learning_state_mode) > 1
-            ):
-                self.init_learning_state = 0.5 * self.smoothed_learning_state_mode[1]
-            else:  # Fallback or warning if not enough data for x_1|T
-                self.init_learning_state = 0.0  # Or use x_0|T
-            self.init_learning_variance = self.sigma_epsilon**2
-        elif initial_state_mode == "estimate_from_t1_direct":
-            if (
-                self.smoothed_learning_state_mode is not None
-                and self.smoothed_learning_state_variance is not None
-                and len(self.smoothed_learning_state_mode) > 1
-            ):
-                self.init_learning_state = self.smoothed_learning_state_mode[1]
-                self.init_learning_variance = self.smoothed_learning_state_variance[1]
-            else:  # Fallback
-                # Use standard x_0|T, P_0|T
-                self.init_learning_state = float(init_learning_state)
-                self.init_learning_variance = float(init_learning_variance)
-        elif initial_state_mode == "estimate":
-            self.init_learning_state = float(init_learning_state)
-            self.init_learning_variance = float(init_learning_variance)
-        else:
-            raise ValueError(f"Unknown initial_state_mode: {initial_state_mode}")
+        self.init_learning_state = float(init_learning_state)
+        self.init_learning_variance = float(init_learning_variance)
 
-        self.init_learning_state = init_learning_state
-        self.init_learning_variance = init_learning_variance
         self.sigma_epsilon = sigma_epsilon
         self.prob_correct_by_chance = prob_correct_by_chance
         self.max_possible_correct = max_possible_correct
         self.mu_bias = self._calculate_mu_bias(self.prob_correct_by_chance)
+
+        self.initial_state_handling_mode = initial_state_mode
 
         # Attributes to store filter/smoother outputs
         self.filtered_prob_correct_response: Optional[jax.Array] = None
@@ -937,6 +906,11 @@ class SmithLearningAlgorithm:
         self.smoothed_learning_state_variance: Optional[jax.Array] = None
         self.smoothed_prob_correct_response: Optional[jax.Array] = None
         self.smoother_gain: Optional[jax.Array] = None  # Has shape (n_trials-1,)
+
+        self._max_possible_correct_val = max_possible_correct  # Store initial config
+        self._is_max_possible_correct_resolved = isinstance(
+            max_possible_correct, (np.ndarray, jax.Array)
+        ) or (isinstance(max_possible_correct, int) and max_possible_correct > 0)
 
     def _calculate_mu_bias(self, prob_chance: float) -> float:
         """Converts probability of chance performance to mu bias term."""
@@ -1030,10 +1004,10 @@ class SmithLearningAlgorithm:
         log_likelihood = jnp.sum(log_likelihood_terms)
 
         (
-            self.smoothed_learning_state,
-            self.smoothed_learning_variance,
-            self.smoothed_one_step,
-            self.smoothed_one_step_variance,
+            self.smoothed_learning_state_mode,
+            self.smoothed_learning_state_variance,
+            self.smoothed_prob_correct_response,
+            self.smoother_gain,  # This has shape (n_trials-1,)
         ) = smith_learning_smoother(
             self.filtered_learning_state_mode,
             self.filtered_learning_state_variance,
@@ -1058,13 +1032,55 @@ class SmithLearningAlgorithm:
         """
         (
             self.sigma_epsilon,
-            self.init_learning_state,
-            self.init_learning_variance,
+            new_init_learning_state,
+            new_init_learning_variance,
         ) = maximization_step(
-            self.smoothed_learning_state,
-            self.smoothed_learning_variance,
-            self.smoothed_one_step_variance,
+            self.smoothed_learning_state_mode,
+            self.smoothed_learning_state_variance,
+            self.smoother_gain,
         )
+
+        # --- Apply initial_state_handling_mode for initial states ---
+        if self.initial_state_handling_mode == "estimate_t0":
+            self.init_learning_state = float(new_init_learning_state)
+            self.init_learning_variance = float(new_init_learning_variance)
+        elif self.initial_state_handling_mode == "fixed_zero":
+            self.init_learning_state = 0.0
+            self.init_learning_variance = (
+                self.sigma_epsilon**2
+            )  # Use updated sigma_epsilon
+        elif self.initial_state_handling_mode == "estimate_t1_conservative":
+            if len(self.smoothed_learning_state_mode) > 1:
+                self.init_learning_state = (
+                    0.5 * self.smoothed_learning_state_mode[1]
+                )  # x_{1|T}
+            else:
+                logger.warning(
+                    "Not enough trials to use 'estimate_t1_conservative' (need at least 2). "
+                    "Falling back to 'estimate_t0' for initial state x0."
+                )
+                self.init_learning_state = float(new_init_learning_state)
+            self.init_learning_variance = (
+                self.sigma_epsilon**2
+            )  # Use updated sigma_epsilon
+        elif self.initial_state_handling_mode == "estimate_t1_direct":
+            if (
+                len(self.smoothed_learning_state_mode) > 1
+                and len(self.smoothed_learning_state_variance) > 1
+            ):
+                self.init_learning_state = self.smoothed_learning_state_mode[
+                    1
+                ]  # x_{1|T}
+                self.init_learning_variance = self.smoothed_learning_state_variance[
+                    1
+                ]  # P_{1|T}
+            else:
+                logger.warning(
+                    "Not enough trials/data to use 'estimate_t1_direct' (need at least 2). "
+                    "Falling back to 'estimate_t0' for initial state (x0, P0)."
+                )
+                self.init_learning_state = float(new_init_learning_state)
+                self.init_learning_variance = float(new_init_learning_variance)
 
     def fit(
         self,
