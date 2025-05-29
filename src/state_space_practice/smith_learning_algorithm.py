@@ -371,3 +371,45 @@ def smith_learning_smoother(
         prob_correct_response,
         smoother_gain,
     )
+
+
+def maximization_step(
+    smoothed_mode: jax.Array,
+    smoothed_variance: jax.Array,
+    smoother_gain: jax.Array,
+) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    """Estimate process noise from smoothed estimates.
+
+    Parameters
+    ----------
+    smoothed_mode : jax.Array, shape (n_trials,)
+        Smoothed learning state mode estimates.
+    smoothed_variance : jax.Array, shape (n_trials,)
+        Smoothed learning state variance estimates.
+    smoother_gain : jax.Array, shape (n_trials,)
+        Smoother gain estimates.
+
+    Returns
+    -------
+    sigma_epsilon : jax.Array, shape (n_trials,)
+        Estimated process noise standard deviation.
+    init_learning_state : jax.Array, shape (1,)
+        Initial learning state estimate.
+    init_learning_variance : jax.Array, shape (1,)
+        Initial learning state variance estimate.
+    """
+    n_trials: int = len(smoothed_mode)
+    expected_squared_diff_terms = (
+        (smoothed_mode[1:] - smoothed_mode[:-1]) ** 2
+        + smoothed_variance[1:]
+        + smoothed_variance[:-1]
+        - 2.0 * smoothed_variance[:-1] * smoother_gain
+    )
+
+    sigma_epsilon_sq = jnp.sum(expected_squared_diff_terms) / (n_trials - 1)
+    sigma_epsilon = jnp.sqrt(sigma_epsilon_sq)
+
+    init_learning_state = smoothed_mode[0]
+    init_learning_variance = smoothed_variance[0]
+
+    return sigma_epsilon, init_learning_state, init_learning_variance
