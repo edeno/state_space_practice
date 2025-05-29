@@ -45,6 +45,7 @@ optimization (BFGS), and efficient vectorized/scanned operations.
 
 """
 
+import logging
 import warnings
 from functools import partial
 from typing import Callable, Optional, Tuple
@@ -52,11 +53,19 @@ from typing import Callable, Optional, Tuple
 import jax
 import jax.numpy as jnp
 import jax.scipy.optimize
+import numpy as np
+import scipy.special
+
+from state_space_practice.utils import check_converged
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def approximate_gaussian(
     log_posterior_func: Callable, x0: jnp.ndarray
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+) -> Tuple[jax.Array, jax.Array]:
     """Approximate the posterior using Laplace approximation.
 
     Finds the mode and covariance matrix using the Hessian of the
@@ -639,3 +648,265 @@ def find_min_consecutive_successes(
             return current_run_length
 
     return None  # No run_length in the specified range met the criterion
+
+
+def simulate_learning_data(
+    n_trials: int = 50,
+    prob_success_init: float = 0.125,
+    prob_success_final: float = 0.6,
+    learning_rate: float = 0.2,
+    inflection_point: float = 25.0,
+    seed: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Simulates learning data with a sigmoid probability curve.
+
+    Generates binary outcomes (0 or 1) for a specified number of trials.
+    The probability of success (outcome 1) for each trial follows a
+    sigmoid curve, transitioning from an initial probability to a final
+    probability.
+
+    Parameters
+    ----------
+    n_trials : int, optional
+        The total number of trials to simulate. Default is 50.
+    prob_success_init : float, optional
+        The initial probability of success at the beginning of learning.
+        Should be between 0 and 1. Default is 0.125.
+    prob_success_final : float, optional
+        The final (asymptotic) probability of success after learning plateaus.
+        Should be between 0 and 1. Default is 0.6.
+    learning_rate : float, optional
+        The rate of learning, controlling the steepness of the sigmoid curve.
+        Higher values indicate faster learning. Default is 0.2.
+    inflection_point : float, optional
+        The trial number at which the learning curve has its inflection point
+        (i.e., the point of steepest learning). Default is 25.0.
+    seed : Optional[int], optional
+        A seed for the random number generator to ensure reproducibility.
+        If None, the generator is initialized without a fixed seed.
+        Default is None.
+
+    Returns
+    -------
+    simulated_outcomes : np.ndarray, shape (n_trials,)
+        An array of simulated binary outcomes (0 or 1) for each trial.
+    true_prob_success : np.ndarray, shape (n_trials,)
+        An array of the true underlying probabilities of success for each trial.
+
+    Notes
+    -----
+    The probability of success $P_k$ for trial $k$ is calculated as:
+    $$
+    P_k = P_{init} + (P_{final} - P_{init}) / (1 + \exp(-lr \cdot (k - infl)))
+    $$
+    where $P_{init}$ is `prob_success_init`, $P_{final}$ is `prob_success_final`,
+    $lr$ is `learning_rate`, $k$ is the trial number (0-indexed), and $infl$
+    is `inflection_point`.
+    """
+    if not (0 <= prob_success_init <= 1):
+        raise ValueError("prob_success_init must be between 0 and 1.")
+    if not (0 <= prob_success_final <= 1):
+        raise ValueError("prob_success_final must be between 0 and 1.")
+
+    trial_indices = np.arange(n_trials)
+    sigmoid_component = scipy.special.expit(
+        learning_rate * (trial_indices - inflection_point)
+    )
+    true_prob_success = (
+        prob_success_init + (prob_success_final - prob_success_init) * sigmoid_component
+    )
+    true_prob_success = np.clip(true_prob_success, 0.0, 1.0)
+
+    rng = np.random.default_rng(seed=seed)
+    simulated_outcomes = rng.binomial(1, true_prob_success)
+
+    return simulated_outcomes, true_prob_success
+
+
+class SmithLearningAlgorithm:
+
+    def __init__(
+        self,
+        init_learning_state: float = 0.0,
+        init_learning_variance: Optional[float] = None,
+        sigma_epsilon: float = jnp.sqrt(0.05),
+        prob_correct_by_chance: float = 0.5,
+        max_possible_correct: Optional[int] = None,
+    ):
+        """Initializes the Smith Learning Algorithm parameters.
+
+        Parameters
+        ----------
+        init_learning_state : float, optional
+            Initial learning state estimate (x_0). Default is 0.0.
+        init_learning_variance : float, optional
+            Initial learning state variance (P_0). Default is None, which sets it to sigma_epsilon^2.
+        sigma_epsilon : float, optional
+            Standard deviation of process noise (σ_ε). Default is sqrt(0.05).
+        prob_correct_by_chance : float, optional
+            Probability of a correct response by chance (p_chance). Default is 0.5.
+        max_possible_correct : int, optional
+            Maximum number of correct responses in each trial (N_k). Default is None.
+        """
+        if not isinstance(init_learning_state, (int, float)):
+            raise TypeError("init_learning_state must be an int or float.")
+        if 0.0 > init_learning_state or init_learning_state > 1.0:
+            raise ValueError("init_learning_state must be between 0 and 1.")
+        if not isinstance(init_learning_variance, (int, float, type(None))):
+            raise TypeError("init_learning_variance must be an int, float, or None.")
+        if init_learning_variance < 0.0:
+            raise ValueError("init_learning_variance must be non-negative.")
+        if init_learning_variance is None:
+            init_learning_variance = sigma_epsilon**2
+        if sigma_epsilon <= 0.0:
+            raise ValueError("sigma_epsilon must be positive.")
+        if not (0.0 < prob_correct_by_chance < 1.0):
+            raise ValueError("prob_correct_by_chance must be between 0 and 1.")
+        if max_possible_correct is not None and max_possible_correct <= 0:
+            raise ValueError("max_possible_correct must be positive if provided.")
+
+        self.init_learning_state = init_learning_state
+        self.init_learning_variance = init_learning_variance
+        self.sigma_epsilon = sigma_epsilon
+        self.prob_correct_by_chance = prob_correct_by_chance
+        self.max_possible_correct = max_possible_correct
+
+    def _e_step(self, n_correct_responses: jax.Array) -> float:
+        """E-step of the EM algorithm.
+
+        Computes the expected log-likelihood of the observed data given
+        the current parameters. This is done by running the Smith learning filter.
+
+        Parameters
+        ----------
+        n_correct_responses : jax.Array, shape (n_trials,)
+            The sequence of correct responses.
+
+        Returns
+        -------
+        log_likelihood : float
+            The marginal log-likelihood of the observed data.
+        """
+        (
+            self.prob_correct_response,
+            self.filtered_learning_state_mode,
+            self.filtered_learning_state_variance,
+            self.filtered_one_step_mode,
+            self.filtered_one_step_variance,
+        ) = smith_learning_filter(
+            n_correct_responses,
+            init_learning_state=self.init_learning_state,
+            init_learning_variance=self.init_learning_variance,
+            sigma_epsilon=self.sigma_epsilon,
+            prob_correct_by_chance=self.prob_correct_by_chance,
+            max_possible_correct=self.max_possible_correct,
+        )
+
+        # Compute log-likelihood from the probabilities
+        # log_likelihood = jnp.sum(
+        #     jax.scipy.stats.binom.logpmf(
+        #         k=n_correct_responses,
+        #         n=self.max_possible_correct or n_correct_responses.max(),
+        #         p=self.prob_correct_response,
+        #     )
+        # )
+        log_likelihood = None
+
+        (
+            self.smoothed_learning_state,
+            self.smoothed_learning_variance,
+            self.smoothed_one_step,
+            self.smoothed_one_step_variance,
+        ) = smith_learning_smoother(
+            self.filtered_learning_state_mode,
+            self.filtered_learning_state_variance,
+            self.filtered_one_step_mode,
+            self.filtered_one_step_variance,
+            prob_correct_by_chance=self.prob_correct_by_chance,
+        )
+
+        return log_likelihood
+
+    def _m_step(self, n_correct_responses: jax.Array) -> None:
+        """M-step of the EM algorithm.
+
+        Updates the model parameters based on the current estimates of the
+        latent variables. This is done by maximizing the expected log-likelihood
+        computed in the E-step.
+
+        Parameters
+        ----------
+        n_correct_responses : jax.Array, shape (n_trials,)
+            The sequence of correct responses.
+        """
+        (
+            self.sigma_epsilon,
+            self.init_learning_state,
+            self.init_learning_variance,
+        ) = maximization_step(
+            self.smoothed_learning_state,
+            self.smoothed_learning_variance,
+            self.smoothed_one_step_variance,
+        )
+
+    def fit(
+        self,
+        n_correct_responses: jax.Array,
+        max_iter: int = 100,
+        tolerance: float = 1e-4,
+    ) -> list[float]:
+        """Fits the model to responses using the EM algorithm.
+
+        Iteratively performs E-steps and M-steps until convergence or
+        the maximum number of iterations is reached.
+
+        Parameters
+        ----------
+        responses : jax.Array, shape (n_trials,)
+            The sequence of responses.
+        max_iter : int, optional
+            Maximum number of EM iterations, by default 100.
+        tolerance : float, optional
+            Convergence tolerance for log-likelihood, by default 1e-4.
+
+        Returns
+        -------
+        log_likelihoods : list[float]
+            A list of marginal log-likelihoods at each iteration.
+        """
+        log_likelihoods = []
+        previous_log_likelihood = -jnp.inf
+
+        for iteration in range(max_iter):
+            # E-step
+            current_log_likelihood = self._e_step(n_correct_responses)
+            log_likelihoods.append(current_log_likelihood)
+
+            # Check convergence
+            is_converged, is_increasing = check_converged(
+                current_log_likelihood, previous_log_likelihood, tolerance
+            )
+
+            if not is_increasing:
+                logger.warning(
+                    f"Log-likelihood decreased at iteration {iteration + 1}!"
+                )
+
+            if is_converged:
+                logger.info(f"Converged after {iteration + 1} iterations.")
+                break
+
+            # M-step
+            self._m_step(n_correct_responses)
+
+            logger.info(
+                f"Iteration {iteration + 1}/{max_iter}\t"
+                f"Log-Likelihood: {current_log_likelihood:.4f}\t"
+                f"Change: {(current_log_likelihood - previous_log_likelihood):.4f}"
+            )
+            previous_log_likelihood = current_log_likelihood
+
+        if len(log_likelihoods) == max_iter:
+            logger.warning("Reached maximum iterations without converging.")
+
+        return log_likelihoods
