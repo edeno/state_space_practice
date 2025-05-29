@@ -828,7 +828,7 @@ class SmithLearningAlgorithm:
         sigma_epsilon: float = jnp.sqrt(0.05),
         prob_correct_by_chance: float = 0.5,
         max_possible_correct: Optional[int] = None,
-        initial_state_method: str = "estimate",
+        initial_state_method: str = "reestimate_initial_from_data",
     ):
         """Initializes the Smith Learning Algorithm parameters.
 
@@ -845,11 +845,13 @@ class SmithLearningAlgorithm:
         max_possible_correct : int, optional
             Maximum number of correct responses in each trial (N_k). Default is None.
         initial_state_method : str, optional
-            Mode for initializing the learning state. Options are:
-            - "fixed_zero": Sets initial state to 0.0 and variance to sigma_epsilon^2.
-            - "estimate_from_t1_conservative": Estimates initial state from the second trial's mode.
-            - "estimate_from_t1_direct": Uses the second trial's mode and variance directly.
-            - "estimate": Uses the provided init_learning_state and init_learning_variance.
+            Mode for learning the initial state.
+            Options are:
+            - "reestimate_initial_from_data": Re-estimates initial state from the data.
+            - "set_initial_to_zero": Initial state is always 0.0 and initial variance is learned.
+            - "set_initial_conservative_from_second_trial": Estimates initial state from the second trial's mode.
+            - "set_initial_direct_from_second_trial": Uses the second trial's mode and variance directly.
+
         """
         if not isinstance(init_learning_state, (int, float)):
             raise TypeError("init_learning_state must be a float.")
@@ -1038,29 +1040,27 @@ class SmithLearningAlgorithm:
         )
 
         # --- Apply init_state_method for initial states ---
-        if self.init_state_method == "estimate_t0":
+        if self.init_state_method == "reestimate_initial_from_data":
             self.init_learning_state = float(new_init_learning_state)
             self.init_learning_variance = float(new_init_learning_variance)
-        elif self.init_state_method == "fixed_zero":
+        elif self.init_state_method == "set_initial_to_zero":
             self.init_learning_state = 0.0
-            self.init_learning_variance = (
-                self.sigma_epsilon**2
-            )  # Use updated sigma_epsilon
-        elif self.init_state_method == "estimate_t1_conservative":
+            self.init_learning_variance = self.sigma_epsilon**2
+        elif self.init_state_method == "set_initial_conservative_from_second_trial":
             if len(self.smoothed_learning_state_mode) > 1:
                 self.init_learning_state = (
                     0.5 * self.smoothed_learning_state_mode[1]
                 )  # x_{1|T}
             else:
                 logger.warning(
-                    "Not enough trials to use 'estimate_t1_conservative' (need at least 2). "
-                    "Falling back to 'estimate_t0' for initial state x0."
+                    "Not enough trials to use 'set_initial_conservative_from_second_trial' (need at least 2). "
+                    "Falling back to 'reestimate_initial_from_data' for initial state x0."
                 )
                 self.init_learning_state = float(new_init_learning_state)
             self.init_learning_variance = (
                 self.sigma_epsilon**2
             )  # Use updated sigma_epsilon
-        elif self.init_state_method == "estimate_t1_direct":
+        elif self.init_state_method == "set_initial_direct_from_second_trial":
             if (
                 len(self.smoothed_learning_state_mode) > 1
                 and len(self.smoothed_learning_state_variance) > 1
@@ -1073,8 +1073,8 @@ class SmithLearningAlgorithm:
                 ]  # P_{1|T}
             else:
                 logger.warning(
-                    "Not enough trials/data to use 'estimate_t1_direct' (need at least 2). "
-                    "Falling back to 'estimate_t0' for initial state (x0, P0)."
+                    "Not enough trials/data to use 'set_initial_direct_from_second_trial' (need at least 2). "
+                    "Falling back to 'reestimate_initial_from_data' for initial state (x0, P0)."
                 )
                 self.init_learning_state = float(new_init_learning_state)
                 self.init_learning_variance = float(new_init_learning_variance)
