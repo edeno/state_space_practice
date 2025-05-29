@@ -12,12 +12,18 @@ observation data. It uses the approach described by:
 The model assumes:
 1.  **Latent Learning State (x_k)**: Follows a Gaussian random walk, representing
     the underlying ability or knowledge at trial 'k'.
-    $$ x_k = x_{k-1} + w_k, \quad w_k \sim N(0, \sigma_\epsilon^2) $$
+    $$
+    x_k = x_{k-1} + w_k, \quad w_k \sim N(0, \sigma_\epsilon^2)
+    $$
 2.  **Observation Model**: The probability of a correct response ($p_k$) is
     linked to the latent state via a sigmoid (logit) function. The number
     of correct responses ($y_k$) in a trial follows a Binomial distribution.
-    $$ p_k = \frac{1}{1 + \exp(-(\mu + x_k))} $$
-    $$ y_k \sim \text{Binomial}(N_k, p_k) $$
+    $$
+    p_k = \frac{1}{1 + \exp(-(\mu + x_k))}
+    $$
+    $$
+    y_k \sim \text{Binomial}(N_k, p_k)
+    $$
     where $\mu$ is a bias term (often related to chance performance) and
     $N_k$ is the maximum possible correct responses in trial 'k'.
 
@@ -30,11 +36,9 @@ and calculating the curvature (Hessian) at the mode.
 
 The module provides:
 - `approximate_gaussian`: Computes the Laplace approximation.
-- `log_posterior_objective`: Defines the log-posterior for a single step.
-- `smith_learning_filter`: Implements the forward-pass filter using
-  `jax.lax.scan` and `approximate_gaussian`.
-- `smith_learning_smoother`: Implements a backward-pass Rauch-Tung-Striebel
-  (RTS) smoother using the Gaussian approximations from the filter.
+- `_log_posterior_objective`: Defines the log-posterior for a single step.
+- `smith_learning_filter`: Implements the forward-pass filter.
+- `smith_learning_smoother`: Implements a backward-pass RTS smoother.
 
 This implementation leverages JAX for automatic differentiation (Hessian),
 optimization (BFGS), and efficient vectorized/scanned operations.
