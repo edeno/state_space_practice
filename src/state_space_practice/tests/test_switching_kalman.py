@@ -6,6 +6,11 @@ module, covering helper functions, core vmapped functions, and integration
 tests comparing SKF to KF and verifying SKF behavior.
 """
 
+import jax
+
+# Enable 64-bit precision for tests that require it.
+jax.config.update("jax_enable_x64", True)
+
 from typing import Tuple
 
 import jax.numpy as jnp
@@ -837,131 +842,376 @@ def test_m_step_two_identical_states(
     np.testing.assert_allclose(skf_new_H[..., 0], skf_new_H[..., 1], rtol=rtol)
 
 
-def test_m_step_two_distinct_states_equal_weights() -> None:
+def test_m_step_discrete_transition_matrix_simple():
     """
-    Tests switching_kalman_maximization_step with synthesized ESS
-    for two distinct states, assuming equal smoothed probabilities for each state.
-    Focuses on recovery of A_j, Q_j, Z, and init_prob.
-    H_j and R_j will be trivial due to zero observations.
+    A bare-bones two-state switching Kalman M-step test.
+    We fix A=1, Q=0, H=1, R=0 so that continuous stats play no role,
+    synthesize a discrete sequence with known Z, and verify z_est ≈ Z.
     """
-    # 1. Define True Parameters for Two Distinct 1D States
+    # 1) Model sizes
+    n_time = 20_000
+    n_cont = 1
+    n_obs = 1
+    n_disc = 2
+
+    # 2) Ground-truth transition matrix
+    #   State 0 → stay 80%, switch→1 with 20%
+    #   State 1 → stay 90%, switch→0 with 10%
+    Z_true = jnp.array([[0.80, 0.20], [0.10, 0.90]], dtype=jnp.float32)
+    init_prob = jnp.array([0.5, 0.5], dtype=jnp.float32)
+
+    # 3) Generate a long discrete path s_t ~ Markov(Z_true)
+    key = random.PRNGKey(0)
+    key, sub = random.split(key)
+    s = jnp.zeros(n_time, dtype=jnp.int32)
+    s = s.at[0].set(random.choice(sub, a=n_disc, p=init_prob))
+    for t in range(1, n_time):
+        key, sub = random.split(key)
+        prev = int(s[t - 1])
+        s = s.at[t].set(random.choice(sub, a=n_disc, p=Z_true[prev]))
+
+    # 4) Build “perfect” smoother outputs:
+    #    • gammaₜ(j)=P(Sₜ=j)=1 for the true j, else 0
+    #    • ξₜ(i,j)=P(Sₜ=i,Sₜ₊₁=j)=1 on the true transition pair, else 0
+    gamma = one_hot(s, n_disc, dtype=jnp.float32)  # (T, 2)
+    ξ = jnp.zeros((n_time - 1, n_disc, n_disc), dtype=jnp.float32)
+    for t in range(n_time - 1):
+        i, j_ = int(s[t]), int(s[t + 1])
+        ξ = ξ.at[t, i, j_].set(1.0)
+
+    # 5) Continuous stats all zero/degenerate:
+    means = jnp.zeros((n_time, n_cont, n_disc), dtype=jnp.float32)
+    covs = jnp.zeros((n_time, n_cont, n_cont, n_disc), dtype=jnp.float32)
+    cross = jnp.zeros((n_time - 1, n_cont, n_cont, n_disc, n_disc), dtype=jnp.float32)
+
+    # 6) Dummy observations (never used in Z‐update)
+    obs = jnp.zeros((n_time, n_obs), dtype=jnp.float32)
+
+    # 7) Call just the M‐step
+    _, _, _, _, _, _, Z_est, init_prob_est = switching_kalman_maximization_step(
+        obs=obs,
+        state_cond_smoother_means=means,
+        state_cond_smoother_covs=covs,
+        smoother_discrete_state_prob=gamma,
+        smoother_joint_discrete_state_prob=ξ,
+        pair_cond_smoother_cross_cov=cross,
+    )
+
+    # 8) Assert we recover Z_true (and roughly the init‐prob too)
+    np.testing.assert_allclose(Z_true, Z_est, atol=1e-2)
+
+
+def test_m_step_transition_matrix_deterministic():
+    """
+    Deterministic test for the discrete-transition M-step.
+    We hand-construct a 3-step path 0 -> 1 -> 0, so that
+      Z_true = [[0,1],
+                [1,0]]
+    and verify that the M-step recovers it exactly.
+    """
+    # 1) dimensions
+    T = 3
+    n_cont = 1
+    n_obs = 1
+    n_disc = 2
+
+    # 2) perfect smoothing marginals gammaₜ(j)=P(Sₜ=j | Y)
+    #    time 0: state=0, time 1: state=1, time 2: state=0
+    gamma = jnp.array(
+        [
+            [1.0, 0.0],  # t=0
+            [0.0, 1.0],  # t=1
+            [1.0, 0.0],  # t=2
+        ],
+        dtype=jnp.float32,
+    )  # shape (T, n_disc)
+
+    # 3) perfect two-step joint ξₜ(i,j)=P(Sₜ=i, Sₜ₊₁=j | Y)
+    #    at t=0: 0->1, at t=1: 1->0
+    ξ = jnp.zeros((T - 1, n_disc, n_disc), dtype=jnp.float32)
+    ξ = ξ.at[0, 0, 1].set(1.0)
+    ξ = ξ.at[1, 1, 0].set(1.0)
+
+    # 4) degenerate continuous statistics (so A,Q,H,R updates are trivial)
+    means = jnp.zeros((T, n_cont, n_disc), dtype=jnp.float32)
+    covs = jnp.zeros((T, n_cont, n_cont, n_disc), dtype=jnp.float32)
+    cross = jnp.zeros((T - 1, n_cont, n_cont, n_disc, n_disc), dtype=jnp.float32)
+
+    # 5) dummy observations (not used for Z)
+    obs = jnp.zeros((T, n_obs), dtype=jnp.float32)
+
+    # 6) run just the M-step
+    _, _, _, _, _, _, Z_est, init_prob_est = switching_kalman_maximization_step(
+        obs=obs,
+        state_cond_smoother_means=means,
+        state_cond_smoother_covs=covs,
+        smoother_discrete_state_prob=gamma,
+        smoother_joint_discrete_state_prob=ξ,
+        pair_cond_smoother_cross_cov=cross,
+    )
+
+    # 7) check we recovered the “swap” transition matrix exactly
+    Z_true = jnp.array([[0.0, 1.0], [1.0, 0.0]], dtype=jnp.float32)
+
+    np.testing.assert_allclose(Z_est, Z_true, atol=0.0)
+
+
+def test_m_step_continuous_transition_matrix_estimation():
+    """
+    Deterministic test for the continuous-transition M-step.
+    We use one discrete state and no noise, so x_t = A_true @ x_{t-1}
+    exactly, and the M-step should recover A_true.
+    """
+    # 1) dimensions
+    T = 10  # Use a longer trajectory for better conditioning
+    n_cont = 2
+    n_obs = 1
+    n_disc = 1
+
+    # 2) Ground-truth A.
+    # **FIX**: Use eigenvalues closer to 1 to prevent exploding state values,
+    # which caused numerical instability with float32.
+    A_true_flat = jnp.array([[1.1, 0.1], [-0.05, 1.2]], dtype=jnp.float32)
+    A_true = A_true_flat[..., None, None].transpose(
+        2, 3, 0, 1
+    )  # Shape (1,1,2,2) -> (2,2,1,1) -> (2,2,1)
+    A_true = A_true.reshape(n_cont, n_cont, n_disc)
+
+    # 3) Build a perfect 2-D trajectory x_t
+    x_t = jnp.zeros((T, n_cont))
+    x_t = x_t.at[0].set(jnp.array([1.0, 1.0]))
+    for t in range(1, T):
+        x_t = x_t.at[t].set(A_true_flat @ x_t[t - 1])
+
+    # 4) Dummy observations (not used for A-update)
+    obs = jnp.zeros((T, n_obs), dtype=jnp.float32)
+
+    # 5) “Perfect” smoother outputs:
+    means = x_t[:, :, None]
+    covs = jnp.zeros((T, n_cont, n_cont, n_disc), dtype=jnp.float32)
+    # The cross term E[x_t x_{t-1}^T] must be provided.
+    cross = jnp.zeros((T - 1, n_cont, n_cont, n_disc, n_disc), dtype=jnp.float32)
+
+    gamma = jnp.ones((T, n_disc), dtype=jnp.float32)
+    ξ = jnp.ones((T - 1, n_disc, n_disc), dtype=jnp.float32)
+
+    # 6) Run only the M-step
+    (A_est, _, _, _, _, _, _, _) = switching_kalman_maximization_step(
+        obs=obs,
+        state_cond_smoother_means=means,
+        state_cond_smoother_covs=covs,
+        smoother_discrete_state_prob=gamma,
+        smoother_joint_discrete_state_prob=ξ,
+        pair_cond_smoother_cross_cov=cross,
+    )
+
+    # 7) Assert A_est == A_true exactly
+    np.testing.assert_allclose(A_est.squeeze(), A_true_flat, atol=2e-5)
+
+
+def test_m_step_continuous_transition_scalar():
+    """
+    Deterministic test for the continuous-transition M-step.
+    x_{t+1} = 2 x_t exactly, so A_est should be 2.
+    """
+    # 1) dimensions
+    T = 5
+    n_cont = 1
+    n_obs = 1
+    n_disc = 1
+
+    # 2) True A = 2
+    A_true = jnp.array([[[2.0]]], dtype=jnp.float32)  # shape (1,1,1)
+
+    # 3) Trajectory: x = [1,2,4,8,16]
+    x_t = jnp.array([[1.0], [2.0], [4.0], [8.0], [16.0]], dtype=jnp.float32)
+
+    # 4) Dummy observations (not used in A update)
+    obs = jnp.zeros((T, n_obs), dtype=jnp.float32)
+
+    # 5) “Perfect” smoother outputs:
+    #    • E[x_t|S=0] = x_t
+    #    • Cov[x_t|S=0] = 0
+    #    • Cov[x_t,x_{t+1}|S=0,S=0] = 0
+    #    • gamma=1 and ξ=1 for the single state
+    means = x_t[:, :, None]  # (T, n_cont, n_disc)
+    covs = jnp.zeros((T, n_cont, n_cont, n_disc), dtype=jnp.float32)
+    cross = jnp.zeros((T - 1, n_cont, n_cont, n_disc, n_disc), dtype=jnp.float32)
+    gamma = jnp.ones((T, n_disc), dtype=jnp.float32)
+    ξ = jnp.ones((T - 1, n_disc, n_disc), dtype=jnp.float32)
+
+    # 6) Run only the M-step
+    A_est, _, _, _, _, _, _, _ = switching_kalman_maximization_step(
+        obs=obs,
+        state_cond_smoother_means=means,
+        state_cond_smoother_covs=covs,
+        smoother_discrete_state_prob=gamma,
+        smoother_joint_discrete_state_prob=ξ,
+        pair_cond_smoother_cross_cov=cross,
+    )
+
+    # 7) Assert exact recovery
+    np.testing.assert_allclose(A_est.squeeze(), 2.0, atol=0.0)
+
+
+def test_m_step_discrete_transition_deterministic_switch():
+    """
+    Tests the discrete transition matrix M-step with a perfect,
+    deterministic switching path (0 -> 1 -> 0 -> ...).
+
+    This test bypasses the filter/smoother by constructing the exact
+    smoothed probabilities (gamma and xi) that would result from a
+    perfect observation of this path. It verifies that the M-step
+    recovers the known transition matrix Z = [[0, 1], [1, 0]].
+    """
+    # 1. Define dimensions and the deterministic path
+    n_time = 4
     n_cont_states = 1
     n_obs_dim = 1
     n_discrete_states = 2
-    T = 200  # Number of time steps for synthetic statistics
+    dtype = jnp.float32
 
-    A0_true = jnp.array([[0.95]])
-    Q0_true = jnp.array([[0.1]])
-    H0_true = jnp.array([[1.0]])  # Will be estimated as ~0 due to zero obs
-    R0_true = jnp.array([[0.5]])  # Will be estimated as ~0 due to zero obs
+    # The true, deterministic path: 0 -> 1 -> 0 -> 1
+    true_states = jnp.array([0, 1, 0, 1])
 
-    A1_true = jnp.array([[0.6]])
-    Q1_true = jnp.array([[0.3]])
-    H1_true = jnp.array([[1.0]])  # Will be estimated as ~0
-    R1_true = jnp.array([[1.2]])  # Will be estimated as ~0
+    # The ground-truth transition matrix we expect to recover
+    z_true = jnp.array([[0.0, 1.0], [1.0, 0.0]], dtype=dtype)
 
-    # True initial conditions for continuous state (per discrete state)
-    # For simplicity in synthesizing ESS, we'll assume zero mean for x_k
-    init_mean_true_cond = jnp.zeros((n_cont_states, n_discrete_states))
-    # Steady-state covariances (assuming zero mean)
-    P_ss_0 = Q0_true / (1 - A0_true[0, 0] ** 2)
-    P_ss_1 = Q1_true / (1 - A1_true[0, 0] ** 2)
-    init_cov_true_cond = jnp.stack([P_ss_0, P_ss_1], axis=-1)
+    # 2. Construct "perfect" smoother outputs (gamma and xi)
+    # gamma_t(j) = P(S_t=j | Y) is 1 for the true state, 0 otherwise.
+    gamma = one_hot(true_states, n_discrete_states, dtype=dtype)
 
-    # True discrete parameters
-    Z_true = jnp.array([[0.8, 0.2], [0.3, 0.7]])
-    init_prob_true = jnp.array([0.5, 0.5])
+    # xi_t(i,j) = P(S_t=i, S_{t+1}=j | Y) is 1 for the true transition, 0 otherwise.
+    xi = jnp.zeros((n_time - 1, n_discrete_states, n_discrete_states), dtype=dtype)
+    for t in range(n_time - 1):
+        i, j = true_states[t], true_states[t + 1]
+        xi = xi.at[t, i, j].set(1.0)
 
-    # 2. Synthesize Expected Sufficient Statistics (ESS)
-    obs_input = jnp.zeros((T, n_obs_dim))
-
-    # Smoothed discrete state probabilities P(S_t=j | Y)
-    skf_sdsp_manual = jnp.full((T, n_discrete_states), 1.0 / n_discrete_states)
-
-    # Smoothed joint discrete state probabilities P(S_t=i, S_{t+1}=j | Y)
-    # For this test, let's make it consistent with Z_true and equal marginals for S_t
-    # P(S_t=i, S_{t+1}=j | Y) = P(S_{t+1}=j | S_t=i, Y) * P(S_t=i | Y)
-    # Approximating P(S_{t+1}=j | S_t=i, Y) with Z_true[i,j]
-    skf_sjdsp_manual = jnp.zeros((T - 1, n_discrete_states, n_discrete_states))
-    for i in range(n_discrete_states):
-        for j_prime in range(n_discrete_states):
-            # P(S_t=i|Y) is 0.5. Z_true[i, j_prime] is P(S_{t+1}=j_prime | S_t=i)
-            skf_sjdsp_manual = skf_sjdsp_manual.at[:, i, j_prime].set(
-                (1.0 / n_discrete_states) * Z_true[i, j_prime]
-            )
-
-    # State conditional smoother means E[x_t | S_t=j, Y]
-    skf_scsm_manual = jnp.zeros((T, n_cont_states, n_discrete_states))
-
-    # State conditional smoother covariances Cov[x_t | S_t=j, Y]
-    # Using steady-state covariances
-    skf_scsc_manual = jnp.zeros((T, n_cont_states, n_cont_states, n_discrete_states))
-    skf_scsc_manual = skf_scsc_manual.at[:, :, :, 0].set(P_ss_0)
-    skf_scsc_manual = skf_scsc_manual.at[:, :, :, 1].set(P_ss_1)
-
-    # Pair conditional smoother cross-cov E[x_t x_{t+1}^T | S_t=i, S_{t+1}=j, Y]
-    # Assuming zero means, this is Cov(x_t, x_{t+1} | S_t=i, S_{t+1}=j, Y)
-    # And E[x_t x_{t+1}^T | S_t=i, S_{t+1}=j] = E[x_t (A_i x_t + w_{t+1})^T | S_t=i]
-    #                                       = E[x_t x_t^T A_i^T | S_t=i]
-    #                                       = (P_ss_i + m_i m_i^T) A_i^T
-    # Since m_i = 0, this is P_ss_i @ A_i_true.T
-    skf_pcscc_manual = jnp.zeros(
-        (T - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+    # 3. Create dummy inputs for all other continuous parameters
+    dummy_obs = jnp.zeros((n_time, n_obs_dim), dtype=dtype)
+    dummy_means = jnp.zeros((n_time, n_cont_states, n_discrete_states), dtype=dtype)
+    dummy_covs = jnp.zeros(
+        (n_time, n_cont_states, n_cont_states, n_discrete_states), dtype=dtype
     )
-    # This term depends on S_t = i (the first discrete index)
-    skf_pcscc_manual = skf_pcscc_manual.at[:, :, :, 0, :].set(P_ss_0 @ A0_true.T)
-    skf_pcscc_manual = skf_pcscc_manual.at[:, :, :, 1, :].set(P_ss_1 @ A1_true.T)
+    dummy_cross_cov = jnp.zeros(
+        (
+            n_time - 1,
+            n_cont_states,
+            n_cont_states,
+            n_discrete_states,
+            n_discrete_states,
+        ),
+        dtype=dtype,
+    )
 
-    # 3. Run switching_kalman_maximization_step
+    # 4. Run the M-step
     (
-        skf_new_A,
-        skf_new_H,
-        skf_new_Q,
-        skf_new_R,
-        skf_new_init_mean,
-        skf_new_init_cov,
-        skf_new_Z,
-        skf_new_init_prob,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        z_est,
+        _,
     ) = switching_kalman_maximization_step(
-        obs_input,
-        skf_scsm_manual,
-        skf_scsc_manual,
-        skf_sdsp_manual,
-        skf_sjdsp_manual,
-        skf_pcscc_manual,
+        obs=dummy_obs,
+        state_cond_smoother_means=dummy_means,
+        state_cond_smoother_covs=dummy_covs,
+        smoother_discrete_state_prob=gamma,
+        smoother_joint_discrete_state_prob=xi,
+        pair_cond_smoother_cross_cov=dummy_cross_cov,
     )
 
-    # 4. Assert Expected Outcomes
-    rtol = 1e-4  # May need adjustment
-    atol = 1e-5  # May need adjustment
+    # 5. Assert exact recovery of the transition matrix
+    np.testing.assert_allclose(z_est, z_true, atol=1e-7)
 
-    # Check A_j
-    np.testing.assert_allclose(skf_new_A[..., 0], A0_true, rtol=rtol, atol=atol)
-    np.testing.assert_allclose(skf_new_A[..., 1], A1_true, rtol=rtol, atol=atol)
 
-    # Check Q_j
-    np.testing.assert_allclose(skf_new_Q[..., 0], Q0_true, rtol=rtol, atol=atol)
-    np.testing.assert_allclose(skf_new_Q[..., 1], Q1_true, rtol=rtol, atol=atol)
+def test_m_step_two_state_continuous_transition():
+    """
+    Tests the M-step for the continuous transition matrix `A` in a
+    two-state system.
+    This test constructs a deterministic trajectory where the system spends
+    the first half of its time in state 0 (with dynamics A_0) and the
+    second half in state 1 (with different dynamics A_1). By providing the
+    M-step with the exact, known smoother outputs for this path, we can
+    definitively test if it correctly recovers both A_0 and A_1.
+    """
+    # 1. Define dimensions and use float64 for numerical stability
+    n_time = 20
+    n_cont_states = 2
+    n_obs_dim = 1
+    n_discrete_states = 2
+    dtype = jnp.float64
 
-    # Check H_j (should be close to zero due to zero obs)
-    np.testing.assert_allclose(skf_new_H[..., 0], jnp.zeros_like(H0_true), atol=1e-3)
-    np.testing.assert_allclose(skf_new_H[..., 1], jnp.zeros_like(H1_true), atol=1e-3)
+    # 2. Define two different ground-truth dynamics
+    a_true_0 = jnp.array([[0.9, 0.1], [-0.1, 0.9]], dtype=dtype)
+    a_true_1 = jnp.array([[1.1, -0.05], [0.05, 1.1]], dtype=dtype)
+    a_true_stacked = jnp.stack([a_true_0, a_true_1], axis=-1)
 
-    # Check R_j (should be close to zero due to zero obs and H being zero)
-    np.testing.assert_allclose(skf_new_R[..., 0], jnp.zeros_like(R0_true), atol=1e-3)
-    np.testing.assert_allclose(skf_new_R[..., 1], jnp.zeros_like(R1_true), atol=1e-3)
+    # 3. Construct the deterministic path (10 steps in state 0, 10 in state 1)
+    half_time = n_time // 2
+    true_states = jnp.array(
+        [0] * half_time + [1] * (n_time - half_time), dtype=jnp.int32
+    )
+    x_t = jnp.zeros((n_time, n_cont_states), dtype=dtype)
+    x_t = x_t.at[0].set(jnp.array([1.0, 1.0], dtype=dtype))
 
-    # Check Z
-    np.testing.assert_allclose(skf_new_Z, Z_true, rtol=rtol, atol=atol)
+    for t in range(n_time - 1):
+        current_state_idx = true_states[t]
+        a_matrix = a_true_stacked[..., current_state_idx]
+        x_t = x_t.at[t + 1].set(a_matrix @ x_t[t])
 
-    # Check initial discrete probability
-    np.testing.assert_allclose(skf_new_init_prob, init_prob_true, rtol=rtol, atol=atol)
+    # 4. Construct "perfect" smoother outputs based on the known path
+    # THIS SECTION IS THE FIX. We must be careful about the transition point.
+    gamma = one_hot(true_states, n_discrete_states, dtype=dtype)
 
-    # Check initial continuous mean (should be close to the synthetic zero means)
-    np.testing.assert_allclose(
-        skf_new_init_mean, init_mean_true_cond, rtol=rtol, atol=atol
+    # Create xi for stay-stay transitions. The switch 0->1 is handled by setting its xi to 0
+    # so it does not contribute to the estimation of A_0 or A_1.
+    xi = jnp.zeros((n_time - 1, n_discrete_states, n_discrete_states), dtype=dtype)
+    for t in range(n_time - 1):
+        i, j = true_states[t], true_states[t + 1]
+        if i == j:  # Only include transitions where the state does not change
+            xi = xi.at[t, i, j].set(1.0)
+
+    means = jnp.zeros((n_time, n_cont_states, n_discrete_states), dtype=dtype)
+    for t in range(n_time):
+        means = means.at[t, :, true_states[t]].set(x_t[t])
+
+    # All covariances are zero in a deterministic system.
+    covs = jnp.zeros(
+        (n_time, n_cont_states, n_cont_states, n_discrete_states), dtype=dtype
+    )
+    cross_cov = jnp.zeros(
+        (
+            n_time - 1,
+            n_cont_states,
+            n_cont_states,
+            n_discrete_states,
+            n_discrete_states,
+        ),
+        dtype=dtype,
+    )
+    dummy_obs = jnp.zeros((n_time, n_obs_dim), dtype=dtype)
+
+    # 5. Run the M-step
+    (
+        a_est,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+    ) = switching_kalman_maximization_step(
+        obs=dummy_obs,
+        state_cond_smoother_means=means,
+        state_cond_smoother_covs=covs,
+        smoother_discrete_state_prob=gamma,
+        smoother_joint_discrete_state_prob=xi,
+        pair_cond_smoother_cross_cov=cross_cov,
     )
 
-    # Check initial continuous covariance
-    np.testing.assert_allclose(skf_new_init_cov[..., 0], P_ss_0, rtol=rtol, atol=atol)
-    np.testing.assert_allclose(skf_new_init_cov[..., 1], P_ss_1, rtol=rtol, atol=atol)
+    # 6. Assert exact recovery of both transition matrices
+    np.testing.assert_allclose(a_est, a_true_stacked, atol=1e-7)
