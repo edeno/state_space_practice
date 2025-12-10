@@ -793,13 +793,6 @@ def switching_kalman_maximization_step(
         obs[..., None], obs[..., None], smoother_discrete_state_prob
     )
 
-    last_gamma = (
-        state_cond_smoother_covs[-1] * smoother_discrete_state_prob[-1, None, None]
-    ) + weighted_sum_of_outer_products(
-        state_cond_smoother_means[-1:],
-        state_cond_smoother_means[-1:],
-        smoother_discrete_state_prob[-1:],
-    )
     first_gamma = (
         state_cond_smoother_covs[0] * smoother_discrete_state_prob[0, None, None]
     ) + weighted_sum_of_outer_products(
@@ -807,8 +800,21 @@ def switching_kalman_maximization_step(
         state_cond_smoother_means[:1],
         smoother_discrete_state_prob[:1],
     )
-    gamma1 = gamma - last_gamma
     gamma2 = gamma - first_gamma
+
+    # gamma1 for transition matrix: must use joint probability P(S_t=i, S_{t+1}=j)
+    # to match the weighting in beta. This sums over the "source" states of transitions.
+    # gamma1[a,b,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_t x_t^T | S_t=i]
+    gamma1 = jnp.einsum(
+        "tij, tabi -> abj",
+        smoother_joint_discrete_state_prob,
+        state_cond_smoother_covs[:-1],
+    ) + jnp.einsum(
+        "tij, tai, tbi -> abj",
+        smoother_joint_discrete_state_prob,
+        state_cond_smoother_means[:-1],
+        state_cond_smoother_means[:-1],
+    )
 
     # gamma: (n_cont_states, n_cont_states, n_discrete_states)
     # beta: (n_cont_states, n_cont_states, n_discrete_states)
@@ -824,12 +830,12 @@ def switching_kalman_maximization_step(
     )
 
     beta = jnp.einsum(
-        "tij,tdcij->cdi",  # c,d are cont_dims, i is S_k state
+        "tij,tdcij->cdj",
         smoother_joint_discrete_state_prob,  # P(S_k=i, S_{k+1}=j)
         pair_cond_smoother_cross_cov,  # E[x_k x_{k+1}^T | S_k=i, S_{k+1}=j]
     )
     beta += jnp.einsum(
-        "tdj,tci,tij->cdi",  # Sum over t, j; keep c, d, i
+        "tdi,tcj,tij->cdj",
         state_cond_smoother_means[:-1],  # m_t^i (Shape T-1, c, i)
         state_cond_smoother_means[1:],  # m_{t+1}^j (Shape T-1, d, j)
         smoother_joint_discrete_state_prob,  # P(S_t=i, S_{t+1}=j) (Shape T-1, i, j)
