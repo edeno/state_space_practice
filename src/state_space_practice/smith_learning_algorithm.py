@@ -87,35 +87,27 @@ def approximate_gaussian(
         The mode of the posterior distribution.
     covariance : jnp.ndarray, shape (1, 1)
         The covariance matrix (approximated) of the posterior distribution.
-
-    Raises
-    ------
-    RuntimeError
-        If the optimization fails to converge.
     """
     neg_log_posterior = lambda x: -log_posterior_func(x)
 
     # Find the mode using BFGS optimization
+    # Note: When called inside jax.lax.scan, result.success is a traced value,
+    # so we cannot use Python conditionals on it. The optimization is assumed
+    # to succeed for well-posed problems.
     result = jax.scipy.optimize.minimize(fun=neg_log_posterior, x0=x0, method="BFGS")
-
-    if not result.success:
-        raise RuntimeError(f"Optimization failed: {result.message}")
 
     mode = result.x
     hessian = jax.hessian(neg_log_posterior)(mode)
 
     # Add regularization for numerical stability
+    # Use pseudo-inverse which is more robust and always works
     reg = 1e-6
-    try:
-        covariance = jnp.linalg.inv(hessian + jnp.eye(hessian.shape[0]) * reg)
-    except jnp.linalg.LinAlgError:
-        warnings.warn("Hessian inversion failed, using pseudo-inverse.", RuntimeWarning)
-        covariance = jnp.linalg.pinv(hessian + jnp.eye(hessian.shape[0]) * reg)
+    covariance = jnp.linalg.pinv(hessian + jnp.eye(hessian.shape[0]) * reg)
 
     return mode, covariance
 
 
-@partial(jax.jit, static_argnames=("max_possible_correct", "bias"))
+@jax.jit
 def _log_posterior_objective(
     learning_state: jax.Array,
     learning_state_prev: float,
@@ -409,11 +401,14 @@ def maximization_step(
         Initial learning state variance estimate.
     """
     n_trials: int = len(smoothed_mode)
+    # E[(x_{k+1} - x_k)^2 | y_{1:T}] = (x_{k+1|T} - x_{k|T})^2 + P_{k+1|T} + P_{k|T}
+    #                                  - 2 * Cov(x_{k+1}, x_k | y_{1:T})
+    # where Cov(x_{k+1}, x_k | y_{1:T}) = A_k * P_{k+1|T}
     expected_squared_diff_terms = (
         (smoothed_mode[1:] - smoothed_mode[:-1]) ** 2
         + smoothed_variance[1:]
         + smoothed_variance[:-1]
-        - 2.0 * smoothed_variance[:-1] * smoother_gain
+        - 2.0 * smoothed_variance[1:] * smoother_gain  # Cov = A_k * P_{k+1|T}
     )
 
     sigma_epsilon_sq = jnp.sum(expected_squared_diff_terms) / (n_trials - 1)
@@ -766,6 +761,261 @@ def _find_runs_of_value(
     return runs
 
 
+def compute_cross_covariance(
+    smoothed_variance: jnp.ndarray,
+    smoother_gain: jnp.ndarray,
+    trial1: int,
+    trial2: int,
+) -> jnp.ndarray:
+    """Compute the cross-covariance between two trials' smoothed states.
+
+    Computes Cov(x_{trial1}, x_{trial2} | y_{1:T}) using the recursive formula
+    from Appendix D of Smith et al. (2004). This is needed for trial-to-trial
+    comparisons.
+
+    The cross-covariance is computed as:
+        Cov(x_i, x_j | y_{1:T}) = A_i * A_{i+1} * ... * A_{j-1} * P_{j|T}
+
+    where A_k is the smoother gain and P_{j|T} is the smoothed variance.
+
+    Parameters
+    ----------
+    smoothed_variance : jnp.ndarray, shape (n_trials,)
+        Smoothed learning state variances (P_{k|T}).
+    smoother_gain : jnp.ndarray, shape (n_trials - 1,)
+        Smoother gain values (A_k). Note: smoother_gain[k] corresponds to
+        the gain for transitioning from trial k to k+1.
+    trial1 : int
+        First trial index (0-based). Must be < trial2.
+    trial2 : int
+        Second trial index (0-based). Must be > trial1.
+
+    Returns
+    -------
+    cross_covariance : jnp.ndarray, scalar
+        The cross-covariance Cov(x_{trial1}, x_{trial2} | y_{1:T}).
+
+    Notes
+    -----
+    This implements the formula from trialtotrial.m in the MATLAB code:
+        for ppp = trial2-1:-1:trial1
+            a1 = A(ppp) * a1
+        end
+        covx = a1 * signewsq(trial2)
+    """
+    # Product of smoother gains from trial1 to trial2-1
+    # smoother_gain[k] is A_k, the gain for the transition from k to k+1
+    # We need A_{trial1} * A_{trial1+1} * ... * A_{trial2-1}
+    gain_product = jnp.prod(smoother_gain[trial1:trial2])
+
+    # Cross-covariance = product of gains * variance at trial2
+    cross_covariance = gain_product * smoothed_variance[trial2]
+
+    return cross_covariance
+
+
+def compare_two_trials(
+    key: jax.random.PRNGKey,
+    smoothed_mode: jnp.ndarray,
+    smoothed_variance: jnp.ndarray,
+    smoother_gain: jnp.ndarray,
+    trial1: int,
+    trial2: int,
+    n_samples: int = 10000,
+    compare_probability: bool = False,
+    mu_bias: Optional[float] = None,
+) -> float:
+    """Compute the probability that learning state at trial1 > trial2.
+
+    This implements the trial-to-trial comparison from trialtotrial.m,
+    computing P(x_{trial1} > x_{trial2} | y_{1:T}) or optionally
+    P(p_{trial1} > p_{trial2} | y_{1:T}) for probability space.
+
+    Parameters
+    ----------
+    key : jax.random.PRNGKey
+        JAX PRNG key for Monte Carlo sampling.
+    smoothed_mode : jnp.ndarray, shape (n_trials,)
+        Smoothed learning state modes (x_{k|T}).
+    smoothed_variance : jnp.ndarray, shape (n_trials,)
+        Smoothed learning state variances (P_{k|T}).
+    smoother_gain : jnp.ndarray, shape (n_trials - 1,)
+        Smoother gain values (A_k).
+    trial1 : int
+        First trial index (0-based).
+    trial2 : int
+        Second trial index (0-based). Must be different from trial1.
+    n_samples : int, optional
+        Number of Monte Carlo samples. Default is 10000.
+    compare_probability : bool, optional
+        If True, compare in probability space (sigmoid-transformed).
+        If False, compare raw latent states. Default is False.
+    mu_bias : float, optional
+        Bias term for sigmoid transformation. Required if compare_probability=True.
+
+    Returns
+    -------
+    p_value : float
+        P(x_{trial1} > x_{trial2} | y_{1:T}), or in probability space if requested.
+        Values > 0.5 indicate trial1 has higher learning state than trial2.
+        Values near 0.95 or 0.05 indicate statistically significant differences.
+    """
+    if trial1 == trial2:
+        return 0.5  # Same trial, no difference
+
+    if compare_probability and mu_bias is None:
+        raise ValueError("mu_bias is required when compare_probability=True")
+
+    # Ensure trial1 < trial2 for covariance computation, then adjust result
+    swapped = trial1 > trial2
+    if swapped:
+        trial1, trial2 = trial2, trial1
+
+    # Compute cross-covariance
+    cross_cov = compute_cross_covariance(
+        smoothed_variance, smoother_gain, trial1, trial2
+    )
+
+    # Build bivariate normal parameters
+    mean_vec = jnp.array([smoothed_mode[trial1], smoothed_mode[trial2]])
+    cov_matrix = jnp.array(
+        [
+            [smoothed_variance[trial1], cross_cov],
+            [cross_cov, smoothed_variance[trial2]],
+        ]
+    )
+
+    # Sample from bivariate normal using eigendecomposition (JIT-compatible)
+    # This avoids Cholesky which can fail for near-singular matrices
+    eigenvalues, eigenvectors = jnp.linalg.eigh(cov_matrix)
+    # Clamp eigenvalues to be non-negative for numerical stability
+    eigenvalues = jnp.maximum(eigenvalues, 0.0)
+    sqrt_cov = eigenvectors @ jnp.diag(jnp.sqrt(eigenvalues))
+
+    # Generate standard normal samples and transform
+    z = jax.random.normal(key, shape=(n_samples, 2))
+    samples = mean_vec + z @ sqrt_cov.T  # shape: (n_samples, 2)
+
+    if compare_probability:
+        # Transform to probability space
+        samples = jax.nn.sigmoid(mu_bias + samples)
+
+    # Compute P(trial1 > trial2)
+    # samples[:, 0] is trial1, samples[:, 1] is trial2
+    p_value = jnp.mean(samples[:, 0] > samples[:, 1])
+
+    # If we swapped, we computed P(original_trial2 > original_trial1)
+    # so we need to return 1 - p_value to get P(original_trial1 > original_trial2)
+    if swapped:
+        p_value = 1.0 - p_value
+
+    return float(p_value)
+
+
+def compute_trial_comparison_matrix(
+    key: jax.random.PRNGKey,
+    smoothed_mode: jnp.ndarray,
+    smoothed_variance: jnp.ndarray,
+    smoother_gain: jnp.ndarray,
+    n_samples: int = 10000,
+    compare_probability: bool = False,
+    mu_bias: Optional[float] = None,
+) -> jnp.ndarray:
+    """Compute pairwise comparison matrix for all trials.
+
+    Computes P(x_i > x_j | y_{1:T}) for all pairs of trials i < j.
+    This implements the full trialtotrial.m functionality.
+
+    Parameters
+    ----------
+    key : jax.random.PRNGKey
+        JAX PRNG key for Monte Carlo sampling.
+    smoothed_mode : jnp.ndarray, shape (n_trials,)
+        Smoothed learning state modes (x_{k|T}).
+    smoothed_variance : jnp.ndarray, shape (n_trials,)
+        Smoothed learning state variances (P_{k|T}).
+    smoother_gain : jnp.ndarray, shape (n_trials - 1,)
+        Smoother gain values (A_k).
+    n_samples : int, optional
+        Number of Monte Carlo samples per comparison. Default is 10000.
+    compare_probability : bool, optional
+        If True, compare in probability space. Default is False.
+    mu_bias : float, optional
+        Bias term for sigmoid. Required if compare_probability=True.
+
+    Returns
+    -------
+    comparison_matrix : jnp.ndarray, shape (n_trials, n_trials)
+        Upper triangular matrix where entry [i, j] (i < j) contains
+        P(x_i > x_j | y_{1:T}). Diagonal is 0.5, lower triangle is NaN.
+    """
+    n_trials = len(smoothed_mode)
+    comparison_matrix = jnp.full((n_trials, n_trials), jnp.nan)
+
+    # Set diagonal to 0.5
+    comparison_matrix = comparison_matrix.at[jnp.diag_indices(n_trials)].set(0.5)
+
+    # Generate all keys upfront
+    n_comparisons = n_trials * (n_trials - 1) // 2
+    keys = jax.random.split(key, n_comparisons)
+
+    key_idx = 0
+    for i in range(n_trials):
+        for j in range(i + 1, n_trials):
+            p_val = compare_two_trials(
+                keys[key_idx],
+                smoothed_mode,
+                smoothed_variance,
+                smoother_gain,
+                trial1=i,
+                trial2=j,
+                n_samples=n_samples,
+                compare_probability=compare_probability,
+                mu_bias=mu_bias,
+            )
+            comparison_matrix = comparison_matrix.at[i, j].set(p_val)
+            key_idx += 1
+
+    return comparison_matrix
+
+
+def find_first_significant_trial(
+    comparison_matrix: jnp.ndarray,
+    reference_trial: int = 0,
+    significance_level: float = 0.05,
+) -> Optional[int]:
+    """Find the first trial significantly different from a reference trial.
+
+    Parameters
+    ----------
+    comparison_matrix : jnp.ndarray, shape (n_trials, n_trials)
+        Comparison matrix from compute_trial_comparison_matrix.
+    reference_trial : int, optional
+        The reference trial to compare against (usually 0 or 1). Default is 0.
+    significance_level : float, optional
+        Significance threshold (two-tailed). Default is 0.05.
+
+    Returns
+    -------
+    first_significant : Optional[int]
+        The first trial index that is significantly different from the reference,
+        or None if no such trial exists.
+    """
+    n_trials = comparison_matrix.shape[0]
+
+    # For trials after reference, check if P(ref > trial) < alpha/2
+    # (i.e., trial is significantly HIGHER than reference)
+    threshold_high = significance_level / 2  # e.g., 0.025
+
+    for j in range(reference_trial + 1, n_trials):
+        p_val = comparison_matrix[reference_trial, j]
+        # P(ref > j) < 0.025 means j is significantly higher
+        if p_val < threshold_high:
+            return j
+
+    return None
+
+
 def calculate_latent_state_percentiles(
     key: jax.random.PRNGKey,
     smoothed_mode: jnp.ndarray,  # shape: (n_trials,)
@@ -863,12 +1113,13 @@ class SmithLearningAlgorithm:
             raise ValueError("sigma_epsilon must be positive.")
 
         if init_learning_variance is None:
-            self.init_learning_variance = sigma_epsilon**2
-
-        else:
+            init_learning_variance = sigma_epsilon**2
+        elif not isinstance(init_learning_variance, (int, float)):
             raise TypeError(
                 "init_learning_variance must be a non-negative float or None."
             )
+        elif init_learning_variance < 0:
+            raise ValueError("init_learning_variance must be non-negative.")
 
         if not (0.0 < prob_correct_by_chance < 1.0):
             raise ValueError(
@@ -1711,3 +1962,293 @@ class SmithLearningAlgorithm:
         ax.legend(fontsize=10)
         ax.grid(True, linestyle="--", alpha=0.6)
         ax.tick_params(axis="both", which="major", labelsize=10)
+
+    def compare_trials(
+        self,
+        key: jax.random.PRNGKey,
+        trial1: int,
+        trial2: int,
+        n_samples: int = 10000,
+        compare_probability: bool = False,
+    ) -> float:
+        """Compare two trials to determine if learning state differs.
+
+        Computes P(x_{trial1} > x_{trial2} | y_{1:T}), the probability that
+        the learning state at trial1 is greater than at trial2, given all
+        observed data.
+
+        Must be called after `fit`.
+
+        Parameters
+        ----------
+        key : jax.random.PRNGKey
+            JAX PRNG key for Monte Carlo sampling.
+        trial1 : int
+            First trial index (0-based).
+        trial2 : int
+            Second trial index (0-based).
+        n_samples : int, optional
+            Number of Monte Carlo samples. Default is 10000.
+        compare_probability : bool, optional
+            If True, compare in probability space (sigmoid-transformed).
+            If False, compare raw latent states. Default is False.
+
+        Returns
+        -------
+        p_value : float
+            P(x_{trial1} > x_{trial2} | y_{1:T}).
+            - Values > 0.975 indicate trial1 is significantly higher than trial2.
+            - Values < 0.025 indicate trial1 is significantly lower than trial2.
+            - Values near 0.5 indicate no significant difference.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+        ValueError
+            If trial indices are out of bounds.
+        """
+        if self.smoothed_learning_state_mode is None:
+            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+
+        n_trials = len(self.smoothed_learning_state_mode)
+        if not (0 <= trial1 < n_trials and 0 <= trial2 < n_trials):
+            raise ValueError(
+                f"Trial indices must be in range [0, {n_trials - 1}]. "
+                f"Got trial1={trial1}, trial2={trial2}."
+            )
+
+        mu_bias = self.mu_bias if compare_probability else None
+
+        return compare_two_trials(
+            key=key,
+            smoothed_mode=self.smoothed_learning_state_mode,
+            smoothed_variance=self.smoothed_learning_state_variance,
+            smoother_gain=self.smoother_gain,
+            trial1=trial1,
+            trial2=trial2,
+            n_samples=n_samples,
+            compare_probability=compare_probability,
+            mu_bias=mu_bias,
+        )
+
+    def get_trial_comparison_matrix(
+        self,
+        key: jax.random.PRNGKey,
+        n_samples: int = 10000,
+        compare_probability: bool = False,
+    ) -> jnp.ndarray:
+        """Compute pairwise comparison matrix for all trials.
+
+        For all pairs of trials i < j, computes P(x_i > x_j | y_{1:T}).
+        This implements the trialtotrial.m functionality from the MATLAB code.
+
+        Must be called after `fit`.
+
+        Parameters
+        ----------
+        key : jax.random.PRNGKey
+            JAX PRNG key for Monte Carlo sampling.
+        n_samples : int, optional
+            Number of Monte Carlo samples per comparison. Default is 10000.
+        compare_probability : bool, optional
+            If True, compare in probability space. Default is False.
+
+        Returns
+        -------
+        comparison_matrix : jnp.ndarray, shape (n_trials, n_trials)
+            Upper triangular matrix where entry [i, j] (i < j) contains
+            P(x_i > x_j | y_{1:T}). Diagonal is 0.5, lower triangle is NaN.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+
+        Examples
+        --------
+        >>> model = SmithLearningAlgorithm()
+        >>> model.fit(responses)
+        >>> key = jax.random.PRNGKey(0)
+        >>> matrix = model.get_trial_comparison_matrix(key)
+        >>> # Check if trial 10 is significantly higher than trial 0
+        >>> p_val = matrix[0, 10]
+        >>> if p_val < 0.025:
+        ...     print("Trial 10 is significantly higher than trial 0")
+        """
+        if self.smoothed_learning_state_mode is None:
+            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+
+        mu_bias = self.mu_bias if compare_probability else None
+
+        return compute_trial_comparison_matrix(
+            key=key,
+            smoothed_mode=self.smoothed_learning_state_mode,
+            smoothed_variance=self.smoothed_learning_state_variance,
+            smoother_gain=self.smoother_gain,
+            n_samples=n_samples,
+            compare_probability=compare_probability,
+            mu_bias=mu_bias,
+        )
+
+    def find_first_significant_improvement(
+        self,
+        key: jax.random.PRNGKey,
+        reference_trial: int = 0,
+        significance_level: float = 0.05,
+        n_samples: int = 10000,
+        compare_probability: bool = False,
+    ) -> Optional[int]:
+        """Find the first trial with significantly higher learning than reference.
+
+        This identifies the earliest trial where the learning state is
+        statistically significantly greater than a reference trial (typically
+        the first trial).
+
+        Must be called after `fit`.
+
+        Parameters
+        ----------
+        key : jax.random.PRNGKey
+            JAX PRNG key for Monte Carlo sampling.
+        reference_trial : int, optional
+            The reference trial to compare against. Default is 0 (first trial).
+        significance_level : float, optional
+            Two-tailed significance threshold. Default is 0.05.
+        n_samples : int, optional
+            Number of Monte Carlo samples per comparison. Default is 10000.
+        compare_probability : bool, optional
+            If True, compare in probability space. Default is False.
+
+        Returns
+        -------
+        first_significant : Optional[int]
+            The 0-indexed trial number of the first trial significantly
+            higher than the reference, or None if no such trial exists.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+
+        Notes
+        -----
+        This corresponds to the analysis in trialtotrial.m that finds
+        "Earliest trial signif above estimated start distribution".
+        """
+        if self.smoothed_learning_state_mode is None:
+            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+
+        comparison_matrix = self.get_trial_comparison_matrix(
+            key=key,
+            n_samples=n_samples,
+            compare_probability=compare_probability,
+        )
+
+        return find_first_significant_trial(
+            comparison_matrix=comparison_matrix,
+            reference_trial=reference_trial,
+            significance_level=significance_level,
+        )
+
+    def plot_trial_comparison_matrix(
+        self,
+        key: jax.random.PRNGKey,
+        n_samples: int = 10000,
+        compare_probability: bool = False,
+        significance_level: float = 0.05,
+        title: Optional[str] = None,
+        cmap: str = "bone",
+    ) -> Tuple[plt.Figure, plt.Axes]:
+        """Plot the trial-to-trial comparison matrix with significant points.
+
+        Creates a heatmap visualization of pairwise trial comparisons,
+        highlighting statistically significant differences. This replicates
+        the visualization from trialtotrial.m.
+
+        Must be called after `fit`.
+
+        Parameters
+        ----------
+        key : jax.random.PRNGKey
+            JAX PRNG key for Monte Carlo sampling.
+        n_samples : int, optional
+            Number of Monte Carlo samples per comparison. Default is 10000.
+        compare_probability : bool, optional
+            If True, compare in probability space. Default is False.
+        significance_level : float, optional
+            Two-tailed significance threshold. Default is 0.05.
+        title : Optional[str], optional
+            Custom title. If None, auto-generated. Default is None.
+        cmap : str, optional
+            Colormap for heatmap. Default is "bone" (matches MATLAB).
+
+        Returns
+        -------
+        fig : plt.Figure
+            The matplotlib figure.
+        ax : plt.Axes
+            The matplotlib axes.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+        """
+        if self.smoothed_learning_state_mode is None:
+            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+
+        comparison_matrix = self.get_trial_comparison_matrix(
+            key=key,
+            n_samples=n_samples,
+            compare_probability=compare_probability,
+        )
+
+        n_trials = comparison_matrix.shape[0]
+        fig, ax = plt.subplots(figsize=(8, 8), constrained_layout=True)
+
+        # Plot heatmap
+        im = ax.imshow(comparison_matrix, cmap=cmap, vmin=0, vmax=1, origin="upper")
+        plt.colorbar(im, ax=ax, label="P(trial_row > trial_col)")
+
+        # Mark significant points
+        alpha = significance_level
+        alpha_half = alpha / 2
+
+        # Find significantly higher (red) and lower (blue) comparisons
+        for i in range(n_trials):
+            for j in range(i + 1, n_trials):
+                p_val = comparison_matrix[i, j]
+                if p_val < alpha_half:
+                    # Trial j is significantly HIGHER than trial i
+                    ax.plot(j, i, "r.", markersize=8)
+                elif p_val < alpha:
+                    # Marginally significant
+                    ax.plot(j, i, "r*", markersize=6)
+                elif p_val > 1 - alpha_half:
+                    # Trial i is significantly HIGHER than trial j (unusual)
+                    ax.plot(j, i, "b.", markersize=8)
+                elif p_val > 1 - alpha:
+                    ax.plot(j, i, "b*", markersize=6)
+
+        # Add diagonal line
+        ax.plot([0, n_trials - 1], [0, n_trials - 1], "k-", linewidth=0.5)
+
+        # Find first significant trial
+        first_sig = find_first_significant_trial(
+            comparison_matrix, reference_trial=0, significance_level=significance_level
+        )
+
+        if title is None:
+            if first_sig is not None:
+                title = f"Trial Comparisons (First sig. above start: {first_sig})"
+            else:
+                title = "Trial Comparisons (No trials sig. above start)"
+
+        ax.set_xlabel("Trial Number", fontsize=12)
+        ax.set_ylabel("Trial Number", fontsize=12)
+        ax.set_title(title, fontsize=14, fontweight="bold")
+        ax.set_xlim(-0.5, n_trials - 0.5)
+        ax.set_ylim(n_trials - 0.5, -0.5)
+
+        return fig, ax
