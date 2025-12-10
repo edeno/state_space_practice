@@ -16,6 +16,10 @@ from state_space_practice.smith_learning_algorithm import (
     approximate_gaussian,
     calculate_latent_state_percentiles,
     calculate_probability_confidence_limits,
+    compute_cross_covariance_matrix,
+    compute_trial_comparison_matrix,
+    compare_two_trials,
+    find_first_significant_trial,
     find_min_consecutive_successes,
     maximization_step,
     simulate_learning_data,
@@ -816,3 +820,391 @@ class TestCalculateLatentStatePercentiles:
 
         # Median (index 1) should be close to mode
         np.testing.assert_allclose(result[1], smoothed_mode, rtol=0.1, atol=0.1)
+
+
+class TestComputeCrossCovarianceMatrix:
+    """Tests for the compute_cross_covariance_matrix function."""
+
+    def test_output_shape(self) -> None:
+        """Output should be square matrix of size n_trials."""
+        n_trials = 20
+        smoothed_variance = jnp.ones(n_trials) * 0.5
+        smoother_gain = jnp.ones(n_trials - 1) * 0.8
+
+        result = compute_cross_covariance_matrix(smoothed_variance, smoother_gain)
+
+        assert result.shape == (n_trials, n_trials)
+
+    def test_diagonal_equals_variance(self) -> None:
+        """Diagonal entries should equal smoothed variances."""
+        n_trials = 20
+        smoothed_variance = jnp.linspace(0.1, 1.0, n_trials)
+        smoother_gain = jnp.ones(n_trials - 1) * 0.8
+
+        result = compute_cross_covariance_matrix(smoothed_variance, smoother_gain)
+
+        np.testing.assert_allclose(jnp.diag(result), smoothed_variance, rtol=1e-5)
+
+    def test_symmetric(self) -> None:
+        """Cross-covariance matrix should be symmetric."""
+        n_trials = 20
+        smoothed_variance = jnp.linspace(0.1, 1.0, n_trials)
+        smoother_gain = jnp.linspace(0.6, 0.9, n_trials - 1)
+
+        result = compute_cross_covariance_matrix(smoothed_variance, smoother_gain)
+
+        np.testing.assert_allclose(result, result.T, rtol=1e-5)
+
+    def test_positive_semidefinite(self) -> None:
+        """Cross-covariance matrix should be positive semi-definite."""
+        n_trials = 20
+        smoothed_variance = jnp.linspace(0.1, 1.0, n_trials)
+        smoother_gain = jnp.linspace(0.6, 0.9, n_trials - 1)
+
+        result = compute_cross_covariance_matrix(smoothed_variance, smoother_gain)
+        eigenvalues = jnp.linalg.eigvalsh(result)
+
+        # All eigenvalues should be non-negative (within tolerance)
+        assert jnp.all(eigenvalues >= -1e-10)
+
+    def test_off_diagonal_decay(self) -> None:
+        """Cross-covariance should decay with distance when gains < 1."""
+        n_trials = 20
+        smoothed_variance = jnp.ones(n_trials) * 0.5
+        smoother_gain = jnp.ones(n_trials - 1) * 0.7  # < 1
+
+        result = compute_cross_covariance_matrix(smoothed_variance, smoother_gain)
+
+        # Check first row: Cov(0, j) should decrease with j
+        first_row = result[0, :]
+        for j in range(1, n_trials - 1):
+            assert first_row[j] >= first_row[j + 1]
+
+    def test_unit_gain_preserves_covariance(self) -> None:
+        """With unit gains, cross-covariance equals variance of later trial."""
+        n_trials = 10
+        smoothed_variance = jnp.linspace(0.1, 1.0, n_trials)
+        smoother_gain = jnp.ones(n_trials - 1)  # All 1.0
+
+        result = compute_cross_covariance_matrix(smoothed_variance, smoother_gain)
+
+        # Cov(i, j) = P_j for i <= j when all gains are 1
+        for i in range(n_trials):
+            for j in range(i, n_trials):
+                np.testing.assert_allclose(
+                    result[i, j], smoothed_variance[j], rtol=1e-5
+                )
+
+
+class TestComputeTrialComparisonMatrix:
+    """Tests for the compute_trial_comparison_matrix function."""
+
+    @pytest.fixture
+    def fitted_model_data(self):
+        """Create fitted model data for testing."""
+        # Simple increasing learning states
+        n_trials = 20
+        smoothed_mode = jnp.linspace(-1.0, 2.0, n_trials)
+        smoothed_variance = jnp.ones(n_trials) * 0.3
+        smoother_gain = jnp.ones(n_trials - 1) * 0.8
+        return smoothed_mode, smoothed_variance, smoother_gain
+
+    def test_output_shape(self, fitted_model_data) -> None:
+        """Output should be square matrix of size n_trials."""
+        smoothed_mode, smoothed_variance, smoother_gain = fitted_model_data
+        n_trials = len(smoothed_mode)
+        key = jax.random.PRNGKey(0)
+
+        result = compute_trial_comparison_matrix(
+            key, smoothed_mode, smoothed_variance, smoother_gain, n_samples=1000
+        )
+
+        assert result.shape == (n_trials, n_trials)
+
+    def test_diagonal_is_half(self, fitted_model_data) -> None:
+        """Diagonal entries should be 0.5 (P(x_i > x_i) = 0.5)."""
+        smoothed_mode, smoothed_variance, smoother_gain = fitted_model_data
+        n_trials = len(smoothed_mode)
+        key = jax.random.PRNGKey(0)
+
+        result = compute_trial_comparison_matrix(
+            key, smoothed_mode, smoothed_variance, smoother_gain, n_samples=1000
+        )
+
+        np.testing.assert_allclose(jnp.diag(result), 0.5, rtol=1e-5)
+
+    def test_lower_triangle_is_nan(self, fitted_model_data) -> None:
+        """Lower triangle should be NaN."""
+        smoothed_mode, smoothed_variance, smoother_gain = fitted_model_data
+        n_trials = len(smoothed_mode)
+        key = jax.random.PRNGKey(0)
+
+        result = compute_trial_comparison_matrix(
+            key, smoothed_mode, smoothed_variance, smoother_gain, n_samples=1000
+        )
+
+        # Check lower triangle (excluding diagonal)
+        lower_tri_mask = jnp.tril(jnp.ones((n_trials, n_trials), dtype=bool), k=-1)
+        assert jnp.all(jnp.isnan(result[lower_tri_mask]))
+
+    def test_upper_triangle_in_bounds(self, fitted_model_data) -> None:
+        """Upper triangle values should be probabilities in [0, 1]."""
+        smoothed_mode, smoothed_variance, smoother_gain = fitted_model_data
+        n_trials = len(smoothed_mode)
+        key = jax.random.PRNGKey(0)
+
+        result = compute_trial_comparison_matrix(
+            key, smoothed_mode, smoothed_variance, smoother_gain, n_samples=1000
+        )
+
+        # Check upper triangle
+        upper_tri_mask = jnp.triu(jnp.ones((n_trials, n_trials), dtype=bool), k=1)
+        upper_values = result[upper_tri_mask]
+
+        assert jnp.all(upper_values >= 0.0)
+        assert jnp.all(upper_values <= 1.0)
+
+    def test_increasing_states_low_early_p_values(self) -> None:
+        """For increasing states, early vs late comparison should have low p."""
+        n_trials = 20
+        # Clear increasing trend
+        smoothed_mode = jnp.linspace(-2.0, 3.0, n_trials)
+        smoothed_variance = jnp.ones(n_trials) * 0.1  # Small variance
+        smoother_gain = jnp.ones(n_trials - 1) * 0.8
+        key = jax.random.PRNGKey(42)
+
+        result = compute_trial_comparison_matrix(
+            key, smoothed_mode, smoothed_variance, smoother_gain, n_samples=5000
+        )
+
+        # P(x_0 > x_19) should be very low since x_19 >> x_0
+        assert result[0, n_trials - 1] < 0.1
+
+        # P(x_0 > x_10) should be less than or equal to P(x_0 > x_5)
+        # (monotonic in distance, allowing for sampling variance)
+        assert result[0, 10] <= result[0, 5] + 0.01
+
+        # Far comparisons should show clear significance
+        assert result[0, n_trials // 2] < 0.3
+
+    def test_constant_states_near_half(self) -> None:
+        """For constant states, all comparisons should be near 0.5."""
+        n_trials = 15
+        smoothed_mode = jnp.ones(n_trials) * 1.0  # All same
+        smoothed_variance = jnp.ones(n_trials) * 0.5
+        smoother_gain = jnp.ones(n_trials - 1) * 0.8
+        key = jax.random.PRNGKey(0)
+
+        result = compute_trial_comparison_matrix(
+            key, smoothed_mode, smoothed_variance, smoother_gain, n_samples=5000
+        )
+
+        # Upper triangle should be near 0.5
+        upper_tri_mask = jnp.triu(jnp.ones((n_trials, n_trials), dtype=bool), k=1)
+        upper_values = result[upper_tri_mask]
+
+        np.testing.assert_allclose(upper_values, 0.5, atol=0.1)
+
+    def test_reproducibility_with_same_key(self, fitted_model_data) -> None:
+        """Same key should produce same results."""
+        smoothed_mode, smoothed_variance, smoother_gain = fitted_model_data
+        key = jax.random.PRNGKey(123)
+
+        result1 = compute_trial_comparison_matrix(
+            key, smoothed_mode, smoothed_variance, smoother_gain, n_samples=1000
+        )
+        result2 = compute_trial_comparison_matrix(
+            key, smoothed_mode, smoothed_variance, smoother_gain, n_samples=1000
+        )
+
+        # Upper triangle should match (lower is NaN)
+        upper_tri_mask = jnp.triu(jnp.ones_like(result1, dtype=bool), k=1)
+        np.testing.assert_allclose(
+            result1[upper_tri_mask], result2[upper_tri_mask], rtol=1e-5
+        )
+
+
+class TestCompareTwoTrials:
+    """Tests for the compare_two_trials function."""
+
+    @pytest.fixture
+    def model_data(self):
+        """Create model data for testing."""
+        n_trials = 20
+        smoothed_mode = jnp.linspace(-1.0, 2.0, n_trials)
+        smoothed_variance = jnp.ones(n_trials) * 0.3
+        smoother_gain = jnp.ones(n_trials - 1) * 0.8
+        return smoothed_mode, smoothed_variance, smoother_gain
+
+    def test_same_trial_returns_half(self, model_data) -> None:
+        """Comparing trial to itself should return 0.5."""
+        smoothed_mode, smoothed_variance, smoother_gain = model_data
+        key = jax.random.PRNGKey(0)
+
+        result = compare_two_trials(
+            key, smoothed_mode, smoothed_variance, smoother_gain,
+            trial1=5, trial2=5
+        )
+
+        assert result == 0.5
+
+    def test_output_is_probability(self, model_data) -> None:
+        """Output should be a probability in [0, 1]."""
+        smoothed_mode, smoothed_variance, smoother_gain = model_data
+        key = jax.random.PRNGKey(0)
+
+        result = compare_two_trials(
+            key, smoothed_mode, smoothed_variance, smoother_gain,
+            trial1=0, trial2=15
+        )
+
+        assert 0.0 <= result <= 1.0
+
+    def test_symmetric_complement(self, model_data) -> None:
+        """P(trial1 > trial2) + P(trial2 > trial1) should equal 1."""
+        smoothed_mode, smoothed_variance, smoother_gain = model_data
+        key = jax.random.PRNGKey(0)
+
+        p_12 = compare_two_trials(
+            key, smoothed_mode, smoothed_variance, smoother_gain,
+            trial1=3, trial2=12
+        )
+        p_21 = compare_two_trials(
+            key, smoothed_mode, smoothed_variance, smoother_gain,
+            trial1=12, trial2=3
+        )
+
+        np.testing.assert_allclose(p_12 + p_21, 1.0, rtol=0.05)
+
+
+class TestFindFirstSignificantTrial:
+    """Tests for the find_first_significant_trial function."""
+
+    def test_finds_significant_in_increasing_data(self) -> None:
+        """Should find significant trial when data shows clear increase."""
+        n_trials = 20
+        # Create matrix where early trials are significantly lower
+        comparison_matrix = jnp.full((n_trials, n_trials), jnp.nan)
+        comparison_matrix = comparison_matrix.at[jnp.diag_indices(n_trials)].set(0.5)
+
+        # Fill upper triangle with decreasing p-values (trial 0 vs later)
+        for j in range(1, n_trials):
+            # P(trial 0 > trial j) decreases as j increases
+            p_val = 0.5 * jnp.exp(-0.3 * j)
+            comparison_matrix = comparison_matrix.at[0, j].set(p_val)
+
+        result = find_first_significant_trial(
+            comparison_matrix, reference_trial=0, significance_level=0.05
+        )
+
+        # Should find a significant trial
+        assert result is not None
+        assert result > 0
+
+    def test_returns_none_when_no_significance(self) -> None:
+        """Should return None when no trial is significantly different."""
+        n_trials = 20
+        comparison_matrix = jnp.full((n_trials, n_trials), jnp.nan)
+        comparison_matrix = comparison_matrix.at[jnp.diag_indices(n_trials)].set(0.5)
+
+        # Fill upper triangle with values near 0.5 (no significance)
+        for i in range(n_trials):
+            for j in range(i + 1, n_trials):
+                comparison_matrix = comparison_matrix.at[i, j].set(0.45)
+
+        result = find_first_significant_trial(
+            comparison_matrix, reference_trial=0, significance_level=0.05
+        )
+
+        assert result is None
+
+    def test_respects_significance_level(self) -> None:
+        """Stricter significance should require stronger evidence."""
+        n_trials = 20
+        comparison_matrix = jnp.full((n_trials, n_trials), jnp.nan)
+        comparison_matrix = comparison_matrix.at[jnp.diag_indices(n_trials)].set(0.5)
+
+        # Create borderline significance
+        for j in range(1, n_trials):
+            # P value of 0.02 - significant at 0.05 but not at 0.01
+            comparison_matrix = comparison_matrix.at[0, j].set(0.02)
+
+        result_lenient = find_first_significant_trial(
+            comparison_matrix, reference_trial=0, significance_level=0.05
+        )
+        result_strict = find_first_significant_trial(
+            comparison_matrix, reference_trial=0, significance_level=0.01
+        )
+
+        assert result_lenient is not None
+        assert result_strict is None
+
+
+class TestSmithLearningAlgorithmTrialComparison:
+    """Tests for trial comparison methods on SmithLearningAlgorithm class."""
+
+    @pytest.fixture
+    def fitted_model(self):
+        """Create and fit a model for testing."""
+        # Learning data with clear improvement
+        responses = jnp.array([0, 1, 0, 0, 1, 0, 1, 1, 0, 1,
+                               1, 1, 1, 0, 1, 1, 1, 1, 1, 1])
+
+        model = SmithLearningAlgorithm(
+            sigma_epsilon=0.3,
+            prob_correct_by_chance=0.5,
+            initial_state_method='set_initial_direct_from_second_trial'
+        )
+        model.fit(responses, max_iter=50)
+        return model
+
+    def test_compare_trials_requires_fit(self) -> None:
+        """compare_trials should raise if model not fitted."""
+        model = SmithLearningAlgorithm()
+        key = jax.random.PRNGKey(0)
+
+        with pytest.raises(RuntimeError, match="not been fitted"):
+            model.compare_trials(key, trial1=0, trial2=5)
+
+    def test_compare_trials_validates_indices(self, fitted_model) -> None:
+        """compare_trials should validate trial indices."""
+        key = jax.random.PRNGKey(0)
+
+        with pytest.raises(ValueError, match="Trial indices"):
+            fitted_model.compare_trials(key, trial1=-1, trial2=5)
+
+        with pytest.raises(ValueError, match="Trial indices"):
+            fitted_model.compare_trials(key, trial1=0, trial2=100)
+
+    def test_compare_trials_returns_probability(self, fitted_model) -> None:
+        """compare_trials should return probability in [0, 1]."""
+        key = jax.random.PRNGKey(0)
+
+        result = fitted_model.compare_trials(key, trial1=0, trial2=15, n_samples=1000)
+
+        assert 0.0 <= result <= 1.0
+
+    def test_get_trial_comparison_matrix_requires_fit(self) -> None:
+        """get_trial_comparison_matrix should raise if model not fitted."""
+        model = SmithLearningAlgorithm()
+        key = jax.random.PRNGKey(0)
+
+        with pytest.raises(RuntimeError, match="not been fitted"):
+            model.get_trial_comparison_matrix(key)
+
+    def test_get_trial_comparison_matrix_shape(self, fitted_model) -> None:
+        """get_trial_comparison_matrix should return correct shape."""
+        key = jax.random.PRNGKey(0)
+        n_trials = len(fitted_model.smoothed_learning_state_mode)
+
+        result = fitted_model.get_trial_comparison_matrix(key, n_samples=1000)
+
+        assert result.shape == (n_trials, n_trials)
+
+    def test_find_first_significant_improvement_requires_fit(self) -> None:
+        """find_first_significant_improvement should raise if not fitted."""
+        model = SmithLearningAlgorithm()
+        key = jax.random.PRNGKey(0)
+
+        with pytest.raises(RuntimeError, match="not been fitted"):
+            model.find_first_significant_improvement(key)

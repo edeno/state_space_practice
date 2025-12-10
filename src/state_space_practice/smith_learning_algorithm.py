@@ -761,57 +761,142 @@ def _find_runs_of_value(
     return runs
 
 
-def compute_cross_covariance(
+def compute_cross_covariance_matrix(
     smoothed_variance: jnp.ndarray,
     smoother_gain: jnp.ndarray,
-    trial1: int,
-    trial2: int,
 ) -> jnp.ndarray:
-    """Compute the cross-covariance between two trials' smoothed states.
+    """Compute the full cross-covariance matrix for all trial pairs.
 
-    Computes Cov(x_{trial1}, x_{trial2} | y_{1:T}) using the recursive formula
-    from Appendix D of Smith et al. (2004). This is needed for trial-to-trial
-    comparisons.
-
-    The cross-covariance is computed as:
+    Computes Cov(x_i, x_j | y_{1:T}) for all pairs i <= j using the formula:
         Cov(x_i, x_j | y_{1:T}) = A_i * A_{i+1} * ... * A_{j-1} * P_{j|T}
 
-    where A_k is the smoother gain and P_{j|T} is the smoothed variance.
+    This is a vectorized computation using cumulative products of smoother gains.
 
     Parameters
     ----------
     smoothed_variance : jnp.ndarray, shape (n_trials,)
         Smoothed learning state variances (P_{k|T}).
     smoother_gain : jnp.ndarray, shape (n_trials - 1,)
-        Smoother gain values (A_k). Note: smoother_gain[k] corresponds to
-        the gain for transitioning from trial k to k+1.
-    trial1 : int
-        First trial index (0-based). Must be < trial2.
-    trial2 : int
-        Second trial index (0-based). Must be > trial1.
+        Smoother gain values (A_k).
 
     Returns
     -------
-    cross_covariance : jnp.ndarray, scalar
-        The cross-covariance Cov(x_{trial1}, x_{trial2} | y_{1:T}).
-
-    Notes
-    -----
-    This implements the formula from trialtotrial.m in the MATLAB code:
-        for ppp = trial2-1:-1:trial1
-            a1 = A(ppp) * a1
-        end
-        covx = a1 * signewsq(trial2)
+    cross_cov_matrix : jnp.ndarray, shape (n_trials, n_trials)
+        Upper triangular matrix where entry [i, j] (i <= j) contains
+        Cov(x_i, x_j | y_{1:T}). Diagonal contains variances P_{k|T}.
+        Lower triangle is symmetric (Cov(x_i, x_j) = Cov(x_j, x_i)).
     """
-    # Product of smoother gains from trial1 to trial2-1
-    # smoother_gain[k] is A_k, the gain for the transition from k to k+1
-    # We need A_{trial1} * A_{trial1+1} * ... * A_{trial2-1}
-    gain_product = jnp.prod(smoother_gain[trial1:trial2])
+    n_trials = len(smoothed_variance)
 
-    # Cross-covariance = product of gains * variance at trial2
-    cross_covariance = gain_product * smoothed_variance[trial2]
+    # Compute cumulative product of smoother gains
+    # cumgain[k] = A_0 * A_1 * ... * A_{k-1} for k >= 1, cumgain[0] = 1
+    log_gains = jnp.log(jnp.clip(smoother_gain, 1e-10, None))
+    cumsum_log_gains = jnp.concatenate([jnp.array([0.0]), jnp.cumsum(log_gains)])
 
-    return cross_covariance
+    # For Cov(x_i, x_j) where i < j:
+    # = A_i * A_{i+1} * ... * A_{j-1} * P_j
+    # = (cumgain[j] / cumgain[i]) * P_j
+    # = exp(cumsum_log[j] - cumsum_log[i]) * P_j
+
+    # Create index grids
+    i_idx, j_idx = jnp.meshgrid(jnp.arange(n_trials), jnp.arange(n_trials), indexing="ij")
+
+    # Compute log of gain products: log(A_i * ... * A_{j-1}) = cumsum_log[j] - cumsum_log[i]
+    log_gain_products = cumsum_log_gains[j_idx] - cumsum_log_gains[i_idx]
+
+    # Cross-covariance = exp(log_gain_products) * P_j (for i <= j)
+    cross_cov_matrix = jnp.exp(log_gain_products) * smoothed_variance[j_idx]
+
+    # For i > j, use symmetry: Cov(x_i, x_j) = Cov(x_j, x_i)
+    # But our formula computes Cov(x_i, x_j) = product(A_i:A_{j-1}) * P_j
+    # which is only valid for i <= j. For i > j, we need to use the transpose.
+    upper_tri = jnp.triu(cross_cov_matrix)
+    cross_cov_matrix = upper_tri + upper_tri.T - jnp.diag(jnp.diag(upper_tri))
+
+    return cross_cov_matrix
+
+
+def compute_trial_comparison_matrix(
+    key: jax.random.PRNGKey,
+    smoothed_mode: jnp.ndarray,
+    smoothed_variance: jnp.ndarray,
+    smoother_gain: jnp.ndarray,
+    n_samples: int = 10000,
+    compare_probability: bool = False,
+    mu_bias: Optional[float] = None,
+) -> jnp.ndarray:
+    """Compute pairwise comparison matrix for all trials (vectorized).
+
+    Computes P(x_i > x_j | y_{1:T}) for all pairs of trials i < j.
+    This implements the full trialtotrial.m functionality using vectorized
+    JAX operations for efficiency.
+
+    Parameters
+    ----------
+    key : jax.random.PRNGKey
+        JAX PRNG key for Monte Carlo sampling.
+    smoothed_mode : jnp.ndarray, shape (n_trials,)
+        Smoothed learning state modes (x_{k|T}).
+    smoothed_variance : jnp.ndarray, shape (n_trials,)
+        Smoothed learning state variances (P_{k|T}).
+    smoother_gain : jnp.ndarray, shape (n_trials - 1,)
+        Smoother gain values (A_k).
+    n_samples : int, optional
+        Number of Monte Carlo samples per comparison. Default is 10000.
+    compare_probability : bool, optional
+        If True, compare in probability space. Default is False.
+    mu_bias : float, optional
+        Bias term for sigmoid. Required if compare_probability=True.
+
+    Returns
+    -------
+    comparison_matrix : jnp.ndarray, shape (n_trials, n_trials)
+        Upper triangular matrix where entry [i, j] (i < j) contains
+        P(x_i > x_j | y_{1:T}). Diagonal is 0.5, lower triangle is NaN.
+    """
+    n_trials = len(smoothed_mode)
+
+    # Compute full cross-covariance matrix
+    cross_cov_matrix = compute_cross_covariance_matrix(smoothed_variance, smoother_gain)
+
+    # Generate samples for all trials at once: shape (n_samples, n_trials)
+    # Sample from multivariate normal N(smoothed_mode, cross_cov_matrix)
+    # Use eigendecomposition for numerical stability
+    eigenvalues, eigenvectors = jnp.linalg.eigh(cross_cov_matrix)
+    eigenvalues = jnp.maximum(eigenvalues, 0.0)  # Ensure non-negative
+    sqrt_cov = eigenvectors @ jnp.diag(jnp.sqrt(eigenvalues))
+
+    # Generate standard normal samples and transform
+    z = jax.random.normal(key, shape=(n_samples, n_trials))
+    samples = smoothed_mode + z @ sqrt_cov.T  # shape: (n_samples, n_trials)
+
+    if compare_probability:
+        if mu_bias is None:
+            raise ValueError("mu_bias is required when compare_probability=True")
+        samples = jax.nn.sigmoid(mu_bias + samples)
+
+    # Compute P(x_i > x_j) for all pairs using broadcasting
+    # samples[:, :, None] has shape (n_samples, n_trials, 1)
+    # samples[:, None, :] has shape (n_samples, 1, n_trials)
+    # comparison has shape (n_samples, n_trials, n_trials)
+    comparison = samples[:, :, None] > samples[:, None, :]
+
+    # Mean over samples gives P(x_i > x_j)
+    comparison_matrix = jnp.mean(comparison, axis=0)
+
+    # Set diagonal to 0.5 and lower triangle to NaN
+    comparison_matrix = jnp.where(
+        jnp.eye(n_trials, dtype=bool),
+        0.5,
+        comparison_matrix,
+    )
+    comparison_matrix = jnp.where(
+        jnp.tril(jnp.ones((n_trials, n_trials), dtype=bool), k=-1),
+        jnp.nan,
+        comparison_matrix,
+    )
+
+    return comparison_matrix
 
 
 def compare_two_trials(
@@ -830,6 +915,9 @@ def compare_two_trials(
     This implements the trial-to-trial comparison from trialtotrial.m,
     computing P(x_{trial1} > x_{trial2} | y_{1:T}) or optionally
     P(p_{trial1} > p_{trial2} | y_{1:T}) for probability space.
+
+    For comparing many pairs, use compute_trial_comparison_matrix() instead
+    which is more efficient due to vectorization.
 
     Parameters
     ----------
@@ -863,120 +951,23 @@ def compare_two_trials(
     if trial1 == trial2:
         return 0.5  # Same trial, no difference
 
-    if compare_probability and mu_bias is None:
-        raise ValueError("mu_bias is required when compare_probability=True")
-
-    # Ensure trial1 < trial2 for covariance computation, then adjust result
-    swapped = trial1 > trial2
-    if swapped:
-        trial1, trial2 = trial2, trial1
-
-    # Compute cross-covariance
-    cross_cov = compute_cross_covariance(
-        smoothed_variance, smoother_gain, trial1, trial2
+    # Compute full comparison matrix and extract the relevant entry
+    comparison_matrix = compute_trial_comparison_matrix(
+        key=key,
+        smoothed_mode=smoothed_mode,
+        smoothed_variance=smoothed_variance,
+        smoother_gain=smoother_gain,
+        n_samples=n_samples,
+        compare_probability=compare_probability,
+        mu_bias=mu_bias,
     )
 
-    # Build bivariate normal parameters
-    mean_vec = jnp.array([smoothed_mode[trial1], smoothed_mode[trial2]])
-    cov_matrix = jnp.array(
-        [
-            [smoothed_variance[trial1], cross_cov],
-            [cross_cov, smoothed_variance[trial2]],
-        ]
-    )
-
-    # Sample from bivariate normal using eigendecomposition (JIT-compatible)
-    # This avoids Cholesky which can fail for near-singular matrices
-    eigenvalues, eigenvectors = jnp.linalg.eigh(cov_matrix)
-    # Clamp eigenvalues to be non-negative for numerical stability
-    eigenvalues = jnp.maximum(eigenvalues, 0.0)
-    sqrt_cov = eigenvectors @ jnp.diag(jnp.sqrt(eigenvalues))
-
-    # Generate standard normal samples and transform
-    z = jax.random.normal(key, shape=(n_samples, 2))
-    samples = mean_vec + z @ sqrt_cov.T  # shape: (n_samples, 2)
-
-    if compare_probability:
-        # Transform to probability space
-        samples = jax.nn.sigmoid(mu_bias + samples)
-
-    # Compute P(trial1 > trial2)
-    # samples[:, 0] is trial1, samples[:, 1] is trial2
-    p_value = jnp.mean(samples[:, 0] > samples[:, 1])
-
-    # If we swapped, we computed P(original_trial2 > original_trial1)
-    # so we need to return 1 - p_value to get P(original_trial1 > original_trial2)
-    if swapped:
-        p_value = 1.0 - p_value
-
-    return float(p_value)
-
-
-def compute_trial_comparison_matrix(
-    key: jax.random.PRNGKey,
-    smoothed_mode: jnp.ndarray,
-    smoothed_variance: jnp.ndarray,
-    smoother_gain: jnp.ndarray,
-    n_samples: int = 10000,
-    compare_probability: bool = False,
-    mu_bias: Optional[float] = None,
-) -> jnp.ndarray:
-    """Compute pairwise comparison matrix for all trials.
-
-    Computes P(x_i > x_j | y_{1:T}) for all pairs of trials i < j.
-    This implements the full trialtotrial.m functionality.
-
-    Parameters
-    ----------
-    key : jax.random.PRNGKey
-        JAX PRNG key for Monte Carlo sampling.
-    smoothed_mode : jnp.ndarray, shape (n_trials,)
-        Smoothed learning state modes (x_{k|T}).
-    smoothed_variance : jnp.ndarray, shape (n_trials,)
-        Smoothed learning state variances (P_{k|T}).
-    smoother_gain : jnp.ndarray, shape (n_trials - 1,)
-        Smoother gain values (A_k).
-    n_samples : int, optional
-        Number of Monte Carlo samples per comparison. Default is 10000.
-    compare_probability : bool, optional
-        If True, compare in probability space. Default is False.
-    mu_bias : float, optional
-        Bias term for sigmoid. Required if compare_probability=True.
-
-    Returns
-    -------
-    comparison_matrix : jnp.ndarray, shape (n_trials, n_trials)
-        Upper triangular matrix where entry [i, j] (i < j) contains
-        P(x_i > x_j | y_{1:T}). Diagonal is 0.5, lower triangle is NaN.
-    """
-    n_trials = len(smoothed_mode)
-    comparison_matrix = jnp.full((n_trials, n_trials), jnp.nan)
-
-    # Set diagonal to 0.5
-    comparison_matrix = comparison_matrix.at[jnp.diag_indices(n_trials)].set(0.5)
-
-    # Generate all keys upfront
-    n_comparisons = n_trials * (n_trials - 1) // 2
-    keys = jax.random.split(key, n_comparisons)
-
-    key_idx = 0
-    for i in range(n_trials):
-        for j in range(i + 1, n_trials):
-            p_val = compare_two_trials(
-                keys[key_idx],
-                smoothed_mode,
-                smoothed_variance,
-                smoother_gain,
-                trial1=i,
-                trial2=j,
-                n_samples=n_samples,
-                compare_probability=compare_probability,
-                mu_bias=mu_bias,
-            )
-            comparison_matrix = comparison_matrix.at[i, j].set(p_val)
-            key_idx += 1
-
-    return comparison_matrix
+    # Extract the comparison for trial1 vs trial2
+    if trial1 < trial2:
+        return float(comparison_matrix[trial1, trial2])
+    else:
+        # P(trial1 > trial2) = 1 - P(trial2 > trial1)
+        return float(1.0 - comparison_matrix[trial2, trial1])
 
 
 def find_first_significant_trial(
