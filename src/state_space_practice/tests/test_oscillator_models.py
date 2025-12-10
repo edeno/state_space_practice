@@ -722,3 +722,373 @@ class TestCovarianceStructure:
         for j in range(model.n_discrete_states):
             R_j = model.measurement_cov[..., j]
             np.testing.assert_allclose(R_j, R_j.T, rtol=1e-10)
+
+
+# ============================================================================
+# Property-Based Tests using Hypothesis
+# ============================================================================
+
+from hypothesis import given, settings
+from hypothesis import strategies as st
+
+
+class TestCommonOscillatorModelProperties:
+    """Property-based tests for CommonOscillatorModel."""
+
+    @given(
+        st.integers(min_value=1, max_value=4),
+        st.integers(min_value=1, max_value=4),
+        st.integers(min_value=1, max_value=6),
+    )
+    @settings(max_examples=20, deadline=None)
+    def test_discrete_transition_is_stochastic(
+        self, n_osc: int, n_disc: int, n_src: int
+    ) -> None:
+        """Discrete transition matrix rows should sum to 1."""
+        model = CommonOscillatorModel(
+            n_oscillators=n_osc,
+            n_discrete_states=n_disc,
+            n_sources=n_src,
+            sampling_freq=100.0,
+            freqs=jnp.ones(n_osc) * 10.0,
+            auto_regressive_coef=jnp.ones(n_osc) * 0.95,
+            process_variance=jnp.ones(n_osc) * 0.1,
+            measurement_variance=0.05,
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        row_sums = jnp.sum(model.discrete_transition_matrix, axis=1)
+        np.testing.assert_allclose(row_sums, jnp.ones(n_disc), rtol=1e-6)
+
+    @given(
+        st.integers(min_value=1, max_value=4),
+        st.integers(min_value=1, max_value=4),
+        st.integers(min_value=1, max_value=6),
+    )
+    @settings(max_examples=20, deadline=None)
+    def test_init_prob_is_valid_distribution(
+        self, n_osc: int, n_disc: int, n_src: int
+    ) -> None:
+        """Initial discrete state probabilities should be valid distribution."""
+        model = CommonOscillatorModel(
+            n_oscillators=n_osc,
+            n_discrete_states=n_disc,
+            n_sources=n_src,
+            sampling_freq=100.0,
+            freqs=jnp.ones(n_osc) * 10.0,
+            auto_regressive_coef=jnp.ones(n_osc) * 0.95,
+            process_variance=jnp.ones(n_osc) * 0.1,
+            measurement_variance=0.05,
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        assert jnp.all(model.init_discrete_state_prob >= 0)
+        np.testing.assert_allclose(
+            jnp.sum(model.init_discrete_state_prob), 1.0, rtol=1e-6
+        )
+
+    @given(
+        st.integers(min_value=1, max_value=3),
+        st.integers(min_value=1, max_value=3),
+        st.integers(min_value=1, max_value=4),
+    )
+    @settings(max_examples=15, deadline=None)
+    def test_covariances_positive_semidefinite(
+        self, n_osc: int, n_disc: int, n_src: int
+    ) -> None:
+        """All covariance matrices should be positive semi-definite."""
+        model = CommonOscillatorModel(
+            n_oscillators=n_osc,
+            n_discrete_states=n_disc,
+            n_sources=n_src,
+            sampling_freq=100.0,
+            freqs=jnp.ones(n_osc) * 10.0,
+            auto_regressive_coef=jnp.ones(n_osc) * 0.95,
+            process_variance=jnp.ones(n_osc) * 0.1,
+            measurement_variance=0.05,
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        for j in range(n_disc):
+            # Check init_cov
+            eigenvalues = jnp.linalg.eigvalsh(model.init_cov[..., j])
+            assert jnp.all(eigenvalues >= -1e-10)
+
+            # Check process_cov
+            eigenvalues = jnp.linalg.eigvalsh(model.process_cov[..., j])
+            assert jnp.all(eigenvalues >= -1e-10)
+
+            # Check measurement_cov
+            eigenvalues = jnp.linalg.eigvalsh(model.measurement_cov[..., j])
+            assert jnp.all(eigenvalues >= -1e-10)
+
+
+class TestCorrelatedNoiseModelProperties:
+    """Property-based tests for CorrelatedNoiseModel."""
+
+    @given(
+        st.integers(min_value=1, max_value=3),
+        st.integers(min_value=1, max_value=3),
+    )
+    @settings(max_examples=15, deadline=None)
+    def test_measurement_matrix_constant_across_states(
+        self, n_osc: int, n_disc: int
+    ) -> None:
+        """For CNM, measurement matrix should be constant across states."""
+        model = CorrelatedNoiseModel(
+            n_oscillators=n_osc,
+            n_discrete_states=n_disc,
+            sampling_freq=100.0,
+            freqs=jnp.ones(n_osc) * 10.0,
+            auto_regressive_coef=jnp.ones(n_osc) * 0.95,
+            process_variance=jnp.ones((n_osc, n_disc)) * 0.1,
+            measurement_variance=0.05,
+            phase_difference=jnp.zeros((n_osc, n_osc, n_disc)),
+            coupling_strength=jnp.zeros((n_osc, n_osc, n_disc)),
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        for j in range(1, n_disc):
+            np.testing.assert_allclose(
+                model.measurement_matrix[..., 0],
+                model.measurement_matrix[..., j],
+                rtol=1e-10,
+            )
+
+    @given(
+        st.integers(min_value=1, max_value=3),
+        st.integers(min_value=1, max_value=3),
+    )
+    @settings(max_examples=15, deadline=None)
+    def test_transition_matrix_constant_across_states(
+        self, n_osc: int, n_disc: int
+    ) -> None:
+        """For CNM, continuous transition matrix should be constant across states."""
+        model = CorrelatedNoiseModel(
+            n_oscillators=n_osc,
+            n_discrete_states=n_disc,
+            sampling_freq=100.0,
+            freqs=jnp.ones(n_osc) * 10.0,
+            auto_regressive_coef=jnp.ones(n_osc) * 0.95,
+            process_variance=jnp.ones((n_osc, n_disc)) * 0.1,
+            measurement_variance=0.05,
+            phase_difference=jnp.zeros((n_osc, n_osc, n_disc)),
+            coupling_strength=jnp.zeros((n_osc, n_osc, n_disc)),
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        for j in range(1, n_disc):
+            np.testing.assert_allclose(
+                model.continuous_transition_matrix[..., 0],
+                model.continuous_transition_matrix[..., j],
+                rtol=1e-10,
+            )
+
+    @given(
+        st.integers(min_value=2, max_value=3),
+        st.integers(min_value=2, max_value=3),
+    )
+    @settings(max_examples=15, deadline=None)
+    def test_process_cov_symmetric_for_all_states(
+        self, n_osc: int, n_disc: int
+    ) -> None:
+        """Process covariance should be symmetric for all discrete states."""
+        model = CorrelatedNoiseModel(
+            n_oscillators=n_osc,
+            n_discrete_states=n_disc,
+            sampling_freq=100.0,
+            freqs=jnp.ones(n_osc) * 10.0,
+            auto_regressive_coef=jnp.ones(n_osc) * 0.95,
+            process_variance=jnp.ones((n_osc, n_disc)) * 0.1,
+            measurement_variance=0.05,
+            phase_difference=jnp.zeros((n_osc, n_osc, n_disc)),
+            coupling_strength=jnp.zeros((n_osc, n_osc, n_disc)),
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        for j in range(n_disc):
+            Q_j = model.process_cov[..., j]
+            np.testing.assert_allclose(Q_j, Q_j.T, rtol=1e-10)
+
+
+class TestDirectedInfluenceModelProperties:
+    """Property-based tests for DirectedInfluenceModel."""
+
+    @given(
+        st.integers(min_value=1, max_value=3),
+        st.integers(min_value=1, max_value=3),
+    )
+    @settings(max_examples=15, deadline=None)
+    def test_process_cov_constant_across_states(
+        self, n_osc: int, n_disc: int
+    ) -> None:
+        """For DIM, process covariance should be constant across states."""
+        model = DirectedInfluenceModel(
+            n_oscillators=n_osc,
+            n_discrete_states=n_disc,
+            sampling_freq=100.0,
+            freqs=jnp.ones(n_osc) * 10.0,
+            auto_regressive_coef=jnp.ones(n_osc) * 0.95,
+            process_variance=jnp.ones(n_osc) * 0.1,
+            measurement_variance=0.05,
+            phase_difference=jnp.zeros((n_osc, n_osc, n_disc)),
+            coupling_strength=jnp.zeros((n_osc, n_osc, n_disc)),
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        for j in range(1, n_disc):
+            np.testing.assert_allclose(
+                model.process_cov[..., 0],
+                model.process_cov[..., j],
+                rtol=1e-10,
+            )
+
+    @given(
+        st.integers(min_value=1, max_value=3),
+        st.integers(min_value=1, max_value=3),
+    )
+    @settings(max_examples=15, deadline=None)
+    def test_measurement_matrix_constant_across_states(
+        self, n_osc: int, n_disc: int
+    ) -> None:
+        """For DIM, measurement matrix should be constant across states."""
+        model = DirectedInfluenceModel(
+            n_oscillators=n_osc,
+            n_discrete_states=n_disc,
+            sampling_freq=100.0,
+            freqs=jnp.ones(n_osc) * 10.0,
+            auto_regressive_coef=jnp.ones(n_osc) * 0.95,
+            process_variance=jnp.ones(n_osc) * 0.1,
+            measurement_variance=0.05,
+            phase_difference=jnp.zeros((n_osc, n_osc, n_disc)),
+            coupling_strength=jnp.zeros((n_osc, n_osc, n_disc)),
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        for j in range(1, n_disc):
+            np.testing.assert_allclose(
+                model.measurement_matrix[..., 0],
+                model.measurement_matrix[..., j],
+                rtol=1e-10,
+            )
+
+
+class TestOscillatorModelInputValidation:
+    """Tests for input validation in oscillator models."""
+
+    def test_com_rejects_mismatched_freqs(self) -> None:
+        """COM should reject freqs with wrong shape."""
+        with pytest.raises(ValueError, match="Shape mismatch.*freqs"):
+            CommonOscillatorModel(
+                n_oscillators=2,
+                n_discrete_states=3,
+                n_sources=4,
+                sampling_freq=100.0,
+                freqs=jnp.array([10.0]),  # Wrong size
+                auto_regressive_coef=jnp.array([0.95, 0.95]),
+                process_variance=jnp.array([0.1, 0.1]),
+                measurement_variance=0.05,
+            )
+
+    def test_com_rejects_mismatched_ar_coef(self) -> None:
+        """COM should reject auto_regressive_coef with wrong shape."""
+        with pytest.raises(ValueError, match="Shape mismatch.*auto_regressive_coef"):
+            CommonOscillatorModel(
+                n_oscillators=2,
+                n_discrete_states=3,
+                n_sources=4,
+                sampling_freq=100.0,
+                freqs=jnp.array([10.0, 12.0]),
+                auto_regressive_coef=jnp.array([0.95]),  # Wrong size
+                process_variance=jnp.array([0.1, 0.1]),
+                measurement_variance=0.05,
+            )
+
+    def test_com_rejects_mismatched_process_variance(self) -> None:
+        """COM should reject process_variance with wrong shape."""
+        with pytest.raises(ValueError, match="Shape mismatch.*process_variance"):
+            CommonOscillatorModel(
+                n_oscillators=2,
+                n_discrete_states=3,
+                n_sources=4,
+                sampling_freq=100.0,
+                freqs=jnp.array([10.0, 12.0]),
+                auto_regressive_coef=jnp.array([0.95, 0.95]),
+                process_variance=jnp.array([0.1]),  # Wrong size
+                measurement_variance=0.05,
+            )
+
+    def test_cnm_rejects_negative_measurement_variance(self) -> None:
+        """CNM should reject negative measurement variance."""
+        with pytest.raises(ValueError, match="measurement_variance must be positive"):
+            CorrelatedNoiseModel(
+                n_oscillators=2,
+                n_discrete_states=3,
+                sampling_freq=100.0,
+                freqs=jnp.array([10.0, 12.0]),
+                auto_regressive_coef=jnp.array([0.95, 0.95]),
+                process_variance=jnp.ones((2, 3)) * 0.1,
+                measurement_variance=-0.05,  # Invalid
+                phase_difference=jnp.zeros((2, 2, 3)),
+                coupling_strength=jnp.zeros((2, 2, 3)),
+            )
+
+    def test_cnm_rejects_zero_measurement_variance(self) -> None:
+        """CNM should reject zero measurement variance."""
+        with pytest.raises(ValueError, match="measurement_variance must be positive"):
+            CorrelatedNoiseModel(
+                n_oscillators=2,
+                n_discrete_states=3,
+                sampling_freq=100.0,
+                freqs=jnp.array([10.0, 12.0]),
+                auto_regressive_coef=jnp.array([0.95, 0.95]),
+                process_variance=jnp.ones((2, 3)) * 0.1,
+                measurement_variance=0.0,  # Invalid
+                phase_difference=jnp.zeros((2, 2, 3)),
+                coupling_strength=jnp.zeros((2, 2, 3)),
+            )
+
+    def test_cnm_rejects_negative_sampling_freq(self) -> None:
+        """CNM should reject negative sampling frequency."""
+        with pytest.raises(ValueError, match="sampling_freq must be positive"):
+            CorrelatedNoiseModel(
+                n_oscillators=2,
+                n_discrete_states=3,
+                sampling_freq=-100.0,  # Invalid
+                freqs=jnp.array([10.0, 12.0]),
+                auto_regressive_coef=jnp.array([0.95, 0.95]),
+                process_variance=jnp.ones((2, 3)) * 0.1,
+                measurement_variance=0.05,
+                phase_difference=jnp.zeros((2, 2, 3)),
+                coupling_strength=jnp.zeros((2, 2, 3)),
+            )
+
+    def test_dim_rejects_mismatched_phase_difference(self) -> None:
+        """DIM should reject phase_difference with wrong shape."""
+        with pytest.raises(ValueError, match="phase_difference must have shape"):
+            DirectedInfluenceModel(
+                n_oscillators=2,
+                n_discrete_states=3,
+                sampling_freq=100.0,
+                freqs=jnp.array([10.0, 12.0]),
+                auto_regressive_coef=jnp.array([0.95, 0.95]),
+                process_variance=jnp.array([0.1, 0.1]),
+                measurement_variance=0.05,
+                phase_difference=jnp.zeros((2, 2)),  # Missing last dim
+                coupling_strength=jnp.zeros((2, 2, 3)),
+            )
+
+    def test_dim_rejects_mismatched_coupling_strength(self) -> None:
+        """DIM should reject coupling_strength with wrong shape."""
+        with pytest.raises(ValueError, match="coupling_strength must have shape"):
+            DirectedInfluenceModel(
+                n_oscillators=2,
+                n_discrete_states=3,
+                sampling_freq=100.0,
+                freqs=jnp.array([10.0, 12.0]),
+                auto_regressive_coef=jnp.array([0.95, 0.95]),
+                process_variance=jnp.array([0.1, 0.1]),
+                measurement_variance=0.05,
+                phase_difference=jnp.zeros((2, 2, 3)),
+                coupling_strength=jnp.zeros((3, 3, 3)),  # Wrong n_osc
+            )

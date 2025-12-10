@@ -28,6 +28,13 @@ def check_converged(
         True if log-likelihood did not decrease by more than tolerance.
 
     """
+    # Handle infinite values (e.g., first iteration when previous is -inf)
+    if not np.isfinite(previous_log_likelihood) or not np.isfinite(log_likelihood):
+        # Can't be converged if either value is infinite
+        # is_increasing is True if current is finite or greater
+        is_increasing = log_likelihood >= previous_log_likelihood
+        return False, bool(is_increasing)
+
     delta_log_likelihood = abs(log_likelihood - previous_log_likelihood)
     eps = np.finfo(float).eps
     avg_log_likelihood = (abs(log_likelihood) + abs(previous_log_likelihood) + eps) / 2

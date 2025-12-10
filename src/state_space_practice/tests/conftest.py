@@ -8,8 +8,10 @@ from hypothesis import strategies as st
 from hypothesis.extra.numpy import arrays
 
 # Configure Hypothesis for JAX compatibility
-settings.register_profile("ci", max_examples=50, deadline=None)
-settings.register_profile("dev", max_examples=20, deadline=None)
+# CI profile: More thorough testing for numerical algorithms
+settings.register_profile("ci", max_examples=100, deadline=None, derandomize=True)
+# Dev profile: Faster iteration during development
+settings.register_profile("dev", max_examples=10, deadline=None)
 settings.load_profile("dev")
 
 

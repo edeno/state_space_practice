@@ -865,11 +865,11 @@ def test_m_step_discrete_transition_matrix_simple():
     key = random.PRNGKey(0)
     key, sub = random.split(key)
     s = jnp.zeros(n_time, dtype=jnp.int32)
-    s = s.at[0].set(random.choice(sub, a=n_disc, p=init_prob))
+    s = s.at[0].set(random.choice(sub, a=n_disc, p=init_prob).astype(jnp.int32))
     for t in range(1, n_time):
         key, sub = random.split(key)
         prev = int(s[t - 1])
-        s = s.at[t].set(random.choice(sub, a=n_disc, p=Z_true[prev]))
+        s = s.at[t].set(random.choice(sub, a=n_disc, p=Z_true[prev]).astype(jnp.int32))
 
     # 4) Build “perfect” smoother outputs:
     #    • gammaₜ(j)=P(Sₜ=j)=1 for the true j, else 0

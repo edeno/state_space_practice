@@ -746,3 +746,283 @@ class TestKalmanMaximizationStepProperties:
         np.testing.assert_allclose(Q_est, Q_est.T, rtol=1e-10, atol=1e-14)
         np.testing.assert_allclose(R_est, R_est.T, rtol=1e-10, atol=1e-14)
         np.testing.assert_allclose(init_cov_est, init_cov_est.T, rtol=1e-10, atol=1e-14)
+
+
+# --- Boundary Tests ---
+
+
+class TestKalmanFilterBoundary:
+    """Boundary tests for Kalman filter edge cases."""
+
+    def test_single_timestep(self) -> None:
+        """Kalman filter should handle single timestep correctly."""
+        init_mean = jnp.array([0.0])
+        init_cov = jnp.eye(1)
+        A = jnp.eye(1)
+        Q = jnp.eye(1) * 0.1
+        H = jnp.eye(1)
+        R = jnp.eye(1)
+        obs = jnp.array([[0.5]])  # Single observation
+
+        filtered_mean, filtered_cov, mll = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        assert filtered_mean.shape == (1, 1)
+        assert filtered_cov.shape == (1, 1, 1)
+        assert jnp.isfinite(mll)
+
+    def test_two_timesteps(self) -> None:
+        """Kalman filter should handle two timesteps correctly."""
+        init_mean = jnp.array([0.0])
+        init_cov = jnp.eye(1)
+        A = jnp.eye(1)
+        Q = jnp.eye(1) * 0.1
+        H = jnp.eye(1)
+        R = jnp.eye(1)
+        obs = jnp.array([[0.5], [0.6]])
+
+        filtered_mean, filtered_cov, mll = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        assert filtered_mean.shape == (2, 1)
+        assert filtered_cov.shape == (2, 1, 1)
+        assert jnp.isfinite(mll)
+
+    @pytest.mark.slow
+    def test_long_sequence(self) -> None:
+        """Kalman filter should handle long sequences without numerical issues."""
+        n_time = 1000
+        init_mean = jnp.array([0.0])
+        init_cov = jnp.eye(1)
+        A = jnp.eye(1) * 0.99  # Stable
+        Q = jnp.eye(1) * 0.1
+        H = jnp.eye(1)
+        R = jnp.eye(1)
+
+        key = random.PRNGKey(42)
+        obs = random.normal(key, (n_time, 1))
+
+        filtered_mean, filtered_cov, mll = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        assert filtered_mean.shape == (n_time, 1)
+        assert not jnp.any(jnp.isnan(filtered_mean))
+        assert not jnp.any(jnp.isnan(filtered_cov))
+        assert jnp.isfinite(mll)
+
+    def test_high_dimensional_state(self) -> None:
+        """Kalman filter should handle higher dimensional states."""
+        n_cont_states = 10
+        n_obs_dim = 5
+        n_time = 20
+
+        key = random.PRNGKey(123)
+        k1, k2, k3 = random.split(key, 3)
+
+        init_mean = jnp.zeros(n_cont_states)
+        init_cov = jnp.eye(n_cont_states)
+
+        # Create stable transition matrix
+        A = jnp.eye(n_cont_states) * 0.9
+        Q = jnp.eye(n_cont_states) * 0.1
+
+        H = random.normal(k1, (n_obs_dim, n_cont_states)) * 0.5
+        R = jnp.eye(n_obs_dim)
+
+        obs = random.normal(k2, (n_time, n_obs_dim))
+
+        filtered_mean, filtered_cov, mll = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        assert filtered_mean.shape == (n_time, n_cont_states)
+        assert filtered_cov.shape == (n_time, n_cont_states, n_cont_states)
+        assert jnp.isfinite(mll)
+
+    def test_very_small_process_noise(self) -> None:
+        """Kalman filter should handle very small process noise."""
+        init_mean = jnp.array([0.0])
+        init_cov = jnp.eye(1)
+        A = jnp.eye(1)
+        Q = jnp.eye(1) * 1e-10  # Very small
+        H = jnp.eye(1)
+        R = jnp.eye(1)
+        obs = jnp.array([[0.5], [0.6], [0.7]])
+
+        filtered_mean, filtered_cov, mll = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        assert not jnp.any(jnp.isnan(filtered_mean))
+        assert not jnp.any(jnp.isnan(filtered_cov))
+
+    def test_very_large_measurement_noise(self) -> None:
+        """Kalman filter should handle very large measurement noise."""
+        init_mean = jnp.array([0.0])
+        init_cov = jnp.eye(1)
+        A = jnp.eye(1)
+        Q = jnp.eye(1) * 0.1
+        H = jnp.eye(1)
+        R = jnp.eye(1) * 1e6  # Very large
+        obs = jnp.array([[0.5], [0.6], [0.7]])
+
+        filtered_mean, filtered_cov, mll = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        # With large R, filter should barely update from prior
+        assert not jnp.any(jnp.isnan(filtered_mean))
+        assert not jnp.any(jnp.isnan(filtered_cov))
+
+
+class TestKalmanSmootherBoundary:
+    """Boundary tests for Kalman smoother edge cases."""
+
+    def test_single_timestep(self) -> None:
+        """Kalman smoother should handle single timestep correctly."""
+        init_mean = jnp.array([0.0])
+        init_cov = jnp.eye(1)
+        A = jnp.eye(1)
+        Q = jnp.eye(1) * 0.1
+        H = jnp.eye(1)
+        R = jnp.eye(1)
+        obs = jnp.array([[0.5]])  # Single observation
+
+        smoother_mean, smoother_cov, smoother_cross_cov, mll = kalman_smoother(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        assert smoother_mean.shape == (1, 1)
+        assert smoother_cov.shape == (1, 1, 1)
+        assert smoother_cross_cov.shape == (0, 1, 1)  # No cross-cov for single step
+        assert jnp.isfinite(mll)
+
+    def test_two_timesteps(self) -> None:
+        """Kalman smoother should handle two timesteps correctly."""
+        init_mean = jnp.array([0.0])
+        init_cov = jnp.eye(1)
+        A = jnp.eye(1)
+        Q = jnp.eye(1) * 0.1
+        H = jnp.eye(1)
+        R = jnp.eye(1)
+        obs = jnp.array([[0.5], [0.6]])
+
+        smoother_mean, smoother_cov, smoother_cross_cov, mll = kalman_smoother(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        assert smoother_mean.shape == (2, 1)
+        assert smoother_cov.shape == (2, 1, 1)
+        assert smoother_cross_cov.shape == (1, 1, 1)
+        assert jnp.isfinite(mll)
+
+    @pytest.mark.slow
+    def test_long_sequence(self) -> None:
+        """Kalman smoother should handle long sequences without numerical issues."""
+        n_time = 1000
+        init_mean = jnp.array([0.0])
+        init_cov = jnp.eye(1)
+        A = jnp.eye(1) * 0.99
+        Q = jnp.eye(1) * 0.1
+        H = jnp.eye(1)
+        R = jnp.eye(1)
+
+        key = random.PRNGKey(42)
+        obs = random.normal(key, (n_time, 1))
+
+        smoother_mean, smoother_cov, smoother_cross_cov, mll = kalman_smoother(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        assert smoother_mean.shape == (n_time, 1)
+        assert not jnp.any(jnp.isnan(smoother_mean))
+        assert not jnp.any(jnp.isnan(smoother_cov))
+        assert jnp.isfinite(mll)
+
+
+# --- Input Handling Tests ---
+
+
+class TestKalmanFilterInputHandling:
+    """Tests for Kalman filter behavior with edge case inputs."""
+
+    def test_handles_zero_mean_observations(self) -> None:
+        """Filter should handle observations centered at zero."""
+        init_mean = jnp.array([0.0])
+        init_cov = jnp.eye(1)
+        A = jnp.eye(1)
+        Q = jnp.eye(1) * 0.1
+        H = jnp.eye(1)
+        R = jnp.eye(1)
+        obs = jnp.zeros((10, 1))
+
+        filtered_mean, filtered_cov, mll = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        assert not jnp.any(jnp.isnan(filtered_mean))
+        assert jnp.isfinite(mll)
+
+    def test_handles_large_observations(self) -> None:
+        """Filter should handle large observation values."""
+        init_mean = jnp.array([0.0])
+        init_cov = jnp.eye(1)
+        A = jnp.eye(1)
+        Q = jnp.eye(1) * 0.1
+        H = jnp.eye(1)
+        R = jnp.eye(1)
+        obs = jnp.array([[1e6], [1e6], [1e6]])
+
+        filtered_mean, filtered_cov, mll = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        assert not jnp.any(jnp.isnan(filtered_mean))
+        # Mean should track towards large observations
+        assert jnp.abs(filtered_mean[-1, 0]) > 1e4
+
+    def test_handles_identity_observation_matrix(self) -> None:
+        """Filter should work with identity observation matrix."""
+        n_states = 3
+        init_mean = jnp.zeros(n_states)
+        init_cov = jnp.eye(n_states)
+        A = jnp.eye(n_states) * 0.9
+        Q = jnp.eye(n_states) * 0.1
+        H = jnp.eye(n_states)
+        R = jnp.eye(n_states)
+
+        key = random.PRNGKey(0)
+        obs = random.normal(key, (10, n_states))
+
+        filtered_mean, filtered_cov, mll = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        assert filtered_mean.shape == (10, n_states)
+        assert jnp.isfinite(mll)
+
+    def test_handles_partial_observation(self) -> None:
+        """Filter should work when observing fewer dimensions than state."""
+        n_states = 4
+        n_obs = 2
+        init_mean = jnp.zeros(n_states)
+        init_cov = jnp.eye(n_states)
+        A = jnp.eye(n_states) * 0.9
+        Q = jnp.eye(n_states) * 0.1
+        H = jnp.zeros((n_obs, n_states))
+        H = H.at[0, 0].set(1.0)
+        H = H.at[1, 2].set(1.0)  # Observe states 0 and 2
+        R = jnp.eye(n_obs)
+
+        key = random.PRNGKey(0)
+        obs = random.normal(key, (10, n_obs))
+
+        filtered_mean, filtered_cov, mll = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        assert filtered_mean.shape == (10, n_states)
+        assert jnp.isfinite(mll)
