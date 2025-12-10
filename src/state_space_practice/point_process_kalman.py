@@ -1,4 +1,5 @@
-from typing import Callable
+import logging
+from typing import Callable, Optional
 
 import jax
 import jax.numpy as jnp
@@ -9,6 +10,9 @@ from state_space_practice.kalman import (
     sum_of_outer_products,
     symmetrize,
 )
+from state_space_practice.utils import check_converged
+
+logger = logging.getLogger(__name__)
 
 
 def log_conditional_intensity(
@@ -421,3 +425,312 @@ def steepest_descent_point_process_filter(
         return posterior_mean, posterior_mean
 
     return jax.lax.scan(_update, init_mean_params, (x, spike_indicator))[1]
+
+
+class PointProcessModel:
+    """Point Process State-Space Model with EM fitting.
+
+    Implements the Eden & Brown (2004) adaptive point process filter/smoother
+    with EM algorithm for parameter estimation.
+
+    Model:
+        x_k = A @ x_{k-1} + w_k,  w_k ~ N(0, Q)
+        n_k ~ Poisson(exp(Z_k @ x_k) * dt)
+
+    The EM algorithm estimates the state dynamics parameters (A, Q) while
+    the latent states x_k are estimated via the E-step (filter/smoother).
+
+    Parameters
+    ----------
+    n_state_dims : int
+        Dimension of the latent state.
+    dt : float
+        Time step size.
+    transition_matrix : jnp.ndarray, optional
+        Initial state transition matrix A. Default is identity (random walk).
+    process_cov : jnp.ndarray, optional
+        Initial process noise covariance Q.
+    init_mean : jnp.ndarray, optional
+        Initial state mean.
+    init_cov : jnp.ndarray, optional
+        Initial state covariance.
+    log_intensity_func : callable, optional
+        Function log_lambda(Z_k, x_k) returning log conditional intensity.
+        Default is linear: Z_k @ x_k.
+    update_transition_matrix : bool
+        Whether to update A in M-step. Default True.
+    update_process_cov : bool
+        Whether to update Q in M-step. Default True.
+    update_init_state : bool
+        Whether to update initial state in M-step. Default True.
+
+    Attributes
+    ----------
+    smoother_mean : jnp.ndarray
+        Smoothed state estimates after fitting.
+    smoother_cov : jnp.ndarray
+        Smoothed state covariances after fitting.
+    smoother_cross_cov : jnp.ndarray
+        Smoothed cross-covariances after fitting.
+
+    References
+    ----------
+    [1] Eden, U.T., Frank, L.M., Barbieri, R., Solo, V. & Brown, E.N. (2004).
+        Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
+        Neural Computation 16, 971-998.
+    """
+
+    def __init__(
+        self,
+        n_state_dims: int,
+        dt: float,
+        transition_matrix: Optional[jnp.ndarray] = None,
+        process_cov: Optional[jnp.ndarray] = None,
+        init_mean: Optional[jnp.ndarray] = None,
+        init_cov: Optional[jnp.ndarray] = None,
+        log_intensity_func: Optional[Callable] = None,
+        update_transition_matrix: bool = True,
+        update_process_cov: bool = True,
+        update_init_state: bool = True,
+    ):
+        self.n_state_dims = n_state_dims
+        self.dt = dt
+
+        # Initialize parameters
+        if transition_matrix is None:
+            self.transition_matrix = jnp.eye(n_state_dims)
+        else:
+            self.transition_matrix = jnp.asarray(transition_matrix)
+
+        if process_cov is None:
+            self.process_cov = jnp.eye(n_state_dims) * 1e-4
+        else:
+            self.process_cov = jnp.asarray(process_cov)
+
+        if init_mean is None:
+            self.init_mean = jnp.zeros(n_state_dims)
+        else:
+            self.init_mean = jnp.asarray(init_mean)
+
+        if init_cov is None:
+            self.init_cov = jnp.eye(n_state_dims)
+        else:
+            self.init_cov = jnp.asarray(init_cov)
+
+        if log_intensity_func is None:
+            self.log_intensity_func = log_conditional_intensity
+        else:
+            self.log_intensity_func = log_intensity_func
+
+        # Update flags
+        self.update_transition_matrix = update_transition_matrix
+        self.update_process_cov = update_process_cov
+        self.update_init_state = update_init_state
+
+        # Results (populated after fit)
+        self.smoother_mean: Optional[jnp.ndarray] = None
+        self.smoother_cov: Optional[jnp.ndarray] = None
+        self.smoother_cross_cov: Optional[jnp.ndarray] = None
+        self.filtered_mean: Optional[jnp.ndarray] = None
+        self.filtered_cov: Optional[jnp.ndarray] = None
+
+    def _e_step(
+        self, design_matrix: jnp.ndarray, spike_indicator: jnp.ndarray
+    ) -> float:
+        """E-step: Run filter and smoother to estimate latent states.
+
+        Parameters
+        ----------
+        design_matrix : jnp.ndarray, shape (n_time, n_state_dims)
+        spike_indicator : jnp.ndarray, shape (n_time,)
+
+        Returns
+        -------
+        marginal_log_likelihood : float
+        """
+        (
+            self.smoother_mean,
+            self.smoother_cov,
+            self.smoother_cross_cov,
+            marginal_log_likelihood,
+        ) = stochastic_point_process_smoother(
+            init_mean_params=self.init_mean,
+            init_covariance_params=self.init_cov,
+            design_matrix=design_matrix,
+            spike_indicator=spike_indicator,
+            dt=self.dt,
+            transition_matrix=self.transition_matrix,
+            process_cov=self.process_cov,
+            log_conditional_intensity=self.log_intensity_func,
+        )
+
+        # Also store filtered results
+        self.filtered_mean, self.filtered_cov, _ = stochastic_point_process_filter(
+            init_mean_params=self.init_mean,
+            init_covariance_params=self.init_cov,
+            design_matrix=design_matrix,
+            spike_indicator=spike_indicator,
+            dt=self.dt,
+            transition_matrix=self.transition_matrix,
+            process_cov=self.process_cov,
+            log_conditional_intensity=self.log_intensity_func,
+        )
+
+        return float(marginal_log_likelihood)
+
+    def _m_step(self) -> None:
+        """M-step: Update model parameters based on smoothed estimates."""
+        if self.smoother_mean is None or self.smoother_cov is None:
+            raise RuntimeError("Must run E-step before M-step")
+
+        transition_matrix, process_cov, init_mean, init_cov = kalman_maximization_step(
+            self.smoother_mean,
+            self.smoother_cov,
+            self.smoother_cross_cov,
+        )
+
+        if self.update_transition_matrix:
+            self.transition_matrix = transition_matrix
+
+        if self.update_process_cov:
+            # Ensure positive definiteness
+            process_cov = symmetrize(process_cov)
+            # Ensure eigenvalues are positive (numerical stability)
+            eigvals, eigvecs = jnp.linalg.eigh(process_cov)
+            eigvals = jnp.maximum(eigvals, 1e-10)
+            process_cov = eigvecs @ jnp.diag(eigvals) @ eigvecs.T
+            self.process_cov = process_cov
+
+        if self.update_init_state:
+            self.init_mean = init_mean
+            self.init_cov = symmetrize(init_cov)
+
+    def fit(
+        self,
+        design_matrix: jnp.ndarray,
+        spike_indicator: jnp.ndarray,
+        max_iter: int = 100,
+        tolerance: float = 1e-4,
+    ) -> list[float]:
+        """Fit the model using the EM algorithm.
+
+        Parameters
+        ----------
+        design_matrix : jnp.ndarray, shape (n_time, n_state_dims)
+            Design matrix for the intensity function.
+        spike_indicator : jnp.ndarray, shape (n_time,)
+            Observed spike counts or indicators.
+        max_iter : int
+            Maximum number of EM iterations.
+        tolerance : float
+            Convergence tolerance for relative change in log-likelihood.
+
+        Returns
+        -------
+        log_likelihoods : list[float]
+            Log-likelihood at each iteration.
+        """
+        design_matrix = jnp.asarray(design_matrix)
+        spike_indicator = jnp.asarray(spike_indicator)
+
+        log_likelihoods: list[float] = []
+        previous_log_likelihood = -jnp.inf
+
+        for iteration in range(max_iter):
+            # E-step
+            current_log_likelihood = self._e_step(design_matrix, spike_indicator)
+            log_likelihoods.append(current_log_likelihood)
+
+            # Check convergence
+            is_converged, is_increasing = check_converged(
+                current_log_likelihood, previous_log_likelihood, tolerance
+            )
+
+            if not is_increasing:
+                logger.warning(
+                    f"Log-likelihood decreased at iteration {iteration + 1}!"
+                )
+
+            if is_converged:
+                logger.info(f"Converged after {iteration + 1} iterations.")
+                break
+
+            # M-step
+            self._m_step()
+
+            logger.info(
+                f"Iteration {iteration + 1}/{max_iter}\t"
+                f"Log-Likelihood: {current_log_likelihood:.4f}\t"
+                f"Change: {(current_log_likelihood - previous_log_likelihood):.6f}"
+            )
+            previous_log_likelihood = current_log_likelihood
+
+        if len(log_likelihoods) == max_iter:
+            logger.warning("Reached maximum iterations without converging.")
+
+        return log_likelihoods
+
+    def get_rate_estimate(
+        self,
+        design_matrix: jnp.ndarray,
+        use_smoothed: bool = True,
+    ) -> jnp.ndarray:
+        """Get the estimated firing rate.
+
+        Parameters
+        ----------
+        design_matrix : jnp.ndarray, shape (n_time, n_state_dims) or (n_pos, n_state_dims)
+            Design matrix to evaluate rate at.
+        use_smoothed : bool
+            If True, use smoothed estimates; otherwise use filtered.
+
+        Returns
+        -------
+        rate : jnp.ndarray, shape (n_time,) or (n_time, n_pos)
+            Estimated firing rate in Hz.
+        """
+        if use_smoothed:
+            if self.smoother_mean is None:
+                raise RuntimeError("Model has not been fitted yet.")
+            state_estimate = self.smoother_mean
+        else:
+            if self.filtered_mean is None:
+                raise RuntimeError("Model has not been fitted yet.")
+            state_estimate = self.filtered_mean
+
+        # state_estimate: (n_time, n_state_dims)
+        # design_matrix: (n_time, n_state_dims) or (n_pos, n_state_dims)
+        log_rate = state_estimate @ design_matrix.T
+        rate = jnp.exp(log_rate) / self.dt
+
+        return rate
+
+    def get_confidence_interval(
+        self, alpha: float = 0.05, use_smoothed: bool = True
+    ) -> jnp.ndarray:
+        """Get confidence intervals for the state estimates.
+
+        Parameters
+        ----------
+        alpha : float
+            Significance level (default 0.05 for 95% CI).
+        use_smoothed : bool
+            If True, use smoothed estimates; otherwise use filtered.
+
+        Returns
+        -------
+        ci : jnp.ndarray, shape (n_time, n_state_dims, 2)
+            Lower and upper bounds of the confidence interval.
+        """
+        if use_smoothed:
+            if self.smoother_mean is None or self.smoother_cov is None:
+                raise RuntimeError("Model has not been fitted yet.")
+            mean = self.smoother_mean
+            cov = self.smoother_cov
+        else:
+            if self.filtered_mean is None or self.filtered_cov is None:
+                raise RuntimeError("Model has not been fitted yet.")
+            mean = self.filtered_mean
+            cov = self.filtered_cov
+
+        return get_confidence_interval(mean, cov, alpha=alpha)
