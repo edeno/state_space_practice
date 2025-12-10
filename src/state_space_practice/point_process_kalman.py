@@ -317,7 +317,10 @@ def kalman_maximization_step(
     )
     gamma1 = gamma - jnp.outer(smoother_mean[-1], smoother_mean[-1]) - smoother_cov[-1]
     gamma2 = gamma - jnp.outer(smoother_mean[0], smoother_mean[0]) - smoother_cov[0]
-    beta = smoother_cross_cov.sum(axis=0).T
+    beta = (
+        smoother_cross_cov.sum(axis=0)
+        + sum_of_outer_products(smoother_mean[:-1], smoother_mean[1:])
+    ).T
 
     # Transition matrix
     transition_matrix = psd_solve(gamma1, beta.T).T
