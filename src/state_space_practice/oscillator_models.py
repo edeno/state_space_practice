@@ -225,17 +225,20 @@ class BaseModel(ABC):
         among other states.
         """
         diag = self.discrete_transition_diag
-        transition_matrix = diag * jnp.identity(self.n_discrete_states)
+        transition_matrix = jnp.diag(diag)
 
         if self.n_discrete_states == 1:
-            off_diag = 0.0  # Or 1.0, but 0.0 makes more sense
-        else:
-            off_diag = (1.0 - diag) / (self.n_discrete_states - 1.0)
+            # Single state: transition matrix is just [[1.0]]
+            self.discrete_transition_matrix = jnp.array([[1.0]])
+            return
+
+        # Compute off-diagonal values for each row
+        off_diag = (1.0 - diag) / (self.n_discrete_states - 1.0)
 
         # Add off-diagonal elements, avoiding the diagonal
-        transition_matrix += jnp.ones(
+        transition_matrix = transition_matrix + jnp.ones(
             (self.n_discrete_states, self.n_discrete_states)
-        ) * off_diag[:, None] - off_diag[:, None] * jnp.identity(self.n_discrete_states)
+        ) * off_diag[:, None] - jnp.diag(off_diag)
 
         # Ensure rows sum to 1 (handle potential floating point issues)
         self.discrete_transition_matrix = transition_matrix / jnp.sum(
