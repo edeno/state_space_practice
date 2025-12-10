@@ -36,7 +36,7 @@ dynamic = ["version"]
 "Bug Tracker" = "https://github.com/edeno/state_space_practice/issues"
 
 [project.optional-dependencies]
-test = ["black", "pytest", "pytest-cov"]
+test = ["black", "pytest", "pytest-cov", "hypothesis"]
 gpu = ["jax[cuda]"]
 viz = ["sortingview"]
 

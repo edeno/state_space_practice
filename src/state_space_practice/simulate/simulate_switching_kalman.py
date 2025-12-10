@@ -220,3 +220,177 @@ def simulate_model(T: int = 30000, blnSimS: bool = False):
         x,
         time,
     )
+
+
+def simulate_distinguishable_states(
+    n_time: int = 1000,
+    seed: int = 42,
+) -> dict:
+    """
+    Generate data where discrete states are easy to distinguish.
+
+    Uses very different dynamics between states:
+    - State 0: stable (A=0.5), low noise (Q=0.01)
+    - State 1: near unit root (A=0.99), high noise (Q=1.0)
+    - Long stays in each state (Z diagonal = 0.98)
+    - Low observation noise
+
+    Parameters
+    ----------
+    n_time : int
+        Number of time steps.
+    seed : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    dict
+        Dictionary with:
+        - obs: observations, shape (n_time, n_obs)
+        - true_states: discrete state sequence, shape (n_time,)
+        - true_continuous: continuous state sequence, shape (n_time, n_cont)
+        - params: dict of all model parameters
+    """
+    rng = np.random.default_rng(seed)
+
+    n_cont = 1
+    n_obs = 1
+    n_disc = 2
+
+    # Very different dynamics
+    A = np.array([[[0.5]], [[0.99]]]).T  # stable vs near unit root
+    Q = np.array([[[0.01]], [[1.0]]]).T  # low vs high noise
+    H = np.array([[[1.0]], [[1.0]]]).T
+    R = np.array([[[0.1]], [[0.1]]]).T  # low observation noise
+    Z = np.array([[0.98, 0.02], [0.02, 0.98]])  # long stays
+
+    init_mean = np.zeros((n_cont, n_disc))
+    init_cov = np.eye(n_cont)[..., None] * np.ones((1, 1, n_disc))
+    init_prob = np.array([0.5, 0.5])
+
+    # Simulate discrete states
+    s = np.zeros(n_time, dtype=int)
+    s[0] = rng.choice(n_disc, p=init_prob)
+    for t in range(1, n_time):
+        s[t] = rng.choice(n_disc, p=Z[s[t - 1]])
+
+    # Simulate continuous states
+    x = np.zeros((n_time, n_cont))
+    x[0] = rng.multivariate_normal(init_mean[:, s[0]], init_cov[:, :, s[0]])
+    for t in range(1, n_time):
+        w = rng.multivariate_normal(np.zeros(n_cont), Q[:, :, s[t]])
+        x[t] = A[:, :, s[t]] @ x[t - 1] + w
+
+    # Simulate observations
+    y = np.zeros((n_time, n_obs))
+    for t in range(n_time):
+        v = rng.multivariate_normal(np.zeros(n_obs), R[:, :, s[t]])
+        y[t] = H[:, :, s[t]] @ x[t] + v
+
+    params = {
+        "A": A,
+        "Q": Q,
+        "H": H,
+        "R": R,
+        "Z": Z,
+        "init_mean": init_mean,
+        "init_cov": init_cov,
+        "init_prob": init_prob,
+        "n_cont": n_cont,
+        "n_obs": n_obs,
+        "n_disc": n_disc,
+    }
+
+    return {
+        "obs": y,
+        "true_states": s,
+        "true_continuous": x,
+        "params": params,
+    }
+
+
+def simulate_challenging_states(
+    n_time: int = 1000,
+    seed: int = 42,
+) -> dict:
+    """
+    Generate data where discrete states are harder to distinguish.
+
+    Similar dynamics between states, requiring careful inference:
+    - State 0: A=0.85, Q=0.15
+    - State 1: A=0.90, Q=0.25
+    - Moderate stays (Z diagonal = 0.90)
+    - Higher observation noise
+
+    Parameters
+    ----------
+    n_time : int
+        Number of time steps.
+    seed : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    dict
+        Dictionary with:
+        - obs: observations, shape (n_time, n_obs)
+        - true_states: discrete state sequence, shape (n_time,)
+        - true_continuous: continuous state sequence, shape (n_time, n_cont)
+        - params: dict of all model parameters
+    """
+    rng = np.random.default_rng(seed)
+
+    n_cont = 1
+    n_obs = 1
+    n_disc = 2
+
+    # Similar dynamics (harder to distinguish)
+    A = np.array([[[0.85]], [[0.90]]]).T
+    Q = np.array([[[0.15]], [[0.25]]]).T
+    H = np.array([[[1.0]], [[1.0]]]).T
+    R = np.array([[[0.5]], [[0.5]]]).T  # higher observation noise
+    Z = np.array([[0.90, 0.10], [0.10, 0.90]])  # more frequent switching
+
+    init_mean = np.zeros((n_cont, n_disc))
+    init_cov = np.eye(n_cont)[..., None] * np.ones((1, 1, n_disc))
+    init_prob = np.array([0.5, 0.5])
+
+    # Simulate discrete states
+    s = np.zeros(n_time, dtype=int)
+    s[0] = rng.choice(n_disc, p=init_prob)
+    for t in range(1, n_time):
+        s[t] = rng.choice(n_disc, p=Z[s[t - 1]])
+
+    # Simulate continuous states
+    x = np.zeros((n_time, n_cont))
+    x[0] = rng.multivariate_normal(init_mean[:, s[0]], init_cov[:, :, s[0]])
+    for t in range(1, n_time):
+        w = rng.multivariate_normal(np.zeros(n_cont), Q[:, :, s[t]])
+        x[t] = A[:, :, s[t]] @ x[t - 1] + w
+
+    # Simulate observations
+    y = np.zeros((n_time, n_obs))
+    for t in range(n_time):
+        v = rng.multivariate_normal(np.zeros(n_obs), R[:, :, s[t]])
+        y[t] = H[:, :, s[t]] @ x[t] + v
+
+    params = {
+        "A": A,
+        "Q": Q,
+        "H": H,
+        "R": R,
+        "Z": Z,
+        "init_mean": init_mean,
+        "init_cov": init_cov,
+        "init_prob": init_prob,
+        "n_cont": n_cont,
+        "n_obs": n_obs,
+        "n_disc": n_disc,
+    }
+
+    return {
+        "obs": y,
+        "true_states": s,
+        "true_continuous": x,
+        "params": params,
+    }
