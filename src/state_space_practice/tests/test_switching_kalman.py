@@ -1215,3 +1215,437 @@ def test_m_step_two_state_continuous_transition():
 
     # 6. Assert exact recovery of both transition matrices
     np.testing.assert_allclose(a_est, a_true_stacked, atol=1e-7)
+
+
+def test_em_monotonic_single_state() -> None:
+    """
+    Tests that EM is monotonically increasing for a single discrete state.
+
+    With one discrete state, the switching Kalman filter reduces to the
+    standard Kalman filter, and EM should be exact (no approximation).
+    """
+    n_time = 100
+    n_cont = 1
+    n_obs = 1
+
+    # Single state model
+    init_mean = jnp.array([[0.0]])  # shape (1, 1)
+    init_cov = jnp.array([[[1.0]]])  # shape (1, 1, 1)
+    init_prob = jnp.array([1.0])
+    A = jnp.array([[[0.9]]])  # shape (1, 1, 1)
+    Q = jnp.array([[[0.1]]])
+    H = jnp.array([[[1.0]]])
+    R = jnp.array([[[1.0]]])
+    Z = jnp.array([[1.0]])
+
+    # Generate data
+    key = random.PRNGKey(42)
+    key, subkey = random.split(key)
+    x = jnp.zeros((n_time,))
+    x = x.at[0].set(random.normal(subkey))
+    for t in range(1, n_time):
+        key, subkey = random.split(key)
+        x = x.at[t].set(0.9 * x[t - 1] + jnp.sqrt(0.1) * random.normal(subkey))
+
+    key, subkey = random.split(key)
+    obs = x[:, None] + random.normal(subkey, (n_time, 1))
+
+    # Run EM
+    current_A, current_Q, current_H, current_R = A, Q, H, R
+    current_init_mean, current_init_cov, current_init_prob = init_mean, init_cov, init_prob
+    current_Z = Z
+
+    log_likelihoods = []
+    for _ in range(10):
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, mll) = switching_kalman_filter(
+            current_init_mean,
+            current_init_cov,
+            current_init_prob,
+            obs,
+            current_Z,
+            current_A,
+            current_Q,
+            current_H,
+            current_R,
+        )
+        log_likelihoods.append(float(mll))
+
+        (
+            _,
+            _,
+            smoother_prob,
+            smoother_joint_prob,
+            _,
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+            pair_cond_cross_cov,
+        ) = switching_kalman_smoother(
+            filter_mean=filter_mean,
+            filter_cov=filter_cov,
+            filter_discrete_state_prob=filter_prob,
+            last_filter_conditional_cont_mean=last_pair_mean,
+            process_cov=current_Q,
+            continuous_transition_matrix=current_A,
+            discrete_state_transition_matrix=current_Z,
+        )
+
+        (
+            current_A,
+            current_H,
+            current_Q,
+            current_R,
+            current_init_mean,
+            current_init_cov,
+            current_Z,
+            current_init_prob,
+        ) = switching_kalman_maximization_step(
+            obs=obs,
+            state_cond_smoother_means=state_cond_smoother_means,
+            state_cond_smoother_covs=state_cond_smoother_covs,
+            smoother_discrete_state_prob=smoother_prob,
+            smoother_joint_discrete_state_prob=smoother_joint_prob,
+            pair_cond_smoother_cross_cov=pair_cond_cross_cov,
+        )
+
+    # Verify strict monotonic increase (single state = exact EM)
+    log_likelihoods = np.array(log_likelihoods)
+    differences = np.diff(log_likelihoods)
+    assert np.all(differences >= -1e-10), f"Log-likelihood decreased: {differences}"
+
+
+def test_em_monotonic_two_identical_states() -> None:
+    """
+    Tests EM with two identical discrete states.
+
+    When both states have identical dynamics, the switching doesn't matter
+    and EM should behave like standard Kalman EM (monotonically increasing).
+    """
+    n_time = 100
+
+    # Two identical dynamics
+    A = jnp.array([[[0.9]], [[0.9]]]).T  # shape (1, 1, 2)
+    Q = jnp.array([[[0.1]], [[0.1]]]).T
+    H = jnp.array([[[1.0]], [[1.0]]]).T
+    R = jnp.array([[[1.0]], [[1.0]]]).T
+
+    # Equal probability of switching
+    Z = jnp.array([[0.5, 0.5], [0.5, 0.5]])
+
+    init_prob = jnp.array([0.5, 0.5])
+    init_mean = jnp.array([[0.0], [0.0]]).T
+    init_cov = jnp.array([[[1.0]], [[1.0]]]).T
+
+    # Generate data
+    key = random.PRNGKey(123)
+    key, subkey = random.split(key)
+    x = jnp.zeros((n_time,))
+    x = x.at[0].set(random.normal(subkey))
+    for t in range(1, n_time):
+        key, subkey = random.split(key)
+        x = x.at[t].set(0.9 * x[t - 1] + jnp.sqrt(0.1) * random.normal(subkey))
+
+    key, subkey = random.split(key)
+    obs = x[:, None] + random.normal(subkey, (n_time, 1))
+
+    # Run EM
+    current_A, current_Q, current_H, current_R = A, Q, H, R
+    current_init_mean, current_init_cov, current_init_prob = init_mean, init_cov, init_prob
+    current_Z = Z
+
+    log_likelihoods = []
+    for _ in range(10):
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, mll) = switching_kalman_filter(
+            current_init_mean,
+            current_init_cov,
+            current_init_prob,
+            obs,
+            current_Z,
+            current_A,
+            current_Q,
+            current_H,
+            current_R,
+        )
+        log_likelihoods.append(float(mll))
+
+        (
+            _,
+            _,
+            smoother_prob,
+            smoother_joint_prob,
+            _,
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+            pair_cond_cross_cov,
+        ) = switching_kalman_smoother(
+            filter_mean=filter_mean,
+            filter_cov=filter_cov,
+            filter_discrete_state_prob=filter_prob,
+            last_filter_conditional_cont_mean=last_pair_mean,
+            process_cov=current_Q,
+            continuous_transition_matrix=current_A,
+            discrete_state_transition_matrix=current_Z,
+        )
+
+        (
+            current_A,
+            current_H,
+            current_Q,
+            current_R,
+            current_init_mean,
+            current_init_cov,
+            current_Z,
+            current_init_prob,
+        ) = switching_kalman_maximization_step(
+            obs=obs,
+            state_cond_smoother_means=state_cond_smoother_means,
+            state_cond_smoother_covs=state_cond_smoother_covs,
+            smoother_discrete_state_prob=smoother_prob,
+            smoother_joint_discrete_state_prob=smoother_joint_prob,
+            pair_cond_smoother_cross_cov=pair_cond_cross_cov,
+        )
+
+    # With identical states, EM should be monotonically increasing
+    log_likelihoods = np.array(log_likelihoods)
+    differences = np.diff(log_likelihoods)
+    assert np.all(
+        differences >= -1e-8
+    ), f"Log-likelihood decreased with identical states: {differences[differences < -1e-8]}"
+
+    # Verify overall improvement
+    assert log_likelihoods[-1] > log_likelihoods[0], "EM should improve log-likelihood"
+
+
+def test_em_monotonic_distinguishable_states() -> None:
+    """
+    Tests EM with two VERY different discrete states.
+
+    When states have very different dynamics (e.g., 100x difference in process
+    noise), they are easy to distinguish and EM should be monotonically
+    increasing because the mixture collapse approximation has minimal effect.
+    """
+    n_time = 500
+
+    # VERY different dynamics - easy to distinguish
+    # State 0: stable (A=0.5), low noise (Q=0.01)
+    # State 1: near unit root (A=0.99), high noise (Q=1.0)
+    A_true = jnp.array([[[0.5]], [[0.99]]]).T
+    Q_true = jnp.array([[[0.01]], [[1.0]]]).T  # 100x difference!
+    H_true = jnp.array([[[1.0]], [[1.0]]]).T
+    R_true = jnp.array([[[0.1]], [[0.1]]]).T
+    Z_true = jnp.array([[0.98, 0.02], [0.02, 0.98]])  # Long stays
+
+    # Generate state sequence
+    key = random.PRNGKey(42)
+    key, s_key = random.split(key)
+
+    true_states = [0]
+    for t in range(1, n_time):
+        s_key, subkey = random.split(s_key)
+        true_states.append(
+            int(random.choice(subkey, jnp.arange(2), p=Z_true[true_states[-1]]))
+        )
+    true_states = jnp.array(true_states)
+
+    # Generate continuous states and observations
+    key, x_key, y_key = random.split(key, 3)
+    x = jnp.zeros((n_time, 1))
+    x_key, subkey = random.split(x_key)
+    x = x.at[0].set(random.normal(subkey, (1,)))
+
+    for t in range(1, n_time):
+        x_key, subkey = random.split(x_key)
+        s = true_states[t]
+        x = x.at[t].set(
+            A_true[:, :, s] @ x[t - 1]
+            + jnp.sqrt(Q_true[0, 0, s]) * random.normal(subkey, (1,))
+        )
+
+    obs = jnp.zeros((n_time, 1))
+    for t in range(n_time):
+        y_key, subkey = random.split(y_key)
+        s = true_states[t]
+        obs = obs.at[t].set(
+            H_true[:, :, s] @ x[t] + jnp.sqrt(R_true[0, 0, s]) * random.normal(subkey, (1,))
+        )
+
+    # Initialize with neutral parameters
+    init_mean = jnp.zeros((1, 2))
+    init_cov = jnp.ones((1, 1, 2))
+    init_prob = jnp.array([0.5, 0.5])
+
+    current_A = jnp.array([[[0.7]], [[0.7]]]).T
+    current_Q = jnp.array([[[0.5]], [[0.5]]]).T
+    current_H = H_true.copy()
+    current_R = R_true.copy()
+    current_Z = jnp.array([[0.9, 0.1], [0.1, 0.9]])
+
+    # Run EM
+    log_likelihoods = []
+    for _ in range(20):
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, mll) = switching_kalman_filter(
+            init_mean,
+            init_cov,
+            init_prob,
+            obs,
+            current_Z,
+            current_A,
+            current_Q,
+            current_H,
+            current_R,
+        )
+        log_likelihoods.append(float(mll))
+
+        (
+            _,
+            _,
+            smoother_prob,
+            smoother_joint_prob,
+            _,
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+            pair_cond_cross_cov,
+        ) = switching_kalman_smoother(
+            filter_mean=filter_mean,
+            filter_cov=filter_cov,
+            filter_discrete_state_prob=filter_prob,
+            last_filter_conditional_cont_mean=last_pair_mean,
+            process_cov=current_Q,
+            continuous_transition_matrix=current_A,
+            discrete_state_transition_matrix=current_Z,
+        )
+
+        (
+            current_A,
+            current_H,
+            current_Q,
+            current_R,
+            _,
+            _,
+            current_Z,
+            _,
+        ) = switching_kalman_maximization_step(
+            obs=obs,
+            state_cond_smoother_means=state_cond_smoother_means,
+            state_cond_smoother_covs=state_cond_smoother_covs,
+            smoother_discrete_state_prob=smoother_prob,
+            smoother_joint_discrete_state_prob=smoother_joint_prob,
+            pair_cond_smoother_cross_cov=pair_cond_cross_cov,
+        )
+
+    # With distinguishable states, EM should be monotonically increasing
+    log_likelihoods = np.array(log_likelihoods)
+    differences = np.diff(log_likelihoods)
+    assert np.all(
+        differences >= -1e-6
+    ), f"Log-likelihood decreased with distinguishable states: {differences[differences < -1e-6]}"
+
+    # Verify significant improvement
+    assert (
+        log_likelihoods[-1] - log_likelihoods[0] > 50
+    ), "EM should significantly improve log-likelihood"
+
+
+def test_em_increases_log_likelihood(simple_skf_model: tuple) -> None:
+    """
+    Tests that the EM algorithm improves log-likelihood overall.
+
+    Note: With similar discrete states, the mixture collapse approximation
+    can cause small oscillations. We test for overall improvement.
+    """
+    (
+        init_mean,
+        init_cov,
+        init_prob,
+        obs,
+        Z,
+        A,
+        Q,
+        H,
+        R,
+    ) = simple_skf_model
+
+    n_iterations = 10
+    log_likelihoods = []
+
+    # Current parameters (start with fixture values)
+    current_init_mean = init_mean
+    current_init_cov = init_cov
+    current_init_prob = init_prob
+    current_A = A
+    current_Q = Q
+    current_H = H
+    current_R = R
+    current_Z = Z
+
+    for iteration in range(n_iterations):
+        # E-step: Run filter and smoother
+        (
+            filter_mean,
+            filter_cov,
+            filter_prob,
+            last_pair_mean,
+            marginal_log_likelihood,
+        ) = switching_kalman_filter(
+            current_init_mean,
+            current_init_cov,
+            current_init_prob,
+            obs,
+            current_Z,
+            current_A,
+            current_Q,
+            current_H,
+            current_R,
+        )
+
+        log_likelihoods.append(float(marginal_log_likelihood))
+
+        (
+            _,
+            _,
+            smoother_prob,
+            smoother_joint_prob,
+            _,
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+            pair_cond_cross_cov,
+        ) = switching_kalman_smoother(
+            filter_mean=filter_mean,
+            filter_cov=filter_cov,
+            filter_discrete_state_prob=filter_prob,
+            last_filter_conditional_cont_mean=last_pair_mean,
+            process_cov=current_Q,
+            continuous_transition_matrix=current_A,
+            discrete_state_transition_matrix=current_Z,
+        )
+
+        # M-step: Update parameters
+        (
+            current_A,
+            current_H,
+            current_Q,
+            current_R,
+            current_init_mean,
+            current_init_cov,
+            current_Z,
+            current_init_prob,
+        ) = switching_kalman_maximization_step(
+            obs=obs,
+            state_cond_smoother_means=state_cond_smoother_means,
+            state_cond_smoother_covs=state_cond_smoother_covs,
+            smoother_discrete_state_prob=smoother_prob,
+            smoother_joint_discrete_state_prob=smoother_joint_prob,
+            pair_cond_smoother_cross_cov=pair_cond_cross_cov,
+        )
+
+    # With approximate EM (mixture collapse), we only guarantee overall improvement
+    log_likelihoods = np.array(log_likelihoods)
+
+    # Verify overall improvement
+    assert (
+        log_likelihoods[-1] >= log_likelihoods[0]
+    ), "EM should improve log-likelihood from initial parameters"
+
+    # Verify no catastrophic divergence (no huge decreases)
+    differences = np.diff(log_likelihoods)
+    max_decrease = differences.min()
+    assert max_decrease > -1.0, f"EM had catastrophic decrease: {max_decrease}"
