@@ -283,7 +283,7 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
   - Fit model on simulated data
   - Assert log-likelihood[t+1] >= log-likelihood[t] - epsilon
 
-- [ ] **8.2** `test_switching_spike_oscillator_recovers_parameters`
+- [x] **8.2** `test_switching_spike_oscillator_recovers_parameters`
   - Simulate with known parameters
   - Fit model
   - Assert recovered params close to true params (within tolerance)
