@@ -3,7 +3,7 @@
 ## Current Status
 
 - **Date**: 2025-12-11
-- **Working on**: Milestone 3 COMPLETE - Ready for Milestone 4 (Simulation Utilities)
+- **Working on**: Milestone 4 COMPLETE - Ready for Milestone 5 (Spike GLM M-Step)
 - **Current Task**: None - waiting for next task
 
 ## Milestone 1 Summary (COMPLETE)
@@ -103,8 +103,39 @@ All 2 tasks completed:
 
 The theoretical property that smoothed variance ≤ filtered variance holds exactly only for marginal distributions in standard Kalman filters. In switching models with mixture collapse approximations, this property may not hold exactly for state-conditional quantities.
 
+## Milestone 4 Summary (COMPLETE)
+
+All 4 tasks completed:
+
+- 4.1 Directory `simulate/` already existed
+- 4.2 Implemented `simulate_switching_spike_oscillator()` function
+- 4.3 Returns ground truth tuple: (spikes, true_states, true_discrete_states)
+- 4.4 Wrote 10 simulation tests (all passing)
+
+### Key Implementation Details (Milestone 4)
+
+#### simulate_switching_spike_oscillator
+
+- Uses `jax.lax.scan` for efficient simulation
+- Simulates discrete states via `jax.random.categorical`
+- Simulates continuous states via `jax.random.multivariate_normal` conditioned on discrete state
+- Simulates spikes via `jax.random.poisson` with rate = exp(baseline + weights @ state) * dt
+- Optional initial conditions with sensible defaults
+
+#### Tests Added
+
+- Output shape verification
+- Spike counts non-negative and integer
+- Discrete states in valid range
+- Single discrete state edge case
+- Reproducibility with same key
+- Different keys produce different results
+- No NaN values
+- Higher baseline produces more spikes
+- State-conditioned dynamics verification
+- Minimal parameters convenience test
+
 ## Next Steps
 
-- Milestone 4: Simulation utilities for synthetic data generation
 - Milestone 5: Spike GLM M-step for observation parameter updates
 - Milestone 6: Dynamics M-step verification

@@ -126,22 +126,24 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
 
 ### Tasks
 
-- [ ] **4.1** Create `src/state_space_practice/simulate/` directory if needed
+- [x] **4.1** Create `src/state_space_practice/simulate/` directory if needed
+  - Directory already exists with `simulate_switching_kalman.py`
 
-- [ ] **4.2** Implement `simulate_switching_spike_oscillator()` function
+- [x] **4.2** Implement `simulate_switching_spike_oscillator()` function
   - Inputs: n_time, transition_matrices, process_covs, discrete_transition_matrix, spike_weights, spike_baseline, dt, key
   - Simulate discrete state sequence via categorical sampling
   - Simulate continuous state via Gaussian dynamics conditioned on discrete state
   - Simulate spikes via Poisson with rate = exp(baseline + weights @ state) * dt
 
-- [ ] **4.3** Return ground truth for validation
+- [x] **4.3** Return ground truth for validation
   - Return tuple: (spikes, true_states, true_discrete_states)
   - All as JAX arrays with documented shapes
 
-- [ ] **4.4** Write simulation tests
+- [x] **4.4** Write simulation tests
   - `test_simulate_output_shapes`: Verify shapes
   - `test_simulate_spike_rates_positive`: Rates are positive
   - `test_simulate_discrete_states_valid`: States in valid range
+  - Plus 7 additional tests for reproducibility, edge cases, dynamics verification
 
 ---
 
