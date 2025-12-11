@@ -3,8 +3,8 @@
 ## Current Status
 
 - **Date**: 2025-12-11
-- **Working on**: Milestone 6 COMPLETE - Ready for Milestone 7 (Model Class)
-- **Current Task**: None - waiting for next task
+- **Working on**: Milestone 7 - Task 7.1 COMPLETE
+- **Current Task**: Task 7.2 - Implement `_initialize_parameters()` method
 
 ## Milestone 1 Summary (COMPLETE)
 
@@ -217,6 +217,26 @@ All 2 tasks completed:
 - When a discrete state has low probability or insufficient data, process covariance can have negative eigenvalues
 - PSD enforcement (e.g., `Q = Q + eps*I`) should be handled at the model class level
 
-## Next Steps
+## Milestone 7 Progress
 
-- Milestone 7: Model class implementation
+### Task 7.1 (COMPLETE)
+
+Implemented `SwitchingSpikeOscillatorModel.__init__()` with:
+
+- Required parameters: n_oscillators, n_neurons, n_discrete_states, sampling_freq, dt
+- Optional: discrete_transition_diag, update flags for M-step
+- Input validation for all positive parameters and array shapes
+- Comprehensive docstrings with parameter descriptions, units, and examples
+- 15 unit tests covering normal cases and error conditions
+
+#### Key Design Decisions
+
+1. **Follows BaseModel pattern** from `oscillator_models.py` for consistency
+2. **Uses `n_neurons` instead of `n_sources`** (point-process terminology)
+3. **Stores `spike_params` instead of measurement_matrix/cov** (different observation model)
+4. **Removed marginal smoother placeholders** (`smoother_mean`, `smoother_cov`) - only conditional statistics needed for M-step
+5. **Added input validation** with clear error messages (fail-fast pattern)
+
+### Next: Task 7.2
+
+Implement `_initialize_parameters()` method

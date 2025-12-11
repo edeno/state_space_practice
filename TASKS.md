@@ -220,7 +220,7 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
 
 ### Tasks
 
-- [ ] **7.1** Implement `SwitchingSpikeOscillatorModel.__init__()`
+- [x] **7.1** Implement `SwitchingSpikeOscillatorModel.__init__()`
   - Parameters: n_oscillators, n_neurons, n_discrete_states, sampling_freq, dt
   - Optional: initial freqs, damping, coupling strengths, phase differences
   - Store update flags (update_A, update_Q, update_B, update_spike_params, etc.)

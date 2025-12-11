@@ -2920,3 +2920,285 @@ class TestDynamicsMStepReuse:
         for s in range(n_discrete_states):
             P0_s = new_init_cov[:, :, s]
             np.testing.assert_allclose(P0_s, P0_s.T, rtol=1e-5)
+
+
+class TestSwitchingSpikeOscillatorModelInit:
+    """Tests for SwitchingSpikeOscillatorModel.__init__() method."""
+
+    def test_init_stores_required_parameters(self) -> None:
+        """Model should store all required parameters."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_oscillators = 2
+        n_neurons = 5
+        n_discrete_states = 3
+        sampling_freq = 100.0
+        dt = 0.01
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=sampling_freq,
+            dt=dt,
+        )
+
+        assert model.n_oscillators == n_oscillators
+        assert model.n_neurons == n_neurons
+        assert model.n_discrete_states == n_discrete_states
+        assert model.sampling_freq == sampling_freq
+        assert model.dt == dt
+        # n_latent should be 2 * n_oscillators (amplitude + phase)
+        assert model.n_latent == 2 * n_oscillators
+
+    def test_init_with_default_update_flags(self) -> None:
+        """Model should have default update flags set to True."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        # Default update flags should be True
+        assert model.update_continuous_transition_matrix is True
+        assert model.update_process_cov is True
+        assert model.update_discrete_transition_matrix is True
+        assert model.update_spike_params is True
+        assert model.update_init_mean is True
+        assert model.update_init_cov is True
+
+    def test_init_with_custom_update_flags(self) -> None:
+        """Model should accept custom update flags."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_continuous_transition_matrix=False,
+            update_process_cov=False,
+            update_spike_params=False,
+        )
+
+        assert model.update_continuous_transition_matrix is False
+        assert model.update_process_cov is False
+        assert model.update_spike_params is False
+        # Others should still be True (default)
+        assert model.update_discrete_transition_matrix is True
+        assert model.update_init_mean is True
+        assert model.update_init_cov is True
+
+    def test_init_with_discrete_transition_diag(self) -> None:
+        """Model should accept custom discrete transition diagonal."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_discrete_states = 3
+        custom_diag = jnp.array([0.9, 0.85, 0.95])
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+            discrete_transition_diag=custom_diag,
+        )
+
+        np.testing.assert_allclose(model.discrete_transition_diag, custom_diag)
+
+    def test_init_with_default_discrete_transition_diag(self) -> None:
+        """Model should create default discrete transition diagonal if not provided."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_discrete_states = 3
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        # Default should be 0.95 for all states
+        expected_diag = jnp.full(n_discrete_states, 0.95)
+        np.testing.assert_allclose(model.discrete_transition_diag, expected_diag)
+
+    def test_init_single_discrete_state(self) -> None:
+        """Model should handle single discrete state case."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=1,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        assert model.n_discrete_states == 1
+        assert model.discrete_transition_diag.shape == (1,)
+
+    def test_init_single_oscillator(self) -> None:
+        """Model should handle single oscillator case."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=1,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        assert model.n_oscillators == 1
+        assert model.n_latent == 2  # 2 * 1
+
+    def test_init_many_neurons(self) -> None:
+        """Model should handle many neurons."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_neurons = 100
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=4,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        assert model.n_neurons == n_neurons
+
+    def test_init_repr_contains_class_name(self) -> None:
+        """Model repr should contain class name."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        repr_str = repr(model)
+        assert "SwitchingSpikeOscillatorModel" in repr_str
+
+    def test_init_repr_contains_key_parameters(self) -> None:
+        """Model repr should contain key parameters."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=3,
+            n_neurons=7,
+            n_discrete_states=4,
+            sampling_freq=50.0,
+            dt=0.02,
+        )
+
+        repr_str = repr(model)
+        assert "n_oscillators=3" in repr_str
+        assert "n_neurons=7" in repr_str
+        assert "n_discrete_states=4" in repr_str
+
+    def test_init_negative_oscillators_raises_error(self) -> None:
+        """Model should raise ValueError for negative n_oscillators."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        with pytest.raises(ValueError, match="n_oscillators must be positive"):
+            SwitchingSpikeOscillatorModel(
+                n_oscillators=-1,
+                n_neurons=5,
+                n_discrete_states=2,
+                sampling_freq=100.0,
+                dt=0.01,
+            )
+
+    def test_init_zero_neurons_raises_error(self) -> None:
+        """Model should raise ValueError for zero n_neurons."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        with pytest.raises(ValueError, match="n_neurons must be positive"):
+            SwitchingSpikeOscillatorModel(
+                n_oscillators=2,
+                n_neurons=0,
+                n_discrete_states=2,
+                sampling_freq=100.0,
+                dt=0.01,
+            )
+
+    def test_init_negative_sampling_freq_raises_error(self) -> None:
+        """Model should raise ValueError for negative sampling_freq."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        with pytest.raises(ValueError, match="sampling_freq must be positive"):
+            SwitchingSpikeOscillatorModel(
+                n_oscillators=2,
+                n_neurons=5,
+                n_discrete_states=2,
+                sampling_freq=-100.0,
+                dt=0.01,
+            )
+
+    def test_init_zero_dt_raises_error(self) -> None:
+        """Model should raise ValueError for zero dt."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        with pytest.raises(ValueError, match="dt must be positive"):
+            SwitchingSpikeOscillatorModel(
+                n_oscillators=2,
+                n_neurons=5,
+                n_discrete_states=2,
+                sampling_freq=100.0,
+                dt=0.0,
+            )
+
+    def test_init_invalid_discrete_transition_diag_shape_raises_error(self) -> None:
+        """Model should raise ValueError for wrong discrete_transition_diag shape."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        with pytest.raises(ValueError, match="discrete_transition_diag shape mismatch"):
+            SwitchingSpikeOscillatorModel(
+                n_oscillators=2,
+                n_neurons=5,
+                n_discrete_states=3,
+                sampling_freq=100.0,
+                dt=0.01,
+                discrete_transition_diag=jnp.array([0.9, 0.95]),  # Wrong shape
+            )

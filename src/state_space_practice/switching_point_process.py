@@ -86,7 +86,10 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
-from state_space_practice.kalman import psd_solve, symmetrize
+from state_space_practice.kalman import symmetrize
+from state_space_practice.point_process_kalman import (
+    _point_process_laplace_update,
+)
 from state_space_practice.switching_kalman import (
     _scale_likelihood,
     _update_discrete_state_probabilities,
@@ -190,79 +193,17 @@ def point_process_kalman_update(
         Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
         Neural Computation 16, 971-998.
     """
-    # Compute gradients and Hessians of log-intensity function
-    # grad: d(log_lambda)/d(state) -> (n_neurons, n_latent) Jacobian
-    # hess: d^2(log_lambda)/d(state)^2 -> (n_neurons, n_latent, n_latent) Hessian
-    if grad_log_intensity_func is None:
-        grad_log_intensity_func = jax.jacfwd(log_intensity_func)
-    if hess_log_intensity_func is None:
-        hess_log_intensity_func = jax.jacfwd(grad_log_intensity_func)
-
-    # Evaluate at the one-step predicted mean
-    log_lambda = log_intensity_func(one_step_mean)  # (n_neurons,)
-    conditional_intensity = jnp.exp(log_lambda) * dt  # Expected spike count
-
-    # Innovation: observed - expected
-    innovation = y_t - conditional_intensity  # (n_neurons,)
-
-    # Jacobian: (n_neurons, n_latent)
-    jacobian = grad_log_intensity_func(one_step_mean)  # (n_neurons, n_latent)
-
-    # Hessian: (n_neurons, n_latent, n_latent)
-    hessian = hess_log_intensity_func(one_step_mean)  # (n_neurons, n_latent, n_latent)
-
-    # For Poisson likelihood with log-link:
-    # log p(y | x) = sum_n [y_n * log(lambda_n * dt) - lambda_n * dt - log(y_n!)]
-    # d/dx log p = sum_n [(y_n - lambda_n * dt) * d(log_lambda_n)/dx]
-    # d^2/dx^2 log p = sum_n [(y_n - lambda_n * dt) * d^2(log_lambda_n)/dx^2
-    #                         - lambda_n * dt * (d(log_lambda_n)/dx)^T @ (d(log_lambda_n)/dx)]
-
-    # Information matrix contribution from each neuron:
-    # Fisher information: lambda_n * dt * grad^T @ grad
-    # (using expected Fisher information, not observed)
-    # Sum over neurons: sum_n lambda_n * dt * jacobian[n]^T @ jacobian[n]
-
-    # Weighted gradient for mean update
-    # sum_n innovation_n * jacobian[n] = jacobian.T @ innovation
-    gradient = jacobian.T @ innovation  # (n_latent,)
-
-    # Information from likelihood (Fisher information approximation)
-    # For each neuron: lambda_n * dt * outer(grad_n, grad_n)
-    # Sum: jacobian.T @ diag(conditional_intensity) @ jacobian
-    fisher_info = jacobian.T @ (
-        conditional_intensity[:, None] * jacobian
-    )  # (n_latent, n_latent)
-
-    # Hessian correction from innovation (second-order term)
-    # sum_n innovation_n * hessian[n]
-    hessian_correction = jnp.einsum(
-        "n,nij->ij", innovation, hessian
-    )  # (n_latent, n_latent)
-
-    # Compute prior precision by solving P_prior @ P_prior^{-1} = I
-    # Using psd_solve for numerical stability instead of explicit inversion
-    n_latent = one_step_mean.shape[0]
-    identity = jnp.eye(n_latent)
-    prior_precision = psd_solve(one_step_cov, identity, diagonal_boost=diagonal_boost)
-
-    # Posterior precision: P^{-1} = P_prior^{-1} + Fisher - innovation * Hessian
-    posterior_precision = prior_precision + fisher_info - hessian_correction
-
-    # Posterior covariance: solve P_post^{-1} @ P_post = I
-    # Using psd_solve for numerical stability
-    posterior_cov = psd_solve(posterior_precision, identity, diagonal_boost=diagonal_boost)
-    posterior_cov = symmetrize(posterior_cov)
-
-    # Posterior mean: Newton step from prior
-    # Solve posterior_precision @ delta = gradient, then mean = one_step_mean + delta
-    posterior_mean = one_step_mean + psd_solve(
-        posterior_precision, gradient, diagonal_boost=diagonal_boost
+    # Delegate to the shared helper in point_process_kalman.py
+    return _point_process_laplace_update(
+        one_step_mean=one_step_mean,
+        one_step_cov=one_step_cov,
+        spike_indicator_t=y_t,
+        dt=dt,
+        log_intensity_func=log_intensity_func,
+        diagonal_boost=diagonal_boost,
+        grad_log_intensity_func=grad_log_intensity_func,
+        hess_log_intensity_func=hess_log_intensity_func,
     )
-
-    # Log-likelihood: sum of Poisson log-pmfs at predicted intensity
-    log_likelihood = jnp.sum(jax.scipy.stats.poisson.logpmf(y_t, conditional_intensity))
-
-    return posterior_mean, posterior_cov, log_likelihood
 
 
 def _point_process_predict_and_update(
@@ -1094,3 +1035,220 @@ def switching_point_process_filter(
         pair_cond_filter_mean[-1],  # Last timestep pair-conditional for smoother
         marginal_log_likelihood,
     )
+
+
+class SwitchingSpikeOscillatorModel:
+    """Switching oscillator network with spike-based observations.
+
+    This model combines:
+    - Oscillator network dynamics (DIM/CNM style transition matrices)
+    - Switching discrete states for different coupling patterns
+    - Point-process (spike) observations via Laplace-EKF
+
+    The latent state x_t has dimension 2 * n_oscillators (amplitude and phase
+    for each oscillator). The dynamics switch between n_discrete_states
+    different configurations, each with potentially different coupling patterns.
+
+    The observation model is a Poisson point-process with log-linear intensity:
+        log(lambda_n(t)) = baseline_n + weights_n @ x_t
+
+    Parameters
+    ----------
+    n_oscillators : int
+        Number of latent oscillators. Must be positive. State dimension will
+        be 2 * n_oscillators (amplitude and phase for each).
+    n_neurons : int
+        Number of observed neurons (spike trains). Must be positive.
+    n_discrete_states : int
+        Number of discrete network states (coupling configurations). Must be
+        positive.
+    sampling_freq : float
+        Sampling frequency in Hz. Must be positive.
+    dt : float
+        Time bin width in seconds. Must be positive. Typically dt <= 1/sampling_freq
+        for numerical stability.
+    discrete_transition_diag : Array | None, optional
+        Diagonal elements of the discrete transition matrix (self-transition
+        probabilities). Values should be in [0, 1]. Shape must be (n_discrete_states,)
+        if provided. If None, defaults to 0.95 for all states.
+    update_continuous_transition_matrix : bool, default=True
+        Whether to update A (dynamics) during M-step.
+    update_process_cov : bool, default=True
+        Whether to update Q (process noise) during M-step.
+    update_discrete_transition_matrix : bool, default=True
+        Whether to update Z (discrete transitions) during M-step.
+    update_spike_params : bool, default=True
+        Whether to update spike GLM parameters (baseline, weights) during M-step.
+    update_init_mean : bool, default=True
+        Whether to update initial mean during M-step.
+    update_init_cov : bool, default=True
+        Whether to update initial covariance during M-step.
+
+    Attributes
+    ----------
+    n_latent : int
+        Dimension of the continuous latent state (2 * n_oscillators).
+    discrete_transition_diag : Array
+        Diagonal of discrete transition matrix.
+
+    Notes
+    -----
+    This model uses the exact per-state-pair structure for the switching filter,
+    which maintains EM monotonicity (up to the Laplace approximation).
+
+    The smoother is observation-model agnostic and reuses
+    ``switching_kalman_smoother`` from the switching_kalman module.
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> model = SwitchingSpikeOscillatorModel(
+    ...     n_oscillators=2,
+    ...     n_neurons=10,
+    ...     n_discrete_states=3,
+    ...     sampling_freq=100.0,
+    ...     dt=0.01,
+    ... )
+    >>> model.n_latent
+    4
+    >>> model.n_discrete_states
+    3
+    """
+
+    def __init__(
+        self,
+        n_oscillators: int,
+        n_neurons: int,
+        n_discrete_states: int,
+        sampling_freq: float,
+        dt: float,
+        discrete_transition_diag: Array | None = None,
+        update_continuous_transition_matrix: bool = True,
+        update_process_cov: bool = True,
+        update_discrete_transition_matrix: bool = True,
+        update_spike_params: bool = True,
+        update_init_mean: bool = True,
+        update_init_cov: bool = True,
+    ) -> None:
+        """Initialize the switching spike oscillator model.
+
+        Parameters
+        ----------
+        n_oscillators : int
+            Number of latent oscillators.
+        n_neurons : int
+            Number of observed neurons.
+        n_discrete_states : int
+            Number of discrete network states.
+        sampling_freq : float
+            Sampling frequency in Hz.
+        dt : float
+            Time bin width in seconds.
+        discrete_transition_diag : Array | None, optional
+            Diagonal of discrete transition matrix. Defaults to 0.95.
+        update_continuous_transition_matrix : bool, default=True
+            Update A during M-step.
+        update_process_cov : bool, default=True
+            Update Q during M-step.
+        update_discrete_transition_matrix : bool, default=True
+            Update Z during M-step.
+        update_spike_params : bool, default=True
+            Update spike GLM params during M-step.
+        update_init_mean : bool, default=True
+            Update initial mean during M-step.
+        update_init_cov : bool, default=True
+            Update initial covariance during M-step.
+
+        Raises
+        ------
+        ValueError
+            If any of n_oscillators, n_neurons, n_discrete_states, sampling_freq,
+            or dt is not positive. Also if discrete_transition_diag has wrong shape.
+        """
+        # Validate input parameters
+        if n_oscillators <= 0:
+            raise ValueError(
+                f"n_oscillators must be positive. Got {n_oscillators}."
+            )
+        if n_neurons <= 0:
+            raise ValueError(f"n_neurons must be positive. Got {n_neurons}.")
+        if n_discrete_states <= 0:
+            raise ValueError(
+                f"n_discrete_states must be positive. Got {n_discrete_states}."
+            )
+        if sampling_freq <= 0:
+            raise ValueError(
+                f"sampling_freq must be positive. Got {sampling_freq}."
+            )
+        if dt <= 0:
+            raise ValueError(f"dt must be positive. Got {dt}.")
+        if discrete_transition_diag is not None:
+            if discrete_transition_diag.shape != (n_discrete_states,):
+                raise ValueError(
+                    f"discrete_transition_diag shape mismatch: expected "
+                    f"({n_discrete_states},), got {discrete_transition_diag.shape}."
+                )
+
+        self.n_oscillators = n_oscillators
+        self.n_neurons = n_neurons
+        self.n_discrete_states = n_discrete_states
+        self.sampling_freq = sampling_freq
+        self.dt = dt
+        self.n_latent = 2 * n_oscillators
+
+        # Set default discrete transition diagonal if not provided
+        if discrete_transition_diag is None:
+            self.discrete_transition_diag = jnp.full(
+                (n_discrete_states,), 0.95, dtype=jnp.float32
+            )
+        else:
+            self.discrete_transition_diag = discrete_transition_diag
+
+        # Store update flags for M-step
+        self.update_continuous_transition_matrix = update_continuous_transition_matrix
+        self.update_process_cov = update_process_cov
+        self.update_discrete_transition_matrix = update_discrete_transition_matrix
+        self.update_spike_params = update_spike_params
+        self.update_init_mean = update_init_mean
+        self.update_init_cov = update_init_cov
+
+        # Placeholders for model parameters (initialized by _initialize_parameters)
+        self.init_mean: Array
+        self.init_cov: Array
+        self.init_discrete_state_prob: Array
+        self.discrete_transition_matrix: Array
+        self.continuous_transition_matrix: Array
+        self.process_cov: Array
+        self.spike_params: SpikeObsParams
+
+        # Placeholders for smoother results (computed in E-step)
+        # Only state-conditional statistics are stored (needed for M-step)
+        self.smoother_state_cond_mean: Array
+        self.smoother_state_cond_cov: Array
+        self.smoother_discrete_state_prob: Array
+        self.smoother_joint_discrete_state_prob: Array
+        self.smoother_pair_cond_cross_cov: Array
+        self.smoother_pair_cond_means: Array
+
+    def __repr__(self) -> str:
+        """Return string representation of the model."""
+        params = [
+            f"n_oscillators={self.n_oscillators}",
+            f"n_neurons={self.n_neurons}",
+            f"n_discrete_states={self.n_discrete_states}",
+            f"sampling_freq={self.sampling_freq}",
+            f"dt={self.dt}",
+        ]
+
+        update_flags = {
+            "A": self.update_continuous_transition_matrix,
+            "Q": self.update_process_cov,
+            "Z": self.update_discrete_transition_matrix,
+            "spike": self.update_spike_params,
+            "m0": self.update_init_mean,
+            "P0": self.update_init_cov,
+        }
+
+        flags_str = ", ".join(f"Update({k})={v}" for k, v in update_flags.items())
+
+        return f"<{self.__class__.__name__}: {', '.join(params)}, [{flags_str}]>"

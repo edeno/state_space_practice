@@ -961,3 +961,360 @@ class TestKalmanMaximizationStepMStepRegression:
         assert not jnp.allclose(A_increasing, A_constant, atol=0.01), (
             "A should depend on state trajectory (outer products of means)"
         )
+
+
+# --- Multi-Neuron Tests ---
+
+
+@pytest.fixture(scope="module")
+def multi_neuron_test_data():
+    """Provides test data for multi-neuron point process tests."""
+    n_time = 100
+    n_params = 3
+    n_neurons = 5
+    dt = 0.02
+
+    key = jax.random.PRNGKey(42)
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+
+    # Initial parameters
+    init_mean = jnp.zeros(n_params)
+    init_cov = jnp.eye(n_params) * 1.0
+
+    # State transition (near identity)
+    transition_matrix = jnp.eye(n_params) * 0.99
+
+    # Process covariance
+    process_cov = jnp.eye(n_params) * 0.01
+
+    # Design matrix for multi-neuron case: (n_time, n_neurons, n_params)
+    # Each neuron has different weights
+    design_matrix = jax.random.normal(k1, (n_time, n_neurons, n_params)) * 0.5
+
+    # True latent state trajectory (for generating spikes)
+    true_states = jax.random.normal(k2, (n_time, n_params)) * 0.3
+
+    # Generate multi-neuron spikes based on design_matrix and true_states
+    # log_rate[t, n] = design_matrix[t, n, :] @ true_states[t, :]
+    log_rate = jnp.einsum("tnp,tp->tn", design_matrix, true_states)
+    rate = jnp.exp(log_rate) * dt
+    spike_indicator = jax.random.poisson(k3, rate).astype(jnp.float64)
+
+    return {
+        "init_mean": init_mean,
+        "init_cov": init_cov,
+        "design_matrix": design_matrix,
+        "spike_indicator": spike_indicator,
+        "dt": dt,
+        "transition_matrix": transition_matrix,
+        "process_cov": process_cov,
+        "n_time": n_time,
+        "n_params": n_params,
+        "n_neurons": n_neurons,
+        "true_states": true_states,
+    }
+
+
+def multi_neuron_log_intensity(design_matrix_t, params):
+    """Multi-neuron log intensity function.
+
+    Parameters
+    ----------
+    design_matrix_t : Array, shape (n_neurons, n_params)
+        Design matrix at time t for all neurons.
+    params : Array, shape (n_params,)
+        Latent state.
+
+    Returns
+    -------
+    Array, shape (n_neurons,)
+        Log intensity for each neuron.
+    """
+    return design_matrix_t @ params
+
+
+class TestMultiNeuronFilter:
+    """Tests for multi-neuron point process filter."""
+
+    def test_output_shapes(self, multi_neuron_test_data) -> None:
+        """Filter outputs should have correct shapes for multi-neuron input."""
+        d = multi_neuron_test_data
+
+        filtered_mean, filtered_cov, mll = stochastic_point_process_filter(
+            d["init_mean"],
+            d["init_cov"],
+            d["design_matrix"],
+            d["spike_indicator"],
+            d["dt"],
+            d["transition_matrix"],
+            d["process_cov"],
+            multi_neuron_log_intensity,
+        )
+
+        assert filtered_mean.shape == (d["n_time"], d["n_params"])
+        assert filtered_cov.shape == (d["n_time"], d["n_params"], d["n_params"])
+        assert mll.shape == ()
+
+    def test_no_nans(self, multi_neuron_test_data) -> None:
+        """Multi-neuron filter should not produce NaN values."""
+        d = multi_neuron_test_data
+
+        filtered_mean, filtered_cov, mll = stochastic_point_process_filter(
+            d["init_mean"],
+            d["init_cov"],
+            d["design_matrix"],
+            d["spike_indicator"],
+            d["dt"],
+            d["transition_matrix"],
+            d["process_cov"],
+            multi_neuron_log_intensity,
+        )
+
+        assert not jnp.any(jnp.isnan(filtered_mean))
+        assert not jnp.any(jnp.isnan(filtered_cov))
+        assert not jnp.isnan(mll)
+
+    def test_log_likelihood_finite(self, multi_neuron_test_data) -> None:
+        """Marginal log likelihood should be finite."""
+        d = multi_neuron_test_data
+
+        _, _, mll = stochastic_point_process_filter(
+            d["init_mean"],
+            d["init_cov"],
+            d["design_matrix"],
+            d["spike_indicator"],
+            d["dt"],
+            d["transition_matrix"],
+            d["process_cov"],
+            multi_neuron_log_intensity,
+        )
+
+        assert jnp.isfinite(mll)
+
+    def test_covariance_symmetric(self, multi_neuron_test_data) -> None:
+        """Multi-neuron filtered covariances should be symmetric."""
+        d = multi_neuron_test_data
+
+        _, filtered_cov, _ = stochastic_point_process_filter(
+            d["init_mean"],
+            d["init_cov"],
+            d["design_matrix"],
+            d["spike_indicator"],
+            d["dt"],
+            d["transition_matrix"],
+            d["process_cov"],
+            multi_neuron_log_intensity,
+        )
+
+        for t in range(d["n_time"]):
+            np.testing.assert_allclose(
+                filtered_cov[t], filtered_cov[t].T, atol=1e-10
+            )
+
+    def test_multi_neuron_reduces_to_single_neuron(self, point_process_test_data) -> None:
+        """Multi-neuron with n_neurons=1 should match single-neuron filter."""
+        d = point_process_test_data
+
+        # Single neuron result (original API)
+        filtered_mean_single, filtered_cov_single, mll_single = stochastic_point_process_filter(
+            d["init_mean"],
+            d["init_cov"],
+            d["design_matrix"],
+            d["spike_indicator"],
+            d["dt"],
+            d["transition_matrix"],
+            d["process_cov"],
+            log_conditional_intensity,
+        )
+
+        # Multi-neuron with n_neurons=1 (same data, reshaped)
+        design_matrix_multi = d["design_matrix"][:, None, :]  # (n_time, 1, n_params)
+        spike_indicator_multi = d["spike_indicator"][:, None]  # (n_time, 1)
+
+        filtered_mean_multi, filtered_cov_multi, mll_multi = stochastic_point_process_filter(
+            d["init_mean"],
+            d["init_cov"],
+            design_matrix_multi,
+            spike_indicator_multi,
+            d["dt"],
+            d["transition_matrix"],
+            d["process_cov"],
+            multi_neuron_log_intensity,
+        )
+
+        np.testing.assert_allclose(filtered_mean_single, filtered_mean_multi, rtol=1e-5)
+        np.testing.assert_allclose(filtered_cov_single, filtered_cov_multi, rtol=1e-5)
+        np.testing.assert_allclose(mll_single, mll_multi, rtol=1e-5)
+
+    def test_more_neurons_reduces_variance(self) -> None:
+        """Adding more informative neurons should reduce posterior variance."""
+        n_time = 50
+        n_params = 2
+        dt = 0.02
+
+        key = jax.random.PRNGKey(123)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        init_mean = jnp.zeros(n_params)
+        init_cov = jnp.eye(n_params)
+        transition_matrix = jnp.eye(n_params) * 0.99
+        process_cov = jnp.eye(n_params) * 0.01
+
+        # Design matrix and spikes for 1 neuron
+        design_1 = jax.random.normal(k1, (n_time, 1, n_params))
+        spikes_1 = jax.random.poisson(k2, jnp.ones((n_time, 1)) * 0.1)
+
+        # Design matrix and spikes for 5 neurons (tile the 1-neuron case)
+        design_5 = jnp.tile(design_1, (1, 5, 1))
+        spikes_5 = jnp.tile(spikes_1, (1, 5))
+
+        # Run filter with 1 neuron
+        _, cov_1, _ = stochastic_point_process_filter(
+            init_mean, init_cov, design_1, spikes_1, dt,
+            transition_matrix, process_cov, multi_neuron_log_intensity
+        )
+
+        # Run filter with 5 neurons (more information)
+        _, cov_5, _ = stochastic_point_process_filter(
+            init_mean, init_cov, design_5, spikes_5, dt,
+            transition_matrix, process_cov, multi_neuron_log_intensity
+        )
+
+        # Average variance should be smaller with more neurons
+        avg_var_1 = jnp.mean(jnp.trace(cov_1, axis1=-2, axis2=-1))
+        avg_var_5 = jnp.mean(jnp.trace(cov_5, axis1=-2, axis2=-1))
+
+        assert avg_var_5 < avg_var_1, (
+            f"Variance should decrease with more neurons: {avg_var_5} >= {avg_var_1}"
+        )
+
+
+class TestMultiNeuronSmoother:
+    """Tests for multi-neuron point process smoother."""
+
+    def test_output_shapes(self, multi_neuron_test_data) -> None:
+        """Smoother outputs should have correct shapes for multi-neuron input."""
+        d = multi_neuron_test_data
+
+        smoother_mean, smoother_cov, smoother_cross_cov, mll = stochastic_point_process_smoother(
+            d["init_mean"],
+            d["init_cov"],
+            d["design_matrix"],
+            d["spike_indicator"],
+            d["dt"],
+            d["transition_matrix"],
+            d["process_cov"],
+            multi_neuron_log_intensity,
+        )
+
+        assert smoother_mean.shape == (d["n_time"], d["n_params"])
+        assert smoother_cov.shape == (d["n_time"], d["n_params"], d["n_params"])
+        assert smoother_cross_cov.shape == (d["n_time"] - 1, d["n_params"], d["n_params"])
+
+    def test_no_nans(self, multi_neuron_test_data) -> None:
+        """Multi-neuron smoother should not produce NaN values."""
+        d = multi_neuron_test_data
+
+        smoother_mean, smoother_cov, smoother_cross_cov, mll = stochastic_point_process_smoother(
+            d["init_mean"],
+            d["init_cov"],
+            d["design_matrix"],
+            d["spike_indicator"],
+            d["dt"],
+            d["transition_matrix"],
+            d["process_cov"],
+            multi_neuron_log_intensity,
+        )
+
+        assert not jnp.any(jnp.isnan(smoother_mean))
+        assert not jnp.any(jnp.isnan(smoother_cov))
+        assert not jnp.any(jnp.isnan(smoother_cross_cov))
+        assert not jnp.isnan(mll)
+
+    def test_smoother_reduces_variance(self, multi_neuron_test_data) -> None:
+        """Smoother should have lower or equal variance compared to filter."""
+        d = multi_neuron_test_data
+
+        filtered_mean, filtered_cov, _ = stochastic_point_process_filter(
+            d["init_mean"],
+            d["init_cov"],
+            d["design_matrix"],
+            d["spike_indicator"],
+            d["dt"],
+            d["transition_matrix"],
+            d["process_cov"],
+            multi_neuron_log_intensity,
+        )
+
+        smoother_mean, smoother_cov, _, _ = stochastic_point_process_smoother(
+            d["init_mean"],
+            d["init_cov"],
+            d["design_matrix"],
+            d["spike_indicator"],
+            d["dt"],
+            d["transition_matrix"],
+            d["process_cov"],
+            multi_neuron_log_intensity,
+        )
+
+        # Exclude last timepoint where smoother = filter
+        filter_trace = jnp.trace(filtered_cov[:-1], axis1=-2, axis2=-1)
+        smoother_trace = jnp.trace(smoother_cov[:-1], axis1=-2, axis2=-1)
+
+        # Smoother variance should be <= filter variance
+        assert jnp.all(smoother_trace <= filter_trace + 1e-6)
+
+
+class TestMultiNeuronIntensityDirection:
+    """Test that spikes in one neuron push state in the correct direction."""
+
+    def test_high_spikes_increase_intensity_estimate(self) -> None:
+        """High spike counts should increase intensity in that direction.
+
+        With a simple linear log-intensity, spikes in a neuron with positive
+        weights should push the latent state to increase that neuron's intensity.
+        """
+        n_time = 20
+        n_params = 2
+        n_neurons = 2
+        dt = 0.02
+
+        init_mean = jnp.zeros(n_params)
+        init_cov = jnp.eye(n_params)
+        transition_matrix = jnp.eye(n_params)  # Random walk
+        process_cov = jnp.eye(n_params) * 0.001
+
+        # Simple design matrix: neuron 0 responds to state[0], neuron 1 to state[1]
+        # Each row is same: [[1, 0], [0, 1]] (identity-like)
+        design_matrix = jnp.broadcast_to(
+            jnp.eye(n_neurons)[None, :, :], (n_time, n_neurons, n_params)
+        )
+
+        # Spikes only in neuron 0 (high rate)
+        spikes_neuron0 = jnp.zeros((n_time, n_neurons))
+        spikes_neuron0 = spikes_neuron0.at[:, 0].set(5)  # 5 spikes per bin in neuron 0
+
+        # Spikes only in neuron 1 (high rate)
+        spikes_neuron1 = jnp.zeros((n_time, n_neurons))
+        spikes_neuron1 = spikes_neuron1.at[:, 1].set(5)  # 5 spikes per bin in neuron 1
+
+        # Run filters
+        mean_0, _, _ = stochastic_point_process_filter(
+            init_mean, init_cov, design_matrix, spikes_neuron0, dt,
+            transition_matrix, process_cov, multi_neuron_log_intensity
+        )
+
+        mean_1, _, _ = stochastic_point_process_filter(
+            init_mean, init_cov, design_matrix, spikes_neuron1, dt,
+            transition_matrix, process_cov, multi_neuron_log_intensity
+        )
+
+        # With spikes in neuron 0, state[0] should be higher than state[1]
+        assert jnp.mean(mean_0[:, 0]) > jnp.mean(mean_0[:, 1]), (
+            "Spikes in neuron 0 should increase state[0]"
+        )
+
+        # With spikes in neuron 1, state[1] should be higher than state[0]
+        assert jnp.mean(mean_1[:, 1]) > jnp.mean(mean_1[:, 0]), (
+            "Spikes in neuron 1 should increase state[1]"
+        )

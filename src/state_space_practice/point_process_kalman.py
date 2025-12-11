@@ -1,3 +1,33 @@
+"""Point-process Kalman filter and smoother for neural spike data.
+
+This module implements state-space models with point-process (spike) observations
+using the Laplace-EKF approach from Eden & Brown (2004).
+
+The model is:
+    x_k = A @ x_{k-1} + w_k,  w_k ~ N(0, Q)
+    y_{n,k} ~ Poisson(exp(log_intensity_func(Z_k, x_k)[n]) * dt)
+
+where x_k is the latent state, y_{n,k} is the spike count for neuron n at time k,
+and log_intensity_func returns log firing rates for all neurons.
+
+Multi-Neuron Support
+--------------------
+The filter supports multiple neurons sharing a common latent state:
+
+- spike_indicator: (n_time, n_neurons) - spike counts for each neuron
+- log_conditional_intensity(Z_k, x_k) returns (n_neurons,) log-intensities
+
+For backwards compatibility, single-neuron inputs are automatically promoted:
+- spike_indicator: (n_time,) is treated as (n_time, 1)
+- scalar log-intensity output is wrapped to (1,)
+
+References
+----------
+[1] Eden, U.T., Frank, L.M., Barbieri, R., Solo, V. & Brown, E.N. (2004).
+    Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
+    Neural Computation 16, 971-998.
+"""
+
 import logging
 from typing import Callable, Optional
 
@@ -20,19 +50,157 @@ logger = logging.getLogger(__name__)
 def log_conditional_intensity(design_matrix: ArrayLike, params: ArrayLike) -> Array:
     """Computes the log conditional intensity for a point process.
 
+    This is the default linear log-intensity function: log(λ) = Z @ x.
+
+    For single-neuron models, this returns a scalar.
+    For multi-neuron models, design_matrix should be (n_neurons, n_params)
+    so this returns (n_neurons,) log-intensities.
+
     Parameters
     ----------
-    design_matrix : ArrayLike, shape (n_time, n_params)
+    design_matrix : ArrayLike, shape (n_params,) or (n_neurons, n_params)
         Design matrix (Z_k) used in the intensity function.
+        For single neuron: (n_params,) row vector.
+        For multi-neuron: (n_neurons, n_params) matrix.
     params : ArrayLike, shape (n_params,)
-        Parameters for the intensity function.
+        Parameters (latent state) for the intensity function.
 
     Returns
     -------
-    Array, shape (n_time,)
+    Array, shape () or (n_neurons,)
         Log conditional intensity (log(λ_k)).
+        Scalar for single-neuron, (n_neurons,) for multi-neuron.
     """
     return jnp.asarray(design_matrix) @ jnp.asarray(params)
+
+
+def _point_process_laplace_update(
+    one_step_mean: Array,
+    one_step_cov: Array,
+    spike_indicator_t: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array], Array],
+    diagonal_boost: float = 1e-9,
+    grad_log_intensity_func: Optional[Callable[[Array], Array]] = None,
+    hess_log_intensity_func: Optional[Callable[[Array], Array]] = None,
+) -> tuple[Array, Array, float]:
+    """Single point-process Laplace-EKF update for multiple neurons.
+
+    Performs a Bayesian update of the latent state posterior given observed
+    spike counts, using a Laplace (Gaussian) approximation to the posterior.
+
+    This is the core math for point-process observation updates, factored
+    out to be reusable by both the non-switching and switching filters.
+
+    The observation model is:
+        y_n ~ Poisson(exp(log_intensity_func(x)[n]) * dt)
+
+    Parameters
+    ----------
+    one_step_mean : Array, shape (n_latent,)
+        Predicted mean from dynamics: A @ m_{t-1}
+    one_step_cov : Array, shape (n_latent, n_latent)
+        Predicted covariance: A @ P_{t-1} @ A.T + Q
+    spike_indicator_t : Array, shape (n_neurons,)
+        Spike counts at time t for all neurons
+    dt : float
+        Time bin width in seconds
+    log_intensity_func : Callable[[Array], Array]
+        Function mapping state (n_latent,) to log-intensities (n_neurons,).
+        Should return log(lambda) where lambda is firing rate in Hz.
+    diagonal_boost : float, default=1e-9
+        Small value added to precision matrix diagonal for numerical stability.
+    grad_log_intensity_func : Callable[[Array], Array] | None, optional
+        Pre-computed gradient function (Jacobian) of log_intensity_func.
+        If None, computed via jax.jacfwd(log_intensity_func).
+        Passing pre-computed functions can improve compilation speed when
+        this function is called repeatedly inside a JIT-compiled context.
+    hess_log_intensity_func : Callable[[Array], Array] | None, optional
+        Pre-computed Hessian function of log_intensity_func.
+        If None, computed via jax.jacfwd of the gradient function.
+
+    Returns
+    -------
+    posterior_mean : Array, shape (n_latent,)
+        Updated state mean after incorporating spike observations
+    posterior_cov : Array, shape (n_latent, n_latent)
+        Updated state covariance after incorporating spike observations
+    log_likelihood : float
+        Sum of Poisson log-pmfs across neurons
+
+    Notes
+    -----
+    The Laplace approximation uses the predicted mean as the expansion point
+    for a single Newton step update. For multiple neurons, the gradients and
+    Hessians are summed across neurons.
+
+    For Poisson likelihood with log-link:
+        log p(y | x) = sum_n [y_n * log(lambda_n * dt) - lambda_n * dt - log(y_n!)]
+        gradient = sum_n [(y_n - lambda_n * dt) * d(log_lambda_n)/dx]
+        Hessian = sum_n [(y_n - lambda_n * dt) * d^2(log_lambda_n)/dx^2
+                        - lambda_n * dt * (d(log_lambda_n)/dx)^T @ (d(log_lambda_n)/dx)]
+
+    References
+    ----------
+    [1] Eden, U.T., Frank, L.M., Barbieri, R., Solo, V. & Brown, E.N. (2004).
+        Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
+        Neural Computation 16, 971-998.
+    """
+    # Compute gradients and Hessians of log-intensity function
+    if grad_log_intensity_func is None:
+        grad_log_intensity_func = jax.jacfwd(log_intensity_func)
+    if hess_log_intensity_func is None:
+        hess_log_intensity_func = jax.jacfwd(grad_log_intensity_func)
+    grad_log_intensity = grad_log_intensity_func
+    hess_log_intensity = hess_log_intensity_func
+
+    # Evaluate at the one-step predicted mean
+    log_lambda = log_intensity_func(one_step_mean)  # (n_neurons,)
+    conditional_intensity = jnp.exp(log_lambda) * dt  # Expected spike count
+
+    # Innovation: observed - expected
+    innovation = spike_indicator_t - conditional_intensity  # (n_neurons,)
+
+    # Jacobian: (n_neurons, n_latent)
+    jacobian = grad_log_intensity(one_step_mean)  # (n_neurons, n_latent)
+
+    # Hessian: (n_neurons, n_latent, n_latent)
+    hessian = hess_log_intensity(one_step_mean)  # (n_neurons, n_latent, n_latent)
+
+    # Weighted gradient for mean update: jacobian.T @ innovation -> (n_latent,)
+    gradient = jacobian.T @ innovation  # (n_latent,)
+
+    # Fisher information: jacobian.T @ diag(conditional_intensity) @ jacobian
+    fisher_info = jacobian.T @ (
+        conditional_intensity[:, None] * jacobian
+    )  # (n_latent, n_latent)
+
+    # Hessian correction: sum_n innovation_n * hessian[n]
+    hessian_correction = jnp.einsum(
+        "n,nij->ij", innovation, hessian
+    )  # (n_latent, n_latent)
+
+    # Prior precision via psd_solve for numerical stability
+    n_latent = one_step_mean.shape[0]
+    identity = jnp.eye(n_latent)
+    prior_precision = psd_solve(one_step_cov, identity, diagonal_boost=diagonal_boost)
+
+    # Posterior precision: P^{-1} = P_prior^{-1} + Fisher - innovation * Hessian
+    posterior_precision = prior_precision + fisher_info - hessian_correction
+
+    # Posterior covariance via psd_solve
+    posterior_cov = psd_solve(posterior_precision, identity, diagonal_boost=diagonal_boost)
+    posterior_cov = symmetrize(posterior_cov)
+
+    # Posterior mean: Newton step from prior
+    posterior_mean = one_step_mean + psd_solve(
+        posterior_precision, gradient, diagonal_boost=diagonal_boost
+    )
+
+    # Log-likelihood: sum of Poisson log-pmfs
+    log_likelihood = jnp.sum(jax.scipy.stats.poisson.logpmf(spike_indicator_t, conditional_intensity))
+
+    return posterior_mean, posterior_cov, log_likelihood
 
 
 def stochastic_point_process_filter(
@@ -50,16 +218,27 @@ def stochastic_point_process_filter(
     This filter estimates a time-varying latent state ($x_k$) based on
     point process observations ($y_k$). It assumes a linear Gaussian state
     transition and a point process observation model where the conditional
-    intensity $\lambda_k$ depends on the state.
+    intensity $\\lambda_k$ depends on the state.
 
-    $$ x_k = A x_{k-1} + w_k, \quad w_k \sim N(0, Q) $$
-    $$ \lambda_k = f(x_k, Z_k) $$
-    $$ y_k \sim \text{Poisson}(\lambda_k \Delta t) \quad (\text{or Bernoulli}) $$
+    $$ x_k = A x_{k-1} + w_k, \\quad w_k \\sim N(0, Q) $$
+    $$ \\lambda_{n,k} = f(x_k, Z_k)_n $$
+    $$ y_{n,k} \\sim \\text{Poisson}(\\lambda_{n,k} \\Delta t) $$
 
     The filter uses a local Gaussian approximation (Laplace-EKF approach)
     at each update step, utilizing the gradient and Hessian of the
     log-likelihood. It implements a single Newton-Raphson like step
     per time bin.
+
+    Multi-Neuron Support
+    --------------------
+    The filter supports multiple neurons sharing a common latent state:
+
+    - spike_indicator: (n_time, n_neurons) - spike counts for each neuron
+    - log_conditional_intensity(Z_k, x_k) should return (n_neurons,)
+
+    For backwards compatibility, single-neuron inputs work as before:
+    - spike_indicator: (n_time,) is internally promoted to (n_time, 1)
+    - scalar log-intensity output is wrapped to (1,)
 
     Parameters
     ----------
@@ -67,19 +246,24 @@ def stochastic_point_process_filter(
         Initial mean of the latent state ($x_0$).
     init_covariance_params : ArrayLike, shape (n_params, n_params)
         Initial covariance of the latent state ($P_0$).
-    design_matrix : ArrayLike, shape (n_time, n_params)
+    design_matrix : ArrayLike, shape (n_time, ...) or (n_time, n_neurons, n_params)
         Design matrix ($Z_k$) used in the intensity function.
-    spike_indicator : ArrayLike, shape (n_time,)
+        Shape depends on the log_conditional_intensity function.
+        For multi-neuron with default linear intensity, use (n_time, n_neurons, n_params).
+    spike_indicator : ArrayLike, shape (n_time,) or (n_time, n_neurons)
         Observed spike counts or indicators ($y_k$).
+        For single neuron: (n_time,)
+        For multiple neurons: (n_time, n_neurons)
     dt : float
-        Time step size ($\Delta t$).
+        Time step size ($\\Delta t$).
     transition_matrix : ArrayLike, shape (n_params, n_params)
         State transition matrix ($A$).
     process_cov : ArrayLike, shape (n_params, n_params)
         Process noise covariance ($Q$).
     log_conditional_intensity : callable
         Function `log_lambda(Z_k, x_k)` returning the log conditional
-        intensity.
+        intensity. Should return (n_neurons,) array for multi-neuron case,
+        or scalar for single-neuron.
 
     Returns
     -------
@@ -90,31 +274,40 @@ def stochastic_point_process_filter(
     marginal_log_likelihood : float
         Total log-likelihood of the observations given the model.
 
+    Notes
+    -----
+    For multiple neurons, the log-likelihood at each timestep is the sum
+    of independent Poisson log-pmfs:
+        log p(y_t | x_t) = sum_n log Poisson(y_{n,t} | lambda_{n,t} * dt)
+
+    The filter aggregates information from all neurons to update the shared
+    latent state. More neurons provide more information, reducing posterior
+    uncertainty.
+
     References
     ----------
     [1] Eden, U. T., Frank, L. M., Barbieri, R., Solo, V. & Brown, E. N.
       Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
       Neural Computation 16, 971-998 (2004).
-
-
     """
-    grad_log_conditional_intensity = jax.jacfwd(log_conditional_intensity, argnums=1)
-    hess_log_conditional_intensity = jax.hessian(log_conditional_intensity, argnums=1)
+    # Convert to arrays
+    init_mean_params = jnp.asarray(init_mean_params)
+    init_covariance_params = jnp.asarray(init_covariance_params)
+    design_matrix = jnp.asarray(design_matrix)
+    spike_indicator = jnp.asarray(spike_indicator)
+    transition_matrix = jnp.asarray(transition_matrix)
+    process_cov = jnp.asarray(process_cov)
+
+    # Promote single-neuron spike_indicator to (n_time, 1) for consistent handling
+    single_neuron = spike_indicator.ndim == 1
+    if single_neuron:
+        spike_indicator = spike_indicator[:, None]
 
     def _step(
         params_prev: tuple[Array, Array, float],
         args: tuple[Array, Array],
-    ) -> tuple[tuple[Array, Array], tuple[Array, Array]]:
-        """Point Process Adaptive Filter update step
-
-        F : transition matrix
-        Q : covariance matrix
-        \theta_{k | k-1} :
-        W_{k | k-1}: one_step_variance_params
-        \theta_{k | k} : posterior_mean
-        W_{k | k} : posterior_variance
-        """
-
+    ) -> tuple[tuple[Array, Array, float], tuple[Array, Array]]:
+        """Point Process Adaptive Filter update step."""
         # Unpack previous parameters
         mean_prev, variance_prev, marginal_log_likelihood = params_prev
         design_matrix_t, spike_indicator_t = args
@@ -126,30 +319,22 @@ def stochastic_point_process_filter(
         )
         one_step_covariance = symmetrize(one_step_covariance)
 
-        # Compute the conditional intensity and innovation
-        conditional_intensity = (
-            jnp.exp(log_conditional_intensity(design_matrix_t, one_step_mean)) * dt
-        )
-        innovation = spike_indicator_t - conditional_intensity
+        # Create log_intensity_func that captures design_matrix_t
+        def log_intensity_func(x):
+            log_lambda = log_conditional_intensity(design_matrix_t, x)
+            # Ensure output is at least 1D for consistent multi-neuron handling
+            return jnp.atleast_1d(log_lambda)
 
-        # Compute the posterior mean and variance
-        one_step_grad = grad_log_conditional_intensity(design_matrix_t, one_step_mean)[
-            None
-        ]
-        one_step_hess = hess_log_conditional_intensity(design_matrix_t, one_step_mean)
+        # Use the generalized multi-neuron Laplace update
+        posterior_mean, posterior_covariance, log_lik = _point_process_laplace_update(
+            one_step_mean,
+            one_step_covariance,
+            spike_indicator_t,
+            dt,
+            log_intensity_func,
+        )
 
-        inverse_posterior_covariance = (
-            jnp.linalg.pinv(one_step_covariance)
-            + ((one_step_grad.T * conditional_intensity) @ one_step_grad)
-            - innovation * one_step_hess
-        )
-        posterior_covariance = jnp.linalg.pinv(inverse_posterior_covariance)
-        posterior_mean = one_step_mean + posterior_covariance @ (
-            one_step_grad.squeeze() * innovation
-        )
-        marginal_log_likelihood += jax.scipy.stats.poisson.logpmf(
-            k=spike_indicator_t, mu=conditional_intensity
-        )
+        marginal_log_likelihood += log_lik
 
         return (posterior_mean, posterior_covariance, marginal_log_likelihood), (
             posterior_mean,
@@ -179,38 +364,44 @@ def stochastic_point_process_smoother(
     process_cov: ArrayLike,
     log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
 ) -> tuple[Array, Array, Array, float]:
-    """
-    Applies a Stochastic State Point Process Smoother (SSPPS).
+    """Applies a Stochastic State Point Process Smoother (SSPPS).
 
     This smoother estimates a time-varying latent state ($x_k$) based on
     point process observations ($y_k$) using a Kalman smoother approach.
     It first applies a stochastic point process filter to obtain the filtered
     means and covariances, and then applies a Kalman smoother to refine these estimates.
-    The smoother uses the filtered means and covariances to compute the smoothed
-    means, covariances, and cross-covariances.
-    $$ x_k = A x_{k-1} + w_k, \quad w_k \sim N(0, Q) $$
-    $$ \lambda_k = f(x_k, Z_k) $$
-    $$ y_k \sim \text{Poisson}(\lambda_k \Delta t) \quad (\text{or Bernoulli}) $$
-    The smoother uses a Kalman smoother update step to refine the filtered estimates.
+
+    $$ x_k = A x_{k-1} + w_k, \\quad w_k \\sim N(0, Q) $$
+    $$ \\lambda_{n,k} = f(x_k, Z_k)_n $$
+    $$ y_{n,k} \\sim \\text{Poisson}(\\lambda_{n,k} \\Delta t) $$
+
+    Multi-Neuron Support
+    --------------------
+    The smoother supports multiple neurons sharing a common latent state.
+    See `stochastic_point_process_filter` for details on multi-neuron inputs.
+
     Parameters
     ----------
     init_mean_params : ArrayLike, shape (n_params,)
         Initial mean of the latent state ($x_0$).
     init_covariance_params : ArrayLike, shape (n_params, n_params)
         Initial covariance of the latent state ($P_0$).
-    design_matrix : ArrayLike, shape (n_time, n_params)
+    design_matrix : ArrayLike, shape (n_time, ...) or (n_time, n_neurons, n_params)
         Design matrix ($Z_k$) used in the intensity function.
-    spike_indicator : ArrayLike, shape (n_time,)
+        Shape depends on the log_conditional_intensity function.
+    spike_indicator : ArrayLike, shape (n_time,) or (n_time, n_neurons)
         Observed spike counts or indicators ($y_k$).
+        For single neuron: (n_time,)
+        For multiple neurons: (n_time, n_neurons)
     dt : float
-        Time step size ($\Delta t$).
+        Time step size ($\\Delta t$).
     transition_matrix : ArrayLike, shape (n_params, n_params)
         State transition matrix ($A$).
     process_cov : ArrayLike, shape (n_params, n_params)
         Process noise covariance ($Q$).
     log_conditional_intensity : callable
         Function `log_lambda(Z_k, x_k)` returning the log conditional
-        intensity.
+        intensity. Should return (n_neurons,) for multi-neuron case.
 
     Returns
     -------
@@ -222,6 +413,12 @@ def stochastic_point_process_smoother(
         Smoothed cross-covariances ($P_{k|T, k-1}$).
     marginal_log_likelihood : float
         Total log-likelihood of the observations given the model.
+
+    Notes
+    -----
+    The smoother is observation-model agnostic - it operates only on the
+    Gaussian posteriors from the filter. The multi-neuron handling is done
+    entirely in the filter step.
 
     References
     ----------
@@ -440,10 +637,21 @@ class PointProcessModel:
 
     Model:
         x_k = A @ x_{k-1} + w_k,  w_k ~ N(0, Q)
-        n_k ~ Poisson(exp(Z_k @ x_k) * dt)
+        n_{j,k} ~ Poisson(exp(log_intensity_func(Z_k, x_k)[j]) * dt)
 
     The EM algorithm estimates the state dynamics parameters (A, Q) while
     the latent states x_k are estimated via the E-step (filter/smoother).
+
+    Multi-Neuron Support
+    --------------------
+    The model supports multiple neurons sharing a common latent state:
+
+    - spike_indicator: (n_time, n_neurons) - spike counts for each neuron
+    - log_intensity_func(Z_k, x_k) should return (n_neurons,) log-intensities
+
+    For backwards compatibility, single-neuron inputs work as before:
+    - spike_indicator: (n_time,) is internally promoted to (n_time, 1)
+    - scalar log-intensity output is wrapped to (1,)
 
     Parameters
     ----------
@@ -462,6 +670,7 @@ class PointProcessModel:
     log_intensity_func : callable, optional
         Function log_lambda(Z_k, x_k) returning log conditional intensity.
         Default is linear: Z_k @ x_k.
+        For multi-neuron, should return (n_neurons,) array.
     update_transition_matrix : bool
         Whether to update A in M-step. Default True.
     update_process_cov : bool
@@ -546,8 +755,10 @@ class PointProcessModel:
 
         Parameters
         ----------
-        design_matrix : ArrayLike, shape (n_time, n_state_dims)
-        spike_indicator : ArrayLike, shape (n_time,)
+        design_matrix : ArrayLike, shape (n_time, ...) or (n_time, n_neurons, n_state_dims)
+            Design matrix for the intensity function.
+        spike_indicator : ArrayLike, shape (n_time,) or (n_time, n_neurons)
+            Observed spike counts. Single neuron: (n_time,), multi-neuron: (n_time, n_neurons).
 
         Returns
         -------
@@ -621,10 +832,13 @@ class PointProcessModel:
 
         Parameters
         ----------
-        design_matrix : ArrayLike, shape (n_time, n_state_dims)
+        design_matrix : ArrayLike, shape (n_time, ...) or (n_time, n_neurons, n_state_dims)
             Design matrix for the intensity function.
-        spike_indicator : ArrayLike, shape (n_time,)
+            Shape depends on the log_intensity_func.
+        spike_indicator : ArrayLike, shape (n_time,) or (n_time, n_neurons)
             Observed spike counts or indicators.
+            For single neuron: (n_time,)
+            For multiple neurons: (n_time, n_neurons)
         max_iter : int
             Maximum number of EM iterations.
         tolerance : float
