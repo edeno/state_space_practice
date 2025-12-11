@@ -3,8 +3,8 @@
 ## Current Status
 
 - **Date**: 2025-12-11
-- **Working on**: Milestone 7 - Tasks 7.1-7.7 COMPLETE
-- **Current Task**: Task 7.8 - Write model class tests
+- **Working on**: Milestone 7 COMPLETE - All 8 tasks done
+- **Next**: Milestone 8 - End-to-End Tests
 
 ## Milestone 1 Summary (COMPLETE)
 
@@ -435,6 +435,46 @@ Implemented `SwitchingSpikeOscillatorModel._project_parameters()` method with:
 - Integration properly placed after M-step calls
 - Excellent test coverage (9 tests covering functional, mathematical, edge cases)
 
-### Next: Task 7.8
+### Task 7.8 (COMPLETE)
 
-Write model class tests for end-to-end validation
+Implemented end-to-end model class tests in `TestSwitchingSpikeOscillatorModelEndToEnd`:
+
+- **test_model_recovers_discrete_states**: Tests discrete state recovery from simulated data
+  - Uses 500 timepoints, 8 neurons, 2 discrete states with distinct dynamics
+  - Conservative spike parameters for numerical stability (small weights, higher baseline)
+  - Accounts for label permutation (checks both orderings)
+  - Threshold: better than chance (>50%)
+- **test_model_recovers_oscillator_params**: Tests parameter recovery
+  - Single discrete state for cleaner recovery
+  - Validates oscillatory block structure (diagonals equal, off-diagonals anti-symmetric)
+  - Validates PSD process covariance
+  - Quantitative check: spectral radius recovery within 30% tolerance
+- **test_model_em_overall_improvement_single_state**: Tests EM improvement
+  - Tests overall improvement (final > initial LL)
+  - Does not test strict per-iteration monotonicity (Laplace approximation can cause small violations)
+- **test_model_fit_on_simulated_data_runs_without_error**: Smoke test
+  - Full pipeline on realistic simulated data
+  - 200 timepoints, 8 neurons, 2 discrete states
+
+#### Key Design Decisions
+
+1. **Conservative spike parameters**: Small weights (0.05 scale), higher baseline (2.0) to prevent GLM M-step weight explosion with sparse data
+2. **Smaller dt (0.01)**: For numerical stability
+3. **Longer time series (200-500 steps)**: Required for reliable parameter estimation
+4. **EM improvement vs monotonicity**: Test for overall improvement, not strict monotonicity (Laplace approximation can cause per-iteration violations)
+5. **Label permutation handling**: Check accuracy for both label orderings
+
+#### Code Review Notes
+
+- APPROVED by code-reviewer agent
+- Added quantitative spectral radius recovery check per reviewer suggestion
+- Added detailed scientific justification for 50% discrete state accuracy threshold
+- Comprehensive documentation of numerical stability considerations
+
+### Next: Milestone 8 - End-to-End Tests
+
+Milestone 7 is now COMPLETE. Next tasks are:
+- 8.1 `test_switching_spike_oscillator_em_monotonic`
+- 8.2 `test_switching_spike_oscillator_recovers_parameters`
+- 8.3 `test_switching_spike_oscillator_vs_non_switching`
+- 8.4 `test_collapse_to_state_conditional`

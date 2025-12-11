@@ -259,7 +259,7 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
   - Apply `project_coupled_transition_matrix` if using DIM structure
   - Ensure Q is PSD
 
-- [ ] **7.8** Write model class tests
+- [x] **7.8** Write model class tests
   - `test_model_fit_runs`: No errors on simulated data
   - `test_model_em_monotonic`: Log-likelihood increases each iteration
   - `test_model_recovers_discrete_states`: Inferred states match true states

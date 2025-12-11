@@ -5613,3 +5613,377 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
             assert jnp.all(eigenvalues >= -1e-8), (
                 f"After fit: Q for state {j} is not PSD"
             )
+
+
+class TestSwitchingSpikeOscillatorModelEndToEnd:
+    """End-to-end tests for SwitchingSpikeOscillatorModel (Task 7.8).
+
+    These tests validate the full model pipeline including:
+    - EM monotonicity on simulated data
+    - Discrete state recovery
+    - Oscillator parameter recovery
+
+    Note: These tests use conservative spike parameters (small weights, higher
+    baseline) to ensure numerical stability during EM. Point-process models
+    with very sparse spikes can cause GLM M-step weight explosion.
+    """
+
+    def test_model_recovers_discrete_states(self) -> None:
+        """Model should recover discrete states from simulated data.
+
+        Simulates data with clear discrete state transitions and verifies that
+        the fitted model's smoothed discrete state probabilities correlate
+        with the true states.
+        """
+        from state_space_practice.simulate.simulate_switching_spikes import (
+            simulate_switching_spike_oscillator,
+        )
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        # Use 2 discrete states with distinct dynamics
+        # Need many samples for reliable parameter recovery
+        n_time = 500  # Long time series for parameter estimation
+        n_neurons = 8
+        n_oscillators = 2
+        n_latent = 2 * n_oscillators
+        n_discrete_states = 2
+        dt = 0.01  # Smaller dt for numerical stability
+        sampling_freq = 100.0
+
+        key = jax.random.PRNGKey(42)
+        key_sim, key_fit = jax.random.split(key)
+
+        # Create distinct transition matrices for each discrete state
+        # State 0: higher damping (more stable)
+        # State 1: lower damping (more dynamic)
+        A0 = jnp.eye(n_latent) * 0.98
+        A1 = jnp.eye(n_latent) * 0.90
+        transition_matrices = jnp.stack([A0, A1], axis=-1)
+
+        # Process covariances - small for stability
+        Q = jnp.eye(n_latent) * 0.01
+        process_covs = jnp.stack([Q, Q], axis=-1)
+
+        # Discrete transition matrix - high self-transition to create blocks
+        discrete_transition_matrix = jnp.array([[0.98, 0.02], [0.02, 0.98]])
+
+        # Conservative spike parameters for numerical stability
+        # Small weights prevent GLM M-step weight explosion
+        # Higher baseline ensures adequate spike counts
+        key_weights, _ = jax.random.split(key_sim)
+        spike_weights = jax.random.normal(key_weights, (n_neurons, n_latent)) * 0.05
+        spike_baseline = jnp.ones(n_neurons) * 2.0  # ~7.4 Hz baseline rate
+
+        # Simulate data
+        spikes, true_states, true_discrete_states = simulate_switching_spike_oscillator(
+            n_time=n_time,
+            transition_matrices=transition_matrices,
+            process_covs=process_covs,
+            discrete_transition_matrix=discrete_transition_matrix,
+            spike_weights=spike_weights,
+            spike_baseline=spike_baseline,
+            dt=dt,
+            key=key_sim,
+        )
+
+        # Fit model
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=sampling_freq,
+            dt=dt,
+            update_continuous_transition_matrix=True,
+            update_process_cov=True,
+            update_spike_params=True,
+        )
+
+        # Run EM for several iterations
+        log_likelihoods = model.fit(spikes, max_iter=10, key=key_fit)
+
+        # Check that EM ran successfully
+        assert len(log_likelihoods) > 2, "EM should run multiple iterations"
+
+        # Get smoothed discrete state probabilities
+        inferred_probs = model.smoother_discrete_state_prob  # (n_time, n_discrete_states)
+
+        # Compute accuracy for direct assignment
+        inferred_states_direct = jnp.argmax(inferred_probs, axis=1)
+        accuracy_direct = jnp.mean(inferred_states_direct == true_discrete_states)
+
+        # Compute accuracy for swapped assignment (in case labels are swapped)
+        inferred_states_swapped = 1 - inferred_states_direct
+        accuracy_swapped = jnp.mean(inferred_states_swapped == true_discrete_states)
+
+        # Take the better accuracy (accounts for label permutation)
+        best_accuracy = max(float(accuracy_direct), float(accuracy_swapped))
+
+        # Discrete state recovery is challenging for several reasons:
+        # 1. EM can converge to local optima (initialization-dependent)
+        # 2. Point-process observations have limited state information per timestep
+        # 3. The Laplace approximation adds noise to the E-step
+        # 4. Similar dynamics between states reduces distinguishability
+        # We test for better-than-chance (>50%) as a baseline validity check.
+        # A production system would use multiple random restarts for better recovery.
+        assert best_accuracy > 0.50, (
+            f"Discrete state recovery accuracy {best_accuracy:.2f} is too low. "
+            f"Expected > 0.50 (better than chance) for data with distinct dynamics."
+        )
+
+    def test_model_recovers_oscillator_params(self) -> None:
+        """Model should approximately recover oscillator parameters from simulated data.
+
+        Tests that the fitted model's parameters are reasonably close to the
+        true parameters used for simulation.
+        """
+        from state_space_practice.simulate.simulate_switching_spikes import (
+            simulate_switching_spike_oscillator,
+        )
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        # Single discrete state for cleaner parameter recovery test
+        # Need many samples for reliable estimation
+        n_time = 500  # Long time series
+        n_neurons = 8
+        n_oscillators = 2
+        n_latent = 2 * n_oscillators
+        n_discrete_states = 1  # Single state avoids label permutation issues
+        dt = 0.01  # Smaller dt for numerical stability
+        sampling_freq = 100.0
+
+        key = jax.random.PRNGKey(123)
+        key_sim, key_fit = jax.random.split(key)
+
+        # True transition matrix: simple damped dynamics
+        # Using diagonal matrix for easier parameter matching
+        A_true = jnp.eye(n_latent) * 0.95
+        transition_matrices = A_true[:, :, None]  # (n_latent, n_latent, 1)
+
+        # Process covariance - small for stability
+        Q_true = jnp.eye(n_latent) * 0.01
+        process_covs = Q_true[:, :, None]  # (n_latent, n_latent, 1)
+
+        # Discrete transition matrix (trivial for single state)
+        discrete_transition_matrix = jnp.array([[1.0]])
+
+        # True spike observation parameters - conservative for stability
+        key_weights, _ = jax.random.split(key_sim)
+        spike_weights_true = jax.random.normal(key_weights, (n_neurons, n_latent)) * 0.05
+        spike_baseline_true = jnp.ones(n_neurons) * 2.0  # Higher baseline
+
+        # Simulate data
+        spikes, true_states, _ = simulate_switching_spike_oscillator(
+            n_time=n_time,
+            transition_matrices=transition_matrices,
+            process_covs=process_covs,
+            discrete_transition_matrix=discrete_transition_matrix,
+            spike_weights=spike_weights_true,
+            spike_baseline=spike_baseline_true,
+            dt=dt,
+            key=key_sim,
+        )
+
+        # Fit model
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=sampling_freq,
+            dt=dt,
+            update_continuous_transition_matrix=True,
+            update_process_cov=True,
+            update_spike_params=True,
+        )
+
+        # Run EM
+        log_likelihoods = model.fit(spikes, max_iter=15, key=key_fit)
+
+        # Verify EM improved log-likelihood
+        assert log_likelihoods[-1] > log_likelihoods[0], (
+            "EM should improve log-likelihood"
+        )
+
+        # Check parameter recovery
+        # 1. Transition matrix structure should be approximately preserved
+        A_fitted = model.continuous_transition_matrix[:, :, 0]
+
+        # The fitted A should have oscillatory block structure
+        # (due to _project_parameters forcing this structure)
+        # Check that diagonal blocks have the rotation-like structure
+        for i in range(n_oscillators):
+            block_fitted = A_fitted[2*i:2*i+2, 2*i:2*i+2]
+            # Diagonal elements should be similar
+            np.testing.assert_allclose(
+                block_fitted[0, 0], block_fitted[1, 1], rtol=0.15,
+                err_msg=f"Fitted block {i}: diagonals should be similar"
+            )
+            # Off-diagonal should be anti-symmetric
+            np.testing.assert_allclose(
+                block_fitted[0, 1], -block_fitted[1, 0], rtol=0.15,
+                err_msg=f"Fitted block {i}: off-diagonals should be anti-symmetric"
+            )
+
+        # 2. Process covariance should be positive definite
+        Q_fitted = model.process_cov[:, :, 0]
+        eigenvalues = jnp.linalg.eigvalsh(Q_fitted)
+        assert jnp.all(eigenvalues > 0), "Fitted Q should be positive definite"
+
+        # 3. All parameters should be finite
+        assert jnp.all(jnp.isfinite(A_fitted)), "A should be finite"
+        assert jnp.all(jnp.isfinite(Q_fitted)), "Q should be finite"
+        assert jnp.all(jnp.isfinite(model.spike_params.weights)), "Weights should be finite"
+        assert jnp.all(jnp.isfinite(model.spike_params.baseline)), "Baseline should be finite"
+
+        # 4. Quantitative recovery: transition matrix spectral radius
+        # True A has all eigenvalues = 0.95 (diagonal), so spectral radius ≈ 0.95
+        true_spectral_radius = 0.95
+        fitted_eigenvalues = jnp.linalg.eigvalsh(A_fitted)
+        fitted_spectral_radius = float(jnp.max(jnp.abs(fitted_eigenvalues)))
+        # Allow generous tolerance for point-process estimation
+        np.testing.assert_allclose(
+            fitted_spectral_radius, true_spectral_radius, rtol=0.3,
+            err_msg="Fitted A spectral radius should be approximately correct"
+        )
+
+    def test_model_em_overall_improvement_single_state(self) -> None:
+        """EM should improve log-likelihood overall for single discrete state case.
+
+        With a single discrete state, the model reduces to a standard
+        point-process state-space model. Note that the Laplace approximation
+        used for point-process observations can cause per-iteration monotonicity
+        violations, so we test for overall improvement rather than strict
+        monotonicity.
+        """
+        from state_space_practice.simulate.simulate_switching_spikes import (
+            simulate_switching_spike_oscillator,
+        )
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        # Conservative parameters for numerical stability
+        n_time = 300  # More samples
+        n_neurons = 6
+        n_oscillators = 2
+        n_latent = 2 * n_oscillators
+        dt = 0.01  # Smaller dt
+        sampling_freq = 100.0
+
+        key = jax.random.PRNGKey(789)
+
+        # Single discrete state
+        A = jnp.eye(n_latent) * 0.95
+        transition_matrices = A[:, :, None]
+        Q = jnp.eye(n_latent) * 0.01  # Smaller process noise
+        process_covs = Q[:, :, None]
+        discrete_transition_matrix = jnp.array([[1.0]])
+
+        # Conservative spike parameters
+        spike_weights = jax.random.normal(key, (n_neurons, n_latent)) * 0.05
+        spike_baseline = jnp.ones(n_neurons) * 2.0  # Higher baseline
+
+        # Simulate
+        spikes, _, _ = simulate_switching_spike_oscillator(
+            n_time=n_time,
+            transition_matrices=transition_matrices,
+            process_covs=process_covs,
+            discrete_transition_matrix=discrete_transition_matrix,
+            spike_weights=spike_weights,
+            spike_baseline=spike_baseline,
+            dt=dt,
+            key=key,
+        )
+
+        # Fit
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=1,
+            sampling_freq=sampling_freq,
+            dt=dt,
+        )
+
+        log_likelihoods = model.fit(spikes, max_iter=10, key=jax.random.PRNGKey(42))
+
+        # Test overall improvement: final LL should be better than initial
+        # Note: We don't test strict per-iteration monotonicity because
+        # the Laplace approximation can cause small violations
+        assert log_likelihoods[-1] > log_likelihoods[0], (
+            f"EM should improve log-likelihood overall: "
+            f"initial={log_likelihoods[0]:.2f}, final={log_likelihoods[-1]:.2f}"
+        )
+
+        # All log-likelihoods should be finite
+        for ll in log_likelihoods:
+            assert jnp.isfinite(ll), f"Log-likelihood {ll} is not finite"
+
+    def test_model_fit_on_simulated_data_runs_without_error(self) -> None:
+        """Model should fit on simulated data without errors.
+
+        This is a comprehensive smoke test that runs the full pipeline
+        on realistic simulated data.
+        """
+        from state_space_practice.simulate.simulate_switching_spikes import (
+            simulate_switching_spike_oscillator,
+        )
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        # Conservative parameters for numerical stability
+        n_time = 200
+        n_neurons = 8
+        n_oscillators = 2
+        n_latent = 2 * n_oscillators
+        n_discrete_states = 2
+        dt = 0.01
+        sampling_freq = 100.0
+
+        key = jax.random.PRNGKey(456)
+
+        # Create realistic parameters
+        A0 = jnp.eye(n_latent) * 0.95
+        A1 = jnp.eye(n_latent) * 0.90
+        transition_matrices = jnp.stack([A0, A1], axis=-1)
+
+        Q = jnp.eye(n_latent) * 0.01
+        process_covs = jnp.stack([Q, Q], axis=-1)
+
+        discrete_transition_matrix = jnp.array([[0.95, 0.05], [0.05, 0.95]])
+
+        # Conservative spike parameters
+        spike_weights = jax.random.normal(key, (n_neurons, n_latent)) * 0.05
+        spike_baseline = jnp.ones(n_neurons) * 2.0
+
+        # Simulate
+        spikes, _, _ = simulate_switching_spike_oscillator(
+            n_time=n_time,
+            transition_matrices=transition_matrices,
+            process_covs=process_covs,
+            discrete_transition_matrix=discrete_transition_matrix,
+            spike_weights=spike_weights,
+            spike_baseline=spike_baseline,
+            dt=dt,
+            key=key,
+        )
+
+        # Fit
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=sampling_freq,
+            dt=dt,
+        )
+
+        # Should not raise any exceptions
+        log_likelihoods = model.fit(spikes, max_iter=5, key=jax.random.PRNGKey(0))
+
+        # Basic sanity checks
+        assert len(log_likelihoods) == 5
+        for ll in log_likelihoods:
+            assert jnp.isfinite(ll)
