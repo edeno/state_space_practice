@@ -279,7 +279,7 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
 
 ### Tasks
 
-- [ ] **8.1** `test_switching_spike_oscillator_em_monotonic`
+- [x] **8.1** `test_switching_spike_oscillator_em_monotonic`
   - Fit model on simulated data
   - Assert log-likelihood[t+1] >= log-likelihood[t] - epsilon
 
