@@ -6320,3 +6320,183 @@ class TestMilestone8EndToEnd:
             err_msg="Initial discrete state prob should sum to 1"
         )
         assert jnp.all(init_prob >= 0), "Initial discrete state prob should be non-negative"
+
+    def test_switching_spike_oscillator_vs_non_switching(self) -> None:
+        """Task 8.3: Switching model with S=1 should behave like non-switching model.
+
+        Tests that when n_discrete_states=1, the SwitchingSpikeOscillatorModel
+        produces similar smoothed means as the non-switching PointProcessModel.
+
+        Key insight: With S=1, the switching machinery should collapse to a
+        standard point-process state-space model. Both models should:
+        1. Track the same underlying latent dynamics
+        2. Produce correlated smoothed means
+        3. Converge to similar log-likelihood values
+
+        Note: Exact equivalence is not expected due to:
+        - Different initialization strategies
+        - Different observation model parameterizations (spike_params vs log_intensity_func)
+        - Different filtering implementations (Laplace-EKF vs filter variants)
+
+        We test for behavioral similarity rather than numerical identity.
+        """
+        from state_space_practice.point_process_kalman import PointProcessModel
+        from state_space_practice.simulate.simulate_switching_spikes import (
+            simulate_switching_spike_oscillator,
+        )
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        # Configuration: single discrete state (non-switching case)
+        n_time = 300
+        n_neurons = 4
+        n_oscillators = 2
+        n_latent = 2 * n_oscillators
+        n_discrete_states = 1  # Key: single state for comparison
+        dt = 0.01
+        sampling_freq = 100.0
+
+        key = jax.random.PRNGKey(99999)
+        key_sim, key_fit = jax.random.split(key)
+
+        # True parameters
+        A_true = jnp.eye(n_latent) * 0.95
+        transition_matrices = A_true[:, :, None]
+        Q_true = jnp.eye(n_latent) * 0.01
+        process_covs = Q_true[:, :, None]
+        discrete_transition_matrix = jnp.array([[1.0]])
+
+        # Spike parameters - moderate coupling for better state inference
+        key_weights, key_sim2 = jax.random.split(key_sim)
+        spike_weights = jax.random.normal(key_weights, (n_neurons, n_latent)) * 0.1
+        spike_baseline = jnp.ones(n_neurons) * 2.0
+
+        # Simulate data
+        spikes, true_states, _ = simulate_switching_spike_oscillator(
+            n_time=n_time,
+            transition_matrices=transition_matrices,
+            process_covs=process_covs,
+            discrete_transition_matrix=discrete_transition_matrix,
+            spike_weights=spike_weights,
+            spike_baseline=spike_baseline,
+            dt=dt,
+            key=key_sim2,
+        )
+
+        # === Set up Switching Model (S=1) with FIXED parameters ===
+        # To make the latent space identifiable, we use identical parameters
+        # in both models and call _e_step directly (bypassing fit() which
+        # would re-initialize parameters).
+        from state_space_practice.switching_point_process import SpikeObsParams
+        switching_model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=sampling_freq,
+            dt=dt,
+        )
+
+        # Set known parameters directly
+        switching_model.spike_params = SpikeObsParams(
+            baseline=spike_baseline, weights=spike_weights
+        )
+        switching_model.continuous_transition_matrix = A_true[:, :, None]
+        switching_model.process_cov = Q_true[:, :, None]
+        switching_model.init_mean = jnp.zeros((n_latent, 1))
+        switching_model.init_cov = jnp.eye(n_latent)[:, :, None]
+        switching_model.discrete_transition_matrix = jnp.array([[1.0]])
+        switching_model.init_discrete_state_prob = jnp.array([1.0])
+
+        # Run E-step directly (filter + smoother)
+        switching_ll = switching_model._e_step(spikes)
+
+        # === Set up Non-Switching Model with IDENTICAL parameters ===
+        # Create log_intensity_func that matches the spike observation model
+        def log_intensity_func(design_row: Array, state: Array) -> Array:
+            """Log-intensity: baseline + weights @ state."""
+            return spike_baseline + spike_weights @ state
+
+        nonswitching_model = PointProcessModel(
+            n_state_dims=n_latent,
+            dt=dt,
+            transition_matrix=A_true,  # Same as switching model
+            process_cov=Q_true,  # Same as switching model
+            init_mean=jnp.zeros(n_latent),
+            init_cov=jnp.eye(n_latent),
+            log_intensity_func=log_intensity_func,
+        )
+
+        # Design matrix (unused by our log_intensity_func, but required by API)
+        design_matrix = jnp.zeros((n_time, 1))
+
+        # Run E-step directly
+        nonswitching_ll = nonswitching_model._e_step(design_matrix, spikes)
+
+        # === Comparisons ===
+
+        # Test 1: Both models produce finite log-likelihoods
+        assert jnp.isfinite(switching_ll), "Switching LL should be finite"
+        assert jnp.isfinite(nonswitching_ll), "Non-switching LL should be finite"
+
+        # Test 1b: Log-likelihoods should be very similar (same model, same data)
+        ll_diff = abs(float(switching_ll) - float(nonswitching_ll))
+        assert ll_diff < 1.0, (
+            f"Log-likelihoods should be nearly identical. "
+            f"Switching: {switching_ll:.2f}, Non-switching: {nonswitching_ll:.2f}, "
+            f"Diff: {ll_diff:.4f}"
+        )
+
+        # Test 2: Both smoothed means should be finite
+        # Get switching model's marginalized smoother mean
+        switching_smoother = jnp.einsum(
+            "tls,ts->tl",
+            switching_model.smoother_state_cond_mean,
+            switching_model.smoother_discrete_state_prob,
+        )
+        assert jnp.all(jnp.isfinite(switching_smoother)), (
+            "Switching smoother mean should be finite"
+        )
+
+        nonswitching_smoother = nonswitching_model.smoother_mean
+        assert jnp.all(jnp.isfinite(nonswitching_smoother)), (
+            "Non-switching smoother mean should be finite"
+        )
+
+        # Test 3: Shapes should match
+        assert switching_smoother.shape == nonswitching_smoother.shape, (
+            f"Smoother shapes don't match: switching={switching_smoother.shape}, "
+            f"non-switching={nonswitching_smoother.shape}"
+        )
+
+        # Test 4: With IDENTICAL parameters, smoothed means should be HIGHLY correlated
+        # Since we disabled all M-step updates and use the same A, Q, and observation
+        # model, both filtering implementations should produce very similar results.
+        # The latent space is now identifiable because all parameters are fixed.
+        correlations = []
+        for i in range(n_latent):
+            corr = jnp.corrcoef(
+                switching_smoother[:, i], nonswitching_smoother[:, i]
+            )[0, 1]
+            correlations.append(float(corr))
+
+        mean_correlation = jnp.mean(jnp.array(correlations))
+
+        # With identical parameters, expect high correlation (>0.8)
+        # Differences arise only from minor implementation details in the
+        # Laplace-EKF filtering/smoothing algorithms
+        assert mean_correlation > 0.8, (
+            f"With identical parameters, smoothed means should be highly correlated. "
+            f"Mean correlation: {mean_correlation:.3f}, per-dim: {correlations}"
+        )
+
+        # Test 5: Both discrete state probs should be trivially 1.0 for S=1
+        assert switching_model.smoother_discrete_state_prob.shape[1] == 1, (
+            "Should have single discrete state"
+        )
+        np.testing.assert_allclose(
+            switching_model.smoother_discrete_state_prob,
+            jnp.ones((n_time, 1)),
+            rtol=1e-5,
+            err_msg="With S=1, all discrete state probs should be 1.0"
+        )

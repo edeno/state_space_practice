@@ -288,7 +288,7 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
   - Fit model
   - Assert recovered params close to true params (within tolerance)
 
-- [ ] **8.3** `test_switching_spike_oscillator_vs_non_switching`
+- [x] **8.3** `test_switching_spike_oscillator_vs_non_switching`
   - S=1 discrete state
   - Compare to `PointProcessModel` from point_process_kalman.py
   - Smoothed means should be similar
