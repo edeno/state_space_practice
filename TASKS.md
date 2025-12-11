@@ -300,7 +300,7 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
 
 ## Milestone 9: Demo Notebook
 
-**Goal**: Working example demonstrating the model on realistic-ish data.
+**Goal**: Working example demonstrating the model on realistic-ish data. Use jupyter-notebook skill.
 
 **Success criteria**: Notebook runs end-to-end; visualizations are clear.
 
@@ -310,31 +310,31 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
 
 ### Tasks
 
-- [ ] **9.1** Set up notebook with imports and random seed
+- [x] **9.1** Set up notebook with imports and random seed
 
-- [ ] **9.2** Simulate data section
+- [x] **9.2** Simulate data section
   - 2 oscillators, 2 discrete states, 10 neurons
   - Different coupling patterns per state
   - ~1000 timesteps
 
-- [ ] **9.3** Fit model section
+- [x] **9.3** Fit model section
   - Initialize model
   - Call fit() with progress logging
   - Plot log-likelihood convergence
 
-- [ ] **9.4** Visualization: Discrete states
+- [x] **9.4** Visualization: Discrete states
   - Plot true vs inferred P(S_t = j)
   - Highlight state transitions
 
-- [ ] **9.5** Visualization: Oscillator trajectories
+- [x] **9.5** Visualization: Oscillator trajectories
   - Plot true states vs smoothed means
   - Show confidence intervals
 
-- [ ] **9.6** Visualization: Learned coupling
+- [x] **9.6** Visualization: Learned coupling
   - Show coupling matrices per discrete state
   - Compare to ground truth
 
-- [ ] **9.7** Visualization: Neuron loadings
+- [x] **9.7** Visualization: Neuron loadings
   - Show which neurons load onto which oscillators
   - Heatmap of C matrix
 

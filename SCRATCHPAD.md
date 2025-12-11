@@ -3,8 +3,8 @@
 ## Current Status
 
 - **Date**: 2025-12-11
-- **Working on**: Milestone 7 COMPLETE - All 8 tasks done
-- **Next**: Milestone 8 - End-to-End Tests
+- **Working on**: Milestone 9 COMPLETE - Demo Notebook done
+- **Next**: All milestones complete!
 
 ## Milestone 1 Summary (COMPLETE)
 
@@ -471,10 +471,111 @@ Implemented end-to-end model class tests in `TestSwitchingSpikeOscillatorModelEn
 - Added detailed scientific justification for 50% discrete state accuracy threshold
 - Comprehensive documentation of numerical stability considerations
 
-### Next: Milestone 8 - End-to-End Tests
+## Milestone 8 Summary (COMPLETE)
 
-Milestone 7 is now COMPLETE. Next tasks are:
-- 8.1 `test_switching_spike_oscillator_em_monotonic`
-- 8.2 `test_switching_spike_oscillator_recovers_parameters`
-- 8.3 `test_switching_spike_oscillator_vs_non_switching`
-- 8.4 `test_collapse_to_state_conditional`
+All 4 tasks completed:
+
+- 8.1 `test_switching_spike_oscillator_em_monotonic` - EM convergence properties with Laplace approximation
+- 8.2 `test_switching_spike_oscillator_recovers_parameters` - Comprehensive parameter recovery test
+- 8.3 `test_switching_spike_oscillator_vs_non_switching` - Compare S=1 switching vs non-switching model
+- 8.4 `test_collapse_to_state_conditional` - Verify Gaussian mixture collapse math
+
+### Key Implementation Details (Milestone 8)
+
+#### Task 8.1: EM Convergence Test
+
+- Tests overall improvement (final LL > initial LL), NOT strict per-iteration monotonicity
+- Scientific rationale: Laplace approximation causes observed LL to decrease even when Q(θ) increases
+- Tests numerical stability (no NaN/Inf), substantial improvement (best > initial + 10.0)
+
+#### Task 8.2: Parameter Recovery Test
+
+- Tests discrete transition matrix recovery with quantitative checks (diag > 0.5, off-diag < 0.5)
+- Tests spectral radius recovery within 30% tolerance, handling label switching
+- Validates PSD process covariance with appropriate scale
+- **Does NOT test state correlation**: Weak observation coupling (~5% rate modulation) provides insufficient information for state inference
+
+#### Task 8.3: Switching vs Non-Switching Comparison
+
+- Uses `_e_step()` directly to avoid parameter re-initialization by `fit()`
+- Sets identical fixed parameters in both models
+- Tests log-likelihood similarity (<1.0 diff)
+- Tests high correlation (>0.8) between smoothed means
+- **Key insight**: `fit()` always re-initializes parameters, overwriting manual settings
+
+#### Task 8.4: Gaussian Mixture Collapse Verification
+
+- Verifies `collapse_gaussian_mixture_per_discrete_state` mathematical correctness
+- Tests state-conditional means/covs match manual calculations
+- Tests collapsed covariances are symmetric and PSD
+- Tests law of total variance: collapsed trace >= average pair trace
+- Edge cases: uniform mixing weights, deterministic (one-hot) weights
+
+### Key Technical Insights from Milestone 8
+
+1. **Laplace approximation non-monotonicity**: EM with approximate E-steps can have observed LL decrease even when the true variational bound Q(θ) increases
+2. **Weak observations**: Spike weights at 0.05 scale provide only ~5% rate modulation - insufficient for reliable state inference
+3. **Latent space non-identifiability**: Without fixed observation parameters, latent space has arbitrary rotation/scaling
+4. **fit() re-initialization**: By design, `fit()` always calls `_initialize_parameters()` - use `_e_step()` directly for fixed-parameter inference
+
+## Milestone 9 Summary (COMPLETE)
+
+All 7 tasks completed:
+
+- 9.1 Set up notebook with imports and random seed
+- 9.2 Simulate data section (2 oscillators, 2 discrete states, 10 neurons)
+- 9.3 Fit model section with progress logging
+- 9.4 Visualization: Discrete states
+- 9.5 Visualization: Oscillator trajectories
+- 9.6 Visualization: Learned coupling
+- 9.7 Visualization: Neuron loadings
+
+### Key Implementation Details (Milestone 9)
+
+#### Demo Notebook Structure
+
+Created `notebooks/switching_spike_oscillator_demo.py` (paired with `.ipynb` via jupytext):
+
+1. **Setup**: JAX 64-bit precision, imports, random seed (42)
+2. **Simulation**: 1000 timesteps, 2 oscillators (4D latent), 10 neurons, 2 discrete states
+   - State 0: Slower oscillations (6, 10 Hz)
+   - State 1: Faster oscillations (8, 14 Hz)
+   - High self-transition probability (0.98)
+3. **Model Fitting**: EM algorithm with convergence monitoring
+4. **Visualizations**:
+   - Simulated data overview (spikes, discrete states, oscillator trajectories)
+   - EM convergence plot
+   - True vs inferred discrete states with accuracy
+   - True vs smoothed oscillator trajectories with correlation
+   - Learned vs true transition matrices
+   - Neuron loadings heatmap
+
+#### Demo Results (Typical Run)
+
+- EM converges in ~22 iterations with significant improvement (+8000 nats)
+- Discrete state accuracy: ~65% (above 50% chance)
+- Oscillator 1 correlation: ~0.77 (strong tracking)
+- Oscillator 2 correlation: ~0.23 (moderate tracking)
+- Mean absolute correlation: ~0.50
+- Spectral radius recovery: close to ground truth (0.9835 vs 0.98 for state 0)
+- Baseline firing rate recovery: 7.93 Hz learned vs 8.0 Hz true
+
+#### Important Caveats Documented
+
+1. **Latent space non-identifiability**: Without fixed observation parameters, latent space has arbitrary sign/rotation. Handled via absolute correlations.
+2. **Observation coupling strength**: Performance depends on spike weight magnitude (0.5 scale used in demo)
+3. **Laplace approximation**: Can cause small EM monotonicity violations
+
+### Project Complete
+
+All 9 milestones of the Switching Spike-Based Oscillator Networks implementation are now complete:
+
+1. ✅ Milestone 1: Core Point-Process Update
+2. ✅ Milestone 2: Switching Filter
+3. ✅ Milestone 3: Smoother Integration
+4. ✅ Milestone 4: Simulation Utilities
+5. ✅ Milestone 5: Spike GLM M-Step
+6. ✅ Milestone 6: Dynamics M-Step Verification
+7. ✅ Milestone 7: Model Class
+8. ✅ Milestone 8: End-to-End Tests
+9. ✅ Milestone 9: Demo Notebook
