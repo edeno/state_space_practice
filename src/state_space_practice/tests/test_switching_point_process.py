@@ -3597,3 +3597,384 @@ class TestSwitchingSpikeOscillatorModelInitializeParameters:
         # Random components should differ
         assert not jnp.allclose(model1.init_mean, model2.init_mean)
         assert not jnp.allclose(model1.spike_params.weights, model2.spike_params.weights)
+
+
+class TestSwitchingSpikeOscillatorModelEStep:
+    """Tests for SwitchingSpikeOscillatorModel._e_step() method (Task 7.3)."""
+
+    def test_e_step_runs_without_error(self) -> None:
+        """_e_step should run without error on valid data."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_oscillators = 2
+        n_neurons = 5
+        n_discrete_states = 2
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        key = jax.random.PRNGKey(42)
+        model._initialize_parameters(key)
+
+        # Generate spikes
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        # E-step should not raise
+        marginal_ll = model._e_step(spikes)
+
+        # Should return a finite scalar
+        assert jnp.isfinite(marginal_ll)
+
+    def test_e_step_returns_scalar_log_likelihood(self) -> None:
+        """_e_step should return a scalar marginal log-likelihood."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 30
+        n_neurons = 4
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        marginal_ll = model._e_step(spikes)
+
+        # Should be a scalar (0-D array)
+        assert marginal_ll.shape == ()
+        assert jnp.isfinite(marginal_ll)
+
+    def test_e_step_stores_smoother_state_cond_mean(self) -> None:
+        """_e_step should store smoother_state_cond_mean with correct shape."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_oscillators = 2
+        n_neurons = 5
+        n_discrete_states = 3
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+
+        assert hasattr(model, "smoother_state_cond_mean")
+        assert model.smoother_state_cond_mean.shape == (
+            n_time,
+            n_latent,
+            n_discrete_states,
+        )
+        assert jnp.all(jnp.isfinite(model.smoother_state_cond_mean))
+
+    def test_e_step_stores_smoother_state_cond_cov(self) -> None:
+        """_e_step should store smoother_state_cond_cov with correct shape."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_oscillators = 2
+        n_neurons = 5
+        n_discrete_states = 3
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+
+        assert hasattr(model, "smoother_state_cond_cov")
+        assert model.smoother_state_cond_cov.shape == (
+            n_time,
+            n_latent,
+            n_latent,
+            n_discrete_states,
+        )
+        assert jnp.all(jnp.isfinite(model.smoother_state_cond_cov))
+
+    def test_e_step_stores_smoother_discrete_state_prob(self) -> None:
+        """_e_step should store smoother_discrete_state_prob with correct shape."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_neurons = 5
+        n_discrete_states = 3
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+
+        assert hasattr(model, "smoother_discrete_state_prob")
+        assert model.smoother_discrete_state_prob.shape == (n_time, n_discrete_states)
+        # Probabilities should sum to 1
+        prob_sums = jnp.sum(model.smoother_discrete_state_prob, axis=1)
+        np.testing.assert_allclose(prob_sums, jnp.ones(n_time), rtol=1e-5)
+        # Probabilities should be non-negative
+        assert jnp.all(model.smoother_discrete_state_prob >= 0)
+
+    def test_e_step_stores_smoother_joint_discrete_state_prob(self) -> None:
+        """_e_step should store smoother_joint_discrete_state_prob with correct shape."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_neurons = 5
+        n_discrete_states = 3
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+
+        assert hasattr(model, "smoother_joint_discrete_state_prob")
+        # Joint probabilities: p(S_t, S_{t+1} | y_{1:T})
+        # Shape: (n_time - 1, n_discrete_states, n_discrete_states)
+        assert model.smoother_joint_discrete_state_prob.shape == (
+            n_time - 1,
+            n_discrete_states,
+            n_discrete_states,
+        )
+        assert jnp.all(jnp.isfinite(model.smoother_joint_discrete_state_prob))
+
+    def test_e_step_stores_smoother_pair_cond_cross_cov(self) -> None:
+        """_e_step should store smoother_pair_cond_cross_cov for M-step."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_oscillators = 2
+        n_neurons = 5
+        n_discrete_states = 2
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+
+        assert hasattr(model, "smoother_pair_cond_cross_cov")
+        # Shape: (n_time - 1, n_latent, n_latent, n_discrete_states, n_discrete_states)
+        assert model.smoother_pair_cond_cross_cov.shape == (
+            n_time - 1,
+            n_latent,
+            n_latent,
+            n_discrete_states,
+            n_discrete_states,
+        )
+        assert jnp.all(jnp.isfinite(model.smoother_pair_cond_cross_cov))
+
+    def test_e_step_stores_smoother_pair_cond_means(self) -> None:
+        """_e_step should store smoother_pair_cond_means for M-step."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_oscillators = 2
+        n_neurons = 5
+        n_discrete_states = 2
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+
+        assert hasattr(model, "smoother_pair_cond_means")
+        # Shape: (n_time - 1, n_latent, n_discrete_states, n_discrete_states)
+        assert model.smoother_pair_cond_means.shape == (
+            n_time - 1,
+            n_latent,
+            n_discrete_states,
+            n_discrete_states,
+        )
+        assert jnp.all(jnp.isfinite(model.smoother_pair_cond_means))
+
+    def test_e_step_single_discrete_state(self) -> None:
+        """_e_step should work with single discrete state."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 30
+        n_neurons = 4
+        n_discrete_states = 1
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        marginal_ll = model._e_step(spikes)
+
+        # Should work without error
+        assert jnp.isfinite(marginal_ll)
+        # Discrete probabilities should all be 1.0 for single state
+        np.testing.assert_allclose(
+            model.smoother_discrete_state_prob, jnp.ones((n_time, 1)), rtol=1e-5
+        )
+
+    def test_e_step_all_zero_spikes(self) -> None:
+        """_e_step should handle all zero spikes (silent neurons)."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 30
+        n_neurons = 4
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        # All zeros - silent neurons
+        spikes = jnp.zeros((n_time, n_neurons))
+
+        marginal_ll = model._e_step(spikes)
+
+        # Should work without error
+        assert jnp.isfinite(marginal_ll)
+        # All smoother outputs should be finite
+        assert jnp.all(jnp.isfinite(model.smoother_state_cond_mean))
+        assert jnp.all(jnp.isfinite(model.smoother_discrete_state_prob))
+
+    def test_e_step_high_spike_counts(self) -> None:
+        """_e_step should handle high spike counts."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 25
+        n_neurons = 3
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        # High spike counts
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 10.0, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        marginal_ll = model._e_step(spikes)
+
+        # Should work without error
+        assert jnp.isfinite(marginal_ll)
+        # All smoother outputs should be finite
+        assert jnp.all(jnp.isfinite(model.smoother_state_cond_mean))
+        assert jnp.all(jnp.isfinite(model.smoother_discrete_state_prob))

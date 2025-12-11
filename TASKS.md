@@ -233,10 +233,10 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
   - Initialize continuous initial state
   - Added shape validation via `_validate_parameter_shapes()`
 
-- [ ] **7.3** Implement `_e_step()` method
+- [x] **7.3** Implement `_e_step()` method
   - Call `switching_point_process_filter`
-  - Call `switching_point_process_smoother`
-  - Store smoother outputs as attributes
+  - Call `switching_kalman_smoother` (observation-model agnostic)
+  - Store smoother outputs as attributes for M-step
   - Return marginal log-likelihood
 
 - [ ] **7.4** Implement `_m_step_dynamics()` method

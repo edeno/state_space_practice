@@ -98,6 +98,7 @@ from state_space_practice.switching_kalman import (
     _scale_likelihood,
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture_per_discrete_state,
+    switching_kalman_smoother,
 )
 
 
@@ -1492,3 +1493,90 @@ class SwitchingSpikeOscillatorModel:
                 f"({self.n_neurons}, {self.n_latent}), "
                 f"got {self.spike_params.weights.shape}."
             )
+
+    def _e_step(self, spikes: Array) -> Array:
+        """E-step: Run filter and smoother, store posterior statistics.
+
+        Performs the expectation step of the EM algorithm:
+        1. Runs the switching point-process filter to compute filtered posteriors
+        2. Runs the switching Kalman smoother (observation-model agnostic)
+        3. Stores smoother outputs as model attributes for the M-step
+
+        Parameters
+        ----------
+        spikes : Array, shape (n_time, n_neurons)
+            Observed spike counts for all neurons at each timestep.
+
+        Returns
+        -------
+        marginal_log_likelihood : Array, shape ()
+            Marginal log-likelihood log p(y_{1:T}) computed during filtering.
+
+        Notes
+        -----
+        After calling this method, the following attributes are set:
+        - smoother_state_cond_mean: E[x_t | y_{1:T}, S_t=j]
+        - smoother_state_cond_cov: Cov[x_t | y_{1:T}, S_t=j]
+        - smoother_discrete_state_prob: P(S_t=j | y_{1:T})
+        - smoother_joint_discrete_state_prob: P(S_t=j, S_{t+1}=k | y_{1:T})
+        - smoother_pair_cond_cross_cov: Cov[x_{t+1}, x_t | y_{1:T}, S_t=j, S_{t+1}=k]
+        - smoother_pair_cond_means: E[x_t | y_{1:T}, S_t=j, S_{t+1}=k]
+
+        These are the sufficient statistics needed by the M-step for dynamics
+        parameter updates via `switching_kalman_maximization_step`.
+        """
+        # Build log-intensity function from current spike parameters
+        def log_intensity_func(state: Array) -> Array:
+            """Compute log-intensity for all neurons given latent state."""
+            return self.spike_params.baseline + self.spike_params.weights @ state
+
+        # Run the switching point-process filter
+        (
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_state_prob,
+            last_pair_cond_filter_mean,
+            marginal_log_likelihood,
+        ) = switching_point_process_filter(
+            init_state_cond_mean=self.init_mean,
+            init_state_cond_cov=self.init_cov,
+            init_discrete_state_prob=self.init_discrete_state_prob,
+            spikes=spikes,
+            discrete_transition_matrix=self.discrete_transition_matrix,
+            continuous_transition_matrix=self.continuous_transition_matrix,
+            process_cov=self.process_cov,
+            dt=self.dt,
+            log_intensity_func=log_intensity_func,
+        )
+
+        # Run the switching Kalman smoother (observation-model agnostic)
+        # The smoother operates on Gaussian posteriors regardless of observation model
+        (
+            _,  # overall_smoother_mean - marginalized over discrete states
+            _,  # overall_smoother_cov - marginalized over discrete states
+            smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob,
+            _,  # overall_smoother_cross_cov - marginalized over discrete states
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+            pair_cond_smoother_cross_covs,
+            pair_cond_smoother_means,
+        ) = switching_kalman_smoother(
+            filter_mean=state_cond_filter_mean,
+            filter_cov=state_cond_filter_cov,
+            filter_discrete_state_prob=filter_discrete_state_prob,
+            last_filter_conditional_cont_mean=last_pair_cond_filter_mean,
+            process_cov=self.process_cov,
+            continuous_transition_matrix=self.continuous_transition_matrix,
+            discrete_state_transition_matrix=self.discrete_transition_matrix,
+        )
+
+        # Store smoother outputs as model attributes for M-step
+        self.smoother_state_cond_mean = state_cond_smoother_means
+        self.smoother_state_cond_cov = state_cond_smoother_covs
+        self.smoother_discrete_state_prob = smoother_discrete_state_prob
+        self.smoother_joint_discrete_state_prob = smoother_joint_discrete_state_prob
+        self.smoother_pair_cond_cross_cov = pair_cond_smoother_cross_covs
+        self.smoother_pair_cond_means = pair_cond_smoother_means
+
+        return marginal_log_likelihood

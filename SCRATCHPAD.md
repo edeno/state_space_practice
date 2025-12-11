@@ -3,8 +3,8 @@
 ## Current Status
 
 - **Date**: 2025-12-11
-- **Working on**: Milestone 7 - Tasks 7.1 and 7.2 COMPLETE
-- **Current Task**: Task 7.3 - Implement `_e_step()` method
+- **Working on**: Milestone 7 - Tasks 7.1, 7.2, and 7.3 COMPLETE
+- **Current Task**: Task 7.4 - Implement `_m_step_dynamics()` method
 
 ## Milestone 1 Summary (COMPLETE)
 
@@ -262,6 +262,38 @@ Implemented `SwitchingSpikeOscillatorModel._initialize_parameters()` with:
 - Edge cases (single discrete state)
 - Reproducibility and randomness
 
-### Next: Task 7.3
+### Task 7.3 (COMPLETE)
 
-Implement `_e_step()` method
+Implemented `SwitchingSpikeOscillatorModel._e_step()` method with:
+
+- Builds `log_intensity_func` closure from current spike parameters
+- Calls `switching_point_process_filter` with model parameters
+- Calls `switching_kalman_smoother` (observation-model agnostic) with filter outputs
+- Stores all 6 required smoother outputs as model attributes for M-step:
+  - `smoother_state_cond_mean`: E[x_t | y_{1:T}, S_t=j]
+  - `smoother_state_cond_cov`: Cov[x_t | y_{1:T}, S_t=j]
+  - `smoother_discrete_state_prob`: P(S_t=j | y_{1:T})
+  - `smoother_joint_discrete_state_prob`: P(S_t=j, S_{t+1}=k | y_{1:T})
+  - `smoother_pair_cond_cross_cov`: Cov[x_{t+1}, x_t | y_{1:T}, S_t=j, S_{t+1}=k]
+  - `smoother_pair_cond_means`: E[x_t | y_{1:T}, S_t=j, S_{t+1}=k]
+- Returns marginal log-likelihood from filter
+
+#### Tests Added (11 tests)
+
+- Basic functionality (runs without error)
+- Return value is scalar log-likelihood
+- Shape verification for all 6 stored attributes
+- Probability constraints (sum to 1, non-negative)
+- Edge cases: single discrete state, zero spikes, high spike counts
+
+#### Code Review Notes
+
+- APPROVED by code-reviewer agent
+- Clean separation: point-process-specific filtering + observation-agnostic smoothing
+- Correct reuse of `switching_kalman_smoother` without modification
+- Proper closure capture of spike parameters
+- Comprehensive docstring with all stored attributes listed
+
+### Next: Task 7.4
+
+Implement `_m_step_dynamics()` method
