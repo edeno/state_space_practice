@@ -159,29 +159,31 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
 
 ### Tasks
 
-- [ ] **5.1** Implement `_single_neuron_glm_loss()` helper
+- [x] **5.1** Implement `_single_neuron_glm_loss()` helper
   - Poisson negative log-likelihood: -sum(y *eta - exp(eta)* dt) where eta = b + c @ m
   - Works with smoother_mean as design matrix
 
-- [ ] **5.2** Implement `_single_neuron_glm_step()` Newton step
+- [x] **5.2** Implement `_single_neuron_glm_step()` Newton step
   - Compute gradient and Hessian of loss
-  - Newton update: params -= H^{-1} @ g
+  - Newton update with backtracking line search for guaranteed descent
   - Return updated params
 
-- [ ] **5.3** Implement `update_spike_glm_params()` function
+- [x] **5.3** Implement `update_spike_glm_params()` function
   - Plug-in method: use smoother_mean directly as design matrix
   - vmap single_neuron_glm over neurons
   - Run max_iter Newton iterations
   - Return updated SpikeObsParams
 
-- [ ] **5.4** Implement second-order expectation variant
+- [x] **5.4** Implement second-order expectation variant
   - Account for E[exp(c @ x)] = exp(c @ m + 0.5 * c @ P @ c)
   - More accurate but requires iterative solve
+  - Added `smoother_cov` and `use_second_order` parameters to `update_spike_glm_params()`
 
-- [ ] **5.5** Write GLM M-step tests
+- [x] **5.5** Write GLM M-step tests
   - `test_glm_mstep_decreases_loss`: Loss decreases after update
   - `test_glm_mstep_output_shapes`: Params have correct shapes
   - `test_glm_mstep_recovers_true_params`: Recovery on simulated data
+  - Additional tests for second-order variant
 
 ---
 

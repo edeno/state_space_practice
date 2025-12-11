@@ -314,6 +314,445 @@ def _point_process_update_per_discrete_state_pair(
     )
 
 
+def _single_neuron_glm_loss(
+    baseline: float,
+    weights: Array,
+    y_n: Array,
+    smoother_mean: Array,
+    dt: float,
+) -> float:
+    """Poisson negative log-likelihood for a single neuron GLM.
+
+    Computes the negative log-likelihood for a Poisson GLM observation model:
+        y_{n,t} ~ Poisson(exp(baseline + weights @ x_t) * dt)
+
+    This is the plug-in method that uses smoother_mean as a point estimate
+    for the latent state x_t.
+
+    Parameters
+    ----------
+    baseline : float
+        Baseline log-rate for the neuron.
+    weights : Array, shape (n_latent,)
+        Linear weights mapping latent state to log-rate.
+    y_n : Array, shape (n_time,)
+        Spike counts for the neuron at each timestep.
+    smoother_mean : Array, shape (n_time, n_latent)
+        Smoothed latent state estimates (used as design matrix).
+    dt : float
+        Time bin width in seconds.
+
+    Returns
+    -------
+    loss : float
+        Negative log-likelihood: -sum_t [y_t * eta_t - exp(eta_t) * dt]
+        where eta_t = baseline + weights @ smoother_mean[t].
+
+    Notes
+    -----
+    The Poisson log-likelihood is:
+        log p(y | eta) = sum_t [y_t * log(lambda_t * dt) - lambda_t * dt - log(y_t!)]
+
+    where lambda_t = exp(eta_t) is the firing rate. Since log(y_t!) doesn't
+    depend on parameters, we omit it and return the negative of:
+        sum_t [y_t * eta_t - exp(eta_t) * dt]
+
+    This function is designed to be differentiable via JAX autodiff for
+    gradient-based optimization.
+    """
+    # Linear predictor: eta_t = baseline + weights @ x_t
+    # smoother_mean: (n_time, n_latent), weights: (n_latent,)
+    eta = baseline + smoother_mean @ weights  # (n_time,)
+
+    # Expected spike count: lambda_t * dt = exp(eta_t) * dt
+    expected_counts = jnp.exp(eta) * dt  # (n_time,)
+
+    # Poisson log-likelihood (without log(y!) term):
+    # sum_t [y_t * eta_t - exp(eta_t) * dt]
+    # Note: We include the dt scaling in the expected counts
+    log_likelihood = jnp.sum(y_n * eta - expected_counts)
+
+    # Return negative log-likelihood for minimization
+    return -log_likelihood
+
+
+def _single_neuron_glm_step(
+    baseline: float,
+    weights: Array,
+    y_n: Array,
+    smoother_mean: Array,
+    dt: float,
+) -> tuple[float, Array]:
+    """Single Newton-Raphson step for Poisson GLM parameter optimization.
+
+    Takes one Newton step to minimize the negative log-likelihood
+    of a Poisson GLM observation model. Uses backtracking line search
+    to ensure descent. The update is:
+        params_new = params - alpha * H^{-1} @ g
+
+    where g is the gradient, H is the Hessian, and alpha is determined
+    by backtracking line search.
+
+    Parameters
+    ----------
+    baseline : float
+        Current baseline log-rate for the neuron.
+    weights : Array, shape (n_latent,)
+        Current linear weights mapping latent state to log-rate.
+    y_n : Array, shape (n_time,)
+        Spike counts for the neuron at each timestep.
+    smoother_mean : Array, shape (n_time, n_latent)
+        Smoothed latent state estimates (used as design matrix).
+    dt : float
+        Time bin width in seconds.
+
+    Returns
+    -------
+    new_baseline : float
+        Updated baseline after Newton step.
+    new_weights : Array, shape (n_latent,)
+        Updated weights after Newton step.
+
+    Notes
+    -----
+    For Poisson GLM with log-link, the negative log-likelihood is convex,
+    so Newton's method is guaranteed to converge. The gradient and Hessian are:
+
+        gradient = -X.T @ (y - mu)
+        Hessian = X.T @ diag(mu) @ X
+
+    where X is the design matrix [1, smoother_mean], y is spike counts,
+    and mu = exp(X @ params) * dt is the expected count.
+
+    We add a small regularization to the Hessian diagonal for numerical stability.
+    Backtracking line search ensures the step decreases the objective.
+    """
+    n_latent = weights.shape[0]
+
+    # Build design matrix: [1, smoother_mean] of shape (n_time, 1 + n_latent)
+    n_time = smoother_mean.shape[0]
+    ones = jnp.ones((n_time, 1))
+    design_matrix = jnp.concatenate([ones, smoother_mean], axis=1)  # (n_time, 1+n_latent)
+
+    # Concatenate parameters into a single vector: [baseline, weights]
+    params = jnp.concatenate([jnp.atleast_1d(baseline), weights])  # (1 + n_latent,)
+
+    # Compute linear predictor and expected counts
+    eta = design_matrix @ params  # (n_time,)
+    mu = jnp.exp(eta) * dt  # Expected spike counts (n_time,)
+
+    # Compute gradient: -X.T @ (y - mu)
+    residual = y_n - mu  # (n_time,)
+    gradient = -design_matrix.T @ residual  # (1 + n_latent,)
+
+    # Compute Hessian: X.T @ diag(mu) @ X
+    weighted_design = design_matrix * mu[:, None]  # (n_time, 1+n_latent)
+    hessian = design_matrix.T @ weighted_design  # (1+n_latent, 1+n_latent)
+
+    # Add small regularization for numerical stability
+    reg = 1e-6 * jnp.eye(1 + n_latent)
+    hessian = hessian + reg
+
+    # Newton direction: delta = H^{-1} @ g
+    delta = jnp.linalg.solve(hessian, gradient)
+
+    # Current loss for backtracking line search
+    current_loss = jnp.sum(mu - y_n * eta)  # NLL without constant term
+
+    # Backtracking line search with Armijo condition
+    # Parameters: alpha starts at 1, beta for reduction, c for sufficient decrease
+    beta = 0.5  # Step reduction factor
+    c = 1e-4  # Armijo constant
+
+    # Expected decrease from gradient (for Armijo condition)
+    # directional_derivative = gradient.T @ delta (should be positive for descent)
+    directional_derivative = jnp.dot(gradient, delta)
+
+    def line_search_step(carry, _):
+        alpha, _ = carry
+        new_params_trial = params - alpha * delta
+        eta_trial = design_matrix @ new_params_trial
+        mu_trial = jnp.exp(eta_trial) * dt
+        new_loss = jnp.sum(mu_trial - y_n * eta_trial)
+
+        # Armijo condition: new_loss <= current_loss - c * alpha * directional_derivative
+        sufficient_decrease = new_loss <= current_loss - c * alpha * directional_derivative
+
+        # Reduce alpha if not sufficient decrease
+        new_alpha = jnp.where(sufficient_decrease, alpha, alpha * beta)
+        return (new_alpha, sufficient_decrease), None
+
+    # Run up to 20 backtracking iterations
+    (final_alpha, _), _ = jax.lax.scan(
+        line_search_step, (jnp.array(1.0), jnp.array(False)), None, length=20
+    )
+
+    # Apply final step
+    new_params = params - final_alpha * delta
+
+    # Extract updated baseline and weights
+    new_baseline = new_params[0]
+    new_weights = new_params[1:]
+
+    return new_baseline, new_weights
+
+
+def _single_neuron_glm_step_second_order(
+    baseline: float,
+    weights: Array,
+    y_n: Array,
+    smoother_mean: Array,
+    smoother_cov: Array,
+    dt: float,
+) -> tuple[float, Array]:
+    """Single Newton step for Poisson GLM with second-order expectation.
+
+    Uses the second-order approximation that accounts for state uncertainty:
+        E[exp(c @ x)] = exp(c @ m + 0.5 * c @ P @ c)
+
+    This gives more accurate parameter estimates when the smoother
+    covariance is significant.
+
+    Parameters
+    ----------
+    baseline : float
+        Current baseline log-rate for the neuron.
+    weights : Array, shape (n_latent,)
+        Current linear weights mapping latent state to log-rate.
+    y_n : Array, shape (n_time,)
+        Spike counts for the neuron at each timestep.
+    smoother_mean : Array, shape (n_time, n_latent)
+        Smoothed latent state estimates.
+    smoother_cov : Array, shape (n_time, n_latent, n_latent)
+        Smoothed latent state covariances.
+    dt : float
+        Time bin width in seconds.
+
+    Returns
+    -------
+    new_baseline : float
+        Updated baseline after Newton step.
+    new_weights : Array, shape (n_latent,)
+        Updated weights after Newton step.
+    """
+    n_latent = weights.shape[0]
+    n_time = smoother_mean.shape[0]
+
+    # Build design matrix with intercept: [1, smoother_mean]
+    ones = jnp.ones((n_time, 1))
+    design_matrix = jnp.concatenate([ones, smoother_mean], axis=1)
+
+    # Concatenate parameters
+    params = jnp.concatenate([jnp.atleast_1d(baseline), weights])
+
+    # Compute variance correction: 0.5 * c @ P_t @ c for each timestep
+    # This is a quadratic form: 0.5 * weights @ P_t @ weights
+    def compute_variance_correction(P_t):
+        return 0.5 * weights @ P_t @ weights
+
+    variance_corrections = jax.vmap(compute_variance_correction)(smoother_cov)
+
+    # Compute linear predictor with variance correction
+    eta = design_matrix @ params + variance_corrections  # (n_time,)
+    mu = jnp.exp(eta) * dt  # Expected spike counts with second-order correction
+
+    # For the gradient w.r.t. baseline, the variance correction doesn't depend on it
+    # For the gradient w.r.t. weights, we need d/dc [c @ m + 0.5 * c @ P @ c]
+    #   = m + P @ c
+
+    # The gradient of the expected log-likelihood term exp(eta) w.r.t params is:
+    # d/d_params [sum_t mu_t] = sum_t mu_t * d_eta/d_params
+    #
+    # For the weights component, d_eta/dc = m_t + P_t @ c
+    # For the baseline, d_eta/db = 1
+    #
+    # So we need an "effective design matrix" that accounts for the variance term
+
+    # Effective design matrix for second-order method
+    # Column 0: ones (for baseline)
+    # Columns 1+: m_t + P_t @ weights (for weights)
+    def compute_effective_design_row(m_t, P_t):
+        effective_latent = m_t + P_t @ weights
+        return jnp.concatenate([jnp.ones(1), effective_latent])
+
+    effective_design = jax.vmap(compute_effective_design_row)(smoother_mean, smoother_cov)
+
+    # Gradient: -X_eff.T @ (y - mu)
+    residual = y_n - mu
+    gradient = -effective_design.T @ residual
+
+    # Hessian: For Poisson GLM, the Hessian also involves second derivatives
+    # of the variance correction term. For simplicity, we use:
+    # H ≈ X_eff.T @ diag(mu) @ X_eff
+    # This is a good approximation when the variance correction is small
+    weighted_design = effective_design * mu[:, None]
+    hessian = effective_design.T @ weighted_design
+
+    # Regularization
+    reg = 1e-6 * jnp.eye(1 + n_latent)
+    hessian = hessian + reg
+
+    # Newton direction
+    delta = jnp.linalg.solve(hessian, gradient)
+
+    # Current loss for backtracking
+    current_loss = jnp.sum(mu - y_n * (design_matrix @ params + variance_corrections))
+
+    # Backtracking line search
+    beta = 0.5
+    c_armijo = 1e-4
+    directional_derivative = jnp.dot(gradient, delta)
+
+    def line_search_step(carry, _):
+        alpha, _ = carry
+        new_params_trial = params - alpha * delta
+        new_weights_trial = new_params_trial[1:]
+
+        # Recompute variance corrections with new weights
+        def compute_var_corr_trial(P_t):
+            return 0.5 * new_weights_trial @ P_t @ new_weights_trial
+
+        var_corr_trial = jax.vmap(compute_var_corr_trial)(smoother_cov)
+
+        eta_trial = design_matrix @ new_params_trial + var_corr_trial
+        mu_trial = jnp.exp(eta_trial) * dt
+        new_loss = jnp.sum(mu_trial - y_n * (design_matrix @ new_params_trial + var_corr_trial))
+
+        sufficient_decrease = new_loss <= current_loss - c_armijo * alpha * directional_derivative
+        new_alpha = jnp.where(sufficient_decrease, alpha, alpha * beta)
+        return (new_alpha, sufficient_decrease), None
+
+    (final_alpha, _), _ = jax.lax.scan(
+        line_search_step, (jnp.array(1.0), jnp.array(False)), None, length=20
+    )
+
+    new_params = params - final_alpha * delta
+    new_baseline = new_params[0]
+    new_weights = new_params[1:]
+
+    return new_baseline, new_weights
+
+
+def update_spike_glm_params(
+    spikes: Array,
+    smoother_mean: Array,
+    current_params: SpikeObsParams,
+    dt: float,
+    max_iter: int = 10,
+    smoother_cov: Array | None = None,
+    use_second_order: bool = False,
+) -> SpikeObsParams:
+    """M-step for spike observation parameters.
+
+    Updates the spike GLM parameters (baseline, weights) by maximizing
+    E_q[log p(y | x; C, b)] with respect to C and b.
+
+    Two methods are available:
+    - Plug-in method (default): Uses smoother_mean directly, ignoring uncertainty.
+    - Second-order method: Accounts for state uncertainty using the correction
+      E[exp(c @ x)] = exp(c @ m + 0.5 * c @ P @ c).
+
+    This runs Newton-Raphson optimization for each neuron independently
+    for max_iter iterations.
+
+    Parameters
+    ----------
+    spikes : Array, shape (n_time, n_neurons)
+        Observed spike counts for all neurons at each timestep.
+    smoother_mean : Array, shape (n_time, n_latent)
+        Smoothed latent state estimates from the E-step.
+    current_params : SpikeObsParams
+        Current parameter estimates (for warm-starting).
+    dt : float
+        Time bin width in seconds.
+    max_iter : int, default=10
+        Maximum Newton iterations per neuron.
+    smoother_cov : Array | None, shape (n_time, n_latent, n_latent), optional
+        Smoothed latent state covariances. Required if use_second_order=True.
+    use_second_order : bool, default=False
+        If True, use second-order expectation method that accounts for
+        state uncertainty. Requires smoother_cov to be provided.
+
+    Returns
+    -------
+    SpikeObsParams
+        Updated baseline and weights for all neurons.
+
+    Notes
+    -----
+    The plug-in method treats the smoothed mean as a fixed design matrix,
+    ignoring uncertainty in the latent state estimates. This is a common
+    approximation that works well when the smoother covariance is small.
+
+    The second-order method provides more accurate estimates when state
+    uncertainty is significant, at the cost of additional computation.
+    """
+    n_neurons = spikes.shape[1]
+    n_time = smoother_mean.shape[0]
+    n_latent = smoother_mean.shape[1]
+
+    # Validate inputs for second-order method
+    if use_second_order:
+        if smoother_cov is None:
+            raise ValueError("smoother_cov required when use_second_order=True")
+        expected_shape = (n_time, n_latent, n_latent)
+        if smoother_cov.shape != expected_shape:
+            raise ValueError(
+                f"smoother_cov shape {smoother_cov.shape} incompatible with "
+                f"expected shape {expected_shape}"
+            )
+
+    # Initialize with current parameters
+    baselines = current_params.baseline
+    weights = current_params.weights
+
+    if use_second_order:
+
+        # Run Newton iterations for all neurons (second-order)
+        def iterate_all_neurons_second_order(carry, _):
+            baselines, weights = carry
+
+            def update_neuron(neuron_idx):
+                b = baselines[neuron_idx]
+                w = weights[neuron_idx]
+                y_n = spikes[:, neuron_idx]
+                new_b, new_w = _single_neuron_glm_step_second_order(
+                    b, w, y_n, smoother_mean, smoother_cov, dt
+                )
+                return new_b, new_w
+
+            neuron_indices = jnp.arange(n_neurons)
+            new_baselines, new_weights = jax.vmap(update_neuron)(neuron_indices)
+
+            return (new_baselines, new_weights), None
+
+        (final_baselines, final_weights), _ = jax.lax.scan(
+            iterate_all_neurons_second_order, (baselines, weights), None, length=max_iter
+        )
+    else:
+        # Run Newton iterations for all neurons (plug-in)
+        def iterate_all_neurons(carry, _):
+            baselines, weights = carry
+
+            def update_neuron(neuron_idx):
+                b = baselines[neuron_idx]
+                w = weights[neuron_idx]
+                y_n = spikes[:, neuron_idx]
+                new_b, new_w = _single_neuron_glm_step(b, w, y_n, smoother_mean, dt)
+                return new_b, new_w
+
+            neuron_indices = jnp.arange(n_neurons)
+            new_baselines, new_weights = jax.vmap(update_neuron)(neuron_indices)
+
+            return (new_baselines, new_weights), None
+
+        (final_baselines, final_weights), _ = jax.lax.scan(
+            iterate_all_neurons, (baselines, weights), None, length=max_iter
+        )
+
+    return SpikeObsParams(baseline=final_baselines, weights=final_weights)
+
+
 def switching_point_process_filter(
     init_state_cond_mean: Array,
     init_state_cond_cov: Array,

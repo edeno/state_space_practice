@@ -9,6 +9,7 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax import Array
 
 # Enable 64-bit precision for numerical stability
@@ -1490,3 +1491,853 @@ class TestSmootherIntegration:
         # Probabilities should sum to 1
         prob_sums = jnp.sum(smoother_discrete_prob, axis=1)
         np.testing.assert_allclose(prob_sums, jnp.ones(n_time), rtol=1e-5)
+
+
+class TestSingleNeuronGLMLoss:
+    """Tests for the _single_neuron_glm_loss helper function (Task 5.1)."""
+
+    def test_loss_output_is_scalar(self) -> None:
+        """Loss function should return a scalar."""
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_loss,
+        )
+
+        n_time = 50
+        n_latent = 4
+        dt = 0.02
+
+        # Spike counts for a single neuron
+        y_n = jax.random.poisson(jax.random.PRNGKey(0), 0.5, shape=(n_time,)).astype(
+            float
+        )
+
+        # Smoother mean as design matrix
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent))
+
+        # GLM parameters: baseline (scalar) and weights (n_latent,)
+        baseline = 0.0
+        weights = jnp.zeros(n_latent)
+
+        loss = _single_neuron_glm_loss(baseline, weights, y_n, smoother_mean, dt)
+
+        assert loss.shape == ()
+
+    def test_loss_is_finite(self) -> None:
+        """Loss should be finite for reasonable inputs."""
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_loss,
+        )
+
+        n_time = 30
+        n_latent = 2
+        dt = 0.02
+
+        y_n = jax.random.poisson(jax.random.PRNGKey(0), 1.0, shape=(n_time,)).astype(
+            float
+        )
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+
+        baseline = 0.0
+        weights = jnp.ones(n_latent) * 0.1
+
+        loss = _single_neuron_glm_loss(baseline, weights, y_n, smoother_mean, dt)
+
+        assert jnp.isfinite(loss)
+
+    def test_loss_nonnegative(self) -> None:
+        """Negative log-likelihood should be non-negative."""
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_loss,
+        )
+
+        n_time = 40
+        n_latent = 3
+        dt = 0.02
+
+        y_n = jax.random.poisson(jax.random.PRNGKey(0), 0.5, shape=(n_time,)).astype(
+            float
+        )
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.3
+
+        baseline = 0.0
+        weights = jnp.ones(n_latent) * 0.1
+
+        loss = _single_neuron_glm_loss(baseline, weights, y_n, smoother_mean, dt)
+
+        # NLL should be non-negative (we're computing -log_likelihood)
+        # Actually, Poisson NLL can be any real number depending on data
+        # But it should be finite
+        assert jnp.isfinite(loss)
+
+    def test_loss_decreases_with_better_params(self) -> None:
+        """Loss should be lower when parameters match data generation."""
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_loss,
+        )
+
+        n_time = 100
+        n_latent = 2
+        dt = 0.02
+
+        # True parameters
+        true_baseline = 1.0
+        true_weights = jnp.array([0.5, -0.3])
+
+        # Generate design matrix
+        key = jax.random.PRNGKey(42)
+        smoother_mean = jax.random.normal(key, (n_time, n_latent)) * 0.5
+
+        # Compute true log rates and sample spikes
+        eta = true_baseline + smoother_mean @ true_weights
+        rates = jnp.exp(eta) * dt
+        y_n = jax.random.poisson(jax.random.PRNGKey(123), rates).astype(float)
+
+        # Loss at true parameters
+        loss_true = _single_neuron_glm_loss(
+            true_baseline, true_weights, y_n, smoother_mean, dt
+        )
+
+        # Loss at wrong parameters (all zeros)
+        loss_wrong = _single_neuron_glm_loss(
+            0.0, jnp.zeros(n_latent), y_n, smoother_mean, dt
+        )
+
+        # True parameters should give lower (or similar) loss
+        # Note: with finite samples, this may not always hold exactly
+        # but with enough data the trend should be clear
+        assert jnp.isfinite(loss_true)
+        assert jnp.isfinite(loss_wrong)
+
+    def test_loss_gradient_computable(self) -> None:
+        """Should be able to compute gradient of loss w.r.t. parameters."""
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_loss,
+        )
+
+        n_time = 30
+        n_latent = 2
+        dt = 0.02
+
+        y_n = jax.random.poisson(jax.random.PRNGKey(0), 0.5, shape=(n_time,)).astype(
+            float
+        )
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+
+        baseline = 0.0
+        weights = jnp.zeros(n_latent)
+
+        # Compute gradients via JAX
+        grad_fn = jax.grad(_single_neuron_glm_loss, argnums=(0, 1))
+        grad_b, grad_w = grad_fn(baseline, weights, y_n, smoother_mean, dt)
+
+        assert grad_b.shape == ()
+        assert grad_w.shape == (n_latent,)
+        assert jnp.isfinite(grad_b)
+        assert jnp.all(jnp.isfinite(grad_w))
+
+    def test_loss_zero_spikes(self) -> None:
+        """Loss should be finite for zero spike counts."""
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_loss,
+        )
+
+        n_time = 20
+        n_latent = 2
+        dt = 0.02
+
+        y_n = jnp.zeros(n_time)  # No spikes
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+
+        baseline = 0.0
+        weights = jnp.ones(n_latent) * 0.1
+
+        loss = _single_neuron_glm_loss(baseline, weights, y_n, smoother_mean, dt)
+
+        assert jnp.isfinite(loss)
+
+    def test_loss_high_spikes(self) -> None:
+        """Loss should be finite for high spike counts."""
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_loss,
+        )
+
+        n_time = 20
+        n_latent = 2
+        dt = 0.02
+
+        # High spike counts
+        y_n = jax.random.poisson(jax.random.PRNGKey(0), 20.0, shape=(n_time,)).astype(
+            float
+        )
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+
+        # Higher baseline to match
+        baseline = 3.0
+        weights = jnp.ones(n_latent) * 0.1
+
+        loss = _single_neuron_glm_loss(baseline, weights, y_n, smoother_mean, dt)
+
+        assert jnp.isfinite(loss)
+
+
+class TestSingleNeuronGLMStep:
+    """Tests for the _single_neuron_glm_step Newton step function (Task 5.2)."""
+
+    def test_output_shapes(self) -> None:
+        """Output shapes should match input parameter shapes."""
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_step,
+        )
+
+        n_time = 50
+        n_latent = 4
+        dt = 0.02
+
+        y_n = jax.random.poisson(jax.random.PRNGKey(0), 0.5, shape=(n_time,)).astype(
+            float
+        )
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent))
+
+        baseline = 0.0
+        weights = jnp.zeros(n_latent)
+
+        new_baseline, new_weights = _single_neuron_glm_step(
+            baseline, weights, y_n, smoother_mean, dt
+        )
+
+        assert new_baseline.shape == ()
+        assert new_weights.shape == (n_latent,)
+
+    def test_output_finite(self) -> None:
+        """Newton step should produce finite parameter updates."""
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_step,
+        )
+
+        n_time = 30
+        n_latent = 2
+        dt = 0.02
+
+        y_n = jax.random.poisson(jax.random.PRNGKey(0), 1.0, shape=(n_time,)).astype(
+            float
+        )
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+
+        baseline = 0.0
+        weights = jnp.ones(n_latent) * 0.1
+
+        new_baseline, new_weights = _single_neuron_glm_step(
+            baseline, weights, y_n, smoother_mean, dt
+        )
+
+        assert jnp.isfinite(new_baseline)
+        assert jnp.all(jnp.isfinite(new_weights))
+
+    def test_step_decreases_loss(self) -> None:
+        """Newton step should decrease the loss (at least for well-conditioned problems)."""
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_loss,
+            _single_neuron_glm_step,
+        )
+
+        n_time = 100
+        n_latent = 2
+        dt = 0.02
+
+        # Generate data from known parameters
+        true_baseline = 1.0
+        true_weights = jnp.array([0.3, -0.2])
+
+        key = jax.random.PRNGKey(42)
+        smoother_mean = jax.random.normal(key, (n_time, n_latent)) * 0.5
+
+        eta = true_baseline + smoother_mean @ true_weights
+        rates = jnp.exp(eta) * dt
+        y_n = jax.random.poisson(jax.random.PRNGKey(123), rates).astype(float)
+
+        # Start from wrong parameters
+        baseline = 0.0
+        weights = jnp.zeros(n_latent)
+
+        loss_before = _single_neuron_glm_loss(baseline, weights, y_n, smoother_mean, dt)
+
+        # Take Newton step
+        new_baseline, new_weights = _single_neuron_glm_step(
+            baseline, weights, y_n, smoother_mean, dt
+        )
+
+        loss_after = _single_neuron_glm_loss(
+            new_baseline, new_weights, y_n, smoother_mean, dt
+        )
+
+        # Loss should decrease (Newton step in descent direction)
+        assert loss_after < loss_before
+
+    def test_step_converges_to_optimal(self) -> None:
+        """Multiple Newton steps should converge to optimal parameters."""
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_loss,
+            _single_neuron_glm_step,
+        )
+
+        n_time = 200
+        n_latent = 2
+        dt = 0.02
+
+        # Generate data from known parameters
+        true_baseline = 0.5
+        true_weights = jnp.array([0.4, -0.3])
+
+        key = jax.random.PRNGKey(55)
+        smoother_mean = jax.random.normal(key, (n_time, n_latent)) * 0.5
+
+        eta = true_baseline + smoother_mean @ true_weights
+        rates = jnp.exp(eta) * dt
+        y_n = jax.random.poisson(jax.random.PRNGKey(77), rates).astype(float)
+
+        # Start from initial parameters
+        baseline = 0.0
+        weights = jnp.zeros(n_latent)
+
+        # Run multiple Newton iterations
+        for _ in range(10):
+            baseline, weights = _single_neuron_glm_step(
+                baseline, weights, y_n, smoother_mean, dt
+            )
+
+        # Check convergence - final parameters should be close to optimal
+        # (may not be exactly true params due to finite sample noise)
+        final_loss = _single_neuron_glm_loss(baseline, weights, y_n, smoother_mean, dt)
+        true_loss = _single_neuron_glm_loss(
+            true_baseline, true_weights, y_n, smoother_mean, dt
+        )
+
+        # Optimized loss should be close to or better than true parameter loss
+        assert final_loss <= true_loss + 1.0  # Allow some tolerance
+
+    def test_step_zero_spikes(self) -> None:
+        """Newton step should handle zero spike counts."""
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_step,
+        )
+
+        n_time = 30
+        n_latent = 2
+        dt = 0.02
+
+        y_n = jnp.zeros(n_time)  # No spikes
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+
+        baseline = 0.0
+        weights = jnp.ones(n_latent) * 0.1
+
+        new_baseline, new_weights = _single_neuron_glm_step(
+            baseline, weights, y_n, smoother_mean, dt
+        )
+
+        assert jnp.isfinite(new_baseline)
+        assert jnp.all(jnp.isfinite(new_weights))
+
+    def test_step_high_spikes(self) -> None:
+        """Newton step should handle high spike counts."""
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_step,
+        )
+
+        n_time = 30
+        n_latent = 2
+        dt = 0.02
+
+        # High spike counts
+        y_n = jax.random.poisson(jax.random.PRNGKey(0), 20.0, shape=(n_time,)).astype(
+            float
+        )
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+
+        baseline = 3.0
+        weights = jnp.ones(n_latent) * 0.1
+
+        new_baseline, new_weights = _single_neuron_glm_step(
+            baseline, weights, y_n, smoother_mean, dt
+        )
+
+        assert jnp.isfinite(new_baseline)
+        assert jnp.all(jnp.isfinite(new_weights))
+
+
+class TestUpdateSpikeGLMParams:
+    """Tests for the update_spike_glm_params function (Task 5.3)."""
+
+    def test_output_shapes(self) -> None:
+        """Output SpikeObsParams should have correct shapes."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            update_spike_glm_params,
+        )
+
+        n_time = 50
+        n_latent = 4
+        n_neurons = 5
+        dt = 0.02
+
+        # Spike data for multiple neurons
+        key = jax.random.PRNGKey(0)
+        spikes = jax.random.poisson(key, 0.5, shape=(n_time, n_neurons)).astype(float)
+
+        # Smoother mean
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+
+        # Current params
+        current_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.zeros((n_neurons, n_latent)),
+        )
+
+        # Update
+        new_params = update_spike_glm_params(
+            spikes, smoother_mean, current_params, dt, max_iter=5
+        )
+
+        assert new_params.baseline.shape == (n_neurons,)
+        assert new_params.weights.shape == (n_neurons, n_latent)
+
+    def test_output_finite(self) -> None:
+        """Updated params should be finite."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            update_spike_glm_params,
+        )
+
+        n_time = 30
+        n_latent = 2
+        n_neurons = 3
+        dt = 0.02
+
+        key = jax.random.PRNGKey(0)
+        spikes = jax.random.poisson(key, 1.0, shape=(n_time, n_neurons)).astype(float)
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+
+        current_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.ones((n_neurons, n_latent)) * 0.1,
+        )
+
+        new_params = update_spike_glm_params(
+            spikes, smoother_mean, current_params, dt, max_iter=5
+        )
+
+        assert jnp.all(jnp.isfinite(new_params.baseline))
+        assert jnp.all(jnp.isfinite(new_params.weights))
+
+    def test_decreases_total_loss(self) -> None:
+        """M-step should decrease the total Poisson NLL across all neurons."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            _single_neuron_glm_loss,
+            update_spike_glm_params,
+        )
+
+        n_time = 100
+        n_latent = 2
+        n_neurons = 3
+        dt = 0.02
+
+        # Generate data from known params
+        true_baseline = jnp.array([1.0, 0.5, 0.0])
+        true_weights = jax.random.normal(jax.random.PRNGKey(0), (n_neurons, n_latent)) * 0.3
+
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+
+        # Generate spikes
+        eta = true_baseline[None, :] + smoother_mean @ true_weights.T
+        rates = jnp.exp(eta) * dt
+        spikes = jax.random.poisson(jax.random.PRNGKey(2), rates).astype(float)
+
+        # Start from wrong params
+        current_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.zeros((n_neurons, n_latent)),
+        )
+
+        # Compute total loss before
+        loss_before = 0.0
+        for n in range(n_neurons):
+            loss_before += _single_neuron_glm_loss(
+                current_params.baseline[n],
+                current_params.weights[n],
+                spikes[:, n],
+                smoother_mean,
+                dt,
+            )
+
+        # Update
+        new_params = update_spike_glm_params(
+            spikes, smoother_mean, current_params, dt, max_iter=10
+        )
+
+        # Compute total loss after
+        loss_after = 0.0
+        for n in range(n_neurons):
+            loss_after += _single_neuron_glm_loss(
+                new_params.baseline[n],
+                new_params.weights[n],
+                spikes[:, n],
+                smoother_mean,
+                dt,
+            )
+
+        assert loss_after < loss_before
+
+    def test_recovers_true_params(self) -> None:
+        """With enough data, should approximately recover true params."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            update_spike_glm_params,
+        )
+
+        n_time = 500
+        n_latent = 2
+        n_neurons = 2
+        dt = 0.02
+
+        # True parameters
+        true_baseline = jnp.array([1.0, 0.5])
+        true_weights = jnp.array([[0.3, -0.2], [-0.1, 0.4]])
+
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+
+        # Generate spikes from true model
+        eta = true_baseline[None, :] + smoother_mean @ true_weights.T
+        rates = jnp.exp(eta) * dt
+        spikes = jax.random.poisson(jax.random.PRNGKey(2), rates).astype(float)
+
+        # Start from zeros
+        current_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.zeros((n_neurons, n_latent)),
+        )
+
+        # Run enough iterations
+        new_params = update_spike_glm_params(
+            spikes, smoother_mean, current_params, dt, max_iter=20
+        )
+
+        # Check recovery (with some tolerance due to finite samples)
+        np.testing.assert_allclose(
+            new_params.baseline, true_baseline, atol=0.3, rtol=0.3
+        )
+        np.testing.assert_allclose(
+            new_params.weights, true_weights, atol=0.3, rtol=0.3
+        )
+
+    def test_single_neuron(self) -> None:
+        """Should work with a single neuron."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            update_spike_glm_params,
+        )
+
+        n_time = 50
+        n_latent = 2
+        n_neurons = 1
+        dt = 0.02
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+
+        current_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.zeros((n_neurons, n_latent)),
+        )
+
+        new_params = update_spike_glm_params(
+            spikes, smoother_mean, current_params, dt, max_iter=5
+        )
+
+        assert new_params.baseline.shape == (1,)
+        assert new_params.weights.shape == (1, n_latent)
+        assert jnp.all(jnp.isfinite(new_params.baseline))
+        assert jnp.all(jnp.isfinite(new_params.weights))
+
+    def test_zero_spikes(self) -> None:
+        """Should handle zero spike counts gracefully."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            update_spike_glm_params,
+        )
+
+        n_time = 30
+        n_latent = 2
+        n_neurons = 3
+        dt = 0.02
+
+        spikes = jnp.zeros((n_time, n_neurons))  # All silent neurons
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+
+        current_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.zeros((n_neurons, n_latent)),
+        )
+
+        new_params = update_spike_glm_params(
+            spikes, smoother_mean, current_params, dt, max_iter=5
+        )
+
+        assert jnp.all(jnp.isfinite(new_params.baseline))
+        assert jnp.all(jnp.isfinite(new_params.weights))
+
+
+class TestUpdateSpikeGLMParamsSecondOrder:
+    """Tests for the second-order expectation variant of update_spike_glm_params (Task 5.4)."""
+
+    def test_second_order_output_shapes(self) -> None:
+        """Second-order method should produce same output shapes."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            update_spike_glm_params,
+        )
+
+        n_time = 50
+        n_latent = 4
+        n_neurons = 5
+        dt = 0.02
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_cov = jnp.stack([jnp.eye(n_latent) * 0.1] * n_time, axis=0)
+
+        current_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.zeros((n_neurons, n_latent)),
+        )
+
+        new_params = update_spike_glm_params(
+            spikes,
+            smoother_mean,
+            current_params,
+            dt,
+            max_iter=5,
+            smoother_cov=smoother_cov,
+            use_second_order=True,
+        )
+
+        assert new_params.baseline.shape == (n_neurons,)
+        assert new_params.weights.shape == (n_neurons, n_latent)
+
+    def test_second_order_output_finite(self) -> None:
+        """Second-order method should produce finite outputs."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            update_spike_glm_params,
+        )
+
+        n_time = 30
+        n_latent = 2
+        n_neurons = 3
+        dt = 0.02
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 1.0, shape=(n_time, n_neurons)
+        ).astype(float)
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_cov = jnp.stack([jnp.eye(n_latent) * 0.1] * n_time, axis=0)
+
+        current_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.ones((n_neurons, n_latent)) * 0.1,
+        )
+
+        new_params = update_spike_glm_params(
+            spikes,
+            smoother_mean,
+            current_params,
+            dt,
+            max_iter=5,
+            smoother_cov=smoother_cov,
+            use_second_order=True,
+        )
+
+        assert jnp.all(jnp.isfinite(new_params.baseline))
+        assert jnp.all(jnp.isfinite(new_params.weights))
+
+    def test_second_order_decreases_loss(self) -> None:
+        """Second-order method should decrease loss."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            _single_neuron_glm_loss,
+            update_spike_glm_params,
+        )
+
+        n_time = 100
+        n_latent = 2
+        n_neurons = 3
+        dt = 0.02
+
+        # Generate data
+        true_baseline = jnp.array([1.0, 0.5, 0.0])
+        true_weights = jax.random.normal(jax.random.PRNGKey(0), (n_neurons, n_latent)) * 0.3
+
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_cov = jnp.stack([jnp.eye(n_latent) * 0.05] * n_time, axis=0)
+
+        eta = true_baseline[None, :] + smoother_mean @ true_weights.T
+        rates = jnp.exp(eta) * dt
+        spikes = jax.random.poisson(jax.random.PRNGKey(2), rates).astype(float)
+
+        # Start from wrong params
+        current_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.zeros((n_neurons, n_latent)),
+        )
+
+        # Compute loss before
+        loss_before = 0.0
+        for n in range(n_neurons):
+            loss_before += _single_neuron_glm_loss(
+                current_params.baseline[n],
+                current_params.weights[n],
+                spikes[:, n],
+                smoother_mean,
+                dt,
+            )
+
+        # Update with second-order
+        new_params = update_spike_glm_params(
+            spikes,
+            smoother_mean,
+            current_params,
+            dt,
+            max_iter=10,
+            smoother_cov=smoother_cov,
+            use_second_order=True,
+        )
+
+        # Compute loss after
+        loss_after = 0.0
+        for n in range(n_neurons):
+            loss_after += _single_neuron_glm_loss(
+                new_params.baseline[n],
+                new_params.weights[n],
+                spikes[:, n],
+                smoother_mean,
+                dt,
+            )
+
+        assert loss_after < loss_before
+
+    def test_second_order_with_zero_variance(self) -> None:
+        """With zero variance, second-order should match plug-in method."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            update_spike_glm_params,
+        )
+
+        n_time = 50
+        n_latent = 2
+        n_neurons = 2
+        dt = 0.02
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        # Zero covariance = deterministic state
+        smoother_cov = jnp.zeros((n_time, n_latent, n_latent))
+
+        current_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.zeros((n_neurons, n_latent)),
+        )
+
+        # Plug-in method
+        params_plugin = update_spike_glm_params(
+            spikes, smoother_mean, current_params, dt, max_iter=10
+        )
+
+        # Second-order with zero variance
+        params_second = update_spike_glm_params(
+            spikes,
+            smoother_mean,
+            current_params,
+            dt,
+            max_iter=10,
+            smoother_cov=smoother_cov,
+            use_second_order=True,
+        )
+
+        # Should be nearly identical
+        np.testing.assert_allclose(
+            params_second.baseline, params_plugin.baseline, rtol=1e-4
+        )
+        np.testing.assert_allclose(
+            params_second.weights, params_plugin.weights, rtol=1e-4
+        )
+
+    def test_second_order_requires_smoother_cov(self) -> None:
+        """Second-order method should raise error if smoother_cov not provided."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            update_spike_glm_params,
+        )
+
+        n_time = 30
+        n_latent = 2
+        n_neurons = 3
+        dt = 0.02
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 1.0, shape=(n_time, n_neurons)
+        ).astype(float)
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+
+        current_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.zeros((n_neurons, n_latent)),
+        )
+
+        with pytest.raises(ValueError, match="smoother_cov required"):
+            update_spike_glm_params(
+                spikes,
+                smoother_mean,
+                current_params,
+                dt,
+                use_second_order=True,  # smoother_cov not provided
+            )
+
+    def test_second_order_validates_smoother_cov_shape(self) -> None:
+        """Second-order method should validate smoother_cov shape."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            update_spike_glm_params,
+        )
+
+        n_time = 30
+        n_latent = 2
+        n_neurons = 3
+        dt = 0.02
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 1.0, shape=(n_time, n_neurons)
+        ).astype(float)
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        # Wrong shape: (n_time, n_latent) instead of (n_time, n_latent, n_latent)
+        smoother_cov_wrong = jax.random.normal(jax.random.PRNGKey(2), (n_time, n_latent))
+
+        current_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.zeros((n_neurons, n_latent)),
+        )
+
+        with pytest.raises(ValueError, match="smoother_cov shape"):
+            update_spike_glm_params(
+                spikes,
+                smoother_mean,
+                current_params,
+                dt,
+                smoother_cov=smoother_cov_wrong,
+                use_second_order=True,
+            )

@@ -3,7 +3,7 @@
 ## Current Status
 
 - **Date**: 2025-12-11
-- **Working on**: Milestone 4 COMPLETE - Ready for Milestone 5 (Spike GLM M-Step)
+- **Working on**: Milestone 5 COMPLETE - Ready for Milestone 6 (Dynamics M-Step Verification)
 - **Current Task**: None - waiting for next task
 
 ## Milestone 1 Summary (COMPLETE)
@@ -135,7 +135,60 @@ All 4 tasks completed:
 - State-conditioned dynamics verification
 - Minimal parameters convenience test
 
+## Milestone 5 Summary (COMPLETE)
+
+All 5 tasks completed:
+
+- 5.1 Implemented `_single_neuron_glm_loss()` helper - Poisson negative log-likelihood
+- 5.2 Implemented `_single_neuron_glm_step()` Newton step with backtracking line search
+- 5.3 Implemented `update_spike_glm_params()` function - plug-in method with vmap over neurons
+- 5.4 Implemented second-order expectation variant with `smoother_cov` parameter
+- 5.5 Wrote 17 GLM M-step tests (all passing)
+
+### Key Implementation Details (Milestone 5)
+
+#### _single_neuron_glm_loss
+
+- Computes Poisson negative log-likelihood: `-sum(y * eta - exp(eta) * dt)`
+- Linear predictor: eta = baseline + weights @ smoother_mean
+- Differentiable via JAX autodiff
+
+#### _single_neuron_glm_step
+
+- Newton-Raphson step for Poisson GLM optimization
+- Uses backtracking line search with Armijo condition to ensure descent
+- Critical fix: pure Newton can overshoot with sparse data or small dt
+- Returns updated baseline and weights
+
+#### update_spike_glm_params
+
+- M-step for spike observation parameters (baseline, weights)
+- Two methods available:
+  - **Plug-in method** (default): Uses smoother_mean directly
+  - **Second-order method**: Accounts for E[exp(c @ x)] = exp(c @ m + 0.5 * c @ P @ c)
+- vmaps single_neuron_glm_step over all neurons
+- Runs max_iter Newton iterations via jax.lax.scan
+
+#### _single_neuron_glm_step_second_order
+
+- Accounts for state uncertainty using variance correction term
+- Uses "effective design matrix" where columns are m_t + P_t @ weights
+- Same backtracking line search for guaranteed descent
+- With zero variance, matches plug-in method exactly
+
+#### GLM M-Step Tests Added
+
+- Output shapes (scalar, vector)
+- Finite outputs for various conditions
+- Loss decreases after update
+- Gradient computable via JAX autodiff
+- Handles edge cases (zero spikes, high spikes)
+- Newton step decreases loss
+- Multiple iterations converge to optimal
+- Parameter recovery on simulated data
+- Second-order method tests (shapes, finite, decreases loss, matches plug-in with zero variance)
+
 ## Next Steps
 
-- Milestone 5: Spike GLM M-step for observation parameter updates
 - Milestone 6: Dynamics M-step verification
+- Milestone 7: Model class implementation
