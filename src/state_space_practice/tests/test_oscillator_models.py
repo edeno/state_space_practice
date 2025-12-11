@@ -1092,3 +1092,177 @@ class TestOscillatorModelInputValidation:
                 phase_difference=jnp.zeros((2, 2, 3)),
                 coupling_strength=jnp.zeros((3, 3, 3)),  # Wrong n_osc
             )
+
+
+# ============================================================================
+# Tests for Reparameterized M-step in DIM
+# ============================================================================
+
+
+class TestReparameterizedMstep:
+    """Tests for the reparameterized M-step in DirectedInfluenceModel."""
+
+    @pytest.fixture
+    def dim_synthetic_observations(self):
+        """Generates synthetic observations for DIM fitting tests."""
+        n_time = 200
+        n_sources = 2  # Must match n_oscillators for DIM
+        key = jax.random.PRNGKey(42)
+
+        # Generate oscillatory data
+        k1, k2 = jax.random.split(key)
+        noise = jax.random.normal(k1, (n_time, n_sources)) * 0.5
+
+        t = jnp.arange(n_time) / 100.0
+        oscillation = jnp.sin(2 * jnp.pi * 10 * t)[:, None]
+        observations = oscillation + noise
+
+        return observations
+
+    def test_reparameterized_flag_default_false(self) -> None:
+        """use_reparameterized_mstep should default to False."""
+        model = DirectedInfluenceModel(
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            auto_regressive_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.array([0.1, 0.1]),
+            measurement_variance=0.1,
+            phase_difference=jnp.zeros((2, 2, 2)),
+            coupling_strength=jnp.zeros((2, 2, 2)),
+        )
+        assert model.use_reparameterized_mstep is False
+
+    def test_reparameterized_flag_can_be_set(self) -> None:
+        """use_reparameterized_mstep should be settable to True."""
+        model = DirectedInfluenceModel(
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            auto_regressive_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.array([0.1, 0.1]),
+            measurement_variance=0.1,
+            phase_difference=jnp.zeros((2, 2, 2)),
+            coupling_strength=jnp.zeros((2, 2, 2)),
+            use_reparameterized_mstep=True,
+        )
+        assert model.use_reparameterized_mstep is True
+
+    def test_reparameterized_fit_runs_without_error(
+        self, dim_synthetic_observations
+    ) -> None:
+        """DIM with reparameterized M-step should fit without errors."""
+        model = DirectedInfluenceModel(
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            auto_regressive_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.array([0.1, 0.1]),
+            measurement_variance=0.1,
+            phase_difference=jnp.zeros((2, 2, 2)),
+            coupling_strength=jnp.zeros((2, 2, 2)),
+            use_reparameterized_mstep=True,
+        )
+
+        log_likelihoods = model.fit(
+            dim_synthetic_observations, jax.random.PRNGKey(42), max_iter=5
+        )
+
+        assert len(log_likelihoods) >= 1
+        assert all(jnp.isfinite(ll) for ll in log_likelihoods)
+
+    def test_reparameterized_produces_valid_oscillator_structure(
+        self, dim_synthetic_observations
+    ) -> None:
+        """A should have rotation block structure after reparameterized M-step."""
+        model = DirectedInfluenceModel(
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            auto_regressive_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.array([0.1, 0.1]),
+            measurement_variance=0.1,
+            phase_difference=jnp.zeros((2, 2, 2)),
+            coupling_strength=jnp.zeros((2, 2, 2)),
+            use_reparameterized_mstep=True,
+        )
+
+        model.fit(dim_synthetic_observations, jax.random.PRNGKey(42), max_iter=5)
+
+        # Check each block is a scaled rotation: [[a, -b], [b, a]]
+        for j in range(model.n_discrete_states):
+            A_j = model.continuous_transition_matrix[..., j]
+            for i in range(model.n_oscillators):
+                for k in range(model.n_oscillators):
+                    block = A_j[2 * i : 2 * i + 2, 2 * k : 2 * k + 2]
+                    # Check rotation structure
+                    np.testing.assert_allclose(
+                        block[0, 0], block[1, 1], atol=1e-6,
+                        err_msg=f"Block ({i},{k}) in state {j}: diagonal elements not equal"
+                    )
+                    np.testing.assert_allclose(
+                        block[0, 1], -block[1, 0], atol=1e-6,
+                        err_msg=f"Block ({i},{k}) in state {j}: off-diagonal elements not antisymmetric"
+                    )
+
+    def test_standard_mstep_still_works(self, dim_synthetic_observations) -> None:
+        """Standard M-step (without reparameterization) should still work."""
+        model = DirectedInfluenceModel(
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            auto_regressive_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.array([0.1, 0.1]),
+            measurement_variance=0.1,
+            phase_difference=jnp.zeros((2, 2, 2)),
+            coupling_strength=jnp.zeros((2, 2, 2)),
+            use_reparameterized_mstep=False,
+        )
+
+        log_likelihoods = model.fit(
+            dim_synthetic_observations, jax.random.PRNGKey(42), max_iter=5
+        )
+
+        assert len(log_likelihoods) >= 1
+        assert all(jnp.isfinite(ll) for ll in log_likelihoods)
+
+    def test_reparameterized_updates_public_attributes(
+        self, dim_synthetic_observations
+    ) -> None:
+        """Public oscillator attributes should be updated after fitting."""
+        init_freqs = jnp.array([8.0, 12.0])
+        init_damping = jnp.array([0.95, 0.95])
+        init_coupling = jnp.zeros((2, 2, 2))
+        init_phase = jnp.zeros((2, 2, 2))
+
+        model = DirectedInfluenceModel(
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=init_freqs,
+            auto_regressive_coef=init_damping,
+            process_variance=jnp.array([0.1, 0.1]),
+            measurement_variance=0.1,
+            phase_difference=init_phase,
+            coupling_strength=init_coupling,
+            use_reparameterized_mstep=True,
+        )
+
+        model.fit(dim_synthetic_observations, jax.random.PRNGKey(42), max_iter=5)
+
+        # After fitting, public attributes should have correct shapes
+        assert model.freqs.shape == (2,)
+        assert model.auto_regressive_coef.shape == (2,)
+        assert model.coupling_strength.shape == (2, 2, 2)
+        assert model.phase_difference.shape == (2, 2, 2)
+
+        # Values should be finite
+        assert jnp.all(jnp.isfinite(model.freqs))
+        assert jnp.all(jnp.isfinite(model.auto_regressive_coef))
+        assert jnp.all(jnp.isfinite(model.coupling_strength))
+        assert jnp.all(jnp.isfinite(model.phase_difference))

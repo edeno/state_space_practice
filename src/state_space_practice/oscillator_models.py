@@ -49,11 +49,14 @@ from state_space_practice.oscillator_utils import (
     construct_correlated_noise_process_covariance,
     construct_directed_influence_measurement_matrix,
     construct_directed_influence_transition_matrix,
+    extract_dim_params_from_matrix,
     get_block_slice,
     project_coupled_transition_matrix,
     project_matrix_blockwise,
 )
 from state_space_practice.switching_kalman import (
+    compute_transition_sufficient_stats,
+    optimize_dim_transition_params,
     switching_kalman_filter,
     switching_kalman_maximization_step,
     switching_kalman_smoother,
@@ -177,6 +180,7 @@ class BaseModel(ABC):
         self.smoother_discrete_state_prob: jax.Array
         self.smoother_joint_discrete_state_prob: jax.Array
         self.smoother_pair_cond_cross_cov: jax.Array
+        self.smoother_pair_cond_means: jax.Array  # E[x_t | S_t=i, S_{t+1}=j]
 
     def __repr__(self) -> str:
         """Returns an unambiguous string representation of the model.
@@ -417,6 +421,7 @@ class BaseModel(ABC):
             self.smoother_state_cond_mean,
             self.smoother_state_cond_cov,
             self.smoother_pair_cond_cross_cov,
+            self.smoother_pair_cond_means,  # E[x_t | S_t=i, S_{t+1}=j]
         ) = switching_kalman_smoother(
             filter_mean=filter_mean,
             filter_cov=filter_cov,
@@ -456,6 +461,7 @@ class BaseModel(ABC):
             smoother_discrete_state_prob=self.smoother_discrete_state_prob,
             smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
             pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
+            pair_cond_smoother_means=self.smoother_pair_cond_means,
         )
 
         # Update parameters based on flags
@@ -478,6 +484,7 @@ class BaseModel(ABC):
 
     def fit(
         self,
+        observations: ArrayLike,
         key: jax.random.PRNGKey,
         max_iter: int = 100,
         tolerance: float = 1e-4,
@@ -503,6 +510,7 @@ class BaseModel(ABC):
         log_likelihoods : list[float]
             A list of marginal log-likelihoods at each iteration.
         """
+        observations = jnp.asarray(observations)
         self._initialize_parameters(key)
         log_likelihoods = []
         previous_log_likelihood = -jnp.inf
@@ -955,6 +963,11 @@ class DirectedInfluenceModel(BaseModel):
         Initial phase differences for coupling.
     coupling_strength : jax.Array, shape (n_oscillators, n_oscillators, n_discrete_states)
         Initial coupling strengths.
+    use_reparameterized_mstep : bool, default=False
+        If True, use reparameterized M-step that directly optimizes oscillator
+        parameters (damping, freq, coupling_strength, phase_diff) to maximize
+        the Q-function. This guarantees valid oscillator structure and monotonic
+        log-likelihood increase. If False, use standard M-step with projection.
     """
 
     def __init__(
@@ -968,6 +981,7 @@ class DirectedInfluenceModel(BaseModel):
         measurement_variance: float,
         phase_difference: jax.Array,
         coupling_strength: jax.Array,
+        use_reparameterized_mstep: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -1026,6 +1040,11 @@ class DirectedInfluenceModel(BaseModel):
         self.update_measurement_matrix = False  # H is fixed in DIM
         self.update_process_cov = False  # Q is fixed in DIM
 
+        # Reparameterized M-step option
+        self.use_reparameterized_mstep = use_reparameterized_mstep
+        # Store current oscillator params for warm-starting optimizer
+        self._current_osc_params: Optional[list[dict]] = None
+
     def _initialize_measurement_matrix(self, key: Optional[jax.random.PRNGKey] = None):
         """Initializes H with [1/sqrt(2), 1/sqrt(2)] blocks, constant across states."""
         measurement_matrix = construct_directed_influence_measurement_matrix(
@@ -1065,21 +1084,166 @@ class DirectedInfluenceModel(BaseModel):
         )
         self.process_cov = jnp.stack([process_cov] * self.n_discrete_states, axis=2)
 
-    def _project_parameters(self):
-        """Projects each A_j to preserve its oscillatory/coupling structure.
+    def _m_step(self, observations: ArrayLike) -> None:
+        """Performs the M-step, with optional reparameterized transition update.
 
-        Uses `project_coupled_transition_matrix` which applies specific
-        projections to diagonal and off-diagonal blocks.
+        Parameters
+        ----------
+        observations : ArrayLike, shape (n_time, n_sources)
+            The sequence of observations.
         """
-        self.continuous_transition_matrix = jnp.stack(
-            [
-                project_coupled_transition_matrix(
-                    self.continuous_transition_matrix[..., j]
-                )
-                for j in range(self.n_discrete_states)
-            ],
-            axis=-1,
+        if self.use_reparameterized_mstep:
+            self._m_step_reparameterized(observations)
+        else:
+            super()._m_step(observations)
+
+    def _m_step_reparameterized(self, observations: ArrayLike) -> None:
+        """M-step using reparameterized optimization for A.
+
+        Instead of solving for A directly and projecting, this optimizes
+        the underlying oscillator parameters (damping, freq, coupling_strength,
+        phase_diff) to maximize the Q-function. This guarantees valid oscillator
+        structure by construction.
+
+        Parameters
+        ----------
+        observations : ArrayLike, shape (n_time, n_sources)
+            The sequence of observations.
+        """
+        # First, run the standard M-step for all parameters except A
+        (
+            _,  # A - we'll compute this ourselves
+            H,
+            Q,
+            R,
+            m0,
+            P0,
+            Z,
+            pi0,
+        ) = switching_kalman_maximization_step(
+            obs=observations,
+            state_cond_smoother_means=self.smoother_state_cond_mean,
+            state_cond_smoother_covs=self.smoother_state_cond_cov,
+            smoother_discrete_state_prob=self.smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
+            pair_cond_smoother_means=self.smoother_pair_cond_means,
         )
+
+        # Update non-A parameters based on flags (same as standard M-step)
+        if self.update_measurement_matrix:
+            self.measurement_matrix = H
+        if self.update_process_cov:
+            self.process_cov = Q
+        if self.update_measurement_cov:
+            self.measurement_cov = R
+        if self.update_init_mean:
+            self.init_mean = m0
+        if self.update_init_cov:
+            self.init_cov = P0
+        if self.update_discrete_transition_matrix:
+            self.discrete_transition_matrix = Z
+        self.init_discrete_state_prob = pi0
+
+        # Now optimize A in parameter space for each discrete state
+        if self.update_continuous_transition_matrix:
+            # Compute sufficient statistics for transition matrix
+            gamma1, beta = compute_transition_sufficient_stats(
+                state_cond_smoother_means=self.smoother_state_cond_mean,
+                state_cond_smoother_covs=self.smoother_state_cond_cov,
+                smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
+                pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
+                pair_cond_smoother_means=self.smoother_pair_cond_means,
+            )
+
+            # Initialize current_osc_params if not already done
+            if self._current_osc_params is None:
+                self._current_osc_params = []
+                for j in range(self.n_discrete_states):
+                    params = extract_dim_params_from_matrix(
+                        self.continuous_transition_matrix[..., j],
+                        self.sampling_freq,
+                        self.n_oscillators,
+                    )
+                    self._current_osc_params.append(params)
+
+            # Optimize for each discrete state
+            A_list = []
+            for j in range(self.n_discrete_states):
+                # Get initial params (warm start from previous iteration)
+                init_params = self._current_osc_params[j]
+
+                # Optimize
+                opt_params = optimize_dim_transition_params(
+                    gamma1=gamma1[..., j],
+                    beta=beta[..., j],
+                    init_params=init_params,
+                    sampling_freq=self.sampling_freq,
+                )
+
+                # Store for warm start
+                self._current_osc_params[j] = opt_params
+
+                # Reconstruct A from optimized parameters
+                A_j = construct_directed_influence_transition_matrix(
+                    freqs=opt_params["freq"],
+                    damping_coeffs=opt_params["damping"],
+                    coupling_strengths=opt_params["coupling_strength"],
+                    phase_diffs=opt_params["phase_diff"],
+                    sampling_freq=self.sampling_freq,
+                )
+                A_list.append(A_j)
+
+            self.continuous_transition_matrix = jnp.stack(A_list, axis=-1)
+
+            # Update public oscillator attributes to reflect optimized values
+            self._update_public_oscillator_params()
+
+    def _update_public_oscillator_params(self) -> None:
+        """Update public oscillator attributes from optimized parameters.
+
+        After the reparameterized M-step, syncs the private _current_osc_params
+        to the public attributes (freqs, auto_regressive_coef, coupling_strength,
+        phase_difference) so downstream code can inspect the learned network.
+        """
+        if self._current_osc_params is None:
+            return
+
+        # Stack per-state values into arrays with state as last dimension
+        # freqs and damping: shape (n_osc,) averaged across states
+        # (they should be similar across states, so we average)
+        freqs_list = [p["freq"] for p in self._current_osc_params]
+        damping_list = [p["damping"] for p in self._current_osc_params]
+
+        # For freqs and damping, take mean across states (they're per-oscillator params)
+        self.freqs = jnp.mean(jnp.stack(freqs_list, axis=-1), axis=-1)
+        self.auto_regressive_coef = jnp.mean(jnp.stack(damping_list, axis=-1), axis=-1)
+
+        # coupling_strength and phase_diff: shape (n_osc, n_osc, n_discrete_states)
+        coupling_list = [p["coupling_strength"] for p in self._current_osc_params]
+        phase_list = [p["phase_diff"] for p in self._current_osc_params]
+
+        self.coupling_strength = jnp.stack(coupling_list, axis=-1)
+        self.phase_difference = jnp.stack(phase_list, axis=-1)
+
+    def _project_parameters(self):
+        """Projects parameters to valid space.
+
+        With reparameterized M-step, A is already valid by construction,
+        so no projection is needed. With standard M-step, projects each A_j
+        to preserve oscillatory/coupling structure.
+        """
+        if not self.use_reparameterized_mstep:
+            # Only project if using standard M-step
+            self.continuous_transition_matrix = jnp.stack(
+                [
+                    project_coupled_transition_matrix(
+                        self.continuous_transition_matrix[..., j]
+                    )
+                    for j in range(self.n_discrete_states)
+                ],
+                axis=-1,
+            )
 
     def fit(
         self,

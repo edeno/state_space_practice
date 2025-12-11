@@ -500,6 +500,7 @@ def switching_kalman_smoother(
     jax.Array,  # State conditional smoother means
     jax.Array,  # State conditional smoother covariances
     jax.Array,  # Pair conditional smoother cross covariances
+    jax.Array,  # Pair conditional smoother means
 ]:
     """Switching Kalman smoother for a linear Gaussian state space model with discrete states.
 
@@ -523,6 +524,8 @@ def switching_kalman_smoother(
     state_cond_smoother_means : jax.Array, shape (n_time, n_cont_states, n_discrete_states)
     state_cond_smoother_covs : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
     pair_cond_smoother_cross_covs : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+    pair_cond_smoother_means : jax.Array, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+        E[X_t | y_{1:T}, S_t=j, S_{t+1}=k] - needed for correct M-step beta computation.
     """
 
     def _step(
@@ -648,6 +651,7 @@ def switching_kalman_smoother(
             state_cond_smoother_means,
             state_cond_smoother_covs,
             pair_cond_smoother_cross_covs,
+            pair_cond_smoother_mean,  # E[X_t | y_{1:T}, S_t=j, S_{t+1}=k]
         )
 
     init_carry = (
@@ -666,6 +670,7 @@ def switching_kalman_smoother(
         state_cond_smoother_means,
         state_cond_smoother_covs,
         pair_cond_smoother_cross_covs,
+        pair_cond_smoother_means,
     ) = jax.lax.scan(
         _step,
         init_carry,
@@ -705,6 +710,7 @@ def switching_kalman_smoother(
         state_cond_smoother_means,
         state_cond_smoother_covs,
         pair_cond_smoother_cross_covs,
+        pair_cond_smoother_means,
     )
 
 
@@ -747,6 +753,7 @@ def switching_kalman_maximization_step(
     smoother_discrete_state_prob: jax.Array,
     smoother_joint_discrete_state_prob: jax.Array,
     pair_cond_smoother_cross_cov: jax.Array,
+    pair_cond_smoother_means: jax.Array | None = None,
 ) -> tuple[
     jax.Array,
     jax.Array,
@@ -773,6 +780,9 @@ def switching_kalman_maximization_step(
         smoother joint discrete state probabilities.
     pair_cond_smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         smoother cross-covariance.
+    pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+        E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses the exact pair-conditional
+        means for beta computation. If None, uses the approximate factored form.
 
     Returns
     -------
@@ -828,20 +838,6 @@ def switching_kalman_maximization_step(
     )
     gamma2 = gamma - first_gamma
 
-    # gamma1 for transition matrix: must use joint probability P(S_t=i, S_{t+1}=j)
-    # to match the weighting in beta. This sums over the "source" states of transitions.
-    # gamma1[a,b,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_t x_t^T | S_t=i]
-    gamma1 = jnp.einsum(
-        "tij, tabi -> abj",
-        smoother_joint_discrete_state_prob,
-        state_cond_smoother_covs[:-1],
-    ) + jnp.einsum(
-        "tij, tai, tbi -> abj",
-        smoother_joint_discrete_state_prob,
-        state_cond_smoother_means[:-1],
-        state_cond_smoother_means[:-1],
-    )
-
     # gamma: (n_cont_states, n_cont_states, n_discrete_states)
     # beta: (n_cont_states, n_cont_states, n_discrete_states)
     # alpha: (n_obs_dim, n_obs_dim, n_discrete_states)
@@ -855,17 +851,67 @@ def switching_kalman_maximization_step(
         alpha, measurement_matrix, delta, n_time
     )
 
-    beta = jnp.einsum(
-        "tij,tdcij->cdj",
-        smoother_joint_discrete_state_prob,  # P(S_k=i, S_{k+1}=j)
-        pair_cond_smoother_cross_cov,  # E[x_k x_{k+1}^T | S_k=i, S_{k+1}=j]
-    )
-    beta += jnp.einsum(
-        "tdi,tcj,tij->cdj",
-        state_cond_smoother_means[:-1],  # m_t^i (Shape T-1, c, i)
-        state_cond_smoother_means[1:],  # m_{t+1}^j (Shape T-1, d, j)
-        smoother_joint_discrete_state_prob,  # P(S_t=i, S_{t+1}=j) (Shape T-1, i, j)
-    )
+    # Compute beta and gamma1 for transition matrix estimation
+    # These use joint probability P(S_t=i, S_{t+1}=j) weighting
+    if pair_cond_smoother_means is not None:
+        # Use exact pair-conditional means: E[x_t | S_t=i, S_{t+1}=j]
+        # This is the correct formulation that guarantees EM monotonicity
+
+        # gamma1[a,b,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_t x_t^T | S_t=i, S_{t+1}=j]
+        # Note: We need pair-conditional covariances too, but we approximate with
+        # state-conditional covariances (the covariance term is less sensitive)
+        gamma1 = jnp.einsum(
+            "tij, tabi -> abj",
+            smoother_joint_discrete_state_prob,
+            state_cond_smoother_covs[:-1],
+        ) + jnp.einsum(
+            "tij, taij, tbij -> abj",
+            smoother_joint_discrete_state_prob,
+            pair_cond_smoother_means,  # E[x_t | S_t=i, S_{t+1}=j]
+            pair_cond_smoother_means,  # E[x_t | S_t=i, S_{t+1}=j]
+        )
+
+        # beta[c,d,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_{t+1} x_t^T | S_t=i, S_{t+1}=j]
+        # = sum_{t,i} P(S_t=i, S_{t+1}=j) * (Cov[x_{t+1}, x_t | ...] + E[x_{t+1}|...] E[x_t|...]^T)
+        beta = jnp.einsum(
+            "tij,tdcij->cdj",
+            smoother_joint_discrete_state_prob,  # P(S_t=i, S_{t+1}=j)
+            pair_cond_smoother_cross_cov,  # Cov[x_{t+1}, x_t | S_t=i, S_{t+1}=j]
+        )
+        # For the mean term, we need E[x_{t+1} | S_t=i, S_{t+1}=j] which we approximate
+        # with E[x_{t+1} | S_{t+1}=j] (state_cond_smoother_means[1:, :, j])
+        # beta[c,d,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_{t+1}|S_{t+1}=j]_c * E[x_t|S_t=i,S_{t+1}=j]_d
+        beta += jnp.einsum(
+            "tdij,tcj,tij->cdj",
+            pair_cond_smoother_means,  # E[x_t | S_t=i, S_{t+1}=j], shape (T-1, d, i, j)
+            state_cond_smoother_means[1:],  # E[x_{t+1} | S_{t+1}=j], shape (T-1, c, j)
+            smoother_joint_discrete_state_prob,  # P(S_t=i, S_{t+1}=j), shape (T-1, i, j)
+        )
+    else:
+        # Approximate factored form (original implementation)
+        # gamma1[a,b,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_t x_t^T | S_t=i]
+        gamma1 = jnp.einsum(
+            "tij, tabi -> abj",
+            smoother_joint_discrete_state_prob,
+            state_cond_smoother_covs[:-1],
+        ) + jnp.einsum(
+            "tij, tai, tbi -> abj",
+            smoother_joint_discrete_state_prob,
+            state_cond_smoother_means[:-1],
+            state_cond_smoother_means[:-1],
+        )
+
+        beta = jnp.einsum(
+            "tij,tdcij->cdj",
+            smoother_joint_discrete_state_prob,  # P(S_k=i, S_{k+1}=j)
+            pair_cond_smoother_cross_cov,  # E[x_k x_{k+1}^T | S_k=i, S_{k+1}=j]
+        )
+        beta += jnp.einsum(
+            "tdi,tcj,tij->cdj",
+            state_cond_smoother_means[:-1],  # m_t^i (Shape T-1, c, i)
+            state_cond_smoother_means[1:],  # m_{t+1}^j (Shape T-1, d, j)
+            smoother_joint_discrete_state_prob,  # P(S_t=i, S_{t+1}=j) (Shape T-1, i, j)
+        )
     # Transition matrix
     continuous_transition_matrix = psd_solve_per_discrete_state(gamma1, beta)
 
@@ -1189,3 +1235,248 @@ def compute_elbo(
     )
 
     return expected_ll + entropy
+
+
+def compute_transition_sufficient_stats(
+    state_cond_smoother_means: jax.Array,
+    state_cond_smoother_covs: jax.Array,
+    smoother_joint_discrete_state_prob: jax.Array,
+    pair_cond_smoother_cross_cov: jax.Array,
+    pair_cond_smoother_means: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Compute sufficient statistics for transition matrix estimation.
+
+    Parameters
+    ----------
+    state_cond_smoother_means : jax.Array, shape (n_time, n_cont_states, n_discrete_states)
+    state_cond_smoother_covs : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
+    smoother_joint_discrete_state_prob : jax.Array, shape (n_time - 1, n_discrete_states, n_discrete_states)
+    pair_cond_smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+    pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+        E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses exact pair-conditional means.
+
+    Returns
+    -------
+    gamma1 : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
+        E[x_t x_t^T] weighted by joint probability P(S_t=i, S_{t+1}=j), summed over i.
+    beta : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
+        E[x_t x_{t+1}^T] weighted by joint probability.
+    """
+    if pair_cond_smoother_means is not None:
+        # Use exact pair-conditional means
+        # gamma1[a,b,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_t x_t^T | S_t=i, S_{t+1}=j]
+        gamma1 = jnp.einsum(
+            "tij, tabi -> abj",
+            smoother_joint_discrete_state_prob,
+            state_cond_smoother_covs[:-1],
+        ) + jnp.einsum(
+            "tij, taij, tbij -> abj",
+            smoother_joint_discrete_state_prob,
+            pair_cond_smoother_means,
+            pair_cond_smoother_means,
+        )
+
+        # beta = E[x_t x_{t+1}^T] weighted by joint probability
+        beta = jnp.einsum(
+            "tij,tdcij->cdj",
+            smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov,
+        )
+        # beta[c,d,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_{t+1}|S_{t+1}=j]_c * E[x_t|S_t=i,S_{t+1}=j]_d
+        beta += jnp.einsum(
+            "tdij,tcj,tij->cdj",
+            pair_cond_smoother_means,  # E[x_t | S_t=i, S_{t+1}=j], shape (T-1, d, i, j)
+            state_cond_smoother_means[1:],  # E[x_{t+1} | S_{t+1}=j], shape (T-1, c, j)
+            smoother_joint_discrete_state_prob,  # P(S_t=i, S_{t+1}=j), shape (T-1, i, j)
+        )
+    else:
+        # Approximate factored form (original implementation)
+        # gamma1[a,b,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_t x_t^T | S_t=i]
+        gamma1 = jnp.einsum(
+            "tij, tabi -> abj",
+            smoother_joint_discrete_state_prob,
+            state_cond_smoother_covs[:-1],
+        ) + jnp.einsum(
+            "tij, tai, tbi -> abj",
+            smoother_joint_discrete_state_prob,
+            state_cond_smoother_means[:-1],
+            state_cond_smoother_means[:-1],
+        )
+
+        # beta = E[x_t x_{t+1}^T] weighted by joint probability
+        beta = jnp.einsum(
+            "tij,tdcij->cdj",
+            smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov,
+        )
+        beta += jnp.einsum(
+            "tdi,tcj,tij->cdj",
+            state_cond_smoother_means[:-1],
+            state_cond_smoother_means[1:],
+            smoother_joint_discrete_state_prob,
+        )
+
+    return gamma1, beta
+
+
+def compute_transition_q_function(
+    A: jax.Array,
+    gamma1: jax.Array,
+    beta: jax.Array,
+) -> float:
+    """Compute the Q-function contribution from transition matrix.
+
+    The Q-function for A (ignoring constants and Q covariance) is:
+        Q(A) ∝ -0.5 * tr(A^T A gamma1 - 2 A^T beta)
+
+    We return the negative Q-function since we want to minimize.
+
+    Parameters
+    ----------
+    A : jax.Array, shape (n_cont, n_cont)
+        Transition matrix.
+    gamma1 : jax.Array, shape (n_cont, n_cont)
+        E[x_t x_t^T] summed over time, weighted by joint discrete state probs.
+    beta : jax.Array, shape (n_cont, n_cont)
+        E[x_t x_{t+1}^T] summed over time, weighted by joint discrete state probs.
+
+    Returns
+    -------
+    float
+        Negative Q-function value (to be minimized).
+    """
+    # We minimize: 0.5 * tr(A^T A gamma1) - tr(A^T beta)
+    # Which is equivalent to maximizing the actual Q-function
+    return 0.5 * jnp.trace(A.T @ A @ gamma1) - jnp.trace(A.T @ beta)
+
+
+def compute_transition_q_from_params(
+    damping: jax.Array,
+    freq: jax.Array,
+    coupling_strength: jax.Array,
+    phase_diff: jax.Array,
+    sampling_freq: float,
+    gamma1: jax.Array,
+    beta: jax.Array,
+) -> float:
+    """Compute Q-function from oscillator parameters.
+
+    This is the objective to minimize in the reparameterized M-step.
+
+    Parameters
+    ----------
+    damping : jax.Array, shape (n_oscillators,)
+        Damping coefficients.
+    freq : jax.Array, shape (n_oscillators,)
+        Frequencies in Hz.
+    coupling_strength : jax.Array, shape (n_oscillators, n_oscillators)
+        Coupling strengths (0 on diagonal).
+    phase_diff : jax.Array, shape (n_oscillators, n_oscillators)
+        Phase differences (0 on diagonal).
+    sampling_freq : float
+        Sampling frequency.
+    gamma1 : jax.Array, shape (n_cont, n_cont)
+        Sufficient statistic.
+    beta : jax.Array, shape (n_cont, n_cont)
+        Sufficient statistic.
+
+    Returns
+    -------
+    float
+        Negative Q-function value (to be minimized).
+    """
+    from state_space_practice.oscillator_utils import (
+        construct_directed_influence_transition_matrix,
+    )
+
+    A = construct_directed_influence_transition_matrix(
+        freqs=freq,
+        damping_coeffs=damping,
+        coupling_strengths=coupling_strength,
+        phase_diffs=phase_diff,
+        sampling_freq=sampling_freq,
+    )
+    return compute_transition_q_function(A, gamma1, beta)
+
+
+def optimize_dim_transition_params(
+    gamma1: jax.Array,
+    beta: jax.Array,
+    init_params: dict,
+    sampling_freq: float,
+    max_iter: int = 100,
+    tol: float = 1e-6,
+) -> dict:
+    """Optimize oscillator parameters to maximize Q-function.
+
+    Uses JAX autodiff + BFGS optimizer.
+
+    Parameters
+    ----------
+    gamma1 : jax.Array, shape (n_cont, n_cont)
+        Sufficient statistic E[x_t x_t^T].
+    beta : jax.Array, shape (n_cont, n_cont)
+        Sufficient statistic E[x_t x_{t+1}^T].
+    init_params : dict
+        Initial parameter values (damping, freq, coupling_strength, phase_diff).
+    sampling_freq : float
+        Sampling frequency.
+    max_iter : int
+        Maximum optimization iterations.
+    tol : float
+        Convergence tolerance.
+
+    Returns
+    -------
+    dict
+        Optimized parameters with keys: damping, freq, coupling_strength, phase_diff.
+    """
+    from jax.scipy.optimize import minimize
+
+    n_osc = len(init_params["damping"])
+
+    def pack_params(params: dict) -> jax.Array:
+        """Flatten params to 1D array for optimizer."""
+        return jnp.concatenate(
+            [
+                params["damping"],
+                params["freq"],
+                params["coupling_strength"].ravel(),
+                params["phase_diff"].ravel(),
+            ]
+        )
+
+    def unpack_params(flat: jax.Array) -> dict:
+        """Unflatten 1D array to param dict."""
+        idx = 0
+        damping = flat[idx : idx + n_osc]
+        idx += n_osc
+        freq = flat[idx : idx + n_osc]
+        idx += n_osc
+        coupling = flat[idx : idx + n_osc * n_osc].reshape(n_osc, n_osc)
+        idx += n_osc * n_osc
+        phase = flat[idx : idx + n_osc * n_osc].reshape(n_osc, n_osc)
+        return {
+            "damping": damping,
+            "freq": freq,
+            "coupling_strength": coupling,
+            "phase_diff": phase,
+        }
+
+    def loss(flat_params: jax.Array) -> float:
+        params = unpack_params(flat_params)
+        return compute_transition_q_from_params(
+            damping=params["damping"],
+            freq=params["freq"],
+            coupling_strength=params["coupling_strength"],
+            phase_diff=params["phase_diff"],
+            sampling_freq=sampling_freq,
+            gamma1=gamma1,
+            beta=beta,
+        )
+
+    # Run optimizer
+    init_flat = pack_params(init_params)
+    result = minimize(loss, init_flat, method="BFGS", tol=tol)
+
+    return unpack_params(result.x)

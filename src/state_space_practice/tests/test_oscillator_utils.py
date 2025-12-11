@@ -17,6 +17,7 @@ from state_space_practice.oscillator_utils import (
     construct_correlated_noise_process_covariance,
     construct_directed_influence_measurement_matrix,
     construct_directed_influence_transition_matrix,
+    extract_dim_params_from_matrix,
     get_block_slice,
     project_coupled_transition_matrix,
     project_matrix_blockwise,
@@ -319,3 +320,94 @@ def test_directed_influence_parametrized(
 
     assert mat_calculated.shape == mat_expected.shape
     assert jnp.allclose(mat_calculated, mat_expected, atol=1e-5)
+
+
+# ============================================================================
+# Tests for extract_dim_params_from_matrix
+# ============================================================================
+
+
+def test_extract_dim_params_roundtrip_simple():
+    """
+    Tests that extract_dim_params_from_matrix can recover parameters
+    used to construct a DIM transition matrix (no coupling case).
+    """
+    n_osc = 2
+    sampling_freq = 100.0
+    freqs = jnp.array([8.0, 12.0])
+    damping = jnp.array([0.95, 0.90])
+    coupling = jnp.zeros((n_osc, n_osc))
+    phase = jnp.zeros((n_osc, n_osc))
+
+    # Construct matrix
+    A = construct_directed_influence_transition_matrix(
+        freqs, damping, coupling, phase, sampling_freq
+    )
+
+    # Extract params
+    params = extract_dim_params_from_matrix(A, sampling_freq, n_osc)
+
+    # Check roundtrip
+    assert jnp.allclose(params["damping"], damping, atol=1e-4)
+    assert jnp.allclose(params["freq"], freqs, atol=0.5)  # freq recovery is less precise
+    assert jnp.allclose(params["coupling_strength"], coupling, atol=1e-4)
+
+
+def test_extract_dim_params_roundtrip_with_coupling():
+    """
+    Tests parameter extraction with non-zero coupling.
+    """
+    n_osc = 2
+    sampling_freq = 100.0
+    freqs = jnp.array([10.0, 15.0])
+    damping = jnp.array([0.95, 0.95])
+    coupling = jnp.array([[0.0, 0.1], [0.05, 0.0]])
+    phase = jnp.array([[0.0, jnp.pi / 4], [jnp.pi / 2, 0.0]])
+
+    # Construct matrix
+    A = construct_directed_influence_transition_matrix(
+        freqs, damping, coupling, phase, sampling_freq
+    )
+
+    # Extract params
+    params = extract_dim_params_from_matrix(A, sampling_freq, n_osc)
+
+    # Check coupling strength recovery (off-diagonal)
+    assert jnp.allclose(params["coupling_strength"][0, 1], coupling[0, 1], atol=1e-4)
+    assert jnp.allclose(params["coupling_strength"][1, 0], coupling[1, 0], atol=1e-4)
+
+    # Diagonal should be zero
+    assert params["coupling_strength"][0, 0] == 0.0
+    assert params["coupling_strength"][1, 1] == 0.0
+
+
+def test_extract_dim_params_reconstructs_matrix():
+    """
+    Tests that extracted parameters can reconstruct the original matrix.
+    """
+    n_osc = 2
+    sampling_freq = 100.0
+    freqs = jnp.array([8.0, 12.0])
+    damping = jnp.array([0.95, 0.92])
+    coupling = jnp.array([[0.0, 0.05], [0.08, 0.0]])
+    phase = jnp.array([[0.0, jnp.pi / 6], [jnp.pi / 3, 0.0]])
+
+    # Construct original matrix
+    A_original = construct_directed_influence_transition_matrix(
+        freqs, damping, coupling, phase, sampling_freq
+    )
+
+    # Extract params
+    params = extract_dim_params_from_matrix(A_original, sampling_freq, n_osc)
+
+    # Reconstruct matrix
+    A_reconstructed = construct_directed_influence_transition_matrix(
+        params["freq"],
+        params["damping"],
+        params["coupling_strength"],
+        params["phase_diff"],
+        sampling_freq,
+    )
+
+    # Should be close
+    assert jnp.allclose(A_reconstructed, A_original, atol=1e-4)

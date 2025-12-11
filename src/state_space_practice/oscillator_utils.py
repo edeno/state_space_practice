@@ -574,6 +574,91 @@ def project_coupled_transition_matrix(transition_matrix: jax.Array) -> jax.Array
     return jnp.block(projected_block_rows)
 
 
+def extract_dim_params_from_matrix(
+    A: jax.Array,
+    sampling_freq: float,
+    n_oscillators: int,
+) -> dict:
+    """Extract oscillator parameters from a DIM transition matrix.
+
+    This function extracts the underlying oscillator parameters (damping, frequency,
+    coupling strength, phase difference) from a transition matrix that has been
+    constructed using construct_directed_influence_transition_matrix().
+
+    The transition matrix has structure:
+    - Diagonal blocks: damping * R(2π*freq/fs) - sum_incoming_coupling * I
+    - Off-diagonal blocks: coupling_strength * R(phase_diff)
+
+    Parameters
+    ----------
+    A : jax.Array, shape (2*n_osc, 2*n_osc)
+        Transition matrix (assumed to have rotation block structure).
+    sampling_freq : float
+        Sampling frequency in Hz.
+    n_oscillators : int
+        Number of oscillators.
+
+    Returns
+    -------
+    dict with keys:
+        - damping: (n_osc,) - damping coefficients in (0, 1)
+        - freq: (n_osc,) - frequencies in Hz
+        - coupling_strength: (n_osc, n_osc) - coupling strengths (0 on diagonal)
+        - phase_diff: (n_osc, n_osc) - phase differences (0 on diagonal)
+    """
+    damping = jnp.zeros(n_oscillators)
+    freq = jnp.zeros(n_oscillators)
+    coupling_strength = jnp.zeros((n_oscillators, n_oscillators))
+    phase_diff = jnp.zeros((n_oscillators, n_oscillators))
+
+    # First pass: extract off-diagonal coupling parameters
+    for i in range(n_oscillators):
+        for j in range(n_oscillators):
+            if i != j:
+                rows, cols = get_block_slice(i, j)
+                block = A[rows, cols]
+                # Off-diagonal block is: coupling_strength * R(phase_diff)
+                # Extract scale (coupling_strength) and angle (phase_diff)
+                U, s, Vh = jnp.linalg.svd(block)
+                scale = jnp.sqrt(s[0] * s[1])  # geometric mean
+                R = U @ Vh
+                angle = jnp.arctan2(R[1, 0], R[0, 0])
+
+                coupling_strength = coupling_strength.at[i, j].set(scale)
+                phase_diff = phase_diff.at[i, j].set(angle)
+
+    # Second pass: extract diagonal block parameters
+    # Diagonal block is: damping * R(2π*freq/fs) - sum_incoming_coupling * I
+    for i in range(n_oscillators):
+        rows, cols = get_block_slice(i, i)
+        block = A[rows, cols]
+
+        # Add back the sum of incoming coupling to recover the rotation
+        sum_incoming = jnp.sum(coupling_strength[i, :])
+        adjusted_block = block + sum_incoming * IDENTITY_2x2
+
+        # Now adjusted_block should be: damping * R(2π*freq/fs)
+        U, s, Vh = jnp.linalg.svd(adjusted_block)
+        scale = jnp.sqrt(s[0] * s[1])  # this is damping
+        R = U @ Vh
+        angle = jnp.arctan2(R[1, 0], R[0, 0])  # this is 2π*freq/fs
+
+        # Convert angle to frequency
+        frequency = angle * sampling_freq / (2 * jnp.pi)
+        # Handle negative frequencies (wrap to positive)
+        frequency = jnp.where(frequency < 0, frequency + sampling_freq / 2, frequency)
+
+        damping = damping.at[i].set(scale)
+        freq = freq.at[i].set(frequency)
+
+    return {
+        "damping": damping,
+        "freq": freq,
+        "coupling_strength": coupling_strength,
+        "phase_diff": phase_diff,
+    }
+
+
 def project_matrix_blockwise(transition_matrix: jax.Array) -> jax.Array:
     """Projects each 2x2 oscillator block of the transition matrix to the closest
     rotation matrix.

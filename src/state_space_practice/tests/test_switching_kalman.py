@@ -524,6 +524,7 @@ def test_skf_smoother_reduces_to_kf_smoother_single_state(
         skf_scsm,
         skf_sccs,
         skf_pcscc,
+        _,  # pair_cond_smoother_means
     ) = switching_kalman_smoother(
         filter_mean=skf_fm,
         filter_cov=skf_fc,
@@ -669,6 +670,7 @@ def test_m_step_one_state(
         skf_scsm,
         skf_scsc,
         skf_pcscc,
+        _,  # pair_cond_smoother_means
     ) = switching_kalman_smoother(
         filter_mean=skf_fm,
         filter_cov=skf_fc,
@@ -791,6 +793,7 @@ def test_m_step_two_identical_states(
         skf_scsm,
         skf_scsc,
         skf_pcscc,
+        _,  # pair_cond_smoother_means
     ) = switching_kalman_smoother(  # Unpack only the necessary outputs for M-step
         filter_mean=skf_fm,
         filter_cov=skf_fc,
@@ -1280,6 +1283,7 @@ def test_em_monotonic_single_state() -> None:
             state_cond_smoother_means,
             state_cond_smoother_covs,
             pair_cond_cross_cov,
+            _,  # pair_cond_smoother_means
         ) = switching_kalman_smoother(
             filter_mean=filter_mean,
             filter_cov=filter_cov,
@@ -1377,6 +1381,7 @@ def test_em_monotonic_two_identical_states() -> None:
             state_cond_smoother_means,
             state_cond_smoother_covs,
             pair_cond_cross_cov,
+            _,  # pair_cond_smoother_means
         ) = switching_kalman_smoother(
             filter_mean=filter_mean,
             filter_cov=filter_cov,
@@ -1505,6 +1510,7 @@ def test_em_monotonic_distinguishable_states() -> None:
             state_cond_smoother_means,
             state_cond_smoother_covs,
             pair_cond_cross_cov,
+            _,  # pair_cond_smoother_means
         ) = switching_kalman_smoother(
             filter_mean=filter_mean,
             filter_cov=filter_cov,
@@ -1609,6 +1615,7 @@ def test_em_increases_log_likelihood(simple_skf_model: tuple) -> None:
             state_cond_smoother_means,
             state_cond_smoother_covs,
             pair_cond_cross_cov,
+            _,  # pair_cond_smoother_means
         ) = switching_kalman_smoother(
             filter_mean=filter_mean,
             filter_cov=filter_cov,
@@ -1713,6 +1720,7 @@ def test_elbo_monotonic_single_state() -> None:
             state_cond_smoother_means,
             state_cond_smoother_covs,
             pair_cond_cross_cov,
+            _,  # pair_cond_smoother_means
         ) = switching_kalman_smoother(
             filter_mean=filter_mean,
             filter_cov=filter_cov,
@@ -1856,6 +1864,7 @@ def test_elbo_monotonic_two_states() -> None:
             state_cond_smoother_means,
             state_cond_smoother_covs,
             pair_cond_cross_cov,
+            _,  # pair_cond_smoother_means
         ) = switching_kalman_smoother(
             filter_mean=filter_mean,
             filter_cov=filter_cov,
@@ -2195,7 +2204,7 @@ class TestSwitchingKalmanSmootherProperties:
         )
 
         # Run smoother
-        _, _, smoother_prob, _, _, _, _, _ = switching_kalman_smoother(
+        _, _, smoother_prob, _, _, _, _, _, _ = switching_kalman_smoother(
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
@@ -2227,7 +2236,7 @@ class TestSwitchingKalmanSmootherProperties:
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
         )
 
-        _, _, smoother_prob, joint_prob, _, _, _, _ = switching_kalman_smoother(
+        _, _, smoother_prob, joint_prob, _, _, _, _, _ = switching_kalman_smoother(
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
@@ -2597,6 +2606,7 @@ def test_discrete_state_recovery_with_smoother() -> None:
         _state_cond_smoother_means,
         _state_cond_smoother_covs,
         _pair_cond_smoother_cross_covs,
+        _,  # pair_cond_smoother_means
     ) = switching_kalman_smoother(
         filter_mean=state_cond_filter_mean,
         filter_cov=state_cond_filter_cov,
@@ -2913,6 +2923,7 @@ def test_continuous_state_mse_smoother() -> None:
         state_cond_smoother_means,
         _,
         _,
+        _,  # pair_cond_smoother_means
     ) = switching_kalman_smoother(
         filter_mean=state_cond_filter_mean,
         filter_cov=state_cond_filter_cov,
@@ -3117,6 +3128,7 @@ def test_continuous_state_mse_multivariate() -> None:
         state_cond_smoother_means,
         _,
         _,
+        _,  # pair_cond_smoother_means
     ) = switching_kalman_smoother(
         filter_mean=state_cond_filter_mean,
         filter_cov=state_cond_filter_cov,
@@ -3226,6 +3238,7 @@ def run_em(
             state_cond_smoother_means,
             state_cond_smoother_covs,
             pair_cond_smoother_cross_covs,
+            _,  # pair_cond_smoother_means
         ) = switching_kalman_smoother(
             filter_mean=state_cond_filter_mean,
             filter_cov=state_cond_filter_cov,
@@ -3770,6 +3783,7 @@ def run_em_partial(
             state_cond_smoother_means,
             state_cond_smoother_covs,
             pair_cond_smoother_cross_covs,
+            _,  # pair_cond_smoother_means
         ) = switching_kalman_smoother(
             filter_mean=state_cond_filter_mean,
             filter_cov=state_cond_filter_cov,
