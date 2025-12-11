@@ -597,7 +597,19 @@ class CommonOscillatorModel(BaseModel):
             )
         self.process_variance = process_variance
 
+        if not isinstance(measurement_variance, (float, int)):
+            raise ValueError(
+                "measurement_variance must be a scalar (float or int)."
+                f" Got {type(measurement_variance)}."
+            )
+        if measurement_variance <= 0:
+            raise ValueError(
+                "measurement_variance must be positive. " f"Got {measurement_variance}."
+            )
         self.measurement_variance = measurement_variance
+
+        if sampling_freq <= 0:
+            raise ValueError("sampling_freq must be positive. " f"Got {sampling_freq}.")
 
         # COM specific M-step update flags
         self.update_continuous_transition_matrix = False
@@ -697,6 +709,41 @@ class CommonOscillatorModel(BaseModel):
 
         return phase1 - phase2
 
+    def fit(
+        self,
+        observations: jnp.ndarray,
+        key: jax.random.PRNGKey,
+        max_iter: int = 100,
+        tolerance: float = 1e-4,
+    ) -> list[float]:
+        """Fits the model to observations using the EM algorithm.
+
+        Iteratively performs E-steps and M-steps until convergence or
+        the maximum number of iterations is reached.
+
+        Parameters
+        ----------
+        observations : jnp.ndarray, shape (n_time, n_sources)
+            The sequence of observations.
+        key : jax.random.PRNGKey
+            JAX random number generator key for initialization.
+        max_iter : int, optional
+            Maximum number of EM iterations, by default 100.
+        tolerance : float, optional
+            Convergence tolerance for log-likelihood, by default 1e-4.
+
+        Returns
+        -------
+        log_likelihoods : list[float]
+            A list of marginal log-likelihoods at each iteration.
+        """
+        if observations.shape[1] != self.n_sources:
+            raise ValueError(
+                f"observations must have {self.n_sources} sources, "
+                f"got {observations.shape[1]}."
+            )
+        return super().fit(observations, key, max_iter, tolerance)
+
 
 class CorrelatedNoiseModel(BaseModel):
     """Correlated Noise Model (CNM).
@@ -745,6 +792,14 @@ class CorrelatedNoiseModel(BaseModel):
         )
         if n_oscillators != self.n_sources:
             raise ValueError("For CNM, n_sources must equal n_oscillators.")
+        if freqs.shape != (n_oscillators,):
+            raise ValueError(
+                f"Shape mismatch: freqs {freqs.shape} vs n_oscillators {n_oscillators}"
+            )
+        if auto_regressive_coef.shape != (n_oscillators,):
+            raise ValueError(
+                f"Shape mismatch: auto_regressive_coef {auto_regressive_coef.shape} vs n_oscillators {n_oscillators}"
+            )
         if process_variance.shape != (n_oscillators, n_discrete_states):
             raise ValueError(
                 "process_variance must have shape (n_oscillators, n_discrete_states)."
