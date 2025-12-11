@@ -3,8 +3,8 @@
 ## Current Status
 
 - **Date**: 2025-12-11
-- **Working on**: Milestone 7 - Tasks 7.1-7.6 COMPLETE
-- **Current Task**: Task 7.7 - Add `_project_parameters()` method
+- **Working on**: Milestone 7 - Tasks 7.1-7.7 COMPLETE
+- **Current Task**: Task 7.8 - Write model class tests
 
 ## Milestone 1 Summary (COMPLETE)
 
@@ -401,6 +401,40 @@ Implemented `SwitchingSpikeOscillatorModel.fit()` method with:
 - Robust test for EM improvement allows Laplace approximation-induced small violations
 - Clean JAX best practices (explicit key threading, Python list for results)
 
-### Next: Task 7.7
+### Task 7.7 (COMPLETE)
 
-Add `_project_parameters()` method
+Implemented `SwitchingSpikeOscillatorModel._project_parameters()` method with:
+
+- **Transition matrix projection**: Projects each A_j to preserve oscillatory block structure
+  - Uses `project_coupled_transition_matrix` from `oscillator_utils.py`
+  - Each 2x2 diagonal block is projected to closest scaled rotation [[a, -b], [b, a]]
+  - Preserves oscillatory dynamics that M-step can break
+- **Process covariance projection**: Ensures each Q_j is:
+  - Symmetric: Q_j = (Q_j + Q_j.T) / 2
+  - Positive semi-definite: Clips negative eigenvalues to 1e-8
+  - Uses eigendecomposition approach for numerical stability
+- **Integration with fit()**: Called after M-step in each EM iteration
+
+#### Tests Added (9 tests)
+
+- `test_project_parameters_runs_without_error`: Basic sanity check
+- `test_project_parameters_ensures_psd_process_cov`: PSD property verified via eigenvalues
+- `test_project_parameters_preserves_transition_matrix_shape`: Shape invariance
+- `test_project_parameters_preserves_process_cov_shape`: Shape invariance
+- `test_project_parameters_produces_finite_values`: Numerical stability
+- `test_project_parameters_single_discrete_state`: Edge case
+- `test_project_parameters_preserves_oscillator_block_structure`: Block structure preservation
+- `test_project_parameters_ensures_symmetric_process_cov`: Symmetry check
+- `test_project_parameters_called_during_fit`: Integration with EM loop
+
+#### Code Review Notes
+
+- APPROVED by code-reviewer agent
+- Correct mathematical approach for both projections
+- Comprehensive docstring explaining purpose and idempotency
+- Integration properly placed after M-step calls
+- Excellent test coverage (9 tests covering functional, mathematical, edge cases)
+
+### Next: Task 7.8
+
+Write model class tests for end-to-end validation

@@ -255,7 +255,7 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
   - Input validation (shape, dtype)
   - Return list of log-likelihoods
 
-- [ ] **7.7** Add `_project_parameters()` method
+- [x] **7.7** Add `_project_parameters()` method
   - Apply `project_coupled_transition_matrix` if using DIM structure
   - Ensure Q is PSD
 

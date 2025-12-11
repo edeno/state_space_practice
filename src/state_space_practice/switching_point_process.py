@@ -92,6 +92,7 @@ from state_space_practice.utils import check_converged
 from state_space_practice.oscillator_utils import (
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
+    project_coupled_transition_matrix,
 )
 from state_space_practice.point_process_kalman import (
     _point_process_laplace_update,
@@ -1714,6 +1715,67 @@ class SwitchingSpikeOscillatorModel:
             dt=self.dt,
         )
 
+    def _project_parameters(self) -> None:
+        """Project estimated parameters onto valid parameter spaces.
+
+        This method ensures that model parameters satisfy their structural
+        constraints after the M-step:
+
+        1. **Transition matrix projection**: Projects each A_j to preserve
+           oscillatory block structure using `project_coupled_transition_matrix`.
+           Each 2x2 diagonal block is projected to the closest scaled rotation
+           matrix [[a, -b], [b, a]], which preserves oscillatory dynamics.
+
+        2. **Process covariance projection**: Ensures each Q_j is:
+           - Symmetric: Q_j = (Q_j + Q_j.T) / 2
+           - Positive semi-definite: Clips negative eigenvalues to a small
+             positive value (1e-8)
+
+        Notes
+        -----
+        This method should be called after `_m_step_dynamics()` in the EM loop.
+        The projections are necessary because:
+
+        - The unconstrained M-step for A can break the oscillatory block
+          structure that is expected for coupled oscillator dynamics
+        - The M-step for Q can produce non-symmetric or non-PSD matrices
+          due to numerical issues or insufficient data for some discrete states
+
+        The projections are idempotent: calling them multiple times has the
+        same effect as calling once.
+        """
+        # Project each transition matrix to preserve oscillatory block structure
+        self.continuous_transition_matrix = jnp.stack(
+            [
+                project_coupled_transition_matrix(
+                    self.continuous_transition_matrix[:, :, j]
+                )
+                for j in range(self.n_discrete_states)
+            ],
+            axis=-1,
+        )
+
+        # Project each process covariance to ensure PSD
+        projected_Q_list = []
+        for j in range(self.n_discrete_states):
+            Q_j = self.process_cov[:, :, j]
+
+            # Ensure symmetry
+            Q_j = (Q_j + Q_j.T) / 2
+
+            # Ensure PSD by eigenvalue clipping
+            eigenvalues, eigenvectors = jnp.linalg.eigh(Q_j)
+            # Clip negative eigenvalues to small positive value
+            eigenvalues_clipped = jnp.maximum(eigenvalues, 1e-8)
+            # Reconstruct PSD matrix
+            Q_j_psd = eigenvectors @ jnp.diag(eigenvalues_clipped) @ eigenvectors.T
+            # Ensure symmetry again (numerical precision)
+            Q_j_psd = (Q_j_psd + Q_j_psd.T) / 2
+
+            projected_Q_list.append(Q_j_psd)
+
+        self.process_cov = jnp.stack(projected_Q_list, axis=-1)
+
     def fit(
         self,
         spikes: ArrayLike,
@@ -1851,5 +1913,8 @@ class SwitchingSpikeOscillatorModel:
             # M-step: update parameters
             self._m_step_dynamics()
             self._m_step_spikes(spikes)
+
+            # Project parameters to valid spaces (oscillatory structure, PSD)
+            self._project_parameters()
 
         return log_likelihoods

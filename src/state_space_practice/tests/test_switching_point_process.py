@@ -5226,7 +5226,6 @@ class TestSwitchingSpikeOscillatorModelFit:
         n_time = 50
         n_neurons = 5
         n_oscillators = 2
-        n_latent = 2 * n_oscillators
 
         model = SwitchingSpikeOscillatorModel(
             n_oscillators=n_oscillators,
@@ -5330,3 +5329,287 @@ class TestSwitchingSpikeOscillatorModelFit:
 
         with pytest.raises(ValueError, match="must match n_neurons"):
             model.fit(spikes_wrong_neurons, max_iter=3, key=jax.random.PRNGKey(42))
+
+
+class TestSwitchingSpikeOscillatorModelProjectParameters:
+    """Tests for SwitchingSpikeOscillatorModel._project_parameters() method (Task 7.7)."""
+
+    def test_project_parameters_runs_without_error(self) -> None:
+        """_project_parameters() should run without error after initialization."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        # Should not raise any exceptions
+        model._project_parameters()
+
+    def test_project_parameters_ensures_psd_process_cov(self) -> None:
+        """_project_parameters() should ensure process covariance is PSD."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        # Perturb Q to potentially break PSD property
+        perturbation = jax.random.normal(
+            jax.random.PRNGKey(1), model.process_cov.shape
+        ) * 0.1
+        model.process_cov = model.process_cov + perturbation
+
+        # After projection, Q should be PSD for each discrete state
+        model._project_parameters()
+
+        for j in range(model.n_discrete_states):
+            Q_j = model.process_cov[:, :, j]
+            eigenvalues = jnp.linalg.eigvalsh(Q_j)
+            # All eigenvalues should be non-negative (PSD)
+            assert jnp.all(eigenvalues >= -1e-10), (
+                f"Q for state {j} is not PSD: min eigenvalue = {eigenvalues.min()}"
+            )
+
+    def test_project_parameters_preserves_transition_matrix_shape(self) -> None:
+        """_project_parameters() should preserve continuous_transition_matrix shape."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=3,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        original_shape = model.continuous_transition_matrix.shape
+
+        model._project_parameters()
+
+        assert model.continuous_transition_matrix.shape == original_shape
+
+    def test_project_parameters_preserves_process_cov_shape(self) -> None:
+        """_project_parameters() should preserve process_cov shape."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=3,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        original_shape = model.process_cov.shape
+
+        model._project_parameters()
+
+        assert model.process_cov.shape == original_shape
+
+    def test_project_parameters_produces_finite_values(self) -> None:
+        """_project_parameters() should produce finite values."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        model._project_parameters()
+
+        assert jnp.all(jnp.isfinite(model.continuous_transition_matrix))
+        assert jnp.all(jnp.isfinite(model.process_cov))
+
+    def test_project_parameters_single_discrete_state(self) -> None:
+        """_project_parameters() should work with single discrete state."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=1,  # Single discrete state
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        # Should not raise any exceptions
+        model._project_parameters()
+
+        # Check shapes
+        assert model.continuous_transition_matrix.shape == (4, 4, 1)
+        assert model.process_cov.shape == (4, 4, 1)
+
+    def test_project_parameters_preserves_oscillator_block_structure(self) -> None:
+        """_project_parameters() should preserve oscillatory block structure in A.
+
+        Each 2x2 diagonal block of the transition matrix should have the form
+        of a scaled rotation matrix: [[a, -b], [b, a]].
+        """
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        # Perturb A slightly to break perfect structure
+        perturbation = jax.random.normal(
+            jax.random.PRNGKey(1), model.continuous_transition_matrix.shape
+        ) * 0.05
+        model.continuous_transition_matrix = (
+            model.continuous_transition_matrix + perturbation
+        )
+
+        model._project_parameters()
+
+        # Check diagonal blocks have rotation structure
+        for j in range(model.n_discrete_states):
+            A_j = model.continuous_transition_matrix[:, :, j]
+            n_osc = model.n_oscillators
+
+            for i in range(n_osc):
+                block = A_j[2 * i : 2 * i + 2, 2 * i : 2 * i + 2]
+                # Diagonal elements should be equal: a, a
+                np.testing.assert_allclose(
+                    block[0, 0], block[1, 1], rtol=1e-5,
+                    err_msg=f"Diagonal block {i} for state {j} has unequal diagonals"
+                )
+                # Off-diagonal elements should be negatives: -b, b
+                np.testing.assert_allclose(
+                    block[0, 1], -block[1, 0], rtol=1e-5,
+                    err_msg=f"Diagonal block {i} for state {j} has incorrect off-diagonals"
+                )
+
+    def test_project_parameters_ensures_symmetric_process_cov(self) -> None:
+        """_project_parameters() should ensure process covariance is symmetric."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        # Perturb Q to break symmetry
+        non_symmetric_perturbation = jnp.zeros_like(model.process_cov)
+        # Add a non-symmetric perturbation
+        for j in range(model.n_discrete_states):
+            Q_j = model.process_cov[:, :, j]
+            # Make slightly non-symmetric
+            Q_j_new = Q_j + 0.01 * jax.random.normal(
+                jax.random.PRNGKey(10 + j), Q_j.shape
+            )
+            non_symmetric_perturbation = non_symmetric_perturbation.at[:, :, j].set(
+                Q_j_new - Q_j
+            )
+        model.process_cov = model.process_cov + non_symmetric_perturbation
+
+        model._project_parameters()
+
+        for j in range(model.n_discrete_states):
+            Q_j = model.process_cov[:, :, j]
+            np.testing.assert_allclose(
+                Q_j, Q_j.T, rtol=1e-10,
+                err_msg=f"Q for state {j} is not symmetric after projection"
+            )
+
+    def test_project_parameters_called_during_fit(self) -> None:
+        """_project_parameters() should be called during fit() after M-step.
+
+        This test verifies that fit() properly calls _project_parameters() by
+        checking that the oscillatory block structure is preserved through
+        multiple EM iterations.
+        """
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 4
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        # Run fit for a few iterations
+        model.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
+
+        # After fit, transition matrices should still have valid block structure
+        for j in range(model.n_discrete_states):
+            A_j = model.continuous_transition_matrix[:, :, j]
+            n_osc = model.n_oscillators
+
+            for i in range(n_osc):
+                block = A_j[2 * i : 2 * i + 2, 2 * i : 2 * i + 2]
+                # Diagonal elements should be equal
+                np.testing.assert_allclose(
+                    block[0, 0], block[1, 1], rtol=1e-4,
+                    err_msg=f"After fit: diagonal block {i} for state {j} broken"
+                )
+                # Off-diagonal elements should be negatives
+                np.testing.assert_allclose(
+                    block[0, 1], -block[1, 0], rtol=1e-4,
+                    err_msg=f"After fit: off-diagonal block {i} for state {j} broken"
+                )
+
+        # Process covariance should be PSD
+        for j in range(model.n_discrete_states):
+            Q_j = model.process_cov[:, :, j]
+            eigenvalues = jnp.linalg.eigvalsh(Q_j)
+            assert jnp.all(eigenvalues >= -1e-8), (
+                f"After fit: Q for state {j} is not PSD"
+            )
