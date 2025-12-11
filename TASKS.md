@@ -293,7 +293,7 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
   - Compare to `PointProcessModel` from point_process_kalman.py
   - Smoothed means should be similar
 
-- [ ] **8.4** `test_collapse_to_state_conditional`
+- [x] **8.4** `test_collapse_to_state_conditional`
   - Verify collapse math is correct
 
 ---

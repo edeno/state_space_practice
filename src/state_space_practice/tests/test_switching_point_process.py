@@ -6500,3 +6500,170 @@ class TestMilestone8EndToEnd:
             rtol=1e-5,
             err_msg="With S=1, all discrete state probs should be 1.0"
         )
+
+    def test_collapse_to_state_conditional(self) -> None:
+        """Task 8.4: Verify Gaussian mixture collapse math is correct.
+
+        Tests that `collapse_gaussian_mixture_per_discrete_state` correctly
+        computes state-conditional moments from pair-conditional moments.
+
+        The collapse formula for mean:
+            E[X | S_t=j] = sum_i P(S_{t-1}=i | S_t=j) * E[X | S_{t-1}=i, S_t=j]
+
+        The collapse formula for covariance (law of total variance):
+            Cov[X | S_t=j] = E[Cov[X | S_{t-1}=i, S_t=j] | S_t=j]
+                           + Cov[E[X | S_{t-1}=i, S_t=j] | S_t=j]
+
+        The second term accounts for uncertainty in which previous state
+        we came from ("variance of the conditional means").
+
+        This test verifies the implementation matches these formulas.
+        """
+        from state_space_practice.switching_kalman import (
+            collapse_gaussian_mixture_per_discrete_state,
+        )
+
+        # Setup: 2 previous states (i), 2 next states (j), 3 latent dims
+        n_prev_states = 2
+        n_next_states = 2
+        n_latent = 3
+
+        # Create known pair-conditional means: E[X | S_{t-1}=i, S_t=j]
+        # Shape: (n_latent, n_prev_states, n_next_states)
+        # For testing, make them clearly different
+        pair_cond_means = jnp.array([
+            # X dim 0
+            [[1.0, 2.0],   # i=0: j=0, j=1
+             [3.0, 4.0]],  # i=1: j=0, j=1
+            # X dim 1
+            [[0.5, 1.5],
+             [2.5, 3.5]],
+            # X dim 2
+            [[-1.0, -2.0],
+             [-3.0, -4.0]],
+        ])  # Shape: (3, 2, 2)
+
+        # Create known pair-conditional covariances: Cov[X | S_{t-1}=i, S_t=j]
+        # Shape: (n_latent, n_latent, n_prev_states, n_next_states)
+        # Use diagonal covariances for simplicity
+        pair_cond_covs = jnp.zeros((n_latent, n_latent, n_prev_states, n_next_states))
+        for i in range(n_prev_states):
+            for j in range(n_next_states):
+                pair_cond_covs = pair_cond_covs.at[:, :, i, j].set(
+                    jnp.eye(n_latent) * (0.1 + 0.1 * i + 0.05 * j)
+                )
+
+        # Mixing weights: P(S_{t-1}=i | S_t=j) for each j
+        # These are the backward conditional probabilities
+        # Shape: (n_prev_states, n_next_states)
+        mixing_weights = jnp.array([
+            [0.7, 0.3],  # For j=0: P(i=0|j=0)=0.7, P(i=1|j=0)=0.3
+            [0.4, 0.6],  # For j=1: P(i=0|j=1)=0.4, P(i=1|j=1)=0.6
+        ]).T  # Transpose to (n_prev_states, n_next_states)
+
+        # Run the collapse function
+        state_cond_means, state_cond_covs = collapse_gaussian_mixture_per_discrete_state(
+            pair_cond_means, pair_cond_covs, mixing_weights
+        )
+
+        # Manually compute expected state-conditional means
+        # E[X | S_t=j] = sum_i P(S_{t-1}=i | S_t=j) * E[X | S_{t-1}=i, S_t=j]
+        expected_means = jnp.zeros((n_latent, n_next_states))
+        for j in range(n_next_states):
+            for i in range(n_prev_states):
+                expected_means = expected_means.at[:, j].add(
+                    mixing_weights[i, j] * pair_cond_means[:, i, j]
+                )
+
+        # Manually compute expected state-conditional covariances
+        # Cov[X | S_t=j] = E[Cov] + Cov[E]
+        #   = sum_i P(i|j) * Cov[X|i,j] + sum_i P(i|j) * (m_ij - m_j)(m_ij - m_j)^T
+        expected_covs = jnp.zeros((n_latent, n_latent, n_next_states))
+        for j in range(n_next_states):
+            mean_j = expected_means[:, j]
+            for i in range(n_prev_states):
+                w_ij = mixing_weights[i, j]
+                # E[Cov] term
+                expected_covs = expected_covs.at[:, :, j].add(
+                    w_ij * pair_cond_covs[:, :, i, j]
+                )
+                # Cov[E] term: w_ij * (m_ij - m_j)(m_ij - m_j)^T
+                diff = pair_cond_means[:, i, j] - mean_j
+                expected_covs = expected_covs.at[:, :, j].add(
+                    w_ij * jnp.outer(diff, diff)
+                )
+
+        # Test 1: State-conditional means match expected
+        np.testing.assert_allclose(
+            state_cond_means, expected_means, rtol=1e-5,
+            err_msg="Collapsed means should match expected values"
+        )
+
+        # Test 2: State-conditional covariances match expected
+        np.testing.assert_allclose(
+            state_cond_covs, expected_covs, rtol=1e-5,
+            err_msg="Collapsed covariances should match expected values"
+        )
+
+        # Test 3: Collapsed covariances should be symmetric
+        for j in range(n_next_states):
+            np.testing.assert_allclose(
+                state_cond_covs[:, :, j], state_cond_covs[:, :, j].T, rtol=1e-10,
+                err_msg=f"Collapsed covariance for state {j} should be symmetric"
+            )
+
+        # Test 4: Collapsed covariances should be PSD
+        for j in range(n_next_states):
+            eigenvalues = jnp.linalg.eigvalsh(state_cond_covs[:, :, j])
+            assert jnp.all(eigenvalues >= -1e-10), (
+                f"Collapsed covariance for state {j} should be PSD. "
+                f"Min eigenvalue: {jnp.min(eigenvalues)}"
+            )
+
+        # Test 5: Collapsed covariance should be >= pair-conditional covariance
+        # (by law of total variance, adding "variance of means" term)
+        for j in range(n_next_states):
+            # Average pair-conditional covariance
+            avg_pair_cov = jnp.zeros((n_latent, n_latent))
+            for i in range(n_prev_states):
+                avg_pair_cov += mixing_weights[i, j] * pair_cond_covs[:, :, i, j]
+
+            # Collapsed covariance should have larger eigenvalues (more uncertainty)
+            collapsed_trace = jnp.trace(state_cond_covs[:, :, j])
+            avg_pair_trace = jnp.trace(avg_pair_cov)
+            assert collapsed_trace >= avg_pair_trace - 1e-10, (
+                f"Collapsed covariance trace ({collapsed_trace:.4f}) should >= "
+                f"average pair-conditional trace ({avg_pair_trace:.4f}) for state {j}"
+            )
+
+        # Test 6: Edge case - uniform mixing weights
+        uniform_weights = jnp.ones((n_prev_states, n_next_states)) / n_prev_states
+        uniform_means, uniform_covs = collapse_gaussian_mixture_per_discrete_state(
+            pair_cond_means, pair_cond_covs, uniform_weights
+        )
+
+        # With uniform weights, mean should be simple average
+        for j in range(n_next_states):
+            expected_uniform_mean = jnp.mean(pair_cond_means[:, :, j], axis=1)
+            np.testing.assert_allclose(
+                uniform_means[:, j], expected_uniform_mean, rtol=1e-5,
+                err_msg=f"Uniform weights: mean for state {j} should be simple average"
+            )
+
+        # Test 7: Edge case - deterministic (one-hot) mixing weights
+        deterministic_weights = jnp.array([[1.0, 0.0], [0.0, 1.0]]).T  # i=j
+        det_means, det_covs = collapse_gaussian_mixture_per_discrete_state(
+            pair_cond_means, pair_cond_covs, deterministic_weights
+        )
+
+        # With deterministic weights, should just select the matching pair
+        for j in range(n_next_states):
+            # When P(i=j | S_t=j) = 1, collapsed = pair(i=j, j)
+            np.testing.assert_allclose(
+                det_means[:, j], pair_cond_means[:, j, j], rtol=1e-5,
+                err_msg="Deterministic weights: mean should equal diagonal pair"
+            )
+            np.testing.assert_allclose(
+                det_covs[:, :, j], pair_cond_covs[:, :, j, j], rtol=1e-5,
+                err_msg="Deterministic weights: cov should equal diagonal pair"
+            )
