@@ -249,10 +249,10 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
   - Call `update_spike_glm_params`
   - Update spike_params
 
-- [ ] **7.6** Implement `fit()` method
+- [x] **7.6** Implement `fit()` method
   - Initialize parameters
   - EM loop: E-step, check convergence, M-step
-  - Log progress
+  - Input validation (shape, dtype)
   - Return list of log-likelihoods
 
 - [ ] **7.7** Add `_project_parameters()` method

@@ -85,8 +85,10 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 from jax import Array
+from jax.typing import ArrayLike
 
 from state_space_practice.kalman import symmetrize
+from state_space_practice.utils import check_converged
 from state_space_practice.oscillator_utils import (
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
@@ -1711,3 +1713,143 @@ class SwitchingSpikeOscillatorModel:
             current_params=self.spike_params,
             dt=self.dt,
         )
+
+    def fit(
+        self,
+        spikes: ArrayLike,
+        max_iter: int = 50,
+        tol: float = 1e-4,
+        key: Array | None = None,
+    ) -> list[float]:
+        """Fit the model to spike data using the EM algorithm.
+
+        Performs Expectation-Maximization (EM) to learn model parameters from
+        observed spike data. The algorithm alternates between:
+        - E-step: Compute posterior distributions over latent states
+        - M-step: Update model parameters to maximize expected log-likelihood
+
+        Parameters
+        ----------
+        spikes : ArrayLike, shape (n_time, n_neurons)
+            Observed spike counts for all neurons at each timestep.
+        max_iter : int, default=50
+            Maximum number of EM iterations.
+        tol : float, default=1e-4
+            Convergence tolerance. The algorithm stops early if the relative
+            change in log-likelihood is less than `tol`:
+                |LL_new - LL_old| / avg < tol
+            where avg = (|LL_new| + |LL_old|) / 2.
+        key : Array | None, optional
+            JAX random key for parameter initialization. If None, uses PRNGKey(0).
+
+        Returns
+        -------
+        log_likelihoods : list[float]
+            Marginal log-likelihood at each EM iteration. Length is the number
+            of iterations performed (may be less than max_iter if converged).
+
+        Raises
+        ------
+        ValueError
+            If spikes has wrong shape (must be 2D with n_neurons columns).
+            If log-likelihood becomes non-finite during iteration.
+
+        Notes
+        -----
+        The EM algorithm for this model:
+
+        **Initialization:**
+        - Parameters are initialized via `_initialize_parameters()`
+        - Spike weights are small random values
+        - Transition matrices start as uncoupled oscillators
+
+        **E-step:**
+        - Run switching point-process filter (Laplace-EKF)
+        - Run switching Kalman smoother (observation-model agnostic)
+        - Store sufficient statistics for M-step
+
+        **M-step:**
+        - Update dynamics parameters (A, Q, Z, initial state) via
+          `switching_kalman_maximization_step`
+        - Update spike GLM parameters (baseline, weights) via
+          `update_spike_glm_params`
+
+        **Convergence:**
+        - Monitor marginal log-likelihood from the E-step
+        - EM guarantees monotonic increase (up to Laplace approximation)
+        - Stop when relative change < tol or max_iter reached
+
+        **Numerical Stability:**
+        - The Laplace approximation can cause small violations of strict
+          monotonicity in individual iterations
+        - Large decreases or NaN/Inf indicate numerical issues
+
+        Examples
+        --------
+        >>> import jax.numpy as jnp
+        >>> import jax
+        >>> model = SwitchingSpikeOscillatorModel(
+        ...     n_oscillators=2,
+        ...     n_neurons=10,
+        ...     n_discrete_states=2,
+        ...     sampling_freq=100.0,
+        ...     dt=0.01,
+        ... )
+        >>> spikes = jax.random.poisson(jax.random.PRNGKey(0), 0.5, (100, 10))
+        >>> log_likelihoods = model.fit(spikes, max_iter=20, key=jax.random.PRNGKey(42))
+        >>> len(log_likelihoods)  # Number of iterations
+        20
+        """
+        # Convert to JAX array
+        spikes = jnp.asarray(spikes)
+
+        # Validate input shape
+        if spikes.ndim != 2:
+            raise ValueError(
+                f"spikes must be 2D array with shape (n_time, n_neurons), "
+                f"got {spikes.ndim}D array with shape {spikes.shape}"
+            )
+        if spikes.shape[1] != self.n_neurons:
+            raise ValueError(
+                f"spikes shape[1] must match n_neurons={self.n_neurons}, "
+                f"got shape {spikes.shape}"
+            )
+
+        # Set default random key if not provided
+        if key is None:
+            key = jax.random.PRNGKey(0)
+
+        # Initialize parameters
+        self._initialize_parameters(key)
+
+        # Track log-likelihoods across iterations
+        log_likelihoods: list[float] = []
+
+        for iteration in range(max_iter):
+            # E-step: compute posteriors
+            marginal_ll = self._e_step(spikes)
+            log_likelihoods.append(float(marginal_ll))
+
+            # Check for numerical issues
+            if not jnp.isfinite(marginal_ll):
+                raise ValueError(
+                    f"Non-finite log-likelihood at iteration {iteration}: "
+                    f"{marginal_ll}. This may indicate numerical instability."
+                )
+
+            # Check convergence (after at least 2 iterations)
+            if iteration > 0:
+                is_converged, _ = check_converged(
+                    log_likelihood=log_likelihoods[-1],
+                    previous_log_likelihood=log_likelihoods[-2],
+                    tolerance=tol,
+                )
+
+                if is_converged:
+                    break
+
+            # M-step: update parameters
+            self._m_step_dynamics()
+            self._m_step_spikes(spikes)
+
+        return log_likelihoods

@@ -3,8 +3,8 @@
 ## Current Status
 
 - **Date**: 2025-12-11
-- **Working on**: Milestone 7 - Tasks 7.1, 7.2, 7.3, 7.4, and 7.5 COMPLETE
-- **Current Task**: Task 7.6 - Implement `fit()` method
+- **Working on**: Milestone 7 - Tasks 7.1-7.6 COMPLETE
+- **Current Task**: Task 7.7 - Add `_project_parameters()` method
 
 ## Milestone 1 Summary (COMPLETE)
 
@@ -360,6 +360,47 @@ Implemented `SwitchingSpikeOscillatorModel._m_step_spikes()` method with:
 - Comprehensive test coverage including edge cases
 - Clean JAX best practices (JIT-compatible einsum)
 
-### Next: Task 7.6
+### Task 7.6 (COMPLETE)
 
-Implement `fit()` method
+Implemented `SwitchingSpikeOscillatorModel.fit()` method with:
+
+- **Parameter initialization**: Calls `_initialize_parameters()` with provided key
+- **EM loop**: Alternates E-step and M-step until convergence or max_iter
+- **Convergence checking**: Uses `check_converged()` from utils for consistent behavior
+- **Input validation**:
+  - Validates spikes is 2D array
+  - Validates n_neurons matches model configuration
+  - Raises ValueError for non-finite log-likelihood during iteration
+- **ArrayLike input**: Accepts numpy/jax arrays via `jnp.asarray()` conversion
+- **Returns list of log-likelihoods** for monitoring convergence
+
+#### Tests Added (15 tests)
+
+- `test_fit_runs_without_error`: Basic sanity check
+- `test_fit_returns_log_likelihoods_list`: Return type validation
+- `test_fit_log_likelihoods_are_finite`: Numerical stability
+- `test_fit_em_overall_improvement`: EM improvement verification (allows Laplace approx violations)
+- `test_fit_initializes_parameters`: Parameters initialized correctly
+- `test_fit_convergence_tolerance`: Early stopping works
+- `test_fit_single_discrete_state`: Edge case (non-switching model)
+- `test_fit_with_zero_spikes`: Edge case (silent neurons)
+- `test_fit_with_high_spike_counts`: Edge case (high firing rates)
+- `test_fit_reproducibility_same_key`: Same key produces same results
+- `test_fit_different_keys_produce_different_results`: Different keys diverge
+- `test_fit_updates_model_parameters`: Parameters updated during EM
+- `test_fit_respects_update_flags`: Update flags honored
+- `test_fit_validates_spikes_shape_2d`: Shape validation error
+- `test_fit_validates_spikes_n_neurons`: n_neurons mismatch error
+
+#### Code Review Notes
+
+- APPROVED by code-reviewer agent
+- Used `ArrayLike` type annotation for input consistency with codebase
+- Integrated `check_converged()` utility for convergence checking
+- Added comprehensive input validation with clear error messages
+- Robust test for EM improvement allows Laplace approximation-induced small violations
+- Clean JAX best practices (explicit key threading, Python list for results)
+
+### Next: Task 7.7
+
+Add `_project_parameters()` method

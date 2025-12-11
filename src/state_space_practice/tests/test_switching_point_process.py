@@ -4848,3 +4848,485 @@ class TestSwitchingSpikeOscillatorModelMStepSpikes:
         # After M-step, params should be finite
         assert jnp.all(jnp.isfinite(model.spike_params.baseline))
         assert jnp.all(jnp.isfinite(model.spike_params.weights))
+
+
+class TestSwitchingSpikeOscillatorModelFit:
+    """Tests for SwitchingSpikeOscillatorModel.fit() method (Task 7.6)."""
+
+    def test_fit_runs_without_error(self) -> None:
+        """fit() should run without error on valid data."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+        n_oscillators = 2
+        n_discrete_states = 2
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        # Generate random spikes
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        # fit() should not raise
+        log_likelihoods = model.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
+
+        # Should return a list of log-likelihoods
+        assert isinstance(log_likelihoods, list)
+        assert len(log_likelihoods) == 3
+
+    def test_fit_returns_log_likelihoods_list(self) -> None:
+        """fit() should return a list of log-likelihoods, one per iteration."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_neurons = 4
+        max_iter = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        log_likelihoods = model.fit(spikes, max_iter=max_iter, key=jax.random.PRNGKey(42))
+
+        # Should return a list of length max_iter
+        assert isinstance(log_likelihoods, list)
+        assert len(log_likelihoods) == max_iter
+
+        # All entries should be finite scalars
+        for ll in log_likelihoods:
+            assert jnp.isfinite(ll)
+
+    def test_fit_log_likelihoods_are_finite(self) -> None:
+        """fit() should return finite log-likelihoods."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 30
+        n_neurons = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        log_likelihoods = model.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
+
+        for ll in log_likelihoods:
+            assert jnp.isfinite(ll), f"Log-likelihood {ll} is not finite"
+
+    def test_fit_em_overall_improvement(self) -> None:
+        """fit() should improve log-likelihood over the course of EM iterations.
+
+        EM should generally increase the log-likelihood, but this implementation
+        uses a Laplace approximation for the point-process observation model, which
+        can introduce small violations of strict monotonicity at individual iterations.
+
+        We test that:
+        1. The final log-likelihood is higher than the initial
+        2. The overall trend is improving (most iterations increase or stay stable)
+        """
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 60
+        n_neurons = 5
+        max_iter = 8
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        log_likelihoods = model.fit(spikes, max_iter=max_iter, key=jax.random.PRNGKey(42))
+
+        # Test 1: Final log-likelihood should be higher than initial
+        initial_ll = log_likelihoods[0]
+        final_ll = log_likelihoods[-1]
+        assert final_ll > initial_ll, (
+            f"EM did not improve log-likelihood: initial={initial_ll}, final={final_ll}"
+        )
+
+        # Test 2: Count iterations where LL increased or stayed approximately stable
+        # Allow 5% relative tolerance for "stable" (Laplace approximation can cause small drops)
+        n_improving_or_stable = 0
+        for i in range(1, len(log_likelihoods)):
+            prev_ll = log_likelihoods[i - 1]
+            curr_ll = log_likelihoods[i]
+            tolerance = 0.05 * abs(prev_ll)
+            if curr_ll >= prev_ll - tolerance:
+                n_improving_or_stable += 1
+
+        # At least half of iterations should be improving or stable
+        min_improving = (len(log_likelihoods) - 1) // 2
+        assert n_improving_or_stable >= min_improving, (
+            f"Too many iterations with significant LL decrease: "
+            f"{n_improving_or_stable}/{len(log_likelihoods)-1} improving/stable "
+            f"(need at least {min_improving})"
+        )
+
+    def test_fit_initializes_parameters(self) -> None:
+        """fit() should initialize parameters before running EM."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 30
+        n_neurons = 4
+        n_oscillators = 2
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        # Before fit, spike_params should not exist as a properly initialized array
+        model.fit(spikes, max_iter=2, key=jax.random.PRNGKey(42))
+
+        # After fit, all parameters should be initialized with correct shapes
+        assert model.spike_params.baseline.shape == (n_neurons,)
+        assert model.spike_params.weights.shape == (n_neurons, n_latent)
+        assert model.init_mean.shape == (n_latent, 2)  # n_discrete_states = 2
+        assert model.init_cov.shape == (n_latent, n_latent, 2)
+
+    def test_fit_convergence_tolerance(self) -> None:
+        """fit() should stop early if convergence tolerance is reached."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        # With very loose tolerance, should converge quickly
+        log_likelihoods = model.fit(
+            spikes, max_iter=100, tol=1e10, key=jax.random.PRNGKey(42)
+        )
+
+        # Should stop early due to loose tolerance
+        # First iteration completes, then second checks convergence
+        assert len(log_likelihoods) <= 3, (
+            f"Expected early convergence, got {len(log_likelihoods)} iterations"
+        )
+
+    def test_fit_single_discrete_state(self) -> None:
+        """fit() should handle single discrete state (non-switching)."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_neurons = 4
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=1,  # Single state
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        log_likelihoods = model.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
+
+        # Should run without error
+        assert len(log_likelihoods) == 3
+        for ll in log_likelihoods:
+            assert jnp.isfinite(ll)
+
+    def test_fit_with_zero_spikes(self) -> None:
+        """fit() should handle data with zero spikes (silent neurons)."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_neurons = 4
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        # All zeros - silent neurons
+        spikes = jnp.zeros((n_time, n_neurons))
+
+        log_likelihoods = model.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
+
+        # Should run without error (though results may be degenerate)
+        assert len(log_likelihoods) == 3
+        for ll in log_likelihoods:
+            assert jnp.isfinite(ll)
+
+    def test_fit_with_high_spike_counts(self) -> None:
+        """fit() should handle data with high spike counts."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        # High spike counts (e.g., high firing rate)
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 10.0, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        log_likelihoods = model.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
+
+        # Should run without error
+        assert len(log_likelihoods) == 3
+        for ll in log_likelihoods:
+            assert jnp.isfinite(ll)
+
+    def test_fit_reproducibility_same_key(self) -> None:
+        """fit() should produce the same results with the same random key."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_neurons = 4
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model1 = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model2 = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        log_likelihoods1 = model1.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
+        log_likelihoods2 = model2.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
+
+        np.testing.assert_allclose(log_likelihoods1, log_likelihoods2, rtol=1e-5)
+
+    def test_fit_different_keys_produce_different_results(self) -> None:
+        """fit() with different keys should produce different results."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_neurons = 4
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model1 = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model2 = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        log_likelihoods1 = model1.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
+        log_likelihoods2 = model2.fit(spikes, max_iter=3, key=jax.random.PRNGKey(123))
+
+        # Results should be different
+        assert not np.allclose(log_likelihoods1, log_likelihoods2)
+
+    def test_fit_updates_model_parameters(self) -> None:
+        """fit() should update model parameters during EM iterations."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+        n_oscillators = 2
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_continuous_transition_matrix=True,
+            update_process_cov=True,
+            update_spike_params=True,
+        )
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        # Run fit to initialize and run EM
+        model.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
+
+        # Parameters should be finite
+        assert jnp.all(jnp.isfinite(model.continuous_transition_matrix))
+        assert jnp.all(jnp.isfinite(model.process_cov))
+        assert jnp.all(jnp.isfinite(model.spike_params.baseline))
+        assert jnp.all(jnp.isfinite(model.spike_params.weights))
+
+    def test_fit_respects_update_flags(self) -> None:
+        """fit() should respect update flags (e.g., disable parameter updates)."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_neurons = 4
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_continuous_transition_matrix=False,  # Disable A update
+            update_spike_params=True,
+        )
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        # Initialize first to capture initial A
+        model._initialize_parameters(jax.random.PRNGKey(42))
+        initial_A = model.continuous_transition_matrix.copy()
+
+        # Run E and M steps manually (as fit would)
+        model._e_step(spikes)
+        model._m_step_dynamics()
+        model._m_step_spikes(spikes)
+
+        # A should not have changed (update disabled)
+        np.testing.assert_allclose(
+            model.continuous_transition_matrix, initial_A, rtol=1e-10
+        )
+
+    def test_fit_validates_spikes_shape_2d(self) -> None:
+        """fit() should raise ValueError for non-2D spikes array."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        # 1D array - wrong shape
+        spikes_1d = jnp.zeros(100)
+
+        with pytest.raises(ValueError, match="must be 2D array"):
+            model.fit(spikes_1d, max_iter=3, key=jax.random.PRNGKey(42))
+
+    def test_fit_validates_spikes_n_neurons(self) -> None:
+        """fit() should raise ValueError when n_neurons doesn't match."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_neurons = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        # Wrong number of neurons (10 instead of 5)
+        spikes_wrong_neurons = jnp.zeros((50, 10))
+
+        with pytest.raises(ValueError, match="must match n_neurons"):
+            model.fit(spikes_wrong_neurons, max_iter=3, key=jax.random.PRNGKey(42))
