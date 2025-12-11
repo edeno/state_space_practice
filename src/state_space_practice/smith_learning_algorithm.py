@@ -56,6 +56,8 @@ import jax.scipy.optimize
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.special
+from jax import Array
+from jax.typing import ArrayLike
 
 from state_space_practice.utils import check_converged
 
@@ -65,8 +67,8 @@ logger = logging.getLogger(__name__)
 
 
 def approximate_gaussian(
-    log_posterior_func: Callable, x0: jnp.ndarray
-) -> Tuple[jax.Array, jax.Array]:
+    log_posterior_func: Callable, x0: ArrayLike
+) -> Tuple[Array, Array]:
     """Approximate the posterior using Laplace approximation.
 
     Finds the mode and covariance matrix using the Hessian of the
@@ -78,14 +80,14 @@ def approximate_gaussian(
     log_posterior_func : Callable
         Function computing the log posterior distribution.
         Takes one argument (state) and returns a scalar.
-    x0 : jnp.ndarray, shape (1,)
+    x0 : ArrayLike, shape (1,)
         Initial guess for the mode.
 
     Returns
     -------
-    mode : jnp.ndarray, shape (1,)
+    mode : Array, shape (1,)
         The mode of the posterior distribution.
-    covariance : jnp.ndarray, shape (1, 1)
+    covariance : Array, shape (1, 1)
         The covariance matrix (approximated) of the posterior distribution.
     """
     neg_log_posterior = lambda x: -log_posterior_func(x)
@@ -109,18 +111,18 @@ def approximate_gaussian(
 
 @jax.jit
 def _log_posterior_objective(
-    learning_state: jax.Array,
+    learning_state: ArrayLike,
     learning_state_prev: float,
     variance_prev: float,
     n_correct_in_trial: int,
     max_possible_correct: int,
     bias: float,
-) -> jax.Array:
+) -> Array:
     """Objective function for the log posterior distribution at one step.
 
     Parameters
     ----------
-    learning_state : jnp.ndarray, shape (1,)
+    learning_state : ArrayLike, shape (1,)
         Current latent learning state estimate, $x_k$.
     learning_state_prev : float
         Previous latent learning state estimate, $x_{k-1}$.
@@ -135,7 +137,7 @@ def _log_posterior_objective(
 
     Returns
     -------
-    log_posterior : jnp.ndarray, shape (n,)
+    log_posterior : Array, shape (n,)
         Log posterior of the state estimate vector
     """
     prob_success = jax.nn.sigmoid(
@@ -152,13 +154,13 @@ def _log_posterior_objective(
 
 
 def smith_learning_filter(
-    n_correct_responses: jax.Array,
+    n_correct_responses: ArrayLike,
     init_learning_state: float = 0.0,
     init_learning_variance: Optional[float] = None,
     sigma_epsilon: float = jnp.sqrt(0.05),
     prob_correct_by_chance: float = 0.5,
     max_possible_correct: Optional[int] = None,
-) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> Tuple[Array, Array, Array, Array, Array]:
     """Applies a non-linear Bayesian filter (Laplace approximation) for learning.
 
     Assumes a random walk model for the latent learning state ($x_k$) and
@@ -170,7 +172,7 @@ def smith_learning_filter(
 
     Parameters
     ----------
-    n_correct_responses : jnp.ndarray, shape (n_trials,)
+    n_correct_responses : ArrayLike, shape (n_trials,)
         Number of correct responses in each trial ($y_k$).
     init_learning_state : float, optional
         The subject's learning state at the beginning of the experiment ($x_0$).
@@ -190,17 +192,18 @@ def smith_learning_filter(
 
     Returns
     -------
-    prob_correct_response : jnp.ndarray, shape (n_trials,)
+    prob_correct_response : Array, shape (n_trials,)
         Posterior probability of a correct response ($p_k$).
-    learning_state_mode : jnp.ndarray, shape (n_trials,)
+    learning_state_mode : Array, shape (n_trials,)
         Posterior mode of the learning state ($x_{k|k}$).
-    learning_state_variance : jnp.ndarray, shape (n_trials,)
+    learning_state_variance : Array, shape (n_trials,)
         Posterior variance of the learning state ($P_{k|k}$).
-    one_step_mode : jnp.ndarray, shape (n_trials,)
+    one_step_mode : Array, shape (n_trials,)
         One-step prediction mode ($x_{k|k-1}$).
-    one_step_variance : jnp.ndarray, shape (n_trials,)
+    one_step_variance : Array, shape (n_trials,)
         One-step prediction variance ($P_{k|k-1}$).
     """
+    n_correct_responses = jnp.asarray(n_correct_responses)
     # Bias term based on chance probability of correct response
     mu: float = jnp.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
     sigma_squared_epsilon: float = sigma_epsilon**2
@@ -279,23 +282,23 @@ def smith_learning_filter(
 
 
 def smith_learning_smoother(
-    filtered_learning_state_mode: jax.Array,
-    filtered_learning_state_variance: jax.Array,
-    one_step_mode: jax.Array,
-    one_step_variance: jax.Array,
+    filtered_learning_state_mode: ArrayLike,
+    filtered_learning_state_variance: ArrayLike,
+    one_step_mode: ArrayLike,
+    one_step_variance: ArrayLike,
     prob_correct_by_chance: float = 0.5,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[Array, Array, Array, Array]:
     """Smooth the filtered learning state estimates using the Kalman smoother.
 
     Parameters
     ----------
-    filtered_learning_state_mode : jax.Array, shape (n_trials,)
+    filtered_learning_state_mode : ArrayLike, shape (n_trials,)
         Learning state mode estimates from the filter
-    filtered_learning_state_variance : jax.Array, shape (n_trials,)
+    filtered_learning_state_variance : ArrayLike, shape (n_trials,)
         Learning state variance estimates from the filter
-    one_step_mode : jax.Array, shape (n_trials,)
+    one_step_mode : ArrayLike, shape (n_trials,)
         One-step prediction of the learning state
-    one_step_variance : jax.Array, shape (n_trials,)
+    one_step_variance : ArrayLike, shape (n_trials,)
         One-step prediction of the variance of the learning state
     prob_correct_by_chance : float, optional
         The probability of a correct response by chance in absence of any
@@ -304,15 +307,19 @@ def smith_learning_smoother(
 
     Returns
     -------
-    learning_state_mode : jax.Array, shape (n_trials,)
+    learning_state_mode : Array, shape (n_trials,)
         Smoothed learning state mode estimates
-    learning_state_variance : jax.Array, shape (n_trials,)
+    learning_state_variance : Array, shape (n_trials,)
         Smoothed learning state variance estimates
-    prob_correct_response : jax.Array, shape (n_trials,)
+    prob_correct_response : Array, shape (n_trials,)
         Smoothed probability of a correct response
-    smoother_gain : jax.Array, shape (n_trials - 1,)
+    smoother_gain : Array, shape (n_trials - 1,)
         Smoother gain estimates
     """
+    filtered_learning_state_mode = jnp.asarray(filtered_learning_state_mode)
+    filtered_learning_state_variance = jnp.asarray(filtered_learning_state_variance)
+    one_step_mode = jnp.asarray(one_step_mode)
+    one_step_variance = jnp.asarray(one_step_variance)
     n_trials: int = len(filtered_learning_state_mode)
     mu: float = jnp.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
 
@@ -376,30 +383,33 @@ def smith_learning_smoother(
 
 
 def maximization_step(
-    smoothed_mode: jax.Array,
-    smoothed_variance: jax.Array,
-    smoother_gain: jax.Array,
-) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    smoothed_mode: ArrayLike,
+    smoothed_variance: ArrayLike,
+    smoother_gain: ArrayLike,
+) -> Tuple[Array, Array, Array]:
     """Estimate process noise from smoothed estimates.
 
     Parameters
     ----------
-    smoothed_mode : jax.Array, shape (n_trials,)
+    smoothed_mode : ArrayLike, shape (n_trials,)
         Smoothed learning state mode estimates.
-    smoothed_variance : jax.Array, shape (n_trials,)
+    smoothed_variance : ArrayLike, shape (n_trials,)
         Smoothed learning state variance estimates.
-    smoother_gain : jax.Array, shape (n_trials,)
+    smoother_gain : ArrayLike, shape (n_trials,)
         Smoother gain estimates.
 
     Returns
     -------
-    sigma_epsilon : jax.Array, shape (n_trials,)
+    sigma_epsilon : Array, shape (n_trials,)
         Estimated process noise standard deviation.
-    init_learning_state : jax.Array, shape (1,)
+    init_learning_state : Array, shape (1,)
         Initial learning state estimate.
-    init_learning_variance : jax.Array, shape (1,)
+    init_learning_variance : Array, shape (1,)
         Initial learning state variance estimate.
     """
+    smoothed_mode = jnp.asarray(smoothed_mode)
+    smoothed_variance = jnp.asarray(smoothed_variance)
+    smoother_gain = jnp.asarray(smoother_gain)
     n_trials: int = len(smoothed_mode)
     # E[(x_{k+1} - x_k)^2 | y_{1:T}] = (x_{k+1|T} - x_{k|T})^2 + P_{k+1|T} + P_{k|T}
     #                                  - 2 * Cov(x_{k+1}, x_k | y_{1:T})
@@ -422,13 +432,13 @@ def maximization_step(
 
 def calculate_probability_confidence_limits(
     key: jax.random.PRNGKey,
-    smoothed_mode: jnp.ndarray,  # shape: (n_trials,)
-    smoothed_variance: jnp.ndarray,  # shape: (n_trials,)
+    smoothed_mode: ArrayLike,
+    smoothed_variance: ArrayLike,
     mu_bias: float,
     n_samples: int = 10000,
-    percentiles: jnp.ndarray = None,
+    percentiles: Optional[ArrayLike] = None,
     prob_correct_by_chance: Optional[float] = None,
-) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
+) -> Tuple[Array, Optional[Array]]:
     """Calculates confidence limits for the probability of a correct response.
 
     This is achieved by sampling from the smoothed posterior distribution of
@@ -439,15 +449,15 @@ def calculate_probability_confidence_limits(
     ----------
     key : jax.random.PRNGKey
         JAX PRNG key for random number generation.
-    smoothed_mode : jnp.ndarray, shape (n_trials,)
+    smoothed_mode : ArrayLike, shape (n_trials,)
         Smoothed learning state means (x_{k|T}).
-    smoothed_variance : jnp.ndarray, shape (n_trials,)
+    smoothed_variance : ArrayLike, shape (n_trials,)
         Smoothed learning state variances (P_{k|T}).
     mu_bias : float
         Bias term (mu) in the sigmoid function: p_k = sigmoid(mu + x_k).
     n_samples : int, optional
         Number of Monte Carlo samples to draw per trial. Default is 10000.
-    percentiles : jnp.ndarray, optional
+    percentiles : ArrayLike, optional
         Array of percentiles to compute (e.g., jnp.array([5, 50, 95])).
         If None, defaults to jnp.array([5.0, 50.0, 95.0]).
     prob_correct_by_chance : Optional[float], optional
@@ -456,13 +466,15 @@ def calculate_probability_confidence_limits(
 
     Returns
     -------
-    probability_percentiles : jnp.ndarray, shape (n_percentiles, n_trials)
+    probability_percentiles : Array, shape (n_percentiles, n_trials)
         The computed percentile values for the probability of correct response
         for each trial.
-    pcert : Optional[jnp.ndarray], shape (n_trials,)
+    pcert : Optional[Array], shape (n_trials,)
         The certainty that p_k > prob_correct_by_chance for each trial.
         Returned if prob_correct_by_chance is not None.
     """
+    smoothed_mode = jnp.asarray(smoothed_mode)
+    smoothed_variance = jnp.asarray(smoothed_variance)
     if percentiles is None:
         percentiles = jnp.array([5.0, 50.0, 95.0])
 

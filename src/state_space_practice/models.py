@@ -1,48 +1,48 @@
 import jax
 import jax.numpy as jnp
+from jax import Array
+from jax.typing import ArrayLike
 
 
-def log_receptive_field_model(
-    position: jnp.ndarray, params: jnp.ndarray
-) -> jnp.ndarray:
+def log_receptive_field_model(position: ArrayLike, params: ArrayLike) -> Array:
     log_max_rate, place_field_center, scale = params
     return log_max_rate - (position - place_field_center) ** 2 / (2 * scale**2)
 
 
 # NOTE: most general form of the SSPPF accounts for multiple neurons which is not implemented here
 def stochastic_point_process_filter(
-    init_mode_params: jnp.ndarray,
-    init_covariance_params: jnp.ndarray,
-    x: jnp.ndarray,
-    spike_indicator: jnp.ndarray,
+    init_mode_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    x: ArrayLike,
+    spike_indicator: ArrayLike,
     dt: float,
-    transition_matrix: jnp.ndarray,
-    latent_state_covariance: jnp.ndarray,
+    transition_matrix: ArrayLike,
+    latent_state_covariance: ArrayLike,
     log_receptive_field_model: callable,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+) -> tuple[Array, Array]:
     """Stochastic State Point Process Filter (SSPPF)
 
     Parameters
     ----------
-    init_mode_params : jnp.ndarray, shape (n_params,)
+    init_mode_params : ArrayLike, shape (n_params,)
         Initial mean parameters
-    init_covariance_params : jnp.ndarray, shape (n_params, n_params)
+    init_covariance_params : ArrayLike, shape (n_params, n_params)
         Initial covariance parameters
-    x : jnp.ndarray, shape (n_time,)
+    x : ArrayLike, shape (n_time,)
         Continuous-valued input signal
-    spike_indicator : jnp.ndarray, shape (n_time,)
+    spike_indicator : ArrayLike, shape (n_time,)
         Spike count
     dt : float
         Time step
-    transition_matrix : jnp.ndarray, shape (n_params, n_params)
-    latent_state_covariance : jnp.ndarray, shape (n_params, n_params)
+    transition_matrix : ArrayLike, shape (n_params, n_params)
+    latent_state_covariance : ArrayLike, shape (n_params, n_params)
     log_receptive_field_model : callable
         Function that takes in `x` and parameters and returns the log spike rate
 
     Returns
     -------
-    posterior_mode : jnp.ndarray, shape (n_time, n_params)
-    posterior_covariance : jnp.ndarray, shape (n_time, n_params, n_params)
+    posterior_mode : Array, shape (n_time, n_params)
+    posterior_covariance : Array, shape (n_time, n_params, n_params)
 
     References
     ----------
@@ -58,9 +58,9 @@ def stochastic_point_process_filter(
 
     # Define the update step
     def _update(
-        params_prev: tuple[jnp.ndarray, jnp.ndarray],
-        args: tuple[jnp.ndarray, jnp.ndarray],
-    ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray]]:
+        params_prev: tuple[Array, Array],
+        args: tuple[Array, Array],
+    ) -> tuple[tuple[Array, Array], tuple[Array, Array]]:
         """Point Process Adaptive Filter update step
 
         F : transition matrix
@@ -119,17 +119,19 @@ def stochastic_point_process_filter(
 
 
 def get_confidence_interval(
-    posterior_mode: jnp.ndarray, posterior_covariance: jnp.ndarray, alpha: float = 0.01
-) -> jnp.ndarray:
+    posterior_mode: ArrayLike, posterior_covariance: ArrayLike, alpha: float = 0.01
+) -> Array:
     """Get the confidence interval from the posterior covariance
 
     Parameters
     ----------
-    posterior_mode : jnp.ndarray, shape (n_time, n_params)
-    posterior_covariance : jnp.ndarray, shape (n_time, n_params, n_params)
+    posterior_mode : ArrayLike, shape (n_time, n_params)
+    posterior_covariance : ArrayLike, shape (n_time, n_params, n_params)
     alpha : float, optional
         Confidence level, by default 0.01
     """
+    posterior_mode = jnp.asarray(posterior_mode)
+    posterior_covariance = jnp.asarray(posterior_covariance)
     z = jax.scipy.stats.norm.ppf(1 - alpha / 2)
     ci = z * jnp.sqrt(
         jnp.diagonal(posterior_covariance, axis1=-2, axis2=-1)
@@ -139,32 +141,32 @@ def get_confidence_interval(
 
 
 def steepest_descent_point_process_filter(
-    init_mean_params: jnp.ndarray,
-    x: jnp.ndarray,
-    spike_indicator: jnp.ndarray,
+    init_mean_params: ArrayLike,
+    x: ArrayLike,
+    spike_indicator: ArrayLike,
     dt: float,
-    epsilon: jnp.ndarray,
+    epsilon: ArrayLike,
     log_receptive_field_model: callable,
-) -> jnp.ndarray:
+) -> Array:
     """Steepest Descent Point Process Filter (SDPPF)
 
     Parameters
     ----------
-    init_mean_params : jnp.ndarray, shape (n_params,)
-    x : jnp.ndarray, shape (n_time,)
+    init_mean_params : ArrayLike, shape (n_params,)
+    x : ArrayLike, shape (n_time,)
         Continuous-valued input signal
-    spike_indicator : jnp.ndarray, shape (n_time,)
+    spike_indicator : ArrayLike, shape (n_time,)
         Spike count
     dt : float
         Time step
-    epsilon : jnp.ndarray, shape (n_params, n_params)
+    epsilon : ArrayLike, shape (n_params, n_params)
         Learning rate
     log_receptive_field_model : callable
         Function that takes in `x` and parameters and returns the log spike rate
 
     Returns
     -------
-    posterior_mode : jnp.ndarray, shape (n_time, n_params)
+    posterior_mode : Array, shape (n_time, n_params)
 
     References
     ----------
@@ -186,8 +188,8 @@ def steepest_descent_point_process_filter(
     grad_log_receptive_field_model = jax.grad(log_receptive_field_model, argnums=1)
 
     def _update(
-        mode_prev: jnp.ndarray, args: tuple[jnp.ndarray, jnp.ndarray]
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        mode_prev: Array, args: tuple[Array, Array]
+    ) -> tuple[Array, Array]:
         """Steepest Descent Point Process Filter update step"""
         x_t, spike_indicator_t = args
         conditional_intensity = jnp.exp(log_receptive_field_model(x_t, mode_prev)) * dt

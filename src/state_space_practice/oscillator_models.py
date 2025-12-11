@@ -39,6 +39,8 @@ from typing import Optional
 
 import jax
 import jax.numpy as jnp
+from jax import Array
+from jax.typing import ArrayLike
 
 from state_space_practice.oscillator_utils import (
     construct_common_oscillator_process_covariance,
@@ -372,7 +374,7 @@ class BaseModel(ABC):
                 f"got {self.measurement_cov.shape}."
             )
 
-    def _e_step(self, observations: jnp.ndarray) -> float:
+    def _e_step(self, observations: ArrayLike) -> float:
         """Performs the Expectation (E) step of the EM algorithm.
 
         Runs the switching Kalman filter and smoother to compute the
@@ -380,7 +382,7 @@ class BaseModel(ABC):
 
         Parameters
         ----------
-        observations : jnp.ndarray, shape (n_time, n_sources)
+        observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
 
         Returns
@@ -427,7 +429,7 @@ class BaseModel(ABC):
 
         return marginal_log_likelihood
 
-    def _m_step(self, observations: jnp.ndarray) -> None:
+    def _m_step(self, observations: ArrayLike) -> None:
         """Performs the Maximization (M) step of the EM algorithm.
 
         Updates the model parameters using the Expected Sufficient Statistics
@@ -435,7 +437,7 @@ class BaseModel(ABC):
 
         Parameters
         ----------
-        observations : jnp.ndarray, shape (n_time, n_sources)
+        observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
         """
         (
@@ -476,7 +478,6 @@ class BaseModel(ABC):
 
     def fit(
         self,
-        observations: jnp.ndarray,
         key: jax.random.PRNGKey,
         max_iter: int = 100,
         tolerance: float = 1e-4,
@@ -488,7 +489,7 @@ class BaseModel(ABC):
 
         Parameters
         ----------
-        observations : jnp.ndarray, shape (n_time, n_sources)
+        observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
         key : jax.random.PRNGKey
             JAX random number generator key for initialization.
@@ -657,7 +658,7 @@ class CommonOscillatorModel(BaseModel):
         """No specific projection needed for COM beyond M-step updates."""
         pass  # H is typically unconstrained in COM
 
-    def get_oscillator_influence_on_node(self) -> jnp.ndarray:
+    def get_oscillator_influence_on_node(self) -> Array:
         """Calculates the influence of each oscillator on each source.
 
         This is computed as the L2 norm of the (2x1) block in H
@@ -665,7 +666,7 @@ class CommonOscillatorModel(BaseModel):
 
         Returns
         -------
-        jnp.ndarray, shape (n_sources, n_oscillators, n_discrete_states)
+        Array, shape (n_sources, n_oscillators, n_discrete_states)
             The influence magnitude.
         """
         n_sources, n_cont_states, n_discrete_states = self.measurement_matrix.shape
@@ -683,7 +684,7 @@ class CommonOscillatorModel(BaseModel):
 
     def get_phase_difference(
         self, node1_ind: int, node2_ind: int, oscillator_ind: int
-    ) -> jnp.ndarray:
+    ) -> Array:
         """Calculates the phase difference between two sources for one oscillator.
 
         Parameters
@@ -697,7 +698,7 @@ class CommonOscillatorModel(BaseModel):
 
         Returns
         -------
-        jnp.ndarray, shape (n_discrete_states,)
+        Array, shape (n_discrete_states,)
             The phase difference in radians for each discrete state.
         """
         _, col = get_block_slice(oscillator_ind, oscillator_ind)
@@ -711,7 +712,7 @@ class CommonOscillatorModel(BaseModel):
 
     def fit(
         self,
-        observations: jnp.ndarray,
+        observations: ArrayLike,
         key: jax.random.PRNGKey,
         max_iter: int = 100,
         tolerance: float = 1e-4,
@@ -723,7 +724,7 @@ class CommonOscillatorModel(BaseModel):
 
         Parameters
         ----------
-        observations : jnp.ndarray, shape (n_time, n_sources)
+        observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
         key : jax.random.PRNGKey
             JAX random number generator key for initialization.
@@ -737,6 +738,7 @@ class CommonOscillatorModel(BaseModel):
         log_likelihoods : list[float]
             A list of marginal log-likelihoods at each iteration.
         """
+        observations = jnp.asarray(observations)
         if observations.shape[1] != self.n_sources:
             raise ValueError(
                 f"observations must have {self.n_sources} sources, "
@@ -896,7 +898,7 @@ class CorrelatedNoiseModel(BaseModel):
 
     def fit(
         self,
-        observations: jnp.ndarray,
+        observations: ArrayLike,
         key: jax.random.PRNGKey,
         max_iter: int = 100,
         tolerance: float = 1e-4,
@@ -908,7 +910,7 @@ class CorrelatedNoiseModel(BaseModel):
 
         Parameters
         ----------
-        observations : jnp.ndarray, shape (n_time, n_sources)
+        observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
         key : jax.random.PRNGKey
             JAX random number generator key for initialization.
@@ -922,6 +924,7 @@ class CorrelatedNoiseModel(BaseModel):
         log_likelihoods : list[float]
             A list of marginal log-likelihoods at each iteration.
         """
+        observations = jnp.asarray(observations)
         if observations.shape[1] != self.n_sources:
             raise ValueError(
                 f"observations must have {self.n_sources} sources, "
@@ -1080,7 +1083,7 @@ class DirectedInfluenceModel(BaseModel):
 
     def fit(
         self,
-        observations: jnp.ndarray,
+        observations: ArrayLike,
         key: jax.random.PRNGKey,
         max_iter: int = 100,
         tolerance: float = 1e-4,
@@ -1092,7 +1095,7 @@ class DirectedInfluenceModel(BaseModel):
 
         Parameters
         ----------
-        observations : jnp.ndarray, shape (n_time, n_sources)
+        observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
         key : jax.random.PRNGKey
             JAX random number generator key for initialization.
@@ -1106,6 +1109,7 @@ class DirectedInfluenceModel(BaseModel):
         log_likelihoods : list[float]
             A list of marginal log-likelihoods at each iteration.
         """
+        observations = jnp.asarray(observations)
         if observations.shape[1] != self.n_sources:
             raise ValueError(
                 f"observations must have {self.n_sources} sources, "

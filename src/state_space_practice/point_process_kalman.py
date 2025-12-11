@@ -3,6 +3,8 @@ from typing import Callable, Optional
 
 import jax
 import jax.numpy as jnp
+from jax import Array
+from jax.typing import ArrayLike
 
 from state_space_practice.kalman import (
     _kalman_smoother_update,
@@ -15,36 +17,34 @@ from state_space_practice.utils import check_converged
 logger = logging.getLogger(__name__)
 
 
-def log_conditional_intensity(
-    design_matrix: jnp.ndarray, params: jnp.ndarray
-) -> jnp.ndarray:
+def log_conditional_intensity(design_matrix: ArrayLike, params: ArrayLike) -> Array:
     """Computes the log conditional intensity for a point process.
 
     Parameters
     ----------
-    design_matrix : jnp.ndarray, shape (n_time, n_params)
+    design_matrix : ArrayLike, shape (n_time, n_params)
         Design matrix (Z_k) used in the intensity function.
-    params : jnp.ndarray, shape (n_params,)
+    params : ArrayLike, shape (n_params,)
         Parameters for the intensity function.
 
     Returns
     -------
-    jnp.ndarray, shape (n_time,)
+    Array, shape (n_time,)
         Log conditional intensity (log(λ_k)).
     """
-    return design_matrix @ params
+    return jnp.asarray(design_matrix) @ jnp.asarray(params)
 
 
 def stochastic_point_process_filter(
-    init_mean_params: jnp.ndarray,
-    init_covariance_params: jnp.ndarray,
-    design_matrix: jnp.ndarray,
-    spike_indicator: jnp.ndarray,
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
     dt: float,
-    transition_matrix: jnp.ndarray,
-    process_cov: jnp.ndarray,
-    log_conditional_intensity: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray],
-) -> tuple[jnp.ndarray, jnp.ndarray, float]:
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+) -> tuple[Array, Array, float]:
     """Applies a Stochastic State Point Process Filter (SSPPF).
 
     This filter estimates a time-varying latent state ($x_k$) based on
@@ -63,19 +63,19 @@ def stochastic_point_process_filter(
 
     Parameters
     ----------
-    init_mean_params : jnp.ndarray, shape (n_params,)
+    init_mean_params : ArrayLike, shape (n_params,)
         Initial mean of the latent state ($x_0$).
-    init_covariance_params : jnp.ndarray, shape (n_params, n_params)
+    init_covariance_params : ArrayLike, shape (n_params, n_params)
         Initial covariance of the latent state ($P_0$).
-    design_matrix : jnp.ndarray, shape (n_time, n_params)
+    design_matrix : ArrayLike, shape (n_time, n_params)
         Design matrix ($Z_k$) used in the intensity function.
-    spike_indicator : jnp.ndarray, shape (n_time,)
+    spike_indicator : ArrayLike, shape (n_time,)
         Observed spike counts or indicators ($y_k$).
     dt : float
         Time step size ($\Delta t$).
-    transition_matrix : jnp.ndarray, shape (n_params, n_params)
+    transition_matrix : ArrayLike, shape (n_params, n_params)
         State transition matrix ($A$).
-    process_cov : jnp.ndarray, shape (n_params, n_params)
+    process_cov : ArrayLike, shape (n_params, n_params)
         Process noise covariance ($Q$).
     log_conditional_intensity : callable
         Function `log_lambda(Z_k, x_k)` returning the log conditional
@@ -83,9 +83,9 @@ def stochastic_point_process_filter(
 
     Returns
     -------
-    posterior_mean : jnp.ndarray, shape (n_time, n_params)
+    posterior_mean : Array, shape (n_time, n_params)
         Filtered posterior means ($x_{k|k}$).
-    posterior_variance : jnp.ndarray, shape (n_time, n_params, n_params)
+    posterior_variance : Array, shape (n_time, n_params, n_params)
         Filtered posterior covariances ($P_{k|k}$).
     marginal_log_likelihood : float
         Total log-likelihood of the observations given the model.
@@ -102,9 +102,9 @@ def stochastic_point_process_filter(
     hess_log_conditional_intensity = jax.hessian(log_conditional_intensity, argnums=1)
 
     def _step(
-        params_prev: tuple[jnp.ndarray, jnp.ndarray, float],
-        args: tuple[jnp.ndarray, jnp.ndarray],
-    ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, jnp.ndarray]]:
+        params_prev: tuple[Array, Array, float],
+        args: tuple[Array, Array],
+    ) -> tuple[tuple[Array, Array], tuple[Array, Array]]:
         """Point Process Adaptive Filter update step
 
         F : transition matrix
@@ -170,15 +170,15 @@ def stochastic_point_process_filter(
 
 
 def stochastic_point_process_smoother(
-    init_mean_params: jnp.ndarray,
-    init_covariance_params: jnp.ndarray,
-    design_matrix: jnp.ndarray,
-    spike_indicator: jnp.ndarray,
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
     dt: float,
-    transition_matrix: jnp.ndarray,
-    process_cov: jnp.ndarray,
-    log_conditional_intensity: callable,
-):
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+) -> tuple[Array, Array, Array, float]:
     """
     Applies a Stochastic State Point Process Smoother (SSPPS).
 
@@ -194,19 +194,19 @@ def stochastic_point_process_smoother(
     The smoother uses a Kalman smoother update step to refine the filtered estimates.
     Parameters
     ----------
-    init_mean_params : jnp.ndarray, shape (n_params,)
+    init_mean_params : ArrayLike, shape (n_params,)
         Initial mean of the latent state ($x_0$).
-    init_covariance_params : jnp.ndarray, shape (n_params, n_params)
+    init_covariance_params : ArrayLike, shape (n_params, n_params)
         Initial covariance of the latent state ($P_0$).
-    design_matrix : jnp.ndarray, shape (n_time, n_params)
+    design_matrix : ArrayLike, shape (n_time, n_params)
         Design matrix ($Z_k$) used in the intensity function.
-    spike_indicator : jnp.ndarray, shape (n_time,)
+    spike_indicator : ArrayLike, shape (n_time,)
         Observed spike counts or indicators ($y_k$).
     dt : float
         Time step size ($\Delta t$).
-    transition_matrix : jnp.ndarray, shape (n_params, n_params)
+    transition_matrix : ArrayLike, shape (n_params, n_params)
         State transition matrix ($A$).
-    process_cov : jnp.ndarray, shape (n_params, n_params)
+    process_cov : ArrayLike, shape (n_params, n_params)
         Process noise covariance ($Q$).
     log_conditional_intensity : callable
         Function `log_lambda(Z_k, x_k)` returning the log conditional
@@ -214,11 +214,11 @@ def stochastic_point_process_smoother(
 
     Returns
     -------
-    smoother_mean : jnp.ndarray, shape (n_time, n_params)
+    smoother_mean : Array, shape (n_time, n_params)
         Smoothed posterior means ($x_{k|T}$).
-    smoother_cov : jnp.ndarray, shape (n_time, n_params, n_params)
+    smoother_cov : Array, shape (n_time, n_params, n_params)
         Smoothed posterior covariances ($P_{k|T}$).
-    smoother_cross_cov : jnp.ndarray, shape (n_time - 1, n_params, n_params)
+    smoother_cross_cov : Array, shape (n_time - 1, n_params, n_params)
         Smoothed cross-covariances ($P_{k|T, k-1}$).
     marginal_log_likelihood : float
         Total log-likelihood of the observations given the model.
@@ -281,30 +281,30 @@ def stochastic_point_process_smoother(
 
 
 def kalman_maximization_step(
-    smoother_mean: jnp.ndarray,
-    smoother_cov: jnp.ndarray,
-    smoother_cross_cov: jnp.ndarray,
-):
+    smoother_mean: ArrayLike,
+    smoother_cov: ArrayLike,
+    smoother_cross_cov: ArrayLike,
+) -> tuple[Array, Array, Array, Array]:
     """Maximization step for the Kalman filter.
 
     Parameters
     ----------
-    smoother_mean : jnp.ndarray, shape (n_time, n_cont_states)
+    smoother_mean : ArrayLike, shape (n_time, n_cont_states)
         smoother mean.
-    smoother_cov : jnp.ndarray, shape (n_time, n_cont_states, n_cont_states)
+    smoother_cov : ArrayLike, shape (n_time, n_cont_states, n_cont_states)
         smoother covariance.
-    smoother_cross_cov : jnp.ndarray, shape (n_time - 1, n_cont_states, n_cont_states)
+    smoother_cross_cov : ArrayLike, shape (n_time - 1, n_cont_states, n_cont_states)
         smoother cross-covariance.
 
     Returns
     -------
-    transition_matrix : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    transition_matrix : Array, shape (n_cont_states, n_cont_states)
         Transition matrix.
-    process_cov : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    process_cov : Array, shape (n_cont_states, n_cont_states)
         Process covariance.
-    mean_init : jnp.ndarray, shape (n_cont_states,)
+    mean_init : Array, shape (n_cont_states,)
         Initial mean.
-    cov_init : jnp.ndarray, shape (n_cont_states, n_cont_states)
+    cov_init : Array, shape (n_cont_states, n_cont_states)
         Initial covariance.
 
     References
@@ -312,6 +312,9 @@ def kalman_maximization_step(
     ... [1] Roweis, S. T., Ghahramani, Z., & Hinton, G. E. (1999). A unifying review of
     linear Gaussian models. Neural computation, 11(2), 305-345.
     """
+    smoother_mean = jnp.asarray(smoother_mean)
+    smoother_cov = jnp.asarray(smoother_cov)
+    smoother_cross_cov = jnp.asarray(smoother_cross_cov)
 
     n_time = smoother_mean.shape[0]
 
@@ -346,17 +349,19 @@ def kalman_maximization_step(
 
 
 def get_confidence_interval(
-    posterior_mean: jnp.ndarray, posterior_covariance: jnp.ndarray, alpha: float = 0.01
-) -> jnp.ndarray:
+    posterior_mean: ArrayLike, posterior_covariance: ArrayLike, alpha: float = 0.01
+) -> Array:
     """Get the confidence interval from the posterior covariance
 
     Parameters
     ----------
-    posterior_mean : jnp.ndarray, shape (n_time, n_params)
-    posterior_covariance : jnp.ndarray, shape (n_time, n_params, n_params)
+    posterior_mean : ArrayLike, shape (n_time, n_params)
+    posterior_covariance : ArrayLike, shape (n_time, n_params, n_params)
     alpha : float, optional
         Confidence level, by default 0.01
     """
+    posterior_mean = jnp.asarray(posterior_mean)
+    posterior_covariance = jnp.asarray(posterior_covariance)
     z = jax.scipy.stats.norm.ppf(1 - alpha / 2)
     ci = z * jnp.sqrt(
         jnp.diagonal(posterior_covariance, axis1=-2, axis2=-1)
@@ -366,32 +371,32 @@ def get_confidence_interval(
 
 
 def steepest_descent_point_process_filter(
-    init_mean_params: jnp.ndarray,
-    x: jnp.ndarray,
-    spike_indicator: jnp.ndarray,
+    init_mean_params: ArrayLike,
+    x: ArrayLike,
+    spike_indicator: ArrayLike,
     dt: float,
-    epsilon: jnp.ndarray,
-    log_receptive_field_model: callable,
-) -> jnp.ndarray:
+    epsilon: ArrayLike,
+    log_receptive_field_model: Callable[[ArrayLike, ArrayLike], Array],
+) -> Array:
     """Steepest Descent Point Process Filter (SDPPF)
 
     Parameters
     ----------
-    init_mean_params : jnp.ndarray, shape (n_params,)
-    x : jnp.ndarray, shape (n_time,)
+    init_mean_params : ArrayLike, shape (n_params,)
+    x : ArrayLike, shape (n_time,)
         Continuous-valued input signal
-    spike_indicator : jnp.ndarray, shape (n_time,)
+    spike_indicator : ArrayLike, shape (n_time,)
         Spike count
     dt : float
         Time step
-    epsilon : jnp.ndarray, shape (n_params, n_params)
+    epsilon : ArrayLike, shape (n_params, n_params)
         Learning rate
     log_receptive_field_model : callable
         Function that takes in `x` and parameters and returns the log spike rate
 
     Returns
     -------
-    posterior_mean : jnp.ndarray, shape (n_time, n_params)
+    posterior_mean : Array, shape (n_time, n_params)
 
     References
     ----------
@@ -413,8 +418,8 @@ def steepest_descent_point_process_filter(
     grad_log_receptive_field_model = jax.grad(log_receptive_field_model, argnums=1)
 
     def _update(
-        mean_prev: jnp.ndarray, args: tuple[jnp.ndarray, jnp.ndarray]
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        mean_prev: Array, args: tuple[Array, Array]
+    ) -> tuple[Array, Array]:
         """Steepest Descent Point Process Filter update step"""
         x_t, spike_indicator_t = args
         conditional_intensity = jnp.exp(log_receptive_field_model(x_t, mean_prev)) * dt
@@ -446,13 +451,13 @@ class PointProcessModel:
         Dimension of the latent state.
     dt : float
         Time step size.
-    transition_matrix : jnp.ndarray, optional
+    transition_matrix : ArrayLike, optional
         Initial state transition matrix A. Default is identity (random walk).
-    process_cov : jnp.ndarray, optional
+    process_cov : ArrayLike, optional
         Initial process noise covariance Q.
-    init_mean : jnp.ndarray, optional
+    init_mean : ArrayLike, optional
         Initial state mean.
-    init_cov : jnp.ndarray, optional
+    init_cov : ArrayLike, optional
         Initial state covariance.
     log_intensity_func : callable, optional
         Function log_lambda(Z_k, x_k) returning log conditional intensity.
@@ -466,11 +471,11 @@ class PointProcessModel:
 
     Attributes
     ----------
-    smoother_mean : jnp.ndarray
+    smoother_mean : Array
         Smoothed state estimates after fitting.
-    smoother_cov : jnp.ndarray
+    smoother_cov : Array
         Smoothed state covariances after fitting.
-    smoother_cross_cov : jnp.ndarray
+    smoother_cross_cov : Array
         Smoothed cross-covariances after fitting.
 
     References
@@ -484,10 +489,10 @@ class PointProcessModel:
         self,
         n_state_dims: int,
         dt: float,
-        transition_matrix: Optional[jnp.ndarray] = None,
-        process_cov: Optional[jnp.ndarray] = None,
-        init_mean: Optional[jnp.ndarray] = None,
-        init_cov: Optional[jnp.ndarray] = None,
+        transition_matrix: Optional[ArrayLike] = None,
+        process_cov: Optional[ArrayLike] = None,
+        init_mean: Optional[ArrayLike] = None,
+        init_cov: Optional[ArrayLike] = None,
         log_intensity_func: Optional[Callable] = None,
         update_transition_matrix: bool = True,
         update_process_cov: bool = True,
@@ -528,21 +533,21 @@ class PointProcessModel:
         self.update_init_state = update_init_state
 
         # Results (populated after fit)
-        self.smoother_mean: Optional[jnp.ndarray] = None
-        self.smoother_cov: Optional[jnp.ndarray] = None
-        self.smoother_cross_cov: Optional[jnp.ndarray] = None
-        self.filtered_mean: Optional[jnp.ndarray] = None
-        self.filtered_cov: Optional[jnp.ndarray] = None
+        self.smoother_mean: Optional[Array] = None
+        self.smoother_cov: Optional[Array] = None
+        self.smoother_cross_cov: Optional[Array] = None
+        self.filtered_mean: Optional[Array] = None
+        self.filtered_cov: Optional[Array] = None
 
     def _e_step(
-        self, design_matrix: jnp.ndarray, spike_indicator: jnp.ndarray
+        self, design_matrix: ArrayLike, spike_indicator: ArrayLike
     ) -> float:
         """E-step: Run filter and smoother to estimate latent states.
 
         Parameters
         ----------
-        design_matrix : jnp.ndarray, shape (n_time, n_state_dims)
-        spike_indicator : jnp.ndarray, shape (n_time,)
+        design_matrix : ArrayLike, shape (n_time, n_state_dims)
+        spike_indicator : ArrayLike, shape (n_time,)
 
         Returns
         -------
@@ -607,8 +612,8 @@ class PointProcessModel:
 
     def fit(
         self,
-        design_matrix: jnp.ndarray,
-        spike_indicator: jnp.ndarray,
+        design_matrix: ArrayLike,
+        spike_indicator: ArrayLike,
         max_iter: int = 100,
         tolerance: float = 1e-4,
     ) -> list[float]:
@@ -616,9 +621,9 @@ class PointProcessModel:
 
         Parameters
         ----------
-        design_matrix : jnp.ndarray, shape (n_time, n_state_dims)
+        design_matrix : ArrayLike, shape (n_time, n_state_dims)
             Design matrix for the intensity function.
-        spike_indicator : jnp.ndarray, shape (n_time,)
+        spike_indicator : ArrayLike, shape (n_time,)
             Observed spike counts or indicators.
         max_iter : int
             Maximum number of EM iterations.
@@ -672,21 +677,21 @@ class PointProcessModel:
 
     def get_rate_estimate(
         self,
-        design_matrix: jnp.ndarray,
+        design_matrix: ArrayLike,
         use_smoothed: bool = True,
-    ) -> jnp.ndarray:
+    ) -> Array:
         """Get the estimated firing rate.
 
         Parameters
         ----------
-        design_matrix : jnp.ndarray, shape (n_time, n_state_dims) or (n_pos, n_state_dims)
+        design_matrix : ArrayLike, shape (n_time, n_state_dims) or (n_pos, n_state_dims)
             Design matrix to evaluate rate at.
         use_smoothed : bool
             If True, use smoothed estimates; otherwise use filtered.
 
         Returns
         -------
-        rate : jnp.ndarray, shape (n_time,) or (n_time, n_pos)
+        rate : Array, shape (n_time,) or (n_time, n_pos)
             Estimated firing rate in Hz.
         """
         if use_smoothed:
@@ -707,7 +712,7 @@ class PointProcessModel:
 
     def get_confidence_interval(
         self, alpha: float = 0.05, use_smoothed: bool = True
-    ) -> jnp.ndarray:
+    ) -> Array:
         """Get confidence intervals for the state estimates.
 
         Parameters
@@ -719,7 +724,7 @@ class PointProcessModel:
 
         Returns
         -------
-        ci : jnp.ndarray, shape (n_time, n_state_dims, 2)
+        ci : Array, shape (n_time, n_state_dims, 2)
             Lower and upper bounds of the confidence interval.
         """
         if use_smoothed:
