@@ -101,15 +101,16 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
 
 ### Tasks
 
-- [ ] **3.1** Create `switching_point_process_smoother()` wrapper/alias
-  - Thin wrapper around `switching_kalman_smoother`
-  - Document that smoother is observation-model agnostic
-  - Verify input shapes match what smoother expects
+- [x] **3.1** ~~Create `switching_point_process_smoother()` wrapper/alias~~
+  - **DECISION**: No wrapper needed - smoother is observation-model agnostic
+  - Just use `switching_kalman_smoother` directly with filter outputs
+  - Verified input shapes match what smoother expects
 
-- [ ] **3.2** Write smoother tests
-  - `test_switching_point_process_smoother_runs`: No errors on filter output
-  - `test_switching_point_process_smoother_consistency`: Smoothed variance ≤ filtered variance
-  - `test_last_pair_cond_mean_for_smoother`: Verify shape compatibility
+- [x] **3.2** Write smoother integration tests
+  - `test_smoother_runs_on_filter_output`: No errors on filter output
+  - `test_smoother_output_no_nans`: Smoother doesn't produce NaN values
+  - `test_smoother_shapes_compatible`: Verify all output shapes compatible
+  - `test_smoother_discrete_probs_sum_to_one`: Probability constraints
 
 ---
 

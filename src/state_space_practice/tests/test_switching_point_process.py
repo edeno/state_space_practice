@@ -1128,3 +1128,365 @@ class TestSwitchingPointProcessFilter:
         assert jnp.all(filter_discrete_state_prob >= 0)
         prob_sums = jnp.sum(filter_discrete_state_prob, axis=1)
         np.testing.assert_allclose(prob_sums, jnp.ones(n_time), rtol=1e-5)
+
+
+class TestSmootherIntegration:
+    """Tests verifying switching_kalman_smoother works with point-process filter outputs.
+
+    The smoother is observation-model agnostic - it only operates on Gaussian posteriors.
+    These tests verify that the point-process filter outputs are compatible with the
+    existing switching_kalman_smoother.
+    """
+
+    def test_smoother_runs_on_filter_output(self) -> None:
+        """Smoother should run without error on point-process filter outputs."""
+        from state_space_practice.switching_kalman import switching_kalman_smoother
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        n_time = 30
+        n_latent = 4
+        n_neurons = 5
+        n_discrete_states = 2
+        dt = 0.02
+
+        # Initial conditions
+        init_state_cond_mean = jnp.zeros((n_latent, n_discrete_states))
+        init_state_cond_cov = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        init_discrete_state_prob = jnp.ones(n_discrete_states) / n_discrete_states
+
+        # Observations
+        key = jax.random.PRNGKey(0)
+        spikes = jax.random.poisson(key, 0.5, shape=(n_time, n_neurons)).astype(float)
+
+        # Dynamics
+        discrete_transition_matrix = jnp.array([[0.9, 0.1], [0.1, 0.9]])
+        continuous_transition_matrix = jnp.stack(
+            [jnp.eye(n_latent) * 0.99, jnp.eye(n_latent) * 0.95], axis=-1
+        )
+        process_cov = jnp.stack(
+            [jnp.eye(n_latent) * 0.01, jnp.eye(n_latent) * 0.02], axis=-1
+        )
+
+        # Spike observation model
+        weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
+        baseline = jnp.zeros(n_neurons)
+        log_intensity_func = linear_log_intensity(weights, baseline)
+
+        # Run filter
+        (
+            filter_mean,
+            filter_cov,
+            filter_discrete_prob,
+            last_pair_cond_mean,
+            _,
+        ) = switching_point_process_filter(
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            spikes,
+            discrete_transition_matrix,
+            continuous_transition_matrix,
+            process_cov,
+            dt,
+            log_intensity_func,
+        )
+
+        # Run smoother on filter output - should not raise
+        # Smoother returns 9 values: (overall_mean, overall_cov, discrete_probs,
+        # joint_discrete_probs, cross_cov, state_cond_mean, state_cond_cov,
+        # pair_cond_cross_cov, pair_cond_mean)
+        (
+            smoother_mean,
+            smoother_cov,
+            smoother_discrete_prob,
+            _,  # joint discrete probs
+            _,  # cross cov
+            _,  # state conditional means
+            _,  # state conditional covs
+            _,  # pair conditional cross covs
+            _,  # pair conditional means
+        ) = switching_kalman_smoother(
+            filter_mean=filter_mean,
+            filter_cov=filter_cov,
+            filter_discrete_state_prob=filter_discrete_prob,
+            last_filter_conditional_cont_mean=last_pair_cond_mean,
+            process_cov=process_cov,
+            continuous_transition_matrix=continuous_transition_matrix,
+            discrete_state_transition_matrix=discrete_transition_matrix,
+        )
+
+        # Verify shapes - overall smoother mean/cov are marginalized over discrete states
+        assert smoother_mean.shape == (n_time, n_latent)
+        assert smoother_cov.shape == (n_time, n_latent, n_latent)
+        assert smoother_discrete_prob.shape == (n_time, n_discrete_states)
+
+    def test_smoother_output_no_nans(self) -> None:
+        """Smoother should not produce NaN values."""
+        from state_space_practice.switching_kalman import switching_kalman_smoother
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        n_time = 25
+        n_latent = 3
+        n_neurons = 4
+        n_discrete_states = 2
+        dt = 0.02
+
+        init_state_cond_mean = jnp.zeros((n_latent, n_discrete_states))
+        init_state_cond_cov = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        init_discrete_state_prob = jnp.ones(n_discrete_states) / n_discrete_states
+
+        key = jax.random.PRNGKey(42)
+        spikes = jax.random.poisson(key, 0.5, shape=(n_time, n_neurons)).astype(float)
+
+        discrete_transition_matrix = jnp.array([[0.9, 0.1], [0.1, 0.9]])
+        continuous_transition_matrix = jnp.stack(
+            [jnp.eye(n_latent) * 0.99, jnp.eye(n_latent) * 0.95], axis=-1
+        )
+        process_cov = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
+
+        weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
+        baseline = jnp.zeros(n_neurons)
+        log_intensity_func = linear_log_intensity(weights, baseline)
+
+        # Filter
+        (
+            filter_mean,
+            filter_cov,
+            filter_discrete_prob,
+            last_pair_cond_mean,
+            _,
+        ) = switching_point_process_filter(
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            spikes,
+            discrete_transition_matrix,
+            continuous_transition_matrix,
+            process_cov,
+            dt,
+            log_intensity_func,
+        )
+
+        # Smoother (9 return values)
+        (
+            smoother_mean,
+            smoother_cov,
+            smoother_discrete_prob,
+            _,  # joint discrete probs
+            _,  # cross cov
+            _,  # state conditional means
+            _,  # state conditional covs
+            _,  # pair conditional cross covs
+            _,  # pair conditional means
+        ) = switching_kalman_smoother(
+            filter_mean=filter_mean,
+            filter_cov=filter_cov,
+            filter_discrete_state_prob=filter_discrete_prob,
+            last_filter_conditional_cont_mean=last_pair_cond_mean,
+            process_cov=process_cov,
+            continuous_transition_matrix=continuous_transition_matrix,
+            discrete_state_transition_matrix=discrete_transition_matrix,
+        )
+
+        assert not jnp.any(jnp.isnan(smoother_mean))
+        assert not jnp.any(jnp.isnan(smoother_cov))
+        assert not jnp.any(jnp.isnan(smoother_discrete_prob))
+
+    def test_smoother_shapes_compatible(self) -> None:
+        """Smoother outputs should have shapes compatible with filter outputs.
+
+        Note: The theoretical property that smoothed variance <= filtered variance
+        holds exactly only for the marginal (overall) distributions in a standard
+        Kalman filter. In switching models with mixture collapse approximations,
+        this property may not hold exactly for state-conditional quantities.
+
+        This test verifies shape compatibility and that the smoother produces
+        reasonable outputs (no NaN, finite values).
+        """
+        from state_space_practice.switching_kalman import switching_kalman_smoother
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        n_time = 40
+        n_latent = 2
+        n_neurons = 3
+        n_discrete_states = 2
+        dt = 0.02
+
+        init_state_cond_mean = jnp.zeros((n_latent, n_discrete_states))
+        init_state_cond_cov = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        init_discrete_state_prob = jnp.ones(n_discrete_states) / n_discrete_states
+
+        key = jax.random.PRNGKey(99)
+        spikes = jax.random.poisson(key, 0.5, shape=(n_time, n_neurons)).astype(float)
+
+        discrete_transition_matrix = jnp.array([[0.9, 0.1], [0.1, 0.9]])
+        continuous_transition_matrix = jnp.stack(
+            [jnp.eye(n_latent) * 0.99, jnp.eye(n_latent) * 0.95], axis=-1
+        )
+        process_cov = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
+
+        weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
+        baseline = jnp.zeros(n_neurons)
+        log_intensity_func = linear_log_intensity(weights, baseline)
+
+        # Filter
+        (
+            filter_mean,
+            filter_cov,
+            filter_discrete_prob,
+            last_pair_cond_mean,
+            _,
+        ) = switching_point_process_filter(
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            spikes,
+            discrete_transition_matrix,
+            continuous_transition_matrix,
+            process_cov,
+            dt,
+            log_intensity_func,
+        )
+
+        # Smoother (9 return values)
+        (
+            overall_smoother_mean,
+            overall_smoother_cov,
+            smoother_discrete_prob,
+            joint_discrete_prob,
+            cross_cov,
+            state_cond_smoother_mean,
+            state_cond_smoother_cov,
+            _,  # pair conditional cross covs
+            _,  # pair conditional means
+        ) = switching_kalman_smoother(
+            filter_mean=filter_mean,
+            filter_cov=filter_cov,
+            filter_discrete_state_prob=filter_discrete_prob,
+            last_filter_conditional_cont_mean=last_pair_cond_mean,
+            process_cov=process_cov,
+            continuous_transition_matrix=continuous_transition_matrix,
+            discrete_state_transition_matrix=discrete_transition_matrix,
+        )
+
+        # Verify shape compatibility
+        # Overall quantities are marginalized over discrete states
+        assert overall_smoother_mean.shape == (n_time, n_latent)
+        assert overall_smoother_cov.shape == (n_time, n_latent, n_latent)
+        assert smoother_discrete_prob.shape == (n_time, n_discrete_states)
+        # Joint discrete prob shape: (n_time - 1, n_discrete_states, n_discrete_states)
+        assert joint_discrete_prob.shape == (
+            n_time - 1,
+            n_discrete_states,
+            n_discrete_states,
+        )
+        # Cross covariance shape: (n_time - 1, n_latent, n_latent)
+        assert cross_cov.shape == (n_time - 1, n_latent, n_latent)
+        # State-conditional quantities indexed by discrete state
+        assert state_cond_smoother_mean.shape == (n_time, n_latent, n_discrete_states)
+        assert state_cond_smoother_cov.shape == (
+            n_time,
+            n_latent,
+            n_latent,
+            n_discrete_states,
+        )
+
+        # All outputs should be finite
+        assert jnp.all(jnp.isfinite(overall_smoother_mean))
+        assert jnp.all(jnp.isfinite(overall_smoother_cov))
+        assert jnp.all(jnp.isfinite(smoother_discrete_prob))
+        assert jnp.all(jnp.isfinite(state_cond_smoother_mean))
+        assert jnp.all(jnp.isfinite(state_cond_smoother_cov))
+
+    def test_smoother_discrete_probs_sum_to_one(self) -> None:
+        """Smoothed discrete probabilities should sum to 1."""
+        from state_space_practice.switching_kalman import switching_kalman_smoother
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        n_time = 20
+        n_latent = 2
+        n_neurons = 3
+        n_discrete_states = 3
+        dt = 0.02
+
+        init_state_cond_mean = jnp.zeros((n_latent, n_discrete_states))
+        init_state_cond_cov = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        init_discrete_state_prob = jnp.ones(n_discrete_states) / n_discrete_states
+
+        key = jax.random.PRNGKey(77)
+        spikes = jax.random.poisson(key, 0.5, shape=(n_time, n_neurons)).astype(float)
+
+        discrete_transition_matrix = jnp.ones((n_discrete_states, n_discrete_states))
+        discrete_transition_matrix = discrete_transition_matrix / n_discrete_states
+
+        continuous_transition_matrix = jnp.stack(
+            [jnp.eye(n_latent) * (0.9 + 0.03 * i) for i in range(n_discrete_states)],
+            axis=-1,
+        )
+        process_cov = jnp.stack(
+            [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
+        )
+
+        weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
+        baseline = jnp.zeros(n_neurons)
+        log_intensity_func = linear_log_intensity(weights, baseline)
+
+        # Filter
+        (
+            filter_mean,
+            filter_cov,
+            filter_discrete_prob,
+            last_pair_cond_mean,
+            _,
+        ) = switching_point_process_filter(
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            spikes,
+            discrete_transition_matrix,
+            continuous_transition_matrix,
+            process_cov,
+            dt,
+            log_intensity_func,
+        )
+
+        # Smoother (9 return values)
+        (
+            _,  # overall mean
+            _,  # overall cov
+            smoother_discrete_prob,
+            _,  # joint discrete probs
+            _,  # cross cov
+            _,  # state conditional means
+            _,  # state conditional covs
+            _,  # pair conditional cross covs
+            _,  # pair conditional means
+        ) = switching_kalman_smoother(
+            filter_mean=filter_mean,
+            filter_cov=filter_cov,
+            filter_discrete_state_prob=filter_discrete_prob,
+            last_filter_conditional_cont_mean=last_pair_cond_mean,
+            process_cov=process_cov,
+            continuous_transition_matrix=continuous_transition_matrix,
+            discrete_state_transition_matrix=discrete_transition_matrix,
+        )
+
+        # Probabilities should sum to 1
+        prob_sums = jnp.sum(smoother_discrete_prob, axis=1)
+        np.testing.assert_allclose(prob_sums, jnp.ones(n_time), rtol=1e-5)

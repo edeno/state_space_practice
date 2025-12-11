@@ -3,8 +3,8 @@
 ## Current Status
 
 - **Date**: 2025-12-11
-- **Working on**: Milestone 2 COMPLETE - Starting Milestone 3 (Smoother Integration)
-- **Current Task**: 3.1 - Create `switching_point_process_smoother()` wrapper/alias
+- **Working on**: Milestone 3 COMPLETE - Ready for Milestone 4 (Simulation Utilities)
+- **Current Task**: None - waiting for next task
 
 ## Milestone 1 Summary (COMPLETE)
 
@@ -80,8 +80,31 @@ All 5 tasks completed:
 
 None currently.
 
+## Milestone 3 Summary (COMPLETE)
+
+All 2 tasks completed:
+
+- 3.1 **Decision**: No wrapper needed - smoother is observation-model agnostic, just use `switching_kalman_smoother` directly
+- 3.2 Wrote 4 smoother integration tests (all passing)
+
+### Key Implementation Details (Milestone 3)
+
+#### Smoother Integration
+
+- `switching_kalman_smoother` works directly with `switching_point_process_filter` outputs
+- No wrapper or alias needed - smoother operates on Gaussian posteriors regardless of observation model
+- Tests verify:
+  - Smoother runs without error on filter output
+  - No NaN values in smoother output
+  - All output shapes are compatible (overall mean/cov are marginalized, state-conditional are indexed)
+  - Smoothed discrete probabilities sum to 1
+
+#### Note on Variance Property
+
+The theoretical property that smoothed variance ≤ filtered variance holds exactly only for marginal distributions in standard Kalman filters. In switching models with mixture collapse approximations, this property may not hold exactly for state-conditional quantities.
+
 ## Next Steps
 
-- Implement `switching_point_process_smoother()` - thin wrapper around `switching_kalman_smoother`
-- Verify smoother runs correctly with filter outputs
-- Write smoother integration tests
+- Milestone 4: Simulation utilities for synthetic data generation
+- Milestone 5: Spike GLM M-step for observation parameter updates
+- Milestone 6: Dynamics M-step verification
