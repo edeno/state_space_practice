@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
-from state_space_practice.kalman import symmetrize
+from state_space_practice.kalman import psd_solve, symmetrize
 from state_space_practice.switching_kalman import (
     _scale_likelihood,
     _update_discrete_state_probabilities,
@@ -64,6 +64,9 @@ def point_process_kalman_update(
     y_t: Array,
     dt: float,
     log_intensity_func: Callable[[Array], Array],
+    diagonal_boost: float = 1e-9,
+    grad_log_intensity_func: Callable[[Array], Array] | None = None,
+    hess_log_intensity_func: Callable[[Array], Array] | None = None,
 ) -> tuple[Array, Array, float]:
     """Single point-process Laplace-EKF update for multiple neurons.
 
@@ -89,6 +92,17 @@ def point_process_kalman_update(
     log_intensity_func : Callable[[Array], Array]
         Function mapping state (n_latent,) to log-intensities (n_neurons,).
         Should return log(lambda) where lambda is firing rate in Hz.
+    diagonal_boost : float, default=1e-9
+        Small value added to precision matrix diagonal for numerical stability
+        when solving linear systems.
+    grad_log_intensity_func : Callable[[Array], Array] | None, optional
+        Pre-computed gradient function (Jacobian) of log_intensity_func.
+        If None, computed via jax.jacfwd(log_intensity_func).
+        Passing pre-computed functions can improve compilation speed when
+        this function is called repeatedly inside a JIT-compiled context.
+    hess_log_intensity_func : Callable[[Array], Array] | None, optional
+        Pre-computed Hessian function of log_intensity_func.
+        If None, computed via jax.jacfwd of the gradient function.
 
     Returns
     -------
@@ -117,8 +131,10 @@ def point_process_kalman_update(
     # Compute gradients and Hessians of log-intensity function
     # grad: d(log_lambda)/d(state) -> (n_neurons, n_latent) Jacobian
     # hess: d^2(log_lambda)/d(state)^2 -> (n_neurons, n_latent, n_latent) Hessian
-    grad_log_intensity = jax.jacfwd(log_intensity_func)
-    hess_log_intensity = jax.jacfwd(grad_log_intensity)
+    if grad_log_intensity_func is None:
+        grad_log_intensity_func = jax.jacfwd(log_intensity_func)
+    if hess_log_intensity_func is None:
+        hess_log_intensity_func = jax.jacfwd(grad_log_intensity_func)
 
     # Evaluate at the one-step predicted mean
     log_lambda = log_intensity_func(one_step_mean)  # (n_neurons,)
@@ -128,10 +144,10 @@ def point_process_kalman_update(
     innovation = y_t - conditional_intensity  # (n_neurons,)
 
     # Jacobian: (n_neurons, n_latent)
-    jacobian = grad_log_intensity(one_step_mean)  # (n_neurons, n_latent)
+    jacobian = grad_log_intensity_func(one_step_mean)  # (n_neurons, n_latent)
 
     # Hessian: (n_neurons, n_latent, n_latent)
-    hessian = hess_log_intensity(one_step_mean)  # (n_neurons, n_latent, n_latent)
+    hessian = hess_log_intensity_func(one_step_mean)  # (n_neurons, n_latent, n_latent)
 
     # For Poisson likelihood with log-link:
     # log p(y | x) = sum_n [y_n * log(lambda_n * dt) - lambda_n * dt - log(y_n!)]
@@ -161,17 +177,25 @@ def point_process_kalman_update(
         "n,nij->ij", innovation, hessian
     )  # (n_latent, n_latent)
 
-    # Inverse posterior covariance (precision)
-    # P^{-1} = P_prior^{-1} + Fisher - innovation * Hessian
-    prior_precision = jnp.linalg.pinv(one_step_cov)
+    # Compute prior precision by solving P_prior @ P_prior^{-1} = I
+    # Using psd_solve for numerical stability instead of explicit inversion
+    n_latent = one_step_mean.shape[0]
+    identity = jnp.eye(n_latent)
+    prior_precision = psd_solve(one_step_cov, identity, diagonal_boost=diagonal_boost)
+
+    # Posterior precision: P^{-1} = P_prior^{-1} + Fisher - innovation * Hessian
     posterior_precision = prior_precision + fisher_info - hessian_correction
 
-    # Posterior covariance
-    posterior_cov = jnp.linalg.pinv(posterior_precision)
+    # Posterior covariance: solve P_post^{-1} @ P_post = I
+    # Using psd_solve for numerical stability
+    posterior_cov = psd_solve(posterior_precision, identity, diagonal_boost=diagonal_boost)
     posterior_cov = symmetrize(posterior_cov)
 
     # Posterior mean: Newton step from prior
-    posterior_mean = one_step_mean + posterior_cov @ gradient
+    # Solve posterior_precision @ delta = gradient, then mean = one_step_mean + delta
+    posterior_mean = one_step_mean + psd_solve(
+        posterior_precision, gradient, diagonal_boost=diagonal_boost
+    )
 
     # Log-likelihood: sum of Poisson log-pmfs at predicted intensity
     log_likelihood = jnp.sum(jax.scipy.stats.poisson.logpmf(y_t, conditional_intensity))
@@ -314,13 +338,79 @@ def _point_process_update_per_discrete_state_pair(
     )
 
 
+def _armijo_line_search(
+    params: Array,
+    delta: Array,
+    gradient: Array,
+    loss_fn: Callable[[Array], float],
+    current_loss: float,
+    beta: float = 0.5,
+    c: float = 1e-4,
+    max_iter: int = 20,
+) -> Array:
+    """Backtracking line search with Armijo condition.
+
+    Finds a step size alpha such that the sufficient decrease (Armijo)
+    condition is satisfied:
+        loss(params - alpha * delta) <= loss(params) - c * alpha * grad^T @ delta
+
+    Parameters
+    ----------
+    params : Array, shape (n_params,)
+        Current parameter values.
+    delta : Array, shape (n_params,)
+        Search direction (typically Newton direction H^{-1} @ g).
+    gradient : Array, shape (n_params,)
+        Gradient at current params.
+    loss_fn : Callable[[Array], float]
+        Loss function to minimize. Takes params and returns scalar loss.
+    current_loss : float
+        Loss at current params (avoids recomputation).
+    beta : float, default=0.5
+        Step reduction factor for backtracking.
+    c : float, default=1e-4
+        Armijo constant for sufficient decrease condition.
+    max_iter : int, default=20
+        Maximum number of backtracking iterations.
+
+    Returns
+    -------
+    alpha : Array
+        Step size satisfying Armijo condition.
+
+    Notes
+    -----
+    The search starts with alpha=1 and repeatedly multiplies by beta
+    until the Armijo condition is satisfied or max_iter is reached.
+    """
+    directional_derivative = jnp.dot(gradient, delta)
+
+    def line_search_step(carry, _):
+        alpha, _ = carry
+        new_params_trial = params - alpha * delta
+        new_loss = loss_fn(new_params_trial)
+
+        # Armijo condition: new_loss <= current_loss - c * alpha * directional_derivative
+        sufficient_decrease = new_loss <= current_loss - c * alpha * directional_derivative
+
+        # Reduce alpha if not sufficient decrease
+        new_alpha = jnp.where(sufficient_decrease, alpha, alpha * beta)
+        return (new_alpha, sufficient_decrease), None
+
+    (final_alpha, _), _ = jax.lax.scan(
+        line_search_step, (jnp.array(1.0), jnp.array(False)), None, length=max_iter
+    )
+
+    return final_alpha
+
+
 def _single_neuron_glm_loss(
-    baseline: float,
+    baseline: Array,
     weights: Array,
     y_n: Array,
     smoother_mean: Array,
     dt: float,
-) -> float:
+) -> Array:
     """Poisson negative log-likelihood for a single neuron GLM.
 
     Computes the negative log-likelihood for a Poisson GLM observation model:
@@ -331,8 +421,8 @@ def _single_neuron_glm_loss(
 
     Parameters
     ----------
-    baseline : float
-        Baseline log-rate for the neuron.
+    baseline : Array, shape ()
+        Baseline log-rate for the neuron (0-D array).
     weights : Array, shape (n_latent,)
         Linear weights mapping latent state to log-rate.
     y_n : Array, shape (n_time,)
@@ -344,7 +434,7 @@ def _single_neuron_glm_loss(
 
     Returns
     -------
-    loss : float
+    loss : Array, shape ()
         Negative log-likelihood: -sum_t [y_t * eta_t - exp(eta_t) * dt]
         where eta_t = baseline + weights @ smoother_mean[t].
 
@@ -377,12 +467,12 @@ def _single_neuron_glm_loss(
 
 
 def _single_neuron_glm_step(
-    baseline: float,
+    baseline: Array,
     weights: Array,
     y_n: Array,
     smoother_mean: Array,
     dt: float,
-) -> tuple[float, Array]:
+) -> tuple[Array, Array]:
     """Single Newton-Raphson step for Poisson GLM parameter optimization.
 
     Takes one Newton step to minimize the negative log-likelihood
@@ -395,8 +485,8 @@ def _single_neuron_glm_step(
 
     Parameters
     ----------
-    baseline : float
-        Current baseline log-rate for the neuron.
+    baseline : Array, shape ()
+        Current baseline log-rate for the neuron (0-D array).
     weights : Array, shape (n_latent,)
         Current linear weights mapping latent state to log-rate.
     y_n : Array, shape (n_time,)
@@ -408,8 +498,8 @@ def _single_neuron_glm_step(
 
     Returns
     -------
-    new_baseline : float
-        Updated baseline after Newton step.
+    new_baseline : Array, shape ()
+        Updated baseline after Newton step (0-D array).
     new_weights : Array, shape (n_latent,)
         Updated weights after Newton step.
 
@@ -459,33 +549,14 @@ def _single_neuron_glm_step(
     # Current loss for backtracking line search
     current_loss = jnp.sum(mu - y_n * eta)  # NLL without constant term
 
-    # Backtracking line search with Armijo condition
-    # Parameters: alpha starts at 1, beta for reduction, c for sufficient decrease
-    beta = 0.5  # Step reduction factor
-    c = 1e-4  # Armijo constant
-
-    # Expected decrease from gradient (for Armijo condition)
-    # directional_derivative = gradient.T @ delta (should be positive for descent)
-    directional_derivative = jnp.dot(gradient, delta)
-
-    def line_search_step(carry, _):
-        alpha, _ = carry
-        new_params_trial = params - alpha * delta
-        eta_trial = design_matrix @ new_params_trial
+    # Define loss function for line search
+    def loss_fn(p):
+        eta_trial = design_matrix @ p
         mu_trial = jnp.exp(eta_trial) * dt
-        new_loss = jnp.sum(mu_trial - y_n * eta_trial)
+        return jnp.sum(mu_trial - y_n * eta_trial)
 
-        # Armijo condition: new_loss <= current_loss - c * alpha * directional_derivative
-        sufficient_decrease = new_loss <= current_loss - c * alpha * directional_derivative
-
-        # Reduce alpha if not sufficient decrease
-        new_alpha = jnp.where(sufficient_decrease, alpha, alpha * beta)
-        return (new_alpha, sufficient_decrease), None
-
-    # Run up to 20 backtracking iterations
-    (final_alpha, _), _ = jax.lax.scan(
-        line_search_step, (jnp.array(1.0), jnp.array(False)), None, length=20
-    )
+    # Backtracking line search with Armijo condition
+    final_alpha = _armijo_line_search(params, delta, gradient, loss_fn, current_loss)
 
     # Apply final step
     new_params = params - final_alpha * delta
@@ -498,13 +569,13 @@ def _single_neuron_glm_step(
 
 
 def _single_neuron_glm_step_second_order(
-    baseline: float,
+    baseline: Array,
     weights: Array,
     y_n: Array,
     smoother_mean: Array,
     smoother_cov: Array,
     dt: float,
-) -> tuple[float, Array]:
+) -> tuple[Array, Array]:
     """Single Newton step for Poisson GLM with second-order expectation.
 
     Uses the second-order approximation that accounts for state uncertainty:
@@ -515,8 +586,8 @@ def _single_neuron_glm_step_second_order(
 
     Parameters
     ----------
-    baseline : float
-        Current baseline log-rate for the neuron.
+    baseline : Array, shape ()
+        Current baseline log-rate for the neuron (0-D array).
     weights : Array, shape (n_latent,)
         Current linear weights mapping latent state to log-rate.
     y_n : Array, shape (n_time,)
@@ -530,8 +601,8 @@ def _single_neuron_glm_step_second_order(
 
     Returns
     -------
-    new_baseline : float
-        Updated baseline after Newton step.
+    new_baseline : Array, shape ()
+        Updated baseline after Newton step (0-D array).
     new_weights : Array, shape (n_latent,)
         Updated weights after Newton step.
     """
@@ -598,15 +669,9 @@ def _single_neuron_glm_step_second_order(
     # Current loss for backtracking
     current_loss = jnp.sum(mu - y_n * (design_matrix @ params + variance_corrections))
 
-    # Backtracking line search
-    beta = 0.5
-    c_armijo = 1e-4
-    directional_derivative = jnp.dot(gradient, delta)
-
-    def line_search_step(carry, _):
-        alpha, _ = carry
-        new_params_trial = params - alpha * delta
-        new_weights_trial = new_params_trial[1:]
+    # Define loss function for line search (includes variance correction recomputation)
+    def loss_fn(p):
+        new_weights_trial = p[1:]
 
         # Recompute variance corrections with new weights
         def compute_var_corr_trial(P_t):
@@ -614,17 +679,12 @@ def _single_neuron_glm_step_second_order(
 
         var_corr_trial = jax.vmap(compute_var_corr_trial)(smoother_cov)
 
-        eta_trial = design_matrix @ new_params_trial + var_corr_trial
+        eta_trial = design_matrix @ p + var_corr_trial
         mu_trial = jnp.exp(eta_trial) * dt
-        new_loss = jnp.sum(mu_trial - y_n * (design_matrix @ new_params_trial + var_corr_trial))
+        return jnp.sum(mu_trial - y_n * (design_matrix @ p + var_corr_trial))
 
-        sufficient_decrease = new_loss <= current_loss - c_armijo * alpha * directional_derivative
-        new_alpha = jnp.where(sufficient_decrease, alpha, alpha * beta)
-        return (new_alpha, sufficient_decrease), None
-
-    (final_alpha, _), _ = jax.lax.scan(
-        line_search_step, (jnp.array(1.0), jnp.array(False)), None, length=20
-    )
+    # Backtracking line search with Armijo condition
+    final_alpha = _armijo_line_search(params, delta, gradient, loss_fn, current_loss)
 
     new_params = params - final_alpha * delta
     new_baseline = new_params[0]
@@ -821,6 +881,17 @@ def switching_point_process_filter(
     1. Computes pair-conditional posteriors for all (i, j) state pairs
     2. Updates discrete state probabilities using the HMM forward algorithm
     3. Collapses pair-conditional to state-conditional via Gaussian mixture
+
+    **Performance**: For production use, wrap this function with ``jax.jit``
+    for significant speedups. The function uses ``jax.lax.scan`` and ``vmap``
+    internally, which benefit greatly from JIT compilation::
+
+        jitted_filter = jax.jit(switching_point_process_filter, static_argnums=(8,))
+        results = jitted_filter(init_mean, init_cov, init_prob, spikes,
+                                trans_mat, cont_trans, proc_cov, dt, log_intensity)
+
+    Note that ``log_intensity_func`` (argument 8) must be marked as static
+    since it's a Python callable.
 
     References
     ----------
