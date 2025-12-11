@@ -3,8 +3,8 @@
 ## Current Status
 
 - **Date**: 2025-12-11
-- **Working on**: Milestone 7 - Tasks 7.1, 7.2, and 7.3 COMPLETE
-- **Current Task**: Task 7.4 - Implement `_m_step_dynamics()` method
+- **Working on**: Milestone 7 - Tasks 7.1, 7.2, 7.3, and 7.4 COMPLETE
+- **Current Task**: Task 7.5 - Implement `_m_step_spikes()` method
 
 ## Milestone 1 Summary (COMPLETE)
 
@@ -294,6 +294,40 @@ Implemented `SwitchingSpikeOscillatorModel._e_step()` method with:
 - Proper closure capture of spike parameters
 - Comprehensive docstring with all stored attributes listed
 
-### Next: Task 7.4
+### Task 7.4 (COMPLETE)
 
-Implement `_m_step_dynamics()` method
+Implemented `SwitchingSpikeOscillatorModel._m_step_dynamics()` method with:
+
+- Calls `switching_kalman_maximization_step` with stored smoother outputs from E-step
+- Uses dummy observation array (required but unused for dynamics M-step)
+- Updates model parameters conditionally based on update flags:
+  - `continuous_transition_matrix (A)`: if `update_continuous_transition_matrix=True`
+  - `process_cov (Q)`: if `update_process_cov=True`, with PSD regularization
+  - `discrete_transition_matrix (Z)`: if `update_discrete_transition_matrix=True`
+  - `init_mean (m0)`: if `update_init_mean=True`
+  - `init_cov (P0)`: if `update_init_cov=True`
+  - `init_discrete_state_prob`: always updated (from smoother posterior at t=0)
+- Ignores `measurement_matrix` and `measurement_cov` returns (assume Gaussian observations)
+- Ensures PSD process covariance via regularization: `Q = Q + 1e-8 * I`
+
+#### Tests Added (15 tests)
+
+- Basic functionality (runs without error)
+- Each parameter update flag tested (A, Q, Z, m0, P0)
+- Disabled flag preserves original value (for each parameter)
+- PSD enforcement for process covariance
+- Single discrete state edge case
+- init_discrete_state_prob always updated and sums to 1
+- All updates disabled case
+
+#### Code Review Notes
+
+- APPROVED by code-reviewer agent
+- Simple, correct delegation to `switching_kalman_maximization_step`
+- Proper handling of update flags (conditional updates)
+- Regularization approach documented and sufficient for typical cases
+- Good docstring explaining which parameters are updated and when
+
+### Next: Task 7.5
+
+Implement `_m_step_spikes()` method

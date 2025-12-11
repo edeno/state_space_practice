@@ -239,10 +239,11 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
   - Store smoother outputs as attributes for M-step
   - Return marginal log-likelihood
 
-- [ ] **7.4** Implement `_m_step_dynamics()` method
+- [x] **7.4** Implement `_m_step_dynamics()` method
   - Call `switching_kalman_maximization_step`
-  - Update A, Q, B, initial state based on update flags
-  - Optionally apply `project_coupled_transition_matrix`
+  - Update A, Q, discrete transitions, initial state based on update flags
+  - Ensure Q is PSD via regularization (eps=1e-8)
+  - Ignore measurement_matrix/measurement_cov returns (Gaussian-only)
 
 - [ ] **7.5** Implement `_m_step_spikes()` method
   - Call `update_spike_glm_params`

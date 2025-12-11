@@ -3978,3 +3978,536 @@ class TestSwitchingSpikeOscillatorModelEStep:
         # All smoother outputs should be finite
         assert jnp.all(jnp.isfinite(model.smoother_state_cond_mean))
         assert jnp.all(jnp.isfinite(model.smoother_discrete_state_prob))
+
+
+class TestSwitchingSpikeOscillatorModelMStepDynamics:
+    """Tests for SwitchingSpikeOscillatorModel._m_step_dynamics() method (Task 7.4)."""
+
+    def test_m_step_dynamics_runs_without_error(self) -> None:
+        """_m_step_dynamics should run without error after E-step."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_neurons = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        # Run E-step first (required before M-step)
+        model._e_step(spikes)
+
+        # M-step dynamics should not raise
+        model._m_step_dynamics()
+
+    def test_m_step_dynamics_updates_continuous_transition_matrix(self) -> None:
+        """_m_step_dynamics should update continuous_transition_matrix when flag is True."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+        n_oscillators = 2
+        n_discrete_states = 2
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_continuous_transition_matrix=True,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_dynamics()
+
+        # A should have correct shape and be finite
+        assert model.continuous_transition_matrix.shape == (
+            n_latent,
+            n_latent,
+            n_discrete_states,
+        )
+        assert jnp.all(jnp.isfinite(model.continuous_transition_matrix))
+
+    def test_m_step_dynamics_does_not_update_continuous_transition_matrix_when_disabled(
+        self,
+    ) -> None:
+        """_m_step_dynamics should not update A when flag is False."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_continuous_transition_matrix=False,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        # Store original A
+        A_before = model.continuous_transition_matrix.copy()
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_dynamics()
+
+        # A should NOT have been updated
+        np.testing.assert_allclose(
+            model.continuous_transition_matrix, A_before, rtol=1e-10
+        )
+
+    def test_m_step_dynamics_updates_process_cov(self) -> None:
+        """_m_step_dynamics should update process_cov when flag is True."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+        n_oscillators = 2
+        n_discrete_states = 2
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_process_cov=True,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_dynamics()
+
+        # Q should have correct shape and be finite
+        assert model.process_cov.shape == (n_latent, n_latent, n_discrete_states)
+        assert jnp.all(jnp.isfinite(model.process_cov))
+
+    def test_m_step_dynamics_does_not_update_process_cov_when_disabled(self) -> None:
+        """_m_step_dynamics should not update Q when flag is False."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_process_cov=False,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        # Store original Q
+        Q_before = model.process_cov.copy()
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_dynamics()
+
+        # Q should NOT have been updated
+        np.testing.assert_allclose(model.process_cov, Q_before, rtol=1e-10)
+
+    def test_m_step_dynamics_updates_discrete_transition_matrix(self) -> None:
+        """_m_step_dynamics should update discrete_transition_matrix when flag is True."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+        n_discrete_states = 2
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_discrete_transition_matrix=True,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_dynamics()
+
+        # Discrete transition matrix should have correct shape
+        assert model.discrete_transition_matrix.shape == (
+            n_discrete_states,
+            n_discrete_states,
+        )
+        # Rows should sum to 1 (stochastic matrix)
+        row_sums = jnp.sum(model.discrete_transition_matrix, axis=1)
+        np.testing.assert_allclose(row_sums, jnp.ones(n_discrete_states), rtol=1e-5)
+        # All entries should be non-negative
+        assert jnp.all(model.discrete_transition_matrix >= 0)
+
+    def test_m_step_dynamics_does_not_update_discrete_transition_when_disabled(
+        self,
+    ) -> None:
+        """_m_step_dynamics should not update Z when flag is False."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_discrete_transition_matrix=False,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        # Store original Z
+        Z_before = model.discrete_transition_matrix.copy()
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_dynamics()
+
+        # Z should NOT have been updated
+        np.testing.assert_allclose(model.discrete_transition_matrix, Z_before, rtol=1e-10)
+
+    def test_m_step_dynamics_updates_init_mean(self) -> None:
+        """_m_step_dynamics should update init_mean when flag is True."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+        n_oscillators = 2
+        n_discrete_states = 2
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_init_mean=True,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_dynamics()
+
+        # init_mean should have correct shape and be finite
+        assert model.init_mean.shape == (n_latent, n_discrete_states)
+        assert jnp.all(jnp.isfinite(model.init_mean))
+
+    def test_m_step_dynamics_does_not_update_init_mean_when_disabled(self) -> None:
+        """_m_step_dynamics should not update init_mean when flag is False."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_init_mean=False,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        # Store original init_mean
+        m0_before = model.init_mean.copy()
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_dynamics()
+
+        # init_mean should NOT have been updated
+        np.testing.assert_allclose(model.init_mean, m0_before, rtol=1e-10)
+
+    def test_m_step_dynamics_updates_init_cov(self) -> None:
+        """_m_step_dynamics should update init_cov when flag is True."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+        n_oscillators = 2
+        n_discrete_states = 2
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_init_cov=True,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_dynamics()
+
+        # init_cov should have correct shape and be finite
+        assert model.init_cov.shape == (n_latent, n_latent, n_discrete_states)
+        assert jnp.all(jnp.isfinite(model.init_cov))
+
+    def test_m_step_dynamics_does_not_update_init_cov_when_disabled(self) -> None:
+        """_m_step_dynamics should not update init_cov when flag is False."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_init_cov=False,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        # Store original init_cov
+        P0_before = model.init_cov.copy()
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_dynamics()
+
+        # init_cov should NOT have been updated
+        np.testing.assert_allclose(model.init_cov, P0_before, rtol=1e-10)
+
+    def test_m_step_dynamics_process_cov_is_psd(self) -> None:
+        """_m_step_dynamics should ensure process_cov is positive semi-definite."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 60
+        n_neurons = 5
+        n_discrete_states = 2
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_process_cov=True,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_dynamics()
+
+        # Process covariance should be PSD for each discrete state
+        for j in range(n_discrete_states):
+            Q_j = model.process_cov[:, :, j]
+            eigvals = jnp.linalg.eigvalsh(Q_j)
+            # All eigenvalues should be non-negative (allowing small numerical error)
+            assert jnp.all(eigvals >= -1e-8), f"Q[{j}] has negative eigenvalue: {eigvals.min()}"
+
+    def test_m_step_dynamics_single_discrete_state(self) -> None:
+        """_m_step_dynamics should work with single discrete state."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_neurons = 5
+        n_discrete_states = 1
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_dynamics()
+
+        # Should complete without error
+        assert jnp.all(jnp.isfinite(model.continuous_transition_matrix))
+        assert jnp.all(jnp.isfinite(model.process_cov))
+        # Discrete transition matrix should be [[1.0]]
+        np.testing.assert_allclose(
+            model.discrete_transition_matrix, jnp.array([[1.0]]), rtol=1e-5
+        )
+
+    def test_m_step_dynamics_init_discrete_state_prob_updated(self) -> None:
+        """_m_step_dynamics should update init_discrete_state_prob."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+        n_discrete_states = 3
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_dynamics()
+
+        # init_discrete_state_prob should sum to 1
+        assert model.init_discrete_state_prob.shape == (n_discrete_states,)
+        np.testing.assert_allclose(
+            jnp.sum(model.init_discrete_state_prob), 1.0, rtol=1e-5
+        )
+        # All entries should be non-negative
+        assert jnp.all(model.init_discrete_state_prob >= 0)
+
+    def test_m_step_dynamics_all_updates_disabled(self) -> None:
+        """_m_step_dynamics should not change anything when all flags are False."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_continuous_transition_matrix=False,
+            update_process_cov=False,
+            update_discrete_transition_matrix=False,
+            update_init_mean=False,
+            update_init_cov=False,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        # Store original values
+        A_before = model.continuous_transition_matrix.copy()
+        Q_before = model.process_cov.copy()
+        Z_before = model.discrete_transition_matrix.copy()
+        m0_before = model.init_mean.copy()
+        P0_before = model.init_cov.copy()
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_dynamics()
+
+        # Nothing should have changed
+        np.testing.assert_allclose(model.continuous_transition_matrix, A_before, rtol=1e-10)
+        np.testing.assert_allclose(model.process_cov, Q_before, rtol=1e-10)
+        np.testing.assert_allclose(model.discrete_transition_matrix, Z_before, rtol=1e-10)
+        np.testing.assert_allclose(model.init_mean, m0_before, rtol=1e-10)
+        np.testing.assert_allclose(model.init_cov, P0_before, rtol=1e-10)

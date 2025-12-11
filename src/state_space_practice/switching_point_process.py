@@ -98,6 +98,7 @@ from state_space_practice.switching_kalman import (
     _scale_likelihood,
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture_per_discrete_state,
+    switching_kalman_maximization_step,
     switching_kalman_smoother,
 )
 
@@ -1580,3 +1581,87 @@ class SwitchingSpikeOscillatorModel:
         self.smoother_pair_cond_means = pair_cond_smoother_means
 
         return marginal_log_likelihood
+
+    def _m_step_dynamics(self) -> None:
+        """M-step for dynamics parameters: A, Q, discrete transitions, initial state.
+
+        Updates the dynamics-related model parameters by calling
+        `switching_kalman_maximization_step` with the stored smoother outputs
+        from the E-step. Parameters are only updated if their corresponding
+        update flag is True.
+
+        This method updates:
+        - continuous_transition_matrix (A): if update_continuous_transition_matrix=True
+        - process_cov (Q): if update_process_cov=True
+        - discrete_transition_matrix (Z): if update_discrete_transition_matrix=True
+        - init_mean (m0): if update_init_mean=True
+        - init_cov (P0): if update_init_cov=True
+        - init_discrete_state_prob: always updated (from smoother posterior)
+
+        Notes
+        -----
+        This method must be called after `_e_step()` which populates the smoother
+        output attributes used here.
+
+        The process covariance Q is regularized to ensure positive semi-definiteness
+        by adding a small value (1e-8) times the identity matrix. This handles
+        cases where low discrete state probability leads to numerically
+        non-PSD estimates from the raw M-step.
+
+        The measurement_matrix and measurement_cov returns from
+        `switching_kalman_maximization_step` are ignored since they assume
+        Gaussian observations, which don't apply to point-process models.
+        """
+        # Call the switching Kalman M-step for dynamics parameters
+        # obs argument is required but not used for dynamics updates
+        # We pass a dummy array since we don't use measurement_matrix/cov outputs
+        n_time = self.smoother_state_cond_mean.shape[0]
+        dummy_obs = jnp.zeros((n_time, 1))
+
+        (
+            new_A,
+            _,  # measurement_matrix - ignored for point-process
+            new_Q,
+            _,  # measurement_cov - ignored for point-process
+            new_init_mean,
+            new_init_cov,
+            new_discrete_transition,
+            new_init_discrete_prob,
+        ) = switching_kalman_maximization_step(
+            obs=dummy_obs,
+            state_cond_smoother_means=self.smoother_state_cond_mean,
+            state_cond_smoother_covs=self.smoother_state_cond_cov,
+            smoother_discrete_state_prob=self.smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
+            pair_cond_smoother_means=self.smoother_pair_cond_means,
+        )
+
+        # Update continuous transition matrix if flag is True
+        if self.update_continuous_transition_matrix:
+            self.continuous_transition_matrix = new_A
+
+        # Update process covariance if flag is True
+        if self.update_process_cov:
+            # Ensure PSD by adding small regularization
+            # The raw M-step can produce non-PSD Q when a discrete state
+            # has low probability or insufficient data
+            eps = 1e-8
+            Q_reg = new_Q + eps * jnp.eye(self.n_latent)[:, :, None]
+            self.process_cov = Q_reg
+
+        # Update discrete transition matrix if flag is True
+        if self.update_discrete_transition_matrix:
+            self.discrete_transition_matrix = new_discrete_transition
+
+        # Update initial mean if flag is True
+        if self.update_init_mean:
+            self.init_mean = new_init_mean
+
+        # Update initial covariance if flag is True
+        if self.update_init_cov:
+            self.init_cov = new_init_cov
+
+        # Always update initial discrete state probabilities
+        # (from smoother posterior at t=0)
+        self.init_discrete_state_prob = new_init_discrete_prob
