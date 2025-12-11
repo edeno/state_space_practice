@@ -3202,3 +3202,398 @@ class TestSwitchingSpikeOscillatorModelInit:
                 dt=0.01,
                 discrete_transition_diag=jnp.array([0.9, 0.95]),  # Wrong shape
             )
+
+
+class TestSwitchingSpikeOscillatorModelInitializeParameters:
+    """Tests for SwitchingSpikeOscillatorModel._initialize_parameters() method (Task 7.2)."""
+
+    def test_initialize_parameters_runs_without_error(self) -> None:
+        """_initialize_parameters should run without error."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=3,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        key = jax.random.PRNGKey(42)
+        model._initialize_parameters(key)  # Should not raise
+
+    def test_initialize_parameters_sets_init_mean(self) -> None:
+        """_initialize_parameters should set init_mean with correct shape."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_oscillators = 2
+        n_discrete_states = 3
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=5,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        key = jax.random.PRNGKey(42)
+        model._initialize_parameters(key)
+
+        assert hasattr(model, "init_mean")
+        assert model.init_mean.shape == (n_latent, n_discrete_states)
+        assert jnp.all(jnp.isfinite(model.init_mean))
+
+    def test_initialize_parameters_sets_init_cov(self) -> None:
+        """_initialize_parameters should set init_cov with correct shape."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_oscillators = 2
+        n_discrete_states = 3
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=5,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        key = jax.random.PRNGKey(42)
+        model._initialize_parameters(key)
+
+        assert hasattr(model, "init_cov")
+        assert model.init_cov.shape == (n_latent, n_latent, n_discrete_states)
+        assert jnp.all(jnp.isfinite(model.init_cov))
+
+    def test_initialize_parameters_sets_init_discrete_state_prob(self) -> None:
+        """_initialize_parameters should set init_discrete_state_prob with correct shape."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_discrete_states = 3
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        key = jax.random.PRNGKey(42)
+        model._initialize_parameters(key)
+
+        assert hasattr(model, "init_discrete_state_prob")
+        assert model.init_discrete_state_prob.shape == (n_discrete_states,)
+        # Should be uniform
+        expected_prob = jnp.ones(n_discrete_states) / n_discrete_states
+        np.testing.assert_allclose(
+            model.init_discrete_state_prob, expected_prob, rtol=1e-5
+        )
+
+    def test_initialize_parameters_sets_discrete_transition_matrix(self) -> None:
+        """_initialize_parameters should set discrete_transition_matrix correctly."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_discrete_states = 2
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        key = jax.random.PRNGKey(42)
+        model._initialize_parameters(key)
+
+        assert hasattr(model, "discrete_transition_matrix")
+        assert model.discrete_transition_matrix.shape == (
+            n_discrete_states,
+            n_discrete_states,
+        )
+        # Rows should sum to 1
+        row_sums = jnp.sum(model.discrete_transition_matrix, axis=1)
+        np.testing.assert_allclose(row_sums, jnp.ones(n_discrete_states), rtol=1e-5)
+        # All entries should be non-negative
+        assert jnp.all(model.discrete_transition_matrix >= 0)
+
+    def test_initialize_parameters_sets_continuous_transition_matrix(self) -> None:
+        """_initialize_parameters should set continuous_transition_matrix."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_oscillators = 2
+        n_discrete_states = 3
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=5,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        key = jax.random.PRNGKey(42)
+        model._initialize_parameters(key)
+
+        assert hasattr(model, "continuous_transition_matrix")
+        assert model.continuous_transition_matrix.shape == (
+            n_latent,
+            n_latent,
+            n_discrete_states,
+        )
+        assert jnp.all(jnp.isfinite(model.continuous_transition_matrix))
+
+    def test_initialize_parameters_sets_process_cov(self) -> None:
+        """_initialize_parameters should set process_cov."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_oscillators = 2
+        n_discrete_states = 3
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=5,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        key = jax.random.PRNGKey(42)
+        model._initialize_parameters(key)
+
+        assert hasattr(model, "process_cov")
+        assert model.process_cov.shape == (n_latent, n_latent, n_discrete_states)
+        assert jnp.all(jnp.isfinite(model.process_cov))
+
+    def test_initialize_parameters_sets_spike_params(self) -> None:
+        """_initialize_parameters should set spike_params with correct shapes."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_oscillators = 2
+        n_neurons = 5
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=3,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        key = jax.random.PRNGKey(42)
+        model._initialize_parameters(key)
+
+        assert hasattr(model, "spike_params")
+        assert isinstance(model.spike_params, SpikeObsParams)
+        assert model.spike_params.baseline.shape == (n_neurons,)
+        assert model.spike_params.weights.shape == (n_neurons, n_latent)
+
+    def test_initialize_parameters_spike_baseline_is_zero(self) -> None:
+        """Spike baseline should be initialized to zero."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_neurons = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=3,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        key = jax.random.PRNGKey(42)
+        model._initialize_parameters(key)
+
+        # Baseline should be zero (exp(0) = 1 Hz baseline rate)
+        np.testing.assert_allclose(model.spike_params.baseline, jnp.zeros(n_neurons))
+
+    def test_initialize_parameters_spike_weights_are_small(self) -> None:
+        """Spike weights should be initialized to small random values."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_neurons = 5
+        n_oscillators = 2
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=3,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        key = jax.random.PRNGKey(42)
+        model._initialize_parameters(key)
+
+        # Weights should be small (max absolute value < 1)
+        assert jnp.all(jnp.abs(model.spike_params.weights) < 1.0)
+        # Weights should be finite
+        assert jnp.all(jnp.isfinite(model.spike_params.weights))
+        # Weights should not all be zero (randomness)
+        assert jnp.any(model.spike_params.weights != 0)
+
+    def test_initialize_parameters_process_cov_is_positive_definite(self) -> None:
+        """Process covariance should be positive definite."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=3,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        key = jax.random.PRNGKey(42)
+        model._initialize_parameters(key)
+
+        # Check each discrete state's process covariance is PSD
+        for s in range(model.n_discrete_states):
+            Q_s = model.process_cov[:, :, s]
+            eigvals = jnp.linalg.eigvalsh(Q_s)
+            assert jnp.all(eigvals > -1e-6), f"State {s} Q not PSD: {eigvals}"
+
+    def test_initialize_parameters_init_cov_is_positive_definite(self) -> None:
+        """Initial covariance should be positive definite."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=3,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        key = jax.random.PRNGKey(42)
+        model._initialize_parameters(key)
+
+        # Check each discrete state's initial covariance is PSD
+        for s in range(model.n_discrete_states):
+            P0_s = model.init_cov[:, :, s]
+            eigvals = jnp.linalg.eigvalsh(P0_s)
+            assert jnp.all(eigvals > -1e-6), f"State {s} P0 not PSD: {eigvals}"
+
+    def test_initialize_parameters_single_discrete_state(self) -> None:
+        """_initialize_parameters should work with single discrete state."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_oscillators = 2
+        n_neurons = 5
+        n_discrete_states = 1
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        key = jax.random.PRNGKey(42)
+        model._initialize_parameters(key)
+
+        # Check all shapes are correct
+        assert model.init_mean.shape == (n_latent, 1)
+        assert model.init_cov.shape == (n_latent, n_latent, 1)
+        assert model.init_discrete_state_prob.shape == (1,)
+        assert model.discrete_transition_matrix.shape == (1, 1)
+        assert model.continuous_transition_matrix.shape == (n_latent, n_latent, 1)
+        assert model.process_cov.shape == (n_latent, n_latent, 1)
+        assert model.spike_params.baseline.shape == (n_neurons,)
+        assert model.spike_params.weights.shape == (n_neurons, n_latent)
+
+        # Single state transition should be 1.0
+        np.testing.assert_allclose(model.discrete_transition_matrix, jnp.array([[1.0]]))
+
+    def test_initialize_parameters_reproducible_with_same_key(self) -> None:
+        """_initialize_parameters should be reproducible with same key."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model1 = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=3,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+        model2 = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=3,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        key = jax.random.PRNGKey(42)
+        model1._initialize_parameters(key)
+        model2._initialize_parameters(key)
+
+        np.testing.assert_allclose(model1.init_mean, model2.init_mean)
+        np.testing.assert_allclose(model1.spike_params.weights, model2.spike_params.weights)
+
+    def test_initialize_parameters_different_with_different_key(self) -> None:
+        """_initialize_parameters should produce different values with different keys."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model1 = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=3,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+        model2 = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=3,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model1._initialize_parameters(jax.random.PRNGKey(1))
+        model2._initialize_parameters(jax.random.PRNGKey(2))
+
+        # Random components should differ
+        assert not jnp.allclose(model1.init_mean, model2.init_mean)
+        assert not jnp.allclose(model1.spike_params.weights, model2.spike_params.weights)

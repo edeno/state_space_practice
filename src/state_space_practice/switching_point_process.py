@@ -87,6 +87,10 @@ import jax.numpy as jnp
 from jax import Array
 
 from state_space_practice.kalman import symmetrize
+from state_space_practice.oscillator_utils import (
+    construct_common_oscillator_process_covariance,
+    construct_common_oscillator_transition_matrix,
+)
 from state_space_practice.point_process_kalman import (
     _point_process_laplace_update,
 )
@@ -1252,3 +1256,239 @@ class SwitchingSpikeOscillatorModel:
         flags_str = ", ".join(f"Update({k})={v}" for k, v in update_flags.items())
 
         return f"<{self.__class__.__name__}: {', '.join(params)}, [{flags_str}]>"
+
+    def _initialize_parameters(self, key: jax.random.PRNGKey) -> None:
+        """Initialize all model parameters.
+
+        Sets up initial values for all model parameters including:
+        - Initial state mean and covariance
+        - Discrete state transition probabilities
+        - Continuous state transition matrices
+        - Process noise covariances
+        - Spike observation parameters (baseline and weights)
+
+        Parameters
+        ----------
+        key : jax.random.PRNGKey
+            JAX random number generator key for reproducible initialization.
+
+        Notes
+        -----
+        The initialization follows these conventions:
+        - Initial state mean: drawn from standard normal distribution
+        - Initial state covariance: identity matrix for each discrete state
+        - Initial discrete state probabilities: uniform across states
+        - Discrete transition matrix: based on `discrete_transition_diag`
+        - Continuous transition matrix: uncoupled oscillators with default
+          frequencies and damping coefficients
+        - Process covariance: identity scaled by 0.01
+        - Spike baseline: zero (corresponding to 1 Hz baseline rate)
+        - Spike weights: small random values (scaled by 0.1)
+        """
+        k1, k2 = jax.random.split(key)
+
+        # Initialize discrete state probabilities (uniform)
+        self._initialize_discrete_state_prob()
+
+        # Initialize discrete transition matrix
+        self._initialize_discrete_transition_matrix()
+
+        # Initialize continuous state (mean and covariance)
+        self._initialize_continuous_state(k1)
+
+        # Initialize continuous transition matrix
+        self._initialize_continuous_transition_matrix()
+
+        # Initialize process covariance
+        self._initialize_process_covariance()
+
+        # Initialize spike observation parameters
+        self._initialize_spike_params(k2)
+
+        # Validate all shapes
+        self._validate_parameter_shapes()
+
+    def _initialize_discrete_state_prob(self) -> None:
+        """Initialize uniform discrete state probabilities."""
+        self.init_discrete_state_prob = (
+            jnp.ones(self.n_discrete_states) / self.n_discrete_states
+        )
+
+    def _initialize_discrete_transition_matrix(self) -> None:
+        """Initialize discrete state transition matrix.
+
+        Constructs the transition matrix based on `discrete_transition_diag`.
+        Off-diagonal elements are set to distribute the remaining probability
+        mass equally among other states.
+        """
+        diag = self.discrete_transition_diag
+        transition_matrix = jnp.diag(diag)
+
+        if self.n_discrete_states == 1:
+            # Single state: transition matrix is just [[1.0]]
+            self.discrete_transition_matrix = jnp.array([[1.0]])
+            return
+
+        # Compute off-diagonal values for each row
+        off_diag = (1.0 - diag) / (self.n_discrete_states - 1.0)
+
+        # Add off-diagonal elements, avoiding the diagonal
+        transition_matrix = (
+            transition_matrix
+            + jnp.ones((self.n_discrete_states, self.n_discrete_states))
+            * off_diag[:, None]
+            - jnp.diag(off_diag)
+        )
+
+        # Ensure rows sum to 1 (handle potential floating point issues)
+        self.discrete_transition_matrix = transition_matrix / jnp.sum(
+            transition_matrix, axis=1, keepdims=True
+        )
+
+    def _initialize_continuous_state(self, key: jax.random.PRNGKey) -> None:
+        """Initialize continuous state mean and covariance.
+
+        Parameters
+        ----------
+        key : jax.random.PRNGKey
+            Random key for sampling initial mean.
+        """
+        # Initial mean: sample from standard normal, same for all discrete states
+        mean = jax.random.multivariate_normal(
+            key=key,
+            mean=jnp.zeros(self.n_latent),
+            cov=jnp.eye(self.n_latent),
+        )
+        self.init_mean = jnp.stack([mean] * self.n_discrete_states, axis=1)
+
+        # Initial covariance: identity for each discrete state
+        self.init_cov = jnp.stack(
+            [jnp.eye(self.n_latent)] * self.n_discrete_states, axis=2
+        )
+
+    def _initialize_continuous_transition_matrix(self) -> None:
+        """Initialize continuous state transition matrices.
+
+        Uses uncoupled oscillator dynamics with default frequencies
+        (uniform in [5, 15] Hz) and damping coefficients (0.95).
+        """
+        # Default frequencies: spread across a reasonable range
+        default_freqs = jnp.linspace(5.0, 15.0, self.n_oscillators)
+
+        # Default damping: stable but not overly damped
+        default_damping = jnp.full(self.n_oscillators, 0.95)
+
+        # Construct uncoupled transition matrix
+        A = construct_common_oscillator_transition_matrix(
+            freqs=default_freqs,
+            auto_regressive_coef=default_damping,
+            sampling_freq=self.sampling_freq,
+        )
+
+        # Stack for each discrete state (same initial A for all states)
+        self.continuous_transition_matrix = jnp.stack(
+            [A] * self.n_discrete_states, axis=2
+        )
+
+    def _initialize_process_covariance(self) -> None:
+        """Initialize process noise covariances.
+
+        Uses block-diagonal structure with small variance (0.01) per oscillator.
+        """
+        # Default variance: small process noise
+        default_variance = jnp.full(self.n_oscillators, 0.01)
+
+        Q = construct_common_oscillator_process_covariance(variance=default_variance)
+
+        # Stack for each discrete state
+        self.process_cov = jnp.stack([Q] * self.n_discrete_states, axis=2)
+
+    def _initialize_spike_params(self, key: jax.random.PRNGKey) -> None:
+        """Initialize spike observation parameters.
+
+        Parameters
+        ----------
+        key : jax.random.PRNGKey
+            Random key for sampling initial weights.
+        """
+        # Baseline: zero (exp(0) = 1 Hz baseline firing rate)
+        baseline = jnp.zeros(self.n_neurons)
+
+        # Weights: small random values
+        weights = (
+            jax.random.normal(key, (self.n_neurons, self.n_latent)) * 0.1
+        )
+
+        self.spike_params = SpikeObsParams(baseline=baseline, weights=weights)
+
+    def _validate_parameter_shapes(self) -> None:
+        """Validate that all initialized parameters have correct shapes.
+
+        Raises
+        ------
+        ValueError
+            If any parameter has an incorrect shape.
+        """
+        if self.init_mean.shape != (self.n_latent, self.n_discrete_states):
+            raise ValueError(
+                f"init_mean shape mismatch: expected "
+                f"({self.n_latent}, {self.n_discrete_states}), "
+                f"got {self.init_mean.shape}."
+            )
+        if self.init_cov.shape != (
+            self.n_latent,
+            self.n_latent,
+            self.n_discrete_states,
+        ):
+            raise ValueError(
+                f"init_cov shape mismatch: expected "
+                f"({self.n_latent}, {self.n_latent}, {self.n_discrete_states}), "
+                f"got {self.init_cov.shape}."
+            )
+        if self.init_discrete_state_prob.shape != (self.n_discrete_states,):
+            raise ValueError(
+                f"init_discrete_state_prob shape mismatch: expected "
+                f"({self.n_discrete_states},), "
+                f"got {self.init_discrete_state_prob.shape}."
+            )
+        if self.discrete_transition_matrix.shape != (
+            self.n_discrete_states,
+            self.n_discrete_states,
+        ):
+            raise ValueError(
+                f"discrete_transition_matrix shape mismatch: expected "
+                f"({self.n_discrete_states}, {self.n_discrete_states}), "
+                f"got {self.discrete_transition_matrix.shape}."
+            )
+        if self.continuous_transition_matrix.shape != (
+            self.n_latent,
+            self.n_latent,
+            self.n_discrete_states,
+        ):
+            raise ValueError(
+                f"continuous_transition_matrix shape mismatch: expected "
+                f"({self.n_latent}, {self.n_latent}, {self.n_discrete_states}), "
+                f"got {self.continuous_transition_matrix.shape}."
+            )
+        if self.process_cov.shape != (
+            self.n_latent,
+            self.n_latent,
+            self.n_discrete_states,
+        ):
+            raise ValueError(
+                f"process_cov shape mismatch: expected "
+                f"({self.n_latent}, {self.n_latent}, {self.n_discrete_states}), "
+                f"got {self.process_cov.shape}."
+            )
+        if self.spike_params.baseline.shape != (self.n_neurons,):
+            raise ValueError(
+                f"spike_params.baseline shape mismatch: expected "
+                f"({self.n_neurons},), "
+                f"got {self.spike_params.baseline.shape}."
+            )
+        if self.spike_params.weights.shape != (self.n_neurons, self.n_latent):
+            raise ValueError(
+                f"spike_params.weights shape mismatch: expected "
+                f"({self.n_neurons}, {self.n_latent}), "
+                f"got {self.spike_params.weights.shape}."
+            )

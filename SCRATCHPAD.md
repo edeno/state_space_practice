@@ -3,8 +3,8 @@
 ## Current Status
 
 - **Date**: 2025-12-11
-- **Working on**: Milestone 7 - Task 7.1 COMPLETE
-- **Current Task**: Task 7.2 - Implement `_initialize_parameters()` method
+- **Working on**: Milestone 7 - Tasks 7.1 and 7.2 COMPLETE
+- **Current Task**: Task 7.3 - Implement `_e_step()` method
 
 ## Milestone 1 Summary (COMPLETE)
 
@@ -237,6 +237,31 @@ Implemented `SwitchingSpikeOscillatorModel.__init__()` with:
 4. **Removed marginal smoother placeholders** (`smoother_mean`, `smoother_cov`) - only conditional statistics needed for M-step
 5. **Added input validation** with clear error messages (fail-fast pattern)
 
-### Next: Task 7.2
+### Task 7.2 (COMPLETE)
 
-Implement `_initialize_parameters()` method
+Implemented `SwitchingSpikeOscillatorModel._initialize_parameters()` with:
+
+- Main method splits key for random operations and calls helper methods
+- `_initialize_discrete_state_prob()`: Uniform probabilities across states
+- `_initialize_discrete_transition_matrix()`: From `discrete_transition_diag` with off-diagonal balance
+- `_initialize_continuous_state()`: Random initial mean from standard normal, identity covariance
+- `_initialize_continuous_transition_matrix()`: Uncoupled oscillators via `construct_common_oscillator_transition_matrix`
+  - Default frequencies: linspace(5, 15) Hz
+  - Default damping: 0.95
+- `_initialize_process_covariance()`: Block-diagonal via `construct_common_oscillator_process_covariance`
+  - Default variance: 0.01 per oscillator
+- `_initialize_spike_params()`: Zero baseline, small random weights (N(0, 0.1²))
+- `_validate_parameter_shapes()`: Comprehensive shape validation matching BaseModel pattern
+
+#### Tests Added (15 tests)
+
+- Basic functionality (runs without error)
+- Shape verification for all parameters
+- Value checks (uniform probs, zero baseline, small weights)
+- Numerical properties (PSD matrices, stochastic matrix)
+- Edge cases (single discrete state)
+- Reproducibility and randomness
+
+### Next: Task 7.3
+
+Implement `_e_step()` method

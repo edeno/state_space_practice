@@ -225,12 +225,13 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
   - Optional: initial freqs, damping, coupling strengths, phase differences
   - Store update flags (update_A, update_Q, update_B, update_spike_params, etc.)
 
-- [ ] **7.2** Implement `_initialize_parameters()` method
-  - Initialize A via `construct_directed_influence_transition_matrix` or identity
+- [x] **7.2** Implement `_initialize_parameters()` method
+  - Initialize A via `construct_common_oscillator_transition_matrix` (uncoupled oscillators)
   - Initialize Q via `construct_common_oscillator_process_covariance`
   - Initialize spike params (baseline=0, weights=small random)
   - Initialize discrete transition matrix
   - Initialize continuous initial state
+  - Added shape validation via `_validate_parameter_shapes()`
 
 - [ ] **7.3** Implement `_e_step()` method
   - Call `switching_point_process_filter`
