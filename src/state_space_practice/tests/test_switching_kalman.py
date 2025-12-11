@@ -846,6 +846,7 @@ def test_m_step_two_identical_states(
     np.testing.assert_allclose(skf_new_H[..., 0], skf_new_H[..., 1], rtol=rtol)
 
 
+@pytest.mark.slow
 def test_m_step_discrete_transition_matrix_simple():
     """
     A bare-bones two-state switching Kalman M-step test.
@@ -1778,6 +1779,7 @@ def test_elbo_monotonic_single_state() -> None:
     assert elbos[-1] > elbos[0], "ELBO should improve over iterations"
 
 
+@pytest.mark.slow
 def test_elbo_monotonic_two_states() -> None:
     """
     Tests ELBO monotonicity with two discrete states.
@@ -3287,6 +3289,7 @@ def run_em(
     return final_params, ll_history
 
 
+@pytest.mark.slow
 def test_em_parameter_recovery_discrete_transition():
     """
     Test EM recovers true discrete transition matrix Z.
@@ -3330,6 +3333,7 @@ def test_em_parameter_recovery_discrete_transition():
     assert max_error < 0.05, f"Max Z error {max_error:.4f} should be < 0.05"
 
 
+@pytest.mark.slow
 def test_em_parameter_recovery_continuous_transition():
     """
     Test EM recovers true continuous transition matrix A.
@@ -3396,6 +3400,7 @@ def test_em_parameter_recovery_continuous_transition():
     assert max_rel_error < 0.20, f"Max A relative error {max_rel_error:.4f} should be < 0.20"
 
 
+@pytest.mark.slow
 def test_em_parameter_recovery_all_params():
     """
     Integration test: recover discrete transition matrix Z when all
@@ -3462,6 +3467,7 @@ def test_em_parameter_recovery_all_params():
     assert Z_error < 0.10, f"Z error {Z_error:.4f} should be < 0.10"
 
 
+@pytest.mark.slow
 def test_em_parameter_recovery_all_parameters():
     """
     Comprehensive test: recover ALL parameters (A, Q, H, R, Z) from perturbed initialization.
@@ -3568,6 +3574,7 @@ def test_em_parameter_recovery_all_parameters():
     assert ll_history[-1] > ll_history[0], "Log-likelihood should improve"
 
 
+@pytest.mark.slow
 def test_em_parameter_recovery_multivariate():
     """
     Test parameter recovery with multivariate continuous and observation states.
@@ -3896,6 +3903,7 @@ def simulated_data_for_individual_recovery():
     return jnp.array(y), true_params
 
 
+@pytest.mark.slow
 def test_individual_recovery_A(simulated_data_for_individual_recovery):
     """Test recovery of A while holding all other parameters at true values."""
     obs, true_params = simulated_data_for_individual_recovery
@@ -3919,6 +3927,7 @@ def test_individual_recovery_A(simulated_data_for_individual_recovery):
     assert ll_history[-1] >= ll_history[0], "Log-likelihood should not decrease"
 
 
+@pytest.mark.slow
 def test_individual_recovery_Q(simulated_data_for_individual_recovery):
     """Test recovery of Q while holding all other parameters at true values."""
     obs, true_params = simulated_data_for_individual_recovery
@@ -3942,6 +3951,7 @@ def test_individual_recovery_Q(simulated_data_for_individual_recovery):
     assert ll_history[-1] >= ll_history[0], "Log-likelihood should not decrease"
 
 
+@pytest.mark.slow
 def test_individual_recovery_H(simulated_data_for_individual_recovery):
     """Test recovery of H while holding all other parameters at true values."""
     obs, true_params = simulated_data_for_individual_recovery
@@ -3965,6 +3975,7 @@ def test_individual_recovery_H(simulated_data_for_individual_recovery):
     assert ll_history[-1] >= ll_history[0], "Log-likelihood should not decrease"
 
 
+@pytest.mark.slow
 def test_individual_recovery_R(simulated_data_for_individual_recovery):
     """Test recovery of R while holding all other parameters at true values."""
     obs, true_params = simulated_data_for_individual_recovery
@@ -3988,6 +3999,7 @@ def test_individual_recovery_R(simulated_data_for_individual_recovery):
     assert ll_history[-1] >= ll_history[0], "Log-likelihood should not decrease"
 
 
+@pytest.mark.slow
 def test_individual_recovery_Z(simulated_data_for_individual_recovery):
     """Test recovery of Z while holding all other parameters at true values."""
     obs, true_params = simulated_data_for_individual_recovery
@@ -4011,6 +4023,7 @@ def test_individual_recovery_Z(simulated_data_for_individual_recovery):
     assert ll_history[-1] >= ll_history[0], "Log-likelihood should not decrease"
 
 
+@pytest.mark.slow
 def test_individual_recovery_H_and_Q_together(simulated_data_for_individual_recovery):
     """
     Test recovery of H and Q together while holding other parameters fixed.
