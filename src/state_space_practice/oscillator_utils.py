@@ -471,7 +471,8 @@ def _project_to_closest_rotation(matrix: jax.Array) -> jax.Array:
     Returns
     -------
     jax.Array, shape (2, 2)
-        The closest rotation matrix to the input matrix
+        The closest rotation matrix to the input matrix.
+        Falls back to the original matrix if SVD fails.
 
     Raises
     ------
@@ -482,21 +483,91 @@ def _project_to_closest_rotation(matrix: jax.Array) -> jax.Array:
         raise ValueError("Matrix must be square")
     if matrix.ndim != 2:
         raise ValueError("Matrix must be 2D")
-    try:
-        U, s, Vh = jnp.linalg.svd(matrix)
 
-        # Instead of scaling each direction by the singular value,
-        # we scale both directions of the matrix by the same geometric mean
-        # i.e. there is no shearing in the rotation matrix
-        scale_factor = _get_scaling_factor(s)
+    U, s, Vh = jnp.linalg.svd(matrix)
 
-        # The rotation matrix is U @ Vh
-        projected = scale_factor * (U @ Vh)
+    # Instead of scaling each direction by the singular value,
+    # we scale both directions of the matrix by the same geometric mean
+    # i.e. there is no shearing in the rotation matrix
+    scale_factor = _get_scaling_factor(s)
 
-    except jnp.linalg.LinAlgError as e:
-        projected = ZEROS_2x2
+    # The rotation matrix is U @ Vh
+    projected = scale_factor * (U @ Vh)
 
-    return projected
+    # If SVD produced NaN/Inf (numerical failure), fall back to original matrix
+    # This preserves dynamics rather than damping out the oscillator
+    is_valid = jnp.all(jnp.isfinite(projected))
+    return jnp.where(is_valid, projected, matrix)
+
+
+def _get_scaling_factor_from_block(block: jax.Array, eps: float = 1e-12) -> jax.Array:
+    """Compute scaling factor from a 2x2 block via SVD.
+
+    Parameters
+    ----------
+    block : jax.Array, shape (2, 2)
+        The block to compute the scaling factor for
+    eps : float, optional
+        Minimum singular value, by default 1e-12
+
+    Returns
+    -------
+    jax.Array
+        The geometric mean of the singular values
+    """
+    _, s, _ = jnp.linalg.svd(block)
+    return _get_scaling_factor(s, eps)
+
+
+def _project_diagonal_block(
+    block: jax.Array, row_sum_scaling: jax.Array
+) -> jax.Array:
+    """Project a diagonal block with row sum adjustment.
+
+    Parameters
+    ----------
+    block : jax.Array, shape (2, 2)
+        The diagonal block to project
+    row_sum_scaling : jax.Array
+        The sum of scaling factors for this row
+
+    Returns
+    -------
+    jax.Array, shape (2, 2)
+        The projected diagonal block
+    """
+    adjusted = block + row_sum_scaling * IDENTITY_2x2
+    projected = _project_to_closest_rotation(adjusted)
+    return projected - row_sum_scaling * IDENTITY_2x2
+
+
+def _project_block(
+    block: jax.Array,
+    row_sum_scaling: jax.Array,
+    is_diagonal: bool,
+) -> jax.Array:
+    """Project a single block, handling diagonal vs off-diagonal cases.
+
+    Parameters
+    ----------
+    block : jax.Array, shape (2, 2)
+        The block to project
+    row_sum_scaling : jax.Array
+        The sum of scaling factors for this row (only used for diagonal blocks)
+    is_diagonal : bool
+        Whether this is a diagonal block
+
+    Returns
+    -------
+    jax.Array, shape (2, 2)
+        The projected block
+    """
+    return jax.lax.cond(
+        is_diagonal,
+        lambda b: _project_diagonal_block(b, row_sum_scaling),
+        lambda b: _project_to_closest_rotation(b),
+        block,
+    )
 
 
 def project_coupled_transition_matrix(transition_matrix: jax.Array) -> jax.Array:
@@ -521,57 +592,44 @@ def project_coupled_transition_matrix(transition_matrix: jax.Array) -> jax.Array
         raise ValueError("Input transition_matrix must be square with even dimensions.")
     n_oscillators = dim // 2
 
-    # --- Pass 1: Calculate scaling factors for off-diagonal blocks ---
-    scaling_factors = jnp.zeros(
-        (n_oscillators, n_oscillators), dtype=transition_matrix.dtype
-    )
-    for from_oscillator in range(n_oscillators):
-        for to_oscillator in range(n_oscillators):
-            if from_oscillator != to_oscillator:
-                block = transition_matrix[
-                    get_block_slice(from_oscillator, to_oscillator)
-                ]
-                try:
-                    scaling_factors = scaling_factors.at[
-                        from_oscillator, to_oscillator
-                    ].set(_get_scaling_factor(jnp.linalg.svd(block)[1]))
-                except jnp.linalg.LinAlgError:
-                    pass  # Leave scaling factor as 0 if SVD fails
+    # Reshape to (n_oscillators, 2, n_oscillators, 2) for block access
+    blocks = transition_matrix.reshape(n_oscillators, 2, n_oscillators, 2)
+    # Transpose to (n_oscillators, n_oscillators, 2, 2) - (from, to, row, col)
+    blocks = blocks.transpose(0, 2, 1, 3)
 
-    # --- Calculate row sums required for diagonal projection ---
+    # --- Pass 1: Calculate scaling factors for all blocks using vmap ---
+    # vmap over both oscillator indices
+    scaling_factors_all = jax.vmap(
+        jax.vmap(_get_scaling_factor_from_block, in_axes=0), in_axes=0
+    )(blocks)  # shape (n_oscillators, n_oscillators)
+
+    # Zero out diagonal elements (we only want off-diagonal scaling factors)
+    diag_mask = jnp.eye(n_oscillators, dtype=bool)
+    scaling_factors = jnp.where(diag_mask, 0.0, scaling_factors_all)
+
+    # Calculate row sums for diagonal block adjustment
     row_sum_scaling = jnp.sum(scaling_factors, axis=1)  # shape (n_oscillators,)
 
-    # --- Pass 2: Compute projected blocks and assemble ---
-    projected_block_rows = []
+    # --- Pass 2: Project all blocks using vmap ---
+    # Create diagonal mask for each block
+    is_diagonal = jnp.eye(n_oscillators, dtype=bool)
 
-    for from_oscillator in range(n_oscillators):  # Row index of the block
-        current_row_blocks = []
-        for to_oscillator in range(n_oscillators):  # Column index of the block
-            rows, cols = get_block_slice(from_oscillator, to_oscillator)
-            if from_oscillator == to_oscillator:
-                # --- Diagonal Block ---
-                projected_modified_block = _project_to_closest_rotation(
-                    transition_matrix[rows, cols]
-                    + row_sum_scaling[from_oscillator] * IDENTITY_2x2
-                )
-                # Subtract the adjustment term
-                projected_block = (
-                    projected_modified_block
-                    - row_sum_scaling[from_oscillator] * IDENTITY_2x2
-                )
-            else:
-                # --- Off-Diagonal ---
-                projected_block = _project_to_closest_rotation(
-                    transition_matrix[rows, cols]
-                )
+    # Broadcast row_sum_scaling for each row
+    row_sums_broadcast = jnp.broadcast_to(
+        row_sum_scaling[:, None], (n_oscillators, n_oscillators)
+    )
 
-            # Append the correctly projected block
-            current_row_blocks.append(projected_block)
+    # vmap _project_block over all blocks
+    project_row = jax.vmap(_project_block, in_axes=(0, 0, 0))
+    project_all = jax.vmap(project_row, in_axes=(0, 0, 0))
 
-        projected_block_rows.append(current_row_blocks)
+    projected_blocks = project_all(
+        blocks, row_sums_broadcast, is_diagonal
+    )  # shape (n_oscillators, n_oscillators, 2, 2)
 
-    # Assemble the final projected matrix
-    return jnp.block(projected_block_rows)
+    # Reshape back to (2*n_oscillators, 2*n_oscillators)
+    # (from, to, row, col) -> (from, row, to, col) -> (2*n_osc, 2*n_osc)
+    return projected_blocks.transpose(0, 2, 1, 3).reshape(dim, dim)
 
 
 def extract_dim_params_from_matrix(
