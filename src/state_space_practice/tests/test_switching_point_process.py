@@ -2341,3 +2341,582 @@ class TestUpdateSpikeGLMParamsSecondOrder:
                 smoother_cov=smoother_cov_wrong,
                 use_second_order=True,
             )
+
+
+class TestDynamicsMStepReuse:
+    """Tests for dynamics M-step reuse with point-process observations.
+
+    The `switching_kalman_maximization_step` function is observation-model agnostic
+    for the dynamics parameters. It operates on smoother outputs (means, covariances,
+    discrete state probabilities) which are Gaussian regardless of observation model.
+
+    For point-process observations, the measurement_matrix and measurement_cov
+    returns should be ignored since they assume Gaussian observations.
+    """
+
+    def test_dynamics_mstep_runs_on_point_process_smoother_output(self) -> None:
+        """Dynamics M-step should run without error on point-process smoother output.
+
+        This verifies that `switching_kalman_maximization_step` can be called directly
+        with smoother outputs from the point-process filter/smoother pipeline.
+        """
+        from state_space_practice.switching_kalman import (
+            switching_kalman_maximization_step,
+            switching_kalman_smoother,
+        )
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        n_time = 50
+        n_latent = 4
+        n_neurons = 5
+        n_discrete_states = 2
+        dt = 0.02
+
+        # Setup initial conditions
+        init_state_cond_mean = jnp.zeros((n_latent, n_discrete_states))
+        init_state_cond_cov = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        init_discrete_state_prob = jnp.ones(n_discrete_states) / n_discrete_states
+
+        # Generate spikes
+        key = jax.random.PRNGKey(42)
+        spikes = jax.random.poisson(key, 0.5, shape=(n_time, n_neurons)).astype(float)
+
+        # Dynamics parameters
+        discrete_transition_matrix = jnp.array([[0.95, 0.05], [0.05, 0.95]])
+        continuous_transition_matrix = jnp.stack(
+            [jnp.eye(n_latent) * 0.99, jnp.eye(n_latent) * 0.95], axis=-1
+        )
+        process_cov = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
+
+        # Spike observation parameters
+        weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
+        baseline = jnp.zeros(n_neurons)
+        log_intensity_func = linear_log_intensity(weights, baseline)
+
+        # Run filter
+        (
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_state_prob,
+            last_pair_cond_filter_mean,
+            _,
+        ) = switching_point_process_filter(
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            spikes,
+            discrete_transition_matrix,
+            continuous_transition_matrix,
+            process_cov,
+            dt,
+            log_intensity_func,
+        )
+
+        # Run smoother (observation-model agnostic)
+        (
+            _,  # overall_smoother_mean
+            _,  # overall_smoother_cov
+            smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob,
+            _,  # overall_smoother_cross_cov
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+            pair_cond_smoother_cross_cov,
+            pair_cond_smoother_means,
+        ) = switching_kalman_smoother(
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_state_prob,
+            last_pair_cond_filter_mean,
+            process_cov,
+            continuous_transition_matrix,
+            discrete_transition_matrix,
+        )
+
+        # Call dynamics M-step with point-process smoother outputs
+        # For point-process models, we pass spikes but note that
+        # measurement_matrix and measurement_cov returns are meaningless
+        (
+            new_continuous_transition_matrix,
+            measurement_matrix,  # Should be ignored for point-process
+            new_process_cov,
+            measurement_cov,  # Should be ignored for point-process
+            new_init_mean,
+            new_init_cov,
+            new_discrete_transition_matrix,
+            new_init_discrete_state_prob,
+        ) = switching_kalman_maximization_step(
+            obs=spikes,  # Not used for dynamics, but required arg
+            state_cond_smoother_means=state_cond_smoother_means,
+            state_cond_smoother_covs=state_cond_smoother_covs,
+            smoother_discrete_state_prob=smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov=pair_cond_smoother_cross_cov,
+            pair_cond_smoother_means=pair_cond_smoother_means,
+        )
+
+        # This should run without error - that's the main test
+
+    def test_dynamics_mstep_returns_correct_shapes(self) -> None:
+        """Dynamics M-step returns should have correct shapes for dynamics parameters.
+
+        The relevant returns for point-process models are:
+        - continuous_transition_matrix: (n_latent, n_latent, n_discrete_states)
+        - process_cov: (n_latent, n_latent, n_discrete_states)
+        - init_mean: (n_latent, n_discrete_states)
+        - init_cov: (n_latent, n_latent, n_discrete_states)
+        - discrete_transition_matrix: (n_discrete_states, n_discrete_states)
+        - init_discrete_state_prob: (n_discrete_states,)
+        """
+        from state_space_practice.switching_kalman import (
+            switching_kalman_maximization_step,
+            switching_kalman_smoother,
+        )
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        n_time = 50
+        n_latent = 4
+        n_neurons = 5
+        n_discrete_states = 3
+        dt = 0.02
+
+        # Setup initial conditions
+        init_state_cond_mean = jnp.zeros((n_latent, n_discrete_states))
+        init_state_cond_cov = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        init_discrete_state_prob = jnp.ones(n_discrete_states) / n_discrete_states
+
+        # Generate spikes
+        key = jax.random.PRNGKey(123)
+        spikes = jax.random.poisson(key, 0.5, shape=(n_time, n_neurons)).astype(float)
+
+        # Dynamics parameters
+        discrete_transition_matrix = jnp.eye(n_discrete_states) * 0.9 + 0.1 / n_discrete_states
+        discrete_transition_matrix = discrete_transition_matrix / discrete_transition_matrix.sum(
+            axis=1, keepdims=True
+        )
+        continuous_transition_matrix = jnp.stack(
+            [jnp.eye(n_latent) * (0.95 + 0.01 * i) for i in range(n_discrete_states)],
+            axis=-1,
+        )
+        process_cov = jnp.stack(
+            [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
+        )
+
+        # Spike observation parameters
+        weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
+        baseline = jnp.zeros(n_neurons)
+        log_intensity_func = linear_log_intensity(weights, baseline)
+
+        # Run filter
+        (
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_state_prob,
+            last_pair_cond_filter_mean,
+            _,
+        ) = switching_point_process_filter(
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            spikes,
+            discrete_transition_matrix,
+            continuous_transition_matrix,
+            process_cov,
+            dt,
+            log_intensity_func,
+        )
+
+        # Run smoother
+        (
+            _,
+            _,
+            smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob,
+            _,
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+            pair_cond_smoother_cross_cov,
+            pair_cond_smoother_means,
+        ) = switching_kalman_smoother(
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_state_prob,
+            last_pair_cond_filter_mean,
+            process_cov,
+            continuous_transition_matrix,
+            discrete_transition_matrix,
+        )
+
+        # Call dynamics M-step
+        (
+            new_continuous_transition_matrix,
+            _,  # measurement_matrix - ignore for point-process
+            new_process_cov,
+            _,  # measurement_cov - ignore for point-process
+            new_init_mean,
+            new_init_cov,
+            new_discrete_transition_matrix,
+            new_init_discrete_state_prob,
+        ) = switching_kalman_maximization_step(
+            obs=spikes,
+            state_cond_smoother_means=state_cond_smoother_means,
+            state_cond_smoother_covs=state_cond_smoother_covs,
+            smoother_discrete_state_prob=smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov=pair_cond_smoother_cross_cov,
+            pair_cond_smoother_means=pair_cond_smoother_means,
+        )
+
+        # Check shapes for dynamics parameters
+        assert new_continuous_transition_matrix.shape == (
+            n_latent,
+            n_latent,
+            n_discrete_states,
+        )
+        assert new_process_cov.shape == (n_latent, n_latent, n_discrete_states)
+        assert new_init_mean.shape == (n_latent, n_discrete_states)
+        assert new_init_cov.shape == (n_latent, n_latent, n_discrete_states)
+        assert new_discrete_transition_matrix.shape == (
+            n_discrete_states,
+            n_discrete_states,
+        )
+        assert new_init_discrete_state_prob.shape == (n_discrete_states,)
+
+    def test_dynamics_mstep_returns_finite_values(self) -> None:
+        """Dynamics M-step should return finite values for all parameters."""
+        from state_space_practice.switching_kalman import (
+            switching_kalman_maximization_step,
+            switching_kalman_smoother,
+        )
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        n_time = 50
+        n_latent = 4
+        n_neurons = 5
+        n_discrete_states = 2
+        dt = 0.02
+
+        # Setup initial conditions
+        init_state_cond_mean = jnp.zeros((n_latent, n_discrete_states))
+        init_state_cond_cov = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        init_discrete_state_prob = jnp.ones(n_discrete_states) / n_discrete_states
+
+        # Generate spikes
+        key = jax.random.PRNGKey(456)
+        spikes = jax.random.poisson(key, 0.5, shape=(n_time, n_neurons)).astype(float)
+
+        # Dynamics parameters
+        discrete_transition_matrix = jnp.array([[0.9, 0.1], [0.1, 0.9]])
+        continuous_transition_matrix = jnp.stack(
+            [jnp.eye(n_latent) * 0.99, jnp.eye(n_latent) * 0.95], axis=-1
+        )
+        process_cov = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
+
+        # Spike observation parameters
+        weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
+        baseline = jnp.zeros(n_neurons)
+        log_intensity_func = linear_log_intensity(weights, baseline)
+
+        # Run filter
+        (
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_state_prob,
+            last_pair_cond_filter_mean,
+            _,
+        ) = switching_point_process_filter(
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            spikes,
+            discrete_transition_matrix,
+            continuous_transition_matrix,
+            process_cov,
+            dt,
+            log_intensity_func,
+        )
+
+        # Run smoother
+        (
+            _,
+            _,
+            smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob,
+            _,
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+            pair_cond_smoother_cross_cov,
+            pair_cond_smoother_means,
+        ) = switching_kalman_smoother(
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_state_prob,
+            last_pair_cond_filter_mean,
+            process_cov,
+            continuous_transition_matrix,
+            discrete_transition_matrix,
+        )
+
+        # Call dynamics M-step
+        (
+            new_continuous_transition_matrix,
+            _,
+            new_process_cov,
+            _,
+            new_init_mean,
+            new_init_cov,
+            new_discrete_transition_matrix,
+            new_init_discrete_state_prob,
+        ) = switching_kalman_maximization_step(
+            obs=spikes,
+            state_cond_smoother_means=state_cond_smoother_means,
+            state_cond_smoother_covs=state_cond_smoother_covs,
+            smoother_discrete_state_prob=smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov=pair_cond_smoother_cross_cov,
+            pair_cond_smoother_means=pair_cond_smoother_means,
+        )
+
+        # All dynamics parameters should be finite
+        assert jnp.all(jnp.isfinite(new_continuous_transition_matrix))
+        assert jnp.all(jnp.isfinite(new_process_cov))
+        assert jnp.all(jnp.isfinite(new_init_mean))
+        assert jnp.all(jnp.isfinite(new_init_cov))
+        assert jnp.all(jnp.isfinite(new_discrete_transition_matrix))
+        assert jnp.all(jnp.isfinite(new_init_discrete_state_prob))
+
+    def test_discrete_transition_matrix_is_valid_stochastic_matrix(self) -> None:
+        """Discrete transition matrix from M-step should be a valid stochastic matrix."""
+        from state_space_practice.switching_kalman import (
+            switching_kalman_maximization_step,
+            switching_kalman_smoother,
+        )
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        n_time = 100
+        n_latent = 2
+        n_neurons = 3
+        n_discrete_states = 2
+        dt = 0.02
+
+        # Setup
+        init_state_cond_mean = jnp.zeros((n_latent, n_discrete_states))
+        init_state_cond_cov = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        init_discrete_state_prob = jnp.ones(n_discrete_states) / n_discrete_states
+
+        key = jax.random.PRNGKey(789)
+        spikes = jax.random.poisson(key, 0.5, shape=(n_time, n_neurons)).astype(float)
+
+        discrete_transition_matrix = jnp.array([[0.9, 0.1], [0.1, 0.9]])
+        continuous_transition_matrix = jnp.stack(
+            [jnp.eye(n_latent) * 0.99, jnp.eye(n_latent) * 0.95], axis=-1
+        )
+        process_cov = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
+
+        weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
+        baseline = jnp.zeros(n_neurons)
+        log_intensity_func = linear_log_intensity(weights, baseline)
+
+        # Run filter and smoother
+        (
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_state_prob,
+            last_pair_cond_filter_mean,
+            _,
+        ) = switching_point_process_filter(
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            spikes,
+            discrete_transition_matrix,
+            continuous_transition_matrix,
+            process_cov,
+            dt,
+            log_intensity_func,
+        )
+
+        (
+            _,
+            _,
+            smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob,
+            _,
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+            pair_cond_smoother_cross_cov,
+            pair_cond_smoother_means,
+        ) = switching_kalman_smoother(
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_state_prob,
+            last_pair_cond_filter_mean,
+            process_cov,
+            continuous_transition_matrix,
+            discrete_transition_matrix,
+        )
+
+        # Call dynamics M-step
+        (
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            new_discrete_transition_matrix,
+            new_init_discrete_state_prob,
+        ) = switching_kalman_maximization_step(
+            obs=spikes,
+            state_cond_smoother_means=state_cond_smoother_means,
+            state_cond_smoother_covs=state_cond_smoother_covs,
+            smoother_discrete_state_prob=smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov=pair_cond_smoother_cross_cov,
+            pair_cond_smoother_means=pair_cond_smoother_means,
+        )
+
+        # Check stochastic matrix properties
+        # Rows should sum to 1
+        np.testing.assert_allclose(
+            new_discrete_transition_matrix.sum(axis=1),
+            jnp.ones(n_discrete_states),
+            rtol=1e-5,
+        )
+        # All entries should be non-negative
+        assert jnp.all(new_discrete_transition_matrix >= 0)
+
+        # Initial probabilities should sum to 1
+        np.testing.assert_allclose(
+            new_init_discrete_state_prob.sum(), 1.0, rtol=1e-5
+        )
+        # All probabilities should be non-negative
+        assert jnp.all(new_init_discrete_state_prob >= 0)
+
+    def test_covariances_are_symmetric(self) -> None:
+        """Covariance matrices from M-step should be symmetric.
+
+        Note: The M-step does NOT guarantee positive semi-definite covariances.
+        When a discrete state has low probability or insufficient data, the
+        process covariance can have negative eigenvalues. PSD enforcement
+        (e.g., adding regularization Q = Q + eps*I) should be handled at the
+        model class level, not in the raw M-step function.
+        """
+        from state_space_practice.switching_kalman import (
+            switching_kalman_maximization_step,
+            switching_kalman_smoother,
+        )
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        n_time = 50
+        n_latent = 4
+        n_neurons = 5
+        n_discrete_states = 2
+        dt = 0.02
+
+        # Setup
+        init_state_cond_mean = jnp.zeros((n_latent, n_discrete_states))
+        init_state_cond_cov = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        init_discrete_state_prob = jnp.ones(n_discrete_states) / n_discrete_states
+
+        key = jax.random.PRNGKey(321)
+        spikes = jax.random.poisson(key, 0.5, shape=(n_time, n_neurons)).astype(float)
+
+        discrete_transition_matrix = jnp.array([[0.9, 0.1], [0.1, 0.9]])
+        continuous_transition_matrix = jnp.stack(
+            [jnp.eye(n_latent) * 0.99, jnp.eye(n_latent) * 0.95], axis=-1
+        )
+        process_cov = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
+
+        weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
+        baseline = jnp.zeros(n_neurons)
+        log_intensity_func = linear_log_intensity(weights, baseline)
+
+        # Run filter and smoother
+        (
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_state_prob,
+            last_pair_cond_filter_mean,
+            _,
+        ) = switching_point_process_filter(
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            spikes,
+            discrete_transition_matrix,
+            continuous_transition_matrix,
+            process_cov,
+            dt,
+            log_intensity_func,
+        )
+
+        (
+            _,
+            _,
+            smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob,
+            _,
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+            pair_cond_smoother_cross_cov,
+            pair_cond_smoother_means,
+        ) = switching_kalman_smoother(
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_state_prob,
+            last_pair_cond_filter_mean,
+            process_cov,
+            continuous_transition_matrix,
+            discrete_transition_matrix,
+        )
+
+        # Call dynamics M-step
+        (
+            _,
+            _,
+            new_process_cov,
+            _,
+            _,
+            new_init_cov,
+            _,
+            _,
+        ) = switching_kalman_maximization_step(
+            obs=spikes,
+            state_cond_smoother_means=state_cond_smoother_means,
+            state_cond_smoother_covs=state_cond_smoother_covs,
+            smoother_discrete_state_prob=smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov=pair_cond_smoother_cross_cov,
+            pair_cond_smoother_means=pair_cond_smoother_means,
+        )
+
+        # Check symmetry for each discrete state's process covariance
+        for s in range(n_discrete_states):
+            Q_s = new_process_cov[:, :, s]
+            np.testing.assert_allclose(Q_s, Q_s.T, rtol=1e-5)
+
+        # Check symmetry for initial covariances
+        for s in range(n_discrete_states):
+            P0_s = new_init_cov[:, :, s]
+            np.testing.assert_allclose(P0_s, P0_s.T, rtol=1e-5)

@@ -3,7 +3,7 @@
 ## Current Status
 
 - **Date**: 2025-12-11
-- **Working on**: Milestone 5 COMPLETE - Ready for Milestone 6 (Dynamics M-Step Verification)
+- **Working on**: Milestone 6 COMPLETE - Ready for Milestone 7 (Model Class)
 - **Current Task**: None - waiting for next task
 
 ## Milestone 1 Summary (COMPLETE)
@@ -188,7 +188,35 @@ All 5 tasks completed:
 - Parameter recovery on simulated data
 - Second-order method tests (shapes, finite, decreases loss, matches plug-in with zero variance)
 
+## Milestone 6 Summary (COMPLETE)
+
+All 2 tasks completed:
+
+- 6.1 Wrote test confirming dynamics M-step reuse (5 tests, all passing)
+- 6.2 Added comprehensive documentation in module docstring
+
+### Key Implementation Details (Milestone 6)
+
+#### Dynamics M-Step Reuse Pattern
+
+- `switching_kalman_maximization_step` works directly with point-process smoother outputs
+- Function is observation-model agnostic - operates on Gaussian posteriors regardless of observation model
+- For point-process models, `measurement_matrix` and `measurement_cov` returns should be ignored
+
+#### Dynamics M-Step Tests Added
+
+- `test_dynamics_mstep_runs_on_point_process_smoother_output`: No errors on filter/smoother output
+- `test_dynamics_mstep_returns_correct_shapes`: A, Q, B, init params have correct shapes
+- `test_dynamics_mstep_returns_finite_values`: All dynamics parameters are finite
+- `test_discrete_transition_matrix_is_valid_stochastic_matrix`: Rows sum to 1, non-negative
+- `test_covariances_are_symmetric`: Symmetry check for covariance matrices
+
+#### Important Notes
+
+- The raw M-step does NOT guarantee positive semi-definite covariances
+- When a discrete state has low probability or insufficient data, process covariance can have negative eigenvalues
+- PSD enforcement (e.g., `Q = Q + eps*I`) should be handled at the model class level
+
 ## Next Steps
 
-- Milestone 6: Dynamics M-step verification
 - Milestone 7: Model class implementation

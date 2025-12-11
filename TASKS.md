@@ -199,12 +199,12 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
 
 ### Tasks
 
-- [ ] **6.1** Write test confirming dynamics M-step reuse
+- [x] **6.1** Write test confirming dynamics M-step reuse
   - Call `switching_kalman_maximization_step` with smoother outputs from point-process filter
   - Verify returned A, Q, B, init params have correct shapes
   - Document that measurement_matrix, measurement_cov returns should be ignored
 
-- [ ] **6.2** Add docstring/comment in code documenting this reuse pattern
+- [x] **6.2** Add docstring/comment in code documenting this reuse pattern
 
 ---
 

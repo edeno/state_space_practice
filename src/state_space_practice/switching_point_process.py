@@ -8,6 +8,68 @@ The model combines:
 - Oscillator network dynamics with switching discrete states (DIM/CNM style)
 - Point-process observations (spikes) using Laplace approximation
 
+EM Algorithm Components
+-----------------------
+For EM learning with point-process observations:
+
+**E-step:**
+1. Filter: Use `switching_point_process_filter()` from this module
+2. Smoother: Use `switching_kalman_smoother()` from `switching_kalman.py`
+   (smoother is observation-model agnostic once filter provides Gaussian posteriors)
+
+**M-step for dynamics parameters:**
+Use `switching_kalman_maximization_step()` from `switching_kalman.py` directly.
+This function is observation-model agnostic - it operates on smoother outputs
+(means, covariances, discrete state probabilities) which are Gaussian regardless
+of observation model.
+
+Example::
+
+    from state_space_practice.switching_kalman import (
+        switching_kalman_maximization_step,
+        switching_kalman_smoother,
+    )
+    from state_space_practice.switching_point_process import (
+        switching_point_process_filter,
+        update_spike_glm_params,
+    )
+
+    # E-step
+    filter_outputs = switching_point_process_filter(...)
+    smoother_outputs = switching_kalman_smoother(*filter_outputs[:4], ...)
+
+    # M-step for dynamics (A, Q, B, initial state, discrete transitions)
+    (
+        new_A, _, new_Q, _, new_init_mean, new_init_cov,
+        new_discrete_trans, new_init_discrete_prob
+    ) = switching_kalman_maximization_step(
+        obs=spikes,  # Required arg but not used for dynamics
+        state_cond_smoother_means=smoother_outputs[5],
+        state_cond_smoother_covs=smoother_outputs[6],
+        smoother_discrete_state_prob=smoother_outputs[2],
+        smoother_joint_discrete_state_prob=smoother_outputs[3],
+        pair_cond_smoother_cross_cov=smoother_outputs[7],
+        pair_cond_smoother_means=smoother_outputs[8],
+    )
+    # NOTE: measurement_matrix and measurement_cov returns (indices 1, 3)
+    # should be IGNORED for point-process models - they assume Gaussian obs.
+
+    # M-step for spike GLM params (baseline, weights)
+    new_spike_params = update_spike_glm_params(
+        spikes, smoother_mean, current_spike_params, dt
+    )
+
+**Important notes on M-step:**
+
+1. The raw M-step does NOT guarantee positive semi-definite covariances.
+   When a discrete state has low probability or insufficient data, the process
+   covariance can have negative eigenvalues. PSD enforcement (e.g., adding
+   regularization ``Q = Q + eps*I``) should be handled at the model class level.
+
+2. The ``measurement_matrix`` and ``measurement_cov`` returns from
+   ``switching_kalman_maximization_step`` should be ignored for point-process
+   models since they assume Gaussian observations.
+
 References
 ----------
 1. Eden, U.T., Frank, L.M., Barbieri, R., Solo, V. & Brown, E.N. (2004).
