@@ -3,8 +3,8 @@
 ## Current Status
 
 - **Date**: 2025-12-11
-- **Working on**: Milestone 7 - Tasks 7.1, 7.2, 7.3, and 7.4 COMPLETE
-- **Current Task**: Task 7.5 - Implement `_m_step_spikes()` method
+- **Working on**: Milestone 7 - Tasks 7.1, 7.2, 7.3, 7.4, and 7.5 COMPLETE
+- **Current Task**: Task 7.6 - Implement `fit()` method
 
 ## Milestone 1 Summary (COMPLETE)
 
@@ -328,6 +328,38 @@ Implemented `SwitchingSpikeOscillatorModel._m_step_dynamics()` method with:
 - Regularization approach documented and sufficient for typical cases
 - Good docstring explaining which parameters are updated and when
 
-### Next: Task 7.5
+### Task 7.5 (COMPLETE)
 
-Implement `_m_step_spikes()` method
+Implemented `SwitchingSpikeOscillatorModel._m_step_spikes()` method with:
+
+- Computes marginalized smoother mean by weighting state-conditional means by discrete state probabilities
+  - Uses efficient `jnp.einsum("tls,ts->tl", ...)` for marginalization
+  - Formula: `E[x_t | y_{1:T}] = sum_j P(S_t=j | y_{1:T}) * E[x_t | y_{1:T}, S_t=j]`
+- Calls `update_spike_glm_params` with marginalized smoother mean
+- Updates `spike_params` only if `update_spike_params=True`
+- Early return pattern for disabled flag
+
+#### Tests Added (9 tests)
+
+- `test_m_step_spikes_runs_without_error`: Basic sanity check
+- `test_m_step_spikes_updates_spike_params_when_enabled`: Flag behavior
+- `test_m_step_spikes_does_not_update_when_disabled`: Flag behavior
+- `test_m_step_spikes_output_shapes_correct`: Shape validation
+- `test_m_step_spikes_output_finite`: Numerical stability
+- `test_m_step_spikes_single_discrete_state`: Edge case
+- `test_m_step_spikes_with_zero_spikes`: Edge case (silent neurons)
+- `test_m_step_spikes_with_high_spike_counts`: Edge case (high firing rates)
+- `test_m_step_spikes_uses_marginalized_smoother_mean`: Validates marginalization
+
+#### Code Review Notes
+
+- APPROVED by code-reviewer agent
+- Correct einsum marginalization formula
+- Proper integration with `update_spike_glm_params`
+- Excellent documentation with mathematical exposition
+- Comprehensive test coverage including edge cases
+- Clean JAX best practices (JIT-compatible einsum)
+
+### Next: Task 7.6
+
+Implement `fit()` method

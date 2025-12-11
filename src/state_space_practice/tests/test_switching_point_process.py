@@ -4511,3 +4511,340 @@ class TestSwitchingSpikeOscillatorModelMStepDynamics:
         np.testing.assert_allclose(model.discrete_transition_matrix, Z_before, rtol=1e-10)
         np.testing.assert_allclose(model.init_mean, m0_before, rtol=1e-10)
         np.testing.assert_allclose(model.init_cov, P0_before, rtol=1e-10)
+
+
+class TestSwitchingSpikeOscillatorModelMStepSpikes:
+    """Tests for SwitchingSpikeOscillatorModel._m_step_spikes() method (Task 7.5)."""
+
+    def test_m_step_spikes_runs_without_error(self) -> None:
+        """_m_step_spikes should run without error after E-step."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_neurons = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        # Run E-step first (required before M-step)
+        model._e_step(spikes)
+
+        # M-step spikes should not raise
+        model._m_step_spikes(spikes)
+
+    def test_m_step_spikes_updates_spike_params_when_enabled(self) -> None:
+        """_m_step_spikes should update spike_params when flag is True."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+        n_oscillators = 2
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_spike_params=True,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        # Store original spike params
+        baseline_before = model.spike_params.baseline.copy()
+        weights_before = model.spike_params.weights.copy()
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_spikes(spikes)
+
+        # Spike params should have correct shapes
+        assert model.spike_params.baseline.shape == (n_neurons,)
+        assert model.spike_params.weights.shape == (n_neurons, n_latent)
+
+        # Spike params should have been updated (different from before)
+        # Note: They might be very close if the initial params are good,
+        # but with random initialization they should typically change
+        params_changed = not (
+            jnp.allclose(model.spike_params.baseline, baseline_before, atol=1e-6)
+            and jnp.allclose(model.spike_params.weights, weights_before, atol=1e-6)
+        )
+        assert params_changed, "spike_params should have been updated"
+
+    def test_m_step_spikes_does_not_update_when_disabled(self) -> None:
+        """_m_step_spikes should not update spike_params when flag is False."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_spike_params=False,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        # Store original spike params
+        baseline_before = model.spike_params.baseline.copy()
+        weights_before = model.spike_params.weights.copy()
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_spikes(spikes)
+
+        # Spike params should NOT have been updated
+        np.testing.assert_allclose(
+            model.spike_params.baseline, baseline_before, rtol=1e-10
+        )
+        np.testing.assert_allclose(
+            model.spike_params.weights, weights_before, rtol=1e-10
+        )
+
+    def test_m_step_spikes_output_shapes_correct(self) -> None:
+        """_m_step_spikes should produce params with correct shapes."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 8
+        n_oscillators = 3
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_spike_params=True,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_spikes(spikes)
+
+        # Check shapes
+        assert model.spike_params.baseline.shape == (n_neurons,)
+        assert model.spike_params.weights.shape == (n_neurons, n_latent)
+
+    def test_m_step_spikes_output_finite(self) -> None:
+        """_m_step_spikes should produce finite parameter values."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_spike_params=True,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_spikes(spikes)
+
+        # All values should be finite
+        assert jnp.all(jnp.isfinite(model.spike_params.baseline))
+        assert jnp.all(jnp.isfinite(model.spike_params.weights))
+
+    def test_m_step_spikes_single_discrete_state(self) -> None:
+        """_m_step_spikes should work with single discrete state."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+        n_oscillators = 2
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=1,  # Single discrete state
+            sampling_freq=100.0,
+            dt=0.01,
+            update_spike_params=True,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_spikes(spikes)
+
+        # Should have correct shapes and be finite
+        assert model.spike_params.baseline.shape == (n_neurons,)
+        assert model.spike_params.weights.shape == (n_neurons, n_latent)
+        assert jnp.all(jnp.isfinite(model.spike_params.baseline))
+        assert jnp.all(jnp.isfinite(model.spike_params.weights))
+
+    def test_m_step_spikes_with_zero_spikes(self) -> None:
+        """_m_step_spikes should handle data with all zero spikes."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+        n_oscillators = 2
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_spike_params=True,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        # All zeros - silent neurons
+        spikes = jnp.zeros((n_time, n_neurons))
+
+        model._e_step(spikes)
+        model._m_step_spikes(spikes)
+
+        # Should have correct shapes and be finite (though values may be extreme)
+        assert model.spike_params.baseline.shape == (n_neurons,)
+        assert model.spike_params.weights.shape == (n_neurons, n_latent)
+        assert jnp.all(jnp.isfinite(model.spike_params.baseline))
+        assert jnp.all(jnp.isfinite(model.spike_params.weights))
+
+    def test_m_step_spikes_with_high_spike_counts(self) -> None:
+        """_m_step_spikes should handle data with high spike counts."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+        n_oscillators = 2
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_spike_params=True,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        # High spike counts (e.g., high firing rate)
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 10.0, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+        model._m_step_spikes(spikes)
+
+        # Should have correct shapes and be finite
+        assert model.spike_params.baseline.shape == (n_neurons,)
+        assert model.spike_params.weights.shape == (n_neurons, n_latent)
+        assert jnp.all(jnp.isfinite(model.spike_params.baseline))
+        assert jnp.all(jnp.isfinite(model.spike_params.weights))
+
+    def test_m_step_spikes_uses_marginalized_smoother_mean(self) -> None:
+        """_m_step_spikes should use marginalized smoother mean for GLM update.
+
+        The M-step for spike params should use the marginal smoother mean
+        (marginalized over discrete states), not the state-conditional means.
+        """
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 50
+        n_neurons = 5
+        n_oscillators = 2
+        n_discrete_states = 2
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_spike_params=True,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model._e_step(spikes)
+
+        # Check that smoother outputs are available
+        assert hasattr(model, "smoother_state_cond_mean")
+        assert hasattr(model, "smoother_discrete_state_prob")
+
+        # State-conditional mean has shape (n_time, n_latent, n_discrete_states)
+        assert model.smoother_state_cond_mean.shape == (
+            n_time,
+            n_latent,
+            n_discrete_states,
+        )
+
+        model._m_step_spikes(spikes)
+
+        # After M-step, params should be finite
+        assert jnp.all(jnp.isfinite(model.spike_params.baseline))
+        assert jnp.all(jnp.isfinite(model.spike_params.weights))

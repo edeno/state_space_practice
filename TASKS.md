@@ -245,7 +245,7 @@ See [docs/switching_spike_oscillator_plan.md](docs/switching_spike_oscillator_pl
   - Ensure Q is PSD via regularization (eps=1e-8)
   - Ignore measurement_matrix/measurement_cov returns (Gaussian-only)
 
-- [ ] **7.5** Implement `_m_step_spikes()` method
+- [x] **7.5** Implement `_m_step_spikes()` method
   - Call `update_spike_glm_params`
   - Update spike_params
 

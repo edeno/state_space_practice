@@ -1665,3 +1665,49 @@ class SwitchingSpikeOscillatorModel:
         # Always update initial discrete state probabilities
         # (from smoother posterior at t=0)
         self.init_discrete_state_prob = new_init_discrete_prob
+
+    def _m_step_spikes(self, spikes: Array) -> None:
+        """M-step for spike observation parameters: baseline and weights.
+
+        Updates the spike GLM parameters by calling `update_spike_glm_params`
+        with the marginalized smoother mean (averaged over discrete states).
+        Parameters are only updated if `update_spike_params` is True.
+
+        Parameters
+        ----------
+        spikes : Array, shape (n_time, n_neurons)
+            Observed spike counts for all neurons at each timestep.
+
+        Notes
+        -----
+        This method must be called after `_e_step()` which populates the smoother
+        output attributes used here.
+
+        The spike GLM update uses the marginal smoother mean, which is computed
+        by marginalizing the state-conditional smoother means over discrete states:
+
+            E[x_t | y_{1:T}] = sum_j P(S_t=j | y_{1:T}) * E[x_t | y_{1:T}, S_t=j]
+
+        This is the standard "plug-in" M-step for the spike parameters.
+        """
+        if not self.update_spike_params:
+            return
+
+        # Compute marginalized smoother mean by weighting state-conditional means
+        # by discrete state probabilities
+        # smoother_state_cond_mean: (n_time, n_latent, n_discrete_states)
+        # smoother_discrete_state_prob: (n_time, n_discrete_states)
+        # Result: (n_time, n_latent)
+        smoother_mean = jnp.einsum(
+            "tls,ts->tl",
+            self.smoother_state_cond_mean,
+            self.smoother_discrete_state_prob,
+        )
+
+        # Update spike GLM parameters
+        self.spike_params = update_spike_glm_params(
+            spikes=spikes,
+            smoother_mean=smoother_mean,
+            current_params=self.spike_params,
+            dt=self.dt,
+        )
