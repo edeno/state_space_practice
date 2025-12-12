@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax import Array
+from jax.typing import ArrayLike
 
 # Enable 64-bit precision for numerical stability
 jax.config.update("jax_enable_x64", True)
@@ -1796,7 +1797,7 @@ class TestSingleNeuronGLMStep:
         y_n = jax.random.poisson(jax.random.PRNGKey(77), rates).astype(float)
 
         # Start from initial parameters
-        baseline = 0.0
+        baseline: ArrayLike = 0.0
         weights = jnp.zeros(n_latent)
 
         # Run multiple Newton iterations
@@ -1960,9 +1961,9 @@ class TestUpdateSpikeGLMParams:
         )
 
         # Compute total loss before
-        loss_before = 0.0
+        loss_before = jnp.array(0.0)
         for n in range(n_neurons):
-            loss_before += _single_neuron_glm_loss(
+            loss_before = loss_before + _single_neuron_glm_loss(
                 current_params.baseline[n],
                 current_params.weights[n],
                 spikes[:, n],
@@ -1976,9 +1977,9 @@ class TestUpdateSpikeGLMParams:
         )
 
         # Compute total loss after
-        loss_after = 0.0
+        loss_after = jnp.array(0.0)
         for n in range(n_neurons):
-            loss_after += _single_neuron_glm_loss(
+            loss_after = loss_after + _single_neuron_glm_loss(
                 new_params.baseline[n],
                 new_params.weights[n],
                 spikes[:, n],
@@ -2195,9 +2196,9 @@ class TestUpdateSpikeGLMParamsSecondOrder:
         )
 
         # Compute loss before
-        loss_before = 0.0
+        loss_before = jnp.array(0.0)
         for n in range(n_neurons):
-            loss_before += _single_neuron_glm_loss(
+            loss_before = loss_before + _single_neuron_glm_loss(
                 current_params.baseline[n],
                 current_params.weights[n],
                 spikes[:, n],
@@ -2217,9 +2218,9 @@ class TestUpdateSpikeGLMParamsSecondOrder:
         )
 
         # Compute loss after
-        loss_after = 0.0
+        loss_after = jnp.array(0.0)
         for n in range(n_neurons):
-            loss_after += _single_neuron_glm_loss(
+            loss_after = loss_after + _single_neuron_glm_loss(
                 new_params.baseline[n],
                 new_params.weights[n],
                 spikes[:, n],
@@ -5330,6 +5331,88 @@ class TestSwitchingSpikeOscillatorModelFit:
         with pytest.raises(ValueError, match="must match n_neurons"):
             model.fit(spikes_wrong_neurons, max_iter=3, key=jax.random.PRNGKey(42))
 
+    def test_fit_skip_init_preserves_parameters(self) -> None:
+        """fit() with skip_init=True should preserve custom parameters."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_neurons = 4
+        n_oscillators = 1  # Single oscillator = 2D latent state
+        n_latent = 2 * n_oscillators
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_continuous_transition_matrix=False,  # Keep A fixed
+        )
+
+        # Initialize parameters first
+        model._initialize_parameters(jax.random.PRNGKey(42))
+
+        # Set custom transition matrix with distinct values
+        # Shape: (n_latent, n_latent, n_discrete_states) = (2, 2, 2)
+        custom_A = jnp.array([
+            [[0.9, 0.8], [0.1, 0.0]],
+            [[-0.1, 0.0], [0.9, 0.8]],
+        ])
+        model.continuous_transition_matrix = custom_A
+
+        # Set custom init_discrete_state_prob
+        custom_init_prob = jnp.array([0.3, 0.7])
+        model.init_discrete_state_prob = custom_init_prob
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        # Fit with skip_init=True - should preserve custom parameters
+        model.fit(spikes, max_iter=2, skip_init=True)
+
+        # Custom A should be preserved (since update_continuous_transition_matrix=False)
+        np.testing.assert_allclose(
+            model.continuous_transition_matrix, custom_A, rtol=1e-10
+        )
+
+    def test_fit_skip_init_false_reinitializes_parameters(self) -> None:
+        """fit() with skip_init=False should reinitialize parameters."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 40
+        n_neurons = 4
+        n_oscillators = 1  # Single oscillator for simplicity
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_continuous_transition_matrix=False,
+        )
+
+        # Initialize and set custom parameters
+        model._initialize_parameters(jax.random.PRNGKey(42))
+        custom_init_prob = jnp.array([0.3, 0.7])
+        model.init_discrete_state_prob = custom_init_prob
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        # Fit with skip_init=False (default) - should reinitialize
+        model.fit(spikes, max_iter=2, key=jax.random.PRNGKey(99))
+
+        # init_discrete_state_prob should be reset to uniform (not our custom value)
+        # After reinitialization, it should be [0.5, 0.5]
+        assert not np.allclose(model.init_discrete_state_prob, custom_init_prob)
+
 
 class TestSwitchingSpikeOscillatorModelProjectParameters:
     """Tests for SwitchingSpikeOscillatorModel._project_parameters() method (Task 7.7)."""
@@ -6459,6 +6542,7 @@ class TestMilestone8EndToEnd:
         )
 
         nonswitching_smoother = nonswitching_model.smoother_mean
+        assert nonswitching_smoother is not None, "Non-switching smoother mean should not be None"
         assert jnp.all(jnp.isfinite(nonswitching_smoother)), (
             "Non-switching smoother mean should be finite"
         )
