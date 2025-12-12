@@ -19,21 +19,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Common Commands
 
+**Important**: Always run pytest, mypy, and ruff via the conda environment to ensure correct dependencies.
+
 ```bash
 # Run all tests
-pytest src/state_space_practice/tests/
+conda run -n state_space_practice pytest src/state_space_practice/tests/
 
 # Run specific test file
-pytest src/state_space_practice/tests/test_kalman.py -v
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_kalman.py -v
 
 # Run tests with coverage
-pytest --cov=src/state_space_practice --cov-report=term-missing
+conda run -n state_space_practice pytest --cov=src/state_space_practice --cov-report=term-missing
 
 # Run linter
-ruff check src/
+conda run -n state_space_practice ruff check src/
 
 # Run type checker (if configured)
-mypy src/state_space_practice/
+conda run -n state_space_practice mypy src/state_space_practice/
 ```
 
 ## Project Structure
