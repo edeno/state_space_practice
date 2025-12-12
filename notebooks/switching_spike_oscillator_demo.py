@@ -74,15 +74,15 @@ print(f"Random seed: {SEED}")
 #
 # We'll create a switching oscillator network with:
 # - **2 oscillators** (4D latent state: 2 dimensions per oscillator)
-# - **2 discrete states** (different dynamics: stable vs. variable)
+# - **2 discrete states** (different stability: stable vs. variable)
 # - **40 neurons** (dense population providing rich observations)
 # - **~4000 timesteps** at 50 Hz (80 seconds of data)
 #
-# The two discrete states differ in:
-# - **Damping**: State 0 is very stable (0.995), State 1 is more variable (0.85)
-# - **Process noise**: State 0 has very low noise (0.01), State 1 has higher noise (0.1)
+# The two discrete states differ in both **damping** and **process noise**:
+# - **State 0**: High damping (0.995), low noise (0.01) - tight, sustained oscillations
+# - **State 1**: Lower damping (0.85), higher noise (0.1) - more variable, decaying oscillations
 #
-# This setup creates clearly distinguishable regimes that the model can reliably identify.
+# This creates clearly distinguishable regimes that the model can learn.
 
 # %%
 # Simulation parameters
@@ -105,16 +105,16 @@ print(f"  Discrete states: {n_discrete_states}")
 
 # %%
 # Define oscillator parameters
-# State 0: Very stable oscillations (high damping, low noise) - "tight little oscillations"
-# State 1: Highly variable oscillations (lower damping, high noise) - "big, messy oscillations"
-# Both states have similar frequencies, but VERY different stability
+# States differ in BOTH damping and process noise for clear identifiability
+# State 0: Stable oscillations (high damping, low noise) - tight trajectories
+# State 1: Variable oscillations (lower damping, higher noise) - messy trajectories
 
 freqs_state0 = jnp.array([8.0, 12.0])  # Hz (theta/alpha)
 freqs_state1 = jnp.array([8.0, 12.0])  # Same frequencies
 
-# Strongly different damping coefficients - creates clearly distinguishable dynamics
-damping_state0 = jnp.array([0.995, 0.995])  # Extremely stable oscillations
-damping_state1 = jnp.array([0.85, 0.85])  # Much more variable/lossy
+# Strongly different damping - creates clearly different amplitude dynamics
+damping_state0 = jnp.array([0.995, 0.995])  # Very stable - sustained oscillations
+damping_state1 = jnp.array([0.85, 0.85])  # More lossy - quicker decay
 
 # Build transition matrices for each discrete state
 A_state0 = construct_common_oscillator_transition_matrix(
@@ -129,12 +129,12 @@ transition_matrices = jnp.stack([A_state0, A_state1], axis=-1)
 
 print(f"Transition matrices shape: {transition_matrices.shape}")
 print(f"State 0: freqs={freqs_state0} Hz, damping={damping_state0} (very stable)")
-print(f"State 1: freqs={freqs_state1} Hz, damping={damping_state1} (variable)")
+print(f"State 1: freqs={freqs_state1} Hz, damping={damping_state1} (more lossy)")
 
 # %%
-# Process noise covariances - different for each state
-# State 0: Very low noise (stable regime) - tight oscillations
-# State 1: Higher noise (variable regime) - more variable oscillations
+# Process noise covariances - amplifies the state difference
+# State 0: Very low noise - tight, stable oscillations
+# State 1: Higher noise - more variable oscillations (10x difference)
 variance_state0 = jnp.array([0.01, 0.01])  # Very low noise
 variance_state1 = jnp.array([0.1, 0.1])  # Higher noise (10x difference)
 
@@ -145,7 +145,7 @@ Q_state1 = construct_common_oscillator_process_covariance(variance_state1)
 process_covs = jnp.stack([Q_state0, Q_state1], axis=-1)
 
 print(f"Process covariance shape: {process_covs.shape}")
-print(f"State 0 variance: {variance_state0} (very low)")
+print(f"State 0 variance: {variance_state0} (very low - tight oscillations)")
 print(f"State 1 variance: {variance_state1} (higher - 10x difference)")
 
 # %%
@@ -175,8 +175,7 @@ key, key_weights = jax.random.split(key)
 spike_baseline = jnp.ones(n_neurons) * jnp.log(8.0)  # ~8 Hz baseline
 
 # Weights: how each neuron couples to oscillators
-# Moderate weights (0.5 scale) + more neurons (40) = highly informative observations
-# Not too strong to avoid rate explosion in the high-variance state
+# Moderate weights (0.5 scale) + many neurons = highly informative observations
 spike_weights = jax.random.normal(key_weights, (n_neurons, n_latent)) * 0.5
 
 print(f"Spike baseline shape: {spike_baseline.shape}")
@@ -564,31 +563,30 @@ print(f"  Learned weight range: [{float(learned_weights.min()):.3f}, {float(lear
 # ## 8. Summary
 #
 # This demo demonstrated the `SwitchingSpikeOscillatorModel` for inferring switching oscillator
-# dynamics from spike observations. With strongly differentiated discrete states and informative
-# spike observations, the model reliably:
+# dynamics from spike observations. The two discrete states are clearly distinguishable through
+# their different stability characteristics (damping) and noise levels.
+#
+# The model reliably:
 #
 # 1. **EM convergence**: The log-likelihood improves dramatically across iterations, confirming
 #    that the EM algorithm is working correctly.
 #
 # 2. **Discrete state inference**: The model identifies discrete state transitions with high
-#    accuracy (typically 85-95%), clearly distinguishing the "stable" vs "variable" regimes.
+#    accuracy, clearly distinguishing "stable" (tight oscillations) vs "variable" (messy oscillations).
 #
-# 3. **Oscillator tracking**: Latent oscillator trajectories are recovered with high correlations
-#    (mean absolute correlation typically >0.7, often with some dimensions >0.85).
+# 3. **Oscillator tracking**: Latent oscillator trajectories are recovered with good correlations.
 #
-# 4. **Parameter recovery**: The model learns transition matrices with spectral radii close to
-#    ground truth, and recovers baseline firing rates accurately.
+# 4. **Parameter recovery**: The model learns transition matrices that capture the key difference
+#    between states (different spectral radii corresponding to different damping).
 #
-# **Key insights**:
-# - Dense neural populations (40 neurons) with moderate coupling provide highly informative
-#   observations about latent dynamics
-# - The two discrete states (stable vs. variable) are clearly distinguishable through their
-#   dramatically different effects on oscillator amplitude and spike variability
-# - Long dwell times (expected 100 steps = 2 seconds) create clean blocks that are easy to classify
+# **Key design choices**:
+# - **Different damping**: State 0 (0.995) vs State 1 (0.85) - creates clearly different dynamics
+# - **Different noise**: 10x variance difference (0.01 vs 0.1) amplifies the state separation
+# - **Dense observations**: 40 neurons provide rich information about latent dynamics
+# - **Long dwell times**: 99% stay probability creates clean blocks for classification
 #
 # **Technical notes**:
-# - Latent space non-identifiability (sign/rotation ambiguity) is expected and handled via
-#   absolute correlations and sign-correction for visualization
+# - Latent space non-identifiability (sign/rotation ambiguity) is handled via absolute correlations
 # - The Laplace approximation can cause small EM monotonicity violations
 # - This demo uses parameters designed for clear demonstration; real data may be more challenging
 
