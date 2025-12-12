@@ -378,7 +378,7 @@ class BaseModel(ABC):
                 f"got {self.measurement_cov.shape}."
             )
 
-    def _e_step(self, observations: ArrayLike) -> float:
+    def _e_step(self, observations: ArrayLike) -> jax.Array:
         """Performs the Expectation (E) step of the EM algorithm.
 
         Runs the switching Kalman filter and smoother to compute the
@@ -391,9 +391,10 @@ class BaseModel(ABC):
 
         Returns
         -------
-        marginal_log_likelihood : float
-            The log-likelihood of the observations given the current parameters.
+        marginal_log_likelihood : jax.Array
+            The log-likelihood of the observations given the current parameters (scalar array).
         """
+        obs_arr: jax.Array = jnp.asarray(observations)
         (
             filter_mean,
             filter_cov,
@@ -404,7 +405,7 @@ class BaseModel(ABC):
             init_state_cond_mean=self.init_mean,
             init_state_cond_cov=self.init_cov,
             init_discrete_state_prob=self.init_discrete_state_prob,
-            obs=observations,
+            obs=obs_arr,
             discrete_transition_matrix=self.discrete_transition_matrix,
             continuous_transition_matrix=self.continuous_transition_matrix,
             process_cov=self.process_cov,
@@ -445,6 +446,7 @@ class BaseModel(ABC):
         observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
         """
+        obs_arr: jax.Array = jnp.asarray(observations)
         (
             A,
             H,
@@ -455,7 +457,7 @@ class BaseModel(ABC):
             Z,
             pi0,
         ) = switching_kalman_maximization_step(
-            obs=observations,
+            obs=obs_arr,
             state_cond_smoother_means=self.smoother_state_cond_mean,
             state_cond_smoother_covs=self.smoother_state_cond_cov,
             smoother_discrete_state_prob=self.smoother_discrete_state_prob,
@@ -488,7 +490,7 @@ class BaseModel(ABC):
         key: Array,
         max_iter: int = 100,
         tolerance: float = 1e-4,
-    ) -> list[float]:
+    ) -> list[jax.Array]:
         """Fits the model to observations using the EM algorithm.
 
         Iteratively performs E-steps and M-steps until convergence or
@@ -507,13 +509,13 @@ class BaseModel(ABC):
 
         Returns
         -------
-        log_likelihoods : list[float]
-            A list of marginal log-likelihoods at each iteration.
+        log_likelihoods : list[jax.Array]
+            A list of marginal log-likelihoods at each iteration (scalar arrays).
         """
         observations = jnp.asarray(observations)
         self._initialize_parameters(key)
-        log_likelihoods = []
-        previous_log_likelihood = -jnp.inf
+        log_likelihoods: list[jax.Array] = []
+        previous_log_likelihood: jax.Array = jnp.array(-jnp.inf)
 
         for iteration in range(max_iter):
             # E-step
@@ -724,7 +726,7 @@ class CommonOscillatorModel(BaseModel):
         key: Array,
         max_iter: int = 100,
         tolerance: float = 1e-4,
-    ) -> list[float]:
+    ) -> list[jax.Array]:
         """Fits the model to observations using the EM algorithm.
 
         Iteratively performs E-steps and M-steps until convergence or
@@ -743,8 +745,8 @@ class CommonOscillatorModel(BaseModel):
 
         Returns
         -------
-        log_likelihoods : list[float]
-            A list of marginal log-likelihoods at each iteration.
+        log_likelihoods : list[jax.Array]
+            A list of marginal log-likelihoods at each iteration (scalar arrays).
         """
         observations = jnp.asarray(observations)
         if observations.shape[1] != self.n_sources:
@@ -910,7 +912,7 @@ class CorrelatedNoiseModel(BaseModel):
         key: Array,
         max_iter: int = 100,
         tolerance: float = 1e-4,
-    ) -> list[float]:
+    ) -> list[jax.Array]:
         """Fits the model to observations using the EM algorithm.
 
         Iteratively performs E-steps and M-steps until convergence or
@@ -929,8 +931,8 @@ class CorrelatedNoiseModel(BaseModel):
 
         Returns
         -------
-        log_likelihoods : list[float]
-            A list of marginal log-likelihoods at each iteration.
+        log_likelihoods : list[jax.Array]
+            A list of marginal log-likelihoods at each iteration (scalar arrays).
         """
         observations = jnp.asarray(observations)
         if observations.shape[1] != self.n_sources:
@@ -1110,6 +1112,7 @@ class DirectedInfluenceModel(BaseModel):
         observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
         """
+        obs_arr: jax.Array = jnp.asarray(observations)
         # First, run the standard M-step for all parameters except A
         (
             _,  # A - we'll compute this ourselves
@@ -1121,7 +1124,7 @@ class DirectedInfluenceModel(BaseModel):
             Z,
             pi0,
         ) = switching_kalman_maximization_step(
-            obs=observations,
+            obs=obs_arr,
             state_cond_smoother_means=self.smoother_state_cond_mean,
             state_cond_smoother_covs=self.smoother_state_cond_cov,
             smoother_discrete_state_prob=self.smoother_discrete_state_prob,
@@ -1251,7 +1254,7 @@ class DirectedInfluenceModel(BaseModel):
         key: Array,
         max_iter: int = 100,
         tolerance: float = 1e-4,
-    ) -> list[float]:
+    ) -> list[jax.Array]:
         """Fits the model to observations using the EM algorithm.
 
         Iteratively performs E-steps and M-steps until convergence or
@@ -1270,8 +1273,8 @@ class DirectedInfluenceModel(BaseModel):
 
         Returns
         -------
-        log_likelihoods : list[float]
-            A list of marginal log-likelihoods at each iteration.
+        log_likelihoods : list[jax.Array]
+            A list of marginal log-likelihoods at each iteration (scalar arrays).
         """
         observations = jnp.asarray(observations)
         if observations.shape[1] != self.n_sources:

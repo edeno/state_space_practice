@@ -79,9 +79,10 @@ def _compute_intrinsic_oscillation_block(
         If the auto_regressive_coef is not between 0 and 1
 
     """
-    return auto_regressive_coef * _get_rotation_matrix(
+    result: jax.Array = jnp.asarray(auto_regressive_coef) * _get_rotation_matrix(
         2 * jnp.pi * oscillation_freq / sampling_freq
     )
+    return result
 
 
 def _compute_coupled_oscillator_block(
@@ -196,7 +197,8 @@ def construct_common_oscillator_transition_matrix(
         for k in range(n_oscillators)
     ]
 
-    return jax.scipy.linalg.block_diag(*diag_blocks)
+    result: jax.Array = jax.scipy.linalg.block_diag(*diag_blocks)
+    return result
 
 
 def construct_common_oscillator_process_covariance(
@@ -221,7 +223,8 @@ def construct_common_oscillator_process_covariance(
     n_oscillators = variance.shape[0]
     diag_blocks = [variance[k] * IDENTITY_2x2 for k in range(n_oscillators)]
 
-    return jax.scipy.linalg.block_diag(*diag_blocks)
+    result: jax.Array = jax.scipy.linalg.block_diag(*diag_blocks)
+    return result
 
 
 def construct_correlated_noise_process_covariance(
@@ -563,12 +566,13 @@ def _project_block(
     jax.Array, shape (2, 2)
         The projected block
     """
-    return jax.lax.cond(
+    result: jax.Array = jax.lax.cond(
         is_diagonal,
         lambda b: _project_diagonal_block(b, row_sum_scaling),
         lambda b: _project_to_closest_rotation(b),
         block,
     )
+    return result
 
 
 def project_coupled_transition_matrix(transition_matrix: jax.Array) -> jax.Array:

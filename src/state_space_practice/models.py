@@ -7,8 +7,10 @@ from jax.typing import ArrayLike
 
 
 def log_receptive_field_model(position: ArrayLike, params: ArrayLike) -> Array:
-    log_max_rate, place_field_center, scale = params
-    return log_max_rate - (position - place_field_center) ** 2 / (2 * scale**2)
+    params_arr = jnp.asarray(params)
+    log_max_rate, place_field_center, scale = params_arr
+    result: Array = log_max_rate - (jnp.asarray(position) - place_field_center) ** 2 / (2 * scale**2)
+    return result
 
 
 # NOTE: most general form of the SSPPF accounts for multiple neurons which is not implemented here
@@ -54,6 +56,14 @@ def stochastic_point_process_filter(
 
 
     """
+    # Convert ArrayLike inputs to Array for internal use
+    init_mode_params_arr: Array = jnp.asarray(init_mode_params)
+    init_covariance_params_arr: Array = jnp.asarray(init_covariance_params)
+    x_arr: Array = jnp.asarray(x)
+    spike_indicator_arr: Array = jnp.asarray(spike_indicator)
+    transition_matrix_arr: Array = jnp.asarray(transition_matrix)
+    latent_state_covariance_arr: Array = jnp.asarray(latent_state_covariance)
+
     # Compute the gradient and hessian of the log receptive field model
     grad_log_receptive_field_model = jax.grad(log_receptive_field_model, argnums=1)
     hess_log_receptive_field_model = jax.hessian(log_receptive_field_model, argnums=1)
@@ -78,10 +88,10 @@ def stochastic_point_process_filter(
         x_t, spike_indicator_t = args
 
         # One-step prediction
-        one_step_mean = transition_matrix @ mode_prev
+        one_step_mean = transition_matrix_arr @ mode_prev
         one_step_variance = (
-            transition_matrix @ covariance_prev @ transition_matrix.T
-            + latent_state_covariance
+            transition_matrix_arr @ covariance_prev @ transition_matrix_arr.T
+            + latent_state_covariance_arr
         )
 
         # Compute the conditional intensity and innovation
@@ -116,7 +126,7 @@ def stochastic_point_process_filter(
 
     # Run the SSPPF
     return jax.lax.scan(
-        _update, (init_mode_params, init_covariance_params), (x, spike_indicator)
+        _update, (init_mode_params_arr, init_covariance_params_arr), (x_arr, spike_indicator_arr)
     )[1]
 
 
@@ -187,6 +197,12 @@ def steepest_descent_point_process_filter(
     This implementation follows the formulation in [2].
 
     """
+    # Convert ArrayLike inputs to Array for internal use
+    init_mean_params_arr: Array = jnp.asarray(init_mean_params)
+    x_arr: Array = jnp.asarray(x)
+    spike_indicator_arr: Array = jnp.asarray(spike_indicator)
+    epsilon_arr: Array = jnp.asarray(epsilon)
+
     grad_log_receptive_field_model = jax.grad(log_receptive_field_model, argnums=1)
 
     def _update(
@@ -197,8 +213,8 @@ def steepest_descent_point_process_filter(
         conditional_intensity = jnp.exp(log_receptive_field_model(x_t, mode_prev)) * dt
         innovation = spike_indicator_t - conditional_intensity
         one_step_grad = grad_log_receptive_field_model(x_t, mode_prev)
-        posterior_mode = mode_prev + epsilon @ one_step_grad * innovation
+        posterior_mode = mode_prev + epsilon_arr @ one_step_grad * innovation
 
         return posterior_mode, posterior_mode
 
-    return jax.lax.scan(_update, init_mean_params, (x, spike_indicator))[1]
+    return jax.lax.scan(_update, init_mean_params_arr, (x_arr, spike_indicator_arr))[1]

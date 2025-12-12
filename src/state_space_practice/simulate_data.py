@@ -5,7 +5,8 @@ def receptive_field_model(position: np.ndarray, params: np.ndarray) -> np.ndarra
     if params.ndim == 1:
         params = params[None]
     log_max_rate, place_field_center, scale = params.T
-    return np.exp(log_max_rate - (position - place_field_center) ** 2 / (2 * scale**2))
+    result: np.ndarray = np.exp(log_max_rate - (position - place_field_center) ** 2 / (2 * scale**2))
+    return result
 
 
 def simulate_eden_brown_2004_jump() -> (

@@ -1,9 +1,15 @@
+from typing import Union
+
+import jax
 import numpy as np
+
+# Type alias for numeric values (scalars, numpy arrays, JAX arrays)
+Numeric = Union[float, int, np.ndarray, jax.Array]
 
 
 def check_converged(
-    log_likelihood: float,
-    previous_log_likelihood: float,
+    log_likelihood: Numeric,
+    previous_log_likelihood: Numeric,
     tolerance: float = 1e-4,
 ) -> tuple[bool, bool]:
     """We have converged if the slope of the log-likelihood function falls below 'tolerance',
@@ -35,9 +41,9 @@ def check_converged(
         is_increasing = log_likelihood >= previous_log_likelihood
         return False, bool(is_increasing)
 
-    delta_log_likelihood = abs(log_likelihood - previous_log_likelihood)
+    delta_log_likelihood = np.abs(log_likelihood - previous_log_likelihood)
     eps = np.finfo(float).eps
-    avg_log_likelihood = (abs(log_likelihood) + abs(previous_log_likelihood) + eps) / 2
+    avg_log_likelihood = (np.abs(log_likelihood) + np.abs(previous_log_likelihood) + eps) / 2
 
     is_increasing = log_likelihood - previous_log_likelihood >= -tolerance
     is_converged = (delta_log_likelihood / avg_log_likelihood) < tolerance

@@ -630,6 +630,12 @@ def steepest_descent_point_process_filter(
     This implementation follows the formulation in [2].
 
     """
+    # Convert ArrayLike inputs to Array
+    init_mean_params_arr: Array = jnp.asarray(init_mean_params)
+    x_arr: Array = jnp.asarray(x)
+    spike_indicator_arr: Array = jnp.asarray(spike_indicator)
+    epsilon_arr: Array = jnp.asarray(epsilon)
+
     grad_log_receptive_field_model = jax.grad(log_receptive_field_model, argnums=1)
 
     def _update(
@@ -640,11 +646,11 @@ def steepest_descent_point_process_filter(
         conditional_intensity = jnp.exp(log_receptive_field_model(x_t, mean_prev)) * dt
         innovation = spike_indicator_t - conditional_intensity
         one_step_grad = grad_log_receptive_field_model(x_t, mean_prev)
-        posterior_mean = mean_prev + epsilon @ one_step_grad * innovation
+        posterior_mean = mean_prev + epsilon_arr @ one_step_grad * innovation
 
         return posterior_mean, posterior_mean
 
-    return jax.lax.scan(_update, init_mean_params, (x, spike_indicator))[1]
+    return jax.lax.scan(_update, init_mean_params_arr, (x_arr, spike_indicator_arr))[1]
 
 
 class PointProcessModel:
@@ -814,7 +820,7 @@ class PointProcessModel:
 
     def _m_step(self) -> None:
         """M-step: Update model parameters based on smoothed estimates."""
-        if self.smoother_mean is None or self.smoother_cov is None:
+        if self.smoother_mean is None or self.smoother_cov is None or self.smoother_cross_cov is None:
             raise RuntimeError("Must run E-step before M-step")
 
         transition_matrix, process_cov, init_mean, init_cov = kalman_maximization_step(

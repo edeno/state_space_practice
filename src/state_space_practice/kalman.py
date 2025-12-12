@@ -89,7 +89,7 @@ def _kalman_filter_update(
     process_cov: jax.Array,
     measurement_matrix: jax.Array,
     measurement_cov: jax.Array,
-) -> tuple[jax.Array, jax.Array, float]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Performs a single update step of the Kalman filter.
 
     Parameters
@@ -115,8 +115,8 @@ def _kalman_filter_update(
         Posterior state mean, $$ m_t $$.
     posterior_cov : jax.Array, shape (n_cont_states, n_cont_states)
         Posterior state covariance, $$ P_t $$.
-    marginal_log_likelihood : float
-        Log-likelihood of the observation, $$ \\log p(y_t | y_{1:t-1}) $$.
+    marginal_log_likelihood : jax.Array
+        Log-likelihood of the observation, $$ \\log p(y_t | y_{1:t-1}) $$ (scalar array).
 
     """
 
@@ -147,8 +147,8 @@ def _kalman_filter_update(
         I_KH @ one_step_cov @ I_KH.T + kalman_gain @ (measurement_cov @ kalman_gain.T)
     )
 
-    marginal_log_likelihood = jax.scipy.stats.multivariate_normal.logpdf(
-        x=obs, mean=obs_mean, cov=obs_cov
+    marginal_log_likelihood = jnp.asarray(
+        jax.scipy.stats.multivariate_normal.logpdf(x=obs, mean=obs_mean, cov=obs_cov)
     )
 
     return posterior_mean, posterior_cov, marginal_log_likelihood
@@ -300,7 +300,7 @@ def kalman_smoother(
     process_cov: jax.Array,
     measurement_matrix: jax.Array,
     measurement_cov: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array, float]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Applies the Rauch-Tung-Striebel (RTS) smoother.
 
     Parameters
@@ -328,8 +328,8 @@ def kalman_smoother(
         Smoothed state covariances, $$ P_{1:T|T} $$.
     smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states)
         Smoothed cross-covariances, $$ P_{t, t+1|T} $$.
-    marginal_log_likelihood : float
-        Total log likelihood of the observations.
+    marginal_log_likelihood : jax.Array
+        Total log likelihood of the observations (scalar array).
 
     """
     filtered_mean, filtered_cov, marginal_log_likelihood = kalman_filter(

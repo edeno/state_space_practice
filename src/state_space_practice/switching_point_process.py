@@ -340,12 +340,13 @@ def _point_process_update_per_discrete_state_pair(
         out_axes=-1,
     )
 
-    return vmapped_update(
+    result: tuple[Array, Array, Array] = vmapped_update(
         prev_state_cond_mean,
         prev_state_cond_cov,
         continuous_transition_matrix,
         process_cov,
     )
+    return result
 
 
 def _armijo_line_search(
