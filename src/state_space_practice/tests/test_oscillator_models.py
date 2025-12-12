@@ -10,7 +10,6 @@ import numpy as np
 import pytest
 
 from state_space_practice.oscillator_models import (
-    BaseModel,
     CommonOscillatorModel,
     CorrelatedNoiseModel,
     DirectedInfluenceModel,

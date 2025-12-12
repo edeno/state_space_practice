@@ -4,7 +4,6 @@ This module tests the convergence checking utility used in EM algorithms.
 """
 
 import numpy as np
-import pytest
 
 from state_space_practice.utils import check_converged
 

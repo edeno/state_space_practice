@@ -40,7 +40,6 @@ from state_space_practice.switching_kalman import (
     switching_kalman_smoother,
     weighted_sum_of_outer_products,
 )
-from state_space_practice.tests.test_kalman import simple_1d_model
 
 # --- Fixtures ---
 
@@ -1933,8 +1932,6 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from state_space_practice.tests.conftest import (
     gaussian_mixture_params,
-    positive_definite_matrices,
-    probability_vectors,
     stochastic_matrices,
     switching_kalman_model_params,
     to_jax,

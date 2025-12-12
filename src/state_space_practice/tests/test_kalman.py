@@ -18,7 +18,6 @@ from state_space_practice.kalman import (
 from state_space_practice.tests.conftest import (
     kalman_model_params,
     positive_definite_matrices,
-    stable_transition_matrices,
     to_jax,
 )
 

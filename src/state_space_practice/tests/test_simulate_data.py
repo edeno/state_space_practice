@@ -5,7 +5,6 @@ including receptive field models and Eden/Brown 2004 simulations.
 """
 
 import numpy as np
-import pytest
 
 from state_space_practice.simulate_data import (
     receptive_field_model,
