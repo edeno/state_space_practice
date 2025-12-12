@@ -83,7 +83,7 @@ def _point_process_laplace_update(
     diagonal_boost: float = 1e-9,
     grad_log_intensity_func: Optional[Callable[[Array], Array]] = None,
     hess_log_intensity_func: Optional[Callable[[Array], Array]] = None,
-) -> tuple[Array, Array, float]:
+) -> tuple[Array, Array, Array]:
     """Single point-process Laplace-EKF update for multiple neurons.
 
     Performs a Bayesian update of the latent state posterior given observed
@@ -125,8 +125,8 @@ def _point_process_laplace_update(
         Updated state mean after incorporating spike observations
     posterior_cov : Array, shape (n_latent, n_latent)
         Updated state covariance after incorporating spike observations
-    log_likelihood : float
-        Sum of Poisson log-pmfs across neurons
+    log_likelihood : Array
+        Sum of Poisson log-pmfs across neurons (scalar array)
 
     Notes
     -----
@@ -212,7 +212,7 @@ def stochastic_point_process_filter(
     transition_matrix: ArrayLike,
     process_cov: ArrayLike,
     log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
-) -> tuple[Array, Array, float]:
+) -> tuple[Array, Array, Array]:
     """Applies a Stochastic State Point Process Filter (SSPPF).
 
     This filter estimates a time-varying latent state ($x_k$) based on
@@ -271,8 +271,8 @@ def stochastic_point_process_filter(
         Filtered posterior means ($x_{k|k}$).
     posterior_variance : Array, shape (n_time, n_params, n_params)
         Filtered posterior covariances ($P_{k|k}$).
-    marginal_log_likelihood : float
-        Total log-likelihood of the observations given the model.
+    marginal_log_likelihood : Array
+        Total log-likelihood of the observations given the model (scalar array).
 
     Notes
     -----
@@ -314,9 +314,9 @@ def stochastic_point_process_filter(
     _hess_log_intensity = jax.jacfwd(_grad_log_intensity, argnums=1)
 
     def _step(
-        params_prev: tuple[Array, Array, float],
+        params_prev: tuple[Array, Array, Array],
         args: tuple[Array, Array],
-    ) -> tuple[tuple[Array, Array, float], tuple[Array, Array]]:
+    ) -> tuple[tuple[Array, Array, Array], tuple[Array, Array]]:
         """Point Process Adaptive Filter update step."""
         # Unpack previous parameters
         mean_prev, variance_prev, marginal_log_likelihood = params_prev
@@ -381,7 +381,7 @@ def stochastic_point_process_smoother(
     transition_matrix: ArrayLike,
     process_cov: ArrayLike,
     log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
-) -> tuple[Array, Array, Array, float]:
+) -> tuple[Array, Array, Array, Array]:
     """Applies a Stochastic State Point Process Smoother (SSPPS).
 
     This smoother estimates a time-varying latent state ($x_k$) based on
@@ -429,8 +429,8 @@ def stochastic_point_process_smoother(
         Smoothed posterior covariances ($P_{k|T}$).
     smoother_cross_cov : Array, shape (n_time - 1, n_params, n_params)
         Smoothed cross-covariances ($P_{k|T, k-1}$).
-    marginal_log_likelihood : float
-        Total log-likelihood of the observations given the model.
+    marginal_log_likelihood : Array
+        Total log-likelihood of the observations given the model (scalar array).
 
     Notes
     -----

@@ -1,3 +1,5 @@
+from typing import Callable
+
 import jax
 import jax.numpy as jnp
 from jax import Array
@@ -18,7 +20,7 @@ def stochastic_point_process_filter(
     dt: float,
     transition_matrix: ArrayLike,
     latent_state_covariance: ArrayLike,
-    log_receptive_field_model: callable,
+    log_receptive_field_model: Callable[[ArrayLike, ArrayLike], Array],
 ) -> tuple[Array, Array]:
     """Stochastic State Point Process Filter (SSPPF)
 
@@ -146,7 +148,7 @@ def steepest_descent_point_process_filter(
     spike_indicator: ArrayLike,
     dt: float,
     epsilon: ArrayLike,
-    log_receptive_field_model: callable,
+    log_receptive_field_model: Callable[[ArrayLike, ArrayLike], Array],
 ) -> Array:
     """Steepest Descent Point Process Filter (SDPPF)
 

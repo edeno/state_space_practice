@@ -163,7 +163,7 @@ def kalman_filter(
     process_cov: jax.Array,
     measurement_matrix: jax.Array,
     measurement_cov: jax.Array,
-) -> tuple[jax.Array, jax.Array, float]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Applies the Kalman filter to a sequence of observations.
 
     Parameters
@@ -189,8 +189,8 @@ def kalman_filter(
         Filtered state means, $$ m_{1:T} $$.
     filtered_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states)
         Filtered state covariances, $$ P_{1:T} $$.
-    marginal_log_likelihood : float
-        Total log likelihood of the observations, $$ \\sum_{t=1}^T \\log p(y_t | y_{1:t-1}) $$.
+    marginal_log_likelihood : jax.Array
+        Total log likelihood of the observations, $$ \\sum_{t=1}^T \\log p(y_t | y_{1:t-1}) $$ (scalar array).
 
     """
 

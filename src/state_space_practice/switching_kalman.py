@@ -159,7 +159,7 @@ def _update_discrete_state_probabilities(
     pair_cond_marginal_likelihood_scaled: jax.Array,
     discrete_transition_matrix: jax.Array,
     prev_filter_discrete_prob: jax.Array,
-) -> tuple[jax.Array, jax.Array, float]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Update the discrete state probabilities using the discrete transition matrix.
 
     Parameters
@@ -176,8 +176,8 @@ def _update_discrete_state_probabilities(
         Updated discrete state probabilities, M_{t|t}(j) = Pr(S_t=j | y_{1:t})
     filter_backward_cond_prob : jax.Array, shape (n_discrete_states, n_discrete_states)
         Mixing weights for the discrete states, W^{i|j} = Pr(S_{t-1}=i | S_t=j, y_{1:t})
-    predictive_likelihood_term_sum : float
-        Scaled predictive likelihood sum
+    predictive_likelihood_term_sum : jax.Array
+        Scaled predictive likelihood sum (scalar array)
     """
     # joint discrete state prob between time steps
     # M_{t-1,t | t}(i, j) = P(S_{t-1}=i, S_t=j | y_{1:t})
@@ -206,7 +206,7 @@ def _update_discrete_state_probabilities(
     )
 
 
-def _scale_likelihood(log_likelihood: jax.Array) -> tuple[jax.Array, float]:
+def _scale_likelihood(log_likelihood: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Scale the log likelihood to avoid numerical underflow.
 
     Parameters
@@ -217,8 +217,8 @@ def _scale_likelihood(log_likelihood: jax.Array) -> tuple[jax.Array, float]:
     -------
     scaled_likelihood : jax.Array, shape (n_discrete_states, n_discrete_states)
         Scaled log likelihood of the discrete states.
-    ll_max : float
-        Maximum log likelihood of the discrete states.
+    ll_max : jax.Array
+        Maximum log likelihood of the discrete states (scalar array).
     """
 
     ll_max = log_likelihood.max()
@@ -241,7 +241,7 @@ def switching_kalman_filter(
     jax.Array,  # Filtered covariance of the continuous latent state
     jax.Array,  # Filtered probability of the discrete states
     jax.Array,  # Last filtered conditional mean of the continuous latent state
-    float,  # Marginal log likelihood of the observations
+    jax.Array,  # Marginal log likelihood of the observations (scalar array)
 ]:
     """Switching Kalman filter for a linear Gaussian state space model with discrete states.
 
@@ -276,15 +276,15 @@ def switching_kalman_filter(
         Filtered probability of the discrete states
     last_pair_cond_filter_mean : jax.Array, shape (n_cont_states, n_discrete_states, n_discrete_states)
         Last filtered conditional mean of the continuous latent state
-    marginal_log_likelihood : float
-        Marginal log likelihood of the observations
+    marginal_log_likelihood : jax.Array
+        Marginal log likelihood of the observations (scalar array)
 
     """
 
     def _step(
-        carry: tuple[jax.Array, jax.Array, jax.Array, float], obs_t: jax.Array
+        carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array], obs_t: jax.Array
     ) -> tuple[
-        tuple[jax.Array, jax.Array, jax.Array, float],  # Next carry
+        tuple[jax.Array, jax.Array, jax.Array, jax.Array],  # Next carry
         tuple[jax.Array, jax.Array, jax.Array, jax.Array],  # Stacked output
     ]:
         """One step of the switching Kalman filter.
@@ -298,8 +298,8 @@ def switching_kalman_filter(
                 Previous state covariance.
             prev_filter_discrete_prob : jax.Array, shape (n_discrete_states,)
                 Previous discrete state probabilities
-            pair_cond_marginal_log_likelihood : float
-                Previous marginal log likelihood
+            pair_cond_marginal_log_likelihood : jax.Array
+                Previous marginal log likelihood (scalar array)
         obs_t : jax.Array, shape (n_obs_dim,)
             Observation at time t
 
@@ -312,8 +312,8 @@ def switching_kalman_filter(
                 Posterior state covariance.
             prev_filter_discrete_prob : jax.Array, shape (n_discrete_states,)
                 Posterior discrete state probabilities
-            marginal_log_likelihood : float
-                Posterior marginal log likelihood
+            marginal_log_likelihood : jax.Array
+                Posterior marginal log likelihood (scalar array)
         stack : tuple
             state_cond_filter_mean : jax.Array, shape (n_cont_states, n_discrete_states)
                 Posterior state mean.
@@ -533,7 +533,7 @@ def switching_kalman_smoother(
         args: tuple[jax.Array, jax.Array, jax.Array],
     ) -> tuple[
         tuple[jax.Array, jax.Array, jax.Array, jax.Array],
-        tuple[jax.Array, jax.Array, jax.Array],
+        tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
     ]:
         """
 
@@ -968,7 +968,7 @@ def compute_expected_complete_log_likelihood(
     measurement_matrix: jax.Array,
     measurement_cov: jax.Array,
     discrete_transition_matrix: jax.Array,
-) -> float:
+) -> jax.Array:
     """Compute the expected complete-data log-likelihood E_q[log p(y, x, s | θ)].
 
     This is the Q-function that the EM algorithm maximizes. For variational EM,
@@ -994,8 +994,8 @@ def compute_expected_complete_log_likelihood(
 
     Returns
     -------
-    expected_complete_ll : float
-        E_q[log p(y, x, s | θ)]
+    expected_complete_ll : jax.Array
+        E_q[log p(y, x, s | θ)] (scalar array)
     """
     n_time = obs.shape[0]
     n_discrete_states = smoother_discrete_state_prob.shape[1]
@@ -1109,7 +1109,7 @@ def compute_posterior_entropy(
     smoother_discrete_state_prob: jax.Array,
     smoother_joint_discrete_state_prob: jax.Array,
     state_cond_smoother_covs: jax.Array,
-) -> float:
+) -> jax.Array:
     """Compute the entropy of the approximate posterior H(q).
 
     For the switching Kalman filter with mixture collapse approximation:
@@ -1123,8 +1123,8 @@ def compute_posterior_entropy(
 
     Returns
     -------
-    entropy : float
-        H(q(x, s))
+    entropy : jax.Array
+        H(q(x, s)) (scalar array)
     """
     n_time = smoother_discrete_state_prob.shape[0]
     n_discrete_states = smoother_discrete_state_prob.shape[1]
@@ -1180,7 +1180,7 @@ def compute_elbo(
     measurement_matrix: jax.Array,
     measurement_cov: jax.Array,
     discrete_transition_matrix: jax.Array,
-) -> float:
+) -> jax.Array:
     """Compute the Evidence Lower Bound (ELBO) for the switching Kalman filter.
 
     ELBO = E_q[log p(y, x, s | θ)] - E_q[log q(x, s)]
@@ -1208,8 +1208,8 @@ def compute_elbo(
 
     Returns
     -------
-    elbo : float
-        The evidence lower bound
+    elbo : jax.Array
+        The evidence lower bound (scalar array)
     """
     expected_ll = compute_expected_complete_log_likelihood(
         obs=obs,
@@ -1323,7 +1323,7 @@ def compute_transition_q_function(
     A: jax.Array,
     gamma1: jax.Array,
     beta: jax.Array,
-) -> float:
+) -> jax.Array:
     """Compute the Q-function contribution from transition matrix.
 
     The Q-function for A (ignoring constants and Q covariance) is:
@@ -1342,8 +1342,8 @@ def compute_transition_q_function(
 
     Returns
     -------
-    float
-        Negative Q-function value (to be minimized).
+    jax.Array
+        Negative Q-function value (to be minimized, scalar array).
     """
     # We minimize: 0.5 * tr(A^T A gamma1) - tr(A^T beta)
     # Which is equivalent to maximizing the actual Q-function
@@ -1358,7 +1358,7 @@ def compute_transition_q_from_params(
     sampling_freq: float,
     gamma1: jax.Array,
     beta: jax.Array,
-) -> float:
+) -> jax.Array:
     """Compute Q-function from oscillator parameters.
 
     This is the objective to minimize in the reparameterized M-step.
@@ -1382,8 +1382,8 @@ def compute_transition_q_from_params(
 
     Returns
     -------
-    float
-        Negative Q-function value (to be minimized).
+    jax.Array
+        Negative Q-function value (to be minimized, scalar array).
     """
     from state_space_practice.oscillator_utils import (
         construct_directed_influence_transition_matrix,
@@ -1463,7 +1463,7 @@ def optimize_dim_transition_params(
             "phase_diff": phase,
         }
 
-    def loss(flat_params: jax.Array) -> float:
+    def loss(flat_params: jax.Array) -> jax.Array:
         params = unpack_params(flat_params)
         return compute_transition_q_from_params(
             damping=params["damping"],

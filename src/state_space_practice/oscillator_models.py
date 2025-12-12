@@ -251,7 +251,7 @@ class BaseModel(ABC):
             transition_matrix, axis=1, keepdims=True
         )
 
-    def _initialize_continuous_state(self, key: jax.random.PRNGKey) -> None:
+    def _initialize_continuous_state(self, key: Array) -> None:
         """Initializes the initial continuous state mean (m0) and covariance (P0).
 
         m0 is drawn from a multivariate normal distribution. P0 is set to identity
@@ -259,7 +259,7 @@ class BaseModel(ABC):
 
         Parameters
         ----------
-        key : jax.random.PRNGKey
+        key : Array
             JAX random number generator key.
         """
         mean = jax.random.multivariate_normal(
@@ -273,7 +273,7 @@ class BaseModel(ABC):
         )
 
     @abstractmethod
-    def _initialize_measurement_matrix(self, key: Optional[jax.random.PRNGKey] = None):
+    def _initialize_measurement_matrix(self, key: Array | None = None):
         """Abstract method to initialize the measurement matrix (H)."""
         pass
 
@@ -297,12 +297,12 @@ class BaseModel(ABC):
         """Abstract method to project estimated parameters onto valid spaces."""
         pass
 
-    def _initialize_parameters(self, key: jax.random.PRNGKey) -> None:
+    def _initialize_parameters(self, key: Array) -> None:
         """Initializes all model parameters by calling specific methods.
 
         Parameters
         ----------
-        key : jax.random.PRNGKey
+        key : Array
             JAX random number generator key.
         """
         k1, k2 = jax.random.split(key)
@@ -485,7 +485,7 @@ class BaseModel(ABC):
     def fit(
         self,
         observations: ArrayLike,
-        key: jax.random.PRNGKey,
+        key: Array,
         max_iter: int = 100,
         tolerance: float = 1e-4,
     ) -> list[float]:
@@ -498,7 +498,7 @@ class BaseModel(ABC):
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
-        key : jax.random.PRNGKey
+        key : Array
             JAX random number generator key for initialization.
         max_iter : int, optional
             Maximum number of EM iterations, by default 100.
@@ -625,7 +625,7 @@ class CommonOscillatorModel(BaseModel):
         self.update_process_cov = False
         self.update_measurement_matrix = True
 
-    def _initialize_measurement_matrix(self, key: Optional[jax.random.PRNGKey] = None):
+    def _initialize_measurement_matrix(self, key: Array | None = None):
         """Initializes H with small random values, varying across discrete states."""
         if key is None:
             raise ValueError("A JAX PRNGKey must be provided for COM initialization.")
@@ -721,7 +721,7 @@ class CommonOscillatorModel(BaseModel):
     def fit(
         self,
         observations: ArrayLike,
-        key: jax.random.PRNGKey,
+        key: Array,
         max_iter: int = 100,
         tolerance: float = 1e-4,
     ) -> list[float]:
@@ -734,7 +734,7 @@ class CommonOscillatorModel(BaseModel):
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
-        key : jax.random.PRNGKey
+        key : Array
             JAX random number generator key for initialization.
         max_iter : int, optional
             Maximum number of EM iterations, by default 100.
@@ -848,7 +848,7 @@ class CorrelatedNoiseModel(BaseModel):
         self.update_measurement_matrix = False  # H is fixed in CNM
         self.update_process_cov = True
 
-    def _initialize_measurement_matrix(self, key: Optional[jax.random.PRNGKey] = None):
+    def _initialize_measurement_matrix(self, key: Array | None = None):
         """Initializes H as block-diagonal [1, 0], constant across states."""
         measurement_matrix = construct_correlated_noise_measurement_matrix(
             self.n_sources,
@@ -907,7 +907,7 @@ class CorrelatedNoiseModel(BaseModel):
     def fit(
         self,
         observations: ArrayLike,
-        key: jax.random.PRNGKey,
+        key: Array,
         max_iter: int = 100,
         tolerance: float = 1e-4,
     ) -> list[float]:
@@ -920,7 +920,7 @@ class CorrelatedNoiseModel(BaseModel):
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
-        key : jax.random.PRNGKey
+        key : Array
             JAX random number generator key for initialization.
         max_iter : int, optional
             Maximum number of EM iterations, by default 100.
@@ -1045,7 +1045,7 @@ class DirectedInfluenceModel(BaseModel):
         # Store current oscillator params for warm-starting optimizer
         self._current_osc_params: Optional[list[dict]] = None
 
-    def _initialize_measurement_matrix(self, key: Optional[jax.random.PRNGKey] = None):
+    def _initialize_measurement_matrix(self, key: Array | None = None):
         """Initializes H with [1/sqrt(2), 1/sqrt(2)] blocks, constant across states."""
         measurement_matrix = construct_directed_influence_measurement_matrix(
             self.n_sources,
@@ -1248,7 +1248,7 @@ class DirectedInfluenceModel(BaseModel):
     def fit(
         self,
         observations: ArrayLike,
-        key: jax.random.PRNGKey,
+        key: Array,
         max_iter: int = 100,
         tolerance: float = 1e-4,
     ) -> list[float]:
@@ -1261,7 +1261,7 @@ class DirectedInfluenceModel(BaseModel):
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
-        key : jax.random.PRNGKey
+        key : Array
             JAX random number generator key for initialization.
         max_iter : int, optional
             Maximum number of EM iterations, by default 100.

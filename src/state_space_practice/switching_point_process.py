@@ -139,7 +139,7 @@ def point_process_kalman_update(
     diagonal_boost: float = 1e-9,
     grad_log_intensity_func: Callable[[Array], Array] | None = None,
     hess_log_intensity_func: Callable[[Array], Array] | None = None,
-) -> tuple[Array, Array, float]:
+) -> tuple[Array, Array, Array]:
     """Single point-process Laplace-EKF update for multiple neurons.
 
     Performs a Bayesian update of the latent state posterior given observed
@@ -182,8 +182,8 @@ def point_process_kalman_update(
         Updated state mean after incorporating spike observations
     posterior_cov : Array, shape (n_latent, n_latent)
         Updated state covariance after incorporating spike observations
-    log_likelihood : float
-        Log p(y_t | y_{1:t-1}) approximated at posterior mode
+    log_likelihood : Array
+        Log p(y_t | y_{1:t-1}) approximated at posterior mode (scalar array)
 
     Notes
     -----
@@ -221,7 +221,7 @@ def _point_process_predict_and_update(
     process_cov: Array,
     dt: float,
     log_intensity_func: Callable[[Array], Array],
-) -> tuple[Array, Array, float]:
+) -> tuple[Array, Array, Array]:
     """Predict with dynamics, then update with spike observations.
 
     This function combines the one-step prediction (using dynamics parameters)
@@ -254,8 +254,8 @@ def _point_process_predict_and_update(
         Pair-conditional posterior mean
     posterior_cov : Array, shape (n_latent, n_latent)
         Pair-conditional posterior covariance
-    log_likelihood : float
-        Log p(y_t | y_{1:t-1}, S_{t-1}=i, S_t=j)
+    log_likelihood : Array
+        Log p(y_t | y_{1:t-1}, S_{t-1}=i, S_t=j) (scalar array)
     """
     # One-step prediction using dynamics for state j
     one_step_mean = continuous_transition_matrix @ prev_state_cond_mean
@@ -352,8 +352,8 @@ def _armijo_line_search(
     params: Array,
     delta: Array,
     gradient: Array,
-    loss_fn: Callable[[Array], float],
-    current_loss: float,
+    loss_fn: Callable[[Array], Array],
+    current_loss: Array,
     beta: float = 0.5,
     c: float = 1e-4,
     max_iter: int = 20,
@@ -372,10 +372,10 @@ def _armijo_line_search(
         Search direction (typically Newton direction H^{-1} @ g).
     gradient : Array, shape (n_params,)
         Gradient at current params.
-    loss_fn : Callable[[Array], float]
-        Loss function to minimize. Takes params and returns scalar loss.
-    current_loss : float
-        Loss at current params (avoids recomputation).
+    loss_fn : Callable[[Array], Array]
+        Loss function to minimize. Takes params and returns scalar array loss.
+    current_loss : Array
+        Loss at current params (avoids recomputation, scalar array).
     beta : float, default=0.5
         Step reduction factor for backtracking.
     c : float, default=1e-4
@@ -886,7 +886,7 @@ def switching_point_process_filter(
     process_cov: Array,
     dt: float,
     log_intensity_func: Callable[[Array], Array],
-) -> tuple[Array, Array, Array, Array, float]:
+) -> tuple[Array, Array, Array, Array, Array]:
     """Switching point-process Kalman filter for spike observations.
 
     This filter implements a Switching Linear Dynamical System (SLDS) with
@@ -932,8 +932,8 @@ def switching_point_process_filter(
     last_pair_cond_filter_mean : Array, shape (n_latent, n_discrete_states, n_discrete_states)
         Pair-conditional filter means at the last timestep. Entry [:, i, j] is
         the mean for p(x_T | y_{1:T}, S_{T-1}=i, S_T=j). Needed by smoother.
-    marginal_log_likelihood : float
-        Marginal log-likelihood log p(y_{1:T}).
+    marginal_log_likelihood : Array
+        Marginal log-likelihood log p(y_{1:T}) (scalar array).
 
     Notes
     -----
@@ -966,9 +966,9 @@ def switching_point_process_filter(
     """
 
     def _step(
-        carry: tuple[Array, Array, Array, float],
+        carry: tuple[Array, Array, Array, Array],
         y_t: Array,
-    ) -> tuple[tuple[Array, Array, Array, float], tuple[Array, Array, Array, Array]]:
+    ) -> tuple[tuple[Array, Array, Array, Array], tuple[Array, Array, Array, Array]]:
         """One step of the switching point-process filter.
 
         Parameters
@@ -980,8 +980,8 @@ def switching_point_process_filter(
                 Previous state-conditional covariances.
             prev_filter_discrete_prob : Array, shape (n_discrete_states,)
                 Previous discrete state probabilities.
-            marginal_log_likelihood : float
-                Accumulated marginal log-likelihood.
+            marginal_log_likelihood : Array
+                Accumulated marginal log-likelihood (scalar array).
         y_t : Array, shape (n_neurons,)
             Spike counts at current timestep.
 
@@ -994,8 +994,8 @@ def switching_point_process_filter(
                 Posterior state-conditional covariances.
             filter_discrete_prob : Array, shape (n_discrete_states,)
                 Posterior discrete state probabilities.
-            marginal_log_likelihood : float
-                Updated accumulated marginal log-likelihood.
+            marginal_log_likelihood : Array
+                Updated accumulated marginal log-likelihood (scalar array).
         stack : tuple
             state_cond_filter_mean : Array, shape (n_latent, n_discrete_states)
                 Posterior state-conditional means.
@@ -1328,7 +1328,7 @@ class SwitchingSpikeOscillatorModel:
 
         return f"<{self.__class__.__name__}: {', '.join(params)}, [{flags_str}]>"
 
-    def _initialize_parameters(self, key: jax.random.PRNGKey) -> None:
+    def _initialize_parameters(self, key: Array) -> None:
         """Initialize all model parameters.
 
         Sets up initial values for all model parameters including:
@@ -1340,7 +1340,7 @@ class SwitchingSpikeOscillatorModel:
 
         Parameters
         ----------
-        key : jax.random.PRNGKey
+        key : Array
             JAX random number generator key for reproducible initialization.
 
         Notes
@@ -1416,12 +1416,12 @@ class SwitchingSpikeOscillatorModel:
             transition_matrix, axis=1, keepdims=True
         )
 
-    def _initialize_continuous_state(self, key: jax.random.PRNGKey) -> None:
+    def _initialize_continuous_state(self, key: Array) -> None:
         """Initialize continuous state mean and covariance.
 
         Parameters
         ----------
-        key : jax.random.PRNGKey
+        key : Array
             Random key for sampling initial mean.
         """
         # Initial mean: sample from standard normal, same for all discrete states
@@ -1474,12 +1474,12 @@ class SwitchingSpikeOscillatorModel:
         # Stack for each discrete state
         self.process_cov = jnp.stack([Q] * self.n_discrete_states, axis=2)
 
-    def _initialize_spike_params(self, key: jax.random.PRNGKey) -> None:
+    def _initialize_spike_params(self, key: Array) -> None:
         """Initialize spike observation parameters.
 
         Parameters
         ----------
-        key : jax.random.PRNGKey
+        key : Array
             Random key for sampling initial weights.
         """
         # Baseline: zero (exp(0) = 1 Hz baseline firing rate)
@@ -1848,6 +1848,7 @@ class SwitchingSpikeOscillatorModel:
         max_iter: int = 50,
         tol: float = 1e-4,
         key: Array | None = None,
+        skip_init: bool = False,
     ) -> list[float]:
         """Fit the model to spike data using the EM algorithm.
 
@@ -1869,6 +1870,9 @@ class SwitchingSpikeOscillatorModel:
             where avg = (|LL_new| + |LL_old|) / 2.
         key : Array | None, optional
             JAX random key for parameter initialization. If None, uses PRNGKey(0).
+        skip_init : bool, default=False
+            If True, skip parameter initialization and use existing parameters.
+            This allows custom initialization before calling fit().
 
         Returns
         -------
@@ -1947,8 +1951,9 @@ class SwitchingSpikeOscillatorModel:
         if key is None:
             key = jax.random.PRNGKey(0)
 
-        # Initialize parameters
-        self._initialize_parameters(key)
+        # Initialize parameters (unless skip_init is True for custom initialization)
+        if not skip_init:
+            self._initialize_parameters(key)
 
         # Track log-likelihoods across iterations
         log_likelihoods: list[float] = []

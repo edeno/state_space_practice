@@ -7,14 +7,9 @@ validating inference algorithms.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import jax
 import jax.numpy as jnp
 from jax import Array
-
-if TYPE_CHECKING:
-    from jax.random import PRNGKey
 
 
 def simulate_switching_spike_oscillator(
@@ -25,7 +20,7 @@ def simulate_switching_spike_oscillator(
     spike_weights: Array,
     spike_baseline: Array,
     dt: float,
-    key: PRNGKey,
+    key: Array,
     init_mean: Array | None = None,
     init_cov: Array | None = None,
     init_discrete_prob: Array | None = None,
@@ -56,7 +51,7 @@ def simulate_switching_spike_oscillator(
         Baseline log firing rates b for each neuron.
     dt : float
         Time bin width in seconds.
-    key : PRNGKey
+    key : Array
         JAX random key for reproducibility.
     init_mean : Array, shape (n_latent,), optional
         Initial continuous state mean. Defaults to zeros.
@@ -109,7 +104,7 @@ def simulate_switching_spike_oscillator(
     # Sample initial discrete state
     s_0 = jax.random.categorical(key_init_discrete, jnp.log(init_discrete_prob))
 
-    def _step(carry: tuple[Array, Array, PRNGKey], _: None) -> tuple[tuple[Array, Array, PRNGKey], tuple[Array, Array, Array]]:
+    def _step(carry: tuple[Array, Array, Array], _: None) -> tuple[tuple[Array, Array, Array], tuple[Array, Array, Array]]:
         """Single simulation step."""
         x_prev, s_prev, key = carry
 

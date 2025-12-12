@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+from jax.typing import ArrayLike
 
 IDENTITY_2x2 = jnp.identity(2)
 ZEROS_2x2 = jnp.zeros((2, 2))
@@ -26,7 +27,7 @@ def get_block_slice(from_oscillator: int, to_oscillator: int) -> tuple:
     return row_slice, col_slice
 
 
-def _get_rotation_matrix(rotation_frequency: float) -> jax.Array:
+def _get_rotation_matrix(rotation_frequency: ArrayLike) -> jax.Array:
     """Get the rotation matrix for a given frequency
 
     The rotation matrix is a 2x2 matrix that rotates a vector.
@@ -53,7 +54,7 @@ def _get_rotation_matrix(rotation_frequency: float) -> jax.Array:
 
 
 def _compute_intrinsic_oscillation_block(
-    oscillation_freq: float, auto_regressive_coef: float, sampling_freq: float = 1.0
+    oscillation_freq: ArrayLike, auto_regressive_coef: ArrayLike, sampling_freq: float = 1.0
 ) -> jax.Array:
     """Compute the rotation matrix for a given frequency and auto-regressive coefficient
 
@@ -84,9 +85,9 @@ def _compute_intrinsic_oscillation_block(
 
 
 def _compute_coupled_oscillator_block(
-    freq: float,
-    auto_regressive_coef: float,
-    sum_incoming_coupling_strength: float,
+    freq: ArrayLike,
+    auto_regressive_coef: ArrayLike,
+    sum_incoming_coupling_strength: ArrayLike,
     sampling_freq: float = 1.0,
 ) -> jax.Array:
     """Compute the diagonal block of the transition matrix for the coupled model.
@@ -122,8 +123,8 @@ def _compute_coupled_oscillator_block(
 
 
 def _compute_coupling_transition_block(
-    phase_difference: float,
-    coupling_strength: float,
+    phase_difference: ArrayLike,
+    coupling_strength: ArrayLike,
 ) -> jax.Array:
     """Compute the off-diagonal block transition matrix for a coupling model
 
@@ -544,7 +545,7 @@ def _project_diagonal_block(
 def _project_block(
     block: jax.Array,
     row_sum_scaling: jax.Array,
-    is_diagonal: bool,
+    is_diagonal: ArrayLike,
 ) -> jax.Array:
     """Project a single block, handling diagonal vs off-diagonal cases.
 

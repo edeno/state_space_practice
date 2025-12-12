@@ -112,11 +112,11 @@ def approximate_gaussian(
 @jax.jit
 def _log_posterior_objective(
     learning_state: ArrayLike,
-    learning_state_prev: float,
-    variance_prev: float,
-    n_correct_in_trial: int,
-    max_possible_correct: int,
-    bias: float,
+    learning_state_prev: ArrayLike,
+    variance_prev: ArrayLike,
+    n_correct_in_trial: ArrayLike,
+    max_possible_correct: ArrayLike,
+    bias: ArrayLike,
 ) -> Array:
     """Objective function for the log posterior distribution at one step.
 
@@ -124,15 +124,15 @@ def _log_posterior_objective(
     ----------
     learning_state : ArrayLike, shape (1,)
         Current latent learning state estimate, $x_k$.
-    learning_state_prev : float
+    learning_state_prev : ArrayLike
         Previous latent learning state estimate, $x_{k-1}$.
-    variance_prev : float
+    variance_prev : ArrayLike
         Previous state variance, $P_{k|k-1}$.
-    n_correct_in_trial : int
+    n_correct_in_trial : ArrayLike
         Number of correct responses in the trial, $y_k$.
-    max_possible_correct : int
+    max_possible_correct : ArrayLike
         Maximum number of correct responses, $N_k$.
-    bias : float
+    bias : ArrayLike
         Bias term ($\mu$) for the observation model.
 
     Returns
@@ -431,7 +431,7 @@ def maximization_step(
 
 
 def calculate_probability_confidence_limits(
-    key: jax.random.PRNGKey,
+    key: Array,
     smoothed_mode: ArrayLike,
     smoothed_variance: ArrayLike,
     mu_bias: float,
@@ -447,7 +447,7 @@ def calculate_probability_confidence_limits(
 
     Parameters
     ----------
-    key : jax.random.PRNGKey
+    key : Array
         JAX PRNG key for random number generation.
     smoothed_mode : ArrayLike, shape (n_trials,)
         Smoothed learning state means (x_{k|T}).
@@ -829,7 +829,7 @@ def compute_cross_covariance_matrix(
 
 
 def compute_trial_comparison_matrix(
-    key: jax.random.PRNGKey,
+    key: Array,
     smoothed_mode: jnp.ndarray,
     smoothed_variance: jnp.ndarray,
     smoother_gain: jnp.ndarray,
@@ -845,7 +845,7 @@ def compute_trial_comparison_matrix(
 
     Parameters
     ----------
-    key : jax.random.PRNGKey
+    key : Array
         JAX PRNG key for Monte Carlo sampling.
     smoothed_mode : jnp.ndarray, shape (n_trials,)
         Smoothed learning state modes (x_{k|T}).
@@ -912,7 +912,7 @@ def compute_trial_comparison_matrix(
 
 
 def compare_two_trials(
-    key: jax.random.PRNGKey,
+    key: Array,
     smoothed_mode: jnp.ndarray,
     smoothed_variance: jnp.ndarray,
     smoother_gain: jnp.ndarray,
@@ -933,7 +933,7 @@ def compare_two_trials(
 
     Parameters
     ----------
-    key : jax.random.PRNGKey
+    key : Array
         JAX PRNG key for Monte Carlo sampling.
     smoothed_mode : jnp.ndarray, shape (n_trials,)
         Smoothed learning state modes (x_{k|T}).
@@ -1020,7 +1020,7 @@ def find_first_significant_trial(
 
 
 def calculate_latent_state_percentiles(
-    key: jax.random.PRNGKey,
+    key: Array,
     smoothed_mode: jnp.ndarray,  # shape: (n_trials,)
     smoothed_variance: jnp.ndarray,  # shape: (n_trials,)
     n_samples: int = 10000,
@@ -1033,7 +1033,7 @@ def calculate_latent_state_percentiles(
 
     Parameters
     ----------
-    key : jax.random.PRNGKey
+    key : Array
         JAX PRNG key for random number generation.
     smoothed_mode : jnp.ndarray, shape (n_trials,)
         Smoothed learning state means (x_{k|T}).
@@ -1401,7 +1401,7 @@ class SmithLearningAlgorithm:
 
     def get_learning_curve(
         self,
-        key: jax.random.PRNGKey,
+        key: Array,
         n_samples: int = 10000,
         percentiles: Optional[jax.Array] = None,
         calculate_pcert: bool = False,
@@ -1414,7 +1414,7 @@ class SmithLearningAlgorithm:
 
         Parameters
         ----------
-        key : jax.random.PRNGKey
+        key : Array
             JAX PRNG key for random number generation (for sampling).
         n_samples : int, optional
             Number of Monte Carlo samples to draw per trial for confidence limits.
@@ -1460,7 +1460,7 @@ class SmithLearningAlgorithm:
 
     def get_latent_state_percentiles(
         self,
-        key: jax.random.PRNGKey,
+        key: Array,
         n_samples: int = 10000,
         percentiles: Optional[jax.Array] = None,
     ) -> jax.Array:
@@ -1471,7 +1471,7 @@ class SmithLearningAlgorithm:
 
         Parameters
         ----------
-        key : jax.random.PRNGKey
+        key : Array
             JAX PRNG key for random number generation.
         n_samples : int, optional
             Number of Monte Carlo samples per trial. Default is 10000.
@@ -1667,7 +1667,7 @@ class SmithLearningAlgorithm:
 
     def find_criterion_trial(
         self,
-        key: jax.random.PRNGKey,  # Needed if get_learning_curve not yet called
+        key: Array,  # Needed if get_learning_curve not yet called
         lower_percentile_for_criterion: float = 5.0,  # e.g., for p05
         chance_level_override: Optional[float] = None,
         n_samples_for_ci: int = 10000,  # if CIs need to be recomputed
@@ -1681,7 +1681,7 @@ class SmithLearningAlgorithm:
 
         Parameters
         ----------
-        key : jax.random.PRNGKey
+        key : Array
             JAX PRNGKey, required if confidence intervals need to be (re)computed.
         lower_percentile_for_criterion : float, optional
             The lower percentile to use from the probability confidence interval
@@ -1775,7 +1775,7 @@ class SmithLearningAlgorithm:
 
     def plot_learning_process(
         self,
-        key: jax.random.PRNGKey,
+        key: Array,
         plot_type: str = "probability",
         observed_n_correct: Optional[jax.Array] = None,
         observed_max_possible: Optional[jax.Array] = None,
@@ -1793,7 +1793,7 @@ class SmithLearningAlgorithm:
 
         Parameters
         ----------
-        key : jax.random.PRNGKey
+        key : Array
             JAX PRNG key for random number generation, required for computing
             confidence intervals if they haven't been implicitly computed by
             prior calls that populate necessary attributes.
@@ -1968,7 +1968,7 @@ class SmithLearningAlgorithm:
 
     def compare_trials(
         self,
-        key: jax.random.PRNGKey,
+        key: Array,
         trial1: int,
         trial2: int,
         n_samples: int = 10000,
@@ -1984,7 +1984,7 @@ class SmithLearningAlgorithm:
 
         Parameters
         ----------
-        key : jax.random.PRNGKey
+        key : Array
             JAX PRNG key for Monte Carlo sampling.
         trial1 : int
             First trial index (0-based).
@@ -2037,7 +2037,7 @@ class SmithLearningAlgorithm:
 
     def get_trial_comparison_matrix(
         self,
-        key: jax.random.PRNGKey,
+        key: Array,
         n_samples: int = 10000,
         compare_probability: bool = False,
     ) -> jnp.ndarray:
@@ -2050,7 +2050,7 @@ class SmithLearningAlgorithm:
 
         Parameters
         ----------
-        key : jax.random.PRNGKey
+        key : Array
             JAX PRNG key for Monte Carlo sampling.
         n_samples : int, optional
             Number of Monte Carlo samples per comparison. Default is 10000.
@@ -2096,7 +2096,7 @@ class SmithLearningAlgorithm:
 
     def find_first_significant_improvement(
         self,
-        key: jax.random.PRNGKey,
+        key: Array,
         reference_trial: int = 0,
         significance_level: float = 0.05,
         n_samples: int = 10000,
@@ -2112,7 +2112,7 @@ class SmithLearningAlgorithm:
 
         Parameters
         ----------
-        key : jax.random.PRNGKey
+        key : Array
             JAX PRNG key for Monte Carlo sampling.
         reference_trial : int, optional
             The reference trial to compare against. Default is 0 (first trial).
@@ -2156,7 +2156,7 @@ class SmithLearningAlgorithm:
 
     def plot_trial_comparison_matrix(
         self,
-        key: jax.random.PRNGKey,
+        key: Array,
         n_samples: int = 10000,
         compare_probability: bool = False,
         significance_level: float = 0.05,
@@ -2173,7 +2173,7 @@ class SmithLearningAlgorithm:
 
         Parameters
         ----------
-        key : jax.random.PRNGKey
+        key : Array
             JAX PRNG key for Monte Carlo sampling.
         n_samples : int, optional
             Number of Monte Carlo samples per comparison. Default is 10000.
