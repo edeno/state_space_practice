@@ -484,6 +484,7 @@ def _single_neuron_glm_step(
     y_n: Array,
     smoother_mean: Array,
     dt: float,
+    weight_l2: float = 0.0,
 ) -> tuple[Array, Array]:
     """Single Newton-Raphson step for Poisson GLM parameter optimization.
 
@@ -507,6 +508,9 @@ def _single_neuron_glm_step(
         Smoothed latent state estimates (used as design matrix).
     dt : float
         Time bin width in seconds.
+    weight_l2 : float, default=0.0
+        L2 regularization strength on the weights (not baseline).
+        Adds 0.5 * weight_l2 * ||weights||^2 to the objective.
 
     Returns
     -------
@@ -520,8 +524,8 @@ def _single_neuron_glm_step(
     For Poisson GLM with log-link, the negative log-likelihood is convex,
     so Newton's method is guaranteed to converge. The gradient and Hessian are:
 
-        gradient = -X.T @ (y - mu)
-        Hessian = X.T @ diag(mu) @ X
+        gradient = -X.T @ (y - mu) + l2_reg * [0, weights]
+        Hessian = X.T @ diag(mu) @ X + l2_reg * diag([0, 1, 1, ...])
 
     where X is the design matrix [1, smoother_mean], y is spike counts,
     and mu = exp(X @ params) * dt is the expected count.
@@ -545,13 +549,22 @@ def _single_neuron_glm_step(
     eta = design_matrix @ params  # (n_time,)
     mu = jnp.exp(eta) * dt  # Expected spike counts (n_time,)
 
-    # Compute gradient: -X.T @ (y - mu)
+    # Compute gradient: -X.T @ (y - mu) + L2 penalty gradient
     residual = y_n - mu  # (n_time,)
     gradient = -design_matrix.T @ residual  # (1 + n_latent,)
+
+    # Add L2 penalty gradient: weight_l2 * [0, weights]
+    # (no penalty on baseline, only on weights)
+    l2_grad = jnp.concatenate([jnp.zeros(1), weight_l2 * weights])
+    gradient = gradient + l2_grad
 
     # Compute Hessian: X.T @ diag(mu) @ X
     weighted_design = design_matrix * mu[:, None]  # (n_time, 1+n_latent)
     hessian = design_matrix.T @ weighted_design  # (1+n_latent, 1+n_latent)
+
+    # Add L2 penalty to Hessian: weight_l2 * diag([0, 1, 1, ...])
+    l2_hess_diag = jnp.concatenate([jnp.zeros(1), jnp.ones(n_latent) * weight_l2])
+    hessian = hessian + jnp.diag(l2_hess_diag)
 
     # Add small regularization for numerical stability
     reg = 1e-6 * jnp.eye(1 + n_latent)
@@ -560,14 +573,17 @@ def _single_neuron_glm_step(
     # Newton direction: delta = H^{-1} @ g
     delta = jnp.linalg.solve(hessian, gradient)
 
-    # Current loss for backtracking line search
-    current_loss = jnp.sum(mu - y_n * eta)  # NLL without constant term
+    # Current loss for backtracking line search (NLL + L2 penalty)
+    current_loss = jnp.sum(mu - y_n * eta) + 0.5 * weight_l2 * jnp.sum(weights**2)
 
     # Define loss function for line search
     def loss_fn(p):
         eta_trial = design_matrix @ p
         mu_trial = jnp.exp(eta_trial) * dt
-        return jnp.sum(mu_trial - y_n * eta_trial)
+        weights_trial = p[1:]
+        nll = jnp.sum(mu_trial - y_n * eta_trial)
+        l2_penalty = 0.5 * weight_l2 * jnp.sum(weights_trial**2)
+        return nll + l2_penalty
 
     # Backtracking line search with Armijo condition
     final_alpha = _armijo_line_search(params, delta, gradient, loss_fn, current_loss)
