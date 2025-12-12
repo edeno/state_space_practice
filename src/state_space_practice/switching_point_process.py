@@ -605,6 +605,7 @@ def _single_neuron_glm_step_second_order(
     smoother_mean: Array,
     smoother_cov: Array,
     dt: float,
+    weight_l2: float = 0.0,
 ) -> tuple[Array, Array]:
     """Single Newton step for Poisson GLM with second-order expectation.
 
@@ -628,6 +629,9 @@ def _single_neuron_glm_step_second_order(
         Smoothed latent state covariances.
     dt : float
         Time bin width in seconds.
+    weight_l2 : float, default=0.0
+        L2 regularization strength on the weights (not baseline).
+        Adds 0.5 * weight_l2 * ||weights||^2 to the objective.
 
     Returns
     -------
@@ -680,9 +684,13 @@ def _single_neuron_glm_step_second_order(
         smoother_mean, smoother_cov
     )
 
-    # Gradient: -X_eff.T @ (y - mu)
+    # Gradient: -X_eff.T @ (y - mu) + L2 penalty gradient
     residual = y_n - mu
     gradient = -effective_design.T @ residual
+
+    # Add L2 penalty gradient: weight_l2 * [0, weights]
+    l2_grad = jnp.concatenate([jnp.zeros(1), weight_l2 * weights])
+    gradient = gradient + l2_grad
 
     # Hessian: For Poisson GLM, the Hessian also involves second derivatives
     # of the variance correction term. For simplicity, we use:
@@ -691,15 +699,22 @@ def _single_neuron_glm_step_second_order(
     weighted_design = effective_design * mu[:, None]
     hessian = effective_design.T @ weighted_design
 
-    # Regularization
+    # Add L2 penalty to Hessian: weight_l2 * diag([0, 1, 1, ...])
+    l2_hess_diag = jnp.concatenate([jnp.zeros(1), jnp.ones(n_latent) * weight_l2])
+    hessian = hessian + jnp.diag(l2_hess_diag)
+
+    # Regularization for numerical stability
     reg = 1e-6 * jnp.eye(1 + n_latent)
     hessian = hessian + reg
 
     # Newton direction
     delta = jnp.linalg.solve(hessian, gradient)
 
-    # Current loss for backtracking
-    current_loss = jnp.sum(mu - y_n * (design_matrix @ params + variance_corrections))
+    # Current loss for backtracking (NLL + L2 penalty)
+    current_loss = (
+        jnp.sum(mu - y_n * (design_matrix @ params + variance_corrections))
+        + 0.5 * weight_l2 * jnp.sum(weights**2)
+    )
 
     # Define loss function for line search (includes variance correction recomputation)
     def loss_fn(p):
@@ -713,7 +728,9 @@ def _single_neuron_glm_step_second_order(
 
         eta_trial = design_matrix @ p + var_corr_trial
         mu_trial = jnp.exp(eta_trial) * dt
-        return jnp.sum(mu_trial - y_n * (design_matrix @ p + var_corr_trial))
+        nll = jnp.sum(mu_trial - y_n * (design_matrix @ p + var_corr_trial))
+        l2_penalty = 0.5 * weight_l2 * jnp.sum(new_weights_trial**2)
+        return nll + l2_penalty
 
     # Backtracking line search with Armijo condition
     final_alpha = _armijo_line_search(params, delta, gradient, loss_fn, current_loss)
@@ -733,11 +750,13 @@ def update_spike_glm_params(
     max_iter: int = 10,
     smoother_cov: Array | None = None,
     use_second_order: bool = False,
+    weight_l2: float = 0.0,
 ) -> SpikeObsParams:
     """M-step for spike observation parameters.
 
     Updates the spike GLM parameters (baseline, weights) by maximizing
-    E_q[log p(y | x; C, b)] with respect to C and b.
+    E_q[log p(y | x; C, b)] with respect to C and b, with optional L2
+    regularization on the weights.
 
     Two methods are available:
     - Plug-in method (default): Uses smoother_mean directly, ignoring uncertainty.
@@ -764,6 +783,9 @@ def update_spike_glm_params(
     use_second_order : bool, default=False
         If True, use second-order expectation method that accounts for
         state uncertainty. Requires smoother_cov to be provided.
+    weight_l2 : float, default=0.0
+        L2 regularization strength on the weights (not baseline).
+        Adds 0.5 * weight_l2 * ||weights||^2 to the objective for each neuron.
 
     Returns
     -------
@@ -778,6 +800,10 @@ def update_spike_glm_params(
 
     The second-order method provides more accurate estimates when state
     uncertainty is significant, at the cost of additional computation.
+
+    The L2 regularization is applied only to the weights, not the baseline,
+    which helps prevent overfitting when the number of neurons is small
+    relative to the latent dimensionality.
     """
     n_neurons = spikes.shape[1]
     n_time = smoother_mean.shape[0]
@@ -809,7 +835,7 @@ def update_spike_glm_params(
                 w = weights[neuron_idx]
                 y_n = spikes[:, neuron_idx]
                 new_b, new_w = _single_neuron_glm_step_second_order(
-                    b, w, y_n, smoother_mean, smoother_cov, dt
+                    b, w, y_n, smoother_mean, smoother_cov, dt, weight_l2
                 )
                 return new_b, new_w
 
@@ -833,7 +859,9 @@ def update_spike_glm_params(
                 b = baselines[neuron_idx]
                 w = weights[neuron_idx]
                 y_n = spikes[:, neuron_idx]
-                new_b, new_w = _single_neuron_glm_step(b, w, y_n, smoother_mean, dt)
+                new_b, new_w = _single_neuron_glm_step(
+                    b, w, y_n, smoother_mean, dt, weight_l2
+                )
                 return new_b, new_w
 
             neuron_indices = jnp.arange(n_neurons)
@@ -1115,6 +1143,11 @@ class SwitchingSpikeOscillatorModel:
         Whether to update initial mean during M-step.
     update_init_cov : bool, default=True
         Whether to update initial covariance during M-step.
+    spike_weight_l2 : float, default=0.0
+        L2 regularization strength on the spike GLM weights (not baseline).
+        Adds 0.5 * spike_weight_l2 * ||weights||^2 to the M-step objective
+        for each neuron. This helps prevent overfitting when the number of
+        neurons is small relative to the latent dimensionality.
 
     Attributes
     ----------
@@ -1161,6 +1194,7 @@ class SwitchingSpikeOscillatorModel:
         update_spike_params: bool = True,
         update_init_mean: bool = True,
         update_init_cov: bool = True,
+        spike_weight_l2: float = 0.0,
     ) -> None:
         """Initialize the switching spike oscillator model.
 
@@ -1190,12 +1224,15 @@ class SwitchingSpikeOscillatorModel:
             Update initial mean during M-step.
         update_init_cov : bool, default=True
             Update initial covariance during M-step.
+        spike_weight_l2 : float, default=0.0
+            L2 regularization strength on the spike GLM weights.
 
         Raises
         ------
         ValueError
             If any of n_oscillators, n_neurons, n_discrete_states, sampling_freq,
-            or dt is not positive. Also if discrete_transition_diag has wrong shape.
+            or dt is not positive. Also if discrete_transition_diag has wrong shape
+            or spike_weight_l2 is negative.
         """
         # Validate input parameters
         if n_oscillators <= 0:
@@ -1216,6 +1253,10 @@ class SwitchingSpikeOscillatorModel:
                     f"discrete_transition_diag shape mismatch: expected "
                     f"({n_discrete_states},), got {discrete_transition_diag.shape}."
                 )
+        if spike_weight_l2 < 0:
+            raise ValueError(
+                f"spike_weight_l2 must be non-negative. Got {spike_weight_l2}."
+            )
 
         self.n_oscillators = n_oscillators
         self.n_neurons = n_neurons
@@ -1239,6 +1280,9 @@ class SwitchingSpikeOscillatorModel:
         self.update_spike_params = update_spike_params
         self.update_init_mean = update_init_mean
         self.update_init_cov = update_init_cov
+
+        # Regularization parameters
+        self.spike_weight_l2 = spike_weight_l2
 
         # Placeholders for model parameters (initialized by _initialize_parameters)
         self.init_mean: Array
@@ -1725,12 +1769,13 @@ class SwitchingSpikeOscillatorModel:
             self.smoother_discrete_state_prob,
         )
 
-        # Update spike GLM parameters
+        # Update spike GLM parameters with L2 regularization
         self.spike_params = update_spike_glm_params(
             spikes=spikes,
             smoother_mean=smoother_mean,
             current_params=self.spike_params,
             dt=self.dt,
+            weight_l2=self.spike_weight_l2,
         )
 
     def _project_parameters(self) -> None:
