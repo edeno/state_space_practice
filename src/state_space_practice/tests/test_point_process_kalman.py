@@ -722,6 +722,8 @@ class TestPointProcessModel:
         ll_history = model.fit(d["design_matrix"], d["spike_indicator"], max_iter=10)
 
         assert not any(np.isnan(ll) for ll in ll_history)
+        assert model.smoother_mean is not None
+        assert model.smoother_cov is not None
         assert not jnp.any(jnp.isnan(model.smoother_mean))
         assert not jnp.any(jnp.isnan(model.smoother_cov))
         assert not jnp.any(jnp.isnan(model.transition_matrix))

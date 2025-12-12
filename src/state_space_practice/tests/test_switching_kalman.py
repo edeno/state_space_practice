@@ -1314,8 +1314,8 @@ def test_em_monotonic_single_state() -> None:
         )
 
     # Verify strict monotonic increase (single state = exact EM)
-    log_likelihoods = np.array(log_likelihoods)
-    differences = np.diff(log_likelihoods)
+    ll_array = np.array(log_likelihoods)
+    differences = np.diff(ll_array)
     assert np.all(differences >= -1e-10), f"Log-likelihood decreased: {differences}"
 
 
@@ -1412,14 +1412,14 @@ def test_em_monotonic_two_identical_states() -> None:
         )
 
     # With identical states, EM should be monotonically increasing
-    log_likelihoods = np.array(log_likelihoods)
-    differences = np.diff(log_likelihoods)
+    ll_array = np.array(log_likelihoods)
+    differences = np.diff(ll_array)
     assert np.all(
         differences >= -1e-8
     ), f"Log-likelihood decreased with identical states: {differences[differences < -1e-8]}"
 
     # Verify overall improvement
-    assert log_likelihoods[-1] > log_likelihoods[0], "EM should improve log-likelihood"
+    assert ll_array[-1] > ll_array[0], "EM should improve log-likelihood"
 
 
 def test_em_monotonic_distinguishable_states() -> None:
@@ -1445,13 +1445,13 @@ def test_em_monotonic_distinguishable_states() -> None:
     key = random.PRNGKey(42)
     key, s_key = random.split(key)
 
-    true_states = [0]
+    true_states_list: list[int] = [0]
     for t in range(1, n_time):
         s_key, subkey = random.split(s_key)
-        true_states.append(
-            int(random.choice(subkey, jnp.arange(2), p=Z_true[true_states[-1]]))
+        true_states_list.append(
+            int(random.choice(subkey, jnp.arange(2), p=Z_true[true_states_list[-1]]))
         )
-    true_states = jnp.array(true_states)
+    true_states = jnp.array(true_states_list)
 
     # Generate continuous states and observations
     key, x_key, y_key = random.split(key, 3)
@@ -1541,15 +1541,15 @@ def test_em_monotonic_distinguishable_states() -> None:
         )
 
     # With distinguishable states, EM should be monotonically increasing
-    log_likelihoods = np.array(log_likelihoods)
-    differences = np.diff(log_likelihoods)
+    ll_array = np.array(log_likelihoods)
+    differences = np.diff(ll_array)
     assert np.all(
         differences >= -1e-6
     ), f"Log-likelihood decreased with distinguishable states: {differences[differences < -1e-6]}"
 
     # Verify significant improvement
     assert (
-        log_likelihoods[-1] - log_likelihoods[0] > 50
+        ll_array[-1] - ll_array[0] > 50
     ), "EM should significantly improve log-likelihood"
 
 
@@ -1647,15 +1647,15 @@ def test_em_increases_log_likelihood(simple_skf_model: tuple) -> None:
         )
 
     # With approximate EM (mixture collapse), we only guarantee overall improvement
-    log_likelihoods = np.array(log_likelihoods)
+    ll_array = np.array(log_likelihoods)
 
     # Verify overall improvement
     assert (
-        log_likelihoods[-1] >= log_likelihoods[0]
+        ll_array[-1] >= ll_array[0]
     ), "EM should improve log-likelihood from initial parameters"
 
     # Verify no catastrophic divergence (no huge decreases)
-    differences = np.diff(log_likelihoods)
+    differences = np.diff(ll_array)
     max_decrease = differences.min()
     assert max_decrease > -1.0, f"EM had catastrophic decrease: {max_decrease}"
 
@@ -1771,12 +1771,12 @@ def test_elbo_monotonic_single_state() -> None:
         )
 
     # Verify ELBO is monotonically increasing
-    elbos = np.array(elbos)
-    differences = np.diff(elbos)
+    elbos_array = np.array(elbos)
+    differences = np.diff(elbos_array)
     assert np.all(differences >= -1e-6), f"ELBO decreased: {differences[differences < -1e-6]}"
 
     # Verify significant improvement
-    assert elbos[-1] > elbos[0], "ELBO should improve over iterations"
+    assert elbos_array[-1] > elbos_array[0], "ELBO should improve over iterations"
 
 
 @pytest.mark.slow
@@ -1800,13 +1800,13 @@ def test_elbo_monotonic_two_states() -> None:
     key = random.PRNGKey(123)
     key, s_key = random.split(key)
 
-    true_states = [0]
+    true_states_list: list[int] = [0]
     for t in range(1, n_time):
         s_key, subkey = random.split(s_key)
-        true_states.append(
-            int(random.choice(subkey, jnp.arange(2), p=Z_true[true_states[-1]]))
+        true_states_list.append(
+            int(random.choice(subkey, jnp.arange(2), p=Z_true[true_states_list[-1]]))
         )
-    true_states = jnp.array(true_states)
+    true_states = jnp.array(true_states_list)
 
     # Generate continuous states and observations
     key, x_key, y_key = random.split(key, 3)
@@ -1916,14 +1916,14 @@ def test_elbo_monotonic_two_states() -> None:
         )
 
     # Verify ELBO is monotonically increasing
-    elbos = np.array(elbos)
-    differences = np.diff(elbos)
+    elbos_array = np.array(elbos)
+    differences = np.diff(elbos_array)
     assert np.all(
         differences >= -1e-6
     ), f"ELBO decreased with two states: {differences[differences < -1e-6]}"
 
     # Verify overall improvement
-    assert elbos[-1] > elbos[0], "ELBO should improve over iterations"
+    assert elbos_array[-1] > elbos_array[0], "ELBO should improve over iterations"
 
 
 # --- Property-Based Tests using Hypothesis ---

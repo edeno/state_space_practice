@@ -77,7 +77,8 @@ def positive_definite_matrices(
     q, _ = np.linalg.qr(random_matrix)
 
     # Construct PD matrix: Q @ diag(eigenvalues) @ Q.T
-    return q @ np.diag(eigenvalues) @ q.T
+    result: np.ndarray = q @ np.diag(eigenvalues) @ q.T
+    return result
 
 
 @st.composite
@@ -134,6 +135,7 @@ def stable_transition_matrices(
         )
     )
 
+    A: np.ndarray
     try:
         q, _ = np.linalg.qr(random_matrix)
         # Construct A = Q @ diag(eigenvalues) @ Q.T
@@ -184,7 +186,8 @@ def stochastic_matrices(
 
     # Normalize rows to sum to 1
     row_sums = matrix.sum(axis=1, keepdims=True)
-    return matrix / row_sums
+    result: np.ndarray = matrix / row_sums
+    return result
 
 
 @st.composite
@@ -224,7 +227,8 @@ def probability_vectors(
     )
 
     # Normalize to sum to 1
-    return vector / vector.sum()
+    result: np.ndarray = vector / vector.sum()
+    return result
 
 
 @st.composite
@@ -471,13 +475,13 @@ def gaussian_mixture_params(
         )
         covs.append(draw(positive_definite_matrices(n_dims)))
 
-    means = np.stack(means, axis=-1)  # (n_dims, n_components)
-    covs = np.stack(covs, axis=-1)  # (n_dims, n_dims, n_components)
+    means_arr = np.stack(means, axis=-1)  # (n_dims, n_components)
+    covs_arr = np.stack(covs, axis=-1)  # (n_dims, n_dims, n_components)
     weights = draw(probability_vectors(n_components))
 
     return {
-        "means": means,
-        "covs": covs,
+        "means": means_arr,
+        "covs": covs_arr,
         "weights": weights,
         "n_dims": n_dims,
         "n_components": n_components,

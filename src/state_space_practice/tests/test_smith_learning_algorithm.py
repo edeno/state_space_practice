@@ -475,6 +475,7 @@ class TestCalculateProbabilityConfidenceLimits:
         )
 
         # Should be very certain (close to 1)
+        assert pcert is not None
         assert jnp.all(pcert > 0.9)
 
 
@@ -652,7 +653,7 @@ class TestSmithLearningAlgorithmClass:
         """Class should initialize without errors."""
         model = SmithLearningAlgorithm(
             init_learning_state=0.0,
-            sigma_epsilon=jnp.sqrt(0.05),
+            sigma_epsilon=float(jnp.sqrt(0.05)),
             prob_correct_by_chance=0.5,
         )
 
@@ -664,7 +665,7 @@ class TestSmithLearningAlgorithmClass:
         model = SmithLearningAlgorithm(
             init_learning_state=0.0,
             init_learning_variance=0.1,
-            sigma_epsilon=jnp.sqrt(0.05),
+            sigma_epsilon=float(jnp.sqrt(0.05)),
             prob_correct_by_chance=0.5,
         )
 
@@ -695,7 +696,7 @@ class TestSmithLearningAlgorithmClass:
     def test_invalid_variance_type_raises(self) -> None:
         """Invalid init_learning_variance type should raise TypeError."""
         with pytest.raises(TypeError):
-            SmithLearningAlgorithm(init_learning_variance="invalid")
+            SmithLearningAlgorithm(init_learning_variance="invalid")  # type: ignore[arg-type]
 
     def test_negative_variance_raises(self) -> None:
         """Negative init_learning_variance should raise ValueError."""
@@ -705,8 +706,8 @@ class TestSmithLearningAlgorithmClass:
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_fit_returns_log_likelihoods(self) -> None:
         """fit() should return list of log-likelihoods."""
-        outcomes, _ = simulate_learning_data(n_trials=20, seed=42)
-        outcomes = jnp.array(outcomes)
+        outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
+        outcomes = jnp.array(outcomes_np)
 
         model = SmithLearningAlgorithm()
         try:
@@ -720,8 +721,8 @@ class TestSmithLearningAlgorithmClass:
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_fit_populates_attributes(self) -> None:
         """fit() should populate smoother attributes."""
-        outcomes, _ = simulate_learning_data(n_trials=20, seed=42)
-        outcomes = jnp.array(outcomes)
+        outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
+        outcomes = jnp.array(outcomes_np)
 
         model = SmithLearningAlgorithm()
         try:
@@ -743,8 +744,8 @@ class TestSmithLearningAlgorithmClass:
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_get_learning_curve_output_shapes(self) -> None:
         """get_learning_curve() should return correct shapes."""
-        outcomes, _ = simulate_learning_data(n_trials=20, seed=42)
-        outcomes = jnp.array(outcomes)
+        outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
+        outcomes = jnp.array(outcomes_np)
 
         model = SmithLearningAlgorithm()
         try:
@@ -1410,10 +1411,11 @@ class TestTrialComparisonProperties:
                 filter_mode, filter_var, one_step_mode, one_step_var
             )
 
-            cross_cov = compute_cross_covariance_matrix(smooth_var, smoother_gain)
-
             comp_matrix = compute_trial_comparison_matrix(
-                smooth_mode, smooth_var, cross_cov
+                key=jax.random.PRNGKey(42),
+                smoothed_mode=smooth_mode,
+                smoothed_variance=smooth_var,
+                smoother_gain=smoother_gain,
             )
 
             diagonal = jnp.diag(comp_matrix)
@@ -1437,10 +1439,11 @@ class TestTrialComparisonProperties:
                 filter_mode, filter_var, one_step_mode, one_step_var
             )
 
-            cross_cov = compute_cross_covariance_matrix(smooth_var, smoother_gain)
-
             comp_matrix = compute_trial_comparison_matrix(
-                smooth_mode, smooth_var, cross_cov
+                key=jax.random.PRNGKey(42),
+                smoothed_mode=smooth_mode,
+                smoothed_variance=smooth_var,
+                smoother_gain=smoother_gain,
             )
 
             assert jnp.all(comp_matrix >= 0.0)

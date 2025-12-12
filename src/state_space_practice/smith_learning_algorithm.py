@@ -46,6 +46,7 @@ optimization (BFGS), and efficient vectorized/scanned operations.
 """
 
 import logging
+import math
 import warnings
 from functools import partial
 from typing import Callable, List, Optional, Tuple
@@ -65,9 +66,14 @@ from state_space_practice.utils import check_converged
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Default process noise standard deviation
+# Smith et al. (2004) used variance of 0.05, so sigma = sqrt(0.05)
+DEFAULT_PROCESS_NOISE_VARIANCE: float = 0.05
+DEFAULT_SIGMA_EPSILON: float = math.sqrt(DEFAULT_PROCESS_NOISE_VARIANCE)
+
 
 def approximate_gaussian(
-    log_posterior_func: Callable, x0: ArrayLike
+    log_posterior_func: Callable[[ArrayLike], Array], x0: ArrayLike
 ) -> Tuple[Array, Array]:
     """Approximate the posterior using Laplace approximation.
 
@@ -92,7 +98,8 @@ def approximate_gaussian(
     """
 
     def neg_log_posterior(x: ArrayLike) -> Array:
-        return -log_posterior_func(x)
+        result: Array = -log_posterior_func(x)
+        return result
 
     # Find the mode using BFGS optimization
     # Note: When called inside jax.lax.scan, result.success is a traced value,
@@ -160,9 +167,9 @@ def smith_learning_filter(
     n_correct_responses: ArrayLike,
     init_learning_state: float = 0.0,
     init_learning_variance: Optional[float] = None,
-    sigma_epsilon: float = jnp.sqrt(0.05),
+    sigma_epsilon: float = DEFAULT_SIGMA_EPSILON,
     prob_correct_by_chance: float = 0.5,
-    max_possible_correct: Optional[int] = None,
+    max_possible_correct: Optional[ArrayLike] = None,
 ) -> Tuple[Array, Array, Array, Array, Array]:
     """Applies a non-linear Bayesian filter (Laplace approximation) for learning.
 
@@ -573,7 +580,7 @@ def find_min_consecutive_successes(
         )
 
     for current_run_length in range(min_run_length, max_run_length + 1):
-        total_prob_at_least_one_run: float
+        total_prob_at_least_one_run: float | Array
         if current_run_length > sequence_length:
             # A run of current_run_length cannot occur in sequence_length trials
             total_prob_at_least_one_run = 0.0
@@ -1088,7 +1095,7 @@ class SmithLearningAlgorithm:
         self,
         init_learning_state: float = 0.0,
         init_learning_variance: Optional[float] = None,
-        sigma_epsilon: ArrayLike = 0.224,  # approximately sqrt(0.05)
+        sigma_epsilon: float = DEFAULT_SIGMA_EPSILON,
         prob_correct_by_chance: float = 0.5,
         max_possible_correct: Optional[int] = None,
         initial_state_method: str = "reestimate_initial_from_data",
@@ -1124,14 +1131,17 @@ class SmithLearningAlgorithm:
         if sigma_epsilon <= 0.0:
             raise ValueError("sigma_epsilon must be positive.")
 
+        init_var: float
         if init_learning_variance is None:
-            init_learning_variance = sigma_epsilon**2
+            init_var = float(sigma_epsilon**2)
         elif not isinstance(init_learning_variance, (int, float)):
             raise TypeError(
                 "init_learning_variance must be a non-negative float or None."
             )
         elif init_learning_variance < 0:
             raise ValueError("init_learning_variance must be non-negative.")
+        else:
+            init_var = float(init_learning_variance)
 
         if not (0.0 < prob_correct_by_chance < 1.0):
             raise ValueError(
@@ -1148,7 +1158,7 @@ class SmithLearningAlgorithm:
                 )
 
         self.init_learning_state = float(init_learning_state)
-        self.init_learning_variance = float(init_learning_variance)
+        self.init_learning_variance = init_var
 
         self.sigma_epsilon = sigma_epsilon
         self.prob_correct_by_chance = prob_correct_by_chance
@@ -1179,7 +1189,7 @@ class SmithLearningAlgorithm:
         # Ensure prob_chance is not exactly 0 or 1 to avoid log(0) or division by zero
         epsilon = 1e-9  # Small epsilon
         prob_chance_clipped = jnp.clip(prob_chance, epsilon, 1.0 - epsilon)
-        return jnp.log(prob_chance_clipped / (1.0 - prob_chance_clipped))
+        return float(jnp.log(prob_chance_clipped / (1.0 - prob_chance_clipped)))
 
     def _resolve_max_possible_correct(
         self, n_correct_responses: jax.Array
@@ -1206,14 +1216,14 @@ class SmithLearningAlgorithm:
                 return jnp.asarray(self._max_possible_correct_val, dtype=jnp.int32)
 
         # If None, infer from data (assuming constant N_k)
-        val = jnp.max(n_correct_responses)
+        val: Array = jnp.max(n_correct_responses)
         if val <= 0:  # handle case where all n_correct_responses are 0
             logger.warning(
                 "All n_correct_responses are 0 or less; max_possible_correct inferred as 1."
             )
-            val = 1
+            val = jnp.array(1)
         resolved_array = jnp.full_like(n_correct_responses, val, dtype=jnp.int32)
-        self._max_possible_correct_val = resolved_array  # Store the array version
+        self._max_possible_correct_val = int(val)  # Store scalar version
         self._is_max_possible_correct_resolved = True
         logger.info(
             f"max_possible_correct was not provided or was scalar; "
@@ -1302,7 +1312,7 @@ class SmithLearningAlgorithm:
             raise RuntimeError("Must run E-step before M-step")
 
         (
-            self.sigma_epsilon,
+            sigma_epsilon_new,
             new_init_learning_state,
             new_init_learning_variance,
         ) = maximization_step(
@@ -1310,6 +1320,7 @@ class SmithLearningAlgorithm:
             self.smoothed_learning_state_variance,
             self.smoother_gain,
         )
+        self.sigma_epsilon = float(sigma_epsilon_new)
 
         # --- Apply init_state_method for initial states ---
         if self.init_state_method == "reestimate_initial_from_data":
@@ -1317,10 +1328,10 @@ class SmithLearningAlgorithm:
             self.init_learning_variance = float(new_init_learning_variance)
         elif self.init_state_method == "set_initial_to_zero":
             self.init_learning_state = 0.0
-            self.init_learning_variance = self.sigma_epsilon**2
+            self.init_learning_variance = float(self.sigma_epsilon**2)
         elif self.init_state_method == "set_initial_conservative_from_second_trial":
             if len(self.smoothed_learning_state_mode) > 1:
-                self.init_learning_state = (
+                self.init_learning_state = float(
                     0.5 * self.smoothed_learning_state_mode[1]
                 )  # x_{1|T}
             else:
@@ -1329,7 +1340,7 @@ class SmithLearningAlgorithm:
                     "Falling back to 'reestimate_initial_from_data' for initial state x0."
                 )
                 self.init_learning_state = float(new_init_learning_state)
-            self.init_learning_variance = (
+            self.init_learning_variance = float(
                 self.sigma_epsilon**2
             )  # Use updated sigma_epsilon
         elif self.init_state_method == "set_initial_direct_from_second_trial":
@@ -1337,12 +1348,12 @@ class SmithLearningAlgorithm:
                 len(self.smoothed_learning_state_mode) > 1
                 and len(self.smoothed_learning_state_variance) > 1
             ):
-                self.init_learning_state = self.smoothed_learning_state_mode[
-                    1
-                ]  # x_{1|T}
-                self.init_learning_variance = self.smoothed_learning_state_variance[
-                    1
-                ]  # P_{1|T}
+                self.init_learning_state = float(
+                    self.smoothed_learning_state_mode[1]
+                )  # x_{1|T}
+                self.init_learning_variance = float(
+                    self.smoothed_learning_state_variance[1]
+                )  # P_{1|T}
             else:
                 logger.warning(
                     "Not enough trials/data to use 'set_initial_direct_from_second_trial' (need at least 2). "
@@ -1355,10 +1366,10 @@ class SmithLearningAlgorithm:
 
     def fit(
         self,
-        n_correct_responses: jax.Array,
+        n_correct_responses: ArrayLike,
         max_iter: int = 100,
         tolerance: float = 1e-4,
-    ) -> list[float]:
+    ) -> List[Optional[float]]:
         """Fits the model to responses using the EM algorithm.
 
         Iteratively performs E-steps and M-steps until convergence or
@@ -1366,7 +1377,7 @@ class SmithLearningAlgorithm:
 
         Parameters
         ----------
-        responses : jax.Array, shape (n_trials,)
+        n_correct_responses : ArrayLike, shape (n_trials,)
             The sequence of responses.
         max_iter : int, optional
             Maximum number of EM iterations, by default 100.
@@ -1375,15 +1386,15 @@ class SmithLearningAlgorithm:
 
         Returns
         -------
-        log_likelihoods : list[float]
+        log_likelihoods : List[Optional[float]]
             A list of marginal log-likelihoods at each iteration.
         """
         log_likelihoods: List[Optional[float]] = []
-        previous_log_likelihood: float = -jnp.inf
+        previous_log_likelihood: float = float("-inf")
 
         for iteration in range(max_iter):
             # E-step
-            current_log_likelihood = self._e_step(n_correct_responses)
+            current_log_likelihood = self._e_step(jnp.asarray(n_correct_responses))
             log_likelihoods.append(current_log_likelihood)
 
             # Check convergence
@@ -1401,14 +1412,16 @@ class SmithLearningAlgorithm:
                 break
 
             # M-step
-            self._m_step(n_correct_responses)
+            self._m_step(jnp.asarray(n_correct_responses))
 
             logger.info(
                 f"Iteration {iteration + 1}/{max_iter}\t"
                 f"Log-Likelihood: {current_log_likelihood:.4f}\t"
                 f"Change: {(current_log_likelihood - previous_log_likelihood):.4f}"
             )
-            previous_log_likelihood = current_log_likelihood
+            previous_log_likelihood = (
+                current_log_likelihood if current_log_likelihood is not None else float("-inf")
+            )
 
         if len(log_likelihoods) == max_iter:
             logger.warning("Reached maximum iterations without converging.")

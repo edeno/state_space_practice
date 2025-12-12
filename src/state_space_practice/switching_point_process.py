@@ -418,7 +418,7 @@ def _armijo_line_search(
 
 
 def _single_neuron_glm_loss(
-    baseline: Array,
+    baseline: ArrayLike,
     weights: Array,
     y_n: Array,
     smoother_mean: Array,
@@ -480,7 +480,7 @@ def _single_neuron_glm_loss(
 
 
 def _single_neuron_glm_step(
-    baseline: Array,
+    baseline: ArrayLike,
     weights: Array,
     y_n: Array,
     smoother_mean: Array,

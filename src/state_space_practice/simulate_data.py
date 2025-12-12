@@ -1,7 +1,8 @@
 import numpy as np
+from numpy.typing import ArrayLike
 
 
-def receptive_field_model(position: np.ndarray, params: np.ndarray) -> np.ndarray:
+def receptive_field_model(position: ArrayLike, params: np.ndarray) -> np.ndarray:
     if params.ndim == 1:
         params = params[None]
     log_max_rate, place_field_center, scale = params.T
