@@ -88,15 +88,12 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.kalman import symmetrize
-from state_space_practice.utils import check_converged
 from state_space_practice.oscillator_utils import (
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
     project_coupled_transition_matrix,
 )
-from state_space_practice.point_process_kalman import (
-    _point_process_laplace_update,
-)
+from state_space_practice.point_process_kalman import _point_process_laplace_update
 from state_space_practice.switching_kalman import (
     _scale_likelihood,
     _update_discrete_state_probabilities,
@@ -104,6 +101,7 @@ from state_space_practice.switching_kalman import (
     switching_kalman_maximization_step,
     switching_kalman_smoother,
 )
+from state_space_practice.utils import check_converged
 
 
 @dataclass
@@ -403,7 +401,9 @@ def _armijo_line_search(
         new_loss = loss_fn(new_params_trial)
 
         # Armijo condition: new_loss <= current_loss - c * alpha * directional_derivative
-        sufficient_decrease = new_loss <= current_loss - c * alpha * directional_derivative
+        sufficient_decrease = (
+            new_loss <= current_loss - c * alpha * directional_derivative
+        )
 
         # Reduce alpha if not sufficient decrease
         new_alpha = jnp.where(sufficient_decrease, alpha, alpha * beta)
@@ -534,7 +534,9 @@ def _single_neuron_glm_step(
     # Build design matrix: [1, smoother_mean] of shape (n_time, 1 + n_latent)
     n_time = smoother_mean.shape[0]
     ones = jnp.ones((n_time, 1))
-    design_matrix = jnp.concatenate([ones, smoother_mean], axis=1)  # (n_time, 1+n_latent)
+    design_matrix = jnp.concatenate(
+        [ones, smoother_mean], axis=1
+    )  # (n_time, 1+n_latent)
 
     # Concatenate parameters into a single vector: [baseline, weights]
     params = jnp.concatenate([jnp.atleast_1d(baseline), weights])  # (1 + n_latent,)
@@ -658,7 +660,9 @@ def _single_neuron_glm_step_second_order(
         effective_latent = m_t + P_t @ weights
         return jnp.concatenate([jnp.ones(1), effective_latent])
 
-    effective_design = jax.vmap(compute_effective_design_row)(smoother_mean, smoother_cov)
+    effective_design = jax.vmap(compute_effective_design_row)(
+        smoother_mean, smoother_cov
+    )
 
     # Gradient: -X_eff.T @ (y - mu)
     residual = y_n - mu
@@ -799,7 +803,10 @@ def update_spike_glm_params(
             return (new_baselines, new_weights), None
 
         (final_baselines, final_weights), _ = jax.lax.scan(
-            iterate_all_neurons_second_order, (baselines, weights), None, length=max_iter
+            iterate_all_neurons_second_order,
+            (baselines, weights),
+            None,
+            length=max_iter,
         )
     else:
         # Run Newton iterations for all neurons (plug-in)
@@ -1176,9 +1183,7 @@ class SwitchingSpikeOscillatorModel:
         """
         # Validate input parameters
         if n_oscillators <= 0:
-            raise ValueError(
-                f"n_oscillators must be positive. Got {n_oscillators}."
-            )
+            raise ValueError(f"n_oscillators must be positive. Got {n_oscillators}.")
         if n_neurons <= 0:
             raise ValueError(f"n_neurons must be positive. Got {n_neurons}.")
         if n_discrete_states <= 0:
@@ -1186,9 +1191,7 @@ class SwitchingSpikeOscillatorModel:
                 f"n_discrete_states must be positive. Got {n_discrete_states}."
             )
         if sampling_freq <= 0:
-            raise ValueError(
-                f"sampling_freq must be positive. Got {sampling_freq}."
-            )
+            raise ValueError(f"sampling_freq must be positive. Got {sampling_freq}.")
         if dt <= 0:
             raise ValueError(f"dt must be positive. Got {dt}.")
         if discrete_transition_diag is not None:
@@ -1420,9 +1423,7 @@ class SwitchingSpikeOscillatorModel:
         baseline = jnp.zeros(self.n_neurons)
 
         # Weights: small random values
-        weights = (
-            jax.random.normal(key, (self.n_neurons, self.n_latent)) * 0.1
-        )
+        weights = jax.random.normal(key, (self.n_neurons, self.n_latent)) * 0.1
 
         self.spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
@@ -1529,6 +1530,7 @@ class SwitchingSpikeOscillatorModel:
         These are the sufficient statistics needed by the M-step for dynamics
         parameter updates via `switching_kalman_maximization_step`.
         """
+
         # Build log-intensity function from current spike parameters
         def log_intensity_func(state: Array) -> Array:
             """Compute log-intensity for all neurons given latent state."""

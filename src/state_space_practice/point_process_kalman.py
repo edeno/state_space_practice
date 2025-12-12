@@ -303,6 +303,16 @@ def stochastic_point_process_filter(
     if single_neuron:
         spike_indicator = spike_indicator[:, None]
 
+    # Pre-compute gradient and Hessian functions outside the scan
+    # These are parameterized by design_matrix_t to avoid recreating jax.jacfwd each step
+    def _log_intensity_with_design(design_matrix_t, x):
+        log_lambda = log_conditional_intensity(design_matrix_t, x)
+        return jnp.atleast_1d(log_lambda)
+
+    # Create grad/hess w.r.t. x (argnums=1), keeping design_matrix_t as parameter
+    _grad_log_intensity = jax.jacfwd(_log_intensity_with_design, argnums=1)
+    _hess_log_intensity = jax.jacfwd(_grad_log_intensity, argnums=1)
+
     def _step(
         params_prev: tuple[Array, Array, float],
         args: tuple[Array, Array],
@@ -321,9 +331,15 @@ def stochastic_point_process_filter(
 
         # Create log_intensity_func that captures design_matrix_t
         def log_intensity_func(x):
-            log_lambda = log_conditional_intensity(design_matrix_t, x)
-            # Ensure output is at least 1D for consistent multi-neuron handling
-            return jnp.atleast_1d(log_lambda)
+            return _log_intensity_with_design(design_matrix_t, x)
+
+        # Create grad/hess functions that capture design_matrix_t
+        # These use the pre-computed jacfwd functions from outside the scan
+        def grad_log_intensity_func(x):
+            return _grad_log_intensity(design_matrix_t, x)
+
+        def hess_log_intensity_func(x):
+            return _hess_log_intensity(design_matrix_t, x)
 
         # Use the generalized multi-neuron Laplace update
         posterior_mean, posterior_covariance, log_lik = _point_process_laplace_update(
@@ -332,6 +348,8 @@ def stochastic_point_process_filter(
             spike_indicator_t,
             dt,
             log_intensity_func,
+            grad_log_intensity_func=grad_log_intensity_func,
+            hess_log_intensity_func=hess_log_intensity_func,
         )
 
         marginal_log_likelihood += log_lik
@@ -893,20 +911,46 @@ class PointProcessModel:
         self,
         design_matrix: ArrayLike,
         use_smoothed: bool = True,
+        evaluate_at_all_positions: bool = True,
     ) -> Array:
-        """Get the estimated firing rate.
+        """Get the estimated firing rate using the model's log-intensity function.
+
+        This method computes firing rates by evaluating the stored log_intensity_func,
+        supporting both single-neuron and multi-neuron models with arbitrary
+        (possibly nonlinear) intensity functions.
 
         Parameters
         ----------
-        design_matrix : ArrayLike, shape (n_time, n_state_dims) or (n_pos, n_state_dims)
-            Design matrix to evaluate rate at.
+        design_matrix : ArrayLike
+            Design matrix to evaluate rate at. Shape depends on usage:
+            - If evaluate_at_all_positions=True (default): (n_pos, n_state_dims)
+              where n_pos can be n_time or any number of positions/conditions
+            - If evaluate_at_all_positions=False: same shape as used during fit,
+              e.g., (n_time, n_state_dims) for single-neuron or
+              (n_time, n_neurons, n_state_dims) for multi-neuron
+
         use_smoothed : bool
             If True, use smoothed estimates; otherwise use filtered.
 
+        evaluate_at_all_positions : bool, default=True
+            If True, evaluate the rate at all positions in design_matrix for each
+            time point, returning shape (n_time, n_pos) for single-neuron or
+            (n_time, n_pos, n_neurons) for multi-neuron.
+            If False, evaluate time-aligned: design_matrix[t] with state[t],
+            returning shape (n_time,) for single-neuron or (n_time, n_neurons)
+            for multi-neuron.
+
         Returns
         -------
-        rate : Array, shape (n_time,) or (n_time, n_pos)
-            Estimated firing rate in Hz.
+        rate : Array
+            Estimated firing rate in Hz. Shape depends on evaluate_at_all_positions
+            and whether the model is single/multi-neuron (see above).
+
+        Notes
+        -----
+        The rate is computed as exp(log_intensity_func(design_matrix, x)) / dt.
+        This generalizes to arbitrary intensity functions, not just the default
+        linear Z @ x.
         """
         if use_smoothed:
             if self.smoother_mean is None:
@@ -917,9 +961,23 @@ class PointProcessModel:
                 raise RuntimeError("Model has not been fitted yet.")
             state_estimate = self.filtered_mean
 
-        # state_estimate: (n_time, n_state_dims)
-        # design_matrix: (n_time, n_state_dims) or (n_pos, n_state_dims)
-        log_rate = state_estimate @ design_matrix.T
+        design_matrix = jnp.asarray(design_matrix)
+
+        if evaluate_at_all_positions:
+            # Evaluate rate at all positions for each time point
+            # For each (time, position) pair, compute log_intensity_func(design[pos], state[time])
+            # vmap over positions (inner), then over times (outer)
+            def rate_at_time(state_t):
+                # For this time's state, evaluate at all positions
+                return jax.vmap(lambda dm: self.log_intensity_func(dm, state_t))(
+                    design_matrix
+                )
+
+            log_rate = jax.vmap(rate_at_time)(state_estimate)  # (n_time, n_pos, ...)
+        else:
+            # Time-aligned evaluation: design_matrix[t] with state_estimate[t]
+            log_rate = jax.vmap(self.log_intensity_func)(design_matrix, state_estimate)
+
         rate = jnp.exp(log_rate) / self.dt
 
         return rate

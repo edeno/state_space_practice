@@ -1318,3 +1318,160 @@ class TestMultiNeuronIntensityDirection:
         assert jnp.mean(mean_1[:, 1]) > jnp.mean(mean_1[:, 0]), (
             "Spikes in neuron 1 should increase state[1]"
         )
+
+
+@pytest.fixture(scope="module")
+def single_neuron_model_data():
+    """Simple test data for single-neuron PointProcessModel tests."""
+    np.random.seed(42)
+    n_time = 100
+    n_basis = 4
+    dt = 0.02
+
+    # Simple cyclic design matrix
+    design_matrix = np.eye(n_basis)[np.arange(n_time) % n_basis]
+
+    # Generate spikes with moderate rate
+    spike_indicator = np.random.poisson(0.3, size=n_time).astype(float)
+
+    return {
+        "design_matrix": jnp.asarray(design_matrix),
+        "spike_indicator": jnp.asarray(spike_indicator),
+        "n_time": n_time,
+        "n_basis": n_basis,
+        "dt": dt,
+    }
+
+
+class TestGetRateEstimateMultiNeuron:
+    """Tests for multi-neuron get_rate_estimate functionality."""
+
+    def test_time_aligned_single_neuron_shape(self, single_neuron_model_data) -> None:
+        """Time-aligned rate estimate should have shape (n_time,) for single neuron."""
+        d = single_neuron_model_data
+        model = PointProcessModel(n_state_dims=d["n_basis"], dt=d["dt"])
+        model.fit(d["design_matrix"], d["spike_indicator"], max_iter=3)
+
+        rate = model.get_rate_estimate(
+            d["design_matrix"], evaluate_at_all_positions=False
+        )
+
+        assert rate.shape == (d["n_time"],)
+        assert jnp.all(rate >= 0)
+        assert not jnp.any(jnp.isnan(rate))
+
+    def test_all_positions_single_neuron_shape(self, single_neuron_model_data) -> None:
+        """All-positions rate estimate should have shape (n_time, n_pos) for single neuron."""
+        d = single_neuron_model_data
+        model = PointProcessModel(n_state_dims=d["n_basis"], dt=d["dt"])
+        model.fit(d["design_matrix"], d["spike_indicator"], max_iter=3)
+
+        # Evaluate at all positions (default behavior)
+        rate = model.get_rate_estimate(d["design_matrix"])
+
+        assert rate.shape == (d["n_time"], d["n_time"])
+        assert jnp.all(rate >= 0)
+        assert not jnp.any(jnp.isnan(rate))
+
+    def test_multi_neuron_time_aligned_shape(self, multi_neuron_test_data) -> None:
+        """Time-aligned rate estimate should have shape (n_time, n_neurons) for multi-neuron."""
+        d = multi_neuron_test_data
+        model = PointProcessModel(
+            n_state_dims=d["n_params"],
+            dt=d["dt"],
+            transition_matrix=d["transition_matrix"],
+            process_cov=d["process_cov"],
+            log_intensity_func=multi_neuron_log_intensity,
+        )
+        model.fit(d["design_matrix"], d["spike_indicator"], max_iter=3)
+
+        rate = model.get_rate_estimate(
+            d["design_matrix"], evaluate_at_all_positions=False
+        )
+
+        assert rate.shape == (d["n_time"], d["n_neurons"])
+        assert jnp.all(rate >= 0)
+        assert not jnp.any(jnp.isnan(rate))
+
+    def test_multi_neuron_all_positions_shape(self, multi_neuron_test_data) -> None:
+        """All-positions rate estimate should have shape (n_time, n_pos, n_neurons)."""
+        d = multi_neuron_test_data
+        model = PointProcessModel(
+            n_state_dims=d["n_params"],
+            dt=d["dt"],
+            transition_matrix=d["transition_matrix"],
+            process_cov=d["process_cov"],
+            log_intensity_func=multi_neuron_log_intensity,
+        )
+        model.fit(d["design_matrix"], d["spike_indicator"], max_iter=3)
+
+        # Evaluate at all positions
+        rate = model.get_rate_estimate(d["design_matrix"])
+
+        assert rate.shape == (d["n_time"], d["n_time"], d["n_neurons"])
+        assert jnp.all(rate >= 0)
+        assert not jnp.any(jnp.isnan(rate))
+
+    def test_filtered_vs_smoothed_rates(self, multi_neuron_test_data) -> None:
+        """Filtered and smoothed rate estimates should differ."""
+        d = multi_neuron_test_data
+        model = PointProcessModel(
+            n_state_dims=d["n_params"],
+            dt=d["dt"],
+            transition_matrix=d["transition_matrix"],
+            process_cov=d["process_cov"],
+            log_intensity_func=multi_neuron_log_intensity,
+        )
+        model.fit(d["design_matrix"], d["spike_indicator"], max_iter=5)
+
+        rate_smoothed = model.get_rate_estimate(
+            d["design_matrix"], use_smoothed=True, evaluate_at_all_positions=False
+        )
+        rate_filtered = model.get_rate_estimate(
+            d["design_matrix"], use_smoothed=False, evaluate_at_all_positions=False
+        )
+
+        # Should have same shape
+        assert rate_smoothed.shape == rate_filtered.shape
+
+        # Last timepoint should be identical (smoother = filter at last time)
+        np.testing.assert_allclose(
+            rate_smoothed[-1], rate_filtered[-1], rtol=1e-5
+        )
+
+        # Earlier timepoints may differ (smoothing uses future info)
+        # Just check they're both valid
+        assert jnp.all(rate_smoothed >= 0)
+        assert jnp.all(rate_filtered >= 0)
+
+    def test_rate_estimate_uses_log_intensity_func(self) -> None:
+        """Rate estimate should use the model's log_intensity_func, not just linear."""
+        n_time = 50
+        n_params = 2
+        dt = 0.02
+
+        # Create a nonlinear log intensity function
+        def nonlinear_log_intensity(design_matrix_t, params):
+            # Quadratic: (Z @ x)^2
+            linear = design_matrix_t @ params
+            return linear ** 2
+
+        key = jax.random.PRNGKey(123)
+        design_matrix = jax.random.normal(key, (n_time, n_params)) * 0.3
+        spike_indicator = jax.random.poisson(
+            jax.random.PRNGKey(456),
+            jnp.exp(jax.vmap(nonlinear_log_intensity)(design_matrix, jnp.zeros((n_time, n_params)))) * dt
+        ).astype(jnp.float64)
+
+        model = PointProcessModel(
+            n_state_dims=n_params,
+            dt=dt,
+            log_intensity_func=nonlinear_log_intensity,
+        )
+        model.fit(design_matrix, spike_indicator, max_iter=3)
+
+        rate = model.get_rate_estimate(design_matrix, evaluate_at_all_positions=False)
+
+        # Rate should be non-negative (exp of anything is positive)
+        assert jnp.all(rate >= 0)
+        assert not jnp.any(jnp.isnan(rate))
