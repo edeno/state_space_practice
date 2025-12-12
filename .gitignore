@@ -155,3 +155,5 @@ _version.py
 .DS_Store
 *.npz
 *.png
+
+/data

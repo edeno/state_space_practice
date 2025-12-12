@@ -1143,11 +1143,14 @@ class SwitchingSpikeOscillatorModel:
         Whether to update initial mean during M-step.
     update_init_cov : bool, default=True
         Whether to update initial covariance during M-step.
-    spike_weight_l2 : float, default=0.0
+    spike_weight_l2 : float, default=0.01
         L2 regularization strength on the spike GLM weights (not baseline).
         Adds 0.5 * spike_weight_l2 * ||weights||^2 to the M-step objective
-        for each neuron. This helps prevent overfitting when the number of
-        neurons is small relative to the latent dimensionality.
+        for each neuron. The default (0.01) corresponds to a prior std of ~10
+        on weight magnitude, which allows any biologically plausible firing
+        rate modulation (up to ~1000x) while preventing pathological runaway
+        values. This provides numerical stability without constraining
+        realistic neurons.
 
     Attributes
     ----------
@@ -1194,7 +1197,7 @@ class SwitchingSpikeOscillatorModel:
         update_spike_params: bool = True,
         update_init_mean: bool = True,
         update_init_cov: bool = True,
-        spike_weight_l2: float = 0.0,
+        spike_weight_l2: float = 0.01,
     ) -> None:
         """Initialize the switching spike oscillator model.
 
@@ -1224,7 +1227,7 @@ class SwitchingSpikeOscillatorModel:
             Update initial mean during M-step.
         update_init_cov : bool, default=True
             Update initial covariance during M-step.
-        spike_weight_l2 : float, default=0.0
+        spike_weight_l2 : float, default=0.01
             L2 regularization strength on the spike GLM weights.
 
         Raises
