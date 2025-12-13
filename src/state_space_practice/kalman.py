@@ -80,6 +80,58 @@ def psd_solve(A: jax.Array, b: jax.Array, diagonal_boost: float = 1e-9) -> jax.A
     )
 
 
+def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-4) -> jax.Array:
+    """Project a matrix onto the positive semi-definite cone.
+
+    This function ensures the input matrix is positive semi-definite by:
+    1. Computing its eigendecomposition
+    2. Clipping eigenvalues to be at least `min_eigenvalue`
+    3. Reconstructing the matrix from the clipped eigenvalues
+
+    This is the standard approach for handling M-step updates in EM algorithms
+    with approximate E-steps (e.g., Laplace-EKF for point-process observations),
+    where the raw M-step can produce non-PSD covariance matrices.
+
+    Parameters
+    ----------
+    Q : jax.Array
+        A symmetric matrix to project onto the PSD cone. Shape (n, n).
+    min_eigenvalue : float, optional
+        Minimum eigenvalue to enforce. Default is 1e-4. This represents the
+        minimum allowable variance in any direction.
+
+    Returns
+    -------
+    jax.Array
+        The projected PSD matrix with all eigenvalues >= min_eigenvalue.
+
+    Notes
+    -----
+    - The input should be symmetric; non-symmetric matrices may give
+      unexpected results.
+    - Uses `jnp.linalg.eigh` which assumes symmetric input.
+    - The min_eigenvalue should be chosen based on the scale of the problem:
+      - Too small (< 1e-8): May not prevent numerical instability
+      - Too large (> 0.1): May dominate learned values
+
+    Examples
+    --------
+    >>> import jax.numpy as jnp
+    >>> Q = jnp.array([[1.0, 0.5], [0.5, -0.1]])  # Non-PSD
+    >>> Q_psd = project_psd(Q, min_eigenvalue=1e-4)
+    >>> jnp.linalg.eigvalsh(Q_psd)  # All eigenvalues >= 1e-4
+
+    """
+    # Compute eigendecomposition (eigh assumes symmetric input)
+    eigvals, eigvecs = jnp.linalg.eigh(Q)
+
+    # Clip eigenvalues to minimum
+    eigvals_clipped = jnp.maximum(eigvals, min_eigenvalue)
+
+    # Reconstruct matrix: Q = V @ diag(lambda) @ V.T
+    return eigvecs @ jnp.diag(eigvals_clipped) @ eigvecs.T
+
+
 @jax.jit
 def _kalman_filter_update(
     mean_prev: jax.Array,

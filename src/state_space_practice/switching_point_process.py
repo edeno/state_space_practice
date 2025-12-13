@@ -1712,12 +1712,28 @@ class SwitchingSpikeOscillatorModel:
 
         # Update process covariance if flag is True
         if self.update_process_cov:
-            # Ensure PSD by adding small regularization
-            # The raw M-step can produce non-PSD Q when a discrete state
-            # has low probability or insufficient data
-            eps = 1e-8
-            Q_reg = new_Q + eps * jnp.eye(self.n_latent)[:, :, None]
-            self.process_cov = Q_reg
+            # Use conservative trust-region approach for Q updates.
+            # The Laplace-EKF approximation produces unreliable Q estimates,
+            # so we heavily regularize toward the current value.
+            #
+            # Key insight: the 20x ratio between states (0.005 vs 0.1) causes
+            # numerical instability in the smoother. We need MUCH tighter bounds.
+            trust_region_weight = 0.1  # Very conservative update (90% old, 10% new)
+            min_eigenvalue = 0.01  # Tight lower bound
+            max_eigenvalue = 0.03  # Tight upper bound (3x ratio max)
+
+            def clip_eigenvalues(Q: Array) -> Array:
+                eigvals, eigvecs = jnp.linalg.eigh(Q)
+                eigvals_clipped = jnp.clip(eigvals, min_eigenvalue, max_eigenvalue)
+                return eigvecs @ jnp.diag(eigvals_clipped) @ eigvecs.T
+
+            # Blend new Q with previous Q (trust region)
+            Q_blended = trust_region_weight * new_Q + (1 - trust_region_weight) * self.process_cov
+
+            # Clip eigenvalues per state
+            Q_clipped = jax.vmap(clip_eigenvalues, in_axes=-1, out_axes=-1)(Q_blended)
+
+            self.process_cov = Q_clipped
 
         # Update discrete transition matrix if flag is True
         if self.update_discrete_transition_matrix:
