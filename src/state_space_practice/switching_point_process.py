@@ -165,9 +165,9 @@ class QRegularizationConfig:
         Whether to apply trust-region regularization and eigenvalue clipping.
     """
 
-    trust_region_weight: float = 0.1
-    min_eigenvalue: float | None = 0.001  # Process noise floor to prevent collapse
-    max_eigenvalue: float | None = None
+    trust_region_weight: float = 0.3  # More conservative blending
+    min_eigenvalue: float | None = 0.01  # Process noise floor to prevent collapse
+    max_eigenvalue: float | None = 1.0  # Prevent explosion
     enabled: bool = True
 
 
