@@ -119,12 +119,14 @@ class SpikeObsParams:
 
     Attributes
     ----------
-    baseline : Array, shape (n_neurons,)
+    baseline : Array, shape (n_neurons,) or (n_neurons, n_discrete_states)
         Baseline log-rate b_n for each neuron. When the latent state is zero,
-        the firing rate is exp(baseline).
-    weights : Array, shape (n_neurons, n_latent)
+        the firing rate is exp(baseline). If provided per discrete state, the
+        discrete state axis must be last.
+    weights : Array, shape (n_neurons, n_latent) or (n_neurons, n_latent, n_discrete_states)
         Linear weights C mapping the oscillator state to log-rates.
         weights[n, :] gives the coupling of neuron n to each latent dimension.
+        If provided per discrete state, the discrete state axis must be last.
     """
 
     baseline: Array
@@ -147,6 +149,82 @@ jax.tree_util.register_pytree_node(
     SpikeObsParams.tree_flatten,
     SpikeObsParams.tree_unflatten,
 )
+
+
+def _is_per_state_spike_params(spike_params: SpikeObsParams) -> bool:
+    """Check if spike params have per-state parameters.
+
+    Parameters
+    ----------
+    spike_params : SpikeObsParams
+        The spike observation parameters to check.
+
+    Returns
+    -------
+    bool
+        True if parameters are per-state (baseline 2D, weights 3D),
+        False if parameters are shared (baseline 1D, weights 2D).
+
+    Raises
+    ------
+    ValueError
+        If parameter dimensions are inconsistent.
+    """
+    if spike_params.baseline.ndim == 1:
+        if spike_params.weights.ndim != 2:
+            raise ValueError(
+                "spike_params.weights must have shape (n_neurons, n_latent) when "
+                "spike_params.baseline is 1D (shared parameters)."
+            )
+        return False
+    if spike_params.baseline.ndim == 2:
+        if spike_params.weights.ndim != 3:
+            raise ValueError(
+                "spike_params.weights must have shape (n_neurons, n_latent, n_states) "
+                "when spike_params.baseline is 2D (per-state parameters)."
+            )
+        return True
+    raise ValueError(
+        f"spike_params.baseline must be 1D (shared) or 2D (per-state), "
+        f"got ndim={spike_params.baseline.ndim}"
+    )
+
+
+def _select_spike_params(spike_params: SpikeObsParams, state_index: Array) -> SpikeObsParams:
+    """Select per-state spike params if a discrete-state axis is present.
+
+    For shared parameters (baseline 1D, weights 2D), returns the params unchanged.
+    For per-state parameters (baseline 2D, weights 3D), selects the slice for
+    the given discrete state index.
+
+    Parameters
+    ----------
+    spike_params : SpikeObsParams
+        Spike observation parameters. Either shared across states:
+        - baseline: (n_neurons,)
+        - weights: (n_neurons, n_latent)
+        Or per-state:
+        - baseline: (n_neurons, n_discrete_states)
+        - weights: (n_neurons, n_latent, n_discrete_states)
+    state_index : Array
+        Index of the discrete state to select (scalar). Only used when
+        spike_params are per-state.
+
+    Returns
+    -------
+    SpikeObsParams
+        Parameters for the selected state, with shapes:
+        - baseline: (n_neurons,)
+        - weights: (n_neurons, n_latent)
+    """
+    if not _is_per_state_spike_params(spike_params):
+        # Shared parameters - return unchanged (state_index is ignored)
+        return spike_params
+
+    # Per-state parameters - select the slice for this discrete state
+    baseline = jnp.take(spike_params.baseline, state_index, axis=-1)
+    weights = jnp.take(spike_params.weights, state_index, axis=-1)
+    return SpikeObsParams(baseline=baseline, weights=weights)
 
 
 @dataclass
@@ -254,6 +332,11 @@ def point_process_kalman_update(
         Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
         Neural Computation 16, 971-998.
     """
+    if spike_params.baseline.ndim != 1 or spike_params.weights.ndim != 2:
+        raise ValueError(
+            "point_process_kalman_update expects single-state spike_params with "
+            "baseline shape (n_neurons,) and weights shape (n_neurons, n_latent)."
+        )
     # Create a closure-free wrapper for the shared helper
     # This binds spike_params so _point_process_laplace_update sees Callable[[Array], Array]
     def _log_intensity_with_params(state: Array) -> Array:
@@ -413,9 +496,12 @@ def _point_process_update_per_discrete_state_pair(
         log p(y_t | y_{1:t-1}, S_{t-1}=i, S_t=j).
     """
 
+    n_discrete_states = continuous_transition_matrix.shape[-1]
+    state_indices = jnp.arange(n_discrete_states)
+
     # Create a version of predict_and_update that only takes array arguments
     # (log_intensity_func, spike_params, dt are captured in the closure for vmap)
-    def _update(prev_mean, prev_cov, A, Q):
+    def _update(prev_mean, prev_cov, A, Q, params_j):
         return _point_process_predict_and_update(
             prev_mean,
             prev_cov,
@@ -424,30 +510,32 @@ def _point_process_update_per_discrete_state_pair(
             Q,
             dt,
             log_intensity_func,
-            spike_params,
+            params_j,
             include_laplace_normalization,
             max_newton_iter,
             line_search_beta,
         )
 
-    # Double vmap:
-    # Inner vmap: over previous state i (axis -1 of prev_mean/prev_cov)
+    def _update_for_state_j(
+        state_index: Array, A: Array, Q: Array
+    ) -> tuple[Array, Array, Array]:
+        """Update for a single next-state j, vmapped over previous states i."""
+        params_j = _select_spike_params(spike_params, state_index)
+        return jax.vmap(
+            _update,
+            in_axes=(-1, -1, None, None, None),  # vmap over prev state i
+            out_axes=-1,
+        )(prev_state_cond_mean, prev_state_cond_cov, A, Q, params_j)
+
     # Outer vmap: over next state j (axis -1 of A/Q)
     vmapped_update = jax.vmap(
-        jax.vmap(
-            _update,
-            in_axes=(-1, -1, None, None),  # vmap over prev state i
-            out_axes=-1,
-        ),
-        in_axes=(None, None, -1, -1),  # vmap over next state j
+        _update_for_state_j,
+        in_axes=(0, -1, -1),
         out_axes=-1,
     )
 
     result: tuple[Array, Array, Array] = vmapped_update(
-        prev_state_cond_mean,
-        prev_state_cond_cov,
-        continuous_transition_matrix,
-        process_cov,
+        state_indices, continuous_transition_matrix, process_cov
     )
     return result
 
@@ -506,24 +594,32 @@ def _first_timestep_point_process_update(
     n_discrete_states = init_state_cond_mean.shape[-1]
 
     # Apply point-process update directly to the prior (no dynamics prediction)
-    # vmap over discrete states j (spike_params captured in closure for vmap)
-    def _update_for_state_j(prior_mean, prior_cov):
+    # vmap over discrete states j with per-state spike params if provided
+    state_indices = jnp.arange(n_discrete_states)
+
+    def _update_for_state_j(
+        prior_mean: Array, prior_cov: Array, state_index: Array
+    ) -> tuple[Array, Array, Array]:
+        """Apply observation update for a single discrete state j."""
+        params_j = _select_spike_params(spike_params, state_index)
         return point_process_kalman_update(
             one_step_mean=prior_mean,  # Use prior directly, no A @ x prediction
             one_step_cov=prior_cov,
             y_t=y_t,
             dt=dt,
             log_intensity_func=log_intensity_func,
-            spike_params=spike_params,
+            spike_params=params_j,
             include_laplace_normalization=include_laplace_normalization,
             max_newton_iter=max_newton_iter,
             line_search_beta=line_search_beta,
         )
 
     # vmap over discrete states
-    vmapped_update = jax.vmap(_update_for_state_j, in_axes=(-1, -1), out_axes=(-1, -1, -1))
+    vmapped_update = jax.vmap(
+        _update_for_state_j, in_axes=(-1, -1, 0), out_axes=(-1, -1, -1)
+    )
     state_cond_filter_mean, state_cond_filter_cov, state_cond_log_lik = vmapped_update(
-        init_state_cond_mean, init_state_cond_cov
+        init_state_cond_mean, init_state_cond_cov, state_indices
     )
 
     # Update discrete state probabilities using observation likelihood
@@ -629,6 +725,7 @@ def _single_neuron_glm_loss(
     y_n: Array,
     smoother_mean: Array,
     dt: float,
+    time_weights: Array | None = None,
 ) -> Array:
     """Poisson negative log-likelihood for a single neuron GLM.
 
@@ -650,6 +747,8 @@ def _single_neuron_glm_loss(
         Smoothed latent state estimates (used as design matrix).
     dt : float
         Time bin width in seconds.
+    time_weights : Array | None, shape (n_time,), optional
+        Per-timestep weights (e.g., state responsibilities). If None, uses ones.
 
     Returns
     -------
@@ -676,10 +775,13 @@ def _single_neuron_glm_loss(
     # Expected spike count: lambda_t * dt = exp(eta_t) * dt
     expected_counts = jnp.exp(eta) * dt  # (n_time,)
 
+    if time_weights is None:
+        time_weights = jnp.ones_like(expected_counts)
+
     # Poisson log-likelihood (without log(y!) term):
     # sum_t [y_t * eta_t - exp(eta_t) * dt]
     # Note: We include the dt scaling in the expected counts
-    log_likelihood = jnp.sum(y_n * eta - expected_counts)
+    log_likelihood = jnp.sum(time_weights * (y_n * eta - expected_counts))
 
     # Return negative log-likelihood for minimization
     return -log_likelihood
@@ -691,6 +793,7 @@ def _single_neuron_glm_step(
     y_n: Array,
     smoother_mean: Array,
     dt: float,
+    time_weights: Array | None = None,
     weight_l2: float = 0.0,
 ) -> tuple[Array, Array]:
     """Single Newton-Raphson step for Poisson GLM parameter optimization.
@@ -715,6 +818,8 @@ def _single_neuron_glm_step(
         Smoothed latent state estimates (used as design matrix).
     dt : float
         Time bin width in seconds.
+    time_weights : Array | None, shape (n_time,), optional
+        Per-timestep weights (e.g., state responsibilities). If None, uses ones.
     weight_l2 : float, default=0.0
         L2 regularization strength on the weights (not baseline).
         Adds 0.5 * weight_l2 * ||weights||^2 to the objective.
@@ -756,8 +861,11 @@ def _single_neuron_glm_step(
     eta = design_matrix @ params  # (n_time,)
     mu = jnp.exp(eta) * dt  # Expected spike counts (n_time,)
 
-    # Compute gradient: -X.T @ (y - mu) + L2 penalty gradient
-    residual = y_n - mu  # (n_time,)
+    if time_weights is None:
+        time_weights = jnp.ones_like(mu)
+
+    # Compute gradient: -X.T @ (w * (y - mu)) + L2 penalty gradient
+    residual = time_weights * (y_n - mu)  # (n_time,)
     gradient = -design_matrix.T @ residual  # (1 + n_latent,)
 
     # Add L2 penalty gradient: weight_l2 * [0, weights]
@@ -765,8 +873,9 @@ def _single_neuron_glm_step(
     l2_grad = jnp.concatenate([jnp.zeros(1), weight_l2 * weights])
     gradient = gradient + l2_grad
 
-    # Compute Hessian: X.T @ diag(mu) @ X
-    weighted_design = design_matrix * mu[:, None]  # (n_time, 1+n_latent)
+    # Compute Hessian: X.T @ diag(w * mu) @ X
+    weighted_mu = time_weights * mu
+    weighted_design = design_matrix * weighted_mu[:, None]  # (n_time, 1+n_latent)
     hessian = design_matrix.T @ weighted_design  # (1+n_latent, 1+n_latent)
 
     # Add L2 penalty to Hessian: weight_l2 * diag([0, 1, 1, ...])
@@ -781,14 +890,14 @@ def _single_neuron_glm_step(
     delta = jnp.linalg.solve(hessian, gradient)
 
     # Current loss for backtracking line search (NLL + L2 penalty)
-    current_loss = jnp.sum(mu - y_n * eta) + 0.5 * weight_l2 * jnp.sum(weights**2)
+    current_loss = jnp.sum(time_weights * (mu - y_n * eta)) + 0.5 * weight_l2 * jnp.sum(weights**2)
 
     # Define loss function for line search
     def loss_fn(p):
         eta_trial = design_matrix @ p
         mu_trial = jnp.exp(eta_trial) * dt
         weights_trial = p[1:]
-        nll = jnp.sum(mu_trial - y_n * eta_trial)
+        nll = jnp.sum(time_weights * (mu_trial - y_n * eta_trial))
         l2_penalty = 0.5 * weight_l2 * jnp.sum(weights_trial**2)
         return nll + l2_penalty
 
@@ -812,6 +921,7 @@ def _neg_Q_single_neuron(
     smoother_cov: Array | None,
     dt: float,
     weight_l2: float,
+    time_weights: Array | None = None,
 ) -> Array:
     """Negative expected log-likelihood for one neuron's Poisson GLM.
 
@@ -838,6 +948,8 @@ def _neg_Q_single_neuron(
         Bin width in seconds.
     weight_l2 : float
         L2 penalty coefficient for the weights.
+    time_weights : Array | None, shape (n_time,), optional
+        Per-timestep weights (e.g., state responsibilities). If None, uses ones.
 
     Returns
     -------
@@ -863,9 +975,12 @@ def _neg_Q_single_neuron(
     eta_safe = jnp.clip(eta, -20.0, 20.0)
     mu = jnp.exp(eta_safe) * dt  # expected counts, (n_time,)
 
+    if time_weights is None:
+        time_weights = jnp.ones_like(mu)
+
     # Negative Q: sum(mu - y * (b + w^T m_t)) + 0.5 * lambda * ||w||^2
     # Note: the y_t term only uses (b + w^T m_t), not the variance correction
-    nll = jnp.sum(mu - y_n * (b + eta_lin))
+    nll = jnp.sum(time_weights * (mu - y_n * (b + eta_lin)))
     l2 = 0.5 * weight_l2 * jnp.sum(w**2)
 
     return nll + l2
@@ -878,6 +993,7 @@ def _single_neuron_glm_step_second_order(
     smoother_mean: Array,
     smoother_cov: Array,
     dt: float,
+    time_weights: Array | None = None,
     weight_l2: float = 0.0,
 ) -> tuple[Array, Array]:
     """Single Newton step for Poisson GLM with exact second-order expectation.
@@ -905,6 +1021,8 @@ def _single_neuron_glm_step_second_order(
         Smoothed latent state covariances.
     dt : float
         Time bin width in seconds.
+    time_weights : Array | None, shape (n_time,), optional
+        Per-timestep weights (e.g., state responsibilities). If None, uses ones.
     weight_l2 : float, default=0.0
         L2 regularization strength on the weights (not baseline).
 
@@ -920,7 +1038,7 @@ def _single_neuron_glm_step_second_order(
 
     def loss_fn(p: Array) -> Array:
         return _neg_Q_single_neuron(
-            p, y_n, smoother_mean, smoother_cov, dt, weight_l2
+            p, y_n, smoother_mean, smoother_cov, dt, weight_l2, time_weights
         )
 
     # Compute exact gradient and Hessian via JAX autodiff
@@ -957,6 +1075,7 @@ def update_spike_glm_params(
     smoother_cov: Array | None = None,
     use_second_order: bool = False,
     weight_l2: float = 0.0,
+    time_weights: Array | None = None,
 ) -> SpikeObsParams:
     """M-step for spike observation parameters.
 
@@ -992,6 +1111,8 @@ def update_spike_glm_params(
     weight_l2 : float, default=0.0
         L2 regularization strength on the weights (not baseline).
         Adds 0.5 * weight_l2 * ||weights||^2 to the objective for each neuron.
+    time_weights : Array | None, shape (n_time,), optional
+        Per-timestep weights (e.g., state responsibilities). If None, uses ones.
 
     Returns
     -------
@@ -1014,6 +1135,20 @@ def update_spike_glm_params(
     n_neurons = spikes.shape[1]
     n_time = smoother_mean.shape[0]
     n_latent = smoother_mean.shape[1]
+
+    if time_weights is None:
+        time_weights = jnp.ones(n_time)
+    else:
+        time_weights = jnp.asarray(time_weights)
+        if time_weights.shape != (n_time,):
+            raise ValueError(
+                f"time_weights shape {time_weights.shape} incompatible with "
+                f"expected shape ({n_time},)"
+            )
+        if not jnp.all(jnp.isfinite(time_weights)):
+            raise ValueError("time_weights contains NaN or Inf values")
+        if jnp.any(time_weights < 0):
+            raise ValueError("time_weights must be non-negative")
 
     # Validate inputs for second-order method
     if use_second_order:
@@ -1041,7 +1176,7 @@ def update_spike_glm_params(
                 w = weights[neuron_idx]
                 y_n = spikes[:, neuron_idx]
                 new_b, new_w = _single_neuron_glm_step_second_order(
-                    b, w, y_n, smoother_mean, smoother_cov, dt, weight_l2
+                    b, w, y_n, smoother_mean, smoother_cov, dt, time_weights, weight_l2
                 )
                 return new_b, new_w
 
@@ -1066,7 +1201,7 @@ def update_spike_glm_params(
                 w = weights[neuron_idx]
                 y_n = spikes[:, neuron_idx]
                 new_b, new_w = _single_neuron_glm_step(
-                    b, w, y_n, smoother_mean, dt, weight_l2
+                    b, w, y_n, smoother_mean, dt, time_weights, weight_l2
                 )
                 return new_b, new_w
 
@@ -1135,8 +1270,11 @@ def switching_point_process_filter(
         Should return log(lambda) where lambda is firing rate in Hz. Takes the
         state (n_latent,) and spike_params as arguments.
     spike_params : SpikeObsParams
-        Spike observation parameters (baseline, weights). Passed to log_intensity_func
-        as data, not captured in closures. This ensures EM parameter updates take effect.
+        Spike observation parameters (baseline, weights). For per-state spike
+        parameters, provide baseline with shape (n_neurons, n_discrete_states)
+        and weights with shape (n_neurons, n_latent, n_discrete_states); the
+        discrete state axis must be last. Passed to log_intensity_func as data,
+        not captured in closures. This ensures EM parameter updates take effect.
     include_laplace_normalization : bool, default=True
         If True, include Laplace normalization and prior terms in the
         observation log-likelihood used for discrete-state updates.
@@ -1426,6 +1564,8 @@ class SwitchingSpikeOscillatorModel:
         Whether to update Z (discrete transitions) during M-step.
     update_spike_params : bool, default=True
         Whether to update spike GLM parameters (baseline, weights) during M-step.
+    separate_spike_params : bool, default=False
+        Whether to fit separate spike GLM parameters per discrete state.
     update_init_mean : bool, default=True
         Whether to update initial mean during M-step.
     update_init_cov : bool, default=True
@@ -1484,6 +1624,7 @@ class SwitchingSpikeOscillatorModel:
         update_process_cov: bool = True,
         update_discrete_transition_matrix: bool = True,
         update_spike_params: bool = True,
+        separate_spike_params: bool = False,
         update_init_mean: bool = True,
         update_init_cov: bool = True,
         q_regularization: QRegularizationConfig | None = None,
@@ -1515,6 +1656,8 @@ class SwitchingSpikeOscillatorModel:
             Update Z during M-step.
         update_spike_params : bool, default=True
             Update spike GLM params during M-step.
+        separate_spike_params : bool, default=False
+            If True, fit a separate spike GLM (baseline, weights) per discrete state.
         update_init_mean : bool, default=True
             Update initial mean during M-step.
         update_init_cov : bool, default=True
@@ -1588,6 +1731,7 @@ class SwitchingSpikeOscillatorModel:
         self.update_process_cov = update_process_cov
         self.update_discrete_transition_matrix = update_discrete_transition_matrix
         self.update_spike_params = update_spike_params
+        self.separate_spike_params = separate_spike_params
         self.update_init_mean = update_init_mean
         self.update_init_cov = update_init_cov
 
@@ -1819,11 +1963,20 @@ class SwitchingSpikeOscillatorModel:
         key : Array
             Random key for sampling initial weights.
         """
-        # Baseline: zero (exp(0) = 1 Hz baseline firing rate)
-        baseline = jnp.zeros(self.n_neurons)
+        if self.separate_spike_params:
+            # Baseline: zero (exp(0) = 1 Hz baseline firing rate)
+            baseline = jnp.zeros((self.n_neurons, self.n_discrete_states))
 
-        # Weights: small random values
-        weights = jax.random.normal(key, (self.n_neurons, self.n_latent)) * 0.1
+            # Weights: small random values, per discrete state (axis last)
+            weights = jax.random.normal(
+                key, (self.n_neurons, self.n_latent, self.n_discrete_states)
+            ) * 0.1
+        else:
+            # Baseline: zero (exp(0) = 1 Hz baseline firing rate)
+            baseline = jnp.zeros(self.n_neurons)
+
+            # Weights: small random values
+            weights = jax.random.normal(key, (self.n_neurons, self.n_latent)) * 0.1
 
         self.spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
@@ -1886,17 +2039,26 @@ class SwitchingSpikeOscillatorModel:
                 f"({self.n_latent}, {self.n_latent}, {self.n_discrete_states}), "
                 f"got {self.process_cov.shape}."
             )
-        if self.spike_params.baseline.shape != (self.n_neurons,):
+        if self.separate_spike_params:
+            expected_baseline = (self.n_neurons, self.n_discrete_states)
+            expected_weights = (
+                self.n_neurons,
+                self.n_latent,
+                self.n_discrete_states,
+            )
+        else:
+            expected_baseline = (self.n_neurons,)
+            expected_weights = (self.n_neurons, self.n_latent)
+
+        if self.spike_params.baseline.shape != expected_baseline:
             raise ValueError(
                 f"spike_params.baseline shape mismatch: expected "
-                f"({self.n_neurons},), "
-                f"got {self.spike_params.baseline.shape}."
+                f"{expected_baseline}, got {self.spike_params.baseline.shape}."
             )
-        if self.spike_params.weights.shape != (self.n_neurons, self.n_latent):
+        if self.spike_params.weights.shape != expected_weights:
             raise ValueError(
                 f"spike_params.weights shape mismatch: expected "
-                f"({self.n_neurons}, {self.n_latent}), "
-                f"got {self.spike_params.weights.shape}."
+                f"{expected_weights}, got {self.spike_params.weights.shape}."
             )
 
     def _e_step(self, spikes: Array) -> Array:
@@ -2115,10 +2277,14 @@ class SwitchingSpikeOscillatorModel:
 
         This is the standard "plug-in" M-step for the spike parameters.
 
-        **Limitation**: This approach uses a single marginalized mean and ignores
-        both the per-state posterior means and the posterior covariance. For a
-        switching model with nonlinear log-link observation model, the correct
-        EM objective would require:
+        If ``separate_spike_params`` is True, this method instead fits one
+        spike GLM per discrete state using state-conditional means/covariances
+        and state responsibilities as time weights.
+
+        **Limitation (shared-parameter mode)**: This approach uses a single
+        marginalized mean and ignores both the per-state posterior means and
+        the posterior covariance. For a switching model with nonlinear log-link
+        observation model, the correct EM objective would require:
 
         1. State-conditional expectations: E_q[log p(y|x) | S_t=j] for each state
         2. Integration over posterior covariance (second-order correction)
@@ -2132,6 +2298,78 @@ class SwitchingSpikeOscillatorModel:
 
         """
         if not self.update_spike_params:
+            return
+
+        if self.separate_spike_params:
+            # Minimum total weight required to update parameters for a state.
+            # States with less weight keep their current parameters unchanged.
+            MIN_STATE_WEIGHT = 1e-8
+
+            def _update_single_state(
+                state_index: int,
+                current_baseline: Array,
+                current_weights: Array,
+                state_weights: Array,
+                state_cond_mean: Array,
+                state_cond_cov: Array,
+            ) -> tuple[Array, Array]:
+                """Update spike GLM params for a single discrete state."""
+                current_params = SpikeObsParams(
+                    baseline=current_baseline,
+                    weights=current_weights,
+                )
+
+                def _keep_current(_: None) -> tuple[Array, Array]:
+                    return current_baseline, current_weights
+
+                def _do_update(_: None) -> tuple[Array, Array]:
+                    updated = update_spike_glm_params(
+                        spikes=spikes,
+                        smoother_mean=state_cond_mean,
+                        current_params=current_params,
+                        dt=self.dt,
+                        time_weights=state_weights,
+                        weight_l2=self.spike_weight_l2,
+                        smoother_cov=state_cond_cov,
+                        use_second_order=True,
+                    )
+                    return updated.baseline, updated.weights
+
+                # Use lax.cond for JIT-compatible conditional execution
+                return jax.lax.cond(
+                    jnp.sum(state_weights) < MIN_STATE_WEIGHT,
+                    _keep_current,
+                    _do_update,
+                    None,
+                )
+
+            # Process all states using vmap for JIT compatibility
+            state_indices = jnp.arange(self.n_discrete_states)
+
+            # Transpose arrays to have state axis first for vmap
+            # spike_params.baseline: (n_neurons, n_discrete_states)
+            # spike_params.weights: (n_neurons, n_latent, n_discrete_states)
+            # smoother_discrete_state_prob: (n_time, n_discrete_states)
+            # smoother_state_cond_mean: (n_time, n_latent, n_discrete_states)
+            # smoother_state_cond_cov: (n_time, n_latent, n_latent, n_discrete_states)
+
+            updated_baselines, updated_weights = jax.vmap(
+                _update_single_state,
+                in_axes=(0, -1, -1, -1, -1, -1),
+                out_axes=(-1, -1),
+            )(
+                state_indices,
+                self.spike_params.baseline,
+                self.spike_params.weights,
+                self.smoother_discrete_state_prob,
+                self.smoother_state_cond_mean,
+                self.smoother_state_cond_cov,
+            )
+
+            self.spike_params = SpikeObsParams(
+                baseline=updated_baselines,
+                weights=updated_weights,
+            )
             return
 
         # Compute marginalized smoother mean by weighting state-conditional means
