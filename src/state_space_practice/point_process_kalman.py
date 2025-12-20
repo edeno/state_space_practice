@@ -255,12 +255,17 @@ def _point_process_laplace_update(
 
     if max_newton_iter == 1:
         # Original single-step behavior (no line search overhead)
+        # Evaluate at prior mean (one_step_mean), so prior gradient is zero
         log_lambda = log_intensity_func(one_step_mean)
         conditional_intensity = jnp.exp(log_lambda) * dt
         innovation = spike_indicator_t - conditional_intensity
         jacobian = grad_log_intensity(one_step_mean)
         hessian = hess_log_intensity(one_step_mean)
-        gradient = jacobian.T @ innovation
+        # Likelihood gradient only; prior gradient = -P^{-1}(x - m) = 0 at x = m
+        likelihood_gradient = jacobian.T @ innovation
+        # Prior gradient is zero at the prior mean, but include explicitly for clarity
+        prior_gradient = jnp.zeros_like(likelihood_gradient)
+        gradient = likelihood_gradient + prior_gradient
         fisher_info = jacobian.T @ (conditional_intensity[:, None] * jacobian)
         hessian_correction = jnp.einsum("n,nij->ij", innovation, hessian)
         posterior_precision = prior_precision + fisher_info - hessian_correction

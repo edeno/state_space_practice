@@ -166,7 +166,7 @@ class QRegularizationConfig:
     """
 
     trust_region_weight: float = 0.1
-    min_eigenvalue: float | None = 1e-8
+    min_eigenvalue: float | None = 0.001  # Process noise floor to prevent collapse
     max_eigenvalue: float | None = None
     enabled: bool = True
 
@@ -859,7 +859,9 @@ def _neg_Q_single_neuron(
 
     # Full log-intensity expectation: b + w^T m_t + 0.5 * w^T P_t w
     eta = b + eta_lin + quad  # (n_time,)
-    mu = jnp.exp(eta) * dt  # expected counts, (n_time,)
+    # Clip eta to prevent overflow: exp(20) ≈ 5e8 (reasonable max count per bin)
+    eta_safe = jnp.clip(eta, -20.0, 20.0)
+    mu = jnp.exp(eta_safe) * dt  # expected counts, (n_time,)
 
     # Negative Q: sum(mu - y * (b + w^T m_t)) + 0.5 * lambda * ||w||^2
     # Note: the y_t term only uses (b + w^T m_t), not the variance correction
@@ -922,6 +924,7 @@ def _single_neuron_glm_step_second_order(
         )
 
     # Compute exact gradient and Hessian via JAX autodiff
+    # We minimize the negative Q-function, so gradient points uphill on -Q (downhill on Q)
     grad = jax.grad(loss_fn)(params)
     hess = jax.hessian(loss_fn)(params)
 
@@ -929,7 +932,7 @@ def _single_neuron_glm_step_second_order(
     ridge = 1e-6
     hess_reg = hess + ridge * jnp.eye(1 + n_latent)
 
-    # Newton direction
+    # Newton direction for minimization: x_new = x - H^{-1} @ grad(neg_Q)
     delta = jnp.linalg.solve(hess_reg, grad)
 
     # Backtracking line search with Armijo condition
@@ -1200,6 +1203,15 @@ def switching_point_process_filter(
     [2] Murphy, K.P. (1998). Switching Kalman Filters.
     [3] Shumway, R.H., and Stoffer, D.S. (1991). Dynamic Linear Models With Switching.
     """
+    # Input validation: ensure spikes is 2D (n_time, n_neurons)
+    spikes = jnp.asarray(spikes)
+    if spikes.ndim == 1:
+        # Promote 1D single-neuron input to 2D
+        spikes = spikes[:, None]
+    elif spikes.ndim != 2:
+        raise ValueError(
+            f"spikes must be 1D or 2D array, got shape {spikes.shape}"
+        )
 
     def _step(
         carry: tuple[Array, Array, Array, Array],
@@ -2162,6 +2174,20 @@ class SwitchingSpikeOscillatorModel:
         # Total marginal covariance
         smoother_cov = expected_cov + var_of_mean
 
+        # Clip covariance eigenvalues to prevent numerical instability in
+        # the second-order M-step. Large covariances (from early EM iterations
+        # with poor initialization) can cause the Newton optimization to diverge.
+        # Max eigenvalue of 1.0 corresponds to std dev ~1 in latent space.
+        max_cov_eigenvalue = 1.0
+
+        def clip_cov_eigenvalues(cov: Array) -> Array:
+            cov = symmetrize(cov)
+            eigvals, eigvecs = jnp.linalg.eigh(cov)
+            eigvals_clipped = jnp.clip(eigvals, 0.0, max_cov_eigenvalue)
+            return eigvecs @ jnp.diag(eigvals_clipped) @ eigvecs.T
+
+        smoother_cov_clipped = jax.vmap(clip_cov_eigenvalues)(smoother_cov)
+
         # Update spike GLM parameters with second-order correction
         self.spike_params = update_spike_glm_params(
             spikes=spikes,
@@ -2169,7 +2195,7 @@ class SwitchingSpikeOscillatorModel:
             current_params=self.spike_params,
             dt=self.dt,
             weight_l2=self.spike_weight_l2,
-            smoother_cov=smoother_cov,
+            smoother_cov=smoother_cov_clipped,
             use_second_order=True,
         )
 
