@@ -17,18 +17,35 @@ from jax.typing import ArrayLike
 jax.config.update("jax_enable_x64", True)
 
 
-def linear_log_intensity(weights: Array, baseline: Array) -> Callable[[Array], Array]:
-    """Create a linear log-intensity function for testing.
+def linear_log_intensity(
+    state: Array, params: "SpikeObsParams"
+) -> Array:
+    """Linear log-intensity function for testing.
 
     Parameters
     ----------
-    weights : Array, shape (n_neurons, n_latent)
-    baseline : Array, shape (n_neurons,)
+    state : Array, shape (n_latent,)
+        Latent state
+    params : SpikeObsParams
+        Spike observation parameters (baseline, weights)
 
     Returns
     -------
-    Callable[[Array], Array]
-        Function mapping state (n_latent,) -> log_rates (n_neurons,)
+    Array, shape (n_neurons,)
+        Log firing rates for all neurons
+    """
+    from state_space_practice.switching_point_process import SpikeObsParams
+
+    return params.baseline + params.weights @ state
+
+
+# Backwards-compatible helper that returns a closure (for tests that don't use the new API)
+def linear_log_intensity_closure(
+    weights: Array, baseline: Array
+) -> Callable[[Array], Array]:
+    """Create a closure-based linear log-intensity function for testing.
+
+    DEPRECATED: Use linear_log_intensity with SpikeObsParams instead.
     """
 
     def log_intensity(state: Array) -> Array:
@@ -84,6 +101,7 @@ class TestPointProcessKalmanUpdate:
     def test_output_shapes_single_neuron(self) -> None:
         """Output shapes should be correct for single neuron."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             point_process_kalman_update,
         )
 
@@ -97,10 +115,10 @@ class TestPointProcessKalmanUpdate:
 
         weights = jnp.ones((n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         posterior_mean, posterior_cov, log_ll = point_process_kalman_update(
-            one_step_mean, one_step_cov, y_t, dt, log_intensity_func
+            one_step_mean, one_step_cov, y_t, dt, linear_log_intensity, spike_params
         )
 
         assert posterior_mean.shape == (n_latent,)
@@ -110,6 +128,7 @@ class TestPointProcessKalmanUpdate:
     def test_output_shapes_multiple_neurons(self) -> None:
         """Output shapes should be correct for multiple neurons."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             point_process_kalman_update,
         )
 
@@ -123,10 +142,10 @@ class TestPointProcessKalmanUpdate:
 
         weights = jax.random.normal(jax.random.PRNGKey(0), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         posterior_mean, posterior_cov, log_ll = point_process_kalman_update(
-            one_step_mean, one_step_cov, y_t, dt, log_intensity_func
+            one_step_mean, one_step_cov, y_t, dt, linear_log_intensity, spike_params
         )
 
         assert posterior_mean.shape == (n_latent,)
@@ -136,6 +155,7 @@ class TestPointProcessKalmanUpdate:
     def test_no_nans(self) -> None:
         """Update should not produce NaN values."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             point_process_kalman_update,
         )
 
@@ -149,10 +169,10 @@ class TestPointProcessKalmanUpdate:
 
         weights = jax.random.normal(jax.random.PRNGKey(42), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         posterior_mean, posterior_cov, log_ll = point_process_kalman_update(
-            one_step_mean, one_step_cov, y_t, dt, log_intensity_func
+            one_step_mean, one_step_cov, y_t, dt, linear_log_intensity, spike_params
         )
 
         assert not jnp.any(jnp.isnan(posterior_mean))
@@ -166,6 +186,7 @@ class TestPointProcessKalmanUpdate:
         push the posterior mean in the direction of lower intensity.
         """
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             point_process_kalman_update,
         )
 
@@ -179,10 +200,10 @@ class TestPointProcessKalmanUpdate:
 
         weights = jnp.ones((n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         posterior_mean, posterior_cov, _ = point_process_kalman_update(
-            one_step_mean, one_step_cov, y_t, dt, log_intensity_func
+            one_step_mean, one_step_cov, y_t, dt, linear_log_intensity, spike_params
         )
 
         # With zero spikes, the update should be small
@@ -192,6 +213,7 @@ class TestPointProcessKalmanUpdate:
     def test_covariance_is_symmetric(self) -> None:
         """Posterior covariance should be symmetric."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             point_process_kalman_update,
         )
 
@@ -205,10 +227,10 @@ class TestPointProcessKalmanUpdate:
 
         weights = jax.random.normal(jax.random.PRNGKey(42), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         _, posterior_cov, _ = point_process_kalman_update(
-            one_step_mean, one_step_cov, y_t, dt, log_intensity_func
+            one_step_mean, one_step_cov, y_t, dt, linear_log_intensity, spike_params
         )
 
         np.testing.assert_allclose(posterior_cov, posterior_cov.T, rtol=1e-5, atol=1e-10)
@@ -216,6 +238,7 @@ class TestPointProcessKalmanUpdate:
     def test_covariance_is_positive_definite(self) -> None:
         """Posterior covariance should be positive semi-definite."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             point_process_kalman_update,
         )
 
@@ -229,10 +252,10 @@ class TestPointProcessKalmanUpdate:
 
         weights = jax.random.normal(jax.random.PRNGKey(42), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         _, posterior_cov, _ = point_process_kalman_update(
-            one_step_mean, one_step_cov, y_t, dt, log_intensity_func
+            one_step_mean, one_step_cov, y_t, dt, linear_log_intensity, spike_params
         )
 
         # All eigenvalues should be non-negative
@@ -242,6 +265,7 @@ class TestPointProcessKalmanUpdate:
     def test_log_likelihood_finite(self) -> None:
         """Log-likelihood should be finite."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             point_process_kalman_update,
         )
 
@@ -255,10 +279,10 @@ class TestPointProcessKalmanUpdate:
 
         weights = jax.random.normal(jax.random.PRNGKey(42), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         _, _, log_ll = point_process_kalman_update(
-            one_step_mean, one_step_cov, y_t, dt, log_intensity_func
+            one_step_mean, one_step_cov, y_t, dt, linear_log_intensity, spike_params
         )
 
         assert jnp.isfinite(log_ll)
@@ -270,6 +294,7 @@ class TestPointProcessKalmanUpdate:
         in a direction that increases predicted intensity.
         """
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             point_process_kalman_update,
         )
 
@@ -283,21 +308,21 @@ class TestPointProcessKalmanUpdate:
         # Positive weights - state should increase to explain spikes
         weights = jnp.ones((n_neurons, n_latent)) * 0.5
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         # Low spikes
         posterior_mean_low, _, _ = point_process_kalman_update(
-            one_step_mean, one_step_cov, jnp.array([0.0]), dt, log_intensity_func
+            one_step_mean, one_step_cov, jnp.array([0.0]), dt, linear_log_intensity, spike_params
         )
 
         # High spikes
         posterior_mean_high, _, _ = point_process_kalman_update(
-            one_step_mean, one_step_cov, jnp.array([5.0]), dt, log_intensity_func
+            one_step_mean, one_step_cov, jnp.array([5.0]), dt, linear_log_intensity, spike_params
         )
 
         # With positive weights, high spikes should lead to higher log-intensity
-        log_rate_low = log_intensity_func(posterior_mean_low)
-        log_rate_high = log_intensity_func(posterior_mean_high)
+        log_rate_low = linear_log_intensity(posterior_mean_low, spike_params)
+        log_rate_high = linear_log_intensity(posterior_mean_high, spike_params)
 
         assert jnp.all(log_rate_high > log_rate_low)
 
@@ -308,6 +333,7 @@ class TestPointProcessPredictAndUpdate:
     def test_output_shapes(self) -> None:
         """Output shapes should be correct."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             _point_process_predict_and_update,
         )
 
@@ -323,7 +349,7 @@ class TestPointProcessPredictAndUpdate:
 
         weights = jax.random.normal(jax.random.PRNGKey(0), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         posterior_mean, posterior_cov, log_ll = _point_process_predict_and_update(
             prev_state_cond_mean,
@@ -332,7 +358,8 @@ class TestPointProcessPredictAndUpdate:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         assert posterior_mean.shape == (n_latent,)
@@ -342,6 +369,7 @@ class TestPointProcessPredictAndUpdate:
     def test_prediction_incorporated(self) -> None:
         """The dynamics prediction should be incorporated before update."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             _point_process_predict_and_update,
             point_process_kalman_update,
         )
@@ -360,18 +388,18 @@ class TestPointProcessPredictAndUpdate:
 
         weights = jnp.ones((n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         # Use predict_and_update
         mean_combined, cov_combined, _ = _point_process_predict_and_update(
-            prev_mean, prev_cov, y_t, A, Q, dt, log_intensity_func
+            prev_mean, prev_cov, y_t, A, Q, dt, linear_log_intensity, spike_params
         )
 
         # Manual prediction + update
         one_step_mean = A @ prev_mean
         one_step_cov = A @ prev_cov @ A.T + Q
         mean_manual, cov_manual, _ = point_process_kalman_update(
-            one_step_mean, one_step_cov, y_t, dt, log_intensity_func
+            one_step_mean, one_step_cov, y_t, dt, linear_log_intensity, spike_params
         )
 
         np.testing.assert_allclose(mean_combined, mean_manual, rtol=1e-5)
@@ -380,6 +408,7 @@ class TestPointProcessPredictAndUpdate:
     def test_no_nans(self) -> None:
         """Should not produce NaN values."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             _point_process_predict_and_update,
         )
 
@@ -395,10 +424,10 @@ class TestPointProcessPredictAndUpdate:
 
         weights = jax.random.normal(jax.random.PRNGKey(42), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         mean, cov, ll = _point_process_predict_and_update(
-            prev_mean, prev_cov, y_t, A, Q, dt, log_intensity_func
+            prev_mean, prev_cov, y_t, A, Q, dt, linear_log_intensity, spike_params
         )
 
         assert not jnp.any(jnp.isnan(mean))
@@ -412,6 +441,7 @@ class TestPointProcessUpdatePerStatePair:
     def test_output_shapes(self) -> None:
         """Output shapes should be correct for state pairs."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             _point_process_update_per_discrete_state_pair,
         )
 
@@ -439,7 +469,7 @@ class TestPointProcessUpdatePerStatePair:
 
         weights = jax.random.normal(jax.random.PRNGKey(0), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         pair_mean, pair_cov, pair_ll = _point_process_update_per_discrete_state_pair(
             prev_state_cond_mean,
@@ -448,7 +478,8 @@ class TestPointProcessUpdatePerStatePair:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Output shapes should be (n_latent, n_discrete_states, n_discrete_states)
@@ -459,6 +490,7 @@ class TestPointProcessUpdatePerStatePair:
     def test_single_state_matches_base_function(self) -> None:
         """With 1 state, should match non-vmapped function."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             _point_process_predict_and_update,
             _point_process_update_per_discrete_state_pair,
         )
@@ -475,11 +507,11 @@ class TestPointProcessUpdatePerStatePair:
 
         weights = jax.random.normal(jax.random.PRNGKey(42), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         # Non-vmapped result
         expected_mean, expected_cov, expected_ll = _point_process_predict_and_update(
-            prev_mean_single, prev_cov_single, y_t, A_single, Q_single, dt, log_intensity_func
+            prev_mean_single, prev_cov_single, y_t, A_single, Q_single, dt, linear_log_intensity, spike_params
         )
 
         # Vmapped result with state dimension
@@ -489,7 +521,7 @@ class TestPointProcessUpdatePerStatePair:
         Q_batched = Q_single[:, :, None]  # (n_latent, n_latent, 1)
 
         pair_mean, pair_cov, pair_ll = _point_process_update_per_discrete_state_pair(
-            prev_mean_batched, prev_cov_batched, y_t, A_batched, Q_batched, dt, log_intensity_func
+            prev_mean_batched, prev_cov_batched, y_t, A_batched, Q_batched, dt, linear_log_intensity, spike_params
         )
 
         # Should match single result
@@ -500,6 +532,7 @@ class TestPointProcessUpdatePerStatePair:
     def test_no_nans(self) -> None:
         """Should not produce NaN values."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             _point_process_update_per_discrete_state_pair,
         )
 
@@ -520,10 +553,10 @@ class TestPointProcessUpdatePerStatePair:
 
         weights = jax.random.normal(k2, (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         pair_mean, pair_cov, pair_ll = _point_process_update_per_discrete_state_pair(
-            prev_mean, prev_cov, y_t, A, Q, dt, log_intensity_func
+            prev_mean, prev_cov, y_t, A, Q, dt, linear_log_intensity, spike_params
         )
 
         assert not jnp.any(jnp.isnan(pair_mean))
@@ -533,6 +566,7 @@ class TestPointProcessUpdatePerStatePair:
     def test_different_states_give_different_results(self) -> None:
         """Different discrete states should give different outputs."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             _point_process_update_per_discrete_state_pair,
         )
 
@@ -551,10 +585,10 @@ class TestPointProcessUpdatePerStatePair:
 
         weights = jnp.ones((n_neurons, n_latent)) * 0.5
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         pair_mean, pair_cov, pair_ll = _point_process_update_per_discrete_state_pair(
-            prev_mean, prev_cov, y_t, A, Q, dt, log_intensity_func
+            prev_mean, prev_cov, y_t, A, Q, dt, linear_log_intensity, spike_params
         )
 
         # Results for state j=0 and j=1 should be different
@@ -568,6 +602,7 @@ class TestSwitchingPointProcessFilter:
     def test_output_shapes(self) -> None:
         """All outputs should have correct shapes (Task 2.5)."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -602,7 +637,7 @@ class TestSwitchingPointProcessFilter:
         # Spike observation parameters
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         (
             state_cond_filter_mean,
@@ -619,7 +654,8 @@ class TestSwitchingPointProcessFilter:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Check shapes
@@ -641,6 +677,7 @@ class TestSwitchingPointProcessFilter:
     def test_discrete_probs_sum_to_one(self) -> None:
         """Discrete state probabilities should sum to 1 at each timestep."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -672,7 +709,7 @@ class TestSwitchingPointProcessFilter:
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         _, _, filter_discrete_state_prob, _, _ = switching_point_process_filter(
             init_state_cond_mean,
@@ -683,7 +720,8 @@ class TestSwitchingPointProcessFilter:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Probabilities should sum to 1 at each timestep
@@ -693,6 +731,7 @@ class TestSwitchingPointProcessFilter:
     def test_discrete_probs_nonnegative(self) -> None:
         """Discrete state probabilities should be non-negative."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -720,7 +759,7 @@ class TestSwitchingPointProcessFilter:
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         _, _, filter_discrete_state_prob, _, _ = switching_point_process_filter(
             init_state_cond_mean,
@@ -731,7 +770,8 @@ class TestSwitchingPointProcessFilter:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # All probabilities should be >= 0
@@ -740,6 +780,7 @@ class TestSwitchingPointProcessFilter:
     def test_no_nans(self) -> None:
         """Filter should not produce NaN values."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -767,7 +808,7 @@ class TestSwitchingPointProcessFilter:
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         (
             state_cond_filter_mean,
@@ -784,7 +825,8 @@ class TestSwitchingPointProcessFilter:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         assert not jnp.any(jnp.isnan(state_cond_filter_mean))
@@ -796,6 +838,7 @@ class TestSwitchingPointProcessFilter:
     def test_marginal_log_likelihood_finite(self) -> None:
         """Marginal log-likelihood should be finite."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -823,7 +866,7 @@ class TestSwitchingPointProcessFilter:
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         _, _, _, _, marginal_log_likelihood = switching_point_process_filter(
             init_state_cond_mean,
@@ -834,7 +877,8 @@ class TestSwitchingPointProcessFilter:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         assert jnp.isfinite(marginal_log_likelihood)
@@ -842,6 +886,7 @@ class TestSwitchingPointProcessFilter:
     def test_single_discrete_state(self) -> None:
         """With 1 discrete state, filter should still work correctly."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -865,7 +910,7 @@ class TestSwitchingPointProcessFilter:
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         (
             state_cond_filter_mean,
@@ -882,7 +927,8 @@ class TestSwitchingPointProcessFilter:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # With S=1, probabilities should always be 1
@@ -898,6 +944,7 @@ class TestSwitchingPointProcessFilter:
     def test_covariances_positive_semidefinite(self) -> None:
         """Filtered covariances should be positive semi-definite."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -925,7 +972,7 @@ class TestSwitchingPointProcessFilter:
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         _, state_cond_filter_cov, _, _, _ = switching_point_process_filter(
             init_state_cond_mean,
@@ -936,7 +983,8 @@ class TestSwitchingPointProcessFilter:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Check all covariances are PSD (eigenvalues >= 0)
@@ -950,6 +998,7 @@ class TestSwitchingPointProcessFilter:
     def test_pair_conditional_shapes(self) -> None:
         """last_pair_cond_filter_mean should have correct shape for smoother."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -985,7 +1034,7 @@ class TestSwitchingPointProcessFilter:
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         _, _, _, last_pair_cond_filter_mean, _ = switching_point_process_filter(
             init_state_cond_mean,
@@ -996,7 +1045,8 @@ class TestSwitchingPointProcessFilter:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Shape: (n_latent, n_discrete_states, n_discrete_states)
@@ -1010,6 +1060,7 @@ class TestSwitchingPointProcessFilter:
     def test_all_zero_spikes(self) -> None:
         """Filter should handle observation sequences with no spikes (silent neurons)."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -1037,7 +1088,7 @@ class TestSwitchingPointProcessFilter:
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         (
             state_cond_filter_mean,
@@ -1054,7 +1105,8 @@ class TestSwitchingPointProcessFilter:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Should not produce NaN values
@@ -1071,6 +1123,7 @@ class TestSwitchingPointProcessFilter:
     def test_high_spike_counts(self) -> None:
         """Filter should handle high spike counts without numerical issues."""
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -1100,7 +1153,7 @@ class TestSwitchingPointProcessFilter:
         # Higher baseline to match high spike counts
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.ones(n_neurons) * 3.0  # Higher baseline for higher rates
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         (
             state_cond_filter_mean,
@@ -1117,7 +1170,8 @@ class TestSwitchingPointProcessFilter:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Should not produce NaN or infinite values
@@ -1144,6 +1198,7 @@ class TestSmootherIntegration:
         """Smoother should run without error on point-process filter outputs."""
         from state_space_practice.switching_kalman import switching_kalman_smoother
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -1176,7 +1231,7 @@ class TestSmootherIntegration:
         # Spike observation model
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         # Run filter
         (
@@ -1194,7 +1249,8 @@ class TestSmootherIntegration:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Run smoother on filter output - should not raise
@@ -1230,6 +1286,7 @@ class TestSmootherIntegration:
         """Smoother should not produce NaN values."""
         from state_space_practice.switching_kalman import switching_kalman_smoother
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -1256,7 +1313,7 @@ class TestSmootherIntegration:
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         # Filter
         (
@@ -1274,7 +1331,8 @@ class TestSmootherIntegration:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Smoother (9 return values)
@@ -1315,6 +1373,7 @@ class TestSmootherIntegration:
         """
         from state_space_practice.switching_kalman import switching_kalman_smoother
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -1341,7 +1400,7 @@ class TestSmootherIntegration:
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         # Filter
         (
@@ -1359,7 +1418,8 @@ class TestSmootherIntegration:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Smoother (9 return values)
@@ -1416,6 +1476,7 @@ class TestSmootherIntegration:
         """Smoothed discrete probabilities should sum to 1."""
         from state_space_practice.switching_kalman import switching_kalman_smoother
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -1447,7 +1508,7 @@ class TestSmootherIntegration:
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         # Filter
         (
@@ -1465,7 +1526,8 @@ class TestSmootherIntegration:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Smoother (9 return values)
@@ -2093,6 +2155,23 @@ class TestUpdateSpikeGLMParams:
 class TestUpdateSpikeGLMParamsSecondOrder:
     """Tests for the second-order expectation variant of update_spike_glm_params (Task 5.4)."""
 
+    @staticmethod
+    def _second_order_glm_loss(
+        baseline: jax.Array,
+        weights: jax.Array,
+        y_n: jax.Array,
+        smoother_mean: jax.Array,
+        smoother_cov: jax.Array,
+        dt: float,
+    ) -> jax.Array:
+        """Negative log-likelihood with second-order expectation correction."""
+        eta = baseline + smoother_mean @ weights
+        var_corrections = jax.vmap(lambda P: 0.5 * weights @ P @ weights)(
+            smoother_cov
+        )
+        mu = jnp.exp(eta + var_corrections) * dt
+        return jnp.sum(mu - y_n * eta)
+
     def test_second_order_output_shapes(self) -> None:
         """Second-order method should produce same output shapes."""
         from state_space_practice.switching_point_process import (
@@ -2230,6 +2309,94 @@ class TestUpdateSpikeGLMParamsSecondOrder:
 
         assert loss_after < loss_before
 
+    def test_second_order_decreases_second_order_loss(self) -> None:
+        """Second-order method should decrease the second-order expected loss."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            update_spike_glm_params,
+        )
+
+        n_time = 80
+        n_latent = 3
+        n_neurons = 2
+        dt = 0.02
+
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent))
+        smoother_cov = jnp.stack([jnp.eye(n_latent) * 0.1] * n_time, axis=0)
+
+        true_baseline = jnp.array([0.4, -0.2])
+        true_weights = jax.random.normal(
+            jax.random.PRNGKey(2), (n_neurons, n_latent)
+        ) * 0.3
+        eta = true_baseline[None, :] + smoother_mean @ true_weights.T
+        rates = jnp.exp(eta) * dt
+        spikes = jax.random.poisson(jax.random.PRNGKey(3), rates).astype(float)
+
+        current_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.zeros((n_neurons, n_latent)),
+        )
+
+        loss_before = jnp.array(0.0)
+        for n in range(n_neurons):
+            loss_before = loss_before + self._second_order_glm_loss(
+                current_params.baseline[n],
+                current_params.weights[n],
+                spikes[:, n],
+                smoother_mean,
+                smoother_cov,
+                dt,
+            )
+
+        new_params = update_spike_glm_params(
+            spikes,
+            smoother_mean,
+            current_params,
+            dt,
+            max_iter=10,
+            smoother_cov=smoother_cov,
+            use_second_order=True,
+        )
+
+        loss_after = jnp.array(0.0)
+        for n in range(n_neurons):
+            loss_after = loss_after + self._second_order_glm_loss(
+                new_params.baseline[n],
+                new_params.weights[n],
+                spikes[:, n],
+                smoother_mean,
+                smoother_cov,
+                dt,
+            )
+
+        assert loss_after < loss_before
+
+    def test_second_order_loss_differs_from_plugin(self) -> None:
+        """Second-order loss should differ from plug-in loss when variance > 0."""
+        from state_space_practice.switching_point_process import _single_neuron_glm_loss
+
+        n_time = 40
+        n_latent = 2
+        dt = 0.02
+
+        baseline = jnp.array(0.2)
+        weights = jnp.array([0.4, -0.3])
+        smoother_mean = jax.random.normal(jax.random.PRNGKey(4), (n_time, n_latent))
+        smoother_cov = jnp.stack([jnp.eye(n_latent) * 0.2] * n_time, axis=0)
+
+        eta = baseline + smoother_mean @ weights
+        rates = jnp.exp(eta) * dt
+        spikes = jax.random.poisson(jax.random.PRNGKey(5), rates).astype(float)
+
+        plugin_loss = _single_neuron_glm_loss(
+            baseline, weights, spikes, smoother_mean, dt
+        )
+        second_order_loss = self._second_order_glm_loss(
+            baseline, weights, spikes, smoother_mean, smoother_cov, dt
+        )
+
+        assert not jnp.isclose(plugin_loss, second_order_loss)
+
     def test_second_order_with_zero_variance(self) -> None:
         """With zero variance, second-order should match plug-in method."""
         from state_space_practice.switching_point_process import (
@@ -2366,6 +2533,7 @@ class TestDynamicsMStepReuse:
             switching_kalman_smoother,
         )
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -2396,7 +2564,7 @@ class TestDynamicsMStepReuse:
         # Spike observation parameters
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         # Run filter
         (
@@ -2414,7 +2582,8 @@ class TestDynamicsMStepReuse:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Run smoother (observation-model agnostic)
@@ -2478,6 +2647,7 @@ class TestDynamicsMStepReuse:
             switching_kalman_smoother,
         )
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -2514,7 +2684,7 @@ class TestDynamicsMStepReuse:
         # Spike observation parameters
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         # Run filter
         (
@@ -2532,7 +2702,8 @@ class TestDynamicsMStepReuse:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Run smoother
@@ -2598,6 +2769,7 @@ class TestDynamicsMStepReuse:
             switching_kalman_smoother,
         )
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -2628,7 +2800,7 @@ class TestDynamicsMStepReuse:
         # Spike observation parameters
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         # Run filter
         (
@@ -2646,7 +2818,8 @@ class TestDynamicsMStepReuse:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Run smoother
@@ -2705,6 +2878,7 @@ class TestDynamicsMStepReuse:
             switching_kalman_smoother,
         )
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -2732,7 +2906,7 @@ class TestDynamicsMStepReuse:
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         # Run filter and smoother
         (
@@ -2750,7 +2924,8 @@ class TestDynamicsMStepReuse:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         (
@@ -2824,6 +2999,7 @@ class TestDynamicsMStepReuse:
             switching_kalman_smoother,
         )
         from state_space_practice.switching_point_process import (
+            SpikeObsParams,
             switching_point_process_filter,
         )
 
@@ -2851,7 +3027,7 @@ class TestDynamicsMStepReuse:
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
-        log_intensity_func = linear_log_intensity(weights, baseline)
+        spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         # Run filter and smoother
         (
@@ -2869,7 +3045,8 @@ class TestDynamicsMStepReuse:
             continuous_transition_matrix,
             process_cov,
             dt,
-            log_intensity_func,
+            linear_log_intensity,
+            spike_params,
         )
 
         (
@@ -3202,6 +3379,34 @@ class TestSwitchingSpikeOscillatorModelInit:
                 sampling_freq=100.0,
                 dt=0.01,
                 discrete_transition_diag=jnp.array([0.9, 0.95]),  # Wrong shape
+            )
+
+    def test_init_invalid_discrete_transition_diag_values_raises_error(self) -> None:
+        """Model should raise ValueError for discrete_transition_diag values outside [0, 1]."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        # Test value > 1
+        with pytest.raises(ValueError, match="discrete_transition_diag values must be probabilities"):
+            SwitchingSpikeOscillatorModel(
+                n_oscillators=2,
+                n_neurons=5,
+                n_discrete_states=2,
+                sampling_freq=100.0,
+                dt=0.01,
+                discrete_transition_diag=jnp.array([0.9, 1.5]),  # Invalid: > 1
+            )
+
+        # Test value < 0
+        with pytest.raises(ValueError, match="discrete_transition_diag values must be probabilities"):
+            SwitchingSpikeOscillatorModel(
+                n_oscillators=2,
+                n_neurons=5,
+                n_discrete_states=2,
+                sampling_freq=100.0,
+                dt=0.01,
+                discrete_transition_diag=jnp.array([-0.1, 0.9]),  # Invalid: < 0
             )
 
 
@@ -5696,6 +5901,61 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
             assert jnp.all(eigenvalues >= -1e-8), (
                 f"After fit: Q for state {j} is not PSD"
             )
+
+    def test_project_parameters_respects_update_flags(self) -> None:
+        """_project_parameters() should not modify parameters when update flags are False."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        # Create model with update flags disabled
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            update_continuous_transition_matrix=False,
+            update_process_cov=False,
+        )
+
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        # Store original values
+        original_A = model.continuous_transition_matrix.copy()
+        original_Q = model.process_cov.copy()
+
+        # Perturb parameters slightly (simulating what might happen in M-step)
+        perturbation_A = jax.random.normal(
+            jax.random.PRNGKey(1), model.continuous_transition_matrix.shape
+        ) * 0.05
+        model.continuous_transition_matrix = (
+            model.continuous_transition_matrix + perturbation_A
+        )
+
+        # Make Q slightly non-symmetric
+        for j in range(model.n_discrete_states):
+            Q_j = model.process_cov[:, :, j]
+            perturbation_Q = jnp.triu(
+                jax.random.normal(jax.random.PRNGKey(2 + j), Q_j.shape) * 0.01, k=1
+            )
+            model.process_cov = model.process_cov.at[:, :, j].set(Q_j + perturbation_Q)
+
+        perturbed_A = model.continuous_transition_matrix.copy()
+        perturbed_Q = model.process_cov.copy()
+
+        # Call _project_parameters - should NOT modify anything since flags are False
+        model._project_parameters()
+
+        # Parameters should remain unchanged (perturbed values preserved)
+        np.testing.assert_array_equal(
+            model.continuous_transition_matrix, perturbed_A,
+            err_msg="A was modified despite update_continuous_transition_matrix=False"
+        )
+        np.testing.assert_array_equal(
+            model.process_cov, perturbed_Q,
+            err_msg="Q was modified despite update_process_cov=False"
+        )
 
 
 class TestSwitchingSpikeOscillatorModelEndToEnd:

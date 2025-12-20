@@ -226,6 +226,151 @@ def _scale_likelihood(log_likelihood: jax.Array) -> tuple[jax.Array, jax.Array]:
     return jnp.exp(log_likelihood - ll_max), ll_max
 
 
+def _kalman_measurement_update_only(
+    prior_mean: jax.Array,
+    prior_cov: jax.Array,
+    obs: jax.Array,
+    measurement_matrix: jax.Array,
+    measurement_cov: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Kalman measurement update without prediction step.
+
+    Used for the first timestep in the x₁ convention where init_state represents
+    the prior for x₁ directly (no dynamics prediction needed).
+
+    Parameters
+    ----------
+    prior_mean : jax.Array, shape (n_cont_states,)
+        Prior state mean p(x₁ | S₁)
+    prior_cov : jax.Array, shape (n_cont_states, n_cont_states)
+        Prior state covariance
+    obs : jax.Array, shape (n_obs_dim,)
+        Observation y₁
+    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
+        Observation matrix H
+    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
+        Observation noise covariance R
+
+    Returns
+    -------
+    posterior_mean : jax.Array, shape (n_cont_states,)
+        Posterior state mean p(x₁ | y₁, S₁)
+    posterior_cov : jax.Array, shape (n_cont_states, n_cont_states)
+        Posterior state covariance
+    marginal_log_likelihood : jax.Array
+        Log p(y₁ | S₁) (scalar array)
+    """
+    # Measurement update (no prediction step)
+    obs_mean = measurement_matrix @ prior_mean
+    obs_cov = symmetrize(
+        measurement_matrix @ prior_cov @ measurement_matrix.T + measurement_cov
+    )
+
+    residual_error = obs - obs_mean
+    kalman_gain = psd_solve(obs_cov, measurement_matrix @ prior_cov).T
+
+    posterior_mean = prior_mean + kalman_gain @ residual_error
+
+    # Joseph form covariance update for numerical stability
+    n_cont = prior_mean.shape[0]
+    I_KH = jnp.eye(n_cont) - kalman_gain @ measurement_matrix
+    posterior_cov = symmetrize(
+        I_KH @ prior_cov @ I_KH.T + kalman_gain @ (measurement_cov @ kalman_gain.T)
+    )
+
+    marginal_log_likelihood = jnp.asarray(
+        jax.scipy.stats.multivariate_normal.logpdf(x=obs, mean=obs_mean, cov=obs_cov)
+    )
+
+    return posterior_mean, posterior_cov, marginal_log_likelihood
+
+
+def _first_timestep_kalman_update(
+    init_state_cond_mean: jax.Array,
+    init_state_cond_cov: jax.Array,
+    init_discrete_state_prob: jax.Array,
+    obs_t: jax.Array,
+    measurement_matrix: jax.Array,
+    measurement_cov: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Handle first timestep with x₁ convention (measurement update only).
+
+    For the first observation y₁, we treat init_state_cond_mean/cov as p(x₁ | S₁)
+    and apply only the measurement update (no dynamics prediction). This aligns
+    with the EM M-step which sets init_state from smoother_means[0] = x₁|T.
+
+    Parameters
+    ----------
+    init_state_cond_mean : jax.Array, shape (n_cont_states, n_discrete_states)
+        Prior belief about x₁ given S₁, p(x₁ | S₁)
+    init_state_cond_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
+        Prior covariance of x₁ given S₁
+    init_discrete_state_prob : jax.Array, shape (n_discrete_states,)
+        Prior probability p(S₁)
+    obs_t : jax.Array, shape (n_obs_dim,)
+        Observation at first timestep y₁
+    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states, n_discrete_states)
+        Observation matrices H_j for each discrete state
+    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim, n_discrete_states)
+        Observation noise covariances R_j for each discrete state
+
+    Returns
+    -------
+    state_cond_filter_mean : jax.Array, shape (n_cont_states, n_discrete_states)
+        Posterior state-conditional means p(x₁ | y₁, S₁=j)
+    state_cond_filter_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
+        Posterior state-conditional covariances
+    filter_discrete_prob : jax.Array, shape (n_discrete_states,)
+        Posterior discrete state probabilities p(S₁ | y₁)
+    pair_cond_filter_mean : jax.Array, shape (n_cont_states, n_discrete_states, n_discrete_states)
+        For compatibility with smoother (diagonal structure at t=1)
+    marginal_log_likelihood : jax.Array
+        Log p(y₁) contribution (scalar array)
+    """
+    n_discrete_states = init_state_cond_mean.shape[-1]
+
+    # Apply measurement update for each discrete state (no dynamics prediction)
+    # vmap over discrete states j
+    vmapped_update = jax.vmap(
+        _kalman_measurement_update_only,
+        in_axes=(-1, -1, None, -1, -1),
+        out_axes=(-1, -1, -1),
+    )
+    state_cond_filter_mean, state_cond_filter_cov, state_cond_log_lik = vmapped_update(
+        init_state_cond_mean,
+        init_state_cond_cov,
+        obs_t,
+        measurement_matrix,
+        measurement_cov,
+    )
+
+    # Update discrete state probabilities using observation likelihood
+    # At t=1, there's no transition from S₀, so we just use:
+    # p(S₁=j | y₁) ∝ p(y₁ | S₁=j) * p(S₁=j)
+    scaled_lik, ll_max = _scale_likelihood(state_cond_log_lik)
+    unnorm_prob = scaled_lik * init_discrete_state_prob
+    norm_const = jnp.sum(unnorm_prob)
+    filter_discrete_prob = _divide_safe(unnorm_prob, norm_const)
+
+    # Marginal log-likelihood contribution
+    marginal_log_likelihood = ll_max + jnp.log(norm_const)
+
+    # For smoother compatibility: create pair_cond_filter_mean
+    # At t=1, there's no S₀, so we create a diagonal structure
+    pair_cond_filter_mean = jnp.broadcast_to(
+        state_cond_filter_mean[:, None, :],
+        (state_cond_filter_mean.shape[0], n_discrete_states, n_discrete_states),
+    )
+
+    return (
+        state_cond_filter_mean,
+        state_cond_filter_cov,
+        filter_discrete_prob,
+        pair_cond_filter_mean,
+        marginal_log_likelihood,
+    )
+
+
 def switching_kalman_filter(
     init_state_cond_mean: jax.Array,
     init_state_cond_cov: jax.Array,
@@ -245,14 +390,24 @@ def switching_kalman_filter(
 ]:
     """Switching Kalman filter for a linear Gaussian state space model with discrete states.
 
+    This filter uses the x₁ convention where init parameters represent the state
+    at the first observation time (not before it). For the first observation y₁,
+    only a measurement update is applied (no dynamics prediction). For subsequent
+    observations y_t (t > 1), the standard predict-then-update cycle is used.
+
+    This convention ensures consistency with the EM M-step, which sets
+    init_state_cond_mean = smoother_means[0] = x₁|T.
+
     Parameters
     ----------
     init_state_cond_mean : jax.Array, shape (n_cont_states, n_discrete_states)
-        Initial value of the continuous latent state $x_1$
+        Prior belief about x₁ given S₁, p(x₁ | S₁ = j) for each discrete state.
+        This is the prior on the latent state *at* the first observation, before
+        incorporating y₁.
     init_state_cond_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-        Initial covariance of the continuous latent state $P_1$
+        Prior covariance of x₁ given S₁ for each discrete state.
     init_discrete_state_prob : jax.Array, shape (n_discrete_states,)
-        Initial probability of the discrete states $p(S_1)$
+        Prior discrete state probabilities p(S₁ = j).
     obs : jax.Array, shape (n_time, n_obs_dim)
         Observations $y_{1:T}$
     discrete_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
@@ -388,21 +543,53 @@ def switching_kalman_filter(
             pair_cond_filter_mean,
         )
 
-    marginal_log_likelihood = jnp.array(0.0)
+    # Handle first timestep with x₁ convention: measurement update only (no dynamics)
+    # init_state_cond_mean represents p(x₁ | S₁), the prior for the first observation
+    (
+        first_state_cond_mean,
+        first_state_cond_cov,
+        first_discrete_prob,
+        first_pair_cond_mean,
+        first_log_lik,
+    ) = _first_timestep_kalman_update(
+        init_state_cond_mean,
+        init_state_cond_cov,
+        init_discrete_state_prob,
+        obs[0],
+        measurement_matrix,
+        measurement_cov,
+    )
+
+    # Run predict-then-update for t=2,...,T
+    # jax.lax.scan handles empty inputs (obs[1:] when n_time=1) gracefully
     (_, _, _, marginal_log_likelihood), (
-        state_cond_filter_mean,
-        state_cond_filter_cov,
-        filter_discrete_state_prob,
-        pair_cond_filter_mean,
+        rest_state_cond_filter_mean,
+        rest_state_cond_filter_cov,
+        rest_filter_discrete_state_prob,
+        rest_pair_cond_filter_mean,
     ) = jax.lax.scan(
         _step,
         (
-            init_state_cond_mean,
-            init_state_cond_cov,
-            init_discrete_state_prob,
-            marginal_log_likelihood,
+            first_state_cond_mean,
+            first_state_cond_cov,
+            first_discrete_prob,
+            first_log_lik,
         ),
-        obs,
+        obs[1:],
+    )
+
+    # Prepend first timestep results
+    state_cond_filter_mean = jnp.concatenate(
+        [first_state_cond_mean[None, ...], rest_state_cond_filter_mean], axis=0
+    )
+    state_cond_filter_cov = jnp.concatenate(
+        [first_state_cond_cov[None, ...], rest_state_cond_filter_cov], axis=0
+    )
+    filter_discrete_state_prob = jnp.concatenate(
+        [first_discrete_prob[None, ...], rest_filter_discrete_state_prob], axis=0
+    )
+    pair_cond_filter_mean = jnp.concatenate(
+        [first_pair_cond_mean[None, ...], rest_pair_cond_filter_mean], axis=0
     )
 
     return (
@@ -920,7 +1107,12 @@ def switching_kalman_maximization_step(
         gamma2, continuous_transition_matrix, beta, n_time_1
     )
 
-    # Initial mean and covariance
+    # Initial mean and covariance (x₁ convention)
+    # init_state_cond_mean represents p(x₁ | S₁), the prior for the first observation.
+    # smoother_means[0] = x₁|T, which is the smoothed estimate of x at the first
+    # observation time. This aligns with the filter's x₁ convention where
+    # init_state is the prior for the first observation (measurement update only,
+    # no dynamics prediction for y₁).
     init_state_cond_mean = state_cond_smoother_means[0]
     init_state_cond_cov = state_cond_smoother_covs[0]
 

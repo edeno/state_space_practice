@@ -95,6 +95,7 @@ from state_space_practice.oscillator_utils import (
 )
 from state_space_practice.point_process_kalman import _point_process_laplace_update
 from state_space_practice.switching_kalman import (
+    _divide_safe,
     _scale_likelihood,
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture_per_discrete_state,
@@ -129,16 +130,60 @@ class SpikeObsParams:
     baseline: Array
     weights: Array
 
+    def tree_flatten(self):
+        """Flatten for JAX pytree registration."""
+        return (self.baseline, self.weights), None
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        """Unflatten for JAX pytree registration."""
+        baseline, weights = children
+        return cls(baseline=baseline, weights=weights)
+
+
+# Register SpikeObsParams as a JAX pytree so it can be traced through jit
+jax.tree_util.register_pytree_node(
+    SpikeObsParams,
+    SpikeObsParams.tree_flatten,
+    SpikeObsParams.tree_unflatten,
+)
+
+
+@dataclass
+class QRegularizationConfig:
+    """Configuration for trust-region regularization of process covariances.
+
+    Parameters
+    ----------
+    trust_region_weight : float
+        Blend factor for new Q estimate: Q = w * new_Q + (1 - w) * old_Q.
+    min_eigenvalue : float | None
+        Lower bound for eigenvalues. None disables lower clipping.
+    max_eigenvalue : float | None
+        Upper bound for eigenvalues. None disables upper clipping.
+    enabled : bool
+        Whether to apply trust-region regularization and eigenvalue clipping.
+    """
+
+    trust_region_weight: float = 0.1
+    min_eigenvalue: float | None = 1e-8
+    max_eigenvalue: float | None = None
+    enabled: bool = True
+
 
 def point_process_kalman_update(
     one_step_mean: Array,
     one_step_cov: Array,
     y_t: Array,
     dt: float,
-    log_intensity_func: Callable[[Array], Array],
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
     diagonal_boost: float = 1e-9,
-    grad_log_intensity_func: Callable[[Array], Array] | None = None,
-    hess_log_intensity_func: Callable[[Array], Array] | None = None,
+    grad_log_intensity_func: Callable[[Array, SpikeObsParams], Array] | None = None,
+    hess_log_intensity_func: Callable[[Array, SpikeObsParams], Array] | None = None,
+    include_laplace_normalization: bool = True,
+    max_newton_iter: int = 1,
+    line_search_beta: float = 0.5,
 ) -> tuple[Array, Array, Array]:
     """Single point-process Laplace-EKF update for multiple neurons.
 
@@ -146,7 +191,7 @@ def point_process_kalman_update(
     spike counts, using a Laplace (Gaussian) approximation to the posterior.
 
     The observation model is:
-        y_n ~ Poisson(exp(log_intensity_func(x)[n]) * dt)
+        y_n ~ Poisson(exp(log_intensity_func(x, spike_params)[n]) * dt)
 
     The update uses a single Newton-Raphson step from the prior mean to
     approximate the posterior.
@@ -161,20 +206,28 @@ def point_process_kalman_update(
         Spike counts at time t for all neurons
     dt : float
         Time bin width in seconds
-    log_intensity_func : Callable[[Array], Array]
-        Function mapping state (n_latent,) to log-intensities (n_neurons,).
+    log_intensity_func : Callable[[Array, SpikeObsParams], Array]
+        Function mapping (state, params) to log-intensities (n_neurons,).
         Should return log(lambda) where lambda is firing rate in Hz.
+        The function takes state (n_latent,) and spike_params as arguments.
+    spike_params : SpikeObsParams
+        Spike observation parameters (baseline, weights). Passed as data to
+        log_intensity_func, allowing JIT compilation without closure issues.
     diagonal_boost : float, default=1e-9
         Small value added to precision matrix diagonal for numerical stability
         when solving linear systems.
-    grad_log_intensity_func : Callable[[Array], Array] | None, optional
-        Pre-computed gradient function (Jacobian) of log_intensity_func.
-        If None, computed via jax.jacfwd(log_intensity_func).
+    grad_log_intensity_func : Callable[[Array, SpikeObsParams], Array] | None, optional
+        Pre-computed gradient function (Jacobian) of log_intensity_func w.r.t. state.
+        If None, computed via jax.jacfwd(log_intensity_func, argnums=0).
         Passing pre-computed functions can improve compilation speed when
         this function is called repeatedly inside a JIT-compiled context.
-    hess_log_intensity_func : Callable[[Array], Array] | None, optional
-        Pre-computed Hessian function of log_intensity_func.
+    hess_log_intensity_func : Callable[[Array, SpikeObsParams], Array] | None, optional
+        Pre-computed Hessian function of log_intensity_func w.r.t. state.
         If None, computed via jax.jacfwd of the gradient function.
+    include_laplace_normalization : bool, default=True
+        If True, include the Laplace normalization and prior terms to approximate
+        log p(y_t | y_{1:t-1}). If False, return the plug-in log-likelihood
+        at the posterior mode without normalization.
 
     Returns
     -------
@@ -191,8 +244,9 @@ def point_process_kalman_update(
     for a single Newton step update. For multiple neurons, the gradients and
     Hessians are summed across neurons.
 
-    The log-likelihood is computed as the sum of Poisson log-pmfs evaluated
-    at the expected intensity (using the predicted mean).
+    The log-likelihood is evaluated at the approximate posterior mode. When
+    ``include_laplace_normalization`` is True, prior and normalization terms
+    are added to approximate the marginal likelihood.
 
     References
     ----------
@@ -200,16 +254,35 @@ def point_process_kalman_update(
         Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
         Neural Computation 16, 971-998.
     """
+    # Create a closure-free wrapper for the shared helper
+    # This binds spike_params so _point_process_laplace_update sees Callable[[Array], Array]
+    def _log_intensity_with_params(state: Array) -> Array:
+        return log_intensity_func(state, spike_params)
+
+    # Wrap grad/hess functions if provided
+    _grad_func = None
+    if grad_log_intensity_func is not None:
+        def _grad_func(state: Array) -> Array:
+            return grad_log_intensity_func(state, spike_params)
+
+    _hess_func = None
+    if hess_log_intensity_func is not None:
+        def _hess_func(state: Array) -> Array:
+            return hess_log_intensity_func(state, spike_params)
+
     # Delegate to the shared helper in point_process_kalman.py
     return _point_process_laplace_update(
         one_step_mean=one_step_mean,
         one_step_cov=one_step_cov,
         spike_indicator_t=y_t,
         dt=dt,
-        log_intensity_func=log_intensity_func,
+        log_intensity_func=_log_intensity_with_params,
         diagonal_boost=diagonal_boost,
-        grad_log_intensity_func=grad_log_intensity_func,
-        hess_log_intensity_func=hess_log_intensity_func,
+        grad_log_intensity_func=_grad_func,
+        hess_log_intensity_func=_hess_func,
+        include_laplace_normalization=include_laplace_normalization,
+        max_newton_iter=max_newton_iter,
+        line_search_beta=line_search_beta,
     )
 
 
@@ -220,7 +293,11 @@ def _point_process_predict_and_update(
     continuous_transition_matrix: Array,
     process_cov: Array,
     dt: float,
-    log_intensity_func: Callable[[Array], Array],
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
+    include_laplace_normalization: bool = True,
+    max_newton_iter: int = 1,
+    line_search_beta: float = 0.5,
 ) -> tuple[Array, Array, Array]:
     """Predict with dynamics, then update with spike observations.
 
@@ -245,8 +322,10 @@ def _point_process_predict_and_update(
         Process noise covariance for discrete state j: Q_j
     dt : float
         Time bin width in seconds
-    log_intensity_func : Callable[[Array], Array]
-        Function mapping state (n_latent,) to log-intensities (n_neurons,).
+    log_intensity_func : Callable[[Array, SpikeObsParams], Array]
+        Function mapping (state, params) to log-intensities (n_neurons,).
+    spike_params : SpikeObsParams
+        Spike observation parameters (baseline, weights).
 
     Returns
     -------
@@ -269,7 +348,15 @@ def _point_process_predict_and_update(
 
     # Point-process Laplace update
     return point_process_kalman_update(
-        one_step_mean, one_step_cov, y_t, dt, log_intensity_func
+        one_step_mean,
+        one_step_cov,
+        y_t,
+        dt,
+        log_intensity_func,
+        spike_params,
+        include_laplace_normalization=include_laplace_normalization,
+        max_newton_iter=max_newton_iter,
+        line_search_beta=line_search_beta,
     )
 
 
@@ -280,7 +367,11 @@ def _point_process_update_per_discrete_state_pair(
     continuous_transition_matrix: Array,
     process_cov: Array,
     dt: float,
-    log_intensity_func: Callable[[Array], Array],
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
+    include_laplace_normalization: bool = True,
+    max_newton_iter: int = 1,
+    line_search_beta: float = 0.5,
 ) -> tuple[Array, Array, Array]:
     """Compute pair-conditional posteriors for all (i, j) state pairs.
 
@@ -305,8 +396,10 @@ def _point_process_update_per_discrete_state_pair(
         Process noise covariances, one per discrete state j
     dt : float
         Time bin width in seconds
-    log_intensity_func : Callable[[Array], Array]
-        Function mapping state (n_latent,) to log-intensities (n_neurons,).
+    log_intensity_func : Callable[[Array, SpikeObsParams], Array]
+        Function mapping (state, params) to log-intensities (n_neurons,).
+    spike_params : SpikeObsParams
+        Spike observation parameters (baseline, weights).
 
     Returns
     -------
@@ -321,10 +414,20 @@ def _point_process_update_per_discrete_state_pair(
     """
 
     # Create a version of predict_and_update that only takes array arguments
-    # (log_intensity_func and dt are captured in the closure)
+    # (log_intensity_func, spike_params, dt are captured in the closure for vmap)
     def _update(prev_mean, prev_cov, A, Q):
         return _point_process_predict_and_update(
-            prev_mean, prev_cov, y_t, A, Q, dt, log_intensity_func
+            prev_mean,
+            prev_cov,
+            y_t,
+            A,
+            Q,
+            dt,
+            log_intensity_func,
+            spike_params,
+            include_laplace_normalization,
+            max_newton_iter,
+            line_search_beta,
         )
 
     # Double vmap:
@@ -347,6 +450,109 @@ def _point_process_update_per_discrete_state_pair(
         process_cov,
     )
     return result
+
+
+def _first_timestep_point_process_update(
+    init_state_cond_mean: Array,
+    init_state_cond_cov: Array,
+    init_discrete_state_prob: Array,
+    y_t: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
+    include_laplace_normalization: bool = True,
+    max_newton_iter: int = 1,
+    line_search_beta: float = 0.5,
+) -> tuple[Array, Array, Array, Array, Array]:
+    """Handle first timestep with x₁ convention (update only, no prediction).
+
+    For the first observation y₁, we treat init_state_cond_mean/cov as p(x₁ | S₁)
+    and apply only the observation update (no dynamics prediction). This aligns
+    with the EM M-step which sets init_state from smoother_means[0] = x₁|T.
+
+    Parameters
+    ----------
+    init_state_cond_mean : Array, shape (n_latent, n_discrete_states)
+        Prior belief about x₁ given S₁, p(x₁ | S₁)
+    init_state_cond_cov : Array, shape (n_latent, n_latent, n_discrete_states)
+        Prior covariance of x₁ given S₁
+    init_discrete_state_prob : Array, shape (n_discrete_states,)
+        Prior probability p(S₁)
+    y_t : Array, shape (n_neurons,)
+        Spike counts at first timestep
+    dt : float
+        Time bin width in seconds
+    log_intensity_func : Callable[[Array, SpikeObsParams], Array]
+        Function mapping (state, params) to log-intensities (n_neurons,).
+    spike_params : SpikeObsParams
+        Spike observation parameters (baseline, weights).
+    include_laplace_normalization : bool, default=True
+        If True, include Laplace normalization terms in log-likelihood
+
+    Returns
+    -------
+    state_cond_filter_mean : Array, shape (n_latent, n_discrete_states)
+        Posterior state-conditional means p(x₁ | y₁, S₁=j)
+    state_cond_filter_cov : Array, shape (n_latent, n_latent, n_discrete_states)
+        Posterior state-conditional covariances
+    filter_discrete_prob : Array, shape (n_discrete_states,)
+        Posterior discrete state probabilities p(S₁ | y₁)
+    pair_cond_filter_mean : Array, shape (n_latent, n_discrete_states, n_discrete_states)
+        For compatibility with smoother, diagonal in first two dims
+        (no pair-conditioning at t=1 since there's no S₀)
+    marginal_log_likelihood : Array
+        Log p(y₁) contribution (scalar array)
+    """
+    n_discrete_states = init_state_cond_mean.shape[-1]
+
+    # Apply point-process update directly to the prior (no dynamics prediction)
+    # vmap over discrete states j (spike_params captured in closure for vmap)
+    def _update_for_state_j(prior_mean, prior_cov):
+        return point_process_kalman_update(
+            one_step_mean=prior_mean,  # Use prior directly, no A @ x prediction
+            one_step_cov=prior_cov,
+            y_t=y_t,
+            dt=dt,
+            log_intensity_func=log_intensity_func,
+            spike_params=spike_params,
+            include_laplace_normalization=include_laplace_normalization,
+            max_newton_iter=max_newton_iter,
+            line_search_beta=line_search_beta,
+        )
+
+    # vmap over discrete states
+    vmapped_update = jax.vmap(_update_for_state_j, in_axes=(-1, -1), out_axes=(-1, -1, -1))
+    state_cond_filter_mean, state_cond_filter_cov, state_cond_log_lik = vmapped_update(
+        init_state_cond_mean, init_state_cond_cov
+    )
+
+    # Update discrete state probabilities using observation likelihood
+    # At t=1, there's no transition from S₀, so we just use:
+    # p(S₁=j | y₁) ∝ p(y₁ | S₁=j) * p(S₁=j)
+    scaled_lik, ll_max = _scale_likelihood(state_cond_log_lik)
+    unnorm_prob = scaled_lik * init_discrete_state_prob
+    norm_const = jnp.sum(unnorm_prob)
+    filter_discrete_prob = _divide_safe(unnorm_prob, norm_const)
+
+    # Marginal log-likelihood contribution
+    marginal_log_likelihood = ll_max + jnp.log(norm_const)
+
+    # For smoother compatibility: create pair_cond_filter_mean
+    # At t=1, there's no S₀, so we create a diagonal structure where
+    # pair_cond_mean[:, i, j] = state_cond_mean[:, j] for all i
+    # This ensures the smoother sees the right structure
+    pair_cond_filter_mean = jnp.broadcast_to(
+        state_cond_filter_mean[:, None, :],
+        (state_cond_filter_mean.shape[0], n_discrete_states, n_discrete_states),
+    )
+
+    return (
+        state_cond_filter_mean,
+        state_cond_filter_cov,
+        filter_discrete_prob,
+        pair_cond_filter_mean,
+        marginal_log_likelihood,
+    )
 
 
 def _armijo_line_search(
@@ -599,6 +805,70 @@ def _single_neuron_glm_step(
     return new_baseline, new_weights
 
 
+def _neg_Q_single_neuron(
+    params: Array,
+    y_n: Array,
+    smoother_mean: Array,
+    smoother_cov: Array | None,
+    dt: float,
+    weight_l2: float,
+) -> Array:
+    """Negative expected log-likelihood for one neuron's Poisson GLM.
+
+    This implements the exact latent-marginalized Q-function for the EM M-step:
+
+        Q(b, w) = sum_t [y_t * (b + w^T m_t) - dt * E[exp(b + w^T x_t)]]
+                  - 0.5 * lambda * ||w||^2
+
+    Using the Gaussian moment generating function:
+        E[exp(w^T x_t)] = exp(w^T m_t + 0.5 * w^T P_t w)
+
+    Parameters
+    ----------
+    params : Array, shape (1 + n_latent,)
+        Concatenated parameters [baseline, weights...].
+    y_n : Array, shape (n_time,)
+        Spike counts for one neuron.
+    smoother_mean : Array, shape (n_time, n_latent)
+        Smoothed latent means m_t.
+    smoother_cov : Array or None, shape (n_time, n_latent, n_latent)
+        Smoothed latent covariances P_t. If None, uses first-order
+        approximation (ignores state uncertainty).
+    dt : float
+        Bin width in seconds.
+    weight_l2 : float
+        L2 penalty coefficient for the weights.
+
+    Returns
+    -------
+    loss : Array, shape ()
+        Negative expected log-likelihood plus L2 penalty.
+    """
+    b = params[0]
+    w = params[1:]
+
+    # Linear term: w^T m_t for each t, shape (n_time,)
+    eta_lin = smoother_mean @ w
+
+    if smoother_cov is None:
+        # First-order approximation: ignore latent uncertainty
+        quad = jnp.zeros(smoother_mean.shape[0])
+    else:
+        # Second-order: 0.5 * w^T P_t w for each t
+        quad = 0.5 * jnp.einsum("tij,i,j->t", smoother_cov, w, w)
+
+    # Full log-intensity expectation: b + w^T m_t + 0.5 * w^T P_t w
+    eta = b + eta_lin + quad  # (n_time,)
+    mu = jnp.exp(eta) * dt  # expected counts, (n_time,)
+
+    # Negative Q: sum(mu - y * (b + w^T m_t)) + 0.5 * lambda * ||w||^2
+    # Note: the y_t term only uses (b + w^T m_t), not the variance correction
+    nll = jnp.sum(mu - y_n * (b + eta_lin))
+    l2 = 0.5 * weight_l2 * jnp.sum(w**2)
+
+    return nll + l2
+
+
 def _single_neuron_glm_step_second_order(
     baseline: Array,
     weights: Array,
@@ -608,18 +878,21 @@ def _single_neuron_glm_step_second_order(
     dt: float,
     weight_l2: float = 0.0,
 ) -> tuple[Array, Array]:
-    """Single Newton step for Poisson GLM with second-order expectation.
+    """Single Newton step for Poisson GLM with exact second-order expectation.
 
-    Uses the second-order approximation that accounts for state uncertainty:
-        E[exp(c @ x)] = exp(c @ m + 0.5 * c @ P @ c)
+    Uses JAX autodiff to compute exact gradient and Hessian of the
+    latent-marginalized Q-function. This accounts for state uncertainty via:
+        E[exp(w^T x)] = exp(w^T m + 0.5 * w^T P w)
 
-    This gives more accurate parameter estimates when the smoother
-    covariance is significant.
+    The Hessian includes all terms, specifically:
+        H_ww = -sum_t mu_t * [(m_t + P_t w)(m_t + P_t w)^T + P_t] - lambda * I
+
+    which was previously approximated by dropping the sum_t mu_t P_t term.
 
     Parameters
     ----------
     baseline : Array, shape ()
-        Current baseline log-rate for the neuron (0-D array).
+        Current baseline log-rate for the neuron.
     weights : Array, shape (n_latent,)
         Current linear weights mapping latent state to log-rate.
     y_n : Array, shape (n_time,)
@@ -632,109 +905,38 @@ def _single_neuron_glm_step_second_order(
         Time bin width in seconds.
     weight_l2 : float, default=0.0
         L2 regularization strength on the weights (not baseline).
-        Adds 0.5 * weight_l2 * ||weights||^2 to the objective.
 
     Returns
     -------
     new_baseline : Array, shape ()
-        Updated baseline after Newton step (0-D array).
+        Updated baseline after Newton step.
     new_weights : Array, shape (n_latent,)
         Updated weights after Newton step.
     """
     n_latent = weights.shape[0]
-    n_time = smoother_mean.shape[0]
-
-    # Build design matrix with intercept: [1, smoother_mean]
-    ones = jnp.ones((n_time, 1))
-    design_matrix = jnp.concatenate([ones, smoother_mean], axis=1)
-
-    # Concatenate parameters
     params = jnp.concatenate([jnp.atleast_1d(baseline), weights])
 
-    # Compute variance correction: 0.5 * c @ P_t @ c for each timestep
-    # This is a quadratic form: 0.5 * weights @ P_t @ weights
-    def compute_variance_correction(P_t):
-        return 0.5 * weights @ P_t @ weights
+    def loss_fn(p: Array) -> Array:
+        return _neg_Q_single_neuron(
+            p, y_n, smoother_mean, smoother_cov, dt, weight_l2
+        )
 
-    variance_corrections = jax.vmap(compute_variance_correction)(smoother_cov)
+    # Compute exact gradient and Hessian via JAX autodiff
+    grad = jax.grad(loss_fn)(params)
+    hess = jax.hessian(loss_fn)(params)
 
-    # Compute linear predictor with variance correction
-    eta = design_matrix @ params + variance_corrections  # (n_time,)
-    mu = jnp.exp(eta) * dt  # Expected spike counts with second-order correction
-
-    # For the gradient w.r.t. baseline, the variance correction doesn't depend on it
-    # For the gradient w.r.t. weights, we need d/dc [c @ m + 0.5 * c @ P @ c]
-    #   = m + P @ c
-
-    # The gradient of the expected log-likelihood term exp(eta) w.r.t params is:
-    # d/d_params [sum_t mu_t] = sum_t mu_t * d_eta/d_params
-    #
-    # For the weights component, d_eta/dc = m_t + P_t @ c
-    # For the baseline, d_eta/db = 1
-    #
-    # So we need an "effective design matrix" that accounts for the variance term
-
-    # Effective design matrix for second-order method
-    # Column 0: ones (for baseline)
-    # Columns 1+: m_t + P_t @ weights (for weights)
-    def compute_effective_design_row(m_t, P_t):
-        effective_latent = m_t + P_t @ weights
-        return jnp.concatenate([jnp.ones(1), effective_latent])
-
-    effective_design = jax.vmap(compute_effective_design_row)(
-        smoother_mean, smoother_cov
-    )
-
-    # Gradient: -X_eff.T @ (y - mu) + L2 penalty gradient
-    residual = y_n - mu
-    gradient = -effective_design.T @ residual
-
-    # Add L2 penalty gradient: weight_l2 * [0, weights]
-    l2_grad = jnp.concatenate([jnp.zeros(1), weight_l2 * weights])
-    gradient = gradient + l2_grad
-
-    # Hessian: For Poisson GLM, the Hessian also involves second derivatives
-    # of the variance correction term. For simplicity, we use:
-    # H ≈ X_eff.T @ diag(mu) @ X_eff
-    # This is a good approximation when the variance correction is small
-    weighted_design = effective_design * mu[:, None]
-    hessian = effective_design.T @ weighted_design
-
-    # Add L2 penalty to Hessian: weight_l2 * diag([0, 1, 1, ...])
-    l2_hess_diag = jnp.concatenate([jnp.zeros(1), jnp.ones(n_latent) * weight_l2])
-    hessian = hessian + jnp.diag(l2_hess_diag)
-
-    # Regularization for numerical stability
-    reg = 1e-6 * jnp.eye(1 + n_latent)
-    hessian = hessian + reg
+    # Regularize Hessian for numerical stability
+    ridge = 1e-6
+    hess_reg = hess + ridge * jnp.eye(1 + n_latent)
 
     # Newton direction
-    delta = jnp.linalg.solve(hessian, gradient)
-
-    # Current loss for backtracking (NLL + L2 penalty)
-    current_loss = (
-        jnp.sum(mu - y_n * (design_matrix @ params + variance_corrections))
-        + 0.5 * weight_l2 * jnp.sum(weights**2)
-    )
-
-    # Define loss function for line search (includes variance correction recomputation)
-    def loss_fn(p):
-        new_weights_trial = p[1:]
-
-        # Recompute variance corrections with new weights
-        def compute_var_corr_trial(P_t):
-            return 0.5 * new_weights_trial @ P_t @ new_weights_trial
-
-        var_corr_trial = jax.vmap(compute_var_corr_trial)(smoother_cov)
-
-        eta_trial = design_matrix @ p + var_corr_trial
-        mu_trial = jnp.exp(eta_trial) * dt
-        nll = jnp.sum(mu_trial - y_n * (design_matrix @ p + var_corr_trial))
-        l2_penalty = 0.5 * weight_l2 * jnp.sum(new_weights_trial**2)
-        return nll + l2_penalty
+    delta = jnp.linalg.solve(hess_reg, grad)
 
     # Backtracking line search with Armijo condition
-    final_alpha = _armijo_line_search(params, delta, gradient, loss_fn, current_loss)
+    current_loss = loss_fn(params)
+    final_alpha = _armijo_line_search(
+        params, delta, grad, loss_fn, current_loss
+    )
 
     new_params = params - final_alpha * delta
     new_baseline = new_params[0]
@@ -886,7 +1088,11 @@ def switching_point_process_filter(
     continuous_transition_matrix: Array,
     process_cov: Array,
     dt: float,
-    log_intensity_func: Callable[[Array], Array],
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
+    include_laplace_normalization: bool = True,
+    max_newton_iter: int = 1,
+    line_search_beta: float = 0.5,
 ) -> tuple[Array, Array, Array, Array, Array]:
     """Switching point-process Kalman filter for spike observations.
 
@@ -897,18 +1103,21 @@ def switching_point_process_filter(
 
     The model is:
         x_t = A_{s_t} @ x_{t-1} + w_t,  w_t ~ N(0, Q_{s_t})
-        y_{n,t} ~ Poisson(exp(log_intensity_func(x_t)[n]) * dt)
+        y_{n,t} ~ Poisson(exp(log_intensity_func(x_t, spike_params)[n]) * dt)
 
     Parameters
     ----------
     init_state_cond_mean : Array, shape (n_latent, n_discrete_states)
-        Initial state-conditional means p(x_0 | S_0 = j) for each discrete state.
+        Prior belief about x₁ given S₁, p(x₁ | S₁ = j) for each discrete state.
+        This is the prior on the latent state *at* the first observation, before
+        incorporating y₁. See "Time Indexing Convention" in Notes for details.
     init_state_cond_cov : Array, shape (n_latent, n_latent, n_discrete_states)
-        Initial state-conditional covariances for each discrete state.
+        Prior covariances of x₁ given S₁ for each discrete state.
     init_discrete_state_prob : Array, shape (n_discrete_states,)
-        Initial discrete state probabilities p(S_0 = j).
+        Prior discrete state probabilities p(S₁ = j).
     spikes : Array, shape (n_time, n_neurons)
-        Observed spike counts for all neurons at each timestep.
+        Observed spike counts for all neurons at each timestep. Observations
+        are indexed as y_1, y_2, ..., y_T (1-indexed in math notation).
     discrete_transition_matrix : Array, shape (n_discrete_states, n_discrete_states)
         Transition probabilities P(S_t = j | S_{t-1} = i). Entry [i, j] gives
         probability of transitioning from state i to state j.
@@ -918,9 +1127,16 @@ def switching_point_process_filter(
         Process noise covariances Q_j for each discrete state j.
     dt : float
         Time bin width in seconds.
-    log_intensity_func : Callable[[Array], Array]
-        Function mapping latent state (n_latent,) to log-intensities (n_neurons,).
-        Should return log(lambda) where lambda is firing rate in Hz.
+    log_intensity_func : Callable[[Array, SpikeObsParams], Array]
+        Function mapping (latent state, params) to log-intensities (n_neurons,).
+        Should return log(lambda) where lambda is firing rate in Hz. Takes the
+        state (n_latent,) and spike_params as arguments.
+    spike_params : SpikeObsParams
+        Spike observation parameters (baseline, weights). Passed to log_intensity_func
+        as data, not captured in closures. This ensures EM parameter updates take effect.
+    include_laplace_normalization : bool, default=True
+        If True, include Laplace normalization and prior terms in the
+        observation log-likelihood used for discrete-state updates.
 
     Returns
     -------
@@ -946,16 +1162,35 @@ def switching_point_process_filter(
     2. Updates discrete state probabilities using the HMM forward algorithm
     3. Collapses pair-conditional to state-conditional via Gaussian mixture
 
+    **Time Indexing Convention (x₁ convention)**:
+    This filter uses the x₁ convention where init parameters represent the state
+    at the first observation time, aligning with the EM M-step:
+
+    - ``init_state_cond_mean`` represents p(x₁ | S₁), the prior for x₁
+    - ``init_discrete_state_prob`` represents p(S₁), the prior for the first
+      discrete state
+    - The first observation ``spikes[0]`` corresponds to y₁ in math notation
+    - For y₁: apply observation update only (no dynamics prediction)
+    - For y_t (t > 1): predict x_t = A @ x_{t-1} + w_t, then update with y_t
+
+    This convention ensures consistency with the EM M-step, which sets
+    init_state_cond_mean = smoother_means[0] = x₁|T. The returned filter
+    outputs at index t represent p(x_{t+1} | y_{1:t+1}) (0-indexed in Python,
+    corresponding to math time index t+1).
+
     **Performance**: For production use, wrap this function with ``jax.jit``
     for significant speedups. The function uses ``jax.lax.scan`` and ``vmap``
     internally, which benefit greatly from JIT compilation::
 
         jitted_filter = jax.jit(switching_point_process_filter, static_argnums=(8,))
         results = jitted_filter(init_mean, init_cov, init_prob, spikes,
-                                trans_mat, cont_trans, proc_cov, dt, log_intensity)
+                                trans_mat, cont_trans, proc_cov, dt,
+                                log_intensity, spike_params)
 
     Note that ``log_intensity_func`` (argument 8) must be marked as static
-    since it's a Python callable.
+    since it's a Python callable. The ``spike_params`` argument (a registered
+    JAX pytree) is passed as data, so parameter updates during EM iterations
+    take effect without recompilation.
 
     References
     ----------
@@ -1028,6 +1263,10 @@ def switching_point_process_filter(
             process_cov,
             dt,
             log_intensity_func,
+            spike_params,
+            include_laplace_normalization,
+            max_newton_iter,
+            line_search_beta,
         )
 
         # 2. Scale likelihood for numerical stability
@@ -1071,22 +1310,57 @@ def switching_point_process_filter(
             pair_cond_filter_mean,
         )
 
-    # Run the filter using jax.lax.scan
-    marginal_log_likelihood = jnp.array(0.0)
+    # Handle first timestep with x₁ convention: update-only (no dynamics prediction)
+    # init_state_cond_mean represents p(x₁ | S₁), the prior for the first observation
+    (
+        first_state_cond_mean,
+        first_state_cond_cov,
+        first_discrete_prob,
+        first_pair_cond_mean,
+        first_log_lik,
+    ) = _first_timestep_point_process_update(
+        init_state_cond_mean,
+        init_state_cond_cov,
+        init_discrete_state_prob,
+        spikes[0],
+        dt,
+        log_intensity_func,
+        spike_params,
+        include_laplace_normalization,
+        max_newton_iter,
+        line_search_beta,
+    )
+
+    # Run predict-then-update for t=2,...,T
+    # jax.lax.scan handles empty inputs (spikes[1:] when n_time=1) gracefully
     (_, _, _, marginal_log_likelihood), (
-        state_cond_filter_mean,
-        state_cond_filter_cov,
-        filter_discrete_state_prob,
-        pair_cond_filter_mean,
+        rest_state_cond_filter_mean,
+        rest_state_cond_filter_cov,
+        rest_filter_discrete_state_prob,
+        rest_pair_cond_filter_mean,
     ) = jax.lax.scan(
         _step,
         (
-            init_state_cond_mean,
-            init_state_cond_cov,
-            init_discrete_state_prob,
-            marginal_log_likelihood,
+            first_state_cond_mean,
+            first_state_cond_cov,
+            first_discrete_prob,
+            first_log_lik,
         ),
-        spikes,
+        spikes[1:],
+    )
+
+    # Prepend first timestep results
+    state_cond_filter_mean = jnp.concatenate(
+        [first_state_cond_mean[None, ...], rest_state_cond_filter_mean], axis=0
+    )
+    state_cond_filter_cov = jnp.concatenate(
+        [first_state_cond_cov[None, ...], rest_state_cond_filter_cov], axis=0
+    )
+    filter_discrete_state_prob = jnp.concatenate(
+        [first_discrete_prob[None, ...], rest_filter_discrete_state_prob], axis=0
+    )
+    pair_cond_filter_mean = jnp.concatenate(
+        [first_pair_cond_mean[None, ...], rest_pair_cond_filter_mean], axis=0
     )
 
     return (
@@ -1144,6 +1418,8 @@ class SwitchingSpikeOscillatorModel:
         Whether to update initial mean during M-step.
     update_init_cov : bool, default=True
         Whether to update initial covariance during M-step.
+    q_regularization : QRegularizationConfig | None, optional
+        Trust-region and eigenvalue clipping configuration for Q updates.
     spike_weight_l2 : float, default=0.01
         L2 regularization strength on the spike GLM weights (not baseline).
         Adds 0.5 * spike_weight_l2 * ||weights||^2 to the M-step objective
@@ -1198,7 +1474,10 @@ class SwitchingSpikeOscillatorModel:
         update_spike_params: bool = True,
         update_init_mean: bool = True,
         update_init_cov: bool = True,
+        q_regularization: QRegularizationConfig | None = None,
         spike_weight_l2: float = 0.01,
+        max_newton_iter: int = 1,
+        line_search_beta: float = 0.5,
     ) -> None:
         """Initialize the switching spike oscillator model.
 
@@ -1228,6 +1507,8 @@ class SwitchingSpikeOscillatorModel:
             Update initial mean during M-step.
         update_init_cov : bool, default=True
             Update initial covariance during M-step.
+        q_regularization : QRegularizationConfig | None, optional
+            Trust-region and eigenvalue clipping configuration for Q updates.
         spike_weight_l2 : float, default=0.01
             L2 regularization strength on the spike GLM weights.
 
@@ -1252,15 +1533,28 @@ class SwitchingSpikeOscillatorModel:
         if dt <= 0:
             raise ValueError(f"dt must be positive. Got {dt}.")
         if discrete_transition_diag is not None:
+            # Convert to array first to enable shape checking for lists/tuples
+            discrete_transition_diag = jnp.asarray(discrete_transition_diag)
             if discrete_transition_diag.shape != (n_discrete_states,):
                 raise ValueError(
                     f"discrete_transition_diag shape mismatch: expected "
                     f"({n_discrete_states},), got {discrete_transition_diag.shape}."
                 )
+            if not jnp.all(
+                (discrete_transition_diag >= 0) & (discrete_transition_diag <= 1)
+            ):
+                raise ValueError(
+                    "discrete_transition_diag values must be probabilities in [0, 1]."
+                )
         if spike_weight_l2 < 0:
             raise ValueError(
                 f"spike_weight_l2 must be non-negative. Got {spike_weight_l2}."
             )
+        if q_regularization is not None:
+            if not (0.0 <= q_regularization.trust_region_weight <= 1.0):
+                raise ValueError(
+                    "q_regularization.trust_region_weight must be in [0, 1]."
+                )
 
         self.n_oscillators = n_oscillators
         self.n_neurons = n_neurons
@@ -1287,6 +1581,11 @@ class SwitchingSpikeOscillatorModel:
 
         # Regularization parameters
         self.spike_weight_l2 = spike_weight_l2
+        self.q_regularization = q_regularization or QRegularizationConfig()
+
+        # Newton iteration parameters for point-process update
+        self.max_newton_iter = max_newton_iter
+        self.line_search_beta = line_search_beta
 
         # Placeholders for model parameters (initialized by _initialize_parameters)
         self.init_mean: Array
@@ -1424,14 +1723,20 @@ class SwitchingSpikeOscillatorModel:
         ----------
         key : Array
             Random key for sampling initial mean.
+
+        Notes
+        -----
+        Each discrete state gets a different random initial mean to break
+        symmetry and allow EM to differentiate between states.
         """
-        # Initial mean: sample from standard normal, same for all discrete states
-        mean = jax.random.multivariate_normal(
-            key=key,
-            mean=jnp.zeros(self.n_latent),
-            cov=jnp.eye(self.n_latent),
-        )
-        self.init_mean = jnp.stack([mean] * self.n_discrete_states, axis=1)
+        # Initial mean: sample independently for each discrete state to break symmetry
+        keys = jax.random.split(key, self.n_discrete_states)
+        means = jax.vmap(
+            lambda k: jax.random.multivariate_normal(
+                key=k, mean=jnp.zeros(self.n_latent), cov=jnp.eye(self.n_latent)
+            )
+        )(keys)
+        self.init_mean = means.T  # Shape: (n_latent, n_discrete_states)
 
         # Initial covariance: identity for each discrete state
         self.init_cov = jnp.stack(
@@ -1442,38 +1747,57 @@ class SwitchingSpikeOscillatorModel:
         """Initialize continuous state transition matrices.
 
         Uses uncoupled oscillator dynamics with default frequencies
-        (uniform in [5, 15] Hz) and damping coefficients (0.95).
+        (uniform in [5, 15] Hz) and damping coefficients that vary slightly
+        across discrete states to break symmetry.
+
+        Notes
+        -----
+        Each discrete state gets slightly different damping coefficients
+        (ranging from 0.90 to 0.98) to break symmetry and allow EM to
+        differentiate between states based on dynamics stability.
         """
         # Default frequencies: spread across a reasonable range
         default_freqs = jnp.linspace(5.0, 15.0, self.n_oscillators)
 
-        # Default damping: stable but not overly damped
-        default_damping = jnp.full(self.n_oscillators, 0.95)
+        # Damping varies per state to break symmetry: from 0.90 to 0.98
+        damping_values = jnp.linspace(0.90, 0.98, self.n_discrete_states)
 
-        # Construct uncoupled transition matrix
-        A = construct_common_oscillator_transition_matrix(
-            freqs=default_freqs,
-            auto_regressive_coef=default_damping,
-            sampling_freq=self.sampling_freq,
-        )
+        # Construct transition matrix for each discrete state
+        transition_matrices = []
+        for i in range(self.n_discrete_states):
+            damping = jnp.full(self.n_oscillators, damping_values[i])
+            A = construct_common_oscillator_transition_matrix(
+                freqs=default_freqs,
+                auto_regressive_coef=damping,
+                sampling_freq=self.sampling_freq,
+            )
+            transition_matrices.append(A)
 
-        # Stack for each discrete state (same initial A for all states)
-        self.continuous_transition_matrix = jnp.stack(
-            [A] * self.n_discrete_states, axis=2
-        )
+        self.continuous_transition_matrix = jnp.stack(transition_matrices, axis=2)
 
     def _initialize_process_covariance(self) -> None:
         """Initialize process noise covariances.
 
-        Uses block-diagonal structure with small variance (0.01) per oscillator.
+        Uses block-diagonal structure with variance that varies across
+        discrete states to break symmetry.
+
+        Notes
+        -----
+        Each discrete state gets different process noise variance
+        (ranging from 0.005 to 0.02) to break symmetry and allow EM to
+        differentiate between states based on noise level.
         """
-        # Default variance: small process noise
-        default_variance = jnp.full(self.n_oscillators, 0.01)
+        # Variance varies per state to break symmetry: from 0.005 to 0.02
+        variance_values = jnp.linspace(0.005, 0.02, self.n_discrete_states)
 
-        Q = construct_common_oscillator_process_covariance(variance=default_variance)
+        # Construct process covariance for each discrete state
+        process_covs = []
+        for i in range(self.n_discrete_states):
+            variance = jnp.full(self.n_oscillators, variance_values[i])
+            Q = construct_common_oscillator_process_covariance(variance=variance)
+            process_covs.append(Q)
 
-        # Stack for each discrete state
-        self.process_cov = jnp.stack([Q] * self.n_discrete_states, axis=2)
+        self.process_cov = jnp.stack(process_covs, axis=2)
 
     def _initialize_spike_params(self, key: Array) -> None:
         """Initialize spike observation parameters.
@@ -1595,10 +1919,10 @@ class SwitchingSpikeOscillatorModel:
         parameter updates via `switching_kalman_maximization_step`.
         """
 
-        # Build log-intensity function from current spike parameters
-        def log_intensity_func(state: Array) -> Array:
-            """Compute log-intensity for all neurons given latent state."""
-            return self.spike_params.baseline + self.spike_params.weights @ state
+        # Log-intensity function takes (state, params) - params passed as data, not closure
+        def log_intensity_func(state: Array, params: SpikeObsParams) -> Array:
+            """Compute log-intensity for all neurons given latent state and params."""
+            return params.baseline + params.weights @ state
 
         # Run the switching point-process filter
         (
@@ -1617,6 +1941,9 @@ class SwitchingSpikeOscillatorModel:
             process_cov=self.process_cov,
             dt=self.dt,
             log_intensity_func=log_intensity_func,
+            spike_params=self.spike_params,
+            max_newton_iter=self.max_newton_iter,
+            line_search_beta=self.line_search_beta,
         )
 
         # Run the switching Kalman smoother (observation-model agnostic)
@@ -1672,10 +1999,9 @@ class SwitchingSpikeOscillatorModel:
         This method must be called after `_e_step()` which populates the smoother
         output attributes used here.
 
-        The process covariance Q is regularized to ensure positive semi-definiteness
-        by adding a small value (1e-8) times the identity matrix. This handles
-        cases where low discrete state probability leads to numerically
-        non-PSD estimates from the raw M-step.
+        The process covariance Q can be regularized via a trust-region blend and
+        eigenvalue clipping (see ``QRegularizationConfig``) to stabilize updates
+        when the Laplace-EKF approximation produces unreliable estimates.
 
         The measurement_matrix and measurement_cov returns from
         `switching_kalman_maximization_step` are ignored since they assume
@@ -1712,28 +2038,30 @@ class SwitchingSpikeOscillatorModel:
 
         # Update process covariance if flag is True
         if self.update_process_cov:
-            # Use conservative trust-region approach for Q updates.
-            # The Laplace-EKF approximation produces unreliable Q estimates,
-            # so we heavily regularize toward the current value.
-            #
-            # Key insight: the 20x ratio between states (0.005 vs 0.1) causes
-            # numerical instability in the smoother. We need MUCH tighter bounds.
-            trust_region_weight = 0.1  # Very conservative update (90% old, 10% new)
-            min_eigenvalue = 0.01  # Tight lower bound
-            max_eigenvalue = 0.03  # Tight upper bound (3x ratio max)
+            cfg = self.q_regularization
+            if cfg.enabled:
+                # Blend new Q with previous Q (trust region)
+                Q_blended = (
+                    cfg.trust_region_weight * new_Q
+                    + (1 - cfg.trust_region_weight) * self.process_cov
+                )
 
-            def clip_eigenvalues(Q: Array) -> Array:
-                eigvals, eigvecs = jnp.linalg.eigh(Q)
-                eigvals_clipped = jnp.clip(eigvals, min_eigenvalue, max_eigenvalue)
-                return eigvecs @ jnp.diag(eigvals_clipped) @ eigvecs.T
+                def clip_eigenvalues(Q: Array) -> Array:
+                    Q = symmetrize(Q)
+                    eigvals, eigvecs = jnp.linalg.eigh(Q)
+                    if cfg.min_eigenvalue is not None:
+                        eigvals = jnp.maximum(eigvals, cfg.min_eigenvalue)
+                    if cfg.max_eigenvalue is not None:
+                        eigvals = jnp.minimum(eigvals, cfg.max_eigenvalue)
+                    return eigvecs @ jnp.diag(eigvals) @ eigvecs.T
 
-            # Blend new Q with previous Q (trust region)
-            Q_blended = trust_region_weight * new_Q + (1 - trust_region_weight) * self.process_cov
-
-            # Clip eigenvalues per state
-            Q_clipped = jax.vmap(clip_eigenvalues, in_axes=-1, out_axes=-1)(Q_blended)
-
-            self.process_cov = Q_clipped
+                # Clip eigenvalues per state
+                Q_clipped = jax.vmap(clip_eigenvalues, in_axes=-1, out_axes=-1)(
+                    Q_blended
+                )
+                self.process_cov = Q_clipped
+            else:
+                self.process_cov = new_Q
 
         # Update discrete transition matrix if flag is True
         if self.update_discrete_transition_matrix:
@@ -1774,6 +2102,22 @@ class SwitchingSpikeOscillatorModel:
             E[x_t | y_{1:T}] = sum_j P(S_t=j | y_{1:T}) * E[x_t | y_{1:T}, S_t=j]
 
         This is the standard "plug-in" M-step for the spike parameters.
+
+        **Limitation**: This approach uses a single marginalized mean and ignores
+        both the per-state posterior means and the posterior covariance. For a
+        switching model with nonlinear log-link observation model, the correct
+        EM objective would require:
+
+        1. State-conditional expectations: E_q[log p(y|x) | S_t=j] for each state
+        2. Integration over posterior covariance (second-order correction)
+
+        The current implementation can introduce bias when state-conditional
+        latents differ significantly. For improved accuracy, consider:
+
+        - Using ``update_spike_glm_params_second_order`` with aggregated
+          state-conditional covariances
+        - Fitting separate observation parameters per discrete state
+
         """
         if not self.update_spike_params:
             return
@@ -1789,13 +2133,44 @@ class SwitchingSpikeOscillatorModel:
             self.smoother_discrete_state_prob,
         )
 
-        # Update spike GLM parameters with L2 regularization
+        # Compute marginalized smoother covariance using law of total variance:
+        # Var[x] = E[Var[x|S]] + Var[E[x|S]]
+        #
+        # E[Var[x|S]] = sum_j P(S=j) * Cov[x|S=j]
+        # smoother_state_cond_cov: (n_time, n_latent, n_latent, n_discrete_states)
+        expected_cov = jnp.einsum(
+            "tlks,ts->tlk",
+            self.smoother_state_cond_cov,
+            self.smoother_discrete_state_prob,
+        )
+
+        # Var[E[x|S]] = sum_j P(S=j) * (m_j - m)(m_j - m)^T
+        # where m = E[x] is the marginal mean computed above
+        # smoother_state_cond_mean: (n_time, n_latent, n_discrete_states)
+        # smoother_mean: (n_time, n_latent)
+        mean_deviation = (
+            self.smoother_state_cond_mean - smoother_mean[:, :, None]
+        )  # (n_time, n_latent, n_discrete_states)
+        # Outer product weighted by state probabilities
+        var_of_mean = jnp.einsum(
+            "tls,tks,ts->tlk",
+            mean_deviation,
+            mean_deviation,
+            self.smoother_discrete_state_prob,
+        )
+
+        # Total marginal covariance
+        smoother_cov = expected_cov + var_of_mean
+
+        # Update spike GLM parameters with second-order correction
         self.spike_params = update_spike_glm_params(
             spikes=spikes,
             smoother_mean=smoother_mean,
             current_params=self.spike_params,
             dt=self.dt,
             weight_l2=self.spike_weight_l2,
+            smoother_cov=smoother_cov,
+            use_second_order=True,
         )
 
     def _project_parameters(self) -> None:
@@ -1826,38 +2201,43 @@ class SwitchingSpikeOscillatorModel:
 
         The projections are idempotent: calling them multiple times has the
         same effect as calling once.
+
+        The projections respect update flags: if `update_continuous_transition_matrix`
+        or `update_process_cov` is False, the corresponding projection is skipped.
         """
         # Project each transition matrix to preserve oscillatory block structure
-        self.continuous_transition_matrix = jnp.stack(
-            [
-                project_coupled_transition_matrix(
-                    self.continuous_transition_matrix[:, :, j]
-                )
-                for j in range(self.n_discrete_states)
-            ],
-            axis=-1,
-        )
+        if self.update_continuous_transition_matrix:
+            self.continuous_transition_matrix = jnp.stack(
+                [
+                    project_coupled_transition_matrix(
+                        self.continuous_transition_matrix[:, :, j]
+                    )
+                    for j in range(self.n_discrete_states)
+                ],
+                axis=-1,
+            )
 
         # Project each process covariance to ensure PSD
-        projected_Q_list = []
-        for j in range(self.n_discrete_states):
-            Q_j = self.process_cov[:, :, j]
+        if self.update_process_cov:
+            projected_Q_list = []
+            for j in range(self.n_discrete_states):
+                Q_j = self.process_cov[:, :, j]
 
-            # Ensure symmetry
-            Q_j = (Q_j + Q_j.T) / 2
+                # Ensure symmetry
+                Q_j = (Q_j + Q_j.T) / 2
 
-            # Ensure PSD by eigenvalue clipping
-            eigenvalues, eigenvectors = jnp.linalg.eigh(Q_j)
-            # Clip negative eigenvalues to small positive value
-            eigenvalues_clipped = jnp.maximum(eigenvalues, 1e-8)
-            # Reconstruct PSD matrix
-            Q_j_psd = eigenvectors @ jnp.diag(eigenvalues_clipped) @ eigenvectors.T
-            # Ensure symmetry again (numerical precision)
-            Q_j_psd = (Q_j_psd + Q_j_psd.T) / 2
+                # Ensure PSD by eigenvalue clipping
+                eigenvalues, eigenvectors = jnp.linalg.eigh(Q_j)
+                # Clip negative eigenvalues to small positive value
+                eigenvalues_clipped = jnp.maximum(eigenvalues, 1e-8)
+                # Reconstruct PSD matrix
+                Q_j_psd = eigenvectors @ jnp.diag(eigenvalues_clipped) @ eigenvectors.T
+                # Ensure symmetry again (numerical precision)
+                Q_j_psd = (Q_j_psd + Q_j_psd.T) / 2
 
-            projected_Q_list.append(Q_j_psd)
+                projected_Q_list.append(Q_j_psd)
 
-        self.process_cov = jnp.stack(projected_Q_list, axis=-1)
+            self.process_cov = jnp.stack(projected_Q_list, axis=-1)
 
     def fit(
         self,

@@ -1477,3 +1477,67 @@ class TestGetRateEstimateMultiNeuron:
         # Rate should be non-negative (exp of anything is positive)
         assert jnp.all(rate >= 0)
         assert not jnp.any(jnp.isnan(rate))
+
+    def test_laplace_update_with_nonlinear_intensity_produces_psd_covariance(
+        self,
+    ) -> None:
+        """Laplace update should produce PSD covariances even with nonlinear intensity.
+
+        For nonlinear log-intensity functions, the Hessian correction term can make
+        the posterior precision matrix indefinite. The Laplace update should project
+        to the PSD cone to ensure valid covariances.
+        """
+        from state_space_practice.point_process_kalman import (
+            _point_process_laplace_update,
+        )
+
+        n_latent = 3
+        dt = 0.01
+
+        # Create a challenging nonlinear log-intensity with large second derivatives
+        # Using a polynomial that will produce significant Hessian corrections
+        n_neurons = 2
+
+        def nonlinear_log_intensity(state):
+            # Quadratic in state components - creates non-trivial Hessians
+            # log_intensity[0] = state[0]^2 + state[1]
+            # log_intensity[1] = state[1]^2 + state[2]
+            return jnp.array([
+                state[0] ** 2 + state[1],
+                state[1] ** 2 + state[2],
+            ])
+
+        # Prior with moderate uncertainty
+        prior_mean = jnp.array([1.0, 0.5, -0.5])
+        prior_cov = jnp.eye(n_latent) * 0.5
+
+        # High spike count to drive strong Hessian corrections
+        # (innovation = y - lambda*dt can be large positive)
+        spike_counts = jnp.array([10.0, 8.0])  # Much higher than expected
+
+        # Run the Laplace update
+        posterior_mean, posterior_cov, log_lik = _point_process_laplace_update(
+            one_step_mean=prior_mean,
+            one_step_cov=prior_cov,
+            spike_indicator_t=spike_counts,
+            dt=dt,
+            log_intensity_func=nonlinear_log_intensity,
+            diagonal_boost=1e-6,
+            include_laplace_normalization=True,
+        )
+
+        # Verify outputs are valid (no NaN/Inf)
+        assert not jnp.any(jnp.isnan(posterior_mean)), "Posterior mean contains NaN"
+        assert not jnp.any(jnp.isnan(posterior_cov)), "Posterior cov contains NaN"
+        assert not jnp.any(jnp.isinf(posterior_mean)), "Posterior mean contains Inf"
+        assert not jnp.any(jnp.isinf(posterior_cov)), "Posterior cov contains Inf"
+
+        # Verify posterior covariance is PSD (all eigenvalues >= 0)
+        eigvals = jnp.linalg.eigvalsh(posterior_cov)
+        assert jnp.all(eigvals >= 0), f"Posterior cov is not PSD: eigenvalues = {eigvals}"
+
+        # Verify covariance is symmetric
+        np.testing.assert_allclose(
+            posterior_cov, posterior_cov.T, rtol=1e-10,
+            err_msg="Posterior covariance is not symmetric"
+        )

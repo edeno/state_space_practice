@@ -83,6 +83,9 @@ def _point_process_laplace_update(
     diagonal_boost: float = 1e-9,
     grad_log_intensity_func: Optional[Callable[[Array], Array]] = None,
     hess_log_intensity_func: Optional[Callable[[Array], Array]] = None,
+    include_laplace_normalization: bool = True,
+    max_newton_iter: int = 1,
+    line_search_beta: float = 0.5,
 ) -> tuple[Array, Array, Array]:
     """Single point-process Laplace-EKF update for multiple neurons.
 
@@ -118,6 +121,17 @@ def _point_process_laplace_update(
     hess_log_intensity_func : Callable[[Array], Array] | None, optional
         Pre-computed Hessian function of log_intensity_func.
         If None, computed via jax.jacfwd of the gradient function.
+    include_laplace_normalization : bool, default=True
+        If True, include the Laplace normalization and prior terms to approximate
+        log p(y_t | y_{1:t-1}). If False, return the plug-in log-likelihood
+        at the posterior mode without normalization.
+    max_newton_iter : int, default=1
+        Maximum number of Newton iterations. Use > 1 with line search for
+        numerical stability with large spike counts (e.g., many neurons).
+    line_search_beta : float, default=0.5
+        Step size reduction factor for backtracking line search. Only used
+        when max_newton_iter > 1. At each iteration, step size is halved
+        until the negative log-posterior decreases or minimum alpha reached.
 
     Returns
     -------
@@ -126,7 +140,7 @@ def _point_process_laplace_update(
     posterior_cov : Array, shape (n_latent, n_latent)
         Updated state covariance after incorporating spike observations
     log_likelihood : Array
-        Sum of Poisson log-pmfs across neurons (scalar array)
+        Approximate log p(y_t | y_{1:t-1}) using a Laplace expansion (scalar array).
 
     Notes
     -----
@@ -154,51 +168,142 @@ def _point_process_laplace_update(
     grad_log_intensity = grad_log_intensity_func
     hess_log_intensity = hess_log_intensity_func
 
-    # Evaluate at the one-step predicted mean
-    log_lambda = log_intensity_func(one_step_mean)  # (n_neurons,)
-    conditional_intensity = jnp.exp(log_lambda) * dt  # Expected spike count
-
-    # Innovation: observed - expected
-    innovation = spike_indicator_t - conditional_intensity  # (n_neurons,)
-
-    # Jacobian: (n_neurons, n_latent)
-    jacobian = grad_log_intensity(one_step_mean)  # (n_neurons, n_latent)
-
-    # Hessian: (n_neurons, n_latent, n_latent)
-    hessian = hess_log_intensity(one_step_mean)  # (n_neurons, n_latent, n_latent)
-
-    # Weighted gradient for mean update: jacobian.T @ innovation -> (n_latent,)
-    gradient = jacobian.T @ innovation  # (n_latent,)
-
-    # Fisher information: jacobian.T @ diag(conditional_intensity) @ jacobian
-    fisher_info = jacobian.T @ (
-        conditional_intensity[:, None] * jacobian
-    )  # (n_latent, n_latent)
-
-    # Hessian correction: sum_n innovation_n * hessian[n]
-    hessian_correction = jnp.einsum(
-        "n,nij->ij", innovation, hessian
-    )  # (n_latent, n_latent)
-
     # Prior precision via psd_solve for numerical stability
     n_latent = one_step_mean.shape[0]
     identity = jnp.eye(n_latent)
     prior_precision = psd_solve(one_step_cov, identity, diagonal_boost=diagonal_boost)
 
-    # Posterior precision: P^{-1} = P_prior^{-1} + Fisher - innovation * Hessian
-    posterior_precision = prior_precision + fisher_info - hessian_correction
+    def _neg_log_posterior(x: Array) -> Array:
+        """Negative log-posterior for line search."""
+        log_lambda = log_intensity_func(x)
+        cond_int = jnp.exp(log_lambda) * dt
+        # Poisson log-likelihood (ignoring constant log(y!) term)
+        log_lik = jnp.sum(spike_indicator_t * jnp.log(cond_int + 1e-10) - cond_int)
+        # Gaussian prior log-probability (ignoring constant)
+        delta = x - one_step_mean
+        log_prior = -0.5 * delta @ (prior_precision @ delta)
+        return -(log_lik + log_prior)
+
+    def _newton_step_at(x: Array) -> tuple[Array, Array, Array]:
+        """Compute Newton step and posterior precision at point x.
+
+        The full posterior is:
+            log p(x | y) = log p(y | x) + log p(x) + const
+
+        Gradient of log posterior:
+            grad = grad_log_likelihood - prior_precision @ (x - prior_mean)
+
+        Hessian of log posterior:
+            H = H_log_likelihood - prior_precision
+        """
+        log_lambda = log_intensity_func(x)
+        conditional_intensity = jnp.exp(log_lambda) * dt
+        innovation = spike_indicator_t - conditional_intensity
+        jacobian = grad_log_intensity(x)
+        hessian = hess_log_intensity(x)
+
+        # Likelihood gradient
+        likelihood_gradient = jacobian.T @ innovation
+
+        # Prior gradient: -prior_precision @ (x - one_step_mean)
+        prior_gradient = -prior_precision @ (x - one_step_mean)
+
+        # Full posterior gradient
+        gradient = likelihood_gradient + prior_gradient
+
+        # Posterior precision (negative Hessian of log posterior)
+        fisher_info = jacobian.T @ (conditional_intensity[:, None] * jacobian)
+        hessian_correction = jnp.einsum("n,nij->ij", innovation, hessian)
+        post_prec = prior_precision + fisher_info - hessian_correction
+
+        # Ensure PSD
+        post_prec = symmetrize(post_prec)
+        eigvals, eigvecs = jnp.linalg.eigh(post_prec)
+        eigvals_safe = jnp.maximum(eigvals, diagonal_boost)
+        post_prec = eigvecs @ jnp.diag(eigvals_safe) @ eigvecs.T
+
+        # Newton direction
+        delta = psd_solve(post_prec, gradient, diagonal_boost=diagonal_boost)
+        return delta, post_prec, gradient
+
+    def _line_search_step(carry, _):
+        """One iteration of Newton with backtracking line search."""
+        x, _ = carry
+        delta, _, _ = _newton_step_at(x)
+        current_loss = _neg_log_posterior(x)
+
+        # Backtracking line search
+        def _backtrack(alpha_carry, _):
+            alpha, _ = alpha_carry
+            new_x = x + alpha * delta
+            new_loss = _neg_log_posterior(new_x)
+            improved = new_loss < current_loss
+            new_alpha = jnp.where(improved, alpha, alpha * line_search_beta)
+            return (new_alpha, improved), None
+
+        (final_alpha, _), _ = jax.lax.scan(
+            _backtrack, (jnp.array(1.0), jnp.array(False)), None, length=10
+        )
+        new_x = x + final_alpha * delta
+
+        # Recompute precision at accepted point for consistency
+        _, new_post_prec, _ = _newton_step_at(new_x)
+        return (new_x, new_post_prec), None
+
+    # Initialize at prior mean
+    x = one_step_mean
+
+    if max_newton_iter == 1:
+        # Original single-step behavior (no line search overhead)
+        log_lambda = log_intensity_func(one_step_mean)
+        conditional_intensity = jnp.exp(log_lambda) * dt
+        innovation = spike_indicator_t - conditional_intensity
+        jacobian = grad_log_intensity(one_step_mean)
+        hessian = hess_log_intensity(one_step_mean)
+        gradient = jacobian.T @ innovation
+        fisher_info = jacobian.T @ (conditional_intensity[:, None] * jacobian)
+        hessian_correction = jnp.einsum("n,nij->ij", innovation, hessian)
+        posterior_precision = prior_precision + fisher_info - hessian_correction
+        posterior_precision = symmetrize(posterior_precision)
+        eigvals, eigvecs = jnp.linalg.eigh(posterior_precision)
+        eigvals_safe = jnp.maximum(eigvals, diagonal_boost)
+        posterior_precision = eigvecs @ jnp.diag(eigvals_safe) @ eigvecs.T
+        posterior_mean = one_step_mean + psd_solve(
+            posterior_precision, gradient, diagonal_boost=diagonal_boost
+        )
+    else:
+        # Iterative Newton with line search
+        (posterior_mean, posterior_precision), _ = jax.lax.scan(
+            _line_search_step, (x, prior_precision), None, length=max_newton_iter
+        )
 
     # Posterior covariance via psd_solve
     posterior_cov = psd_solve(posterior_precision, identity, diagonal_boost=diagonal_boost)
     posterior_cov = symmetrize(posterior_cov)
 
-    # Posterior mean: Newton step from prior
-    posterior_mean = one_step_mean + psd_solve(
-        posterior_precision, gradient, diagonal_boost=diagonal_boost
+    # Log-likelihood at posterior mode (approximate)
+    log_lambda_mode = log_intensity_func(posterior_mean)
+    conditional_intensity_mode = jnp.exp(log_lambda_mode) * dt
+    log_likelihood = jnp.sum(
+        jax.scipy.stats.poisson.logpmf(
+            spike_indicator_t, conditional_intensity_mode
+        )
     )
 
-    # Log-likelihood: sum of Poisson log-pmfs
-    log_likelihood = jnp.sum(jax.scipy.stats.poisson.logpmf(spike_indicator_t, conditional_intensity))
+    if include_laplace_normalization:
+        # Laplace correction: log p(y) ≈ log p(y|x*) + log p(x*) + 0.5 log|P_post|
+        # Constant terms (d/2 * log 2π) are omitted since they cancel across states.
+        def _logdet_psd(mat: Array) -> Array:
+            mat = symmetrize(mat) + diagonal_boost * jnp.eye(mat.shape[0])
+            sign, logdet = jnp.linalg.slogdet(mat)
+            return jnp.where(sign > 0, logdet, 0.0)
+
+        delta = posterior_mean - one_step_mean
+        quad = delta @ (prior_precision @ delta)
+        logdet_prior = _logdet_psd(one_step_cov)
+        logdet_post = _logdet_psd(posterior_cov)
+        log_prior = -0.5 * quad - 0.5 * logdet_prior
+        log_likelihood = log_likelihood + log_prior + 0.5 * logdet_post
 
     return posterior_mean, posterior_cov, log_likelihood
 
@@ -212,6 +317,7 @@ def stochastic_point_process_filter(
     transition_matrix: ArrayLike,
     process_cov: ArrayLike,
     log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = True,
 ) -> tuple[Array, Array, Array]:
     """Applies a Stochastic State Point Process Filter (SSPPF).
 
@@ -264,6 +370,10 @@ def stochastic_point_process_filter(
         Function `log_lambda(Z_k, x_k)` returning the log conditional
         intensity. Should return (n_neurons,) array for multi-neuron case,
         or scalar for single-neuron.
+    include_laplace_normalization : bool, default=True
+        If True, include Laplace normalization and prior terms in the
+        marginal log-likelihood. If False, return the plug-in log-likelihood
+        at the posterior mode without normalization.
 
     Returns
     -------
@@ -276,9 +386,11 @@ def stochastic_point_process_filter(
 
     Notes
     -----
-    For multiple neurons, the log-likelihood at each timestep is the sum
+    For multiple neurons, the observation log-likelihood term is the sum
     of independent Poisson log-pmfs:
         log p(y_t | x_t) = sum_n log Poisson(y_{n,t} | lambda_{n,t} * dt)
+    When ``include_laplace_normalization`` is True, prior and normalization
+    terms are added to approximate the marginal log-likelihood.
 
     The filter aggregates information from all neurons to update the shared
     latent state. More neurons provide more information, reducing posterior
@@ -350,6 +462,7 @@ def stochastic_point_process_filter(
             log_intensity_func,
             grad_log_intensity_func=grad_log_intensity_func,
             hess_log_intensity_func=hess_log_intensity_func,
+            include_laplace_normalization=include_laplace_normalization,
         )
 
         marginal_log_likelihood += log_lik
@@ -381,6 +494,7 @@ def stochastic_point_process_smoother(
     transition_matrix: ArrayLike,
     process_cov: ArrayLike,
     log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = True,
 ) -> tuple[Array, Array, Array, Array]:
     """Applies a Stochastic State Point Process Smoother (SSPPS).
 
@@ -420,6 +534,10 @@ def stochastic_point_process_smoother(
     log_conditional_intensity : callable
         Function `log_lambda(Z_k, x_k)` returning the log conditional
         intensity. Should return (n_neurons,) for multi-neuron case.
+    include_laplace_normalization : bool, default=True
+        If True, include Laplace normalization and prior terms in the
+        marginal log-likelihood. If False, return the plug-in log-likelihood
+        at the posterior mode without normalization.
 
     Returns
     -------
@@ -454,6 +572,7 @@ def stochastic_point_process_smoother(
             transition_matrix,
             process_cov,
             log_conditional_intensity,
+            include_laplace_normalization=include_laplace_normalization,
         )
     )
 
