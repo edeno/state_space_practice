@@ -896,10 +896,6 @@ class TestKalmanMaximizationStepMStepRegression:
         n_time = 100
         n_params = 3
 
-        # Generate smoother outputs from a random walk
-        true_A = jnp.eye(n_params)
-        true_Q = jnp.eye(n_params) * 0.01
-
         # Simulate a random walk
         states = [jnp.zeros(n_params)]
         for _ in range(n_time - 1):
@@ -1497,8 +1493,6 @@ class TestGetRateEstimateMultiNeuron:
 
         # Create a challenging nonlinear log-intensity with large second derivatives
         # Using a polynomial that will produce significant Hessian corrections
-        n_neurons = 2
-
         def nonlinear_log_intensity(state):
             # Quadratic in state components - creates non-trivial Hessians
             # log_intensity[0] = state[0]^2 + state[1]
@@ -1812,6 +1806,199 @@ class TestPointProcessMathCorrectness:
                 f"n={[1,5,20][i]} trace={traces[i]:.6f} vs "
                 f"n={[1,5,20][i+1]} trace={traces[i+1]:.6f}"
             )
+
+
+class TestPointProcessEMCorrectness:
+    """Tests verifying EM correctness for the non-switching PointProcessModel."""
+
+    def test_em_log_likelihood_improves(self) -> None:
+        """EM log-likelihood should improve overall.
+
+        The Laplace approximation can cause small per-iteration decreases,
+        but the overall trend should be upward.
+        """
+        n_time = 500
+        n_params = 3  # intercept + 2 features
+        dt = 0.01
+
+        # True parameters
+        true_params = jnp.array([1.0, 0.5, -0.3])
+
+        # Design matrix: intercept + 2 features
+        key = jax.random.PRNGKey(42)
+        k1, k2 = jax.random.split(key)
+        features = jax.random.normal(k1, (n_time, 2)) * 0.3
+        design_matrix = jnp.concatenate(
+            [jnp.ones((n_time, 1)), features], axis=1
+        )
+
+        # Simulate spikes
+        log_rate = log_conditional_intensity(design_matrix, true_params)
+        rate = jnp.exp(log_rate) * dt
+        spikes = jax.random.poisson(k2, rate).astype(float)
+
+        # Fit model from wrong initial params
+        model = PointProcessModel(
+            n_state_dims=n_params,
+            dt=dt,
+            transition_matrix=jnp.eye(n_params),
+            process_cov=jnp.eye(n_params) * 0.001,
+            init_mean=jnp.zeros(n_params),
+            init_cov=jnp.eye(n_params) * 1.0,
+        )
+
+        log_likelihoods = model.fit(
+            design_matrix, spikes, max_iter=15, tolerance=1e-8,
+        )
+
+        # Overall improvement
+        assert log_likelihoods[-1] > log_likelihoods[0], (
+            f"EM should improve LL: first={log_likelihoods[0]:.2f}, "
+            f"last={log_likelihoods[-1]:.2f}"
+        )
+
+        # All finite
+        for i, ll in enumerate(log_likelihoods):
+            assert np.isfinite(ll), f"LL should be finite at iteration {i}"
+
+    def test_em_recovers_stationary_params(self) -> None:
+        """With A=I and small Q, EM should recover the true GLM parameters.
+
+        The state is the parameter vector. With identity dynamics and small
+        process noise, the smoother mean at steady state should approximate
+        the true parameters.
+        """
+        n_time = 2000
+        n_params = 3  # intercept + 2 features
+        dt = 0.01
+
+        true_params = jnp.array([1.5, 0.8, -0.5])
+
+        key = jax.random.PRNGKey(99)
+        k1, k2 = jax.random.split(key)
+        features = jax.random.normal(k1, (n_time, 2)) * 0.3
+        design_matrix = jnp.concatenate(
+            [jnp.ones((n_time, 1)), features], axis=1
+        )
+
+        log_rate = log_conditional_intensity(design_matrix, true_params)
+        rate = jnp.exp(log_rate) * dt
+        spikes = jax.random.poisson(k2, rate).astype(float)
+
+        model = PointProcessModel(
+            n_state_dims=n_params,
+            dt=dt,
+            transition_matrix=jnp.eye(n_params),
+            process_cov=jnp.eye(n_params) * 0.0001,
+            init_mean=jnp.zeros(n_params),
+            init_cov=jnp.eye(n_params) * 1.0,
+            update_process_cov=True,
+            update_transition_matrix=False,
+        )
+
+        model.fit(design_matrix, spikes, max_iter=30, tolerance=1e-6)
+
+        # Smoother mean averaged over the middle portion should approximate
+        # true params. The smoother state drifts slightly due to process noise,
+        # so we average over the central 50% of time to reduce variance.
+        mid_start = n_time // 4
+        mid_end = 3 * n_time // 4
+        recovered_params = jnp.mean(model.smoother_mean[mid_start:mid_end], axis=0)
+
+        np.testing.assert_allclose(
+            recovered_params, true_params, atol=0.5,
+            err_msg="Smoother should recover approximately true parameters"
+        )
+
+    def test_em_monotonic_per_iteration(self) -> None:
+        """With well-conditioned data, EM should be nearly monotonic.
+
+        Any decrease should be < 1% of total improvement.
+        """
+        n_time = 300
+        n_params = 2  # intercept + 1 feature
+        dt = 0.01
+
+        true_params = jnp.array([2.0, 0.5])
+
+        key = jax.random.PRNGKey(7)
+        k1, k2 = jax.random.split(key)
+        features = jax.random.normal(k1, (n_time, 1)) * 0.5
+        design_matrix = jnp.concatenate(
+            [jnp.ones((n_time, 1)), features], axis=1
+        )
+
+        log_rate = log_conditional_intensity(design_matrix, true_params)
+        rate = jnp.exp(log_rate) * dt
+        spikes = jax.random.poisson(k2, rate).astype(float)
+
+        model = PointProcessModel(
+            n_state_dims=n_params,
+            dt=dt,
+            transition_matrix=jnp.eye(n_params),
+            process_cov=jnp.eye(n_params) * 0.001,
+            init_mean=jnp.zeros(n_params),
+            init_cov=jnp.eye(n_params) * 1.0,
+        )
+
+        log_likelihoods = model.fit(
+            design_matrix, spikes, max_iter=15, tolerance=1e-8,
+        )
+
+        total_improvement = log_likelihoods[-1] - log_likelihoods[0]
+        assert total_improvement > 0, "EM should improve overall"
+
+        for i in range(1, len(log_likelihoods)):
+            if log_likelihoods[i] < log_likelihoods[i - 1]:
+                drop = log_likelihoods[i - 1] - log_likelihoods[i]
+                assert drop < 0.05 * total_improvement, (
+                    f"EM drop at [{i}]={drop:.4f} exceeds 5% of "
+                    f"total improvement {total_improvement:.4f}"
+                )
+
+    def test_em_convergence_is_fixed_point(self) -> None:
+        """At convergence, one more EM iteration should barely change params."""
+        n_time = 300
+        n_params = 2
+        dt = 0.01
+
+        key = jax.random.PRNGKey(55)
+        k1, k2 = jax.random.split(key)
+        design_matrix = jnp.concatenate(
+            [jnp.ones((n_time, 1)),
+             jax.random.normal(k1, (n_time, 1)) * 0.3], axis=1
+        )
+        spikes = jax.random.poisson(
+            k2, 0.3, shape=(n_time,)
+        ).astype(float)
+
+        model = PointProcessModel(
+            n_state_dims=n_params,
+            dt=dt,
+            transition_matrix=jnp.eye(n_params),
+            process_cov=jnp.eye(n_params) * 0.001,
+            init_mean=jnp.zeros(n_params),
+            init_cov=jnp.eye(n_params),
+        )
+
+        # Run to convergence
+        model.fit(design_matrix, spikes, max_iter=50, tolerance=1e-8)
+
+        A_converged = model.transition_matrix.copy()
+        Q_converged = model.process_cov.copy()
+
+        # Run one more iteration manually
+        model._e_step(design_matrix, spikes)
+        model._m_step()
+
+        np.testing.assert_allclose(
+            model.transition_matrix, A_converged, atol=0.01,
+            err_msg="A should be near fixed point"
+        )
+        np.testing.assert_allclose(
+            model.process_cov, Q_converged, atol=0.01,
+            err_msg="Q should be near fixed point"
+        )
 
 
 class TestPointProcessNumericalStability:

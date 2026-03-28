@@ -139,19 +139,19 @@ def simple_2_state_params() -> Tuple[Array, Array, Array, Array, int, int, int]:
         Observation matrix (O, N, M).
     R : Array
         Observation noise covariance (O, O, M).
-    N : int
+    n_cont : int
         Number of continuous states.
-    M : int
+    n_disc : int
         Number of discrete states.
-    O : int
+    n_obs : int
         Number of observation dimensions.
     """
-    N, M, O = 1, 2, 1
+    n_cont, n_disc, n_obs = 1, 2, 1
     A = jnp.array([[[0.9]], [[1.05]]]).T
     Q = jnp.array([[[0.1]], [[0.5]]]).T
     H = jnp.array([[[1.0]], [[1.0]]]).T
     R = jnp.array([[[1.0]], [[2.0]]]).T
-    return A, Q, H, R, N, M, O
+    return A, Q, H, R, n_cont, n_disc, n_obs
 
 
 # --- Unit Tests: Helper Functions ---
@@ -263,7 +263,7 @@ def test_kalman_filter_update_per_discrete_state_pair(
     simple_2_state_params: tuple,
 ) -> None:
     """Tests the vmapped Kalman filter update step."""
-    A, Q, H, R, N, M, O = simple_2_state_params
+    A, Q, H, R, n_cont, n_disc, n_obs = simple_2_state_params
     mean_prev = jnp.array([[0.0], [5.0]]).T
     cov_prev = jnp.array([[[1.0]], [[2.0]]]).T
     obs = jnp.array([1.0])
@@ -272,9 +272,9 @@ def test_kalman_filter_update_per_discrete_state_pair(
         mean_prev, cov_prev, obs, A, Q, H, R
     )
 
-    assert pair_m.shape == (N, M, M)
-    assert pair_c.shape == (N, N, M, M)
-    assert pair_ll.shape == (M, M)
+    assert pair_m.shape == (n_cont, n_disc, n_disc)
+    assert pair_c.shape == (n_cont, n_cont, n_disc, n_disc)
+    assert pair_ll.shape == (n_disc, n_disc)
 
 
 def test_collapse_gaussian_mixture_per_discrete_state() -> None:
@@ -767,8 +767,6 @@ def test_m_step_two_identical_states(
 
     # 2. Setup SKF parameters for two identical states
     n_discrete_states = 2
-    n_cont_states = init_mean_kf.shape[0]
-    n_obs_dim = H_kf.shape[0]  # Assuming H_kf is (n_obs_dim, n_cont_states)
 
     # Initial continuous states (mean and cov are identical for both discrete states)
     skf_init_mean = jnp.stack([init_mean_kf] * n_discrete_states, axis=-1)
@@ -999,10 +997,8 @@ def test_m_step_continuous_transition_matrix_estimation():
     n_obs = 1
     n_disc = 1
 
-    # 2) Ground-truth A.
-    # **FIX**: Use eigenvalues closer to 1 to prevent exploding state values,
-    # which caused numerical instability with float32.
-    A_true_flat = jnp.array([[1.1, 0.1], [-0.05, 1.2]], dtype=jnp.float32)
+    # 2) Ground-truth A (asymmetric, stable with spectral radius < 1).
+    A_true_flat = jnp.array([[0.9, 0.1], [-0.05, 0.8]], dtype=jnp.float32)
     A_true = A_true_flat[..., None, None].transpose(
         2, 3, 0, 1
     )  # Shape (1,1,2,2) -> (2,2,1,1) -> (2,2,1)
@@ -1052,8 +1048,6 @@ def test_m_step_continuous_transition_scalar():
     n_disc = 1
 
     # 2) True A = 2
-    A_true = jnp.array([[[2.0]]], dtype=jnp.float32)  # shape (1,1,1)
-
     # 3) Trajectory: x = [1,2,4,8,16]
     x_t = jnp.array([[1.0], [2.0], [4.0], [8.0], [16.0]], dtype=jnp.float32)
 
@@ -1256,8 +1250,6 @@ def test_em_monotonic_single_state() -> None:
     standard Kalman filter, and EM should be exact (no approximation).
     """
     n_time = 100
-    n_cont = 1
-    n_obs = 1
 
     # Single state model
     init_mean = jnp.array([[0.0]])  # shape (1, 1)

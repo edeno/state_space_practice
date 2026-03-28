@@ -447,9 +447,9 @@ class TestPsdSolveProperties:
     def test_handles_identity_matrix_b(self, A: np.ndarray) -> None:
         """Solving A @ X = I should give the inverse of A."""
         A_jax = jnp.array(A)
-        I = jnp.eye(3)
+        identity = jnp.eye(3)
 
-        X = psd_solve(A_jax, I)
+        X = psd_solve(A_jax, identity)
 
         # A @ X should be close to identity (use atol for numerical precision)
         # Note: float32 precision limits accuracy to ~1e-5
@@ -1198,8 +1198,10 @@ class TestKalmanFilterMathCorrectness:
             L = np.linalg.cholesky(S)
             norm_innov[t] = np.linalg.solve(L, innovations[t])
 
-        # Lag-1 autocorrelation for each component
-        bartlett_bound = 5.0 / np.sqrt(n_time)  # 5-sigma
+        # Lag-1 autocorrelation for each component.
+        # Bartlett's formula: Var(r_k) ≈ 1/N for white noise.
+        # Using 5-sigma bound (p < 3e-7) to avoid flaky tests.
+        bartlett_bound = 5.0 / np.sqrt(n_time)
         for d in range(n_obs):
             v = norm_innov[:, d]
             autocorr = np.corrcoef(v[:-1], v[1:])[0, 1]
