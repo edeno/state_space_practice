@@ -11,6 +11,7 @@ import pytest
 
 from state_space_practice.point_process_kalman import (
     PointProcessModel,
+    _point_process_laplace_update,
     get_confidence_interval,
     kalman_maximization_step,
     log_conditional_intensity,
@@ -1541,3 +1542,308 @@ class TestGetRateEstimateMultiNeuron:
             posterior_cov, posterior_cov.T, rtol=1e-10,
             err_msg="Posterior covariance is not symmetric"
         )
+
+
+# --- Mathematical Correctness Tests ---
+
+
+class TestPointProcessGradientCorrectness:
+    """Tests verifying gradient/Hessian via finite differences.
+
+    Catches sign errors or missing terms in the analytical gradient/Hessian
+    that would be invisible to tests reimplementing the same formula.
+    """
+
+    def _make_log_intensity(
+        self, weights: jnp.ndarray, baseline: jnp.ndarray
+    ):
+        """Create a linear log-intensity function: log_lambda = baseline + W @ x."""
+        def log_intensity(x):
+            return jnp.atleast_1d(baseline + weights @ x)
+        return log_intensity
+
+    def _neg_log_posterior(
+        self, x, one_step_mean, prior_precision, spikes, dt, log_intensity_func
+    ):
+        """Compute negative log-posterior for finite difference checks."""
+        log_lambda = log_intensity_func(x)
+        cond_int = jnp.exp(log_lambda) * dt
+        log_lik = jnp.sum(spikes * jnp.log(cond_int + 1e-10) - cond_int)
+        delta = x - one_step_mean
+        log_prior = -0.5 * delta @ (prior_precision @ delta)
+        return -(log_lik + log_prior)
+
+    def test_gradient_matches_finite_difference(self) -> None:
+        """Analytical gradient should match finite-difference gradient."""
+        n_latent, n_neurons = 3, 4
+        dt = 0.01
+
+        key = jax.random.PRNGKey(42)
+        k1, k2, k3 = jax.random.split(key, 3)
+        weights = jax.random.normal(k1, (n_neurons, n_latent)) * 0.5
+        baseline = jax.random.normal(k2, (n_neurons,)) - 1.0
+        log_intensity_func = self._make_log_intensity(weights, baseline)
+
+        one_step_mean = jnp.zeros(n_latent)
+        prior_precision = jnp.eye(n_latent)
+        spikes = jnp.array([0.0, 1.0, 0.0, 2.0])
+
+        # Analytical gradient at the prior mean
+        log_lambda = log_intensity_func(one_step_mean)
+        cond_int = jnp.exp(log_lambda) * dt
+        innovation = spikes - cond_int
+        jacobian = jax.jacfwd(log_intensity_func)(one_step_mean)
+        analytical_grad = jacobian.T @ innovation  # prior grad = 0 at prior mean
+
+        # Finite-difference gradient
+        eps = 1e-5
+        fd_grad = np.zeros(n_latent)
+        for d in range(n_latent):
+            x_plus = np.array(one_step_mean).copy()
+            x_minus = np.array(one_step_mean).copy()
+            x_plus[d] += eps
+            x_minus[d] -= eps
+            f_plus = self._neg_log_posterior(
+                jnp.array(x_plus), one_step_mean, prior_precision,
+                spikes, dt, log_intensity_func
+            )
+            f_minus = self._neg_log_posterior(
+                jnp.array(x_minus), one_step_mean, prior_precision,
+                spikes, dt, log_intensity_func
+            )
+            fd_grad[d] = -(float(f_plus) - float(f_minus)) / (2 * eps)
+
+        np.testing.assert_allclose(
+            analytical_grad, fd_grad, rtol=1e-4, atol=1e-6,
+            err_msg="Analytical gradient should match finite differences"
+        )
+
+    def test_hessian_matches_finite_difference(self) -> None:
+        """Analytical Hessian should match finite-difference Hessian."""
+        n_latent, n_neurons = 3, 4
+        dt = 0.01
+
+        key = jax.random.PRNGKey(42)
+        k1, k2 = jax.random.split(key)
+        weights = jax.random.normal(k1, (n_neurons, n_latent)) * 0.5
+        baseline = jax.random.normal(k2, (n_neurons,)) - 1.0
+        log_intensity_func = self._make_log_intensity(weights, baseline)
+
+        one_step_mean = jnp.zeros(n_latent)
+        prior_precision = jnp.eye(n_latent)
+        spikes = jnp.array([0.0, 1.0, 0.0, 2.0])
+
+        # Analytical Hessian of negative log-posterior at prior mean
+        log_lambda = log_intensity_func(one_step_mean)
+        cond_int = jnp.exp(log_lambda) * dt
+        innovation = spikes - cond_int
+        jacobian = jax.jacfwd(log_intensity_func)(one_step_mean)
+        hessian_log_lambda = jax.jacfwd(jax.jacfwd(log_intensity_func))(one_step_mean)
+
+        fisher_info = jacobian.T @ (cond_int[:, None] * jacobian)
+        hessian_correction = jnp.einsum("n,nij->ij", innovation, hessian_log_lambda)
+        # Posterior precision = -Hessian of log-posterior
+        analytical_neg_hessian = prior_precision + fisher_info - hessian_correction
+
+        # Finite-difference Hessian of negative log-posterior
+        eps = 1e-4
+        fd_hessian = np.zeros((n_latent, n_latent))
+        for i in range(n_latent):
+            for j in range(n_latent):
+                x_pp = np.array(one_step_mean).copy()
+                x_pm = np.array(one_step_mean).copy()
+                x_mp = np.array(one_step_mean).copy()
+                x_mm = np.array(one_step_mean).copy()
+                x_pp[i] += eps
+                x_pp[j] += eps
+                x_pm[i] += eps
+                x_pm[j] -= eps
+                x_mp[i] -= eps
+                x_mp[j] += eps
+                x_mm[i] -= eps
+                x_mm[j] -= eps
+                f_pp = float(self._neg_log_posterior(
+                    jnp.array(x_pp), one_step_mean, prior_precision,
+                    spikes, dt, log_intensity_func
+                ))
+                f_pm = float(self._neg_log_posterior(
+                    jnp.array(x_pm), one_step_mean, prior_precision,
+                    spikes, dt, log_intensity_func
+                ))
+                f_mp = float(self._neg_log_posterior(
+                    jnp.array(x_mp), one_step_mean, prior_precision,
+                    spikes, dt, log_intensity_func
+                ))
+                f_mm = float(self._neg_log_posterior(
+                    jnp.array(x_mm), one_step_mean, prior_precision,
+                    spikes, dt, log_intensity_func
+                ))
+                fd_hessian[i, j] = (f_pp - f_pm - f_mp + f_mm) / (4 * eps**2)
+
+        np.testing.assert_allclose(
+            analytical_neg_hessian, fd_hessian, rtol=1e-3, atol=1e-5,
+            err_msg="Analytical Hessian should match finite differences"
+        )
+
+
+class TestPointProcessMathCorrectness:
+    """Tests verifying mathematical properties of the Laplace-EKF update."""
+
+    def test_laplace_update_single_neuron_analytical(self) -> None:
+        """1D state, linear log-intensity: verify against hand-derived solution.
+
+        For log_lambda = x, prior N(m, P), y spikes:
+          gradient at m = y - exp(m)*dt
+          precision at m = 1/P + exp(m)*dt
+          posterior mean = m + gradient / precision
+          posterior cov = 1 / precision
+        """
+        dt = 0.02
+
+        def log_intensity(x):
+            return jnp.atleast_1d(x)  # log_lambda = x
+
+        for y, label in [(0.0, "no_spike"), (1.0, "spike")]:
+            m = jnp.array([0.0])
+            P = jnp.array([[1.0]])
+            spikes = jnp.array([y])
+
+            lambda_dt = jnp.exp(m[0]) * dt  # exp(0)*0.02 = 0.02
+            gradient = y - lambda_dt
+            precision = 1.0 / P[0, 0] + lambda_dt
+            expected_mean = m[0] + float(gradient / precision)
+            expected_cov = 1.0 / float(precision)
+
+            post_mean, post_cov, _ = _point_process_laplace_update(
+                m, P, spikes, dt, log_intensity,
+                include_laplace_normalization=False,
+            )
+
+            np.testing.assert_allclose(
+                post_mean[0], expected_mean, rtol=1e-4,
+                err_msg=f"Mean wrong for {label}"
+            )
+            np.testing.assert_allclose(
+                post_cov[0, 0], expected_cov, rtol=1e-4,
+                err_msg=f"Cov wrong for {label}"
+            )
+
+    def test_zero_spike_pushes_mean_toward_lower_intensity(self) -> None:
+        """y=0 should decrease the posterior mean (lower intensity)."""
+        dt = 0.02
+
+        def log_intensity(x):
+            return jnp.atleast_1d(x[0])
+
+        m = jnp.array([1.0])  # moderate intensity
+        P = jnp.array([[1.0]])
+        spikes = jnp.array([0.0])
+
+        post_mean, _, _ = _point_process_laplace_update(
+            m, P, spikes, dt, log_intensity,
+            include_laplace_normalization=False,
+        )
+
+        assert post_mean[0] < m[0] - 1e-8, (
+            f"Zero spikes should decrease mean: prior={m[0]:.6f}, "
+            f"posterior={post_mean[0]:.6f}"
+        )
+
+    def test_posterior_concentrates_with_more_spikes(self) -> None:
+        """With multiple Newton iterations, more spikes should tighten the posterior.
+
+        For linear log-intensity, the single-step Laplace precision is
+        data-independent (Fisher info depends only on the predicted intensity).
+        With multiple Newton steps, the posterior mode shifts, changing the
+        intensity at the evaluation point, so precision becomes data-dependent.
+        """
+        dt = 0.02
+
+        def log_intensity(x):
+            return jnp.atleast_1d(x[0])
+
+        m = jnp.array([1.0])
+        P = jnp.array([[2.0]])
+
+        covs = []
+        for y in [0.0, 1.0, 5.0, 10.0]:
+            _, post_cov, _ = _point_process_laplace_update(
+                m, P, jnp.array([y]), dt, log_intensity,
+                include_laplace_normalization=False,
+                max_newton_iter=5,
+            )
+            covs.append(float(post_cov[0, 0]))
+
+        # With multiple Newton steps, higher spike count → higher posterior mode
+        # → higher exp(x*) → higher Fisher info → tighter posterior
+        for i in range(len(covs) - 1):
+            assert covs[i] >= covs[i + 1] - 1e-10, (
+                f"Cov should decrease with more spikes: "
+                f"y={[0,1,5,10][i]} cov={covs[i]:.6f} vs "
+                f"y={[0,1,5,10][i+1]} cov={covs[i+1]:.6f}"
+            )
+
+    def test_multi_neuron_reduces_posterior_variance(self) -> None:
+        """More neurons observing the same state should reduce uncertainty."""
+        n_latent = 2
+        dt = 0.02
+        m = jnp.ones(n_latent)
+        P = jnp.eye(n_latent)
+
+        traces = []
+        for n_neurons in [1, 5, 20]:
+            key = jax.random.PRNGKey(n_neurons)
+            weights = jax.random.normal(key, (n_neurons, n_latent)) * 0.3
+            baseline = -jnp.ones(n_neurons)
+
+            def log_intensity(x, w=weights, b=baseline):
+                return jnp.atleast_1d(b + w @ x)
+
+            spikes = jnp.ones(n_neurons)
+            _, post_cov, _ = _point_process_laplace_update(
+                m, P, spikes, dt, log_intensity,
+                include_laplace_normalization=False,
+            )
+            traces.append(float(jnp.trace(post_cov)))
+
+        for i in range(len(traces) - 1):
+            assert traces[i] > traces[i + 1], (
+                f"Trace should decrease with more neurons: "
+                f"n={[1,5,20][i]} trace={traces[i]:.6f} vs "
+                f"n={[1,5,20][i+1]} trace={traces[i+1]:.6f}"
+            )
+
+
+class TestPointProcessNumericalStability:
+    """Tests for point-process filter numerical stability."""
+
+    def test_filter_very_sparse_spikes(self) -> None:
+        """Very sparse spikes (~5 in 5000 bins): should stay finite."""
+        n_time = 5000
+        dt = 0.001
+        n_params = 3  # intercept + 2 latent weights
+
+        A = jnp.eye(n_params) * 0.999
+        Q = jnp.eye(n_params) * 0.001
+        init_mean = jnp.array([-7.0, 0.0, 0.0])
+        init_cov = jnp.eye(n_params)
+
+        # Design matrix: intercept + 2 zero-valued features
+        design_matrix = jnp.concatenate(
+            [jnp.ones((n_time, 1)), jnp.zeros((n_time, 2))], axis=-1
+        )
+
+        # Generate sparse spikes (very low rate)
+        key = jax.random.PRNGKey(42)
+        log_rate = log_conditional_intensity(design_matrix, init_mean)
+        rate = jnp.exp(log_rate) * dt
+        spikes = jax.random.poisson(key, rate).astype(float)
+
+        filtered_mean, filtered_cov, mll = stochastic_point_process_filter(
+            init_mean, init_cov, design_matrix, spikes[:, None], dt,
+            A, Q, log_conditional_intensity,
+        )
+
+        assert jnp.all(jnp.isfinite(filtered_mean)), "Means should be finite"
+        assert jnp.all(jnp.isfinite(filtered_cov)), "Covs should be finite"
+        assert jnp.isfinite(mll), "MLL should be finite"

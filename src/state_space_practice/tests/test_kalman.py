@@ -1,11 +1,17 @@
 from typing import Tuple
 
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from jax import Array, random
+
+from scipy.linalg import solve_discrete_are
 
 from state_space_practice.kalman import (
     kalman_filter,
@@ -642,14 +648,14 @@ class TestKalmanSmootherProperties:
         _, filter_cov, _ = kalman_filter(init_mean, init_cov, obs, A, Q, H, R)
         _, smoother_cov, _, _ = kalman_smoother(init_mean, init_cov, obs, A, Q, H, R)
 
-        # Smoother should have <= uncertainty (by trace)
-        # Allow small numerical tolerance
+        # Smoother should have strictly lower uncertainty than filter at interior times
         for t in range(n_time - 1):  # Exclude last step where they're equal
             filter_trace = jnp.trace(filter_cov[t])
             smoother_trace = jnp.trace(smoother_cov[t])
-            assert (
-                smoother_trace <= filter_trace + 1e-6
-            ), f"Smoother trace > filter trace at t={t}"
+            assert smoother_trace <= filter_trace, (
+                f"Smoother trace {smoother_trace:.6f} > filter trace "
+                f"{filter_trace:.6f} at t={t}"
+            )
 
     @given(kalman_model_params(n_cont_states=2, n_obs_dim=2))
     @settings(max_examples=20, deadline=None)
@@ -1025,3 +1031,428 @@ class TestKalmanFilterInputHandling:
 
         assert filtered_mean.shape == (10, n_states)
         assert jnp.isfinite(mll)
+
+
+# --- Mathematical Correctness Tests ---
+
+
+def _make_asymmetric_stable_A(n: int, seed: int = 0) -> jnp.ndarray:
+    """Create an asymmetric stable transition matrix with distinct eigenvalues."""
+    key = random.PRNGKey(seed)
+    # Random eigenvectors (non-orthogonal)
+    V = random.normal(key, (n, n)) * 0.3 + jnp.eye(n)
+    # Distinct eigenvalues in (0.5, 0.95)
+    eigs = jnp.linspace(0.5, 0.95, n)
+    A = V @ jnp.diag(eigs) @ jnp.linalg.inv(V)
+    return A
+
+
+def _simulate_from_model(
+    A: jnp.ndarray,
+    Q: jnp.ndarray,
+    H: jnp.ndarray,
+    R: jnp.ndarray,
+    init_mean: jnp.ndarray,
+    init_cov: jnp.ndarray,
+    n_time: int,
+    seed: int = 0,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Simulate observations and states from a linear Gaussian model."""
+    key = random.PRNGKey(seed)
+    n_state = A.shape[0]
+    n_obs = H.shape[0]
+
+    states = np.zeros((n_time, n_state))
+    obs = np.zeros((n_time, n_obs))
+
+    key_init, key = random.split(key)
+    states[0] = np.array(
+        random.multivariate_normal(key_init, init_mean, init_cov)
+    )
+    for t in range(n_time):
+        if t > 0:
+            key_proc, key = random.split(key)
+            states[t] = np.array(A) @ states[t - 1] + np.array(
+                random.multivariate_normal(key_proc, jnp.zeros(n_state), Q)
+            )
+        key_obs, key = random.split(key)
+        obs[t] = np.array(H) @ states[t] + np.array(
+            random.multivariate_normal(key_obs, jnp.zeros(n_obs), R)
+        )
+
+    return jnp.array(obs), jnp.array(states)
+
+
+class TestKalmanFilterMathCorrectness:
+    """Tests verifying mathematical correctness of the Kalman filter.
+
+    Uses asymmetric A matrices and independent reference implementations
+    to catch transpose, indexing, and formula errors.
+    """
+
+    def test_filter_steady_state_covariance_matches_dare(self) -> None:
+        """Filter covariance should converge to the DARE solution (scipy)."""
+        n_state, n_obs = 3, 2
+        A = _make_asymmetric_stable_A(n_state, seed=0)
+        Q = jnp.eye(n_state) * 0.1
+        H = jnp.array([[1.0, 0.3, -0.1], [0.0, 0.8, 0.5]])
+        R = jnp.eye(n_obs) * 0.5
+
+        # scipy DARE: different algorithm (Schur decomposition of symplectic pencil)
+        # Solves: P = A P A^T + Q - A P H^T (H P H^T + R)^{-1} H P A^T
+        P_dare = jnp.array(
+            solve_discrete_are(
+                np.array(A).T, np.array(H).T, np.array(Q), np.array(R)
+            )
+        )
+
+        init_mean = jnp.zeros(n_state)
+        init_cov = jnp.eye(n_state)
+        obs = random.normal(random.PRNGKey(42), (500, n_obs))
+
+        _, filtered_cov, _ = kalman_filter(init_mean, init_cov, obs, A, Q, H, R)
+
+        # The filter's predicted covariance converges to the DARE solution.
+        P_pred_last = A @ filtered_cov[-1] @ A.T + Q
+        np.testing.assert_allclose(
+            P_pred_last, P_dare, rtol=1e-4, atol=1e-6,
+            err_msg="Filter predicted covariance should converge to DARE solution"
+        )
+
+    def test_filter_matches_numpy_reference(self) -> None:
+        """Filter should match an independent numpy implementation."""
+        n_state, n_obs = 3, 2
+        A = _make_asymmetric_stable_A(n_state, seed=1)
+        Q = jnp.eye(n_state) * 0.2
+        H = jnp.array([[1.0, -0.5, 0.2], [0.3, 1.0, -0.1]])
+        R = jnp.eye(n_obs) * 0.5
+        init_mean = jnp.zeros(n_state)
+        init_cov = jnp.eye(n_state)
+        obs = random.normal(random.PRNGKey(99), (20, n_obs))
+
+        # Reference: plain numpy predict-update loop
+        # Library convention: every step does predict-then-update, including t=0.
+        # init_mean/init_cov represent state at t=0; first obs is at t=1.
+        m = np.array(init_mean)
+        P = np.array(init_cov)
+        A_np, Q_np, H_np, R_np = (
+            np.array(A), np.array(Q), np.array(H), np.array(R)
+        )
+        obs_np = np.array(obs)
+        ref_means, ref_covs = [], []
+        for t in range(20):
+            # Predict
+            m = A_np @ m
+            P = A_np @ P @ A_np.T + Q_np
+            # Update
+            S = H_np @ P @ H_np.T + R_np
+            K = P @ H_np.T @ np.linalg.inv(S)
+            v = obs_np[t] - H_np @ m
+            m = m + K @ v
+            IKH = np.eye(n_state) - K @ H_np
+            P = IKH @ P @ IKH.T + K @ R_np @ K.T
+            P = 0.5 * (P + P.T)
+            ref_means.append(m.copy())
+            ref_covs.append(P.copy())
+        ref_means = np.array(ref_means)
+        ref_covs = np.array(ref_covs)
+
+        filtered_mean, filtered_cov, _ = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        np.testing.assert_allclose(
+            filtered_mean, ref_means, rtol=1e-8, atol=1e-10,
+            err_msg="Filter means should match numpy reference"
+        )
+        np.testing.assert_allclose(
+            filtered_cov, ref_covs, rtol=1e-8, atol=1e-10,
+            err_msg="Filter covariances should match numpy reference"
+        )
+
+    def test_1d_kalman_steady_state_analytical(self) -> None:
+        """1D random walk: filter cov should converge to closed-form solution."""
+        q, r = 0.1, 1.0
+        # Steady-state filtered cov satisfies: P = (P + q) * r / (P + q + r)
+        # Solving: P^2 + P*q - q*r = 0
+        # P_filtered = (-q + sqrt(q^2 + 4*q*r)) / 2
+        P_filtered_inf = (-q + np.sqrt(q**2 + 4 * q * r)) / 2
+
+        A = jnp.array([[1.0]])
+        Q = jnp.array([[q]])
+        H = jnp.array([[1.0]])
+        R = jnp.array([[r]])
+        init_mean = jnp.array([0.0])
+        init_cov = jnp.array([[1.0]])
+        obs = random.normal(random.PRNGKey(0), (200, 1))
+
+        _, filtered_cov, _ = kalman_filter(init_mean, init_cov, obs, A, Q, H, R)
+
+        np.testing.assert_allclose(
+            filtered_cov[-1, 0, 0], P_filtered_inf, rtol=1e-4,
+            err_msg="1D filter should converge to analytical steady state"
+        )
+
+    def test_filter_innovations_are_white(self) -> None:
+        """Normalized innovations should have near-zero lag-1 autocorrelation.
+
+        Uses fixed seed and 5-sigma Bartlett bound to avoid flakiness.
+        """
+        n_state, n_obs = 2, 2
+        A = _make_asymmetric_stable_A(n_state, seed=3)
+        Q = jnp.eye(n_state) * 0.1
+        H = jnp.array([[1.0, 0.3], [-0.2, 0.9]])
+        R = jnp.eye(n_obs) * 0.5
+        init_mean = jnp.zeros(n_state)
+        init_cov = jnp.eye(n_state)
+        n_time = 2000
+
+        obs, _ = _simulate_from_model(
+            A, Q, H, R, init_mean, init_cov, n_time, seed=0
+        )
+        filtered_mean, filtered_cov, _ = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        # Compute innovations: v_t = y_t - H @ m_{t|t-1}
+        # Library predicts at every step: m_{t|t-1} = A @ m_{t-1|t-1}
+        # For t=0: m_{0|-1} = A @ init_mean
+        innovations = np.zeros((n_time, n_obs))
+        pred_mean_0 = A @ init_mean
+        innovations[0] = np.array(obs[0] - H @ pred_mean_0)
+        for t in range(1, n_time):
+            pred_mean = A @ filtered_mean[t - 1]
+            innovations[t] = np.array(obs[t] - H @ pred_mean)
+
+        # Normalize by innovation covariance
+        norm_innov = np.zeros_like(innovations)
+        P_pred_0 = np.array(A @ init_cov @ A.T + Q)
+        S0 = np.array(H) @ P_pred_0 @ np.array(H).T + np.array(R)
+        S0 = 0.5 * (S0 + S0.T)
+        L0 = np.linalg.cholesky(S0)
+        norm_innov[0] = np.linalg.solve(L0, innovations[0])
+        for t in range(1, n_time):
+            P_pred = np.array(A @ filtered_cov[t - 1] @ A.T + Q)
+            S = np.array(H) @ P_pred @ np.array(H).T + np.array(R)
+            S = 0.5 * (S + S.T)
+            L = np.linalg.cholesky(S)
+            norm_innov[t] = np.linalg.solve(L, innovations[t])
+
+        # Lag-1 autocorrelation for each component
+        bartlett_bound = 5.0 / np.sqrt(n_time)  # 5-sigma
+        for d in range(n_obs):
+            v = norm_innov[:, d]
+            autocorr = np.corrcoef(v[:-1], v[1:])[0, 1]
+            assert abs(autocorr) < bartlett_bound, (
+                f"Innovation dim {d} lag-1 autocorrelation {autocorr:.4f} "
+                f"exceeds 5-sigma bound {bartlett_bound:.4f}"
+            )
+
+
+class TestKalmanSmootherMathCorrectness:
+    """Tests verifying mathematical correctness of the RTS smoother."""
+
+    def test_smoother_cross_cov_identity_asymmetric_A(self) -> None:
+        """Cross-covariance should satisfy P_{t,t+1|T} = G_t @ P_{t+1|T}.
+
+        G_t is recomputed independently from filter outputs, creating a
+        three-way consistency check between filter_cov, smoother_cov, cross_cov.
+        """
+        n_state, n_obs = 3, 2
+        A = _make_asymmetric_stable_A(n_state, seed=5)
+        Q = jnp.eye(n_state) * 0.15
+        H = jnp.array([[1.0, 0.3, -0.1], [0.0, 0.8, 0.5]])
+        R = jnp.eye(n_obs) * 0.5
+        init_mean = jnp.zeros(n_state)
+        init_cov = jnp.eye(n_state)
+
+        obs = random.normal(random.PRNGKey(123), (50, n_obs))
+        filtered_mean, filtered_cov, _ = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+        _, smoother_cov, smoother_cross_cov, _ = kalman_smoother(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        for t in range(49):
+            P_pred = A @ filtered_cov[t] @ A.T + Q
+            P_pred_sym = 0.5 * (P_pred + P_pred.T)
+            G_t = filtered_cov[t] @ A.T @ jnp.linalg.inv(P_pred_sym)
+
+            expected_cross_cov = G_t @ smoother_cov[t + 1]
+            np.testing.assert_allclose(
+                smoother_cross_cov[t], expected_cross_cov,
+                rtol=1e-5, atol=1e-8,
+                err_msg=f"Cross-cov identity failed at t={t}"
+            )
+
+    def test_smoother_mean_satisfies_rts_recursion(self) -> None:
+        """Smoother mean should satisfy the RTS backward recursion.
+
+        m_{t|T} = m_{t|t} + G_t(m_{t+1|T} - A m_{t|t}).
+        """
+        n_state, n_obs = 3, 2
+        A = _make_asymmetric_stable_A(n_state, seed=7)
+        Q = jnp.eye(n_state) * 0.1
+        H = jnp.array([[1.0, 0.0, 0.5], [-0.3, 1.0, 0.0]])
+        R = jnp.eye(n_obs) * 0.3
+        init_mean = jnp.zeros(n_state)
+        init_cov = jnp.eye(n_state)
+
+        obs = random.normal(random.PRNGKey(77), (30, n_obs))
+        filtered_mean, filtered_cov, _ = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+        smoother_mean, _, _, _ = kalman_smoother(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        for t in range(29):
+            P_pred = A @ filtered_cov[t] @ A.T + Q
+            P_pred_sym = 0.5 * (P_pred + P_pred.T)
+            G_t = filtered_cov[t] @ A.T @ jnp.linalg.inv(P_pred_sym)
+
+            expected = filtered_mean[t] + G_t @ (
+                smoother_mean[t + 1] - A @ filtered_mean[t]
+            )
+            np.testing.assert_allclose(
+                smoother_mean[t], expected, rtol=1e-5, atol=1e-8,
+                err_msg=f"RTS recursion failed at t={t}"
+            )
+
+
+class TestKalmanEMMonotonicity:
+    """Tests verifying EM log-likelihood monotonicity."""
+
+    def test_em_log_likelihood_monotonic_asymmetric_A(self) -> None:
+        """Linear Gaussian EM: log-likelihood must be non-decreasing."""
+        n_state, n_obs = 2, 2
+        A_true = _make_asymmetric_stable_A(n_state, seed=15)
+        Q_true = jnp.eye(n_state) * 0.2
+        H_true = jnp.array([[1.0, 0.3], [-0.2, 0.9]])
+        R_true = jnp.eye(n_obs) * 0.5
+        init_mean_true = jnp.zeros(n_state)
+        init_cov_true = jnp.eye(n_state)
+
+        obs, _ = _simulate_from_model(
+            A_true, Q_true, H_true, R_true, init_mean_true, init_cov_true,
+            200, seed=42
+        )
+
+        # Start from perturbed parameters
+        A = jnp.eye(n_state) * 0.5
+        Q = jnp.eye(n_state)
+        H = jnp.eye(n_obs, n_state)
+        R = jnp.eye(n_obs) * 2.0
+        init_mean = jnp.zeros(n_state)
+        init_cov = jnp.eye(n_state) * 2.0
+
+        log_likelihoods = []
+        for _ in range(15):
+            _, _, mll = kalman_filter(init_mean, init_cov, obs, A, Q, H, R)
+            log_likelihoods.append(float(mll))
+
+            sm, sc, scc, _ = kalman_smoother(init_mean, init_cov, obs, A, Q, H, R)
+            A, H, Q, R, init_mean, init_cov = kalman_maximization_step(
+                obs, sm, sc, scc
+            )
+
+        for i in range(1, len(log_likelihoods)):
+            assert log_likelihoods[i] >= log_likelihoods[i - 1] - 1e-6, (
+                f"EM monotonicity violated: LL[{i}]={log_likelihoods[i]:.6f} "
+                f"< LL[{i-1}]={log_likelihoods[i-1]:.6f}"
+            )
+
+
+class TestKalmanMStepMathCorrectness:
+    """Tests verifying the EM M-step computes correct parameter estimates."""
+
+    def test_mstep_A_satisfies_normal_equations(self) -> None:
+        """M-step output A should satisfy A @ gamma1 = beta.
+
+        gamma1 and beta are recomputed from smoother outputs using numpy.
+        """
+        n_state, n_obs = 3, 2
+        A = _make_asymmetric_stable_A(n_state, seed=10)
+        Q = jnp.eye(n_state) * 0.2
+        H = jnp.array([[1.0, 0.5, -0.2], [0.0, 0.8, 0.3]])
+        R = jnp.eye(n_obs) * 0.5
+        init_mean = jnp.zeros(n_state)
+        init_cov = jnp.eye(n_state)
+
+        obs, _ = _simulate_from_model(A, Q, H, R, init_mean, init_cov, 200, seed=42)
+        sm, sc, scc, _ = kalman_smoother(init_mean, init_cov, obs, A, Q, H, R)
+
+        A_est, _, _, _, _, _ = kalman_maximization_step(obs, sm, sc, scc)
+
+        # Recompute gamma1 and beta from smoother outputs (plain numpy)
+        sm_np, sc_np, scc_np = np.array(sm), np.array(sc), np.array(scc)
+
+        gamma1 = np.zeros((n_state, n_state))
+        for t in range(199):
+            gamma1 += sc_np[t] + np.outer(sm_np[t], sm_np[t])
+
+        beta = np.zeros((n_state, n_state))
+        for t in range(199):
+            beta += scc_np[t].T + np.outer(sm_np[t + 1], sm_np[t])
+
+        lhs = np.array(A_est) @ gamma1
+        np.testing.assert_allclose(
+            lhs, beta, rtol=1e-4, atol=1e-7,
+            err_msg="M-step A should satisfy normal equations A @ gamma1 = beta"
+        )
+
+
+class TestKalmanNumericalStability:
+    """Tests for numerical stability under adversarial conditions."""
+
+    def test_filter_nearly_unobservable_state(self) -> None:
+        """Nearly unobservable dimension should retain large uncertainty."""
+        n_state, n_obs = 3, 2
+        A = _make_asymmetric_stable_A(n_state, seed=20)
+        Q = jnp.eye(n_state) * 0.1
+        H = jnp.array([[1.0, 0.0, 0.0], [0.0, 1.0, 1e-8]])
+        R = jnp.eye(n_obs) * 0.5
+        init_mean = jnp.zeros(n_state)
+        init_cov = jnp.eye(n_state)
+
+        obs = random.normal(random.PRNGKey(42), (100, n_obs))
+        filtered_mean, filtered_cov, mll = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        assert jnp.all(jnp.isfinite(filtered_mean)), "Means should be finite"
+        assert jnp.all(jnp.isfinite(filtered_cov)), "Covariances should be finite"
+        assert jnp.isfinite(mll), "MLL should be finite"
+
+        for t in range(100):
+            eigvals = jnp.linalg.eigvalsh(filtered_cov[t])
+            assert jnp.all(eigvals > -1e-8), f"Cov not PSD at t={t}"
+
+        assert filtered_cov[-1, 2, 2] > filtered_cov[-1, 0, 0], (
+            "Unobserved state should have larger uncertainty"
+        )
+
+    def test_filter_nearly_unstable_dynamics(self) -> None:
+        """Spectral radius near 1: filter should stay finite for 500 steps."""
+        n_state = 2
+        V = jnp.array([[1.0, 0.3], [-0.1, 1.0]])
+        A = V @ jnp.diag(jnp.array([0.999, 0.998])) @ jnp.linalg.inv(V)
+        Q = jnp.eye(n_state) * 0.001
+        H = jnp.eye(n_state)
+        R = jnp.eye(n_state) * 1.0
+        init_mean = jnp.zeros(n_state)
+        init_cov = jnp.eye(n_state)
+
+        obs = random.normal(random.PRNGKey(42), (500, n_state))
+        filtered_mean, filtered_cov, mll = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        assert jnp.all(jnp.isfinite(filtered_mean)), "Means should be finite"
+        assert jnp.all(jnp.isfinite(filtered_cov)), "Covariances should be finite"
+        assert jnp.isfinite(mll), "MLL should be finite"
+
+        for t in range(500):
+            eigvals = jnp.linalg.eigvalsh(filtered_cov[t])
+            assert jnp.all(eigvals > -1e-8), f"Cov not PSD at t={t}"

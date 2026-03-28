@@ -1140,15 +1140,15 @@ def update_spike_glm_params(
         time_weights = jnp.ones(n_time)
     else:
         time_weights = jnp.asarray(time_weights)
+        # Shape validation (static, works in traced context)
         if time_weights.shape != (n_time,):
             raise ValueError(
                 f"time_weights shape {time_weights.shape} incompatible with "
                 f"expected shape ({n_time},)"
             )
-        if not jnp.all(jnp.isfinite(time_weights)):
-            raise ValueError("time_weights contains NaN or Inf values")
-        if jnp.any(time_weights < 0):
-            raise ValueError("time_weights must be non-negative")
+        # Note: We don't validate finite/non-negative here because this function
+        # may be called inside JAX traced contexts (e.g., lax.cond, vmap).
+        # Callers are responsible for ensuring valid weights.
 
     # Validate inputs for second-order method
     if use_second_order:
@@ -1564,7 +1564,7 @@ class SwitchingSpikeOscillatorModel:
         Whether to update Z (discrete transitions) during M-step.
     update_spike_params : bool, default=True
         Whether to update spike GLM parameters (baseline, weights) during M-step.
-    separate_spike_params : bool, default=False
+    separate_spike_params : bool, default=True
         Whether to fit separate spike GLM parameters per discrete state.
     update_init_mean : bool, default=True
         Whether to update initial mean during M-step.
@@ -1598,6 +1598,8 @@ class SwitchingSpikeOscillatorModel:
 
     Examples
     --------
+    Separate spike GLM parameters per discrete state (default):
+
     >>> import jax.numpy as jnp
     >>> model = SwitchingSpikeOscillatorModel(
     ...     n_oscillators=2,
@@ -1610,6 +1612,21 @@ class SwitchingSpikeOscillatorModel:
     4
     >>> model.n_discrete_states
     3
+    >>> model.separate_spike_params
+    True
+
+    Shared spike GLM parameters across all discrete states:
+
+    >>> model_shared = SwitchingSpikeOscillatorModel(
+    ...     n_oscillators=2,
+    ...     n_neurons=10,
+    ...     n_discrete_states=3,
+    ...     sampling_freq=100.0,
+    ...     dt=0.01,
+    ...     separate_spike_params=False,
+    ... )
+    >>> model_shared.separate_spike_params
+    False
     """
 
     def __init__(
@@ -1624,7 +1641,7 @@ class SwitchingSpikeOscillatorModel:
         update_process_cov: bool = True,
         update_discrete_transition_matrix: bool = True,
         update_spike_params: bool = True,
-        separate_spike_params: bool = False,
+        separate_spike_params: bool = True,
         update_init_mean: bool = True,
         update_init_cov: bool = True,
         q_regularization: QRegularizationConfig | None = None,
@@ -1656,7 +1673,7 @@ class SwitchingSpikeOscillatorModel:
             Update Z during M-step.
         update_spike_params : bool, default=True
             Update spike GLM params during M-step.
-        separate_spike_params : bool, default=False
+        separate_spike_params : bool, default=True
             If True, fit a separate spike GLM (baseline, weights) per discrete state.
         update_init_mean : bool, default=True
             Update initial mean during M-step.
