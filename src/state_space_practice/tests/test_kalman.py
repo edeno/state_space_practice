@@ -55,46 +55,6 @@ def test_psd_solve() -> None:
     assert not jnp.any(jnp.isnan(x_ns))
 
 
-@pytest.fixture(scope="module")
-def simple_1d_model() -> Tuple[Array, Array, Array, Array, Array, Array, Array]:
-    """Provides parameters and data for a simple 1D random walk model."""
-    key = random.PRNGKey(0)
-    n_time = 50
-    n_cont_states = 1
-    n_obs_dim = 1
-
-    init_mean = jnp.array([0.0])
-    init_cov = jnp.eye(n_cont_states) * 1.0
-    transition_matrix = jnp.eye(n_cont_states) * 1.0
-    process_cov = jnp.eye(n_cont_states) * 0.1
-    measurement_matrix = jnp.eye(n_obs_dim, n_cont_states)
-    measurement_cov = jnp.eye(n_obs_dim) * 1.0
-
-    true_states = [init_mean]
-    obs = []
-    k1, k2 = random.split(key)
-
-    for t in range(1, n_time):
-        w = random.multivariate_normal(k1, jnp.zeros(n_cont_states), process_cov)
-        true_states.append(transition_matrix @ true_states[-1] + w)
-        k1, _ = random.split(k1)
-
-    for t in range(n_time):
-        v = random.multivariate_normal(k2, jnp.zeros(n_obs_dim), measurement_cov)
-        obs.append(measurement_matrix @ true_states[t] + v)
-        k2, _ = random.split(k2)
-
-    return (
-        init_mean,
-        init_cov,
-        jnp.array(obs),
-        transition_matrix,
-        process_cov,
-        measurement_matrix,
-        measurement_cov,
-    )
-
-
 def test_kalman_filter_shapes_and_likelihood(simple_1d_model: tuple) -> None:
     """Tests Kalman filter output shapes and likelihood value."""
     (

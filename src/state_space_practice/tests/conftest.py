@@ -1,11 +1,18 @@
 """Shared fixtures and Hypothesis strategies for state space model tests."""
 
+from typing import Tuple
+
 import jax
+
+jax.config.update("jax_enable_x64", True)
+
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from hypothesis import settings
 from hypothesis import strategies as st
 from hypothesis.extra.numpy import arrays
+from jax import Array, random
 
 # Configure Hypothesis for JAX compatibility
 # CI profile: More thorough testing for numerical algorithms
@@ -491,3 +498,49 @@ def gaussian_mixture_params(
 def to_jax(*arrays: np.ndarray) -> tuple[jax.Array, ...]:
     """Convert numpy arrays to JAX arrays."""
     return tuple(jnp.array(arr) for arr in arrays)
+
+
+# --- Shared Fixtures ---
+
+
+@pytest.fixture(scope="session")
+def simple_1d_model() -> Tuple[Array, Array, Array, Array, Array, Array, Array]:
+    """Provides parameters and data for a simple 1D random walk model.
+
+    Used by both test_kalman.py and test_switching_kalman.py.
+    """
+    key = random.PRNGKey(0)
+    n_time = 50
+    n_cont_states = 1
+    n_obs_dim = 1
+
+    init_mean = jnp.array([0.0])
+    init_cov = jnp.eye(n_cont_states) * 1.0
+    transition_matrix = jnp.eye(n_cont_states) * 1.0
+    process_cov = jnp.eye(n_cont_states) * 0.1
+    measurement_matrix = jnp.eye(n_obs_dim, n_cont_states)
+    measurement_cov = jnp.eye(n_obs_dim) * 1.0
+
+    true_states = [init_mean]
+    obs = []
+    k1, k2 = random.split(key)
+
+    for t in range(1, n_time):
+        w = random.multivariate_normal(k1, jnp.zeros(n_cont_states), process_cov)
+        true_states.append(transition_matrix @ true_states[-1] + w)
+        k1, _ = random.split(k1)
+
+    for t in range(n_time):
+        v = random.multivariate_normal(k2, jnp.zeros(n_obs_dim), measurement_cov)
+        obs.append(measurement_matrix @ true_states[t] + v)
+        k2, _ = random.split(k2)
+
+    return (
+        init_mean,
+        init_cov,
+        jnp.array(obs),
+        transition_matrix,
+        process_cov,
+        measurement_matrix,
+        measurement_cov,
+    )

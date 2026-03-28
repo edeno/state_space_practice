@@ -7214,3 +7214,303 @@ class TestMilestone8EndToEnd:
                 det_covs[:, :, j], pair_cond_covs[:, :, j, j], rtol=1e-5,
                 err_msg="Deterministic weights: cov should equal diagonal pair"
             )
+
+
+# --- EM Verification Tests ---
+
+
+class TestEMVerification:
+    """Tests that directly verify EM algorithm correctness for point-process models.
+
+    These tests go beyond structural checks to verify that:
+    1. Degenerate cases match known analytical solutions
+    2. The M-step increases the Q-function
+    3. Parameters can be recovered from simulated data
+    4. Discrete states can be recovered from distinct firing patterns
+    """
+
+    def test_constant_state_recovers_poisson_mle(self) -> None:
+        """With A=I, Q=0, the spike GLM M-step should recover the Poisson MLE.
+
+        When the latent state is constant (no dynamics noise), the model
+        reduces to a standard Poisson GLM. The MLE for the baseline is
+        log(total_spikes / (T * dt)), and the weights should be near zero.
+        """
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            update_spike_glm_params,
+        )
+
+        n_time = 2000
+        n_neurons = 3
+        n_latent = 2
+        dt = 0.01
+
+        # Generate spikes from known constant rates
+        true_rates = jnp.array([5.0, 10.0, 20.0])  # Hz
+        key = jax.random.PRNGKey(42)
+        spikes = jax.random.poisson(
+            key, true_rates[None, :] * dt, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        # Smoother output: constant zero state with zero covariance
+        smoother_mean = jnp.zeros((n_time, n_latent))
+        smoother_cov = jnp.zeros((n_time, n_latent, n_latent))
+
+        # Initial params: wrong baseline, small weights
+        init_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.zeros((n_neurons, n_latent)),
+        )
+
+        # Run multiple M-step iterations
+        updated = update_spike_glm_params(
+            spikes=spikes,
+            smoother_mean=smoother_mean,
+            current_params=init_params,
+            dt=dt,
+            smoother_cov=smoother_cov,
+            use_second_order=True,
+            max_iter=20,
+        )
+
+        # Expected baseline: log(mean_count / dt)
+        # With zero state and zero weights, exp(baseline) * dt = expected count
+        mean_counts = jnp.mean(spikes, axis=0)
+        expected_baseline = jnp.log(mean_counts / dt + 1e-10)
+
+        np.testing.assert_allclose(
+            updated.baseline, expected_baseline, rtol=0.05,
+            err_msg="Baseline should converge to log(mean_rate)"
+        )
+
+        # Weights should remain near zero (no signal from constant state)
+        assert jnp.max(jnp.abs(updated.weights)) < 0.1, (
+            f"Weights should stay near zero, got max={jnp.max(jnp.abs(updated.weights)):.4f}"
+        )
+
+    def test_mstep_increases_spike_q_function(self) -> None:
+        """The M-step should increase (or maintain) the spike Q-function.
+
+        Q(theta_new) >= Q(theta_old) is the fundamental EM guarantee.
+        We verify this by computing Q before and after the spike M-step
+        using the same E-step posterior.
+        """
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            _neg_Q_single_neuron,
+            update_spike_glm_params,
+        )
+
+        n_time = 500
+        n_neurons = 2
+        n_latent = 2
+        dt = 0.01
+
+        key = jax.random.PRNGKey(99)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        # Generate synthetic smoother outputs
+        smoother_mean = jax.random.normal(k1, (n_time, n_latent)) * 0.5
+        smoother_cov = jnp.tile(
+            jnp.eye(n_latent) * 0.1, (n_time, 1, 1)
+        )
+
+        # Generate spikes from known params
+        true_baseline = jnp.array([1.0, 2.0])
+        true_weights = jax.random.normal(k2, (n_neurons, n_latent)) * 0.3
+        eta = true_baseline[None, :] + smoother_mean @ true_weights.T
+        rates = jnp.exp(eta) * dt
+        spikes = jax.random.poisson(k3, rates).astype(float)
+
+        # Start from deliberately wrong params
+        old_params = SpikeObsParams(
+            baseline=jnp.array([0.0, 0.0]),
+            weights=jnp.zeros((n_neurons, n_latent)),
+        )
+
+        # Compute Q before M-step
+        def compute_total_Q(params):
+            total = 0.0
+            for n in range(n_neurons):
+                p = jnp.concatenate([jnp.atleast_1d(params.baseline[n]), params.weights[n]])
+                total += float(_neg_Q_single_neuron(
+                    p, spikes[:, n], smoother_mean, smoother_cov, dt, 0.0
+                ))
+            return total  # This is the negative Q, so lower is better
+
+        neg_Q_before = compute_total_Q(old_params)
+
+        # Run one M-step iteration
+        new_params = update_spike_glm_params(
+            spikes=spikes,
+            smoother_mean=smoother_mean,
+            current_params=old_params,
+            dt=dt,
+            smoother_cov=smoother_cov,
+            use_second_order=True,
+            max_iter=1,
+        )
+
+        neg_Q_after = compute_total_Q(new_params)
+
+        # M-step should decrease negative Q (increase Q)
+        assert neg_Q_after <= neg_Q_before + 1e-6, (
+            f"M-step should increase Q: -Q_before={neg_Q_before:.4f}, "
+            f"-Q_after={neg_Q_after:.4f}, diff={neg_Q_after - neg_Q_before:.6f}"
+        )
+
+    def test_discrete_state_recovery_from_firing_rates(self) -> None:
+        """Switching model should identify states with distinct firing rates.
+
+        Simulate data where state 0 has low firing and state 1 has high firing.
+        After fitting, the smoother's discrete state probabilities should
+        correctly segment the data.
+        """
+        from state_space_practice.switching_point_process import (
+            QRegularizationConfig,
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 400
+        n_neurons = 5
+        n_oscillators = 1
+        n_discrete_states = 2
+        dt = 0.01
+
+        # Create data with clear state-dependent firing patterns
+        key = jax.random.PRNGKey(7)
+        k1, k2 = jax.random.split(key)
+
+        # True discrete states: blocks of ~100 time steps each
+        true_states = jnp.concatenate([
+            jnp.zeros(100, dtype=int),
+            jnp.ones(100, dtype=int),
+            jnp.zeros(100, dtype=int),
+            jnp.ones(100, dtype=int),
+        ])
+
+        # State 0: low firing (~2 Hz), State 1: high firing (~20 Hz)
+        low_rate = 2.0 * dt
+        high_rate = 20.0 * dt
+
+        rates = jnp.where(
+            true_states[:, None] == 0,
+            low_rate * jnp.ones((n_time, n_neurons)),
+            high_rate * jnp.ones((n_time, n_neurons)),
+        )
+        spikes = jax.random.poisson(k1, rates).astype(float)
+
+        # Fit model with per-state spike params to capture rate differences
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=1.0 / dt,
+            dt=dt,
+            q_regularization=QRegularizationConfig(),
+            # Fix dynamics — only learn observation and discrete params
+            update_continuous_transition_matrix=False,
+            update_process_cov=False,
+            update_init_mean=False,
+            update_init_cov=False,
+            separate_spike_params=True,
+        )
+
+        # Try multiple seeds since the model can be sensitive to initialization
+        fitted = False
+        for seed in [10, 20, 30, 40, 50]:
+            try:
+                log_likelihoods = model.fit(
+                    spikes, max_iter=30, key=jax.random.PRNGKey(seed)
+                )
+                fitted = True
+                break
+            except ValueError:
+                continue
+
+        assert fitted, "Model failed to fit with all attempted seeds"
+        assert log_likelihoods[-1] > log_likelihoods[0], "EM should improve LL"
+
+        # Check discrete state segmentation (handle label swapping)
+        smoother_prob = np.array(model.smoother_discrete_state_prob)
+        corr_0 = np.corrcoef(np.array(true_states, dtype=float), smoother_prob[:, 0])[0, 1]
+        corr_1 = np.corrcoef(np.array(true_states, dtype=float), smoother_prob[:, 1])[0, 1]
+        best_corr = max(abs(corr_0), abs(corr_1))
+
+        assert best_corr > 0.4, (
+            f"Discrete states should be recoverable from distinct firing rates. "
+            f"Best |correlation| = {best_corr:.3f}"
+        )
+
+    def test_em_convergence_fixed_point(self) -> None:
+        """At convergence, one more EM iteration should not change parameters.
+
+        Run EM to convergence, then check that another iteration produces
+        nearly identical parameters. This tests that the converged point
+        is actually a fixed point of the EM operator.
+        """
+        from state_space_practice.switching_point_process import (
+            QRegularizationConfig,
+            SwitchingSpikeOscillatorModel,
+        )
+
+        n_time = 100
+        n_neurons = 3
+        n_oscillators = 1
+        n_discrete_states = 2
+        dt = 0.01
+
+        key = jax.random.PRNGKey(42)
+        spikes = jax.random.poisson(
+            key, 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=n_oscillators,
+            n_neurons=n_neurons,
+            n_discrete_states=n_discrete_states,
+            sampling_freq=1.0 / dt,
+            dt=dt,
+            q_regularization=QRegularizationConfig(),
+        )
+
+        # Run to convergence
+        model.fit(spikes, max_iter=50, tol=1e-8, key=jax.random.PRNGKey(0))
+
+        # Store converged parameters
+        A_converged = model.continuous_transition_matrix.copy()
+        Q_converged = model.process_cov.copy()
+        Z_converged = model.discrete_transition_matrix.copy()
+        baseline_converged = model.spike_params.baseline.copy()
+        weights_converged = model.spike_params.weights.copy()
+
+        # Run one more iteration
+        model.fit(spikes, max_iter=1, skip_init=True, tol=1e-15)
+
+        # Parameters should barely change. The Q-regularization trust-region
+        # (default 30% blend) means even at convergence there can be small
+        # parameter drift. Use generous tolerance.
+        np.testing.assert_allclose(
+            model.continuous_transition_matrix, A_converged, atol=0.02,
+            err_msg="A should be near fixed point"
+        )
+        np.testing.assert_allclose(
+            model.process_cov, Q_converged, atol=0.05,
+            err_msg="Q should be near fixed point"
+        )
+        np.testing.assert_allclose(
+            model.discrete_transition_matrix, Z_converged, atol=0.02,
+            err_msg="Z should be near fixed point"
+        )
+        # Spike params can drift more at convergence because the GLM M-step
+        # uses Newton iterations that may not reach the exact optimum.
+        # States with very low firing (baseline << 0) are especially noisy.
+        np.testing.assert_allclose(
+            model.spike_params.baseline, baseline_converged, atol=0.1,
+            err_msg="Baseline should be near fixed point"
+        )
+        np.testing.assert_allclose(
+            model.spike_params.weights, weights_converged, atol=0.1,
+            err_msg="Weights should be near fixed point"
+        )
