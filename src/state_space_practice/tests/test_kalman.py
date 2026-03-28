@@ -453,7 +453,7 @@ class TestPsdSolveProperties:
 
         # A @ X should be close to identity (use atol for numerical precision)
         # Note: float32 precision limits accuracy to ~1e-5
-        np.testing.assert_allclose(A_jax @ X, I, rtol=1e-3, atol=2e-5)
+        np.testing.assert_allclose(A_jax @ X, identity, rtol=1e-3, atol=2e-5)
 
 
 class TestSumOfOuterProductsProperties:
