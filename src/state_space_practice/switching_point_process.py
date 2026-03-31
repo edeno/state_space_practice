@@ -923,6 +923,8 @@ def _neg_Q_single_neuron(
     dt: float,
     weight_l2: float,
     time_weights: Array | None = None,
+    baseline_prior: Array | None = None,
+    baseline_prior_l2: float = 0.0,
 ) -> Array:
     """Negative expected log-likelihood for one neuron's Poisson GLM.
 
@@ -968,6 +970,8 @@ def _neg_Q_single_neuron(
         quad = jnp.zeros(smoother_mean.shape[0])
     else:
         # Second-order: 0.5 * w^T P_t w for each t
+        # This term can be large when smoother covariance P is large, but the
+        # eta clip below (at [-20, 20]) prevents exp overflow regardless.
         quad = 0.5 * jnp.einsum("tij,i,j->t", smoother_cov, w, w)
 
     # Full log-intensity expectation: b + w^T m_t + 0.5 * w^T P_t w
@@ -984,7 +988,16 @@ def _neg_Q_single_neuron(
     nll = jnp.sum(time_weights * (mu - y_n * (b + eta_lin)))
     l2 = 0.5 * weight_l2 * jnp.sum(w**2)
 
-    return nll + l2
+    # Baseline shrinkage prior: 0.5 * baseline_prior_l2 * (b - b_prior)^2
+    # When baseline_prior_l2 > 0, this keeps the Hessian well-conditioned for
+    # neurons with near-zero rate and prevents baselines from drifting to
+    # extreme values. The prior center b_prior is typically the empirical
+    # log-rate, so neurons shrink toward their average rate.
+    if baseline_prior is None:
+        baseline_prior = jnp.zeros_like(b)
+    baseline_penalty = 0.5 * baseline_prior_l2 * (b - baseline_prior) ** 2
+
+    return nll + l2 + baseline_penalty
 
 
 def _single_neuron_glm_step_second_order(
@@ -996,6 +1009,8 @@ def _single_neuron_glm_step_second_order(
     dt: float,
     time_weights: Array | None = None,
     weight_l2: float = 0.0,
+    baseline_prior: Array | None = None,
+    baseline_prior_l2: float = 0.0,
 ) -> tuple[Array, Array]:
     """Single Newton step for Poisson GLM with exact second-order expectation.
 
@@ -1039,7 +1054,8 @@ def _single_neuron_glm_step_second_order(
 
     def loss_fn(p: Array) -> Array:
         return _neg_Q_single_neuron(
-            p, y_n, smoother_mean, smoother_cov, dt, weight_l2, time_weights
+            p, y_n, smoother_mean, smoother_cov, dt, weight_l2, time_weights,
+            baseline_prior, baseline_prior_l2,
         )
 
     # Compute exact gradient and Hessian via JAX autodiff
@@ -1077,6 +1093,8 @@ def update_spike_glm_params(
     use_second_order: bool = False,
     weight_l2: float = 0.0,
     time_weights: Array | None = None,
+    baseline_prior: Array | None = None,
+    baseline_prior_l2: float = 0.0,
 ) -> SpikeObsParams:
     """M-step for spike observation parameters.
 
@@ -1176,8 +1194,10 @@ def update_spike_glm_params(
                 b = baselines[neuron_idx]
                 w = weights[neuron_idx]
                 y_n = spikes[:, neuron_idx]
+                bp = baseline_prior[neuron_idx] if baseline_prior is not None else None
                 new_b, new_w = _single_neuron_glm_step_second_order(
-                    b, w, y_n, smoother_mean, smoother_cov, dt, time_weights, weight_l2
+                    b, w, y_n, smoother_mean, smoother_cov, dt, time_weights, weight_l2,
+                    bp, baseline_prior_l2,
                 )
                 return new_b, new_w
 
@@ -1647,8 +1667,10 @@ class SwitchingSpikeOscillatorModel:
         update_init_cov: bool = True,
         q_regularization: QRegularizationConfig | None = None,
         spike_weight_l2: float = 0.01,
+        spike_baseline_prior_l2: float = 0.001,
         max_newton_iter: int = 1,
         line_search_beta: float = 0.5,
+        smoother_type: str = "gpb1",
     ) -> None:
         """Initialize the switching spike oscillator model.
 
@@ -1759,7 +1781,11 @@ class SwitchingSpikeOscillatorModel:
 
         # Newton iteration parameters for point-process update
         self.max_newton_iter = max_newton_iter
+        self.spike_baseline_prior_l2 = spike_baseline_prior_l2
         self.line_search_beta = line_search_beta
+        if smoother_type not in ("gpb1", "gpb2"):
+            raise ValueError(f"smoother_type must be 'gpb1' or 'gpb2', got '{smoother_type}'")
+        self.smoother_type = smoother_type
 
         # Placeholders for model parameters (initialized by _initialize_parameters)
         self.init_mean: Array
@@ -2324,6 +2350,15 @@ class SwitchingSpikeOscillatorModel:
             # States with less weight keep their current parameters unchanged.
             MIN_STATE_WEIGHT = 1e-8
 
+            # Baseline prior: empirical log-rate per neuron (average across states).
+            # This prevents baselines from drifting to extreme values for neurons
+            # with near-zero rate in one state.
+            if self.spike_baseline_prior_l2 > 0:
+                mean_counts = jnp.mean(spikes, axis=0)
+                baseline_prior = jnp.log(mean_counts / self.dt + 1e-10)
+            else:
+                baseline_prior = None
+
             def _update_single_state(
                 state_index: int,
                 current_baseline: Array,
@@ -2351,6 +2386,8 @@ class SwitchingSpikeOscillatorModel:
                         weight_l2=self.spike_weight_l2,
                         smoother_cov=state_cond_cov,
                         use_second_order=True,
+                        baseline_prior=baseline_prior,
+                        baseline_prior_l2=self.spike_baseline_prior_l2,
                     )
                     return updated.baseline, updated.weights
 
