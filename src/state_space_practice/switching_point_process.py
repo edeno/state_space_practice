@@ -84,6 +84,7 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
+import optimistix as optx
 from jax import Array
 from jax.typing import ArrayLike
 
@@ -953,11 +954,17 @@ def _neg_Q_single_neuron(
         L2 penalty coefficient for the weights.
     time_weights : Array | None, shape (n_time,), optional
         Per-timestep weights (e.g., state responsibilities). If None, uses ones.
+    baseline_prior : Array | None, shape (), optional
+        Prior center for baseline shrinkage. Typically the empirical log-rate.
+        If None, defaults to zero (equivalent to standard L2 on baseline).
+    baseline_prior_l2 : float, default=0.0
+        Strength of baseline shrinkage prior. When > 0, adds
+        ``0.5 * baseline_prior_l2 * (b - baseline_prior)^2`` to the loss.
 
     Returns
     -------
     loss : Array, shape ()
-        Negative expected log-likelihood plus L2 penalty.
+        Negative expected log-likelihood plus regularization penalties.
     """
     b = params[0]
     w = params[1:]
@@ -1012,16 +1019,17 @@ def _single_neuron_glm_step_second_order(
     baseline_prior: Array | None = None,
     baseline_prior_l2: float = 0.0,
 ) -> tuple[Array, Array]:
-    """Single Newton step for Poisson GLM with exact second-order expectation.
+    """Optimize Poisson GLM with second-order expectation using BFGS.
 
-    Uses JAX autodiff to compute exact gradient and Hessian of the
-    latent-marginalized Q-function. This accounts for state uncertainty via:
+    Uses optimistix BFGS to minimize the latent-marginalized Q-function,
+    which accounts for state uncertainty via the Gaussian MGF:
         E[exp(w^T x)] = exp(w^T m + 0.5 * w^T P w)
 
-    The Hessian includes all terms, specifically:
-        H_ww = -sum_t mu_t * [(m_t + P_t w)(m_t + P_t w)^T + P_t] - lambda * I
-
-    which was previously approximated by dropping the sum_t mu_t P_t term.
+    BFGS is used instead of Newton's method because:
+    1. It naturally handles ill-conditioned Hessians (builds approximation
+       from gradient differences, which stay bounded)
+    2. It is faster (no explicit Hessian computation)
+    3. It eliminates the need for ad hoc ridge regularization and step clipping
 
     Parameters
     ----------
@@ -1041,44 +1049,33 @@ def _single_neuron_glm_step_second_order(
         Per-timestep weights (e.g., state responsibilities). If None, uses ones.
     weight_l2 : float, default=0.0
         L2 regularization strength on the weights (not baseline).
+    baseline_prior : Array | None, optional
+        Prior center for baseline shrinkage. If None, no prior.
+    baseline_prior_l2 : float, default=0.0
+        Strength of baseline shrinkage prior.
 
     Returns
     -------
     new_baseline : Array, shape ()
-        Updated baseline after Newton step.
+        Updated baseline.
     new_weights : Array, shape (n_latent,)
-        Updated weights after Newton step.
+        Updated weights.
     """
-    n_latent = weights.shape[0]
     params = jnp.concatenate([jnp.atleast_1d(baseline), weights])
 
-    def loss_fn(p: Array) -> Array:
+    def loss_fn(p: Array, args: Array) -> Array:
         return _neg_Q_single_neuron(
             p, y_n, smoother_mean, smoother_cov, dt, weight_l2, time_weights,
             baseline_prior, baseline_prior_l2,
         )
 
-    # Compute exact gradient and Hessian via JAX autodiff
-    # We minimize the negative Q-function, so gradient points uphill on -Q (downhill on Q)
-    grad = jax.grad(loss_fn)(params)
-    hess = jax.hessian(loss_fn)(params)
-
-    # Regularize Hessian for numerical stability
-    ridge = 1e-6
-    hess_reg = hess + ridge * jnp.eye(1 + n_latent)
-
-    # Newton direction for minimization: x_new = x - H^{-1} @ grad(neg_Q)
-    delta = jnp.linalg.solve(hess_reg, grad)
-
-    # Backtracking line search with Armijo condition
-    current_loss = loss_fn(params)
-    final_alpha = _armijo_line_search(
-        params, delta, grad, loss_fn, current_loss
+    solver = optx.BFGS(rtol=1e-5, atol=1e-5)
+    result = optx.minimise(
+        loss_fn, solver, params, args=None, max_steps=50, throw=False,
     )
 
-    new_params = params - final_alpha * delta
-    new_baseline = new_params[0]
-    new_weights = new_params[1:]
+    new_baseline = result.value[0]
+    new_weights = result.value[1:]
 
     return new_baseline, new_weights
 
@@ -1104,11 +1101,10 @@ def update_spike_glm_params(
 
     Two methods are available:
     - Plug-in method (default): Uses smoother_mean directly, ignoring uncertainty.
+      Runs Newton-Raphson with Armijo line search for max_iter iterations.
     - Second-order method: Accounts for state uncertainty using the correction
-      E[exp(c @ x)] = exp(c @ m + 0.5 * c @ P @ c).
-
-    This runs Newton-Raphson optimization for each neuron independently
-    for max_iter iterations.
+      E[exp(c @ x)] = exp(c @ m + 0.5 * c @ P @ c). Uses BFGS (via optimistix)
+      which converges internally — max_iter is ignored for this path.
 
     Parameters
     ----------
@@ -1121,7 +1117,8 @@ def update_spike_glm_params(
     dt : float
         Time bin width in seconds.
     max_iter : int, default=10
-        Maximum Newton iterations per neuron.
+        Maximum Newton iterations per neuron (plug-in method only;
+        ignored when use_second_order=True).
     smoother_cov : Array | None, shape (n_time, n_latent, n_latent), optional
         Smoothed latent state covariances. Required if use_second_order=True.
     use_second_order : bool, default=False
@@ -1186,32 +1183,24 @@ def update_spike_glm_params(
 
     if use_second_order:
 
-        # Run Newton iterations for all neurons (second-order)
-        def iterate_all_neurons_second_order(carry, _):
-            baselines, weights = carry
+        # BFGS optimization for all neurons (second-order).
+        # Unlike the plug-in Newton step which takes one step per iteration,
+        # BFGS runs to convergence internally, so we call it once (no scan).
+        def update_neuron_bfgs(neuron_idx):
+            b = baselines[neuron_idx]
+            w = weights[neuron_idx]
+            y_n = spikes[:, neuron_idx]
+            # Note: `baseline_prior is not None` is a Python-level check resolved
+            # at trace time (static), not per-element at vmap runtime.
+            bp = baseline_prior[neuron_idx] if baseline_prior is not None else None
+            new_b, new_w = _single_neuron_glm_step_second_order(
+                b, w, y_n, smoother_mean, smoother_cov, dt, time_weights, weight_l2,
+                bp, baseline_prior_l2,
+            )
+            return new_b, new_w
 
-            def update_neuron(neuron_idx):
-                b = baselines[neuron_idx]
-                w = weights[neuron_idx]
-                y_n = spikes[:, neuron_idx]
-                bp = baseline_prior[neuron_idx] if baseline_prior is not None else None
-                new_b, new_w = _single_neuron_glm_step_second_order(
-                    b, w, y_n, smoother_mean, smoother_cov, dt, time_weights, weight_l2,
-                    bp, baseline_prior_l2,
-                )
-                return new_b, new_w
-
-            neuron_indices = jnp.arange(n_neurons)
-            new_baselines, new_weights = jax.vmap(update_neuron)(neuron_indices)
-
-            return (new_baselines, new_weights), None
-
-        (final_baselines, final_weights), _ = jax.lax.scan(
-            iterate_all_neurons_second_order,
-            (baselines, weights),
-            None,
-            length=max_iter,
-        )
+        neuron_indices = jnp.arange(n_neurons)
+        final_baselines, final_weights = jax.vmap(update_neuron_bfgs)(neuron_indices)
     else:
         # Run Newton iterations for all neurons (plug-in)
         def iterate_all_neurons(carry, _):
@@ -1667,7 +1656,7 @@ class SwitchingSpikeOscillatorModel:
         update_init_cov: bool = True,
         q_regularization: QRegularizationConfig | None = None,
         spike_weight_l2: float = 0.01,
-        spike_baseline_prior_l2: float = 0.001,
+        spike_baseline_prior_l2: float = 0.0,
         max_newton_iter: int = 1,
         line_search_beta: float = 0.5,
         smoother_type: str = "gpb1",

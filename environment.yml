@@ -9,6 +9,8 @@ dependencies:
 - scipy
 - jax
 - optax
+- pip:
+  - optimistix
 - pandas
 - networkx
 - xarray
