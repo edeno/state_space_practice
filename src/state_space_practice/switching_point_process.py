@@ -101,6 +101,7 @@ from state_space_practice.switching_kalman import (
     collapse_gaussian_mixture_per_discrete_state,
     switching_kalman_maximization_step,
     switching_kalman_smoother,
+    switching_kalman_smoother_gpb2,
 )
 from state_space_practice.utils import check_converged
 
@@ -2149,7 +2150,8 @@ class SwitchingSpikeOscillatorModel:
             state_cond_smoother_covs,
             pair_cond_smoother_cross_covs,
             pair_cond_smoother_means,
-        ) = switching_kalman_smoother(
+        ) = (switching_kalman_smoother_gpb2 if self.smoother_type == "gpb2"
+             else switching_kalman_smoother)(
             filter_mean=state_cond_filter_mean,
             filter_cov=state_cond_filter_cov,
             filter_discrete_state_prob=filter_discrete_state_prob,
