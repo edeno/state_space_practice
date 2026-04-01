@@ -6781,11 +6781,12 @@ class TestMilestone8EndToEnd:
         )
         assert jnp.all(init_prob >= 0), "Initial discrete state prob should be non-negative"
 
-    def test_separate_spike_params_default_end_to_end(self) -> None:
-        """End-to-end test exercising the default separate_spike_params=True.
+    def test_spike_params_end_to_end(self) -> None:
+        """End-to-end test exercising shared spike params.
 
-        Validates that the model fits successfully with per-state spike GLM
-        parameters (the default). Uses random Poisson spike data and checks:
+        Validates that the model fits successfully with shared spike GLM
+        parameters (separate_spike_params=False). Uses random Poisson spike
+        data and checks:
         1. EM completes without error and all log-likelihoods are finite
         2. All parameters are finite
         3. Per-state spike parameters have the correct shape

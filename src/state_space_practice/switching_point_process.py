@@ -1050,9 +1050,11 @@ def _single_neuron_glm_step_second_order(
     weight_l2 : float, default=0.0
         L2 regularization strength on the weights (not baseline).
     baseline_prior : Array | None, optional
-        Prior center for baseline shrinkage. If None, no prior.
+        Prior center for baseline shrinkage. If None, uses a zero-centered
+        prior when baseline_prior_l2 > 0.
     baseline_prior_l2 : float, default=0.0
-        Strength of baseline shrinkage prior.
+        Strength of baseline shrinkage prior. Setting to 0.0 disables the
+        prior regardless of baseline_prior.
 
     Returns
     -------
@@ -1129,6 +1131,12 @@ def update_spike_glm_params(
         Adds 0.5 * weight_l2 * ||weights||^2 to the objective for each neuron.
     time_weights : Array | None, shape (n_time,), optional
         Per-timestep weights (e.g., state responsibilities). If None, uses ones.
+    baseline_prior : Array | None, optional
+        Prior center for baseline shrinkage. If None, uses a zero-centered
+        prior when baseline_prior_l2 > 0.
+    baseline_prior_l2 : float, default=0.0
+        Strength of baseline shrinkage prior. Setting to 0.0 disables the
+        prior regardless of baseline_prior.
 
     Returns
     -------
@@ -1695,6 +1703,11 @@ class SwitchingSpikeOscillatorModel:
             Trust-region and eigenvalue clipping configuration for Q updates.
         spike_weight_l2 : float, default=0.01
             L2 regularization strength on the spike GLM weights.
+        spike_baseline_prior_l2 : float, default=0.0
+            L2 regularization strength shrinking spike baselines toward zero.
+            Setting to 0.0 disables the prior.
+        smoother_type : str, default="gpb1"
+            Switching smoother algorithm. Must be "gpb1" or "gpb2".
 
         Raises
         ------
@@ -1770,6 +1783,8 @@ class SwitchingSpikeOscillatorModel:
 
         # Newton iteration parameters for point-process update
         self.max_newton_iter = max_newton_iter
+        if spike_baseline_prior_l2 < 0:
+            raise ValueError(f"spike_baseline_prior_l2 must be non-negative, got {spike_baseline_prior_l2}")
         self.spike_baseline_prior_l2 = spike_baseline_prior_l2
         self.line_search_beta = line_search_beta
         if smoother_type not in ("gpb1", "gpb2"):

@@ -838,7 +838,7 @@ def switching_kalman_smoother(
         )
 
         # 1b. Stabilize pair-conditional smoother outputs (GPB1 safety net).
-        # Cap at 1000x the filter covariance trace. This is large enough to
+        # Cap at 1e8x the filter covariance trace. This is large enough to
         # not interfere with normal EM dynamics (where smoother cov can
         # legitimately exceed filter cov by 10-100x from GPB1 collapse) but
         # catches the exponential blowup that leads to overflow on long
