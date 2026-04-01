@@ -1666,7 +1666,7 @@ def compute_expected_complete_log_likelihood(
                 log_prob = -0.5 * (
                     n_cont_states * jnp.log(2 * jnp.pi) + log_det_Q + trace_term
                 )
-                log_cont_trans += weight * log_prob
+                log_cont_trans += jnp.where(weight > 0, weight * log_prob, 0.0)
 
     # 5. E_q[sum_t log p(y_t | x_t, s_t)] - observations
     log_obs = 0.0
@@ -1692,7 +1692,7 @@ def compute_expected_complete_log_likelihood(
 
             trace_term = jnp.trace(psd_solve(R_j, expected_residual))
             log_prob = -0.5 * (n_obs * jnp.log(2 * jnp.pi) + log_det_R + trace_term)
-            log_obs += weight * log_prob
+            log_obs += jnp.where(weight > 0, weight * log_prob, 0.0)
 
     return log_init_discrete + log_init_cont + log_discrete_trans + log_cont_trans + log_obs
 
@@ -1750,7 +1750,7 @@ def compute_posterior_entropy(
             gaussian_entropy = 0.5 * (
                 n_cont_states * (1 + jnp.log(2 * jnp.pi)) + log_det
             )
-            cont_entropy += weight * gaussian_entropy
+            cont_entropy += jnp.where(weight > 0, weight * gaussian_entropy, 0.0)
 
     return discrete_entropy + cont_entropy
 

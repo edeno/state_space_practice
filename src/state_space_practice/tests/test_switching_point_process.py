@@ -6792,7 +6792,7 @@ class TestMilestone8EndToEnd:
         data and checks:
         1. EM completes without error and all log-likelihoods are finite
         2. All parameters are finite
-        3. Per-state spike parameters have the correct shape
+        3. Shared spike parameters have the correct shape
         4. Discrete transition matrix is a valid stochastic matrix
         """
         from state_space_practice.switching_point_process import (
