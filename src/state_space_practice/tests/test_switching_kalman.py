@@ -405,6 +405,7 @@ def test_switching_kalman_filter_shapes(simple_skf_model: tuple) -> None:
         filt_c,
         filt_p,
         last_pair_m,
+        _,  # last_pair_cond_filter_cov
         mll,
     ) = switching_kalman_filter(init_mean, init_cov, init_prob, obs, Z, A, Q, H, R)
 
@@ -453,6 +454,7 @@ def test_skf_reduces_to_kf_single_state(simple_1d_model: tuple) -> None:
         skf_c,
         skf_p,
         _,
+        _,  # last_pair_cond_filter_cov
         skf_mll,
     ) = switching_kalman_filter(
         skf_init_mean,
@@ -511,6 +513,7 @@ def test_skf_smoother_reduces_to_kf_smoother_single_state(
         skf_fc,
         skf_fp,
         last_pair_m,
+        _,  # last_pair_cond_filter_cov
         skf_mll,
     ) = switching_kalman_filter(
         skf_init_mean,
@@ -571,14 +574,14 @@ def test_skf_deterministic_stay(simple_skf_model: tuple) -> None:
 
     Z_stay = jnp.array([[1.0, 0.0], [0.0, 1.0]])
     init_prob_0 = jnp.array([1.0, 0.0])
-    _, _, filt_p_0, _, _ = switching_kalman_filter(
+    _, _, filt_p_0, _, _, _ = switching_kalman_filter(
         init_mean, init_cov, init_prob_0, obs, Z_stay, A, Q, H, R
     )
     expected_p_0 = jnp.zeros_like(filt_p_0).at[:, 0].set(1.0)
     np.testing.assert_allclose(filt_p_0, expected_p_0, atol=1e-6)
 
     init_prob_1 = jnp.array([0.0, 1.0])
-    _, _, filt_p_1, _, _ = switching_kalman_filter(
+    _, _, filt_p_1, _, _, _ = switching_kalman_filter(
         init_mean, init_cov, init_prob_1, obs, Z_stay, A, Q, H, R
     )
     expected_p_1 = jnp.zeros_like(filt_p_1).at[:, 1].set(1.0)
@@ -603,7 +606,7 @@ def test_skf_deterministic_switch(simple_skf_model: tuple) -> None:
     Z_switch = jnp.array([[0.0, 1.0], [1.0, 0.0]])
     init_prob_0 = jnp.array([1.0, 0.0])
 
-    _, _, filt_p, _, _ = switching_kalman_filter(
+    _, _, filt_p, _, _, _ = switching_kalman_filter(
         init_mean, init_cov, init_prob_0, obs, Z_switch, A, Q, H, R
     )
 
@@ -672,6 +675,7 @@ def test_m_step_one_state(
         skf_fc,
         skf_fp,
         last_pair_m,
+        _,  # last_pair_cond_filter_cov
         skf_mll,
     ) = switching_kalman_filter(
         skf_init_mean,
@@ -792,6 +796,7 @@ def test_m_step_two_identical_states(
         skf_fc,  # state_cond_filter_cov
         skf_fp,  # filter_discrete_state_prob
         last_pair_m,  # last_filter_conditional_cont_mean
+        _,  # last_pair_cond_filter_cov
         _,  # mll
     ) = switching_kalman_filter(
         skf_init_mean,
@@ -1280,7 +1285,7 @@ def test_em_monotonic_single_state() -> None:
 
     log_likelihoods = []
     for _ in range(10):
-        (filter_mean, filter_cov, filter_prob, last_pair_mean, mll) = switching_kalman_filter(
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, mll) = switching_kalman_filter(
             current_init_mean,
             current_init_cov,
             current_init_prob,
@@ -1378,7 +1383,7 @@ def test_em_monotonic_two_identical_states() -> None:
 
     log_likelihoods = []
     for _ in range(10):
-        (filter_mean, filter_cov, filter_prob, last_pair_mean, mll) = switching_kalman_filter(
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, mll) = switching_kalman_filter(
             current_init_mean,
             current_init_cov,
             current_init_prob,
@@ -1507,7 +1512,7 @@ def test_em_monotonic_distinguishable_states() -> None:
     # Run EM
     log_likelihoods = []
     for _ in range(20):
-        (filter_mean, filter_cov, filter_prob, last_pair_mean, mll) = switching_kalman_filter(
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, mll) = switching_kalman_filter(
             init_mean,
             init_cov,
             init_prob,
@@ -1610,6 +1615,7 @@ def test_em_increases_log_likelihood(simple_skf_model: tuple) -> None:
             filter_cov,
             filter_prob,
             last_pair_mean,
+            _,  # last_pair_cond_filter_cov
             marginal_log_likelihood,
         ) = switching_kalman_filter(
             current_init_mean,
@@ -1718,7 +1724,7 @@ def test_elbo_monotonic_single_state() -> None:
     elbos = []
     for _ in range(10):
         # E-step
-        (filter_mean, filter_cov, filter_prob, last_pair_mean, _) = switching_kalman_filter(
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, _) = switching_kalman_filter(
             current_init_mean,
             current_init_cov,
             current_init_prob,
@@ -1863,7 +1869,7 @@ def test_elbo_monotonic_two_states() -> None:
     elbos = []
     for _ in range(15):
         # E-step
-        (filter_mean, filter_cov, filter_prob, last_pair_mean, _) = switching_kalman_filter(
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, _) = switching_kalman_filter(
             init_mean,
             init_cov,
             init_prob,
@@ -2139,7 +2145,7 @@ class TestSwitchingKalmanFilterProperties:
         key = random.PRNGKey(0)
         obs = random.normal(key, (n_time, params["n_obs_dim"]))
 
-        _, _, filter_prob, _, mll = switching_kalman_filter(
+        _, _, filter_prob, _, _, mll = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
         )
 
@@ -2162,7 +2168,7 @@ class TestSwitchingKalmanFilterProperties:
         key = random.PRNGKey(1)
         obs = random.normal(key, (n_time, params["n_obs_dim"]))
 
-        _, filter_cov, _, _, _ = switching_kalman_filter(
+        _, filter_cov, _, _, _, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
         )
 
@@ -2191,7 +2197,7 @@ class TestSwitchingKalmanFilterProperties:
         key = random.PRNGKey(2)
         obs = random.normal(key, (n_time, params["n_obs_dim"]))
 
-        _, _, filter_prob, _, _ = switching_kalman_filter(
+        _, _, filter_prob, _, _, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
         )
 
@@ -2217,7 +2223,7 @@ class TestSwitchingKalmanSmootherProperties:
         obs = random.normal(key, (n_time, params["n_obs_dim"]))
 
         # Run filter
-        filter_mean, filter_cov, filter_prob, last_pair_mean, _ = switching_kalman_filter(
+        filter_mean, filter_cov, filter_prob, last_pair_mean, _, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
         )
 
@@ -2250,7 +2256,7 @@ class TestSwitchingKalmanSmootherProperties:
         key = random.PRNGKey(4)
         obs = random.normal(key, (n_time, params["n_obs_dim"]))
 
-        filter_mean, filter_cov, filter_prob, last_pair_mean, _ = switching_kalman_filter(
+        filter_mean, filter_cov, filter_prob, last_pair_mean, _, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
         )
 
@@ -2440,6 +2446,7 @@ def test_discrete_state_recovery_easy() -> None:
         state_cond_filter_cov,
         filter_discrete_state_prob,
         _,
+        _,  # last_pair_cond_filter_cov
         _,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -2523,6 +2530,7 @@ def test_discrete_state_recovery_moderate() -> None:
         state_cond_filter_cov,
         filter_discrete_state_prob,
         _,
+        _,  # last_pair_cond_filter_cov
         _,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -2601,6 +2609,7 @@ def test_discrete_state_recovery_with_smoother() -> None:
         state_cond_filter_cov,
         filter_discrete_state_prob,
         last_filter_conditional_cont_mean,
+        _,  # last_pair_cond_filter_cov
         marginal_log_likelihood,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -2695,6 +2704,7 @@ def test_discrete_state_recovery_multivariate() -> None:
         state_cond_filter_cov,
         filter_discrete_state_prob,
         _,
+        _,  # last_pair_cond_filter_cov
         _,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -2831,6 +2841,7 @@ def test_continuous_state_mse_filter() -> None:
         _state_cond_filter_cov,
         filter_discrete_state_prob,
         _,
+        _,  # last_pair_cond_filter_cov
         _,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -2918,6 +2929,7 @@ def test_continuous_state_mse_smoother() -> None:
         state_cond_filter_cov,
         filter_discrete_state_prob,
         last_filter_conditional_cont_mean,
+        _,  # last_pair_cond_filter_cov
         _,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -3035,6 +3047,7 @@ def test_continuous_state_mse_vs_standard_kalman() -> None:
         _,
         filter_discrete_state_prob,
         _,
+        _,  # last_pair_cond_filter_cov
         _,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -3123,6 +3136,7 @@ def test_continuous_state_mse_multivariate() -> None:
         state_cond_filter_cov,
         filter_discrete_state_prob,
         last_filter_conditional_cont_mean,
+        _,  # last_pair_cond_filter_cov
         _,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -3231,6 +3245,7 @@ def run_em(
             state_cond_filter_cov,
             filter_discrete_state_prob,
             last_filter_conditional_cont_mean,
+            _,  # last_pair_cond_filter_cov
             marginal_ll,
         ) = switching_kalman_filter(
             init_state_cond_mean=init_mean,
@@ -3781,6 +3796,7 @@ def run_em_partial(
             state_cond_filter_cov,
             filter_discrete_state_prob,
             last_filter_conditional_cont_mean,
+            _,  # last_pair_cond_filter_cov
             marginal_ll,
         ) = switching_kalman_filter(
             init_state_cond_mean=init_mean,
@@ -4118,7 +4134,7 @@ class TestSwitchingMStepMathCorrectness:
         skf_H = H[..., None]
         skf_R = R[..., None]
 
-        skf_fm, skf_fc, skf_fp, last_pair_m, _ = switching_kalman_filter(
+        skf_fm, skf_fc, skf_fp, last_pair_m, _, _ = switching_kalman_filter(
             init_mean[:, None], init_cov[..., None], jnp.array([1.0]),
             obs, Z, skf_A, skf_Q, skf_H, skf_R,
         )
@@ -4233,7 +4249,7 @@ class TestSwitchingEMMonotonicity:
 
         elbos = []
         for _ in range(10):
-            fm, fc, fp, lpm, mll = switching_kalman_filter(
+            fm, fc, fp, lpm, _, mll = switching_kalman_filter(
                 init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
             )
             (
@@ -4288,7 +4304,7 @@ class TestSwitchingNumericalStability:
 
         obs = random.normal(random.PRNGKey(42), (200, n_obs))
 
-        fm, fc, fp, lpm, _ = switching_kalman_filter(
+        fm, fc, fp, lpm, _, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
         )
         (
@@ -4504,7 +4520,7 @@ class TestGPB2ExactMStep:
         init_prob = jnp.array([0.5, 0.5])
         obs = random.normal(random.PRNGKey(0), (n_time, n_obs))
 
-        fm, fc, fp, lpm, _ = switching_kalman_filter(
+        fm, fc, fp, lpm, _, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
         )
 
@@ -4599,7 +4615,7 @@ class TestGPB2ExactMStep:
         init_prob = jnp.array([0.5, 0.5])
         obs = random.normal(random.PRNGKey(42), (n_time, n_obs))
 
-        fm, fc, fp, lpm, _ = switching_kalman_filter(
+        fm, fc, fp, lpm, _, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
         )
 

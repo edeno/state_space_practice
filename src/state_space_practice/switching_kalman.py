@@ -355,11 +355,15 @@ def _first_timestep_kalman_update(
     # Marginal log-likelihood contribution
     marginal_log_likelihood = ll_max + jnp.log(norm_const)
 
-    # For smoother compatibility: create pair_cond_filter_mean
+    # For smoother compatibility: create pair_cond_filter_mean and cov
     # At t=1, there's no S₀, so we create a diagonal structure
     pair_cond_filter_mean = jnp.broadcast_to(
         state_cond_filter_mean[:, None, :],
         (state_cond_filter_mean.shape[0], n_discrete_states, n_discrete_states),
+    )
+    pair_cond_filter_cov = jnp.broadcast_to(
+        state_cond_filter_cov[:, :, None, :],
+        (*state_cond_filter_cov.shape[:2], n_discrete_states, n_discrete_states),
     )
 
     return (
@@ -367,6 +371,7 @@ def _first_timestep_kalman_update(
         state_cond_filter_cov,
         filter_discrete_prob,
         pair_cond_filter_mean,
+        pair_cond_filter_cov,
         marginal_log_likelihood,
     )
 
@@ -430,7 +435,9 @@ def switching_kalman_filter(
     filter_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
         Filtered probability of the discrete states
     last_pair_cond_filter_mean : jax.Array, shape (n_cont_states, n_discrete_states, n_discrete_states)
-        Last filtered conditional mean of the continuous latent state
+        Last filtered pair-conditional mean E[x_T | S_{T-1}=i, S_T=j]
+    last_pair_cond_filter_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+        Last filtered pair-conditional covariance Cov[x_T | S_{T-1}=i, S_T=j]
     marginal_log_likelihood : jax.Array
         Marginal log likelihood of the observations (scalar array)
 
@@ -541,6 +548,7 @@ def switching_kalman_filter(
             state_cond_filter_cov,
             filter_discrete_prob,
             pair_cond_filter_mean,
+            pair_cond_filter_cov,
         )
 
     # Handle first timestep with x₁ convention: measurement update only (no dynamics)
@@ -550,6 +558,7 @@ def switching_kalman_filter(
         first_state_cond_cov,
         first_discrete_prob,
         first_pair_cond_mean,
+        first_pair_cond_cov,
         first_log_lik,
     ) = _first_timestep_kalman_update(
         init_state_cond_mean,
@@ -567,6 +576,7 @@ def switching_kalman_filter(
         rest_state_cond_filter_cov,
         rest_filter_discrete_state_prob,
         rest_pair_cond_filter_mean,
+        rest_pair_cond_filter_cov,
     ) = jax.lax.scan(
         _step,
         (
@@ -591,12 +601,16 @@ def switching_kalman_filter(
     pair_cond_filter_mean = jnp.concatenate(
         [first_pair_cond_mean[None, ...], rest_pair_cond_filter_mean], axis=0
     )
+    pair_cond_filter_cov = jnp.concatenate(
+        [first_pair_cond_cov[None, ...], rest_pair_cond_filter_cov], axis=0
+    )
 
     return (
         state_cond_filter_mean,
         state_cond_filter_cov,
         filter_discrete_state_prob,
         pair_cond_filter_mean[-1],
+        pair_cond_filter_cov[-1],
         marginal_log_likelihood,
     )
 
@@ -1002,6 +1016,7 @@ def switching_kalman_smoother_gpb2(
     process_cov: jax.Array,
     continuous_transition_matrix: jax.Array,
     discrete_state_transition_matrix: jax.Array,
+    last_filter_conditional_cont_cov: jax.Array | None = None,
 ) -> tuple[
     jax.Array, jax.Array, jax.Array, jax.Array, jax.Array,
     jax.Array, jax.Array, jax.Array, jax.Array,
@@ -1176,19 +1191,17 @@ def switching_kalman_smoother_gpb2(
         )
 
     # Initialize carry from last filter output.
-    # The mean is already pair-conditional from the filter: E[x_T | S_{T-1}=i, S_T=j].
-    # The covariance is state-conditional: Cov[x_T | S_T=j] (the filter collapses
-    # pair-conditional to state-conditional via GPB1 at each step). We broadcast it
-    # to (S_i, S_j) shape. This is an approximation: the true pair-conditional
-    # Cov[x_T | S_{T-1}=i, S_T=j] differs across i due to the Var[E[x|S_{T-1}]]
-    # spread term. The error affects only the first backward step and is the same
-    # order as GPB1's per-step collapse approximation.
     last_pair_mean = last_filter_conditional_cont_mean  # (L, S, S) already pair-cond
     n_cont = filter_cov.shape[1]
-    last_pair_cov = jnp.broadcast_to(
-        filter_cov[-1][:, :, None, :],  # (L, L, 1, S_j) → (L, L, S_i, S_j)
-        (n_cont, n_cont, n_discrete_states, n_discrete_states),
-    )
+    if last_filter_conditional_cont_cov is not None:
+        # Use exact pair-conditional covariance from the filter
+        last_pair_cov = last_filter_conditional_cont_cov  # (L, L, S_i, S_j)
+    else:
+        # Fallback: broadcast state-conditional to pair-conditional
+        last_pair_cov = jnp.broadcast_to(
+            filter_cov[-1][:, :, None, :],  # (L, L, 1, S_j) → (L, L, S_i, S_j)
+            (n_cont, n_cont, n_discrete_states, n_discrete_states),
+        )
 
     init_carry = (
         last_pair_mean,

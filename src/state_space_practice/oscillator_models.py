@@ -400,6 +400,7 @@ class BaseModel(ABC):
             filter_cov,
             filter_discrete_state_prob,
             last_cond_cont_mean,
+            _,  # last_pair_cond_filter_cov (used by GPB2 only)
             marginal_log_likelihood,
         ) = switching_kalman_filter(
             init_state_cond_mean=self.init_mean,

@@ -643,12 +643,17 @@ def _first_timestep_point_process_update(
         state_cond_filter_mean[:, None, :],
         (state_cond_filter_mean.shape[0], n_discrete_states, n_discrete_states),
     )
+    pair_cond_filter_cov = jnp.broadcast_to(
+        state_cond_filter_cov[:, :, None, :],
+        (*state_cond_filter_cov.shape[:2], n_discrete_states, n_discrete_states),
+    )
 
     return (
         state_cond_filter_mean,
         state_cond_filter_cov,
         filter_discrete_prob,
         pair_cond_filter_mean,
+        pair_cond_filter_cov,
         marginal_log_likelihood,
     )
 
@@ -1492,6 +1497,7 @@ def switching_point_process_filter(
             state_cond_filter_cov,
             filter_discrete_prob,
             pair_cond_filter_mean,
+            pair_cond_filter_cov,
         )
 
     # Handle first timestep with x₁ convention: update-only (no dynamics prediction)
@@ -1501,6 +1507,7 @@ def switching_point_process_filter(
         first_state_cond_cov,
         first_discrete_prob,
         first_pair_cond_mean,
+        first_pair_cond_cov,
         first_log_lik,
     ) = _first_timestep_point_process_update(
         init_state_cond_mean,
@@ -1522,6 +1529,7 @@ def switching_point_process_filter(
         rest_state_cond_filter_cov,
         rest_filter_discrete_state_prob,
         rest_pair_cond_filter_mean,
+        rest_pair_cond_filter_cov,
     ) = jax.lax.scan(
         _step,
         (
@@ -1546,12 +1554,16 @@ def switching_point_process_filter(
     pair_cond_filter_mean = jnp.concatenate(
         [first_pair_cond_mean[None, ...], rest_pair_cond_filter_mean], axis=0
     )
+    pair_cond_filter_cov = jnp.concatenate(
+        [first_pair_cond_cov[None, ...], rest_pair_cond_filter_cov], axis=0
+    )
 
     return (
         state_cond_filter_mean,
         state_cond_filter_cov,
         filter_discrete_state_prob,
         pair_cond_filter_mean[-1],  # Last timestep pair-conditional for smoother
+        pair_cond_filter_cov[-1],   # Last timestep pair-conditional cov for GPB2
         marginal_log_likelihood,
     )
 
@@ -2174,6 +2186,7 @@ class SwitchingSpikeOscillatorModel:
             state_cond_filter_cov,
             filter_discrete_state_prob,
             last_pair_cond_filter_mean,
+            last_pair_cond_filter_cov,
             marginal_log_likelihood,
         ) = switching_point_process_filter(
             init_state_cond_mean=self.init_mean,
@@ -2209,7 +2222,10 @@ class SwitchingSpikeOscillatorModel:
                 state_cond_smoother_means, state_cond_smoother_covs,
                 pair_cond_smoother_cross_covs, pair_cond_smoother_means,
                 pair_cond_smoother_covs, next_pair_cond_smoother_means,
-            ) = switching_kalman_smoother_gpb2(**smoother_args)
+            ) = switching_kalman_smoother_gpb2(
+                **smoother_args,
+                last_filter_conditional_cont_cov=last_pair_cond_filter_cov,
+            )
         else:
             (
                 _, _, smoother_discrete_state_prob,
