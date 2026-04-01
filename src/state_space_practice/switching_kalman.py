@@ -1024,7 +1024,7 @@ def switching_kalman_smoother_gpb2(
             next_pair_cond_smoother_mean,   # (L, S_j, S_k) = (S_t, S_{t+1})
             next_pair_cond_smoother_cov,    # (L, L, S_j, S_k)
             next_smoother_discrete_prob,    # (S,) P(S_{t+1}=k | y_{1:T})
-            _,  # placeholder for prev pair_cond_smoother_mean (from outputs)
+            _,  # unused in carry; required by jax.lax.scan pytree structure
         ) = carry
 
         state_cond_filter_mean, state_cond_filter_cov, filter_discrete_prob = args
@@ -1567,6 +1567,15 @@ def compute_expected_complete_log_likelihood(
     -------
     expected_complete_ll : jax.Array
         E_q[log p(y, x, s | θ)] (scalar array)
+
+    Notes
+    -----
+    When GPB2 pair-conditional quantities are provided, the transition
+    Q-function term uses exact pair-conditional means and covariances for
+    x_t, but Cov[x_{t+1} | S_t, S_{t+1}] is still approximated with
+    the state-conditional Cov[x_{t+1} | S_{t+1}] since the GPB2 smoother
+    does not produce that quantity directly. This is a minor residual
+    approximation affecting only the ELBO diagnostic, not parameter updates.
     """
     n_time = obs.shape[0]
     n_discrete_states = smoother_discrete_state_prob.shape[1]

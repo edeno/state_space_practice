@@ -1113,8 +1113,8 @@ def update_spike_glm_params(
     - Plug-in method (default): Uses smoother_mean directly, ignoring uncertainty.
       Runs Newton-Raphson with Armijo line search for max_iter iterations.
     - Second-order method: Accounts for state uncertainty using the correction
-      E[exp(c @ x)] = exp(c @ m + 0.5 * c @ P @ c). Uses BFGS (via optimistix)
-      which converges internally — max_iter is ignored for this path.
+      E[exp(c @ x)] = exp(c @ m + 0.5 * c @ P @ c). Uses BFGS (via optimistix);
+      max_iter controls the BFGS step budget.
 
     Parameters
     ----------
