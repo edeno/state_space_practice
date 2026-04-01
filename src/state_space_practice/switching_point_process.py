@@ -1203,37 +1203,44 @@ def update_spike_glm_params(
         # BFGS optimization for all neurons (second-order).
         # Unlike the plug-in Newton step which takes one step per iteration,
         # BFGS runs to convergence internally, so we call it once (no scan).
-        def update_neuron_bfgs(neuron_idx):
-            b = baselines[neuron_idx]
-            w = weights[neuron_idx]
-            y_n = spikes[:, neuron_idx]
-            # Note: `baseline_prior is not None` is a Python-level check resolved
-            # at trace time (static), not per-element at vmap runtime.
-            bp = baseline_prior[neuron_idx] if baseline_prior is not None else None
+        # vmap directly over neuron-axis data to avoid gather ops inside BFGS while_loop.
+        def update_neuron_bfgs(b, w, y_n, bp):
             new_b, new_w = _single_neuron_glm_step_second_order(
                 b, w, y_n, smoother_mean, smoother_cov, dt, time_weights, weight_l2,
                 bp, baseline_prior_l2, max_steps=max_iter,
             )
             return new_b, new_w
 
-        neuron_indices = jnp.arange(n_neurons)
-        final_baselines, final_weights = jax.vmap(update_neuron_bfgs)(neuron_indices)
+        # baseline_prior is a Python-level None check resolved at trace time (static)
+        if baseline_prior is not None:
+            final_baselines, final_weights = jax.vmap(
+                update_neuron_bfgs, in_axes=(0, 0, 1, 0)
+            )(baselines, weights, spikes, baseline_prior)
+        else:
+            def update_neuron_bfgs_no_prior(b, w, y_n):
+                new_b, new_w = _single_neuron_glm_step_second_order(
+                    b, w, y_n, smoother_mean, smoother_cov, dt, time_weights,
+                    weight_l2, None, baseline_prior_l2, max_steps=max_iter,
+                )
+                return new_b, new_w
+            final_baselines, final_weights = jax.vmap(
+                update_neuron_bfgs_no_prior, in_axes=(0, 0, 1)
+            )(baselines, weights, spikes)
     else:
         # Run Newton iterations for all neurons (plug-in)
+        # vmap directly over neuron-axis data.
         def iterate_all_neurons(carry, _):
             baselines, weights = carry
 
-            def update_neuron(neuron_idx):
-                b = baselines[neuron_idx]
-                w = weights[neuron_idx]
-                y_n = spikes[:, neuron_idx]
+            def update_neuron(b, w, y_n):
                 new_b, new_w = _single_neuron_glm_step(
                     b, w, y_n, smoother_mean, dt, time_weights, weight_l2
                 )
                 return new_b, new_w
 
-            neuron_indices = jnp.arange(n_neurons)
-            new_baselines, new_weights = jax.vmap(update_neuron)(neuron_indices)
+            new_baselines, new_weights = jax.vmap(
+                update_neuron, in_axes=(0, 0, 1)
+            )(baselines, weights, spikes)
 
             return (new_baselines, new_weights), None
 

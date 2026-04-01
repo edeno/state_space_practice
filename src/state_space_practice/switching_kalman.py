@@ -1621,8 +1621,6 @@ def compute_expected_complete_log_likelihood(
             # Sum over source states i weighted by P(s_t=i, s_{t+1}=j | y_{1:T})
             for i in range(n_discrete_states):
                 weight = smoother_joint_discrete_state_prob[t, i, j]
-                if weight < 1e-10:
-                    continue
 
                 # E_q[(x_{t+1} - A_j x_t)(x_{t+1} - A_j x_t)^T | s_t=i, s_{t+1}=j]
                 # Use pair-conditional quantities when available (GPB2 exact),
@@ -1680,8 +1678,6 @@ def compute_expected_complete_log_likelihood(
 
         for t in range(n_time):
             weight = smoother_discrete_state_prob[t, j]
-            if weight < 1e-10:
-                continue
 
             m_t_j = state_cond_smoother_means[t, :, j]
             V_t_j = state_cond_smoother_covs[t, :, :, j]
@@ -1749,8 +1745,6 @@ def compute_posterior_entropy(
     for j in range(n_discrete_states):
         for t in range(n_time):
             weight = smoother_discrete_state_prob[t, j]
-            if weight < 1e-10:
-                continue
             cov_j = state_cond_smoother_covs[t, :, :, j]
             log_det = jnp.linalg.slogdet(cov_j)[1]
             gaussian_entropy = 0.5 * (
