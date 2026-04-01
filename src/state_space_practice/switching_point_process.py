@@ -1720,11 +1720,9 @@ class SwitchingSpikeOscillatorModel:
             Switching smoother algorithm. Must be "gpb1" or "gpb2".
             GPB2 carries S² pair-conditional Gaussians through the backward
             pass (vs S state-conditional for GPB1), providing better numerical
-            stability for long sequences with sparse observations. Note: the
-            dynamics M-step uses approximate factored sufficient statistics
-            with GPB2 because its pair-conditional means are indexed by
-            (S_{t-1}, S_t) rather than (S_t, S_{t+1}) as the M-step expects.
-            This is a known approximation, not a bug.
+            stability for long sequences with sparse observations. The
+            dynamics M-step receives correct (S_t, S_{t+1})-conditioned
+            sufficient statistics from both smoother types.
 
         Raises
         ------
@@ -2214,12 +2212,10 @@ class SwitchingSpikeOscillatorModel:
         self.smoother_discrete_state_prob = smoother_discrete_state_prob
         self.smoother_joint_discrete_state_prob = smoother_joint_discrete_state_prob
         self.smoother_pair_cond_cross_cov = pair_cond_smoother_cross_covs
-        # GPB2 pair_cond_smoother_means is conditioned on (S_{t-1}, S_t) but
-        # the M-step expects conditioning on (S_t, S_{t+1}). Pass None for
-        # GPB2 so the M-step uses the approximate factored form instead.
-        self.smoother_pair_cond_means = (
-            None if self.smoother_type == "gpb2" else pair_cond_smoother_means
-        )
+        # Both GPB1 and GPB2 now output pair_cond_smoother_means with the
+        # M-step convention E[x_t | S_t=j, S_{t+1}=k]. GPB2 computes this by
+        # marginalizing its triple-conditional means over S_{t-1}.
+        self.smoother_pair_cond_means = pair_cond_smoother_means
 
         return marginal_log_likelihood
 

@@ -1120,9 +1120,21 @@ def switching_kalman_smoother_gpb2(
         # Simplified: cross_jk = sum_i P(i|j) * cross_ijk
         #   (because E[x_{t+1}|i,j,k] = E[x_{t+1}|j,k] — independent of i)
 
-        # Weighted sum over i for each (j,k): einsum is clearest here
-        # triple_cross: (L, L, S_i, S_j, S_k)
+        # Marginalize triple-conditional over S_{t-1}=i to get M-step quantities
+        # indexed by (S_t=j, S_{t+1}=k). These are the pair-conditional means
+        # and cross-covariances the M-step expects.
+        #
+        # triple_mean: (L, S_i, S_j, S_k) = E[x_t | S_{t-1}=i, S_t=j, S_{t+1}=k]
+        # triple_cross: (L, L, S_i, S_j, S_k) = Cov[x_t, x_{t+1} | ...]
         # backward_prob: (S_i, S_j) = P(S_{t-1}=i | S_t=j)
+        #
+        # For each (j,k): sum_i P(i|j) * quantity(i,j,k) → quantity(j,k)
+        mstep_pair_cond_means = jnp.einsum(
+            "lijk,ij->ljk",
+            triple_mean,
+            smoother_backward_cond_prob,
+        )
+
         pair_cond_smoother_cross_covs = jnp.einsum(
             "abijk,ij->abjk",
             triple_cross,
@@ -1137,10 +1149,10 @@ def switching_kalman_smoother_gpb2(
         )
 
         return (
-            pair_cond_smoother_mean,      # (L, S_i, S_j) — carry
+            pair_cond_smoother_mean,      # (L, S_i, S_j) — carry (S_{t-1}, S_t)
             pair_cond_smoother_cov,       # (L, L, S_i, S_j) — carry
             smoother_discrete_state_prob,  # (S,) — carry
-            pair_cond_smoother_mean,       # for output stacking
+            mstep_pair_cond_means,        # (L, S_j, S_k) — M-step output (S_t, S_{t+1})
         ), (
             overall_smoother_mean,
             overall_smoother_covs,
@@ -1150,7 +1162,7 @@ def switching_kalman_smoother_gpb2(
             state_cond_smoother_means,
             state_cond_smoother_covs,
             pair_cond_smoother_cross_covs,
-            pair_cond_smoother_mean,
+            mstep_pair_cond_means,        # E[x_t | S_t=j, S_{t+1}=k] — correct for M-step
         )
 
     # Initialize carry from last filter output
