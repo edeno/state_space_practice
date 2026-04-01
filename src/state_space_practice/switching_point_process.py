@@ -1018,6 +1018,7 @@ def _single_neuron_glm_step_second_order(
     weight_l2: float = 0.0,
     baseline_prior: Array | None = None,
     baseline_prior_l2: float = 0.0,
+    max_steps: int = 50,
 ) -> tuple[Array, Array]:
     """Optimize Poisson GLM with second-order expectation using BFGS.
 
@@ -1065,7 +1066,7 @@ def _single_neuron_glm_step_second_order(
     """
     params = jnp.concatenate([jnp.atleast_1d(baseline), weights])
 
-    def loss_fn(p: Array, args: Array) -> Array:
+    def loss_fn(p: Array, args: None) -> Array:
         return _neg_Q_single_neuron(
             p, y_n, smoother_mean, smoother_cov, dt, weight_l2, time_weights,
             baseline_prior, baseline_prior_l2,
@@ -1073,7 +1074,7 @@ def _single_neuron_glm_step_second_order(
 
     solver = optx.BFGS(rtol=1e-5, atol=1e-5)
     result = optx.minimise(
-        loss_fn, solver, params, args=None, max_steps=50, throw=False,
+        loss_fn, solver, params, args=None, max_steps=max_steps, throw=False,
     )
 
     new_baseline = result.value[0]
@@ -1119,8 +1120,8 @@ def update_spike_glm_params(
     dt : float
         Time bin width in seconds.
     max_iter : int, default=10
-        Maximum Newton iterations per neuron (plug-in method only;
-        ignored when use_second_order=True).
+        For plug-in method: maximum Newton iterations per neuron.
+        For second-order (BFGS): maximum BFGS steps per neuron.
     smoother_cov : Array | None, shape (n_time, n_latent, n_latent), optional
         Smoothed latent state covariances. Required if use_second_order=True.
     use_second_order : bool, default=False
@@ -1203,7 +1204,7 @@ def update_spike_glm_params(
             bp = baseline_prior[neuron_idx] if baseline_prior is not None else None
             new_b, new_w = _single_neuron_glm_step_second_order(
                 b, w, y_n, smoother_mean, smoother_cov, dt, time_weights, weight_l2,
-                bp, baseline_prior_l2,
+                bp, baseline_prior_l2, max_steps=max_iter,
             )
             return new_b, new_w
 
@@ -1704,7 +1705,8 @@ class SwitchingSpikeOscillatorModel:
         spike_weight_l2 : float, default=0.01
             L2 regularization strength on the spike GLM weights.
         spike_baseline_prior_l2 : float, default=0.0
-            L2 regularization strength shrinking spike baselines toward zero.
+            L2 regularization strength shrinking spike baselines toward the
+            empirical log-rate (computed per neuron from mean spike counts).
             Setting to 0.0 disables the prior.
         smoother_type : str, default="gpb1"
             Switching smoother algorithm. Must be "gpb1" or "gpb2".
