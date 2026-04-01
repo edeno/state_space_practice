@@ -355,11 +355,15 @@ def _first_timestep_kalman_update(
     # Marginal log-likelihood contribution
     marginal_log_likelihood = ll_max + jnp.log(norm_const)
 
-    # For smoother compatibility: create pair_cond_filter_mean
+    # For smoother compatibility: create pair_cond_filter_mean and cov
     # At t=1, there's no S₀, so we create a diagonal structure
     pair_cond_filter_mean = jnp.broadcast_to(
         state_cond_filter_mean[:, None, :],
         (state_cond_filter_mean.shape[0], n_discrete_states, n_discrete_states),
+    )
+    pair_cond_filter_cov = jnp.broadcast_to(
+        state_cond_filter_cov[:, :, None, :],
+        (*state_cond_filter_cov.shape[:2], n_discrete_states, n_discrete_states),
     )
 
     return (
@@ -367,6 +371,7 @@ def _first_timestep_kalman_update(
         state_cond_filter_cov,
         filter_discrete_prob,
         pair_cond_filter_mean,
+        pair_cond_filter_cov,
         marginal_log_likelihood,
     )
 
@@ -430,7 +435,9 @@ def switching_kalman_filter(
     filter_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
         Filtered probability of the discrete states
     last_pair_cond_filter_mean : jax.Array, shape (n_cont_states, n_discrete_states, n_discrete_states)
-        Last filtered conditional mean of the continuous latent state
+        Last filtered pair-conditional mean E[x_T | S_{T-1}=i, S_T=j]
+    last_pair_cond_filter_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+        Last filtered pair-conditional covariance Cov[x_T | S_{T-1}=i, S_T=j]
     marginal_log_likelihood : jax.Array
         Marginal log likelihood of the observations (scalar array)
 
@@ -541,6 +548,7 @@ def switching_kalman_filter(
             state_cond_filter_cov,
             filter_discrete_prob,
             pair_cond_filter_mean,
+            pair_cond_filter_cov,
         )
 
     # Handle first timestep with x₁ convention: measurement update only (no dynamics)
@@ -550,6 +558,7 @@ def switching_kalman_filter(
         first_state_cond_cov,
         first_discrete_prob,
         first_pair_cond_mean,
+        first_pair_cond_cov,
         first_log_lik,
     ) = _first_timestep_kalman_update(
         init_state_cond_mean,
@@ -567,6 +576,7 @@ def switching_kalman_filter(
         rest_state_cond_filter_cov,
         rest_filter_discrete_state_prob,
         rest_pair_cond_filter_mean,
+        rest_pair_cond_filter_cov,
     ) = jax.lax.scan(
         _step,
         (
@@ -591,12 +601,16 @@ def switching_kalman_filter(
     pair_cond_filter_mean = jnp.concatenate(
         [first_pair_cond_mean[None, ...], rest_pair_cond_filter_mean], axis=0
     )
+    pair_cond_filter_cov = jnp.concatenate(
+        [first_pair_cond_cov[None, ...], rest_pair_cond_filter_cov], axis=0
+    )
 
     return (
         state_cond_filter_mean,
         state_cond_filter_cov,
         filter_discrete_state_prob,
         pair_cond_filter_mean[-1],
+        pair_cond_filter_cov[-1],
         marginal_log_likelihood,
     )
 
@@ -608,6 +622,72 @@ _kalman_smoother_update_per_discrete_state_pair = jax.vmap(
     in_axes=(-1, -1, None, None, -1, -1),
     out_axes=-1,
 )
+
+# GPB2 triple vmap: produces S³ triple-conditional smoother posteriors.
+#
+# For each (i, j, k) = (S_{t-1}, S_t, S_{t+1}):
+#   carry: (L, S_j, S_k) = smoother at t+1 conditioned on (S_t=j, S_{t+1}=k)
+#   filter: (L, S_i) = filter at t-1 conditioned on S_{t-1}=i
+#   dynamics: A_j, Q_j indexed by S_t=j
+#
+# Innermost: vmap over i (filter axis)
+# Middle: vmap over j (carry first axis + dynamics)
+# Outer: vmap over k (carry second axis)
+#
+# Output shapes: mean (L, S_i, S_j, S_k), cov (L, L, S_i, S_j, S_k)
+_gpb2_kalman_smoother_update_triple = jax.vmap(
+    jax.vmap(
+        jax.vmap(
+            _kalman_smoother_update,
+            in_axes=(None, None, -1, -1, None, None),
+            out_axes=-1,
+        ),
+        in_axes=(1, 2, None, None, -1, -1),
+        out_axes=-1,
+    ),
+    in_axes=(-1, -1, None, None, None, None),
+    out_axes=-1,
+)
+
+
+def _collapse_triple_to_pair(
+    triple_mean: jax.Array,
+    triple_cov: jax.Array,
+    weights: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Collapse S³ triple-conditional Gaussians to S² pair-conditional.
+
+    Marginalizes over the last conditioning variable (S_{t+1}=k) for each
+    pair (S_{t-1}=i, S_t=j).
+
+    Parameters
+    ----------
+    triple_mean : jax.Array, shape (n_latent, S_i, S_j, S_k)
+    triple_cov : jax.Array, shape (n_latent, n_latent, S_i, S_j, S_k)
+    weights : jax.Array, shape (S_j, S_k)
+        P(S_{t+1}=k | S_t=j, y_{1:T}) — forward conditional probability.
+
+    Returns
+    -------
+    pair_mean : jax.Array, shape (n_latent, S_i, S_j)
+    pair_cov : jax.Array, shape (n_latent, n_latent, S_i, S_j)
+    """
+    # For each (i, j): collapse over k using weights[j, :]
+    # collapse_gaussian_mixture expects: means (L, S_k), cov (L, L, S_k), weights (S_k,)
+    #
+    # After outer vmap slices j: triple_mean becomes (L, S_i, S_k)
+    # Inner vmap iterates over S_i (axis -2), leaving (L, S_k) per slice — correct.
+    _collapse_over_k_for_fixed_j = jax.vmap(
+        collapse_gaussian_mixture,
+        in_axes=(-2, -2, None),  # vmap over i (second-to-last), keep k as mixture
+        out_axes=(-1, -1),
+    )
+    _collapse_over_k = jax.vmap(
+        _collapse_over_k_for_fixed_j,
+        in_axes=(-2, -2, 0),  # vmap over j (second-to-last of 4D), weights axis 0
+        out_axes=(-1, -1),
+    )
+    return _collapse_over_k(triple_mean, triple_cov, weights)
 
 
 def _update_smoother_discrete_probabilities(
@@ -771,6 +851,33 @@ def switching_kalman_smoother(
             continuous_transition_matrix,  # E[X_{t+1} | X_t], shape (n_cont_states, n_cont_states, n_discrete_states)
         )
 
+        # 1b. Stabilize pair-conditional smoother outputs (GPB1 safety net).
+        # Cap at 1e8x the filter covariance trace. This is large enough to
+        # not interfere with normal EM dynamics (where smoother cov can
+        # legitimately exceed filter cov by 10-100x from GPB1 collapse) but
+        # catches the exponential blowup that leads to overflow on long
+        # sequences (where growth reaches 10^100+).
+        _COV_CAP_MULTIPLIER = 1e8
+        _MAX_SMOOTHER_MEAN_ABS = 1e6
+
+        # Compute max allowed trace from filter cov
+        max_filter_trace = jnp.max(jax.vmap(jnp.trace, in_axes=-1)(state_cond_filter_cov))
+        max_allowed_trace = max_filter_trace * _COV_CAP_MULTIPLIER + 1.0
+
+        def _cap_pair_cov(pair_cov_jk):
+            trace = jnp.trace(pair_cov_jk)
+            ratio = trace / max_allowed_trace
+            return jnp.where(ratio > 1.0, pair_cov_jk / ratio, pair_cov_jk)
+
+        pair_cond_smoother_covs = jax.vmap(
+            jax.vmap(_cap_pair_cov, in_axes=-1, out_axes=-1),
+            in_axes=-1, out_axes=-1,
+        )(pair_cond_smoother_covs)
+
+        pair_cond_smoother_mean = jnp.clip(
+            pair_cond_smoother_mean, -_MAX_SMOOTHER_MEAN_ABS, _MAX_SMOOTHER_MEAN_ABS,
+        )
+
         # 2. Compute discrete state intermediates
         (
             smoother_discrete_state_prob,  # Pr(S_t=j | y_{1:T}), shape (n_discrete_states,),  M_{t | T}(j)
@@ -901,6 +1008,262 @@ def switching_kalman_smoother(
     )
 
 
+def switching_kalman_smoother_gpb2(
+    filter_mean: jax.Array,
+    filter_cov: jax.Array,
+    filter_discrete_state_prob: jax.Array,
+    last_filter_conditional_cont_mean: jax.Array,
+    process_cov: jax.Array,
+    continuous_transition_matrix: jax.Array,
+    discrete_state_transition_matrix: jax.Array,
+    last_filter_conditional_cont_cov: jax.Array | None = None,
+) -> tuple[
+    jax.Array, jax.Array, jax.Array, jax.Array, jax.Array,
+    jax.Array, jax.Array, jax.Array, jax.Array,
+]:
+    """GPB2 switching Kalman smoother — carries S² pair-conditional structure.
+
+    Same interface and return types as switching_kalman_smoother (GPB1), but
+    maintains pair-conditional (S_t, S_{t+1}) Gaussians through the backward
+    pass instead of collapsing to state-conditional at each step. This
+    provides better numerical stability for long sequences with sparse
+    observations (smoother gain > 1) by avoiding the aggressive GPB1 collapse
+    that introduces unbounded Var[E[x|S]] growth.
+
+    Computational cost is ~2x GPB1 for S=2 (8 vs 4 RTS updates per step).
+    """
+    n_discrete_states = filter_mean.shape[-1]
+
+    def _step(carry, args):
+        (
+            next_pair_cond_smoother_mean,   # (L, S_j, S_k) = (S_t, S_{t+1})
+            next_pair_cond_smoother_cov,    # (L, L, S_j, S_k)
+            next_smoother_discrete_prob,    # (S,) P(S_{t+1}=k | y_{1:T})
+            _,  # unused in carry; required by jax.lax.scan pytree structure
+        ) = carry
+
+        state_cond_filter_mean, state_cond_filter_cov, filter_discrete_prob = args
+
+        # 1. Triple-conditional smoother update: (L, S_i, S_j, S_k)
+        # For each (i, j, k): RTS update with filter(i), carry(j,k), dynamics(j)
+        (
+            triple_mean,   # (L, S_i, S_j, S_k)
+            triple_cov,    # (L, L, S_i, S_j, S_k)
+            triple_cross,  # (L, L, S_i, S_j, S_k)
+        ) = _gpb2_kalman_smoother_update_triple(
+            next_pair_cond_smoother_mean,   # (L, S_j, S_k)
+            next_pair_cond_smoother_cov,    # (L, L, S_j, S_k)
+            state_cond_filter_mean,         # (L, S_i)
+            state_cond_filter_cov,          # (L, L, S_i)
+            process_cov,                    # (L, L, S_j) — dynamics indexed by S_t=j
+            continuous_transition_matrix,   # (L, L, S_j)
+        )
+
+        # 2. Compute discrete state probabilities
+        (
+            smoother_discrete_state_prob,
+            smoother_backward_cond_prob,
+            joint_smoother_discrete_prob,
+            smoother_forward_cond_prob,
+        ) = _update_smoother_discrete_probabilities(
+            filter_discrete_prob,
+            discrete_state_transition_matrix,
+            next_smoother_discrete_prob,
+        )
+
+        # 3. Collapse S³ → S² by marginalizing over S_{t+1}=k
+        # For each (i, j): collapse over k using P(S_{t+1}=k | S_t=j, y_{1:T})
+        (
+            pair_cond_smoother_mean,   # (L, S_i, S_j)
+            pair_cond_smoother_cov,    # (L, L, S_i, S_j)
+        ) = _collapse_triple_to_pair(
+            triple_mean, triple_cov, smoother_forward_cond_prob,
+        )
+
+        # 4. Extract state-conditional and overall outputs (same as GPB1)
+        # Collapse (S_i, S_j) → S_j by marginalizing over S_{t-1}=i
+        (
+            state_cond_smoother_means,  # (L, S_j)
+            state_cond_smoother_covs,   # (L, L, S_j)
+        ) = collapse_gaussian_mixture_per_discrete_state(
+            pair_cond_smoother_mean,    # (L, S_i, S_j)
+            pair_cond_smoother_cov,     # (L, L, S_i, S_j)
+            smoother_backward_cond_prob,  # P(S_{t-1}=i | S_t=j, y_{1:T})
+        )
+
+        # Overall smoother (collapse S_j → 1)
+        (
+            overall_smoother_mean,
+            overall_smoother_covs,
+        ) = collapse_gaussian_mixture(
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+            smoother_discrete_state_prob,
+        )
+
+        # Cross-covariance for M-step.
+        #
+        # The M-step needs Cov[x_{t+1}, x_t | S_t=j, S_{t+1}=k] indexed by (j,k).
+        # We have triple_cross[:,:,i,j,k] = Cov[x_t, x_{t+1} | i, j, k] (note: t, t+1 order)
+        # and triple_mean[:,i,j,k] = E[x_t | i, j, k].
+        #
+        # To get (j,k)-conditional, marginalize over i using
+        # smoother_backward_cond_prob[i, j] = P(S_{t-1}=i | S_t=j).
+        #
+        # For each (j,k):
+        #   cross_jk = sum_i P(i|j) * cross_ijk + sum_i P(i|j) * outer(m_t_ijk - m_t_jk, m_t1_jk - ...)
+        # The second term involves means of x_{t+1} given (i,j,k). Since the carry has
+        # next_pair_cond_smoother_mean[:,j,k] = E[x_{t+1} | j, k] (already marginalized over i),
+        # x_{t+1} doesn't depend on i. So the spread term only involves x_t means.
+        #
+        # Simplified: cross_jk = sum_i P(i|j) * cross_ijk
+        #   (because E[x_{t+1}|i,j,k] = E[x_{t+1}|j,k] — independent of i)
+
+        # Marginalize triple-conditional over S_{t-1}=i to get M-step quantities
+        # indexed by (S_t=j, S_{t+1}=k). These are the pair-conditional means,
+        # covariances, and cross-covariances the M-step expects.
+        #
+        # triple_mean: (L, S_i, S_j, S_k) = E[x_t | S_{t-1}=i, S_t=j, S_{t+1}=k]
+        # triple_cov:  (L, L, S_i, S_j, S_k) = Cov[x_t | S_{t-1}=i, S_t=j, S_{t+1}=k]
+        # triple_cross: (L, L, S_i, S_j, S_k) = Cov[x_t, x_{t+1} | ...]
+        # backward_prob: (S_i, S_j) = P(S_{t-1}=i | S_t=j)
+        #
+        # For each (j,k): sum_i P(i|j) * quantity(i,j,k) → quantity(j,k)
+        mstep_pair_cond_means = jnp.einsum(
+            "lijk,ij->ljk",
+            triple_mean,
+            smoother_backward_cond_prob,
+        )
+
+        # Pair-conditional covariance for x_t: Cov[x_t | S_t=j, S_{t+1}=k]
+        # = E_i[Cov[x_t | i,j,k]] + Var_i[E[x_t | i,j,k]]
+        # First term: weighted average of triple covariances
+        mstep_pair_cond_covs = jnp.einsum(
+            "abijk,ij->abjk",
+            triple_cov,
+            smoother_backward_cond_prob,
+        )
+        # Second term: spread of means (Var_i[E[x_t | i,j,k]])
+        # = sum_i P(i|j) * (m_ijk - m_jk)(m_ijk - m_jk)^T
+        mean_diff = triple_mean - mstep_pair_cond_means[:, None, :, :]  # (L, S_i, S_j, S_k)
+        mstep_pair_cond_covs += jnp.einsum(
+            "aijk,bijk,ij->abjk",
+            mean_diff,
+            mean_diff,
+            smoother_backward_cond_prob,
+        )
+
+        pair_cond_smoother_cross_covs = jnp.einsum(
+            "abijk,ij->abjk",
+            triple_cross,
+            smoother_backward_cond_prob,
+        )
+
+        # Pair-conditional mean for x_{t+1}: E[x_{t+1} | S_t=j, S_{t+1}=k]
+        # This comes from the carry (next_pair_cond_smoother_mean), which was
+        # already marginalized to (S_t, S_{t+1}) conditioning at step t+1.
+        mstep_next_pair_cond_means = next_pair_cond_smoother_mean  # (L, S_j, S_k)
+
+        # Collapse to overall cross-cov
+        overall_smoother_cross_cov = jnp.einsum(
+            "abjk,jk->ab",
+            pair_cond_smoother_cross_covs,
+            joint_smoother_discrete_prob,
+        )
+
+        return (
+            pair_cond_smoother_mean,      # (L, S_i, S_j) — carry (S_{t-1}, S_t)
+            pair_cond_smoother_cov,       # (L, L, S_i, S_j) — carry
+            smoother_discrete_state_prob,  # (S,) — carry
+            mstep_pair_cond_means,        # (L, S_j, S_k) — M-step output (S_t, S_{t+1})
+        ), (
+            overall_smoother_mean,
+            overall_smoother_covs,
+            smoother_discrete_state_prob,
+            joint_smoother_discrete_prob,
+            overall_smoother_cross_cov,
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+            pair_cond_smoother_cross_covs,
+            mstep_pair_cond_means,        # E[x_t | S_t=j, S_{t+1}=k]
+            mstep_pair_cond_covs,         # Cov[x_t | S_t=j, S_{t+1}=k]
+            mstep_next_pair_cond_means,   # E[x_{t+1} | S_t=j, S_{t+1}=k]
+        )
+
+    # Initialize carry from last filter output.
+    last_pair_mean = last_filter_conditional_cont_mean  # (L, S, S) already pair-cond
+    n_cont = filter_cov.shape[1]
+    if last_filter_conditional_cont_cov is not None:
+        # Use exact pair-conditional covariance from the filter
+        last_pair_cov = last_filter_conditional_cont_cov  # (L, L, S_i, S_j)
+    else:
+        # Fallback: broadcast state-conditional to pair-conditional
+        last_pair_cov = jnp.broadcast_to(
+            filter_cov[-1][:, :, None, :],  # (L, L, 1, S_j) → (L, L, S_i, S_j)
+            (n_cont, n_cont, n_discrete_states, n_discrete_states),
+        )
+
+    init_carry = (
+        last_pair_mean,
+        last_pair_cov,
+        filter_discrete_state_prob[-1],
+        last_pair_mean,
+    )
+
+    _, (
+        overall_smoother_mean,
+        overall_smoother_covs,
+        smoother_discrete_state_prob,
+        smoother_joint_discrete_state_prob,
+        overall_smoother_cross_cov,
+        state_cond_smoother_means,
+        state_cond_smoother_covs,
+        pair_cond_smoother_cross_covs,
+        pair_cond_smoother_means,
+        pair_cond_smoother_covs_mstep,
+        next_pair_cond_smoother_means,
+    ) = jax.lax.scan(
+        _step,
+        init_carry,
+        (filter_mean[:-1], filter_cov[:-1], filter_discrete_state_prob[:-1]),
+        reverse=True,
+    )
+
+    # Append last timestep (same as GPB1)
+    last_overall_mean, last_overall_cov = collapse_gaussian_mixture(
+        filter_mean[-1], filter_cov[-1], filter_discrete_state_prob[-1],
+    )
+    overall_smoother_mean = jnp.concatenate(
+        [overall_smoother_mean, last_overall_mean[None]], axis=0
+    )
+    overall_smoother_covs = jnp.concatenate(
+        [overall_smoother_covs, last_overall_cov[None]], axis=0
+    )
+    smoother_discrete_state_prob = jnp.concatenate(
+        [smoother_discrete_state_prob, filter_discrete_state_prob[-1][None]], axis=0
+    )
+    state_cond_smoother_means = jnp.concatenate(
+        [state_cond_smoother_means, filter_mean[-1][None]], axis=0
+    )
+    state_cond_smoother_covs = jnp.concatenate(
+        [state_cond_smoother_covs, filter_cov[-1][None]], axis=0
+    )
+
+    return (
+        overall_smoother_mean,
+        overall_smoother_covs,
+        smoother_discrete_state_prob,
+        smoother_joint_discrete_state_prob,
+        overall_smoother_cross_cov,
+        state_cond_smoother_means,
+        state_cond_smoother_covs,
+        pair_cond_smoother_cross_covs,
+        pair_cond_smoother_means,
+        pair_cond_smoother_covs_mstep,
+        next_pair_cond_smoother_means,
+    )
+
+
 def weighted_sum_of_outer_products(
     x: jax.Array, y: jax.Array, weights: jax.Array
 ) -> jax.Array:
@@ -941,6 +1304,8 @@ def switching_kalman_maximization_step(
     smoother_joint_discrete_state_prob: jax.Array,
     pair_cond_smoother_cross_cov: jax.Array,
     pair_cond_smoother_means: jax.Array | None = None,
+    pair_cond_smoother_covs: jax.Array | None = None,
+    next_pair_cond_smoother_means: jax.Array | None = None,
 ) -> tuple[
     jax.Array,
     jax.Array,
@@ -968,8 +1333,14 @@ def switching_kalman_maximization_step(
     pair_cond_smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         smoother cross-covariance.
     pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
-        E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses the exact pair-conditional
-        means for beta computation. If None, uses the approximate factored form.
+        E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional
+        means for transition sufficient statistics. If None, uses the approximate factored form.
+    pair_cond_smoother_covs : jax.Array | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+        Cov[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional
+        covariances for gamma1. If None, falls back to state-conditional covariances.
+    next_pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+        E[X_{t+1} | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional
+        next-step means for beta. If None, falls back to state-conditional means.
 
     Returns
     -------
@@ -1041,39 +1412,56 @@ def switching_kalman_maximization_step(
     # Compute beta and gamma1 for transition matrix estimation
     # These use joint probability P(S_t=i, S_{t+1}=j) weighting
     if pair_cond_smoother_means is not None:
-        # Use exact pair-conditional means: E[x_t | S_t=i, S_{t+1}=j]
-        # This is the correct formulation that guarantees EM monotonicity
+        # Exact pair-conditional sufficient statistics for GPB2.
+        # Uses E[x_t | S_t=i, S_{t+1}=j] and optionally the exact
+        # pair-conditional covariances and next-step means if available.
 
-        # gamma1[a,b,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_t x_t^T | S_t=i, S_{t+1}=j]
-        # Note: We need pair-conditional covariances too, but we approximate with
-        # state-conditional covariances (the covariance term is less sensitive)
-        gamma1 = jnp.einsum(
-            "tij, tabi -> abj",
-            smoother_joint_discrete_state_prob,
-            state_cond_smoother_covs[:-1],
-        ) + jnp.einsum(
+        # gamma1[a,b,j] = sum_{t,i} w_t^{ij} * E[x_t x_t^T | S_t=i, S_{t+1}=j]
+        #               = sum_{t,i} w_t^{ij} * (Cov[x_t | i,j] + m_t^{ij} (m_t^{ij})^T)
+        if pair_cond_smoother_covs is not None:
+            # Exact: use pair-conditional Cov[x_t | S_t=i, S_{t+1}=j]
+            gamma1 = jnp.einsum(
+                "tij, tabij -> abj",
+                smoother_joint_discrete_state_prob,
+                pair_cond_smoother_covs,
+            )
+        else:
+            # Fallback: approximate with state-conditional Cov[x_t | S_t=i]
+            gamma1 = jnp.einsum(
+                "tij, tabi -> abj",
+                smoother_joint_discrete_state_prob,
+                state_cond_smoother_covs[:-1],
+            )
+        gamma1 += jnp.einsum(
             "tij, taij, tbij -> abj",
             smoother_joint_discrete_state_prob,
-            pair_cond_smoother_means,  # E[x_t | S_t=i, S_{t+1}=j]
-            pair_cond_smoother_means,  # E[x_t | S_t=i, S_{t+1}=j]
+            pair_cond_smoother_means,
+            pair_cond_smoother_means,
         )
 
-        # beta[c,d,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_{t+1} x_t^T | S_t=i, S_{t+1}=j]
-        # = sum_{t,i} P(S_t=i, S_{t+1}=j) * (Cov[x_{t+1}, x_t | ...] + E[x_{t+1}|...] E[x_t|...]^T)
+        # beta[c,d,j] = sum_{t,i} w_t^{ij} * E[x_{t+1} x_t^T | S_t=i, S_{t+1}=j]
+        #             = sum_{t,i} w_t^{ij} * (Cov[x_{t+1}, x_t | i,j] + m_{t+1}^{ij} (m_t^{ij})^T)
         beta = jnp.einsum(
             "tij,tdcij->cdj",
-            smoother_joint_discrete_state_prob,  # P(S_t=i, S_{t+1}=j)
-            pair_cond_smoother_cross_cov,  # Cov[x_{t+1}, x_t | S_t=i, S_{t+1}=j]
+            smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov,
         )
-        # For the mean term, we need E[x_{t+1} | S_t=i, S_{t+1}=j] which we approximate
-        # with E[x_{t+1} | S_{t+1}=j] (state_cond_smoother_means[1:, :, j])
-        # beta[c,d,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_{t+1}|S_{t+1}=j]_c * E[x_t|S_t=i,S_{t+1}=j]_d
-        beta += jnp.einsum(
-            "tdij,tcj,tij->cdj",
-            pair_cond_smoother_means,  # E[x_t | S_t=i, S_{t+1}=j], shape (T-1, d, i, j)
-            state_cond_smoother_means[1:],  # E[x_{t+1} | S_{t+1}=j], shape (T-1, c, j)
-            smoother_joint_discrete_state_prob,  # P(S_t=i, S_{t+1}=j), shape (T-1, i, j)
-        )
+        if next_pair_cond_smoother_means is not None:
+            # Exact: use E[x_{t+1} | S_t=i, S_{t+1}=j]
+            beta += jnp.einsum(
+                "tdij,tcij,tij->cdj",
+                pair_cond_smoother_means,       # E[x_t | S_t=i, S_{t+1}=j]
+                next_pair_cond_smoother_means,  # E[x_{t+1} | S_t=i, S_{t+1}=j]
+                smoother_joint_discrete_state_prob,
+            )
+        else:
+            # Fallback: approximate E[x_{t+1} | S_t=i, S_{t+1}=j] ≈ E[x_{t+1} | S_{t+1}=j]
+            beta += jnp.einsum(
+                "tdij,tcj,tij->cdj",
+                pair_cond_smoother_means,
+                state_cond_smoother_means[1:],
+                smoother_joint_discrete_state_prob,
+            )
     else:
         # Approximate factored form (original implementation)
         # gamma1[a,b,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_t x_t^T | S_t=i]
@@ -1160,6 +1548,9 @@ def compute_expected_complete_log_likelihood(
     measurement_matrix: jax.Array,
     measurement_cov: jax.Array,
     discrete_transition_matrix: jax.Array,
+    pair_cond_smoother_means: jax.Array | None = None,
+    pair_cond_smoother_covs: jax.Array | None = None,
+    next_pair_cond_smoother_means: jax.Array | None = None,
 ) -> jax.Array:
     """Compute the expected complete-data log-likelihood E_q[log p(y, x, s | θ)].
 
@@ -1183,11 +1574,27 @@ def compute_expected_complete_log_likelihood(
     measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states, n_discrete_states)
     measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim, n_discrete_states)
     discrete_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
+    pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+        E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses exact pair-conditional
+        quantities for the transition Q-function term.
+    pair_cond_smoother_covs : jax.Array | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+        Cov[X_t | y_{1:T}, S_t=i, S_{t+1}=j].
+    next_pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+        E[X_{t+1} | y_{1:T}, S_t=i, S_{t+1}=j].
 
     Returns
     -------
     expected_complete_ll : jax.Array
         E_q[log p(y, x, s | θ)] (scalar array)
+
+    Notes
+    -----
+    When GPB2 pair-conditional quantities are provided, the transition
+    Q-function term uses exact pair-conditional means and covariances for
+    x_t, but Cov[x_{t+1} | S_t, S_{t+1}] is still approximated with
+    the state-conditional Cov[x_{t+1} | S_{t+1}] since the GPB2 smoother
+    does not produce that quantity directly. This is a minor residual
+    approximation affecting only the ELBO diagnostic, not parameter updates.
     """
     n_time = obs.shape[0]
     n_discrete_states = smoother_discrete_state_prob.shape[1]
@@ -1233,23 +1640,37 @@ def compute_expected_complete_log_likelihood(
             # Sum over source states i weighted by P(s_t=i, s_{t+1}=j | y_{1:T})
             for i in range(n_discrete_states):
                 weight = smoother_joint_discrete_state_prob[t, i, j]
-                if weight < 1e-10:
-                    continue
 
                 # E_q[(x_{t+1} - A_j x_t)(x_{t+1} - A_j x_t)^T | s_t=i, s_{t+1}=j]
-                # Need: E[x_{t+1} x_{t+1}^T], E[x_{t+1} x_t^T], E[x_t x_t^T]
-                m_t_i = state_cond_smoother_means[t, :, i]
-                m_t1_j = state_cond_smoother_means[t + 1, :, j]
-                V_t_i = state_cond_smoother_covs[t, :, :, i]
+                # Use pair-conditional quantities when available (GPB2 exact),
+                # otherwise fall back to state-conditional (GPB1 approximate).
+                if pair_cond_smoother_means is not None:
+                    m_t_ij = pair_cond_smoother_means[t, :, i, j]
+                else:
+                    m_t_ij = state_cond_smoother_means[t, :, i]
+
+                if next_pair_cond_smoother_means is not None:
+                    m_t1_ij = next_pair_cond_smoother_means[t, :, i, j]
+                else:
+                    m_t1_ij = state_cond_smoother_means[t + 1, :, j]
+
+                if pair_cond_smoother_covs is not None:
+                    V_t_ij = pair_cond_smoother_covs[t, :, :, i, j]
+                else:
+                    V_t_ij = state_cond_smoother_covs[t, :, :, i]
+
+                # For V_{t+1}, we don't have pair-conditional Cov[x_{t+1} | S_t, S_{t+1}]
+                # separately (only Cov[x_t | S_t, S_{t+1}]). Use state-conditional.
                 V_t1_j = state_cond_smoother_covs[t + 1, :, :, j]
+
                 cross_cov_ij = pair_cond_smoother_cross_cov[t, :, :, i, j]
 
                 # E[x_{t+1} x_{t+1}^T | ...]
-                E_xt1_xt1 = V_t1_j + jnp.outer(m_t1_j, m_t1_j)
+                E_xt1_xt1 = V_t1_j + jnp.outer(m_t1_ij, m_t1_ij)
                 # E[x_t x_t^T | ...]
-                E_xt_xt = V_t_i + jnp.outer(m_t_i, m_t_i)
+                E_xt_xt = V_t_ij + jnp.outer(m_t_ij, m_t_ij)
                 # E[x_{t+1} x_t^T | ...]
-                E_xt1_xt = cross_cov_ij + jnp.outer(m_t1_j, m_t_i)
+                E_xt1_xt = cross_cov_ij + jnp.outer(m_t1_ij, m_t_ij)
 
                 # E[(x_{t+1} - A x_t)(x_{t+1} - A x_t)^T]
                 # = E[x_{t+1} x_{t+1}^T] - A E[x_t x_{t+1}^T] - E[x_{t+1} x_t^T] A^T + A E[x_t x_t^T] A^T
@@ -1264,7 +1685,7 @@ def compute_expected_complete_log_likelihood(
                 log_prob = -0.5 * (
                     n_cont_states * jnp.log(2 * jnp.pi) + log_det_Q + trace_term
                 )
-                log_cont_trans += weight * log_prob
+                log_cont_trans += jnp.where(weight > 0, weight * log_prob, 0.0)
 
     # 5. E_q[sum_t log p(y_t | x_t, s_t)] - observations
     log_obs = 0.0
@@ -1276,8 +1697,6 @@ def compute_expected_complete_log_likelihood(
 
         for t in range(n_time):
             weight = smoother_discrete_state_prob[t, j]
-            if weight < 1e-10:
-                continue
 
             m_t_j = state_cond_smoother_means[t, :, j]
             V_t_j = state_cond_smoother_covs[t, :, :, j]
@@ -1292,7 +1711,7 @@ def compute_expected_complete_log_likelihood(
 
             trace_term = jnp.trace(psd_solve(R_j, expected_residual))
             log_prob = -0.5 * (n_obs * jnp.log(2 * jnp.pi) + log_det_R + trace_term)
-            log_obs += weight * log_prob
+            log_obs += jnp.where(weight > 0, weight * log_prob, 0.0)
 
     return log_init_discrete + log_init_cont + log_discrete_trans + log_cont_trans + log_obs
 
@@ -1345,14 +1764,12 @@ def compute_posterior_entropy(
     for j in range(n_discrete_states):
         for t in range(n_time):
             weight = smoother_discrete_state_prob[t, j]
-            if weight < 1e-10:
-                continue
             cov_j = state_cond_smoother_covs[t, :, :, j]
             log_det = jnp.linalg.slogdet(cov_j)[1]
             gaussian_entropy = 0.5 * (
                 n_cont_states * (1 + jnp.log(2 * jnp.pi)) + log_det
             )
-            cont_entropy += weight * gaussian_entropy
+            cont_entropy += jnp.where(weight > 0, weight * gaussian_entropy, 0.0)
 
     return discrete_entropy + cont_entropy
 
@@ -1372,6 +1789,9 @@ def compute_elbo(
     measurement_matrix: jax.Array,
     measurement_cov: jax.Array,
     discrete_transition_matrix: jax.Array,
+    pair_cond_smoother_means: jax.Array | None = None,
+    pair_cond_smoother_covs: jax.Array | None = None,
+    next_pair_cond_smoother_means: jax.Array | None = None,
 ) -> jax.Array:
     """Compute the Evidence Lower Bound (ELBO) for the switching Kalman filter.
 
@@ -1397,6 +1817,12 @@ def compute_elbo(
     measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states, n_discrete_states)
     measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim, n_discrete_states)
     discrete_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
+    pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+        E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. Optional, for GPB2 exact Q-function.
+    pair_cond_smoother_covs : jax.Array | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+        Cov[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. Optional, for GPB2 exact Q-function.
+    next_pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+        E[X_{t+1} | y_{1:T}, S_t=i, S_{t+1}=j]. Optional, for GPB2 exact Q-function.
 
     Returns
     -------
@@ -1418,6 +1844,9 @@ def compute_elbo(
         measurement_matrix=measurement_matrix,
         measurement_cov=measurement_cov,
         discrete_transition_matrix=discrete_transition_matrix,
+        pair_cond_smoother_means=pair_cond_smoother_means,
+        pair_cond_smoother_covs=pair_cond_smoother_covs,
+        next_pair_cond_smoother_means=next_pair_cond_smoother_means,
     )
 
     entropy = compute_posterior_entropy(
@@ -1435,6 +1864,8 @@ def compute_transition_sufficient_stats(
     smoother_joint_discrete_state_prob: jax.Array,
     pair_cond_smoother_cross_cov: jax.Array,
     pair_cond_smoother_means: jax.Array | None = None,
+    pair_cond_smoother_covs: jax.Array | None = None,
+    next_pair_cond_smoother_means: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Compute sufficient statistics for transition matrix estimation.
 
@@ -1445,7 +1876,11 @@ def compute_transition_sufficient_stats(
     smoother_joint_discrete_state_prob : jax.Array, shape (n_time - 1, n_discrete_states, n_discrete_states)
     pair_cond_smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
     pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
-        E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses exact pair-conditional means.
+        E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional means.
+    pair_cond_smoother_covs : jax.Array | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+        Cov[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional covariances.
+    next_pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+        E[X_{t+1} | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional next means.
 
     Returns
     -------
@@ -1455,35 +1890,48 @@ def compute_transition_sufficient_stats(
         E[x_t x_{t+1}^T] weighted by joint probability.
     """
     if pair_cond_smoother_means is not None:
-        # Use exact pair-conditional means
-        # gamma1[a,b,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_t x_t^T | S_t=i, S_{t+1}=j]
-        gamma1 = jnp.einsum(
-            "tij, tabi -> abj",
-            smoother_joint_discrete_state_prob,
-            state_cond_smoother_covs[:-1],
-        ) + jnp.einsum(
+        # gamma1[a,b,j] = sum_{t,i} w_t^{ij} * (Cov[x_t | i,j] + m_t^{ij} (m_t^{ij})^T)
+        if pair_cond_smoother_covs is not None:
+            gamma1 = jnp.einsum(
+                "tij, tabij -> abj",
+                smoother_joint_discrete_state_prob,
+                pair_cond_smoother_covs,
+            )
+        else:
+            gamma1 = jnp.einsum(
+                "tij, tabi -> abj",
+                smoother_joint_discrete_state_prob,
+                state_cond_smoother_covs[:-1],
+            )
+        gamma1 += jnp.einsum(
             "tij, taij, tbij -> abj",
             smoother_joint_discrete_state_prob,
             pair_cond_smoother_means,
             pair_cond_smoother_means,
         )
 
-        # beta = E[x_t x_{t+1}^T] weighted by joint probability
+        # beta[c,d,j] = sum_{t,i} w_t^{ij} * (Cov[x_{t+1}, x_t | i,j] + m_{t+1}^{ij} (m_t^{ij})^T)
         beta = jnp.einsum(
             "tij,tdcij->cdj",
             smoother_joint_discrete_state_prob,
             pair_cond_smoother_cross_cov,
         )
-        # beta[c,d,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_{t+1}|S_{t+1}=j]_c * E[x_t|S_t=i,S_{t+1}=j]_d
-        beta += jnp.einsum(
-            "tdij,tcj,tij->cdj",
-            pair_cond_smoother_means,  # E[x_t | S_t=i, S_{t+1}=j], shape (T-1, d, i, j)
-            state_cond_smoother_means[1:],  # E[x_{t+1} | S_{t+1}=j], shape (T-1, c, j)
-            smoother_joint_discrete_state_prob,  # P(S_t=i, S_{t+1}=j), shape (T-1, i, j)
-        )
+        if next_pair_cond_smoother_means is not None:
+            beta += jnp.einsum(
+                "tdij,tcij,tij->cdj",
+                pair_cond_smoother_means,
+                next_pair_cond_smoother_means,
+                smoother_joint_discrete_state_prob,
+            )
+        else:
+            beta += jnp.einsum(
+                "tdij,tcj,tij->cdj",
+                pair_cond_smoother_means,
+                state_cond_smoother_means[1:],
+                smoother_joint_discrete_state_prob,
+            )
     else:
         # Approximate factored form (original implementation)
-        # gamma1[a,b,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * E[x_t x_t^T | S_t=i]
         gamma1 = jnp.einsum(
             "tij, tabi -> abj",
             smoother_joint_discrete_state_prob,
@@ -1495,7 +1943,6 @@ def compute_transition_sufficient_stats(
             state_cond_smoother_means[:-1],
         )
 
-        # beta = E[x_t x_{t+1}^T] weighted by joint probability
         beta = jnp.einsum(
             "tij,tdcij->cdj",
             smoother_joint_discrete_state_prob,

@@ -405,6 +405,7 @@ def test_switching_kalman_filter_shapes(simple_skf_model: tuple) -> None:
         filt_c,
         filt_p,
         last_pair_m,
+        _,  # last_pair_cond_filter_cov
         mll,
     ) = switching_kalman_filter(init_mean, init_cov, init_prob, obs, Z, A, Q, H, R)
 
@@ -453,6 +454,7 @@ def test_skf_reduces_to_kf_single_state(simple_1d_model: tuple) -> None:
         skf_c,
         skf_p,
         _,
+        _,  # last_pair_cond_filter_cov
         skf_mll,
     ) = switching_kalman_filter(
         skf_init_mean,
@@ -511,6 +513,7 @@ def test_skf_smoother_reduces_to_kf_smoother_single_state(
         skf_fc,
         skf_fp,
         last_pair_m,
+        _,  # last_pair_cond_filter_cov
         skf_mll,
     ) = switching_kalman_filter(
         skf_init_mean,
@@ -571,14 +574,14 @@ def test_skf_deterministic_stay(simple_skf_model: tuple) -> None:
 
     Z_stay = jnp.array([[1.0, 0.0], [0.0, 1.0]])
     init_prob_0 = jnp.array([1.0, 0.0])
-    _, _, filt_p_0, _, _ = switching_kalman_filter(
+    _, _, filt_p_0, _, _, _ = switching_kalman_filter(
         init_mean, init_cov, init_prob_0, obs, Z_stay, A, Q, H, R
     )
     expected_p_0 = jnp.zeros_like(filt_p_0).at[:, 0].set(1.0)
     np.testing.assert_allclose(filt_p_0, expected_p_0, atol=1e-6)
 
     init_prob_1 = jnp.array([0.0, 1.0])
-    _, _, filt_p_1, _, _ = switching_kalman_filter(
+    _, _, filt_p_1, _, _, _ = switching_kalman_filter(
         init_mean, init_cov, init_prob_1, obs, Z_stay, A, Q, H, R
     )
     expected_p_1 = jnp.zeros_like(filt_p_1).at[:, 1].set(1.0)
@@ -603,7 +606,7 @@ def test_skf_deterministic_switch(simple_skf_model: tuple) -> None:
     Z_switch = jnp.array([[0.0, 1.0], [1.0, 0.0]])
     init_prob_0 = jnp.array([1.0, 0.0])
 
-    _, _, filt_p, _, _ = switching_kalman_filter(
+    _, _, filt_p, _, _, _ = switching_kalman_filter(
         init_mean, init_cov, init_prob_0, obs, Z_switch, A, Q, H, R
     )
 
@@ -672,6 +675,7 @@ def test_m_step_one_state(
         skf_fc,
         skf_fp,
         last_pair_m,
+        _,  # last_pair_cond_filter_cov
         skf_mll,
     ) = switching_kalman_filter(
         skf_init_mean,
@@ -792,6 +796,7 @@ def test_m_step_two_identical_states(
         skf_fc,  # state_cond_filter_cov
         skf_fp,  # filter_discrete_state_prob
         last_pair_m,  # last_filter_conditional_cont_mean
+        _,  # last_pair_cond_filter_cov
         _,  # mll
     ) = switching_kalman_filter(
         skf_init_mean,
@@ -1280,7 +1285,7 @@ def test_em_monotonic_single_state() -> None:
 
     log_likelihoods = []
     for _ in range(10):
-        (filter_mean, filter_cov, filter_prob, last_pair_mean, mll) = switching_kalman_filter(
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, mll) = switching_kalman_filter(
             current_init_mean,
             current_init_cov,
             current_init_prob,
@@ -1378,7 +1383,7 @@ def test_em_monotonic_two_identical_states() -> None:
 
     log_likelihoods = []
     for _ in range(10):
-        (filter_mean, filter_cov, filter_prob, last_pair_mean, mll) = switching_kalman_filter(
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, mll) = switching_kalman_filter(
             current_init_mean,
             current_init_cov,
             current_init_prob,
@@ -1507,7 +1512,7 @@ def test_em_monotonic_distinguishable_states() -> None:
     # Run EM
     log_likelihoods = []
     for _ in range(20):
-        (filter_mean, filter_cov, filter_prob, last_pair_mean, mll) = switching_kalman_filter(
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, mll) = switching_kalman_filter(
             init_mean,
             init_cov,
             init_prob,
@@ -1610,6 +1615,7 @@ def test_em_increases_log_likelihood(simple_skf_model: tuple) -> None:
             filter_cov,
             filter_prob,
             last_pair_mean,
+            _,  # last_pair_cond_filter_cov
             marginal_log_likelihood,
         ) = switching_kalman_filter(
             current_init_mean,
@@ -1718,7 +1724,7 @@ def test_elbo_monotonic_single_state() -> None:
     elbos = []
     for _ in range(10):
         # E-step
-        (filter_mean, filter_cov, filter_prob, last_pair_mean, _) = switching_kalman_filter(
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, _) = switching_kalman_filter(
             current_init_mean,
             current_init_cov,
             current_init_prob,
@@ -1863,7 +1869,7 @@ def test_elbo_monotonic_two_states() -> None:
     elbos = []
     for _ in range(15):
         # E-step
-        (filter_mean, filter_cov, filter_prob, last_pair_mean, _) = switching_kalman_filter(
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, _) = switching_kalman_filter(
             init_mean,
             init_cov,
             init_prob,
@@ -2139,7 +2145,7 @@ class TestSwitchingKalmanFilterProperties:
         key = random.PRNGKey(0)
         obs = random.normal(key, (n_time, params["n_obs_dim"]))
 
-        _, _, filter_prob, _, mll = switching_kalman_filter(
+        _, _, filter_prob, _, _, mll = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
         )
 
@@ -2162,7 +2168,7 @@ class TestSwitchingKalmanFilterProperties:
         key = random.PRNGKey(1)
         obs = random.normal(key, (n_time, params["n_obs_dim"]))
 
-        _, filter_cov, _, _, _ = switching_kalman_filter(
+        _, filter_cov, _, _, _, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
         )
 
@@ -2191,7 +2197,7 @@ class TestSwitchingKalmanFilterProperties:
         key = random.PRNGKey(2)
         obs = random.normal(key, (n_time, params["n_obs_dim"]))
 
-        _, _, filter_prob, _, _ = switching_kalman_filter(
+        _, _, filter_prob, _, _, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
         )
 
@@ -2217,7 +2223,7 @@ class TestSwitchingKalmanSmootherProperties:
         obs = random.normal(key, (n_time, params["n_obs_dim"]))
 
         # Run filter
-        filter_mean, filter_cov, filter_prob, last_pair_mean, _ = switching_kalman_filter(
+        filter_mean, filter_cov, filter_prob, last_pair_mean, _, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
         )
 
@@ -2250,7 +2256,7 @@ class TestSwitchingKalmanSmootherProperties:
         key = random.PRNGKey(4)
         obs = random.normal(key, (n_time, params["n_obs_dim"]))
 
-        filter_mean, filter_cov, filter_prob, last_pair_mean, _ = switching_kalman_filter(
+        filter_mean, filter_cov, filter_prob, last_pair_mean, _, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
         )
 
@@ -2440,6 +2446,7 @@ def test_discrete_state_recovery_easy() -> None:
         state_cond_filter_cov,
         filter_discrete_state_prob,
         _,
+        _,  # last_pair_cond_filter_cov
         _,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -2523,6 +2530,7 @@ def test_discrete_state_recovery_moderate() -> None:
         state_cond_filter_cov,
         filter_discrete_state_prob,
         _,
+        _,  # last_pair_cond_filter_cov
         _,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -2601,6 +2609,7 @@ def test_discrete_state_recovery_with_smoother() -> None:
         state_cond_filter_cov,
         filter_discrete_state_prob,
         last_filter_conditional_cont_mean,
+        _,  # last_pair_cond_filter_cov
         marginal_log_likelihood,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -2695,6 +2704,7 @@ def test_discrete_state_recovery_multivariate() -> None:
         state_cond_filter_cov,
         filter_discrete_state_prob,
         _,
+        _,  # last_pair_cond_filter_cov
         _,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -2831,6 +2841,7 @@ def test_continuous_state_mse_filter() -> None:
         _state_cond_filter_cov,
         filter_discrete_state_prob,
         _,
+        _,  # last_pair_cond_filter_cov
         _,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -2918,6 +2929,7 @@ def test_continuous_state_mse_smoother() -> None:
         state_cond_filter_cov,
         filter_discrete_state_prob,
         last_filter_conditional_cont_mean,
+        _,  # last_pair_cond_filter_cov
         _,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -3035,6 +3047,7 @@ def test_continuous_state_mse_vs_standard_kalman() -> None:
         _,
         filter_discrete_state_prob,
         _,
+        _,  # last_pair_cond_filter_cov
         _,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -3123,6 +3136,7 @@ def test_continuous_state_mse_multivariate() -> None:
         state_cond_filter_cov,
         filter_discrete_state_prob,
         last_filter_conditional_cont_mean,
+        _,  # last_pair_cond_filter_cov
         _,
     ) = switching_kalman_filter(
         init_state_cond_mean=init_mean,
@@ -3231,6 +3245,7 @@ def run_em(
             state_cond_filter_cov,
             filter_discrete_state_prob,
             last_filter_conditional_cont_mean,
+            _,  # last_pair_cond_filter_cov
             marginal_ll,
         ) = switching_kalman_filter(
             init_state_cond_mean=init_mean,
@@ -3781,6 +3796,7 @@ def run_em_partial(
             state_cond_filter_cov,
             filter_discrete_state_prob,
             last_filter_conditional_cont_mean,
+            _,  # last_pair_cond_filter_cov
             marginal_ll,
         ) = switching_kalman_filter(
             init_state_cond_mean=init_mean,
@@ -4118,7 +4134,7 @@ class TestSwitchingMStepMathCorrectness:
         skf_H = H[..., None]
         skf_R = R[..., None]
 
-        skf_fm, skf_fc, skf_fp, last_pair_m, _ = switching_kalman_filter(
+        skf_fm, skf_fc, skf_fp, last_pair_m, _, _ = switching_kalman_filter(
             init_mean[:, None], init_cov[..., None], jnp.array([1.0]),
             obs, Z, skf_A, skf_Q, skf_H, skf_R,
         )
@@ -4233,7 +4249,7 @@ class TestSwitchingEMMonotonicity:
 
         elbos = []
         for _ in range(10):
-            fm, fc, fp, lpm, mll = switching_kalman_filter(
+            fm, fc, fp, lpm, _, mll = switching_kalman_filter(
                 init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
             )
             (
@@ -4288,7 +4304,7 @@ class TestSwitchingNumericalStability:
 
         obs = random.normal(random.PRNGKey(42), (200, n_obs))
 
-        fm, fc, fp, lpm, _ = switching_kalman_filter(
+        fm, fc, fp, lpm, _, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
         )
         (
@@ -4315,3 +4331,318 @@ class TestSwitchingNumericalStability:
             jnp.sum(new_Z, axis=1), jnp.ones(n_discrete), rtol=1e-5,
             err_msg="Z rows should sum to 1"
         )
+
+
+class TestGPB2ExactMStep:
+    """Tests for exact pair-conditional M-step with GPB2 outputs."""
+
+    def test_gamma1_matches_closed_form(self) -> None:
+        """gamma1 from exact path should equal hand-computed formula.
+
+        gamma1^j = sum_{t,k} w_t^{jk} * (P_t^{jk} + m_t^{jk} (m_t^{jk})^T)
+        """
+        from state_space_practice.switching_kalman import (
+            compute_transition_sufficient_stats,
+        )
+
+        T, L, S = 5, 2, 2
+        key = random.PRNGKey(0)
+
+        # Construct pair-conditional quantities
+        k1, k2, k3, k4, k5 = random.split(key, 5)
+        pair_means = random.normal(k1, (T, L, S, S))
+        # Make pair covs PSD and different from state-conditional
+        raw = random.normal(k2, (T, L, L, S, S))
+        pair_covs = jnp.einsum("tabij,tcbij->tacij", raw, raw) + 0.1 * jnp.eye(L)[None, :, :, None, None]
+
+        # State-conditional (intentionally different to detect fallback use)
+        state_means = random.normal(k3, (T + 1, L, S))
+        raw_sc = random.normal(k4, (T + 1, L, L, S))
+        state_covs = jnp.einsum("tabi,tcbi->taci", raw_sc, raw_sc) + 0.1 * jnp.eye(L)[None, :, :, None]
+
+        # Joint probs
+        joint_probs = jnp.abs(random.normal(k5, (T, S, S)))
+        joint_probs = joint_probs / joint_probs.sum(axis=(1, 2), keepdims=True)
+
+        # Dummy cross-covs (not used for gamma1)
+        cross_covs = jnp.zeros((T, L, L, S, S))
+
+        # Compute with exact path
+        gamma1_exact, _ = compute_transition_sufficient_stats(
+            state_cond_smoother_means=state_means,
+            state_cond_smoother_covs=state_covs,
+            smoother_joint_discrete_state_prob=joint_probs,
+            pair_cond_smoother_cross_cov=cross_covs,
+            pair_cond_smoother_means=pair_means,
+            pair_cond_smoother_covs=pair_covs,
+            next_pair_cond_smoother_means=None,
+        )
+
+        # Hand-compute expected gamma1
+        # gamma1[a,b,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * (P_t^{ij} + m_t^{ij} (m_t^{ij})^T)
+        # Here j indexes S_{t+1} (destination state), i indexes S_t (source state)
+        gamma1_expected = jnp.zeros((L, L, S))
+        for j in range(S):  # S_{t+1}
+            for t in range(T):
+                for i in range(S):  # S_t
+                    w = joint_probs[t, i, j]
+                    m = pair_means[t, :, i, j]
+                    P = pair_covs[t, :, :, i, j]
+                    gamma1_expected = gamma1_expected.at[:, :, j].add(
+                        w * (P + jnp.outer(m, m))
+                    )
+
+        np.testing.assert_allclose(gamma1_exact, gamma1_expected, rtol=1e-6)
+
+    def test_beta_matches_closed_form(self) -> None:
+        """beta from exact path should equal hand-computed formula.
+
+        beta^j = sum_{t,k} w_t^{jk} * (cross_t^{jk} + m_{t+1}^{jk} (m_t^{jk})^T)
+        """
+        from state_space_practice.switching_kalman import (
+            compute_transition_sufficient_stats,
+        )
+
+        T, L, S = 5, 2, 2
+        key = random.PRNGKey(1)
+        k1, k2, k3, k4, k5, k6 = random.split(key, 6)
+
+        pair_means = random.normal(k1, (T, L, S, S))
+        next_pair_means = random.normal(k2, (T, L, S, S))
+        cross_covs = random.normal(k3, (T, L, L, S, S))
+
+        state_means = random.normal(k4, (T + 1, L, S))
+        state_covs = jnp.stack([jnp.eye(L)] * S, axis=-1)[None].repeat(T + 1, axis=0)
+
+        joint_probs = jnp.abs(random.normal(k5, (T, S, S)))
+        joint_probs = joint_probs / joint_probs.sum(axis=(1, 2), keepdims=True)
+
+        pair_covs = jnp.stack([jnp.eye(L)] * (S * S), axis=-1).reshape(L, L, S, S)[None].repeat(T, axis=0)
+
+        _, beta_exact = compute_transition_sufficient_stats(
+            state_cond_smoother_means=state_means,
+            state_cond_smoother_covs=state_covs,
+            smoother_joint_discrete_state_prob=joint_probs,
+            pair_cond_smoother_cross_cov=cross_covs,
+            pair_cond_smoother_means=pair_means,
+            pair_cond_smoother_covs=pair_covs,
+            next_pair_cond_smoother_means=next_pair_means,
+        )
+
+        # Hand-compute
+        # beta[c,d,j] = sum_{t,i} P(S_t=i, S_{t+1}=j) * (cross_t^{ij} + m_{t+1}^{ij} (m_t^{ij})^T)
+        # j indexes S_{t+1}, i indexes S_t
+        beta_expected = jnp.zeros((L, L, S))
+        for j in range(S):  # S_{t+1}
+            for t in range(T):
+                for i in range(S):  # S_t
+                    w = joint_probs[t, i, j]
+                    # cross_covs[t, d, c, i, j] via einsum "tdcij->cdj"
+                    # gives beta[c,d] = cross[d,c], so transpose
+                    cross = cross_covs[t, :, :, i, j].T
+                    m_t = pair_means[t, :, i, j]
+                    m_tp1 = next_pair_means[t, :, i, j]
+                    beta_expected = beta_expected.at[:, :, j].add(
+                        w * (cross + jnp.outer(m_tp1, m_t))
+                    )
+
+        np.testing.assert_allclose(beta_exact, beta_expected, rtol=1e-6)
+
+    def test_exact_differs_from_approximate(self) -> None:
+        """Exact pair-conditional path should differ from approximate when
+        pair-conditional quantities differ from state-conditional."""
+        from state_space_practice.switching_kalman import (
+            compute_transition_sufficient_stats,
+        )
+
+        T, L, S = 10, 2, 2
+        key = random.PRNGKey(2)
+        k1, k2, k3, k4, k5, k6 = random.split(key, 6)
+
+        pair_means = random.normal(k1, (T, L, S, S))
+        next_pair_means = random.normal(k2, (T, L, S, S))
+        cross_covs = random.normal(k3, (T, L, L, S, S))
+
+        state_means = random.normal(k4, (T + 1, L, S))
+        state_covs = jnp.stack([jnp.eye(L)] * S, axis=-1)[None].repeat(T + 1, axis=0)
+
+        # Make pair covs intentionally different from state covs
+        pair_covs = jnp.stack([jnp.eye(L) * 3.0] * (S * S), axis=-1).reshape(L, L, S, S)[None].repeat(T, axis=0)
+
+        joint_probs = jnp.abs(random.normal(k5, (T, S, S))) + 0.01
+        joint_probs = joint_probs / joint_probs.sum(axis=(1, 2), keepdims=True)
+
+        # Exact path
+        gamma1_exact, beta_exact = compute_transition_sufficient_stats(
+            state_cond_smoother_means=state_means,
+            state_cond_smoother_covs=state_covs,
+            smoother_joint_discrete_state_prob=joint_probs,
+            pair_cond_smoother_cross_cov=cross_covs,
+            pair_cond_smoother_means=pair_means,
+            pair_cond_smoother_covs=pair_covs,
+            next_pair_cond_smoother_means=next_pair_means,
+        )
+
+        # Approximate path (no pair_cond_covs or next_pair_cond_means)
+        gamma1_approx, beta_approx = compute_transition_sufficient_stats(
+            state_cond_smoother_means=state_means,
+            state_cond_smoother_covs=state_covs,
+            smoother_joint_discrete_state_prob=joint_probs,
+            pair_cond_smoother_cross_cov=cross_covs,
+            pair_cond_smoother_means=pair_means,
+            pair_cond_smoother_covs=None,
+            next_pair_cond_smoother_means=None,
+        )
+
+        # They should differ because pair_covs != state_covs
+        # and next_pair_means != state_means[1:]
+        assert not jnp.allclose(gamma1_exact, gamma1_approx, atol=1e-6), \
+            "gamma1 should differ between exact and approximate paths"
+        assert not jnp.allclose(beta_exact, beta_approx, atol=1e-6), \
+            "beta should differ between exact and approximate paths"
+
+    def test_gpb2_smoother_extra_outputs_shapes(self) -> None:
+        """GPB2 smoother should return pair_cond_covs and next_pair_cond_means
+        with correct shapes."""
+        from state_space_practice.switching_kalman import (
+            switching_kalman_filter,
+            switching_kalman_smoother_gpb2,
+        )
+
+        n_time, n_latent, n_obs, n_states = 30, 2, 2, 2
+        A = jnp.stack([jnp.eye(n_latent) * 0.9] * n_states, axis=-1)
+        Q = jnp.stack([jnp.eye(n_latent) * 0.1] * n_states, axis=-1)
+        H = jnp.stack([jnp.eye(n_obs)] * n_states, axis=-1)
+        R = jnp.stack([jnp.eye(n_obs)] * n_states, axis=-1)
+        Z = jnp.array([[0.9, 0.1], [0.1, 0.9]])
+        init_mean = jnp.zeros((n_latent, n_states))
+        init_cov = jnp.stack([jnp.eye(n_latent)] * n_states, axis=-1)
+        init_prob = jnp.array([0.5, 0.5])
+        obs = random.normal(random.PRNGKey(0), (n_time, n_obs))
+
+        fm, fc, fp, lpm, _, _ = switching_kalman_filter(
+            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
+        )
+
+        result = switching_kalman_smoother_gpb2(
+            filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
+            last_filter_conditional_cont_mean=lpm,
+            process_cov=Q, continuous_transition_matrix=A,
+            discrete_state_transition_matrix=Z,
+        )
+
+        # GPB2 returns 11 outputs
+        assert len(result) == 11, f"GPB2 should return 11 outputs, got {len(result)}"
+
+        pair_cond_covs = result[9]   # Cov[x_t | S_t=j, S_{t+1}=k]
+        next_pair_means = result[10]  # E[x_{t+1} | S_t=j, S_{t+1}=k]
+
+        # pair_cond_covs: (T-1, L, L, S, S)
+        assert pair_cond_covs.shape == (n_time - 1, n_latent, n_latent, n_states, n_states), \
+            f"pair_cond_covs shape: {pair_cond_covs.shape}"
+        # next_pair_means: (T-1, L, S, S)
+        assert next_pair_means.shape == (n_time - 1, n_latent, n_states, n_states), \
+            f"next_pair_means shape: {next_pair_means.shape}"
+
+        assert jnp.all(jnp.isfinite(pair_cond_covs)), "pair_cond_covs should be finite"
+        assert jnp.all(jnp.isfinite(next_pair_means)), "next_pair_means should be finite"
+
+        # pair_cond_covs should be PSD (non-negative trace for each (j,k))
+        for j in range(n_states):
+            for k in range(n_states):
+                traces = jax.vmap(jnp.trace)(pair_cond_covs[:, :, :, j, k])
+                assert jnp.all(traces >= 0), \
+                    f"pair_cond_covs[:,:,:,{j},{k}] should have non-negative trace"
+
+    def test_gpb1_path_unchanged_with_none_params(self) -> None:
+        """GPB1 path should produce identical results when new params are None."""
+        from state_space_practice.switching_kalman import (
+            compute_transition_sufficient_stats,
+        )
+
+        T, L, S = 10, 2, 2
+        key = random.PRNGKey(3)
+        k1, k2, k3 = random.split(key, 3)
+
+        state_means = random.normal(k1, (T + 1, L, S))
+        state_covs = jnp.stack([jnp.eye(L)] * S, axis=-1)[None].repeat(T + 1, axis=0)
+        joint_probs = jnp.abs(random.normal(k2, (T, S, S))) + 0.01
+        joint_probs = joint_probs / joint_probs.sum(axis=(1, 2), keepdims=True)
+        cross_covs = random.normal(k3, (T, L, L, S, S))
+
+        # Without pair_cond_smoother_means (full approximate)
+        gamma1_orig, beta_orig = compute_transition_sufficient_stats(
+            state_cond_smoother_means=state_means,
+            state_cond_smoother_covs=state_covs,
+            smoother_joint_discrete_state_prob=joint_probs,
+            pair_cond_smoother_cross_cov=cross_covs,
+        )
+
+        # With explicit None for all new params
+        gamma1_none, beta_none = compute_transition_sufficient_stats(
+            state_cond_smoother_means=state_means,
+            state_cond_smoother_covs=state_covs,
+            smoother_joint_discrete_state_prob=joint_probs,
+            pair_cond_smoother_cross_cov=cross_covs,
+            pair_cond_smoother_means=None,
+            pair_cond_smoother_covs=None,
+            next_pair_cond_smoother_means=None,
+        )
+
+        np.testing.assert_array_equal(gamma1_orig, gamma1_none)
+        np.testing.assert_array_equal(beta_orig, beta_none)
+
+    def test_gpb2_pair_cond_covs_include_spread_term(self) -> None:
+        """Pair-conditional covariances from GPB2 should include the spread term
+        from marginalizing over S_{t-1}, making them >= simple weighted average."""
+        from state_space_practice.switching_kalman import (
+            switching_kalman_filter,
+            switching_kalman_smoother_gpb2,
+        )
+
+        n_time, n_latent, n_obs, n_states = 50, 2, 2, 2
+        # Use different dynamics per state to create spread in means
+        A = jnp.stack([
+            jnp.array([[0.95, -0.1], [0.1, 0.95]]),
+            jnp.array([[0.8, 0.2], [-0.2, 0.8]]),
+        ], axis=-1)
+        Q = jnp.stack([jnp.eye(n_latent) * 0.1] * n_states, axis=-1)
+        H = jnp.stack([jnp.eye(n_obs)] * n_states, axis=-1)
+        R = jnp.stack([jnp.eye(n_obs) * 0.5] * n_states, axis=-1)
+        Z = jnp.array([[0.8, 0.2], [0.2, 0.8]])
+        init_mean = jnp.zeros((n_latent, n_states))
+        init_cov = jnp.stack([jnp.eye(n_latent)] * n_states, axis=-1)
+        init_prob = jnp.array([0.5, 0.5])
+        obs = random.normal(random.PRNGKey(42), (n_time, n_obs))
+
+        fm, fc, fp, lpm, _, _ = switching_kalman_filter(
+            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
+        )
+
+        result = switching_kalman_smoother_gpb2(
+            filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
+            last_filter_conditional_cont_mean=lpm,
+            process_cov=Q, continuous_transition_matrix=A,
+            discrete_state_transition_matrix=Z,
+        )
+
+        pair_cond_covs = result[9]   # (T-1, L, L, S_j, S_k)
+        state_cond_covs = result[6]  # (T, L, L, S)
+
+        # Pair-conditional traces should generally be >= state-conditional traces
+        # (because of the spread term from marginalizing over S_{t-1})
+        # This won't always hold strictly at every timestep, but on average
+        # the pair-conditional should be at least as large
+        for j in range(n_states):
+            pair_traces = jnp.mean(
+                jax.vmap(jnp.trace)(pair_cond_covs[:, :, :, j, 0]) +
+                jax.vmap(jnp.trace)(pair_cond_covs[:, :, :, j, 1])
+            ) / 2
+            state_traces = jnp.mean(
+                jax.vmap(jnp.trace)(state_cond_covs[:-1, :, :, j])
+            )
+            # Pair-conditional should not be dramatically smaller than state-conditional
+            assert pair_traces >= state_traces * 0.9, (
+                f"Pair-conditional trace ({pair_traces:.4f}) should be >= "
+                f"state-conditional trace ({state_traces:.4f}) for state {j}"
+            )

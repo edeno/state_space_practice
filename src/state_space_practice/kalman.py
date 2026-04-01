@@ -330,6 +330,7 @@ def _kalman_smoother_update(
     smoother_mean = filter_mean + smoother_kalman_gain @ (
         next_smoother_mean - one_step_mean
     )
+
     # Smoothed covariance P_{t|T}
     smoother_cov = symmetrize(
         filter_cov
