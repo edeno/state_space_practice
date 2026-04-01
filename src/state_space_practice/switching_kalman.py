@@ -1044,22 +1044,6 @@ def switching_kalman_smoother_gpb2(
             continuous_transition_matrix,   # (L, L, S_j)
         )
 
-        # 1b. Stabilize triple-conditional outputs (safety net).
-        _MAX_COV_TRACE = 1e6
-        _MAX_MEAN_ABS = 1e4
-
-        def _cap_triple_cov(cov_ijk):
-            trace = jnp.trace(cov_ijk)
-            ratio = trace / _MAX_COV_TRACE
-            return jnp.where(ratio > 1.0, cov_ijk / ratio, cov_ijk)
-
-        triple_cov = jax.vmap(jax.vmap(jax.vmap(
-            _cap_triple_cov, in_axes=-1, out_axes=-1
-        ), in_axes=-1, out_axes=-1), in_axes=-1, out_axes=-1)(triple_cov)
-
-        triple_mean = jnp.clip(triple_mean, -_MAX_MEAN_ABS, _MAX_MEAN_ABS)
-        triple_cross = jnp.clip(triple_cross, -_MAX_COV_TRACE, _MAX_COV_TRACE)
-
         # 2. Compute discrete state probabilities
         (
             smoother_discrete_state_prob,
