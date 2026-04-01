@@ -7825,3 +7825,106 @@ class TestEMVerification:
             f"Smoother should be at least as good as filter: "
             f"filter={corr:.3f}, smoother={corr_s:.3f}"
         )
+
+
+class TestGPB2Smoother:
+    """Tests for the GPB2 switching smoother."""
+
+    def test_gpb2_output_shapes_match_gpb1(self) -> None:
+        """GPB2 smoother should return same shapes as GPB1."""
+        from state_space_practice.switching_kalman import (
+            switching_kalman_filter,
+            switching_kalman_smoother,
+            switching_kalman_smoother_gpb2,
+        )
+
+        n_time, n_latent, n_obs, n_states = 30, 2, 2, 2
+        A = jnp.stack([jnp.eye(n_latent) * 0.9] * n_states, axis=-1)
+        Q = jnp.stack([jnp.eye(n_latent) * 0.1] * n_states, axis=-1)
+        H = jnp.stack([jnp.eye(n_obs)] * n_states, axis=-1)
+        R = jnp.stack([jnp.eye(n_obs)] * n_states, axis=-1)
+        Z = jnp.array([[0.9, 0.1], [0.1, 0.9]])
+        init_mean = jnp.zeros((n_latent, n_states))
+        init_cov = jnp.stack([jnp.eye(n_latent)] * n_states, axis=-1)
+        init_prob = jnp.array([0.5, 0.5])
+        obs = jax.random.normal(jax.random.PRNGKey(0), (n_time, n_obs))
+
+        fm, fc, fp, lpm, _ = switching_kalman_filter(
+            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
+        )
+
+        r1 = switching_kalman_smoother(
+            filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
+            last_filter_conditional_cont_mean=lpm,
+            process_cov=Q, continuous_transition_matrix=A,
+            discrete_state_transition_matrix=Z,
+        )
+        r2 = switching_kalman_smoother_gpb2(
+            filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
+            last_filter_conditional_cont_mean=lpm,
+            process_cov=Q, continuous_transition_matrix=A,
+            discrete_state_transition_matrix=Z,
+        )
+
+        for i in range(9):
+            assert r1[i].shape == r2[i].shape, (
+                f"Output {i} shape mismatch: GPB1={r1[i].shape}, GPB2={r2[i].shape}"
+            )
+
+    def test_gpb2_produces_finite_outputs(self) -> None:
+        """GPB2 smoother should produce all finite outputs."""
+        from state_space_practice.switching_kalman import (
+            switching_kalman_filter,
+            switching_kalman_smoother_gpb2,
+        )
+
+        n_time, n_latent, n_obs, n_states = 50, 2, 2, 2
+        A = jnp.stack([jnp.eye(n_latent) * 0.9] * n_states, axis=-1)
+        Q = jnp.stack([jnp.eye(n_latent) * 0.1] * n_states, axis=-1)
+        H = jnp.stack([jnp.eye(n_obs)] * n_states, axis=-1)
+        R = jnp.stack([jnp.eye(n_obs)] * n_states, axis=-1)
+        Z = jnp.array([[0.9, 0.1], [0.1, 0.9]])
+        init_mean = jnp.zeros((n_latent, n_states))
+        init_cov = jnp.stack([jnp.eye(n_latent)] * n_states, axis=-1)
+        init_prob = jnp.array([0.5, 0.5])
+        obs = jax.random.normal(jax.random.PRNGKey(0), (n_time, n_obs))
+
+        fm, fc, fp, lpm, _ = switching_kalman_filter(
+            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
+        )
+        result = switching_kalman_smoother_gpb2(
+            filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
+            last_filter_conditional_cont_mean=lpm,
+            process_cov=Q, continuous_transition_matrix=A,
+            discrete_state_transition_matrix=Z,
+        )
+
+        for i, name in enumerate([
+            "overall_mean", "overall_cov", "disc_prob", "joint_disc",
+            "cross_cov", "state_mean", "state_cov", "pair_cross", "pair_mean",
+        ]):
+            assert jnp.all(jnp.isfinite(result[i])), f"GPB2 {name} not finite"
+
+    def test_gpb2_model_fit_runs(self) -> None:
+        """Model.fit() with smoother_type='gpb2' should run without error."""
+        from state_space_practice.switching_point_process import (
+            QRegularizationConfig,
+            SwitchingSpikeOscillatorModel,
+        )
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(50, 5)
+        ).astype(float)
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=1, n_neurons=5, n_discrete_states=2,
+            sampling_freq=100.0, dt=0.01,
+            q_regularization=QRegularizationConfig(),
+            separate_spike_params=False,
+            smoother_type="gpb2",
+        )
+        lls = model.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
+
+        assert len(lls) == 3
+        for ll in lls:
+            assert jnp.isfinite(ll), f"LL should be finite, got {ll}"

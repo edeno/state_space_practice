@@ -2197,7 +2197,12 @@ class SwitchingSpikeOscillatorModel:
         self.smoother_discrete_state_prob = smoother_discrete_state_prob
         self.smoother_joint_discrete_state_prob = smoother_joint_discrete_state_prob
         self.smoother_pair_cond_cross_cov = pair_cond_smoother_cross_covs
-        self.smoother_pair_cond_means = pair_cond_smoother_means
+        # GPB2 pair_cond_smoother_means is conditioned on (S_{t-1}, S_t) but
+        # the M-step expects conditioning on (S_t, S_{t+1}). Pass None for
+        # GPB2 so the M-step uses the approximate factored form instead.
+        self.smoother_pair_cond_means = (
+            None if self.smoother_type == "gpb2" else pair_cond_smoother_means
+        )
 
         return marginal_log_likelihood
 
