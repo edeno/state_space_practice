@@ -1175,8 +1175,14 @@ def switching_kalman_smoother_gpb2(
             mstep_next_pair_cond_means,   # E[x_{t+1} | S_t=j, S_{t+1}=k]
         )
 
-    # Initialize carry from last filter output
-    # At t=T, expand state-conditional to pair-conditional by broadcasting
+    # Initialize carry from last filter output.
+    # The mean is already pair-conditional from the filter: E[x_T | S_{T-1}=i, S_T=j].
+    # The covariance is state-conditional: Cov[x_T | S_T=j] (the filter collapses
+    # pair-conditional to state-conditional via GPB1 at each step). We broadcast it
+    # to (S_i, S_j) shape. This is an approximation: the true pair-conditional
+    # Cov[x_T | S_{T-1}=i, S_T=j] differs across i due to the Var[E[x|S_{T-1}]]
+    # spread term. The error affects only the first backward step and is the same
+    # order as GPB1's per-step collapse approximation.
     last_pair_mean = last_filter_conditional_cont_mean  # (L, S, S) already pair-cond
     n_cont = filter_cov.shape[1]
     last_pair_cov = jnp.broadcast_to(
