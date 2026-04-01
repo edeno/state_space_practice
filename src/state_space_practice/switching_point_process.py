@@ -1077,8 +1077,15 @@ def _single_neuron_glm_step_second_order(
         loss_fn, solver, params, args=None, max_steps=max_steps, throw=False,
     )
 
-    new_baseline = result.value[0]
-    new_weights = result.value[1:]
+    # On non-convergence, only accept the result if it improved the loss.
+    # Otherwise keep the current parameters to avoid destabilizing EM.
+    current_loss = loss_fn(params, None)
+    new_loss = loss_fn(result.value, None)
+    use_new = jnp.isfinite(new_loss) & (new_loss <= current_loss)
+    final_params = jnp.where(use_new, result.value, params)
+
+    new_baseline = final_params[0]
+    new_weights = final_params[1:]
 
     return new_baseline, new_weights
 
@@ -1120,8 +1127,9 @@ def update_spike_glm_params(
     dt : float
         Time bin width in seconds.
     max_iter : int, default=10
-        For plug-in method: maximum Newton iterations per neuron.
-        For second-order (BFGS): maximum BFGS steps per neuron.
+        Maximum optimization steps per neuron. For the plug-in method, this
+        is the number of Newton-Raphson iterations. For the second-order
+        method (BFGS), this is the BFGS step budget.
     smoother_cov : Array | None, shape (n_time, n_latent, n_latent), optional
         Smoothed latent state covariances. Required if use_second_order=True.
     use_second_order : bool, default=False
@@ -1710,6 +1718,13 @@ class SwitchingSpikeOscillatorModel:
             Setting to 0.0 disables the prior.
         smoother_type : str, default="gpb1"
             Switching smoother algorithm. Must be "gpb1" or "gpb2".
+            GPB2 carries S² pair-conditional Gaussians through the backward
+            pass (vs S state-conditional for GPB1), providing better numerical
+            stability for long sequences with sparse observations. Note: the
+            dynamics M-step uses approximate factored sufficient statistics
+            with GPB2 because its pair-conditional means are indexed by
+            (S_{t-1}, S_t) rather than (S_t, S_{t+1}) as the M-step expects.
+            This is a known approximation, not a bug.
 
         Raises
         ------
