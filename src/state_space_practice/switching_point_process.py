@@ -2185,18 +2185,7 @@ class SwitchingSpikeOscillatorModel:
 
         # Run the switching Kalman smoother (observation-model agnostic)
         # The smoother operates on Gaussian posteriors regardless of observation model
-        (
-            _,  # overall_smoother_mean - marginalized over discrete states
-            _,  # overall_smoother_cov - marginalized over discrete states
-            smoother_discrete_state_prob,
-            smoother_joint_discrete_state_prob,
-            _,  # overall_smoother_cross_cov - marginalized over discrete states
-            state_cond_smoother_means,
-            state_cond_smoother_covs,
-            pair_cond_smoother_cross_covs,
-            pair_cond_smoother_means,
-        ) = (switching_kalman_smoother_gpb2 if self.smoother_type == "gpb2"
-             else switching_kalman_smoother)(
+        smoother_args = dict(
             filter_mean=state_cond_filter_mean,
             filter_cov=state_cond_filter_cov,
             filter_discrete_state_prob=filter_discrete_state_prob,
@@ -2206,16 +2195,33 @@ class SwitchingSpikeOscillatorModel:
             discrete_state_transition_matrix=self.discrete_transition_matrix,
         )
 
+        if self.smoother_type == "gpb2":
+            (
+                _, _, smoother_discrete_state_prob,
+                smoother_joint_discrete_state_prob, _,
+                state_cond_smoother_means, state_cond_smoother_covs,
+                pair_cond_smoother_cross_covs, pair_cond_smoother_means,
+                pair_cond_smoother_covs, next_pair_cond_smoother_means,
+            ) = switching_kalman_smoother_gpb2(**smoother_args)
+        else:
+            (
+                _, _, smoother_discrete_state_prob,
+                smoother_joint_discrete_state_prob, _,
+                state_cond_smoother_means, state_cond_smoother_covs,
+                pair_cond_smoother_cross_covs, pair_cond_smoother_means,
+            ) = switching_kalman_smoother(**smoother_args)
+            pair_cond_smoother_covs = None
+            next_pair_cond_smoother_means = None
+
         # Store smoother outputs as model attributes for M-step
         self.smoother_state_cond_mean = state_cond_smoother_means
         self.smoother_state_cond_cov = state_cond_smoother_covs
         self.smoother_discrete_state_prob = smoother_discrete_state_prob
         self.smoother_joint_discrete_state_prob = smoother_joint_discrete_state_prob
         self.smoother_pair_cond_cross_cov = pair_cond_smoother_cross_covs
-        # Both GPB1 and GPB2 now output pair_cond_smoother_means with the
-        # M-step convention E[x_t | S_t=j, S_{t+1}=k]. GPB2 computes this by
-        # marginalizing its triple-conditional means over S_{t-1}.
         self.smoother_pair_cond_means = pair_cond_smoother_means
+        self.smoother_pair_cond_covs = pair_cond_smoother_covs
+        self.smoother_next_pair_cond_means = next_pair_cond_smoother_means
 
         return marginal_log_likelihood
 
@@ -2271,6 +2277,8 @@ class SwitchingSpikeOscillatorModel:
             smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
             pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
             pair_cond_smoother_means=self.smoother_pair_cond_means,
+            pair_cond_smoother_covs=self.smoother_pair_cond_covs,
+            next_pair_cond_smoother_means=self.smoother_next_pair_cond_means,
         )
 
         # Update continuous transition matrix if flag is True
