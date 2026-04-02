@@ -1133,14 +1133,12 @@ def _single_neuron_glm_step_second_order(
     # Newton direction
     delta = jnp.linalg.solve(hess_reg, grad)
 
-    # Damped Newton step: cap step norm to prevent overshooting.
-    # For well-conditioned problems the full step (alpha=1) is taken.
-    # For ill-conditioned problems the step is scaled down.
-    max_step_norm = 2.0
-    step_norm = jnp.sqrt(jnp.sum(delta ** 2))
-    alpha = jnp.where(step_norm > max_step_norm, max_step_norm / step_norm, 1.0)
-
-    new_params = params - alpha * delta
+    # Damped Newton: use half-step (alpha=0.5) to prevent overshooting.
+    # Full Newton step (alpha=1) can overshoot on non-quadratic objectives,
+    # especially with the second-order correction term. A fixed damping
+    # factor is simple, compiles fast (no lax.scan for line search), and
+    # maintains EM progress while avoiding the non-monotonic LL degradation.
+    new_params = params - 0.5 * delta
     new_baseline = new_params[0]
     new_weights = new_params[1:]
 
