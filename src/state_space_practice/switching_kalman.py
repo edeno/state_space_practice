@@ -1059,6 +1059,26 @@ def switching_kalman_smoother_gpb2(
             continuous_transition_matrix,   # (L, L, S_j)
         )
 
+        # 1b. Stabilize triple-conditional outputs.
+        # Even though GPB2 avoids GPB1's mixture-collapse spread growth,
+        # extreme damping contrasts can produce numerically large values in
+        # the RTS update. Cap relative to filter covariance to prevent overflow
+        # while preserving the exact statistics for well-conditioned problems.
+        max_filter_trace = jnp.max(jax.vmap(jnp.trace, in_axes=-1)(state_cond_filter_cov))
+        max_allowed = max_filter_trace * 1e8 + 1.0
+
+        def _cap_cov(cov_slice):
+            trace = jnp.trace(cov_slice)
+            ratio = trace / max_allowed
+            return jnp.where(ratio > 1.0, cov_slice / ratio, cov_slice)
+
+        triple_cov = jax.vmap(jax.vmap(jax.vmap(
+            _cap_cov, in_axes=-1, out_axes=-1
+        ), in_axes=-1, out_axes=-1), in_axes=-1, out_axes=-1)(triple_cov)
+
+        triple_mean = jnp.clip(triple_mean, -1e6, 1e6)
+        triple_cross = jnp.clip(triple_cross, -max_allowed, max_allowed)
+
         # 2. Compute discrete state probabilities
         (
             smoother_discrete_state_prob,

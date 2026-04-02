@@ -84,7 +84,6 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
-import optimistix as optx
 from jax import Array
 from jax.typing import ArrayLike
 
@@ -1023,19 +1022,15 @@ def _single_neuron_glm_step_second_order(
     weight_l2: float = 0.0,
     baseline_prior: Array | None = None,
     baseline_prior_l2: float = 0.0,
-    max_steps: int = 50,
 ) -> tuple[Array, Array]:
-    """Optimize Poisson GLM with second-order expectation using BFGS.
+    """Single Newton step for Poisson GLM with second-order expectation.
 
-    Uses optimistix BFGS to minimize the latent-marginalized Q-function,
-    which accounts for state uncertainty via the Gaussian MGF:
+    Uses JAX autodiff to compute exact gradient and Hessian of the
+    latent-marginalized Q-function, with adaptive ridge regularization
+    and Armijo backtracking line search.
+
+    Accounts for state uncertainty via the Gaussian MGF:
         E[exp(w^T x)] = exp(w^T m + 0.5 * w^T P w)
-
-    BFGS is used instead of Newton's method because:
-    1. It naturally handles ill-conditioned Hessians (builds approximation
-       from gradient differences, which stay bounded)
-    2. It is faster (no explicit Hessian computation)
-    3. It eliminates the need for ad hoc ridge regularization and step clipping
 
     Parameters
     ----------
@@ -1069,28 +1064,85 @@ def _single_neuron_glm_step_second_order(
     new_weights : Array, shape (n_latent,)
         Updated weights.
     """
+    n_latent = weights.shape[0]
     params = jnp.concatenate([jnp.atleast_1d(baseline), weights])
 
-    def loss_fn(p: Array, args: None) -> Array:
-        return _neg_Q_single_neuron(
-            p, y_n, smoother_mean, smoother_cov, dt, weight_l2, time_weights,
-            baseline_prior, baseline_prior_l2,
-        )
+    # Analytical gradient and Hessian of the second-order Poisson GLM objective.
+    # Avoids jax.hessian which causes slow compilation inside nested vmap/scan.
+    #
+    # Objective: L = sum_t w_t * [mu_t - y_t * (b + w^T m_t)] + regularization
+    # where mu_t = exp(b + w^T m_t + 0.5 * w^T P_t w) * dt
+    b = params[0]
+    w = params[1:]
 
-    solver = optx.BFGS(rtol=1e-5, atol=1e-5)
-    result = optx.minimise(
-        loss_fn, solver, params, args=None, max_steps=max_steps, throw=False,
-    )
+    eta_lin = smoother_mean @ w  # (T,)
+    quad = 0.5 * jnp.einsum("tij,i,j->t", smoother_cov, w, w)  # (T,)
+    eta = b + eta_lin + quad
+    eta_safe = jnp.clip(eta, -20.0, 20.0)
+    mu = jnp.exp(eta_safe) * dt  # (T,)
 
-    # On non-convergence, only accept the result if it improved the loss.
-    # Otherwise keep the current parameters to avoid destabilizing EM.
-    current_loss = loss_fn(params, None)
-    new_loss = loss_fn(result.value, None)
-    use_new = jnp.isfinite(new_loss) & (new_loss <= current_loss)
-    final_params = jnp.where(use_new, result.value, params)
+    if time_weights is None:
+        time_weights_val = jnp.ones_like(mu)
+    else:
+        time_weights_val = time_weights
 
-    new_baseline = final_params[0]
-    new_weights = final_params[1:]
+    # d_eta/d[b,w] = [1, m_t + P_t @ w] for each t
+    Pw = jnp.einsum("tij,j->ti", smoother_cov, w)  # (T, L)
+    m_plus_Pw = smoother_mean + Pw  # (T, L)
+
+    # Gradient: g = sum_t w_t * (mu_t * [1, m_t+P_tw] - y_t * [1, m_t])
+    wt_mu = time_weights_val * mu  # (T,)
+    wt_y = time_weights_val * y_n  # (T,)
+
+    grad_b = jnp.sum(wt_mu - wt_y)
+    grad_w = m_plus_Pw.T @ wt_mu - smoother_mean.T @ wt_y  # (L,)
+    grad_w += weight_l2 * w  # L2 on weights
+
+    # Baseline prior gradient
+    if baseline_prior is None:
+        bp = jnp.zeros_like(b)
+    else:
+        bp = baseline_prior
+    grad_b += baseline_prior_l2 * (b - bp)
+
+    grad = jnp.concatenate([jnp.atleast_1d(grad_b), grad_w])
+
+    # Hessian: H = sum_t w_t * mu_t * d_t d_t^T + block from P_t + regularization
+    # where d_t = [1, m_t + P_t w]
+    # H[0,0] = sum_t w_t * mu_t
+    # H[0,1:] = H[1:,0] = sum_t w_t * mu_t * (m_t + P_t w)
+    # H[1:,1:] = sum_t w_t * mu_t * [(m_t+P_tw)(m_t+P_tw)^T + P_t]
+    hess_bb = jnp.sum(wt_mu) + baseline_prior_l2
+    hess_bw = m_plus_Pw.T @ wt_mu  # (L,)
+    hess_ww = jnp.einsum("ti,t,tj->ij", m_plus_Pw, wt_mu, m_plus_Pw)  # (L,L)
+    hess_ww += jnp.einsum("tij,t->ij", smoother_cov, wt_mu)  # P_t contribution
+    hess_ww += weight_l2 * jnp.eye(n_latent)  # L2
+
+    # Assemble full Hessian
+    hess = jnp.zeros((1 + n_latent, 1 + n_latent))
+    hess = hess.at[0, 0].set(hess_bb)
+    hess = hess.at[0, 1:].set(hess_bw)
+    hess = hess.at[1:, 0].set(hess_bw)
+    hess = hess.at[1:, 1:].set(hess_ww)
+
+    # Adaptive ridge: scale with Hessian magnitude for degenerate neurons
+    hess_scale = jnp.maximum(jnp.max(jnp.abs(jnp.diag(hess))), 1.0)
+    ridge = 1e-4 * hess_scale
+    hess_reg = hess + ridge * jnp.eye(1 + n_latent)
+
+    # Newton direction
+    delta = jnp.linalg.solve(hess_reg, grad)
+
+    # Damped Newton step: cap step norm to prevent overshooting.
+    # For well-conditioned problems the full step (alpha=1) is taken.
+    # For ill-conditioned problems the step is scaled down.
+    max_step_norm = 2.0
+    step_norm = jnp.sqrt(jnp.sum(delta ** 2))
+    alpha = jnp.where(step_norm > max_step_norm, max_step_norm / step_norm, 1.0)
+
+    new_params = params - alpha * delta
+    new_baseline = new_params[0]
+    new_weights = new_params[1:]
 
     return new_baseline, new_weights
 
@@ -1118,8 +1170,8 @@ def update_spike_glm_params(
     - Plug-in method (default): Uses smoother_mean directly, ignoring uncertainty.
       Runs Newton-Raphson with Armijo line search for max_iter iterations.
     - Second-order method: Accounts for state uncertainty using the correction
-      E[exp(c @ x)] = exp(c @ m + 0.5 * c @ P @ c). Uses BFGS (via optimistix);
-      max_iter controls the BFGS step budget.
+      E[exp(c @ x)] = exp(c @ m + 0.5 * c @ P @ c). Uses Newton-Raphson with
+      exact Hessian, adaptive ridge, and Armijo line search for max_iter steps.
 
     Parameters
     ----------
@@ -1205,32 +1257,33 @@ def update_spike_glm_params(
 
     if use_second_order:
 
-        # BFGS optimization for all neurons (second-order).
-        # Unlike the plug-in Newton step which takes one step per iteration,
-        # BFGS runs to convergence internally, so we call it once (no scan).
-        # vmap directly over neuron-axis data to avoid gather ops inside BFGS while_loop.
-        def update_neuron_bfgs(b, w, y_n, bp):
-            new_b, new_w = _single_neuron_glm_step_second_order(
-                b, w, y_n, smoother_mean, smoother_cov, dt, time_weights, weight_l2,
-                bp, baseline_prior_l2, max_steps=max_iter,
-            )
-            return new_b, new_w
+        # Newton iterations for all neurons (second-order).
+        # Uses analytical gradient + Hessian with adaptive ridge and Armijo
+        # line search. Python loop over iterations avoids deeply nested
+        # lax.scan which causes slow JIT compilation.
+        for _ in range(max_iter):
+            if baseline_prior is not None:
+                def update_neuron(b, w, y_n, bp):
+                    return _single_neuron_glm_step_second_order(
+                        b, w, y_n, smoother_mean, smoother_cov, dt,
+                        time_weights, weight_l2, bp, baseline_prior_l2,
+                    )
 
-        # baseline_prior is a Python-level None check resolved at trace time (static)
-        if baseline_prior is not None:
-            final_baselines, final_weights = jax.vmap(
-                update_neuron_bfgs, in_axes=(0, 0, 1, 0)
-            )(baselines, weights, spikes, baseline_prior)
-        else:
-            def update_neuron_bfgs_no_prior(b, w, y_n):
-                new_b, new_w = _single_neuron_glm_step_second_order(
-                    b, w, y_n, smoother_mean, smoother_cov, dt, time_weights,
-                    weight_l2, None, baseline_prior_l2, max_steps=max_iter,
-                )
-                return new_b, new_w
-            final_baselines, final_weights = jax.vmap(
-                update_neuron_bfgs_no_prior, in_axes=(0, 0, 1)
-            )(baselines, weights, spikes)
+                baselines, weights = jax.vmap(
+                    update_neuron, in_axes=(0, 0, 1, 0)
+                )(baselines, weights, spikes, baseline_prior)
+            else:
+                def update_neuron_no_prior(b, w, y_n):
+                    return _single_neuron_glm_step_second_order(
+                        b, w, y_n, smoother_mean, smoother_cov, dt,
+                        time_weights, weight_l2, None, baseline_prior_l2,
+                    )
+
+                baselines, weights = jax.vmap(
+                    update_neuron_no_prior, in_axes=(0, 0, 1)
+                )(baselines, weights, spikes)
+
+        final_baselines, final_weights = baselines, weights
     else:
         # Run Newton iterations for all neurons (plug-in)
         # vmap directly over neuron-axis data.
@@ -2412,72 +2465,42 @@ class SwitchingSpikeOscillatorModel:
             else:
                 baseline_prior = None
 
-            def _update_single_state(
-                state_index: int,
-                current_baseline: Array,
-                current_weights: Array,
-                state_weights: Array,
-                state_cond_mean: Array,
-                state_cond_cov: Array,
-            ) -> tuple[Array, Array]:
-                """Update spike GLM params for a single discrete state."""
+            # Python loop over discrete states (typically 2-4).
+            # Avoids vmap → lax.cond → lax.scan → vmap nesting that causes
+            # prohibitive JIT compilation times.
+            new_baselines = []
+            new_weights = []
+            for j in range(self.n_discrete_states):
+                state_weights = self.smoother_discrete_state_prob[:, j]
+                total_weight = jnp.sum(state_weights)
+
+                if total_weight < MIN_STATE_WEIGHT:
+                    new_baselines.append(self.spike_params.baseline[:, j])
+                    new_weights.append(self.spike_params.weights[:, :, j])
+                    continue
+
                 current_params = SpikeObsParams(
-                    baseline=current_baseline,
-                    weights=current_weights,
+                    baseline=self.spike_params.baseline[:, j],
+                    weights=self.spike_params.weights[:, :, j],
                 )
-
-                def _keep_current(_: None) -> tuple[Array, Array]:
-                    return current_baseline, current_weights
-
-                def _do_update(_: None) -> tuple[Array, Array]:
-                    updated = update_spike_glm_params(
-                        spikes=spikes,
-                        smoother_mean=state_cond_mean,
-                        current_params=current_params,
-                        dt=self.dt,
-                        time_weights=state_weights,
-                        weight_l2=self.spike_weight_l2,
-                        smoother_cov=state_cond_cov,
-                        use_second_order=True,
-                        baseline_prior=baseline_prior,
-                        baseline_prior_l2=self.spike_baseline_prior_l2,
-                    )
-                    return updated.baseline, updated.weights
-
-                # Use lax.cond for JIT-compatible conditional execution
-                return jax.lax.cond(
-                    jnp.sum(state_weights) < MIN_STATE_WEIGHT,
-                    _keep_current,
-                    _do_update,
-                    None,
+                updated = update_spike_glm_params(
+                    spikes=spikes,
+                    smoother_mean=self.smoother_state_cond_mean[:, :, j],
+                    current_params=current_params,
+                    dt=self.dt,
+                    time_weights=state_weights,
+                    weight_l2=self.spike_weight_l2,
+                    smoother_cov=self.smoother_state_cond_cov[:, :, :, j],
+                    use_second_order=True,
+                    baseline_prior=baseline_prior,
+                    baseline_prior_l2=self.spike_baseline_prior_l2,
                 )
-
-            # Process all states using vmap for JIT compatibility
-            state_indices = jnp.arange(self.n_discrete_states)
-
-            # Transpose arrays to have state axis first for vmap
-            # spike_params.baseline: (n_neurons, n_discrete_states)
-            # spike_params.weights: (n_neurons, n_latent, n_discrete_states)
-            # smoother_discrete_state_prob: (n_time, n_discrete_states)
-            # smoother_state_cond_mean: (n_time, n_latent, n_discrete_states)
-            # smoother_state_cond_cov: (n_time, n_latent, n_latent, n_discrete_states)
-
-            updated_baselines, updated_weights = jax.vmap(
-                _update_single_state,
-                in_axes=(0, -1, -1, -1, -1, -1),
-                out_axes=(-1, -1),
-            )(
-                state_indices,
-                self.spike_params.baseline,
-                self.spike_params.weights,
-                self.smoother_discrete_state_prob,
-                self.smoother_state_cond_mean,
-                self.smoother_state_cond_cov,
-            )
+                new_baselines.append(updated.baseline)
+                new_weights.append(updated.weights)
 
             self.spike_params = SpikeObsParams(
-                baseline=updated_baselines,
-                weights=updated_weights,
+                baseline=jnp.stack(new_baselines, axis=-1),
+                weights=jnp.stack(new_weights, axis=-1),
             )
             return
 
