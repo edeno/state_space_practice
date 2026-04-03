@@ -1239,7 +1239,6 @@ def update_spike_glm_params(
     which helps prevent overfitting when the number of neurons is small
     relative to the latent dimensionality.
     """
-    n_neurons = spikes.shape[1]
     n_time = smoother_mean.shape[0]
     n_latent = smoother_mean.shape[1]
 
