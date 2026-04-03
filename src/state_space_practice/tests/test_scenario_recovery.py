@@ -177,24 +177,27 @@ class TestCNMRecovery:
 class TestDIMRecovery:
     """Verify DirectedInfluenceModel recovers state segmentation from DIM data.
 
-    States switch coupling direction between oscillators.
+    States switch coupling direction between oscillators. Initialized with
+    zero coupling — the model must discover the coupling from data.
     """
 
     @pytest.fixture(scope="class")
     def fitted(self):
         data = simulate_dim_scenario()
         p = data["params"]
+        n_osc = p["n_oscillators"]
+        n_disc = p["n_discrete_states"]
 
         model = DirectedInfluenceModel(
-            n_oscillators=p["n_oscillators"],
-            n_discrete_states=p["n_discrete_states"],
+            n_oscillators=n_osc,
+            n_discrete_states=n_disc,
             sampling_freq=p["sampling_freq"],
             freqs=jnp.array(p["freqs"]),
             auto_regressive_coef=jnp.array(p["damping"]),
             process_variance=jnp.array(p["process_variance"]),
             measurement_variance=p["measurement_variance"],
-            phase_difference=jnp.array(p["phase_difference"]),
-            coupling_strength=jnp.array(p["coupling_strength"]),
+            phase_difference=jnp.zeros((n_osc, n_osc, n_disc)),
+            coupling_strength=jnp.zeros((n_osc, n_osc, n_disc)),
         )
         lls = model.fit(
             jnp.array(data["obs"]),

@@ -127,11 +127,13 @@ def simulate_cnm_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
     A = np.stack([A_single, A_single], axis=2)
 
     # Q: state 0 = independent, state 1 = correlated
-    # Higher variance (0.2) allows stronger coupling while staying PSD
-    variance = jnp.array([0.2, 0.2])
+    # Higher variance (0.3) allows stronger coupling while staying PSD.
+    # Q1 eigvals [0.1, 0.1, 0.5, 0.5] vs Q0 [0.3, 0.3, 0.3, 0.3] —
+    # same total variance but different structure.
+    variance = jnp.array([0.3, 0.3])
     coupling_strength_corr = jnp.zeros(
         (N_OSCILLATORS, N_OSCILLATORS)
-    ).at[0, 1].set(0.15).at[1, 0].set(0.15)
+    ).at[0, 1].set(0.2).at[1, 0].set(0.2)
     Q0 = np.array(construct_correlated_noise_process_covariance(
         variance=variance,
         phase_difference=jnp.zeros((N_OSCILLATORS, N_OSCILLATORS)),
