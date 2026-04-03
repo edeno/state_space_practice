@@ -45,10 +45,12 @@ def simulate_switching_spike_oscillator(
     discrete_transition_matrix : Array, shape (n_discrete_states, n_discrete_states)
         Discrete state transition probabilities Z[i,j] = P(s_t=j | s_{t-1}=i).
         Rows should sum to 1.
-    spike_weights : Array, shape (n_neurons, n_latent)
+    spike_weights : Array, shape (n_neurons, n_latent) or (n_neurons, n_latent, n_discrete_states)
         Linear weights C mapping latent state to log firing rates.
-    spike_baseline : Array, shape (n_neurons,)
+        If 3D, per-state weights are indexed by the current discrete state.
+    spike_baseline : Array, shape (n_neurons,) or (n_neurons, n_discrete_states)
         Baseline log firing rates b for each neuron.
+        If 2D, per-state baselines are indexed by the current discrete state.
     dt : float
         Time bin width in seconds.
     key : Array
@@ -87,6 +89,9 @@ def simulate_switching_spike_oscillator(
     n_latent = transition_matrices.shape[0]
     n_discrete_states = transition_matrices.shape[-1]
 
+    # Determine if spike params are per-state
+    per_state_spikes = spike_weights.ndim == 3
+
     # Set defaults for initial conditions
     if init_mean is None:
         init_mean = jnp.zeros(n_latent)
@@ -124,8 +129,16 @@ def simulate_switching_spike_oscillator(
         x_mean = A_s @ x_prev
         x_t = jax.random.multivariate_normal(key_continuous, x_mean, Q_s)
 
+        # Get spike params for current discrete state (or shared)
+        if per_state_spikes:
+            b_s = spike_baseline[:, s_t]
+            c_s = spike_weights[:, :, s_t]
+        else:
+            b_s = spike_baseline
+            c_s = spike_weights
+
         # Compute firing rates: lambda_n = exp(b_n + c_n @ x_t)
-        log_rates = spike_baseline + spike_weights @ x_t
+        log_rates = b_s + c_s @ x_t
         rates = jnp.exp(log_rates) * dt
 
         # Sample spikes: y_n ~ Poisson(lambda_n * dt)
