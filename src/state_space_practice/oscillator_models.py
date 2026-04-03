@@ -1235,19 +1235,27 @@ class DirectedInfluenceModel(BaseModel):
 
         With reparameterized M-step, A is already valid by construction,
         so no projection is needed. With standard M-step, projects each A_j
-        to preserve oscillatory/coupling structure.
+        to preserve oscillatory/coupling structure and enforces stability
+        (spectral radius < 1).
         """
         if not self.use_reparameterized_mstep:
-            # Only project if using standard M-step
-            self.continuous_transition_matrix = jnp.stack(
-                [
-                    project_coupled_transition_matrix(
-                        self.continuous_transition_matrix[..., j]
-                    )
-                    for j in range(self.n_discrete_states)
-                ],
-                axis=-1,
-            )
+            projected = []
+            for j in range(self.n_discrete_states):
+                A_j = project_coupled_transition_matrix(
+                    self.continuous_transition_matrix[..., j]
+                )
+                # Enforce spectral radius < 1 for stability
+                max_spectral_radius = 0.99
+                eigvals = jnp.linalg.eigvals(A_j)
+                spectral_radius = jnp.max(jnp.abs(eigvals))
+                scale = jnp.where(
+                    spectral_radius > max_spectral_radius,
+                    max_spectral_radius / spectral_radius,
+                    1.0,
+                )
+                A_j = A_j * scale
+                projected.append(A_j)
+            self.continuous_transition_matrix = jnp.stack(projected, axis=-1)
 
     def fit(
         self,

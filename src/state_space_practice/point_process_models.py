@@ -568,9 +568,26 @@ class BaseSwitchingPointProcessModel(ABC):
             self.discrete_transition_matrix = new_discrete_transition
 
         if self.update_init_mean:
-            self.init_mean = new_init_mean
+            # Clip init_mean to prevent divergence. With sparse spike data,
+            # the smoother at t=0 is poorly constrained and can produce
+            # extreme estimates. The latent state is centered, so values
+            # beyond a few standard deviations are unphysical.
+            self.init_mean = jnp.clip(new_init_mean, -10.0, 10.0)
 
         if self.update_init_cov:
+            # Regularize init_cov eigenvalues. The smoother at t=0 can have
+            # enormous uncertainty with sparse observations, causing a
+            # positive feedback loop: large init_cov → diffuse filter →
+            # even larger smoother uncertainty → larger init_cov.
+            def clip_init_cov_eigenvalues(P: Array) -> Array:
+                P = symmetrize(P)
+                eigvals, eigvecs = jnp.linalg.eigh(P)
+                eigvals = jnp.clip(eigvals, 1e-4, 2.0)
+                return eigvecs @ jnp.diag(eigvals) @ eigvecs.T
+
+            new_init_cov = jax.vmap(
+                clip_init_cov_eigenvalues, in_axes=-1, out_axes=-1
+            )(new_init_cov)
             self.init_cov = new_init_cov
 
         self.init_discrete_state_prob = new_init_discrete_prob
@@ -1250,17 +1267,27 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         self.phase_difference = jnp.stack(phase_list, axis=-1)
 
     def _project_parameters(self) -> None:
-        """Project A to preserve oscillatory block structure."""
+        """Project A to preserve oscillatory block structure and ensure stability."""
         if self.use_reparameterized_mstep:
             return  # Already valid by construction
 
         if self.update_continuous_transition_matrix:
-            self.continuous_transition_matrix = jnp.stack(
-                [
-                    project_coupled_transition_matrix(
-                        self.continuous_transition_matrix[:, :, j]
-                    )
-                    for j in range(self.n_discrete_states)
-                ],
-                axis=-1,
-            )
+            projected = []
+            for j in range(self.n_discrete_states):
+                A_j = project_coupled_transition_matrix(
+                    self.continuous_transition_matrix[:, :, j]
+                )
+                # Enforce spectral radius < 1 for stability.
+                # The M-step can produce unstable A (spectral radius > 1)
+                # which causes the latent state to grow exponentially.
+                max_spectral_radius = 0.99
+                eigvals = jnp.linalg.eigvals(A_j)
+                spectral_radius = jnp.max(jnp.abs(eigvals))
+                scale = jnp.where(
+                    spectral_radius > max_spectral_radius,
+                    max_spectral_radius / spectral_radius,
+                    1.0,
+                )
+                A_j = A_j * scale
+                projected.append(A_j)
+            self.continuous_transition_matrix = jnp.stack(projected, axis=-1)
