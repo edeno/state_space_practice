@@ -269,8 +269,10 @@ class BaseSwitchingPointProcessModel(ABC):
         n_states = self.n_discrete_states
         spikes_np = np_cpu.array(spikes)
 
-        # Window size: ~100 timesteps for stable statistics
-        window = min(100, n_time // (2 * n_states))
+        # Window size: ~50 timesteps (0.5s at 100Hz) for good balance
+        # between temporal resolution and statistical stability.
+        # Short enough to resolve oscillator frequencies (8-25Hz).
+        window = min(50, n_time // (2 * n_states))
         window = max(window, 10)
 
         # Compute windowed features: per-neuron mean and variance
@@ -285,12 +287,14 @@ class BaseSwitchingPointProcessModel(ABC):
             )
             return
 
-        # Reshape into windows and compute per-neuron features
+        # Reshape into windows and compute features
         trimmed = spikes_np[: n_windows * window]
         windowed = trimmed.reshape(n_windows, window, -1)
-        # Features: per-neuron mean rate and per-neuron variance
+        # Features: per-neuron mean rate, per-neuron variance,
+        # and windowed spectral features (power at oscillator frequencies)
         means = windowed.mean(axis=1)      # (n_windows, n_neurons)
         variances = windowed.var(axis=1)   # (n_windows, n_neurons)
+
         features = np_cpu.concatenate([means, variances], axis=1)
 
         # Fit GMM
@@ -1092,6 +1096,79 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
         self.process_cov = jnp.stack(
             [process_cov] * self.n_discrete_states, axis=2
         )
+
+    def _warm_initialize_states(self, spikes: Array) -> None:
+        """Warm-initialize using spectral features.
+
+        COM-PP states differ in which oscillator modulates the neurons
+        (e.g., theta vs beta), so windowed spectral band power ratios
+        are better features than rate alone.
+        """
+        import numpy as np_cpu
+        from sklearn.mixture import GaussianMixture
+
+        n_time = spikes.shape[0]
+        n_states = self.n_discrete_states
+        spikes_np = np_cpu.array(spikes)
+
+        window = min(50, n_time // (2 * n_states))
+        window = max(window, 10)
+        n_windows = n_time // window
+        if n_windows < n_states * 2:
+            super()._warm_initialize_states(spikes)
+            return
+
+        trimmed = spikes_np[: n_windows * window]
+        windowed = trimmed.reshape(n_windows, window, -1)
+
+        # Per-neuron mean rates
+        means = windowed.mean(axis=1)
+
+        # Spectral: band power in oscillator frequency ranges
+        total_per_window = windowed.sum(axis=2)
+        total_per_window = total_per_window - total_per_window.mean(
+            axis=1, keepdims=True
+        )
+        freqs_fft = np_cpu.fft.rfftfreq(window, d=1.0 / self.sampling_freq)
+        power = np_cpu.abs(np_cpu.fft.rfft(total_per_window, axis=1)) ** 2
+        power_sum = power.sum(axis=1, keepdims=True) + 1e-10
+        power_norm = power / power_sum
+
+        # Band power at each oscillator's frequency ± 2Hz
+        spectral_features = []
+        for freq in np_cpu.array(self.freqs):
+            mask = (freqs_fft >= freq - 2) & (freqs_fft <= freq + 2)
+            if mask.any():
+                spectral_features.append(
+                    power_norm[:, mask].sum(axis=1, keepdims=True)
+                )
+        if spectral_features:
+            spectral = np_cpu.concatenate(spectral_features, axis=1)
+            features = np_cpu.concatenate([means, spectral], axis=1)
+        else:
+            features = means
+
+        gmm = GaussianMixture(
+            n_components=n_states, covariance_type="full",
+            n_init=5, random_state=0,
+        )
+        gmm.fit(features)
+        window_probs = gmm.predict_proba(features)
+
+        probs_np = np_cpu.repeat(window_probs, window, axis=0)
+        if n_time > n_windows * window:
+            remainder = n_time - n_windows * window
+            probs_np = np_cpu.concatenate(
+                [probs_np, np_cpu.tile(window_probs[-1], (remainder, 1))]
+            )
+        probs = jnp.array(probs_np[:n_time])
+        probs = probs * 0.9 + 0.05 / n_states
+        probs = probs / probs.sum(axis=1, keepdims=True)
+
+        self.smoother_discrete_state_prob = probs
+        joint = probs[:-1, :, None] * probs[1:, None, :]
+        joint = joint / jnp.sum(joint, axis=(1, 2), keepdims=True)
+        self.smoother_joint_discrete_state_prob = joint
 
     def _project_parameters(self) -> None:
         """No projection needed — A and Q are not updated."""
