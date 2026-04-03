@@ -249,6 +249,81 @@ class BaseSwitchingPointProcessModel(ABC):
     # Initialization methods
     # ------------------------------------------------------------------
 
+    def _warm_initialize_states(self, spikes: Array) -> None:
+        """Warm-initialize discrete state probabilities from spike statistics.
+
+        Uses a Gaussian mixture model on windowed per-neuron spike features
+        (mean rate + rate variance) to segment data into approximate discrete
+        states. This captures both rate changes (COM-PP) and variance changes
+        (CNM-PP) for symmetry breaking.
+
+        Parameters
+        ----------
+        spikes : Array, shape (n_time, n_neurons)
+            Observed spike counts.
+        """
+        import numpy as np_cpu
+        from sklearn.mixture import GaussianMixture
+
+        n_time = spikes.shape[0]
+        n_states = self.n_discrete_states
+        spikes_np = np_cpu.array(spikes)
+
+        # Window size: ~100 timesteps for stable statistics
+        window = min(100, n_time // (2 * n_states))
+        window = max(window, 10)
+
+        # Compute windowed features: per-neuron mean and variance
+        n_windows = n_time // window
+        if n_windows < n_states * 2:
+            # Not enough windows — fall back to uniform
+            self.smoother_discrete_state_prob = (
+                jnp.ones((n_time, n_states)) / n_states
+            )
+            self.smoother_joint_discrete_state_prob = (
+                jnp.ones((n_time - 1, n_states, n_states)) / n_states**2
+            )
+            return
+
+        # Reshape into windows and compute per-neuron features
+        trimmed = spikes_np[: n_windows * window]
+        windowed = trimmed.reshape(n_windows, window, -1)
+        # Features: per-neuron mean rate and per-neuron variance
+        means = windowed.mean(axis=1)      # (n_windows, n_neurons)
+        variances = windowed.var(axis=1)   # (n_windows, n_neurons)
+        features = np_cpu.concatenate([means, variances], axis=1)
+
+        # Fit GMM
+        gmm = GaussianMixture(
+            n_components=n_states,
+            covariance_type="full",
+            n_init=5,
+            random_state=0,
+        )
+        gmm.fit(features)
+        window_probs = gmm.predict_proba(features)  # (n_windows, n_states)
+
+        # Expand window probabilities to per-timestep
+        probs_np = np_cpu.repeat(window_probs, window, axis=0)
+        # Handle remainder timesteps
+        if n_time > n_windows * window:
+            remainder = n_time - n_windows * window
+            probs_np = np_cpu.concatenate(
+                [probs_np, np_cpu.tile(window_probs[-1], (remainder, 1))]
+            )
+        probs = jnp.array(probs_np[:n_time])
+
+        # Soften to avoid numerical issues (min prob 0.05)
+        probs = probs * 0.9 + 0.05 / n_states
+        probs = probs / probs.sum(axis=1, keepdims=True)
+
+        self.smoother_discrete_state_prob = probs
+
+        # Joint probabilities from adjacent timestep marginals
+        joint = probs[:-1, :, None] * probs[1:, None, :]
+        joint = joint / jnp.sum(joint, axis=(1, 2), keepdims=True)
+        self.smoother_joint_discrete_state_prob = joint
+
     def _initialize_parameters(self, key: Array) -> None:
         """Initialize all model parameters."""
         k1, k2 = jax.random.split(key)
@@ -705,6 +780,7 @@ class BaseSwitchingPointProcessModel(ABC):
         tol: float = 1e-4,
         key: Array | None = None,
         skip_init: bool = False,
+        n_restarts: int = 1,
     ) -> list[float]:
         """Fit the model to spike data using EM.
 
@@ -720,11 +796,14 @@ class BaseSwitchingPointProcessModel(ABC):
             JAX random key for initialization. Defaults to PRNGKey(0).
         skip_init : bool, default=False
             If True, skip initialization (use existing parameters).
+        n_restarts : int, default=1
+            Number of random restarts. Each restart uses a different random
+            key. The run with the best final log-likelihood is kept.
 
         Returns
         -------
         log_likelihoods : list[float]
-            Marginal log-likelihood at each iteration.
+            Marginal log-likelihood at each iteration (from the best restart).
         """
         spikes = jnp.asarray(spikes)
 
@@ -742,8 +821,46 @@ class BaseSwitchingPointProcessModel(ABC):
         if key is None:
             key = jax.random.PRNGKey(0)
 
+        if n_restarts > 1 and not skip_init:
+            return self._fit_multi_restart(
+                spikes, max_iter, tol, key, n_restarts
+            )
+
+        return self._fit_single(spikes, max_iter, tol, key, skip_init)
+
+    def _fit_single(
+        self,
+        spikes: Array,
+        max_iter: int,
+        tol: float,
+        key: Array,
+        skip_init: bool = False,
+    ) -> list[float]:
+        """Single EM run with warm initialization."""
         if not skip_init:
             self._initialize_parameters(key)
+            self._warm_initialize_states(spikes)
+            # Set placeholder smoother outputs needed by spike M-step
+            n_time = spikes.shape[0]
+            self.smoother_state_cond_mean = jnp.zeros(
+                (n_time, self.n_latent, self.n_discrete_states)
+            )
+            self.smoother_state_cond_cov = jnp.stack(
+                [jnp.eye(self.n_latent)] * self.n_discrete_states, axis=2
+            )[None].repeat(n_time, axis=0)
+            self.smoother_pair_cond_cross_cov = jnp.zeros(
+                (
+                    n_time - 1,
+                    self.n_latent,
+                    self.n_latent,
+                    self.n_discrete_states,
+                    self.n_discrete_states,
+                )
+            )
+            self.smoother_pair_cond_means = None
+            self.smoother_pair_cond_covs = None
+            self.smoother_next_pair_cond_means = None
+            self._m_step_spikes(spikes)
 
         log_likelihoods: list[float] = []
 
@@ -786,6 +903,72 @@ class BaseSwitchingPointProcessModel(ABC):
             logger.warning("Reached maximum iterations without converging.")
 
         return log_likelihoods
+
+    def _fit_multi_restart(
+        self,
+        spikes: Array,
+        max_iter: int,
+        tol: float,
+        key: Array,
+        n_restarts: int,
+    ) -> list[float]:
+        """Run EM with multiple random restarts, keep the best.
+
+        Each restart uses a different random key for initialization.
+        The run with the highest final log-likelihood is kept, and the
+        model's parameters are set to those of the best run.
+        """
+        import copy
+
+        best_lls: list[float] | None = None
+        best_final_ll = -float("inf")
+        best_state: dict | None = None
+
+        keys = jax.random.split(key, n_restarts)
+
+        for restart in range(n_restarts):
+            try:
+                lls = self._fit_single(spikes, max_iter, tol, keys[restart])
+                final_ll = lls[-1] if lls else -float("inf")
+
+                if final_ll > best_final_ll:
+                    best_final_ll = final_ll
+                    best_lls = lls
+                    # Save model state
+                    best_state = {
+                        "init_mean": self.init_mean,
+                        "init_cov": self.init_cov,
+                        "init_discrete_state_prob": self.init_discrete_state_prob,
+                        "discrete_transition_matrix": self.discrete_transition_matrix,
+                        "continuous_transition_matrix": self.continuous_transition_matrix,
+                        "process_cov": self.process_cov,
+                        "spike_params": copy.deepcopy(self.spike_params),
+                        "smoother_discrete_state_prob": self.smoother_discrete_state_prob,
+                    }
+
+                logger.info(
+                    f"Restart {restart + 1}/{n_restarts}: "
+                    f"final LL={final_ll:.4f}"
+                )
+            except ValueError:
+                logger.warning(
+                    f"Restart {restart + 1}/{n_restarts}: failed (non-finite LL)"
+                )
+                continue
+
+        if best_state is None:
+            raise ValueError(
+                f"All {n_restarts} restarts failed with non-finite log-likelihood."
+            )
+
+        # Restore best model state
+        for attr, value in best_state.items():
+            setattr(self, attr, value)
+
+        # Re-run E-step to populate all smoother outputs for the best params
+        self._e_step(spikes)
+
+        return best_lls
 
 
 # ==========================================================================

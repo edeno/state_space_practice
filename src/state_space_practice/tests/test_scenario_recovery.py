@@ -250,6 +250,7 @@ class TestCOMPPRecovery:
             jnp.array(data["spikes"]),
             max_iter=50,
             key=jax.random.PRNGKey(0),
+            n_restarts=3,
         )
         return model, data, lls
 
@@ -303,6 +304,7 @@ class TestCNMPPRecovery:
             jnp.array(data["spikes"]),
             max_iter=50,
             key=jax.random.PRNGKey(0),
+            n_restarts=3,
         )
         return model, data, lls
 
@@ -353,6 +355,7 @@ class TestDIMPPRecovery:
             jnp.array(data["spikes"]),
             max_iter=50,
             key=jax.random.PRNGKey(0),
+            n_restarts=3,
         )
         return model, data, lls
 
