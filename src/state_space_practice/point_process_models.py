@@ -929,6 +929,9 @@ class BaseSwitchingPointProcessModel(ABC):
             )
             for attr, value in best_params.items():
                 setattr(self, attr, value)
+            # Re-run E-step to populate all smoother outputs consistently
+            # with the restored parameters
+            self._e_step(spikes)
 
         if len(log_likelihoods) == max_iter:
             logger.warning("Reached maximum iterations without converging.")

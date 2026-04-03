@@ -2165,7 +2165,9 @@ def optimize_dim_transition_params(
 
     opt_params = unpack_constrained(result.x)
 
-    # Post-check: verify spectral radius of resulting A matrix
+    # Post-check: verify spectral radius of resulting A matrix.
+    # If unstable, uniformly scale damping AND coupling so the
+    # spectral radius of the reconstructed A is <= 0.99.
     A_opt = construct_directed_influence_transition_matrix(
         freqs=opt_params["freq"],
         damping_coeffs=opt_params["damping"],
@@ -2174,8 +2176,8 @@ def optimize_dim_transition_params(
         sampling_freq=sampling_freq,
     )
     spectral_radius = jnp.max(jnp.abs(jnp.linalg.eigvals(A_opt)))
-    # If still unstable (shouldn't happen with bounded params), scale down
     safe_scale = jnp.where(spectral_radius > 0.99, 0.99 / spectral_radius, 1.0)
     opt_params["damping"] = opt_params["damping"] * safe_scale
+    opt_params["coupling_strength"] = opt_params["coupling_strength"] * safe_scale
 
     return opt_params

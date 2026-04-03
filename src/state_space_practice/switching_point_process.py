@@ -705,12 +705,13 @@ def _armijo_line_search(
     directional_derivative = jnp.dot(gradient, delta)
 
     def line_search_step(carry, _):
-        alpha, _ = carry
+        alpha, found = carry
+        # Skip loss evaluation if we already found a good step size
         new_params_trial = params - alpha * delta
-        new_loss = loss_fn(new_params_trial)
+        new_loss = jnp.where(found, current_loss, loss_fn(new_params_trial))
 
         # Armijo condition: new_loss <= current_loss - c * alpha * directional_derivative
-        sufficient_decrease = (
+        sufficient_decrease = found | (
             new_loss <= current_loss - c * alpha * directional_derivative
         )
 
