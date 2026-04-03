@@ -40,6 +40,7 @@ from state_space_practice.oscillator_utils import (
     project_matrix_blockwise,
 )
 from state_space_practice.switching_kalman import (
+    compute_transition_q_function,
     compute_transition_sufficient_stats,
     optimize_dim_transition_params,
     switching_kalman_maximization_step,
@@ -757,12 +758,18 @@ class BaseSwitchingPointProcessModel(ABC):
                 )
 
             if iteration > 0:
-                is_converged, _ = check_converged(
+                is_converged, is_increasing = check_converged(
                     log_likelihood=log_likelihoods[-1],
                     previous_log_likelihood=log_likelihoods[-2],
                     tolerance=tol,
                 )
-                if is_converged:
+                if not is_increasing:
+                    logger.warning(
+                        f"Log-likelihood decreased at iteration {iteration + 1}: "
+                        f"{log_likelihoods[-2]:.4f} -> {log_likelihoods[-1]:.4f}"
+                    )
+                # Only declare convergence if LL is not decreasing
+                if is_converged and is_increasing:
                     logger.info(f"Converged after {iteration + 1} iterations.")
                     break
 
@@ -1157,11 +1164,26 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         )
 
     def _m_step_dynamics(self) -> None:
-        """M-step with optional reparameterized transition update."""
+        """M-step with optional reparameterized transition update.
+
+        Caches the unconstrained A and sufficient statistics (gamma1, beta)
+        so that _project_parameters can check whether projection worsens
+        the Q-function.
+        """
         if self.use_reparameterized_mstep:
             self._m_step_reparameterized()
-        else:
-            super()._m_step_dynamics()
+            return
+
+        super()._m_step_dynamics()
+
+        # Cache sufficient statistics for Q-function-aware projection
+        self._transition_suff_stats = compute_transition_sufficient_stats(
+            state_cond_smoother_means=self.smoother_state_cond_mean,
+            state_cond_smoother_covs=self.smoother_state_cond_cov,
+            smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
+            pair_cond_smoother_means=self.smoother_pair_cond_means,
+        )
 
     def _m_step_reparameterized(self) -> None:
         """M-step using reparameterized optimization for A.
@@ -1267,27 +1289,64 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         self.phase_difference = jnp.stack(phase_list, axis=-1)
 
     def _project_parameters(self) -> None:
-        """Project A to preserve oscillatory block structure and ensure stability."""
+        """Project A to oscillatory block structure, preserving EM monotonicity.
+
+        The unconstrained M-step maximizes the Q-function. Block projection
+        can worsen the Q-function, breaking EM monotonicity. We only accept
+        the projected A if it does not increase the Q-function loss. If
+        projection worsens the objective, we keep the unconstrained A.
+
+        After projection (or not), we enforce spectral radius < 1 for
+        stability, again only accepting the rescaled A if it doesn't
+        worsen the Q-function.
+        """
         if self.use_reparameterized_mstep:
             return  # Already valid by construction
 
-        if self.update_continuous_transition_matrix:
-            projected = []
-            for j in range(self.n_discrete_states):
-                A_j = project_coupled_transition_matrix(
-                    self.continuous_transition_matrix[:, :, j]
+        if not self.update_continuous_transition_matrix:
+            return
+
+        suff_stats = getattr(self, "_transition_suff_stats", None)
+
+        projected = []
+        for j in range(self.n_discrete_states):
+            A_unc_j = self.continuous_transition_matrix[:, :, j]
+            A_proj_j = project_coupled_transition_matrix(A_unc_j)
+
+            # Only accept projection if it doesn't worsen Q-function
+            if suff_stats is not None:
+                gamma1_j = suff_stats[0][:, :, j]
+                beta_j = suff_stats[1][:, :, j]
+                q_unc = compute_transition_q_function(A_unc_j, gamma1_j, beta_j)
+                q_proj = compute_transition_q_function(A_proj_j, gamma1_j, beta_j)
+                # compute_transition_q_function returns negative Q (to minimize)
+                # so q_proj > q_unc means projection worsened the objective
+                A_j = jnp.where(q_proj <= q_unc, A_proj_j, A_unc_j)
+            else:
+                A_j = A_proj_j
+
+            # Enforce spectral radius < 1 for stability
+            max_spectral_radius = 0.99
+            eigvals = jnp.linalg.eigvals(A_j)
+            spectral_radius = jnp.max(jnp.abs(eigvals))
+            scale = jnp.where(
+                spectral_radius > max_spectral_radius,
+                max_spectral_radius / spectral_radius,
+                1.0,
+            )
+            A_scaled = A_j * scale
+
+            # Only accept scaling if it doesn't worsen Q-function
+            if suff_stats is not None:
+                q_scaled = compute_transition_q_function(
+                    A_scaled, gamma1_j, beta_j
                 )
-                # Enforce spectral radius < 1 for stability.
-                # The M-step can produce unstable A (spectral radius > 1)
-                # which causes the latent state to grow exponentially.
-                max_spectral_radius = 0.99
-                eigvals = jnp.linalg.eigvals(A_j)
-                spectral_radius = jnp.max(jnp.abs(eigvals))
-                scale = jnp.where(
-                    spectral_radius > max_spectral_radius,
-                    max_spectral_radius / spectral_radius,
-                    1.0,
+                q_before = compute_transition_q_function(
+                    A_j, gamma1_j, beta_j
                 )
-                A_j = A_j * scale
-                projected.append(A_j)
-            self.continuous_transition_matrix = jnp.stack(projected, axis=-1)
+                A_j = jnp.where(q_scaled <= q_before, A_scaled, A_j)
+            else:
+                A_j = A_scaled
+
+            projected.append(A_j)
+        self.continuous_transition_matrix = jnp.stack(projected, axis=-1)

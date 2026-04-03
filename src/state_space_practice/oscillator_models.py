@@ -55,6 +55,7 @@ from state_space_practice.oscillator_utils import (
     project_matrix_blockwise,
 )
 from state_space_practice.switching_kalman import (
+    compute_transition_q_function,
     compute_transition_sufficient_stats,
     optimize_dim_transition_params,
     switching_kalman_filter,
@@ -1090,6 +1091,8 @@ class DirectedInfluenceModel(BaseModel):
     def _m_step(self, observations: ArrayLike) -> None:
         """Performs the M-step, with optional reparameterized transition update.
 
+        Caches transition sufficient statistics for Q-function-aware projection.
+
         Parameters
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
@@ -1099,6 +1102,14 @@ class DirectedInfluenceModel(BaseModel):
             self._m_step_reparameterized(observations)
         else:
             super()._m_step(observations)
+            # Cache sufficient stats for Q-function check in projection
+            self._transition_suff_stats = compute_transition_sufficient_stats(
+                state_cond_smoother_means=self.smoother_state_cond_mean,
+                state_cond_smoother_covs=self.smoother_state_cond_cov,
+                smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
+                pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
+                pair_cond_smoother_means=self.smoother_pair_cond_means,
+            )
 
     def _m_step_reparameterized(self, observations: ArrayLike) -> None:
         """M-step using reparameterized optimization for A.
@@ -1231,31 +1242,54 @@ class DirectedInfluenceModel(BaseModel):
         self.phase_difference = jnp.stack(phase_list, axis=-1)
 
     def _project_parameters(self):
-        """Projects parameters to valid space.
+        """Projects parameters to valid space, preserving EM monotonicity.
 
-        With reparameterized M-step, A is already valid by construction,
-        so no projection is needed. With standard M-step, projects each A_j
-        to preserve oscillatory/coupling structure and enforces stability
-        (spectral radius < 1).
+        With reparameterized M-step, A is already valid by construction.
+        With standard M-step, projects each A_j to oscillatory block
+        structure and enforces stability (spectral radius < 1), but only
+        accepts changes that don't worsen the Q-function.
         """
-        if not self.use_reparameterized_mstep:
-            projected = []
-            for j in range(self.n_discrete_states):
-                A_j = project_coupled_transition_matrix(
-                    self.continuous_transition_matrix[..., j]
+        if self.use_reparameterized_mstep:
+            return
+
+        suff_stats = getattr(self, "_transition_suff_stats", None)
+
+        projected = []
+        for j in range(self.n_discrete_states):
+            A_unc_j = self.continuous_transition_matrix[..., j]
+            A_proj_j = project_coupled_transition_matrix(A_unc_j)
+
+            if suff_stats is not None:
+                gamma1_j = suff_stats[0][:, :, j]
+                beta_j = suff_stats[1][:, :, j]
+                q_unc = compute_transition_q_function(A_unc_j, gamma1_j, beta_j)
+                q_proj = compute_transition_q_function(A_proj_j, gamma1_j, beta_j)
+                A_j = jnp.where(q_proj <= q_unc, A_proj_j, A_unc_j)
+            else:
+                A_j = A_proj_j
+
+            # Enforce spectral radius < 1 for stability
+            max_spectral_radius = 0.99
+            eigvals = jnp.linalg.eigvals(A_j)
+            spectral_radius = jnp.max(jnp.abs(eigvals))
+            scale = jnp.where(
+                spectral_radius > max_spectral_radius,
+                max_spectral_radius / spectral_radius,
+                1.0,
+            )
+            A_scaled = A_j * scale
+
+            if suff_stats is not None:
+                q_scaled = compute_transition_q_function(
+                    A_scaled, gamma1_j, beta_j
                 )
-                # Enforce spectral radius < 1 for stability
-                max_spectral_radius = 0.99
-                eigvals = jnp.linalg.eigvals(A_j)
-                spectral_radius = jnp.max(jnp.abs(eigvals))
-                scale = jnp.where(
-                    spectral_radius > max_spectral_radius,
-                    max_spectral_radius / spectral_radius,
-                    1.0,
-                )
-                A_j = A_j * scale
-                projected.append(A_j)
-            self.continuous_transition_matrix = jnp.stack(projected, axis=-1)
+                q_before = compute_transition_q_function(A_j, gamma1_j, beta_j)
+                A_j = jnp.where(q_scaled <= q_before, A_scaled, A_j)
+            else:
+                A_j = A_scaled
+
+            projected.append(A_j)
+        self.continuous_transition_matrix = jnp.stack(projected, axis=-1)
 
     def fit(
         self,

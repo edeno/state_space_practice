@@ -1133,12 +1133,30 @@ def _single_neuron_glm_step_second_order(
     # Newton direction
     delta = jnp.linalg.solve(hess_reg, grad)
 
-    # Damped Newton: use half-step (alpha=0.5) to prevent overshooting.
-    # Full Newton step (alpha=1) can overshoot on non-quadratic objectives,
-    # especially with the second-order correction term. A fixed damping
-    # factor is simple, compiles fast (no lax.scan for line search), and
-    # maintains EM progress while avoiding the non-monotonic LL degradation.
-    new_params = params - 0.5 * delta
+    # Armijo backtracking line search to guarantee sufficient decrease.
+    # The second-order Poisson GLM objective is non-quadratic, so full
+    # Newton steps can overshoot. The line search ensures monotone decrease.
+    def loss_fn(p: Array) -> Array:
+        b_trial = p[0]
+        w_trial = p[1:]
+        eta_lin_trial = smoother_mean @ w_trial
+        quad_trial = 0.5 * jnp.einsum("tij,i,j->t", smoother_cov, w_trial, w_trial)
+        eta_trial = b_trial + eta_lin_trial + quad_trial
+        eta_trial_safe = jnp.clip(eta_trial, -20.0, 20.0)
+        mu_trial = jnp.exp(eta_trial_safe) * dt
+        loss = jnp.sum(time_weights_val * (mu_trial - y_n * (b_trial + eta_lin_trial)))
+        loss += 0.5 * weight_l2 * jnp.dot(w_trial, w_trial)
+        if baseline_prior is not None:
+            loss += 0.5 * baseline_prior_l2 * (b_trial - bp) ** 2
+        else:
+            loss += 0.5 * baseline_prior_l2 * b_trial**2
+        return loss
+
+    current_loss = loss_fn(params)
+    alpha = _armijo_line_search(
+        params, delta, grad, loss_fn, current_loss, beta=0.5, max_iter=10
+    )
+    new_params = params - alpha * delta
     new_baseline = new_params[0]
     new_weights = new_params[1:]
 
@@ -1669,14 +1687,15 @@ class SwitchingSpikeOscillatorModel:
         Whether to update initial covariance during M-step.
     q_regularization : QRegularizationConfig | None, optional
         Trust-region and eigenvalue clipping configuration for Q updates.
-    spike_weight_l2 : float, default=0.01
+    spike_weight_l2 : float, default=100.0
         L2 regularization strength on the spike GLM weights (not baseline).
         Adds 0.5 * spike_weight_l2 * ||weights||^2 to the M-step objective
-        for each neuron. The default (0.01) corresponds to a prior std of ~10
-        on weight magnitude, which allows any biologically plausible firing
-        rate modulation (up to ~1000x) while preventing pathological runaway
-        values. This provides numerical stability without constraining
-        realistic neurons.
+        for each neuron. This is an absolute penalty that must be scaled
+        relative to the data likelihood, which grows with sequence length
+        and firing rate. The default (100.0) keeps weight norms ~O(1),
+        corresponding to realistic theta modulation depths of ~2-10x in
+        firing rate. For short sequences or low-rate neurons, reduce
+        proportionally.
 
     Attributes
     ----------
@@ -1742,7 +1761,7 @@ class SwitchingSpikeOscillatorModel:
         update_init_mean: bool = True,
         update_init_cov: bool = True,
         q_regularization: QRegularizationConfig | None = None,
-        spike_weight_l2: float = 0.01,
+        spike_weight_l2: float = 100.0,
         spike_baseline_prior_l2: float = 0.0,
         max_newton_iter: int = 1,
         line_search_beta: float = 0.5,
@@ -1780,7 +1799,7 @@ class SwitchingSpikeOscillatorModel:
             Update initial covariance during M-step.
         q_regularization : QRegularizationConfig | None, optional
             Trust-region and eigenvalue clipping configuration for Q updates.
-        spike_weight_l2 : float, default=0.01
+        spike_weight_l2 : float, default=100.0
             L2 regularization strength on the spike GLM weights.
         spike_baseline_prior_l2 : float, default=0.0
             L2 regularization strength shrinking spike baselines toward the
