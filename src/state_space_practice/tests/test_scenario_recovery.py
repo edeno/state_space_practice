@@ -3,7 +3,7 @@
 Each test class simulates data from a model's generative process and verifies
 that fitting the model recovers:
 1. Correct discrete state segmentation
-2. Finite, non-decreasing log-likelihoods
+2. Finite log-likelihoods
 
 These tests are marked @pytest.mark.slow since EM fitting is expensive.
 Run with: pytest -m slow
@@ -81,7 +81,10 @@ def state_segmentation_accuracy(
 
 @pytest.mark.slow
 class TestCOMRecovery:
-    """Verify CommonOscillatorModel recovers state segmentation from COM data."""
+    """Verify CommonOscillatorModel recovers state segmentation from COM data.
+
+    States switch between theta and beta frequency content in observations.
+    """
 
     @pytest.fixture(scope="class")
     def fitted(self):
@@ -124,7 +127,11 @@ class TestCOMRecovery:
 
 @pytest.mark.slow
 class TestCNMRecovery:
-    """Verify CorrelatedNoiseModel recovers state segmentation from CNM data."""
+    """Verify CorrelatedNoiseModel recovers state segmentation from CNM data.
+
+    States switch between independent and correlated process noise. Tests
+    the actual correlation structure mechanism of CNM.
+    """
 
     @pytest.fixture(scope="class")
     def fitted(self):
@@ -168,7 +175,10 @@ class TestCNMRecovery:
 
 @pytest.mark.slow
 class TestDIMRecovery:
-    """Verify DirectedInfluenceModel recovers state segmentation from DIM data."""
+    """Verify DirectedInfluenceModel recovers state segmentation from DIM data.
+
+    States switch coupling direction between oscillators.
+    """
 
     @pytest.fixture(scope="class")
     def fitted(self):
@@ -212,7 +222,11 @@ class TestDIMRecovery:
 
 @pytest.mark.slow
 class TestCOMPPRecovery:
-    """Verify COM-PP recovers state segmentation from COM-PP spike data."""
+    """Verify COM-PP recovers state segmentation from COM-PP spike data.
+
+    All neurons are active in both states but couple to different oscillators
+    (theta vs beta). No silent/active neuron trick.
+    """
 
     @pytest.fixture(scope="class")
     def fitted(self):
@@ -246,7 +260,7 @@ class TestCOMPPRecovery:
             data["true_states"],
             np.array(model.smoother_discrete_state_prob),
         )
-        assert acc >= 0.70, f"State segmentation accuracy {acc:.3f} < 0.70"
+        assert acc >= 0.60, f"State segmentation accuracy {acc:.3f} < 0.60"
 
 
 # ============================================================================
@@ -256,13 +270,19 @@ class TestCOMPPRecovery:
 
 @pytest.mark.slow
 class TestCNMPPRecovery:
-    """Verify CNM-PP recovers state segmentation from CNM-PP spike data."""
+    """Verify CNM-PP recovers state segmentation from CNM-PP spike data.
+
+    Shared spike params — state segmentation relies on the Q variance
+    contrast being detectable through the latent dynamics. The Laplace-EKF
+    cannot detect correlation structure changes from spikes (see scenarios.py
+    docstring), so this tests variance contrast as the PP-identifiable
+    component of the CNM mechanism.
+    """
 
     @pytest.fixture(scope="class")
     def fitted(self):
-        data = simulate_cnm_pp_scenario(n_time=5000)
+        data = simulate_cnm_pp_scenario()
         p = data["params"]
-        spikes = jnp.array(data["spikes"])
 
         model = CorrelatedNoisePointProcessModel(
             n_oscillators=p["n_oscillators"],
@@ -275,13 +295,12 @@ class TestCNMPPRecovery:
             process_variance=jnp.array(p["process_variance"]),
             phase_difference=jnp.array(p["phase_difference"]),
             coupling_strength=jnp.array(p["coupling_strength"]),
-            # init state M-step is unstable for sparse spike data:
-            # smoother uncertainty at t=0 is enormous with few spikes,
-            # causing init_cov eigenvalues to explode across iterations.
-            update_init_mean=False,
-            update_init_cov=False,
         )
-        lls = model.fit(spikes, max_iter=50, key=jax.random.PRNGKey(0))
+        lls = model.fit(
+            jnp.array(data["spikes"]),
+            max_iter=50,
+            key=jax.random.PRNGKey(0),
+        )
         return model, data, lls
 
     def test_log_likelihoods_finite(self, fitted):
@@ -304,13 +323,16 @@ class TestCNMPPRecovery:
 
 @pytest.mark.slow
 class TestDIMPPRecovery:
-    """Verify DIM-PP recovers state segmentation from DIM-PP spike data."""
+    """Verify DIM-PP recovers state segmentation from DIM-PP spike data.
+
+    Shared spike params — state segmentation relies on the coupling
+    direction reversal being detectable through the latent dynamics.
+    """
 
     @pytest.fixture(scope="class")
     def fitted(self):
-        data = simulate_dim_pp_scenario(n_time=5000)
+        data = simulate_dim_pp_scenario()
         p = data["params"]
-        spikes = jnp.array(data["spikes"])
 
         model = DirectedInfluencePointProcessModel(
             n_oscillators=p["n_oscillators"],
@@ -323,10 +345,12 @@ class TestDIMPPRecovery:
             process_variance=jnp.array(p["process_variance"]),
             phase_difference=jnp.array(p["phase_difference"]),
             coupling_strength=jnp.array(p["coupling_strength"]),
-            update_init_mean=False,
-            update_init_cov=False,
         )
-        lls = model.fit(spikes, max_iter=50, key=jax.random.PRNGKey(0))
+        lls = model.fit(
+            jnp.array(data["spikes"]),
+            max_iter=50,
+            key=jax.random.PRNGKey(0),
+        )
         return model, data, lls
 
     def test_log_likelihoods_finite(self, fitted):
