@@ -2092,27 +2092,52 @@ def optimize_dim_transition_params(
     """
     from jax.scipy.optimize import minimize
 
+    from state_space_practice.oscillator_utils import (
+        construct_directed_influence_transition_matrix,
+    )
+
     n_osc = len(init_params["damping"])
 
-    def pack_params(params: dict) -> jax.Array:
-        """Flatten params to 1D array for optimizer."""
-        return jnp.concatenate(
-            [
-                params["damping"],
-                params["freq"],
-                params["coupling_strength"].ravel(),
-                params["phase_diff"].ravel(),
-            ]
-        )
+    # Optimize in transformed coordinates for stability:
+    # - damping: sigmoid maps (-inf, inf) -> (0, max_damping)
+    # - coupling_strength: tanh maps (-inf, inf) -> (-max_coupling, max_coupling)
+    # - freq, phase_diff: unconstrained
+    max_damping = 0.995
+    max_coupling = 0.5
 
-    def unpack_params(flat: jax.Array) -> dict:
-        """Unflatten 1D array to param dict."""
+    def _sigmoid(x: jax.Array) -> jax.Array:
+        return max_damping * jax.nn.sigmoid(x)
+
+    def _inv_sigmoid(y: jax.Array) -> jax.Array:
+        y_clipped = jnp.clip(y / max_damping, 1e-6, 1.0 - 1e-6)
+        return jnp.log(y_clipped / (1.0 - y_clipped))
+
+    def _bounded_coupling(x: jax.Array) -> jax.Array:
+        return max_coupling * jnp.tanh(x)
+
+    def _inv_bounded_coupling(y: jax.Array) -> jax.Array:
+        y_clipped = jnp.clip(y / max_coupling, -1.0 + 1e-6, 1.0 - 1e-6)
+        return jnp.arctanh(y_clipped)
+
+    def pack_unconstrained(params: dict) -> jax.Array:
+        """Map physical params to unconstrained coordinates."""
+        return jnp.concatenate([
+            _inv_sigmoid(params["damping"]),
+            params["freq"],
+            _inv_bounded_coupling(params["coupling_strength"]).ravel(),
+            params["phase_diff"].ravel(),
+        ])
+
+    def unpack_constrained(flat: jax.Array) -> dict:
+        """Map unconstrained coordinates to physical params."""
         idx = 0
-        damping = flat[idx : idx + n_osc]
+        damping = _sigmoid(flat[idx : idx + n_osc])
         idx += n_osc
         freq = flat[idx : idx + n_osc]
         idx += n_osc
-        coupling = flat[idx : idx + n_osc * n_osc].reshape(n_osc, n_osc)
+        coupling = _bounded_coupling(
+            flat[idx : idx + n_osc * n_osc].reshape(n_osc, n_osc)
+        )
         idx += n_osc * n_osc
         phase = flat[idx : idx + n_osc * n_osc].reshape(n_osc, n_osc)
         return {
@@ -2123,7 +2148,7 @@ def optimize_dim_transition_params(
         }
 
     def loss(flat_params: jax.Array) -> jax.Array:
-        params = unpack_params(flat_params)
+        params = unpack_constrained(flat_params)
         return compute_transition_q_from_params(
             damping=params["damping"],
             freq=params["freq"],
@@ -2134,8 +2159,23 @@ def optimize_dim_transition_params(
             beta=beta,
         )
 
-    # Run optimizer
-    init_flat = pack_params(init_params)
+    # Run optimizer in unconstrained space
+    init_flat = pack_unconstrained(init_params)
     result = minimize(loss, init_flat, method="BFGS", tol=tol)
 
-    return unpack_params(result.x)
+    opt_params = unpack_constrained(result.x)
+
+    # Post-check: verify spectral radius of resulting A matrix
+    A_opt = construct_directed_influence_transition_matrix(
+        freqs=opt_params["freq"],
+        damping_coeffs=opt_params["damping"],
+        coupling_strengths=opt_params["coupling_strength"],
+        phase_diffs=opt_params["phase_diff"],
+        sampling_freq=sampling_freq,
+    )
+    spectral_radius = jnp.max(jnp.abs(jnp.linalg.eigvals(A_opt)))
+    # If still unstable (shouldn't happen with bounded params), scale down
+    safe_scale = jnp.where(spectral_radius > 0.99, 0.99 / spectral_radius, 1.0)
+    opt_params["damping"] = opt_params["damping"] * safe_scale
+
+    return opt_params

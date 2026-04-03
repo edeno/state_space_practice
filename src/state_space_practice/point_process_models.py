@@ -862,7 +862,11 @@ class BaseSwitchingPointProcessModel(ABC):
             self.smoother_next_pair_cond_means = None
             self._m_step_spikes(spikes)
 
+        import copy
+
         log_likelihoods: list[float] = []
+        best_ll = -float("inf")
+        best_params: dict | None = None
 
         for iteration in range(max_iter):
             marginal_ll = self._e_step(spikes)
@@ -873,6 +877,20 @@ class BaseSwitchingPointProcessModel(ABC):
                     f"Non-finite log-likelihood at iteration {iteration}: "
                     f"{marginal_ll}. This may indicate numerical instability."
                 )
+
+            # Track best parameters seen (approximate EM can decrease LL)
+            if log_likelihoods[-1] > best_ll:
+                best_ll = log_likelihoods[-1]
+                best_params = {
+                    "init_mean": self.init_mean,
+                    "init_cov": self.init_cov,
+                    "init_discrete_state_prob": self.init_discrete_state_prob,
+                    "discrete_transition_matrix": self.discrete_transition_matrix,
+                    "continuous_transition_matrix": self.continuous_transition_matrix,
+                    "process_cov": self.process_cov,
+                    "spike_params": copy.deepcopy(self.spike_params),
+                    "smoother_discrete_state_prob": self.smoother_discrete_state_prob,
+                }
 
             if iteration > 0:
                 is_converged, is_increasing = check_converged(
@@ -898,6 +916,15 @@ class BaseSwitchingPointProcessModel(ABC):
                 f"Iteration {iteration + 1}/{max_iter}\t"
                 f"Log-Likelihood: {log_likelihoods[-1]:.4f}"
             )
+
+        # Restore best parameters if LL decreased at any point
+        if best_params is not None and log_likelihoods[-1] < best_ll:
+            logger.info(
+                f"Restoring best params from LL={best_ll:.4f} "
+                f"(final was {log_likelihoods[-1]:.4f})"
+            )
+            for attr, value in best_params.items():
+                setattr(self, attr, value)
 
         if len(log_likelihoods) == max_iter:
             logger.warning("Reached maximum iterations without converging.")
