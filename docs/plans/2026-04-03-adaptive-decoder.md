@@ -1,12 +1,53 @@
 # Adaptive Position Decoder with Drifting Tuning Curves Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
+>
+> **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.
 
 **Goal:** Build a decoder that simultaneously tracks the animal's position AND the evolution of each neuron's place field, so that decoding remains accurate across hours or days without retraining. When position tracking is available, the model calibrates; when tracking drops out, decoding continues using the self-maintained tuning curves.
 
 **Architecture:** A factored state-space model with two interleaved components: (1) a position decoder (4-dim state: x, y, vx, vy) and (2) per-neuron place field trackers (n_basis-dim weights per neuron). At each time step, the algorithm alternates: decode position given current weight estimates, then update weights given decoded position. When external position is available (e.g., from video tracking), it enters as an additional observation on the position state, anchoring the estimates. The factored structure keeps computation tractable — the position filter is 4-dim regardless of neuron count, and weight updates are independent across neurons.
 
 **Tech Stack:** JAX, existing `_point_process_laplace_update`, `build_2d_spline_basis`/`evaluate_basis` from `place_field_model.py`, `build_position_dynamics` from `position_decoder.py` (Task 1 of position decoding plan).
+
+**Prerequisite Gates:**
+
+- This plan depends on checked-in position-decoder functionality, including `build_position_dynamics` and any decoder-side helper APIs introduced by the position-decoding plan.
+- Verify that `place_field_model.py` and any required basis-evaluation utilities exist and match the assumptions in this document before implementation.
+- If the position-decoding plan is only partially implemented, stop and complete the missing decoder prerequisites before starting this plan.
+
+**Verification Gates:**
+
+- Targeted tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_adaptive_decoder.py -v`
+- Neighbor regression tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_position_decoder.py src/state_space_practice/tests/test_place_field_model.py -v`
+- Lint after each completed task: `conda run -n state_space_practice ruff check src/state_space_practice`
+- Before declaring the plan complete, run the targeted tests plus the neighbor regression tests in the same environment and confirm the expected pass/fail transitions for each task.
+
+**Feasibility Status:** PARTIAL (depends on position-decoder completion)
+
+**Codebase Reality Check:**
+
+- Reusable pieces already exist: point-process Laplace updates and place-field basis machinery in `src/state_space_practice/point_process_kalman.py` and `src/state_space_practice/place_field_model.py`.
+- Planned new module is required: `src/state_space_practice/adaptive_decoder.py`.
+- This plan assumes production-ready decoder APIs from the position-decoding plan (`build_position_dynamics` and decoder-side helpers).
+
+**Claude Code Execution Notes:**
+
+- Hard stop before Task 1: run `conda run -n state_space_practice pytest src/state_space_practice/tests/test_position_decoder.py -v` and proceed only if fully passing.
+- Implement in two isolated gates: first position update from spikes, then per-neuron weight update; only then wire the alternating full loop.
+- Add a synthetic drift smoke check after integration: verify decode error remains bounded when place fields drift over time.
+
+**MVP Scope Lock (implement now):**
+
+- Implement semi-supervised mode only (position observations available for part of the session).
+- Keep drift covariance simple and fixed/diagonal in MVP.
+- Support a single alternating schedule without optional heuristics.
+
+**Defer Until Post-MVP:**
+
+- Fully unsupervised long-horizon adaptation as the primary mode.
+- Rich process-noise parameterizations and schedule tuning.
+- Aggressive online optimization variants.
 
 **References:**
 

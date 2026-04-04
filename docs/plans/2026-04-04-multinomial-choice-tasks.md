@@ -1,8 +1,50 @@
-# Multinomial Choice Model — Implementation Tasks
+# Multinomial Choice Learning Model Implementation Plan - Task Breakdown
 
-> **For Claude:** Implement these tasks sequentially. Each task has verification
-> steps — do NOT proceed to the next task until all verifications pass. Use the
-> `jax` skill for JAX best practices. Use `test-driven-development` skill.
+> **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
+>
+> **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.
+
+**Goal:** Implement the multinomial choice learning model described in `docs/plans/2026-04-04-multinomial-choice-model.md`, including the Laplace update, filter/smoother, EM wrapper, and diagnostics.
+
+**Architecture:** This task breakdown follows the companion design doc. The latent state uses the `K-1` reference-option parameterization, the observation model is categorical softmax, and inference uses analytic gradient/Hessian updates with a Laplace-EKF-style filter and RTS smoother.
+
+**Tech Stack:** JAX, existing `kalman.py` utilities, and existing `smith_learning_algorithm.py` API patterns.
+
+**Prerequisite Gates:**
+
+- Read and follow the companion design contract in `docs/plans/2026-04-04-multinomial-choice-model.md` before implementation.
+- Verify that `smith_learning_algorithm.py` and `kalman.py` expose the APIs referenced in this task breakdown before editing code.
+- If the codebase shape differs from this checklist, update the checklist first instead of guessing the missing API surface.
+
+**Verification Gates:**
+
+- Targeted tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_multinomial_choice.py -v`
+- Neighbor regression tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_smith_learning_algorithm.py src/state_space_practice/tests/test_kalman.py -v`
+- Lint after each completed task: `conda run -n state_space_practice ruff check src/state_space_practice`
+- Before declaring the plan complete, run the targeted tests plus the neighbor regression tests in the same environment and confirm the expected pass/fail transitions for each task.
+
+**Feasibility Status:** READY
+
+**Codebase Reality Check:**
+
+- The task sequence is feasible with current foundations in `src/state_space_practice/kalman.py` and `src/state_space_practice/smith_learning_algorithm.py`.
+- Planned new implementation/test files remain required: `src/state_space_practice/multinomial_choice.py` and `src/state_space_practice/tests/test_multinomial_choice.py`.
+
+**Claude Code Execution Notes:**
+
+- Execute this file as the canonical runbook; do not reorder tasks unless a gate fails.
+- Add a mandatory stop/go check between Task 1 and Task 2: ensure the standalone softmax observation update tests pass before wiring filter/smoother.
+- Keep the EM wrapper step isolated from plotting/diagnostics so numerical issues can be debugged before API polish.
+
+**MVP Scope Lock (implement now):**
+
+- Complete only the core pipeline: softmax update, filter/smoother, EM fit, and one minimal diagnostics path.
+- Keep simulations and plotting minimal and tied directly to required acceptance tests.
+
+**Defer Until Post-MVP:**
+
+- Extended visualization tooling and rich reporting helpers.
+- Optional alternative optimizers or advanced fitting modes.
 
 **Design doc:** `docs/plans/2026-04-04-multinomial-choice-model.md`
 

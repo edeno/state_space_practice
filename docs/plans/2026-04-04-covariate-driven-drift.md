@@ -1,12 +1,51 @@
 # Covariate-Driven Place Field Drift Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
+>
+> **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.
 
 **Goal:** Extend `PlaceFieldModel` so that place field drift rate and direction are modulated by observable covariates — reward, errors, running speed, context, time. This directly tests what causes representational drift and remapping.
 
 **Architecture:** The standard random-walk model `θ_t = θ_{t-1} + noise` becomes `θ_t = θ_{t-1} + B @ (covariates_t ⊗ Z(p_t)) + noise(Q(context_t))`. Two extensions: (1) **input-driven drift** where reward, errors, etc. push the weights in a specific direction via learned coefficients B, and (2) **context-modulated noise** where the drift rate Q depends on behavioral context via learned log-linear coefficients. Both B and Q parameters are learned via EM alongside the existing place field inference.
 
 **Tech Stack:** JAX, existing `PlaceFieldModel`, `stochastic_point_process_smoother`, `build_2d_spline_basis`.
+
+**Prerequisite Gates:**
+
+- Verify that `PlaceFieldModel` and the existing point-process smoother expose the state trajectories and basis values needed by this plan.
+- Keep the input-driven drift layer and the context-modulated noise layer as separate gates; do not start the full EM wrapper until each extension passes standalone tests.
+- If covariate alignment with time bins is underspecified in code, stop and add a validated preprocessing step before implementing model updates.
+
+**Verification Gates:**
+
+- Targeted tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_covariate_drift.py -v`
+- Neighbor regression tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_place_field_model.py src/state_space_practice/tests/test_point_process_kalman.py -v`
+- Lint after each completed task: `conda run -n state_space_practice ruff check src/state_space_practice`
+- Before declaring the plan complete, run the targeted tests plus the neighbor regression tests in the same environment and confirm the expected pass/fail transitions for each task.
+
+**Feasibility Status:** PARTIAL
+
+**Codebase Reality Check:**
+
+- Reusable components exist: place-field inference and spline basis utilities in `src/state_space_practice/place_field_model.py` plus point-process smoothing in `src/state_space_practice/point_process_kalman.py`.
+- Planned new module is required: `src/state_space_practice/covariate_drift.py`.
+
+**Claude Code Execution Notes:**
+
+- Treat this as two independent gates: input-driven drift (`B` terms) first, context-modulated noise (`Q(context)`) second.
+- Add a strict covariate/time-bin alignment check before any model updates; this is the most common failure mode in this class of model.
+- Require synthetic directional-effect smoke tests (reward/error covariates produce expected drift-direction changes) before integrating into a full EM wrapper.
+
+**MVP Scope Lock (implement now):**
+
+- Implement input-driven drift coefficients with a small fixed covariate set (for example: reward and speed only).
+- Keep process noise context-independent in MVP (single Q).
+- Provide one API path for covariate-aligned preprocessing and model fitting.
+
+**Defer Until Post-MVP:**
+
+- Context-modulated noise models (`Q(context)`) and Gamma-style variance regression.
+- Broad covariate libraries and automated feature selection.
 
 **References:**
 

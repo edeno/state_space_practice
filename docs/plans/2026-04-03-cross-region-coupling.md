@@ -1,12 +1,52 @@
 # Cross-Region Oscillator Coupling with Subpopulation Discovery Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
+>
+> **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.
 
 **Goal:** Build a model that discovers directed oscillatory coupling between brain regions (e.g., PFC-HPC) and identifies which neurons form the communication subpopulations, all from spike data alone.
 
 **Architecture:** Extends the existing `DirectedInfluenceModel` to a multi-region setting. The latent state is a concatenation of per-region oscillator states. The transition matrix has block structure: diagonal blocks are within-region dynamics, off-diagonal blocks are cross-region coupling that switches with discrete state. Spike observations have per-neuron loading weights onto all regions' oscillators — neurons with large cross-region weights are the "relay" cells. A mixture prior on the weights encourages sparse subpopulation structure.
 
 **Tech Stack:** JAX, existing `switching_point_process_filter`, `switching_kalman_smoother`, `construct_directed_influence_transition_matrix`, `update_spike_glm_params`, `SpikeObsParams`.
+
+**Prerequisite Gates:**
+
+- Verify that the current repository contains the switching point-process, oscillator utility, and point-process model infrastructure referenced here before implementation.
+- Treat the mixture prior and multi-region coupling extensions as separate gating layers: do not start the mixture-model work until the multi-region dynamics and observation model are passing their own tests.
+- If any step requires new abstractions for region labels or cross-region blocks, land those abstractions in isolation and validate them before attempting the full model class.
+
+**Verification Gates:**
+
+- Targeted tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_multi_region_oscillator.py src/state_space_practice/tests/test_multi_region_spike_obs.py src/state_space_practice/tests/test_subpopulation_mixture.py src/state_space_practice/tests/test_multi_region_model.py -v`
+- Neighbor regression tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_oscillator_utils.py src/state_space_practice/tests/test_switching_point_process.py src/state_space_practice/tests/test_point_process_models.py -v`
+- Lint after each completed task: `conda run -n state_space_practice ruff check src/state_space_practice`
+- Before declaring the plan complete, run the targeted tests plus the neighbor regression tests in the same environment and confirm the expected pass/fail transitions for each task.
+
+**Feasibility Status:** SPECULATIVE (new multi-region abstractions required)
+
+**Codebase Reality Check:**
+
+- Reusable pieces exist: oscillator matrix construction in `src/state_space_practice/oscillator_utils.py`, switching point-process routines in `src/state_space_practice/switching_point_process.py`, and point-process model primitives.
+- Planned new modules are required for execution: `src/state_space_practice/multi_region_spike_obs.py`, `src/state_space_practice/subpopulation_mixture.py`, and `src/state_space_practice/multi_region_model.py`.
+
+**Claude Code Execution Notes:**
+
+- Build in strict layers: (1) multi-region transition/measurement block construction, (2) multi-region spike observation update, (3) mixture/subpopulation prior, (4) full model integration.
+- Do not combine mixture modeling with unfinished dynamics code in the same task; each layer should have passing targeted tests before moving on.
+- Add a finite-difference Jacobian check for the multi-region spike observation updates before full EM integration.
+
+**MVP Scope Lock (implement now):**
+
+- Start with exactly two regions and one oscillator per region.
+- Implement cross-region coupling inference without subpopulation mixture priors.
+- Validate directionality recovery on synthetic two-region data before any clustering extensions.
+
+**Defer Until Post-MVP:**
+
+- Mixture/subpopulation discovery priors.
+- More than two regions and higher-dimensional coupling hierarchies.
+- Full model-selection and rich clustering diagnostics.
 
 **References:**
 

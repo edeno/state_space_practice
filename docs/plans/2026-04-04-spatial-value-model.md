@@ -1,12 +1,53 @@
 # Spatial-Value Population Model Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
+>
+> **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.
 
 **Goal:** Build a model that jointly infers spatial tuning and value representations from a population of neurons that mix both signals, discovering which neurons encode space, value, or both, and tracking how each component drifts over time.
 
 **Architecture:** The latent state has two parts: (1) value features `v_t ∈ R^K` representing the animal's valuation of K options, inferred from choices and spikes, and (2) per-neuron spatial weights `w_{n,t}` on a 2D spline basis, inferred from spikes and known position. Each neuron's firing rate is a GLM combining both: `log(λ_n) = baseline_n + α_n^{space} @ Z(p_t) + α_n^{value} @ v_t`. The model alternates between inferring values (given spatial weights) and updating spatial weights (given values), with choices providing an additional observation on the value state.
 
 **Tech Stack:** JAX, existing `PlaceFieldModel` infrastructure (spline basis, Laplace-EKF), `multinomial_choice` (softmax update), `build_2d_spline_basis`/`evaluate_basis`.
+
+**Prerequisite Gates:**
+
+- This plan depends on checked-in multinomial choice functionality, including `softmax_observation_update` and the choice filter/smoother APIs from the companion multinomial choice plan.
+- Verify that `PlaceFieldModel` and basis-evaluation helpers exist and match the assumptions here before implementing mixed spatial-value updates.
+- Treat the value-state layer and spatial-weight layer as separate gates; do not start the full `SpatialValueModel` wrapper until each standalone component passes its own tests.
+
+**Verification Gates:**
+
+- Targeted tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_spatial_value_model.py -v`
+- Neighbor regression tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_place_field_model.py src/state_space_practice/tests/test_multinomial_choice.py -v`
+- Lint after each completed task: `conda run -n state_space_practice ruff check src/state_space_practice`
+- Before declaring the plan complete, run the targeted tests plus the neighbor regression tests in the same environment and confirm the expected pass/fail transitions for each task.
+
+**Feasibility Status:** PARTIAL (depends on multinomial-choice completion)
+
+**Codebase Reality Check:**
+
+- Reusable components exist in `src/state_space_practice/place_field_model.py` and point-process infrastructure.
+- This plan depends on a completed multinomial choice module (`softmax_observation_update` and choice filter/smoother APIs).
+- Planned new module is required: `src/state_space_practice/spatial_value_model.py`.
+
+**Claude Code Execution Notes:**
+
+- Hard stop before Task 1: run `conda run -n state_space_practice pytest src/state_space_practice/tests/test_multinomial_choice.py -v` and proceed only when passing.
+- Build with isolated value-only and spatial-only gates before attempting joint inference.
+- Add memory-aware smoke tests early (moderate neuron count and basis size) to catch state-size blowups before full dataset runs.
+
+**MVP Scope Lock (implement now):**
+
+- Implement a fixed small-option value state and a reduced neuron subset path for joint validation.
+- Support one joint-inference schedule (value update then spatial update) without extra alternation heuristics.
+- Require two isolated baseline checks: value-only and spatial-only behavior must match their standalone models.
+
+**Defer Until Post-MVP:**
+
+- Full-population scaling and advanced memory optimizations.
+- Rich mixed-selectivity clustering and interpretability tooling.
+- Multiple inference schedules and adaptive alternation policies.
 
 **References:**
 

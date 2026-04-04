@@ -1,12 +1,51 @@
 # Cross-Session Representational Drift Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
+>
+> **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.
 
 **Goal:** Build a two-level hierarchical model that links within-session place field estimates to between-session drift dynamics, enabling inference of how place fields evolve across days — including during unobserved intervals (sleep, off-task periods).
 
 **Architecture:** Level 1 (within-session): fit `PlaceFieldModel` independently per session to get smoothed weights and their uncertainty. Level 2 (across-session): treat the per-session weight estimates as noisy observations of a slowly drifting latent representation, and run a standard Kalman smoother across sessions. The between-session process noise scales with the inter-session time interval. An optional population extension uses low-rank structure to distinguish coherent drift from independent noise.
 
 **Tech Stack:** JAX, existing `PlaceFieldModel`, `kalman_filter`/`kalman_smoother` from `kalman.py`, numpy for the session-level bookkeeping.
+
+**Prerequisite Gates:**
+
+- Verify that `PlaceFieldModel` exposes the fitted state summaries assumed in this plan, including smoothed means and covariances.
+- Confirm that `kalman.py` contains the filtering and smoothing utilities needed for the session-level model before starting cross-session code.
+- If the within-session summaries are not available in the required form, stop and add that extraction layer first before implementing the cross-session model.
+
+**Verification Gates:**
+
+- Targeted tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_cross_session_drift.py -v`
+- Neighbor regression tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_place_field_model.py src/state_space_practice/tests/test_kalman.py -v`
+- Lint after each completed task: `conda run -n state_space_practice ruff check src/state_space_practice`
+- Before declaring the plan complete, run the targeted tests plus the neighbor regression tests in the same environment and confirm the expected pass/fail transitions for each task.
+
+**Feasibility Status:** READY
+
+**Codebase Reality Check:**
+
+- Reusable components already exist: `PlaceFieldModel` in `src/state_space_practice/place_field_model.py` and Kalman filter/smoother routines in `src/state_space_practice/kalman.py`.
+- Planned new module is required: `src/state_space_practice/cross_session_drift.py`.
+
+**Claude Code Execution Notes:**
+
+- First gate should be API confirmation: verify fitted within-session summaries (means/covariances) can be extracted from `PlaceFieldModel` before coding cross-session dynamics.
+- Land session-summary extraction as an isolated first increment, with tests, before implementing between-session filtering/smoothing.
+- Include a synthetic multi-session smoke test (known drift rate and irregular session gaps) before adding optional low-rank population extensions.
+
+**MVP Scope Lock (implement now):**
+
+- Implement independent-neuron cross-session random-walk drift with time-gap scaling.
+- Provide one clean session-summary extractor and one cross-session fit API.
+- Require synthetic recovery and a minimal real-data run across a small session set.
+
+**Defer Until Post-MVP:**
+
+- Low-rank/shared-factor population drift models.
+- Joint fitting of within-session and cross-session levels in one loop.
 
 **References:**
 

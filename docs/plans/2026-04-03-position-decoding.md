@@ -1,12 +1,51 @@
 # Position Decoding from Spikes via Laplace-EKF Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
+>
+> **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.
 
 **Goal:** Build a model that decodes the animal's 2D position from population spiking activity using a point-process state-space model with Laplace-EKF, where the latent state is the animal's position and the observation model is the neurons' place-field tuning curves.
 
 **Architecture:** The latent state is `[x, y, vx, vy]` (position + velocity), evolving via constant-velocity dynamics. Spike observations from N neurons are Poisson with rates determined by each neuron's place field evaluated at the current position estimate. The place fields can be either pre-estimated (from a training period) or learned jointly via EM. The Laplace-EKF handles the nonlinear Poisson observation model. This is the natural inverse of `PlaceFieldModel` — encoding maps spikes → tuning, decoding maps tuning + spikes → position.
 
 **Tech Stack:** JAX, existing `_point_process_laplace_update` from `point_process_kalman.py`, existing `build_2d_spline_basis`/`evaluate_basis` from `place_field_model.py`, multi-neuron support already in the filter.
+
+**Prerequisite Gates:**
+
+- Verify that `point_process_kalman.py`, `place_field_model.py`, and the referenced helper symbols exist in the current repository before editing code.
+- Reconcile any mismatch between this plan and the checked-in APIs before implementation; do not guess missing helper behavior.
+- If a task requires a Jacobian or interpolation helper that is not present, add that support in the smallest validated step before continuing to downstream decoder tasks.
+
+**Verification Gates:**
+
+- Targeted tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_position_decoder.py -v`
+- Neighbor regression tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_place_field_model.py src/state_space_practice/tests/test_point_process_kalman.py -v`
+- Lint after each completed task: `conda run -n state_space_practice ruff check src/state_space_practice`
+- Before declaring the plan complete, run the targeted tests plus the neighbor regression tests in the same environment and confirm the expected pass/fail transitions for each task.
+
+**Feasibility Status:** READY
+
+**Codebase Reality Check:**
+
+- Reusable symbols already exist: `_point_process_laplace_update` in `src/state_space_practice/point_process_kalman.py`, spline basis helpers in `src/state_space_practice/place_field_model.py`, and Kalman utility primitives in `src/state_space_practice/kalman.py`.
+- Planned new module is still required: `src/state_space_practice/position_decoder.py`.
+
+**Claude Code Execution Notes:**
+
+- Start with the smallest independent slice: implement and test `build_position_dynamics` first, then layer observation updates.
+- Add a smoke script/notebook check immediately after Task 2: decode a synthetic 2D trajectory and require finite outputs plus bounded RMSE before moving to downstream tasks.
+- If Jacobian/interpolation helpers are missing during implementation, pause and land those helpers with focused tests before continuing decoder logic.
+
+**MVP Scope Lock (implement now):**
+
+- Implement only a fixed place-field decoder using precomputed place fields (no joint place-field learning in this plan).
+- Support a single stable API path first: position filter + smoother for 2D position and velocity.
+- Require one synthetic end-to-end decode benchmark and one lightweight real-data smoke run.
+
+**Defer Until Post-MVP:**
+
+- Alternative place-field parameterizations beyond the initial fixed representation.
+- Advanced decoder variants (multi-model or adaptive transitions).
 
 **References:**
 

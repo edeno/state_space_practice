@@ -1,12 +1,52 @@
 # Joint Learning + Representational Drift Model Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
+>
+> **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.
 
 **Goal:** Build a model that jointly infers brain state, behavioral learning, and place field drift — linking them through a shared switching discrete state so that learning rate and drift rate are both state-dependent.
 
 **Architecture:** A factored state-space model with three components sharing a discrete switching state: (1) a binomial learning model for behavioral performance (Smith-style), (2) per-neuron place field weight models (PlaceFieldModel-style), and (3) a discrete state that modulates the process noise of both. The E-step uses a structured variational approach: infer discrete states from all observations jointly, then run separate smoothers for learning state and spatial weights conditional on the discrete state. The M-step learns per-state process noise (learning rate and drift rate), spike parameters, and discrete transition probabilities.
 
 **Tech Stack:** JAX, patsy (spline basis), existing `smith_learning_filter`/`smith_learning_smoother`, `stochastic_point_process_smoother`, `switching_kalman_filter` infrastructure.
+
+**Prerequisite Gates:**
+
+- Verify that the current repository contains the Smith learning, place-field, and switching Kalman infrastructure referenced here before implementation.
+- Treat the plan as layered work: do not start the full joint model until the state-dependent learning and state-dependent place-field components each pass their standalone tests.
+- If the discrete-state emission factorization is ambiguous in code, stop and resolve that interface explicitly before wiring together the full variational loop.
+
+**Verification Gates:**
+
+- Targeted tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_state_dependent_learning.py src/state_space_practice/tests/test_joint_discrete_state.py src/state_space_practice/tests/test_state_dependent_drift.py src/state_space_practice/tests/test_joint_learning_drift_model.py -v`
+- Neighbor regression tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_smith_learning_algorithm.py src/state_space_practice/tests/test_place_field_model.py src/state_space_practice/tests/test_switching_kalman.py -v`
+- Lint after each completed task: `conda run -n state_space_practice ruff check src/state_space_practice`
+- Before declaring the plan complete, run the targeted tests plus the neighbor regression tests in the same environment and confirm the expected pass/fail transitions for each task.
+
+**Feasibility Status:** SPECULATIVE (high integration complexity)
+
+**Codebase Reality Check:**
+
+- Useful building blocks exist: Smith learning in `src/state_space_practice/smith_learning_algorithm.py`, point-process smoothing in `src/state_space_practice/point_process_kalman.py`, and switching infrastructure in `src/state_space_practice/switching_kalman.py`.
+- Planned new modules are required: `src/state_space_practice/state_dependent_learning.py`, `src/state_space_practice/joint_discrete_state.py`, and `src/state_space_practice/joint_learning_drift_model.py`.
+
+**Claude Code Execution Notes:**
+
+- Execute as gated prototypes, not as one end-to-end build: first implement state-dependent learning and prove single-state equivalence to the current Smith model.
+- Only after standalone state-dependent components pass should you wire the joint discrete-state inference layer.
+- Add a mandatory synthetic recovery checkpoint before full model packaging: two-state data with known state labels should be recovered at high accuracy before proceeding.
+
+**MVP Scope Lock (implement now):**
+
+- Build a two-state prototype with fixed transition matrix and fixed discrete-state count.
+- Start with one simplified spatial component (single neuron or small neuron subset) for joint-loop validation.
+- Require equivalence tests to baseline one-state models before any broader integration.
+
+**Defer Until Post-MVP:**
+
+- Full-population joint inference at scale.
+- Learning transition dynamics jointly with all other parameters.
+- Additional state counts and advanced variational refinements.
 
 **References:**
 

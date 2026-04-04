@@ -1,10 +1,51 @@
-# Multinomial Choice Learning Model — Design Document
+# Multinomial Choice Learning Model Implementation Plan
+
+> **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
+>
+> **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.
 
 **Goal:** Build a state-space model that tracks an animal's evolving valuation of multiple choice options in a multi-armed bandit task, where the latent state is a vector of option values that drift over time and choices are multinomial (softmax) observations.
 
 **Architecture:** The latent state is `x_t ∈ R^{K-1}` representing the animal's relative value for each of K-1 choice options (option 0 is the reference, fixed at 0 for identifiability). Values evolve via random walk. The observation is the animal's choice, modeled as `Categorical(softmax([0, x_t]))`. Inference uses the Laplace-EKF. EM learns the drift rate (process noise) and inverse temperature.
 
 **Tech Stack:** JAX, existing Laplace-EKF pattern from `smith_learning_algorithm.py`, `psd_solve`/`symmetrize`/`_kalman_smoother_update` from `kalman.py`.
+
+**Prerequisite Gates:**
+
+- Use this document as the design contract and the companion task breakdown in `docs/plans/2026-04-04-multinomial-choice-tasks.md` as the execution checklist.
+- Verify that `smith_learning_algorithm.py` and `kalman.py` contain the APIs referenced here before implementation.
+- If the companion task document and this design document disagree, resolve the discrepancy in the plan before writing code.
+
+**Verification Gates:**
+
+- Targeted tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_multinomial_choice.py -v`
+- Neighbor regression tests: `conda run -n state_space_practice pytest src/state_space_practice/tests/test_smith_learning_algorithm.py src/state_space_practice/tests/test_kalman.py -v`
+- Lint after each completed task: `conda run -n state_space_practice ruff check src/state_space_practice`
+- Before declaring the plan complete, run the targeted tests plus the neighbor regression tests in the same environment and confirm the expected pass/fail transitions for each task.
+
+**Feasibility Status:** READY
+
+**Codebase Reality Check:**
+
+- Reusable primitives exist: Laplace-EKF patterns in `src/state_space_practice/smith_learning_algorithm.py` and linear-algebra/smoother utilities in `src/state_space_practice/kalman.py`.
+- Planned new module is required: `src/state_space_practice/multinomial_choice.py`.
+
+**Claude Code Execution Notes:**
+
+- Use this file as the design contract and the companion task-breakdown plan as the execution sequence.
+- Add early equivalence gates: K=2 multinomial should agree with the existing Smith-style binary setting before broadening to K>2.
+- Keep the softmax update implementation analytically grounded (explicit gradient/Hessian) and add finite-check assertions around Newton updates.
+
+**MVP Scope Lock (implement now):**
+
+- Implement K=3 choices as the primary supported case first (general code can still accept K>2).
+- Use scalar process-noise parameterization (`Q = q * I`) and a single inverse-temperature parameter.
+- Require K=2 consistency to Smith-style behavior as the core acceptance gate.
+
+**Defer Until Post-MVP:**
+
+- Rich process-noise structures and hierarchical priors.
+- Multi-condition temperature schedules and context-dependent choice policies.
 
 **References:**
 
