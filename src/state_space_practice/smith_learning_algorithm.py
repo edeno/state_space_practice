@@ -194,9 +194,10 @@ def smith_learning_filter(
         The probability of a correct response by chance in absence of any
         learning or experience, used to set the bias.
         Chance probability ($p_{chance}$), defaults to 0.5.
-    max_possible_correct : float, optional
+    max_possible_correct : int, ArrayLike, or None, optional
         Maximum number of correct responses in each trial ($N_k$).
-        Defaults to max(n_correct_responses).
+        Can be a scalar int (applied to all trials) or an array of
+        per-trial values. Defaults to max(n_correct_responses).
 
     Returns
     -------
@@ -235,7 +236,6 @@ def smith_learning_filter(
     else:
         max_correct_arr = jnp.asarray(max_possible_correct)
 
-    @jax.jit
     def _step(
         carry: tuple[Array, Array], trial_data: tuple[Array, Array]
     ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array, Array]]:
@@ -335,11 +335,10 @@ def smith_learning_smoother(
     one_step_variance = jnp.asarray(one_step_variance)
     n_trials: int = len(filtered_learning_state_mode)
 
-    @jax.jit
     def _step(
         carry: tuple[Array, Array], k: int
     ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
-        """A single JIT-compiled step of the RTS smoother."""
+        """A single step of the RTS smoother."""
         mode_smoothed_next, variance_smoothed_next = carry
         smoother_gain = (
             filtered_learning_state_variance[k] / one_step_variance[k + 1]
@@ -361,7 +360,6 @@ def smith_learning_smoother(
         filtered_learning_state_mode[-1],
         filtered_learning_state_variance[-1],
     )
-    n_trials = len(filtered_learning_state_mode)
     _, output = jax.lax.scan(
         _step,
         init_params,
@@ -1448,7 +1446,9 @@ class SmithLearningAlgorithm:
         Parameters
         ----------
         n_correct_responses : ArrayLike, shape (n_trials,)
-            The sequence of responses.
+            Number of correct responses at each trial. For binary
+            (hit/miss) data, these are 0s and 1s. For multi-choice data,
+            values range from 0 to ``max_possible_correct``.
         max_iter : int, optional
             Maximum number of EM iterations, by default 100.
         tolerance : float, optional
@@ -1464,9 +1464,13 @@ class SmithLearningAlgorithm:
             E-step that ensures stored results match the MLE parameters.
         """
         n_correct_responses = jnp.asarray(n_correct_responses)
-        if n_correct_responses.ndim != 1 or len(n_correct_responses) < 2:
+        if n_correct_responses.ndim != 1:
             raise ValueError(
-                "n_correct_responses must be a 1D array with at least 2 trials."
+                f"n_correct_responses must be a 1D array, got shape {n_correct_responses.shape}."
+            )
+        if len(n_correct_responses) < 2:
+            raise ValueError(
+                f"n_correct_responses must have at least 2 trials, got {len(n_correct_responses)}."
             )
 
         log_likelihoods: list[float] = []
@@ -1494,7 +1498,10 @@ class SmithLearningAlgorithm:
                 self._m_step(n_correct_responses)
                 final_ll = self._e_step(n_correct_responses)
                 log_likelihoods.append(final_ll)
-                msg = f"Converged after {iteration + 1} iterations."
+                msg = (
+                    f"Converged after {iteration + 1} iterations. "
+                    f"sigma_epsilon={self.sigma_epsilon:.4g}"
+                )
                 logger.info(msg)
                 if verbose:
                     print(msg)
@@ -1721,12 +1728,13 @@ class SmithLearningAlgorithm:
 
         Raises
         ------
-        RuntimeError
-            If `prob_correct_by_chance` is None and the model has not been fitted.
-        TypeError
-            If `observed_binary_responses` is not a JAX or NumPy array.
         ValueError
             If `observed_binary_responses` is not 1D.
+
+        Notes
+        -----
+        When ``prob_correct_by_chance`` is None, uses ``self.prob_correct_by_chance``
+        which is set at construction time (no fitting required).
         """
         observed_binary_responses = jnp.asarray(observed_binary_responses)
         if observed_binary_responses.ndim != 1:
@@ -1765,9 +1773,8 @@ class SmithLearningAlgorithm:
         # Find all runs of successes (value 1) of length >= j_crit
         # Use the helper function _find_runs_of_value
         # Ensure observed_binary_responses is a JAX array for the helper
-        observed_binary_responses_jnp = jnp.asarray(observed_binary_responses)
         significant_runs = _find_runs_of_value(
-            data=observed_binary_responses_jnp,
+            data=observed_binary_responses,
             value_to_find=1,  # Assuming 1 represents success
             min_length=j_crit,
         )
@@ -1988,6 +1995,14 @@ class SmithLearningAlgorithm:
             if title is None:
                 title = "Learning Curve (Probability Correct)"
             ax.set_ylim((0, 1.05))  # Give a little space above 1.0
+            # Draw chance-level reference line
+            ax.axhline(
+                self.prob_correct_by_chance,
+                color="gray",
+                linestyle="--",
+                linewidth=1,
+                label=f"Chance ({self.prob_correct_by_chance:.2g})",
+            )
         elif plot_type == "latent_state":
             state_percentiles = self.get_latent_state_percentiles(
                 key=key, n_samples=n_samples, percentiles=plot_percentiles
@@ -2167,7 +2182,7 @@ class SmithLearningAlgorithm:
         key: Array,
         n_samples: int = 10000,
         compare_probability: bool = False,
-    ) -> jnp.ndarray:
+    ) -> Array:
         """Compute pairwise comparison matrix for all trials.
 
         For all pairs of trials i < j, computes P(x_i > x_j | y_{1:T}).

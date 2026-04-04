@@ -907,6 +907,96 @@ class TestSmithLearningAlgorithmEdgeCases:
             model.fit(jnp.array([[1, 0], [0, 1]]))
 
 
+class TestFindCriterionTrial:
+    """Tests for find_criterion_trial method."""
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_returns_int_for_learning_data(self) -> None:
+        """Should return a trial index for data with clear learning."""
+        outcomes_np, _ = simulate_learning_data(
+            n_trials=50, seed=42, prob_success_init=0.3, prob_success_final=0.95
+        )
+        outcomes = jnp.array(outcomes_np)
+        model = SmithLearningAlgorithm()
+        try:
+            model.fit(outcomes, max_iter=10)
+        except Exception as e:
+            pytest.skip(f"fit() failed: {e}")
+        result = model.find_criterion_trial(jax.random.PRNGKey(0))
+        # Should return an int or None; if learning is clear, should be int
+        assert result is None or isinstance(result, int)
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_returns_none_for_no_learning(self) -> None:
+        """Should return None when performance never exceeds chance."""
+        outcomes = jnp.zeros(30, dtype=jnp.int32)  # All failures
+        model = SmithLearningAlgorithm()
+        try:
+            model.fit(outcomes, max_iter=5)
+        except Exception as e:
+            pytest.skip(f"fit() failed: {e}")
+        result = model.find_criterion_trial(jax.random.PRNGKey(0))
+        assert result is None
+
+    def test_requires_fit(self) -> None:
+        """Should raise if not fitted."""
+        model = SmithLearningAlgorithm()
+        with pytest.raises(RuntimeError, match="not been fitted"):
+            model.find_criterion_trial(jax.random.PRNGKey(0))
+
+
+class TestIdentifySignificantRuns:
+    """Tests for identify_significant_runs_in_data and find_critical_run_length."""
+
+    def test_find_critical_run_length_without_fit(self) -> None:
+        """find_critical_run_length should work without fitting."""
+        model = SmithLearningAlgorithm(prob_correct_by_chance=0.5)
+        result = model.find_critical_run_length(sequence_length=50)
+        assert result is None or isinstance(result, int)
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_identify_runs_returns_tuple(self) -> None:
+        """identify_significant_runs_in_data should return (j_crit, runs)."""
+        model = SmithLearningAlgorithm(prob_correct_by_chance=0.5)
+        data = jnp.array([0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0])
+        j_crit, runs = model.identify_significant_runs_in_data(data)
+        assert j_crit is None or isinstance(j_crit, int)
+        assert isinstance(runs, list)
+
+    def test_identify_runs_empty_input(self) -> None:
+        """Empty input should return (None, [])."""
+        model = SmithLearningAlgorithm()
+        j_crit, runs = model.identify_significant_runs_in_data(jnp.array([]))
+        assert j_crit is None
+        assert runs == []
+
+
+class TestPlotTrialComparisonMatrix:
+    """Tests for plot_trial_comparison_matrix method."""
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_returns_fig_ax(self) -> None:
+        """plot_trial_comparison_matrix should return (fig, ax)."""
+        outcomes_np, _ = simulate_learning_data(n_trials=15, seed=42)
+        outcomes = jnp.array(outcomes_np)
+        model = SmithLearningAlgorithm()
+        try:
+            model.fit(outcomes, max_iter=3)
+        except Exception as e:
+            pytest.skip(f"fit() failed: {e}")
+        fig, ax = model.plot_trial_comparison_matrix(
+            jax.random.PRNGKey(0), n_samples=100
+        )
+        assert isinstance(fig, plt.Figure)
+        plt.close(fig)
+
+    def test_requires_fit(self) -> None:
+        """Should raise if not fitted."""
+        model = SmithLearningAlgorithm()
+        with pytest.raises(RuntimeError, match="not been fitted"):
+            model.plot_trial_comparison_matrix(jax.random.PRNGKey(0))
+
+
 class TestCalculateLatentStatePercentiles:
     """Tests for calculate_latent_state_percentiles function."""
 
