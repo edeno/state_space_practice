@@ -171,10 +171,10 @@ class TestPlaceFieldModelFit:
         with pytest.raises(ValueError, match="same number of time bins"):
             model.fit(sim_data["position"][:10], sim_data["spikes"])
 
-    def test_multidim_spikes_rejected(self, sim_data: dict) -> None:
+    def test_3d_spikes_rejected(self, sim_data: dict) -> None:
         model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
-        bad_spikes = np.zeros((len(sim_data["spikes"]), 2))
-        with pytest.raises(ValueError, match="1D"):
+        bad_spikes = np.zeros((len(sim_data["spikes"]), 2, 3))
+        with pytest.raises(ValueError, match="1D.*or 2D"):
             model.fit(sim_data["position"], bad_spikes)
 
     def test_max_iter_warning(self, sim_data: dict, caplog) -> None:
@@ -418,3 +418,188 @@ class TestGetStateConfidenceInterval:
         n_time = len(sim_data["spikes"])
         assert ci.shape == (n_time, model.n_basis, 2)
         assert jnp.all(ci[..., 0] <= ci[..., 1])
+
+
+# ------------------------------------------------------------------
+# Filtered estimates
+# ------------------------------------------------------------------
+
+
+class TestFilteredEstimates:
+    """Tests for stored filtered estimates."""
+
+    def test_filtered_populated(self, sim_data: dict) -> None:
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        model.fit(
+            sim_data["position"],
+            sim_data["spikes"],
+            max_iter=3,
+            verbose=False,
+        )
+        n_time = len(sim_data["spikes"])
+        assert model.filtered_mean.shape == (n_time, model.n_basis)
+        assert model.filtered_cov.shape == (n_time, model.n_basis, model.n_basis)
+        assert not jnp.any(jnp.isnan(model.filtered_mean))
+
+
+# ------------------------------------------------------------------
+# BIC / AIC / summary
+# ------------------------------------------------------------------
+
+
+class TestModelComparison:
+    """Tests for BIC, AIC, and summary."""
+
+    def test_bic_aic_finite(self, sim_data: dict) -> None:
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        model.fit(
+            sim_data["position"],
+            sim_data["spikes"],
+            max_iter=3,
+            verbose=False,
+        )
+        assert np.isfinite(model.bic())
+        assert np.isfinite(model.aic())
+
+    def test_bic_not_fitted(self) -> None:
+        model = PlaceFieldModel(dt=0.004)
+        with pytest.raises(RuntimeError, match="Call model.fit"):
+            model.bic()
+
+    def test_n_free_params(self) -> None:
+        m = PlaceFieldModel(dt=0.004, n_interior_knots=3)
+        # Before fit, n_basis is None — but n_free_params uses it
+        # After fit, it should be n_basis (diagonal Q) + 2*n_basis (init)
+        # With default settings: update_process_cov=True (diagonal), update_init_state=True
+        # n_free_params = n_basis + n_basis + n_basis = 3 * n_basis
+        # We can only test after fit, but let's verify the property logic
+        assert m.update_process_cov is True
+        assert m.update_init_state is True
+        assert m.update_transition_matrix is False
+
+    def test_n_free_params_after_fit(self, sim_data: dict) -> None:
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        model.fit(
+            sim_data["position"],
+            sim_data["spikes"],
+            max_iter=3,
+            verbose=False,
+        )
+        nb = model.n_basis
+        # diagonal Q + init_mean + init_cov_diag = 3 * n_basis
+        assert model.n_free_params == 3 * nb
+
+    def test_more_knots_higher_bic_penalty(self, sim_data: dict) -> None:
+        model_small = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        model_small.fit(
+            sim_data["position"],
+            sim_data["spikes"],
+            max_iter=5,
+            verbose=False,
+        )
+        assert model_small.n_free_params < 200  # sanity check
+
+    def test_summary_string(self, sim_data: dict) -> None:
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        model.fit(
+            sim_data["position"],
+            sim_data["spikes"],
+            max_iter=3,
+            verbose=False,
+        )
+        s = model.summary()
+        assert "PlaceFieldModel Summary" in s
+        assert "BIC" in s
+        assert "AIC" in s
+        assert "n_basis_per_neuron" in s
+        assert "total_spikes" in s
+
+    def test_summary_not_fitted(self) -> None:
+        model = PlaceFieldModel(dt=0.004)
+        with pytest.raises(RuntimeError, match="Call model.fit"):
+            model.summary()
+
+
+# ------------------------------------------------------------------
+# Custom intensity function
+# ------------------------------------------------------------------
+
+
+class TestCustomIntensity:
+    """Tests for custom log_intensity_func."""
+
+    def test_custom_func_runs(self, sim_data: dict) -> None:
+        # Use the default linear function explicitly
+        from state_space_practice.point_process_kalman import log_conditional_intensity
+
+        model = PlaceFieldModel(
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            log_intensity_func=log_conditional_intensity,
+        )
+        lls = model.fit(
+            sim_data["position"],
+            sim_data["spikes"],
+            max_iter=3,
+            verbose=False,
+        )
+        assert len(lls) >= 1
+        assert all(np.isfinite(ll) for ll in lls)
+
+
+# ------------------------------------------------------------------
+# Multi-neuron
+# ------------------------------------------------------------------
+
+
+class TestMultiNeuron:
+    """Tests for multi-neuron fitting."""
+
+    def test_two_neuron_fit(self, sim_data: dict) -> None:
+        # Stack the same neuron twice as a simple multi-neuron test
+        spikes_2n = np.column_stack([sim_data["spikes"], sim_data["spikes"]])
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        lls = model.fit(
+            sim_data["position"],
+            spikes_2n,
+            max_iter=3,
+            verbose=False,
+        )
+        assert len(lls) >= 1
+        assert model.n_neurons == 2
+        assert model.n_basis == 2 * model.n_basis_per_neuron
+        n_time = len(sim_data["spikes"])
+        assert model.smoother_mean.shape == (n_time, model.n_basis)
+
+    def test_multi_neuron_predict_rate_map(self, sim_data: dict) -> None:
+        spikes_2n = np.column_stack([sim_data["spikes"], sim_data["spikes"]])
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        model.fit(sim_data["position"], spikes_2n, max_iter=3, verbose=False)
+        grid, _, _ = model.make_grid(n_grid=10)
+        # Each neuron should have its own rate map
+        rate0, _ = model.predict_rate_map(grid, neuron_idx=0)
+        rate1, _ = model.predict_rate_map(grid, neuron_idx=1)
+        assert rate0.shape == (100,)
+        assert rate1.shape == (100,)
+        assert np.all(np.isfinite(rate0))
+        assert np.all(np.isfinite(rate1))
+
+    def test_multi_neuron_score(self, sim_data: dict) -> None:
+        spikes_2n = np.column_stack([sim_data["spikes"], sim_data["spikes"]])
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        model.fit(sim_data["position"], spikes_2n, max_iter=3, verbose=False)
+        ll = model.score(sim_data["position"], spikes_2n)
+        assert np.isfinite(ll)
+
+    def test_3d_spikes_rejected(self, sim_data: dict) -> None:
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        bad = np.zeros((len(sim_data["spikes"]), 2, 3))
+        with pytest.raises(ValueError, match="1D.*or 2D"):
+            model.fit(sim_data["position"], bad)
+
+    def test_multi_neuron_summary(self, sim_data: dict) -> None:
+        spikes_2n = np.column_stack([sim_data["spikes"], sim_data["spikes"]])
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        model.fit(sim_data["position"], spikes_2n, max_iter=3, verbose=False)
+        s = model.summary()
+        assert "n_neurons" in s

@@ -33,7 +33,7 @@ References
 """
 
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 import jax
 import jax.numpy as jnp
@@ -180,6 +180,10 @@ class PlaceFieldModel:
 
     where Z_t is the spline basis evaluated at the animal's position at time t.
 
+    Supports multiple neurons sharing a common spatial basis: each neuron
+    has its own set of weights, concatenated into a single state vector.
+    Pass spikes as ``(n_time, n_neurons)`` to enable multi-neuron mode.
+
     Parameters are estimated via EM: the E-step uses a Laplace-EKF
     filter/smoother, and the M-step updates the process noise covariance Q
     and initial conditions.
@@ -205,6 +209,12 @@ class PlaceFieldModel:
         Scale for the initial state covariance (init_cov = I * init_cov_scale).
         Controls how uncertain the initial weight estimates are. Larger values
         allow faster initial adaptation but may cause instability.
+    log_intensity_func : callable or None, default=None
+        Custom log-intensity function with signature
+        ``(design_matrix, params) -> log_rate``. If None, uses the default
+        linear function ``log(lambda) = Z @ x``. For nonlinear functions,
+        ``predict_rate_map`` uses the time-averaged weights which is an
+        approximation; consider using ``smoother_mean`` directly.
     update_transition_matrix : bool, default=False
         Whether to learn A. Default False (keeps A = I for random walk).
     update_process_cov : bool, default=True
@@ -214,14 +224,20 @@ class PlaceFieldModel:
 
     Attributes (set after fit)
     --------------------------
-    smoother_mean : Array, shape (n_time, n_basis)
-        Smoothed weight estimates after fitting.
-    smoother_cov : Array, shape (n_time, n_basis, n_basis)
-        Smoothed weight covariances after fitting.
+    smoother_mean : Array, shape (n_time, n_state)
+        Smoothed weight estimates. For multi-neuron, n_state = n_neurons * n_basis.
+    smoother_cov : Array, shape (n_time, n_state, n_state)
+        Smoothed weight covariances.
+    filtered_mean : Array, shape (n_time, n_state)
+        Filtered (causal) weight estimates.
+    filtered_cov : Array, shape (n_time, n_state, n_state)
+        Filtered weight covariances.
     basis_info : dict
         Spline basis specification (knots, bounds, formula).
     log_likelihoods : list[float]
         Log-likelihood history from fitting.
+    n_neurons : int
+        Number of neurons (detected from spikes during fit).
 
     Examples
     --------
@@ -237,6 +253,7 @@ class PlaceFieldModel:
         process_noise_structure: str = "diagonal",
         init_process_noise: float = 1e-5,
         init_cov_scale: float = 1.0,
+        log_intensity_func: Optional[Callable[[ArrayLike, ArrayLike], Array]] = None,
         update_transition_matrix: bool = False,
         update_process_cov: bool = True,
         update_init_state: bool = True,
@@ -258,13 +275,19 @@ class PlaceFieldModel:
         self.process_noise_structure = process_noise_structure
         self.init_process_noise = init_process_noise
         self.init_cov_scale = init_cov_scale
+        self._log_intensity_func = (
+            log_intensity_func if log_intensity_func is not None
+            else log_conditional_intensity
+        )
         self.update_transition_matrix = update_transition_matrix
         self.update_process_cov = update_process_cov
         self.update_init_state = update_init_state
 
         # Populated during fit
         self.basis_info: Optional[dict] = None
-        self.n_basis: Optional[int] = None
+        self.n_basis_per_neuron: Optional[int] = None
+        self.n_basis: Optional[int] = None  # total state dim
+        self.n_neurons: int = 1
         self.transition_matrix: Optional[Array] = None
         self.process_cov: Optional[Array] = None
         self.init_mean: Optional[Array] = None
@@ -272,7 +295,11 @@ class PlaceFieldModel:
         self.smoother_mean: Optional[Array] = None
         self.smoother_cov: Optional[Array] = None
         self.smoother_cross_cov: Optional[Array] = None
+        self.filtered_mean: Optional[Array] = None
+        self.filtered_cov: Optional[Array] = None
         self.log_likelihoods: list[float] = []
+        self._total_spikes: int = 0
+        self._n_time: int = 0
 
     def __repr__(self) -> str:
         fitted = self.smoother_mean is not None
@@ -285,8 +312,10 @@ class PlaceFieldModel:
         if fitted and self.process_cov is not None:
             q_mean = float(jnp.diag(self.process_cov).mean())
             parts.append(f"Q_diag_mean={q_mean:.2e}")
-        if fitted and self.n_basis is not None:
-            parts.append(f"n_basis={self.n_basis}")
+        if fitted and self.n_basis_per_neuron is not None:
+            parts.append(f"n_basis={self.n_basis_per_neuron}")
+        if fitted and self.n_neurons > 1:
+            parts.append(f"n_neurons={self.n_neurons}")
         return f"<PlaceFieldModel: {', '.join(parts)}>"
 
     @classmethod
@@ -356,6 +385,14 @@ class PlaceFieldModel:
 
         return cls(dt=dt, n_interior_knots=n_interior_knots, **kwargs)
 
+    def _neuron_weights(
+        self, neuron_idx: int = 0
+    ) -> tuple[slice, int]:
+        """Return the slice into the state vector for a given neuron."""
+        nb = self.n_basis_per_neuron
+        start = neuron_idx * nb
+        return slice(start, start + nb), nb
+
     def _check_fitted(self, method_name: str) -> None:
         """Raise if the model has not been fitted."""
         if self.smoother_mean is None:
@@ -370,15 +407,34 @@ class PlaceFieldModel:
         knots_x: Optional[np.ndarray] = None,
         knots_y: Optional[np.ndarray] = None,
     ) -> Array:
-        """Build the spline design matrix from position data."""
-        design_matrix, self.basis_info = build_2d_spline_basis(
+        """Build the spline design matrix from position data.
+
+        For single-neuron: returns shape (n_time, n_basis).
+        For multi-neuron: returns shape (n_time, n_neurons, n_neurons * n_basis)
+        as a block-diagonal matrix where each neuron selects its own weight slice.
+        """
+        Z_base, self.basis_info = build_2d_spline_basis(
             position,
             n_interior_knots=self.n_interior_knots,
             knots_x=knots_x,
             knots_y=knots_y,
         )
-        self.n_basis = self.basis_info["n_basis"]
-        return jnp.asarray(design_matrix)
+        self.n_basis_per_neuron = self.basis_info["n_basis"]
+
+        if self.n_neurons == 1:
+            self.n_basis = self.n_basis_per_neuron
+            return jnp.asarray(Z_base)
+
+        # Multi-neuron: block-diagonal design matrix
+        # Z_full[t, j, j*nb:(j+1)*nb] = Z_base[t, :]
+        self.n_basis = self.n_neurons * self.n_basis_per_neuron
+        n_time = Z_base.shape[0]
+        nb = self.n_basis_per_neuron
+        Z_base_jnp = jnp.asarray(Z_base)
+        Z_full = jnp.zeros((n_time, self.n_neurons, self.n_basis))
+        for j in range(self.n_neurons):
+            Z_full = Z_full.at[:, j, j * nb:(j + 1) * nb].set(Z_base_jnp)
+        return Z_full
 
     def _initialize_parameters(self) -> None:
         """Initialize model parameters."""
@@ -405,7 +461,17 @@ class PlaceFieldModel:
             dt=self.dt,
             transition_matrix=self.transition_matrix,
             process_cov=self.process_cov,
-            log_conditional_intensity=log_conditional_intensity,
+            log_conditional_intensity=self._log_intensity_func,
+        )
+        self.filtered_mean, self.filtered_cov, _ = stochastic_point_process_filter(
+            init_mean_params=self.init_mean,
+            init_covariance_params=self.init_cov,
+            design_matrix=design_matrix,
+            spike_indicator=spikes,
+            dt=self.dt,
+            transition_matrix=self.transition_matrix,
+            process_cov=self.process_cov,
+            log_conditional_intensity=self._log_intensity_func,
         )
         return float(marginal_ll)
 
@@ -468,10 +534,9 @@ class PlaceFieldModel:
         ``fit()``.
 
         Spikes are assigned to bin *i* if ``time_bins[i] < spike_time <=
-        time_bins[i+1]`` (right-closed intervals). Spikes exactly at
-        ``time_bins[0]`` are assigned to bin 0 (the first bin). Spikes
-        before ``time_bins[0]`` or after ``time_bins[-1] + dt`` are
-        silently discarded.
+        time_bins[i+1]`` (right-closed intervals). Spikes at or before
+        ``time_bins[0]`` are silently discarded, as are spikes after
+        ``time_bins[-1] + dt``.
 
         Parameters
         ----------
@@ -536,10 +601,12 @@ class PlaceFieldModel:
         # Validate inputs
         position = np.asarray(position)
         spikes = jnp.asarray(spikes)
-        if spikes.ndim != 1:
+        if spikes.ndim == 1:
+            spikes = spikes[:, None]  # (n_time,) -> (n_time, 1)
+        if spikes.ndim != 2:
             raise ValueError(
-                f"spikes must be 1D with shape (n_time,), got shape {spikes.shape}. "
-                f"Multi-neuron input is not supported; fit one neuron at a time."
+                f"spikes must be 1D (n_time,) or 2D (n_time, n_neurons), "
+                f"got shape {spikes.shape}."
             )
         if jnp.any(spikes < 0):
             raise ValueError(
@@ -552,6 +619,14 @@ class PlaceFieldModel:
                 f"got position ({position.shape[0]},) vs spikes ({spikes.shape[0]},)"
             )
 
+        self.n_neurons = spikes.shape[1]
+        self._n_time = spikes.shape[0]
+        self._total_spikes = int(spikes.sum())
+
+        # Squeeze back to 1D for single-neuron (filter expects 1D)
+        if self.n_neurons == 1:
+            spikes = spikes.squeeze(axis=1)
+
         # Build basis and initialize
         design_matrix = self._build_design_matrix(position, knots_x, knots_y)
         self._initialize_parameters()
@@ -560,18 +635,22 @@ class PlaceFieldModel:
             if verbose:
                 print(msg)
 
+        neurons_str = f", n_neurons={self.n_neurons}" if self.n_neurons > 1 else ""
         _print(
-            f"PlaceFieldModel: n_time={len(spikes)}, n_basis={self.n_basis}, "
-            f"total_spikes={int(spikes.sum())}"
+            f"PlaceFieldModel: n_time={self._n_time}, "
+            f"n_basis={self.n_basis_per_neuron}{neurons_str}, "
+            f"total_spikes={self._total_spikes}"
         )
 
         self.log_likelihoods = []
 
         for iteration in range(max_iter):
-            # Save previous smoother state so we can roll back on LL decrease
+            # Save previous state so we can roll back on LL decrease
             prev_smoother_mean = self.smoother_mean
             prev_smoother_cov = self.smoother_cov
             prev_smoother_cross_cov = self.smoother_cross_cov
+            prev_filtered_mean = self.filtered_mean
+            prev_filtered_cov = self.filtered_cov
 
             ll = self._e_step(design_matrix, spikes)
             self.log_likelihoods.append(ll)
@@ -587,10 +666,12 @@ class PlaceFieldModel:
                     ll, self.log_likelihoods[-2], tolerance
                 )
                 if not is_increasing:
-                    # Roll back to the previous (better) smoother state
+                    # Roll back to the previous (better) state
                     self.smoother_mean = prev_smoother_mean
                     self.smoother_cov = prev_smoother_cov
                     self.smoother_cross_cov = prev_smoother_cross_cov
+                    self.filtered_mean = prev_filtered_mean
+                    self.filtered_cov = prev_filtered_cov
                     msg = (
                         f"LL decreased: "
                         f"{self.log_likelihoods[-2]:.1f} -> {ll:.1f}; "
@@ -620,6 +701,7 @@ class PlaceFieldModel:
         grid_positions: np.ndarray,
         time_slice: Optional[slice] = None,
         alpha: float = 0.05,
+        neuron_idx: int = 0,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Predict the firing rate map at given spatial positions.
 
@@ -635,6 +717,8 @@ class PlaceFieldModel:
             If None, uses the full session.
         alpha : float, default=0.05
             Significance level for credible interval (0.05 for 95% CI).
+        neuron_idx : int, default=0
+            Which neuron's rate map to compute (for multi-neuron models).
 
         Returns
         -------
@@ -654,12 +738,13 @@ class PlaceFieldModel:
         self._check_fitted("predict_rate_map")
 
         Z_grid = evaluate_basis(grid_positions, self.basis_info)
+        s, _ = self._neuron_weights(neuron_idx)
 
         if time_slice is None:
             time_slice = slice(None)
 
-        weights = np.array(self.smoother_mean[time_slice].mean(axis=0))
-        cov = np.array(self.smoother_cov[time_slice].mean(axis=0))
+        weights = np.array(self.smoother_mean[time_slice, s].mean(axis=0))
+        cov = np.array(self.smoother_cov[time_slice][:, s, s].mean(axis=0))
 
         log_rate = Z_grid @ weights
         var_log_rate = np.sum(Z_grid @ cov * Z_grid, axis=1)
@@ -676,6 +761,7 @@ class PlaceFieldModel:
         self,
         grid_positions: np.ndarray,
         n_blocks: int = 20,
+        neuron_idx: int = 0,
     ) -> np.ndarray:
         """Estimate the place field center over time.
 
@@ -689,6 +775,8 @@ class PlaceFieldModel:
         n_blocks : int, default=20
             Number of temporal blocks. Time steps are split as evenly as
             possible using ``np.array_split``, so no data is dropped.
+        neuron_idx : int, default=0
+            Which neuron's center to estimate (for multi-neuron models).
 
         Returns
         -------
@@ -698,6 +786,7 @@ class PlaceFieldModel:
         self._check_fitted("predict_center")
 
         Z_grid = evaluate_basis(grid_positions, self.basis_info)
+        s, _ = self._neuron_weights(neuron_idx)
         n_time = self.smoother_mean.shape[0]
         if n_blocks < 1 or n_blocks > n_time:
             raise ValueError(
@@ -707,7 +796,7 @@ class PlaceFieldModel:
         block_indices = np.array_split(np.arange(n_time), n_blocks)
         centers = np.zeros((n_blocks, 2))
         for i, idx in enumerate(block_indices):
-            weights = np.array(self.smoother_mean[idx].mean(axis=0))
+            weights = np.array(self.smoother_mean[idx][:, s].mean(axis=0))
             rate = np.exp(Z_grid @ weights)
             # Weighted centroid (more stable than argmax)
             rate_sum = rate.sum()
@@ -764,8 +853,9 @@ class PlaceFieldModel:
         ----------
         position : np.ndarray, shape (n_time, 2)
             Animal position (x, y) at each time bin.
-        spikes : ArrayLike, shape (n_time,)
-            Spike counts per time bin.
+        spikes : ArrayLike, shape (n_time,) or (n_time, n_neurons)
+            Spike counts per time bin. Must match the number of neurons
+            the model was fitted with.
 
         Returns
         -------
@@ -776,15 +866,28 @@ class PlaceFieldModel:
 
         position = np.asarray(position)
         spikes = jnp.asarray(spikes)
+        # Normalize spikes shape to match fit convention
+        if spikes.ndim == 1 and self.n_neurons == 1:
+            pass  # single-neuron, keep 1D
+        elif spikes.ndim == 2 and self.n_neurons == 1:
+            spikes = spikes.squeeze(axis=1)
         if position.shape[0] != spikes.shape[0]:
             raise ValueError(
                 f"position and spikes must have the same number of time bins: "
                 f"got position ({position.shape[0]},) vs spikes ({spikes.shape[0]},)"
             )
 
-        design_matrix = jnp.asarray(
-            evaluate_basis(position, self.basis_info)
-        )
+        # Build design matrix matching the fitted n_neurons
+        Z_base = evaluate_basis(position, self.basis_info)
+        if self.n_neurons == 1:
+            design_matrix = jnp.asarray(Z_base)
+        else:
+            nb = self.n_basis_per_neuron
+            n_time = Z_base.shape[0]
+            Z_base_jnp = jnp.asarray(Z_base)
+            design_matrix = jnp.zeros((n_time, self.n_neurons, self.n_basis))
+            for j in range(self.n_neurons):
+                design_matrix = design_matrix.at[:, j, j * nb:(j + 1) * nb].set(Z_base_jnp)
 
         _, _, marginal_ll = stochastic_point_process_filter(
             init_mean_params=self.init_mean,
@@ -794,7 +897,7 @@ class PlaceFieldModel:
             dt=self.dt,
             transition_matrix=self.transition_matrix,
             process_cov=self.process_cov,
-            log_conditional_intensity=log_conditional_intensity,
+            log_conditional_intensity=self._log_intensity_func,
         )
         return float(marginal_ll)
 
@@ -819,6 +922,119 @@ class PlaceFieldModel:
         )
 
     # ------------------------------------------------------------------
+    # Model comparison
+    # ------------------------------------------------------------------
+
+    @property
+    def n_free_params(self) -> int:
+        """Number of free parameters learned via EM.
+
+        Counts diagonal entries of Q (or 1 for isotropic), A entries if
+        learned, and initial mean + diagonal covariance if learned.
+        """
+        n = 0
+        if self.update_process_cov:
+            n += self.n_basis if self.process_noise_structure == "diagonal" else 1
+        if self.update_transition_matrix:
+            n += self.n_basis ** 2
+        if self.update_init_state:
+            n += self.n_basis  # mean
+            n += self.n_basis  # diagonal of covariance (effective)
+        return n
+
+    def bic(self) -> float:
+        """Bayesian Information Criterion. Lower is better.
+
+        BIC = -2 * log_likelihood + k * ln(n)
+
+        where k is the number of free parameters and n is the number of
+        time bins.
+
+        Returns
+        -------
+        float
+        """
+        self._check_fitted("bic")
+        n = self.smoother_mean.shape[0]
+        return -2.0 * self.log_likelihoods[-1] + self.n_free_params * np.log(n)
+
+    def aic(self) -> float:
+        """Akaike Information Criterion. Lower is better.
+
+        AIC = -2 * log_likelihood + 2 * k
+
+        where k is the number of free parameters.
+
+        Returns
+        -------
+        float
+        """
+        self._check_fitted("aic")
+        return -2.0 * self.log_likelihoods[-1] + 2.0 * self.n_free_params
+
+    def summary(self) -> str:
+        """Return a text summary of the fitted model.
+
+        Returns
+        -------
+        str
+            Multi-line summary including data statistics, fit quality,
+            process noise, and drift metrics.
+        """
+        self._check_fitted("summary")
+
+        n_time = self.smoother_mean.shape[0]
+        session_duration = n_time * self.dt
+        mean_rate = self._total_spikes / session_duration if session_duration > 0 else 0.0
+
+        q_diag = jnp.diag(self.process_cov)
+
+        lines = [
+            "PlaceFieldModel Summary",
+            "=" * 50,
+            f"  dt:                       {self.dt:.4g} s",
+            f"  n_interior_knots:         {self.n_interior_knots}",
+            f"  n_basis_per_neuron:       {self.n_basis_per_neuron}",
+            f"  n_neurons:                {self.n_neurons}",
+            f"  process_noise_structure:  {self.process_noise_structure}",
+            "",
+            "Data",
+            "-" * 50,
+            f"  n_time_bins:              {n_time}",
+            f"  session_duration:         {session_duration:.1f} s",
+            f"  total_spikes:             {self._total_spikes}",
+            f"  mean_rate:                {mean_rate:.2f} Hz",
+            "",
+            "Fit",
+            "-" * 50,
+            f"  EM iterations:            {len(self.log_likelihoods)}",
+            f"  final log-likelihood:     {self.log_likelihoods[-1]:.2f}",
+            f"  BIC:                      {self.bic():.2f}",
+            f"  AIC:                      {self.aic():.2f}",
+            f"  n_free_params:            {self.n_free_params}",
+            "",
+            "Process noise Q (diagonal)",
+            "-" * 50,
+            f"  mean:                     {float(q_diag.mean()):.2e}",
+            f"  min:                      {float(q_diag.min()):.2e}",
+            f"  max:                      {float(q_diag.max()):.2e}",
+        ]
+
+        try:
+            drift = self.drift_summary(n_blocks=10)
+            lines.extend([
+                "",
+                "Drift",
+                "-" * 50,
+                f"  total (start-to-end):     {drift['total_drift']:.2f} cm",
+                f"  cumulative (path):        {drift['cumulative_drift']:.2f} cm",
+            ])
+        except Exception:
+            pass
+
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # Drift analysis
     # ------------------------------------------------------------------
 
@@ -826,6 +1042,7 @@ class PlaceFieldModel:
         self,
         n_grid: int = 80,
         n_blocks: int = 20,
+        neuron_idx: int = 0,
     ) -> dict:
         """Summarize place field drift over the session.
 
@@ -835,6 +1052,8 @@ class PlaceFieldModel:
             Grid resolution for center estimation.
         n_blocks : int, default=20
             Number of temporal blocks for center trajectory.
+        neuron_idx : int, default=0
+            Which neuron to summarize (for multi-neuron models).
 
         Returns
         -------
@@ -849,6 +1068,7 @@ class PlaceFieldModel:
 
         grid, _, _ = self.make_grid(n_grid)
         Z_grid = evaluate_basis(grid, self.basis_info)
+        s, _ = self._neuron_weights(neuron_idx)
         n_time = self.smoother_mean.shape[0]
 
         block_indices = np.array_split(np.arange(n_time), n_blocks)
@@ -857,7 +1077,7 @@ class PlaceFieldModel:
         block_times = np.zeros(n_blocks)
 
         for i, idx in enumerate(block_indices):
-            weights = np.array(self.smoother_mean[idx].mean(axis=0))
+            weights = np.array(self.smoother_mean[idx][:, s].mean(axis=0))
             rate = np.exp(Z_grid @ weights)
             rate_sum = rate.sum()
             if rate_sum > 0:
