@@ -604,6 +604,55 @@ class TestMultiNeuron:
         s = model.summary()
         assert "n_neurons" in s
 
+    def test_multi_neuron_recovers_distinct_fields(self) -> None:
+        """Two neurons with well-separated fields should produce distinct rate maps."""
+        rng = np.random.default_rng(123)
+        dt = 0.020
+        arena_size = 80.0
+        n_time = 2000
+        n_interior_knots = 3
+
+        # Lawnmower trajectory for good spatial coverage
+        position = rng.uniform(0, arena_size, (n_time, 2))
+
+        # Neuron 0: field centered at (25, 25)
+        center0 = np.array([25.0, 25.0])
+        dist_sq_0 = np.sum((position - center0) ** 2, axis=1)
+        rate0 = 1.0 + 25.0 * np.exp(-dist_sq_0 / (2 * 10.0**2))
+        spikes0 = rng.poisson(rate0 * dt)
+
+        # Neuron 1: field centered at (60, 60)
+        center1 = np.array([60.0, 60.0])
+        dist_sq_1 = np.sum((position - center1) ** 2, axis=1)
+        rate1 = 1.0 + 25.0 * np.exp(-dist_sq_1 / (2 * 10.0**2))
+        spikes1 = rng.poisson(rate1 * dt)
+
+        spikes_2n = np.column_stack([spikes0, spikes1])
+
+        model = PlaceFieldModel(dt=dt, n_interior_knots=n_interior_knots)
+        model.fit(position, spikes_2n, max_iter=20, verbose=False)
+
+        # Check that each neuron's peak rate is near its true center
+        grid, _, _ = model.make_grid(n_grid=30)
+        for neuron_idx, true_center in enumerate([center0, center1]):
+            rate_map, _ = model.predict_rate_map(grid, neuron_idx=neuron_idx)
+            peak_idx = np.argmax(rate_map)
+            estimated_peak = grid[peak_idx]
+            dist = np.linalg.norm(estimated_peak - true_center)
+            assert dist < 15.0, (
+                f"Neuron {neuron_idx}: estimated peak {estimated_peak} "
+                f"is {dist:.1f} cm from true center {true_center}"
+            )
+
+        # The two neurons' rate maps should differ substantially
+        rate0_map, _ = model.predict_rate_map(grid, neuron_idx=0)
+        rate1_map, _ = model.predict_rate_map(grid, neuron_idx=1)
+        correlation = np.corrcoef(rate0_map, rate1_map)[0, 1]
+        assert correlation < 0.5, (
+            f"Neuron rate maps are too similar (r={correlation:.2f}), "
+            f"multi-neuron fitting may not be separating neurons."
+        )
+
     def test_score_wrong_neuron_count(self, sim_data: dict) -> None:
         spikes_2n = np.column_stack([sim_data["spikes"], sim_data["spikes"]])
         model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
