@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from state_space_practice.smith_learning_algorithm import (
-    SmithLearningAlgorithm,
+    SmithLearningModel,
     _find_runs_of_value,
     _log_posterior_objective,
     approximate_gaussian,
@@ -647,12 +647,12 @@ class TestSimulateLearningData:
         assert not np.array_equal(outcomes1, outcomes2)
 
 
-class TestSmithLearningAlgorithmClass:
-    """Tests for the SmithLearningAlgorithm class."""
+class TestSmithLearningModelClass:
+    """Tests for the SmithLearningModel class."""
 
     def test_initialization(self) -> None:
         """Class should initialize without errors."""
-        model = SmithLearningAlgorithm(
+        model = SmithLearningModel(
             init_learning_state=0.0,
             sigma_epsilon=float(jnp.sqrt(0.05)),
             prob_correct_by_chance=0.5,
@@ -663,7 +663,7 @@ class TestSmithLearningAlgorithmClass:
 
     def test_initialization_with_explicit_variance(self) -> None:
         """Class should accept explicit init_learning_variance."""
-        model = SmithLearningAlgorithm(
+        model = SmithLearningModel(
             init_learning_state=0.0,
             init_learning_variance=0.1,
             sigma_epsilon=float(jnp.sqrt(0.05)),
@@ -675,7 +675,7 @@ class TestSmithLearningAlgorithmClass:
     def test_default_variance_equals_sigma_squared(self) -> None:
         """Default init_learning_variance should equal sigma_epsilon^2."""
         sigma_eps = 0.3
-        model = SmithLearningAlgorithm(sigma_epsilon=sigma_eps)
+        model = SmithLearningModel(sigma_epsilon=sigma_eps)
 
         np.testing.assert_allclose(
             model.init_learning_variance, sigma_eps**2, rtol=1e-10
@@ -684,34 +684,34 @@ class TestSmithLearningAlgorithmClass:
     def test_invalid_sigma_epsilon_raises(self) -> None:
         """Negative sigma_epsilon should raise error."""
         with pytest.raises(ValueError):
-            SmithLearningAlgorithm(sigma_epsilon=-0.1)
+            SmithLearningModel(sigma_epsilon=-0.1)
 
     def test_invalid_prob_chance_raises(self) -> None:
         """Invalid prob_correct_by_chance should raise error."""
         with pytest.raises(ValueError, match="prob_correct_by_chance"):
-            SmithLearningAlgorithm(prob_correct_by_chance=0.0)
+            SmithLearningModel(prob_correct_by_chance=0.0)
 
         with pytest.raises(ValueError, match="prob_correct_by_chance"):
-            SmithLearningAlgorithm(prob_correct_by_chance=1.0)
+            SmithLearningModel(prob_correct_by_chance=1.0)
 
     def test_invalid_variance_type_raises(self) -> None:
         """Invalid init_learning_variance type should raise TypeError."""
         with pytest.raises(TypeError):
-            SmithLearningAlgorithm(init_learning_variance="invalid")  # type: ignore[arg-type]
+            SmithLearningModel(init_learning_variance="invalid")  # type: ignore[arg-type]
 
     def test_negative_variance_raises(self) -> None:
         """Negative init_learning_variance should raise ValueError."""
         with pytest.raises(ValueError, match="non-negative"):
-            SmithLearningAlgorithm(init_learning_variance=-0.1)
+            SmithLearningModel(init_learning_variance=-0.1)
 
     def test_invalid_initial_state_method_raises(self) -> None:
         """Invalid initial_state_method should raise ValueError."""
         with pytest.raises(ValueError, match="initial_state_method must be one of"):
-            SmithLearningAlgorithm(initial_state_method="typo")
+            SmithLearningModel(initial_state_method="typo")
 
     def test_is_fitted_false_before_fit(self) -> None:
         """is_fitted should be False before calling fit()."""
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         assert not model.is_fitted
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -719,7 +719,7 @@ class TestSmithLearningAlgorithmClass:
         """is_fitted should be True after calling fit()."""
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(outcomes, max_iter=3)
         except Exception as e:
@@ -728,9 +728,9 @@ class TestSmithLearningAlgorithmClass:
 
     def test_repr_before_fit(self) -> None:
         """__repr__ should show 'not fitted' before fit."""
-        model = SmithLearningAlgorithm(sigma_epsilon=0.22)
+        model = SmithLearningModel(sigma_epsilon=0.22)
         r = repr(model)
-        assert "SmithLearningAlgorithm(" in r
+        assert "SmithLearningModel(" in r
         assert "not fitted" in r
         assert "0.22" in r
 
@@ -739,7 +739,7 @@ class TestSmithLearningAlgorithmClass:
         """__repr__ should show 'fitted' after fit."""
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(outcomes, max_iter=3)
         except Exception as e:
@@ -749,16 +749,16 @@ class TestSmithLearningAlgorithmClass:
         assert "not fitted" not in r
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
-    def test_plot_learning_process_returns_fig_ax(self) -> None:
-        """plot_learning_process should return (fig, ax)."""
+    def test_plot_learning_curve_returns_fig_ax(self) -> None:
+        """plot_learning_curve should return (fig, ax)."""
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(outcomes, max_iter=3)
         except Exception as e:
             pytest.skip(f"fit() failed: {e}")
-        result = model.plot_learning_process(jax.random.PRNGKey(0))
+        result = model.plot_learning_curve(jax.random.PRNGKey(0))
         assert isinstance(result, tuple)
         assert len(result) == 2
         fig, ax = result
@@ -770,7 +770,7 @@ class TestSmithLearningAlgorithmClass:
         """fit(verbose=True) should print convergence info to stdout."""
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(outcomes, max_iter=5, verbose=True)
         except Exception as e:
@@ -783,7 +783,7 @@ class TestSmithLearningAlgorithmClass:
         """fit() should run final M-step + E-step so stored results match MLE params."""
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             log_likelihoods = model.fit(outcomes, max_iter=50)
         except Exception as e:
@@ -799,7 +799,7 @@ class TestSmithLearningAlgorithmClass:
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
 
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             log_likelihoods = model.fit(outcomes, max_iter=3)
         except Exception as e:
@@ -814,7 +814,7 @@ class TestSmithLearningAlgorithmClass:
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
 
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(outcomes, max_iter=3)
         except Exception as e:
@@ -826,7 +826,7 @@ class TestSmithLearningAlgorithmClass:
 
     def test_get_learning_curve_requires_fit(self) -> None:
         """get_learning_curve() should raise if not fitted."""
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
 
         with pytest.raises(RuntimeError):
             model.get_learning_curve(jax.random.PRNGKey(0))
@@ -837,7 +837,7 @@ class TestSmithLearningAlgorithmClass:
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
 
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(outcomes, max_iter=3)
         except Exception as e:
@@ -852,25 +852,25 @@ class TestSmithLearningAlgorithmClass:
         assert prob_above_chance is None  # Not requested
 
 
-class TestSmithLearningAlgorithmEdgeCases:
+class TestSmithLearningModelEdgeCases:
     """Edge case tests for scientific robustness."""
 
     def test_single_trial_raises(self) -> None:
         """fit() with a single trial should raise ValueError."""
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         with pytest.raises(ValueError, match="at least 2 trials"):
             model.fit(jnp.array([1]))
 
     def test_n_correct_exceeds_max_possible_raises(self) -> None:
         """fit() should raise if n_correct > max_possible_correct."""
-        model = SmithLearningAlgorithm(max_possible_correct=1)
+        model = SmithLearningModel(max_possible_correct=1)
         with pytest.raises(ValueError, match="exceeding max_possible_correct"):
             model.fit(jnp.array([0, 1, 2, 1, 0]))
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_all_zeros_produces_finite(self) -> None:
         """All-zero outcomes should not produce NaN/Inf."""
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         outcomes = jnp.zeros(20, dtype=jnp.int32)
         log_likelihoods = model.fit(outcomes, max_iter=5)
         assert all(np.isfinite(ll) for ll in log_likelihoods)
@@ -880,7 +880,7 @@ class TestSmithLearningAlgorithmEdgeCases:
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_all_ones_produces_finite(self) -> None:
         """All-one outcomes should not produce NaN/Inf."""
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         outcomes = jnp.ones(20, dtype=jnp.int32)
         log_likelihoods = model.fit(outcomes, max_iter=5)
         assert all(np.isfinite(ll) for ll in log_likelihoods)
@@ -892,7 +892,7 @@ class TestSmithLearningAlgorithmEdgeCases:
         """sigma_epsilon should remain positive and finite after fitting."""
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(outcomes, max_iter=10)
         except Exception as e:
@@ -902,7 +902,7 @@ class TestSmithLearningAlgorithmEdgeCases:
 
     def test_2d_input_raises(self) -> None:
         """fit() with 2D input should raise ValueError."""
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         with pytest.raises(ValueError, match="1D"):
             model.fit(jnp.array([[1, 0], [0, 1]]))
 
@@ -914,7 +914,7 @@ class TestSummaryAndScoring:
     def test_log_likelihood_stored_after_fit(self) -> None:
         """log_likelihood_ should be populated after fit."""
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(jnp.array(outcomes_np), max_iter=5)
         except Exception as e:
@@ -928,7 +928,7 @@ class TestSummaryAndScoring:
     def test_bic_is_finite(self) -> None:
         """bic() should return a finite value after fit."""
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(jnp.array(outcomes_np), max_iter=5)
         except Exception as e:
@@ -938,7 +938,7 @@ class TestSummaryAndScoring:
 
     def test_bic_requires_fit(self) -> None:
         """bic() should raise if not fitted."""
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         with pytest.raises(RuntimeError, match="not been fitted"):
             model.bic()
 
@@ -947,7 +947,7 @@ class TestSummaryAndScoring:
         """compare_to_null() should return a dict with expected keys."""
         outcomes_np, _ = simulate_learning_data(n_trials=30, seed=42)
         outcomes = jnp.array(outcomes_np)
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(outcomes, max_iter=10)
         except Exception as e:
@@ -971,7 +971,7 @@ class TestSummaryAndScoring:
             prob_success_init=0.2, prob_success_final=0.9,
         )
         outcomes = jnp.array(outcomes_np)
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(outcomes, max_iter=30)
         except Exception as e:
@@ -985,7 +985,7 @@ class TestSummaryAndScoring:
         """summary() should return a multi-line string."""
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(outcomes, max_iter=5)
         except Exception as e:
@@ -1001,7 +1001,7 @@ class TestSummaryAndScoring:
         """summary() with key and data should include null comparison."""
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(outcomes, max_iter=5)
         except Exception as e:
@@ -1015,7 +1015,7 @@ class TestSummaryAndScoring:
 
     def test_summary_requires_fit(self) -> None:
         """summary() should raise if not fitted."""
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         with pytest.raises(RuntimeError, match="not been fitted"):
             model.summary()
 
@@ -1030,7 +1030,7 @@ class TestFindCriterionTrial:
             n_trials=50, seed=42, prob_success_init=0.3, prob_success_final=0.95
         )
         outcomes = jnp.array(outcomes_np)
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(outcomes, max_iter=10)
         except Exception as e:
@@ -1043,7 +1043,7 @@ class TestFindCriterionTrial:
     def test_returns_none_for_no_learning(self) -> None:
         """Should return None when performance never exceeds chance."""
         outcomes = jnp.zeros(30, dtype=jnp.int32)  # All failures
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(outcomes, max_iter=5)
         except Exception as e:
@@ -1053,33 +1053,33 @@ class TestFindCriterionTrial:
 
     def test_requires_fit(self) -> None:
         """Should raise if not fitted."""
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         with pytest.raises(RuntimeError, match="not been fitted"):
             model.find_criterion_trial(jax.random.PRNGKey(0))
 
 
 class TestIdentifySignificantRuns:
-    """Tests for identify_significant_runs_in_data and find_critical_run_length."""
+    """Tests for find_significant_runs and find_critical_run_length."""
 
     def test_find_critical_run_length_without_fit(self) -> None:
         """find_critical_run_length should work without fitting."""
-        model = SmithLearningAlgorithm(prob_correct_by_chance=0.5)
+        model = SmithLearningModel(prob_correct_by_chance=0.5)
         result = model.find_critical_run_length(sequence_length=50)
         assert result is None or isinstance(result, int)
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_identify_runs_returns_tuple(self) -> None:
-        """identify_significant_runs_in_data should return (j_crit, runs)."""
-        model = SmithLearningAlgorithm(prob_correct_by_chance=0.5)
+        """find_significant_runs should return (j_crit, runs)."""
+        model = SmithLearningModel(prob_correct_by_chance=0.5)
         data = jnp.array([0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0])
-        j_crit, runs = model.identify_significant_runs_in_data(data)
+        j_crit, runs = model.find_significant_runs(data)
         assert j_crit is None or isinstance(j_crit, int)
         assert isinstance(runs, list)
 
     def test_identify_runs_empty_input(self) -> None:
         """Empty input should return (None, [])."""
-        model = SmithLearningAlgorithm()
-        j_crit, runs = model.identify_significant_runs_in_data(jnp.array([]))
+        model = SmithLearningModel()
+        j_crit, runs = model.find_significant_runs(jnp.array([]))
         assert j_crit is None
         assert runs == []
 
@@ -1092,7 +1092,7 @@ class TestPlotTrialComparisonMatrix:
         """plot_trial_comparison_matrix should return (fig, ax)."""
         outcomes_np, _ = simulate_learning_data(n_trials=15, seed=42)
         outcomes = jnp.array(outcomes_np)
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         try:
             model.fit(outcomes, max_iter=3)
         except Exception as e:
@@ -1105,9 +1105,61 @@ class TestPlotTrialComparisonMatrix:
 
     def test_requires_fit(self) -> None:
         """Should raise if not fitted."""
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         with pytest.raises(RuntimeError, match="not been fitted"):
             model.plot_trial_comparison_matrix(jax.random.PRNGKey(0))
+
+
+class TestPlotConvergence:
+    """Tests for plot_convergence method."""
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_returns_fig_ax(self) -> None:
+        """plot_convergence should return (fig, ax)."""
+        outcomes_np, _ = simulate_learning_data(n_trials=15, seed=42)
+        model = SmithLearningModel()
+        try:
+            model.fit(jnp.array(outcomes_np), max_iter=3)
+        except Exception as e:
+            pytest.skip(f"fit() failed: {e}")
+        fig, ax = model.plot_convergence()
+        assert isinstance(fig, plt.Figure)
+        plt.close(fig)
+
+    def test_requires_fit(self) -> None:
+        """Should raise if not fitted."""
+        model = SmithLearningModel()
+        with pytest.raises(RuntimeError, match="not been fitted"):
+            model.plot_convergence()
+
+
+class TestPlotSummary:
+    """Tests for plot_summary method."""
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_returns_fig_axes(self) -> None:
+        """plot_summary should return (fig, axes) with 3 panels."""
+        outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
+        outcomes = jnp.array(outcomes_np)
+        model = SmithLearningModel()
+        try:
+            model.fit(outcomes, max_iter=5)
+        except Exception as e:
+            pytest.skip(f"fit() failed: {e}")
+        fig, axes = model.plot_summary(
+            jax.random.PRNGKey(0),
+            observed_n_correct=outcomes,
+            n_samples=200,
+        )
+        assert isinstance(fig, plt.Figure)
+        assert len(axes) == 3
+        plt.close(fig)
+
+    def test_requires_fit(self) -> None:
+        """Should raise if not fitted."""
+        model = SmithLearningModel()
+        with pytest.raises(RuntimeError, match="not been fitted"):
+            model.plot_summary(jax.random.PRNGKey(0))
 
 
 class TestCalculateLatentStatePercentiles:
@@ -1489,8 +1541,8 @@ class TestFindFirstSignificantTrial:
         assert result_strict is None
 
 
-class TestSmithLearningAlgorithmTrialComparison:
-    """Tests for trial comparison methods on SmithLearningAlgorithm class."""
+class TestSmithLearningModelTrialComparison:
+    """Tests for trial comparison methods on SmithLearningModel class."""
 
     @pytest.fixture
     def fitted_model(self):
@@ -1499,7 +1551,7 @@ class TestSmithLearningAlgorithmTrialComparison:
         responses = jnp.array([0, 1, 0, 0, 1, 0, 1, 1, 0, 1,
                                1, 1, 1, 0, 1, 1, 1, 1, 1, 1])
 
-        model = SmithLearningAlgorithm(
+        model = SmithLearningModel(
             sigma_epsilon=0.3,
             prob_correct_by_chance=0.5,
             initial_state_method='set_initial_direct_from_second_trial'
@@ -1509,7 +1561,7 @@ class TestSmithLearningAlgorithmTrialComparison:
 
     def test_compare_trials_requires_fit(self) -> None:
         """compare_trials should raise if model not fitted."""
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         key = jax.random.PRNGKey(0)
 
         with pytest.raises(RuntimeError, match="not been fitted"):
@@ -1535,7 +1587,7 @@ class TestSmithLearningAlgorithmTrialComparison:
 
     def test_get_trial_comparison_matrix_requires_fit(self) -> None:
         """get_trial_comparison_matrix should raise if model not fitted."""
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         key = jax.random.PRNGKey(0)
 
         with pytest.raises(RuntimeError, match="not been fitted"):
@@ -1552,7 +1604,7 @@ class TestSmithLearningAlgorithmTrialComparison:
 
     def test_find_first_significant_improvement_requires_fit(self) -> None:
         """find_first_significant_improvement should raise if not fitted."""
-        model = SmithLearningAlgorithm()
+        model = SmithLearningModel()
         key = jax.random.PRNGKey(0)
 
         with pytest.raises(RuntimeError, match="not been fitted"):

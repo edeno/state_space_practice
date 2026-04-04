@@ -1070,7 +1070,7 @@ VALID_INIT_METHODS = frozenset({
 })
 
 
-class SmithLearningAlgorithm:
+class SmithLearningModel:
     """Bayesian state-space model for tracking learning from trial outcomes.
 
     Implements the Smith et al. (2004) algorithm for estimating a latent
@@ -1079,11 +1079,11 @@ class SmithLearningAlgorithm:
 
     Typical workflow::
 
-        model = SmithLearningAlgorithm(sigma_epsilon=0.22)
+        model = SmithLearningModel(sigma_epsilon=0.22)
         log_likelihoods = model.fit(outcomes)
         key = jax.random.PRNGKey(0)
         prob_percentiles, _ = model.get_learning_curve(key)
-        fig, ax = model.plot_learning_process(key, observed_n_correct=outcomes)
+        fig, ax = model.plot_learning_curve(key, observed_n_correct=outcomes)
 
     Attributes
     ----------
@@ -1235,7 +1235,7 @@ class SmithLearningAlgorithm:
     def __repr__(self) -> str:
         fitted = "fitted" if self.is_fitted else "not fitted"
         return (
-            f"SmithLearningAlgorithm("
+            f"SmithLearningModel("
             f"sigma_epsilon={self.sigma_epsilon:.4g}, "
             f"prob_correct_by_chance={self.prob_correct_by_chance:.4g}, "
             f"init_learning_state={self.init_learning_state:.4g}, "
@@ -1451,7 +1451,7 @@ class SmithLearningAlgorithm:
         Calling ``fit()`` again on an already-fitted model performs a
         **warm restart**: it continues from the current parameter values
         (``sigma_epsilon``, ``init_learning_state``, ``init_learning_variance``).
-        To start fresh, create a new ``SmithLearningAlgorithm`` instance.
+        To start fresh, create a new ``SmithLearningModel`` instance.
 
         Parameters
         ----------
@@ -1704,7 +1704,7 @@ class SmithLearningAlgorithm:
             max_run_length=max_run_length,
         )
 
-    def identify_significant_runs_in_data(
+    def find_significant_runs(
         self,
         observed_binary_responses: ArrayLike,
         prob_correct_by_chance: Optional[float] = None,
@@ -1913,7 +1913,7 @@ class SmithLearningAlgorithm:
 
         return criterion_trial
 
-    def plot_learning_process(
+    def plot_learning_curve(
         self,
         key: Array,
         plot_type: str = "probability",
@@ -2228,7 +2228,7 @@ class SmithLearningAlgorithm:
 
         Examples
         --------
-        >>> model = SmithLearningAlgorithm()
+        >>> model = SmithLearningModel()
         >>> model.fit(responses)
         >>> key = jax.random.PRNGKey(0)
         >>> matrix = model.get_trial_comparison_matrix(key)
@@ -2437,7 +2437,7 @@ class SmithLearningAlgorithm:
             raise RuntimeError("Model has not been fitted. Run .fit() method first.")
 
         lines = [
-            "SmithLearningAlgorithm Summary",
+            "SmithLearningModel Summary",
             "=" * 40,
             f"  sigma_epsilon:          {self.sigma_epsilon:.4g}",
             f"  prob_correct_by_chance:  {self.prob_correct_by_chance:.4g}",
@@ -2590,3 +2590,148 @@ class SmithLearningAlgorithm:
         ax.set_ylim(n_trials - 0.5, -0.5)
 
         return fig, ax
+
+    def plot_convergence(self) -> tuple[plt.Figure, plt.Axes]:
+        """Plot the EM log-likelihood convergence trace.
+
+        Must be called after ``fit()``.
+
+        Returns
+        -------
+        fig : plt.Figure
+            The matplotlib figure.
+        ax : plt.Axes
+            The matplotlib axes.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+        """
+        if self.log_likelihood_history_ is None:
+            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+
+        fig, ax = plt.subplots(figsize=(8, 4), constrained_layout=True)
+        iterations = range(1, len(self.log_likelihood_history_) + 1)
+        ax.plot(iterations, self.log_likelihood_history_, "o-", markersize=4)
+        ax.set_xlabel("EM Iteration", fontsize=12)
+        ax.set_ylabel("Log-Likelihood", fontsize=12)
+        ax.set_title("EM Convergence", fontsize=14, fontweight="bold")
+        ax.grid(True, linestyle="--", alpha=0.6)
+
+        return fig, ax
+
+    def plot_summary(
+        self,
+        key: Array,
+        observed_n_correct: Optional[ArrayLike] = None,
+        n_samples: int = 10000,
+    ) -> tuple[plt.Figure, np.ndarray]:
+        """Multi-panel diagnostic figure summarizing the fitted model.
+
+        Creates a 3-panel figure:
+
+        1. Learning curve (probability) with observed data and criterion trial
+        2. Latent state trajectory with confidence interval
+        3. EM convergence trace
+
+        Must be called after ``fit()``.
+
+        Parameters
+        ----------
+        key : Array
+            JAX PRNG key for Monte Carlo sampling.
+        observed_n_correct : ArrayLike, shape (n_trials,), optional
+            Observed correct responses to overlay on the learning curve.
+        n_samples : int, optional
+            Number of Monte Carlo samples for confidence intervals.
+            Default is 10000.
+
+        Returns
+        -------
+        fig : plt.Figure
+            The matplotlib figure.
+        axes : np.ndarray of plt.Axes
+            Array of axes objects for each panel.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+        """
+        if not self.is_fitted:
+            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
+
+        n_trials = len(self.smoothed_learning_state_mode)
+        trials_axis = jnp.arange(n_trials)
+        plot_percentiles = jnp.array([5.0, 50.0, 95.0])
+
+        # --- Panel 1: Learning curve (probability) ---
+        ax = axes[0]
+        key1, key2 = jax.random.split(key)
+        prob_percentiles, _ = self.get_learning_curve(
+            key=key1, n_samples=n_samples, percentiles=plot_percentiles,
+        )
+        ax.plot(trials_axis, prob_percentiles[1], color="blue", linewidth=2,
+                label="Smoothed median")
+        ax.fill_between(trials_axis, prob_percentiles[0], prob_percentiles[2],
+                        color="blue", alpha=0.2, label="90% CI")
+        ax.axhline(self.prob_correct_by_chance, color="gray", linestyle="--",
+                    linewidth=1, label=f"Chance ({self.prob_correct_by_chance:.2g})")
+
+        if observed_n_correct is not None:
+            observed_n_correct = jnp.asarray(observed_n_correct)
+            if jnp.all((observed_n_correct == 0) | (observed_n_correct == 1)):
+                ax.scatter(trials_axis, observed_n_correct, color="lightgray",
+                           alpha=0.7, s=15, marker="|", label="Observed (0/1)")
+
+        # Mark criterion trial
+        criterion = self.find_criterion_trial(key1, n_samples=n_samples)
+        if criterion is not None and criterion > 0:
+            ax.axvline(criterion, color="green", linestyle=":", linewidth=1.5,
+                       label=f"Criterion trial ({criterion})")
+
+        ax.set_xlabel("Trial", fontsize=11)
+        ax.set_ylabel("P(Correct)", fontsize=11)
+        ax.set_title("Learning Curve", fontsize=13, fontweight="bold")
+        ax.set_ylim(0, 1.05)
+        ax.legend(fontsize=8, loc="lower right")
+        ax.grid(True, linestyle="--", alpha=0.4)
+
+        # --- Panel 2: Latent state ---
+        ax = axes[1]
+        state_percentiles = self.get_latent_state_percentiles(
+            key=key2, n_samples=n_samples, percentiles=plot_percentiles,
+        )
+        ax.plot(trials_axis, state_percentiles[1], color="blue", linewidth=2,
+                label="Smoothed median")
+        ax.fill_between(trials_axis, state_percentiles[0], state_percentiles[2],
+                        color="blue", alpha=0.2, label="90% CI")
+        ax.axhline(0, color="gray", linestyle="--", linewidth=0.8)
+        ax.set_xlabel("Trial", fontsize=11)
+        ax.set_ylabel("Latent State", fontsize=11)
+        ax.set_title("Latent Learning State", fontsize=13, fontweight="bold")
+        ax.legend(fontsize=8)
+        ax.grid(True, linestyle="--", alpha=0.4)
+
+        # --- Panel 3: EM convergence ---
+        ax = axes[2]
+        if self.log_likelihood_history_:
+            iterations = range(1, len(self.log_likelihood_history_) + 1)
+            ax.plot(iterations, self.log_likelihood_history_, "o-", markersize=3,
+                    color="blue")
+        ax.set_xlabel("EM Iteration", fontsize=11)
+        ax.set_ylabel("Log-Likelihood", fontsize=11)
+        ax.set_title("EM Convergence", fontsize=13, fontweight="bold")
+        ax.grid(True, linestyle="--", alpha=0.4)
+
+        fig.suptitle(
+            f"SmithLearningModel Summary "
+            f"(\u03c3\u03b5={self.sigma_epsilon:.3g}, "
+            f"BIC={self.bic():.1f})",
+            fontsize=14, fontweight="bold",
+        )
+
+        return fig, axes
