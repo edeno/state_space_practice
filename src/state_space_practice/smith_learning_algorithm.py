@@ -150,7 +150,7 @@ def _log_posterior_objective(
     """
     prob_success = jax.nn.sigmoid(
         bias + learning_state
-    )  # can add in covariates @ learning_state
+    )
     log_likelihood = jax.scipy.stats.binom.logpmf(
         k=n_correct_in_trial, n=max_possible_correct, p=prob_success
     )
@@ -1799,41 +1799,35 @@ class SmithLearningModel:
 
     def find_criterion_trial(
         self,
-        key: Array,  # Needed if get_learning_curve not yet called
-        lower_percentile_for_criterion: float = 5.0,  # e.g., for p05
-        chance_level_override: Optional[float] = None,
-        n_samples: int = 10000,  # if CIs need to be recomputed
+        key: Array,
+        alpha: float = 0.05,
+        n_samples: int = 10000,
     ) -> Optional[int]:
         """Determines the first trial where learning is reliably above chance.
 
-        Finds the first trial where the lower confidence bound (e.g., 5th
-        percentile) of the estimated probability of a correct response is
-        consistently at or above the chance level.
+        Uses the Smith et al. (2004) criterion: finds the first trial k
+        such that P(p_k > p_chance | y_{1:T}) >= 1 - alpha for all
+        subsequent trials k' >= k. This is computed directly from the
+        ``prob_above_chance`` posterior probability, not from percentile
+        thresholds.
 
         Parameters
         ----------
         key : Array
-            JAX PRNGKey, required if confidence intervals need to be (re)computed.
-        lower_percentile_for_criterion : float, optional
-            The lower percentile to use from the probability confidence interval
-            (e.g., 5.0 for the 5th percentile, p05). Default is 5.0.
-        chance_level_override : Optional[float], optional
-            The probability of success considered as chance level.
-            If None, uses the model's ``prob_correct_by_chance``.
-            Default is None.
+            JAX PRNGKey for Monte Carlo sampling.
+        alpha : float, optional
+            Significance level. The criterion requires
+            P(p_k > p_chance) >= 1 - alpha. Default is 0.05.
         n_samples : int, optional
-            Number of Monte Carlo samples if confidence intervals need to be recomputed.
-            Default is 10000.
+            Number of Monte Carlo samples. Default is 10000.
 
         Returns
         -------
         Optional[int]
-            The 0-indexed trial number of the first trial where the lower
-            confidence bound is at or above chance. Returns 0 if the lower
-            bound never falls below chance (learning appears established from
-            the start). Returns None if the criterion is never met
-            (performance never reliably exceeds chance within the observed
-            trials).
+            The 0-indexed trial number of the first trial where performance
+            is permanently above chance at the given significance level.
+            Returns 0 if always above chance from the start.
+            Returns None if the criterion is never met.
 
         Raises
         ------
@@ -1850,63 +1844,41 @@ class SmithLearningModel:
         if not self.is_fitted:
             raise RuntimeError("Model has not been fitted. Run .fit() method first.")
 
-        chance_p = (
-            chance_level_override
-            if chance_level_override is not None
-            else self.prob_correct_by_chance
-        )
-
-        target_percentiles = jnp.array(
-            [
-                lower_percentile_for_criterion,
-                50.0,
-                100.0 - lower_percentile_for_criterion,
-            ]
-        )
-
-        prob_percentiles, _ = self.get_learning_curve(
+        # Compute P(p_k > p_chance | y_{1:T}) for each trial
+        _, prob_above_chance = self.get_learning_curve(
             key=key,
             n_samples=n_samples,
-            percentiles=target_percentiles,
-            return_prob_above_chance=False,
+            return_prob_above_chance=True,
         )
 
-        p_lower_bound = prob_percentiles[0, :]
+        threshold = 1.0 - alpha
+        meets_criterion = jnp.asarray(prob_above_chance >= threshold)
 
-        # Find the first trial from which the lower CI is permanently
-        # at or above chance for all subsequent trials (Smith et al. 2004).
-        # We scan from the end to find the last trial below chance;
-        # the criterion trial is the one after it.
-        above_chance = jnp.asarray(p_lower_bound >= chance_p)
-
-        if bool(jnp.all(above_chance)):
+        if bool(jnp.all(meets_criterion)):
             logger.info(
-                f"The {lower_percentile_for_criterion}th percentile of success probability "
-                f"is never below the chance level of {chance_p:.3f}. "
-                f"Performance appears above chance from trial 0."
+                f"P(p_k > chance) >= {threshold:.2f} for all trials. "
+                f"Performance above chance from trial 0."
             )
             return 0
 
-        if not bool(above_chance[-1]):
+        if not bool(meets_criterion[-1]):
             logger.info(
-                f"The {lower_percentile_for_criterion}th percentile of success probability "
-                f"is still below chance ({chance_p:.3f}) at the last trial. "
+                f"P(p_k > chance) < {threshold:.2f} at the last trial. "
                 f"Learning criterion not met within the observed trials."
             )
             return None
 
-        # Find the last trial below chance. The criterion trial is the
-        # first trial after which the CI permanently stays above chance.
-        below_chance_indices = jnp.where(~above_chance)[0]
-        last_trial_below_chance = int(below_chance_indices[-1])
+        # Find the last trial that fails the criterion.
+        # The criterion trial is the first trial after which the
+        # condition holds permanently (Smith et al. 2004).
+        fails_criterion = jnp.where(~meets_criterion)[0]
+        last_fail = int(fails_criterion[-1])
+        criterion_trial = last_fail + 1
 
-        # Verify the CI stays above chance for ALL subsequent trials.
-        # This matches the Smith et al. (2004) definition exactly.
-        criterion_trial = last_trial_below_chance + 1
-        if not bool(jnp.all(above_chance[criterion_trial:])):
-            # CI oscillates — no sustained criterion met
+        # Verify it holds for ALL subsequent trials
+        if not bool(jnp.all(meets_criterion[criterion_trial:])):
             logger.info(
-                "Lower CI oscillates above and below chance; "
+                "P(p_k > chance) oscillates above and below threshold; "
                 "no sustained criterion trial found."
             )
             return None
