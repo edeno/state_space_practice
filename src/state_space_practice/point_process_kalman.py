@@ -500,7 +500,8 @@ def stochastic_point_process_smoother(
     process_cov: ArrayLike,
     log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
     include_laplace_normalization: bool = True,
-) -> tuple[Array, Array, Array, Array]:
+    return_filtered: bool = False,
+) -> tuple[Array, ...]:
     """Applies a Stochastic State Point Process Smoother (SSPPS).
 
     This smoother estimates a time-varying latent state ($x_k$) based on
@@ -616,7 +617,10 @@ def stochastic_point_process_smoother(
     smoother_mean = jnp.concatenate((smoother_mean, filtered_mean[-1][None]))
     smoother_cov = jnp.concatenate((smoother_cov, filtered_cov[-1][None]))
 
-    return smoother_mean, smoother_cov, smoother_cross_cov, marginal_log_likelihood
+    result = (smoother_mean, smoother_cov, smoother_cross_cov, marginal_log_likelihood)
+    if return_filtered:
+        return result + (filtered_mean, filtered_cov)
+    return result
 
 
 def kalman_maximization_step(

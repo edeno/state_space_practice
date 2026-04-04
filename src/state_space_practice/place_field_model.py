@@ -389,9 +389,33 @@ class PlaceFieldModel:
         self, neuron_idx: int = 0
     ) -> tuple[slice, int]:
         """Return the slice into the state vector for a given neuron."""
+        if neuron_idx < 0 or neuron_idx >= self.n_neurons:
+            raise ValueError(
+                f"neuron_idx={neuron_idx} out of range for "
+                f"n_neurons={self.n_neurons}"
+            )
         nb = self.n_basis_per_neuron
         start = neuron_idx * nb
         return slice(start, start + nb), nb
+
+    def _build_block_diagonal(self, Z_base: np.ndarray) -> Array:
+        """Build block-diagonal design matrix for multi-neuron models.
+
+        Parameters
+        ----------
+        Z_base : np.ndarray, shape (n_time, n_basis_per_neuron)
+
+        Returns
+        -------
+        Array, shape (n_time, n_neurons, n_basis)
+        """
+        nb = self.n_basis_per_neuron
+        n_time = Z_base.shape[0]
+        Z_base_jnp = jnp.asarray(Z_base)
+        Z_full = jnp.zeros((n_time, self.n_neurons, self.n_basis))
+        for j in range(self.n_neurons):
+            Z_full = Z_full.at[:, j, j * nb:(j + 1) * nb].set(Z_base_jnp)
+        return Z_full
 
     def _check_fitted(self, method_name: str) -> None:
         """Raise if the model has not been fitted."""
@@ -426,15 +450,8 @@ class PlaceFieldModel:
             return jnp.asarray(Z_base)
 
         # Multi-neuron: block-diagonal design matrix
-        # Z_full[t, j, j*nb:(j+1)*nb] = Z_base[t, :]
         self.n_basis = self.n_neurons * self.n_basis_per_neuron
-        n_time = Z_base.shape[0]
-        nb = self.n_basis_per_neuron
-        Z_base_jnp = jnp.asarray(Z_base)
-        Z_full = jnp.zeros((n_time, self.n_neurons, self.n_basis))
-        for j in range(self.n_neurons):
-            Z_full = Z_full.at[:, j, j * nb:(j + 1) * nb].set(Z_base_jnp)
-        return Z_full
+        return self._build_block_diagonal(Z_base)
 
     def _initialize_parameters(self) -> None:
         """Initialize model parameters."""
@@ -453,6 +470,8 @@ class PlaceFieldModel:
             self.smoother_cov,
             self.smoother_cross_cov,
             marginal_ll,
+            self.filtered_mean,
+            self.filtered_cov,
         ) = stochastic_point_process_smoother(
             init_mean_params=self.init_mean,
             init_covariance_params=self.init_cov,
@@ -462,16 +481,7 @@ class PlaceFieldModel:
             transition_matrix=self.transition_matrix,
             process_cov=self.process_cov,
             log_conditional_intensity=self._log_intensity_func,
-        )
-        self.filtered_mean, self.filtered_cov, _ = stochastic_point_process_filter(
-            init_mean_params=self.init_mean,
-            init_covariance_params=self.init_cov,
-            design_matrix=design_matrix,
-            spike_indicator=spikes,
-            dt=self.dt,
-            transition_matrix=self.transition_matrix,
-            process_cov=self.process_cov,
-            log_conditional_intensity=self._log_intensity_func,
+            return_filtered=True,
         )
         return float(marginal_ll)
 
@@ -520,7 +530,9 @@ class PlaceFieldModel:
 
         if self.update_init_state:
             self.init_mean = sm[0]
-            self.init_cov = symmetrize(sc[0])
+            # Keep init_cov diagonal to match n_free_params count and
+            # keep the model tractable for BIC/AIC comparisons.
+            self.init_cov = jnp.diag(jnp.maximum(jnp.diag(sc[0]), 1e-10))
 
     @staticmethod
     def bin_spike_times(
@@ -672,9 +684,12 @@ class PlaceFieldModel:
                     self.smoother_cross_cov = prev_smoother_cross_cov
                     self.filtered_mean = prev_filtered_mean
                     self.filtered_cov = prev_filtered_cov
+                    # Remove the bad LL so log_likelihoods[-1] matches
+                    # the stored model state (used by bic/aic/summary).
+                    bad_ll = self.log_likelihoods.pop()
                     msg = (
                         f"LL decreased: "
-                        f"{self.log_likelihoods[-2]:.1f} -> {ll:.1f}; "
+                        f"{self.log_likelihoods[-1]:.1f} -> {bad_ll:.1f}; "
                         f"stopping EM and rolling back to previous E-step."
                     )
                     _print(f"  WARNING: {msg}")
@@ -734,8 +749,22 @@ class PlaceFieldModel:
         time-averaged weight. This gives a representative sense of how
         uncertain the rate estimate is at each spatial location during the
         specified period.
+
+        This method always uses the linear approximation ``exp(Z @ weights)``.
+        If a nonlinear ``log_intensity_func`` was set at construction, this
+        prediction is an approximation. Use ``smoother_mean`` directly with
+        your intensity function for exact predictions.
         """
         self._check_fitted("predict_rate_map")
+
+        import warnings
+        if self._log_intensity_func is not log_conditional_intensity:
+            warnings.warn(
+                "predict_rate_map uses the linear approximation exp(Z @ x). "
+                "For the nonlinear log_intensity_func set on this model, "
+                "use smoother_mean directly with your intensity function.",
+                stacklevel=2,
+            )
 
         Z_grid = evaluate_basis(grid_positions, self.basis_info)
         s, _ = self._neuron_weights(neuron_idx)
@@ -866,11 +895,21 @@ class PlaceFieldModel:
 
         position = np.asarray(position)
         spikes = jnp.asarray(spikes)
-        # Normalize spikes shape to match fit convention
-        if spikes.ndim == 1 and self.n_neurons == 1:
-            pass  # single-neuron, keep 1D
-        elif spikes.ndim == 2 and self.n_neurons == 1:
-            spikes = spikes.squeeze(axis=1)
+        # Validate and normalize spikes shape
+        if self.n_neurons == 1:
+            if spikes.ndim == 2:
+                spikes = spikes.squeeze(axis=1)
+        else:
+            if spikes.ndim == 1:
+                raise ValueError(
+                    f"Model was fitted with n_neurons={self.n_neurons} but "
+                    f"received 1D spikes. Pass (n_time, {self.n_neurons}) array."
+                )
+            if spikes.ndim == 2 and spikes.shape[1] != self.n_neurons:
+                raise ValueError(
+                    f"Expected {self.n_neurons} spike columns (matching fitted "
+                    f"n_neurons), got {spikes.shape[1]}."
+                )
         if position.shape[0] != spikes.shape[0]:
             raise ValueError(
                 f"position and spikes must have the same number of time bins: "
@@ -882,12 +921,7 @@ class PlaceFieldModel:
         if self.n_neurons == 1:
             design_matrix = jnp.asarray(Z_base)
         else:
-            nb = self.n_basis_per_neuron
-            n_time = Z_base.shape[0]
-            Z_base_jnp = jnp.asarray(Z_base)
-            design_matrix = jnp.zeros((n_time, self.n_neurons, self.n_basis))
-            for j in range(self.n_neurons):
-                design_matrix = design_matrix.at[:, j, j * nb:(j + 1) * nb].set(Z_base_jnp)
+            design_matrix = self._build_block_diagonal(Z_base)
 
         _, _, marginal_ll = stochastic_point_process_filter(
             init_mean_params=self.init_mean,
@@ -1029,8 +1063,8 @@ class PlaceFieldModel:
                 f"  total (start-to-end):     {drift['total_drift']:.2f} cm",
                 f"  cumulative (path):        {drift['cumulative_drift']:.2f} cm",
             ])
-        except Exception:
-            pass
+        except (ValueError, RuntimeError) as e:
+            logger.debug("drift_summary unavailable in summary: %s", e)
 
         return "\n".join(lines)
 
@@ -1105,6 +1139,7 @@ class PlaceFieldModel:
         self,
         n_time_bins: int = 3,
         n_grid: int = 50,
+        neuron_idx: int = 0,
         ax: Optional[np.ndarray] = None,
     ):
         """Plot estimated rate maps in temporal bins.
@@ -1115,6 +1150,8 @@ class PlaceFieldModel:
             Number of temporal bins (e.g., 3 for early/middle/late).
         n_grid : int, default=50
             Spatial grid resolution per dimension.
+        neuron_idx : int, default=0
+            Which neuron to plot (for multi-neuron models).
         ax : array of Axes or None
             Matplotlib axes to plot into. If None, creates a new figure.
 
@@ -1139,7 +1176,9 @@ class PlaceFieldModel:
         # Compute all rate maps first to get shared color scale
         rate_maps = []
         for idx in block_indices:
-            rate, _ = self.predict_rate_map(grid, time_slice=slice(idx[0], idx[-1] + 1))
+            rate, _ = self.predict_rate_map(
+                grid, time_slice=slice(idx[0], idx[-1] + 1), neuron_idx=neuron_idx,
+            )
             rate_maps.append(rate.reshape(n_grid, n_grid))
 
         vmax = max(r.max() for r in rate_maps)

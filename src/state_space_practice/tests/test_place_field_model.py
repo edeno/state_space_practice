@@ -603,3 +603,86 @@ class TestMultiNeuron:
         model.fit(sim_data["position"], spikes_2n, max_iter=3, verbose=False)
         s = model.summary()
         assert "n_neurons" in s
+
+    def test_score_wrong_neuron_count(self, sim_data: dict) -> None:
+        spikes_2n = np.column_stack([sim_data["spikes"], sim_data["spikes"]])
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        model.fit(sim_data["position"], spikes_2n, max_iter=3, verbose=False)
+        # 1D spikes should be rejected for a 2-neuron model
+        with pytest.raises(ValueError, match="n_neurons=2"):
+            model.score(sim_data["position"], sim_data["spikes"])
+        # Wrong number of columns
+        with pytest.raises(ValueError, match="Expected 2"):
+            model.score(sim_data["position"], np.column_stack(
+                [sim_data["spikes"], sim_data["spikes"], sim_data["spikes"]]
+            ))
+
+    def test_neuron_idx_out_of_range(self, sim_data: dict) -> None:
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        model.fit(sim_data["position"], sim_data["spikes"], max_iter=3, verbose=False)
+        grid, _, _ = model.make_grid(n_grid=5)
+        with pytest.raises(ValueError, match="neuron_idx=1 out of range"):
+            model.predict_rate_map(grid, neuron_idx=1)
+
+
+# ------------------------------------------------------------------
+# n_free_params variations
+# ------------------------------------------------------------------
+
+
+class TestNFreeParamsVariations:
+    """Tests for n_free_params across configurations."""
+
+    def test_no_updates(self, sim_data: dict) -> None:
+        model = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3,
+            update_process_cov=False, update_init_state=False,
+        )
+        model.fit(sim_data["position"], sim_data["spikes"], max_iter=3, verbose=False)
+        assert model.n_free_params == 0
+
+    def test_isotropic(self, sim_data: dict) -> None:
+        model = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3,
+            process_noise_structure="isotropic",
+        )
+        model.fit(sim_data["position"], sim_data["spikes"], max_iter=3, verbose=False)
+        # isotropic Q (1) + init_mean (nb) + init_cov_diag (nb) = 1 + 2*nb
+        assert model.n_free_params == 1 + 2 * model.n_basis
+
+    def test_with_transition(self, sim_data: dict) -> None:
+        model = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3,
+            update_transition_matrix=True,
+        )
+        model.fit(sim_data["position"], sim_data["spikes"], max_iter=3, verbose=False)
+        nb = model.n_basis
+        # diagonal Q (nb) + A (nb^2) + init_mean (nb) + init_cov_diag (nb) = nb^2 + 3*nb
+        assert model.n_free_params == nb ** 2 + 3 * nb
+
+
+# ------------------------------------------------------------------
+# Nonlinear intensity warning
+# ------------------------------------------------------------------
+
+
+class TestNonlinearWarning:
+    """Tests for warning when predict_rate_map uses linear approximation."""
+
+    def test_warning_with_custom_func(self, sim_data: dict) -> None:
+        import warnings
+
+        def custom_func(dm, params):
+            return dm @ params  # same as default but different object
+
+        model = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3,
+            log_intensity_func=custom_func,
+        )
+        model.fit(sim_data["position"], sim_data["spikes"], max_iter=3, verbose=False)
+        grid, _, _ = model.make_grid(n_grid=5)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            model.predict_rate_map(grid)
+            assert len(w) == 1
+            assert "linear approximation" in str(w[0].message)
