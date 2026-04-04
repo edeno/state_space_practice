@@ -48,8 +48,9 @@ optimization (BFGS), and efficient vectorized/scanned operations.
 import logging
 import math
 import warnings
+from collections.abc import Callable
 from functools import partial
-from typing import Callable, List, Optional, Tuple
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -62,8 +63,6 @@ from jax.typing import ArrayLike
 
 from state_space_practice.utils import check_converged
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Default process noise standard deviation
@@ -74,7 +73,7 @@ DEFAULT_SIGMA_EPSILON: float = math.sqrt(DEFAULT_PROCESS_NOISE_VARIANCE)
 
 def approximate_gaussian(
     log_posterior_func: Callable[[ArrayLike], Array], x0: ArrayLike
-) -> Tuple[Array, Array]:
+) -> tuple[Array, Array]:
     """Approximate the posterior using Laplace approximation.
 
     Finds the mode and covariance matrix using the Hessian of the
@@ -119,7 +118,6 @@ def approximate_gaussian(
     return mode, covariance
 
 
-@jax.jit
 def _log_posterior_objective(
     learning_state: ArrayLike,
     learning_state_prev: ArrayLike,
@@ -147,8 +145,8 @@ def _log_posterior_objective(
 
     Returns
     -------
-    log_posterior : Array, shape (n,)
-        Log posterior of the state estimate vector
+    log_posterior : Array, shape ()
+        Scalar log posterior of the state estimate
     """
     prob_success = jax.nn.sigmoid(
         bias + learning_state
@@ -170,7 +168,7 @@ def smith_learning_filter(
     sigma_epsilon: float = DEFAULT_SIGMA_EPSILON,
     prob_correct_by_chance: float = 0.5,
     max_possible_correct: Optional[ArrayLike] = None,
-) -> Tuple[Array, Array, Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array, Array]:
     """Applies a non-linear Bayesian filter (Laplace approximation) for learning.
 
     Assumes a random walk model for the latent learning state ($x_k$) and
@@ -239,8 +237,8 @@ def smith_learning_filter(
 
     @jax.jit
     def _step(
-        carry: Tuple[Array, Array], trial_data: Tuple[Array, Array]
-    ) -> Tuple[Tuple[Array, Array], Tuple[Array, Array, Array, Array]]:
+        carry: tuple[Array, Array], trial_data: tuple[Array, Array]
+    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array, Array]]:
         """A single step of the non-linear filter."""
         mode_prev, variance_prev = carry
         n_correct_trial_k, max_possible_correct_trial_k = trial_data
@@ -339,8 +337,8 @@ def smith_learning_smoother(
 
     @jax.jit
     def _step(
-        carry: Tuple[Array, Array], k: int
-    ) -> Tuple[Tuple[Array, Array], Tuple[Array, Array, Array]]:
+        carry: tuple[Array, Array], k: int
+    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
         """A single JIT-compiled step of the RTS smoother."""
         mode_smoothed_next, variance_smoothed_next = carry
         smoother_gain = (
@@ -397,62 +395,65 @@ def smith_learning_smoother(
 
 
 def maximization_step(
-    smoothed_mode: ArrayLike,
-    smoothed_variance: ArrayLike,
+    smoothed_learning_state_mode: ArrayLike,
+    smoothed_learning_state_variance: ArrayLike,
     smoother_gain: ArrayLike,
-) -> Tuple[Array, Array, Array]:
+) -> tuple[Array, Array, Array]:
     """Estimate process noise from smoothed estimates.
 
     Parameters
     ----------
-    smoothed_mode : ArrayLike, shape (n_trials,)
+    smoothed_learning_state_mode : ArrayLike, shape (n_trials,)
         Smoothed learning state mode estimates.
-    smoothed_variance : ArrayLike, shape (n_trials,)
+    smoothed_learning_state_variance : ArrayLike, shape (n_trials,)
         Smoothed learning state variance estimates.
-    smoother_gain : ArrayLike, shape (n_trials,)
+    smoother_gain : ArrayLike, shape (n_trials - 1,)
         Smoother gain estimates.
 
     Returns
     -------
-    sigma_epsilon : Array, shape (n_trials,)
-        Estimated process noise standard deviation.
-    init_learning_state : Array, shape (1,)
-        Initial learning state estimate.
-    init_learning_variance : Array, shape (1,)
-        Initial learning state variance estimate.
+    sigma_epsilon : Array, shape ()
+        Estimated process noise standard deviation (scalar).
+    init_learning_state : Array, shape ()
+        Initial learning state estimate (scalar).
+    init_learning_variance : Array, shape ()
+        Initial learning state variance estimate (scalar).
     """
-    smoothed_mode = jnp.asarray(smoothed_mode)
-    smoothed_variance = jnp.asarray(smoothed_variance)
+    smoothed_learning_state_mode = jnp.asarray(smoothed_learning_state_mode)
+    smoothed_learning_state_variance = jnp.asarray(smoothed_learning_state_variance)
     smoother_gain = jnp.asarray(smoother_gain)
-    n_trials: int = len(smoothed_mode)
+    n_trials: int = len(smoothed_learning_state_mode)
     # E[(x_{k+1} - x_k)^2 | y_{1:T}] = (x_{k+1|T} - x_{k|T})^2 + P_{k+1|T} + P_{k|T}
     #                                  - 2 * Cov(x_{k+1}, x_k | y_{1:T})
     # where Cov(x_{k+1}, x_k | y_{1:T}) = A_k * P_{k+1|T}
     expected_squared_diff_terms = (
-        (smoothed_mode[1:] - smoothed_mode[:-1]) ** 2
-        + smoothed_variance[1:]
-        + smoothed_variance[:-1]
-        - 2.0 * smoothed_variance[1:] * smoother_gain  # Cov = A_k * P_{k+1|T}
+        (smoothed_learning_state_mode[1:] - smoothed_learning_state_mode[:-1]) ** 2
+        + smoothed_learning_state_variance[1:]
+        + smoothed_learning_state_variance[:-1]
+        - 2.0 * smoothed_learning_state_variance[1:] * smoother_gain  # Cov = A_k * P_{k+1|T}
     )
 
     sigma_epsilon_sq = jnp.sum(expected_squared_diff_terms) / (n_trials - 1)
+    # Clamp to prevent NaN from negative values (can occur when smoother
+    # gains exceed 1) and enforce a minimum floor to avoid degenerate estimates.
+    sigma_epsilon_sq = jnp.maximum(sigma_epsilon_sq, 1e-12)
     sigma_epsilon = jnp.sqrt(sigma_epsilon_sq)
 
-    init_learning_state = smoothed_mode[0]
-    init_learning_variance = smoothed_variance[0]
+    init_learning_state = smoothed_learning_state_mode[0]
+    init_learning_variance = smoothed_learning_state_variance[0]
 
     return sigma_epsilon, init_learning_state, init_learning_variance
 
 
 def calculate_probability_confidence_limits(
     key: Array,
-    smoothed_mode: ArrayLike,
-    smoothed_variance: ArrayLike,
-    mu_bias: float,
+    smoothed_learning_state_mode: ArrayLike,
+    smoothed_learning_state_variance: ArrayLike,
+    prob_correct_by_chance: float,
     n_samples: int = 10000,
     percentiles: Optional[ArrayLike] = None,
-    prob_correct_by_chance: Optional[float] = None,
-) -> Tuple[Array, Optional[Array]]:
+    return_prob_above_chance: bool = False,
+) -> tuple[Array, Optional[Array]]:
     """Calculates confidence limits for the probability of a correct response.
 
     This is achieved by sampling from the smoothed posterior distribution of
@@ -463,39 +464,43 @@ def calculate_probability_confidence_limits(
     ----------
     key : Array
         JAX PRNG key for random number generation.
-    smoothed_mode : ArrayLike, shape (n_trials,)
+    smoothed_learning_state_mode : ArrayLike, shape (n_trials,)
         Smoothed learning state means (x_{k|T}).
-    smoothed_variance : ArrayLike, shape (n_trials,)
+    smoothed_learning_state_variance : ArrayLike, shape (n_trials,)
         Smoothed learning state variances (P_{k|T}).
-    mu_bias : float
-        Bias term (mu) in the sigmoid function: p_k = sigmoid(mu + x_k).
+    prob_correct_by_chance : float
+        Probability of a correct response by chance. Used to compute the
+        bias term (mu) in the sigmoid function: p_k = sigmoid(mu + x_k).
+        If ``return_prob_above_chance`` is True, also used as the threshold
+        for computing prob_above_chance.
     n_samples : int, optional
         Number of Monte Carlo samples to draw per trial. Default is 10000.
     percentiles : ArrayLike, optional
         Array of percentiles to compute (e.g., jnp.array([5, 50, 95])).
         If None, defaults to jnp.array([5.0, 50.0, 95.0]).
-    prob_correct_by_chance : Optional[float], optional
-        If provided, computes the certainty (pcert) that the true probability
-        of a correct response is greater than this chance level. Default is None.
+    return_prob_above_chance : bool, optional
+        If True, computes the certainty (prob_above_chance) that the true probability
+        of a correct response is greater than the chance level. Default is False.
 
     Returns
     -------
     probability_percentiles : Array, shape (n_percentiles, n_trials)
         The computed percentile values for the probability of correct response
         for each trial.
-    pcert : Optional[Array], shape (n_trials,)
+    prob_above_chance : Optional[Array], shape (n_trials,)
         The certainty that p_k > prob_correct_by_chance for each trial.
-        Returned if prob_correct_by_chance is not None.
+        Returned if return_prob_above_chance is True.
     """
-    smoothed_mode = jnp.asarray(smoothed_mode)
-    smoothed_variance = jnp.asarray(smoothed_variance)
+    mu_bias = math.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
+    smoothed_learning_state_mode = jnp.asarray(smoothed_learning_state_mode)
+    smoothed_learning_state_variance = jnp.asarray(smoothed_learning_state_variance)
     if percentiles is None:
         percentiles = jnp.array([5.0, 50.0, 95.0])
 
-    n_trials = smoothed_mode.shape[0]
+    n_trials = smoothed_learning_state_mode.shape[0]
 
     epsilon = 1e-9
-    smoothed_std_dev = jnp.sqrt(jnp.maximum(smoothed_variance, epsilon))
+    smoothed_std_dev = jnp.sqrt(jnp.maximum(smoothed_learning_state_variance, epsilon))
 
     # Function to process a single trial
     def process_trial(key_trial, mode_k, std_dev_k):
@@ -512,27 +517,27 @@ def calculate_probability_confidence_limits(
         # Calculate requested percentiles for this trial
         trial_percentiles = jnp.percentile(prob_samples, percentiles)
 
-        # Calculate pcert if requested
-        if prob_correct_by_chance is not None:
-            trial_pcert = jnp.mean(prob_samples > prob_correct_by_chance)
-            return trial_percentiles, trial_pcert
+        # Calculate prob_above_chance if requested
+        if return_prob_above_chance:
+            trial_prob_above_chance = jnp.mean(prob_samples > prob_correct_by_chance)
+            return trial_percentiles, trial_prob_above_chance
         else:
             return trial_percentiles, None  # Or jnp.nan if a consistent shape is needed
 
     # Generate per-trial PRNG keys
     trial_keys = jax.random.split(key, n_trials)
     probability_percentiles = jax.vmap(process_trial)(
-        trial_keys, smoothed_mode, smoothed_std_dev
+        trial_keys, smoothed_learning_state_mode, smoothed_std_dev
     )
 
-    if prob_correct_by_chance is not None:
+    if return_prob_above_chance:
         return probability_percentiles[0].T, probability_percentiles[1]
     else:
         return probability_percentiles[0].T, None
 
 
 def find_min_consecutive_successes(
-    prob_success_null: float,
+    prob_correct_by_chance: float,
     critical_probability_threshold: float,
     sequence_length: int,
     min_run_length: int = 2,
@@ -540,7 +545,7 @@ def find_min_consecutive_successes(
 ) -> Optional[int]:
     """
     Finds the minimum number of consecutive successes (run_length) in a sequence of
-    `sequence_length` Bernoulli trials (with success probability `prob_success_null`)
+    `sequence_length` Bernoulli trials (with success probability `prob_correct_by_chance`)
     such that the probability of observing at least one such run is less
     than `critical_probability_threshold`.
 
@@ -549,7 +554,7 @@ def find_min_consecutive_successes(
 
     Parameters
     ----------
-    prob_success_null : float
+    prob_correct_by_chance : float
         Probability of a correct response under the null hypothesis (e.g., 0.5).
     critical_probability_threshold : float
         The critical p-value (e.g., 0.01 or 0.05).
@@ -567,8 +572,8 @@ def find_min_consecutive_successes(
         the criterion. Returns None if no run_length in the range
         [min_run_length, max_run_length] satisfies the condition.
     """
-    if not (0 < prob_success_null < 1):
-        raise ValueError("prob_success_null must be between 0 and 1.")
+    if not (0 < prob_correct_by_chance < 1):
+        raise ValueError("prob_correct_by_chance must be between 0 and 1.")
     if not (0 < critical_probability_threshold < 1):
         raise ValueError("critical_probability_threshold must be between 0 and 1.")
     if sequence_length <= 0:
@@ -580,86 +585,47 @@ def find_min_consecutive_successes(
         )
 
     for current_run_length in range(min_run_length, max_run_length + 1):
-        total_prob_at_least_one_run: float | Array
+        total_prob_at_least_one_run: float
         if current_run_length > sequence_length:
-            # A run of current_run_length cannot occur in sequence_length trials
             total_prob_at_least_one_run = 0.0
         else:
-            # prob_first_run_ends_at_idx[i] stores P(first run of length `current_run_length`
-            # ends at a trial corresponding to index i in this array).
-            # The length of this array is `sequence_length - current_run_length + 1`,
-            # representing the number of possible ending positions for the *first* run.
             n_possible_ending_positions = sequence_length - current_run_length + 1
-            prob_first_run_ends_at_idx = jnp.zeros(n_possible_ending_positions)
+            prob_first_run_ends_at_idx = np.zeros(n_possible_ending_positions)
 
-            # Probability of run of length `current_run_length`
-            prob_run_occurs = prob_success_null**current_run_length
+            prob_run_occurs = prob_correct_by_chance**current_run_length
 
             # Base case: first run ends at trial `current_run_length`
-            # (corresponds to index 0 in prob_first_run_ends_at_idx)
-            prob_first_run_ends_at_idx = prob_first_run_ends_at_idx.at[0].set(
-                prob_run_occurs
-            )
+            prob_first_run_ends_at_idx[0] = prob_run_occurs
 
-            # Case 1: Short sequence (sequence_length <= 2 * current_run_length)
             if sequence_length <= 2 * current_run_length:
                 if n_possible_ending_positions > 1:
-                    # For runs ending at trial k > current_run_length,
-                    # they must be preceded by a failure.
-                    # P(F S...S) = (1-p)p^j
-                    prob_first_run_ends_at_idx = prob_first_run_ends_at_idx.at[1:].set(
-                        prob_run_occurs * (1 - prob_success_null)
+                    prob_first_run_ends_at_idx[1:] = (
+                        prob_run_occurs * (1 - prob_correct_by_chance)
                     )
-            # Case 2: Longer sequence (sequence_length > 2 * current_run_length)
             else:
-                # For runs ending at trials > current_run_length and <= 2*current_run_length
-                # (indices 1 to current_run_length in prob_first_run_ends_at_idx)
-                # Example: if current_run_length is 3:
-                # f[0] for run ending at trial 3 (SSS)
-                # f[1] for run ending at trial 4 (FSSS)
-                # f[2] for run ending at trial 5 (XFSSS)
-                # f[current_run_length] for run ending at trial 2*current_run_length
-
-                # Max index for this simple assignment part:
-                # min(current_run_length, n_possible_ending_positions - 1)
-                # This covers indices 1 up to current_run_length
                 idx_simple_end = min(
                     current_run_length, n_possible_ending_positions - 1
                 )
-                if idx_simple_end >= 1:  # Ensure slice is valid
-                    prob_first_run_ends_at_idx = prob_first_run_ends_at_idx.at[
-                        1 : idx_simple_end + 1
-                    ].set(prob_run_occurs * (1 - prob_success_null))
+                if idx_simple_end >= 1:
+                    prob_first_run_ends_at_idx[1 : idx_simple_end + 1] = (
+                        prob_run_occurs * (1 - prob_correct_by_chance)
+                    )
 
                 # Recursive part for runs ending at trials > 2*current_run_length
-                # Loop for current_f_idx from current_run_length + 1
-                # up to n_possible_ending_positions - 1
-                # This corresponds to runs ending at actual trial numbers > 2*current_run_length
                 for current_f_idx in range(
                     current_run_length + 1, n_possible_ending_positions
                 ):
-                    # Sum P(first run ends at k) for k from current_run_length up to
-                    # trial_index_of_current_f - current_run_length - 1.
-                    # In terms of prob_first_run_ends_at_idx indices:
-                    # Sum f[0]...f[current_f_idx - current_run_length - 1]
                     sum_limit_exclusive = current_f_idx - current_run_length
-
-                    # Ensure sum_limit_exclusive is not negative for slicing
-                    # Though sum of empty slice is 0.
-                    sum_prev_f_values = jnp.sum(
+                    sum_prev_f_values = np.sum(
                         prob_first_run_ends_at_idx[0:sum_limit_exclusive]
                     )
-
-                    new_f_value = (
+                    prob_first_run_ends_at_idx[current_f_idx] = (
                         prob_run_occurs
-                        * (1 - prob_success_null)
+                        * (1 - prob_correct_by_chance)
                         * (1 - sum_prev_f_values)
                     )
-                    prob_first_run_ends_at_idx = prob_first_run_ends_at_idx.at[
-                        current_f_idx
-                    ].set(new_f_value)
 
-            total_prob_at_least_one_run = jnp.sum(prob_first_run_ends_at_idx)
+            total_prob_at_least_one_run = float(np.sum(prob_first_run_ends_at_idx))
 
         if total_prob_at_least_one_run < critical_probability_threshold:
             return current_run_length
@@ -674,7 +640,7 @@ def simulate_learning_data(
     learning_rate: float = 0.2,
     inflection_point: float = 25.0,
     seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Simulates learning data with a sigmoid probability curve.
 
     Generates binary outcomes (0 or 1) for a specified number of trials.
@@ -742,7 +708,7 @@ def simulate_learning_data(
 
 def _find_runs_of_value(
     data: jax.Array, value_to_find: int, min_length: int
-) -> List[Tuple[int, int]]:
+) -> list[tuple[int, int]]:
     """
     Finds start and end indices of runs of a specific value of at least a minimum length.
 
@@ -757,7 +723,7 @@ def _find_runs_of_value(
 
     Returns
     -------
-    List[Tuple[int, int]]
+    list[tuple[int, int]]
         A list of (start_index, end_index) tuples for each qualifying run.
         Indices are 0-based, and end_index is inclusive.
     """
@@ -788,9 +754,9 @@ def _find_runs_of_value(
 
 
 def compute_cross_covariance_matrix(
-    smoothed_variance: jnp.ndarray,
-    smoother_gain: jnp.ndarray,
-) -> jnp.ndarray:
+    smoothed_learning_state_variance: ArrayLike,
+    smoother_gain: ArrayLike,
+) -> Array:
     """Compute the full cross-covariance matrix for all trial pairs.
 
     Computes Cov(x_i, x_j | y_{1:T}) for all pairs i <= j using the formula:
@@ -800,7 +766,7 @@ def compute_cross_covariance_matrix(
 
     Parameters
     ----------
-    smoothed_variance : jnp.ndarray, shape (n_trials,)
+    smoothed_learning_state_variance : jnp.ndarray, shape (n_trials,)
         Smoothed learning state variances (P_{k|T}).
     smoother_gain : jnp.ndarray, shape (n_trials - 1,)
         Smoother gain values (A_k).
@@ -812,7 +778,7 @@ def compute_cross_covariance_matrix(
         Cov(x_i, x_j | y_{1:T}). Diagonal contains variances P_{k|T}.
         Lower triangle is symmetric (Cov(x_i, x_j) = Cov(x_j, x_i)).
     """
-    n_trials = len(smoothed_variance)
+    n_trials = len(smoothed_learning_state_variance)
 
     # Compute cumulative product of smoother gains
     # cumgain[k] = A_0 * A_1 * ... * A_{k-1} for k >= 1, cumgain[0] = 1
@@ -831,7 +797,7 @@ def compute_cross_covariance_matrix(
     log_gain_products = cumsum_log_gains[j_idx] - cumsum_log_gains[i_idx]
 
     # Cross-covariance = exp(log_gain_products) * P_j (for i <= j)
-    cross_cov_matrix = jnp.exp(log_gain_products) * smoothed_variance[j_idx]
+    cross_cov_matrix = jnp.exp(log_gain_products) * smoothed_learning_state_variance[j_idx]
 
     # For i > j, use symmetry: Cov(x_i, x_j) = Cov(x_j, x_i)
     # But our formula computes Cov(x_i, x_j) = product(A_i:A_{j-1}) * P_j
@@ -844,13 +810,13 @@ def compute_cross_covariance_matrix(
 
 def compute_trial_comparison_matrix(
     key: Array,
-    smoothed_mode: jnp.ndarray,
-    smoothed_variance: jnp.ndarray,
-    smoother_gain: jnp.ndarray,
+    smoothed_learning_state_mode: ArrayLike,
+    smoothed_learning_state_variance: ArrayLike,
+    smoother_gain: ArrayLike,
     n_samples: int = 10000,
     compare_probability: bool = False,
-    mu_bias: Optional[float] = None,
-) -> jnp.ndarray:
+    prob_correct_by_chance: Optional[float] = None,
+) -> Array:
     """Compute pairwise comparison matrix for all trials (vectorized).
 
     Computes P(x_i > x_j | y_{1:T}) for all pairs of trials i < j.
@@ -861,9 +827,9 @@ def compute_trial_comparison_matrix(
     ----------
     key : Array
         JAX PRNG key for Monte Carlo sampling.
-    smoothed_mode : jnp.ndarray, shape (n_trials,)
+    smoothed_learning_state_mode : jnp.ndarray, shape (n_trials,)
         Smoothed learning state modes (x_{k|T}).
-    smoothed_variance : jnp.ndarray, shape (n_trials,)
+    smoothed_learning_state_variance : jnp.ndarray, shape (n_trials,)
         Smoothed learning state variances (P_{k|T}).
     smoother_gain : jnp.ndarray, shape (n_trials - 1,)
         Smoother gain values (A_k).
@@ -871,8 +837,9 @@ def compute_trial_comparison_matrix(
         Number of Monte Carlo samples per comparison. Default is 10000.
     compare_probability : bool, optional
         If True, compare in probability space. Default is False.
-    mu_bias : float, optional
-        Bias term for sigmoid. Required if compare_probability=True.
+    prob_correct_by_chance : Optional[float], optional
+        Probability of correct response by chance. Required if compare_probability=True.
+        Used to compute the bias term for sigmoid transformation.
 
     Returns
     -------
@@ -880,13 +847,13 @@ def compute_trial_comparison_matrix(
         Upper triangular matrix where entry [i, j] (i < j) contains
         P(x_i > x_j | y_{1:T}). Diagonal is 0.5, lower triangle is NaN.
     """
-    n_trials = len(smoothed_mode)
+    n_trials = len(smoothed_learning_state_mode)
 
     # Compute full cross-covariance matrix
-    cross_cov_matrix = compute_cross_covariance_matrix(smoothed_variance, smoother_gain)
+    cross_cov_matrix = compute_cross_covariance_matrix(smoothed_learning_state_variance, smoother_gain)
 
     # Generate samples for all trials at once: shape (n_samples, n_trials)
-    # Sample from multivariate normal N(smoothed_mode, cross_cov_matrix)
+    # Sample from multivariate normal N(smoothed_learning_state_mode, cross_cov_matrix)
     # Use eigendecomposition for numerical stability
     eigenvalues, eigenvectors = jnp.linalg.eigh(cross_cov_matrix)
     eigenvalues = jnp.maximum(eigenvalues, 0.0)  # Ensure non-negative
@@ -894,11 +861,12 @@ def compute_trial_comparison_matrix(
 
     # Generate standard normal samples and transform
     z = jax.random.normal(key, shape=(n_samples, n_trials))
-    samples = smoothed_mode + z @ sqrt_cov.T  # shape: (n_samples, n_trials)
+    samples = smoothed_learning_state_mode + z @ sqrt_cov.T  # shape: (n_samples, n_trials)
 
     if compare_probability:
-        if mu_bias is None:
-            raise ValueError("mu_bias is required when compare_probability=True")
+        if prob_correct_by_chance is None:
+            raise ValueError("prob_correct_by_chance is required when compare_probability=True")
+        mu_bias = math.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
         samples = jax.nn.sigmoid(mu_bias + samples)
 
     # Compute P(x_i > x_j) for all pairs using broadcasting
@@ -927,14 +895,14 @@ def compute_trial_comparison_matrix(
 
 def compare_two_trials(
     key: Array,
-    smoothed_mode: jnp.ndarray,
-    smoothed_variance: jnp.ndarray,
-    smoother_gain: jnp.ndarray,
+    smoothed_learning_state_mode: ArrayLike,
+    smoothed_learning_state_variance: ArrayLike,
+    smoother_gain: ArrayLike,
     trial1: int,
     trial2: int,
     n_samples: int = 10000,
     compare_probability: bool = False,
-    mu_bias: Optional[float] = None,
+    prob_correct_by_chance: Optional[float] = None,
 ) -> float:
     """Compute the probability that learning state at trial1 > trial2.
 
@@ -949,9 +917,9 @@ def compare_two_trials(
     ----------
     key : Array
         JAX PRNG key for Monte Carlo sampling.
-    smoothed_mode : jnp.ndarray, shape (n_trials,)
+    smoothed_learning_state_mode : jnp.ndarray, shape (n_trials,)
         Smoothed learning state modes (x_{k|T}).
-    smoothed_variance : jnp.ndarray, shape (n_trials,)
+    smoothed_learning_state_variance : jnp.ndarray, shape (n_trials,)
         Smoothed learning state variances (P_{k|T}).
     smoother_gain : jnp.ndarray, shape (n_trials - 1,)
         Smoother gain values (A_k).
@@ -964,40 +932,46 @@ def compare_two_trials(
     compare_probability : bool, optional
         If True, compare in probability space (sigmoid-transformed).
         If False, compare raw latent states. Default is False.
-    mu_bias : float, optional
-        Bias term for sigmoid transformation. Required if compare_probability=True.
+    prob_correct_by_chance : Optional[float], optional
+        Probability of correct response by chance. Required if compare_probability=True.
+        Used to compute the bias term for sigmoid transformation.
 
     Returns
     -------
-    p_value : float
-        P(x_{trial1} > x_{trial2} | y_{1:T}), or in probability space if requested.
+    posterior_probability : float
+        Bayesian posterior probability P(x_{trial1} > x_{trial2} | y_{1:T}),
+        or in probability space if requested. This is NOT a frequentist p-value.
         Values > 0.5 indicate trial1 has higher learning state than trial2.
         Values near 0.95 or 0.05 indicate statistically significant differences.
     """
     if trial1 == trial2:
         return 0.5  # Same trial, no difference
 
-    # Compute full comparison matrix and extract the relevant entry
-    comparison_matrix = compute_trial_comparison_matrix(
-        key=key,
-        smoothed_mode=smoothed_mode,
-        smoothed_variance=smoothed_variance,
-        smoother_gain=smoother_gain,
-        n_samples=n_samples,
-        compare_probability=compare_probability,
-        mu_bias=mu_bias,
-    )
+    # Sample from 2x2 marginal; avoids O(n² × n_samples) full comparison matrix
+    cross_cov_matrix = compute_cross_covariance_matrix(smoothed_learning_state_variance, smoother_gain)
+    indices = jnp.array([trial1, trial2])
+    mean_2 = smoothed_learning_state_mode[indices]
+    cov_2 = cross_cov_matrix[jnp.ix_(indices, indices)]
 
-    # Extract the comparison for trial1 vs trial2
-    if trial1 < trial2:
-        return float(comparison_matrix[trial1, trial2])
-    else:
-        # P(trial1 > trial2) = 1 - P(trial2 > trial1)
-        return float(1.0 - comparison_matrix[trial2, trial1])
+    # Sample from bivariate normal
+    eigenvalues, eigenvectors = jnp.linalg.eigh(cov_2)
+    eigenvalues = jnp.maximum(eigenvalues, 0.0)
+    sqrt_cov = eigenvectors @ jnp.diag(jnp.sqrt(eigenvalues))
+
+    z = jax.random.normal(key, shape=(n_samples, 2))
+    samples = mean_2 + z @ sqrt_cov.T  # shape: (n_samples, 2)
+
+    if compare_probability:
+        if prob_correct_by_chance is None:
+            raise ValueError("prob_correct_by_chance is required when compare_probability=True")
+        mu_bias = math.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
+        samples = jax.nn.sigmoid(mu_bias + samples)
+
+    return float(jnp.mean(samples[:, 0] > samples[:, 1]))
 
 
 def find_first_significant_trial(
-    comparison_matrix: jnp.ndarray,
+    comparison_matrix: ArrayLike,
     reference_trial: int = 0,
     significance_level: float = 0.05,
 ) -> Optional[int]:
@@ -1035,8 +1009,8 @@ def find_first_significant_trial(
 
 def calculate_latent_state_percentiles(
     key: Array,
-    smoothed_mode: ArrayLike,  # shape: (n_trials,)
-    smoothed_variance: ArrayLike,  # shape: (n_trials,)
+    smoothed_learning_state_mode: ArrayLike,  # shape: (n_trials,)
+    smoothed_learning_state_variance: ArrayLike,  # shape: (n_trials,)
     n_samples: int = 10000,
     percentiles: Optional[ArrayLike] = None,
 ) -> Array:
@@ -1049,9 +1023,9 @@ def calculate_latent_state_percentiles(
     ----------
     key : Array
         JAX PRNG key for random number generation.
-    smoothed_mode : jnp.ndarray, shape (n_trials,)
+    smoothed_learning_state_mode : jnp.ndarray, shape (n_trials,)
         Smoothed learning state means (x_{k|T}).
-    smoothed_variance : jnp.ndarray, shape (n_trials,)
+    smoothed_learning_state_variance : jnp.ndarray, shape (n_trials,)
         Smoothed learning state variances (P_{k|T}).
     n_samples : int, optional
         Number of Monte Carlo samples to draw per trial. Default is 10000.
@@ -1067,11 +1041,11 @@ def calculate_latent_state_percentiles(
     if percentiles is None:
         percentiles = jnp.array([5.0, 50.0, 95.0])
 
-    smoothed_mode_arr = jnp.asarray(smoothed_mode)
-    smoothed_variance_arr = jnp.asarray(smoothed_variance)
-    n_trials = smoothed_mode_arr.shape[0]
+    smoothed_learning_state_mode_arr = jnp.asarray(smoothed_learning_state_mode)
+    smoothed_learning_state_variance_arr = jnp.asarray(smoothed_learning_state_variance)
+    n_trials = smoothed_learning_state_mode_arr.shape[0]
     epsilon = 1e-9  # For numerical stability if variance is tiny
-    smoothed_std_dev = jnp.sqrt(jnp.maximum(smoothed_variance_arr, epsilon))
+    smoothed_std_dev = jnp.sqrt(jnp.maximum(smoothed_learning_state_variance_arr, epsilon))
 
     def process_trial_state(key_trial: Array, mode_k: Array, std_dev_k: Array) -> Array:
         latent_state_samples = mode_k + std_dev_k * jax.random.normal(
@@ -1083,13 +1057,78 @@ def calculate_latent_state_percentiles(
     # Use vmap for efficient per-trial processing
     # mapped_results will have shape (n_trials, n_percentiles)
     mapped_results: Array = jax.vmap(process_trial_state)(
-        trial_keys, smoothed_mode_arr, smoothed_std_dev
+        trial_keys, smoothed_learning_state_mode_arr, smoothed_std_dev
     )
     # Transpose to get (n_percentiles, n_trials)
     return mapped_results.T
 
 
+VALID_INIT_METHODS = frozenset({
+    "reestimate_initial_from_data",
+    "set_initial_to_zero",
+    "set_initial_conservative_from_second_trial",
+    "set_initial_direct_from_second_trial",
+    "user_provided",
+})
+
+
 class SmithLearningAlgorithm:
+    """Bayesian state-space model for tracking learning from trial outcomes.
+
+    Implements the Smith et al. (2004) algorithm for estimating a latent
+    learning state from binomial (correct/incorrect) trial data. Uses a
+    Laplace-approximated Kalman filter/smoother with EM parameter estimation.
+
+    Typical workflow::
+
+        model = SmithLearningAlgorithm(sigma_epsilon=0.22)
+        log_likelihoods = model.fit(outcomes)
+        key = jax.random.PRNGKey(0)
+        prob_percentiles, _ = model.get_learning_curve(key)
+        fig, ax = model.plot_learning_process(key, observed_n_correct=outcomes)
+
+    Attributes
+    ----------
+    sigma_epsilon : float
+        Process noise standard deviation.
+    prob_correct_by_chance : float
+        Probability of correct response by chance.
+    mu_bias : float
+        Bias term derived from ``prob_correct_by_chance`` (logit of chance).
+    initial_state_method : str
+        Strategy for updating initial state during EM.
+    max_possible_correct : Optional[int]
+        Maximum correct responses per trial (``N_k``).
+    init_learning_state : float
+        Initial learning state estimate (updated during EM).
+    init_learning_variance : float
+        Initial learning state variance (updated during EM).
+    filtered_prob_correct_response : Optional[jax.Array]
+        Filtered probability of correct response, shape ``(n_trials,)``.
+    filtered_learning_state_mode : Optional[jax.Array]
+        Filtered learning state mode, shape ``(n_trials,)``.
+    filtered_learning_state_variance : Optional[jax.Array]
+        Filtered learning state variance, shape ``(n_trials,)``.
+    filtered_one_step_mode : Optional[jax.Array]
+        One-step-ahead predicted mode, shape ``(n_trials,)``.
+    filtered_one_step_variance : Optional[jax.Array]
+        One-step-ahead predicted variance, shape ``(n_trials,)``.
+    smoothed_learning_state_mode : Optional[jax.Array]
+        Smoothed learning state mode, shape ``(n_trials,)``.
+    smoothed_learning_state_variance : Optional[jax.Array]
+        Smoothed learning state variance, shape ``(n_trials,)``.
+    smoothed_prob_correct_response : Optional[jax.Array]
+        Smoothed probability of correct response, shape ``(n_trials,)``.
+    smoother_gain : Optional[jax.Array]
+        Smoother gain, shape ``(n_trials - 1,)``.
+
+    References
+    ----------
+    Smith, A. C., Frank, L. M., Wirth, S., Yanike, M., Hu, D., Kubota, Y.,
+    Graybiel, A. M., Suzuki, W. A., & Brown, E. N. (2004).
+    Dynamic analysis of learning in behavioral experiments.
+    Journal of Neuroscience, 24(2), 447-461.
+    """
 
     def __init__(
         self,
@@ -1143,6 +1182,12 @@ class SmithLearningAlgorithm:
         else:
             init_var = float(init_learning_variance)
 
+        if initial_state_method not in VALID_INIT_METHODS:
+            raise ValueError(
+                f"initial_state_method must be one of {sorted(VALID_INIT_METHODS)}, "
+                f"got {initial_state_method!r}."
+            )
+
         if not (0.0 < prob_correct_by_chance < 1.0):
             raise ValueError(
                 "prob_correct_by_chance must be between 0 and 1 (exclusive)."
@@ -1165,7 +1210,7 @@ class SmithLearningAlgorithm:
         self.max_possible_correct = max_possible_correct
         self.mu_bias = self._calculate_mu_bias(self.prob_correct_by_chance)
 
-        self.init_state_method = initial_state_method
+        self.initial_state_method = initial_state_method
 
         # Attributes to store filter/smoother outputs
         self.filtered_prob_correct_response: Optional[jax.Array] = None
@@ -1179,57 +1224,68 @@ class SmithLearningAlgorithm:
         self.smoothed_prob_correct_response: Optional[jax.Array] = None
         self.smoother_gain: Optional[jax.Array] = None  # Has shape (n_trials-1,)
 
-        self._max_possible_correct_val = max_possible_correct  # Store initial config
-        self._is_max_possible_correct_resolved = isinstance(
-            max_possible_correct, (np.ndarray, jax.Array)
-        ) or (isinstance(max_possible_correct, int) and max_possible_correct > 0)
+    def __repr__(self) -> str:
+        fitted = "fitted" if self.is_fitted else "not fitted"
+        return (
+            f"SmithLearningAlgorithm("
+            f"sigma_epsilon={self.sigma_epsilon:.4g}, "
+            f"prob_correct_by_chance={self.prob_correct_by_chance:.4g}, "
+            f"init_learning_state={self.init_learning_state:.4g}, "
+            f"initial_state_method={self.initial_state_method!r}, "
+            f"{fitted})"
+        )
 
-    def _calculate_mu_bias(self, prob_chance: float) -> float:
-        """Converts probability of chance performance to mu bias term."""
-        # Ensure prob_chance is not exactly 0 or 1 to avoid log(0) or division by zero
-        epsilon = 1e-9  # Small epsilon
-        prob_chance_clipped = jnp.clip(prob_chance, epsilon, 1.0 - epsilon)
-        return float(jnp.log(prob_chance_clipped / (1.0 - prob_chance_clipped)))
+    @property
+    def is_fitted(self) -> bool:
+        """Whether the model has been fitted."""
+        return (
+            self.smoothed_learning_state_mode is not None
+            and self.smoothed_learning_state_variance is not None
+            and self.smoother_gain is not None
+        )
+
+    def _calculate_mu_bias(self, prob_correct_by_chance: float) -> float:
+        """Converts probability of chance performance to mu bias term (logit)."""
+        epsilon = 1e-9
+        p = max(epsilon, min(prob_correct_by_chance, 1.0 - epsilon))
+        return math.log(p / (1.0 - p))
 
     def _resolve_max_possible_correct(
         self, n_correct_responses: jax.Array
     ) -> jax.Array:
-        """
-        Resolves max_possible_correct to an array if it's None or scalar.
-        Stores it in self._max_possible_correct_val.
-        """
-        if (
-            self._is_max_possible_correct_resolved
-            and self._max_possible_correct_val is not None
-        ):
-            if isinstance(self._max_possible_correct_val, int):
-                return jnp.array(
-                    [self._max_possible_correct_val] * len(n_correct_responses),
-                    dtype=jnp.int32,
-                )
-            # If already an array (checked in init or resolved before)
-            if isinstance(self._max_possible_correct_val, (np.ndarray, jax.Array)):
-                if len(self._max_possible_correct_val) != len(n_correct_responses):
-                    raise ValueError(
-                        "Provided max_possible_correct array has inconsistent length with n_correct_responses."
-                    )
-                return jnp.asarray(self._max_possible_correct_val, dtype=jnp.int32)
+        """Resolves max_possible_correct to an array matching n_correct_responses.
 
-        # If None, infer from data (assuming constant N_k)
-        val: Array = jnp.max(n_correct_responses)
-        if val <= 0:  # handle case where all n_correct_responses are 0
+        If ``max_possible_correct`` was provided as an int, broadcasts to an
+        array. If it was provided as an array, validates length. If None,
+        infers from the maximum of ``n_correct_responses`` (stateless — no
+        caching, so re-fitting with different data works correctly).
+        """
+        n_trials = len(n_correct_responses)
+        mpc = self.max_possible_correct
+
+        if mpc is not None:
+            if isinstance(mpc, int):
+                return jnp.full(n_trials, mpc, dtype=jnp.int32)
+            # Array case
+            mpc_arr = jnp.asarray(mpc, dtype=jnp.int32)
+            if len(mpc_arr) != n_trials:
+                raise ValueError(
+                    f"max_possible_correct array length ({len(mpc_arr)}) "
+                    f"doesn't match n_correct_responses length ({n_trials})."
+                )
+            return mpc_arr
+
+        # Infer from data
+        val = int(jnp.max(n_correct_responses))
+        if val <= 0:
             logger.warning(
                 "All n_correct_responses are 0 or less; max_possible_correct inferred as 1."
             )
-            val = jnp.array(1)
-        resolved_array = jnp.full_like(n_correct_responses, val, dtype=jnp.int32)
-        self._max_possible_correct_val = int(val)  # Store scalar version
-        self._is_max_possible_correct_resolved = True
+            val = 1
         logger.info(
-            f"max_possible_correct was not provided or was scalar; "
-            f"resolved to constant value {val} for all trials."
+            f"max_possible_correct not provided; inferred as {val} from data."
         )
-        return resolved_array
+        return jnp.full(n_trials, val, dtype=jnp.int32)
 
     def _e_step(self, n_correct_responses: jax.Array) -> float:
         """E-step of the EM algorithm.
@@ -1245,13 +1301,22 @@ class SmithLearningAlgorithm:
         Returns
         -------
         log_likelihood : float
-            The marginal log-likelihood of the observed data.
+            Approximate marginal log-likelihood, computed by evaluating
+            the binomial PMF at the one-step predicted modes. This is not
+            the true marginal likelihood (which would require integrating
+            over the predictive uncertainty) but is standard practice for
+            Laplace-EKF models and sufficient for EM convergence monitoring.
         """
         resolved_trial_max_correct = self._resolve_max_possible_correct(
             n_correct_responses
         )
+        if bool(jnp.any(n_correct_responses > resolved_trial_max_correct)):
+            raise ValueError(
+                "n_correct_responses contains values exceeding max_possible_correct. "
+                "Check your data or provide max_possible_correct explicitly."
+            )
         (
-            self.prob_correct_response,
+            self.filtered_prob_correct_response,
             self.filtered_learning_state_mode,
             self.filtered_learning_state_variance,
             self.filtered_one_step_mode,
@@ -1290,7 +1355,7 @@ class SmithLearningAlgorithm:
             prob_correct_by_chance=self.prob_correct_by_chance,
         )
 
-        return float(log_likelihood) if log_likelihood is not None else None
+        return float(log_likelihood)
 
     def _m_step(self, n_correct_responses: jax.Array) -> None:
         """M-step of the EM algorithm.
@@ -1304,11 +1369,7 @@ class SmithLearningAlgorithm:
         n_correct_responses : jax.Array, shape (n_trials,)
             The sequence of correct responses.
         """
-        if (
-            self.smoothed_learning_state_mode is None
-            or self.smoothed_learning_state_variance is None
-            or self.smoother_gain is None
-        ):
+        if not self.is_fitted:
             raise RuntimeError("Must run E-step before M-step")
 
         (
@@ -1322,14 +1383,14 @@ class SmithLearningAlgorithm:
         )
         self.sigma_epsilon = float(sigma_epsilon_new)
 
-        # --- Apply init_state_method for initial states ---
-        if self.init_state_method == "reestimate_initial_from_data":
+        # --- Apply initial_state_method for initial states ---
+        if self.initial_state_method == "reestimate_initial_from_data":
             self.init_learning_state = float(new_init_learning_state)
             self.init_learning_variance = float(new_init_learning_variance)
-        elif self.init_state_method == "set_initial_to_zero":
+        elif self.initial_state_method == "set_initial_to_zero":
             self.init_learning_state = 0.0
             self.init_learning_variance = float(self.sigma_epsilon**2)
-        elif self.init_state_method == "set_initial_conservative_from_second_trial":
+        elif self.initial_state_method == "set_initial_conservative_from_second_trial":
             if len(self.smoothed_learning_state_mode) > 1:
                 self.init_learning_state = float(
                     0.5 * self.smoothed_learning_state_mode[1]
@@ -1343,7 +1404,10 @@ class SmithLearningAlgorithm:
             self.init_learning_variance = float(
                 self.sigma_epsilon**2
             )  # Use updated sigma_epsilon
-        elif self.init_state_method == "set_initial_direct_from_second_trial":
+        elif self.initial_state_method == "set_initial_direct_from_second_trial":
+            # Heuristic: uses smoothed trial-1 estimate as initial condition.
+            # Not from Smith et al. (2004); may not converge to same fixed point
+            # as "reestimate_initial_from_data".
             if (
                 len(self.smoothed_learning_state_mode) > 1
                 and len(self.smoothed_learning_state_variance) > 1
@@ -1361,7 +1425,7 @@ class SmithLearningAlgorithm:
                 )
                 self.init_learning_state = float(new_init_learning_state)
                 self.init_learning_variance = float(new_init_learning_variance)
-        elif self.init_state_method == "user_provided":
+        elif self.initial_state_method == "user_provided":
             pass  # No change to initial state, user must set it externally
 
     def fit(
@@ -1369,11 +1433,17 @@ class SmithLearningAlgorithm:
         n_correct_responses: ArrayLike,
         max_iter: int = 100,
         tolerance: float = 1e-4,
-    ) -> List[Optional[float]]:
+        verbose: bool = False,
+    ) -> list[float]:
         """Fits the model to responses using the EM algorithm.
 
         Iteratively performs E-steps and M-steps until convergence or
         the maximum number of iterations is reached.
+
+        Calling ``fit()`` again on an already-fitted model performs a
+        **warm restart**: it continues from the current parameter values
+        (``sigma_epsilon``, ``init_learning_state``, ``init_learning_variance``).
+        To start fresh, create a new ``SmithLearningAlgorithm`` instance.
 
         Parameters
         ----------
@@ -1383,18 +1453,28 @@ class SmithLearningAlgorithm:
             Maximum number of EM iterations, by default 100.
         tolerance : float, optional
             Convergence tolerance for log-likelihood, by default 1e-4.
+        verbose : bool, optional
+            If True, print convergence progress to stdout. Default is False.
 
         Returns
         -------
-        log_likelihoods : List[Optional[float]]
-            A list of marginal log-likelihoods at each iteration.
+        log_likelihoods : list[float]
+            A list of marginal log-likelihoods at each iteration. On
+            convergence, a final entry is appended from a post-convergence
+            E-step that ensures stored results match the MLE parameters.
         """
-        log_likelihoods: List[Optional[float]] = []
+        n_correct_responses = jnp.asarray(n_correct_responses)
+        if n_correct_responses.ndim != 1 or len(n_correct_responses) < 2:
+            raise ValueError(
+                "n_correct_responses must be a 1D array with at least 2 trials."
+            )
+
+        log_likelihoods: list[float] = []
         previous_log_likelihood: float = float("-inf")
 
         for iteration in range(max_iter):
             # E-step
-            current_log_likelihood = self._e_step(jnp.asarray(n_correct_responses))
+            current_log_likelihood = self._e_step(n_correct_responses)
             log_likelihoods.append(current_log_likelihood)
 
             # Check convergence
@@ -1403,28 +1483,45 @@ class SmithLearningAlgorithm:
             )
 
             if not is_increasing:
-                logger.warning(
-                    f"Log-likelihood decreased at iteration {iteration + 1}!"
-                )
+                msg = f"Log-likelihood decreased at iteration {iteration + 1}!"
+                logger.warning(msg)
+                if verbose:
+                    print(f"  WARNING: {msg}")
 
             if is_converged:
-                logger.info(f"Converged after {iteration + 1} iterations.")
+                # Run final M-step to get MLE params, then E-step so
+                # stored smoother results match the converged params.
+                self._m_step(n_correct_responses)
+                final_ll = self._e_step(n_correct_responses)
+                log_likelihoods.append(final_ll)
+                msg = f"Converged after {iteration + 1} iterations."
+                logger.info(msg)
+                if verbose:
+                    print(msg)
                 break
 
             # M-step
-            self._m_step(jnp.asarray(n_correct_responses))
+            self._m_step(n_correct_responses)
 
+            change = current_log_likelihood - previous_log_likelihood
             logger.info(
                 f"Iteration {iteration + 1}/{max_iter}\t"
                 f"Log-Likelihood: {current_log_likelihood:.4f}\t"
-                f"Change: {(current_log_likelihood - previous_log_likelihood):.4f}"
+                f"Change: {change:.4f}"
             )
-            previous_log_likelihood = (
-                current_log_likelihood if current_log_likelihood is not None else float("-inf")
-            )
+            if verbose:
+                print(
+                    f"  Iter {iteration + 1}/{max_iter}  "
+                    f"LL={current_log_likelihood:.4f}  "
+                    f"delta={change:+.4f}"
+                )
+            previous_log_likelihood = current_log_likelihood
 
         if len(log_likelihoods) == max_iter:
-            logger.warning("Reached maximum iterations without converging.")
+            msg = "Reached maximum iterations without converging."
+            logger.warning(msg)
+            if verbose:
+                print(f"  WARNING: {msg}")
 
         return log_likelihoods
 
@@ -1433,8 +1530,8 @@ class SmithLearningAlgorithm:
         key: Array,
         n_samples: int = 10000,
         percentiles: Optional[jax.Array] = None,
-        calculate_pcert: bool = False,
-    ) -> Tuple[jax.Array, Optional[jax.Array]]:
+        return_prob_above_chance: bool = False,
+    ) -> tuple[jax.Array, Optional[jax.Array]]:
         """
         Calculates the smoothed learning curve (probability of correct response)
         and its confidence limits.
@@ -1451,9 +1548,9 @@ class SmithLearningAlgorithm:
         percentiles : jax.Array, optional
             Array of percentiles to compute for the probability (e.g., jnp.array([5, 50, 95])).
             If None, defaults to jnp.array([5.0, 50.0, 95.0]).
-        calculate_pcert : bool, optional
-            If True, also calculates and returns the certainty (pcert) that the true
-            probability of a correct response is greater than `self.current_prob_correct_by_chance`.
+        return_prob_above_chance : bool, optional
+            If True, also calculates and returns the certainty (prob_above_chance) that the true
+            probability of a correct response is greater than `self.prob_correct_by_chance`.
             Default is False.
 
         Returns
@@ -1461,30 +1558,25 @@ class SmithLearningAlgorithm:
         probability_percentiles : jnp.ndarray
             Shape (n_percentiles, n_trials). Computed percentile values for the
             probability of correct response for each trial.
-        pcert : Optional[jnp.ndarray]
-            Shape (n_trials,). Certainty p_k > p_chance. Returned if `calculate_pcert` is True.
+        prob_above_chance : Optional[jnp.ndarray]
+            Shape (n_trials,). Certainty p_k > p_chance. Returned if `return_prob_above_chance` is True.
 
         Raises
         ------
         RuntimeError
             If the model has not been fitted yet (i.e., smoothed estimates are not available).
         """
-        if (
-            self.smoothed_learning_state_mode is None
-            or self.smoothed_learning_state_variance is None
-        ):
+        if not self.is_fitted:
             raise RuntimeError("Model has not been fitted. Run .fit() method first.")
-
-        prob_chance_for_pcert = self.prob_correct_by_chance if calculate_pcert else None
 
         return calculate_probability_confidence_limits(
             key=key,
-            smoothed_mode=self.smoothed_learning_state_mode,
-            smoothed_variance=self.smoothed_learning_state_variance,
-            mu_bias=self.mu_bias,
+            smoothed_learning_state_mode=self.smoothed_learning_state_mode,
+            smoothed_learning_state_variance=self.smoothed_learning_state_variance,
+            prob_correct_by_chance=self.prob_correct_by_chance,
             n_samples=n_samples,
             percentiles=percentiles,
-            prob_correct_by_chance=prob_chance_for_pcert,
+            return_prob_above_chance=return_prob_above_chance,
         )
 
     def get_latent_state_percentiles(
@@ -1518,16 +1610,13 @@ class SmithLearningAlgorithm:
         RuntimeError
             If the model has not been fitted.
         """
-        if (
-            self.smoothed_learning_state_mode is None
-            or self.smoothed_learning_state_variance is None
-        ):
+        if not self.is_fitted:
             raise RuntimeError("Model has not been fitted. Run .fit() method first.")
 
         return calculate_latent_state_percentiles(
             key=key,
-            smoothed_mode=self.smoothed_learning_state_mode,
-            smoothed_variance=self.smoothed_learning_state_variance,
+            smoothed_learning_state_mode=self.smoothed_learning_state_mode,
+            smoothed_learning_state_variance=self.smoothed_learning_state_variance,
             n_samples=n_samples,
             percentiles=percentiles,
         )
@@ -1535,7 +1624,7 @@ class SmithLearningAlgorithm:
     def find_critical_run_length(
         self,
         sequence_length: int,
-        prob_success_null: Optional[float] = None,
+        prob_correct_by_chance: Optional[float] = None,
         critical_probability_threshold: float = 0.05,
         min_run_length: int = 2,
         max_run_length: int = 35,
@@ -1550,10 +1639,10 @@ class SmithLearningAlgorithm:
         sequence_length : int
             The length of the trial sequence to consider for the criterion
             (e.g., total number of trials in an experiment block).
-        prob_success_null : Optional[float], optional
+        prob_correct_by_chance : Optional[float], optional
             Probability of success under the null hypothesis (e.g., chance performance).
-            If None, this method attempts to use the model's fitted
-            `self.current_prob_correct_by_chance`. Default is None.
+            If None, this method attempts to use the model's
+            `self.prob_correct_by_chance`. Default is None.
         critical_probability_threshold : float, optional
             The critical p-value (alpha) for determining significance.
             Default is 0.05.
@@ -1569,31 +1658,23 @@ class SmithLearningAlgorithm:
             statistically significant. Returns None if no such run length is
             found within the specified range that meets the criterion.
 
-        Raises
-        ------
-        RuntimeError
-            If `prob_success_null` is None and the model has not been fitted yet
-            (so `self.current_prob_correct_by_chance` is not available/fitted).
+        Notes
+        -----
+        When ``prob_correct_by_chance`` is None, uses ``self.prob_correct_by_chance``
+        which is set at construction time (no fitting required).
         """
-        prob_success_null_to_use: float
-        if prob_success_null is None:
-            # Check if model has been fitted by looking at one of the E-step results
-            if self.filtered_learning_state_mode is None:
-                raise RuntimeError(
-                    "Model must be fitted to use its estimate of "
-                    "prob_correct_by_chance as prob_success_null. "
-                    "Alternatively, provide prob_success_null directly."
-                )
-            prob_success_null_to_use = self.prob_correct_by_chance
+        prob_correct_by_chance_to_use: float
+        if prob_correct_by_chance is None:
+            prob_correct_by_chance_to_use = self.prob_correct_by_chance
             logger.info(
-                f"Using fitted prob_correct_by_chance "
-                f"({prob_success_null_to_use:.3f}) as prob_success_null."
+                f"Using prob_correct_by_chance "
+                f"({prob_correct_by_chance_to_use:.3f})."
             )
         else:
-            prob_success_null_to_use = prob_success_null
+            prob_correct_by_chance_to_use = prob_correct_by_chance
 
         return find_min_consecutive_successes(
-            prob_success_null=prob_success_null_to_use,
+            prob_correct_by_chance=prob_correct_by_chance_to_use,
             critical_probability_threshold=critical_probability_threshold,
             sequence_length=sequence_length,
             min_run_length=min_run_length,
@@ -1602,12 +1683,12 @@ class SmithLearningAlgorithm:
 
     def identify_significant_runs_in_data(
         self,
-        observed_binary_responses: jax.Array,  # Ensure this is a JAX or NumPy array
-        prob_success_null: Optional[float] = None,
+        observed_binary_responses: ArrayLike,
+        prob_correct_by_chance: Optional[float] = None,
         critical_probability_threshold: float = 0.05,
         min_run_length_for_j_crit: int = 2,  # Parameter for j_crit calculation
         max_run_length_for_j_crit: int = 35,  # Parameter for j_crit calculation
-    ) -> Tuple[Optional[int], List[Tuple[int, int]]]:
+    ) -> tuple[Optional[int], list[tuple[int, int]]]:
         """
         Identifies significant runs of successes in observed binary data.
 
@@ -1620,9 +1701,9 @@ class SmithLearningAlgorithm:
         ----------
         observed_binary_responses : jax.Array, shape (n_trials,)
             A 1D sequence of binary outcomes (1 for success, 0 for failure).
-        prob_success_null : Optional[float], optional
+        prob_correct_by_chance : Optional[float], optional
             Probability of success under the null hypothesis used for determining `j_crit`.
-            If None, defaults to the model's fitted `self.current_prob_correct_by_chance`.
+            If None, defaults to the model's `self.prob_correct_by_chance`.
         critical_probability_threshold : float, optional
             The critical p-value (alpha) for determining `j_crit`. Default is 0.05.
         min_run_length_for_j_crit : int, optional
@@ -1632,23 +1713,22 @@ class SmithLearningAlgorithm:
 
         Returns
         -------
-        Tuple[Optional[int], List[Tuple[int, int]]]
+        tuple[Optional[int], list[tuple[int, int]]]
             - j_crit (Optional[int]): The determined critical run length.
-            - significant_runs (List[Tuple[int, int]]): A list of (start_index, end_index)
+            - significant_runs (list[tuple[int, int]]): A list of (start_index, end_index)
               tuples for each identified significant run of successes in the
               `observed_binary_responses`. Indices are 0-based and end_index is inclusive.
 
         Raises
         ------
         RuntimeError
-            If `prob_success_null` is None and the model has not been fitted.
+            If `prob_correct_by_chance` is None and the model has not been fitted.
         TypeError
             If `observed_binary_responses` is not a JAX or NumPy array.
         ValueError
             If `observed_binary_responses` is not 1D.
         """
-        if not isinstance(observed_binary_responses, (jax.Array, np.ndarray)):
-            raise TypeError("observed_binary_responses must be a JAX or NumPy array.")
+        observed_binary_responses = jnp.asarray(observed_binary_responses)
         if observed_binary_responses.ndim != 1:
             raise ValueError("observed_binary_responses must be a 1D array.")
         # It's assumed observed_binary_responses contains 0s and 1s.
@@ -1659,13 +1739,13 @@ class SmithLearningAlgorithm:
 
         j_crit = self.find_critical_run_length(
             sequence_length=sequence_length,
-            prob_success_null=prob_success_null,
+            prob_correct_by_chance=prob_correct_by_chance,
             critical_probability_threshold=critical_probability_threshold,
             min_run_length=min_run_length_for_j_crit,
             max_run_length=max_run_length_for_j_crit,
         )
 
-        significant_runs: List[Tuple[int, int]] = []
+        significant_runs: list[tuple[int, int]] = []
         if j_crit is None:
             logger.info(
                 "No critical run length (j_crit) could be determined "
@@ -1699,14 +1779,13 @@ class SmithLearningAlgorithm:
         key: Array,  # Needed if get_learning_curve not yet called
         lower_percentile_for_criterion: float = 5.0,  # e.g., for p05
         chance_level_override: Optional[float] = None,
-        n_samples_for_ci: int = 10000,  # if CIs need to be recomputed
+        n_samples: int = 10000,  # if CIs need to be recomputed
     ) -> Optional[int]:
-        """Determines a trial index indicating when learning is reliably above chance.
+        """Determines the first trial where learning is reliably above chance.
 
-        This method finds the last trial where the lower confidence bound
-        (e.g., 5th percentile) of the estimated probability of a correct response
-        is below a specified chance level. The trial *after* this index
-        can be considered a point where performance is consistently above chance.
+        Finds the first trial where the lower confidence bound (e.g., 5th
+        percentile) of the estimated probability of a correct response is
+        consistently at or above the chance level.
 
         Parameters
         ----------
@@ -1717,28 +1796,35 @@ class SmithLearningAlgorithm:
             (e.g., 5.0 for the 5th percentile, p05). Default is 5.0.
         chance_level_override : Optional[float], optional
             The probability of success considered as chance level.
-            If None, uses the model's fitted `self.current_prob_correct_by_chance`.
+            If None, uses the model's ``prob_correct_by_chance``.
             Default is None.
-        n_samples_for_ci : int, optional
+        n_samples : int, optional
             Number of Monte Carlo samples if confidence intervals need to be recomputed.
             Default is 10000.
 
         Returns
         -------
         Optional[int]
-            The 0-indexed trial number representing the last point where the lower
-            confidence bound of success probability was below the chance level.
-            Returns None if this condition is never met, or always met, or if
-            the model is not fitted.
+            The 0-indexed trial number of the first trial where the lower
+            confidence bound is at or above chance. Returns 0 if the lower
+            bound never falls below chance (learning appears established from
+            the start). Returns None if the criterion is never met
+            (performance never reliably exceeds chance within the observed
+            trials).
 
         Raises
         ------
         RuntimeError
             If the model has not been fitted.
-        ValueError
-            If `lower_percentile_for_criterion` is not found in computed CIs.
+
+        Examples
+        --------
+        >>> model.fit(outcomes)
+        >>> criterion = model.find_criterion_trial(jax.random.PRNGKey(0))
+        >>> if criterion is not None:
+        ...     print(f"Learning established at trial {criterion}")
         """
-        if self.smoothed_learning_state_mode is None:
+        if not self.is_fitted:
             raise RuntimeError("Model has not been fitted. Run .fit() method first.")
 
         chance_p = (
@@ -1747,8 +1833,6 @@ class SmithLearningAlgorithm:
             else self.prob_correct_by_chance
         )
 
-        # Get the confidence intervals for the probability of correct response
-        # Ensure percentiles passed to get_learning_curve includes the desired one
         target_percentiles = jnp.array(
             [
                 lower_percentile_for_criterion,
@@ -1759,48 +1843,52 @@ class SmithLearningAlgorithm:
 
         prob_percentiles, _ = self.get_learning_curve(
             key=key,
-            n_samples=n_samples_for_ci,
+            n_samples=n_samples,
             percentiles=target_percentiles,
-            calculate_pcert=False,  # pcert not needed for this specific calculation
+            return_prob_above_chance=False,
         )
 
-        # Assuming prob_percentiles is (n_percentiles, n_trials)
-        # and the first row corresponds to lower_percentile_for_criterion
-        # This requires knowing the order or finding the correct row.
-        # If target_percentiles are sorted, prob_percentiles[0] is p_lower.
         p_lower_bound = prob_percentiles[0, :]
 
-        # Find indices where the lower bound is less than chance_p
-        # Note: MATLAB's find gives 1-based indices. Python gives 0-based.
-        below_chance_indices = jnp.where(p_lower_bound < chance_p)[0]
+        # Find the first trial from which the lower CI is permanently
+        # at or above chance for all subsequent trials (Smith et al. 2004).
+        # We scan from the end to find the last trial below chance;
+        # the criterion trial is the one after it.
+        above_chance = jnp.asarray(p_lower_bound >= chance_p)
 
-        if below_chance_indices.shape[0] == 0:
-            # Lower bound is never below chance (e.g., starts above chance or chance is very low)
-            # Or, if learning is immediate, this might also be empty.
-            # Consider what this means: performance is always reliably above chance from trial 0.
-            # Smith et al. would return NaN, here maybe None or -1.
+        if bool(jnp.all(above_chance)):
             logger.info(
                 f"The {lower_percentile_for_criterion}th percentile of success probability "
-                f"is never below the chance level of {chance_p:.3f}."
+                f"is never below the chance level of {chance_p:.3f}. "
+                f"Performance appears above chance from trial 0."
             )
-            return None  # Or -1 to indicate learning from the start
+            return 0
 
-        # `cback` in MATLAB is the last such trial.
-        last_trial_below_chance = below_chance_indices[-1]
-
-        # The MATLAB code has a check: if(cback(end) < size(I,2) ).
-        # This means if the very last trial's p05 is still below chance,
-        # it considers learning not "fully" established by this criterion.
-        # Here, n_trials = len(p_lower_bound)
-        if int(last_trial_below_chance) == (len(p_lower_bound) - 1):
+        if not bool(above_chance[-1]):
             logger.info(
                 f"The {lower_percentile_for_criterion}th percentile of success probability "
                 f"is still below chance ({chance_p:.3f}) at the last trial. "
                 f"Learning criterion not met within the observed trials."
             )
-            return None  # Or last_trial_below_chance if definition differs slightly
+            return None
 
-        return int(last_trial_below_chance)
+        # Find the last trial below chance. The criterion trial is the
+        # first trial after which the CI permanently stays above chance.
+        below_chance_indices = jnp.where(~above_chance)[0]
+        last_trial_below_chance = int(below_chance_indices[-1])
+
+        # Verify the CI stays above chance for ALL subsequent trials.
+        # This matches the Smith et al. (2004) definition exactly.
+        criterion_trial = last_trial_below_chance + 1
+        if not bool(jnp.all(above_chance[criterion_trial:])):
+            # CI oscillates — no sustained criterion met
+            logger.info(
+                "Lower CI oscillates above and below chance; "
+                "no sustained criterion trial found."
+            )
+            return None
+
+        return criterion_trial
 
     def plot_learning_process(
         self,
@@ -1808,12 +1896,12 @@ class SmithLearningAlgorithm:
         plot_type: str = "probability",
         observed_n_correct: Optional[jax.Array] = None,
         observed_max_possible: Optional[jax.Array] = None,
-        confidence_bounds: Tuple[float, float] = (5.0, 95.0),
-        n_samples_ci: int = 10000,
+        confidence_bounds: tuple[float, float] = (5.0, 95.0),
+        n_samples: int = 10000,
         title: Optional[str] = None,
         xlabel: str = "Trial",
         ylabel_override: Optional[str] = None,
-    ) -> None:
+    ) -> tuple[plt.Figure, plt.Axes]:
         """Plots the smoothed learning process with confidence intervals.
 
         This method visualizes either the probability of a correct response or
@@ -1839,11 +1927,11 @@ class SmithLearningAlgorithm:
             and represents counts from multiple sub-trials. If `observed_n_correct`
             represents binary (0/1) outcomes, this can be omitted or set to ones.
             Default is None.
-        confidence_bounds : Tuple[float, float], optional
+        confidence_bounds : tuple[float, float], optional
             Tuple of two floats representing the lower and upper percentile bounds
             for the confidence interval (e.g., (5.0, 95.0) for a 90% CI).
             Default is (5.0, 95.0).
-        n_samples_ci : int, optional
+        n_samples : int, optional
             Number of Monte Carlo samples used to compute confidence intervals.
             Default is 10000.
         title : Optional[str], optional
@@ -1855,6 +1943,13 @@ class SmithLearningAlgorithm:
             Custom label for the y-axis. If None, a default label is generated
             based on `plot_type`. Default is None.
 
+        Returns
+        -------
+        fig : plt.Figure
+            The matplotlib figure.
+        ax : plt.Axes
+            The matplotlib axes.
+
         Raises
         ------
         RuntimeError
@@ -1864,7 +1959,7 @@ class SmithLearningAlgorithm:
             If `plot_type` is invalid, or if `observed_n_correct` and
             `observed_max_possible` have inconsistent lengths.
         """
-        if self.smoothed_learning_state_mode is None:
+        if not self.is_fitted:
             raise RuntimeError("Model has not been fitted. Run .fit() method first.")
 
         n_trials = len(self.smoothed_learning_state_mode)
@@ -1880,9 +1975,9 @@ class SmithLearningAlgorithm:
         if plot_type == "probability":
             prob_percentiles, _ = self.get_learning_curve(
                 key=key,
-                n_samples=n_samples_ci,
+                n_samples=n_samples,
                 percentiles=plot_percentiles,
-                calculate_pcert=False,
+                return_prob_above_chance=False,
             )
             lower_ci = prob_percentiles[0, :]
             median_curve = prob_percentiles[1, :]
@@ -1895,7 +1990,7 @@ class SmithLearningAlgorithm:
             ax.set_ylim((0, 1.05))  # Give a little space above 1.0
         elif plot_type == "latent_state":
             state_percentiles = self.get_latent_state_percentiles(
-                key=key, n_samples=n_samples_ci, percentiles=plot_percentiles
+                key=key, n_samples=n_samples, percentiles=plot_percentiles
             )
             lower_ci = state_percentiles[0, :]
             median_curve = state_percentiles[1, :]
@@ -1995,6 +2090,8 @@ class SmithLearningAlgorithm:
         ax.grid(True, linestyle="--", alpha=0.6)
         ax.tick_params(axis="both", which="major", labelsize=10)
 
+        return fig, ax
+
     def compare_trials(
         self,
         key: Array,
@@ -2027,8 +2124,9 @@ class SmithLearningAlgorithm:
 
         Returns
         -------
-        p_value : float
-            P(x_{trial1} > x_{trial2} | y_{1:T}).
+        posterior_probability : float
+            Bayesian posterior probability P(x_{trial1} > x_{trial2} | y_{1:T}).
+            This is NOT a frequentist p-value.
             - Values > 0.975 indicate trial1 is significantly higher than trial2.
             - Values < 0.025 indicate trial1 is significantly lower than trial2.
             - Values near 0.5 indicate no significant difference.
@@ -2040,11 +2138,7 @@ class SmithLearningAlgorithm:
         ValueError
             If trial indices are out of bounds.
         """
-        if (
-            self.smoothed_learning_state_mode is None
-            or self.smoothed_learning_state_variance is None
-            or self.smoother_gain is None
-        ):
+        if not self.is_fitted:
             raise RuntimeError("Model has not been fitted. Run .fit() method first.")
 
         n_trials = len(self.smoothed_learning_state_mode)
@@ -2054,18 +2148,18 @@ class SmithLearningAlgorithm:
                 f"Got trial1={trial1}, trial2={trial2}."
             )
 
-        mu_bias = self.mu_bias if compare_probability else None
+        prob_chance = self.prob_correct_by_chance if compare_probability else None
 
         return compare_two_trials(
             key=key,
-            smoothed_mode=self.smoothed_learning_state_mode,
-            smoothed_variance=self.smoothed_learning_state_variance,
+            smoothed_learning_state_mode=self.smoothed_learning_state_mode,
+            smoothed_learning_state_variance=self.smoothed_learning_state_variance,
             smoother_gain=self.smoother_gain,
             trial1=trial1,
             trial2=trial2,
             n_samples=n_samples,
             compare_probability=compare_probability,
-            mu_bias=mu_bias,
+            prob_correct_by_chance=prob_chance,
         )
 
     def get_trial_comparison_matrix(
@@ -2112,23 +2206,19 @@ class SmithLearningAlgorithm:
         >>> if p_val < 0.025:
         ...     print("Trial 10 is significantly higher than trial 0")
         """
-        if (
-            self.smoothed_learning_state_mode is None
-            or self.smoothed_learning_state_variance is None
-            or self.smoother_gain is None
-        ):
+        if not self.is_fitted:
             raise RuntimeError("Model has not been fitted. Run .fit() method first.")
 
-        mu_bias = self.mu_bias if compare_probability else None
+        prob_chance = self.prob_correct_by_chance if compare_probability else None
 
         return compute_trial_comparison_matrix(
             key=key,
-            smoothed_mode=self.smoothed_learning_state_mode,
-            smoothed_variance=self.smoothed_learning_state_variance,
+            smoothed_learning_state_mode=self.smoothed_learning_state_mode,
+            smoothed_learning_state_variance=self.smoothed_learning_state_variance,
             smoother_gain=self.smoother_gain,
             n_samples=n_samples,
             compare_probability=compare_probability,
-            mu_bias=mu_bias,
+            prob_correct_by_chance=prob_chance,
         )
 
     def find_first_significant_improvement(
@@ -2176,7 +2266,7 @@ class SmithLearningAlgorithm:
         This corresponds to the analysis in trialtotrial.m that finds
         "Earliest trial signif above estimated start distribution".
         """
-        if self.smoothed_learning_state_mode is None:
+        if not self.is_fitted:
             raise RuntimeError("Model has not been fitted. Run .fit() method first.")
 
         comparison_matrix = self.get_trial_comparison_matrix(
@@ -2199,7 +2289,7 @@ class SmithLearningAlgorithm:
         significance_level: float = 0.05,
         title: Optional[str] = None,
         cmap: str = "bone",
-    ) -> Tuple[plt.Figure, plt.Axes]:
+    ) -> tuple[plt.Figure, plt.Axes]:
         """Plot the trial-to-trial comparison matrix with significant points.
 
         Creates a heatmap visualization of pairwise trial comparisons,
@@ -2235,7 +2325,7 @@ class SmithLearningAlgorithm:
         RuntimeError
             If the model has not been fitted.
         """
-        if self.smoothed_learning_state_mode is None:
+        if not self.is_fitted:
             raise RuntimeError("Model has not been fitted. Run .fit() method first.")
 
         comparison_matrix = self.get_trial_comparison_matrix(
@@ -2251,25 +2341,43 @@ class SmithLearningAlgorithm:
         im = ax.imshow(comparison_matrix, cmap=cmap, vmin=0, vmax=1, origin="upper")
         plt.colorbar(im, ax=ax, label="P(trial_row > trial_col)")
 
-        # Mark significant points
+        # Mark significant points using vectorized masks
         alpha = significance_level
         alpha_half = alpha / 2
+        upper_mask = np.triu(np.ones((n_trials, n_trials), dtype=bool), k=1)
+        mat_np = np.asarray(comparison_matrix)
 
-        # Find significantly higher (red) and lower (blue) comparisons
-        for i in range(n_trials):
-            for j in range(i + 1, n_trials):
-                p_val = comparison_matrix[i, j]
-                if p_val < alpha_half:
-                    # Trial j is significantly HIGHER than trial i
-                    ax.plot(j, i, "r.", markersize=8)
-                elif p_val < alpha:
-                    # Marginally significant
-                    ax.plot(j, i, "r*", markersize=6)
-                elif p_val > 1 - alpha_half:
-                    # Trial i is significantly HIGHER than trial j (unusual)
-                    ax.plot(j, i, "b.", markersize=8)
-                elif p_val > 1 - alpha:
-                    ax.plot(j, i, "b*", markersize=6)
+        # Colorblind-safe palette (Wong 2011)
+        color_higher = "#E69F00"  # orange
+        color_lower = "#0072B2"   # blue
+
+        # Significant: trial j higher than trial i
+        sig_higher = upper_mask & (mat_np < alpha_half)
+        rows, cols = np.where(sig_higher)
+        if len(rows) > 0:
+            ax.scatter(cols, rows, c=color_higher, marker="o", s=40,
+                       label="Sig. higher", zorder=3)
+
+        # Marginal: trial j higher
+        marg_higher = upper_mask & (mat_np >= alpha_half) & (mat_np < alpha)
+        rows, cols = np.where(marg_higher)
+        if len(rows) > 0:
+            ax.scatter(cols, rows, c=color_higher, marker="*", s=30,
+                       label="Marg. higher", zorder=3)
+
+        # Significant: trial i higher than trial j (unusual)
+        sig_lower = upper_mask & (mat_np > 1 - alpha_half)
+        rows, cols = np.where(sig_lower)
+        if len(rows) > 0:
+            ax.scatter(cols, rows, c=color_lower, marker="^", s=40,
+                       label="Sig. lower", zorder=3)
+
+        # Marginal: trial i higher
+        marg_lower = upper_mask & (mat_np <= 1 - alpha_half) & (mat_np > 1 - alpha)
+        rows, cols = np.where(marg_lower)
+        if len(rows) > 0:
+            ax.scatter(cols, rows, c=color_lower, marker="*", s=30,
+                       label="Marg. lower", zorder=3)
 
         # Add diagonal line
         ax.plot([0, n_trials - 1], [0, n_trials - 1], "k-", linewidth=0.5)
