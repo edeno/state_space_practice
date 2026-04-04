@@ -23,6 +23,13 @@ References
 [1] Eden, U.T., Frank, L.M., Barbieri, R., Solo, V. & Brown, E.N. (2004).
     Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
     Neural Computation 16, 971-998.
+[2] Brown, E.N., Frank, L.M., Tang, D., Quirk, M.C. & Wilson, M.A. (1998).
+    A statistical paradigm for neural spike train decoding applied to position
+    prediction from ensemble firing patterns of rat hippocampal place cells.
+    J Neuroscience 18(18), 7411-7425.
+[3] Ziv, Y., Burns, L.D., Cocker, E.D., Hamel, E.O., Ghosh, K.K.,
+    Kitch, L.J., El Gamal, A. & Bhatt, M.J. (2013). Long-term dynamics
+    of CA1 hippocampal place codes. Nature Neuroscience 16, 264-266.
 """
 
 import logging
