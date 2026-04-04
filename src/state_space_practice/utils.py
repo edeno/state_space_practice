@@ -31,7 +31,7 @@ def check_converged(
     is_converged : bool
         True if the relative change < tolerance.
     is_increasing : bool
-        True if log-likelihood did not decrease by more than tolerance.
+        True if the relative decrease does not exceed tolerance.
 
     """
     # Handle infinite values (e.g., first iteration when previous is -inf)
@@ -45,7 +45,8 @@ def check_converged(
     eps = np.finfo(float).eps
     avg_log_likelihood = (np.abs(log_likelihood) + np.abs(previous_log_likelihood) + eps) / 2
 
-    is_increasing = log_likelihood - previous_log_likelihood >= -tolerance
+    relative_change = (log_likelihood - previous_log_likelihood) / avg_log_likelihood
+    is_increasing = relative_change >= -tolerance
     is_converged = (delta_log_likelihood / avg_log_likelihood) < tolerance
 
     return bool(is_converged), bool(is_increasing)
