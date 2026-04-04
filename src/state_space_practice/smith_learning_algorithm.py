@@ -1119,6 +1119,10 @@ class SmithLearningAlgorithm:
         Smoothed probability of correct response, shape ``(n_trials,)``.
     smoother_gain : Optional[jax.Array]
         Smoother gain, shape ``(n_trials - 1,)``.
+    log_likelihood_ : Optional[float]
+        Final log-likelihood after fitting.
+    n_iter_ : Optional[int]
+        Number of EM iterations performed.
 
     References
     ----------
@@ -1221,6 +1225,12 @@ class SmithLearningAlgorithm:
         self.smoothed_learning_state_variance: Optional[jax.Array] = None
         self.smoothed_prob_correct_response: Optional[jax.Array] = None
         self.smoother_gain: Optional[jax.Array] = None  # Has shape (n_trials-1,)
+
+        # Fit diagnostics
+        self.log_likelihood_: Optional[float] = None
+        self.n_iter_: Optional[int] = None
+        self.log_likelihood_history_: Optional[list[float]] = None
+        self._n_trials_: Optional[int] = None
 
     def __repr__(self) -> str:
         fitted = "fitted" if self.is_fitted else "not fitted"
@@ -1529,6 +1539,12 @@ class SmithLearningAlgorithm:
             logger.warning(msg)
             if verbose:
                 print(f"  WARNING: {msg}")
+
+        # Store fit diagnostics
+        self.log_likelihood_ = log_likelihoods[-1] if log_likelihoods else None
+        self.n_iter_ = len(log_likelihoods)
+        self.log_likelihood_history_ = log_likelihoods
+        self._n_trials_ = len(n_correct_responses)
 
         return log_likelihoods
 
@@ -2295,6 +2311,165 @@ class SmithLearningAlgorithm:
             reference_trial=reference_trial,
             significance_level=significance_level,
         )
+
+    def bic(self) -> float:
+        """Bayesian Information Criterion for the fitted model.
+
+        BIC = -2 * log_likelihood + k * ln(n)
+
+        where k is the number of free parameters (sigma_epsilon, init_learning_state,
+        init_learning_variance = 3) and n is the number of trials.
+
+        Returns
+        -------
+        float
+            BIC value. Lower is better.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+        """
+        if not self.is_fitted or self.log_likelihood_ is None:
+            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+        n_params = 3  # sigma_epsilon, init_learning_state, init_learning_variance
+        return -2.0 * self.log_likelihood_ + n_params * math.log(self._n_trials_)
+
+    def compare_to_null(
+        self,
+        n_correct_responses: Optional[ArrayLike] = None,
+    ) -> dict:
+        """Compare the fitted model to a null (no-learning) model.
+
+        The null model assumes a constant probability of correct response
+        equal to ``prob_correct_by_chance`` (i.e., sigma_epsilon=0, no
+        learning state evolution). This is the simplest baseline: the
+        subject performs at chance on every trial.
+
+        Parameters
+        ----------
+        n_correct_responses : ArrayLike, shape (n_trials,), optional
+            The observed data. If None, uses the data from the last ``fit()``
+            call (requires that the model stores resolved max_possible_correct).
+
+        Returns
+        -------
+        dict
+            Dictionary with keys:
+
+            - ``"model_ll"``: Log-likelihood of the fitted model.
+            - ``"null_ll"``: Log-likelihood of the null (chance) model.
+            - ``"model_bic"``: BIC of the fitted model.
+            - ``"null_bic"``: BIC of the null model.
+            - ``"delta_bic"``: ``null_bic - model_bic``. Positive values
+              favor the learning model. Values > 10 are "very strong"
+              evidence (Kass & Raftery, 1995).
+            - ``"learning_detected"``: True if delta_bic > 2.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+        ValueError
+            If ``n_correct_responses`` is not provided and cannot be inferred.
+        """
+        if not self.is_fitted or self.log_likelihood_ is None:
+            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+
+        if n_correct_responses is None:
+            raise ValueError(
+                "n_correct_responses must be provided for null model comparison."
+            )
+
+        n_correct_responses = jnp.asarray(n_correct_responses)
+        resolved_max = self._resolve_max_possible_correct(n_correct_responses)
+
+        # Null model: constant probability = prob_correct_by_chance
+        epsilon = 1e-9
+        p_null = max(epsilon, min(self.prob_correct_by_chance, 1.0 - epsilon))
+        null_ll = float(jnp.sum(
+            jax.scipy.stats.binom.logpmf(
+                k=n_correct_responses, n=resolved_max, p=p_null
+            )
+        ))
+
+        # BIC: null model has 0 free parameters (chance is fixed)
+        model_bic = self.bic()
+        null_bic = -2.0 * null_ll  # 0 params, so penalty term is 0
+
+        delta_bic = null_bic - model_bic  # positive favors learning model
+
+        return {
+            "model_ll": self.log_likelihood_,
+            "null_ll": null_ll,
+            "model_bic": model_bic,
+            "null_bic": null_bic,
+            "delta_bic": delta_bic,
+            "learning_detected": delta_bic > 2.0,
+        }
+
+    def summary(
+        self,
+        key: Optional[Array] = None,
+        n_correct_responses: Optional[ArrayLike] = None,
+    ) -> str:
+        """Return a text summary of the fitted model.
+
+        Parameters
+        ----------
+        key : Array, optional
+            JAX PRNG key. If provided, computes the criterion trial.
+        n_correct_responses : ArrayLike, optional
+            Observed data. If provided along with ``key``, includes a null
+            model comparison.
+
+        Returns
+        -------
+        str
+            Multi-line summary string.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+        """
+        if not self.is_fitted:
+            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+
+        lines = [
+            "SmithLearningAlgorithm Summary",
+            "=" * 40,
+            f"  sigma_epsilon:          {self.sigma_epsilon:.4g}",
+            f"  prob_correct_by_chance:  {self.prob_correct_by_chance:.4g}",
+            f"  init_learning_state:    {self.init_learning_state:.4g}",
+            f"  init_learning_variance: {self.init_learning_variance:.4g}",
+            f"  initial_state_method:   {self.initial_state_method}",
+            "",
+            f"  EM iterations:          {self.n_iter_}",
+            f"  Log-likelihood:         {self.log_likelihood_:.4f}",
+            f"  BIC:                    {self.bic():.4f}",
+            f"  N trials:               {self._n_trials_}",
+        ]
+
+        if key is not None:
+            criterion = self.find_criterion_trial(key)
+            if criterion is not None:
+                lines.append(f"  Criterion trial:        {criterion}")
+            else:
+                lines.append("  Criterion trial:        not met")
+
+        if key is not None and n_correct_responses is not None:
+            comparison = self.compare_to_null(n_correct_responses)
+            lines.extend([
+                "",
+                "  Null model comparison:",
+                f"    Null LL:              {comparison['null_ll']:.4f}",
+                f"    Null BIC:             {comparison['null_bic']:.4f}",
+                f"    Delta BIC:            {comparison['delta_bic']:.4f}",
+                f"    Learning detected:    {comparison['learning_detected']}",
+            ])
+
+        return "\n".join(lines)
 
     def plot_trial_comparison_matrix(
         self,

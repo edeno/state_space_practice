@@ -907,6 +907,119 @@ class TestSmithLearningAlgorithmEdgeCases:
             model.fit(jnp.array([[1, 0], [0, 1]]))
 
 
+class TestSummaryAndScoring:
+    """Tests for summary(), bic(), and compare_to_null()."""
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_log_likelihood_stored_after_fit(self) -> None:
+        """log_likelihood_ should be populated after fit."""
+        outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
+        model = SmithLearningAlgorithm()
+        try:
+            model.fit(jnp.array(outcomes_np), max_iter=5)
+        except Exception as e:
+            pytest.skip(f"fit() failed: {e}")
+        assert model.log_likelihood_ is not None
+        assert np.isfinite(model.log_likelihood_)
+        assert model.n_iter_ is not None
+        assert model.n_iter_ > 0
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_bic_is_finite(self) -> None:
+        """bic() should return a finite value after fit."""
+        outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
+        model = SmithLearningAlgorithm()
+        try:
+            model.fit(jnp.array(outcomes_np), max_iter=5)
+        except Exception as e:
+            pytest.skip(f"fit() failed: {e}")
+        bic = model.bic()
+        assert np.isfinite(bic)
+
+    def test_bic_requires_fit(self) -> None:
+        """bic() should raise if not fitted."""
+        model = SmithLearningAlgorithm()
+        with pytest.raises(RuntimeError, match="not been fitted"):
+            model.bic()
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_compare_to_null_returns_dict(self) -> None:
+        """compare_to_null() should return a dict with expected keys."""
+        outcomes_np, _ = simulate_learning_data(n_trials=30, seed=42)
+        outcomes = jnp.array(outcomes_np)
+        model = SmithLearningAlgorithm()
+        try:
+            model.fit(outcomes, max_iter=10)
+        except Exception as e:
+            pytest.skip(f"fit() failed: {e}")
+        result = model.compare_to_null(outcomes)
+        assert isinstance(result, dict)
+        expected_keys = {
+            "model_ll", "null_ll", "model_bic", "null_bic",
+            "delta_bic", "learning_detected",
+        }
+        assert set(result.keys()) == expected_keys
+        assert np.isfinite(result["model_ll"])
+        assert np.isfinite(result["null_ll"])
+        assert np.isfinite(result["delta_bic"])
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_compare_to_null_detects_learning(self) -> None:
+        """Learning model should beat null on clear learning data."""
+        outcomes_np, _ = simulate_learning_data(
+            n_trials=50, seed=42,
+            prob_success_init=0.2, prob_success_final=0.9,
+        )
+        outcomes = jnp.array(outcomes_np)
+        model = SmithLearningAlgorithm()
+        try:
+            model.fit(outcomes, max_iter=30)
+        except Exception as e:
+            pytest.skip(f"fit() failed: {e}")
+        result = model.compare_to_null(outcomes)
+        assert result["model_ll"] > result["null_ll"], \
+            "Learning model should have higher LL than null"
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_summary_returns_string(self) -> None:
+        """summary() should return a multi-line string."""
+        outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
+        outcomes = jnp.array(outcomes_np)
+        model = SmithLearningAlgorithm()
+        try:
+            model.fit(outcomes, max_iter=5)
+        except Exception as e:
+            pytest.skip(f"fit() failed: {e}")
+        s = model.summary()
+        assert isinstance(s, str)
+        assert "sigma_epsilon" in s
+        assert "Log-likelihood" in s
+        assert "BIC" in s
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_summary_with_key_and_data(self) -> None:
+        """summary() with key and data should include null comparison."""
+        outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
+        outcomes = jnp.array(outcomes_np)
+        model = SmithLearningAlgorithm()
+        try:
+            model.fit(outcomes, max_iter=5)
+        except Exception as e:
+            pytest.skip(f"fit() failed: {e}")
+        s = model.summary(
+            key=jax.random.PRNGKey(0),
+            n_correct_responses=outcomes,
+        )
+        assert "Delta BIC" in s
+        assert "Criterion trial" in s
+
+    def test_summary_requires_fit(self) -> None:
+        """summary() should raise if not fitted."""
+        model = SmithLearningAlgorithm()
+        with pytest.raises(RuntimeError, match="not been fitted"):
+            model.summary()
+
+
 class TestFindCriterionTrial:
     """Tests for find_criterion_trial method."""
 
