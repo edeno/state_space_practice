@@ -18,11 +18,17 @@
 - The latent state is `x_t ∈ R^{K-1}`, NOT `R^K`. Option 0 is the reference
   (fixed at value 0) for identifiability. The full value vector for softmax is
   `v_t = [0, x_t]`.
-- Use a single Newton step for the Laplace update (the softmax log-likelihood
-  is log-concave, so no iterative BFGS needed).
+- Use iterative Newton (2-3 steps with convergence check) for the Laplace
+  update. The softmax log-likelihood is log-concave, so Newton converges
+  reliably, but a single step may not reach the mode for large β.
 - Process noise Q is scalar × I (diagonal, same drift for all options).
+  `init_cov` is fixed (identity, not learned via EM).
 - Follow `SmithLearningModel` patterns: `__repr__`, `is_fitted`, `summary()`,
   `bic()`, `compare_to_null()`, `plot_*()` methods, `verbose` in `fit()`.
+- Task 3 tests use manually constructed choice arrays (e.g., `jnp.ones`,
+  `np.random.default_rng`), NOT `simulate_choice_data` (which is Task 4).
+- Apply `@jax.jit` to `multinomial_choice_filter` and `multinomial_choice_smoother`.
+- Use `jax.vmap` over the β grid in the M-step for performance.
 
 ---
 
@@ -105,9 +111,16 @@ def softmax_observation_update(
     #    (all free values decrease — correct behavior)
     # 6. Neg-Hessian w.r.t. x (K-1 × K-1):
     #    β² * (diag(p[1:]) - outer(p[1:], p[1:]))
-    # 7. Posterior precision = prior_precision + neg_hessian
-    # 8. Newton step: post_mean = prior_mean + solve(post_precision, gradient)
-    # 9. Posterior covariance = inv(posterior_precision)
+    # 7. Iterative Newton (2-3 steps with convergence check):
+    #    x = prior_mean
+    #    for _ in range(max_newton_steps):
+    #        Recompute v=[0,x], p=softmax(β*v), gradient, neg_hessian at x
+    #        posterior_precision = prior_precision + neg_hessian
+    #        newton_step = solve(posterior_precision, gradient + prior_precision @ (prior_mean - x))
+    #        x_new = x + newton_step
+    #        if converged (|x_new - x| < tol): break
+    #        x = x_new
+    # 8. Posterior covariance = inv(posterior_precision) at final x
 ```
 
 Import `psd_solve` and `symmetrize` from `state_space_practice.kalman`.
@@ -146,8 +159,8 @@ from typing import NamedTuple
 class ChoiceFilterResult(NamedTuple):
     filtered_values: Array          # (n_trials, K-1)
     filtered_covariances: Array     # (n_trials, K-1, K-1)
-    predicted_values: Array         # (n_trials, K-1) — needed by smoother
-    predicted_covariances: Array    # (n_trials, K-1, K-1) — needed by smoother
+    predicted_values: Array         # (n_trials, K-1) — for diagnostics
+    predicted_covariances: Array    # (n_trials, K-1, K-1) — for diagnostics
     marginal_log_likelihood: Array  # scalar
 
 class ChoiceSmootherResult(NamedTuple):
@@ -228,6 +241,11 @@ def multinomial_choice_smoother(
    from `A @ filter_cov @ A.T + Q`, so we do NOT need to pass predicted values
 5. Convention: `smoother_cross_cov[t]` = `Cov(x_t, x_{t+1} | y_{1:T})`
    where index t is the earlier trial. The M-step must be consistent with this.
+6. **IMPORTANT:** The reverse `lax.scan` over `filtered[:-1]` produces
+   `(n_trials-1, K-1)` arrays. You MUST append the last filtered state to
+   get `(n_trials, K-1)` smoothed output (same pattern as `kalman_smoother`
+   in kalman.py lines 445-446). The `test_last_trial_matches_filter` test
+   will catch this if forgotten.
 
 ### Step 2.5: Run tests — verify they PASS
 
@@ -300,12 +318,14 @@ class TestMultinomialChoiceModel:
         # choice >= n_options or choice < 0 should raise ValueError
 
     def test_two_options_consistent_with_smith(self):
-        # KEY VALIDATION: With K=2 binary choices (β=1, prob_chance=0.5),
-        # MultinomialChoiceModel smoothed_values[:,0] should be nearly
-        # identical to SmithLearningModel smoothed_learning_state_mode.
-        # Use jnp.allclose(atol=0.1) NOT just correlation > 0.9, because
-        # loose correlation cannot catch systematic scale errors in β.
-        # Both models must use the same sigma/Q and be fitted to the same data.
+        # KEY VALIDATION: With K=2 binary choices, compare multinomial vs Smith.
+        # Setup: fix β=1, prob_chance=0.5, same sigma_epsilon=sqrt(Q).
+        # Both models: learn_inverse_temperature=False, learn_process_noise=False
+        # (fix parameters to be identical, only compare filter/smoother output).
+        # Use the SAME data (binary outcomes → choices for multinomial).
+        # Check: correlation > 0.95 AND mean absolute error < 0.2 in logit units.
+        # The models won't be exactly equal (iterative Newton vs BFGS, K-1 vs
+        # scalar parameterization) but should be very close with fixed params.
 ```
 
 ### Step 3.2: Run tests — verify they FAIL
@@ -356,8 +376,13 @@ Methods to implement:
     ]
     q = mean(diag(Q_hat)), clamped >= 1e-8
     ```
-  - M-step for β: grid search (default `[0.1, 0.3, 0.5, 1, 2, 3, 5, 8, 12]`,
-    configurable via `beta_grid` parameter)
+  - M-step for β: two-phase optimization:
+    (a) Coarse grid search (default `[0.1, 0.3, 0.5, 1, 2, 3, 5, 8, 12]`,
+    configurable via `beta_grid`). Use `jax.vmap` over grid for performance.
+    (b) Golden-section refinement around best grid point (bracket =
+    neighboring grid values, ~10 steps). This handles β >> 12.
+  - EM iteration order: run smoother (for Q M-step), then grid search
+    filters (for β M-step). This means T + N_β * T forward passes per iter.
   - Store `log_likelihood_`, `n_iter_`, `log_likelihood_history_`
 - `choice_probabilities()` — softmax(β * [0, smoothed_values])
 - `bic()` — parameter count: Q (1 scalar) + β (1 scalar) + initial mean (K-1 values)

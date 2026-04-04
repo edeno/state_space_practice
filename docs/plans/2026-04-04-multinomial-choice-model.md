@@ -61,7 +61,17 @@ Step 4: Negative Hessian w.r.t. x (K-1 × K-1 submatrix):
     well-behaved — no BFGS failure modes.
 ```
 
-Because the Hessian is analytic and the posterior is log-concave, we use a single Newton step (not iterative BFGS). This is faster and more robust than the Smith model's BFGS approach.
+Because the Hessian is analytic and the posterior is log-concave, we use
+iterative Newton (2-3 steps with convergence check) rather than BFGS. For
+moderate β and well-conditioned priors, a single Newton step is often
+sufficient, but with large β or a prior mean far from the mode, Newton can
+overshoot. Iterating to convergence ensures the Laplace mode is accurate,
+which is critical for the K=2 consistency test with SmithLearningModel.
+
+**Note on approximation:** Even with iterative Newton, the Laplace-EKF is
+an approximation (Gaussian posterior at each step). The Smith model uses
+BFGS to find the exact Laplace mode for each scalar update; the
+multinomial model uses Newton iteration on the K-1 dimensional problem.
 
 ### EM M-step
 
@@ -85,12 +95,13 @@ The M-step updates:
    `Cov(x_t, x_{t+1} | y_{1:T})` — the cross-covariance between
    consecutive trials. Convention: index `t` refers to the earlier trial.
 
-2. **Inverse temperature β**: Grid search over candidate values, selecting
-   the β that maximizes the predictive log-likelihood from a filter pass.
-   Default grid: `[0.1, 0.3, 0.5, 1, 2, 3, 5, 8, 12]`. Configurable.
-   **Limitation:** If true β > max(grid), EM saturates. For highly
-   deterministic data, expand the grid or add a golden-section refinement
-   step around the best grid point.
+2. **Inverse temperature β**: Two-phase optimization:
+   (a) Coarse grid search over candidates (default: `[0.1, 0.3, 0.5, 1, 2, 3, 5, 8, 12]`).
+   (b) Golden-section refinement around the best grid point (bracket = neighboring
+   grid values, 10 refinement steps). This handles β >> 12 without needing a
+   huge grid. Use `jax.vmap` over the grid to vectorize the filter passes.
+   The `init_cov` is fixed (not learned via EM), so BIC parameter count
+   is K+1: Q (1 scalar) + β (1 scalar) + init_mean (K-1 values).
 
 ### Log-likelihood approximation
 
