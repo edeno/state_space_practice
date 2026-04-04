@@ -42,7 +42,7 @@ from jax import Array
 from jax.typing import ArrayLike
 from patsy import dmatrix
 
-from state_space_practice.kalman import sum_of_outer_products, symmetrize
+from state_space_practice.kalman import psd_solve, sum_of_outer_products, symmetrize
 from state_space_practice.point_process_kalman import (
     get_confidence_interval,
     log_conditional_intensity,
@@ -193,10 +193,18 @@ class PlaceFieldModel:
         spatial resolution. Total basis functions = (n_interior_knots + 3)^2.
     process_noise_structure : str, default="diagonal"
         Structure of the process noise covariance Q:
-        - "diagonal": independent variance per basis function (learned via EM)
-        - "isotropic": single scalar variance shared across all basis functions
+        - "diagonal": independent variance per basis function (learned via EM).
+          Use for most analyses; allows each spatial basis function to drift
+          at its own rate.
+        - "isotropic": single scalar variance shared across all basis functions.
+          Faster to converge but assumes uniform drift across all spatial
+          basis functions, which is rarely appropriate for place cells.
     init_process_noise : float, default=1e-5
         Initial value for the diagonal of Q.
+    init_cov_scale : float, default=1.0
+        Scale for the initial state covariance (init_cov = I * init_cov_scale).
+        Controls how uncertain the initial weight estimates are. Larger values
+        allow faster initial adaptation but may cause instability.
     update_transition_matrix : bool, default=False
         Whether to learn A. Default False (keeps A = I for random walk).
     update_process_cov : bool, default=True
@@ -204,8 +212,8 @@ class PlaceFieldModel:
     update_init_state : bool, default=True
         Whether to learn initial mean and covariance via EM.
 
-    Attributes
-    ----------
+    Attributes (set after fit)
+    --------------------------
     smoother_mean : Array, shape (n_time, n_basis)
         Smoothed weight estimates after fitting.
     smoother_cov : Array, shape (n_time, n_basis, n_basis)
@@ -228,6 +236,7 @@ class PlaceFieldModel:
         n_interior_knots: int = 5,
         process_noise_structure: str = "diagonal",
         init_process_noise: float = 1e-5,
+        init_cov_scale: float = 1.0,
         update_transition_matrix: bool = False,
         update_process_cov: bool = True,
         update_init_state: bool = True,
@@ -248,6 +257,7 @@ class PlaceFieldModel:
         self.n_interior_knots = n_interior_knots
         self.process_noise_structure = process_noise_structure
         self.init_process_noise = init_process_noise
+        self.init_cov_scale = init_cov_scale
         self.update_transition_matrix = update_transition_matrix
         self.update_process_cov = update_process_cov
         self.update_init_state = update_init_state
@@ -269,7 +279,7 @@ class PlaceFieldModel:
         parts = [
             f"dt={self.dt}",
             f"n_interior_knots={self.n_interior_knots}",
-            f"Q_structure={self.process_noise_structure}",
+            f"process_noise_structure={self.process_noise_structure}",
             f"fitted={fitted}",
         ]
         if fitted and self.process_cov is not None:
@@ -339,10 +349,20 @@ class PlaceFieldModel:
         knot_spacing = place_field_width / 3.0
         extent_x = arena_range_x[1] - arena_range_x[0]
         extent_y = arena_range_y[1] - arena_range_y[0]
-        extent = max(extent_x, extent_y)
+        # Use average extent so non-square arenas don't over-parameterize
+        # the short axis (same n_interior_knots is used for both dimensions).
+        extent = (extent_x + extent_y) / 2.0
         n_interior_knots = max(3, int(np.round(extent / knot_spacing)))
 
         return cls(dt=dt, n_interior_knots=n_interior_knots, **kwargs)
+
+    def _check_fitted(self, method_name: str) -> None:
+        """Raise if the model has not been fitted."""
+        if self.smoother_mean is None:
+            raise RuntimeError(
+                f"Model has not been fitted. "
+                f"Call model.fit(position, spikes) before {method_name}()."
+            )
 
     def _build_design_matrix(
         self,
@@ -366,7 +386,7 @@ class PlaceFieldModel:
         self.transition_matrix = jnp.eye(n)
         self.process_cov = jnp.eye(n) * self.init_process_noise
         self.init_mean = jnp.zeros(n)
-        self.init_cov = jnp.eye(n) * 1.0
+        self.init_cov = jnp.eye(n) * self.init_cov_scale
 
     def _e_step(
         self, design_matrix: Array, spikes: Array
@@ -414,8 +434,6 @@ class PlaceFieldModel:
         ).T
 
         if self.update_transition_matrix:
-            from state_space_practice.kalman import psd_solve
-
             A_new = psd_solve(gamma1, beta.T).T
             self.transition_matrix = A_new
             Q_new = (gamma2 - A_new @ beta.T) / (n_time - 1)
@@ -449,6 +467,12 @@ class PlaceFieldModel:
         most recording systems) into the binned spike counts expected by
         ``fit()``.
 
+        Spikes are assigned to bin *i* if ``time_bins[i] < spike_time <=
+        time_bins[i+1]`` (right-closed intervals). Spikes exactly at
+        ``time_bins[0]`` are assigned to bin 0 (the first bin). Spikes
+        before ``time_bins[0]`` or after ``time_bins[-1] + dt`` are
+        silently discarded.
+
         Parameters
         ----------
         spike_times : np.ndarray, shape (n_spikes,)
@@ -477,7 +501,7 @@ class PlaceFieldModel:
         self,
         position: np.ndarray,
         spikes: ArrayLike,
-        max_iter: int = 10,
+        max_iter: int = 100,
         tolerance: float = 1e-4,
         knots_x: Optional[np.ndarray] = None,
         knots_y: Optional[np.ndarray] = None,
@@ -492,7 +516,7 @@ class PlaceFieldModel:
         spikes : ArrayLike, shape (n_time,)
             Spike counts per time bin. Use ``PlaceFieldModel.bin_spike_times``
             to convert spike time arrays to binned counts.
-        max_iter : int, default=10
+        max_iter : int, default=100
             Maximum number of EM iterations.
         tolerance : float, default=1e-4
             Convergence tolerance for relative log-likelihood change.
@@ -517,6 +541,11 @@ class PlaceFieldModel:
                 f"spikes must be 1D with shape (n_time,), got shape {spikes.shape}. "
                 f"Multi-neuron input is not supported; fit one neuron at a time."
             )
+        if jnp.any(spikes < 0):
+            raise ValueError(
+                "spikes must be non-negative counts. Got negative values. "
+                "If you have continuous rates, bin them first."
+            )
         if position.shape[0] != spikes.shape[0]:
             raise ValueError(
                 f"position and spikes must have the same number of time bins: "
@@ -539,10 +568,15 @@ class PlaceFieldModel:
         self.log_likelihoods = []
 
         for iteration in range(max_iter):
+            # Save previous smoother state so we can roll back on LL decrease
+            prev_smoother_mean = self.smoother_mean
+            prev_smoother_cov = self.smoother_cov
+            prev_smoother_cross_cov = self.smoother_cross_cov
+
             ll = self._e_step(design_matrix, spikes)
             self.log_likelihoods.append(ll)
 
-            _print(f"  EM iter {iteration + 1}/{max_iter}: LL = {ll:.1f}")
+            _print(f"  EM iter {iteration + 1:>{len(str(max_iter))}}/{max_iter}: LL = {ll:.1f}")
 
             if not jnp.isfinite(ll):
                 _print(f"  WARNING: Non-finite LL at iteration {iteration + 1}")
@@ -553,15 +587,31 @@ class PlaceFieldModel:
                     ll, self.log_likelihoods[-2], tolerance
                 )
                 if not is_increasing:
-                    _print(
-                        f"  WARNING: LL decreased: "
-                        f"{self.log_likelihoods[-2]:.1f} -> {ll:.1f}"
+                    # Roll back to the previous (better) smoother state
+                    self.smoother_mean = prev_smoother_mean
+                    self.smoother_cov = prev_smoother_cov
+                    self.smoother_cross_cov = prev_smoother_cross_cov
+                    msg = (
+                        f"LL decreased: "
+                        f"{self.log_likelihoods[-2]:.1f} -> {ll:.1f}; "
+                        f"stopping EM and rolling back to previous E-step."
                     )
-                if is_converged and is_increasing:
+                    _print(f"  WARNING: {msg}")
+                    logger.warning(msg)
+                    break
+                if is_converged:
                     _print(f"  Converged after {iteration + 1} iterations.")
                     break
 
             self._m_step()
+        else:
+            msg = (
+                f"EM reached maximum iterations ({max_iter}) without "
+                f"converging. Consider increasing max_iter or loosening "
+                f"tolerance."
+            )
+            _print(f"  WARNING: {msg}")
+            logger.warning(msg)
 
         return self.log_likelihoods
 
@@ -576,11 +626,6 @@ class PlaceFieldModel:
         Evaluates the estimated place field at a grid of positions,
         averaging the smoothed weights over the specified time window.
 
-        The confidence interval reflects the average per-time-step posterior
-        uncertainty over the window, not the uncertainty of the time-averaged
-        weight. This gives a representative sense of how uncertain the rate
-        estimate is at each spatial location during the specified period.
-
         Parameters
         ----------
         grid_positions : np.ndarray, shape (n_grid_points, 2)
@@ -589,17 +634,24 @@ class PlaceFieldModel:
             Time window over which to average the smoothed weights.
             If None, uses the full session.
         alpha : float, default=0.05
-            Significance level for confidence interval (0.05 for 95% CI).
+            Significance level for credible interval (0.05 for 95% CI).
 
         Returns
         -------
         rate : np.ndarray, shape (n_grid_points,)
             Estimated firing rate (Hz) at each grid position.
         rate_ci : np.ndarray, shape (n_grid_points, 2)
-            Lower and upper confidence bounds on the rate (Hz).
+            Lower and upper credible bounds on the rate (Hz).
+
+        Notes
+        -----
+        The credible interval reflects the average per-time-step marginal
+        posterior uncertainty over the window, not the uncertainty of the
+        time-averaged weight. This gives a representative sense of how
+        uncertain the rate estimate is at each spatial location during the
+        specified period.
         """
-        if self.smoother_mean is None or self.basis_info is None:
-            raise RuntimeError("Model has not been fitted yet.")
+        self._check_fitted("predict_rate_map")
 
         Z_grid = evaluate_basis(grid_positions, self.basis_info)
 
@@ -643,8 +695,7 @@ class PlaceFieldModel:
         centers : np.ndarray, shape (n_blocks, 2)
             Estimated place field center (x, y) in each block.
         """
-        if self.smoother_mean is None or self.basis_info is None:
-            raise RuntimeError("Model has not been fitted yet.")
+        self._check_fitted("predict_center")
 
         Z_grid = evaluate_basis(grid_positions, self.basis_info)
         n_time = self.smoother_mean.shape[0]
@@ -693,8 +744,7 @@ class PlaceFieldModel:
         >>> rate, ci = model.predict_rate_map(grid)
         >>> plt.pcolormesh(x_edges, y_edges, rate.reshape(len(y_edges), len(x_edges)))
         """
-        if self.basis_info is None:
-            raise RuntimeError("Model has not been fitted yet.")
+        self._check_fitted("make_grid")
         x = np.linspace(self.basis_info["x_lo"], self.basis_info["x_hi"], n_grid)
         y = np.linspace(self.basis_info["y_lo"], self.basis_info["y_hi"], n_grid)
         xx, yy = np.meshgrid(x, y)
@@ -722,13 +772,19 @@ class PlaceFieldModel:
         log_likelihood : float
             Marginal log-likelihood of the held-out data.
         """
-        if self.basis_info is None or self.init_mean is None:
-            raise RuntimeError("Model has not been fitted yet.")
+        self._check_fitted("score")
+
+        position = np.asarray(position)
+        spikes = jnp.asarray(spikes)
+        if position.shape[0] != spikes.shape[0]:
+            raise ValueError(
+                f"position and spikes must have the same number of time bins: "
+                f"got position ({position.shape[0]},) vs spikes ({spikes.shape[0]},)"
+            )
 
         design_matrix = jnp.asarray(
-            evaluate_basis(np.asarray(position), self.basis_info)
+            evaluate_basis(position, self.basis_info)
         )
-        spikes = jnp.asarray(spikes)
 
         _, _, marginal_ll = stochastic_point_process_filter(
             init_mean_params=self.init_mean,
@@ -757,8 +813,7 @@ class PlaceFieldModel:
         ci : Array, shape (n_time, n_basis, 2)
             Lower and upper bounds for each weight at each time step.
         """
-        if self.smoother_mean is None or self.smoother_cov is None:
-            raise RuntimeError("Model has not been fitted yet.")
+        self._check_fitted("get_state_confidence_interval")
         return get_confidence_interval(
             self.smoother_mean, self.smoother_cov, alpha=alpha
         )
@@ -787,11 +842,10 @@ class PlaceFieldModel:
             centers : (n_blocks, 2) — place field center per block
             total_drift : float — Euclidean distance from first to last center (cm)
             cumulative_drift : float — total path length of center trajectory (cm)
-            mean_rate_per_block : (n_blocks,) — peak rate in each block
-            block_times : (n_blocks,) — center time of each block (in time steps)
+            peak_rate_per_block : (n_blocks,) — peak rate in each block (Hz)
+            block_times : (n_blocks,) — center time of each block (seconds)
         """
-        if self.smoother_mean is None:
-            raise RuntimeError("Model has not been fitted yet.")
+        self._check_fitted("drift_summary")
 
         grid, _, _ = self.make_grid(n_grid)
         Z_grid = evaluate_basis(grid, self.basis_info)
@@ -819,7 +873,7 @@ class PlaceFieldModel:
             "centers": centers,
             "total_drift": float(np.linalg.norm(centers[-1] - centers[0])),
             "cumulative_drift": float(displacements.sum()),
-            "mean_rate_per_block": peak_rates,
+            "peak_rate_per_block": peak_rates,
             "block_times": block_times * self.dt,
         }
 
@@ -851,8 +905,7 @@ class PlaceFieldModel:
         """
         import matplotlib.pyplot as plt
 
-        if self.smoother_mean is None:
-            raise RuntimeError("Model has not been fitted yet.")
+        self._check_fitted("plot_rate_maps")
 
         grid, x_edges, y_edges = self.make_grid(n_grid)
         n_time = self.smoother_mean.shape[0]
@@ -881,7 +934,7 @@ class PlaceFieldModel:
 
         for i, (rate_map, label) in enumerate(zip(rate_maps, labels)):
             im = axes[i].pcolormesh(
-                x_edges, y_edges, rate_map, cmap="hot", vmin=0, vmax=vmax
+                x_edges, y_edges, rate_map, cmap="viridis", vmin=0, vmax=vmax
             )
             axes[i].set_title(label)
             axes[i].set_aspect("equal")
@@ -901,7 +954,7 @@ class PlaceFieldModel:
     ):
         """Plot the place field center trajectory over time.
 
-        Colors the trajectory from blue (start) to red (end).
+        Colors the trajectory from dark (start) to bright (end).
 
         Parameters
         ----------
@@ -927,7 +980,7 @@ class PlaceFieldModel:
         else:
             fig = ax.figure
 
-        colors = plt.cm.coolwarm(np.linspace(0, 1, n_blocks))
+        colors = plt.cm.viridis(np.linspace(0, 1, n_blocks))
         for i in range(n_blocks - 1):
             ax.plot(
                 centers[i : i + 2, 0],
