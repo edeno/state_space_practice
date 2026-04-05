@@ -188,17 +188,26 @@ class PlaceFieldRateMaps:
         dt: float,
         n_grid: int = 50,
         sigma: float = 5.0,
+        min_occupancy_s: float = 0.02,
     ) -> PlaceFieldRateMaps:
         """Estimate rate maps from position and spike data using KDE.
 
         Parameters
         ----------
         position : np.ndarray, shape (n_time, 2)
+            Animal position in cm at each time bin.
         spike_counts : np.ndarray, shape (n_time,) or (n_time, n_neurons)
+            Spike counts per time bin (and per neuron).
         dt : float
+            Time bin width in seconds.
         n_grid : int
+            Number of spatial bins per dimension.
         sigma : float
             Gaussian smoothing kernel width in cm.
+        min_occupancy_s : float
+            Minimum occupancy time (seconds) for a grid bin to have a
+            nonzero rate estimate. Bins below this threshold are set to
+            zero rate. Default 0.02 s (5 time bins at dt=0.004).
 
         Returns
         -------
@@ -252,7 +261,7 @@ class PlaceFieldRateMaps:
             )
             spike_smooth = gaussian_filter(spike_map.T, sigma_bins)
             rate_maps[n] = np.where(
-                occ_smooth > dt * 5, spike_smooth / occ_smooth, 0
+                occ_smooth > min_occupancy_s, spike_smooth / occ_smooth, 0
             )
 
         # Use bin centers as grid coordinates
@@ -392,14 +401,16 @@ class DecoderResult:
     ----------
     position_mean : Array, shape (n_time, n_state)
         Decoded position (and velocity) at each time step.
-        Columns: [x, y, vx, vy] or [x, y].
+        Columns: [x, y, vx, vy] if include_velocity=True, else [x, y].
+        Use the ``position_xy`` property for just the (x, y) coordinates.
     position_cov : Array, shape (n_time, n_state, n_state)
         Posterior covariance at each time step.
     marginal_log_likelihood : float
         Laplace approximation to the marginal log-evidence
         sum_t log p(y_t | y_{1:t-1}), where y_t are the spike counts.
         Includes the prior term and Laplace normalization correction.
-        Suitable for model comparison and hyperparameter selection.
+        This is a sum over time bins, so longer recordings yield larger
+        values. Normalize by n_time for cross-session comparison.
     """
 
     def __init__(
@@ -411,6 +422,16 @@ class DecoderResult:
         self.position_mean = position_mean
         self.position_cov = position_cov
         self.marginal_log_likelihood = marginal_log_likelihood
+
+    @property
+    def position_xy(self) -> Array:
+        """Decoded (x, y) position, shape (n_time, 2)."""
+        return self.position_mean[:, :2]
+
+    @property
+    def position_cov_xy(self) -> Array:
+        """Position (x, y) covariance block, shape (n_time, 2, 2)."""
+        return self.position_cov[:, :2, :2]
 
     def __repr__(self) -> str:
         n_time = self.position_mean.shape[0]
@@ -556,12 +577,18 @@ def position_decoder_smoother(
 ) -> DecoderResult:
     """Decode position from spikes using Laplace-EKF + RTS smoother.
 
-    Same parameters as ``position_decoder_filter``. Returns smoothed
-    (non-causal) estimates that use the full spike train.
+    Runs the forward filter, then applies the Rauch-Tung-Striebel
+    backward smoother to produce non-causal position estimates that
+    use the entire spike train. Smoothed estimates have lower variance
+    than filtered estimates.
+
+    Parameters are the same as :func:`position_decoder_filter`.
 
     Returns
     -------
-    DecoderResult with smoothed position estimates.
+    DecoderResult
+        Smoothed position estimates with the same marginal_log_likelihood
+        as the forward filter (the smoother does not change it).
     """
     filter_result = position_decoder_filter(
         spikes, rate_maps, dt, q_pos, q_vel,
@@ -662,12 +689,14 @@ class PositionDecoder:
         position: np.ndarray,
         spikes: np.ndarray,
     ) -> None:
-        """Estimate place field rate maps from training data.
+        """Estimate place field rate maps from training data via KDE.
 
         Parameters
         ----------
         position : np.ndarray, shape (n_time, 2)
+            Animal position in cm at each time bin.
         spikes : np.ndarray, shape (n_time,) or (n_time, n_neurons)
+            Spike counts per time bin (and per neuron).
         """
         self.rate_maps = PlaceFieldRateMaps.from_spike_position_data(
             position=position,
@@ -675,6 +704,37 @@ class PositionDecoder:
             dt=self.dt,
             n_grid=self.n_grid,
             sigma=self.smoothing_sigma,
+        )
+        logger.info(
+            "Fitted rate maps for %d neurons on %dx%d grid",
+            self.rate_maps.n_neurons, self.n_grid, self.n_grid,
+        )
+
+    def fit_from_model(
+        self,
+        model,
+        n_grid: Optional[int] = None,
+        time_slice: Optional[slice] = None,
+    ) -> None:
+        """Use rate maps from a fitted PlaceFieldModel.
+
+        Parameters
+        ----------
+        model : PlaceFieldModel
+            Fitted encoding model.
+        n_grid : int or None
+            Grid resolution. If None, uses self.n_grid.
+        time_slice : slice or None
+            Time bin indices to average over. None = full session.
+        """
+        self.rate_maps = PlaceFieldRateMaps.from_place_field_model(
+            model, n_grid=n_grid or self.n_grid, time_slice=time_slice,
+        )
+        logger.info(
+            "Loaded rate maps for %d neurons on %dx%d grid from PlaceFieldModel",
+            self.rate_maps.n_neurons,
+            self.rate_maps.rate_maps.shape[1],
+            self.rate_maps.rate_maps.shape[2],
         )
 
     def decode(
@@ -702,7 +762,11 @@ class PositionDecoder:
         DecoderResult
         """
         if self.rate_maps is None:
-            raise RuntimeError("Must call fit() before decode().")
+            raise RuntimeError(
+                "PositionDecoder.decode() called before fitting. "
+                "Call decoder.fit(position, spikes) or "
+                "decoder.fit_from_model(model) first."
+            )
 
         spikes_arr = jnp.asarray(spikes)
         if spikes_arr.ndim == 1:
@@ -710,8 +774,10 @@ class PositionDecoder:
 
         if spikes_arr.shape[1] != self.rate_maps.n_neurons:
             raise ValueError(
-                f"Expected {self.rate_maps.n_neurons} spike columns, "
-                f"got {spikes_arr.shape[1]}"
+                f"spikes has {spikes_arr.shape[1]} neurons but rate maps "
+                f"were estimated from {self.rate_maps.n_neurons} neurons. "
+                f"Ensure test spikes use the same neuron ordering as "
+                f"training data"
             )
 
         if method == "smoother":
@@ -740,11 +806,17 @@ class PositionDecoder:
     ):
         """Plot decoded vs true position trajectory.
 
+        When called without ``ax``, creates a two-panel figure:
+        left panel shows the 2D trajectory, right panel shows
+        position error and uncertainty over time.
+
         Parameters
         ----------
         result : DecoderResult
         true_position : np.ndarray or None, shape (n_time, 2)
-        ax : Axes or None
+        ax : array of Axes or None
+            If provided, must be an array of 2 Axes for both panels,
+            or a single Axes for trajectory-only mode.
 
         Returns
         -------
@@ -752,10 +824,12 @@ class PositionDecoder:
         """
         import matplotlib.pyplot as plt
 
-        decoded = np.array(result.position_mean[:, :2])
+        decoded = np.array(result.position_xy)
 
         if ax is None:
-            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            n_panels = 2 if true_position is not None else 1
+            fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5))
+            axes = np.atleast_1d(axes)
         else:
             axes = np.atleast_1d(ax)
             fig = axes[0].figure
