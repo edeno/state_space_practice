@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
+from functools import partial
 from typing import NamedTuple, Optional
 
 import jax
@@ -202,6 +203,7 @@ def multinomial_choice_filter(
     choices_arr = jnp.asarray(choices, dtype=jnp.int32)
     k_free = n_options - 1
 
+    # Resolve defaults before JIT boundary
     if init_mean is None:
         init_mean = jnp.zeros(k_free)
     else:
@@ -211,6 +213,23 @@ def multinomial_choice_filter(
     else:
         init_cov = jnp.asarray(init_cov)
 
+    return _multinomial_choice_filter_jit(
+        choices_arr, n_options, process_noise, inverse_temperature,
+        init_mean, init_cov,
+    )
+
+
+@partial(jax.jit, static_argnames=("n_options",))
+def _multinomial_choice_filter_jit(
+    choices: Array,
+    n_options: int,
+    process_noise: float,
+    inverse_temperature: float,
+    init_mean: Array,
+    init_cov: Array,
+) -> ChoiceFilterResult:
+    """JIT-compiled filter core."""
+    k_free = n_options - 1
     Q = jnp.eye(k_free) * process_noise
 
     def _step(carry, choice_t):
@@ -233,7 +252,7 @@ def multinomial_choice_filter(
 
     init_carry = (init_mean, init_cov, jnp.array(0.0))
     (_, _, marginal_ll), (filt_vals, filt_covs, pred_vals, pred_covs) = (
-        jax.lax.scan(_step, init_carry, choices_arr)
+        jax.lax.scan(_step, init_carry, choices)
     )
 
     return ChoiceFilterResult(
@@ -243,6 +262,37 @@ def multinomial_choice_filter(
         predicted_covariances=pred_covs,
         marginal_log_likelihood=marginal_ll,
     )
+
+
+@jax.jit
+def _rts_smoother_pass(
+    filtered_values: Array,
+    filtered_covariances: Array,
+    Q: Array,
+) -> tuple[Array, Array, Array]:
+    """JIT-compiled RTS backward smoother for random walk dynamics."""
+    from state_space_practice.kalman import _kalman_smoother_update
+
+    A = jnp.eye(Q.shape[0])
+
+    def _smooth_step(carry, inputs):
+        next_sm_mean, next_sm_cov = carry
+        f_mean, f_cov = inputs
+
+        sm_mean, sm_cov, cross_cov = _kalman_smoother_update(
+            next_sm_mean, next_sm_cov,
+            f_mean, f_cov,
+            Q, A,
+        )
+        return (sm_mean, sm_cov), (sm_mean, sm_cov, cross_cov)
+
+    _, (sm_means, sm_covs, cross_covs) = jax.lax.scan(
+        _smooth_step,
+        (filtered_values[-1], filtered_covariances[-1]),
+        (filtered_values[:-1], filtered_covariances[:-1]),
+        reverse=True,
+    )
+    return sm_means, sm_covs, cross_covs
 
 
 def multinomial_choice_smoother(
@@ -261,8 +311,6 @@ def multinomial_choice_smoother(
     -------
     ChoiceSmootherResult
     """
-    from state_space_practice.kalman import _kalman_smoother_update
-
     filt = multinomial_choice_filter(
         choices, n_options, process_noise, inverse_temperature,
         init_mean, init_cov,
@@ -270,24 +318,9 @@ def multinomial_choice_smoother(
 
     k_free = n_options - 1
     Q = jnp.eye(k_free) * process_noise
-    A = jnp.eye(k_free)  # Random walk
 
-    def _smooth_step(carry, inputs):
-        next_sm_mean, next_sm_cov = carry
-        f_mean, f_cov = inputs
-
-        sm_mean, sm_cov, cross_cov = _kalman_smoother_update(
-            next_sm_mean, next_sm_cov,
-            f_mean, f_cov,
-            Q, A,
-        )
-        return (sm_mean, sm_cov), (sm_mean, sm_cov, cross_cov)
-
-    _, (sm_means, sm_covs, cross_covs) = jax.lax.scan(
-        _smooth_step,
-        (filt.filtered_values[-1], filt.filtered_covariances[-1]),
-        (filt.filtered_values[:-1], filt.filtered_covariances[:-1]),
-        reverse=True,
+    sm_means, sm_covs, cross_covs = _rts_smoother_pass(
+        filt.filtered_values, filt.filtered_covariances, Q,
     )
 
     # Append last filtered state (smoother[-1] == filter[-1])
@@ -409,6 +442,11 @@ class MultinomialChoiceModel:
         """
         choices_arr = jnp.asarray(choices, dtype=jnp.int32)
         self._n_trials = int(choices_arr.shape[0])
+
+        if self._n_trials < 2:
+            raise ValueError(
+                f"Need at least 2 trials for EM fitting, got {self._n_trials}"
+            )
 
         # Validate choices
         choices_np = np.asarray(choices)
@@ -549,14 +587,26 @@ class MultinomialChoiceModel:
         )
         return jax.nn.softmax(self.inverse_temperature * full_values, axis=1)
 
+    @property
+    def n_free_params(self) -> int:
+        """Number of free parameters actually learned by EM."""
+        n = 0
+        if self.learn_process_noise:
+            n += 1  # Q scalar
+        if self.learn_inverse_temperature:
+            n += 1  # beta
+        return n
+
     def bic(self) -> float:
         """Bayesian Information Criterion.
 
-        Parameter count: Q (1) + beta (1) + init_mean (K-1) = K+1.
+        Only counts parameters that are actually learned via EM.
         """
         self._check_fitted("bic")
-        n_params = self.n_options + 1
-        return -2.0 * self.log_likelihood_ + n_params * math.log(self._n_trials)
+        return (
+            -2.0 * self.log_likelihood_
+            + self.n_free_params * math.log(self._n_trials)
+        )
 
     def compare_to_null(self, choices: Optional[ArrayLike] = None) -> dict:
         """Compare fitted model to a null (uniform 1/K) model.

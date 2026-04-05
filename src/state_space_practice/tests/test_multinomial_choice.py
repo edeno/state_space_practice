@@ -292,6 +292,11 @@ class TestMultinomialChoiceModel:
         with pytest.raises(ValueError):
             model.fit(np.array([0, 1, 3]))  # 3 is out of range
 
+    def test_single_trial_raises(self):
+        model = MultinomialChoiceModel(n_options=3)
+        with pytest.raises(ValueError, match="at least 2 trials"):
+            model.fit(np.array([1]))
+
     def test_two_options_consistent_with_smith(self):
         """K=2 multinomial should agree with SmithLearningModel."""
         from state_space_practice.smith_learning_algorithm import SmithLearningModel
