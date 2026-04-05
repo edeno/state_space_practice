@@ -4,9 +4,9 @@
 >
 > **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.
 
-**Goal:** Build a shared latent belief-state model for multi-armed bandit behavior where the same latent value state explains both trial choices and neural spiking activity.
+**Goal:** Build a shared latent belief-state model for multi-armed bandit behavior where the same latent value state explains trial choices and task-variable neural spiking activity, serving as the mPFC or behavior-linked latent foundation rather than the CA1 represented-content model.
 
-**Architecture:** Use a single latent value state `x_t` (relative option values) with random-walk dynamics. Apply two observation updates at each step: (1) multinomial choice update via softmax likelihood and (2) point-process spike update using position-conditioned neural firing with value modulation. Use Laplace-EKF style updates with existing Kalman smoothing utilities.
+**Architecture:** Use a single latent value state `x_t` (relative option values) with random-walk dynamics. Apply two observation updates at each step: (1) multinomial choice update via softmax likelihood and (2) optional neural spike update using position-conditioned firing with value modulation. Use Laplace-EKF style updates with existing Kalman smoothing utilities. This plan is for belief or value inference, not for replay or theta-sequence content; CA1 represented-content switching belongs in a separate model layer.
 
 **Tech Stack:** JAX, `multinomial_choice` softmax update/filter/smoother APIs, `place_field_model` basis utilities, point-process update patterns from `point_process_kalman.py`, smoother primitives in `kalman.py`.
 
@@ -37,18 +37,21 @@
 - Keep one shared latent state object as the design invariant; do not fork behavior and neural latent trajectories.
 - Add finite-value assertions after each update (choice and spike) and before smoother passes.
 - Implement a behavior-only mode in the same API for parity checks and ablations.
+- Do not overload this plan with CA1 replay, retrospective or prospective sequence modes, or represented-position switching. Those belong to the represented-state and value-gated sequence plans.
 
 **MVP Scope Lock (implement now):**
 
 - Support K=3 options as the primary case with option-0 reference identifiability.
 - Use scalar process noise (`Q = q * I`) and fixed per-neuron value loading during initial integration.
 - Implement one update schedule per time step: predict -> choice update (if trial event) -> spike update (if spikes observed).
+- Prioritize behavior plus mPFC-like or task-variable neural signals; treat CA1 spike inputs here as optional ablations, not the primary replay model.
 - Require three acceptance checks: behavior-only parity, neural-only sanity, and joint model held-out choice gain over behavior-only.
 
 **Defer Until Post-MVP:**
 
 - Rich process-noise structures and hierarchical priors over value dynamics.
-- Adaptive/learned per-neuron value loadings during full joint EM.
+- Adaptive or learned per-neuron value loadings during full joint EM.
+- CA1 represented-content switching, replay or theta-sequence modes, and value-gated sequence expression.
 - Multi-session hierarchical coupling and cross-region latent coupling in the same model.
 
 **References:**
