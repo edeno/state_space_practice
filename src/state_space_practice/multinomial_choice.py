@@ -28,7 +28,11 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.kalman import psd_solve, symmetrize
+from state_space_practice.kalman import (
+    _kalman_smoother_update,
+    psd_solve,
+    symmetrize,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -272,8 +276,6 @@ def _rts_smoother_pass(
     Q: Array,
 ) -> tuple[Array, Array, Array]:
     """JIT-compiled RTS backward smoother for random walk dynamics."""
-    from state_space_practice.kalman import _kalman_smoother_update
-
     A = jnp.eye(Q.shape[0])
 
     def _smooth_step(carry, inputs):
@@ -336,7 +338,7 @@ def multinomial_choice_smoother(
     )
 
 
-_DEFAULT_BETA_GRID = jnp.array([0.1, 0.3, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0])
+_DEFAULT_BETA_GRID = (0.1, 0.3, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0)
 
 
 class MultinomialChoiceModel:
@@ -470,7 +472,7 @@ class MultinomialChoiceModel:
             )
 
         if beta_grid is None:
-            beta_grid = _DEFAULT_BETA_GRID
+            beta_grid = jnp.array(_DEFAULT_BETA_GRID)
         else:
             beta_grid = jnp.asarray(beta_grid)
 
@@ -528,19 +530,29 @@ class MultinomialChoiceModel:
         return log_likelihoods
 
     def _m_step_process_noise(self, smooth: ChoiceSmootherResult) -> float:
-        """M-step: update scalar process noise from smoother statistics."""
+        """M-step: update scalar process noise from smoother statistics.
+
+        Uses the standard EM formula for a random walk (A=I):
+            Q_hat = (1/(T-1)) * sum_{t=1}^{T-1} [
+                (m_t - m_{t-1})(m_t - m_{t-1})'
+                + P_t + P_{t-1} - 2 * C_{t-1,t}
+            ]
+        where C_{t-1,t} = Cov(x_{t-1}, x_t | y_{1:T}) from the smoother.
+        Convention: smoother_cross_cov[t] = Cov(x_t, x_{t+1} | y_{1:T}),
+        which pairs with diff[t] = m[t+1] - m[t].
+        """
         m = smooth.smoothed_values       # (T, K-1)
         P = smooth.smoothed_covariances  # (T, K-1, K-1)
         C = smooth.smoother_cross_cov    # (T-1, K-1, K-1)
 
-        # Q_hat = (1/(T-1)) * sum_t [ (m_t - m_{t-1})(...)' + P_t + P_{t-1} - 2*C_{t-1} ]
+        T_minus_1 = m.shape[0] - 1
         diff = m[1:] - m[:-1]  # (T-1, K-1)
         Q_hat = (
-            jnp.einsum("ti,tj->ij", diff, diff) / (m.shape[0] - 1)
-            + jnp.mean(P[1:], axis=0)
-            + jnp.mean(P[:-1], axis=0)
-            - 2 * jnp.mean(C, axis=0)
-        )
+            jnp.einsum("ti,tj->ij", diff, diff)
+            + jnp.sum(P[1:], axis=0)
+            + jnp.sum(P[:-1], axis=0)
+            - 2 * jnp.sum(C, axis=0)
+        ) / T_minus_1
         # Scalar Q: mean of diagonal, clamped
         q = float(jnp.maximum(jnp.mean(jnp.diag(Q_hat)), 1e-8))
         return q
@@ -566,10 +578,17 @@ class MultinomialChoiceModel:
         )(beta_grid)
 
         best_idx = int(jnp.argmax(lls))
+        best_beta = float(beta_grid[best_idx])
 
         # Golden-section refinement around the best grid point
-        lo = float(beta_grid[max(0, best_idx - 1)])
-        hi = float(beta_grid[min(len(beta_grid) - 1, best_idx + 1)])
+        lo_idx = max(0, best_idx - 1)
+        hi_idx = min(len(beta_grid) - 1, best_idx + 1)
+        lo = float(beta_grid[lo_idx])
+        hi = float(beta_grid[hi_idx])
+
+        # If at grid edge, bracket collapses — skip refinement
+        if hi - lo < 1e-10:
+            return best_beta
 
         gr = (math.sqrt(5) + 1) / 2
         for _ in range(10):
