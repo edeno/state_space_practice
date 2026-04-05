@@ -122,14 +122,22 @@ def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-4) -> jax.Array:
     >>> jnp.linalg.eigvalsh(Q_psd)  # All eigenvalues >= 1e-4
 
     """
+    Q = symmetrize(Q)
+
     # Compute eigendecomposition (eigh assumes symmetric input)
     eigvals, eigvecs = jnp.linalg.eigh(Q)
 
     # Clip eigenvalues to minimum
     eigvals_clipped = jnp.maximum(eigvals, min_eigenvalue)
 
-    # Reconstruct matrix: Q = V @ diag(lambda) @ V.T
-    return eigvecs @ jnp.diag(eigvals_clipped) @ eigvecs.T
+    # Re-symmetrize after reconstruction to eliminate roundoff-level asymmetry.
+    projected = eigvecs @ jnp.diag(eigvals_clipped) @ eigvecs.T
+    return symmetrize(projected)
+
+
+def stabilize_covariance(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
+    """Symmetrize a covariance-like matrix and project it to the PSD cone."""
+    return project_psd(symmetrize(cov), min_eigenvalue=min_eigenvalue)
 
 
 @jax.jit
@@ -519,15 +527,19 @@ def kalman_maximization_step(
 
     # Measurement matrix and covariance
     measurement_matrix = psd_solve(gamma, delta.T).T
-    measurement_cov = (alpha - measurement_matrix @ delta.T) / n_time
-    measurement_cov = symmetrize(measurement_cov)
+    measurement_cov = stabilize_covariance(
+        (alpha - measurement_matrix @ delta.T) / n_time,
+        min_eigenvalue=1e-8,
+    )
 
     # Transition matrix
     transition_matrix = psd_solve(gamma1, beta.T).T
 
     # Process covariance
-    process_cov = (gamma2 - transition_matrix @ beta.T) / (n_time - 1)
-    process_cov = symmetrize(process_cov)
+    process_cov = stabilize_covariance(
+        (gamma2 - transition_matrix @ beta.T) / (n_time - 1),
+        min_eigenvalue=1e-8,
+    )
 
     # Initial mean and covariance
     init_mean = smoother_mean[0]

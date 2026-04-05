@@ -10,7 +10,6 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from jax import Array, random
-
 from scipy.linalg import solve_discrete_are
 
 from state_space_practice.kalman import (
@@ -712,6 +711,27 @@ class TestKalmanMaximizationStepProperties:
         np.testing.assert_allclose(R_est, R_est.T, rtol=1e-10, atol=1e-14)
         np.testing.assert_allclose(init_cov_est, init_cov_est.T, rtol=1e-10, atol=1e-14)
 
+    def test_inconsistent_sufficient_statistics_still_return_psd_covariances(
+        self,
+    ) -> None:
+        """M-step covariances should remain PSD under slight statistic inconsistency."""
+        obs = jnp.ones((3, 1))
+        smoother_mean = jnp.ones((3, 1))
+        smoother_cov = jnp.array([[[-0.9]], [[-0.9]], [[-0.9]]])
+        smoother_cross_cov = jnp.array([[[0.1]], [[0.1]]])
+
+        _, _, Q_est, R_est, _, _ = kalman_maximization_step(
+            obs, smoother_mean, smoother_cov, smoother_cross_cov
+        )
+
+        eigvals_q = jnp.linalg.eigvalsh(Q_est)
+        eigvals_r = jnp.linalg.eigvalsh(R_est)
+
+        assert jnp.all(jnp.isfinite(Q_est))
+        assert jnp.all(jnp.isfinite(R_est))
+        assert jnp.min(eigvals_q) >= -1e-8
+        assert jnp.min(eigvals_r) >= -1e-8
+
 
 # --- Boundary Tests ---
 
@@ -1026,9 +1046,7 @@ def _simulate_from_model(
     obs = np.zeros((n_time, n_obs))
 
     key_init, key = random.split(key)
-    states[0] = np.array(
-        random.multivariate_normal(key_init, init_mean, init_cov)
-    )
+    states[0] = np.array(random.multivariate_normal(key_init, init_mean, init_cov))
     for t in range(n_time):
         if t > 0:
             key_proc, key = random.split(key)
@@ -1061,9 +1079,7 @@ class TestKalmanFilterMathCorrectness:
         # scipy DARE: different algorithm (Schur decomposition of symplectic pencil)
         # Solves: P = A P A^T + Q - A P H^T (H P H^T + R)^{-1} H P A^T
         P_dare = jnp.array(
-            solve_discrete_are(
-                np.array(A).T, np.array(H).T, np.array(Q), np.array(R)
-            )
+            solve_discrete_are(np.array(A).T, np.array(H).T, np.array(Q), np.array(R))
         )
 
         init_mean = jnp.zeros(n_state)
@@ -1075,8 +1091,11 @@ class TestKalmanFilterMathCorrectness:
         # The filter's predicted covariance converges to the DARE solution.
         P_pred_last = A @ filtered_cov[-1] @ A.T + Q
         np.testing.assert_allclose(
-            P_pred_last, P_dare, rtol=1e-4, atol=1e-6,
-            err_msg="Filter predicted covariance should converge to DARE solution"
+            P_pred_last,
+            P_dare,
+            rtol=1e-4,
+            atol=1e-6,
+            err_msg="Filter predicted covariance should converge to DARE solution",
         )
 
     def test_filter_matches_numpy_reference(self) -> None:
@@ -1095,9 +1114,7 @@ class TestKalmanFilterMathCorrectness:
         # init_mean/init_cov represent state at t=0; first obs is at t=1.
         m = np.array(init_mean)
         P = np.array(init_cov)
-        A_np, Q_np, H_np, R_np = (
-            np.array(A), np.array(Q), np.array(H), np.array(R)
-        )
+        A_np, Q_np, H_np, R_np = (np.array(A), np.array(Q), np.array(H), np.array(R))
         obs_np = np.array(obs)
         ref_means, ref_covs = [], []
         for t in range(20):
@@ -1122,12 +1139,18 @@ class TestKalmanFilterMathCorrectness:
         )
 
         np.testing.assert_allclose(
-            filtered_mean, ref_means, rtol=1e-8, atol=1e-10,
-            err_msg="Filter means should match numpy reference"
+            filtered_mean,
+            ref_means,
+            rtol=1e-8,
+            atol=1e-10,
+            err_msg="Filter means should match numpy reference",
         )
         np.testing.assert_allclose(
-            filtered_cov, ref_covs, rtol=1e-8, atol=1e-10,
-            err_msg="Filter covariances should match numpy reference"
+            filtered_cov,
+            ref_covs,
+            rtol=1e-8,
+            atol=1e-10,
+            err_msg="Filter covariances should match numpy reference",
         )
 
     def test_1d_kalman_steady_state_analytical(self) -> None:
@@ -1149,8 +1172,10 @@ class TestKalmanFilterMathCorrectness:
         _, filtered_cov, _ = kalman_filter(init_mean, init_cov, obs, A, Q, H, R)
 
         np.testing.assert_allclose(
-            filtered_cov[-1, 0, 0], P_filtered_inf, rtol=1e-4,
-            err_msg="1D filter should converge to analytical steady state"
+            filtered_cov[-1, 0, 0],
+            P_filtered_inf,
+            rtol=1e-4,
+            err_msg="1D filter should converge to analytical steady state",
         )
 
     def test_filter_innovations_are_white(self) -> None:
@@ -1167,9 +1192,7 @@ class TestKalmanFilterMathCorrectness:
         init_cov = jnp.eye(n_state)
         n_time = 2000
 
-        obs, _ = _simulate_from_model(
-            A, Q, H, R, init_mean, init_cov, n_time, seed=0
-        )
+        obs, _ = _simulate_from_model(A, Q, H, R, init_mean, init_cov, n_time, seed=0)
         filtered_mean, filtered_cov, _ = kalman_filter(
             init_mean, init_cov, obs, A, Q, H, R
         )
@@ -1243,9 +1266,11 @@ class TestKalmanSmootherMathCorrectness:
 
             expected_cross_cov = G_t @ smoother_cov[t + 1]
             np.testing.assert_allclose(
-                smoother_cross_cov[t], expected_cross_cov,
-                rtol=1e-5, atol=1e-8,
-                err_msg=f"Cross-cov identity failed at t={t}"
+                smoother_cross_cov[t],
+                expected_cross_cov,
+                rtol=1e-5,
+                atol=1e-8,
+                err_msg=f"Cross-cov identity failed at t={t}",
             )
 
     def test_smoother_mean_satisfies_rts_recursion(self) -> None:
@@ -1265,9 +1290,7 @@ class TestKalmanSmootherMathCorrectness:
         filtered_mean, filtered_cov, _ = kalman_filter(
             init_mean, init_cov, obs, A, Q, H, R
         )
-        smoother_mean, _, _, _ = kalman_smoother(
-            init_mean, init_cov, obs, A, Q, H, R
-        )
+        smoother_mean, _, _, _ = kalman_smoother(init_mean, init_cov, obs, A, Q, H, R)
 
         for t in range(29):
             P_pred = A @ filtered_cov[t] @ A.T + Q
@@ -1278,8 +1301,11 @@ class TestKalmanSmootherMathCorrectness:
                 smoother_mean[t + 1] - A @ filtered_mean[t]
             )
             np.testing.assert_allclose(
-                smoother_mean[t], expected, rtol=1e-5, atol=1e-8,
-                err_msg=f"RTS recursion failed at t={t}"
+                smoother_mean[t],
+                expected,
+                rtol=1e-5,
+                atol=1e-8,
+                err_msg=f"RTS recursion failed at t={t}",
             )
 
 
@@ -1297,8 +1323,7 @@ class TestKalmanEMMonotonicity:
         init_cov_true = jnp.eye(n_state)
 
         obs, _ = _simulate_from_model(
-            A_true, Q_true, H_true, R_true, init_mean_true, init_cov_true,
-            200, seed=42
+            A_true, Q_true, H_true, R_true, init_mean_true, init_cov_true, 200, seed=42
         )
 
         # Start from perturbed parameters
@@ -1315,9 +1340,7 @@ class TestKalmanEMMonotonicity:
             log_likelihoods.append(float(mll))
 
             sm, sc, scc, _ = kalman_smoother(init_mean, init_cov, obs, A, Q, H, R)
-            A, H, Q, R, init_mean, init_cov = kalman_maximization_step(
-                obs, sm, sc, scc
-            )
+            A, H, Q, R, init_mean, init_cov = kalman_maximization_step(obs, sm, sc, scc)
 
         for i in range(1, len(log_likelihoods)):
             assert log_likelihoods[i] >= log_likelihoods[i - 1] - 1e-6, (
@@ -1360,8 +1383,11 @@ class TestKalmanMStepMathCorrectness:
 
         lhs = np.array(A_est) @ gamma1
         np.testing.assert_allclose(
-            lhs, beta, rtol=1e-4, atol=1e-7,
-            err_msg="M-step A should satisfy normal equations A @ gamma1 = beta"
+            lhs,
+            beta,
+            rtol=1e-4,
+            atol=1e-7,
+            err_msg="M-step A should satisfy normal equations A @ gamma1 = beta",
         )
 
 
@@ -1391,9 +1417,9 @@ class TestKalmanNumericalStability:
             eigvals = jnp.linalg.eigvalsh(filtered_cov[t])
             assert jnp.all(eigvals > -1e-8), f"Cov not PSD at t={t}"
 
-        assert filtered_cov[-1, 2, 2] > filtered_cov[-1, 0, 0], (
-            "Unobserved state should have larger uncertainty"
-        )
+        assert (
+            filtered_cov[-1, 2, 2] > filtered_cov[-1, 0, 0]
+        ), "Unobserved state should have larger uncertainty"
 
     def test_filter_nearly_unstable_dynamics(self) -> None:
         """Spectral radius near 1: filter should stay finite for 500 steps."""

@@ -39,6 +39,7 @@ from jax.typing import ArrayLike
 from state_space_practice.kalman import (
     _kalman_smoother_update,
     psd_solve,
+    stabilize_covariance,
     sum_of_outer_products,
     symmetrize,
 )
@@ -72,6 +73,18 @@ def log_conditional_intensity(design_matrix: ArrayLike, params: ArrayLike) -> Ar
         Scalar for single-neuron, (n_neurons,) for multi-neuron.
     """
     return jnp.asarray(design_matrix) @ jnp.asarray(params)
+
+
+def _safe_expected_count(
+    log_rate: Array,
+    dt: float,
+    min_log_count: float = -20.0,
+    max_log_count: float = 20.0,
+) -> Array:
+    """Convert log-rate in Hz to expected count per bin with overflow protection."""
+    dt_array = jnp.asarray(dt, dtype=log_rate.dtype)
+    log_count = log_rate + jnp.log(dt_array)
+    return jnp.exp(jnp.clip(log_count, min_log_count, max_log_count))
 
 
 def _point_process_laplace_update(
@@ -176,9 +189,9 @@ def _point_process_laplace_update(
     def _neg_log_posterior(x: Array) -> Array:
         """Negative log-posterior for line search."""
         log_lambda = log_intensity_func(x)
-        cond_int = jnp.exp(log_lambda) * dt
+        cond_int = _safe_expected_count(log_lambda, dt)
         # Poisson log-likelihood (ignoring constant log(y!) term)
-        log_lik = jnp.sum(spike_indicator_t * jnp.log(cond_int + 1e-10) - cond_int)
+        log_lik = jnp.sum(spike_indicator_t * jnp.log(cond_int) - cond_int)
         # Gaussian prior log-probability (ignoring constant)
         delta = x - one_step_mean
         log_prior = -0.5 * delta @ (prior_precision @ delta)
@@ -197,7 +210,7 @@ def _point_process_laplace_update(
             H = H_log_likelihood - prior_precision
         """
         log_lambda = log_intensity_func(x)
-        conditional_intensity = jnp.exp(log_lambda) * dt
+        conditional_intensity = _safe_expected_count(log_lambda, dt)
         innovation = spike_indicator_t - conditional_intensity
         jacobian = grad_log_intensity(x)
         hessian = hess_log_intensity(x)
@@ -217,10 +230,7 @@ def _point_process_laplace_update(
         post_prec = prior_precision + fisher_info - hessian_correction
 
         # Ensure PSD
-        post_prec = symmetrize(post_prec)
-        eigvals, eigvecs = jnp.linalg.eigh(post_prec)
-        eigvals_safe = jnp.maximum(eigvals, diagonal_boost)
-        post_prec = eigvecs @ jnp.diag(eigvals_safe) @ eigvecs.T
+        post_prec = stabilize_covariance(post_prec, min_eigenvalue=diagonal_boost)
 
         # Newton direction
         delta = psd_solve(post_prec, gradient, diagonal_boost=diagonal_boost)
@@ -257,7 +267,7 @@ def _point_process_laplace_update(
         # Original single-step behavior (no line search overhead)
         # Evaluate at prior mean (one_step_mean), so prior gradient is zero
         log_lambda = log_intensity_func(one_step_mean)
-        conditional_intensity = jnp.exp(log_lambda) * dt
+        conditional_intensity = _safe_expected_count(log_lambda, dt)
         innovation = spike_indicator_t - conditional_intensity
         jacobian = grad_log_intensity(one_step_mean)
         hessian = hess_log_intensity(one_step_mean)
@@ -269,10 +279,9 @@ def _point_process_laplace_update(
         fisher_info = jacobian.T @ (conditional_intensity[:, None] * jacobian)
         hessian_correction = jnp.einsum("n,nij->ij", innovation, hessian)
         posterior_precision = prior_precision + fisher_info - hessian_correction
-        posterior_precision = symmetrize(posterior_precision)
-        eigvals, eigvecs = jnp.linalg.eigh(posterior_precision)
-        eigvals_safe = jnp.maximum(eigvals, diagonal_boost)
-        posterior_precision = eigvecs @ jnp.diag(eigvals_safe) @ eigvecs.T
+        posterior_precision = stabilize_covariance(
+            posterior_precision, min_eigenvalue=diagonal_boost
+        )
         posterior_mean = one_step_mean + psd_solve(
             posterior_precision, gradient, diagonal_boost=diagonal_boost
         )
@@ -283,25 +292,25 @@ def _point_process_laplace_update(
         )
 
     # Posterior covariance via psd_solve
-    posterior_cov = psd_solve(posterior_precision, identity, diagonal_boost=diagonal_boost)
-    posterior_cov = symmetrize(posterior_cov)
+    posterior_cov = psd_solve(
+        posterior_precision, identity, diagonal_boost=diagonal_boost
+    )
+    posterior_cov = stabilize_covariance(posterior_cov, min_eigenvalue=diagonal_boost)
 
     # Log-likelihood at posterior mode (approximate)
     log_lambda_mode = log_intensity_func(posterior_mean)
-    conditional_intensity_mode = jnp.exp(log_lambda_mode) * dt
+    conditional_intensity_mode = _safe_expected_count(log_lambda_mode, dt)
     log_likelihood = jnp.sum(
-        jax.scipy.stats.poisson.logpmf(
-            spike_indicator_t, conditional_intensity_mode
-        )
+        jax.scipy.stats.poisson.logpmf(spike_indicator_t, conditional_intensity_mode)
     )
 
     if include_laplace_normalization:
         # Laplace correction: log p(y) ≈ log p(y|x*) + log p(x*) + 0.5 log|P_post|
         # Constant terms (d/2 * log 2π) are omitted since they cancel across states.
         def _logdet_psd(mat: Array) -> Array:
-            mat = symmetrize(mat) + diagonal_boost * jnp.eye(mat.shape[0])
-            sign, logdet = jnp.linalg.slogdet(mat)
-            return jnp.where(sign > 0, logdet, 0.0)
+            eigvals = jnp.linalg.eigvalsh(symmetrize(mat))
+            eigvals = jnp.maximum(eigvals, diagonal_boost)
+            return jnp.sum(jnp.log(eigvals))
 
         delta = posterior_mean - one_step_mean
         quad = delta @ (prior_precision @ delta)
@@ -676,8 +685,10 @@ def kalman_maximization_step(
     transition_matrix = psd_solve(gamma1, beta.T).T
 
     # Process covariance
-    process_cov = (gamma2 - transition_matrix @ beta.T) / (n_time - 1)
-    process_cov = symmetrize(process_cov)
+    process_cov = stabilize_covariance(
+        (gamma2 - transition_matrix @ beta.T) / (n_time - 1),
+        min_eigenvalue=1e-8,
+    )
 
     # Initial mean and covariance
     init_mean = smoother_mean[0]
@@ -766,9 +777,7 @@ def steepest_descent_point_process_filter(
 
     grad_log_receptive_field_model = jax.grad(log_receptive_field_model, argnums=1)
 
-    def _update(
-        mean_prev: Array, args: tuple[Array, Array]
-    ) -> tuple[Array, Array]:
+    def _update(mean_prev: Array, args: tuple[Array, Array]) -> tuple[Array, Array]:
         """Steepest Descent Point Process Filter update step"""
         x_t, spike_indicator_t = args
         conditional_intensity = jnp.exp(log_receptive_field_model(x_t, mean_prev)) * dt
@@ -900,9 +909,7 @@ class PointProcessModel:
         self.filtered_mean: Optional[Array] = None
         self.filtered_cov: Optional[Array] = None
 
-    def _e_step(
-        self, design_matrix: ArrayLike, spike_indicator: ArrayLike
-    ) -> float:
+    def _e_step(self, design_matrix: ArrayLike, spike_indicator: ArrayLike) -> float:
         """E-step: Run filter and smoother to estimate latent states.
 
         Parameters
@@ -948,7 +955,11 @@ class PointProcessModel:
 
     def _m_step(self) -> None:
         """M-step: Update model parameters based on smoothed estimates."""
-        if self.smoother_mean is None or self.smoother_cov is None or self.smoother_cross_cov is None:
+        if (
+            self.smoother_mean is None
+            or self.smoother_cov is None
+            or self.smoother_cross_cov is None
+        ):
             raise RuntimeError("Must run E-step before M-step")
 
         transition_matrix, process_cov, init_mean, init_cov = kalman_maximization_step(
@@ -962,12 +973,7 @@ class PointProcessModel:
 
         if self.update_process_cov:
             # Ensure positive definiteness
-            process_cov = symmetrize(process_cov)
-            # Ensure eigenvalues are positive (numerical stability)
-            eigvals, eigvecs = jnp.linalg.eigh(process_cov)
-            eigvals = jnp.maximum(eigvals, 1e-10)
-            process_cov = eigvecs @ jnp.diag(eigvals) @ eigvecs.T
-            self.process_cov = process_cov
+            self.process_cov = stabilize_covariance(process_cov, min_eigenvalue=1e-10)
 
         if self.update_init_state:
             self.init_mean = init_mean
@@ -1082,7 +1088,7 @@ class PointProcessModel:
 
         Notes
         -----
-        The rate is computed as exp(log_intensity_func(design_matrix, x)) / dt.
+        The rate is computed as exp(log_intensity_func(design_matrix, x)).
         This generalizes to arbitrary intensity functions, not just the default
         linear Z @ x.
         """
@@ -1112,7 +1118,7 @@ class PointProcessModel:
             # Time-aligned evaluation: design_matrix[t] with state_estimate[t]
             log_rate = jax.vmap(self.log_intensity_func)(design_matrix, state_estimate)
 
-        rate = jnp.exp(log_rate) / self.dt
+        rate = jnp.exp(log_rate)
 
         return rate
 

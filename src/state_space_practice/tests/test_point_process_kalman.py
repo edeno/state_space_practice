@@ -32,9 +32,7 @@ class TestLogConditionalIntensity:
         n_time = 100
         n_params = 3
 
-        design_matrix = jax.random.normal(
-            jax.random.PRNGKey(0), (n_time, n_params)
-        )
+        design_matrix = jax.random.normal(jax.random.PRNGKey(0), (n_time, n_params))
         params = jnp.ones(n_params)
 
         log_intensity = log_conditional_intensity(design_matrix, params)
@@ -46,9 +44,7 @@ class TestLogConditionalIntensity:
         n_time = 50
         n_params = 3
 
-        design_matrix = jax.random.normal(
-            jax.random.PRNGKey(0), (n_time, n_params)
-        )
+        design_matrix = jax.random.normal(jax.random.PRNGKey(0), (n_time, n_params))
         params1 = jnp.array([1.0, 2.0, 3.0])
         params2 = jnp.array([2.0, 4.0, 6.0])  # 2x params1
 
@@ -62,9 +58,7 @@ class TestLogConditionalIntensity:
         n_time = 50
         n_params = 3
 
-        design_matrix = jax.random.normal(
-            jax.random.PRNGKey(0), (n_time, n_params)
-        )
+        design_matrix = jax.random.normal(jax.random.PRNGKey(0), (n_time, n_params))
         params = jnp.zeros(n_params)
 
         log_intensity = log_conditional_intensity(design_matrix, params)
@@ -330,9 +324,7 @@ class TestStochasticPointProcessSmoother:
 
         # Smoother should have lower or equal variance at all times except last
         # (last time point should be equal)
-        np.testing.assert_allclose(
-            smoother_var[-1], filter_var[-1], rtol=1e-5
-        )
+        np.testing.assert_allclose(smoother_var[-1], filter_var[-1], rtol=1e-5)
 
         # For other time points, smoother variance should be <= filter variance
         assert jnp.all(smoother_var[:-1] <= filter_var[:-1] + 1e-6)
@@ -510,9 +502,7 @@ class TestSteepestDescentPointProcessFilter:
 
         assert not jnp.any(jnp.isnan(posterior_mean))
 
-    def test_zero_learning_rate_preserves_params(
-        self, point_process_test_data
-    ) -> None:
+    def test_zero_learning_rate_preserves_params(self, point_process_test_data) -> None:
         """With zero learning rate, parameters should stay constant."""
         d = point_process_test_data
         epsilon = jnp.zeros((d["n_params"], d["n_params"]))
@@ -804,7 +794,10 @@ class TestPointProcessModel:
 
         rate = model.get_rate_estimate(d["design_matrix"])
 
-        assert rate.shape == (d["n_time"], d["n_time"])  # (n_time, n_time) due to design @ design.T
+        assert rate.shape == (
+            d["n_time"],
+            d["n_time"],
+        )  # (n_time, n_time) due to design @ design.T
         assert jnp.all(rate >= 0)  # Rates should be non-negative
         assert not jnp.any(jnp.isnan(rate))
 
@@ -870,9 +863,7 @@ class TestPointProcessModel:
 
         # A should be close to identity for random walk (allow 0.25 tolerance)
         # Note: with limited data, exact recovery is difficult
-        np.testing.assert_allclose(
-            model.transition_matrix, jnp.eye(n_basis), atol=0.25
-        )
+        np.testing.assert_allclose(model.transition_matrix, jnp.eye(n_basis), atol=0.25)
 
 
 class TestKalmanMaximizationStepMStepRegression:
@@ -957,9 +948,9 @@ class TestKalmanMaximizationStepMStepRegression:
 
         # With the fix, A should be different for different trajectories
         # because the outer products of means contribute differently
-        assert not jnp.allclose(A_increasing, A_constant, atol=0.01), (
-            "A should depend on state trajectory (outer products of means)"
-        )
+        assert not jnp.allclose(
+            A_increasing, A_constant, atol=0.01
+        ), "A should depend on state trajectory (outer products of means)"
 
 
 # --- Multi-Neuron Tests ---
@@ -1106,39 +1097,43 @@ class TestMultiNeuronFilter:
         )
 
         for t in range(d["n_time"]):
-            np.testing.assert_allclose(
-                filtered_cov[t], filtered_cov[t].T, atol=1e-10
-            )
+            np.testing.assert_allclose(filtered_cov[t], filtered_cov[t].T, atol=1e-10)
 
-    def test_multi_neuron_reduces_to_single_neuron(self, point_process_test_data) -> None:
+    def test_multi_neuron_reduces_to_single_neuron(
+        self, point_process_test_data
+    ) -> None:
         """Multi-neuron with n_neurons=1 should match single-neuron filter."""
         d = point_process_test_data
 
         # Single neuron result (original API)
-        filtered_mean_single, filtered_cov_single, mll_single = stochastic_point_process_filter(
-            d["init_mean"],
-            d["init_cov"],
-            d["design_matrix"],
-            d["spike_indicator"],
-            d["dt"],
-            d["transition_matrix"],
-            d["process_cov"],
-            log_conditional_intensity,
+        filtered_mean_single, filtered_cov_single, mll_single = (
+            stochastic_point_process_filter(
+                d["init_mean"],
+                d["init_cov"],
+                d["design_matrix"],
+                d["spike_indicator"],
+                d["dt"],
+                d["transition_matrix"],
+                d["process_cov"],
+                log_conditional_intensity,
+            )
         )
 
         # Multi-neuron with n_neurons=1 (same data, reshaped)
         design_matrix_multi = d["design_matrix"][:, None, :]  # (n_time, 1, n_params)
         spike_indicator_multi = d["spike_indicator"][:, None]  # (n_time, 1)
 
-        filtered_mean_multi, filtered_cov_multi, mll_multi = stochastic_point_process_filter(
-            d["init_mean"],
-            d["init_cov"],
-            design_matrix_multi,
-            spike_indicator_multi,
-            d["dt"],
-            d["transition_matrix"],
-            d["process_cov"],
-            multi_neuron_log_intensity,
+        filtered_mean_multi, filtered_cov_multi, mll_multi = (
+            stochastic_point_process_filter(
+                d["init_mean"],
+                d["init_cov"],
+                design_matrix_multi,
+                spike_indicator_multi,
+                d["dt"],
+                d["transition_matrix"],
+                d["process_cov"],
+                multi_neuron_log_intensity,
+            )
         )
 
         np.testing.assert_allclose(filtered_mean_single, filtered_mean_multi, rtol=1e-5)
@@ -1169,23 +1164,35 @@ class TestMultiNeuronFilter:
 
         # Run filter with 1 neuron
         _, cov_1, _ = stochastic_point_process_filter(
-            init_mean, init_cov, design_1, spikes_1, dt,
-            transition_matrix, process_cov, multi_neuron_log_intensity
+            init_mean,
+            init_cov,
+            design_1,
+            spikes_1,
+            dt,
+            transition_matrix,
+            process_cov,
+            multi_neuron_log_intensity,
         )
 
         # Run filter with 5 neurons (more information)
         _, cov_5, _ = stochastic_point_process_filter(
-            init_mean, init_cov, design_5, spikes_5, dt,
-            transition_matrix, process_cov, multi_neuron_log_intensity
+            init_mean,
+            init_cov,
+            design_5,
+            spikes_5,
+            dt,
+            transition_matrix,
+            process_cov,
+            multi_neuron_log_intensity,
         )
 
         # Average variance should be smaller with more neurons
         avg_var_1 = jnp.mean(jnp.trace(cov_1, axis1=-2, axis2=-1))
         avg_var_5 = jnp.mean(jnp.trace(cov_5, axis1=-2, axis2=-1))
 
-        assert avg_var_5 < avg_var_1, (
-            f"Variance should decrease with more neurons: {avg_var_5} >= {avg_var_1}"
-        )
+        assert (
+            avg_var_5 < avg_var_1
+        ), f"Variance should decrease with more neurons: {avg_var_5} >= {avg_var_1}"
 
 
 class TestMultiNeuronSmoother:
@@ -1195,34 +1202,42 @@ class TestMultiNeuronSmoother:
         """Smoother outputs should have correct shapes for multi-neuron input."""
         d = multi_neuron_test_data
 
-        smoother_mean, smoother_cov, smoother_cross_cov, mll = stochastic_point_process_smoother(
-            d["init_mean"],
-            d["init_cov"],
-            d["design_matrix"],
-            d["spike_indicator"],
-            d["dt"],
-            d["transition_matrix"],
-            d["process_cov"],
-            multi_neuron_log_intensity,
+        smoother_mean, smoother_cov, smoother_cross_cov, mll = (
+            stochastic_point_process_smoother(
+                d["init_mean"],
+                d["init_cov"],
+                d["design_matrix"],
+                d["spike_indicator"],
+                d["dt"],
+                d["transition_matrix"],
+                d["process_cov"],
+                multi_neuron_log_intensity,
+            )
         )
 
         assert smoother_mean.shape == (d["n_time"], d["n_params"])
         assert smoother_cov.shape == (d["n_time"], d["n_params"], d["n_params"])
-        assert smoother_cross_cov.shape == (d["n_time"] - 1, d["n_params"], d["n_params"])
+        assert smoother_cross_cov.shape == (
+            d["n_time"] - 1,
+            d["n_params"],
+            d["n_params"],
+        )
 
     def test_no_nans(self, multi_neuron_test_data) -> None:
         """Multi-neuron smoother should not produce NaN values."""
         d = multi_neuron_test_data
 
-        smoother_mean, smoother_cov, smoother_cross_cov, mll = stochastic_point_process_smoother(
-            d["init_mean"],
-            d["init_cov"],
-            d["design_matrix"],
-            d["spike_indicator"],
-            d["dt"],
-            d["transition_matrix"],
-            d["process_cov"],
-            multi_neuron_log_intensity,
+        smoother_mean, smoother_cov, smoother_cross_cov, mll = (
+            stochastic_point_process_smoother(
+                d["init_mean"],
+                d["init_cov"],
+                d["design_matrix"],
+                d["spike_indicator"],
+                d["dt"],
+                d["transition_matrix"],
+                d["process_cov"],
+                multi_neuron_log_intensity,
+            )
         )
 
         assert not jnp.any(jnp.isnan(smoother_mean))
@@ -1299,24 +1314,36 @@ class TestMultiNeuronIntensityDirection:
 
         # Run filters
         mean_0, _, _ = stochastic_point_process_filter(
-            init_mean, init_cov, design_matrix, spikes_neuron0, dt,
-            transition_matrix, process_cov, multi_neuron_log_intensity
+            init_mean,
+            init_cov,
+            design_matrix,
+            spikes_neuron0,
+            dt,
+            transition_matrix,
+            process_cov,
+            multi_neuron_log_intensity,
         )
 
         mean_1, _, _ = stochastic_point_process_filter(
-            init_mean, init_cov, design_matrix, spikes_neuron1, dt,
-            transition_matrix, process_cov, multi_neuron_log_intensity
+            init_mean,
+            init_cov,
+            design_matrix,
+            spikes_neuron1,
+            dt,
+            transition_matrix,
+            process_cov,
+            multi_neuron_log_intensity,
         )
 
         # With spikes in neuron 0, state[0] should be higher than state[1]
-        assert jnp.mean(mean_0[:, 0]) > jnp.mean(mean_0[:, 1]), (
-            "Spikes in neuron 0 should increase state[0]"
-        )
+        assert jnp.mean(mean_0[:, 0]) > jnp.mean(
+            mean_0[:, 1]
+        ), "Spikes in neuron 0 should increase state[0]"
 
         # With spikes in neuron 1, state[1] should be higher than state[0]
-        assert jnp.mean(mean_1[:, 1]) > jnp.mean(mean_1[:, 0]), (
-            "Spikes in neuron 1 should increase state[1]"
-        )
+        assert jnp.mean(mean_1[:, 1]) > jnp.mean(
+            mean_1[:, 0]
+        ), "Spikes in neuron 1 should increase state[1]"
 
 
 @pytest.fixture(scope="module")
@@ -1344,6 +1371,17 @@ def single_neuron_model_data():
 
 class TestGetRateEstimateMultiNeuron:
     """Tests for multi-neuron get_rate_estimate functionality."""
+
+    def test_rate_estimate_uses_hz_convention_not_expected_count(self) -> None:
+        """Rate estimate should return exp(log_rate), not exp(log_rate) / dt."""
+        model = PointProcessModel(n_state_dims=1, dt=0.02)
+        model.smoother_mean = jnp.array([[jnp.log(4.0)]])
+
+        rate = model.get_rate_estimate(
+            jnp.array([[1.0]]), evaluate_at_all_positions=False
+        )
+
+        np.testing.assert_allclose(rate, jnp.array([4.0]), rtol=1e-10)
 
     def test_time_aligned_single_neuron_shape(self, single_neuron_model_data) -> None:
         """Time-aligned rate estimate should have shape (n_time,) for single neuron."""
@@ -1434,9 +1472,7 @@ class TestGetRateEstimateMultiNeuron:
         assert rate_smoothed.shape == rate_filtered.shape
 
         # Last timepoint should be identical (smoother = filter at last time)
-        np.testing.assert_allclose(
-            rate_smoothed[-1], rate_filtered[-1], rtol=1e-5
-        )
+        np.testing.assert_allclose(rate_smoothed[-1], rate_filtered[-1], rtol=1e-5)
 
         # Earlier timepoints may differ (smoothing uses future info)
         # Just check they're both valid
@@ -1453,13 +1489,18 @@ class TestGetRateEstimateMultiNeuron:
         def nonlinear_log_intensity(design_matrix_t, params):
             # Quadratic: (Z @ x)^2
             linear = design_matrix_t @ params
-            return linear ** 2
+            return linear**2
 
         key = jax.random.PRNGKey(123)
         design_matrix = jax.random.normal(key, (n_time, n_params)) * 0.3
         spike_indicator = jax.random.poisson(
             jax.random.PRNGKey(456),
-            jnp.exp(jax.vmap(nonlinear_log_intensity)(design_matrix, jnp.zeros((n_time, n_params)))) * dt
+            jnp.exp(
+                jax.vmap(nonlinear_log_intensity)(
+                    design_matrix, jnp.zeros((n_time, n_params))
+                )
+            )
+            * dt,
         ).astype(jnp.float64)
 
         model = PointProcessModel(
@@ -1497,10 +1538,12 @@ class TestGetRateEstimateMultiNeuron:
             # Quadratic in state components - creates non-trivial Hessians
             # log_intensity[0] = state[0]^2 + state[1]
             # log_intensity[1] = state[1]^2 + state[2]
-            return jnp.array([
-                state[0] ** 2 + state[1],
-                state[1] ** 2 + state[2],
-            ])
+            return jnp.array(
+                [
+                    state[0] ** 2 + state[1],
+                    state[1] ** 2 + state[2],
+                ]
+            )
 
         # Prior with moderate uncertainty
         prior_mean = jnp.array([1.0, 0.5, -0.5])
@@ -1529,13 +1572,39 @@ class TestGetRateEstimateMultiNeuron:
 
         # Verify posterior covariance is PSD (all eigenvalues >= 0)
         eigvals = jnp.linalg.eigvalsh(posterior_cov)
-        assert jnp.all(eigvals >= 0), f"Posterior cov is not PSD: eigenvalues = {eigvals}"
+        assert jnp.all(
+            eigvals >= 0
+        ), f"Posterior cov is not PSD: eigenvalues = {eigvals}"
 
         # Verify covariance is symmetric
         np.testing.assert_allclose(
-            posterior_cov, posterior_cov.T, rtol=1e-10,
-            err_msg="Posterior covariance is not symmetric"
+            posterior_cov,
+            posterior_cov.T,
+            rtol=1e-10,
+            err_msg="Posterior covariance is not symmetric",
         )
+
+    @pytest.mark.parametrize("log_rate", [200.0, 800.0])
+    def test_laplace_update_large_log_rates_remain_finite(
+        self, log_rate: float
+    ) -> None:
+        """Large positive log-rates should not create inf/nan outputs."""
+
+        def large_log_intensity(_state):
+            return jnp.array([log_rate])
+
+        posterior_mean, posterior_cov, log_lik = _point_process_laplace_update(
+            one_step_mean=jnp.zeros(1),
+            one_step_cov=jnp.eye(1),
+            spike_indicator_t=jnp.array([0.0]),
+            dt=0.02,
+            log_intensity_func=large_log_intensity,
+            include_laplace_normalization=True,
+        )
+
+        assert jnp.all(jnp.isfinite(posterior_mean))
+        assert jnp.all(jnp.isfinite(posterior_cov))
+        assert jnp.isfinite(log_lik)
 
 
 # --- Mathematical Correctness Tests ---
@@ -1548,12 +1617,12 @@ class TestPointProcessGradientCorrectness:
     that would be invisible to tests reimplementing the same formula.
     """
 
-    def _make_log_intensity(
-        self, weights: jnp.ndarray, baseline: jnp.ndarray
-    ):
+    def _make_log_intensity(self, weights: jnp.ndarray, baseline: jnp.ndarray):
         """Create a linear log-intensity function: log_lambda = baseline + W @ x."""
+
         def log_intensity(x):
             return jnp.atleast_1d(baseline + weights @ x)
+
         return log_intensity
 
     def _neg_log_posterior(
@@ -1598,18 +1667,29 @@ class TestPointProcessGradientCorrectness:
             x_plus[d] += eps
             x_minus[d] -= eps
             f_plus = self._neg_log_posterior(
-                jnp.array(x_plus), one_step_mean, prior_precision,
-                spikes, dt, log_intensity_func
+                jnp.array(x_plus),
+                one_step_mean,
+                prior_precision,
+                spikes,
+                dt,
+                log_intensity_func,
             )
             f_minus = self._neg_log_posterior(
-                jnp.array(x_minus), one_step_mean, prior_precision,
-                spikes, dt, log_intensity_func
+                jnp.array(x_minus),
+                one_step_mean,
+                prior_precision,
+                spikes,
+                dt,
+                log_intensity_func,
             )
             fd_grad[d] = -(float(f_plus) - float(f_minus)) / (2 * eps)
 
         np.testing.assert_allclose(
-            analytical_grad, fd_grad, rtol=1e-4, atol=1e-6,
-            err_msg="Analytical gradient should match finite differences"
+            analytical_grad,
+            fd_grad,
+            rtol=1e-4,
+            atol=1e-6,
+            err_msg="Analytical gradient should match finite differences",
         )
 
     def test_hessian_matches_finite_difference(self) -> None:
@@ -1656,27 +1736,54 @@ class TestPointProcessGradientCorrectness:
                 x_mp[j] += eps
                 x_mm[i] -= eps
                 x_mm[j] -= eps
-                f_pp = float(self._neg_log_posterior(
-                    jnp.array(x_pp), one_step_mean, prior_precision,
-                    spikes, dt, log_intensity_func
-                ))
-                f_pm = float(self._neg_log_posterior(
-                    jnp.array(x_pm), one_step_mean, prior_precision,
-                    spikes, dt, log_intensity_func
-                ))
-                f_mp = float(self._neg_log_posterior(
-                    jnp.array(x_mp), one_step_mean, prior_precision,
-                    spikes, dt, log_intensity_func
-                ))
-                f_mm = float(self._neg_log_posterior(
-                    jnp.array(x_mm), one_step_mean, prior_precision,
-                    spikes, dt, log_intensity_func
-                ))
+                f_pp = float(
+                    self._neg_log_posterior(
+                        jnp.array(x_pp),
+                        one_step_mean,
+                        prior_precision,
+                        spikes,
+                        dt,
+                        log_intensity_func,
+                    )
+                )
+                f_pm = float(
+                    self._neg_log_posterior(
+                        jnp.array(x_pm),
+                        one_step_mean,
+                        prior_precision,
+                        spikes,
+                        dt,
+                        log_intensity_func,
+                    )
+                )
+                f_mp = float(
+                    self._neg_log_posterior(
+                        jnp.array(x_mp),
+                        one_step_mean,
+                        prior_precision,
+                        spikes,
+                        dt,
+                        log_intensity_func,
+                    )
+                )
+                f_mm = float(
+                    self._neg_log_posterior(
+                        jnp.array(x_mm),
+                        one_step_mean,
+                        prior_precision,
+                        spikes,
+                        dt,
+                        log_intensity_func,
+                    )
+                )
                 fd_hessian[i, j] = (f_pp - f_pm - f_mp + f_mm) / (4 * eps**2)
 
         np.testing.assert_allclose(
-            analytical_neg_hessian, fd_hessian, rtol=1e-3, atol=1e-5,
-            err_msg="Analytical Hessian should match finite differences"
+            analytical_neg_hessian,
+            fd_hessian,
+            rtol=1e-3,
+            atol=1e-5,
+            err_msg="Analytical Hessian should match finite differences",
         )
 
 
@@ -1709,17 +1816,25 @@ class TestPointProcessMathCorrectness:
             expected_cov = 1.0 / float(precision)
 
             post_mean, post_cov, _ = _point_process_laplace_update(
-                m, P, spikes, dt, log_intensity,
+                m,
+                P,
+                spikes,
+                dt,
+                log_intensity,
                 include_laplace_normalization=False,
             )
 
             np.testing.assert_allclose(
-                post_mean[0], expected_mean, rtol=1e-4,
-                err_msg=f"Mean wrong for {label}"
+                post_mean[0],
+                expected_mean,
+                rtol=1e-4,
+                err_msg=f"Mean wrong for {label}",
             )
             np.testing.assert_allclose(
-                post_cov[0, 0], expected_cov, rtol=1e-4,
-                err_msg=f"Cov wrong for {label}"
+                post_cov[0, 0],
+                expected_cov,
+                rtol=1e-4,
+                err_msg=f"Cov wrong for {label}",
             )
 
     def test_zero_spike_pushes_mean_toward_lower_intensity(self) -> None:
@@ -1734,7 +1849,11 @@ class TestPointProcessMathCorrectness:
         spikes = jnp.array([0.0])
 
         post_mean, _, _ = _point_process_laplace_update(
-            m, P, spikes, dt, log_intensity,
+            m,
+            P,
+            spikes,
+            dt,
+            log_intensity,
             include_laplace_normalization=False,
         )
 
@@ -1762,7 +1881,11 @@ class TestPointProcessMathCorrectness:
         covs = []
         for y in [0.0, 1.0, 5.0, 10.0]:
             _, post_cov, _ = _point_process_laplace_update(
-                m, P, jnp.array([y]), dt, log_intensity,
+                m,
+                P,
+                jnp.array([y]),
+                dt,
+                log_intensity,
                 include_laplace_normalization=False,
                 max_newton_iter=5,
             )
@@ -1795,7 +1918,11 @@ class TestPointProcessMathCorrectness:
 
             spikes = jnp.ones(n_neurons)
             _, post_cov, _ = _point_process_laplace_update(
-                m, P, spikes, dt, log_intensity,
+                m,
+                P,
+                spikes,
+                dt,
+                log_intensity,
                 include_laplace_normalization=False,
             )
             traces.append(float(jnp.trace(post_cov)))
@@ -1828,9 +1955,7 @@ class TestPointProcessEMCorrectness:
         key = jax.random.PRNGKey(42)
         k1, k2 = jax.random.split(key)
         features = jax.random.normal(k1, (n_time, 2)) * 0.3
-        design_matrix = jnp.concatenate(
-            [jnp.ones((n_time, 1)), features], axis=1
-        )
+        design_matrix = jnp.concatenate([jnp.ones((n_time, 1)), features], axis=1)
 
         # Simulate spikes
         log_rate = log_conditional_intensity(design_matrix, true_params)
@@ -1848,7 +1973,10 @@ class TestPointProcessEMCorrectness:
         )
 
         log_likelihoods = model.fit(
-            design_matrix, spikes, max_iter=15, tolerance=1e-8,
+            design_matrix,
+            spikes,
+            max_iter=15,
+            tolerance=1e-8,
         )
 
         # Overall improvement
@@ -1877,9 +2005,7 @@ class TestPointProcessEMCorrectness:
         key = jax.random.PRNGKey(99)
         k1, k2 = jax.random.split(key)
         features = jax.random.normal(k1, (n_time, 2)) * 0.3
-        design_matrix = jnp.concatenate(
-            [jnp.ones((n_time, 1)), features], axis=1
-        )
+        design_matrix = jnp.concatenate([jnp.ones((n_time, 1)), features], axis=1)
 
         log_rate = log_conditional_intensity(design_matrix, true_params)
         rate = jnp.exp(log_rate) * dt
@@ -1906,8 +2032,10 @@ class TestPointProcessEMCorrectness:
         recovered_params = jnp.mean(model.smoother_mean[mid_start:mid_end], axis=0)
 
         np.testing.assert_allclose(
-            recovered_params, true_params, atol=0.5,
-            err_msg="Smoother should recover approximately true parameters"
+            recovered_params,
+            true_params,
+            atol=0.5,
+            err_msg="Smoother should recover approximately true parameters",
         )
 
     def test_em_monotonic_per_iteration(self) -> None:
@@ -1924,9 +2052,7 @@ class TestPointProcessEMCorrectness:
         key = jax.random.PRNGKey(7)
         k1, k2 = jax.random.split(key)
         features = jax.random.normal(k1, (n_time, 1)) * 0.5
-        design_matrix = jnp.concatenate(
-            [jnp.ones((n_time, 1)), features], axis=1
-        )
+        design_matrix = jnp.concatenate([jnp.ones((n_time, 1)), features], axis=1)
 
         log_rate = log_conditional_intensity(design_matrix, true_params)
         rate = jnp.exp(log_rate) * dt
@@ -1942,7 +2068,10 @@ class TestPointProcessEMCorrectness:
         )
 
         log_likelihoods = model.fit(
-            design_matrix, spikes, max_iter=15, tolerance=1e-8,
+            design_matrix,
+            spikes,
+            max_iter=15,
+            tolerance=1e-8,
         )
 
         total_improvement = log_likelihoods[-1] - log_likelihoods[0]
@@ -1965,12 +2094,9 @@ class TestPointProcessEMCorrectness:
         key = jax.random.PRNGKey(55)
         k1, k2 = jax.random.split(key)
         design_matrix = jnp.concatenate(
-            [jnp.ones((n_time, 1)),
-             jax.random.normal(k1, (n_time, 1)) * 0.3], axis=1
+            [jnp.ones((n_time, 1)), jax.random.normal(k1, (n_time, 1)) * 0.3], axis=1
         )
-        spikes = jax.random.poisson(
-            k2, 0.3, shape=(n_time,)
-        ).astype(float)
+        spikes = jax.random.poisson(k2, 0.3, shape=(n_time,)).astype(float)
 
         model = PointProcessModel(
             n_state_dims=n_params,
@@ -1992,12 +2118,16 @@ class TestPointProcessEMCorrectness:
         model._m_step()
 
         np.testing.assert_allclose(
-            model.transition_matrix, A_converged, atol=0.01,
-            err_msg="A should be near fixed point"
+            model.transition_matrix,
+            A_converged,
+            atol=0.01,
+            err_msg="A should be near fixed point",
         )
         np.testing.assert_allclose(
-            model.process_cov, Q_converged, atol=0.01,
-            err_msg="Q should be near fixed point"
+            model.process_cov,
+            Q_converged,
+            atol=0.01,
+            err_msg="Q should be near fixed point",
         )
 
 
@@ -2027,8 +2157,14 @@ class TestPointProcessNumericalStability:
         spikes = jax.random.poisson(key, rate).astype(float)
 
         filtered_mean, filtered_cov, mll = stochastic_point_process_filter(
-            init_mean, init_cov, design_matrix, spikes[:, None], dt,
-            A, Q, log_conditional_intensity,
+            init_mean,
+            init_cov,
+            design_matrix,
+            spikes[:, None],
+            dt,
+            A,
+            Q,
+            log_conditional_intensity,
         )
 
         assert jnp.all(jnp.isfinite(filtered_mean)), "Means should be finite"

@@ -19,6 +19,7 @@ import pytest
 from jax import Array, random
 from jax.nn import one_hot
 
+import state_space_practice.switching_kalman as switching_kalman_module
 from state_space_practice.kalman import (
     kalman_filter,
     kalman_maximization_step,
@@ -474,12 +475,8 @@ def test_skf_reduces_to_kf_single_state(simple_1d_model: tuple) -> None:
     # is that P_pred = P_0 + Q at t=0 for the standard KF vs P_0 for the
     # switching KF. This causes discrepancies at early timesteps that decay
     # geometrically. Use looser tolerance to accommodate.
-    np.testing.assert_allclose(
-        kf_m.squeeze(), skf_m.squeeze(), rtol=0.05, atol=0.01
-    )
-    np.testing.assert_allclose(
-        kf_c.squeeze(), skf_c.squeeze(), rtol=0.05, atol=0.01
-    )
+    np.testing.assert_allclose(kf_m.squeeze(), skf_m.squeeze(), rtol=0.05, atol=0.01)
+    np.testing.assert_allclose(kf_c.squeeze(), skf_c.squeeze(), rtol=0.05, atol=0.01)
     np.testing.assert_allclose(skf_p, 1.0, rtol=1e-5)
 
 
@@ -1280,21 +1277,27 @@ def test_em_monotonic_single_state() -> None:
 
     # Run EM
     current_A, current_Q, current_H, current_R = A, Q, H, R
-    current_init_mean, current_init_cov, current_init_prob = init_mean, init_cov, init_prob
+    current_init_mean, current_init_cov, current_init_prob = (
+        init_mean,
+        init_cov,
+        init_prob,
+    )
     current_Z = Z
 
     log_likelihoods = []
     for _ in range(10):
-        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, mll) = switching_kalman_filter(
-            current_init_mean,
-            current_init_cov,
-            current_init_prob,
-            obs,
-            current_Z,
-            current_A,
-            current_Q,
-            current_H,
-            current_R,
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, mll) = (
+            switching_kalman_filter(
+                current_init_mean,
+                current_init_cov,
+                current_init_prob,
+                obs,
+                current_Z,
+                current_A,
+                current_Q,
+                current_H,
+                current_R,
+            )
         )
         log_likelihoods.append(float(mll))
 
@@ -1378,21 +1381,27 @@ def test_em_monotonic_two_identical_states() -> None:
 
     # Run EM
     current_A, current_Q, current_H, current_R = A, Q, H, R
-    current_init_mean, current_init_cov, current_init_prob = init_mean, init_cov, init_prob
+    current_init_mean, current_init_cov, current_init_prob = (
+        init_mean,
+        init_cov,
+        init_prob,
+    )
     current_Z = Z
 
     log_likelihoods = []
     for _ in range(10):
-        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, mll) = switching_kalman_filter(
-            current_init_mean,
-            current_init_cov,
-            current_init_prob,
-            obs,
-            current_Z,
-            current_A,
-            current_Q,
-            current_H,
-            current_R,
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, mll) = (
+            switching_kalman_filter(
+                current_init_mean,
+                current_init_cov,
+                current_init_prob,
+                obs,
+                current_Z,
+                current_A,
+                current_Q,
+                current_H,
+                current_R,
+            )
         )
         log_likelihoods.append(float(mll))
 
@@ -1495,7 +1504,8 @@ def test_em_monotonic_distinguishable_states() -> None:
         y_key, subkey = random.split(y_key)
         s = true_states[t]
         obs = obs.at[t].set(
-            H_true[:, :, s] @ x[t] + jnp.sqrt(R_true[0, 0, s]) * random.normal(subkey, (1,))
+            H_true[:, :, s] @ x[t]
+            + jnp.sqrt(R_true[0, 0, s]) * random.normal(subkey, (1,))
         )
 
     # Initialize with neutral parameters
@@ -1512,16 +1522,18 @@ def test_em_monotonic_distinguishable_states() -> None:
     # Run EM
     log_likelihoods = []
     for _ in range(20):
-        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, mll) = switching_kalman_filter(
-            init_mean,
-            init_cov,
-            init_prob,
-            obs,
-            current_Z,
-            current_A,
-            current_Q,
-            current_H,
-            current_R,
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, mll) = (
+            switching_kalman_filter(
+                init_mean,
+                init_cov,
+                init_prob,
+                obs,
+                current_Z,
+                current_A,
+                current_Q,
+                current_H,
+                current_R,
+            )
         )
         log_likelihoods.append(float(mll))
 
@@ -1718,22 +1730,28 @@ def test_elbo_monotonic_single_state() -> None:
 
     # Run EM and track ELBO
     current_A, current_Q, current_H, current_R = A, Q, H, R
-    current_init_mean, current_init_cov, current_init_prob = init_mean, init_cov, init_prob
+    current_init_mean, current_init_cov, current_init_prob = (
+        init_mean,
+        init_cov,
+        init_prob,
+    )
     current_Z = Z
 
     elbos = []
     for _ in range(10):
         # E-step
-        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, _) = switching_kalman_filter(
-            current_init_mean,
-            current_init_cov,
-            current_init_prob,
-            obs,
-            current_Z,
-            current_A,
-            current_Q,
-            current_H,
-            current_R,
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, _) = (
+            switching_kalman_filter(
+                current_init_mean,
+                current_init_cov,
+                current_init_prob,
+                obs,
+                current_Z,
+                current_A,
+                current_Q,
+                current_H,
+                current_R,
+            )
         )
 
         (
@@ -1797,7 +1815,9 @@ def test_elbo_monotonic_single_state() -> None:
     # Verify ELBO is monotonically increasing
     elbos_array = np.array(elbos)
     differences = np.diff(elbos_array)
-    assert np.all(differences >= -1e-6), f"ELBO decreased: {differences[differences < -1e-6]}"
+    assert np.all(
+        differences >= -1e-6
+    ), f"ELBO decreased: {differences[differences < -1e-6]}"
 
     # Verify significant improvement
     assert elbos_array[-1] > elbos_array[0], "ELBO should improve over iterations"
@@ -1851,7 +1871,8 @@ def test_elbo_monotonic_two_states() -> None:
         y_key, subkey = random.split(y_key)
         s = true_states[t]
         obs = obs.at[t].set(
-            H_true[:, :, s] @ x[t] + jnp.sqrt(R_true[0, 0, s]) * random.normal(subkey, (1,))
+            H_true[:, :, s] @ x[t]
+            + jnp.sqrt(R_true[0, 0, s]) * random.normal(subkey, (1,))
         )
 
     # Initialize with neutral parameters
@@ -1869,16 +1890,18 @@ def test_elbo_monotonic_two_states() -> None:
     elbos = []
     for _ in range(15):
         # E-step
-        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, _) = switching_kalman_filter(
-            init_mean,
-            init_cov,
-            init_prob,
-            obs,
-            current_Z,
-            current_A,
-            current_Q,
-            current_H,
-            current_R,
+        (filter_mean, filter_cov, filter_prob, last_pair_mean, _, _) = (
+            switching_kalman_filter(
+                init_mean,
+                init_cov,
+                init_prob,
+                obs,
+                current_Z,
+                current_A,
+                current_Q,
+                current_H,
+                current_R,
+            )
         )
 
         (
@@ -1955,6 +1978,7 @@ def test_elbo_monotonic_two_states() -> None:
 
 from hypothesis import given, settings
 from hypothesis import strategies as st
+
 from state_space_practice.tests.conftest import (
     gaussian_mixture_params,
     stochastic_matrices,
@@ -1970,7 +1994,9 @@ class TestCollapseGaussianMixtureProperties:
     @settings(max_examples=50, deadline=None)
     def test_collapsed_mean_is_weighted_average(self, params: dict) -> None:
         """The collapsed mean should be the weighted average of component means."""
-        means, covs, weights = to_jax(params["means"], params["covs"], params["weights"])
+        means, covs, weights = to_jax(
+            params["means"], params["covs"], params["weights"]
+        )
 
         collapsed_mean, _ = collapse_gaussian_mixture(means, covs, weights)
 
@@ -1982,42 +2008,58 @@ class TestCollapseGaussianMixtureProperties:
     @settings(max_examples=50, deadline=None)
     def test_collapsed_covariance_is_positive_semidefinite(self, params: dict) -> None:
         """The collapsed covariance should be positive semi-definite."""
-        means, covs, weights = to_jax(params["means"], params["covs"], params["weights"])
+        means, covs, weights = to_jax(
+            params["means"], params["covs"], params["weights"]
+        )
 
         _, collapsed_cov = collapse_gaussian_mixture(means, covs, weights)
 
         # Check eigenvalues are non-negative
         eigenvalues = jnp.linalg.eigvalsh(collapsed_cov)
-        assert jnp.all(eigenvalues >= -1e-10), f"Negative eigenvalue: {eigenvalues.min()}"
+        assert jnp.all(
+            eigenvalues >= -1e-10
+        ), f"Negative eigenvalue: {eigenvalues.min()}"
 
     @given(gaussian_mixture_params())
     @settings(max_examples=50, deadline=None)
     def test_collapsed_covariance_is_symmetric(self, params: dict) -> None:
         """The collapsed covariance should be symmetric."""
-        means, covs, weights = to_jax(params["means"], params["covs"], params["weights"])
+        means, covs, weights = to_jax(
+            params["means"], params["covs"], params["weights"]
+        )
 
         _, collapsed_cov = collapse_gaussian_mixture(means, covs, weights)
 
         # Use atol for numerical precision with values near zero
-        np.testing.assert_allclose(collapsed_cov, collapsed_cov.T, rtol=1e-10, atol=1e-14)
+        np.testing.assert_allclose(
+            collapsed_cov, collapsed_cov.T, rtol=1e-10, atol=1e-14
+        )
 
     @given(gaussian_mixture_params(n_components=1))
     @settings(max_examples=30, deadline=None)
     def test_single_component_is_identity(self, params: dict) -> None:
         """With a single component, collapse should return the original."""
-        means, covs, weights = to_jax(params["means"], params["covs"], params["weights"])
+        means, covs, weights = to_jax(
+            params["means"], params["covs"], params["weights"]
+        )
 
         collapsed_mean, collapsed_cov = collapse_gaussian_mixture(means, covs, weights)
 
         # Use atol to handle subnormal numbers (values near machine epsilon)
-        np.testing.assert_allclose(collapsed_mean, means.squeeze(), rtol=1e-5, atol=1e-300)
-        np.testing.assert_allclose(collapsed_cov, covs.squeeze(), rtol=1e-5, atol=1e-300)
+        np.testing.assert_allclose(
+            collapsed_mean, means.squeeze(), rtol=1e-5, atol=1e-300
+        )
+        np.testing.assert_allclose(
+            collapsed_cov, covs.squeeze(), rtol=1e-5, atol=1e-300
+        )
 
     @given(gaussian_mixture_params())
     @settings(max_examples=50, deadline=None)
     def test_law_of_total_variance(self, params: dict) -> None:
         """Var[X] = E[Var[X|S]] + Var[E[X|S]] (law of total variance)."""
-        means, covs, weights = to_jax(params["means"], params["covs"], params["weights"])
+        means, covs, weights = to_jax(
+            params["means"], params["covs"], params["weights"]
+        )
 
         collapsed_mean, collapsed_cov = collapse_gaussian_mixture(means, covs, weights)
 
@@ -2037,7 +2079,9 @@ class TestScaleLikelihoodProperties:
 
     @given(
         st.integers(min_value=1, max_value=5),
-        st.floats(min_value=-1000, max_value=1000, allow_nan=False, allow_infinity=False),
+        st.floats(
+            min_value=-1000, max_value=1000, allow_nan=False, allow_infinity=False
+        ),
     )
     @settings(max_examples=50, deadline=None)
     def test_scaled_max_is_one(self, n: int, offset: float) -> None:
@@ -2128,7 +2172,9 @@ class TestStochasticMatrixProperties:
 class TestSwitchingKalmanFilterProperties:
     """Property-based tests for the switching Kalman filter."""
 
-    @given(switching_kalman_model_params(n_cont_states=1, n_obs_dim=1, n_discrete_states=2))
+    @given(
+        switching_kalman_model_params(n_cont_states=1, n_obs_dim=1, n_discrete_states=2)
+    )
     @settings(max_examples=20, deadline=None)
     def test_filter_probabilities_sum_to_one(self, params: dict) -> None:
         """Filter discrete state probabilities should sum to 1 at each time step."""
@@ -2153,7 +2199,9 @@ class TestSwitchingKalmanFilterProperties:
         prob_sums = jnp.sum(filter_prob, axis=1)
         np.testing.assert_allclose(prob_sums, jnp.ones(n_time), rtol=1e-4)
 
-    @given(switching_kalman_model_params(n_cont_states=1, n_obs_dim=1, n_discrete_states=2))
+    @given(
+        switching_kalman_model_params(n_cont_states=1, n_obs_dim=1, n_discrete_states=2)
+    )
     @settings(max_examples=20, deadline=None)
     def test_filter_covariances_are_positive_definite(self, params: dict) -> None:
         """Filter covariances should be positive definite."""
@@ -2182,7 +2230,9 @@ class TestSwitchingKalmanFilterProperties:
                     eigenvalues > -1e-8
                 ), f"Non-PD covariance at t={t}, j={j}: {eigenvalues}"
 
-    @given(switching_kalman_model_params(n_cont_states=1, n_obs_dim=1, n_discrete_states=1))
+    @given(
+        switching_kalman_model_params(n_cont_states=1, n_obs_dim=1, n_discrete_states=1)
+    )
     @settings(max_examples=20, deadline=None)
     def test_single_state_probabilities_always_one(self, params: dict) -> None:
         """With a single discrete state, probability should always be 1."""
@@ -2207,7 +2257,9 @@ class TestSwitchingKalmanFilterProperties:
 class TestSwitchingKalmanSmootherProperties:
     """Property-based tests for the switching Kalman smoother."""
 
-    @given(switching_kalman_model_params(n_cont_states=1, n_obs_dim=1, n_discrete_states=2))
+    @given(
+        switching_kalman_model_params(n_cont_states=1, n_obs_dim=1, n_discrete_states=2)
+    )
     @settings(max_examples=20, deadline=None)
     def test_smoother_probabilities_sum_to_one(self, params: dict) -> None:
         """Smoother discrete state probabilities should sum to 1 at each time step."""
@@ -2223,8 +2275,8 @@ class TestSwitchingKalmanSmootherProperties:
         obs = random.normal(key, (n_time, params["n_obs_dim"]))
 
         # Run filter
-        filter_mean, filter_cov, filter_prob, last_pair_mean, _, _ = switching_kalman_filter(
-            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+        filter_mean, filter_cov, filter_prob, last_pair_mean, _, _ = (
+            switching_kalman_filter(init_mean, init_cov, init_prob, obs, Z, A, Q, H, R)
         )
 
         # Run smoother
@@ -2241,7 +2293,9 @@ class TestSwitchingKalmanSmootherProperties:
         prob_sums = jnp.sum(smoother_prob, axis=1)
         np.testing.assert_allclose(prob_sums, jnp.ones(n_time), rtol=1e-4)
 
-    @given(switching_kalman_model_params(n_cont_states=1, n_obs_dim=1, n_discrete_states=2))
+    @given(
+        switching_kalman_model_params(n_cont_states=1, n_obs_dim=1, n_discrete_states=2)
+    )
     @settings(max_examples=20, deadline=None)
     def test_joint_probabilities_consistent_with_marginals(self, params: dict) -> None:
         """Joint probabilities should marginalize to smoother probabilities."""
@@ -2256,8 +2310,8 @@ class TestSwitchingKalmanSmootherProperties:
         key = random.PRNGKey(4)
         obs = random.normal(key, (n_time, params["n_obs_dim"]))
 
-        filter_mean, filter_cov, filter_prob, last_pair_mean, _, _ = switching_kalman_filter(
-            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+        filter_mean, filter_cov, filter_prob, last_pair_mean, _, _ = (
+            switching_kalman_filter(init_mean, init_cov, init_prob, obs, Z, A, Q, H, R)
         )
 
         _, _, smoother_prob, joint_prob, _, _, _, _, _ = switching_kalman_smoother(
@@ -2272,9 +2326,7 @@ class TestSwitchingKalmanSmootherProperties:
 
         # Sum joint prob over S_{t+1} should give smoother prob at time t
         marginal_from_joint = jnp.sum(joint_prob, axis=2)  # Sum over k
-        np.testing.assert_allclose(
-            marginal_from_joint, smoother_prob[:-1], rtol=1e-4
-        )
+        np.testing.assert_allclose(marginal_from_joint, smoother_prob[:-1], rtol=1e-4)
 
         # Sum joint prob over S_t should give smoother prob at time t+1
         marginal_from_joint_next = jnp.sum(joint_prob, axis=1)  # Sum over j
@@ -2292,7 +2344,9 @@ class TestWeightedSumOfOuterProductsProperties:
         st.integers(min_value=1, max_value=3),
     )
     @settings(max_examples=30, deadline=None)
-    def test_matches_einsum_definition(self, n_time: int, n_dims: int, n_states: int) -> None:
+    def test_matches_einsum_definition(
+        self, n_time: int, n_dims: int, n_states: int
+    ) -> None:
         """Result should match the einsum definition."""
         key = random.PRNGKey(42)
         x = random.normal(key, (n_time, n_dims, n_states))
@@ -2330,12 +2384,22 @@ class TestMStepProperties:
         gamma = jnp.abs(random.normal(key, (n_time, n_disc))) + 0.1
         gamma = gamma / gamma.sum(axis=1, keepdims=True)
 
-        xi = jnp.abs(random.normal(random.fold_in(key, 1), (n_time - 1, n_disc, n_disc))) + 0.01
+        xi = (
+            jnp.abs(random.normal(random.fold_in(key, 1), (n_time - 1, n_disc, n_disc)))
+            + 0.01
+        )
         xi = xi / xi.sum(axis=(1, 2), keepdims=True)
 
         means = random.normal(random.fold_in(key, 2), (n_time, n_cont, n_disc))
-        covs = jnp.abs(random.normal(random.fold_in(key, 3), (n_time, n_cont, n_cont, n_disc))) + 0.1
-        cross = random.normal(random.fold_in(key, 4), (n_time - 1, n_cont, n_cont, n_disc, n_disc))
+        covs = (
+            jnp.abs(
+                random.normal(random.fold_in(key, 3), (n_time, n_cont, n_cont, n_disc))
+            )
+            + 0.1
+        )
+        cross = random.normal(
+            random.fold_in(key, 4), (n_time - 1, n_cont, n_cont, n_disc, n_disc)
+        )
         obs = random.normal(random.fold_in(key, 5), (n_time, n_obs))
 
         _, _, _, _, _, _, Z_est, _ = switching_kalman_maximization_step(
@@ -2723,9 +2787,9 @@ def test_discrete_state_recovery_multivariate() -> None:
     accuracy_after_transient = compute_state_accuracy(
         filter_discrete_state_prob[100:], true_states[100:]
     )
-    assert accuracy_after_transient > 0.90, (
-        f"Multivariate oscillator accuracy {accuracy_after_transient:.3f} should be > 0.90"
-    )
+    assert (
+        accuracy_after_transient > 0.90
+    ), f"Multivariate oscillator accuracy {accuracy_after_transient:.3f} should be > 0.90"
 
 
 # --- Continuous State MSE Tests ---
@@ -2864,9 +2928,9 @@ def test_continuous_state_mse_filter() -> None:
     filter_mse = compute_mse(filter_posterior_mean, true_x)
     obs_mse = compute_mse(obs, true_x)  # Baseline: using raw observations
 
-    assert filter_mse < obs_mse, (
-        f"Filter MSE {filter_mse:.4f} should be < observation MSE {obs_mse:.4f}"
-    )
+    assert (
+        filter_mse < obs_mse
+    ), f"Filter MSE {filter_mse:.4f} should be < observation MSE {obs_mse:.4f}"
 
 
 def test_continuous_state_mse_smoother() -> None:
@@ -2977,9 +3041,9 @@ def test_continuous_state_mse_smoother() -> None:
     smoother_mse = compute_mse(smoother_posterior_mean, true_x)
 
     # Allow small tolerance for numerical precision
-    assert smoother_mse <= filter_mse + 1e-6, (
-        f"Smoother MSE {smoother_mse:.4f} should be <= filter MSE {filter_mse:.4f}"
-    )
+    assert (
+        smoother_mse <= filter_mse + 1e-6
+    ), f"Smoother MSE {smoother_mse:.4f} should be <= filter MSE {filter_mse:.4f}"
 
 
 def test_continuous_state_mse_vs_standard_kalman() -> None:
@@ -3082,9 +3146,9 @@ def test_continuous_state_mse_vs_standard_kalman() -> None:
     kf_mse = compute_mse(kf_mean, true_x)
 
     # SKF with oracle knowledge should be better than standard KF with wrong params
-    assert skf_mse < kf_mse, (
-        f"SKF MSE {skf_mse:.4f} should be < standard KF MSE {kf_mse:.4f}"
-    )
+    assert (
+        skf_mse < kf_mse
+    ), f"SKF MSE {skf_mse:.4f} should be < standard KF MSE {kf_mse:.4f}"
 
 
 def test_continuous_state_mse_multivariate() -> None:
@@ -3184,9 +3248,9 @@ def test_continuous_state_mse_multivariate() -> None:
     smoother_mse = compute_mse(smoother_posterior_mean, true_x[100:])
 
     # Smoother should be at least as good as filter
-    assert smoother_mse <= filter_mse + 1e-3, (
-        f"Smoother MSE {smoother_mse:.4f} should be <= filter MSE {filter_mse:.4f}"
-    )
+    assert (
+        smoother_mse <= filter_mse + 1e-3
+    ), f"Smoother MSE {smoother_mse:.4f} should be <= filter MSE {filter_mse:.4f}"
 
 
 # --- Parameter Recovery Tests ---
@@ -3428,7 +3492,9 @@ def test_em_parameter_recovery_continuous_transition():
     # Check A recovery (relative error)
     rel_error = jnp.abs(final_params["A"] - true_A) / (jnp.abs(true_A) + 1e-8)
     max_rel_error = float(jnp.max(rel_error))
-    assert max_rel_error < 0.20, f"Max A relative error {max_rel_error:.4f} should be < 0.20"
+    assert (
+        max_rel_error < 0.20
+    ), f"Max A relative error {max_rel_error:.4f} should be < 0.20"
 
 
 @pytest.mark.slow
@@ -3577,20 +3643,26 @@ def test_em_parameter_recovery_all_parameters():
     # Tight tolerance (5%) because A directly determines temporal correlations.
     A_rel_error = jnp.abs(final_params["A"] - true_A_jnp) / (jnp.abs(true_A_jnp) + 1e-8)
     A_max_rel_error = float(jnp.max(A_rel_error))
-    assert A_max_rel_error < 0.05, f"A relative error {A_max_rel_error:.4f} should be < 0.05"
+    assert (
+        A_max_rel_error < 0.05
+    ), f"A relative error {A_max_rel_error:.4f} should be < 0.05"
 
     # R: measurement covariance - identifiable from observation noise floor.
     # Moderate tolerance (15%) because estimation depends on state uncertainty.
     R_rel_error = jnp.abs(final_params["R"] - true_R_jnp) / (jnp.abs(true_R_jnp) + 1e-8)
     R_max_rel_error = float(jnp.max(R_rel_error))
-    assert R_max_rel_error < 0.15, f"R relative error {R_max_rel_error:.4f} should be < 0.15"
+    assert (
+        R_max_rel_error < 0.15
+    ), f"R relative error {R_max_rel_error:.4f} should be < 0.15"
 
     # Z: discrete transition matrix - highly identifiable with long sequences.
     # Tight absolute tolerance (2%) because probabilities are well-estimated
     # when states persist long enough to count transitions accurately.
     Z_abs_error = jnp.abs(final_params["Z"] - true_Z_jnp)
     Z_max_abs_error = float(jnp.max(Z_abs_error))
-    assert Z_max_abs_error < 0.02, f"Z absolute error {Z_max_abs_error:.4f} should be < 0.02"
+    assert (
+        Z_max_abs_error < 0.02
+    ), f"Z absolute error {Z_max_abs_error:.4f} should be < 0.02"
 
     # H and Q have scale ambiguity: scaling H by k and Q by 1/k² preserves
     # the observation distribution. Only H²Q (the observation variance
@@ -3599,7 +3671,9 @@ def test_em_parameter_recovery_all_parameters():
     est_H2Q = final_params["H"] ** 2 * final_params["Q"]
     H2Q_rel_error = jnp.abs(est_H2Q - true_H2Q) / (jnp.abs(true_H2Q) + 1e-8)
     H2Q_max_rel_error = float(jnp.max(H2Q_rel_error))
-    assert H2Q_max_rel_error < 0.15, f"H^2*Q relative error {H2Q_max_rel_error:.4f} should be < 0.15"
+    assert (
+        H2Q_max_rel_error < 0.15
+    ), f"H^2*Q relative error {H2Q_max_rel_error:.4f} should be < 0.15"
 
     # Verify log-likelihood improved
     assert ll_history[-1] > ll_history[0], "Log-likelihood should improve"
@@ -3700,18 +3774,26 @@ def test_em_parameter_recovery_multivariate():
     # A: transition matrix - identifiable from dynamics. Looser tolerance (15%)
     # for multivariate case due to more parameters and cross-terms.
     for j in range(n_disc):
-        A_frobenius = float(jnp.linalg.norm(final_params["A"][:, :, j] - true_A[:, :, j]))
+        A_frobenius = float(
+            jnp.linalg.norm(final_params["A"][:, :, j] - true_A[:, :, j])
+        )
         A_true_norm = float(jnp.linalg.norm(true_A[:, :, j]))
         A_rel_error = A_frobenius / (A_true_norm + 1e-8)
-        assert A_rel_error < 0.15, f"A[{j}] relative Frobenius error {A_rel_error:.4f} should be < 0.15"
+        assert (
+            A_rel_error < 0.15
+        ), f"A[{j}] relative Frobenius error {A_rel_error:.4f} should be < 0.15"
 
     # R: measurement covariance - identifiable but harder in multivariate case.
     # Tolerance (25%) accounts for covariance estimation uncertainty.
     for j in range(n_disc):
-        R_frobenius = float(jnp.linalg.norm(final_params["R"][:, :, j] - true_R[:, :, j]))
+        R_frobenius = float(
+            jnp.linalg.norm(final_params["R"][:, :, j] - true_R[:, :, j])
+        )
         R_true_norm = float(jnp.linalg.norm(true_R[:, :, j]))
         R_rel_error = R_frobenius / (R_true_norm + 1e-8)
-        assert R_rel_error < 0.25, f"R[{j}] relative Frobenius error {R_rel_error:.4f} should be < 0.25"
+        assert (
+            R_rel_error < 0.25
+        ), f"R[{j}] relative Frobenius error {R_rel_error:.4f} should be < 0.25"
 
     # H and Q have scale ambiguity in multivariate case too.
     # H @ Q @ H.T is the identifiable quantity (observation covariance from state).
@@ -3725,7 +3807,9 @@ def test_em_parameter_recovery_multivariate():
         HQH_frobenius = float(jnp.linalg.norm(est_HQH - true_HQH))
         HQH_true_norm = float(jnp.linalg.norm(true_HQH))
         HQH_rel_error = HQH_frobenius / (HQH_true_norm + 1e-8)
-        assert HQH_rel_error < 0.25, f"H@Q@H.T[{j}] relative Frobenius error {HQH_rel_error:.4f} should be < 0.25"
+        assert (
+            HQH_rel_error < 0.25
+        ), f"H@Q@H.T[{j}] relative Frobenius error {HQH_rel_error:.4f} should be < 0.25"
 
     # Verify log-likelihood improved
     assert ll_history[-1] > ll_history[0], "Log-likelihood should improve"
@@ -3953,7 +4037,9 @@ def test_individual_recovery_A(simulated_data_for_individual_recovery):
     true_A = jnp.array(true_params["A"])
     A_rel_error = jnp.abs(final_params["A"] - true_A) / (jnp.abs(true_A) + 1e-8)
     A_max_rel_error = float(jnp.max(A_rel_error))
-    assert A_max_rel_error < 0.10, f"A relative error {A_max_rel_error:.4f} should be < 0.10"
+    assert (
+        A_max_rel_error < 0.10
+    ), f"A relative error {A_max_rel_error:.4f} should be < 0.10"
 
     # LL should improve
     assert ll_history[-1] >= ll_history[0], "Log-likelihood should not decrease"
@@ -3977,7 +4063,9 @@ def test_individual_recovery_Q(simulated_data_for_individual_recovery):
     true_Q = jnp.array(true_params["Q"])
     Q_rel_error = jnp.abs(final_params["Q"] - true_Q) / (jnp.abs(true_Q) + 1e-8)
     Q_max_rel_error = float(jnp.max(Q_rel_error))
-    assert Q_max_rel_error < 0.25, f"Q relative error {Q_max_rel_error:.4f} should be < 0.25"
+    assert (
+        Q_max_rel_error < 0.25
+    ), f"Q relative error {Q_max_rel_error:.4f} should be < 0.25"
 
     # LL should improve
     assert ll_history[-1] >= ll_history[0], "Log-likelihood should not decrease"
@@ -4001,7 +4089,9 @@ def test_individual_recovery_H(simulated_data_for_individual_recovery):
     true_H = jnp.array(true_params["H"])
     H_rel_error = jnp.abs(final_params["H"] - true_H) / (jnp.abs(true_H) + 1e-8)
     H_max_rel_error = float(jnp.max(H_rel_error))
-    assert H_max_rel_error < 0.10, f"H relative error {H_max_rel_error:.4f} should be < 0.10"
+    assert (
+        H_max_rel_error < 0.10
+    ), f"H relative error {H_max_rel_error:.4f} should be < 0.10"
 
     # LL should improve
     assert ll_history[-1] >= ll_history[0], "Log-likelihood should not decrease"
@@ -4025,7 +4115,9 @@ def test_individual_recovery_R(simulated_data_for_individual_recovery):
     true_R = jnp.array(true_params["R"])
     R_rel_error = jnp.abs(final_params["R"] - true_R) / (jnp.abs(true_R) + 1e-8)
     R_max_rel_error = float(jnp.max(R_rel_error))
-    assert R_max_rel_error < 0.15, f"R relative error {R_max_rel_error:.4f} should be < 0.15"
+    assert (
+        R_max_rel_error < 0.15
+    ), f"R relative error {R_max_rel_error:.4f} should be < 0.15"
 
     # LL should improve
     assert ll_history[-1] >= ll_history[0], "Log-likelihood should not decrease"
@@ -4049,7 +4141,9 @@ def test_individual_recovery_Z(simulated_data_for_individual_recovery):
     true_Z = jnp.array(true_params["Z"])
     Z_abs_error = jnp.abs(final_params["Z"] - true_Z)
     Z_max_abs_error = float(jnp.max(Z_abs_error))
-    assert Z_max_abs_error < 0.03, f"Z absolute error {Z_max_abs_error:.4f} should be < 0.03"
+    assert (
+        Z_max_abs_error < 0.03
+    ), f"Z absolute error {Z_max_abs_error:.4f} should be < 0.03"
 
     # LL should improve
     assert ll_history[-1] >= ll_history[0], "Log-likelihood should not decrease"
@@ -4080,7 +4174,9 @@ def test_individual_recovery_H_and_Q_together(simulated_data_for_individual_reco
     est_H2Q = final_params["H"] ** 2 * final_params["Q"]
     H2Q_rel_error = jnp.abs(est_H2Q - true_H2Q) / (jnp.abs(true_H2Q) + 1e-8)
     H2Q_max_rel_error = float(jnp.max(H2Q_rel_error))
-    assert H2Q_max_rel_error < 0.15, f"H²Q relative error {H2Q_max_rel_error:.4f} should be < 0.15"
+    assert (
+        H2Q_max_rel_error < 0.15
+    ), f"H²Q relative error {H2Q_max_rel_error:.4f} should be < 0.15"
 
     # LL should improve
     assert ll_history[-1] >= ll_history[0], "Log-likelihood should not decrease"
@@ -4121,9 +4217,7 @@ class TestSwitchingMStepMathCorrectness:
         obs = random.normal(key, (100, n_obs))
 
         # Non-switching path
-        kf_sm, kf_sc, kf_scc, _ = kalman_smoother(
-            init_mean, init_cov, obs, A, Q, H, R
-        )
+        kf_sm, kf_sc, kf_scc, _ = kalman_smoother(init_mean, init_cov, obs, A, Q, H, R)
         kf_A, kf_H, kf_Q, kf_R, kf_im, kf_ic = kalman_maximization_step(
             obs, kf_sm, kf_sc, kf_scc
         )
@@ -4135,23 +4229,51 @@ class TestSwitchingMStepMathCorrectness:
         skf_R = R[..., None]
 
         skf_fm, skf_fc, skf_fp, last_pair_m, _, _ = switching_kalman_filter(
-            init_mean[:, None], init_cov[..., None], jnp.array([1.0]),
-            obs, Z, skf_A, skf_Q, skf_H, skf_R,
+            init_mean[:, None],
+            init_cov[..., None],
+            jnp.array([1.0]),
+            obs,
+            Z,
+            skf_A,
+            skf_Q,
+            skf_H,
+            skf_R,
         )
         (
-            _, _, skf_sdsp, skf_sjdsp, _, skf_scsm, skf_scsc, skf_pcscc, _,
+            _,
+            _,
+            skf_sdsp,
+            skf_sjdsp,
+            _,
+            skf_scsm,
+            skf_scsc,
+            skf_pcscc,
+            _,
         ) = switching_kalman_smoother(
-            filter_mean=skf_fm, filter_cov=skf_fc,
+            filter_mean=skf_fm,
+            filter_cov=skf_fc,
             filter_discrete_state_prob=skf_fp,
             last_filter_conditional_cont_mean=last_pair_m,
-            process_cov=skf_Q, continuous_transition_matrix=skf_A,
+            process_cov=skf_Q,
+            continuous_transition_matrix=skf_A,
             discrete_state_transition_matrix=Z,
         )
         (
-            skf_new_A, skf_new_H, skf_new_Q, skf_new_R,
-            skf_new_im, skf_new_ic, _, _,
+            skf_new_A,
+            skf_new_H,
+            skf_new_Q,
+            skf_new_R,
+            skf_new_im,
+            skf_new_ic,
+            _,
+            _,
         ) = switching_kalman_maximization_step(
-            obs, skf_scsm, skf_scsc, skf_sdsp, skf_sjdsp, skf_pcscc,
+            obs,
+            skf_scsm,
+            skf_scsc,
+            skf_sdsp,
+            skf_sjdsp,
+            skf_pcscc,
         )
 
         # The switching smoother's GPB1 approximation (pair-conditional collapse)
@@ -4159,14 +4281,21 @@ class TestSwitchingMStepMathCorrectness:
         # asymmetric A, the difference is ~5% relative. The 1D version of this
         # test (test_m_step_one_state) passes at rtol=1e-5 because the collapse
         # is exact in 1D.
-        np.testing.assert_allclose(kf_A, skf_new_A.squeeze(), rtol=0.05,
-                                   err_msg="A mismatch: S=1 switching vs non-switching")
-        np.testing.assert_allclose(kf_H, skf_new_H.squeeze(), rtol=0.07,
-                                   err_msg="H mismatch")
-        np.testing.assert_allclose(kf_Q, skf_new_Q.squeeze(), rtol=0.1,
-                                   err_msg="Q mismatch")
-        np.testing.assert_allclose(kf_R, skf_new_R.squeeze(), rtol=0.07,
-                                   err_msg="R mismatch")
+        np.testing.assert_allclose(
+            kf_A,
+            skf_new_A.squeeze(),
+            rtol=0.05,
+            err_msg="A mismatch: S=1 switching vs non-switching",
+        )
+        np.testing.assert_allclose(
+            kf_H, skf_new_H.squeeze(), rtol=0.07, err_msg="H mismatch"
+        )
+        np.testing.assert_allclose(
+            kf_Q, skf_new_Q.squeeze(), rtol=0.1, err_msg="Q mismatch"
+        )
+        np.testing.assert_allclose(
+            kf_R, skf_new_R.squeeze(), rtol=0.07, err_msg="R mismatch"
+        )
 
     def test_switching_mstep_from_known_sufficient_stats(self) -> None:
         """Feed analytically constructed sufficient stats, verify normal equations.
@@ -4181,22 +4310,28 @@ class TestSwitchingMStepMathCorrectness:
         key = random.PRNGKey(55)
         state_means = random.normal(key, (n_time, n_state, n_discrete)) * 0.5
 
-        state_covs = jnp.tile(
-            jnp.eye(n_state)[..., None], (1, 1, n_discrete)
-        )[None].repeat(n_time, axis=0) * 0.1
+        state_covs = (
+            jnp.tile(jnp.eye(n_state)[..., None], (1, 1, n_discrete))[None].repeat(
+                n_time, axis=0
+            )
+            * 0.1
+        )
 
         discrete_prob = jnp.ones((n_time, n_discrete)) * 0.5
         joint_prob = jnp.ones((n_time - 1, n_discrete, n_discrete)) * 0.25
 
         # Zero cross-covariance: beta comes purely from the mean terms
-        cross_cov = jnp.zeros(
-            (n_time - 1, n_state, n_state, n_discrete, n_discrete)
-        )
+        cross_cov = jnp.zeros((n_time - 1, n_state, n_state, n_discrete, n_discrete))
 
         obs = random.normal(random.PRNGKey(66), (n_time, n_obs))
 
         (new_A, _, _, _, _, _, _, _) = switching_kalman_maximization_step(
-            obs, state_means, state_covs, discrete_prob, joint_prob, cross_cov,
+            obs,
+            state_means,
+            state_covs,
+            discrete_prob,
+            joint_prob,
+            cross_cov,
         )
 
         # Verify normal equations: A_j @ gamma1_j = beta_j
@@ -4211,15 +4346,17 @@ class TestSwitchingMStepMathCorrectness:
                 for i in range(n_discrete):
                     w = jp_np[t, i, j]
                     gamma1_j += w * (
-                        sc_np[t, :, :, i]
-                        + np.outer(sm_np[t, :, i], sm_np[t, :, i])
+                        sc_np[t, :, :, i] + np.outer(sm_np[t, :, i], sm_np[t, :, i])
                     )
                     beta_j += w * np.outer(sm_np[t + 1, :, j], sm_np[t, :, i])
 
             lhs = np.array(new_A[:, :, j]) @ gamma1_j
             np.testing.assert_allclose(
-                lhs, beta_j, rtol=1e-4, atol=1e-7,
-                err_msg=f"Normal equations not satisfied for state {j}"
+                lhs,
+                beta_j,
+                rtol=1e-4,
+                atol=1e-7,
+                err_msg=f"Normal equations not satisfied for state {j}",
             )
 
 
@@ -4250,37 +4387,72 @@ class TestSwitchingEMMonotonicity:
         elbos = []
         for _ in range(10):
             fm, fc, fp, lpm, _, mll = switching_kalman_filter(
-                init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
+                init_mean,
+                init_cov,
+                init_prob,
+                obs,
+                Z,
+                A,
+                Q,
+                H,
+                R,
             )
             (
-                _, _, sdsp, sjdsp, _, scsm, scsc, pcscc, pcsmeans,
+                _,
+                _,
+                sdsp,
+                sjdsp,
+                _,
+                scsm,
+                scsc,
+                pcscc,
+                pcsmeans,
             ) = switching_kalman_smoother(
-                filter_mean=fm, filter_cov=fc,
+                filter_mean=fm,
+                filter_cov=fc,
                 filter_discrete_state_prob=fp,
                 last_filter_conditional_cont_mean=lpm,
-                process_cov=Q, continuous_transition_matrix=A,
+                process_cov=Q,
+                continuous_transition_matrix=A,
                 discrete_state_transition_matrix=Z,
             )
 
             elbo = compute_elbo(
-                obs, scsm, scsc, sdsp, sjdsp, pcscc,
-                init_mean, init_cov, init_prob,
-                A, Q, H, R, Z,
+                obs,
+                scsm,
+                scsc,
+                sdsp,
+                sjdsp,
+                pcscc,
+                init_mean,
+                init_cov,
+                init_prob,
+                A,
+                Q,
+                H,
+                R,
+                Z,
             )
             elbos.append(float(elbo))
 
             A, H, Q, R, init_mean, init_cov, Z, init_prob = (
                 switching_kalman_maximization_step(
-                    obs, scsm, scsc, sdsp, sjdsp, pcscc, pcsmeans,
+                    obs,
+                    scsm,
+                    scsc,
+                    sdsp,
+                    sjdsp,
+                    pcscc,
+                    pcsmeans,
                 )
             )
 
         # Overall improvement: ELBO at end should exceed ELBO at start.
         # GPB1 moment-matching does NOT guarantee per-iteration monotonicity,
         # so we only check overall trend.
-        assert elbos[-1] > elbos[0], (
-            f"ELBO should improve overall: first={elbos[0]:.4f}, last={elbos[-1]:.4f}"
-        )
+        assert (
+            elbos[-1] > elbos[0]
+        ), f"ELBO should improve overall: first={elbos[0]:.4f}, last={elbos[-1]:.4f}"
 
         # All ELBOs should be finite
         for i, e in enumerate(elbos):
@@ -4305,21 +4477,52 @@ class TestSwitchingNumericalStability:
         obs = random.normal(random.PRNGKey(42), (200, n_obs))
 
         fm, fc, fp, lpm, _, _ = switching_kalman_filter(
-            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
+            init_mean,
+            init_cov,
+            init_prob,
+            obs,
+            Z,
+            A,
+            Q,
+            H,
+            R,
         )
         (
-            _, _, sdsp, sjdsp, _, scsm, scsc, pcscc, pcsmeans,
+            _,
+            _,
+            sdsp,
+            sjdsp,
+            _,
+            scsm,
+            scsc,
+            pcscc,
+            pcsmeans,
         ) = switching_kalman_smoother(
-            filter_mean=fm, filter_cov=fc,
+            filter_mean=fm,
+            filter_cov=fc,
             filter_discrete_state_prob=fp,
             last_filter_conditional_cont_mean=lpm,
-            process_cov=Q, continuous_transition_matrix=A,
+            process_cov=Q,
+            continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
         )
         (
-            new_A, new_H, new_Q, new_R, _, _, new_Z, _,
+            new_A,
+            new_H,
+            new_Q,
+            new_R,
+            _,
+            _,
+            new_Z,
+            _,
         ) = switching_kalman_maximization_step(
-            obs, scsm, scsc, sdsp, sjdsp, pcscc, pcsmeans,
+            obs,
+            scsm,
+            scsc,
+            sdsp,
+            sjdsp,
+            pcscc,
+            pcsmeans,
         )
 
         assert jnp.all(jnp.isfinite(new_A)), "A should be finite"
@@ -4328,8 +4531,131 @@ class TestSwitchingNumericalStability:
         assert jnp.all(jnp.isfinite(new_R)), "R should be finite"
         assert jnp.all(jnp.isfinite(new_Z)), "Z should be finite"
         np.testing.assert_allclose(
-            jnp.sum(new_Z, axis=1), jnp.ones(n_discrete), rtol=1e-5,
-            err_msg="Z rows should sum to 1"
+            jnp.sum(new_Z, axis=1),
+            jnp.ones(n_discrete),
+            rtol=1e-5,
+            err_msg="Z rows should sum to 1",
+        )
+
+    def test_mstep_low_occupancy_state_returns_psd_covariances(self) -> None:
+        """Low-occupancy states should still yield finite PSD Q/R estimates."""
+        obs = jnp.ones((3, 1))
+        state_cond_smoother_means = jnp.ones((3, 1, 2))
+        state_cond_smoother_covs = jnp.array(
+            [
+                [[[0.1, -0.99]]],
+                [[[0.1, -0.99]]],
+                [[[0.1, -0.99]]],
+            ]
+        )
+        smoother_discrete_state_prob = jnp.array(
+            [[0.999, 0.001], [0.999, 0.001], [0.999, 0.001]]
+        )
+        smoother_joint_discrete_state_prob = jnp.array(
+            [
+                [[0.999, 0.001], [0.0, 0.0]],
+                [[0.999, 0.001], [0.0, 0.0]],
+            ]
+        )
+        pair_cond_smoother_cross_cov = jnp.zeros((2, 1, 1, 2, 2))
+
+        (
+            _,
+            _,
+            process_cov,
+            measurement_cov,
+            _,
+            _,
+            _,
+            _,
+        ) = switching_kalman_maximization_step(
+            obs=obs,
+            state_cond_smoother_means=state_cond_smoother_means,
+            state_cond_smoother_covs=state_cond_smoother_covs,
+            smoother_discrete_state_prob=smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov=pair_cond_smoother_cross_cov,
+        )
+
+        for covariances in (process_cov, measurement_cov):
+            for state in range(covariances.shape[-1]):
+                state_cov = covariances[..., state]
+                eigvals = jnp.linalg.eigvalsh(state_cov)
+
+                assert jnp.all(jnp.isfinite(state_cov))
+                np.testing.assert_allclose(
+                    state_cov, state_cov.T, rtol=1e-10, atol=1e-14
+                )
+                assert jnp.min(eigvals) >= -1e-8
+
+    def test_elbo_zero_weight_paths_do_not_depend_on_log_floor(
+        self, monkeypatch
+    ) -> None:
+        """ELBO should be invariant to log-floor changes on exact-zero posterior paths."""
+        obs = jnp.zeros((2, 1))
+        state_cond_smoother_means = jnp.zeros((2, 1, 2))
+        state_cond_smoother_covs = jnp.array(
+            [
+                [[[1.0, 1.0]]],
+                [[[1.0, 1.0]]],
+            ]
+        )
+        smoother_discrete_state_prob = jnp.array([[1.0, 0.0], [1.0, 0.0]])
+        smoother_joint_discrete_state_prob = jnp.array([[[1.0, 0.0], [0.0, 0.0]]])
+        pair_cond_smoother_cross_cov = jnp.zeros((1, 1, 1, 2, 2))
+
+        init_state_cond_mean = jnp.zeros((1, 2))
+        init_state_cond_cov = jnp.stack([jnp.eye(1), jnp.eye(1)], axis=-1)
+        init_discrete_state_prob = jnp.array([1.0, 0.0])
+        continuous_transition_matrix = jnp.stack([jnp.eye(1), jnp.eye(1)], axis=-1)
+        process_cov = jnp.stack([jnp.eye(1), jnp.eye(1)], axis=-1)
+        measurement_matrix = jnp.stack([jnp.eye(1), jnp.eye(1)], axis=-1)
+        measurement_cov = jnp.stack([jnp.eye(1), jnp.eye(1)], axis=-1)
+        discrete_transition_matrix = jnp.array([[1.0, 0.0], [0.0, 1.0]])
+
+        baseline_elbo = compute_elbo(
+            obs=obs,
+            state_cond_smoother_means=state_cond_smoother_means,
+            state_cond_smoother_covs=state_cond_smoother_covs,
+            smoother_discrete_state_prob=smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov=pair_cond_smoother_cross_cov,
+            init_state_cond_mean=init_state_cond_mean,
+            init_state_cond_cov=init_state_cond_cov,
+            init_discrete_state_prob=init_discrete_state_prob,
+            continuous_transition_matrix=continuous_transition_matrix,
+            process_cov=process_cov,
+            measurement_matrix=measurement_matrix,
+            measurement_cov=measurement_cov,
+            discrete_transition_matrix=discrete_transition_matrix,
+        )
+
+        monkeypatch.setattr(switching_kalman_module, "_LOG_FLOOR_VALUE", -1e6)
+
+        perturbed_floor_elbo = compute_elbo(
+            obs=obs,
+            state_cond_smoother_means=state_cond_smoother_means,
+            state_cond_smoother_covs=state_cond_smoother_covs,
+            smoother_discrete_state_prob=smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov=pair_cond_smoother_cross_cov,
+            init_state_cond_mean=init_state_cond_mean,
+            init_state_cond_cov=init_state_cond_cov,
+            init_discrete_state_prob=init_discrete_state_prob,
+            continuous_transition_matrix=continuous_transition_matrix,
+            process_cov=process_cov,
+            measurement_matrix=measurement_matrix,
+            measurement_cov=measurement_cov,
+            discrete_transition_matrix=discrete_transition_matrix,
+        )
+
+        assert jnp.isfinite(baseline_elbo)
+        assert jnp.isfinite(perturbed_floor_elbo)
+        np.testing.assert_allclose(
+            baseline_elbo,
+            perturbed_floor_elbo,
+            rtol=1e-10,
+            atol=1e-12,
         )
 
 
@@ -4353,12 +4679,18 @@ class TestGPB2ExactMStep:
         pair_means = random.normal(k1, (T, L, S, S))
         # Make pair covs PSD and different from state-conditional
         raw = random.normal(k2, (T, L, L, S, S))
-        pair_covs = jnp.einsum("tabij,tcbij->tacij", raw, raw) + 0.1 * jnp.eye(L)[None, :, :, None, None]
+        pair_covs = (
+            jnp.einsum("tabij,tcbij->tacij", raw, raw)
+            + 0.1 * jnp.eye(L)[None, :, :, None, None]
+        )
 
         # State-conditional (intentionally different to detect fallback use)
         state_means = random.normal(k3, (T + 1, L, S))
         raw_sc = random.normal(k4, (T + 1, L, L, S))
-        state_covs = jnp.einsum("tabi,tcbi->taci", raw_sc, raw_sc) + 0.1 * jnp.eye(L)[None, :, :, None]
+        state_covs = (
+            jnp.einsum("tabi,tcbi->taci", raw_sc, raw_sc)
+            + 0.1 * jnp.eye(L)[None, :, :, None]
+        )
 
         # Joint probs
         joint_probs = jnp.abs(random.normal(k5, (T, S, S)))
@@ -4417,7 +4749,11 @@ class TestGPB2ExactMStep:
         joint_probs = jnp.abs(random.normal(k5, (T, S, S)))
         joint_probs = joint_probs / joint_probs.sum(axis=(1, 2), keepdims=True)
 
-        pair_covs = jnp.stack([jnp.eye(L)] * (S * S), axis=-1).reshape(L, L, S, S)[None].repeat(T, axis=0)
+        pair_covs = (
+            jnp.stack([jnp.eye(L)] * (S * S), axis=-1)
+            .reshape(L, L, S, S)[None]
+            .repeat(T, axis=0)
+        )
 
         _, beta_exact = compute_transition_sufficient_stats(
             state_cond_smoother_means=state_means,
@@ -4467,7 +4803,11 @@ class TestGPB2ExactMStep:
         state_covs = jnp.stack([jnp.eye(L)] * S, axis=-1)[None].repeat(T + 1, axis=0)
 
         # Make pair covs intentionally different from state covs
-        pair_covs = jnp.stack([jnp.eye(L) * 3.0] * (S * S), axis=-1).reshape(L, L, S, S)[None].repeat(T, axis=0)
+        pair_covs = (
+            jnp.stack([jnp.eye(L) * 3.0] * (S * S), axis=-1)
+            .reshape(L, L, S, S)[None]
+            .repeat(T, axis=0)
+        )
 
         joint_probs = jnp.abs(random.normal(k5, (T, S, S))) + 0.01
         joint_probs = joint_probs / joint_probs.sum(axis=(1, 2), keepdims=True)
@@ -4496,10 +4836,12 @@ class TestGPB2ExactMStep:
 
         # They should differ because pair_covs != state_covs
         # and next_pair_means != state_means[1:]
-        assert not jnp.allclose(gamma1_exact, gamma1_approx, atol=1e-6), \
-            "gamma1 should differ between exact and approximate paths"
-        assert not jnp.allclose(beta_exact, beta_approx, atol=1e-6), \
-            "beta should differ between exact and approximate paths"
+        assert not jnp.allclose(
+            gamma1_exact, gamma1_approx, atol=1e-6
+        ), "gamma1 should differ between exact and approximate paths"
+        assert not jnp.allclose(
+            beta_exact, beta_approx, atol=1e-6
+        ), "beta should differ between exact and approximate paths"
 
     def test_gpb2_smoother_extra_outputs_shapes(self) -> None:
         """GPB2 smoother should return pair_cond_covs and next_pair_cond_means
@@ -4521,38 +4863,61 @@ class TestGPB2ExactMStep:
         obs = random.normal(random.PRNGKey(0), (n_time, n_obs))
 
         fm, fc, fp, lpm, _, _ = switching_kalman_filter(
-            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
+            init_mean,
+            init_cov,
+            init_prob,
+            obs,
+            Z,
+            A,
+            Q,
+            H,
+            R,
         )
 
         result = switching_kalman_smoother_gpb2(
-            filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
+            filter_mean=fm,
+            filter_cov=fc,
+            filter_discrete_state_prob=fp,
             last_filter_conditional_cont_mean=lpm,
-            process_cov=Q, continuous_transition_matrix=A,
+            process_cov=Q,
+            continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
         )
 
         # GPB2 returns 11 outputs
         assert len(result) == 11, f"GPB2 should return 11 outputs, got {len(result)}"
 
-        pair_cond_covs = result[9]   # Cov[x_t | S_t=j, S_{t+1}=k]
+        pair_cond_covs = result[9]  # Cov[x_t | S_t=j, S_{t+1}=k]
         next_pair_means = result[10]  # E[x_{t+1} | S_t=j, S_{t+1}=k]
 
         # pair_cond_covs: (T-1, L, L, S, S)
-        assert pair_cond_covs.shape == (n_time - 1, n_latent, n_latent, n_states, n_states), \
-            f"pair_cond_covs shape: {pair_cond_covs.shape}"
+        assert pair_cond_covs.shape == (
+            n_time - 1,
+            n_latent,
+            n_latent,
+            n_states,
+            n_states,
+        ), f"pair_cond_covs shape: {pair_cond_covs.shape}"
         # next_pair_means: (T-1, L, S, S)
-        assert next_pair_means.shape == (n_time - 1, n_latent, n_states, n_states), \
-            f"next_pair_means shape: {next_pair_means.shape}"
+        assert next_pair_means.shape == (
+            n_time - 1,
+            n_latent,
+            n_states,
+            n_states,
+        ), f"next_pair_means shape: {next_pair_means.shape}"
 
         assert jnp.all(jnp.isfinite(pair_cond_covs)), "pair_cond_covs should be finite"
-        assert jnp.all(jnp.isfinite(next_pair_means)), "next_pair_means should be finite"
+        assert jnp.all(
+            jnp.isfinite(next_pair_means)
+        ), "next_pair_means should be finite"
 
         # pair_cond_covs should be PSD (non-negative trace for each (j,k))
         for j in range(n_states):
             for k in range(n_states):
                 traces = jax.vmap(jnp.trace)(pair_cond_covs[:, :, :, j, k])
-                assert jnp.all(traces >= 0), \
-                    f"pair_cond_covs[:,:,:,{j},{k}] should have non-negative trace"
+                assert jnp.all(
+                    traces >= 0
+                ), f"pair_cond_covs[:,:,:,{j},{k}] should have non-negative trace"
 
     def test_gpb1_path_unchanged_with_none_params(self) -> None:
         """GPB1 path should produce identical results when new params are None."""
@@ -4602,10 +4967,13 @@ class TestGPB2ExactMStep:
 
         n_time, n_latent, n_obs, n_states = 50, 2, 2, 2
         # Use different dynamics per state to create spread in means
-        A = jnp.stack([
-            jnp.array([[0.95, -0.1], [0.1, 0.95]]),
-            jnp.array([[0.8, 0.2], [-0.2, 0.8]]),
-        ], axis=-1)
+        A = jnp.stack(
+            [
+                jnp.array([[0.95, -0.1], [0.1, 0.95]]),
+                jnp.array([[0.8, 0.2], [-0.2, 0.8]]),
+            ],
+            axis=-1,
+        )
         Q = jnp.stack([jnp.eye(n_latent) * 0.1] * n_states, axis=-1)
         H = jnp.stack([jnp.eye(n_obs)] * n_states, axis=-1)
         R = jnp.stack([jnp.eye(n_obs) * 0.5] * n_states, axis=-1)
@@ -4616,17 +4984,28 @@ class TestGPB2ExactMStep:
         obs = random.normal(random.PRNGKey(42), (n_time, n_obs))
 
         fm, fc, fp, lpm, _, _ = switching_kalman_filter(
-            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
+            init_mean,
+            init_cov,
+            init_prob,
+            obs,
+            Z,
+            A,
+            Q,
+            H,
+            R,
         )
 
         result = switching_kalman_smoother_gpb2(
-            filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
+            filter_mean=fm,
+            filter_cov=fc,
+            filter_discrete_state_prob=fp,
             last_filter_conditional_cont_mean=lpm,
-            process_cov=Q, continuous_transition_matrix=A,
+            process_cov=Q,
+            continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
         )
 
-        pair_cond_covs = result[9]   # (T-1, L, L, S_j, S_k)
+        pair_cond_covs = result[9]  # (T-1, L, L, S_j, S_k)
         state_cond_covs = result[6]  # (T, L, L, S)
 
         # Pair-conditional traces should generally be >= state-conditional traces
@@ -4634,13 +5013,14 @@ class TestGPB2ExactMStep:
         # This won't always hold strictly at every timestep, but on average
         # the pair-conditional should be at least as large
         for j in range(n_states):
-            pair_traces = jnp.mean(
-                jax.vmap(jnp.trace)(pair_cond_covs[:, :, :, j, 0]) +
-                jax.vmap(jnp.trace)(pair_cond_covs[:, :, :, j, 1])
-            ) / 2
-            state_traces = jnp.mean(
-                jax.vmap(jnp.trace)(state_cond_covs[:-1, :, :, j])
+            pair_traces = (
+                jnp.mean(
+                    jax.vmap(jnp.trace)(pair_cond_covs[:, :, :, j, 0])
+                    + jax.vmap(jnp.trace)(pair_cond_covs[:, :, :, j, 1])
+                )
+                / 2
             )
+            state_traces = jnp.mean(jax.vmap(jnp.trace)(state_cond_covs[:-1, :, :, j]))
             # Pair-conditional should not be dramatically smaller than state-conditional
             assert pair_traces >= state_traces * 0.9, (
                 f"Pair-conditional trace ({pair_traces:.4f}) should be >= "

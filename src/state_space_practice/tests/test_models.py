@@ -242,6 +242,38 @@ class TestStochasticPointProcessFilter:
         # First mode should be close to init (only prediction step, small update)
         np.testing.assert_allclose(posterior_mode[0], init_mode, rtol=0.5)
 
+    def test_large_log_rates_keep_posterior_covariance_finite_and_symmetric(
+        self,
+    ) -> None:
+        """Legacy filter should keep covariances finite under large log-rates."""
+        n_time = 3
+        n_params = 3
+        dt = 0.02
+
+        def large_log_rate_model(position, params):
+            del position
+            return 800.0 + 0.0 * jnp.sum(params)
+
+        _, posterior_cov = stochastic_point_process_filter(
+            init_mode_params=jnp.zeros(n_params),
+            init_covariance_params=jnp.eye(n_params) * 0.1,
+            x=jnp.zeros(n_time),
+            spike_indicator=jnp.zeros(n_time),
+            dt=dt,
+            transition_matrix=jnp.eye(n_params),
+            latent_state_covariance=jnp.eye(n_params) * 1e-3,
+            log_receptive_field_model=large_log_rate_model,
+        )
+
+        assert jnp.all(jnp.isfinite(posterior_cov))
+        for time_ind in range(n_time):
+            np.testing.assert_allclose(
+                posterior_cov[time_ind],
+                posterior_cov[time_ind].T,
+                rtol=1e-10,
+                atol=1e-14,
+            )
+
 
 class TestSteepestDescentPointProcessFilter:
     """Tests for the steepest_descent_point_process_filter function."""

@@ -5,12 +5,22 @@ import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.kalman import psd_solve, stabilize_covariance
+
 
 def log_receptive_field_model(position: ArrayLike, params: ArrayLike) -> Array:
     params_arr = jnp.asarray(params)
     log_max_rate, place_field_center, scale = params_arr
-    result: Array = log_max_rate - (jnp.asarray(position) - place_field_center) ** 2 / (2 * scale**2)
+    result: Array = log_max_rate - (jnp.asarray(position) - place_field_center) ** 2 / (
+        2 * scale**2
+    )
     return result
+
+
+def _safe_expected_count(log_rate: Array, dt: float) -> Array:
+    """Convert log-rate to expected count with overflow protection."""
+    log_count = log_rate + jnp.log(jnp.asarray(dt, dtype=log_rate.dtype))
+    return jnp.exp(jnp.clip(log_count, -20.0, 20.0))
 
 
 # NOTE: most general form of the SSPPF accounts for multiple neurons which is not implemented here
@@ -95,8 +105,8 @@ def stochastic_point_process_filter(
         )
 
         # Compute the conditional intensity and innovation
-        conditional_intensity = (
-            jnp.exp(log_receptive_field_model(x_t, one_step_mean)) * dt
+        conditional_intensity = _safe_expected_count(
+            log_receptive_field_model(x_t, one_step_mean), dt
         )
         innovation = spike_indicator_t - conditional_intensity
 
@@ -107,12 +117,20 @@ def stochastic_point_process_filter(
         # sum over:
         # (one_step_grad.T * conditional_intensity @ one_step_grad) - innovation * one_step_hess
         # if multiple neurons
+        identity = jnp.eye(one_step_variance.shape[0], dtype=one_step_variance.dtype)
+        prior_precision = psd_solve(one_step_variance, identity)
         inverse_posterior_covariance = (
-            jnp.linalg.pinv(one_step_variance)
+            prior_precision
             + (one_step_grad.T * conditional_intensity @ one_step_grad)
             - innovation * one_step_hess
         )
-        posterior_covariance = jnp.linalg.pinv(inverse_posterior_covariance)
+        inverse_posterior_covariance = stabilize_covariance(
+            inverse_posterior_covariance, min_eigenvalue=1e-9
+        )
+        posterior_covariance = psd_solve(inverse_posterior_covariance, identity)
+        posterior_covariance = stabilize_covariance(
+            posterior_covariance, min_eigenvalue=1e-9
+        )
 
         # sum over one_step_grad.squeeze() * innovation if multiple neurons
         posterior_mode = one_step_mean + posterior_covariance @ (
@@ -126,7 +144,9 @@ def stochastic_point_process_filter(
 
     # Run the SSPPF
     return jax.lax.scan(
-        _update, (init_mode_params_arr, init_covariance_params_arr), (x_arr, spike_indicator_arr)
+        _update,
+        (init_mode_params_arr, init_covariance_params_arr),
+        (x_arr, spike_indicator_arr),
     )[1]
 
 
@@ -205,9 +225,7 @@ def steepest_descent_point_process_filter(
 
     grad_log_receptive_field_model = jax.grad(log_receptive_field_model, argnums=1)
 
-    def _update(
-        mode_prev: Array, args: tuple[Array, Array]
-    ) -> tuple[Array, Array]:
+    def _update(mode_prev: Array, args: tuple[Array, Array]) -> tuple[Array, Array]:
         """Steepest Descent Point Process Filter update step"""
         x_t, spike_indicator_t = args
         conditional_intensity = jnp.exp(log_receptive_field_model(x_t, mode_prev)) * dt
