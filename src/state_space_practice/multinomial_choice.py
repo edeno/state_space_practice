@@ -49,36 +49,37 @@ def _softmax_update_core(
     beta = inverse_temperature
     k_free = n_options - 1
 
-    # One-hot for chosen option (full K-dim)
+    # Precompute constants
     e_k = jnp.zeros(n_options).at[choice].set(1.0)
+    e_k_free = e_k[1:]
+    eye_k = jnp.eye(k_free)
+    zero_ref = jnp.zeros(1)
+    beta_sq = beta**2
 
     # Log-likelihood at the prior mean (for EM monitoring)
-    v_prior = jnp.concatenate([jnp.zeros(1), prior_mean])
+    v_prior = jnp.concatenate([zero_ref, prior_mean])
     log_lik = jax.nn.log_softmax(beta * v_prior)[choice]
 
     # Prior precision
-    eye_k = jnp.eye(k_free)
     prior_precision = psd_solve(prior_cov, eye_k)
 
     # Fixed Newton iterations (unrolled for JIT compatibility)
     x = prior_mean
     for _ in range(max_newton_steps):
-        v = jnp.concatenate([jnp.zeros(1), x])
-        p = jax.nn.softmax(beta * v)
-        p_free = p[1:]
+        v = jnp.concatenate([zero_ref, x])
+        p_free = jax.nn.softmax(beta * v)[1:]
 
-        gradient = beta * (e_k[1:] - p_free)
-        neg_hessian = beta**2 * (jnp.diag(p_free) - jnp.outer(p_free, p_free))
+        gradient = beta * (e_k_free - p_free)
+        neg_hessian = beta_sq * (jnp.diag(p_free) - jnp.outer(p_free, p_free))
 
         posterior_precision = prior_precision + neg_hessian
         rhs = gradient + prior_precision @ (prior_mean - x)
         x = x + psd_solve(posterior_precision, rhs)
 
     # Final posterior covariance at the mode
-    v = jnp.concatenate([jnp.zeros(1), x])
-    p = jax.nn.softmax(beta * v)
-    p_free = p[1:]
-    neg_hessian = beta**2 * (jnp.diag(p_free) - jnp.outer(p_free, p_free))
+    v = jnp.concatenate([zero_ref, x])
+    p_free = jax.nn.softmax(beta * v)[1:]
+    neg_hessian = beta_sq * (jnp.diag(p_free) - jnp.outer(p_free, p_free))
     posterior_precision = prior_precision + neg_hessian
     posterior_cov = symmetrize(psd_solve(posterior_precision, eye_k))
 

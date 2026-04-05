@@ -366,6 +366,62 @@ class TestSimulateChoiceData:
         np.testing.assert_array_equal(d1.true_values, d2.true_values)
 
 
+class TestMultinomialChoiceIntegration:
+    """End-to-end: simulate data, fit model, check recovery."""
+
+    def test_recovers_simulated_values(self):
+        """Smoothed values should track true values on simulated data."""
+        data = simulate_choice_data(
+            n_trials=300, n_options=4,
+            process_noise=0.05, inverse_temperature=2.0, seed=42,
+        )
+        model = MultinomialChoiceModel(n_options=4)
+        model.fit(np.array(data.choices), max_iter=15)
+
+        smoothed = np.array(model._smoother_result.smoothed_values)
+        true_vals = np.array(data.true_values)
+
+        # Check correlation per option (after warmup)
+        warmup = 50
+        for k in range(3):
+            corr = np.corrcoef(smoothed[warmup:, k], true_vals[warmup:, k])[0, 1]
+            assert corr > 0.5, (
+                f"Option {k+1} correlation {corr:.2f} < 0.5"
+            )
+
+    def test_compare_to_null_detects_learning(self):
+        """Model should beat null on simulated biased data."""
+        data = simulate_choice_data(
+            n_trials=200, n_options=3,
+            process_noise=0.05, inverse_temperature=3.0, seed=42,
+        )
+        model = MultinomialChoiceModel(n_options=3)
+        model.fit(np.array(data.choices), max_iter=10)
+        comparison = model.compare_to_null()
+        assert comparison["learning_detected"]
+
+    def test_uniform_random_no_learning(self):
+        """Uniform random choices should not detect learning."""
+        rng = np.random.default_rng(42)
+        choices = rng.integers(0, 4, size=200)
+        model = MultinomialChoiceModel(n_options=4)
+        model.fit(choices, max_iter=10)
+        comparison = model.compare_to_null()
+        # With uniform data, delta_bic should be small or negative
+        assert comparison["delta_bic"] < 10.0
+
+    def test_all_outputs_finite(self):
+        """No NaN/Inf in any output."""
+        data = simulate_choice_data(n_trials=200, n_options=3, seed=42)
+        model = MultinomialChoiceModel(n_options=3)
+        model.fit(np.array(data.choices), max_iter=5)
+
+        assert np.isfinite(model.log_likelihood_)
+        assert np.isfinite(model.bic())
+        assert np.all(np.isfinite(np.array(model._smoother_result.smoothed_values)))
+        assert np.all(np.isfinite(np.array(model.choice_probabilities())))
+
+
 class TestMultinomialChoiceModelPlotting:
     @pytest.fixture
     def fitted_model(self):
