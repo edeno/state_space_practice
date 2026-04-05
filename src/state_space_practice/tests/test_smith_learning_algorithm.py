@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 """Tests for the smith_learning_algorithm module.
 
 This module tests the Bayesian state-space model for learning dynamics,
@@ -17,9 +18,9 @@ from state_space_practice.smith_learning_algorithm import (
     approximate_gaussian,
     calculate_latent_state_percentiles,
     calculate_probability_confidence_limits,
+    compare_two_trials,
     compute_cross_covariance_matrix,
     compute_trial_comparison_matrix,
-    compare_two_trials,
     find_first_significant_trial,
     find_min_consecutive_successes,
     maximization_step,
@@ -398,7 +399,10 @@ class TestCalculateProbabilityConfidenceLimits:
         smoothed_learning_state_variance = jnp.ones(n_trials) * 0.5
 
         percentiles, prob_above_chance = calculate_probability_confidence_limits(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, prob_correct_by_chance=0.5
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            prob_correct_by_chance=0.5,
         )
 
         # Default percentiles are [5, 50, 95]
@@ -433,7 +437,10 @@ class TestCalculateProbabilityConfidenceLimits:
         smoothed_learning_state_variance = jnp.ones(n_trials) * 0.5
 
         percentiles, _ = calculate_probability_confidence_limits(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, prob_correct_by_chance=0.5
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            prob_correct_by_chance=0.5,
         )
 
         assert jnp.all(percentiles >= 0)
@@ -496,11 +503,15 @@ class TestFindMinConsecutiveSuccesses:
     def test_higher_prob_needs_longer_run(self) -> None:
         """Higher null probability should require longer run for significance."""
         result_low = find_min_consecutive_successes(
-            prob_correct_by_chance=0.3, critical_probability_threshold=0.05, sequence_length=100
+            prob_correct_by_chance=0.3,
+            critical_probability_threshold=0.05,
+            sequence_length=100,
         )
 
         result_high = find_min_consecutive_successes(
-            prob_correct_by_chance=0.7, critical_probability_threshold=0.05, sequence_length=100
+            prob_correct_by_chance=0.7,
+            critical_probability_threshold=0.05,
+            sequence_length=100,
         )
 
         # With higher probability, need longer run to be surprising
@@ -510,11 +521,15 @@ class TestFindMinConsecutiveSuccesses:
     def test_stricter_threshold_needs_longer_run(self) -> None:
         """Stricter threshold should require longer run."""
         result_loose = find_min_consecutive_successes(
-            prob_correct_by_chance=0.5, critical_probability_threshold=0.10, sequence_length=100
+            prob_correct_by_chance=0.5,
+            critical_probability_threshold=0.10,
+            sequence_length=100,
         )
 
         result_strict = find_min_consecutive_successes(
-            prob_correct_by_chance=0.5, critical_probability_threshold=0.01, sequence_length=100
+            prob_correct_by_chance=0.5,
+            critical_probability_threshold=0.01,
+            sequence_length=100,
         )
 
         if result_loose is not None and result_strict is not None:
@@ -524,12 +539,16 @@ class TestFindMinConsecutiveSuccesses:
         """Invalid probability should raise ValueError."""
         with pytest.raises(ValueError):
             find_min_consecutive_successes(
-                prob_correct_by_chance=1.5, critical_probability_threshold=0.05, sequence_length=100
+                prob_correct_by_chance=1.5,
+                critical_probability_threshold=0.05,
+                sequence_length=100,
             )
 
         with pytest.raises(ValueError):
             find_min_consecutive_successes(
-                prob_correct_by_chance=-0.1, critical_probability_threshold=0.05, sequence_length=100
+                prob_correct_by_chance=-0.1,
+                critical_probability_threshold=0.05,
+                sequence_length=100,
             )
 
 
@@ -955,8 +974,12 @@ class TestSummaryAndScoring:
         result = model.compare_to_null(outcomes)
         assert isinstance(result, dict)
         expected_keys = {
-            "model_ll", "null_ll", "model_bic", "null_bic",
-            "delta_bic", "learning_detected",
+            "model_ll",
+            "null_ll",
+            "model_bic",
+            "null_bic",
+            "delta_bic",
+            "learning_detected",
         }
         assert set(result.keys()) == expected_keys
         assert np.isfinite(result["model_ll"])
@@ -967,8 +990,10 @@ class TestSummaryAndScoring:
     def test_compare_to_null_detects_learning(self) -> None:
         """Learning model should beat null on clear learning data."""
         outcomes_np, _ = simulate_learning_data(
-            n_trials=50, seed=42,
-            prob_success_init=0.2, prob_success_final=0.9,
+            n_trials=50,
+            seed=42,
+            prob_success_init=0.2,
+            prob_success_final=0.9,
         )
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
@@ -977,8 +1002,9 @@ class TestSummaryAndScoring:
         except Exception as e:
             pytest.skip(f"fit() failed: {e}")
         result = model.compare_to_null(outcomes)
-        assert result["model_ll"] > result["null_ll"], \
-            "Learning model should have higher LL than null"
+        assert (
+            result["model_ll"] > result["null_ll"]
+        ), "Learning model should have higher LL than null"
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_summary_returns_string(self) -> None:
@@ -1173,7 +1199,9 @@ class TestCalculateLatentStatePercentiles:
         smoothed_learning_state_mode = jnp.zeros(n_trials)
         smoothed_learning_state_variance = jnp.ones(n_trials) * 0.5
 
-        result = calculate_latent_state_percentiles(key, smoothed_learning_state_mode, smoothed_learning_state_variance)
+        result = calculate_latent_state_percentiles(
+            key, smoothed_learning_state_mode, smoothed_learning_state_variance
+        )
 
         # Default percentiles [5, 50, 95]
         assert result.shape == (3, n_trials)
@@ -1188,7 +1216,10 @@ class TestCalculateLatentStatePercentiles:
         custom_percentiles = jnp.array([10.0, 25.0, 75.0, 90.0])
 
         result = calculate_latent_state_percentiles(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, percentiles=custom_percentiles
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            percentiles=custom_percentiles,
         )
 
         assert result.shape == (4, n_trials)
@@ -1201,7 +1232,9 @@ class TestCalculateLatentStatePercentiles:
         smoothed_learning_state_mode = jax.random.normal(key, (n_trials,))
         smoothed_learning_state_variance = jnp.ones(n_trials) * 0.5
 
-        result = calculate_latent_state_percentiles(key, smoothed_learning_state_mode, smoothed_learning_state_variance)
+        result = calculate_latent_state_percentiles(
+            key, smoothed_learning_state_mode, smoothed_learning_state_variance
+        )
 
         # p5 <= p50 <= p95
         assert jnp.all(result[0] <= result[1])
@@ -1216,11 +1249,16 @@ class TestCalculateLatentStatePercentiles:
         smoothed_learning_state_variance = jnp.ones(n_trials) * 0.01  # Small variance
 
         result = calculate_latent_state_percentiles(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, n_samples=10000
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            n_samples=10000,
         )
 
         # Median (index 1) should be close to mode
-        np.testing.assert_allclose(result[1], smoothed_learning_state_mode, rtol=0.1, atol=0.1)
+        np.testing.assert_allclose(
+            result[1], smoothed_learning_state_mode, rtol=0.1, atol=0.1
+        )
 
 
 class TestComputeCrossCovarianceMatrix:
@@ -1232,7 +1270,9 @@ class TestComputeCrossCovarianceMatrix:
         smoothed_learning_state_variance = jnp.ones(n_trials) * 0.5
         smoother_gain = jnp.ones(n_trials - 1) * 0.8
 
-        result = compute_cross_covariance_matrix(smoothed_learning_state_variance, smoother_gain)
+        result = compute_cross_covariance_matrix(
+            smoothed_learning_state_variance, smoother_gain
+        )
 
         assert result.shape == (n_trials, n_trials)
 
@@ -1242,9 +1282,13 @@ class TestComputeCrossCovarianceMatrix:
         smoothed_learning_state_variance = jnp.linspace(0.1, 1.0, n_trials)
         smoother_gain = jnp.ones(n_trials - 1) * 0.8
 
-        result = compute_cross_covariance_matrix(smoothed_learning_state_variance, smoother_gain)
+        result = compute_cross_covariance_matrix(
+            smoothed_learning_state_variance, smoother_gain
+        )
 
-        np.testing.assert_allclose(jnp.diag(result), smoothed_learning_state_variance, rtol=1e-5)
+        np.testing.assert_allclose(
+            jnp.diag(result), smoothed_learning_state_variance, rtol=1e-5
+        )
 
     def test_symmetric(self) -> None:
         """Cross-covariance matrix should be symmetric."""
@@ -1252,7 +1296,9 @@ class TestComputeCrossCovarianceMatrix:
         smoothed_learning_state_variance = jnp.linspace(0.1, 1.0, n_trials)
         smoother_gain = jnp.linspace(0.6, 0.9, n_trials - 1)
 
-        result = compute_cross_covariance_matrix(smoothed_learning_state_variance, smoother_gain)
+        result = compute_cross_covariance_matrix(
+            smoothed_learning_state_variance, smoother_gain
+        )
 
         np.testing.assert_allclose(result, result.T, rtol=1e-5)
 
@@ -1262,7 +1308,9 @@ class TestComputeCrossCovarianceMatrix:
         smoothed_learning_state_variance = jnp.linspace(0.1, 1.0, n_trials)
         smoother_gain = jnp.linspace(0.6, 0.9, n_trials - 1)
 
-        result = compute_cross_covariance_matrix(smoothed_learning_state_variance, smoother_gain)
+        result = compute_cross_covariance_matrix(
+            smoothed_learning_state_variance, smoother_gain
+        )
         eigenvalues = jnp.linalg.eigvalsh(result)
 
         # All eigenvalues should be non-negative (within tolerance)
@@ -1274,7 +1322,9 @@ class TestComputeCrossCovarianceMatrix:
         smoothed_learning_state_variance = jnp.ones(n_trials) * 0.5
         smoother_gain = jnp.ones(n_trials - 1) * 0.7  # < 1
 
-        result = compute_cross_covariance_matrix(smoothed_learning_state_variance, smoother_gain)
+        result = compute_cross_covariance_matrix(
+            smoothed_learning_state_variance, smoother_gain
+        )
 
         # Check first row: Cov(0, j) should decrease with j
         first_row = result[0, :]
@@ -1287,7 +1337,9 @@ class TestComputeCrossCovarianceMatrix:
         smoothed_learning_state_variance = jnp.linspace(0.1, 1.0, n_trials)
         smoother_gain = jnp.ones(n_trials - 1)  # All 1.0
 
-        result = compute_cross_covariance_matrix(smoothed_learning_state_variance, smoother_gain)
+        result = compute_cross_covariance_matrix(
+            smoothed_learning_state_variance, smoother_gain
+        )
 
         # Cov(i, j) = P_j for i <= j when all gains are 1
         for i in range(n_trials):
@@ -1308,40 +1360,67 @@ class TestComputeTrialComparisonMatrix:
         smoothed_learning_state_mode = jnp.linspace(-1.0, 2.0, n_trials)
         smoothed_learning_state_variance = jnp.ones(n_trials) * 0.3
         smoother_gain = jnp.ones(n_trials - 1) * 0.8
-        return smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain
+        return (
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+        )
 
     def test_output_shape(self, fitted_model_data) -> None:
         """Output should be square matrix of size n_trials."""
-        smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain = fitted_model_data
+        (
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+        ) = fitted_model_data
         n_trials = len(smoothed_learning_state_mode)
         key = jax.random.PRNGKey(0)
 
         result = compute_trial_comparison_matrix(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain, n_samples=1000
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+            n_samples=1000,
         )
 
         assert result.shape == (n_trials, n_trials)
 
     def test_diagonal_is_half(self, fitted_model_data) -> None:
         """Diagonal entries should be 0.5 (P(x_i > x_i) = 0.5)."""
-        smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain = fitted_model_data
-        n_trials = len(smoothed_learning_state_mode)
+        (
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+        ) = fitted_model_data
         key = jax.random.PRNGKey(0)
 
         result = compute_trial_comparison_matrix(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain, n_samples=1000
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+            n_samples=1000,
         )
 
         np.testing.assert_allclose(jnp.diag(result), 0.5, rtol=1e-5)
 
     def test_lower_triangle_is_nan(self, fitted_model_data) -> None:
         """Lower triangle should be NaN."""
-        smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain = fitted_model_data
+        (
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+        ) = fitted_model_data
         n_trials = len(smoothed_learning_state_mode)
         key = jax.random.PRNGKey(0)
 
         result = compute_trial_comparison_matrix(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain, n_samples=1000
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+            n_samples=1000,
         )
 
         # Check lower triangle (excluding diagonal)
@@ -1350,12 +1429,20 @@ class TestComputeTrialComparisonMatrix:
 
     def test_upper_triangle_in_bounds(self, fitted_model_data) -> None:
         """Upper triangle values should be probabilities in [0, 1]."""
-        smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain = fitted_model_data
+        (
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+        ) = fitted_model_data
         n_trials = len(smoothed_learning_state_mode)
         key = jax.random.PRNGKey(0)
 
         result = compute_trial_comparison_matrix(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain, n_samples=1000
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+            n_samples=1000,
         )
 
         # Check upper triangle
@@ -1375,7 +1462,11 @@ class TestComputeTrialComparisonMatrix:
         key = jax.random.PRNGKey(42)
 
         result = compute_trial_comparison_matrix(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain, n_samples=5000
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+            n_samples=5000,
         )
 
         # P(x_0 > x_19) should be very low since x_19 >> x_0
@@ -1397,7 +1488,11 @@ class TestComputeTrialComparisonMatrix:
         key = jax.random.PRNGKey(0)
 
         result = compute_trial_comparison_matrix(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain, n_samples=5000
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+            n_samples=5000,
         )
 
         # Upper triangle should be near 0.5
@@ -1408,14 +1503,26 @@ class TestComputeTrialComparisonMatrix:
 
     def test_reproducibility_with_same_key(self, fitted_model_data) -> None:
         """Same key should produce same results."""
-        smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain = fitted_model_data
+        (
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+        ) = fitted_model_data
         key = jax.random.PRNGKey(123)
 
         result1 = compute_trial_comparison_matrix(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain, n_samples=1000
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+            n_samples=1000,
         )
         result2 = compute_trial_comparison_matrix(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain, n_samples=1000
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+            n_samples=1000,
         )
 
         # Upper triangle should match (lower is NaN)
@@ -1435,44 +1542,76 @@ class TestCompareTwoTrials:
         smoothed_learning_state_mode = jnp.linspace(-1.0, 2.0, n_trials)
         smoothed_learning_state_variance = jnp.ones(n_trials) * 0.3
         smoother_gain = jnp.ones(n_trials - 1) * 0.8
-        return smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain
+        return (
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+        )
 
     def test_same_trial_returns_half(self, model_data) -> None:
         """Comparing trial to itself should return 0.5."""
-        smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain = model_data
+        (
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+        ) = model_data
         key = jax.random.PRNGKey(0)
 
         result = compare_two_trials(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain,
-            trial1=5, trial2=5
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+            trial1=5,
+            trial2=5,
         )
 
         assert result == 0.5
 
     def test_output_is_probability(self, model_data) -> None:
         """Output should be a probability in [0, 1]."""
-        smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain = model_data
+        (
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+        ) = model_data
         key = jax.random.PRNGKey(0)
 
         result = compare_two_trials(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain,
-            trial1=0, trial2=15
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+            trial1=0,
+            trial2=15,
         )
 
         assert 0.0 <= result <= 1.0
 
     def test_symmetric_complement(self, model_data) -> None:
         """P(trial1 > trial2) + P(trial2 > trial1) should equal 1."""
-        smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain = model_data
+        (
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+        ) = model_data
         key = jax.random.PRNGKey(0)
 
         p_12 = compare_two_trials(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain,
-            trial1=3, trial2=12
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+            trial1=3,
+            trial2=12,
         )
         p_21 = compare_two_trials(
-            key, smoothed_learning_state_mode, smoothed_learning_state_variance, smoother_gain,
-            trial1=12, trial2=3
+            key,
+            smoothed_learning_state_mode,
+            smoothed_learning_state_variance,
+            smoother_gain,
+            trial1=12,
+            trial2=3,
         )
 
         np.testing.assert_allclose(p_12 + p_21, 1.0, rtol=0.05)
@@ -1548,13 +1687,14 @@ class TestSmithLearningModelTrialComparison:
     def fitted_model(self):
         """Create and fit a model for testing."""
         # Learning data with clear improvement
-        responses = jnp.array([0, 1, 0, 0, 1, 0, 1, 1, 0, 1,
-                               1, 1, 1, 0, 1, 1, 1, 1, 1, 1])
+        responses = jnp.array(
+            [0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1]
+        )
 
         model = SmithLearningModel(
             sigma_epsilon=0.3,
             prob_correct_by_chance=0.5,
-            initial_state_method='set_initial_direct_from_second_trial'
+            initial_state_method="set_initial_direct_from_second_trial",
         )
         model.fit(responses, max_iter=50)
         return model

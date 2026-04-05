@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 """Shared fixtures and Hypothesis strategies for state space model tests."""
 
 from typing import Tuple
@@ -355,7 +356,9 @@ def switching_kalman_model_params(
     if n_obs_dim is None:
         n_obs_dim = draw(st.integers(min_value=1, max_value=max_obs_dim))
     if n_discrete_states is None:
-        n_discrete_states = draw(st.integers(min_value=1, max_value=max_discrete_states))
+        n_discrete_states = draw(
+            st.integers(min_value=1, max_value=max_discrete_states)
+        )
 
     # Initial continuous state parameters per discrete state
     init_means = []
@@ -378,7 +381,9 @@ def switching_kalman_model_params(
         init_covs.append(draw(positive_definite_matrices(n_cont_states)))
 
     init_mean = np.stack(init_means, axis=-1)  # (n_cont_states, n_discrete_states)
-    init_cov = np.stack(init_covs, axis=-1)  # (n_cont_states, n_cont_states, n_discrete_states)
+    init_cov = np.stack(
+        init_covs, axis=-1
+    )  # (n_cont_states, n_cont_states, n_discrete_states)
 
     # Initial discrete state probability
     init_prob = draw(probability_vectors(n_discrete_states))

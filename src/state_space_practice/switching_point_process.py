@@ -97,6 +97,7 @@ from state_space_practice.point_process_kalman import _point_process_laplace_upd
 from state_space_practice.switching_kalman import (
     _divide_safe,
     _scale_likelihood,
+    _stabilize_probability_vector,
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture_per_discrete_state,
     switching_kalman_maximization_step,
@@ -191,7 +192,9 @@ def _is_per_state_spike_params(spike_params: SpikeObsParams) -> bool:
     )
 
 
-def _select_spike_params(spike_params: SpikeObsParams, state_index: Array) -> SpikeObsParams:
+def _select_spike_params(
+    spike_params: SpikeObsParams, state_index: Array
+) -> SpikeObsParams:
     """Select per-state spike params if a discrete-state axis is present.
 
     For shared parameters (baseline 1D, weights 2D), returns the params unchanged.
@@ -338,6 +341,7 @@ def point_process_kalman_update(
             "point_process_kalman_update expects single-state spike_params with "
             "baseline shape (n_neurons,) and weights shape (n_neurons, n_latent)."
         )
+
     # Create a closure-free wrapper for the shared helper
     # This binds spike_params so _point_process_laplace_update sees Callable[[Array], Array]
     def _log_intensity_with_params(state: Array) -> Array:
@@ -346,11 +350,13 @@ def point_process_kalman_update(
     # Wrap grad/hess functions if provided
     _grad_func = None
     if grad_log_intensity_func is not None:
+
         def _grad_func(state: Array) -> Array:
             return grad_log_intensity_func(state, spike_params)
 
     _hess_func = None
     if hess_log_intensity_func is not None:
+
         def _hess_func(state: Array) -> Array:
             return hess_log_intensity_func(state, spike_params)
 
@@ -593,6 +599,8 @@ def _first_timestep_point_process_update(
         Log p(y₁) contribution (scalar array)
     """
     n_discrete_states = init_state_cond_mean.shape[-1]
+
+    init_discrete_state_prob = _stabilize_probability_vector(init_discrete_state_prob)
 
     # Apply point-process update directly to the prior (no dynamics prediction)
     # vmap over discrete states j with per-state spike params if provided
@@ -897,7 +905,9 @@ def _single_neuron_glm_step(
     delta = jnp.linalg.solve(hessian, gradient)
 
     # Current loss for backtracking line search (NLL + L2 penalty)
-    current_loss = jnp.sum(time_weights * (mu - y_n * eta)) + 0.5 * weight_l2 * jnp.sum(weights**2)
+    current_loss = jnp.sum(time_weights * (mu - y_n * eta)) + 0.5 * weight_l2 * jnp.sum(
+        weights**2
+    )
 
     # Define loss function for line search
     def loss_fn(p):
@@ -1279,20 +1289,38 @@ def update_spike_glm_params(
         # lax.scan which causes slow JIT compilation.
         for _ in range(max_iter):
             if baseline_prior is not None:
+
                 def update_neuron(b, w, y_n, bp):
                     return _single_neuron_glm_step_second_order(
-                        b, w, y_n, smoother_mean, smoother_cov, dt,
-                        time_weights, weight_l2, bp, baseline_prior_l2,
+                        b,
+                        w,
+                        y_n,
+                        smoother_mean,
+                        smoother_cov,
+                        dt,
+                        time_weights,
+                        weight_l2,
+                        bp,
+                        baseline_prior_l2,
                     )
 
-                baselines, weights = jax.vmap(
-                    update_neuron, in_axes=(0, 0, 1, 0)
-                )(baselines, weights, spikes, baseline_prior)
+                baselines, weights = jax.vmap(update_neuron, in_axes=(0, 0, 1, 0))(
+                    baselines, weights, spikes, baseline_prior
+                )
             else:
+
                 def update_neuron_no_prior(b, w, y_n):
                     return _single_neuron_glm_step_second_order(
-                        b, w, y_n, smoother_mean, smoother_cov, dt,
-                        time_weights, weight_l2, None, baseline_prior_l2,
+                        b,
+                        w,
+                        y_n,
+                        smoother_mean,
+                        smoother_cov,
+                        dt,
+                        time_weights,
+                        weight_l2,
+                        None,
+                        baseline_prior_l2,
                     )
 
                 baselines, weights = jax.vmap(
@@ -1312,9 +1340,9 @@ def update_spike_glm_params(
                 )
                 return new_b, new_w
 
-            new_baselines, new_weights = jax.vmap(
-                update_neuron, in_axes=(0, 0, 1)
-            )(baselines, weights, spikes)
+            new_baselines, new_weights = jax.vmap(update_neuron, in_axes=(0, 0, 1))(
+                baselines, weights, spikes
+            )
 
             return (new_baselines, new_weights), None
 
@@ -1455,9 +1483,7 @@ def switching_point_process_filter(
         # Promote 1D single-neuron input to 2D
         spikes = spikes[:, None]
     elif spikes.ndim != 2:
-        raise ValueError(
-            f"spikes must be 1D or 2D array, got shape {spikes.shape}"
-        )
+        raise ValueError(f"spikes must be 1D or 2D array, got shape {spikes.shape}")
 
     def _step(
         carry: tuple[Array, Array, Array, Array],
@@ -1632,7 +1658,7 @@ def switching_point_process_filter(
         state_cond_filter_cov,
         filter_discrete_state_prob,
         pair_cond_filter_mean[-1],  # Last timestep pair-conditional for smoother
-        pair_cond_filter_cov[-1],   # Last timestep pair-conditional cov for GPB2
+        pair_cond_filter_cov[-1],  # Last timestep pair-conditional cov for GPB2
         marginal_log_likelihood,
     )
 
@@ -1888,11 +1914,15 @@ class SwitchingSpikeOscillatorModel:
         # Newton iteration parameters for point-process update
         self.max_newton_iter = max_newton_iter
         if spike_baseline_prior_l2 < 0:
-            raise ValueError(f"spike_baseline_prior_l2 must be non-negative, got {spike_baseline_prior_l2}")
+            raise ValueError(
+                f"spike_baseline_prior_l2 must be non-negative, got {spike_baseline_prior_l2}"
+            )
         self.spike_baseline_prior_l2 = spike_baseline_prior_l2
         self.line_search_beta = line_search_beta
         if smoother_type not in ("gpb1", "gpb2"):
-            raise ValueError(f"smoother_type must be 'gpb1' or 'gpb2', got '{smoother_type}'")
+            raise ValueError(
+                f"smoother_type must be 'gpb1' or 'gpb2', got '{smoother_type}'"
+            )
         self.smoother_type = smoother_type
 
         # Placeholders for model parameters (initialized by _initialize_parameters)
@@ -2120,9 +2150,12 @@ class SwitchingSpikeOscillatorModel:
             baseline = jnp.zeros((self.n_neurons, self.n_discrete_states))
 
             # Weights: small random values, per discrete state (axis last)
-            weights = jax.random.normal(
-                key, (self.n_neurons, self.n_latent, self.n_discrete_states)
-            ) * 0.1
+            weights = (
+                jax.random.normal(
+                    key, (self.n_neurons, self.n_latent, self.n_discrete_states)
+                )
+                * 0.1
+            )
         else:
             # Baseline: zero (exp(0) = 1 Hz baseline firing rate)
             baseline = jnp.zeros(self.n_neurons)
@@ -2287,21 +2320,32 @@ class SwitchingSpikeOscillatorModel:
 
         if self.smoother_type == "gpb2":
             (
-                _, _, smoother_discrete_state_prob,
-                smoother_joint_discrete_state_prob, _,
-                state_cond_smoother_means, state_cond_smoother_covs,
-                pair_cond_smoother_cross_covs, pair_cond_smoother_means,
-                pair_cond_smoother_covs, next_pair_cond_smoother_means,
+                _,
+                _,
+                smoother_discrete_state_prob,
+                smoother_joint_discrete_state_prob,
+                _,
+                state_cond_smoother_means,
+                state_cond_smoother_covs,
+                pair_cond_smoother_cross_covs,
+                pair_cond_smoother_means,
+                pair_cond_smoother_covs,
+                next_pair_cond_smoother_means,
             ) = switching_kalman_smoother_gpb2(
                 **smoother_args,
                 last_filter_conditional_cont_cov=last_pair_cond_filter_cov,
             )
         else:
             (
-                _, _, smoother_discrete_state_prob,
-                smoother_joint_discrete_state_prob, _,
-                state_cond_smoother_means, state_cond_smoother_covs,
-                pair_cond_smoother_cross_covs, pair_cond_smoother_means,
+                _,
+                _,
+                smoother_discrete_state_prob,
+                smoother_joint_discrete_state_prob,
+                _,
+                state_cond_smoother_means,
+                state_cond_smoother_covs,
+                pair_cond_smoother_cross_covs,
+                pair_cond_smoother_means,
             ) = switching_kalman_smoother(**smoother_args)
             pair_cond_smoother_covs = None
             next_pair_cond_smoother_means = None

@@ -100,8 +100,6 @@ def simulate(A, B0, Q, R, Z, X_0, S_0, T, s=None):
 
     n = R.shape[0]  # # of electrodes
     x_dim = A.shape[0]  # # of oscillators*2 == k*2 == continuous hidden state dimension
-    M = A.shape[-1]  # # of switching states
-
     blnSimS = s is None
     if blnSimS:
         s = np.zeros(T, dtype=int)

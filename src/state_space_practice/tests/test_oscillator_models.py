@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 """Tests for the oscillator_models module.
 
 This module tests the switching oscillator model classes (COM, CNM, DIM)
@@ -59,8 +60,12 @@ def correlated_noise_params():
         "auto_regressive_coef": jnp.array([0.95, 0.95]),
         "process_variance": jnp.ones((n_oscillators, n_discrete_states)) * 0.1,
         "measurement_variance": 0.05,
-        "phase_difference": jnp.zeros((n_oscillators, n_oscillators, n_discrete_states)),
-        "coupling_strength": jnp.zeros((n_oscillators, n_oscillators, n_discrete_states)),
+        "phase_difference": jnp.zeros(
+            (n_oscillators, n_oscillators, n_discrete_states)
+        ),
+        "coupling_strength": jnp.zeros(
+            (n_oscillators, n_oscillators, n_discrete_states)
+        ),
     }
 
 
@@ -79,8 +84,12 @@ def directed_influence_params():
         "auto_regressive_coef": jnp.array([0.95, 0.95]),
         "process_variance": jnp.array([0.1, 0.1]),
         "measurement_variance": 0.05,
-        "phase_difference": jnp.zeros((n_oscillators, n_oscillators, n_discrete_states)),
-        "coupling_strength": jnp.zeros((n_oscillators, n_oscillators, n_discrete_states)),
+        "phase_difference": jnp.zeros(
+            (n_oscillators, n_oscillators, n_discrete_states)
+        ),
+        "coupling_strength": jnp.zeros(
+            (n_oscillators, n_oscillators, n_discrete_states)
+        ),
     }
 
 
@@ -148,20 +157,26 @@ class TestCommonOscillatorModel:
         assert model.measurement_matrix.shape == (n_src, n_cont, n_disc)
         assert model.measurement_cov.shape == (n_src, n_src, n_disc)
 
-    def test_discrete_transition_rows_sum_to_one(self, common_oscillator_params) -> None:
+    def test_discrete_transition_rows_sum_to_one(
+        self, common_oscillator_params
+    ) -> None:
         """Discrete transition matrix rows should sum to 1."""
         model = CommonOscillatorModel(**common_oscillator_params)
         model._initialize_parameters(jax.random.PRNGKey(0))
 
         row_sums = jnp.sum(model.discrete_transition_matrix, axis=1)
-        np.testing.assert_allclose(row_sums, jnp.ones(model.n_discrete_states), rtol=1e-6)
+        np.testing.assert_allclose(
+            row_sums, jnp.ones(model.n_discrete_states), rtol=1e-6
+        )
 
     def test_discrete_state_prob_sums_to_one(self, common_oscillator_params) -> None:
         """Initial discrete state probabilities should sum to 1."""
         model = CommonOscillatorModel(**common_oscillator_params)
         model._initialize_parameters(jax.random.PRNGKey(0))
 
-        np.testing.assert_allclose(jnp.sum(model.init_discrete_state_prob), 1.0, rtol=1e-6)
+        np.testing.assert_allclose(
+            jnp.sum(model.init_discrete_state_prob), 1.0, rtol=1e-6
+        )
 
     def test_constant_A_across_states(self, common_oscillator_params) -> None:
         """For COM, continuous transition matrix should be constant across states."""
@@ -188,7 +203,9 @@ class TestCommonOscillatorModel:
                 rtol=1e-10,
             )
 
-    def test_measurement_matrix_varies_across_states(self, common_oscillator_params) -> None:
+    def test_measurement_matrix_varies_across_states(
+        self, common_oscillator_params
+    ) -> None:
         """For COM, measurement matrix should vary across states (randomly initialized)."""
         model = CommonOscillatorModel(**common_oscillator_params)
         model._initialize_parameters(jax.random.PRNGKey(0))
@@ -218,7 +235,9 @@ class TestCommonOscillatorModel:
             model.n_discrete_states,
         )
 
-    def test_get_oscillator_influence_non_negative(self, common_oscillator_params) -> None:
+    def test_get_oscillator_influence_non_negative(
+        self, common_oscillator_params
+    ) -> None:
         """Oscillator influence should be non-negative (it's an L2 norm)."""
         model = CommonOscillatorModel(**common_oscillator_params)
         model._initialize_parameters(jax.random.PRNGKey(0))
@@ -334,7 +353,9 @@ class TestCorrelatedNoiseModel:
             assert H[i, 2 * i] == 1.0
             assert H[i, 2 * i + 1] == 0.0
 
-    def test_invalid_process_variance_shape_raises(self, correlated_noise_params) -> None:
+    def test_invalid_process_variance_shape_raises(
+        self, correlated_noise_params
+    ) -> None:
         """Invalid process_variance shape should raise."""
         params = correlated_noise_params.copy()
         params["process_variance"] = jnp.array([0.1, 0.1])  # Wrong shape
@@ -585,7 +606,9 @@ class TestSingleDiscreteState:
 
         assert model.discrete_transition_matrix.shape == (1, 1)
         assert model.init_discrete_state_prob.shape == (1,)
-        np.testing.assert_allclose(model.discrete_transition_matrix[0, 0], 1.0, rtol=1e-6)
+        np.testing.assert_allclose(
+            model.discrete_transition_matrix[0, 0], 1.0, rtol=1e-6
+        )
         np.testing.assert_allclose(model.init_discrete_state_prob[0], 1.0, rtol=1e-6)
 
     def test_single_state_fit(self, synthetic_observations) -> None:
@@ -652,9 +675,7 @@ class TestEdgeCases:
             with pytest.raises(ValueError):
                 model.fit(synthetic_observations, jax.random.PRNGKey(0), max_iter=2)
 
-    def test_dim_observations_shape_validation(
-        self, directed_influence_params
-    ) -> None:
+    def test_dim_observations_shape_validation(self, directed_influence_params) -> None:
         """DIM should validate observation shape matches n_sources."""
         model = DirectedInfluenceModel(**directed_influence_params)
 
@@ -918,9 +939,7 @@ class TestDirectedInfluenceModelProperties:
         st.integers(min_value=1, max_value=3),
     )
     @settings(max_examples=15, deadline=None)
-    def test_process_cov_constant_across_states(
-        self, n_osc: int, n_disc: int
-    ) -> None:
+    def test_process_cov_constant_across_states(self, n_osc: int, n_disc: int) -> None:
         """For DIM, process covariance should be constant across states."""
         model = DirectedInfluenceModel(
             n_oscillators=n_osc,
@@ -1200,12 +1219,16 @@ class TestReparameterizedMstep:
                     block = A_j[2 * i : 2 * i + 2, 2 * k : 2 * k + 2]
                     # Check rotation structure
                     np.testing.assert_allclose(
-                        block[0, 0], block[1, 1], atol=1e-6,
-                        err_msg=f"Block ({i},{k}) in state {j}: diagonal elements not equal"
+                        block[0, 0],
+                        block[1, 1],
+                        atol=1e-6,
+                        err_msg=f"Block ({i},{k}) in state {j}: diagonal elements not equal",
                     )
                     np.testing.assert_allclose(
-                        block[0, 1], -block[1, 0], atol=1e-6,
-                        err_msg=f"Block ({i},{k}) in state {j}: off-diagonal elements not antisymmetric"
+                        block[0, 1],
+                        -block[1, 0],
+                        atol=1e-6,
+                        err_msg=f"Block ({i},{k}) in state {j}: off-diagonal elements not antisymmetric",
                     )
 
     def test_standard_mstep_still_works(self, dim_synthetic_observations) -> None:

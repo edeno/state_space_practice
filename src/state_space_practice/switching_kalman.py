@@ -133,6 +133,7 @@ def _divide_safe(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
 # Minimum probability threshold for numerical stability
 _LOG_PROB_FLOOR = 1e-10
 _LOG_FLOOR_VALUE = -23.0  # approximately log(1e-10)
+_DISCRETE_PROB_STABILITY_FLOOR = 1e-12
 
 
 def _safe_log(x: jax.Array) -> jax.Array:
@@ -154,6 +155,13 @@ def _safe_log(x: jax.Array) -> jax.Array:
         log(x) where x > _LOG_PROB_FLOOR, otherwise _LOG_FLOOR_VALUE.
     """
     return jnp.where(x > _LOG_PROB_FLOOR, jnp.log(x), _LOG_FLOOR_VALUE)
+
+
+def _stabilize_probability_vector(probabilities: jax.Array) -> jax.Array:
+    """Prevent exact-zero probability lockout from numerical underflow."""
+    floor = jnp.asarray(_DISCRETE_PROB_STABILITY_FLOOR, dtype=probabilities.dtype)
+    stabilized = jnp.maximum(probabilities, floor)
+    return stabilized / jnp.sum(stabilized)
 
 
 def _update_discrete_state_probabilities(
@@ -182,6 +190,8 @@ def _update_discrete_state_probabilities(
     """
     # joint discrete state prob between time steps
     # M_{t-1,t | t}(i, j) = P(S_{t-1}=i, S_t=j | y_{1:t})
+    prev_filter_discrete_prob = _stabilize_probability_vector(prev_filter_discrete_prob)
+
     joint_discrete_state_prob = (
         pair_cond_marginal_likelihood_scaled  # L(i, j)
         * discrete_transition_matrix  # Z(i, j)
@@ -344,6 +354,8 @@ def _first_timestep_kalman_update(
         measurement_matrix,
         measurement_cov,
     )
+
+    init_discrete_state_prob = _stabilize_probability_vector(init_discrete_state_prob)
 
     # Update discrete state probabilities using observation likelihood
     # At t=1, there's no transition from S₀, so we just use:

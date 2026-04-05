@@ -350,7 +350,6 @@ class TestSteepestDescentPointProcessFilter:
     def test_parameter_drift_with_spikes(self) -> None:
         """Parameters should drift toward spike locations."""
         n_time = 200
-        n_params = 3
         dt = 0.02
 
         # Start with place field at 150

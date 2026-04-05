@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 """
 Tests for the switching Kalman filter and smoother implementations.
 
@@ -207,7 +208,7 @@ def test_update_discrete_state_probabilities() -> None:
 
 
 def test_update_discrete_state_probabilities_zero_sum_check() -> None:
-    """Tests _update_discrete_state_probabilities handles zero predictive sum."""
+    """Tests underflowed discrete priors do not zero-lock the forward pass."""
     likelihood = jnp.array([[0.0, 0.1], [0.2, 0.8]])
     transitions = jnp.array([[1.0, 0.0], [0.0, 1.0]])
     prev_probs = jnp.array([1.0, 0.0])
@@ -218,9 +219,9 @@ def test_update_discrete_state_probabilities_zero_sum_check() -> None:
 
     assert not jnp.any(jnp.isnan(m_t)), "m_t contains NaN!"
     assert not jnp.any(jnp.isnan(w)), "w contains NaN!"
-    np.testing.assert_allclose(m_t, jnp.array([0.0, 0.0]), atol=1e-6)
-    np.testing.assert_allclose(w, jnp.zeros_like(w), atol=1e-6)
-    np.testing.assert_allclose(ll_sum, 0.0, atol=1e-6)
+    np.testing.assert_allclose(m_t, jnp.array([0.0, 1.0]), atol=1e-6)
+    np.testing.assert_allclose(w, jnp.array([[0.0, 0.0], [0.0, 1.0]]), atol=1e-6)
+    assert ll_sum > 0.0
 
 
 def test_update_smoother_discrete_probabilities() -> None:

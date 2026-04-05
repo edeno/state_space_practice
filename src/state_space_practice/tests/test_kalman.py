@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 from typing import Tuple
 
 import jax
