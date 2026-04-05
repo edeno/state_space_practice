@@ -405,6 +405,18 @@ class MultinomialChoiceModel:
     def is_fitted(self) -> bool:
         return self._smoother_result is not None
 
+    @property
+    def smoothed_values(self) -> Array:
+        """Smoothed option values, shape (n_trials, K-1)."""
+        self._check_fitted("smoothed_values")
+        return self._smoother_result.smoothed_values
+
+    @property
+    def smoothed_covariances(self) -> Array:
+        """Smoothed covariances, shape (n_trials, K-1, K-1)."""
+        self._check_fitted("smoothed_covariances")
+        return self._smoother_result.smoothed_covariances
+
     def _check_fitted(self, method: str) -> None:
         if not self.is_fitted:
             raise RuntimeError(
@@ -475,10 +487,10 @@ class MultinomialChoiceModel:
             log_likelihoods.append(ll)
 
             if verbose:
-                print(
-                    f"  EM iter {iteration + 1}: LL={ll:.2f}, "
-                    f"beta={self.inverse_temperature:.3f}, "
-                    f"Q={self.process_noise:.6f}"
+                logger.info(
+                    "EM iter %d: LL=%.2f, beta=%.3f, Q=%.6f",
+                    iteration + 1, ll,
+                    self.inverse_temperature, self.process_noise,
                 )
 
             # Check convergence
@@ -490,7 +502,7 @@ class MultinomialChoiceModel:
                     rel_change = abs(ll - prev_ll)
                 if rel_change < tolerance:
                     if verbose:
-                        print(f"  Converged at iteration {iteration + 1}")
+                        logger.info("Converged at iteration %d", iteration + 1)
                     break
 
             # M-step for process noise Q
@@ -609,7 +621,7 @@ class MultinomialChoiceModel:
             + self.n_free_params * math.log(self._n_trials)
         )
 
-    def compare_to_null(self, choices: Optional[ArrayLike] = None) -> dict:
+    def compare_to_null(self) -> dict:
         """Compare fitted model to a null (uniform 1/K) model.
 
         Returns
@@ -634,9 +646,10 @@ class MultinomialChoiceModel:
             "learning_detected": delta_bic > 2.0,
         }
 
-    def summary(self, choices: Optional[ArrayLike] = None) -> str:
-        """Text summary of fitted model."""
+    def summary(self) -> str:
+        """Text summary of fitted model including null comparison."""
         self._check_fitted("summary")
+        comparison = self.compare_to_null()
         lines = [
             "MultinomialChoiceModel Summary",
             "=" * 40,
@@ -647,14 +660,10 @@ class MultinomialChoiceModel:
             f"  n_em_iterations:       {self.n_iter_}",
             f"  log_likelihood:        {self.log_likelihood_:.2f}",
             f"  BIC:                   {self.bic():.2f}",
+            f"  null_ll (uniform):     {comparison['null_ll']:.2f}",
+            f"  delta_BIC:             {comparison['delta_bic']:.2f}",
+            f"  learning_detected:     {comparison['learning_detected']}",
         ]
-        if choices is not None:
-            comparison = self.compare_to_null(choices)
-            lines.extend([
-                f"  null_ll (uniform):     {comparison['null_ll']:.2f}",
-                f"  delta_BIC:             {comparison['delta_bic']:.2f}",
-                f"  learning_detected:     {comparison['learning_detected']}",
-            ])
         return "\n".join(lines)
 
     def plot_values(self, observed_choices=None, option_labels=None, ax=None):
@@ -708,10 +717,15 @@ class MultinomialChoiceModel:
         # Bottom: choice probabilities (stacked area)
         axes[1].stackplot(trials, probs.T, labels=option_labels, alpha=0.7)
         if observed_choices is not None:
-            axes[1].scatter(
-                trials, np.asarray(observed_choices) / (self.n_options - 1),
-                c="k", s=3, alpha=0.3, zorder=5, label="Observed",
-            )
+            # Mark observed choices as tick marks along the top
+            choices_np = np.asarray(observed_choices)
+            for k in range(self.n_options):
+                chosen_trials = trials[choices_np == k]
+                if len(chosen_trials) > 0:
+                    axes[1].eventplot(
+                        chosen_trials, lineoffsets=1.02 - k * 0.03,
+                        linelengths=0.02, colors="k", alpha=0.4,
+                    )
         axes[1].set_ylabel("Choice probability")
         axes[1].set_xlabel("Trial")
         axes[1].set_title("Choice Probabilities")

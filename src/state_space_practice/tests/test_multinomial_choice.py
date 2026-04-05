@@ -235,12 +235,13 @@ class TestMultinomialChoiceModel:
 
         assert model_switch.process_noise > model_stable.process_noise
 
-    def test_fit_verbose(self, capsys):
+    def test_fit_verbose(self, caplog):
+        import logging
         rng = np.random.default_rng(42)
         model = MultinomialChoiceModel(n_options=3)
-        model.fit(rng.integers(0, 3, size=50), max_iter=2, verbose=True)
-        captured = capsys.readouterr()
-        assert "EM iter" in captured.out
+        with caplog.at_level(logging.INFO, logger="state_space_practice.multinomial_choice"):
+            model.fit(rng.integers(0, 3, size=50), max_iter=2, verbose=True)
+        assert "EM iter" in caplog.text
 
     def test_choice_probabilities(self):
         rng = np.random.default_rng(42)
@@ -260,9 +261,8 @@ class TestMultinomialChoiceModel:
     def test_summary_returns_string(self):
         rng = np.random.default_rng(42)
         model = MultinomialChoiceModel(n_options=3)
-        choices = rng.integers(0, 3, size=100)
-        model.fit(choices, max_iter=3)
-        s = model.summary(choices=choices)
+        model.fit(rng.integers(0, 3, size=100), max_iter=3)
+        s = model.summary()
         assert "MultinomialChoiceModel" in s
         assert "inverse_temperature" in s
         assert "learning_detected" in s
@@ -272,7 +272,7 @@ class TestMultinomialChoiceModel:
         choices = np.where(np.random.default_rng(42).random(200) < 0.8, 1, 0)
         model = MultinomialChoiceModel(n_options=2)
         model.fit(choices, max_iter=10)
-        comparison = model.compare_to_null(choices)
+        comparison = model.compare_to_null()
         assert comparison["learning_detected"]
         assert comparison["delta_bic"] > 0
 
@@ -378,7 +378,7 @@ class TestMultinomialChoiceIntegration:
         model = MultinomialChoiceModel(n_options=4)
         model.fit(np.array(data.choices), max_iter=15)
 
-        smoothed = np.array(model._smoother_result.smoothed_values)
+        smoothed = np.array(model.smoothed_values)
         true_vals = np.array(data.true_values)
 
         # Check correlation per option (after warmup)
@@ -418,7 +418,7 @@ class TestMultinomialChoiceIntegration:
 
         assert np.isfinite(model.log_likelihood_)
         assert np.isfinite(model.bic())
-        assert np.all(np.isfinite(np.array(model._smoother_result.smoothed_values)))
+        assert np.all(np.isfinite(np.array(model.smoothed_values)))
         assert np.all(np.isfinite(np.array(model.choice_probabilities())))
 
 
