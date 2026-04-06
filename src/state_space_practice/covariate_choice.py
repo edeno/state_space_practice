@@ -122,11 +122,85 @@ def m_step_input_gain(
     return B_hat
 
 
+def m_step_obs_weights(
+    smoothed_values: Array,
+    choices: Array,
+    obs_covariates: Array,
+    n_options: int,
+    inverse_temperature: float,
+    current_obs_weights: Array,
+    max_newton_steps: int = 5,
+) -> Array:
+    """Newton M-step for observation weights Theta.
+
+    Maximizes sum_t log softmax(beta * [0, m_t] + Theta @ z_t)[c_t]
+    w.r.t. Theta, holding smoothed values m_t fixed. This is a
+    standard multinomial logistic regression (concave in Theta).
+
+    Parameters
+    ----------
+    smoothed_values : Array, shape (T, K-1)
+    choices : Array, shape (T,) int
+    obs_covariates : Array, shape (T, d_obs)
+    n_options : int
+    inverse_temperature : float
+    current_obs_weights : Array, shape (K, d_obs)
+        Current Theta estimate (warm start).
+    max_newton_steps : int
+
+    Returns
+    -------
+    Theta_hat : Array, shape (K, d_obs)
+    """
+    T = smoothed_values.shape[0]
+    d_obs = obs_covariates.shape[1]
+    K = n_options
+    beta = inverse_temperature
+
+    # Build full value vectors: [0, m_t] for each trial
+    zeros = jnp.zeros((T, 1))
+    full_values = jnp.concatenate([zeros, smoothed_values], axis=1)  # (T, K)
+
+    # One-hot choices
+    e_choices = jax.nn.one_hot(choices, K)  # (T, K)
+
+    # Newton iteration on Theta (flattened to K*d_obs vector)
+    theta = current_obs_weights.ravel()  # (K * d_obs,)
+
+    for _ in range(max_newton_steps):
+        Theta = theta.reshape(K, d_obs)
+        # Logits: beta * v_t + Theta @ z_t
+        offsets = obs_covariates @ Theta.T  # (T, K)
+        logits = beta * full_values + offsets
+        probs = jax.nn.softmax(logits, axis=1)  # (T, K)
+
+        # Gradient: sum_t (e_t - p_t) ⊗ z_t → (K, d_obs)
+        residuals = e_choices - probs  # (T, K)
+        grad = jnp.einsum("tk,td->kd", residuals, obs_covariates)  # (K, d_obs)
+        grad_flat = grad.ravel()
+
+        # Block-diagonal Fisher approximation for Hessian
+        hess_diag_blocks = []
+        for k in range(K):
+            w = probs[:, k] * (1 - probs[:, k])  # (T,)
+            Hk = jnp.einsum("t,td,te->de", w, obs_covariates, obs_covariates)
+            hess_diag_blocks.append(Hk)
+        hess = jax.scipy.linalg.block_diag(*hess_diag_blocks)
+
+        # Damped Newton step (0.5 step size for stability)
+        step = psd_solve(hess, grad_flat)
+        theta = theta + 0.5 * step
+
+    return theta.reshape(K, d_obs)
+
+
 def covariate_choice_filter(
     choices: ArrayLike,
     n_options: int,
     covariates: Optional[ArrayLike] = None,
     input_gain: Optional[ArrayLike] = None,
+    obs_covariates: Optional[ArrayLike] = None,
+    obs_weights: Optional[ArrayLike] = None,
     process_noise: float = 0.01,
     inverse_temperature: float = 1.0,
     init_mean: Optional[ArrayLike] = None,
@@ -140,10 +214,16 @@ def covariate_choice_filter(
         Observed choices (0-indexed integers in [0, K)).
     n_options : int
         Total number of options K.
-    covariates : ArrayLike or None, shape (n_trials, d)
-        Trial-level covariates. None means no covariates (random walk).
-    input_gain : ArrayLike or None, shape (K-1, d)
-        Input-gain matrix B. Required if covariates is not None.
+    covariates : ArrayLike or None, shape (n_trials, d_dyn)
+        Dynamics covariates driving value updates. None = random walk.
+    input_gain : ArrayLike or None, shape (K-1, d_dyn)
+        Input-gain matrix B for dynamics covariates.
+    obs_covariates : ArrayLike or None, shape (n_trials, d_obs)
+        Observation covariates that bias choice probabilities without
+        changing the latent value state (e.g., stay/switch, spatial bias).
+    obs_weights : ArrayLike or None, shape (K, d_obs)
+        Weights mapping observation covariates to logit offsets.
+        Full K-dim (including reference option).
     process_noise : float
         Scalar process noise (Q = process_noise * I).
     inverse_temperature : float
@@ -169,6 +249,7 @@ def covariate_choice_filter(
     else:
         init_cov = jnp.asarray(init_cov)
 
+    # Dynamics covariates
     if covariates is not None:
         covariates_arr = jnp.asarray(covariates)
         if covariates_arr.shape[0] != choices_arr.shape[0]:
@@ -180,12 +261,27 @@ def covariate_choice_filter(
             input_gain = jnp.zeros((k_free, covariates_arr.shape[1]))
         input_gain_arr = jnp.asarray(input_gain)
     else:
-        # No covariates: use dummy zero arrays
         covariates_arr = jnp.zeros((choices_arr.shape[0], 1))
         input_gain_arr = jnp.zeros((k_free, 1))
 
+    # Observation covariates
+    if obs_covariates is not None:
+        obs_cov_arr = jnp.asarray(obs_covariates)
+        if obs_cov_arr.shape[0] != choices_arr.shape[0]:
+            raise ValueError(
+                f"obs_covariates has {obs_cov_arr.shape[0]} rows but choices "
+                f"has {choices_arr.shape[0]} trials"
+            )
+        if obs_weights is None:
+            obs_weights = jnp.zeros((n_options, obs_cov_arr.shape[1]))
+        obs_weights_arr = jnp.asarray(obs_weights)
+    else:
+        obs_cov_arr = jnp.zeros((choices_arr.shape[0], 1))
+        obs_weights_arr = jnp.zeros((n_options, 1))
+
     return _covariate_choice_filter_jit(
         choices_arr, n_options, covariates_arr, input_gain_arr,
+        obs_cov_arr, obs_weights_arr,
         process_noise, inverse_temperature, init_mean, init_cov,
     )
 
@@ -196,27 +292,33 @@ def _covariate_choice_filter_jit(
     n_options: int,
     covariates: Array,
     input_gain: Array,
+    obs_covariates: Array,
+    obs_weights: Array,
     process_noise: float,
     inverse_temperature: float,
     init_mean: Array,
     init_cov: Array,
 ) -> ChoiceFilterResult:
-    """JIT-compiled filter core with covariate-driven prediction."""
+    """JIT-compiled filter core with dynamics and observation covariates."""
     k_free = n_options - 1
     Q = jnp.eye(k_free) * process_noise
 
     def _step(carry, inputs):
         filt_mean, filt_cov, total_ll = carry
-        choice_t, u_t = inputs
+        choice_t, u_t, z_t = inputs
 
         # Predict with control input
         pred_mean = filt_mean + input_gain @ u_t
         pred_cov = filt_cov + Q
 
-        # Update via Laplace-EKF
+        # Observation offset from obs covariates: Θ @ z_t
+        obs_offset = obs_weights @ z_t
+
+        # Update via Laplace-EKF with obs offset
         post_mean, post_cov, ll = _softmax_update_core(
             pred_mean, pred_cov, choice_t,
             n_options, inverse_temperature,
+            obs_offset=obs_offset,
         )
 
         total_ll = total_ll + ll
@@ -226,7 +328,7 @@ def _covariate_choice_filter_jit(
 
     init_carry = (init_mean, init_cov, jnp.array(0.0))
     (_, _, marginal_ll), (filt_vals, filt_covs, pred_vals, pred_covs) = (
-        jax.lax.scan(_step, init_carry, (choices, covariates))
+        jax.lax.scan(_step, init_carry, (choices, covariates, obs_covariates))
     )
 
     return ChoiceFilterResult(
@@ -243,6 +345,8 @@ def covariate_choice_smoother(
     n_options: int,
     covariates: Optional[ArrayLike] = None,
     input_gain: Optional[ArrayLike] = None,
+    obs_covariates: Optional[ArrayLike] = None,
+    obs_weights: Optional[ArrayLike] = None,
     process_noise: float = 0.01,
     inverse_temperature: float = 1.0,
     init_mean: Optional[ArrayLike] = None,
@@ -258,6 +362,7 @@ def covariate_choice_smoother(
     """
     filt = covariate_choice_filter(
         choices, n_options, covariates, input_gain,
+        obs_covariates, obs_weights,
         process_noise, inverse_temperature, init_mean, init_cov,
     )
 
@@ -280,13 +385,18 @@ def covariate_choice_smoother(
 
 
 class CovariateChoiceModel:
-    """Multi-armed bandit with covariate-driven value dynamics.
+    """Multi-armed bandit with covariate-driven value dynamics and
+    observation-level choice biases.
 
-    Extends MultinomialChoiceModel with input-driven value updates:
-        x_t = x_{t-1} + B @ u_t + noise
+    Extends MultinomialChoiceModel with two types of covariates:
 
-    where B is a learned input-gain matrix mapping trial covariates
-    to value updates. When n_covariates=0, reduces to
+    1. **Dynamics covariates** (input-gain B): drive value updates
+       ``x_t = x_{t-1} + B @ u_t + noise``
+    2. **Observation covariates** (obs weights Theta): bias choice
+       probabilities without changing the latent value state
+       ``p(c_t) = softmax(beta * [0, x_t] + Theta @ z_t)``
+
+    When n_covariates=0 and n_obs_covariates=0, reduces to
     MultinomialChoiceModel (pure random walk).
 
     Parameters
@@ -294,7 +404,9 @@ class CovariateChoiceModel:
     n_options : int
         Number of choice options K.
     n_covariates : int
-        Number of covariates d.
+        Number of dynamics covariates d_dyn.
+    n_obs_covariates : int
+        Number of observation covariates d_obs.
     init_inverse_temperature : float
         Starting inverse temperature for EM.
     init_process_noise : float
@@ -303,28 +415,35 @@ class CovariateChoiceModel:
         Whether to learn beta via EM.
     learn_process_noise : bool
         Whether to learn Q via EM.
+    learn_obs_weights : bool
+        Whether to learn Theta via EM.
     """
 
     def __init__(
         self,
         n_options: int,
         n_covariates: int = 0,
+        n_obs_covariates: int = 0,
         init_inverse_temperature: float = 1.0,
         init_process_noise: float = 0.01,
         learn_inverse_temperature: bool = True,
         learn_process_noise: bool = True,
+        learn_obs_weights: bool = True,
     ):
         if n_options < 2:
             raise ValueError(f"n_options must be >= 2, got {n_options}")
         self.n_options = n_options
         self.n_covariates = n_covariates
+        self.n_obs_covariates = n_obs_covariates
         self.inverse_temperature = init_inverse_temperature
         self.process_noise = init_process_noise
         self.learn_inverse_temperature = learn_inverse_temperature
         self.learn_process_noise = learn_process_noise
+        self.learn_obs_weights = learn_obs_weights
 
         k_free = n_options - 1
         self.input_gain_: Array = jnp.zeros((k_free, max(n_covariates, 1)))
+        self.obs_weights_: Array = jnp.zeros((n_options, max(n_obs_covariates, 1)))
 
         # Fitted state
         self._smoother_result: Optional[ChoiceSmootherResult] = None
@@ -333,6 +452,7 @@ class CovariateChoiceModel:
         self.log_likelihood_history_: Optional[list[float]] = None
         self._n_trials: Optional[int] = None
         self._covariates: Optional[Array] = None
+        self._obs_covariates: Optional[Array] = None
 
     def __repr__(self) -> str:
         fitted = self.is_fitted
@@ -370,6 +490,7 @@ class CovariateChoiceModel:
         self,
         choices: ArrayLike,
         covariates: Optional[ArrayLike] = None,
+        obs_covariates: Optional[ArrayLike] = None,
         max_iter: int = 50,
         tolerance: float = 1e-4,
         verbose: bool = False,
@@ -381,8 +502,11 @@ class CovariateChoiceModel:
         ----------
         choices : ArrayLike, shape (n_trials,)
             Observed choices (0-indexed integers in [0, K)).
-        covariates : ArrayLike or None, shape (n_trials, d)
-            Trial-level covariates. None for no covariates.
+        covariates : ArrayLike or None, shape (n_trials, d_dyn)
+            Dynamics covariates driving value updates. None = random walk.
+        obs_covariates : ArrayLike or None, shape (n_trials, d_obs)
+            Observation covariates biasing choice probabilities
+            (e.g., stay/switch indicator, spatial bias). None = no bias.
         max_iter : int
             Maximum EM iterations.
         tolerance : float
@@ -411,6 +535,7 @@ class CovariateChoiceModel:
                 f"got range [{choices_np.min()}, {choices_np.max()}]"
             )
 
+        # Dynamics covariates
         if self.n_covariates > 0 and covariates is not None:
             self._covariates = jnp.asarray(covariates)
             if self._covariates.shape[1] != self.n_covariates:
@@ -426,6 +551,22 @@ class CovariateChoiceModel:
         else:
             self._covariates = None
 
+        # Observation covariates
+        if self.n_obs_covariates > 0 and obs_covariates is not None:
+            self._obs_covariates = jnp.asarray(obs_covariates)
+            if self._obs_covariates.shape[1] != self.n_obs_covariates:
+                raise ValueError(
+                    f"obs_covariates has {self._obs_covariates.shape[1]} columns "
+                    f"but model expects n_obs_covariates={self.n_obs_covariates}"
+                )
+        elif self.n_obs_covariates > 0 and obs_covariates is None:
+            raise ValueError(
+                f"Model has n_obs_covariates={self.n_obs_covariates} but no "
+                f"obs_covariates were passed to fit()"
+            )
+        else:
+            self._obs_covariates = None
+
         if beta_grid is None:
             beta_grid = jnp.array(_DEFAULT_BETA_GRID)
         else:
@@ -439,6 +580,8 @@ class CovariateChoiceModel:
                 choices_arr, self.n_options,
                 covariates=self._covariates,
                 input_gain=self.input_gain_ if self.n_covariates > 0 else None,
+                obs_covariates=self._obs_covariates,
+                obs_weights=self.obs_weights_ if self.n_obs_covariates > 0 else None,
                 process_noise=self.process_noise,
                 inverse_temperature=self.inverse_temperature,
             )
@@ -470,6 +613,16 @@ class CovariateChoiceModel:
                     smooth.smoothed_values, self._covariates,
                 )
 
+            # M-step for Theta (observation weights)
+            if (self.learn_obs_weights
+                    and self.n_obs_covariates > 0
+                    and self._obs_covariates is not None):
+                self.obs_weights_ = m_step_obs_weights(
+                    smooth.smoothed_values, choices_arr,
+                    self._obs_covariates, self.n_options,
+                    self.inverse_temperature, self.obs_weights_,
+                )
+
             # M-step for process noise Q
             if self.learn_process_noise:
                 self.process_noise = self._m_step_process_noise(smooth)
@@ -485,6 +638,8 @@ class CovariateChoiceModel:
             choices_arr, self.n_options,
             covariates=self._covariates,
             input_gain=self.input_gain_ if self.n_covariates > 0 else None,
+            obs_covariates=self._obs_covariates,
+            obs_weights=self.obs_weights_ if self.n_obs_covariates > 0 else None,
             process_noise=self.process_noise,
             inverse_temperature=self.inverse_temperature,
         )
@@ -532,6 +687,8 @@ class CovariateChoiceModel:
                 choices, self.n_options,
                 covariates=self._covariates,
                 input_gain=self.input_gain_ if self.n_covariates > 0 else None,
+                obs_covariates=self._obs_covariates,
+                obs_weights=self.obs_weights_ if self.n_obs_covariates > 0 else None,
                 process_noise=self.process_noise,
                 inverse_temperature=beta,
             )
@@ -569,6 +726,8 @@ class CovariateChoiceModel:
     def choice_probabilities(self) -> Array:
         """Softmax choice probabilities from smoothed values.
 
+        Includes observation covariate offsets if present.
+
         Returns
         -------
         probs : Array, shape (n_trials, K)
@@ -578,7 +737,10 @@ class CovariateChoiceModel:
         full_values = jnp.concatenate(
             [zeros, self._smoother_result.smoothed_values], axis=1,
         )
-        return jax.nn.softmax(self.inverse_temperature * full_values, axis=1)
+        logits = self.inverse_temperature * full_values
+        if self.n_obs_covariates > 0 and self._obs_covariates is not None:
+            logits = logits + self._obs_covariates @ self.obs_weights_.T
+        return jax.nn.softmax(logits, axis=1)
 
     @property
     def n_free_params(self) -> int:
@@ -589,7 +751,9 @@ class CovariateChoiceModel:
         if self.learn_inverse_temperature:
             n += 1
         if self.n_covariates > 0:
-            n += (self.n_options - 1) * self.n_covariates  # B matrix entries
+            n += (self.n_options - 1) * self.n_covariates  # B matrix
+        if self.n_obs_covariates > 0 and self.learn_obs_weights:
+            n += self.n_options * self.n_obs_covariates  # Theta matrix
         return n
 
     def bic(self) -> float:

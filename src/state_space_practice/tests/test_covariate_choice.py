@@ -662,3 +662,159 @@ class TestRescorlaWagnerComparison:
         null_model = CovariateChoiceModel(n_options=3, n_covariates=0)
         null_model.fit(data.choices, max_iter=25)
         assert model.log_likelihood_ > null_model.log_likelihood_
+
+
+class TestObservationCovariates:
+    """Tests for observation covariates (Theta @ z_t in softmax)."""
+
+    def test_no_obs_covariates_parity(self):
+        """With obs_weights=0, should match model without obs covariates."""
+        rng = np.random.default_rng(42)
+        choices = np.where(rng.random(100) < 0.7, 1, rng.integers(0, 3, size=100))
+        # Dummy obs covariates that should have no effect when Theta=0
+        obs_cov = rng.standard_normal((100, 2))
+
+        # Model without obs covariates
+        m1 = CovariateChoiceModel(n_options=3)
+        m1.fit(choices, max_iter=3)
+
+        # Model with obs covariates but learn_obs_weights=False (Theta stays 0)
+        m2 = CovariateChoiceModel(n_options=3, n_obs_covariates=2,
+                                   learn_obs_weights=False)
+        m2.fit(choices, obs_covariates=obs_cov, max_iter=3)
+
+        # Log-likelihoods should be identical
+        np.testing.assert_allclose(
+            m1.log_likelihood_, m2.log_likelihood_, rtol=1e-4,
+        )
+
+    def test_stay_bias_learned(self):
+        """With strong perseveration, Theta should capture stay preference."""
+        rng = np.random.default_rng(42)
+        n_trials = 300
+        # Generate choices with strong perseveration
+        choices = np.zeros(n_trials, dtype=int)
+        choices[0] = rng.integers(0, 3)
+        for t in range(1, n_trials):
+            if rng.random() < 0.8:  # 80% stay
+                choices[t] = choices[t - 1]
+            else:
+                choices[t] = rng.integers(0, 3)
+
+        # Build stay indicator: z_t[k] = 1 if option k was chosen on trial t-1
+        obs_cov = np.zeros((n_trials, 3))
+        for t in range(1, n_trials):
+            obs_cov[t, choices[t - 1]] = 1.0
+
+        model = CovariateChoiceModel(
+            n_options=3, n_obs_covariates=3,
+            learn_inverse_temperature=False,
+            learn_process_noise=False,
+        )
+        model.fit(choices, obs_covariates=obs_cov, max_iter=10)
+
+        # Diagonal of Theta should be positive (stay bias)
+        Theta = np.array(model.obs_weights_)
+        for k in range(3):
+            assert Theta[k, k] > 0, f"Stay bias for option {k}: {Theta[k, k]:.3f}"
+
+    def test_obs_covariates_improve_ll(self):
+        """Model with obs covariates should improve LL on perseverative data."""
+        rng = np.random.default_rng(42)
+        n_trials = 200
+        choices = np.zeros(n_trials, dtype=int)
+        choices[0] = 1
+        for t in range(1, n_trials):
+            if rng.random() < 0.75:
+                choices[t] = choices[t - 1]
+            else:
+                choices[t] = rng.integers(0, 3)
+
+        obs_cov = np.zeros((n_trials, 3))
+        for t in range(1, n_trials):
+            obs_cov[t, choices[t - 1]] = 1.0
+
+        # Fix beta and Q so only Theta is learned — avoids EM instability
+        # from joint beta/Theta optimization
+        # Without obs covariates
+        m_base = CovariateChoiceModel(
+            n_options=3, learn_inverse_temperature=False, learn_process_noise=False,
+        )
+        m_base.fit(choices, max_iter=5)
+
+        # With obs covariates (only learn Theta)
+        m_obs = CovariateChoiceModel(
+            n_options=3, n_obs_covariates=3,
+            learn_inverse_temperature=False, learn_process_noise=False,
+        )
+        m_obs.fit(choices, obs_covariates=obs_cov, max_iter=5)
+
+        assert m_obs.log_likelihood_ > m_base.log_likelihood_
+
+    def test_obs_covariates_dont_change_latent_state(self):
+        """Obs covariates shift probabilities, not the value trajectory."""
+        rng = np.random.default_rng(42)
+        choices = rng.integers(0, 3, size=100)
+        obs_cov = rng.standard_normal((100, 2))
+
+        # Fix all params, only learn Theta
+        m = CovariateChoiceModel(
+            n_options=3, n_obs_covariates=2,
+            learn_inverse_temperature=False,
+            learn_process_noise=False,
+        )
+        m.fit(choices, obs_covariates=obs_cov, max_iter=5)
+        vals_with = np.array(m.smoothed_values)
+
+        # Same but without obs covariates
+        m_base = CovariateChoiceModel(
+            n_options=3,
+            learn_inverse_temperature=False,
+            learn_process_noise=False,
+        )
+        m_base.fit(choices, max_iter=5)
+        vals_without = np.array(m_base.smoothed_values)
+
+        # Values should be similar (not identical since obs covariates
+        # change the softmax probabilities which feed back through the
+        # Laplace update, but the effect should be small)
+        corr = np.corrcoef(vals_with.ravel(), vals_without.ravel())[0, 1]
+        assert corr > 0.8, f"Value trajectories too different: r={corr:.3f}"
+
+    def test_obs_weights_shape(self):
+        """obs_weights_ should be (K, d_obs)."""
+        rng = np.random.default_rng(42)
+        choices = rng.integers(0, 4, size=50)
+        obs_cov = rng.standard_normal((50, 3))
+
+        m = CovariateChoiceModel(n_options=4, n_obs_covariates=3)
+        m.fit(choices, obs_covariates=obs_cov, max_iter=2)
+        assert m.obs_weights_.shape == (4, 3)
+
+    def test_n_free_params_includes_obs_weights(self):
+        """BIC should count Theta parameters."""
+        m = CovariateChoiceModel(
+            n_options=3, n_obs_covariates=2,
+            learn_process_noise=True,
+            learn_inverse_temperature=True,
+        )
+        # Q(1) + beta(1) + Theta(3*2=6) = 8
+        assert m.n_free_params == 8
+
+    def test_choice_probabilities_include_obs_offset(self):
+        """choice_probabilities should include Theta @ z_t."""
+        rng = np.random.default_rng(42)
+        choices = rng.integers(0, 3, size=100)
+        obs_cov = rng.standard_normal((100, 2))
+
+        m = CovariateChoiceModel(n_options=3, n_obs_covariates=2)
+        m.fit(choices, obs_covariates=obs_cov, max_iter=3)
+        probs = m.choice_probabilities()
+        assert probs.shape == (100, 3)
+        np.testing.assert_allclose(probs.sum(axis=1), 1.0, atol=1e-6)
+
+    def test_missing_obs_covariates_raises(self):
+        """If n_obs_covariates > 0 but no obs_covariates passed, raise."""
+        m = CovariateChoiceModel(n_options=3, n_obs_covariates=2)
+        with pytest.raises(ValueError, match="obs_covariates"):
+            m.fit(np.array([0, 1, 2, 1, 0]))

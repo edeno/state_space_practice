@@ -44,11 +44,20 @@ def _softmax_update_core(
     n_options: int,
     inverse_temperature: float,
     max_newton_steps: int = 3,
+    obs_offset: Optional[Array] = None,
 ) -> tuple[Array, Array, Array]:
     """JIT-compatible Laplace-EKF update for softmax observation.
 
     All inputs must be JAX arrays (no Python-level validation).
     Use ``softmax_observation_update`` for the public API with validation.
+
+    Parameters
+    ----------
+    obs_offset : Array or None, shape (K,)
+        Additive offset to the logits before softmax. Used for
+        observation covariates (e.g., stay bias, spatial bias).
+        These shift choice probabilities without changing the
+        latent value state. None means no offset.
     """
     beta = inverse_temperature
     k_free = n_options - 1
@@ -59,10 +68,11 @@ def _softmax_update_core(
     eye_k = jnp.eye(k_free)
     zero_ref = jnp.zeros(1)
     beta_sq = beta**2
+    _obs_offset = obs_offset if obs_offset is not None else jnp.zeros(n_options)
 
     # Log-likelihood at the prior mean (for EM monitoring)
     v_prior = jnp.concatenate([zero_ref, prior_mean])
-    log_lik = jax.nn.log_softmax(beta * v_prior)[choice]
+    log_lik = jax.nn.log_softmax(beta * v_prior + _obs_offset)[choice]
 
     # Prior precision
     prior_precision = psd_solve(prior_cov, eye_k)
@@ -71,7 +81,7 @@ def _softmax_update_core(
     x = prior_mean
     for _ in range(max_newton_steps):
         v = jnp.concatenate([zero_ref, x])
-        p_free = jax.nn.softmax(beta * v)[1:]
+        p_free = jax.nn.softmax(beta * v + _obs_offset)[1:]
 
         gradient = beta * (e_k_free - p_free)
         neg_hessian = beta_sq * (jnp.diag(p_free) - jnp.outer(p_free, p_free))
@@ -82,7 +92,7 @@ def _softmax_update_core(
 
     # Final posterior covariance at the mode
     v = jnp.concatenate([zero_ref, x])
-    p_free = jax.nn.softmax(beta * v)[1:]
+    p_free = jax.nn.softmax(beta * v + _obs_offset)[1:]
     neg_hessian = beta_sq * (jnp.diag(p_free) - jnp.outer(p_free, p_free))
     posterior_precision = prior_precision + neg_hessian
     posterior_cov = symmetrize(psd_solve(posterior_precision, eye_k))
