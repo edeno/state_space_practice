@@ -26,6 +26,7 @@ Both tracks share the same dependency graph. The scientific track has a "minimum
 | Numerical Stability | **DONE** (kalman.py, switching_kalman.py, point_process_kalman.py stabilized) |
 | Position Decoding | **DONE** (position_decoder.py, 35 tests) |
 | Multinomial Choice | **DONE** (multinomial_choice.py, 43 tests) |
+| RL Covariates | **DONE** (covariate_choice.py, 55 tests — dynamics covariates, obs covariates, decay) |
 | All others | Not started |
 
 ## Dependency Graph
@@ -87,8 +88,11 @@ Both tracks share the same dependency graph. The scientific track has a "minimum
 | Order | Plan | Feasibility | Risk | Effort | Depends On |
 |---|---|---|---|---|---|
 | 0 | numerical-stability-remediation.md | **DONE** | Low | 1 week | None |
+| 0.5 | computational-improvements.md | READY | Low-Med | 2-3 weeks | None |
 
-Fixed correctness bugs in kalman.py, switching_kalman.py, and point_process_kalman.py.
+Order 0: Fixed correctness bugs in kalman.py, switching_kalman.py, and point_process_kalman.py.
+
+Order 0.5: Parallel smoother (associative scan), Woodbury-optimized updates, Joseph form covariance, parameter constraints, SGD fitting. Model-agnostic infrastructure that benefits all downstream plans. Tasks are independent — can be done in any order or interleaved with model work.
 
 ### Infrastructure Track
 
@@ -97,7 +101,9 @@ Fixed correctness bugs in kalman.py, switching_kalman.py, and point_process_kalm
 | 1 | position-decoding.md | READY | Low-Med | 1-2 weeks | None | **DONE** |
 | 2 | cross-session-drift.md | READY | Low-Med | 1-2 weeks | None | Not started |
 | 3 | multinomial-choice-model.md | READY | Low-Med | 2-3 weeks | None | **DONE** |
-| 3.5 | rl-state-space-covariates.md | READY | Low-Med | 1-2 weeks | Multinomial Choice | Not started |
+| 3.5 | rl-state-space-covariates.md | READY | Low-Med | 1-2 weeks | Multinomial Choice | **DONE** |
+| 3.6 | contingency-belief-latent-task-state.md | PARTIAL | Medium | 2-3 weeks | Multinomial Choice | Not started |
+| 3.7 | switching-choice-model.md | READY | Medium | 1-2 weeks | RL Covariates + Switching Kalman | Not started |
 | 4 | joint-belief-state-decoder.md | PARTIAL | Medium | 2-3 weeks | Multinomial Choice | Not started |
 | 5 | adaptive-decoder.md | PARTIAL | Medium | 2 weeks | Position Decoding | Not started |
 | 6 | covariate-driven-drift.md | PARTIAL | Medium | 2-3 weeks | Cross-Session Drift | Not started |
@@ -130,6 +136,7 @@ Claim: "CA1 alternates between local and nonlocal represented content, and laten
 - **Order 0** fixes shared infrastructure bugs before anything builds on top.
 - **Orders 1-3** (DONE) established the core decoding and behavioral models.
 - **Order 3.5** (RL covariates) strengthens the behavioral model with mechanistic value updates, supporting all downstream value-related plans.
+- **Order 3.6** adds an explicit hidden-world-state or contingency-belief model, complementing both continuous value inference and planned strategy-state switching.
 - **Orders 4-7** are dependency-driven integrations.
 - **Orders 8-9** are speculative integration efforts — only after lower-risk pieces are validated.
 - **S1-S2** form the minimum publishable path using infrastructure already built.

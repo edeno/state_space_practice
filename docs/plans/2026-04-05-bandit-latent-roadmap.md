@@ -52,6 +52,7 @@ Parallel infrastructure, not on the shortest scientific path:
 - `2026-04-03-adaptive-decoder.md`
 - `2026-04-04-covariate-driven-drift.md`
 - `2026-04-03-joint-learning-drift.md`
+- `2026-04-06-contingency-belief-latent-task-state.md`
 
 These remain useful, especially for long-timescale remapping, but they are not the first route to replay, theta-sequence, and value-modulated content in CA1.
 
@@ -194,6 +195,7 @@ Stop condition:
 - The repository already has strong support for physical-position decoding and behavior-driven value inference.
 - The missing scientific object is represented content, so that layer should be added before any cross-region story.
 - Value-gated sequence expression now comes before neural belief coupling because it already has a pragmatic behavior-first input path and gives the shortest novel result.
+- A contingency-belief or latent-task-state model is a useful parallel behavior-side extension, especially for later mPFC interpretation, but it is not required for the shortest CA1-first publishable path.
 - Cross-region latent coupling should come only after the CA1-only content model and the mPFC-like belief model both work independently.
 - A modular multi-timescale hierarchy is best treated as a later synthesis layer rather than part of the first publishable result.
 - The existing oscillator cross-region plan remains useful, but only after the content-level models are in place.
