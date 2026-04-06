@@ -6,6 +6,7 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.kalman import psd_solve, stabilize_covariance
+from state_space_practice.point_process_kalman import _safe_expected_count
 
 
 def log_receptive_field_model(position: ArrayLike, params: ArrayLike) -> Array:
@@ -15,12 +16,6 @@ def log_receptive_field_model(position: ArrayLike, params: ArrayLike) -> Array:
         2 * scale**2
     )
     return result
-
-
-def _safe_expected_count(log_rate: Array, dt: float) -> Array:
-    """Convert log-rate to expected count with overflow protection."""
-    log_count = log_rate + jnp.log(jnp.asarray(dt, dtype=log_rate.dtype))
-    return jnp.exp(jnp.clip(log_count, -20.0, 20.0))
 
 
 # NOTE: most general form of the SSPPF accounts for multiple neurons which is not implemented here
@@ -228,7 +223,9 @@ def steepest_descent_point_process_filter(
     def _update(mode_prev: Array, args: tuple[Array, Array]) -> tuple[Array, Array]:
         """Steepest Descent Point Process Filter update step"""
         x_t, spike_indicator_t = args
-        conditional_intensity = jnp.exp(log_receptive_field_model(x_t, mode_prev)) * dt
+        conditional_intensity = _safe_expected_count(
+            log_receptive_field_model(x_t, mode_prev), dt
+        )
         innovation = spike_indicator_t - conditional_intensity
         one_step_grad = grad_log_receptive_field_model(x_t, mode_prev)
         posterior_mode = mode_prev + epsilon_arr @ one_step_grad * innovation
