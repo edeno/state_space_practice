@@ -80,7 +80,7 @@ def psd_solve(A: jax.Array, b: jax.Array, diagonal_boost: float = 1e-9) -> jax.A
     )
 
 
-def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-4) -> jax.Array:
+def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
     """Project a matrix onto the positive semi-definite cone.
 
     This function ensures the input matrix is positive semi-definite by:
