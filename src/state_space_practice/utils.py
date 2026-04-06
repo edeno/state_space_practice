@@ -1,7 +1,9 @@
 from typing import Union
 
 import jax
+import jax.numpy as jnp
 import numpy as np
+from jax import Array
 
 # Type alias for numeric values (scalars, numpy arrays, JAX arrays)
 Numeric = Union[float, int, np.ndarray, jax.Array]
@@ -50,3 +52,36 @@ def check_converged(
     is_converged = (delta_log_likelihood / avg_log_likelihood) < tolerance
 
     return bool(is_converged), bool(is_increasing)
+
+
+def make_discrete_transition_matrix(
+    diag: Array, n_discrete_states: int
+) -> Array:
+    """Build a row-stochastic transition matrix from diagonal values.
+
+    Off-diagonal elements distribute the remaining probability mass
+    equally among other states.
+
+    Parameters
+    ----------
+    diag : Array, shape (n_discrete_states,)
+        Diagonal (self-transition) probabilities for each state.
+    n_discrete_states : int
+        Number of discrete states.
+
+    Returns
+    -------
+    transition_matrix : Array, shape (n_discrete_states, n_discrete_states)
+        Row-stochastic transition matrix.
+    """
+    if n_discrete_states == 1:
+        return jnp.array([[1.0]])
+
+    transition_matrix = jnp.diag(diag)
+    off_diag = (1.0 - diag) / (n_discrete_states - 1.0)
+    transition_matrix = (
+        transition_matrix
+        + jnp.ones((n_discrete_states, n_discrete_states)) * off_diag[:, None]
+        - jnp.diag(off_diag)
+    )
+    return transition_matrix / jnp.sum(transition_matrix, axis=1, keepdims=True)

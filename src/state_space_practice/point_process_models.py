@@ -53,7 +53,7 @@ from state_space_practice.switching_point_process import (
     switching_point_process_filter,
     update_spike_glm_params,
 )
-from state_space_practice.utils import check_converged
+from state_space_practice.utils import check_converged, make_discrete_transition_matrix
 
 logger = logging.getLogger(__name__)
 
@@ -347,22 +347,8 @@ class BaseSwitchingPointProcessModel(ABC):
 
     def _initialize_discrete_transition_matrix(self) -> None:
         """Initialize discrete state transition matrix from diagonal."""
-        diag = self.discrete_transition_diag
-        transition_matrix = jnp.diag(diag)
-
-        if self.n_discrete_states == 1:
-            self.discrete_transition_matrix = jnp.array([[1.0]])
-            return
-
-        off_diag = (1.0 - diag) / (self.n_discrete_states - 1.0)
-        transition_matrix = (
-            transition_matrix
-            + jnp.ones((self.n_discrete_states, self.n_discrete_states))
-            * off_diag[:, None]
-            - jnp.diag(off_diag)
-        )
-        self.discrete_transition_matrix = transition_matrix / jnp.sum(
-            transition_matrix, axis=1, keepdims=True
+        self.discrete_transition_matrix = make_discrete_transition_matrix(
+            self.discrete_transition_diag, self.n_discrete_states
         )
 
     def _initialize_continuous_state(self, key: Array) -> None:

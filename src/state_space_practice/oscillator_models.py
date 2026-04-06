@@ -62,10 +62,8 @@ from state_space_practice.switching_kalman import (
     switching_kalman_maximization_step,
     switching_kalman_smoother,
 )
-from state_space_practice.utils import check_converged
+from state_space_practice.utils import check_converged, make_discrete_transition_matrix
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -231,25 +229,8 @@ class BaseModel(ABC):
         elements are set to distribute the remaining probability mass equally
         among other states.
         """
-        diag = self.discrete_transition_diag
-        transition_matrix = jnp.diag(diag)
-
-        if self.n_discrete_states == 1:
-            # Single state: transition matrix is just [[1.0]]
-            self.discrete_transition_matrix = jnp.array([[1.0]])
-            return
-
-        # Compute off-diagonal values for each row
-        off_diag = (1.0 - diag) / (self.n_discrete_states - 1.0)
-
-        # Add off-diagonal elements, avoiding the diagonal
-        transition_matrix = transition_matrix + jnp.ones(
-            (self.n_discrete_states, self.n_discrete_states)
-        ) * off_diag[:, None] - jnp.diag(off_diag)
-
-        # Ensure rows sum to 1 (handle potential floating point issues)
-        self.discrete_transition_matrix = transition_matrix / jnp.sum(
-            transition_matrix, axis=1, keepdims=True
+        self.discrete_transition_matrix = make_discrete_transition_matrix(
+            self.discrete_transition_diag, self.n_discrete_states
         )
 
     def _initialize_continuous_state(self, key: Array) -> None:
