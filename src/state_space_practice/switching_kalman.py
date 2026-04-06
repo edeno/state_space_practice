@@ -133,7 +133,7 @@ def _divide_safe(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
 # Minimum probability threshold for numerical stability
 _LOG_PROB_FLOOR = 1e-10
 _LOG_FLOOR_VALUE = -23.0  # approximately log(1e-10)
-_DISCRETE_PROB_STABILITY_FLOOR = 1e-12
+_DISCRETE_PROB_STABILITY_FLOOR = 1e-10
 
 
 def _safe_log(x: jax.Array) -> jax.Array:
@@ -158,7 +158,30 @@ def _safe_log(x: jax.Array) -> jax.Array:
 
 
 def _stabilize_probability_vector(probabilities: jax.Array) -> jax.Array:
-    """Prevent exact-zero probability lockout from numerical underflow."""
+    """Prevent exact-zero probability lockout from numerical underflow.
+
+    Applies a small floor to each element, then re-normalizes so the vector
+    sums to 1. This ensures that no discrete state is permanently excluded
+    once its probability underflows to zero.
+
+    Parameters
+    ----------
+    probabilities : jax.Array, shape (n_states,)
+        Probability vector (non-negative, ideally sums to 1).
+
+    Returns
+    -------
+    jax.Array, shape (n_states,)
+        Stabilized probability vector that sums to 1 with all entries
+        >= ``_DISCRETE_PROB_STABILITY_FLOOR`` (before re-normalization).
+
+    Notes
+    -----
+    If the input is all zeros (e.g. from complete underflow), every element
+    is raised to the floor and re-normalization produces a uniform
+    distribution. This is intentional for numerical robustness, but callers
+    should validate inputs upstream if they need to detect invalid priors.
+    """
     floor = jnp.asarray(_DISCRETE_PROB_STABILITY_FLOOR, dtype=probabilities.dtype)
     stabilized = jnp.maximum(probabilities, floor)
     return stabilized / jnp.sum(stabilized)
@@ -303,7 +326,7 @@ def _first_timestep_kalman_update(
     obs_t: jax.Array,
     measurement_matrix: jax.Array,
     measurement_cov: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Handle first timestep with x₁ convention (measurement update only).
 
     For the first observation y₁, we treat init_state_cond_mean/cov as p(x₁ | S₁)
@@ -403,7 +426,8 @@ def switching_kalman_filter(
     jax.Array,  # Filtered mean of the continuous latent state
     jax.Array,  # Filtered covariance of the continuous latent state
     jax.Array,  # Filtered probability of the discrete states
-    jax.Array,  # Last filtered conditional mean of the continuous latent state
+    jax.Array,  # Last filtered pair-conditional mean
+    jax.Array,  # Last filtered pair-conditional covariance
     jax.Array,  # Marginal log likelihood of the observations (scalar array)
 ]:
     """Switching Kalman filter for a linear Gaussian state space model with discrete states.
@@ -460,7 +484,7 @@ def switching_kalman_filter(
         carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array], obs_t: jax.Array
     ) -> tuple[
         tuple[jax.Array, jax.Array, jax.Array, jax.Array],  # Next carry
-        tuple[jax.Array, jax.Array, jax.Array, jax.Array],  # Stacked output
+        tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],  # Stacked output
     ]:
         """One step of the switching Kalman filter.
 
@@ -736,6 +760,12 @@ def _update_smoother_discrete_probabilities(
         Pr(S_{t+1}=k | S{t}=j, y_{1:T}), shape (n_discrete_states, n_discrete_states), W^{k | j}_t
 
     """
+    # Stabilize filter input to prevent underflow propagation.
+    # Note: next_smoother_discrete_prob is NOT stabilized here — it is
+    # stabilized in the carry output so that the stored smoother_prob[t+1]
+    # and the value used to compute joint_prob[t] are always identical.
+    filter_discrete_prob = _stabilize_probability_vector(filter_discrete_prob)
+
     # Discrete smoother prob
     # P(S_t = j, S_{t+1} = k | y_{1:T})
     smoother_backward_cond_prob = (
@@ -959,10 +989,18 @@ def switching_kalman_smoother(
             next_smoother_discrete_prob,  # Pr(S_{t+1} = k | y_{1:T}), M_{t+1 | T}(k)
         )
 
+        # Stabilize smoother_discrete_state_prob in the carry only,
+        # so it is consistent when used as next_smoother_discrete_prob
+        # in the next backward step. The output arrays store the
+        # un-stabilized version for exact joint/marginal consistency.
+        stabilized_smoother_prob = _stabilize_probability_vector(
+            smoother_discrete_state_prob
+        )
+
         return (
             state_cond_smoother_means,
             state_cond_smoother_covs,
-            smoother_discrete_state_prob,
+            stabilized_smoother_prob,
             pair_cond_smoother_mean,
         ), (
             overall_smoother_mean,
@@ -1046,15 +1084,17 @@ def switching_kalman_smoother_gpb2(
     discrete_state_transition_matrix: jax.Array,
     last_filter_conditional_cont_cov: jax.Array | None = None,
 ) -> tuple[
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
+    jax.Array,  # overall_smoother_mean
+    jax.Array,  # overall_smoother_covs
+    jax.Array,  # smoother_discrete_state_prob
+    jax.Array,  # smoother_joint_discrete_state_prob
+    jax.Array,  # overall_smoother_cross_cov
+    jax.Array,  # state_cond_smoother_means
+    jax.Array,  # state_cond_smoother_covs
+    jax.Array,  # pair_cond_smoother_cross_covs
+    jax.Array,  # pair_cond_smoother_means
+    jax.Array,  # pair_cond_smoother_covs_mstep
+    jax.Array,  # next_pair_cond_smoother_means
 ]:
     """GPB2 switching Kalman smoother — carries S² pair-conditional structure.
 
