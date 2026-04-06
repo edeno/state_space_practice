@@ -79,6 +79,7 @@ References
 3. Murphy, K.P. (1998). Switching Kalman Filters.
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Callable
 
@@ -105,6 +106,8 @@ from state_space_practice.switching_kalman import (
     switching_kalman_smoother_gpb2,
 )
 from state_space_practice.utils import check_converged, make_discrete_transition_matrix
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -558,7 +561,7 @@ def _first_timestep_point_process_update(
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 1,
     line_search_beta: float = 0.5,
-) -> tuple[Array, Array, Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array, Array, Array]:
     """Handle first timestep with x₁ convention (update only, no prediction).
 
     For the first observation y₁, we treat init_state_cond_mean/cov as p(x₁ | S₁)
@@ -1367,7 +1370,7 @@ def switching_point_process_filter(
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 1,
     line_search_beta: float = 0.5,
-) -> tuple[Array, Array, Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array, Array, Array]:
     """Switching point-process Kalman filter for spike observations.
 
     This filter implements a Switching Linear Dynamical System (SLDS) with
@@ -1488,7 +1491,7 @@ def switching_point_process_filter(
     def _step(
         carry: tuple[Array, Array, Array, Array],
         y_t: Array,
-    ) -> tuple[tuple[Array, Array, Array, Array], tuple[Array, Array, Array, Array]]:
+    ) -> tuple[tuple[Array, Array, Array, Array], tuple[Array, Array, Array, Array, Array]]:
         """One step of the switching point-process filter.
 
         Parameters
@@ -2513,7 +2516,7 @@ class SwitchingSpikeOscillatorModel:
             new_weights = []
             for j in range(self.n_discrete_states):
                 state_weights = self.smoother_discrete_state_prob[:, j]
-                total_weight = jnp.sum(state_weights)
+                total_weight = float(jnp.sum(state_weights))
 
                 if total_weight < MIN_STATE_WEIGHT:
                     new_baselines.append(self.spike_params.baseline[:, j])
@@ -2643,15 +2646,23 @@ class SwitchingSpikeOscillatorModel:
         or `update_process_cov` is False, the corresponding projection is skipped.
         """
         # Project each transition matrix to preserve oscillatory block structure
+        # and clamp spectral radius to < 1 for stability
         if self.update_continuous_transition_matrix:
+            _MAX_SPECTRAL_RADIUS = 0.999
+            projected_A_list = []
+            for j in range(self.n_discrete_states):
+                A_j = project_coupled_transition_matrix(
+                    self.continuous_transition_matrix[:, :, j]
+                )
+                # Clamp spectral radius to prevent unstable dynamics
+                eigvals = jnp.linalg.eigvals(A_j)
+                sr = jnp.max(jnp.abs(eigvals))
+                scale = jnp.where(
+                    sr > _MAX_SPECTRAL_RADIUS, _MAX_SPECTRAL_RADIUS / sr, 1.0
+                )
+                projected_A_list.append(A_j * scale)
             self.continuous_transition_matrix = jnp.stack(
-                [
-                    project_coupled_transition_matrix(
-                        self.continuous_transition_matrix[:, :, j]
-                    )
-                    for j in range(self.n_discrete_states)
-                ],
-                axis=-1,
+                projected_A_list, axis=-1
             )
 
         # Project each process covariance to ensure PSD
@@ -2792,6 +2803,30 @@ class SwitchingSpikeOscillatorModel:
         # Track log-likelihoods across iterations
         log_likelihoods: list[float] = []
 
+        # Snapshot parameters for rollback on LL decrease
+        import copy
+        prev_params: dict | None = None
+
+        def _snapshot_params() -> dict:
+            return {
+                "continuous_transition_matrix": self.continuous_transition_matrix.copy(),
+                "process_cov": self.process_cov.copy(),
+                "discrete_transition_matrix": self.discrete_transition_matrix.copy(),
+                "init_mean": self.init_mean.copy(),
+                "init_cov": self.init_cov.copy(),
+                "init_discrete_state_prob": self.init_discrete_state_prob.copy(),
+                "spike_params": copy.deepcopy(self.spike_params),
+            }
+
+        def _restore_params(params: dict) -> None:
+            self.continuous_transition_matrix = params["continuous_transition_matrix"]
+            self.process_cov = params["process_cov"]
+            self.discrete_transition_matrix = params["discrete_transition_matrix"]
+            self.init_mean = params["init_mean"]
+            self.init_cov = params["init_cov"]
+            self.init_discrete_state_prob = params["init_discrete_state_prob"]
+            self.spike_params = params["spike_params"]
+
         for iteration in range(max_iter):
             # E-step: compute posteriors
             marginal_ll = self._e_step(spikes)
@@ -2799,21 +2834,44 @@ class SwitchingSpikeOscillatorModel:
 
             # Check for numerical issues
             if not jnp.isfinite(marginal_ll):
+                if prev_params is not None:
+                    _restore_params(prev_params)
+                    log_likelihoods.pop()
+                    logger.warning(
+                        "Non-finite LL at iteration %d; rolled back to previous.",
+                        iteration,
+                    )
+                    break
                 raise ValueError(
                     f"Non-finite log-likelihood at iteration {iteration}: "
                     f"{marginal_ll}. This may indicate numerical instability."
                 )
 
-            # Check convergence (after at least 2 iterations)
+            # Check convergence and LL decrease (after at least 2 iterations)
             if iteration > 0:
-                is_converged, _ = check_converged(
+                is_converged, is_increasing = check_converged(
                     log_likelihood=log_likelihoods[-1],
                     previous_log_likelihood=log_likelihoods[-2],
                     tolerance=tol,
                 )
 
+                if not is_increasing and prev_params is not None:
+                    _restore_params(prev_params)
+                    log_likelihoods.pop()
+                    logger.warning(
+                        "LL decreased at iteration %d (%.1f -> %.1f); "
+                        "rolled back and stopping.",
+                        iteration,
+                        log_likelihoods[-1],
+                        float(marginal_ll),
+                    )
+                    break
+
                 if is_converged:
                     break
+
+            # Snapshot before M-step modifies parameters
+            prev_params = _snapshot_params()
 
             # M-step: update parameters
             self._m_step_dynamics()
