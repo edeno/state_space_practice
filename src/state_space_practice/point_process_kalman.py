@@ -75,6 +75,26 @@ def log_conditional_intensity(design_matrix: ArrayLike, params: ArrayLike) -> Ar
     return jnp.asarray(design_matrix) @ jnp.asarray(params)
 
 
+def _logdet_psd(mat: Array, diagonal_boost: float = 1e-9) -> Array:
+    """Log-determinant of a PSD matrix, clamping eigenvalues for stability.
+
+    Parameters
+    ----------
+    mat : Array, shape (n, n)
+        Symmetric positive semi-definite matrix.
+    diagonal_boost : float
+        Minimum eigenvalue floor to avoid log(0).
+
+    Returns
+    -------
+    Array
+        Scalar log-determinant.
+    """
+    eigvals = jnp.linalg.eigvalsh(symmetrize(mat))
+    eigvals = jnp.maximum(eigvals, diagonal_boost)
+    return jnp.sum(jnp.log(eigvals))
+
+
 def _safe_expected_count(
     log_rate: Array,
     dt: float,
@@ -191,6 +211,7 @@ def _point_process_laplace_update(
         log_lambda = log_intensity_func(x)
         cond_int = _safe_expected_count(log_lambda, dt)
         # Poisson log-likelihood (ignoring constant log(y!) term)
+        # No floor needed: _safe_expected_count guarantees cond_int >= exp(-20) > 0
         log_lik = jnp.sum(spike_indicator_t * jnp.log(cond_int) - cond_int)
         # Gaussian prior log-probability (ignoring constant)
         delta = x - one_step_mean
@@ -307,15 +328,10 @@ def _point_process_laplace_update(
     if include_laplace_normalization:
         # Laplace correction: log p(y) ≈ log p(y|x*) + log p(x*) + 0.5 log|P_post|
         # Constant terms (d/2 * log 2π) are omitted since they cancel across states.
-        def _logdet_psd(mat: Array) -> Array:
-            eigvals = jnp.linalg.eigvalsh(symmetrize(mat))
-            eigvals = jnp.maximum(eigvals, diagonal_boost)
-            return jnp.sum(jnp.log(eigvals))
-
         delta = posterior_mean - one_step_mean
         quad = delta @ (prior_precision @ delta)
-        logdet_prior = _logdet_psd(one_step_cov)
-        logdet_post = _logdet_psd(posterior_cov)
+        logdet_prior = _logdet_psd(one_step_cov, diagonal_boost)
+        logdet_post = _logdet_psd(posterior_cov, diagonal_boost)
         log_prior = -0.5 * quad - 0.5 * logdet_prior
         log_likelihood = log_likelihood + log_prior + 0.5 * logdet_post
 
@@ -780,7 +796,9 @@ def steepest_descent_point_process_filter(
     def _update(mean_prev: Array, args: tuple[Array, Array]) -> tuple[Array, Array]:
         """Steepest Descent Point Process Filter update step"""
         x_t, spike_indicator_t = args
-        conditional_intensity = jnp.exp(log_receptive_field_model(x_t, mean_prev)) * dt
+        conditional_intensity = _safe_expected_count(
+            log_receptive_field_model(x_t, mean_prev), dt
+        )
         innovation = spike_indicator_t - conditional_intensity
         one_step_grad = grad_log_receptive_field_model(x_t, mean_prev)
         posterior_mean = mean_prev + epsilon_arr @ one_step_grad * innovation
@@ -972,8 +990,9 @@ class PointProcessModel:
             self.transition_matrix = transition_matrix
 
         if self.update_process_cov:
-            # Ensure positive definiteness
-            self.process_cov = stabilize_covariance(process_cov, min_eigenvalue=1e-10)
+            # kalman_maximization_step already applies stabilize_covariance
+            # with min_eigenvalue=1e-8
+            self.process_cov = process_cov
 
         if self.update_init_state:
             self.init_mean = init_mean
