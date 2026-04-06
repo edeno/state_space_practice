@@ -284,9 +284,16 @@ def _rts_smoother_pass(
     filtered_values: Array,
     filtered_covariances: Array,
     Q: Array,
+    A: Optional[Array] = None,
 ) -> tuple[Array, Array, Array]:
-    """JIT-compiled RTS backward smoother for random walk dynamics."""
-    A = jnp.eye(Q.shape[0])
+    """JIT-compiled RTS backward smoother.
+
+    Parameters
+    ----------
+    A : Array or None
+        Transition matrix. None defaults to identity (random walk).
+    """
+    A = A if A is not None else jnp.eye(Q.shape[0])
 
     def _smooth_step(carry, inputs):
         next_sm_mean, next_sm_cov = carry

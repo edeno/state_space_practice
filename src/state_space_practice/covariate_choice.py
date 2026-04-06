@@ -54,9 +54,10 @@ def covariate_predict(
     filt_cov: Array,
     covariates_t: Array,
     input_gain: Array,
+    transition_matrix: Array,
     process_noise_cov: Array,
 ) -> tuple[Array, Array]:
-    """Prediction step with control input.
+    """Prediction step with transition matrix and control input.
 
     Parameters
     ----------
@@ -68,6 +69,9 @@ def covariate_predict(
         Covariate vector for current trial.
     input_gain : Array, shape (K-1, d)
         Input-gain matrix B.
+    transition_matrix : Array, shape (K-1, K-1)
+        State transition matrix A. Identity = random walk.
+        decay * I = mean-reverting (Ornstein-Uhlenbeck).
     process_noise_cov : Array, shape (K-1, K-1)
         Process noise covariance Q.
 
@@ -76,8 +80,8 @@ def covariate_predict(
     pred_mean : Array, shape (K-1,)
     pred_cov : Array, shape (K-1, K-1)
     """
-    pred_mean = filt_mean + input_gain @ covariates_t
-    pred_cov = filt_cov + process_noise_cov
+    pred_mean = transition_matrix @ filt_mean + input_gain @ covariates_t
+    pred_cov = transition_matrix @ filt_cov @ transition_matrix.T + process_noise_cov
     return pred_mean, pred_cov
 
 
@@ -203,6 +207,7 @@ def covariate_choice_filter(
     obs_weights: Optional[ArrayLike] = None,
     process_noise: float = 0.01,
     inverse_temperature: float = 1.0,
+    decay: float = 1.0,
     init_mean: Optional[ArrayLike] = None,
     init_cov: Optional[ArrayLike] = None,
 ) -> ChoiceFilterResult:
@@ -228,6 +233,10 @@ def covariate_choice_filter(
         Scalar process noise (Q = process_noise * I).
     inverse_temperature : float
         Softmax inverse temperature beta.
+    decay : float
+        Value decay rate. 1.0 = random walk (no decay).
+        < 1.0 = mean-reverting toward zero (Ornstein-Uhlenbeck).
+        Transition matrix is A = decay * I.
     init_mean : ArrayLike or None
         Initial state mean, shape (K-1,). Default: zeros.
     init_cov : ArrayLike or None
@@ -282,7 +291,7 @@ def covariate_choice_filter(
     return _covariate_choice_filter_jit(
         choices_arr, n_options, covariates_arr, input_gain_arr,
         obs_cov_arr, obs_weights_arr,
-        process_noise, inverse_temperature, init_mean, init_cov,
+        process_noise, inverse_temperature, decay, init_mean, init_cov,
     )
 
 
@@ -296,22 +305,24 @@ def _covariate_choice_filter_jit(
     obs_weights: Array,
     process_noise: float,
     inverse_temperature: float,
+    decay: float,
     init_mean: Array,
     init_cov: Array,
 ) -> ChoiceFilterResult:
-    """JIT-compiled filter core with dynamics and observation covariates."""
+    """JIT-compiled filter core with decay, dynamics, and obs covariates."""
     k_free = n_options - 1
     Q = jnp.eye(k_free) * process_noise
+    A = jnp.eye(k_free) * decay
 
     def _step(carry, inputs):
         filt_mean, filt_cov, total_ll = carry
         choice_t, u_t, z_t = inputs
 
-        # Predict with control input
-        pred_mean = filt_mean + input_gain @ u_t
-        pred_cov = filt_cov + Q
+        # Predict with transition and control input
+        pred_mean = A @ filt_mean + input_gain @ u_t
+        pred_cov = A @ filt_cov @ A.T + Q
 
-        # Observation offset from obs covariates: Θ @ z_t
+        # Observation offset from obs covariates
         obs_offset = obs_weights @ z_t
 
         # Update via Laplace-EKF with obs offset
@@ -349,6 +360,7 @@ def covariate_choice_smoother(
     obs_weights: Optional[ArrayLike] = None,
     process_noise: float = 0.01,
     inverse_temperature: float = 1.0,
+    decay: float = 1.0,
     init_mean: Optional[ArrayLike] = None,
     init_cov: Optional[ArrayLike] = None,
 ) -> ChoiceSmootherResult:
@@ -363,14 +375,15 @@ def covariate_choice_smoother(
     filt = covariate_choice_filter(
         choices, n_options, covariates, input_gain,
         obs_covariates, obs_weights,
-        process_noise, inverse_temperature, init_mean, init_cov,
+        process_noise, inverse_temperature, decay, init_mean, init_cov,
     )
 
     k_free = n_options - 1
     Q = jnp.eye(k_free) * process_noise
+    A = jnp.eye(k_free) * decay
 
     sm_means, sm_covs, cross_covs = _rts_smoother_pass(
-        filt.filtered_values, filt.filtered_covariances, Q,
+        filt.filtered_values, filt.filtered_covariances, Q, A,
     )
 
     smoothed_values = jnp.concatenate([sm_means, filt.filtered_values[-1:]])
@@ -411,10 +424,15 @@ class CovariateChoiceModel:
         Starting inverse temperature for EM.
     init_process_noise : float
         Starting process noise for EM.
+    init_decay : float
+        Starting value decay rate. 1.0 = random walk (no decay).
+        < 1.0 = mean-reverting toward zero.
     learn_inverse_temperature : bool
         Whether to learn beta via EM.
     learn_process_noise : bool
         Whether to learn Q via EM.
+    learn_decay : bool
+        Whether to learn the decay parameter via EM.
     learn_obs_weights : bool
         Whether to learn Theta via EM.
     """
@@ -426,8 +444,10 @@ class CovariateChoiceModel:
         n_obs_covariates: int = 0,
         init_inverse_temperature: float = 1.0,
         init_process_noise: float = 0.01,
+        init_decay: float = 1.0,
         learn_inverse_temperature: bool = True,
         learn_process_noise: bool = True,
+        learn_decay: bool = False,
         learn_obs_weights: bool = True,
     ):
         if n_options < 2:
@@ -437,8 +457,10 @@ class CovariateChoiceModel:
         self.n_obs_covariates = n_obs_covariates
         self.inverse_temperature = init_inverse_temperature
         self.process_noise = init_process_noise
+        self.decay = init_decay
         self.learn_inverse_temperature = learn_inverse_temperature
         self.learn_process_noise = learn_process_noise
+        self.learn_decay = learn_decay
         self.learn_obs_weights = learn_obs_weights
 
         k_free = n_options - 1
@@ -460,7 +482,8 @@ class CovariateChoiceModel:
             f"CovariateChoiceModel(n_options={self.n_options}, "
             f"n_covariates={self.n_covariates}, "
             f"beta={self.inverse_temperature:.3f}, "
-            f"Q={self.process_noise:.4f}, fitted={fitted})"
+            f"Q={self.process_noise:.4f}, "
+            f"decay={self.decay:.4f}, fitted={fitted})"
         )
 
     @property
@@ -584,15 +607,16 @@ class CovariateChoiceModel:
                 obs_weights=self.obs_weights_ if self.n_obs_covariates > 0 else None,
                 process_noise=self.process_noise,
                 inverse_temperature=self.inverse_temperature,
+                decay=self.decay,
             )
             ll = float(smooth.marginal_log_likelihood)
             log_likelihoods.append(ll)
 
             if verbose:
                 logger.info(
-                    "EM iter %d: LL=%.2f, beta=%.3f, Q=%.6f",
+                    "EM iter %d: LL=%.2f, beta=%.3f, Q=%.6f, decay=%.4f",
                     iteration + 1, ll,
-                    self.inverse_temperature, self.process_noise,
+                    self.inverse_temperature, self.process_noise, self.decay,
                 )
 
             # Check convergence
@@ -623,6 +647,10 @@ class CovariateChoiceModel:
                     self.inverse_temperature, self.obs_weights_,
                 )
 
+            # M-step for decay
+            if self.learn_decay:
+                self.decay = self._m_step_decay(smooth)
+
             # M-step for process noise Q
             if self.learn_process_noise:
                 self.process_noise = self._m_step_process_noise(smooth)
@@ -642,6 +670,7 @@ class CovariateChoiceModel:
             obs_weights=self.obs_weights_ if self.n_obs_covariates > 0 else None,
             process_noise=self.process_noise,
             inverse_temperature=self.inverse_temperature,
+            decay=self.decay,
         )
         self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
         self.n_iter_ = len(log_likelihoods)
@@ -649,29 +678,56 @@ class CovariateChoiceModel:
 
         return log_likelihoods
 
+    def _m_step_decay(self, smooth: ChoiceSmootherResult) -> float:
+        """M-step: update scalar decay from smoother statistics.
+
+        For x_t = a * x_{t-1} + B u_t + w_t, the M-step for scalar a is:
+            a = sum_t [m_t - B u_t]' m_{t-1} / sum_t [m_{t-1}' m_{t-1} + tr(P_{t-1})]
+        This is a weighted regression of (m_t - B u_t) on m_{t-1}.
+        """
+        m = smooth.smoothed_values  # (T, K-1)
+        P = smooth.smoothed_covariances  # (T, K-1, K-1)
+
+        target = m[1:]  # (T-1, K-1)
+        if self.n_covariates > 0 and self._covariates is not None:
+            u = self._covariates[1:]
+            target = target - u @ self.input_gain_.T
+
+        # Numerator: sum_t (target_t)' m_{t-1}
+        numer = jnp.sum(target * m[:-1])
+        # Denominator: sum_t (m_{t-1}' m_{t-1} + tr(P_{t-1}))
+        denom = jnp.sum(m[:-1] ** 2) + jnp.sum(
+            jnp.trace(P[:-1], axis1=1, axis2=2)
+        )
+        a = float(jnp.clip(numer / jnp.maximum(denom, 1e-10), 0.01, 1.0))
+        return a
+
     def _m_step_process_noise(self, smooth: ChoiceSmootherResult) -> float:
         """M-step: update scalar process noise from smoother statistics.
 
-        When covariates are present, subtracts B @ u_t from the increments
-        before computing residual variance.
+        Accounts for transition matrix A and dynamics covariates B.
+        Residual: m_t - A m_{t-1} - B u_t.
         """
         m = smooth.smoothed_values
         P = smooth.smoothed_covariances
         C = smooth.smoother_cross_cov
+        a = self.decay
 
         T_minus_1 = m.shape[0] - 1
-        diff = m[1:] - m[:-1]  # (T-1, K-1)
+        diff = m[1:] - a * m[:-1]  # (T-1, K-1)
 
         # Subtract covariate contribution if present
         if self.n_covariates > 0 and self._covariates is not None:
-            u = self._covariates[1:]  # (T-1, d)
+            u = self._covariates[1:]
             diff = diff - u @ self.input_gain_.T
 
+        # Q_hat with transition: E[(x_t - A x_{t-1})(...)'] =
+        #   diff diff' + P_t + a^2 P_{t-1} - 2a C_{t-1,t}
         Q_hat = (
             jnp.einsum("ti,tj->ij", diff, diff)
             + jnp.sum(P[1:], axis=0)
-            + jnp.sum(P[:-1], axis=0)
-            - 2 * jnp.sum(C, axis=0)
+            + a**2 * jnp.sum(P[:-1], axis=0)
+            - 2 * a * jnp.sum(C, axis=0)
         ) / T_minus_1
         q = float(jnp.maximum(jnp.mean(jnp.diag(Q_hat)), 1e-8))
         return q
@@ -691,6 +747,7 @@ class CovariateChoiceModel:
                 obs_weights=self.obs_weights_ if self.n_obs_covariates > 0 else None,
                 process_noise=self.process_noise,
                 inverse_temperature=beta,
+                decay=self.decay,
             )
             return result.marginal_log_likelihood
 
@@ -754,6 +811,8 @@ class CovariateChoiceModel:
             n += (self.n_options - 1) * self.n_covariates  # B matrix
         if self.n_obs_covariates > 0 and self.learn_obs_weights:
             n += self.n_options * self.n_obs_covariates  # Theta matrix
+        if self.learn_decay:
+            n += 1  # scalar decay
         return n
 
     def bic(self) -> float:

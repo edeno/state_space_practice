@@ -25,27 +25,29 @@ class TestCovariatePrediction:
     """Tests for covariate_predict."""
 
     def test_prediction_with_covariates(self):
-        """pred_mean = filt_mean + B @ u_t."""
+        """pred_mean = A @ filt_mean + B @ u_t."""
         filt_mean = jnp.array([1.0, 2.0])
         filt_cov = jnp.eye(2) * 0.1
         B = jnp.array([[0.5, 0.0], [0.0, 0.3]])
+        A = jnp.eye(2)  # random walk
         u_t = jnp.array([1.0, 0.0])
         Q = jnp.eye(2) * 0.01
 
-        pred_mean, pred_cov = covariate_predict(filt_mean, filt_cov, u_t, B, Q)
+        pred_mean, pred_cov = covariate_predict(filt_mean, filt_cov, u_t, B, A, Q)
 
         np.testing.assert_allclose(pred_mean, jnp.array([1.5, 2.0]), atol=1e-6)
-        np.testing.assert_allclose(pred_cov, filt_cov + Q, atol=1e-6)
+        np.testing.assert_allclose(pred_cov, A @ filt_cov @ A.T + Q, atol=1e-6)
 
     def test_prediction_without_covariates(self):
-        """B = zeros -> pred_mean = filt_mean (random walk)."""
+        """B = zeros, A = I -> pred_mean = filt_mean (random walk)."""
         filt_mean = jnp.array([1.0, 2.0])
         filt_cov = jnp.eye(2) * 0.1
         B = jnp.zeros((2, 2))
+        A = jnp.eye(2)
         u_t = jnp.array([1.0, 1.0])
         Q = jnp.eye(2) * 0.01
 
-        pred_mean, pred_cov = covariate_predict(filt_mean, filt_cov, u_t, B, Q)
+        pred_mean, pred_cov = covariate_predict(filt_mean, filt_cov, u_t, B, A, Q)
 
         np.testing.assert_allclose(pred_mean, filt_mean, atol=1e-6)
 
@@ -55,13 +57,27 @@ class TestCovariatePrediction:
         filt_mean = jnp.zeros(k_free)
         filt_cov = jnp.eye(k_free)
         B = jnp.zeros((k_free, d))
+        A = jnp.eye(k_free)
         u_t = jnp.ones(d)
         Q = jnp.eye(k_free) * 0.01
 
-        pred_mean, pred_cov = covariate_predict(filt_mean, filt_cov, u_t, B, Q)
+        pred_mean, pred_cov = covariate_predict(filt_mean, filt_cov, u_t, B, A, Q)
 
         assert pred_mean.shape == (k_free,)
         assert pred_cov.shape == (k_free, k_free)
+
+    def test_prediction_with_decay(self):
+        """decay < 1 should shrink pred_mean toward zero."""
+        filt_mean = jnp.array([2.0, 3.0])
+        filt_cov = jnp.eye(2) * 0.1
+        B = jnp.zeros((2, 1))
+        A = jnp.eye(2) * 0.9  # decay = 0.9
+        u_t = jnp.zeros(1)
+        Q = jnp.eye(2) * 0.01
+
+        pred_mean, _ = covariate_predict(filt_mean, filt_cov, u_t, B, A, Q)
+
+        np.testing.assert_allclose(pred_mean, jnp.array([1.8, 2.7]), atol=1e-6)
 
 
 class TestMStepInputGain:
@@ -818,3 +834,94 @@ class TestObservationCovariates:
         m = CovariateChoiceModel(n_options=3, n_obs_covariates=2)
         with pytest.raises(ValueError, match="obs_covariates"):
             m.fit(np.array([0, 1, 2, 1, 0]))
+
+
+class TestDecayDynamics:
+    """Tests for mean-reverting value decay (A = decay * I)."""
+
+    def test_decay_1_is_random_walk(self):
+        """decay=1.0 should match the default (no decay)."""
+        rng = np.random.default_rng(42)
+        choices = rng.integers(0, 3, size=100)
+
+        m1 = CovariateChoiceModel(n_options=3, init_decay=1.0, learn_decay=False)
+        m1.fit(choices, max_iter=3)
+
+        m2 = CovariateChoiceModel(n_options=3, learn_decay=False)
+        m2.fit(choices, max_iter=3)
+
+        np.testing.assert_allclose(m1.log_likelihood_, m2.log_likelihood_, rtol=1e-4)
+
+    def test_decay_shrinks_values(self):
+        """With decay < 1, values should stay closer to zero than random walk."""
+        rng = np.random.default_rng(42)
+        choices = np.where(rng.random(200) < 0.8, 1, rng.integers(0, 3, size=200))
+
+        m_walk = CovariateChoiceModel(
+            n_options=3, init_decay=1.0, learn_decay=False,
+            learn_inverse_temperature=False, learn_process_noise=False,
+        )
+        m_walk.fit(choices, max_iter=3)
+
+        m_decay = CovariateChoiceModel(
+            n_options=3, init_decay=0.9, learn_decay=False,
+            learn_inverse_temperature=False, learn_process_noise=False,
+        )
+        m_decay.fit(choices, max_iter=3)
+
+        walk_mag = np.mean(np.abs(np.array(m_walk.smoothed_values)))
+        decay_mag = np.mean(np.abs(np.array(m_decay.smoothed_values)))
+        assert decay_mag < walk_mag
+
+    def test_learn_decay(self):
+        """EM should learn a decay < 1 on mean-reverting data."""
+        rng = np.random.default_rng(42)
+        n_trials = 300
+        # Generate data with decay: values revert to 0
+        true_decay = 0.85
+        x = np.zeros((n_trials, 2))
+        for t in range(1, n_trials):
+            x[t] = true_decay * x[t - 1] + rng.normal(0, 0.1, 2)
+        # Choices from softmax
+        full_v = np.column_stack([np.zeros(n_trials), x])
+        probs = np.exp(2.0 * full_v)
+        probs = probs / probs.sum(axis=1, keepdims=True)
+        choices = np.array([rng.choice(3, p=probs[t]) for t in range(n_trials)])
+
+        model = CovariateChoiceModel(
+            n_options=3, learn_decay=True,
+            init_decay=1.0,  # start from random walk
+        )
+        model.fit(choices, max_iter=15)
+        # Should learn decay < 1
+        assert model.decay < 0.99, f"decay={model.decay:.3f}, expected < 0.99"
+
+    def test_decay_with_covariates(self):
+        """Decay should work alongside dynamics covariates."""
+        rng = np.random.default_rng(42)
+        n_trials = 200
+        choices = np.where(rng.random(n_trials) < 0.7, 1, rng.integers(0, 3, size=n_trials))
+        covariates = np.zeros((n_trials, 2))
+        for t in range(1, n_trials):
+            if choices[t - 1] > 0:
+                covariates[t, choices[t - 1] - 1] = 1.0
+
+        model = CovariateChoiceModel(
+            n_options=3, n_covariates=2, init_decay=0.95,
+            learn_decay=False,
+        )
+        model.fit(choices, covariates=covariates, max_iter=5)
+        assert np.isfinite(model.log_likelihood_)
+
+    def test_decay_in_repr(self):
+        m = CovariateChoiceModel(n_options=3, init_decay=0.9)
+        assert "decay=0.9000" in repr(m)
+
+    def test_n_free_params_with_decay(self):
+        m = CovariateChoiceModel(
+            n_options=3, learn_decay=True,
+            learn_process_noise=True,
+            learn_inverse_temperature=True,
+        )
+        # Q(1) + beta(1) + decay(1) = 3
+        assert m.n_free_params == 3
