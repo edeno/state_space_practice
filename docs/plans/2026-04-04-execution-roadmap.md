@@ -1,16 +1,15 @@
-# Claude Code Execution Roadmap for Plan Set
+# Claude Code Execution Roadmap
 
-> For Claude: Execute plans in this exact order. Do not start a downstream plan until all entry and exit gates for upstream dependencies pass.
+> For Claude: Execute plans in this exact order within each track. Do not start a downstream plan until all entry and exit gates for upstream dependencies pass.
 
 ## Purpose
 
-This roadmap provides one strict implementation queue for all ten plans in docs/plans, with:
+This roadmap provides the authoritative implementation queue for all plans in docs/plans/, organized into two tracks:
 
-- dependency order
-- feasibility/risk level
-- estimated implementation effort
-- objective entry gates and exit gates
-- stop conditions for unsafe progression
+- **Infrastructure track:** Core models and utilities that form the computational foundation
+- **Scientific track:** Neuroscience-specific models that build on the infrastructure to test scientific hypotheses about CA1/mPFC replay, theta sequences, and value-modulated neural coding
+
+Both tracks share the same dependency graph. The scientific track has a "minimum publishable path" — the shortest route to a novel scientific claim.
 
 ## Global Rules
 
@@ -20,48 +19,153 @@ This roadmap provides one strict implementation queue for all ten plans in docs/
 4. If any gate fails, stop and fix before continuing.
 5. For speculative plans, complete prototype scope before full model integration.
 
+## Status
+
+| Plan | Status |
+|---|---|
+| Position Decoding | **DONE** (position_decoder.py, 35 tests) |
+| Multinomial Choice | **DONE** (multinomial_choice.py, 43 tests) |
+| All others | Not started |
+
+## Dependency Graph
+
+```
+                    ┌─────────────────────────┐
+                    │  0. Numerical Stability  │
+                    │     (infrastructure)     │
+                    └────────┬────────────────┘
+                             │
+        ┌────────────────────┼────────────────────┐
+        │                    │                     │
+        ▼                    ▼                     ▼
+  ┌──────────┐      ┌──────────────┐      ┌──────────────┐
+  │ 1. Pos   │      │ 2. Cross-    │      │ 3. Multinomial│
+  │ Decoding │      │ Session Drift│      │ Choice       │
+  │ ✅ DONE  │      │              │      │ ✅ DONE      │
+  └────┬─────┘      └──────┬───────┘      └──┬───────────┘
+       │                   │                  │
+       │                   │          ┌───────┴────────┐
+       │                   │          │                │
+       │                   │          ▼                ▼
+       │                   │   ┌────────────┐  ┌─────────────┐
+       ▼                   │   │ 3.5 RL     │  │ 4. Joint    │
+  ┌──────────┐             │   │ Covariates │  │ Belief      │
+  │ 5. Adapt.│             │   └─────┬──────┘  │ Decoder     │
+  │ Decoder  │             │         │         └──────┬──────┘
+  └──────────┘             │         │                │
+       │                   ▼         │                │
+       │            ┌────────────┐   │                │
+       │            │ 6. Covar.  │   │                │
+       │            │ Drift      │   │                │
+       │            └────────────┘   │                │
+       │                   │         │                │
+       ▼                   ▼         ▼                ▼
+  ┌─────────────────────────────────────────────────────┐
+  │              Integration Plans (7-9)                 │
+  │  7. Spatial-Value  8. Joint Learn+Drift  9. X-Region│
+  └─────────────────────────────────────────────────────┘
+
+  Scientific Track (builds on infrastructure):
+
+  1. Pos Decoding ──► CA1 Represented-State Switching
+       ✅ DONE              │
+                             ▼
+  3. Multinomial ──► Value-Gated Sequence Expression
+     Choice                  │
+     ✅ DONE                 ▼
+                     Coupled Dual-Latent CA1-mPFC
+                             │
+                             ▼
+                     Hierarchical Multi-Timescale
+```
+
 ## Ordered Queue
+
+### Foundation (Order 0)
 
 | Order | Plan | Feasibility | Risk | Effort | Depends On |
 |---|---|---|---|---|---|
-| 1 | 2026-04-03-position-decoding.md + 2026-04-03-position-decoding-tasks.md | READY | Low-Med | 1-2 weeks | None |
-| 2 | 2026-04-03-cross-session-drift.md + 2026-04-03-cross-session-drift-tasks.md | READY | Low-Med | 1-2 weeks | None |
-| 3 | 2026-04-04-multinomial-choice-model.md + 2026-04-04-multinomial-choice-tasks.md | READY | Low-Med | 2-3 weeks | None |
-| 4 | 2026-04-04-joint-belief-state-decoder.md + 2026-04-04-joint-belief-state-decoder-tasks.md | PARTIAL | Medium | 2-3 weeks | Multinomial Choice complete |
-| 5 | 2026-04-03-adaptive-decoder.md | PARTIAL | Medium | 2 weeks | Position Decoding |
-| 6 | 2026-04-04-covariate-driven-drift.md | PARTIAL | Medium | 2-3 weeks | Cross-Session Drift baseline APIs |
-| 7 | 2026-04-04-spatial-value-model.md | PARTIAL | Medium-High | 2-3 weeks | Multinomial Choice + Joint Belief Decoder complete |
-| 8 | 2026-04-03-joint-learning-drift.md | SPECULATIVE | High | 3+ weeks | Adaptive + Covariate + Multinomial pieces |
-| 9 | 2026-04-03-cross-region-coupling.md | SPECULATIVE | High | 3+ weeks | Switching point-process stability + oscillator block abstractions |
+| 0 | numerical-stability-remediation.md | READY | Low | 1 week | None |
+
+Fixes correctness bugs in kalman.py, switching_kalman.py, and point_process_kalman.py that all downstream plans depend on. Should be done first.
+
+### Infrastructure Track
+
+| Order | Plan | Feasibility | Risk | Effort | Depends On | Status |
+|---|---|---|---|---|---|---|
+| 1 | position-decoding.md | READY | Low-Med | 1-2 weeks | None | **DONE** |
+| 2 | cross-session-drift.md | READY | Low-Med | 1-2 weeks | None | Not started |
+| 3 | multinomial-choice-model.md | READY | Low-Med | 2-3 weeks | None | **DONE** |
+| 3.5 | rl-state-space-covariates.md | READY | Low-Med | 1-2 weeks | Multinomial Choice | Not started |
+| 4 | joint-belief-state-decoder.md | PARTIAL | Medium | 2-3 weeks | Multinomial Choice | Not started |
+| 5 | adaptive-decoder.md | PARTIAL | Medium | 2 weeks | Position Decoding | Not started |
+| 6 | covariate-driven-drift.md | PARTIAL | Medium | 2-3 weeks | Cross-Session Drift | Not started |
+| 7 | spatial-value-model.md | PARTIAL | Med-High | 2-3 weeks | Multinomial Choice + Joint Belief | Not started |
+| 8 | joint-learning-drift.md | SPECULATIVE | High | 3+ weeks | Adaptive + Covariate + Multinomial | Not started |
+| 9 | cross-region-coupling.md | SPECULATIVE | High | 3+ weeks | Switching point-process + oscillator | Not started |
+
+### Scientific Track (CA1/mPFC replay and value)
+
+| Order | Plan | Feasibility | Risk | Effort | Depends On |
+|---|---|---|---|---|---|
+| S1 | ca1-represented-state-switching.md | PARTIAL | Medium | 2-3 weeks | Position Decoding (DONE) |
+| S2 | value-gated-sequence-expression.md | PARTIAL | Med-High | 2-3 weeks | S1 + Multinomial Choice (DONE) |
+| S3 | coupled-dual-latent-ca1-mpfc.md | PARTIAL | High | 3+ weeks | S1 + Joint Belief Decoder |
+| S4 | hierarchical-multi-timescale.md | SPECULATIVE | High | 3+ weeks | S1 + Multinomial Choice + Cross-Session Drift |
+
+### Minimum Publishable Path
+
+The shortest route to a novel scientific claim:
+
+1. Position Decoding — **DONE**
+2. Multinomial Choice — **DONE**
+3. CA1 Represented-State Switching (S1) — next scientific target
+4. Value-Gated Sequence Expression (S2) — the novel result
+
+Claim: "CA1 alternates between local and nonlocal represented content, and latent value inferred from behavior biases nonlocal sequence expression."
 
 ## Why This Order
 
-- Orders 1-3 maximize fast wins using existing infrastructure and reduce unknowns.
-- Orders 4-7 are dependency-driven integrations that become tractable after the core models exist.
-- Orders 8-9 are research-grade integration efforts and should only start once lower-risk blocks are validated.
+- **Order 0** fixes shared infrastructure bugs before anything builds on top.
+- **Orders 1-3** (DONE) established the core decoding and behavioral models.
+- **Order 3.5** (RL covariates) strengthens the behavioral model with mechanistic value updates, supporting all downstream value-related plans.
+- **Orders 4-7** are dependency-driven integrations.
+- **Orders 8-9** are speculative integration efforts — only after lower-risk pieces are validated.
+- **S1-S2** form the minimum publishable path using infrastructure already built.
+- **S3-S4** are ambitious cross-region and multi-timescale models for later.
+
+## Shared Code Opportunities
+
+The following plans share identical mathematical patterns and should use shared helpers:
+
+- **Input-gain M-step** (B matrix from smoother statistics): Used by both RL Covariates (Order 3.5) and Covariate-Driven Drift (Order 6). Extract `m_step_input_gain(smoothed_increments, covariates)` into `kalman.py`.
+- **Model comparison utilities** (BIC, held-out LL, cross-validation): Used by Multinomial Choice, RL Covariates, Joint Belief Decoder, and Value-Gated Sequences. Consider a shared `model_comparison.py` utility module.
 
 ## Plan Entry/Exit Gates
 
-### Order 1: Position Decoding
+### Order 0: Numerical Stability
 
 Entry gate:
 
-- point-process and place-field regression baseline passes
-
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_point_process_kalman.py src/state_space_practice/tests/test_place_field_model.py -v
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_kalman.py src/state_space_practice/tests/test_switching_kalman.py src/state_space_practice/tests/test_point_process_kalman.py -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_position_decoder.py -v
+# Same tests must still pass, plus new stability regression tests
+conda run -n state_space_practice pytest src/state_space_practice/tests/ -v
 conda run -n state_space_practice ruff check src/state_space_practice
 ```
 
 Stop condition:
 
-- synthetic decode smoke run has unstable or non-finite trajectories
+- Any existing test regresses after stabilization changes
+
+### Order 1: Position Decoding — DONE
+
+35 tests passing. Exit gate satisfied.
 
 ### Order 2: Cross-Session Drift
 
@@ -82,26 +186,31 @@ Stop condition:
 
 - session summary extraction API cannot provide stable means/covariances
 
-### Order 3: Multinomial Choice (Design + Tasks)
+### Order 3: Multinomial Choice — DONE
+
+43 tests passing. Exit gate satisfied. K=2 Smith consistency verified.
+
+### Order 3.5: RL State-Space Covariates
 
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_smith_learning_algorithm.py src/state_space_practice/tests/test_kalman.py -v
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_multinomial_choice.py src/state_space_practice/tests/test_kalman.py -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_multinomial_choice.py -v
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_covariate_choice.py -v
 conda run -n state_space_practice ruff check src/state_space_practice
 ```
 
-Stop condition:
+Stop conditions:
 
-- K=2 consistency check against Smith-style behavior fails
+- No-covariate mode does not reproduce MultinomialChoiceModel exactly
+- Rescorla-Wagner equivalence test fails (K=2, reward covariate, Q=0)
 
-### Order 4: Joint Belief-State Decoder (Design + Tasks)
+### Order 4: Joint Belief-State Decoder
 
 Entry gate:
 
@@ -185,10 +294,10 @@ Entry gate:
 conda run -n state_space_practice pytest src/state_space_practice/tests/test_adaptive_decoder.py src/state_space_practice/tests/test_covariate_drift.py src/state_space_practice/tests/test_multinomial_choice.py -v
 ```
 
-Exit gate (prototype):
+Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_state_dependent_learning.py src/state_space_practice/tests/test_joint_discrete_state.py src/state_space_practice/tests/test_state_dependent_drift.py src/state_space_practice/tests/test_joint_learning_drift_model.py -v
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_joint_learning_drift_model.py -v
 conda run -n state_space_practice ruff check src/state_space_practice
 ```
 
@@ -204,10 +313,10 @@ Entry gate:
 conda run -n state_space_practice pytest src/state_space_practice/tests/test_switching_point_process.py src/state_space_practice/tests/test_oscillator_utils.py -v
 ```
 
-Exit gate (two-region MVP):
+Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_multi_region_oscillator.py src/state_space_practice/tests/test_multi_region_spike_obs.py src/state_space_practice/tests/test_multi_region_model.py -v
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_multi_region_model.py -v
 conda run -n state_space_practice ruff check src/state_space_practice
 ```
 
@@ -215,28 +324,83 @@ Stop condition:
 
 - finite-difference Jacobian checks for multi-region spike observation fail
 
-## Suggested Branching Strategy
+### Scientific Track Gates
 
-Use one branch per order block:
+#### S1: CA1 Represented-State Switching
 
-- roadmap-order-1-position-decoding
-- roadmap-order-2-cross-session-drift
-- roadmap-order-3-multinomial-choice
-- roadmap-order-4-joint-belief-decoder
-- roadmap-order-5-adaptive-decoder
-- roadmap-order-6-covariate-drift
-- roadmap-order-7-spatial-value
-- roadmap-order-8-joint-learning-drift
-- roadmap-order-9-cross-region-coupling
+Entry gate:
 
-Do not stack more than one unfinished speculative branch.
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_position_decoder.py src/state_space_practice/tests/test_switching_kalman.py src/state_space_practice/tests/test_point_process_kalman.py -v
+```
+
+Exit gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_ca1_represented_state.py -v
+conda run -n state_space_practice ruff check src/state_space_practice
+```
+
+Stop condition:
+
+- discrete state posterior does not distinguish local vs. nonlocal content on synthetic data with known replay events
+
+#### S2: Value-Gated Sequence Expression
+
+Entry gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_ca1_represented_state.py src/state_space_practice/tests/test_multinomial_choice.py -v
+```
+
+Exit gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_value_gated_sequence.py -v
+conda run -n state_space_practice ruff check src/state_space_practice
+```
+
+Stop condition:
+
+- value modulation of nonlocal content is not detectable on synthetic data with known value-destination coupling
+
+#### S3: Coupled Dual-Latent CA1-mPFC
+
+Entry gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_ca1_represented_state.py src/state_space_practice/tests/test_joint_belief_decoder.py -v
+```
+
+Exit gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_dual_latent_coupling.py -v
+conda run -n state_space_practice ruff check src/state_space_practice
+```
+
+#### S4: Hierarchical Multi-Timescale
+
+Entry gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_ca1_represented_state.py src/state_space_practice/tests/test_multinomial_choice.py -v
+```
+
+Exit gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_hierarchical_timescale.py -v
+conda run -n state_space_practice ruff check src/state_space_practice
+```
 
 ## Suggested Weekly Milestones
 
-- Week 1-2: Orders 1-2
-- Week 3-5: Orders 3-4
-- Week 6-10: Orders 5-7
-- Week 11+: Orders 8-9 prototypes
+- Week 1: Order 0 (numerical stability)
+- Week 2-3: Order 3.5 (RL covariates) — immediate next step
+- Week 3-4: S1 (CA1 represented-state switching) — min publishable path
+- Week 5-6: S2 (value-gated sequences) — the novel scientific result
+- Week 7+: Orders 2, 4-7 as needed; S3-S4 as stretch goals
 
 ## Completion Definition
 
