@@ -23,6 +23,7 @@ Both tracks share the same dependency graph. The scientific track has a "minimum
 
 | Plan | Status |
 |---|---|
+| Numerical Stability | **DONE** (kalman.py, switching_kalman.py, point_process_kalman.py stabilized) |
 | Position Decoding | **DONE** (position_decoder.py, 35 tests) |
 | Multinomial Choice | **DONE** (multinomial_choice.py, 43 tests) |
 | All others | Not started |
@@ -85,9 +86,9 @@ Both tracks share the same dependency graph. The scientific track has a "minimum
 
 | Order | Plan | Feasibility | Risk | Effort | Depends On |
 |---|---|---|---|---|---|
-| 0 | numerical-stability-remediation.md | READY | Low | 1 week | None |
+| 0 | numerical-stability-remediation.md | **DONE** | Low | 1 week | None |
 
-Fixes correctness bugs in kalman.py, switching_kalman.py, and point_process_kalman.py that all downstream plans depend on. Should be done first.
+Fixed correctness bugs in kalman.py, switching_kalman.py, and point_process_kalman.py.
 
 ### Infrastructure Track
 
