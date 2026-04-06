@@ -394,6 +394,7 @@ class PlaceFieldModel:
                 f"neuron_idx={neuron_idx} out of range for "
                 f"n_neurons={self.n_neurons}"
             )
+        assert self.n_basis_per_neuron is not None, "Model not initialized"
         nb = self.n_basis_per_neuron
         start = neuron_idx * nb
         return slice(start, start + nb), nb
@@ -409,6 +410,8 @@ class PlaceFieldModel:
         -------
         Array, shape (n_time, n_neurons, n_basis)
         """
+        assert self.n_basis_per_neuron is not None, "Model not initialized"
+        assert self.n_basis is not None, "Model not initialized"
         nb = self.n_basis_per_neuron
         n_time = Z_base.shape[0]
         Z_base_jnp = jnp.asarray(Z_base)
@@ -424,6 +427,15 @@ class PlaceFieldModel:
                 f"Model has not been fitted. "
                 f"Call model.fit(position, spikes) before {method_name}()."
             )
+        # These are always set before smoother_mean; assert for type narrowing
+        assert self.basis_info is not None
+        assert self.n_basis is not None
+        assert self.n_basis_per_neuron is not None
+        assert self.transition_matrix is not None
+        assert self.process_cov is not None
+        assert self.init_mean is not None
+        assert self.init_cov is not None
+        assert self.smoother_cov is not None
 
     def _build_design_matrix(
         self,
@@ -455,6 +467,7 @@ class PlaceFieldModel:
 
     def _initialize_parameters(self) -> None:
         """Initialize model parameters."""
+        assert self.n_basis is not None, "Must call _build_design_matrix first"
         n = self.n_basis
         self.transition_matrix = jnp.eye(n)
         self.process_cov = jnp.eye(n) * self.init_process_noise
@@ -465,6 +478,10 @@ class PlaceFieldModel:
         self, design_matrix: Array, spikes: Array
     ) -> float:
         """E-step: run filter and smoother."""
+        assert self.init_mean is not None, "Model not initialized"
+        assert self.init_cov is not None, "Model not initialized"
+        assert self.transition_matrix is not None, "Model not initialized"
+        assert self.process_cov is not None, "Model not initialized"
         (
             self.smoother_mean,
             self.smoother_cov,
@@ -496,6 +513,10 @@ class PlaceFieldModel:
         The diagonal/isotropic constraint on Q is then applied, discarding
         off-diagonal covariance structure to keep the model tractable.
         """
+        assert self.smoother_mean is not None, "E-step must run before M-step"
+        assert self.smoother_cov is not None, "E-step must run before M-step"
+        assert self.smoother_cross_cov is not None, "E-step must run before M-step"
+        assert self.n_basis is not None, "Model not initialized"
         sm = self.smoother_mean
         sc = self.smoother_cov
         scc = self.smoother_cross_cov
@@ -756,6 +777,9 @@ class PlaceFieldModel:
         your intensity function for exact predictions.
         """
         self._check_fitted("predict_rate_map")
+        assert self.basis_info is not None
+        assert self.smoother_mean is not None
+        assert self.smoother_cov is not None
 
         import warnings
         if self._log_intensity_func is not log_conditional_intensity:
@@ -813,6 +837,8 @@ class PlaceFieldModel:
             Estimated place field center (x, y) in each block.
         """
         self._check_fitted("predict_center")
+        assert self.basis_info is not None
+        assert self.smoother_mean is not None
 
         Z_grid = evaluate_basis(grid_positions, self.basis_info)
         s, _ = self._neuron_weights(neuron_idx)
@@ -863,6 +889,7 @@ class PlaceFieldModel:
         >>> plt.pcolormesh(x_edges, y_edges, rate.reshape(len(y_edges), len(x_edges)))
         """
         self._check_fitted("make_grid")
+        assert self.basis_info is not None
         x = np.linspace(self.basis_info["x_lo"], self.basis_info["x_hi"], n_grid)
         y = np.linspace(self.basis_info["y_lo"], self.basis_info["y_hi"], n_grid)
         xx, yy = np.meshgrid(x, y)
@@ -892,6 +919,11 @@ class PlaceFieldModel:
             Marginal log-likelihood of the held-out data.
         """
         self._check_fitted("score")
+        assert self.basis_info is not None
+        assert self.init_mean is not None
+        assert self.init_cov is not None
+        assert self.transition_matrix is not None
+        assert self.process_cov is not None
 
         position = np.asarray(position)
         spikes = jnp.asarray(spikes)
@@ -951,6 +983,8 @@ class PlaceFieldModel:
             Lower and upper bounds for each weight at each time step.
         """
         self._check_fitted("get_state_confidence_interval")
+        assert self.smoother_mean is not None
+        assert self.smoother_cov is not None
         return get_confidence_interval(
             self.smoother_mean, self.smoother_cov, alpha=alpha
         )
@@ -966,14 +1000,16 @@ class PlaceFieldModel:
         Counts diagonal entries of Q (or 1 for isotropic), A entries if
         learned, and initial mean + diagonal covariance if learned.
         """
+        assert self.n_basis is not None, "Model not initialized"
+        nb = self.n_basis
         n = 0
         if self.update_process_cov:
-            n += self.n_basis if self.process_noise_structure == "diagonal" else 1
+            n += nb if self.process_noise_structure == "diagonal" else 1
         if self.update_transition_matrix:
-            n += self.n_basis ** 2
+            n += nb ** 2
         if self.update_init_state:
-            n += self.n_basis  # mean
-            n += self.n_basis  # diagonal of covariance (effective)
+            n += nb  # mean
+            n += nb  # diagonal of covariance (effective)
         return n
 
     def bic(self) -> float:
@@ -989,8 +1025,9 @@ class PlaceFieldModel:
         float
         """
         self._check_fitted("bic")
+        assert self.smoother_mean is not None
         n = self.smoother_mean.shape[0]
-        return -2.0 * self.log_likelihoods[-1] + self.n_free_params * np.log(n)
+        return float(-2.0 * self.log_likelihoods[-1] + self.n_free_params * np.log(n))
 
     def aic(self) -> float:
         """Akaike Information Criterion. Lower is better.
@@ -1016,6 +1053,8 @@ class PlaceFieldModel:
             process noise, and drift metrics.
         """
         self._check_fitted("summary")
+        assert self.smoother_mean is not None
+        assert self.process_cov is not None
 
         n_time = self.smoother_mean.shape[0]
         session_duration = n_time * self.dt
@@ -1099,6 +1138,8 @@ class PlaceFieldModel:
             block_times : (n_blocks,) — center time of each block (seconds)
         """
         self._check_fitted("drift_summary")
+        assert self.basis_info is not None
+        assert self.smoother_mean is not None
 
         grid, _, _ = self.make_grid(n_grid)
         Z_grid = evaluate_basis(grid, self.basis_info)
@@ -1163,6 +1204,7 @@ class PlaceFieldModel:
         import matplotlib.pyplot as plt
 
         self._check_fitted("plot_rate_maps")
+        assert self.smoother_mean is not None
 
         grid, x_edges, y_edges = self.make_grid(n_grid)
         n_time = self.smoother_mean.shape[0]
@@ -1239,7 +1281,8 @@ class PlaceFieldModel:
         else:
             fig = ax.figure
 
-        colors = plt.cm.viridis(np.linspace(0, 1, n_blocks))
+        cmap = plt.get_cmap("viridis")
+        colors = cmap(np.linspace(0, 1, n_blocks))
         for i in range(n_blocks - 1):
             ax.plot(
                 centers[i : i + 2, 0],
