@@ -7,6 +7,13 @@ Extends the multinomial choice model with input-driven value dynamics:
 where B is a learned input-gain matrix mapping trial covariates to value
 updates. When covariates are absent, reduces to MultinomialChoiceModel.
 
+Covariate indexing convention
+-----------------------------
+``covariates[t]`` drives the prediction at trial t, i.e. the transition
+from x_{t-1} to x_t. In an RL context, the reward earned on trial t-1
+should appear as ``covariates[t]`` so that it drives the value update
+going into trial t. ``covariates[0]`` is typically zero (no prior reward).
+
 References
 ----------
 [1] Rescorla, R.A. & Wagner, A.R. (1972). A theory of Pavlovian conditioning.
@@ -29,10 +36,11 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.kalman import _kalman_smoother_update, psd_solve
+from state_space_practice.kalman import psd_solve
 from state_space_practice.multinomial_choice import (
     ChoiceFilterResult,
     ChoiceSmootherResult,
+    _rts_smoother_pass,
     _softmax_update_core,
 )
 
@@ -87,14 +95,23 @@ def m_step_input_gain(
     smoothed_values : Array, shape (T, K-1)
         Smoothed state means from RTS smoother.
     covariates : Array, shape (T, d)
-        Covariate matrix. Row t drives the transition x_{t-1} -> x_t.
+        Covariate matrix. Row t drives the prediction at trial t
+        (transition x_{t-1} -> x_t). Uses covariates[1:] paired with
+        diff[i] = m[i+1] - m[i], since diff[i] corresponds to the
+        transition driven by covariates[i+1].
 
     Returns
     -------
     B_hat : Array, shape (K-1, d)
+
+    Notes
+    -----
+    Since covariates are observed (not random), the cross-covariance
+    terms from the smoother drop out and this simple regression is
+    the exact EM M-step for B.
     """
     diff = smoothed_values[1:] - smoothed_values[:-1]  # (T-1, K-1)
-    u = covariates[1:]  # (T-1, d)
+    u = covariates[1:]  # (T-1, d) — covariates[i+1] drives diff[i]
 
     # Cross term: sum delta_m_t u_t'
     cross = jnp.einsum("ti,tj->ij", diff, u)  # (K-1, d)
@@ -154,6 +171,11 @@ def covariate_choice_filter(
 
     if covariates is not None:
         covariates_arr = jnp.asarray(covariates)
+        if covariates_arr.shape[0] != choices_arr.shape[0]:
+            raise ValueError(
+                f"covariates has {covariates_arr.shape[0]} rows but choices "
+                f"has {choices_arr.shape[0]} trials"
+            )
         if input_gain is None:
             input_gain = jnp.zeros((k_free, covariates_arr.shape[1]))
         input_gain_arr = jnp.asarray(input_gain)
@@ -255,35 +277,6 @@ def covariate_choice_smoother(
         smoother_cross_cov=cross_covs,
         marginal_log_likelihood=filt.marginal_log_likelihood,
     )
-
-
-@jax.jit
-def _rts_smoother_pass(
-    filtered_values: Array,
-    filtered_covariances: Array,
-    Q: Array,
-) -> tuple[Array, Array, Array]:
-    """JIT-compiled RTS backward smoother for random walk dynamics."""
-    A = jnp.eye(Q.shape[0])
-
-    def _smooth_step(carry, inputs):
-        next_sm_mean, next_sm_cov = carry
-        f_mean, f_cov = inputs
-
-        sm_mean, sm_cov, cross_cov = _kalman_smoother_update(
-            next_sm_mean, next_sm_cov,
-            f_mean, f_cov,
-            Q, A,
-        )
-        return (sm_mean, sm_cov), (sm_mean, sm_cov, cross_cov)
-
-    _, (sm_means, sm_covs, cross_covs) = jax.lax.scan(
-        _smooth_step,
-        (filtered_values[-1], filtered_covariances[-1]),
-        (filtered_values[:-1], filtered_covariances[:-1]),
-        reverse=True,
-    )
-    return sm_means, sm_covs, cross_covs
 
 
 class CovariateChoiceModel:
@@ -420,6 +413,16 @@ class CovariateChoiceModel:
 
         if self.n_covariates > 0 and covariates is not None:
             self._covariates = jnp.asarray(covariates)
+            if self._covariates.shape[1] != self.n_covariates:
+                raise ValueError(
+                    f"covariates has {self._covariates.shape[1]} columns but "
+                    f"model expects n_covariates={self.n_covariates}"
+                )
+        elif self.n_covariates > 0 and covariates is None:
+            raise ValueError(
+                f"Model has n_covariates={self.n_covariates} but no "
+                f"covariates were passed to fit()"
+            )
         else:
             self._covariates = None
 
@@ -843,9 +846,10 @@ def simulate_rl_choice_data(
     """Simulate multi-armed bandit data with covariate-driven value evolution.
 
     Generates choices from a softmax model where option values evolve
-    according to ``x_t = x_{t-1} + B @ u_t + noise``. Covariates are
-    binary reward indicators: ``u_t[k] = 1`` if non-reference option k+1
-    was chosen and rewarded on trial t.
+    according to ``x_t = x_{t-1} + B @ u_t + noise``. Covariates follow
+    the filter convention: ``u_t`` drives the prediction at trial t
+    (i.e., the transition x_{t-1} -> x_t). For reward covariates, this
+    means the reward earned on trial t-1 appears as ``u_t``.
 
     Parameters
     ----------
@@ -879,6 +883,15 @@ def simulate_rl_choice_data(
     covariates = np.zeros((n_trials, d))
 
     for t in range(n_trials):
+        # Apply covariate-driven update: covariates[t] drives x[t-1] -> x[t]
+        # (covariates[0] is zero — no prior reward before first trial)
+        if t > 0:
+            values[t] = (
+                values[t - 1]
+                + B @ covariates[t]
+                + rng.normal(0, np.sqrt(process_noise), k_free)
+            )
+
         # Choice from softmax
         full_vals = np.concatenate([[0.0], values[t]])
         logits = inverse_temperature * full_vals
@@ -888,16 +901,11 @@ def simulate_rl_choice_data(
         probs[t] = p
         choices[t] = rng.choice(n_options, p=p)
 
-        # Generate reward covariate
-        if choices[t] > 0:
-            covariates[t, choices[t] - 1] = float(rng.random() < reward_prob)
-
-        # Update values for next trial
-        if t < n_trials - 1:
-            values[t + 1] = (
-                values[t]
-                + B @ covariates[t]
-                + rng.normal(0, np.sqrt(process_noise), k_free)
+        # Generate reward covariate for *next* trial
+        # Reward earned on trial t becomes covariates[t+1]
+        if choices[t] > 0 and t < n_trials - 1:
+            covariates[t + 1, choices[t] - 1] = float(
+                rng.random() < reward_prob
             )
 
     return SimulatedRLChoiceData(

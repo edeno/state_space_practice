@@ -303,6 +303,14 @@ def _generate_reward_covariate_data(
     covariates = np.zeros((n_trials, d))
 
     for t in range(n_trials):
+        # Apply covariate-driven update: covariates[t] drives x[t-1] -> x[t]
+        if t > 0:
+            values[t] = (
+                values[t - 1]
+                + B_true @ covariates[t]
+                + rng.normal(0, np.sqrt(process_noise), k_free)
+            )
+
         # Choice from softmax
         full_vals = np.concatenate([[0.0], values[t]])
         logits = inverse_temperature * full_vals
@@ -312,16 +320,9 @@ def _generate_reward_covariate_data(
         choices[t] = rng.choice(n_options, p=probs)
 
         # Reward: chosen option gets reward with prob 0.7
-        if choices[t] > 0:
-            covariates[t, choices[t] - 1] = float(rng.random() < 0.7)
-
-        # Update values for next trial
-        if t < n_trials - 1:
-            values[t + 1] = (
-                values[t]
-                + B_true @ covariates[t]
-                + rng.normal(0, np.sqrt(process_noise), k_free)
-            )
+        # Reward from trial t becomes covariates[t+1]
+        if choices[t] > 0 and t < n_trials - 1:
+            covariates[t + 1, choices[t] - 1] = float(rng.random() < 0.7)
 
     return (
         jnp.array(choices),
@@ -386,7 +387,7 @@ class TestCovariateChoiceModel:
 
         # Log-likelihoods should be close
         np.testing.assert_allclose(
-            cov_model.log_likelihood_, mult_model.log_likelihood_, atol=1.0,
+            cov_model.log_likelihood_, mult_model.log_likelihood_, atol=0.1,
         )
 
     def test_fit_with_covariates_improves_ll(self):
@@ -426,7 +427,7 @@ class TestCovariateChoiceModel:
         lls = model.fit(choices, covariates=covariates, max_iter=15)
 
         for i in range(1, len(lls)):
-            assert lls[i] >= lls[i - 1] - 1.0  # allow small tolerance
+            assert lls[i] >= lls[i - 1] - 0.1  # Laplace-EKF is approximate
 
     def test_choice_probabilities(self):
         choices, covariates, _, _ = _generate_reward_covariate_data(n_trials=100)
@@ -497,20 +498,22 @@ class TestCovariateChoiceModel:
         n_trials = 500
 
         # Generate RW data with known learning rate
+        # Convention: covariates[t] drives x[t-1] -> x[t]
+        # So reward from trial t becomes covariates[t+1]
         value = 0.0
         choices = np.zeros(n_trials, dtype=int)
         covariates = np.zeros((n_trials, 1))
 
         for t in range(n_trials):
+            # Apply covariate update (covariates[t] was set on previous trial)
+            value = value + alpha_true * covariates[t, 0]
+
             p1 = 1.0 / (1.0 + np.exp(-2.0 * value))
             choices[t] = 1 if rng.random() < p1 else 0
 
-            if choices[t] == 1:
-                reward = float(rng.random() < 0.7)
-            else:
-                reward = 0.0
-            covariates[t, 0] = reward
-            value = value + alpha_true * reward
+            # Reward from this trial drives next trial's prediction
+            if choices[t] == 1 and t < n_trials - 1:
+                covariates[t + 1, 0] = float(rng.random() < 0.7)
 
         # Fit covariate model
         cov_model = CovariateChoiceModel(n_options=2, n_covariates=1)
