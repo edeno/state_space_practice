@@ -236,11 +236,15 @@ class PlaceFieldRateMaps:
         if y_max - y_min < 1e-6:
             y_min, y_max = y_min - sigma, y_min + sigma
 
-        # Use n_grid+1 bin edges so histogram2d produces n_grid bins,
-        # making n_grid mean "number of spatial bins" consistently
-        # with from_place_field_model.
-        x_bin_edges = np.linspace(x_min, x_max, n_grid + 1)
-        y_bin_edges = np.linspace(y_min, y_max, n_grid + 1)
+        # Extend the range by half a bin so that bin centers span the
+        # full observed position range.  Without this, the interpolation
+        # grid covers only [x_min + dx/2, x_max - dx/2], leaving a
+        # half-bin gap on each side where observed positions get
+        # clipped and the observation gradient is zero.
+        dx = (x_max - x_min) / n_grid
+        dy = (y_max - y_min) / n_grid
+        x_bin_edges = np.linspace(x_min - dx / 2, x_max + dx / 2, n_grid + 1)
+        y_bin_edges = np.linspace(y_min - dy / 2, y_max + dy / 2, n_grid + 1)
 
         # Compute occupancy
         occ, _, _ = np.histogram2d(
@@ -248,9 +252,12 @@ class PlaceFieldRateMaps:
             bins=[x_bin_edges, y_bin_edges],
         )
         occ_time = occ * dt
-        # Smooth occupancy
+        # Smooth occupancy (zero-pad at array boundaries to avoid
+        # reflecting occupied-region data into the padding bins)
         sigma_bins = sigma / (x_bin_edges[1] - x_bin_edges[0])
-        occ_smooth = gaussian_filter(occ_time.T, sigma_bins)
+        occ_smooth = gaussian_filter(
+            occ_time.T, sigma_bins, mode="constant", cval=0
+        )
 
         rate_maps = np.zeros((n_neurons, n_grid, n_grid))
         for n in range(n_neurons):
@@ -259,12 +266,14 @@ class PlaceFieldRateMaps:
                 bins=[x_bin_edges, y_bin_edges],
                 weights=spike_counts[:, n],
             )
-            spike_smooth = gaussian_filter(spike_map.T, sigma_bins)
+            spike_smooth = gaussian_filter(
+                spike_map.T, sigma_bins, mode="constant", cval=0
+            )
             rate_maps[n] = np.where(
                 occ_smooth > min_occupancy_s, spike_smooth / occ_smooth, 0
             )
 
-        # Use bin centers as grid coordinates
+        # Bin centers now span [x_min, x_max] (the full data range)
         x_centers = 0.5 * (x_bin_edges[:-1] + x_bin_edges[1:])
         y_centers = 0.5 * (y_bin_edges[:-1] + y_bin_edges[1:])
 
