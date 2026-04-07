@@ -455,3 +455,42 @@ class TestMultinomialChoiceModelPlotting:
         model = MultinomialChoiceModel(n_options=3)
         with pytest.raises(RuntimeError):
             model.plot_values()
+
+
+class TestMultinomialSGDFitting:
+    """Tests for SGD fitting on MultinomialChoiceModel."""
+
+    def test_sgd_improves_ll(self):
+        rng = np.random.default_rng(42)
+        choices = np.where(rng.random(200) < 0.7, 1, rng.integers(0, 3, size=200))
+        model = MultinomialChoiceModel(n_options=3)
+        lls = model.fit_sgd(choices, num_steps=50)
+        assert lls[-1] > lls[0]
+
+    def test_sgd_respects_constraints(self):
+        rng = np.random.default_rng(42)
+        model = MultinomialChoiceModel(n_options=3)
+        model.fit_sgd(rng.integers(0, 3, size=100), num_steps=50)
+        assert model.process_noise > 0
+        assert model.inverse_temperature > 0
+
+    def test_sgd_model_is_fitted(self):
+        rng = np.random.default_rng(42)
+        model = MultinomialChoiceModel(n_options=3)
+        model.fit_sgd(rng.integers(0, 3, size=100), num_steps=20)
+        assert model.is_fitted
+        assert model.smoothed_values.shape[0] == 100
+
+    def test_sgd_matches_em_approximately(self):
+        """SGD and EM should converge to similar LL on same data."""
+        rng = np.random.default_rng(42)
+        choices = np.where(rng.random(200) < 0.6, 1, rng.integers(0, 3, size=200))
+
+        m_em = MultinomialChoiceModel(n_options=3)
+        m_em.fit(choices, max_iter=20)
+
+        m_sgd = MultinomialChoiceModel(n_options=3)
+        m_sgd.fit_sgd(choices, num_steps=200)
+
+        # LLs should be within 10% of each other
+        assert abs(m_em.log_likelihood_ - m_sgd.log_likelihood_) / abs(m_em.log_likelihood_) < 0.1
