@@ -16,6 +16,8 @@ References
 
 """
 
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg
@@ -78,6 +80,109 @@ def psd_solve(A: jax.Array, b: jax.Array, diagonal_boost: float = 1e-9) -> jax.A
         b,
         assume_a="pos",
     )
+
+
+def woodbury_kalman_gain(
+    prior_cov: jax.Array,
+    emission_matrix: jax.Array,
+    emission_cov_diag: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Compute Kalman gain using the Woodbury identity for diagonal R.
+
+    When the observation noise covariance R is diagonal, the standard
+    Kalman gain computation is O(D_obs^3). The Woodbury identity reduces
+    this to O(D_state^3), which is much faster when D_obs >> D_state
+    (e.g. many neurons, low-dimensional latent state).
+
+    Parameters
+    ----------
+    prior_cov : jax.Array, shape (D_state, D_state)
+        Prior (predicted) state covariance P.
+    emission_matrix : jax.Array, shape (D_obs, D_state)
+        Observation matrix H.
+    emission_cov_diag : jax.Array, shape (D_obs,)
+        Diagonal of observation noise covariance R.
+
+    Returns
+    -------
+    K : jax.Array, shape (D_state, D_obs)
+        Kalman gain.
+    S : jax.Array, shape (D_obs, D_obs)
+        Innovation covariance H P H' + R (for log-likelihood).
+    S_inv : jax.Array, shape (D_obs, D_obs)
+        Inverse of innovation covariance (via Woodbury).
+    """
+    D = prior_cov.shape[0]
+    I_D = jnp.eye(D)
+    # U = H @ chol(P), shape (D_obs, D_state)
+    U = emission_matrix @ jnp.linalg.cholesky(prior_cov)
+    X = U / emission_cov_diag[:, None]  # R^{-1} U, shape (D_obs, D_state)
+    # Woodbury: S^{-1} = R^{-1} - X (I + U' X)^{-1} X'
+    S_inv = jnp.diag(1.0 / emission_cov_diag) - X @ psd_solve(I_D + U.T @ X, X.T)
+    K = prior_cov @ emission_matrix.T @ S_inv
+    S = jnp.diag(emission_cov_diag) + emission_matrix @ prior_cov @ emission_matrix.T
+    return K, S, S_inv
+
+
+def standard_kalman_gain(
+    prior_cov: jax.Array,
+    emission_matrix: jax.Array,
+    emission_cov: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Compute Kalman gain using the standard formula.
+
+    Parameters
+    ----------
+    prior_cov : jax.Array, shape (D_state, D_state)
+        Prior (predicted) state covariance P.
+    emission_matrix : jax.Array, shape (D_obs, D_state)
+        Observation matrix H.
+    emission_cov : jax.Array, shape (D_obs, D_obs)
+        Observation noise covariance R.
+
+    Returns
+    -------
+    K : jax.Array, shape (D_state, D_obs)
+        Kalman gain.
+    S : jax.Array, shape (D_obs, D_obs)
+        Innovation covariance H P H' + R.
+    """
+    S = symmetrize(emission_matrix @ prior_cov @ emission_matrix.T + emission_cov)
+    K = psd_solve(S, emission_matrix @ prior_cov).T
+    return K, S
+
+
+def joseph_form_update(
+    prior_cov: jax.Array,
+    kalman_gain: jax.Array,
+    emission_matrix: jax.Array,
+    emission_cov: jax.Array,
+) -> jax.Array:
+    """Joseph form covariance update: always PSD by construction.
+
+    Computes ``P_post = (I - K H) P (I - K H)' + K R K'``, which is
+    a sum of PSD terms and therefore guaranteed PSD regardless of
+    floating-point rounding.
+
+    Parameters
+    ----------
+    prior_cov : jax.Array, shape (D, D)
+        Prior (predicted) state covariance.
+    kalman_gain : jax.Array, shape (D, D_obs)
+        Kalman gain K.
+    emission_matrix : jax.Array, shape (D_obs, D)
+        Observation matrix H.
+    emission_cov : jax.Array, shape (D_obs, D_obs)
+        Observation noise covariance R.
+
+    Returns
+    -------
+    jax.Array, shape (D, D)
+        Posterior covariance, guaranteed PSD.
+    """
+    D = prior_cov.shape[0]
+    I_KH = jnp.eye(D) - kalman_gain @ emission_matrix
+    return symmetrize(I_KH @ prior_cov @ I_KH.T + kalman_gain @ emission_cov @ kalman_gain.T)
 
 
 def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
@@ -444,6 +549,135 @@ def kalman_smoother(
     smoother_cov = jnp.concatenate((smoother_cov, filtered_cov[-1][None]))
 
     return smoother_mean, smoother_cov, smoother_cross_cov, marginal_log_likelihood
+
+
+class _SmootherElement(NamedTuple):
+    """Associative scan element for parallel RTS smoother.
+
+    Each element (E, g, L) encodes one backward smoother step so that
+    the composition of elements via the associative operator yields the
+    full smoothed posterior.
+
+    Attributes
+    ----------
+    E : jax.Array, shape (..., D, D)
+        Smoother gain (analogous to J_t in the sequential formulation).
+    g : jax.Array, shape (..., D)
+        Bias term: m_{t|t} - J_t @ m_{t+1|t}.
+    L : jax.Array, shape (..., D, D)
+        Residual covariance: P_{t|t} - J_t @ P_{t+1|t} @ J_t.T.
+
+    Note: shape prefix ``...`` indicates these may be batched by
+    ``jax.lax.associative_scan``.
+    """
+
+    E: jax.Array
+    g: jax.Array
+    L: jax.Array
+
+
+def parallel_kalman_smoother(
+    filtered_means: jax.Array,
+    filtered_covariances: jax.Array,
+    transition_matrix: jax.Array,
+    process_cov: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """RTS smoother via parallel associative scan.
+
+    Algebraically equivalent to the sequential ``kalman_smoother`` backward
+    pass but runs in O(log T) parallel depth on GPU/TPU via
+    ``jax.lax.associative_scan``.
+
+    Parameters
+    ----------
+    filtered_means : jax.Array, shape (T, D)
+        Filtered state means from the forward Kalman filter.
+    filtered_covariances : jax.Array, shape (T, D, D)
+        Filtered state covariances from the forward Kalman filter.
+    transition_matrix : jax.Array, shape (D, D) or (T-1, D, D)
+        State transition matrix. If 2-D, the same matrix is used at every
+        time step. If 3-D, ``transition_matrix[t]`` is used for the
+        transition from time ``t`` to ``t+1``.
+    process_cov : jax.Array, shape (D, D) or (T-1, D, D)
+        Process noise covariance. Broadcasting rules follow
+        ``transition_matrix``.
+
+    Returns
+    -------
+    smoothed_means : jax.Array, shape (T, D)
+        Smoothed state means.
+    smoothed_covariances : jax.Array, shape (T, D, D)
+        Smoothed state covariances.
+    cross_covariances : jax.Array, shape (T-1, D, D)
+        Lag-one cross-covariances P_{t, t+1|T}.
+
+    References
+    ----------
+    Särkkä, S. & García-Fernández, Á.F. (2021). Temporal parallelization
+    of Bayesian smoothers. IEEE Trans. Automatic Control 66(1), 299-306.
+    """
+    T, D = filtered_means.shape
+
+    # Broadcast time-invariant parameters to (T-1, D, D)
+    if transition_matrix.ndim == 2:
+        A = jnp.broadcast_to(transition_matrix, (T - 1, D, D))
+    else:
+        A = transition_matrix
+    if process_cov.ndim == 2:
+        Q = jnp.broadcast_to(process_cov, (T - 1, D, D))
+    else:
+        Q = process_cov
+
+    # Build per-timestep smoother elements for t = 0, ..., T-2
+    def _build_element(filt_mean, filt_cov, A_t, Q_t):
+        pred_cov = symmetrize(A_t @ filt_cov @ A_t.T + Q_t)
+        pred_mean = A_t @ filt_mean
+        J = psd_solve(pred_cov, A_t @ filt_cov).T  # smoother gain
+        g = filt_mean - J @ pred_mean
+        L = symmetrize(filt_cov - J @ pred_cov @ J.T)
+        return _SmootherElement(E=J, g=g, L=L)
+
+    elements = jax.vmap(_build_element)(
+        filtered_means[:-1], filtered_covariances[:-1], A, Q
+    )
+
+    # Terminal element for t = T-1: no dependence on future state
+    terminal = _SmootherElement(
+        E=jnp.zeros((D, D)),
+        g=filtered_means[-1],
+        L=filtered_covariances[-1],
+    )
+
+    # Concatenate elements with terminal at end
+    all_elements = _SmootherElement(
+        E=jnp.concatenate([elements.E, terminal.E[None]], axis=0),
+        g=jnp.concatenate([elements.g, terminal.g[None]], axis=0),
+        L=jnp.concatenate([elements.L, terminal.L[None]], axis=0),
+    )
+
+    # Associative operator vmapped over the batch dimension that
+    # associative_scan introduces when combining sub-sequences.
+    @jax.vmap
+    def _operator(elem1, elem2):
+        E1, g1, L1 = elem1
+        E2, g2, L2 = elem2
+        E = E2 @ E1
+        g = E2 @ g1 + g2
+        L = symmetrize(E2 @ L1 @ E2.T + L2)
+        return _SmootherElement(E=E, g=g, L=L)
+
+    scanned = jax.lax.associative_scan(
+        _operator, all_elements, reverse=True
+    )
+
+    smoothed_means = scanned.g
+    smoothed_covariances = scanned.L
+
+    # Cross-covariances: P_{t,t+1|T} = J_t @ P_{t+1|T}
+    smoother_gains = elements.E  # (T-1, D, D)
+    cross_covariances = jnp.einsum("tij,tjk->tik", smoother_gains, smoothed_covariances[1:])
+
+    return smoothed_means, smoothed_covariances, cross_covariances
 
 
 def sum_of_outer_products(x: jax.Array, y: jax.Array) -> jax.Array:

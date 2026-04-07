@@ -14,12 +14,16 @@ from jax import Array, random
 from scipy.linalg import solve_discrete_are
 
 from state_space_practice.kalman import (
+    joseph_form_update,
     kalman_filter,
     kalman_maximization_step,
     kalman_smoother,
+    parallel_kalman_smoother,
     psd_solve,
+    standard_kalman_gain,
     sum_of_outer_products,
     symmetrize,
+    woodbury_kalman_gain,
 )
 from state_space_practice.tests.conftest import (
     kalman_model_params,
@@ -1445,3 +1449,268 @@ class TestKalmanNumericalStability:
         for t in range(500):
             eigvals = jnp.linalg.eigvalsh(filtered_cov[t])
             assert jnp.all(eigvals > -1e-8), f"Cov not PSD at t={t}"
+
+
+# --- Parallel Kalman Smoother Tests ---
+
+
+class TestParallelKalmanSmoother:
+    """Tests for the parallel RTS smoother via associative scan."""
+
+    def test_matches_sequential_smoother(self) -> None:
+        """Parallel smoother should match sequential smoother to high precision."""
+        key = random.PRNGKey(42)
+        T, D = 500, 4
+        A = 0.95 * jnp.eye(D) + 0.02 * random.normal(key, (D, D))
+        Q = jnp.eye(D) * 0.1
+        H = jnp.eye(D)
+        R = jnp.eye(D) * 0.5
+        init_mean = jnp.zeros(D)
+        init_cov = jnp.eye(D)
+
+        obs = random.normal(random.PRNGKey(0), (T, D))
+
+        # Sequential
+        seq_mean, seq_cov, seq_cross, mll = kalman_smoother(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        # Parallel: first run filter, then parallel smoother
+        filt_mean, filt_cov, _ = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+        par_mean, par_cov, par_cross = parallel_kalman_smoother(
+            filt_mean, filt_cov, A, Q
+        )
+
+        np.testing.assert_allclose(par_mean, seq_mean, atol=1e-5)
+        np.testing.assert_allclose(par_cov, seq_cov, atol=1e-5)
+        np.testing.assert_allclose(par_cross, seq_cross, atol=1e-5)
+
+    def test_output_shapes(self) -> None:
+        """Output shapes should be correct."""
+        T, D = 100, 3
+        filt_mean = jnp.zeros((T, D))
+        filt_cov = jnp.broadcast_to(jnp.eye(D), (T, D, D))
+        A = jnp.eye(D)
+        Q = jnp.eye(D) * 0.1
+
+        sm, sc, sx = parallel_kalman_smoother(filt_mean, filt_cov, A, Q)
+
+        assert sm.shape == (T, D)
+        assert sc.shape == (T, D, D)
+        assert sx.shape == (T - 1, D, D)
+
+    def test_single_timestep(self) -> None:
+        """T=1: smoother output should equal filter output."""
+        D = 2
+        filt_mean = jnp.array([[1.0, 2.0]])
+        filt_cov = jnp.eye(D)[None] * 0.5
+        A = jnp.eye(D)
+        Q = jnp.eye(D) * 0.1
+
+        sm, sc, sx = parallel_kalman_smoother(filt_mean, filt_cov, A, Q)
+
+        np.testing.assert_allclose(sm, filt_mean, atol=1e-10)
+        np.testing.assert_allclose(sc, filt_cov, atol=1e-10)
+        assert sx.shape == (0, D, D)
+
+    def test_two_timesteps(self) -> None:
+        """T=2: verify against closed-form RTS update."""
+        D = 1
+        init_mean = jnp.array([0.0])
+        init_cov = jnp.eye(D)
+        A = jnp.eye(D)
+        Q = jnp.eye(D) * 0.1
+        H = jnp.eye(D)
+        R = jnp.eye(D)
+        obs = jnp.array([[0.5], [0.6]])
+
+        # Get sequential answer
+        seq_mean, seq_cov, seq_cross, _ = kalman_smoother(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+
+        # Get parallel answer
+        filt_mean, filt_cov, _ = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+        par_mean, par_cov, par_cross = parallel_kalman_smoother(
+            filt_mean, filt_cov, A, Q
+        )
+
+        np.testing.assert_allclose(par_mean, seq_mean, atol=1e-6)
+        np.testing.assert_allclose(par_cov, seq_cov, atol=1e-6)
+        np.testing.assert_allclose(par_cross, seq_cross, atol=1e-6)
+
+    def test_time_varying_transition(self) -> None:
+        """Should handle per-timestep transition matrices."""
+        T, D = 50, 2
+        key = random.PRNGKey(7)
+        init_mean = jnp.zeros(D)
+        init_cov = jnp.eye(D)
+
+        # Time-varying A: slowly changing
+        A_base = 0.9 * jnp.eye(D)
+        perturbations = 0.01 * random.normal(key, (T - 1, D, D))
+        A_tv = A_base[None] + perturbations  # (T-1, D, D)
+
+        Q = jnp.eye(D) * 0.1
+        H = jnp.eye(D)
+        R = jnp.eye(D) * 0.5
+
+        # Simulate observations using first A
+        obs = random.normal(random.PRNGKey(99), (T, D))
+
+        # Run filter with first A (filter doesn't support TV, so use constant)
+        filt_mean, filt_cov, _ = kalman_filter(
+            init_mean, init_cov, obs, A_base, Q, H, R
+        )
+
+        # Parallel smoother with time-varying A
+        sm, sc, sx = parallel_kalman_smoother(filt_mean, filt_cov, A_tv, Q)
+
+        assert sm.shape == (T, D)
+        assert sc.shape == (T, D, D)
+        assert sx.shape == (T - 1, D, D)
+        assert jnp.all(jnp.isfinite(sm))
+        assert jnp.all(jnp.isfinite(sc))
+
+    def test_smoothed_covariances_psd(self) -> None:
+        """Smoothed covariances should be positive semi-definite."""
+        key = random.PRNGKey(123)
+        T, D = 200, 3
+        A = 0.9 * jnp.eye(D)
+        Q = jnp.eye(D) * 0.1
+        H = jnp.eye(D)
+        R = jnp.eye(D) * 0.5
+        init_mean = jnp.zeros(D)
+        init_cov = jnp.eye(D)
+
+        obs = random.normal(key, (T, D))
+        filt_mean, filt_cov, _ = kalman_filter(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+        _, sc, _ = parallel_kalman_smoother(filt_mean, filt_cov, A, Q)
+
+        for t in range(T):
+            eigvals = jnp.linalg.eigvalsh(sc[t])
+            assert jnp.all(eigvals > -1e-8), f"Smoothed cov not PSD at t={t}"
+
+
+# --- Woodbury Kalman Gain Tests ---
+
+
+class TestWoodburyKalmanGain:
+    """Tests for Woodbury-optimized Kalman gain computation."""
+
+    def test_matches_standard_gain(self) -> None:
+        """Woodbury gain should match standard gain for diagonal R."""
+        key = random.PRNGKey(42)
+        D_state, D_obs = 4, 50
+        P = random.normal(key, (D_state, D_state))
+        P = P @ P.T + 0.1 * jnp.eye(D_state)  # PSD
+        H = random.normal(random.PRNGKey(1), (D_obs, D_state))
+        R_diag = jnp.abs(random.normal(random.PRNGKey(2), (D_obs,))) + 0.1
+
+        K_w, S_w, _ = woodbury_kalman_gain(P, H, R_diag)
+        K_s, S_s = standard_kalman_gain(P, H, jnp.diag(R_diag))
+
+        np.testing.assert_allclose(K_w, K_s, atol=1e-6)
+        np.testing.assert_allclose(S_w, S_s, atol=1e-6)
+
+    def test_many_neurons(self) -> None:
+        """Should work correctly with 200 neurons and 4-dim state."""
+        key = random.PRNGKey(99)
+        D_state, D_obs = 4, 200
+        P = jnp.eye(D_state) * 0.5
+        H = random.normal(key, (D_obs, D_state)) * 0.1
+        R_diag = jnp.ones(D_obs) * 0.3
+
+        K_w, S_w, _ = woodbury_kalman_gain(P, H, R_diag)
+        K_s, S_s = standard_kalman_gain(P, H, jnp.diag(R_diag))
+
+        np.testing.assert_allclose(K_w, K_s, atol=1e-5)
+
+    def test_log_likelihood_matches(self) -> None:
+        """Innovation log-likelihood should match between methods."""
+        key = random.PRNGKey(7)
+        D_state, D_obs = 3, 20
+        P = jnp.eye(D_state)
+        H = random.normal(key, (D_obs, D_state))
+        R_diag = jnp.ones(D_obs) * 0.5
+
+        _, S_w, _ = woodbury_kalman_gain(P, H, R_diag)
+        _, S_s = standard_kalman_gain(P, H, jnp.diag(R_diag))
+
+        # Log-likelihood uses logdet(S) — should match
+        sign_w, logdet_w = jnp.linalg.slogdet(S_w)
+        sign_s, logdet_s = jnp.linalg.slogdet(S_s)
+        np.testing.assert_allclose(logdet_w, logdet_s, atol=1e-5)
+
+    def test_small_obs_dim(self) -> None:
+        """Should still work when D_obs < D_state (no benefit, but correct)."""
+        D_state, D_obs = 4, 2
+        P = jnp.eye(D_state)
+        H = jnp.zeros((D_obs, D_state)).at[0, 0].set(1.0).at[1, 1].set(1.0)
+        R_diag = jnp.ones(D_obs) * 0.5
+
+        K_w, _, _ = woodbury_kalman_gain(P, H, R_diag)
+        K_s, _ = standard_kalman_gain(P, H, jnp.diag(R_diag))
+
+        np.testing.assert_allclose(K_w, K_s, atol=1e-6)
+
+
+# --- Joseph Form Tests ---
+
+
+class TestJosephFormUpdate:
+    """Tests for the Joseph form covariance update."""
+
+    def test_matches_standard_well_conditioned(self) -> None:
+        """Joseph form should match P - K S K' on well-conditioned problems."""
+        D = 3
+        P = jnp.eye(D) * 2.0
+        H = jnp.eye(D)
+        R = jnp.eye(D) * 0.5
+        K, S = standard_kalman_gain(P, H, R)
+
+        # Standard: P_post = P - K S K'
+        P_standard = P - K @ S @ K.T
+
+        # Joseph form
+        P_joseph = joseph_form_update(P, K, H, R)
+
+        np.testing.assert_allclose(P_joseph, P_standard, atol=1e-10)
+
+    def test_maintains_psd_ill_conditioned(self) -> None:
+        """Joseph form should maintain PSD even with near-singular prior."""
+        D = 4
+        # Near-singular prior: one eigenvalue very small
+        eigvals = jnp.array([1e-10, 0.1, 1.0, 10.0])
+        V = jnp.linalg.qr(random.normal(random.PRNGKey(42), (D, D)))[0]
+        P = V @ jnp.diag(eigvals) @ V.T
+
+        H = random.normal(random.PRNGKey(1), (D, D))
+        R = jnp.eye(D) * 0.1
+        S = H @ P @ H.T + R
+        K = psd_solve(S, H @ P).T
+
+        P_joseph = joseph_form_update(P, K, H, R)
+
+        # All eigenvalues should be non-negative
+        eigs = jnp.linalg.eigvalsh(P_joseph)
+        assert jnp.all(eigs >= -1e-12), f"Joseph form lost PSD: {eigs}"
+
+    def test_symmetric_output(self) -> None:
+        """Joseph form output should be exactly symmetric."""
+        D = 3
+        P = jnp.eye(D) + 0.1 * random.normal(random.PRNGKey(5), (D, D))
+        P = P @ P.T
+        H = random.normal(random.PRNGKey(6), (2, D))
+        R = jnp.eye(2) * 0.5
+        K, _ = standard_kalman_gain(P, H, R)
+
+        P_joseph = joseph_form_update(P, K, H, R)
+
+        np.testing.assert_allclose(P_joseph, P_joseph.T, atol=1e-14)

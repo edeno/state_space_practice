@@ -925,3 +925,62 @@ class TestDecayDynamics:
         )
         # Q(1) + beta(1) + decay(1) = 3
         assert m.n_free_params == 3
+
+
+class TestSGDFitting:
+    """Tests for SGD fitting via optax."""
+
+    def test_sgd_improves_ll(self):
+        """Log-likelihood should improve from initial parameters."""
+        rng = np.random.default_rng(42)
+        choices = np.where(rng.random(200) < 0.7, 1, rng.integers(0, 3, size=200))
+        model = CovariateChoiceModel(n_options=3)
+        lls = model.fit_sgd(choices, num_steps=50)
+        assert lls[-1] > lls[0]
+
+    def test_sgd_learns_beta(self):
+        """Deterministic choices should lead to high beta."""
+        choices = np.ones(200, dtype=int)
+        model = CovariateChoiceModel(n_options=3)
+        model.fit_sgd(choices, num_steps=200)
+        assert model.inverse_temperature > 1.5
+
+    def test_sgd_respects_constraints(self):
+        """After SGD: process_noise > 0, 0 < decay < 1."""
+        rng = np.random.default_rng(42)
+        model = CovariateChoiceModel(
+            n_options=3, init_decay=0.9, learn_decay=True,
+        )
+        model.fit_sgd(rng.integers(0, 3, size=100), num_steps=50)
+        assert model.process_noise > 0
+        assert 0 < model.decay < 1
+
+    def test_sgd_with_covariates(self):
+        """SGD should work with dynamics covariates."""
+        data = simulate_rl_choice_data(n_trials=200, n_options=3, seed=42)
+        model = CovariateChoiceModel(n_options=3, n_covariates=2)
+        lls = model.fit_sgd(
+            data.choices, covariates=data.covariates, num_steps=50,
+        )
+        assert np.isfinite(model.log_likelihood_)
+        assert len(lls) == 50
+
+    def test_sgd_model_is_fitted(self):
+        """Model should report as fitted after SGD."""
+        rng = np.random.default_rng(42)
+        model = CovariateChoiceModel(n_options=3)
+        model.fit_sgd(rng.integers(0, 3, size=100), num_steps=20)
+        assert model.is_fitted
+        assert model.smoothed_values.shape[0] == 100
+
+    def test_sgd_verbose(self, caplog):
+        """Verbose mode should log progress."""
+        import logging
+
+        rng = np.random.default_rng(42)
+        model = CovariateChoiceModel(n_options=3)
+        with caplog.at_level(logging.INFO):
+            model.fit_sgd(
+                rng.integers(0, 3, size=50), num_steps=15, verbose=True,
+            )
+        assert "SGD step" in caplog.text
