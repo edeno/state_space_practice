@@ -12,6 +12,24 @@
 
 **Design reference:** Dynamax (probml/dynamax) uses a base-class `fit_sgd` + model-specific `marginal_log_prob`, with TFP bijectors for constraints and `stop_gradient` for freezing parameters. We adopt the same architecture but with pure-JAX transforms (no TFP dependency) and a mixin class (since our models don't share a single base class).
 
+**Follow-on scope note:** This plan stops at baseline `fit_sgd()` support plus constrained optimization. Two intentionally separate follow-on plans build on that foundation without expanding the core optimizer rollout scope: `docs/plans/2026-04-07-regularized-oscillator-connectivity.md` (sparse and area-to-area penalties on oscillator coupling) and `docs/plans/2026-04-07-dynamic-neuron-coupling.md` (a new dynamic spike-history model family for neuron-to-neuron coupling).
+
+## Dependency Diagram
+
+```
+SGD Task 0-1 (infra + choice refactor)
+├── SGD Task 2 (Smith) — can start immediately after Task 1
+├── SGD Task 3 (PointProcess) ← gradient stability gate
+│   └── Dynamic Coupling Plan (all tasks)
+├── SGD Task 4 (PlaceField) — can start immediately after Task 1
+└── SGD Task 5-6 (Oscillators)
+    ├── Regularization Plan (all tasks)
+    └── SGD Task 7-9 (Switching PP) ← gradient stability gate
+
+Tasks 2, 3, 4 can run in parallel after Task 1. The two follow-on plans
+can start as soon as their specific prerequisites are met.
+```
+
 ## Architecture
 
 ```
@@ -34,7 +52,7 @@ parameter_transforms.py (extended)
 
 Each model implements:
 - `_build_param_spec() → tuple[dict, dict]` — returns `(params, spec)` with current parameter values and their transforms. Must respect model-specific flags (e.g., `learn_process_noise`, `initial_state_method`).
-- `_sgd_loss_fn(params: dict, *args) → Array` — returns **raw** negative marginal log-likelihood (NOT normalized). The mixin divides by `_n_timesteps` internally. Receives **constrained** parameters. Must not read mutable model attributes — all data must come through arguments (required for `lax.scan` JIT compatibility).
+- `_sgd_loss_fn(params: dict, *args) → Array` — returns **raw** negative marginal log-likelihood (NOT normalized). The mixin divides by `_n_timesteps` internally. Receives **constrained** parameters.
 - `_store_sgd_params(params: dict) → None` — writes optimized parameters back to model attributes.
 - `_finalize_sgd(*args, **kwargs) → None` — runs final smoother pass and populates fitted-state diagnostics (smoothed values, covariances, `log_likelihood_`, `is_fitted`, etc.).
 
@@ -58,11 +76,11 @@ Each model implements:
 
 2. **Discrete transition matrix Z uses softmax rows.** `STOCHASTIC_ROW` transform applies softmax per row, mapping unconstrained reals to row-stochastic matrices. This is equivalent to dynamax's `SoftmaxCentered` bijector.
 
-3. **`stop_gradient` for frozen parameters.** Instead of excluding non-learnable parameters from the dict, include all parameters and apply `jax.lax.stop_gradient()` during `transform_to_constrained()` for params marked as frozen. This keeps the PyTree structure constant.
+3. **Frozen parameters use `optax.masked` + `stop_gradient`.** Include all parameters in the dict and apply `jax.lax.stop_gradient()` during `transform_to_constrained()` for params marked as frozen. Additionally, use `optax.masked` to exclude frozen parameters from the optimizer state entirely — this prevents momentum/second-moment buffers from being maintained for non-learnable params and avoids leaking stale optimizer state. The `stop_gradient` ensures correctness in the forward pass; `optax.masked` ensures the optimizer ignores them.
 
 4. **Loss normalized by sequence length.** The loss is `-marginal_log_likelihood / n_timesteps`, making learning rates transferable across datasets.
 
-5. **Python loop for verbose, lax.scan for non-verbose.** Following dynamax's pattern: Python loop for outer training (allows logging), lax.scan for JIT-compiled fast path.
+5. **Python loop only (no lax.scan).** Always use a Python loop for the optimization steps. The `lax.scan` path requires the loss closure to be JIT-compatible, but `self._sgd_loss_fn` captures `self` through the mixin dispatch, and models may reference mutable attributes. Making every model's loss function scan-safe is a significant constraint that will cause confusing JIT errors. For typical step counts (200-500), the Python loop overhead is negligible. If a future use case requires 10k+ steps, add a JIT-compiled fast path as a targeted optimization then.
 
 6. **`_finalize_sgd` hook for model-specific post-optimization.** The existing choice-model `fit_sgd` implementations run a final smoother pass and populate `_smoother_result`, `log_likelihood_`, and `is_fitted` after optimization. The mixin must call a model-specific finalization hook to preserve this contract.
 
@@ -108,10 +126,11 @@ STOCHASTIC_ROW = ParameterTransform(
 
 #### Step 0.2: Add trainable flag and stop_gradient support
 
-Extend `ParameterTransform` with a `trainable` field:
+Convert `ParameterTransform` from `NamedTuple` to `@dataclass(frozen=True)`. Rationale: adding a third field to a NamedTuple breaks positional destructuring (`to_unc, to_con = POSITIVE`). A frozen dataclass is extensible without this hazard and anticipates future fields (e.g., `name`, `shape_hint`).
 
 ```python
-class ParameterTransform(NamedTuple):
+@dataclass(frozen=True)
+class ParameterTransform:
     to_unconstrained: Callable[[Array], Array]
     to_constrained: Callable[[Array], Array]
     trainable: bool = True
@@ -130,27 +149,11 @@ def transform_to_constrained(unc_params: dict, spec: dict) -> dict:
     return result
 ```
 
-**Breaking change check:** Adding a third field to a `NamedTuple` with a default value requires care:
-
-1. All existing constants (`POSITIVE`, `UNIT_INTERVAL`, `UNCONSTRAINED`, `PSD_MATRIX`) must be updated to include `trainable=True` explicitly: `POSITIVE = ParameterTransform(to_unconstrained=..., to_constrained=..., trainable=True)`.
-2. New constants like `STOCHASTIC_ROW` must also include `trainable=True` explicitly — omitting it creates a 2-tuple that will fail.
-3. Any external code using positional construction `ParameterTransform(fn1, fn2)` will still work (gets `trainable=True` default), but code that pattern-matches on `len(transform)` or `._fields` needs updating.
-4. Task 0.4 tests must verify: (a) existing transforms still have 3 fields, (b) `trainable` defaults to `True`, (c) `ParameterTransform(fn1, fn2)` still works without explicit `trainable`.
-
 #### Step 0.3: Create SGDFittableMixin
 
 Create `src/state_space_practice/sgd_fitting.py`:
 
 ```python
-import logging
-from typing import Optional
-
-import jax
-from jax import Array
-
-logger = logging.getLogger(__name__)
-
-
 class SGDFittableMixin:
     """Mixin providing fit_sgd() for state-space models.
 
@@ -169,6 +172,7 @@ class SGDFittableMixin:
         optimizer: Optional[object] = None,
         num_steps: int = 200,
         verbose: bool = False,
+        convergence_tol: Optional[float] = None,
         **kwargs,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
@@ -183,6 +187,8 @@ class SGDFittableMixin:
             Number of optimization steps.
         verbose : bool
             Log progress every 10 steps.
+        convergence_tol : float or None
+            If set, stop early when loss change < tol for 5 consecutive steps.
 
         Returns
         -------
@@ -203,40 +209,52 @@ class SGDFittableMixin:
         unc_params = transform_to_unconstrained(params, param_spec)
         n_timesteps = float(self._n_timesteps)
 
-        @jax.value_and_grad
-        def loss_fn(unc_p):
-            p = transform_to_constrained(unc_p, param_spec)
-            return self._sgd_loss_fn(p, *args, **kwargs) / n_timesteps
+        # Build trainable mask and wrap optimizer
+        trainable_mask = {k: spec.trainable for k, spec in param_spec.items()}
 
         if optimizer is None:
             optimizer = optax.chain(
                 optax.clip_by_global_norm(10.0),
                 optax.adam(1e-2),
             )
+        optimizer = optax.masked(optimizer, trainable_mask)
         opt_state = optimizer.init(unc_params)
 
-        def _train_step(carry, _):
-            unc_p, o_state = carry
-            loss, grads = loss_fn(unc_p)
-            updates, new_o_state = optimizer.update(grads, o_state, unc_p)
-            new_unc_p = optax.apply_updates(unc_p, updates)
-            return (new_unc_p, new_o_state), loss
+        @jax.value_and_grad
+        def loss_fn(unc_p):
+            p = transform_to_constrained(unc_p, param_spec)
+            return self._sgd_loss_fn(p, *args, **kwargs) / n_timesteps
 
-        if verbose:
-            log_likelihoods: list[float] = []
-            for step in range(num_steps):
-                (unc_params, opt_state), loss = _train_step(
-                    (unc_params, opt_state), None,
-                )
-                ll = -float(loss) * self._n_timesteps
-                log_likelihoods.append(ll)
-                if step % 10 == 0 or step == num_steps - 1:
-                    logger.info("SGD step %d: LL=%.2f", step, ll)
-        else:
-            (unc_params, opt_state), losses = jax.lax.scan(
-                _train_step, (unc_params, opt_state), None, length=num_steps,
-            )
-            log_likelihoods = (-losses * n_timesteps).tolist()
+        log_likelihoods: list[float] = []
+        best_unc_params = unc_params
+        stall_count = 0
+
+        for step in range(num_steps):
+            loss, grads = loss_fn(unc_params)
+
+            if not jnp.isfinite(loss):
+                logger.warning("SGD step %d: NaN/inf loss — restoring last good params and stopping.", step)
+                unc_params = best_unc_params
+                break
+
+            updates, opt_state = optimizer.update(grads, opt_state, unc_params)
+            unc_params = optax.apply_updates(unc_params, updates)
+
+            ll = -float(loss) * n_timesteps
+            log_likelihoods.append(ll)
+            best_unc_params = unc_params
+
+            if verbose and (step % 10 == 0 or step == num_steps - 1):
+                logger.info("SGD step %d: LL=%.2f", step, ll)
+
+            if convergence_tol is not None and len(log_likelihoods) >= 2:
+                if abs(log_likelihoods[-1] - log_likelihoods[-2]) < convergence_tol:
+                    stall_count += 1
+                else:
+                    stall_count = 0
+                if stall_count >= 5:
+                    logger.info("SGD converged at step %d.", step)
+                    break
 
         final_params = transform_to_constrained(unc_params, param_spec)
         self._store_sgd_params(final_params)
@@ -246,7 +264,7 @@ class SGDFittableMixin:
         return log_likelihoods
 ```
 
-Note: `_sgd_loss_fn` returns the **raw** negative marginal LL (not normalized). The mixin divides by `n_timesteps`. This avoids each model having to know about normalization.
+Note: The mixin uses only a Python loop — no `lax.scan` path. This avoids JIT closure issues with `self` and is simpler to debug. `_sgd_loss_fn` returns the **raw** negative marginal LL (not normalized). The mixin divides by `n_timesteps`. This avoids each model having to know about normalization.
 
 #### Step 0.4: Tests
 
@@ -673,6 +691,17 @@ Unlike the oscillator hierarchy classes, `SwitchingSpikeOscillatorModel` does NO
 - `init_mean`, `init_cov` — per state.
 
 The `update_*` flags (`update_continuous_transition_matrix`, `update_process_cov`, etc.) should map to the `trainable` field in the param spec: when a flag is False, the parameter is included but frozen via `stop_gradient`.
+
+**Stability constraint:** Since this model optimizes raw A matrices without oscillator structure, a soft spectral-radius penalty is required to prevent divergent dynamics:
+
+```python
+def _spectral_radius_penalty(A, max_radius=0.99):
+    eigenvalues = jnp.linalg.eigvals(A)
+    radius = jnp.max(jnp.abs(eigenvalues))
+    return jnp.maximum(radius - max_radius, 0.0) ** 2
+```
+
+Add this penalty inside `_sgd_loss_fn` with a default weight of `lambda_stability=10.0`. This replaces the eigenvalue projection in `_project_parameters()` with a differentiable soft constraint. If the penalty alone is insufficient to maintain stability on synthetic tests, defer Task 9 entirely and document the issue.
 
 #### Step 9.1: Add mixin, implement four methods
 
