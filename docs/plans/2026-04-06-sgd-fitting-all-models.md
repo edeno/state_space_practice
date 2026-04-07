@@ -258,6 +258,46 @@ conda run -n state_space_practice pytest src/state_space_practice/tests/test_sgd
 conda run -n state_space_practice ruff check src/state_space_practice
 ```
 
+#### Step 0.5: Public initialization API for keyed model families
+
+The oscillator models (`BaseModel` subclasses), switching point-process models (`BaseSwitchingPointProcessModel` subclasses), and `SwitchingSpikeOscillatorModel` currently expose only private `_initialize_parameters(key)` methods. These are called internally by `fit()`. For SGD, callers need a public entry point.
+
+Add a thin public wrapper to each model family's base class:
+
+```python
+# In BaseModel (oscillator_models.py):
+def initialize_parameters(self, key: Array, obs: Array) -> None:
+    """Allocate and initialize model parameters.
+
+    Must be called before fit_sgd(). Called automatically by fit().
+    """
+    self._initialize_parameters(key)
+
+# In BaseSwitchingPointProcessModel (point_process_models.py):
+def initialize_parameters(self, key: Array, spikes: Array) -> None:
+    """Allocate and initialize model parameters including spike GLM.
+
+    Must be called before fit_sgd(). Called automatically by fit().
+    """
+    self._initialize_parameters(key)
+
+# In SwitchingSpikeOscillatorModel (switching_point_process.py):
+def initialize_parameters(self, key: Array) -> None:
+    """Allocate and initialize model parameters.
+
+    Must be called before fit_sgd(). Called automatically by fit().
+    """
+    self._initialize_parameters(key)
+```
+
+**Important:** These wrappers do NOT replicate the full EM warm-start (spectral clustering, placeholder smoother stats, initial spike M-step). They only allocate parameter arrays. For SGD on switching point-process models, a separate warm-start helper is needed (see Task 7).
+
+Update the existing `fit()` methods to call `self.initialize_parameters(key, ...)` instead of `self._initialize_parameters(key)` directly, preserving backward compatibility.
+
+Tests: verify `initialize_parameters` is callable and produces allocated arrays.
+
+**Note on parameter materialization timing:** For oscillator models, A, Q, R, H are materialized during `_initialize_parameters()`, NOT at construction time. This means `_check_sgd_initialized()` must verify these arrays exist (via `hasattr`), and the plan's language about "fixed at construction time" should be read as "fixed at initialization time."
+
 ---
 
 ### Task 1: Refactor Choice Models to Use Mixin
@@ -451,7 +491,7 @@ This mirrors the existing EM pattern where `fit()` calls `initialize_parameters(
 
 `_sgd_loss_fn` must:
 1. Receive constrained parameters (primarily H, plus Z, init)
-2. Use the already-initialized A, Q, R (fixed at construction time from `freqs`, `auto_regressive_coef`, `process_variance`, `measurement_variance`)
+2. Use the already-initialized A, Q, R (materialized during `initialize_parameters()`, not at construction time, from `freqs`, `auto_regressive_coef`, `process_variance`, `measurement_variance`)
 3. Call the switching Kalman filter with the learned H and fixed A, Q, R
 4. Return `-marginal_log_likelihood`
 
@@ -543,8 +583,8 @@ The existing codebase uses trust-region blending, Armijo line search, eigenvalue
 ### Task 8: BaseSwitchingPointProcessModel + Subclasses
 
 #### What it learns (in addition to oscillator params)
-- `baseline_` — spike GLM baseline (UNCONSTRAINED)
-- `spike_weights_` — spike GLM weights (UNCONSTRAINED)
+- `spike_params.baseline` — spike GLM baseline (UNCONSTRAINED), stored in `SpikeObsParams` struct
+- `spike_params.weights` — spike GLM weights (UNCONSTRAINED), stored in `SpikeObsParams` struct
 
 #### Step 8.1: Add mixin to BaseSwitchingPointProcessModel ABC
 
@@ -553,7 +593,24 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
     ...
 ```
 
-`_check_sgd_initialized()` must verify that parameters are allocated AND that the spike GLM parameters (`self.spike_params.baseline`, `self.spike_params.weights` — stored as a `SpikeObsParams` struct, not as `baseline_`/`spike_weights_` attributes) are initialized. The existing `fit()` path runs warm initialization (spectral clustering of discrete states, placeholder smoother statistics, initial spike M-step) before the main EM loop. For SGD, only parameter allocation is required — the warm-start heuristics are EM-specific. Callers must call `model.initialize_parameters(key=..., obs=...)` before `fit_sgd()`.
+`_check_sgd_initialized()` must verify that parameters are allocated AND that the spike GLM parameters (`self.spike_params.baseline`, `self.spike_params.weights` — stored as a `SpikeObsParams` struct, not as `baseline_`/`spike_weights_` attributes) are initialized.
+
+**SGD warm-start for switching point-process models:**
+
+The existing `fit()` path does more than allocate arrays before the main EM loop. It runs a multi-step warm-start sequence (see `_fit_single` in `point_process_models.py`):
+1. `_initialize_parameters(key)` — allocate A, Q, Z, H, R, spike params
+2. `_warm_initialize_states(spikes)` — spectral clustering to seed discrete states
+3. Create placeholder smoother statistics (zeros for smoother means/covs/cross-covs)
+4. `_m_step_spikes(spikes)` — initial spike GLM fit using placeholder statistics
+
+For SGD, steps 2-4 are not strictly required (SGD will optimize from any valid starting point), but they provide a much better initialization than random parameters. Without them, the gradient stability gate (Task 7) may fail not because of fundamental gradient issues but because of a poor starting point.
+
+**Decision:** Add a `_warm_initialize_for_sgd(key, spikes)` helper to `BaseSwitchingPointProcessModel` that runs:
+1. `initialize_parameters(key, spikes)` — allocates all arrays
+2. `_warm_initialize_states(spikes)` — seeds discrete states from data (cheap, helpful)
+3. A basic spike GLM initialization (e.g., set baselines to log of mean firing rate, weights to small random values) — NOT the full Newton M-step, but enough for a reasonable starting point
+
+This helper is called by `fit_sgd` before optimization, or callers can call it manually. The gradient stability gate (Task 7) should test both cold-start (random init) and warm-start to characterize the difference.
 
 The `_build_param_spec` for spike GLM parameters should use keys like `"spike_baseline"` and `"spike_weights"` in the param dict, and `_store_sgd_params` must write back to `self.spike_params.baseline` and `self.spike_params.weights` (or reconstruct a new `SpikeObsParams`).
 
@@ -595,7 +652,7 @@ Unlike the oscillator hierarchy classes, `SwitchingSpikeOscillatorModel` does NO
 - `continuous_transition_matrix` — UNCONSTRAINED (per state). No oscillator structure is enforced during SGD. This is a tradeoff: it gives the optimizer full freedom but may produce non-oscillatory solutions. If structure preservation is needed, a future extension could add a `use_scientific_parameterization` flag that introduces `freqs`/`damping` as learnable parameters and reconstructs A from them (similar to the oscillator hierarchy).
 - `process_cov` — PSD_MATRIX (per state).
 - `discrete_transition_matrix` (Z) — STOCHASTIC_ROW.
-- `baseline_`, `spike_weights_` — UNCONSTRAINED (spike GLM params, optionally per state).
+- `spike_params.baseline`, `spike_params.weights` — UNCONSTRAINED (spike GLM params via `SpikeObsParams` struct, optionally per state).
 - `init_mean`, `init_cov` — per state.
 
 The `update_*` flags (`update_continuous_transition_matrix`, `update_process_cov`, etc.) should map to the `trainable` field in the param spec: when a flag is False, the parameter is included but frozen via `stop_gradient`.
