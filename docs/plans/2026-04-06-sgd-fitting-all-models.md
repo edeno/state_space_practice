@@ -66,7 +66,7 @@ Each model implements:
 
 6. **`_finalize_sgd` hook for model-specific post-optimization.** The existing choice-model `fit_sgd` implementations run a final smoother pass and populate `_smoother_result`, `log_likelihood_`, and `is_fitted` after optimization. The mixin must call a model-specific finalization hook to preserve this contract.
 
-7. **Initialization contract for oscillator and switching models.** The mixin does NOT handle parameter initialization. For models that require keyed initialization (oscillator family, switching point-process), callers must call `model.initialize_parameters(key=key, ...)` before `fit_sgd`. The mixin calls `self._check_sgd_initialized()` at the top of `fit_sgd`, which raises `RuntimeError` if parameters are not allocated. For choice models and SmithLearningModel, parameters are allocated at construction time, so no separate initialization is needed. This avoids duplicating the warm-start logic (spectral clustering, placeholder smoother stats, initial spike M-step) that exists in each model's `fit()` method — SGD only needs valid starting parameters, not the full EM warm-start procedure.
+7. **Initialization contract: mixin never initializes, model families override `fit_sgd` when needed.** The base mixin does NOT handle parameter initialization — it only calls `self._check_sgd_initialized()` and raises `RuntimeError` if parameters are not allocated. For choice models and SmithLearningModel, parameters are allocated at construction time, so no separate initialization is needed. For oscillator and switching point-process models, callers must call `model.initialize_parameters(key=key, ...)` before `fit_sgd()`. The mixin itself never calls initialization helpers. If a model family needs warm-start logic before optimization, its base class overrides `fit_sgd` to perform that setup and then delegates to `super().fit_sgd(...)`. This keeps the mixin pure and lets each family own its initialization lifecycle.
 
 8. **Point-process gradient stability gate.** Before exposing SGD for point-process models, verify that gradients through the Laplace-EKF are finite on small synthetic problems. If gradients are unstable, defer that model and document the issue (following the differentiable-EM plan's guidance).
 
@@ -485,7 +485,7 @@ model.initialize_parameters(key=jax.random.PRNGKey(0), obs=obs)
 model.fit_sgd(obs, num_steps=200)
 ```
 
-This mirrors the existing EM pattern where `fit()` calls `initialize_parameters()` internally. For SGD, initialization is explicit because SGD does not need the full EM warm-start procedure (spectral clustering, etc.) — it only needs valid starting parameters.
+This mirrors the existing EM pattern where `fit()` calls `initialize_parameters()` internally. For SGD, initialization is explicit — callers must call `initialize_parameters()` before `fit_sgd()`. The mixin itself never initializes (design decision #7). `BaseModel` does NOT override `fit_sgd`; it relies on `_check_sgd_initialized()` to enforce the precondition.
 
 #### Step 5.2: Implement on CommonOscillatorModel first
 
@@ -605,12 +605,29 @@ The existing `fit()` path does more than allocate arrays before the main EM loop
 
 For SGD, steps 2-4 are not strictly required (SGD will optimize from any valid starting point), but they provide a much better initialization than random parameters. Without them, the gradient stability gate (Task 7) may fail not because of fundamental gradient issues but because of a poor starting point.
 
-**Decision:** Add a `_warm_initialize_for_sgd(key, spikes)` helper to `BaseSwitchingPointProcessModel` that runs:
-1. `initialize_parameters(key, spikes)` — allocates all arrays
-2. `_warm_initialize_states(spikes)` — seeds discrete states from data (cheap, helpful)
-3. A basic spike GLM initialization (e.g., set baselines to log of mean firing rate, weights to small random values) — NOT the full Newton M-step, but enough for a reasonable starting point
+**Decision:** `BaseSwitchingPointProcessModel` overrides `fit_sgd` to perform family-specific warm-start before delegating to the mixin:
 
-This helper is called by `fit_sgd` before optimization, or callers can call it manually. The gradient stability gate (Task 7) should test both cold-start (random init) and warm-start to characterize the difference.
+```python
+class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
+    def fit_sgd(self, spikes, *, key=None, skip_warm_init=False, **kwargs):
+        if not skip_warm_init:
+            if key is None:
+                raise ValueError("key required for warm initialization")
+            self._warm_initialize_for_sgd(key, spikes)
+        return super().fit_sgd(spikes, **kwargs)
+
+    def _warm_initialize_for_sgd(self, key, spikes):
+        """Lightweight warm-start for SGD (not the full EM warm-start)."""
+        self.initialize_parameters(key, spikes)       # allocate arrays
+        self._warm_initialize_states(spikes)           # seed discrete states
+        # Initialize spike baselines to log mean firing rate
+        # (NOT the full Newton M-step, just a reasonable starting point)
+        ...
+```
+
+The mixin itself never initializes. Callers who want manual control can call `initialize_parameters` + optionally `_warm_initialize_for_sgd` themselves, then pass `skip_warm_init=True`.
+
+The gradient stability gate (Task 7) should test both cold-start (random init) and warm-start to characterize the difference.
 
 The `_build_param_spec` for spike GLM parameters should use keys like `"spike_baseline"` and `"spike_weights"` in the param dict, and `_store_sgd_params` must write back to `self.spike_params.baseline` and `self.spike_params.weights` (or reconstruct a new `SpikeObsParams`).
 
