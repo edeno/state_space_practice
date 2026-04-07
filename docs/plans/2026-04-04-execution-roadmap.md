@@ -88,11 +88,14 @@ Both tracks share the same dependency graph. The scientific track has a "minimum
 | Order | Plan | Feasibility | Risk | Effort | Depends On |
 |---|---|---|---|---|---|
 | 0 | numerical-stability-remediation.md | **DONE** | Low | 1 week | None |
-| 0.5 | computational-improvements.md | READY | Low-Med | 2-3 weeks | None |
+| 0.5 | computational-improvements.md | **DONE** | Low-Med | 2-3 weeks | None |
+| 0.6 | sgd-fitting-all-models.md | READY | Med | 3-4 weeks | 0.5 |
 
 Order 0: Fixed correctness bugs in kalman.py, switching_kalman.py, and point_process_kalman.py.
 
-Order 0.5: Parallel smoother (associative scan), Woodbury-optimized updates, Joseph form covariance, parameter constraints, SGD fitting. Model-agnostic infrastructure that benefits all downstream plans. Tasks are independent — can be done in any order or interleaved with model work.
+Order 0.5: **DONE.** Parallel smoother (associative scan), Woodbury-optimized updates, Joseph form covariance, parameter constraints, SGD fitting for choice models.
+
+Order 0.6: SGD fitting mixin for all model classes. Adds STOCHASTIC_ROW transform, trainable flag with stop_gradient, shared SGDFittableMixin. Covers SmithLearningModel, PointProcessModel, PlaceFieldModel, all oscillator models, and all switching point-process models.
 
 ### Infrastructure Track
 
