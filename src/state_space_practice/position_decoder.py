@@ -291,9 +291,10 @@ class PlaceFieldRateMaps:
         )
 
     def log_rate_jacobian(self, position: Array) -> Array:
-        """Jacobian of log firing rate w.r.t. position via finite differences.
+        """Jacobian of log firing rate w.r.t. position via jax.jacfwd.
 
-        JIT-compatible. Uses half-grid-spacing central differences.
+        JIT-compatible. Uses automatic differentiation for exact
+        gradients through the bilinear interpolation.
 
         Parameters
         ----------
@@ -366,32 +367,18 @@ def _bilinear_log_rate_jacobian(
     dx: float,
     dy: float,
 ) -> Array:
-    """JIT-compatible Jacobian of log-rate via central finite differences."""
-    eps_x = dx * 0.5
-    eps_y = dy * 0.5
+    """JIT-compatible Jacobian of log-rate via jax.jacfwd.
 
-    # Use .at[].add() to perturb position without allocating new arrays
+    Uses automatic differentiation through the bilinear interpolation
+    for exact gradients.
+    """
     pos_xy = position[:2]
-    eps_vec_x = jnp.array([eps_x, 0.0])
-    eps_vec_y = jnp.array([0.0, eps_y])
 
-    rate_xp = _bilinear_log_rate(
-        pos_xy + eps_vec_x, log_rate_maps, x_edges, y_edges, dx, dy
-    )
-    rate_xm = _bilinear_log_rate(
-        pos_xy - eps_vec_x, log_rate_maps, x_edges, y_edges, dx, dy
-    )
-    rate_yp = _bilinear_log_rate(
-        pos_xy + eps_vec_y, log_rate_maps, x_edges, y_edges, dx, dy
-    )
-    rate_ym = _bilinear_log_rate(
-        pos_xy - eps_vec_y, log_rate_maps, x_edges, y_edges, dx, dy
-    )
+    def _log_rate_xy(xy: Array) -> Array:
+        return _bilinear_log_rate(xy, log_rate_maps, x_edges, y_edges, dx, dy)
 
-    dfdx = (rate_xp - rate_xm) / (2 * eps_x)
-    dfdy = (rate_yp - rate_ym) / (2 * eps_y)
-
-    return jnp.column_stack([dfdx, dfdy])
+    # jacfwd gives shape (n_neurons, 2) — Jacobian of vector output w.r.t. 2D input
+    return jax.jacfwd(_log_rate_xy)(pos_xy)
 
 
 class DecoderResult:
