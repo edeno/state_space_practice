@@ -28,6 +28,8 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.sgd_fitting import SGDFittableMixin
+
 from state_space_practice.kalman import (
     _kalman_smoother_update,
     psd_solve,
@@ -358,7 +360,7 @@ def multinomial_choice_smoother(
 _DEFAULT_BETA_GRID = (0.1, 0.3, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0)
 
 
-class MultinomialChoiceModel:
+class MultinomialChoiceModel(SGDFittableMixin):
     """Multi-armed bandit choice model with evolving option values.
 
     Tracks latent option values from a sequence of choices using a
@@ -552,11 +554,9 @@ class MultinomialChoiceModel:
         optimizer: Optional[object] = None,
         num_steps: int = 200,
         verbose: bool = False,
+        convergence_tol: Optional[float] = None,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
-
-        Uses optax for optimization. Parameters are transformed to
-        unconstrained space, optimized, and transformed back.
 
         Parameters
         ----------
@@ -568,19 +568,13 @@ class MultinomialChoiceModel:
             Number of optimization steps.
         verbose : bool
             Log progress every 10 steps.
+        convergence_tol : float or None
+            If set, stop early when loss change < tol for 5 consecutive steps.
 
         Returns
         -------
         log_likelihoods : list of float
         """
-        import optax
-
-        from state_space_practice.parameter_transforms import (
-            POSITIVE,
-            transform_to_constrained,
-            transform_to_unconstrained,
-        )
-
         choices_arr = jnp.asarray(choices, dtype=jnp.int32)
         self._n_trials = int(choices_arr.shape[0])
 
@@ -596,83 +590,60 @@ class MultinomialChoiceModel:
                 f"got range [{choices_np.min()}, {choices_np.max()}]"
             )
 
-        k_free = self.n_options - 1
+        return super().fit_sgd(
+            choices_arr,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+        )
 
-        # Build parameter spec
-        param_spec: dict = {}
+    # --- SGDFittableMixin protocol ---
+
+    @property
+    def _n_timesteps(self) -> int:
+        return self._n_trials
+
+    def _check_sgd_initialized(self) -> None:
+        pass  # Parameters are allocated at construction time
+
+    def _build_param_spec(self) -> tuple[dict, dict]:
+        from state_space_practice.parameter_transforms import POSITIVE
+
         params: dict = {}
+        spec: dict = {}
         if self.learn_process_noise:
-            param_spec["process_noise"] = POSITIVE
             params["process_noise"] = jnp.array(self.process_noise)
+            spec["process_noise"] = POSITIVE
         if self.learn_inverse_temperature:
-            param_spec["inverse_temperature"] = POSITIVE
             params["inverse_temperature"] = jnp.array(self.inverse_temperature)
+            spec["inverse_temperature"] = POSITIVE
+        return params, spec
 
-        if not param_spec:
-            raise ValueError("No learnable parameters — nothing to optimize.")
+    def _sgd_loss_fn(self, params: dict, choices: Array) -> Array:
+        k_free = self.n_options - 1
+        result = _multinomial_choice_filter_jit(
+            choices, self.n_options,
+            params.get("process_noise", jnp.array(self.process_noise)),
+            params.get("inverse_temperature", jnp.array(self.inverse_temperature)),
+            jnp.zeros(k_free),
+            jnp.eye(k_free),
+        )
+        return -result.marginal_log_likelihood
 
-        unc_params = transform_to_unconstrained(params, param_spec)
-        n_trials = float(self._n_trials)
+    def _store_sgd_params(self, params: dict) -> None:
+        if "process_noise" in params:
+            self.process_noise = float(params["process_noise"])
+        if "inverse_temperature" in params:
+            self.inverse_temperature = float(params["inverse_temperature"])
 
-        @jax.value_and_grad
-        def loss_fn(unc_p):
-            p = transform_to_constrained(unc_p, param_spec)
-            result = _multinomial_choice_filter_jit(
-                choices_arr, self.n_options,
-                p.get("process_noise", jnp.array(self.process_noise)),
-                p.get("inverse_temperature", jnp.array(self.inverse_temperature)),
-                jnp.zeros(k_free),
-                jnp.eye(k_free),
-            )
-            return -result.marginal_log_likelihood / n_trials
-
-        if optimizer is None:
-            optimizer = optax.chain(
-                optax.clip_by_global_norm(10.0),
-                optax.adam(1e-2),
-            )
-        opt_state = optimizer.init(unc_params)
-
-        def _train_step(carry, _):
-            unc_p, o_state = carry
-            loss, grads = loss_fn(unc_p)
-            updates, new_o_state = optimizer.update(grads, o_state, unc_p)
-            new_unc_p = optax.apply_updates(unc_p, updates)
-            return (new_unc_p, new_o_state), loss
-
-        if verbose:
-            log_likelihoods: list[float] = []
-            for step in range(num_steps):
-                (unc_params, opt_state), loss = _train_step(
-                    (unc_params, opt_state), None,
-                )
-                ll = -float(loss) * self._n_trials
-                log_likelihoods.append(ll)
-                if step % 10 == 0 or step == num_steps - 1:
-                    logger.info("SGD step %d: LL=%.2f", step, ll)
-        else:
-            (unc_params, opt_state), losses = jax.lax.scan(
-                _train_step, (unc_params, opt_state), None, length=num_steps,
-            )
-            log_likelihoods = (-losses * n_trials).tolist()
-
-        # Store learned parameters
-        final_params = transform_to_constrained(unc_params, param_spec)
-        if "process_noise" in final_params:
-            self.process_noise = float(final_params["process_noise"])
-        if "inverse_temperature" in final_params:
-            self.inverse_temperature = float(final_params["inverse_temperature"])
-
-        # Final smoother pass
+    def _finalize_sgd(self, choices: Array) -> None:
         self._smoother_result = multinomial_choice_smoother(
-            choices_arr, self.n_options,
+            choices, self.n_options,
             process_noise=self.process_noise,
             inverse_temperature=self.inverse_temperature,
         )
         self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
-        self.log_likelihood_history_ = log_likelihoods
-
-        return log_likelihoods
 
     def _m_step_process_noise(self, smooth: ChoiceSmootherResult) -> float:
         """M-step: update scalar process noise from smoother statistics.
