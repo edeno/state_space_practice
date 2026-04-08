@@ -114,10 +114,13 @@ def _ensure_psd(mat: Array, diagonal_boost: float = 1e-9) -> Array:
     """
     mat = symmetrize(mat)
     n = mat.shape[0]
-    # Compute minimum eigenvalue (detached from backward pass)
+    # Compute minimum eigenvalue (detached from backward pass —
+    # jitter is a conditioning scalar, not a learned parameter)
     min_eig = jax.lax.stop_gradient(jnp.min(jnp.linalg.eigvalsh(mat)))
-    # Add enough jitter: if min_eig < diagonal_boost, shift up
-    jitter = jnp.maximum(diagonal_boost - min_eig, diagonal_boost)
+    # Shift past the negative eigenvalue with a relative margin to
+    # prevent Schur complement cancellation in float32 Cholesky
+    abs_shift = jnp.maximum(-min_eig, 0.0)
+    jitter = abs_shift + abs_shift * 1e-5 + diagonal_boost
     L = jnp.linalg.cholesky(mat + jitter * jnp.eye(n))
     return L @ L.T
 

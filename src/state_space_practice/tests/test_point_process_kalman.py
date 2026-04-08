@@ -1560,7 +1560,7 @@ class TestGetRateEstimateMultiNeuron:
             spike_indicator_t=spike_counts,
             dt=dt,
             log_intensity_func=nonlinear_log_intensity,
-            diagonal_boost=1e-6,
+            diagonal_boost=1e-9,  # production default
             include_laplace_normalization=True,
         )
 
