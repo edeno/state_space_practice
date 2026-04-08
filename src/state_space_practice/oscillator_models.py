@@ -62,12 +62,13 @@ from state_space_practice.switching_kalman import (
     switching_kalman_maximization_step,
     switching_kalman_smoother,
 )
+from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import check_converged, make_discrete_transition_matrix
 
 logger = logging.getLogger(__name__)
 
 
-class BaseModel(ABC):
+class BaseModel(ABC, SGDFittableMixin):
     """Abstract base class for switching oscillator models.
 
     This class provides the core structure for Expectation-Maximization (EM)
@@ -537,6 +538,81 @@ class BaseModel(ABC):
 
         return log_likelihoods
 
+    # --- SGDFittableMixin protocol (shared by all oscillator subclasses) ---
+
+    def fit_sgd(
+        self,
+        observations: ArrayLike,
+        key: Array,
+        optimizer: Optional[object] = None,
+        num_steps: int = 200,
+        verbose: bool = False,
+        convergence_tol: Optional[float] = None,
+    ) -> list[float]:
+        """Fit by minimizing negative marginal LL via gradient descent.
+
+        Parameters
+        ----------
+        observations : ArrayLike, shape (n_time, n_sources)
+            The sequence of observations.
+        key : Array
+            JAX random key for parameter initialization.
+        optimizer : optax optimizer or None
+            Default: adam(1e-2) with gradient clipping.
+        num_steps : int
+            Number of optimization steps.
+        verbose : bool
+            Log progress every 10 steps.
+        convergence_tol : float or None
+            If set, stop early when |ΔLL| < tol for 5 consecutive steps.
+
+        Returns
+        -------
+        log_likelihoods : list of float
+        """
+        observations = jnp.asarray(observations)
+        self._initialize_parameters(key)
+        self._sgd_n_time = observations.shape[0]
+
+        return super().fit_sgd(
+            observations,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+        )
+
+    @property
+    def _n_timesteps(self) -> int:
+        return self._sgd_n_time
+
+    def _check_sgd_initialized(self) -> None:
+        if not hasattr(self, "continuous_transition_matrix") or \
+           self.continuous_transition_matrix is None:
+            raise RuntimeError(
+                "Call fit_sgd(observations, key=...) to initialize parameters."
+            )
+
+    def _store_sgd_params(self, params: dict) -> None:
+        if "measurement_matrix" in params:
+            self.measurement_matrix = params["measurement_matrix"]
+        if "measurement_cov" in params:
+            self.measurement_cov = params["measurement_cov"]
+        if "discrete_transition_matrix" in params:
+            self.discrete_transition_matrix = params["discrete_transition_matrix"]
+        if "init_mean" in params:
+            self.init_mean = params["init_mean"]
+        if "init_cov" in params:
+            self.init_cov = params["init_cov"]
+        if "init_discrete_state_prob" in params:
+            self.init_discrete_state_prob = params["init_discrete_state_prob"]
+        # Subclasses may store additional params (coupling, etc.)
+
+    def _finalize_sgd(self, observations: ArrayLike) -> None:
+        self._e_step(observations)
+
+    # Subclasses must implement _build_param_spec and _sgd_loss_fn
+
 
 class CommonOscillatorModel(BaseModel):
     """Common Oscillator Model (COM).
@@ -738,6 +814,93 @@ class CommonOscillatorModel(BaseModel):
                 f"got {observations.shape[1]}."
             )
         return super().fit(observations, key, max_iter, tolerance)
+
+    # --- SGDFittableMixin: COM-specific param spec and loss ---
+
+    def _build_param_spec(self) -> tuple[dict, dict]:
+        from state_space_practice.parameter_transforms import (
+            PSD_MATRIX,
+            STOCHASTIC_ROW,
+            UNCONSTRAINED,
+        )
+
+        params: dict = {}
+        spec: dict = {}
+
+        if self.update_measurement_matrix:
+            params["measurement_matrix"] = self.measurement_matrix
+            spec["measurement_matrix"] = UNCONSTRAINED
+        if self.update_measurement_cov:
+            # Per-state R: vmap PSD transform over last axis
+            for j in range(self.n_discrete_states):
+                key = f"measurement_cov_{j}"
+                params[key] = self.measurement_cov[..., j]
+                spec[key] = PSD_MATRIX
+        if self.update_discrete_transition_matrix:
+            params["discrete_transition_matrix"] = self.discrete_transition_matrix
+            spec["discrete_transition_matrix"] = STOCHASTIC_ROW
+        if self.update_init_mean:
+            params["init_mean"] = self.init_mean
+            spec["init_mean"] = UNCONSTRAINED
+        if self.update_init_cov:
+            for j in range(self.n_discrete_states):
+                key = f"init_cov_{j}"
+                params[key] = self.init_cov[..., j]
+                spec[key] = PSD_MATRIX
+
+        return params, spec
+
+    def _sgd_loss_fn(self, params: dict, observations: Array) -> Array:
+        H = params.get("measurement_matrix", self.measurement_matrix)
+        Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
+        m0 = params.get("init_mean", self.init_mean)
+
+        # Reconstruct per-state R from individual PSD params
+        R = self.measurement_cov
+        if any(k.startswith("measurement_cov_") for k in params):
+            R = jnp.stack(
+                [params.get(f"measurement_cov_{j}", self.measurement_cov[..., j])
+                 for j in range(self.n_discrete_states)],
+                axis=-1,
+            )
+
+        # Reconstruct per-state P0 from individual PSD params
+        P0 = self.init_cov
+        if any(k.startswith("init_cov_") for k in params):
+            P0 = jnp.stack(
+                [params.get(f"init_cov_{j}", self.init_cov[..., j])
+                 for j in range(self.n_discrete_states)],
+                axis=-1,
+            )
+
+        result = switching_kalman_filter(
+            init_state_cond_mean=m0,
+            init_state_cond_cov=P0,
+            init_discrete_state_prob=self.init_discrete_state_prob,
+            obs=observations,
+            discrete_transition_matrix=Z,
+            continuous_transition_matrix=self.continuous_transition_matrix,
+            process_cov=self.process_cov,
+            measurement_matrix=H,
+            measurement_cov=R,
+        )
+        return -result[5]  # scalar marginal_ll
+
+    def _store_sgd_params(self, params: dict) -> None:
+        super()._store_sgd_params(params)
+        # Reconstruct per-state arrays from individual PSD params
+        if any(k.startswith("measurement_cov_") for k in params):
+            self.measurement_cov = jnp.stack(
+                [params.get(f"measurement_cov_{j}", self.measurement_cov[..., j])
+                 for j in range(self.n_discrete_states)],
+                axis=-1,
+            )
+        if any(k.startswith("init_cov_") for k in params):
+            self.init_cov = jnp.stack(
+                [params.get(f"init_cov_{j}", self.init_cov[..., j])
+                 for j in range(self.n_discrete_states)],
+                axis=-1,
+            )
 
 
 class CorrelatedNoiseModel(BaseModel):
@@ -1249,7 +1412,10 @@ class DirectedInfluenceModel(BaseModel):
             else:
                 A_j = A_proj_j
 
-            # Enforce spectral radius < 1 for stability
+            # Enforce spectral radius < 1 for stability (unconditional).
+            # Stability is a hard physical constraint: an unstable A causes
+            # state divergence and invalidates the E-step posteriors. Unlike
+            # the block structure projection above, this is not optional.
             max_spectral_radius = 0.99
             eigvals = jnp.linalg.eigvals(A_j)
             spectral_radius = jnp.max(jnp.abs(eigvals))
@@ -1258,16 +1424,7 @@ class DirectedInfluenceModel(BaseModel):
                 max_spectral_radius / spectral_radius,
                 1.0,
             )
-            A_scaled = A_j * scale
-
-            if suff_stats is not None:
-                q_scaled = compute_transition_q_function(
-                    A_scaled, gamma1_j, beta_j
-                )
-                q_before = compute_transition_q_function(A_j, gamma1_j, beta_j)
-                A_j = jnp.where(q_scaled <= q_before, A_scaled, A_j)
-            else:
-                A_j = A_scaled
+            A_j = A_j * scale
 
             projected.append(A_j)
         self.continuous_transition_matrix = jnp.stack(projected, axis=-1)
@@ -1307,3 +1464,122 @@ class DirectedInfluenceModel(BaseModel):
                 f"got {observations.shape[1]}."
             )
         return super().fit(observations, key, max_iter, tolerance)
+
+    # --- SGDFittableMixin: DIM-specific param spec and loss ---
+
+    def _build_param_spec(self) -> tuple[dict, dict]:
+        from state_space_practice.parameter_transforms import (
+            PSD_MATRIX,
+            STOCHASTIC_ROW,
+            UNCONSTRAINED,
+        )
+
+        params: dict = {}
+        spec: dict = {}
+
+        if self.update_continuous_transition_matrix:
+            params["phase_difference"] = self.phase_difference
+            spec["phase_difference"] = UNCONSTRAINED
+            params["coupling_strength"] = self.coupling_strength
+            spec["coupling_strength"] = UNCONSTRAINED
+
+        if self.update_measurement_cov:
+            for j in range(self.n_discrete_states):
+                k = f"measurement_cov_{j}"
+                params[k] = self.measurement_cov[..., j]
+                spec[k] = PSD_MATRIX
+
+        if self.update_discrete_transition_matrix:
+            params["discrete_transition_matrix"] = self.discrete_transition_matrix
+            spec["discrete_transition_matrix"] = STOCHASTIC_ROW
+
+        if self.update_init_mean:
+            params["init_mean"] = self.init_mean
+            spec["init_mean"] = UNCONSTRAINED
+
+        if self.update_init_cov:
+            for j in range(self.n_discrete_states):
+                k = f"init_cov_{j}"
+                params[k] = self.init_cov[..., j]
+                spec[k] = PSD_MATRIX
+
+        return params, spec
+
+    def _sgd_loss_fn(self, params: dict, observations) -> jax.Array:
+        phase_diff = params.get("phase_difference", self.phase_difference)
+        coupling = params.get("coupling_strength", self.coupling_strength)
+
+        A_list = []
+        for j in range(self.n_discrete_states):
+            A_j = construct_directed_influence_transition_matrix(
+                freqs=self.freqs,
+                damping_coeffs=self.auto_regressive_coef,
+                phase_diffs=phase_diff[..., j],
+                coupling_strengths=coupling[..., j],
+                sampling_freq=self.sampling_freq,
+            )
+            A_list.append(A_j)
+        A = jnp.stack(A_list, axis=-1)
+
+        Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
+        m0 = params.get("init_mean", self.init_mean)
+
+        R = self.measurement_cov
+        if any(k.startswith("measurement_cov_") for k in params):
+            R = jnp.stack(
+                [params.get(f"measurement_cov_{j}", self.measurement_cov[..., j])
+                 for j in range(self.n_discrete_states)],
+                axis=-1,
+            )
+
+        P0 = self.init_cov
+        if any(k.startswith("init_cov_") for k in params):
+            P0 = jnp.stack(
+                [params.get(f"init_cov_{j}", self.init_cov[..., j])
+                 for j in range(self.n_discrete_states)],
+                axis=-1,
+            )
+
+        result = switching_kalman_filter(
+            init_state_cond_mean=m0,
+            init_state_cond_cov=P0,
+            init_discrete_state_prob=self.init_discrete_state_prob,
+            obs=observations,
+            discrete_transition_matrix=Z,
+            continuous_transition_matrix=A,
+            process_cov=self.process_cov,
+            measurement_matrix=self.measurement_matrix,
+            measurement_cov=R,
+        )
+        return -result[5]
+
+    def _store_sgd_params(self, params: dict) -> None:
+        super()._store_sgd_params(params)
+        if "phase_difference" in params:
+            self.phase_difference = params["phase_difference"]
+        if "coupling_strength" in params:
+            self.coupling_strength = params["coupling_strength"]
+        if "phase_difference" in params or "coupling_strength" in params:
+            A_list = []
+            for j in range(self.n_discrete_states):
+                A_j = construct_directed_influence_transition_matrix(
+                    freqs=self.freqs,
+                    damping_coeffs=self.auto_regressive_coef,
+                    phase_diffs=self.phase_difference[..., j],
+                    coupling_strengths=self.coupling_strength[..., j],
+                    sampling_freq=self.sampling_freq,
+                )
+                A_list.append(A_j)
+            self.continuous_transition_matrix = jnp.stack(A_list, axis=-1)
+        if any(k.startswith("measurement_cov_") for k in params):
+            self.measurement_cov = jnp.stack(
+                [params.get(f"measurement_cov_{j}", self.measurement_cov[..., j])
+                 for j in range(self.n_discrete_states)],
+                axis=-1,
+            )
+        if any(k.startswith("init_cov_") for k in params):
+            self.init_cov = jnp.stack(
+                [params.get(f"init_cov_{j}", self.init_cov[..., j])
+                 for j in range(self.n_discrete_states)],
+                axis=-1,
+            )

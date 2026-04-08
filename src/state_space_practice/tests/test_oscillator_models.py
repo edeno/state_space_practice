@@ -1288,3 +1288,145 @@ class TestReparameterizedMstep:
         assert jnp.all(jnp.isfinite(model.auto_regressive_coef))
         assert jnp.all(jnp.isfinite(model.coupling_strength))
         assert jnp.all(jnp.isfinite(model.phase_difference))
+
+
+class TestDIMStabilityEnforcement:
+    """Tests that spectral radius clamping is unconditional."""
+
+    def test_projection_enforces_stability(
+        self, directed_influence_params
+    ) -> None:
+        """An unstable A must always be clamped, regardless of Q-function."""
+        model = DirectedInfluenceModel(**directed_influence_params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        # Inject an unstable transition matrix (spectral radius > 1)
+        n_latent = 2 * model.n_oscillators
+        for j in range(model.n_discrete_states):
+            model.continuous_transition_matrix = (
+                model.continuous_transition_matrix.at[:, :, j].set(
+                    jnp.eye(n_latent) * 1.5
+                )
+            )
+
+        model._project_parameters()
+
+        for j in range(model.n_discrete_states):
+            A_j = model.continuous_transition_matrix[:, :, j]
+            eigvals = jnp.linalg.eigvals(A_j)
+            sr = float(jnp.max(jnp.abs(eigvals)))
+            assert sr < 1.0, (
+                f"State {j}: spectral radius {sr} >= 1.0 after projection"
+            )
+
+    def test_stable_matrix_unchanged_by_projection(
+        self, directed_influence_params
+    ) -> None:
+        """A matrix already within spectral radius bound should not be scaled."""
+        params = {**directed_influence_params, "n_discrete_states": 1}
+        # Adjust state-dependent arrays to match n_discrete_states=1
+        params["phase_difference"] = params["phase_difference"][:, :, :1]
+        params["coupling_strength"] = params["coupling_strength"][:, :, :1]
+        model = DirectedInfluenceModel(**params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        # Set A to a valid scaled rotation with sr = 0.8
+        n = 2 * model.n_oscillators
+        A = jnp.eye(n) * 0.8
+        model.continuous_transition_matrix = A[:, :, None]
+
+        model._project_parameters()
+
+        # Spectral radius should remain at ~0.8 (not scaled further)
+        eigvals = jnp.linalg.eigvals(
+            model.continuous_transition_matrix[:, :, 0]
+        )
+        sr = float(jnp.max(jnp.abs(eigvals)))
+        assert 0.75 < sr < 0.85, f"Stable matrix was unnecessarily scaled: sr={sr}"
+
+
+class TestCommonOscillatorSGDFitting:
+    """Tests for CommonOscillatorModel.fit_sgd()."""
+
+    @pytest.fixture
+    def com_setup(self):
+        """Create a small COM + synthetic data."""
+        from state_space_practice.simulate.scenarios import simulate_com_scenario
+
+        scenario = simulate_com_scenario(n_time=200, seed=42)
+        p = scenario["params"]
+        model = CommonOscillatorModel(
+            n_oscillators=p["n_oscillators"],
+            n_discrete_states=p["n_discrete_states"],
+            n_sources=p["n_sources"],
+            sampling_freq=p["sampling_freq"],
+            freqs=p["freqs"],
+            auto_regressive_coef=p["damping"],
+            process_variance=p["process_variance"],
+            measurement_variance=p["measurement_variance"],
+        )
+        return model, scenario["obs"]
+
+    def test_sgd_improves_ll(self, com_setup):
+        model, obs = com_setup
+        key = jax.random.PRNGKey(0)
+        lls = model.fit_sgd(obs, key=key, num_steps=30)
+        # LL should improve from first to last
+        assert lls[-1] > lls[0]
+
+    def test_sgd_discrete_transitions_stochastic(self, com_setup):
+        model, obs = com_setup
+        key = jax.random.PRNGKey(0)
+        model.fit_sgd(obs, key=key, num_steps=20)
+        Z = model.discrete_transition_matrix
+        np.testing.assert_allclose(Z.sum(axis=1), 1.0, atol=1e-6)
+
+    def test_sgd_measurement_matrix_finite(self, com_setup):
+        model, obs = com_setup
+        key = jax.random.PRNGKey(0)
+        model.fit_sgd(obs, key=key, num_steps=20)
+        assert jnp.all(jnp.isfinite(model.measurement_matrix))
+
+
+class TestDirectedInfluenceSGDFitting:
+    """Tests for DirectedInfluenceModel.fit_sgd()."""
+
+    @pytest.fixture
+    def dim_setup(self):
+        """Create a small DIM + synthetic data."""
+        from state_space_practice.simulate.scenarios import simulate_dim_scenario
+
+        scenario = simulate_dim_scenario(n_time=200, seed=42)
+        p = scenario["params"]
+        model = DirectedInfluenceModel(
+            n_oscillators=p["n_oscillators"],
+            n_discrete_states=p["n_discrete_states"],
+            sampling_freq=p["sampling_freq"],
+            freqs=p["freqs"],
+            auto_regressive_coef=p["damping"],
+            process_variance=p["process_variance"],
+            measurement_variance=p["measurement_variance"],
+            phase_difference=p["phase_difference"],
+            coupling_strength=p["coupling_strength"],
+        )
+        return model, scenario["obs"]
+
+    def test_sgd_improves_ll(self, dim_setup):
+        model, obs = dim_setup
+        key = jax.random.PRNGKey(0)
+        lls = model.fit_sgd(obs, key=key, num_steps=30)
+        assert lls[-1] > lls[0]
+
+    def test_sgd_coupling_params_finite(self, dim_setup):
+        model, obs = dim_setup
+        key = jax.random.PRNGKey(0)
+        model.fit_sgd(obs, key=key, num_steps=20)
+        assert jnp.all(jnp.isfinite(model.coupling_strength))
+        assert jnp.all(jnp.isfinite(model.phase_difference))
+
+    def test_sgd_discrete_transitions_stochastic(self, dim_setup):
+        model, obs = dim_setup
+        key = jax.random.PRNGKey(0)
+        model.fit_sgd(obs, key=key, num_steps=20)
+        Z = model.discrete_transition_matrix
+        np.testing.assert_allclose(Z.sum(axis=1), 1.0, atol=1e-6)
