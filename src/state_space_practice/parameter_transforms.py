@@ -1,8 +1,8 @@
 """Lightweight parameter constraint transforms for SGD optimization.
 
 Maps between constrained parameter spaces (positive reals, unit interval,
-PSD matrices) and unconstrained reals for gradient-based optimization.
-No TFP dependency -- pure JAX.
+PSD matrices, row-stochastic matrices) and unconstrained reals for
+gradient-based optimization. No TFP dependency -- pure JAX.
 
 Usage::
 
@@ -12,18 +12,21 @@ Usage::
 """
 
 import math
-from typing import Callable, NamedTuple
+from dataclasses import dataclass
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
 from jax import Array
 
 
-class ParameterTransform(NamedTuple):
+@dataclass(frozen=True)
+class ParameterTransform:
     """Maps between constrained and unconstrained parameter spaces."""
 
     to_unconstrained: Callable[[Array], Array]
     to_constrained: Callable[[Array], Array]
+    trainable: bool = True
 
 
 def _inverse_softplus(x: Array) -> Array:
@@ -81,11 +84,50 @@ PSD_MATRIX = ParameterTransform(
 )
 
 
+def _stochastic_to_real(Z: Array) -> Array:
+    """Row-stochastic matrix to unconstrained logits (drop last column)."""
+    # Jitter to avoid log(0)
+    Z_safe = jnp.maximum(Z, 1e-10)
+    return jnp.log(Z_safe[..., :-1]) - jnp.log(Z_safe[..., -1:])
+
+
+def _real_to_stochastic(logits: Array) -> Array:
+    """Unconstrained logits to row-stochastic matrix via softmax."""
+    full_logits = jnp.concatenate(
+        [logits, jnp.zeros_like(logits[..., :1])], axis=-1
+    )
+    return jax.nn.softmax(full_logits, axis=-1)
+
+
+STOCHASTIC_ROW = ParameterTransform(
+    to_unconstrained=_stochastic_to_real,
+    to_constrained=_real_to_stochastic,
+)
+
+
+def frozen(transform: ParameterTransform) -> ParameterTransform:
+    """Return a copy of the transform with trainable=False."""
+    return ParameterTransform(
+        to_unconstrained=transform.to_unconstrained,
+        to_constrained=transform.to_constrained,
+        trainable=False,
+    )
+
+
 def transform_to_unconstrained(params: dict, spec: dict) -> dict:
     """Transform a dict of constrained parameters to unconstrained space."""
     return {k: spec[k].to_unconstrained(v) for k, v in params.items()}
 
 
 def transform_to_constrained(unc_params: dict, spec: dict) -> dict:
-    """Transform a dict of unconstrained parameters back to constrained space."""
-    return {k: spec[k].to_constrained(v) for k, v in unc_params.items()}
+    """Transform a dict of unconstrained parameters back to constrained space.
+
+    Applies jax.lax.stop_gradient for parameters marked as not trainable.
+    """
+    result = {}
+    for k, v in unc_params.items():
+        value = spec[k].to_constrained(v)
+        if not spec[k].trainable:
+            value = jax.lax.stop_gradient(value)
+        result[k] = value
+    return result

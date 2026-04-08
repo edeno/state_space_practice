@@ -28,6 +28,7 @@ dependencies = [
     "track_linearization",
     "matplotlib",
     "seaborn",
+    "optax",
 ]
 dynamic = ["version"]
 
