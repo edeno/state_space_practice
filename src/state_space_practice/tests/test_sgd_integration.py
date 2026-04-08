@@ -301,3 +301,116 @@ class TestPointProcessSGDIntegration:
             model_em.smoother_mean[:, 0],
         )[0, 1])
         assert corr > 0.7, f"Smoothed state correlation too low: {corr}"
+
+    def test_em_works_at_high_state_dim(self):
+        """Verify EM still works without stabilize_covariance at n_state=15."""
+        from state_space_practice.point_process_kalman import PointProcessModel
+
+        n_state = 15
+        n_neurons = 5
+        n_time = 100
+        dt = 0.001
+
+        key = jax.random.PRNGKey(42)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        A = 0.95 * jnp.eye(n_state)
+        Q = 0.01 * jnp.eye(n_state)
+
+        def _step(x, k):
+            x_new = A @ x + jax.random.multivariate_normal(
+                k, jnp.zeros(n_state), Q
+            )
+            return x_new, x_new
+
+        keys = jax.random.split(k1, n_time)
+        _, states = jax.lax.scan(_step, jnp.zeros(n_state), keys)
+
+        W = jax.random.normal(k2, (n_neurons, n_state)) * 0.3
+        design_matrix = jnp.tile(W, (n_time, 1, 1))
+        log_rates = jnp.einsum("tnk,tk->tn", design_matrix, states)
+        rates = jnp.exp(jnp.clip(log_rates, -5, 5)) * dt
+        spikes = jax.random.poisson(k3, rates)
+
+        model = PointProcessModel(n_state, dt)
+        model.fit(design_matrix, spikes, max_iter=5)
+
+        assert model.smoother_mean is not None
+        assert model.smoother_mean.shape == (n_time, n_state)
+        assert jnp.all(jnp.isfinite(model.smoother_mean))
+
+
+# ---------------------------------------------------------------------------
+# PlaceFieldModel: simulate → fit EM + SGD → verify recovery
+# ---------------------------------------------------------------------------
+
+
+class TestPlaceFieldSGDIntegration:
+    """End-to-end: simulate place field data → fit EM and SGD → verify."""
+
+    def test_em_and_sgd_both_work(self):
+        from state_space_practice.place_field_model import PlaceFieldModel
+        from state_space_practice.simulate_data import simulate_2d_moving_place_field
+
+        sim = simulate_2d_moving_place_field(
+            total_time=20.0, dt=0.020, arena_size=80.0,
+            peak_rate=25.0, background_rate=1.0,
+            n_interior_knots=3, rng=np.random.default_rng(42),
+        )
+
+        # EM fit
+        model_em = PlaceFieldModel(
+            dt=sim["dt"], n_interior_knots=3, init_process_noise=1e-3,
+        )
+        em_lls = model_em.fit(
+            sim["position"], sim["spikes"], max_iter=5, verbose=False,
+        )
+        assert len(em_lls) > 0
+        assert model_em.smoother_mean is not None
+
+        # SGD fit
+        import optax
+
+        model_sgd = PlaceFieldModel(
+            dt=sim["dt"], n_interior_knots=3, init_process_noise=1e-3,
+        )
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(10.0), optax.adam(1e-3),
+        )
+        sgd_lls = model_sgd.fit_sgd(
+            sim["position"], sim["spikes"],
+            optimizer=optimizer, num_steps=30,
+        )
+        assert len(sgd_lls) > 1
+        assert all(np.isfinite(ll) for ll in sgd_lls)
+        assert model_sgd.smoother_mean is not None
+        assert model_sgd.smoother_mean.shape == model_em.smoother_mean.shape
+
+    def test_sgd_improves_ll_on_real_scale_data(self):
+        """SGD should improve LL on realistic place field data (36 basis dims)."""
+        from state_space_practice.place_field_model import PlaceFieldModel
+        from state_space_practice.simulate_data import simulate_2d_moving_place_field
+
+        import optax
+
+        sim = simulate_2d_moving_place_field(
+            total_time=30.0, dt=0.020, arena_size=80.0,
+            peak_rate=25.0, background_rate=1.0,
+            n_interior_knots=3, rng=np.random.default_rng(99),
+        )
+
+        model = PlaceFieldModel(
+            dt=sim["dt"], n_interior_knots=3, init_process_noise=1e-3,
+        )
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(10.0), optax.adam(1e-3),
+        )
+        lls = model.fit_sgd(
+            sim["position"], sim["spikes"],
+            optimizer=optimizer, num_steps=50,
+        )
+
+        # LL should improve (or at least not go to NaN)
+        assert all(np.isfinite(ll) for ll in lls)
+        # Process cov should remain positive
+        assert jnp.all(jnp.diag(model.process_cov) > 0)

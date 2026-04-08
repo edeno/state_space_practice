@@ -738,53 +738,15 @@ class TestNonlinearWarning:
 
 
 class TestPlaceFieldSGDGradientStability:
-    """Gradient stability tests for PlaceFieldModel SGD.
+    """Gradient stability test for Laplace-EKF at PlaceFieldModel dimensions.
 
-    The root cause of NaN gradients at n_state >= 7 is stabilize_covariance
-    (eigendecomp-based PSD projection) inside _point_process_laplace_update.
-    The eigvalsh backward pass is unstable for near-degenerate eigenvalues.
-    Setting stabilize_precision=False resolves the issue.
+    Verifies that removing stabilize_covariance (eigendecomp-based PSD
+    projection) from the Laplace update gives finite gradients at all
+    dimensions, including PlaceFieldModel scale (25+ basis functions).
     """
 
-    def test_gradient_nan_with_eigendecomp_stabilize(self) -> None:
-        """stabilize_covariance on precision causes NaN grads at n_state >= 7."""
-        from state_space_practice.parameter_transforms import (
-            POSITIVE,
-            transform_to_constrained,
-            transform_to_unconstrained,
-        )
-        from state_space_practice.point_process_kalman import (
-            log_conditional_intensity,
-            stochastic_point_process_filter,
-        )
-
-        n_state = 10
-        key = jax.random.PRNGKey(42)
-        A = 0.99 * jnp.eye(n_state)
-        Q = 0.01 * jnp.eye(n_state)
-        m0 = jnp.zeros(n_state)
-        P0 = jnp.eye(n_state)
-        W = jax.random.normal(key, (3, n_state)) * 0.1
-        dm = jnp.tile(W, (50, 1, 1))
-        spikes = jax.random.poisson(key, jnp.ones((50, 3)) * 0.01)
-
-        spec = {"q_diag": POSITIVE}
-        params = {"q_diag": jnp.diag(Q)}
-        unc = transform_to_unconstrained(params, spec)
-
-        def loss_fn(unc_p):
-            p = transform_to_constrained(unc_p, spec)
-            _, _, mll = stochastic_point_process_filter(
-                m0, P0, dm, spikes, 0.001, A, jnp.diag(p["q_diag"]),
-                log_conditional_intensity, stabilize_precision=True,
-            )
-            return -mll
-
-        g = jax.grad(loss_fn)(unc)
-        assert not jnp.all(jnp.isfinite(g["q_diag"]))
-
-    def test_gradient_finite_without_eigendecomp_stabilize(self) -> None:
-        """stabilize_precision=False gives finite grads at high dims."""
+    def test_gradient_finite_at_high_state_dim(self) -> None:
+        """Gradients through Laplace-EKF are finite at n_state=25."""
         from state_space_practice.parameter_transforms import (
             POSITIVE,
             transform_to_constrained,
@@ -813,7 +775,7 @@ class TestPlaceFieldSGDGradientStability:
             p = transform_to_constrained(unc_p, spec)
             _, _, mll = stochastic_point_process_filter(
                 m0, P0, dm, spikes, 0.001, A, jnp.diag(p["q_diag"]),
-                log_conditional_intensity, stabilize_precision=False,
+                log_conditional_intensity,
             )
             return -mll
 

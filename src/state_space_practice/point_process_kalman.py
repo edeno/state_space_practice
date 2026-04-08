@@ -96,6 +96,32 @@ def _logdet_psd(mat: Array, diagonal_boost: float = 1e-9) -> Array:
     return jnp.sum(jnp.log(eigvals))
 
 
+def _ensure_psd(mat: Array, diagonal_boost: float = 1e-9) -> Array:
+    """Ensure a matrix is PSD via Cholesky with adaptive jitter.
+
+    Unlike stabilize_covariance (eigendecomp-based), this is fully
+    differentiable — the Cholesky backward pass is well-conditioned
+    even for near-degenerate eigenvalues.
+
+    For matrices that are already PSD (the common case in the Laplace-EKF
+    with linear observation models), this adds only diagonal_boost to the
+    diagonal. For indefinite matrices (possible with nonlinear observation
+    models where the Hessian correction dominates), it computes the
+    required jitter from the minimum eigenvalue and adds it before Cholesky.
+
+    The eigenvalue computation is detached from the backward pass via
+    stop_gradient so it doesn't introduce the eigvalsh gradient instability.
+    """
+    mat = symmetrize(mat)
+    n = mat.shape[0]
+    # Compute minimum eigenvalue (detached from backward pass)
+    min_eig = jax.lax.stop_gradient(jnp.min(jnp.linalg.eigvalsh(mat)))
+    # Add enough jitter: if min_eig < diagonal_boost, shift up
+    jitter = jnp.maximum(diagonal_boost - min_eig, diagonal_boost)
+    L = jnp.linalg.cholesky(mat + jitter * jnp.eye(n))
+    return L @ L.T
+
+
 def _safe_expected_count(
     log_rate: Array,
     dt: float,
@@ -120,7 +146,6 @@ def _point_process_laplace_update(
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 1,
     line_search_beta: float = 0.5,
-    stabilize_precision: bool = True,
 ) -> tuple[Array, Array, Array]:
     """Single point-process Laplace-EKF update for multiple neurons.
 
@@ -167,12 +192,6 @@ def _point_process_laplace_update(
         Step size reduction factor for backtracking line search. Only used
         when max_newton_iter > 1. At each iteration, step size is halved
         until the negative log-posterior decreases or minimum alpha reached.
-    stabilize_precision : bool, default=True
-        If True, project posterior precision to PSD via eigendecomposition.
-        Set to False for SGD: the eigendecomposition backward pass is
-        numerically unstable for near-degenerate eigenvalues at n_state >= 7.
-        When False, relies on diagonal_boost in psd_solve for stability.
-
     Returns
     -------
     posterior_mean : Array, shape (n_latent,)
@@ -256,12 +275,9 @@ def _point_process_laplace_update(
         fisher_info = jacobian.T @ (conditional_intensity[:, None] * jacobian)
         hessian_correction = jnp.einsum("n,nij->ij", innovation, hessian)
         post_prec = prior_precision + fisher_info - hessian_correction
+        post_prec = _ensure_psd(post_prec, diagonal_boost)
 
-        # Ensure PSD (skip for SGD: eigendecomp backward is unstable at high dims)
-        if stabilize_precision:
-            post_prec = stabilize_covariance(post_prec, min_eigenvalue=diagonal_boost)
-
-        # Newton direction
+        # Newton direction (psd_solve adds diagonal_boost for stability)
         delta = psd_solve(post_prec, gradient, diagonal_boost=diagonal_boost)
         return delta, post_prec, gradient
 
@@ -308,10 +324,9 @@ def _point_process_laplace_update(
         fisher_info = jacobian.T @ (conditional_intensity[:, None] * jacobian)
         hessian_correction = jnp.einsum("n,nij->ij", innovation, hessian)
         posterior_precision = prior_precision + fisher_info - hessian_correction
-        if stabilize_precision:
-            posterior_precision = stabilize_covariance(
-                posterior_precision, min_eigenvalue=diagonal_boost
-            )
+        posterior_precision = _ensure_psd(
+            posterior_precision, diagonal_boost
+        )
         posterior_mean = one_step_mean + psd_solve(
             posterior_precision, gradient, diagonal_boost=diagonal_boost
         )
@@ -325,8 +340,7 @@ def _point_process_laplace_update(
     posterior_cov = psd_solve(
         posterior_precision, identity, diagonal_boost=diagonal_boost
     )
-    if stabilize_precision:
-        posterior_cov = stabilize_covariance(posterior_cov, min_eigenvalue=diagonal_boost)
+    posterior_cov = _ensure_psd(posterior_cov, diagonal_boost)
 
     # Log-likelihood at posterior mode (approximate)
     log_lambda_mode = log_intensity_func(posterior_mean)
@@ -358,7 +372,6 @@ def stochastic_point_process_filter(
     process_cov: ArrayLike,
     log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
     include_laplace_normalization: bool = True,
-    stabilize_precision: bool = True,
 ) -> tuple[Array, Array, Array]:
     """Applies a Stochastic State Point Process Filter (SSPPF).
 
@@ -504,7 +517,6 @@ def stochastic_point_process_filter(
             grad_log_intensity_func=grad_log_intensity_func,
             hess_log_intensity_func=hess_log_intensity_func,
             include_laplace_normalization=include_laplace_normalization,
-            stabilize_precision=stabilize_precision,
         )
 
         marginal_log_likelihood += log_lik

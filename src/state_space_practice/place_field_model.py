@@ -858,7 +858,6 @@ class PlaceFieldModel(SGDFittableMixin):
             transition_matrix=A,
             process_cov=Q,
             log_conditional_intensity=self._log_intensity_func,
-            stabilize_precision=False,  # eigendecomp backward NaN at high dims
         )
         return -marginal_ll
 
