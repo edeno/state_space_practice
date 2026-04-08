@@ -2052,3 +2052,58 @@ class TestSimulateLearningDataProperties:
 
         assert len(outcomes) == n_trials
         assert len(true_prob) == n_trials
+
+
+class TestSmithSGDFitting:
+    """Tests for SmithLearningModel.fit_sgd()."""
+
+    @pytest.fixture
+    def simple_outcomes(self):
+        """Generate simple learning data."""
+        from state_space_practice.smith_learning_algorithm import (
+            simulate_learning_data,
+        )
+
+        outcomes, _ = simulate_learning_data(
+            n_trials=100, prob_success_init=0.3, prob_success_final=0.9, seed=42
+        )
+        return outcomes
+
+    def test_sgd_improves_ll(self, simple_outcomes):
+        model = SmithLearningModel(sigma_epsilon=0.1)
+        initial_ll = model._e_step(jnp.asarray(simple_outcomes))
+        model2 = SmithLearningModel(sigma_epsilon=0.1)
+        lls = model2.fit_sgd(simple_outcomes, num_steps=50)
+        assert lls[-1] > initial_ll
+
+    def test_sgd_respects_constraints(self, simple_outcomes):
+        model = SmithLearningModel(sigma_epsilon=0.1)
+        model.fit_sgd(simple_outcomes, num_steps=50)
+        assert model.sigma_epsilon > 0
+
+    def test_sgd_model_is_fitted(self, simple_outcomes):
+        model = SmithLearningModel(sigma_epsilon=0.1)
+        model.fit_sgd(simple_outcomes, num_steps=50)
+        assert model.is_fitted
+        assert model.log_likelihood_ is not None
+        assert model.smoothed_learning_state_mode is not None
+
+    def test_sgd_matches_em_approximately(self, simple_outcomes):
+        model_em = SmithLearningModel(sigma_epsilon=0.1)
+        model_em.fit(simple_outcomes, max_iter=50)
+
+        model_sgd = SmithLearningModel(sigma_epsilon=0.1)
+        model_sgd.fit_sgd(simple_outcomes, num_steps=200)
+
+        # Both should find reasonable sigma_epsilon
+        assert abs(model_sgd.sigma_epsilon - model_em.sigma_epsilon) < 0.3
+
+    def test_sgd_respects_initial_state_method(self, simple_outcomes):
+        """When initial_state_method='set_initial_to_zero', init params are frozen."""
+        model = SmithLearningModel(
+            sigma_epsilon=0.1, initial_state_method="set_initial_to_zero"
+        )
+        model.fit_sgd(simple_outcomes, num_steps=50)
+        # Init state should still be 0
+        assert model.init_learning_state == 0.0
+        assert model.is_fitted

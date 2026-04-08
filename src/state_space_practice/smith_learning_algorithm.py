@@ -61,6 +61,7 @@ import scipy.special
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import check_converged
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,65 @@ def approximate_gaussian(
     return mode, covariance
 
 
+def _approximate_gaussian_newton(
+    log_posterior_func: Callable[[ArrayLike], Array],
+    x0: ArrayLike,
+    n_steps: int = 10,
+) -> tuple[Array, Array]:
+    """Differentiable Laplace approximation using fixed Newton iterations.
+
+    Unlike approximate_gaussian (which uses BFGS via lax.while_loop and is
+    not reverse-mode differentiable), this version uses a fixed number of
+    Newton-Raphson steps. This makes it compatible with jax.grad for SGD.
+
+    Only supports 1D (scalar) state variables. For the 1D Smith learning
+    model, 10 Newton steps are typically more than sufficient.
+
+    Parameters
+    ----------
+    log_posterior_func : Callable
+        Function computing the log posterior. Takes shape (1,) input.
+    x0 : ArrayLike, shape (1,)
+        Initial guess for the mode. Must be 1D (scalar state).
+    n_steps : int
+        Number of Newton-Raphson iterations.
+
+    Returns
+    -------
+    mode : Array, shape (1,)
+    covariance : Array, shape (1, 1)
+    """
+    x0_arr = jnp.asarray(x0)
+    if x0_arr.squeeze().ndim != 0:
+        raise ValueError(
+            "_approximate_gaussian_newton only supports 1D states, "
+            f"got x0 with shape {x0_arr.shape}"
+        )
+
+    def neg_log_posterior(x):
+        return -log_posterior_func(x)
+
+    grad_fn = jax.grad(neg_log_posterior)
+    hess_fn = jax.grad(grad_fn)
+
+    def newton_step(x, _):
+        g = grad_fn(x)
+        h = hess_fn(x)
+        # Regularize Hessian for stability
+        h_safe = jnp.maximum(h, 1e-6)
+        x_new = x - g / h_safe
+        return x_new, None
+
+    mode, _ = jax.lax.scan(newton_step, jnp.squeeze(x0_arr), None, length=n_steps)
+
+    # Compute covariance from Hessian at mode
+    h = hess_fn(mode)
+    h_safe = jnp.maximum(h, 1e-6)
+    variance = 1.0 / h_safe
+
+    return jnp.expand_dims(mode, 0), jnp.expand_dims(jnp.expand_dims(variance, 0), 0)
+
+
 def _log_posterior_objective(
     learning_state: ArrayLike,
     learning_state_prev: ArrayLike,
@@ -168,6 +228,7 @@ def smith_learning_filter(
     sigma_epsilon: float = DEFAULT_SIGMA_EPSILON,
     prob_correct_by_chance: float = 0.5,
     max_possible_correct: Optional[ArrayLike] = None,
+    differentiable: bool = False,
 ) -> tuple[Array, Array, Array, Array, Array]:
     """Applies a non-linear Bayesian filter (Laplace approximation) for learning.
 
@@ -198,6 +259,11 @@ def smith_learning_filter(
         Maximum number of correct responses in each trial ($N_k$).
         Can be a scalar int (applied to all trials) or an array of
         per-trial values. Defaults to max(n_correct_responses).
+    differentiable : bool, optional
+        If True, use fixed-iteration Newton steps instead of BFGS for
+        the Laplace approximation. This makes the filter compatible with
+        ``jax.grad`` for SGD fitting, at the cost of slightly less
+        precise mode-finding. Default False (BFGS).
 
     Returns
     -------
@@ -257,7 +323,8 @@ def smith_learning_filter(
             bias=mu,
         )
         # Find mode and covariance (variance)
-        posterior_mode, posterior_variance = approximate_gaussian(
+        approx_fn = _approximate_gaussian_newton if differentiable else approximate_gaussian
+        posterior_mode, posterior_variance = approx_fn(
             log_objective_func, x0=jnp.array([one_step_mode])
         )
         posterior_mode = jnp.squeeze(posterior_mode)
@@ -1070,7 +1137,7 @@ VALID_INIT_METHODS = frozenset({
 })
 
 
-class SmithLearningModel:
+class SmithLearningModel(SGDFittableMixin):
     """Bayesian state-space model for tracking learning from trial outcomes.
 
     Implements the Smith et al. (2004) algorithm for estimating a latent
@@ -1547,6 +1614,181 @@ class SmithLearningModel:
         self._n_trials_ = len(n_correct_responses)
 
         return log_likelihoods
+
+    # --- SGDFittableMixin protocol ---
+
+    def fit_sgd(
+        self,
+        n_correct_responses: ArrayLike,
+        optimizer: Optional[object] = None,
+        num_steps: int = 200,
+        verbose: bool = False,
+        convergence_tol: Optional[float] = None,
+    ) -> list[float]:
+        """Fit by minimizing negative marginal LL via gradient descent.
+
+        Parameters
+        ----------
+        n_correct_responses : ArrayLike, shape (n_trials,)
+            Number of correct responses at each trial.
+        optimizer : optax optimizer or None
+            Default: adam(1e-2) with gradient clipping.
+        num_steps : int
+            Number of optimization steps.
+        verbose : bool
+            Log progress every 10 steps.
+        convergence_tol : float or None
+            If set, stop early when loss change < tol for 5 consecutive steps.
+
+        Returns
+        -------
+        log_likelihoods : list of float
+        """
+        n_correct_arr = jnp.asarray(n_correct_responses)
+        if n_correct_arr.ndim != 1:
+            raise ValueError(
+                f"n_correct_responses must be 1D, got shape {n_correct_arr.shape}."
+            )
+        if len(n_correct_arr) < 2:
+            raise ValueError(
+                f"Need at least 2 trials, got {len(n_correct_arr)}."
+            )
+        self._n_trials_ = int(n_correct_arr.shape[0])
+        self._resolved_max_correct = self._resolve_max_possible_correct(
+            n_correct_arr
+        )
+
+        return super().fit_sgd(
+            n_correct_arr,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+        )
+
+    @property
+    def _n_timesteps(self) -> int:
+        return self._n_trials_
+
+    def _check_sgd_initialized(self) -> None:
+        pass  # Parameters allocated at construction time
+
+    def _build_param_spec(self) -> tuple[dict, dict]:
+        from state_space_practice.parameter_transforms import (
+            POSITIVE,
+            UNCONSTRAINED,
+        )
+
+        params: dict = {}
+        spec: dict = {}
+
+        # Process noise is always learnable
+        params["sigma_epsilon"] = jnp.array(self.sigma_epsilon)
+        spec["sigma_epsilon"] = POSITIVE
+
+        # Initial state params depend on initial_state_method
+        if self.initial_state_method in (
+            "reestimate_initial_from_data",
+            "user_provided",
+        ):
+            params["init_learning_state"] = jnp.array(self.init_learning_state)
+            spec["init_learning_state"] = UNCONSTRAINED
+            params["init_learning_variance"] = jnp.array(
+                self.init_learning_variance
+            )
+            spec["init_learning_variance"] = POSITIVE
+        # For other methods, init state is data-driven or fixed — freeze it.
+
+        return params, spec
+
+    def _sgd_loss_fn(
+        self, params: dict, n_correct_responses: Array
+    ) -> Array:
+        sigma_eps = params.get(
+            "sigma_epsilon", jnp.array(self.sigma_epsilon)
+        )
+        init_state = params.get(
+            "init_learning_state", jnp.array(self.init_learning_state)
+        )
+        init_var = params.get(
+            "init_learning_variance", jnp.array(self.init_learning_variance)
+        )
+
+        (
+            _prob_correct,
+            _learning_state_mode,
+            _learning_state_var,
+            one_step_mode,
+            _one_step_var,
+        ) = smith_learning_filter(
+            n_correct_responses,
+            init_learning_state=init_state,
+            init_learning_variance=init_var,
+            sigma_epsilon=sigma_eps,
+            prob_correct_by_chance=self.prob_correct_by_chance,
+            max_possible_correct=self._resolved_max_correct,
+            differentiable=True,
+        )
+
+        prob_pred_success = jax.nn.sigmoid(self.mu_bias + one_step_mode)
+        epsilon = 1e-9
+        prob_pred_success = jnp.clip(prob_pred_success, epsilon, 1.0 - epsilon)
+
+        log_likelihood_terms = jax.scipy.stats.binom.logpmf(
+            k=n_correct_responses,
+            n=self._resolved_max_correct,
+            p=prob_pred_success,
+        )
+        return -jnp.sum(log_likelihood_terms)
+
+    def _store_sgd_params(self, params: dict) -> None:
+        if "sigma_epsilon" in params:
+            self.sigma_epsilon = float(params["sigma_epsilon"])
+        if "init_learning_state" in params:
+            self.init_learning_state = float(params["init_learning_state"])
+        if "init_learning_variance" in params:
+            self.init_learning_variance = float(params["init_learning_variance"])
+
+    def _finalize_sgd(self, n_correct_responses: Array) -> None:
+        resolved_max = self._resolve_max_possible_correct(n_correct_responses)
+        (
+            self.filtered_prob_correct_response,
+            self.filtered_learning_state_mode,
+            self.filtered_learning_state_variance,
+            self.filtered_one_step_mode,
+            self.filtered_one_step_variance,
+        ) = smith_learning_filter(
+            n_correct_responses,
+            init_learning_state=self.init_learning_state,
+            init_learning_variance=self.init_learning_variance,
+            sigma_epsilon=self.sigma_epsilon,
+            prob_correct_by_chance=self.prob_correct_by_chance,
+            max_possible_correct=resolved_max,
+        )
+        (
+            self.smoothed_learning_state_mode,
+            self.smoothed_learning_state_variance,
+            self.smoothed_prob_correct_response,
+            self.smoother_gain,
+        ) = smith_learning_smoother(
+            self.filtered_learning_state_mode,
+            self.filtered_learning_state_variance,
+            self.filtered_one_step_mode,
+            self.filtered_one_step_variance,
+            prob_correct_by_chance=self.prob_correct_by_chance,
+        )
+
+        prob_pred_success = jax.nn.sigmoid(
+            self.mu_bias + self.filtered_one_step_mode
+        )
+        epsilon = 1e-9
+        prob_pred_success = jnp.clip(prob_pred_success, epsilon, 1.0 - epsilon)
+        log_likelihood_terms = jax.scipy.stats.binom.logpmf(
+            k=n_correct_responses,
+            n=resolved_max,
+            p=prob_pred_success,
+        )
+        self.log_likelihood_ = float(jnp.sum(log_likelihood_terms))
 
     def get_learning_curve(
         self,
