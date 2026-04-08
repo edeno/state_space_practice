@@ -738,17 +738,16 @@ class TestNonlinearWarning:
 
 
 class TestPlaceFieldSGDGradientStability:
-    """Gradient stability gate for PlaceFieldModel SGD.
+    """Gradient stability tests for PlaceFieldModel SGD.
 
-    PlaceFieldModel has 25+ dimensional latent state (spline basis).
-    Gradients through the Laplace-EKF become NaN for n_state >= 10
-    due to numerical instability in Cholesky/solve operations during
-    reverse-mode differentiation. SGD fitting is deferred until
-    a custom_vjp or implicit differentiation approach is implemented.
+    The root cause of NaN gradients at n_state >= 7 is stabilize_covariance
+    (eigendecomp-based PSD projection) inside _point_process_laplace_update.
+    The eigvalsh backward pass is unstable for near-degenerate eigenvalues.
+    Setting stabilize_precision=False resolves the issue.
     """
 
-    def test_gradient_nan_at_high_state_dim(self) -> None:
-        """Document: gradients are NaN for n_state >= 10."""
+    def test_gradient_nan_with_eigendecomp_stabilize(self) -> None:
+        """stabilize_covariance on precision causes NaN grads at n_state >= 7."""
         from state_space_practice.parameter_transforms import (
             POSITIVE,
             transform_to_constrained,
@@ -759,7 +758,6 @@ class TestPlaceFieldSGDGradientStability:
             stochastic_point_process_filter,
         )
 
-        # n_state=10 is the threshold where gradients fail
         n_state = 10
         key = jax.random.PRNGKey(42)
         A = 0.99 * jnp.eye(n_state)
@@ -776,19 +774,17 @@ class TestPlaceFieldSGDGradientStability:
 
         def loss_fn(unc_p):
             p = transform_to_constrained(unc_p, spec)
-            Q_val = jnp.diag(p["q_diag"])
             _, _, mll = stochastic_point_process_filter(
-                m0, P0, dm, spikes, 0.001, A, Q_val, log_conditional_intensity,
+                m0, P0, dm, spikes, 0.001, A, jnp.diag(p["q_diag"]),
+                log_conditional_intensity, stabilize_precision=True,
             )
             return -mll
 
         g = jax.grad(loss_fn)(unc)
-        # Document: gradients are NaN at n_state=10
-        # This blocks PlaceFieldModel SGD (n_basis >= 25)
         assert not jnp.all(jnp.isfinite(g["q_diag"]))
 
-    def test_gradient_finite_at_low_state_dim(self) -> None:
-        """Confirm: gradients work for n_state <= 5."""
+    def test_gradient_finite_without_eigendecomp_stabilize(self) -> None:
+        """stabilize_precision=False gives finite grads at high dims."""
         from state_space_practice.parameter_transforms import (
             POSITIVE,
             transform_to_constrained,
@@ -799,7 +795,7 @@ class TestPlaceFieldSGDGradientStability:
             stochastic_point_process_filter,
         )
 
-        n_state = 5
+        n_state = 25  # PlaceFieldModel scale
         key = jax.random.PRNGKey(42)
         A = 0.99 * jnp.eye(n_state)
         Q = 0.01 * jnp.eye(n_state)
@@ -815,11 +811,62 @@ class TestPlaceFieldSGDGradientStability:
 
         def loss_fn(unc_p):
             p = transform_to_constrained(unc_p, spec)
-            Q_val = jnp.diag(p["q_diag"])
             _, _, mll = stochastic_point_process_filter(
-                m0, P0, dm, spikes, 0.001, A, Q_val, log_conditional_intensity,
+                m0, P0, dm, spikes, 0.001, A, jnp.diag(p["q_diag"]),
+                log_conditional_intensity, stabilize_precision=False,
             )
             return -mll
 
         g = jax.grad(loss_fn)(unc)
         assert jnp.all(jnp.isfinite(g["q_diag"]))
+
+
+class TestPlaceFieldSGDFitting:
+    """Tests for PlaceFieldModel.fit_sgd()."""
+
+    def test_sgd_improves_ll(self, sim_data: dict) -> None:
+        import optax
+
+        model = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-3,
+        )
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(10.0), optax.adam(1e-3),
+        )
+        lls = model.fit_sgd(
+            sim_data["position"], sim_data["spikes"],
+            optimizer=optimizer, num_steps=30,
+        )
+        assert len(lls) > 1
+        assert all(np.isfinite(ll) for ll in lls)
+
+    def test_sgd_process_cov_positive(self, sim_data: dict) -> None:
+        import optax
+
+        model = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-3,
+        )
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(10.0), optax.adam(1e-3),
+        )
+        model.fit_sgd(
+            sim_data["position"], sim_data["spikes"],
+            optimizer=optimizer, num_steps=20,
+        )
+        assert jnp.all(jnp.diag(model.process_cov) > 0)
+
+    def test_sgd_populates_smoother(self, sim_data: dict) -> None:
+        import optax
+
+        model = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-3,
+        )
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(10.0), optax.adam(1e-3),
+        )
+        model.fit_sgd(
+            sim_data["position"], sim_data["spikes"],
+            optimizer=optimizer, num_steps=10,
+        )
+        assert model.smoother_mean is not None
+        assert model.filtered_mean is not None

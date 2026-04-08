@@ -765,21 +765,7 @@ class PlaceFieldModel(SGDFittableMixin):
         -------
         log_likelihoods : list of float
 
-        Raises
-        ------
-        NotImplementedError
-            SGD is deferred for PlaceFieldModel because gradients through
-            the Laplace-EKF are NaN for n_state >= 10 (PlaceFieldModel
-            has 25+ spline basis dimensions). Use ``model.fit()`` (EM)
-            instead. SGD will be re-enabled once a custom_vjp or
-            implicit differentiation approach is implemented.
         """
-        raise NotImplementedError(
-            "PlaceFieldModel.fit_sgd is deferred: gradients through the "
-            "Laplace-EKF are NaN for n_state >= 10 (PlaceFieldModel has "
-            "25+ basis dims). Use model.fit() (EM) instead. SGD requires "
-            "a custom_vjp or implicit differentiation approach."
-        )
         position = np.asarray(position)
         spikes = jnp.asarray(spikes)
         if spikes.ndim == 1:
@@ -872,6 +858,7 @@ class PlaceFieldModel(SGDFittableMixin):
             transition_matrix=A,
             process_cov=Q,
             log_conditional_intensity=self._log_intensity_func,
+            stabilize_precision=False,  # eigendecomp backward NaN at high dims
         )
         return -marginal_ll
 

@@ -120,6 +120,7 @@ def _point_process_laplace_update(
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 1,
     line_search_beta: float = 0.5,
+    stabilize_precision: bool = True,
 ) -> tuple[Array, Array, Array]:
     """Single point-process Laplace-EKF update for multiple neurons.
 
@@ -166,6 +167,11 @@ def _point_process_laplace_update(
         Step size reduction factor for backtracking line search. Only used
         when max_newton_iter > 1. At each iteration, step size is halved
         until the negative log-posterior decreases or minimum alpha reached.
+    stabilize_precision : bool, default=True
+        If True, project posterior precision to PSD via eigendecomposition.
+        Set to False for SGD: the eigendecomposition backward pass is
+        numerically unstable for near-degenerate eigenvalues at n_state >= 7.
+        When False, relies on diagonal_boost in psd_solve for stability.
 
     Returns
     -------
@@ -251,8 +257,9 @@ def _point_process_laplace_update(
         hessian_correction = jnp.einsum("n,nij->ij", innovation, hessian)
         post_prec = prior_precision + fisher_info - hessian_correction
 
-        # Ensure PSD
-        post_prec = stabilize_covariance(post_prec, min_eigenvalue=diagonal_boost)
+        # Ensure PSD (skip for SGD: eigendecomp backward is unstable at high dims)
+        if stabilize_precision:
+            post_prec = stabilize_covariance(post_prec, min_eigenvalue=diagonal_boost)
 
         # Newton direction
         delta = psd_solve(post_prec, gradient, diagonal_boost=diagonal_boost)
@@ -301,9 +308,10 @@ def _point_process_laplace_update(
         fisher_info = jacobian.T @ (conditional_intensity[:, None] * jacobian)
         hessian_correction = jnp.einsum("n,nij->ij", innovation, hessian)
         posterior_precision = prior_precision + fisher_info - hessian_correction
-        posterior_precision = stabilize_covariance(
-            posterior_precision, min_eigenvalue=diagonal_boost
-        )
+        if stabilize_precision:
+            posterior_precision = stabilize_covariance(
+                posterior_precision, min_eigenvalue=diagonal_boost
+            )
         posterior_mean = one_step_mean + psd_solve(
             posterior_precision, gradient, diagonal_boost=diagonal_boost
         )
@@ -317,7 +325,8 @@ def _point_process_laplace_update(
     posterior_cov = psd_solve(
         posterior_precision, identity, diagonal_boost=diagonal_boost
     )
-    posterior_cov = stabilize_covariance(posterior_cov, min_eigenvalue=diagonal_boost)
+    if stabilize_precision:
+        posterior_cov = stabilize_covariance(posterior_cov, min_eigenvalue=diagonal_boost)
 
     # Log-likelihood at posterior mode (approximate)
     log_lambda_mode = log_intensity_func(posterior_mean)
@@ -349,6 +358,7 @@ def stochastic_point_process_filter(
     process_cov: ArrayLike,
     log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
     include_laplace_normalization: bool = True,
+    stabilize_precision: bool = True,
 ) -> tuple[Array, Array, Array]:
     """Applies a Stochastic State Point Process Filter (SSPPF).
 
@@ -494,6 +504,7 @@ def stochastic_point_process_filter(
             grad_log_intensity_func=grad_log_intensity_func,
             hess_log_intensity_func=hess_log_intensity_func,
             include_laplace_normalization=include_laplace_normalization,
+            stabilize_precision=stabilize_precision,
         )
 
         marginal_log_likelihood += log_lik
