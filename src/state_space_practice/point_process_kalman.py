@@ -43,6 +43,7 @@ from state_space_practice.kalman import (
     sum_of_outer_products,
     symmetrize,
 )
+from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import check_converged
 
 logger = logging.getLogger(__name__)
@@ -808,7 +809,7 @@ def steepest_descent_point_process_filter(
     return jax.lax.scan(_update, init_mean_params_arr, (x_arr, spike_indicator_arr))[1]
 
 
-class PointProcessModel:
+class PointProcessModel(SGDFittableMixin):
     """Point Process State-Space Model with EM fitting.
 
     Implements the Eden & Brown (2004) adaptive point process filter/smoother
@@ -1065,6 +1066,146 @@ class PointProcessModel:
             logger.warning("Reached maximum iterations without converging.")
 
         return log_likelihoods
+
+    # --- SGDFittableMixin protocol ---
+
+    def fit_sgd(
+        self,
+        design_matrix: ArrayLike,
+        spike_indicator: ArrayLike,
+        optimizer: Optional[object] = None,
+        num_steps: int = 200,
+        verbose: bool = False,
+        convergence_tol: Optional[float] = None,
+    ) -> list[float]:
+        """Fit by minimizing negative marginal LL via gradient descent.
+
+        Parameters
+        ----------
+        design_matrix : ArrayLike
+            Design matrix for the intensity function.
+        spike_indicator : ArrayLike
+            Observed spike counts.
+        optimizer : optax optimizer or None
+            Default: adam(1e-2) with gradient clipping.
+        num_steps : int
+            Number of optimization steps.
+        verbose : bool
+            Log progress every 10 steps.
+        convergence_tol : float or None
+            If set, stop early when loss change < tol for 5 consecutive steps.
+
+        Returns
+        -------
+        log_likelihoods : list of float
+        """
+        design_matrix = jnp.asarray(design_matrix)
+        spike_indicator = jnp.asarray(spike_indicator)
+        if spike_indicator.ndim == 1:
+            spike_indicator = spike_indicator[:, None]
+        self._sgd_n_time = spike_indicator.shape[0]
+        self._sgd_design_matrix = design_matrix
+        self._sgd_spike_indicator = spike_indicator
+
+        return super().fit_sgd(
+            design_matrix, spike_indicator,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+        )
+
+    @property
+    def _n_timesteps(self) -> int:
+        return self._sgd_n_time
+
+    def _check_sgd_initialized(self) -> None:
+        pass  # Parameters allocated at construction time
+
+    def _build_param_spec(self) -> tuple[dict, dict]:
+        from state_space_practice.parameter_transforms import (
+            PSD_MATRIX,
+            UNCONSTRAINED,
+        )
+
+        params: dict = {}
+        spec: dict = {}
+
+        if self.update_transition_matrix:
+            params["transition_matrix"] = self.transition_matrix
+            spec["transition_matrix"] = UNCONSTRAINED
+
+        if self.update_process_cov:
+            params["process_cov"] = self.process_cov
+            spec["process_cov"] = PSD_MATRIX
+
+        if self.update_init_state:
+            params["init_mean"] = self.init_mean
+            spec["init_mean"] = UNCONSTRAINED
+            params["init_cov"] = self.init_cov
+            spec["init_cov"] = PSD_MATRIX
+
+        return params, spec
+
+    def _sgd_loss_fn(
+        self, params: dict, design_matrix: Array, spike_indicator: Array
+    ) -> Array:
+        A = params.get("transition_matrix", self.transition_matrix)
+        Q = params.get("process_cov", self.process_cov)
+        m0 = params.get("init_mean", self.init_mean)
+        P0 = params.get("init_cov", self.init_cov)
+
+        _, _, marginal_ll = stochastic_point_process_filter(
+            init_mean_params=m0,
+            init_covariance_params=P0,
+            design_matrix=design_matrix,
+            spike_indicator=spike_indicator,
+            dt=self.dt,
+            transition_matrix=A,
+            process_cov=Q,
+            log_conditional_intensity=self.log_intensity_func,
+        )
+        return -marginal_ll
+
+    def _store_sgd_params(self, params: dict) -> None:
+        if "transition_matrix" in params:
+            self.transition_matrix = params["transition_matrix"]
+        if "process_cov" in params:
+            self.process_cov = params["process_cov"]
+        if "init_mean" in params:
+            self.init_mean = params["init_mean"]
+        if "init_cov" in params:
+            self.init_cov = params["init_cov"]
+
+    def _finalize_sgd(
+        self, design_matrix: Array, spike_indicator: Array
+    ) -> None:
+        (
+            self.smoother_mean,
+            self.smoother_cov,
+            self.smoother_cross_cov,
+            marginal_ll,
+        ) = stochastic_point_process_smoother(
+            init_mean_params=self.init_mean,
+            init_covariance_params=self.init_cov,
+            design_matrix=design_matrix,
+            spike_indicator=spike_indicator,
+            dt=self.dt,
+            transition_matrix=self.transition_matrix,
+            process_cov=self.process_cov,
+            log_conditional_intensity=self.log_intensity_func,
+        )
+        self.filtered_mean, self.filtered_cov, _ = stochastic_point_process_filter(
+            init_mean_params=self.init_mean,
+            init_covariance_params=self.init_cov,
+            design_matrix=design_matrix,
+            spike_indicator=spike_indicator,
+            dt=self.dt,
+            transition_matrix=self.transition_matrix,
+            process_cov=self.process_cov,
+            log_conditional_intensity=self.log_intensity_func,
+        )
+        self.log_likelihood_ = float(marginal_ll)
 
     def get_rate_estimate(
         self,

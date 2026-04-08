@@ -2170,3 +2170,100 @@ class TestPointProcessNumericalStability:
         assert jnp.all(jnp.isfinite(filtered_mean)), "Means should be finite"
         assert jnp.all(jnp.isfinite(filtered_cov)), "Covs should be finite"
         assert jnp.isfinite(mll), "MLL should be finite"
+
+
+class TestPointProcessGradientStability:
+    """Gradient stability gate: verify gradients through Laplace-EKF are finite."""
+
+    def test_gradient_through_filter_wrt_A_Q(self):
+        """Gradients through Laplace-EKF must be finite for SGD to work."""
+        n_state = 2
+        n_neurons = 3
+        n_time = 50
+        dt = 0.001
+
+        key = jax.random.PRNGKey(0)
+        A = 0.99 * jnp.eye(n_state)
+        Q = 0.001 * jnp.eye(n_state)
+        m0 = jnp.zeros(n_state)
+        P0 = jnp.eye(n_state)
+
+        # Simple linear log-intensity with known weights
+        W = jax.random.normal(key, (n_neurons, n_state)) * 0.1
+        design_matrix = jnp.tile(W, (n_time, 1, 1))
+        spike_indicator = jax.random.poisson(
+            key, jnp.ones((n_time, n_neurons)) * 0.01
+        )
+
+        def loss_fn(A_val, Q_flat):
+            from state_space_practice.parameter_transforms import PSD_MATRIX
+
+            Q_val = PSD_MATRIX.to_constrained(Q_flat)
+            _, _, mll = stochastic_point_process_filter(
+                m0, P0, design_matrix, spike_indicator, dt, A_val, Q_val,
+                log_conditional_intensity,
+            )
+            return -mll
+
+        from state_space_practice.parameter_transforms import PSD_MATRIX
+
+        Q_flat = PSD_MATRIX.to_unconstrained(Q)
+
+        grad_A, grad_Q = jax.grad(loss_fn, argnums=(0, 1))(A, Q_flat)
+
+        assert jnp.all(jnp.isfinite(grad_A)), f"Grad A not finite: {grad_A}"
+        assert jnp.all(jnp.isfinite(grad_Q)), f"Grad Q not finite: {grad_Q}"
+        # Check gradients are reasonably bounded
+        assert float(jnp.max(jnp.abs(grad_A))) < 1e6
+        assert float(jnp.max(jnp.abs(grad_Q))) < 1e6
+
+
+class TestPointProcessSGDFitting:
+    """Tests for PointProcessModel.fit_sgd()."""
+
+    @pytest.fixture
+    def small_pp_problem(self):
+        """Create a small synthetic point process problem."""
+        n_state = 2
+        n_neurons = 3
+        n_time = 100
+        dt = 0.001
+
+        key = jax.random.PRNGKey(42)
+        W = jax.random.normal(key, (n_neurons, n_state)) * 0.1
+        design_matrix = jnp.tile(W, (n_time, 1, 1))
+        spike_indicator = jax.random.poisson(
+            key, jnp.ones((n_time, n_neurons)) * 0.01
+        )
+        return n_state, dt, design_matrix, spike_indicator
+
+    def test_sgd_improves_ll(self, small_pp_problem):
+        n_state, dt, design_matrix, spike_indicator = small_pp_problem
+        model = PointProcessModel(n_state, dt)
+        initial_ll = model._e_step(design_matrix, spike_indicator)
+        model2 = PointProcessModel(n_state, dt)
+        lls = model2.fit_sgd(design_matrix, spike_indicator, num_steps=30)
+        assert lls[-1] > initial_ll
+
+    def test_sgd_respects_constraints(self, small_pp_problem):
+        n_state, dt, design_matrix, spike_indicator = small_pp_problem
+        model = PointProcessModel(n_state, dt)
+        model.fit_sgd(design_matrix, spike_indicator, num_steps=30)
+        # Process cov should be PSD
+        eigvals = jnp.linalg.eigvalsh(model.process_cov)
+        assert jnp.all(eigvals > 0)
+
+    def test_sgd_process_cov_psd(self, small_pp_problem):
+        n_state, dt, design_matrix, spike_indicator = small_pp_problem
+        model = PointProcessModel(n_state, dt)
+        model.fit_sgd(design_matrix, spike_indicator, num_steps=30)
+        eigvals = jnp.linalg.eigvalsh(model.process_cov)
+        assert jnp.all(eigvals > 0), "Process cov not PSD after SGD"
+
+    def test_sgd_model_has_smoother_results(self, small_pp_problem):
+        n_state, dt, design_matrix, spike_indicator = small_pp_problem
+        model = PointProcessModel(n_state, dt)
+        model.fit_sgd(design_matrix, spike_indicator, num_steps=30)
+        assert model.smoother_mean is not None
+        assert model.smoother_cov is not None
+        assert hasattr(model, "log_likelihood_")
