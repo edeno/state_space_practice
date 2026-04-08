@@ -10,9 +10,7 @@ This roadmap reorganizes the next modeling steps around what the repository alre
 - switching discrete-state inference in `switching_kalman.py`
 - point-process observation updates in `point_process_kalman.py`
 - CA1 encoding and decoding foundations in `place_field_model.py` and `position_decoder.py`
-- bandit belief or value inference in `multinomial_choice.py`
-
-The main missing layer is represented content: there is no checked-in model that distinguishes the rat's physical location from the location currently represented by CA1 activity. The roadmap below adds that layer first, then builds value gating, timescale hierarchy, and CA1-mPFC coupling on top of it.
+- bandit belief or value inference in `multinomial_choice.py` and `covariate_choice.py`
 
 ## Codebase Reality Check
 
@@ -20,6 +18,7 @@ Already implemented and reviewed:
 
 - `src/state_space_practice/position_decoder.py`: fixed-place-field decoding of physical position from spikes
 - `src/state_space_practice/multinomial_choice.py`: latent option-value filtering and smoothing from behavior
+- `src/state_space_practice/covariate_choice.py`: covariate-driven value dynamics (reward → value updates)
 - `src/state_space_practice/place_field_model.py`: drifting spatial encoding weights on spline bases
 - `src/state_space_practice/switching_kalman.py`: generic discrete-continuous switching inference
 - `src/state_space_practice/switching_point_process.py`: switching point-process filtering for spike observations
@@ -27,75 +26,174 @@ Already implemented and reviewed:
 
 Not yet implemented:
 
-- represented-content or replay state separate from physical position
-- value-dependent switching into local versus nonlocal sequence modes, plus destination bias within nonlocal content
-- heterogeneous CA1 and mPFC latent blocks in one coupled model
-- explicit fast or slow hierarchy tying sequence content, trial belief, and session drift together
+- SGD fitting mixin for all model classes (P1)
+- contingency-belief or hidden-world-state model (P2)
+- switching behavioral strategy model (P3)
+- joint learning + representational drift model (P4)
+- adaptive decoder with drifting tuning curves (P5)
+- regularized oscillator connectivity penalties (P6)
+- represented-content or replay state separate from physical position (S1)
+- value-dependent switching into local versus nonlocal sequence modes (S2)
+- heterogeneous CA1 and mPFC latent blocks in one coupled model (S3)
+- explicit fast or slow hierarchy tying sequence content, trial belief, and session drift (S4)
 
-## Recommended Queue
+## Current Priority Queue
 
-| Order | Plan | Why It Comes Here | Depends On |
+The current priorities focus on infrastructure and behavioral modeling:
+
+| Priority | Plan | Track | Why It Comes Here |
 |---|---|---|---|
-| 1 | `2026-04-03-position-decoding.md` | Reusable CA1 rate-map and decoding foundation | None |
-| 2 | `2026-04-04-multinomial-choice-model.md` | Reusable latent belief or value foundation | None |
-| 3 | `2026-04-05-ca1-represented-state-switching.md` | First explicit model of local vs nonlocal represented content | Position decoding |
-| 4 | `2026-04-05-value-gated-sequence-expression.md` | First novel test of whether latent value changes CA1 nonlocal expression or destination bias | Represented-state switching + multinomial choice |
-| 5 | `2026-04-04-joint-belief-state-decoder.md` | Behavior plus neural belief-state foundation, best interpreted as mPFC or task-variable neural model | Multinomial choice |
-| 6 | `2026-04-05-coupled-dual-latent-ca1-mpfc.md` | First content-level cross-region model with distinct CA1 and mPFC latents | Represented-state switching + joint belief |
-| 7 | `2026-04-04-spatial-value-model.md` | Mixed-selectivity decomposition after represented-content foundation exists | Multinomial choice + place-field infrastructure |
-| 8 | `2026-04-05-hierarchical-multi-timescale.md` | Later synthesis layer linking fast sequence content, trial belief, and slow drift | Represented-state switching + multinomial choice + cross-session drift foundation |
-| 9 | `2026-04-03-cross-region-coupling.md` | Optional later oscillator-level communication model after content-level coupling is interpretable | Switching point-process + oscillator abstractions |
+| P1 | `sgd-fitting-all-models.md` | Infrastructure | Unified optimizer for all models; unblocks P6 |
+| P2 | `contingency-belief-latent-task-state.md` | Behavioral | Hidden world-state belief; future mPFC foundation |
+| P3 | `switching-choice-model.md` | Behavioral | Strategy-dependent value dynamics (exploit/explore) |
+| P4 | `joint-learning-drift.md` | Integration | Links learning rate and drift via shared switching state |
+| P5 | `adaptive-decoder.md` | Neural | Long-duration decoding without retraining |
+| P6 | `regularized-oscillator-connectivity.md` | Oscillator | Sparse area-to-area coupling penalties |
 
-Parallel infrastructure, not on the shortest scientific path:
+### Behavioral Modeling Sub-Roadmap
 
-- `2026-04-03-cross-session-drift.md`
-- `2026-04-03-adaptive-decoder.md`
-- `2026-04-04-covariate-driven-drift.md`
-- `2026-04-03-joint-learning-drift.md`
-- `2026-04-06-contingency-belief-latent-task-state.md`
+The three behavioral plans (P2, P3, P4) form a conceptual progression:
 
-These remain useful, especially for long-timescale remapping, but they are not the first route to replay, theta-sequence, and value-modulated content in CA1.
+```
+MultinomialChoiceModel (DONE) ──► CovariateChoiceModel (DONE)
+        │                                    │
+        ▼                                    ▼
+  P2: Contingency Belief              P3: Switching Choice
+  "What does the animal think         "How is the animal
+   the world rules are?"               learning right now?"
+        │                                    │
+        └────────────┬───────────────────────┘
+                     ▼
+            P4: Joint Learning + Drift
+            "Do learning rate and place field
+             drift share the same brain state?"
+```
 
-## Minimum Publishable Path
+P2 and P3 are independent and answer different questions. P4 is the ambitious integration.
 
-If the goal is to be pragmatic but still say something genuinely new, the shortest path is:
+## Deferred Scientific Track
 
-1. `2026-04-03-position-decoding.md`
-2. `2026-04-04-multinomial-choice-model.md`
-3. `2026-04-05-ca1-represented-state-switching.md`
-4. `2026-04-05-value-gated-sequence-expression.md`
+The minimum publishable path (CA1 replay + value gating) is deferred in favor of the current priorities but remains the shortest route to a novel scientific claim:
 
-This four-plan path is the recommended first milestone because it supports a concrete scientific claim:
+| Order | Plan | Status | Depends On |
+|---|---|---|---|
+| S1 | `ca1-represented-state-switching.md` | Deferred | Position Decoding (DONE) |
+| S2 | `value-gated-sequence-expression.md` | Deferred | S1 + Multinomial Choice (DONE) |
+| S3 | `coupled-dual-latent-ca1-mpfc.md` | Deferred | S1 + Joint Belief Decoder |
+| S4 | `hierarchical-multi-timescale.md` | Deferred | S1 + Multinomial Choice + Cross-Session Drift |
 
-- CA1 alternates between local and nonlocal represented content
-- latent value inferred from behavior biases nonlocal sequence expression or destination content
+Claim when S1-S2 are complete: "CA1 alternates between local and nonlocal represented content, and latent value inferred from behavior biases nonlocal sequence expression."
 
-That claim is more novel than standard place-field or value-regression analyses, but it still builds almost entirely on checked-in numerical infrastructure.
+## Deferred Infrastructure
 
-## Second-Stage Path
-
-Only after the minimum publishable path is working should you add:
-
-5. `2026-04-04-joint-belief-state-decoder.md`
-6. `2026-04-05-coupled-dual-latent-ca1-mpfc.md`
-
-This is the first defensible route to a cross-region claim, because it asks whether an mPFC-like belief latent improves explanation of CA1 nonlocal content beyond behavior alone.
-
-## Later or Optional Extensions
-
-These are useful, but they should not be prerequisites for the first novel result:
-
-- `2026-04-04-spatial-value-model.md`
-- `2026-04-05-hierarchical-multi-timescale.md`
-- `2026-04-03-cross-region-coupling.md`
-- `2026-04-03-cross-session-drift.md`
-- `2026-04-03-adaptive-decoder.md`
-- `2026-04-04-covariate-driven-drift.md`
-- `2026-04-03-joint-learning-drift.md`
+| Plan | Depends On | Notes |
+|---|---|---|
+| `cross-session-drift.md` | None | Useful for S4 and long-timescale remapping |
+| `joint-belief-state-decoder.md` | Multinomial Choice (DONE) | Neural + behavioral value fusion |
+| `covariate-driven-drift.md` | Cross-Session Drift | Reward/context-driven remapping |
+| `spatial-value-model.md` | Multinomial Choice + Joint Belief | Mixed-selectivity decomposition |
+| `cross-region-coupling.md` | Switching PP + Oscillator | Multi-region block dynamics |
+| `dynamic-neuron-coupling.md` | SGD Fitting (PP task 3) | Time-varying spike-history GLM |
+| `principled-stabilization-refactor.md` | None | Replace ad hoc numerical guards |
 
 ## Entry and Exit Gates
 
-### Order 3: CA1 Represented-State Switching
+### P1: SGD Fitting All Models
+
+Entry gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/ -v
+```
+
+Exit gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/ -v
+conda run -n state_space_practice ruff check src/state_space_practice
+```
+
+### P2: Contingency Belief
+
+Entry gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_multinomial_choice.py src/state_space_practice/tests/test_covariate_choice.py src/state_space_practice/tests/test_switching_kalman.py -v
+```
+
+Exit gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_contingency_belief.py -v
+conda run -n state_space_practice ruff check src/state_space_practice
+```
+
+Stop condition:
+
+- posterior state occupancy does not distinguish synthetic block-structured contingencies
+
+### P3: Switching Choice Model
+
+Entry gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_covariate_choice.py src/state_space_practice/tests/test_multinomial_choice.py src/state_space_practice/tests/test_switching_kalman.py -v
+```
+
+Exit gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_switching_choice.py -v
+conda run -n state_space_practice ruff check src/state_space_practice
+```
+
+### P4: Joint Learning + Drift
+
+Entry gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_smith_learning_algorithm.py src/state_space_practice/tests/test_place_field_model.py src/state_space_practice/tests/test_switching_kalman.py -v
+```
+
+Exit gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_state_dependent_learning.py src/state_space_practice/tests/test_joint_discrete_state.py src/state_space_practice/tests/test_state_dependent_drift.py src/state_space_practice/tests/test_joint_learning_drift_model.py -v
+conda run -n state_space_practice ruff check src/state_space_practice
+```
+
+### P5: Adaptive Decoder
+
+Entry gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_position_decoder.py -v
+```
+
+Exit gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_adaptive_decoder.py src/state_space_practice/tests/test_position_decoder.py src/state_space_practice/tests/test_place_field_model.py -v
+conda run -n state_space_practice ruff check src/state_space_practice
+```
+
+### P6: Regularized Oscillator Connectivity
+
+Entry gate:
+
+```bash
+# Requires P1 oscillator SGD tasks 5-6 complete
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_oscillator_models.py src/state_space_practice/tests/test_oscillator_utils.py -v
+```
+
+Exit gate:
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_oscillator_regularization.py src/state_space_practice/tests/test_oscillator_models.py src/state_space_practice/tests/test_oscillator_utils.py -v
+conda run -n state_space_practice ruff check src/state_space_practice
+```
+
+### S1: CA1 Represented-State Switching (deferred)
 
 Entry gate:
 
@@ -114,7 +212,7 @@ Stop condition:
 
 - local-mode decoding cannot recover the standard position decoder on synthetic data
 
-### Order 4: Value-Gated Sequence Expression
+### S2: Value-Gated Sequence Expression (deferred)
 
 Entry gate:
 
@@ -133,69 +231,12 @@ Stop condition:
 
 - value features do not change local versus nonlocal occupancy or nonlocal represented destination on held-out data
 
-### Order 5: Joint Belief-State Decoder
-
-Entry gate:
-
-```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_multinomial_choice.py src/state_space_practice/tests/test_place_field_model.py src/state_space_practice/tests/test_point_process_kalman.py -v
-```
-
-Exit gate:
-
-```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_joint_belief_decoder.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
-```
-
-Stop condition:
-
-- neural observations do not improve held-out belief or choice inference over behavior-only baseline
-
-### Order 6: Coupled Dual-Latent CA1-mPFC
-
-Entry gate:
-
-```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_ca1_represented_state.py src/state_space_practice/tests/test_joint_belief_decoder.py src/state_space_practice/tests/test_switching_point_process.py -v
-```
-
-Exit gate:
-
-```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_dual_latent_ca1_mpfc.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
-```
-
-Stop condition:
-
-- one region's latent can be removed without reducing held-out prediction of the other region or behavior
-
-### Order 8: Hierarchical Multi-Timescale
-
-Entry gate:
-
-```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_ca1_represented_state.py src/state_space_practice/tests/test_multinomial_choice.py src/state_space_practice/tests/test_place_field_model.py -v
-```
-
-Exit gate:
-
-```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_hierarchical_multi_timescale.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
-```
-
-Stop condition:
-
-- the hierarchy collapses to one timescale or cannot produce stable posterior summaries across fast and slow layers
-
 ## Why This Queue
 
-- The repository already has strong support for physical-position decoding and behavior-driven value inference.
-- The missing scientific object is represented content, so that layer should be added before any cross-region story.
-- Value-gated sequence expression now comes before neural belief coupling because it already has a pragmatic behavior-first input path and gives the shortest novel result.
-- A contingency-belief or latent-task-state model is a useful parallel behavior-side extension, especially for later mPFC interpretation, but it is not required for the shortest CA1-first publishable path.
-- Cross-region latent coupling should come only after the CA1-only content model and the mPFC-like belief model both work independently.
-- A modular multi-timescale hierarchy is best treated as a later synthesis layer rather than part of the first publishable result.
-- The existing oscillator cross-region plan remains useful, but only after the content-level models are in place.
+- **P1 (SGD Fitting)** is foundational infrastructure that improves every downstream model and unblocks P6.
+- **P2 (Contingency Belief)** models what the animal believes about the world, complementing P3's strategy model. Later serves as mPFC belief latent for S3.
+- **P3 (Switching Choice)** is the behavioral strategy-switching model — directly interpretable and the first model that infers exploit/explore without the experimenter's contingency table.
+- **P4 (Joint Learning+Drift)** is the ambitious integration linking behavioral learning and neural remapping. SPECULATIVE but scientifically important — implements prototype-first.
+- **P5 (Adaptive Decoder)** enables multi-hour decoding, needed for any long-session neural analysis.
+- **P6 (Regularized Oscillator)** adds structured sparsity to oscillator coupling — the scientific payoff of P1's oscillator SGD.
+- The scientific track (S1-S4) is deferred but all dependencies are already met for S1. It can be reactivated at any time.
