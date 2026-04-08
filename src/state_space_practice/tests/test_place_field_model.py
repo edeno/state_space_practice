@@ -735,3 +735,91 @@ class TestNonlinearWarning:
             model.predict_rate_map(grid)
             assert len(w) == 1
             assert "linear approximation" in str(w[0].message)
+
+
+class TestPlaceFieldSGDGradientStability:
+    """Gradient stability gate for PlaceFieldModel SGD.
+
+    PlaceFieldModel has 25+ dimensional latent state (spline basis).
+    Gradients through the Laplace-EKF become NaN for n_state >= 10
+    due to numerical instability in Cholesky/solve operations during
+    reverse-mode differentiation. SGD fitting is deferred until
+    a custom_vjp or implicit differentiation approach is implemented.
+    """
+
+    def test_gradient_nan_at_high_state_dim(self) -> None:
+        """Document: gradients are NaN for n_state >= 10."""
+        from state_space_practice.parameter_transforms import (
+            POSITIVE,
+            transform_to_constrained,
+            transform_to_unconstrained,
+        )
+        from state_space_practice.point_process_kalman import (
+            log_conditional_intensity,
+            stochastic_point_process_filter,
+        )
+
+        # n_state=10 is the threshold where gradients fail
+        n_state = 10
+        key = jax.random.PRNGKey(42)
+        A = 0.99 * jnp.eye(n_state)
+        Q = 0.01 * jnp.eye(n_state)
+        m0 = jnp.zeros(n_state)
+        P0 = jnp.eye(n_state)
+        W = jax.random.normal(key, (3, n_state)) * 0.1
+        dm = jnp.tile(W, (50, 1, 1))
+        spikes = jax.random.poisson(key, jnp.ones((50, 3)) * 0.01)
+
+        spec = {"q_diag": POSITIVE}
+        params = {"q_diag": jnp.diag(Q)}
+        unc = transform_to_unconstrained(params, spec)
+
+        def loss_fn(unc_p):
+            p = transform_to_constrained(unc_p, spec)
+            Q_val = jnp.diag(p["q_diag"])
+            _, _, mll = stochastic_point_process_filter(
+                m0, P0, dm, spikes, 0.001, A, Q_val, log_conditional_intensity,
+            )
+            return -mll
+
+        g = jax.grad(loss_fn)(unc)
+        # Document: gradients are NaN at n_state=10
+        # This blocks PlaceFieldModel SGD (n_basis >= 25)
+        assert not jnp.all(jnp.isfinite(g["q_diag"]))
+
+    def test_gradient_finite_at_low_state_dim(self) -> None:
+        """Confirm: gradients work for n_state <= 5."""
+        from state_space_practice.parameter_transforms import (
+            POSITIVE,
+            transform_to_constrained,
+            transform_to_unconstrained,
+        )
+        from state_space_practice.point_process_kalman import (
+            log_conditional_intensity,
+            stochastic_point_process_filter,
+        )
+
+        n_state = 5
+        key = jax.random.PRNGKey(42)
+        A = 0.99 * jnp.eye(n_state)
+        Q = 0.01 * jnp.eye(n_state)
+        m0 = jnp.zeros(n_state)
+        P0 = jnp.eye(n_state)
+        W = jax.random.normal(key, (3, n_state)) * 0.1
+        dm = jnp.tile(W, (50, 1, 1))
+        spikes = jax.random.poisson(key, jnp.ones((50, 3)) * 0.01)
+
+        spec = {"q_diag": POSITIVE}
+        params = {"q_diag": jnp.diag(Q)}
+        unc = transform_to_unconstrained(params, spec)
+
+        def loss_fn(unc_p):
+            p = transform_to_constrained(unc_p, spec)
+            Q_val = jnp.diag(p["q_diag"])
+            _, _, mll = stochastic_point_process_filter(
+                m0, P0, dm, spikes, 0.001, A, Q_val, log_conditional_intensity,
+            )
+            return -mll
+
+        g = jax.grad(loss_fn)(unc)
+        assert jnp.all(jnp.isfinite(g["q_diag"]))

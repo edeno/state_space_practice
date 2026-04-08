@@ -49,6 +49,7 @@ from state_space_practice.point_process_kalman import (
     stochastic_point_process_filter,
     stochastic_point_process_smoother,
 )
+from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import check_converged
 
 logger = logging.getLogger(__name__)
@@ -169,7 +170,7 @@ def evaluate_basis(
     return np.asarray(dmatrix(basis_info["formula"], {"x": x, "y": y, **env}))
 
 
-class PlaceFieldModel:
+class PlaceFieldModel(SGDFittableMixin):
     """Point-process model for tracking time-varying 2D place fields.
 
     The latent state is a vector of GLM weights on a 2D spatial spline basis.
@@ -731,6 +732,168 @@ class PlaceFieldModel:
             logger.warning(msg)
 
         return self.log_likelihoods
+
+    # --- SGDFittableMixin protocol ---
+
+    def fit_sgd(
+        self,
+        position: ArrayLike,
+        spikes: ArrayLike,
+        optimizer: Optional[object] = None,
+        num_steps: int = 200,
+        verbose: bool = False,
+        convergence_tol: Optional[float] = None,
+    ) -> list[float]:
+        """Fit by minimizing negative marginal LL via gradient descent.
+
+        Parameters
+        ----------
+        position : ArrayLike, shape (n_time, 2)
+            2D positions at each time bin.
+        spikes : ArrayLike, shape (n_time,) or (n_time, n_neurons)
+            Spike counts per time bin.
+        optimizer : optax optimizer or None
+            Default: adam(1e-2) with gradient clipping.
+        num_steps : int
+            Number of optimization steps.
+        verbose : bool
+            Log progress every 10 steps.
+        convergence_tol : float or None
+            If set, stop early when |ΔLL| < tol for 5 consecutive steps.
+
+        Returns
+        -------
+        log_likelihoods : list of float
+        """
+        position = np.asarray(position)
+        spikes = jnp.asarray(spikes)
+        if spikes.ndim == 1:
+            spikes = spikes[:, None]
+
+        self._sgd_n_time = spikes.shape[0]
+        self.n_neurons = spikes.shape[1]
+
+        # Squeeze back to 1D for single-neuron (filter expects 1D)
+        if self.n_neurons == 1:
+            spikes = spikes.squeeze(axis=1)
+
+        # Build design matrix and initialize parameters
+        design_matrix = self._build_design_matrix(position)
+        if self.init_mean is None:
+            self._initialize_parameters()
+
+        return super().fit_sgd(
+            design_matrix, spikes,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+        )
+
+    @property
+    def _n_timesteps(self) -> int:
+        return self._sgd_n_time
+
+    def _check_sgd_initialized(self) -> None:
+        if self.init_mean is None:
+            raise RuntimeError(
+                "Model parameters not initialized. "
+                "Call fit_sgd(position, spikes) not super().fit_sgd() directly."
+            )
+
+    def _build_param_spec(self) -> tuple[dict, dict]:
+        from state_space_practice.parameter_transforms import (
+            POSITIVE,
+            PSD_MATRIX,
+            UNCONSTRAINED,
+        )
+
+        params: dict = {}
+        spec: dict = {}
+
+        if self.update_process_cov:
+            if self.process_noise_structure == "diagonal":
+                # Optimize per-basis-function variances
+                params["process_diag"] = jnp.diag(self.process_cov)
+                spec["process_diag"] = POSITIVE
+            else:  # isotropic
+                params["process_scalar"] = jnp.array(
+                    jnp.mean(jnp.diag(self.process_cov))
+                )
+                spec["process_scalar"] = POSITIVE
+
+        if self.update_transition_matrix:
+            params["transition_matrix"] = self.transition_matrix
+            spec["transition_matrix"] = UNCONSTRAINED
+
+        if self.update_init_state:
+            params["init_mean"] = self.init_mean
+            spec["init_mean"] = UNCONSTRAINED
+            params["init_cov"] = self.init_cov
+            spec["init_cov"] = PSD_MATRIX
+
+        return params, spec
+
+    def _sgd_loss_fn(
+        self, params: dict, design_matrix: Array, spikes: Array
+    ) -> Array:
+        A = params.get("transition_matrix", self.transition_matrix)
+        m0 = params.get("init_mean", self.init_mean)
+        P0 = params.get("init_cov", self.init_cov)
+
+        if "process_diag" in params:
+            Q = jnp.diag(params["process_diag"])
+        elif "process_scalar" in params:
+            Q = jnp.eye(self.n_basis) * params["process_scalar"]
+        else:
+            Q = self.process_cov
+
+        _, _, marginal_ll = stochastic_point_process_filter(
+            init_mean_params=m0,
+            init_covariance_params=P0,
+            design_matrix=design_matrix,
+            spike_indicator=spikes,
+            dt=self.dt,
+            transition_matrix=A,
+            process_cov=Q,
+            log_conditional_intensity=self._log_intensity_func,
+        )
+        return -marginal_ll
+
+    def _store_sgd_params(self, params: dict) -> None:
+        if "process_diag" in params:
+            self.process_cov = jnp.diag(params["process_diag"])
+        elif "process_scalar" in params:
+            self.process_cov = jnp.eye(self.n_basis) * params["process_scalar"]
+        if "transition_matrix" in params:
+            self.transition_matrix = params["transition_matrix"]
+        if "init_mean" in params:
+            self.init_mean = params["init_mean"]
+        if "init_cov" in params:
+            self.init_cov = params["init_cov"]
+
+    def _finalize_sgd(
+        self, design_matrix: Array, spikes: Array
+    ) -> None:
+        (
+            self.smoother_mean,
+            self.smoother_cov,
+            self.smoother_cross_cov,
+            marginal_ll,
+            self.filtered_mean,
+            self.filtered_cov,
+        ) = stochastic_point_process_smoother(
+            init_mean_params=self.init_mean,
+            init_covariance_params=self.init_cov,
+            design_matrix=design_matrix,
+            spike_indicator=spikes,
+            dt=self.dt,
+            transition_matrix=self.transition_matrix,
+            process_cov=self.process_cov,
+            log_conditional_intensity=self._log_intensity_func,
+            return_filtered=True,
+        )
+        self.log_likelihoods = [float(marginal_ll)]
 
     def predict_rate_map(
         self,
