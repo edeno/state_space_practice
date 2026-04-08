@@ -611,6 +611,23 @@ class BaseModel(ABC, SGDFittableMixin):
     def _finalize_sgd(self, observations: ArrayLike) -> None:
         self._e_step(observations)
 
+    def _reconstruct_per_state_array(
+        self, params: dict, prefix: str, fallback: Array
+    ) -> Array:
+        """Reconstruct a (…, n_discrete_states) array from per-state PSD params.
+
+        Used by subclass _sgd_loss_fn and _store_sgd_params to reassemble
+        arrays like measurement_cov and init_cov from per-state keys
+        (e.g. "measurement_cov_0", "measurement_cov_1", ...).
+        """
+        if not any(k.startswith(f"{prefix}_") for k in params):
+            return fallback
+        return jnp.stack(
+            [params.get(f"{prefix}_{j}", fallback[..., j])
+             for j in range(self.n_discrete_states)],
+            axis=-1,
+        )
+
     # Subclasses must implement _build_param_spec and _sgd_loss_fn
 
 
@@ -854,24 +871,8 @@ class CommonOscillatorModel(BaseModel):
         H = params.get("measurement_matrix", self.measurement_matrix)
         Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
         m0 = params.get("init_mean", self.init_mean)
-
-        # Reconstruct per-state R from individual PSD params
-        R = self.measurement_cov
-        if any(k.startswith("measurement_cov_") for k in params):
-            R = jnp.stack(
-                [params.get(f"measurement_cov_{j}", self.measurement_cov[..., j])
-                 for j in range(self.n_discrete_states)],
-                axis=-1,
-            )
-
-        # Reconstruct per-state P0 from individual PSD params
-        P0 = self.init_cov
-        if any(k.startswith("init_cov_") for k in params):
-            P0 = jnp.stack(
-                [params.get(f"init_cov_{j}", self.init_cov[..., j])
-                 for j in range(self.n_discrete_states)],
-                axis=-1,
-            )
+        R = self._reconstruct_per_state_array(params, "measurement_cov", self.measurement_cov)
+        P0 = self._reconstruct_per_state_array(params, "init_cov", self.init_cov)
 
         result = switching_kalman_filter(
             init_state_cond_mean=m0,
@@ -888,19 +889,12 @@ class CommonOscillatorModel(BaseModel):
 
     def _store_sgd_params(self, params: dict) -> None:
         super()._store_sgd_params(params)
-        # Reconstruct per-state arrays from individual PSD params
-        if any(k.startswith("measurement_cov_") for k in params):
-            self.measurement_cov = jnp.stack(
-                [params.get(f"measurement_cov_{j}", self.measurement_cov[..., j])
-                 for j in range(self.n_discrete_states)],
-                axis=-1,
-            )
-        if any(k.startswith("init_cov_") for k in params):
-            self.init_cov = jnp.stack(
-                [params.get(f"init_cov_{j}", self.init_cov[..., j])
-                 for j in range(self.n_discrete_states)],
-                axis=-1,
-            )
+        self.measurement_cov = self._reconstruct_per_state_array(
+            params, "measurement_cov", self.measurement_cov
+        )
+        self.init_cov = self._reconstruct_per_state_array(
+            params, "init_cov", self.init_cov
+        )
 
 
 class CorrelatedNoiseModel(BaseModel):
@@ -1523,22 +1517,8 @@ class DirectedInfluenceModel(BaseModel):
 
         Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
         m0 = params.get("init_mean", self.init_mean)
-
-        R = self.measurement_cov
-        if any(k.startswith("measurement_cov_") for k in params):
-            R = jnp.stack(
-                [params.get(f"measurement_cov_{j}", self.measurement_cov[..., j])
-                 for j in range(self.n_discrete_states)],
-                axis=-1,
-            )
-
-        P0 = self.init_cov
-        if any(k.startswith("init_cov_") for k in params):
-            P0 = jnp.stack(
-                [params.get(f"init_cov_{j}", self.init_cov[..., j])
-                 for j in range(self.n_discrete_states)],
-                axis=-1,
-            )
+        R = self._reconstruct_per_state_array(params, "measurement_cov", self.measurement_cov)
+        P0 = self._reconstruct_per_state_array(params, "init_cov", self.init_cov)
 
         result = switching_kalman_filter(
             init_state_cond_mean=m0,
@@ -1559,6 +1539,7 @@ class DirectedInfluenceModel(BaseModel):
             self.phase_difference = params["phase_difference"]
         if "coupling_strength" in params:
             self.coupling_strength = params["coupling_strength"]
+        # Reconstruct A from updated scientific params
         if "phase_difference" in params or "coupling_strength" in params:
             A_list = []
             for j in range(self.n_discrete_states):
@@ -1571,15 +1552,9 @@ class DirectedInfluenceModel(BaseModel):
                 )
                 A_list.append(A_j)
             self.continuous_transition_matrix = jnp.stack(A_list, axis=-1)
-        if any(k.startswith("measurement_cov_") for k in params):
-            self.measurement_cov = jnp.stack(
-                [params.get(f"measurement_cov_{j}", self.measurement_cov[..., j])
-                 for j in range(self.n_discrete_states)],
-                axis=-1,
-            )
-        if any(k.startswith("init_cov_") for k in params):
-            self.init_cov = jnp.stack(
-                [params.get(f"init_cov_{j}", self.init_cov[..., j])
-                 for j in range(self.n_discrete_states)],
-                axis=-1,
-            )
+        self.measurement_cov = self._reconstruct_per_state_array(
+            params, "measurement_cov", self.measurement_cov
+        )
+        self.init_cov = self._reconstruct_per_state_array(
+            params, "init_cov", self.init_cov
+        )

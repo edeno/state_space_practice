@@ -1387,6 +1387,13 @@ class TestCommonOscillatorSGDFitting:
         model.fit_sgd(obs, key=key, num_steps=20)
         assert jnp.all(jnp.isfinite(model.measurement_matrix))
 
+    def test_sgd_populates_smoother_state(self, com_setup):
+        model, obs = com_setup
+        key = jax.random.PRNGKey(0)
+        model.fit_sgd(obs, key=key, num_steps=20)
+        assert model.smoother_state_cond_mean is not None
+        assert jnp.all(jnp.isfinite(model.smoother_state_cond_mean))
+
 
 class TestDirectedInfluenceSGDFitting:
     """Tests for DirectedInfluenceModel.fit_sgd()."""
