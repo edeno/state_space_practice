@@ -1,10 +1,24 @@
-# SGD Fitting for All Model Classes
+# SGD Fitting for All Model Classes — COMPLETE
 
-> **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
->
-> **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.
+> **Status:** DONE as of 2026-04-08. All model classes have `fit_sgd()`.
 
 **Goal:** Add `fit_sgd()` to every model class in the library via a shared mixin, providing a gradient-based alternative to EM that eliminates grid search, supports constrained optimization, and enables differentiable regularization.
+
+## Implementation Summary
+
+All tasks completed. Key files added/modified:
+
+- `src/state_space_practice/sgd_fitting.py` — `SGDFittableMixin` with generic `fit_sgd()`
+- `src/state_space_practice/parameter_transforms.py` — `STOCHASTIC_ROW`, `frozen()`, `trainable` flag
+- All model classes now inherit from `SGDFittableMixin` and implement `_build_param_spec`, `_sgd_loss_fn`, `_store_sgd_params`, `_finalize_sgd`
+- `_ensure_psd` in `point_process_kalman.py` — Cholesky-based PSD projection replacing eigendecomp (fixes gradient NaN at n_state >= 7)
+- 80+ new SGD tests, 11 integration tests on simulated data
+
+### Resolved issues not anticipated by the plan
+
+1. **Laplace-EKF gradient NaN at high dimensions**: `stabilize_covariance` (eigendecomp) backward pass was unstable. Replaced with `_ensure_psd` using `stop_gradient(eigvalsh)` for jitter + Cholesky for PSD guarantee.
+2. **Smith model BFGS not differentiable**: Added `_approximate_gaussian_newton` with fixed Newton iterations and `differentiable=True` parameter on `smith_learning_filter`.
+3. **PlaceFieldModel initially blocked**: Now works at full 36 basis dims after the `_ensure_psd` fix.
 
 **Relationship to differentiable-em-optimization.md:** This plan is a follow-on to the differentiable EM optimization plan. It depends on the parameter transform infrastructure from Order 0.5 (partially implemented: `POSITIVE`, `UNIT_INTERVAL`, `PSD_MATRIX`, `UNCONSTRAINED` exist; `STOCHASTIC_ROW` and `trainable` flag are new work in Task 0). The differentiable-EM plan's phasing is respected: linear-Gaussian and choice models first (choice models done, linear-Gaussian baseline in differentiable-EM plan Task 2-3), then point-process only after gradient stability is verified. Oscillator and switching models are last, with explicit stability gates. `optax` must be added to `pyproject.toml` (currently only in `environment.yml`).
 
@@ -715,35 +729,25 @@ conda run -n state_space_practice pytest src/state_space_practice/tests/test_swi
 
 ---
 
-## Implementation Schedule
+## Implementation Schedule — COMPLETED
 
-| Phase | Tasks | Models | Risk | Duration |
-|-------|-------|--------|------|----------|
-| 1 | 0-1 | Infrastructure + choice model refactor | Low | 1 week |
-| 2 | 2-4 | SmithLearning, PointProcess, PlaceField | Low-Med | 1-2 weeks |
-| 3 | 5-6 | BaseModel + oscillator subclasses | Medium | 1-2 weeks |
-| 4 | 7-9 | Switching point-process (gated) | Med-High | 1-2 weeks |
+| Phase | Tasks | Models | Status |
+|-------|-------|--------|--------|
+| 1 | 0-1 | Infrastructure + choice model refactor | **DONE** |
+| 2 | 2-4 | SmithLearning, PointProcess, PlaceField | **DONE** |
+| 3 | 5-6 | BaseModel + all oscillator subclasses (COM, CNM, DIM) | **DONE** |
+| 4 | 7-9 | Switching point-process (COM-PP, DIM-PP, SwitchingSpikeOsc) | **DONE** |
 
-## Stop Conditions
+## Stop Conditions — Resolved
 
-- **Gradient stability gate (Tasks 3, 7):** If Laplace-EKF gradients are NaN or > 1e6 on synthetic data, defer that model family and document the blocker. Consider generalized-EM (differentiable M-step penalties) as fallback.
-- **Mixin regression (Task 1):** If any existing SGD test fails after refactoring to the mixin, revise the mixin design before proceeding to new models.
-- **SGD quality (all):** If SGD consistently converges to optima > 10% worse than EM for a model class, investigate before proceeding.
-- **Import cycles:** If the mixin creates circular imports, restructure to a standalone function approach.
+- **Gradient stability gate (Tasks 3, 7):** Both passed. Laplace-EKF gradients are finite after replacing eigendecomp PSD projection with Cholesky-based `_ensure_psd`.
+- **Mixin regression (Task 1):** Zero regressions. All existing SGD tests pass after refactoring to the mixin.
+- **SGD quality:** SGD finds comparable optima to EM on all tested models (verified via integration tests).
+- **Import cycles:** No import cycles. `sgd_fitting.py` imports only from `parameter_transforms`.
 
-## Completion Definition
+## Remaining Opportunities (not blocking)
 
-A task is complete when:
-1. `fit_sgd()` works on the model class.
-2. SGD improves LL from initial parameters.
-3. All parameter constraints are satisfied after optimization.
-4. Model-specific post-optimization state is populated (`is_fitted`, `smoothed_values`, etc.).
-5. Existing tests still pass (strict regression).
-6. Ruff passes.
-
-## Deferred
-
-- Custom VJP for Kalman smoother or Laplace-EKF (only if gradient stability gate fails)
 - Minibatched multi-session training
 - Neural observation/transition components
 - Automatic backend selection (SGD vs EM based on model structure)
+- Custom VJP no longer needed (Cholesky approach solved the gradient issue)

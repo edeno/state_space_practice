@@ -28,6 +28,7 @@ Both tracks share the same dependency graph. The scientific track has a "minimum
 | Multinomial Choice | **DONE** (multinomial_choice.py, 43 tests) |
 | RL Covariates | **DONE** (covariate_choice.py, 55 tests — dynamics covariates, obs covariates, decay) |
 | Computational Improvements | **DONE** (parallel smoother, Woodbury, Joseph form, parameter constraints, SGD for choice models) |
+| SGD Fitting All Models | **DONE** (fit_sgd() on all model classes, 80+ SGD tests, eigendecomp→Cholesky PSD fix) |
 | All others | Not started |
 
 ## Current Priority Queue
@@ -36,12 +37,12 @@ The following six plans are the current implementation priorities, ordered by in
 
 | Priority | Plan | Feasibility | Risk | Depends On | Notes |
 |---|---|---|---|---|---|
-| **P1** | sgd-fitting-all-models.md | READY | Med | Computational Improvements (DONE) | Unblocks P6; highest priority |
+| **P1** | sgd-fitting-all-models.md | **DONE** | — | Computational Improvements (DONE) | All model classes have fit_sgd() |
 | **P2** | contingency-belief-latent-task-state.md | PARTIAL | Med | Multinomial Choice (DONE) | Can start in parallel with P1 |
 | **P3** | switching-choice-model.md | READY | Med | RL Covariates (DONE) + switching_kalman | Can start in parallel with P1-P2 |
 | **P4** | joint-learning-drift.md | SPECULATIVE | High | Smith + PlaceField + switching_kalman (all exist) | Prototype first; high integration complexity |
 | **P5** | adaptive-decoder.md | PARTIAL | Med | Position Decoding (DONE) | Can start in parallel with P1-P3 |
-| **P6** | regularized-oscillator-connectivity.md | HIGH | Low | **SGD Fitting tasks 5-6** (P1) | Blocked until P1 oscillator SGD is done |
+| **P6** | regularized-oscillator-connectivity.md | HIGH | Low | SGD Fitting (P1, **DONE**) | Unblocked — DIM SGD over coupling params ready |
 
 ### Parallelism Opportunities
 
@@ -155,13 +156,13 @@ P1 through P5 have no mutual dependencies and can proceed in parallel:
 |---|---|---|---|---|---|
 | 0 | numerical-stability-remediation.md | **DONE** | Low | 1 week | None |
 | 0.5 | computational-improvements.md | **DONE** | Low-Med | 2-3 weeks | None |
-| 0.6 | sgd-fitting-all-models.md | READY | Med | 3-4 weeks | 0.5 |
+| 0.6 | sgd-fitting-all-models.md | **DONE** | — | — | 0.5 |
 
 Order 0: Fixed correctness bugs in kalman.py, switching_kalman.py, and point_process_kalman.py.
 
 Order 0.5: **DONE.** Parallel smoother (associative scan), Woodbury-optimized updates, Joseph form covariance, parameter constraints, SGD fitting for choice models.
 
-Order 0.6: **P1 — current top priority.** SGD fitting mixin for all model classes. Adds STOCHASTIC_ROW transform, trainable flag with stop_gradient, shared SGDFittableMixin. Covers SmithLearningModel, PointProcessModel, PlaceFieldModel, all oscillator models, and all switching point-process models.
+Order 0.6: **DONE.** SGD fitting mixin for all model classes. SGDFittableMixin with STOCHASTIC_ROW transform, trainable flag, stop_gradient for frozen params, optax.masked. Covers MultinomialChoiceModel, CovariateChoiceModel, SmithLearningModel, PointProcessModel, PlaceFieldModel, CommonOscillatorModel, CorrelatedNoiseModel, DirectedInfluenceModel, all switching point-process models, and SwitchingSpikeOscillatorModel. Bonus: replaced eigendecomp-based PSD projection with Cholesky-based `_ensure_psd` in Laplace-EKF update to fix gradient NaN at high state dimensions.
 
 ### Infrastructure Track
 
@@ -184,8 +185,8 @@ Order 0.6: **P1 — current top priority.** SGD fitting mixin for all model clas
 
 | Order | Plan | Feasibility | Risk | Effort | Depends On | Status |
 |---|---|---|---|---|---|---|
-| O1 | regularized-oscillator-connectivity.md | HIGH | Low | 1-2 weeks | SGD Fitting (oscillator tasks 5-6) | **P6** |
-| O2 | dynamic-neuron-coupling.md | PARTIAL | Med | 2-3 weeks | SGD Fitting (point-process task 3) | Not started (deferred) |
+| O1 | regularized-oscillator-connectivity.md | HIGH | Low | 1-2 weeks | SGD Fitting (**DONE**) | **P6** — unblocked |
+| O2 | dynamic-neuron-coupling.md | PARTIAL | Med | 2-3 weeks | SGD Fitting (**DONE**) | Not started — unblocked |
 | O3 | principled-stabilization-refactor.md | PARTIAL | Med | 2-3 weeks | None | Not started (deferred) |
 
 ### Scientific Track (CA1/mPFC replay and value)
@@ -213,7 +214,7 @@ Claim: "CA1 alternates between local and nonlocal represented content, and laten
 - **Order 0** fixes shared infrastructure bugs before anything builds on top.
 - **Orders 1-3** (DONE) established the core decoding and behavioral models.
 - **Order 3.5** (RL covariates) strengthens the behavioral model with mechanistic value updates, supporting all downstream value-related plans.
-- **P1 (SGD Fitting)** is the top current priority because it provides a unified optimization path for all model classes and unblocks P6 (regularized oscillator connectivity).
+- **P1 (SGD Fitting)** is **DONE** — all model classes have `fit_sgd()`, P6 is unblocked.
 - **P2 (Contingency Belief)** adds an explicit hidden-world-state model, complementing both continuous value inference and planned strategy-state switching.
 - **P3 (Switching Choice)** is the first switching behavioral model with per-state value dynamics.
 - **P4 (Joint Learning+Drift)** is SPECULATIVE but scientifically important — links learning rate and representational drift through shared discrete states.

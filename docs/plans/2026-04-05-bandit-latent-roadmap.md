@@ -41,14 +41,14 @@ Not yet implemented:
 
 The current priorities focus on infrastructure and behavioral modeling:
 
-| Priority | Plan | Track | Why It Comes Here |
+| Priority | Plan | Track | Status |
 |---|---|---|---|
-| P1 | `sgd-fitting-all-models.md` | Infrastructure | Unified optimizer for all models; unblocks P6 |
-| P2 | `contingency-belief-latent-task-state.md` | Behavioral | Hidden world-state belief; future mPFC foundation |
-| P3 | `switching-choice-model.md` | Behavioral | Strategy-dependent value dynamics (exploit/explore) |
-| P4 | `joint-learning-drift.md` | Integration | Links learning rate and drift via shared switching state |
-| P5 | `adaptive-decoder.md` | Neural | Long-duration decoding without retraining |
-| P6 | `regularized-oscillator-connectivity.md` | Oscillator | Sparse area-to-area coupling penalties |
+| P1 | `sgd-fitting-all-models.md` | Infrastructure | **DONE** — all model classes have fit_sgd() |
+| P2 | `contingency-belief-latent-task-state.md` | Behavioral | Not started — next priority |
+| P3 | `switching-choice-model.md` | Behavioral | Not started |
+| P4 | `joint-learning-drift.md` | Integration | Not started |
+| P5 | `adaptive-decoder.md` | Neural | Not started |
+| P6 | `regularized-oscillator-connectivity.md` | Oscillator | Not started — unblocked by P1 |
 
 ### Behavioral Modeling Sub-Roadmap
 
@@ -177,13 +177,13 @@ conda run -n state_space_practice pytest src/state_space_practice/tests/test_ada
 conda run -n state_space_practice ruff check src/state_space_practice
 ```
 
-### P6: Regularized Oscillator Connectivity
+### P6: Regularized Oscillator Connectivity (unblocked)
 
 Entry gate:
 
 ```bash
-# Requires P1 oscillator SGD tasks 5-6 complete
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_oscillator_models.py src/state_space_practice/tests/test_oscillator_utils.py -v
+# P1 oscillator SGD is DONE
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_oscillator_models.py src/state_space_practice/tests/test_oscillator_utils.py -v -k "sgd or SGD"
 ```
 
 Exit gate:
@@ -233,10 +233,10 @@ Stop condition:
 
 ## Why This Queue
 
-- **P1 (SGD Fitting)** is foundational infrastructure that improves every downstream model and unblocks P6.
+- **P1 (SGD Fitting)** is **DONE** — all model classes have `fit_sgd()`, P6 is unblocked.
 - **P2 (Contingency Belief)** models what the animal believes about the world, complementing P3's strategy model. Later serves as mPFC belief latent for S3.
 - **P3 (Switching Choice)** is the behavioral strategy-switching model — directly interpretable and the first model that infers exploit/explore without the experimenter's contingency table.
 - **P4 (Joint Learning+Drift)** is the ambitious integration linking behavioral learning and neural remapping. SPECULATIVE but scientifically important — implements prototype-first.
 - **P5 (Adaptive Decoder)** enables multi-hour decoding, needed for any long-session neural analysis.
-- **P6 (Regularized Oscillator)** adds structured sparsity to oscillator coupling — the scientific payoff of P1's oscillator SGD.
+- **P6 (Regularized Oscillator)** is unblocked — DIM SGD over `coupling_strength`/`phase_difference` is ready for penalty terms.
 - The scientific track (S1-S4) is deferred but all dependencies are already met for S1. It can be reactivated at any time.
