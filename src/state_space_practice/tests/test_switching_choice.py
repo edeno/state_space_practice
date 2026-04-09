@@ -181,14 +181,23 @@ class TestSwitchingChoiceFilter:
         assert jnp.isfinite(result.marginal_log_likelihood)
 
     def test_single_state_matches_covariate_filter(self):
-        """S=1 should produce same LL as CovariateChoiceModel filter."""
+        """S=1 must produce identical filtered values to CovariateChoiceModel.
+
+        Uses nonzero init_mean, nonzero covariates, and decay != 1 to
+        exercise the full prediction path including A @ x at trial 0.
+        """
         from state_space_practice.covariate_choice import _covariate_choice_filter_jit
 
         choices = jax.random.randint(jax.random.PRNGKey(42), (100,), 0, 4)
         k_free = 3
         q = 0.01
         beta = 2.0
-        decay = 0.95
+        decay = 0.6  # nontrivial decay
+
+        init_mean = jnp.array([0.5, -0.3, 0.1])
+        init_cov = jnp.eye(k_free) * 0.5
+        covariates = jax.random.normal(jax.random.PRNGKey(1), (100, 2)) * 0.1
+        input_gain = jax.random.normal(jax.random.PRNGKey(2), (k_free, 2)) * 0.1
 
         # Switching filter with S=1
         result_sw = switching_choice_filter(
@@ -196,33 +205,28 @@ class TestSwitchingChoiceFilter:
             process_noises=jnp.array([q]),
             inverse_temperatures=jnp.array([beta]),
             decays=jnp.array([decay]),
-            init_mean=jnp.zeros(k_free),
-            init_cov=jnp.eye(k_free),
+            init_mean=init_mean,
+            init_cov=init_cov,
+            covariates=covariates,
+            input_gain=input_gain,
         )
 
         # Non-switching CovariateChoiceModel filter
         result_cov = _covariate_choice_filter_jit(
             choices, 4,
-            jnp.zeros((100, 1)),  # covariates
-            jnp.zeros((k_free, 1)),  # input_gain
+            covariates,
+            input_gain,
             jnp.zeros((100, 1)),  # obs_covariates
             jnp.zeros((4, 1)),  # obs_weights
             q, beta, decay,
-            jnp.zeros(k_free),  # init_mean
-            jnp.eye(k_free),  # init_cov
+            init_mean,
+            init_cov,
         )
 
-        # The switching filter evaluates LL at the MAP mode (for correct
-        # discrete-state weighting), while the non-switching filter evaluates
-        # at the prior mean (for EM convergence monitoring). These are
-        # intentionally different: mode-LL is systematically higher.
-        # Instead of comparing LL values, verify the filtered values match.
-        sw_values = result_sw.filtered_values[:, :, 0]  # (T, K-1) for state 0
+        # Filtered values must match exactly (same Newton steps, same prediction)
+        sw_values = result_sw.filtered_values[:, :, 0]  # (T, K-1)
         cov_values = result_cov.filtered_values  # (T, K-1)
-        # Filtered values should be highly correlated
-        for dim in range(k_free):
-            corr = float(jnp.corrcoef(sw_values[:, dim], cov_values[:, dim])[0, 1])
-            assert corr > 0.95, f"Dim {dim}: corr={corr:.3f}"
+        np.testing.assert_allclose(sw_values, cov_values, atol=1e-6)
 
     def test_two_state_switching_detected(self):
         """First half exploit (deterministic), second half explore (random)."""

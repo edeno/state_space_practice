@@ -288,13 +288,11 @@ def switching_choice_filter(
     init_discrete_prob = _stabilize_probability_vector(init_discrete_prob)
 
     # --- First timestep: apply covariate prediction + observation update ---
-    # Unlike the point-process filter (which skips dynamics at t=0), we apply
-    # the covariate-driven prediction B @ u_0 to match the non-switching
-    # CovariateChoiceModel convention where covariates[0] drives x_0.
+    # Apply full prediction at t=0 (decay + covariates + process noise)
+    # to match the non-switching CovariateChoiceModel convention.
     def _first_update_for_state(prior_mean, prior_cov, beta, A_j, Q_j):
-        # Apply covariate prediction (but not decay — init is the prior)
-        pred_mean = prior_mean + ig_arr @ cov_arr[0]
-        pred_cov = prior_cov + Q_j
+        pred_mean = A_j @ prior_mean + ig_arr @ cov_arr[0]
+        pred_cov = A_j @ prior_cov @ A_j.T + Q_j
 
         obs_offset_0 = ow_arr @ obs_cov_arr[0]
         post_mean, post_cov, _ll_prior = _softmax_update_core(
@@ -581,20 +579,21 @@ class SwitchingChoiceModel(SGDFittableMixin):
     def _m_step(self, choices, filter_result, smoother_result):
         """M-step: update per-state Q and transition matrix.
 
-        Uses smoother joint discrete state probabilities for the transition
-        matrix (proper EM), and smoother discrete state probabilities for Q.
+        Uses smoother quantities throughout (proper EM):
+        - smoother_joint_discrete_state_prob for transition matrix
+        - state_cond_smoother_means + smoother_discrete_state_prob for Q
         """
         gamma = smoother_result[2]  # smoothed discrete probs (T, S)
         joint = smoother_result[3]  # smoother joint (T-1, S, S)
+        smoother_means = smoother_result[5]  # state-conditional smoother means (T, K-1, S)
         S = self.n_discrete_states
         eps = 1e-10
 
-        # Per-state process noise: weighted variance of value increments
-        values = filter_result.filtered_values  # (T, K-1, S)
+        # Per-state process noise: weighted variance of smoothed value increments
         for s in range(S):
             w = gamma[1:, s]  # (T-1,)
             w_sum = jnp.maximum(jnp.sum(w), eps)
-            diff = values[1:, :, s] - self.decays_[s] * values[:-1, :, s]
+            diff = smoother_means[1:, :, s] - self.decays_[s] * smoother_means[:-1, :, s]
             q_hat = jnp.sum(w[:, None] * diff**2, axis=0).mean() / w_sum
             self.process_noises_ = self.process_noises_.at[s].set(
                 jnp.maximum(q_hat, 1e-6)
