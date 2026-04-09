@@ -120,7 +120,6 @@ def compute_choice_log_likelihood(
     choice_t: ArrayLike,
     state_values: Array,
     inverse_temperature: float,
-    n_options: int,
 ) -> Array:
     """Compute log P(choice | state) for each state.
 
@@ -132,8 +131,6 @@ def compute_choice_log_likelihood(
         Value preferences per state-option pair.
     inverse_temperature : float
         Softmax temperature.
-    n_options : int
-        Number of options.
 
     Returns
     -------
@@ -142,7 +139,7 @@ def compute_choice_log_likelihood(
     """
     logits = inverse_temperature * state_values  # (n_states, n_options)
     log_probs = jax.nn.log_softmax(logits, axis=1)  # (n_states, n_options)
-    return log_probs[:, choice_t]  # (n_states,)
+    return log_probs[:, choice_t]
 
 
 def contingency_belief_filter(
@@ -209,6 +206,20 @@ def contingency_belief_filter(
         transition_covariates = jnp.zeros((n_trials, 1))
         transition_weights = jnp.zeros((n_states, n_states, 1))
 
+    def _update(predicted, choice_t, reward_t):
+        """Bayes update: predicted → posterior given observations."""
+        reward_ll = compute_reward_log_likelihood(
+            reward_t, choice_t, reward_probs
+        )
+        choice_ll = compute_choice_log_likelihood(
+            choice_t, state_values, inverse_temperature
+        )
+        log_obs = reward_ll + choice_ll
+        log_joint = jnp.log(jnp.maximum(predicted, 1e-30)) + log_obs
+        log_norm = jax.nn.logsumexp(log_joint)
+        posterior = jnp.exp(log_joint - log_norm)
+        return posterior, log_norm
+
     def _step(carry, trial_data):
         prev_belief, accum_ll = carry
         choice_t, reward_t, h_t = trial_data
@@ -217,32 +228,24 @@ def contingency_belief_filter(
         trans = compute_input_output_transition_matrix(
             transition_logits, transition_weights, h_t
         )
-        predicted = trans.T @ prev_belief  # (n_states,)
+        predicted = trans.T @ prev_belief
 
-        # Update with reward observation
-        reward_ll = compute_reward_log_likelihood(
-            reward_t, choice_t, reward_probs
-        )  # (n_states,)
+        posterior, log_norm = _update(predicted, choice_t, reward_t)
+        return (posterior, accum_ll + log_norm), posterior
 
-        # Update with choice observation
-        choice_ll = compute_choice_log_likelihood(
-            choice_t, state_values, inverse_temperature, n_options
-        )  # (n_states,)
+    # t=0: use init_state_prob directly as prior (no transition applied)
+    posterior_0, log_norm_0 = _update(
+        init_state_prob, choices[0], rewards[0]
+    )
 
-        # Combined log-likelihood per state
-        log_obs = reward_ll + choice_ll
-        # Numerically stable update: work in log space
-        log_joint = jnp.log(jnp.maximum(predicted, 1e-30)) + log_obs
-        # Normalize
-        log_norm = jax.nn.logsumexp(log_joint)
-        posterior = jnp.exp(log_joint - log_norm)
+    # t=1:T: scan with transitions
+    init_carry = (posterior_0, log_norm_0)
+    remaining_inputs = (choices[1:], rewards[1:], transition_covariates[1:])
+    (_, total_ll), posteriors_rest = jax.lax.scan(
+        _step, init_carry, remaining_inputs
+    )
 
-        new_ll = accum_ll + log_norm
-        return (posterior, new_ll), posterior
-
-    init_carry = (init_state_prob, jnp.array(0.0))
-    inputs = (choices, rewards, transition_covariates)
-    (_, total_ll), posteriors = jax.lax.scan(_step, init_carry, inputs)
+    posteriors = jnp.concatenate([posterior_0[None], posteriors_rest], axis=0)
 
     return ContingencyBeliefResult(
         state_posterior=posteriors,
@@ -303,6 +306,19 @@ def contingency_belief_smoother(
         transition_weights = jnp.zeros((n_states, n_states, 1))
 
     # --- Forward pass: store filter beliefs and per-step info ---
+    def _fwd_update(predicted, choice_t, reward_t):
+        reward_ll = compute_reward_log_likelihood(
+            reward_t, choice_t, reward_probs
+        )
+        choice_ll = compute_choice_log_likelihood(
+            choice_t, state_values, inverse_temperature
+        )
+        log_obs = reward_ll + choice_ll
+        log_joint = jnp.log(jnp.maximum(predicted, 1e-30)) + log_obs
+        log_norm = jax.nn.logsumexp(log_joint)
+        posterior = jnp.exp(log_joint - log_norm)
+        return posterior, log_norm
+
     def _forward_step(carry, trial_data):
         prev_belief, accum_ll = carry
         choice_t, reward_t, h_t = trial_data
@@ -311,25 +327,31 @@ def contingency_belief_smoother(
             transition_logits, transition_weights, h_t
         )
         predicted = trans.T @ prev_belief
+        posterior, log_norm = _fwd_update(predicted, choice_t, reward_t)
 
-        reward_ll = compute_reward_log_likelihood(
-            reward_t, choice_t, reward_probs
-        )
-        choice_ll = compute_choice_log_likelihood(
-            choice_t, state_values, inverse_temperature, n_options
-        )
-        log_obs = reward_ll + choice_ll
-        log_joint = jnp.log(jnp.maximum(predicted, 1e-30)) + log_obs
-        log_norm = jax.nn.logsumexp(log_joint)
-        posterior = jnp.exp(log_joint - log_norm)
+        return (posterior, accum_ll + log_norm), (posterior, predicted, trans)
 
-        new_ll = accum_ll + log_norm
-        return (posterior, new_ll), (posterior, predicted, trans)
+    # t=0: use init_state_prob directly
+    posterior_0, log_norm_0 = _fwd_update(
+        init_state_prob, choices[0], rewards[0]
+    )
+    # Dummy transition for t=0 (not used by backward pass)
+    dummy_trans = jax.nn.softmax(transition_logits, axis=1)
 
-    init_carry = (init_state_prob, jnp.array(0.0))
-    inputs = (choices, rewards, transition_covariates)
-    (_, total_ll), (filter_beliefs, predicted_beliefs, trans_matrices) = (
-        jax.lax.scan(_forward_step, init_carry, inputs)
+    # t=1:T
+    init_carry = (posterior_0, log_norm_0)
+    remaining_inputs = (choices[1:], rewards[1:], transition_covariates[1:])
+    (_, total_ll), (filt_rest, pred_rest, trans_rest) = (
+        jax.lax.scan(_forward_step, init_carry, remaining_inputs)
+    )
+
+    # Concatenate t=0 with t=1:T
+    filter_beliefs = jnp.concatenate([posterior_0[None], filt_rest], axis=0)
+    predicted_beliefs = jnp.concatenate(
+        [init_state_prob[None], pred_rest], axis=0
+    )
+    trans_matrices = jnp.concatenate(
+        [dummy_trans[None], trans_rest], axis=0
     )
 
     # --- Backward pass ---
@@ -508,17 +530,10 @@ class ContingencyBeliefModel(SGDFittableMixin):
         trans_probs = trans_counts / jnp.maximum(row_sums, eps)
         self.transition_logits_ = jnp.log(jnp.maximum(trans_probs, eps))
 
-        # Update state_values from choice-weighted posteriors
-        for s in range(self.n_states):
-            for k in range(self.n_options):
-                mask = (choices == k)
-                numerator = jnp.sum(gamma[:, s] * mask)
-                denominator = jnp.sum(gamma[:, s])
-                freq = numerator / jnp.maximum(denominator, eps)
-                # Map frequency to value (logit-like)
-                self.state_values_ = self.state_values_.at[s, k].set(
-                    jnp.log(jnp.maximum(freq, eps))
-                )
+        # state_values_ and inverse_temperature_ are NOT updated in the
+        # EM M-step because the choice log-likelihood softmax(beta * V)
+        # has no closed-form M-step for general beta. These parameters
+        # are learned via SGD (fit_sgd) instead.
 
     def predict_state_posterior(
         self, choices: ArrayLike, rewards: ArrayLike
