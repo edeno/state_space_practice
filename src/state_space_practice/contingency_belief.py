@@ -31,6 +31,8 @@ import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.sgd_fitting import SGDFittableMixin
+
 logger = logging.getLogger(__name__)
 
 
@@ -382,3 +384,253 @@ def contingency_belief_smoother(
         pairwise_state_prob=pairwise,
         log_likelihood=total_ll,
     )
+
+
+class ContingencyBeliefModel(SGDFittableMixin):
+    """Contingency-belief model for multi-armed bandit behavior.
+
+    Infers hidden task-state/contingency from choices and rewards using
+    an input-output HMM with EM or SGD fitting.
+
+    Parameters
+    ----------
+    n_states : int
+        Number of latent contingency states.
+    n_options : int
+        Number of choice options.
+    init_inverse_temperature : float
+        Starting inverse temperature.
+    """
+
+    def __init__(
+        self,
+        n_states: int,
+        n_options: int,
+        init_inverse_temperature: float = 1.0,
+    ):
+        self.n_states = n_states
+        self.n_options = n_options
+        self.inverse_temperature_ = init_inverse_temperature
+
+        # Initialize parameters
+        self.reward_probs_ = jnp.ones((n_states, n_options)) / 2
+        self.state_values_ = jax.random.normal(
+            jax.random.PRNGKey(0), (n_states, n_options)
+        ) * 0.1
+        self.transition_logits_ = jnp.zeros((n_states, n_states))
+
+        # Fitted state
+        self._smoother_result = None
+        self.log_likelihood_: Optional[float] = None
+        self.log_likelihood_history_: Optional[list[float]] = None
+        self._n_trials: Optional[int] = None
+
+    @property
+    def is_fitted(self) -> bool:
+        return self._smoother_result is not None
+
+    def fit(
+        self,
+        choices: ArrayLike,
+        rewards: ArrayLike,
+        max_iter: int = 50,
+        tolerance: float = 1e-4,
+    ) -> list[float]:
+        """Fit via EM algorithm.
+
+        Parameters
+        ----------
+        choices : ArrayLike, shape (n_trials,)
+        rewards : ArrayLike, shape (n_trials,)
+        max_iter : int
+        tolerance : float
+
+        Returns
+        -------
+        log_likelihoods : list of float
+        """
+        choices = jnp.asarray(choices, dtype=jnp.int32)
+        rewards = jnp.asarray(rewards, dtype=jnp.int32)
+        self._n_trials = int(choices.shape[0])
+
+        log_likelihoods: list[float] = []
+        prev_ll = float("-inf")
+
+        for iteration in range(max_iter):
+            # E-step: run smoother
+            result = contingency_belief_smoother(
+                choices=choices,
+                rewards=rewards,
+                n_states=self.n_states,
+                n_options=self.n_options,
+                reward_probs=self.reward_probs_,
+                state_values=self.state_values_,
+                inverse_temperature=self.inverse_temperature_,
+                transition_logits=self.transition_logits_,
+            )
+            self._smoother_result = result
+            ll = float(result.log_likelihood)
+            log_likelihoods.append(ll)
+
+            if abs(ll - prev_ll) < tolerance and iteration > 0:
+                logger.info(f"Converged at iteration {iteration + 1}")
+                break
+            prev_ll = ll
+
+            # M-step: update parameters from smoothed statistics
+            self._m_step(choices, rewards, result)
+
+        self.log_likelihood_ = log_likelihoods[-1]
+        self.log_likelihood_history_ = log_likelihoods
+        return log_likelihoods
+
+    def _m_step(self, choices, rewards, result):
+        """M-step: update parameters from smoothed posterior."""
+        gamma = result.smoothed_state_prob  # (T, S)
+        xi = result.pairwise_state_prob  # (T-1, S, S)
+
+        # Update reward_probs: weighted counts
+        eps = 1e-10
+        for s in range(self.n_states):
+            for k in range(self.n_options):
+                mask = (choices == k)
+                weight = gamma[:, s] * mask
+                n_reward = jnp.sum(weight * rewards)
+                n_total = jnp.sum(weight)
+                self.reward_probs_ = self.reward_probs_.at[s, k].set(
+                    jnp.clip(n_reward / jnp.maximum(n_total, eps), eps, 1 - eps)
+                )
+
+        # Update transition logits from pairwise counts
+        # T_new[i,j] ∝ sum_t xi[t, i, j]
+        trans_counts = xi.sum(axis=0)  # (S, S)
+        row_sums = trans_counts.sum(axis=1, keepdims=True)
+        trans_probs = trans_counts / jnp.maximum(row_sums, eps)
+        self.transition_logits_ = jnp.log(jnp.maximum(trans_probs, eps))
+
+        # Update state_values from choice-weighted posteriors
+        for s in range(self.n_states):
+            for k in range(self.n_options):
+                mask = (choices == k)
+                numerator = jnp.sum(gamma[:, s] * mask)
+                denominator = jnp.sum(gamma[:, s])
+                freq = numerator / jnp.maximum(denominator, eps)
+                # Map frequency to value (logit-like)
+                self.state_values_ = self.state_values_.at[s, k].set(
+                    jnp.log(jnp.maximum(freq, eps))
+                )
+
+    def predict_state_posterior(
+        self, choices: ArrayLike, rewards: ArrayLike
+    ) -> Array:
+        """Predict smoothed state posterior for given data."""
+        result = contingency_belief_smoother(
+            choices=jnp.asarray(choices, dtype=jnp.int32),
+            rewards=jnp.asarray(rewards, dtype=jnp.int32),
+            n_states=self.n_states,
+            n_options=self.n_options,
+            reward_probs=self.reward_probs_,
+            state_values=self.state_values_,
+            inverse_temperature=self.inverse_temperature_,
+            transition_logits=self.transition_logits_,
+        )
+        return result.smoothed_state_prob
+
+    # --- SGDFittableMixin protocol ---
+
+    def fit_sgd(
+        self,
+        choices: ArrayLike,
+        rewards: ArrayLike,
+        optimizer=None,
+        num_steps: int = 200,
+        verbose: bool = False,
+        convergence_tol=None,
+    ) -> list[float]:
+        """Fit by minimizing negative marginal LL via gradient descent.
+
+        Parameters
+        ----------
+        choices : ArrayLike, shape (n_trials,)
+        rewards : ArrayLike, shape (n_trials,)
+        optimizer : optax optimizer or None
+        num_steps : int
+        verbose : bool
+        convergence_tol : float or None
+
+        Returns
+        -------
+        log_likelihoods : list of float
+        """
+        choices = jnp.asarray(choices, dtype=jnp.int32)
+        rewards = jnp.asarray(rewards, dtype=jnp.int32)
+        self._n_trials = int(choices.shape[0])
+
+        return super().fit_sgd(
+            choices, rewards,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+        )
+
+    @property
+    def _n_timesteps(self) -> int:
+        return self._n_trials
+
+    def _check_sgd_initialized(self) -> None:
+        pass  # Parameters allocated at construction
+
+    def _build_param_spec(self) -> tuple[dict, dict]:
+        from state_space_practice.parameter_transforms import (
+            POSITIVE,
+            UNCONSTRAINED,
+            UNIT_INTERVAL,
+        )
+
+        params = {
+            "reward_probs": self.reward_probs_,
+            "state_values": self.state_values_,
+            "inverse_temperature": jnp.array(self.inverse_temperature_),
+            "transition_logits": self.transition_logits_,
+        }
+        spec = {
+            "reward_probs": UNIT_INTERVAL,
+            "state_values": UNCONSTRAINED,
+            "inverse_temperature": POSITIVE,
+            "transition_logits": UNCONSTRAINED,
+        }
+        return params, spec
+
+    def _sgd_loss_fn(self, params: dict, choices: Array, rewards: Array) -> Array:
+        result = contingency_belief_filter(
+            choices=choices,
+            rewards=rewards,
+            n_states=self.n_states,
+            n_options=self.n_options,
+            reward_probs=params["reward_probs"],
+            state_values=params["state_values"],
+            inverse_temperature=params["inverse_temperature"],
+            transition_logits=params["transition_logits"],
+        )
+        return -result.log_likelihood
+
+    def _store_sgd_params(self, params: dict) -> None:
+        self.reward_probs_ = params["reward_probs"]
+        self.state_values_ = params["state_values"]
+        self.inverse_temperature_ = float(params["inverse_temperature"])
+        self.transition_logits_ = params["transition_logits"]
+
+    def _finalize_sgd(self, choices: Array, rewards: Array) -> None:
+        result = contingency_belief_smoother(
+            choices=choices,
+            rewards=rewards,
+            n_states=self.n_states,
+            n_options=self.n_options,
+            reward_probs=self.reward_probs_,
+            state_values=self.state_values_,
+            inverse_temperature=self.inverse_temperature_,
+            transition_logits=self.transition_logits_,
+        )
+        self._smoother_result = result
+        self.log_likelihood_ = float(result.log_likelihood)

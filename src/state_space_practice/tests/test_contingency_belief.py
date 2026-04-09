@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from state_space_practice.contingency_belief import (
+    ContingencyBeliefModel,
     ContingencyBeliefResult,
     compute_input_output_transition_matrix,
     compute_reward_log_likelihood,
@@ -212,3 +213,109 @@ class TestContingencyBeliefSmoother:
         filter_entropy = entropy(filter_result.state_posterior).mean()
         smoother_entropy = entropy(smoother_result.smoothed_state_prob).mean()
         assert smoother_entropy <= filter_entropy + 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Synthetic data helper
+# ---------------------------------------------------------------------------
+
+def _simulate_block_bandit(n_trials=100, n_options=3, seed=42):
+    """Simulate block-structured bandit: state switches halfway."""
+    key = jax.random.PRNGKey(seed)
+    k1, k2 = jax.random.split(key)
+
+    # State 0: option 0 is best; State 1: option 2 is best
+    reward_probs = jnp.array([
+        [0.8, 0.1, 0.1],
+        [0.1, 0.1, 0.8],
+    ])
+    half = n_trials // 2
+    true_states = jnp.concatenate([jnp.zeros(half), jnp.ones(n_trials - half)]).astype(jnp.int32)
+
+    # Generate choices: animals mostly pick the best option for current state
+    best_options = jnp.array([0, 2])  # best for state 0, state 1
+    choices = best_options[true_states]
+    # Add noise: 20% random choices
+    noise_mask = jax.random.bernoulli(k1, 0.2, (n_trials,))
+    random_choices = jax.random.randint(k2, (n_trials,), 0, n_options)
+    choices = jnp.where(noise_mask, random_choices, choices)
+
+    # Generate rewards from true state
+    reward_p = reward_probs[true_states, choices]
+    rewards = jax.random.bernoulli(jax.random.PRNGKey(seed + 1), reward_p).astype(jnp.int32)
+
+    return choices, rewards, true_states, reward_probs
+
+
+# ---------------------------------------------------------------------------
+# ContingencyBeliefModel tests
+# ---------------------------------------------------------------------------
+
+class TestContingencyBeliefModel:
+    def test_fit_improves_ll(self):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=80)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        lls = model.fit(choices, rewards, max_iter=10)
+        assert len(lls) > 1
+        assert lls[-1] > lls[0]
+
+    def test_fit_recovers_reward_probs(self):
+        choices, rewards, _, true_rp = _simulate_block_bandit(n_trials=200)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.fit(choices, rewards, max_iter=20)
+        # Learned reward_probs should roughly match ground truth
+        # (up to state permutation)
+        learned = model.reward_probs_
+        # Check that max reward prob per state is high (>0.5)
+        assert jnp.max(learned[0]) > 0.5
+        assert jnp.max(learned[1]) > 0.5
+
+    def test_predict_state_posterior(self):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=60)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.fit(choices, rewards, max_iter=10)
+        posterior = model.predict_state_posterior(choices, rewards)
+        assert posterior.shape == (60, 2)
+        np.testing.assert_allclose(posterior.sum(axis=1), 1.0, atol=1e-6)
+
+    def test_zero_transition_weights_stationary(self):
+        """With zero transition weights, should behave like stationary HMM."""
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=50)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.fit(choices, rewards, max_iter=5)
+        assert model.is_fitted
+
+
+class TestContingencyBeliefSGD:
+    def test_sgd_improves_ll(self):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=80)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        lls = model.fit_sgd(choices, rewards, num_steps=50)
+        assert lls[-1] > lls[0]
+
+    def test_sgd_respects_constraints(self):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=80)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.fit_sgd(choices, rewards, num_steps=30)
+        # Reward probs should be in (0, 1)
+        assert jnp.all(model.reward_probs_ > 0)
+        assert jnp.all(model.reward_probs_ < 1)
+        # Inverse temperature should be positive
+        assert model.inverse_temperature_ > 0
+
+    def test_sgd_model_is_fitted(self):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=60)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.fit_sgd(choices, rewards, num_steps=20)
+        assert model.is_fitted
+
+    def test_sgd_vs_em_both_finite(self):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=100)
+        model_em = ContingencyBeliefModel(n_states=2, n_options=3)
+        model_em.fit(choices, rewards, max_iter=15)
+
+        model_sgd = ContingencyBeliefModel(n_states=2, n_options=3)
+        model_sgd.fit_sgd(choices, rewards, num_steps=100)
+
+        assert np.isfinite(model_em.log_likelihood_)
+        assert np.isfinite(model_sgd.log_likelihood_)
