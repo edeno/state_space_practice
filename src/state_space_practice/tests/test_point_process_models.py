@@ -593,3 +593,41 @@ class TestSwitchingPPSGDFitting:
         norm_reg = float(jnp.sum(jnp.abs(model_reg.coupling_strength)))
 
         assert norm_reg < norm_base
+
+    def test_spike_weight_l2_shrinks_weights(self):
+        """Higher spike_weight_l2 should produce smaller spike weights."""
+        from state_space_practice.simulate.scenarios import (
+            simulate_dim_pp_scenario,
+        )
+
+        scenario = simulate_dim_pp_scenario(n_time=100, seed=42)
+        p = scenario["params"]
+        key = jax.random.PRNGKey(0)
+
+        def _make(l2):
+            return DirectedInfluencePointProcessModel(
+                n_oscillators=p["n_oscillators"],
+                n_neurons=p["n_neurons"],
+                n_discrete_states=p["n_discrete_states"],
+                sampling_freq=p["sampling_freq"],
+                dt=p["dt"],
+                freqs=p["freqs"],
+                auto_regressive_coef=p["damping"],
+                process_variance=p["process_variance"],
+                phase_difference=p["phase_difference"],
+                coupling_strength=p["coupling_strength"],
+                spike_weight_l2=l2,
+            )
+
+        model_low = _make(0.01)
+        model_low.fit_sgd(scenario["spikes"], key=key, num_steps=20)
+        norm_low = float(jnp.sum(model_low.spike_params.weights**2))
+
+        model_high = _make(10.0)
+        model_high.fit_sgd(scenario["spikes"], key=key, num_steps=20)
+        norm_high = float(jnp.sum(model_high.spike_params.weights**2))
+
+        assert norm_high < norm_low, (
+            f"Higher L2 ({norm_high:.4f}) should give smaller weight norm "
+            f"than lower L2 ({norm_low:.4f})"
+        )

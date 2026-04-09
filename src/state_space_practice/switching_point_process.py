@@ -3078,7 +3078,13 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             log_intensity_func=log_int,
             spike_params=sp,
         )
-        return -result[5]
+        loss = -result[5]
+
+        # Spike weight L2 penalty (matches EM M-step regularization)
+        if self.spike_weight_l2 > 0:
+            loss = loss + 0.5 * self.spike_weight_l2 * jnp.sum(weights**2)
+
+        return loss
 
     def _store_sgd_params(self, params):
         if "discrete_transition_matrix" in params:
