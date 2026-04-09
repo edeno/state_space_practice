@@ -288,24 +288,31 @@ def switching_choice_filter(
 
     init_discrete_prob = _stabilize_probability_vector(init_discrete_prob)
 
-    # --- First timestep: update only (no dynamics prediction) ---
-    def _first_update_for_state(prior_mean, prior_cov, beta):
+    # --- First timestep: apply covariate prediction + observation update ---
+    # Unlike the point-process filter (which skips dynamics at t=0), we apply
+    # the covariate-driven prediction B @ u_0 to match the non-switching
+    # CovariateChoiceModel convention where covariates[0] drives x_0.
+    def _first_update_for_state(prior_mean, prior_cov, beta, A_j, Q_j):
+        # Apply covariate prediction (but not decay — init is the prior)
+        pred_mean = prior_mean + ig_arr @ cov_arr[0]
+        pred_cov = prior_cov + Q_j
+
         obs_offset_0 = ow_arr @ obs_cov_arr[0]
         post_mean, post_cov, _ll_prior = _softmax_update_core(
-            prior_mean, prior_cov, choices[0], n_options, beta,
+            pred_mean, pred_cov, choices[0], n_options, beta,
             obs_offset=obs_offset_0,
         )
         # LL at mode for discrete-state weighting
         v_mode = jnp.concatenate([jnp.zeros(1), post_mean])
-        _off = obs_offset_0 if obs_offset_0 is not None else jnp.zeros(n_options)
-        ll = jax.nn.log_softmax(beta * v_mode + _off)[choices[0]]
+        ll = jax.nn.log_softmax(beta * v_mode + obs_offset_0)[choices[0]]
         return post_mean, post_cov, ll
 
     first_means, first_covs, first_lls = jax.vmap(
         _first_update_for_state,
-        in_axes=(1, 2, 0),
+        in_axes=(1, 2, 0, 2, 2),
         out_axes=(1, 2, 0),
-    )(init_state_cond_mean, init_state_cond_cov, inverse_temperatures)
+    )(init_state_cond_mean, init_state_cond_cov, inverse_temperatures,
+      transition_matrices, process_covs)
     # first_means: (K-1, S), first_covs: (K-1, K-1, S), first_lls: (S,)
 
     # Scale and update discrete probs for first timestep
@@ -506,7 +513,11 @@ class SwitchingChoiceModel(SGDFittableMixin):
         max_iter: int = 50,
         tolerance: float = 1e-4,
     ) -> list[float]:
-        """Fit via EM algorithm.
+        """Fit via simplified EM algorithm.
+
+        EM updates per-state process_noises and discrete_transition_matrix.
+        Per-state inverse_temperatures and decays are NOT updated (no
+        closed-form M-step). Use fit_sgd() for full parameter learning.
 
         Parameters
         ----------
@@ -751,10 +762,20 @@ def simulate_switching_choice_data(
     key = jax.random.PRNGKey(seed)
 
     if process_noises is None:
+        if S > 2:
+            raise ValueError(
+                f"Default process_noises only defined for S<=2, got S={S}. "
+                "Provide explicit process_noises."
+            )
         process_noises = jnp.array([0.001, 0.05][:S])
     else:
         process_noises = jnp.asarray(process_noises)
     if inverse_temperatures is None:
+        if S > 2:
+            raise ValueError(
+                f"Default inverse_temperatures only defined for S<=2, got S={S}. "
+                "Provide explicit inverse_temperatures."
+            )
         inverse_temperatures = jnp.array([5.0, 0.5][:S])
     else:
         inverse_temperatures = jnp.asarray(inverse_temperatures)

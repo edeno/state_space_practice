@@ -277,22 +277,40 @@ class TestSwitchingChoiceModel:
             model.smoothed_discrete_probs_.sum(axis=1), 1.0, atol=1e-5
         )
 
-    def test_two_state_learns_different_betas(self):
-        """Exploit phase + explore phase should give different betas."""
+    def test_em_does_not_update_betas(self):
+        """EM does not update inverse_temperatures (no closed-form M-step).
+
+        Per-state betas are learned via SGD only. EM updates Q and Z.
+        """
         from state_space_practice.switching_choice import SwitchingChoiceModel
 
-        # Exploit: always choose 0; explore: random
-        exploit = jnp.zeros(80, dtype=jnp.int32)
-        explore = jax.random.randint(jax.random.PRNGKey(0), (80,), 0, 4)
-        choices = jnp.concatenate([exploit, explore])
-
+        choices = jax.random.randint(jax.random.PRNGKey(0), (100,), 0, 3)
+        # Start with equal betas
         model = SwitchingChoiceModel(
-            n_options=4, n_discrete_states=2,
-            init_inverse_temperatures=jnp.array([5.0, 1.0]),
+            n_options=3, n_discrete_states=2,
+            init_inverse_temperatures=jnp.array([2.0, 2.0]),
         )
-        model.fit(choices, max_iter=10)
-        # Per-state betas should differ
-        assert model.inverse_temperatures_[0] != model.inverse_temperatures_[1]
+        model.fit(choices, max_iter=5)
+        # Betas should be unchanged (EM doesn't update them)
+        np.testing.assert_allclose(model.inverse_temperatures_, [2.0, 2.0])
+
+    def test_sgd_learns_different_betas(self):
+        """SGD should learn different betas for exploit/explore data."""
+        from state_space_practice.switching_choice import (
+            SwitchingChoiceModel,
+            simulate_switching_choice_data,
+        )
+
+        sim = simulate_switching_choice_data(
+            n_trials=200, n_options=3,
+            inverse_temperatures=jnp.array([5.0, 0.5]),
+            process_noises=jnp.array([0.001, 0.05]),
+            seed=42,
+        )
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model.fit_sgd(sim.choices, num_steps=100)
+        # Per-state betas should differ after SGD
+        assert abs(float(model.inverse_temperatures_[0] - model.inverse_temperatures_[1])) > 0.1
 
     def test_sgd_improves_ll(self):
         from state_space_practice.switching_choice import SwitchingChoiceModel
@@ -334,7 +352,9 @@ class TestSimulateSwitchingChoiceData:
         from state_space_practice.switching_choice import simulate_switching_choice_data
 
         sim = simulate_switching_choice_data(
-            n_trials=200, n_options=3, n_discrete_states=3, seed=0
+            n_trials=200, n_options=3, n_discrete_states=3, seed=0,
+            process_noises=jnp.array([0.001, 0.01, 0.05]),
+            inverse_temperatures=jnp.array([5.0, 2.0, 0.5]),
         )
         assert jnp.all(sim.true_states >= 0)
         assert jnp.all(sim.true_states < 3)
