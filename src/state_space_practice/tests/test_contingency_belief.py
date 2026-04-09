@@ -433,3 +433,21 @@ class TestContingencyBeliefIntegration:
         assert model.smoothed_state_posterior_ is not None
         assert model.state_posterior_.shape == (60, 2)
         assert model.smoothed_state_posterior_.shape == (60, 2)
+
+    def test_em_with_transition_covariates(self):
+        """EM should use transition covariates in the E-step."""
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=100)
+        n_trials = len(choices)
+        covariates = jnp.zeros((n_trials, 1))
+        covariates = covariates.at[n_trials // 2, 0].set(1.0)
+
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        lls = model.fit(
+            choices, rewards,
+            transition_covariates=covariates,
+            max_iter=15,
+        )
+        assert len(lls) > 1
+        # Coefficients should have expanded for the covariate
+        assert model.transition_coefficients_.shape[0] == 2
+        assert model.is_fitted
