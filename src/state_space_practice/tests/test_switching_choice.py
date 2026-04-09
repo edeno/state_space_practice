@@ -11,6 +11,7 @@ import pytest
 from state_space_practice.switching_choice import (
     _softmax_predict_and_update,
     _softmax_update_per_state_pair,
+    switching_choice_filter,
 )
 
 
@@ -147,3 +148,94 @@ class TestSoftmaxUpdatePerStatePair:
             mean, cov, jnp.int32(0), A, Q, 3, betas, B, u, obs_offset,
         )
         assert jnp.all(jnp.isfinite(pair_ll))
+
+
+class TestSwitchingChoiceFilter:
+    """Tests for the switching choice filter."""
+
+    def test_output_shapes(self):
+        n_trials, K, S = 50, 3, 2
+        choices = jax.random.randint(jax.random.PRNGKey(0), (n_trials,), 0, K)
+        result = switching_choice_filter(
+            choices, n_options=K, n_discrete_states=S,
+        )
+        assert result.filtered_values.shape == (n_trials, K - 1, S)
+        assert result.filtered_covs.shape == (n_trials, K - 1, K - 1, S)
+        assert result.discrete_state_probs.shape == (n_trials, S)
+        assert result.marginal_log_likelihood.shape == ()
+
+    def test_discrete_probs_sum_to_one(self):
+        choices = jax.random.randint(jax.random.PRNGKey(0), (100,), 0, 3)
+        result = switching_choice_filter(choices, n_options=3, n_discrete_states=2)
+        row_sums = result.discrete_state_probs.sum(axis=1)
+        np.testing.assert_allclose(row_sums, 1.0, atol=1e-6)
+
+    def test_discrete_probs_nonnegative(self):
+        choices = jax.random.randint(jax.random.PRNGKey(0), (100,), 0, 3)
+        result = switching_choice_filter(choices, n_options=3, n_discrete_states=2)
+        assert jnp.all(result.discrete_state_probs >= -1e-10)
+
+    def test_marginal_ll_finite(self):
+        choices = jax.random.randint(jax.random.PRNGKey(0), (100,), 0, 3)
+        result = switching_choice_filter(choices, n_options=3, n_discrete_states=2)
+        assert jnp.isfinite(result.marginal_log_likelihood)
+
+    def test_single_state_matches_covariate_filter(self):
+        """S=1 should produce same LL as CovariateChoiceModel filter."""
+        from state_space_practice.covariate_choice import _covariate_choice_filter_jit
+
+        choices = jax.random.randint(jax.random.PRNGKey(42), (100,), 0, 4)
+        k_free = 3
+        q = 0.01
+        beta = 2.0
+        decay = 0.95
+
+        # Switching filter with S=1
+        result_sw = switching_choice_filter(
+            choices, n_options=4, n_discrete_states=1,
+            process_noises=jnp.array([q]),
+            inverse_temperatures=jnp.array([beta]),
+            decays=jnp.array([decay]),
+            init_mean=jnp.zeros(k_free),
+            init_cov=jnp.eye(k_free),
+        )
+
+        # Non-switching CovariateChoiceModel filter
+        result_cov = _covariate_choice_filter_jit(
+            choices, 4,
+            jnp.zeros((100, 1)),  # covariates
+            jnp.zeros((k_free, 1)),  # input_gain
+            jnp.zeros((100, 1)),  # obs_covariates
+            jnp.zeros((4, 1)),  # obs_weights
+            q, beta, decay,
+            jnp.zeros(k_free),  # init_mean
+            jnp.eye(k_free),  # init_cov
+        )
+
+        # Allow small difference from first-timestep convention
+        # (switching filter: update-only at t=0; covariate filter: predict+update)
+        np.testing.assert_allclose(
+            float(result_sw.marginal_log_likelihood),
+            float(result_cov.marginal_log_likelihood),
+            atol=0.5,
+        )
+
+    def test_two_state_switching_detected(self):
+        """First half exploit (deterministic), second half explore (random)."""
+        key = jax.random.PRNGKey(0)
+        # Exploit phase: always choose 0
+        exploit = jnp.zeros(50, dtype=jnp.int32)
+        # Explore phase: random
+        explore = jax.random.randint(key, (50,), 0, 3)
+        choices = jnp.concatenate([exploit, explore])
+
+        result = switching_choice_filter(
+            choices, n_options=3, n_discrete_states=2,
+            inverse_temperatures=jnp.array([5.0, 0.5]),  # high vs low beta
+            process_noises=jnp.array([0.001, 0.05]),
+        )
+        # The filter should detect some difference in state probs
+        # between the two halves
+        first_half = result.discrete_state_probs[:25].mean(axis=0)
+        second_half = result.discrete_state_probs[75:].mean(axis=0)
+        assert not jnp.allclose(first_half, second_half, atol=0.05)
