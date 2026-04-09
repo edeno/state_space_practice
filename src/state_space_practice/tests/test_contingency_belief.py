@@ -11,6 +11,7 @@ import pytest
 from state_space_practice.contingency_belief import (
     ContingencyBeliefModel,
     ContingencyBeliefResult,
+    centered_softmax,
     compute_input_output_transition_matrix,
     compute_reward_log_likelihood,
     contingency_belief_filter,
@@ -21,51 +22,55 @@ from state_space_practice.contingency_belief import (
 
 class TestTransitionLogitsToMatrix:
     def test_rows_sum_to_one(self):
-        logits = jnp.zeros((3, 3))
+        # Centered: (3, 2) logits → (3, 3) transition matrix
+        logits = jnp.zeros((3, 2))
         trans = transition_logits_to_matrix(logits)
         np.testing.assert_allclose(trans.sum(axis=1), 1.0, atol=1e-7)
 
     def test_uniform_for_zero_logits(self):
-        logits = jnp.zeros((2, 2))
+        # 3 states: zero logits → uniform 1/3
+        logits = jnp.zeros((3, 2))
         trans = transition_logits_to_matrix(logits)
-        np.testing.assert_allclose(trans, 0.5, atol=1e-7)
+        np.testing.assert_allclose(trans, 1.0 / 3, atol=1e-7)
 
     def test_higher_logit_gives_higher_prob(self):
-        logits = jnp.array([[5.0, 0.0], [0.0, 5.0]])
+        # Centered: (2, 1) logits. Positive logit → state 0 preferred over reference
+        logits = jnp.array([[5.0], [-5.0]])
         trans = transition_logits_to_matrix(logits)
-        assert trans[0, 0] > trans[0, 1]
-        assert trans[1, 1] > trans[1, 0]
+        assert trans[0, 0] > trans[0, 1]  # from 0: prefer state 0
+        assert trans[1, 1] > trans[1, 0]  # from 1: prefer state 1 (reference)
 
     def test_gradient_finite(self):
-        logits = jnp.array([[1.0, -1.0], [-0.5, 0.5]])
+        logits = jnp.array([[1.0], [-0.5]])
         g = jax.grad(lambda x: transition_logits_to_matrix(x).sum())(logits)
         assert jnp.all(jnp.isfinite(g))
 
 
 class TestInputOutputTransitionMatrix:
     def test_zero_covariates_recover_baseline(self):
-        baseline = jnp.array([[2.0, 0.0], [0.0, 2.0]])
-        weights = jnp.zeros((2, 2, 3))
+        # Centered: (2, 1) logits
+        baseline = jnp.array([[2.0], [-2.0]])
+        weights = jnp.zeros((2, 1, 3))
         h_t = jnp.zeros(3)
         trans = compute_input_output_transition_matrix(baseline, weights, h_t)
-        expected = jax.nn.softmax(baseline, axis=1)
+        expected = centered_softmax(baseline)
         np.testing.assert_allclose(trans, expected, atol=1e-7)
 
     def test_rows_sum_to_one(self):
-        baseline = jnp.ones((3, 3))
-        weights = jax.random.normal(jax.random.PRNGKey(0), (3, 3, 2))
+        baseline = jnp.ones((3, 2))
+        weights = jax.random.normal(jax.random.PRNGKey(0), (3, 2, 2))
         h_t = jnp.array([1.0, -1.0])
         trans = compute_input_output_transition_matrix(baseline, weights, h_t)
         np.testing.assert_allclose(trans.sum(axis=1), 1.0, atol=1e-7)
 
     def test_covariates_shift_transitions(self):
-        baseline = jnp.zeros((2, 2))
-        weights = jnp.zeros((2, 2, 1))
-        weights = weights.at[0, 1, 0].set(5.0)  # covariate pushes s0→s1
+        baseline = jnp.zeros((2, 1))
+        weights = jnp.zeros((2, 1, 1))
+        weights = weights.at[0, 0, 0].set(5.0)  # covariate pushes s0→s0
         h_t = jnp.array([1.0])
         trans = compute_input_output_transition_matrix(baseline, weights, h_t)
-        # s0→s1 should be higher than s0→s0
-        assert trans[0, 1] > trans[0, 0]
+        # s0→s0 should be higher than s0→s1 (reference)
+        assert trans[0, 0] > trans[0, 1]
 
 
 class TestRewardLogLikelihood:
@@ -113,7 +118,7 @@ class TestContingencyBeliefFilter:
             reward_probs=jnp.array([[0.8, 0.2], [0.2, 0.8]]),
             state_values=jnp.array([[2.0, 0.0], [0.0, 2.0]]),
             inverse_temperature=1.0,
-            transition_logits=jnp.array([[3.0, 0.0], [0.0, 3.0]]),
+            transition_logits=jnp.array([[3.0], [-3.0]]),
         )
         assert result.state_posterior.shape == (5, 2)
         assert result.log_likelihood.shape == ()
@@ -127,7 +132,7 @@ class TestContingencyBeliefFilter:
             reward_probs=jnp.array([[0.8, 0.2], [0.5, 0.5], [0.2, 0.8]]),
             state_values=jnp.array([[2.0, 0.0], [1.0, 1.0], [0.0, 2.0]]),
             inverse_temperature=1.0,
-            transition_logits=jnp.zeros((3, 3)),
+            transition_logits=jnp.zeros((3, 2)),
         )
         row_sums = result.state_posterior.sum(axis=1)
         np.testing.assert_allclose(row_sums, 1.0, atol=1e-7)
@@ -146,7 +151,7 @@ class TestContingencyBeliefFilter:
             reward_probs=jnp.array([[0.8, 0.2], [0.2, 0.8]]),
             state_values=jnp.array([[2.0, 0.0], [0.0, 2.0]]),
             inverse_temperature=2.0,
-            transition_logits=jnp.array([[2.0, -1.0], [-1.0, 2.0]]),
+            transition_logits=jnp.array([[3.0], [-3.0]]),
         )
         # Early trials should favor state 0
         assert result.state_posterior[5, 0] > result.state_posterior[5, 1]
@@ -162,7 +167,7 @@ class TestContingencyBeliefFilter:
             reward_probs=jnp.array([[0.8, 0.2], [0.2, 0.8]]),
             state_values=jnp.array([[1.0, 0.0], [0.0, 1.0]]),
             inverse_temperature=1.0,
-            transition_logits=jnp.zeros((2, 2)),
+            transition_logits=jnp.zeros((2, 1)),
         )
         assert jnp.isfinite(result.log_likelihood)
 
@@ -181,7 +186,7 @@ class TestContingencyBeliefSmoother:
             reward_probs=jnp.array([[0.8, 0.2], [0.2, 0.8]]),
             state_values=jnp.array([[2.0, 0.0], [0.0, 2.0]]),
             inverse_temperature=2.0,
-            transition_logits=jnp.array([[2.0, -1.0], [-1.0, 2.0]]),
+            transition_logits=jnp.array([[3.0], [-3.0]]),
         )
         return kwargs
 
@@ -285,15 +290,12 @@ class TestContingencyBeliefModel:
         model.fit(choices, rewards, max_iter=5)
         assert model.is_fitted
 
-    def test_em_monotone(self):
-        """EM should be monotonically non-decreasing."""
+    def test_em_improves_overall(self):
+        """EM should improve LL overall (generalized EM with Dirichlet prior)."""
         choices, rewards, _, _ = _simulate_block_bandit(n_trials=100)
         model = ContingencyBeliefModel(n_states=2, n_options=3)
         lls = model.fit(choices, rewards, max_iter=20)
-        for i in range(1, len(lls)):
-            assert lls[i] >= lls[i - 1] - 1e-3, (
-                f"LL decreased at iteration {i}: {lls[i-1]:.4f} → {lls[i]:.4f}"
-            )
+        assert lls[-1] > lls[0]
 
 
 class TestContingencyBeliefSGD:
@@ -370,8 +372,8 @@ class TestContingencyBeliefIntegration:
         choices, rewards, _, _ = _simulate_block_bandit(n_trials=60)
         model = ContingencyBeliefModel(n_states=2, n_options=3)
         model.fit(choices, rewards, max_iter=10)
-        # Transition matrix should be proper stochastic
-        trans = jax.nn.softmax(model.transition_logits_, axis=1)
+        # Transition matrix from centered logits should be stochastic
+        trans = centered_softmax(model._get_transition_logits())
         np.testing.assert_allclose(trans.sum(axis=1), 1.0, atol=1e-6)
 
     def test_three_state_model(self):
@@ -383,27 +385,26 @@ class TestContingencyBeliefIntegration:
         assert model.is_fitted
 
     def test_sgd_with_transition_covariates(self):
-        """SGD should learn nonzero transition weights from covariates."""
+        """SGD should learn nonzero transition coefficients from covariates."""
         choices, rewards, true_states, _ = _simulate_block_bandit(
             n_trials=100, n_options=3, seed=42,
         )
         # Create a "reset" covariate that fires at the block boundary
         n_trials = len(choices)
         covariates = jnp.zeros((n_trials, 1))
-        covariates = covariates.at[n_trials // 2, 0].set(1.0)  # reset signal
+        covariates = covariates.at[n_trials // 2, 0].set(1.0)
 
-        model = ContingencyBeliefModel(
-            n_states=2, n_options=3, n_transition_covariates=1,
-        )
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
         lls = model.fit_sgd(
             choices, rewards,
             transition_covariates=covariates,
             num_steps=100,
         )
         assert lls[-1] > lls[0]
-        # Transition weights should be nonzero (learned from covariates)
-        assert model.transition_weights_ is not None
-        assert jnp.any(jnp.abs(model.transition_weights_) > 0.01)
+        # Coefficients should have > 1 row (intercept + covariate)
+        assert model.transition_coefficients_.shape[0] == 2
+        # Non-intercept coefficients should be nonzero
+        assert jnp.any(jnp.abs(model.transition_coefficients_[1:]) > 0.01)
 
     def test_fitted_state_attributes(self):
         """Model should populate state_posterior_ and smoothed_state_posterior_."""
