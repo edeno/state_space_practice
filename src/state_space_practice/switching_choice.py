@@ -287,9 +287,13 @@ def switching_choice_filter(
 
     init_discrete_prob = _stabilize_probability_vector(init_discrete_prob)
 
-    # --- First timestep: apply covariate prediction + observation update ---
-    # Apply full prediction at t=0 (decay + covariates + process noise)
-    # to match the non-switching CovariateChoiceModel convention.
+    # --- First timestep: predict + update (x₀ convention) ---
+    # This uses the x₀ convention (predict+update at t=0) to match the
+    # non-switching CovariateChoiceModel, NOT the x₁ convention used by
+    # switching_kalman_filter and switching_point_process_filter (which
+    # skip prediction at t=0). The x₀ convention means init_mean is
+    # the prior BEFORE the first observation, not AT it. The smoother
+    # still works because it only uses filter outputs, not the convention.
     def _first_update_for_state(prior_mean, prior_cov, beta, A_j, Q_j):
         pred_mean = A_j @ prior_mean + ig_arr @ cov_arr[0]
         pred_cov = A_j @ prior_cov @ A_j.T + Q_j
@@ -582,6 +586,12 @@ class SwitchingChoiceModel(SGDFittableMixin):
         Uses smoother quantities throughout (proper EM):
         - smoother_joint_discrete_state_prob for transition matrix
         - state_cond_smoother_means + smoother_discrete_state_prob for Q
+
+        Note: does NOT delegate to switching_kalman_maximization_step
+        because the choice model uses scalar per-state parameters
+        (decay, Q, beta) rather than full matrices. The maximization_step
+        expects matrix A/Q and returns matrices. Per-state beta and decay
+        have no closed-form M-step and are learned via SGD only.
         """
         gamma = smoother_result[2]  # smoothed discrete probs (T, S)
         joint = smoother_result[3]  # smoother joint (T-1, S, S)
