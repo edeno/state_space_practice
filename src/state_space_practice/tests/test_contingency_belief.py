@@ -319,3 +319,52 @@ class TestContingencyBeliefSGD:
 
         assert np.isfinite(model_em.log_likelihood_)
         assert np.isfinite(model_sgd.log_likelihood_)
+
+
+class TestContingencyBeliefIntegration:
+    """End-to-end integration tests on synthetic block-structured data."""
+
+    def test_em_recovers_block_structure(self):
+        """EM should recover which state is active in each block."""
+        choices, rewards, true_states, _ = _simulate_block_bandit(
+            n_trials=200, n_options=3, seed=42,
+        )
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.fit(choices, rewards, max_iter=30)
+
+        posterior = model.predict_state_posterior(choices, rewards)
+        # Find which model state corresponds to which true state
+        # (handle label permutation)
+        first_half_state = jnp.argmax(posterior[:50].mean(axis=0))
+        second_half_state = jnp.argmax(posterior[150:].mean(axis=0))
+        assert first_half_state != second_half_state
+
+    def test_sgd_recovers_block_structure(self):
+        """SGD should also recover the block structure."""
+        choices, rewards, true_states, _ = _simulate_block_bandit(
+            n_trials=200, n_options=3, seed=42,
+        )
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.fit_sgd(choices, rewards, num_steps=200)
+
+        posterior = model.predict_state_posterior(choices, rewards)
+        first_half_state = jnp.argmax(posterior[:50].mean(axis=0))
+        second_half_state = jnp.argmax(posterior[150:].mean(axis=0))
+        assert first_half_state != second_half_state
+
+    def test_reduces_to_stationary_with_zero_weights(self):
+        """With no covariates, should act like a standard HMM."""
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=60)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.fit(choices, rewards, max_iter=10)
+        # Transition matrix should be proper stochastic
+        trans = jax.nn.softmax(model.transition_logits_, axis=1)
+        np.testing.assert_allclose(trans.sum(axis=1), 1.0, atol=1e-6)
+
+    def test_three_state_model(self):
+        """Model with 3 states should fit without errors."""
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=100)
+        model = ContingencyBeliefModel(n_states=3, n_options=3)
+        lls = model.fit(choices, rewards, max_iter=15)
+        assert all(np.isfinite(ll) for ll in lls)
+        assert model.is_fitted
