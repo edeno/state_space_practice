@@ -1,8 +1,6 @@
-# Switching Choice Model: Strategy-Dependent Multi-Armed Bandit
+# Switching Choice Model: Strategy-Dependent Multi-Armed Bandit — COMPLETE
 
-> **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
->
-> **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.
+> **Status:** DONE as of 2026-04-09. All 4 tasks complete, 25 tests.
 
 **Goal:** Build a switching state-space choice model where discrete latent states represent behavioral strategies (e.g., exploit, explore, reset) that control how continuous option values evolve and drive choices. This bridges two existing approaches: the Julia lab's HMM (discrete contingency states with fixed reward tables) and our `CovariateChoiceModel` (continuous values with a single dynamics regime).
 

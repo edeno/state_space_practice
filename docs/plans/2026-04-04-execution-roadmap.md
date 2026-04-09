@@ -39,48 +39,62 @@ The following six plans are the current implementation priorities, ordered by in
 |---|---|---|---|---|---|
 | **P1** | sgd-fitting-all-models.md | **DONE** | — | Computational Improvements (DONE) | All model classes have fit_sgd() |
 | **P2** | contingency-belief-latent-task-state.md | **DONE** | — | Multinomial Choice (DONE) | Input-output HMM with EM + SGD |
-| **P3** | switching-choice-model.md | READY | Med | RL Covariates (DONE) + switching_kalman | Can start in parallel with P1-P2 |
+| **P2.5** | uncertainty-aware-behavioral-modeling.md | READY | Low-Med | RL Covariates (DONE) + Contingency Belief (DONE) | First-class uncertainty summaries + uncertainty-aware policy |
+| **P3** | switching-choice-model.md | **DONE** | — | RL Covariates (DONE) + switching_kalman | Per-state beta/Q/decay, GPB2 filter, EM + SGD |
 | **P4** | joint-learning-drift.md | SPECULATIVE | High | Smith + PlaceField + switching_kalman (all exist) | Prototype first; high integration complexity |
 | **P5** | adaptive-decoder.md | PARTIAL | Med | Position Decoding (DONE) | Can start in parallel with P1-P3 |
 | **P6** | regularized-oscillator-connectivity.md | **DONE** | — | SGD Fitting (P1, **DONE**) | Edge L1, area group L2, state-shared penalties |
 
 ### Parallelism Opportunities
 
-P1 through P5 have no mutual dependencies and can proceed in parallel:
+P2.5 can proceed as soon as P2 and the RL covariate work are complete. P3-P5 remain parallelizable:
 
 ```
-                    ┌─────────────────────────┐
-                    │  Completed Foundation    │
-                    │  (Stability, Comp Impr,  │
-                    │   Pos Dec, Choice, RL)   │
-                    └────────┬────────────────┘
-                             │
-     ┌───────────┬───────────┼───────────┬────────────┐
-     │           │           │           │            │
-     ▼           ▼           ▼           ▼            ▼
-  ┌──────┐  ┌──────┐   ┌──────┐   ┌──────┐     ┌──────┐
-  │ P1   │  │ P2   │   │ P3   │   │ P4   │     │ P5   │
-  │ SGD  │  │Contin│   │Switch│   │Joint │     │Adapt │
-  │Fittin│  │gency │   │Choice│   │Learn │     │Decode│
-  │  g   │  │Belief│   │Model │   │+Drift│     │  r   │
-  └──┬───┘  └──────┘   └──────┘   └──────┘     └──────┘
-     │
-     │ (after oscillator SGD tasks 5-6)
-     ▼
-  ┌──────┐
-  │ P6   │
-  │Regul.│
-  │Oscil.│
-  └──────┘
+                                ┌─────────────────────────┐
+                                │  Completed Foundation    │
+                                │  (Stability, Comp Impr,  │
+                                │   Pos Dec, Choice, RL)   │
+                                └────────┬────────────────┘
+                                               │
+                                ┌────────▼────────┐
+                                │      P2         │
+                                │  Contingency    │
+                                │    Belief       │
+                                └────────┬────────┘
+                                               │
+                                ┌────────▼────────┐
+                                │     P2.5        │
+                                │  Uncertainty    │
+                                │    Modeling     │
+                                └─────┬─────┬─────┘
+                                          │     │
+       ┌───────────┬────────┘     └───────────┬────────────┐
+       │           │                           │            │
+       ▼           ▼                           ▼            ▼
+  ┌──────┐   ┌──────┐                    ┌──────┐     ┌──────┐
+  │ P3   │   │ P4   │                    │ P5   │     │ P1   │
+  │Switch│   │Joint │                    │Adapt │     │ SGD  │
+  │Choice│   │Learn │                    │Decode│     │Fittin│
+  │Model │   │+Drift│                    │  r   │     │  g   │
+  └──────┘   └──────┘                    └──────┘     └──┬───┘
+                                                                                               │
+                                                                                               │ (after oscillator SGD tasks 5-6)
+                                                                                               ▼
+                                                                                          ┌──────┐
+                                                                                          │ P6   │
+                                                                                          │Regul.│
+                                                                                          │Oscil.│
+                                                                                          └──────┘
 ```
 
 ### Suggested Execution Strategy
 
 - **Phase A (parallel):** Start P1 (SGD Fitting) and P2 (Contingency Belief) simultaneously. P1 is the largest infrastructure investment and unblocks P6. P2 is a self-contained new module.
-- **Phase B (after P1 tasks 0-1 or P2):** Start P3 (Switching Choice) — benefits from seeing the SGD mixin pattern established.
-- **Phase C (after Phase A/B):** Start P5 (Adaptive Decoder) — independent but lower priority.
-- **Phase D (after P1 tasks 5-6):** Start P6 (Regularized Oscillator) — blocked until oscillator SGD exists.
-- **Phase E (after Phase A/B validation):** Start P4 (Joint Learning+Drift) — SPECULATIVE, prototype-first. Benefits from infrastructure maturity.
+- **Phase B (after P2):** Start P2.5 (Uncertainty-Aware Behavioral Modeling) — low-risk leverage on existing posterior quantities and the cleanest scientist-facing output upgrade.
+- **Phase C (after P2 or P2.5):** Start P3 (Switching Choice) — benefits from uncertainty summaries already existing for later state-dependent policies.
+- **Phase D (after Phase A/B/C):** Start P5 (Adaptive Decoder) — independent but lower priority.
+- **Phase E (after P1 tasks 5-6):** Start P6 (Regularized Oscillator) — blocked until oscillator SGD exists.
+- **Phase F (after Phase B/C validation):** Start P4 (Joint Learning+Drift) — SPECULATIVE, prototype-first. Benefits from uncertainty-aware behavioral outputs.
 
 ## Dependency Graph (Full)
 
@@ -173,6 +187,7 @@ Order 0.6: **DONE.** SGD fitting mixin for all model classes. SGDFittableMixin w
 | 3 | multinomial-choice-model.md | READY | Low-Med | 2-3 weeks | None | **DONE** |
 | 3.5 | rl-state-space-covariates.md | READY | Low-Med | 1-2 weeks | Multinomial Choice | **DONE** |
 | 3.6 | contingency-belief-latent-task-state.md | PARTIAL | Medium | 2-3 weeks | Multinomial Choice | **P2** |
+| 3.65 | uncertainty-aware-behavioral-modeling.md | READY | Low-Med | 1-2 weeks | RL Covariates + Contingency Belief | **P2.5** |
 | 3.7 | switching-choice-model.md | READY | Medium | 1-2 weeks | RL Covariates + Switching Kalman | **P3** |
 | 4 | joint-belief-state-decoder.md | PARTIAL | Medium | 2-3 weeks | Multinomial Choice | Not started (deferred) |
 | 5 | adaptive-decoder.md | PARTIAL | Medium | 2 weeks | Position Decoding | **P5** |
@@ -217,6 +232,7 @@ Claim: "CA1 alternates between local and nonlocal represented content, and laten
 - **P1 (SGD Fitting)** is **DONE** — all model classes have `fit_sgd()`.
 - **P6 (Regularized Oscillator)** is **DONE** — edge L1, area group L2, state-shared group L2 penalties on DIM coupling.
 - **P2 (Contingency Belief)** is **DONE** — input-output HMM with centered softmax, Dirichlet prior, design-matrix transitions, EM + SGD.
+- **P2.5 (Uncertainty-Aware Behavioral Modeling)** is the next low-risk behavioral upgrade — it exposes uncertainty summaries as first-class outputs and adds an uncertainty-sensitive policy path that will transfer naturally to switching models later.
 - **P3 (Switching Choice)** is the first switching behavioral model with per-state value dynamics.
 - **P4 (Joint Learning+Drift)** is SPECULATIVE but scientifically important — links learning rate and representational drift through shared discrete states.
 - **P5 (Adaptive Decoder)** enables long-duration decoding without retraining.
