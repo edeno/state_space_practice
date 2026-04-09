@@ -471,3 +471,70 @@ class TestInputValidation:
 
         with pytest.raises(ValueError, match="2D"):
             model.fit(wrong_spikes, max_iter=1, key=jax.random.PRNGKey(0))
+
+
+class TestSwitchingPPSGDFitting:
+    """Tests for switching point-process SGD fitting."""
+
+    @pytest.fixture
+    def com_pp_setup(self):
+        from state_space_practice.simulate.scenarios import simulate_com_pp_scenario
+
+        scenario = simulate_com_pp_scenario(n_time=100, seed=42)
+        p = scenario["params"]
+        model = CommonOscillatorPointProcessModel(
+            n_oscillators=p["n_oscillators"],
+            n_neurons=p["n_neurons"],
+            n_discrete_states=p["n_discrete_states"],
+            sampling_freq=p["sampling_freq"],
+            dt=p["dt"],
+            freqs=p["freqs"],
+            auto_regressive_coef=p["damping"],
+            process_variance=p["process_variance"],
+        )
+        return model, scenario["spikes"]
+
+    @pytest.fixture
+    def dim_pp_setup(self):
+        from state_space_practice.simulate.scenarios import simulate_dim_pp_scenario
+
+        scenario = simulate_dim_pp_scenario(n_time=100, seed=42)
+        p = scenario["params"]
+        model = DirectedInfluencePointProcessModel(
+            n_oscillators=p["n_oscillators"],
+            n_neurons=p["n_neurons"],
+            n_discrete_states=p["n_discrete_states"],
+            sampling_freq=p["sampling_freq"],
+            dt=p["dt"],
+            freqs=p["freqs"],
+            auto_regressive_coef=p["damping"],
+            process_variance=p["process_variance"],
+            phase_difference=p["phase_difference"],
+            coupling_strength=p["coupling_strength"],
+        )
+        return model, scenario["spikes"]
+
+    def test_com_pp_sgd_improves_ll(self, com_pp_setup):
+        model, spikes = com_pp_setup
+        key = jax.random.PRNGKey(0)
+        lls = model.fit_sgd(spikes, key=key, num_steps=20)
+        assert lls[-1] > lls[0]
+
+    def test_com_pp_sgd_populates_smoother(self, com_pp_setup):
+        model, spikes = com_pp_setup
+        key = jax.random.PRNGKey(0)
+        model.fit_sgd(spikes, key=key, num_steps=10)
+        assert model.smoother_state_cond_mean is not None
+
+    def test_dim_pp_sgd_improves_ll(self, dim_pp_setup):
+        model, spikes = dim_pp_setup
+        key = jax.random.PRNGKey(0)
+        lls = model.fit_sgd(spikes, key=key, num_steps=20)
+        assert lls[-1] > lls[0]
+
+    def test_dim_pp_sgd_coupling_finite(self, dim_pp_setup):
+        model, spikes = dim_pp_setup
+        key = jax.random.PRNGKey(0)
+        model.fit_sgd(spikes, key=key, num_steps=10)
+        assert jnp.all(jnp.isfinite(model.coupling_strength))
+        assert jnp.all(jnp.isfinite(model.phase_difference))

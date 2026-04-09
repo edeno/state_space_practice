@@ -1437,3 +1437,38 @@ class TestDirectedInfluenceSGDFitting:
         model.fit_sgd(obs, key=key, num_steps=20)
         Z = model.discrete_transition_matrix
         np.testing.assert_allclose(Z.sum(axis=1), 1.0, atol=1e-6)
+
+
+class TestCorrelatedNoiseSGDFitting:
+    """Tests for CorrelatedNoiseModel.fit_sgd()."""
+
+    @pytest.fixture
+    def cnm_setup(self):
+        from state_space_practice.simulate.scenarios import simulate_cnm_scenario
+
+        scenario = simulate_cnm_scenario(n_time=200, seed=42)
+        p = scenario["params"]
+        model = CorrelatedNoiseModel(
+            n_oscillators=p["n_oscillators"],
+            n_discrete_states=p["n_discrete_states"],
+            sampling_freq=p["sampling_freq"],
+            freqs=p["freqs"],
+            auto_regressive_coef=p["damping"],
+            process_variance=p["process_variance"],
+            measurement_variance=p["measurement_variance"],
+            phase_difference=p["phase_difference"],
+            coupling_strength=p["coupling_strength"],
+        )
+        return model, scenario["obs"]
+
+    def test_sgd_improves_ll(self, cnm_setup):
+        model, obs = cnm_setup
+        key = jax.random.PRNGKey(0)
+        lls = model.fit_sgd(obs, key=key, num_steps=30)
+        assert lls[-1] > lls[0]
+
+    def test_sgd_process_variance_positive(self, cnm_setup):
+        model, obs = cnm_setup
+        key = jax.random.PRNGKey(0)
+        model.fit_sgd(obs, key=key, num_steps=20)
+        assert jnp.all(model.process_variance > 0)

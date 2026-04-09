@@ -53,12 +53,13 @@ from state_space_practice.switching_point_process import (
     switching_point_process_filter,
     update_spike_glm_params,
 )
+from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import check_converged, make_discrete_transition_matrix
 
 logger = logging.getLogger(__name__)
 
 
-class BaseSwitchingPointProcessModel(ABC):
+class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
     """Abstract base class for switching oscillator models with spike observations.
 
     This class provides the core EM machinery for switching linear dynamical
@@ -990,6 +991,137 @@ class BaseSwitchingPointProcessModel(ABC):
 
         return best_lls
 
+    # --- SGDFittableMixin protocol (shared by all switching PP subclasses) ---
+
+    def fit_sgd(
+        self,
+        spikes: Array,
+        key: Optional[Array] = None,
+        optimizer: Optional[object] = None,
+        num_steps: int = 200,
+        verbose: bool = False,
+        convergence_tol: Optional[float] = None,
+    ) -> list[float]:
+        """Fit by minimizing negative marginal LL via gradient descent.
+
+        Parameters
+        ----------
+        spikes : Array, shape (n_time, n_neurons)
+            Observed spike counts.
+        key : Array or None
+            JAX random key for initialization. Required on first call.
+        optimizer : optax optimizer or None
+            Default: adam(1e-2) with gradient clipping.
+        num_steps : int
+            Number of optimization steps.
+        verbose : bool
+            Log progress every 10 steps.
+        convergence_tol : float or None
+            If set, stop early when |ΔLL| < tol for 5 consecutive steps.
+
+        Returns
+        -------
+        log_likelihoods : list of float
+        """
+        spikes = jnp.asarray(spikes)
+        self._sgd_n_time = spikes.shape[0]
+
+        if not self._is_initialized():
+            if key is None:
+                raise ValueError("key required for initialization on first call")
+            self._initialize_parameters(key)
+            self._warm_initialize_states(spikes)
+
+        return super().fit_sgd(
+            spikes,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+        )
+
+    def _is_initialized(self) -> bool:
+        return (
+            hasattr(self, "continuous_transition_matrix")
+            and self.continuous_transition_matrix is not None
+            and hasattr(self, "spike_params")
+            and self.spike_params is not None
+        )
+
+    @property
+    def _n_timesteps(self) -> int:
+        return self._sgd_n_time
+
+    def _check_sgd_initialized(self) -> None:
+        if not self._is_initialized():
+            raise RuntimeError(
+                "Call fit_sgd(spikes, key=...) to initialize parameters."
+            )
+
+    def _store_sgd_params(self, params: dict) -> None:
+        if "discrete_transition_matrix" in params:
+            self.discrete_transition_matrix = params["discrete_transition_matrix"]
+        if "init_mean" in params:
+            self.init_mean = params["init_mean"]
+        if "spike_baseline" in params:
+            self.spike_params = SpikeObsParams(
+                baseline=params["spike_baseline"],
+                weights=params.get("spike_weights", self.spike_params.weights),
+            )
+        if "spike_weights" in params and "spike_baseline" not in params:
+            self.spike_params = SpikeObsParams(
+                baseline=self.spike_params.baseline,
+                weights=params["spike_weights"],
+            )
+        # Per-state arrays reconstructed by subclasses
+
+    def _finalize_sgd(self, spikes: Array) -> None:
+        self._e_step(spikes)
+
+    def _sgd_loss_fn(self, params: dict, spikes: Array) -> Array:
+        """Compute negative marginal LL for SGD. Subclasses can override."""
+        Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
+        m0 = params.get("init_mean", self.init_mean)
+        A = params.get("_A", self.continuous_transition_matrix)
+        Q = params.get("_Q", self.process_cov)
+
+        baseline = params.get("spike_baseline", self.spike_params.baseline)
+        weights = params.get("spike_weights", self.spike_params.weights)
+        sp = SpikeObsParams(baseline=baseline, weights=weights)
+
+        P0 = self._reconstruct_per_state_array(
+            params, "init_cov", self.init_cov
+        )
+
+        def log_int(state, p):
+            return p.baseline + p.weights @ state
+
+        result = switching_point_process_filter(
+            init_state_cond_mean=m0,
+            init_state_cond_cov=P0,
+            init_discrete_state_prob=self.init_discrete_state_prob,
+            spikes=spikes,
+            discrete_transition_matrix=Z,
+            continuous_transition_matrix=A,
+            process_cov=Q,
+            dt=self.dt,
+            log_intensity_func=log_int,
+            spike_params=sp,
+        )
+        return -result[5]
+
+    def _reconstruct_per_state_array(
+        self, params: dict, prefix: str, fallback: Array
+    ) -> Array:
+        """Reconstruct a (…, n_discrete_states) array from per-state params."""
+        if not any(k.startswith(f"{prefix}_") for k in params):
+            return fallback
+        return jnp.stack(
+            [params.get(f"{prefix}_{j}", fallback[..., j])
+             for j in range(self.n_discrete_states)],
+            axis=-1,
+        )
+
 
 # ==========================================================================
 # Common Oscillator Model (COM-PP)
@@ -1162,6 +1294,44 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
     def _project_parameters(self) -> None:
         """No projection needed — A and Q are not updated."""
         pass
+
+    def _build_param_spec(self) -> tuple[dict, dict]:
+        from state_space_practice.parameter_transforms import (
+            PSD_MATRIX,
+            STOCHASTIC_ROW,
+            UNCONSTRAINED,
+        )
+
+        params: dict = {}
+        spec: dict = {}
+
+        if self.update_spike_params:
+            params["spike_baseline"] = self.spike_params.baseline
+            spec["spike_baseline"] = UNCONSTRAINED
+            params["spike_weights"] = self.spike_params.weights
+            spec["spike_weights"] = UNCONSTRAINED
+
+        if self.update_discrete_transition_matrix:
+            params["discrete_transition_matrix"] = self.discrete_transition_matrix
+            spec["discrete_transition_matrix"] = STOCHASTIC_ROW
+
+        if self.update_init_mean:
+            params["init_mean"] = self.init_mean
+            spec["init_mean"] = UNCONSTRAINED
+
+        if self.update_init_cov:
+            for j in range(self.n_discrete_states):
+                k = f"init_cov_{j}"
+                params[k] = self.init_cov[..., j]
+                spec[k] = PSD_MATRIX
+
+        return params, spec
+
+    def _store_sgd_params(self, params: dict) -> None:
+        super()._store_sgd_params(params)
+        self.init_cov = self._reconstruct_per_state_array(
+            params, "init_cov", self.init_cov
+        )
 
 
 # ==========================================================================
@@ -1601,7 +1771,10 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             else:
                 A_j = A_proj_j
 
-            # Enforce spectral radius < 1 for stability
+            # Enforce spectral radius < 1 for stability (unconditional).
+            # Stability is a hard physical constraint: an unstable A causes
+            # state divergence and invalidates the E-step posteriors. Unlike
+            # the block structure projection above, this is not optional.
             max_spectral_radius = 0.99
             eigvals = jnp.linalg.eigvals(A_j)
             spectral_radius = jnp.max(jnp.abs(eigvals))
@@ -1610,19 +1783,89 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
                 max_spectral_radius / spectral_radius,
                 1.0,
             )
-            A_scaled = A_j * scale
-
-            # Only accept scaling if it doesn't worsen Q-function
-            if suff_stats is not None:
-                q_scaled = compute_transition_q_function(
-                    A_scaled, gamma1_j, beta_j
-                )
-                q_before = compute_transition_q_function(
-                    A_j, gamma1_j, beta_j
-                )
-                A_j = jnp.where(q_scaled <= q_before, A_scaled, A_j)
-            else:
-                A_j = A_scaled
+            A_j = A_j * scale
 
             projected.append(A_j)
         self.continuous_transition_matrix = jnp.stack(projected, axis=-1)
+
+    # --- SGDFittableMixin: DIM-PP specific ---
+
+    def _build_param_spec(self) -> tuple[dict, dict]:
+        from state_space_practice.parameter_transforms import (
+            PSD_MATRIX,
+            STOCHASTIC_ROW,
+            UNCONSTRAINED,
+        )
+
+        params: dict = {}
+        spec: dict = {}
+
+        if self.update_continuous_transition_matrix:
+            params["phase_difference"] = self.phase_difference
+            spec["phase_difference"] = UNCONSTRAINED
+            params["coupling_strength"] = self.coupling_strength
+            spec["coupling_strength"] = UNCONSTRAINED
+
+        if self.update_spike_params:
+            params["spike_baseline"] = self.spike_params.baseline
+            spec["spike_baseline"] = UNCONSTRAINED
+            params["spike_weights"] = self.spike_params.weights
+            spec["spike_weights"] = UNCONSTRAINED
+
+        if self.update_discrete_transition_matrix:
+            params["discrete_transition_matrix"] = self.discrete_transition_matrix
+            spec["discrete_transition_matrix"] = STOCHASTIC_ROW
+
+        if self.update_init_mean:
+            params["init_mean"] = self.init_mean
+            spec["init_mean"] = UNCONSTRAINED
+
+        if self.update_init_cov:
+            for j in range(self.n_discrete_states):
+                k = f"init_cov_{j}"
+                params[k] = self.init_cov[..., j]
+                spec[k] = PSD_MATRIX
+
+        return params, spec
+
+    def _sgd_loss_fn(self, params: dict, spikes: jax.Array) -> jax.Array:
+        phase_diff = params.get("phase_difference", self.phase_difference)
+        coupling = params.get("coupling_strength", self.coupling_strength)
+
+        A_list = []
+        for j in range(self.n_discrete_states):
+            A_j = construct_directed_influence_transition_matrix(
+                freqs=self.freqs,
+                damping_coeffs=self.auto_regressive_coef,
+                phase_diffs=phase_diff[..., j],
+                coupling_strengths=coupling[..., j],
+                sampling_freq=self.sampling_freq,
+            )
+            A_list.append(A_j)
+
+        # Inject reconstructed A into the base loss function via params
+        params_with_A = dict(params)
+        params_with_A["_A"] = jnp.stack(A_list, axis=-1)
+        return super()._sgd_loss_fn(params_with_A, spikes)
+
+    def _store_sgd_params(self, params: dict) -> None:
+        super()._store_sgd_params(params)
+        if "phase_difference" in params:
+            self.phase_difference = params["phase_difference"]
+        if "coupling_strength" in params:
+            self.coupling_strength = params["coupling_strength"]
+        if "phase_difference" in params or "coupling_strength" in params:
+            A_list = []
+            for j in range(self.n_discrete_states):
+                A_j = construct_directed_influence_transition_matrix(
+                    freqs=self.freqs,
+                    damping_coeffs=self.auto_regressive_coef,
+                    phase_diffs=self.phase_difference[..., j],
+                    coupling_strengths=self.coupling_strength[..., j],
+                    sampling_freq=self.sampling_freq,
+                )
+                A_list.append(A_j)
+            self.continuous_transition_matrix = jnp.stack(A_list, axis=-1)
+        self.init_cov = self._reconstruct_per_state_array(
+            params, "init_cov", self.init_cov
+        )

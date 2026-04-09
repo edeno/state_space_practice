@@ -7947,3 +7947,37 @@ class TestGPB2Smoother:
         assert len(lls) == 3
         for ll in lls:
             assert jnp.isfinite(ll), f"LL should be finite, got {ll}"
+
+
+class TestSwitchingSpikeOscillatorSGD:
+    """Tests for SwitchingSpikeOscillatorModel.fit_sgd()."""
+
+    def test_sgd_improves_ll(self):
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2, n_neurons=4, n_discrete_states=2,
+            sampling_freq=100.0, dt=0.01,
+        )
+        key = jax.random.PRNGKey(42)
+        spikes = jax.random.poisson(key, jnp.ones((100, 4)) * 0.01)
+        lls = model.fit_sgd(spikes, key=key, num_steps=15)
+        assert len(lls) > 1
+        assert lls[-1] > lls[0]
+
+    def test_sgd_params_finite(self):
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2, n_neurons=4, n_discrete_states=2,
+            sampling_freq=100.0, dt=0.01,
+        )
+        key = jax.random.PRNGKey(42)
+        spikes = jax.random.poisson(key, jnp.ones((100, 4)) * 0.01)
+        model.fit_sgd(spikes, key=key, num_steps=10)
+        assert jnp.all(jnp.isfinite(model.continuous_transition_matrix))
+        assert jnp.all(jnp.isfinite(model.spike_params.baseline))

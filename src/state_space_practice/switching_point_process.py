@@ -89,6 +89,7 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.kalman import symmetrize
+from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.oscillator_utils import (
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
@@ -236,16 +237,26 @@ def _select_spike_params(
 
 @dataclass
 class QRegularizationConfig:
-    """Configuration for trust-region regularization of process covariances.
+    """Configuration for trust-region regularization of dynamics covariances.
+
+    Controls regularization of both process covariance (Q) and initial state
+    covariance (init_cov) during the M-step. Trust-region blending and
+    eigenvalue clipping prevent the GPB1 smoother's backward collapse from
+    creating a positive feedback loop through init_cov.
 
     Parameters
     ----------
     trust_region_weight : float
-        Blend factor for new Q estimate: Q = w * new_Q + (1 - w) * old_Q.
+        Blend factor for new estimates: P = w * new_P + (1 - w) * old_P.
+        Applied to both Q and init_cov.
     min_eigenvalue : float | None
         Lower bound for eigenvalues. None disables lower clipping.
     max_eigenvalue : float | None
-        Upper bound for eigenvalues. None disables upper clipping.
+        Upper bound for Q eigenvalues. None disables upper clipping.
+    init_cov_max_eigenvalue : float | None
+        Upper bound for init_cov eigenvalues. More lenient than Q's cap
+        since init_cov represents prior uncertainty about the initial state,
+        which can legitimately exceed per-step process noise. None disables.
     enabled : bool
         Whether to apply trust-region regularization and eigenvalue clipping.
     """
@@ -253,6 +264,7 @@ class QRegularizationConfig:
     trust_region_weight: float = 0.3  # More conservative blending
     min_eigenvalue: float | None = 0.01  # Process noise floor to prevent collapse
     max_eigenvalue: float | None = 1.0  # Prevent explosion
+    init_cov_max_eigenvalue: float | None = 10.0  # Prevent GPB1 feedback loop
     enabled: bool = True
 
 
@@ -1666,7 +1678,7 @@ def switching_point_process_filter(
     )
 
 
-class SwitchingSpikeOscillatorModel:
+class SwitchingSpikeOscillatorModel(SGDFittableMixin):
     """Switching oscillator network with spike-based observations.
 
     This model combines:
@@ -2366,9 +2378,13 @@ class SwitchingSpikeOscillatorModel:
         This method must be called after `_e_step()` which populates the smoother
         output attributes used here.
 
-        The process covariance Q can be regularized via a trust-region blend and
-        eigenvalue clipping (see ``QRegularizationConfig``) to stabilize updates
-        when the Laplace-EKF approximation produces unreliable estimates.
+        The process covariance Q and initial covariance P0 can be regularized
+        via a trust-region blend and eigenvalue clipping (see
+        ``QRegularizationConfig``) to stabilize updates when the Laplace-EKF
+        approximation produces unreliable estimates. The P0 regularization is
+        particularly important for the GPB1 smoother, whose backward collapse
+        step inflates the smoother covariance at t=0, creating a positive
+        feedback loop through init_cov if left unchecked.
 
         The measurement_matrix and measurement_cov returns from
         `switching_kalman_maximization_step` are ignored since they assume
@@ -2442,6 +2458,35 @@ class SwitchingSpikeOscillatorModel:
 
         # Update initial covariance if flag is True
         if self.update_init_cov:
+            # The GPB1 smoother backward collapse inflates the covariance at
+            # t=0 well beyond the filter covariance. This inflated value, when
+            # used directly as init_cov for the next EM iteration, creates a
+            # positive feedback loop: large init_cov → weak filter constraint
+            # → even larger smoother cov → even larger init_cov. Apply
+            # trust-region blending and eigenvalue clipping to break
+            # this cycle.
+            cfg = self.q_regularization
+            if cfg.enabled:
+                init_cov_blended = (
+                    cfg.trust_region_weight * new_init_cov
+                    + (1 - cfg.trust_region_weight) * self.init_cov
+                )
+
+                def _clip_init_cov(P: Array) -> Array:
+                    P = symmetrize(P)
+                    eigvals, eigvecs = jnp.linalg.eigh(P)
+                    if cfg.min_eigenvalue is not None:
+                        eigvals = jnp.maximum(eigvals, cfg.min_eigenvalue)
+                    if cfg.init_cov_max_eigenvalue is not None:
+                        eigvals = jnp.minimum(
+                            eigvals, cfg.init_cov_max_eigenvalue
+                        )
+                    return eigvecs @ jnp.diag(eigvals) @ eigvecs.T
+
+                new_init_cov = jax.vmap(
+                    _clip_init_cov, in_axes=-1, out_axes=-1
+                )(init_cov_blended)
+
             self.init_cov = new_init_cov
 
         # Always update initial discrete state probabilities
@@ -2692,6 +2737,7 @@ class SwitchingSpikeOscillatorModel:
         spikes: ArrayLike,
         max_iter: int = 50,
         tol: float = 1e-4,
+        decrease_tol: float = 1e-2,
         key: Array | None = None,
         skip_init: bool = False,
     ) -> list[float]:
@@ -2713,6 +2759,10 @@ class SwitchingSpikeOscillatorModel:
             change in log-likelihood is less than `tol`:
                 |LL_new - LL_old| / avg < tol
             where avg = (|LL_new| + |LL_old|) / 2.
+        decrease_tol : float, default=1e-2
+            Tolerance for LL decrease detection. The Laplace-EKF E-step is
+            approximate, so small LL decreases are expected. Only roll back
+            and stop when the relative decrease exceeds this threshold.
         key : Array | None, optional
             JAX random key for parameter initialization. If None, uses PRNGKey(0).
         skip_init : bool, default=False
@@ -2849,10 +2899,21 @@ class SwitchingSpikeOscillatorModel:
 
             # Check convergence and LL decrease (after at least 2 iterations)
             if iteration > 0:
-                is_converged, is_increasing = check_converged(
+                is_converged, _ = check_converged(
                     log_likelihood=log_likelihoods[-1],
                     previous_log_likelihood=log_likelihoods[-2],
                     tolerance=tol,
+                )
+
+                # Use a lenient tolerance for the LL decrease check.
+                # The Laplace-EKF E-step is approximate, so small LL
+                # decreases (~0.1%) are expected and acceptable. Only
+                # roll back on substantial decreases that indicate true
+                # divergence, not Laplace approximation noise.
+                _, is_increasing = check_converged(
+                    log_likelihood=log_likelihoods[-1],
+                    previous_log_likelihood=log_likelihoods[-2],
+                    tolerance=decrease_tol,
                 )
 
                 if not is_increasing and prev_params is not None:
@@ -2881,3 +2942,166 @@ class SwitchingSpikeOscillatorModel:
             self._project_parameters()
 
         return log_likelihoods
+
+    # --- SGDFittableMixin protocol ---
+
+    def fit_sgd(
+        self,
+        spikes,
+        key=None,
+        optimizer=None,
+        num_steps=200,
+        verbose=False,
+        convergence_tol=None,
+    ):
+        """Fit by minimizing negative marginal LL via gradient descent.
+
+        Parameters
+        ----------
+        spikes : Array, shape (n_time, n_neurons)
+        key : Array or None
+            JAX random key for initialization on first call.
+        optimizer : optax optimizer or None
+        num_steps : int
+        verbose : bool
+        convergence_tol : float or None
+
+        Returns
+        -------
+        log_likelihoods : list of float
+        """
+        spikes = jnp.asarray(spikes)
+        self._sgd_n_time = spikes.shape[0]
+
+        if not hasattr(self, "continuous_transition_matrix") or \
+           self.continuous_transition_matrix is None:
+            if key is None:
+                raise ValueError("key required for initialization")
+            self._initialize_parameters(key)
+
+        return super().fit_sgd(
+            spikes,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+        )
+
+    @property
+    def _n_timesteps(self):
+        return self._sgd_n_time
+
+    def _check_sgd_initialized(self):
+        if not hasattr(self, "continuous_transition_matrix") or \
+           self.continuous_transition_matrix is None:
+            raise RuntimeError("Call fit_sgd(spikes, key=...) first.")
+
+    def _build_param_spec(self):
+        from state_space_practice.parameter_transforms import (
+            PSD_MATRIX,
+            STOCHASTIC_ROW,
+            UNCONSTRAINED,
+        )
+
+        params = {}
+        spec = {}
+
+        if self.update_continuous_transition_matrix:
+            # Raw A matrices (no oscillator structure enforced)
+            for j in range(self.n_discrete_states):
+                k = f"A_{j}"
+                params[k] = self.continuous_transition_matrix[..., j]
+                spec[k] = UNCONSTRAINED
+
+        if self.update_process_cov:
+            for j in range(self.n_discrete_states):
+                k = f"Q_{j}"
+                params[k] = self.process_cov[..., j]
+                spec[k] = PSD_MATRIX
+
+        if self.update_spike_params:
+            params["spike_baseline"] = self.spike_params.baseline
+            spec["spike_baseline"] = UNCONSTRAINED
+            params["spike_weights"] = self.spike_params.weights
+            spec["spike_weights"] = UNCONSTRAINED
+
+        if self.update_discrete_transition_matrix:
+            params["discrete_transition_matrix"] = self.discrete_transition_matrix
+            spec["discrete_transition_matrix"] = STOCHASTIC_ROW
+
+        if self.update_init_mean:
+            params["init_mean"] = self.init_mean
+            spec["init_mean"] = UNCONSTRAINED
+
+        if self.update_init_cov:
+            for j in range(self.n_discrete_states):
+                k = f"init_cov_{j}"
+                params[k] = self.init_cov[..., j]
+                spec[k] = PSD_MATRIX
+
+        return params, spec
+
+    def _sgd_loss_fn(self, params, spikes):
+        Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
+        m0 = params.get("init_mean", self.init_mean)
+
+        baseline = params.get("spike_baseline", self.spike_params.baseline)
+        weights = params.get("spike_weights", self.spike_params.weights)
+        sp = SpikeObsParams(baseline=baseline, weights=weights)
+
+        # Reconstruct per-state arrays
+        def _recon(prefix, fallback):
+            if not any(k.startswith(f"{prefix}_") for k in params):
+                return fallback
+            return jnp.stack(
+                [params.get(f"{prefix}_{j}", fallback[..., j])
+                 for j in range(self.n_discrete_states)],
+                axis=-1,
+            )
+
+        A = _recon("A", self.continuous_transition_matrix)
+        Q = _recon("Q", self.process_cov)
+        P0 = _recon("init_cov", self.init_cov)
+
+        def log_int(state, p):
+            return p.baseline + p.weights @ state
+
+        result = switching_point_process_filter(
+            init_state_cond_mean=m0,
+            init_state_cond_cov=P0,
+            init_discrete_state_prob=self.init_discrete_state_prob,
+            spikes=spikes,
+            discrete_transition_matrix=Z,
+            continuous_transition_matrix=A,
+            process_cov=Q,
+            dt=self.dt,
+            log_intensity_func=log_int,
+            spike_params=sp,
+        )
+        return -result[5]
+
+    def _store_sgd_params(self, params):
+        if "discrete_transition_matrix" in params:
+            self.discrete_transition_matrix = params["discrete_transition_matrix"]
+        if "init_mean" in params:
+            self.init_mean = params["init_mean"]
+        if "spike_baseline" in params or "spike_weights" in params:
+            self.spike_params = SpikeObsParams(
+                baseline=params.get("spike_baseline", self.spike_params.baseline),
+                weights=params.get("spike_weights", self.spike_params.weights),
+            )
+
+        def _store_recon(prefix, attr):
+            if any(k.startswith(f"{prefix}_") for k in params):
+                setattr(self, attr, jnp.stack(
+                    [params.get(f"{prefix}_{j}", getattr(self, attr)[..., j])
+                     for j in range(self.n_discrete_states)],
+                    axis=-1,
+                ))
+
+        _store_recon("A", "continuous_transition_matrix")
+        _store_recon("Q", "process_cov")
+        _store_recon("init_cov", "init_cov")
+
+    def _finalize_sgd(self, spikes):
+        self._e_step(spikes)

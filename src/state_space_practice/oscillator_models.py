@@ -1082,6 +1082,100 @@ class CorrelatedNoiseModel(BaseModel):
             )
         return super().fit(observations, key, max_iter, tolerance)
 
+    # --- SGDFittableMixin: CNM-specific param spec and loss ---
+
+    def _build_param_spec(self) -> tuple[dict, dict]:
+        from state_space_practice.parameter_transforms import (
+            PSD_MATRIX,
+            POSITIVE,
+            STOCHASTIC_ROW,
+            UNCONSTRAINED,
+        )
+
+        params: dict = {}
+        spec: dict = {}
+
+        if self.update_process_cov:
+            params["process_variance"] = self.process_variance
+            spec["process_variance"] = POSITIVE
+            params["phase_difference"] = self.phase_difference
+            spec["phase_difference"] = UNCONSTRAINED
+            params["coupling_strength"] = self.coupling_strength
+            spec["coupling_strength"] = UNCONSTRAINED
+
+        if self.update_discrete_transition_matrix:
+            params["discrete_transition_matrix"] = self.discrete_transition_matrix
+            spec["discrete_transition_matrix"] = STOCHASTIC_ROW
+
+        if self.update_init_mean:
+            params["init_mean"] = self.init_mean
+            spec["init_mean"] = UNCONSTRAINED
+
+        if self.update_init_cov:
+            for j in range(self.n_discrete_states):
+                k = f"init_cov_{j}"
+                params[k] = self.init_cov[..., j]
+                spec[k] = PSD_MATRIX
+
+        return params, spec
+
+    def _sgd_loss_fn(self, params: dict, observations: Array) -> Array:
+        Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
+        m0 = params.get("init_mean", self.init_mean)
+        P0 = self._reconstruct_per_state_array(params, "init_cov", self.init_cov)
+
+        # Reconstruct per-state Q from scientific params
+        proc_var = params.get("process_variance", self.process_variance)
+        phase_diff = params.get("phase_difference", self.phase_difference)
+        coupling = params.get("coupling_strength", self.coupling_strength)
+
+        Q_list = []
+        for j in range(self.n_discrete_states):
+            Q_j = construct_correlated_noise_process_covariance(
+                variance=proc_var if proc_var.ndim == 1 else proc_var[:, j],
+                phase_difference=phase_diff[..., j],
+                coupling_strength=coupling[..., j],
+            )
+            Q_list.append(Q_j)
+        Q = jnp.stack(Q_list, axis=-1)
+
+        result = switching_kalman_filter(
+            init_state_cond_mean=m0,
+            init_state_cond_cov=P0,
+            init_discrete_state_prob=self.init_discrete_state_prob,
+            obs=observations,
+            discrete_transition_matrix=Z,
+            continuous_transition_matrix=self.continuous_transition_matrix,
+            process_cov=Q,
+            measurement_matrix=self.measurement_matrix,
+            measurement_cov=self.measurement_cov,
+        )
+        return -result[5]
+
+    def _store_sgd_params(self, params: dict) -> None:
+        super()._store_sgd_params(params)
+        if "process_variance" in params:
+            self.process_variance = params["process_variance"]
+        if "phase_difference" in params:
+            self.phase_difference = params["phase_difference"]
+        if "coupling_strength" in params:
+            self.coupling_strength = params["coupling_strength"]
+        # Reconstruct Q from updated params
+        if any(k in params for k in ("process_variance", "phase_difference", "coupling_strength")):
+            Q_list = []
+            for j in range(self.n_discrete_states):
+                pv = self.process_variance
+                Q_j = construct_correlated_noise_process_covariance(
+                    variance=pv if pv.ndim == 1 else pv[:, j],
+                    phase_difference=self.phase_difference[..., j],
+                    coupling_strength=self.coupling_strength[..., j],
+                )
+                Q_list.append(Q_j)
+            self.process_cov = jnp.stack(Q_list, axis=-1)
+        self.init_cov = self._reconstruct_per_state_array(
+            params, "init_cov", self.init_cov
+        )
+
 
 class DirectedInfluenceModel(BaseModel):
     """Directed Influence Model (DIM).
