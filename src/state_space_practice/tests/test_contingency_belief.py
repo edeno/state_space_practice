@@ -544,7 +544,7 @@ class TestObservationDesignMatrix:
         """predict_state_posterior should use obs_design_matrix."""
         choices, rewards, _, _ = _simulate_block_bandit(n_trials=60)
         obs_dm = jnp.zeros((60, 1))
-        obs_dm = obs_dm.at[30:, 0].set(1.0)  # obs covariate active in second half
+        obs_dm = obs_dm.at[30:, 0].set(1.0)
 
         model = ContingencyBeliefModel(
             n_states=2, n_options=3, n_obs_covariates=1,
@@ -559,3 +559,29 @@ class TestObservationDesignMatrix:
         )
         assert posterior.shape == (60, 2)
         np.testing.assert_allclose(posterior.sum(axis=1), 1.0, atol=1e-6)
+
+    def test_predict_shorter_sequence_after_obs_fit(self):
+        """predict on shorter sequence after obs-aware fit should not crash."""
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=80)
+        obs_dm = jnp.zeros((80, 1))
+        obs_dm = obs_dm.at[40:, 0].set(1.0)
+
+        model = ContingencyBeliefModel(
+            n_states=2, n_options=3, n_obs_covariates=1,
+        )
+        model.fit_sgd(
+            choices, rewards, obs_design_matrix=obs_dm, num_steps=15,
+        )
+        # Predict on shorter sequence WITHOUT obs (stationary action model)
+        posterior = model.predict_state_posterior(choices[:30], rewards[:30])
+        assert posterior.shape == (30, 2)
+        np.testing.assert_allclose(posterior.sum(axis=1), 1.0, atol=1e-6)
+
+    def test_em_does_not_accept_obs_design_matrix(self):
+        """EM fit() should not accept obs_design_matrix (no M-step)."""
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=50)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        # fit() should not have obs_design_matrix parameter
+        import inspect
+        sig = inspect.signature(model.fit)
+        assert "obs_design_matrix" not in sig.parameters

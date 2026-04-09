@@ -369,7 +369,23 @@ def contingency_belief_filter(
     has_obs_covariates = (
         obs_design_matrix is not None and obs_weights is not None
     )
-    if not has_obs_covariates:
+    if has_obs_covariates:
+        if obs_design_matrix.shape[0] != n_trials:
+            raise ValueError(
+                f"obs_design_matrix has {obs_design_matrix.shape[0]} rows "
+                f"but choices has {n_trials} trials"
+            )
+        if obs_weights.shape[0] != n_options:
+            raise ValueError(
+                f"obs_weights has {obs_weights.shape[0]} rows "
+                f"but n_options is {n_options}"
+            )
+        if obs_weights.shape[1] != obs_design_matrix.shape[1]:
+            raise ValueError(
+                f"obs_weights width {obs_weights.shape[1]} != "
+                f"obs_design_matrix width {obs_design_matrix.shape[1]}"
+            )
+    else:
         obs_design_matrix = jnp.zeros((n_trials, 1))
         obs_weights = jnp.zeros((n_options, 1))
 
@@ -485,7 +501,18 @@ def contingency_belief_smoother(
     has_obs_covariates = (
         obs_design_matrix is not None and obs_weights is not None
     )
-    if not has_obs_covariates:
+    if has_obs_covariates:
+        if obs_design_matrix.shape[0] != n_trials:
+            raise ValueError(
+                f"obs_design_matrix has {obs_design_matrix.shape[0]} rows "
+                f"but choices has {n_trials} trials"
+            )
+        if obs_weights.shape[1] != obs_design_matrix.shape[1]:
+            raise ValueError(
+                f"obs_weights width {obs_weights.shape[1]} != "
+                f"obs_design_matrix width {obs_design_matrix.shape[1]}"
+            )
+    else:
         obs_design_matrix = jnp.zeros((n_trials, 1))
         obs_weights = jnp.zeros((n_options, 1))
 
@@ -747,11 +774,13 @@ class ContingencyBeliefModel(SGDFittableMixin):
         choices: ArrayLike,
         rewards: ArrayLike,
         transition_covariates: Optional[ArrayLike] = None,
-        obs_design_matrix: Optional[ArrayLike] = None,
         max_iter: int = 50,
         tolerance: float = 1e-4,
     ) -> list[float]:
         """Fit via EM algorithm.
+
+        Note: obs_design_matrix is not supported in EM (no closed-form
+        M-step for obs_weights). Use fit_sgd() for observation covariates.
 
         Parameters
         ----------
@@ -890,9 +919,9 @@ class ContingencyBeliefModel(SGDFittableMixin):
             self._transition_design_matrix = self._build_design_matrix(n_trials)
         if obs_design_matrix is not None:
             self._obs_design_matrix = jnp.asarray(obs_design_matrix)
-        elif self.obs_weights_ is None:
+        else:
+            # Always clear obs state for prediction to prevent stale-length bugs
             self._obs_design_matrix = None
-        # else: keep stored _obs_design_matrix (caller must ensure length matches)
         kwargs = self._smoother_kwargs(choices, rewards)
         result = contingency_belief_smoother(**kwargs)
         self._transition_design_matrix = old_tdm
