@@ -1,10 +1,17 @@
-# Regularized Oscillator Connectivity Implementation Plan
+# Regularized Oscillator Connectivity Implementation Plan — COMPLETE
 
-> **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
->
-> **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.
+> **Status:** DONE as of 2026-04-08. All 4 tasks complete, 24 tests.
 
 **Goal:** Add structured SGD penalties for oscillator coupling parameters so `DirectedInfluenceModel` and later `CorrelatedNoiseModel` can express sparse edge structure and area-to-area pathway priors.
+
+## Implementation Summary
+
+- `src/state_space_practice/oscillator_regularization.py` — penalty utilities, config, area summary
+- `DirectedInfluenceModel.fit_sgd()` accepts `connectivity_penalty` kwarg
+- Three penalty families: edge L1, area group L2, state-shared group L2
+- `get_area_coupling_summary()` for reporting block-level norms
+- 21 regularization tests + 3 DIM regularized SGD tests
+- Integration tests verify edge penalty shrinks coupling and area penalty reduces cross-area coupling
 
 **Architecture:** Keep the existing EM path unchanged. Add a small regularization layer that operates on the constrained scientific parameterization used by oscillator SGD (`coupling_strength`, `phase_difference`, optionally `process_variance`) and augments `_sgd_loss_fn` with additive penalties. The first implementation targets `DirectedInfluenceModel`, where coupling is the main scientific quantity; `CorrelatedNoiseModel` support comes later and remains explicitly gated.
 

@@ -48,7 +48,7 @@ The current priorities focus on infrastructure and behavioral modeling:
 | P3 | `switching-choice-model.md` | Behavioral | Not started |
 | P4 | `joint-learning-drift.md` | Integration | Not started |
 | P5 | `adaptive-decoder.md` | Neural | Not started |
-| P6 | `regularized-oscillator-connectivity.md` | Oscillator | Not started — unblocked by P1 |
+| P6 | `regularized-oscillator-connectivity.md` | Oscillator | **DONE** — edge L1, area group L2, state-shared penalties |
 
 ### Behavioral Modeling Sub-Roadmap
 
@@ -238,5 +238,5 @@ Stop condition:
 - **P3 (Switching Choice)** is the behavioral strategy-switching model — directly interpretable and the first model that infers exploit/explore without the experimenter's contingency table.
 - **P4 (Joint Learning+Drift)** is the ambitious integration linking behavioral learning and neural remapping. SPECULATIVE but scientifically important — implements prototype-first.
 - **P5 (Adaptive Decoder)** enables multi-hour decoding, needed for any long-session neural analysis.
-- **P6 (Regularized Oscillator)** is unblocked — DIM SGD over `coupling_strength`/`phase_difference` is ready for penalty terms.
+- **P6 (Regularized Oscillator)** is **DONE** — edge L1, area group L2, state-shared group L2 penalties on DIM coupling.
 - The scientific track (S1-S4) is deferred but all dependencies are already met for S1. It can be reactivated at any time.

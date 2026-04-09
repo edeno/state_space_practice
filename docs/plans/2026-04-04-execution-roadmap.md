@@ -42,7 +42,7 @@ The following six plans are the current implementation priorities, ordered by in
 | **P3** | switching-choice-model.md | READY | Med | RL Covariates (DONE) + switching_kalman | Can start in parallel with P1-P2 |
 | **P4** | joint-learning-drift.md | SPECULATIVE | High | Smith + PlaceField + switching_kalman (all exist) | Prototype first; high integration complexity |
 | **P5** | adaptive-decoder.md | PARTIAL | Med | Position Decoding (DONE) | Can start in parallel with P1-P3 |
-| **P6** | regularized-oscillator-connectivity.md | HIGH | Low | SGD Fitting (P1, **DONE**) | Unblocked — DIM SGD over coupling params ready |
+| **P6** | regularized-oscillator-connectivity.md | **DONE** | — | SGD Fitting (P1, **DONE**) | Edge L1, area group L2, state-shared penalties |
 
 ### Parallelism Opportunities
 
@@ -185,7 +185,7 @@ Order 0.6: **DONE.** SGD fitting mixin for all model classes. SGDFittableMixin w
 
 | Order | Plan | Feasibility | Risk | Effort | Depends On | Status |
 |---|---|---|---|---|---|---|
-| O1 | regularized-oscillator-connectivity.md | HIGH | Low | 1-2 weeks | SGD Fitting (**DONE**) | **P6** — unblocked |
+| O1 | regularized-oscillator-connectivity.md | **DONE** | — | — | SGD Fitting (**DONE**) | **P6** — complete |
 | O2 | dynamic-neuron-coupling.md | PARTIAL | Med | 2-3 weeks | SGD Fitting (**DONE**) | Not started — unblocked |
 | O3 | principled-stabilization-refactor.md | PARTIAL | Med | 2-3 weeks | None | Not started (deferred) |
 
@@ -214,7 +214,8 @@ Claim: "CA1 alternates between local and nonlocal represented content, and laten
 - **Order 0** fixes shared infrastructure bugs before anything builds on top.
 - **Orders 1-3** (DONE) established the core decoding and behavioral models.
 - **Order 3.5** (RL covariates) strengthens the behavioral model with mechanistic value updates, supporting all downstream value-related plans.
-- **P1 (SGD Fitting)** is **DONE** — all model classes have `fit_sgd()`, P6 is unblocked.
+- **P1 (SGD Fitting)** is **DONE** — all model classes have `fit_sgd()`.
+- **P6 (Regularized Oscillator)** is **DONE** — edge L1, area group L2, state-shared group L2 penalties on DIM coupling.
 - **P2 (Contingency Belief)** adds an explicit hidden-world-state model, complementing both continuous value inference and planned strategy-state switching.
 - **P3 (Switching Choice)** is the first switching behavioral model with per-state value dynamics.
 - **P4 (Joint Learning+Drift)** is SPECULATIVE but scientifically important — links learning rate and representational drift through shared discrete states.
