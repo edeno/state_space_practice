@@ -1496,23 +1496,39 @@ class TestDirectedInfluenceRegularizedSGD:
         )
         return model, scenario["obs"]
 
-    def test_edge_penalty_shrinks_coupling_norm(self, dim_setup):
+    def test_edge_penalty_shrinks_coupling_norm(self):
         from state_space_practice.oscillator_regularization import (
             OscillatorPenaltyConfig,
         )
+        from state_space_practice.simulate.scenarios import simulate_dim_scenario
 
-        model_base, obs = dim_setup
-        model_reg, _ = dim_setup
+        scenario = simulate_dim_scenario(n_time=200, seed=42)
+        p = scenario["params"]
         key = jax.random.PRNGKey(0)
 
+        def _make_model():
+            return DirectedInfluenceModel(
+                n_oscillators=p["n_oscillators"],
+                n_discrete_states=p["n_discrete_states"],
+                sampling_freq=p["sampling_freq"],
+                freqs=p["freqs"],
+                auto_regressive_coef=p["damping"],
+                process_variance=p["process_variance"],
+                measurement_variance=p["measurement_variance"],
+                phase_difference=p["phase_difference"],
+                coupling_strength=p["coupling_strength"],
+            )
+
         # Baseline: no penalty
-        model_base.fit_sgd(obs, key=key, num_steps=30)
+        model_base = _make_model()
+        model_base.fit_sgd(scenario["obs"], key=key, num_steps=30)
         norm_base = float(jnp.sum(jnp.abs(model_base.coupling_strength)))
 
         # Regularized: edge L1
+        model_reg = _make_model()
         config = OscillatorPenaltyConfig(edge_l1=0.5)
         model_reg.fit_sgd(
-            obs, key=key, num_steps=30, connectivity_penalty=config,
+            scenario["obs"], key=key, num_steps=30, connectivity_penalty=config,
         )
         norm_reg = float(jnp.sum(jnp.abs(model_reg.coupling_strength)))
 

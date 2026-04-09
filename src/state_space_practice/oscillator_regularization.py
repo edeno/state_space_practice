@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 
 
@@ -34,11 +35,19 @@ class OscillatorPenaltyConfig:
     state_shared_group_l2 : float
         Weight for group L2 penalty shared across discrete states.
     area_labels : Array or None
-        Integer array mapping oscillator index to brain area.
+        Integer array mapping oscillator index to brain area. Labels must
+        be contiguous integers starting at 0 (e.g., [0, 0, 1, 1, 2]).
         Required when area_group_l2 > 0 or state_shared_group_l2 > 0.
     exclude_diagonal : bool
         If True (default), exclude self-coupling (diagonal) from penalties.
         Self-coupling represents damping, not inter-oscillator influence.
+
+    Notes
+    -----
+    Penalty weights are applied before per-timestep normalization in the
+    SGD loss (which divides by n_timesteps). The effective gradient
+    contribution is lambda / T. To keep lambda comparable across datasets
+    of different lengths, scale proportionally: lambda_eff = lambda * T.
     """
 
     edge_l1: float = 0.0
@@ -106,7 +115,7 @@ def _area_block_frobenius(
     Array, shape ()
     """
     c = _mask_diagonal(coupling_state[None], exclude_diagonal)[0]
-    unique_areas = jnp.unique(area_labels, size=int(area_labels.max()) + 1)
+    unique_areas = np.unique(np.asarray(area_labels))
     penalty = jnp.array(0.0)
     for a in unique_areas:
         for b in unique_areas:
@@ -169,7 +178,7 @@ def state_shared_area_penalty(
     Array, shape ()
     """
     n_states = coupling.shape[0]
-    unique_areas = jnp.unique(area_labels, size=int(area_labels.max()) + 1)
+    unique_areas = np.unique(np.asarray(area_labels))
     penalty = jnp.array(0.0)
     for a in unique_areas:
         for b in unique_areas:
@@ -212,7 +221,8 @@ def get_area_coupling_summary(
             Total cross-area coupling norm per state.
     """
     n_states = coupling.shape[0]
-    n_areas = int(area_labels.max()) + 1
+    area_labels_np = np.asarray(area_labels)
+    n_areas = int(area_labels_np.max()) + 1
 
     block_norms = jnp.zeros((n_states, n_areas, n_areas))
     for s in range(n_states):
