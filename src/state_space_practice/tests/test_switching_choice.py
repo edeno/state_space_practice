@@ -243,3 +243,69 @@ class TestSwitchingChoiceFilter:
         first_half = result.discrete_state_probs[:25].mean(axis=0)
         second_half = result.discrete_state_probs[75:].mean(axis=0)
         assert not jnp.allclose(first_half, second_half, atol=0.05)
+
+
+class TestSwitchingChoiceModel:
+    """Tests for the SwitchingChoiceModel class."""
+
+    def test_fit_returns_log_likelihoods(self):
+        from state_space_practice.switching_choice import SwitchingChoiceModel
+
+        choices = jax.random.randint(jax.random.PRNGKey(0), (100,), 0, 3)
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        lls = model.fit(choices, max_iter=5)
+        assert len(lls) > 0
+        assert all(np.isfinite(ll) for ll in lls)
+
+    def test_is_fitted(self):
+        from state_space_practice.switching_choice import SwitchingChoiceModel
+
+        choices = jax.random.randint(jax.random.PRNGKey(0), (50,), 0, 3)
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        assert not model.is_fitted
+        model.fit(choices, max_iter=3)
+        assert model.is_fitted
+
+    def test_discrete_state_posterior_shape(self):
+        from state_space_practice.switching_choice import SwitchingChoiceModel
+
+        choices = jax.random.randint(jax.random.PRNGKey(0), (80,), 0, 3)
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model.fit(choices, max_iter=3)
+        assert model.smoothed_discrete_probs_.shape == (80, 2)
+        np.testing.assert_allclose(
+            model.smoothed_discrete_probs_.sum(axis=1), 1.0, atol=1e-5
+        )
+
+    def test_two_state_learns_different_betas(self):
+        """Exploit phase + explore phase should give different betas."""
+        from state_space_practice.switching_choice import SwitchingChoiceModel
+
+        # Exploit: always choose 0; explore: random
+        exploit = jnp.zeros(80, dtype=jnp.int32)
+        explore = jax.random.randint(jax.random.PRNGKey(0), (80,), 0, 4)
+        choices = jnp.concatenate([exploit, explore])
+
+        model = SwitchingChoiceModel(
+            n_options=4, n_discrete_states=2,
+            init_inverse_temperatures=jnp.array([5.0, 1.0]),
+        )
+        model.fit(choices, max_iter=10)
+        # Per-state betas should differ
+        assert model.inverse_temperatures_[0] != model.inverse_temperatures_[1]
+
+    def test_sgd_improves_ll(self):
+        from state_space_practice.switching_choice import SwitchingChoiceModel
+
+        choices = jax.random.randint(jax.random.PRNGKey(0), (100,), 0, 3)
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        lls = model.fit_sgd(choices, num_steps=30)
+        assert lls[-1] > lls[0]
+
+    def test_sgd_model_is_fitted(self):
+        from state_space_practice.switching_choice import SwitchingChoiceModel
+
+        choices = jax.random.randint(jax.random.PRNGKey(0), (60,), 0, 3)
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model.fit_sgd(choices, num_steps=15)
+        assert model.is_fitted

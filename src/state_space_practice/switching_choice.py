@@ -30,6 +30,7 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.multinomial_choice import _softmax_update_core
+from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.switching_kalman import (
     _scale_likelihood,
     _stabilize_probability_vector,
@@ -386,3 +387,324 @@ def switching_choice_filter(
         pair_cond_means=pair_cond_means,
         pair_cond_covs=pair_cond_covs,
     )
+
+
+class SwitchingChoiceModel(SGDFittableMixin):
+    """Switching multi-armed bandit with per-state learning dynamics.
+
+    Discrete latent states represent behavioral strategies (e.g.,
+    exploit vs explore) that control how option values evolve.
+
+    Parameters
+    ----------
+    n_options : int
+        Number of choice options K.
+    n_discrete_states : int
+        Number of discrete behavioral states S.
+    n_covariates : int
+        Number of dynamics covariates.
+    n_obs_covariates : int
+        Number of observation covariates.
+    init_inverse_temperatures : Array or None, shape (S,)
+        Per-state starting inverse temperatures.
+    init_process_noises : Array or None, shape (S,)
+        Per-state starting process noises.
+    init_decays : Array or None, shape (S,)
+        Per-state starting decays.
+    """
+
+    def __init__(
+        self,
+        n_options: int,
+        n_discrete_states: int = 2,
+        n_covariates: int = 0,
+        n_obs_covariates: int = 0,
+        init_inverse_temperatures: Optional[ArrayLike] = None,
+        init_process_noises: Optional[ArrayLike] = None,
+        init_decays: Optional[ArrayLike] = None,
+    ):
+        self.n_options = n_options
+        self.n_discrete_states = n_discrete_states
+        self.n_covariates = n_covariates
+        self.n_obs_covariates = n_obs_covariates
+        k_free = n_options - 1
+        S = n_discrete_states
+
+        # Per-state parameters
+        if init_inverse_temperatures is not None:
+            self.inverse_temperatures_ = jnp.asarray(init_inverse_temperatures)
+        else:
+            self.inverse_temperatures_ = jnp.ones(S)
+        if init_process_noises is not None:
+            self.process_noises_ = jnp.asarray(init_process_noises)
+        else:
+            self.process_noises_ = jnp.ones(S) * 0.01
+        if init_decays is not None:
+            self.decays_ = jnp.asarray(init_decays)
+        else:
+            self.decays_ = jnp.ones(S)
+
+        # Shared parameters
+        self.init_mean_ = jnp.zeros(k_free)
+        self.init_cov_ = jnp.eye(k_free)
+        self.discrete_transition_matrix_ = (
+            0.9 * jnp.eye(S) + 0.1 / S * jnp.ones((S, S))
+        )
+        if n_covariates > 0:
+            self.input_gain_ = jnp.zeros((k_free, n_covariates))
+        else:
+            self.input_gain_ = None
+        if n_obs_covariates > 0:
+            self.obs_weights_ = jnp.zeros((n_options, n_obs_covariates))
+        else:
+            self.obs_weights_ = None
+
+        # Fitted state
+        self._filter_result: Optional[SwitchingChoiceFilterResult] = None
+        self.smoothed_discrete_probs_: Optional[Array] = None
+        self.log_likelihood_: Optional[float] = None
+        self.log_likelihood_history_: Optional[list[float]] = None
+        self._n_trials: Optional[int] = None
+
+    @property
+    def is_fitted(self) -> bool:
+        return self._filter_result is not None
+
+    def __repr__(self) -> str:
+        fitted = "fitted" if self.is_fitted else "not fitted"
+        return (
+            f"SwitchingChoiceModel(n_options={self.n_options}, "
+            f"n_discrete_states={self.n_discrete_states}, {fitted})"
+        )
+
+    def _run_filter(self, choices, covariates=None, obs_covariates=None):
+        """Run the switching choice filter with current parameters."""
+        kwargs = dict(
+            choices=choices,
+            n_options=self.n_options,
+            n_discrete_states=self.n_discrete_states,
+            process_noises=self.process_noises_,
+            inverse_temperatures=self.inverse_temperatures_,
+            decays=self.decays_,
+            discrete_transition_matrix=self.discrete_transition_matrix_,
+            init_mean=self.init_mean_,
+            init_cov=self.init_cov_,
+        )
+        if covariates is not None and self.input_gain_ is not None:
+            kwargs["covariates"] = covariates
+            kwargs["input_gain"] = self.input_gain_
+        if obs_covariates is not None and self.obs_weights_ is not None:
+            kwargs["obs_covariates"] = obs_covariates
+            kwargs["obs_weights"] = self.obs_weights_
+        return switching_choice_filter(**kwargs)
+
+    def fit(
+        self,
+        choices: ArrayLike,
+        covariates: Optional[ArrayLike] = None,
+        obs_covariates: Optional[ArrayLike] = None,
+        max_iter: int = 50,
+        tolerance: float = 1e-4,
+    ) -> list[float]:
+        """Fit via EM algorithm.
+
+        Parameters
+        ----------
+        choices : ArrayLike, shape (n_trials,)
+        covariates : ArrayLike or None, shape (n_trials, d_dyn)
+        obs_covariates : ArrayLike or None, shape (n_trials, d_obs)
+        max_iter : int
+        tolerance : float
+
+        Returns
+        -------
+        log_likelihoods : list of float
+        """
+        choices = jnp.asarray(choices, dtype=jnp.int32)
+        self._n_trials = int(choices.shape[0])
+        self._covariates = jnp.asarray(covariates) if covariates is not None else None
+        self._obs_covariates = jnp.asarray(obs_covariates) if obs_covariates is not None else None
+
+        log_likelihoods: list[float] = []
+        prev_ll = float("-inf")
+
+        for iteration in range(max_iter):
+            # E-step
+            result = self._run_filter(choices, self._covariates, self._obs_covariates)
+            self._filter_result = result
+            ll = float(result.marginal_log_likelihood)
+            log_likelihoods.append(ll)
+
+            if abs(ll - prev_ll) < tolerance and iteration > 0:
+                logger.info(f"Converged at iteration {iteration + 1}")
+                break
+            prev_ll = ll
+
+            # M-step (simplified: update per-state Q and transition matrix)
+            self._m_step(choices, result)
+
+        # Run smoother for discrete state posteriors
+        from state_space_practice.switching_kalman import switching_kalman_smoother
+        smoother_result = switching_kalman_smoother(
+            filter_mean=result.filtered_values,
+            filter_cov=result.filtered_covs,
+            filter_discrete_state_prob=result.discrete_state_probs,
+            last_filter_conditional_cont_mean=result.pair_cond_means[-1],
+            process_cov=jnp.stack(
+                [q * jnp.eye(self.n_options - 1) for q in self.process_noises_],
+                axis=-1,
+            ),
+            continuous_transition_matrix=jnp.stack(
+                [d * jnp.eye(self.n_options - 1) for d in self.decays_],
+                axis=-1,
+            ),
+            discrete_state_transition_matrix=self.discrete_transition_matrix_,
+        )
+        self.smoothed_discrete_probs_ = smoother_result[2]  # smoothed discrete probs
+
+        self.log_likelihood_ = log_likelihoods[-1]
+        self.log_likelihood_history_ = log_likelihoods
+        return log_likelihoods
+
+    def _m_step(self, choices, result):
+        """Simplified M-step: update per-state Q and transition matrix."""
+        gamma = result.discrete_state_probs  # (T, S)
+        S = self.n_discrete_states
+        eps = 1e-10
+
+        # Per-state process noise: weighted variance of value increments
+        values = result.filtered_values  # (T, K-1, S)
+        for s in range(S):
+            w = gamma[1:, s]  # (T-1,)
+            w_sum = jnp.maximum(jnp.sum(w), eps)
+            diff = values[1:, :, s] - self.decays_[s] * values[:-1, :, s]
+            # Weighted mean squared increment
+            q_hat = jnp.sum(w[:, None] * diff**2, axis=0).mean() / w_sum
+            self.process_noises_ = self.process_noises_.at[s].set(
+                jnp.maximum(q_hat, 1e-6)
+            )
+
+        # Transition matrix from consecutive discrete probs (simple estimate)
+        joint = gamma[:-1, :, None] * gamma[1:, None, :]  # (T-1, S, S)
+        trans_counts = joint.sum(axis=0)  # (S, S)
+        row_sums = trans_counts.sum(axis=1, keepdims=True)
+        self.discrete_transition_matrix_ = trans_counts / jnp.maximum(row_sums, eps)
+
+    # --- SGDFittableMixin protocol ---
+
+    def fit_sgd(
+        self,
+        choices: ArrayLike,
+        covariates: Optional[ArrayLike] = None,
+        obs_covariates: Optional[ArrayLike] = None,
+        optimizer=None,
+        num_steps: int = 200,
+        verbose: bool = False,
+        convergence_tol=None,
+    ) -> list[float]:
+        """Fit by minimizing negative marginal LL via gradient descent."""
+        choices = jnp.asarray(choices, dtype=jnp.int32)
+        self._n_trials = int(choices.shape[0])
+        self._covariates = jnp.asarray(covariates) if covariates is not None else None
+        self._obs_covariates = jnp.asarray(obs_covariates) if obs_covariates is not None else None
+
+        return super().fit_sgd(
+            choices,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+        )
+
+    @property
+    def _n_timesteps(self) -> int:
+        return self._n_trials
+
+    def _check_sgd_initialized(self) -> None:
+        pass
+
+    def _build_param_spec(self) -> tuple[dict, dict]:
+        from state_space_practice.parameter_transforms import (
+            POSITIVE,
+            STOCHASTIC_ROW,
+            UNCONSTRAINED,
+            UNIT_INTERVAL,
+        )
+
+        params = {
+            "process_noises": self.process_noises_,
+            "inverse_temperatures": self.inverse_temperatures_,
+            "decays": self.decays_,
+            "discrete_transition_matrix": self.discrete_transition_matrix_,
+            "init_mean": self.init_mean_,
+        }
+        spec = {
+            "process_noises": POSITIVE,
+            "inverse_temperatures": POSITIVE,
+            "decays": UNIT_INTERVAL,
+            "discrete_transition_matrix": STOCHASTIC_ROW,
+            "init_mean": UNCONSTRAINED,
+        }
+        if self.input_gain_ is not None:
+            params["input_gain"] = self.input_gain_
+            spec["input_gain"] = UNCONSTRAINED
+        if self.obs_weights_ is not None:
+            params["obs_weights"] = self.obs_weights_
+            spec["obs_weights"] = UNCONSTRAINED
+        return params, spec
+
+    def _sgd_loss_fn(self, params: dict, choices: Array) -> Array:
+        kwargs = dict(
+            choices=choices,
+            n_options=self.n_options,
+            n_discrete_states=self.n_discrete_states,
+            process_noises=params["process_noises"],
+            inverse_temperatures=params["inverse_temperatures"],
+            decays=params["decays"],
+            discrete_transition_matrix=params["discrete_transition_matrix"],
+            init_mean=params["init_mean"],
+            init_cov=self.init_cov_,
+        )
+        if self._covariates is not None and "input_gain" in params:
+            kwargs["covariates"] = self._covariates
+            kwargs["input_gain"] = params["input_gain"]
+        if self._obs_covariates is not None and "obs_weights" in params:
+            kwargs["obs_covariates"] = self._obs_covariates
+            kwargs["obs_weights"] = params["obs_weights"]
+
+        result = switching_choice_filter(**kwargs)
+        return -result.marginal_log_likelihood
+
+    def _store_sgd_params(self, params: dict) -> None:
+        self.process_noises_ = params["process_noises"]
+        self.inverse_temperatures_ = params["inverse_temperatures"]
+        self.decays_ = params["decays"]
+        self.discrete_transition_matrix_ = params["discrete_transition_matrix"]
+        self.init_mean_ = params["init_mean"]
+        if "input_gain" in params:
+            self.input_gain_ = params["input_gain"]
+        if "obs_weights" in params:
+            self.obs_weights_ = params["obs_weights"]
+
+    def _finalize_sgd(self, choices: Array) -> None:
+        result = self._run_filter(choices, self._covariates, self._obs_covariates)
+        self._filter_result = result
+
+        from state_space_practice.switching_kalman import switching_kalman_smoother
+        smoother_result = switching_kalman_smoother(
+            filter_mean=result.filtered_values,
+            filter_cov=result.filtered_covs,
+            filter_discrete_state_prob=result.discrete_state_probs,
+            last_filter_conditional_cont_mean=result.pair_cond_means[-1],
+            process_cov=jnp.stack(
+                [q * jnp.eye(self.n_options - 1) for q in self.process_noises_],
+                axis=-1,
+            ),
+            continuous_transition_matrix=jnp.stack(
+                [d * jnp.eye(self.n_options - 1) for d in self.decays_],
+                axis=-1,
+            ),
+            discrete_state_transition_matrix=self.discrete_transition_matrix_,
+        )
+        self.smoothed_discrete_probs_ = smoother_result[2]
+        self.log_likelihood_ = float(result.marginal_log_likelihood)
