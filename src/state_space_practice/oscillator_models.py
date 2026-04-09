@@ -1674,7 +1674,8 @@ class DirectedInfluenceModel(BaseModel):
             # coupling shape: (n_osc, n_osc, n_states) → (n_states, n_osc, n_osc)
             coupling_transposed = jnp.moveaxis(coupling, -1, 0)
             base_loss = base_loss + total_connectivity_penalty(
-                coupling_transposed, penalty_config
+                coupling_transposed, penalty_config,
+                n_timesteps=self._n_timesteps,
             )
 
         return base_loss

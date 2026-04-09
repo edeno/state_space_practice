@@ -124,6 +124,26 @@ class TestOscillatorPenaltyConfig:
         penalty = total_connectivity_penalty(coupling, config)
         assert float(penalty) > 0.0
 
+    def test_length_invariant_by_default(self):
+        """Default: penalty * T, so effective penalty after /T is lambda."""
+        config = OscillatorPenaltyConfig(edge_l1=1.0)
+        coupling = jnp.ones((2, 3, 3)) * 0.5
+        p_100 = total_connectivity_penalty(coupling, config, n_timesteps=100)
+        p_1000 = total_connectivity_penalty(coupling, config, n_timesteps=1000)
+        # After dividing by T: p_100/100 ≈ p_1000/1000
+        np.testing.assert_allclose(
+            float(p_100) / 100, float(p_1000) / 1000, rtol=1e-10
+        )
+
+    def test_scale_with_length_true(self):
+        """scale_with_length=True: raw penalty, no T scaling."""
+        config = OscillatorPenaltyConfig(edge_l1=1.0, scale_with_length=True)
+        coupling = jnp.ones((2, 3, 3)) * 0.5
+        p_100 = total_connectivity_penalty(coupling, config, n_timesteps=100)
+        p_1000 = total_connectivity_penalty(coupling, config, n_timesteps=1000)
+        # Raw penalty doesn't depend on T
+        np.testing.assert_allclose(float(p_100), float(p_1000), rtol=1e-10)
+
 
 class TestAreaCouplingSummary:
     def test_block_norms_shape(self):

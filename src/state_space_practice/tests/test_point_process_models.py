@@ -538,3 +538,58 @@ class TestSwitchingPPSGDFitting:
         model.fit_sgd(spikes, key=key, num_steps=10)
         assert jnp.all(jnp.isfinite(model.coupling_strength))
         assert jnp.all(jnp.isfinite(model.phase_difference))
+
+    def test_dim_pp_sgd_with_edge_penalty(self, dim_pp_setup):
+        from state_space_practice.oscillator_regularization import (
+            OscillatorPenaltyConfig,
+        )
+
+        model, spikes = dim_pp_setup
+        key = jax.random.PRNGKey(0)
+        config = OscillatorPenaltyConfig(edge_l1=0.5)
+        lls = model.fit_sgd(
+            spikes, key=key, num_steps=15, connectivity_penalty=config,
+        )
+        assert len(lls) > 1
+        assert jnp.all(jnp.isfinite(model.coupling_strength))
+
+    def test_dim_pp_penalty_shrinks_coupling(self):
+        """Edge penalty should shrink coupling norm vs unpenalized."""
+        from state_space_practice.oscillator_regularization import (
+            OscillatorPenaltyConfig,
+        )
+        from state_space_practice.simulate.scenarios import (
+            simulate_dim_pp_scenario,
+        )
+
+        scenario = simulate_dim_pp_scenario(n_time=100, seed=42)
+        p = scenario["params"]
+        key = jax.random.PRNGKey(0)
+
+        def _make():
+            return DirectedInfluencePointProcessModel(
+                n_oscillators=p["n_oscillators"],
+                n_neurons=p["n_neurons"],
+                n_discrete_states=p["n_discrete_states"],
+                sampling_freq=p["sampling_freq"],
+                dt=p["dt"],
+                freqs=p["freqs"],
+                auto_regressive_coef=p["damping"],
+                process_variance=p["process_variance"],
+                phase_difference=p["phase_difference"],
+                coupling_strength=p["coupling_strength"],
+            )
+
+        model_base = _make()
+        model_base.fit_sgd(scenario["spikes"], key=key, num_steps=20)
+        norm_base = float(jnp.sum(jnp.abs(model_base.coupling_strength)))
+
+        model_reg = _make()
+        config = OscillatorPenaltyConfig(edge_l1=1.0)
+        model_reg.fit_sgd(
+            scenario["spikes"], key=key, num_steps=20,
+            connectivity_penalty=config,
+        )
+        norm_reg = float(jnp.sum(jnp.abs(model_reg.coupling_strength)))
+
+        assert norm_reg < norm_base

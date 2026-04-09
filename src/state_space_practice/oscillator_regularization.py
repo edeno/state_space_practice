@@ -41,13 +41,14 @@ class OscillatorPenaltyConfig:
     exclude_diagonal : bool
         If True (default), exclude self-coupling (diagonal) from penalties.
         Self-coupling represents damping, not inter-oscillator influence.
-
-    Notes
-    -----
-    Penalty weights are applied before per-timestep normalization in the
-    SGD loss (which divides by n_timesteps). The effective gradient
-    contribution is lambda / T. To keep lambda comparable across datasets
-    of different lengths, scale proportionally: lambda_eff = lambda * T.
+    scale_with_length : bool
+        If False (default), the penalty is length-invariant: it is
+        multiplied by n_timesteps internally so that the effective
+        gradient contribution is lambda (not lambda / T). This means
+        the same lambda produces the same regularization strength
+        regardless of recording length.
+        If True, the raw penalty is added to the loss without scaling,
+        so longer recordings dilute the penalty (lambda_eff = lambda / T).
     """
 
     edge_l1: float = 0.0
@@ -55,6 +56,7 @@ class OscillatorPenaltyConfig:
     state_shared_group_l2: float = 0.0
     area_labels: Optional[Array] = None
     exclude_diagonal: bool = True
+    scale_with_length: bool = False
 
 
 def _mask_diagonal(coupling: Array, exclude: bool) -> Array:
@@ -254,6 +256,7 @@ def get_area_coupling_summary(
 def total_connectivity_penalty(
     coupling: Array,
     config: OscillatorPenaltyConfig,
+    n_timesteps: int = 1,
 ) -> Array:
     """Compute the total regularization penalty from a config.
 
@@ -264,11 +267,16 @@ def total_connectivity_penalty(
         ``model.coupling_strength`` transposed to (n_states, n_osc, n_osc).
     config : OscillatorPenaltyConfig
         Penalty configuration with weights and area labels.
+    n_timesteps : int
+        Number of timesteps in the dataset. Used to make the penalty
+        length-invariant when ``config.scale_with_length=False``.
 
     Returns
     -------
     Array, shape ()
-        Total scalar penalty.
+        Total scalar penalty. When ``scale_with_length=False``, this is
+        multiplied by ``n_timesteps`` so that after the mixin divides
+        the total loss by T, the effective penalty is exactly lambda.
     """
     penalty = jnp.array(0.0)
 
@@ -296,5 +304,11 @@ def total_connectivity_penalty(
             coupling, config.area_labels,
             exclude_diagonal=config.exclude_diagonal,
         )
+
+    # When scale_with_length=False (default), multiply by T so that
+    # after the mixin divides total loss by T, the effective penalty
+    # is exactly lambda (length-invariant).
+    if not config.scale_with_length:
+        penalty = penalty * n_timesteps
 
     return penalty
