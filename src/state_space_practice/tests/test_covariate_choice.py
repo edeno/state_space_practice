@@ -984,3 +984,27 @@ class TestSGDFitting:
                 rng.integers(0, 3, size=50), num_steps=15, verbose=True,
             )
         assert "SGD step" in caplog.text
+
+
+class TestCovariateUncertaintySummaries:
+    """Tests for uncertainty summary attributes."""
+
+    def test_uncertainty_populated_after_em(self):
+        from state_space_practice.covariate_choice import simulate_rl_choice_data
+
+        sim = simulate_rl_choice_data(n_trials=50, n_options=3, seed=0)
+        model = CovariateChoiceModel(
+            n_options=3, n_covariates=sim.covariates.shape[1],
+        )
+        model.fit(sim.choices, covariates=sim.covariates, max_iter=3)
+        assert model.predicted_option_variances_ is not None
+        assert model.predicted_option_variances_.shape == (50, 3)
+        assert model.surprise_ is not None
+        assert model.surprise_.shape == (50,)
+
+    def test_uncertainty_populated_after_sgd(self):
+        rng = np.random.default_rng(42)
+        model = CovariateChoiceModel(n_options=3)
+        model.fit_sgd(rng.integers(0, 3, size=50), num_steps=10)
+        assert model.predicted_option_variances_ is not None
+        assert model.predicted_choice_entropy_ is not None

@@ -494,3 +494,41 @@ class TestMultinomialSGDFitting:
 
         # LLs should be within 10% of each other
         assert abs(m_em.log_likelihood_ - m_sgd.log_likelihood_) / abs(m_em.log_likelihood_) < 0.1
+
+
+class TestMultinomialUncertaintySummaries:
+    """Tests for uncertainty summary attributes."""
+
+    def test_uncertainty_populated_after_em(self):
+        choices = simulate_choice_data(n_trials=50, n_options=3, seed=0).choices
+        model = MultinomialChoiceModel(n_options=3)
+        model.fit(choices, max_iter=3)
+        assert model.predicted_option_variances_ is not None
+        assert model.predicted_option_variances_.shape == (50, 3)
+        assert model.smoothed_option_variances_ is not None
+        assert model.smoothed_option_variances_.shape == (50, 3)
+        assert model.predicted_choice_entropy_ is not None
+        assert model.predicted_choice_entropy_.shape == (50,)
+        assert model.surprise_ is not None
+        assert model.surprise_.shape == (50,)
+
+    def test_uncertainty_populated_after_sgd(self):
+        choices = simulate_choice_data(n_trials=50, n_options=3, seed=0).choices
+        model = MultinomialChoiceModel(n_options=3)
+        model.fit_sgd(choices, num_steps=10)
+        assert model.predicted_option_variances_ is not None
+        assert model.surprise_ is not None
+
+    def test_reference_option_variance_is_zero(self):
+        choices = simulate_choice_data(n_trials=50, n_options=3, seed=0).choices
+        model = MultinomialChoiceModel(n_options=3)
+        model.fit(choices, max_iter=3)
+        # Reference option (index 0) should have zero variance
+        np.testing.assert_allclose(model.predicted_option_variances_[:, 0], 0.0)
+        np.testing.assert_allclose(model.smoothed_option_variances_[:, 0], 0.0)
+
+    def test_surprise_is_positive(self):
+        choices = simulate_choice_data(n_trials=50, n_options=3, seed=0).choices
+        model = MultinomialChoiceModel(n_options=3)
+        model.fit(choices, max_iter=3)
+        assert jnp.all(model.surprise_ >= 0)

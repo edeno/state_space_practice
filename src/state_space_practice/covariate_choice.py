@@ -477,6 +477,12 @@ class CovariateChoiceModel(SGDFittableMixin):
         self._covariates: Optional[Array] = None
         self._obs_covariates: Optional[Array] = None
 
+        # Uncertainty summaries
+        self.predicted_option_variances_: Optional[Array] = None
+        self.smoothed_option_variances_: Optional[Array] = None
+        self.predicted_choice_entropy_: Optional[Array] = None
+        self.surprise_: Optional[Array] = None
+
     def __repr__(self) -> str:
         fitted = self.is_fitted
         return (
@@ -490,6 +496,39 @@ class CovariateChoiceModel(SGDFittableMixin):
     @property
     def is_fitted(self) -> bool:
         return self._smoother_result is not None
+
+    def _populate_uncertainty(self, choices: Array) -> None:
+        """Compute uncertainty summaries from filter + smoother results."""
+        from state_space_practice.behavioral_uncertainty import (
+            append_reference_option,
+            categorical_entropy,
+            compute_surprise,
+            option_variances_from_covariances,
+        )
+
+        filt = covariate_choice_filter(
+            choices, self.n_options,
+            covariates=self._covariates,
+            input_gain=self.input_gain_ if self.n_covariates > 0 else None,
+            obs_covariates=self._obs_covariates,
+            obs_weights=self.obs_weights_ if self.n_obs_covariates > 0 else None,
+            process_noise=self.process_noise,
+            inverse_temperature=self.inverse_temperature,
+            decay=self.decay,
+        )
+
+        self.predicted_option_variances_ = option_variances_from_covariances(
+            filt.predicted_covariances
+        )
+        self.smoothed_option_variances_ = option_variances_from_covariances(
+            self._smoother_result.smoothed_covariances
+        )
+        full_pred = append_reference_option(filt.predicted_values)
+        pred_probs = jax.nn.softmax(
+            self.inverse_temperature * full_pred, axis=1
+        )
+        self.predicted_choice_entropy_ = categorical_entropy(pred_probs)
+        self.surprise_ = compute_surprise(pred_probs, choices)
 
     @property
     def smoothed_values(self) -> Array:
@@ -676,6 +715,7 @@ class CovariateChoiceModel(SGDFittableMixin):
         self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
         self.n_iter_ = len(log_likelihoods)
         self.log_likelihood_history_ = log_likelihoods
+        self._populate_uncertainty(choices_arr)
 
         return log_likelihoods
 
@@ -844,6 +884,7 @@ class CovariateChoiceModel(SGDFittableMixin):
             decay=self.decay,
         )
         self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
+        self._populate_uncertainty(choices)
 
     def _m_step_decay(self, smooth: ChoiceSmootherResult) -> float:
         """M-step: update scalar decay from smoother statistics.

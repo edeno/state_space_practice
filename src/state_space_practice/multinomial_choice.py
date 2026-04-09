@@ -414,6 +414,12 @@ class MultinomialChoiceModel(SGDFittableMixin):
         self.log_likelihood_history_: Optional[list[float]] = None
         self._n_trials: Optional[int] = None
 
+        # Uncertainty summaries (populated after fitting)
+        self.predicted_option_variances_: Optional[Array] = None
+        self.smoothed_option_variances_: Optional[Array] = None
+        self.predicted_choice_entropy_: Optional[Array] = None
+        self.surprise_: Optional[Array] = None
+
     def __repr__(self) -> str:
         fitted = self.is_fitted
         return (
@@ -425,6 +431,41 @@ class MultinomialChoiceModel(SGDFittableMixin):
     @property
     def is_fitted(self) -> bool:
         return self._smoother_result is not None
+
+    def _populate_uncertainty(self, choices: Array) -> None:
+        """Compute uncertainty summaries from filter + smoother results."""
+        from state_space_practice.behavioral_uncertainty import (
+            append_reference_option,
+            categorical_entropy,
+            compute_surprise,
+            option_variances_from_covariances,
+        )
+
+        # Run filter to get predicted quantities
+        filt = multinomial_choice_filter(
+            choices, self.n_options,
+            self.process_noise, self.inverse_temperature,
+        )
+
+        # Predicted variances (full K options)
+        self.predicted_option_variances_ = option_variances_from_covariances(
+            filt.predicted_covariances
+        )
+
+        # Smoothed variances
+        self.smoothed_option_variances_ = option_variances_from_covariances(
+            self._smoother_result.smoothed_covariances
+        )
+
+        # Predicted choice entropy
+        full_pred = append_reference_option(filt.predicted_values)
+        pred_probs = jax.nn.softmax(
+            self.inverse_temperature * full_pred, axis=1
+        )
+        self.predicted_choice_entropy_ = categorical_entropy(pred_probs)
+
+        # Surprise
+        self.surprise_ = compute_surprise(pred_probs, choices)
 
     @property
     def smoothed_values(self) -> Array:
@@ -545,6 +586,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
         self.n_iter_ = len(log_likelihoods)
         self.log_likelihood_history_ = log_likelihoods
+        self._populate_uncertainty(choices_arr)
 
         return log_likelihoods
 
@@ -644,6 +686,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
             inverse_temperature=self.inverse_temperature,
         )
         self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
+        self._populate_uncertainty(choices)
 
     def _m_step_process_noise(self, smooth: ChoiceSmootherResult) -> float:
         """M-step: update scalar process noise from smoother statistics.
