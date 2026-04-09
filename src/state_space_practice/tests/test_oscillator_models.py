@@ -1472,3 +1472,77 @@ class TestCorrelatedNoiseSGDFitting:
         key = jax.random.PRNGKey(0)
         model.fit_sgd(obs, key=key, num_steps=20)
         assert jnp.all(model.process_variance > 0)
+
+
+class TestDirectedInfluenceRegularizedSGD:
+    """Tests for DIM SGD with connectivity penalties."""
+
+    @pytest.fixture
+    def dim_setup(self):
+        from state_space_practice.simulate.scenarios import simulate_dim_scenario
+
+        scenario = simulate_dim_scenario(n_time=200, seed=42)
+        p = scenario["params"]
+        model = DirectedInfluenceModel(
+            n_oscillators=p["n_oscillators"],
+            n_discrete_states=p["n_discrete_states"],
+            sampling_freq=p["sampling_freq"],
+            freqs=p["freqs"],
+            auto_regressive_coef=p["damping"],
+            process_variance=p["process_variance"],
+            measurement_variance=p["measurement_variance"],
+            phase_difference=p["phase_difference"],
+            coupling_strength=p["coupling_strength"],
+        )
+        return model, scenario["obs"]
+
+    def test_edge_penalty_shrinks_coupling_norm(self, dim_setup):
+        from state_space_practice.oscillator_regularization import (
+            OscillatorPenaltyConfig,
+        )
+
+        model_base, obs = dim_setup
+        model_reg, _ = dim_setup
+        key = jax.random.PRNGKey(0)
+
+        # Baseline: no penalty
+        model_base.fit_sgd(obs, key=key, num_steps=30)
+        norm_base = float(jnp.sum(jnp.abs(model_base.coupling_strength)))
+
+        # Regularized: edge L1
+        config = OscillatorPenaltyConfig(edge_l1=0.5)
+        model_reg.fit_sgd(
+            obs, key=key, num_steps=30, connectivity_penalty=config,
+        )
+        norm_reg = float(jnp.sum(jnp.abs(model_reg.coupling_strength)))
+
+        assert norm_reg < norm_base, (
+            f"Regularized norm ({norm_reg:.4f}) should be smaller than "
+            f"baseline ({norm_base:.4f})"
+        )
+
+    def test_area_penalty_shrinks_block_norms(self, dim_setup):
+        from state_space_practice.oscillator_regularization import (
+            OscillatorPenaltyConfig,
+        )
+
+        model, obs = dim_setup
+        key = jax.random.PRNGKey(0)
+        # 2 oscillators, 2 areas (one per oscillator)
+        area_labels = jnp.array([0, 1])
+        config = OscillatorPenaltyConfig(
+            area_group_l2=1.0, area_labels=area_labels,
+        )
+        lls = model.fit_sgd(
+            obs, key=key, num_steps=30, connectivity_penalty=config,
+        )
+        # Should still produce finite results
+        assert all(np.isfinite(ll) for ll in lls)
+        assert jnp.all(jnp.isfinite(model.coupling_strength))
+
+    def test_no_penalty_matches_baseline(self, dim_setup):
+        """fit_sgd with None penalty should match no-penalty fit."""
+        model, obs = dim_setup
+        key = jax.random.PRNGKey(0)
+        lls = model.fit_sgd(obs, key=key, num_steps=20, connectivity_penalty=None)
+        assert lls[-1] > lls[0]

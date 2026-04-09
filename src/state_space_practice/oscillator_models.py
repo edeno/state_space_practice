@@ -1593,6 +1593,44 @@ class DirectedInfluenceModel(BaseModel):
 
         return params, spec
 
+    def fit_sgd(
+        self,
+        observations: ArrayLike,
+        key: Array,
+        optimizer: Optional[object] = None,
+        num_steps: int = 200,
+        verbose: bool = False,
+        convergence_tol: Optional[float] = None,
+        connectivity_penalty: Optional[object] = None,
+    ) -> list[float]:
+        """Fit by minimizing negative marginal LL via gradient descent.
+
+        Parameters
+        ----------
+        observations : ArrayLike, shape (n_time, n_sources)
+        key : Array
+            JAX random key for parameter initialization.
+        optimizer : optax optimizer or None
+        num_steps : int
+        verbose : bool
+        convergence_tol : float or None
+        connectivity_penalty : OscillatorPenaltyConfig or None
+            If provided, adds structured sparsity penalties on
+            coupling_strength during SGD optimization.
+
+        Returns
+        -------
+        log_likelihoods : list of float
+        """
+        self._connectivity_penalty = connectivity_penalty
+        return super().fit_sgd(
+            observations, key,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+        )
+
     def _sgd_loss_fn(self, params: dict, observations) -> jax.Array:
         phase_diff = params.get("phase_difference", self.phase_difference)
         coupling = params.get("coupling_strength", self.coupling_strength)
@@ -1625,7 +1663,21 @@ class DirectedInfluenceModel(BaseModel):
             measurement_matrix=self.measurement_matrix,
             measurement_cov=R,
         )
-        return -result[5]
+        base_loss = -result[5]
+
+        # Add connectivity penalty if configured
+        penalty_config = getattr(self, "_connectivity_penalty", None)
+        if penalty_config is not None:
+            from state_space_practice.oscillator_regularization import (
+                total_connectivity_penalty,
+            )
+            # coupling shape: (n_osc, n_osc, n_states) → (n_states, n_osc, n_osc)
+            coupling_transposed = jnp.moveaxis(coupling, -1, 0)
+            base_loss = base_loss + total_connectivity_penalty(
+                coupling_transposed, penalty_config
+            )
+
+        return base_loss
 
     def _store_sgd_params(self, params: dict) -> None:
         super()._store_sgd_params(params)
