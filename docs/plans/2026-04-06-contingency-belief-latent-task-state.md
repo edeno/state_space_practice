@@ -1,6 +1,6 @@
-# Contingency-Belief / Latent Task-State Model Implementation Plan
+# Contingency-Belief / Latent Task-State Model Implementation Plan — COMPLETE
 
-> **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
+> **Status:** DONE as of 2026-04-09. All tasks complete, 37 tests, smoke check passes.
 
 **Goal:** Build a behavior-first latent task-state model that infers hidden contingency or rule states from bandit behavior, supports input-output transitions driven by trial covariates, and provides a reusable latent foundation for later mPFC-linked neural models.
 
