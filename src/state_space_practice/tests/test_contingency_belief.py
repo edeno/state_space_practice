@@ -38,7 +38,7 @@ class TestTransitionLogitsToMatrix:
 
     def test_gradient_finite(self):
         logits = jnp.array([[1.0, -1.0], [-0.5, 0.5]])
-        g = jax.grad(lambda l: transition_logits_to_matrix(l).sum())(logits)
+        g = jax.grad(lambda x: transition_logits_to_matrix(x).sum())(logits)
         assert jnp.all(jnp.isfinite(g))
 
 
@@ -381,3 +381,37 @@ class TestContingencyBeliefIntegration:
         lls = model.fit(choices, rewards, max_iter=15)
         assert all(np.isfinite(ll) for ll in lls)
         assert model.is_fitted
+
+    def test_sgd_with_transition_covariates(self):
+        """SGD should learn nonzero transition weights from covariates."""
+        choices, rewards, true_states, _ = _simulate_block_bandit(
+            n_trials=100, n_options=3, seed=42,
+        )
+        # Create a "reset" covariate that fires at the block boundary
+        n_trials = len(choices)
+        covariates = jnp.zeros((n_trials, 1))
+        covariates = covariates.at[n_trials // 2, 0].set(1.0)  # reset signal
+
+        model = ContingencyBeliefModel(
+            n_states=2, n_options=3, n_transition_covariates=1,
+        )
+        lls = model.fit_sgd(
+            choices, rewards,
+            transition_covariates=covariates,
+            num_steps=100,
+        )
+        assert lls[-1] > lls[0]
+        # Transition weights should be nonzero (learned from covariates)
+        assert model.transition_weights_ is not None
+        assert jnp.any(jnp.abs(model.transition_weights_) > 0.01)
+
+    def test_fitted_state_attributes(self):
+        """Model should populate state_posterior_ and smoothed_state_posterior_."""
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=60)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.fit_sgd(choices, rewards, num_steps=20)
+        assert model.smoothed_state_posterior_ is not None
+        assert model.smoothed_state_posterior_.shape == (60, 2)
+        np.testing.assert_allclose(
+            model.smoothed_state_posterior_.sum(axis=1), 1.0, atol=1e-6
+        )

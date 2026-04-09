@@ -420,6 +420,8 @@ class ContingencyBeliefModel(SGDFittableMixin):
         Number of latent contingency states.
     n_options : int
         Number of choice options.
+    n_transition_covariates : int
+        Number of transition covariates. 0 = stationary HMM.
     init_inverse_temperature : float
         Starting inverse temperature.
     """
@@ -428,10 +430,12 @@ class ContingencyBeliefModel(SGDFittableMixin):
         self,
         n_states: int,
         n_options: int,
+        n_transition_covariates: int = 0,
         init_inverse_temperature: float = 1.0,
     ):
         self.n_states = n_states
         self.n_options = n_options
+        self.n_transition_covariates = n_transition_covariates
         self.inverse_temperature_ = init_inverse_temperature
 
         # Initialize parameters
@@ -440,21 +444,61 @@ class ContingencyBeliefModel(SGDFittableMixin):
             jax.random.PRNGKey(0), (n_states, n_options)
         ) * 0.1
         self.transition_logits_ = jnp.zeros((n_states, n_states))
+        if n_transition_covariates > 0:
+            self.transition_weights_ = jnp.zeros(
+                (n_states, n_states, n_transition_covariates)
+            )
+        else:
+            self.transition_weights_: Optional[Array] = None
 
-        # Fitted state
-        self._smoother_result = None
+        # Fitted state (public attributes per plan)
+        self.state_posterior_: Optional[Array] = None
+        self.smoothed_state_posterior_: Optional[Array] = None
+        self._smoother_result: Optional[SmootherResult] = None
         self.log_likelihood_: Optional[float] = None
         self.log_likelihood_history_: Optional[list[float]] = None
         self._n_trials: Optional[int] = None
+        self._transition_covariates: Optional[Array] = None
 
     @property
     def is_fitted(self) -> bool:
         return self._smoother_result is not None
 
+    def _smoother_kwargs(self, choices, rewards):
+        """Build kwargs for filter/smoother calls."""
+        kwargs = dict(
+            choices=choices,
+            rewards=rewards,
+            n_states=self.n_states,
+            n_options=self.n_options,
+            reward_probs=self.reward_probs_,
+            state_values=self.state_values_,
+            inverse_temperature=self.inverse_temperature_,
+            transition_logits=self.transition_logits_,
+        )
+        if self.transition_weights_ is not None:
+            kwargs["transition_weights"] = self.transition_weights_
+        if self._transition_covariates is not None:
+            kwargs["transition_covariates"] = self._transition_covariates
+        return kwargs
+
+    def _populate_fitted_state(self, result: SmootherResult) -> None:
+        """Store fitted state from smoother result."""
+        self._smoother_result = result
+        self.smoothed_state_posterior_ = result.smoothed_state_prob
+        self.log_likelihood_ = float(result.log_likelihood)
+        # Also run filter for causal posteriors
+        filter_result = contingency_belief_filter(
+            **{k: v for k, v in self._last_smoother_kwargs.items()
+               if k != "dummy"}  # reuse same kwargs
+        )
+        self.state_posterior_ = filter_result.state_posterior
+
     def fit(
         self,
         choices: ArrayLike,
         rewards: ArrayLike,
+        transition_covariates: Optional[ArrayLike] = None,
         max_iter: int = 50,
         tolerance: float = 1e-4,
     ) -> list[float]:
@@ -464,6 +508,8 @@ class ContingencyBeliefModel(SGDFittableMixin):
         ----------
         choices : ArrayLike, shape (n_trials,)
         rewards : ArrayLike, shape (n_trials,)
+        transition_covariates : ArrayLike or None, shape (n_trials, d_h)
+            Time-varying transition covariates.
         max_iter : int
         tolerance : float
 
@@ -475,22 +521,24 @@ class ContingencyBeliefModel(SGDFittableMixin):
         rewards = jnp.asarray(rewards, dtype=jnp.int32)
         self._n_trials = int(choices.shape[0])
 
+        if transition_covariates is not None:
+            self._transition_covariates = jnp.asarray(transition_covariates)
+        elif self.n_transition_covariates > 0:
+            raise ValueError(
+                f"Model has n_transition_covariates={self.n_transition_covariates}"
+                " but no transition_covariates were passed"
+            )
+
         log_likelihoods: list[float] = []
         prev_ll = float("-inf")
 
         for iteration in range(max_iter):
             # E-step: run smoother
-            result = contingency_belief_smoother(
-                choices=choices,
-                rewards=rewards,
-                n_states=self.n_states,
-                n_options=self.n_options,
-                reward_probs=self.reward_probs_,
-                state_values=self.state_values_,
-                inverse_temperature=self.inverse_temperature_,
-                transition_logits=self.transition_logits_,
-            )
+            kwargs = self._smoother_kwargs(choices, rewards)
+            self._last_smoother_kwargs = kwargs
+            result = contingency_belief_smoother(**kwargs)
             self._smoother_result = result
+            self.smoothed_state_posterior_ = result.smoothed_state_prob
             ll = float(result.log_likelihood)
             log_likelihoods.append(ll)
 
@@ -536,12 +584,17 @@ class ContingencyBeliefModel(SGDFittableMixin):
         # are learned via SGD (fit_sgd) instead.
 
     def predict_state_posterior(
-        self, choices: ArrayLike, rewards: ArrayLike
+        self,
+        choices: ArrayLike,
+        rewards: ArrayLike,
+        transition_covariates: Optional[ArrayLike] = None,
     ) -> Array:
         """Predict smoothed state posterior for given data."""
-        result = contingency_belief_smoother(
-            choices=jnp.asarray(choices, dtype=jnp.int32),
-            rewards=jnp.asarray(rewards, dtype=jnp.int32),
+        choices = jnp.asarray(choices, dtype=jnp.int32)
+        rewards = jnp.asarray(rewards, dtype=jnp.int32)
+        kwargs = dict(
+            choices=choices,
+            rewards=rewards,
             n_states=self.n_states,
             n_options=self.n_options,
             reward_probs=self.reward_probs_,
@@ -549,6 +602,11 @@ class ContingencyBeliefModel(SGDFittableMixin):
             inverse_temperature=self.inverse_temperature_,
             transition_logits=self.transition_logits_,
         )
+        if self.transition_weights_ is not None:
+            kwargs["transition_weights"] = self.transition_weights_
+        if transition_covariates is not None:
+            kwargs["transition_covariates"] = jnp.asarray(transition_covariates)
+        result = contingency_belief_smoother(**kwargs)
         return result.smoothed_state_prob
 
     # --- SGDFittableMixin protocol ---
@@ -557,6 +615,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
         self,
         choices: ArrayLike,
         rewards: ArrayLike,
+        transition_covariates: Optional[ArrayLike] = None,
         optimizer=None,
         num_steps: int = 200,
         verbose: bool = False,
@@ -568,6 +627,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
         ----------
         choices : ArrayLike, shape (n_trials,)
         rewards : ArrayLike, shape (n_trials,)
+        transition_covariates : ArrayLike or None, shape (n_trials, d_h)
         optimizer : optax optimizer or None
         num_steps : int
         verbose : bool
@@ -580,6 +640,14 @@ class ContingencyBeliefModel(SGDFittableMixin):
         choices = jnp.asarray(choices, dtype=jnp.int32)
         rewards = jnp.asarray(rewards, dtype=jnp.int32)
         self._n_trials = int(choices.shape[0])
+
+        if transition_covariates is not None:
+            self._transition_covariates = jnp.asarray(transition_covariates)
+        elif self.n_transition_covariates > 0:
+            raise ValueError(
+                f"Model has n_transition_covariates={self.n_transition_covariates}"
+                " but no transition_covariates were passed"
+            )
 
         return super().fit_sgd(
             choices, rewards,
@@ -615,10 +683,13 @@ class ContingencyBeliefModel(SGDFittableMixin):
             "inverse_temperature": POSITIVE,
             "transition_logits": UNCONSTRAINED,
         }
+        if self.transition_weights_ is not None:
+            params["transition_weights"] = self.transition_weights_
+            spec["transition_weights"] = UNCONSTRAINED
         return params, spec
 
     def _sgd_loss_fn(self, params: dict, choices: Array, rewards: Array) -> Array:
-        result = contingency_belief_filter(
+        kwargs = dict(
             choices=choices,
             rewards=rewards,
             n_states=self.n_states,
@@ -628,6 +699,11 @@ class ContingencyBeliefModel(SGDFittableMixin):
             inverse_temperature=params["inverse_temperature"],
             transition_logits=params["transition_logits"],
         )
+        if "transition_weights" in params:
+            kwargs["transition_weights"] = params["transition_weights"]
+        if self._transition_covariates is not None:
+            kwargs["transition_covariates"] = self._transition_covariates
+        result = contingency_belief_filter(**kwargs)
         return -result.log_likelihood
 
     def _store_sgd_params(self, params: dict) -> None:
@@ -635,17 +711,12 @@ class ContingencyBeliefModel(SGDFittableMixin):
         self.state_values_ = params["state_values"]
         self.inverse_temperature_ = float(params["inverse_temperature"])
         self.transition_logits_ = params["transition_logits"]
+        if "transition_weights" in params:
+            self.transition_weights_ = params["transition_weights"]
 
     def _finalize_sgd(self, choices: Array, rewards: Array) -> None:
-        result = contingency_belief_smoother(
-            choices=choices,
-            rewards=rewards,
-            n_states=self.n_states,
-            n_options=self.n_options,
-            reward_probs=self.reward_probs_,
-            state_values=self.state_values_,
-            inverse_temperature=self.inverse_temperature_,
-            transition_logits=self.transition_logits_,
-        )
+        kwargs = self._smoother_kwargs(choices, rewards)
+        result = contingency_belief_smoother(**kwargs)
         self._smoother_result = result
+        self.smoothed_state_posterior_ = result.smoothed_state_prob
         self.log_likelihood_ = float(result.log_likelihood)
