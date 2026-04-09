@@ -10,7 +10,7 @@ from typing import Dict, Any, Tuple, Optional, List
 from functools import partial
 from jax import Array
 
-from state_space_practice.kalman import psd_solve, symmetrize
+from state_space_practice.kalman import psd_solve, symmetrize, joseph_form_update
 from state_space_practice.oscillator_models import BaseModel
 from state_space_practice.parameter_transforms import UNCONSTRAINED, POSITIVE, ParameterTransform
 from state_space_practice.sgd_fitting import SGDFittableMixin
@@ -107,7 +107,7 @@ class JointHamiltonianModel(BaseModel, SGDFittableMixin):
 
             err_l = y_lfp_t - (C_l @ m_pred + d_l)
             m_mid = m_pred + K_l @ err_l
-            P_mid = P_pred - K_l @ C_l @ P_pred
+            P_mid = joseph_form_update(P_pred, K_l, C_l, R_l)
 
             sign, logdet = jnp.linalg.slogdet(S_l)
             ll_lfp = -0.5 * (err_l @ psd_solve(S_l, err_l) + logdet)
@@ -159,7 +159,7 @@ class JointHamiltonianModel(BaseModel, SGDFittableMixin):
             S_l = C_l @ P_pred @ C_l.T + R_l
             K_l = psd_solve(S_l, C_l @ P_pred).T
             m_mid = m_pred + K_l @ (y_lfp_t - (C_l @ m_pred + d_l))
-            P_mid = P_pred - K_l @ C_l @ P_pred
+            P_mid = joseph_form_update(P_pred, K_l, C_l, R_l)
 
             # Spike Update
             rate_mid = jnp.exp(jnp.dot(C_s, m_mid) + d_s) * self.dt

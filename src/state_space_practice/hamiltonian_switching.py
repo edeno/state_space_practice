@@ -10,7 +10,7 @@ from typing import Dict, Any, Tuple, Optional, List
 from functools import partial
 from jax import Array
 
-from state_space_practice.kalman import psd_solve, symmetrize
+from state_space_practice.kalman import psd_solve, symmetrize, joseph_form_update
 from state_space_practice.hamiltonian_joint import JointHamiltonianModel
 from state_space_practice.parameter_transforms import UNCONSTRAINED, STOCHASTIC_ROW, ParameterTransform
 from state_space_practice.nonlinear_dynamics import (
@@ -98,7 +98,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
                 S_l = C_l @ Pp @ C_l.T + R_l
                 K_l = psd_solve(S_l, C_l @ Pp).T
                 m_mid = mp + K_l @ (y_lfp_t - (C_l @ mp + d_l))
-                P_mid = Pp - K_l @ C_l @ Pp
+                P_mid = joseph_form_update(Pp, K_l, C_l, R_l)
                 err_l = y_lfp_t - (C_l @ mp + d_l)
                 sign, logdet = jnp.linalg.slogdet(S_l)
                 ll_l = -0.5 * (err_l @ psd_solve(S_l, err_l) + logdet)
@@ -128,7 +128,17 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
 
     @partial(jax.jit, static_argnums=(0,))
     def smooth(self, lfp_data: Array, spike_data: Array, params: Dict[str, Any]) -> Tuple[Array, Array, Array]:
-        """Switching RTS Smoother (Simplified state-conditional version)."""
+        """Switching EKF-RTS smoother with Kim-style discrete-state smoothing.
+
+        Returns smoothed continuous means and covariances per discrete state,
+        plus smoothed discrete-state probabilities.
+
+        Returns
+        -------
+        smoothed_means : Array, shape (n_time, n_latent, n_discrete_states)
+        smoothed_covs : Array, shape (n_time, n_latent, n_latent, n_discrete_states)
+        smoothed_probs : Array, shape (n_time, n_discrete_states)
+        """
         mlp_params, omega = params["mlp"], params["omega"]
         Z = params["Z"]
         C_l, d_l = params["C_lfp"], params["d_lfp"]
@@ -165,7 +175,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
                 S_l = C_l @ Pp @ C_l.T + R_l
                 K_l = psd_solve(S_l, C_l @ Pp).T
                 m_mid = mp + K_l @ (y_lfp_t - (C_l @ mp + d_l))
-                P_mid = Pp - K_l @ C_l @ Pp
+                P_mid = joseph_form_update(Pp, K_l, C_l, R_l)
                 err_l = y_lfp_t - (C_l @ mp + d_l)
                 sign, logdet = jnp.linalg.slogdet(S_l)
                 ll_l = -0.5 * (err_l @ psd_solve(S_l, err_l) + logdet)
@@ -184,29 +194,38 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
             m_f, P_f = m_f.T, P_f.transpose(1, 2, 0)
             scaled_lik, _ = _scale_likelihood(lls_k)
             pi_filt = _divide_safe(scaled_lik * pi_pred_k, jnp.sum(scaled_lik * pi_pred_k))
-            return (m_f, P_f, pi_filt), (m_f, P_f, m_p_k, P_p_k, F_jk, joint_pi_pred, pi_pred_k)
+            return (m_f, P_f, pi_filt), (m_f, P_f, m_p_k, P_p_k, F_jk, joint_pi_pred, pi_pred_k, pi_filt)
 
         m0 = params["init_mean"]
         P0 = self.init_cov
         pi0 = params["init_pi"]
-        _, (m_filt, P_filt, m_pred, P_pred, F_all, joint_pi_all, pi_pred_all) = jax.lax.scan(forward_step, (m0, P0, pi0), (lfp_data, spike_data))
+        _, (m_filt, P_filt, m_pred, P_pred, F_all, joint_pi_all, pi_pred_all, pi_filt_all) = jax.lax.scan(forward_step, (m0, P0, pi0), (lfp_data, spike_data))
 
         def backward_step(carry, inputs):
-            m_s_next, P_s_next = carry
-            m_f_t, P_f_t, m_p_next, P_p_next, F_next_jk, joint_pi_next, pi_pred_next_k = inputs
+            m_s_next, P_s_next, pi_s_next = carry
+            m_f_t, P_f_t, m_p_next, P_p_next, F_next_jk, joint_pi_next, pi_pred_next_k, pi_filt_t = inputs
+
+            # Smooth discrete states
+            # pi_smooth[t,k] = pi_filt[t,k] * sum_j(Z[k,j] * pi_smooth[t+1,j] / pi_pred[t+1,j])
+            ratio = _divide_safe(pi_s_next, pi_pred_next_k)
+            pi_s_t = pi_filt_t * (Z @ ratio)
+            pi_s_t = _divide_safe(pi_s_t, jnp.sum(pi_s_t))  # normalize
+
             def smooth_k(k):
                 w_jk = _divide_safe(joint_pi_next[:, k], pi_pred_next_k[k])
                 F_avg = jnp.sum(w_jk[:, None, None] * F_next_jk[:, k, :, :], axis=0)
                 return ekf_smooth_step(m_f_t[:, k], P_f_t[:, :, k], m_p_next[:, k], P_p_next[:, :, k], m_s_next[:, k], P_s_next[:, :, k], F_avg)
             m_s, P_s = jax.vmap(smooth_k)(jnp.arange(K_states))
-            return (m_s.T, P_s.transpose(1, 2, 0)), (m_s.T, P_s.transpose(1, 2, 0))
+            return (m_s.T, P_s.transpose(1, 2, 0), pi_s_t), (m_s.T, P_s.transpose(1, 2, 0), pi_s_t)
 
-        init_s = (m_filt[-1], P_filt[-1])
-        bw_in = (m_filt[:-1], P_filt[:-1], m_pred[1:], P_pred[1:], F_all[1:], joint_pi_all[1:], pi_pred_all[1:])
-        _, (m_smooth_rev, P_smooth_rev) = jax.lax.scan(backward_step, init_s, bw_in, reverse=True)
+        # Use last filtered probs as initial smoothed probs
+        init_s = (m_filt[-1], P_filt[-1], pi_filt_all[-1])
+        bw_in = (m_filt[:-1], P_filt[:-1], m_pred[1:], P_pred[1:], F_all[1:], joint_pi_all[1:], pi_pred_all[1:], pi_filt_all[:-1])
+        _, (m_smooth_rev, P_smooth_rev, pi_smooth_rev) = jax.lax.scan(backward_step, init_s, bw_in, reverse=True)
         m_s = jnp.concatenate([m_smooth_rev, m_filt[-1:]], axis=0)
         P_s = jnp.concatenate([P_smooth_rev, P_filt[-1:]], axis=0)
-        return m_s, P_s
+        pi_s = jnp.concatenate([pi_smooth_rev, pi_filt_all[-1:]], axis=0)
+        return m_s, P_s, pi_s
 
     def _build_param_spec(self) -> Tuple[Dict[str, Any], Dict[str, ParameterTransform]]:
         params, spec = super()._build_param_spec()

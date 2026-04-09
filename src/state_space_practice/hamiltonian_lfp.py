@@ -9,7 +9,7 @@ from typing import Dict, Any, Tuple, Optional, List
 from functools import partial
 from jax import Array
 
-from state_space_practice.kalman import psd_solve
+from state_space_practice.kalman import psd_solve, joseph_form_update
 from state_space_practice.oscillator_models import BaseModel
 from state_space_practice.parameter_transforms import UNCONSTRAINED, POSITIVE, ParameterTransform
 from state_space_practice.sgd_fitting import SGDFittableMixin
@@ -86,7 +86,7 @@ class HamiltonianLFPModel(BaseModel, SGDFittableMixin):
             K = psd_solve(S, C @ P_pred).T
             err = y_t - (C @ m_pred + d)
             m_post = m_pred + K @ err
-            P_post = P_pred - K @ C @ P_pred
+            P_post = joseph_form_update(P_pred, K, C, R)
             sign, logdet = jnp.linalg.slogdet(S)
             ll = -0.5 * (err @ psd_solve(S, err) + logdet + self.n_sources * jnp.log(2 * jnp.pi))
             return (m_post, P_post), (m_post, P_post, ll)
@@ -113,7 +113,7 @@ class HamiltonianLFPModel(BaseModel, SGDFittableMixin):
             S = C @ P_pred @ C.T + R
             K = psd_solve(S, C @ P_pred).T
             m_post = m_pred + K @ (y_t - (C @ m_pred + d))
-            P_post = P_pred - K @ C @ P_pred
+            P_post = joseph_form_update(P_pred, K, C, R)
             return (m_post, P_post), (m_post, P_post, m_pred, P_pred, F_t)
 
         m0 = params["init_mean"]
