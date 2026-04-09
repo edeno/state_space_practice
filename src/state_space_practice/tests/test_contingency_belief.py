@@ -476,3 +476,86 @@ class TestContingencyBeliefIntegration:
         # Coefficients should have expanded for the covariate
         assert model.transition_coefficients_.shape[0] == 2
         assert model.is_fitted
+
+
+class TestObservationDesignMatrix:
+    """Tests for observation-side design matrix (obs_design_matrix / obs_weights)."""
+
+    def test_no_obs_covariates_unchanged(self):
+        """Omitting obs inputs should reproduce original behavior."""
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=50)
+        # Without obs covariates
+        result_base = contingency_belief_filter(
+            choices=choices, rewards=rewards, n_states=2, n_options=3,
+            reward_probs=jnp.array([[0.8, 0.1, 0.1], [0.1, 0.1, 0.8]]),
+            state_values=jnp.array([[1.0, 0.0, -1.0], [-1.0, 0.0, 1.0]]),
+            inverse_temperature=1.0,
+            transition_logits=jnp.zeros((2, 1)),
+        )
+        # With zero obs covariates (should be identical)
+        result_zero = contingency_belief_filter(
+            choices=choices, rewards=rewards, n_states=2, n_options=3,
+            reward_probs=jnp.array([[0.8, 0.1, 0.1], [0.1, 0.1, 0.8]]),
+            state_values=jnp.array([[1.0, 0.0, -1.0], [-1.0, 0.0, 1.0]]),
+            inverse_temperature=1.0,
+            transition_logits=jnp.zeros((2, 1)),
+            obs_design_matrix=jnp.zeros((50, 1)),
+            obs_weights=jnp.zeros((3, 1)),
+        )
+        np.testing.assert_allclose(
+            result_base.state_posterior, result_zero.state_posterior, atol=1e-10
+        )
+
+    def test_obs_offset_shifts_choice_probs(self):
+        """Nonzero obs offset should change action probabilities."""
+        from state_space_practice.contingency_belief import (
+            compute_choice_log_likelihood,
+        )
+
+        state_values = jnp.array([[1.0, 0.0], [0.0, 1.0]])
+        # Without offset
+        ll_base = compute_choice_log_likelihood(0, state_values, 1.0)
+        # With offset favoring option 1
+        ll_offset = compute_choice_log_likelihood(
+            0, state_values, 1.0, obs_offset=jnp.array([-2.0, 2.0])
+        )
+        # Offset should reduce LL of choosing option 0
+        assert float(ll_offset[0]) < float(ll_base[0])
+
+    def test_model_fit_sgd_with_obs_covariates(self):
+        """Model should accept and learn obs_weights via SGD."""
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=80)
+        # Stay bias: obs_design_matrix encodes previous choice
+        obs_dm = jnp.zeros((80, 3))
+        for t in range(1, 80):
+            obs_dm = obs_dm.at[t, choices[t - 1]].set(1.0)
+
+        model = ContingencyBeliefModel(
+            n_states=2, n_options=3, n_obs_covariates=3,
+        )
+        lls = model.fit_sgd(
+            choices, rewards, obs_design_matrix=obs_dm, num_steps=30,
+        )
+        assert lls[-1] > lls[0]
+        assert model.obs_weights_ is not None
+        assert model.obs_weights_.shape == (3, 3)
+
+    def test_model_predict_with_obs_covariates(self):
+        """predict_state_posterior should use obs_design_matrix."""
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=60)
+        obs_dm = jnp.zeros((60, 1))
+        obs_dm = obs_dm.at[30:, 0].set(1.0)  # obs covariate active in second half
+
+        model = ContingencyBeliefModel(
+            n_states=2, n_options=3, n_obs_covariates=1,
+        )
+        model.fit_sgd(
+            choices, rewards, obs_design_matrix=obs_dm, num_steps=20,
+        )
+        # Predict on different data with obs covariates
+        new_obs_dm = jnp.ones((60, 1))
+        posterior = model.predict_state_posterior(
+            choices, rewards, obs_design_matrix=new_obs_dm,
+        )
+        assert posterior.shape == (60, 2)
+        np.testing.assert_allclose(posterior.sum(axis=1), 1.0, atol=1e-6)
