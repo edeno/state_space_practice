@@ -89,8 +89,7 @@ def _softmax_predict_and_update(
     # Recompute LL at the MAP mode (not prior mean) for correct
     # discrete-state weighting in the switching filter
     v_mode = jnp.concatenate([jnp.zeros(1), post_mean])
-    _offset = obs_offset if obs_offset is not None else jnp.zeros(n_options)
-    ll = jax.nn.log_softmax(inverse_temperature * v_mode + _offset)[choice]
+    ll = jax.nn.log_softmax(inverse_temperature * v_mode + obs_offset)[choice]
 
     return post_mean, post_cov, ll
 
@@ -540,9 +539,10 @@ class SwitchingChoiceModel(SGDFittableMixin):
         prev_ll = float("-inf")
 
         for iteration in range(max_iter):
-            # E-step
+            # E-step: filter + smoother
             result = self._run_filter(choices, self._covariates, self._obs_covariates)
             self._filter_result = result
+            smoother_result = self._run_smoother(result)
             ll = float(result.marginal_log_likelihood)
             log_likelihoods.append(ll)
 
@@ -551,52 +551,56 @@ class SwitchingChoiceModel(SGDFittableMixin):
                 break
             prev_ll = ll
 
-            # M-step (simplified: update per-state Q and transition matrix)
-            self._m_step(choices, result)
+            # M-step
+            self._m_step(choices, result, smoother_result)
 
-        # Run smoother for discrete state posteriors
-        from state_space_practice.switching_kalman import switching_kalman_smoother
-        smoother_result = switching_kalman_smoother(
-            filter_mean=result.filtered_values,
-            filter_cov=result.filtered_covs,
-            filter_discrete_state_prob=result.discrete_state_probs,
-            last_filter_conditional_cont_mean=result.pair_cond_means[-1],
-            process_cov=jnp.stack(
-                [q * jnp.eye(self.n_options - 1) for q in self.process_noises_],
-                axis=-1,
-            ),
-            continuous_transition_matrix=jnp.stack(
-                [d * jnp.eye(self.n_options - 1) for d in self.decays_],
-                axis=-1,
-            ),
-            discrete_state_transition_matrix=self.discrete_transition_matrix_,
-        )
-        self.smoothed_discrete_probs_ = smoother_result[2]  # smoothed discrete probs
-
+        self.smoothed_discrete_probs_ = smoother_result[2]
         self.log_likelihood_ = log_likelihoods[-1]
         self.log_likelihood_history_ = log_likelihoods
         return log_likelihoods
 
-    def _m_step(self, choices, result):
-        """Simplified M-step: update per-state Q and transition matrix."""
-        gamma = result.discrete_state_probs  # (T, S)
+    def _run_smoother(self, filter_result):
+        """Run the switching Kalman smoother on filter output."""
+        from state_space_practice.switching_kalman import switching_kalman_smoother
+
+        k_free = self.n_options - 1
+        return switching_kalman_smoother(
+            filter_mean=filter_result.filtered_values,
+            filter_cov=filter_result.filtered_covs,
+            filter_discrete_state_prob=filter_result.discrete_state_probs,
+            last_filter_conditional_cont_mean=filter_result.pair_cond_means[-1],
+            process_cov=jnp.stack(
+                [q * jnp.eye(k_free) for q in self.process_noises_], axis=-1,
+            ),
+            continuous_transition_matrix=jnp.stack(
+                [d * jnp.eye(k_free) for d in self.decays_], axis=-1,
+            ),
+            discrete_state_transition_matrix=self.discrete_transition_matrix_,
+        )
+
+    def _m_step(self, choices, filter_result, smoother_result):
+        """M-step: update per-state Q and transition matrix.
+
+        Uses smoother joint discrete state probabilities for the transition
+        matrix (proper EM), and smoother discrete state probabilities for Q.
+        """
+        gamma = smoother_result[2]  # smoothed discrete probs (T, S)
+        joint = smoother_result[3]  # smoother joint (T-1, S, S)
         S = self.n_discrete_states
         eps = 1e-10
 
         # Per-state process noise: weighted variance of value increments
-        values = result.filtered_values  # (T, K-1, S)
+        values = filter_result.filtered_values  # (T, K-1, S)
         for s in range(S):
             w = gamma[1:, s]  # (T-1,)
             w_sum = jnp.maximum(jnp.sum(w), eps)
             diff = values[1:, :, s] - self.decays_[s] * values[:-1, :, s]
-            # Weighted mean squared increment
             q_hat = jnp.sum(w[:, None] * diff**2, axis=0).mean() / w_sum
             self.process_noises_ = self.process_noises_.at[s].set(
                 jnp.maximum(q_hat, 1e-6)
             )
 
-        # Transition matrix from consecutive discrete probs (simple estimate)
-        joint = gamma[:-1, :, None] * gamma[1:, None, :]  # (T-1, S, S)
+        # Transition matrix from smoother joint (proper EM)
         trans_counts = joint.sum(axis=0)  # (S, S)
         row_sums = trans_counts.sum(axis=1, keepdims=True)
         self.discrete_transition_matrix_ = trans_counts / jnp.maximum(row_sums, eps)
@@ -700,23 +704,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
     def _finalize_sgd(self, choices: Array) -> None:
         result = self._run_filter(choices, self._covariates, self._obs_covariates)
         self._filter_result = result
-
-        from state_space_practice.switching_kalman import switching_kalman_smoother
-        smoother_result = switching_kalman_smoother(
-            filter_mean=result.filtered_values,
-            filter_cov=result.filtered_covs,
-            filter_discrete_state_prob=result.discrete_state_probs,
-            last_filter_conditional_cont_mean=result.pair_cond_means[-1],
-            process_cov=jnp.stack(
-                [q * jnp.eye(self.n_options - 1) for q in self.process_noises_],
-                axis=-1,
-            ),
-            continuous_transition_matrix=jnp.stack(
-                [d * jnp.eye(self.n_options - 1) for d in self.decays_],
-                axis=-1,
-            ),
-            discrete_state_transition_matrix=self.discrete_transition_matrix_,
-        )
+        smoother_result = self._run_smoother(result)
         self.smoothed_discrete_probs_ = smoother_result[2]
         self.log_likelihood_ = float(result.marginal_log_likelihood)
 
@@ -788,38 +776,41 @@ def simulate_switching_choice_data(
     else:
         transition_matrix = jnp.asarray(transition_matrix)
 
-    # Simulate
-    k1, k2, k3, k4 = jax.random.split(key, 4)
+    # Simulate via lax.scan for efficiency
+    k1, k2, k3 = jax.random.split(key, 3)
+    state_keys = jax.random.split(k1, n_trials)
+    value_keys = jax.random.split(k2, n_trials)
+    choice_keys = jax.random.split(k3, n_trials)
 
-    # States
-    states = jnp.zeros(n_trials, dtype=jnp.int32)
-    state = 0
-    state_list = [state]
-    for t in range(1, n_trials):
-        k_t = jax.random.fold_in(k1, t)
-        state = jax.random.choice(k_t, S, p=transition_matrix[state])
-        state_list.append(int(state))
-    states = jnp.array(state_list, dtype=jnp.int32)
+    # States via scan
+    def _state_step(prev_state, key_t):
+        next_state = jax.random.choice(key_t, S, p=transition_matrix[prev_state])
+        next_state = jnp.int32(next_state)
+        return next_state, next_state
 
-    # Values
-    values = jnp.zeros((n_trials, k_free))
-    for t in range(1, n_trials):
-        s = states[t]
-        k_t = jax.random.fold_in(k2, t)
-        noise = jax.random.normal(k_t, (k_free,)) * jnp.sqrt(process_noises[s])
-        values = values.at[t].set(decays[s] * values[t - 1] + noise)
+    _, states = jax.lax.scan(_state_step, jnp.int32(0), state_keys[1:])
+    states = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), states])
 
-    # Choices
-    choices = jnp.zeros(n_trials, dtype=jnp.int32)
-    all_probs = jnp.zeros((n_trials, n_options))
-    for t in range(n_trials):
-        s = states[t]
-        v = jnp.concatenate([jnp.zeros(1), values[t]])
-        probs = jax.nn.softmax(inverse_temperatures[s] * v)
-        all_probs = all_probs.at[t].set(probs)
-        k_t = jax.random.fold_in(k3, t)
-        c = jax.random.choice(k_t, n_options, p=probs)
-        choices = choices.at[t].set(jnp.int32(c))
+    # Values via scan
+    def _value_step(prev_val, inputs):
+        key_t, state_t = inputs
+        noise = jax.random.normal(key_t, (k_free,)) * jnp.sqrt(process_noises[state_t])
+        new_val = decays[state_t] * prev_val + noise
+        return new_val, new_val
+
+    _, values_rest = jax.lax.scan(
+        _value_step, jnp.zeros(k_free), (value_keys[1:], states[1:])
+    )
+    values = jnp.concatenate([jnp.zeros((1, k_free)), values_rest], axis=0)
+
+    # Choices via vmap (independent across trials)
+    def _sample_choice(key_t, val_t, state_t):
+        v = jnp.concatenate([jnp.zeros(1), val_t])
+        probs = jax.nn.softmax(inverse_temperatures[state_t] * v)
+        c = jax.random.choice(key_t, n_options, p=probs)
+        return c, probs
+
+    choices, all_probs = jax.vmap(_sample_choice)(choice_keys, values, states)
 
     return SimulatedSwitchingChoiceData(
         choices=choices,
