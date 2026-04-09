@@ -708,3 +708,101 @@ class SwitchingChoiceModel(SGDFittableMixin):
         )
         self.smoothed_discrete_probs_ = smoother_result[2]
         self.log_likelihood_ = float(result.marginal_log_likelihood)
+
+
+class SimulatedSwitchingChoiceData(NamedTuple):
+    """Simulated switching choice data."""
+
+    choices: Array        # (n_trials,)
+    true_values: Array    # (n_trials, K-1)
+    true_states: Array    # (n_trials,)
+    true_probs: Array     # (n_trials, K)
+
+
+def simulate_switching_choice_data(
+    n_trials: int = 200,
+    n_options: int = 3,
+    n_discrete_states: int = 2,
+    process_noises: Optional[ArrayLike] = None,
+    inverse_temperatures: Optional[ArrayLike] = None,
+    decays: Optional[ArrayLike] = None,
+    transition_matrix: Optional[ArrayLike] = None,
+    seed: int = 42,
+) -> SimulatedSwitchingChoiceData:
+    """Simulate switching multi-armed bandit choice data.
+
+    Parameters
+    ----------
+    n_trials : int
+    n_options : int
+    n_discrete_states : int
+    process_noises : ArrayLike or None, shape (S,)
+    inverse_temperatures : ArrayLike or None, shape (S,)
+    decays : ArrayLike or None, shape (S,)
+    transition_matrix : ArrayLike or None, shape (S, S)
+    seed : int
+
+    Returns
+    -------
+    SimulatedSwitchingChoiceData
+    """
+    S = n_discrete_states
+    k_free = n_options - 1
+    key = jax.random.PRNGKey(seed)
+
+    if process_noises is None:
+        process_noises = jnp.array([0.001, 0.05][:S])
+    else:
+        process_noises = jnp.asarray(process_noises)
+    if inverse_temperatures is None:
+        inverse_temperatures = jnp.array([5.0, 0.5][:S])
+    else:
+        inverse_temperatures = jnp.asarray(inverse_temperatures)
+    if decays is None:
+        decays = jnp.ones(S)
+    else:
+        decays = jnp.asarray(decays)
+    if transition_matrix is None:
+        transition_matrix = 0.95 * jnp.eye(S) + 0.05 / S * jnp.ones((S, S))
+    else:
+        transition_matrix = jnp.asarray(transition_matrix)
+
+    # Simulate
+    k1, k2, k3, k4 = jax.random.split(key, 4)
+
+    # States
+    states = jnp.zeros(n_trials, dtype=jnp.int32)
+    state = 0
+    state_list = [state]
+    for t in range(1, n_trials):
+        k_t = jax.random.fold_in(k1, t)
+        state = jax.random.choice(k_t, S, p=transition_matrix[state])
+        state_list.append(int(state))
+    states = jnp.array(state_list, dtype=jnp.int32)
+
+    # Values
+    values = jnp.zeros((n_trials, k_free))
+    for t in range(1, n_trials):
+        s = states[t]
+        k_t = jax.random.fold_in(k2, t)
+        noise = jax.random.normal(k_t, (k_free,)) * jnp.sqrt(process_noises[s])
+        values = values.at[t].set(decays[s] * values[t - 1] + noise)
+
+    # Choices
+    choices = jnp.zeros(n_trials, dtype=jnp.int32)
+    all_probs = jnp.zeros((n_trials, n_options))
+    for t in range(n_trials):
+        s = states[t]
+        v = jnp.concatenate([jnp.zeros(1), values[t]])
+        probs = jax.nn.softmax(inverse_temperatures[s] * v)
+        all_probs = all_probs.at[t].set(probs)
+        k_t = jax.random.fold_in(k3, t)
+        c = jax.random.choice(k_t, n_options, p=probs)
+        choices = choices.at[t].set(jnp.int32(c))
+
+    return SimulatedSwitchingChoiceData(
+        choices=choices,
+        true_values=values,
+        true_states=states,
+        true_probs=all_probs,
+    )

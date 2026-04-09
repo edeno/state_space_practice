@@ -309,3 +309,68 @@ class TestSwitchingChoiceModel:
         model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
         model.fit_sgd(choices, num_steps=15)
         assert model.is_fitted
+
+
+class TestSimulateSwitchingChoiceData:
+    """Tests for the simulation helper."""
+
+    def test_output_shapes(self):
+        from state_space_practice.switching_choice import simulate_switching_choice_data
+
+        sim = simulate_switching_choice_data(n_trials=100, n_options=3, seed=42)
+        assert sim.choices.shape == (100,)
+        assert sim.true_values.shape == (100, 2)  # K-1
+        assert sim.true_states.shape == (100,)
+        assert sim.true_probs.shape == (100, 3)
+
+    def test_choices_valid(self):
+        from state_space_practice.switching_choice import simulate_switching_choice_data
+
+        sim = simulate_switching_choice_data(n_trials=200, n_options=4, seed=0)
+        assert jnp.all(sim.choices >= 0)
+        assert jnp.all(sim.choices < 4)
+
+    def test_states_valid(self):
+        from state_space_practice.switching_choice import simulate_switching_choice_data
+
+        sim = simulate_switching_choice_data(
+            n_trials=200, n_options=3, n_discrete_states=3, seed=0
+        )
+        assert jnp.all(sim.true_states >= 0)
+        assert jnp.all(sim.true_states < 3)
+
+    def test_seed_reproducibility(self):
+        from state_space_practice.switching_choice import simulate_switching_choice_data
+
+        s1 = simulate_switching_choice_data(n_trials=50, n_options=3, seed=42)
+        s2 = simulate_switching_choice_data(n_trials=50, n_options=3, seed=42)
+        np.testing.assert_array_equal(s1.choices, s2.choices)
+
+
+class TestModelComparison:
+    """Tests for switching vs non-switching model comparison."""
+
+    def test_switching_beats_nonswitching_on_switching_data(self):
+        from state_space_practice.covariate_choice import CovariateChoiceModel
+        from state_space_practice.switching_choice import (
+            SwitchingChoiceModel,
+            simulate_switching_choice_data,
+        )
+
+        sim = simulate_switching_choice_data(
+            n_trials=200, n_options=3, n_discrete_states=2,
+            inverse_temperatures=jnp.array([5.0, 0.5]),
+            process_noises=jnp.array([0.001, 0.05]),
+            seed=42,
+        )
+
+        # Switching model
+        model_sw = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model_sw.fit_sgd(sim.choices, num_steps=100)
+
+        # Non-switching model
+        model_ns = CovariateChoiceModel(n_options=3)
+        model_ns.fit_sgd(sim.choices, num_steps=100)
+
+        # Switching model should have better LL on switching data
+        assert model_sw.log_likelihood_ > model_ns.log_likelihood_
