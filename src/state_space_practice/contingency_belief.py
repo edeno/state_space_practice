@@ -811,17 +811,21 @@ class ContingencyBeliefModel(SGDFittableMixin):
         rewards: ArrayLike,
         transition_covariates: Optional[ArrayLike] = None,
     ) -> Array:
-        """Predict smoothed state posterior for given data."""
+        """Predict smoothed state posterior for given data.
+
+        Always builds a fresh design matrix from the input length — does
+        not reuse the training design matrix.
+        """
         choices = jnp.asarray(choices, dtype=jnp.int32)
         rewards = jnp.asarray(rewards, dtype=jnp.int32)
         n_trials = int(choices.shape[0])
-        # Temporarily set design matrix for this prediction
+        # Build fresh design matrix for this prediction
         old_dm = self._transition_design_matrix
         if transition_covariates is not None:
             self._transition_design_matrix = self._build_design_matrix(
                 n_trials, jnp.asarray(transition_covariates)
             )
-        elif old_dm is None:
+        else:
             self._transition_design_matrix = self._build_design_matrix(n_trials)
         kwargs = self._smoother_kwargs(choices, rewards)
         result = contingency_belief_smoother(**kwargs)

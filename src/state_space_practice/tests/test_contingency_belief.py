@@ -434,6 +434,31 @@ class TestContingencyBeliefIntegration:
         assert model.state_posterior_.shape == (60, 2)
         assert model.smoothed_state_posterior_.shape == (60, 2)
 
+    def test_predict_on_different_length_after_covariate_fit(self):
+        """predict_state_posterior should work on sequences of any length."""
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=100)
+        covariates = jnp.zeros((100, 1))
+        covariates = covariates.at[50, 0].set(1.0)
+
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.fit_sgd(choices, rewards, transition_covariates=covariates, num_steps=20)
+
+        # Predict on shorter sequence (no covariates — stationary)
+        short_choices = choices[:30]
+        short_rewards = rewards[:30]
+        posterior = model.predict_state_posterior(short_choices, short_rewards)
+        assert posterior.shape == (30, 2)
+        np.testing.assert_allclose(posterior.sum(axis=1), 1.0, atol=1e-6)
+
+        # Predict on longer sequence with new covariates
+        long_choices = jnp.concatenate([choices, choices])
+        long_rewards = jnp.concatenate([rewards, rewards])
+        long_cov = jnp.zeros((200, 1))
+        posterior_long = model.predict_state_posterior(
+            long_choices, long_rewards, transition_covariates=long_cov
+        )
+        assert posterior_long.shape == (200, 2)
+
     def test_em_with_transition_covariates(self):
         """EM should use transition covariates in the E-step."""
         choices, rewards, _, _ = _simulate_block_bandit(n_trials=100)
