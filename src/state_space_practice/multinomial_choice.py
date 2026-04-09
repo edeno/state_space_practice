@@ -72,7 +72,7 @@ def _softmax_update_core(
     beta_sq = beta**2
     _obs_offset = obs_offset if obs_offset is not None else jnp.zeros(n_options)
 
-    # Log-likelihood at the prior mean (for EM monitoring)
+    # Log-likelihood at the prior mean (for EM monitoring in non-switching models)
     v_prior = jnp.concatenate([zero_ref, prior_mean])
     log_lik = jax.nn.log_softmax(beta * v_prior + _obs_offset)[choice]
 

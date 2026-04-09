@@ -212,13 +212,17 @@ class TestSwitchingChoiceFilter:
             jnp.eye(k_free),  # init_cov
         )
 
-        # Allow small difference from first-timestep convention
-        # (switching filter: update-only at t=0; covariate filter: predict+update)
-        np.testing.assert_allclose(
-            float(result_sw.marginal_log_likelihood),
-            float(result_cov.marginal_log_likelihood),
-            atol=0.5,
-        )
+        # The switching filter evaluates LL at the MAP mode (for correct
+        # discrete-state weighting), while the non-switching filter evaluates
+        # at the prior mean (for EM convergence monitoring). These are
+        # intentionally different: mode-LL is systematically higher.
+        # Instead of comparing LL values, verify the filtered values match.
+        sw_values = result_sw.filtered_values[:, :, 0]  # (T, K-1) for state 0
+        cov_values = result_cov.filtered_values  # (T, K-1)
+        # Filtered values should be highly correlated
+        for dim in range(k_free):
+            corr = float(jnp.corrcoef(sw_values[:, dim], cov_values[:, dim])[0, 1])
+            assert corr > 0.95, f"Dim {dim}: corr={corr:.3f}"
 
     def test_two_state_switching_detected(self):
         """First half exploit (deterministic), second half explore (random)."""

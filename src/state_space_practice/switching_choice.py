@@ -80,10 +80,17 @@ def _softmax_predict_and_update(
     )
 
     # Update via softmax Laplace-EKF
-    post_mean, post_cov, ll = _softmax_update_core(
+    post_mean, post_cov, _ll_prior = _softmax_update_core(
         pred_mean, pred_cov, choice, n_options, inverse_temperature,
         obs_offset=obs_offset,
     )
+
+    # Recompute LL at the MAP mode (not prior mean) for correct
+    # discrete-state weighting in the switching filter
+    v_mode = jnp.concatenate([jnp.zeros(1), post_mean])
+    _offset = obs_offset if obs_offset is not None else jnp.zeros(n_options)
+    ll = jax.nn.log_softmax(inverse_temperature * v_mode + _offset)[choice]
+
     return post_mean, post_cov, ll
 
 
@@ -249,6 +256,8 @@ def switching_choice_filter(
         cov_arr = jnp.asarray(covariates)
         ig_arr = jnp.asarray(input_gain) if input_gain is not None else jnp.zeros((k_free, 1))
     else:
+        if input_gain is not None:
+            raise ValueError("input_gain provided but covariates is None")
         cov_arr = jnp.zeros((n_trials, 1))
         ig_arr = jnp.zeros((k_free, 1))
 
@@ -256,6 +265,10 @@ def switching_choice_filter(
         obs_cov_arr = jnp.asarray(obs_covariates)
         ow_arr = jnp.asarray(obs_weights)
     else:
+        if obs_covariates is not None or obs_weights is not None:
+            raise ValueError(
+                "obs_covariates and obs_weights must both be provided or both None"
+            )
         obs_cov_arr = jnp.zeros((n_trials, 1))
         ow_arr = jnp.zeros((n_options, 1))
 
@@ -276,10 +289,16 @@ def switching_choice_filter(
 
     # --- First timestep: update only (no dynamics prediction) ---
     def _first_update_for_state(prior_mean, prior_cov, beta):
-        return _softmax_update_core(
+        obs_offset_0 = ow_arr @ obs_cov_arr[0]
+        post_mean, post_cov, _ll_prior = _softmax_update_core(
             prior_mean, prior_cov, choices[0], n_options, beta,
-            obs_offset=ow_arr @ obs_cov_arr[0],
+            obs_offset=obs_offset_0,
         )
+        # LL at mode for discrete-state weighting
+        v_mode = jnp.concatenate([jnp.zeros(1), post_mean])
+        _off = obs_offset_0 if obs_offset_0 is not None else jnp.zeros(n_options)
+        ll = jax.nn.log_softmax(beta * v_mode + _off)[choices[0]]
+        return post_mean, post_cov, ll
 
     first_means, first_covs, first_lls = jax.vmap(
         _first_update_for_state,
