@@ -407,12 +407,29 @@ class TestContingencyBeliefIntegration:
         assert jnp.any(jnp.abs(model.transition_coefficients_[1:]) > 0.01)
 
     def test_fitted_state_attributes(self):
-        """Model should populate state_posterior_ and smoothed_state_posterior_."""
+        """Model should populate both state_posterior_ and smoothed_state_posterior_."""
         choices, rewards, _, _ = _simulate_block_bandit(n_trials=60)
         model = ContingencyBeliefModel(n_states=2, n_options=3)
         model.fit_sgd(choices, rewards, num_steps=20)
+        # Smoothed (acausal)
         assert model.smoothed_state_posterior_ is not None
         assert model.smoothed_state_posterior_.shape == (60, 2)
         np.testing.assert_allclose(
             model.smoothed_state_posterior_.sum(axis=1), 1.0, atol=1e-6
         )
+        # Causal (filtered)
+        assert model.state_posterior_ is not None
+        assert model.state_posterior_.shape == (60, 2)
+        np.testing.assert_allclose(
+            model.state_posterior_.sum(axis=1), 1.0, atol=1e-6
+        )
+
+    def test_em_populates_both_posteriors(self):
+        """EM should also populate both causal and smoothed posteriors."""
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=60)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.fit(choices, rewards, max_iter=5)
+        assert model.state_posterior_ is not None
+        assert model.smoothed_state_posterior_ is not None
+        assert model.state_posterior_.shape == (60, 2)
+        assert model.smoothed_state_posterior_.shape == (60, 2)

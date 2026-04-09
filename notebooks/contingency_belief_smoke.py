@@ -62,7 +62,8 @@ def main():
     print(f"Final LL: {em_lls[-1]:.2f}")
     print(f"Learned reward probs:\n  State 0: {model_em.reward_probs_[0]}")
     print(f"  State 1: {model_em.reward_probs_[1]}")
-    trans = jax.nn.softmax(model_em.transition_logits_, axis=1)
+    from state_space_practice.contingency_belief import centered_softmax
+    trans = centered_softmax(model_em._get_transition_logits())
     print(f"Transition matrix:\n{trans}")
 
     # --- SGD Fit ---
@@ -96,16 +97,15 @@ def main():
     covariates = jnp.zeros((n_trials, 1))
     covariates = covariates.at[n_trials // 2, 0].set(1.0)
 
-    model_cov = ContingencyBeliefModel(
-        n_states=2, n_options=3, n_transition_covariates=1,
-    )
+    model_cov = ContingencyBeliefModel(n_states=2, n_options=3)
     cov_lls = model_cov.fit_sgd(
         choices, rewards,
         transition_covariates=covariates,
         num_steps=200,
     )
     print(f"Final LL with covariates: {cov_lls[-1]:.2f}")
-    print(f"Transition weights: {model_cov.transition_weights_}")
+    print(f"Transition coefficients shape: {model_cov.transition_coefficients_.shape}")
+    print(f"Non-intercept coefficients:\n{model_cov.transition_coefficients_[1:]}")
 
     print("\n" + "=" * 60)
     print("Smoke check complete.")

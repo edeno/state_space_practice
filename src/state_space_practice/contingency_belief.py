@@ -666,8 +666,9 @@ class ContingencyBeliefModel(SGDFittableMixin):
         )
 
     def _smoother_kwargs(self, choices, rewards):
-        """Build kwargs for filter/smoother calls."""
-        return dict(
+        """Build kwargs for filter/smoother calls, including covariates."""
+        coefs = self.transition_coefficients_
+        kwargs = dict(
             choices=choices,
             rewards=rewards,
             n_states=self.n_states,
@@ -675,8 +676,13 @@ class ContingencyBeliefModel(SGDFittableMixin):
             reward_probs=self.reward_probs_,
             state_values=self.state_values_,
             inverse_temperature=self.inverse_temperature_,
-            transition_logits=self._get_transition_logits(),
+            transition_logits=coefs[0],  # intercept: (S, S-1)
         )
+        # Pass covariate-driven transitions if non-stationary
+        if coefs.shape[0] > 1 and self._transition_design_matrix is not None:
+            kwargs["transition_weights"] = jnp.moveaxis(coefs[1:], 0, -1)
+            kwargs["transition_covariates"] = self._transition_design_matrix[:, 1:]
+        return kwargs
 
     def fit(
         self,
@@ -744,6 +750,10 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
         self.log_likelihood_ = log_likelihoods[-1]
         self.log_likelihood_history_ = log_likelihoods
+        # Populate causal posterior from final parameters
+        filter_kwargs = self._smoother_kwargs(choices, rewards)
+        filter_result = contingency_belief_filter(**filter_kwargs)
+        self.state_posterior_ = filter_result.state_posterior
         return log_likelihoods
 
     def _m_step(self, choices, rewards, result):
@@ -804,8 +814,18 @@ class ContingencyBeliefModel(SGDFittableMixin):
         """Predict smoothed state posterior for given data."""
         choices = jnp.asarray(choices, dtype=jnp.int32)
         rewards = jnp.asarray(rewards, dtype=jnp.int32)
+        n_trials = int(choices.shape[0])
+        # Temporarily set design matrix for this prediction
+        old_dm = self._transition_design_matrix
+        if transition_covariates is not None:
+            self._transition_design_matrix = self._build_design_matrix(
+                n_trials, jnp.asarray(transition_covariates)
+            )
+        elif old_dm is None:
+            self._transition_design_matrix = self._build_design_matrix(n_trials)
         kwargs = self._smoother_kwargs(choices, rewards)
         result = contingency_belief_smoother(**kwargs)
+        self._transition_design_matrix = old_dm
         return result.smoothed_state_prob
 
     # --- SGDFittableMixin protocol ---
@@ -921,3 +941,6 @@ class ContingencyBeliefModel(SGDFittableMixin):
         self._smoother_result = result
         self.smoothed_state_posterior_ = result.smoothed_state_prob
         self.log_likelihood_ = float(result.log_likelihood)
+        # Also populate causal posterior
+        filter_result = contingency_belief_filter(**kwargs)
+        self.state_posterior_ = filter_result.state_posterior
