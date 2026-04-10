@@ -159,3 +159,6 @@ _version.py
 
 /data
 /output
+
+# Claude Code local settings
+.claude/
