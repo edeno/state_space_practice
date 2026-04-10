@@ -440,7 +440,7 @@ class TestSwitchingChoiceUncertainty:
         model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
         model.fit_sgd(choices, num_steps=10)
         assert model.per_state_predicted_variances_ is not None
-        assert model.per_state_predicted_variances_.shape == (50, 2, 3)  # (T, S, K)
+        assert model.per_state_predicted_variances_.shape == (50, 3, 2)  # (T, K, S)
 
     def test_predicted_uses_prior_not_posterior(self):
         """Predicted variances should be larger than filtered (prior > posterior)."""

@@ -533,18 +533,23 @@ class SwitchingChoiceModel(SGDFittableMixin):
         # Zero for reference option, then marginalize over states
         zero_ref = jnp.zeros((per_state_vars.shape[0], 1, per_state_vars.shape[2]))
         full_vars = jnp.concatenate([zero_ref, per_state_vars], axis=1)  # (T, K, S)
-        # Per-state predicted variances (before marginalization)
-        self.per_state_predicted_variances_ = jnp.moveaxis(full_vars, -1, 1)  # (T, S, K)
+        # Per-state predicted variances, shape (T, K, S) per plan convention
+        self.per_state_predicted_variances_ = full_vars  # (T, K, S)
 
         # Weighted average over states
         self.predicted_option_variances_ = jnp.einsum(
             "tks,ts->tk", full_vars, disc_probs
         )
 
-        # Smoothed variances: use smoothed discrete probs if available
-        if self.smoothed_discrete_probs_ is not None:
+        # Smoothed variances: use smoother state-conditional covariances
+        if hasattr(self, '_smoother_state_cond_covs') and self._smoother_state_cond_covs is not None:
+            smoother_diag = jnp.diagonal(
+                self._smoother_state_cond_covs, axis1=1, axis2=2
+            )  # (T, K-1, S)
+            zero_ref_sm = jnp.zeros((smoother_diag.shape[0], 1, smoother_diag.shape[2]))
+            full_sm_vars = jnp.concatenate([zero_ref_sm, smoother_diag], axis=1)
             self.smoothed_option_variances_ = jnp.einsum(
-                "tks,ts->tk", full_vars, self.smoothed_discrete_probs_
+                "tks,ts->tk", full_sm_vars, self.smoothed_discrete_probs_
             )
         else:
             self.smoothed_option_variances_ = self.predicted_option_variances_
@@ -650,6 +655,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
             self._m_step(choices, result, smoother_result)
 
         self.smoothed_discrete_probs_ = smoother_result[2]
+        self._smoother_state_cond_covs = smoother_result[6]  # (T, K-1, K-1, S)
         self.log_likelihood_ = log_likelihoods[-1]
         self.log_likelihood_history_ = log_likelihoods
         self._populate_uncertainty(choices)
@@ -809,6 +815,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
         self._filter_result = result
         smoother_result = self._run_smoother(result)
         self.smoothed_discrete_probs_ = smoother_result[2]
+        self._smoother_state_cond_covs = smoother_result[6]  # (T, K-1, K-1, S)
         self.log_likelihood_ = float(result.marginal_log_likelihood)
         self._populate_uncertainty(choices)
 

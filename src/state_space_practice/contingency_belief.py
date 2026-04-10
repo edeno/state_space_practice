@@ -749,21 +749,50 @@ class ContingencyBeliefModel(SGDFittableMixin):
             self.predicted_reward_variance_ = var
 
         # Surprise from PREDICTED (prior) choice probabilities.
-        # The predicted state is P(s_t | y_{1:t-1}), NOT the posterior
-        # P(s_t | y_{1:t}). We reconstruct it from the lagged posterior
-        # and transition matrix. At t=0, use init_state_prob.
+        # Uses time-varying transition matrices (from covariates if present)
+        # and observation offsets (from obs_design_matrix if present).
         if self.state_posterior_ is not None:
-            trans = centered_softmax(self._get_transition_logits())
-            # predicted[0] = init_state_prob, predicted[t] = T' @ posterior[t-1]
+            n_trials = len(choices)
             init_prob = jnp.ones(self.n_states) / self.n_states
-            predicted_state = jnp.concatenate([
-                init_prob[None, :],
-                (self.state_posterior_[:-1] @ trans),  # (T-1, S)
-            ], axis=0)  # (T, S)
 
-            logits = self.inverse_temperature_ * self.state_values_  # (S, K)
-            per_state_probs = jax.nn.softmax(logits, axis=1)  # (S, K)
-            predicted_probs = predicted_state @ per_state_probs  # (T, K)
+            # Build per-trial transition matrices
+            coefs = self.transition_coefficients_
+            if coefs.shape[0] > 1 and self._transition_design_matrix is not None:
+                # Non-stationary: compute per-trial transition matrix
+                trans_weights = jnp.moveaxis(coefs[1:], 0, -1)
+                dm_covs = self._transition_design_matrix[:, 1:]
+
+                def _get_trans_t(h_t):
+                    return compute_input_output_transition_matrix(
+                        coefs[0], trans_weights, h_t
+                    )
+                # predicted[t] = posterior[t-1] @ T_t for t > 0
+                pred_states = []
+                pred_states.append(init_prob)
+                for t in range(1, n_trials):
+                    T_t = _get_trans_t(dm_covs[t])
+                    pred_states.append(self.state_posterior_[t - 1] @ T_t)
+                predicted_state = jnp.stack(pred_states, axis=0)
+            else:
+                # Stationary
+                trans = centered_softmax(coefs[0])
+                predicted_state = jnp.concatenate([
+                    init_prob[None, :],
+                    (self.state_posterior_[:-1] @ trans),
+                ], axis=0)
+
+            # Per-state choice probs with obs offsets
+            base_logits = self.inverse_temperature_ * self.state_values_  # (S, K)
+            if self.obs_weights_ is not None and self._obs_design_matrix is not None:
+                # Per-trial obs offset
+                obs_offsets = self._obs_design_matrix @ self.obs_weights_.T  # (T, K)
+                per_state_logits = base_logits[None, :, :] + obs_offsets[:, None, :]  # (T, S, K)
+                per_state_probs = jax.nn.softmax(per_state_logits, axis=-1)  # (T, S, K)
+                predicted_probs = jnp.einsum("tsk,ts->tk", per_state_probs, predicted_state)
+            else:
+                per_state_probs = jax.nn.softmax(base_logits, axis=1)  # (S, K)
+                predicted_probs = predicted_state @ per_state_probs  # (T, K)
+
             self.surprise_ = compute_surprise(predicted_probs, choices)
 
     def _get_transition_logits(self) -> Array:
