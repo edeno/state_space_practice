@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from state_space_practice.oscillator_utils import (
@@ -411,3 +412,83 @@ def test_extract_dim_params_reconstructs_matrix():
 
     # Should be close
     assert jnp.allclose(A_reconstructed, A_original, atol=1e-4)
+
+
+# ============================================================================
+# Tests for SVD fallback in _project_to_closest_rotation
+# ============================================================================
+
+
+class TestProjectToClosestRotationFallback:
+    """Tests for the SVD failure fallback in _project_to_closest_rotation."""
+
+    def test_nan_input_returns_damped_identity(self) -> None:
+        """A matrix with NaN entries should produce a finite damped identity."""
+        matrix = jnp.array([[jnp.nan, 0.0], [0.0, jnp.nan]])
+        result = _project_to_closest_rotation(matrix)
+
+        assert jnp.all(jnp.isfinite(result)), f"Result should be finite: {result}"
+        # Should be a scaled identity (damped, no rotation)
+        np.testing.assert_allclose(result[0, 1], 0.0, atol=1e-10)
+        np.testing.assert_allclose(result[1, 0], 0.0, atol=1e-10)
+        np.testing.assert_allclose(result[0, 0], result[1, 1], atol=1e-10)
+
+    def test_inf_input_returns_finite_fallback(self) -> None:
+        """A matrix with Inf entries should produce a finite result."""
+        matrix = jnp.array([[jnp.inf, 0.0], [0.0, 1.0]])
+        result = _project_to_closest_rotation(matrix)
+
+        assert jnp.all(jnp.isfinite(result)), f"Result should be finite: {result}"
+
+    def test_all_nan_uses_default_scale(self) -> None:
+        """All-NaN matrix can't compute Frobenius norm; uses default 0.5."""
+        matrix = jnp.full((2, 2), jnp.nan)
+        result = _project_to_closest_rotation(matrix)
+
+        assert jnp.all(jnp.isfinite(result))
+        # Scale should be 0.5 (the default fallback)
+        np.testing.assert_allclose(result[0, 0], 0.5, atol=1e-10)
+
+    def test_well_conditioned_input_unchanged(self) -> None:
+        """A valid scaled rotation should pass through SVD without fallback."""
+        # [[a, -b], [b, a]] is already a scaled rotation
+        matrix = jnp.array([[0.9, -0.3], [0.3, 0.9]])
+        result = _project_to_closest_rotation(matrix)
+
+        np.testing.assert_allclose(result, matrix, atol=1e-6)
+
+    def test_fallback_produces_valid_block_structure(self) -> None:
+        """Fallback identity has scaled rotation structure [[a, 0], [0, a]]."""
+        matrix = jnp.array([[jnp.nan, 1.0], [1.0, jnp.nan]])
+        result = _project_to_closest_rotation(matrix)
+
+        # Identity is a special case of [[a, -b], [b, a]] with b=0
+        np.testing.assert_allclose(result[0, 1], -result[1, 0], atol=1e-10)
+        np.testing.assert_allclose(result[0, 0], result[1, 1], atol=1e-10)
+
+
+class TestProjectCoupledTransitionMatrixPathological:
+    """Tests for project_coupled_transition_matrix with pathological inputs."""
+
+    def test_unstable_matrix_produces_finite_output(self) -> None:
+        """An unstable transition matrix should still project to finite result."""
+        # Large diagonal = spectral radius > 1
+        A = jnp.array([
+            [2.0, -0.5, 0.1, 0.0],
+            [0.5, 2.0, 0.0, 0.1],
+            [0.1, 0.0, 1.5, -0.3],
+            [0.0, 0.1, 0.3, 1.5],
+        ])
+        result = project_coupled_transition_matrix(A)
+        assert jnp.all(jnp.isfinite(result))
+
+    def test_near_singular_matrix_produces_finite_output(self) -> None:
+        """A nearly singular matrix should project without NaN."""
+        A = jnp.array([
+            [1e-15, -1e-15, 0.0, 0.0],
+            [1e-15, 1e-15, 0.0, 0.0],
+            [0.0, 0.0, 1e-15, -1e-15],
+            [0.0, 0.0, 1e-15, 1e-15],
+        ])
+        result = project_coupled_transition_matrix(A)
+        assert jnp.all(jnp.isfinite(result))

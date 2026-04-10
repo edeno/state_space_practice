@@ -475,8 +475,8 @@ def _project_to_closest_rotation(matrix: jax.Array) -> jax.Array:
     Returns
     -------
     jax.Array, shape (2, 2)
-        The closest rotation matrix to the input matrix.
-        Falls back to the original matrix if SVD fails.
+        The closest scaled rotation matrix to the input matrix.
+        Falls back to a damped identity if SVD produces non-finite values.
 
     Raises
     ------
@@ -498,10 +498,17 @@ def _project_to_closest_rotation(matrix: jax.Array) -> jax.Array:
     # The rotation matrix is U @ Vh
     projected = scale_factor * (U @ Vh)
 
-    # If SVD produced NaN/Inf (numerical failure), fall back to original matrix
-    # This preserves dynamics rather than damping out the oscillator
+    # If SVD produced NaN/Inf (numerical failure), fall back to a damped
+    # identity (zero rotation). Returning the original matrix would defeat
+    # the purpose of projection since it is the problematic input. The
+    # Frobenius norm / sqrt(2) gives the RMS singular value, which is the
+    # ideal scale for a 2x2 scaled rotation. Downstream spectral radius
+    # clamping will correct the scale if needed.
     is_valid = jnp.all(jnp.isfinite(projected))
-    return jnp.where(is_valid, projected, matrix)
+    frob_norm = jnp.linalg.norm(matrix, "fro")
+    fallback_scale = jnp.where(jnp.isfinite(frob_norm), frob_norm / jnp.sqrt(2.0), 0.5)
+    fallback = fallback_scale * jnp.eye(matrix.shape[0])
+    return jnp.where(is_valid, projected, fallback)
 
 
 def _get_scaling_factor_from_block(block: jax.Array, eps: float = 1e-12) -> jax.Array:
@@ -521,6 +528,31 @@ def _get_scaling_factor_from_block(block: jax.Array, eps: float = 1e-12) -> jax.
     """
     _, s, _ = jnp.linalg.svd(block)
     return _get_scaling_factor(s, eps)
+
+
+def _extract_scale_and_angle(block: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Extract scaling factor and rotation angle from a 2x2 block via SVD.
+
+    Decomposes ``block ≈ scale * R(angle)`` where R is a rotation matrix.
+
+    Parameters
+    ----------
+    block : jax.Array, shape (2, 2)
+
+    Returns
+    -------
+    scale : jax.Array
+        Geometric mean of the singular values, floored at 1e-12 via
+        ``_get_scaling_factor`` to prevent NaN when either singular value
+        underflows to zero (e.g. zero-coupling blocks).
+    angle : jax.Array
+        Rotation angle in radians.
+    """
+    U, s, Vh = jnp.linalg.svd(block)
+    scale = _get_scaling_factor(s)
+    R = U @ Vh
+    angle = jnp.arctan2(R[1, 0], R[0, 0])
+    return scale, angle
 
 
 def _project_diagonal_block(
@@ -680,12 +712,7 @@ def extract_dim_params_from_matrix(
             if i != j:
                 rows, cols = get_block_slice(i, j)
                 block = A[rows, cols]
-                # Off-diagonal block is: coupling_strength * R(phase_diff)
-                # Extract scale (coupling_strength) and angle (phase_diff)
-                U, s, Vh = jnp.linalg.svd(block)
-                scale = jnp.sqrt(s[0] * s[1])  # geometric mean
-                R = U @ Vh
-                angle = jnp.arctan2(R[1, 0], R[0, 0])
+                scale, angle = _extract_scale_and_angle(block)
 
                 coupling_strength = coupling_strength.at[i, j].set(scale)
                 phase_diff = phase_diff.at[i, j].set(angle)
@@ -701,10 +728,7 @@ def extract_dim_params_from_matrix(
         adjusted_block = block + sum_incoming * IDENTITY_2x2
 
         # Now adjusted_block should be: damping * R(2π*freq/fs)
-        U, s, Vh = jnp.linalg.svd(adjusted_block)
-        scale = jnp.sqrt(s[0] * s[1])  # this is damping
-        R = U @ Vh
-        angle = jnp.arctan2(R[1, 0], R[0, 0])  # this is 2π*freq/fs
+        scale, angle = _extract_scale_and_angle(adjusted_block)
 
         # Convert angle to frequency
         frequency = angle * sampling_freq / (2 * jnp.pi)
