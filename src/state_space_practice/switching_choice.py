@@ -37,6 +37,8 @@ from state_space_practice.switching_kalman import (
 )
 from state_space_practice.utils import (
     scale_likelihood as _scale_likelihood,
+)
+from state_space_practice.utils import (
     stabilize_probability_vector as _stabilize_probability_vector,
 )
 
@@ -523,41 +525,10 @@ class SwitchingChoiceModel(SGDFittableMixin):
             return
 
         result = self._filter_result
-        disc_probs = result.discrete_state_probs  # (T, S)
+        disc_probs = result.discrete_state_probs  # (T, S) — filtered posterior
 
-        # Marginalize predicted (prior) variances over discrete states
-        per_state_vars = jnp.diagonal(
-            result.predicted_covs, axis1=1, axis2=2
-        )  # (T, K-1, S) — per-state predicted variances
-
-        # Zero for reference option, then marginalize over states
-        zero_ref = jnp.zeros((per_state_vars.shape[0], 1, per_state_vars.shape[2]))
-        full_vars = jnp.concatenate([zero_ref, per_state_vars], axis=1)  # (T, K, S)
-        # Per-state predicted variances, shape (T, K, S) per plan convention
-        self.per_state_predicted_variances_ = full_vars  # (T, K, S)
-
-        # Weighted average over states
-        self.predicted_option_variances_ = jnp.einsum(
-            "tks,ts->tk", full_vars, disc_probs
-        )
-
-        # Smoothed variances: use smoother state-conditional covariances
-        if hasattr(self, '_smoother_state_cond_covs') and self._smoother_state_cond_covs is not None:
-            smoother_diag = jnp.diagonal(
-                self._smoother_state_cond_covs, axis1=1, axis2=2
-            )  # (T, K-1, S)
-            zero_ref_sm = jnp.zeros((smoother_diag.shape[0], 1, smoother_diag.shape[2]))
-            full_sm_vars = jnp.concatenate([zero_ref_sm, smoother_diag], axis=1)
-            self.smoothed_option_variances_ = jnp.einsum(
-                "tks,ts->tk", full_sm_vars, self.smoothed_discrete_probs_
-            )
-        else:
-            self.smoothed_option_variances_ = self.predicted_option_variances_
-
-        # Predicted choice entropy and surprise.
-        # Use PREDICTED (prior) state probs P(s_t | y_{1:t-1}), not the
-        # filtered posterior P(s_t | y_{1:t}). Reconstruct from lagged
-        # posterior + transition matrix.
+        # Predicted (prior) discrete state probs: P(s_t | y_{1:t-1}).
+        # Reconstruct from lagged filtered posterior + transition matrix.
         init_prob = jnp.ones(self.n_discrete_states) / self.n_discrete_states
         predicted_disc = jnp.concatenate([
             init_prob[None, :],
@@ -565,6 +536,59 @@ class SwitchingChoiceModel(SGDFittableMixin):
         ], axis=0)  # (T, S)
 
         per_state_values = result.predicted_values  # (T, K-1, S) — prior, not posterior
+
+        # Per-state predicted variances (diagonal of covariance)
+        per_state_vars = jnp.diagonal(
+            result.predicted_covs, axis1=1, axis2=2
+        )  # (T, K-1, S)
+
+        # Zero for reference option, then full K
+        zero_ref = jnp.zeros((per_state_vars.shape[0], 1, per_state_vars.shape[2]))
+        full_vars = jnp.concatenate([zero_ref, per_state_vars], axis=1)  # (T, K, S)
+        self.per_state_predicted_variances_ = full_vars  # (T, K, S)
+
+        # Per-state predicted means (full K with reference option)
+        full_means = jnp.concatenate([
+            jnp.zeros((per_state_values.shape[0], 1, per_state_values.shape[2])),
+            per_state_values,
+        ], axis=1)  # (T, K, S)
+
+        # Law of total variance: Var(x) = E[Var(x|s)] + Var(E[x|s])
+        # Use PREDICTED (prior) state probs for weighting.
+        e_var = jnp.einsum("tks,ts->tk", full_vars, predicted_disc)  # E[Var(x|s)]
+        e_mean = jnp.einsum("tks,ts->tk", full_means, predicted_disc)  # E[E[x|s]]
+        e_mean_sq = jnp.einsum("tks,ts->tk", full_means ** 2, predicted_disc)
+        var_mean = e_mean_sq - e_mean ** 2  # Var(E[x|s])
+        self.predicted_option_variances_ = e_var + var_mean
+
+        # Smoothed variances: law of total variance with smoother quantities
+        if hasattr(self, '_smoother_state_cond_covs') and self._smoother_state_cond_covs is not None:
+            smoother_diag = jnp.diagonal(
+                self._smoother_state_cond_covs, axis1=1, axis2=2
+            )  # (T, K-1, S)
+            zero_ref_sm = jnp.zeros((smoother_diag.shape[0], 1, smoother_diag.shape[2]))
+            full_sm_vars = jnp.concatenate([zero_ref_sm, smoother_diag], axis=1)
+
+            # Smoother state-conditional means
+            smoother_means = getattr(self, '_smoother_state_cond_means', None)
+            if smoother_means is not None:
+                full_sm_means = jnp.concatenate([
+                    jnp.zeros((smoother_means.shape[0], 1, smoother_means.shape[2])),
+                    smoother_means,
+                ], axis=1)  # (T, K, S)
+                sm_disc = self.smoothed_discrete_probs_
+                sm_e_var = jnp.einsum("tks,ts->tk", full_sm_vars, sm_disc)
+                sm_e_mean = jnp.einsum("tks,ts->tk", full_sm_means, sm_disc)
+                sm_e_mean_sq = jnp.einsum("tks,ts->tk", full_sm_means ** 2, sm_disc)
+                sm_var_mean = sm_e_mean_sq - sm_e_mean ** 2
+                self.smoothed_option_variances_ = sm_e_var + sm_var_mean
+            else:
+                # Fallback: no between-state term
+                self.smoothed_option_variances_ = jnp.einsum(
+                    "tks,ts->tk", full_sm_vars, self.smoothed_discrete_probs_
+                )
+        else:
+            self.smoothed_option_variances_ = self.predicted_option_variances_
 
         # Obs offset: Theta @ z_t, shape (T, K) or zeros if no obs covariates
         if self.obs_weights_ is not None and self._obs_covariates is not None:
@@ -662,6 +686,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
             self._m_step(choices, result, smoother_result)
 
         self.smoothed_discrete_probs_ = smoother_result[2]
+        self._smoother_state_cond_means = smoother_result[5]  # (T, K-1, S)
         self._smoother_state_cond_covs = smoother_result[6]  # (T, K-1, K-1, S)
         self.log_likelihood_ = log_likelihoods[-1]
         self.log_likelihood_history_ = log_likelihoods
@@ -822,6 +847,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
         self._filter_result = result
         smoother_result = self._run_smoother(result)
         self.smoothed_discrete_probs_ = smoother_result[2]
+        self._smoother_state_cond_means = smoother_result[5]  # (T, K-1, S)
         self._smoother_state_cond_covs = smoother_result[6]  # (T, K-1, K-1, S)
         self.log_likelihood_ = float(result.marginal_log_likelihood)
         self._populate_uncertainty(choices)

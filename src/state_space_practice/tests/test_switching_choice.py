@@ -443,21 +443,40 @@ class TestSwitchingChoiceUncertainty:
         assert model.per_state_predicted_variances_.shape == (50, 3, 2)  # (T, K, S)
 
     def test_predicted_uses_prior_not_posterior(self):
-        """Predicted variances should be larger than filtered (prior > posterior)."""
+        """Predicted variances should be larger than filtered (posterior)."""
         from state_space_practice.switching_choice import SwitchingChoiceModel
 
         choices = jax.random.randint(jax.random.PRNGKey(0), (50,), 0, 3)
         model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
         model.fit_sgd(choices, num_steps=10)
         # Predicted (prior) variance should generally be >= filtered (posterior)
-        # because the observation update reduces uncertainty
         pred_var = model.predicted_option_variances_[:, 1:].mean()  # exclude ref
-        # filtered_covs are posterior — extract variance
+        # Compute filtered variance using filtered (posterior) state probs
         filt_diag = jnp.diagonal(
             model._filter_result.filtered_covs, axis1=1, axis2=2
         )  # (T, K-1, S)
         filt_var = jnp.einsum(
             "tks,ts->tk", filt_diag, model._filter_result.discrete_state_probs
         ).mean()
-        # Prior should be at least as large as posterior on average
         assert float(pred_var) >= float(filt_var) - 1e-6
+
+    def test_variance_includes_between_state_term(self):
+        """Marginalized variance should include between-state mean spread."""
+        from state_space_practice.switching_choice import SwitchingChoiceModel
+
+        choices = jax.random.randint(jax.random.PRNGKey(0), (50,), 0, 3)
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model.fit_sgd(choices, num_steps=10)
+        # Total variance >= E[Var(x|s)] (within-state average)
+        per_state = model.per_state_predicted_variances_  # (T, K, S)
+        disc_probs = model._filter_result.discrete_state_probs  # (T, S)
+        # Reconstruct predicted (prior) state probs
+        init_prob = jnp.ones(model.n_discrete_states) / model.n_discrete_states
+        predicted_disc = jnp.concatenate([
+            init_prob[None, :],
+            (disc_probs[:-1] @ model.discrete_transition_matrix_),
+        ], axis=0)
+        within_only = jnp.einsum("tks,ts->tk", per_state, predicted_disc)
+        total = model.predicted_option_variances_
+        # Total variance >= within-state variance (between-state term is >= 0)
+        assert jnp.all(total >= within_only - 1e-6)

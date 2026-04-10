@@ -535,10 +535,12 @@ class CovariateChoiceModel(SGDFittableMixin):
             self._smoother_result.smoothed_covariances
         )
 
-        # Predicted choice entropy
-        pred_probs = jax.nn.softmax(
-            self.inverse_temperature * self.predicted_option_values_, axis=1
-        )
+        # Predicted choice entropy — include obs offset Theta @ z_t
+        logits = self.inverse_temperature * self.predicted_option_values_
+        if self.obs_weights_ is not None and self._obs_covariates is not None:
+            obs_offsets = self._obs_covariates @ self.obs_weights_.T  # (T, K)
+            logits = logits + obs_offsets
+        pred_probs = jax.nn.softmax(logits, axis=1)
         self.predicted_choice_entropy_ = categorical_entropy(pred_probs)
         self.surprise_ = compute_surprise(pred_probs, choices)
 
