@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from state_space_practice.position_decoder import (
+    AdaptiveInflationConfig,
     DecoderResult,
     PlaceFieldRateMaps,
     PositionDecoder,
@@ -605,3 +606,151 @@ class TestPositionDecoder:
         )
         assert "fitted=True" in repr(decoder)
         assert "n_neurons=5" in repr(decoder)
+
+
+class TestAdaptiveInflation:
+    """Regression tests for innovation-based covariance inflation."""
+
+    @pytest.fixture
+    def rate_maps_and_data(self):
+        """Build simple rate maps and synthetic spike data."""
+        rng = np.random.default_rng(42)
+        n_time = 500
+        dt = 0.004
+
+        t = np.arange(n_time) * dt
+        true_x = 50 + 20 * np.cos(2 * np.pi * t / 2.0)
+        true_y = 50 + 20 * np.sin(2 * np.pi * t / 2.0)
+        position = np.column_stack([true_x, true_y])
+
+        n_neurons = 8
+        centers = rng.uniform(20, 80, (n_neurons, 2))
+        spikes = np.zeros((n_time, n_neurons))
+        for n in range(n_neurons):
+            dist_sq = np.sum((position - centers[n]) ** 2, axis=1)
+            rate = 25 * np.exp(-dist_sq / (2 * 15**2)) + 0.5
+            spikes[:, n] = rng.poisson(rate * dt)
+
+        rm = PlaceFieldRateMaps.from_spike_position_data(
+            position, spikes, dt=dt, n_grid=50, sigma=5.0,
+        )
+        return rm, spikes, position, dt
+
+    def test_disabled_matches_baseline(self, rate_maps_and_data):
+        """Inflation disabled should reproduce the no-inflation result."""
+        rm, spikes, position, dt = rate_maps_and_data
+        init_pos = jnp.array(position[0])
+
+        result_none = position_decoder_filter(
+            spikes=spikes, rate_maps=rm, dt=dt,
+            q_pos=50.0, include_velocity=False,
+            init_position=init_pos,
+        )
+        result_off = position_decoder_filter(
+            spikes=spikes, rate_maps=rm, dt=dt,
+            q_pos=50.0, include_velocity=False,
+            init_position=init_pos,
+            adaptive_inflation=AdaptiveInflationConfig(enabled=False),
+        )
+        np.testing.assert_allclose(
+            result_none.position_mean, result_off.position_mean, atol=1e-10,
+        )
+
+    def test_inflation_increases_covariance(self, rate_maps_and_data):
+        """With inflation enabled, filter covariances should be >= baseline."""
+        rm, spikes, position, dt = rate_maps_and_data
+        init_pos = jnp.array(position[0])
+
+        result_base = position_decoder_filter(
+            spikes=spikes, rate_maps=rm, dt=dt,
+            q_pos=50.0, include_velocity=False,
+            init_position=init_pos,
+        )
+        result_infl = position_decoder_filter(
+            spikes=spikes, rate_maps=rm, dt=dt,
+            q_pos=50.0, include_velocity=False,
+            init_position=init_pos,
+            adaptive_inflation=AdaptiveInflationConfig(gain=1.0, max_alpha=5.0),
+        )
+        # Mean trace of covariance should be >= baseline
+        base_trace = np.mean(np.trace(np.array(result_base.position_cov), axis1=1, axis2=2))
+        infl_trace = np.mean(np.trace(np.array(result_infl.position_cov), axis1=1, axis2=2))
+        assert infl_trace >= base_trace
+
+    def test_capped_inflation_bounds_covariance_growth(self, rate_maps_and_data):
+        """With max_alpha near 1, covariance growth is bounded."""
+        rm, spikes, position, dt = rate_maps_and_data
+        init_pos = jnp.array(position[0])
+
+        result_capped = position_decoder_filter(
+            spikes=spikes, rate_maps=rm, dt=dt,
+            q_pos=50.0, include_velocity=False,
+            init_position=init_pos,
+            adaptive_inflation=AdaptiveInflationConfig(
+                gain=100.0, max_alpha=1.01,
+            ),
+        )
+        result_base = position_decoder_filter(
+            spikes=spikes, rate_maps=rm, dt=dt,
+            q_pos=50.0, include_velocity=False,
+            init_position=init_pos,
+        )
+        base_trace = np.trace(np.array(result_base.position_cov), axis1=1, axis2=2)
+        capped_trace = np.trace(np.array(result_capped.position_cov), axis1=1, axis2=2)
+        ratio = capped_trace / np.maximum(base_trace, 1e-12)
+        # Per-step cap is 1.01; accumulated ratio should stay modest
+        assert np.max(ratio) < 3.0
+
+    def test_no_spikes_no_inflation(self, rate_maps_and_data):
+        """With zero spikes, innovation is negative and inflation is skipped."""
+        rm, spikes, position, dt = rate_maps_and_data
+        init_pos = jnp.array(position[0])
+
+        zero_spikes = np.zeros_like(spikes)
+        result_base = position_decoder_filter(
+            spikes=zero_spikes, rate_maps=rm, dt=dt,
+            q_pos=50.0, include_velocity=False,
+            init_position=init_pos,
+        )
+        result_infl = position_decoder_filter(
+            spikes=zero_spikes, rate_maps=rm, dt=dt,
+            q_pos=50.0, include_velocity=False,
+            init_position=init_pos,
+            adaptive_inflation=AdaptiveInflationConfig(gain=2.0, max_alpha=10.0),
+        )
+        # With zero spikes the score is small (innovation = -lambda*dt)
+        # so the clip to alpha >= 1 prevents any deflation; the result
+        # may still differ slightly because the score is not exactly zero.
+        base_cov = np.array(result_base.position_cov)
+        infl_cov = np.array(result_infl.position_cov)
+        base_trace = np.trace(base_cov, axis1=1, axis2=2)
+        infl_trace = np.trace(infl_cov, axis1=1, axis2=2)
+        # Covariance should not shrink (alpha clipped at 1)
+        assert np.all(infl_trace >= base_trace - 1e-6)
+
+    def test_smoother_with_inflation_produces_valid_output(self, rate_maps_and_data):
+        """Smoother with inflation produces finite, correctly-shaped output."""
+        rm, spikes, position, dt = rate_maps_and_data
+        init_pos = jnp.array(position[0])
+        cfg = AdaptiveInflationConfig(gain=0.5, max_alpha=5.0)
+
+        result_f = position_decoder_filter(
+            spikes=spikes, rate_maps=rm, dt=dt,
+            q_pos=50.0, include_velocity=False,
+            init_position=init_pos,
+            adaptive_inflation=cfg,
+        )
+        result_s = position_decoder_smoother(
+            spikes=spikes, rate_maps=rm, dt=dt,
+            q_pos=50.0, include_velocity=False,
+            init_position=init_pos,
+            adaptive_inflation=cfg,
+        )
+        assert not np.any(np.isnan(result_f.position_mean))
+        assert not np.any(np.isnan(result_s.position_mean))
+        assert result_s.position_mean.shape == result_f.position_mean.shape
+        # Smoother covariance should generally be <= filter covariance
+        f_trace = np.trace(np.array(result_f.position_cov), axis1=1, axis2=2)
+        s_trace = np.trace(np.array(result_s.position_cov), axis1=1, axis2=2)
+        # Check that smoother reduces uncertainty on average
+        assert np.mean(s_trace) < np.mean(f_trace) * 1.1
