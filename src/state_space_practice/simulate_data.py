@@ -12,17 +12,15 @@ def receptive_field_model(position: ArrayLike, params: np.ndarray) -> np.ndarray
     return result
 
 
-def simulate_eden_brown_2004_jump() -> (
-    tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]
-):
-    dt = 0.020  # seconds
-    total_time = 8000.0  # seconds
+def _eden_brown_2004_base(
+    dt: float = 0.020,
+    total_time: float = 8000.0,
+    speed: float = 125.0,
+    track_length: float = 300.0,
+) -> tuple[np.ndarray, np.ndarray, int, np.ndarray, np.ndarray]:
+    """Shared setup for Eden & Brown 2004 simulations."""
     n_total_steps = int(total_time / dt)
-
     time = np.arange(0, total_time, dt)
-
-    speed = 125.0  # cm/s
-    track_length = 300.0  # cm
 
     run1 = np.arange(0, track_length, speed * dt)
     run2 = np.arange(track_length, 0, -speed * dt)
@@ -33,6 +31,16 @@ def simulate_eden_brown_2004_jump() -> (
 
     true_params1 = np.array([np.log(10.0), 250.0, np.sqrt(12.0)])
     true_params2 = np.array([np.log(30.0), 150.0, np.sqrt(20.0)])
+
+    return time, position, n_total_steps, true_params1, true_params2
+
+
+def simulate_eden_brown_2004_jump() -> (
+    tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]
+):
+    dt = 0.020
+    time, position, _, true_params1, true_params2 = _eden_brown_2004_base(dt=dt)
+
     true_rate1 = receptive_field_model(position[: position.shape[0] // 2], true_params1)
     true_rate2 = receptive_field_model(position[position.shape[0] // 2 :], true_params2)
     true_rate = np.concatenate((true_rate1, true_rate2))
@@ -42,24 +50,8 @@ def simulate_eden_brown_2004_jump() -> (
 
 
 def simulate_eden_brown_2004_linear():
-    dt = 0.020  # seconds
-    total_time = 8000.0  # seconds
-    n_total_steps = int(total_time / dt)
-
-    time = np.arange(0, total_time, dt)
-
-    speed = 125.0  # cm/s
-    track_length = 300.0  # cm
-
-    run1 = np.arange(0, track_length, speed * dt)
-    run2 = np.arange(track_length, 0, -speed * dt)
-    run = np.concatenate((run1, run2))
-
-    position = np.concatenate([run] * int(np.ceil(n_total_steps / run.shape[0])))
-    position = position[:n_total_steps]
-
-    true_params1 = np.array([np.log(10.0), 250.0, np.sqrt(12.0)])
-    true_params2 = np.array([np.log(30.0), 150.0, np.sqrt(20.0)])
+    dt = 0.020
+    time, position, n_total_steps, true_params1, true_params2 = _eden_brown_2004_base(dt=dt)
 
     # Interpolate between true_params1 and true_params2
     true_params = np.linspace(true_params1, true_params2, n_total_steps)
