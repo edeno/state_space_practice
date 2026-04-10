@@ -151,7 +151,7 @@ def _point_process_laplace_update(
     points. For **linear** log-intensities (``log lambda = Z @ x``, the
     default via :func:`log_conditional_intensity`) the second derivative is
     zero and Fisher scoring is mathematically identical to full Newton.
-    For **nonlinear** intensities (e.g. KDE or bicubic rate maps in
+    For **nonlinear** intensities (e.g. KDE rate maps in
     :class:`PositionDecoder`), Fisher scoring produces better-conditioned,
     more stable updates. This matches the approach used in dynamax and
     generalized linear model IRLS.
@@ -227,9 +227,9 @@ def _point_process_laplace_update(
     #
     # For linear log-intensity (log lambda = Z @ x), the second derivative is
     # zero so Fisher scoring is mathematically identical to full Newton.
-    # For nonlinear intensities (e.g. KDE/bicubic rate maps in
-    # PositionDecoder), Fisher scoring produces better-conditioned updates
-    # because it avoids inverting a precision whose PSD-ness relies on jitter.
+    # For nonlinear intensities (e.g. KDE rate maps in PositionDecoder),
+    # Fisher scoring produces better-conditioned updates because it
+    # avoids inverting a precision whose PSD-ness relies on jitter.
     if grad_log_intensity_func is None:
         grad_log_intensity_func = jax.jacfwd(log_intensity_func)
     grad_log_intensity = grad_log_intensity_func

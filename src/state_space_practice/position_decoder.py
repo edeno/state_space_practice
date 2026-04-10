@@ -82,7 +82,7 @@ class AdaptiveInflationConfig:
 
 def build_position_dynamics(
     dt: float,
-    q_pos: float = 1.0,
+    q_pos: float = 100.0,
     q_vel: float = 10.0,
     include_velocity: bool = True,
 ) -> tuple[Array, Array]:
@@ -93,7 +93,12 @@ def build_position_dynamics(
     dt : float
         Time bin width in seconds.
     q_pos : float
-        Position process noise (cm^2/s).
+        Position process noise (cm^2/s). Per-step position variance is
+        ``q_pos * dt``. Set this at least as large as the square of the
+        animal's typical per-step motion (e.g. ``speed_cm_per_s**2 * dt``)
+        so the prior can accommodate the real trajectory rather than
+        collapsing onto the rate-map center. Default 100 corresponds to
+        per-step std of ``sqrt(100 * dt)`` cm.
     q_vel : float
         Velocity process noise (cm^2/s^3). Only used if include_velocity=True.
     include_velocity : bool, default=True
@@ -145,6 +150,30 @@ class PlaceFieldRateMaps:
         X coordinates of the grid.
     y_edges : np.ndarray, shape (n_grid_y,)
         Y coordinates of the grid.
+    occupancy_mask : np.ndarray or None
+        Boolean mask of on-track bins, used to build the track penalty.
+    spike_histograms : np.ndarray or None
+        Optional raw (n_neurons, n_grid_y, n_grid_x) spike counts per
+        bin; required to enable the analytical KDE evaluation path.
+    occ_histogram : np.ndarray or None
+        Optional raw (n_grid_y, n_grid_x) occupancy per bin in seconds;
+        required to enable the analytical KDE evaluation path.
+    kde_sigma : float or None
+        KDE bandwidth in cm. Required to enable the KDE path.
+    baseline_rates : np.ndarray or None
+        Optional (n_neurons,) session-wide mean firing rate per neuron
+        (Hz), used as the Bayesian shrinkage prior in the KDE path.
+    occupancy_tau : float, default=0.0
+        **Absolute** shrinkage weight in seconds for the KDE Bayesian
+        prior. This is the already-scaled value used directly inside
+        ``_kde_log_rate``; it is **not** the dimensionless prior weight
+        that :meth:`from_spike_position_data` exposes. Users
+        constructing this class directly should set this to an
+        absolute number of seconds (or leave it at 0 to disable
+        shrinkage); users who go through ``from_spike_position_data``
+        should use that method's ``occupancy_tau`` argument instead,
+        which is dimensionless and auto-scaled by the median per-bin
+        occupancy of the training data.
     """
 
     def __init__(
@@ -156,6 +185,8 @@ class PlaceFieldRateMaps:
         spike_histograms: Optional[np.ndarray] = None,
         occ_histogram: Optional[np.ndarray] = None,
         kde_sigma: Optional[float] = None,
+        baseline_rates: Optional[np.ndarray] = None,
+        occupancy_tau: float = 0.0,
     ):
         self.rate_maps = np.asarray(rate_maps)
         self.x_edges = np.asarray(x_edges)
@@ -205,6 +236,7 @@ class PlaceFieldRateMaps:
         # the pre-smoothed rate map.  This preserves the full spatial
         # gradient information of the Gaussian kernel.
         self._kde_sigma = kde_sigma
+        self._occupancy_tau = float(occupancy_tau)
         if spike_histograms is not None and occ_histogram is not None and kde_sigma is not None:
             # spike_histograms: (n_neurons, n_grid_y, n_grid_x) — raw spike counts per bin
             # occ_histogram: (n_grid_y, n_grid_x) — occupancy time per bin
@@ -216,6 +248,14 @@ class PlaceFieldRateMaps:
             )
             self._jax_occ_hist = jnp.array(occ_histogram.ravel())  # (ny*nx,)
             self._jax_kde_sigma2 = jnp.array(kde_sigma ** 2)
+            # Baseline rates for the kernel-weighted Bayesian shrinkage
+            # (see _kde_log_rate). If not supplied, default to zero
+            # baseline with zero tau, which recovers the unshrunk
+            # Nadaraya-Watson estimator.
+            if baseline_rates is None:
+                baseline_rates = np.zeros(self.n_neurons, dtype=np.float64)
+            self._jax_baseline_rates = jnp.asarray(baseline_rates, dtype=jnp.float64)
+            self._jax_occupancy_tau = jnp.asarray(self._occupancy_tau, dtype=jnp.float64)
             self._use_analytical = True
         else:
             self._use_analytical = False
@@ -259,7 +299,7 @@ class PlaceFieldRateMaps:
         dt: float,
         n_grid: int = 50,
         sigma: float = 5.0,
-        occupancy_tau: float = 1.0,
+        occupancy_tau: float = 0.0,
     ) -> PlaceFieldRateMaps:
         """Estimate rate maps from position and spike data using KDE.
 
@@ -283,11 +323,14 @@ class PlaceFieldRateMaps:
         sigma : float
             Gaussian smoothing kernel width in cm.
         occupancy_tau : float
-            Shrinkage timescale in seconds.  Controls how much
-            occupancy is needed before the local rate estimate is
-            trusted over the session-wide baseline.  At a location
-            with ``occ`` seconds of data, the shrinkage weight toward
-            the local estimate is ``occ / (occ + tau)``.  Default 1.0 s.
+            Dimensionless Bayesian prior weight for the per-neuron
+            baseline rate. Scaled internally by the median nonzero
+            per-bin occupancy, so the same value works across session
+            lengths and grid resolutions. Default 0.0 disables
+            shrinkage entirely, returning raw Nadaraya-Watson rate
+            estimates; set ``tau=1`` to give the prior roughly the
+            same weight as a typical well-sampled bin, and ``tau>>1``
+            to make the prior dominate at low-occupancy locations.
         Returns
         -------
         PlaceFieldRateMaps
@@ -342,11 +385,23 @@ class PlaceFieldRateMaps:
         total_time = position.shape[0] * dt
         baseline_rates = spike_counts.sum(axis=0) / total_time  # (n_neurons,)
 
+        # Auto-scale the shrinkage strength to the data. ``occupancy_tau``
+        # is interpreted as a dimensionless Bayesian prior weight relative
+        # to the typical per-bin occupancy rather than an absolute time in
+        # seconds. This way the same tau works across session lengths and
+        # grid resolutions: tau=0 means no shrinkage, tau=1 means the
+        # prior carries roughly as much weight as a typical well-sampled
+        # bin, and tau≫1 makes the prior dominate.
+        nonzero_occ = occ_smooth[occ_smooth > 0]
+        typical_occ = float(np.median(nonzero_occ)) if len(nonzero_occ) > 0 else 1.0
+        effective_tau = occupancy_tau * typical_occ
+
         # Occupancy-dependent shrinkage weight: local estimate is trusted
         # in proportion to local occupancy, reverting to baseline where
-        # data is sparse.  w = occ / (occ + tau), so:
+        # data is sparse.
         #   rate_shrunk = w * rate_local + (1 - w) * baseline
-        #              = (spike_smooth + tau * baseline) / (occ_smooth + tau)
+        #              = (spike_smooth + eff_tau * baseline)
+        #              / (occ_smooth + eff_tau)
         rate_maps = np.zeros((n_neurons, n_grid, n_grid))
         for n in range(n_neurons):
             spike_map, _, _ = np.histogram2d(
@@ -358,8 +413,8 @@ class PlaceFieldRateMaps:
                 spike_map.T, sigma_bins, mode="constant", cval=0
             )
             rate_maps[n] = (
-                (spike_smooth + occupancy_tau * baseline_rates[n])
-                / (occ_smooth + occupancy_tau)
+                (spike_smooth + effective_tau * baseline_rates[n])
+                / (occ_smooth + effective_tau)
             )
 
         # Bin centers now span [x_min, x_max] (the full data range)
@@ -400,15 +455,18 @@ class PlaceFieldRateMaps:
             spike_histograms=spike_histograms,
             occ_histogram=occ_time.T,
             kde_sigma=sigma,
+            baseline_rates=baseline_rates,
+            occupancy_tau=float(effective_tau),
         )
 
     def log_rate(self, position: Array) -> Array:
         """Evaluate log firing rate for all neurons at a position.
 
-        When KDE sufficient statistics are available (from
-        ``from_spike_position_data``), uses analytical kernel-sum
-        evaluation for exact rates.  Otherwise falls back to bicubic
-        grid interpolation.
+        Uses the analytical KDE kernel-sum evaluation when sufficient
+        statistics are available (from :meth:`from_spike_position_data`),
+        and falls back to bilinear interpolation over the pre-computed
+        log rate maps when the class was constructed from a ready-made
+        ``rate_maps`` array (e.g. from an analytic model).
 
         Parameters
         ----------
@@ -426,8 +484,10 @@ class PlaceFieldRateMaps:
                 self._jax_spike_hists,
                 self._jax_occ_hist,
                 self._jax_kde_sigma2,
+                self._jax_baseline_rates,
+                self._jax_occupancy_tau,
             )
-        return _bicubic_log_rate(
+        return _bilinear_log_rate(
             position, self._jax_log_rate_maps,
             self._jax_x_edges, self._jax_y_edges,
             self._dx, self._dy,
@@ -436,8 +496,8 @@ class PlaceFieldRateMaps:
     def log_rate_jacobian(self, position: Array) -> Array:
         """Jacobian of log firing rate w.r.t. position via jax.jacfwd.
 
-        When KDE sufficient statistics are available, differentiates
-        through the analytical kernel-sum evaluation.
+        Uses the analytical KDE path when sufficient statistics are
+        available and bilinear interpolation otherwise.
 
         Parameters
         ----------
@@ -455,8 +515,10 @@ class PlaceFieldRateMaps:
                 self._jax_spike_hists,
                 self._jax_occ_hist,
                 self._jax_kde_sigma2,
+                self._jax_baseline_rates,
+                self._jax_occupancy_tau,
             )
-        return _bicubic_log_rate_jacobian(
+        return _bilinear_log_rate_jacobian(
             position, self._jax_log_rate_maps,
             self._jax_x_edges, self._jax_y_edges,
             self._dx, self._dy,
@@ -469,26 +531,44 @@ def _kde_log_rate(
     encoding_spikes: Array,
     occ_weights: Array,
     sigma2: Array,
+    baseline_rates: Array,
+    occupancy_tau: Array,
 ) -> Array:
-    """Evaluate log firing rate via KDE kernel sums over gridded data.
+    """Evaluate log firing rate via KDE kernel sums with Bayesian shrinkage.
 
     Computes the rate for each neuron by summing Gaussian kernels
     centered at grid positions, weighted by per-bin spike counts and
-    occupancy times.
+    occupancy times, then blending toward the neuron's session-wide
+    baseline firing rate:
 
-    rate_n(x) = sum_g[spike_{n,g} * K(x - pos_g)] / sum_g[occ_g * K(x - pos_g)]
+        rate_n(x) = (Σ_g spike_{n,g} K(x−pos_g) + τ·baseline_n)
+                  / (Σ_g occ_g K(x−pos_g) + τ)
+
+    This is the natural kernel-weighted generalization of the
+    occupancy-shrunk rate-map estimator used by the Gaussian-smoothed
+    rate-map path in :func:`PlaceFieldRateMaps.from_spike_position_data`.
+    When ``occupancy_tau=0`` it reduces to the raw Nadaraya-Watson
+    estimator.
 
     Parameters
     ----------
     position : Array, shape (2,) or (4,)
     encoding_positions : Array, shape (n_bins, 2)
-        Grid centre positions.
+        Grid centre positions (cm).
     encoding_spikes : Array, shape (n_neurons, n_bins)
-        Spike counts per grid bin per neuron.
+        Raw spike counts per grid bin per neuron (dimensionless counts).
     occ_weights : Array, shape (n_bins,)
-        Occupancy time (seconds) per grid bin.
+        Occupancy per grid bin in **seconds per bin**.
     sigma2 : Array, scalar
         Squared KDE bandwidth (sigma^2, cm^2).
+    baseline_rates : Array, shape (n_neurons,)
+        Session-wide mean firing rate per neuron (Hz). Used as the
+        Bayesian prior mean for the shrinkage.
+    occupancy_tau : Array, scalar
+        Shrinkage timescale (seconds). Larger values pull the estimate
+        toward the baseline more aggressively at low-occupancy query
+        positions. A value of 0 disables shrinkage and recovers the
+        plain Nadaraya-Watson estimator.
 
     Returns
     -------
@@ -497,12 +577,27 @@ def _kde_log_rate(
     xy = position[:2]
     diff = encoding_positions - xy[None, :]  # (n_bins, 2)
     dist_sq = jnp.sum(diff ** 2, axis=1)  # (n_bins,)
-    kernel = jnp.exp(-0.5 * dist_sq / sigma2)  # (n_bins,)
+    kernel_unnorm = jnp.exp(-0.5 * dist_sq / sigma2)  # (n_bins,)
 
-    occ_kernel = jnp.sum(occ_weights * kernel) + 1e-30
-    spike_kernels = encoding_spikes @ kernel  # (n_neurons,)
+    # Normalize the kernel so weights sum to 1. This makes the
+    # kernel-weighted occupancy sum comparable in units (seconds) to
+    # ``occupancy_tau``, matching the scale-wise behavior of the
+    # Gaussian-smoothed rate-map construction in from_spike_position_data
+    # (which uses ``scipy.ndimage.gaussian_filter``, itself a normalized
+    # weighted average).
+    kernel_sum = jnp.sum(kernel_unnorm) + 1e-30
+    kernel = kernel_unnorm / kernel_sum
 
-    rates = spike_kernels / occ_kernel
+    occ_kernel = jnp.sum(occ_weights * kernel)  # "seconds" (weighted-avg occ per bin)
+    spike_kernels = encoding_spikes @ kernel    # (n_neurons,), weighted-avg counts per bin
+
+    # Bayesian shrinkage toward the per-neuron baseline rate.
+    # When the kernel-weighted occupancy is large (>> tau), the
+    # estimate approaches the raw kernel regression; when it is
+    # small (<< tau), it reverts to the neuron's session baseline.
+    numerator = spike_kernels + occupancy_tau * baseline_rates
+    denominator = occ_kernel + occupancy_tau + 1e-30
+    rates = numerator / denominator
     return jnp.log(jnp.maximum(rates, 1e-10))
 
 
@@ -512,12 +607,22 @@ def _kde_log_rate_jacobian(
     encoding_spikes: Array,
     occ_weights: Array,
     sigma2: Array,
+    baseline_rates: Array,
+    occupancy_tau: Array,
 ) -> Array:
     """Jacobian of KDE log-rate via jax.jacfwd."""
     pos_xy = position[:2]
 
     def _log_rate_xy(xy: Array) -> Array:
-        return _kde_log_rate(xy, encoding_positions, encoding_spikes, occ_weights, sigma2)
+        return _kde_log_rate(
+            xy,
+            encoding_positions,
+            encoding_spikes,
+            occ_weights,
+            sigma2,
+            baseline_rates,
+            occupancy_tau,
+        )
 
     return jax.jacfwd(_log_rate_xy)(pos_xy)
 
@@ -567,89 +672,6 @@ def _bilinear_log_rate(
         + log_rate_maps[:, y1, x1] * fx * fy
     )
     return val
-
-
-def _catmull_rom(t: Array) -> Array:
-    """Catmull-Rom cubic spline basis weights for offset t in [0, 1].
-
-    Returns weights for the 4 grid points at indices -1, 0, 1, 2
-    relative to the cell containing the query point.
-    """
-    t2 = t * t
-    t3 = t2 * t
-    w0 = -0.5 * t3 + t2 - 0.5 * t
-    w1 = 1.5 * t3 - 2.5 * t2 + 1.0
-    w2 = -1.5 * t3 + 2.0 * t2 + 0.5 * t
-    w3 = 0.5 * t3 - 0.5 * t2
-    return jnp.array([w0, w1, w2, w3])
-
-
-def _bicubic_log_rate(
-    position: Array,
-    log_rate_maps: Array,
-    x_edges: Array,
-    y_edges: Array,
-    dx: float,
-    dy: float,
-) -> Array:
-    """JIT-compatible bicubic (Catmull-Rom) interpolation of log-rate maps.
-
-    Uses a 4x4 grid neighborhood and C1-continuous cubic spline
-    weights.  The smooth interpolation preserves spatial gradients
-    much better than bilinear interpolation, yielding ~25x larger
-    Fisher information when differentiated with jax.jacfwd.
-
-    Parameters
-    ----------
-    position : Array, shape (2,) or (4,)
-    log_rate_maps : Array, shape (n_neurons, n_grid_y, n_grid_x)
-    x_edges, y_edges : Array
-    dx, dy : float
-
-    Returns
-    -------
-    log_rate : Array, shape (n_neurons,)
-    """
-    x, y = position[0], position[1]
-    ny, nx = log_rate_maps.shape[1], log_rate_maps.shape[2]
-
-    xi = jnp.clip((x - x_edges[0]) / dx, 0.0, nx - 1 - 1e-9)
-    yi = jnp.clip((y - y_edges[0]) / dy, 0.0, ny - 1 - 1e-9)
-
-    ix = jnp.floor(xi).astype(jnp.int32)
-    iy = jnp.floor(yi).astype(jnp.int32)
-    fx = xi - ix
-    fy = yi - iy
-
-    wx = _catmull_rom(fx)  # (4,)
-    wy = _catmull_rom(fy)  # (4,)
-
-    # Gather the 4x4 neighborhood, clamping indices at boundaries
-    val = jnp.zeros(log_rate_maps.shape[0])
-    for j in range(4):
-        jj = jnp.clip(iy + j - 1, 0, ny - 1)
-        for i in range(4):
-            ii = jnp.clip(ix + i - 1, 0, nx - 1)
-            val = val + log_rate_maps[:, jj, ii] * wx[i] * wy[j]
-
-    return val
-
-
-def _bicubic_log_rate_jacobian(
-    position: Array,
-    log_rate_maps: Array,
-    x_edges: Array,
-    y_edges: Array,
-    dx: float,
-    dy: float,
-) -> Array:
-    """Jacobian of bicubic log-rate via jax.jacfwd."""
-    pos_xy = position[:2]
-
-    def _log_rate_xy(xy: Array) -> Array:
-        return _bicubic_log_rate(xy, log_rate_maps, x_edges, y_edges, dx, dy)
-
-    return jax.jacfwd(_log_rate_xy)(pos_xy)
 
 
 def _bilinear_log_rate_jacobian(
@@ -766,7 +788,7 @@ def position_decoder_filter(
     spikes: ArrayLike,
     rate_maps: PlaceFieldRateMaps,
     dt: float,
-    q_pos: float = 1.0,
+    q_pos: float = 100.0,
     q_vel: float = 10.0,
     include_velocity: bool = True,
     init_position: Optional[ArrayLike] = None,
@@ -787,11 +809,23 @@ def position_decoder_filter(
     dt : float
         Time bin width in seconds.
     q_pos : float
-        Position process noise (cm^2/s).
+        Position process noise (cm^2/s). Per-step position variance is
+        ``q_pos * dt``. Set this at least as large as the square of the
+        animal's typical per-step motion (e.g. ``speed_cm_per_s**2 * dt``)
+        so the prior can accommodate the real trajectory rather than
+        collapsing onto the rate-map center. Default 100 corresponds to
+        per-step std of ``sqrt(100 * dt)`` cm.
     q_vel : float
         Velocity process noise (cm^2/s^3).
     include_velocity : bool
-        Whether to include velocity in the state.
+        Whether to include velocity in the state. NOTE: the
+        constant-velocity random-walk dynamics can develop a cross-axis
+        drift on trajectories where one dimension carries little
+        observational information (e.g. a linear track with a single
+        symmetric field), because the (position, velocity) covariance
+        cross-term accumulates and there is no mean-reversion in
+        velocity. For robust decoding on linear or 1D data prefer
+        ``include_velocity=False``.
     init_position : ArrayLike or None
         Initial position estimate [x, y] or [x, y, vx, vy].
         If None, uses center of arena.
@@ -860,28 +894,32 @@ def position_decoder_filter(
     _vel_pad = jnp.zeros((n_neurons, 2)) if include_velocity else None
 
     # Use analytical KDE evaluation when sufficient statistics are
-    # available; fall back to bicubic grid interpolation otherwise.
+    # available; fall back to bilinear grid interpolation otherwise.
     _use_kde = rate_maps._use_analytical
     if _use_kde:
         _grid_xy = rate_maps._jax_grid_xy
         _spike_hists = rate_maps._jax_spike_hists
         _occ_hist = rate_maps._jax_occ_hist
         _sigma2 = rate_maps._jax_kde_sigma2
+        _baseline = rate_maps._jax_baseline_rates
+        _tau = rate_maps._jax_occupancy_tau
 
     def log_intensity_func(state):
         if _use_kde:
-            return _kde_log_rate(state, _grid_xy, _spike_hists, _occ_hist, _sigma2)
-        return _bicubic_log_rate(
+            return _kde_log_rate(
+                state, _grid_xy, _spike_hists, _occ_hist, _sigma2, _baseline, _tau,
+            )
+        return _bilinear_log_rate(
             state, jax_log_rate_maps, jax_x_edges, jax_y_edges, grid_dx, grid_dy
         )
 
     def grad_log_intensity_func(state):
         if _use_kde:
             jac_pos = _kde_log_rate_jacobian(
-                state, _grid_xy, _spike_hists, _occ_hist, _sigma2
+                state, _grid_xy, _spike_hists, _occ_hist, _sigma2, _baseline, _tau,
             )
         else:
-            jac_pos = _bicubic_log_rate_jacobian(
+            jac_pos = _bilinear_log_rate_jacobian(
                 state, jax_log_rate_maps, jax_x_edges, jax_y_edges, grid_dx, grid_dy
             )
         if include_velocity:
@@ -987,7 +1025,7 @@ def position_decoder_smoother(
     spikes: ArrayLike,
     rate_maps: PlaceFieldRateMaps,
     dt: float,
-    q_pos: float = 1.0,
+    q_pos: float = 100.0,
     q_vel: float = 10.0,
     include_velocity: bool = True,
     init_position: Optional[ArrayLike] = None,
@@ -1064,16 +1102,34 @@ class PositionDecoder:
     ----------
     dt : float
         Time bin width in seconds.
-    q_pos : float, default=1.0
-        Position process noise (cm^2/s).
+    q_pos : float, default=100.0
+        Position process noise (cm^2/s). Per-step position variance is
+        ``q_pos * dt``. Should be at least as large as
+        ``speed_cm_per_s**2 * dt`` so the prior can accommodate the
+        animal's real motion rather than collapsing the posterior. The
+        default 100 gives a per-step std of ``sqrt(100 * dt)`` cm,
+        which covers hippocampal-scale behavior up to ~50 cm/s.
     q_vel : float, default=10.0
-        Velocity process noise (cm^2/s^3).
+        Velocity process noise (cm^2/s^3). Only used when
+        ``include_velocity=True``.
     include_velocity : bool, default=True
-        Include velocity in the state.
+        Include velocity in the state. NOTE: the constant-velocity
+        random-walk dynamics can develop a cross-axis drift on
+        trajectories where one dimension carries little observational
+        information (e.g. strictly 1D linear tracks with a single
+        field), because the (position, velocity) covariance cross-term
+        accumulates and there is no mean-reversion in velocity. For
+        robust decoding on linear or 1D data, or any case where you
+        suspect one axis of the place fields is undersampled, prefer
+        ``include_velocity=False``.
     n_grid : int, default=50
         Grid resolution for rate map estimation.
     smoothing_sigma : float, default=5.0
         Gaussian smoothing kernel width (cm) for rate map estimation.
+    occupancy_tau : float, default=0.0
+        Dimensionless Bayesian shrinkage weight for the per-neuron
+        baseline rate in the KDE rate-map estimator; see
+        :meth:`PlaceFieldRateMaps.from_spike_position_data`.
 
     Examples
     --------
@@ -1086,12 +1142,12 @@ class PositionDecoder:
     def __init__(
         self,
         dt: float,
-        q_pos: float = 1.0,
+        q_pos: float = 100.0,
         q_vel: float = 10.0,
         include_velocity: bool = True,
         n_grid: int = 50,
         smoothing_sigma: float = 5.0,
-        occupancy_tau: float = 1.0,
+        occupancy_tau: float = 0.0,
         max_newton_iter: int = 1,
         adaptive_inflation: Optional[AdaptiveInflationConfig] = None,
     ):
