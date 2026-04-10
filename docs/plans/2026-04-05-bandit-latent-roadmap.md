@@ -46,7 +46,7 @@ The current priorities focus on infrastructure and behavioral modeling:
 |---|---|---|---|
 | P1 | `sgd-fitting-all-models.md` | Infrastructure | **DONE** — all model classes have fit_sgd() |
 | P2 | `contingency-belief-latent-task-state.md` | Behavioral | **DONE** — input-output HMM with EM + SGD |
-| P2.5 | `uncertainty-aware-behavioral-modeling.md` | Behavioral | Not started |
+| P2.5 | `uncertainty-aware-behavioral-modeling.md` | Behavioral | **DONE** — uncertainty summaries + surprise on all models |
 | P3 | `switching-choice-model.md` | Behavioral | **DONE** — per-state beta/Q/decay, GPB2 filter, EM + SGD |
 | P4 | `joint-learning-drift.md` | Integration | Not started |
 | P5 | `adaptive-decoder.md` | Neural | Not started |

@@ -39,7 +39,7 @@ The following six plans are the current implementation priorities, ordered by in
 |---|---|---|---|---|---|
 | **P1** | sgd-fitting-all-models.md | **DONE** | — | Computational Improvements (DONE) | All model classes have fit_sgd() |
 | **P2** | contingency-belief-latent-task-state.md | **DONE** | — | Multinomial Choice (DONE) | Input-output HMM with EM + SGD |
-| **P2.5** | uncertainty-aware-behavioral-modeling.md | READY | Low-Med | RL Covariates (DONE) + Contingency Belief (DONE) | First-class uncertainty summaries + uncertainty-aware policy |
+| **P2.5** | uncertainty-aware-behavioral-modeling.md | **DONE** | — | RL Covariates (DONE) + Contingency Belief (DONE) | Uncertainty summaries + surprise on all behavioral models |
 | **P3** | switching-choice-model.md | **DONE** | — | RL Covariates (DONE) + switching_kalman | Per-state beta/Q/decay, GPB2 filter, EM + SGD |
 | **P4** | joint-learning-drift.md | SPECULATIVE | High | Smith + PlaceField + switching_kalman (all exist) | Prototype first; high integration complexity |
 | **P5** | adaptive-decoder.md | PARTIAL | Med | Position Decoding (DONE) | Can start in parallel with P1-P3 |
