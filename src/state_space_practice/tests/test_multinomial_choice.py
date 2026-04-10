@@ -527,6 +527,30 @@ class TestMultinomialUncertaintySummaries:
         np.testing.assert_allclose(model.predicted_option_variances_[:, 0], 0.0)
         np.testing.assert_allclose(model.smoothed_option_variances_[:, 0], 0.0)
 
+    def test_option_values_populated(self):
+        choices = simulate_choice_data(n_trials=50, n_options=3, seed=0).choices
+        model = MultinomialChoiceModel(n_options=3)
+        model.fit(choices, max_iter=3)
+        assert model.predicted_option_values_.shape == (50, 3)
+        assert model.filtered_option_values_.shape == (50, 3)
+        assert model.smoothed_option_values_.shape == (50, 3)
+        assert model.filtered_option_variances_.shape == (50, 3)
+        # Reference option value should be zero
+        np.testing.assert_allclose(model.predicted_option_values_[:, 0], 0.0)
+        np.testing.assert_allclose(model.filtered_option_values_[:, 0], 0.0)
+        np.testing.assert_allclose(model.smoothed_option_values_[:, 0], 0.0)
+        # Filtered variance reference option is zero
+        np.testing.assert_allclose(model.filtered_option_variances_[:, 0], 0.0)
+
+    def test_option_values_populated_after_sgd(self):
+        choices = simulate_choice_data(n_trials=50, n_options=3, seed=0).choices
+        model = MultinomialChoiceModel(n_options=3)
+        model.fit_sgd(choices, num_steps=10)
+        assert model.predicted_option_values_.shape == (50, 3)
+        assert model.filtered_option_values_.shape == (50, 3)
+        assert model.smoothed_option_values_.shape == (50, 3)
+        assert model.filtered_option_variances_.shape == (50, 3)
+
     def test_surprise_is_positive(self):
         choices = simulate_choice_data(n_trials=50, n_options=3, seed=0).choices
         model = MultinomialChoiceModel(n_options=3)

@@ -517,15 +517,27 @@ class CovariateChoiceModel(SGDFittableMixin):
             decay=self.decay,
         )
 
+        # Option values (full K with reference option appended)
+        self.predicted_option_values_ = append_reference_option(filt.predicted_values)
+        self.filtered_option_values_ = append_reference_option(filt.filtered_values)
+        self.smoothed_option_values_ = append_reference_option(
+            self._smoother_result.smoothed_values
+        )
+
+        # Option variances (full K options)
         self.predicted_option_variances_ = option_variances_from_covariances(
             filt.predicted_covariances
+        )
+        self.filtered_option_variances_ = option_variances_from_covariances(
+            filt.filtered_covariances
         )
         self.smoothed_option_variances_ = option_variances_from_covariances(
             self._smoother_result.smoothed_covariances
         )
-        full_pred = append_reference_option(filt.predicted_values)
+
+        # Predicted choice entropy
         pred_probs = jax.nn.softmax(
-            self.inverse_temperature * full_pred, axis=1
+            self.inverse_temperature * self.predicted_option_values_, axis=1
         )
         self.predicted_choice_entropy_ = categorical_entropy(pred_probs)
         self.surprise_ = compute_surprise(pred_probs, choices)

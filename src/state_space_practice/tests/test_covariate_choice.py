@@ -1008,3 +1008,21 @@ class TestCovariateUncertaintySummaries:
         model.fit_sgd(rng.integers(0, 3, size=50), num_steps=10)
         assert model.predicted_option_variances_ is not None
         assert model.predicted_choice_entropy_ is not None
+
+    def test_option_values_populated(self):
+        from state_space_practice.covariate_choice import simulate_rl_choice_data
+
+        sim = simulate_rl_choice_data(n_trials=50, n_options=3, seed=0)
+        model = CovariateChoiceModel(
+            n_options=3, n_covariates=sim.covariates.shape[1],
+        )
+        model.fit(sim.choices, covariates=sim.covariates, max_iter=3)
+        assert model.predicted_option_values_.shape == (50, 3)
+        assert model.filtered_option_values_.shape == (50, 3)
+        assert model.smoothed_option_values_.shape == (50, 3)
+        assert model.filtered_option_variances_.shape == (50, 3)
+        # Reference option value should be zero
+        np.testing.assert_allclose(model.predicted_option_values_[:, 0], 0.0)
+        np.testing.assert_allclose(model.filtered_option_values_[:, 0], 0.0)
+        np.testing.assert_allclose(model.smoothed_option_values_[:, 0], 0.0)
+        np.testing.assert_allclose(model.filtered_option_variances_[:, 0], 0.0)
