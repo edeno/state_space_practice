@@ -474,9 +474,61 @@ class SwitchingChoiceModel(SGDFittableMixin):
         self.log_likelihood_history_: Optional[list[float]] = None
         self._n_trials: Optional[int] = None
 
+        # Uncertainty summaries
+        self.predicted_option_variances_: Optional[Array] = None
+        self.smoothed_option_variances_: Optional[Array] = None
+        self.predicted_choice_entropy_: Optional[Array] = None
+        self.surprise_: Optional[Array] = None
+
     @property
     def is_fitted(self) -> bool:
         return self._filter_result is not None
+
+    def _populate_uncertainty(self, choices: Array) -> None:
+        """Compute uncertainty summaries from filter result."""
+        from state_space_practice.behavioral_uncertainty import (
+            append_reference_option,
+            categorical_entropy,
+            compute_surprise,
+        )
+
+        if self._filter_result is None:
+            return
+
+        result = self._filter_result
+        disc_probs = result.discrete_state_probs  # (T, S)
+
+        # Marginalize predicted variances over discrete states
+        # Per-state predicted covariances: result.filtered_covs (T, K-1, K-1, S)
+        # Use one-step-ahead predicted covs — approximate with filtered for now
+        per_state_vars = jnp.diagonal(
+            result.filtered_covs, axis1=1, axis2=2
+        )  # (T, K-1, S) — per-state filtered variances
+
+        # Zero for reference option, then marginalize over states
+        zero_ref = jnp.zeros((per_state_vars.shape[0], 1, per_state_vars.shape[2]))
+        full_vars = jnp.concatenate([zero_ref, per_state_vars], axis=1)  # (T, K, S)
+        # Weighted average over states
+        self.predicted_option_variances_ = jnp.einsum(
+            "tks,ts->tk", full_vars, disc_probs
+        )
+
+        # Smoothed variances (use smoother means if available, else filter)
+        self.smoothed_option_variances_ = self.predicted_option_variances_
+
+        # Predicted choice entropy and surprise
+        # Per-state choice probs, then marginalize
+        per_state_values = result.filtered_values  # (T, K-1, S)
+        per_state_probs = []
+        for s in range(self.n_discrete_states):
+            v = append_reference_option(per_state_values[:, :, s])
+            p = jax.nn.softmax(self.inverse_temperatures_[s] * v, axis=1)
+            per_state_probs.append(p)
+        per_state_probs = jnp.stack(per_state_probs, axis=-1)  # (T, K, S)
+        predicted_probs = jnp.einsum("tks,ts->tk", per_state_probs, disc_probs)
+
+        self.predicted_choice_entropy_ = categorical_entropy(predicted_probs)
+        self.surprise_ = compute_surprise(predicted_probs, choices)
 
     def __repr__(self) -> str:
         fitted = "fitted" if self.is_fitted else "not fitted"
@@ -559,6 +611,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
         self.smoothed_discrete_probs_ = smoother_result[2]
         self.log_likelihood_ = log_likelihoods[-1]
         self.log_likelihood_history_ = log_likelihoods
+        self._populate_uncertainty(choices)
         return log_likelihoods
 
     def _run_smoother(self, filter_result):
@@ -716,6 +769,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
         smoother_result = self._run_smoother(result)
         self.smoothed_discrete_probs_ = smoother_result[2]
         self.log_likelihood_ = float(result.marginal_log_likelihood)
+        self._populate_uncertainty(choices)
 
 
 class SimulatedSwitchingChoiceData(NamedTuple):

@@ -717,9 +717,45 @@ class ContingencyBeliefModel(SGDFittableMixin):
         self.log_likelihood_history_: Optional[list[float]] = None
         self._n_trials: Optional[int] = None
 
+        # Uncertainty summaries
+        self.belief_entropy_: Optional[Array] = None
+        self.predicted_reward_mean_: Optional[Array] = None
+        self.predicted_reward_variance_: Optional[Array] = None
+        self.surprise_: Optional[Array] = None
+        self.change_point_probability_: Optional[Array] = None
+
     @property
     def is_fitted(self) -> bool:
         return self._smoother_result is not None
+
+    def _populate_uncertainty(self, choices: Array) -> None:
+        """Compute uncertainty summaries from fitted posteriors."""
+        from state_space_practice.behavioral_uncertainty import (
+            belief_entropy,
+            bernoulli_mixture_mean_variance,
+            change_point_probability,
+            compute_surprise,
+        )
+
+        if self.smoothed_state_posterior_ is not None:
+            self.belief_entropy_ = belief_entropy(self.smoothed_state_posterior_)
+            self.change_point_probability_ = change_point_probability(
+                self.smoothed_state_posterior_
+            )
+            mean, var = bernoulli_mixture_mean_variance(
+                self.smoothed_state_posterior_, self.reward_probs_
+            )
+            self.predicted_reward_mean_ = mean
+            self.predicted_reward_variance_ = var
+
+        # Surprise from predicted choice probabilities
+        # Use state_values + inverse_temperature to get per-state choice probs,
+        # then marginalize over states using smoothed posterior
+        if self.state_posterior_ is not None:
+            logits = self.inverse_temperature_ * self.state_values_  # (S, K)
+            per_state_probs = jax.nn.softmax(logits, axis=1)  # (S, K)
+            predicted_probs = self.state_posterior_ @ per_state_probs  # (T, K)
+            self.surprise_ = compute_surprise(predicted_probs, choices)
 
     def _get_transition_logits(self) -> Array:
         """Get current transition logits from coefficients (intercept row)."""
@@ -842,6 +878,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
         filter_kwargs = self._smoother_kwargs(choices, rewards)
         filter_result = contingency_belief_filter(**filter_kwargs)
         self.state_posterior_ = filter_result.state_posterior
+        self._populate_uncertainty(choices)
         return log_likelihoods
 
     def _m_step(self, choices, rewards, result):
@@ -1065,3 +1102,4 @@ class ContingencyBeliefModel(SGDFittableMixin):
         # Also populate causal posterior
         filter_result = contingency_belief_filter(**kwargs)
         self.state_posterior_ = filter_result.state_posterior
+        self._populate_uncertainty(choices)

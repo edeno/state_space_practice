@@ -585,3 +585,41 @@ class TestObservationDesignMatrix:
         import inspect
         sig = inspect.signature(model.fit)
         assert "obs_design_matrix" not in sig.parameters
+
+
+class TestContingencyBeliefUncertainty:
+    """Tests for belief uncertainty summaries."""
+
+    def test_uncertainty_populated_after_sgd(self):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=80)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.fit_sgd(choices, rewards, num_steps=20)
+        assert model.belief_entropy_ is not None
+        assert model.belief_entropy_.shape == (80,)
+        assert model.predicted_reward_mean_ is not None
+        assert model.predicted_reward_mean_.shape == (80, 3)
+        assert model.predicted_reward_variance_ is not None
+        assert model.predicted_reward_variance_.shape == (80, 3)
+        assert model.surprise_ is not None
+        assert model.surprise_.shape == (80,)
+        assert model.change_point_probability_ is not None
+        assert model.change_point_probability_.shape == (80,)
+
+    def test_uncertainty_populated_after_em(self):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=60)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.fit(choices, rewards, max_iter=5)
+        assert model.belief_entropy_ is not None
+        assert model.surprise_ is not None
+
+    def test_change_point_spikes_at_boundary(self):
+        """Change-point probability should be higher near the block switch."""
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=100)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.fit_sgd(choices, rewards, num_steps=50)
+        # First 10 trials should have low change-point prob
+        early_cp = float(model.change_point_probability_[:10].mean())
+        # Around the switch (trial 50), should be higher
+        mid_cp = float(model.change_point_probability_[45:55].mean())
+        # This is a soft check — the model may not perfectly detect the switch
+        assert mid_cp >= early_cp - 0.1

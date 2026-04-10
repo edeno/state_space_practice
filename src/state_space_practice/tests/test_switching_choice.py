@@ -398,3 +398,37 @@ class TestModelComparison:
 
         # Switching model should have better LL on switching data
         assert model_sw.log_likelihood_ > model_ns.log_likelihood_
+
+
+class TestSwitchingChoiceUncertainty:
+    """Tests for switching choice model uncertainty summaries."""
+
+    def test_uncertainty_populated_after_sgd(self):
+        from state_space_practice.switching_choice import SwitchingChoiceModel
+
+        choices = jax.random.randint(jax.random.PRNGKey(0), (80,), 0, 3)
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model.fit_sgd(choices, num_steps=15)
+        assert model.predicted_option_variances_ is not None
+        assert model.predicted_option_variances_.shape == (80, 3)
+        assert model.surprise_ is not None
+        assert model.surprise_.shape == (80,)
+        assert model.predicted_choice_entropy_ is not None
+        assert model.predicted_choice_entropy_.shape == (80,)
+
+    def test_uncertainty_populated_after_em(self):
+        from state_space_practice.switching_choice import SwitchingChoiceModel
+
+        choices = jax.random.randint(jax.random.PRNGKey(0), (60,), 0, 3)
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model.fit(choices, max_iter=3)
+        assert model.predicted_option_variances_ is not None
+        assert model.surprise_ is not None
+
+    def test_surprise_is_positive(self):
+        from state_space_practice.switching_choice import SwitchingChoiceModel
+
+        choices = jax.random.randint(jax.random.PRNGKey(0), (50,), 0, 3)
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model.fit_sgd(choices, num_steps=10)
+        assert jnp.all(model.surprise_ >= 0)
