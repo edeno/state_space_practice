@@ -355,7 +355,7 @@ def contingency_belief_filter(
     n_trials = choices.shape[0]
 
     if transition_logits is None:
-        transition_logits = jnp.zeros((n_states, n_states))
+        transition_logits = jnp.zeros((n_states, n_states - 1))
     if init_state_prob is None:
         init_state_prob = jnp.ones(n_states) / n_states
 
@@ -487,7 +487,7 @@ def contingency_belief_smoother(
     n_trials = choices.shape[0]
 
     if transition_logits is None:
-        transition_logits = jnp.zeros((n_states, n_states))
+        transition_logits = jnp.zeros((n_states, n_states - 1))
     if init_state_prob is None:
         init_state_prob = jnp.ones(n_states) / n_states
 
@@ -506,6 +506,11 @@ def contingency_belief_smoother(
             raise ValueError(
                 f"obs_design_matrix has {obs_design_matrix.shape[0]} rows "
                 f"but choices has {n_trials} trials"
+            )
+        if obs_weights.shape[0] != n_options:
+            raise ValueError(
+                f"obs_weights has {obs_weights.shape[0]} rows "
+                f"but n_options is {n_options}"
             )
         if obs_weights.shape[1] != obs_design_matrix.shape[1]:
             raise ValueError(

@@ -171,6 +171,39 @@ class TestContingencyBeliefFilter:
         )
         assert jnp.isfinite(result.log_likelihood)
 
+    def test_default_transition_logits_n_states_3(self):
+        """Default transition_logits should work for n_states > 2."""
+        result = contingency_belief_filter(
+            choices=jnp.array([0, 1, 0, 1], dtype=jnp.int32),
+            rewards=jnp.array([1, 0, 1, 0], dtype=jnp.int32),
+            n_states=3,
+            n_options=2,
+            reward_probs=jnp.array([[0.8, 0.2], [0.5, 0.5], [0.2, 0.8]]),
+            state_values=jnp.array([[2.0, 0.0], [1.0, 1.0], [0.0, 2.0]]),
+            inverse_temperature=1.0,
+            # transition_logits omitted — uses default
+        )
+        assert result.state_posterior.shape == (4, 3)
+        np.testing.assert_allclose(
+            result.state_posterior.sum(axis=1), 1.0, atol=1e-7
+        )
+
+    def test_obs_weights_row_count_mismatch(self):
+        """Filter should raise a clear error for bad obs_weights rows."""
+        with pytest.raises(ValueError, match="obs_weights has .* rows"):
+            contingency_belief_filter(
+                choices=jnp.array([0, 1, 0], dtype=jnp.int32),
+                rewards=jnp.array([1, 0, 1], dtype=jnp.int32),
+                n_states=2,
+                n_options=2,
+                reward_probs=jnp.array([[0.8, 0.2], [0.2, 0.8]]),
+                state_values=jnp.array([[1.0, 0.0], [0.0, 1.0]]),
+                inverse_temperature=1.0,
+                transition_logits=jnp.zeros((2, 1)),
+                obs_design_matrix=jnp.ones((3, 1)),
+                obs_weights=jnp.zeros((3, 1)),  # wrong: 3 rows, n_options=2
+            )
+
 
 class TestContingencyBeliefSmoother:
     @pytest.fixture
@@ -218,6 +251,39 @@ class TestContingencyBeliefSmoother:
         filter_entropy = entropy(filter_result.state_posterior).mean()
         smoother_entropy = entropy(smoother_result.smoothed_state_prob).mean()
         assert smoother_entropy <= filter_entropy + 1e-6
+
+    def test_default_transition_logits_n_states_3(self):
+        """Default transition_logits should work for n_states > 2."""
+        result = contingency_belief_smoother(
+            choices=jnp.array([0, 1, 0, 1], dtype=jnp.int32),
+            rewards=jnp.array([1, 0, 1, 0], dtype=jnp.int32),
+            n_states=3,
+            n_options=2,
+            reward_probs=jnp.array([[0.8, 0.2], [0.5, 0.5], [0.2, 0.8]]),
+            state_values=jnp.array([[2.0, 0.0], [1.0, 1.0], [0.0, 2.0]]),
+            inverse_temperature=1.0,
+            # transition_logits omitted — uses default
+        )
+        assert result.smoothed_state_prob.shape == (4, 3)
+        np.testing.assert_allclose(
+            result.smoothed_state_prob.sum(axis=1), 1.0, atol=1e-6
+        )
+
+    def test_obs_weights_row_count_mismatch(self):
+        """Smoother should raise a clear error for bad obs_weights rows."""
+        with pytest.raises(ValueError, match="obs_weights has .* rows"):
+            contingency_belief_smoother(
+                choices=jnp.array([0, 1, 0], dtype=jnp.int32),
+                rewards=jnp.array([1, 0, 1], dtype=jnp.int32),
+                n_states=2,
+                n_options=2,
+                reward_probs=jnp.array([[0.8, 0.2], [0.2, 0.8]]),
+                state_values=jnp.array([[1.0, 0.0], [0.0, 1.0]]),
+                inverse_temperature=1.0,
+                transition_logits=jnp.zeros((2, 1)),
+                obs_design_matrix=jnp.ones((3, 1)),
+                obs_weights=jnp.zeros((3, 1)),  # wrong: 3 rows, n_options=2
+            )
 
 
 # ---------------------------------------------------------------------------
