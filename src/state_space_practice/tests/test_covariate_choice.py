@@ -1026,3 +1026,31 @@ class TestCovariateUncertaintySummaries:
         np.testing.assert_allclose(model.filtered_option_values_[:, 0], 0.0)
         np.testing.assert_allclose(model.smoothed_option_values_[:, 0], 0.0)
         np.testing.assert_allclose(model.filtered_option_variances_[:, 0], 0.0)
+
+    def test_obs_covariates_affect_surprise_and_entropy(self):
+        """Nonzero obs_covariates should change surprise and entropy."""
+        rng = np.random.default_rng(99)
+        n_trials, n_options = 50, 3
+        choices = rng.integers(0, n_options, size=n_trials)
+
+        # Fit without obs covariates
+        m_base = CovariateChoiceModel(n_options=n_options)
+        m_base.fit_sgd(choices, num_steps=5)
+
+        # Fit with obs covariates (strong offset favoring option 1)
+        obs_cov = np.zeros((n_trials, 1))
+        obs_cov[:, 0] = 3.0  # constant strong bias
+        m_obs = CovariateChoiceModel(n_options=n_options, n_obs_covariates=1)
+        # Set a nonzero obs weight so the offset actually takes effect
+        m_obs.obs_weights_ = jnp.array([[0.0], [2.0], [-1.0]])  # (K, d_obs)
+        m_obs.fit_sgd(choices, obs_covariates=obs_cov, num_steps=5)
+
+        # The obs offset shifts choice probabilities, so entropy and
+        # surprise must differ from the no-offset model
+        assert not np.allclose(
+            m_base.predicted_choice_entropy_, m_obs.predicted_choice_entropy_,
+            atol=1e-3,
+        ), "obs_covariates should change predicted_choice_entropy_"
+        assert not np.allclose(
+            m_base.surprise_, m_obs.surprise_, atol=1e-3,
+        ), "obs_covariates should change surprise_"

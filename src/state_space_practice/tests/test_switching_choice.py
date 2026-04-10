@@ -460,23 +460,40 @@ class TestSwitchingChoiceUncertainty:
         ).mean()
         assert float(pred_var) >= float(filt_var) - 1e-6
 
-    def test_variance_includes_between_state_term(self):
-        """Marginalized variance should include between-state mean spread."""
+    def test_variance_law_of_total_variance(self):
+        """Marginalized variance should equal E[Var(x|s)] + Var(E[x|s])."""
+        from state_space_practice.behavioral_uncertainty import append_reference_option
         from state_space_practice.switching_choice import SwitchingChoiceModel
 
         choices = jax.random.randint(jax.random.PRNGKey(0), (50,), 0, 3)
         model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
         model.fit_sgd(choices, num_steps=10)
-        # Total variance >= E[Var(x|s)] (within-state average)
-        per_state = model.per_state_predicted_variances_  # (T, K, S)
+
+        per_state_vars = model.per_state_predicted_variances_  # (T, K, S)
         disc_probs = model._filter_result.discrete_state_probs  # (T, S)
+
         # Reconstruct predicted (prior) state probs
         init_prob = jnp.ones(model.n_discrete_states) / model.n_discrete_states
         predicted_disc = jnp.concatenate([
             init_prob[None, :],
             (disc_probs[:-1] @ model.discrete_transition_matrix_),
         ], axis=0)
-        within_only = jnp.einsum("tks,ts->tk", per_state, predicted_disc)
-        total = model.predicted_option_variances_
-        # Total variance >= within-state variance (between-state term is >= 0)
-        assert jnp.all(total >= within_only - 1e-6)
+
+        # Per-state means (full K with reference)
+        per_state_vals = model._filter_result.predicted_values  # (T, K-1, S)
+        full_means = jnp.concatenate([
+            jnp.zeros((per_state_vals.shape[0], 1, per_state_vals.shape[2])),
+            per_state_vals,
+        ], axis=1)  # (T, K, S)
+
+        # E[Var(x|s)]
+        e_var = jnp.einsum("tks,ts->tk", per_state_vars, predicted_disc)
+        # Var(E[x|s]) = E[mu^2] - E[mu]^2
+        e_mean = jnp.einsum("tks,ts->tk", full_means, predicted_disc)
+        e_mean_sq = jnp.einsum("tks,ts->tk", full_means ** 2, predicted_disc)
+        var_mean = e_mean_sq - e_mean ** 2
+
+        expected_total = e_var + var_mean
+        np.testing.assert_allclose(
+            model.predicted_option_variances_, expected_total, atol=1e-5,
+        )
