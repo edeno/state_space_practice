@@ -748,13 +748,22 @@ class ContingencyBeliefModel(SGDFittableMixin):
             self.predicted_reward_mean_ = mean
             self.predicted_reward_variance_ = var
 
-        # Surprise from predicted choice probabilities
-        # Use state_values + inverse_temperature to get per-state choice probs,
-        # then marginalize over states using smoothed posterior
+        # Surprise from PREDICTED (prior) choice probabilities.
+        # The predicted state is P(s_t | y_{1:t-1}), NOT the posterior
+        # P(s_t | y_{1:t}). We reconstruct it from the lagged posterior
+        # and transition matrix. At t=0, use init_state_prob.
         if self.state_posterior_ is not None:
+            trans = centered_softmax(self._get_transition_logits())
+            # predicted[0] = init_state_prob, predicted[t] = T' @ posterior[t-1]
+            init_prob = jnp.ones(self.n_states) / self.n_states
+            predicted_state = jnp.concatenate([
+                init_prob[None, :],
+                (self.state_posterior_[:-1] @ trans),  # (T-1, S)
+            ], axis=0)  # (T, S)
+
             logits = self.inverse_temperature_ * self.state_values_  # (S, K)
             per_state_probs = jax.nn.softmax(logits, axis=1)  # (S, K)
-            predicted_probs = self.state_posterior_ @ per_state_probs  # (T, K)
+            predicted_probs = predicted_state @ per_state_probs  # (T, K)
             self.surprise_ = compute_surprise(predicted_probs, choices)
 
     def _get_transition_logits(self) -> Array:

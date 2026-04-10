@@ -513,11 +513,24 @@ class SwitchingChoiceModel(SGDFittableMixin):
             "tks,ts->tk", full_vars, disc_probs
         )
 
-        # Smoothed variances (use smoother means if available, else filter)
-        self.smoothed_option_variances_ = self.predicted_option_variances_
+        # Smoothed variances: use smoothed discrete probs if available
+        if self.smoothed_discrete_probs_ is not None:
+            self.smoothed_option_variances_ = jnp.einsum(
+                "tks,ts->tk", full_vars, self.smoothed_discrete_probs_
+            )
+        else:
+            self.smoothed_option_variances_ = self.predicted_option_variances_
 
-        # Predicted choice entropy and surprise
-        # Per-state choice probs, then marginalize
+        # Predicted choice entropy and surprise.
+        # Use PREDICTED (prior) state probs P(s_t | y_{1:t-1}), not the
+        # filtered posterior P(s_t | y_{1:t}). Reconstruct from lagged
+        # posterior + transition matrix.
+        init_prob = jnp.ones(self.n_discrete_states) / self.n_discrete_states
+        predicted_disc = jnp.concatenate([
+            init_prob[None, :],
+            (disc_probs[:-1] @ self.discrete_transition_matrix_),
+        ], axis=0)  # (T, S)
+
         per_state_values = result.filtered_values  # (T, K-1, S)
         per_state_probs = []
         for s in range(self.n_discrete_states):
@@ -525,7 +538,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
             p = jax.nn.softmax(self.inverse_temperatures_[s] * v, axis=1)
             per_state_probs.append(p)
         per_state_probs = jnp.stack(per_state_probs, axis=-1)  # (T, K, S)
-        predicted_probs = jnp.einsum("tks,ts->tk", per_state_probs, disc_probs)
+        predicted_probs = jnp.einsum("tks,ts->tk", per_state_probs, predicted_disc)
 
         self.predicted_choice_entropy_ = categorical_entropy(predicted_probs)
         self.surprise_ = compute_surprise(predicted_probs, choices)

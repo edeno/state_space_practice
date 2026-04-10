@@ -433,7 +433,11 @@ class MultinomialChoiceModel(SGDFittableMixin):
         return self._smoother_result is not None
 
     def _populate_uncertainty(self, choices: Array) -> None:
-        """Compute uncertainty summaries from filter + smoother results."""
+        """Compute uncertainty summaries from filter + smoother results.
+
+        Note: runs the filter once to get predicted quantities (predicted_values,
+        predicted_covariances) which are not stored on the smoother result.
+        """
         from state_space_practice.behavioral_uncertainty import (
             append_reference_option,
             categorical_entropy,
@@ -441,7 +445,6 @@ class MultinomialChoiceModel(SGDFittableMixin):
             option_variances_from_covariances,
         )
 
-        # Run filter to get predicted quantities
         filt = multinomial_choice_filter(
             choices, self.n_options,
             self.process_noise, self.inverse_temperature,
