@@ -155,5 +155,7 @@ _version.py
 .DS_Store
 *.npz
 *.png
+*.pkl
 
 /data
+/output

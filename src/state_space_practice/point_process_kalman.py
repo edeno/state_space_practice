@@ -96,35 +96,6 @@ def _logdet_psd(mat: Array, diagonal_boost: float = 1e-9) -> Array:
     return jnp.sum(jnp.log(eigvals))
 
 
-def _ensure_psd(mat: Array, diagonal_boost: float = 1e-9) -> Array:
-    """Ensure a matrix is PSD via Cholesky with adaptive jitter.
-
-    Unlike stabilize_covariance (eigendecomp-based), this is fully
-    differentiable — the Cholesky backward pass is well-conditioned
-    even for near-degenerate eigenvalues.
-
-    For matrices that are already PSD (the common case in the Laplace-EKF
-    with linear observation models), this adds only diagonal_boost to the
-    diagonal. For indefinite matrices (possible with nonlinear observation
-    models where the Hessian correction dominates), it computes the
-    required jitter from the minimum eigenvalue and adds it before Cholesky.
-
-    The eigenvalue computation is detached from the backward pass via
-    stop_gradient so it doesn't introduce the eigvalsh gradient instability.
-    """
-    mat = symmetrize(mat)
-    n = mat.shape[0]
-    # Compute minimum eigenvalue (detached from backward pass —
-    # jitter is a conditioning scalar, not a learned parameter)
-    min_eig = jax.lax.stop_gradient(jnp.min(jnp.linalg.eigvalsh(mat)))
-    # Shift past the negative eigenvalue with a relative margin to
-    # prevent Schur complement cancellation in float32 Cholesky
-    abs_shift = jnp.maximum(-min_eig, 0.0)
-    jitter = abs_shift + abs_shift * 1e-5 + diagonal_boost
-    L = jnp.linalg.cholesky(mat + jitter * jnp.eye(n))
-    return L @ L.T
-
-
 def _safe_expected_count(
     log_rate: Array,
     dt: float,
@@ -145,7 +116,6 @@ def _point_process_laplace_update(
     log_intensity_func: Callable[[Array], Array],
     diagonal_boost: float = 1e-9,
     grad_log_intensity_func: Optional[Callable[[Array], Array]] = None,
-    hess_log_intensity_func: Optional[Callable[[Array], Array]] = None,
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 1,
     line_search_beta: float = 0.5,
@@ -153,13 +123,38 @@ def _point_process_laplace_update(
     """Single point-process Laplace-EKF update for multiple neurons.
 
     Performs a Bayesian update of the latent state posterior given observed
-    spike counts, using a Laplace (Gaussian) approximation to the posterior.
+    spike counts, using a Gaussian (Laplace) approximation to the posterior.
+    The approximation is built via **Fisher scoring** (expected Hessian /
+    statistical linearization) rather than full Newton-Raphson with the
+    observed Hessian.
 
     This is the core math for point-process observation updates, factored
     out to be reusable by both the non-switching and switching filters.
 
     The observation model is:
         y_n ~ Poisson(exp(log_intensity_func(x)[n]) * dt)
+
+    Fisher scoring vs full Newton
+    -----------------------------
+    The posterior precision is built as
+
+        P_post = P_prior + J' diag(lambda * dt) J
+
+    where ``J`` is the Jacobian of ``log_intensity_func`` w.r.t. the state
+    and ``lambda`` is the conditional intensity. This is a sum of PSD
+    matrices, so ``P_post`` is PSD by construction and requires no
+    eigenvalue stabilization.
+
+    Full Newton would additionally subtract the observed Hessian correction
+    ``sum_n (y_n - lambda_n * dt) * d^2(log lambda_n)/dx^2``, which is
+    indefinite in general and can produce wildly large steps at non-MAP
+    points. For **linear** log-intensities (``log lambda = Z @ x``, the
+    default via :func:`log_conditional_intensity`) the second derivative is
+    zero and Fisher scoring is mathematically identical to full Newton.
+    For **nonlinear** intensities (e.g. KDE or bicubic rate maps in
+    :class:`PositionDecoder`), Fisher scoring produces better-conditioned,
+    more stable updates. This matches the approach used in dynamax and
+    generalized linear model IRLS.
 
     Parameters
     ----------
@@ -181,16 +176,15 @@ def _point_process_laplace_update(
         If None, computed via jax.jacfwd(log_intensity_func).
         Passing pre-computed functions can improve compilation speed when
         this function is called repeatedly inside a JIT-compiled context.
-    hess_log_intensity_func : Callable[[Array], Array] | None, optional
-        Pre-computed Hessian function of log_intensity_func.
-        If None, computed via jax.jacfwd of the gradient function.
     include_laplace_normalization : bool, default=True
         If True, include the Laplace normalization and prior terms to approximate
         log p(y_t | y_{1:t-1}). If False, return the plug-in log-likelihood
         at the posterior mode without normalization.
     max_newton_iter : int, default=1
-        Maximum number of Newton iterations. Use > 1 with line search for
-        numerical stability with large spike counts (e.g., many neurons).
+        Maximum number of Fisher scoring iterations. Use > 1 with line search
+        for numerical stability with large spike counts (e.g., many neurons).
+        (Named ``max_newton_iter`` for backwards compatibility; the inner
+        iterations are Fisher steps, not full Newton.)
     line_search_beta : float, default=0.5
         Step size reduction factor for backtracking line search. Only used
         when max_newton_iter > 1. At each iteration, step size is halved
@@ -207,8 +201,8 @@ def _point_process_laplace_update(
     Notes
     -----
     The Laplace approximation uses the predicted mean as the expansion point
-    for a single Newton step update. For multiple neurons, the gradients and
-    Hessians are summed across neurons.
+    for a single Fisher scoring step. For multiple neurons, the gradients
+    and Jacobians are summed across neurons.
 
     For Poisson likelihood with log-link:
         log p(y | x) = sum_n [y_n * log(lambda_n * dt) - lambda_n * dt - log(y_n!)]
@@ -222,13 +216,23 @@ def _point_process_laplace_update(
         Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
         Neural Computation 16, 971-998.
     """
-    # Compute gradients and Hessians of log-intensity function
+    # Compute gradient of log-intensity function. The Hessian is NOT used
+    # because we use Fisher scoring (expected Hessian) rather than the full
+    # observed Hessian. For Poisson with log link, the Fisher information is
+    # J' diag(lambda * dt) J, which is PSD by construction — no stabilization
+    # of the posterior precision is required. The observed Hessian adds a
+    # (y - lambda*dt) * d^2(log lambda)/dx^2 correction that can be indefinite
+    # at non-MAP points; dropping it is the standard approach used in
+    # dynamax, glmnet-style IRLS, and textbook Fisher scoring.
+    #
+    # For linear log-intensity (log lambda = Z @ x), the second derivative is
+    # zero so Fisher scoring is mathematically identical to full Newton.
+    # For nonlinear intensities (e.g. KDE/bicubic rate maps in
+    # PositionDecoder), Fisher scoring produces better-conditioned updates
+    # because it avoids inverting a precision whose PSD-ness relies on jitter.
     if grad_log_intensity_func is None:
         grad_log_intensity_func = jax.jacfwd(log_intensity_func)
-    if hess_log_intensity_func is None:
-        hess_log_intensity_func = jax.jacfwd(grad_log_intensity_func)
     grad_log_intensity = grad_log_intensity_func
-    hess_log_intensity = hess_log_intensity_func
 
     # Prior precision via psd_solve for numerical stability
     n_latent = one_step_mean.shape[0]
@@ -247,25 +251,25 @@ def _point_process_laplace_update(
         log_prior = -0.5 * delta @ (prior_precision @ delta)
         return -(log_lik + log_prior)
 
-    def _newton_step_at(x: Array) -> tuple[Array, Array, Array]:
-        """Compute Newton step and posterior precision at point x.
+    def _fisher_step_at(x: Array) -> tuple[Array, Array, Array]:
+        """Compute Fisher-scoring step and posterior precision at point x.
 
-        The full posterior is:
-            log p(x | y) = log p(y | x) + log p(x) + const
+        Uses the expected Hessian (Fisher information) rather than the
+        observed Hessian:
 
-        Gradient of log posterior:
-            grad = grad_log_likelihood - prior_precision @ (x - prior_mean)
+            -E[H_log_likelihood] = J' diag(lambda * dt) J    [PSD]
 
-        Hessian of log posterior:
-            H = H_log_likelihood - prior_precision
+        Combined with the prior precision this gives a posterior precision
+        that is PSD by construction:
+
+            post_prec = prior_precision + J' diag(lambda * dt) J
         """
         log_lambda = log_intensity_func(x)
         conditional_intensity = _safe_expected_count(log_lambda, dt)
         innovation = spike_indicator_t - conditional_intensity
         jacobian = grad_log_intensity(x)
-        hessian = hess_log_intensity(x)
 
-        # Likelihood gradient
+        # Likelihood gradient (same as full Newton)
         likelihood_gradient = jacobian.T @ innovation
 
         # Prior gradient: -prior_precision @ (x - one_step_mean)
@@ -274,20 +278,21 @@ def _point_process_laplace_update(
         # Full posterior gradient
         gradient = likelihood_gradient + prior_gradient
 
-        # Posterior precision (negative Hessian of log posterior)
+        # Fisher information (expected negative Hessian of log-likelihood).
+        # J' diag(cond_int) J is a sum of rank-1 PSD terms. Adding the PSD
+        # prior precision gives a PSD posterior precision — no stabilization
+        # of indefiniteness is required.
         fisher_info = jacobian.T @ (conditional_intensity[:, None] * jacobian)
-        hessian_correction = jnp.einsum("n,nij->ij", innovation, hessian)
-        post_prec = prior_precision + fisher_info - hessian_correction
-        post_prec = _ensure_psd(post_prec, diagonal_boost)
+        post_prec = symmetrize(prior_precision + fisher_info)
 
-        # Newton direction (psd_solve adds diagonal_boost for stability)
+        # Fisher-scoring direction
         delta = psd_solve(post_prec, gradient, diagonal_boost=diagonal_boost)
         return delta, post_prec, gradient
 
     def _line_search_step(carry, _):
-        """One iteration of Newton with backtracking line search."""
+        """One iteration of Fisher scoring with backtracking line search."""
         x, _ = carry
-        delta, _, _ = _newton_step_at(x)
+        delta, _, _ = _fisher_step_at(x)
         current_loss = _neg_log_posterior(x)
 
         # Backtracking line search
@@ -305,45 +310,41 @@ def _point_process_laplace_update(
         new_x = x + final_alpha * delta
 
         # Recompute precision at accepted point for consistency
-        _, new_post_prec, _ = _newton_step_at(new_x)
+        _, new_post_prec, _ = _fisher_step_at(new_x)
         return (new_x, new_post_prec), None
 
     # Initialize at prior mean
     x = one_step_mean
 
     if max_newton_iter == 1:
-        # Original single-step behavior (no line search overhead)
-        # Evaluate at prior mean (one_step_mean), so prior gradient is zero
+        # Single-step Fisher scoring (no line search overhead).
+        # Evaluate at prior mean (one_step_mean), so prior gradient is zero.
         log_lambda = log_intensity_func(one_step_mean)
         conditional_intensity = _safe_expected_count(log_lambda, dt)
         innovation = spike_indicator_t - conditional_intensity
         jacobian = grad_log_intensity(one_step_mean)
-        hessian = hess_log_intensity(one_step_mean)
         # Likelihood gradient only; prior gradient = -P^{-1}(x - m) = 0 at x = m
         likelihood_gradient = jacobian.T @ innovation
-        # Prior gradient is zero at the prior mean, but include explicitly for clarity
         prior_gradient = jnp.zeros_like(likelihood_gradient)
         gradient = likelihood_gradient + prior_gradient
         fisher_info = jacobian.T @ (conditional_intensity[:, None] * jacobian)
-        hessian_correction = jnp.einsum("n,nij->ij", innovation, hessian)
-        posterior_precision = prior_precision + fisher_info - hessian_correction
-        posterior_precision = _ensure_psd(
-            posterior_precision, diagonal_boost
-        )
+        posterior_precision = symmetrize(prior_precision + fisher_info)
         posterior_mean = one_step_mean + psd_solve(
             posterior_precision, gradient, diagonal_boost=diagonal_boost
         )
     else:
-        # Iterative Newton with line search
+        # Iterative Fisher scoring with line search
         (posterior_mean, posterior_precision), _ = jax.lax.scan(
             _line_search_step, (x, prior_precision), None, length=max_newton_iter
         )
 
-    # Posterior covariance via psd_solve
-    posterior_cov = psd_solve(
+    # Posterior covariance via psd_solve. No post-hoc stabilization needed
+    # because posterior_precision is PSD by construction (sum of two PSD
+    # matrices). psd_solve itself adds a small diagonal boost for Cholesky
+    # conditioning.
+    posterior_cov = symmetrize(psd_solve(
         posterior_precision, identity, diagonal_boost=diagonal_boost
-    )
-    posterior_cov = _ensure_psd(posterior_cov, diagonal_boost)
+    ))
 
     # Log-likelihood at posterior mode (approximate)
     log_lambda_mode = log_intensity_func(posterior_mean)
@@ -472,15 +473,15 @@ def stochastic_point_process_filter(
     if single_neuron:
         spike_indicator = spike_indicator[:, None]
 
-    # Pre-compute gradient and Hessian functions outside the scan
-    # These are parameterized by design_matrix_t to avoid recreating jax.jacfwd each step
+    # Pre-compute gradient function outside the scan.
+    # Parameterized by design_matrix_t to avoid recreating jax.jacfwd each step.
     def _log_intensity_with_design(design_matrix_t, x):
         log_lambda = log_conditional_intensity(design_matrix_t, x)
         return jnp.atleast_1d(log_lambda)
 
-    # Create grad/hess w.r.t. x (argnums=1), keeping design_matrix_t as parameter
+    # Gradient w.r.t. x (argnums=1), keeping design_matrix_t as parameter.
+    # No Hessian is needed — Fisher scoring uses only first-order info.
     _grad_log_intensity = jax.jacfwd(_log_intensity_with_design, argnums=1)
-    _hess_log_intensity = jax.jacfwd(_grad_log_intensity, argnums=1)
 
     def _step(
         params_prev: tuple[Array, Array, Array],
@@ -502,15 +503,12 @@ def stochastic_point_process_filter(
         def log_intensity_func(x):
             return _log_intensity_with_design(design_matrix_t, x)
 
-        # Create grad/hess functions that capture design_matrix_t
-        # These use the pre-computed jacfwd functions from outside the scan
+        # Grad closure capturing design_matrix_t; uses the pre-computed
+        # jacfwd function from outside the scan.
         def grad_log_intensity_func(x):
             return _grad_log_intensity(design_matrix_t, x)
 
-        def hess_log_intensity_func(x):
-            return _hess_log_intensity(design_matrix_t, x)
-
-        # Use the generalized multi-neuron Laplace update
+        # Fisher-scoring Laplace update (no Hessian needed)
         posterior_mean, posterior_covariance, log_lik = _point_process_laplace_update(
             one_step_mean,
             one_step_covariance,
@@ -518,7 +516,6 @@ def stochastic_point_process_filter(
             dt,
             log_intensity_func,
             grad_log_intensity_func=grad_log_intensity_func,
-            hess_log_intensity_func=hess_log_intensity_func,
             include_laplace_normalization=include_laplace_normalization,
         )
 

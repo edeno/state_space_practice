@@ -89,17 +89,14 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.kalman import symmetrize
-from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.oscillator_utils import (
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
     project_coupled_transition_matrix,
 )
 from state_space_practice.point_process_kalman import _point_process_laplace_update
+from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.switching_kalman import (
-    _divide_safe,
-    _scale_likelihood,
-    _stabilize_probability_vector,
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture_per_discrete_state,
     switching_kalman_maximization_step,
@@ -107,6 +104,11 @@ from state_space_practice.switching_kalman import (
     switching_kalman_smoother_gpb2,
 )
 from state_space_practice.utils import check_converged, make_discrete_transition_matrix
+from state_space_practice.utils import divide_safe as _divide_safe
+from state_space_practice.utils import scale_likelihood as _scale_likelihood
+from state_space_practice.utils import (
+    stabilize_probability_vector as _stabilize_probability_vector,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +279,6 @@ def point_process_kalman_update(
     spike_params: SpikeObsParams,
     diagonal_boost: float = 1e-9,
     grad_log_intensity_func: Callable[[Array, SpikeObsParams], Array] | None = None,
-    hess_log_intensity_func: Callable[[Array, SpikeObsParams], Array] | None = None,
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 1,
     line_search_beta: float = 0.5,
@@ -286,11 +287,13 @@ def point_process_kalman_update(
 
     Performs a Bayesian update of the latent state posterior given observed
     spike counts, using a Laplace (Gaussian) approximation to the posterior.
+    The approximation is built via Fisher scoring (expected Hessian) so the
+    posterior precision is PSD by construction.
 
     The observation model is:
         y_n ~ Poisson(exp(log_intensity_func(x, spike_params)[n]) * dt)
 
-    The update uses a single Newton-Raphson step from the prior mean to
+    The update uses a single Fisher scoring step from the prior mean to
     approximate the posterior.
 
     Parameters
@@ -318,9 +321,6 @@ def point_process_kalman_update(
         If None, computed via jax.jacfwd(log_intensity_func, argnums=0).
         Passing pre-computed functions can improve compilation speed when
         this function is called repeatedly inside a JIT-compiled context.
-    hess_log_intensity_func : Callable[[Array, SpikeObsParams], Array] | None, optional
-        Pre-computed Hessian function of log_intensity_func w.r.t. state.
-        If None, computed via jax.jacfwd of the gradient function.
     include_laplace_normalization : bool, default=True
         If True, include the Laplace normalization and prior terms to approximate
         log p(y_t | y_{1:t-1}). If False, return the plug-in log-likelihood
@@ -338,8 +338,8 @@ def point_process_kalman_update(
     Notes
     -----
     The Laplace approximation uses the predicted mean as the expansion point
-    for a single Newton step update. For multiple neurons, the gradients and
-    Hessians are summed across neurons.
+    for a single Fisher scoring step. For multiple neurons, the gradients and
+    Jacobians are summed across neurons.
 
     The log-likelihood is evaluated at the approximate posterior mode. When
     ``include_laplace_normalization`` is True, prior and normalization terms
@@ -362,18 +362,12 @@ def point_process_kalman_update(
     def _log_intensity_with_params(state: Array) -> Array:
         return log_intensity_func(state, spike_params)
 
-    # Wrap grad/hess functions if provided
+    # Wrap grad function if provided
     _grad_func = None
     if grad_log_intensity_func is not None:
 
         def _grad_func(state: Array) -> Array:
             return grad_log_intensity_func(state, spike_params)
-
-    _hess_func = None
-    if hess_log_intensity_func is not None:
-
-        def _hess_func(state: Array) -> Array:
-            return hess_log_intensity_func(state, spike_params)
 
     # Delegate to the shared helper in point_process_kalman.py
     return _point_process_laplace_update(
@@ -384,7 +378,6 @@ def point_process_kalman_update(
         log_intensity_func=_log_intensity_with_params,
         diagonal_boost=diagonal_boost,
         grad_log_intensity_func=_grad_func,
-        hess_log_intensity_func=_hess_func,
         include_laplace_normalization=include_laplace_normalization,
         max_newton_iter=max_newton_iter,
         line_search_beta=line_search_beta,
