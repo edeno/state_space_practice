@@ -432,3 +432,32 @@ class TestSwitchingChoiceUncertainty:
         model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
         model.fit_sgd(choices, num_steps=10)
         assert jnp.all(model.surprise_ >= 0)
+
+    def test_per_state_predicted_variances_shape(self):
+        from state_space_practice.switching_choice import SwitchingChoiceModel
+
+        choices = jax.random.randint(jax.random.PRNGKey(0), (50,), 0, 3)
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model.fit_sgd(choices, num_steps=10)
+        assert model.per_state_predicted_variances_ is not None
+        assert model.per_state_predicted_variances_.shape == (50, 2, 3)  # (T, S, K)
+
+    def test_predicted_uses_prior_not_posterior(self):
+        """Predicted variances should be larger than filtered (prior > posterior)."""
+        from state_space_practice.switching_choice import SwitchingChoiceModel
+
+        choices = jax.random.randint(jax.random.PRNGKey(0), (50,), 0, 3)
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model.fit_sgd(choices, num_steps=10)
+        # Predicted (prior) variance should generally be >= filtered (posterior)
+        # because the observation update reduces uncertainty
+        pred_var = model.predicted_option_variances_[:, 1:].mean()  # exclude ref
+        # filtered_covs are posterior — extract variance
+        filt_diag = jnp.diagonal(
+            model._filter_result.filtered_covs, axis1=1, axis2=2
+        )  # (T, K-1, S)
+        filt_var = jnp.einsum(
+            "tks,ts->tk", filt_diag, model._filter_result.discrete_state_probs
+        ).mean()
+        # Prior should be at least as large as posterior on average
+        assert float(pred_var) >= float(filt_var) - 1e-6

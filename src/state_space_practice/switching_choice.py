@@ -32,10 +32,12 @@ from jax.typing import ArrayLike
 from state_space_practice.multinomial_choice import _softmax_update_core
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.switching_kalman import (
-    _scale_likelihood,
-    _stabilize_probability_vector,
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture_per_discrete_state,
+)
+from state_space_practice.utils import (
+    scale_likelihood as _scale_likelihood,
+    stabilize_probability_vector as _stabilize_probability_vector,
 )
 
 logger = logging.getLogger(__name__)
@@ -166,9 +168,11 @@ def _softmax_update_per_state_pair(
 class SwitchingChoiceFilterResult(NamedTuple):
     """Result container for switching choice filter."""
 
-    filtered_values: Array        # (n_trials, K-1, S) state-conditional
-    filtered_covs: Array          # (n_trials, K-1, K-1, S) state-conditional
-    discrete_state_probs: Array   # (n_trials, S)
+    filtered_values: Array        # (n_trials, K-1, S) state-conditional posterior
+    filtered_covs: Array          # (n_trials, K-1, K-1, S) state-conditional posterior
+    predicted_values: Array       # (n_trials, K-1, S) state-conditional predicted (prior)
+    predicted_covs: Array         # (n_trials, K-1, K-1, S) state-conditional predicted
+    discrete_state_probs: Array   # (n_trials, S) filtered posterior
     marginal_log_likelihood: Array  # scalar
     pair_cond_means: Array        # (n_trials, K-1, S, S) for smoother
     pair_cond_covs: Array         # (n_trials, K-1, K-1, S, S) for smoother
@@ -306,15 +310,15 @@ def switching_choice_filter(
         # LL at mode for discrete-state weighting
         v_mode = jnp.concatenate([jnp.zeros(1), post_mean])
         ll = jax.nn.log_softmax(beta * v_mode + obs_offset_0)[choices[0]]
-        return post_mean, post_cov, ll
+        return post_mean, post_cov, ll, pred_mean, pred_cov
 
-    first_means, first_covs, first_lls = jax.vmap(
+    first_means, first_covs, first_lls, first_pred_means, first_pred_covs = jax.vmap(
         _first_update_for_state,
         in_axes=(1, 2, 0, 2, 2),
-        out_axes=(1, 2, 0),
+        out_axes=(1, 2, 0, 1, 2),
     )(init_state_cond_mean, init_state_cond_cov, inverse_temperatures,
       transition_matrices, process_covs)
-    # first_means: (K-1, S), first_covs: (K-1, K-1, S), first_lls: (S,)
+    # first_means: (K-1, S), first_pred_means: (K-1, S), etc.
 
     # Scale and update discrete probs for first timestep
     # Convert per-state LL to pair format for reuse of _update functions
@@ -335,6 +339,18 @@ def switching_choice_filter(
         choice_t, u_t, z_t = trial_data
 
         obs_offset_t = ow_arr @ z_t  # (K,)
+
+        # Compute per-state predicted (prior) means and covs
+        def _predict_for_state_j(prev_m, prev_c, A_j, Q_j):
+            pred_m = A_j @ prev_m + ig_arr @ u_t
+            pred_c = A_j @ prev_c @ A_j.T + Q_j
+            return pred_m, pred_c
+
+        pred_means, pred_covs = jax.vmap(
+            _predict_for_state_j,
+            in_axes=(1, 2, 2, 2),
+            out_axes=(1, 2),
+        )(prev_mean, prev_cov, transition_matrices, process_covs)
 
         # Per-state-pair predict + update
         pair_mean, pair_cov, pair_ll = _softmax_update_per_state_pair(
@@ -361,6 +377,7 @@ def switching_choice_filter(
 
         return (state_mean, state_cov, disc_prob, new_ll), (
             state_mean, state_cov, disc_prob, pair_mean, pair_cov,
+            pred_means, pred_covs,
         )
 
     init_carry = (first_means, first_covs, first_discrete_prob, first_marginal_ll)
@@ -368,6 +385,7 @@ def switching_choice_filter(
 
     (_, _, _, total_ll), (
         rest_means, rest_covs, rest_disc_probs, rest_pair_means, rest_pair_covs,
+        rest_pred_means, rest_pred_covs,
     ) = jax.lax.scan(_step, init_carry, scan_inputs)
 
     # Concatenate first timestep
@@ -386,10 +404,18 @@ def switching_choice_filter(
     pair_cond_covs = jnp.concatenate(
         [first_pair_cov[None], rest_pair_covs], axis=0
     )
+    predicted_values = jnp.concatenate(
+        [first_pred_means[None], rest_pred_means], axis=0
+    )
+    predicted_covs = jnp.concatenate(
+        [first_pred_covs[None], rest_pred_covs], axis=0
+    )
 
     return SwitchingChoiceFilterResult(
         filtered_values=filtered_values,
         filtered_covs=filtered_covs,
+        predicted_values=predicted_values,
+        predicted_covs=predicted_covs,
         discrete_state_probs=discrete_state_probs,
         marginal_log_likelihood=total_ll,
         pair_cond_means=pair_cond_means,
@@ -479,6 +505,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
         self.smoothed_option_variances_: Optional[Array] = None
         self.predicted_choice_entropy_: Optional[Array] = None
         self.surprise_: Optional[Array] = None
+        self.per_state_predicted_variances_: Optional[Array] = None
 
     @property
     def is_fitted(self) -> bool:
@@ -498,16 +525,17 @@ class SwitchingChoiceModel(SGDFittableMixin):
         result = self._filter_result
         disc_probs = result.discrete_state_probs  # (T, S)
 
-        # Marginalize predicted variances over discrete states
-        # Per-state predicted covariances: result.filtered_covs (T, K-1, K-1, S)
-        # Use one-step-ahead predicted covs — approximate with filtered for now
+        # Marginalize predicted (prior) variances over discrete states
         per_state_vars = jnp.diagonal(
-            result.filtered_covs, axis1=1, axis2=2
-        )  # (T, K-1, S) — per-state filtered variances
+            result.predicted_covs, axis1=1, axis2=2
+        )  # (T, K-1, S) — per-state predicted variances
 
         # Zero for reference option, then marginalize over states
         zero_ref = jnp.zeros((per_state_vars.shape[0], 1, per_state_vars.shape[2]))
         full_vars = jnp.concatenate([zero_ref, per_state_vars], axis=1)  # (T, K, S)
+        # Per-state predicted variances (before marginalization)
+        self.per_state_predicted_variances_ = jnp.moveaxis(full_vars, -1, 1)  # (T, S, K)
+
         # Weighted average over states
         self.predicted_option_variances_ = jnp.einsum(
             "tks,ts->tk", full_vars, disc_probs
@@ -531,7 +559,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
             (disc_probs[:-1] @ self.discrete_transition_matrix_),
         ], axis=0)  # (T, S)
 
-        per_state_values = result.filtered_values  # (T, K-1, S)
+        per_state_values = result.predicted_values  # (T, K-1, S) — prior, not posterior
         per_state_probs = []
         for s in range(self.n_discrete_states):
             v = append_reference_option(per_state_values[:, :, s])
