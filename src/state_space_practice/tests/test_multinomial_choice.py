@@ -556,3 +556,66 @@ class TestMultinomialUncertaintySummaries:
         model = MultinomialChoiceModel(n_options=3)
         model.fit(choices, max_iter=3)
         assert jnp.all(model.surprise_ >= 0)
+
+
+@pytest.mark.slow
+class TestMultinomialRecovery:
+    """Generative recovery: simulate from known params, fit, check recovery."""
+
+    def test_recovers_latent_values_from_simulation(self):
+        """Fitted smoother values should correlate strongly with truth."""
+        sim = simulate_choice_data(
+            n_trials=400,
+            n_options=3,
+            process_noise=0.05,
+            inverse_temperature=2.0,
+            seed=7,
+        )
+        model = MultinomialChoiceModel(
+            n_options=3,
+            init_process_noise=0.05,
+            init_inverse_temperature=2.0,
+        )
+        model.fit(sim.choices, max_iter=5)
+
+        # Smoother should track the latent random walk
+        true_vals = np.asarray(sim.true_values)  # (T, K-1)
+        smoothed = np.asarray(model._smoother_result.smoothed_values)
+
+        # Per-option correlation between truth and smoother posterior mean
+        for k in range(true_vals.shape[1]):
+            r = np.corrcoef(true_vals[:, k], smoothed[:, k])[0, 1]
+            assert r > 0.6, f"option {k + 1}: corr={r:.3f} too low"
+
+        # Predictive accuracy: argmax choice probs should agree with
+        # argmax of true choice probs at least 60% of the time
+        true_probs = np.asarray(sim.true_probs)
+        full_smoothed = np.column_stack([
+            np.zeros(len(smoothed)), smoothed
+        ])
+        pred_probs = np.exp(2.0 * full_smoothed)
+        pred_probs /= pred_probs.sum(axis=1, keepdims=True)
+        agree = (pred_probs.argmax(axis=1) == true_probs.argmax(axis=1)).mean()
+        assert agree > 0.6, f"argmax agreement {agree:.2f} < 0.6"
+
+    def test_sgd_recovers_latent_values(self):
+        """SGD path should also recover latent values."""
+        sim = simulate_choice_data(
+            n_trials=400,
+            n_options=3,
+            process_noise=0.05,
+            inverse_temperature=2.0,
+            seed=11,
+        )
+        model = MultinomialChoiceModel(
+            n_options=3,
+            init_process_noise=0.05,
+            init_inverse_temperature=2.0,
+        )
+        model.fit_sgd(sim.choices, num_steps=50)
+
+        true_vals = np.asarray(sim.true_values)
+        smoothed = np.asarray(model._smoother_result.smoothed_values)
+        for k in range(true_vals.shape[1]):
+            r = np.corrcoef(true_vals[:, k], smoothed[:, k])[0, 1]
+            assert r > 0.6, f"option {k + 1}: corr={r:.3f} too low"

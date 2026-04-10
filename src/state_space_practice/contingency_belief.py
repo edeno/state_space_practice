@@ -264,6 +264,40 @@ def compute_reward_log_likelihood(
     )
 
 
+def _validate_obs_weights_shape(
+    obs_weights: Array, n_states: int, n_options: int
+) -> None:
+    """Validate obs_weights shape is either (K, d) or (S, K, d).
+
+    Raises ValueError with a descriptive message on mismatch.
+    """
+    if obs_weights.ndim == 2:
+        # Shared offset: (n_options, d_obs)
+        if obs_weights.shape[0] != n_options:
+            raise ValueError(
+                f"obs_weights has {obs_weights.shape[0]} rows "
+                f"but n_options is {n_options}"
+            )
+    elif obs_weights.ndim == 3:
+        # Per-state offset: (n_states, n_options, d_obs)
+        if obs_weights.shape[0] != n_states:
+            raise ValueError(
+                f"obs_weights has {obs_weights.shape[0]} states "
+                f"but n_states is {n_states}"
+            )
+        if obs_weights.shape[1] != n_options:
+            raise ValueError(
+                f"obs_weights has {obs_weights.shape[1]} options "
+                f"but n_options is {n_options}"
+            )
+    else:
+        raise ValueError(
+            f"obs_weights must have 2 dims (n_options, d_obs) for shared "
+            f"offsets or 3 dims (n_states, n_options, d_obs) for "
+            f"per-state offsets, got ndim={obs_weights.ndim}"
+        )
+
+
 def compute_choice_log_likelihood(
     choice_t: ArrayLike,
     state_values: Array,
@@ -280,9 +314,15 @@ def compute_choice_log_likelihood(
         Value preferences per state-option pair.
     inverse_temperature : float
         Softmax temperature.
-    obs_offset : Array or None, shape (n_options,)
+    obs_offset : Array or None
         Additive offset to action logits from observation design matrix.
-        Shared across states. If None, no offset.
+        Two supported shapes:
+
+        - ``(n_options,)``: shared across states (e.g. a global stay bias).
+        - ``(n_states, n_options)``: state-specific offsets (e.g. a stay
+          bias that only operates in certain contingency states).
+
+        If None, no offset.
 
     Returns
     -------
@@ -291,7 +331,9 @@ def compute_choice_log_likelihood(
     """
     logits = inverse_temperature * state_values  # (n_states, n_options)
     if obs_offset is not None:
-        logits = logits + obs_offset[None, :]  # broadcast (1, K) + (S, K)
+        # obs_offset is either (K,) (shared) or (S, K) (per-state).
+        # Broadcasting: (S, K) + (K,) or (S, K) + (S, K) both work.
+        logits = logits + obs_offset
     log_probs = jax.nn.log_softmax(logits, axis=1)  # (n_states, n_options)
     return log_probs[:, choice_t]
 
@@ -341,8 +383,14 @@ def contingency_belief_filter(
         Initial state distribution. Default: uniform.
     obs_design_matrix : Array or None, shape (n_trials, d_obs)
         Observation-side design matrix for action biases.
-    obs_weights : Array or None, shape (n_options, d_obs)
+    obs_weights : Array or None
         Weights mapping observation covariates to action logit offsets.
+        Two supported shapes:
+
+        - ``(n_options, d_obs)``: shared across all states — a global
+          action bias like a side preference.
+        - ``(n_states, n_options, d_obs)``: state-specific biases — e.g.
+          a stay bias that only operates in one contingency state.
 
     Returns
     -------
@@ -369,20 +417,18 @@ def contingency_belief_filter(
     has_obs_covariates = (
         obs_design_matrix is not None and obs_weights is not None
     )
+    per_state_obs = False
     if has_obs_covariates:
         if obs_design_matrix.shape[0] != n_trials:
             raise ValueError(
                 f"obs_design_matrix has {obs_design_matrix.shape[0]} rows "
                 f"but choices has {n_trials} trials"
             )
-        if obs_weights.shape[0] != n_options:
+        _validate_obs_weights_shape(obs_weights, n_states, n_options)
+        per_state_obs = obs_weights.ndim == 3
+        if obs_weights.shape[-1] != obs_design_matrix.shape[1]:
             raise ValueError(
-                f"obs_weights has {obs_weights.shape[0]} rows "
-                f"but n_options is {n_options}"
-            )
-        if obs_weights.shape[1] != obs_design_matrix.shape[1]:
-            raise ValueError(
-                f"obs_weights width {obs_weights.shape[1]} != "
+                f"obs_weights last-axis size {obs_weights.shape[-1]} != "
                 f"obs_design_matrix width {obs_design_matrix.shape[1]}"
             )
     else:
@@ -405,6 +451,8 @@ def contingency_belief_filter(
         return posterior, log_norm
 
     def _compute_obs_offset(obs_dm_t):
+        if per_state_obs:
+            return obs_weights @ obs_dm_t  # (n_states, n_options)
         return obs_weights @ obs_dm_t  # (n_options,)
 
     def _step(carry, trial_data):
@@ -507,14 +555,10 @@ def contingency_belief_smoother(
                 f"obs_design_matrix has {obs_design_matrix.shape[0]} rows "
                 f"but choices has {n_trials} trials"
             )
-        if obs_weights.shape[0] != n_options:
+        _validate_obs_weights_shape(obs_weights, n_states, n_options)
+        if obs_weights.shape[-1] != obs_design_matrix.shape[1]:
             raise ValueError(
-                f"obs_weights has {obs_weights.shape[0]} rows "
-                f"but n_options is {n_options}"
-            )
-        if obs_weights.shape[1] != obs_design_matrix.shape[1]:
-            raise ValueError(
-                f"obs_weights width {obs_weights.shape[1]} != "
+                f"obs_weights last-axis size {obs_weights.shape[-1]} != "
                 f"obs_design_matrix width {obs_design_matrix.shape[1]}"
             )
     else:
@@ -544,7 +588,7 @@ def contingency_belief_smoother(
             transition_logits, transition_weights, h_t
         )
         predicted = trans.T @ prev_belief
-        obs_offset_t = obs_weights @ obs_dm_t
+        obs_offset_t = obs_weights @ obs_dm_t  # (K,) or (S, K)
         posterior, log_norm = _fwd_update(predicted, choice_t, reward_t, obs_offset_t)
 
         return (posterior, accum_ll + log_norm), (posterior, predicted, trans)
@@ -656,6 +700,13 @@ class ContingencyBeliefModel(SGDFittableMixin):
     n_obs_covariates : int
         Number of observation-side covariates for action biases.
         0 = no observation covariates (default).
+    per_state_obs_weights : bool
+        If True, ``obs_weights_`` has shape ``(n_states, n_options,
+        n_obs_covariates)`` and each contingency state gets its own
+        offset from the observation covariates (e.g. a stay bias that
+        only operates in one state). If False (default),
+        ``obs_weights_`` has shape ``(n_options, n_obs_covariates)``
+        and the offset is shared across states.
     init_inverse_temperature : float
         Starting inverse temperature.
     init_diagonal : float
@@ -673,6 +724,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
         n_states: int,
         n_options: int,
         n_obs_covariates: int = 0,
+        per_state_obs_weights: bool = False,
         init_inverse_temperature: float = 1.0,
         init_diagonal: float = 0.9,
         concentration: float = 1.0,
@@ -682,6 +734,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
         self.n_states = n_states
         self.n_options = n_options
         self.n_obs_covariates = n_obs_covariates
+        self.per_state_obs_weights = per_state_obs_weights
         self.inverse_temperature_ = init_inverse_temperature
         self.init_diagonal = init_diagonal
         self.concentration = concentration
@@ -709,7 +762,12 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
         # Observation-side covariates for action biases
         if n_obs_covariates > 0:
-            self.obs_weights_ = jnp.zeros((n_options, n_obs_covariates))
+            if per_state_obs_weights:
+                self.obs_weights_ = jnp.zeros(
+                    (n_states, n_options, n_obs_covariates)
+                )
+            else:
+                self.obs_weights_ = jnp.zeros((n_options, n_obs_covariates))
         else:
             self.obs_weights_: Optional[Array] = None
         self._obs_design_matrix: Optional[Array] = None
@@ -790,8 +848,21 @@ class ContingencyBeliefModel(SGDFittableMixin):
             base_logits = self.inverse_temperature_ * self.state_values_  # (S, K)
             if self.obs_weights_ is not None and self._obs_design_matrix is not None:
                 # Per-trial obs offset
-                obs_offsets = self._obs_design_matrix @ self.obs_weights_.T  # (T, K)
-                per_state_logits = base_logits[None, :, :] + obs_offsets[:, None, :]  # (T, S, K)
+                if self.obs_weights_.ndim == 3:
+                    # Per-state offset: (S, K, d) @ (T, d) → (T, S, K)
+                    # einsum for clarity
+                    obs_offsets_per_state = jnp.einsum(
+                        "skd,td->tsk",
+                        self.obs_weights_,
+                        self._obs_design_matrix,
+                    )  # (T, S, K)
+                    per_state_logits = base_logits[None, :, :] + obs_offsets_per_state
+                else:
+                    # Shared offset: (K, d) @ (T, d) → (T, K)
+                    obs_offsets = self._obs_design_matrix @ self.obs_weights_.T
+                    per_state_logits = (
+                        base_logits[None, :, :] + obs_offsets[:, None, :]
+                    )
                 per_state_probs = jax.nn.softmax(per_state_logits, axis=-1)  # (T, S, K)
                 predicted_probs = jnp.einsum("tsk,ts->tk", per_state_probs, predicted_state)
             else:

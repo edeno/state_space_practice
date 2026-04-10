@@ -15,6 +15,7 @@ from state_space_practice.behavioral_uncertainty import (
     change_point_probability,
     compute_surprise,
     option_variances_from_covariances,
+    pairwise_change_point_probability,
 )
 
 
@@ -106,6 +107,63 @@ class TestChangePointProbability:
         probs = jnp.array([[0.5, 0.5]])
         cp = change_point_probability(probs)
         np.testing.assert_allclose(cp, 0.5, atol=1e-8)
+
+
+class TestPairwiseChangePointProbability:
+    def test_zero_when_no_switches(self):
+        # Pairwise joint with all mass on the diagonal → no switches
+        n_states = 2
+        T_minus_1 = 5
+        pairwise = jnp.zeros((T_minus_1, n_states, n_states))
+        pairwise = pairwise.at[:, 0, 0].set(1.0)  # always stay in state 0
+        cp = pairwise_change_point_probability(pairwise)
+        assert cp.shape == (T_minus_1 + 1,)
+        np.testing.assert_allclose(cp, 0.0, atol=1e-8)
+
+    def test_one_when_all_switch(self):
+        # Pairwise joint with all mass off-diagonal → always switching
+        n_states = 2
+        T_minus_1 = 4
+        pairwise = jnp.zeros((T_minus_1, n_states, n_states))
+        pairwise = pairwise.at[:, 0, 1].set(0.5)
+        pairwise = pairwise.at[:, 1, 0].set(0.5)
+        cp = pairwise_change_point_probability(pairwise)
+        # First entry is 0, rest are 1
+        np.testing.assert_allclose(cp[0], 0.0)
+        np.testing.assert_allclose(cp[1:], 1.0, atol=1e-8)
+
+    def test_spike_at_block_boundary(self):
+        """Real end-to-end: contingency smoother + pairwise cp on block data."""
+        from state_space_practice.contingency_belief import (
+            contingency_belief_smoother,
+        )
+
+        # Strong block structure: reward on option 0 first, then option 1
+        choices = jnp.array([0] * 20 + [1] * 20, dtype=jnp.int32)
+        rewards = jnp.array([1] * 20 + [1] * 20, dtype=jnp.int32)
+        result = contingency_belief_smoother(
+            choices=choices,
+            rewards=rewards,
+            n_states=2,
+            n_options=2,
+            reward_probs=jnp.array([[0.9, 0.1], [0.1, 0.9]]),
+            state_values=jnp.array([[2.0, 0.0], [0.0, 2.0]]),
+            inverse_temperature=2.0,
+            transition_logits=jnp.array([[3.0], [-3.0]]),  # sticky
+        )
+        cp = pairwise_change_point_probability(result.pairwise_state_prob)
+        # Total switch mass should concentrate near the block boundary (t=20)
+        boundary_region = cp[15:25].sum()
+        early_region = cp[1:15].sum()
+        late_region = cp[25:].sum()
+        assert float(boundary_region) > float(early_region)
+        assert float(boundary_region) > float(late_region)
+
+    def test_trial_zero_is_zero(self):
+        pairwise = jnp.array([[[0.3, 0.2], [0.2, 0.3]]])  # (1, 2, 2)
+        cp = pairwise_change_point_probability(pairwise)
+        assert cp.shape == (2,)
+        np.testing.assert_allclose(cp[0], 0.0)
 
 
 class TestBernoulliMixture:

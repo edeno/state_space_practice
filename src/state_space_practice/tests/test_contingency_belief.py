@@ -286,6 +286,169 @@ class TestContingencyBeliefSmoother:
             )
 
 
+class TestPerStateObsWeights:
+    """Tests for per-state observation-side offsets in contingency models."""
+
+    def test_filter_accepts_per_state_obs_weights(self):
+        from state_space_practice.contingency_belief import (
+            contingency_belief_filter,
+        )
+
+        choices = jnp.array([0, 1, 0, 1], dtype=jnp.int32)
+        rewards = jnp.array([1, 0, 1, 0], dtype=jnp.int32)
+        result = contingency_belief_filter(
+            choices=choices,
+            rewards=rewards,
+            n_states=2,
+            n_options=2,
+            reward_probs=jnp.array([[0.8, 0.2], [0.2, 0.8]]),
+            state_values=jnp.array([[1.0, 0.0], [0.0, 1.0]]),
+            inverse_temperature=1.0,
+            transition_logits=jnp.zeros((2, 1)),
+            obs_design_matrix=jnp.ones((4, 1)),
+            obs_weights=jnp.zeros((2, 2, 1)),  # (S, K, d)
+        )
+        assert result.state_posterior.shape == (4, 2)
+        np.testing.assert_allclose(
+            result.state_posterior.sum(axis=1), 1.0, atol=1e-7
+        )
+
+    def test_per_state_bias_differs_from_shared_bias(self):
+        """A bias that only operates in state 1 should yield different
+        posteriors than a bias shared across both states."""
+        from state_space_practice.contingency_belief import (
+            contingency_belief_filter,
+        )
+
+        choices = jnp.array([0, 0, 0, 0, 0], dtype=jnp.int32)
+        rewards = jnp.array([0, 0, 0, 0, 0], dtype=jnp.int32)
+        common = dict(
+            choices=choices,
+            rewards=rewards,
+            n_states=2,
+            n_options=2,
+            reward_probs=jnp.array([[0.5, 0.5], [0.5, 0.5]]),
+            state_values=jnp.array([[1.0, 0.0], [0.0, 1.0]]),
+            inverse_temperature=1.0,
+            transition_logits=jnp.zeros((2, 1)),
+            obs_design_matrix=jnp.ones((5, 1)),
+        )
+        # Shared bias: option 0 +2 in both states
+        shared = contingency_belief_filter(
+            **common,
+            obs_weights=jnp.array([[2.0], [0.0]]),  # (K=2, d=1)
+        )
+        # Per-state bias: option 0 +2 only in state 0
+        per_state = contingency_belief_filter(
+            **common,
+            obs_weights=jnp.array([
+                [[2.0], [0.0]],  # state 0: bias option 0
+                [[0.0], [0.0]],  # state 1: no bias
+            ]),  # (S=2, K=2, d=1)
+        )
+        assert not np.allclose(
+            shared.state_posterior, per_state.state_posterior, atol=1e-3
+        ), "shared vs per-state obs_weights should give different posteriors"
+
+    def test_per_state_reduces_to_shared_when_rows_identical(self):
+        """Per-state obs_weights with identical rows should match shared."""
+        from state_space_practice.contingency_belief import (
+            contingency_belief_filter,
+        )
+
+        choices = jnp.array([0, 1, 0, 1, 0], dtype=jnp.int32)
+        rewards = jnp.array([1, 0, 1, 0, 1], dtype=jnp.int32)
+        common = dict(
+            choices=choices,
+            rewards=rewards,
+            n_states=2,
+            n_options=2,
+            reward_probs=jnp.array([[0.8, 0.2], [0.2, 0.8]]),
+            state_values=jnp.array([[1.0, 0.0], [0.0, 1.0]]),
+            inverse_temperature=1.0,
+            transition_logits=jnp.zeros((2, 1)),
+            obs_design_matrix=jnp.ones((5, 1)),
+        )
+        shared_w = jnp.array([[0.5], [-0.5]])  # (K, d)
+        shared = contingency_belief_filter(**common, obs_weights=shared_w)
+
+        per_state_w = jnp.stack([shared_w, shared_w], axis=0)  # (S, K, d)
+        per_state = contingency_belief_filter(
+            **common, obs_weights=per_state_w,
+        )
+        np.testing.assert_allclose(
+            shared.state_posterior, per_state.state_posterior, atol=1e-6
+        )
+
+    def test_smoother_accepts_per_state_obs_weights(self):
+        from state_space_practice.contingency_belief import (
+            contingency_belief_smoother,
+        )
+
+        choices = jnp.array([0, 1, 0, 1], dtype=jnp.int32)
+        rewards = jnp.array([1, 0, 1, 0], dtype=jnp.int32)
+        result = contingency_belief_smoother(
+            choices=choices,
+            rewards=rewards,
+            n_states=2,
+            n_options=2,
+            reward_probs=jnp.array([[0.8, 0.2], [0.2, 0.8]]),
+            state_values=jnp.array([[1.0, 0.0], [0.0, 1.0]]),
+            inverse_temperature=1.0,
+            transition_logits=jnp.zeros((2, 1)),
+            obs_design_matrix=jnp.ones((4, 1)),
+            obs_weights=jnp.zeros((2, 2, 1)),  # (S, K, d)
+        )
+        assert result.smoothed_state_prob.shape == (4, 2)
+        np.testing.assert_allclose(
+            result.smoothed_state_prob.sum(axis=1), 1.0, atol=1e-6
+        )
+
+    def test_model_fit_sgd_with_per_state_obs_weights(self):
+        """ContingencyBeliefModel.fit_sgd with per_state_obs_weights=True."""
+        from state_space_practice.contingency_belief import ContingencyBeliefModel
+
+        rng = np.random.default_rng(5)
+        choices = rng.integers(0, 2, size=40)
+        rewards = rng.integers(0, 2, size=40)
+        obs_cov = rng.normal(size=(40, 1))
+
+        model = ContingencyBeliefModel(
+            n_states=2,
+            n_options=2,
+            n_obs_covariates=1,
+            per_state_obs_weights=True,
+        )
+        assert model.obs_weights_.shape == (2, 2, 1)
+        model.fit_sgd(
+            choices, rewards, obs_design_matrix=obs_cov, num_steps=5,
+        )
+        # Should still have per-state shape after fitting
+        assert model.obs_weights_.shape == (2, 2, 1)
+        assert model.log_likelihood_ is not None
+        assert np.isfinite(model.log_likelihood_)
+
+    def test_filter_rejects_bad_per_state_shape(self):
+        """Filter should raise on wrong per-state obs_weights dim count."""
+        from state_space_practice.contingency_belief import (
+            contingency_belief_filter,
+        )
+
+        with pytest.raises(ValueError, match="obs_weights has .* states"):
+            contingency_belief_filter(
+                choices=jnp.array([0, 1, 0], dtype=jnp.int32),
+                rewards=jnp.array([1, 0, 1], dtype=jnp.int32),
+                n_states=2,
+                n_options=2,
+                reward_probs=jnp.array([[0.8, 0.2], [0.2, 0.8]]),
+                state_values=jnp.array([[1.0, 0.0], [0.0, 1.0]]),
+                inverse_temperature=1.0,
+                transition_logits=jnp.zeros((2, 1)),
+                obs_design_matrix=jnp.ones((3, 1)),
+                obs_weights=jnp.zeros((3, 2, 1)),  # S=3 but n_states=2
+            )
+
+
 # ---------------------------------------------------------------------------
 # Synthetic data helper
 # ---------------------------------------------------------------------------

@@ -96,20 +96,71 @@ def compute_surprise(predicted_probs: Array, choices: Array) -> Array:
 
 
 def change_point_probability(state_probs: Array) -> Array:
-    """Change-point probability: 1 - max(state_posterior).
+    """Posterior uncertainty proxy: 1 - max(state_posterior).
 
-    Proxy for "the model thinks a state switch just happened."
-    High when the posterior is uncertain between states.
+    .. warning::
+       Despite the name, this is NOT the probability that a state switch
+       just occurred. It is posterior uncertainty / ambiguity — high
+       whenever the marginal posterior is spread across multiple states,
+       regardless of whether the mass actually moved between consecutive
+       trials. For the true per-trial switch probability
+       P(s_t != s_{t-1} | data), use
+       :func:`pairwise_change_point_probability`, which requires the
+       pairwise smoothed joint from the HMM smoother.
+
+    This proxy is still useful as a quick "the model is unsure" signal
+    and is retained for backwards compatibility.
 
     Parameters
     ----------
     state_probs : Array, shape (T, S)
+        Marginal posterior over discrete states.
 
     Returns
     -------
     Array, shape (T,)
+        1 - max(state_probs, axis=-1) per trial.
+
+    See Also
+    --------
+    pairwise_change_point_probability : True marginal switch probability.
     """
     return 1.0 - jnp.max(state_probs, axis=-1)
+
+
+def pairwise_change_point_probability(pairwise_state_prob: Array) -> Array:
+    """True per-trial switch probability P(s_t != s_{t-1} | data).
+
+    Marginalizes off-diagonal mass from the pairwise smoothed joint:
+
+    .. math::
+       P(s_t \\neq s_{t-1} \\mid y_{1:T}) = \\sum_{i \\neq j}
+       P(s_{t-1}=i,\\, s_t=j \\mid y_{1:T})
+
+    This is the correct quantity for locating putative contingency
+    switch points in behavioral data.
+
+    Parameters
+    ----------
+    pairwise_state_prob : Array, shape (T-1, S, S)
+        Smoothed pairwise joint `P(s_{t-1}, s_t | data)` from an HMM
+        smoother (e.g., ``contingency_belief_smoother``).
+        ``pairwise_state_prob[t, i, j] = P(s_t=i, s_{t+1}=j | data)``.
+
+    Returns
+    -------
+    Array, shape (T,)
+        Switch probability per trial. The first entry is 0 because no
+        previous trial exists, and subsequent entries are
+        ``1 - sum_i P(s_{t-1}=i, s_t=i | data)`` (off-diagonal mass).
+    """
+    # Diagonal gives P(s_{t-1} = s_t) for each pair index
+    n_states = pairwise_state_prob.shape[-1]
+    diag = pairwise_state_prob[..., jnp.arange(n_states), jnp.arange(n_states)]
+    stay_prob = jnp.sum(diag, axis=-1)  # (T-1,)
+    switch_prob = 1.0 - stay_prob
+    # Prepend 0 for trial 0 (no previous trial to switch from)
+    return jnp.concatenate([jnp.zeros(1), switch_prob])
 
 
 def bernoulli_mixture_mean_variance(

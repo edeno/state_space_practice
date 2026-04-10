@@ -462,7 +462,6 @@ class TestSwitchingChoiceUncertainty:
 
     def test_variance_law_of_total_variance(self):
         """Marginalized variance should equal E[Var(x|s)] + Var(E[x|s])."""
-        from state_space_practice.behavioral_uncertainty import append_reference_option
         from state_space_practice.switching_choice import SwitchingChoiceModel
 
         choices = jax.random.randint(jax.random.PRNGKey(0), (50,), 0, 3)
@@ -497,3 +496,77 @@ class TestSwitchingChoiceUncertainty:
         np.testing.assert_allclose(
             model.predicted_option_variances_, expected_total, atol=1e-5,
         )
+
+
+@pytest.mark.slow
+class TestSwitchingChoiceRecovery:
+    """Generative recovery: simulate → fit → check state sequence recovery."""
+
+    def test_predicted_choice_probs_track_generative(self):
+        """Fit on switching data and check that predicted choice
+        probabilities correlate with the true generative probabilities.
+
+        This is a predictive-distribution recovery test. We don't require
+        recovery of exact state labels (which is under-determined for
+        choice-only data with shared value dynamics); we require that
+        the fitted predictive distribution matches the generative
+        distribution in expectation.
+        """
+        from state_space_practice.switching_choice import (
+            SwitchingChoiceModel,
+            simulate_switching_choice_data,
+        )
+
+        sim = simulate_switching_choice_data(
+            n_trials=400,
+            n_options=3,
+            n_discrete_states=2,
+            seed=21,
+        )
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model.fit_sgd(sim.choices, num_steps=100)
+
+        # Reconstruct model predictive probabilities from filter output:
+        # marginalize state-conditional predictive values over discrete probs
+        filt_values = np.asarray(model._filter_result.predicted_values)  # (T, K-1, S)
+        disc_probs = np.asarray(model._filter_result.discrete_state_probs)  # (T, S)
+        betas = np.asarray(model.inverse_temperatures_)  # (S,)
+
+        # Per-state choice probabilities
+        zero_ref = np.zeros(
+            (filt_values.shape[0], 1, filt_values.shape[2])
+        )
+        full_vals = np.concatenate([zero_ref, filt_values], axis=1)  # (T, K, S)
+        per_state_logits = betas[None, None, :] * full_vals  # (T, K, S)
+        per_state_logits -= per_state_logits.max(axis=1, keepdims=True)
+        per_state_probs = np.exp(per_state_logits)
+        per_state_probs /= per_state_probs.sum(axis=1, keepdims=True)
+        pred_probs = np.einsum("tks,ts->tk", per_state_probs, disc_probs)
+
+        true_probs = np.asarray(sim.true_probs)
+
+        # Mean absolute error between predicted and true choice probs
+        mae = np.mean(np.abs(pred_probs - true_probs))
+        assert mae < 0.15, f"predictive MAE {mae:.3f} >= 0.15"
+
+    def test_fit_sgd_improves_log_likelihood_from_simulation(self):
+        """SGD should improve LL on data drawn from the model's family."""
+        from state_space_practice.switching_choice import (
+            SwitchingChoiceModel,
+            simulate_switching_choice_data,
+        )
+
+        sim = simulate_switching_choice_data(
+            n_trials=300,
+            n_options=3,
+            n_discrete_states=2,
+            seed=5,
+        )
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model.fit_sgd(sim.choices, num_steps=50)
+        history = model.log_likelihood_history_
+        # LL should improve from start to end
+        assert history[-1] > history[0] + 0.5, (
+            f"LL did not improve: {history[0]:.3f} -> {history[-1]:.3f}"
+        )
+        assert np.isfinite(history[-1])
