@@ -565,10 +565,17 @@ class SwitchingChoiceModel(SGDFittableMixin):
         ], axis=0)  # (T, S)
 
         per_state_values = result.predicted_values  # (T, K-1, S) — prior, not posterior
+
+        # Obs offset: Theta @ z_t, shape (T, K) or zeros if no obs covariates
+        if self.obs_weights_ is not None and self._obs_covariates is not None:
+            obs_offsets = self._obs_covariates @ self.obs_weights_.T  # (T, K)
+        else:
+            obs_offsets = jnp.zeros((per_state_values.shape[0], self.n_options))
+
         per_state_probs = []
         for s in range(self.n_discrete_states):
             v = append_reference_option(per_state_values[:, :, s])
-            p = jax.nn.softmax(self.inverse_temperatures_[s] * v, axis=1)
+            p = jax.nn.softmax(self.inverse_temperatures_[s] * v + obs_offsets, axis=1)
             per_state_probs.append(p)
         per_state_probs = jnp.stack(per_state_probs, axis=-1)  # (T, K, S)
         predicted_probs = jnp.einsum("tks,ts->tk", per_state_probs, predicted_disc)
