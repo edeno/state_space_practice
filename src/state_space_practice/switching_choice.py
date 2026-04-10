@@ -35,9 +35,7 @@ from state_space_practice.switching_kalman import (
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture_per_discrete_state,
 )
-from state_space_practice.utils import (
-    scale_likelihood as _scale_likelihood,
-)
+from state_space_practice.utils import scale_likelihood as _scale_likelihood
 from state_space_practice.utils import (
     stabilize_probability_vector as _stabilize_probability_vector,
 )

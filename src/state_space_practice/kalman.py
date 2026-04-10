@@ -23,63 +23,11 @@ import jax.numpy as jnp
 import jax.scipy.linalg
 import jax.scipy.stats.multivariate_normal
 
-
-def symmetrize(A: jax.Array) -> jax.Array:
-    """Symmetrize one or more matrices by averaging each matrix with its transpose.
-
-    Parameters
-    ----------
-    A : jax.Array
-        A matrix or a batch of matrices to be symmetrized. The last two
-        dimensions should be square matrices.
-
-    Returns
-    -------
-    jax.Array
-        The symmetrized matrix or batch of matrices, where each output matrix
-        is (A + A.T) / 2.
-
-    Examples
-    --------
-    >>> import jax.numpy as jnp
-    >>> A = jnp.array([[1, 2], [3, 4]])
-    >>> symmetrize(A)
-    DeviceArray([[1. , 2.5],
-                 [2.5, 4. ]], dtype=float32)
-
-    """
-    return 0.5 * (A + jnp.swapaxes(A, -1, -2))
-
-
-def psd_solve(A: jax.Array, b: jax.Array, diagonal_boost: float = 1e-9) -> jax.Array:
-    """Solves a linear system Ax = b for positive semi-definite (PSD) matrices A.
-
-    This function wraps a linear algebra solver, ensuring numerical stability
-    by symmetrizing the input matrix A and adding a small value to its
-    diagonal (diagonal_boost). It is intended for use with PSD matrices,
-    where 'assume_a="pos"' can be safely set for performance.
-
-    Parameters
-    ----------
-    A : jax.Array
-        The coefficient matrix, expected to be positive semi-definite.
-    b : jax.Array
-        The right-hand side vector or matrix.
-    diagonal_boost : float, optional
-        Small value added to the diagonal of A to improve numerical
-        stability. Default is 1e-9.
-
-    Returns
-    -------
-    jax.Array
-        The solution x to the linear system Ax = b.
-
-    """
-    return jax.scipy.linalg.solve(
-        symmetrize(A) + diagonal_boost * jnp.eye(A.shape[-1], dtype=A.dtype),
-        b,
-        assume_a="pos",
-    )
+from state_space_practice.utils import (  # noqa: F401 — re-exported for backward compat
+    psd_solve,
+    stabilize_covariance,
+    symmetrize,
+)
 
 
 def woodbury_kalman_gain(
@@ -185,64 +133,54 @@ def joseph_form_update(
     return symmetrize(I_KH @ prior_cov @ I_KH.T + kalman_gain @ emission_cov @ kalman_gain.T)
 
 
-def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
-    """Project a matrix onto the positive semi-definite cone.
 
-    This function ensures the input matrix is positive semi-definite by:
-    1. Computing its eigendecomposition
-    2. Clipping eigenvalues to be at least `min_eigenvalue`
-    3. Reconstructing the matrix from the clipped eigenvalues
-
-    This is the standard approach for handling M-step updates in EM algorithms
-    with approximate E-steps (e.g., Laplace-EKF for point-process observations),
-    where the raw M-step can produce non-PSD covariance matrices.
+@jax.jit
+def kalman_measurement_update(
+    prior_mean: jax.Array,
+    prior_cov: jax.Array,
+    obs: jax.Array,
+    measurement_matrix: jax.Array,
+    measurement_cov: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Kalman measurement update (no prediction step).
 
     Parameters
     ----------
-    Q : jax.Array
-        A symmetric matrix to project onto the PSD cone. Shape (n, n).
-    min_eigenvalue : float, optional
-        Minimum eigenvalue to enforce. Default is 1e-4. This represents the
-        minimum allowable variance in any direction.
+    prior_mean : jax.Array, shape (n_cont_states,)
+        Prior state mean.
+    prior_cov : jax.Array, shape (n_cont_states, n_cont_states)
+        Prior state covariance.
+    obs : jax.Array, shape (n_obs_dim,)
+        Observation.
+    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
+        Observation matrix H.
+    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
+        Observation noise covariance R.
 
     Returns
     -------
-    jax.Array
-        The projected PSD matrix with all eigenvalues >= min_eigenvalue.
-
-    Notes
-    -----
-    - The input should be symmetric; non-symmetric matrices may give
-      unexpected results.
-    - Uses `jnp.linalg.eigh` which assumes symmetric input.
-    - The min_eigenvalue should be chosen based on the scale of the problem:
-      - Too small (< 1e-8): May not prevent numerical instability
-      - Too large (> 0.1): May dominate learned values
-
-    Examples
-    --------
-    >>> import jax.numpy as jnp
-    >>> Q = jnp.array([[1.0, 0.5], [0.5, -0.1]])  # Non-PSD
-    >>> Q_psd = project_psd(Q, min_eigenvalue=1e-4)
-    >>> jnp.linalg.eigvalsh(Q_psd)  # All eigenvalues >= 1e-4
-
+    posterior_mean : jax.Array, shape (n_cont_states,)
+    posterior_cov : jax.Array, shape (n_cont_states, n_cont_states)
+    marginal_log_likelihood : jax.Array (scalar)
     """
-    Q = symmetrize(Q)
+    obs_mean = measurement_matrix @ prior_mean
+    obs_cov = symmetrize(
+        measurement_matrix @ prior_cov @ measurement_matrix.T + measurement_cov
+    )
 
-    # Compute eigendecomposition (eigh assumes symmetric input)
-    eigvals, eigvecs = jnp.linalg.eigh(Q)
+    residual_error = obs - obs_mean
+    kalman_gain = psd_solve(obs_cov, measurement_matrix @ prior_cov).T
 
-    # Clip eigenvalues to minimum
-    eigvals_clipped = jnp.maximum(eigvals, min_eigenvalue)
+    posterior_mean = prior_mean + kalman_gain @ residual_error
+    posterior_cov = joseph_form_update(
+        prior_cov, kalman_gain, measurement_matrix, measurement_cov
+    )
 
-    # Re-symmetrize after reconstruction to eliminate roundoff-level asymmetry.
-    projected = eigvecs @ jnp.diag(eigvals_clipped) @ eigvecs.T
-    return symmetrize(projected)
+    marginal_log_likelihood = jnp.asarray(
+        jax.scipy.stats.multivariate_normal.logpdf(x=obs, mean=obs_mean, cov=obs_cov)
+    )
 
-
-def stabilize_covariance(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
-    """Symmetrize a covariance-like matrix and project it to the PSD cone."""
-    return project_psd(symmetrize(cov), min_eigenvalue=min_eigenvalue)
+    return posterior_mean, posterior_cov, marginal_log_likelihood
 
 
 @jax.jit
@@ -284,39 +222,14 @@ def _kalman_filter_update(
         Log-likelihood of the observation, $$ \\log p(y_t | y_{1:t-1}) $$ (scalar array).
 
     """
-
     # One step prediction
     one_step_mean = transition_matrix @ mean_prev
     one_step_cov = transition_matrix @ cov_prev @ transition_matrix.T + process_cov
 
     # Measurement update
-    obs_mean = measurement_matrix @ one_step_mean
-    # obs_cross_cov = one_step_cov @ measurement_matrix.T
-
-    # project system uncertainty into measurement space
-    obs_cov = symmetrize(
-        measurement_matrix @ one_step_cov @ measurement_matrix.T + measurement_cov
+    return kalman_measurement_update(
+        one_step_mean, one_step_cov, obs, measurement_matrix, measurement_cov
     )
-
-    residual_error = obs - obs_mean  # innovation
-    kalman_gain = psd_solve(obs_cov, measurement_matrix @ one_step_cov).T
-
-    posterior_mean = one_step_mean + kalman_gain @ residual_error
-    # posterior_cov = one_step_cov - kalman_gain @ obs_cov @ kalman_gain.T
-    # subtraction could result in the diagonal matrix with negative values
-    # More stable solution is P = (I-KH)P(I-KH)' + KRK' to ensure positive semidefinite
-    # This is known as the Joseph form covariance update
-    n_cont = mean_prev.shape[0]
-    I_KH = jnp.eye(n_cont) - kalman_gain @ measurement_matrix
-    posterior_cov = symmetrize(
-        I_KH @ one_step_cov @ I_KH.T + kalman_gain @ (measurement_cov @ kalman_gain.T)
-    )
-
-    marginal_log_likelihood = jnp.asarray(
-        jax.scipy.stats.multivariate_normal.logpdf(x=obs, mean=obs_mean, cov=obs_cov)
-    )
-
-    return posterior_mean, posterior_cov, marginal_log_likelihood
 
 
 @jax.jit

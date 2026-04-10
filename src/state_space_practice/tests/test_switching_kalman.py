@@ -20,7 +20,7 @@ import pytest
 from jax import Array, random
 from jax.nn import one_hot
 
-import state_space_practice.switching_kalman as switching_kalman_module
+import state_space_practice.utils as utils_module
 from state_space_practice.kalman import (
     kalman_filter,
     kalman_maximization_step,
@@ -4633,7 +4633,7 @@ class TestSwitchingNumericalStability:
             discrete_transition_matrix=discrete_transition_matrix,
         )
 
-        monkeypatch.setattr(switching_kalman_module, "_LOG_FLOOR_VALUE", -1e6)
+        monkeypatch.setattr(utils_module, "_LOG_FLOOR_VALUE", -1e6)
 
         perturbed_floor_elbo = compute_elbo(
             obs=obs,

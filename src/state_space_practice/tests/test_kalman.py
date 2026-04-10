@@ -17,6 +17,7 @@ from state_space_practice.kalman import (
     joseph_form_update,
     kalman_filter,
     kalman_maximization_step,
+    kalman_measurement_update,
     kalman_smoother,
     parallel_kalman_smoother,
     psd_solve,
@@ -57,6 +58,36 @@ def test_psd_solve() -> None:
     b_ns = jnp.array([2.0, 2.0])
     x_ns = psd_solve(A_ns, b_ns, diagonal_boost=1e-6)
     assert not jnp.any(jnp.isnan(x_ns))
+
+
+def test_kalman_measurement_update_1d() -> None:
+    """Tests kalman_measurement_update against analytic 1D scalar formulas."""
+    prior_mean = jnp.array([2.0])
+    prior_cov = jnp.array([[4.0]])
+    obs = jnp.array([3.0])
+    H = jnp.array([[1.0]])
+    R = jnp.array([[1.0]])
+
+    post_mean, post_cov, mll = kalman_measurement_update(
+        prior_mean, prior_cov, obs, H, R
+    )
+
+    # Analytic: K = P*H' / (H*P*H' + R) = 4/(4+1) = 0.8
+    # post_mean = prior + K*(obs - H*prior) = 2 + 0.8*(3-2) = 2.8
+    # post_cov (Joseph) = (1-KH)*P*(1-KH)' + K*R*K' = 0.2*4*0.2 + 0.8*1*0.8 = 0.16+0.64 = 0.8
+    np.testing.assert_allclose(post_mean, jnp.array([2.8]), atol=1e-6)
+    np.testing.assert_allclose(post_cov, jnp.array([[0.8]]), atol=1e-6)
+
+    # posterior_cov should be PSD
+    assert jnp.all(jnp.linalg.eigvalsh(post_cov) > 0)
+
+    # marginal_log_likelihood should match scipy
+    from scipy.stats import multivariate_normal as mvn
+
+    expected_mll = mvn.logpdf(
+        np.array([3.0]), mean=np.array([2.0]), cov=np.array([[5.0]])
+    )
+    np.testing.assert_allclose(mll, expected_mll, atol=1e-5)
 
 
 def test_kalman_filter_shapes_and_likelihood(simple_1d_model: tuple) -> None:

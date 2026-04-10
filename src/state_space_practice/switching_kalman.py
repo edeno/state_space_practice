@@ -9,15 +9,23 @@ References
 5. https://github.com/Stephen-Lab-BU/Switching_Oscillator_Networks
 """
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 
 from state_space_practice.kalman import (
     _kalman_filter_update,
     _kalman_smoother_update,
+    kalman_measurement_update,
     psd_solve,
     stabilize_covariance,
-    symmetrize,
+)
+from state_space_practice.utils import divide_safe as _divide_safe
+from state_space_practice.utils import safe_log as _safe_log
+from state_space_practice.utils import scale_likelihood as _scale_likelihood
+from state_space_practice.utils import (
+    stabilize_probability_vector as _stabilize_probability_vector,
 )
 
 _kalman_filter_update_per_discrete_state_pair = jax.vmap(
@@ -118,73 +126,42 @@ collapse_cross_gaussian_mixture_across_states = jax.vmap(
 )
 
 
-def _divide_safe(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
-    """Divides two arrays, while setting the result to 0.0
-    if the denominator is 0.0.
+def _cap_covariance_trace(
+    cov: jax.Array,
+    max_allowed_trace: jax.Array,
+) -> jax.Array:
+    """Cap a single covariance matrix so its trace does not exceed max_allowed_trace."""
+    trace = jnp.trace(cov)
+    ratio = trace / max_allowed_trace
+    return jnp.where(ratio > 1.0, cov / ratio, cov)
+
+
+_COV_CAP_MULTIPLIER = 1e8
+_MAX_SMOOTHER_MEAN_ABS = 1e6
+
+
+def _compute_max_allowed_trace(
+    state_cond_filter_cov: jax.Array,
+) -> jax.Array:
+    """Compute the maximum allowed covariance trace from filter covariances.
 
     Parameters
     ----------
-    numerator : jax.Array
-    denominator : jax.Array
-    """
-    return jnp.where(denominator == 0.0, 0.0, numerator / denominator)
-
-
-# Minimum probability threshold for numerical stability
-_LOG_PROB_FLOOR = 1e-10
-_LOG_FLOOR_VALUE = -23.0  # approximately log(1e-10)
-_DISCRETE_PROB_STABILITY_FLOOR = 1e-10
-
-
-def _safe_log(x: jax.Array) -> jax.Array:
-    """Compute log(x) with numerical stability for small probabilities.
-
-    Uses jnp.where to explicitly handle near-zero values rather than
-    silently adding a small constant. This makes the numerical treatment
-    explicit and avoids potential issues where true zeros could silently
-    produce finite values.
-
-    Parameters
-    ----------
-    x : jax.Array
-        Input array (typically probabilities).
+    state_cond_filter_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
+        State-conditional filter covariances. The last axis is the discrete
+        state dimension, which is what the inner ``vmap`` broadcasts over.
 
     Returns
     -------
     jax.Array
-        log(x) where x > _LOG_PROB_FLOOR, otherwise _LOG_FLOOR_VALUE.
+        Scalar maximum trace, equal to ``max(trace(cov[:, :, k]) for k in states) * _COV_CAP_MULTIPLIER + 1.0``.
+        The additive 1.0 prevents the cap from collapsing to zero when filter
+        covariances are identically zero.
     """
-    return jnp.where(x > _LOG_PROB_FLOOR, jnp.log(x), _LOG_FLOOR_VALUE)
-
-
-def _stabilize_probability_vector(probabilities: jax.Array) -> jax.Array:
-    """Prevent exact-zero probability lockout from numerical underflow.
-
-    Applies a small floor to each element, then re-normalizes so the vector
-    sums to 1. This ensures that no discrete state is permanently excluded
-    once its probability underflows to zero.
-
-    Parameters
-    ----------
-    probabilities : jax.Array, shape (n_states,)
-        Probability vector (non-negative, ideally sums to 1).
-
-    Returns
-    -------
-    jax.Array, shape (n_states,)
-        Stabilized probability vector that sums to 1 with all entries
-        >= ``_DISCRETE_PROB_STABILITY_FLOOR`` (before re-normalization).
-
-    Notes
-    -----
-    If the input is all zeros (e.g. from complete underflow), every element
-    is raised to the floor and re-normalization produces a uniform
-    distribution. This is intentional for numerical robustness, but callers
-    should validate inputs upstream if they need to detect invalid priors.
-    """
-    floor = jnp.asarray(_DISCRETE_PROB_STABILITY_FLOOR, dtype=probabilities.dtype)
-    stabilized = jnp.maximum(probabilities, floor)
-    return stabilized / jnp.sum(stabilized)
+    max_filter_trace = jnp.max(
+        jax.vmap(jnp.trace, in_axes=-1)(state_cond_filter_cov)
+    )
+    return max_filter_trace * _COV_CAP_MULTIPLIER + 1.0
 
 
 def _update_discrete_state_probabilities(
@@ -240,85 +217,6 @@ def _update_discrete_state_probabilities(
     )
 
 
-def _scale_likelihood(log_likelihood: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Scale the log likelihood to avoid numerical underflow.
-
-    Parameters
-    ----------
-    log_likelihood : jax.Array, shape (n_discrete_states, n_discrete_states)
-        Log likelihood of the discrete states.
-    Returns
-    -------
-    scaled_likelihood : jax.Array, shape (n_discrete_states, n_discrete_states)
-        Scaled log likelihood of the discrete states.
-    ll_max : jax.Array
-        Maximum log likelihood of the discrete states (scalar array).
-    """
-
-    ll_max = log_likelihood.max()
-    ll_max = jnp.where(jnp.isfinite(ll_max), ll_max, 0.0)
-    return jnp.exp(log_likelihood - ll_max), ll_max
-
-
-def _kalman_measurement_update_only(
-    prior_mean: jax.Array,
-    prior_cov: jax.Array,
-    obs: jax.Array,
-    measurement_matrix: jax.Array,
-    measurement_cov: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Kalman measurement update without prediction step.
-
-    Used for the first timestep in the x₁ convention where init_state represents
-    the prior for x₁ directly (no dynamics prediction needed).
-
-    Parameters
-    ----------
-    prior_mean : jax.Array, shape (n_cont_states,)
-        Prior state mean p(x₁ | S₁)
-    prior_cov : jax.Array, shape (n_cont_states, n_cont_states)
-        Prior state covariance
-    obs : jax.Array, shape (n_obs_dim,)
-        Observation y₁
-    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
-        Observation matrix H
-    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
-        Observation noise covariance R
-
-    Returns
-    -------
-    posterior_mean : jax.Array, shape (n_cont_states,)
-        Posterior state mean p(x₁ | y₁, S₁)
-    posterior_cov : jax.Array, shape (n_cont_states, n_cont_states)
-        Posterior state covariance
-    marginal_log_likelihood : jax.Array
-        Log p(y₁ | S₁) (scalar array)
-    """
-    # Measurement update (no prediction step)
-    obs_mean = measurement_matrix @ prior_mean
-    obs_cov = symmetrize(
-        measurement_matrix @ prior_cov @ measurement_matrix.T + measurement_cov
-    )
-
-    residual_error = obs - obs_mean
-    kalman_gain = psd_solve(obs_cov, measurement_matrix @ prior_cov).T
-
-    posterior_mean = prior_mean + kalman_gain @ residual_error
-
-    # Joseph form covariance update for numerical stability
-    n_cont = prior_mean.shape[0]
-    I_KH = jnp.eye(n_cont) - kalman_gain @ measurement_matrix
-    posterior_cov = symmetrize(
-        I_KH @ prior_cov @ I_KH.T + kalman_gain @ (measurement_cov @ kalman_gain.T)
-    )
-
-    marginal_log_likelihood = jnp.asarray(
-        jax.scipy.stats.multivariate_normal.logpdf(x=obs, mean=obs_mean, cov=obs_cov)
-    )
-
-    return posterior_mean, posterior_cov, marginal_log_likelihood
-
-
 def _first_timestep_kalman_update(
     init_state_cond_mean: jax.Array,
     init_state_cond_cov: jax.Array,
@@ -366,7 +264,7 @@ def _first_timestep_kalman_update(
     # Apply measurement update for each discrete state (no dynamics prediction)
     # vmap over discrete states j
     vmapped_update = jax.vmap(
-        _kalman_measurement_update_only,
+        kalman_measurement_update,
         in_axes=(-1, -1, None, -1, -1),
         out_axes=(-1, -1, -1),
     )
@@ -910,22 +808,11 @@ def switching_kalman_smoother(
         # legitimately exceed filter cov by 10-100x from GPB1 collapse) but
         # catches the exponential blowup that leads to overflow on long
         # sequences (where growth reaches 10^100+).
-        _COV_CAP_MULTIPLIER = 1e8
-        _MAX_SMOOTHER_MEAN_ABS = 1e6
+        max_allowed_trace = _compute_max_allowed_trace(state_cond_filter_cov)
 
-        # Compute max allowed trace from filter cov
-        max_filter_trace = jnp.max(
-            jax.vmap(jnp.trace, in_axes=-1)(state_cond_filter_cov)
-        )
-        max_allowed_trace = max_filter_trace * _COV_CAP_MULTIPLIER + 1.0
-
-        def _cap_pair_cov(pair_cov_jk):
-            trace = jnp.trace(pair_cov_jk)
-            ratio = trace / max_allowed_trace
-            return jnp.where(ratio > 1.0, pair_cov_jk / ratio, pair_cov_jk)
-
+        _cap = partial(_cap_covariance_trace, max_allowed_trace=max_allowed_trace)
         pair_cond_smoother_covs = jax.vmap(
-            jax.vmap(_cap_pair_cov, in_axes=-1, out_axes=-1),
+            jax.vmap(_cap, in_axes=-1, out_axes=-1),
             in_axes=-1,
             out_axes=-1,
         )(pair_cond_smoother_covs)
@@ -1139,25 +1026,18 @@ def switching_kalman_smoother_gpb2(
         # extreme damping contrasts can produce numerically large values in
         # the RTS update. Cap relative to filter covariance to prevent overflow
         # while preserving the exact statistics for well-conditioned problems.
-        max_filter_trace = jnp.max(
-            jax.vmap(jnp.trace, in_axes=-1)(state_cond_filter_cov)
-        )
-        max_allowed = max_filter_trace * 1e8 + 1.0
+        max_allowed = _compute_max_allowed_trace(state_cond_filter_cov)
 
-        def _cap_cov(cov_slice):
-            trace = jnp.trace(cov_slice)
-            ratio = trace / max_allowed
-            return jnp.where(ratio > 1.0, cov_slice / ratio, cov_slice)
-
+        _cap = partial(_cap_covariance_trace, max_allowed_trace=max_allowed)
         triple_cov = jax.vmap(
             jax.vmap(
-                jax.vmap(_cap_cov, in_axes=-1, out_axes=-1), in_axes=-1, out_axes=-1
+                jax.vmap(_cap, in_axes=-1, out_axes=-1), in_axes=-1, out_axes=-1
             ),
             in_axes=-1,
             out_axes=-1,
         )(triple_cov)
 
-        triple_mean = jnp.clip(triple_mean, -1e6, 1e6)
+        triple_mean = jnp.clip(triple_mean, -_MAX_SMOOTHER_MEAN_ABS, _MAX_SMOOTHER_MEAN_ABS)
         triple_cross = jnp.clip(triple_cross, -max_allowed, max_allowed)
 
         # 2. Compute discrete state probabilities

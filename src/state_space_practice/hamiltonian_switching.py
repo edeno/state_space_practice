@@ -4,22 +4,31 @@ Combines multiple Hamiltonian energy landscapes with switching discrete states,
 sharing a single multimodal (LFP + Spikes) observation head.
 """
 
+from functools import partial
+from typing import Any, Dict, List, Optional, Tuple
+
 import jax
 import jax.numpy as jnp
-from typing import Dict, Any, Tuple, Optional, List
-from functools import partial
 from jax import Array
 
-from state_space_practice.kalman import psd_solve, symmetrize, joseph_form_update
 from state_space_practice.hamiltonian_joint import JointHamiltonianModel
-from state_space_practice.parameter_transforms import UNCONSTRAINED, STOCHASTIC_ROW, ParameterTransform
+from state_space_practice.kalman import joseph_form_update, psd_solve, symmetrize
 from state_space_practice.nonlinear_dynamics import (
-    apply_mlp, init_mlp_params, ekf_predict_step,
-    get_transition_jacobian, ekf_smooth_step
+    apply_mlp,
+    ekf_predict_step,
+    ekf_smooth_step,
+    get_transition_jacobian,
+    init_mlp_params,
 )
-from state_space_practice.switching_kalman import (
-    collapse_gaussian_mixture, _divide_safe, _scale_likelihood
+from state_space_practice.parameter_transforms import (
+    STOCHASTIC_ROW,
+    UNCONSTRAINED,
+    ParameterTransform,
 )
+from state_space_practice.switching_kalman import collapse_gaussian_mixture
+from state_space_practice.utils import divide_safe as _divide_safe
+from state_space_practice.utils import scale_likelihood as _scale_likelihood
+
 
 class SwitchingHamiltonianJointModel(JointHamiltonianModel):
     """Switching Model with multiple Hamiltonian energy landscapes."""
