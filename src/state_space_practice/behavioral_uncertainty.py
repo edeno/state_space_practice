@@ -95,39 +95,6 @@ def compute_surprise(predicted_probs: Array, choices: Array) -> Array:
     return -jnp.log(p)
 
 
-def change_point_probability(state_probs: Array) -> Array:
-    """Posterior uncertainty proxy: 1 - max(state_posterior).
-
-    .. warning::
-       Despite the name, this is NOT the probability that a state switch
-       just occurred. It is posterior uncertainty / ambiguity — high
-       whenever the marginal posterior is spread across multiple states,
-       regardless of whether the mass actually moved between consecutive
-       trials. For the true per-trial switch probability
-       P(s_t != s_{t-1} | data), use
-       :func:`pairwise_change_point_probability`, which requires the
-       pairwise smoothed joint from the HMM smoother.
-
-    This proxy is still useful as a quick "the model is unsure" signal
-    and is retained for backwards compatibility.
-
-    Parameters
-    ----------
-    state_probs : Array, shape (T, S)
-        Marginal posterior over discrete states.
-
-    Returns
-    -------
-    Array, shape (T,)
-        1 - max(state_probs, axis=-1) per trial.
-
-    See Also
-    --------
-    pairwise_change_point_probability : True marginal switch probability.
-    """
-    return 1.0 - jnp.max(state_probs, axis=-1)
-
-
 def pairwise_change_point_probability(pairwise_state_prob: Array) -> Array:
     """True per-trial switch probability P(s_t != s_{t-1} | data).
 

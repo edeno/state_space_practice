@@ -12,7 +12,6 @@ from state_space_practice.behavioral_uncertainty import (
     belief_entropy,
     bernoulli_mixture_mean_variance,
     categorical_entropy,
-    change_point_probability,
     compute_surprise,
     option_variances_from_covariances,
     pairwise_change_point_probability,
@@ -95,18 +94,6 @@ class TestComputeSurprise:
         choices = jnp.zeros(50, dtype=jnp.int32)
         surp = compute_surprise(probs, choices)
         assert surp.shape == (50,)
-
-
-class TestChangePointProbability:
-    def test_zero_for_certain_state(self):
-        probs = jnp.array([[1.0, 0.0], [0.0, 1.0]])
-        cp = change_point_probability(probs)
-        np.testing.assert_allclose(cp, 0.0, atol=1e-8)
-
-    def test_high_for_uncertain_state(self):
-        probs = jnp.array([[0.5, 0.5]])
-        cp = change_point_probability(probs)
-        np.testing.assert_allclose(cp, 0.5, atol=1e-8)
 
 
 class TestPairwiseChangePointProbability:

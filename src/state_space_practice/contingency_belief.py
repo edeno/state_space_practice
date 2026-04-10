@@ -796,20 +796,26 @@ class ContingencyBeliefModel(SGDFittableMixin):
         from state_space_practice.behavioral_uncertainty import (
             belief_entropy,
             bernoulli_mixture_mean_variance,
-            change_point_probability,
             compute_surprise,
+            pairwise_change_point_probability,
         )
 
         if self.smoothed_state_posterior_ is not None:
             self.belief_entropy_ = belief_entropy(self.smoothed_state_posterior_)
-            self.change_point_probability_ = change_point_probability(
-                self.smoothed_state_posterior_
-            )
             mean, var = bernoulli_mixture_mean_variance(
                 self.smoothed_state_posterior_, self.reward_probs_
             )
             self.predicted_reward_mean_ = mean
             self.predicted_reward_variance_ = var
+
+        # True per-trial switch probability from the smoother's pairwise joint
+        if (
+            self._smoother_result is not None
+            and self._smoother_result.pairwise_state_prob is not None
+        ):
+            self.change_point_probability_ = pairwise_change_point_probability(
+                self._smoother_result.pairwise_state_prob
+            )
 
         # Surprise from PREDICTED (prior) choice probabilities.
         # Uses time-varying transition matrices (from covariates if present)
