@@ -912,6 +912,198 @@ class TestPlaceFieldSGDFitting:
         assert model.filtered_mean is not None
 
 
+class TestWarmStart:
+    """Tests for the stationary Poisson GLM warm-start path."""
+
+    def test_warm_start_sets_init_mean_away_from_zero(
+        self, sim_data: dict
+    ) -> None:
+        """Warm-start must produce a non-trivial init_mean from spikes.
+
+        With zero spikes the MAP collapses to the prior mean (zeros). With
+        real spike data the MAP is pulled toward non-zero weights that
+        capture the rate map. A warm-started model on realistic data must
+        therefore have ``|init_mean| > 0``.
+        """
+        model = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+        )
+        # Run fit_sgd with warm_start=True but 0 optimizer steps: that sets
+        # init_mean / init_cov from the warm-start path without letting SGD
+        # drift from them.
+        import optax
+        opt = optax.adam(1e-3)
+        model.fit_sgd(
+            sim_data["position"], sim_data["spikes"],
+            optimizer=opt, num_steps=0, warm_start=True,
+        )
+        assert model.init_mean is not None
+        assert model.init_cov is not None
+        assert float(jnp.linalg.norm(model.init_mean)) > 0.1, (
+            "warm-start init_mean should move away from zero on real data"
+        )
+
+    def test_warm_start_improves_marginal_ll_at_init(
+        self, sim_data: dict
+    ) -> None:
+        """Warm-start must improve the marginal LL evaluated at init_mean/init_cov.
+
+        This is the direct test of the warm-start's value proposition:
+        we evaluate ``stochastic_point_process_filter`` at the warm-start
+        ``(init_mean, init_cov)`` vs. the cold-start ``(zeros, I)`` and
+        assert the warm-start LL is strictly better. Unlike a post-SGD-step
+        comparison, this cannot be confounded by the optimizer recovering
+        from a bad initialization in one step, so it directly probes the
+        quality of the initial state.
+        """
+        from state_space_practice.point_process_kalman import (
+            log_conditional_intensity,
+            stochastic_point_process_filter,
+        )
+        import optax
+
+        opt = optax.adam(1e-3)
+
+        # Warm-started model: init_mean / init_cov set by Laplace-GLM fit.
+        m_warm = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+        )
+        m_warm.fit_sgd(
+            sim_data["position"], sim_data["spikes"],
+            optimizer=opt, num_steps=0, warm_start=True,
+        )
+        # Cold-started: init_mean=zeros, init_cov=init_cov_scale*I
+        m_cold = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+        )
+        m_cold.fit_sgd(
+            sim_data["position"], sim_data["spikes"],
+            optimizer=opt, num_steps=0, warm_start=False,
+        )
+
+        # Evaluate the filter directly at each model's init state —
+        # no SGD steps taken, so this is the marginal LL at the initial
+        # prior, the quantity the warm-start is designed to improve.
+        design_matrix = m_warm._expand_to_block_diagonal(
+            m_warm._build_spline_basis_matrix(np.asarray(sim_data["position"]))
+        )
+        spikes = jnp.asarray(sim_data["spikes"])
+        if spikes.ndim == 2 and spikes.shape[1] == 1:
+            spikes = spikes.squeeze(axis=1)
+
+        _, _, ll_warm = stochastic_point_process_filter(
+            m_warm.init_mean, m_warm.init_cov, design_matrix, spikes,
+            m_warm.dt, m_warm.transition_matrix, m_warm.process_cov,
+            log_conditional_intensity,
+            max_log_count=m_warm._max_log_count,
+        )
+        _, _, ll_cold = stochastic_point_process_filter(
+            m_cold.init_mean, m_cold.init_cov, design_matrix, spikes,
+            m_cold.dt, m_cold.transition_matrix, m_cold.process_cov,
+            log_conditional_intensity,
+            max_log_count=m_cold._max_log_count,
+        )
+        assert jnp.isfinite(ll_warm) and jnp.isfinite(ll_cold)
+        assert ll_warm > ll_cold, (
+            f"warm-start marginal LL at init ({float(ll_warm):.2f}) should "
+            f"be better than cold-start ({float(ll_cold):.2f})"
+        )
+
+    def test_warm_start_window_slices_data(self, sim_data: dict) -> None:
+        """warm_start_window must restrict the GLM fit to that slice.
+
+        We compare the warm-started init_mean for window=first-half vs
+        window=whole-session. They should differ, proving the window
+        parameter is actually changing the fit.
+        """
+        import optax
+
+        opt = optax.adam(1e-3)
+        n_time = len(sim_data["spikes"])
+
+        m_whole = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+        )
+        m_whole.fit_sgd(
+            sim_data["position"], sim_data["spikes"],
+            optimizer=opt, num_steps=0, warm_start=True, warm_start_window=None,
+        )
+
+        m_half = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+        )
+        m_half.fit_sgd(
+            sim_data["position"], sim_data["spikes"],
+            optimizer=opt, num_steps=0, warm_start=True,
+            warm_start_window=slice(0, n_time // 2),
+        )
+
+        # Half-window and full-window warm-starts should not produce
+        # identical init_means on a real dataset.
+        assert not jnp.allclose(m_whole.init_mean, m_half.init_mean)
+
+    def test_warm_start_false_matches_old_defaults(self, sim_data: dict) -> None:
+        """warm_start=False must reproduce the pre-warm-start behavior.
+
+        With ``warm_start=False``, ``init_mean`` should be all zeros and
+        ``init_cov`` should equal ``init_cov_scale * I`` — the old scalar
+        defaults that predate this commit. This is the back-compat path
+        for ablation studies.
+        """
+        import optax
+
+        model = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3,
+            init_process_noise=1e-5, init_cov_scale=0.5,
+        )
+        opt = optax.adam(1e-3)
+        model.fit_sgd(
+            sim_data["position"], sim_data["spikes"],
+            optimizer=opt, num_steps=0, warm_start=False,
+        )
+        assert jnp.allclose(model.init_mean, jnp.zeros(model.n_basis))
+        assert jnp.allclose(
+            model.init_cov, jnp.eye(model.n_basis) * 0.5, atol=1e-10
+        )
+
+    def test_warm_start_multi_neuron_block_diagonal_cov(
+        self, sim_data: dict
+    ) -> None:
+        """Multi-neuron warm-start must produce a block-diagonal init_cov.
+
+        The design matrix is block-diagonal across neurons (each neuron's
+        log-intensity depends only on its own weight slice), so the
+        Laplace covariance from independent per-neuron GLM fits must
+        also be block-diagonal.
+        """
+        # Build a 2-neuron spike array from sim_data
+        spikes_single = np.asarray(sim_data["spikes"])
+        if spikes_single.ndim == 2:
+            spikes_single = spikes_single.squeeze(axis=-1)
+        spikes_multi = np.stack([spikes_single, spikes_single[::-1]], axis=-1)
+
+        model = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+        )
+        # Populate n_neurons and warm-start directly (avoid running SGD)
+        model.n_neurons = 2
+        Z_base = model._build_spline_basis_matrix(
+            np.asarray(sim_data["position"])
+        )
+        model._warm_start_parameters(Z_base, jnp.asarray(spikes_multi), None)
+
+        nb = model.n_basis_per_neuron
+        assert model.init_cov.shape == (2 * nb, 2 * nb)
+        # Off-diagonal (cross-neuron) block must be exactly zero
+        cross_block = model.init_cov[:nb, nb:]
+        assert jnp.allclose(cross_block, jnp.zeros_like(cross_block))
+        # Diagonal blocks must be PSD (positive eigenvalues)
+        eigvals_0 = jnp.linalg.eigvalsh(model.init_cov[:nb, :nb])
+        eigvals_1 = jnp.linalg.eigvalsh(model.init_cov[nb:, nb:])
+        assert jnp.all(eigvals_0 > 0)
+        assert jnp.all(eigvals_1 > 0)
+
+
 class TestMaxFiringRateHz:
     """Tests for the ``max_firing_rate_hz`` ceiling and saturation warning."""
 
