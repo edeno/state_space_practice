@@ -111,7 +111,11 @@ class SGDFittableMixin:
             return self._sgd_loss_fn(p, *args, **kwargs) / n_timesteps
 
         log_likelihoods: list[float] = []
-        # Track last valid params for NaN recovery (not best-loss tracking)
+        # last_valid_unc_params tracks the most recent params that
+        # produced finite loss. It is updated ONLY after the finite check
+        # and BEFORE apply_updates, so on NaN recovery we roll back to a
+        # set of params we actually confirmed as good — not the post-
+        # update params that then produced NaN on the next iteration.
         last_valid_unc_params = unc_params
         stall_count = 0
 
@@ -129,12 +133,17 @@ class SGDFittableMixin:
                 unc_params = last_valid_unc_params
                 break
 
+            # loss_fn just confirmed these params are finite. Snapshot
+            # NOW, before the update mutates them — so that on the next
+            # iteration's potential NaN, we can restore to this known-
+            # good state rather than to the failing post-update state.
+            last_valid_unc_params = unc_params
+
             updates, opt_state = optimizer.update(grads, opt_state, unc_params)
             unc_params = optax.apply_updates(unc_params, updates)
 
             ll = -float(loss) * n_timesteps
             log_likelihoods.append(ll)
-            last_valid_unc_params = unc_params
 
             if verbose and (step % 10 == 0 or step == num_steps - 1):
                 logger.info("SGD step %d: LL=%.2f", step, ll)

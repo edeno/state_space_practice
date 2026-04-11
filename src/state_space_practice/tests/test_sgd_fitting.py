@@ -199,3 +199,142 @@ class TestSGDFittableMixin:
         optimizer = optax.adam(1e-1)
         lls = model.fit_sgd(jnp.array(5.0), optimizer=optimizer, num_steps=50)
         assert len(lls) == 50
+
+    def test_nan_recovery_restores_last_finite_params(self) -> None:
+        """Regression test: NaN recovery must roll back to params that
+        were confirmed finite by a previous loss_fn call, NOT to the
+        post-update params that just produced NaN.
+
+        Earlier versions of the mixin assigned ``last_valid_unc_params``
+        at the END of each loop iteration — AFTER ``optax.apply_updates``.
+        Consequence: at step N+1 NaN, ``last_valid_unc_params`` was the
+        post-step-N-update params — exactly the params the just-failed
+        ``loss_fn`` was evaluated on. Restoration was a no-op, and
+        downstream ``_finalize_sgd`` ran on the NaN-producing params.
+
+        The fix captures the snapshot AFTER confirming finite loss,
+        BEFORE ``apply_updates``. That guarantees the snapshot is a
+        set of params that ``loss_fn`` has actually evaluated and
+        approved.
+
+        Test mechanic: use a loss that NaNs when ``scale`` crosses a
+        threshold. The trajectory is linear (constant gradient), so
+        each SGD step moves ``scale`` by a fixed amount. With the
+        correct fix, after NaN recovery ``model.scale`` must equal the
+        LAST finite-loss value, not the post-update value that
+        triggered NaN.
+        """
+
+        class _NanAboveThreshold(SGDFittableMixin):
+            """Loss = -scale, NaN once scale > 1.4."""
+
+            def __init__(self):
+                self.scale = 0.0
+                self._initialized = True
+
+            @property
+            def _n_timesteps(self):
+                return 100
+
+            def _check_sgd_initialized(self):
+                pass
+
+            def _build_param_spec(self):
+                return {"scale": jnp.array(self.scale)}, {
+                    "scale": UNCONSTRAINED
+                }
+
+            def _sgd_loss_fn(self, params, _target):
+                # Loss = -scale (maximize scale). NaN once scale > 1.4.
+                return jnp.where(
+                    params["scale"] > 1.4,
+                    jnp.array(jnp.nan),
+                    -params["scale"] * self._n_timesteps,
+                )
+
+            def _store_sgd_params(self, params):
+                self.scale = float(params["scale"])
+
+            def _finalize_sgd(self, _target):
+                pass
+
+        import optax
+
+        # Gradient of -scale wrt scale is -1, so with SGD lr=0.5 each
+        # step increments scale by 0.5. Trajectory:
+        #   step 0: scale=0.0 → loss=0,    post=0.5 → last_valid=0.0
+        #   step 1: scale=0.5 → loss=-0.5, post=1.0 → last_valid=0.5
+        #   step 2: scale=1.0 → loss=-1.0, post=1.5 → last_valid=1.0
+        #   step 3: scale=1.5 → loss=NaN  → restore to last_valid=1.0
+        #
+        # CORRECT fix (snapshot after finite confirmation, before update):
+        #   model.scale after recovery == 1.0 (step 2's evaluated params)
+        #
+        # BUGGY version (snapshot at end of loop, after update):
+        #   last_valid at NaN time would be 1.5 → restored model.scale == 1.5
+        #
+        # BROKEN alternative (snapshot at top of loop, before loss_fn):
+        #   last_valid at top of step 3 is 1.5 → restored model.scale == 1.5
+        #   — same as buggy, because unc_params doesn't change between
+        #   end of prev iter and top of next iter.
+        #
+        # Only the correct fix restores to 1.0.
+        model = _NanAboveThreshold()
+        optimizer = optax.sgd(learning_rate=0.5)
+
+        lls = model.fit_sgd(
+            jnp.array(0.0), optimizer=optimizer, num_steps=10
+        )
+
+        # Finite LL for steps 0, 1, 2 (loss = 0, -0.5, -1.0 → LL = 0, 50, 100)
+        assert len(lls) == 3, f"expected 3 finite steps, got {len(lls)}"
+        assert all(np.isfinite(ll) for ll in lls)
+        np.testing.assert_allclose(lls, [0.0, 50.0, 100.0], atol=1e-6)
+
+        # The critical assertion: model.scale must equal the LAST
+        # finite-loss scale value (1.0), NOT the post-update value
+        # from step 2 (1.5) that triggered NaN at step 3.
+        assert np.isfinite(model.scale)
+        np.testing.assert_allclose(model.scale, 1.0, atol=1e-6)
+
+    def test_nan_at_step_zero_is_noop_recovery(self) -> None:
+        """If the very first loss evaluation returns NaN, recovery has
+        nothing valid to restore — the user's init was already bad.
+        The contract is: ``model.scale`` is left at its init value,
+        ``lls`` is empty, and ``fit_sgd`` does not crash.
+        """
+
+        class _AlwaysNan(SGDFittableMixin):
+            def __init__(self):
+                self.scale = 2.0  # already above the NaN threshold
+                self._initialized = True
+
+            @property
+            def _n_timesteps(self):
+                return 100
+
+            def _check_sgd_initialized(self):
+                pass
+
+            def _build_param_spec(self):
+                return {"scale": jnp.array(self.scale)}, {
+                    "scale": UNCONSTRAINED
+                }
+
+            def _sgd_loss_fn(self, params, _target):
+                return jnp.where(
+                    params["scale"] > 1.4,
+                    jnp.array(jnp.nan),
+                    -params["scale"] * self._n_timesteps,
+                )
+
+            def _store_sgd_params(self, params):
+                self.scale = float(params["scale"])
+
+            def _finalize_sgd(self, _target):
+                pass
+
+        model = _AlwaysNan()
+        lls = model.fit_sgd(jnp.array(0.0), num_steps=10)
+        assert lls == []
+        np.testing.assert_allclose(model.scale, 2.0, atol=1e-6)
