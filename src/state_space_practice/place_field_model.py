@@ -560,17 +560,20 @@ class PlaceFieldModel(SGDFittableMixin):
     def bin_spike_times(
         spike_times: np.ndarray,
         time_bins: np.ndarray,
+        warn_on_drops: bool = True,
     ) -> np.ndarray:
-        """Bin spike times into time bins.
+        """Bin a single neuron's spike times into time bins.
 
-        Convenience method for converting spike time arrays (as returned by
-        most recording systems) into the binned spike counts expected by
-        ``fit()``.
+        Thin single-neuron wrapper around
+        :func:`state_space_practice.preprocessing.bin_spike_times`. For
+        multi-neuron data, call ``preprocessing.bin_spike_times`` directly.
 
-        Spikes are assigned to bin *i* if ``time_bins[i] < spike_time <=
-        time_bins[i+1]`` (right-closed intervals). Spikes at or before
-        ``time_bins[0]`` are silently discarded, as are spikes after
-        ``time_bins[-1] + dt``.
+        Uses ``np.histogram`` semantics: bins are left-closed
+        ``[t_i, t_{i+1})`` for all bins except the last, which is
+        ``[t_{T-1}, t_{T-1} + dt]``. Spikes outside
+        ``[time_bins[0], time_bins[-1] + dt]`` are silently discarded;
+        a ``UserWarning`` is issued when any are dropped (pass
+        ``warn_on_drops=False`` to suppress).
 
         Parameters
         ----------
@@ -578,6 +581,10 @@ class PlaceFieldModel(SGDFittableMixin):
             Times of individual spikes (in seconds or matching time_bins units).
         time_bins : np.ndarray, shape (n_time,)
             Left edges of time bins (e.g., from ``np.arange(t_start, t_end, dt)``).
+        warn_on_drops : bool, default=True
+            Emit a warning if spikes fall outside the bin window. Prevents
+            the silent-funnel-to-last-bin failure mode that used to occur
+            when callers passed a sub-window of the spike time range.
 
         Returns
         -------
@@ -590,11 +597,21 @@ class PlaceFieldModel(SGDFittableMixin):
         >>> spike_counts = PlaceFieldModel.bin_spike_times(spike_times, time_bins)
         >>> model.fit(position, spike_counts)
         """
-        spike_counts = np.zeros(len(time_bins), dtype=int)
-        bin_indices = np.searchsorted(time_bins, spike_times) - 1
-        valid = (bin_indices >= 0) & (bin_indices < len(time_bins))
-        np.add.at(spike_counts, bin_indices[valid], 1)
-        return spike_counts
+        from state_space_practice.preprocessing import (
+            bin_spike_times as _bin_spike_times_multi,
+        )
+
+        spike_times = np.asarray(spike_times)
+        # Pass _warn_stacklevel=3 so the warning points at the user's call
+        # site rather than this wrapper's delegation line: user -> wrapper
+        # -> canonical -> _warn_if_out_of_window.
+        counts_2d = _bin_spike_times_multi(
+            [spike_times],
+            time_bins,
+            warn_on_drops=warn_on_drops,
+            _warn_stacklevel=3,
+        )
+        return counts_2d[:, 0]
 
     def fit(
         self,

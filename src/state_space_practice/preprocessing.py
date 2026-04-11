@@ -10,33 +10,100 @@ JIT-compatible. For JAX-compatible operations, see the core model modules.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import numpy.typing as npt
 from numpy.typing import ArrayLike, NDArray
 
 
+def _warn_if_out_of_window(
+    spike_times_list: list[NDArray[np.floating]],
+    t_start: float,
+    t_end: float,
+    stacklevel: int,
+) -> None:
+    """Emit a ``UserWarning`` naming the count of out-of-window spikes.
+
+    Factored out so that wrappers (e.g., ``PlaceFieldModel.bin_spike_times``)
+    can pass the correct ``stacklevel`` for the warning to point at the user's
+    call site rather than the wrapper's delegation line.
+    """
+    n_dropped_total = 0
+    n_offending_units = 0
+    for st in spike_times_list:
+        if st.size == 0:
+            continue
+        n_dropped = int(np.sum((st < t_start) | (st > t_end)))
+        if n_dropped > 0:
+            n_offending_units += 1
+            n_dropped_total += n_dropped
+    if n_dropped_total > 0:
+        warnings.warn(
+            f"bin_spike_times: {n_dropped_total} spike(s) across "
+            f"{n_offending_units} unit(s) fall outside the bin window "
+            f"[{t_start:g}, {t_end:g}] and were discarded. "
+            f"Check that time_bins covers the full spike time range, "
+            f"or filter with clip_spike_times_to_window first. "
+            f"Pass warn_on_drops=False to suppress this warning.",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
+
+
 def bin_spike_times(
-    spike_times: list[NDArray[np.floating]],
+    spike_times: list[NDArray[np.floating]] | NDArray[np.floating],
     time_bins: ArrayLike,
+    warn_on_drops: bool = True,
+    _warn_stacklevel: int = 2,
 ) -> NDArray[np.int_]:
-    """Bin spike times into count matrix.
+    """Bin spike times into a count matrix.
+
+    Uses ``np.histogram`` semantics: bins are left-closed ``[t_i, t_{i+1})``
+    for all bins except the last, which is ``[t_{T-1}, t_{T-1} + dt]`` and
+    includes both endpoints. Spikes outside ``[time_bins[0], time_bins[-1] + dt]``
+    are **silently discarded**; a ``UserWarning`` is emitted by default when
+    any such drops occur so silent failures become visible.
 
     Parameters
     ----------
-    spike_times : list of arrays
-        Spike times for each unit (in seconds). Each array contains the
-        timestamps when that unit fired.
-    time_bins : array-like
-        Bin edges (left edges, uniform spacing assumed). The last bin
-        extends to time_bins[-1] + bin_width where bin_width is inferred
-        from the spacing.
+    spike_times : list of numpy arrays, or single 1D numpy array
+        Spike times per unit (in seconds). If a single 1D ``np.ndarray`` is
+        passed, it is treated as a single-unit list. This function is
+        NumPy-only and not JIT-compatible; JAX arrays should be converted
+        via ``np.asarray`` first.
+    time_bins : array-like, shape (n_time,)
+        Left edges of the time bins, uniformly spaced. The last bin extends
+        to ``time_bins[-1] + bin_width`` where ``bin_width`` is inferred from
+        the spacing of ``time_bins``.
+    warn_on_drops : bool, default=True
+        If True (default), emit a ``UserWarning`` when any spikes fall outside
+        ``[time_bins[0], time_bins[-1] + bin_width]``. Set to False to suppress
+        when out-of-window drops are expected (e.g., when intentionally binning
+        a sub-window of a session).
+    _warn_stacklevel : int, default=2
+        Private parameter used by wrappers (e.g., ``PlaceFieldModel.bin_spike_times``)
+        to pass the correct stacklevel so the warning points at the user's
+        call site, not the wrapper. Direct callers should leave this at 2.
 
     Returns
     -------
     spikes : array, shape (n_time, n_neurons)
-        Spike counts per bin for each neuron. Note: Unlike latent state
-        arrays (n_latent, n_time), spike observations use (n_time, n_neurons)
-        following observation matrix conventions.
+        Spike counts per bin for each neuron. Note: unlike latent state
+        arrays ``(n_latent, n_time)``, spike observations use
+        ``(n_time, n_neurons)`` following observation-matrix conventions.
+
+    Warnings
+    --------
+    UserWarning
+        Emitted when ``warn_on_drops`` is True and any spikes fall outside
+        the window. This used to be a silent failure mode that funneled
+        out-of-window spikes into the last bin and caused catastrophic
+        log-likelihoods downstream; the warning now surfaces it directly.
+
+    See Also
+    --------
+    clip_spike_times_to_window : filter spike times to a window before binning.
 
     Examples
     --------
@@ -47,18 +114,44 @@ def bin_spike_times(
     (5, 2)
     """
     time_bins = np.asarray(time_bins)
-    n_neurons = len(spike_times)
+    if time_bins.ndim != 1 or time_bins.size < 2:
+        raise ValueError(
+            "time_bins must be a 1D array with at least 2 entries "
+            "so bin width can be inferred from spacing."
+        )
+
+    # Accept a single 1D array as shorthand for a single-unit list.
+    single_unit = isinstance(spike_times, np.ndarray) and spike_times.ndim == 1
+    if single_unit:
+        spike_times_list: list[NDArray[np.floating]] = [spike_times]  # type: ignore[list-item]
+    else:
+        spike_times_list = [np.asarray(st) for st in spike_times]
+
+    n_neurons = len(spike_times_list)
     n_time = len(time_bins)
 
-    # Infer bin width from spacing
-    bin_width = time_bins[1] - time_bins[0]
+    # Infer bin width from spacing, then construct the right edge explicitly.
+    # Note: t_end is the closed right endpoint of the last bin (np.histogram
+    # includes the right edge only for the final bin). A spike at exactly
+    # t_end is binned in the last bin, NOT dropped or flagged as out-of-window.
+    bin_width = float(time_bins[1] - time_bins[0])
+    t_start = float(time_bins[0])
+    t_end = float(time_bins[-1]) + bin_width
+    bin_edges = np.append(time_bins, t_end)
 
-    # Create bin edges for histogram (need right edge too)
-    bin_edges = np.append(time_bins, time_bins[-1] + bin_width)
+    # Out-of-window diagnostics. np.histogram silently drops spikes outside
+    # bin_edges, which was previously a catastrophic silent-failure mode
+    # (spikes past time_bins[-1] used to be funneled into the last bin via
+    # a searchsorted catch-all). Surface it as a warning at the caller's
+    # frame so the problem is visible at the call site.
+    if warn_on_drops:
+        _warn_if_out_of_window(
+            spike_times_list, t_start, t_end, stacklevel=_warn_stacklevel + 1
+        )
 
-    # Bin each neuron's spikes
+    # Bin each neuron's spikes via np.histogram (drops out-of-range silently).
     spikes = np.zeros((n_time, n_neurons), dtype=np.int_)
-    for n, st in enumerate(spike_times):
+    for n, st in enumerate(spike_times_list):
         counts, _ = np.histogram(st, bins=bin_edges)
         spikes[:, n] = counts
 

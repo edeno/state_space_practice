@@ -56,15 +56,67 @@ class TestBinSpikeTimes:
 
     def test_preserves_total_spikes(self):
         """Test that binning preserves total spike count."""
-        rng = np.random.default_rng(42)
-        spike_times = [rng.uniform(0, 10, 100) for _ in range(5)]
-        time_bins = np.arange(0, 10, 0.01)
+        import warnings as _w
 
-        counts = bin_spike_times(spike_times, time_bins)
+        rng = np.random.default_rng(42)
+        # uniform(0, 10) returns values in [0, 10), and we give explicit
+        # headroom past 10 in time_bins so the last bin fully covers the
+        # spike range and no drop-warning can fire regardless of seed.
+        spike_times = [rng.uniform(0, 10, 100) for _ in range(5)]
+        time_bins = np.arange(0, 10.02, 0.01)  # last bin ends at ~10.02
+
+        with _w.catch_warnings():
+            _w.simplefilter("error")  # any warning would raise
+            counts = bin_spike_times(spike_times, time_bins)
 
         total_original = sum(len(st) for st in spike_times)
         total_binned = counts.sum()
         assert total_binned == total_original
+
+    def test_out_of_window_warning_and_no_funnel(self):
+        """Spikes past time_bins[-1] + dt must be dropped (not funneled
+        into the last bin) and must trigger a UserWarning.
+
+        Regression test for the silent-funnel bug that caused catastrophic
+        log-likelihoods in PlaceFieldModel.fit_sgd on real data where a
+        sub-window of spike times was being binned. Before the fix, all
+        out-of-window spikes got assigned to bin T-1, producing one
+        pathological count that drove a single Fisher step to O(100)
+        step magnitude and log-likelihoods of -1e8.
+        """
+        import pytest
+
+        time_bins = np.arange(0, 5, 1.0)  # dt=1, t_end=5
+        spike_times = [
+            np.array([0.5, 1.5, 2.5]),  # all in-window
+            np.concatenate([np.array([3.5]), np.full(1000, 99.9)]),  # 1 in, 1000 out
+        ]
+        with pytest.warns(UserWarning, match="1000 spike"):
+            counts = bin_spike_times(spike_times, time_bins)
+        # Neuron 0: all 3 in-window spikes counted
+        assert counts[:, 0].sum() == 3
+        # Neuron 1: only the one in-window spike counted; 1000 out-of-window dropped
+        assert counts[:, 1].sum() == 1
+        # Critically: bin T-1 (the last bin) does NOT contain the out-of-window flood
+        assert counts[-1, 1] == 0
+
+    def test_warn_on_drops_suppression(self):
+        """warn_on_drops=False suppresses the out-of-window warning."""
+        import warnings
+
+        time_bins = np.arange(0, 5, 1.0)
+        spike_times = [np.array([100.0])]  # out-of-window
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning would raise
+            counts = bin_spike_times(spike_times, time_bins, warn_on_drops=False)
+        assert counts.sum() == 0
+
+    def test_accepts_single_1d_array(self):
+        """Shorthand: passing a single 1D array treats it as one unit."""
+        time_bins = np.arange(0, 5, 1.0)
+        counts = bin_spike_times(np.array([0.5, 1.5, 2.5]), time_bins)
+        assert counts.shape == (5, 1)
+        assert counts.sum() == 3
 
 
 class TestComputeFiringRates:

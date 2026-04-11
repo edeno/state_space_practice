@@ -346,30 +346,106 @@ class TestPlaceFieldModelScore:
 
 
 class TestBinSpikeTimes:
-    """Tests for the spike binning utility."""
+    """Tests for the spike binning utility.
+
+    Note: uses left-closed ``[t_i, t_{i+1})`` bins (inherited from the
+    canonical ``np.histogram``-based implementation in
+    ``state_space_practice.preprocessing``). The last bin ``[t_{T-1},
+    t_{T-1} + dt]`` is right-closed on the endpoint.
+    """
 
     def test_known_spike_train(self) -> None:
         time_bins = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
         spike_times = np.array([0.5, 0.7, 2.3, 4.0])
         counts = PlaceFieldModel.bin_spike_times(spike_times, time_bins)
-        # bin 0: [0, 1) -> 0.5, 0.7 = 2 spikes
-        # bin 1: [1, 2) -> 0 spikes
-        # bin 2: [2, 3) -> 2.3 = 1 spike
-        # bin 3: [3, 4) -> 4.0 = 1 spike (searchsorted returns 4, -1 = bin 3)
-        # bin 4: empty
-        np.testing.assert_array_equal(counts, [2, 0, 1, 1, 0])
+        # Left-closed intervals:
+        # bin 0: [0, 1) -> 0.5, 0.7 -> 2
+        # bin 1: [1, 2) -> 0
+        # bin 2: [2, 3) -> 2.3 -> 1
+        # bin 3: [3, 4) -> 0
+        # bin 4: [4, 5] -> 4.0 -> 1  (last bin is right-closed on endpoint)
+        np.testing.assert_array_equal(counts, [2, 0, 1, 0, 1])
 
     def test_spike_at_session_start(self) -> None:
-        """Spike exactly at time_bins[0] gets searchsorted index 0, -1 = -1, discarded."""
+        """Spike exactly at time_bins[0] falls in bin 0 (left-closed)."""
         time_bins = np.arange(0, 5, 1.0)
         counts = PlaceFieldModel.bin_spike_times(np.array([0.0]), time_bins)
-        # Spike at t=0 is discarded by the (t_i, t_{i+1}] convention
-        assert counts.sum() == 0
+        assert counts[0] == 1
+        assert counts.sum() == 1
 
     def test_empty_spike_train(self) -> None:
         time_bins = np.arange(0, 10, 1.0)
         counts = PlaceFieldModel.bin_spike_times(np.array([]), time_bins)
         np.testing.assert_array_equal(counts, np.zeros(len(time_bins), dtype=int))
+
+    def test_out_of_window_spikes_discarded_with_warning(self) -> None:
+        """Spikes past time_bins[-1] + dt must be discarded, not funneled
+        into the last bin. This is a regression test for the silent-funnel
+        bug that caused catastrophic log-likelihoods in fit_sgd."""
+        time_bins = np.arange(0, 5, 1.0)  # [0, 1, 2, 3, 4], dt=1, t_end=5
+        # Inject many spikes FAR past the window. Before the fix, these
+        # all got dumped into bin T-1 via the searchsorted catch-all.
+        spike_times = np.concatenate(
+            [
+                np.array([0.5, 1.5, 2.5]),  # in-window: 3 spikes, one per bin
+                np.full(9999, 100.0),  # 9999 spikes at t=100, way past t_end=5
+            ]
+        )
+        with pytest.warns(UserWarning, match="9999 spike"):
+            counts = PlaceFieldModel.bin_spike_times(spike_times, time_bins)
+        # Bin 4 (the last bin, [4, 5]) should be empty, NOT contain 9999.
+        assert counts[4] == 0
+        # Only the 3 in-window spikes should survive.
+        assert counts.sum() == 3
+        np.testing.assert_array_equal(counts, [1, 1, 1, 0, 0])
+
+    def test_warn_on_drops_suppression(self) -> None:
+        """warn_on_drops=False silences the out-of-window warning."""
+        import warnings as _w
+
+        time_bins = np.arange(0, 5, 1.0)
+        spike_times = np.array([100.0])  # out-of-window
+        with _w.catch_warnings():
+            _w.simplefilter("error")  # any UserWarning would raise
+            counts = PlaceFieldModel.bin_spike_times(
+                spike_times, time_bins, warn_on_drops=False
+            )
+        assert counts.sum() == 0
+
+    def test_spikes_in_last_bin_not_dropped(self) -> None:
+        """Spikes in the genuine last bin [t_{T-1}, t_{T-1} + dt] must count."""
+        time_bins = np.arange(0, 5, 1.0)  # dt=1, last bin is [4, 5]
+        spike_times = np.array([4.5])  # inside last bin
+        counts = PlaceFieldModel.bin_spike_times(spike_times, time_bins)
+        assert counts[-1] == 1
+        assert counts.sum() == 1
+
+    def test_warning_points_at_caller_through_wrapper(self) -> None:
+        """The drop warning must point at the user's call site, not at
+        the preprocessing module or the PlaceFieldModel wrapper itself.
+
+        Regression test for a stacklevel bug where the warning would
+        report ``preprocessing.py`` or ``place_field_model.py`` as the
+        source, making it harder for users to find where the bad
+        ``time_bins`` came from. ``PlaceFieldModel.bin_spike_times``
+        delegates to the canonical implementation, which is two frames
+        deep, so it must pass ``_warn_stacklevel=3``.
+        """
+        import warnings as _w
+
+        time_bins = np.arange(0, 5, 1.0)
+        spike_times = np.array([100.0])  # out-of-window
+
+        with _w.catch_warnings(record=True) as captured:
+            _w.simplefilter("always")
+            PlaceFieldModel.bin_spike_times(spike_times, time_bins)
+
+        assert len(captured) == 1
+        warning = captured[0]
+        # Warning should point at THIS test file, not at the library internals.
+        assert warning.filename == __file__, (
+            f"stacklevel points at {warning.filename}, expected {__file__}"
+        )
 
 
 # ------------------------------------------------------------------
