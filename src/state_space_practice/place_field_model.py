@@ -206,12 +206,26 @@ class PlaceFieldModel(SGDFittableMixin):
         - "isotropic": single scalar variance shared across all basis functions.
           Faster to converge but assumes uniform drift across all spatial
           basis functions, which is rarely appropriate for place cells.
-    init_process_noise : float, default=1e-5
-        Initial value for the diagonal of Q.
-    init_cov_scale : float, default=1.0
-        Scale for the initial state covariance (init_cov = I * init_cov_scale).
-        Controls how uncertain the initial weight estimates are. Larger values
-        allow faster initial adaptation but may cause instability.
+    init_process_noise : float, default=1e-6
+        Initial value for the diagonal of Q. Chosen so that the cumulative
+        random-walk drift over a typical session is small in log-rate space:
+        ``sqrt(Q * T) ≈ 0.1`` nats for T=10,000 bins, i.e. the log-rate
+        weights wander by ~0.1 nats (standard deviation) over the session.
+        This is consistent with the small within-session place-field drift
+        reported for CA1 in Ziv 2013 / Mankin 2012 — a few centimeters in
+        arena space, which maps to a small log-rate perturbation on the
+        spline-weight vector. EM (``fit``) updates Q from data, so this
+        default only controls the initial scale; ``fit_sgd`` optimizes it
+        via gradient descent.
+    init_cov_scale : float, default=0.01
+        Scale for the initial state covariance (``init_cov = I * init_cov_scale``)
+        when ``warm_start=False``. Controls how uncertain the initial
+        weight estimates are. Only used when warm-start is disabled; the
+        default warm-start path replaces this with the Laplace posterior
+        covariance of a stationary Poisson GLM, which is data-driven and
+        far tighter than any scalar default. The scalar ``0.01``
+        corresponds to prior std ~0.1 per weight — a reasonable
+        "weakly informative" fallback when the warm-start is skipped.
     max_firing_rate_hz : float, default=500.0
         Physiologically motivated ceiling on the instantaneous firing rate.
         Used to set ``max_log_count = log(max_firing_rate_hz * dt)`` inside
@@ -265,8 +279,8 @@ class PlaceFieldModel(SGDFittableMixin):
         dt: float,
         n_interior_knots: int = 5,
         process_noise_structure: str = "diagonal",
-        init_process_noise: float = 1e-5,
-        init_cov_scale: float = 1.0,
+        init_process_noise: float = 1e-6,
+        init_cov_scale: float = 0.01,
         log_intensity_func: Optional[Callable[[ArrayLike, ArrayLike], Array]] = None,
         update_transition_matrix: bool = False,
         update_process_cov: bool = True,

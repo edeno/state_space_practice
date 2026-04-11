@@ -93,6 +93,13 @@ class TestPlaceFieldModelInit:
         m = PlaceFieldModel(dt=0.004)
         assert m.dt == 0.004
         assert m.n_interior_knots == 5
+        # Pin the biologically motivated defaults so a future refactor
+        # can't silently revert them. See PlaceFieldModel.__init__ docstring
+        # for the derivations (cumulative log-rate drift, warm-start
+        # fallback, physiological firing-rate ceiling).
+        assert m.init_process_noise == 1e-6
+        assert m.init_cov_scale == 0.01
+        assert m.max_firing_rate_hz == 500.0
 
     def test_invalid_dt(self) -> None:
         with pytest.raises(ValueError, match="dt must be positive"):
