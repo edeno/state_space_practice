@@ -46,6 +46,7 @@ from patsy import dmatrix
 from state_space_practice.kalman import psd_solve, sum_of_outer_products, symmetrize
 from state_space_practice.point_process_kalman import (
     _safe_expected_count,
+    _validate_filter_numerics,
     get_confidence_interval,
     log_conditional_intensity,
     stochastic_point_process_filter,
@@ -190,6 +191,21 @@ class PlaceFieldModel(SGDFittableMixin):
     Parameters are estimated via EM: the E-step uses a Laplace-EKF
     filter/smoother, and the M-step updates the process noise covariance Q
     and initial conditions.
+
+    Numerical precision
+    -------------------
+    The Laplace-EKF filter's covariance propagation requires **float64**
+    for reliable long-sequence fits. In float32, accumulated roundoff can
+    drive the posterior covariance below PSD after ~250-5000 time bins
+    depending on ``init_cov`` conditioning, causing silent NaN. Enable
+    float64 BEFORE importing this module::
+
+        import jax
+        jax.config.update("jax_enable_x64", True)
+        from state_space_practice import PlaceFieldModel
+
+    ``fit`` and ``fit_sgd`` validate ``init_cov`` at entry and raise if
+    it is not PSD, or warn if the configuration is at risk of f32 NaN.
 
     Parameters
     ----------
@@ -838,6 +854,9 @@ class PlaceFieldModel(SGDFittableMixin):
             log_conditional_intensity=self._log_intensity_func,
             return_filtered=True,
             max_log_count=self._max_log_count,
+            # fit() validates once at the top before EM starts; skip
+            # per-iteration re-validation (eigvalsh is O(d^3)).
+            validate_inputs=False,
         )
         return float(marginal_ll)
 
@@ -1046,6 +1065,13 @@ class PlaceFieldModel(SGDFittableMixin):
         else:
             self._initialize_parameters()
 
+        # Numerical sanity check: validate init_cov is PSD and warn if
+        # the configuration is at risk of f32 NaN during the scan. Runs
+        # once here so the EM loop's _e_step calls can skip re-validation.
+        _validate_filter_numerics(
+            self.init_cov, n_time=design_matrix.shape[0]
+        )
+
         def _print(msg: str) -> None:
             if verbose:
                 print(msg)
@@ -1197,6 +1223,14 @@ class PlaceFieldModel(SGDFittableMixin):
         elif self.init_mean is None:
             self._initialize_parameters()
 
+        # Numerical sanity check: validate init_cov is PSD and warn if
+        # the configuration is at risk of f32 NaN during the scan. Runs
+        # once here so the SGD loop's _sgd_loss_fn can skip re-validation
+        # (the eigvalsh call is not jit-traceable anyway).
+        _validate_filter_numerics(
+            self.init_cov, n_time=design_matrix.shape[0]
+        )
+
         return super().fit_sgd(
             design_matrix, spikes,
             optimizer=optimizer,
@@ -1273,6 +1307,10 @@ class PlaceFieldModel(SGDFittableMixin):
             process_cov=Q,
             log_conditional_intensity=self._log_intensity_func,
             max_log_count=self._max_log_count,
+            # fit_sgd validates once at the top before the SGD loop;
+            # skip per-step re-validation inside the jit'd loss fn
+            # (the eigvalsh would break tracing anyway).
+            validate_inputs=False,
         )
         return -marginal_ll
 
@@ -1309,6 +1347,8 @@ class PlaceFieldModel(SGDFittableMixin):
             log_conditional_intensity=self._log_intensity_func,
             return_filtered=True,
             max_log_count=self._max_log_count,
+            # fit_sgd validated at the top; skip per-call re-validation.
+            validate_inputs=False,
         )
         self.log_likelihoods = [float(marginal_ll)]
         # Saturation diagnostic: post-hoc check on the filtered posterior.
@@ -1551,6 +1591,9 @@ class PlaceFieldModel(SGDFittableMixin):
             process_cov=self.process_cov,
             log_conditional_intensity=self._log_intensity_func,
             max_log_count=self._max_log_count,
+            # init_cov was validated at fit time; skip O(d^3) eigvalsh
+            # on every score() call.
+            validate_inputs=False,
         )
         return float(marginal_ll)
 

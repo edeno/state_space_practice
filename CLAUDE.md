@@ -76,3 +76,34 @@ src/state_space_practice/
 - Tests use `pytest` with fixtures in `conftest.py`
 - Use `hypothesis` for property-based testing where appropriate
 - Test numerical properties (PSD covariances, probabilities sum to 1, etc.)
+
+## Numerical precision
+
+The Laplace-EKF filter (`stochastic_point_process_filter`,
+`stochastic_point_process_smoother`, and all callers including
+`PlaceFieldModel.fit` / `fit_sgd`) requires **float64** for long
+sequences. In float32, accumulated roundoff in the covariance
+propagation can drive the posterior covariance to lose PSD after a
+few hundred to a few thousand time bins — the exact number depends on
+the condition number of `init_cov`. The symptom is a silent NaN
+somewhere in the forward pass.
+
+**Always enable x64 before importing this library:**
+
+```python
+import jax
+jax.config.update("jax_enable_x64", True)
+
+# NOW import — the x64 flag must be set before any jax.numpy allocations
+from state_space_practice import PlaceFieldModel
+```
+
+The filter validates `init_cov` at the top of every public entry
+point. On a non-PSD prior it raises `ValueError` (the filter is
+guaranteed to NaN). On f32 + long T + ill-conditioned `init_cov` it
+emits a `UserWarning` pointing at the import-order recipe above.
+
+Test suites always run with x64 enabled (see `jax.config.update` in
+`tests/conftest.py`), so regression tests do not exercise the f32 NaN
+path. Production users who omit the x64 flag will see the warning on
+their first `fit` / `fit_sgd` call if their problem is at risk.

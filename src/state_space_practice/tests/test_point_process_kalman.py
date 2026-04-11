@@ -13,6 +13,7 @@ from state_space_practice.point_process_kalman import (
     PointProcessModel,
     _logdet_psd,
     _point_process_laplace_update,
+    _validate_filter_numerics,
     get_confidence_interval,
     kalman_maximization_step,
     log_conditional_intensity,
@@ -2329,3 +2330,150 @@ class TestLogdetPsd:
             got = _logdet_psd(jnp.eye(n))  # use default diagonal_boost=1e-9
             expected = n * float(jnp.log(1.0 + 1e-9))
             np.testing.assert_allclose(float(got), expected, atol=1e-12)
+
+
+class TestValidateFilterNumerics:
+    """Tests for ``_validate_filter_numerics``.
+
+    Regression test class for the f32-NaN observability story: the filter
+    should raise on non-PSD init_cov (guaranteed NaN) and warn on f32 +
+    long T + ill-conditioned configurations (likely NaN). This mirrors
+    the two failure modes in the user bug report:
+      Problem A: T=1501, d=36, cond=5e3, min_eig=2e-4 → NaN at bin 245
+      Problem B: T=28,373, d=64, cond=1e4, min_eig=9e-5 → NaN at step 2
+    """
+
+    def test_raises_on_non_psd_init_cov(self) -> None:
+        n = 8
+        bad = jnp.eye(n).at[0, 0].set(-0.5)  # indefinite — one negative eig
+        with pytest.raises(ValueError, match="not positive definite"):
+            _validate_filter_numerics(bad, n_time=100)
+
+    def test_raises_on_zero_eigenvalue(self) -> None:
+        """Rank-deficient matrix — min eigenvalue exactly 0."""
+        n = 8
+        A = jax.random.normal(jax.random.PRNGKey(0), (n, n // 2))
+        mat = A @ A.T  # rank n/2, min_eig == 0
+        with pytest.raises(ValueError, match="not positive definite"):
+            _validate_filter_numerics(mat, n_time=100)
+
+    def test_raises_on_non_square(self) -> None:
+        bad = jnp.zeros((5, 8))
+        with pytest.raises(ValueError, match="square 2D matrix"):
+            _validate_filter_numerics(bad, n_time=100)
+
+    def test_well_conditioned_psd_passes_silently(self) -> None:
+        """Well-conditioned f64 init_cov must produce neither error nor warning."""
+        import warnings
+
+        init_cov = jnp.eye(36) * 0.5  # cond=1, min_eig=0.5
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning would raise
+            _validate_filter_numerics(init_cov, n_time=10_000)
+
+    def test_no_warning_in_f64_on_long_ill_conditioned(self) -> None:
+        """f64 mode: even Problem B conditioning does NOT trigger a warning.
+
+        Tests run with jax_enable_x64=True (see module-level config), so
+        the f32-risk branch must not fire. This guards against regressions
+        where the validation would false-positive in the production
+        (f64-enabled) path.
+        """
+        import warnings
+
+        # Construct an init_cov with cond=1e4, min_eig=9e-5 — exactly
+        # the Problem B conditioning from the user's bug report.
+        n = 64
+        eigs = jnp.logspace(
+            jnp.log10(9e-5),
+            jnp.log10(9e-5 * 1e4),
+            n,
+        )
+        U, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(2), (n, n)))
+        init_cov = (U * eigs) @ U.T
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _validate_filter_numerics(init_cov, n_time=28_373)
+
+    def test_warns_on_f32_long_ill_conditioned(self) -> None:
+        """f32 init_cov on a long / ill-conditioned problem must warn.
+
+        The validator keys off ``init_covariance.dtype == float32``, so
+        explicitly casting an otherwise-valid init_cov to f32 is the
+        supported way to trigger the warning. We do NOT flip
+        ``jax_enable_x64`` mid-test because that corrupts pre-existing
+        f64 arrays in the test's scope.
+
+        The conditioning here matches Problem B from the user bug
+        report: T=28k, d=64, min_eig=9e-5, max_eig=0.9, cond ~1e4.
+        """
+        n = 64
+        eigs = jnp.logspace(
+            jnp.log10(9e-5),
+            jnp.log10(9e-5 * 1e4),
+            n,
+        )
+        U, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(2), (n, n)))
+        init_cov_f32 = ((U * eigs) @ U.T).astype(jnp.float32)
+
+        with pytest.warns(UserWarning, match="float32"):
+            _validate_filter_numerics(init_cov_f32, n_time=28_373)
+
+    def test_f32_short_well_conditioned_no_warning(self) -> None:
+        """f32 with a short, well-conditioned problem must NOT warn.
+
+        The warning is gated on estimated accumulated roundoff exceeding
+        half of min_eig. For T=100, d=10, min_eig=0.5, the roundoff
+        budget is comfortable and no warning should fire.
+        """
+        import warnings
+
+        init_cov_f32 = (jnp.eye(10) * 0.5).astype(jnp.float32)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            _validate_filter_numerics(init_cov_f32, n_time=100)
+
+    def test_validate_inputs_false_skips_check(self) -> None:
+        """``validate_inputs=False`` bypasses the validation layer.
+
+        We construct a tiny problem with an init_cov that:
+          - has a tiny (-1e-12) negative eigenvalue, so the validation
+            layer would raise with "not positive definite"
+          - is close enough to PSD that ``psd_solve``'s internal
+            ``diagonal_boost=1e-9`` rescues the Cholesky, so the
+            downstream scan completes without NaN
+
+        With validate_inputs=True (default), this raises ValueError
+        from the validator. With validate_inputs=False, the filter
+        runs to completion and produces finite output.
+        """
+        key = jax.random.PRNGKey(0)
+        T, n_state = 10, 4
+        dm = jax.random.normal(key, (T, n_state)) * 0.1
+        spikes = jnp.zeros(T, dtype=jnp.int32)
+        bad_init_cov = jnp.eye(n_state) * 0.5
+        bad_init_cov = bad_init_cov.at[0, 0].set(-1e-12)
+
+        # Default path: validation fires and raises.
+        with pytest.raises(ValueError, match="not positive definite"):
+            stochastic_point_process_filter(
+                jnp.zeros(n_state), bad_init_cov, dm, spikes, 0.01,
+                jnp.eye(n_state), jnp.eye(n_state) * 1e-6,
+                log_conditional_intensity,
+            )
+
+        # Opt-out path: validation is skipped, psd_solve's diagonal_boost
+        # rescues the Cholesky, and the filter produces finite output.
+        # (We don't assert output correctness — only that the validation
+        # layer was bypassed cleanly.)
+        filtered_mean, filtered_cov, mll = stochastic_point_process_filter(
+            jnp.zeros(n_state), bad_init_cov, dm, spikes, 0.01,
+            jnp.eye(n_state), jnp.eye(n_state) * 1e-6,
+            log_conditional_intensity,
+            validate_inputs=False,
+        )
+        assert jnp.all(jnp.isfinite(filtered_mean))
+        assert jnp.all(jnp.isfinite(filtered_cov))
+        assert jnp.isfinite(mll)

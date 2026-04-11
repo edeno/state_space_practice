@@ -29,6 +29,7 @@ References
 """
 
 import logging
+import warnings
 from typing import Callable, Optional
 
 import jax
@@ -47,6 +48,119 @@ from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import check_converged
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_filter_numerics(
+    init_covariance: Array,
+    n_time: int,
+    stacklevel: int = 3,
+) -> None:
+    """Validate init_cov positive definiteness + warn about f32 numerical risk.
+
+    Raises
+    ------
+    ValueError
+        If ``init_covariance`` is non-square, not symmetric, or has a
+        non-positive minimum eigenvalue. The filter's Cholesky-based
+        updates require *strict* positive definiteness — a rank-deficient
+        or indefinite input will NaN on the first Cholesky, so there is
+        no point running the forward pass.
+
+    Warns
+    -----
+    UserWarning
+        If ``init_covariance.dtype`` is ``float32`` AND the problem is
+        long enough / ill-conditioned enough that accumulated covariance
+        roundoff is likely to drive the predicted covariance below PSD
+        during the scan. The warning names the three risk factors
+        (T, n_state, cond) and tells the user the fix: enable float64
+        BEFORE importing the library.
+
+    Notes
+    -----
+    This helper runs at the top of each public entry point (``fit``,
+    ``fit_sgd``) once per call, then inner call sites pass
+    ``validate_inputs=False`` to skip re-validation. This matters for
+    two reasons:
+
+    1. The SGD loss function runs inside ``jax.jit``, which forbids the
+       ``eigvalsh → float(...)`` conversion used here. Inner calls must
+       bypass the check entirely.
+    2. EM iterations re-run the E-step hundreds of times on unchanged
+       ``init_cov``, so per-iteration re-validation wastes O(d^3) work
+       per iteration.
+
+    The pattern is: each model class's ``fit`` / ``fit_sgd`` validates
+    explicitly at the top of the public API call, and threads
+    ``validate_inputs=False`` through to inner ``_e_step``, ``_sgd_loss_fn``,
+    and ``_finalize_sgd`` methods.
+    """
+    if init_covariance.ndim != 2 or init_covariance.shape[0] != init_covariance.shape[1]:
+        raise ValueError(
+            f"init_covariance must be a square 2D matrix, got shape "
+            f"{init_covariance.shape}"
+        )
+
+    # Eigenvalue check. eigvalsh is O(d^3) but only runs once per filter
+    # invocation, vs d^3 per scan step — negligible.
+    init_cov_sym = symmetrize(init_covariance)
+    eigs = jnp.linalg.eigvalsh(init_cov_sym)
+    min_eig = float(eigs.min())
+    max_eig = float(eigs.max())
+
+    if min_eig <= 0:
+        raise ValueError(
+            f"init_covariance is not positive definite "
+            f"(min eigenvalue {min_eig:g}). The filter's Cholesky-based "
+            f"updates require strict positive definiteness; a rank-"
+            f"deficient or indefinite matrix will NaN on the first step. "
+            f"Check the warm-start or init_cov_scale parameter, or "
+            f"supply a known-PD matrix."
+        )
+
+    # Condition number. Cap the denominator to avoid divide-by-zero on
+    # an (already-filtered) perfectly-rank-deficient matrix.
+    cond = max_eig / max(min_eig, 1e-300)
+    n_state = int(init_covariance.shape[0])
+
+    # Check precision: the filter's scan body inherits its dtype from
+    # init_covariance (via jnp.asarray internally). If the caller passed
+    # an f32 array — either because jax_enable_x64 is off, or because
+    # they explicitly cast — the inner Cholesky solves and matrix
+    # products accumulate f32 roundoff. f64 arrays do not have this
+    # issue in practice.
+    is_f32 = init_covariance.dtype == jnp.float32
+
+    if is_f32:
+        # Rough upper bound on per-bin absolute covariance roundoff from
+        # the predict-step congruence (A @ P @ A^T + Q) and the Laplace
+        # update (psd_solve'd precision). The constants come from
+        # standard error-analysis bounds for Cholesky; we use a
+        # conservative ~sqrt(n_state) factor and f32 machine epsilon
+        # ~1.2e-7. Accumulated over n_time bins (random-walk model),
+        # total roundoff ~ n_time * sqrt(n_state) * eps * max_eig.
+        f32_eps = 1.2e-7
+        worst_roundoff = (
+            float((n_time * n_state) ** 0.5) * f32_eps * max_eig
+        )
+        if worst_roundoff > 0.5 * min_eig:
+            warnings.warn(
+                f"stochastic_point_process_filter running in float32 with "
+                f"a long / ill-conditioned problem: "
+                f"T={n_time}, n_state={n_state}, "
+                f"init_cov condition number {cond:.1e}, "
+                f"min_eig {min_eig:.2e}, max_eig {max_eig:.2e}. "
+                f"Estimated accumulated covariance roundoff "
+                f"({worst_roundoff:.2e}) exceeds half of min_eig, which "
+                f"means the predict step's covariance is likely to lose "
+                f"PSD during the scan and produce NaN. Enable float64 "
+                f"BEFORE importing state_space_practice:\n"
+                f"    import jax\n"
+                f"    jax.config.update('jax_enable_x64', True)\n"
+                f"    # now import state_space_practice models",
+                UserWarning,
+                stacklevel=stacklevel,
+            )
 
 
 def log_conditional_intensity(design_matrix: ArrayLike, params: ArrayLike) -> Array:
@@ -407,6 +521,7 @@ def stochastic_point_process_filter(
     log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
     include_laplace_normalization: bool = True,
     max_log_count: float = 20.0,
+    validate_inputs: bool = True,
 ) -> tuple[Array, Array, Array]:
     """Applies a Stochastic State Point Process Filter (SSPPF).
 
@@ -493,6 +608,21 @@ def stochastic_point_process_filter(
     latent state. More neurons provide more information, reducing posterior
     uncertainty.
 
+    Numerical precision
+    -------------------
+    This filter requires **float64** for reliable long-sequence fits.
+    In float32, accumulated roundoff in the covariance propagation can
+    drive the posterior covariance below PSD after ~250-5000 time bins
+    (depending on ``init_covariance_params`` conditioning), producing
+    silent NaN output. Enable float64 BEFORE importing this module::
+
+        import jax
+        jax.config.update("jax_enable_x64", True)
+
+    The entry-point validation (``validate_inputs=True``, default) warns
+    when the dtype-and-conditioning combination is at risk and raises
+    when ``init_covariance_params`` is not positive definite.
+
     References
     ----------
     [1] Eden, U. T., Frank, L. M., Barbieri, R., Solo, V. & Brown, E. N.
@@ -506,6 +636,17 @@ def stochastic_point_process_filter(
     spike_indicator = jnp.asarray(spike_indicator)
     transition_matrix = jnp.asarray(transition_matrix)
     process_cov = jnp.asarray(process_cov)
+
+    # Numerical sanity check. Raises on non-PSD init_cov, warns on f32 +
+    # long T + ill-conditioned configurations. Gated behind
+    # ``validate_inputs`` so tight inner loops (e.g. SGD) can pass False
+    # after a single validation at the top of fit_sgd. stacklevel=4 so
+    # the warning points at the user's call site: user -> fit_sgd ->
+    # _sgd_loss_fn -> stochastic_point_process_filter -> _validate.
+    if validate_inputs:
+        _validate_filter_numerics(
+            init_covariance_params, n_time=spike_indicator.shape[0], stacklevel=4
+        )
 
     # Promote single-neuron spike_indicator to (n_time, 1) for consistent handling
     single_neuron = spike_indicator.ndim == 1
@@ -591,6 +732,7 @@ def stochastic_point_process_smoother(
     include_laplace_normalization: bool = True,
     return_filtered: bool = False,
     max_log_count: float = 20.0,
+    validate_inputs: bool = True,
 ) -> tuple[Array, ...]:
     """Applies a Stochastic State Point Process Smoother (SSPPS).
 
@@ -670,6 +812,7 @@ def stochastic_point_process_smoother(
             log_conditional_intensity,
             include_laplace_normalization=include_laplace_normalization,
             max_log_count=max_log_count,
+            validate_inputs=validate_inputs,
         )
     )
 
@@ -1030,6 +1173,9 @@ class PointProcessModel(SGDFittableMixin):
             transition_matrix=self.transition_matrix,
             process_cov=self.process_cov,
             log_conditional_intensity=self.log_intensity_func,
+            # fit() validates once at entry; skip re-validation on each
+            # EM iteration's E-step.
+            validate_inputs=False,
         )
 
         # Also store filtered results
@@ -1042,6 +1188,7 @@ class PointProcessModel(SGDFittableMixin):
             transition_matrix=self.transition_matrix,
             process_cov=self.process_cov,
             log_conditional_intensity=self.log_intensity_func,
+            validate_inputs=False,
         )
 
         return float(marginal_log_likelihood)
@@ -1103,6 +1250,12 @@ class PointProcessModel(SGDFittableMixin):
         """
         design_matrix = jnp.asarray(design_matrix)
         spike_indicator = jnp.asarray(spike_indicator)
+
+        # Numerical sanity check once at the top: validate PSD and warn
+        # on f32 risk. Skips per-iteration re-validation in the E-step.
+        _validate_filter_numerics(
+            jnp.asarray(self.init_cov), n_time=spike_indicator.shape[0]
+        )
 
         log_likelihoods: list[float] = []
         previous_log_likelihood = -jnp.inf
@@ -1181,6 +1334,14 @@ class PointProcessModel(SGDFittableMixin):
         self._sgd_design_matrix = design_matrix
         self._sgd_spike_indicator = spike_indicator
 
+        # Numerical sanity check once at the top: validate PSD and warn
+        # on f32 risk. The SGD loss_fn runs inside jax.jit, which cannot
+        # call eigvalsh's host-side float() conversion, so per-step
+        # re-validation is both wasteful and forbidden.
+        _validate_filter_numerics(
+            jnp.asarray(self.init_cov), n_time=spike_indicator.shape[0]
+        )
+
         return super().fit_sgd(
             design_matrix, spike_indicator,
             optimizer=optimizer,
@@ -1238,6 +1399,9 @@ class PointProcessModel(SGDFittableMixin):
             transition_matrix=A,
             process_cov=Q,
             log_conditional_intensity=self.log_intensity_func,
+            # fit_sgd validated once at the top; skip per-step
+            # re-validation inside the jit'd loss fn.
+            validate_inputs=False,
         )
         return -marginal_ll
 
@@ -1268,6 +1432,7 @@ class PointProcessModel(SGDFittableMixin):
             transition_matrix=self.transition_matrix,
             process_cov=self.process_cov,
             log_conditional_intensity=self.log_intensity_func,
+            validate_inputs=False,  # validated at fit_sgd entry
         )
         self.filtered_mean, self.filtered_cov, _ = stochastic_point_process_filter(
             init_mean_params=self.init_mean,
@@ -1278,6 +1443,7 @@ class PointProcessModel(SGDFittableMixin):
             transition_matrix=self.transition_matrix,
             process_cov=self.process_cov,
             log_conditional_intensity=self.log_intensity_func,
+            validate_inputs=False,  # validated at fit_sgd entry
         )
         self.log_likelihood_ = float(marginal_ll)
 
