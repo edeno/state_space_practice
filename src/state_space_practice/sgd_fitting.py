@@ -97,6 +97,14 @@ class SGDFittableMixin:
         optimizer = optax.masked(optimizer, trainable_mask)
         opt_state = optimizer.init(unc_params)
 
+        # jit is essential for performance: without it, every step retraces
+        # the full filter graph through Python dispatch (~65x slower on CPU,
+        # more on GPU due to per-primitive host/device sync). Safe because
+        # nothing inside self mutates during the SGD loop below —
+        # _store_sgd_params only runs after the loop. If a subclass ever
+        # mutates self attributes inside _sgd_loss_fn, jit will silently
+        # freeze stale values; keep that invariant.
+        @jax.jit
         @jax.value_and_grad
         def loss_fn(unc_p):
             p = transform_to_constrained(unc_p, param_spec)
