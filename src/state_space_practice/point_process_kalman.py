@@ -119,6 +119,7 @@ def _point_process_laplace_update(
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 1,
     line_search_beta: float = 0.5,
+    max_log_count: float = 20.0,
 ) -> tuple[Array, Array, Array]:
     """Single point-process Laplace-EKF update for multiple neurons.
 
@@ -189,6 +190,14 @@ def _point_process_laplace_update(
         Step size reduction factor for backtracking line search. Only used
         when max_newton_iter > 1. At each iteration, step size is halved
         until the negative log-posterior decreases or minimum alpha reached.
+    max_log_count : float, default=20.0
+        Ceiling on ``log(rate * dt)`` applied inside ``_safe_expected_count``
+        to prevent overflow when the Fisher step produces implausibly large
+        intensities. Callers should set this to a physiologically motivated
+        value, e.g. ``log(max_firing_rate_hz * dt)``. The default of 20.0
+        corresponds to ~2.4e9 Hz at dt=0.2s, which is high enough to mask
+        pathological outlier bins; tighter ceilings (e.g. ``log(500 * dt)``)
+        catch them.
     Returns
     -------
     posterior_mean : Array, shape (n_latent,)
@@ -242,7 +251,7 @@ def _point_process_laplace_update(
     def _neg_log_posterior(x: Array) -> Array:
         """Negative log-posterior for line search."""
         log_lambda = log_intensity_func(x)
-        cond_int = _safe_expected_count(log_lambda, dt)
+        cond_int = _safe_expected_count(log_lambda, dt, max_log_count=max_log_count)
         # Poisson log-likelihood (ignoring constant log(y!) term)
         # No floor needed: _safe_expected_count guarantees cond_int >= exp(-20) > 0
         log_lik = jnp.sum(spike_indicator_t * jnp.log(cond_int) - cond_int)
@@ -265,7 +274,9 @@ def _point_process_laplace_update(
             post_prec = prior_precision + J' diag(lambda * dt) J
         """
         log_lambda = log_intensity_func(x)
-        conditional_intensity = _safe_expected_count(log_lambda, dt)
+        conditional_intensity = _safe_expected_count(
+            log_lambda, dt, max_log_count=max_log_count
+        )
         innovation = spike_indicator_t - conditional_intensity
         jacobian = grad_log_intensity(x)
 
@@ -320,7 +331,9 @@ def _point_process_laplace_update(
         # Single-step Fisher scoring (no line search overhead).
         # Evaluate at prior mean (one_step_mean), so prior gradient is zero.
         log_lambda = log_intensity_func(one_step_mean)
-        conditional_intensity = _safe_expected_count(log_lambda, dt)
+        conditional_intensity = _safe_expected_count(
+            log_lambda, dt, max_log_count=max_log_count
+        )
         innovation = spike_indicator_t - conditional_intensity
         jacobian = grad_log_intensity(one_step_mean)
         # Likelihood gradient only; prior gradient = -P^{-1}(x - m) = 0 at x = m
@@ -348,7 +361,9 @@ def _point_process_laplace_update(
 
     # Log-likelihood at posterior mode (approximate)
     log_lambda_mode = log_intensity_func(posterior_mean)
-    conditional_intensity_mode = _safe_expected_count(log_lambda_mode, dt)
+    conditional_intensity_mode = _safe_expected_count(
+        log_lambda_mode, dt, max_log_count=max_log_count
+    )
     log_likelihood = jnp.sum(
         jax.scipy.stats.poisson.logpmf(spike_indicator_t, conditional_intensity_mode)
     )
@@ -376,6 +391,7 @@ def stochastic_point_process_filter(
     process_cov: ArrayLike,
     log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
     include_laplace_normalization: bool = True,
+    max_log_count: float = 20.0,
 ) -> tuple[Array, Array, Array]:
     """Applies a Stochastic State Point Process Filter (SSPPF).
 
@@ -432,6 +448,14 @@ def stochastic_point_process_filter(
         If True, include Laplace normalization and prior terms in the
         marginal log-likelihood. If False, return the plug-in log-likelihood
         at the posterior mode without normalization.
+    max_log_count : float, default=20.0
+        Ceiling on ``log(rate * dt)`` used by the Laplace update's safe
+        exponentiation to prevent overflow on pathological spike counts.
+        Pass a physiologically motivated value (e.g.
+        ``log(max_firing_rate_hz * dt)``) to catch outlier bins that would
+        otherwise drive the Fisher step into a catastrophic region. The
+        default of 20.0 corresponds to ~2.4e9 Hz at dt=0.2s and is kept
+        for backwards compatibility with existing callers.
 
     Returns
     -------
@@ -517,6 +541,7 @@ def stochastic_point_process_filter(
             log_intensity_func,
             grad_log_intensity_func=grad_log_intensity_func,
             include_laplace_normalization=include_laplace_normalization,
+            max_log_count=max_log_count,
         )
 
         marginal_log_likelihood += log_lik
@@ -550,6 +575,7 @@ def stochastic_point_process_smoother(
     log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
     include_laplace_normalization: bool = True,
     return_filtered: bool = False,
+    max_log_count: float = 20.0,
 ) -> tuple[Array, ...]:
     """Applies a Stochastic State Point Process Smoother (SSPPS).
 
@@ -628,6 +654,7 @@ def stochastic_point_process_smoother(
             process_cov,
             log_conditional_intensity,
             include_laplace_normalization=include_laplace_normalization,
+            max_log_count=max_log_count,
         )
     )
 
@@ -771,6 +798,7 @@ def steepest_descent_point_process_filter(
     dt: float,
     epsilon: ArrayLike,
     log_receptive_field_model: Callable[[ArrayLike, ArrayLike], Array],
+    max_log_count: float = 20.0,
 ) -> Array:
     """Steepest Descent Point Process Filter (SDPPF)
 
@@ -787,6 +815,12 @@ def steepest_descent_point_process_filter(
         Learning rate
     log_receptive_field_model : callable
         Function that takes in `x` and parameters and returns the log spike rate
+    max_log_count : float, default=20.0
+        Ceiling on ``log(rate * dt)`` applied inside ``_safe_expected_count``
+        to prevent overflow on pathological spike counts. Pass a physiologically
+        motivated value (e.g. ``log(max_firing_rate_hz * dt)``) if you expect
+        outlier bins. The default of 20.0 matches the Laplace-EKF filter's
+        default for backwards compatibility.
 
     Returns
     -------
@@ -821,7 +855,9 @@ def steepest_descent_point_process_filter(
         """Steepest Descent Point Process Filter update step"""
         x_t, spike_indicator_t = args
         conditional_intensity = _safe_expected_count(
-            log_receptive_field_model(x_t, mean_prev), dt
+            log_receptive_field_model(x_t, mean_prev),
+            dt,
+            max_log_count=max_log_count,
         )
         innovation = spike_indicator_t - conditional_intensity
         one_step_grad = grad_log_receptive_field_model(x_t, mean_prev)

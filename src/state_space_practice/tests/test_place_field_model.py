@@ -1,5 +1,7 @@
 """Tests for the PlaceFieldModel class and supporting functions."""
 
+import warnings
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -908,3 +910,143 @@ class TestPlaceFieldSGDFitting:
         )
         assert model.smoother_mean is not None
         assert model.filtered_mean is not None
+
+
+class TestMaxFiringRateHz:
+    """Tests for the ``max_firing_rate_hz`` ceiling and saturation warning."""
+
+    def test_default_ceiling_matches_physiology(self) -> None:
+        """Default ceiling corresponds to ``log(500 * dt)``."""
+        model = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        expected = float(np.log(500.0 * 0.02))  # log(10) ≈ 2.3
+        assert np.isclose(model._max_log_count, expected)
+
+    def test_invalid_max_firing_rate_rejected(self) -> None:
+        """Non-positive max_firing_rate_hz must raise."""
+        with pytest.raises(ValueError, match="max_firing_rate_hz must be positive"):
+            PlaceFieldModel(
+                dt=0.02, n_interior_knots=3, max_firing_rate_hz=0.0
+            )
+        with pytest.raises(ValueError, match="max_firing_rate_hz must be positive"):
+            PlaceFieldModel(
+                dt=0.02, n_interior_knots=3, max_firing_rate_hz=-10.0
+            )
+
+    def test_ceiling_caps_marginal_ll_on_pathological_bin(self) -> None:
+        """Pathological outlier bin must not drive marginal LL to -1e8.
+
+        Regression for the original bug report: a single bin with 5926
+        spikes (vs 0-10 in neighbors) caused Laplace-EKF's first marginal
+        LL to reach ~-4.86e8 with the default max_log_count=20. With the
+        physiological ceiling max_firing_rate_hz=500 Hz at dt=0.2s, the
+        per-bin Poisson logpmf contribution is bounded by
+        ``5926 * log(100) - 100 - lgamma(5927)`` ≈ -21k. Accounting for
+        Laplace normalization and the quadratic prior term on a single
+        outlier bin, the total LL over 200 bins must stay above -1e5.
+        The uncapped (default=20) path produces ~-1e8, so the gap is huge.
+        """
+        from state_space_practice.point_process_kalman import (
+            log_conditional_intensity,
+            stochastic_point_process_filter,
+        )
+
+        key = jax.random.PRNGKey(0)
+        n_time, n_basis = 200, 16
+        dt = 0.2
+        # Tight design matrix with modest weights; typical bins have O(1) spikes.
+        Z = jax.random.normal(key, (n_time, n_basis)) * 0.3
+        spikes = jax.random.poisson(
+            jax.random.split(key, 1)[0], jnp.full((n_time,), 1.0)
+        )
+        # Inject the pathological count in the middle of the series so the
+        # filter has context on both sides.
+        spikes = spikes.at[n_time // 2].set(5926)
+
+        m0 = jnp.zeros(n_basis)
+        P0 = jnp.eye(n_basis) * 0.01  # tight prior
+        A = jnp.eye(n_basis)
+        Q = jnp.eye(n_basis) * 1e-7
+
+        # WITH the physiological ceiling (max_log_count = log(500 * 0.2) ≈ 4.6)
+        _, _, mll_capped = stochastic_point_process_filter(
+            m0, P0, Z, spikes, dt, A, Q,
+            log_conditional_intensity,
+            max_log_count=float(np.log(500.0 * dt)),
+        )
+        # WITHOUT (default of 20) — the old catastrophic-LL path
+        _, _, mll_default = stochastic_point_process_filter(
+            m0, P0, Z, spikes, dt, A, Q,
+            log_conditional_intensity,
+        )
+
+        # The physiological ceiling must keep the total marginal LL within
+        # the analytical bound (~-21k for the one bad bin, plus -O(1) from
+        # the 199 good bins and the Laplace normalization).
+        assert jnp.isfinite(mll_capped)
+        assert mll_capped > -1e5, (
+            f"ceiling should keep LL > -1e5 (analytical bound ~-21k for the "
+            f"outlier bin); got {float(mll_capped):.2e}"
+        )
+        # And it must be dramatically better than the default-ceiling LL on
+        # this pathological input (default path produces ~-1e8).
+        assert mll_capped - mll_default > 1e5, (
+            f"ceiling should improve LL by >1e5; got capped={float(mll_capped):.2e} "
+            f"default={float(mll_default):.2e}"
+        )
+
+    def test_saturation_warning_machinery_does_not_crash(
+        self, sim_data: dict
+    ) -> None:
+        """The saturation check must run cleanly on the ``fit_sgd`` forward path.
+
+        Note: this test does NOT assert that the warning fires. With a
+        tight prior (``init_cov_scale=0.01``) and a single outlier bin,
+        the Laplace-EKF posterior mean is pulled back toward the prior
+        at that bin and may not reach the 500 Hz ceiling, even though the
+        *data* clearly would. That's the expected behavior of a well-
+        regularized filter — the whole point of this commit is that
+        outlier bins no longer blow up the LL. A test that hard-asserts
+        the warning fires would be brittle.
+
+        What this test checks:
+        1. ``fit_sgd`` completes without crashing when given a bin with
+           a 1000-spike artifact (this used to produce catastrophic LLs).
+        2. If the warning does fire, its message has the expected format.
+        3. The saturation check itself (vmap, shape handling) runs without
+           dtype or shape errors on realistic input.
+        """
+        import optax
+
+        # Inject an artifact spike flood into the middle of the series.
+        spikes = np.asarray(sim_data["spikes"])
+        if spikes.ndim == 2:
+            spikes = spikes.squeeze(axis=-1)
+        spikes = spikes.astype(np.int64).copy()
+        bad_idx = spikes.shape[0] // 2
+        spikes[bad_idx] = 1000  # far above any physiological rate
+
+        model = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3,
+            init_process_noise=1e-5, init_cov_scale=0.01,
+            max_firing_rate_hz=500.0,
+        )
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(10.0), optax.adam(1e-3),
+        )
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            lls = model.fit_sgd(
+                sim_data["position"], spikes,
+                optimizer=optimizer, num_steps=5,
+            )
+        # Core assertion: the forward path completed and returned finite LLs.
+        assert all(np.isfinite(ll) for ll in lls), (
+            f"fit_sgd must return finite LLs on outlier data, got {lls}"
+        )
+        # If the warning fired, it must name the configured ceiling.
+        saturation_warnings = [
+            w for w in captured
+            if "saturated" in str(w.message).lower()
+        ]
+        for w in saturation_warnings:
+            assert "max_firing_rate_hz" in str(w.message)

@@ -33,6 +33,7 @@ References
 """
 
 import logging
+import warnings
 from typing import Callable, Optional
 
 import jax
@@ -210,6 +211,17 @@ class PlaceFieldModel(SGDFittableMixin):
         Scale for the initial state covariance (init_cov = I * init_cov_scale).
         Controls how uncertain the initial weight estimates are. Larger values
         allow faster initial adaptation but may cause instability.
+    max_firing_rate_hz : float, default=500.0
+        Physiologically motivated ceiling on the instantaneous firing rate.
+        Used to set ``max_log_count = log(max_firing_rate_hz * dt)`` inside
+        the Laplace-EKF filter's safe-exponentiation clip. Pathological bins
+        (e.g. artifact counts, mis-binned spike floods) that would otherwise
+        drive the Fisher step into a catastrophic log-likelihood region are
+        clipped to this ceiling; the user is warned at the end of the fit
+        if more than 0.1%% of bin/neuron combinations saturate, which usually
+        indicates a data-quality issue upstream. The default of 500 Hz is
+        conservative for CA1 pyramidal cells (<100 Hz peak) and generous
+        enough not to clip fast-spiking interneurons under normal conditions.
     log_intensity_func : callable or None, default=None
         Custom log-intensity function with signature
         ``(design_matrix, params) -> log_rate``. If None, uses the default
@@ -258,6 +270,7 @@ class PlaceFieldModel(SGDFittableMixin):
         update_transition_matrix: bool = False,
         update_process_cov: bool = True,
         update_init_state: bool = True,
+        max_firing_rate_hz: float = 500.0,
     ):
         if dt <= 0:
             raise ValueError(f"dt must be positive, got {dt}")
@@ -270,12 +283,17 @@ class PlaceFieldModel(SGDFittableMixin):
                 f"process_noise_structure must be 'diagonal' or 'isotropic', "
                 f"got '{process_noise_structure}'"
             )
+        if max_firing_rate_hz <= 0:
+            raise ValueError(
+                f"max_firing_rate_hz must be positive, got {max_firing_rate_hz}"
+            )
 
         self.dt = dt
         self.n_interior_knots = n_interior_knots
         self.process_noise_structure = process_noise_structure
         self.init_process_noise = init_process_noise
         self.init_cov_scale = init_cov_scale
+        self.max_firing_rate_hz = max_firing_rate_hz
         self._log_intensity_func = (
             log_intensity_func if log_intensity_func is not None
             else log_conditional_intensity
@@ -475,6 +493,79 @@ class PlaceFieldModel(SGDFittableMixin):
         self.init_mean = jnp.zeros(n)
         self.init_cov = jnp.eye(n) * self.init_cov_scale
 
+    @property
+    def _max_log_count(self) -> float:
+        """Physiological ceiling converted to ``log(rate * dt)``.
+
+        Used by the Laplace-EKF filter's safe-exponentiation clip. A posterior
+        that saturates this value indicates a data-quality issue (e.g. a
+        pathological outlier bin from mis-binned spikes).
+        """
+        # Plain NumPy is fine here: this is a scalar computed on concrete
+        # Python floats, not a traced JAX value.
+        return float(np.log(self.max_firing_rate_hz * self.dt))
+
+    # Fraction of bin/neuron combinations allowed to saturate the firing-rate
+    # ceiling before the saturation warning fires. Chosen so that a single
+    # bad bin in a 1000-bin session does trigger the warning (one bin out of
+    # ~1000 is ~0.1%) while random near-ceiling fluctuations in a well-behaved
+    # session do not. Raise this if you have so many bad bins that you want
+    # only the worst offenders to produce warnings.
+    _SATURATION_WARN_FRAC = 1e-3
+
+    def _warn_if_rate_saturated(
+        self,
+        design_matrix: Array,
+        posterior_mean: Array,
+        context: str,
+    ) -> None:
+        """Emit a warning if enough filtered bin/neuron log-counts saturate.
+
+        Computes ``log_rate + log(dt)`` at the posterior mean for each time
+        bin and checks how many entries reach the Laplace-EKF clip ceiling
+        (``self._max_log_count``). If more than ``_SATURATION_WARN_FRAC``
+        of entries saturate, emits a ``UserWarning`` naming the count so
+        the user can investigate upstream data quality rather than silently
+        accept a clipped fit.
+
+        Parameters
+        ----------
+        design_matrix : Array, shape (n_time, n_basis) or (n_time, n_neurons, n_basis)
+            Same design matrix passed to the filter/smoother.
+        posterior_mean : Array, shape (n_time, n_state)
+            Filtered (or smoothed) posterior means ``x_{k|k}``.
+        context : str
+            Method name for the warning message (``"fit"`` or ``"fit_sgd"``).
+        """
+        # log_intensity_func(Z_t, x_t) returns a scalar (single-neuron) or
+        # (n_neurons,) (multi-neuron). vmap over time to get log-rates for
+        # every bin, then flatten so the count logic is shape-agnostic.
+        log_rates = jax.vmap(self._log_intensity_func)(
+            design_matrix, posterior_mean
+        )
+        log_counts = log_rates + float(np.log(self.dt))
+        log_counts_flat = jnp.ravel(log_counts)
+
+        ceiling = self._max_log_count
+        n_saturated = int(jnp.sum(log_counts_flat >= ceiling))
+        n_total = int(log_counts_flat.size)
+        if n_total == 0:
+            return
+        frac = n_saturated / n_total
+        if frac > self._SATURATION_WARN_FRAC:
+            msg = (
+                f"PlaceFieldModel.{context}: {n_saturated}/{n_total} "
+                f"({100 * frac:.2f}%) bin/neuron log-counts saturated the "
+                f"max_firing_rate_hz={self.max_firing_rate_hz:g} Hz ceiling "
+                f"(max_log_count={ceiling:g}). This usually indicates a "
+                f"data-quality issue (e.g. mis-binned spikes, artifact "
+                f"counts, or an overly tight ceiling). Check your spike "
+                f"binning and consider raising max_firing_rate_hz if the "
+                f"ceiling is genuinely too tight for your neuron population."
+            )
+            logger.warning(msg)
+            warnings.warn(msg, UserWarning, stacklevel=2)
+
     def _e_step(
         self, design_matrix: Array, spikes: Array
     ) -> float:
@@ -500,6 +591,7 @@ class PlaceFieldModel(SGDFittableMixin):
             process_cov=self.process_cov,
             log_conditional_intensity=self._log_intensity_func,
             return_filtered=True,
+            max_log_count=self._max_log_count,
         )
         return float(marginal_ll)
 
@@ -748,6 +840,14 @@ class PlaceFieldModel(SGDFittableMixin):
             _print(f"  WARNING: {msg}")
             logger.warning(msg)
 
+        # Saturation diagnostic: post-hoc check on the final filtered posterior.
+        # Runs after fit completes so a substantial fraction of clipped bins
+        # surfaces as a warning rather than a silently degraded fit.
+        if self.filtered_mean is not None:
+            self._warn_if_rate_saturated(
+                design_matrix, self.filtered_mean, context="fit"
+            )
+
         return self.log_likelihoods
 
     # --- SGDFittableMixin protocol ---
@@ -875,6 +975,7 @@ class PlaceFieldModel(SGDFittableMixin):
             transition_matrix=A,
             process_cov=Q,
             log_conditional_intensity=self._log_intensity_func,
+            max_log_count=self._max_log_count,
         )
         return -marginal_ll
 
@@ -910,8 +1011,16 @@ class PlaceFieldModel(SGDFittableMixin):
             process_cov=self.process_cov,
             log_conditional_intensity=self._log_intensity_func,
             return_filtered=True,
+            max_log_count=self._max_log_count,
         )
         self.log_likelihoods = [float(marginal_ll)]
+        # Saturation diagnostic: post-hoc check on the filtered posterior.
+        # If a substantial fraction of bins saturate the physiological
+        # ceiling, the filter output is unreliable.
+        assert self.filtered_mean is not None
+        self._warn_if_rate_saturated(
+            design_matrix, self.filtered_mean, context="fit_sgd"
+        )
 
     def predict_rate_map(
         self,
@@ -962,7 +1071,6 @@ class PlaceFieldModel(SGDFittableMixin):
         assert self.smoother_mean is not None
         assert self.smoother_cov is not None
 
-        import warnings
         if self._log_intensity_func is not log_conditional_intensity:
             warnings.warn(
                 "predict_rate_map uses the linear approximation exp(Z @ x). "
@@ -1145,6 +1253,7 @@ class PlaceFieldModel(SGDFittableMixin):
             transition_matrix=self.transition_matrix,
             process_cov=self.process_cov,
             log_conditional_intensity=self._log_intensity_func,
+            max_log_count=self._max_log_count,
         )
         return float(marginal_ll)
 
