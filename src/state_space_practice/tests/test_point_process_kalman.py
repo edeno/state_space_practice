@@ -10,7 +10,10 @@ import numpy as np
 import pytest
 
 from state_space_practice.point_process_kalman import (
+    BlockDiagonalStructure,
     PointProcessModel,
+    _detect_block_diagonal_problem,
+    _is_block_diagonal,
     _logdet_psd,
     _point_process_laplace_update,
     _validate_filter_numerics,
@@ -2477,3 +2480,253 @@ class TestValidateFilterNumerics:
         assert jnp.all(jnp.isfinite(filtered_mean))
         assert jnp.all(jnp.isfinite(filtered_cov))
         assert jnp.isfinite(mll)
+
+
+class TestIsBlockDiagonal:
+    """Tests for the ``_is_block_diagonal`` low-level predicate."""
+
+    def test_identity_is_block_diagonal(self) -> None:
+        assert _is_block_diagonal(jnp.eye(12), n_blocks=3, block_size=4)
+
+    def test_diag_matrix_is_block_diagonal(self) -> None:
+        assert _is_block_diagonal(jnp.diag(jnp.arange(8.0)), n_blocks=4, block_size=2)
+
+    def test_wrong_total_size_returns_false(self) -> None:
+        # 10 != 3 * 4 = 12
+        assert not _is_block_diagonal(jnp.eye(10), n_blocks=3, block_size=4)
+
+    def test_non_square_returns_false(self) -> None:
+        assert not _is_block_diagonal(jnp.zeros((4, 8)), n_blocks=2, block_size=4)
+
+    def test_non_block_diagonal_returns_false(self) -> None:
+        # Dense symmetric matrix with random cross-block entries.
+        A = jax.random.normal(jax.random.PRNGKey(0), (6, 6))
+        A = A @ A.T + jnp.eye(6)
+        assert not _is_block_diagonal(A, n_blocks=2, block_size=3)
+
+    def test_n_blocks_one_is_trivially_block_diagonal(self) -> None:
+        """A single block IS the whole matrix — trivially block-diagonal."""
+        A = jax.random.normal(jax.random.PRNGKey(1), (4, 4))
+        A = A @ A.T
+        assert _is_block_diagonal(A, n_blocks=1, block_size=4)
+
+    def test_genuine_block_diagonal_detected(self) -> None:
+        # Construct a (2-block, 3-per-block) block-diagonal matrix.
+        b0 = jnp.array([[2.0, 0.5, 0.1], [0.5, 1.0, 0.2], [0.1, 0.2, 3.0]])
+        b1 = jnp.array([[1.5, 0.3, 0.0], [0.3, 2.0, 0.4], [0.0, 0.4, 1.0]])
+        A = jnp.zeros((6, 6)).at[:3, :3].set(b0).at[3:, 3:].set(b1)
+        assert _is_block_diagonal(A, n_blocks=2, block_size=3)
+
+    def test_tolerance_allows_small_off_block_noise(self) -> None:
+        """Off-block entries within ``atol`` should be treated as zero."""
+        A = jnp.eye(6)
+        A = A.at[0, 3].set(1e-12)  # tiny cross-block entry
+        A = A.at[3, 0].set(1e-12)
+        assert _is_block_diagonal(A, n_blocks=2, block_size=3, atol=1e-10)
+        assert not _is_block_diagonal(A, n_blocks=2, block_size=3, atol=1e-14)
+
+
+class TestDetectBlockDiagonalProblem:
+    """Tests for the ``_detect_block_diagonal_problem`` dispatch helper.
+
+    Regression test class for the block-diagonal filter specialization.
+    Detection must only return non-None for genuinely block-diagonal
+    problems — a false positive would dispatch to the block filter on a
+    dense problem and produce wrong results.
+    """
+
+    def _make_block_problem(self, n_neurons: int, block_size: int, T: int = 20):
+        """Construct a well-formed block-diagonal filter problem."""
+        key = jax.random.PRNGKey(0)
+        keys = jax.random.split(key, 3)
+
+        # Per-neuron dynamics (identical across neurons)
+        A_block = jnp.eye(block_size)
+        Q_block = jnp.eye(block_size) * 1e-4
+
+        # Block-diagonal expansion
+        n_state = n_neurons * block_size
+        A = jnp.zeros((n_state, n_state))
+        Q = jnp.zeros((n_state, n_state))
+        for j in range(n_neurons):
+            A = A.at[j * block_size:(j + 1) * block_size,
+                     j * block_size:(j + 1) * block_size].set(A_block)
+            Q = Q.at[j * block_size:(j + 1) * block_size,
+                     j * block_size:(j + 1) * block_size].set(Q_block)
+
+        # Block-diagonal init_cov (per-neuron distinct)
+        init_cov = jnp.zeros((n_state, n_state))
+        for j in range(n_neurons):
+            block = jnp.eye(block_size) * (0.1 + 0.05 * j)
+            init_cov = init_cov.at[j * block_size:(j + 1) * block_size,
+                                    j * block_size:(j + 1) * block_size].set(block)
+
+        init_mean = jax.random.normal(keys[0], (n_state,)) * 0.1
+
+        # Block-diagonal design matrix: Z_base of shape (T, block_size),
+        # expanded so neuron j's row has Z_base in its own slice, zeros elsewhere.
+        Z_base = jax.random.normal(keys[1], (T, block_size)) * 0.3
+        Z = jnp.zeros((T, n_neurons, n_state))
+        for j in range(n_neurons):
+            Z = Z.at[:, j, j * block_size:(j + 1) * block_size].set(Z_base)
+
+        return init_mean, init_cov, A, Q, Z, Z_base
+
+    def test_detects_genuine_block_diagonal_3_neurons(self) -> None:
+        m, P, A, Q, Z, Z_base_ref = self._make_block_problem(
+            n_neurons=3, block_size=4
+        )
+        result = _detect_block_diagonal_problem(m, P, A, Q, Z)
+        assert isinstance(result, BlockDiagonalStructure)
+        assert result.n_neurons == 3
+        assert result.block_size == 4
+        # A_block and Q_block extracted from the (0, 0) slice
+        np.testing.assert_allclose(
+            np.asarray(result.A_block), np.asarray(jnp.eye(4))
+        )
+        # Z_base should match the first neuron's slice
+        np.testing.assert_allclose(
+            np.asarray(result.Z_base), np.asarray(Z_base_ref)
+        )
+        # init_means_per_neuron shape (n_neurons, block_size)
+        assert result.init_means_per_neuron.shape == (3, 4)
+        # init_covs_per_neuron shape (n_neurons, block_size, block_size)
+        assert result.init_covs_per_neuron.shape == (3, 4, 4)
+        # Verify the per-neuron init_covs are the diagonal blocks
+        np.testing.assert_allclose(
+            np.asarray(result.init_covs_per_neuron[0]),
+            np.asarray(jnp.eye(4) * 0.1),
+        )
+        np.testing.assert_allclose(
+            np.asarray(result.init_covs_per_neuron[2]),
+            np.asarray(jnp.eye(4) * 0.2),
+        )
+
+    def test_rejects_dense_design_matrix(self) -> None:
+        """Dense multi-neuron design matrix (non-block-diagonal) → None."""
+        m, P, A, Q, _Z, _ = self._make_block_problem(n_neurons=3, block_size=4)
+        # Replace design matrix with a dense random version
+        T = 20
+        n_state = 12
+        Z_dense = jnp.zeros((T, 3, n_state))
+        for j in range(3):
+            # Every neuron depends on every state entry — not block-diagonal
+            Z_dense = Z_dense.at[:, j, :].set(
+                jax.random.normal(jax.random.PRNGKey(j + 100), (T, n_state))
+            )
+        assert _detect_block_diagonal_problem(m, P, A, Q, Z_dense) is None
+
+    def test_rejects_dense_init_cov(self) -> None:
+        m, _P_block, A, Q, Z, _ = self._make_block_problem(
+            n_neurons=3, block_size=4
+        )
+        # Replace init_cov with a dense random PD matrix
+        rng_key = jax.random.PRNGKey(42)
+        L = jax.random.normal(rng_key, (12, 12))
+        P_dense = L @ L.T + jnp.eye(12) * 0.1
+        assert _detect_block_diagonal_problem(m, P_dense, A, Q, Z) is None
+
+    def test_rejects_dense_transition_matrix(self) -> None:
+        m, P, _A_block, Q, Z, _ = self._make_block_problem(
+            n_neurons=3, block_size=4
+        )
+        A_dense = jnp.eye(12) + 0.01 * jax.random.normal(
+            jax.random.PRNGKey(7), (12, 12)
+        )
+        assert _detect_block_diagonal_problem(m, P, A_dense, Q, Z) is None
+
+    def test_single_neuron_returns_none(self) -> None:
+        """Single-neuron (2D) design matrix → dense filter is optimal."""
+        m = jnp.zeros(4)
+        P = jnp.eye(4) * 0.1
+        A = jnp.eye(4)
+        Q = jnp.eye(4) * 1e-4
+        Z = jax.random.normal(jax.random.PRNGKey(0), (20, 4))
+        assert _detect_block_diagonal_problem(m, P, A, Q, Z) is None
+
+    def test_wrong_shape_returns_none(self) -> None:
+        """n_state not divisible by n_neurons → None."""
+        T, n_neurons = 20, 3
+        Z_bad = jax.random.normal(
+            jax.random.PRNGKey(0), (T, n_neurons, 10)
+        )  # 10 not divisible by 3
+        assert _detect_block_diagonal_problem(
+            jnp.zeros(10), jnp.eye(10), jnp.eye(10), jnp.eye(10) * 1e-4, Z_bad
+        ) is None
+
+    def test_heterogeneous_per_neuron_basis_returns_none(self) -> None:
+        """If per-neuron Z slices differ across neurons, detection fails."""
+        m, P, A, Q, Z, _ = self._make_block_problem(
+            n_neurons=3, block_size=4
+        )
+        # Perturb neuron 1's slice so it differs from neuron 0's
+        Z_het = Z.at[:, 1, 4:8].set(Z[:, 1, 4:8] + 0.5)
+        assert _detect_block_diagonal_problem(m, P, A, Q, Z_het) is None
+
+    def test_heterogeneous_a_blocks_returns_none(self) -> None:
+        """Per-neuron A-block mismatch must reject detection.
+
+        CRITICAL regression test: if A has block-diagonal structure
+        but the diagonal blocks differ across neurons (e.g., post-EM
+        with update_transition_matrix=True producing slightly different
+        per-neuron dynamics due to floating-point non-associativity),
+        the block-diagonal filter would extract only block-0's A and
+        apply it to every neuron, silently producing wrong results.
+
+        The detector must catch this and fall back to the dense filter.
+        """
+        m, P, A, Q, Z, _ = self._make_block_problem(
+            n_neurons=3, block_size=4
+        )
+        # Perturb neuron 1's A block so it differs from neuron 0's
+        A_het = A.at[4:8, 4:8].set(A[4:8, 4:8] * 1.05)
+        assert _detect_block_diagonal_problem(m, P, A_het, Q, Z) is None
+
+    def test_heterogeneous_q_blocks_returns_none(self) -> None:
+        """Per-neuron Q-block mismatch must reject detection."""
+        m, P, A, Q, Z, _ = self._make_block_problem(
+            n_neurons=3, block_size=4
+        )
+        # Perturb neuron 2's Q block
+        Q_het = Q.at[8:12, 8:12].set(Q[8:12, 8:12] * 2.0)
+        assert _detect_block_diagonal_problem(m, P, A, Q_het, Z) is None
+
+    def test_place_field_model_problem_is_detected(self) -> None:
+        """End-to-end: construct a PlaceFieldModel problem and verify the
+        detector recognizes its structure. This is the primary target:
+        PlaceFieldModel's multi-neuron path builds exactly this shape,
+        so detection must succeed on its outputs.
+        """
+        import numpy as np_
+
+        from state_space_practice.place_field_model import PlaceFieldModel
+
+        rng = np_.random.default_rng(0)
+        position = rng.uniform(0, 100, (500, 2))
+        spikes = rng.poisson(1.0, (500, 3)).astype(np_.int64)
+
+        model = PlaceFieldModel(
+            dt=0.02, n_interior_knots=3, init_process_noise=1e-5
+        )
+        # Run fit_sgd with num_steps=0 to populate init state and
+        # design_matrix without any optimizer updates.
+        import optax
+        model.fit_sgd(
+            position, spikes, optimizer=optax.sgd(1e-4),
+            num_steps=0, warm_start=True,
+        )
+
+        # Rebuild the design matrix the same way fit_sgd does
+        Z_base = model._build_spline_basis_matrix(position)
+        design_matrix = model._expand_to_block_diagonal(Z_base)
+
+        result = _detect_block_diagonal_problem(
+            model.init_mean,
+            model.init_cov,
+            model.transition_matrix,
+            model.process_cov,
+            design_matrix,
+        )
+        assert isinstance(result, BlockDiagonalStructure)
+        assert result.n_neurons == 3
+        assert result.block_size == model.n_basis_per_neuron
