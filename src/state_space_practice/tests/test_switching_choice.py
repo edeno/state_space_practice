@@ -433,68 +433,161 @@ class TestSwitchingChoiceUncertainty:
         model.fit_sgd(choices, num_steps=10)
         assert jnp.all(model.surprise_ >= 0)
 
-    def test_per_state_predicted_variances_shape(self):
-        from state_space_practice.switching_choice import SwitchingChoiceModel
 
-        choices = jax.random.randint(jax.random.PRNGKey(0), (50,), 0, 3)
-        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
-        model.fit_sgd(choices, num_steps=10)
+# Shape combinations for parametrized uncertainty tests. Crucially includes
+# at least one non-square (K-1 != S) config — square configs like (3, 2) can
+# hide axis-ordering bugs because dimensions are numerically indistinguishable.
+UNCERTAINTY_SHAPE_CASES = [
+    pytest.param((3, 2), id="K3_S2_square"),
+    pytest.param((4, 2), id="K4_S2_more_options"),
+    pytest.param((3, 5), id="K3_S5_more_states"),
+]
+
+
+@pytest.fixture(
+    scope="class",
+    params=UNCERTAINTY_SHAPE_CASES,
+)
+def fitted_switching_choice_model(request):
+    """Fit a SwitchingChoiceModel at the given (n_options, n_discrete_states).
+
+    Class-scoped so each shape is only fit once across the tests that use it.
+    """
+    from state_space_practice.switching_choice import SwitchingChoiceModel
+
+    n_options, n_discrete_states = request.param
+    n_trials = 40
+    choices = jax.random.randint(
+        jax.random.PRNGKey(0), (n_trials,), 0, n_options
+    )
+    model = SwitchingChoiceModel(
+        n_options=n_options, n_discrete_states=n_discrete_states,
+    )
+    model.fit_sgd(choices, num_steps=5)
+    return model, choices, n_trials, n_options, n_discrete_states
+
+
+class TestSwitchingChoiceUncertaintyShapes:
+    """Shape-parametrized tests for the uncertainty summaries.
+
+    These use a fixture that sweeps ``(n_options, n_discrete_states)`` including
+    a non-square case (K-1 != S) so axis-ordering bugs cannot hide behind
+    numerically indistinguishable dimensions.
+    """
+
+    def test_uncertainty_populated(self, fitted_switching_choice_model):
+        model, _, T, K, S = fitted_switching_choice_model
+        assert model.predicted_option_variances_ is not None
+        assert model.predicted_option_variances_.shape == (T, K)
+        assert model.smoothed_option_variances_ is not None
+        assert model.smoothed_option_variances_.shape == (T, K)
         assert model.per_state_predicted_variances_ is not None
-        assert model.per_state_predicted_variances_.shape == (50, 3, 2)  # (T, K, S)
+        assert model.per_state_predicted_variances_.shape == (T, K, S)
+        assert model.surprise_ is not None
+        assert model.surprise_.shape == (T,)
+        assert model.predicted_choice_entropy_ is not None
+        assert model.predicted_choice_entropy_.shape == (T,)
 
-    def test_predicted_uses_prior_not_posterior(self):
-        """Predicted variances should be larger than filtered (posterior)."""
-        from state_space_practice.switching_choice import SwitchingChoiceModel
+    def test_reference_option_variance_is_zero(
+        self, fitted_switching_choice_model,
+    ):
+        model, *_ = fitted_switching_choice_model
+        np.testing.assert_allclose(
+            model.predicted_option_variances_[:, 0], 0.0, atol=1e-8,
+        )
+        np.testing.assert_allclose(
+            model.smoothed_option_variances_[:, 0], 0.0, atol=1e-8,
+        )
+        np.testing.assert_allclose(
+            model.per_state_predicted_variances_[:, 0, :], 0.0, atol=1e-8,
+        )
 
-        choices = jax.random.randint(jax.random.PRNGKey(0), (50,), 0, 3)
-        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
-        model.fit_sgd(choices, num_steps=10)
-        # Predicted (prior) variance should generally be >= filtered (posterior)
+    def test_variances_finite_and_nonnegative(
+        self, fitted_switching_choice_model,
+    ):
+        model, *_ = fitted_switching_choice_model
+        assert jnp.all(jnp.isfinite(model.predicted_option_variances_))
+        assert jnp.all(jnp.isfinite(model.smoothed_option_variances_))
+        assert jnp.all(model.predicted_option_variances_ >= -1e-8)
+        assert jnp.all(model.smoothed_option_variances_ >= -1e-8)
+
+    def test_predicted_uses_prior_not_posterior(
+        self, fitted_switching_choice_model,
+    ):
+        """Predicted (prior) variance should be >= filtered (posterior)."""
+        model, *_ = fitted_switching_choice_model
+
         pred_var = model.predicted_option_variances_[:, 1:].mean()  # exclude ref
-        # Compute filtered variance using filtered (posterior) state probs
-        filt_diag = jnp.diagonal(
-            model._filter_result.filtered_covs, axis1=1, axis2=2
-        )  # (T, K-1, S)
-        filt_var = jnp.einsum(
-            "tks,ts->tk", filt_diag, model._filter_result.discrete_state_probs
-        ).mean()
-        assert float(pred_var) >= float(filt_var) - 1e-6
 
-    def test_variance_law_of_total_variance(self):
-        """Marginalized variance should equal E[Var(x|s)] + Var(E[x|s])."""
-        from state_space_practice.switching_choice import SwitchingChoiceModel
-
-        choices = jax.random.randint(jax.random.PRNGKey(0), (50,), 0, 3)
-        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
-        model.fit_sgd(choices, num_steps=10)
-
-        per_state_vars = model.per_state_predicted_variances_  # (T, K, S)
+        # Extract filtered covariance diagonals independently: (T, K-1, S).
+        # Use explicit einsum to avoid the jnp.diagonal axis-ordering pitfall.
+        filt_diag = jnp.einsum(
+            "tiis->tis", model._filter_result.filtered_covs
+        )
+        # Reconstruct predicted (prior) state probs the same way the model does.
         disc_probs = model._filter_result.discrete_state_probs  # (T, S)
-
-        # Reconstruct predicted (prior) state probs
         init_prob = jnp.ones(model.n_discrete_states) / model.n_discrete_states
         predicted_disc = jnp.concatenate([
             init_prob[None, :],
-            (disc_probs[:-1] @ model.discrete_transition_matrix_),
+            disc_probs[:-1] @ model.discrete_transition_matrix_,
         ], axis=0)
+        filt_var = jnp.einsum("tks,ts->tk", filt_diag, predicted_disc).mean()
+        assert float(pred_var) >= float(filt_var) - 1e-6
 
-        # Per-state means (full K with reference)
-        per_state_vals = model._filter_result.predicted_values  # (T, K-1, S)
-        full_means = jnp.concatenate([
-            jnp.zeros((per_state_vals.shape[0], 1, per_state_vals.shape[2])),
-            per_state_vals,
-        ], axis=1)  # (T, K, S)
+    def test_variance_law_of_total_variance(
+        self, fitted_switching_choice_model,
+    ):
+        """``predicted_option_variances_`` must equal E[Var(x|s)] + Var(E[x|s]).
 
-        # E[Var(x|s)]
-        e_var = jnp.einsum("tks,ts->tk", per_state_vars, predicted_disc)
-        # Var(E[x|s]) = E[mu^2] - E[mu]^2
-        e_mean = jnp.einsum("tks,ts->tk", full_means, predicted_disc)
-        e_mean_sq = jnp.einsum("tks,ts->tk", full_means ** 2, predicted_disc)
-        var_mean = e_mean_sq - e_mean ** 2
+        The expected value is computed independently from ``result.predicted_covs``
+        via a Python loop over (trial, option, state), so any shape/axis bug in
+        how ``per_state_predicted_variances_`` is populated is detectable — this
+        test does NOT re-use that attribute on both sides of the assertion.
+        """
+        model, *_ = fitted_switching_choice_model
+        result = model._filter_result
 
-        expected_total = e_var + var_mean
+        T = int(result.predicted_covs.shape[0])
+        K = int(model.n_options)
+        S = int(model.n_discrete_states)
+
+        covs_np = np.asarray(result.predicted_covs)  # (T, K-1, K-1, S)
+        vals_np = np.asarray(result.predicted_values)  # (T, K-1, S)
+
+        # Reconstruct predicted (prior) state probs the same way the model does.
+        disc_probs = np.asarray(result.discrete_state_probs)  # (T, S)
+        trans = np.asarray(model.discrete_transition_matrix_)  # (S, S)
+        init_prob = np.ones(S) / S
+        predicted_disc = np.concatenate([
+            init_prob[None, :],
+            disc_probs[:-1] @ trans,
+        ], axis=0)  # (T, S)
+
+        expected_total = np.zeros((T, K))
+        for t in range(T):
+            for k in range(K):
+                if k == 0:
+                    # Reference option: per-state mean and variance are 0,
+                    # so the total variance is identically 0.
+                    continue
+                k_idx = k - 1  # index into (K-1)-sized arrays
+                e_var = 0.0
+                e_mean = 0.0
+                e_mean_sq = 0.0
+                for s in range(S):
+                    p = float(predicted_disc[t, s])
+                    v = float(covs_np[t, k_idx, k_idx, s])
+                    m = float(vals_np[t, k_idx, s])
+                    e_var += p * v
+                    e_mean += p * m
+                    e_mean_sq += p * m * m
+                var_mean = e_mean_sq - e_mean * e_mean
+                expected_total[t, k] = e_var + var_mean
+
         np.testing.assert_allclose(
-            model.predicted_option_variances_, expected_total, atol=1e-5,
+            np.asarray(model.predicted_option_variances_),
+            expected_total,
+            atol=1e-6,
         )
 
 

@@ -535,9 +535,12 @@ class SwitchingChoiceModel(SGDFittableMixin):
 
         per_state_values = result.predicted_values  # (T, K-1, S) — prior, not posterior
 
-        # Per-state predicted variances (diagonal of covariance)
-        per_state_vars = jnp.diagonal(
-            result.predicted_covs, axis1=1, axis2=2
+        # Per-state predicted variances (diagonal of covariance).
+        # predicted_covs has shape (T, K-1, K-1, S); we need (T, K-1, S).
+        # jnp.diagonal appends the diagonal as the last axis, so calling it
+        # with axis1=1, axis2=2 yields (T, S, K-1), not (T, K-1, S).
+        per_state_vars = jnp.einsum(
+            "tiis->tis", result.predicted_covs
         )  # (T, K-1, S)
 
         # Zero for reference option, then full K
@@ -561,8 +564,9 @@ class SwitchingChoiceModel(SGDFittableMixin):
 
         # Smoothed variances: law of total variance with smoother quantities
         if hasattr(self, '_smoother_state_cond_covs') and self._smoother_state_cond_covs is not None:
-            smoother_diag = jnp.diagonal(
-                self._smoother_state_cond_covs, axis1=1, axis2=2
+            # See note above on diagonal axis ordering; use einsum to get (T, K-1, S).
+            smoother_diag = jnp.einsum(
+                "tiis->tis", self._smoother_state_cond_covs
             )  # (T, K-1, S)
             zero_ref_sm = jnp.zeros((smoother_diag.shape[0], 1, smoother_diag.shape[2]))
             full_sm_vars = jnp.concatenate([zero_ref_sm, smoother_diag], axis=1)
