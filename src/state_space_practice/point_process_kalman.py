@@ -1009,6 +1009,209 @@ def stochastic_point_process_filter(
     return filtered_mean, filtered_cov, marginal_log_likelihood
 
 
+def _stochastic_point_process_filter_block_diagonal(
+    structure: BlockDiagonalStructure,
+    spike_indicator: Array,
+    dt: float,
+    include_laplace_normalization: bool = True,
+    max_log_count: float = 20.0,
+) -> tuple[Array, Array, Array]:
+    """Block-diagonal Laplace-EKF filter via vmapped per-neuron scans.
+
+    Consumes a ``BlockDiagonalStructure`` (from
+    ``_detect_block_diagonal_problem``) and runs ``n_neurons`` independent
+    filters in parallel via ``jax.vmap``. Each per-neuron filter operates
+    at ``d=block_size`` state dimension rather than ``d=n_neurons*block_size``,
+    giving ~``n_neurons^2`` speedup on the per-step Cholesky.
+
+    Mathematical equivalence
+    ------------------------
+    For a block-diagonal problem, the dense filter's posterior decomposes
+    into ``n_neurons`` independent per-neuron posteriors. Specifically:
+
+    - ``A @ P @ A^T + Q`` is block-diagonal → each block is
+      ``A_block @ P_j @ A_block^T + Q_block`` computed independently.
+    - ``J^T diag(rate*dt) J`` (Fisher info) for neuron j depends only
+      on that neuron's basis slice and its own weights, so it contributes
+      only to block j of the posterior precision.
+    - The Laplace normalization's ``logdet(P_prior)`` for a block-
+      diagonal matrix equals ``sum_j logdet(P_j_prior)``, so per-neuron
+      logdet contributions sum correctly to the full-problem logdet.
+    - Same for ``logdet(P_post)``.
+    - The quadratic form ``(x* - m)^T P_prior^{-1} (x* - m)`` also
+      decomposes into a sum over neurons because ``P_prior`` is
+      block-diagonal.
+
+    Therefore: per-neuron ``log p(y_t^j | y_{1:t-1})`` contributions
+    sum to the full-problem marginal log-likelihood. This is mathematically
+    identical (not approximately) to the dense filter's output on a
+    block-diagonal problem.
+
+    Output shape compatibility
+    --------------------------
+    To be a drop-in replacement for the dense filter, this function
+    returns ``filtered_mean`` of shape ``(n_time, n_state)`` and
+    ``filtered_cov`` of shape ``(n_time, n_state, n_state)`` — both
+    reassembled from the per-neuron trajectories. This materializes the
+    dense cov every time step, which is wasteful for very large
+    ``n_neurons``. A future optimization could return a ``BlockCovariance``
+    view that lazily materializes; for now the full dense form is
+    returned so downstream callers (``PlaceFieldModel.predict_rate_map``,
+    EM M-step, confidence intervals) work unchanged.
+
+    Parameters
+    ----------
+    structure : BlockDiagonalStructure
+        Per-neuron factored filter problem.
+    spike_indicator : Array, shape (n_time, n_neurons)
+        Spike counts per neuron per time bin. Must be 2D (not 1D);
+        callers with single-neuron problems should dispatch to the
+        dense filter, not this function.
+    dt : float
+        Time bin width.
+    include_laplace_normalization : bool, default=True
+    max_log_count : float, default=20.0
+
+    Returns
+    -------
+    filtered_mean : Array, shape (n_time, n_neurons * block_size)
+        Concatenated per-neuron posterior means.
+    filtered_cov : Array, shape (n_time, n_neurons * block_size, n_neurons * block_size)
+        Block-diagonal posterior covariance (dense-form for API compat).
+    marginal_log_likelihood : Array, scalar
+        Total log-likelihood summed across neurons.
+    """
+    n_neurons = structure.n_neurons
+    nb = structure.block_size
+    n_state = n_neurons * nb
+    n_time = structure.Z_base.shape[0]
+    A_block = structure.A_block
+    Q_block = structure.Q_block
+
+    # Per-neuron Laplace-EKF scan. Each neuron sees a scalar observation
+    # (its own spike count at time t) and a (nb,) state vector. The
+    # log-intensity function for neuron j at time t is `z_j_t @ x_j`,
+    # which is a scalar — wrap it to `(1,)` because
+    # _point_process_laplace_update expects an n_obs-dimensional output.
+    def _step_one_neuron(carry, args):
+        mean_prev, cov_prev, ll_acc = carry
+        z_row_t, y_t = args  # z_row_t: (nb,), y_t: scalar
+
+        # Predict step (block-level). Matches the dense filter's
+        # symmetric predict from A4 for consistency.
+        one_step_mean = A_block @ mean_prev
+        cov_prev_sym = symmetrize(cov_prev)
+        one_step_cov = symmetrize(
+            A_block @ cov_prev_sym @ A_block.T + Q_block
+        )
+
+        # Laplace update at per-neuron scale. The observation is a
+        # scalar spike count; wrap to (1,) for the update helper.
+        spike_as_vec = jnp.atleast_1d(y_t)
+
+        def _lin(x_block: Array) -> Array:
+            return jnp.atleast_1d(z_row_t @ x_block)
+
+        def _grad(x_block: Array) -> Array:
+            # Analytical gradient: d(log_intensity)/dx = z_row_t.
+            # Faster than jax.jacfwd on this linear function, and
+            # avoids reconstructing the gradient function per step.
+            #
+            # Safe because _detect_block_diagonal_problem's contract
+            # requires a Z_base-block design matrix, which produces a
+            # strictly linear log_intensity (log_lambda = Z @ x). The
+            # block-diagonal path cannot receive a nonlinear intensity
+            # function like PositionDecoder's KDE rate map — detection
+            # rejects ndim==2 design matrices.
+            return z_row_t[None, :]
+
+        post_mean, post_cov, log_lik_step = _point_process_laplace_update(
+            one_step_mean,
+            one_step_cov,
+            spike_as_vec,
+            dt,
+            _lin,
+            grad_log_intensity_func=_grad,
+            include_laplace_normalization=include_laplace_normalization,
+            max_log_count=max_log_count,
+        )
+        return (
+            (post_mean, post_cov, ll_acc + log_lik_step),
+            (post_mean, post_cov),
+        )
+
+    def _run_one_neuron(init_mean_j: Array, init_cov_j: Array, spikes_j: Array):
+        """Scan one neuron over time.
+
+        ``Z_base`` is captured from the enclosing scope as a non-vmapped
+        input (all neurons share the same basis by BlockDiagonalStructure
+        contract).
+        """
+        init_carry = (init_mean_j, init_cov_j, jnp.array(0.0, dtype=init_mean_j.dtype))
+        (_, _, ll_j), (means_j, covs_j) = jax.lax.scan(
+            _step_one_neuron,
+            init_carry,
+            (structure.Z_base, spikes_j),
+        )
+        return means_j, covs_j, ll_j
+
+    # vmap over neurons: each neuron gets its own init_mean_j, init_cov_j,
+    # and column of spike_indicator. Z_base is captured (not vmapped).
+    means_per_neuron, covs_per_neuron, lls_per_neuron = jax.vmap(
+        _run_one_neuron, in_axes=(0, 0, 1)
+    )(
+        structure.init_means_per_neuron,
+        structure.init_covs_per_neuron,
+        spike_indicator,
+    )
+    # means_per_neuron: (n_neurons, n_time, nb)
+    # covs_per_neuron: (n_neurons, n_time, nb, nb)
+    # lls_per_neuron: (n_neurons,)
+
+    # Reassemble concatenated filtered_mean of shape (n_time, n_state).
+    # Transpose to (n_time, n_neurons, nb), then reshape to (n_time, n_state).
+    filtered_mean = jnp.transpose(means_per_neuron, (1, 0, 2)).reshape(n_time, n_state)
+
+    # Reassemble block-diagonal filtered_cov of shape (n_time, n_state, n_state).
+    # For each time step, place each per-neuron (nb, nb) block on the diagonal.
+    # This is the dense-form API that downstream callers expect. A future
+    # optimization could return a BlockCovariance view to avoid the O(n_state^2)
+    # zero-padding per time step.
+    #
+    # Implementation: use advanced indexing (a single `.at[...].set(...)`
+    # scatter) rather than a Python for-loop over blocks. The loop approach
+    # creates O(n_neurons) static scatter nodes in the XLA program, which
+    # inflates compile time for large n_neurons. The single-scatter form
+    # produces one gather node regardless of n_neurons.
+    covs_time_first = jnp.transpose(covs_per_neuron, (1, 0, 2, 3))
+    # (n_time, n_neurons, nb, nb)
+
+    # Precompute the row/column indices of the diagonal blocks. For block j,
+    # rows/cols live in [j*nb : (j+1)*nb]. Shape: (n_neurons, nb).
+    block_offsets = jnp.arange(n_neurons) * nb
+    within_block = jnp.arange(nb)
+    row_idx = block_offsets[:, None] + within_block[None, :]  # (n_neurons, nb)
+    col_idx = row_idx  # diagonal blocks share the same row and column indices
+
+    def _assemble_one_step(covs_at_t: Array) -> Array:
+        # covs_at_t: (n_neurons, nb, nb). Output: (n_state, n_state).
+        dense = jnp.zeros((n_state, n_state), dtype=covs_at_t.dtype)
+        # Broadcasted fancy indexing: sets dense[row_idx[j, a], col_idx[j, b]]
+        # = covs_at_t[j, a, b] for all j, a, b in one scatter.
+        return dense.at[row_idx[:, :, None], col_idx[:, None, :]].set(covs_at_t)
+
+    filtered_cov = jax.vmap(_assemble_one_step)(covs_time_first)
+
+    # Marginal log-likelihood: sum across neurons. For block-diagonal
+    # problems, log p(y_t | y_{1:t-1}) decomposes as a sum of per-neuron
+    # contributions — the Laplace normalization's logdet of a block-
+    # diagonal matrix equals the sum of its blocks' logdets, and the
+    # quadratic form similarly decomposes.
+    marginal_ll = jnp.sum(lls_per_neuron)
+
+    return filtered_mean, filtered_cov, marginal_ll
+
+
 def stochastic_point_process_smoother(
     init_mean_params: ArrayLike,
     init_covariance_params: ArrayLike,

@@ -16,6 +16,7 @@ from state_space_practice.point_process_kalman import (
     _is_block_diagonal,
     _logdet_psd,
     _point_process_laplace_update,
+    _stochastic_point_process_filter_block_diagonal,
     _validate_filter_numerics,
     get_confidence_interval,
     kalman_maximization_step,
@@ -2730,3 +2731,236 @@ class TestDetectBlockDiagonalProblem:
         assert isinstance(result, BlockDiagonalStructure)
         assert result.n_neurons == 3
         assert result.block_size == model.n_basis_per_neuron
+
+
+class TestBlockDiagonalFilterEquivalence:
+    """Prove the block-diagonal filter produces identical output to the
+    dense filter on block-diagonal problems.
+
+    This is the critical gate for B2. The block filter is mathematically
+    equivalent to the dense filter on block-diagonal problems (see the
+    docstring of ``_stochastic_point_process_filter_block_diagonal`` for
+    the derivation), and these tests verify that equivalence holds at
+    f64 numerical precision for both forward output and gradients.
+    """
+
+    def _make_problem(
+        self, n_neurons: int, block_size: int, T: int = 50, seed: int = 0
+    ):
+        """Construct a block-diagonal filter problem ready for both paths.
+
+        Returns (init_mean, init_cov, A, Q, design_matrix, spikes) where:
+          - A, Q, init_cov are block-diagonal with identical A and Q blocks
+          - design_matrix has shape (T, n_neurons, n_neurons*block_size)
+            with shared Z_base across neurons
+          - spikes has shape (T, n_neurons) with Poisson counts
+        """
+        key = jax.random.PRNGKey(seed)
+        k_m, k_Z, k_spikes = jax.random.split(key, 3)
+        n_state = n_neurons * block_size
+        dt = 0.02
+
+        # Per-neuron dynamics (identical across neurons)
+        A_block = 0.98 * jnp.eye(block_size) + 0.01 * jax.random.normal(
+            k_m, (block_size, block_size)
+        )
+        A_block = (A_block + A_block.T) / 2  # symmetrize for simplicity
+        Q_block = jnp.eye(block_size) * 1e-5
+
+        # Block-diagonal expansion
+        A = jnp.zeros((n_state, n_state))
+        Q = jnp.zeros((n_state, n_state))
+        for j in range(n_neurons):
+            A = A.at[
+                j * block_size : (j + 1) * block_size,
+                j * block_size : (j + 1) * block_size,
+            ].set(A_block)
+            Q = Q.at[
+                j * block_size : (j + 1) * block_size,
+                j * block_size : (j + 1) * block_size,
+            ].set(Q_block)
+
+        # Per-neuron-distinct init_cov (each block different)
+        init_cov = jnp.zeros((n_state, n_state))
+        for j in range(n_neurons):
+            block = jnp.eye(block_size) * (0.05 + 0.02 * j)
+            init_cov = init_cov.at[
+                j * block_size : (j + 1) * block_size,
+                j * block_size : (j + 1) * block_size,
+            ].set(block)
+
+        init_mean = jax.random.normal(k_m, (n_state,)) * 0.1
+
+        # Shared basis across neurons
+        Z_base = jax.random.normal(k_Z, (T, block_size)) * 0.3
+        Z = jnp.zeros((T, n_neurons, n_state))
+        for j in range(n_neurons):
+            Z = Z.at[:, j, j * block_size : (j + 1) * block_size].set(Z_base)
+
+        # Poisson spike counts with moderate rate
+        rates = jnp.ones((T, n_neurons)) * 1.0
+        spikes = jax.random.poisson(k_spikes, rates).astype(jnp.int32)
+
+        return init_mean, init_cov, A, Q, Z, spikes, dt
+
+    def _run_both_paths(
+        self, init_mean, init_cov, A, Q, Z, spikes, dt,
+        include_laplace_normalization=True,
+    ):
+        """Run the dense filter and the block filter on the same problem."""
+        dense_mean, dense_cov, dense_mll = stochastic_point_process_filter(
+            init_mean, init_cov, Z, spikes, dt, A, Q,
+            log_conditional_intensity,
+            include_laplace_normalization=include_laplace_normalization,
+            validate_inputs=False,  # we know the problem is PSD
+        )
+        structure = _detect_block_diagonal_problem(
+            init_mean, init_cov, A, Q, Z
+        )
+        assert structure is not None, "test problem must be detected as block-diagonal"
+        block_mean, block_cov, block_mll = (
+            _stochastic_point_process_filter_block_diagonal(
+                structure, spikes, dt,
+                include_laplace_normalization=include_laplace_normalization,
+            )
+        )
+        return (dense_mean, dense_cov, dense_mll), (block_mean, block_cov, block_mll)
+
+    def test_filtered_mean_matches_dense_2_neurons(self) -> None:
+        problem = self._make_problem(n_neurons=2, block_size=4, T=30)
+        dense, block = self._run_both_paths(*problem)
+        np.testing.assert_allclose(
+            np.asarray(block[0]), np.asarray(dense[0]),
+            atol=1e-10, rtol=1e-10,
+        )
+
+    def test_filtered_cov_matches_dense_2_neurons(self) -> None:
+        problem = self._make_problem(n_neurons=2, block_size=4, T=30)
+        dense, block = self._run_both_paths(*problem)
+        np.testing.assert_allclose(
+            np.asarray(block[1]), np.asarray(dense[1]),
+            atol=1e-10, rtol=1e-10,
+        )
+
+    def test_marginal_ll_matches_dense_2_neurons(self) -> None:
+        problem = self._make_problem(n_neurons=2, block_size=4, T=30)
+        dense, block = self._run_both_paths(*problem)
+        np.testing.assert_allclose(
+            float(block[2]), float(dense[2]), atol=1e-9, rtol=1e-10,
+        )
+
+    def test_matches_dense_3_neurons_longer_sequence(self) -> None:
+        """Larger problem: 3 neurons, T=100, block_size=6. Tests the
+        vmap + scan combo at a non-trivial scale."""
+        problem = self._make_problem(
+            n_neurons=3, block_size=6, T=100, seed=42
+        )
+        dense, block = self._run_both_paths(*problem)
+        np.testing.assert_allclose(
+            np.asarray(block[0]), np.asarray(dense[0]), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            np.asarray(block[1]), np.asarray(dense[1]), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            float(block[2]), float(dense[2]), atol=1e-8, rtol=1e-10
+        )
+
+    def test_matches_dense_without_laplace_normalization(self) -> None:
+        """Same equivalence should hold when Laplace normalization is off."""
+        problem = self._make_problem(n_neurons=3, block_size=4, T=30)
+        dense, block = self._run_both_paths(
+            *problem, include_laplace_normalization=False,
+        )
+        np.testing.assert_allclose(
+            np.asarray(block[0]), np.asarray(dense[0]), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            np.asarray(block[1]), np.asarray(dense[1]), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            float(block[2]), float(dense[2]), atol=1e-9, rtol=1e-10
+        )
+
+    def test_gradient_matches_dense_for_fit_sgd(self) -> None:
+        """jax.grad through both filters must agree.
+
+        This is the critical gate for fit_sgd: if the block filter's
+        gradient doesn't match the dense filter's gradient, SGD updates
+        will differ between paths even if the forward pass matches to
+        machine precision. Without this test, B4's auto-dispatch could
+        silently change optimization behavior.
+
+        We differentiate the marginal log-likelihood with respect to a
+        scalar multiplier on Q_block. Detection happens OUTSIDE jax.grad
+        (the detection helper uses host-side ``float()`` and is not
+        trace-compatible), and the block filter consumes a pre-built
+        ``BlockDiagonalStructure`` with the scaled Q block substituted
+        in. The dense path parallel-rebuilds the full Q matrix inside
+        grad for a fair comparison.
+        """
+        init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
+            n_neurons=3, block_size=4, T=30, seed=7
+        )
+        n_neurons, block_size = 3, 4
+
+        # Pre-build the structure OUTSIDE jax.grad (detection uses
+        # host-side float() and is not trace-compatible by design; see
+        # the dispatch note in _detect_block_diagonal_problem). The
+        # block filter then consumes a pre-built structure as a
+        # non-traced input.
+        ref_structure = _detect_block_diagonal_problem(
+            init_mean, init_cov, A, Q, Z
+        )
+        assert ref_structure is not None
+
+        def dense_loss(q_scale):
+            # Rebuild the full (n_state, n_state) Q matrix from q_scale.
+            Q_scaled = Q * q_scale
+            _, _, mll = stochastic_point_process_filter(
+                init_mean, init_cov, Z, spikes, dt, A, Q_scaled,
+                log_conditional_intensity,
+                validate_inputs=False,
+            )
+            return -mll
+
+        def block_loss(q_scale):
+            # Substitute the scaled Q_block into the pre-detected
+            # structure. All other fields (A_block, init_*, Z_base,
+            # n_neurons, block_size) are unchanged.
+            Q_block_scaled = ref_structure.Q_block * q_scale
+            structure = ref_structure._replace(Q_block=Q_block_scaled)
+            _, _, mll = _stochastic_point_process_filter_block_diagonal(
+                structure, spikes, dt,
+            )
+            return -mll
+
+        q_scale = jnp.array(1.0)
+        grad_dense = jax.grad(dense_loss)(q_scale)
+        grad_block = jax.grad(block_loss)(q_scale)
+        np.testing.assert_allclose(
+            float(grad_block), float(grad_dense), atol=1e-8, rtol=1e-9,
+        )
+
+    def test_filtered_cov_is_block_diagonal(self) -> None:
+        """The block filter's reassembled filtered_cov should be
+        block-diagonal at every time step (by construction). Verify
+        the off-block entries are zero to machine precision."""
+        problem = self._make_problem(n_neurons=3, block_size=4, T=20)
+        _, block = self._run_both_paths(*problem)
+        _, block_cov, _ = block
+        n_neurons, nb = 3, 4
+        n_state = n_neurons * nb
+        for t in range(block_cov.shape[0]):
+            for j in range(n_neurons):
+                for k in range(n_neurons):
+                    if j == k:
+                        continue  # diagonal block — any value allowed
+                    sub = block_cov[
+                        t,
+                        j * nb : (j + 1) * nb,
+                        k * nb : (k + 1) * nb,
+                    ]
+                    assert float(jnp.max(jnp.abs(sub))) < 1e-12, (
+                        f"off-block ({j}, {k}) at t={t} is not zero"
+                    )
