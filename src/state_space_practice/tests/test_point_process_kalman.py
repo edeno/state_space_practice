@@ -11,6 +11,7 @@ import pytest
 
 from state_space_practice.point_process_kalman import (
     PointProcessModel,
+    _logdet_psd,
     _point_process_laplace_update,
     get_confidence_interval,
     kalman_maximization_step,
@@ -2267,3 +2268,64 @@ class TestPointProcessSGDFitting:
         assert model.smoother_mean is not None
         assert model.smoother_cov is not None
         assert hasattr(model, "log_likelihood_")
+
+
+class TestLogdetPsd:
+    """Tests for the Cholesky-based ``_logdet_psd`` helper.
+
+    Regression test class for the performance optimization that replaced
+    ``eigvalsh``-based logdet with a Cholesky-based one (~1.7x filter
+    speedup at T=10k, d=36). These tests pin the numerical contract so a
+    future refactor can't silently change the logdet behavior.
+    """
+
+    def test_matches_slogdet_on_well_conditioned_psd(self) -> None:
+        """Cholesky-logdet matches ``jnp.linalg.slogdet`` on PSD input.
+
+        ``slogdet`` is the reference implementation; ``_logdet_psd`` trades
+        a small constant stability shift for a ~3-5x speedup. On a
+        well-conditioned matrix the shift is negligible and the two must
+        agree to ~1e-6.
+        """
+        key = jax.random.PRNGKey(0)
+        n = 32
+        # PSD via A A' + jitter. Well-conditioned: eigvals in [1, n+1].
+        A = jax.random.normal(key, (n, n))
+        mat = A @ A.T + jnp.eye(n)  # eigvals bounded below by 1
+
+        ref_sign, ref_logdet = jnp.linalg.slogdet(mat)
+        got = _logdet_psd(mat, diagonal_boost=1e-9)
+        assert float(ref_sign) == 1.0
+        np.testing.assert_allclose(float(got), float(ref_logdet), atol=1e-6)
+
+    def test_stabilized_on_near_singular_matrix(self) -> None:
+        """Cholesky-logdet does not crash on a near-singular PSD matrix.
+
+        The ``diagonal_boost`` shift ensures the Cholesky succeeds even
+        when the input has eigenvalues at machine-precision scale — this
+        is critical for the inner filter loop where the posterior
+        covariance can be near-singular in high-information directions.
+        """
+        n = 16
+        # Rank-deficient PSD: A has rank 8 → 8 zero eigenvalues before shift.
+        A = jax.random.normal(jax.random.PRNGKey(1), (n, n // 2))
+        mat = A @ A.T  # rank n//2
+
+        # Should not crash and should produce a finite logdet.
+        result = _logdet_psd(mat, diagonal_boost=1e-9)
+        assert jnp.isfinite(result)
+        # With the shift, the result is approximately sum(log(eigs + 1e-9))
+        # which is finite (vs -inf for the raw rank-deficient matrix).
+
+    def test_identity_matches_zero_logdet(self) -> None:
+        """logdet(I) ≈ 0 under the production diagonal_boost.
+
+        With ``diagonal_boost=1e-9`` (the production default), the shift
+        adds ``1e-9`` to each eigenvalue of ``I``, so each post-shift eigenvalue
+        is ``1 + 1e-9`` and the logdet is ``n * log(1 + 1e-9) ≈ n * 1e-9``.
+        The test uses the default to cover the actual code path callers hit.
+        """
+        for n in (4, 16, 64):
+            got = _logdet_psd(jnp.eye(n))  # use default diagonal_boost=1e-9
+            expected = n * float(jnp.log(1.0 + 1e-9))
+            np.testing.assert_allclose(float(got), expected, atol=1e-12)
