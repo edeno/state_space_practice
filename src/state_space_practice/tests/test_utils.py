@@ -1,5 +1,6 @@
 """Tests for the utils module."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -167,6 +168,85 @@ class TestLinearAlgebraUtilities:
         x = psd_solve(A, b)
         expected = np.linalg.solve(A, b)
         np.testing.assert_allclose(x, expected, atol=1e-6)
+
+    def test_psd_solve_relative_boost_scales_with_max_diag(self) -> None:
+        """psd_solve's relative_boost must scale with max|diag(A)|.
+
+        For a large-scale matrix (max_diag ~ 1e6), the absolute
+        diagonal_boost=1e-9 is vastly smaller than max|diag|, so the
+        relative component dominates and the effective shift should be
+        on the order of ``relative_boost * max_diag``.
+        """
+        # max_diag ~ 1e6, well-conditioned otherwise
+        A = jnp.array([[1.0e6, 100.0], [100.0, 5.0e5]])
+        b = jnp.array([1.0, 2.0])
+
+        # Reference solution via direct inverse
+        expected = np.linalg.solve(np.asarray(A), np.asarray(b))
+
+        # psd_solve should still agree to reasonable precision despite
+        # the larger effective shift — the relative shift preserves
+        # relative signal.
+        x = psd_solve(A, b)
+        np.testing.assert_allclose(
+            np.asarray(x), expected, rtol=1e-5, atol=0,
+            err_msg="relative boost should not swamp the signal"
+        )
+
+    def test_psd_solve_small_scale_unchanged(self) -> None:
+        """On a small-scale well-conditioned matrix, the adaptive boost
+        should behave almost identically to the old absolute-only boost
+        (max_diag is O(1), so relative * max_diag ~ relative_boost,
+        which is still much smaller than the matrix eigenvalues)."""
+        A = jnp.array([[4.0, 1.0], [1.0, 3.0]])
+        b = jnp.array([1.0, 2.0])
+        x = psd_solve(A, b)
+        expected = np.linalg.solve(np.asarray(A), np.asarray(b))
+        np.testing.assert_allclose(np.asarray(x), expected, atol=1e-6)
+
+    def test_psd_solve_near_singular_stabilized(self) -> None:
+        """A rank-deficient PSD matrix has infinitely many solutions;
+        this test only asserts ``psd_solve`` returns a finite output
+        (does not crash or NaN), not that the solution is unique or
+        meaningful. The regression target is the f32 NaN / Cholesky-
+        failure mode, not solution correctness.
+        """
+        # Construct a 4x4 rank-2 PSD matrix
+        A_low_rank = jax.random.normal(jax.random.PRNGKey(0), (4, 2))
+        A = A_low_rank @ A_low_rank.T  # rank 2, 2 zero eigenvalues
+        b = jnp.array([1.0, 2.0, 3.0, 4.0])
+        x = psd_solve(A, b)
+        assert jnp.all(jnp.isfinite(x)), (
+            "psd_solve should return finite output on rank-deficient input"
+        )
+
+    def test_psd_solve_relative_boost_zero_matches_old_behavior(self) -> None:
+        """``relative_boost=0.0`` disables relative scaling entirely.
+
+        Documents the back-compat escape hatch: setting relative_boost to
+        zero reproduces the pre-adaptive (absolute-only) behavior. Used by
+        callers that need bit-for-bit reproducibility with older code.
+        """
+        A = jnp.array([[4.0, 1.0], [1.0, 3.0]])
+        b = jnp.array([1.0, 2.0])
+        x_default = psd_solve(A, b)
+        x_no_relative = psd_solve(A, b, relative_boost=0.0)
+        # On this small-scale well-conditioned matrix the two should agree
+        # to machine precision because the relative contribution is
+        # negligible vs the absolute floor (1e-12*4 << 1e-9).
+        np.testing.assert_allclose(
+            np.asarray(x_default), np.asarray(x_no_relative), atol=1e-12
+        )
+
+    def test_psd_solve_zero_matrix_falls_back_to_absolute_boost(self) -> None:
+        """All-zero matrix: ``max_diag=0``, so effective boost equals the
+        absolute diagonal_boost. The solver should produce a finite
+        output (the diagonal boost is the only thing regularizing the
+        otherwise-singular system)."""
+        A = jnp.zeros((3, 3))
+        b = jnp.array([1.0, 2.0, 3.0])
+        x = psd_solve(A, b)
+        assert jnp.all(jnp.isfinite(x))
 
     def test_project_psd_clips_negative_eigvals(self) -> None:
         Q = jnp.array([[1.0, 0.5], [0.5, -0.1]])  # indefinite

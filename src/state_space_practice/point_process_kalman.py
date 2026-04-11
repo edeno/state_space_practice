@@ -672,12 +672,19 @@ def stochastic_point_process_filter(
         mean_prev, variance_prev, marginal_log_likelihood = params_prev
         design_matrix_t, spike_indicator_t = args
 
-        # One-step prediction
+        # One-step prediction. Symmetrize variance_prev BEFORE the
+        # congruence so any accumulated asymmetry from the previous step
+        # isn't amplified by A @ ... @ A^T. Re-symmetrize AFTER the
+        # addition to clean up any residual asymmetry introduced by
+        # finite-precision arithmetic. This belt-and-suspenders approach
+        # is cheap (two 0.5*(M + M.T) ops per step) and makes the
+        # covariance propagation more robust to f32 roundoff.
         one_step_mean = transition_matrix @ mean_prev
-        one_step_covariance = (
-            transition_matrix @ variance_prev @ transition_matrix.T + process_cov
+        variance_prev_sym = symmetrize(variance_prev)
+        one_step_covariance = symmetrize(
+            transition_matrix @ variance_prev_sym @ transition_matrix.T
+            + process_cov
         )
-        one_step_covariance = symmetrize(one_step_covariance)
 
         # Create log_intensity_func that captures design_matrix_t
         def log_intensity_func(x):

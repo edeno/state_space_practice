@@ -42,13 +42,47 @@ def symmetrize(A: jax.Array) -> jax.Array:
     return 0.5 * (A + jnp.swapaxes(A, -1, -2))
 
 
-def psd_solve(A: jax.Array, b: jax.Array, diagonal_boost: float = 1e-9) -> jax.Array:
+def psd_solve(
+    A: jax.Array,
+    b: jax.Array,
+    diagonal_boost: float = 1e-9,
+    relative_boost: float = 1e-12,
+) -> jax.Array:
     """Solves a linear system Ax = b for positive semi-definite (PSD) matrices A.
 
     This function wraps a linear algebra solver, ensuring numerical stability
-    by symmetrizing the input matrix A and adding a small value to its
-    diagonal (diagonal_boost). It is intended for use with PSD matrices,
-    where 'assume_a="pos"' can be safely set for performance.
+    by symmetrizing the input matrix A and adding a scaled diagonal shift
+    before Cholesky. It is intended for use with PSD matrices, where
+    ``assume_a="pos"`` can be safely set for performance.
+
+    Stabilization shift
+    -------------------
+    The shift added to the diagonal is::
+
+        effective = max(diagonal_boost, relative_boost * max|diag(A)|)
+
+    Using ``max(absolute, relative * scale)`` is standard numerics
+    practice. Rationale:
+
+    - The absolute ``diagonal_boost`` handles matrices whose entries are
+      O(1) or smaller; the ~1e-9 floor sits just above f64 cholesky
+      precision and catches matrices that are numerically (but not
+      structurally) positive semidefinite.
+    - The ``relative_boost`` handles matrices whose entries span many
+      orders of magnitude. A cov matrix with ``max_diag ~ 1e6`` needs a
+      larger shift than ``1e-9`` to stabilize cholesky; a cov with
+      ``max_diag ~ 1e-3`` would have ``1e-9`` be a relatively large
+      perturbation of the signal. Relative scaling is scale-invariant
+      and gives roughly f64-precision-level stability on any input.
+
+    The default ``relative_boost=1e-12`` is approximately 1e4 * f64
+    machine epsilon — small enough that the shift does not perturb
+    near-singular f64 matrices (whose smallest eigenvalues may be at
+    1e-10 to 1e-5) but still catches genuinely ill-conditioned matrices
+    at large scales (where ``max_diag * 1e-12`` exceeds the absolute
+    ``1e-9`` floor). Callers can raise ``relative_boost`` for aggressive
+    regularization or lower it to 0.0 to disable relative scaling
+    entirely and match the pre-adaptive behavior.
 
     Parameters
     ----------
@@ -57,8 +91,13 @@ def psd_solve(A: jax.Array, b: jax.Array, diagonal_boost: float = 1e-9) -> jax.A
     b : jax.Array
         The right-hand side vector or matrix.
     diagonal_boost : float, optional
-        Small value added to the diagonal of A to improve numerical
-        stability. Default is 1e-9.
+        Absolute floor for the stabilization shift. Default is 1e-9.
+    relative_boost : float, optional
+        Coefficient of ``max|diag(A)|`` used as the relative component
+        of the stabilization shift. Default is 1e-12 (~1e4 * f64 eps).
+        Pass ``0.0`` to disable relative scaling entirely and match the
+        pre-adaptive (absolute-only) behavior — useful for callers that
+        need bit-for-bit reproducibility with older code.
 
     Returns
     -------
@@ -66,8 +105,19 @@ def psd_solve(A: jax.Array, b: jax.Array, diagonal_boost: float = 1e-9) -> jax.A
         The solution x to the linear system Ax = b.
 
     """
+    A_sym = symmetrize(A)
+    n = A.shape[-1]
+    # Use the maximum absolute diagonal entry as the reference scale for
+    # the relative boost. For PSD matrices this is a tight bound on the
+    # largest eigenvalue; for slightly non-PSD matrices (floating-point
+    # drift) it is still a reasonable scale reference.
+    max_diag = jnp.max(jnp.abs(jnp.diagonal(A_sym, axis1=-2, axis2=-1)))
+    effective_boost = jnp.maximum(
+        jnp.asarray(diagonal_boost, dtype=A.dtype),
+        jnp.asarray(relative_boost, dtype=A.dtype) * max_diag,
+    )
     return jax.scipy.linalg.solve(
-        symmetrize(A) + float(diagonal_boost) * jnp.eye(A.shape[-1], dtype=A.dtype),
+        A_sym + effective_boost * jnp.eye(n, dtype=A.dtype),
         b,
         assume_a="pos",
     )
