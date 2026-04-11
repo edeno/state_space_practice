@@ -588,7 +588,10 @@ class PlaceFieldModel(SGDFittableMixin):
             usual recommendation (whole dataset is typically best for
             statistical efficiency and spatial coverage).
         max_iter : int, default=15
-            Newton iterations. 10-15 is plenty for a convex Poisson GLM.
+            Newton iterations. The intercept-matching initial guess
+            (see below) makes Newton converge to machine precision in
+            ~8 iterations on well-conditioned problems, so 15 is
+            comfortable insurance for poorly-conditioned data.
         prior_precision : float, default=1.0
             Weak Gaussian prior on the weights, added to the Hessian for
             numerical stability and to regularize basis functions whose
@@ -621,10 +624,38 @@ class PlaceFieldModel(SGDFittableMixin):
         single_neuron = spikes.ndim == 1
         spikes_2d = spikes[:, None] if single_neuron else spikes
         n_neurons = spikes_2d.shape[1]
+        n_time = Z_base.shape[0]
 
         # Per-neuron Newton fit. Convex problem → well-defined MAP.
         eye = jnp.eye(nb)
         prior = prior_precision * eye
+
+        # Intercept-matching initial guess: find the weight vector that best
+        # represents a constant log-rate equal to the mean rate of the data.
+        # For a constant target t, the least-squares solution in the column
+        # space of Z_base is:
+        #
+        #     w_init(t) = (Z' Z + prior)^{-1} Z' (t * 1_T)
+        #              = t * [(Z' Z + prior)^{-1} Z' 1_T]
+        #              = t * intercept_direction
+        #
+        # ``intercept_direction`` depends only on Z_base and is shared across
+        # neurons; we hoist it out of the per-neuron vmap.
+        #
+        # Borrowed from NeMoS's ``initialize_intercept_matching_mean_rate``
+        # (flatironinstitute/nemos) but adapted to our no-explicit-intercept
+        # spline parameterization by projecting the constant onto Z_base's
+        # column space rather than fitting a separate intercept. Starting
+        # Newton from this instead of zeros makes the first iteration refine
+        # the spatial pattern rather than find the mean rate.
+        #
+        # Note: ``ZtZ_plus_prior`` here is the *linearization-free* Gram
+        # matrix used only for this one-shot initializer. The Newton-step
+        # Hessian below is the data-dependent Fisher information
+        # ``Z' diag(mu) Z + prior`` and must not be replaced with this.
+        ZtZ_plus_prior = Z_base.T @ Z_base + prior
+        Zt_ones = Z_base.T @ jnp.ones(n_time, dtype=Z_base.dtype)
+        intercept_direction = psd_solve(ZtZ_plus_prior, Zt_ones)  # (nb,)
 
         def _fit_one(y: Array) -> tuple[Array, Array]:
             y = y.astype(Z_base.dtype)
@@ -642,7 +673,12 @@ class PlaceFieldModel(SGDFittableMixin):
                 delta = psd_solve(hess, grad)
                 return w - delta, None
 
-            w0 = jnp.zeros(nb, dtype=Z_base.dtype)
+            # Initial log-rate targets the mean rate of this neuron, in log
+            # Hz. Guard against zero-spike neurons (add one "phantom spike"
+            # per session to avoid log(0)).
+            mean_count_per_bin = (jnp.sum(y) + 1.0) / n_time
+            target_log_rate = jnp.log(mean_count_per_bin / self.dt)
+            w0 = target_log_rate * intercept_direction
             w_mle, _ = jax.lax.scan(_newton_step, w0, None, length=max_iter)
 
             # Laplace covariance at the MAP

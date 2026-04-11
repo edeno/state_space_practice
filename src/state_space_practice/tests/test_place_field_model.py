@@ -963,11 +963,12 @@ class TestWarmStart:
         from a bad initialization in one step, so it directly probes the
         quality of the initial state.
         """
+        import optax
+
         from state_space_practice.point_process_kalman import (
             log_conditional_intensity,
             stochastic_point_process_filter,
         )
-        import optax
 
         opt = optax.adam(1e-3)
 
@@ -1071,6 +1072,77 @@ class TestWarmStart:
         assert jnp.allclose(model.init_mean, jnp.zeros(model.n_basis))
         assert jnp.allclose(
             model.init_cov, jnp.eye(model.n_basis) * 0.5, atol=1e-10
+        )
+
+    def test_warm_start_converges_at_low_max_iter(
+        self, sim_data: dict
+    ) -> None:
+        """With the intercept-matching initial guess, Newton converges to
+        machine precision in ~8 iterations. Max_iter=3 should already be
+        within 20% relative error of the machine-precision fit, proving
+        the initial guess is close to the MAP.
+        """
+        model = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+        )
+        model.n_neurons = 1
+        Z_base = model._build_spline_basis_matrix(
+            np.asarray(sim_data["position"])
+        )
+        spikes = jnp.asarray(sim_data["spikes"])
+        if spikes.ndim == 2 and spikes.shape[1] == 1:
+            spikes = spikes.squeeze(axis=1)
+
+        # Reference: many-iteration fit
+        w_ref, _ = model._fit_stationary_glm(Z_base, spikes, max_iter=30)
+
+        # At max_iter=3 we should already be close (not yet fully
+        # converged, but in the same neighborhood). This test would
+        # catch a regression where the intercept init stops working.
+        w_3, _ = model._fit_stationary_glm(Z_base, spikes, max_iter=3)
+        err = float(jnp.linalg.norm(w_3 - w_ref)) / float(jnp.linalg.norm(w_ref))
+        assert err < 0.2, (
+            f"intercept-init Newton should converge to within 20% of the "
+            f"reference in 3 iterations; got relative error {err:.3f}"
+        )
+
+    def test_warm_start_initial_rate_matches_mean(
+        self, sim_data: dict
+    ) -> None:
+        """The warm-start's initial weights (before Newton even runs) should
+        produce predicted rates that match the empirical mean firing rate.
+
+        This is the direct test of the NeMoS-inspired intercept-matching
+        initializer: the least-squares projection of ``log(mean_rate)``
+        onto the column space of Z_base must give a weight vector whose
+        average predicted rate is close to the observed mean rate.
+
+        We verify this at ``max_iter=0`` (no Newton steps) so we're testing
+        the initial guess directly, not the post-Newton MAP.
+        """
+        model = PlaceFieldModel(
+            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+        )
+        model.n_neurons = 1
+        Z_base = model._build_spline_basis_matrix(
+            np.asarray(sim_data["position"])
+        )
+        spikes = jnp.asarray(sim_data["spikes"])
+        if spikes.ndim == 2 and spikes.shape[1] == 1:
+            spikes = spikes.squeeze(axis=1)
+
+        # max_iter=0: return the initial guess without running Newton
+        w_init, _ = model._fit_stationary_glm(Z_base, spikes, max_iter=0)
+        predicted_rate = float(jnp.mean(jnp.exp(Z_base @ w_init)))
+        observed_rate = float(jnp.mean(spikes) / sim_data["dt"])
+        # Initial rate should match observed to within ~30% — the match
+        # is approximate because the spline basis is not a partition of
+        # unity, so the projection of a constant onto its column space
+        # has a non-zero residual. Newton's first iteration cleans this up.
+        rel_err = abs(predicted_rate - observed_rate) / max(observed_rate, 1e-6)
+        assert rel_err < 0.3, (
+            f"initial predicted rate {predicted_rate:.3f} should be close "
+            f"to observed {observed_rate:.3f}; relative error {rel_err:.3f}"
         )
 
     def test_warm_start_multi_neuron_block_diagonal_cov(
