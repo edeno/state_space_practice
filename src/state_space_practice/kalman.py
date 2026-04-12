@@ -168,16 +168,35 @@ def kalman_measurement_update(
         measurement_matrix @ prior_cov @ measurement_matrix.T + measurement_cov
     )
 
-    residual_error = obs - obs_mean
-    kalman_gain = psd_solve(obs_cov, measurement_matrix @ prior_cov).T
+    # Single Cholesky factorization, reused for Kalman gain and log-likelihood.
+    # This replaces separate psd_solve() + multivariate_normal.logpdf() calls
+    # that each computed their own Cholesky of obs_cov.
+    n = obs_cov.shape[-1]
+    max_diag = jnp.max(jnp.abs(jnp.diagonal(obs_cov)))
+    effective_boost = jnp.maximum(
+        jnp.asarray(1e-9, dtype=obs_cov.dtype),
+        jnp.asarray(1e-12, dtype=obs_cov.dtype) * max_diag,
+    )
+    obs_cov_stable = obs_cov + effective_boost * jnp.eye(n, dtype=obs_cov.dtype)
+    L = jax.scipy.linalg.cholesky(obs_cov_stable, lower=True)
 
+    # Kalman gain: K = P H^T S^{-1}  (solve S^T K^T = H P  via cho_solve)
+    kalman_gain = jax.scipy.linalg.cho_solve(
+        (L, True), measurement_matrix @ prior_cov
+    ).T
+
+    residual_error = obs - obs_mean
     posterior_mean = prior_mean + kalman_gain @ residual_error
     posterior_cov = joseph_form_update(
         prior_cov, kalman_gain, measurement_matrix, measurement_cov
     )
 
-    marginal_log_likelihood = jnp.asarray(
-        jax.scipy.stats.multivariate_normal.logpdf(x=obs, mean=obs_mean, cov=obs_cov)
+    # log N(y; μ, S) = -½ [d log(2π) + log|S| + (y-μ)^T S^{-1} (y-μ)]
+    alpha = jax.scipy.linalg.solve_triangular(L, residual_error, lower=True)
+    log_det = 2.0 * jnp.sum(jnp.log(jnp.diagonal(L)))
+    d = obs_cov.shape[0]
+    marginal_log_likelihood = -0.5 * (
+        d * jnp.log(2.0 * jnp.pi) + log_det + alpha @ alpha
     )
 
     return posterior_mean, posterior_cov, marginal_log_likelihood
