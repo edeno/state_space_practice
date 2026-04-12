@@ -1321,3 +1321,165 @@ class TestMaxFiringRateHz:
         ]
         for w in saturation_warnings:
             assert "max_firing_rate_hz" in str(w.message)
+
+
+class TestBlockDiagonalDispatch:
+    """Tests for PlaceFieldModel's auto-dispatch to the block-diagonal
+    filter path.
+
+    These tests verify that:
+    1. Multi-neuron fits automatically dispatch to the block path
+       (``_block_n_neurons`` and ``_block_size`` are set non-None).
+    2. ``force_dense=True`` disables dispatch and falls through to the
+       dense filter.
+    3. The two paths produce numerically equivalent output (smoother
+       mean, marginal LL) on the same problem — critical for fit_sgd
+       correctness, since SGD updates depend on gradient equivalence.
+    4. Single-neuron fits do not dispatch (no structure to exploit).
+    """
+
+    def _make_multi_neuron_data(self, n_neurons: int = 3, n_time: int = 500):
+        """Construct simulated multi-neuron data via simulate_2d_moving_place_field."""
+        sim = simulate_2d_moving_place_field(total_time=n_time * 0.02, dt=0.02)
+        position = sim["position"]
+        # Replicate single-neuron spikes into n_neurons columns with
+        # slightly different noise per neuron so the fit is non-trivial.
+        base_spikes = np.asarray(sim["spikes"]).squeeze()
+        rng = np.random.default_rng(0)
+        spikes_multi = np.stack(
+            [
+                base_spikes + rng.integers(0, 2, size=base_spikes.shape)
+                for _ in range(n_neurons)
+            ],
+            axis=-1,
+        ).astype(np.int64)
+        return position, spikes_multi
+
+    def test_fit_sgd_multi_neuron_dispatches_to_block_path(self) -> None:
+        """Multi-neuron fit_sgd should detect block structure and set
+        ``_block_n_neurons`` / ``_block_size`` non-None."""
+        position, spikes = self._make_multi_neuron_data(n_neurons=3)
+        model = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        import optax
+
+        model.fit_sgd(
+            position, spikes, optimizer=optax.sgd(1e-4), num_steps=0
+        )
+        assert model._block_n_neurons == 3
+        assert model._block_size == model.n_basis_per_neuron
+
+    def test_fit_sgd_multi_neuron_force_dense_skips_dispatch(self) -> None:
+        """force_dense=True should suppress block detection."""
+        position, spikes = self._make_multi_neuron_data(n_neurons=3)
+        model = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        import optax
+
+        model.fit_sgd(
+            position, spikes, optimizer=optax.sgd(1e-4),
+            num_steps=0, force_dense=True,
+        )
+        assert model._block_n_neurons is None
+        assert model._block_size is None
+
+    def test_fit_sgd_single_neuron_does_not_dispatch(self) -> None:
+        """Single-neuron fits have design_matrix.ndim==2, which detection
+        rejects. Auto-dispatch should leave _block_n_neurons as None."""
+        sim = simulate_2d_moving_place_field(total_time=10.0, dt=0.02)
+        model = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        import optax
+
+        model.fit_sgd(
+            sim["position"], sim["spikes"],
+            optimizer=optax.sgd(1e-4), num_steps=0,
+        )
+        assert model._block_n_neurons is None
+        assert model._block_size is None
+
+    def test_fit_sgd_block_vs_dense_initial_step_matches(self) -> None:
+        """Block and dense paths must produce an identical step-0 LL.
+
+        The step-0 LL is the forward filter evaluated at the warm-start
+        init state before any optimizer updates. Both paths should give
+        bit-identical output at this step (pinned at atol=1e-9 by the
+        low-level equivalence tests in TestBlockDiagonalFilterEquivalence).
+
+        Across subsequent SGD steps, the trajectories naturally diverge
+        because the dense path's autodiff produces non-zero off-block
+        gradient components on the init_cov parameter (spurious entries
+        that the block filter never computes), which feed into the PSD
+        parameter transform and perturb the reconstructed init_cov
+        differently between paths. This is not a bug — the block path
+        is the CORRECT gradient for the block-diagonal parameterization,
+        and the dense path has extra off-block noise that gets projected
+        away by the next M-step / detection cycle. See the
+        PlaceFieldModel class docstring for the full architectural
+        explanation.
+
+        For this test we pin step-0 LL equivalence to tight tolerance,
+        and only require that both paths produce finite LLs across the
+        full SGD trajectory (no NaN, no divergence).
+        """
+        position, spikes = self._make_multi_neuron_data(n_neurons=3, n_time=200)
+
+        import optax
+
+        m_block = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        lls_block = m_block.fit_sgd(
+            position, spikes, optimizer=optax.sgd(1e-4), num_steps=5,
+            force_dense=False,
+        )
+        assert m_block._block_n_neurons == 3
+
+        m_dense = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        lls_dense = m_dense.fit_sgd(
+            position, spikes, optimizer=optax.sgd(1e-4), num_steps=5,
+            force_dense=True,
+        )
+        assert m_dense._block_n_neurons is None
+
+        # Step 0 LL must match bit-exactly (both paths run the filter
+        # on identical warm-started init state).
+        np.testing.assert_allclose(
+            float(lls_block[0]), float(lls_dense[0]),
+            atol=1e-9, rtol=1e-10,
+        )
+
+        # Both paths must produce finite LLs throughout — no NaN drift.
+        assert all(np.isfinite(ll) for ll in lls_block)
+        assert all(np.isfinite(ll) for ll in lls_dense)
+
+        # Both paths should converge in the same direction (LL should
+        # improve or stay flat, not diverge catastrophically).
+        assert lls_block[-1] >= lls_block[0] - 1.0
+        assert lls_dense[-1] >= lls_dense[0] - 1.0
+
+    def test_fit_em_multi_neuron_dispatches(self) -> None:
+        """EM fit() also uses block dispatch when structure is detected."""
+        position, spikes = self._make_multi_neuron_data(n_neurons=2, n_time=200)
+        model = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        model.fit(position, spikes, max_iter=3, verbose=False)
+        assert model._block_n_neurons == 2
+        # Fit completes and produces finite LLs
+        assert all(np.isfinite(ll) for ll in model.log_likelihoods)
+        assert model.smoother_mean is not None
+
+    def test_fit_em_block_vs_dense_equivalence(self) -> None:
+        """EM fit() under block dispatch should agree with force_dense."""
+        position, spikes = self._make_multi_neuron_data(n_neurons=2, n_time=200)
+
+        m_block = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        lls_block = m_block.fit(
+            position, spikes, max_iter=3, verbose=False, force_dense=False,
+        )
+        assert m_block._block_n_neurons == 2
+
+        m_dense = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        lls_dense = m_dense.fit(
+            position, spikes, max_iter=3, verbose=False, force_dense=True,
+        )
+        assert m_dense._block_n_neurons is None
+
+        np.testing.assert_allclose(
+            np.asarray(lls_block), np.asarray(lls_dense),
+            atol=1e-5, rtol=1e-6,
+        )

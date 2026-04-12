@@ -3173,6 +3173,39 @@ class TestBlockDiagonalSmootherEquivalence:
                         f"cross_cov off-block ({j},{k}) at t={t} is nonzero"
                     )
 
+    def test_shape_mismatch_guard(self) -> None:
+        """Block dispatch with wrong n_neurons * block_size raises ValueError.
+
+        Regression for the case where caller passes stale dispatch
+        integers — e.g., detected on one problem, reused on another
+        with a different state dimension. The guard catches the
+        inconsistency at dispatch time and raises a clear error
+        naming the mismatch.
+        """
+        n_neurons, block_size, T = 3, 4, 20
+        n_state = n_neurons * block_size  # 12
+        # Build a valid block-diagonal problem of the ACTUAL size
+        init_mean = jnp.zeros(n_state)
+        init_cov = jnp.eye(n_state) * 0.1
+        A = jnp.eye(n_state)
+        Q = jnp.eye(n_state) * 1e-4
+        Z = jnp.zeros((T, n_neurons, n_state))
+        Z_base = jax.random.normal(
+            jax.random.PRNGKey(0), (T, block_size)
+        )
+        for j in range(n_neurons):
+            Z = Z.at[:, j, j * block_size : (j + 1) * block_size].set(Z_base)
+        spikes = jnp.zeros((T, n_neurons), dtype=jnp.int32)
+
+        # Pass WRONG dispatch integers (3 * 6 = 18, but actual n_state = 12)
+        with pytest.raises(ValueError, match="block dispatch shape mismatch"):
+            stochastic_point_process_smoother(
+                init_mean, init_cov, Z, spikes, 0.02, A, Q,
+                log_conditional_intensity,
+                validate_inputs=False,
+                block_n_neurons=3, block_size=6,  # mismatch: 18 != 12
+            )
+
     def test_matches_dense_with_non_symmetric_A_block(self) -> None:
         """Non-symmetric A_block (rotation-damping style) must also match.
 

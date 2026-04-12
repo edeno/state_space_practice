@@ -445,6 +445,98 @@ def _detect_block_diagonal_problem(
     )
 
 
+def _build_block_structure_from_traced(
+    init_mean: Array,
+    init_cov: Array,
+    transition_matrix: Array,
+    process_cov: Array,
+    design_matrix: Array,
+    n_neurons: int,
+    block_size: int,
+) -> BlockDiagonalStructure:
+    """Build a BlockDiagonalStructure from traced arrays using pure slicing.
+
+    Unlike ``_detect_block_diagonal_problem`` — which uses host-side
+    ``float()`` conversions for tolerance scaling and thus cannot run
+    inside ``jax.jit`` / ``jax.grad`` — this helper assumes the caller
+    has ALREADY verified block-diagonal structure (at fit entry time,
+    with concrete arrays) and simply extracts the per-neuron factors
+    via static slicing. It runs safely inside the jit boundary because
+    ``n_neurons`` and ``block_size`` are Python integers (not traced
+    values) and all slicing indices are compile-time constants.
+
+    Used by ``stochastic_point_process_filter``'s auto-dispatch path:
+    the caller runs ``_detect_block_diagonal_problem`` once at fit
+    entry to get ``n_neurons`` / ``block_size``, then passes those
+    integers into the jit-compiled loss function. Inside the loss
+    function, the traced (init_mean, init_cov, A, Q, Z) arrays may
+    differ from the detection-time values (e.g., the SGD optimizer
+    has updated them), but they're guaranteed to preserve the same
+    block-diagonal structure as long as:
+      - the caller uses a block-diagonal parameterization (e.g.,
+        ``process_noise_structure="diagonal"``), AND
+      - ``update_transition_matrix=False`` (no off-block entries
+        can be introduced by EM's M-step).
+
+    The model layer is responsible for calling _detect_block_diagonal_
+    problem at BOTH fit entry AND after each EM M-step to catch any
+    structural regression.
+
+    Parameters
+    ----------
+    init_mean : Array, shape (n_neurons * block_size,)
+    init_cov : Array, shape (n_state, n_state)
+    transition_matrix : Array, shape (n_state, n_state)
+    process_cov : Array, shape (n_state, n_state)
+    design_matrix : Array, shape (n_time, n_neurons, n_state)
+    n_neurons : int
+    block_size : int
+
+    Returns
+    -------
+    BlockDiagonalStructure
+    """
+    nb = block_size
+    # A_block: extract the (0, 0) diagonal block of transition_matrix.
+    # Inside jit this is a static slice on the traced matrix.
+    A_block = transition_matrix[:nb, :nb]
+    Q_block = process_cov[:nb, :nb]
+
+    # Per-neuron init_mean: reshape the concatenated state vector.
+    init_means_per_neuron = init_mean.reshape(n_neurons, nb)
+
+    # Per-neuron init_cov: extract the diagonal blocks via static slicing.
+    # ``n_neurons`` and ``nb`` are Python ints (compile-time constants),
+    # so ``init_cov[j*nb:(j+1)*nb, ...]`` resolves to a static slice at
+    # trace time. Using a Python for-loop over ``range(n_neurons)``
+    # produces one slice op per neuron — fine for realistic n_neurons
+    # (up to ~64) because the loop is unrolled at trace time.
+    init_covs_per_neuron = jnp.stack(
+        [
+            init_cov[
+                j * nb : (j + 1) * nb,
+                j * nb : (j + 1) * nb,
+            ]
+            for j in range(n_neurons)
+        ]
+    )
+
+    # Z_base: neuron 0's own slice is (n_time, block_size). All neurons
+    # share the same Z_base by the block-diagonal contract, so neuron 0
+    # is representative.
+    Z_base = design_matrix[:, 0, 0:nb]
+
+    return BlockDiagonalStructure(
+        A_block=A_block,
+        Q_block=Q_block,
+        init_means_per_neuron=init_means_per_neuron,
+        init_covs_per_neuron=init_covs_per_neuron,
+        Z_base=Z_base,
+        n_neurons=n_neurons,
+        block_size=nb,
+    )
+
+
 def log_conditional_intensity(design_matrix: ArrayLike, params: ArrayLike) -> Array:
     """Computes the log conditional intensity for a point process.
 
@@ -804,6 +896,9 @@ def stochastic_point_process_filter(
     include_laplace_normalization: bool = True,
     max_log_count: float = 20.0,
     validate_inputs: bool = True,
+    block_n_neurons: Optional[int] = None,
+    block_size: Optional[int] = None,
+    force_dense: bool = False,
 ) -> tuple[Array, Array, Array]:
     """Applies a Stochastic State Point Process Filter (SSPPF).
 
@@ -918,6 +1013,55 @@ def stochastic_point_process_filter(
     spike_indicator = jnp.asarray(spike_indicator)
     transition_matrix = jnp.asarray(transition_matrix)
     process_cov = jnp.asarray(process_cov)
+
+    # Block-diagonal dispatch (opt-in via block_n_neurons / block_size).
+    # The caller is responsible for calling _detect_block_diagonal_problem
+    # ONCE at fit entry time (outside jax.jit / jax.grad) to determine
+    # these integers. Inside the jit boundary they are Python constants,
+    # not traced, so we can use them for static slicing of the traced
+    # (init_mean, init_cov, A, Q, design_matrix) arrays into per-neuron
+    # factors. This is safe because block extraction is pure array
+    # slicing — no host-side float() conversions.
+    if (
+        block_n_neurons is not None
+        and block_size is not None
+        and not force_dense
+    ):
+        if spike_indicator.ndim == 1:
+            raise ValueError(
+                "block_n_neurons / block_size can only be passed for "
+                "multi-neuron (2D spike_indicator) inputs."
+            )
+        # Shape guard: block_n_neurons * block_size must match the total
+        # state dimension. A mismatch means the caller passed wrong
+        # detection integers or the model state shape changed between
+        # detection and dispatch.
+        expected_state_dim = block_n_neurons * block_size
+        if init_covariance_params.shape[-1] != expected_state_dim:
+            raise ValueError(
+                f"block dispatch shape mismatch: block_n_neurons="
+                f"{block_n_neurons} * block_size={block_size} = "
+                f"{expected_state_dim}, but init_cov has shape "
+                f"{init_covariance_params.shape}. Re-run "
+                f"_detect_block_diagonal_problem to refresh the "
+                f"dispatch integers."
+            )
+        structure = _build_block_structure_from_traced(
+            init_mean_params,
+            init_covariance_params,
+            transition_matrix,
+            process_cov,
+            design_matrix,
+            block_n_neurons,
+            block_size,
+        )
+        return _stochastic_point_process_filter_block_diagonal(
+            structure,
+            spike_indicator,
+            dt,
+            include_laplace_normalization=include_laplace_normalization,
+            max_log_count=max_log_count,
+        )
 
     # Numerical sanity check. Raises on non-PSD init_cov, warns on f32 +
     # long T + ill-conditioned configurations. Gated behind
@@ -1404,6 +1548,9 @@ def stochastic_point_process_smoother(
     return_filtered: bool = False,
     max_log_count: float = 20.0,
     validate_inputs: bool = True,
+    block_n_neurons: Optional[int] = None,
+    block_size: Optional[int] = None,
+    force_dense: bool = False,
 ) -> tuple[Array, ...]:
     """Applies a Stochastic State Point Process Smoother (SSPPS).
 
@@ -1471,6 +1618,58 @@ def stochastic_point_process_smoother(
         Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
         Neural Computation 16, 971-998 (2004).
     """
+    # Convert to arrays up-front so the dispatch branch can slice.
+    init_mean_params = jnp.asarray(init_mean_params)
+    init_covariance_params = jnp.asarray(init_covariance_params)
+    design_matrix = jnp.asarray(design_matrix)
+    spike_indicator = jnp.asarray(spike_indicator)
+    transition_matrix = jnp.asarray(transition_matrix)
+    process_cov = jnp.asarray(process_cov)
+
+    # Block-diagonal dispatch: same opt-in contract as the filter.
+    # See stochastic_point_process_filter's block-dispatch comment for
+    # the full rationale. If both block_n_neurons and block_size are
+    # provided (as Python ints) and force_dense is False, we short-
+    # circuit to _stochastic_point_process_smoother_block_diagonal
+    # which vmaps the forward and backward passes per-neuron.
+    if (
+        block_n_neurons is not None
+        and block_size is not None
+        and not force_dense
+    ):
+        if spike_indicator.ndim == 1:
+            raise ValueError(
+                "block_n_neurons / block_size can only be passed for "
+                "multi-neuron (2D spike_indicator) inputs."
+            )
+        expected_state_dim = block_n_neurons * block_size
+        if init_covariance_params.shape[-1] != expected_state_dim:
+            raise ValueError(
+                f"block dispatch shape mismatch: block_n_neurons="
+                f"{block_n_neurons} * block_size={block_size} = "
+                f"{expected_state_dim}, but init_cov has shape "
+                f"{init_covariance_params.shape}. Re-run "
+                f"_detect_block_diagonal_problem to refresh the "
+                f"dispatch integers."
+            )
+        structure = _build_block_structure_from_traced(
+            init_mean_params,
+            init_covariance_params,
+            transition_matrix,
+            process_cov,
+            design_matrix,
+            block_n_neurons,
+            block_size,
+        )
+        return _stochastic_point_process_smoother_block_diagonal(
+            structure,
+            spike_indicator,
+            dt,
+            include_laplace_normalization=include_laplace_normalization,
+            max_log_count=max_log_count,
+            return_filtered=return_filtered,
+        )
+
     filtered_mean, filtered_cov, marginal_log_likelihood = (
         stochastic_point_process_filter(
             init_mean_params,
