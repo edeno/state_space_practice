@@ -1009,6 +1009,120 @@ def stochastic_point_process_filter(
     return filtered_mean, filtered_cov, marginal_log_likelihood
 
 
+def _run_forward_block_diagonal(
+    structure: BlockDiagonalStructure,
+    spike_indicator: Array,
+    dt: float,
+    include_laplace_normalization: bool = True,
+    max_log_count: float = 20.0,
+) -> tuple[Array, Array, Array]:
+    """Run the per-neuron forward Laplace-EKF filter in block form.
+
+    Shared helper for ``_stochastic_point_process_filter_block_diagonal``
+    and ``_stochastic_point_process_smoother_block_diagonal``. Both
+    consumers need access to the per-neuron forward posteriors —
+    the filter reassembles them into dense form immediately, while
+    the smoother feeds them to the backward pass before reassembly.
+
+    Parameters
+    ----------
+    structure : BlockDiagonalStructure
+    spike_indicator : Array, shape (n_time, n_neurons)
+    dt : float
+    include_laplace_normalization : bool, default=True
+    max_log_count : float, default=20.0
+
+    Returns
+    -------
+    fwd_means : Array, shape (n_neurons, n_time, block_size)
+        Per-neuron forward posterior means at each time step.
+    fwd_covs : Array, shape (n_neurons, n_time, block_size, block_size)
+        Per-neuron forward posterior covariances.
+    lls_per_neuron : Array, shape (n_neurons,)
+        Per-neuron marginal log-likelihood (sum over time steps).
+    """
+    A_block = structure.A_block
+    Q_block = structure.Q_block
+
+    def _step_one_neuron(carry, args):
+        mean_prev, cov_prev, ll_acc = carry
+        z_row_t, y_t = args
+        one_step_mean = A_block @ mean_prev
+        cov_prev_sym = symmetrize(cov_prev)
+        one_step_cov = symmetrize(
+            A_block @ cov_prev_sym @ A_block.T + Q_block
+        )
+        spike_as_vec = jnp.atleast_1d(y_t)
+
+        def _lin(x_block: Array) -> Array:
+            return jnp.atleast_1d(z_row_t @ x_block)
+
+        def _grad(_x_block: Array) -> Array:
+            # Analytical gradient: d(log_intensity)/dx = z_row_t.
+            # Safe because _detect_block_diagonal_problem's contract
+            # requires a Z_base-block design matrix, which produces a
+            # strictly linear log_intensity. The block-diagonal path
+            # cannot receive a nonlinear intensity (e.g. PositionDecoder's
+            # KDE rate map) — detection rejects ndim==2 design matrices.
+            return z_row_t[None, :]
+
+        post_mean, post_cov, log_lik_step = _point_process_laplace_update(
+            one_step_mean,
+            one_step_cov,
+            spike_as_vec,
+            dt,
+            _lin,
+            grad_log_intensity_func=_grad,
+            include_laplace_normalization=include_laplace_normalization,
+            max_log_count=max_log_count,
+        )
+        return (
+            (post_mean, post_cov, ll_acc + log_lik_step),
+            (post_mean, post_cov),
+        )
+
+    def _run_one_neuron(init_mean_j: Array, init_cov_j: Array, spikes_j: Array):
+        init_carry = (init_mean_j, init_cov_j, jnp.array(0.0, dtype=init_mean_j.dtype))
+        (_, _, ll_j), (means_j, covs_j) = jax.lax.scan(
+            _step_one_neuron,
+            init_carry,
+            (structure.Z_base, spikes_j),
+        )
+        return means_j, covs_j, ll_j
+
+    return jax.vmap(_run_one_neuron, in_axes=(0, 0, 1))(
+        structure.init_means_per_neuron,
+        structure.init_covs_per_neuron,
+        spike_indicator,
+    )
+
+
+def _assemble_block_diagonal_covs(
+    covs_per_neuron: Array,
+    n_neurons: int,
+    block_size: int,
+) -> Array:
+    """Reassemble (n_neurons, n_time, nb, nb) blocks into a dense
+    (n_time, n_state, n_state) block-diagonal matrix via a single
+    broadcasted scatter.
+
+    Shared between the filter and smoother for cov / cross_cov reassembly.
+    """
+    n_state = n_neurons * block_size
+    block_offsets = jnp.arange(n_neurons) * block_size
+    within_block = jnp.arange(block_size)
+    row_idx = block_offsets[:, None] + within_block[None, :]
+    col_idx = row_idx
+
+    def _assemble_one(covs_at_t: Array) -> Array:
+        dense = jnp.zeros((n_state, n_state), dtype=covs_at_t.dtype)
+        return dense.at[row_idx[:, :, None], col_idx[:, None, :]].set(covs_at_t)
+
+    # Input: (n_neurons, n_time_dim, nb, nb). Transpose to put time first.
+    covs_time_first = jnp.transpose(covs_per_neuron, (1, 0, 2, 3))
+    return jax.vmap(_assemble_one)(covs_time_first)
+
+
 def _stochastic_point_process_filter_block_diagonal(
     structure: BlockDiagonalStructure,
     spike_indicator: Array,
@@ -1085,122 +1199,28 @@ def _stochastic_point_process_filter_block_diagonal(
     nb = structure.block_size
     n_state = n_neurons * nb
     n_time = structure.Z_base.shape[0]
-    A_block = structure.A_block
-    Q_block = structure.Q_block
 
-    # Per-neuron Laplace-EKF scan. Each neuron sees a scalar observation
-    # (its own spike count at time t) and a (nb,) state vector. The
-    # log-intensity function for neuron j at time t is `z_j_t @ x_j`,
-    # which is a scalar — wrap it to `(1,)` because
-    # _point_process_laplace_update expects an n_obs-dimensional output.
-    def _step_one_neuron(carry, args):
-        mean_prev, cov_prev, ll_acc = carry
-        z_row_t, y_t = args  # z_row_t: (nb,), y_t: scalar
-
-        # Predict step (block-level). Matches the dense filter's
-        # symmetric predict from A4 for consistency.
-        one_step_mean = A_block @ mean_prev
-        cov_prev_sym = symmetrize(cov_prev)
-        one_step_cov = symmetrize(
-            A_block @ cov_prev_sym @ A_block.T + Q_block
-        )
-
-        # Laplace update at per-neuron scale. The observation is a
-        # scalar spike count; wrap to (1,) for the update helper.
-        spike_as_vec = jnp.atleast_1d(y_t)
-
-        def _lin(x_block: Array) -> Array:
-            return jnp.atleast_1d(z_row_t @ x_block)
-
-        def _grad(x_block: Array) -> Array:
-            # Analytical gradient: d(log_intensity)/dx = z_row_t.
-            # Faster than jax.jacfwd on this linear function, and
-            # avoids reconstructing the gradient function per step.
-            #
-            # Safe because _detect_block_diagonal_problem's contract
-            # requires a Z_base-block design matrix, which produces a
-            # strictly linear log_intensity (log_lambda = Z @ x). The
-            # block-diagonal path cannot receive a nonlinear intensity
-            # function like PositionDecoder's KDE rate map — detection
-            # rejects ndim==2 design matrices.
-            return z_row_t[None, :]
-
-        post_mean, post_cov, log_lik_step = _point_process_laplace_update(
-            one_step_mean,
-            one_step_cov,
-            spike_as_vec,
-            dt,
-            _lin,
-            grad_log_intensity_func=_grad,
-            include_laplace_normalization=include_laplace_normalization,
-            max_log_count=max_log_count,
-        )
-        return (
-            (post_mean, post_cov, ll_acc + log_lik_step),
-            (post_mean, post_cov),
-        )
-
-    def _run_one_neuron(init_mean_j: Array, init_cov_j: Array, spikes_j: Array):
-        """Scan one neuron over time.
-
-        ``Z_base`` is captured from the enclosing scope as a non-vmapped
-        input (all neurons share the same basis by BlockDiagonalStructure
-        contract).
-        """
-        init_carry = (init_mean_j, init_cov_j, jnp.array(0.0, dtype=init_mean_j.dtype))
-        (_, _, ll_j), (means_j, covs_j) = jax.lax.scan(
-            _step_one_neuron,
-            init_carry,
-            (structure.Z_base, spikes_j),
-        )
-        return means_j, covs_j, ll_j
-
-    # vmap over neurons: each neuron gets its own init_mean_j, init_cov_j,
-    # and column of spike_indicator. Z_base is captured (not vmapped).
-    means_per_neuron, covs_per_neuron, lls_per_neuron = jax.vmap(
-        _run_one_neuron, in_axes=(0, 0, 1)
-    )(
-        structure.init_means_per_neuron,
-        structure.init_covs_per_neuron,
+    # Forward pass via the shared per-neuron scan helper.
+    means_per_neuron, covs_per_neuron, lls_per_neuron = _run_forward_block_diagonal(
+        structure,
         spike_indicator,
+        dt,
+        include_laplace_normalization=include_laplace_normalization,
+        max_log_count=max_log_count,
     )
     # means_per_neuron: (n_neurons, n_time, nb)
     # covs_per_neuron: (n_neurons, n_time, nb, nb)
     # lls_per_neuron: (n_neurons,)
 
     # Reassemble concatenated filtered_mean of shape (n_time, n_state).
-    # Transpose to (n_time, n_neurons, nb), then reshape to (n_time, n_state).
-    filtered_mean = jnp.transpose(means_per_neuron, (1, 0, 2)).reshape(n_time, n_state)
+    filtered_mean = jnp.transpose(means_per_neuron, (1, 0, 2)).reshape(
+        n_time, n_state
+    )
 
-    # Reassemble block-diagonal filtered_cov of shape (n_time, n_state, n_state).
-    # For each time step, place each per-neuron (nb, nb) block on the diagonal.
-    # This is the dense-form API that downstream callers expect. A future
-    # optimization could return a BlockCovariance view to avoid the O(n_state^2)
-    # zero-padding per time step.
-    #
-    # Implementation: use advanced indexing (a single `.at[...].set(...)`
-    # scatter) rather than a Python for-loop over blocks. The loop approach
-    # creates O(n_neurons) static scatter nodes in the XLA program, which
-    # inflates compile time for large n_neurons. The single-scatter form
-    # produces one gather node regardless of n_neurons.
-    covs_time_first = jnp.transpose(covs_per_neuron, (1, 0, 2, 3))
-    # (n_time, n_neurons, nb, nb)
-
-    # Precompute the row/column indices of the diagonal blocks. For block j,
-    # rows/cols live in [j*nb : (j+1)*nb]. Shape: (n_neurons, nb).
-    block_offsets = jnp.arange(n_neurons) * nb
-    within_block = jnp.arange(nb)
-    row_idx = block_offsets[:, None] + within_block[None, :]  # (n_neurons, nb)
-    col_idx = row_idx  # diagonal blocks share the same row and column indices
-
-    def _assemble_one_step(covs_at_t: Array) -> Array:
-        # covs_at_t: (n_neurons, nb, nb). Output: (n_state, n_state).
-        dense = jnp.zeros((n_state, n_state), dtype=covs_at_t.dtype)
-        # Broadcasted fancy indexing: sets dense[row_idx[j, a], col_idx[j, b]]
-        # = covs_at_t[j, a, b] for all j, a, b in one scatter.
-        return dense.at[row_idx[:, :, None], col_idx[:, None, :]].set(covs_at_t)
-
-    filtered_cov = jax.vmap(_assemble_one_step)(covs_time_first)
+    # Reassemble dense block-diagonal filtered_cov via the shared scatter
+    # helper. A future optimization could return a BlockCovariance view
+    # to avoid the O(n_state^2) zero-padding per time step.
+    filtered_cov = _assemble_block_diagonal_covs(covs_per_neuron, n_neurons, nb)
 
     # Marginal log-likelihood: sum across neurons. For block-diagonal
     # problems, log p(y_t | y_{1:t-1}) decomposes as a sum of per-neuron
@@ -1210,6 +1230,165 @@ def _stochastic_point_process_filter_block_diagonal(
     marginal_ll = jnp.sum(lls_per_neuron)
 
     return filtered_mean, filtered_cov, marginal_ll
+
+
+def _stochastic_point_process_smoother_block_diagonal(
+    structure: BlockDiagonalStructure,
+    spike_indicator: Array,
+    dt: float,
+    include_laplace_normalization: bool = True,
+    max_log_count: float = 20.0,
+    return_filtered: bool = False,
+) -> tuple[Array, ...]:
+    """Block-diagonal RTS smoother via vmapped per-neuron backward pass.
+
+    Runs the block-diagonal forward filter
+    (``_stochastic_point_process_filter_block_diagonal``) to get
+    per-neuron filtered posteriors, then runs the standard RTS backward
+    pass INDEPENDENTLY per neuron via jax.vmap. The smoother is
+    observation-model-agnostic — it operates only on Gaussian moments —
+    so the block-diagonal decomposition propagates through the backward
+    pass without any additional algebra.
+
+    Mathematical equivalence
+    ------------------------
+    The RTS backward step ``_kalman_smoother_update`` uses only:
+
+    - Per-time-step filter mean and covariance (per-neuron in the block form)
+    - ``transition_matrix`` (per-neuron ``A_block``)
+    - ``process_cov`` (per-neuron ``Q_block``)
+
+    All of these are block-diagonal by construction. The smoother gain
+    ``J_t = P_{t|t} A^T (A P_{t|t} A^T + Q)^{-1}`` has block-diagonal
+    structure when ``P_{t|t}``, ``A``, and ``Q`` are all block-diagonal,
+    so the backward update decomposes neuron-by-neuron. Running the
+    backward pass per-neuron is mathematically identical to running it
+    on the full dense state.
+
+    Output shape compatibility
+    --------------------------
+    Returns dense ``(n_time, n_state, n_state)`` covariances and
+    ``(n_time - 1, n_state, n_state)`` cross-covariances, reassembled
+    from per-neuron blocks via the same scatter-into-zero-matrix pattern
+    as the forward filter. Downstream callers (EM M-step, confidence
+    intervals) see the same API as the dense smoother.
+
+    Parameters
+    ----------
+    structure : BlockDiagonalStructure
+    spike_indicator : Array, shape (n_time, n_neurons)
+    dt : float
+    include_laplace_normalization : bool, default=True
+    max_log_count : float, default=20.0
+    return_filtered : bool, default=False
+        If True, also return the filtered mean and covariance.
+
+    Returns
+    -------
+    smoother_mean : Array, shape (n_time, n_state)
+    smoother_cov : Array, shape (n_time, n_state, n_state)
+    smoother_cross_cov : Array, shape (n_time - 1, n_state, n_state)
+    marginal_log_likelihood : Array, scalar
+    filtered_mean, filtered_cov : Array (optional, if return_filtered=True)
+    """
+    n_neurons = structure.n_neurons
+    nb = structure.block_size
+    n_state = n_neurons * nb
+    A_block = structure.A_block
+    Q_block = structure.Q_block
+
+    # Forward pass via the shared per-neuron helper. Returns per-neuron
+    # moments (n_neurons, n_time, nb) that the backward pass can consume
+    # directly, without going through the dense reassembly.
+    fwd_means, fwd_covs, lls_per_neuron = _run_forward_block_diagonal(
+        structure,
+        spike_indicator,
+        dt,
+        include_laplace_normalization=include_laplace_normalization,
+        max_log_count=max_log_count,
+    )
+    # fwd_means: (n_neurons, n_time, nb)
+    # fwd_covs: (n_neurons, n_time, nb, nb)
+
+    # Backward RTS smoother pass per neuron. _kalman_smoother_update is
+    # observation-model-agnostic — it uses only A, Q, and the filtered
+    # Gaussian moments. For block-diagonal A and Q, the backward pass
+    # decomposes into independent per-neuron smoothers, exactly matching
+    # the dense filter's backward pass on the block-diagonal problem.
+
+    def _backward_step(carry, args):
+        next_smoother_mean, next_smoother_cov = carry
+        filter_mean, filter_cov = args
+        sm, sc, scc = _kalman_smoother_update(
+            next_smoother_mean,
+            next_smoother_cov,
+            filter_mean,
+            filter_cov,
+            Q_block,
+            A_block,
+        )
+        return (sm, sc), (sm, sc, scc)
+
+    def _run_backward_one_neuron(means_j, covs_j):
+        # Initial carry: the last-time-step filtered posterior.
+        (_, _), (sm_rev, sc_rev, scc_rev) = jax.lax.scan(
+            _backward_step,
+            (means_j[-1], covs_j[-1]),
+            (means_j[:-1], covs_j[:-1]),
+            reverse=True,
+        )
+        # Append the last time step's filter posterior (no backward update)
+        sm_full = jnp.concatenate((sm_rev, means_j[-1][None]))
+        sc_full = jnp.concatenate((sc_rev, covs_j[-1][None]))
+        return sm_full, sc_full, scc_rev
+
+    (
+        smoother_means_per_neuron,
+        smoother_covs_per_neuron,
+        smoother_cross_covs_per_neuron,
+    ) = jax.vmap(_run_backward_one_neuron)(fwd_means, fwd_covs)
+    # smoother_means_per_neuron: (n_neurons, n_time, nb)
+    # smoother_covs_per_neuron:  (n_neurons, n_time, nb, nb)
+    # smoother_cross_covs_per_neuron: (n_neurons, n_time - 1, nb, nb)
+
+    n_time = structure.Z_base.shape[0]
+
+    # Reassemble concatenated smoother_mean (n_time, n_state).
+    smoother_mean = jnp.transpose(smoother_means_per_neuron, (1, 0, 2)).reshape(
+        n_time, n_state
+    )
+
+    # Reassemble block-diagonal covariances (n_time, n_state, n_state)
+    # and cross-covariances (n_time-1, n_state, n_state) via the shared
+    # scatter helper. Matches the dense smoother API.
+    #
+    # Cross-cov index convention: _kalman_smoother_update returns
+    # ``J_t @ P_{t+1|T}``, which is the smoothed lag-one cross-cov
+    # ``P_{t, t+1|T}`` (current-next). EM M-step consumers expect this
+    # convention, so we preserve it in the block reassembly — see the
+    # dense smoother's "# Lag-one cross covariance P_{t, t+1|T}" comment
+    # in ``_kalman_smoother_update``.
+    smoother_cov = _assemble_block_diagonal_covs(
+        smoother_covs_per_neuron, n_neurons, nb
+    )
+    smoother_cross_cov = _assemble_block_diagonal_covs(
+        smoother_cross_covs_per_neuron, n_neurons, nb
+    )
+
+    marginal_ll = jnp.sum(lls_per_neuron)
+
+    if return_filtered:
+        filtered_mean = jnp.transpose(fwd_means, (1, 0, 2)).reshape(n_time, n_state)
+        filtered_cov = _assemble_block_diagonal_covs(fwd_covs, n_neurons, nb)
+        return (
+            smoother_mean,
+            smoother_cov,
+            smoother_cross_cov,
+            marginal_ll,
+            filtered_mean,
+            filtered_cov,
+        )
+    return smoother_mean, smoother_cov, smoother_cross_cov, marginal_ll
 
 
 def stochastic_point_process_smoother(

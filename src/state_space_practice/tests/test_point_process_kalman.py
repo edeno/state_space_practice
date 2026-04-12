@@ -17,6 +17,7 @@ from state_space_practice.point_process_kalman import (
     _logdet_psd,
     _point_process_laplace_update,
     _stochastic_point_process_filter_block_diagonal,
+    _stochastic_point_process_smoother_block_diagonal,
     _validate_filter_numerics,
     get_confidence_interval,
     kalman_maximization_step,
@@ -2964,3 +2965,287 @@ class TestBlockDiagonalFilterEquivalence:
                     assert float(jnp.max(jnp.abs(sub))) < 1e-12, (
                         f"off-block ({j}, {k}) at t={t} is not zero"
                     )
+
+
+class TestBlockDiagonalSmootherEquivalence:
+    """Prove the block-diagonal smoother produces identical output to
+    the dense smoother on block-diagonal problems.
+
+    The RTS backward pass is observation-model-agnostic and operates on
+    the already-computed filtered Gaussians. For block-diagonal A, Q,
+    and filtered posteriors, the smoother gain and backward update
+    decompose into independent per-neuron operations. These tests pin
+    that the per-neuron decomposition produces bit-for-bit equivalent
+    output (within f64 numerical precision).
+    """
+
+    def _make_problem(self, n_neurons, block_size, T=50, seed=0):
+        """Same construction as TestBlockDiagonalFilterEquivalence so
+        the two test classes operate on identical inputs."""
+        key = jax.random.PRNGKey(seed)
+        k_m, k_Z, k_spikes = jax.random.split(key, 3)
+        n_state = n_neurons * block_size
+        dt = 0.02
+
+        A_block = 0.98 * jnp.eye(block_size) + 0.01 * jax.random.normal(
+            k_m, (block_size, block_size)
+        )
+        A_block = (A_block + A_block.T) / 2
+        Q_block = jnp.eye(block_size) * 1e-5
+
+        A = jnp.zeros((n_state, n_state))
+        Q = jnp.zeros((n_state, n_state))
+        for j in range(n_neurons):
+            A = A.at[
+                j * block_size : (j + 1) * block_size,
+                j * block_size : (j + 1) * block_size,
+            ].set(A_block)
+            Q = Q.at[
+                j * block_size : (j + 1) * block_size,
+                j * block_size : (j + 1) * block_size,
+            ].set(Q_block)
+
+        init_cov = jnp.zeros((n_state, n_state))
+        for j in range(n_neurons):
+            block = jnp.eye(block_size) * (0.05 + 0.02 * j)
+            init_cov = init_cov.at[
+                j * block_size : (j + 1) * block_size,
+                j * block_size : (j + 1) * block_size,
+            ].set(block)
+
+        init_mean = jax.random.normal(k_m, (n_state,)) * 0.1
+        Z_base = jax.random.normal(k_Z, (T, block_size)) * 0.3
+        Z = jnp.zeros((T, n_neurons, n_state))
+        for j in range(n_neurons):
+            Z = Z.at[:, j, j * block_size : (j + 1) * block_size].set(Z_base)
+
+        rates = jnp.ones((T, n_neurons)) * 1.0
+        spikes = jax.random.poisson(k_spikes, rates).astype(jnp.int32)
+        return init_mean, init_cov, A, Q, Z, spikes, dt
+
+    def _run_both_paths(
+        self,
+        init_mean,
+        init_cov,
+        A,
+        Q,
+        Z,
+        spikes,
+        dt,
+        include_laplace_normalization=True,
+        return_filtered=False,
+    ):
+        dense_result = stochastic_point_process_smoother(
+            init_mean,
+            init_cov,
+            Z,
+            spikes,
+            dt,
+            A,
+            Q,
+            log_conditional_intensity,
+            include_laplace_normalization=include_laplace_normalization,
+            return_filtered=return_filtered,
+            validate_inputs=False,
+        )
+        structure = _detect_block_diagonal_problem(init_mean, init_cov, A, Q, Z)
+        assert structure is not None
+        block_result = _stochastic_point_process_smoother_block_diagonal(
+            structure,
+            spikes,
+            dt,
+            include_laplace_normalization=include_laplace_normalization,
+            return_filtered=return_filtered,
+        )
+        return dense_result, block_result
+
+    def test_smoother_mean_matches_dense_2_neurons(self) -> None:
+        problem = self._make_problem(n_neurons=2, block_size=4, T=30)
+        dense, block = self._run_both_paths(*problem)
+        np.testing.assert_allclose(
+            np.asarray(block[0]), np.asarray(dense[0]),
+            atol=1e-10, rtol=1e-10,
+        )
+
+    def test_smoother_cov_matches_dense_2_neurons(self) -> None:
+        problem = self._make_problem(n_neurons=2, block_size=4, T=30)
+        dense, block = self._run_both_paths(*problem)
+        np.testing.assert_allclose(
+            np.asarray(block[1]), np.asarray(dense[1]),
+            atol=1e-10, rtol=1e-10,
+        )
+
+    def test_smoother_cross_cov_matches_dense_2_neurons(self) -> None:
+        """Cross-covariance must match to machine precision. Used by
+        the EM M-step, so this is correctness-critical."""
+        problem = self._make_problem(n_neurons=2, block_size=4, T=30)
+        dense, block = self._run_both_paths(*problem)
+        np.testing.assert_allclose(
+            np.asarray(block[2]), np.asarray(dense[2]),
+            atol=1e-10, rtol=1e-10,
+        )
+
+    def test_marginal_ll_matches_dense_2_neurons(self) -> None:
+        problem = self._make_problem(n_neurons=2, block_size=4, T=30)
+        dense, block = self._run_both_paths(*problem)
+        np.testing.assert_allclose(
+            float(block[3]), float(dense[3]), atol=1e-9, rtol=1e-10,
+        )
+
+    def test_matches_dense_3_neurons_longer_sequence(self) -> None:
+        """3 neurons, T=100, block_size=6 — non-trivial vmap + scan scale."""
+        problem = self._make_problem(
+            n_neurons=3, block_size=6, T=100, seed=42
+        )
+        dense, block = self._run_both_paths(*problem)
+        np.testing.assert_allclose(
+            np.asarray(block[0]), np.asarray(dense[0]), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            np.asarray(block[1]), np.asarray(dense[1]), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            np.asarray(block[2]), np.asarray(dense[2]), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            float(block[3]), float(dense[3]), atol=1e-8, rtol=1e-10
+        )
+
+    def test_matches_dense_with_return_filtered(self) -> None:
+        """return_filtered=True must produce matching filtered outputs
+        in addition to the smoother outputs."""
+        problem = self._make_problem(n_neurons=3, block_size=4, T=30)
+        dense, block = self._run_both_paths(*problem, return_filtered=True)
+        # Smoother outputs
+        np.testing.assert_allclose(
+            np.asarray(block[0]), np.asarray(dense[0]), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            np.asarray(block[1]), np.asarray(dense[1]), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            np.asarray(block[2]), np.asarray(dense[2]), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            float(block[3]), float(dense[3]), atol=1e-9
+        )
+        # Filtered outputs (index 4 and 5)
+        np.testing.assert_allclose(
+            np.asarray(block[4]), np.asarray(dense[4]), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            np.asarray(block[5]), np.asarray(dense[5]), atol=1e-10
+        )
+
+    def test_smoother_cov_is_block_diagonal(self) -> None:
+        problem = self._make_problem(n_neurons=3, block_size=4, T=20)
+        _, block = self._run_both_paths(*problem)
+        smoother_cov = block[1]
+        n_neurons, nb = 3, 4
+        for t in range(smoother_cov.shape[0]):
+            for j in range(n_neurons):
+                for k in range(n_neurons):
+                    if j == k:
+                        continue
+                    sub = smoother_cov[
+                        t, j * nb : (j + 1) * nb, k * nb : (k + 1) * nb
+                    ]
+                    assert float(jnp.max(jnp.abs(sub))) < 1e-12, (
+                        f"smoother off-block ({j},{k}) at t={t} is nonzero"
+                    )
+
+    def test_smoother_cross_cov_is_block_diagonal(self) -> None:
+        """Cross-covariance must also be block-diagonal — EM M-step
+        consumers rely on this for correct sufficient statistics."""
+        problem = self._make_problem(n_neurons=3, block_size=4, T=20)
+        _, block = self._run_both_paths(*problem)
+        cross_cov = block[2]
+        n_neurons, nb = 3, 4
+        for t in range(cross_cov.shape[0]):
+            for j in range(n_neurons):
+                for k in range(n_neurons):
+                    if j == k:
+                        continue
+                    sub = cross_cov[
+                        t, j * nb : (j + 1) * nb, k * nb : (k + 1) * nb
+                    ]
+                    assert float(jnp.max(jnp.abs(sub))) < 1e-12, (
+                        f"cross_cov off-block ({j},{k}) at t={t} is nonzero"
+                    )
+
+    def test_matches_dense_with_non_symmetric_A_block(self) -> None:
+        """Non-symmetric A_block (rotation-damping style) must also match.
+
+        The default _make_problem symmetrizes A_block for simplicity,
+        which makes the smoother gain formula simplify. A real oscillator
+        transition matrix is non-symmetric (has complex eigenvalues in
+        conjugate pairs). This test verifies the per-neuron backward
+        scan handles non-symmetric A correctly, matching the dense
+        smoother output to f64 precision.
+        """
+        key = jax.random.PRNGKey(99)
+        n_neurons, block_size, T = 2, 4, 40
+        n_state = n_neurons * block_size
+
+        # Rotation-damping style A_block: damped oscillation with
+        # frequency ω=1 and damping ratio ζ=0.05, discretized at dt=0.02.
+        # This is strictly non-symmetric.
+        theta = 0.02  # ~ ω * dt
+        damp = 0.98
+        A_block = damp * jnp.array(
+            [
+                [jnp.cos(theta), -jnp.sin(theta), 0.0, 0.0],
+                [jnp.sin(theta), jnp.cos(theta), 0.0, 0.0],
+                [0.0, 0.0, jnp.cos(theta * 2), -jnp.sin(theta * 2)],
+                [0.0, 0.0, jnp.sin(theta * 2), jnp.cos(theta * 2)],
+            ]
+        )
+        # Confirm it's non-symmetric
+        assert not jnp.allclose(A_block, A_block.T), (
+            "test setup error: A_block is symmetric"
+        )
+
+        Q_block = jnp.eye(block_size) * 1e-5
+        A = jnp.zeros((n_state, n_state))
+        Q = jnp.zeros((n_state, n_state))
+        for j in range(n_neurons):
+            A = A.at[
+                j * block_size : (j + 1) * block_size,
+                j * block_size : (j + 1) * block_size,
+            ].set(A_block)
+            Q = Q.at[
+                j * block_size : (j + 1) * block_size,
+                j * block_size : (j + 1) * block_size,
+            ].set(Q_block)
+
+        init_cov = jnp.zeros((n_state, n_state))
+        for j in range(n_neurons):
+            init_cov = init_cov.at[
+                j * block_size : (j + 1) * block_size,
+                j * block_size : (j + 1) * block_size,
+            ].set(jnp.eye(block_size) * (0.05 + 0.02 * j))
+
+        init_mean = jax.random.normal(key, (n_state,)) * 0.1
+        Z_base = jax.random.normal(jax.random.PRNGKey(101), (T, block_size)) * 0.3
+        Z = jnp.zeros((T, n_neurons, n_state))
+        for j in range(n_neurons):
+            Z = Z.at[:, j, j * block_size : (j + 1) * block_size].set(Z_base)
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(102), jnp.ones((T, n_neurons))
+        ).astype(jnp.int32)
+
+        dense, block = self._run_both_paths(
+            init_mean, init_cov, A, Q, Z, spikes, 0.02
+        )
+        np.testing.assert_allclose(
+            np.asarray(block[0]), np.asarray(dense[0]), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            np.asarray(block[1]), np.asarray(dense[1]), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            np.asarray(block[2]), np.asarray(dense[2]), atol=1e-10
+        )
+        np.testing.assert_allclose(
+            float(block[3]), float(dense[3]), atol=1e-9
+        )
