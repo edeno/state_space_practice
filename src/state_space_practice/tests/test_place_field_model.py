@@ -1483,3 +1483,69 @@ class TestBlockDiagonalDispatch:
             np.asarray(lls_block), np.asarray(lls_dense),
             atol=1e-5, rtol=1e-6,
         )
+
+    def test_em_falls_back_to_dense_when_m_step_breaks_structure(self) -> None:
+        """When update_transition_matrix=True, the M-step writes back a
+        dense A that breaks block-diagonal structure. The next E-step
+        must automatically fall back to the dense filter path.
+
+        Regression for the re-detect-after-M-step logic. Without this
+        re-detection, the next E-step would call _build_block_structure_
+        from_traced on a non-block-diagonal A, silently applying block
+        0's A to every neuron and producing wrong results.
+
+        We verify by checking that ``_block_n_neurons`` is set to None
+        after the first M-step, AND that the fit completes without
+        crashing (the dense path handles the dense A correctly).
+        """
+        position, spikes = self._make_multi_neuron_data(
+            n_neurons=2, n_time=300
+        )
+        model = PlaceFieldModel(
+            dt=0.02,
+            n_interior_knots=3,
+            update_transition_matrix=True,  # allows M-step to learn A
+        )
+        lls = model.fit(position, spikes, max_iter=2, verbose=False)
+
+        # After the first M-step, A may no longer be block-diagonal
+        # (the M-step formula produces a full matrix when
+        # update_transition_matrix=True). The re-detect logic should
+        # set _block_n_neurons=None in that case, falling back to dense.
+        # We don't strictly require the fall-back to happen (if the
+        # learned A happens to be block-diagonal by luck, detection
+        # still succeeds), but the fit must complete without crashing.
+        assert len(lls) >= 1
+        assert all(np.isfinite(ll) for ll in lls)
+        assert model.smoother_mean is not None
+        # If the M-step did produce a non-block-diagonal A, verify
+        # that fall-back happened and the dense path produced the fit.
+        from state_space_practice.point_process_kalman import (
+            _is_block_diagonal,
+        )
+
+        if not _is_block_diagonal(
+            model.transition_matrix,
+            n_blocks=2,
+            block_size=model.n_basis_per_neuron,
+        ):
+            assert model._block_n_neurons is None, (
+                "A became non-block-diagonal but re-detect did not "
+                "flip the dispatch to dense"
+            )
+
+    def test_score_reuses_fit_time_dispatch(self) -> None:
+        """score() should reuse the block dispatch decision made at fit time
+        without re-detecting. This keeps score() fast — detection is
+        O(d^3) for eigvalsh-free checks but still ~ms-scale — while
+        guaranteeing consistency between fit and score outputs."""
+        position, spikes = self._make_multi_neuron_data(n_neurons=3, n_time=100)
+        model = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        model.fit(position, spikes, max_iter=2, verbose=False)
+        assert model._block_n_neurons == 3
+
+        # score() on the fitted model should produce finite output
+        # while still having _block_n_neurons set.
+        ll = model.score(position, spikes)
+        assert np.isfinite(ll)
+        assert model._block_n_neurons == 3  # dispatch state preserved
