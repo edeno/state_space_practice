@@ -977,6 +977,11 @@ class ContingencyBeliefModel(SGDFittableMixin):
         rewards = jnp.asarray(rewards, dtype=jnp.int32)
         self._n_trials = int(choices.shape[0])
 
+        # Clear stale observation covariates from a previous fit_sgd() or
+        # predict() call.  EM does not support obs covariates, and leaving
+        # _obs_design_matrix set would silently leak them into _smoother_kwargs.
+        self._obs_design_matrix = None
+
         if transition_covariates is not None:
             cov = jnp.asarray(transition_covariates)
         else:
