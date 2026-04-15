@@ -200,7 +200,16 @@ def dirichlet_neg_log_likelihood(
 ) -> Array:
     """Negative expected complete log-likelihood for transition M-step.
 
-    Combines multinomial cross-entropy with Dirichlet prior.
+    Computes a penalized multinomial cross-entropy loss.  The ``alpha``
+    parameter adds ``(alpha - 1)`` pseudo-counts to each trial's expected
+    counts, which acts as a Dirichlet-like smoothing term.
+
+    Note: this is **not** a proper Dirichlet prior when transitions are
+    covariate-dependent (multinomial-logit).  A Dirichlet prior is conjugate
+    to a single probability vector, not to a sequence of softmax-
+    parameterized probabilities.  The smoothing still regularizes the
+    coefficients toward uniform transitions, but the resulting MAP estimate
+    does not correspond to a Bayesian posterior under any Dirichlet prior.
 
     Parameters
     ----------
@@ -210,7 +219,9 @@ def dirichlet_neg_log_likelihood(
     response : Array, shape (n_samples, n_states)
         Expected counts (from joint distribution) for this from-state.
     alpha : Array, shape (n_states,)
-        Dirichlet prior for this row.
+        Pseudo-count smoothing (acts like Dirichlet alpha for the
+        intercept-only case, but is only an approximation when
+        covariates are present).
     l2_penalty : float
         L2 on non-intercept coefficients.
 
@@ -224,7 +235,11 @@ def dirichlet_neg_log_likelihood(
 
     n_samples = response.shape[0]
     prior = alpha - 1.0
-    neg_ll = -jnp.sum((response + prior) * log_probs) / n_samples
+    # Data term: average per sample.
+    # Prior term: average log_probs over samples so the regularization
+    # strength is constant regardless of dataset size.
+    avg_log_probs = jnp.mean(log_probs, axis=0)  # (n_states,)
+    neg_ll = -jnp.sum(response * log_probs) / n_samples - jnp.sum(prior * avg_log_probs)
 
     # L2 on non-intercept coefficients
     l2_term = l2_penalty * jnp.sum(coefficients[1:] ** 2)
