@@ -176,6 +176,11 @@ class HamiltonianLFPModel(BaseModel, SGDFittableMixin):
             _, _, lls = self.filter(lfp_data, params)
             lik_loss = -jnp.sum(lls)
         else:
+            # Surrogate loss: deterministic rollout SSE.  This is NOT the
+            # Gaussian state-space marginal likelihood — it drops the
+            # observation-noise scale, process prior, and latent
+            # uncertainty.  Useful for warm-starting dynamics parameters
+            # before switching to use_filter=True.
             C, d = params["C"], params["d"]
             x0 = params["init_mean"]
             def scan_fn(x_prev, _):

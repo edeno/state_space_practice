@@ -3,7 +3,7 @@
 Discrete latent states represent behavioral strategies (e.g., exploit
 vs explore) that control how continuous option values evolve and drive
 choices. Combines the softmax observation model from multinomial_choice
-with the GPB2 switching infrastructure from switching_kalman.
+with the GPB1/IMM switching infrastructure from switching_kalman.
 
 Model:
     s_t ~ Categorical(T[s_{t-1}, :])
@@ -84,15 +84,10 @@ def _softmax_predict_and_update(
     )
 
     # Update via softmax Laplace-EKF
-    post_mean, post_cov, _ll_prior = _softmax_update_core(
+    post_mean, post_cov, ll = _softmax_update_core(
         pred_mean, pred_cov, choice, n_options, inverse_temperature,
         obs_offset=obs_offset,
     )
-
-    # Recompute LL at the MAP mode (not prior mean) for correct
-    # discrete-state weighting in the switching filter
-    v_mode = jnp.concatenate([jnp.zeros(1), post_mean])
-    ll = jax.nn.log_softmax(inverse_temperature * v_mode + obs_offset)[choice]
 
     return post_mean, post_cov, ll
 
@@ -199,7 +194,7 @@ def switching_choice_filter(
     init_cov: Optional[ArrayLike] = None,
     init_discrete_prob: Optional[ArrayLike] = None,
 ) -> SwitchingChoiceFilterResult:
-    """Switching choice filter with GPB2 approximation.
+    """Switching choice filter with GPB1/IMM approximation.
 
     Parameters
     ----------
@@ -304,13 +299,10 @@ def switching_choice_filter(
         pred_cov = A_j @ prior_cov @ A_j.T + Q_j
 
         obs_offset_0 = ow_arr @ obs_cov_arr[0]
-        post_mean, post_cov, _ll_prior = _softmax_update_core(
+        post_mean, post_cov, ll = _softmax_update_core(
             pred_mean, pred_cov, choices[0], n_options, beta,
             obs_offset=obs_offset_0,
         )
-        # LL at mode for discrete-state weighting
-        v_mode = jnp.concatenate([jnp.zeros(1), post_mean])
-        ll = jax.nn.log_softmax(beta * v_mode + obs_offset_0)[choices[0]]
         return post_mean, post_cov, ll, pred_mean, pred_cov
 
     first_means, first_covs, first_lls, first_pred_means, first_pred_covs = jax.vmap(
@@ -718,9 +710,9 @@ class SwitchingChoiceModel(SGDFittableMixin):
     def _m_step(self, choices, filter_result, smoother_result):
         """M-step: update per-state Q and transition matrix.
 
-        Uses smoother quantities throughout (proper EM):
+        Uses smoother quantities throughout (approximate EM via GPB1/IMM):
         - smoother_joint_discrete_state_prob for transition matrix
-        - state_cond_smoother_means + smoother_discrete_state_prob for Q
+        - state_cond_smoother_means/covs + cross-covs for Q
 
         Note: does NOT delegate to switching_kalman_maximization_step
         because the choice model uses scalar per-state parameters
@@ -731,20 +723,58 @@ class SwitchingChoiceModel(SGDFittableMixin):
         gamma = smoother_result[2]  # smoothed discrete probs (T, S)
         joint = smoother_result[3]  # smoother joint (T-1, S, S)
         smoother_means = smoother_result[5]  # state-conditional smoother means (T, K-1, S)
+        smoother_covs = smoother_result[6]   # state-conditional smoother covs (T, K-1, K-1, S)
+        pair_cross_covs = smoother_result[7]  # pair-cond cross-covs (T-1, K-1, K-1, S, S)
         S = self.n_discrete_states
+        k_free = self.n_options - 1
         eps = 1e-10
 
-        # Per-state process noise: weighted variance of smoothed value increments
+        # Deterministic input: B @ u_t for each t
+        if self.input_gain_ is not None and self._covariates is not None:
+            Bu = self._covariates @ self.input_gain_.T  # (T, K-1)
+        else:
+            Bu = jnp.zeros((smoother_means.shape[0], k_free))
+
+        # Per-state process noise: E[||x_t - A_s x_{t-1} - B u_t||^2 | y_{1:T}]
+        # Full expected sufficient statistic includes covariance terms:
+        #   E[(x_t - A x_{t-1})(x_t - A x_{t-1})^T]
+        #     = (E[x_t] - A E[x_{t-1}])(...)^T + P_t - A C_{t,t-1}^T - C_{t,t-1} A^T + A P_{t-1} A^T
+        # where P = smoother cov, C = smoother cross-cov, and we subtract Bu from the mean residual.
         for s in range(S):
             w = gamma[1:, s]  # (T-1,)
             w_sum = jnp.maximum(jnp.sum(w), eps)
-            diff = smoother_means[1:, :, s] - self.decays_[s] * smoother_means[:-1, :, s]
-            q_hat = jnp.sum(w[:, None] * diff**2, axis=0).mean() / w_sum
+            decay_s = self.decays_[s]
+
+            # Mean residual: E[x_t] - decay_s * E[x_{t-1}] - B u_t
+            mean_resid = (
+                smoother_means[1:, :, s]
+                - decay_s * smoother_means[:-1, :, s]
+                - Bu[1:]
+            )
+
+            # Covariance correction terms (diagonal of the expected outer product)
+            # P_t|T for state s
+            P_t = smoother_covs[1:, :, :, s]       # (T-1, K-1, K-1)
+            P_tm1 = smoother_covs[:-1, :, :, s]    # (T-1, K-1, K-1)
+            # Cross-covariance: use the (s, s) pair-conditional slice
+            C_t = pair_cross_covs[:, :, :, s, s]    # (T-1, K-1, K-1)
+
+            # E[(x_t - A x_{t-1})(x_t - A x_{t-1})^T] correction trace
+            # = tr(P_t) - 2 * decay * tr(C_t) + decay^2 * tr(P_{t-1})
+            cov_trace = (
+                jnp.trace(P_t, axis1=1, axis2=2)
+                - 2 * decay_s * jnp.trace(C_t, axis1=1, axis2=2)
+                + decay_s**2 * jnp.trace(P_tm1, axis1=1, axis2=2)
+            )  # (T-1,)
+
+            # Weighted average: mean-residual squared + covariance correction
+            mean_sq = jnp.sum(mean_resid**2, axis=1)  # (T-1,)
+            q_hat = jnp.sum(w * (mean_sq + cov_trace)) / (w_sum * k_free)
             self.process_noises_ = self.process_noises_.at[s].set(
                 jnp.maximum(q_hat, 1e-6)
             )
 
-        # Transition matrix from smoother joint (proper EM)
+        # Transition matrix from smoother joint
         trans_counts = joint.sum(axis=0)  # (S, S)
         row_sums = trans_counts.sum(axis=1, keepdims=True)
         self.discrete_transition_matrix_ = trans_counts / jnp.maximum(row_sums, eps)

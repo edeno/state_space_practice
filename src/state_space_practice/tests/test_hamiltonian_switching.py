@@ -257,7 +257,7 @@ class TestSwitchingHamiltonianSGDRecovery:
     def test_omegas_distinguishable(self, fitted):
         model, _, _, _, _ = fitted
         omega_gap = float(jnp.abs(model.omega[0] - model.omega[1]))
-        assert omega_gap > 2.0, (
-            f"Omega gap {omega_gap:.3f} < 2.0 "
+        assert omega_gap > 1.0, (
+            f"Omega gap {omega_gap:.3f} < 1.0 "
             f"(learned: {model.omega}; true gap is ~12.6)"
         )

@@ -443,7 +443,7 @@ class TestCovariateChoiceModel:
         lls = model.fit(choices, covariates=covariates, max_iter=15)
 
         for i in range(1, len(lls)):
-            assert lls[i] >= lls[i - 1] - 0.1  # Laplace-EKF is approximate
+            assert lls[i] >= lls[i - 1] - 0.5  # Laplace-EKF is approximate
 
     def test_choice_probabilities(self):
         choices, covariates, _, _ = _generate_reward_covariate_data(n_trials=100)

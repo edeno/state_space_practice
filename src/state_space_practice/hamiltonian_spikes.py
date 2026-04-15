@@ -11,6 +11,7 @@ import jax.numpy as jnp
 from jax import Array
 
 from state_space_practice.kalman import psd_solve, symmetrize
+from state_space_practice.point_process_kalman import _logdet_psd
 from state_space_practice.nonlinear_dynamics import (
     apply_mlp,
     ekf_predict_step,
@@ -115,7 +116,15 @@ class HamiltonianSpikeModel(BaseModel, SGDFittableMixin):
             P_post = symmetrize(P_pred - P_pred @ psd_solve(I_n + H_lik @ P_pred, H_lik @ P_pred))
 
             m_post = m_pred + P_post @ grad
-            ll = log_lik_fn(m_post)
+
+            # Laplace-approximated marginal: log p(y_t | y_{1:t-1})
+            ll_at_mode = log_lik_fn(m_post)
+            delta = m_post - m_pred
+            quad = delta @ psd_solve(P_pred, delta)
+            ll = (ll_at_mode
+                  - 0.5 * quad
+                  - 0.5 * _logdet_psd(P_pred)
+                  + 0.5 * _logdet_psd(P_post))
 
             return (m_post, P_post), (m_post, P_post, ll)
 

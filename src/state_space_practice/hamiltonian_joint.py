@@ -12,6 +12,7 @@ import jax.numpy as jnp
 from jax import Array
 
 from state_space_practice.kalman import joseph_form_update, psd_solve, symmetrize
+from state_space_practice.point_process_kalman import _logdet_psd
 from state_space_practice.nonlinear_dynamics import (
     apply_mlp,
     ekf_predict_step,
@@ -117,21 +118,29 @@ class JointHamiltonianModel(BaseModel, SGDFittableMixin):
             P_mid = joseph_form_update(P_pred, K_l, C_l, R_l)
 
             sign, logdet = jnp.linalg.slogdet(S_l)
-            ll_lfp = -0.5 * (err_l @ psd_solve(S_l, err_l) + logdet)
+            n_lfp = err_l.shape[0]
+            ll_lfp = -0.5 * (err_l @ psd_solve(S_l, err_l) + logdet
+                             + n_lfp * jnp.log(2 * jnp.pi))
 
             # 3. Spike Update (Laplace Approximation)
             rate_mid = jnp.exp(jnp.dot(C_s, m_mid) + d_s) * self.dt
             grad_s = jnp.dot(C_s.T, y_spike_t - rate_mid)
             H_s = jnp.dot(C_s.T, (rate_mid[:, None] * C_s))
-            
+
             n = P_mid.shape[0]
             I_n = jnp.eye(n)
             P_post = symmetrize(P_mid - P_mid @ psd_solve(I_n + H_s @ P_mid, H_s @ P_mid))
             m_post = m_mid + P_post @ grad_s
-            
-            # Poisson Log-Likelihood
+
+            # Laplace-approximated marginal for spike observation
             rate_post = jnp.exp(jnp.dot(C_s, m_post) + d_s) * self.dt
-            ll_spike = jnp.sum(y_spike_t * jnp.log(rate_post + 1e-10) - rate_post)
+            ll_spike_at_mode = jnp.sum(y_spike_t * jnp.log(rate_post + 1e-10) - rate_post)
+            delta_s = m_post - m_mid
+            quad_s = delta_s @ psd_solve(P_mid, delta_s)
+            ll_spike = (ll_spike_at_mode
+                        - 0.5 * quad_s
+                        - 0.5 * _logdet_psd(P_mid)
+                        + 0.5 * _logdet_psd(P_post))
 
             return (m_post, P_post), (m_post, P_post, ll_lfp + ll_spike)
 
@@ -259,7 +268,10 @@ class JointHamiltonianModel(BaseModel, SGDFittableMixin):
             _, _, lls = self.filter(lfp_data, spike_data, params)
             lik_loss = -jnp.sum(lls)
         else:
-            # Deterministic Joint rollout (Simplified)
+            # Surrogate loss: deterministic rollout (LFP SSE + plug-in
+            # Poisson NLL).  This is NOT the joint state-space marginal
+            # likelihood — it drops observation-noise scale, process
+            # prior, and latent uncertainty.  Useful for warm-starting.
             mlp_params, omega = params["mlp"], params["omega"]
             trans_params = {**mlp_params, "omega": omega}
             C_l, d_l = params["C_lfp"], params["d_lfp"]

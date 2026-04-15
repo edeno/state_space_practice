@@ -13,6 +13,7 @@ from jax import Array
 
 from state_space_practice.hamiltonian_joint import JointHamiltonianModel
 from state_space_practice.kalman import joseph_form_update, psd_solve, symmetrize
+from state_space_practice.point_process_kalman import _logdet_psd
 from state_space_practice.nonlinear_dynamics import (
     apply_mlp,
     ekf_predict_step,
@@ -93,7 +94,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
             v_predict = jax.vmap(jax.vmap(predict_j_k, in_axes=(None, None, 0)), in_axes=(1, 2, None))
             m_p_jk, P_p_jk = v_predict(m_prev, P_prev, jnp.arange(K_states))
 
-            joint_pi_pred = Z.T * pi_prev[:, None]
+            joint_pi_pred = pi_prev[:, None] * Z
             pi_pred_k = jnp.sum(joint_pi_pred, axis=0)
 
             def collapse_k(k):
@@ -111,7 +112,9 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
                 P_mid = joseph_form_update(Pp, K_l, C_l, R_l)
                 err_l = y_lfp_t - (C_l @ mp + d_l)
                 sign, logdet = jnp.linalg.slogdet(S_l)
-                ll_l = -0.5 * (err_l @ psd_solve(S_l, err_l) + logdet)
+                n_lfp = err_l.shape[0]
+                ll_l = -0.5 * (err_l @ psd_solve(S_l, err_l) + logdet
+                               + n_lfp * jnp.log(2 * jnp.pi))
 
                 rate_mid = jnp.exp(jnp.dot(C_s, m_mid) + d_s) * self.dt
                 grad_s = jnp.dot(C_s.T, y_spike_t - rate_mid)
@@ -120,8 +123,16 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
                 I_n = jnp.eye(n)
                 P_post = symmetrize(P_mid - P_mid @ psd_solve(I_n + H_s @ P_mid, H_s @ P_mid))
                 m_post = m_mid + P_post @ grad_s
+
+                # Laplace-approximated marginal for spike observation
                 rate_post = jnp.exp(jnp.dot(C_s, m_post) + d_s) * self.dt
-                ll_s = jnp.sum(y_spike_t * jnp.log(rate_post + 1e-10) - rate_post)
+                ll_s_mode = jnp.sum(y_spike_t * jnp.log(rate_post + 1e-10) - rate_post)
+                delta_s = m_post - m_mid
+                quad_s = delta_s @ psd_solve(P_mid, delta_s)
+                ll_s = (ll_s_mode
+                        - 0.5 * quad_s
+                        - 0.5 * _logdet_psd(P_mid)
+                        + 0.5 * _logdet_psd(P_post))
                 return m_post, P_post, ll_l + ll_s
 
             m_filt, P_filt, lls_k = jax.vmap(update_k)(jnp.arange(K_states))
@@ -171,7 +182,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
             v_predict = jax.vmap(jax.vmap(predict_j_k, in_axes=(None, None, 0)), in_axes=(1, 2, None))
             m_p_jk, P_p_jk, F_jk = v_predict(m_prev, P_prev, jnp.arange(K_states))
             
-            joint_pi_pred = Z.T * pi_prev[:, None]
+            joint_pi_pred = pi_prev[:, None] * Z
             pi_pred_k = jnp.sum(joint_pi_pred, axis=0)
             
             def collapse_k(k):
@@ -240,6 +251,12 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
 
     def _build_param_spec(self) -> Tuple[Dict[str, Any], Dict[str, ParameterTransform]]:
         params, spec = super()._build_param_spec()
+        # Remove inherited single-matrix Q: the switching model uses per-state
+        # process_cov (shape n x n x K) read directly from self.process_cov
+        # in filter/smoother.  Exposing a single Q for optimization would be
+        # structurally inconsistent with the per-state dynamics.
+        params.pop("Q", None)
+        spec.pop("Q", None)
         params["init_mean"] = self.init_mean
         params["Z"] = self.discrete_transition_matrix
         params["init_pi"] = self.init_discrete_state_prob

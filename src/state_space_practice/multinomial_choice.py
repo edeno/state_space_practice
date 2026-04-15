@@ -35,6 +35,7 @@ from state_space_practice.kalman import (
     psd_solve,
     symmetrize,
 )
+from state_space_practice.point_process_kalman import _logdet_psd
 
 logger = logging.getLogger(__name__)
 
@@ -77,10 +78,6 @@ def _softmax_update_core(
     beta_sq = beta**2
     _obs_offset = obs_offset if obs_offset is not None else jnp.zeros(n_options)
 
-    # Log-likelihood at the prior mean (for EM monitoring in non-switching models)
-    v_prior = jnp.concatenate([zero_ref, prior_mean])
-    log_lik = jax.nn.log_softmax(beta * v_prior + _obs_offset)[choice]
-
     # Prior precision
     prior_precision = psd_solve(prior_cov, eye_k)
 
@@ -103,6 +100,18 @@ def _softmax_update_core(
     neg_hessian = beta_sq * (jnp.diag(p_free) - jnp.outer(p_free, p_free))
     posterior_precision = prior_precision + neg_hessian
     posterior_cov = symmetrize(psd_solve(posterior_precision, eye_k))
+
+    # Laplace-approximated marginal log-likelihood log p(c_t | y_{1:t-1}):
+    #   ≈ log p(c_t | x*) + log p(x* | y_{1:t-1}) + ½ log|Σ_post| + const
+    # where x* is the posterior mode, and (k/2)log(2π) cancels.
+    # See point_process_kalman._stochastic_point_process_filter_step for
+    # the same derivation applied to Poisson observations.
+    log_lik_at_mode = jax.nn.log_softmax(beta * v + _obs_offset)[choice]
+    delta = x - prior_mean
+    quad = delta @ (prior_precision @ delta)
+    logdet_prior = _logdet_psd(prior_cov)
+    logdet_post = _logdet_psd(posterior_cov)
+    log_lik = log_lik_at_mode - 0.5 * quad - 0.5 * logdet_prior + 0.5 * logdet_post
 
     return x, posterior_cov, log_lik
 
