@@ -2,9 +2,16 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
-from state_space_practice.nonlinear_dynamics import leapfrog_step, apply_mlp
+from state_space_practice.nonlinear_dynamics import apply_mlp, leapfrog_step
+from state_space_practice.tests.recovery_helpers import (
+    assert_ll_improves,
+    simulate_harmonic_oscillator,
+    simulate_lfp_observations,
+    state_segmentation_accuracy,
+)
 
 
 @pytest.fixture
@@ -162,4 +169,95 @@ class TestSwitchingHamiltonianBehavioral:
         assert mean_prob_state0 > 0.7, (
             f"Mean smoothed probability of true state (0) is {mean_prob_state0:.3f}, "
             f"expected > 0.7 for observation-driven mode discrimination"
+        )
+
+
+@pytest.mark.slow
+class TestSwitchingHamiltonianSGDRecovery:
+    """Verify fit_sgd learns distinguishable omegas and recovers state structure."""
+
+    @pytest.fixture(scope="class")
+    def fitted(self):
+        from state_space_practice.hamiltonian_switching import SwitchingHamiltonianJointModel
+
+        dt = 0.01
+        n_time = 500
+        n_lfp = 2
+        n_spikes = 1
+        omega_0 = 2 * jnp.pi   # ~1 Hz
+        omega_1 = 6 * jnp.pi   # ~3 Hz
+
+        # Generate switching state sequence (Z diagonal=0.95)
+        Z = jnp.array([[0.95, 0.05], [0.05, 0.95]])
+        key = jax.random.PRNGKey(42)
+        key, subkey = jax.random.split(key)
+
+        def markov_step(state, k):
+            probs = Z[state]
+            next_state = jax.random.choice(k, 2, p=probs).astype(jnp.int32)
+            return next_state, next_state
+
+        keys = jax.random.split(subkey, n_time)
+        _, true_states = jax.lax.scan(markov_step, jnp.int32(0), keys)
+
+        # Generate latent trajectory per state
+        x_true_0, mlp_params = simulate_harmonic_oscillator(
+            omega=omega_0, n_time=n_time, dt=dt,
+            key=jax.random.PRNGKey(10), hidden_dims=[8],
+        )
+        x_true_1, _ = simulate_harmonic_oscillator(
+            omega=omega_1, n_time=n_time, dt=dt,
+            key=jax.random.PRNGKey(11), hidden_dims=[8],
+        )
+
+        # Select latent trajectory based on state
+        x_true = jnp.where(
+            true_states[:, None] == 0, x_true_0, x_true_1,
+        )
+
+        # Generate LFP observations
+        C_lfp = jnp.eye(2)
+        d_lfp = jnp.zeros(n_lfp)
+        lfp = simulate_lfp_observations(
+            x_true, C_lfp, d_lfp, noise_std=0.2,
+            key=jax.random.PRNGKey(99),
+        )
+        spikes = jnp.zeros((n_time, n_spikes))
+
+        model = SwitchingHamiltonianJointModel(
+            n_oscillators=1, n_discrete_states=2,
+            n_lfp_sources=n_lfp, n_spike_sources=n_spikes,
+            sampling_freq=1.0 / dt, hidden_dims=[8], seed=0,
+        )
+        # Initialise both omegas close together so the model must learn
+        # to separate them (avoids a vacuously true distinguishability test)
+        mid_omega = (omega_0 + omega_1) / 2
+        model.omega = jnp.array([mid_omega, mid_omega * 1.05])
+
+        lls = model.fit_sgd(
+            lfp, spikes, key=jax.random.PRNGKey(1), num_steps=200,
+        )
+        return model, true_states, lfp, spikes, lls
+
+    def test_ll_improves(self, fitted):
+        _, _, _, _, lls = fitted
+        assert_ll_improves(lls, label="SwitchingHamiltonian SGD")
+
+    def test_state_segmentation(self, fitted):
+        model, true_states, lfp, spikes, _ = fitted
+        params, _ = model._build_param_spec()
+        _, _, pi_s = model.smooth(lfp, spikes, params)
+        acc = state_segmentation_accuracy(
+            np.array(true_states), np.array(pi_s),
+        )
+        assert acc >= 0.65, (
+            f"State segmentation accuracy {acc:.3f} < 0.65"
+        )
+
+    def test_omegas_distinguishable(self, fitted):
+        model, _, _, _, _ = fitted
+        omega_gap = float(jnp.abs(model.omega[0] - model.omega[1]))
+        assert omega_gap > 2.0, (
+            f"Omega gap {omega_gap:.3f} < 2.0 "
+            f"(learned: {model.omega}; true gap is ~12.6)"
         )

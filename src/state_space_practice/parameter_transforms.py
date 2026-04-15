@@ -41,6 +41,25 @@ POSITIVE = ParameterTransform(
     to_constrained=jax.nn.softplus,
 )
 
+def positive_capped(max_val: float = 50.0) -> ParameterTransform:
+    """Positive transform capped at ``max_val`` to prevent numerical overflow.
+
+    Uses ``softplus`` for the base map, then clips to ``[0, max_val]``.
+    Useful for inverse temperature parameters where very large values
+    cause ill-conditioned Hessians in the Laplace-EKF update.
+    """
+    def _to_constrained(x: Array) -> Array:
+        return jnp.minimum(jax.nn.softplus(x), max_val)
+
+    def _to_unconstrained(x: Array) -> Array:
+        return _inverse_softplus(jnp.minimum(x, max_val - 1e-6))
+
+    return ParameterTransform(
+        to_unconstrained=_to_unconstrained,
+        to_constrained=_to_constrained,
+    )
+
+
 UNIT_INTERVAL = ParameterTransform(
     to_unconstrained=lambda x: jnp.log(x / (1 - x)),  # logit
     to_constrained=jax.nn.sigmoid,

@@ -59,6 +59,11 @@ from state_space_practice.utils import check_converged, make_discrete_transition
 logger = logging.getLogger(__name__)
 
 
+def _linear_log_intensity(state: Array, params: SpikeObsParams) -> Array:
+    """Linear log-intensity: baseline + weights @ state."""
+    return params.baseline + params.weights @ state
+
+
 class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
     """Abstract base class for switching oscillator models with spike observations.
 
@@ -120,6 +125,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
         sampling_freq: float,
         dt: float,
         discrete_transition_diag: Array | None = None,
+        stickiness: float = 0.0,
         update_continuous_transition_matrix: bool = True,
         update_process_cov: bool = True,
         update_discrete_transition_matrix: bool = True,
@@ -184,12 +190,23 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
         self.dt = dt
         self.n_latent = 2 * n_oscillators
 
+        # Default: ~1s expected dwell time, computed from sampling_freq.
+        # p_stay = 1 - 1/(dwell_seconds * sampling_freq)
         if discrete_transition_diag is None:
+            expected_dwell_sec = 1.0
+            p_stay = 1.0 - 1.0 / (expected_dwell_sec * sampling_freq)
             self.discrete_transition_diag = jnp.full(
-                (n_discrete_states,), 0.95, dtype=jnp.float32
+                (n_discrete_states,), p_stay
             )
         else:
-            self.discrete_transition_diag = discrete_transition_diag
+            self.discrete_transition_diag = jnp.asarray(discrete_transition_diag)
+
+        # Dirichlet prior for transition matrix (sticky prior)
+        from state_space_practice.contingency_belief import get_transition_prior
+        self.transition_prior = get_transition_prior(
+            concentration=1.0, stickiness=stickiness,
+            n_states=n_discrete_states,
+        ) if stickiness > 0 else None
 
         self.update_continuous_transition_matrix = update_continuous_transition_matrix
         self.update_process_cov = update_process_cov
@@ -234,17 +251,57 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
         ]
 
         update_flags = {
-            "A": self.update_continuous_transition_matrix,
-            "Q": self.update_process_cov,
-            "Z": self.update_discrete_transition_matrix,
-            "spike": self.update_spike_params,
-            "m0": self.update_init_mean,
-            "P0": self.update_init_cov,
+            "transition": self.update_continuous_transition_matrix,
+            "process_cov": self.update_process_cov,
+            "discrete_transition": self.update_discrete_transition_matrix,
+            "spike_params": self.update_spike_params,
+            "init_mean": self.update_init_mean,
+            "init_cov": self.update_init_cov,
         }
 
         flags_str = ", ".join(f"Update({k})={v}" for k, v in update_flags.items())
 
         return f"<{self.__class__.__name__}: {', '.join(params)}, [{flags_str}]>"
+
+    def decode(self) -> Array:
+        """Return the most likely discrete state at each time step.
+
+        Returns
+        -------
+        states : Array, shape (n_time,)
+            Argmax of smoother discrete state probabilities.
+
+        Raises
+        ------
+        RuntimeError
+            If called before fit() or fit_sgd().
+        """
+        if not hasattr(self, "smoother_discrete_state_prob") or \
+           self.smoother_discrete_state_prob is None:
+            raise RuntimeError(
+                "Call fit() or fit_sgd() before decode()."
+            )
+        return jnp.argmax(self.smoother_discrete_state_prob, axis=1)
+
+    def predict_proba(self) -> Array:
+        """Return smoothed discrete state probabilities.
+
+        Returns
+        -------
+        probs : Array, shape (n_time, n_discrete_states)
+            Posterior probability of each discrete state at each time step.
+
+        Raises
+        ------
+        RuntimeError
+            If called before fit() or fit_sgd().
+        """
+        if not hasattr(self, "smoother_discrete_state_prob") or \
+           self.smoother_discrete_state_prob is None:
+            raise RuntimeError(
+                "Call fit() or fit_sgd() before predict_proba()."
+            )
+        return self.smoother_discrete_state_prob
 
     # ------------------------------------------------------------------
     # Initialization methods
@@ -487,9 +544,6 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
         marginal_log_likelihood : Array, shape ()
         """
 
-        def log_intensity_func(state: Array, params: SpikeObsParams) -> Array:
-            return params.baseline + params.weights @ state
-
         (
             state_cond_filter_mean,
             state_cond_filter_cov,
@@ -506,7 +560,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             continuous_transition_matrix=self.continuous_transition_matrix,
             process_cov=self.process_cov,
             dt=self.dt,
-            log_intensity_func=log_intensity_func,
+            log_intensity_func=_linear_log_intensity,
             spike_params=self.spike_params,
             max_newton_iter=self.max_newton_iter,
             line_search_beta=self.line_search_beta,
@@ -602,6 +656,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             next_pair_cond_smoother_means=getattr(
                 self, "smoother_next_pair_cond_means", None
             ),
+            transition_prior=self.transition_prior,
         )
 
         if self.update_continuous_transition_matrix:
@@ -897,6 +952,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                 # Only declare convergence if LL is not decreasing
                 if is_converged and is_increasing:
                     logger.info(f"Converged after {iteration + 1} iterations.")
+                    self.converged_ = True
                     break
 
             self._m_step_dynamics()
@@ -907,6 +963,9 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                 f"Iteration {iteration + 1}/{max_iter}\t"
                 f"Log-Likelihood: {log_likelihoods[-1]:.4f}"
             )
+        else:
+            self.converged_ = False
+            logger.warning("Reached maximum iterations without converging.")
 
         # Restore best parameters if LL decreased at any point
         if best_params is not None and log_likelihoods[-1] < best_ll:
@@ -919,9 +978,6 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             # Re-run E-step to populate all smoother outputs consistently
             # with the restored parameters
             self._e_step(spikes)
-
-        if len(log_likelihoods) == max_iter:
-            logger.warning("Reached maximum iterations without converging.")
 
         return log_likelihoods
 
@@ -1093,9 +1149,6 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             params, "init_cov", self.init_cov
         )
 
-        def log_int(state, p):
-            return p.baseline + p.weights @ state
-
         result = switching_point_process_filter(
             init_state_cond_mean=m0,
             init_state_cond_cov=P0,
@@ -1105,7 +1158,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             continuous_transition_matrix=A,
             process_cov=Q,
             dt=self.dt,
-            log_intensity_func=log_int,
+            log_intensity_func=_linear_log_intensity,
             spike_params=sp,
         )
         loss = -result[5]
@@ -1159,7 +1212,7 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
         Time bin width in seconds.
     freqs : Array, shape (n_oscillators,)
         Intrinsic oscillation frequencies in Hz.
-    auto_regressive_coef : Array, shape (n_oscillators,)
+    damping_coef : Array, shape (n_oscillators,)
         Damping coefficients for each oscillator (0 to 1).
     process_variance : Array, shape (n_oscillators,)
         Process noise variance for each oscillator.
@@ -1173,7 +1226,7 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
         sampling_freq: float,
         dt: float,
         freqs: jax.Array,
-        auto_regressive_coef: jax.Array,
+        damping_coef: jax.Array,
         process_variance: jax.Array,
         **kwargs,
     ):
@@ -1189,9 +1242,9 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
             raise ValueError(
                 f"freqs shape {freqs.shape} != ({n_oscillators},)"
             )
-        if auto_regressive_coef.shape != (n_oscillators,):
+        if damping_coef.shape != (n_oscillators,):
             raise ValueError(
-                f"auto_regressive_coef shape {auto_regressive_coef.shape} "
+                f"damping_coef shape {damping_coef.shape} "
                 f"!= ({n_oscillators},)"
             )
         if process_variance.shape != (n_oscillators,):
@@ -1201,14 +1254,14 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
             )
 
         self.freqs = freqs
-        self.auto_regressive_coef = auto_regressive_coef
+        self.damping_coef = damping_coef
         self.process_variance = process_variance
 
     def _initialize_continuous_transition_matrix(self) -> None:
         """A is constant across states: uncoupled oscillators."""
         transition_matrix = construct_common_oscillator_transition_matrix(
             freqs=self.freqs,
-            auto_regressive_coef=self.auto_regressive_coef,
+            damping_coef=self.damping_coef,
             sampling_freq=self.sampling_freq,
         )
         self.continuous_transition_matrix = jnp.stack(
@@ -1370,7 +1423,7 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         Time bin width in seconds.
     freqs : Array, shape (n_oscillators,)
         Intrinsic oscillation frequencies in Hz.
-    auto_regressive_coef : Array, shape (n_oscillators,)
+    damping_coef : Array, shape (n_oscillators,)
         Damping coefficients for each oscillator.
     process_variance : Array, shape (n_oscillators, n_discrete_states)
         Process noise variance per oscillator per state.
@@ -1388,7 +1441,7 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         sampling_freq: float,
         dt: float,
         freqs: jax.Array,
-        auto_regressive_coef: jax.Array,
+        damping_coef: jax.Array,
         process_variance: jax.Array,
         phase_difference: jax.Array,
         coupling_strength: jax.Array,
@@ -1405,9 +1458,9 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
             raise ValueError(
                 f"freqs shape {freqs.shape} != ({n_oscillators},)"
             )
-        if auto_regressive_coef.shape != (n_oscillators,):
+        if damping_coef.shape != (n_oscillators,):
             raise ValueError(
-                f"auto_regressive_coef shape {auto_regressive_coef.shape} "
+                f"damping_coef shape {damping_coef.shape} "
                 f"!= ({n_oscillators},)"
             )
         if process_variance.shape != (n_oscillators, n_discrete_states):
@@ -1435,7 +1488,7 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
             )
 
         self.freqs = freqs
-        self.auto_regressive_coef = auto_regressive_coef
+        self.damping_coef = damping_coef
         self.process_variance = process_variance
         self.phase_difference = phase_difference
         self.coupling_strength = coupling_strength
@@ -1444,7 +1497,7 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         """A is constant across states: uncoupled oscillators."""
         transition_matrix = construct_common_oscillator_transition_matrix(
             freqs=self.freqs,
-            auto_regressive_coef=self.auto_regressive_coef,
+            damping_coef=self.damping_coef,
             sampling_freq=self.sampling_freq,
         )
         self.continuous_transition_matrix = jnp.stack(
@@ -1483,6 +1536,89 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
 
         self.process_cov = jnp.stack(projected_Q_list, axis=-1)
 
+    # --- SGDFittableMixin: CNM-PP specific ---
+
+    def _build_param_spec(self) -> tuple[dict, dict]:
+        from state_space_practice.parameter_transforms import (
+            PSD_MATRIX,
+            POSITIVE,
+            STOCHASTIC_ROW,
+            UNCONSTRAINED,
+        )
+
+        params: dict = {}
+        spec: dict = {}
+
+        if self.update_process_cov:
+            params["process_variance"] = self.process_variance
+            spec["process_variance"] = POSITIVE
+            params["phase_difference"] = self.phase_difference
+            spec["phase_difference"] = UNCONSTRAINED
+            params["coupling_strength"] = self.coupling_strength
+            spec["coupling_strength"] = UNCONSTRAINED
+
+        if self.update_spike_params:
+            params["spike_baseline"] = self.spike_params.baseline
+            spec["spike_baseline"] = UNCONSTRAINED
+            params["spike_weights"] = self.spike_params.weights
+            spec["spike_weights"] = UNCONSTRAINED
+
+        if self.update_discrete_transition_matrix:
+            params["discrete_transition_matrix"] = self.discrete_transition_matrix
+            spec["discrete_transition_matrix"] = STOCHASTIC_ROW
+
+        if self.update_init_mean:
+            params["init_mean"] = self.init_mean
+            spec["init_mean"] = UNCONSTRAINED
+
+        if self.update_init_cov:
+            for j in range(self.n_discrete_states):
+                k = f"init_cov_{j}"
+                params[k] = self.init_cov[..., j]
+                spec[k] = PSD_MATRIX
+
+        return params, spec
+
+    def _sgd_loss_fn(self, params: dict, spikes: jax.Array) -> jax.Array:
+        # Reconstruct per-state Q from scientific params
+        proc_var = params.get("process_variance", self.process_variance)
+        phase_diff = params.get("phase_difference", self.phase_difference)
+        coupling = params.get("coupling_strength", self.coupling_strength)
+
+        # Vectorize Q construction over discrete states (last axis)
+        Q = jax.vmap(
+            construct_correlated_noise_process_covariance,
+            in_axes=(-1, -1, -1), out_axes=-1,
+        )(proc_var, phase_diff, coupling)
+
+        # Inject reconstructed Q into the base loss function via params
+        params_with_Q = dict(params)
+        params_with_Q["_Q"] = Q
+        return super()._sgd_loss_fn(params_with_Q, spikes)
+
+    def _store_sgd_params(self, params: dict) -> None:
+        super()._store_sgd_params(params)
+        if "process_variance" in params:
+            self.process_variance = params["process_variance"]
+        if "phase_difference" in params:
+            self.phase_difference = params["phase_difference"]
+        if "coupling_strength" in params:
+            self.coupling_strength = params["coupling_strength"]
+        # Reconstruct Q from updated params
+        if any(k in params for k in ("process_variance", "phase_difference", "coupling_strength")):
+            Q_list = []
+            for j in range(self.n_discrete_states):
+                Q_j = construct_correlated_noise_process_covariance(
+                    variance=self.process_variance[:, j],
+                    phase_difference=self.phase_difference[..., j],
+                    coupling_strength=self.coupling_strength[..., j],
+                )
+                Q_list.append(Q_j)
+            self.process_cov = jnp.stack(Q_list, axis=-1)
+        self.init_cov = self._reconstruct_per_state_array(
+            params, "init_cov", self.init_cov
+        )
+
 
 # ==========================================================================
 # Directed Influence Model (DIM-PP)
@@ -1514,7 +1650,7 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         Time bin width in seconds.
     freqs : Array, shape (n_oscillators,)
         Intrinsic oscillation frequencies in Hz.
-    auto_regressive_coef : Array, shape (n_oscillators,)
+    damping_coef : Array, shape (n_oscillators,)
         Damping coefficients for each oscillator.
     process_variance : Array, shape (n_oscillators,)
         Process noise variance (constant across states).
@@ -1535,7 +1671,7 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         sampling_freq: float,
         dt: float,
         freqs: jax.Array,
-        auto_regressive_coef: jax.Array,
+        damping_coef: jax.Array,
         process_variance: jax.Array,
         phase_difference: jax.Array,
         coupling_strength: jax.Array,
@@ -1553,9 +1689,9 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             raise ValueError(
                 f"freqs shape {freqs.shape} != ({n_oscillators},)"
             )
-        if auto_regressive_coef.shape != (n_oscillators,):
+        if damping_coef.shape != (n_oscillators,):
             raise ValueError(
-                f"auto_regressive_coef shape {auto_regressive_coef.shape} "
+                f"damping_coef shape {damping_coef.shape} "
                 f"!= ({n_oscillators},)"
             )
         if process_variance.shape != (n_oscillators,):
@@ -1583,7 +1719,7 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             )
 
         self.freqs = freqs
-        self.auto_regressive_coef = auto_regressive_coef
+        self.damping_coef = damping_coef
         self.process_variance = process_variance
         self.phase_difference = phase_difference
         self.coupling_strength = coupling_strength
@@ -1596,7 +1732,7 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             [
                 construct_directed_influence_transition_matrix(
                     freqs=self.freqs,
-                    damping_coeffs=self.auto_regressive_coef,
+                    damping_coeffs=self.damping_coef,
                     coupling_strengths=self.coupling_strength[:, :, state_ind],
                     phase_diffs=self.phase_difference[:, :, state_ind],
                     sampling_freq=self.sampling_freq,
@@ -1670,6 +1806,7 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             next_pair_cond_smoother_means=getattr(
                 self, "smoother_next_pair_cond_means", None
             ),
+            transition_prior=self.transition_prior,
         )
 
         if self.update_discrete_transition_matrix:
@@ -1730,7 +1867,7 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         damping_list = [p["damping"] for p in self._current_osc_params]
 
         self.freqs = jnp.mean(jnp.stack(freqs_list, axis=-1), axis=-1)
-        self.auto_regressive_coef = jnp.mean(
+        self.damping_coef = jnp.mean(
             jnp.stack(damping_list, axis=-1), axis=-1
         )
 
@@ -1794,6 +1931,29 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             projected.append(A_j)
         self.continuous_transition_matrix = jnp.stack(projected, axis=-1)
 
+        # Sync coupling_strength and phase_difference from the projected A
+        self._sync_coupling_from_transition_matrix()
+
+    def _sync_coupling_from_transition_matrix(self) -> None:
+        """Extract coupling/phase params from the current transition matrix.
+
+        Called after standard EM projection so that ``coupling_strength``
+        and ``phase_difference`` reflect the fitted A, not just the
+        initial values.
+        """
+        coupling_list = []
+        phase_list = []
+        for j in range(self.n_discrete_states):
+            params = extract_dim_params_from_matrix(
+                self.continuous_transition_matrix[:, :, j],
+                self.sampling_freq,
+                self.n_oscillators,
+            )
+            coupling_list.append(params["coupling_strength"])
+            phase_list.append(params["phase_diff"])
+        self.coupling_strength = jnp.stack(coupling_list, axis=-1)
+        self.phase_difference = jnp.stack(phase_list, axis=-1)
+
     # --- SGDFittableMixin: DIM-PP specific ---
 
     def _build_param_spec(self) -> tuple[dict, dict]:
@@ -1846,6 +2006,11 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
     ):
         """Fit by minimizing negative marginal LL via gradient descent.
 
+        SGD optimizes ``coupling_strength`` and ``phase_difference``
+        (and optionally spike params, discrete transition, init params).
+        Frequencies (``freqs``) and damping (``damping_coef``) are frozen
+        during SGD and used as constants.
+
         Parameters
         ----------
         spikes : Array, shape (n_time, n_neurons)
@@ -1876,7 +2041,7 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         for j in range(self.n_discrete_states):
             A_j = construct_directed_influence_transition_matrix(
                 freqs=self.freqs,
-                damping_coeffs=self.auto_regressive_coef,
+                damping_coeffs=self.damping_coef,
                 phase_diffs=phase_diff[..., j],
                 coupling_strengths=coupling[..., j],
                 sampling_freq=self.sampling_freq,
@@ -1913,7 +2078,7 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             for j in range(self.n_discrete_states):
                 A_j = construct_directed_influence_transition_matrix(
                     freqs=self.freqs,
-                    damping_coeffs=self.auto_regressive_coef,
+                    damping_coeffs=self.damping_coef,
                     phase_diffs=self.phase_difference[..., j],
                     coupling_strengths=self.coupling_strength[..., j],
                     sampling_freq=self.sampling_freq,

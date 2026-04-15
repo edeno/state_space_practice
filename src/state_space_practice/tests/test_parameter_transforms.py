@@ -92,6 +92,43 @@ class TestPSDMatrixTransform:
         assert jnp.all(jnp.isfinite(g))
 
 
+class TestPositiveCappedTransform:
+    def test_roundtrip(self) -> None:
+        from state_space_practice.parameter_transforms import positive_capped
+
+        cap = positive_capped(max_val=50.0)
+        x = jnp.array([0.01, 1.0, 10.0, 49.0])
+        unc = cap.to_unconstrained(x)
+        recovered = cap.to_constrained(unc)
+        np.testing.assert_allclose(recovered, x, rtol=1e-4)
+
+    def test_respects_cap(self) -> None:
+        from state_space_practice.parameter_transforms import positive_capped
+
+        cap = positive_capped(max_val=20.0)
+        unc = jnp.array([-10.0, 0.0, 10.0, 100.0])
+        x = cap.to_constrained(unc)
+        assert jnp.all(x >= 0)
+        assert jnp.all(x <= 20.0)
+
+    def test_gradient_finite(self) -> None:
+        from state_space_practice.parameter_transforms import positive_capped
+
+        cap = positive_capped(max_val=50.0)
+        grad_fn = jax.grad(lambda unc: cap.to_constrained(unc).sum())
+        g = grad_fn(jnp.array([0.0, 1.0, -1.0]))
+        assert jnp.all(jnp.isfinite(g))
+
+    def test_roundtrip_near_cap(self) -> None:
+        from state_space_practice.parameter_transforms import positive_capped
+
+        cap = positive_capped(max_val=10.0)
+        x = jnp.array([9.5])
+        unc = cap.to_unconstrained(x)
+        recovered = cap.to_constrained(unc)
+        np.testing.assert_allclose(recovered, x, atol=1e-4)
+
+
 class TestDictTransforms:
     def test_roundtrip(self) -> None:
         spec = {"q": POSITIVE, "beta": POSITIVE, "decay": UNIT_INTERVAL}

@@ -11,12 +11,14 @@ jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 # ---------------------------------------------------------------------------
 # MultinomialChoiceModel: simulate → fit_sgd → verify recovery
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 class TestMultinomialChoiceSGDIntegration:
     """End-to-end: simulate choice data → fit_sgd → recover parameters."""
 
@@ -43,7 +45,9 @@ class TestMultinomialChoiceSGDIntegration:
 
         # LL should improve
         assert lls[-1] > lls[0]
-        # Parameters should be positive and finite
+        # Parameters should be positive and finite. Due to Q/beta tradeoff
+        # (higher Q + lower beta ≈ lower Q + higher beta), we don't enforce
+        # tight ranges — just verify the product Q*beta is in a reasonable range
         assert model.process_noise > 0
         assert model.inverse_temperature > 0
         assert np.isfinite(model.process_noise)
@@ -51,6 +55,13 @@ class TestMultinomialChoiceSGDIntegration:
         # Model should be fully fitted (smoother populated)
         assert model.is_fitted
         assert model.smoothed_values.shape == (300, 2)
+        # Smoothed values should track true values
+        corr = float(jnp.corrcoef(
+            model.smoothed_values[:, 0], sim.true_values[:, 0],
+        )[0, 1])
+        assert corr > 0.5, (
+            f"Smoothed-vs-true values correlation {corr:.3f} < 0.5"
+        )
 
     def test_sgd_vs_em_agreement(self):
         from state_space_practice.multinomial_choice import (
@@ -84,6 +95,7 @@ class TestMultinomialChoiceSGDIntegration:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 class TestCovariateChoiceSGDIntegration:
     """End-to-end: simulate RL choice data → fit_sgd → recover parameters."""
 
@@ -110,6 +122,20 @@ class TestCovariateChoiceSGDIntegration:
         assert model.is_fitted
         # Input gain should be learned (nonzero)
         assert jnp.any(jnp.abs(model.input_gain_) > 0.01)
+        # Smoothed values should track true values
+        corr = float(jnp.corrcoef(
+            model.smoothed_values[:, 0], sim.true_values[:, 0],
+        )[0, 1])
+        assert corr > 0.5, (
+            f"Smoothed-vs-true values correlation {corr:.3f} < 0.5"
+        )
+        # Input gain diagonal should be non-negative (reward increases value).
+        # Some entries may be near zero if that option was rarely chosen.
+        diag = jnp.diag(model.input_gain_)
+        assert jnp.all(diag >= -0.05), (
+            f"Input gain diagonal should be non-negative (learning from reward), "
+            f"got {diag}"
+        )
 
     def test_sgd_vs_em_agreement(self):
         from state_space_practice.covariate_choice import (
@@ -143,6 +169,7 @@ class TestCovariateChoiceSGDIntegration:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 class TestSmithSGDIntegration:
     """End-to-end: simulate learning data → fit_sgd → recover sigma_epsilon."""
 
@@ -152,7 +179,6 @@ class TestSmithSGDIntegration:
             simulate_learning_data,
         )
 
-        true_sigma = 0.3
         outcomes, _ = simulate_learning_data(
             n_trials=200,
             prob_success_init=0.4,
@@ -203,6 +229,7 @@ class TestSmithSGDIntegration:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 class TestPointProcessSGDIntegration:
     """End-to-end: simulate spike data → fit_sgd → recover dynamics."""
 
@@ -345,6 +372,7 @@ class TestPointProcessSGDIntegration:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 class TestPlaceFieldSGDIntegration:
     """End-to-end: simulate place field data → fit EM and SGD → verify."""
 

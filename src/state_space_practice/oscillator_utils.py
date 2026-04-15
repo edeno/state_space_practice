@@ -1,9 +1,32 @@
+import warnings
+
 import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 
 IDENTITY_2x2 = jnp.identity(2)
 ZEROS_2x2 = jnp.zeros((2, 2))
+
+
+def _scatter_block_diagonal(blocks: jax.Array) -> jax.Array:
+    """Assemble an array of 2x2 blocks into a block-diagonal matrix.
+
+    Parameters
+    ----------
+    blocks : jax.Array, shape (n_blocks, 2, 2)
+
+    Returns
+    -------
+    jax.Array, shape (2 * n_blocks, 2 * n_blocks)
+    """
+    n = blocks.shape[0]
+    size = 2 * n
+    # Flatten each 2x2 block and scatter 4 elements per block
+    flat = blocks.reshape(n, 4)  # (n, 4)
+    offsets = jnp.array([0, 1, size, size + 1])  # within-block offsets in flat matrix
+    base = 2 * jnp.arange(n) * (size + 1)  # diagonal starting positions
+    indices = base[:, None] + offsets[None, :]  # (n, 4)
+    return jnp.zeros(size * size).at[indices.ravel()].set(flat.ravel()).reshape(size, size)
 
 
 def get_block_slice(from_oscillator: int, to_oscillator: int) -> tuple:
@@ -54,7 +77,7 @@ def _get_rotation_matrix(rotation_frequency: ArrayLike) -> jax.Array:
 
 
 def _compute_intrinsic_oscillation_block(
-    oscillation_freq: ArrayLike, auto_regressive_coef: ArrayLike, sampling_freq: float = 1.0
+    oscillation_freq: ArrayLike, damping_coef: ArrayLike, sampling_freq: float = 1.0
 ) -> jax.Array:
     """Compute the rotation matrix for a given frequency and auto-regressive coefficient
 
@@ -62,9 +85,10 @@ def _compute_intrinsic_oscillation_block(
     ----------
     oscillation_freq : float
         Oscillation frequency in Hz
-    auto_regressive_coef : float
+    damping_coef : float
         Controls the damping of the oscillation. A value of 1 corresponds to a
         pure oscillation, while a value of 0 corresponds to no oscillation.
+        Values outside [0, 1] are valid inputs but may produce unstable dynamics.
     sampling_freq : float, optional
         Samples per second, by default 1
 
@@ -73,13 +97,8 @@ def _compute_intrinsic_oscillation_block(
     jax.Array, shape (2, 2)
         The transition matrix at the specified frequency
 
-    Raises
-    ------
-    ValueError
-        If the auto_regressive_coef is not between 0 and 1
-
     """
-    result: jax.Array = jnp.asarray(auto_regressive_coef) * _get_rotation_matrix(
+    result: jax.Array = jnp.asarray(damping_coef) * _get_rotation_matrix(
         2 * jnp.pi * oscillation_freq / sampling_freq
     )
     return result
@@ -87,7 +106,7 @@ def _compute_intrinsic_oscillation_block(
 
 def _compute_coupled_oscillator_block(
     freq: ArrayLike,
-    auto_regressive_coef: ArrayLike,
+    damping_coef: ArrayLike,
     sum_incoming_coupling_strength: ArrayLike,
     sampling_freq: float = 1.0,
 ) -> jax.Array:
@@ -102,7 +121,7 @@ def _compute_coupled_oscillator_block(
     ----------
     freq : float
         Oscillation frequency in Hz
-    auto_regressive_coef : float
+    damping_coef : float
         Controls the damping of the oscillation. A value of 1 corresponds to a
         pure oscillation, while a value of 0 corresponds to no oscillation.
     sum_incoming_coupling_strength : float
@@ -118,7 +137,7 @@ def _compute_coupled_oscillator_block(
 
     """
     return (
-        _compute_intrinsic_oscillation_block(freq, auto_regressive_coef, sampling_freq)
+        _compute_intrinsic_oscillation_block(freq, damping_coef, sampling_freq)
         - sum_incoming_coupling_strength * IDENTITY_2x2
     )
 
@@ -149,7 +168,7 @@ def _compute_coupling_transition_block(
 
 def construct_common_oscillator_transition_matrix(
     freqs: jax.Array,
-    auto_regressive_coef: jax.Array,
+    damping_coef: jax.Array,
     sampling_freq: float = 1.0,
 ) -> jax.Array:
     """Constructs the transition matrix for a common oscillator model.
@@ -166,7 +185,7 @@ def construct_common_oscillator_transition_matrix(
     ----------
     freqs : jax.Array, shape (n_oscillators,)
         Array of oscillation frequencies (fk) for each oscillator.
-    auto_regressive_coef : jax.Array, shape (n_oscillators,)
+    damping_coef : jax.Array, shape (n_oscillators,)
         Array of auto-regressive coefficients (alpha_j^k) for each oscillator k.
     sampling_freq : float, optional
         Sampling frequency (Fs) in Hz, by default 1.0.
@@ -181,24 +200,26 @@ def construct_common_oscillator_transition_matrix(
         If input array dimensions do not match the inferred number of oscillators.
     """
     n_oscillators = freqs.shape[0]
-    if not auto_regressive_coef.shape == (n_oscillators,):
+    if not damping_coef.shape == (n_oscillators,):
         raise ValueError(
-            "auto_regressive_coef must be a 1D array of shape (n_oscillators,)"
+            "damping_coef must be a 1D array of shape (n_oscillators,)"
         )
-    if jnp.any(jnp.logical_or(auto_regressive_coef > 1, auto_regressive_coef < 0)):
-        raise ValueError("Auto-regressive coefficients must be between 0 and 1")
+    # Warn and clamp out-of-range values (JIT-compatible via pre-trace check)
+    if not isinstance(damping_coef, jax.core.Tracer):
+        if jnp.any(jnp.logical_or(damping_coef > 1, damping_coef < 0)):
+            warnings.warn(
+                "damping_coef values outside [0, 1] will be clipped",
+                UserWarning,
+                stacklevel=2,
+            )
+    damping_coef = jnp.clip(damping_coef, 0.0, 1.0)
 
-    diag_blocks = [
-        _compute_intrinsic_oscillation_block(
-            oscillation_freq=freqs[k],
-            auto_regressive_coef=auto_regressive_coef[k],
-            sampling_freq=sampling_freq,
-        )
-        for k in range(n_oscillators)
-    ]
-
-    result: jax.Array = jax.scipy.linalg.block_diag(*diag_blocks)
-    return result
+    # Vectorized: compute all 2x2 blocks at once, then scatter into block-diagonal
+    blocks = jax.vmap(
+        _compute_intrinsic_oscillation_block, in_axes=(0, 0, None)
+    )(freqs, damping_coef, sampling_freq)
+    # blocks: (n_oscillators, 2, 2)
+    return _scatter_block_diagonal(blocks)
 
 
 def construct_common_oscillator_process_covariance(
@@ -220,11 +241,9 @@ def construct_common_oscillator_process_covariance(
         The process covariance matrix for the common oscillator model.
 
     """
-    n_oscillators = variance.shape[0]
-    diag_blocks = [variance[k] * IDENTITY_2x2 for k in range(n_oscillators)]
-
-    result: jax.Array = jax.scipy.linalg.block_diag(*diag_blocks)
-    return result
+    # Each oscillator contributes a diagonal 2x2 block: variance[k] * I
+    # This is equivalent to diag(v0, v0, v1, v1, ..., vn, vn)
+    return jnp.diag(jnp.repeat(variance, 2))
 
 
 def construct_correlated_noise_process_covariance(
@@ -253,21 +272,20 @@ def construct_correlated_noise_process_covariance(
     """
     n_oscillators = variance.shape[0]
 
-    return jnp.block(
-        [
-            [
-                (
-                    variance[from_oscillator] * IDENTITY_2x2
-                    if from_oscillator == to_oscillator
-                    else _compute_coupling_transition_block(
-                        phase_difference[from_oscillator, to_oscillator],
-                        coupling_strength[from_oscillator, to_oscillator],
-                    )
-                )
-                for to_oscillator in range(n_oscillators)
-            ]
-            for from_oscillator in range(n_oscillators)
-        ]
+    # Compute all (n, n) coupling blocks at once via nested vmap
+    coupling_row = jax.vmap(_compute_coupling_transition_block, in_axes=(0, 0))
+    all_blocks = jax.vmap(coupling_row, in_axes=(0, 0))(
+        phase_difference, coupling_strength
+    )  # (n_oscillators, n_oscillators, 2, 2)
+
+    # Replace diagonal blocks with variance * I
+    diag_blocks = variance[:, None, None] * IDENTITY_2x2[None, :, :]
+    diag_idx = jnp.arange(n_oscillators)
+    all_blocks = all_blocks.at[diag_idx, diag_idx].set(diag_blocks)
+
+    # Reshape (n, n, 2, 2) -> (2n, 2n)
+    return all_blocks.swapaxes(1, 2).reshape(
+        2 * n_oscillators, 2 * n_oscillators
     )
 
 
@@ -701,42 +719,31 @@ def extract_dim_params_from_matrix(
         - coupling_strength: (n_osc, n_osc) - coupling strengths (0 on diagonal)
         - phase_diff: (n_osc, n_osc) - phase differences (0 on diagonal)
     """
-    damping = jnp.zeros(n_oscillators)
-    freq = jnp.zeros(n_oscillators)
-    coupling_strength = jnp.zeros((n_oscillators, n_oscillators))
-    phase_diff = jnp.zeros((n_oscillators, n_oscillators))
+    # Reshape A into (n, n, 2, 2) blocks
+    blocks = A.reshape(n_oscillators, 2, n_oscillators, 2).transpose(0, 2, 1, 3)
 
-    # First pass: extract off-diagonal coupling parameters
-    for i in range(n_oscillators):
-        for j in range(n_oscillators):
-            if i != j:
-                rows, cols = get_block_slice(i, j)
-                block = A[rows, cols]
-                scale, angle = _extract_scale_and_angle(block)
+    # Extract scale and angle from all blocks at once via nested vmap
+    _extract_row = jax.vmap(_extract_scale_and_angle)
+    _extract_all = jax.vmap(_extract_row)
+    all_scales, all_angles = _extract_all(blocks)
+    # all_scales, all_angles: (n_oscillators, n_oscillators)
 
-                coupling_strength = coupling_strength.at[i, j].set(scale)
-                phase_diff = phase_diff.at[i, j].set(angle)
+    # Off-diagonal entries are coupling parameters; zero out diagonal
+    diag_idx = jnp.arange(n_oscillators)
+    coupling_strength = all_scales.at[diag_idx, diag_idx].set(0.0)
+    phase_diff = all_angles.at[diag_idx, diag_idx].set(0.0)
 
-    # Second pass: extract diagonal block parameters
-    # Diagonal block is: damping * R(2π*freq/fs) - sum_incoming_coupling * I
-    for i in range(n_oscillators):
-        rows, cols = get_block_slice(i, i)
-        block = A[rows, cols]
+    # Diagonal blocks: damping * R(2π*freq/fs) - sum_incoming_coupling * I
+    # Add back sum of incoming coupling to recover the intrinsic rotation
+    sum_incoming = jnp.sum(coupling_strength, axis=1)  # (n_oscillators,)
+    diag_blocks = blocks[diag_idx, diag_idx]  # (n_oscillators, 2, 2)
+    adjusted = diag_blocks + sum_incoming[:, None, None] * IDENTITY_2x2[None, :, :]
 
-        # Add back the sum of incoming coupling to recover the rotation
-        sum_incoming = jnp.sum(coupling_strength[i, :])
-        adjusted_block = block + sum_incoming * IDENTITY_2x2
+    damping, angles = jax.vmap(_extract_scale_and_angle)(adjusted)
 
-        # Now adjusted_block should be: damping * R(2π*freq/fs)
-        scale, angle = _extract_scale_and_angle(adjusted_block)
-
-        # Convert angle to frequency
-        frequency = angle * sampling_freq / (2 * jnp.pi)
-        # Handle negative frequencies (wrap to positive)
-        frequency = jnp.where(frequency < 0, frequency + sampling_freq / 2, frequency)
-
-        damping = damping.at[i].set(scale)
-        freq = freq.at[i].set(frequency)
+    # Convert angles to frequencies, wrapping negatives
+    freq = angles * sampling_freq / (2 * jnp.pi)
+    freq = jnp.where(freq < 0, freq + sampling_freq / 2, freq)
 
     return {
         "damping": damping,

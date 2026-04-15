@@ -45,17 +45,21 @@ optimization (BFGS), and efficient vectorized/scanned operations.
 
 """
 
+from __future__ import annotations
+
 import logging
 import math
 import warnings
 from collections.abc import Callable
 from functools import partial
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    import matplotlib.pyplot as plt
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.optimize
-import matplotlib.pyplot as plt
 import numpy as np
 import scipy.special
 from jax import Array
@@ -75,11 +79,18 @@ DEFAULT_SIGMA_EPSILON: float = math.sqrt(DEFAULT_PROCESS_NOISE_VARIANCE)
 def approximate_gaussian(
     log_posterior_func: Callable[[ArrayLike], Array], x0: ArrayLike
 ) -> tuple[Array, Array]:
-    """Approximate the posterior using Laplace approximation.
+    """Approximate the posterior using Laplace approximation (BFGS).
 
     Finds the mode and covariance matrix using the Hessian of the
     negative log posterior. Adds regularization to the Hessian before
     inversion for numerical stability.
+
+    This function uses ``jax.scipy.optimize.minimize(method="BFGS")``
+    internally. It is **not** reverse-mode differentiable: ``jax.grad``
+    cannot propagate through the BFGS solver. For SGD-based fitting
+    (where gradients must flow through the filter), use the Newton path
+    via ``differentiable=True`` in ``smith_learning_filter`` or
+    ``SmithLearningModel.fit_sgd``.
 
     Parameters
     ----------
@@ -278,12 +289,11 @@ def smith_learning_filter(
     one_step_variance : Array, shape (n_trials,)
         One-step prediction variance ($P_{k|k-1}$).
     """
+    # Resolve concrete values before JIT boundary
     n_correct_responses = jnp.asarray(n_correct_responses)
-    # Bias term based on chance probability of correct response
     mu = jnp.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
     sigma_squared_epsilon = jnp.asarray(sigma_epsilon) ** 2
 
-    # Set initial variance if not provided
     init_var: Array
     if init_learning_variance is None:
         init_var = sigma_squared_epsilon
@@ -301,6 +311,27 @@ def smith_learning_filter(
         )
     else:
         max_correct_arr = jnp.asarray(max_possible_correct)
+
+    return _smith_learning_filter_impl(
+        n_correct_responses, max_correct_arr,
+        jnp.asarray(init_learning_state), init_var,
+        sigma_squared_epsilon, mu,
+        differentiable=differentiable,
+    )
+
+
+@partial(jax.jit, static_argnames=["differentiable"])
+def _smith_learning_filter_impl(
+    n_correct_responses: Array,
+    max_correct_arr: Array,
+    init_learning_state: Array,
+    init_var: Array,
+    sigma_squared_epsilon: Array,
+    mu: Array,
+    *,
+    differentiable: bool = False,
+) -> tuple[Array, Array, Array, Array, Array]:
+    """JIT-compiled inner implementation of the Smith learning filter."""
 
     def _step(
         carry: tuple[Array, Array], trial_data: tuple[Array, Array]
@@ -361,6 +392,7 @@ def smith_learning_filter(
     )
 
 
+@jax.jit
 def smith_learning_smoother(
     filtered_learning_state_mode: ArrayLike,
     filtered_learning_state_variance: ArrayLike,
@@ -459,6 +491,7 @@ def smith_learning_smoother(
     )
 
 
+@jax.jit
 def maximization_step(
     smoothed_learning_state_mode: ArrayLike,
     smoothed_learning_state_variance: ArrayLike,
@@ -2199,6 +2232,8 @@ class SmithLearningModel(SGDFittableMixin):
         if not self.is_fitted:
             raise RuntimeError("Model has not been fitted. Run .fit() method first.")
 
+        import matplotlib.pyplot as plt
+
         n_trials = len(self.smoothed_learning_state_mode)
         trials_axis = jnp.arange(n_trials)
 
@@ -2732,6 +2767,8 @@ class SmithLearningModel(SGDFittableMixin):
         if not self.is_fitted:
             raise RuntimeError("Model has not been fitted. Run .fit() method first.")
 
+        import matplotlib.pyplot as plt
+
         comparison_matrix = self.get_trial_comparison_matrix(
             key=key,
             n_samples=n_samples,
@@ -2825,6 +2862,8 @@ class SmithLearningModel(SGDFittableMixin):
         if self.log_likelihood_history_ is None:
             raise RuntimeError("Model has not been fitted. Run .fit() method first.")
 
+        import matplotlib.pyplot as plt
+
         fig, ax = plt.subplots(figsize=(8, 4), constrained_layout=True)
         iterations = range(1, len(self.log_likelihood_history_) + 1)
         ax.plot(iterations, self.log_likelihood_history_, "o-", markersize=4)
@@ -2875,6 +2914,8 @@ class SmithLearningModel(SGDFittableMixin):
         """
         if not self.is_fitted:
             raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+
+        import matplotlib.pyplot as plt
 
         fig, axes = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
 

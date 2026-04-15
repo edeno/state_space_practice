@@ -16,6 +16,7 @@ from state_space_practice.kalman import joseph_form_update, psd_solve, symmetriz
 from state_space_practice.nonlinear_dynamics import (
     apply_mlp,
     ekf_predict_step,
+    ekf_predict_step_with_jacobian,
     ekf_smooth_step,
     get_transition_jacobian,
     init_mlp_params,
@@ -162,8 +163,9 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
             
             def predict_j_k(mj, Pj, k):
                 trans_k = {**jax.tree_util.tree_map(lambda x: x[k], mlp_params), "omega": omega[k]}
-                F_jk = get_transition_jacobian(mj, trans_k, apply_mlp, self.dt)
-                m_pred, P_pred = ekf_predict_step(mj, Pj, trans_k, apply_mlp, Q[:, :, k], self.dt)
+                m_pred, P_pred, F_jk = ekf_predict_step_with_jacobian(
+                    mj, Pj, trans_k, apply_mlp, Q[:, :, k], self.dt
+                )
                 return m_pred, P_pred, F_jk
 
             v_predict = jax.vmap(jax.vmap(predict_j_k, in_axes=(None, None, 0)), in_axes=(1, 2, None))

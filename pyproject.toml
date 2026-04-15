@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "state_space_practice"
 description = ""
 readme = "README.md"
-requires-python = ">=3.8,<3.11"
+requires-python = ">=3.10,<3.13"
 license = { file = "LICENSE" }
 authors = [{ name = "Eric Denovellis", email = "eric.denovellis@ucsf.edu" }]
 classifiers = [

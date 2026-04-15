@@ -614,6 +614,7 @@ def sum_of_outer_products(x: jax.Array, y: jax.Array) -> jax.Array:
     return x.T @ y
 
 
+@jax.jit
 def kalman_maximization_step(
     obs: jax.Array,
     smoother_mean: jax.Array,

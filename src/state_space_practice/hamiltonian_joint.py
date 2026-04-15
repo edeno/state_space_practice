@@ -4,20 +4,27 @@ Unifies continuous voltage (LFP) and sparse point-processes (Spikes)
 under a single shared Hamiltonian latent trajectory.
 """
 
+from functools import partial
+from typing import Any, Dict, List, Optional, Tuple
+
 import jax
 import jax.numpy as jnp
-from typing import Dict, Any, Tuple, Optional, List
-from functools import partial
 from jax import Array
 
-from state_space_practice.kalman import psd_solve, symmetrize, joseph_form_update
-from state_space_practice.oscillator_models import BaseModel
-from state_space_practice.parameter_transforms import UNCONSTRAINED, POSITIVE, ParameterTransform
-from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.kalman import joseph_form_update, psd_solve, symmetrize
 from state_space_practice.nonlinear_dynamics import (
-    leapfrog_step, apply_mlp, init_mlp_params, ekf_predict_step,
-    get_transition_jacobian, ekf_smooth_step
+    apply_mlp,
+    ekf_predict_step,
+    ekf_predict_step_with_jacobian,
+    ekf_smooth_step,
+    get_transition_jacobian,
+    init_mlp_params,
+    leapfrog_step,
 )
+from state_space_practice.oscillator_models import BaseModel
+from state_space_practice.parameter_transforms import PSD_MATRIX, POSITIVE, UNCONSTRAINED, ParameterTransform
+from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.utils import stabilize_covariance
 
 class JointHamiltonianModel(BaseModel, SGDFittableMixin):
     """Joint Model combining Gaussian LFP and Poisson Spikes."""
@@ -90,7 +97,7 @@ class JointHamiltonianModel(BaseModel, SGDFittableMixin):
         d_s = params["d_spikes"]
         
         R_l = jnp.eye(self.n_lfp) * self.obs_noise_std**2
-        Q = self.process_cov[:, :, 0]
+        Q = params.get("Q", self.process_cov[:, :, 0])
 
         def step(carry, obs_t):
             y_lfp_t, y_spike_t = obs_t
@@ -144,16 +151,17 @@ class JointHamiltonianModel(BaseModel, SGDFittableMixin):
         C_l, d_l = params["C_lfp"], params["d_lfp"]
         C_s, d_s = params["C_spikes"], params["d_spikes"]
         R_l = jnp.eye(self.n_lfp) * self.obs_noise_std**2
-        Q = self.process_cov[:, :, 0]
+        Q = params.get("Q", self.process_cov[:, :, 0])
 
         # 1. Forward Pass (Store predicted and filtered states)
         def forward_step(carry, obs_t):
             y_lfp_t, y_spike_t = obs_t
             m_prev, P_prev = carry
             
-            # Predict
-            F_t = get_transition_jacobian(m_prev, trans_params, apply_mlp, self.dt)
-            m_pred, P_pred = ekf_predict_step(m_prev, P_prev, trans_params, apply_mlp, Q, self.dt)
+            # Predict (returns Jacobian to avoid recomputation)
+            m_pred, P_pred, F_t = ekf_predict_step_with_jacobian(
+                m_prev, P_prev, trans_params, apply_mlp, Q, self.dt
+            )
             
             # LFP Update
             S_l = C_l @ P_pred @ C_l.T + R_l
@@ -201,7 +209,7 @@ class JointHamiltonianModel(BaseModel, SGDFittableMixin):
         self,
         lfp_obs: Array,
         spike_obs: Array,
-        key: Array,
+        key: Array | None = None,
         optimizer: Optional[object] = None,
         num_steps: int = 200,
         verbose: bool = False,
@@ -231,12 +239,14 @@ class JointHamiltonianModel(BaseModel, SGDFittableMixin):
             "C_spikes": self.C_spikes,
             "d_spikes": self.d_spikes,
             "init_mean": self.init_mean[:, 0],
+            "Q": self.process_cov[:, :, 0],
         }
         spec = {
             "mlp": UNCONSTRAINED, "omega": POSITIVE,
             "C_lfp": UNCONSTRAINED, "d_lfp": UNCONSTRAINED,
             "C_spikes": UNCONSTRAINED, "d_spikes": UNCONSTRAINED,
-            "init_mean": UNCONSTRAINED
+            "init_mean": UNCONSTRAINED,
+            "Q": PSD_MATRIX,
         }
         return params, spec
 
@@ -296,7 +306,11 @@ class JointHamiltonianModel(BaseModel, SGDFittableMixin):
         self.C_spikes = params["C_spikes"]
         self.d_spikes = params["d_spikes"]
         self.init_mean = self.init_mean.at[:, 0].set(params["init_mean"])
-        
+        if "Q" in params:
+            self.process_cov = jnp.stack(
+                [stabilize_covariance(params["Q"])], axis=2
+            )
+
         # Resynchronize BaseModel fields
         self.measurement_matrix = jnp.zeros((self.n_sources, self.n_cont_states, 1)).at[:self.n_lfp, :, 0].set(self.C_lfp)
         self.measurement_matrix = self.measurement_matrix.at[self.n_lfp:, :, 0].set(self.C_spikes)

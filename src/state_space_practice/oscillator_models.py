@@ -133,6 +133,7 @@ class BaseModel(ABC, SGDFittableMixin):
         n_sources: int,
         sampling_freq: float,
         discrete_transition_diag: Optional[jax.Array] = None,
+        stickiness: float = 0.0,
         update_discrete_transition_matrix: bool = True,
         update_continuous_transition_matrix: bool = True,
         update_measurement_matrix: bool = True,
@@ -147,13 +148,31 @@ class BaseModel(ABC, SGDFittableMixin):
         self.sampling_freq = sampling_freq
         self.n_cont_states = 2 * n_oscillators
 
-        # Set default diagonal if not provided
+        # Set default diagonal if not provided.
+        # Default: ~1s expected dwell time, computed from sampling_freq.
+        # p_stay = 1 - 1/(dwell_seconds * sampling_freq)
         if discrete_transition_diag is None:
+            expected_dwell_sec = 1.0
+            if sampling_freq < 1.0 / expected_dwell_sec:
+                raise ValueError(
+                    f"sampling_freq={sampling_freq} Hz is too low for "
+                    f"expected_dwell_sec={expected_dwell_sec}. "
+                    f"Require sampling_freq >= {1.0 / expected_dwell_sec} Hz."
+                )
+            p_stay = 1.0 - 1.0 / (expected_dwell_sec * sampling_freq)
+            p_stay = max(0.0, min(0.95, p_stay))
             self.discrete_transition_diag = jnp.full(
-                (n_discrete_states,), 0.95, dtype=jnp.float32
+                (n_discrete_states,), p_stay
             )
         else:
-            self.discrete_transition_diag = discrete_transition_diag
+            self.discrete_transition_diag = jnp.asarray(discrete_transition_diag)
+
+        # Dirichlet prior for transition matrix (sticky prior)
+        from state_space_practice.contingency_belief import get_transition_prior
+        self.transition_prior = get_transition_prior(
+            concentration=1.0, stickiness=stickiness,
+            n_states=n_discrete_states,
+        ) if stickiness > 0 else None
 
         # Store update flags
         self.update_discrete_transition_matrix = update_discrete_transition_matrix
@@ -200,22 +219,174 @@ class BaseModel(ABC, SGDFittableMixin):
 
         # Add update flags for clarity
         update_flags = {
-            "Z": self.update_discrete_transition_matrix,
-            "A": self.update_continuous_transition_matrix,
-            "H": self.update_measurement_matrix,
-            "Q": self.update_process_cov,
-            "R": self.update_measurement_cov,
-            "m0": self.update_init_mean,
-            "P0": self.update_init_cov,
+            "discrete_transition": self.update_discrete_transition_matrix,
+            "transition": self.update_continuous_transition_matrix,
+            "measurement": self.update_measurement_matrix,
+            "process_cov": self.update_process_cov,
+            "measurement_cov": self.update_measurement_cov,
+            "init_mean": self.update_init_mean,
+            "init_cov": self.update_init_cov,
         }
 
-        # Filter for flags that are False (since True is default/expected)
-        # Or show all for full clarity - let's show all for now.
         flags_str = ", ".join(f"Update({k})={v}" for k, v in update_flags.items())
 
         return (
             f"<{self.__class__.__name__}: " f"{', '.join(params)}, " f"[{flags_str}]>"
         )
+
+    def decode(self) -> jax.Array:
+        """Return the most likely discrete state at each time step.
+
+        Returns
+        -------
+        states : jax.Array, shape (n_time,)
+            Argmax of smoother discrete state probabilities.
+
+        Raises
+        ------
+        RuntimeError
+            If called before fit() or fit_sgd().
+        """
+        if not hasattr(self, "smoother_discrete_state_prob") or \
+           self.smoother_discrete_state_prob is None:
+            raise RuntimeError(
+                "Call fit() or fit_sgd() before decode()."
+            )
+        return jnp.argmax(self.smoother_discrete_state_prob, axis=1)
+
+    def predict_proba(self) -> jax.Array:
+        """Return smoothed discrete state probabilities.
+
+        Returns
+        -------
+        probs : jax.Array, shape (n_time, n_discrete_states)
+            Posterior probability of each discrete state at each time step.
+
+        Raises
+        ------
+        RuntimeError
+            If called before fit() or fit_sgd().
+        """
+        if not hasattr(self, "smoother_discrete_state_prob") or \
+           self.smoother_discrete_state_prob is None:
+            raise RuntimeError(
+                "Call fit() or fit_sgd() before predict_proba()."
+            )
+        return self.smoother_discrete_state_prob
+
+    def _warm_initialize_states(self, observations: ArrayLike) -> None:
+        """Warm-initialize discrete state priors and per-state init_mean.
+
+        Uses windowed cross-covariance features clustered with a Gaussian
+        mixture model to break symmetry before the first E-step.  Sets
+        ``init_mean`` to per-state latent estimates (via H pseudo-inverse)
+        and ``init_discrete_state_prob`` from GMM mixing weights.
+        Also scales ``init_cov`` to match data variance.
+
+        Subclasses may override to use model-specific features (e.g.
+        spectral features for COM).  The shared post-GMM logic lives
+        in ``_apply_warm_init``.
+
+        Parameters
+        ----------
+        observations : ArrayLike, shape (n_time, n_sources)
+        """
+        import numpy as np_cpu
+
+        n_time, n_sources = observations.shape
+        n_states = self.n_discrete_states
+        obs_np = np_cpu.array(observations)
+
+        if n_states <= 1:
+            return
+
+        window, n_windows, windowed = self._prepare_windows(obs_np, n_states)
+        if windowed is None:
+            return
+
+        # Windowed cross-covariance features (upper triangle)
+        triu_idx = np_cpu.triu_indices(n_sources)
+        features = np_cpu.stack(
+            [np_cpu.cov(windowed[w].T)[triu_idx] for w in range(n_windows)]
+        )
+
+        self._apply_warm_init(features, obs_np, windowed, n_states)
+
+    @staticmethod
+    def _prepare_windows(obs_np, n_states):
+        """Compute windowed observations for warm init.
+
+        Returns (window, n_windows, windowed) or (None, None, None)
+        if there is not enough data.
+        """
+
+        n_time = obs_np.shape[0]
+        window = min(50, n_time // (2 * n_states))
+        window = max(window, 10)
+        n_windows = n_time // window
+
+        if n_windows < n_states * 2:
+            logger.debug(
+                "Warm init skipped: only %d windows for %d states.",
+                n_windows, n_states,
+            )
+            return None, None, None
+
+        trimmed = obs_np[: n_windows * window]
+        windowed = trimmed.reshape(n_windows, window, -1)
+        return window, n_windows, windowed
+
+    def _apply_warm_init(self, features, obs_np, windowed, n_states) -> None:
+        """Shared GMM clustering and parameter setting for warm init.
+
+        Called by ``_warm_initialize_states`` (and subclass overrides)
+        after model-specific features have been constructed.
+
+        Assumes ``self.measurement_matrix`` is already initialized
+        (H is constant across states for CNM and DIM).
+        """
+        import numpy as np_cpu
+        from sklearn.mixture import GaussianMixture
+
+        gmm = GaussianMixture(
+            n_components=n_states,
+            covariance_type="full",
+            n_init=5,
+            random_state=0,
+        )
+        gmm.fit(features)
+        labels = gmm.predict(features)
+
+        # Per-state init_mean via H pseudo-inverse
+        H = np_cpu.array(self.measurement_matrix[:, :, 0])
+        H_pinv = np_cpu.linalg.pinv(H)
+
+        per_state_means = []
+        for j in range(n_states):
+            mask = labels == j
+            if mask.any():
+                state_obs_mean = windowed[mask].mean(axis=(0, 1))
+            else:
+                state_obs_mean = obs_np.mean(axis=0)
+            per_state_means.append(H_pinv @ state_obs_mean)
+
+        self.init_mean = jnp.stack(
+            [jnp.array(m) for m in per_state_means], axis=1
+        )
+
+        # Data-informed init_cov scaled to observation variance
+        obs_var = np_cpu.var(obs_np, axis=0).mean()
+        scale = max(float(obs_var), 1e-6)
+        self.init_cov = jnp.stack(
+            [scale * jnp.identity(self.n_cont_states)] * n_states, axis=2
+        )
+
+        # init_discrete_state_prob from GMM mixing weights (smoothed)
+        eps = 0.1
+        weights = np_cpu.array(gmm.weights_)
+        smoothed = weights * (1.0 - eps) + eps / n_states
+        smoothed = smoothed / smoothed.sum()
+        self.init_discrete_state_prob = jnp.array(smoothed)
 
     def _initialize_discrete_state_prob(self) -> None:
         """Initializes the starting probability for each discrete state."""
@@ -448,6 +619,7 @@ class BaseModel(ABC, SGDFittableMixin):
             smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
             pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
             pair_cond_smoother_means=self.smoother_pair_cond_means,
+            transition_prior=self.transition_prior,
         )
 
         # Update parameters based on flags
@@ -471,10 +643,11 @@ class BaseModel(ABC, SGDFittableMixin):
     def fit(
         self,
         observations: ArrayLike,
-        key: Array,
+        key: Array | None = None,
         max_iter: int = 100,
-        tolerance: float = 1e-4,
-    ) -> list[jax.Array]:
+        tol: float = 1e-4,
+        skip_init: bool = False,
+    ) -> list[float]:
         """Fits the model to observations using the EM algorithm.
 
         Iteratively performs E-steps and M-steps until convergence or
@@ -484,31 +657,39 @@ class BaseModel(ABC, SGDFittableMixin):
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
-        key : Array
-            JAX random number generator key for initialization.
+        key : Array or None, optional
+            JAX random key for initialization. Defaults to PRNGKey(0).
         max_iter : int, optional
             Maximum number of EM iterations, by default 100.
-        tolerance : float, optional
+        tol : float, optional
             Convergence tolerance for log-likelihood, by default 1e-4.
+        skip_init : bool, default=False
+            If True, skip initialization and warm start (use existing
+            parameters). Useful for resuming fitting or providing
+            custom initial parameters.
 
         Returns
         -------
-        log_likelihoods : list[jax.Array]
-            A list of marginal log-likelihoods at each iteration (scalar arrays).
+        log_likelihoods : list[float]
+            Marginal log-likelihood at each iteration.
         """
+        if key is None:
+            key = jax.random.PRNGKey(0)
         observations = jnp.asarray(observations)
-        self._initialize_parameters(key)
-        log_likelihoods: list[jax.Array] = []
-        previous_log_likelihood: jax.Array = jnp.array(-jnp.inf)
+        if not skip_init:
+            self._initialize_parameters(key)
+            self._warm_initialize_states(observations)
+        log_likelihoods: list[float] = []
+        previous_log_likelihood = -float("inf")
 
         for iteration in range(max_iter):
             # E-step
-            current_log_likelihood = self._e_step(observations)
+            current_log_likelihood = float(self._e_step(observations))
             log_likelihoods.append(current_log_likelihood)
 
             # Check convergence
             is_converged, is_increasing = check_converged(
-                current_log_likelihood, previous_log_likelihood, tolerance
+                current_log_likelihood, previous_log_likelihood, tol
             )
 
             if not is_increasing:
@@ -518,6 +699,7 @@ class BaseModel(ABC, SGDFittableMixin):
 
             if is_converged:
                 logger.info(f"Converged after {iteration + 1} iterations.")
+                self.converged_ = True
                 break
 
             # M-step
@@ -532,8 +714,8 @@ class BaseModel(ABC, SGDFittableMixin):
                 f"Change: {(current_log_likelihood - previous_log_likelihood):.4f}"
             )
             previous_log_likelihood = current_log_likelihood
-
-        if len(log_likelihoods) == max_iter:
+        else:
+            self.converged_ = False
             logger.warning("Reached maximum iterations without converging.")
 
         return log_likelihoods
@@ -543,11 +725,12 @@ class BaseModel(ABC, SGDFittableMixin):
     def fit_sgd(
         self,
         observations: ArrayLike,
-        key: Array,
+        key: Array | None = None,
         optimizer: Optional[object] = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: Optional[float] = None,
+        skip_init: bool = False,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
 
@@ -555,8 +738,9 @@ class BaseModel(ABC, SGDFittableMixin):
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
-        key : Array
+        key : Array or None
             JAX random key for parameter initialization.
+            If None, defaults to ``jax.random.PRNGKey(0)``.
         optimizer : optax optimizer or None
             Default: adam(1e-2) with gradient clipping.
         num_steps : int
@@ -565,13 +749,19 @@ class BaseModel(ABC, SGDFittableMixin):
             Log progress every 10 steps.
         convergence_tol : float or None
             If set, stop early when |ΔLL| < tol for 5 consecutive steps.
+        skip_init : bool, default=False
+            If True, skip initialization and warm start.
 
         Returns
         -------
         log_likelihoods : list of float
         """
+        if key is None:
+            key = jax.random.PRNGKey(0)
         observations = jnp.asarray(observations)
-        self._initialize_parameters(key)
+        if not skip_init:
+            self._initialize_parameters(key)
+            self._warm_initialize_states(observations)
         self._sgd_n_time = observations.shape[0]
 
         return super().fit_sgd(
@@ -643,7 +833,7 @@ class CommonOscillatorModel(BaseModel):
     ----------
     freqs : jax.Array, shape (n_oscillators,)
         Intrinsic frequencies of the oscillators.
-    auto_regressive_coef : jax.Array, shape (n_oscillators,)
+    damping_coef : jax.Array, shape (n_oscillators,)
         Damping coefficients for each oscillator.
     process_variance : jax.Array, shape (n_oscillators,)
         Process noise variance for each oscillator.
@@ -658,7 +848,7 @@ class CommonOscillatorModel(BaseModel):
         n_sources: int,
         sampling_freq: float,
         freqs: jax.Array,
-        auto_regressive_coef: jax.Array,
+        damping_coef: jax.Array,
         process_variance: jax.Array,
         measurement_variance: float,
         **kwargs,
@@ -672,11 +862,11 @@ class CommonOscillatorModel(BaseModel):
             )
         self.freqs = freqs
 
-        if auto_regressive_coef.shape != (n_oscillators,):
+        if damping_coef.shape != (n_oscillators,):
             raise ValueError(
-                f"Shape mismatch: auto_regressive_coef {auto_regressive_coef.shape} vs n_oscillators {n_oscillators}"
+                f"Shape mismatch: damping_coef {damping_coef.shape} vs n_oscillators {n_oscillators}"
             )
-        self.auto_regressive_coef = auto_regressive_coef
+        self.damping_coef = damping_coef
 
         if process_variance.shape != (n_oscillators,):
             raise ValueError(
@@ -710,7 +900,6 @@ class CommonOscillatorModel(BaseModel):
         self.measurement_matrix = jax.random.uniform(
             key,
             (self.n_sources, self.n_cont_states, self.n_discrete_states),
-            dtype=jnp.float32,
             minval=0.0,
             maxval=0.1,
         )
@@ -726,7 +915,7 @@ class CommonOscillatorModel(BaseModel):
         """Initializes A based on freqs/damping, constant across discrete states."""
         transition_matrix = construct_common_oscillator_transition_matrix(
             freqs=self.freqs,
-            auto_regressive_coef=self.auto_regressive_coef,
+            damping_coef=self.damping_coef,
             sampling_freq=self.sampling_freq,
         )
         self.continuous_transition_matrix = jnp.stack(
@@ -799,30 +988,30 @@ class CommonOscillatorModel(BaseModel):
     def fit(
         self,
         observations: ArrayLike,
-        key: Array,
+        key: Array | None = None,
         max_iter: int = 100,
-        tolerance: float = 1e-4,
-    ) -> list[jax.Array]:
+        tol: float = 1e-4,
+        skip_init: bool = False,
+    ) -> list[float]:
         """Fits the model to observations using the EM algorithm.
-
-        Iteratively performs E-steps and M-steps until convergence or
-        the maximum number of iterations is reached.
 
         Parameters
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
-        key : Array
-            JAX random number generator key for initialization.
+        key : Array or None, optional
+            JAX random key for initialization. Defaults to PRNGKey(0).
         max_iter : int, optional
             Maximum number of EM iterations, by default 100.
-        tolerance : float, optional
+        tol : float, optional
             Convergence tolerance for log-likelihood, by default 1e-4.
+        skip_init : bool, default=False
+            If True, skip initialization and warm start.
 
         Returns
         -------
-        log_likelihoods : list[jax.Array]
-            A list of marginal log-likelihoods at each iteration (scalar arrays).
+        log_likelihoods : list[float]
+            Marginal log-likelihood at each iteration.
         """
         observations = jnp.asarray(observations)
         if observations.shape[1] != self.n_sources:
@@ -830,7 +1019,7 @@ class CommonOscillatorModel(BaseModel):
                 f"observations must have {self.n_sources} sources, "
                 f"got {observations.shape[1]}."
             )
-        return super().fit(observations, key, max_iter, tolerance)
+        return super().fit(observations, key, max_iter, tol, skip_init=skip_init)
 
     # --- SGDFittableMixin: COM-specific param spec and loss ---
 
@@ -909,7 +1098,7 @@ class CorrelatedNoiseModel(BaseModel):
     ----------
     freqs : jax.Array, shape (n_oscillators,)
         Intrinsic frequencies of the oscillators.
-    auto_regressive_coef : jax.Array, shape (n_oscillators,)
+    damping_coef : jax.Array, shape (n_oscillators,)
         Damping coefficients for each oscillator.
     process_variance : jax.Array, shape (n_oscillators, n_discrete_states)
         Process noise variance for each oscillator and state.
@@ -927,7 +1116,7 @@ class CorrelatedNoiseModel(BaseModel):
         n_discrete_states: int,
         sampling_freq: float,
         freqs: jax.Array,
-        auto_regressive_coef: jax.Array,
+        damping_coef: jax.Array,
         process_variance: jax.Array,
         measurement_variance: float,
         phase_difference: jax.Array,
@@ -948,9 +1137,9 @@ class CorrelatedNoiseModel(BaseModel):
             raise ValueError(
                 f"Shape mismatch: freqs {freqs.shape} vs n_oscillators {n_oscillators}"
             )
-        if auto_regressive_coef.shape != (n_oscillators,):
+        if damping_coef.shape != (n_oscillators,):
             raise ValueError(
-                f"Shape mismatch: auto_regressive_coef {auto_regressive_coef.shape} vs n_oscillators {n_oscillators}"
+                f"Shape mismatch: damping_coef {damping_coef.shape} vs n_oscillators {n_oscillators}"
             )
         if process_variance.shape != (n_oscillators, n_discrete_states):
             raise ValueError(
@@ -979,7 +1168,7 @@ class CorrelatedNoiseModel(BaseModel):
         if sampling_freq <= 0:
             raise ValueError("sampling_freq must be positive. " f"Got {sampling_freq}.")
         self.freqs = freqs
-        self.auto_regressive_coef = auto_regressive_coef
+        self.damping_coef = damping_coef
         self.process_variance = process_variance
         self.measurement_variance = measurement_variance
         self.phase_difference = phase_difference
@@ -1010,7 +1199,7 @@ class CorrelatedNoiseModel(BaseModel):
         """Initializes A based on freqs/damping, constant across discrete states."""
         transition_matrix = construct_common_oscillator_transition_matrix(
             freqs=self.freqs,
-            auto_regressive_coef=self.auto_regressive_coef,
+            damping_coef=self.damping_coef,
             sampling_freq=self.sampling_freq,
         )
         self.continuous_transition_matrix = jnp.stack(
@@ -1049,30 +1238,30 @@ class CorrelatedNoiseModel(BaseModel):
     def fit(
         self,
         observations: ArrayLike,
-        key: Array,
+        key: Array | None = None,
         max_iter: int = 100,
-        tolerance: float = 1e-4,
-    ) -> list[jax.Array]:
+        tol: float = 1e-4,
+        skip_init: bool = False,
+    ) -> list[float]:
         """Fits the model to observations using the EM algorithm.
-
-        Iteratively performs E-steps and M-steps until convergence or
-        the maximum number of iterations is reached.
 
         Parameters
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
-        key : Array
-            JAX random number generator key for initialization.
+        key : Array or None, optional
+            JAX random key for initialization. Defaults to PRNGKey(0).
         max_iter : int, optional
             Maximum number of EM iterations, by default 100.
-        tolerance : float, optional
+        tol : float, optional
             Convergence tolerance for log-likelihood, by default 1e-4.
+        skip_init : bool, default=False
+            If True, skip initialization and warm start.
 
         Returns
         -------
-        log_likelihoods : list[jax.Array]
-            A list of marginal log-likelihoods at each iteration (scalar arrays).
+        log_likelihoods : list[float]
+            Marginal log-likelihood at each iteration.
         """
         observations = jnp.asarray(observations)
         if observations.shape[1] != self.n_sources:
@@ -1080,7 +1269,7 @@ class CorrelatedNoiseModel(BaseModel):
                 f"observations must have {self.n_sources} sources, "
                 f"got {observations.shape[1]}."
             )
-        return super().fit(observations, key, max_iter, tolerance)
+        return super().fit(observations, key, max_iter, tol, skip_init=skip_init)
 
     # --- SGDFittableMixin: CNM-specific param spec and loss ---
 
@@ -1129,15 +1318,11 @@ class CorrelatedNoiseModel(BaseModel):
         phase_diff = params.get("phase_difference", self.phase_difference)
         coupling = params.get("coupling_strength", self.coupling_strength)
 
-        Q_list = []
-        for j in range(self.n_discrete_states):
-            Q_j = construct_correlated_noise_process_covariance(
-                variance=proc_var if proc_var.ndim == 1 else proc_var[:, j],
-                phase_difference=phase_diff[..., j],
-                coupling_strength=coupling[..., j],
-            )
-            Q_list.append(Q_j)
-        Q = jnp.stack(Q_list, axis=-1)
+        # Vectorize Q construction over discrete states (last axis)
+        Q = jax.vmap(
+            construct_correlated_noise_process_covariance,
+            in_axes=(-1, -1, -1), out_axes=-1,
+        )(proc_var, phase_diff, coupling)
 
         result = switching_kalman_filter(
             init_state_cond_mean=m0,
@@ -1162,16 +1347,10 @@ class CorrelatedNoiseModel(BaseModel):
             self.coupling_strength = params["coupling_strength"]
         # Reconstruct Q from updated params
         if any(k in params for k in ("process_variance", "phase_difference", "coupling_strength")):
-            Q_list = []
-            for j in range(self.n_discrete_states):
-                pv = self.process_variance
-                Q_j = construct_correlated_noise_process_covariance(
-                    variance=pv if pv.ndim == 1 else pv[:, j],
-                    phase_difference=self.phase_difference[..., j],
-                    coupling_strength=self.coupling_strength[..., j],
-                )
-                Q_list.append(Q_j)
-            self.process_cov = jnp.stack(Q_list, axis=-1)
+            self.process_cov = jax.vmap(
+                construct_correlated_noise_process_covariance,
+                in_axes=(-1, -1, -1), out_axes=-1,
+            )(self.process_variance, self.phase_difference, self.coupling_strength)
         self.init_cov = self._reconstruct_per_state_array(
             params, "init_cov", self.init_cov
         )
@@ -1189,7 +1368,7 @@ class DirectedInfluenceModel(BaseModel):
     ----------
     freqs : jax.Array, shape (n_oscillators,)
         Intrinsic frequencies of the oscillators.
-    auto_regressive_coef : jax.Array, shape (n_oscillators,)
+    damping_coef : jax.Array, shape (n_oscillators,)
         Damping coefficients for each oscillator.
     process_variance : jax.Array, shape (n_oscillators,)
         Process noise variance (constant across states).
@@ -1212,7 +1391,7 @@ class DirectedInfluenceModel(BaseModel):
         n_discrete_states: int,
         sampling_freq: float,
         freqs: jax.Array,
-        auto_regressive_coef: jax.Array,
+        damping_coef: jax.Array,
         process_variance: jax.Array,
         measurement_variance: float,
         phase_difference: jax.Array,
@@ -1235,11 +1414,11 @@ class DirectedInfluenceModel(BaseModel):
                 f"Shape mismatch: freqs {freqs.shape} vs n_oscillators {n_oscillators}"
             )
         self.freqs = freqs
-        if auto_regressive_coef.shape != (n_oscillators,):
+        if damping_coef.shape != (n_oscillators,):
             raise ValueError(
-                f"Shape mismatch: auto_regressive_coef {auto_regressive_coef.shape} vs n_oscillators {n_oscillators}"
+                f"Shape mismatch: damping_coef {damping_coef.shape} vs n_oscillators {n_oscillators}"
             )
-        self.auto_regressive_coef = auto_regressive_coef
+        self.damping_coef = damping_coef
         if process_variance.shape != (n_oscillators,):
             raise ValueError(
                 f"Shape mismatch: process_variance {process_variance.shape} vs n_oscillators {n_oscillators}"
@@ -1303,7 +1482,7 @@ class DirectedInfluenceModel(BaseModel):
             [
                 construct_directed_influence_transition_matrix(
                     freqs=self.freqs,
-                    damping_coeffs=self.auto_regressive_coef,
+                    damping_coeffs=self.damping_coef,
                     coupling_strengths=self.coupling_strength[..., state_ind],
                     phase_diffs=self.phase_difference[..., state_ind],
                     sampling_freq=self.sampling_freq,
@@ -1375,6 +1554,7 @@ class DirectedInfluenceModel(BaseModel):
             smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
             pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
             pair_cond_smoother_means=self.smoother_pair_cond_means,
+            transition_prior=self.transition_prior,
         )
 
         # Update non-A parameters based on flags (same as standard M-step)
@@ -1450,7 +1630,7 @@ class DirectedInfluenceModel(BaseModel):
         """Update public oscillator attributes from optimized parameters.
 
         After the reparameterized M-step, syncs the private _current_osc_params
-        to the public attributes (freqs, auto_regressive_coef, coupling_strength,
+        to the public attributes (freqs, damping_coef, coupling_strength,
         phase_difference) so downstream code can inspect the learned network.
         """
         if self._current_osc_params is None:
@@ -1464,7 +1644,7 @@ class DirectedInfluenceModel(BaseModel):
 
         # For freqs and damping, take mean across states (they're per-oscillator params)
         self.freqs = jnp.mean(jnp.stack(freqs_list, axis=-1), axis=-1)
-        self.auto_regressive_coef = jnp.mean(jnp.stack(damping_list, axis=-1), axis=-1)
+        self.damping_coef = jnp.mean(jnp.stack(damping_list, axis=-1), axis=-1)
 
         # coupling_strength and phase_diff: shape (n_osc, n_osc, n_discrete_states)
         coupling_list = [p["coupling_strength"] for p in self._current_osc_params]
@@ -1517,33 +1697,57 @@ class DirectedInfluenceModel(BaseModel):
             projected.append(A_j)
         self.continuous_transition_matrix = jnp.stack(projected, axis=-1)
 
+        # Sync coupling_strength and phase_difference from the projected A
+        # so users can inspect learned network parameters after standard EM
+        self._sync_coupling_from_transition_matrix()
+
+    def _sync_coupling_from_transition_matrix(self) -> None:
+        """Extract coupling/phase params from the current transition matrix.
+
+        Called after standard EM projection so that ``coupling_strength``
+        and ``phase_difference`` reflect the fitted A, not just the
+        initial values.
+        """
+        coupling_list = []
+        phase_list = []
+        for j in range(self.n_discrete_states):
+            params = extract_dim_params_from_matrix(
+                self.continuous_transition_matrix[..., j],
+                self.sampling_freq,
+                self.n_oscillators,
+            )
+            coupling_list.append(params["coupling_strength"])
+            phase_list.append(params["phase_diff"])
+        self.coupling_strength = jnp.stack(coupling_list, axis=-1)
+        self.phase_difference = jnp.stack(phase_list, axis=-1)
+
     def fit(
         self,
         observations: ArrayLike,
-        key: Array,
+        key: Array | None = None,
         max_iter: int = 100,
-        tolerance: float = 1e-4,
-    ) -> list[jax.Array]:
+        tol: float = 1e-4,
+        skip_init: bool = False,
+    ) -> list[float]:
         """Fits the model to observations using the EM algorithm.
-
-        Iteratively performs E-steps and M-steps until convergence or
-        the maximum number of iterations is reached.
 
         Parameters
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
-        key : Array
-            JAX random number generator key for initialization.
+        key : Array or None, optional
+            JAX random key for initialization. Defaults to PRNGKey(0).
         max_iter : int, optional
             Maximum number of EM iterations, by default 100.
-        tolerance : float, optional
+        tol : float, optional
             Convergence tolerance for log-likelihood, by default 1e-4.
+        skip_init : bool, default=False
+            If True, skip initialization and warm start.
 
         Returns
         -------
-        log_likelihoods : list[jax.Array]
-            A list of marginal log-likelihoods at each iteration (scalar arrays).
+        log_likelihoods : list[float]
+            Marginal log-likelihood at each iteration.
         """
         observations = jnp.asarray(observations)
         if observations.shape[1] != self.n_sources:
@@ -1551,7 +1755,7 @@ class DirectedInfluenceModel(BaseModel):
                 f"observations must have {self.n_sources} sources, "
                 f"got {observations.shape[1]}."
             )
-        return super().fit(observations, key, max_iter, tolerance)
+        return super().fit(observations, key, max_iter, tol, skip_init=skip_init)
 
     # --- SGDFittableMixin: DIM-specific param spec and loss ---
 
@@ -1596,20 +1800,27 @@ class DirectedInfluenceModel(BaseModel):
     def fit_sgd(
         self,
         observations: ArrayLike,
-        key: Array,
+        key: Array | None = None,
         optimizer: Optional[object] = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: Optional[float] = None,
         connectivity_penalty: Optional[object] = None,
+        skip_init: bool = False,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
+
+        SGD optimizes ``coupling_strength`` and ``phase_difference``
+        (and optionally discrete transition, init params, measurement cov).
+        Frequencies (``freqs``) and damping (``damping_coef``) are frozen
+        during SGD and used as constants.
 
         Parameters
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
-        key : Array
+        key : Array or None
             JAX random key for parameter initialization.
+            If None, defaults to ``jax.random.PRNGKey(0)``.
         optimizer : optax optimizer or None
         num_steps : int
         verbose : bool
@@ -1617,6 +1828,8 @@ class DirectedInfluenceModel(BaseModel):
         connectivity_penalty : OscillatorPenaltyConfig or None
             If provided, adds structured sparsity penalties on
             coupling_strength during SGD optimization.
+        skip_init : bool, default=False
+            If True, skip initialization and warm start.
 
         Returns
         -------
@@ -1624,28 +1837,27 @@ class DirectedInfluenceModel(BaseModel):
         """
         self._connectivity_penalty = connectivity_penalty
         return super().fit_sgd(
-            observations, key,
+            observations, key=key,
             optimizer=optimizer,
             num_steps=num_steps,
             verbose=verbose,
             convergence_tol=convergence_tol,
+            skip_init=skip_init,
         )
 
     def _sgd_loss_fn(self, params: dict, observations) -> jax.Array:
         phase_diff = params.get("phase_difference", self.phase_difference)
         coupling = params.get("coupling_strength", self.coupling_strength)
 
-        A_list = []
-        for j in range(self.n_discrete_states):
-            A_j = construct_directed_influence_transition_matrix(
-                freqs=self.freqs,
-                damping_coeffs=self.auto_regressive_coef,
-                phase_diffs=phase_diff[..., j],
-                coupling_strengths=coupling[..., j],
+        # Vectorize A construction over discrete states (last axis)
+        A = jax.vmap(
+            lambda pd, cs: construct_directed_influence_transition_matrix(
+                freqs=self.freqs, damping_coeffs=self.damping_coef,
+                phase_diffs=pd, coupling_strengths=cs,
                 sampling_freq=self.sampling_freq,
-            )
-            A_list.append(A_j)
-        A = jnp.stack(A_list, axis=-1)
+            ),
+            in_axes=(-1, -1), out_axes=-1,
+        )(phase_diff, coupling)
 
         Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
         m0 = params.get("init_mean", self.init_mean)
@@ -1688,17 +1900,14 @@ class DirectedInfluenceModel(BaseModel):
             self.coupling_strength = params["coupling_strength"]
         # Reconstruct A from updated scientific params
         if "phase_difference" in params or "coupling_strength" in params:
-            A_list = []
-            for j in range(self.n_discrete_states):
-                A_j = construct_directed_influence_transition_matrix(
-                    freqs=self.freqs,
-                    damping_coeffs=self.auto_regressive_coef,
-                    phase_diffs=self.phase_difference[..., j],
-                    coupling_strengths=self.coupling_strength[..., j],
+            self.continuous_transition_matrix = jax.vmap(
+                lambda pd, cs: construct_directed_influence_transition_matrix(
+                    freqs=self.freqs, damping_coeffs=self.damping_coef,
+                    phase_diffs=pd, coupling_strengths=cs,
                     sampling_freq=self.sampling_freq,
-                )
-                A_list.append(A_j)
-            self.continuous_transition_matrix = jnp.stack(A_list, axis=-1)
+                ),
+                in_axes=(-1, -1), out_axes=-1,
+            )(self.phase_difference, self.coupling_strength)
         self.measurement_cov = self._reconstruct_per_state_array(
             params, "measurement_cov", self.measurement_cov
         )

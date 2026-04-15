@@ -171,6 +171,7 @@ class TestAreaCouplingSummary:
         assert jnp.all(jnp.isfinite(summary["cross_area_norm"]))
 
 
+@pytest.mark.slow
 class TestRegularizedSGDIntegration:
     """End-to-end: sparse DIM data → fit with penalty → verify sparsity."""
 
@@ -188,7 +189,7 @@ class TestRegularizedSGDIntegration:
             n_discrete_states=p["n_discrete_states"],
             sampling_freq=p["sampling_freq"],
             freqs=p["freqs"],
-            auto_regressive_coef=p["damping"],
+            damping_coef=p["damping"],
             process_variance=p["process_variance"],
             measurement_variance=p["measurement_variance"],
             phase_difference=p["phase_difference"],
@@ -203,7 +204,7 @@ class TestRegularizedSGDIntegration:
             n_discrete_states=p["n_discrete_states"],
             sampling_freq=p["sampling_freq"],
             freqs=p["freqs"],
-            auto_regressive_coef=p["damping"],
+            damping_coef=p["damping"],
             process_variance=p["process_variance"],
             measurement_variance=p["measurement_variance"],
             phase_difference=p["phase_difference"],
@@ -233,7 +234,7 @@ class TestRegularizedSGDIntegration:
             n_discrete_states=p["n_discrete_states"],
             sampling_freq=p["sampling_freq"],
             freqs=p["freqs"],
-            auto_regressive_coef=p["damping"],
+            damping_coef=p["damping"],
             process_variance=p["process_variance"],
             measurement_variance=p["measurement_variance"],
             phase_difference=p["phase_difference"],
@@ -272,7 +273,7 @@ class TestRegularizedSGDIntegration:
             n_discrete_states=p["n_discrete_states"],
             sampling_freq=p["sampling_freq"],
             freqs=p["freqs"],
-            auto_regressive_coef=p["damping"],
+            damping_coef=p["damping"],
             process_variance=p["process_variance"],
             measurement_variance=p["measurement_variance"],
             phase_difference=p["phase_difference"],
@@ -289,7 +290,7 @@ class TestRegularizedSGDIntegration:
             n_discrete_states=p["n_discrete_states"],
             sampling_freq=p["sampling_freq"],
             freqs=p["freqs"],
-            auto_regressive_coef=p["damping"],
+            damping_coef=p["damping"],
             process_variance=p["process_variance"],
             measurement_variance=p["measurement_variance"],
             phase_difference=p["phase_difference"],

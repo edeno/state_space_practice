@@ -93,39 +93,18 @@ def edge_l1_penalty(
     return jnp.sum(jnp.sqrt(c**2 + eps))
 
 
-def _area_block_frobenius(
-    coupling_state: Array,
-    area_labels: Array,
-    eps: float = 1e-8,
-    exclude_diagonal: bool = True,
-) -> Array:
-    """Sum of Frobenius norms over area-to-area blocks for one state.
-
-    Parameters
-    ----------
-    coupling_state : Array, shape (n_osc, n_osc)
-        Coupling for a single discrete state.
-    area_labels : Array, shape (n_osc,)
-        Integer area label per oscillator.
-    eps : float
-        Smoothing constant.
-    exclude_diagonal : bool
-        Exclude self-coupling.
+def _build_area_pair_masks(area_labels: Array, n_areas: int) -> Array:
+    """Build boolean masks for all area pairs.
 
     Returns
     -------
-    Array, shape ()
+    Array, shape (n_areas, n_areas, n_osc, n_osc)
+        masks[a, b, i, j] is True iff area_labels[i]==a and area_labels[j]==b.
     """
-    c = _mask_diagonal(coupling_state[None], exclude_diagonal)[0]
-    unique_areas = np.unique(np.asarray(area_labels))
-    penalty = jnp.array(0.0)
-    for a in unique_areas:
-        for b in unique_areas:
-            mask_a = (area_labels == a)[:, None]
-            mask_b = (area_labels == b)[None, :]
-            block = c * mask_a * mask_b
-            penalty = penalty + jnp.sqrt(jnp.sum(block**2) + eps)
-    return penalty
+    areas = jnp.arange(n_areas)
+    mask_rows = (area_labels[None, :] == areas[:, None])  # (n_areas, n_osc)
+    # (n_areas, 1, n_osc, 1) * (1, n_areas, 1, n_osc) -> (n_areas, n_areas, n_osc, n_osc)
+    return mask_rows[:, None, :, None] * mask_rows[None, :, None, :]
 
 
 def area_group_penalty(
@@ -149,12 +128,12 @@ def area_group_penalty(
     -------
     Array, shape ()
     """
-    penalty = jnp.array(0.0)
-    for s in range(coupling.shape[0]):
-        penalty = penalty + _area_block_frobenius(
-            coupling[s], area_labels, eps, exclude_diagonal
-        )
-    return penalty
+    c = _mask_diagonal(coupling, exclude_diagonal)
+    n_areas = int(np.asarray(area_labels).max()) + 1
+    masks = _build_area_pair_masks(area_labels, n_areas)
+    # (n_states, n_areas, n_areas): sum c^2 within each area block per state
+    block_sq = jnp.einsum("sij,abij->sab", c ** 2, masks.astype(c.dtype))
+    return jnp.sum(jnp.sqrt(block_sq + eps))
 
 
 def state_shared_area_penalty(
@@ -179,21 +158,13 @@ def state_shared_area_penalty(
     -------
     Array, shape ()
     """
-    n_states = coupling.shape[0]
-    unique_areas = np.unique(np.asarray(area_labels))
-    penalty = jnp.array(0.0)
-    for a in unique_areas:
-        for b in unique_areas:
-            mask_a = (area_labels == a)[:, None]
-            mask_b = (area_labels == b)[None, :]
-            # Sum squared Frobenius norms across states
-            sum_sq = jnp.array(0.0)
-            for s in range(n_states):
-                c = _mask_diagonal(coupling[s:s + 1], exclude_diagonal)[0]
-                block = c * mask_a * mask_b
-                sum_sq = sum_sq + jnp.sum(block**2)
-            penalty = penalty + jnp.sqrt(sum_sq + eps)
-    return penalty
+    c = _mask_diagonal(coupling, exclude_diagonal)
+    n_areas = int(np.asarray(area_labels).max()) + 1
+    masks = _build_area_pair_masks(area_labels, n_areas)
+    # Sum c^2 within each area block per state: (n_states, n_areas, n_areas)
+    block_sq = jnp.einsum("sij,abij->sab", c ** 2, masks.astype(c.dtype))
+    # Sum across states, then sqrt for group penalty
+    return jnp.sum(jnp.sqrt(jnp.sum(block_sq, axis=0) + eps))
 
 
 def get_area_coupling_summary(
@@ -226,25 +197,15 @@ def get_area_coupling_summary(
     area_labels_np = np.asarray(area_labels)
     n_areas = int(area_labels_np.max()) + 1
 
-    block_norms = jnp.zeros((n_states, n_areas, n_areas))
-    for s in range(n_states):
-        c = _mask_diagonal(coupling[s:s + 1], exclude_diagonal)[0]
-        for a in range(n_areas):
-            for b in range(n_areas):
-                mask_a = (area_labels == a)[:, None]
-                mask_b = (area_labels == b)[None, :]
-                block = c * mask_a * mask_b
-                block_norms = block_norms.at[s, a, b].set(
-                    jnp.sqrt(jnp.sum(block**2))
-                )
+    c = _mask_diagonal(coupling, exclude_diagonal)
+    masks = _build_area_pair_masks(area_labels, n_areas)
+    # (n_states, n_areas, n_areas)
+    block_sq = jnp.einsum("sij,abij->sab", c ** 2, masks.astype(c.dtype))
+    block_norms = jnp.sqrt(block_sq)
 
     within_mask = jnp.eye(n_areas, dtype=bool)
-    within_area_norm = jnp.array([
-        jnp.sum(block_norms[s] * within_mask) for s in range(n_states)
-    ])
-    cross_area_norm = jnp.array([
-        jnp.sum(block_norms[s] * ~within_mask) for s in range(n_states)
-    ])
+    within_area_norm = jnp.sum(block_norms * within_mask[None, :, :], axis=(-2, -1))
+    cross_area_norm = jnp.sum(block_norms * ~within_mask[None, :, :], axis=(-2, -1))
 
     return {
         "block_norms": block_norms,

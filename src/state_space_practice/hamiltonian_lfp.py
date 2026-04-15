@@ -10,11 +10,13 @@ from functools import partial
 from jax import Array
 
 from state_space_practice.kalman import psd_solve, joseph_form_update
+from state_space_practice.utils import stabilize_covariance
 from state_space_practice.oscillator_models import BaseModel
-from state_space_practice.parameter_transforms import UNCONSTRAINED, POSITIVE, ParameterTransform
+from state_space_practice.parameter_transforms import PSD_MATRIX, POSITIVE, UNCONSTRAINED, ParameterTransform
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.nonlinear_dynamics import (
     leapfrog_step, apply_mlp, init_mlp_params, ekf_predict_step,
+    ekf_predict_step_with_jacobian,
     get_transition_jacobian, ekf_smooth_step
 )
 
@@ -77,7 +79,7 @@ class HamiltonianLFPModel(BaseModel, SGDFittableMixin):
         current_trans_params = {**mlp_params, "omega": omega}
         C, d = params["C"], params["d"]
         R = jnp.eye(self.n_sources) * self.obs_noise_std**2
-        Q = self.process_cov[:, :, 0]
+        Q = params.get("Q", self.process_cov[:, :, 0])
 
         def step(carry, y_t):
             m_prev, P_prev = carry
@@ -104,12 +106,13 @@ class HamiltonianLFPModel(BaseModel, SGDFittableMixin):
         current_trans_params = {**mlp_params, "omega": omega}
         C, d = params["C"], params["d"]
         R = jnp.eye(self.n_sources) * self.obs_noise_std**2
-        Q = self.process_cov[:, :, 0]
+        Q = params.get("Q", self.process_cov[:, :, 0])
 
         def forward_step(carry, y_t):
             m_prev, P_prev = carry
-            F_t = get_transition_jacobian(m_prev, current_trans_params, apply_mlp, self.dt)
-            m_pred, P_pred = ekf_predict_step(m_prev, P_prev, current_trans_params, apply_mlp, Q, self.dt)
+            m_pred, P_pred, F_t = ekf_predict_step_with_jacobian(
+                m_prev, P_prev, current_trans_params, apply_mlp, Q, self.dt
+            )
             S = C @ P_pred @ C.T + R
             K = psd_solve(S, C @ P_pred).T
             m_post = m_pred + K @ (y_t - (C @ m_pred + d))
@@ -134,14 +137,24 @@ class HamiltonianLFPModel(BaseModel, SGDFittableMixin):
         return m_s, P_s
 
     def _build_param_spec(self) -> Tuple[Dict[str, Any], Dict[str, ParameterTransform]]:
-        params = {"mlp": self.mlp_params, "omega": self.omega, "C": self.C, "d": self.d, "init_mean": self.init_mean[:, 0]}
-        spec = {"mlp": UNCONSTRAINED, "omega": POSITIVE, "C": UNCONSTRAINED, "d": UNCONSTRAINED, "init_mean": UNCONSTRAINED}
+        params = {
+            "mlp": self.mlp_params, "omega": self.omega,
+            "C": self.C, "d": self.d,
+            "init_mean": self.init_mean[:, 0],
+            "Q": self.process_cov[:, :, 0],
+        }
+        spec = {
+            "mlp": UNCONSTRAINED, "omega": POSITIVE,
+            "C": UNCONSTRAINED, "d": UNCONSTRAINED,
+            "init_mean": UNCONSTRAINED,
+            "Q": PSD_MATRIX,
+        }
         return params, spec
 
     def fit_sgd(
         self,
         observations: Array,
-        key: Array,
+        key: Array | None = None,
         optimizer: Optional[object] = None,
         num_steps: int = 200,
         verbose: bool = False,
@@ -180,6 +193,10 @@ class HamiltonianLFPModel(BaseModel, SGDFittableMixin):
         self.C = params["C"]
         self.d = params["d"]
         self.init_mean = self.init_mean.at[:, 0].set(params["init_mean"])
+        if "Q" in params:
+            self.process_cov = jnp.stack(
+                [stabilize_covariance(params["Q"])], axis=2
+            )
 
     def _initialize_measurement_matrix(self, key=None): pass
     def _initialize_measurement_covariance(self): pass

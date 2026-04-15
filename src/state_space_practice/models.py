@@ -1,3 +1,4 @@
+import warnings
 from typing import Callable
 
 import jax
@@ -29,7 +30,14 @@ def stochastic_point_process_filter(
     latent_state_covariance: ArrayLike,
     log_receptive_field_model: Callable[[ArrayLike, ArrayLike], Array],
 ) -> tuple[Array, Array]:
-    """Stochastic State Point Process Filter (SSPPF)
+    """Stochastic State Point Process Filter (SSPPF).
+
+    .. deprecated::
+        This implementation uses the **observed Hessian** (not Fisher scoring)
+        and may produce indefinite posterior precision matrices. Use
+        :func:`point_process_kalman.stochastic_point_process_filter` instead,
+        which uses Fisher scoring and is numerically more stable. This function
+        will be removed in a future version.
 
     Parameters
     ----------
@@ -61,6 +69,13 @@ def stochastic_point_process_filter(
 
 
     """
+    warnings.warn(
+        "stochastic_point_process_filter in models.py uses the observed Hessian "
+        "(not Fisher scoring) and may produce indefinite posterior precision. "
+        "Use point_process_kalman.stochastic_point_process_filter instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     # Convert ArrayLike inputs to Array for internal use
     init_mode_params_arr: Array = jnp.asarray(init_mode_params)
     init_covariance_params_arr: Array = jnp.asarray(init_covariance_params)

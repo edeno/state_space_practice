@@ -3,20 +3,27 @@
 Uses Hamiltonian dynamics with a Poisson/Point-Process readout for spike data.
 """
 
+from functools import partial
+from typing import Any, Dict, List, Optional, Tuple
+
 import jax
 import jax.numpy as jnp
-from typing import Dict, Any, Tuple, Optional, List
-from functools import partial
 from jax import Array
 
 from state_space_practice.kalman import psd_solve, symmetrize
-from state_space_practice.oscillator_models import BaseModel
-from state_space_practice.parameter_transforms import UNCONSTRAINED, POSITIVE, ParameterTransform
-from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.nonlinear_dynamics import (
-    leapfrog_step, apply_mlp, init_mlp_params, ekf_predict_step,
-    get_transition_jacobian, ekf_smooth_step
+    apply_mlp,
+    ekf_predict_step,
+    ekf_predict_step_with_jacobian,
+    ekf_smooth_step,
+    get_transition_jacobian,
+    init_mlp_params,
+    leapfrog_step,
 )
+from state_space_practice.oscillator_models import BaseModel
+from state_space_practice.parameter_transforms import PSD_MATRIX, POSITIVE, UNCONSTRAINED, ParameterTransform
+from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.utils import stabilize_covariance
 
 class HamiltonianSpikeModel(BaseModel, SGDFittableMixin):
     """Spike Model with Hamiltonian dynamics and Point-Process observations."""
@@ -83,7 +90,7 @@ class HamiltonianSpikeModel(BaseModel, SGDFittableMixin):
         
         C = params["C"]
         d = params["d"]
-        Q = self.process_cov[:, :, 0]
+        Q = params.get("Q", self.process_cov[:, :, 0])
 
         def step(carry, y_t):
             m_prev, P_prev = carry
@@ -125,12 +132,13 @@ class HamiltonianSpikeModel(BaseModel, SGDFittableMixin):
         omega = params["omega"]
         current_trans_params = {**mlp_params, "omega": omega}
         C, d = params["C"], params["d"]
-        Q = self.process_cov[:, :, 0]
+        Q = params.get("Q", self.process_cov[:, :, 0])
 
         def forward_step(carry, y_t):
             m_prev, P_prev = carry
-            F_t = get_transition_jacobian(m_prev, current_trans_params, apply_mlp, self.dt)
-            m_pred, P_pred = ekf_predict_step(m_prev, P_prev, current_trans_params, apply_mlp, Q, self.dt)
+            m_pred, P_pred, F_t = ekf_predict_step_with_jacobian(
+                m_prev, P_prev, current_trans_params, apply_mlp, Q, self.dt
+            )
             
             rate_pred = jnp.exp(jnp.dot(C, m_pred) + d) * self.dt
             grad = jnp.dot(C.T, y_t - rate_pred)
@@ -162,7 +170,7 @@ class HamiltonianSpikeModel(BaseModel, SGDFittableMixin):
     def fit_sgd(
         self,
         observations: Array,
-        key: Array,
+        key: Array | None = None,
         optimizer: Optional[object] = None,
         num_steps: int = 200,
         verbose: bool = False,
@@ -190,13 +198,15 @@ class HamiltonianSpikeModel(BaseModel, SGDFittableMixin):
             "C": self.C,
             "d": self.d,
             "init_mean": self.init_mean[:, 0],
+            "Q": self.process_cov[:, :, 0],
         }
         spec = {
-            "mlp": UNCONSTRAINED, 
+            "mlp": UNCONSTRAINED,
             "omega": POSITIVE,
-            "C": UNCONSTRAINED, 
-            "d": UNCONSTRAINED, 
-            "init_mean": UNCONSTRAINED
+            "C": UNCONSTRAINED,
+            "d": UNCONSTRAINED,
+            "init_mean": UNCONSTRAINED,
+            "Q": PSD_MATRIX,
         }
         return params, spec
 
@@ -239,6 +249,10 @@ class HamiltonianSpikeModel(BaseModel, SGDFittableMixin):
         self.C = params["C"]
         self.d = params["d"]
         self.init_mean = self.init_mean.at[:, 0].set(params["init_mean"])
+        if "Q" in params:
+            self.process_cov = jnp.stack(
+                [stabilize_covariance(params["Q"])], axis=2
+            )
 
     # Required Abstract Stubs
     def _initialize_measurement_matrix(self, key=None): pass

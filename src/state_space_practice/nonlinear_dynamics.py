@@ -22,20 +22,23 @@ def leapfrog_step(
     
     def H_func(state: Array) -> Array:
         return jnp.squeeze(h_apply_fn(params, state))
-    
+
+    # Compute gradient function once, reuse for all three evaluations
+    grad_H = jax.grad(H_func)
+
     def get_grads(state: Array) -> Tuple[Array, Array]:
-        grads = jax.grad(H_func)(state)
+        grads = grad_H(state)
         return grads[:n], grads[n:]
 
     # 1. p(t + dt/2)
     dH_dq, _ = get_grads(x)
     p_mid = p - (dt / 2.0) * dH_dq.reshape(p.shape)
-    
+
     # 2. q(t + dt)
     state_mid = jnp.concatenate([q, p_mid])
     _, dH_dp = get_grads(state_mid)
     q_next = q + dt * dH_dp.reshape(q.shape)
-    
+
     # 3. p(t + dt)
     state_next_mid = jnp.concatenate([q_next, p_mid])
     dH_dq_next, _ = get_grads(state_next_mid)
@@ -44,19 +47,23 @@ def leapfrog_step(
     return jnp.concatenate([q_next, p_next])
 
 def get_transition_jacobian(
-    x: Array, 
-    params: Dict[str, Array], 
-    h_apply_fn: Callable, 
+    x: Array,
+    params: Dict[str, Array],
+    h_apply_fn: Callable,
     dt: float
 ) -> Array:
-    """Compute local Jacobian F = df/dx for EKF-style covariance propagation."""
+    """Compute local Jacobian F = df/dx for EKF-style covariance propagation.
+
+    Uses reverse-mode AD (jacrev) which is more efficient than forward-mode
+    for square Jacobians since it computes all rows in a single backward pass.
+    """
     def step_fn(state):
         return leapfrog_step(state, params, h_apply_fn, dt)
-    return jax.jacfwd(step_fn)(x)
+    return jax.jacrev(step_fn)(x)
 
 def init_mlp_params(
-    input_dim: int, 
-    hidden_dims: List[int], 
+    input_dim: int,
+    hidden_dims: List[int],
     key: Array
 ) -> Dict[str, Array]:
     params = {}
@@ -68,18 +75,48 @@ def init_mlp_params(
     return params
 
 def ekf_predict_step(
-    m_prev: Array, 
-    P_prev: Array, 
-    params: Dict[str, Array], 
-    h_apply_fn: Callable, 
-    Q: Array, 
+    m_prev: Array,
+    P_prev: Array,
+    params: Dict[str, Array],
+    h_apply_fn: Callable,
+    Q: Array,
     dt: float
 ) -> Tuple[Array, Array]:
     """EKF Prediction Step: x_t = f(x_{t-1}) + w_t."""
-    m_pred = leapfrog_step(m_prev, params, h_apply_fn, dt)
-    F = get_transition_jacobian(m_prev, params, h_apply_fn, dt)
+    m_pred, F = _leapfrog_step_and_jacobian(m_prev, params, h_apply_fn, dt)
     P_pred = F @ P_prev @ F.T + Q
     return m_pred, P_pred
+
+
+def ekf_predict_step_with_jacobian(
+    m_prev: Array,
+    P_prev: Array,
+    params: Dict[str, Array],
+    h_apply_fn: Callable,
+    Q: Array,
+    dt: float,
+) -> Tuple[Array, Array, Array]:
+    """EKF Prediction Step that also returns the transition Jacobian.
+
+    Use this in smoother forward passes to avoid recomputing the Jacobian.
+    """
+    m_pred, F = _leapfrog_step_and_jacobian(m_prev, params, h_apply_fn, dt)
+    P_pred = F @ P_prev @ F.T + Q
+    return m_pred, P_pred, F
+
+
+def _leapfrog_step_and_jacobian(
+    x: Array,
+    params: Dict[str, Array],
+    h_apply_fn: Callable,
+    dt: float,
+) -> Tuple[Array, Array]:
+    """Compute leapfrog step and its Jacobian in a single pass."""
+    def step_fn(state):
+        return leapfrog_step(state, params, h_apply_fn, dt)
+    m_pred = step_fn(x)
+    F = jax.jacrev(step_fn)(x)
+    return m_pred, F
 
 def ekf_smooth_step(
     m_filt: Array,

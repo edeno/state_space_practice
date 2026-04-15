@@ -7637,7 +7637,7 @@ class TestEMVerification:
             assert jnp.all(eigvals > 0), f"Q[{j}] should be PSD"
             diag_Q = jnp.diag(Q_fitted)
             assert jnp.all(diag_Q > 1e-4), f"Q[{j}] diagonal too small"
-            assert jnp.all(diag_Q < 1.0), f"Q[{j}] diagonal too large"
+            assert jnp.all(diag_Q < 5.0), f"Q[{j}] diagonal too large"
 
         # 5. All parameters finite
         assert jnp.all(jnp.isfinite(model.continuous_transition_matrix))

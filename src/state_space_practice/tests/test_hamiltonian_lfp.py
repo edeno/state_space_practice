@@ -1,11 +1,16 @@
-"""Smoke tests for HamiltonianLFPModel."""
+"""Smoke and recovery tests for HamiltonianLFPModel."""
 
 import jax
 import jax.numpy as jnp
 import pytest
 
 from state_space_practice.hamiltonian_lfp import HamiltonianLFPModel
-from state_space_practice.nonlinear_dynamics import leapfrog_step, apply_mlp
+from state_space_practice.nonlinear_dynamics import apply_mlp, leapfrog_step
+from state_space_practice.tests.recovery_helpers import (
+    assert_ll_improves,
+    simulate_harmonic_oscillator,
+    simulate_lfp_observations,
+)
 
 
 class TestHamiltonianLFPSmoke:
@@ -134,4 +139,75 @@ class TestHamiltonianLFPBehavioral:
         # Smoother should track the oscillation
         assert jnp.corrcoef(m_s[:, 0], x_true[:, 0])[0, 1] > 0.8, (
             "Smoothed position should be highly correlated with true position"
+        )
+
+
+@pytest.mark.slow
+class TestHamiltonianLFPSGDRecovery:
+    """Verify fit_sgd learns omega and observation matrix from LFP data."""
+
+    @pytest.fixture(scope="class")
+    def fitted(self):
+        omega_true = 2 * jnp.pi
+        dt = 0.01
+        n_time = 300
+
+        x_true, mlp_params = simulate_harmonic_oscillator(
+            omega=omega_true, n_time=n_time, dt=dt,
+            key=jax.random.PRNGKey(42), hidden_dims=[8],
+        )
+
+        C_true = jnp.eye(2)
+        d_true = jnp.zeros(2)
+        lfp = simulate_lfp_observations(
+            x_true, C_true, d_true, noise_std=0.3,
+            key=jax.random.PRNGKey(99),
+        )
+
+        # Initialise model with perturbed omega
+        model = HamiltonianLFPModel(
+            n_sources=2, n_oscillators=1, hidden_dims=[8], seed=0,
+            sampling_freq=1.0 / dt,
+        )
+        model.omega = omega_true * 1.3  # 30% off
+
+        lls = model.fit_sgd(
+            lfp, key=jax.random.PRNGKey(1), num_steps=200,
+        )
+        return model, x_true, omega_true, lfp, lls
+
+    def test_ll_improves(self, fitted):
+        _, _, _, _, lls = fitted
+        assert_ll_improves(lls, label="HamiltonianLFP SGD")
+
+    def test_frequency_recovery(self, fitted):
+        model, _, omega_true, _, _ = fitted
+        rel_error = float(abs(model.omega - omega_true) / omega_true)
+        assert rel_error < 0.20, (
+            f"Omega relative error {rel_error:.3f} >= 0.20 "
+            f"(learned={float(model.omega):.3f}, true={float(omega_true):.3f})"
+        )
+
+    def test_smoother_tracks_truth(self, fitted):
+        model, x_true, _, lfp, _ = fitted
+        params, _ = model._build_param_spec()
+        m_s, _ = model.smooth(lfp, params)
+        corr = float(jnp.corrcoef(m_s[:, 0], x_true[:, 0])[0, 1])
+        assert corr > 0.7, (
+            f"Post-learning smoother correlation {corr:.3f} < 0.7"
+        )
+
+    def test_q_is_learned(self, fitted):
+        """Process covariance Q should change from its initial value after SGD."""
+        model, _, _, _, _ = fitted
+        Q_learned = model.process_cov[:, :, 0]
+        # Initial Q was 1e-4 * I; after learning it should differ
+        Q_init = jnp.eye(model.n_cont_states) * 1e-4
+        assert not jnp.allclose(Q_learned, Q_init, atol=1e-6), (
+            "Q should have changed from its initial value after SGD"
+        )
+        # Q should remain PSD (positive eigenvalues)
+        eigvals = jnp.linalg.eigvalsh(Q_learned)
+        assert jnp.all(eigvals > 0), (
+            f"Learned Q should be PSD, but has eigenvalues {eigvals}"
         )

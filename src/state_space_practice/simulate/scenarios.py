@@ -66,7 +66,7 @@ def simulate_com_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
 
     # A: constant, uncoupled oscillators
     A_single = np.array(construct_common_oscillator_transition_matrix(
-        freqs=FREQS, auto_regressive_coef=DAMPING, sampling_freq=SAMPLING_FREQ
+        freqs=FREQS, damping_coef=DAMPING, sampling_freq=SAMPLING_FREQ
     ))
     A = np.stack([A_single, A_single], axis=2)
 
@@ -122,7 +122,7 @@ def simulate_cnm_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
 
     # A: constant, uncoupled oscillators
     A_single = np.array(construct_common_oscillator_transition_matrix(
-        freqs=FREQS, auto_regressive_coef=DAMPING, sampling_freq=SAMPLING_FREQ
+        freqs=FREQS, damping_coef=DAMPING, sampling_freq=SAMPLING_FREQ
     ))
     A = np.stack([A_single, A_single], axis=2)
 
@@ -272,7 +272,7 @@ def simulate_com_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
     dt = 0.01
 
     A_single = construct_common_oscillator_transition_matrix(
-        freqs=FREQS, auto_regressive_coef=DAMPING, sampling_freq=SAMPLING_FREQ
+        freqs=FREQS, damping_coef=DAMPING, sampling_freq=SAMPLING_FREQ
     )
     A = jnp.stack([A_single, A_single], axis=2)
 
@@ -342,7 +342,7 @@ def simulate_cnm_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
     dt = 0.01
 
     A_single = construct_common_oscillator_transition_matrix(
-        freqs=FREQS, auto_regressive_coef=DAMPING, sampling_freq=SAMPLING_FREQ
+        freqs=FREQS, damping_coef=DAMPING, sampling_freq=SAMPLING_FREQ
     )
     A = jnp.stack([A_single, A_single], axis=2)
 

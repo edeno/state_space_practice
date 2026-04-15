@@ -7,7 +7,6 @@ including the Laplace approximation filter/smoother and EM algorithm.
 
 import jax
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 
@@ -28,6 +27,7 @@ from state_space_practice.smith_learning_algorithm import (
     smith_learning_filter,
     smith_learning_smoother,
 )
+from state_space_practice.tests.recovery_helpers import assert_ll_monotonic
 
 # Enable 64-bit precision for numerical stability
 jax.config.update("jax_enable_x64", True)
@@ -770,6 +770,8 @@ class TestSmithLearningModelClass:
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_plot_learning_curve_returns_fig_ax(self) -> None:
         """plot_learning_curve should return (fig, ax)."""
+        import matplotlib.pyplot as plt
+
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
@@ -1116,6 +1118,8 @@ class TestPlotTrialComparisonMatrix:
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_returns_fig_ax(self) -> None:
         """plot_trial_comparison_matrix should return (fig, ax)."""
+        import matplotlib.pyplot as plt
+
         outcomes_np, _ = simulate_learning_data(n_trials=15, seed=42)
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
@@ -1142,6 +1146,8 @@ class TestPlotConvergence:
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_returns_fig_ax(self) -> None:
         """plot_convergence should return (fig, ax)."""
+        import matplotlib.pyplot as plt
+
         outcomes_np, _ = simulate_learning_data(n_trials=15, seed=42)
         model = SmithLearningModel()
         try:
@@ -1165,6 +1171,8 @@ class TestPlotSummary:
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_returns_fig_axes(self) -> None:
         """plot_summary should return (fig, axes) with 3 panels."""
+        import matplotlib.pyplot as plt
+
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
@@ -2107,3 +2115,63 @@ class TestSmithSGDFitting:
         # Init state should still be 0
         assert model.init_learning_state == 0.0
         assert model.is_fitted
+
+
+# ============================================================================
+# Integration: learning curve recovery on simulated data
+# ============================================================================
+
+
+@pytest.mark.slow
+class TestSmithLearningModelRecovery:
+    """Fit SmithLearningModel on simulated sigmoid learning data and verify
+    the recovered learning curve tracks the true probability trajectory."""
+
+    @pytest.fixture(scope="class")
+    def fitted(self):
+        outcomes, true_prob = simulate_learning_data(
+            n_trials=200,
+            prob_success_init=0.125,
+            prob_success_final=0.6,
+            seed=42,
+        )
+        model = SmithLearningModel(sigma_epsilon=0.2)
+        lls = model.fit(outcomes, max_iter=30)
+        return model, true_prob, lls
+
+    def test_ll_monotonic(self, fitted):
+        _, _, lls = fitted
+        assert_ll_monotonic(lls, tol=1e-3, label="SmithLearningModel")
+
+    def test_learning_curve_correlation(self, fitted):
+        model, true_prob, _ = fitted
+        smoothed_prob = np.array(model.smoothed_prob_correct_response)
+        corr = float(np.corrcoef(smoothed_prob, true_prob)[0, 1])
+        assert corr > 0.7, (
+            f"Smoothed-vs-true learning curve correlation {corr:.3f} < 0.7"
+        )
+
+    def test_early_probability_near_chance(self, fitted):
+        model, _, _ = fitted
+        early_prob = float(model.smoothed_prob_correct_response[0])
+        assert early_prob < 0.3, (
+            f"Early smoothed probability {early_prob:.3f} >= 0.3 "
+            f"(true is ~0.125)"
+        )
+
+    def test_late_probability_above_chance(self, fitted):
+        model, _, _ = fitted
+        late_prob = float(model.smoothed_prob_correct_response[-1])
+        assert late_prob > 0.4, (
+            f"Late smoothed probability {late_prob:.3f} <= 0.4 "
+            f"(true is ~0.6)"
+        )
+
+    def test_smoother_reduces_variance(self, fitted):
+        model, _, _ = fitted
+        filter_var = np.mean(np.array(model.filtered_learning_state_variance))
+        smoother_var = np.mean(np.array(model.smoothed_learning_state_variance))
+        assert smoother_var <= filter_var * 1.01, (
+            f"Smoother variance ({smoother_var:.6f}) not less than "
+            f"filter variance ({filter_var:.6f})"
+        )

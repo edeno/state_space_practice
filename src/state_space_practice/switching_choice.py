@@ -22,6 +22,7 @@ References
 """
 
 import logging
+import functools
 from typing import NamedTuple, Optional
 
 import jax
@@ -178,6 +179,10 @@ class SwitchingChoiceFilterResult(NamedTuple):
     pair_cond_covs: Array         # (n_trials, K-1, K-1, S, S) for smoother
 
 
+@functools.partial(
+    jax.jit,
+    static_argnames=["n_options", "n_discrete_states"],
+)
 def switching_choice_filter(
     choices: ArrayLike,
     n_options: int,
@@ -278,12 +283,8 @@ def switching_choice_filter(
 
     # Build per-state transition and process cov matrices
     # A_j = decay_j * I, Q_j = q_j * I
-    transition_matrices = jnp.stack(
-        [d * jnp.eye(k_free) for d in decays], axis=-1
-    )  # (K-1, K-1, S)
-    process_covs = jnp.stack(
-        [q * jnp.eye(k_free) for q in process_noises], axis=-1
-    )  # (K-1, K-1, S)
+    transition_matrices = decays[None, None, :] * jnp.eye(k_free)[:, :, None]  # (K-1, K-1, S)
+    process_covs = process_noises[None, None, :] * jnp.eye(k_free)[:, :, None]  # (K-1, K-1, S)
 
     # Expand init_mean/cov to per-state (shared)
     init_state_cond_mean = jnp.stack([init_mean] * S, axis=-1)  # (K-1, S)
@@ -787,6 +788,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
             STOCHASTIC_ROW,
             UNCONSTRAINED,
             UNIT_INTERVAL,
+            positive_capped,
         )
 
         params = {
@@ -798,7 +800,10 @@ class SwitchingChoiceModel(SGDFittableMixin):
         }
         spec = {
             "process_noises": POSITIVE,
-            "inverse_temperatures": POSITIVE,
+            # Cap inverse_temperature to prevent NaN in the Laplace-EKF
+            # update: beta^2 * (diag(p) - outer(p,p)) becomes ill-conditioned
+            # when beta > ~50.
+            "inverse_temperatures": positive_capped(50.0),
             "decays": UNIT_INTERVAL,
             "discrete_transition_matrix": STOCHASTIC_ROW,
             "init_mean": UNCONSTRAINED,

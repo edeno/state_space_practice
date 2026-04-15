@@ -30,6 +30,7 @@ References
 
 import logging
 import warnings
+import functools
 from typing import Callable, NamedTuple, Optional
 
 import jax
@@ -818,10 +819,15 @@ def _point_process_laplace_update(
             new_alpha = jnp.where(improved, alpha, alpha * line_search_beta)
             return (new_alpha, improved), None
 
-        (final_alpha, _), _ = jax.lax.scan(
+        (final_alpha, line_search_improved), _ = jax.lax.scan(
             _backtrack, (jnp.array(1.0), jnp.array(False)), None, length=10
         )
-        new_x = x + final_alpha * delta
+        candidate_x = x + final_alpha * delta
+
+        # Reject uphill steps: reuse the improved flag from the backtracking
+        # scan rather than re-evaluating _neg_log_posterior. If improved is
+        # False, no step size decreased the loss — keep current x.
+        new_x = jnp.where(line_search_improved, candidate_x, x)
 
         # Recompute precision at accepted point for consistency
         _, new_post_prec, _ = _fisher_step_at(new_x)
@@ -899,6 +905,7 @@ def stochastic_point_process_filter(
     block_n_neurons: Optional[int] = None,
     block_size: Optional[int] = None,
     force_dense: bool = False,
+    max_newton_iter: int = 1,
 ) -> tuple[Array, Array, Array]:
     """Applies a Stochastic State Point Process Filter (SSPPF).
 
@@ -1061,6 +1068,7 @@ def stochastic_point_process_filter(
             dt,
             include_laplace_normalization=include_laplace_normalization,
             max_log_count=max_log_count,
+            max_newton_iter=max_newton_iter,
         )
 
     # Numerical sanity check. Raises on non-PSD init_cov, warns on f32 +
@@ -1079,14 +1087,49 @@ def stochastic_point_process_filter(
     if single_neuron:
         spike_indicator = spike_indicator[:, None]
 
+    return _stochastic_point_process_filter_impl(
+        init_mean_params,
+        init_covariance_params,
+        design_matrix,
+        spike_indicator,
+        transition_matrix,
+        process_cov,
+        dt=dt,
+        log_conditional_intensity=log_conditional_intensity,
+        include_laplace_normalization=include_laplace_normalization,
+        max_log_count=max_log_count,
+        max_newton_iter=max_newton_iter,
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=[
+        "log_conditional_intensity",
+        "include_laplace_normalization",
+        "max_newton_iter",
+    ],
+)
+def _stochastic_point_process_filter_impl(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    *,
+    dt: float,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = True,
+    max_log_count: float = 20.0,
+    max_newton_iter: int = 1,
+) -> tuple[Array, Array, Array]:
+    """JIT-compiled inner implementation of the point process filter."""
     # Pre-compute gradient function outside the scan.
-    # Parameterized by design_matrix_t to avoid recreating jax.jacfwd each step.
     def _log_intensity_with_design(design_matrix_t, x):
         log_lambda = log_conditional_intensity(design_matrix_t, x)
         return jnp.atleast_1d(log_lambda)
 
-    # Gradient w.r.t. x (argnums=1), keeping design_matrix_t as parameter.
-    # No Hessian is needed — Fisher scoring uses only first-order info.
     _grad_log_intensity = jax.jacfwd(_log_intensity_with_design, argnums=1)
 
     def _step(
@@ -1094,17 +1137,9 @@ def stochastic_point_process_filter(
         args: tuple[Array, Array],
     ) -> tuple[tuple[Array, Array, Array], tuple[Array, Array]]:
         """Point Process Adaptive Filter update step."""
-        # Unpack previous parameters
         mean_prev, variance_prev, marginal_log_likelihood = params_prev
         design_matrix_t, spike_indicator_t = args
 
-        # One-step prediction. Symmetrize variance_prev BEFORE the
-        # congruence so any accumulated asymmetry from the previous step
-        # isn't amplified by A @ ... @ A^T. Re-symmetrize AFTER the
-        # addition to clean up any residual asymmetry introduced by
-        # finite-precision arithmetic. This belt-and-suspenders approach
-        # is cheap (two 0.5*(M + M.T) ops per step) and makes the
-        # covariance propagation more robust to f32 roundoff.
         one_step_mean = transition_matrix @ mean_prev
         variance_prev_sym = symmetrize(variance_prev)
         one_step_covariance = symmetrize(
@@ -1112,16 +1147,12 @@ def stochastic_point_process_filter(
             + process_cov
         )
 
-        # Create log_intensity_func that captures design_matrix_t
         def log_intensity_func(x):
             return _log_intensity_with_design(design_matrix_t, x)
 
-        # Grad closure capturing design_matrix_t; uses the pre-computed
-        # jacfwd function from outside the scan.
         def grad_log_intensity_func(x):
             return _grad_log_intensity(design_matrix_t, x)
 
-        # Fisher-scoring Laplace update (no Hessian needed)
         posterior_mean, posterior_covariance, log_lik = _point_process_laplace_update(
             one_step_mean,
             one_step_covariance,
@@ -1131,6 +1162,7 @@ def stochastic_point_process_filter(
             grad_log_intensity_func=grad_log_intensity_func,
             include_laplace_normalization=include_laplace_normalization,
             max_log_count=max_log_count,
+            max_newton_iter=max_newton_iter,
         )
 
         marginal_log_likelihood += log_lik
@@ -1159,6 +1191,7 @@ def _run_forward_block_diagonal(
     dt: float,
     include_laplace_normalization: bool = True,
     max_log_count: float = 20.0,
+    max_newton_iter: int = 1,
 ) -> tuple[Array, Array, Array]:
     """Run the per-neuron forward Laplace-EKF filter in block form.
 
@@ -1219,6 +1252,7 @@ def _run_forward_block_diagonal(
             grad_log_intensity_func=_grad,
             include_laplace_normalization=include_laplace_normalization,
             max_log_count=max_log_count,
+            max_newton_iter=max_newton_iter,
         )
         return (
             (post_mean, post_cov, ll_acc + log_lik_step),
@@ -1273,6 +1307,7 @@ def _stochastic_point_process_filter_block_diagonal(
     dt: float,
     include_laplace_normalization: bool = True,
     max_log_count: float = 20.0,
+    max_newton_iter: int = 1,
 ) -> tuple[Array, Array, Array]:
     """Block-diagonal Laplace-EKF filter via vmapped per-neuron scans.
 
@@ -1351,6 +1386,7 @@ def _stochastic_point_process_filter_block_diagonal(
         dt,
         include_laplace_normalization=include_laplace_normalization,
         max_log_count=max_log_count,
+        max_newton_iter=max_newton_iter,
     )
     # means_per_neuron: (n_neurons, n_time, nb)
     # covs_per_neuron: (n_neurons, n_time, nb, nb)
@@ -1383,6 +1419,7 @@ def _stochastic_point_process_smoother_block_diagonal(
     include_laplace_normalization: bool = True,
     max_log_count: float = 20.0,
     return_filtered: bool = False,
+    max_newton_iter: int = 1,
 ) -> tuple[Array, ...]:
     """Block-diagonal RTS smoother via vmapped per-neuron backward pass.
 
@@ -1450,6 +1487,7 @@ def _stochastic_point_process_smoother_block_diagonal(
         dt,
         include_laplace_normalization=include_laplace_normalization,
         max_log_count=max_log_count,
+        max_newton_iter=max_newton_iter,
     )
     # fwd_means: (n_neurons, n_time, nb)
     # fwd_covs: (n_neurons, n_time, nb, nb)
@@ -1551,6 +1589,7 @@ def stochastic_point_process_smoother(
     block_n_neurons: Optional[int] = None,
     block_size: Optional[int] = None,
     force_dense: bool = False,
+    max_newton_iter: int = 1,
 ) -> tuple[Array, ...]:
     """Applies a Stochastic State Point Process Smoother (SSPPS).
 
@@ -1668,6 +1707,7 @@ def stochastic_point_process_smoother(
             include_laplace_normalization=include_laplace_normalization,
             max_log_count=max_log_count,
             return_filtered=return_filtered,
+            max_newton_iter=max_newton_iter,
         )
 
     filtered_mean, filtered_cov, marginal_log_likelihood = (
@@ -1683,32 +1723,39 @@ def stochastic_point_process_smoother(
             include_laplace_normalization=include_laplace_normalization,
             max_log_count=max_log_count,
             validate_inputs=validate_inputs,
+            max_newton_iter=max_newton_iter,
         )
     )
 
-    def _step(carry, args):
-        (
-            next_smoother_mean,
-            next_smoother_cov,
-        ) = carry
-
-        filter_mean, filter_cov = args
-
-        smoother_mean, smoother_cov, smoother_cross_cov = _kalman_smoother_update(
-            next_smoother_mean,
-            next_smoother_cov,
-            filter_mean,
-            filter_cov,
-            process_cov,
-            transition_matrix,
+    smoother_mean, smoother_cov, smoother_cross_cov = (
+        _stochastic_point_process_smoother_backward(
+            filtered_mean, filtered_cov, process_cov, transition_matrix,
         )
-        return (
-            smoother_mean,
-            smoother_cov,
-        ), (
-            smoother_mean,
-            smoother_cov,
-            smoother_cross_cov,
+    )
+
+    result = (smoother_mean, smoother_cov, smoother_cross_cov, marginal_log_likelihood)
+    if return_filtered:
+        return result + (filtered_mean, filtered_cov)
+    return result
+
+
+@jax.jit
+def _stochastic_point_process_smoother_backward(
+    filtered_mean: Array,
+    filtered_cov: Array,
+    process_cov: Array,
+    transition_matrix: Array,
+) -> tuple[Array, Array, Array]:
+    """JIT-compiled backward pass of the point process smoother."""
+    def _step(carry, args):
+        next_smoother_mean, next_smoother_cov = carry
+        filter_mean, filter_cov = args
+        smoother_mean, smoother_cov, smoother_cross_cov = _kalman_smoother_update(
+            next_smoother_mean, next_smoother_cov,
+            filter_mean, filter_cov, process_cov, transition_matrix,
+        )
+        return (smoother_mean, smoother_cov), (
+            smoother_mean, smoother_cov, smoother_cross_cov,
         )
 
     (_, _), (smoother_mean, smoother_cov, smoother_cross_cov) = jax.lax.scan(
@@ -1721,12 +1768,10 @@ def stochastic_point_process_smoother(
     smoother_mean = jnp.concatenate((smoother_mean, filtered_mean[-1][None]))
     smoother_cov = jnp.concatenate((smoother_cov, filtered_cov[-1][None]))
 
-    result = (smoother_mean, smoother_cov, smoother_cross_cov, marginal_log_likelihood)
-    if return_filtered:
-        return result + (filtered_mean, filtered_cov)
-    return result
+    return smoother_mean, smoother_cov, smoother_cross_cov
 
 
+@jax.jit
 def kalman_maximization_step(
     smoother_mean: ArrayLike,
     smoother_cov: ArrayLike,
@@ -1973,9 +2018,11 @@ class PointProcessModel(SGDFittableMixin):
         update_transition_matrix: bool = True,
         update_process_cov: bool = True,
         update_init_state: bool = True,
+        max_newton_iter: int = 1,
     ):
         self.n_state_dims = n_state_dims
         self.dt = dt
+        self.max_newton_iter = max_newton_iter
 
         # Initialize parameters
         if transition_matrix is None:
@@ -2046,6 +2093,7 @@ class PointProcessModel(SGDFittableMixin):
             # fit() validates once at entry; skip re-validation on each
             # EM iteration's E-step.
             validate_inputs=False,
+            max_newton_iter=self.max_newton_iter,
         )
 
         # Also store filtered results
@@ -2059,6 +2107,7 @@ class PointProcessModel(SGDFittableMixin):
             process_cov=self.process_cov,
             log_conditional_intensity=self.log_intensity_func,
             validate_inputs=False,
+            max_newton_iter=self.max_newton_iter,
         )
 
         return float(marginal_log_likelihood)
@@ -2272,6 +2321,7 @@ class PointProcessModel(SGDFittableMixin):
             # fit_sgd validated once at the top; skip per-step
             # re-validation inside the jit'd loss fn.
             validate_inputs=False,
+            max_newton_iter=self.max_newton_iter,
         )
         return -marginal_ll
 
@@ -2303,6 +2353,7 @@ class PointProcessModel(SGDFittableMixin):
             process_cov=self.process_cov,
             log_conditional_intensity=self.log_intensity_func,
             validate_inputs=False,  # validated at fit_sgd entry
+            max_newton_iter=self.max_newton_iter,
         )
         self.filtered_mean, self.filtered_cov, _ = stochastic_point_process_filter(
             init_mean_params=self.init_mean,
@@ -2314,6 +2365,7 @@ class PointProcessModel(SGDFittableMixin):
             process_cov=self.process_cov,
             log_conditional_intensity=self.log_intensity_func,
             validate_inputs=False,  # validated at fit_sgd entry
+            max_newton_iter=self.max_newton_iter,
         )
         self.log_likelihood_ = float(marginal_ll)
 

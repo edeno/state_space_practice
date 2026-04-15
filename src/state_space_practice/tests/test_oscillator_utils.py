@@ -12,6 +12,7 @@ from state_space_practice.oscillator_utils import (
     _get_rotation_matrix,
     _get_scaling_factor,
     _project_to_closest_rotation,
+    _scatter_block_diagonal,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
     construct_correlated_noise_measurement_matrix,
@@ -29,6 +30,22 @@ def test_get_block_slice():
     rows, cols = get_block_slice(1, 2)
     assert rows == slice(2, 4)
     assert cols == slice(4, 6)
+
+
+@pytest.mark.parametrize("n_blocks", [1, 2, 3])
+def test_scatter_block_diagonal_matches_block_diag(n_blocks):
+    """_scatter_block_diagonal must produce the same result as jax.scipy.linalg.block_diag."""
+    key = jax.random.PRNGKey(42)
+    blocks = jax.random.normal(key, (n_blocks, 2, 2))
+    result = _scatter_block_diagonal(blocks)
+    expected = jax.scipy.linalg.block_diag(*[blocks[k] for k in range(n_blocks)])
+    np.testing.assert_allclose(result, expected, atol=1e-14)
+    # Off-diagonal blocks must be zero
+    for i in range(n_blocks):
+        for j in range(n_blocks):
+            if i != j:
+                block = result[2 * i:2 * (i + 1), 2 * j:2 * (j + 1)]
+                assert jnp.allclose(block, 0.0), f"Off-diag block ({i},{j}) non-zero"
 
 
 def test__get_rotation_matrix_identity():
@@ -96,6 +113,31 @@ def test_construct_correlated_noise_process_covariance():
         [[1.0 * jnp.eye(2), jnp.zeros((2, 2))], [jnp.zeros((2, 2)), 2.0 * jnp.eye(2)]]
     )
     assert jnp.allclose(mat, expected, atol=1e-7)
+
+
+def test_construct_correlated_noise_process_covariance_nonzero_coupling():
+    """Off-diagonal coupling blocks must match coupling_strength * R(phase_diff)."""
+    key = jax.random.PRNGKey(99)
+    n_osc = 3
+    var = jax.random.uniform(key, (n_osc,), minval=0.5, maxval=2.0)
+    phase = jax.random.uniform(key, (n_osc, n_osc), minval=0, maxval=jnp.pi)
+    coupling = jax.random.uniform(key, (n_osc, n_osc), minval=0.1, maxval=0.5)
+
+    mat = construct_correlated_noise_process_covariance(var, phase, coupling)
+
+    # Check diagonal blocks are variance * I
+    for i in range(n_osc):
+        block = mat[2 * i:2 * (i + 1), 2 * i:2 * (i + 1)]
+        np.testing.assert_allclose(block, var[i] * jnp.eye(2), atol=1e-13)
+
+    # Check off-diagonal blocks match coupling_strength * R(phase_diff)
+    from state_space_practice.oscillator_utils import _compute_coupling_transition_block
+    for i in range(n_osc):
+        for j in range(n_osc):
+            if i != j:
+                block = mat[2 * i:2 * (i + 1), 2 * j:2 * (j + 1)]
+                expected = _compute_coupling_transition_block(phase[i, j], coupling[i, j])
+                np.testing.assert_allclose(block, expected, atol=1e-13)
 
 
 def test_construct_correlated_noise_measurement_matrix():

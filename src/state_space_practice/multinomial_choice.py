@@ -55,6 +55,11 @@ def _softmax_update_core(
 
     Parameters
     ----------
+    max_newton_steps : int, default 3
+        Number of Newton-Raphson iterations for Laplace mode-finding.
+        These are unrolled at JIT compile time, so large values (> ~10)
+        significantly increase compilation time and XLA graph size
+        without proportional accuracy gains for well-conditioned problems.
     obs_offset : Array or None, shape (K,)
         Additive offset to the logits before softmax. Used for
         observation covariates (e.g., stay bias, spatial bias).

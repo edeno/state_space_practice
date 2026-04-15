@@ -18,6 +18,10 @@ from state_space_practice.contingency_belief import (
     contingency_belief_smoother,
     transition_logits_to_matrix,
 )
+from state_space_practice.tests.recovery_helpers import (
+    assert_ll_improves,
+    state_segmentation_accuracy,
+)
 
 
 class TestTransitionLogitsToMatrix:
@@ -852,3 +856,87 @@ class TestContingencyBeliefUncertainty:
         mid_cp = float(model.change_point_probability_[45:55].mean())
         # This is a soft check — the model may not perfectly detect the switch
         assert mid_cp >= early_cp - 0.1
+
+
+# ============================================================================
+# Integration: state recovery with numeric accuracy on simulated block bandit
+# ============================================================================
+
+
+@pytest.mark.slow
+class TestContingencyBeliefRecovery:
+    """Fit ContingencyBeliefModel on simulated block bandit and verify
+    state segmentation accuracy and reward probability recovery."""
+
+    @pytest.fixture(scope="class")
+    def fitted(self):
+        # Use multiple block switches for richer signal
+        key = jax.random.PRNGKey(42)
+        n_trials = 300
+        n_options = 3
+
+        # State switches every 75 trials: 0, 1, 0, 1
+        block_len = 75
+        true_states = jnp.concatenate([
+            jnp.full(block_len, i % 2) for i in range(n_trials // block_len)
+        ]).astype(jnp.int32)
+
+        reward_probs = jnp.array([
+            [0.8, 0.1, 0.1],  # state 0: option 0 is best
+            [0.1, 0.1, 0.8],  # state 1: option 2 is best
+        ])
+
+        # Generate choices: animals mostly pick best option (80% accuracy)
+        best_options = jnp.array([0, 2])
+        choices = best_options[true_states]
+        k1, k2 = jax.random.split(key)
+        noise_mask = jax.random.bernoulli(k1, 0.2, (n_trials,))
+        random_choices = jax.random.randint(k2, (n_trials,), 0, n_options)
+        choices = jnp.where(noise_mask, random_choices, choices)
+
+        # Generate rewards
+        reward_p = reward_probs[true_states, choices]
+        rewards = jax.random.bernoulli(
+            jax.random.PRNGKey(43), reward_p,
+        ).astype(jnp.int32)
+
+        model = ContingencyBeliefModel(n_states=2, n_options=n_options)
+        lls = model.fit(choices, rewards, max_iter=30)
+        return model, choices, rewards, true_states, reward_probs, lls
+
+    def test_ll_improves(self, fitted):
+        _, _, _, _, _, lls = fitted
+        assert_ll_improves(lls, label="ContingencyBeliefModel")
+
+    def test_state_segmentation_accuracy(self, fitted):
+        model, choices, rewards, true_states, _, _ = fitted
+        posterior = model.predict_state_posterior(choices, rewards)
+        acc = state_segmentation_accuracy(
+            np.array(true_states), np.array(posterior),
+        )
+        assert acc >= 0.70, (
+            f"State segmentation accuracy {acc:.3f} < 0.70"
+        )
+
+    def test_reward_prob_best_option_high(self, fitted):
+        model, _, _, _, _, _ = fitted
+        # Best learned reward prob per state should be high
+        learned = np.array(model.reward_probs_)
+        for s in range(2):
+            best_prob = float(np.max(learned[s]))
+            assert best_prob > 0.65, (
+                f"State {s}: best reward prob {best_prob:.3f} < 0.65 "
+                f"(true is 0.8)"
+            )
+
+    def test_reward_prob_worst_options_low(self, fitted):
+        model, _, _, _, _, _ = fitted
+        learned = np.array(model.reward_probs_)
+        for s in range(2):
+            # Sort and check the two worst options
+            sorted_probs = np.sort(learned[s])
+            worst_prob = float(sorted_probs[0])
+            assert worst_prob < 0.4, (
+                f"State {s}: worst reward prob {worst_prob:.3f} >= 0.4 "
+                f"(true is ~0.1)"
+            )

@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import jax.scipy.linalg
 import numpy as np
 from jax import Array
+from scipy.optimize import linear_sum_assignment
 
 # Type alias for numeric values (scalars, numpy arrays, JAX arrays)
 Numeric = Union[float, int, np.ndarray, jax.Array]
@@ -166,13 +167,21 @@ _DISCRETE_PROB_STABILITY_FLOOR = 1e-10
 
 
 def divide_safe(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
-    """Divides two arrays, while setting the result to 0.0
-    if the denominator is 0.0.
+    """Divide two arrays, returning 0.0 where denominator is exactly 0.0.
+
+    Guards against division-by-zero for exact floating-point zeros only
+    (e.g., probability vectors with structural zeros). Does NOT guard
+    against near-zero denominators, NaN, or Inf values.
 
     Parameters
     ----------
     numerator : jax.Array
     denominator : jax.Array
+
+    Returns
+    -------
+    jax.Array
+        ``numerator / denominator``, with 0.0 where ``denominator == 0.0``.
     """
     return jnp.where(denominator == 0.0, 0.0, numerator / denominator)
 
@@ -322,3 +331,129 @@ def make_discrete_transition_matrix(
         - jnp.diag(off_diag)
     )
     return transition_matrix / jnp.sum(transition_matrix, axis=1, keepdims=True)
+
+
+# ---------------------------------------------------------------------------
+# Discrete-state inference utilities
+# Viterbi algorithm adapted from dynamax (probml/dynamax), MIT License.
+# https://github.com/probml/dynamax/blob/main/dynamax/hidden_markov_model/inference.py
+# ---------------------------------------------------------------------------
+
+
+@jax.jit
+def hmm_viterbi(
+    initial_probs: Array,
+    transition_matrix: Array,
+    log_likelihoods: Array,
+) -> Array:
+    """Find the most likely discrete state sequence (Viterbi algorithm).
+
+    Uses a backward-forward decomposition that is compatible with
+    ``jax.lax.scan`` and fully JIT-able.
+
+    Parameters
+    ----------
+    initial_probs : Array, shape (K,)
+        Prior probability of each discrete state at time 0.
+    transition_matrix : Array, shape (K, K)
+        Row-stochastic transition matrix where entry ``(i, j)`` is
+        ``P(S_t = j | S_{t-1} = i)``.
+    log_likelihoods : Array, shape (T, K)
+        Per-state log observation likelihoods ``log p(y_t | S_t = k)``
+        at each time step.
+
+    Returns
+    -------
+    states : Array, shape (T,)
+        Most likely state sequence (integer-valued).
+    """
+    num_timesteps, num_states = log_likelihoods.shape
+
+    # Backward pass: accumulate best future scores and store argmax pointers
+    def _backward_step(best_next_score, t):
+        scores = jnp.log(transition_matrix) + best_next_score + log_likelihoods[t + 1]
+        best_next_state = jnp.argmax(scores, axis=1)
+        best_next_score = jnp.max(scores, axis=1)
+        return best_next_score, best_next_state
+
+    best_second_score, best_next_states = jax.lax.scan(
+        _backward_step, jnp.zeros(num_states), jnp.arange(num_timesteps - 1), reverse=True
+    )
+
+    # Pick the best first state
+    first_state = jnp.argmax(
+        jnp.log(initial_probs) + log_likelihoods[0] + best_second_score
+    )
+
+    # Forward pass: trace through pointers
+    def _forward_step(state, best_next_state):
+        next_state = best_next_state[state]
+        return next_state, next_state
+
+    _, states = jax.lax.scan(_forward_step, first_state, best_next_states)
+
+    return jnp.concatenate([jnp.array([first_state]), states])
+
+
+# ---------------------------------------------------------------------------
+# Discrete-state alignment utilities
+# Adapted from dynamax (probml/dynamax), MIT License.
+# https://github.com/probml/dynamax/blob/main/dynamax/utils/utils.py
+# ---------------------------------------------------------------------------
+
+
+def compute_state_overlap(
+    z1: Array,
+    z2: Array,
+) -> Array:
+    """Compute a matrix of state-wise overlap counts between two state sequences.
+
+    Entry ``(i, j)`` counts the number of time steps where ``z1 == i`` and
+    ``z2 == j``.
+
+    Parameters
+    ----------
+    z1 : Int[Array, " num_timesteps"]
+        First state sequence (integer-valued, non-negative).
+    z2 : Int[Array, " num_timesteps"]
+        Second state sequence (integer-valued, non-negative, same length).
+
+    Returns
+    -------
+    overlap : Array, shape (K, K)
+        Overlap matrix where ``K = max(z1.max(), z2.max()) + 1``.
+    """
+    K = jnp.maximum(z1.max(), z2.max()) + 1
+    overlap = jnp.sum(
+        (z1[:, None] == jnp.arange(K))[:, :, None]
+        & (z2[:, None] == jnp.arange(K))[:, None, :],
+        axis=0,
+    )
+    return overlap
+
+
+def find_permutation(
+    z1: Array,
+    z2: Array,
+) -> np.ndarray:
+    """Find the permutation of labels in ``z1`` that best aligns with ``z2``.
+
+    Uses the Hungarian algorithm on the negated overlap matrix to find the
+    optimal assignment.
+
+    Parameters
+    ----------
+    z1 : Int[Array, " num_timesteps"]
+        First state sequence (integer-valued, non-negative).
+    z2 : Int[Array, " num_timesteps"]
+        Second state sequence (integer-valued, non-negative, same length).
+
+    Returns
+    -------
+    permutation : np.ndarray, shape (K,)
+        Permutation such that ``jnp.take(permutation, z1)`` best aligns
+        with ``z2``.  ``K = max(z1.max(), z2.max()) + 1``.
+    """
+    overlap = compute_state_overlap(z1, z2)
+    _, perm = linear_sum_assignment(-np.asarray(overlap))
+    return perm

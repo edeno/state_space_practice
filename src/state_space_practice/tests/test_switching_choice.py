@@ -9,8 +9,10 @@ import numpy as np
 import pytest
 
 from state_space_practice.switching_choice import (
+    SwitchingChoiceModel,
     _softmax_predict_and_update,
     _softmax_update_per_state_pair,
+    simulate_switching_choice_data,
     switching_choice_filter,
 )
 
@@ -663,3 +665,24 @@ class TestSwitchingChoiceRecovery:
             f"LL did not improve: {history[0]:.3f} -> {history[-1]:.3f}"
         )
         assert np.isfinite(history[-1])
+
+    def test_sgd_learns_distinct_per_state_params(self):
+        """SGD should learn per-state betas that differ from each other.
+
+        Note: exact state segmentation from choice data alone is
+        under-determined (the generative model has shared value dynamics),
+        so we test parameter distinguishability rather than state recovery.
+        The predictive-distribution test above validates the model's
+        overall recovery quality.
+        """
+        sim = simulate_switching_choice_data(
+            n_trials=300, n_options=3, n_discrete_states=2, seed=21,
+        )
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model.fit_sgd(sim.choices, num_steps=100)
+        # Per-state betas should differ (true gap is 4.5)
+        gap = float(abs(model.inverse_temperatures_[0] - model.inverse_temperatures_[1]))
+        assert gap > 0.1, (
+            f"Per-state beta gap {gap:.3f} < 0.1 after SGD "
+            f"(learned: {model.inverse_temperatures_})"
+        )

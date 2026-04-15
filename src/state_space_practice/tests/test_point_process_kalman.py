@@ -2903,7 +2903,6 @@ class TestBlockDiagonalFilterEquivalence:
         init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
             n_neurons=3, block_size=4, T=30, seed=7
         )
-        n_neurons, block_size = 3, 4
 
         # Pre-build the structure OUTSIDE jax.grad (detection uses
         # host-side float() and is not trace-compatible by design; see
@@ -2951,7 +2950,6 @@ class TestBlockDiagonalFilterEquivalence:
         _, block = self._run_both_paths(*problem)
         _, block_cov, _ = block
         n_neurons, nb = 3, 4
-        n_state = n_neurons * nb
         for t in range(block_cov.shape[0]):
             for j in range(n_neurons):
                 for k in range(n_neurons):
@@ -3281,4 +3279,126 @@ class TestBlockDiagonalSmootherEquivalence:
         )
         np.testing.assert_allclose(
             float(block[3]), float(dense[3]), atol=1e-9
+        )
+
+
+# ============================================================================
+# Integration: PointProcessModel parameter + trajectory recovery
+# ============================================================================
+
+
+@pytest.mark.slow
+class TestPointProcessModelRecovery:
+    """Fit PointProcessModel on simulated AR(1) + Poisson data and verify
+    transition matrix recovery and latent trajectory tracking."""
+
+    @pytest.fixture(scope="class")
+    def fitted(self):
+        # 1D latent state, single neuron — simplest recovery scenario
+        n_basis = 3
+        n_time = 500
+        dt = 0.02
+
+        # True dynamics: near random walk (matches proven test pattern)
+        true_A = jnp.eye(n_basis)  # random walk
+        true_Q = 0.05 * jnp.eye(n_basis)
+
+        # Simulate latent trajectory
+        key = jax.random.PRNGKey(123)
+        key, subkey = jax.random.split(key)
+
+        def step(x, k):
+            x_next = true_A @ x + jax.random.multivariate_normal(
+                k, jnp.zeros(n_basis), true_Q
+            )
+            return x_next, x_next
+
+        keys = jax.random.split(subkey, n_time)
+        _, x_true = jax.lax.scan(step, jnp.zeros(n_basis), keys)
+
+        # Cycling one-hot design matrix (proven in test_random_walk_recovery)
+        design_matrix = jnp.eye(n_basis)[jnp.arange(n_time) % n_basis]
+
+        # Simulate spikes
+        log_rates_diag = jnp.sum(design_matrix * x_true, axis=1)
+        rates = jnp.exp(jnp.clip(log_rates_diag, -5, 3)) * dt
+        key, subkey = jax.random.split(key)
+        spikes = jax.random.poisson(subkey, rates).astype(float)
+
+        # Fit model — start A away from identity
+        model = PointProcessModel(
+            n_state_dims=n_basis,
+            dt=dt,
+            transition_matrix=0.8 * jnp.eye(n_basis),
+            process_cov=0.1 * jnp.eye(n_basis),
+        )
+        lls = model.fit(design_matrix, spikes, max_iter=20)
+
+        return model, x_true, true_A, true_Q, lls
+
+    def test_ll_improves(self, fitted):
+        """Laplace-EKF EM is approximate — LL may not be monotonic but
+        should improve overall."""
+        from state_space_practice.tests.recovery_helpers import assert_ll_improves
+
+        _, _, _, _, lls = fitted
+        assert_ll_improves(lls, label="PointProcessModel")
+
+    def test_transition_matrix_recovery(self, fitted):
+        model, _, true_A, _, _ = fitted
+        # Point-process EM with Laplace approximation: atol=0.25
+        # (consistent with existing test_random_walk_recovery)
+        np.testing.assert_allclose(
+            model.transition_matrix, true_A, atol=0.25,
+        )
+
+    def test_process_cov_psd(self, fitted):
+        model, _, _, _, _ = fitted
+        eigvals = jnp.linalg.eigvalsh(model.process_cov)
+        assert jnp.all(eigvals > 0), (
+            f"Q has non-positive eigenvalues: {eigvals}"
+        )
+
+
+@pytest.mark.slow
+class TestMaxNewtonIterReducesLLDecreases:
+    """Verify that max_newton_iter > 1 reduces LL decreases in EM.
+
+    With strong observation coupling, the single-Newton-step Laplace
+    approximation is inaccurate, causing EM to be non-monotonic. More
+    Newton iterations should improve the Laplace approximation and
+    reduce the frequency of LL decreases.
+    """
+
+    def test_more_newton_steps_fewer_ll_decreases(self):
+        n_basis, n_time, dt = 3, 500, 0.02
+        key = jax.random.PRNGKey(123)
+        k1, k2 = jax.random.split(key)
+
+        def step(x, k):
+            return x + jax.random.normal(k, (n_basis,)) * 0.1, x
+        _, x_true = jax.lax.scan(step, jnp.zeros(n_basis), jax.random.split(k1, n_time))
+
+        # Strong coupling (scale=2.0) to trigger Laplace breakdown
+        scale = 2.0
+        design_matrix = jnp.eye(n_basis)[jnp.arange(n_time) % n_basis] * scale
+        log_rates = jnp.sum(design_matrix * x_true, axis=1)
+        rates = jnp.exp(jnp.clip(log_rates, -5, 3)) * dt
+        spikes = jax.random.poisson(k2, rates).astype(float)
+
+        decreases = {}
+        for max_ni in [1, 5]:
+            model = PointProcessModel(
+                n_state_dims=n_basis, dt=dt,
+                transition_matrix=0.8 * jnp.eye(n_basis),
+                process_cov=0.1 * jnp.eye(n_basis),
+                max_newton_iter=max_ni,
+            )
+            lls = model.fit(design_matrix, spikes, max_iter=10)
+            ll_changes = [lls[i] - lls[i - 1] for i in range(1, len(lls))]
+            decreases[max_ni] = sum(1 for c in ll_changes if c < -1e-3)
+
+        assert decreases[5] <= decreases[1], (
+            f"max_newton_iter=5 should have <= LL decreases than "
+            f"max_newton_iter=1, got {decreases[5]} vs {decreases[1]}"
         )

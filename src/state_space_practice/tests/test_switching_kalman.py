@@ -27,6 +27,8 @@ from state_space_practice.kalman import (
     kalman_smoother,
 )
 from state_space_practice.switching_kalman import (
+    _compute_expected_complete_log_likelihood_reference,
+    _compute_posterior_entropy_reference,
     _kalman_filter_update_per_discrete_state_pair,
     _kalman_smoother_update_per_discrete_state_pair,
     _scale_likelihood,
@@ -37,6 +39,8 @@ from state_space_practice.switching_kalman import (
     collapse_gaussian_mixture_over_next_discrete_state,
     collapse_gaussian_mixture_per_discrete_state,
     compute_elbo,
+    compute_expected_complete_log_likelihood,
+    compute_posterior_entropy,
     switching_kalman_filter,
     switching_kalman_maximization_step,
     switching_kalman_smoother,
@@ -5029,3 +5033,118 @@ class TestGPB2ExactMStep:
                 f"Pair-conditional trace ({pair_traces:.4f}) should be >= "
                 f"state-conditional trace ({state_traces:.4f}) for state {j}"
             )
+
+
+# ============================================================================
+# Vectorized ELBO equivalence tests
+# ============================================================================
+
+
+class TestVectorizedELBOEquivalence:
+    """Verify vectorized ELBO functions match reference loop implementations."""
+
+    @pytest.fixture
+    def smoother_outputs(self):
+        """Run filter+smoother on a small problem to get all needed quantities."""
+        np.random.seed(42)
+        K, n, T, d = 2, 3, 20, 2
+        obs = jnp.array(np.random.randn(T, d))
+        A = jnp.stack([0.9 * jnp.eye(n)] * K, axis=-1)
+        Q = jnp.stack([0.1 * jnp.eye(n)] * K, axis=-1)
+        H = jnp.stack([np.random.randn(d, n) * 0.1] * K, axis=-1)
+        R = jnp.stack([0.5 * jnp.eye(d)] * K, axis=-1)
+        Z = jnp.array([[0.9, 0.1], [0.1, 0.9]])
+        m0 = jnp.zeros((n, K))
+        P0 = jnp.stack([jnp.eye(n)] * K, axis=-1)
+        pi0 = jnp.array([0.5, 0.5])
+
+        fm, fc, fdp, lfc = switching_kalman_filter(
+            m0, P0, pi0, obs, Z, A, Q, H, R
+        )[:4]
+        sm_result = switching_kalman_smoother(fm, fc, fdp, lfc, Q, A, Z)
+        return {
+            "obs": obs, "A": A, "Q": Q, "H": H, "R": R, "Z": Z,
+            "m0": m0, "P0": P0, "pi0": pi0,
+            "sm_dp": sm_result[2], "sm_jdp": sm_result[3],
+            "sc_means": sm_result[5], "sc_covs": sm_result[6],
+            "pc_xcov": sm_result[7], "pc_means": sm_result[8],
+        }
+
+    def test_entropy_matches_reference(self, smoother_outputs):
+        """Vectorized entropy must match reference loop implementation."""
+        s = smoother_outputs
+        ref = _compute_posterior_entropy_reference(s["sm_dp"], s["sm_jdp"], s["sc_covs"])
+        new = compute_posterior_entropy(s["sm_dp"], s["sm_jdp"], s["sc_covs"])
+        np.testing.assert_allclose(float(ref), float(new), atol=1e-10)
+
+    def test_ll_matches_reference_no_pair_cond(self, smoother_outputs):
+        """Vectorized LL (GPB1 path, no pair-conditional) must match reference."""
+        s = smoother_outputs
+        args = (s["obs"], s["sc_means"], s["sc_covs"], s["sm_dp"], s["sm_jdp"],
+                s["pc_xcov"], s["m0"], s["P0"], s["pi0"], s["A"], s["Q"],
+                s["H"], s["R"], s["Z"])
+        ref = _compute_expected_complete_log_likelihood_reference(*args)
+        new = compute_expected_complete_log_likelihood(*args)
+        np.testing.assert_allclose(float(ref), float(new), atol=1e-10)
+
+    def test_ll_matches_reference_with_pair_cond(self, smoother_outputs):
+        """Vectorized LL (GPB2 path, with pair-conditional means) must match reference."""
+        s = smoother_outputs
+        args = (s["obs"], s["sc_means"], s["sc_covs"], s["sm_dp"], s["sm_jdp"],
+                s["pc_xcov"], s["m0"], s["P0"], s["pi0"], s["A"], s["Q"],
+                s["H"], s["R"], s["Z"])
+        ref = _compute_expected_complete_log_likelihood_reference(
+            *args, pair_cond_smoother_means=s["pc_means"]
+        )
+        new = compute_expected_complete_log_likelihood(
+            *args, pair_cond_smoother_means=s["pc_means"]
+        )
+        np.testing.assert_allclose(float(ref), float(new), atol=1e-10)
+
+    def test_entropy_jit_compiles(self, smoother_outputs):
+        """Vectorized entropy must be JIT-compilable."""
+        s = smoother_outputs
+        ref = _compute_posterior_entropy_reference(s["sm_dp"], s["sm_jdp"], s["sc_covs"])
+        jitted = jax.jit(compute_posterior_entropy)(s["sm_dp"], s["sm_jdp"], s["sc_covs"])
+        np.testing.assert_allclose(float(ref), float(jitted), atol=1e-10)
+
+    def test_ll_asymmetric_k3(self):
+        """K=3 with distinct per-state params and asymmetric Z exposes axis bugs."""
+        np.random.seed(123)
+        K, n, T, d = 3, 2, 15, 2
+        obs = jnp.array(np.random.randn(T, d))
+        # Distinct A, Q, H, R for each state
+        A = jnp.stack([
+            jnp.array([[0.9, 0.1], [-0.1, 0.8]]),
+            jnp.array([[0.7, 0.0], [0.0, 0.95]]),
+            jnp.array([[0.85, -0.05], [0.05, 0.9]]),
+        ], axis=-1)
+        Q = jnp.stack([0.1 * jnp.eye(n), 0.2 * jnp.eye(n), 0.05 * jnp.eye(n)], axis=-1)
+        H = jnp.stack([np.random.randn(d, n) * 0.1 for _ in range(K)], axis=-1)
+        R = jnp.stack([0.3 * jnp.eye(d), 0.5 * jnp.eye(d), 0.1 * jnp.eye(d)], axis=-1)
+        # Asymmetric Z
+        Z = jnp.array([[0.8, 0.15, 0.05], [0.1, 0.7, 0.2], [0.05, 0.1, 0.85]])
+        m0 = jnp.zeros((n, K))
+        P0 = jnp.stack([jnp.eye(n)] * K, axis=-1)
+        pi0 = jnp.array([0.5, 0.3, 0.2])
+
+        fm, fc, fdp, lfc = switching_kalman_filter(m0, P0, pi0, obs, Z, A, Q, H, R)[:4]
+        r = switching_kalman_smoother(fm, fc, fdp, lfc, Q, A, Z)
+        sm_dp, sm_jdp = r[2], r[3]
+        sc_means, sc_covs, pc_xcov = r[5], r[6], r[7]
+
+        # Guard: Z is actually asymmetric in the smoother output
+        assert not jnp.allclose(sm_jdp[0, 0, 1], sm_jdp[0, 1, 0]), (
+            "Joint probs should be asymmetric for this test to be meaningful"
+        )
+
+        args = (obs, sc_means, sc_covs, sm_dp, sm_jdp, pc_xcov,
+                m0, P0, pi0, A, Q, H, R, Z)
+        ref = _compute_expected_complete_log_likelihood_reference(*args)
+        new = compute_expected_complete_log_likelihood(*args)
+        np.testing.assert_allclose(float(ref), float(new), atol=1e-10)
+
+        # Also test entropy
+        ent_ref = _compute_posterior_entropy_reference(sm_dp, sm_jdp, sc_covs)
+        ent_new = compute_posterior_entropy(sm_dp, sm_jdp, sc_covs)
+        np.testing.assert_allclose(float(ent_ref), float(ent_new), atol=1e-10)

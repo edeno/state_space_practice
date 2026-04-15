@@ -35,21 +35,27 @@ def _eden_brown_2004_base(
     return time, position, n_total_steps, true_params1, true_params2
 
 
-def simulate_eden_brown_2004_jump() -> (
-    tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]
-):
+def simulate_eden_brown_2004_jump(
+    rng: np.random.Generator | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]:
+    if rng is None:
+        rng = np.random.default_rng()
     dt = 0.020
     time, position, _, true_params1, true_params2 = _eden_brown_2004_base(dt=dt)
 
     true_rate1 = receptive_field_model(position[: position.shape[0] // 2], true_params1)
     true_rate2 = receptive_field_model(position[position.shape[0] // 2 :], true_params2)
     true_rate = np.concatenate((true_rate1, true_rate2))
-    spike_indicator = np.random.poisson(true_rate * dt)
+    spike_indicator = rng.poisson(true_rate * dt)
 
     return time, position, spike_indicator, dt, true_params1, true_params2
 
 
-def simulate_eden_brown_2004_linear():
+def simulate_eden_brown_2004_linear(
+    rng: np.random.Generator | None = None,
+):
+    if rng is None:
+        rng = np.random.default_rng()
     dt = 0.020
     time, position, n_total_steps, true_params1, true_params2 = _eden_brown_2004_base(dt=dt)
 
@@ -59,7 +65,7 @@ def simulate_eden_brown_2004_linear():
     true_rate = np.exp(
         log_max_rate - (position - place_field_center) ** 2 / (2 * scale**2)
     )
-    spike_indicator = np.random.poisson(true_rate * dt)
+    spike_indicator = rng.poisson(true_rate * dt)
 
     return time, position, spike_indicator, dt, true_params
 

@@ -56,8 +56,10 @@ class SGDFittableMixin:
         verbose : bool
             Log progress every 10 steps.
         convergence_tol : float or None
-            If set, stop early when |ΔLL| < tol for 5 consecutive steps,
-            where LL is the total (unnormalized) log-likelihood.
+            If set, stop early when the relative change
+            ``|ΔLL| / avg(|LL|) < tol`` for 5 consecutive steps.
+            This is a dimensionless fraction (e.g., ``1e-4`` means 0.01%
+            relative change), consistent with the EM convergence check.
 
         Returns
         -------
@@ -146,14 +148,21 @@ class SGDFittableMixin:
             log_likelihoods.append(ll)
 
             if verbose and (step % 10 == 0 or step == num_steps - 1):
-                logger.info("SGD step %d: LL=%.2f", step, ll)
+                print(f"SGD step {step}: LL={ll:.2f}")
 
             if convergence_tol is not None and len(log_likelihoods) >= 2:
-                if abs(log_likelihoods[-1] - log_likelihoods[-2]) < convergence_tol:
+                # Use relative change for convergence, consistent with EM's
+                # check_converged in utils.py. This avoids stalling too early
+                # for problems with large total LL.
+                avg = (abs(log_likelihoods[-1]) + abs(log_likelihoods[-2])) / 2
+                rel_change = abs(log_likelihoods[-1] - log_likelihoods[-2]) / max(avg, 1e-10)
+                if rel_change < convergence_tol:
                     stall_count += 1
                 else:
                     stall_count = 0
                 if stall_count >= 5:
+                    if verbose:
+                        print(f"SGD converged at step {step}.")
                     logger.info("SGD converged at step %d.", step)
                     break
 

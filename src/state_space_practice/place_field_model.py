@@ -334,6 +334,7 @@ class PlaceFieldModel(SGDFittableMixin):
         update_process_cov: bool = True,
         update_init_state: bool = True,
         max_firing_rate_hz: float = 500.0,
+        max_newton_iter: int = 1,
     ):
         if dt <= 0:
             raise ValueError(f"dt must be positive, got {dt}")
@@ -357,6 +358,7 @@ class PlaceFieldModel(SGDFittableMixin):
         self.init_process_noise = init_process_noise
         self.init_cov_scale = init_cov_scale
         self.max_firing_rate_hz = max_firing_rate_hz
+        self.max_newton_iter = max_newton_iter
         self._log_intensity_func = (
             log_intensity_func if log_intensity_func is not None
             else log_conditional_intensity
@@ -502,9 +504,12 @@ class PlaceFieldModel(SGDFittableMixin):
         nb = self.n_basis_per_neuron
         n_time = Z_base.shape[0]
         Z_base_jnp = jnp.asarray(Z_base)
-        Z_full = jnp.zeros((n_time, self.n_neurons, self.n_basis))
-        for j in range(self.n_neurons):
-            Z_full = Z_full.at[:, j, j * nb:(j + 1) * nb].set(Z_base_jnp)
+        # Z_full[t, j, :] = kron(e_j, Z_base[t]) — non-zero only at j*nb:(j+1)*nb
+        eye_n = jnp.eye(self.n_neurons)  # (n_neurons, n_neurons)
+        # (1, n_neurons, n_neurons, 1) * (n_time, 1, 1, nb) -> (n_time, n_neurons, n_neurons, nb)
+        Z_full = (eye_n[None, :, :, None] * Z_base_jnp[:, None, None, :]).reshape(
+            n_time, self.n_neurons, self.n_neurons * nb
+        )
         return Z_full
 
     def _check_fitted(self, method_name: str) -> None:
@@ -754,11 +759,14 @@ class PlaceFieldModel(SGDFittableMixin):
 
         # Multi-neuron: concatenate means and block-diagonalize covariances.
         init_mean = w_mles.reshape(n_neurons * nb)
-        init_cov = jnp.zeros((n_neurons * nb, n_neurons * nb), dtype=Z_base.dtype)
-        for j in range(n_neurons):
-            init_cov = init_cov.at[j * nb : (j + 1) * nb, j * nb : (j + 1) * nb].set(
-                covs[j]
-            )
+        # Block-diagonal from (n_neurons, nb, nb) -> (n_neurons*nb, n_neurons*nb)
+        # using flat index scatter
+        total = n_neurons * nb
+        idx = jnp.arange(n_neurons)
+        row_base = (idx * nb)[:, None, None] + jnp.arange(nb)[None, :, None]
+        col_base = (idx * nb)[:, None, None] + jnp.arange(nb)[None, None, :]
+        init_cov = jnp.zeros((total, total), dtype=Z_base.dtype)
+        init_cov = init_cov.at[row_base, col_base].set(covs)
         return init_mean, symmetrize(init_cov)
 
     def _warm_start_parameters(
@@ -949,6 +957,7 @@ class PlaceFieldModel(SGDFittableMixin):
             # update_transition_matrix changes A's structure.
             block_n_neurons=self._block_n_neurons,
             block_size=self._block_size,
+            max_newton_iter=self.max_newton_iter,
         )
         return float(marginal_ll)
 
@@ -1457,6 +1466,7 @@ class PlaceFieldModel(SGDFittableMixin):
             # through to the dense path.
             block_n_neurons=self._block_n_neurons,
             block_size=self._block_size,
+            max_newton_iter=self.max_newton_iter,
         )
         return -marginal_ll
 
@@ -1498,6 +1508,7 @@ class PlaceFieldModel(SGDFittableMixin):
             # Block-diagonal dispatch (None/None falls through to dense).
             block_n_neurons=self._block_n_neurons,
             block_size=self._block_size,
+            max_newton_iter=self.max_newton_iter,
         )
         self.log_likelihoods = [float(marginal_ll)]
         # Saturation diagnostic: post-hoc check on the filtered posterior.
@@ -1746,6 +1757,7 @@ class PlaceFieldModel(SGDFittableMixin):
             # Reuse the block-diagonal dispatch decision made at fit time.
             block_n_neurons=self._block_n_neurons,
             block_size=self._block_size,
+            max_newton_iter=self.max_newton_iter,
         )
         return float(marginal_ll)
 

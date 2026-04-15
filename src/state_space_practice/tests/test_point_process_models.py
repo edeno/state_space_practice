@@ -40,7 +40,7 @@ def com_pp_params():
         "sampling_freq": sampling_freq,
         "dt": dt,
         "freqs": jnp.array([8.0, 12.0]),
-        "auto_regressive_coef": jnp.array([0.95, 0.95]),
+        "damping_coef": jnp.array([0.95, 0.95]),
         "process_variance": jnp.array([0.1, 0.1]),
     }
 
@@ -61,7 +61,7 @@ def cnm_pp_params():
         "sampling_freq": sampling_freq,
         "dt": dt,
         "freqs": jnp.array([8.0, 12.0]),
-        "auto_regressive_coef": jnp.array([0.95, 0.95]),
+        "damping_coef": jnp.array([0.95, 0.95]),
         "process_variance": jnp.ones((n_oscillators, n_discrete_states)) * 0.1,
         "phase_difference": jnp.zeros(
             (n_oscillators, n_oscillators, n_discrete_states)
@@ -88,7 +88,7 @@ def dim_pp_params():
         "sampling_freq": sampling_freq,
         "dt": dt,
         "freqs": jnp.array([8.0, 12.0]),
-        "auto_regressive_coef": jnp.array([0.95, 0.95]),
+        "damping_coef": jnp.array([0.95, 0.95]),
         "process_variance": jnp.array([0.1, 0.1]),
         "phase_difference": jnp.zeros(
             (n_oscillators, n_oscillators, n_discrete_states)
@@ -205,6 +205,7 @@ class TestCommonOscillatorPointProcessModel:
                 rtol=1e-10,
             )
 
+    @pytest.mark.slow
     def test_e_step_runs(self, com_pp_params, synthetic_spikes) -> None:
         """E-step should produce finite log-likelihood."""
         model = CommonOscillatorPointProcessModel(**com_pp_params)
@@ -213,6 +214,7 @@ class TestCommonOscillatorPointProcessModel:
         marginal_ll = model._e_step(synthetic_spikes)
         assert jnp.isfinite(marginal_ll)
 
+    @pytest.mark.slow
     def test_fit_runs(self, com_pp_params, synthetic_spikes) -> None:
         """fit() should complete without error for a few iterations."""
         model = CommonOscillatorPointProcessModel(**com_pp_params)
@@ -281,6 +283,7 @@ class TestCorrelatedNoisePointProcessModel:
             eigvals = jnp.linalg.eigvalsh(model.process_cov[..., j])
             assert jnp.all(eigvals >= -1e-10)
 
+    @pytest.mark.slow
     def test_e_step_runs(self, cnm_pp_params, synthetic_spikes) -> None:
         model = CorrelatedNoisePointProcessModel(**cnm_pp_params)
         model._initialize_parameters(jax.random.PRNGKey(0))
@@ -288,6 +291,7 @@ class TestCorrelatedNoisePointProcessModel:
         marginal_ll = model._e_step(synthetic_spikes)
         assert jnp.isfinite(marginal_ll)
 
+    @pytest.mark.slow
     def test_fit_runs(self, cnm_pp_params, synthetic_spikes) -> None:
         model = CorrelatedNoisePointProcessModel(**cnm_pp_params)
         log_likelihoods = model.fit(
@@ -360,6 +364,7 @@ class TestDirectedInfluencePointProcessModel:
                 rtol=1e-10,
             )
 
+    @pytest.mark.slow
     def test_e_step_runs(self, dim_pp_params, synthetic_spikes) -> None:
         model = DirectedInfluencePointProcessModel(**dim_pp_params)
         model._initialize_parameters(jax.random.PRNGKey(0))
@@ -367,6 +372,7 @@ class TestDirectedInfluencePointProcessModel:
         marginal_ll = model._e_step(synthetic_spikes)
         assert jnp.isfinite(marginal_ll)
 
+    @pytest.mark.slow
     def test_fit_runs(self, dim_pp_params, synthetic_spikes) -> None:
         model = DirectedInfluencePointProcessModel(**dim_pp_params)
         log_likelihoods = model.fit(
@@ -376,6 +382,7 @@ class TestDirectedInfluencePointProcessModel:
         assert len(log_likelihoods) == 3
         assert all(np.isfinite(ll) for ll in log_likelihoods)
 
+    @pytest.mark.slow
     def test_reparameterized_mstep(self, dim_pp_params, synthetic_spikes) -> None:
         """DIM-PP with reparameterized M-step should run without error."""
         model = DirectedInfluencePointProcessModel(
@@ -428,7 +435,7 @@ class TestInputValidation:
                 sampling_freq=100.0,
                 dt=0.01,
                 freqs=jnp.array([8.0]),
-                auto_regressive_coef=jnp.array([0.95]),
+                damping_coef=jnp.array([0.95]),
                 process_variance=jnp.array([0.1]),
             )
 
@@ -441,7 +448,7 @@ class TestInputValidation:
                 sampling_freq=100.0,
                 dt=-0.01,
                 freqs=jnp.array([8.0, 12.0]),
-                auto_regressive_coef=jnp.array([0.95, 0.95]),
+                damping_coef=jnp.array([0.95, 0.95]),
                 process_variance=jnp.array([0.1, 0.1]),
             )
 
@@ -454,7 +461,7 @@ class TestInputValidation:
                 sampling_freq=100.0,
                 dt=0.01,
                 freqs=jnp.array([8.0]),  # Wrong shape
-                auto_regressive_coef=jnp.array([0.95, 0.95]),
+                damping_coef=jnp.array([0.95, 0.95]),
                 process_variance=jnp.array([0.1, 0.1]),
             )
 
@@ -473,6 +480,7 @@ class TestInputValidation:
             model.fit(wrong_spikes, max_iter=1, key=jax.random.PRNGKey(0))
 
 
+@pytest.mark.slow
 class TestSwitchingPPSGDFitting:
     """Tests for switching point-process SGD fitting."""
 
@@ -489,7 +497,7 @@ class TestSwitchingPPSGDFitting:
             sampling_freq=p["sampling_freq"],
             dt=p["dt"],
             freqs=p["freqs"],
-            auto_regressive_coef=p["damping"],
+            damping_coef=p["damping"],
             process_variance=p["process_variance"],
         )
         return model, scenario["spikes"]
@@ -507,7 +515,7 @@ class TestSwitchingPPSGDFitting:
             sampling_freq=p["sampling_freq"],
             dt=p["dt"],
             freqs=p["freqs"],
-            auto_regressive_coef=p["damping"],
+            damping_coef=p["damping"],
             process_variance=p["process_variance"],
             phase_difference=p["phase_difference"],
             coupling_strength=p["coupling_strength"],
@@ -574,7 +582,7 @@ class TestSwitchingPPSGDFitting:
                 sampling_freq=p["sampling_freq"],
                 dt=p["dt"],
                 freqs=p["freqs"],
-                auto_regressive_coef=p["damping"],
+                damping_coef=p["damping"],
                 process_variance=p["process_variance"],
                 phase_difference=p["phase_difference"],
                 coupling_strength=p["coupling_strength"],
@@ -612,7 +620,7 @@ class TestSwitchingPPSGDFitting:
                 sampling_freq=p["sampling_freq"],
                 dt=p["dt"],
                 freqs=p["freqs"],
-                auto_regressive_coef=p["damping"],
+                damping_coef=p["damping"],
                 process_variance=p["process_variance"],
                 phase_difference=p["phase_difference"],
                 coupling_strength=p["coupling_strength"],

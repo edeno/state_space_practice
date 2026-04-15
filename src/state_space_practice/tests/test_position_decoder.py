@@ -983,3 +983,99 @@ class TestAdaptiveInflation:
         assert np.all(np.isfinite(f_trace))
         assert np.all(np.isfinite(s_trace))
         assert np.mean(s_trace) < np.mean(f_trace) * 1.5
+
+
+# ============================================================================
+# Integration: rate-map quality after fit
+# ============================================================================
+
+
+@pytest.mark.slow
+class TestPositionDecoderRateMapRecovery:
+    """Verify that PositionDecoder.fit() learns rate maps whose peaks
+    match the true place field centers."""
+
+    @pytest.fixture(scope="class")
+    def fitted_decoder(self):
+        rng = np.random.default_rng(42)
+        n_time = 7500  # 30 s at dt=0.004
+        dt = 0.004
+
+        t = np.arange(n_time) * dt
+        true_x = 50 + 20 * np.cos(2 * np.pi * t / 2.0)
+        true_y = 50 + 20 * np.sin(2 * np.pi * t / 2.0)
+        position = np.column_stack([true_x, true_y])
+
+        grid_xs = np.linspace(28, 72, 4)
+        grid_ys = np.linspace(28, 72, 4)
+        centers = np.array([(cx, cy) for cx in grid_xs for cy in grid_ys])
+        n_neurons = len(centers)
+        sigma_rf = 8.0
+        peak_rate = 30.0
+
+        spikes = np.zeros((n_time, n_neurons))
+        for n in range(n_neurons):
+            dist_sq = np.sum((position - centers[n]) ** 2, axis=1)
+            rate = peak_rate * np.exp(-dist_sq / (2 * sigma_rf**2)) + 0.5
+            spikes[:, n] = rng.poisson(rate * dt)
+
+        decoder = PositionDecoder(dt=dt)
+        decoder.fit(position=position, spikes=spikes)
+        return decoder, centers
+
+    def test_rate_map_peaks_near_true_centers(self, fitted_decoder):
+        decoder, centers = fitted_decoder
+        x_edges = decoder.rate_maps.x_edges
+        y_edges = decoder.rate_maps.y_edges
+        xx, yy = np.meshgrid(x_edges, y_edges)
+        grid = np.column_stack([xx.ravel(), yy.ravel()])
+
+        # Only test neurons whose fields are well-sampled by the circular
+        # trajectory (center 50, radius 20). Interior neurons at ~10 cm
+        # from arena center are never visited and can't be estimated.
+        trajectory_center = np.array([50.0, 50.0])
+        trajectory_radius = 20.0
+        well_sampled_mask = []
+        for c in centers:
+            dist_to_path = abs(np.linalg.norm(c - trajectory_center) - trajectory_radius)
+            well_sampled_mask.append(dist_to_path < 8.0)  # within sigma_rf of path
+
+        errors = []
+        for n in range(len(centers)):
+            log_rates = np.array([
+                float(decoder.rate_maps.log_rate(jnp.array(g))[n])
+                for g in grid
+            ])
+            peak_idx = np.argmax(log_rates)
+            estimated_peak = grid[peak_idx]
+            dist = float(np.linalg.norm(estimated_peak - centers[n]))
+            errors.append(dist)
+
+        # Well-sampled neurons should have peaks within 10 cm of truth
+        well_sampled_errors = [e for e, m in zip(errors, well_sampled_mask) if m]
+        assert len(well_sampled_errors) >= 8, (
+            f"Expected >= 8 well-sampled neurons, got {len(well_sampled_errors)}"
+        )
+        for n, (dist, is_sampled) in enumerate(zip(errors, well_sampled_mask)):
+            if is_sampled:
+                assert dist < 10.0, (
+                    f"Well-sampled neuron {n}: peak is "
+                    f"{dist:.1f} cm from true center {centers[n]}"
+                )
+
+        mean_well_sampled = float(np.mean(well_sampled_errors))
+        assert mean_well_sampled < 5.0, (
+            f"Mean well-sampled peak error {mean_well_sampled:.1f} cm >= 5.0"
+        )
+
+    def test_rate_maps_have_dynamic_range(self, fitted_decoder):
+        decoder, _ = fitted_decoder
+        rate_maps = np.exp(decoder.rate_maps.rate_maps)  # log -> linear
+        for n in range(rate_maps.shape[0]):
+            max_rate = float(np.max(rate_maps[n]))
+            median_rate = float(np.median(rate_maps[n]))
+            ratio = max_rate / max(median_rate, 1e-10)
+            assert ratio > 3.0, (
+                f"Neuron {n}: rate map dynamic range {ratio:.1f} < 3.0 "
+                f"(max={max_rate:.2f}, median={median_rate:.2f})"
+            )

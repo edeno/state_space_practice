@@ -13,6 +13,7 @@ from state_space_practice.place_field_model import (
     evaluate_basis,
 )
 from state_space_practice.simulate_data import simulate_2d_moving_place_field
+from state_space_practice.tests.recovery_helpers import assert_ll_monotonic
 
 jax.config.update("jax_enable_x64", True)
 
@@ -1549,3 +1550,62 @@ class TestBlockDiagonalDispatch:
         ll = model.score(position, spikes)
         assert np.isfinite(ll)
         assert model._block_n_neurons == 3  # dispatch state preserved
+
+
+# ------------------------------------------------------------------
+# Integration: rate-map recovery on simulated data
+# ------------------------------------------------------------------
+
+
+@pytest.mark.slow
+class TestPlaceFieldModelRecovery:
+    """Fit PlaceFieldModel on simulated moving place field and verify
+    the recovered rate map correlates with ground truth."""
+
+    @pytest.fixture(scope="class")
+    def fitted(self):
+        data = simulate_2d_moving_place_field(
+            total_time=30.0,
+            dt=0.020,
+            arena_size=80.0,
+            peak_rate=25.0,
+            background_rate=1.0,
+            n_interior_knots=4,
+            rng=np.random.default_rng(42),
+        )
+        model = PlaceFieldModel(dt=data["dt"], n_interior_knots=4)
+        lls = model.fit(
+            data["position"], data["spikes"], max_iter=20, verbose=False,
+        )
+        return model, data, lls
+
+    def test_ll_monotonic(self, fitted):
+        _, _, lls = fitted
+        assert_ll_monotonic(lls, tol=1e-3, label="PlaceFieldModel")
+
+    def test_rate_map_correlates_with_truth(self, fitted):
+        model, data, _ = fitted
+        # Predict rate at the observed positions (time-averaged)
+        grid, _, _ = model.make_grid(n_grid=30)
+        rate_map, _ = model.predict_rate_map(grid)
+        assert np.all(np.isfinite(rate_map)), "Rate map contains non-finite values"
+        # Correlate predicted rate at observed positions with true rate
+        pred_rate_at_pos, _ = model.predict_rate_map(data["position"])
+        corr = float(np.corrcoef(pred_rate_at_pos, data["true_rate"])[0, 1])
+        assert corr > 0.6, (
+            f"Predicted-vs-true rate correlation {corr:.3f} < 0.6"
+        )
+
+    def test_rate_map_peak_near_true_center(self, fitted):
+        model, data, _ = fitted
+        grid, _, _ = model.make_grid(n_grid=30)
+        rate_map, _ = model.predict_rate_map(grid)
+        peak_idx = np.argmax(rate_map)
+        estimated_peak = grid[peak_idx]
+        # True center at the midpoint of the simulation (time-averaged)
+        true_center = np.mean(data["true_center"], axis=0)
+        dist = float(np.linalg.norm(estimated_peak - true_center))
+        assert dist < 15.0, (
+            f"Rate map peak {estimated_peak} is {dist:.1f} cm from "
+            f"true center {true_center}"
+        )

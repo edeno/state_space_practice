@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Development Environment
 
 - **Conda environment**: `state_space_practice`
-- **Python version**: 3.8-3.10
+- **Python version**: 3.10-3.12
 - **Activate**: `conda activate state_space_practice`
 
 ## Common Commands
@@ -76,6 +76,11 @@ src/state_space_practice/
 - Tests use `pytest` with fixtures in `conftest.py`
 - Use `hypothesis` for property-based testing where appropriate
 - Test numerical properties (PSD covariances, probabilities sum to 1, etc.)
+- Mark any test that runs EM, SGD, or full filter/smoother pipelines with `@pytest.mark.slow`. Fast suite (`-m "not slow"`) should finish in under a minute.
+- **Prefer behavioral assertions over shape/type checks.** A test that only checks `.shape` or `isinstance` on a deterministic constructor will never catch a real bug. Instead test *meaning*: "smoother estimate is closer to truth than prior", "chosen option value increases", "LL improves over iterations".
+- **Use fixtures for shared setup.** If 3+ tests construct the same parameters, extract a fixture. Don't duplicate 20 lines of boilerplate per test.
+- **Statistical tests must actually test statistics.** Don't assert `0 < mean < 1` and call it a Poisson test. Use `assert_allclose` with a meaningful tolerance, or a proper goodness-of-fit test.
+- **Every test must be able to fail.** If an assertion is vacuously true (e.g., `x <= x` when both sides return the same default), the test provides no signal. Add a guard assertion that the interesting condition was actually reached.
 
 ## Numerical precision
 

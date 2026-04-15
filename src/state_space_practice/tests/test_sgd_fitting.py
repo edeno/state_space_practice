@@ -139,7 +139,7 @@ class TestSGDFittableMixin:
         model = _ToyModel(scale=3.0)
         target = jnp.array(5.0)
         optimizer = optax.adam(1e-1)
-        lls = model.fit_sgd(target, optimizer=optimizer, num_steps=200)
+        model.fit_sgd(target, optimizer=optimizer, num_steps=200)
         # Scale should move toward target
         assert abs(model.scale - 5.0) < 0.5
         assert model.is_fitted

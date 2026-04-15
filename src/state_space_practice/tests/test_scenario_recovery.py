@@ -9,8 +9,6 @@ These tests are marked @pytest.mark.slow since EM fitting is expensive.
 Run with: pytest -m slow
 """
 
-from itertools import permutations
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -34,44 +32,9 @@ from state_space_practice.simulate.scenarios import (
     simulate_dim_pp_scenario,
     simulate_dim_scenario,
 )
+from state_space_practice.tests.recovery_helpers import state_segmentation_accuracy
 
 jax.config.update("jax_enable_x64", True)
-
-
-# ============================================================================
-# Utility
-# ============================================================================
-
-
-def state_segmentation_accuracy(
-    true_states: np.ndarray,
-    smoother_discrete_state_prob: np.ndarray,
-) -> float:
-    """Compute best-permutation state segmentation accuracy.
-
-    Parameters
-    ----------
-    true_states : np.ndarray, shape (n_time,)
-        Ground truth discrete state labels (integers).
-    smoother_discrete_state_prob : np.ndarray, shape (n_time, n_discrete_states)
-        Posterior state probabilities from the model.
-
-    Returns
-    -------
-    accuracy : float
-        Best accuracy across all label permutations.
-    """
-    inferred = np.array(jnp.argmax(smoother_discrete_state_prob, axis=1))
-    true = np.array(true_states)
-    n_states = smoother_discrete_state_prob.shape[1]
-
-    best_acc = 0.0
-    for perm in permutations(range(n_states)):
-        remapped = np.array([perm[s] for s in inferred])
-        acc = float(np.mean(remapped == true))
-        best_acc = max(best_acc, acc)
-
-    return best_acc
 
 
 # ============================================================================
@@ -97,7 +60,7 @@ class TestCOMRecovery:
             n_sources=p["n_sources"],
             sampling_freq=p["sampling_freq"],
             freqs=jnp.array(p["freqs"]),
-            auto_regressive_coef=jnp.array(p["damping"]),
+            damping_coef=jnp.array(p["damping"]),
             process_variance=jnp.array(p["process_variance"]),
             measurement_variance=p["measurement_variance"],
         )
@@ -143,7 +106,7 @@ class TestCNMRecovery:
             n_discrete_states=p["n_discrete_states"],
             sampling_freq=p["sampling_freq"],
             freqs=jnp.array(p["freqs"]),
-            auto_regressive_coef=jnp.array(p["damping"]),
+            damping_coef=jnp.array(p["damping"]),
             process_variance=jnp.array(p["process_variance"]),
             measurement_variance=p["measurement_variance"],
             phase_difference=jnp.array(p["phase_difference"]),
@@ -193,7 +156,7 @@ class TestDIMRecovery:
             n_discrete_states=n_disc,
             sampling_freq=p["sampling_freq"],
             freqs=jnp.array(p["freqs"]),
-            auto_regressive_coef=jnp.array(p["damping"]),
+            damping_coef=jnp.array(p["damping"]),
             process_variance=jnp.array(p["process_variance"]),
             measurement_variance=p["measurement_variance"],
             phase_difference=jnp.zeros((n_osc, n_osc, n_disc)),
@@ -243,7 +206,7 @@ class TestCOMPPRecovery:
             sampling_freq=p["sampling_freq"],
             dt=p["dt"],
             freqs=jnp.array(p["freqs"]),
-            auto_regressive_coef=jnp.array(p["damping"]),
+            damping_coef=jnp.array(p["damping"]),
             process_variance=jnp.array(p["process_variance"]),
         )
         lls = model.fit(
@@ -299,7 +262,7 @@ class TestCNMPPRecovery:
             sampling_freq=p["sampling_freq"],
             dt=p["dt"],
             freqs=jnp.array(p["freqs"]),
-            auto_regressive_coef=jnp.array(p["damping"]),
+            damping_coef=jnp.array(p["damping"]),
             process_variance=jnp.array(p["process_variance"]),
             phase_difference=jnp.array(p["phase_difference"]),
             coupling_strength=jnp.array(p["coupling_strength"]),
@@ -364,7 +327,7 @@ class TestDIMPPRecovery:
             sampling_freq=p["sampling_freq"],
             dt=p["dt"],
             freqs=jnp.array(p["freqs"]),
-            auto_regressive_coef=jnp.array(p["damping"]),
+            damping_coef=jnp.array(p["damping"]),
             process_variance=jnp.array(p["process_variance"]),
             phase_difference=jnp.array(p["phase_difference"]),
             coupling_strength=jnp.array(p["coupling_strength"]),

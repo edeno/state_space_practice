@@ -81,6 +81,7 @@ References
 
 import logging
 from dataclasses import dataclass
+import functools
 from typing import Callable
 
 import jax
@@ -396,6 +397,7 @@ def _point_process_predict_and_update(
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 1,
     line_search_beta: float = 0.5,
+    grad_log_intensity_func: Callable[[Array, SpikeObsParams], Array] | None = None,
 ) -> tuple[Array, Array, Array]:
     """Predict with dynamics, then update with spike observations.
 
@@ -424,6 +426,11 @@ def _point_process_predict_and_update(
         Function mapping (state, params) to log-intensities (n_neurons,).
     spike_params : SpikeObsParams
         Spike observation parameters (baseline, weights).
+    grad_log_intensity_func : Callable or None, optional
+        Pre-computed Jacobian of log_intensity_func w.r.t. state.
+        If None, computed inside the update via jax.jacfwd.
+        Pre-computing and passing this avoids redundant autodiff
+        when called inside scan + vmap.
 
     Returns
     -------
@@ -452,6 +459,7 @@ def _point_process_predict_and_update(
         dt,
         log_intensity_func,
         spike_params,
+        grad_log_intensity_func=grad_log_intensity_func,
         include_laplace_normalization=include_laplace_normalization,
         max_newton_iter=max_newton_iter,
         line_search_beta=line_search_beta,
@@ -514,6 +522,10 @@ def _point_process_update_per_discrete_state_pair(
     n_discrete_states = continuous_transition_matrix.shape[-1]
     state_indices = jnp.arange(n_discrete_states)
 
+    # Pre-compute Jacobian once, outside the vmap, to avoid redundant
+    # jax.jacfwd construction inside each state-pair update.
+    _grad_log_intensity = jax.jacfwd(log_intensity_func, argnums=0)
+
     # Create a version of predict_and_update that only takes array arguments
     # (log_intensity_func, spike_params, dt are captured in the closure for vmap)
     def _update(prev_mean, prev_cov, A, Q, params_j):
@@ -529,6 +541,7 @@ def _point_process_update_per_discrete_state_pair(
             include_laplace_normalization,
             max_newton_iter,
             line_search_beta,
+            grad_log_intensity_func=_grad_log_intensity,
         )
 
     def _update_for_state_j(
@@ -1361,6 +1374,14 @@ def update_spike_glm_params(
     return SpikeObsParams(baseline=final_baselines, weights=final_weights)
 
 
+@functools.partial(
+    jax.jit,
+    static_argnames=[
+        "log_intensity_func",
+        "include_laplace_normalization",
+        "max_newton_iter",
+    ],
+)
 def switching_point_process_filter(
     init_state_cond_mean: Array,
     init_state_cond_cov: Array,
@@ -2094,7 +2115,7 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             damping = jnp.full(self.n_oscillators, damping_values[i])
             A = construct_common_oscillator_transition_matrix(
                 freqs=default_freqs,
-                auto_regressive_coef=damping,
+                damping_coef=damping,
                 sampling_freq=self.sampling_freq,
             )
             transition_matrices.append(A)

@@ -23,15 +23,17 @@ References
     behavioral experiments. J Neuroscience 24(2), 447-461.
 """
 
+import functools
 import logging
 from typing import NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
+import jax.scipy.optimize
 import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
-from scipy.optimize import minimize as scipy_minimize
+
 
 from state_space_practice.sgd_fitting import SGDFittableMixin
 
@@ -338,6 +340,7 @@ def compute_choice_log_likelihood(
     return log_probs[:, choice_t]
 
 
+@functools.partial(jax.jit, static_argnames=["n_states", "n_options"])
 def contingency_belief_filter(
     choices: ArrayLike,
     rewards: ArrayLike,
@@ -500,6 +503,7 @@ class SmootherResult(NamedTuple):
     log_likelihood: Array  # scalar
 
 
+@functools.partial(jax.jit, static_argnames=["n_states", "n_options"])
 def contingency_belief_smoother(
     choices: ArrayLike,
     rewards: ArrayLike,
@@ -821,7 +825,6 @@ class ContingencyBeliefModel(SGDFittableMixin):
         # Uses time-varying transition matrices (from covariates if present)
         # and observation offsets (from obs_design_matrix if present).
         if self.state_posterior_ is not None:
-            n_trials = len(choices)
             init_prob = jnp.ones(self.n_states) / self.n_states
 
             # Build per-trial transition matrices
@@ -836,12 +839,17 @@ class ContingencyBeliefModel(SGDFittableMixin):
                         coefs[0], trans_weights, h_t
                     )
                 # predicted[t] = posterior[t-1] @ T_t for t > 0
-                pred_states = []
-                pred_states.append(init_prob)
-                for t in range(1, n_trials):
-                    T_t = _get_trans_t(dm_covs[t])
-                    pred_states.append(self.state_posterior_[t - 1] @ T_t)
-                predicted_state = jnp.stack(pred_states, axis=0)
+                # No sequential dependency: vmap over trials
+                def _predict_one(posterior_prev, h_t):
+                    T_t = _get_trans_t(h_t)
+                    return posterior_prev @ T_t
+
+                pred_rest = jax.vmap(_predict_one)(
+                    self.state_posterior_[:-1], dm_covs[1:]
+                )
+                predicted_state = jnp.concatenate(
+                    [init_prob[None, :], pred_rest], axis=0
+                )
             else:
                 # Stationary
                 trans = centered_softmax(coefs[0])
@@ -1019,36 +1027,38 @@ class ContingencyBeliefModel(SGDFittableMixin):
             reward_counts / jnp.maximum(total_counts, eps), eps, 1 - eps
         )
 
-        # Update transition coefficients per row via Newton-CG
+        # Update transition coefficients per row via JAX BFGS
         alpha = get_transition_prior(
             self.concentration, self.stickiness, self.n_states
         )
-        design = np.asarray(self._transition_design_matrix[:-1])  # (T-1, d)
+        design = jnp.asarray(self._transition_design_matrix[:-1])  # (T-1, d)
+        l2_pen = self.transition_regularization
 
-        for from_state in range(self.n_states):
-            x0 = np.asarray(
-                self.transition_coefficients_[:, from_state, :].ravel()
-            )
-            response = np.asarray(xi[:, from_state, :])
-            row_alpha = np.asarray(alpha[from_state])
-
-            result_opt = scipy_minimize(
-                fun=lambda c: float(dirichlet_neg_log_likelihood(
-                    jnp.array(c), jnp.array(design), jnp.array(response),
-                    jnp.array(row_alpha), self.transition_regularization,
-                )),
-                x0=x0,
-                method="L-BFGS-B",
-                jac=lambda c: np.asarray(_dirichlet_gradient(
-                    jnp.array(c), jnp.array(design), jnp.array(response),
-                    jnp.array(row_alpha), self.transition_regularization,
-                )),
+        def _optimize_one_row(x0_flat, response_row, alpha_row):
+            """Optimize transition coefficients for one from-state."""
+            def loss(c):
+                return dirichlet_neg_log_likelihood(
+                    c, design, response_row, alpha_row, l2_pen
+                )
+            result_opt = jax.scipy.optimize.minimize(
+                loss, x0_flat, method="BFGS",
                 options={"maxiter": 50},
             )
-            n_coef = design.shape[1]
-            self.transition_coefficients_ = self.transition_coefficients_.at[
-                :, from_state, :
-            ].set(jnp.array(result_opt.x.reshape((n_coef, -1))))
+            return result_opt.x
+
+        # vmap over from_state dimension
+        x0_all = self.transition_coefficients_.transpose(1, 0, 2).reshape(
+            self.n_states, -1
+        )  # (n_states, n_coef * (n_states - 1))
+        response_all = xi.transpose(1, 0, 2)  # (n_states, T-1, n_states)
+        alpha_all = alpha  # (n_states, n_states)
+
+        optimized = jax.vmap(_optimize_one_row)(x0_all, response_all, alpha_all)
+        # optimized: (n_states, n_coef * (n_states - 1))
+        n_coef = design.shape[1]
+        self.transition_coefficients_ = optimized.reshape(
+            self.n_states, n_coef, -1
+        ).transpose(1, 0, 2)
 
     def predict_state_posterior(
         self,
