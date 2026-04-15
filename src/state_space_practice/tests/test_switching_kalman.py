@@ -44,6 +44,7 @@ from state_space_practice.switching_kalman import (
     switching_kalman_filter,
     switching_kalman_maximization_step,
     switching_kalman_smoother,
+    switching_kalman_viterbi,
     weighted_sum_of_outer_products,
 )
 
@@ -5148,3 +5149,71 @@ class TestVectorizedELBOEquivalence:
         ent_ref = _compute_posterior_entropy_reference(sm_dp, sm_jdp, sc_covs)
         ent_new = compute_posterior_entropy(sm_dp, sm_jdp, sc_covs)
         np.testing.assert_allclose(float(ent_ref), float(ent_new), atol=1e-10)
+
+
+# --- Viterbi tests ---
+
+
+def test_viterbi_returns_valid_states(simple_skf_model: tuple) -> None:
+    """Viterbi output should be integer states in [0, K) with correct length."""
+    init_mean, init_cov, init_prob, obs, Z, A, Q, H, R = simple_skf_model
+    states = switching_kalman_viterbi(
+        init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+    )
+    n_discrete_states = init_mean.shape[-1]
+    assert states.shape == (obs.shape[0],)
+    assert jnp.all(states >= 0) and jnp.all(states < n_discrete_states)
+
+
+def test_viterbi_agrees_with_filter_argmax(simple_skf_model: tuple) -> None:
+    """On easy problems, Viterbi and filter-argmax should mostly agree."""
+    init_mean, init_cov, init_prob, obs, Z, A, Q, H, R = simple_skf_model
+    states = switching_kalman_viterbi(
+        init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+    )
+    filter_result = switching_kalman_filter(
+        init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+    )
+    filter_argmax = jnp.argmax(filter_result[2], axis=-1)
+    # At least 70% agreement on this easy model
+    agreement = jnp.mean(states == filter_argmax)
+    assert agreement > 0.7, f"Only {float(agreement):.0%} agreement"
+
+
+@pytest.mark.slow
+def test_viterbi_uses_posterior_not_prior() -> None:
+    """Viterbi should condition on the posterior after obs[0], not the prior.
+
+    We set up a model where the prior strongly favors state 0 but the first
+    observation is an extreme outlier that can only come from state 1. If the
+    Viterbi correctly uses the posterior at t=0, it should assign state 1 at
+    t=0. Using the prior would incorrectly assign state 0.
+    """
+    # State 0: mean=0, State 1: mean=100
+    init_mean = jnp.array([[0.0], [100.0]]).T
+    init_cov = jnp.array([[[1.0]], [[1.0]]]).T
+    # Prior strongly favors state 0
+    init_prob = jnp.array([0.99, 0.01])
+
+    A = jnp.array([[[1.0]], [[1.0]]]).T
+    Q = jnp.array([[[0.1]], [[0.1]]]).T
+    H = jnp.array([[[1.0]], [[1.0]]]).T
+    R = jnp.array([[[0.1]], [[0.1]]]).T  # Tight obs noise
+    Z = jnp.array([[0.95, 0.05], [0.05, 0.95]])
+
+    # First obs at 100 — can only come from state 1
+    # Rest of obs also near 100
+    n_time = 20
+    obs = jnp.full((n_time, 1), 100.0)
+
+    states = switching_kalman_viterbi(
+        init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+    )
+
+    # The first state must be 1 (posterior after seeing obs=100)
+    assert int(states[0]) == 1, (
+        f"Viterbi assigned state {int(states[0])} at t=0, "
+        "expected state 1 (observation=100 near state-1 mean=100)"
+    )
+    # All states should be 1
+    assert jnp.all(states == 1), "All states should be 1 given obs=100"

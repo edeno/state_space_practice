@@ -590,7 +590,7 @@ def switching_kalman_viterbi(
     (
         first_state_cond_mean,
         first_state_cond_cov,
-        _,
+        first_discrete_prob,
         _,
         _,
         _,
@@ -602,19 +602,6 @@ def switching_kalman_viterbi(
         measurement_matrix,
         measurement_cov,
     )
-
-    # Per-state log-likelihoods at t=0 (measurement update only, shape (K,))
-    first_state_log_lik = jax.vmap(
-        kalman_measurement_update,
-        in_axes=(-1, -1, None, -1, -1),
-        out_axes=(-1, -1, -1),
-    )(
-        init_state_cond_mean,
-        init_state_cond_cov,
-        obs[0],
-        measurement_matrix,
-        measurement_cov,
-    )[2]  # just the log-likelihoods
 
     # --- Forward pass: collect pair log-likelihoods -----------------------
     def _step(carry, obs_t):
@@ -657,7 +644,7 @@ def switching_kalman_viterbi(
     _, pair_log_liks = jax.lax.scan(
         _step,
         (first_state_cond_mean, first_state_cond_cov,
-         _stabilize_probability_vector(init_discrete_state_prob)),
+         _stabilize_probability_vector(first_discrete_prob)),
         obs[1:],
     )
     # pair_log_liks: (T-1, K, K) where entry (t, i, j) is
@@ -682,9 +669,10 @@ def switching_kalman_viterbi(
         reverse=True,
     )
 
-    # Best first state
+    # Best first state: first_discrete_prob is already p(S_1 | y_1),
+    # so the first-obs likelihood is already encoded — do not add it again.
     first_state = jnp.argmax(
-        jnp.log(init_discrete_state_prob) + first_state_log_lik + best_second_score
+        jnp.log(first_discrete_prob) + best_second_score
     )
 
     # Forward trace
