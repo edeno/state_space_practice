@@ -684,7 +684,8 @@ class TestPointProcessModel:
         )
 
         assert isinstance(ll_history, list)
-        assert len(ll_history) == 5
+        # max_iter iterations + 1 final E-step to sync posteriors
+        assert len(ll_history) == 6
         assert all(isinstance(ll, float) for ll in ll_history)
 
     def test_fit_populates_smoother_results(self, simple_model_data) -> None:

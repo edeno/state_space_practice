@@ -966,6 +966,8 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
         else:
             self.converged_ = False
             logger.warning("Reached maximum iterations without converging.")
+            # Final E-step to sync smoother results with current parameters
+            self._e_step(spikes)
 
         # Restore best parameters if LL decreased at any point
         if best_params is not None and log_likelihoods[-1] < best_ll:

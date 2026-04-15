@@ -2210,6 +2210,9 @@ class PointProcessModel(SGDFittableMixin):
 
         if len(log_likelihoods) == max_iter:
             logger.warning("Reached maximum iterations without converging.")
+            # Final E-step to sync smoother results with current parameters
+            final_ll = float(self._e_step(design_matrix, spike_indicator))
+            log_likelihoods.append(final_ll)
 
         return log_likelihoods
 

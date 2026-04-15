@@ -721,6 +721,13 @@ class BaseModel(ABC, SGDFittableMixin):
             self.converged_ = False
             logger.warning("Reached maximum iterations without converging.")
 
+        # Final E-step to sync smoother results with current parameters.
+        # Without this, the stored posteriors correspond to the previous
+        # iteration's parameters after the last M-step.
+        if not self.converged_:
+            final_ll = float(self._e_step(observations))
+            log_likelihoods.append(final_ll)
+
         return log_likelihoods
 
     # --- SGDFittableMixin protocol (shared by all oscillator subclasses) ---
