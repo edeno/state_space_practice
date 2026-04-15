@@ -89,11 +89,12 @@ def covariate_predict(
 def m_step_input_gain(
     smoothed_values: Array,
     covariates: Array,
+    decay: float = 1.0,
 ) -> Array:
     """Closed-form M-step for input-gain matrix B.
 
-    B_hat = [sum_t delta_m_t u_t'] @ [sum_t u_t u_t']^{-1}
-    where delta_m_t = m_{t|T} - m_{t-1|T}.
+    B_hat = [sum_t r_t u_t'] @ [sum_t u_t u_t']^{-1}
+    where r_t = m_{t|T} - decay * m_{t-1|T} is the dynamics residual.
 
     Parameters
     ----------
@@ -102,8 +103,11 @@ def m_step_input_gain(
     covariates : Array, shape (T, d)
         Covariate matrix. Row t drives the prediction at trial t
         (transition x_{t-1} -> x_t). Uses covariates[1:] paired with
-        diff[i] = m[i+1] - m[i], since diff[i] corresponds to the
-        transition driven by covariates[i+1].
+        the residual at each transition.
+    decay : float, default 1.0
+        AR decay coefficient. When decay != 1, the dynamics are
+        x_t = decay * x_{t-1} + B u_t + w_t, so the target for B
+        is m_t - decay * m_{t-1}, not m_t - m_{t-1}.
 
     Returns
     -------
@@ -115,7 +119,7 @@ def m_step_input_gain(
     terms from the smoother drop out and this simple regression is
     the exact EM M-step for B.
     """
-    diff = smoothed_values[1:] - smoothed_values[:-1]  # (T-1, K-1)
+    diff = smoothed_values[1:] - decay * smoothed_values[:-1]  # (T-1, K-1)
     u = covariates[1:]  # (T-1, d) — covariates[i+1] drives diff[i]
 
     # Cross term: sum delta_m_t u_t'
@@ -689,6 +693,7 @@ class CovariateChoiceModel(SGDFittableMixin):
             if self.n_covariates > 0 and self._covariates is not None:
                 self.input_gain_ = m_step_input_gain(
                     smooth.smoothed_values, self._covariates,
+                    decay=self.decay,
                 )
 
             # M-step for Theta (observation weights)
