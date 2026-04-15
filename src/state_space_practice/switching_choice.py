@@ -736,38 +736,47 @@ class SwitchingChoiceModel(SGDFittableMixin):
             Bu = jnp.zeros((smoother_means.shape[0], k_free))
 
         # Per-state process noise: E[||x_t - A_s x_{t-1} - B u_t||^2 | y_{1:T}]
-        # Full expected sufficient statistic includes covariance terms:
-        #   E[(x_t - A x_{t-1})(x_t - A x_{t-1})^T]
-        #     = (E[x_t] - A E[x_{t-1}])(...)^T + P_t - A C_{t,t-1}^T - C_{t,t-1} A^T + A P_{t-1} A^T
-        # where P = smoother cov, C = smoother cross-cov, and we subtract Bu from the mean residual.
+        # weighted by P(S_t=s | y_{1:T}).
+        #
+        # The correct weight for Q_s aggregates over ALL previous states:
+        #   w_t = sum_i P(S_{t-1}=i, S_t=s | y_{1:T})
+        # and the cross-covariance terms must similarly aggregate over
+        # (i, s) pairs.  See switching_kalman_maximization_step for the
+        # reference implementation using full sufficient statistics.
         for s in range(S):
-            w = gamma[1:, s]  # (T-1,)
+            # Weight: sum over previous states i of joint P(S_{t-1}=i, S_t=s)
+            w = joint[:, :, s].sum(axis=1)  # (T-1,): sum_i P(S_{t-1}=i, S_t=s)
             w_sum = jnp.maximum(jnp.sum(w), eps)
             decay_s = self.decays_[s]
 
-            # Mean residual: E[x_t] - decay_s * E[x_{t-1}] - B u_t
+            # Mean residual: E[x_t|S_t=s] - decay_s * E[x_{t-1}|S_t=s] - B u_t
+            # For the previous-state mean, marginalize over S_{t-1} using
+            # the backward conditional P(S_{t-1}=i | S_t=s, y_{1:T}).
+            # As an approximation consistent with the GPB1 collapsed means,
+            # we use the state-conditional smoother mean at s directly.
             mean_resid = (
                 smoother_means[1:, :, s]
                 - decay_s * smoother_means[:-1, :, s]
                 - Bu[1:]
             )
 
-            # Covariance correction terms (diagonal of the expected outer product)
-            # P_t|T for state s
+            # Covariance correction: aggregate cross-covs over all (i, s) pairs
             P_t = smoother_covs[1:, :, :, s]       # (T-1, K-1, K-1)
             P_tm1 = smoother_covs[:-1, :, :, s]    # (T-1, K-1, K-1)
-            # Cross-covariance: use the (s, s) pair-conditional slice
-            C_t = pair_cross_covs[:, :, :, s, s]    # (T-1, K-1, K-1)
+            # Sum cross-cov over previous states: sum_i joint(i,s) * C(i,s)
+            # pair_cross_covs shape: (T-1, K-1, K-1, S_prev, S_curr)
+            C_t_weighted = jnp.einsum(
+                "ti,tabi->tab", joint[:, :, s], pair_cross_covs[:, :, :, :, s]
+            )  # (T-1, K-1, K-1)
+            # Normalize to get expected cross-cov
+            C_t = C_t_weighted / jnp.maximum(w[:, None, None], eps)
 
-            # E[(x_t - A x_{t-1})(x_t - A x_{t-1})^T] correction trace
-            # = tr(P_t) - 2 * decay * tr(C_t) + decay^2 * tr(P_{t-1})
             cov_trace = (
                 jnp.trace(P_t, axis1=1, axis2=2)
                 - 2 * decay_s * jnp.trace(C_t, axis1=1, axis2=2)
                 + decay_s**2 * jnp.trace(P_tm1, axis1=1, axis2=2)
             )  # (T-1,)
 
-            # Weighted average: mean-residual squared + covariance correction
             mean_sq = jnp.sum(mean_resid**2, axis=1)  # (T-1,)
             q_hat = jnp.sum(w * (mean_sq + cov_trace)) / (w_sum * k_free)
             self.process_noises_ = self.process_noises_.at[s].set(
