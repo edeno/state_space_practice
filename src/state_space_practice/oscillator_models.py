@@ -533,10 +533,13 @@ class BaseModel(ABC, SGDFittableMixin):
             )
 
     def _e_step(self, observations: ArrayLike) -> jax.Array:
-        """Performs the Expectation (E) step of the EM algorithm.
+        """Performs the Expectation (E) step of the approximate EM algorithm.
 
-        Runs the switching Kalman filter and smoother to compute the
-        Expected Sufficient Statistics (ESS) and the marginal log-likelihood.
+        Runs the switching Kalman filter and GPB1/IMM approximate smoother
+        to compute collapsed sufficient statistics and the marginal
+        log-likelihood.  Because the smoother collapses K^2 mixture
+        components to K at each step, the sufficient statistics are
+        approximate and exact EM monotonicity does not hold.
 
         Parameters
         ----------
