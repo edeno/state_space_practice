@@ -334,4 +334,15 @@ class JointHamiltonianModel(BaseModel, SGDFittableMixin):
     def _initialize_process_covariance(self): pass
     def _project_parameters(self): pass
     def _check_sgd_initialized(self): pass
-    def _finalize_sgd(self, *args, **kwargs): pass
+    def _finalize_sgd(self, lfp_data, spike_data=None, **kwargs):
+        """Run filter + smoother to populate fitted states after SGD."""
+        if spike_data is None:
+            raise ValueError("spike_data required for _finalize_sgd")
+        params = self._build_param_spec()[0]
+        means, covs, lls = self.filter(lfp_data, spike_data, params)
+        self.filtered_means_ = means
+        self.filtered_covs_ = covs
+        self.log_likelihood_ = float(jnp.sum(lls))
+        sm_means, sm_covs = self.smooth(lfp_data, spike_data, params)
+        self.smoothed_means_ = sm_means
+        self.smoothed_covs_ = sm_covs

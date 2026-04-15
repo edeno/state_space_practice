@@ -270,4 +270,13 @@ class HamiltonianSpikeModel(BaseModel, SGDFittableMixin):
     def _initialize_process_covariance(self): pass
     def _project_parameters(self): pass
     def _check_sgd_initialized(self): pass
-    def _finalize_sgd(self, *args, **kwargs): pass
+    def _finalize_sgd(self, spikes, **kwargs):
+        """Run filter + smoother to populate fitted states after SGD."""
+        params = self._build_param_spec()[0]
+        means, covs, lls = self.filter(spikes, params)
+        self.filtered_means_ = means
+        self.filtered_covs_ = covs
+        self.log_likelihood_ = float(jnp.sum(lls))
+        sm_means, sm_covs = self.smooth(spikes, params)
+        self.smoothed_means_ = sm_means
+        self.smoothed_covs_ = sm_covs
