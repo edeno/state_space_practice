@@ -19,6 +19,7 @@ References
 from __future__ import annotations
 
 import logging
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -1106,6 +1107,52 @@ def position_decoder_filter(
     (_, _, marginal_ll), (filtered_mean, filtered_cov) = jax.lax.scan(
         _step, init_carry, spikes_arr,
     )
+
+    # Divergence sanity check: flag runaway escapes from the rate-map
+    # extent.  Minor boundary overshoot during normal tracking (within
+    # a few ``sigma_track`` of the edge) is expected near the arena
+    # boundary and does not warrant a warning; we only flag escapes
+    # that are either large in magnitude (>3·sigma_track) or persist
+    # for a substantial fraction of the trajectory (>20%).
+    _x_min = float(rate_maps.x_edges[0])
+    _x_max = float(rate_maps.x_edges[-1])
+    _y_min = float(rate_maps.y_edges[0])
+    _y_max = float(rate_maps.y_edges[-1])
+    # Ignore overshoots smaller than ``sigma_track`` — these are
+    # expected on trajectories that pass near the rate-map boundary
+    # and do not indicate divergence.
+    tol = float(sigma_track)
+    xy_means = np.asarray(filtered_mean[:, :2])
+    out_mask = (
+        (xy_means[:, 0] < _x_min - tol) | (xy_means[:, 0] > _x_max + tol)
+        | (xy_means[:, 1] < _y_min - tol) | (xy_means[:, 1] > _y_max + tol)
+    )
+    n_out = int(out_mask.sum())
+    frac_out = n_out / max(xy_means.shape[0], 1)
+    max_escape_x = float(
+        np.max(
+            np.maximum(xy_means[:, 0] - _x_max, _x_min - xy_means[:, 0])
+        )
+    )
+    max_escape_y = float(
+        np.max(
+            np.maximum(xy_means[:, 1] - _y_max, _y_min - xy_means[:, 1])
+        )
+    )
+    max_escape = max(max_escape_x, max_escape_y)
+    severe = max_escape > 3.0 * sigma_track
+    persistent = frac_out > 0.20
+    if severe or persistent:
+        first_out = int(np.argmax(out_mask))
+        warnings.warn(
+            f"position_decoder: filtered mean left the rate-map extent "
+            f"at {n_out}/{xy_means.shape[0]} time bins "
+            f"(first escape at t={first_out}, max overshoot "
+            f"{max_escape:.1f} cm).  This usually indicates a divergent "
+            f"filter — check q_pos, adaptive_inflation, and init_cov.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     return DecoderResult(
         position_mean=filtered_mean,
