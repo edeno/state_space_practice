@@ -926,13 +926,39 @@ def position_decoder_filter(
             return jnp.concatenate([jac_pos, _vel_pad], axis=1)
         return jac_pos
 
+    # Grid extent for out-of-grid extrapolation of the penalty.
+    _x_min = jax_x_edges[0]
+    _x_max = jax_x_edges[-1]
+    _y_min = jax_y_edges[0]
+    _y_max = jax_y_edges[-1]
+    _penalty_inv_sigma2 = 1.0 / (sigma_track ** 2)
+
     def _penalty_at(pos_xy):
-        """Scalar track-distance penalty at (x, y)."""
-        return _bilinear_log_rate(
+        """Scalar track-distance penalty at (x, y).
+
+        Inside the grid the value is the bilinear-interpolated penalty
+        field (quadratic bowl off-track).  Outside the grid the bilinear
+        value is clamped to the edge; we add an explicit quadratic bowl
+        ``0.5 * (dist_out / sigma_track)^2`` based on how far the
+        position has escaped the grid, so the gradient keeps pulling
+        back after the filter leaves the rate-map support.
+        """
+        interior = _bilinear_log_rate(
             pos_xy, jax_penalty_map, jax_x_edges, jax_y_edges, grid_dx, grid_dy
         )[0]
+        dx_out = (
+            jnp.maximum(pos_xy[0] - _x_max, 0.0)
+            - jnp.maximum(_x_min - pos_xy[0], 0.0)
+        )
+        dy_out = (
+            jnp.maximum(pos_xy[1] - _y_max, 0.0)
+            - jnp.maximum(_y_min - pos_xy[1], 0.0)
+        )
+        exterior = 0.5 * _penalty_inv_sigma2 * (dx_out ** 2 + dy_out ** 2)
+        return interior + exterior
 
     _penalty_grad_fn = jax.grad(_penalty_at)
+    _penalty_value_fn = _penalty_at
 
     # Adaptive inflation configuration — capture as JAX-compatible
     # constants so they can be used inside the traced _step function.
@@ -958,18 +984,26 @@ def position_decoder_filter(
         one_step_cov = A @ cov_prev @ A.T + Q
         one_step_cov = symmetrize(one_step_cov)
 
-        # Incorporate distance-to-track prior into the prediction.
-        # The penalty is a log-prior: log p_track(x) = -penalty(x).
-        # We shift the predicted mean by a natural gradient step:
-        #   new_mean = old_mean - cov @ grad_penalty
-        # This pulls the prediction toward the track before the
-        # Laplace observation update.
+        # Incorporate distance-to-track prior into the prediction as
+        # a proper log-prior: the quadratic bowl ``0.5 (d/σ)^2`` has
+        # local Hessian ≈ ``g g^T / (2 * p)`` where ``g = ∇penalty``
+        # and ``p = penalty``.  Adding this rank-1 precision to the
+        # predicted Gaussian and solving in closed form (Woodbury)
+        # gives a bounded nudge: at distance ``d`` off-track the
+        # mean moves at most ``d`` toward the track regardless of
+        # how inflated the predicted covariance has become.  When
+        # the filter is on-track (p = 0, g = 0) the update is a
+        # no-op by construction.
+        pen_val = _penalty_value_fn(one_step_mean[:2])
         pen_grad_xy = _penalty_grad_fn(one_step_mean[:2])
-        if include_velocity:
-            pen_grad = jnp.concatenate([pen_grad_xy, jnp.zeros(2)])
-        else:
-            pen_grad = pen_grad_xy
-        one_step_mean = one_step_mean - one_step_cov @ pen_grad
+        Sxx = one_step_cov[:2, :2]
+        Sx_all = one_step_cov[:, :2]  # (n_state, 2)
+        Sg = Sx_all @ pen_grad_xy  # (n_state,)
+        gSg = pen_grad_xy @ Sxx @ pen_grad_xy
+        denom = 2.0 * pen_val + gSg + 1e-12
+        one_step_mean = one_step_mean - Sg * (2.0 * pen_val / denom)
+        one_step_cov = one_step_cov - jnp.outer(Sg, Sg) / denom
+        one_step_cov = symmetrize(one_step_cov)
 
         # Adaptive covariance inflation: if the Poisson score at the
         # predicted state is larger than the Fisher information predicts,
