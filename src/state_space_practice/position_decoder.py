@@ -830,7 +830,9 @@ def position_decoder_filter(
         Initial position estimate [x, y] or [x, y, vx, vy].
         If None, uses center of arena.
     init_cov : ArrayLike or None
-        Initial covariance. If None, uses large diagonal.
+        Initial covariance. If None, auto-scales from the rate-map
+        extent so ±3σ spans the arena per dimension (see ``init_cov``
+        construction in ``position_decoder_filter``).
     track_penalty : Array or None
         Pre-built penalty map from :func:`_build_track_penalty`.
         If None, built automatically from rate_maps.
@@ -855,6 +857,12 @@ def position_decoder_filter(
     A, Q = build_position_dynamics(dt, q_pos, q_vel, include_velocity)
     n_state = A.shape[0]
 
+    # Track whether the caller supplied an informative ``init_position``.
+    # When they did, a tight default ``init_cov`` is appropriate (the
+    # first Laplace update should not jump far from the provided seed).
+    # When they didn't, scale ``init_cov`` from the arena extent so the
+    # prior is uninformative within the arena.
+    _init_position_supplied = init_position is not None
     if init_position is None:
         cx = float(rate_maps.x_edges.mean())
         cy = float(rate_maps.y_edges.mean())
@@ -864,7 +872,29 @@ def position_decoder_filter(
             init_position = jnp.array([cx, cy])
 
     if init_cov is None:
-        init_cov = jnp.eye(n_state) * 100.0
+        if _init_position_supplied:
+            # Tight prior: ±3σ ≈ sigma_track.  Users who provide
+            # init_position usually know the starting location well.
+            pos_var = sigma_track ** 2
+            if include_velocity:
+                vel_var = 100.0  # ±3σ = 30 cm/s
+                init_cov = jnp.diag(jnp.array([pos_var, pos_var, vel_var, vel_var]))
+            else:
+                init_cov = jnp.diag(jnp.array([pos_var, pos_var]))
+        else:
+            # Loose prior: ±3σ covers the arena (uninformative default
+            # when init_position falls back to the arena center).
+            x_extent = float(rate_maps.x_edges[-1] - rate_maps.x_edges[0])
+            y_extent = float(rate_maps.y_edges[-1] - rate_maps.y_edges[0])
+            pos_var_x = (x_extent / 6.0) ** 2
+            pos_var_y = (y_extent / 6.0) ** 2
+            if include_velocity:
+                vel_var = 100.0
+                init_cov = jnp.diag(
+                    jnp.array([pos_var_x, pos_var_y, vel_var, vel_var])
+                )
+            else:
+                init_cov = jnp.diag(jnp.array([pos_var_x, pos_var_y]))
 
     # Capture JAX arrays from rate_maps for JIT-compatible closures
     jax_log_rate_maps = rate_maps._jax_log_rate_maps
