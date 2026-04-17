@@ -193,7 +193,6 @@ def get_area_coupling_summary(
         cross_area_norm : Array, shape (n_states,)
             Total cross-area coupling norm per state.
     """
-    n_states = coupling.shape[0]
     area_labels_np = np.asarray(area_labels)
     n_areas = int(area_labels_np.max()) + 1
 

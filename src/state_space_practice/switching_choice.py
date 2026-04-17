@@ -720,7 +720,6 @@ class SwitchingChoiceModel(SGDFittableMixin):
         expects matrix A/Q and returns matrices. Per-state beta and decay
         have no closed-form M-step and are learned via SGD only.
         """
-        gamma = smoother_result[2]  # smoothed discrete probs (T, S)
         joint = smoother_result[3]  # smoother joint (T-1, S, S)
         smoother_means = smoother_result[5]  # state-conditional smoother means (T, K-1, S)
         smoother_covs = smoother_result[6]   # state-conditional smoother covs (T, K-1, K-1, S)
