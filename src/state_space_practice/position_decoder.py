@@ -425,19 +425,20 @@ class PlaceFieldRateMaps:
         x_centers = 0.5 * (x_bin_edges[:-1] + x_bin_edges[1:])
         y_centers = 0.5 * (y_bin_edges[:-1] + y_bin_edges[1:])
 
-        # Store occupancy mask based on raw (unsmoothed) occupancy.
-        # A bin is on-track if the animal was ever there.  We use
-        # smoothed occupancy with a relative threshold to fill in
-        # bins that the animal traversed but didn't dwell in (due to
-        # finite bin size).  The threshold is a fraction of the
-        # median non-zero smoothed occupancy, making it robust to
-        # both short and long recordings.
-        nonzero_occ = occ_smooth[occ_smooth > 0]
-        if len(nonzero_occ) > 0:
-            occ_threshold = 0.1 * np.median(nonzero_occ)
-        else:
-            occ_threshold = 0.0
-        occupancy_mask = occ_smooth > occ_threshold
+        # Store occupancy mask: any bin with positive smoothed
+        # occupancy is treated as on-track.  The gaussian_filter
+        # above already spreads each visited bin by ±~3σ, so
+        # ``occ_smooth > 0`` includes a natural buffer around
+        # traversed bins without an explicit density threshold.
+        # A relative threshold (e.g. ``0.1 * median(nonzero)``)
+        # would mis-classify rarely-visited-but-valid locations
+        # (dead-ends, arm tips, quick pass-throughs) as off-track,
+        # causing the track penalty to actively repel the decoder
+        # from places the animal could legitimately be.  Users
+        # with track geometry (e.g. a ``track_graph``) should
+        # rasterize it and pass a geometry-derived mask through
+        # the ``PlaceFieldRateMaps`` constructor instead.
+        occupancy_mask = occ_smooth > 0
 
         # Store raw histograms as KDE sufficient statistics so the
         # analytical rate evaluation can compute exact kernel-sum

@@ -751,10 +751,17 @@ class TestPositionDecoder:
         true_warm = true_pos[warmup:]
 
         # (1) Real tracking: correlation with truth in both dimensions.
+        # Thresholds calibrated after relaxing the occupancy mask to
+        # ``occ_smooth > 0`` (prior default was ``occ_smooth > 0.1 *
+        # median(nonzero)``).  On this densely-sampled synthetic circle
+        # the old threshold incidentally produced a helpful off-track
+        # annulus that pulled the decoder toward the trajectory; the
+        # new default is more permissive (correct for real mazes with
+        # rarely-visited arms, slightly less helpful here).
         corr_x = np.corrcoef(decoded_warm[:, 0], true_warm[:, 0])[0, 1]
         corr_y = np.corrcoef(decoded_warm[:, 1], true_warm[:, 1])[0, 1]
-        assert corr_x > 0.9, f"corr_x={corr_x:.3f} — decoder is not tracking x"
-        assert corr_y > 0.9, f"corr_y={corr_y:.3f} — decoder is not tracking y"
+        assert corr_x > 0.85, f"corr_x={corr_x:.3f} — decoder is not tracking x"
+        assert corr_y > 0.85, f"corr_y={corr_y:.3f} — decoder is not tracking y"
 
         # (2) No flat-lining: decoder must actually move in both dims.
         decoded_std = decoded_warm.std(axis=0)
@@ -763,12 +770,13 @@ class TestPositionDecoder:
         )
 
         # (3) Median error sanity check.
-        # Threshold calibrated against the new default ``max_newton_iter=3``
-        # which converges each Fisher step more aggressively onto the
-        # (biased) KDE rate-map peaks than the previous ``max_newton_iter=1``
-        # default, slightly increasing steady-state bias on this fixture.
+        # Threshold calibrated twice: first for ``max_newton_iter=3``
+        # (tighter per-step Fisher convergence onto biased KDE peaks),
+        # then relaxed again for the ``occ_smooth > 0`` mask default
+        # (broader on-track region, less penalty pull toward the
+        # circular trajectory on this synthetic fixture).
         error = np.median(np.linalg.norm(decoded_warm - true_warm, axis=1))
-        assert error < 12.0, f"median error {error:.2f} cm"
+        assert error < 14.0, f"median error {error:.2f} cm"
 
     def test_decode_requires_fit(self):
         decoder = PositionDecoder(dt=0.004)
