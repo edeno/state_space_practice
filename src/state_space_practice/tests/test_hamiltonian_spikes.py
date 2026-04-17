@@ -192,3 +192,86 @@ class TestHamiltonianSpikeSGDRecovery:
         m_s, _ = model.smooth(spikes, params)
         assert jnp.all(jnp.isfinite(m_s)), "Smoother produced non-finite values"
         assert m_s.shape == x_true.shape
+
+
+@pytest.mark.slow
+class TestHamiltonianVsLinearBaseline:
+    """Nonlinear Hamiltonian model should beat a linear random-walk
+    PointProcessModel on spike data from nonlinear latent dynamics.
+
+    Closes V1 plan success criterion 5 / Task 6
+    (docs/plans/2026-04-08-hamiltonian-oscillator-state-space-model.md):
+    'The nonlinear Hamiltonian model outperforms a linear random-walk
+    or linear oscillator baseline on at least one nonlinear synthetic
+    benchmark.'
+    """
+
+    def test_nonlinear_beats_linear_on_duffing_oscillator(self):
+        from state_space_practice.point_process_kalman import PointProcessModel
+
+        dt = 0.01
+        n_time = 400
+        n_sources = 6
+        omega = 2 * jnp.pi  # ~1 Hz base oscillation
+        alpha = 4.0  # cubic stiffness → Duffing nonlinearity
+
+        # Symplectic Euler integration of Duffing Hamiltonian:
+        # H = p^2/2 + omega^2 q^2/2 + alpha q^4/4
+        def duffing_step(x, key_i):
+            q, p = x[0], x[1]
+            p_new = p + dt * (-(omega ** 2) * q - alpha * q ** 3)
+            q_new = q + dt * p_new
+            x_new = jnp.array([q_new, p_new])
+            x_new = x_new + jax.random.normal(key_i, (2,)) * 1e-3
+            return x_new, x_new
+
+        x0 = jnp.array([1.0, 0.0])
+        keys = jax.random.split(jax.random.PRNGKey(42), n_time)
+        _, x_true = jax.lax.scan(duffing_step, x0, keys)
+
+        # Linear Poisson readout (both models see identical spikes).
+        C_true = jax.random.normal(jax.random.PRNGKey(10), (n_sources, 2)) * 0.5
+        d_true = -1.5 * jnp.ones(n_sources)
+        spikes = simulate_poisson_spikes(
+            x_true, C_true, d_true, dt=dt, key=jax.random.PRNGKey(77),
+        )
+
+        # --- Nonlinear Hamiltonian fit ---
+        # Warm-start observation params and init state to match what the linear
+        # baseline gets for free via the design matrix. The comparison isolates
+        # the dynamics prior — both models share the same readout knowledge.
+        nonlinear = HamiltonianSpikeModel(
+            n_sources=n_sources, n_oscillators=1, hidden_dims=[8], seed=0,
+            sampling_freq=1.0 / dt,
+        )
+        nonlinear.C = C_true
+        nonlinear.d = d_true
+        nonlinear.init_mean = x0[:, None]
+        nonlinear.omega = omega  # seed frequency near truth
+        nonlinear.fit_sgd(
+            spikes, key=jax.random.PRNGKey(1), num_steps=200,
+            use_filter=False,
+        )
+        nonlinear_ll = float(nonlinear.log_likelihood_)
+
+        # --- Linear random-walk fit ---
+        # Intercept absorbed as a constant third latent dimension:
+        # log_rate[t, n] = C_true[n, :] @ q_p_t + 1.0 * bias_t.
+        design_matrix = jnp.concatenate([
+            jnp.broadcast_to(C_true[None, :, :], (n_time, n_sources, 2)),
+            jnp.ones((n_time, n_sources, 1)),
+        ], axis=-1)
+        linear = PointProcessModel(
+            n_state_dims=3, dt=dt,
+            init_mean=jnp.array([x0[0], x0[1], float(d_true[0])]),
+            init_cov=jnp.eye(3) * 0.1,
+            process_cov=jnp.eye(3) * 1e-3,
+        )
+        linear.fit_sgd(design_matrix, spikes, num_steps=200)
+        linear_ll = float(linear.log_likelihood_)
+
+        assert nonlinear_ll > linear_ll, (
+            f"Nonlinear Hamiltonian LL ({nonlinear_ll:.2f}) should exceed "
+            f"linear random-walk baseline LL ({linear_ll:.2f}) on "
+            f"Duffing-oscillator spike data."
+        )

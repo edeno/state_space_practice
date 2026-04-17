@@ -29,6 +29,8 @@ Both tracks share the same dependency graph. The scientific track has a "minimum
 | RL Covariates | **DONE** (covariate_choice.py, 55 tests — dynamics covariates, obs covariates, decay) |
 | Computational Improvements | **DONE** (parallel smoother, Woodbury, Joseph form, parameter constraints, SGD for choice models) |
 | SGD Fitting All Models | **DONE** (fit_sgd() on all model classes, 80+ SGD tests, eigendecomp→Cholesky PSD fix) |
+| Hamiltonian Oscillator SSM | **DONE** (hamiltonian_spikes/lfp/joint/switching.py, 34 tests, nonlinear>linear baseline verified) |
+| Hamiltonian Review Fixes | **DONE** (all 7 phases: runtime crashes, state layout, PRNG split, Phase 4 weighted-Jacobian smoother, smoke tests, API cleanup) |
 | All others | Not started |
 
 ## Current Priority Queue
@@ -204,6 +206,18 @@ Order 0.6: **DONE.** SGD fitting mixin for all model classes. SGDFittableMixin w
 | O2 | dynamic-neuron-coupling.md | PARTIAL | Med | 2-3 weeks | SGD Fitting (**DONE**) | Not started — unblocked |
 | O3 | principled-stabilization-refactor.md | PARTIAL | Med | 2-3 weeks | None | Not started (deferred) |
 
+### Hamiltonian Track (standalone, nonlinear dynamics)
+
+| Order | Plan | Feasibility | Risk | Effort | Depends On | Status |
+|---|---|---|---|---|---|---|
+| H1 | hamiltonian-oscillator-state-space-model.md | **DONE** | — | — | SGD Fitting (**DONE**), point_process_kalman | Four modules (spikes/lfp/joint/switching) plus `nonlinear_dynamics.py`. Implementation diverged from plan's single-module skeleton. |
+| H2 | hamiltonian-review-fixes.md | **DONE** | — | — | H1 | All 7 phases complete: runtime crashes, multi-osc state layout, PRNG split, weighted-Jacobian smoother, smoke tests for LFP/Joint, API cleanup, full-suite verification. |
+| H3 | square-root-filter-investigation.md | **DEFERRED** | — | — | None | Un-defer only on a concrete trigger (real f32 failure, GPU memory pressure). See plan §"When to un-defer". |
+
+The Hamiltonian family is standalone from `BaseModel` EM by design — see
+[docs/hamiltonian_architecture.md](../hamiltonian_architecture.md) for the
+rationale. Fitting is SGD-only (`.fit_sgd()`); `.fit()` raises `NotImplementedError`.
+
 ### Scientific Track (CA1/mPFC replay and value)
 
 | Order | Plan | Feasibility | Risk | Effort | Depends On |
@@ -237,6 +251,7 @@ Claim: "CA1 alternates between local and nonlocal represented content, and laten
 - **P4 (Joint Learning+Drift)** is SPECULATIVE but scientifically important — links learning rate and representational drift through shared discrete states.
 - **P5 (Adaptive Decoder)** enables long-duration decoding without retraining.
 - **P6 (Regularized Oscillator)** adds structured sparsity penalties to oscillator coupling — blocked until P1 oscillator tasks complete.
+- **H1/H2 (Hamiltonian Track)** are **DONE**. Symplectic nonlinear latent dynamics (leapfrog + EKF linearization) with Gaussian and point-process observations, plus a switching variant. Standalone from `BaseModel` EM; SGD-only fitting. No downstream plan currently depends on this track, so it ran on its own schedule outside the priority queue.
 - **S1-S2** form the minimum publishable path using infrastructure already built (currently deferred).
 - **S3-S4** are ambitious cross-region and multi-timescale models for later.
 
@@ -492,6 +507,28 @@ conda run -n state_space_practice ruff check src/state_space_practice
 Stop condition:
 
 - finite-difference Jacobian checks for multi-region spike observation fail
+
+### Hamiltonian Track Gates
+
+#### H1: Hamiltonian Oscillator State-Space Model — DONE
+
+Exit gate (passes as of 2026-04-16):
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_hamiltonian_spikes.py src/state_space_practice/tests/test_hamiltonian_lfp.py src/state_space_practice/tests/test_hamiltonian_joint.py -v
+```
+
+34 tests pass, including `TestHamiltonianVsLinearBaseline::test_nonlinear_beats_linear_on_duffing_oscillator` which closes V1 plan success criterion 5.
+
+#### H2: Hamiltonian Review Fixes — DONE
+
+Exit gate (passes as of 2026-04-16):
+
+```bash
+conda run -n state_space_practice pytest src/state_space_practice/tests/test_hamiltonian_switching.py -v
+```
+
+All Phase 1–6 items verified: runtime-crash fixes, multi-oscillator state layout, PRNG split, probability-weighted Jacobian in switching smoother (verified by `test_smooth_sensitive_to_transition_asymmetry`), smoke tests for LFP/Joint, API cleanup.
 
 ### Scientific Track Gates
 

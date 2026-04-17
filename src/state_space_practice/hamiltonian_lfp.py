@@ -1,6 +1,9 @@
 """Hamiltonian LFP Model (Gaussian Observation).
 
 Uses Hamiltonian dynamics with a linear-Gaussian readout for voltage data.
+
+See docs/hamiltonian_architecture.md for why this family is standalone
+(no linear-Gaussian EM integration, SGD-only fitting).
 """
 
 import jax
@@ -17,7 +20,7 @@ from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.nonlinear_dynamics import (
     leapfrog_step, apply_mlp, init_mlp_params, ekf_predict_step,
     ekf_predict_step_with_jacobian,
-    get_transition_jacobian, ekf_smooth_step
+    ekf_smooth_step,
 )
 
 class HamiltonianLFPModel(BaseModel, SGDFittableMixin):

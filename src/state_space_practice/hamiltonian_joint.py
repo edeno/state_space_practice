@@ -2,6 +2,9 @@
 
 Unifies continuous voltage (LFP) and sparse point-processes (Spikes)
 under a single shared Hamiltonian latent trajectory.
+
+See docs/hamiltonian_architecture.md for why this family is standalone
+(no linear-Gaussian EM integration, SGD-only fitting).
 """
 
 from functools import partial
@@ -18,7 +21,6 @@ from state_space_practice.nonlinear_dynamics import (
     ekf_predict_step,
     ekf_predict_step_with_jacobian,
     ekf_smooth_step,
-    get_transition_jacobian,
     init_mlp_params,
     leapfrog_step,
 )
