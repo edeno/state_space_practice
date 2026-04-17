@@ -192,6 +192,9 @@ class PlaceFieldRateMaps:
         self.x_edges = np.asarray(x_edges)
         self.y_edges = np.asarray(y_edges)
         self.occupancy_mask = occupancy_mask
+        # Set by ``from_spike_position_data`` when position data is
+        # available; read by decoder entry points when ``q_pos=None``.
+        self.suggested_q_pos: Optional[float] = None
 
         if len(self.x_edges) < 2 or len(self.y_edges) < 2:
             raise ValueError("x_edges and y_edges must have at least 2 points")
@@ -447,7 +450,22 @@ class PlaceFieldRateMaps:
             )
             spike_histograms[n] = spike_map.T
 
-        return cls(
+        # Estimate q_pos (cm^2/s) from observed position increments.
+        # ``var(Δpos)`` equals ``2 * q_pos * dt`` for an independent-step
+        # random walk (it's the variance of a difference of independent
+        # increments), so ``var(Δpos)/dt ≈ 2 * q_pos_true``.  We keep
+        # the upward bias deliberately as a conservative default: an
+        # over-estimated process noise lets the prior accommodate real
+        # motion, whereas under-estimating it collapses the filter onto
+        # the rate-map center.  Callers who want an unbiased estimate
+        # should pass an explicit ``q_pos`` to the decoder.
+        pos_diffs = np.diff(position, axis=0)
+        if len(pos_diffs) > 0:
+            suggested_q_pos = float(np.max(np.var(pos_diffs, axis=0)) / dt)
+        else:
+            suggested_q_pos = 100.0
+
+        instance = cls(
             rate_maps=rate_maps,
             x_edges=x_centers,
             y_edges=y_centers,
@@ -458,6 +476,8 @@ class PlaceFieldRateMaps:
             baseline_rates=baseline_rates,
             occupancy_tau=float(effective_tau),
         )
+        instance.suggested_q_pos = suggested_q_pos
+        return instance
 
     def log_rate(self, position: Array) -> Array:
         """Evaluate log firing rate for all neurons at a position.
@@ -788,7 +808,7 @@ def position_decoder_filter(
     spikes: ArrayLike,
     rate_maps: PlaceFieldRateMaps,
     dt: float,
-    q_pos: float = 100.0,
+    q_pos: Optional[float] = None,
     q_vel: float = 10.0,
     include_velocity: bool = True,
     init_position: Optional[ArrayLike] = None,
@@ -808,13 +828,15 @@ def position_decoder_filter(
         Pre-estimated place fields for each neuron.
     dt : float
         Time bin width in seconds.
-    q_pos : float
+    q_pos : float or None
         Position process noise (cm^2/s). Per-step position variance is
         ``q_pos * dt``. Set this at least as large as the square of the
         animal's typical per-step motion (e.g. ``speed_cm_per_s**2 * dt``)
         so the prior can accommodate the real trajectory rather than
-        collapsing onto the rate-map center. Default 100 corresponds to
-        per-step std of ``sqrt(100 * dt)`` cm.
+        collapsing onto the rate-map center. If None and ``rate_maps``
+        was built from ``from_spike_position_data``, uses the
+        ``suggested_q_pos`` estimated from training-time position
+        increments (``var(Δpos)/dt``).  Otherwise falls back to 100.0.
     q_vel : float
         Velocity process noise (cm^2/s^3).
     include_velocity : bool
@@ -852,6 +874,13 @@ def position_decoder_filter(
         raise ValueError(
             f"spikes has {spikes_arr.shape[1]} columns but rate_maps "
             f"has {rate_maps.n_neurons} neurons"
+        )
+
+    if q_pos is None:
+        q_pos = (
+            rate_maps.suggested_q_pos
+            if rate_maps.suggested_q_pos is not None
+            else 100.0
         )
 
     A, Q = build_position_dynamics(dt, q_pos, q_vel, include_velocity)
@@ -1089,7 +1118,7 @@ def position_decoder_smoother(
     spikes: ArrayLike,
     rate_maps: PlaceFieldRateMaps,
     dt: float,
-    q_pos: float = 100.0,
+    q_pos: Optional[float] = None,
     q_vel: float = 10.0,
     include_velocity: bool = True,
     init_position: Optional[ArrayLike] = None,
@@ -1114,6 +1143,13 @@ def position_decoder_smoother(
         Smoothed position estimates with the same marginal_log_likelihood
         as the forward filter (the smoother does not change it).
     """
+    if q_pos is None:
+        q_pos = (
+            rate_maps.suggested_q_pos
+            if rate_maps.suggested_q_pos is not None
+            else 100.0
+        )
+
     filter_result = position_decoder_filter(
         spikes, rate_maps, dt, q_pos, q_vel,
         include_velocity, init_position, init_cov,
