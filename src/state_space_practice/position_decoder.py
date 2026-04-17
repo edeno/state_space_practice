@@ -62,8 +62,8 @@ class AdaptiveInflationConfig:
     """
 
     enabled: bool = True
-    gain: float = 0.5
-    max_alpha: float = 10.0
+    gain: float = 0.1
+    max_alpha: float = 3.0
     epsilon: float = 1e-6
     min_fisher_trace: float = 1e-8
 
@@ -795,7 +795,7 @@ def position_decoder_filter(
     init_cov: Optional[ArrayLike] = None,
     track_penalty: Optional[Array] = None,
     sigma_track: float = 5.0,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     adaptive_inflation: Optional[AdaptiveInflationConfig] = None,
 ) -> DecoderResult:
     """Decode position from spikes using Laplace-EKF filter.
@@ -1096,7 +1096,7 @@ def position_decoder_smoother(
     init_cov: Optional[ArrayLike] = None,
     track_penalty: Optional[Array] = None,
     sigma_track: float = 5.0,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     adaptive_inflation: Optional[AdaptiveInflationConfig] = None,
 ) -> DecoderResult:
     """Decode position from spikes using Laplace-EKF + RTS smoother.
@@ -1212,7 +1212,7 @@ class PositionDecoder:
         n_grid: int = 50,
         smoothing_sigma: float = 5.0,
         occupancy_tau: float = 0.0,
-        max_newton_iter: int = 1,
+        max_newton_iter: int = 3,
         adaptive_inflation: Optional[AdaptiveInflationConfig] = None,
     ):
         self.dt = dt
