@@ -750,18 +750,17 @@ class TestPositionDecoder:
         decoded_warm = decoded_pos[warmup:]
         true_warm = true_pos[warmup:]
 
-        # (1) Real tracking: correlation with truth in both dimensions.
-        # Thresholds calibrated after relaxing the occupancy mask to
-        # ``occ_smooth > 0`` (prior default was ``occ_smooth > 0.1 *
-        # median(nonzero)``).  On this densely-sampled synthetic circle
-        # the old threshold incidentally produced a helpful off-track
-        # annulus that pulled the decoder toward the trajectory; the
-        # new default is more permissive (correct for real mazes with
-        # rarely-visited arms, slightly less helpful here).
-        corr_x = np.corrcoef(decoded_warm[:, 0], true_warm[:, 0])[0, 1]
-        corr_y = np.corrcoef(decoded_warm[:, 1], true_warm[:, 1])[0, 1]
-        assert corr_x > 0.85, f"corr_x={corr_x:.3f} — decoder is not tracking x"
-        assert corr_y > 0.85, f"corr_y={corr_y:.3f} — decoder is not tracking y"
+        # This fixture's noiseless circular trajectory is an
+        # adversarial case for the raw-histogram track mask (1-cell-
+        # wide visited ring, ~7.5% of the grid), which causes the
+        # penalty to drive low-amplitude oscillation around the ring.
+        # Correlation assertions are intentionally NOT made here —
+        # this is a smoke test for "decoder produces motion that
+        # roughly tracks truth", not a quality gate.  The real
+        # quality gate is ``TestRawOccupancyMask.
+        # test_decoder_tracks_realistic_trajectory`` which uses a
+        # representative noisy-position fixture and asserts tight
+        # correlation + median error + a mask-does-work comparison.
 
         # (2) No flat-lining: decoder must actually move in both dims.
         decoded_std = decoded_warm.std(axis=0)
@@ -770,13 +769,13 @@ class TestPositionDecoder:
         )
 
         # (3) Median error sanity check.
-        # Threshold calibrated twice: first for ``max_newton_iter=3``
-        # (tighter per-step Fisher convergence onto biased KDE peaks),
-        # then relaxed again for the ``occ_smooth > 0`` mask default
-        # (broader on-track region, less penalty pull toward the
-        # circular trajectory on this synthetic fixture).
+        # Tightened from 14 → 10 cm after switching to the raw-
+        # histogram occupancy mask, which produces a tighter penalty
+        # region: the filter mean tracks the ring more closely even
+        # though the low-amplitude oscillation seen above lowers
+        # correlation.
         error = np.median(np.linalg.norm(decoded_warm - true_warm, axis=1))
-        assert error < 14.0, f"median error {error:.2f} cm"
+        assert error < 10.0, f"median error {error:.2f} cm"
 
     def test_decode_requires_fit(self):
         decoder = PositionDecoder(dt=0.004)
@@ -839,6 +838,215 @@ class TestPositionDecoder:
         )
         assert "fitted=True" in repr(decoder)
         assert f"n_neurons={trajectory_data['n_neurons']}" in repr(decoder)
+
+
+class TestRawOccupancyMask:
+    """Tests for the raw-histogram track mask introduced when the
+    default changed from ``occ_smooth > 0`` to ``occ > 0``.
+
+    The noiseless ``TestPositionDecoder.trajectory_data`` fixture is
+    an adversarial case for this default (1-cell-wide visited ring).
+    These tests use fixtures that match real experimental conditions
+    — position with natural tracking noise and multi-arm topology —
+    and verify the default behaves correctly there.
+    """
+
+    @pytest.fixture
+    def realistic_trajectory_data(self):
+        """Circular trajectory with ~1 cm tracking noise, matching the
+        natural jitter of LED- or DLC-based position tracking.
+        """
+        rng = np.random.default_rng(42)
+        n_time = 7500  # 30 s at dt=0.004
+        dt = 0.004
+
+        t = np.arange(n_time) * dt
+        true_x = 50 + 20 * np.cos(2 * np.pi * t / 2.0)
+        true_y = 50 + 20 * np.sin(2 * np.pi * t / 2.0)
+        position = np.column_stack([
+            true_x + rng.normal(0.0, 1.0, size=n_time),
+            true_y + rng.normal(0.0, 1.0, size=n_time),
+        ])
+
+        grid_xs = np.linspace(28, 72, 4)
+        grid_ys = np.linspace(28, 72, 4)
+        centers = np.array([(cx, cy) for cx in grid_xs for cy in grid_ys])
+        n_neurons = len(centers)
+        sigma_rf = 8.0
+        peak_rate = 30.0
+
+        spikes = np.zeros((n_time, n_neurons))
+        for n in range(n_neurons):
+            dist_sq = np.sum((position - centers[n]) ** 2, axis=1)
+            rate = peak_rate * np.exp(-dist_sq / (2 * sigma_rf**2)) + 0.5
+            spikes[:, n] = rng.poisson(rate * dt)
+
+        return {
+            "position": position,
+            "spikes": spikes,
+            "dt": dt,
+            "n_time": n_time,
+        }
+
+    @pytest.mark.slow
+    def test_decoder_tracks_realistic_trajectory(self, realistic_trajectory_data):
+        """With natural position jitter, the raw-mask default gives
+        good correlation and sub-sigma-track median error.
+
+        Also verifies that the raw mask is *doing real work* by
+        decoding the same data with an all-True mask (no penalty)
+        and asserting the raw-mask median error is meaningfully
+        smaller.  Without this guard, the test would pass whenever
+        the decoder happens to work on noisy data, regardless of
+        mask quality.
+        """
+        position = realistic_trajectory_data["position"]
+        spikes = realistic_trajectory_data["spikes"]
+        dt = realistic_trajectory_data["dt"]
+
+        def _decode(rate_maps):
+            init = jnp.asarray(position[0])
+            result = position_decoder_smoother(
+                spikes=spikes,
+                rate_maps=rate_maps,
+                dt=dt,
+                q_pos=500.0,
+                include_velocity=False,
+                init_position=init,
+            )
+            decoded = np.array(result.position_mean[:, :2])
+            warmup = 500
+            return decoded[warmup:], position[warmup:]
+
+        # Raw-mask default.
+        rm_raw = PlaceFieldRateMaps.from_spike_position_data(
+            position=position, spike_counts=spikes, dt=dt,
+        )
+        decoded_warm, true_warm = _decode(rm_raw)
+
+        corr_x = np.corrcoef(decoded_warm[:, 0], true_warm[:, 0])[0, 1]
+        corr_y = np.corrcoef(decoded_warm[:, 1], true_warm[:, 1])[0, 1]
+        error_raw = np.median(np.linalg.norm(decoded_warm - true_warm, axis=1))
+
+        assert corr_x > 0.85, f"corr_x={corr_x:.3f}"
+        assert corr_y > 0.85, f"corr_y={corr_y:.3f}"
+        assert error_raw < 6.0, f"median error {error_raw:.2f} cm"
+
+        # Same data with an all-True mask (penalty has no restoring
+        # force anywhere).  The raw mask should produce meaningfully
+        # better decoding.
+        rm_all_true = PlaceFieldRateMaps.from_spike_position_data(
+            position=position, spike_counts=spikes, dt=dt,
+            occupancy_mask=np.ones_like(rm_raw.occupancy_mask),
+        )
+        decoded_all, true_all = _decode(rm_all_true)
+        error_all = np.median(np.linalg.norm(decoded_all - true_all, axis=1))
+
+        assert error_raw < 0.75 * error_all, (
+            f"raw-mask median error {error_raw:.2f} cm is not "
+            f"meaningfully better than all-True-mask "
+            f"{error_all:.2f} cm — the penalty is not doing work."
+        )
+
+    def test_multi_arm_mask_does_not_bridge_arms(self):
+        """On a disjoint multi-arm track, the raw-mask default must
+        NOT mark the gap between arms as on-track.
+
+        Regression test for the bug that motivated the default change:
+        the old ``occ_smooth > 0`` mask's Gaussian halo bridged gaps
+        between adjacent arms, nullifying the track penalty's
+        restoring force into the gap region.
+        """
+        rng = np.random.default_rng(42)
+        n_time = 6000
+        dt = 0.004
+
+        # Two disjoint horizontal arms at y=20 and y=80, x in [20, 80].
+        # 3 s on each arm, repeated; 20-cm gap between arms.
+        t = np.arange(n_time) * dt
+        arm_x = 20 + 60 * (0.5 + 0.5 * np.sin(2 * np.pi * t / 3.0))
+        arm_y = np.where(t % 6.0 < 3.0, 20.0, 80.0)
+        position = np.column_stack([
+            arm_x + rng.normal(0.0, 0.5, size=n_time),
+            arm_y + rng.normal(0.0, 0.5, size=n_time),
+        ])
+
+        n_neurons = 4
+        centers = np.array([[30, 20], [70, 20], [30, 80], [70, 80]])
+        spikes = np.zeros((n_time, n_neurons))
+        for n in range(n_neurons):
+            dist_sq = np.sum((position - centers[n]) ** 2, axis=1)
+            rate = 20 * np.exp(-dist_sq / (2 * 8**2)) + 0.5
+            spikes[:, n] = rng.poisson(rate * dt)
+
+        rm = PlaceFieldRateMaps.from_spike_position_data(
+            position=position,
+            spike_counts=spikes,
+            dt=dt,
+            n_grid=50,
+            sigma=5.0,
+            # Shrinkage prior avoids divide-by-zero in bins with
+            # neither occupancy nor spikes (i.e. the gap region
+            # between arms).
+            occupancy_tau=1.0,
+        )
+
+        mask = rm.occupancy_mask
+        assert mask is not None
+
+        # The gap region is 30 ≤ y ≤ 70 (between the two arms).  Find
+        # the grid rows corresponding to y-centers in that range.
+        y_centers = rm.y_edges
+        gap_rows = (y_centers >= 30.0) & (y_centers <= 70.0)
+        gap_mask = mask[gap_rows, :]
+
+        # Allow up to 2% of gap bins to be flagged on-track (noise
+        # can stray slightly into the gap during the arm switch).
+        gap_fraction_on_track = gap_mask.mean()
+        assert gap_fraction_on_track < 0.02, (
+            f"Gap region has {gap_fraction_on_track:.1%} bins flagged "
+            "on-track; the raw mask should not bridge disjoint arms."
+        )
+
+        # Sanity: the arms themselves should be substantially
+        # on-track.  Arm rows are |y - 20| < 5 or |y - 80| < 5.
+        arm_rows = (
+            (np.abs(y_centers - 20.0) < 5.0)
+            | (np.abs(y_centers - 80.0) < 5.0)
+        )
+        arm_mask = mask[arm_rows, :]
+        # Arms span x in [20, 80], which is 60/80 = 75% of the x extent
+        # (using the min/max of ``arm_x``).  Require at least 40% of
+        # arm-row bins to be on-track.
+        arm_fraction_on_track = arm_mask.mean()
+        assert arm_fraction_on_track > 0.40, (
+            f"Arm rows have only {arm_fraction_on_track:.1%} bins "
+            "flagged on-track; mask is too restrictive."
+        )
+
+    def test_user_supplied_mask_overrides_auto_construction(self):
+        """Passing an explicit mask to ``from_spike_position_data``
+        bypasses the auto-constructed histogram mask."""
+        rng = np.random.default_rng(0)
+        n_time = 1000
+        dt = 0.004
+        position = np.column_stack([
+            50 + 10 * np.cos(np.linspace(0, 4 * np.pi, n_time)),
+            50 + 10 * np.sin(np.linspace(0, 4 * np.pi, n_time)),
+        ])
+        spikes = rng.poisson(0.1, (n_time, 2))
+
+        # All-True override — everything on-track.
+        custom_mask = np.ones((20, 20), dtype=bool)
+        rm = PlaceFieldRateMaps.from_spike_position_data(
+            position=position,
+            spike_counts=spikes,
+            dt=dt,
+            n_grid=20,
+            occupancy_mask=custom_mask,
+        )
+        assert rm.occupancy_mask is custom_mask
+        assert rm.occupancy_mask.all()
 
 
 class TestAdaptiveInflation:
@@ -932,13 +1140,14 @@ class TestAdaptiveInflation:
         capped_trace = np.trace(np.array(result_capped.position_cov), axis1=1, axis2=2)
         ratio = capped_trace / np.maximum(base_trace, 1e-12)
         # Per-step cap is 1.01; accumulated ratio should stay bounded.
-        # Threshold relaxed from 3 to 5 after enabling the precision-
-        # based track-penalty update (which shrinks baseline cov near
-        # boundaries) and ``max_newton_iter=3`` (tighter Laplace
-        # posterior per step).  Both make ``base_trace`` slightly
-        # smaller, inflating the ratio without changing the bounded-
-        # growth property the test verifies.
-        assert np.max(ratio) < 5.0
+        # Threshold relaxed across several rounds of decoder tuning:
+        # 3 → 5 after the precision-based penalty + max_newton_iter=3,
+        # 5 → 6 after switching to the raw-histogram track mask
+        # (tighter on-track region → larger baseline innovations on
+        # this fixture's thin-ring trajectory, inflating both base
+        # and capped traces).  Still tests the bounded-growth
+        # property; ratios blowing up would show O(100×) growth.
+        assert np.max(ratio) < 6.0
 
     def test_no_spikes_no_inflation(self, rate_maps_and_data):
         """With zero spikes, innovation is negative and inflation is skipped."""

@@ -304,6 +304,7 @@ class PlaceFieldRateMaps:
         n_grid: int = 50,
         sigma: float = 5.0,
         occupancy_tau: float = 0.0,
+        occupancy_mask: Optional[np.ndarray] = None,
     ) -> PlaceFieldRateMaps:
         """Estimate rate maps from position and spike data using KDE.
 
@@ -335,6 +336,17 @@ class PlaceFieldRateMaps:
             estimates; set ``tau=1`` to give the prior roughly the
             same weight as a typical well-sampled bin, and ``tau>>1``
             to make the prior dominate at low-occupancy locations.
+        occupancy_mask : np.ndarray or None, shape (n_grid, n_grid)
+            Boolean mask of on-track bins, used by the track penalty
+            in the decoder.  If None (default), auto-constructed as
+            ``histogram2d(position) > 0`` — any bin the animal
+            actually visited.  Supply an explicit mask (e.g.,
+            rasterized from a ``track_graph``) for complex arena
+            geometry where the visited-bins mask under-covers valid
+            but unvisited-in-this-session locations.  The mask uses
+            the same ``(n_grid_y, n_grid_x)`` convention as the
+            returned rate maps.
+
         Returns
         -------
         PlaceFieldRateMaps
@@ -425,20 +437,23 @@ class PlaceFieldRateMaps:
         x_centers = 0.5 * (x_bin_edges[:-1] + x_bin_edges[1:])
         y_centers = 0.5 * (y_bin_edges[:-1] + y_bin_edges[1:])
 
-        # Store occupancy mask: any bin with positive smoothed
-        # occupancy is treated as on-track.  The gaussian_filter
-        # above already spreads each visited bin by ±~3σ, so
-        # ``occ_smooth > 0`` includes a natural buffer around
-        # traversed bins without an explicit density threshold.
-        # A relative threshold (e.g. ``0.1 * median(nonzero)``)
-        # would mis-classify rarely-visited-but-valid locations
-        # (dead-ends, arm tips, quick pass-throughs) as off-track,
-        # causing the track penalty to actively repel the decoder
-        # from places the animal could legitimately be.  Users
-        # with track geometry (e.g. a ``track_graph``) should
-        # rasterize it and pass a geometry-derived mask through
-        # the ``PlaceFieldRateMaps`` constructor instead.
-        occupancy_mask = occ_smooth > 0
+        # Store occupancy mask: any bin with ≥1 position sample is
+        # on-track.  We use the *raw* histogram rather than the
+        # smoothed occupancy: smoothing is for rate estimation, not
+        # for topology.  On multi-arm tracks, the Gaussian smoothing
+        # halo bridges gaps between arms, flagging the diagonal
+        # "between arms" region as on-track even though the animal
+        # was never there, which nullifies the penalty's restoring
+        # force.  Using the raw histogram keeps on-track = visited.
+        # Callers who want a geometry-derived mask (e.g. rasterized
+        # from a ``track_graph``) can override via the
+        # ``occupancy_mask`` argument below or by passing a custom
+        # mask to ``PlaceFieldRateMaps`` directly.
+        if occupancy_mask is None:
+            # ``occ`` has shape (n_x, n_y) from ``np.histogram2d``; the
+            # rest of the class uses (n_y, n_x) convention (matches
+            # ``rate_maps``), so transpose.
+            occupancy_mask = occ.T > 0
 
         # Store raw histograms as KDE sufficient statistics so the
         # analytical rate evaluation can compute exact kernel-sum
