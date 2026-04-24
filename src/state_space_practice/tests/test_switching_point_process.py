@@ -5190,6 +5190,7 @@ class TestSwitchingSpikeOscillatorModelMStepSpikes:
 class TestSwitchingSpikeOscillatorModelFit:
     """Tests for SwitchingSpikeOscillatorModel.fit() method (Task 7.6)."""
 
+    @pytest.mark.slow
     def test_fit_runs_without_error(self) -> None:
         """fit() should run without error on valid data."""
         from state_space_practice.switching_point_process import (
@@ -5222,6 +5223,7 @@ class TestSwitchingSpikeOscillatorModelFit:
         assert isinstance(log_likelihoods, list)
         assert len(log_likelihoods) == 3
 
+    @pytest.mark.slow
     def test_fit_returns_log_likelihoods_list(self) -> None:
         """fit() should return a list of log-likelihoods, one per iteration."""
         from state_space_practice.switching_point_process import (
@@ -5255,6 +5257,7 @@ class TestSwitchingSpikeOscillatorModelFit:
         for ll in log_likelihoods:
             assert jnp.isfinite(ll)
 
+    @pytest.mark.slow
     def test_fit_log_likelihoods_are_finite(self) -> None:
         """fit() should return finite log-likelihoods."""
         from state_space_practice.switching_point_process import (
@@ -5281,6 +5284,7 @@ class TestSwitchingSpikeOscillatorModelFit:
         for ll in log_likelihoods:
             assert jnp.isfinite(ll), f"Log-likelihood {ll} is not finite"
 
+    @pytest.mark.slow
     def test_fit_em_overall_improvement(self) -> None:
         """fit() should improve log-likelihood over the course of EM iterations.
 
@@ -5340,6 +5344,7 @@ class TestSwitchingSpikeOscillatorModelFit:
             f"(need at least {min_improving})"
         )
 
+    @pytest.mark.slow
     def test_fit_initializes_parameters(self) -> None:
         """fit() should initialize parameters before running EM."""
         from state_space_practice.switching_point_process import (
@@ -5373,6 +5378,7 @@ class TestSwitchingSpikeOscillatorModelFit:
         assert model.init_mean.shape == (n_latent, 2)  # n_discrete_states = 2
         assert model.init_cov.shape == (n_latent, n_latent, 2)
 
+    @pytest.mark.slow
     def test_fit_convergence_tolerance(self) -> None:
         """fit() should stop early if convergence tolerance is reached."""
         from state_space_practice.switching_point_process import (
@@ -5405,6 +5411,7 @@ class TestSwitchingSpikeOscillatorModelFit:
             f"Expected early convergence, got {len(log_likelihoods)} iterations"
         )
 
+    @pytest.mark.slow
     def test_fit_single_discrete_state(self) -> None:
         """fit() should handle single discrete state (non-switching)."""
         from state_space_practice.switching_point_process import (
@@ -5433,6 +5440,7 @@ class TestSwitchingSpikeOscillatorModelFit:
         for ll in log_likelihoods:
             assert jnp.isfinite(ll)
 
+    @pytest.mark.slow
     def test_fit_with_zero_spikes(self) -> None:
         """fit() should handle data with zero spikes (silent neurons)."""
         from state_space_practice.switching_point_process import (
@@ -5460,6 +5468,7 @@ class TestSwitchingSpikeOscillatorModelFit:
         for ll in log_likelihoods:
             assert jnp.isfinite(ll)
 
+    @pytest.mark.slow
     def test_fit_with_high_spike_counts(self) -> None:
         """fit() should handle data with high spike counts."""
         from state_space_practice.switching_point_process import (
@@ -5490,6 +5499,7 @@ class TestSwitchingSpikeOscillatorModelFit:
         for ll in log_likelihoods:
             assert jnp.isfinite(ll)
 
+    @pytest.mark.slow
     def test_fit_reproducibility_same_key(self) -> None:
         """fit() should produce the same results with the same random key."""
         from state_space_practice.switching_point_process import (
@@ -5524,6 +5534,7 @@ class TestSwitchingSpikeOscillatorModelFit:
 
         np.testing.assert_allclose(log_likelihoods1, log_likelihoods2, rtol=1e-5)
 
+    @pytest.mark.slow
     def test_fit_different_keys_produce_different_results(self) -> None:
         """fit() with different keys should produce different results."""
         from state_space_practice.switching_point_process import (
@@ -5559,6 +5570,7 @@ class TestSwitchingSpikeOscillatorModelFit:
         # Results should be different
         assert not np.allclose(log_likelihoods1, log_likelihoods2)
 
+    @pytest.mark.slow
     def test_fit_updates_model_parameters(self) -> None:
         """fit() should update model parameters during EM iterations."""
         from state_space_practice.switching_point_process import (
@@ -5631,6 +5643,7 @@ class TestSwitchingSpikeOscillatorModelFit:
             model.continuous_transition_matrix, initial_A, rtol=1e-10
         )
 
+    @pytest.mark.slow
     def test_fit_validates_spikes_shape_2d(self) -> None:
         """fit() should raise ValueError for non-2D spikes array."""
         from state_space_practice.switching_point_process import (
@@ -5651,6 +5664,7 @@ class TestSwitchingSpikeOscillatorModelFit:
         with pytest.raises(ValueError, match="must be 2D array"):
             model.fit(spikes_1d, max_iter=3, key=jax.random.PRNGKey(42))
 
+    @pytest.mark.slow
     def test_fit_validates_spikes_n_neurons(self) -> None:
         """fit() should raise ValueError when n_neurons doesn't match."""
         from state_space_practice.switching_point_process import (
@@ -5673,6 +5687,7 @@ class TestSwitchingSpikeOscillatorModelFit:
         with pytest.raises(ValueError, match="must match n_neurons"):
             model.fit(spikes_wrong_neurons, max_iter=3, key=jax.random.PRNGKey(42))
 
+    @pytest.mark.slow
     def test_fit_skip_init_preserves_parameters(self) -> None:
         """fit() with skip_init=True should preserve custom parameters."""
         from state_space_practice.switching_point_process import (
@@ -5719,6 +5734,7 @@ class TestSwitchingSpikeOscillatorModelFit:
             model.continuous_transition_matrix, custom_A, rtol=1e-10
         )
 
+    @pytest.mark.slow
     def test_fit_skip_init_false_reinitializes_parameters(self) -> None:
         """fit() with skip_init=False should reinitialize parameters."""
         from state_space_practice.switching_point_process import (
@@ -5983,6 +5999,7 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
                 err_msg=f"Q for state {j} is not symmetric after projection"
             )
 
+    @pytest.mark.slow
     def test_project_parameters_called_during_fit(self) -> None:
         """_project_parameters() should be called during fit() after M-step.
 
@@ -6103,6 +6120,7 @@ class TestSwitchingSpikeOscillatorModelEndToEnd:
     with very sparse spikes can cause GLM M-step weight explosion.
     """
 
+    @pytest.mark.slow
     def test_model_recovers_discrete_states(self) -> None:
         """Model should recover discrete states from simulated data.
 
@@ -6208,6 +6226,7 @@ class TestSwitchingSpikeOscillatorModelEndToEnd:
             f"Expected > 0.50 (better than chance) for data with distinct dynamics."
         )
 
+    @pytest.mark.slow
     def test_model_recovers_oscillator_params(self) -> None:
         """Model should approximately recover oscillator parameters from simulated data.
 
@@ -6325,6 +6344,7 @@ class TestSwitchingSpikeOscillatorModelEndToEnd:
             err_msg="Fitted A spectral radius should be approximately correct"
         )
 
+    @pytest.mark.slow
     def test_model_em_overall_improvement_single_state(self) -> None:
         """EM should improve log-likelihood overall for single discrete state case.
 
@@ -6397,6 +6417,7 @@ class TestSwitchingSpikeOscillatorModelEndToEnd:
         for ll in log_likelihoods:
             assert jnp.isfinite(ll), f"Log-likelihood {ll} is not finite"
 
+    @pytest.mark.slow
     def test_model_fit_on_simulated_data_runs_without_error(self) -> None:
         """Model should fit on simulated data without errors.
 
@@ -6478,6 +6499,7 @@ class TestMilestone8EndToEnd:
     Note: These tests build on Task 7.8 tests but with stricter validation.
     """
 
+    @pytest.mark.slow
     def test_switching_spike_oscillator_em_monotonic(self) -> None:
         """Task 8.1: EM convergence properties with Laplace approximation.
 
@@ -6602,6 +6624,7 @@ class TestMilestone8EndToEnd:
         # can cause many violations, especially in early iterations. The key
         # is that overall improvement occurs (tested above).
 
+    @pytest.mark.slow
     def test_switching_spike_oscillator_recovers_parameters(self) -> None:
         """Task 8.2: Model should recover parameters from simulated data.
 
@@ -6800,6 +6823,7 @@ class TestMilestone8EndToEnd:
         )
         assert jnp.all(init_prob >= 0), "Initial discrete state prob should be non-negative"
 
+    @pytest.mark.slow
     def test_spike_params_end_to_end(self) -> None:
         """End-to-end test exercising shared spike params.
 
@@ -7359,6 +7383,7 @@ class TestEMVerification:
             f"-Q_after={neg_Q_after:.4f}, diff={neg_Q_after - neg_Q_before:.6f}"
         )
 
+    @pytest.mark.slow
     def test_discrete_state_recovery_from_firing_rates(self) -> None:
         """Switching model should identify states with distinct firing rates.
 
@@ -7442,6 +7467,7 @@ class TestEMVerification:
             f"Best |correlation| = {best_corr:.3f}"
         )
 
+    @pytest.mark.slow
     def test_em_convergence_fixed_point(self) -> None:
         """At convergence, one more EM iteration should not change parameters.
 
@@ -7515,6 +7541,7 @@ class TestEMVerification:
             err_msg="Weights should be near fixed point"
         )
 
+    @pytest.mark.slow
     def test_parameter_recovery_from_simulation(self) -> None:
         """Fit model on simulated switching data and verify parameter recovery.
 
@@ -7924,6 +7951,7 @@ class TestGPB2Smoother:
         ]):
             assert jnp.all(jnp.isfinite(result[i])), f"GPB2 {name} not finite"
 
+    @pytest.mark.slow
     def test_gpb2_model_fit_runs(self) -> None:
         """Model.fit() with smoother_type='gpb2' should run without error."""
         from state_space_practice.switching_point_process import (
@@ -7952,6 +7980,7 @@ class TestGPB2Smoother:
 class TestSwitchingSpikeOscillatorSGD:
     """Tests for SwitchingSpikeOscillatorModel.fit_sgd()."""
 
+    @pytest.mark.slow
     def test_sgd_improves_ll(self):
         from state_space_practice.switching_point_process import (
             SwitchingSpikeOscillatorModel,
@@ -7967,6 +7996,7 @@ class TestSwitchingSpikeOscillatorSGD:
         assert len(lls) > 1
         assert lls[-1] > lls[0]
 
+    @pytest.mark.slow
     def test_sgd_params_finite(self):
         from state_space_practice.switching_point_process import (
             SwitchingSpikeOscillatorModel,

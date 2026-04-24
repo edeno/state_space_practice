@@ -1251,6 +1251,7 @@ def test_m_step_two_state_continuous_transition():
     np.testing.assert_allclose(a_est, a_true_stacked, atol=1e-7)
 
 
+@pytest.mark.slow
 def test_em_monotonic_single_state() -> None:
     """
     Tests that EM is monotonically increasing for a single discrete state.
@@ -1352,6 +1353,7 @@ def test_em_monotonic_single_state() -> None:
     assert np.all(differences >= -1e-10), f"Log-likelihood decreased: {differences}"
 
 
+@pytest.mark.slow
 def test_em_monotonic_two_identical_states() -> None:
     """
     Tests EM with two identical discrete states.
@@ -1461,6 +1463,7 @@ def test_em_monotonic_two_identical_states() -> None:
     assert ll_array[-1] > ll_array[0], "EM should improve log-likelihood"
 
 
+@pytest.mark.slow
 def test_em_monotonic_distinguishable_states() -> None:
     """
     Tests EM with two VERY different discrete states.
@@ -1595,6 +1598,7 @@ def test_em_monotonic_distinguishable_states() -> None:
     ), "EM should significantly improve log-likelihood"
 
 
+@pytest.mark.slow
 def test_em_increases_log_likelihood(simple_skf_model: tuple) -> None:
     """
     Tests that the EM algorithm improves log-likelihood overall.
@@ -1703,6 +1707,7 @@ def test_em_increases_log_likelihood(simple_skf_model: tuple) -> None:
     assert max_decrease > -1.0, f"EM had catastrophic decrease: {max_decrease}"
 
 
+@pytest.mark.slow
 def test_elbo_monotonic_single_state() -> None:
     """
     Tests that the ELBO (variational lower bound) is monotonically increasing.

@@ -166,12 +166,9 @@ class TestSmithLearningFilter:
         outcomes, _ = simulated_data
         n_trials = len(outcomes)
 
-        try:
-            prob, mode, variance, one_step_mode, one_step_var = smith_learning_filter(
-                outcomes, max_possible_correct=1
-            )
-        except Exception as e:
-            pytest.skip(f"smith_learning_filter failed (likely JAX tracing issue): {e}")
+        prob, mode, variance, one_step_mode, one_step_var = smith_learning_filter(
+            outcomes, max_possible_correct=1
+        )
 
         assert prob.shape == (n_trials,)
         assert mode.shape == (n_trials,)
@@ -184,10 +181,7 @@ class TestSmithLearningFilter:
         """Probabilities should be in [0, 1]."""
         outcomes, _ = simulated_data
 
-        try:
-            prob, _, _, _, _ = smith_learning_filter(outcomes, max_possible_correct=1)
-        except Exception as e:
-            pytest.skip(f"smith_learning_filter failed: {e}")
+        prob, _, _, _, _ = smith_learning_filter(outcomes, max_possible_correct=1)
 
         assert jnp.all(prob >= 0)
         assert jnp.all(prob <= 1)
@@ -197,12 +191,9 @@ class TestSmithLearningFilter:
         """Variances should be positive."""
         outcomes, _ = simulated_data
 
-        try:
-            _, _, variance, _, one_step_var = smith_learning_filter(
-                outcomes, max_possible_correct=1
-            )
-        except Exception as e:
-            pytest.skip(f"smith_learning_filter failed: {e}")
+        _, _, variance, _, one_step_var = smith_learning_filter(
+            outcomes, max_possible_correct=1
+        )
 
         assert jnp.all(variance > 0)
         assert jnp.all(one_step_var > 0)
@@ -212,12 +203,9 @@ class TestSmithLearningFilter:
         """Filter should not produce NaN values."""
         outcomes, _ = simulated_data
 
-        try:
-            prob, mode, variance, one_step_mode, one_step_var = smith_learning_filter(
-                outcomes, max_possible_correct=1
-            )
-        except Exception as e:
-            pytest.skip(f"smith_learning_filter failed: {e}")
+        prob, mode, variance, one_step_mode, one_step_var = smith_learning_filter(
+            outcomes, max_possible_correct=1
+        )
 
         assert not jnp.any(jnp.isnan(prob))
         assert not jnp.any(jnp.isnan(mode))
@@ -230,15 +218,12 @@ class TestSmithLearningFilter:
         """Custom initial state should affect filter output."""
         outcomes, _ = simulated_data
 
-        try:
-            prob_default, _, _, _, _ = smith_learning_filter(
-                outcomes, init_learning_state=0.0, max_possible_correct=1
-            )
-            prob_high, _, _, _, _ = smith_learning_filter(
-                outcomes, init_learning_state=2.0, max_possible_correct=1
-            )
-        except Exception as e:
-            pytest.skip(f"smith_learning_filter failed: {e}")
+        prob_default, _, _, _, _ = smith_learning_filter(
+            outcomes, init_learning_state=0.0, max_possible_correct=1
+        )
+        prob_high, _, _, _, _ = smith_learning_filter(
+            outcomes, init_learning_state=2.0, max_possible_correct=1
+        )
 
         # First probability should be higher with higher initial state
         assert prob_high[0] > prob_default[0]
@@ -248,15 +233,12 @@ class TestSmithLearningFilter:
         """Higher sigma_epsilon should lead to higher variance."""
         outcomes, _ = simulated_data
 
-        try:
-            _, _, var_low, _, _ = smith_learning_filter(
-                outcomes, sigma_epsilon=0.1, max_possible_correct=1
-            )
-            _, _, var_high, _, _ = smith_learning_filter(
-                outcomes, sigma_epsilon=0.5, max_possible_correct=1
-            )
-        except Exception as e:
-            pytest.skip(f"smith_learning_filter failed: {e}")
+        _, _, var_low, _, _ = smith_learning_filter(
+            outcomes, sigma_epsilon=0.1, max_possible_correct=1
+        )
+        _, _, var_high, _, _ = smith_learning_filter(
+            outcomes, sigma_epsilon=0.5, max_possible_correct=1
+        )
 
         # Average variance should be higher with higher sigma_epsilon
         assert jnp.mean(var_high) > jnp.mean(var_low)
@@ -271,12 +253,9 @@ class TestSmithLearningSmoother:
         outcomes, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes)
 
-        try:
-            prob, mode, variance, one_step_mode, one_step_var = smith_learning_filter(
-                outcomes, max_possible_correct=1
-            )
-        except Exception as e:
-            pytest.skip(f"smith_learning_filter failed: {e}")
+        prob, mode, variance, one_step_mode, one_step_var = smith_learning_filter(
+            outcomes, max_possible_correct=1
+        )
 
         return {
             "mode": mode,
@@ -342,15 +321,12 @@ class TestMaximizationStep:
         outcomes, _ = simulate_learning_data(n_trials=30, seed=42)
         outcomes = jnp.array(outcomes)
 
-        try:
-            prob, mode, variance, one_step_mode, one_step_var = smith_learning_filter(
-                outcomes, max_possible_correct=1
-            )
-            sm_mode, sm_var, _, sm_gain = smith_learning_smoother(
-                mode, variance, one_step_mode, one_step_var
-            )
-        except Exception as e:
-            pytest.skip(f"Filter/smoother failed: {e}")
+        prob, mode, variance, one_step_mode, one_step_var = smith_learning_filter(
+            outcomes, max_possible_correct=1
+        )
+        sm_mode, sm_var, _, sm_gain = smith_learning_smoother(
+            mode, variance, one_step_mode, one_step_var
+        )
 
         return {"mode": sm_mode, "variance": sm_var, "gain": sm_gain}
 
@@ -739,10 +715,7 @@ class TestSmithLearningModelClass:
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
-        try:
-            model.fit(outcomes, max_iter=3)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(outcomes, max_iter=3)
         assert model.is_fitted
 
     def test_repr_before_fit(self) -> None:
@@ -759,10 +732,7 @@ class TestSmithLearningModelClass:
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
-        try:
-            model.fit(outcomes, max_iter=3)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(outcomes, max_iter=3)
         r = repr(model)
         assert "fitted)" in r
         assert "not fitted" not in r
@@ -775,10 +745,7 @@ class TestSmithLearningModelClass:
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
-        try:
-            model.fit(outcomes, max_iter=3)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(outcomes, max_iter=3)
         result = model.plot_learning_curve(jax.random.PRNGKey(0))
         assert isinstance(result, tuple)
         assert len(result) == 2
@@ -792,10 +759,7 @@ class TestSmithLearningModelClass:
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
-        try:
-            model.fit(outcomes, max_iter=5, verbose=True)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(outcomes, max_iter=5, verbose=True)
         captured = capsys.readouterr()
         assert "LL=" in captured.out or "Converged" in captured.out
 
@@ -805,10 +769,7 @@ class TestSmithLearningModelClass:
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
-        try:
-            log_likelihoods = model.fit(outcomes, max_iter=50)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        log_likelihoods = model.fit(outcomes, max_iter=50)
         # If converged, the final log-likelihood entry is from the post-convergence E-step
         if len(log_likelihoods) >= 2:
             # The last two LLs should be very close (converged params + final E-step)
@@ -821,10 +782,7 @@ class TestSmithLearningModelClass:
         outcomes = jnp.array(outcomes_np)
 
         model = SmithLearningModel()
-        try:
-            log_likelihoods = model.fit(outcomes, max_iter=3)
-        except Exception as e:
-            pytest.skip(f"fit() failed (likely JAX tracing issue): {e}")
+        log_likelihoods = model.fit(outcomes, max_iter=3)
 
         assert isinstance(log_likelihoods, list)
         assert len(log_likelihoods) > 0
@@ -836,10 +794,7 @@ class TestSmithLearningModelClass:
         outcomes = jnp.array(outcomes_np)
 
         model = SmithLearningModel()
-        try:
-            model.fit(outcomes, max_iter=3)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(outcomes, max_iter=3)
 
         assert model.smoothed_learning_state_mode is not None
         assert model.smoothed_learning_state_variance is not None
@@ -859,10 +814,7 @@ class TestSmithLearningModelClass:
         outcomes = jnp.array(outcomes_np)
 
         model = SmithLearningModel()
-        try:
-            model.fit(outcomes, max_iter=3)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(outcomes, max_iter=3)
 
         percentiles, prob_above_chance = model.get_learning_curve(
             jax.random.PRNGKey(0), n_samples=100
@@ -914,10 +866,7 @@ class TestSmithLearningModelEdgeCases:
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
-        try:
-            model.fit(outcomes, max_iter=10)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(outcomes, max_iter=10)
         assert model.sigma_epsilon > 0
         assert np.isfinite(model.sigma_epsilon)
 
@@ -936,10 +885,7 @@ class TestSummaryAndScoring:
         """log_likelihood_ should be populated after fit."""
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         model = SmithLearningModel()
-        try:
-            model.fit(jnp.array(outcomes_np), max_iter=5)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(jnp.array(outcomes_np), max_iter=5)
         assert model.log_likelihood_ is not None
         assert np.isfinite(model.log_likelihood_)
         assert model.n_iter_ is not None
@@ -950,10 +896,7 @@ class TestSummaryAndScoring:
         """bic() should return a finite value after fit."""
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         model = SmithLearningModel()
-        try:
-            model.fit(jnp.array(outcomes_np), max_iter=5)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(jnp.array(outcomes_np), max_iter=5)
         bic = model.bic()
         assert np.isfinite(bic)
 
@@ -969,10 +912,7 @@ class TestSummaryAndScoring:
         outcomes_np, _ = simulate_learning_data(n_trials=30, seed=42)
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
-        try:
-            model.fit(outcomes, max_iter=10)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(outcomes, max_iter=10)
         result = model.compare_to_null(outcomes)
         assert isinstance(result, dict)
         expected_keys = {
@@ -999,10 +939,7 @@ class TestSummaryAndScoring:
         )
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
-        try:
-            model.fit(outcomes, max_iter=30)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(outcomes, max_iter=30)
         result = model.compare_to_null(outcomes)
         assert (
             result["model_ll"] > result["null_ll"]
@@ -1014,10 +951,7 @@ class TestSummaryAndScoring:
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
-        try:
-            model.fit(outcomes, max_iter=5)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(outcomes, max_iter=5)
         s = model.summary()
         assert isinstance(s, str)
         assert "sigma_epsilon" in s
@@ -1030,10 +964,7 @@ class TestSummaryAndScoring:
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
-        try:
-            model.fit(outcomes, max_iter=5)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(outcomes, max_iter=5)
         s = model.summary(
             key=jax.random.PRNGKey(0),
             n_correct_responses=outcomes,
@@ -1059,10 +990,7 @@ class TestFindCriterionTrial:
         )
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
-        try:
-            model.fit(outcomes, max_iter=10)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(outcomes, max_iter=10)
         result = model.find_criterion_trial(jax.random.PRNGKey(0))
         # Should return an int or None; if learning is clear, should be int
         assert result is None or isinstance(result, int)
@@ -1072,10 +1000,7 @@ class TestFindCriterionTrial:
         """Should return None when performance never exceeds chance."""
         outcomes = jnp.zeros(30, dtype=jnp.int32)  # All failures
         model = SmithLearningModel()
-        try:
-            model.fit(outcomes, max_iter=5)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(outcomes, max_iter=5)
         result = model.find_criterion_trial(jax.random.PRNGKey(0))
         assert result is None
 
@@ -1123,10 +1048,7 @@ class TestPlotTrialComparisonMatrix:
         outcomes_np, _ = simulate_learning_data(n_trials=15, seed=42)
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
-        try:
-            model.fit(outcomes, max_iter=3)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(outcomes, max_iter=3)
         fig, ax = model.plot_trial_comparison_matrix(
             jax.random.PRNGKey(0), n_samples=100
         )
@@ -1150,10 +1072,7 @@ class TestPlotConvergence:
 
         outcomes_np, _ = simulate_learning_data(n_trials=15, seed=42)
         model = SmithLearningModel()
-        try:
-            model.fit(jnp.array(outcomes_np), max_iter=3)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(jnp.array(outcomes_np), max_iter=3)
         fig, ax = model.plot_convergence()
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
@@ -1176,10 +1095,7 @@ class TestPlotSummary:
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
         model = SmithLearningModel()
-        try:
-            model.fit(outcomes, max_iter=5)
-        except Exception as e:
-            pytest.skip(f"fit() failed: {e}")
+        model.fit(outcomes, max_iter=5)
         fig, axes = model.plot_summary(
             jax.random.PRNGKey(0),
             observed_n_correct=outcomes,

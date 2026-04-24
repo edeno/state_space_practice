@@ -439,8 +439,14 @@ class TestPositionDecoderFilter:
             axis=1,
         ))
 
-        # With sparse spikes, smoother may not always improve substantially
-        assert smoother_error <= filter_error * 1.2
+        # RTS smoother has lower MSE than the forward filter at every
+        # time step; the small slack absorbs numerical noise from the
+        # backward scan on realistic-length sequences.
+        smoother_tol = 1e-2
+        assert smoother_error <= filter_error * (1 + smoother_tol), (
+            f"Smoother error {smoother_error:.4f} exceeds filter error "
+            f"{filter_error:.4f} by more than {smoother_tol * 100:.1f}%."
+        )
 
     def test_smoother_last_matches_filter(self, decoding_data):
         """Last smoother time step should match filter."""

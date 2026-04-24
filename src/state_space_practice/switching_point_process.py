@@ -1232,9 +1232,10 @@ def update_spike_glm_params(
     dt : float
         Time bin width in seconds.
     max_iter : int, default=10
-        Maximum optimization steps per neuron. For the plug-in method, this
-        is the number of Newton-Raphson iterations. For the second-order
-        method (BFGS), this is the BFGS step budget.
+        Maximum optimization steps per neuron. Both the plug-in and the
+        second-order method use Newton steps with analytical gradient and
+        Hessian plus Armijo backtracking line search — there is no BFGS
+        path. This sets the per-neuron Newton step budget.
     smoother_cov : Array | None, shape (n_time, n_latent, n_latent), optional
         Smoothed latent state covariances. Required if use_second_order=True.
     use_second_order : bool, default=False

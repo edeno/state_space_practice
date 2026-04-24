@@ -88,7 +88,9 @@ def _compute_intrinsic_oscillation_block(
     damping_coef : float
         Controls the damping of the oscillation. A value of 1 corresponds to a
         pure oscillation, while a value of 0 corresponds to no oscillation.
-        Values outside [0, 1] are valid inputs but may produce unstable dynamics.
+        Callers such as :func:`diag` warn and clip values outside ``[0, 1]``
+        before invoking this function, so passing an out-of-range value here
+        directly is a programming error.
     sampling_freq : float, optional
         Samples per second, by default 1
 

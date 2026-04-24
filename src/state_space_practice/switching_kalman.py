@@ -66,11 +66,13 @@ def collapse_gaussian_mixture(
     unconditional_mean_x = conditional_means_x @ mixing_weights  # E[X]
     diff_x = conditional_means_x - unconditional_mean_x[:, None]
 
-    unconditional_cov_xx = (
+    # Cov[X] via the law of total covariance:
+    #   Cov[X] = E[Cov[X | S]] + Cov[E[X | S]]
+    unconditional_cov_x = (
         conditional_cov @ mixing_weights + (diff_x * mixing_weights) @ diff_x.T
-    )  # E[XX]
+    )
 
-    return unconditional_mean_x, unconditional_cov_xx
+    return unconditional_mean_x, unconditional_cov_x
 
 
 def collapse_gaussian_mixture_cross_covariance(
@@ -88,7 +90,7 @@ def collapse_gaussian_mixture_cross_covariance(
     conditional_means_y : jax.Array, shape (n_dims, n_discrete_states)
         E[Y | S = j]
     conditional_cross_cov : jax.Array, shape (n_dims, n_dims, n_discrete_states)
-        E[X,Y^T | S = j], Conditional expectation of the outer product.
+        Cov[X, Y | S = j], conditional cross-covariance per discrete state.
     mixing_weights : jax.Array, shape (n_discrete_states,)
         P[S = j]
 
@@ -99,7 +101,7 @@ def collapse_gaussian_mixture_cross_covariance(
     unconditional_mean_y : jax.Array, shape (n_dims,)
         E[Y]
     unconditional_cov_xy : jax.Array, shape (n_dims, n_dims)
-        E[X,Y^T]
+        Cov[X, Y]
     """
 
     unconditional_mean_x = conditional_means_x @ mixing_weights  # E[X]
@@ -108,9 +110,11 @@ def collapse_gaussian_mixture_cross_covariance(
     diff_x = conditional_means_x - unconditional_mean_x[:, None]
     diff_y = conditional_means_y - unconditional_mean_y[:, None]
 
+    # Cov[X, Y] via the law of total covariance:
+    #   Cov[X, Y] = E[Cov[X, Y | S]] + Cov[E[X | S], E[Y | S]]
     unconditional_cov_xy = (
         conditional_cross_cov @ mixing_weights + (diff_x * mixing_weights) @ diff_y.T
-    )  # E[XY]
+    )
 
     return unconditional_mean_x, unconditional_mean_y, unconditional_cov_xy
 
@@ -1130,12 +1134,17 @@ def switching_kalman_smoother_gpb2(
 ]:
     """GPB2 switching Kalman smoother — carries S² pair-conditional structure.
 
-    Same interface and return types as switching_kalman_smoother (GPB1), but
-    maintains pair-conditional (S_t, S_{t+1}) Gaussians through the backward
+    Maintains pair-conditional (S_t, S_{t+1}) Gaussians through the backward
     pass instead of collapsing to state-conditional at each step. This
     provides better numerical stability for long sequences with sparse
     observations (smoother gain > 1) by avoiding the aggressive GPB1 collapse
     that introduces unbounded Var[E[x|S]] growth.
+
+    Return interface differs from :func:`switching_kalman_smoother` (GPB1):
+    GPB2 returns 11 arrays (see Returns in the type annotation above), adding
+    ``pair_cond_smoother_covs_mstep`` and ``next_pair_cond_smoother_means``
+    on top of GPB1's 9. Callers expecting GPB1's tuple cannot substitute GPB2
+    without adjusting their unpacking.
 
     Computational cost is ~2x GPB1 for S=2 (8 vs 4 RTS updates per step).
     """

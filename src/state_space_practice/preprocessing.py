@@ -89,9 +89,7 @@ def bin_spike_times(
     Returns
     -------
     spikes : array, shape (n_time, n_neurons)
-        Spike counts per bin for each neuron. Note: unlike latent state
-        arrays ``(n_latent, n_time)``, spike observations use
-        ``(n_time, n_neurons)`` following observation-matrix conventions.
+        Spike counts per bin for each neuron.
 
     Warnings
     --------

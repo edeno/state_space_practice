@@ -919,9 +919,19 @@ def stochastic_point_process_filter(
     $$ y_{n,k} \\sim \\text{Poisson}(\\lambda_{n,k} \\Delta t) $$
 
     The filter uses a local Gaussian approximation (Laplace-EKF approach)
-    at each update step, utilizing the gradient and Hessian of the
-    log-likelihood. It implements a single Newton-Raphson like step
-    per time bin.
+    at each update step. It implements a single Fisher-scoring step per
+    time bin: the update uses the *expected* Hessian
+    $E[\\nabla^2 \\log p]$ of the Poisson log-likelihood (equivalently, the
+    negative of the inverse-intensity-weighted outer product) rather than
+    the observed Hessian, which is what makes this Fisher scoring rather
+    than Newton-Raphson. The practical effect is that the Hessian is always
+    negative semidefinite, so no damping or trust-region safeguarding is
+    needed for PSD of the covariance update.
+
+    If ``max_newton_iter > 1`` the same Fisher-scoring step is iterated
+    per time bin with a fixed-length backtracking scan. For a true Newton
+    step with observed Hessian + Armijo line search, see
+    :func:`switching_point_process._single_neuron_glm_step_second_order`.
 
     Multi-Neuron Support
     --------------------
@@ -1772,12 +1782,18 @@ def _stochastic_point_process_smoother_backward(
 
 
 @jax.jit
-def kalman_maximization_step(
+def dynamics_only_m_step(
     smoother_mean: ArrayLike,
     smoother_cov: ArrayLike,
     smoother_cross_cov: ArrayLike,
 ) -> tuple[Array, Array, Array, Array]:
-    """Maximization step for the Kalman filter.
+    """Dynamics-only M-step: update (A, Q, init_mean, init_cov) from smoother outputs.
+
+    Unlike :func:`state_space_practice.kalman.kalman_maximization_step`, this
+    variant does not update measurement parameters (H, R) — only the latent
+    dynamics (transition matrix, process covariance) and the initial state.
+    Used by point-process / spike models whose observation model is a GLM
+    fit separately, not a linear-Gaussian emission.
 
     Parameters
     ----------
@@ -1852,7 +1868,9 @@ def get_confidence_interval(
     posterior_mean : ArrayLike, shape (n_time, n_params)
     posterior_covariance : ArrayLike, shape (n_time, n_params, n_params)
     alpha : float, optional
-        Confidence level, by default 0.01
+        Significance level in ``(0, 1)``, by default ``0.01``. Returns a
+        ``1 - alpha`` confidence interval (i.e. the default 0.01 gives a
+        99% CI, not a 1% CI).
     """
     posterior_mean = jnp.asarray(posterior_mean)
     posterior_covariance = jnp.asarray(posterior_covariance)
@@ -2121,7 +2139,7 @@ class PointProcessModel(SGDFittableMixin):
         ):
             raise RuntimeError("Must run E-step before M-step")
 
-        transition_matrix, process_cov, init_mean, init_cov = kalman_maximization_step(
+        transition_matrix, process_cov, init_mean, init_cov = dynamics_only_m_step(
             self.smoother_mean,
             self.smoother_cov,
             self.smoother_cross_cov,
@@ -2131,7 +2149,7 @@ class PointProcessModel(SGDFittableMixin):
             self.transition_matrix = transition_matrix
 
         if self.update_process_cov:
-            # kalman_maximization_step already applies stabilize_covariance
+            # dynamics_only_m_step already applies stabilize_covariance
             # with min_eigenvalue=1e-8
             self.process_cov = process_cov
 

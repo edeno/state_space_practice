@@ -966,7 +966,7 @@ class PlaceFieldModel(SGDFittableMixin):
 
         When A is fixed to identity (random walk), Q is computed directly as
         the expected variance of state increments under the posterior, rather
-        than using the unconstrained ML formula from kalman_maximization_step.
+        than using the unconstrained ML formula from dynamics_only_m_step.
         This avoids a small bias from the A-Q coupling in the general formula.
 
         The diagonal/isotropic constraint on Q is then applied, discarding
@@ -1255,7 +1255,7 @@ class PlaceFieldModel(SGDFittableMixin):
             # Re-detect block structure after the M-step, unconditionally.
             # The primary case where the M-step can break block-
             # diagonality is update_transition_matrix=True (where
-            # kalman_maximization_step returns both a dense A_new and a
+            # dynamics_only_m_step returns both a dense A_new and a
             # dense Q_new that are not diagonalized before being
             # written to self.process_cov). But unconditional re-
             # detection is cheap relative to the E-step (one host-side

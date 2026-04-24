@@ -62,7 +62,7 @@ src/state_space_practice/
 - Use `jax.numpy` (imported as `jnp`) instead of NumPy for array operations
 - Functions should be JIT-compatible; use `jax.lax.scan` for loops
 - Use `vmap` for batching operations across array dimensions
-- Arrays use shape convention: `(n_latent, n_time)` or `(n_latent, n_latent, n_discrete_states)`
+- Arrays use shape convention: time axis leads, discrete-state axis trails. Sequences are `(n_time, n_latent)`, per-time covariances are `(n_time, n_latent, n_latent)`, and switching/discrete quantities place the discrete-state axis last — e.g. `(n_latent, n_discrete_states)` for per-state means and `(n_latent, n_latent, n_discrete_states)` for per-state covariances.
 - use jax skill
 
 ### Type Annotations

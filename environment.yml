@@ -4,7 +4,7 @@ channels:
 - franklab
 - edeno
 dependencies:
-- python >=3.8,<3.11
+- python >=3.10,<3.13
 - numpy
 - scipy
 - jax

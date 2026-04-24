@@ -170,7 +170,9 @@ def get_confidence_interval(
     posterior_mode : ArrayLike, shape (n_time, n_params)
     posterior_covariance : ArrayLike, shape (n_time, n_params, n_params)
     alpha : float, optional
-        Confidence level, by default 0.01
+        Significance level in ``(0, 1)``, by default ``0.01``. Returns a
+        ``1 - alpha`` confidence interval (i.e. the default 0.01 gives a
+        99% CI, not a 1% CI).
     """
     posterior_mode = jnp.asarray(posterior_mode)
     posterior_covariance = jnp.asarray(posterior_covariance)

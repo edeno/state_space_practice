@@ -20,7 +20,7 @@ from state_space_practice.point_process_kalman import (
     _stochastic_point_process_smoother_block_diagonal,
     _validate_filter_numerics,
     get_confidence_interval,
-    kalman_maximization_step,
+    dynamics_only_m_step,
     log_conditional_intensity,
     steepest_descent_point_process_filter,
     stochastic_point_process_filter,
@@ -367,7 +367,7 @@ class TestStochasticPointProcessSmoother:
 
 
 class TestKalmanMaximizationStep:
-    """Tests for the kalman_maximization_step function."""
+    """Tests for the dynamics_only_m_step function."""
 
     @pytest.fixture
     def smoother_outputs(self, point_process_test_data):
@@ -398,7 +398,7 @@ class TestKalmanMaximizationStep:
         """M-step outputs should have correct shapes."""
         s = smoother_outputs
 
-        transition_matrix, process_cov, init_mean, init_cov = kalman_maximization_step(
+        transition_matrix, process_cov, init_mean, init_cov = dynamics_only_m_step(
             s["smoother_mean"],
             s["smoother_cov"],
             s["smoother_cross_cov"],
@@ -414,7 +414,7 @@ class TestKalmanMaximizationStep:
         """M-step should not produce NaN values."""
         s = smoother_outputs
 
-        transition_matrix, process_cov, init_mean, init_cov = kalman_maximization_step(
+        transition_matrix, process_cov, init_mean, init_cov = dynamics_only_m_step(
             s["smoother_mean"],
             s["smoother_cov"],
             s["smoother_cross_cov"],
@@ -429,7 +429,7 @@ class TestKalmanMaximizationStep:
         """Process covariance should be symmetric."""
         s = smoother_outputs
 
-        _, process_cov, _, _ = kalman_maximization_step(
+        _, process_cov, _, _ = dynamics_only_m_step(
             s["smoother_mean"],
             s["smoother_cov"],
             s["smoother_cross_cov"],
@@ -441,7 +441,7 @@ class TestKalmanMaximizationStep:
         """Initial covariance should be symmetric."""
         s = smoother_outputs
 
-        _, _, _, init_cov = kalman_maximization_step(
+        _, _, _, init_cov = dynamics_only_m_step(
             s["smoother_mean"],
             s["smoother_cov"],
             s["smoother_cross_cov"],
@@ -453,7 +453,7 @@ class TestKalmanMaximizationStep:
         """Initial mean should equal first smoother mean."""
         s = smoother_outputs
 
-        _, _, init_mean, _ = kalman_maximization_step(
+        _, _, init_mean, _ = dynamics_only_m_step(
             s["smoother_mean"],
             s["smoother_cov"],
             s["smoother_cross_cov"],
@@ -465,7 +465,7 @@ class TestKalmanMaximizationStep:
         """Initial covariance should equal first smoother covariance."""
         s = smoother_outputs
 
-        _, _, _, init_cov = kalman_maximization_step(
+        _, _, _, init_cov = dynamics_only_m_step(
             s["smoother_mean"],
             s["smoother_cov"],
             s["smoother_cross_cov"],
@@ -875,7 +875,7 @@ class TestPointProcessModel:
 
 
 class TestKalmanMaximizationStepMStepRegression:
-    """Regression tests for the kalman_maximization_step M-step bug fix.
+    """Regression tests for the dynamics_only_m_step M-step bug fix.
 
     The bug was that the beta computation was missing the outer products of
     consecutive means. This caused incorrect estimation of A and Q.
@@ -910,7 +910,7 @@ class TestKalmanMaximizationStepMStepRegression:
         smoother_cross_cov = jnp.stack([jnp.eye(n_params) * 0.0005] * (n_time - 1))
 
         # Run M-step
-        A_est, Q_est, _, _ = kalman_maximization_step(
+        A_est, Q_est, _, _ = dynamics_only_m_step(
             smoother_mean, smoother_cov, smoother_cross_cov
         )
 
@@ -943,14 +943,14 @@ class TestKalmanMaximizationStepMStepRegression:
         smoother_cov = jnp.stack([jnp.eye(n_params) * 0.01] * n_time)
         smoother_cross_cov = jnp.stack([jnp.eye(n_params) * 0.005] * (n_time - 1))
 
-        A_increasing, _, _, _ = kalman_maximization_step(
+        A_increasing, _, _, _ = dynamics_only_m_step(
             smoother_mean_increasing, smoother_cov, smoother_cross_cov
         )
 
         # Case 2: States that are constant (all zeros)
         smoother_mean_constant = jnp.zeros((n_time, n_params))
 
-        A_constant, _, _, _ = kalman_maximization_step(
+        A_constant, _, _, _ = dynamics_only_m_step(
             smoother_mean_constant, smoother_cov, smoother_cross_cov
         )
 
