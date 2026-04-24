@@ -155,6 +155,35 @@ class TestMultinomialChoiceFilter:
         assert result.marginal_log_likelihood < 0
 
 
+class TestMultinomialChoiceFilterInputValidation:
+    """C2 fix: out-of-range choices must raise, not silently produce a
+    zero indicator (= ``no observation`` update that leaves the posterior
+    unchanged).
+    """
+
+    def test_negative_choice_raises(self):
+        choices = np.array([0, 1, -1, 2])
+        with pytest.raises(ValueError, match=r"choices must be in \[0, 3\)"):
+            multinomial_choice_filter(choices, n_options=3)
+
+    def test_out_of_range_choice_raises(self):
+        choices = np.array([0, 1, 3, 2])  # n_options=3 → valid range [0, 3)
+        with pytest.raises(ValueError, match=r"choices must be in \[0, 3\)"):
+            multinomial_choice_filter(choices, n_options=3)
+
+    def test_smoother_inherits_validation(self):
+        """Smoother delegates to the filter, so the same guard fires."""
+        choices = np.array([0, 1, -1, 2])
+        with pytest.raises(ValueError, match=r"choices must be in \[0, 3\)"):
+            multinomial_choice_smoother(choices, n_options=3)
+
+    def test_valid_boundary_choices_ok(self):
+        """Boundary values 0 and n_options-1 must pass."""
+        choices = np.array([0, 2, 0, 2, 1])  # n_options=3 → [0, 1, 2] valid
+        result = multinomial_choice_filter(choices, n_options=3)
+        assert jnp.isfinite(result.marginal_log_likelihood)
+
+
 class TestMultinomialChoiceSmoother:
     def test_output_shapes(self):
         rng = np.random.default_rng(42)

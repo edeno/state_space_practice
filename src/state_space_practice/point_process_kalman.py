@@ -28,9 +28,8 @@ References
     Neural Computation 16, 971-998.
 """
 
-import logging
-import warnings
 import functools
+import logging
 from typing import Callable, NamedTuple, Optional
 
 import jax
@@ -46,7 +45,10 @@ from state_space_practice.kalman import (
     symmetrize,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import check_converged
+from state_space_practice.utils import (
+    _validate_filter_numerics as _validate_filter_numerics_impl,
+    check_converged,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,112 +58,20 @@ def _validate_filter_numerics(
     n_time: int,
     stacklevel: int = 3,
 ) -> None:
-    """Validate init_cov positive definiteness + warn about f32 numerical risk.
+    """Laplace-EKF wrapper around the shared validator in ``utils``.
 
-    Raises
-    ------
-    ValueError
-        If ``init_covariance`` is non-square, not symmetric, or has a
-        non-positive minimum eigenvalue. The filter's Cholesky-based
-        updates require *strict* positive definiteness — a rank-deficient
-        or indefinite input will NaN on the first Cholesky, so there is
-        no point running the forward pass.
-
-    Warns
-    -----
-    UserWarning
-        If ``init_covariance.dtype`` is ``float32`` AND the problem is
-        long enough / ill-conditioned enough that accumulated covariance
-        roundoff is likely to drive the predicted covariance below PSD
-        during the scan. The warning names the three risk factors
-        (T, n_state, cond) and tells the user the fix: enable float64
-        BEFORE importing the library.
-
-    Notes
-    -----
-    This helper runs at the top of each public entry point (``fit``,
-    ``fit_sgd``) once per call, then inner call sites pass
-    ``validate_inputs=False`` to skip re-validation. This matters for
-    two reasons:
-
-    1. The SGD loss function runs inside ``jax.jit``, which forbids the
-       ``eigvalsh → float(...)`` conversion used here. Inner calls must
-       bypass the check entirely.
-    2. EM iterations re-run the E-step hundreds of times on unchanged
-       ``init_cov``, so per-iteration re-validation wastes O(d^3) work
-       per iteration.
-
-    The pattern is: each model class's ``fit`` / ``fit_sgd`` validates
-    explicitly at the top of the public API call, and threads
-    ``validate_inputs=False`` through to inner ``_e_step``, ``_sgd_loss_fn``,
-    and ``_finalize_sgd`` methods.
+    See :func:`state_space_practice.utils._validate_filter_numerics` for the
+    full contract. Kept as a module-level thin wrapper so existing
+    ``from state_space_practice.point_process_kalman import
+    _validate_filter_numerics`` imports continue to work, and so the f32
+    warning names this filter specifically.
     """
-    if init_covariance.ndim != 2 or init_covariance.shape[0] != init_covariance.shape[1]:
-        raise ValueError(
-            f"init_covariance must be a square 2D matrix, got shape "
-            f"{init_covariance.shape}"
-        )
-
-    # Eigenvalue check. eigvalsh is O(d^3) but only runs once per filter
-    # invocation, vs d^3 per scan step — negligible.
-    init_cov_sym = symmetrize(init_covariance)
-    eigs = jnp.linalg.eigvalsh(init_cov_sym)
-    min_eig = float(eigs.min())
-    max_eig = float(eigs.max())
-
-    if min_eig <= 0:
-        raise ValueError(
-            f"init_covariance is not positive definite "
-            f"(min eigenvalue {min_eig:g}). The filter's Cholesky-based "
-            f"updates require strict positive definiteness; a rank-"
-            f"deficient or indefinite matrix will NaN on the first step. "
-            f"Check the warm-start or init_cov_scale parameter, or "
-            f"supply a known-PD matrix."
-        )
-
-    # Condition number. Cap the denominator to avoid divide-by-zero on
-    # an (already-filtered) perfectly-rank-deficient matrix.
-    cond = max_eig / max(min_eig, 1e-300)
-    n_state = int(init_covariance.shape[0])
-
-    # Check precision: the filter's scan body inherits its dtype from
-    # init_covariance (via jnp.asarray internally). If the caller passed
-    # an f32 array — either because jax_enable_x64 is off, or because
-    # they explicitly cast — the inner Cholesky solves and matrix
-    # products accumulate f32 roundoff. f64 arrays do not have this
-    # issue in practice.
-    is_f32 = init_covariance.dtype == jnp.float32
-
-    if is_f32:
-        # Rough upper bound on per-bin absolute covariance roundoff from
-        # the predict-step congruence (A @ P @ A^T + Q) and the Laplace
-        # update (psd_solve'd precision). The constants come from
-        # standard error-analysis bounds for Cholesky; we use a
-        # conservative ~sqrt(n_state) factor and f32 machine epsilon
-        # ~1.2e-7. Accumulated over n_time bins (random-walk model),
-        # total roundoff ~ n_time * sqrt(n_state) * eps * max_eig.
-        f32_eps = 1.2e-7
-        worst_roundoff = (
-            float((n_time * n_state) ** 0.5) * f32_eps * max_eig
-        )
-        if worst_roundoff > 0.5 * min_eig:
-            warnings.warn(
-                f"stochastic_point_process_filter running in float32 with "
-                f"a long / ill-conditioned problem: "
-                f"T={n_time}, n_state={n_state}, "
-                f"init_cov condition number {cond:.1e}, "
-                f"min_eig {min_eig:.2e}, max_eig {max_eig:.2e}. "
-                f"Estimated accumulated covariance roundoff "
-                f"({worst_roundoff:.2e}) exceeds half of min_eig, which "
-                f"means the predict step's covariance is likely to lose "
-                f"PSD during the scan and produce NaN. Enable float64 "
-                f"BEFORE importing state_space_practice:\n"
-                f"    import jax\n"
-                f"    jax.config.update('jax_enable_x64', True)\n"
-                f"    # now import state_space_practice models",
-                UserWarning,
-                stacklevel=stacklevel,
-            )
+    _validate_filter_numerics_impl(
+        init_covariance,
+        n_time,
+        stacklevel=stacklevel + 1,
+        filter_name="stochastic_point_process_filter",
+    )
 
 
 def _is_block_diagonal(

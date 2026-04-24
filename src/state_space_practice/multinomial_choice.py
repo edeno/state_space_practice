@@ -36,6 +36,7 @@ from state_space_practice.kalman import (
     symmetrize,
 )
 from state_space_practice.point_process_kalman import _logdet_psd
+from state_space_practice.utils import validate_choice_indices as _validate_choices
 
 logger = logging.getLogger(__name__)
 
@@ -230,7 +231,13 @@ def multinomial_choice_filter(
     Returns
     -------
     ChoiceFilterResult
+
+    Raises
+    ------
+    ValueError
+        If any entry of ``choices`` is outside ``[0, n_options)``.
     """
+    _validate_choices(choices, n_options)
     choices_arr = jnp.asarray(choices, dtype=jnp.int32)
     k_free = n_options - 1
 
@@ -547,13 +554,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
                 f"Need at least 2 trials for EM fitting, got {self._n_trials}"
             )
 
-        # Validate choices
-        choices_np = np.asarray(choices)
-        if np.any(choices_np < 0) or np.any(choices_np >= self.n_options):
-            raise ValueError(
-                f"All choices must be in [0, {self.n_options}), "
-                f"got range [{choices_np.min()}, {choices_np.max()}]"
-            )
+        _validate_choices(choices, self.n_options)
 
         if beta_grid is None:
             beta_grid = jnp.array(_DEFAULT_BETA_GRID)

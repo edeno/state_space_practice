@@ -1,10 +1,12 @@
-from typing import Union
+import warnings
+from typing import Optional, Union
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg
 import numpy as np
 from jax import Array
+from jax.typing import ArrayLike
 from scipy.optimize import linear_sum_assignment
 
 # Type alias for numeric values (scalars, numpy arrays, JAX arrays)
@@ -154,6 +156,157 @@ def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
 def stabilize_covariance(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
     """Symmetrize a covariance-like matrix and project it to the PSD cone."""
     return project_psd(symmetrize(cov), min_eigenvalue=min_eigenvalue)
+
+
+def validate_choice_indices(choices: ArrayLike, n_options: int) -> None:
+    """Host-side bounds check on discrete choice / category indices.
+
+    JAX's out-of-range indexing is silent by default:
+    ``jnp.zeros(K).at[i].set(1.0)`` and ``jax.nn.one_hot(i, K)`` both
+    produce an all-zero vector when ``i`` is outside ``[0, K)`` rather
+    than raising. Downstream filters / observation models then treat
+    the step as "no observation" and leave the posterior unchanged,
+    which looks like a normal result. This helper fails loudly before
+    any JIT dispatch so out-of-range data is caught at the public API.
+    """
+    choices_np = np.asarray(choices)
+    if choices_np.size == 0:
+        return
+    if np.any(choices_np < 0) or np.any(choices_np >= n_options):
+        raise ValueError(
+            f"All choices must be in [0, {n_options}), "
+            f"got range [{int(choices_np.min())}, {int(choices_np.max())}]. "
+            f"JAX silently maps out-of-range indices to a zero indicator "
+            f"vector (= no observation), so this would otherwise produce "
+            f"a normal-looking result on bad data."
+        )
+
+
+def _validate_filter_numerics(
+    init_covariance: Array,
+    n_time: int,
+    stacklevel: int = 3,
+    filter_name: str = "filter",
+    measurement_cov: Optional[Array] = None,
+) -> None:
+    """Validate init_cov positive definiteness + warn about f32 numerical risk.
+
+    Shared by the Laplace-EKF point-process path
+    (``stochastic_point_process_filter``) and the linear-Gaussian path
+    (``kalman_filter`` / ``kalman_smoother``). Both families are Cholesky-
+    based, so strictly-positive-definite ``init_cov`` is a hard requirement
+    and f32 + long-T is a documented risk.
+
+    Raises
+    ------
+    ValueError
+        If ``init_covariance`` is non-square, not symmetric, or has a
+        non-positive minimum eigenvalue. Same check is applied to
+        ``measurement_cov`` when supplied.
+
+    Warns
+    -----
+    UserWarning
+        If ``init_covariance.dtype`` is ``float32`` AND the problem is
+        long enough / ill-conditioned enough that accumulated covariance
+        roundoff is likely to drive the predicted covariance below PSD
+        during the scan.
+
+    Notes
+    -----
+    This helper runs at the top of each public entry point (``fit``,
+    ``fit_sgd``, or the public filter/smoother wrappers) once per call,
+    then inner call sites pass ``validate_inputs=False`` to skip
+    re-validation. The ``eigvalsh → float(...)`` conversion used here
+    is incompatible with ``jax.jit`` tracing, so inner calls must bypass
+    the check entirely.
+    """
+    if init_covariance.ndim != 2 or init_covariance.shape[0] != init_covariance.shape[1]:
+        raise ValueError(
+            f"init_covariance must be a square 2D matrix, got shape "
+            f"{init_covariance.shape}"
+        )
+
+    # Eigenvalue check. eigvalsh is O(d^3) but only runs once per filter
+    # invocation, vs d^3 per scan step — negligible.
+    init_cov_sym = symmetrize(init_covariance)
+    eigs = jnp.linalg.eigvalsh(init_cov_sym)
+    min_eig = float(eigs.min())
+    max_eig = float(eigs.max())
+
+    if min_eig <= 0:
+        raise ValueError(
+            f"init_covariance is not positive definite "
+            f"(min eigenvalue {min_eig:g}). The filter's Cholesky-based "
+            f"updates require strict positive definiteness; a rank-"
+            f"deficient or indefinite matrix will NaN on the first step. "
+            f"Check the warm-start or init_cov_scale parameter, or "
+            f"supply a known-PD matrix."
+        )
+
+    if measurement_cov is not None:
+        if (
+            measurement_cov.ndim != 2
+            or measurement_cov.shape[0] != measurement_cov.shape[1]
+        ):
+            raise ValueError(
+                f"measurement_cov must be a square 2D matrix, got shape "
+                f"{measurement_cov.shape}"
+            )
+        r_eigs = jnp.linalg.eigvalsh(symmetrize(measurement_cov))
+        r_min_eig = float(r_eigs.min())
+        if r_min_eig <= 0:
+            raise ValueError(
+                f"measurement_cov is not positive definite "
+                f"(min eigenvalue {r_min_eig:g}). Observation-noise "
+                f"covariance R must be strictly positive definite; a "
+                f"rank-deficient or indefinite R makes the innovation "
+                f"covariance H P H' + R singular and the filter will "
+                f"NaN on the first step. Check the R you supplied."
+            )
+
+    # Condition number. Cap the denominator to avoid divide-by-zero on
+    # an (already-filtered) perfectly-rank-deficient matrix.
+    cond = max_eig / max(min_eig, 1e-300)
+    n_state = int(init_covariance.shape[0])
+
+    # Check precision: the filter's scan body inherits its dtype from
+    # init_covariance (via jnp.asarray internally). If the caller passed
+    # an f32 array — either because jax_enable_x64 is off, or because
+    # they explicitly cast — the inner Cholesky solves and matrix
+    # products accumulate f32 roundoff. f64 arrays do not have this
+    # issue in practice.
+    is_f32 = init_covariance.dtype == jnp.float32
+
+    if is_f32:
+        # Rough upper bound on per-bin absolute covariance roundoff from
+        # the predict-step congruence (A @ P @ A^T + Q) and the Cholesky
+        # update. Error-analysis constants: conservative ~sqrt(n_state)
+        # factor, f32 machine epsilon ~1.2e-7. Accumulated over n_time
+        # bins (random-walk model), total roundoff ~
+        # n_time * sqrt(n_state) * eps * max_eig.
+        f32_eps = 1.2e-7
+        worst_roundoff = (
+            float((n_time * n_state) ** 0.5) * f32_eps * max_eig
+        )
+        if worst_roundoff > 0.5 * min_eig:
+            warnings.warn(
+                f"{filter_name} running in float32 with "
+                f"a long / ill-conditioned problem: "
+                f"T={n_time}, n_state={n_state}, "
+                f"init_cov condition number {cond:.1e}, "
+                f"min_eig {min_eig:.2e}, max_eig {max_eig:.2e}. "
+                f"Estimated accumulated covariance roundoff "
+                f"({worst_roundoff:.2e}) exceeds half of min_eig, which "
+                f"means the predict step's covariance is likely to lose "
+                f"PSD during the scan and produce NaN. Enable float64 "
+                f"BEFORE importing state_space_practice:\n"
+                f"    import jax\n"
+                f"    jax.config.update('jax_enable_x64', True)\n"
+                f"    # now import state_space_practice models",
+                UserWarning,
+                stacklevel=stacklevel,
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -1745,3 +1745,85 @@ class TestJosephFormUpdate:
         P_joseph = joseph_form_update(P, K, H, R)
 
         np.testing.assert_allclose(P_joseph, P_joseph.T, atol=1e-14)
+
+
+class TestKalmanInputValidation:
+    """Guards on ``kalman_filter`` / ``kalman_smoother`` public entries.
+
+    An indefinite ``init_cov`` or ``measurement_cov`` produces NaN
+    mid-scan; callers can't distinguish "my covariance is bad" from
+    "my data is pathological." The public wrappers eigenvalue-check
+    both matrices host-side and raise ``ValueError`` before any work
+    runs.
+    """
+
+    def _well_posed_args(self, D: int = 2, T: int = 10, seed: int = 0) -> tuple:
+        key = random.PRNGKey(seed)
+        k_obs, k_A, k_init = random.split(key, 3)
+        A = jnp.eye(D) + 0.01 * random.normal(k_A, (D, D))
+        Q = jnp.eye(D) * 0.1
+        H = jnp.eye(D)
+        R = jnp.eye(D)
+        init_mean = jnp.zeros(D)
+        init_cov = jnp.eye(D)
+        obs = random.normal(k_obs, (T, D))
+        return init_mean, init_cov, obs, A, Q, H, R
+
+    def test_kalman_filter_rejects_negative_definite_init_cov(self) -> None:
+        init_mean, _, obs, A, Q, H, R = self._well_posed_args()
+        bad_init_cov = -jnp.eye(2)
+        with pytest.raises(ValueError, match="not positive definite"):
+            kalman_filter(init_mean, bad_init_cov, obs, A, Q, H, R)
+
+    def test_kalman_filter_rejects_zero_init_cov(self) -> None:
+        init_mean, _, obs, A, Q, H, R = self._well_posed_args()
+        bad_init_cov = jnp.zeros((2, 2))
+        with pytest.raises(ValueError, match="not positive definite"):
+            kalman_filter(init_mean, bad_init_cov, obs, A, Q, H, R)
+
+    def test_kalman_filter_rejects_indefinite_measurement_cov(self) -> None:
+        init_mean, init_cov, obs, A, Q, H, _ = self._well_posed_args()
+        bad_R = jnp.array([[1.0, 2.0], [2.0, 1.0]])  # eigs = 3, -1
+        with pytest.raises(ValueError, match="measurement_cov.*not positive definite"):
+            kalman_filter(init_mean, init_cov, obs, A, Q, H, bad_R)
+
+    def test_kalman_smoother_rejects_negative_definite_init_cov(self) -> None:
+        init_mean, _, obs, A, Q, H, R = self._well_posed_args()
+        bad_init_cov = -jnp.eye(2)
+        with pytest.raises(ValueError, match="not positive definite"):
+            kalman_smoother(init_mean, bad_init_cov, obs, A, Q, H, R)
+
+    def test_kalman_smoother_rejects_indefinite_measurement_cov(self) -> None:
+        init_mean, init_cov, obs, A, Q, H, _ = self._well_posed_args()
+        bad_R = jnp.array([[0.5, 1.0], [1.0, 0.5]])  # eigs = 1.5, -0.5
+        with pytest.raises(ValueError, match="measurement_cov.*not positive definite"):
+            kalman_smoother(init_mean, init_cov, obs, A, Q, H, bad_R)
+
+    def test_validate_inputs_false_bypasses_check(self) -> None:
+        """``validate_inputs=False`` must skip the eigvalsh call.
+
+        Inner EM call sites that have already validated use this escape
+        hatch to avoid O(d^3) re-work each iteration. With a bad
+        ``init_cov`` and the bypass on, the filter runs (and typically
+        produces NaN downstream); without the bypass, it would raise.
+        """
+        init_mean, _, obs, A, Q, H, R = self._well_posed_args()
+        bad_init_cov = jnp.zeros((2, 2))
+        filtered_mean, filtered_cov, mll = kalman_filter(
+            init_mean, bad_init_cov, obs, A, Q, H, R,
+            validate_inputs=False,
+        )
+        # We don't require NaN specifically (dtype / environment dependent),
+        # only that no ValueError was raised host-side.
+        assert filtered_mean.shape == obs.shape
+        del filtered_cov, mll
+
+    def test_well_posed_inputs_pass_validation(self) -> None:
+        """Positive case: a well-posed PD ``init_cov`` / PD ``R`` must not raise."""
+        init_mean, init_cov, obs, A, Q, H, R = self._well_posed_args()
+        filtered_mean, _, _ = kalman_filter(init_mean, init_cov, obs, A, Q, H, R)
+        assert filtered_mean.shape == obs.shape
+        smoother_mean, _, _, _ = kalman_smoother(
+            init_mean, init_cov, obs, A, Q, H, R
+        )
+        assert smoother_mean.shape == obs.shape

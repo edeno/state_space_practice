@@ -44,6 +44,7 @@ from state_space_practice.multinomial_choice import (
     _rts_smoother_pass,
     _softmax_update_core,
 )
+from state_space_practice.utils import validate_choice_indices
 
 logger = logging.getLogger(__name__)
 
@@ -609,12 +610,7 @@ class CovariateChoiceModel(SGDFittableMixin):
                 f"Need at least 2 trials for EM fitting, got {self._n_trials}"
             )
 
-        choices_np = np.asarray(choices)
-        if np.any(choices_np < 0) or np.any(choices_np >= self.n_options):
-            raise ValueError(
-                f"All choices must be in [0, {self.n_options}), "
-                f"got range [{choices_np.min()}, {choices_np.max()}]"
-            )
+        validate_choice_indices(choices, self.n_options)
 
         # Dynamics covariates
         if self.n_covariates > 0 and covariates is not None:
@@ -780,12 +776,7 @@ class CovariateChoiceModel(SGDFittableMixin):
                 f"Need at least 2 trials for SGD fitting, got {self._n_trials}"
             )
 
-        choices_np = np.asarray(choices)
-        if np.any(choices_np < 0) or np.any(choices_np >= self.n_options):
-            raise ValueError(
-                f"All choices must be in [0, {self.n_options}), "
-                f"got range [{choices_np.min()}, {choices_np.max()}]"
-            )
+        validate_choice_indices(choices, self.n_options)
 
         if self.n_covariates > 0 and covariates is not None:
             self._covariates = jnp.asarray(covariates)

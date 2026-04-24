@@ -24,6 +24,7 @@ import jax.scipy.linalg
 import jax.scipy.stats.multivariate_normal
 
 from state_space_practice.utils import (  # noqa: F401 — re-exported for backward compat
+    _validate_filter_numerics,
     psd_solve,
     stabilize_covariance,
     symmetrize,
@@ -233,7 +234,7 @@ def _kalman_filter_update(
 
 
 @jax.jit
-def kalman_filter(
+def _kalman_filter_impl(
     init_mean: jax.Array,
     init_cov: jax.Array,
     obs: jax.Array,
@@ -242,35 +243,7 @@ def kalman_filter(
     measurement_matrix: jax.Array,
     measurement_cov: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Applies the Kalman filter to a sequence of observations.
-
-    Parameters
-    ----------
-    init_mean : jax.Array, shape (n_cont_states,)
-        Initial state mean, $$ m_0 $$.
-    init_cov : jax.Array, shape (n_cont_states, n_cont_states)
-        Initial state covariance, $$ P_0 $$.
-    obs : jax.Array, shape (n_time, n_obs_dim)
-        Sequence of observations, $$ y_{1:T} $$.
-    transition_matrix : jax.Array, shape (n_cont_states, n_cont_states)
-        State transition matrix, $$ A $$.
-    process_cov : jax.Array, shape (n_cont_states, n_cont_states)
-        State noise covariance, $$ \\Sigma $$.
-    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
-        Observation matrix, $$ H $$.
-    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
-        Observation noise covariance, $$ R $$.
-
-    Returns
-    -------
-    filtered_mean : jax.Array, shape (n_time, n_cont_states)
-        Filtered state means, $$ m_{1:T} $$.
-    filtered_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states)
-        Filtered state covariances, $$ P_{1:T} $$.
-    marginal_log_likelihood : jax.Array
-        Total log likelihood of the observations, $$ \\sum_{t=1}^T \\log p(y_t | y_{1:t-1}) $$ (scalar array).
-
-    """
+    """Jitted Kalman-filter scan. See :func:`kalman_filter` for the public API."""
 
     def _step(carry, obs_t):
         mean_prev, cov_prev, marginal_log_likelihood = carry
@@ -304,6 +277,78 @@ def kalman_filter(
     )
 
     return filtered_mean, filtered_cov, marginal_log_likelihood
+
+
+def kalman_filter(
+    init_mean: jax.Array,
+    init_cov: jax.Array,
+    obs: jax.Array,
+    transition_matrix: jax.Array,
+    process_cov: jax.Array,
+    measurement_matrix: jax.Array,
+    measurement_cov: jax.Array,
+    validate_inputs: bool = True,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Applies the Kalman filter to a sequence of observations.
+
+    Parameters
+    ----------
+    init_mean : jax.Array, shape (n_cont_states,)
+        Initial state mean, $$ m_0 $$.
+    init_cov : jax.Array, shape (n_cont_states, n_cont_states)
+        Initial state covariance, $$ P_0 $$. Must be strictly positive
+        definite.
+    obs : jax.Array, shape (n_time, n_obs_dim)
+        Sequence of observations, $$ y_{1:T} $$.
+    transition_matrix : jax.Array, shape (n_cont_states, n_cont_states)
+        State transition matrix, $$ A $$.
+    process_cov : jax.Array, shape (n_cont_states, n_cont_states)
+        State noise covariance, $$ \\Sigma $$.
+    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
+        Observation matrix, $$ H $$.
+    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
+        Observation noise covariance, $$ R $$. Must be strictly positive
+        definite.
+    validate_inputs : bool, default=True
+        If True, validate ``init_cov`` and ``measurement_cov`` are
+        positive definite and warn when f32 + long T is at risk of
+        losing PSD during the scan. Inner EM/SGD call sites that have
+        already validated should pass ``False`` to skip the O(d^3)
+        eigenvalue recomputation.
+
+    Returns
+    -------
+    filtered_mean : jax.Array, shape (n_time, n_cont_states)
+        Filtered state means, $$ m_{1:T} $$.
+    filtered_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states)
+        Filtered state covariances, $$ P_{1:T} $$.
+    marginal_log_likelihood : jax.Array
+        Total log likelihood of the observations, $$ \\sum_{t=1}^T \\log p(y_t | y_{1:t-1}) $$ (scalar array).
+
+    Raises
+    ------
+    ValueError
+        If ``validate_inputs=True`` and ``init_cov`` or
+        ``measurement_cov`` is not strictly positive definite.
+    """
+    if validate_inputs:
+        _validate_filter_numerics(
+            jnp.asarray(init_cov),
+            n_time=int(jnp.asarray(obs).shape[0]),
+            stacklevel=3,
+            filter_name="kalman_filter",
+            measurement_cov=jnp.asarray(measurement_cov),
+        )
+
+    return _kalman_filter_impl(
+        init_mean,
+        init_cov,
+        obs,
+        transition_matrix,
+        process_cov,
+        measurement_matrix,
+        measurement_cov,
+    )
 
 
 @jax.jit
@@ -371,7 +416,7 @@ def _kalman_smoother_update(
 
 
 @jax.jit
-def kalman_smoother(
+def _kalman_smoother_impl(
     init_mean: jax.Array,
     init_cov: jax.Array,
     obs: jax.Array,
@@ -380,38 +425,8 @@ def kalman_smoother(
     measurement_matrix: jax.Array,
     measurement_cov: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Applies the Rauch-Tung-Striebel (RTS) smoother.
-
-    Parameters
-    ----------
-    init_mean : jax.Array, shape (n_cont_states,)
-        Initial state mean, $$ m_0 $$.
-    init_cov : jax.Array, shape (n_cont_states, n_cont_states)
-        Initial state covariance, $$ P_0 $$.
-    obs : jax.Array, shape (n_time, n_obs_dim)
-        Sequence of observations, $$ y_{1:T} $$.
-    transition_matrix : jax.Array, shape (n_cont_states, n_cont_states)
-        State transition matrix, $$ A $$.
-    process_cov : jax.Array, shape (n_cont_states, n_cont_states)
-        State noise covariance, $$ \\Sigma $$.
-    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
-        Observation matrix, $$ H $$.
-    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
-        Observation noise covariance, $$ R $$.
-
-    Returns
-    -------
-    smoother_mean : jax.Array, shape (n_time, n_cont_states)
-        Smoothed state means, $$ m_{1:T|T} $$.
-    smoother_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states)
-        Smoothed state covariances, $$ P_{1:T|T} $$.
-    smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states)
-        Smoothed cross-covariances, $$ P_{t, t+1|T} $$.
-    marginal_log_likelihood : jax.Array
-        Total log likelihood of the observations (scalar array).
-
-    """
-    filtered_mean, filtered_cov, marginal_log_likelihood = kalman_filter(
+    """Jitted RTS smoother. See :func:`kalman_smoother` for the public API."""
+    filtered_mean, filtered_cov, marginal_log_likelihood = _kalman_filter_impl(
         init_mean,
         init_cov,
         obs,
@@ -462,6 +477,80 @@ def kalman_smoother(
     smoother_cov = jnp.concatenate((smoother_cov, filtered_cov[-1][None]))
 
     return smoother_mean, smoother_cov, smoother_cross_cov, marginal_log_likelihood
+
+
+def kalman_smoother(
+    init_mean: jax.Array,
+    init_cov: jax.Array,
+    obs: jax.Array,
+    transition_matrix: jax.Array,
+    process_cov: jax.Array,
+    measurement_matrix: jax.Array,
+    measurement_cov: jax.Array,
+    validate_inputs: bool = True,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Applies the Rauch-Tung-Striebel (RTS) smoother.
+
+    Parameters
+    ----------
+    init_mean : jax.Array, shape (n_cont_states,)
+        Initial state mean, $$ m_0 $$.
+    init_cov : jax.Array, shape (n_cont_states, n_cont_states)
+        Initial state covariance, $$ P_0 $$. Must be strictly positive
+        definite.
+    obs : jax.Array, shape (n_time, n_obs_dim)
+        Sequence of observations, $$ y_{1:T} $$.
+    transition_matrix : jax.Array, shape (n_cont_states, n_cont_states)
+        State transition matrix, $$ A $$.
+    process_cov : jax.Array, shape (n_cont_states, n_cont_states)
+        State noise covariance, $$ \\Sigma $$.
+    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
+        Observation matrix, $$ H $$.
+    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
+        Observation noise covariance, $$ R $$. Must be strictly positive
+        definite.
+    validate_inputs : bool, default=True
+        If True, validate ``init_cov`` and ``measurement_cov`` are
+        positive definite and warn when f32 + long T is at risk of
+        losing PSD during the scan. Inner EM call sites that have
+        already validated should pass ``False`` to skip the O(d^3)
+        eigenvalue recomputation.
+
+    Returns
+    -------
+    smoother_mean : jax.Array, shape (n_time, n_cont_states)
+        Smoothed state means, $$ m_{1:T|T} $$.
+    smoother_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states)
+        Smoothed state covariances, $$ P_{1:T|T} $$.
+    smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states)
+        Smoothed cross-covariances, $$ P_{t, t+1|T} $$.
+    marginal_log_likelihood : jax.Array
+        Total log likelihood of the observations (scalar array).
+
+    Raises
+    ------
+    ValueError
+        If ``validate_inputs=True`` and ``init_cov`` or
+        ``measurement_cov`` is not strictly positive definite.
+    """
+    if validate_inputs:
+        _validate_filter_numerics(
+            jnp.asarray(init_cov),
+            n_time=int(jnp.asarray(obs).shape[0]),
+            stacklevel=3,
+            filter_name="kalman_smoother",
+            measurement_cov=jnp.asarray(measurement_cov),
+        )
+
+    return _kalman_smoother_impl(
+        init_mean,
+        init_cov,
+        obs,
+        transition_matrix,
+        process_cov,
+        measurement_matrix,
+        measurement_cov,
+    )
 
 
 class _SmootherElement(NamedTuple):
