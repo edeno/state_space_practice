@@ -58,6 +58,14 @@ from state_space_practice.utils import check_converged, make_discrete_transition
 
 logger = logging.getLogger(__name__)
 
+# Bounds for the M-step init_cov eigenvalue clip in switching point-process
+# models. Lower bound prevents the smoother at t=0 from collapsing to a
+# point estimate; upper bound prevents a positive feedback loop with sparse
+# observations (large init_cov → diffuse filter → larger smoother
+# uncertainty → larger init_cov).
+_INIT_COV_EIGVAL_MIN = 1e-4
+_INIT_COV_EIGVAL_MAX = 2.0
+
 
 def _linear_log_intensity(state: Array, params: SpikeObsParams) -> Array:
     """Linear log-intensity: baseline + weights @ state."""
@@ -697,19 +705,36 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             self.init_mean = jnp.clip(new_init_mean, -10.0, 10.0)
 
         if self.update_init_cov:
-            # Regularize init_cov eigenvalues. The smoother at t=0 can have
-            # enormous uncertainty with sparse observations, causing a
-            # positive feedback loop: large init_cov → diffuse filter →
-            # even larger smoother uncertainty → larger init_cov.
             def clip_init_cov_eigenvalues(P: Array) -> Array:
                 P = symmetrize(P)
                 eigvals, eigvecs = jnp.linalg.eigh(P)
-                eigvals = jnp.clip(eigvals, 1e-4, 2.0)
+                eigvals = jnp.clip(eigvals, _INIT_COV_EIGVAL_MIN, _INIT_COV_EIGVAL_MAX)
                 return eigvecs @ jnp.diag(eigvals) @ eigvecs.T
 
+            def _per_state_eigrange(P: Array) -> tuple[Array, Array]:
+                eigs = jnp.linalg.eigvalsh(symmetrize(P))
+                return jnp.min(eigs), jnp.max(eigs)
+
+            per_state_min, per_state_max = jax.vmap(
+                _per_state_eigrange, in_axes=-1
+            )(new_init_cov)
+            raw_min = float(jnp.min(per_state_min))
+            raw_max = float(jnp.max(per_state_max))
             new_init_cov = jax.vmap(
                 clip_init_cov_eigenvalues, in_axes=-1, out_axes=-1
             )(new_init_cov)
+            if raw_min < _INIT_COV_EIGVAL_MIN or raw_max > _INIT_COV_EIGVAL_MAX:
+                logger.info(
+                    "M-step init_cov eigenvalues clipped to [%.0e, %.1f] "
+                    "(raw range across discrete states: [%.2e, %.2e]). "
+                    "Frequent triggering indicates the smoother at t=0 is "
+                    "numerically diffuse — consider tightening the prior "
+                    "or shortening the sequence.",
+                    _INIT_COV_EIGVAL_MIN,
+                    _INIT_COV_EIGVAL_MAX,
+                    raw_min,
+                    raw_max,
+                )
             self.init_cov = new_init_cov
 
         self.init_discrete_state_prob = new_init_discrete_prob

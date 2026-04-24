@@ -48,6 +48,7 @@ from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import (
     _validate_filter_numerics as _validate_filter_numerics_impl,
     check_converged,
+    debug_print_if,
 )
 
 logger = logging.getLogger(__name__)
@@ -738,6 +739,20 @@ def _point_process_laplace_update(
         # scan rather than re-evaluating _neg_log_posterior. If improved is
         # False, no step size decreased the loss — keep current x.
         new_x = jnp.where(line_search_improved, candidate_x, x)
+
+        # Surface the "all 10 backtrack steps failed" case. Without this,
+        # a pathological loss produces a silent no-op step and the caller
+        # sees a normal-looking converged fit. Fires at most once per
+        # (time-bin, newton-iter) combination — not per backtrack step.
+        debug_print_if(
+            ~line_search_improved,
+            "point_process_kalman: Armijo backtracking scan exhausted "
+            "all 10 steps without finding a descent direction "
+            "(final_alpha={a:.2e}); keeping prior x. Expect stalled "
+            "Newton iteration; check that log-intensity is finite at "
+            "one_step_mean.",
+            a=final_alpha,
+        )
 
         # Recompute precision at accepted point for consistency
         _, new_post_prec, _ = _fisher_step_at(new_x)

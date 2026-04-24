@@ -158,6 +158,22 @@ def stabilize_covariance(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Ar
     return project_psd(symmetrize(cov), min_eigenvalue=min_eigenvalue)
 
 
+def debug_print_if(condition: jax.Array, fmt: str, **fmt_kwargs) -> None:
+    """Fire ``jax.debug.print(fmt, **fmt_kwargs)`` only when ``condition`` is True.
+
+    Wraps ``jax.lax.cond`` so callers don't have to spell out the
+    ``(lambda: jax.debug.print(...), lambda: None)`` pattern at every
+    silent-fallback site. The print branch fires when the predicate is
+    True (i.e. when the *bad* condition holds), matching how the call
+    site reads at the user's eye: "if `~is_valid`, print the warning."
+    """
+    jax.lax.cond(
+        condition,
+        lambda: jax.debug.print(fmt, **fmt_kwargs),
+        lambda: None,
+    )
+
+
 def validate_choice_indices(choices: ArrayLike, n_options: int) -> None:
     """Host-side bounds check on discrete choice / category indices.
 
@@ -380,10 +396,22 @@ def stabilize_probability_vector(probabilities: jax.Array) -> jax.Array:
     -----
     If the input is all zeros (e.g. from complete underflow), every element
     is raised to the floor and re-normalization produces a uniform
-    distribution. This is intentional for numerical robustness, but callers
-    should validate inputs upstream if they need to detect invalid priors.
+    distribution. This is intentional for numerical robustness, but it is
+    usually a sign of upstream numerical trouble — every iteration the
+    filter's discrete-state posterior is reset toward uniform, erasing the
+    evidence from observations. A ``jax.debug.print`` fires on the all-zero
+    path so callers see it in filter/smoother logs without changing the
+    function's return contract.
     """
     floor = jnp.asarray(_DISCRETE_PROB_STABILITY_FLOOR, dtype=probabilities.dtype)
+    debug_print_if(
+        jnp.all(probabilities <= 0),
+        "utils.stabilize_probability_vector: input was all-zero (max={m}); "
+        "falling back to uniform distribution. The filter's discrete-state "
+        "posterior is being silently reset — expect the switching-model "
+        "fit to ignore observations at this step.",
+        m=jnp.max(probabilities),
+    )
     stabilized = jnp.maximum(probabilities, floor)
     return stabilized / jnp.sum(stabilized)
 

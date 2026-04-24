@@ -4,6 +4,8 @@ import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 
+from state_space_practice.utils import debug_print_if
+
 IDENTITY_2x2 = jnp.identity(2)
 ZEROS_2x2 = jnp.zeros((2, 2))
 
@@ -528,6 +530,18 @@ def _project_to_closest_rotation(matrix: jax.Array) -> jax.Array:
     frob_norm = jnp.linalg.norm(matrix, "fro")
     fallback_scale = jnp.where(jnp.isfinite(frob_norm), frob_norm / jnp.sqrt(2.0), 0.5)
     fallback = fallback_scale * jnp.eye(matrix.shape[0])
+    # Fires once per bad block, not per filter step. Without this, the
+    # caller sees a converged-looking fit where one or more oscillation
+    # components are silently nulled (the fallback is a scaled identity =
+    # zero rotation).
+    debug_print_if(
+        ~is_valid,
+        "oscillator_utils._project_to_closest_rotation: SVD produced "
+        "non-finite entries; using damped-identity fallback (scale={s}). "
+        "This oscillation component has zero rotation until the input "
+        "is regularized.",
+        s=fallback_scale,
+    )
     return jnp.where(is_valid, projected, fallback)
 
 
