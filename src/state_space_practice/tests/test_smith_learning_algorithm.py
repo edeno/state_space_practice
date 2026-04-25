@@ -2091,3 +2091,23 @@ class TestSmithLearningModelRecovery:
             f"Smoother variance ({smoother_var:.6f}) not less than "
             f"filter variance ({filter_var:.6f})"
         )
+
+
+class TestSmithEMRollback:
+    """EM loop must roll back state on LL decrease."""
+
+    def test_smith_em_rolls_back(self, caplog) -> None:
+        from state_space_practice.tests.conftest import (
+            assert_em_rolls_back_on_ll_decrease,
+        )
+
+        rng = np.random.default_rng(0)
+        n_correct = jnp.asarray(rng.integers(0, 2, size=50).astype(float))
+        model = SmithLearningModel(
+            init_learning_state=0.0,
+            sigma_epsilon=float(jnp.sqrt(0.05)),
+            prob_correct_by_chance=0.5,
+        )
+        assert_em_rolls_back_on_ll_decrease(
+            model, (n_correct,), caplog,
+        )

@@ -549,3 +549,59 @@ def simple_1d_model() -> Tuple[Array, Array, Array, Array, Array, Array, Array]:
         measurement_matrix,
         measurement_cov,
     )
+
+
+def assert_em_rolls_back_on_ll_decrease(
+    model,
+    fit_args,
+    caplog,
+    *,
+    fit_kwargs=None,
+    ll_sequence=(0.0, -1e6, -1e6),
+):
+    """Inject a synthetic LL drop into ``model._e_step`` and assert rollback.
+
+    Used by the per-EM-loop rollback regression tests
+    (TestEMRollbackOnDecrease, TestOscillatorEMRollback,
+    TestSmithEMRollback). Replaces ``model._e_step`` with a wrapper
+    that runs the real E-step (so smoother/filter state is still
+    populated) and then returns successive values from
+    ``ll_sequence`` instead of the real LL.
+
+    Asserts a warning containing "rolling back" fires and that the
+    bad LL was popped from the returned ``log_likelihoods``.
+    """
+    fit_kwargs = dict(fit_kwargs or {})
+    fit_kwargs.setdefault("max_iter", 5)
+    original_e_step = model._e_step
+    seq = iter(ll_sequence)
+
+    def fake_e_step(*args, **kwargs):
+        real = original_e_step(*args, **kwargs)
+        try:
+            val = next(seq)
+        except StopIteration:
+            return real
+        # Match the real return's runtime type so downstream
+        # ``float(...)`` / arithmetic in the EM loop sees the same
+        # interface. JAX scalar arrays don't have a usable
+        # ``type(real)(value)`` constructor; route via jnp.asarray.
+        if hasattr(real, "dtype"):
+            return jnp.asarray(val, dtype=real.dtype)
+        return float(val)
+
+    model._e_step = fake_e_step
+
+    with caplog.at_level("WARNING"):
+        lls = model.fit(*fit_args, **fit_kwargs)
+
+    assert any(
+        "rolling back" in r.message.lower() for r in caplog.records
+    ), (
+        f"Expected a rollback warning, got: "
+        f"{[r.message for r in caplog.records]}"
+    )
+    assert lls[0] == ll_sequence[0], (
+        f"First LL should be the good one ({ll_sequence[0]}), got {lls}"
+    )
+    return lls

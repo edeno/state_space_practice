@@ -3403,3 +3403,32 @@ class TestMaxNewtonIterReducesLLDecreases:
             f"max_newton_iter=5 should have <= LL decreases than "
             f"max_newton_iter=1, got {decreases[5]} vs {decreases[1]}"
         )
+
+
+class TestEMRollbackOnDecrease:
+    """EM loop must roll back state on LL decrease.
+
+    On a synthetic LL trajectory that drops at iter 1, the loop must
+    (a) emit a warning naming both the prior and the bad LL,
+    (b) drop the bad LL from the returned list,
+    (c) restore prior smoother / M-step state so the user sees a
+        consistent (params, smoother) pair from the prior iteration,
+    (d) stop the loop early.
+    """
+
+    def test_point_process_em_rolls_back(self, caplog) -> None:
+        from state_space_practice.tests.conftest import (
+            assert_em_rolls_back_on_ll_decrease,
+        )
+
+        rng = np.random.default_rng(0)
+        n_time, n_basis = 100, 3
+        design_matrix = jnp.asarray(
+            np.eye(n_basis)[np.arange(n_time) % n_basis]
+        )
+        spikes = jnp.asarray(rng.poisson(0.3, size=n_time).astype(float))
+        model = PointProcessModel(n_state_dims=n_basis, dt=0.02)
+
+        assert_em_rolls_back_on_ll_decrease(
+            model, (design_matrix, spikes), caplog,
+        )

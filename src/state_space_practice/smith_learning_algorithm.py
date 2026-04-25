@@ -1584,43 +1584,82 @@ class SmithLearningModel(SGDFittableMixin):
             )
 
         log_likelihoods: list[float] = []
-        previous_log_likelihood: float = float("-inf")
+        # Snapshot keys: smoother + filter outputs the E-step produces,
+        # plus the M-step parameters (sigma_epsilon and the
+        # initial-variance derivative). On LL decrease we restore both
+        # so the stored (params, smoother) pair is consistent with the
+        # prior iteration.
+        _snapshot_keys = (
+            "filtered_prob_correct_response",
+            "filtered_learning_state_mode", "filtered_learning_state_variance",
+            "filtered_one_step_mode", "filtered_one_step_variance",
+            "smoother_gain",
+            "sigma_epsilon", "init_learning_variance",
+        )
 
         for iteration in range(max_iter):
-            # E-step
+            # Smoother / filter outputs are not assigned until the
+            # first E-step runs, so use getattr's None default. The
+            # matching `if v is not None` guard in the restore loop
+            # skips uninitialised entries.
+            prev_state = {k: getattr(self, k, None) for k in _snapshot_keys}
+
             current_log_likelihood = self._e_step(n_correct_responses)
             log_likelihoods.append(current_log_likelihood)
 
-            # Check convergence
-            is_converged, is_increasing = check_converged(
-                current_log_likelihood, previous_log_likelihood, tolerance
-            )
-
-            if not is_increasing:
-                msg = f"Log-likelihood decreased at iteration {iteration + 1}!"
+            if not jnp.isfinite(current_log_likelihood):
+                msg = (
+                    f"Non-finite log-likelihood at iteration {iteration + 1}; "
+                    f"stopping EM."
+                )
                 logger.warning(msg)
                 if verbose:
                     print(f"  WARNING: {msg}")
-
-            if is_converged:
-                # Run final M-step to get MLE params, then E-step so
-                # stored smoother results match the converged params.
-                self._m_step(n_correct_responses)
-                final_ll = self._e_step(n_correct_responses)
-                log_likelihoods.append(final_ll)
-                msg = (
-                    f"Converged after {iteration + 1} iterations. "
-                    f"sigma_epsilon={self.sigma_epsilon:.4g}"
-                )
-                logger.info(msg)
-                if verbose:
-                    print(msg)
                 break
 
-            # M-step
+            if iteration > 0:
+                is_converged, is_increasing = check_converged(
+                    current_log_likelihood, log_likelihoods[-2], tolerance
+                )
+
+                if not is_increasing:
+                    for k, v in prev_state.items():
+                        if v is not None:
+                            setattr(self, k, v)
+                    bad_ll = log_likelihoods.pop()
+                    msg = (
+                        f"LL decreased: {log_likelihoods[-1]:.4f} -> "
+                        f"{bad_ll:.4f}; rolling back to previous E-step "
+                        f"and stopping EM."
+                    )
+                    logger.warning(msg)
+                    if verbose:
+                        print(f"  WARNING: {msg}")
+                    break
+
+                if is_converged:
+                    # Run final M-step to get MLE params, then E-step
+                    # so stored smoother results match the converged
+                    # params.
+                    self._m_step(n_correct_responses)
+                    final_ll = self._e_step(n_correct_responses)
+                    log_likelihoods.append(final_ll)
+                    msg = (
+                        f"Converged after {iteration + 1} iterations. "
+                        f"sigma_epsilon={self.sigma_epsilon:.4g}"
+                    )
+                    logger.info(msg)
+                    if verbose:
+                        print(msg)
+                    break
+
             self._m_step(n_correct_responses)
 
-            change = current_log_likelihood - previous_log_likelihood
+            change = (
+                current_log_likelihood - log_likelihoods[-2]
+                if iteration > 0
+                else float("nan")
+            )
             logger.info(
                 f"Iteration {iteration + 1}/{max_iter}\t"
                 f"Log-Likelihood: {current_log_likelihood:.4f}\t"
@@ -1632,7 +1671,6 @@ class SmithLearningModel(SGDFittableMixin):
                     f"LL={current_log_likelihood:.4f}  "
                     f"delta={change:+.4f}"
                 )
-            previous_log_likelihood = current_log_likelihood
 
         if len(log_likelihoods) == max_iter:
             msg = "Reached maximum iterations without converging."

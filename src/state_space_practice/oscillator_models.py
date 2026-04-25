@@ -683,40 +683,76 @@ class BaseModel(ABC, SGDFittableMixin):
             self._initialize_parameters(key)
             self._warm_initialize_states(observations)
         log_likelihoods: list[float] = []
-        previous_log_likelihood = -float("inf")
+        # Snapshot keys: smoother outputs the E-step produces, plus the
+        # M-step parameters the subclass may overwrite. On LL decrease we
+        # restore both so the stored (params, smoother) pair is
+        # consistent with the prior iteration.
+        _snapshot_keys = (
+            "smoother_state_cond_mean", "smoother_state_cond_cov",
+            "smoother_discrete_state_prob", "smoother_joint_discrete_state_prob",
+            "smoother_pair_cond_cross_cov", "smoother_pair_cond_means",
+            "continuous_transition_matrix", "process_cov",
+            "measurement_matrix", "measurement_cov",
+            "init_mean", "init_cov",
+            "init_discrete_state_prob", "discrete_transition_matrix",
+        )
 
         for iteration in range(max_iter):
-            # E-step
+            # Smoother state attributes (smoother_state_cond_mean etc.)
+            # are not assigned until the first E-step runs, so use
+            # getattr's None default. The matching `if v is not None`
+            # guard in the restore loop skips uninitialised entries.
+            prev_state = {k: getattr(self, k, None) for k in _snapshot_keys}
+
             current_log_likelihood = float(self._e_step(observations))
             log_likelihoods.append(current_log_likelihood)
 
-            # Check convergence
-            is_converged, is_increasing = check_converged(
-                current_log_likelihood, previous_log_likelihood, tol
-            )
-
-            if not is_increasing:
+            if not jnp.isfinite(current_log_likelihood):
                 logger.warning(
-                    f"Log-likelihood decreased at iteration {iteration + 1}!"
+                    f"Non-finite log-likelihood at iteration {iteration + 1}; "
+                    f"stopping EM."
                 )
-
-            if is_converged:
-                logger.info(f"Converged after {iteration + 1} iterations.")
-                self.converged_ = True
+                self.converged_ = False
                 break
 
-            # M-step
-            self._m_step(observations)
+            if iteration > 0:
+                is_converged, is_increasing = check_converged(
+                    current_log_likelihood, log_likelihoods[-2], tol
+                )
 
-            # Projection step
+                if not is_increasing:
+                    for k, v in prev_state.items():
+                        if v is not None:
+                            setattr(self, k, v)
+                    bad_ll = log_likelihoods.pop()
+                    logger.warning(
+                        f"LL decreased: {log_likelihoods[-1]:.4f} -> "
+                        f"{bad_ll:.4f}; rolling back to previous E-step "
+                        f"and stopping EM."
+                    )
+                    self.converged_ = False
+                    break
+
+                if is_converged:
+                    logger.info(
+                        f"Converged after {iteration + 1} iterations."
+                    )
+                    self.converged_ = True
+                    break
+
+            self._m_step(observations)
             self._project_parameters()
 
+            change = (
+                current_log_likelihood - log_likelihoods[-2]
+                if iteration > 0
+                else float("nan")
+            )
             logger.info(
                 f"Iteration {iteration + 1}/{max_iter}\t"
                 f"Log-Likelihood: {current_log_likelihood:.4f}\t"
-                f"Change: {(current_log_likelihood - previous_log_likelihood):.4f}"
+                f"Change: {change:.4f}"
             )
-            previous_log_likelihood = current_log_likelihood
         else:
             self.converged_ = False
             logger.warning("Reached maximum iterations without converging.")

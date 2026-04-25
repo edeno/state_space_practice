@@ -1707,3 +1707,32 @@ class TestBaseModelPStayValidation:
         )
         assert jnp.all(model.discrete_transition_diag >= 0)
         assert jnp.all(model.discrete_transition_diag <= 0.95)
+
+
+class TestOscillatorEMRollback:
+    """EM loop must roll back state on LL decrease.
+
+    Same contract as test_point_process_kalman.TestEMRollbackOnDecrease.
+    """
+
+    def test_oscillator_em_rolls_back(self, caplog) -> None:
+        from state_space_practice.simulate.scenarios import simulate_com_scenario
+        from state_space_practice.tests.conftest import (
+            assert_em_rolls_back_on_ll_decrease,
+        )
+
+        scenario = simulate_com_scenario(n_time=200, seed=0)
+        p = scenario["params"]
+        model = CommonOscillatorModel(
+            n_oscillators=p["n_oscillators"],
+            n_discrete_states=p["n_discrete_states"],
+            n_sources=p["n_sources"],
+            sampling_freq=p["sampling_freq"],
+            freqs=p["freqs"],
+            damping_coef=p["damping"],
+            process_variance=p["process_variance"],
+            measurement_variance=p["measurement_variance"],
+        )
+        assert_em_rolls_back_on_ll_decrease(
+            model, (scenario["obs"],), caplog,
+        )

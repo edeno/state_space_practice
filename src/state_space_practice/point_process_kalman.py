@@ -2111,36 +2111,76 @@ class PointProcessModel(SGDFittableMixin):
         )
 
         log_likelihoods: list[float] = []
-        previous_log_likelihood = -jnp.inf
 
         for iteration in range(max_iter):
-            # E-step
+            # Snapshot state for potential rollback on LL decrease.
+            # Pattern from place_field_model.py: when an EM iteration
+            # produces a worse marginal LL than the previous one, the
+            # M-step parameters from the *previous* iteration are the
+            # ones to keep; restoring them gives a consistent
+            # (params, smoother) pair from the prior iteration.
+            prev_smoother_mean = self.smoother_mean
+            prev_smoother_cov = self.smoother_cov
+            prev_smoother_cross_cov = self.smoother_cross_cov
+            prev_filtered_mean = self.filtered_mean
+            prev_filtered_cov = self.filtered_cov
+            prev_transition_matrix = self.transition_matrix
+            prev_process_cov = self.process_cov
+            prev_init_mean = self.init_mean
+            prev_init_cov = self.init_cov
+
             current_log_likelihood = self._e_step(design_matrix, spike_indicator)
             log_likelihoods.append(current_log_likelihood)
 
-            # Check convergence
-            is_converged, is_increasing = check_converged(
-                current_log_likelihood, previous_log_likelihood, tolerance
-            )
-
-            if not is_increasing:
+            if not jnp.isfinite(current_log_likelihood):
                 logger.warning(
-                    f"Log-likelihood decreased at iteration {iteration + 1}!"
+                    f"Non-finite log-likelihood at iteration {iteration + 1}; "
+                    f"stopping EM."
                 )
-
-            if is_converged:
-                logger.info(f"Converged after {iteration + 1} iterations.")
                 break
 
-            # M-step
+            if iteration > 0:
+                is_converged, is_increasing = check_converged(
+                    current_log_likelihood,
+                    log_likelihoods[-2],
+                    tolerance,
+                )
+
+                if not is_increasing:
+                    # Roll back to previous (better) state and stop.
+                    self.smoother_mean = prev_smoother_mean
+                    self.smoother_cov = prev_smoother_cov
+                    self.smoother_cross_cov = prev_smoother_cross_cov
+                    self.filtered_mean = prev_filtered_mean
+                    self.filtered_cov = prev_filtered_cov
+                    self.transition_matrix = prev_transition_matrix
+                    self.process_cov = prev_process_cov
+                    self.init_mean = prev_init_mean
+                    self.init_cov = prev_init_cov
+                    bad_ll = log_likelihoods.pop()
+                    logger.warning(
+                        f"LL decreased: {log_likelihoods[-1]:.4f} -> "
+                        f"{bad_ll:.4f}; rolling back to previous E-step "
+                        f"and stopping EM."
+                    )
+                    break
+
+                if is_converged:
+                    logger.info(f"Converged after {iteration + 1} iterations.")
+                    break
+
             self._m_step()
 
+            change = (
+                current_log_likelihood - log_likelihoods[-2]
+                if iteration > 0
+                else float("nan")
+            )
             logger.info(
                 f"Iteration {iteration + 1}/{max_iter}\t"
                 f"Log-Likelihood: {current_log_likelihood:.4f}\t"
-                f"Change: {(current_log_likelihood - previous_log_likelihood):.6f}"
+                f"Change: {change:.6f}"
             )
-            previous_log_likelihood = current_log_likelihood
 
         if len(log_likelihoods) == max_iter:
             logger.warning("Reached maximum iterations without converging.")
