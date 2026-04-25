@@ -1,0 +1,217 @@
+"""Shared EKF / Laplace-EKF kernel for the Hamiltonian model family.
+
+The four Hamiltonian model files (``hamiltonian_lfp``,
+``hamiltonian_spikes``, ``hamiltonian_joint``, ``hamiltonian_switching``)
+re-implemented the same per-step measurement-update bodies and the same
+RTS backward pass. This module exposes those building blocks as pure
+JIT-compatible functions so each model class composes them rather than
+inlining the math four times.
+
+Conventions
+-----------
+- All helpers take JAX arrays and return JAX arrays. None capture
+  Python state; closures over external arrays inside ``jax.lax.scan``
+  bodies must come from the caller, not from this module.
+- Log-likelihoods returned here are the per-step contribution. Callers
+  accumulate via the scan ``carry`` or via ``jnp.sum`` over the scan
+  output, depending on filter/smoother convention.
+
+See docs/hamiltonian_architecture.md for the broader rationale (why the
+Hamiltonian family is standalone — no linear-Gaussian EM integration,
+SGD-only fitting).
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Tuple
+
+import jax
+import jax.numpy as jnp
+from jax import Array
+
+from state_space_practice.kalman import joseph_form_update, psd_solve, symmetrize
+from state_space_practice.nonlinear_dynamics import ekf_smooth_step
+from state_space_practice.point_process_kalman import _logdet_psd
+
+
+def gaussian_measurement_update(
+    m_pred: Array,
+    P_pred: Array,
+    y: Array,
+    C: Array,
+    d: Array,
+    R: Array,
+    *,
+    include_normalization_const: bool = True,
+) -> Tuple[Array, Array, Array]:
+    """Standard Kalman update for a linear-Gaussian observation y ~ N(C x + d, R).
+
+    Returns
+    -------
+    m_post : (n,)
+    P_post : (n, n) — Joseph-form for PSD preservation
+    log_likelihood : ()
+        Per-step Gaussian marginal log-likelihood. Set
+        ``include_normalization_const=False`` to drop the
+        ``n_obs * log(2π)`` constant — useful for *relative* likelihoods
+        (e.g. discrete-state softmax in switching models) where the
+        constant cancels in normalization.
+    """
+    err = y - (C @ m_pred + d)
+    S = C @ P_pred @ C.T + R
+    K = psd_solve(S, C @ P_pred).T
+    m_post = m_pred + K @ err
+    P_post = joseph_form_update(P_pred, K, C, R)
+
+    _, logdet = jnp.linalg.slogdet(S)
+    ll = -0.5 * (err @ psd_solve(S, err) + logdet)
+    if include_normalization_const:
+        n_obs = err.shape[0]
+        ll = ll - 0.5 * n_obs * jnp.log(2 * jnp.pi)
+    return m_post, P_post, ll
+
+
+def point_process_laplace_update(
+    m_pred: Array,
+    P_pred: Array,
+    y: Array,
+    C: Array,
+    d: Array,
+    dt: float,
+    *,
+    compute_log_likelihood: bool = True,
+) -> Tuple[Array, Array, Array]:
+    """Single-Newton Laplace update for Poisson observations.
+
+    Observation model: ``y[n] ~ Poisson(exp(C[n] @ x + d[n]) * dt)``.
+    Linearises the log-likelihood at ``m_pred`` and applies one
+    information-form update; the posterior mean is the prior mean
+    plus ``P_post @ score_at_prior_mean``.
+
+    Returns
+    -------
+    m_post : (n,)
+    P_post : (n, n) — symmetrised
+    log_likelihood : ()
+        Laplace-approximated marginal ``log p(y | y_{1:t-1})``.
+        With ``compute_log_likelihood=False`` returns ``jnp.array(0.0)``
+        (used in the smoother forward pass where ll is discarded).
+    """
+    rate_pred = jnp.exp(C @ m_pred + d) * dt
+    grad = C.T @ (y - rate_pred)
+    H_lik = C.T @ (rate_pred[:, None] * C)
+
+    n = P_pred.shape[0]
+    P_post = symmetrize(
+        P_pred - P_pred @ psd_solve(jnp.eye(n) + H_lik @ P_pred, H_lik @ P_pred)
+    )
+    m_post = m_pred + P_post @ grad
+
+    if not compute_log_likelihood:
+        return m_post, P_post, jnp.array(0.0)
+
+    rate_post = jnp.exp(C @ m_post + d) * dt
+    ll_at_mode = jnp.sum(y * jnp.log(rate_post + 1e-10) - rate_post)
+    delta = m_post - m_pred
+    quad = delta @ psd_solve(P_pred, delta)
+    ll = (
+        ll_at_mode
+        - 0.5 * quad
+        - 0.5 * _logdet_psd(P_pred)
+        + 0.5 * _logdet_psd(P_post)
+    )
+    return m_post, P_post, ll
+
+
+def ekf_rts_backward_pass(
+    m_filt: Array,
+    P_filt: Array,
+    m_pred: Array,
+    P_pred: Array,
+    F: Array,
+) -> Tuple[Array, Array]:
+    """EKF-RTS backward smoother given a forward pass's filtered + predicted state.
+
+    Parameters
+    ----------
+    m_filt, P_filt : (T, n) and (T, n, n)
+        Filtered means and covariances.
+    m_pred, P_pred : (T, n) and (T, n, n)
+        One-step-ahead predicted means and covariances. The
+        ``backward_step`` consumes ``m_pred[t+1]``, ``P_pred[t+1]`` and
+        ``F[t+1]`` while smoothing position ``t``.
+    F : (T, n, n)
+        Transition Jacobian at each forward step (``∂f/∂x`` evaluated
+        at the previous filtered mean, returned by
+        ``ekf_predict_step_with_jacobian``).
+
+    Returns
+    -------
+    m_smooth, P_smooth : (T, n) and (T, n, n)
+        The final time step is not re-smoothed (``m_smooth[-1] == m_filt[-1]``).
+    """
+
+    def backward_step(carry, inputs):
+        m_s_next, P_s_next = carry
+        m_f_t, P_f_t, m_p_next, P_p_next, F_next = inputs
+        m_s, P_s = ekf_smooth_step(
+            m_f_t, P_f_t, m_p_next, P_p_next, m_s_next, P_s_next, F_next,
+        )
+        return (m_s, P_s), (m_s, P_s)
+
+    init_smooth = (m_filt[-1], P_filt[-1])
+    bw_inputs = (m_filt[:-1], P_filt[:-1], m_pred[1:], P_pred[1:], F[1:])
+    _, (m_s_rev, P_s_rev) = jax.lax.scan(
+        backward_step, init_smooth, bw_inputs, reverse=True,
+    )
+    m_smooth = jnp.concatenate([m_s_rev, m_filt[-1:]], axis=0)
+    P_smooth = jnp.concatenate([P_s_rev, P_filt[-1:]], axis=0)
+    return m_smooth, P_smooth
+
+
+def mlp_l2_penalty(mlp_params: Dict[str, Any]) -> Array:
+    """Sum of squared MLP weights (entries whose key starts with 'w').
+
+    The Hamiltonian models all penalise weights ``w*`` but not biases
+    ``b*``; this helper centralises the convention.
+    """
+    return jnp.sum(
+        jnp.array(
+            [jnp.sum(v ** 2) for k, v in mlp_params.items() if k.startswith("w")]
+        )
+    )
+
+
+def default_init_mean(n_oscillators: int) -> Array:
+    """Default Hamiltonian latent state at t=0: positions=0.1, momenta=0."""
+    return jnp.concatenate(
+        [jnp.full((n_oscillators,), 0.1), jnp.zeros((n_oscillators,))]
+    )
+
+
+class _BaseModelStubs:
+    """Mixin providing no-op implementations of BaseModel's abstract hooks.
+
+    The Hamiltonian family is SGD-only — the linear-Gaussian EM hooks
+    (``_initialize_measurement_matrix`` etc.) are not used by any
+    Hamiltonian model. Each class previously defined six identical
+    one-line ``pass`` stubs; this mixin defines them once.
+    """
+
+    def _initialize_measurement_matrix(self, key=None) -> None:
+        return
+
+    def _initialize_measurement_covariance(self) -> None:
+        return
+
+    def _initialize_continuous_transition_matrix(self) -> None:
+        return
+
+    def _initialize_process_covariance(self) -> None:
+        return
+
+    def _project_parameters(self) -> None:
+        return
+
+    def _check_sgd_initialized(self) -> None:
+        return
