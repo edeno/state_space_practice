@@ -416,6 +416,66 @@ def _kalman_smoother_update(
 
 
 @jax.jit
+def rts_backward_scan(
+    filtered_mean: jax.Array,
+    filtered_cov: jax.Array,
+    transition_matrix: jax.Array,
+    process_cov: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Sequential RTS backward smoother given filtered means and covariances.
+
+    This is the observable-agnostic backward pass: it consumes filtered
+    state estimates from any forward filter (linear-Gaussian, point-
+    process / Laplace-EKF, oscillator) and produces smoothed estimates.
+    Both :func:`_kalman_smoother_impl` and the position-decoder
+    smoother call this helper so the RTS recurrence is implemented
+    once.
+
+    Parameters
+    ----------
+    filtered_mean : jax.Array, shape (n_time, n_cont_states)
+    filtered_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states)
+    transition_matrix : jax.Array, shape (n_cont_states, n_cont_states)
+    process_cov : jax.Array, shape (n_cont_states, n_cont_states)
+
+    Returns
+    -------
+    smoother_mean : jax.Array, shape (n_time, n_cont_states)
+    smoother_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states)
+    smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states)
+        Lag-one cross-covariances P_{t, t+1|T}.
+    """
+
+    def _step(
+        carry: tuple[jax.Array, jax.Array],
+        args: tuple[jax.Array, jax.Array],
+    ) -> tuple[tuple[jax.Array, jax.Array], tuple[jax.Array, jax.Array, jax.Array]]:
+        next_smoother_mean, next_smoother_cov = carry
+        filter_mean, filter_cov = args
+        smoother_mean, smoother_cov, smoother_cross_cov = _kalman_smoother_update(
+            next_smoother_mean, next_smoother_cov,
+            filter_mean, filter_cov,
+            process_cov, transition_matrix,
+        )
+        return (smoother_mean, smoother_cov), (
+            smoother_mean, smoother_cov, smoother_cross_cov,
+        )
+
+    init_carry = (filtered_mean[-1], filtered_cov[-1])
+    (_, _), (smoother_mean, smoother_cov, smoother_cross_cov) = jax.lax.scan(
+        _step,
+        init_carry,
+        (filtered_mean[:-1], filtered_cov[:-1]),
+        reverse=True,
+    )
+    return (
+        jnp.concatenate((smoother_mean, filtered_mean[-1][None])),
+        jnp.concatenate((smoother_cov, filtered_cov[-1][None])),
+        smoother_cross_cov,
+    )
+
+
+@jax.jit
 def _kalman_smoother_impl(
     init_mean: jax.Array,
     init_cov: jax.Array,
@@ -427,55 +487,13 @@ def _kalman_smoother_impl(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Jitted RTS smoother. See :func:`kalman_smoother` for the public API."""
     filtered_mean, filtered_cov, marginal_log_likelihood = _kalman_filter_impl(
-        init_mean,
-        init_cov,
-        obs,
-        transition_matrix,
-        process_cov,
-        measurement_matrix,
-        measurement_cov,
+        init_mean, init_cov, obs,
+        transition_matrix, process_cov,
+        measurement_matrix, measurement_cov,
     )
-
-    def _step(
-        carry: tuple[jax.Array, jax.Array],
-        args: tuple[jax.Array, jax.Array],
-    ) -> tuple[tuple[jax.Array, jax.Array], tuple[jax.Array, jax.Array, jax.Array]]:
-        """Helper function for `jax.lax.scan` backward pass."""
-        (
-            next_smoother_mean,
-            next_smoother_cov,
-        ) = carry
-
-        filter_mean, filter_cov = args
-
-        smoother_mean, smoother_cov, smoother_cross_cov = _kalman_smoother_update(
-            next_smoother_mean,
-            next_smoother_cov,
-            filter_mean,
-            filter_cov,
-            process_cov,
-            transition_matrix,
-        )
-        return (
-            smoother_mean,
-            smoother_cov,
-        ), (
-            smoother_mean,
-            smoother_cov,
-            smoother_cross_cov,
-        )
-
-    init_carry = (filtered_mean[-1], filtered_cov[-1])
-    (_, _), (smoother_mean, smoother_cov, smoother_cross_cov) = jax.lax.scan(
-        _step,
-        init_carry,
-        (filtered_mean[:-1], filtered_cov[:-1]),
-        reverse=True,
+    smoother_mean, smoother_cov, smoother_cross_cov = rts_backward_scan(
+        filtered_mean, filtered_cov, transition_matrix, process_cov,
     )
-
-    smoother_mean = jnp.concatenate((smoother_mean, filtered_mean[-1][None]))
-    smoother_cov = jnp.concatenate((smoother_cov, filtered_cov[-1][None]))
-
     return smoother_mean, smoother_cov, smoother_cross_cov, marginal_log_likelihood
 
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import warnings
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional
 
 import jax
@@ -29,7 +30,7 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.kalman import _kalman_smoother_update, symmetrize
+from state_space_practice.kalman import rts_backward_scan, symmetrize
 from state_space_practice.point_process_kalman import (
     _point_process_laplace_update,
     _safe_expected_count,
@@ -821,6 +822,167 @@ def _build_track_penalty(
     return jnp.array(penalty)
 
 
+@partial(
+    jax.jit,
+    static_argnames=(
+        "dt",
+        "sigma_track",
+        "grid_dx",
+        "grid_dy",
+        "n_neurons",
+        "n_state",
+        "include_velocity",
+        "max_newton_iter",
+        "use_kde",
+        "inflate",
+    ),
+)
+def _run_filter_scan(
+    spikes_arr: Array,
+    init_carry: tuple,
+    A: Array,
+    Q: Array,
+    jax_log_rate_maps: Array,
+    jax_x_edges: Array,
+    jax_y_edges: Array,
+    track_penalty: Array,
+    kde_args: tuple,
+    infl_args: tuple,
+    *,
+    dt: float,
+    sigma_track: float,
+    grid_dx: float,
+    grid_dy: float,
+    n_neurons: int,
+    n_state: int,
+    include_velocity: bool,
+    max_newton_iter: int,
+    use_kde: bool,
+    inflate: bool,
+) -> tuple[Array, Array, Array]:
+    """JIT-compiled core: build closures, run forward filter scan.
+
+    All scalar config (``dt``, ``sigma_track``, ``grid_dx``, ``grid_dy``)
+    is passed as static args. JAX recompiles per-unique-value, but in
+    typical decode workflows these floats are fixed across calls
+    (dt is set once per session, grid spacing is rate-map-bound) so
+    the cache hits. We tested passing them as tracers to allow
+    parameter sweeps without recompile, but XLA's runtime-value codegen
+    produced slightly different floating-point order, breaking a tight
+    test threshold (4% drift on a 10000-bin decode error). Static gives
+    deterministic codegen and the recompile cost (~200 ms once per
+    unique value) is acceptable.
+    """
+    _grid_xy, _spike_hists, _occ_hist, _sigma2, _baseline, _tau = kde_args
+    _infl_gain, _infl_max, _infl_eps, _infl_min_ft = infl_args
+    _infl_d = jnp.array(2.0)
+    _vel_pad = jnp.zeros((n_neurons, 2)) if include_velocity else None
+    jax_penalty_map = track_penalty[None, :, :]
+
+    def log_intensity_func(state):
+        if use_kde:
+            return _kde_log_rate(
+                state, _grid_xy, _spike_hists, _occ_hist, _sigma2, _baseline, _tau,
+            )
+        return _bilinear_log_rate(
+            state, jax_log_rate_maps, jax_x_edges, jax_y_edges, grid_dx, grid_dy
+        )
+
+    def grad_log_intensity_func(state):
+        if use_kde:
+            jac_pos = _kde_log_rate_jacobian(
+                state, _grid_xy, _spike_hists, _occ_hist, _sigma2, _baseline, _tau,
+            )
+        else:
+            jac_pos = _bilinear_log_rate_jacobian(
+                state, jax_log_rate_maps, jax_x_edges, jax_y_edges, grid_dx, grid_dy
+            )
+        if include_velocity:
+            return jnp.concatenate([jac_pos, _vel_pad], axis=1)
+        return jac_pos
+
+    _x_min = jax_x_edges[0]
+    _x_max = jax_x_edges[-1]
+    _y_min = jax_y_edges[0]
+    _y_max = jax_y_edges[-1]
+    _penalty_inv_sigma2 = 1.0 / (sigma_track ** 2)
+
+    def _penalty_at(pos_xy):
+        interior = _bilinear_log_rate(
+            pos_xy, jax_penalty_map, jax_x_edges, jax_y_edges, grid_dx, grid_dy
+        )[0]
+        dx_out = (
+            jnp.maximum(pos_xy[0] - _x_max, 0.0)
+            - jnp.maximum(_x_min - pos_xy[0], 0.0)
+        )
+        dy_out = (
+            jnp.maximum(pos_xy[1] - _y_max, 0.0)
+            - jnp.maximum(_y_min - pos_xy[1], 0.0)
+        )
+        exterior = 0.5 * _penalty_inv_sigma2 * (dx_out ** 2 + dy_out ** 2)
+        return interior + exterior
+
+    _penalty_grad_fn = jax.grad(_penalty_at)
+    _penalty_value_fn = _penalty_at
+
+    def _step(carry, spike_t):
+        mean_prev, cov_prev, total_ll = carry
+
+        # Prediction
+        one_step_mean = A @ mean_prev
+        one_step_cov = A @ cov_prev @ A.T + Q
+        one_step_cov = symmetrize(one_step_cov)
+
+        # Distance-to-track prior as a rank-1 precision update (Woodbury);
+        # see position_decoder_filter docstring for the derivation.
+        pen_val = _penalty_value_fn(one_step_mean[:2])
+        pen_grad_xy = _penalty_grad_fn(one_step_mean[:2])
+        Sxx = one_step_cov[:2, :2]
+        Sx_all = one_step_cov[:, :2]
+        Sg = Sx_all @ pen_grad_xy
+        gSg = pen_grad_xy @ Sxx @ pen_grad_xy
+        denom = 2.0 * pen_val + gSg + 1e-12
+        one_step_mean = one_step_mean - Sg * (2.0 * pen_val / denom)
+        one_step_cov = one_step_cov - jnp.outer(Sg, Sg) / denom
+        one_step_cov = symmetrize(one_step_cov)
+
+        if inflate:
+            log_lambda = log_intensity_func(one_step_mean)
+            cond_int = _safe_expected_count(log_lambda, dt)
+            jacobian = grad_log_intensity_func(one_step_mean)
+            innovation = spike_t - cond_int
+            score = jacobian.T @ innovation
+            fisher = jacobian.T @ (cond_int[:, None] * jacobian)
+            fisher_trace = jnp.trace(fisher)
+            fisher_reg = fisher + _infl_eps * jnp.eye(n_state)
+            s_t = (score @ jnp.linalg.solve(fisher_reg, score)) / _infl_d
+            alpha_t = jnp.where(
+                fisher_trace > _infl_min_ft,
+                jnp.clip(1.0 + _infl_gain * (s_t - 1.0), 1.0, _infl_max),
+                1.0,
+            )
+            one_step_cov = one_step_cov * alpha_t
+
+        post_mean, post_cov, ll = _point_process_laplace_update(
+            one_step_mean,
+            one_step_cov,
+            spike_t,
+            dt,
+            log_intensity_func,
+            grad_log_intensity_func=grad_log_intensity_func,
+            include_laplace_normalization=True,
+            max_newton_iter=max_newton_iter,
+        )
+
+        total_ll = total_ll + ll
+        return (post_mean, post_cov, total_ll), (post_mean, post_cov)
+
+    (_, _, marginal_ll), (filtered_mean, filtered_cov) = jax.lax.scan(
+        _step, init_carry, spikes_arr,
+    )
+    return filtered_mean, filtered_cov, marginal_ll
+
+
 def position_decoder_filter(
     spikes: ArrayLike,
     rate_maps: PlaceFieldRateMaps,
@@ -963,165 +1125,63 @@ def position_decoder_filter(
                 (len(rate_maps.y_edges), len(rate_maps.x_edges))
             )
     track_penalty = jnp.asarray(track_penalty)
-    # Store as (1, ny, nx) for bilinear interpolation reuse
-    jax_penalty_map = track_penalty[None, :, :]
-
-    # Precompute constants used in every scan step
-    _vel_pad = jnp.zeros((n_neurons, 2)) if include_velocity else None
 
     # Use analytical KDE evaluation when sufficient statistics are
     # available; fall back to bilinear grid interpolation otherwise.
-    _use_kde = rate_maps._use_analytical
-    if _use_kde:
-        _grid_xy = rate_maps._jax_grid_xy
-        _spike_hists = rate_maps._jax_spike_hists
-        _occ_hist = rate_maps._jax_occ_hist
-        _sigma2 = rate_maps._jax_kde_sigma2
-        _baseline = rate_maps._jax_baseline_rates
-        _tau = rate_maps._jax_occupancy_tau
-
-    def log_intensity_func(state):
-        if _use_kde:
-            return _kde_log_rate(
-                state, _grid_xy, _spike_hists, _occ_hist, _sigma2, _baseline, _tau,
-            )
-        return _bilinear_log_rate(
-            state, jax_log_rate_maps, jax_x_edges, jax_y_edges, grid_dx, grid_dy
+    use_kde = rate_maps._use_analytical
+    if use_kde:
+        kde_args = (
+            rate_maps._jax_grid_xy,
+            rate_maps._jax_spike_hists,
+            rate_maps._jax_occ_hist,
+            rate_maps._jax_kde_sigma2,
+            rate_maps._jax_baseline_rates,
+            rate_maps._jax_occupancy_tau,
+        )
+    else:
+        # Pass zero-shaped sentinels; static `use_kde=False` skips this
+        # branch in the impl. Keeping the arg position stable lets JIT
+        # cache one impl per (use_kde, shapes) combination.
+        kde_args = (
+            jnp.zeros((1, 2)),
+            jnp.zeros((rate_maps.n_neurons, 1)),
+            jnp.zeros((1,)),
+            jnp.zeros(()),
+            jnp.zeros((rate_maps.n_neurons,)),
+            jnp.zeros(()),
         )
 
-    def grad_log_intensity_func(state):
-        if _use_kde:
-            jac_pos = _kde_log_rate_jacobian(
-                state, _grid_xy, _spike_hists, _occ_hist, _sigma2, _baseline, _tau,
-            )
-        else:
-            jac_pos = _bilinear_log_rate_jacobian(
-                state, jax_log_rate_maps, jax_x_edges, jax_y_edges, grid_dx, grid_dy
-            )
-        if include_velocity:
-            return jnp.concatenate([jac_pos, _vel_pad], axis=1)
-        return jac_pos
-
-    # Grid extent for out-of-grid extrapolation of the penalty.
-    _x_min = jax_x_edges[0]
-    _x_max = jax_x_edges[-1]
-    _y_min = jax_y_edges[0]
-    _y_max = jax_y_edges[-1]
-    _penalty_inv_sigma2 = 1.0 / (sigma_track ** 2)
-
-    def _penalty_at(pos_xy):
-        """Scalar track-distance penalty at (x, y).
-
-        Inside the grid the value is the bilinear-interpolated penalty
-        field (quadratic bowl off-track).  Outside the grid the bilinear
-        value is clamped to the edge; we add an explicit quadratic bowl
-        ``0.5 * (dist_out / sigma_track)^2`` based on how far the
-        position has escaped the grid, so the gradient keeps pulling
-        back after the filter leaves the rate-map support.
-        """
-        interior = _bilinear_log_rate(
-            pos_xy, jax_penalty_map, jax_x_edges, jax_y_edges, grid_dx, grid_dy
-        )[0]
-        dx_out = (
-            jnp.maximum(pos_xy[0] - _x_max, 0.0)
-            - jnp.maximum(_x_min - pos_xy[0], 0.0)
-        )
-        dy_out = (
-            jnp.maximum(pos_xy[1] - _y_max, 0.0)
-            - jnp.maximum(_y_min - pos_xy[1], 0.0)
-        )
-        exterior = 0.5 * _penalty_inv_sigma2 * (dx_out ** 2 + dy_out ** 2)
-        return interior + exterior
-
-    _penalty_grad_fn = jax.grad(_penalty_at)
-    _penalty_value_fn = _penalty_at
-
-    # Adaptive inflation configuration — capture as JAX-compatible
-    # constants so they can be used inside the traced _step function.
-    _inflate = adaptive_inflation is not None and adaptive_inflation.enabled
-    if _inflate:
+    inflate = adaptive_inflation is not None and adaptive_inflation.enabled
+    if inflate:
         assert adaptive_inflation is not None  # narrow for mypy
-        _infl_gain = jnp.array(adaptive_inflation.gain)
-        _infl_max = jnp.array(adaptive_inflation.max_alpha)
-        _infl_eps = jnp.array(adaptive_inflation.epsilon)
-        _infl_min_ft = jnp.array(adaptive_inflation.min_fisher_trace)
-        # Normalise by the number of observed position dimensions (2),
-        # not n_state.  The Fisher matrix has rank 2 regardless of
-        # whether velocity is in the state, so the score statistic
-        # has E[s_t]=1 only when divided by 2.
-        _infl_d = jnp.array(2.0)
-
-    # Run filter with jax.lax.scan
-    def _step(carry, spike_t):
-        mean_prev, cov_prev, total_ll = carry
-
-        # Prediction
-        one_step_mean = A @ mean_prev
-        one_step_cov = A @ cov_prev @ A.T + Q
-        one_step_cov = symmetrize(one_step_cov)
-
-        # Incorporate distance-to-track prior into the prediction as
-        # a proper log-prior: the quadratic bowl ``0.5 (d/σ)^2`` has
-        # local Hessian ≈ ``g g^T / (2 * p)`` where ``g = ∇penalty``
-        # and ``p = penalty``.  Adding this rank-1 precision to the
-        # predicted Gaussian and solving in closed form (Woodbury)
-        # gives a bounded nudge: at distance ``d`` off-track the
-        # mean moves at most ``d`` toward the track regardless of
-        # how inflated the predicted covariance has become.  When
-        # the filter is on-track (p = 0, g = 0) the update is a
-        # no-op by construction.
-        pen_val = _penalty_value_fn(one_step_mean[:2])
-        pen_grad_xy = _penalty_grad_fn(one_step_mean[:2])
-        Sxx = one_step_cov[:2, :2]
-        Sx_all = one_step_cov[:, :2]  # (n_state, 2)
-        Sg = Sx_all @ pen_grad_xy  # (n_state,)
-        gSg = pen_grad_xy @ Sxx @ pen_grad_xy
-        denom = 2.0 * pen_val + gSg + 1e-12
-        one_step_mean = one_step_mean - Sg * (2.0 * pen_val / denom)
-        one_step_cov = one_step_cov - jnp.outer(Sg, Sg) / denom
-        one_step_cov = symmetrize(one_step_cov)
-
-        # Adaptive covariance inflation: if the Poisson score at the
-        # predicted state is larger than the Fisher information predicts,
-        # the filter is overconfident and we inflate the predicted
-        # covariance before the Laplace update.
-        if _inflate:
-            log_lambda = log_intensity_func(one_step_mean)
-            cond_int = _safe_expected_count(log_lambda, dt)
-            jacobian = grad_log_intensity_func(one_step_mean)
-            innovation = spike_t - cond_int
-            score = jacobian.T @ innovation  # (n_state,)
-            fisher = jacobian.T @ (cond_int[:, None] * jacobian)  # (n_state, n_state)
-            fisher_trace = jnp.trace(fisher)
-            # Standardised score statistic: s = g^T F^{-1} g / d
-            fisher_reg = fisher + _infl_eps * jnp.eye(n_state)
-            s_t = (score @ jnp.linalg.solve(fisher_reg, score)) / _infl_d
-            # Inflate only when Fisher is non-trivial and score is large
-            alpha_t = jnp.where(
-                fisher_trace > _infl_min_ft,
-                jnp.clip(1.0 + _infl_gain * (s_t - 1.0), 1.0, _infl_max),
-                1.0,
-            )
-            one_step_cov = one_step_cov * alpha_t
-
-        # Laplace update (spike observation model)
-        post_mean, post_cov, ll = _point_process_laplace_update(
-            one_step_mean,
-            one_step_cov,
-            spike_t,
-            dt,
-            log_intensity_func,
-            grad_log_intensity_func=grad_log_intensity_func,
-            include_laplace_normalization=True,
-            max_newton_iter=max_newton_iter,
+        infl_args = (
+            jnp.array(adaptive_inflation.gain),
+            jnp.array(adaptive_inflation.max_alpha),
+            jnp.array(adaptive_inflation.epsilon),
+            jnp.array(adaptive_inflation.min_fisher_trace),
         )
-
-        total_ll = total_ll + ll
-        return (post_mean, post_cov, total_ll), (post_mean, post_cov)
+    else:
+        infl_args = (jnp.zeros(()), jnp.zeros(()), jnp.zeros(()), jnp.zeros(()))
 
     init_carry = (jnp.asarray(init_position), jnp.asarray(init_cov), jnp.array(0.0))
-    (_, _, marginal_ll), (filtered_mean, filtered_cov) = jax.lax.scan(
-        _step, init_carry, spikes_arr,
+    filtered_mean, filtered_cov, marginal_ll = _run_filter_scan(
+        spikes_arr,
+        init_carry,
+        A, Q,
+        jax_log_rate_maps, jax_x_edges, jax_y_edges,
+        track_penalty,
+        kde_args,
+        infl_args,
+        dt=dt,
+        sigma_track=sigma_track,
+        grid_dx=grid_dx,
+        grid_dy=grid_dy,
+        n_neurons=n_neurons,
+        n_state=n_state,
+        include_velocity=include_velocity,
+        max_newton_iter=max_newton_iter,
+        use_kde=use_kde,
+        inflate=inflate,
     )
 
     # Divergence sanity check: flag runaway escapes from the rate-map
@@ -1222,28 +1282,9 @@ def position_decoder_smoother(
     )
 
     A, Q = build_position_dynamics(dt, q_pos, q_vel, include_velocity)
-
-    # RTS backward smoother
-    def _smooth_step(carry, inputs):
-        next_sm_mean, next_sm_cov = carry
-        filt_mean, filt_cov = inputs
-
-        sm_mean, sm_cov, _ = _kalman_smoother_update(
-            next_sm_mean, next_sm_cov,
-            filt_mean, filt_cov,
-            Q, A,
-        )
-        return (sm_mean, sm_cov), (sm_mean, sm_cov)
-
-    _, (sm_mean, sm_cov) = jax.lax.scan(
-        _smooth_step,
-        (filter_result.position_mean[-1], filter_result.position_cov[-1]),
-        (filter_result.position_mean[:-1], filter_result.position_cov[:-1]),
-        reverse=True,
+    smoother_mean, smoother_cov, _ = rts_backward_scan(
+        filter_result.position_mean, filter_result.position_cov, A, Q,
     )
-
-    smoother_mean = jnp.concatenate([sm_mean, filter_result.position_mean[-1:]])
-    smoother_cov = jnp.concatenate([sm_cov, filter_result.position_cov[-1:]])
 
     return DecoderResult(
         position_mean=smoother_mean,
