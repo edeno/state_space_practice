@@ -13,29 +13,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Development Environment
 
-- **Conda environment**: `state_space_practice`
-- **Python version**: 3.10-3.12
-- **Activate**: `conda activate state_space_practice`
+- **Manager**: [uv](https://docs.astral.sh/uv/). `uv.lock` is committed; the environment is reproducible.
+- **Python version**: 3.10-3.12 (uv provisions an interpreter automatically)
+- **Set up**: `uv sync --extra test` (creates `.venv` with all runtime + dev/test dependencies, and installs the package editable)
 
 ## Common Commands
 
-**Important**: Always run pytest, mypy, and ruff via the conda environment to ensure correct dependencies.
+**Important**: Run all tooling through `uv run` so it uses the locked `.venv`, not whatever
+interpreter is otherwise active. (If a conda base env is active, uv prints a harmless
+`VIRTUAL_ENV ... does not match` warning and uses `.venv` anyway; pass `--no-sync` to skip
+re-resolution on each call.)
 
 ```bash
 # Run all tests
-conda run -n state_space_practice pytest src/state_space_practice/tests/
+uv run pytest src/state_space_practice/tests/
 
 # Run specific test file
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_kalman.py -v
+uv run pytest src/state_space_practice/tests/test_kalman.py -v
 
 # Run tests with coverage
-conda run -n state_space_practice pytest --cov=src/state_space_practice --cov-report=term-missing
+uv run pytest --cov=src/state_space_practice --cov-report=term-missing
 
-# Run linter
-conda run -n state_space_practice ruff check src/
+# Run linter / formatter
+uv run ruff check src/
+uv run ruff format src/
 
-# Run type checker (if configured)
-conda run -n state_space_practice mypy src/state_space_practice/
+# Run type checker
+uv run mypy src/state_space_practice/
 ```
 
 ## Project Structure
