@@ -9,6 +9,7 @@ jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
 import numpy as np
+import numpy.typing as npt
 import pytest
 from hypothesis import settings
 from hypothesis import strategies as st
@@ -595,13 +596,58 @@ def assert_em_rolls_back_on_ll_decrease(
     with caplog.at_level("WARNING"):
         lls = model.fit(*fit_args, **fit_kwargs)
 
-    assert any(
-        "rolling back" in r.message.lower() for r in caplog.records
-    ), (
-        f"Expected a rollback warning, got: "
-        f"{[r.message for r in caplog.records]}"
+    assert any("rolling back" in r.message.lower() for r in caplog.records), (
+        f"Expected a rollback warning, got: {[r.message for r in caplog.records]}"
     )
     assert lls[0] == ll_sequence[0], (
         f"First LL should be the good one ({ll_sequence[0]}), got {lls}"
     )
     return lls
+
+
+# --- Spike-field coupling validation fixtures ---
+
+
+@pytest.fixture
+def make_coupling_posterior():
+    """Factory building a ``CouplingPosterior`` from explicit mean/var arrays.
+
+    Imported lazily so collection does not depend on the coupling module existing.
+    """
+
+    def _make(
+        beta_real_mean: npt.ArrayLike,
+        beta_imag_mean: npt.ArrayLike,
+        beta_real_var: npt.ArrayLike,
+        beta_imag_var: npt.ArrayLike,
+        samples: npt.ArrayLike | None = None,
+    ):
+        from state_space_practice.coupling_validation import CouplingPosterior
+
+        return CouplingPosterior(
+            beta_real_mean=np.asarray(beta_real_mean, dtype=float),
+            beta_imag_mean=np.asarray(beta_imag_mean, dtype=float),
+            beta_real_var=np.asarray(beta_real_var, dtype=float),
+            beta_imag_var=np.asarray(beta_imag_var, dtype=float),
+            samples=None if samples is None else np.asarray(samples),
+        )
+
+    return _make
+
+
+@pytest.fixture
+def make_ground_truth():
+    """Factory returning ``(beta_real_true, beta_imag_true, coupling_mask)`` arrays."""
+
+    def _make(
+        beta_real_true: npt.ArrayLike,
+        beta_imag_true: npt.ArrayLike,
+        coupling_mask: npt.ArrayLike,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return (
+            np.asarray(beta_real_true, dtype=float),
+            np.asarray(beta_imag_true, dtype=float),
+            np.asarray(coupling_mask, dtype=bool),
+        )
+
+    return _make
