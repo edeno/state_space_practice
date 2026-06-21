@@ -780,9 +780,9 @@ def _point_process_laplace_update(
     # because posterior_precision is PSD by construction (sum of two PSD
     # matrices). psd_solve itself adds a small diagonal boost for Cholesky
     # conditioning.
-    posterior_cov = symmetrize(psd_solve(
-        posterior_precision, identity, diagonal_boost=diagonal_boost
-    ))
+    posterior_cov = symmetrize(
+        psd_solve(posterior_precision, identity, diagonal_boost=diagonal_boost)
+    )
 
     # Log-likelihood at posterior mode (approximate)
     log_lambda_mode = log_intensity_func(posterior_mean)
@@ -796,6 +796,226 @@ def _point_process_laplace_update(
     if include_laplace_normalization:
         # Laplace correction: log p(y) ≈ log p(y|x*) + log p(x*) + 0.5 log|P_post|
         # Constant terms (d/2 * log 2π) are omitted since they cancel across states.
+        delta = posterior_mean - one_step_mean
+        quad = delta @ (prior_precision @ delta)
+        logdet_prior = _logdet_psd(one_step_cov, diagonal_boost)
+        logdet_post = _logdet_psd(posterior_cov, diagonal_boost)
+        log_prior = -0.5 * quad - 0.5 * logdet_prior
+        log_likelihood = log_likelihood + log_prior + 0.5 * logdet_post
+
+    return posterior_mean, posterior_cov, log_likelihood
+
+
+class GLMFamily(NamedTuple):
+    """Observation family for the GLM Laplace update.
+
+    A family encapsulates everything that differs between exponential-family
+    observation models with a canonical link, so the Fisher-scoring skeleton in
+    :func:`glm_laplace_update` is shared. ``eta`` is the linear predictor (the
+    natural parameter): for Poisson it is the log-rate, for Bernoulli the logit.
+
+    Attributes
+    ----------
+    mean : callable ``eta -> mu``
+        Conditional mean (expected count for Poisson, probability for Bernoulli).
+    fisher_weight : callable ``(eta, mu) -> w``
+        Diagonal Fisher-information weight; the Fisher info is ``J' diag(w) J``,
+        PSD by construction. (Poisson ``w = mu``; Bernoulli ``w = mu (1 - mu)``.)
+    loglik_plugin : callable ``(y, eta, mu) -> scalar``
+        Log-likelihood up to an additive constant, used for the line search.
+    loglik_normalized : callable ``(y, eta, mu) -> scalar``
+        Fully normalized log-likelihood, used for the returned marginal LL.
+    """
+
+    mean: Callable[[Array], Array]
+    fisher_weight: Callable[[Array, Array], Array]
+    loglik_plugin: Callable[[Array, Array, Array], Array]
+    loglik_normalized: Callable[[Array, Array, Array], Array]
+
+
+def poisson_family(dt: float, max_log_count: float = 20.0) -> GLMFamily:
+    """Poisson family with log link, matching :func:`_point_process_laplace_update`.
+
+    The mean is ``exp(eta) * dt`` with the same overflow clipping as the legacy
+    update, so ``glm_laplace_update(..., poisson_family(dt))`` reproduces it.
+    Returns a fresh ``GLMFamily`` (with fresh closures) on each call, so hoist it
+    out of any ``jit``/``scan`` loop to keep the cache warm.
+    """
+
+    def mean(eta: Array) -> Array:
+        return _safe_expected_count(eta, dt, max_log_count=max_log_count)
+
+    def fisher_weight(_eta: Array, mu: Array) -> Array:
+        return mu
+
+    def loglik_plugin(y: Array, _eta: Array, mu: Array) -> Array:
+        # Poisson log-likelihood without the constant log(y!) term.
+        return jnp.sum(y * jnp.log(mu) - mu)
+
+    def loglik_normalized(y: Array, _eta: Array, mu: Array) -> Array:
+        return jnp.sum(jax.scipy.stats.poisson.logpmf(y, mu))
+
+    return GLMFamily(mean, fisher_weight, loglik_plugin, loglik_normalized)
+
+
+# Saturation guard: clip the logit so sigmoid/softplus cannot overflow. This is a
+# numerical guard on the *mean/log-likelihood only* — the Jacobian used by the
+# update differentiates the unclipped eta_func, so the clip is not part of the
+# model gradient (it is inert at realistic |eta|, where sigmoid is already
+# saturated). Do not "fix" the asymmetry by clipping inside the Jacobian.
+_BERNOULLI_ETA_CLIP = 30.0
+
+
+def _bernoulli_mean(eta: Array) -> Array:
+    return jax.nn.sigmoid(jnp.clip(eta, -_BERNOULLI_ETA_CLIP, _BERNOULLI_ETA_CLIP))
+
+
+def _bernoulli_fisher_weight(_eta: Array, mu: Array) -> Array:
+    return mu * (1.0 - mu)
+
+
+def _bernoulli_loglik(y: Array, eta: Array, _mu: Array) -> Array:
+    # Bernoulli-logit log-pmf: y * eta - softplus(eta). Already normalized, so the
+    # plug-in and normalized log-likelihoods coincide.
+    eta_clipped = jnp.clip(eta, -_BERNOULLI_ETA_CLIP, _BERNOULLI_ETA_CLIP)
+    return jnp.sum(y * eta_clipped - jax.nn.softplus(eta_clipped))
+
+
+#: Bernoulli observation family with logit link (spikes are 0/1 per bin).
+BERNOULLI_LOGIT_FAMILY = GLMFamily(
+    mean=_bernoulli_mean,
+    fisher_weight=_bernoulli_fisher_weight,
+    loglik_plugin=_bernoulli_loglik,
+    loglik_normalized=_bernoulli_loglik,
+)
+
+
+def glm_laplace_update(
+    one_step_mean: Array,
+    one_step_cov: Array,
+    observations: Array,
+    eta_func: Callable[[Array], Array],
+    family: GLMFamily,
+    diagonal_boost: float = 1e-9,
+    grad_eta_func: Optional[Callable[[Array], Array]] = None,
+    include_laplace_normalization: bool = True,
+    max_newton_iter: int = 1,
+    line_search_beta: float = 0.5,
+) -> tuple[Array, Array, Array]:
+    """Family-generic Laplace measurement update via Fisher scoring.
+
+    Generalizes :func:`_point_process_laplace_update` to any :class:`GLMFamily`
+    with a canonical link; with ``poisson_family(dt)`` it reproduces the legacy
+    Poisson update bit-for-bit (see ``test_glm_laplace``). The posterior precision
+    ``prior_precision + J' diag(w) J`` is PSD by construction, so no eigenvalue
+    stabilization is needed.
+
+    Parameters
+    ----------
+    one_step_mean : Array, shape (n_latent,)
+        Predicted mean ``A @ m_{t-1}``.
+    one_step_cov : Array, shape (n_latent, n_latent)
+        Predicted covariance ``A @ P_{t-1} @ A.T + Q``.
+    observations : Array, shape (n_obs,)
+        Observed counts (Poisson) or 0/1 indicators (Bernoulli) at this bin.
+    eta_func : callable ``x -> eta``
+        Maps state (n_latent,) to the linear predictor (n_obs,). May be nonlinear;
+        the Jacobian is taken with ``jax.jacfwd`` if ``grad_eta_func`` is None (pass
+        a constant ``grad_eta_func`` when ``eta_func`` is linear, to skip jacfwd).
+    family : GLMFamily
+        Observation family (e.g. :data:`BERNOULLI_LOGIT_FAMILY`).
+    diagonal_boost, grad_eta_func, include_laplace_normalization, max_newton_iter,
+    line_search_beta
+        As in :func:`_point_process_laplace_update`.
+
+    Returns
+    -------
+    posterior_mean : Array, shape (n_latent,)
+    posterior_cov : Array, shape (n_latent, n_latent)
+    log_likelihood : Array
+        Approximate ``log p(y_t | y_{1:t-1})`` (Laplace expansion) if normalized.
+    """
+    if grad_eta_func is None:
+        grad_eta_func = jax.jacfwd(eta_func)
+    grad_eta = grad_eta_func
+
+    n_latent = one_step_mean.shape[0]
+    identity = jnp.eye(n_latent)
+    prior_precision = psd_solve(one_step_cov, identity, diagonal_boost=diagonal_boost)
+
+    def _neg_log_posterior(x: Array) -> Array:
+        eta = eta_func(x)
+        mu = family.mean(eta)
+        log_lik = family.loglik_plugin(observations, eta, mu)
+        delta = x - one_step_mean
+        log_prior = -0.5 * delta @ (prior_precision @ delta)
+        return -(log_lik + log_prior)
+
+    def _fisher_step_at(x: Array) -> tuple[Array, Array, Array]:
+        eta = eta_func(x)
+        mu = family.mean(eta)
+        innovation = observations - mu
+        jacobian = grad_eta(x)
+        likelihood_gradient = jacobian.T @ innovation
+        prior_gradient = -prior_precision @ (x - one_step_mean)
+        gradient = likelihood_gradient + prior_gradient
+        weight = family.fisher_weight(eta, mu)
+        fisher_info = jacobian.T @ (weight[:, None] * jacobian)
+        post_prec = symmetrize(prior_precision + fisher_info)
+        delta = psd_solve(post_prec, gradient, diagonal_boost=diagonal_boost)
+        return delta, post_prec, gradient
+
+    def _line_search_step(carry, _):
+        x, _ = carry
+        delta, _, _ = _fisher_step_at(x)
+        current_loss = _neg_log_posterior(x)
+
+        def _backtrack(alpha_carry, _):
+            alpha, _ = alpha_carry
+            new_x = x + alpha * delta
+            new_loss = _neg_log_posterior(new_x)
+            improved = new_loss < current_loss
+            new_alpha = jnp.where(improved, alpha, alpha * line_search_beta)
+            return (new_alpha, improved), None
+
+        (final_alpha, line_search_improved), _ = jax.lax.scan(
+            _backtrack, (jnp.array(1.0), jnp.array(False)), None, length=10
+        )
+        candidate_x = x + final_alpha * delta
+        new_x = jnp.where(line_search_improved, candidate_x, x)
+        _, new_post_prec, _ = _fisher_step_at(new_x)
+        return (new_x, new_post_prec), None
+
+    x = one_step_mean
+    if max_newton_iter == 1:
+        # Single Fisher step from the prior mean (prior gradient is zero there).
+        eta = eta_func(one_step_mean)
+        mu = family.mean(eta)
+        innovation = observations - mu
+        jacobian = grad_eta(one_step_mean)
+        likelihood_gradient = jacobian.T @ innovation
+        prior_gradient = jnp.zeros_like(likelihood_gradient)
+        gradient = likelihood_gradient + prior_gradient
+        weight = family.fisher_weight(eta, mu)
+        fisher_info = jacobian.T @ (weight[:, None] * jacobian)
+        posterior_precision = symmetrize(prior_precision + fisher_info)
+        posterior_mean = one_step_mean + psd_solve(
+            posterior_precision, gradient, diagonal_boost=diagonal_boost
+        )
+    else:
+        (posterior_mean, posterior_precision), _ = jax.lax.scan(
+            _line_search_step, (x, prior_precision), None, length=max_newton_iter
+        )
+
+    posterior_cov = symmetrize(
+        psd_solve(posterior_precision, identity, diagonal_boost=diagonal_boost)
+    )
+
+    eta_mode = eta_func(posterior_mean)
+    mu_mode = family.mean(eta_mode)
+    log_likelihood = family.loglik_normalized(observations, eta_mode, mu_mode)
+
+    if include_laplace_normalization:
         delta = posterior_mean - one_step_mean
         quad = delta @ (prior_precision @ delta)
         logdet_prior = _logdet_psd(one_step_cov, diagonal_boost)
@@ -955,11 +1175,7 @@ def stochastic_point_process_filter(
     # (init_mean, init_cov, A, Q, design_matrix) arrays into per-neuron
     # factors. This is safe because block extraction is pure array
     # slicing — no host-side float() conversions.
-    if (
-        block_n_neurons is not None
-        and block_size is not None
-        and not force_dense
-    ):
+    if block_n_neurons is not None and block_size is not None and not force_dense:
         if spike_indicator.ndim == 1:
             raise ValueError(
                 "block_n_neurons / block_size can only be passed for "
@@ -1051,6 +1267,7 @@ def _stochastic_point_process_filter_impl(
     max_newton_iter: int = 1,
 ) -> tuple[Array, Array, Array]:
     """JIT-compiled inner implementation of the point process filter."""
+
     # Pre-compute gradient function outside the scan.
     def _log_intensity_with_design(design_matrix_t, x):
         log_lambda = log_conditional_intensity(design_matrix_t, x)
@@ -1069,8 +1286,7 @@ def _stochastic_point_process_filter_impl(
         one_step_mean = transition_matrix @ mean_prev
         variance_prev_sym = symmetrize(variance_prev)
         one_step_covariance = symmetrize(
-            transition_matrix @ variance_prev_sym @ transition_matrix.T
-            + process_cov
+            transition_matrix @ variance_prev_sym @ transition_matrix.T + process_cov
         )
 
         def log_intensity_func(x):
@@ -1099,9 +1315,12 @@ def _stochastic_point_process_filter_impl(
         )
 
     marginal_log_likelihood = jnp.array(0.0)
-    (_, _, marginal_log_likelihood), (
-        filtered_mean,
-        filtered_cov,
+    (
+        (_, _, marginal_log_likelihood),
+        (
+            filtered_mean,
+            filtered_cov,
+        ),
     ) = jax.lax.scan(
         _step,
         (init_mean_params, init_covariance_params, marginal_log_likelihood),
@@ -1152,9 +1371,7 @@ def _run_forward_block_diagonal(
         z_row_t, y_t = args
         one_step_mean = A_block @ mean_prev
         cov_prev_sym = symmetrize(cov_prev)
-        one_step_cov = symmetrize(
-            A_block @ cov_prev_sym @ A_block.T + Q_block
-        )
+        one_step_cov = symmetrize(A_block @ cov_prev_sym @ A_block.T + Q_block)
         spike_as_vec = jnp.atleast_1d(y_t)
 
         def _lin(x_block: Array) -> Array:
@@ -1319,9 +1536,7 @@ def _stochastic_point_process_filter_block_diagonal(
     # lls_per_neuron: (n_neurons,)
 
     # Reassemble concatenated filtered_mean of shape (n_time, n_state).
-    filtered_mean = jnp.transpose(means_per_neuron, (1, 0, 2)).reshape(
-        n_time, n_state
-    )
+    filtered_mean = jnp.transpose(means_per_neuron, (1, 0, 2)).reshape(n_time, n_state)
 
     # Reassemble dense block-diagonal filtered_cov via the shared scatter
     # helper. A future optimization could return a BlockCovariance view
@@ -1597,11 +1812,7 @@ def stochastic_point_process_smoother(
     # provided (as Python ints) and force_dense is False, we short-
     # circuit to _stochastic_point_process_smoother_block_diagonal
     # which vmaps the forward and backward passes per-neuron.
-    if (
-        block_n_neurons is not None
-        and block_size is not None
-        and not force_dense
-    ):
+    if block_n_neurons is not None and block_size is not None and not force_dense:
         if spike_indicator.ndim == 1:
             raise ValueError(
                 "block_n_neurons / block_size can only be passed for "
@@ -1655,7 +1866,10 @@ def stochastic_point_process_smoother(
 
     smoother_mean, smoother_cov, smoother_cross_cov = (
         _stochastic_point_process_smoother_backward(
-            filtered_mean, filtered_cov, process_cov, transition_matrix,
+            filtered_mean,
+            filtered_cov,
+            process_cov,
+            transition_matrix,
         )
     )
 
@@ -1673,15 +1887,22 @@ def _stochastic_point_process_smoother_backward(
     transition_matrix: Array,
 ) -> tuple[Array, Array, Array]:
     """JIT-compiled backward pass of the point process smoother."""
+
     def _step(carry, args):
         next_smoother_mean, next_smoother_cov = carry
         filter_mean, filter_cov = args
         smoother_mean, smoother_cov, smoother_cross_cov = _kalman_smoother_update(
-            next_smoother_mean, next_smoother_cov,
-            filter_mean, filter_cov, process_cov, transition_matrix,
+            next_smoother_mean,
+            next_smoother_cov,
+            filter_mean,
+            filter_cov,
+            process_cov,
+            transition_matrix,
         )
         return (smoother_mean, smoother_cov), (
-            smoother_mean, smoother_cov, smoother_cross_cov,
+            smoother_mean,
+            smoother_cov,
+            smoother_cross_cov,
         )
 
     (_, _), (smoother_mean, smoother_cov, smoother_cross_cov) = jax.lax.scan(
@@ -2239,7 +2460,8 @@ class PointProcessModel(SGDFittableMixin):
         )
 
         return super().fit_sgd(
-            design_matrix, spike_indicator,
+            design_matrix,
+            spike_indicator,
             optimizer=optimizer,
             num_steps=num_steps,
             verbose=verbose,
@@ -2312,9 +2534,7 @@ class PointProcessModel(SGDFittableMixin):
         if "init_cov" in params:
             self.init_cov = params["init_cov"]
 
-    def _finalize_sgd(
-        self, design_matrix: Array, spike_indicator: Array
-    ) -> None:
+    def _finalize_sgd(self, design_matrix: Array, spike_indicator: Array) -> None:
         (
             self.smoother_mean,
             self.smoother_cov,

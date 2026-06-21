@@ -18,6 +18,8 @@ from state_space_practice.circular_stats import (
 from state_space_practice.coupling_model import (
     CouplingModelParams,
     build_transition,
+    deinterleave_coupling,
+    interleave_coupling,
     logit,
     validate_coupling_params,
 )
@@ -78,6 +80,37 @@ class TestModelMaps:
         np.testing.assert_allclose(np.asarray(Q), np.diag(np.repeat(var, 2)))
 
 
+class TestInterleaveCoupling:
+    def test_interleave_layout(self):
+        """(S,J) real/imag blocks -> [bR_0, bI_0, bR_1, bI_1, ...]."""
+        design = interleave_coupling(
+            beta_real=jnp.array([[1.0, 3.0]]), beta_imag=jnp.array([[2.0, 4.0]])
+        )
+        np.testing.assert_array_equal(np.asarray(design), [[1.0, 2.0, 3.0, 4.0]])
+
+    def test_roundtrip(self):
+        """deinterleave(interleave(bR, bI)) == (bR, bI)."""
+        br = jnp.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+        bi = jnp.array([[-1.0, -2.0, -3.0], [-4.0, -5.0, -6.0]])
+        out_r, out_i = deinterleave_coupling(interleave_coupling(br, bi))
+        np.testing.assert_array_equal(np.asarray(out_r), np.asarray(br))
+        np.testing.assert_array_equal(np.asarray(out_i), np.asarray(bi))
+
+    def test_design_row_matches_logit_coupling(self, coupling_params_small):
+        """interleave(beta) @ state equals the coupling term of logit().
+
+        Pins the single-source-of-truth contract: the interleaved design row and
+        the model logit use the same band-interleaved layout, so the EKF/PG
+        design rows cannot drift from the simulator's logit.
+        """
+        params = coupling_params_small
+        state = jnp.arange(1.0, 2 * params.osc_frequencies.shape[0] + 1)  # (2J,)
+        design = interleave_coupling(params.beta_real, params.beta_imag)
+        coupling_term = np.asarray(design @ state)
+        expected = np.asarray(logit(state, params) - params.baseline)
+        np.testing.assert_allclose(coupling_term, expected, atol=1e-12)
+
+
 class TestSimulatorBasics:
     def test_spikes_binary(self, simulated_coupling_small):
         assert set(np.unique(np.asarray(simulated_coupling_small.spikes))) <= {0.0, 1.0}
@@ -87,6 +120,18 @@ class TestSimulatorBasics:
         expected = np.array([[True, False], [True, False], [True, False]])
         np.testing.assert_array_equal(
             np.asarray(simulated_coupling_small.coupling_mask), expected
+        )
+
+    def test_lfp_is_latent_plus_noise(
+        self, simulated_coupling_small, coupling_params_small
+    ):
+        """The LFP is the latent observed through N(0, lfp_noise_var) noise."""
+        sim = simulated_coupling_small
+        assert sim.lfp.shape == sim.latent_true.shape
+        resid = np.asarray(sim.lfp) - np.asarray(sim.latent_true)
+        np.testing.assert_allclose(resid.mean(axis=0), 0.0, atol=0.05)
+        np.testing.assert_allclose(
+            resid.var(axis=0), coupling_params_small.lfp_noise_var, rtol=0.15
         )
 
     def test_determinism(self, coupling_params_small):
@@ -248,3 +293,9 @@ class TestValidation:
     def test_rejects_nonpositive_n_time(self, coupling_params_small):
         with pytest.raises(ValueError, match="n_time"):
             simulate_coupling(coupling_params_small, n_time=0, seed=0)
+
+    def test_rejects_nonpositive_lfp_noise(self, coupling_params_small):
+        with pytest.raises(ValueError, match="lfp_noise_var"):
+            simulate_coupling(
+                coupling_params_small._replace(lfp_noise_var=0.0), n_time=100, seed=0
+            )

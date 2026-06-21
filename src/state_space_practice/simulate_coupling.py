@@ -53,7 +53,11 @@ def simulate_coupling(
     transition_matrix, process_covariance = build_transition(params)
     n_latent = transition_matrix.shape[0]
 
-    init_key, noise_key, spike_key = jax.random.split(jax.random.PRNGKey(seed), 3)
+    base_key = jax.random.PRNGKey(seed)
+    init_key, noise_key, spike_key = jax.random.split(base_key, 3)
+    # Derive the LFP key independently so adding the field does not perturb the
+    # latent/spike RNG stream (existing seeds reproduce their prior values).
+    lfp_key = jax.random.fold_in(base_key, 1)
 
     # Start from the oscillator stationary distribution so early bins are not a
     # warm-up transient: each component has variance var / (1 - decay**2).
@@ -80,10 +84,16 @@ def simulate_coupling(
     eta = params.baseline[None, :] + re @ params.beta_real.T + im @ params.beta_imag.T
     spikes = jax.random.bernoulli(spike_key, sigmoid(eta)).astype(jnp.float64)
 
+    # Field observation: the latent seen through isotropic Gaussian noise.
+    lfp = latent + jnp.sqrt(params.lfp_noise_var) * jax.random.normal(
+        lfp_key, latent.shape
+    )
+
     coupling_mask = (params.beta_real**2 + params.beta_imag**2) > 0
 
     return SimulatedCoupling(
         spikes=spikes,
+        lfp=lfp,
         latent_true=latent,
         beta_real_true=params.beta_real,
         beta_imag_true=params.beta_imag,

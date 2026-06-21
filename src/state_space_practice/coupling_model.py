@@ -53,6 +53,13 @@ class CouplingModelParams(NamedTuple):
         must be ``None``. Kept in the contract so adding it later does not change
         the type. Placed last (after ``dt``) because NamedTuple requires
         defaulted fields to follow non-defaulted ones.
+    lfp_noise_var : float
+        Isotropic variance of the LFP observation noise. The latent is also
+        observed as a "field": ``lfp_k = x_k + N(0, lfp_noise_var * I)`` (the
+        measurement matrix is the identity). The LFP is what makes coupling
+        inference well-posed — it pins the latent ``x`` so spikes only need to
+        identify the coupling. (Observing the full state is an idealization; a
+        lower-dimensional real-valued LFP projection is a future refinement.)
     """
 
     osc_frequencies: Array
@@ -63,6 +70,7 @@ class CouplingModelParams(NamedTuple):
     baseline: Array
     dt: float
     history_kernel: Optional[Array] = None
+    lfp_noise_var: float = 0.25
 
 
 class SimulatedCoupling(NamedTuple):
@@ -72,6 +80,8 @@ class SimulatedCoupling(NamedTuple):
     ----------
     spikes : Array, shape (T, S)
         0/1 Bernoulli draws.
+    lfp : Array, shape (T, 2J)
+        Noisy field observation of the latent, ``x_k + N(0, lfp_noise_var * I)``.
     latent_true : Array, shape (T, 2J)
         True latent trajectory, ordered ``[re_0, im_0, ...]``.
     beta_real_true, beta_imag_true : Array, shape (S, J)
@@ -89,6 +99,7 @@ class SimulatedCoupling(NamedTuple):
     """
 
     spikes: Array
+    lfp: Array
     latent_true: Array
     beta_real_true: Array
     beta_imag_true: Array
@@ -143,6 +154,8 @@ def validate_coupling_params(params: CouplingModelParams) -> None:
         raise ValueError("process_noise_var must be nonnegative")
     if not params.dt > 0.0:
         raise ValueError(f"dt must be positive, got {params.dt}")
+    if not params.lfp_noise_var > 0.0:
+        raise ValueError(f"lfp_noise_var must be positive, got {params.lfp_noise_var}")
     for name in ("osc_frequencies", "beta_real", "beta_imag", "baseline"):
         if not np.all(np.isfinite(np.asarray(getattr(params, name)))):
             raise ValueError(f"{name} contains non-finite values")
@@ -187,3 +200,49 @@ def logit(state: ArrayLike, params: CouplingModelParams) -> Array:
     re = state[0::2]  # (J,)
     im = state[1::2]  # (J,)
     return params.baseline + params.beta_real @ re + params.beta_imag @ im
+
+
+def interleave_coupling(beta_real: ArrayLike, beta_imag: ArrayLike) -> Array:
+    """Pack ``(S, J)`` real/imag coupling blocks into interleaved design rows.
+
+    The latent state is ordered ``[re_0, im_0, re_1, im_1, ...]``, so the matching
+    coupling "design row" for neuron ``s`` is
+    ``[beta_real[s,0], beta_imag[s,0], beta_real[s,1], beta_imag[s,1], ...]``.
+    Then ``design_row @ state`` equals the coupling term of the logit (the
+    per-band sum ``sum_j beta_real[s,j] re_j + beta_imag[s,j] im_j``).
+
+    This is the single source of truth for the real/imag <-> interleaved
+    conversion, shared by the simulator, the EKF augmented state, and the PG
+    design, so the four sites cannot drift apart.
+
+    Parameters
+    ----------
+    beta_real, beta_imag : ArrayLike, shape (S, J)
+
+    Returns
+    -------
+    design : Array, shape (S, 2J)
+        Interleaved coupling, columns ``[bR_0, bI_0, bR_1, bI_1, ...]``.
+    """
+    beta_real = jnp.asarray(beta_real)
+    beta_imag = jnp.asarray(beta_imag)
+    n_neurons, n_bands = beta_real.shape
+    return jnp.stack([beta_real, beta_imag], axis=-1).reshape(n_neurons, 2 * n_bands)
+
+
+def deinterleave_coupling(design: ArrayLike) -> tuple[Array, Array]:
+    """Inverse of :func:`interleave_coupling`: split interleaved rows into blocks.
+
+    Parameters
+    ----------
+    design : ArrayLike, shape (S, 2J)
+        Interleaved coupling, columns ``[bR_0, bI_0, bR_1, bI_1, ...]``.
+
+    Returns
+    -------
+    beta_real, beta_imag : Array, shape (S, J)
+    """
+    design = jnp.asarray(design)
+    n_neurons, n_interleaved = design.shape
+    blocks = design.reshape(n_neurons, n_interleaved // 2, 2)
+    return blocks[..., 0], blocks[..., 1]
