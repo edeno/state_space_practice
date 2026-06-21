@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **Manager**: [uv](https://docs.astral.sh/uv/). `uv.lock` is committed; the environment is reproducible.
 - **Python version**: 3.10-3.12 (uv provisions an interpreter automatically)
-- **Set up**: `uv sync --extra test` (creates `.venv` with all runtime + dev/test dependencies, and installs the package editable)
+- **Set up**: `uv sync --extra test --extra coupling` (creates `.venv` with runtime + dev/test deps and installs the package editable; the `coupling` extra adds `polyagamma`, used by the Polya-Gamma coupling estimator and its tests)
 
 ## Common Commands
 

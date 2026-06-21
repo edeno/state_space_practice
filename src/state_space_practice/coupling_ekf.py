@@ -21,12 +21,11 @@ import numpy as np
 
 from state_space_practice.coupling_model import (
     CouplingModelParams,
-    build_transition,
     deinterleave_coupling,
+    smooth_latent_from_lfp,
     validate_coupling_params,
 )
 from state_space_practice.coupling_validation import CouplingPosterior
-from state_space_practice.kalman import kalman_smoother
 from state_space_practice.point_process_kalman import (
     BERNOULLI_LOGIT_FAMILY,
     glm_laplace_update,
@@ -66,8 +65,7 @@ def fit_coupling_ekf(
     validate_coupling_params(params)
     spikes = jnp.asarray(spikes)
     lfp = jnp.asarray(lfp)
-    transition_matrix, process_cov = build_transition(params)
-    n_latent = transition_matrix.shape[0]
+    n_latent = 2 * int(np.shape(params.osc_frequencies)[0])
     n_neurons = int(np.shape(params.beta_real)[0])
 
     # Cross-check shapes so a mismatch raises rather than silently broadcasting or
@@ -81,22 +79,8 @@ def fit_coupling_ekf(
             f"lfp must have shape ({spikes.shape[0]}, {n_latent}); got {tuple(lfp.shape)}"
         )
 
-    # Stage 1: Kalman-smooth the latent from the LFP (H = I, R = lfp_noise_var I).
-    stationary_var = jnp.asarray(params.process_noise_var) / (
-        1.0 - jnp.asarray(params.osc_decay) ** 2
-    )
-    init_cov = jnp.diag(jnp.repeat(stationary_var, 2))
-    measurement_matrix = jnp.eye(n_latent)
-    measurement_cov = params.lfp_noise_var * jnp.eye(n_latent)
-    smoothed_latent, *_ = kalman_smoother(
-        jnp.zeros(n_latent),
-        init_cov,
-        lfp,
-        transition_matrix,
-        process_cov,
-        measurement_matrix,
-        measurement_cov,
-    )
+    # Stage 1: Kalman-smooth the latent from the LFP (shared with the PG estimator).
+    smoothed_latent = smooth_latent_from_lfp(lfp, params)
 
     # Stage 2: per-neuron Bernoulli logistic regression of spikes on smoothed x.
     # eta(beta) = baseline + smoothed_latent @ beta is linear in beta, so its

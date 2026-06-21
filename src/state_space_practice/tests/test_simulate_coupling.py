@@ -21,6 +21,7 @@ from state_space_practice.coupling_model import (
     deinterleave_coupling,
     interleave_coupling,
     logit,
+    smooth_latent_from_lfp,
     validate_coupling_params,
 )
 from state_space_practice.simulate_coupling import simulate_coupling
@@ -109,6 +110,20 @@ class TestInterleaveCoupling:
         coupling_term = np.asarray(design @ state)
         expected = np.asarray(logit(state, params) - params.baseline)
         np.testing.assert_allclose(coupling_term, expected, atol=1e-12)
+
+
+class TestSmoothLatentFromLFP:
+    def test_smoothed_tracks_truth_better_than_raw_lfp(
+        self, simulated_coupling_small, coupling_params_small
+    ):
+        """The LFP smoother denoises toward the true latent (lower MAE than raw LFP)."""
+        sim = simulated_coupling_small
+        smoothed = np.asarray(smooth_latent_from_lfp(sim.lfp, coupling_params_small))
+        truth = np.asarray(sim.latent_true)
+        mae_smoothed = np.mean(np.abs(smoothed - truth))
+        mae_raw = np.mean(np.abs(np.asarray(sim.lfp) - truth))
+        assert smoothed.shape == truth.shape
+        assert mae_smoothed < mae_raw  # smoothing genuinely recovers the latent
 
 
 class TestSimulatorBasics:

@@ -1747,6 +1747,33 @@ wheels = [
 ]
 
 [[package]]
+name = "polyagamma"
+version = "2.0.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5e/f3/d829de9140ad15ffb011a81e1c252cea5815bd178ecea94d6f89b6c2ccf7/polyagamma-2.0.2.tar.gz", hash = "sha256:7fbadf5845433c7a81293503edf73020a3825935433d2bae2a5dd68183516f4c", size = 119776, upload-time = "2025-03-21T15:04:50.616Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ad/f2/f3fab90f4d5c677357ab41498b10c64a732e9d7667ba926e79b63043c8f7/polyagamma-2.0.2-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:b2bb325d3ed04ca186b780461dfa196cd492919c1bb5d86a6f3d95b6065b6283", size = 85513, upload-time = "2025-03-21T15:04:22.028Z" },
+    { url = "https://files.pythonhosted.org/packages/81/61/8b411b977b3f855222fed207c08b73ec09ae36a85e1834fe5d77162cd1f7/polyagamma-2.0.2-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:a2581e6f3bb4086c5c3970172a5ccbb8acdab79284e36c5615c452de9dfa0a4b", size = 226449, upload-time = "2025-03-21T15:04:23.688Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/0c/964e6ea012c2c224d8ecc1f1de7484b8e9b6be8d7598ea8c29bc1d48ed49/polyagamma-2.0.2-cp310-cp310-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c4f8b00eafe34d3ad47c40b5b32c48f44f8452f94a894dd2e440be8cc0fb4006", size = 231953, upload-time = "2025-03-21T15:04:25.682Z" },
+    { url = "https://files.pythonhosted.org/packages/4d/84/2edf4baf81c41b19394830296ee800e5e00df1519ea336ab13c0821b1e19/polyagamma-2.0.2-cp310-cp310-musllinux_1_2_x86_64.whl", hash = "sha256:cd807eea4ebb60e074399f058aa626280e7188f8f0dadda084ffb05e724cd6aa", size = 237451, upload-time = "2025-03-21T15:04:27.261Z" },
+    { url = "https://files.pythonhosted.org/packages/86/b4/237c484ae57e474a5fe5bd55d55759bec3e8d31050a7152a16554cc8edfd/polyagamma-2.0.2-cp310-cp310-win_amd64.whl", hash = "sha256:224284be13ff4ff05733e45a9f804220431b29fd56b08f1917d0848862164fee", size = 86806, upload-time = "2025-03-21T15:04:28.811Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/15/a662d7850d8b8ddedf92bb93906d7725d73077bdb9eaa1da127575dae41f/polyagamma-2.0.2-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:d52cc24077c66cc25130d7047eb24edaaf7ff68025be77ea6a3de7a8659bdd1d", size = 85558, upload-time = "2025-03-21T15:04:29.876Z" },
+    { url = "https://files.pythonhosted.org/packages/bf/04/e0885204b4fd551ec009a63e348342c4eff7420bfd4fba01afde860238f8/polyagamma-2.0.2-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:aa8f2ee20e78db0acf1f5603f7020337be95e6a29d290fbdf2d521aff4dbb684", size = 235805, upload-time = "2025-03-21T15:04:31.306Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/9b/36dfad2564ab332b81fd8791fce74c42f15abe7ee87b681b5f1dbf39f159/polyagamma-2.0.2-cp311-cp311-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c51089f24cb7caf855cab7e1e1277467e1c0b03df2d8c8899e723c8561616140", size = 240873, upload-time = "2025-03-21T15:04:32.464Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/05/3d67adcdea30c57f21b1bbb8bed845a221622fc5e637556fe996573695c7/polyagamma-2.0.2-cp311-cp311-musllinux_1_2_x86_64.whl", hash = "sha256:5181b896bd62a6c6bf9b9ee91d796e8c6537e1edc507936ca775c75a03e38421", size = 247194, upload-time = "2025-03-21T15:04:33.954Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/de/88afda42d1eb553f5a759e3e18417e172ea2ad89d438b98db44087890df7/polyagamma-2.0.2-cp311-cp311-win_amd64.whl", hash = "sha256:a52ff80b41f02b3c3930743c024f632e21a37e35cd0444ba6d7ab19db210104a", size = 86836, upload-time = "2025-03-21T15:04:35.106Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/25/0a1610694a925f5f66e3626140617209c2255a684a865278e0dd36a163ec/polyagamma-2.0.2-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:67a3004f99bd5d4a9cceeb82cd7554f131c2eb4aa98b17d76a4a75c3ba38fcaf", size = 86145, upload-time = "2025-03-21T15:04:36.143Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/3d/dce3d3c404bb686751f5c55ad1190c55ee5e9d17c9913a8ed5fddb727041/polyagamma-2.0.2-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:6d6a83e4be7acb4d8ae4b507e50d211d016c76670f78bae116ff02432dfdc1d4", size = 246591, upload-time = "2025-03-21T15:04:37.131Z" },
+    { url = "https://files.pythonhosted.org/packages/c7/c3/2f36de5ab1c75cda80532339eb13470ad5c200e4c90b598220592f605ed8/polyagamma-2.0.2-cp312-cp312-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:4d0429c4a398e4a36142b7eac1e061bd6b42def85c6281be7db32cc58d1d9760", size = 252811, upload-time = "2025-03-21T15:04:38.37Z" },
+    { url = "https://files.pythonhosted.org/packages/78/43/6c6c52a193b2ecc966e5a2e5c9aa04e2c102d57fe36ffe793917d1d48a2f/polyagamma-2.0.2-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:815a4adfdaf5c1ae9cebbe20dfdfb13234e06d1da8d786b68e83d9d6412bc01a", size = 259148, upload-time = "2025-03-21T15:04:42.034Z" },
+    { url = "https://files.pythonhosted.org/packages/f7/b0/8310fa61dfa6c5e07c7c701bc3b1170bac371f8f6acdd584574146c76dc6/polyagamma-2.0.2-cp312-cp312-win_amd64.whl", hash = "sha256:e7f80da4fb34e9e69a7671ceff72e7a27b5866f72364593bf9a0c7468569ce6e", size = 87343, upload-time = "2025-03-21T15:04:43.643Z" },
+]
+
+[[package]]
 name = "probeinterface"
 version = "0.3.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2518,6 +2545,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+coupling = [
+    { name = "polyagamma" },
+]
 gpu = [
     { name = "jax", version = "0.6.2", source = { registry = "https://pypi.org/simple" }, extra = ["cuda"], marker = "python_full_version < '3.11'" },
     { name = "jax", version = "0.10.2", source = { registry = "https://pypi.org/simple" }, extra = ["cuda"], marker = "python_full_version >= '3.11'" },
@@ -2548,6 +2578,7 @@ requires-dist = [
     { name = "optax" },
     { name = "pandas" },
     { name = "patsy" },
+    { name = "polyagamma", marker = "extra == 'coupling'" },
     { name = "pytest", marker = "extra == 'test'" },
     { name = "pytest-cov", marker = "extra == 'test'" },
     { name = "ruff", marker = "extra == 'test'" },
@@ -2559,7 +2590,7 @@ requires-dist = [
     { name = "track-linearization" },
     { name = "xarray" },
 ]
-provides-extras = ["gpu", "test", "viz"]
+provides-extras = ["coupling", "gpu", "test", "viz"]
 
 [[package]]
 name = "threadpoolctl"

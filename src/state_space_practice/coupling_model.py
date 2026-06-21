@@ -23,6 +23,7 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.kalman import kalman_smoother
 from state_space_practice.oscillator_utils import (
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
@@ -200,6 +201,42 @@ def logit(state: ArrayLike, params: CouplingModelParams) -> Array:
     re = state[0::2]  # (J,)
     im = state[1::2]  # (J,)
     return params.baseline + params.beta_real @ re + params.beta_imag @ im
+
+
+def smooth_latent_from_lfp(lfp: ArrayLike, params: CouplingModelParams) -> Array:
+    """Kalman-smooth the latent from the LFP (``H = I``, ``R = lfp_noise_var I``).
+
+    Stage 1 of both coupling estimators: the field observes the latent, so this is
+    a linear-Gaussian RTS smoother (no spikes, no bilinear degeneracy). The initial
+    covariance is the oscillator stationary covariance. Returns only the smoothed
+    mean — using it as a fixed design for the coupling regression is the plug-in
+    approximation (it ignores the smoother's posterior uncertainty in ``x``).
+
+    Parameters
+    ----------
+    lfp : ArrayLike, shape (T, 2J)
+    params : CouplingModelParams
+
+    Returns
+    -------
+    smoothed_latent : Array, shape (T, 2J)
+    """
+    transition_matrix, process_cov = build_transition(params)
+    n_latent = transition_matrix.shape[0]
+    stationary_var = jnp.asarray(params.process_noise_var) / (
+        1.0 - jnp.asarray(params.osc_decay) ** 2
+    )
+    init_cov = jnp.diag(jnp.repeat(stationary_var, 2))
+    smoothed_latent, *_ = kalman_smoother(
+        jnp.zeros(n_latent),
+        init_cov,
+        jnp.asarray(lfp),
+        transition_matrix,
+        process_cov,
+        jnp.eye(n_latent),
+        params.lfp_noise_var * jnp.eye(n_latent),
+    )
+    return smoothed_latent
 
 
 def interleave_coupling(beta_real: ArrayLike, beta_imag: ArrayLike) -> Array:

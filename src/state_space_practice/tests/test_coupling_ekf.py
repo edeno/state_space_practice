@@ -61,7 +61,10 @@ class TestRecovery:
         assert mask.any() and not mask.all()  # guard: coupled AND control bands exist
 
         _, pval = wald_test(post)
-        det = detection_metrics(pval, mask)
+        # alpha=0.01: with 3 control entries the family-wise false-positive rate at
+        # 0.05 is ~14%, so a borderline control fluctuation (p~0.05) flips `fp` by
+        # luck. 0.01 controls FWER here, while true couplings have p~0.
+        det = detection_metrics(pval, mask, alpha=0.01)
         assert det["fp"] == 0  # no control band flagged
         assert det["f1"] == 1.0  # every coupled band detected
 
