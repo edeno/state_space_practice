@@ -651,3 +651,36 @@ def make_ground_truth():
         )
 
     return _make
+
+
+@pytest.fixture(scope="module")
+def coupling_params_small():
+    """A small Bernoulli-logistic coupling model: 3 neurons, 2 bands.
+
+    Band 0 is couplable (neurons get known magnitude/phase), band 1 is a
+    false-positive control (all-zero coupling). Stationary latent variance is 1
+    per component (``process_noise_var / (1 - decay**2) = 1``), so coupling of
+    magnitude 2 modulates the logit strongly. Base rate is ``sigmoid(baseline)``
+    = 0.05 per 1 ms bin.
+    """
+    from state_space_practice.coupling_model import CouplingModelParams
+
+    baseline_logit = float(np.log(0.05 / 0.95))
+    return CouplingModelParams(
+        osc_frequencies=jnp.array([6.0, 10.0]),
+        osc_decay=jnp.array([0.99, 0.99]),
+        process_noise_var=jnp.array([1.0 - 0.99**2, 1.0 - 0.99**2]),
+        # neuron 0 -> band0 phase 0; neuron 1 -> band0 phase pi/2; neuron 2 -> band0 phase pi
+        beta_real=jnp.array([[2.0, 0.0], [0.0, 0.0], [-2.0, 0.0]]),
+        beta_imag=jnp.array([[0.0, 0.0], [2.0, 0.0], [0.0, 0.0]]),
+        baseline=jnp.full((3,), baseline_logit),
+        dt=1e-3,
+    )
+
+
+@pytest.fixture(scope="module")
+def simulated_coupling_small(coupling_params_small):
+    """A single simulation of ``coupling_params_small`` (5000 bins, seed 0)."""
+    from state_space_practice.simulate_coupling import simulate_coupling
+
+    return simulate_coupling(coupling_params_small, n_time=5000, seed=0)
