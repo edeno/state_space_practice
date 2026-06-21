@@ -1,5 +1,12 @@
 # Dynamic Neuron-to-Neuron Spike Coupling Implementation Plan
 
+> **Update (2026-06-21): safe + de-risked.** This plan's regressors are *observed*
+> lagged spikes (not an unobserved latent), so it avoids the bilinear degeneracy
+> that blocks the latent-oscillator coupling plans (see
+> [2026-06-21-spike-field-coupling-findings.md](2026-06-21-spike-field-coupling-findings.md)).
+> Reuse `glm_laplace_update` + `GLMFamily(POISSON)` for the spike GLM update rather
+> than building a bespoke one.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
 >
 > **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.

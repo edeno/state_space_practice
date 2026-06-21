@@ -1,5 +1,11 @@
 # Numerical Stability Remediation Implementation Plan
 
+> **Update (2026-06-21):** consolidate the point-process Laplace update onto the new
+> `glm_laplace_update` + `poisson_family` (bit-for-bit with the legacy
+> `_point_process_laplace_update`, PSD by construction). Tracked follow-up: fold the
+> legacy update into this shared core. See
+> [2026-06-21-spike-field-coupling-findings.md](2026-06-21-spike-field-coupling-findings.md).
+
 > **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
 
 **Goal:** Eliminate the highest-risk correctness and numerical stability problems in the Kalman, switching Kalman, and point-process code paths without changing the intended model semantics.

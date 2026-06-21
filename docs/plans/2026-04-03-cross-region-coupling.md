@@ -1,5 +1,14 @@
 # Cross-Region Oscillator Coupling with Subpopulation Discovery Implementation Plan
 
+> **⚠ Update (2026-06-21): blocked as specified — read first.** This plan infers
+> per-region latent oscillators *and* cross-region loadings from **spikes alone**,
+> which is degenerate: the bilinear spike logit `η = β·x` has a zero Jacobian at the
+> symmetric point, so joint estimators cannot bootstrap (verified empirically). See
+> [2026-06-21-spike-field-coupling-findings.md](2026-06-21-spike-field-coupling-findings.md).
+> Revise to require a per-region LFP and the LFP-conditioned two-stage estimator
+> (smooth each latent from its LFP, then regress coupling from spikes); reuse the new
+> `coupling_*` modules / `glm_laplace_update` instead of bespoke updates.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
 >
 > **Execution mode:** Finish one task completely before starting the next one. If any prerequisite gate or verification gate fails, stop and resolve that issue before continuing.

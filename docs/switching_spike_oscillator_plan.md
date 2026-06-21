@@ -1,5 +1,13 @@
 # Implementation Plan: Switching Spike-Based Oscillator Networks
 
+> **⚠ Update (2026-06-21): identifiability caveat — read first.** Inferring the
+> switching oscillator dynamics *and* the spike loadings from spikes alone is
+> degenerate (bilinear `η = β·x`; EM monotonicity does **not** imply identifiability
+> — monotone EM can converge to a garbage optimum). See
+> [plans/2026-06-21-spike-field-coupling-findings.md](plans/2026-06-21-spike-field-coupling-findings.md).
+> Add an LFP observation and make the LFP-smoothing pass a stage of the pipeline
+> (§7.2), not just a comparison baseline.
+
 This document outlines the implementation plan for a **Switching Linear Dynamical System (SLDS)** that combines:
 
 - Oscillator network dynamics with switching discrete states (DIM/CNM style)

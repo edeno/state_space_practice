@@ -1,5 +1,13 @@
 # Differentiable Parameter Optimization for Existing State-Space Models Implementation Plan
 
+> **Update (2026-06-21):** the point-process extension (Task 5) is de-risked — a
+> family-generic, PSD-by-construction Laplace update (`glm_laplace_update` /
+> `GLMFamily`) now exists, and the Laplace approximation was validated against an
+> exact Polya-Gamma reference. See
+> [2026-06-21-spike-field-coupling-findings.md](2026-06-21-spike-field-coupling-findings.md).
+> Caveat: any *joint latent + multiplicative-parameter* extension hits the bilinear
+> degeneracy and needs an observed anchor (an LFP), not just optimization.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
 
 **Goal:** Add a gradient-based alternative to closed-form EM for models that already exist in this repository, starting with linear-Gaussian systems and only then extending to point-process models.

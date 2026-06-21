@@ -1,5 +1,13 @@
 # Hamiltonian Oscillator State-Space Model Implementation Plan
 
+> **Update (2026-06-21):** "Known Risk #1: zero-gradient startup through the
+> Hamiltonian parameters" is a real degeneracy, confirmed empirically elsewhere
+> (see [2026-06-21-spike-field-coupling-findings.md](2026-06-21-spike-field-coupling-findings.md)).
+> Harden acceptance to check ground-truth latent recovery (not only "LL improves"),
+> keep the Gaussian/LFP-observation wrapper as the de-risking fallback, and use the
+> public `glm_laplace_update`/`GLMFamily` rather than the private
+> `_point_process_laplace_update`.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
 
 **Goal:** Build a SymODEN-style latent oscillator model for neural data: symplectic Hamiltonian latent dynamics, stochastic state uncertainty, and existing Gaussian or point-process observation likelihoods.
