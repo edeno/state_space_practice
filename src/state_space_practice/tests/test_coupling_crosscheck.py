@@ -1,0 +1,115 @@
+"""Tests for the EKF-vs-PG cross-check harness."""
+
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from state_space_practice.coupling_crosscheck import (
+    _score,
+    aggregate,
+    run_crosscheck,
+    scale_coupling,
+)
+from state_space_practice.coupling_validation import CouplingPosterior
+
+
+def _fake_sim(beta_real_true, beta_imag_true, mask):
+    return SimpleNamespace(
+        coupling_mask=np.asarray(mask, dtype=bool),
+        beta_real_true=np.asarray(beta_real_true, dtype=float),
+        beta_imag_true=np.asarray(beta_imag_true, dtype=float),
+    )
+
+
+class TestScore:
+    def test_perfect_recovery(self):
+        """Mean == truth -> zero bias, full coverage, expected Gaussian CI width."""
+        post = CouplingPosterior(
+            beta_real_mean=np.array([[1.0]]),
+            beta_imag_mean=np.array([[0.0]]),
+            beta_real_var=np.array([[0.01]]),
+            beta_imag_var=np.array([[0.01]]),
+            samples=None,
+        )
+        sim = _fake_sim([[1.0]], [[0.0]], [[True]])
+        s = _score(post, sim)
+        assert s["abs_bias"] == pytest.approx(0.0, abs=1e-9)
+        assert s["coverage95"] == 1.0
+        # Gaussian 95% width = 2 * 1.95996 * sd
+        assert s["ci_width"] == pytest.approx(2 * 1.959964 * 0.1, rel=1e-3)
+        assert s["phase_mae"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_coverage_detects_miss(self):
+        """A real mean far from truth (tight CI) drops coverage to 0.5 (imag still ok)."""
+        post = CouplingPosterior(
+            beta_real_mean=np.array([[1.0]]),
+            beta_imag_mean=np.array([[0.0]]),
+            beta_real_var=np.array([[1e-4]]),  # tight: CI excludes the true 5.0
+            beta_imag_var=np.array([[1e-4]]),
+            samples=None,
+        )
+        sim = _fake_sim([[5.0]], [[0.0]], [[True]])
+        s = _score(post, sim)
+        assert s["coverage95"] == 0.5  # real component missed, imag covered
+
+
+class TestAggregate:
+    def test_groups_and_averages(self):
+        records = [
+            {
+                "coupling_mag": 1.0,
+                "replicate": 0,
+                "ekf": {"abs_bias": 0.1},
+                "pg": {"abs_bias": 0.2},
+                "ekf_pg_mean_maxdiff": 0.05,
+            },
+            {
+                "coupling_mag": 1.0,
+                "replicate": 1,
+                "ekf": {"abs_bias": 0.3},
+                "pg": {"abs_bias": 0.4},
+                "ekf_pg_mean_maxdiff": 0.07,
+            },
+        ]
+        agg = aggregate(records)
+        assert agg[1.0]["n"] == 2
+        assert agg[1.0]["ekf"]["abs_bias"] == pytest.approx(0.2)
+        assert agg[1.0]["pg"]["abs_bias"] == pytest.approx(0.3)
+        assert agg[1.0]["ekf_pg_mean_maxdiff"] == pytest.approx(0.06)
+
+
+class TestScaleCoupling:
+    def test_scales_magnitude(self, coupling_params_small):
+        scaled = scale_coupling(coupling_params_small, 0.5)
+        np.testing.assert_allclose(
+            np.asarray(scaled.beta_real),
+            0.5 * np.asarray(coupling_params_small.beta_real),
+        )
+        # non-coupling fields untouched
+        np.testing.assert_array_equal(
+            np.asarray(scaled.osc_frequencies),
+            np.asarray(coupling_params_small.osc_frequencies),
+        )
+
+
+@pytest.mark.slow
+class TestIntegration:
+    def test_runs_and_methods_agree_on_strong_cell(self, coupling_params_small):
+        records = run_crosscheck(
+            coupling_params_small,
+            scales=[1.0],
+            n_time=4000,
+            n_replicates=1,
+            pg_n_iter=200,
+            pg_burn_in=100,
+        )
+        assert len(records) == 1
+        rec = records[0]
+        for method in ("ekf", "pg"):
+            for value in rec[method].values():
+                assert np.isfinite(value)
+        # strong coupling: both detect perfectly and the two methods agree closely
+        assert rec["ekf"]["detection_auc"] == 1.0
+        assert rec["pg"]["detection_auc"] == 1.0
+        assert rec["ekf_pg_mean_maxdiff"] < 0.15
