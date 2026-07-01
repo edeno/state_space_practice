@@ -556,8 +556,8 @@ class BaseModel(ABC, SGDFittableMixin):
             filter_mean,
             filter_cov,
             filter_discrete_state_prob,
-            last_cond_cont_mean,
-            _,  # last_pair_cond_filter_cov (used by GPB2 only)
+            pair_cond_filter_mean,
+            _,  # pair_cond_filter_cov trajectory (used by GPB2 only)
             marginal_log_likelihood,
         ) = switching_kalman_filter(
             init_state_cond_mean=self.init_mean,
@@ -585,7 +585,7 @@ class BaseModel(ABC, SGDFittableMixin):
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_discrete_state_prob,
-            last_filter_conditional_cont_mean=last_cond_cont_mean,
+            last_filter_conditional_cont_mean=pair_cond_filter_mean[-1],
             process_cov=self.process_cov,
             continuous_transition_matrix=self.continuous_transition_matrix,
             discrete_state_transition_matrix=self.discrete_transition_matrix,

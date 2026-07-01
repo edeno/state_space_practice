@@ -411,8 +411,8 @@ def test_switching_kalman_filter_shapes(simple_skf_model: tuple) -> None:
         filt_m,
         filt_c,
         filt_p,
-        last_pair_m,
-        _,  # last_pair_cond_filter_cov
+        pair_cond_m,
+        _,  # pair_cond_filter_cov trajectory
         mll,
     ) = switching_kalman_filter(init_mean, init_cov, init_prob, obs, Z, A, Q, H, R)
 
@@ -424,7 +424,8 @@ def test_switching_kalman_filter_shapes(simple_skf_model: tuple) -> None:
         n_discrete_states,
     )
     assert filt_p.shape == (n_time, n_discrete_states)
-    assert last_pair_m.shape == (
+    assert pair_cond_m.shape == (
+        n_time,
         n_cont_states,
         n_discrete_states,
         n_discrete_states,
@@ -543,7 +544,7 @@ def test_skf_smoother_reduces_to_kf_smoother_single_state(
         filter_mean=skf_fm,
         filter_cov=skf_fc,
         filter_discrete_state_prob=skf_fp,
-        last_filter_conditional_cont_mean=last_pair_m,
+        last_filter_conditional_cont_mean=last_pair_m[-1],
         process_cov=skf_Q,
         continuous_transition_matrix=skf_A,
         discrete_state_transition_matrix=skf_Z,
@@ -706,7 +707,7 @@ def test_m_step_one_state(
         filter_mean=skf_fm,
         filter_cov=skf_fc,
         filter_discrete_state_prob=skf_fp,
-        last_filter_conditional_cont_mean=last_pair_m,
+        last_filter_conditional_cont_mean=last_pair_m[-1],
         process_cov=skf_Q,
         continuous_transition_matrix=skf_A,
         discrete_state_transition_matrix=skf_Z,
@@ -830,7 +831,7 @@ def test_m_step_two_identical_states(
         filter_mean=skf_fm,
         filter_cov=skf_fc,
         filter_discrete_state_prob=skf_fp,
-        last_filter_conditional_cont_mean=last_pair_m,
+        last_filter_conditional_cont_mean=last_pair_m[-1],
         process_cov=skf_Q,
         continuous_transition_matrix=skf_A,
         discrete_state_transition_matrix=skf_Z,
@@ -1323,7 +1324,7 @@ def test_em_monotonic_single_state() -> None:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean,
+            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=current_Q,
             continuous_transition_matrix=current_A,
             discrete_state_transition_matrix=current_Z,
@@ -1428,7 +1429,7 @@ def test_em_monotonic_two_identical_states() -> None:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean,
+            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=current_Q,
             continuous_transition_matrix=current_A,
             discrete_state_transition_matrix=current_Z,
@@ -1561,7 +1562,7 @@ def test_em_monotonic_distinguishable_states() -> None:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean,
+            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=current_Q,
             continuous_transition_matrix=current_A,
             discrete_state_transition_matrix=current_Z,
@@ -1668,7 +1669,7 @@ def test_em_increases_log_likelihood(simple_skf_model: tuple) -> None:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean,
+            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=current_Q,
             continuous_transition_matrix=current_A,
             discrete_state_transition_matrix=current_Z,
@@ -1780,7 +1781,7 @@ def test_elbo_monotonic_single_state() -> None:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean,
+            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=current_Q,
             continuous_transition_matrix=current_A,
             discrete_state_transition_matrix=current_Z,
@@ -1930,7 +1931,7 @@ def test_elbo_monotonic_two_states() -> None:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean,
+            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=current_Q,
             continuous_transition_matrix=current_A,
             discrete_state_transition_matrix=current_Z,
@@ -2296,7 +2297,7 @@ class TestSwitchingKalmanSmootherProperties:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean,
+            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
@@ -2330,7 +2331,7 @@ class TestSwitchingKalmanSmootherProperties:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_prob,
-            last_filter_conditional_cont_mean=last_pair_mean,
+            last_filter_conditional_cont_mean=last_pair_mean[-1],
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
@@ -2715,7 +2716,7 @@ def test_discrete_state_recovery_with_smoother() -> None:
         filter_mean=state_cond_filter_mean,
         filter_cov=state_cond_filter_cov,
         filter_discrete_state_prob=filter_discrete_state_prob,
-        last_filter_conditional_cont_mean=last_filter_conditional_cont_mean,
+        last_filter_conditional_cont_mean=last_filter_conditional_cont_mean[-1],
         process_cov=Q,
         continuous_transition_matrix=A,
         discrete_state_transition_matrix=Z,
@@ -3035,7 +3036,7 @@ def test_continuous_state_mse_smoother() -> None:
         filter_mean=state_cond_filter_mean,
         filter_cov=state_cond_filter_cov,
         filter_discrete_state_prob=filter_discrete_state_prob,
-        last_filter_conditional_cont_mean=last_filter_conditional_cont_mean,
+        last_filter_conditional_cont_mean=last_filter_conditional_cont_mean[-1],
         process_cov=Q,
         continuous_transition_matrix=A,
         discrete_state_transition_matrix=Z,
@@ -3242,7 +3243,7 @@ def test_continuous_state_mse_multivariate() -> None:
         filter_mean=state_cond_filter_mean,
         filter_cov=state_cond_filter_cov,
         filter_discrete_state_prob=filter_discrete_state_prob,
-        last_filter_conditional_cont_mean=last_filter_conditional_cont_mean,
+        last_filter_conditional_cont_mean=last_filter_conditional_cont_mean[-1],
         process_cov=Q,
         continuous_transition_matrix=A,
         discrete_state_transition_matrix=Z,
@@ -3353,7 +3354,7 @@ def run_em(
             filter_mean=state_cond_filter_mean,
             filter_cov=state_cond_filter_cov,
             filter_discrete_state_prob=filter_discrete_state_prob,
-            last_filter_conditional_cont_mean=last_filter_conditional_cont_mean,
+            last_filter_conditional_cont_mean=last_filter_conditional_cont_mean[-1],
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
@@ -3924,7 +3925,7 @@ def run_em_partial(
             filter_mean=state_cond_filter_mean,
             filter_cov=state_cond_filter_cov,
             filter_discrete_state_prob=filter_discrete_state_prob,
-            last_filter_conditional_cont_mean=last_filter_conditional_cont_mean,
+            last_filter_conditional_cont_mean=last_filter_conditional_cont_mean[-1],
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
@@ -4266,7 +4267,7 @@ class TestSwitchingMStepMathCorrectness:
             filter_mean=skf_fm,
             filter_cov=skf_fc,
             filter_discrete_state_prob=skf_fp,
-            last_filter_conditional_cont_mean=last_pair_m,
+            last_filter_conditional_cont_mean=last_pair_m[-1],
             process_cov=skf_Q,
             continuous_transition_matrix=skf_A,
             discrete_state_transition_matrix=Z,
@@ -4424,7 +4425,7 @@ class TestSwitchingEMMonotonicity:
                 filter_mean=fm,
                 filter_cov=fc,
                 filter_discrete_state_prob=fp,
-                last_filter_conditional_cont_mean=lpm,
+                last_filter_conditional_cont_mean=lpm[-1],
                 process_cov=Q,
                 continuous_transition_matrix=A,
                 discrete_state_transition_matrix=Z,
@@ -4514,7 +4515,7 @@ class TestSwitchingNumericalStability:
             filter_mean=fm,
             filter_cov=fc,
             filter_discrete_state_prob=fp,
-            last_filter_conditional_cont_mean=lpm,
+            last_filter_conditional_cont_mean=lpm[-1],
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
@@ -4875,7 +4876,7 @@ class TestGPB2ExactMStep:
         init_prob = jnp.array([0.5, 0.5])
         obs = random.normal(random.PRNGKey(0), (n_time, n_obs))
 
-        fm, fc, fp, lpm, _, _ = switching_kalman_filter(
+        fm, fc, fp, pcm, pcc, _ = switching_kalman_filter(
             init_mean,
             init_cov,
             init_prob,
@@ -4891,7 +4892,8 @@ class TestGPB2ExactMStep:
             filter_mean=fm,
             filter_cov=fc,
             filter_discrete_state_prob=fp,
-            last_filter_conditional_cont_mean=lpm,
+            pair_cond_filter_mean=pcm,
+            pair_cond_filter_cov=pcc,
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
@@ -4996,7 +4998,7 @@ class TestGPB2ExactMStep:
         init_prob = jnp.array([0.5, 0.5])
         obs = random.normal(random.PRNGKey(42), (n_time, n_obs))
 
-        fm, fc, fp, lpm, _, _ = switching_kalman_filter(
+        fm, fc, fp, pcm, pcc, _ = switching_kalman_filter(
             init_mean,
             init_cov,
             init_prob,
@@ -5012,7 +5014,8 @@ class TestGPB2ExactMStep:
             filter_mean=fm,
             filter_cov=fc,
             filter_discrete_state_prob=fp,
-            last_filter_conditional_cont_mean=lpm,
+            pair_cond_filter_mean=pcm,
+            pair_cond_filter_cov=pcc,
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
@@ -5067,7 +5070,7 @@ class TestVectorizedELBOEquivalence:
         fm, fc, fdp, lfc = switching_kalman_filter(
             m0, P0, pi0, obs, Z, A, Q, H, R
         )[:4]
-        sm_result = switching_kalman_smoother(fm, fc, fdp, lfc, Q, A, Z)
+        sm_result = switching_kalman_smoother(fm, fc, fdp, lfc[-1], Q, A, Z)
         return {
             "obs": obs, "A": A, "Q": Q, "H": H, "R": R, "Z": Z,
             "m0": m0, "P0": P0, "pi0": pi0,
@@ -5135,7 +5138,7 @@ class TestVectorizedELBOEquivalence:
         pi0 = jnp.array([0.5, 0.3, 0.2])
 
         fm, fc, fdp, lfc = switching_kalman_filter(m0, P0, pi0, obs, Z, A, Q, H, R)[:4]
-        r = switching_kalman_smoother(fm, fc, fdp, lfc, Q, A, Z)
+        r = switching_kalman_smoother(fm, fc, fdp, lfc[-1], Q, A, Z)
         sm_dp, sm_jdp = r[2], r[3]
         sc_means, sc_covs, pc_xcov = r[5], r[6], r[7]
 

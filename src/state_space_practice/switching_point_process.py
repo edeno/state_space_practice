@@ -1453,9 +1453,12 @@ def switching_point_process_filter(
         Filtered state-conditional covariances.
     filter_discrete_state_prob : Array, shape (n_time, n_discrete_states)
         Filtered discrete state probabilities p(S_t = j | y_{1:t}).
-    last_pair_cond_filter_mean : Array, shape (n_latent, n_discrete_states, n_discrete_states)
-        Pair-conditional filter means at the last timestep. Entry [:, i, j] is
-        the mean for p(x_T | y_{1:T}, S_{T-1}=i, S_T=j). Needed by smoother.
+    pair_cond_filter_mean : Array, shape (n_time, n_latent, n_discrete_states, n_discrete_states)
+        Pair-conditional filter mean trajectory. Entry [t, :, i, j] is the mean
+        for p(x_t | y_{1:t}, S_{t-1}=i, S_t=j). The GPB2 smoother consumes the
+        whole trajectory; GPB1 callers use the last timestep ``[-1]``.
+    pair_cond_filter_cov : Array, shape (n_time, n_latent, n_latent, n_discrete_states, n_discrete_states)
+        Pair-conditional filter covariance trajectory.
     marginal_log_likelihood : Array
         Marginal log-likelihood log p(y_{1:T}) (scalar array).
 
@@ -1687,8 +1690,8 @@ def switching_point_process_filter(
         state_cond_filter_mean,
         state_cond_filter_cov,
         filter_discrete_state_prob,
-        pair_cond_filter_mean[-1],  # Last timestep pair-conditional for smoother
-        pair_cond_filter_cov[-1],  # Last timestep pair-conditional cov for GPB2
+        pair_cond_filter_mean,  # full pair-conditional trajectory (GPB2 smoother)
+        pair_cond_filter_cov,  # full pair-conditional cov trajectory
         marginal_log_likelihood,
     )
 
@@ -2298,8 +2301,8 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            last_pair_cond_filter_mean,
-            last_pair_cond_filter_cov,
+            pair_cond_filter_mean,
+            pair_cond_filter_cov,
             marginal_log_likelihood,
         ) = switching_point_process_filter(
             init_state_cond_mean=self.init_mean,
@@ -2322,7 +2325,6 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             filter_mean=state_cond_filter_mean,
             filter_cov=state_cond_filter_cov,
             filter_discrete_state_prob=filter_discrete_state_prob,
-            last_filter_conditional_cont_mean=last_pair_cond_filter_mean,
             process_cov=self.process_cov,
             continuous_transition_matrix=self.continuous_transition_matrix,
             discrete_state_transition_matrix=self.discrete_transition_matrix,
@@ -2343,7 +2345,8 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 next_pair_cond_smoother_means,
             ) = switching_kalman_smoother_gpb2(
                 **smoother_args,
-                last_filter_conditional_cont_cov=last_pair_cond_filter_cov,
+                pair_cond_filter_mean=pair_cond_filter_mean,
+                pair_cond_filter_cov=pair_cond_filter_cov,
             )
         else:
             (
@@ -2356,7 +2359,10 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 state_cond_smoother_covs,
                 pair_cond_smoother_cross_covs,
                 pair_cond_smoother_means,
-            ) = switching_kalman_smoother(**smoother_args)
+            ) = switching_kalman_smoother(
+                **smoother_args,
+                last_filter_conditional_cont_mean=pair_cond_filter_mean[-1],
+            )
             pair_cond_smoother_covs = None
             next_pair_cond_smoother_means = None
 

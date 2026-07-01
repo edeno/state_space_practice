@@ -669,6 +669,7 @@ class TestSwitchingPointProcessFilter:
         )
         assert filter_discrete_state_prob.shape == (n_time, n_discrete_states)
         assert last_pair_cond_filter_mean.shape == (
+            n_time,
             n_latent,
             n_discrete_states,
             n_discrete_states,
@@ -942,7 +943,7 @@ class TestSwitchingPointProcessFilter:
         # Shapes should still be correct
         assert state_cond_filter_mean.shape == (n_time, n_latent, 1)
         assert state_cond_filter_cov.shape == (n_time, n_latent, n_latent, 1)
-        assert last_pair_cond_filter_mean.shape == (n_latent, 1, 1)
+        assert last_pair_cond_filter_mean.shape == (n_time, n_latent, 1, 1)
 
     def test_covariances_positive_semidefinite(self) -> None:
         """Filtered covariances should be positive semi-definite."""
@@ -1052,9 +1053,10 @@ class TestSwitchingPointProcessFilter:
             spike_params,
         )
 
-        # Shape: (n_latent, n_discrete_states, n_discrete_states)
-        # where [:, i, j] is the mean for p(x_T | y_{1:T}, S_{T-1}=i, S_T=j)
+        # Shape: (n_time, n_latent, n_discrete_states, n_discrete_states)
+        # where [t, :, i, j] is the mean for p(x_t | y_{1:t}, S_{t-1}=i, S_t=j)
         assert last_pair_cond_filter_mean.shape == (
+            n_time,
             n_latent,
             n_discrete_states,
             n_discrete_states,
@@ -1408,7 +1410,7 @@ class TestSmootherIntegration:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_discrete_prob,
-            last_filter_conditional_cont_mean=last_pair_cond_mean,
+            last_filter_conditional_cont_mean=last_pair_cond_mean[-1],
             process_cov=process_cov,
             continuous_transition_matrix=continuous_transition_matrix,
             discrete_state_transition_matrix=discrete_transition_matrix,
@@ -1488,7 +1490,7 @@ class TestSmootherIntegration:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_discrete_prob,
-            last_filter_conditional_cont_mean=last_pair_cond_mean,
+            last_filter_conditional_cont_mean=last_pair_cond_mean[-1],
             process_cov=process_cov,
             continuous_transition_matrix=continuous_transition_matrix,
             discrete_state_transition_matrix=discrete_transition_matrix,
@@ -1576,7 +1578,7 @@ class TestSmootherIntegration:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_discrete_prob,
-            last_filter_conditional_cont_mean=last_pair_cond_mean,
+            last_filter_conditional_cont_mean=last_pair_cond_mean[-1],
             process_cov=process_cov,
             continuous_transition_matrix=continuous_transition_matrix,
             discrete_state_transition_matrix=discrete_transition_matrix,
@@ -1685,7 +1687,7 @@ class TestSmootherIntegration:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_discrete_prob,
-            last_filter_conditional_cont_mean=last_pair_cond_mean,
+            last_filter_conditional_cont_mean=last_pair_cond_mean[-1],
             process_cov=process_cov,
             continuous_transition_matrix=continuous_transition_matrix,
             discrete_state_transition_matrix=discrete_transition_matrix,
@@ -2720,7 +2722,7 @@ class TestDynamicsMStepReuse:
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            last_pair_cond_filter_mean,
+            last_pair_cond_filter_mean[-1],
             process_cov,
             continuous_transition_matrix,
             discrete_transition_matrix,
@@ -2841,7 +2843,7 @@ class TestDynamicsMStepReuse:
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            last_pair_cond_filter_mean,
+            last_pair_cond_filter_mean[-1],
             process_cov,
             continuous_transition_matrix,
             discrete_transition_matrix,
@@ -2958,7 +2960,7 @@ class TestDynamicsMStepReuse:
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            last_pair_cond_filter_mean,
+            last_pair_cond_filter_mean[-1],
             process_cov,
             continuous_transition_matrix,
             discrete_transition_matrix,
@@ -3064,7 +3066,7 @@ class TestDynamicsMStepReuse:
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            last_pair_cond_filter_mean,
+            last_pair_cond_filter_mean[-1],
             process_cov,
             continuous_transition_matrix,
             discrete_transition_matrix,
@@ -3186,7 +3188,7 @@ class TestDynamicsMStepReuse:
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            last_pair_cond_filter_mean,
+            last_pair_cond_filter_mean[-1],
             process_cov,
             continuous_transition_matrix,
             discrete_transition_matrix,
@@ -7745,7 +7747,7 @@ class TestEMVerification:
         (_, _, _, _, _, scsm, _, _, _) = switching_kalman_smoother(
             filter_mean=fm, filter_cov=fc,
             filter_discrete_state_prob=fp,
-            last_filter_conditional_cont_mean=lpm,
+            last_filter_conditional_cont_mean=lpm[-1],
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=jnp.array([[1.0]]),
@@ -7858,7 +7860,7 @@ class TestEMVerification:
         (_, _, sdsp, _, _, _, _, _, _) = switching_kalman_smoother(
             filter_mean=fm, filter_cov=fc,
             filter_discrete_state_prob=fp,
-            last_filter_conditional_cont_mean=lpm,
+            last_filter_conditional_cont_mean=lpm[-1],
             process_cov=Q, continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
         )
@@ -7895,19 +7897,19 @@ class TestGPB2Smoother:
         init_prob = jnp.array([0.5, 0.5])
         obs = jax.random.normal(jax.random.PRNGKey(0), (n_time, n_obs))
 
-        fm, fc, fp, lpm, _, _ = switching_kalman_filter(
+        fm, fc, fp, pcm, pcc, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
         )
 
         r1 = switching_kalman_smoother(
             filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
-            last_filter_conditional_cont_mean=lpm,
+            last_filter_conditional_cont_mean=pcm[-1],
             process_cov=Q, continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
         )
         r2 = switching_kalman_smoother_gpb2(
             filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
-            last_filter_conditional_cont_mean=lpm,
+            pair_cond_filter_mean=pcm, pair_cond_filter_cov=pcc,
             process_cov=Q, continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
         )
@@ -7935,12 +7937,12 @@ class TestGPB2Smoother:
         init_prob = jnp.array([0.5, 0.5])
         obs = jax.random.normal(jax.random.PRNGKey(0), (n_time, n_obs))
 
-        fm, fc, fp, lpm, _, _ = switching_kalman_filter(
+        fm, fc, fp, pcm, pcc, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
         )
         result = switching_kalman_smoother_gpb2(
             filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
-            last_filter_conditional_cont_mean=lpm,
+            pair_cond_filter_mean=pcm, pair_cond_filter_cov=pcc,
             process_cov=Q, continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
         )
@@ -7975,6 +7977,7 @@ class TestGPB2Smoother:
         assert len(lls) == 3
         for ll in lls:
             assert jnp.isfinite(ll), f"LL should be finite, got {ll}"
+
 
 
 class TestSwitchingSpikeOscillatorSGD:

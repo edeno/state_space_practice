@@ -556,8 +556,8 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            last_pair_cond_filter_mean,
-            last_pair_cond_filter_cov,
+            pair_cond_filter_mean,
+            pair_cond_filter_cov,
             marginal_log_likelihood,
         ) = switching_point_process_filter(
             init_state_cond_mean=self.init_mean,
@@ -578,7 +578,6 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             filter_mean=state_cond_filter_mean,
             filter_cov=state_cond_filter_cov,
             filter_discrete_state_prob=filter_discrete_state_prob,
-            last_filter_conditional_cont_mean=last_pair_cond_filter_mean,
             process_cov=self.process_cov,
             continuous_transition_matrix=self.continuous_transition_matrix,
             discrete_state_transition_matrix=self.discrete_transition_matrix,
@@ -599,7 +598,8 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                 next_pair_cond_smoother_means,
             ) = switching_kalman_smoother_gpb2(
                 **smoother_args,
-                last_filter_conditional_cont_cov=last_pair_cond_filter_cov,
+                pair_cond_filter_mean=pair_cond_filter_mean,
+                pair_cond_filter_cov=pair_cond_filter_cov,
             )
         else:
             (
@@ -612,7 +612,10 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                 state_cond_smoother_covs,
                 pair_cond_smoother_cross_covs,
                 pair_cond_smoother_means,
-            ) = switching_kalman_smoother(**smoother_args)
+            ) = switching_kalman_smoother(
+                **smoother_args,
+                last_filter_conditional_cont_mean=pair_cond_filter_mean[-1],
+            )
             pair_cond_smoother_covs = None
             next_pair_cond_smoother_means = None
 
