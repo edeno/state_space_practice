@@ -5045,6 +5045,207 @@ class TestGPB2ExactMStep:
 
 
 # ============================================================================
+# GPB2 accuracy vs exact brute-force enumeration
+# ============================================================================
+
+
+def _exact_switching_smoother(init_mean, init_cov, init_prob, obs, Z, A, Q, H, R):
+    """Exact switching smoother by enumerating all ``n_states ** n_time`` paths.
+
+    Each discrete path is an ordinary linear-Gaussian model, so its Gaussian
+    smoother and marginal likelihood are closed-form. The exact posterior
+    ``E[x_t | y_{1:T}]`` and ``Cov[x_t | y_{1:T}]`` are the likelihood-weighted
+    mixture over paths (law of total mean / covariance). Feasible only for
+    small ``n_time`` (used here as an independent ground truth for GPB1/GPB2).
+
+    The transition ``x_{t-1} -> x_t`` uses ``A[..., S_t]`` (destination-indexed),
+    matching :func:`switching_kalman_filter`; the first step uses the x_1
+    convention (measurement update only).
+    """
+    import itertools
+
+    from jax.scipy.special import logsumexp
+
+    from state_space_practice.kalman import (
+        _kalman_filter_update,
+        _kalman_smoother_update,
+        kalman_measurement_update,
+    )
+
+    n_time = obs.shape[0]
+    n_states = init_prob.shape[0]
+
+    log_w, all_means, all_covs = [], [], []
+    for path in itertools.product(range(n_states), repeat=n_time):
+        s0 = path[0]
+        m, c, ll = kalman_measurement_update(
+            init_mean[:, s0], init_cov[:, :, s0], obs[0], H[:, :, s0], R[:, :, s0]
+        )
+        means, covs = [m], [c]
+        log_path = jnp.log(init_prob[s0]) + ll
+        for t in range(1, n_time):
+            st = path[t]
+            m, c, ll = _kalman_filter_update(
+                m, c, obs[t], A[:, :, st], Q[:, :, st], H[:, :, st], R[:, :, st]
+            )
+            means.append(m)
+            covs.append(c)
+            log_path = log_path + jnp.log(Z[path[t - 1], st]) + ll
+        means, covs = jnp.stack(means), jnp.stack(covs)
+
+        # Time-varying RTS backward: x_t -> x_{t+1} uses A[..., S_{t+1}].
+        sm_means = [None] * n_time
+        sm_covs = [None] * n_time
+        sm_means[-1], sm_covs[-1] = means[-1], covs[-1]
+        for t in range(n_time - 2, -1, -1):
+            s_next = path[t + 1]
+            sm, sc, _ = _kalman_smoother_update(
+                sm_means[t + 1],
+                sm_covs[t + 1],
+                means[t],
+                covs[t],
+                Q[:, :, s_next],
+                A[:, :, s_next],
+            )
+            sm_means[t], sm_covs[t] = sm, sc
+
+        log_w.append(log_path)
+        all_means.append(jnp.stack(sm_means))
+        all_covs.append(jnp.stack(sm_covs))
+
+    log_w = jnp.stack(log_w)
+    w = jnp.exp(log_w - logsumexp(log_w))  # normalized posterior over paths
+    all_means = jnp.stack(all_means)  # (n_paths, n_time, n_latent)
+    all_covs = jnp.stack(all_covs)  # (n_paths, n_time, n_latent, n_latent)
+
+    exact_mean = jnp.einsum("p,ptl->tl", w, all_means)
+    diff = all_means - exact_mean[None]
+    exact_cov = jnp.einsum("p,ptab->tab", w, all_covs) + jnp.einsum(
+        "p,pta,ptb->tab", w, diff, diff
+    )
+    return exact_mean, exact_cov
+
+
+class TestGPB2ExactAccuracy:
+    """GPB2 must match the exact enumerated switching smoother.
+
+    Regression guard for the axis-indexing bug in the original GPB2 triple
+    update (wrong per-state dynamics index + filter-conditioning axis). The
+    defect only surfaces with distinct per-state dynamics, so this test uses
+    ``A_0 != A_1`` and ``Q_0 != Q_1`` and compares against a brute-force exact
+    smoother. GPB2 keeps more structure than GPB1, so it must be at least as
+    accurate as GPB1 (the pre-fix GPB2 was ~6x worse).
+    """
+
+    @pytest.mark.slow
+    def test_gpb2_matches_exact_with_distinct_dynamics(self) -> None:
+        from state_space_practice.switching_kalman import (
+            switching_kalman_filter,
+            switching_kalman_smoother,
+            switching_kalman_smoother_gpb2,
+        )
+
+        n_time, n_latent, n_obs, n_states = 8, 2, 2, 2
+        A = jnp.stack(
+            [
+                jnp.array([[0.95, -0.2], [0.2, 0.95]]),
+                jnp.array([[0.5, 0.4], [-0.4, 0.5]]),
+            ],
+            axis=-1,
+        )
+        Q = jnp.stack([jnp.eye(2) * 0.05, jnp.eye(2) * 0.4], axis=-1)
+        H = jnp.stack([jnp.eye(2)] * 2, axis=-1)
+        R = jnp.stack([jnp.eye(2) * 0.3] * 2, axis=-1)
+        Z = jnp.array([[0.85, 0.15], [0.2, 0.8]])
+        init_mean = jnp.zeros((n_latent, n_states))
+        init_cov = jnp.stack([jnp.eye(2)] * 2, axis=-1)
+        init_prob = jnp.array([0.6, 0.4])
+        obs = random.normal(random.PRNGKey(1), (n_time, n_obs)) * 1.5
+
+        exact_mean, exact_cov = _exact_switching_smoother(
+            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+        )
+
+        (fm, fc, fp, pcm, pcc, _) = switching_kalman_filter(
+            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+        )
+        gpb1 = switching_kalman_smoother(fm, fc, fp, pcm[-1], Q, A, Z)
+        gpb2 = switching_kalman_smoother_gpb2(fm, fc, fp, pcm, pcc, Q, A, Z)
+
+        gpb1_mean_err = float(jnp.max(jnp.abs(gpb1[0] - exact_mean)))
+        gpb2_mean_err = float(jnp.max(jnp.abs(gpb2[0] - exact_mean)))
+        gpb2_cov_err = float(jnp.max(jnp.abs(gpb2[1] - exact_cov)))
+
+        # Guards: the bug only manifests with BOTH distinct per-state dynamics
+        # and a non-degenerate discrete posterior. Assert both so the test can
+        # never silently become vacuous (e.g. if the fixture dynamics are made
+        # identical, or the posterior collapses to a single state).
+        assert not jnp.allclose(A[..., 0], A[..., 1]), "dynamics must differ"
+        assert not jnp.allclose(Q[..., 0], Q[..., 1]), "process cov must differ"
+        assert float(jnp.mean(jnp.max(fp, axis=1))) < 0.95, "posterior too confident"
+
+        # GPB2 must be close to exact. The primary guard is the relative check
+        # below (GPB2 must beat GPB1); the absolute bounds are a coarse sanity
+        # net kept comfortably above the achieved error (~1.9e-2 mean, ~1.0e-2
+        # cov) but well under the pre-fix error (~1.4e-1 mean, ~5.2e-2 cov).
+        assert gpb2_mean_err < 3e-2, (
+            f"GPB2 mean error {gpb2_mean_err:.3e} too large vs exact "
+            f"(GPB1 achieves {gpb1_mean_err:.3e})"
+        )
+        assert gpb2_cov_err < 3e-2, f"GPB2 cov error {gpb2_cov_err:.3e} too large"
+        assert gpb2_mean_err <= gpb1_mean_err + 5e-3, (
+            f"GPB2 ({gpb2_mean_err:.3e}) should be at least as accurate as "
+            f"GPB1 ({gpb1_mean_err:.3e})"
+        )
+
+    @pytest.mark.parametrize("n_time", [1, 2])
+    def test_gpb2_handles_short_sequences(self, n_time: int) -> None:
+        """GPB2 must run on very short sequences (T=1, T=2), like GPB1.
+
+        The backward scan has ``n_time - 1`` steps, so the per-step inputs
+        (including the shifted ``prev_filter_discrete_prob``) must all have a
+        matching leading axis, which is empty at ``n_time == 1``. For T=2 the
+        exact enumeration is cheap, so also check agreement with ground truth.
+        """
+        from state_space_practice.switching_kalman import (
+            switching_kalman_filter,
+            switching_kalman_smoother_gpb2,
+        )
+
+        n_latent, n_obs, n_states = 2, 2, 2
+        A = jnp.stack(
+            [
+                jnp.array([[0.95, -0.2], [0.2, 0.95]]),
+                jnp.array([[0.5, 0.4], [-0.4, 0.5]]),
+            ],
+            axis=-1,
+        )
+        Q = jnp.stack([jnp.eye(2) * 0.05, jnp.eye(2) * 0.4], axis=-1)
+        H = jnp.stack([jnp.eye(2)] * 2, axis=-1)
+        R = jnp.stack([jnp.eye(2) * 0.3] * 2, axis=-1)
+        Z = jnp.array([[0.85, 0.15], [0.2, 0.8]])
+        init_mean = jnp.zeros((n_latent, n_states))
+        init_cov = jnp.stack([jnp.eye(2)] * 2, axis=-1)
+        init_prob = jnp.array([0.6, 0.4])
+        obs = random.normal(random.PRNGKey(n_time), (n_time, n_obs)) * 1.5
+
+        fm, fc, fp, pcm, pcc, _ = switching_kalman_filter(
+            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+        )
+        gpb2 = switching_kalman_smoother_gpb2(fm, fc, fp, pcm, pcc, Q, A, Z)
+
+        assert gpb2[0].shape == (n_time, n_latent)
+        assert jnp.all(jnp.isfinite(gpb2[0])) and jnp.all(jnp.isfinite(gpb2[1]))
+
+        if n_time == 2:
+            exact_mean, exact_cov = _exact_switching_smoother(
+                init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+            )
+            assert float(jnp.max(jnp.abs(gpb2[0] - exact_mean))) < 3e-2
+            assert float(jnp.max(jnp.abs(gpb2[1] - exact_cov))) < 3e-2
+
+
+# ============================================================================
 # Vectorized ELBO equivalence tests
 # ============================================================================
 

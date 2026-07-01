@@ -7978,6 +7978,49 @@ class TestGPB2Smoother:
         for ll in lls:
             assert jnp.isfinite(ll), f"LL should be finite, got {ll}"
 
+    @pytest.mark.slow
+    def test_gpb2_em_improves_ll_with_distinct_dynamics(self) -> None:
+        """EM with smoother_type='gpb2' should improve the LL monotonically.
+
+        This is the path users actually run (point-process Laplace-EKF filter →
+        GPB2 smoother → M-step). The Laplace-EKF is not linear-Gaussian so the
+        exact-enumeration oracle does not apply, but a correct GPB2 must still
+        feed the M-step consistent sufficient statistics, which shows up as a
+        monotone EM log-likelihood. A regression to the old axis bug (~6x worse
+        smoother) corrupts those statistics. The states differentiate during
+        the fit (asserted below), so the distinct-dynamics regime that exposes
+        the bug is genuinely exercised.
+        """
+        from state_space_practice.switching_point_process import (
+            QRegularizationConfig,
+            SwitchingSpikeOscillatorModel,
+        )
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(80, 5)
+        ).astype(float)
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=1, n_neurons=5, n_discrete_states=2,
+            sampling_freq=100.0, dt=0.01,
+            q_regularization=QRegularizationConfig(),
+            separate_spike_params=False,
+            smoother_type="gpb2",
+        )
+        lls = [float(x) for x in model.fit(spikes, max_iter=6, key=jax.random.PRNGKey(42))]
+
+        assert all(jnp.isfinite(jnp.asarray(x)) for x in lls)
+        # Monotone non-decreasing (small negative tolerance for the GPB/EKF
+        # approximation) and net improvement over the run.
+        for prev, nxt in zip(lls[:-1], lls[1:]):
+            assert nxt >= prev - 1e-3, f"EM LL decreased: {prev:.4f} -> {nxt:.4f}"
+        assert lls[-1] > lls[0], "EM should improve the log-likelihood overall"
+        # Confirm the fit actually reached distinct per-state dynamics, i.e. the
+        # regime where the GPB2 axis bug would manifest.
+        A = model.continuous_transition_matrix
+        assert not jnp.allclose(A[..., 0], A[..., 1]), (
+            "fit did not differentiate the discrete states' dynamics"
+        )
 
 
 class TestSwitchingSpikeOscillatorSGD:
