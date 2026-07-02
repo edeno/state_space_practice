@@ -28,16 +28,19 @@ suite (EM / full-pipeline tests) was not run.
 
 ## Status tracker
 
+Remediation shipped on branch `fix/review-remediation` (phases 1, 3, 4, 5, 6,
+each reviewed clean). ✅ done · ◑ partial (rest deferred, see notes) · ⏸ paused.
+
 | # | Finding | Severity | Phase | Status |
 |---|---------|----------|-------|--------|
-| 1 | Brittle red test `test_capped_inflation_bounds_covariance_growth` | Build-red | 1 | ☐ |
-| 2 | `CorrelatedNoiseModel` non-symmetric/non-PSD `Q` | Critical | 2 | ☐ |
-| 3 | Theme A — silent numerical-divergence guards (no telemetry) | High | 4 | ☐ |
-| 4 | Theme B — inconsistent invariant/input validation | High | 3 | ☐ |
-| 5 | Statistical-validity notes (Wald, reward-init, Rayleigh, capped-transform) | Medium | 5 | ☐ |
-| 6 | Doc/comment accuracy hazards | Low | 6 | ☐ |
-| 7 | Report-only simplifications (dedup / dead / test-only code) | Low | 6 | ☐ |
-| 8 | Test-quality gaps (valid-only projection tests, no EM-guard tests, unseeded RNG) | Medium | 1,3,4 | ☐ |
+| 1 | Brittle red test `test_capped_inflation_bounds_covariance_growth` | Build-red | 1 | ✅ done (rewritten to per-step-cap invariant; RNG seeded) |
+| 2 | `CorrelatedNoiseModel` non-symmetric/non-PSD `Q` | Critical | 2 | ⏸ paused — needs tie-blocks-vs-symmetrize decision |
+| 3 | Theme A — silent numerical-divergence guards (no telemetry) | High | 4 | ◑ EM `converged_` flags + GPB cap telemetry; other in-jit clamps deferred |
+| 4 | Theme B — inconsistent invariant/input validation | High | 3 | ◑ host-side covariance/prob/scalar validators; jitted filter-level deferred |
+| 5 | Statistical-validity notes (Wald, reward-init, Rayleigh, capped-transform) | Medium | 5 | ◑ positive_capped gradient + reward-init fixed; Wald deferred; Rayleigh no-change |
+| 6 | Doc/comment accuracy hazards | Low | 6 | ✅ done (except one self-consistent time-index comment left as-is) |
+| 7 | Report-only simplifications (dedup / dead / test-only code) | Low | 6 | ◑ switching_kalman dedup + contingency dead-branch; `_m_step_beta`/hoist deferred |
+| 8 | Test-quality gaps (valid-only projection tests, no EM-guard tests, unseeded RNG) | Medium | 1,3,4 | ◑ inflation test + validator/guard/converged tests added; broader gaps remain |
 
 ---
 
