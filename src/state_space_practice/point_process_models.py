@@ -1666,7 +1666,10 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
             self.phase_difference = params["phase_difference"]
         if "coupling_strength" in params:
             self.coupling_strength = params["coupling_strength"]
-        # Reconstruct Q from updated params
+        # Reconstruct Q from updated params, projecting each to the nearest
+        # symmetric PSD covariance: coupling_strength is UNCONSTRAINED during
+        # SGD, so the raw reconstruction can be indefinite (matching the EM
+        # _project_parameters path).
         if any(k in params for k in ("process_variance", "phase_difference", "coupling_strength")):
             Q_list = []
             for j in range(self.n_discrete_states):
@@ -1675,7 +1678,7 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
                     phase_difference=self.phase_difference[..., j],
                     coupling_strength=self.coupling_strength[..., j],
                 )
-                Q_list.append(Q_j)
+                Q_list.append(stabilize_covariance(Q_j))
             self.process_cov = jnp.stack(Q_list, axis=-1)
         self.init_cov = self._reconstruct_per_state_array(
             params, "init_cov", self.init_cov

@@ -379,6 +379,14 @@ def validate_covariance(
             raise ValueError(
                 f"{where} must be a square 2D matrix, got shape {mat.shape}"
             )
+        # Reject NaN/Inf up front: they slip past the symmetry check
+        # (allclose treats inf == inf) and the eigenvalue floor (a NaN/Inf
+        # eigenvalue is not <= 0), so a non-finite "covariance" would pass.
+        if not bool(jnp.all(jnp.isfinite(mat))):
+            raise ValueError(
+                f"{where} has non-finite entries (NaN/Inf); a covariance "
+                f"must be finite."
+            )
         # Symmetry is checked on the RAW matrix: symmetrizing first would let a
         # non-symmetric "covariance" pass undetected (the exact defect that hid
         # in CorrelatedNoiseModel's process covariance).
@@ -437,6 +445,8 @@ def validate_transition_matrix(
         raise ValueError(
             f"{name} must be a square 2D matrix, got shape {arr.shape}"
         )
+    if not bool(jnp.all(jnp.isfinite(arr))):
+        raise ValueError(f"{name} has non-finite entries (NaN/Inf).")
     if bool(jnp.any(arr < -atol)):
         raise ValueError(
             f"{name} has negative entries (min {float(arr.min()):g}); "
@@ -475,6 +485,8 @@ def validate_probability_vector(
         If any entry is negative or the entries do not sum to 1 within ``atol``.
     """
     arr = jnp.asarray(probabilities)
+    if not bool(jnp.all(jnp.isfinite(arr))):
+        raise ValueError(f"{name} has non-finite entries (NaN/Inf).")
     if bool(jnp.any(arr < -atol)):
         raise ValueError(
             f"{name} has negative entries (min {float(arr.min()):g}); "

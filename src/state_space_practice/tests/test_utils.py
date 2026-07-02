@@ -362,6 +362,12 @@ class TestValidateCovariance:
         with pytest.raises(ValueError, match="square"):
             validate_covariance(jnp.ones((2, 3)))
 
+    def test_non_finite_raises(self) -> None:
+        # diag([inf, 1]) is "symmetric" and has all eigenvalues >= 0, so only an
+        # explicit finiteness check catches it.
+        with pytest.raises(ValueError, match="non-finite"):
+            validate_covariance(jnp.diag(jnp.array([jnp.inf, 1.0])))
+
 
 class TestValidateTransitionMatrix:
     """Tests for validate_transition_matrix (row-stochastic guard)."""
@@ -377,6 +383,10 @@ class TestValidateTransitionMatrix:
         with pytest.raises(ValueError, match="non-negative"):
             validate_transition_matrix(jnp.array([[1.2, -0.2], [0.3, 0.7]]))
 
+    def test_non_finite_raises(self) -> None:
+        with pytest.raises(ValueError, match="non-finite"):
+            validate_transition_matrix(jnp.array([[jnp.nan, 0.0], [0.5, 0.5]]))
+
 
 class TestValidateProbabilityVector:
     """Tests for validate_probability_vector (simplex guard)."""
@@ -391,3 +401,8 @@ class TestValidateProbabilityVector:
     def test_negative_entry_raises(self) -> None:
         with pytest.raises(ValueError, match="non-negative"):
             validate_probability_vector(jnp.array([1.2, -0.2]))
+
+    def test_non_finite_raises(self) -> None:
+        # [0.5, nan] would slip past the sum check: abs(nan - 1) > atol is False.
+        with pytest.raises(ValueError, match="non-finite"):
+            validate_probability_vector(jnp.array([0.5, jnp.nan]))

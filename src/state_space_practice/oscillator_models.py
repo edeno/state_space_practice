@@ -1405,12 +1405,18 @@ class CorrelatedNoiseModel(BaseModel):
             self.phase_difference = params["phase_difference"]
         if "coupling_strength" in params:
             self.coupling_strength = params["coupling_strength"]
-        # Reconstruct Q from updated params
+        # Reconstruct Q from updated params, then project to the nearest
+        # symmetric PSD covariance: coupling_strength is UNCONSTRAINED during
+        # SGD, so the raw reconstruction can be indefinite (matching what
+        # _project_parameters does on the EM path).
         if any(k in params for k in ("process_variance", "phase_difference", "coupling_strength")):
-            self.process_cov = jax.vmap(
+            Q_raw = jax.vmap(
                 construct_correlated_noise_process_covariance,
                 in_axes=(-1, -1, -1), out_axes=-1,
             )(self.process_variance, self.phase_difference, self.coupling_strength)
+            self.process_cov = jax.vmap(
+                stabilize_covariance, in_axes=-1, out_axes=-1
+            )(Q_raw)
         self.init_cov = self._reconstruct_per_state_array(
             params, "init_cov", self.init_cov
         )

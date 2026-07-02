@@ -255,24 +255,40 @@ def construct_correlated_noise_process_covariance(
     phase_difference: jax.Array,
     coupling_strength: jax.Array,
 ) -> jax.Array:
-    """This allows the noise driving different oscillators to be correlated,
-    representing shared unobserved inputs or influences, distinct
-    from direct dynamic coupling in the transition matrix.
+    """Symmetric process covariance for correlated oscillator noise.
+
+    Lets the noise driving different oscillators be correlated, representing
+    shared unobserved inputs -- distinct from directed dynamic coupling in the
+    transition matrix (directed influence belongs in the DirectedInfluenceModel,
+    not in a covariance).
+
+    Because a covariance is symmetric, only the STRICT UPPER TRIANGLE (i < j) of
+    ``phase_difference`` / ``coupling_strength`` is used: the (i, j) cross-block
+    is ``coupling_strength[i, j] * R(phase_difference[i, j])`` and the (j, i)
+    block is its transpose. Diagonal and lower-triangle entries of these two
+    inputs are IGNORED (the diagonal blocks are set to ``variance * I``).
+    Consequently, coupling supplied only in the lower triangle yields zero
+    coupling.
 
     Parameters
     ----------
     variance : jax.Array, shape (n_oscillators,)
-        Array of process noise variances (sigma_j) for each oscillator.
+        Process-noise variance for each oscillator; sets the diagonal 2x2 blocks
+        to ``variance[j] * I``.
     phase_difference : jax.Array, shape (n_oscillators, n_oscillators)
-        Matrix where phase_diffs[n1, n2] is the phase difference for
-        coupling from oscillator n2 to oscillator n1 (phi_j^{n1,n2}).
+        Per-pair phase of the noise correlation. Only the strict upper triangle
+        (i < j) is read; ``phase_difference[i, j]`` sets the phase of the (i, j)
+        cross-block, and the (j, i) block is its transpose.
     coupling_strength : jax.Array, shape (n_oscillators, n_oscillators)
-        Matrix where coupling_strengths[n1, n2] is the coupling strength
+        Per-pair noise-correlation magnitude. Only the strict upper triangle
+        (i < j) is read; the lower triangle is derived as the transpose.
 
     Returns
     -------
     process_covariance : jax.Array, shape (2 * n_oscillators, 2 * n_oscillators)
-        The process covariance matrix for the correlated noise model.
+        Symmetric process covariance. Symmetric by construction, but NOT
+        guaranteed positive semidefinite for large coupling -- the model's
+        ``_project_parameters`` / entry-point validation enforce PSD.
     """
     n_oscillators = variance.shape[0]
 
