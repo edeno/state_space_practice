@@ -52,7 +52,6 @@ from state_space_practice.oscillator_utils import (
     extract_dim_params_from_matrix,
     get_block_slice,
     project_coupled_transition_matrix,
-    project_matrix_blockwise,
 )
 from state_space_practice.switching_kalman import (
     compute_transition_q_function,
@@ -63,7 +62,11 @@ from state_space_practice.switching_kalman import (
     switching_kalman_smoother,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import check_converged, make_discrete_transition_matrix
+from state_space_practice.utils import (
+    check_converged,
+    make_discrete_transition_matrix,
+    stabilize_covariance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1268,14 +1271,18 @@ class CorrelatedNoiseModel(BaseModel):
         # Needs shape (n_cont_states, n_cont_states, n_discrete_states)
 
     def _project_parameters(self):
-        """Projects each Q_j to preserve its oscillatory/coupling structure.
+        """Projects each per-state Q to the nearest symmetric PSD covariance.
 
-        Uses `project_matrix_blockwise` to project each 2x2 block to its
-        closest (scaled) rotation matrix.
+        The constructor already makes Q symmetric with rotation-structured
+        cross-blocks; strong coupling can still push it indefinite, so floor
+        the eigenvalues to keep it a valid covariance for the Cholesky-based
+        switching filter. (A per-block rotation projection would re-break the
+        cross-block symmetry the constructor establishes, so it is not used
+        here -- a rotation matrix is not a valid covariance block.)
         """
         self.process_cov = jnp.stack(
             [
-                project_matrix_blockwise(self.process_cov[..., j])
+                stabilize_covariance(self.process_cov[..., j])
                 for j in range(self.n_discrete_states)
             ],
             axis=-1,

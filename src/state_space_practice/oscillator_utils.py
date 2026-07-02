@@ -282,6 +282,20 @@ def construct_correlated_noise_process_covariance(
         phase_difference, coupling_strength
     )  # (n_oscillators, n_oscillators, 2, 2)
 
+    # Enforce covariance symmetry: the (j, i) cross-block must equal the (i, j)
+    # cross-block transposed. Take the strict upper triangle (i < j) as the
+    # source of truth and mirror it to the lower triangle as its transpose, so
+    # the assembled Q is symmetric by construction. This gives one correlation
+    # magnitude and one (signed) phase per oscillator pair -- the identifiable
+    # parametrization of a phase-coupled noise covariance -- instead of the
+    # independent directed blocks that made Q non-symmetric. Only the strict
+    # upper triangle of ``phase_difference`` / ``coupling_strength`` is used.
+    lower_source = jnp.swapaxes(jnp.swapaxes(all_blocks, 0, 1), -1, -2)
+    upper_mask = (
+        jnp.arange(n_oscillators)[:, None] < jnp.arange(n_oscillators)[None, :]
+    )  # (n, n), True where i < j
+    all_blocks = jnp.where(upper_mask[..., None, None], all_blocks, lower_source)
+
     # Replace diagonal blocks with variance * I
     diag_blocks = variance[:, None, None] * IDENTITY_2x2[None, :, :]
     diag_idx = jnp.arange(n_oscillators)

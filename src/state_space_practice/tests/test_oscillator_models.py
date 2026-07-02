@@ -371,39 +371,36 @@ class TestCorrelatedNoiseModel:
         with pytest.raises(ValueError, match="measurement_variance must be positive"):
             CorrelatedNoiseModel(**params)
 
-    def test_project_parameters_preserves_block_structure(
+    def test_project_parameters_produces_symmetric_psd(
         self, correlated_noise_params
     ) -> None:
-        """_project_parameters should maintain Q's oscillator block structure.
+        """_project_parameters must yield a valid (symmetric PSD) covariance.
 
-        Note: The CNM projection preserves 2x2 block structure (scaled rotation matrices),
-        not full matrix symmetry. Each 2x2 diagonal block should be a scaled rotation.
+        The M-step can perturb Q off symmetry and off the PSD cone; the
+        projection symmetrizes and floors the eigenvalues so the result is a
+        covariance the Cholesky-based switching filter can consume. (A per-block
+        rotation projection is deliberately not used -- a rotation is not a valid
+        covariance block and would re-break the cross-block symmetry.)
         """
         model = CorrelatedNoiseModel(**correlated_noise_params)
         model._initialize_parameters(jax.random.PRNGKey(0))
 
-        # Simulate M-step modifying Q slightly
-        model.process_cov = model.process_cov + 0.01 * jax.random.normal(
-            jax.random.PRNGKey(1), model.process_cov.shape
-        )
+        # Perturb Q the way an M-step might: asymmetrically and off the PSD cone.
+        perturb = jax.random.normal(jax.random.PRNGKey(1), model.process_cov.shape)
+        model.process_cov = model.process_cov + 0.1 * perturb
+
+        # Guard: the perturbation actually made Q asymmetric, so the projection
+        # has real work to do (the assertions below can't pass vacuously).
+        pre = np.array(model.process_cov[..., 0])
+        assert np.max(np.abs(pre - pre.T)) > 1e-6
 
         model._project_parameters()
 
-        # Check that 2x2 diagonal blocks have rotation structure: [[a, -b], [b, a]]
         for j in range(model.n_discrete_states):
-            Q_j = model.process_cov[..., j]
-            n_osc = model.n_oscillators
-
-            for i in range(n_osc):
-                block = Q_j[2 * i : 2 * i + 2, 2 * i : 2 * i + 2]
-                # Diagonal elements should be equal
-                np.testing.assert_allclose(
-                    block[0, 0], block[1, 1], rtol=1e-5, atol=1e-10
-                )
-                # Off-diagonal elements should be negatives of each other
-                np.testing.assert_allclose(
-                    block[0, 1], -block[1, 0], rtol=1e-5, atol=1e-10
-                )
+            Q_j = np.array(model.process_cov[..., j])
+            np.testing.assert_allclose(Q_j, Q_j.T, atol=1e-10)  # symmetric
+            eigs = np.linalg.eigvals(Q_j).real
+            assert np.all(eigs >= -1e-8)  # positive semidefinite
 
 
 # ============================================================================
@@ -687,15 +684,31 @@ class TestEdgeCases:
             model.fit(wrong_obs, jax.random.PRNGKey(0), max_iter=2)
 
     def test_process_cov_positive_semidefinite(self, correlated_noise_params) -> None:
-        """Process covariance should be positive semi-definite."""
-        model = CorrelatedNoiseModel(**correlated_noise_params)
+        """Raw process covariance must be PSD, checked with general eigvals.
+
+        Uses ``eigvals`` (not ``eigvalsh``, which silently symmetrizes and so
+        cannot detect an asymmetric "covariance") and nonzero coupling with
+        magnitude below the process variance (so Q stays positive definite),
+        exercising the off-diagonal cross-blocks.
+        """
+        params = dict(correlated_noise_params)
+        n_osc = params["n_oscillators"]
+        n_disc = params["n_discrete_states"]
+        coupling = np.zeros((n_osc, n_osc, n_disc))
+        coupling[0, 1, :] = 0.05  # < process_variance (0.1) -> Q positive definite
+        phase = np.zeros((n_osc, n_osc, n_disc))
+        phase[0, 1, :] = 0.7
+        params["coupling_strength"] = jnp.array(coupling)
+        params["phase_difference"] = jnp.array(phase)
+        model = CorrelatedNoiseModel(**params)
         model._initialize_parameters(jax.random.PRNGKey(0))
 
         for j in range(model.n_discrete_states):
-            Q_j = model.process_cov[..., j]
-            eigenvalues = jnp.linalg.eigvalsh(Q_j)
-            # All eigenvalues should be >= 0 (with numerical tolerance)
-            assert jnp.all(eigenvalues >= -1e-10)
+            Q_j = np.array(model.process_cov[..., j])
+            off_diag = Q_j - np.diag(np.diag(Q_j))
+            assert np.any(np.abs(off_diag) > 1e-6)  # coupling actually exercised
+            eigenvalues = np.linalg.eigvals(Q_j).real
+            assert np.all(eigenvalues >= -1e-8)
 
     def test_measurement_cov_positive_definite(self, common_oscillator_params) -> None:
         """Measurement covariance should be positive definite."""
@@ -877,7 +890,17 @@ class TestCorrelatedNoiseModelProperties:
     def test_process_cov_symmetric_for_all_states(
         self, n_osc: int, n_disc: int
     ) -> None:
-        """Process covariance should be symmetric for all discrete states."""
+        """Q must be symmetric even from ASYMMETRIC directed phase/coupling input.
+
+        A covariance is symmetric by definition; the constructor uses only the
+        upper triangle of the directed inputs and mirrors it as the transpose,
+        so a Q built from ``phase[i,j] != phase[j,i]`` / ``coupling[i,j] !=
+        coupling[j,i]`` must still come out symmetric.
+        """
+        rng = np.random.default_rng(0)
+        # Directed inputs that are NOT symmetric across (i, j) / (j, i).
+        phase = rng.uniform(-1.0, 1.0, (n_osc, n_osc, n_disc))
+        coupling = rng.uniform(0.01, 0.05, (n_osc, n_osc, n_disc))
         model = CorrelatedNoiseModel(
             n_oscillators=n_osc,
             n_discrete_states=n_disc,
@@ -886,14 +909,18 @@ class TestCorrelatedNoiseModelProperties:
             damping_coef=jnp.ones(n_osc) * 0.95,
             process_variance=jnp.ones((n_osc, n_disc)) * 0.1,
             measurement_variance=0.05,
-            phase_difference=jnp.zeros((n_osc, n_osc, n_disc)),
-            coupling_strength=jnp.zeros((n_osc, n_osc, n_disc)),
+            phase_difference=jnp.array(phase),
+            coupling_strength=jnp.array(coupling),
         )
         model._initialize_parameters(jax.random.PRNGKey(0))
 
         for j in range(n_disc):
-            Q_j = model.process_cov[..., j]
-            np.testing.assert_allclose(Q_j, Q_j.T, rtol=1e-10)
+            Q_j = np.array(model.process_cov[..., j])
+            # Guard: the off-diagonal cross-blocks are actually nonzero, so a
+            # zero-coupling (trivially symmetric) Q cannot pass vacuously.
+            off_diag = Q_j - np.diag(np.diag(Q_j))
+            assert np.any(np.abs(off_diag) > 1e-6)
+            np.testing.assert_allclose(Q_j, Q_j.T, atol=1e-10)
 
 
 class TestDirectedInfluenceModelProperties:
