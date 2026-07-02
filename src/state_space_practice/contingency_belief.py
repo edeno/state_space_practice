@@ -760,6 +760,22 @@ class ContingencyBeliefModel(SGDFittableMixin):
         self.stickiness = stickiness
         self.transition_regularization = transition_regularization
 
+        if init_inverse_temperature <= 0:
+            raise ValueError(
+                f"init_inverse_temperature must be > 0, got "
+                f"{init_inverse_temperature}."
+            )
+        if not 0.0 <= init_diagonal <= 1.0:
+            raise ValueError(
+                f"init_diagonal must be a probability in [0, 1], got "
+                f"{init_diagonal}; a value >= 1 makes the off-diagonal "
+                f"transition probabilities negative."
+            )
+        if concentration <= 0:
+            raise ValueError(f"concentration must be > 0, got {concentration}.")
+        if stickiness < 0:
+            raise ValueError(f"stickiness must be >= 0, got {stickiness}.")
+
         # Initialize parameters
         self.reward_probs_ = jnp.ones((n_states, n_options)) / 2
         self.state_values_ = jax.random.normal(

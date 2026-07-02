@@ -686,3 +686,22 @@ class TestSwitchingChoiceRecovery:
             f"Per-state beta gap {gap:.3f} < 0.1 after SGD "
             f"(learned: {model.inverse_temperatures_})"
         )
+
+
+class TestSwitchingChoiceValidation:
+    """Construction-time guards on per-state hyperparameters."""
+
+    def test_rejects_negative_inverse_temperature(self):
+        with pytest.raises(
+            ValueError, match="inverse_temperatures must be strictly positive"
+        ):
+            SwitchingChoiceModel(
+                n_options=3, n_discrete_states=2,
+                init_inverse_temperatures=[-1.0, 1.0],
+            )
+
+    def test_rejects_decay_outside_unit_interval(self):
+        with pytest.raises(ValueError, match="decays must lie in"):
+            SwitchingChoiceModel(
+                n_options=3, n_discrete_states=2, init_decays=[1.5, 0.9],
+            )

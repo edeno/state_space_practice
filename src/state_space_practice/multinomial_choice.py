@@ -422,6 +422,16 @@ class MultinomialChoiceModel(SGDFittableMixin):
     ):
         if n_options < 2:
             raise ValueError(f"n_options must be >= 2, got {n_options}")
+        if init_inverse_temperature <= 0:
+            raise ValueError(
+                f"init_inverse_temperature must be > 0 (a non-positive value "
+                f"inverts choice preferences), got {init_inverse_temperature}."
+            )
+        if init_process_noise < 0:
+            raise ValueError(
+                f"init_process_noise must be non-negative (Q = process_noise * I "
+                f"must be PSD), got {init_process_noise}."
+            )
         self.n_options = n_options
         self.inverse_temperature = init_inverse_temperature
         self.process_noise = init_process_noise

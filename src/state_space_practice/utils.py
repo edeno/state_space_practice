@@ -325,6 +325,169 @@ def _validate_filter_numerics(
             )
 
 
+def validate_covariance(
+    covariance: Array,
+    name: str = "covariance",
+    *,
+    require_positive_definite: bool = True,
+    symmetry_atol: float = 1e-8,
+    symmetry_rtol: float = 1e-6,
+) -> None:
+    """Validate a covariance matrix (or per-discrete-state stack) is symmetric PSD.
+
+    Unlike :func:`_validate_filter_numerics` (which symmetrizes before its
+    eigenvalue check and therefore cannot detect an asymmetric matrix), this
+    validator checks symmetry on the *raw* matrix. It is the general-purpose
+    covariance guard for public entry points that do not go through the
+    kalman/place-field f32-warning path.
+
+    Parameters
+    ----------
+    covariance : Array
+        Either a single square matrix ``(d, d)`` or a stack of per-discrete-
+        state matrices ``(d, d, n_states)`` (discrete-state axis last, per the
+        project convention).
+    name : str
+        Field name used in error messages.
+    require_positive_definite : bool, default True
+        If True, require a strictly positive minimum eigenvalue (as the
+        Cholesky-based filters need). If False, accept a positive-semidefinite
+        matrix (minimum eigenvalue ``>= -symmetry_atol``).
+    symmetry_atol, symmetry_rtol : float
+        Absolute/relative tolerance for the ``C == C.T`` check.
+
+    Raises
+    ------
+    ValueError
+        If any slice is non-square, non-symmetric, or violates the eigenvalue
+        floor. For a stacked input the offending discrete-state index is named.
+    """
+    arr = jnp.asarray(covariance)
+    if arr.ndim == 2:
+        slices: list[tuple[Optional[int], Array]] = [(None, arr)]
+    elif arr.ndim == 3:
+        slices = [(k, arr[..., k]) for k in range(arr.shape[-1])]
+    else:
+        raise ValueError(
+            f"{name} must be a 2D matrix or a 3D per-state stack "
+            f"(d, d, n_states), got shape {arr.shape}"
+        )
+
+    for state_ind, mat in slices:
+        where = name if state_ind is None else f"{name}[..., {state_ind}]"
+        if mat.ndim != 2 or mat.shape[0] != mat.shape[1]:
+            raise ValueError(
+                f"{where} must be a square 2D matrix, got shape {mat.shape}"
+            )
+        # Symmetry is checked on the RAW matrix: symmetrizing first would let a
+        # non-symmetric "covariance" pass undetected (the exact defect that hid
+        # in CorrelatedNoiseModel's process covariance).
+        if not bool(
+            jnp.allclose(mat, mat.T, rtol=symmetry_rtol, atol=symmetry_atol)
+        ):
+            asym = float(jnp.max(jnp.abs(mat - mat.T)))
+            raise ValueError(
+                f"{where} is not symmetric (max|C - C^T| = {asym:g}). A "
+                f"covariance must be symmetric; an asymmetric matrix is not a "
+                f"valid covariance and its Cholesky/eigen-decomposition is "
+                f"ill-defined."
+            )
+        min_eig = float(jnp.linalg.eigvalsh(symmetrize(mat)).min())
+        if require_positive_definite:
+            invalid = min_eig <= 0.0
+            kind = "positive definite"
+        else:
+            invalid = min_eig < -symmetry_atol
+            kind = "positive semidefinite"
+        if invalid:
+            raise ValueError(
+                f"{where} is not {kind} (min eigenvalue {min_eig:g}). "
+                f"Covariance matrices in the Cholesky-based filters must be "
+                f"{kind}; a rank-deficient or indefinite matrix will NaN on "
+                f"the first step. Check the value you supplied."
+            )
+
+
+def validate_transition_matrix(
+    transition_matrix: Array,
+    name: str = "transition_matrix",
+    *,
+    atol: float = 1e-6,
+) -> None:
+    """Validate a row-stochastic transition matrix (rows non-negative, sum to 1).
+
+    Parameters
+    ----------
+    transition_matrix : Array, shape (n_states, n_states)
+        Discrete-state transition matrix, row-stochastic by convention
+        (``T[i, j] = P(next = j | current = i)``).
+    name : str
+        Field name used in error messages.
+    atol : float
+        Absolute tolerance for the per-row sum-to-one check.
+
+    Raises
+    ------
+    ValueError
+        If the matrix is non-square, has negative entries, or has a row that
+        does not sum to 1 within ``atol``.
+    """
+    arr = jnp.asarray(transition_matrix)
+    if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+        raise ValueError(
+            f"{name} must be a square 2D matrix, got shape {arr.shape}"
+        )
+    if bool(jnp.any(arr < -atol)):
+        raise ValueError(
+            f"{name} has negative entries (min {float(arr.min()):g}); "
+            f"transition probabilities must be non-negative."
+        )
+    row_sums = jnp.sum(arr, axis=1)
+    if not bool(jnp.allclose(row_sums, 1.0, atol=atol)):
+        worst = float(jnp.max(jnp.abs(row_sums - 1.0)))
+        raise ValueError(
+            f"{name} rows must sum to 1 (max deviation {worst:g}). Note the "
+            f"row-stochastic convention T[i, j] = P(next=j | current=i); a "
+            f"transposed matrix is a common cause of this error."
+        )
+
+
+def validate_probability_vector(
+    probabilities: Array,
+    name: str = "probabilities",
+    *,
+    atol: float = 1e-6,
+) -> None:
+    """Validate a probability vector (non-negative entries summing to 1).
+
+    Parameters
+    ----------
+    probabilities : Array, shape (n_states,)
+        Discrete probability vector.
+    name : str
+        Field name used in error messages.
+    atol : float
+        Absolute tolerance for the sum-to-one check.
+
+    Raises
+    ------
+    ValueError
+        If any entry is negative or the entries do not sum to 1 within ``atol``.
+    """
+    arr = jnp.asarray(probabilities)
+    if bool(jnp.any(arr < -atol)):
+        raise ValueError(
+            f"{name} has negative entries (min {float(arr.min()):g}); "
+            f"probabilities must be non-negative."
+        )
+    total = float(jnp.sum(arr))
+    if abs(total - 1.0) > atol:
+        raise ValueError(
+            f"{name} must sum to 1 (got {total:g}). Supply a normalized "
+            f"probability vector."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Probability utilities
 # ---------------------------------------------------------------------------

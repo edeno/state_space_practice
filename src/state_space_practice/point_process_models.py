@@ -54,7 +54,13 @@ from state_space_practice.switching_point_process import (
     update_spike_glm_params,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import check_converged, make_discrete_transition_matrix
+from state_space_practice.utils import (
+    check_converged,
+    make_discrete_transition_matrix,
+    validate_covariance,
+    validate_probability_vector,
+    validate_transition_matrix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +209,15 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
         if discrete_transition_diag is None:
             expected_dwell_sec = 1.0
             p_stay = 1.0 - 1.0 / (expected_dwell_sec * sampling_freq)
+            if not 0.0 <= p_stay <= 1.0:
+                raise ValueError(
+                    f"Computed default self-transition probability "
+                    f"p_stay={p_stay:g} is outside [0, 1] (from "
+                    f"sampling_freq={sampling_freq} Hz and a {expected_dwell_sec}s "
+                    f"expected dwell time). This occurs when "
+                    f"sampling_freq < 1 / expected_dwell_sec; pass "
+                    f"discrete_transition_diag explicitly for low sampling rates."
+                )
             self.discrete_transition_diag = jnp.full(
                 (n_discrete_states,), p_stay
             )
@@ -478,12 +493,19 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                 f"({self.n_latent}, {self.n_latent}, {self.n_discrete_states}), "
                 f"got {self.init_cov.shape}."
             )
+        # init_cov must be symmetric PD per discrete state; the Cholesky-based
+        # Laplace-EKF NaNs on a non-PSD prior. (process_cov is validated once
+        # its correlated-noise constructor is fixed to produce symmetric PSD Q.)
+        validate_covariance(self.init_cov, "init_cov")
         if self.init_discrete_state_prob.shape != (self.n_discrete_states,):
             raise ValueError(
                 f"init_discrete_state_prob shape mismatch: expected "
                 f"({self.n_discrete_states},), "
                 f"got {self.init_discrete_state_prob.shape}."
             )
+        validate_probability_vector(
+            self.init_discrete_state_prob, "init_discrete_state_prob"
+        )
         if self.discrete_transition_matrix.shape != (
             self.n_discrete_states,
             self.n_discrete_states,
@@ -493,6 +515,9 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                 f"({self.n_discrete_states}, {self.n_discrete_states}), "
                 f"got {self.discrete_transition_matrix.shape}."
             )
+        validate_transition_matrix(
+            self.discrete_transition_matrix, "discrete_transition_matrix"
+        )
         if self.continuous_transition_matrix.shape != (
             self.n_latent,
             self.n_latent,

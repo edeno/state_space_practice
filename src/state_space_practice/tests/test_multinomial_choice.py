@@ -648,3 +648,15 @@ class TestMultinomialRecovery:
         for k in range(true_vals.shape[1]):
             r = np.corrcoef(true_vals[:, k], smoothed[:, k])[0, 1]
             assert r > 0.6, f"option {k + 1}: corr={r:.3f} too low"
+
+
+class TestMultinomialChoiceValidation:
+    """Construction-time guards on scalar hyperparameters."""
+
+    def test_rejects_nonpositive_inverse_temperature(self):
+        with pytest.raises(ValueError, match="inverse_temperature must be > 0"):
+            MultinomialChoiceModel(n_options=3, init_inverse_temperature=-1.0)
+
+    def test_rejects_negative_process_noise(self):
+        with pytest.raises(ValueError, match="process_noise must be non-negative"):
+            MultinomialChoiceModel(n_options=3, init_process_noise=-0.1)

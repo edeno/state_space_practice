@@ -3,6 +3,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from state_space_practice.utils import (
     check_converged,
@@ -14,6 +15,9 @@ from state_space_practice.utils import (
     stabilize_covariance,
     stabilize_probability_vector,
     symmetrize,
+    validate_covariance,
+    validate_probability_vector,
+    validate_transition_matrix,
 )
 
 
@@ -320,3 +324,70 @@ class TestProbabilityUtilities:
         assert float(ll_max) == 0.0
         # exp(-inf - 0) = 0.0
         np.testing.assert_allclose(scaled, jnp.zeros(3))
+
+
+class TestValidateCovariance:
+    """Tests for validate_covariance (symmetric-PSD guard)."""
+
+    def test_symmetric_pd_passes(self) -> None:
+        validate_covariance(jnp.eye(3))  # should not raise
+
+    def test_per_state_stack_passes(self) -> None:
+        cov = jnp.stack([jnp.eye(2), 2.0 * jnp.eye(2)], axis=-1)  # (2, 2, 2)
+        validate_covariance(cov)
+
+    def test_asymmetric_raises(self) -> None:
+        # Symmetric eigvalsh would NOT catch this; the raw-matrix check must.
+        asym = jnp.array([[1.0, 0.5], [-0.5, 1.0]])
+        with pytest.raises(ValueError, match="not symmetric"):
+            validate_covariance(asym)
+
+    def test_indefinite_raises(self) -> None:
+        indef = jnp.array([[1.0, 2.0], [2.0, 1.0]])  # eigenvalues 3, -1
+        with pytest.raises(ValueError, match="not positive definite"):
+            validate_covariance(indef)
+
+    def test_per_state_names_offending_index(self) -> None:
+        cov = jnp.stack([jnp.eye(2), jnp.array([[1.0, 2.0], [2.0, 1.0]])], axis=-1)
+        with pytest.raises(ValueError, match=r"\[\.\.\., 1\]"):
+            validate_covariance(cov)
+
+    def test_semidefinite_allowed_when_not_requiring_pd(self) -> None:
+        psd_singular = jnp.array([[1.0, 0.0], [0.0, 0.0]])
+        validate_covariance(psd_singular, require_positive_definite=False)
+        with pytest.raises(ValueError, match="not positive definite"):
+            validate_covariance(psd_singular, require_positive_definite=True)
+
+    def test_non_square_raises(self) -> None:
+        with pytest.raises(ValueError, match="square"):
+            validate_covariance(jnp.ones((2, 3)))
+
+
+class TestValidateTransitionMatrix:
+    """Tests for validate_transition_matrix (row-stochastic guard)."""
+
+    def test_row_stochastic_passes(self) -> None:
+        validate_transition_matrix(jnp.array([[0.9, 0.1], [0.2, 0.8]]))
+
+    def test_rows_not_summing_to_one_raises(self) -> None:
+        with pytest.raises(ValueError, match="sum to 1"):
+            validate_transition_matrix(jnp.array([[0.9, 0.9], [0.1, 0.1]]))
+
+    def test_negative_entry_raises(self) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            validate_transition_matrix(jnp.array([[1.2, -0.2], [0.3, 0.7]]))
+
+
+class TestValidateProbabilityVector:
+    """Tests for validate_probability_vector (simplex guard)."""
+
+    def test_valid_simplex_passes(self) -> None:
+        validate_probability_vector(jnp.array([0.2, 0.3, 0.5]))
+
+    def test_unnormalized_raises(self) -> None:
+        with pytest.raises(ValueError, match="sum to 1"):
+            validate_probability_vector(jnp.array([0.5, 0.6, 0.3]))
+
+    def test_negative_entry_raises(self) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            validate_probability_vector(jnp.array([1.2, -0.2]))

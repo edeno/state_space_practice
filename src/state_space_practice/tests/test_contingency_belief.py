@@ -940,3 +940,17 @@ class TestContingencyBeliefRecovery:
                 f"State {s}: worst reward prob {worst_prob:.3f} >= 0.4 "
                 f"(true is ~0.1)"
             )
+
+
+class TestContingencyBeliefValidation:
+    """Construction-time guards on scalar hyperparameters."""
+
+    def test_rejects_nonpositive_inverse_temperature(self):
+        with pytest.raises(ValueError, match="init_inverse_temperature must be > 0"):
+            ContingencyBeliefModel(
+                n_states=2, n_options=2, init_inverse_temperature=0.0
+            )
+
+    def test_rejects_init_diagonal_above_one(self):
+        with pytest.raises(ValueError, match="init_diagonal must be a probability"):
+            ContingencyBeliefModel(n_states=2, n_options=2, init_diagonal=1.5)

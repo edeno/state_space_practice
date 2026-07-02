@@ -1173,6 +1173,17 @@ class TestAdaptiveInflation:
         infl_trace = np.trace(np.array(result_infl.position_cov), axis1=1, axis2=2)
         assert np.any(infl_trace > base_trace + 1e-9)
 
+    def test_rejects_non_psd_init_cov(self, rate_maps_and_data):
+        """A symmetric-indefinite init_cov is rejected loudly, not run to NaN."""
+        rm, spikes, position, dt = rate_maps_and_data
+        indefinite = jnp.array([[1.0, 2.0], [2.0, 1.0]])  # eigenvalues 3, -1
+        with pytest.raises(ValueError, match="init_cov"):
+            position_decoder_filter(
+                spikes=spikes, rate_maps=rm, dt=dt, q_pos=50.0,
+                include_velocity=False, init_position=jnp.array(position[0]),
+                init_cov=indefinite,
+            )
+
     def test_no_spikes_no_inflation(self, rate_maps_and_data):
         """With zero spikes, innovation is negative and inflation is skipped."""
         rm, spikes, position, dt = rate_maps_and_data
@@ -1330,3 +1341,19 @@ class TestPositionDecoderRateMapRecovery:
                 f"Neuron {n}: rate map dynamic range {ratio:.1f} < 3.0 "
                 f"(max={max_rate:.2f}, median={median_rate:.2f})"
             )
+
+
+class TestAdaptiveInflationConfigBounds:
+    """The per-step inflation cap must be bounded above, not just below."""
+
+    def test_rejects_max_alpha_above_ceiling(self):
+        with pytest.raises(ValueError, match="max_alpha must be <="):
+            AdaptiveInflationConfig(max_alpha=1e6)
+
+    def test_rejects_gain_above_ceiling(self):
+        with pytest.raises(ValueError, match="gain must be <="):
+            AdaptiveInflationConfig(gain=1e9)
+
+    def test_accepts_reasonable_values(self):
+        cfg = AdaptiveInflationConfig(gain=100.0, max_alpha=5.0)
+        assert cfg.max_alpha == 5.0 and cfg.gain == 100.0
