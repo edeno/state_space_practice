@@ -705,3 +705,15 @@ class TestSwitchingChoiceValidation:
             SwitchingChoiceModel(
                 n_options=3, n_discrete_states=2, init_decays=[1.5, 0.9],
             )
+
+    def test_converged_flag_false_when_not_converged(self):
+        # Deterministic: one iteration cannot satisfy the convergence check, so
+        # converged_ must be False. (The True direction for this same
+        # `while abs(ll-prev_ll)<tol and iteration>0` loop is covered by the
+        # contingency-belief test, whose data converges; switching_choice EM
+        # does not reliably converge on random choices in a bounded budget.)
+        rng = np.random.default_rng(0)
+        choices = rng.integers(0, 3, size=200)
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model.fit(choices, max_iter=1)
+        assert model.converged_ is False

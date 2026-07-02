@@ -66,6 +66,7 @@ from state_space_practice.utils import (
     check_converged,
     make_discrete_transition_matrix,
     stabilize_covariance,
+    validate_covariance,
 )
 
 logger = logging.getLogger(__name__)
@@ -1268,7 +1269,13 @@ class CorrelatedNoiseModel(BaseModel):
             ],
             axis=2,
         )
-        # Needs shape (n_cont_states, n_cont_states, n_discrete_states)
+        # Needs shape (n_cont_states, n_cont_states, n_discrete_states).
+        # The constructor guarantees symmetry; reject a too-strong coupling that
+        # makes Q symmetric-but-indefinite (it would reach the switching filter on
+        # EM iteration 0, before _project_parameters floors the eigenvalues).
+        validate_covariance(
+            self.process_cov, "process_cov", require_positive_definite=False
+        )
 
     def _project_parameters(self):
         """Projects each per-state Q to the nearest symmetric PSD covariance.

@@ -37,7 +37,6 @@ from state_space_practice.oscillator_utils import (
     construct_directed_influence_transition_matrix,
     extract_dim_params_from_matrix,
     project_coupled_transition_matrix,
-    project_matrix_blockwise,
 )
 from state_space_practice.switching_kalman import (
     compute_transition_q_function,
@@ -57,6 +56,7 @@ from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import (
     check_converged,
     make_discrete_transition_matrix,
+    stabilize_covariance,
     validate_covariance,
     validate_probability_vector,
     validate_transition_matrix,
@@ -494,8 +494,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                 f"got {self.init_cov.shape}."
             )
         # init_cov must be symmetric PD per discrete state; the Cholesky-based
-        # Laplace-EKF NaNs on a non-PSD prior. (process_cov is validated once
-        # its correlated-noise constructor is fixed to produce symmetric PSD Q.)
+        # Laplace-EKF NaNs on a non-PSD prior.
         validate_covariance(self.init_cov, "init_cov")
         if self.init_discrete_state_prob.shape != (self.n_discrete_states,):
             raise ValueError(
@@ -538,6 +537,12 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                 f"({self.n_latent}, {self.n_latent}, {self.n_discrete_states}), "
                 f"got {self.process_cov.shape}."
             )
+        # process_cov must be symmetric PSD per state; a too-strong correlated-
+        # noise coupling yields a symmetric-but-indefinite Q that would reach the
+        # Cholesky-based filter on EM iteration 0 (before _project_parameters).
+        validate_covariance(
+            self.process_cov, "process_cov", require_positive_definite=False
+        )
         if self.separate_spike_params:
             expected_baseline = (self.n_neurons, self.n_discrete_states)
             expected_weights = (
@@ -1574,22 +1579,24 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         )
 
     def _project_parameters(self) -> None:
-        """Project Q to preserve oscillatory block structure and ensure PSD."""
+        """Project each per-state Q to the nearest symmetric PSD covariance.
+
+        The correlated-noise constructor now emits a symmetric Q (tie-blocks), so
+        the M-step only needs to floor eigenvalues to keep it PSD. A per-block
+        rotation projection (the old ``project_matrix_blockwise``) is not used --
+        it distorts the noise-correlation structure and re-breaks the cross-block
+        symmetry the constructor establishes; a rotation is not a covariance block.
+        """
         if not self.update_process_cov:
             return
 
-        projected_Q_list = []
-        for j in range(self.n_discrete_states):
-            Q_j = project_matrix_blockwise(self.process_cov[:, :, j])
-            # Ensure PSD
-            Q_j = symmetrize(Q_j)
-            eigenvalues, eigenvectors = jnp.linalg.eigh(Q_j)
-            eigenvalues_clipped = jnp.maximum(eigenvalues, 1e-8)
-            Q_j_psd = eigenvectors @ jnp.diag(eigenvalues_clipped) @ eigenvectors.T
-            Q_j_psd = symmetrize(Q_j_psd)
-            projected_Q_list.append(Q_j_psd)
-
-        self.process_cov = jnp.stack(projected_Q_list, axis=-1)
+        self.process_cov = jnp.stack(
+            [
+                stabilize_covariance(self.process_cov[:, :, j])
+                for j in range(self.n_discrete_states)
+            ],
+            axis=-1,
+        )
 
     # --- SGDFittableMixin: CNM-PP specific ---
 

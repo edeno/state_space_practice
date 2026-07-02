@@ -135,21 +135,39 @@ def _cap_covariance_trace(
     cov: jax.Array,
     max_allowed_trace: jax.Array,
 ) -> jax.Array:
-    """Cap a single covariance matrix so its trace does not exceed max_allowed_trace."""
+    """Cap a single covariance matrix so its trace does not exceed max_allowed_trace.
+
+    Pure (no telemetry): this runs under ``jax.vmap``, where ``lax.cond`` lowers
+    to ``select`` and both branches execute, so a per-element ``debug_print_if``
+    here would fire on every lane regardless of the predicate. The divergence
+    signal is emitted once at the call site via ``_warn_if_cov_cap_engaged``.
+    """
     trace = jnp.trace(cov)
     ratio = trace / max_allowed_trace
-    # The cap only engages on a genuine GPB smoother blow-up (threshold is 1e8x
-    # the filter trace). When it fires, the returned posterior and the EM
-    # sufficient statistics derived from it are numerically unreliable, so
-    # surface it rather than silently rescaling to a plausible bounded value.
-    debug_print_if(
-        ratio > 1.0,
-        "switching_kalman: smoother covariance trace exceeded the cap "
-        "(ratio={r:.2e}); the GPB smoother has diverged and the returned "
-        "posterior + EM statistics are unreliable.",
-        r=ratio,
-    )
     return jnp.where(ratio > 1.0, cov / ratio, cov)
+
+
+def _warn_if_cov_cap_engaged(
+    covs: jax.Array, max_allowed_trace: jax.Array, label: str
+) -> None:
+    """Emit ONE divergence warning if any covariance-lane trace exceeds the cap.
+
+    ``covs`` has its two leading axes as the (n_cont, n_cont) covariance and any
+    number of trailing discrete-state axes. Reducing to a single scalar
+    predicate here -- rather than inside the vmapped ``_cap_covariance_trace`` --
+    is what makes the signal fire only on a genuine blow-up (the cap engaging on
+    some lane), not on every fit. Called from the (non-vmapped) smoother scan
+    body, so ``debug_print_if``'s ``lax.cond`` behaves conditionally.
+    """
+    traces = jnp.trace(covs, axis1=0, axis2=1)
+    debug_print_if(
+        jnp.any(traces > max_allowed_trace),
+        f"switching_kalman: {label} smoother covariance exceeded the "
+        f"{_COV_CAP_MULTIPLIER:.0e}x-filter cap (max trace {{m:.2e}}); the GPB "
+        f"smoother has diverged and the returned posterior + EM statistics are "
+        f"unreliable.",
+        m=jnp.max(traces),
+    )
 
 
 _COV_CAP_MULTIPLIER = 1e8
@@ -983,6 +1001,9 @@ def switching_kalman_smoother(
         # sequences (where growth reaches 10^100+).
         max_allowed_trace = _compute_max_allowed_trace(state_cond_filter_cov)
 
+        _warn_if_cov_cap_engaged(
+            pair_cond_smoother_covs, max_allowed_trace, "GPB1"
+        )
         _cap = partial(_cap_covariance_trace, max_allowed_trace=max_allowed_trace)
         pair_cond_smoother_covs = jax.vmap(
             jax.vmap(_cap, in_axes=-1, out_axes=-1),
@@ -1246,6 +1267,7 @@ def switching_kalman_smoother_gpb2(
         )(pair_filter_cov)  # (Si, Sj)
         max_allowed = jnp.max(pair_filter_traces) * _COV_CAP_MULTIPLIER + 1.0
 
+        _warn_if_cov_cap_engaged(triple_cov, max_allowed, "GPB2")
         _cap = partial(_cap_covariance_trace, max_allowed_trace=max_allowed)
         triple_cov = jax.vmap(
             jax.vmap(

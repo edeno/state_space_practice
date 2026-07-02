@@ -639,3 +639,38 @@ class TestSwitchingPPSGDFitting:
             f"Higher L2 ({norm_high:.4f}) should give smaller weight norm "
             f"than lower L2 ({norm_low:.4f})"
         )
+
+
+class TestPointProcessValidation:
+    """Construction-time validators wired into _validate_parameter_shapes."""
+
+    def test_rejects_low_sampling_freq_via_p_stay(self, com_pp_params):
+        # sampling_freq < 1/expected_dwell -> computed default p_stay < 0.
+        params = dict(com_pp_params)
+        params["sampling_freq"] = 0.5
+        with pytest.raises(ValueError, match="p_stay"):
+            CommonOscillatorPointProcessModel(**params)
+
+    def test_rejects_negative_process_variance(self, com_pp_params):
+        # Negative variance -> indefinite diagonal Q. process_cov is built and
+        # validated in _initialize_parameters (fit-time setup), before the EM
+        # loop, so it is caught there rather than at __init__.
+        params = dict(com_pp_params)
+        params["process_variance"] = jnp.array([-0.1, 0.1])
+        model = CommonOscillatorPointProcessModel(**params)
+        with pytest.raises(ValueError, match="process_cov"):
+            model._initialize_parameters(jax.random.PRNGKey(0))
+
+    def test_cnm_rejects_indefinite_process_cov(self, cnm_pp_params):
+        # Coupling magnitude above the process variance makes the (symmetric)
+        # correlated-noise Q indefinite; caught in _initialize_parameters before
+        # it reaches the Cholesky-based filter on EM iteration 0.
+        params = dict(cnm_pp_params)
+        n_osc = params["n_oscillators"]
+        n_disc = params["n_discrete_states"]
+        coupling = np.zeros((n_osc, n_osc, n_disc))
+        coupling[0, 1, :] = 0.5  # > process_variance (0.1)
+        params["coupling_strength"] = jnp.array(coupling)
+        model = CorrelatedNoisePointProcessModel(**params)
+        with pytest.raises(ValueError, match="process_cov"):
+            model._initialize_parameters(jax.random.PRNGKey(0))
