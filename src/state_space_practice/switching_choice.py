@@ -709,16 +709,8 @@ class SwitchingChoiceModel(SGDFittableMixin):
         self._smoother_state_cond_covs = smoother_result[6]  # (T, K-1, K-1, S)
         self.log_likelihood_ = log_likelihoods[-1]
         self.log_likelihood_history_ = log_likelihoods
-        self.converged_ = converged
         self._populate_uncertainty(choices)
-
-        if not converged and max_iter > 1:
-            logger.warning(
-                "%s.fit did not converge in %d EM iterations; the returned "
-                "parameters are the last iterate, not a converged fit "
-                "(increase max_iter or relax tolerance).",
-                type(self).__name__, max_iter,
-            )
+        self._finalize_convergence(converged, max_iter)
 
         return log_likelihoods
 

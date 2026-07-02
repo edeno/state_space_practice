@@ -1047,20 +1047,12 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
         self.log_likelihood_ = log_likelihoods[-1]
         self.log_likelihood_history_ = log_likelihoods
-        self.converged_ = converged
         # Populate causal posterior from final parameters
         filter_kwargs = self._smoother_kwargs(choices, rewards)
         filter_result = contingency_belief_filter(**filter_kwargs)
         self.state_posterior_ = filter_result.state_posterior
         self._populate_uncertainty(choices)
-
-        if not converged and max_iter > 1:
-            logger.warning(
-                "%s.fit did not converge in %d EM iterations; the returned "
-                "parameters are the last iterate, not a converged fit "
-                "(increase max_iter or relax tolerance).",
-                type(self).__name__, max_iter,
-            )
+        self._finalize_convergence(converged, max_iter)
 
         return log_likelihoods
 
