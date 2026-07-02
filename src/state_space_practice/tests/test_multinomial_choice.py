@@ -660,3 +660,15 @@ class TestMultinomialChoiceValidation:
     def test_rejects_negative_process_noise(self):
         with pytest.raises(ValueError, match="process_noise must be non-negative"):
             MultinomialChoiceModel(n_options=3, init_process_noise=-0.1)
+
+    def test_converged_flag_reflects_convergence(self):
+        rng = np.random.default_rng(0)
+        choices = rng.integers(0, 3, size=200)
+        # One iteration cannot satisfy the convergence check -> not converged.
+        m1 = MultinomialChoiceModel(n_options=3)
+        m1.fit(choices, max_iter=1)
+        assert m1.converged_ is False
+        # A generous budget on this easy problem converges -> flag flips to True.
+        m2 = MultinomialChoiceModel(n_options=3)
+        m2.fit(choices, max_iter=100)
+        assert m2.converged_ is True

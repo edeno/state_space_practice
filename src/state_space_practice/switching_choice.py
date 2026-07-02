@@ -508,6 +508,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
             self.obs_weights_ = None
 
         # Fitted state
+        self.converged_: Optional[bool] = None
         self._filter_result: Optional[SwitchingChoiceFilterResult] = None
         self.smoothed_discrete_probs_: Optional[Array] = None
         self.log_likelihood_: Optional[float] = None
@@ -684,6 +685,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
 
         log_likelihoods: list[float] = []
         prev_ll = float("-inf")
+        converged = False
 
         for iteration in range(max_iter):
             # E-step: filter + smoother
@@ -695,6 +697,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
 
             if abs(ll - prev_ll) < tolerance and iteration > 0:
                 logger.info(f"Converged at iteration {iteration + 1}")
+                converged = True
                 break
             prev_ll = ll
 
@@ -706,7 +709,17 @@ class SwitchingChoiceModel(SGDFittableMixin):
         self._smoother_state_cond_covs = smoother_result[6]  # (T, K-1, K-1, S)
         self.log_likelihood_ = log_likelihoods[-1]
         self.log_likelihood_history_ = log_likelihoods
+        self.converged_ = converged
         self._populate_uncertainty(choices)
+
+        if not converged and max_iter > 1:
+            logger.warning(
+                "%s.fit did not converge in %d EM iterations; the returned "
+                "parameters are the last iterate, not a converged fit "
+                "(increase max_iter or relax tolerance).",
+                type(self).__name__, max_iter,
+            )
+
         return log_likelihoods
 
     def _run_smoother(self, filter_result):

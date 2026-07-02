@@ -21,6 +21,7 @@ from state_space_practice.kalman import (
     psd_solve,
     stabilize_covariance,
 )
+from state_space_practice.utils import debug_print_if
 from state_space_practice.utils import divide_safe as _divide_safe
 from state_space_practice.utils import safe_log as _safe_log
 from state_space_practice.utils import scale_likelihood as _scale_likelihood
@@ -137,6 +138,17 @@ def _cap_covariance_trace(
     """Cap a single covariance matrix so its trace does not exceed max_allowed_trace."""
     trace = jnp.trace(cov)
     ratio = trace / max_allowed_trace
+    # The cap only engages on a genuine GPB smoother blow-up (threshold is 1e8x
+    # the filter trace). When it fires, the returned posterior and the EM
+    # sufficient statistics derived from it are numerically unreliable, so
+    # surface it rather than silently rescaling to a plausible bounded value.
+    debug_print_if(
+        ratio > 1.0,
+        "switching_kalman: smoother covariance trace exceeded the cap "
+        "(ratio={r:.2e}); the GPB smoother has diverged and the returned "
+        "posterior + EM statistics are unreliable.",
+        r=ratio,
+    )
     return jnp.where(ratio > 1.0, cov / ratio, cov)
 
 

@@ -794,6 +794,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
             init_logits[None, :, :]  # (1, n_states, n_states - 1)
         )
         self._transition_design_matrix: Optional[Array] = None
+        self.converged_: Optional[bool] = None
 
         # Observation-side covariates for action biases
         if n_obs_covariates > 0:
@@ -1018,6 +1019,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
         log_likelihoods: list[float] = []
         prev_ll = float("-inf")
+        converged = False
 
         for iteration in range(max_iter):
             # E-step
@@ -1030,6 +1032,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
             if abs(ll - prev_ll) < tolerance and iteration > 0:
                 logger.info(f"Converged at iteration {iteration + 1}")
+                converged = True
                 break
             prev_ll = ll
 
@@ -1038,11 +1041,21 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
         self.log_likelihood_ = log_likelihoods[-1]
         self.log_likelihood_history_ = log_likelihoods
+        self.converged_ = converged
         # Populate causal posterior from final parameters
         filter_kwargs = self._smoother_kwargs(choices, rewards)
         filter_result = contingency_belief_filter(**filter_kwargs)
         self.state_posterior_ = filter_result.state_posterior
         self._populate_uncertainty(choices)
+
+        if not converged and max_iter > 1:
+            logger.warning(
+                "%s.fit did not converge in %d EM iterations; the returned "
+                "parameters are the last iterate, not a converged fit "
+                "(increase max_iter or relax tolerance).",
+                type(self).__name__, max_iter,
+            )
+
         return log_likelihoods
 
     def _m_step(self, choices, rewards, result):
