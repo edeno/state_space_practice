@@ -28,13 +28,13 @@ suite (EM / full-pipeline tests) was not run.
 
 ## Status tracker
 
-Remediation shipped on branch `fix/review-remediation` (phases 1, 3, 4, 5, 6,
-each reviewed clean). ✅ done · ◑ partial (rest deferred, see notes) · ⏸ paused.
+Remediation shipped on branch `fix/review-remediation` (all six phases 1–6,
+each reviewed clean). ✅ done · ◑ partial (rest deferred, see notes).
 
 | # | Finding | Severity | Phase | Status |
 |---|---------|----------|-------|--------|
 | 1 | Brittle red test `test_capped_inflation_bounds_covariance_growth` | Build-red | 1 | ✅ done (rewritten to per-step-cap invariant; RNG seeded) |
-| 2 | `CorrelatedNoiseModel` non-symmetric/non-PSD `Q` | Critical | 2 | ⏸ paused — needs tie-blocks-vs-symmetrize decision |
+| 2 | `CorrelatedNoiseModel` non-symmetric/non-PSD `Q` | Critical | 2 | ✅ done (tie-blocks → symmetric-PSD `Q`; PSD-projection; asymmetry-catching tests) |
 | 3 | Theme A — silent numerical-divergence guards (no telemetry) | High | 4 | ◑ EM `converged_` flags + GPB cap telemetry; other in-jit clamps deferred |
 | 4 | Theme B — inconsistent invariant/input validation | High | 3 | ◑ host-side covariance/prob/scalar validators; jitted filter-level deferred |
 | 5 | Statistical-validity notes (Wald, reward-init, Rayleigh, capped-transform) | Medium | 5 | ◑ positive_capped gradient + reward-init fixed; Wald deferred; Rayleigh no-change |
