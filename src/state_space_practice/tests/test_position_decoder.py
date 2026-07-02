@@ -181,8 +181,9 @@ class TestPlaceFieldRateMaps:
 
     def test_from_spike_position_data_length_mismatch(self):
         """Mismatched position/spike lengths should raise ValueError."""
-        position = np.random.randn(100, 2)
-        spikes = np.random.poisson(0.1, (90, 3))
+        rng = np.random.default_rng(0)
+        position = rng.standard_normal((100, 2))
+        spikes = rng.poisson(0.1, (90, 3))
 
         with pytest.raises(ValueError, match="same number of time bins"):
             PlaceFieldRateMaps.from_spike_position_data(
@@ -1125,35 +1126,52 @@ class TestAdaptiveInflation:
         assert infl_trace >= base_trace
 
     def test_capped_inflation_bounds_covariance_growth(self, rate_maps_and_data):
-        """With max_alpha near 1, covariance growth is bounded."""
+        """The per-step cap ``max_alpha`` bounds the covariance inflation.
+
+        Inflation multiplies the one-step predicted covariance by
+        ``clip(1 + gain * (s_t - 1), 1, max_alpha)`` each bin. At the tightest
+        cap (``max_alpha == 1.0``) that multiplier is pinned to 1 regardless of
+        the innovation-driven signal ``s_t`` or the ``gain``, so the filter must
+        exactly reproduce the no-inflation baseline — even with a large gain that
+        would otherwise inflate aggressively.
+
+        (The earlier version asserted a fixed bound on ``capped_trace /
+        base_trace``. That ratio is not governed by the cap: it is dominated by
+        bins where the *baseline* trace is transiently near zero, and it is
+        non-monotone in ``max_alpha`` — which is why its threshold was relaxed
+        3 → 5 → 6 and still drifted to ~40x. The per-step cap is the real
+        invariant, tested here.)
+        """
         rm, spikes, position, dt = rate_maps_and_data
         init_pos = jnp.array(position[0])
 
-        result_capped = position_decoder_filter(
-            spikes=spikes, rate_maps=rm, dt=dt,
-            q_pos=50.0, include_velocity=False,
-            init_position=init_pos,
-            adaptive_inflation=AdaptiveInflationConfig(
-                gain=100.0, max_alpha=1.01,
-            ),
-        )
         result_base = position_decoder_filter(
             spikes=spikes, rate_maps=rm, dt=dt,
             q_pos=50.0, include_velocity=False,
             init_position=init_pos,
         )
+        # A large gain cannot grow the covariance because the per-step
+        # multiplier is clipped to max_alpha == 1.0.
+        result_capped = position_decoder_filter(
+            spikes=spikes, rate_maps=rm, dt=dt,
+            q_pos=50.0, include_velocity=False,
+            init_position=init_pos,
+            adaptive_inflation=AdaptiveInflationConfig(gain=100.0, max_alpha=1.0),
+        )
         base_trace = np.trace(np.array(result_base.position_cov), axis1=1, axis2=2)
         capped_trace = np.trace(np.array(result_capped.position_cov), axis1=1, axis2=2)
-        ratio = capped_trace / np.maximum(base_trace, 1e-12)
-        # Per-step cap is 1.01; accumulated ratio should stay bounded.
-        # Threshold relaxed across several rounds of decoder tuning:
-        # 3 → 5 after the precision-based penalty + max_newton_iter=3,
-        # 5 → 6 after switching to the raw-histogram track mask
-        # (tighter on-track region → larger baseline innovations on
-        # this fixture's thin-ring trajectory, inflating both base
-        # and capped traces).  Still tests the bounded-growth
-        # property; ratios blowing up would show O(100×) growth.
-        assert np.max(ratio) < 6.0
+        np.testing.assert_allclose(capped_trace, base_trace, rtol=1e-9, atol=1e-9)
+
+        # Guard: a looser cap must actually let inflation act, or the assertion
+        # above would hold vacuously (a no-op inflation trivially matches base).
+        result_infl = position_decoder_filter(
+            spikes=spikes, rate_maps=rm, dt=dt,
+            q_pos=50.0, include_velocity=False,
+            init_position=init_pos,
+            adaptive_inflation=AdaptiveInflationConfig(gain=100.0, max_alpha=1.5),
+        )
+        infl_trace = np.trace(np.array(result_infl.position_cov), axis1=1, axis2=2)
+        assert np.any(infl_trace > base_trace + 1e-9)
 
     def test_no_spikes_no_inflation(self, rate_maps_and_data):
         """With zero spikes, innovation is negative and inflation is skipped."""
