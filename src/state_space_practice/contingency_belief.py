@@ -776,8 +776,16 @@ class ContingencyBeliefModel(SGDFittableMixin):
         if stickiness < 0:
             raise ValueError(f"stickiness must be >= 0, got {stickiness}.")
 
-        # Initialize parameters
-        self.reward_probs_ = jnp.ones((n_states, n_options)) / 2
+        # Initialize parameters. reward_probs_ is perturbed off 0.5 per state
+        # (distinct seed from state_values_) so EM does not start at a saddle
+        # where the reward channel provides no state-discriminating signal --
+        # the failure mode when states differ mainly in reward contingency.
+        self.reward_probs_ = jnp.clip(
+            0.5 + 0.05 * jax.random.normal(
+                jax.random.PRNGKey(1), (n_states, n_options)
+            ),
+            0.01, 0.99,
+        )
         self.state_values_ = jax.random.normal(
             jax.random.PRNGKey(0), (n_states, n_options)
         ) * 0.1

@@ -128,6 +128,17 @@ class TestPositiveCappedTransform:
         recovered = cap.to_constrained(unc)
         np.testing.assert_allclose(recovered, x, atol=1e-4)
 
+    def test_gradient_nonzero_at_cap(self) -> None:
+        from state_space_practice.parameter_transforms import positive_capped
+
+        # A hard min(softplus, max_val) clip has exactly zero gradient once the
+        # constrained value saturates, freezing an optimized parameter at the
+        # boundary. The smooth map must keep a strictly positive gradient there.
+        cap = positive_capped(max_val=10.0)
+        grad_fn = jax.grad(lambda unc: cap.to_constrained(unc).sum())
+        g = grad_fn(jnp.array([20.0]))  # constrained value saturated near max_val
+        assert jnp.all(g > 0.0)
+
 
 class TestDictTransforms:
     def test_roundtrip(self) -> None:
