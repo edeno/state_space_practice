@@ -757,7 +757,9 @@ def extract_dim_params_from_matrix(
 
     damping, angles = jax.vmap(_extract_scale_and_angle)(adjusted)
 
-    # Convert angles to frequencies, wrapping negatives
+    # Convert angles to frequencies. A negative recovered frequency is folded
+    # up by sampling_freq / 2 (into [0, fs/2)), treating it as a sub-Nyquist
+    # alias of the SVD-recovered angle -- not a full-period (fs) unwrap.
     freq = angles * sampling_freq / (2 * jnp.pi)
     freq = jnp.where(freq < 0, freq + sampling_freq / 2, freq)
 

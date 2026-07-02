@@ -2553,9 +2553,11 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         The current implementation can introduce bias when state-conditional
         latents differ significantly. For improved accuracy, consider:
 
-        - Using ``update_spike_glm_params_second_order`` with aggregated
-          state-conditional covariances
+        - ``update_spike_glm_params(..., use_second_order=True)`` with
+          aggregated state-conditional covariances (the second-order path
+          already used here for the covariance correction)
         - Fitting separate observation parameters per discrete state
+          (``separate_spike_params=True``)
 
         """
         if not self.update_spike_params:

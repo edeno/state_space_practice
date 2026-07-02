@@ -435,7 +435,6 @@ def contingency_belief_filter(
     has_obs_covariates = (
         obs_design_matrix is not None and obs_weights is not None
     )
-    per_state_obs = False
     if has_obs_covariates:
         if obs_design_matrix.shape[0] != n_trials:
             raise ValueError(
@@ -443,7 +442,6 @@ def contingency_belief_filter(
                 f"but choices has {n_trials} trials"
             )
         _validate_obs_weights_shape(obs_weights, n_states, n_options)
-        per_state_obs = obs_weights.ndim == 3
         if obs_weights.shape[-1] != obs_design_matrix.shape[1]:
             raise ValueError(
                 f"obs_weights last-axis size {obs_weights.shape[-1]} != "
@@ -469,9 +467,9 @@ def contingency_belief_filter(
         return posterior, log_norm
 
     def _compute_obs_offset(obs_dm_t):
-        if per_state_obs:
-            return obs_weights @ obs_dm_t  # (n_states, n_options)
-        return obs_weights @ obs_dm_t  # (n_options,)
+        # Shape is (n_states, n_options) when obs_weights is per-state (ndim 3),
+        # else (n_options,); the matmul handles both without branching.
+        return obs_weights @ obs_dm_t
 
     def _step(carry, trial_data):
         prev_belief, accum_ll = carry

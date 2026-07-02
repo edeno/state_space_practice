@@ -805,7 +805,8 @@ def _update_smoother_discrete_probabilities(
     filter_discrete_prob : jax.Array, shape (n_discrete_states,)
         Pr(S_t=j | y_{1:t}), shape (n_discrete_states,), M_{t | t}(j)
     discrete_state_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
-        Pr(S_t=j | S_{t-1}=k), shape (n_discrete_states, n_discrete_states), Z(j, k)
+        Z[j, k] = Pr(S_{t+1}=k | S_t=j) -- row-stochastic (row = current state,
+        column = next state), matching the usage below.
     next_smoother_discrete_prob : jax.Array, shape (n_discrete_states,)
         Pr(S_{t+1}=k | y_{1:T}), shape (n_discrete_states,) M_{t+1 | T}(k)
 
@@ -964,7 +965,7 @@ def switching_kalman_smoother(
         (
             pair_cond_smoother_mean,  # E[X_t | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_discrete_states, n_discrete_states)
             pair_cond_smoother_covs,  # Cov[X_t | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
-            pair_cond_smoother_cross_covs,  # Cov[X_{t+1}, X_t | y_{1:T}, S_{t+1}=j, S_{t}=k], shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+            pair_cond_smoother_cross_covs,  # Cov[X_{t+1}, X_t | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         ) = _kalman_smoother_update_per_discrete_state_pair(
             next_state_cond_smoother_mean,  # E[X_{t+1} | y_{1:T}, S_t=k], shape (n_cont_states, n_discrete_states)
             next_state_cond_smoother_cov,  # Cov[X_{t+1} | y_{1:T}, S_t=k], shape (n_cont_states, n_cont_states, n_discrete_states)
@@ -1003,7 +1004,7 @@ def switching_kalman_smoother(
             smoother_forward_cond_prob,  # Pr(S_{t+1}=k | S{t}=j, y_{1:T}), shape (n_discrete_states, n_discrete_states), W^{k | j}_t
         ) = _update_smoother_discrete_probabilities(
             filter_discrete_prob,  # Pr(S_t=j | y_{1:t}), shape (n_discrete_states,), M_{t | t}(j)
-            discrete_state_transition_matrix,  # Pr(S_t=j | S_{t-1}=k), shape (n_discrete_states, n_discrete_states), Z(j, k)
+            discrete_state_transition_matrix,  # Z[j,k] = Pr(S_{t+1}=k | S_t=j), row-stochastic, shape (n_discrete_states, n_discrete_states)
             next_smoother_discrete_prob,  # Pr(S_{t+1}=k | y_{1:T}), shape (n_discrete_states,) M_{t+1 | T}(k)
         )
 
@@ -1665,72 +1666,19 @@ def switching_kalman_maximization_step(
     # Compute gamma1 and beta (transition sufficient statistics) here
     # because the code path depends on which Optional args are provided.
 
-    # Compute beta and gamma1 for transition matrix estimation
-    # These use joint probability P(S_t=i, S_{t+1}=j) weighting
-    if pair_cond_smoother_means is not None:
-        # Exact pair-conditional sufficient statistics for GPB2.
-        if pair_cond_smoother_covs is not None:
-            gamma1 = jnp.einsum(
-                "tij, tabij -> abj",
-                smoother_joint_discrete_state_prob,
-                pair_cond_smoother_covs,
-            )
-        else:
-            gamma1 = jnp.einsum(
-                "tij, tabi -> abj",
-                smoother_joint_discrete_state_prob,
-                state_cond_smoother_covs[:-1],
-            )
-        gamma1 += jnp.einsum(
-            "tij, taij, tbij -> abj",
-            smoother_joint_discrete_state_prob,
-            pair_cond_smoother_means,
-            pair_cond_smoother_means,
-        )
-
-        beta = jnp.einsum(
-            "tij,tdcij->cdj",
-            smoother_joint_discrete_state_prob,
-            pair_cond_smoother_cross_cov,
-        )
-        if next_pair_cond_smoother_means is not None:
-            beta += jnp.einsum(
-                "tdij,tcij,tij->cdj",
-                pair_cond_smoother_means,
-                next_pair_cond_smoother_means,
-                smoother_joint_discrete_state_prob,
-            )
-        else:
-            beta += jnp.einsum(
-                "tdij,tcj,tij->cdj",
-                pair_cond_smoother_means,
-                state_cond_smoother_means[1:],
-                smoother_joint_discrete_state_prob,
-            )
-    else:
-        # Approximate factored form (original implementation)
-        gamma1 = jnp.einsum(
-            "tij, tabi -> abj",
-            smoother_joint_discrete_state_prob,
-            state_cond_smoother_covs[:-1],
-        ) + jnp.einsum(
-            "tij, tai, tbi -> abj",
-            smoother_joint_discrete_state_prob,
-            state_cond_smoother_means[:-1],
-            state_cond_smoother_means[:-1],
-        )
-
-        beta = jnp.einsum(
-            "tij,tdcij->cdj",
-            smoother_joint_discrete_state_prob,
-            pair_cond_smoother_cross_cov,
-        )
-        beta += jnp.einsum(
-            "tdi,tcj,tij->cdj",
-            state_cond_smoother_means[:-1],
-            state_cond_smoother_means[1:],
-            smoother_joint_discrete_state_prob,
-        )
+    # Transition sufficient statistics (gamma1, beta), weighted by the joint
+    # probability P(S_t=i, S_{t+1}=j). Delegated to the shared
+    # compute_transition_sufficient_stats so the two identical implementations
+    # cannot drift apart.
+    gamma1, beta = compute_transition_sufficient_stats(
+        state_cond_smoother_means=state_cond_smoother_means,
+        state_cond_smoother_covs=state_cond_smoother_covs,
+        smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
+        pair_cond_smoother_cross_cov=pair_cond_smoother_cross_cov,
+        pair_cond_smoother_means=pair_cond_smoother_means,
+        pair_cond_smoother_covs=pair_cond_smoother_covs,
+        next_pair_cond_smoother_means=next_pair_cond_smoother_means,
+    )
 
     # Transition prior pseudo-counts (zeros = no prior = ML estimate)
     n_discrete_states = smoother_discrete_state_prob.shape[1]

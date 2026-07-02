@@ -10,8 +10,8 @@ degeneracy in *this estimator* (a spikes-only joint fit would be degenerate):
 2. **Regress coupling from spikes** (Laplace). For each neuron, logistic-regress
    its spikes on the smoothed latent via :func:`glm_laplace_update` with the
    Bernoulli family. The returned coupling posterior mean/variance is the Laplace
-   (Fisher-scoring) approximation; its bias is what a future Polya-Gamma
-   cross-check is intended to quantify.
+   (Fisher-scoring) approximation; its bias is quantified by the Polya-Gamma
+   cross-check (:mod:`coupling_pg` / :mod:`coupling_crosscheck`).
 
 Requires float64 (the test suite enables ``jax_enable_x64``).
 """
