@@ -65,6 +65,7 @@ from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import (
     check_converged,
     make_discrete_transition_matrix,
+    shift_to_psd,
     stabilize_covariance,
     validate_covariance,
 )
@@ -1383,6 +1384,11 @@ class CorrelatedNoiseModel(BaseModel):
             construct_correlated_noise_process_covariance,
             in_axes=(-1, -1, -1), out_axes=-1,
         )(proc_var, phase_diff, coupling)
+        # coupling_strength is UNCONSTRAINED, so SGD can propose a coupling that
+        # makes the reconstructed Q indefinite, which NaN-poisons the filter and
+        # the gradient. shift_to_psd is a gradient-safe barrier: identity while Q
+        # is PSD, a smooth lift back to the cone otherwise.
+        Q = jax.vmap(shift_to_psd, in_axes=-1, out_axes=-1)(Q)
 
         result = switching_kalman_filter(
             init_state_cond_mean=m0,
@@ -1405,17 +1411,17 @@ class CorrelatedNoiseModel(BaseModel):
             self.phase_difference = params["phase_difference"]
         if "coupling_strength" in params:
             self.coupling_strength = params["coupling_strength"]
-        # Reconstruct Q from updated params, then project to the nearest
-        # symmetric PSD covariance: coupling_strength is UNCONSTRAINED during
-        # SGD, so the raw reconstruction can be indefinite (matching what
-        # _project_parameters does on the EM path).
+        # Reconstruct Q from updated params, applying the same gradient-safe PSD
+        # shift the SGD loss used (coupling_strength is UNCONSTRAINED, so the raw
+        # reconstruction can be indefinite). Matching the loss's projection keeps
+        # the stored process_cov identical to what the optimizer evaluated.
         if any(k in params for k in ("process_variance", "phase_difference", "coupling_strength")):
             Q_raw = jax.vmap(
                 construct_correlated_noise_process_covariance,
                 in_axes=(-1, -1, -1), out_axes=-1,
             )(self.process_variance, self.phase_difference, self.coupling_strength)
             self.process_cov = jax.vmap(
-                stabilize_covariance, in_axes=-1, out_axes=-1
+                shift_to_psd, in_axes=-1, out_axes=-1
             )(Q_raw)
         self.init_cov = self._reconstruct_per_state_array(
             params, "init_cov", self.init_cov

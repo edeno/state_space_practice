@@ -158,6 +158,48 @@ def stabilize_covariance(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Ar
     return project_psd(symmetrize(cov), min_eigenvalue=min_eigenvalue)
 
 
+def shift_to_psd(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
+    r"""Lift a symmetric matrix to the PSD cone by a uniform eigenvalue shift.
+
+    Returns ``cov + max(min_eigenvalue - lambda_min(cov), 0) * I`` -- the
+    smallest isotropic diagonal shift that raises the minimum eigenvalue to at
+    least ``min_eigenvalue``. For a matrix already PSD to within
+    ``min_eigenvalue`` the shift is zero and this is the identity.
+
+    Unlike :func:`stabilize_covariance` / :func:`project_psd`, this reads only
+    ``lambda_min`` (via ``eigvalsh``) and never forms the eigenvector
+    reconstruction ``V diag(f(lambda)) V^T``. That reconstruction has a gradient
+    with ``1 / (lambda_i - lambda_j)`` terms that blow up to NaN when
+    eigenvalues are degenerate -- which happens routinely for block-structured
+    process covariances (e.g. the correlated-noise oscillator ``Q`` has paired
+    eigenvalues). ``eigvalsh().min()`` keeps a finite gradient through such
+    points, so this variant is safe to call **inside a differentiated SGD
+    loss**; ``stabilize_covariance`` is for host-side (non-differentiated) use.
+
+    The tradeoff is that the shift is isotropic (adds the same amount to every
+    eigenvalue) rather than clipping only the offending ones, so it inflates the
+    already-large eigenvalues too. Since it is exactly the identity whenever the
+    matrix is PSD, this only affects the indefinite region, where it acts as a
+    smooth barrier steering the optimizer back toward valid covariances.
+
+    Parameters
+    ----------
+    cov : jax.Array
+        A symmetric matrix. Shape (n, n).
+    min_eigenvalue : float, optional
+        Target lower bound on the minimum eigenvalue. Default is 1e-8.
+
+    Returns
+    -------
+    jax.Array
+        ``cov`` shifted so its minimum eigenvalue is at least
+        ``min_eigenvalue``. Shape (n, n).
+    """
+    lambda_min = jnp.linalg.eigvalsh(cov).min()
+    shift = jnp.maximum(min_eigenvalue - lambda_min, 0.0)
+    return cov + shift * jnp.eye(cov.shape[-1], dtype=cov.dtype)
+
+
 def debug_print_if(condition: jax.Array, fmt: str, **fmt_kwargs) -> None:
     """Fire ``jax.debug.print(fmt, **fmt_kwargs)`` only when ``condition`` is True.
 

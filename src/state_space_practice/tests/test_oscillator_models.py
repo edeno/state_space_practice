@@ -1468,6 +1468,38 @@ class TestCorrelatedNoiseSGDFitting:
         model.fit_sgd(obs, key=key, num_steps=20)
         assert jnp.all(model.process_variance > 0)
 
+    @pytest.mark.slow
+    def test_sgd_loss_finite_and_differentiable_at_indefinite_coupling(
+        self, cnm_setup
+    ):
+        # coupling_strength is UNCONSTRAINED during SGD, so the optimizer can
+        # propose a coupling whose reconstructed Q is indefinite. The loss must
+        # stay finite AND differentiable there (via the gradient-safe PSD shift);
+        # otherwise a NaN loss/gradient poisons the optimizer. Without the fix
+        # both go NaN. The guard confirms the proposed Q is actually indefinite.
+        from state_space_practice.oscillator_utils import (
+            construct_correlated_noise_process_covariance,
+        )
+
+        model, obs = cnm_setup
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        n_osc, n_states = model.n_oscillators, model.n_discrete_states
+        big = 5.0 * float(jnp.max(model.process_variance))  # coupling >> variance
+
+        Q_raw = construct_correlated_noise_process_covariance(
+            variance=model.process_variance[:, 0],
+            phase_difference=model.phase_difference[..., 0],
+            coupling_strength=jnp.zeros((n_osc, n_osc)).at[0, 1].set(big),
+        )
+        assert jnp.linalg.eigvalsh(Q_raw).min() < 0.0  # guard: barrier is active
+
+        def loss(c):
+            cp = jnp.zeros((n_osc, n_osc, n_states)).at[0, 1, :].set(c)
+            return model._sgd_loss_fn({"coupling_strength": cp}, obs)
+
+        assert bool(jnp.isfinite(loss(big)))
+        assert bool(jnp.isfinite(jax.grad(loss)(big)))
+
 
 @pytest.mark.slow
 class TestDirectedInfluenceRegularizedSGD:

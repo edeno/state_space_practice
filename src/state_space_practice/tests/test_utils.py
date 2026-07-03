@@ -12,6 +12,7 @@ from state_space_practice.utils import (
     psd_solve,
     safe_log,
     scale_likelihood,
+    shift_to_psd,
     stabilize_covariance,
     stabilize_probability_vector,
     symmetrize,
@@ -262,6 +263,61 @@ class TestLinearAlgebraUtilities:
         C = jnp.array([[2.0, 0.5], [0.5, 1.0]])  # PSD already
         stabilized = stabilize_covariance(C)
         np.testing.assert_allclose(stabilized, C, atol=1e-6)
+
+
+def _degenerate_block_cov(coupling: float) -> jax.Array:
+    """A 4x4 symmetric matrix with paired (degenerate) eigenvalues 0.1 +/- c.
+
+    This is the eigenvalue structure that makes eigenvector-reconstruction
+    projections (project_psd / stabilize_covariance) produce NaN gradients:
+    the ``1/(lambda_i - lambda_j)`` terms diverge on the degenerate pairs.
+    """
+    return jnp.array(
+        [
+            [0.1, 0.0, coupling, 0.0],
+            [0.0, 0.1, 0.0, coupling],
+            [coupling, 0.0, 0.1, 0.0],
+            [0.0, coupling, 0.0, 0.1],
+        ]
+    )
+
+
+class TestShiftToPsd:
+    """Tests for the gradient-safe PSD shift used inside SGD losses."""
+
+    def test_identity_on_psd_input(self) -> None:
+        C = jnp.array([[2.0, 0.5], [0.5, 1.0]])  # PSD already
+        np.testing.assert_allclose(shift_to_psd(C), C, atol=1e-12)
+
+    def test_lifts_indefinite_to_psd(self) -> None:
+        Q = _degenerate_block_cov(0.5)  # eigenvalues 0.1 +/- 0.5 -> min -0.4
+        assert jnp.linalg.eigvalsh(Q).min() < 0.0  # guard: input is indefinite
+        lifted = shift_to_psd(Q, min_eigenvalue=1e-6)
+        assert jnp.linalg.eigvalsh(lifted).min() >= 1e-6 - 1e-9
+
+    def test_shift_is_isotropic_and_symmetric(self) -> None:
+        Q = _degenerate_block_cov(0.5)
+        lifted = shift_to_psd(Q)
+        # Only the diagonal is shifted (by a single scalar); off-diagonals unchanged.
+        np.testing.assert_allclose(lifted - Q, jnp.diag(jnp.diag(lifted - Q)), atol=1e-12)
+        diag_shift = jnp.diag(lifted - Q)
+        np.testing.assert_allclose(diag_shift, diag_shift[0], atol=1e-12)
+        np.testing.assert_allclose(lifted, lifted.T, atol=1e-12)
+
+    def test_gradient_finite_through_degenerate_indefinite(self) -> None:
+        # The whole point of shift_to_psd: a differentiated projection that stays
+        # finite where eigenvector-reconstruction projections NaN. Guard that the
+        # barrier is actually active (Q indefinite) at the evaluation point.
+        def loss(c: float) -> jax.Array:
+            return shift_to_psd(_degenerate_block_cov(c)).sum()
+
+        c_eval = 0.5
+        assert jnp.linalg.eigvalsh(_degenerate_block_cov(c_eval)).min() < 0.0
+        grad = jax.grad(loss)(c_eval)
+        assert bool(jnp.isfinite(grad))
+        # The eigenvector-reconstruction projection NaNs here -- this is the bug
+        # shift_to_psd exists to avoid.
+        assert not bool(jnp.isfinite(jax.grad(lambda c: stabilize_covariance(_degenerate_block_cov(c)).sum())(c_eval)))
 
 
 class TestProbabilityUtilities:
