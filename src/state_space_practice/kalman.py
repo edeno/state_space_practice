@@ -61,6 +61,17 @@ def woodbury_kalman_gain(
     S_inv : jax.Array, shape (D_obs, D_obs)
         Inverse of innovation covariance (via Woodbury).
     """
+    emission_cov_diag = jnp.asarray(emission_cov_diag)
+    if emission_cov_diag.ndim != 1:
+        raise ValueError(
+            "emission_cov_diag must be a 1D vector of positive variances, "
+            f"got shape {emission_cov_diag.shape}."
+        )
+    if not bool(jnp.all(jnp.isfinite(emission_cov_diag))):
+        raise ValueError("emission_cov_diag must contain only finite values.")
+    if not bool(jnp.all(emission_cov_diag > 0.0)):
+        raise ValueError("emission_cov_diag entries must be positive.")
+
     D = prior_cov.shape[0]
     I_D = jnp.eye(D)
     # U = H @ chol(P), shape (D_obs, D_state)
@@ -132,6 +143,84 @@ def joseph_form_update(
     D = prior_cov.shape[0]
     I_KH = jnp.eye(D) - kalman_gain @ emission_matrix
     return symmetrize(I_KH @ prior_cov @ I_KH.T + kalman_gain @ emission_cov @ kalman_gain.T)
+
+
+def _validate_kalman_public_inputs(
+    init_mean: jax.Array,
+    init_cov: jax.Array,
+    obs: jax.Array,
+    transition_matrix: jax.Array,
+    process_cov: jax.Array,
+    measurement_matrix: jax.Array,
+    measurement_cov: jax.Array,
+    *,
+    filter_name: str,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Host-side validation for public linear-Gaussian APIs."""
+    init_mean = jnp.asarray(init_mean)
+    init_cov = jnp.asarray(init_cov)
+    obs = jnp.asarray(obs)
+    transition_matrix = jnp.asarray(transition_matrix)
+    process_cov = jnp.asarray(process_cov)
+    measurement_matrix = jnp.asarray(measurement_matrix)
+    measurement_cov = jnp.asarray(measurement_cov)
+
+    if init_mean.ndim != 1:
+        raise ValueError(f"init_mean must be 1D, got shape {init_mean.shape}.")
+    if obs.ndim != 2:
+        raise ValueError(f"obs must have shape (n_time, n_obs_dim), got {obs.shape}.")
+    if obs.shape[0] == 0:
+        raise ValueError("obs must contain at least one time step.")
+
+    n_state = init_mean.shape[0]
+    n_obs = obs.shape[1]
+    expected_shapes = {
+        "init_cov": (n_state, n_state),
+        "transition_matrix": (n_state, n_state),
+        "process_cov": (n_state, n_state),
+        "measurement_matrix": (n_obs, n_state),
+        "measurement_cov": (n_obs, n_obs),
+    }
+    actual_arrays = {
+        "init_cov": init_cov,
+        "transition_matrix": transition_matrix,
+        "process_cov": process_cov,
+        "measurement_matrix": measurement_matrix,
+        "measurement_cov": measurement_cov,
+    }
+    for name, expected_shape in expected_shapes.items():
+        if actual_arrays[name].shape != expected_shape:
+            raise ValueError(
+                f"{name} must have shape {expected_shape}, "
+                f"got {actual_arrays[name].shape}."
+            )
+
+    for name, arr in (
+        ("init_mean", init_mean),
+        ("obs", obs),
+        ("transition_matrix", transition_matrix),
+        ("measurement_matrix", measurement_matrix),
+    ):
+        if not bool(jnp.all(jnp.isfinite(arr))):
+            raise ValueError(f"{name} must contain only finite values.")
+
+    _validate_filter_numerics(
+        init_cov,
+        n_time=int(obs.shape[0]),
+        stacklevel=4,
+        filter_name=filter_name,
+        measurement_cov=measurement_cov,
+        process_cov=process_cov,
+    )
+    return (
+        init_mean,
+        init_cov,
+        obs,
+        transition_matrix,
+        process_cov,
+        measurement_matrix,
+        measurement_cov,
+    )
 
 
 
@@ -310,11 +399,12 @@ def kalman_filter(
         Observation noise covariance, $$ R $$. Must be strictly positive
         definite.
     validate_inputs : bool, default=True
-        If True, validate ``init_cov`` and ``measurement_cov`` are
-        positive definite and warn when f32 + long T is at risk of
-        losing PSD during the scan. Inner EM/SGD call sites that have
-        already validated should pass ``False`` to skip the O(d^3)
-        eigenvalue recomputation.
+        If True, validate array shapes, finite observations, non-empty
+        ``obs``, positive-definite ``init_cov`` / ``measurement_cov``, and
+        positive-semidefinite ``process_cov``. Also warn when f32 + long T
+        is at risk of losing PSD during the scan. Inner EM/SGD call sites
+        that have already validated should pass ``False`` to skip the
+        O(d^3) eigenvalue recomputation.
 
     Returns
     -------
@@ -328,16 +418,27 @@ def kalman_filter(
     Raises
     ------
     ValueError
-        If ``validate_inputs=True`` and ``init_cov`` or
-        ``measurement_cov`` is not strictly positive definite.
+        If ``validate_inputs=True`` and any public input is malformed, non-finite,
+        or has an invalid covariance.
     """
     if validate_inputs:
-        _validate_filter_numerics(
-            jnp.asarray(init_cov),
-            n_time=int(jnp.asarray(obs).shape[0]),
-            stacklevel=3,
+        (
+            init_mean,
+            init_cov,
+            obs,
+            transition_matrix,
+            process_cov,
+            measurement_matrix,
+            measurement_cov,
+        ) = _validate_kalman_public_inputs(
+            init_mean,
+            init_cov,
+            obs,
+            transition_matrix,
+            process_cov,
+            measurement_matrix,
+            measurement_cov,
             filter_name="kalman_filter",
-            measurement_cov=jnp.asarray(measurement_cov),
         )
 
     return _kalman_filter_impl(
@@ -528,10 +629,11 @@ def kalman_smoother(
         Observation noise covariance, $$ R $$. Must be strictly positive
         definite.
     validate_inputs : bool, default=True
-        If True, validate ``init_cov`` and ``measurement_cov`` are
-        positive definite and warn when f32 + long T is at risk of
-        losing PSD during the scan. Inner EM call sites that have
-        already validated should pass ``False`` to skip the O(d^3)
+        If True, validate array shapes, finite observations, non-empty
+        ``obs``, positive-definite ``init_cov`` / ``measurement_cov``, and
+        positive-semidefinite ``process_cov``. Also warn when f32 + long T
+        is at risk of losing PSD during the scan. Inner EM call sites that
+        have already validated should pass ``False`` to skip the O(d^3)
         eigenvalue recomputation.
 
     Returns
@@ -548,16 +650,27 @@ def kalman_smoother(
     Raises
     ------
     ValueError
-        If ``validate_inputs=True`` and ``init_cov`` or
-        ``measurement_cov`` is not strictly positive definite.
+        If ``validate_inputs=True`` and any public input is malformed, non-finite,
+        or has an invalid covariance.
     """
     if validate_inputs:
-        _validate_filter_numerics(
-            jnp.asarray(init_cov),
-            n_time=int(jnp.asarray(obs).shape[0]),
-            stacklevel=3,
+        (
+            init_mean,
+            init_cov,
+            obs,
+            transition_matrix,
+            process_cov,
+            measurement_matrix,
+            measurement_cov,
+        ) = _validate_kalman_public_inputs(
+            init_mean,
+            init_cov,
+            obs,
+            transition_matrix,
+            process_cov,
+            measurement_matrix,
+            measurement_cov,
             filter_name="kalman_smoother",
-            measurement_cov=jnp.asarray(measurement_cov),
         )
 
     return _kalman_smoother_impl(
@@ -637,6 +750,8 @@ def parallel_kalman_smoother(
     of Bayesian smoothers. IEEE Trans. Automatic Control 66(1), 299-306.
     """
     T, D = filtered_means.shape
+    if T == 0:
+        raise ValueError("filtered_means must contain at least one time step.")
 
     # Broadcast time-invariant parameters to (T-1, D, D)
     if transition_matrix.ndim == 2:
@@ -766,6 +881,11 @@ def kalman_maximization_step(
     """
 
     n_time: int = obs.shape[0]
+    if n_time < 2:
+        raise ValueError(
+            "kalman_maximization_step requires at least 2 time steps to "
+            "estimate transition dynamics."
+        )
 
     # Compute intermediate expectation terms
     gamma = jnp.sum(smoother_cov, axis=0) + sum_of_outer_products(

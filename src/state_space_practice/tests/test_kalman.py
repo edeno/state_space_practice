@@ -261,6 +261,17 @@ def test_kalman_maximization_step_recovery(kalman_m_step_test_data: tuple) -> No
     assert jnp.allclose(init_cov_est, init_cov_est.T)
 
 
+def test_kalman_maximization_step_rejects_one_timestep() -> None:
+    """Transition dynamics are not identifiable from a single smoothed state."""
+    obs = jnp.zeros((1, 2))
+    smoother_mean = jnp.zeros((1, 2))
+    smoother_cov = jnp.eye(2)[None]
+    smoother_cross_cov = jnp.zeros((0, 2, 2))
+
+    with pytest.raises(ValueError, match="at least 2 time steps"):
+        kalman_maximization_step(obs, smoother_mean, smoother_cov, smoother_cross_cov)
+
+
 @pytest.fixture(scope="module")
 def multi_dim_model() -> Tuple[
     Array,
@@ -1546,6 +1557,14 @@ class TestParallelKalmanSmoother:
         np.testing.assert_allclose(sc, filt_cov, atol=1e-10)
         assert sx.shape == (0, D, D)
 
+    def test_rejects_zero_timesteps(self) -> None:
+        """T=0 should fail clearly instead of broadcasting to negative shapes."""
+        D = 2
+        filt_mean = jnp.zeros((0, D))
+        filt_cov = jnp.zeros((0, D, D))
+        with pytest.raises(ValueError, match="at least one time step"):
+            parallel_kalman_smoother(filt_mean, filt_cov, jnp.eye(D), jnp.eye(D))
+
     def test_two_timesteps(self) -> None:
         """T=2: verify against closed-form RTS update."""
         D = 1
@@ -1691,6 +1710,26 @@ class TestWoodburyKalmanGain:
 
         np.testing.assert_allclose(K_w, K_s, atol=1e-6)
 
+    @pytest.mark.parametrize(
+        "diag, match",
+        [
+            (jnp.array([0.0, 1.0]), "positive"),
+            (jnp.array([-1.0, 1.0]), "positive"),
+            (jnp.array([jnp.nan, 1.0]), "finite"),
+        ],
+    )
+    def test_rejects_invalid_emission_cov_diag(self, diag, match) -> None:
+        P = jnp.eye(2)
+        H = jnp.ones((2, 2)) * 0.1
+        with pytest.raises(ValueError, match=match):
+            woodbury_kalman_gain(P, H, diag)
+
+    def test_rejects_nonvector_emission_cov_diag(self) -> None:
+        P = jnp.eye(2)
+        H = jnp.ones((2, 2)) * 0.1
+        with pytest.raises(ValueError, match="1D vector"):
+            woodbury_kalman_gain(P, H, jnp.eye(2))
+
 
 # --- Joseph Form Tests ---
 
@@ -1781,11 +1820,42 @@ class TestKalmanInputValidation:
         with pytest.raises(ValueError, match="not positive definite"):
             kalman_filter(init_mean, bad_init_cov, obs, A, Q, H, R)
 
+    def test_kalman_filter_rejects_asymmetric_init_cov(self) -> None:
+        init_mean, _, obs, A, Q, H, R = self._well_posed_args()
+        bad_init_cov = jnp.array([[1.0, 0.5], [0.0, 1.0]])
+        with pytest.raises(ValueError, match="init_covariance.*not symmetric"):
+            kalman_filter(init_mean, bad_init_cov, obs, A, Q, H, R)
+
     def test_kalman_filter_rejects_indefinite_measurement_cov(self) -> None:
         init_mean, init_cov, obs, A, Q, H, _ = self._well_posed_args()
         bad_R = jnp.array([[1.0, 2.0], [2.0, 1.0]])  # eigs = 3, -1
         with pytest.raises(ValueError, match="measurement_cov.*not positive definite"):
             kalman_filter(init_mean, init_cov, obs, A, Q, H, bad_R)
+
+    def test_kalman_filter_rejects_asymmetric_measurement_cov(self) -> None:
+        init_mean, init_cov, obs, A, Q, H, _ = self._well_posed_args()
+        bad_R = jnp.array([[1.0, 0.25], [0.0, 1.0]])
+        with pytest.raises(ValueError, match="measurement_cov.*not symmetric"):
+            kalman_filter(init_mean, init_cov, obs, A, Q, H, bad_R)
+
+    @pytest.mark.parametrize(
+        "bad_Q, match",
+        [
+            (jnp.array([[0.1, 0.5], [0.0, 0.1]]), "process_cov.*not symmetric"),
+            (jnp.array([[0.1, 1.0], [1.0, 0.1]]), "positive semidefinite"),
+            (jnp.array([[0.1, jnp.nan], [jnp.nan, 0.1]]), "non-finite"),
+        ],
+    )
+    def test_kalman_filter_rejects_invalid_process_cov(self, bad_Q, match) -> None:
+        init_mean, init_cov, obs, A, _, H, R = self._well_posed_args()
+        with pytest.raises(ValueError, match=match):
+            kalman_filter(init_mean, init_cov, obs, A, bad_Q, H, R)
+
+    def test_kalman_filter_rejects_empty_observations(self) -> None:
+        init_mean, init_cov, _, A, Q, H, R = self._well_posed_args()
+        obs = jnp.zeros((0, 2))
+        with pytest.raises(ValueError, match="at least one time step"):
+            kalman_filter(init_mean, init_cov, obs, A, Q, H, R)
 
     def test_kalman_smoother_rejects_negative_definite_init_cov(self) -> None:
         init_mean, _, obs, A, Q, H, R = self._well_posed_args()
@@ -1798,6 +1868,18 @@ class TestKalmanInputValidation:
         bad_R = jnp.array([[0.5, 1.0], [1.0, 0.5]])  # eigs = 1.5, -0.5
         with pytest.raises(ValueError, match="measurement_cov.*not positive definite"):
             kalman_smoother(init_mean, init_cov, obs, A, Q, H, bad_R)
+
+    def test_kalman_smoother_rejects_invalid_process_cov(self) -> None:
+        init_mean, init_cov, obs, A, _, H, R = self._well_posed_args()
+        bad_Q = jnp.array([[0.1, 0.5], [0.0, 0.1]])
+        with pytest.raises(ValueError, match="process_cov.*not symmetric"):
+            kalman_smoother(init_mean, init_cov, obs, A, bad_Q, H, R)
+
+    def test_kalman_smoother_rejects_empty_observations(self) -> None:
+        init_mean, init_cov, _, A, Q, H, R = self._well_posed_args()
+        obs = jnp.zeros((0, 2))
+        with pytest.raises(ValueError, match="at least one time step"):
+            kalman_smoother(init_mean, init_cov, obs, A, Q, H, R)
 
     def test_validate_inputs_false_bypasses_check(self) -> None:
         """``validate_inputs=False`` must skip the eigvalsh call.

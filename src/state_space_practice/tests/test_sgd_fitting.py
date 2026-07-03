@@ -200,6 +200,62 @@ class TestSGDFittableMixin:
         lls = model.fit_sgd(jnp.array(5.0), optimizer=optimizer, num_steps=50)
         assert len(lls) == 50
 
+    def test_num_steps_rejects_negative_and_non_integer(self) -> None:
+        # 0 is a valid setup-only fit (no optimization steps); only negative or
+        # non-integer values are rejected.
+        model = _ToyModel(scale=1.0)
+        for num_steps in (-2, 1.5):
+            with pytest.raises(ValueError, match="num_steps"):
+                model.fit_sgd(jnp.array(5.0), num_steps=num_steps)
+
+    def test_n_timesteps_must_be_positive(self) -> None:
+        class _ZeroTimestepModel(_ToyModel):
+            @property
+            def _n_timesteps(self):
+                return 0
+
+        model = _ZeroTimestepModel(scale=1.0)
+        with pytest.raises(ValueError, match="_n_timesteps"):
+            model.fit_sgd(jnp.array(5.0), num_steps=1)
+
+    def test_nonfinite_update_restores_last_valid_params(self) -> None:
+        class _BadGradientAtInit(SGDFittableMixin):
+            def __init__(self):
+                self.scale = 0.0
+                self._initialized = True
+                self.is_fitted = False
+
+            @property
+            def _n_timesteps(self):
+                return 1
+
+            def _check_sgd_initialized(self):
+                pass
+
+            def _build_param_spec(self):
+                return {"scale": jnp.array(self.scale)}, {
+                    "scale": UNCONSTRAINED
+                }
+
+            def _sgd_loss_fn(self, params):
+                return jnp.sqrt(params["scale"])
+
+            def _store_sgd_params(self, params):
+                self.scale = float(params["scale"])
+
+            def _finalize_sgd(self):
+                self.is_fitted = True
+
+        import optax
+
+        model = _BadGradientAtInit()
+        lls = model.fit_sgd(optimizer=optax.sgd(1.0), num_steps=1)
+
+        assert lls == []
+        assert model.is_fitted
+        assert np.isfinite(model.scale)
+        np.testing.assert_allclose(model.scale, 0.0, atol=1e-12)
+
     def test_nan_recovery_restores_last_finite_params(self) -> None:
         """Regression test: NaN recovery must roll back to params that
         were confirmed finite by a previous loss_fn call, NOT to the

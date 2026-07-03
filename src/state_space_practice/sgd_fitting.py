@@ -14,12 +14,33 @@ Models must implement:
 """
 
 import logging
+import math
+import operator
 from typing import Optional
 
 import jax
 import jax.numpy as jnp
 
 logger = logging.getLogger(__name__)
+
+
+def _tree_all_finite(tree: object) -> bool:
+    """Return True when every numeric leaf in a pytree is finite."""
+    return all(
+        bool(jnp.all(jnp.isfinite(jnp.asarray(leaf))))
+        for leaf in jax.tree_util.tree_leaves(tree)
+    )
+
+
+def _tree_all_finite_array(tree: object) -> jax.Array:
+    """JIT-compatible finite check for numeric pytree leaves."""
+    checks = [
+        jnp.all(jnp.isfinite(jnp.asarray(leaf)))
+        for leaf in jax.tree_util.tree_leaves(tree)
+    ]
+    if not checks:
+        return jnp.array(True)
+    return jnp.all(jnp.stack(checks))
 
 
 class SGDFittableMixin:
@@ -90,6 +111,13 @@ class SGDFittableMixin:
             transform_to_unconstrained,
         )
 
+        try:
+            num_steps = operator.index(num_steps)
+        except TypeError as exc:
+            raise ValueError("num_steps must be a non-negative integer.") from exc
+        if num_steps < 0:
+            raise ValueError("num_steps must be a non-negative integer.")
+
         self._check_sgd_initialized()
         params, param_spec = self._build_param_spec()
 
@@ -98,6 +126,13 @@ class SGDFittableMixin:
 
         unc_params = transform_to_unconstrained(params, param_spec)
         n_timesteps = float(self._n_timesteps)
+        if not math.isfinite(n_timesteps) or n_timesteps <= 0.0:
+            raise ValueError("_n_timesteps must be positive and finite for SGD fitting.")
+        if not _tree_all_finite(unc_params):
+            raise ValueError(
+                "Initial unconstrained SGD parameters contain NaN or inf. "
+                "Check the model's initial parameter values."
+            )
 
         # Build trainable mask and wrap optimizer
         # Frozen parameter handling uses two complementary mechanisms:
@@ -134,7 +169,12 @@ class SGDFittableMixin:
             loss, grads = jax.value_and_grad(_loss_inner)(unc_p)
             updates, new_opt_st = optimizer.update(grads, opt_st, unc_p)
             new_unc_p = optax.apply_updates(unc_p, updates)
-            return loss, new_unc_p, new_opt_st
+            step_finite = (
+                _tree_all_finite_array(grads)
+                & _tree_all_finite_array(updates)
+                & _tree_all_finite_array(new_unc_p)
+            )
+            return loss, new_unc_p, new_opt_st, step_finite
 
         log_likelihoods: list[float] = []
         # last_valid_unc_params tracks the most recent params that
@@ -148,14 +188,23 @@ class SGDFittableMixin:
         # Python loop (not lax.scan) to support NaN checks and verbose
         # logging without JIT closure issues with self.
         for step in range(num_steps):
-            loss, new_unc_params, new_opt_state = train_step(
+            loss, new_unc_params, new_opt_state, step_finite = train_step(
                 unc_params, opt_state
             )
 
-            if not jnp.isfinite(loss):
+            if not bool(jnp.isfinite(loss)):
                 logger.warning(
                     "SGD step %d: NaN/inf loss — restoring last valid params "
                     "and stopping.",
+                    step,
+                )
+                unc_params = last_valid_unc_params
+                break
+
+            if not bool(step_finite):
+                logger.warning(
+                    "SGD step %d: NaN/inf gradient or parameter update — restoring "
+                    "last valid params and stopping.",
                     step,
                 )
                 unc_params = last_valid_unc_params

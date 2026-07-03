@@ -5,11 +5,13 @@ jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax import random
 
 from state_space_practice.parameter_transforms import (
     POSITIVE,
     PSD_MATRIX,
+    STOCHASTIC_ROW,
     UNCONSTRAINED,
     UNIT_INTERVAL,
     transform_to_constrained,
@@ -35,6 +37,12 @@ class TestPositiveTransform:
         assert jnp.all(jnp.isfinite(g))
         assert jnp.all(g > 0)  # exp is always positive
 
+    def test_rejects_nonpositive_to_unconstrained(self) -> None:
+        with pytest.raises(ValueError, match="strictly positive"):
+            POSITIVE.to_unconstrained(jnp.array([0.0, 1.0]))
+        with pytest.raises(ValueError, match="strictly positive"):
+            POSITIVE.to_unconstrained(jnp.array([-1.0]))
+
 
 class TestUnitIntervalTransform:
     def test_roundtrip(self) -> None:
@@ -51,6 +59,18 @@ class TestUnitIntervalTransform:
         grad_fn = jax.grad(lambda unc: UNIT_INTERVAL.to_constrained(unc).sum())
         g = grad_fn(jnp.array([0.0, 2.0, -2.0]))
         assert jnp.all(jnp.isfinite(g))
+
+    def test_rejects_values_outside_unit_interval(self) -> None:
+        for value in (-0.1, 1.1):
+            with pytest.raises(ValueError, match="between 0 and 1"):
+                UNIT_INTERVAL.to_unconstrained(jnp.array(value))
+
+    def test_endpoints_map_to_finite(self) -> None:
+        # 0 and 1 are valid (e.g. a decay of 1.0 = no forgetting); they clamp
+        # away from the logit's poles to a finite unconstrained value.
+        for value in (0.0, 1.0):
+            unc = UNIT_INTERVAL.to_unconstrained(jnp.array(value))
+            assert bool(jnp.isfinite(unc))
 
 
 class TestUnconstrainedTransform:
@@ -90,6 +110,20 @@ class TestPSDMatrixTransform:
         unc = jnp.array([0.5, -0.3, 0.1])
         g = jax.grad(loss)(unc)
         assert jnp.all(jnp.isfinite(g))
+
+    def test_rejects_invalid_unconstrained_length(self) -> None:
+        with pytest.raises(ValueError, match="triangular"):
+            PSD_MATRIX.to_constrained(jnp.array([1.0, 2.0]))
+
+    def test_rejects_nonsymmetric_matrix(self) -> None:
+        P = jnp.array([[1.0, 0.5], [0.0, 1.0]])
+        with pytest.raises(ValueError, match="symmetric"):
+            PSD_MATRIX.to_unconstrained(P)
+
+    def test_rejects_non_psd_matrix(self) -> None:
+        P = jnp.array([[1.0, 0.0], [0.0, -0.1]])
+        with pytest.raises(ValueError, match="positive semidefinite"):
+            PSD_MATRIX.to_unconstrained(P)
 
 
 class TestPositiveCappedTransform:
@@ -138,6 +172,39 @@ class TestPositiveCappedTransform:
         grad_fn = jax.grad(lambda unc: cap.to_constrained(unc).sum())
         g = grad_fn(jnp.array([20.0]))  # constrained value saturated near max_val
         assert jnp.all(g > 0.0)
+
+    def test_rejects_invalid_cap(self) -> None:
+        from state_space_practice.parameter_transforms import positive_capped
+
+        with pytest.raises(ValueError, match="max_val"):
+            positive_capped(max_val=0.0)
+        with pytest.raises(ValueError, match="max_val"):
+            positive_capped(max_val=-1.0)
+
+    def test_rejects_values_outside_cap(self) -> None:
+        from state_space_practice.parameter_transforms import positive_capped
+
+        cap = positive_capped(max_val=10.0)
+        for value in (-1.0, 11.0):
+            with pytest.raises(ValueError, match="between 0 and max_val"):
+                cap.to_unconstrained(jnp.array(value))
+
+
+class TestStochasticRowTransform:
+    def test_rejects_rows_that_do_not_sum_to_one(self) -> None:
+        Z = jnp.array([[2.0, 2.0]])
+        with pytest.raises(ValueError, match="sum to one"):
+            STOCHASTIC_ROW.to_unconstrained(Z)
+
+    def test_rejects_negative_entries(self) -> None:
+        Z = jnp.array([[-1.0, 2.0]])
+        with pytest.raises(ValueError, match="non-negative"):
+            STOCHASTIC_ROW.to_unconstrained(Z)
+
+    def test_allows_zero_entries(self) -> None:
+        Z = jnp.array([[1.0, 0.0]])
+        unc = STOCHASTIC_ROW.to_unconstrained(Z)
+        assert jnp.all(jnp.isfinite(unc))
 
 
 class TestDictTransforms:
