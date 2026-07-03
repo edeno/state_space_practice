@@ -34,6 +34,24 @@ class SGDFittableMixin:
     - _n_timesteps: int (property or attribute)
     """
 
+    def _finalize_convergence(self, converged: bool, max_iter: int) -> None:
+        """Record the EM convergence flag and warn if the fit did not converge.
+
+        Shared terminal-convergence policy for the EM fitters that subclass this
+        mixin: sets ``self.converged_`` and, on max-iter exhaustion, logs a
+        warning under the model's own module logger. The per-loop convergence
+        criterion (which differs across fitters) stays in each ``fit`` method.
+        """
+        self.converged_ = converged
+        if not converged and max_iter > 1:
+            logging.getLogger(type(self).__module__).warning(
+                "%s.fit did not converge in %d EM iterations; the returned "
+                "parameters are the last iterate, not a converged fit "
+                "(increase max_iter or relax tolerance).",
+                type(self).__name__,
+                max_iter,
+            )
+
     def fit_sgd(
         self,
         *args,

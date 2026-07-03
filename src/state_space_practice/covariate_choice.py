@@ -477,6 +477,7 @@ class CovariateChoiceModel(SGDFittableMixin):
         self._smoother_result: Optional[ChoiceSmootherResult] = None
         self.log_likelihood_: Optional[float] = None
         self.n_iter_: Optional[int] = None
+        self.converged_: Optional[bool] = None
         self.log_likelihood_history_: Optional[list[float]] = None
         self._n_trials: Optional[int] = None
         self._covariates: Optional[Array] = None
@@ -650,6 +651,7 @@ class CovariateChoiceModel(SGDFittableMixin):
             beta_grid = jnp.asarray(beta_grid)
 
         log_likelihoods = []
+        converged = False
 
         for iteration in range(max_iter):
             # E-step: run smoother
@@ -683,6 +685,7 @@ class CovariateChoiceModel(SGDFittableMixin):
                 if rel_change < tolerance:
                     if verbose:
                         logger.info("Converged at iteration %d", iteration + 1)
+                    converged = True
                     break
 
             # M-step for B (input gain)
@@ -731,6 +734,7 @@ class CovariateChoiceModel(SGDFittableMixin):
         self.n_iter_ = len(log_likelihoods)
         self.log_likelihood_history_ = log_likelihoods
         self._populate_uncertainty(choices_arr)
+        self._finalize_convergence(converged, max_iter)
 
         return log_likelihoods
 

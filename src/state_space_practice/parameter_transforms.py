@@ -42,17 +42,24 @@ POSITIVE = ParameterTransform(
 )
 
 def positive_capped(max_val: float = 50.0) -> ParameterTransform:
-    """Positive transform capped at ``max_val`` to prevent numerical overflow.
+    """Positive transform smoothly saturating in ``(0, max_val)``.
 
-    Uses ``softplus`` for the base map, then clips to ``[0, max_val]``.
-    Useful for inverse temperature parameters where very large values
-    cause ill-conditioned Hessians in the Laplace-EKF update.
+    Maps unconstrained reals to ``(0, max_val)`` via ``max_val * sigmoid``.
+    Unlike a hard ``min(softplus(x), max_val)`` clip -- whose gradient is
+    exactly zero once the cap is reached, so SGD cannot move a parameter back
+    off the boundary and it freezes there with no diagnostic -- this map has a
+    strictly positive gradient everywhere. Useful for inverse-temperature
+    parameters where very large values cause ill-conditioned Hessians in the
+    Laplace-EKF update.
     """
     def _to_constrained(x: Array) -> Array:
-        return jnp.minimum(jax.nn.softplus(x), max_val)
+        return max_val * jax.nn.sigmoid(x)
 
     def _to_unconstrained(x: Array) -> Array:
-        return _inverse_softplus(jnp.minimum(x, max_val - 1e-6))
+        # logit(x / max_val), clamped away from the open-interval endpoints so
+        # a value stored at exactly 0 or max_val does not map to +/-inf.
+        ratio = jnp.clip(x / max_val, 1e-6, 1.0 - 1e-6)
+        return jnp.log(ratio) - jnp.log1p(-ratio)
 
     return ParameterTransform(
         to_unconstrained=_to_unconstrained,

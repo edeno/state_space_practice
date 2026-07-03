@@ -422,6 +422,16 @@ class MultinomialChoiceModel(SGDFittableMixin):
     ):
         if n_options < 2:
             raise ValueError(f"n_options must be >= 2, got {n_options}")
+        if init_inverse_temperature <= 0:
+            raise ValueError(
+                f"init_inverse_temperature must be > 0 (a non-positive value "
+                f"inverts choice preferences), got {init_inverse_temperature}."
+            )
+        if init_process_noise < 0:
+            raise ValueError(
+                f"init_process_noise must be non-negative (Q = process_noise * I "
+                f"must be PSD), got {init_process_noise}."
+            )
         self.n_options = n_options
         self.inverse_temperature = init_inverse_temperature
         self.process_noise = init_process_noise
@@ -432,6 +442,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         self._smoother_result: Optional[ChoiceSmootherResult] = None
         self.log_likelihood_: Optional[float] = None
         self.n_iter_: Optional[int] = None
+        self.converged_: Optional[bool] = None
         self.log_likelihood_history_: Optional[list[float]] = None
         self._n_trials: Optional[int] = None
 
@@ -562,6 +573,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
             beta_grid = jnp.asarray(beta_grid)
 
         log_likelihoods = []
+        converged = False
 
         for iteration in range(max_iter):
             # E-step: run smoother with current parameters
@@ -590,6 +602,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
                 if rel_change < tolerance:
                     if verbose:
                         logger.info("Converged at iteration %d", iteration + 1)
+                    converged = True
                     break
 
             # M-step for process noise Q
@@ -612,6 +625,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         self.n_iter_ = len(log_likelihoods)
         self.log_likelihood_history_ = log_likelihoods
         self._populate_uncertainty(choices_arr)
+        self._finalize_convergence(converged, max_iter)
 
         return log_likelihoods
 

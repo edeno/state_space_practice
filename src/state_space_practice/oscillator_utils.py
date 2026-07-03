@@ -10,6 +10,11 @@ IDENTITY_2x2 = jnp.identity(2)
 ZEROS_2x2 = jnp.zeros((2, 2))
 
 
+def _wrap_angle(angle: jax.Array) -> jax.Array:
+    """Wrap angles to [-pi, pi) for phase-equivalence checks."""
+    return jnp.mod(angle + jnp.pi, 2 * jnp.pi) - jnp.pi
+
+
 def _scatter_block_diagonal(blocks: jax.Array) -> jax.Array:
     """Assemble an array of 2x2 blocks into a block-diagonal matrix.
 
@@ -250,29 +255,133 @@ def construct_common_oscillator_process_covariance(
     return jnp.diag(jnp.repeat(variance, 2))
 
 
+def canonicalize_correlated_noise_pair_parameters(
+    phase_difference: jax.Array,
+    coupling_strength: jax.Array,
+    *,
+    atol: float = 1e-8,
+) -> tuple[jax.Array, jax.Array]:
+    """Canonicalize CNM pair parameters to strict-upper-triangle storage.
+
+    The correlated-noise model has one undirected noise-correlation parameter per
+    oscillator pair. For convenience at public API boundaries, this accepts any
+    of three equivalent user inputs for each pair and discrete state:
+
+    - strict upper triangle only,
+    - strict lower triangle only, or
+    - both triangles, if they describe the same covariance block
+      (equal coupling and opposite phase).
+
+    The returned arrays zero the diagonal/lower triangle and store the canonical
+    pair parameters in the strict upper triangle. If both directions are supplied
+    but disagree, a ``ValueError`` is raised instead of silently ignoring one.
+
+    This is a host-side API helper, not a differentiated loss primitive.
+    """
+    phase = jnp.asarray(phase_difference)
+    coupling = jnp.asarray(coupling_strength)
+    if phase.shape != coupling.shape:
+        raise ValueError(
+            "phase_difference and coupling_strength must have the same shape; "
+            f"got {phase.shape} and {coupling.shape}."
+        )
+    if phase.ndim not in (2, 3) or phase.shape[0] != phase.shape[1]:
+        raise ValueError(
+            "phase_difference and coupling_strength must be square pair "
+            f"matrices with optional discrete-state axis, got shape {phase.shape}."
+        )
+    if not bool(jnp.all(jnp.isfinite(phase))) or not bool(
+        jnp.all(jnp.isfinite(coupling))
+    ):
+        raise ValueError(
+            "phase_difference and coupling_strength must contain only finite "
+            "values (no NaN/Inf)."
+        )
+
+    n_oscillators = phase.shape[0]
+    canonical_phase = jnp.zeros_like(phase)
+    canonical_coupling = jnp.zeros_like(coupling)
+
+    diag_idx = jnp.arange(n_oscillators)
+    diag_coupling = coupling[diag_idx, diag_idx]
+    if bool(jnp.any(jnp.abs(diag_coupling) > atol)):
+        max_diag = float(jnp.max(jnp.abs(diag_coupling)))
+        raise ValueError(
+            "coupling_strength diagonal entries are ignored by CNM and must be "
+            f"zero (max |diag| = {max_diag:g}). Put pair couplings in an "
+            "off-diagonal entry instead."
+        )
+
+    for i in range(n_oscillators):
+        for j in range(i + 1, n_oscillators):
+            upper_c = coupling[i, j]
+            lower_c = coupling[j, i]
+            upper_p = phase[i, j]
+            lower_p = phase[j, i]
+            has_upper = jnp.abs(upper_c) > atol
+            has_lower = jnp.abs(lower_c) > atol
+            has_both = has_upper & has_lower
+
+            coupling_conflict = has_both & (jnp.abs(upper_c - lower_c) > atol)
+            phase_conflict = has_both & (
+                jnp.abs(_wrap_angle(upper_p + lower_p)) > atol
+            )
+            if bool(jnp.any(coupling_conflict | phase_conflict)):
+                raise ValueError(
+                    "Conflicting correlated-noise pair parameters for pair "
+                    f"({i}, {j}). CNM covariance has one undirected pair "
+                    "parameter: supply only one triangle, or set "
+                    "coupling_strength[i,j] == coupling_strength[j,i] and "
+                    "phase_difference[i,j] == -phase_difference[j,i] (mod 2*pi)."
+                )
+
+            use_lower = (~has_upper) & has_lower
+            canon_c = jnp.where(use_lower, lower_c, upper_c)
+            canon_p = jnp.where(use_lower, -lower_p, upper_p)
+            canonical_coupling = canonical_coupling.at[i, j].set(canon_c)
+            canonical_phase = canonical_phase.at[i, j].set(canon_p)
+
+    return canonical_phase, canonical_coupling
+
+
 def construct_correlated_noise_process_covariance(
     variance: jax.Array,
     phase_difference: jax.Array,
     coupling_strength: jax.Array,
 ) -> jax.Array:
-    """This allows the noise driving different oscillators to be correlated,
-    representing shared unobserved inputs or influences, distinct
-    from direct dynamic coupling in the transition matrix.
+    """Symmetric process covariance for correlated oscillator noise.
+
+    Lets the noise driving different oscillators be correlated, representing
+    shared unobserved inputs -- distinct from directed dynamic coupling in the
+    transition matrix (directed influence belongs in the DirectedInfluenceModel,
+    not in a covariance).
+
+    Because a covariance is symmetric, this low-level constructor reads the
+    STRICT UPPER TRIANGLE (i < j) of ``phase_difference`` /
+    ``coupling_strength``: the (i, j) cross-block is
+    ``coupling_strength[i, j] * R(phase_difference[i, j])`` and the (j, i)
+    block is its transpose. Model constructors call
+    ``canonicalize_correlated_noise_pair_parameters`` first, so user-facing
+    inputs may be upper-only, lower-only, or mirrored full-pair values.
 
     Parameters
     ----------
     variance : jax.Array, shape (n_oscillators,)
-        Array of process noise variances (sigma_j) for each oscillator.
+        Process-noise variance for each oscillator; sets the diagonal 2x2 blocks
+        to ``variance[j] * I``.
     phase_difference : jax.Array, shape (n_oscillators, n_oscillators)
-        Matrix where phase_diffs[n1, n2] is the phase difference for
-        coupling from oscillator n2 to oscillator n1 (phi_j^{n1,n2}).
+        Per-pair phase of the noise correlation in canonical strict-upper form;
+        ``phase_difference[i, j]`` sets the phase of the (i, j) cross-block, and
+        the (j, i) block is its transpose.
     coupling_strength : jax.Array, shape (n_oscillators, n_oscillators)
-        Matrix where coupling_strengths[n1, n2] is the coupling strength
+        Per-pair noise-correlation magnitude in canonical strict-upper form.
 
     Returns
     -------
     process_covariance : jax.Array, shape (2 * n_oscillators, 2 * n_oscillators)
-        The process covariance matrix for the correlated noise model.
+        Symmetric process covariance. Symmetric by construction, but NOT
+        guaranteed positive semidefinite for large coupling -- the model's
+        ``_project_parameters`` / entry-point validation enforce PSD.
     """
     n_oscillators = variance.shape[0]
 
@@ -281,6 +390,20 @@ def construct_correlated_noise_process_covariance(
     all_blocks = jax.vmap(coupling_row, in_axes=(0, 0))(
         phase_difference, coupling_strength
     )  # (n_oscillators, n_oscillators, 2, 2)
+
+    # Enforce covariance symmetry: the (j, i) cross-block must equal the (i, j)
+    # cross-block transposed. Take the strict upper triangle (i < j) as the
+    # source of truth and mirror it to the lower triangle as its transpose, so
+    # the assembled Q is symmetric by construction. This gives one correlation
+    # magnitude and one (signed) phase per oscillator pair -- the identifiable
+    # parametrization of a phase-coupled noise covariance -- instead of the
+    # independent directed blocks that made Q non-symmetric. Only the strict
+    # upper triangle of ``phase_difference`` / ``coupling_strength`` is used.
+    lower_source = jnp.swapaxes(jnp.swapaxes(all_blocks, 0, 1), -1, -2)
+    upper_mask = (
+        jnp.arange(n_oscillators)[:, None] < jnp.arange(n_oscillators)[None, :]
+    )  # (n, n), True where i < j
+    all_blocks = jnp.where(upper_mask[..., None, None], all_blocks, lower_source)
 
     # Replace diagonal blocks with variance * I
     diag_blocks = variance[:, None, None] * IDENTITY_2x2[None, :, :]
@@ -526,23 +649,37 @@ def _project_to_closest_rotation(matrix: jax.Array) -> jax.Array:
     # Frobenius norm / sqrt(2) gives the RMS singular value, which is the
     # ideal scale for a 2x2 scaled rotation. Downstream spectral radius
     # clamping will correct the scale if needed.
+    #
+    # This helper is PURE (no telemetry): it runs under ``jax.vmap`` (see
+    # ``project_coupled_transition_matrix``), where ``lax.cond`` lowers to
+    # ``select`` and both branches execute, so a per-block ``debug_print_if``
+    # here fires on every lane regardless of the predicate. The fallback signal
+    # is emitted once, reduced with ``jnp.any``, at the non-vmapped call sites.
     is_valid = jnp.all(jnp.isfinite(projected))
     frob_norm = jnp.linalg.norm(matrix, "fro")
     fallback_scale = jnp.where(jnp.isfinite(frob_norm), frob_norm / jnp.sqrt(2.0), 0.5)
     fallback = fallback_scale * jnp.eye(matrix.shape[0])
-    # Fires once per bad block, not per filter step. Without this, the
-    # caller sees a converged-looking fit where one or more oscillation
-    # components are silently nulled (the fallback is a scaled identity =
-    # zero rotation).
-    debug_print_if(
-        ~is_valid,
-        "oscillator_utils._project_to_closest_rotation: SVD produced "
-        "non-finite entries; using damped-identity fallback (scale={s}). "
-        "This oscillation component has zero rotation until the input "
-        "is regularized.",
-        s=fallback_scale,
-    )
     return jnp.where(is_valid, projected, fallback)
+
+
+def _warn_if_rotation_projection_degenerate(transition_matrix: jax.Array) -> None:
+    """Emit ONE fallback warning if any 2x2 block would fail rotation projection.
+
+    ``_project_to_closest_rotation`` falls back to a damped identity (zero
+    rotation, silently nulling an oscillation component) exactly when its input
+    block is non-finite: the SVD of any finite 2x2 is finite, and the geometric-
+    mean scale of a finite block is finite, so a finite block never triggers the
+    fallback. The reduced predicate is therefore ``any(~isfinite(input))``,
+    computed here in the NON-vmapped caller so ``debug_print_if``'s ``lax.cond``
+    behaves conditionally instead of firing on every block.
+    """
+    debug_print_if(
+        jnp.any(~jnp.isfinite(transition_matrix)),
+        "oscillator_utils: transition matrix has non-finite entries; the "
+        "affected 2x2 oscillator block(s) were replaced by a damped-identity "
+        "(zero rotation) fallback, so those components are nulled until the "
+        "input is regularized.",
+    )
 
 
 def _get_scaling_factor_from_block(block: jax.Array, eps: float = 1e-12) -> jax.Array:
@@ -663,6 +800,9 @@ def project_coupled_transition_matrix(transition_matrix: jax.Array) -> jax.Array
         raise ValueError("Input transition_matrix must be square with even dimensions.")
     n_oscillators = dim // 2
 
+    # Non-vmapped: emit one reduced fallback signal for the whole matrix.
+    _warn_if_rotation_projection_degenerate(transition_matrix)
+
     # Reshape to (n_oscillators, 2, n_oscillators, 2) for block access
     blocks = transition_matrix.reshape(n_oscillators, 2, n_oscillators, 2)
     # Transpose to (n_oscillators, n_oscillators, 2, 2) - (from, to, row, col)
@@ -757,7 +897,9 @@ def extract_dim_params_from_matrix(
 
     damping, angles = jax.vmap(_extract_scale_and_angle)(adjusted)
 
-    # Convert angles to frequencies, wrapping negatives
+    # Convert angles to frequencies. A negative recovered frequency is folded
+    # up by sampling_freq / 2 (into [0, fs/2)), treating it as a sub-Nyquist
+    # alias of the SVD-recovered angle -- not a full-period (fs) unwrap.
     freq = angles * sampling_freq / (2 * jnp.pi)
     freq = jnp.where(freq < 0, freq + sampling_freq / 2, freq)
 
@@ -790,6 +932,8 @@ def project_matrix_blockwise(transition_matrix: jax.Array) -> jax.Array:
     if dim % 2 != 0 or transition_matrix.shape != (dim, dim):
         raise ValueError("Input transition_matrix must be square with even dimensions.")
     n_oscillators = dim // 2
+
+    _warn_if_rotation_projection_degenerate(transition_matrix)
 
     return jnp.block(
         [

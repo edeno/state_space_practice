@@ -43,6 +43,7 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.oscillator_utils import (
+    canonicalize_correlated_noise_pair_parameters,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
     construct_correlated_noise_measurement_matrix,
@@ -52,7 +53,6 @@ from state_space_practice.oscillator_utils import (
     extract_dim_params_from_matrix,
     get_block_slice,
     project_coupled_transition_matrix,
-    project_matrix_blockwise,
 )
 from state_space_practice.switching_kalman import (
     compute_transition_q_function,
@@ -63,7 +63,13 @@ from state_space_practice.switching_kalman import (
     switching_kalman_smoother,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import check_converged, make_discrete_transition_matrix
+from state_space_practice.utils import (
+    check_converged,
+    make_discrete_transition_matrix,
+    shift_to_psd,
+    stabilize_covariance,
+    validate_covariance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1151,9 +1157,15 @@ class CorrelatedNoiseModel(BaseModel):
     measurement_variance : float
         Variance of the measurement noise.
     phase_difference : jax.Array, shape (n_oscillators, n_oscillators, n_discrete_states)
-        Initial phase differences for noise correlation.
+        Initial phase differences for noise correlation. Each oscillator pair may
+        be supplied in the strict upper triangle, strict lower triangle, or both
+        triangles if the two entries are opposite phases; values are stored
+        canonically in the strict upper triangle.
     coupling_strength : jax.Array, shape (n_oscillators, n_oscillators, n_discrete_states)
-        Initial coupling strengths for noise correlation.
+        Initial coupling strengths for noise correlation. Each oscillator pair
+        may be supplied in the strict upper triangle, strict lower triangle, or
+        both triangles if the two entries agree; values are stored canonically in
+        the strict upper triangle.
     """
 
     def __init__(
@@ -1213,6 +1225,12 @@ class CorrelatedNoiseModel(BaseModel):
             )
         if sampling_freq <= 0:
             raise ValueError("sampling_freq must be positive. " f"Got {sampling_freq}.")
+        phase_difference, coupling_strength = (
+            canonicalize_correlated_noise_pair_parameters(
+                phase_difference, coupling_strength
+            )
+        )
+
         self.freqs = freqs
         self.damping_coef = damping_coef
         self.process_variance = process_variance
@@ -1265,17 +1283,27 @@ class CorrelatedNoiseModel(BaseModel):
             ],
             axis=2,
         )
-        # Needs shape (n_cont_states, n_cont_states, n_discrete_states)
+        # Needs shape (n_cont_states, n_cont_states, n_discrete_states).
+        # The constructor guarantees symmetry; reject a too-strong coupling that
+        # makes Q symmetric-but-indefinite (it would reach the switching filter on
+        # EM iteration 0, before _project_parameters floors the eigenvalues).
+        validate_covariance(
+            self.process_cov, "process_cov", require_positive_definite=False
+        )
 
     def _project_parameters(self):
-        """Projects each Q_j to preserve its oscillatory/coupling structure.
+        """Projects each per-state Q to the nearest symmetric PSD covariance.
 
-        Uses `project_matrix_blockwise` to project each 2x2 block to its
-        closest (scaled) rotation matrix.
+        The constructor already makes Q symmetric with rotation-structured
+        cross-blocks; strong coupling can still push it indefinite, so floor
+        the eigenvalues to keep it a valid covariance for the Cholesky-based
+        switching filter. (A per-block rotation projection would re-break the
+        cross-block symmetry the constructor establishes, so it is not used
+        here -- a rotation matrix is not a valid covariance block.)
         """
         self.process_cov = jnp.stack(
             [
-                project_matrix_blockwise(self.process_cov[..., j])
+                stabilize_covariance(self.process_cov[..., j])
                 for j in range(self.n_discrete_states)
             ],
             axis=-1,
@@ -1369,6 +1397,11 @@ class CorrelatedNoiseModel(BaseModel):
             construct_correlated_noise_process_covariance,
             in_axes=(-1, -1, -1), out_axes=-1,
         )(proc_var, phase_diff, coupling)
+        # coupling_strength is UNCONSTRAINED, so SGD can propose a coupling that
+        # makes the reconstructed Q indefinite, which NaN-poisons the filter and
+        # the gradient. shift_to_psd is a gradient-safe barrier: identity while Q
+        # is PSD, a smooth lift back to the cone otherwise.
+        Q = jax.vmap(shift_to_psd, in_axes=-1, out_axes=-1)(Q)
 
         result = switching_kalman_filter(
             init_state_cond_mean=m0,
@@ -1391,12 +1424,24 @@ class CorrelatedNoiseModel(BaseModel):
             self.phase_difference = params["phase_difference"]
         if "coupling_strength" in params:
             self.coupling_strength = params["coupling_strength"]
-        # Reconstruct Q from updated params
+        if any(k in params for k in ("phase_difference", "coupling_strength")):
+            self.phase_difference, self.coupling_strength = (
+                canonicalize_correlated_noise_pair_parameters(
+                    self.phase_difference, self.coupling_strength
+                )
+            )
+        # Reconstruct Q from updated params, applying the same gradient-safe PSD
+        # shift the SGD loss used (coupling_strength is UNCONSTRAINED, so the raw
+        # reconstruction can be indefinite). Matching the loss's projection keeps
+        # the stored process_cov identical to what the optimizer evaluated.
         if any(k in params for k in ("process_variance", "phase_difference", "coupling_strength")):
-            self.process_cov = jax.vmap(
+            Q_raw = jax.vmap(
                 construct_correlated_noise_process_covariance,
                 in_axes=(-1, -1, -1), out_axes=-1,
             )(self.process_variance, self.phase_difference, self.coupling_strength)
+            self.process_cov = jax.vmap(
+                shift_to_psd, in_axes=-1, out_axes=-1
+            )(Q_raw)
         self.init_cov = self._reconstruct_per_state_array(
             params, "init_cov", self.init_cov
         )

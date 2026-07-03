@@ -104,7 +104,11 @@ from state_space_practice.switching_kalman import (
     switching_kalman_smoother,
     switching_kalman_smoother_gpb2,
 )
-from state_space_practice.utils import check_converged, make_discrete_transition_matrix
+from state_space_practice.utils import (
+    check_converged,
+    make_discrete_transition_matrix,
+    stabilize_covariance,
+)
 from state_space_practice.utils import divide_safe as _divide_safe
 from state_space_practice.utils import scale_likelihood as _scale_likelihood
 from state_space_practice.utils import (
@@ -2553,9 +2557,11 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         The current implementation can introduce bias when state-conditional
         latents differ significantly. For improved accuracy, consider:
 
-        - Using ``update_spike_glm_params_second_order`` with aggregated
-          state-conditional covariances
+        - ``update_spike_glm_params(..., use_second_order=True)`` with
+          aggregated state-conditional covariances (the second-order path
+          already used here for the covariance correction)
         - Fitting separate observation parameters per discrete state
+          (``separate_spike_params=True``)
 
         """
         if not self.update_spike_params:
@@ -2731,27 +2737,16 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 projected_A_list, axis=-1
             )
 
-        # Project each process covariance to ensure PSD
+        # Project each process covariance to the nearest symmetric PSD matrix
+        # (symmetrize -> eigenvalue floor at 1e-8 -> reconstruct).
         if self.update_process_cov:
-            projected_Q_list = []
-            for j in range(self.n_discrete_states):
-                Q_j = self.process_cov[:, :, j]
-
-                # Ensure symmetry
-                Q_j = (Q_j + Q_j.T) / 2
-
-                # Ensure PSD by eigenvalue clipping
-                eigenvalues, eigenvectors = jnp.linalg.eigh(Q_j)
-                # Clip negative eigenvalues to small positive value
-                eigenvalues_clipped = jnp.maximum(eigenvalues, 1e-8)
-                # Reconstruct PSD matrix
-                Q_j_psd = eigenvectors @ jnp.diag(eigenvalues_clipped) @ eigenvectors.T
-                # Ensure symmetry again (numerical precision)
-                Q_j_psd = (Q_j_psd + Q_j_psd.T) / 2
-
-                projected_Q_list.append(Q_j_psd)
-
-            self.process_cov = jnp.stack(projected_Q_list, axis=-1)
+            self.process_cov = jnp.stack(
+                [
+                    stabilize_covariance(self.process_cov[:, :, j])
+                    for j in range(self.n_discrete_states)
+                ],
+                axis=-1,
+            )
 
     def fit(
         self,

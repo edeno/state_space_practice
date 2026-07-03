@@ -940,3 +940,30 @@ class TestContingencyBeliefRecovery:
                 f"State {s}: worst reward prob {worst_prob:.3f} >= 0.4 "
                 f"(true is ~0.1)"
             )
+
+
+class TestContingencyBeliefValidation:
+    """Construction-time guards on scalar hyperparameters."""
+
+    def test_rejects_nonpositive_inverse_temperature(self):
+        with pytest.raises(ValueError, match="init_inverse_temperature must be > 0"):
+            ContingencyBeliefModel(
+                n_states=2, n_options=2, init_inverse_temperature=0.0
+            )
+
+    def test_rejects_init_diagonal_above_one(self):
+        with pytest.raises(ValueError, match="init_diagonal must be a probability"):
+            ContingencyBeliefModel(n_states=2, n_options=2, init_diagonal=1.5)
+
+    def test_converged_flag_reflects_convergence(self):
+        # Distinct `while abs(ll-prev_ll)<tol and iteration>0` EM loop; verify
+        # converged_ here as well as in multinomial.
+        rng = np.random.default_rng(0)
+        choices = rng.integers(0, 2, size=200)
+        rewards = rng.integers(0, 2, size=200)
+        m1 = ContingencyBeliefModel(n_states=2, n_options=2)
+        m1.fit(choices, rewards, max_iter=1)
+        assert m1.converged_ is False  # cannot converge in one iteration
+        m2 = ContingencyBeliefModel(n_states=2, n_options=2)
+        m2.fit(choices, rewards, max_iter=100)
+        assert m2.converged_ is True

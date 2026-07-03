@@ -31,13 +31,13 @@ from jax import Array
 
 from state_space_practice.kalman import symmetrize
 from state_space_practice.oscillator_utils import (
+    canonicalize_correlated_noise_pair_parameters,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
     construct_correlated_noise_process_covariance,
     construct_directed_influence_transition_matrix,
     extract_dim_params_from_matrix,
     project_coupled_transition_matrix,
-    project_matrix_blockwise,
 )
 from state_space_practice.switching_kalman import (
     compute_transition_q_function,
@@ -54,7 +54,15 @@ from state_space_practice.switching_point_process import (
     update_spike_glm_params,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import check_converged, make_discrete_transition_matrix
+from state_space_practice.utils import (
+    check_converged,
+    make_discrete_transition_matrix,
+    shift_to_psd,
+    stabilize_covariance,
+    validate_covariance,
+    validate_probability_vector,
+    validate_transition_matrix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +211,15 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
         if discrete_transition_diag is None:
             expected_dwell_sec = 1.0
             p_stay = 1.0 - 1.0 / (expected_dwell_sec * sampling_freq)
+            if not 0.0 <= p_stay <= 1.0:
+                raise ValueError(
+                    f"Computed default self-transition probability "
+                    f"p_stay={p_stay:g} is outside [0, 1] (from "
+                    f"sampling_freq={sampling_freq} Hz and a {expected_dwell_sec}s "
+                    f"expected dwell time). This occurs when "
+                    f"sampling_freq < 1 / expected_dwell_sec; pass "
+                    f"discrete_transition_diag explicitly for low sampling rates."
+                )
             self.discrete_transition_diag = jnp.full(
                 (n_discrete_states,), p_stay
             )
@@ -478,12 +495,18 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                 f"({self.n_latent}, {self.n_latent}, {self.n_discrete_states}), "
                 f"got {self.init_cov.shape}."
             )
+        # init_cov must be symmetric PD per discrete state; the Cholesky-based
+        # Laplace-EKF NaNs on a non-PSD prior.
+        validate_covariance(self.init_cov, "init_cov")
         if self.init_discrete_state_prob.shape != (self.n_discrete_states,):
             raise ValueError(
                 f"init_discrete_state_prob shape mismatch: expected "
                 f"({self.n_discrete_states},), "
                 f"got {self.init_discrete_state_prob.shape}."
             )
+        validate_probability_vector(
+            self.init_discrete_state_prob, "init_discrete_state_prob"
+        )
         if self.discrete_transition_matrix.shape != (
             self.n_discrete_states,
             self.n_discrete_states,
@@ -493,6 +516,9 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                 f"({self.n_discrete_states}, {self.n_discrete_states}), "
                 f"got {self.discrete_transition_matrix.shape}."
             )
+        validate_transition_matrix(
+            self.discrete_transition_matrix, "discrete_transition_matrix"
+        )
         if self.continuous_transition_matrix.shape != (
             self.n_latent,
             self.n_latent,
@@ -513,6 +539,12 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                 f"({self.n_latent}, {self.n_latent}, {self.n_discrete_states}), "
                 f"got {self.process_cov.shape}."
             )
+        # process_cov must be symmetric PSD per state; a too-strong correlated-
+        # noise coupling yields a symmetric-but-indefinite Q that would reach the
+        # Cholesky-based filter on EM iteration 0 (before _project_parameters).
+        validate_covariance(
+            self.process_cov, "process_cov", require_positive_definite=False
+        )
         if self.separate_spike_params:
             expected_baseline = (self.n_neurons, self.n_discrete_states)
             expected_weights = (
@@ -1458,9 +1490,15 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
     process_variance : Array, shape (n_oscillators, n_discrete_states)
         Process noise variance per oscillator per state.
     phase_difference : Array, shape (n_oscillators, n_oscillators, n_discrete_states)
-        Phase differences for noise correlation.
+        Phase differences for noise correlation. Each oscillator pair may be
+        supplied in the strict upper triangle, strict lower triangle, or both
+        triangles if the two entries are opposite phases; values are stored
+        canonically in the strict upper triangle.
     coupling_strength : Array, shape (n_oscillators, n_oscillators, n_discrete_states)
-        Coupling strengths for noise correlation.
+        Coupling strengths for noise correlation. Each oscillator pair may be
+        supplied in the strict upper triangle, strict lower triangle, or both
+        triangles if the two entries agree; values are stored canonically in the
+        strict upper triangle.
     """
 
     def __init__(
@@ -1517,6 +1555,12 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
                 f"!= ({n_oscillators}, {n_oscillators}, {n_discrete_states})"
             )
 
+        phase_difference, coupling_strength = (
+            canonicalize_correlated_noise_pair_parameters(
+                phase_difference, coupling_strength
+            )
+        )
+
         self.freqs = freqs
         self.damping_coef = damping_coef
         self.process_variance = process_variance
@@ -1549,22 +1593,24 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         )
 
     def _project_parameters(self) -> None:
-        """Project Q to preserve oscillatory block structure and ensure PSD."""
+        """Project each per-state Q to the nearest symmetric PSD covariance.
+
+        The correlated-noise constructor now emits a symmetric Q (tie-blocks), so
+        the M-step only needs to floor eigenvalues to keep it PSD. A per-block
+        rotation projection (the old ``project_matrix_blockwise``) is not used --
+        it distorts the noise-correlation structure and re-breaks the cross-block
+        symmetry the constructor establishes; a rotation is not a covariance block.
+        """
         if not self.update_process_cov:
             return
 
-        projected_Q_list = []
-        for j in range(self.n_discrete_states):
-            Q_j = project_matrix_blockwise(self.process_cov[:, :, j])
-            # Ensure PSD
-            Q_j = symmetrize(Q_j)
-            eigenvalues, eigenvectors = jnp.linalg.eigh(Q_j)
-            eigenvalues_clipped = jnp.maximum(eigenvalues, 1e-8)
-            Q_j_psd = eigenvectors @ jnp.diag(eigenvalues_clipped) @ eigenvectors.T
-            Q_j_psd = symmetrize(Q_j_psd)
-            projected_Q_list.append(Q_j_psd)
-
-        self.process_cov = jnp.stack(projected_Q_list, axis=-1)
+        self.process_cov = jnp.stack(
+            [
+                stabilize_covariance(self.process_cov[:, :, j])
+                for j in range(self.n_discrete_states)
+            ],
+            axis=-1,
+        )
 
     # --- SGDFittableMixin: CNM-PP specific ---
 
@@ -1620,6 +1666,11 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
             construct_correlated_noise_process_covariance,
             in_axes=(-1, -1, -1), out_axes=-1,
         )(proc_var, phase_diff, coupling)
+        # coupling_strength is UNCONSTRAINED, so SGD can propose a coupling that
+        # makes the reconstructed Q indefinite, which NaN-poisons the filter and
+        # the gradient. shift_to_psd is a gradient-safe barrier: identity while Q
+        # is PSD, a smooth lift back to the cone otherwise.
+        Q = jax.vmap(shift_to_psd, in_axes=-1, out_axes=-1)(Q)
 
         # Inject reconstructed Q into the base loss function via params
         params_with_Q = dict(params)
@@ -1634,7 +1685,16 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
             self.phase_difference = params["phase_difference"]
         if "coupling_strength" in params:
             self.coupling_strength = params["coupling_strength"]
-        # Reconstruct Q from updated params
+        if any(k in params for k in ("phase_difference", "coupling_strength")):
+            self.phase_difference, self.coupling_strength = (
+                canonicalize_correlated_noise_pair_parameters(
+                    self.phase_difference, self.coupling_strength
+                )
+            )
+        # Reconstruct Q from updated params, applying the same gradient-safe PSD
+        # shift the SGD loss used (coupling_strength is UNCONSTRAINED, so the raw
+        # reconstruction can be indefinite). Matching the loss's projection keeps
+        # the stored process_cov identical to what the optimizer evaluated.
         if any(k in params for k in ("process_variance", "phase_difference", "coupling_strength")):
             Q_list = []
             for j in range(self.n_discrete_states):
@@ -1643,7 +1703,7 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
                     phase_difference=self.phase_difference[..., j],
                     coupling_strength=self.coupling_strength[..., j],
                 )
-                Q_list.append(Q_j)
+                Q_list.append(shift_to_psd(Q_j))
             self.process_cov = jnp.stack(Q_list, axis=-1)
         self.init_cov = self._reconstruct_per_state_array(
             params, "init_cov", self.init_cov

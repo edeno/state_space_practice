@@ -435,7 +435,6 @@ def contingency_belief_filter(
     has_obs_covariates = (
         obs_design_matrix is not None and obs_weights is not None
     )
-    per_state_obs = False
     if has_obs_covariates:
         if obs_design_matrix.shape[0] != n_trials:
             raise ValueError(
@@ -443,7 +442,6 @@ def contingency_belief_filter(
                 f"but choices has {n_trials} trials"
             )
         _validate_obs_weights_shape(obs_weights, n_states, n_options)
-        per_state_obs = obs_weights.ndim == 3
         if obs_weights.shape[-1] != obs_design_matrix.shape[1]:
             raise ValueError(
                 f"obs_weights last-axis size {obs_weights.shape[-1]} != "
@@ -469,9 +467,9 @@ def contingency_belief_filter(
         return posterior, log_norm
 
     def _compute_obs_offset(obs_dm_t):
-        if per_state_obs:
-            return obs_weights @ obs_dm_t  # (n_states, n_options)
-        return obs_weights @ obs_dm_t  # (n_options,)
+        # Shape is (n_states, n_options) when obs_weights is per-state (ndim 3),
+        # else (n_options,); the matmul handles both without branching.
+        return obs_weights @ obs_dm_t
 
     def _step(carry, trial_data):
         prev_belief, accum_ll = carry
@@ -760,8 +758,32 @@ class ContingencyBeliefModel(SGDFittableMixin):
         self.stickiness = stickiness
         self.transition_regularization = transition_regularization
 
-        # Initialize parameters
-        self.reward_probs_ = jnp.ones((n_states, n_options)) / 2
+        if init_inverse_temperature <= 0:
+            raise ValueError(
+                f"init_inverse_temperature must be > 0, got "
+                f"{init_inverse_temperature}."
+            )
+        if not 0.0 <= init_diagonal <= 1.0:
+            raise ValueError(
+                f"init_diagonal must be a probability in [0, 1], got "
+                f"{init_diagonal}; a value >= 1 makes the off-diagonal "
+                f"transition probabilities negative."
+            )
+        if concentration <= 0:
+            raise ValueError(f"concentration must be > 0, got {concentration}.")
+        if stickiness < 0:
+            raise ValueError(f"stickiness must be >= 0, got {stickiness}.")
+
+        # Initialize parameters. reward_probs_ is perturbed off 0.5 per state
+        # (distinct seed from state_values_) so EM does not start at a saddle
+        # where the reward channel provides no state-discriminating signal --
+        # the failure mode when states differ mainly in reward contingency.
+        self.reward_probs_ = jnp.clip(
+            0.5 + 0.05 * jax.random.normal(
+                jax.random.PRNGKey(1), (n_states, n_options)
+            ),
+            0.01, 0.99,
+        )
         self.state_values_ = jax.random.normal(
             jax.random.PRNGKey(0), (n_states, n_options)
         ) * 0.1
@@ -778,6 +800,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
             init_logits[None, :, :]  # (1, n_states, n_states - 1)
         )
         self._transition_design_matrix: Optional[Array] = None
+        self.converged_: Optional[bool] = None
 
         # Observation-side covariates for action biases
         if n_obs_covariates > 0:
@@ -1002,6 +1025,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
         log_likelihoods: list[float] = []
         prev_ll = float("-inf")
+        converged = False
 
         for iteration in range(max_iter):
             # E-step
@@ -1014,6 +1038,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
             if abs(ll - prev_ll) < tolerance and iteration > 0:
                 logger.info(f"Converged at iteration {iteration + 1}")
+                converged = True
                 break
             prev_ll = ll
 
@@ -1027,6 +1052,8 @@ class ContingencyBeliefModel(SGDFittableMixin):
         filter_result = contingency_belief_filter(**filter_kwargs)
         self.state_posterior_ = filter_result.state_posterior
         self._populate_uncertainty(choices)
+        self._finalize_convergence(converged, max_iter)
+
         return log_likelihoods
 
     def _m_step(self, choices, rewards, result):

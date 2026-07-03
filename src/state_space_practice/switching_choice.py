@@ -471,6 +471,27 @@ class SwitchingChoiceModel(SGDFittableMixin):
         else:
             self.decays_ = jnp.ones(S)
 
+        # Per-state parameters have hard validity constraints that EM/SGD assume
+        # but do not enforce for the fixed (non-learned) values; a negative
+        # inverse temperature silently inverts choice preferences.
+        if bool(jnp.any(self.inverse_temperatures_ <= 0)):
+            raise ValueError(
+                "init_inverse_temperatures must be strictly positive (a "
+                "non-positive inverse temperature makes the softmax degenerate "
+                "or inverts choice preferences); got min "
+                f"{float(jnp.min(self.inverse_temperatures_))}."
+            )
+        if bool(jnp.any(self.process_noises_ < 0)):
+            raise ValueError(
+                "init_process_noises must be non-negative (Q_j = q_j * I must be "
+                f"PSD); got min {float(jnp.min(self.process_noises_))}."
+            )
+        if bool(jnp.any((self.decays_ <= 0) | (self.decays_ > 1))):
+            raise ValueError(
+                "init_decays must lie in (0, 1] for stable latent dynamics; got "
+                f"[{float(jnp.min(self.decays_))}, {float(jnp.max(self.decays_))}]."
+            )
+
         # Shared parameters
         self.init_mean_ = jnp.zeros(k_free)
         self.init_cov_ = jnp.eye(k_free)
@@ -487,6 +508,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
             self.obs_weights_ = None
 
         # Fitted state
+        self.converged_: Optional[bool] = None
         self._filter_result: Optional[SwitchingChoiceFilterResult] = None
         self.smoothed_discrete_probs_: Optional[Array] = None
         self.log_likelihood_: Optional[float] = None
@@ -663,6 +685,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
 
         log_likelihoods: list[float] = []
         prev_ll = float("-inf")
+        converged = False
 
         for iteration in range(max_iter):
             # E-step: filter + smoother
@@ -674,6 +697,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
 
             if abs(ll - prev_ll) < tolerance and iteration > 0:
                 logger.info(f"Converged at iteration {iteration + 1}")
+                converged = True
                 break
             prev_ll = ll
 
@@ -686,6 +710,8 @@ class SwitchingChoiceModel(SGDFittableMixin):
         self.log_likelihood_ = log_likelihoods[-1]
         self.log_likelihood_history_ = log_likelihoods
         self._populate_uncertainty(choices)
+        self._finalize_convergence(converged, max_iter)
+
         return log_likelihoods
 
     def _run_smoother(self, filter_result):

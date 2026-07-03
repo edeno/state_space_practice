@@ -686,3 +686,34 @@ class TestSwitchingChoiceRecovery:
             f"Per-state beta gap {gap:.3f} < 0.1 after SGD "
             f"(learned: {model.inverse_temperatures_})"
         )
+
+
+class TestSwitchingChoiceValidation:
+    """Construction-time guards on per-state hyperparameters."""
+
+    def test_rejects_negative_inverse_temperature(self):
+        with pytest.raises(
+            ValueError, match="inverse_temperatures must be strictly positive"
+        ):
+            SwitchingChoiceModel(
+                n_options=3, n_discrete_states=2,
+                init_inverse_temperatures=[-1.0, 1.0],
+            )
+
+    def test_rejects_decay_outside_unit_interval(self):
+        with pytest.raises(ValueError, match="decays must lie in"):
+            SwitchingChoiceModel(
+                n_options=3, n_discrete_states=2, init_decays=[1.5, 0.9],
+            )
+
+    def test_converged_flag_false_when_not_converged(self):
+        # Deterministic: one iteration cannot satisfy the convergence check, so
+        # converged_ must be False. (The True direction for this same
+        # `while abs(ll-prev_ll)<tol and iteration>0` loop is covered by the
+        # contingency-belief test, whose data converges; switching_choice EM
+        # does not reliably converge on random choices in a bounded budget.)
+        rng = np.random.default_rng(0)
+        choices = rng.integers(0, 3, size=200)
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model.fit(choices, max_iter=1)
+        assert model.converged_ is False

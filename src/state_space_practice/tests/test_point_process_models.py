@@ -241,6 +241,36 @@ class TestCorrelatedNoisePointProcessModel:
         assert model.n_neurons == cnm_pp_params["n_neurons"]
         assert model.n_discrete_states == cnm_pp_params["n_discrete_states"]
 
+    def test_lower_triangle_pair_params_are_canonicalized(self, cnm_pp_params) -> None:
+        params = dict(cnm_pp_params)
+        n_disc = params["n_discrete_states"]
+        params["phase_difference"] = (
+            jnp.zeros((2, 2, n_disc)).at[1, 0, :].set(-0.7)
+        )
+        params["coupling_strength"] = (
+            jnp.zeros((2, 2, n_disc)).at[1, 0, :].set(0.05)
+        )
+
+        model = CorrelatedNoisePointProcessModel(**params)
+
+        np.testing.assert_allclose(model.phase_difference[0, 1, :], 0.7)
+        np.testing.assert_allclose(model.coupling_strength[0, 1, :], 0.05)
+        np.testing.assert_allclose(model.phase_difference[1, 0, :], 0.0)
+        np.testing.assert_allclose(model.coupling_strength[1, 0, :], 0.0)
+
+    def test_conflicting_pair_params_raise(self, cnm_pp_params) -> None:
+        params = dict(cnm_pp_params)
+        n_disc = params["n_discrete_states"]
+        params["phase_difference"] = (
+            jnp.zeros((2, 2, n_disc)).at[0, 1, :].set(0.7).at[1, 0, :].set(0.3)
+        )
+        params["coupling_strength"] = (
+            jnp.zeros((2, 2, n_disc)).at[0, 1, :].set(0.05).at[1, 0, :].set(0.05)
+        )
+
+        with pytest.raises(ValueError, match="Conflicting correlated-noise"):
+            CorrelatedNoisePointProcessModel(**params)
+
     def test_update_flags(self, cnm_pp_params) -> None:
         """CNM-PP should update Q but not A."""
         model = CorrelatedNoisePointProcessModel(**cnm_pp_params)
@@ -314,6 +344,38 @@ class TestCorrelatedNoisePointProcessModel:
         for j in range(model.n_discrete_states):
             eigvals = jnp.linalg.eigvalsh(model.process_cov[..., j])
             assert jnp.all(eigvals >= -1e-10)
+
+    @pytest.mark.slow
+    def test_sgd_loss_finite_and_differentiable_at_indefinite_coupling(
+        self, cnm_pp_params, synthetic_spikes
+    ) -> None:
+        # coupling_strength is UNCONSTRAINED during SGD, so the optimizer can
+        # propose a coupling whose reconstructed Q is indefinite. The loss must
+        # stay finite AND differentiable there (via the gradient-safe PSD shift);
+        # without the fix both go NaN and poison the optimizer. The guard confirms
+        # the proposed Q is actually indefinite so the barrier path is exercised.
+        from state_space_practice.oscillator_utils import (
+            construct_correlated_noise_process_covariance,
+        )
+
+        model = CorrelatedNoisePointProcessModel(**cnm_pp_params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        n_osc, n_states = model.n_oscillators, model.n_discrete_states
+        big = 5.0 * float(jnp.max(model.process_variance))  # coupling >> variance
+
+        Q_raw = construct_correlated_noise_process_covariance(
+            variance=model.process_variance[:, 0],
+            phase_difference=model.phase_difference[..., 0],
+            coupling_strength=jnp.zeros((n_osc, n_osc)).at[0, 1].set(big),
+        )
+        assert jnp.linalg.eigvalsh(Q_raw).min() < 0.0  # guard: barrier is active
+
+        def loss(c):
+            cp = jnp.zeros((n_osc, n_osc, n_states)).at[0, 1, :].set(c)
+            return model._sgd_loss_fn({"coupling_strength": cp}, synthetic_spikes)
+
+        assert bool(jnp.isfinite(loss(big)))
+        assert bool(jnp.isfinite(jax.grad(loss)(big)))
 
 
 # ============================================================================
@@ -639,3 +701,38 @@ class TestSwitchingPPSGDFitting:
             f"Higher L2 ({norm_high:.4f}) should give smaller weight norm "
             f"than lower L2 ({norm_low:.4f})"
         )
+
+
+class TestPointProcessValidation:
+    """Construction-time validators wired into _validate_parameter_shapes."""
+
+    def test_rejects_low_sampling_freq_via_p_stay(self, com_pp_params):
+        # sampling_freq < 1/expected_dwell -> computed default p_stay < 0.
+        params = dict(com_pp_params)
+        params["sampling_freq"] = 0.5
+        with pytest.raises(ValueError, match="p_stay"):
+            CommonOscillatorPointProcessModel(**params)
+
+    def test_rejects_negative_process_variance(self, com_pp_params):
+        # Negative variance -> indefinite diagonal Q. process_cov is built and
+        # validated in _initialize_parameters (fit-time setup), before the EM
+        # loop, so it is caught there rather than at __init__.
+        params = dict(com_pp_params)
+        params["process_variance"] = jnp.array([-0.1, 0.1])
+        model = CommonOscillatorPointProcessModel(**params)
+        with pytest.raises(ValueError, match="process_cov"):
+            model._initialize_parameters(jax.random.PRNGKey(0))
+
+    def test_cnm_rejects_indefinite_process_cov(self, cnm_pp_params):
+        # Coupling magnitude above the process variance makes the (symmetric)
+        # correlated-noise Q indefinite; caught in _initialize_parameters before
+        # it reaches the Cholesky-based filter on EM iteration 0.
+        params = dict(cnm_pp_params)
+        n_osc = params["n_oscillators"]
+        n_disc = params["n_discrete_states"]
+        coupling = np.zeros((n_osc, n_osc, n_disc))
+        coupling[0, 1, :] = 0.5  # > process_variance (0.1)
+        params["coupling_strength"] = jnp.array(coupling)
+        model = CorrelatedNoisePointProcessModel(**params)
+        with pytest.raises(ValueError, match="process_cov"):
+            model._initialize_parameters(jax.random.PRNGKey(0))

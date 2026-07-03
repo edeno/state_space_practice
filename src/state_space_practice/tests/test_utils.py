@@ -3,6 +3,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from state_space_practice.utils import (
     check_converged,
@@ -11,9 +12,13 @@ from state_space_practice.utils import (
     psd_solve,
     safe_log,
     scale_likelihood,
+    shift_to_psd,
     stabilize_covariance,
     stabilize_probability_vector,
     symmetrize,
+    validate_covariance,
+    validate_probability_vector,
+    validate_transition_matrix,
 )
 
 
@@ -260,6 +265,61 @@ class TestLinearAlgebraUtilities:
         np.testing.assert_allclose(stabilized, C, atol=1e-6)
 
 
+def _degenerate_block_cov(coupling: float) -> jax.Array:
+    """A 4x4 symmetric matrix with paired (degenerate) eigenvalues 0.1 +/- c.
+
+    This is the eigenvalue structure that makes eigenvector-reconstruction
+    projections (project_psd / stabilize_covariance) produce NaN gradients:
+    the ``1/(lambda_i - lambda_j)`` terms diverge on the degenerate pairs.
+    """
+    return jnp.array(
+        [
+            [0.1, 0.0, coupling, 0.0],
+            [0.0, 0.1, 0.0, coupling],
+            [coupling, 0.0, 0.1, 0.0],
+            [0.0, coupling, 0.0, 0.1],
+        ]
+    )
+
+
+class TestShiftToPsd:
+    """Tests for the gradient-safe PSD shift used inside SGD losses."""
+
+    def test_identity_on_psd_input(self) -> None:
+        C = jnp.array([[2.0, 0.5], [0.5, 1.0]])  # PSD already
+        np.testing.assert_allclose(shift_to_psd(C), C, atol=1e-12)
+
+    def test_lifts_indefinite_to_psd(self) -> None:
+        Q = _degenerate_block_cov(0.5)  # eigenvalues 0.1 +/- 0.5 -> min -0.4
+        assert jnp.linalg.eigvalsh(Q).min() < 0.0  # guard: input is indefinite
+        lifted = shift_to_psd(Q, min_eigenvalue=1e-6)
+        assert jnp.linalg.eigvalsh(lifted).min() >= 1e-6 - 1e-9
+
+    def test_shift_is_isotropic_and_symmetric(self) -> None:
+        Q = _degenerate_block_cov(0.5)
+        lifted = shift_to_psd(Q)
+        # Only the diagonal is shifted (by a single scalar); off-diagonals unchanged.
+        np.testing.assert_allclose(lifted - Q, jnp.diag(jnp.diag(lifted - Q)), atol=1e-12)
+        diag_shift = jnp.diag(lifted - Q)
+        np.testing.assert_allclose(diag_shift, diag_shift[0], atol=1e-12)
+        np.testing.assert_allclose(lifted, lifted.T, atol=1e-12)
+
+    def test_gradient_finite_through_degenerate_indefinite(self) -> None:
+        # The whole point of shift_to_psd: a differentiated projection that stays
+        # finite where eigenvector-reconstruction projections NaN. Guard that the
+        # barrier is actually active (Q indefinite) at the evaluation point.
+        def loss(c: float) -> jax.Array:
+            return shift_to_psd(_degenerate_block_cov(c)).sum()
+
+        c_eval = 0.5
+        assert jnp.linalg.eigvalsh(_degenerate_block_cov(c_eval)).min() < 0.0
+        grad = jax.grad(loss)(c_eval)
+        assert bool(jnp.isfinite(grad))
+        # The eigenvector-reconstruction projection NaNs here -- this is the bug
+        # shift_to_psd exists to avoid.
+        assert not bool(jnp.isfinite(jax.grad(lambda c: stabilize_covariance(_degenerate_block_cov(c)).sum())(c_eval)))
+
+
 class TestProbabilityUtilities:
     """Tests for probability utilities moved from switching_kalman.py."""
 
@@ -320,3 +380,85 @@ class TestProbabilityUtilities:
         assert float(ll_max) == 0.0
         # exp(-inf - 0) = 0.0
         np.testing.assert_allclose(scaled, jnp.zeros(3))
+
+
+class TestValidateCovariance:
+    """Tests for validate_covariance (symmetric-PSD guard)."""
+
+    def test_symmetric_pd_passes(self) -> None:
+        validate_covariance(jnp.eye(3))  # should not raise
+
+    def test_per_state_stack_passes(self) -> None:
+        cov = jnp.stack([jnp.eye(2), 2.0 * jnp.eye(2)], axis=-1)  # (2, 2, 2)
+        validate_covariance(cov)
+
+    def test_asymmetric_raises(self) -> None:
+        # Symmetric eigvalsh would NOT catch this; the raw-matrix check must.
+        asym = jnp.array([[1.0, 0.5], [-0.5, 1.0]])
+        with pytest.raises(ValueError, match="not symmetric"):
+            validate_covariance(asym)
+
+    def test_indefinite_raises(self) -> None:
+        indef = jnp.array([[1.0, 2.0], [2.0, 1.0]])  # eigenvalues 3, -1
+        with pytest.raises(ValueError, match="not positive definite"):
+            validate_covariance(indef)
+
+    def test_per_state_names_offending_index(self) -> None:
+        cov = jnp.stack([jnp.eye(2), jnp.array([[1.0, 2.0], [2.0, 1.0]])], axis=-1)
+        with pytest.raises(ValueError, match=r"\[\.\.\., 1\]"):
+            validate_covariance(cov)
+
+    def test_semidefinite_allowed_when_not_requiring_pd(self) -> None:
+        psd_singular = jnp.array([[1.0, 0.0], [0.0, 0.0]])
+        validate_covariance(psd_singular, require_positive_definite=False)
+        with pytest.raises(ValueError, match="not positive definite"):
+            validate_covariance(psd_singular, require_positive_definite=True)
+
+    def test_non_square_raises(self) -> None:
+        with pytest.raises(ValueError, match="square"):
+            validate_covariance(jnp.ones((2, 3)))
+
+    def test_non_finite_raises(self) -> None:
+        # diag([inf, 1]) is "symmetric" and has all eigenvalues >= 0, so only an
+        # explicit finiteness check catches it.
+        with pytest.raises(ValueError, match="non-finite"):
+            validate_covariance(jnp.diag(jnp.array([jnp.inf, 1.0])))
+
+
+class TestValidateTransitionMatrix:
+    """Tests for validate_transition_matrix (row-stochastic guard)."""
+
+    def test_row_stochastic_passes(self) -> None:
+        validate_transition_matrix(jnp.array([[0.9, 0.1], [0.2, 0.8]]))
+
+    def test_rows_not_summing_to_one_raises(self) -> None:
+        with pytest.raises(ValueError, match="sum to 1"):
+            validate_transition_matrix(jnp.array([[0.9, 0.9], [0.1, 0.1]]))
+
+    def test_negative_entry_raises(self) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            validate_transition_matrix(jnp.array([[1.2, -0.2], [0.3, 0.7]]))
+
+    def test_non_finite_raises(self) -> None:
+        with pytest.raises(ValueError, match="non-finite"):
+            validate_transition_matrix(jnp.array([[jnp.nan, 0.0], [0.5, 0.5]]))
+
+
+class TestValidateProbabilityVector:
+    """Tests for validate_probability_vector (simplex guard)."""
+
+    def test_valid_simplex_passes(self) -> None:
+        validate_probability_vector(jnp.array([0.2, 0.3, 0.5]))
+
+    def test_unnormalized_raises(self) -> None:
+        with pytest.raises(ValueError, match="sum to 1"):
+            validate_probability_vector(jnp.array([0.5, 0.6, 0.3]))
+
+    def test_negative_entry_raises(self) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            validate_probability_vector(jnp.array([1.2, -0.2]))
+
+    def test_non_finite_raises(self) -> None:
+        # [0.5, nan] would slip past the sum check: abs(nan - 1) > atol is False.
+        with pytest.raises(ValueError, match="non-finite"):
+            validate_probability_vector(jnp.array([0.5, jnp.nan]))

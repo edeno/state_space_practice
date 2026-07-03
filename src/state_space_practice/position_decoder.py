@@ -31,12 +31,20 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.kalman import rts_backward_scan, symmetrize
+from state_space_practice.utils import validate_covariance
 from state_space_practice.point_process_kalman import (
     _point_process_laplace_update,
     _safe_expected_count,
 )
 
 logger = logging.getLogger(__name__)
+
+# Upper bounds for AdaptiveInflationConfig. The per-step multiplier compounds
+# across time bins, so an unbounded max_alpha (or a gain large enough to pin
+# the multiplier at max_alpha every bin) drives runaway covariance growth --
+# the exact divergence adaptive inflation exists to prevent.
+_MAX_INFLATION_MAX_ALPHA = 100.0
+_MAX_INFLATION_GAIN = 1.0e4
 
 
 @dataclass
@@ -72,8 +80,22 @@ class AdaptiveInflationConfig:
     def __post_init__(self):
         if self.gain < 0:
             raise ValueError(f"gain must be >= 0, got {self.gain}")
+        if self.gain > _MAX_INFLATION_GAIN:
+            raise ValueError(
+                f"gain must be <= {_MAX_INFLATION_GAIN}, got {self.gain}. Very "
+                f"large gains drive the per-step inflation factor to its "
+                f"max_alpha ceiling on every bin, which compounds into runaway "
+                f"covariance growth."
+            )
         if self.max_alpha < 1.0:
             raise ValueError(f"max_alpha must be >= 1.0, got {self.max_alpha}")
+        if self.max_alpha > _MAX_INFLATION_MAX_ALPHA:
+            raise ValueError(
+                f"max_alpha must be <= {_MAX_INFLATION_MAX_ALPHA}, got "
+                f"{self.max_alpha}. A per-step multiplier this large multiplies "
+                f"the predicted covariance without bound across time bins; the "
+                f"filter will diverge. The default is {3.0}."
+            )
         if self.epsilon <= 0:
             raise ValueError(f"epsilon must be > 0, got {self.epsilon}")
         if self.min_fisher_trace < 0:
@@ -1163,7 +1185,13 @@ def position_decoder_filter(
     else:
         infl_args = (jnp.zeros(()), jnp.zeros(()), jnp.zeros(()), jnp.zeros(()))
 
-    init_carry = (jnp.asarray(init_position), jnp.asarray(init_cov), jnp.array(0.0))
+    # The EKF propagation, Woodbury track-penalty downdate, and Laplace update
+    # all assume a symmetric PD init_cov; a non-PSD one silently produces
+    # all-NaN output (and the divergence guard below is NaN-blind).
+    init_cov = jnp.asarray(init_cov)
+    validate_covariance(init_cov, "init_cov")
+
+    init_carry = (jnp.asarray(init_position), init_cov, jnp.array(0.0))
     filtered_mean, filtered_cov, marginal_ll = _run_filter_scan(
         spikes_arr,
         init_carry,

@@ -13,6 +13,7 @@ from state_space_practice.oscillator_utils import (
     _get_scaling_factor,
     _project_to_closest_rotation,
     _scatter_block_diagonal,
+    canonicalize_correlated_noise_pair_parameters,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
     construct_correlated_noise_measurement_matrix,
@@ -116,7 +117,12 @@ def test_construct_correlated_noise_process_covariance():
 
 
 def test_construct_correlated_noise_process_covariance_nonzero_coupling():
-    """Off-diagonal coupling blocks must match coupling_strength * R(phase_diff)."""
+    """Q is symmetric: upper cross-block = coupling*R(phase), lower = its transpose.
+
+    The directed inputs are asymmetric (``phase[i,j] != phase[j,i]``), but a
+    covariance must be symmetric, so the constructor uses only the strict upper
+    triangle and mirrors it as the transpose.
+    """
     key = jax.random.PRNGKey(99)
     n_osc = 3
     var = jax.random.uniform(key, (n_osc,), minval=0.5, maxval=2.0)
@@ -125,19 +131,70 @@ def test_construct_correlated_noise_process_covariance_nonzero_coupling():
 
     mat = construct_correlated_noise_process_covariance(var, phase, coupling)
 
-    # Check diagonal blocks are variance * I
+    # Diagonal blocks are variance * I.
     for i in range(n_osc):
         block = mat[2 * i:2 * (i + 1), 2 * i:2 * (i + 1)]
         np.testing.assert_allclose(block, var[i] * jnp.eye(2), atol=1e-13)
 
-    # Check off-diagonal blocks match coupling_strength * R(phase_diff)
+    # Off-diagonal blocks: the strict upper triangle is coupling * R(phase); the
+    # lower triangle is the transpose of its upper partner (tie-blocks symmetry).
     from state_space_practice.oscillator_utils import _compute_coupling_transition_block
     for i in range(n_osc):
         for j in range(n_osc):
-            if i != j:
-                block = mat[2 * i:2 * (i + 1), 2 * j:2 * (j + 1)]
-                expected = _compute_coupling_transition_block(phase[i, j], coupling[i, j])
-                np.testing.assert_allclose(block, expected, atol=1e-13)
+            if i == j:
+                continue
+            block = mat[2 * i:2 * (i + 1), 2 * j:2 * (j + 1)]
+            u, v = min(i, j), max(i, j)
+            upper = _compute_coupling_transition_block(phase[u, v], coupling[u, v])
+            expected = upper if i < j else upper.T
+            np.testing.assert_allclose(block, expected, atol=1e-13)
+
+    # The assembled covariance must be symmetric (this fails on the old
+    # directed-block constructor, which used phase[i,j] and phase[j,i]
+    # independently).
+    np.testing.assert_allclose(mat, mat.T, atol=1e-13)
+
+
+def test_canonicalize_correlated_noise_pair_parameters_accepts_lower_only():
+    phase = jnp.zeros((2, 2, 2)).at[1, 0, :].set(-0.7)
+    coupling = jnp.zeros((2, 2, 2)).at[1, 0, :].set(0.2)
+
+    canon_phase, canon_coupling = canonicalize_correlated_noise_pair_parameters(
+        phase, coupling
+    )
+
+    np.testing.assert_allclose(canon_phase[0, 1, :], 0.7, atol=1e-12)
+    np.testing.assert_allclose(canon_coupling[0, 1, :], 0.2, atol=1e-12)
+    np.testing.assert_allclose(canon_phase[1, 0, :], 0.0, atol=1e-12)
+    np.testing.assert_allclose(canon_coupling[1, 0, :], 0.0, atol=1e-12)
+
+
+def test_canonicalize_correlated_noise_pair_parameters_accepts_mirrored_full_pair():
+    phase = jnp.zeros((2, 2)).at[0, 1].set(0.7).at[1, 0].set(-0.7)
+    coupling = jnp.zeros((2, 2)).at[0, 1].set(0.2).at[1, 0].set(0.2)
+
+    canon_phase, canon_coupling = canonicalize_correlated_noise_pair_parameters(
+        phase, coupling
+    )
+
+    np.testing.assert_allclose(canon_phase, jnp.array([[0.0, 0.7], [0.0, 0.0]]))
+    np.testing.assert_allclose(canon_coupling, jnp.array([[0.0, 0.2], [0.0, 0.0]]))
+
+
+def test_canonicalize_correlated_noise_pair_parameters_rejects_conflict():
+    phase = jnp.zeros((2, 2)).at[0, 1].set(0.7).at[1, 0].set(0.4)
+    coupling = jnp.zeros((2, 2)).at[0, 1].set(0.2).at[1, 0].set(0.2)
+
+    with pytest.raises(ValueError, match="Conflicting correlated-noise"):
+        canonicalize_correlated_noise_pair_parameters(phase, coupling)
+
+
+def test_canonicalize_correlated_noise_pair_parameters_rejects_diagonal_coupling():
+    phase = jnp.zeros((2, 2))
+    coupling = jnp.eye(2) * 0.2
+
+    with pytest.raises(ValueError, match="diagonal"):
+        canonicalize_correlated_noise_pair_parameters(phase, coupling)
 
 
 def test_construct_correlated_noise_measurement_matrix():
@@ -534,3 +591,42 @@ class TestProjectCoupledTransitionMatrixPathological:
         ])
         result = project_coupled_transition_matrix(A)
         assert jnp.all(jnp.isfinite(result))
+
+    def test_finite_input_emits_no_false_fallback_warning(self, capfd) -> None:
+        """A finite input must not emit the non-finite fallback telemetry.
+
+        The per-block ``debug_print_if`` used to live inside
+        ``_project_to_closest_rotation``, which runs under ``jax.vmap`` where
+        ``lax.cond`` lowers to ``select`` and both branches execute -- so the
+        "non-finite" warning fired for every block on every call, even on
+        perfectly finite input. Capture at the fd level (``capfd``) because
+        ``jax.debug.print`` writes past ``sys.stdout``.
+        """
+        A = jnp.array([
+            [0.9, -0.3, 0.05, 0.0],
+            [0.3, 0.9, 0.0, 0.05],
+            [0.05, 0.0, 0.8, -0.2],
+            [0.0, 0.05, 0.2, 0.8],
+        ])
+        assert jnp.all(jnp.isfinite(A))  # guard: input is finite
+        capfd.readouterr()  # drop anything buffered before the call
+        result = project_coupled_transition_matrix(A)
+        result.block_until_ready()
+        jax.effects_barrier()  # flush pending jax.debug.print effects
+        captured = capfd.readouterr()
+        assert "non-finite" not in (captured.out + captured.err).lower(), (
+            "finite input should not emit any non-finite fallback warning; "
+            f"got: {captured.out + captured.err!r}"
+        )
+
+    def test_nonfinite_input_emits_fallback_warning(self, capfd) -> None:
+        """A non-finite input must still emit exactly the fail-loud signal."""
+        A = jnp.eye(4).at[0, 0].set(jnp.nan)
+        capfd.readouterr()
+        result = project_coupled_transition_matrix(A)
+        result.block_until_ready()
+        jax.effects_barrier()
+        captured = capfd.readouterr()
+        assert "non-finite" in (captured.out + captured.err).lower(), (
+            "non-finite input should emit the damped-identity fallback warning"
+        )

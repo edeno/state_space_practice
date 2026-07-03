@@ -648,3 +648,27 @@ class TestMultinomialRecovery:
         for k in range(true_vals.shape[1]):
             r = np.corrcoef(true_vals[:, k], smoothed[:, k])[0, 1]
             assert r > 0.6, f"option {k + 1}: corr={r:.3f} too low"
+
+
+class TestMultinomialChoiceValidation:
+    """Construction-time guards on scalar hyperparameters."""
+
+    def test_rejects_nonpositive_inverse_temperature(self):
+        with pytest.raises(ValueError, match="inverse_temperature must be > 0"):
+            MultinomialChoiceModel(n_options=3, init_inverse_temperature=-1.0)
+
+    def test_rejects_negative_process_noise(self):
+        with pytest.raises(ValueError, match="process_noise must be non-negative"):
+            MultinomialChoiceModel(n_options=3, init_process_noise=-0.1)
+
+    def test_converged_flag_reflects_convergence(self):
+        rng = np.random.default_rng(0)
+        choices = rng.integers(0, 3, size=200)
+        # One iteration cannot satisfy the convergence check -> not converged.
+        m1 = MultinomialChoiceModel(n_options=3)
+        m1.fit(choices, max_iter=1)
+        assert m1.converged_ is False
+        # A generous budget on this easy problem converges -> flag flips to True.
+        m2 = MultinomialChoiceModel(n_options=3)
+        m2.fit(choices, max_iter=100)
+        assert m2.converged_ is True

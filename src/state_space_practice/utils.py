@@ -158,6 +158,48 @@ def stabilize_covariance(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Ar
     return project_psd(symmetrize(cov), min_eigenvalue=min_eigenvalue)
 
 
+def shift_to_psd(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
+    r"""Lift a symmetric matrix to the PSD cone by a uniform eigenvalue shift.
+
+    Returns ``cov + max(min_eigenvalue - lambda_min(cov), 0) * I`` -- the
+    smallest isotropic diagonal shift that raises the minimum eigenvalue to at
+    least ``min_eigenvalue``. For a matrix already PSD to within
+    ``min_eigenvalue`` the shift is zero and this is the identity.
+
+    Unlike :func:`stabilize_covariance` / :func:`project_psd`, this reads only
+    ``lambda_min`` (via ``eigvalsh``) and never forms the eigenvector
+    reconstruction ``V diag(f(lambda)) V^T``. That reconstruction has a gradient
+    with ``1 / (lambda_i - lambda_j)`` terms that blow up to NaN when
+    eigenvalues are degenerate -- which happens routinely for block-structured
+    process covariances (e.g. the correlated-noise oscillator ``Q`` has paired
+    eigenvalues). ``eigvalsh().min()`` keeps a finite gradient through such
+    points, so this variant is safe to call **inside a differentiated SGD
+    loss**; ``stabilize_covariance`` is for host-side (non-differentiated) use.
+
+    The tradeoff is that the shift is isotropic (adds the same amount to every
+    eigenvalue) rather than clipping only the offending ones, so it inflates the
+    already-large eigenvalues too. Since it is exactly the identity whenever the
+    matrix is PSD, this only affects the indefinite region, where it acts as a
+    smooth barrier steering the optimizer back toward valid covariances.
+
+    Parameters
+    ----------
+    cov : jax.Array
+        A symmetric matrix. Shape (n, n).
+    min_eigenvalue : float, optional
+        Target lower bound on the minimum eigenvalue. Default is 1e-8.
+
+    Returns
+    -------
+    jax.Array
+        ``cov`` shifted so its minimum eigenvalue is at least
+        ``min_eigenvalue``. Shape (n, n).
+    """
+    lambda_min = jnp.linalg.eigvalsh(cov).min()
+    shift = jnp.maximum(min_eigenvalue - lambda_min, 0.0)
+    return cov + shift * jnp.eye(cov.shape[-1], dtype=cov.dtype)
+
+
 def debug_print_if(condition: jax.Array, fmt: str, **fmt_kwargs) -> None:
     """Fire ``jax.debug.print(fmt, **fmt_kwargs)`` only when ``condition`` is True.
 
@@ -323,6 +365,181 @@ def _validate_filter_numerics(
                 UserWarning,
                 stacklevel=stacklevel,
             )
+
+
+def validate_covariance(
+    covariance: Array,
+    name: str = "covariance",
+    *,
+    require_positive_definite: bool = True,
+    symmetry_atol: float = 1e-8,
+    symmetry_rtol: float = 1e-6,
+) -> None:
+    """Validate a covariance matrix (or per-discrete-state stack) is symmetric PSD.
+
+    Unlike :func:`_validate_filter_numerics` (which symmetrizes before its
+    eigenvalue check and therefore cannot detect an asymmetric matrix), this
+    validator checks symmetry on the *raw* matrix. It is the general-purpose
+    covariance guard for public entry points that do not go through the
+    kalman/place-field f32-warning path.
+
+    Parameters
+    ----------
+    covariance : Array
+        Either a single square matrix ``(d, d)`` or a stack of per-discrete-
+        state matrices ``(d, d, n_states)`` (discrete-state axis last, per the
+        project convention).
+    name : str
+        Field name used in error messages.
+    require_positive_definite : bool, default True
+        If True, require a strictly positive minimum eigenvalue (as the
+        Cholesky-based filters need). If False, accept a positive-semidefinite
+        matrix (minimum eigenvalue ``>= -symmetry_atol``).
+    symmetry_atol, symmetry_rtol : float
+        Absolute/relative tolerance for the ``C == C.T`` check.
+
+    Raises
+    ------
+    ValueError
+        If any slice is non-square, non-symmetric, or violates the eigenvalue
+        floor. For a stacked input the offending discrete-state index is named.
+    """
+    arr = jnp.asarray(covariance)
+    if arr.ndim == 2:
+        slices: list[tuple[Optional[int], Array]] = [(None, arr)]
+    elif arr.ndim == 3:
+        slices = [(k, arr[..., k]) for k in range(arr.shape[-1])]
+    else:
+        raise ValueError(
+            f"{name} must be a 2D matrix or a 3D per-state stack "
+            f"(d, d, n_states), got shape {arr.shape}"
+        )
+
+    for state_ind, mat in slices:
+        where = name if state_ind is None else f"{name}[..., {state_ind}]"
+        if mat.ndim != 2 or mat.shape[0] != mat.shape[1]:
+            raise ValueError(
+                f"{where} must be a square 2D matrix, got shape {mat.shape}"
+            )
+        # Reject NaN/Inf up front: they slip past the symmetry check
+        # (allclose treats inf == inf) and the eigenvalue floor (a NaN/Inf
+        # eigenvalue is not <= 0), so a non-finite "covariance" would pass.
+        if not bool(jnp.all(jnp.isfinite(mat))):
+            raise ValueError(
+                f"{where} has non-finite entries (NaN/Inf); a covariance "
+                f"must be finite."
+            )
+        # Symmetry is checked on the RAW matrix: symmetrizing first would let a
+        # non-symmetric "covariance" pass undetected (the exact defect that hid
+        # in CorrelatedNoiseModel's process covariance).
+        if not bool(
+            jnp.allclose(mat, mat.T, rtol=symmetry_rtol, atol=symmetry_atol)
+        ):
+            asym = float(jnp.max(jnp.abs(mat - mat.T)))
+            raise ValueError(
+                f"{where} is not symmetric (max|C - C^T| = {asym:g}). A "
+                f"covariance must be symmetric; an asymmetric matrix is not a "
+                f"valid covariance and its Cholesky/eigen-decomposition is "
+                f"ill-defined."
+            )
+        min_eig = float(jnp.linalg.eigvalsh(symmetrize(mat)).min())
+        if require_positive_definite:
+            invalid = min_eig <= 0.0
+            kind = "positive definite"
+        else:
+            invalid = min_eig < -symmetry_atol
+            kind = "positive semidefinite"
+        if invalid:
+            raise ValueError(
+                f"{where} is not {kind} (min eigenvalue {min_eig:g}). "
+                f"Covariance matrices in the Cholesky-based filters must be "
+                f"{kind}; a rank-deficient or indefinite matrix will NaN on "
+                f"the first step. Check the value you supplied."
+            )
+
+
+def validate_transition_matrix(
+    transition_matrix: Array,
+    name: str = "transition_matrix",
+    *,
+    atol: float = 1e-6,
+) -> None:
+    """Validate a row-stochastic transition matrix (rows non-negative, sum to 1).
+
+    Parameters
+    ----------
+    transition_matrix : Array, shape (n_states, n_states)
+        Discrete-state transition matrix, row-stochastic by convention
+        (``T[i, j] = P(next = j | current = i)``).
+    name : str
+        Field name used in error messages.
+    atol : float
+        Absolute tolerance for the per-row sum-to-one check.
+
+    Raises
+    ------
+    ValueError
+        If the matrix is non-square, has negative entries, or has a row that
+        does not sum to 1 within ``atol``.
+    """
+    arr = jnp.asarray(transition_matrix)
+    if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+        raise ValueError(
+            f"{name} must be a square 2D matrix, got shape {arr.shape}"
+        )
+    if not bool(jnp.all(jnp.isfinite(arr))):
+        raise ValueError(f"{name} has non-finite entries (NaN/Inf).")
+    if bool(jnp.any(arr < -atol)):
+        raise ValueError(
+            f"{name} has negative entries (min {float(arr.min()):g}); "
+            f"transition probabilities must be non-negative."
+        )
+    row_sums = jnp.sum(arr, axis=1)
+    if not bool(jnp.allclose(row_sums, 1.0, atol=atol)):
+        worst = float(jnp.max(jnp.abs(row_sums - 1.0)))
+        raise ValueError(
+            f"{name} rows must sum to 1 (max deviation {worst:g}). Note the "
+            f"row-stochastic convention T[i, j] = P(next=j | current=i); a "
+            f"transposed matrix is a common cause of this error."
+        )
+
+
+def validate_probability_vector(
+    probabilities: Array,
+    name: str = "probabilities",
+    *,
+    atol: float = 1e-6,
+) -> None:
+    """Validate a probability vector (non-negative entries summing to 1).
+
+    Parameters
+    ----------
+    probabilities : Array, shape (n_states,)
+        Discrete probability vector.
+    name : str
+        Field name used in error messages.
+    atol : float
+        Absolute tolerance for the sum-to-one check.
+
+    Raises
+    ------
+    ValueError
+        If any entry is negative or the entries do not sum to 1 within ``atol``.
+    """
+    arr = jnp.asarray(probabilities)
+    if not bool(jnp.all(jnp.isfinite(arr))):
+        raise ValueError(f"{name} has non-finite entries (NaN/Inf).")
+    if bool(jnp.any(arr < -atol)):
+        raise ValueError(
+            f"{name} has negative entries (min {float(arr.min()):g}); "
+            f"probabilities must be non-negative."
+        )
+    total = float(jnp.sum(arr))
+    if abs(total - 1.0) > atol:
+        raise ValueError(
+            f"{name} must sum to 1 (got {total:g}). Supply a normalized "
+            f"probability vector."
+        )
 
 
 # ---------------------------------------------------------------------------
