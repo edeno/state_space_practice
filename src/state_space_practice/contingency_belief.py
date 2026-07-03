@@ -36,7 +36,11 @@ from jax.typing import ArrayLike
 
 
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import validate_choice_indices, validate_count_array
+from state_space_practice.utils import (
+    check_converged,
+    validate_choice_indices,
+    validate_count_array,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1124,6 +1128,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
         prev_ll = float("-inf")
         converged = False
         params_dirty = False
+        last_accepted: dict | None = None
 
         for iteration in range(max_iter):
             # E-step
@@ -1141,16 +1146,41 @@ class ContingencyBeliefModel(SGDFittableMixin):
                 break
             prev_ll = ll
 
+            # Snapshot the parameters this accepted E-step used so a degrading
+            # final M-step can be rolled back (approximate EM can decrease LL).
+            last_accepted = {
+                "reward_probs_": self.reward_probs_,
+                "transition_coefficients_": self.transition_coefficients_,
+            }
             # M-step
             self._m_step(choices, rewards, result)
             params_dirty = True
 
         if params_dirty and log_likelihoods:
+            # Final E-step syncs the smoother to the last M-step's parameters.
+            # Accept it only if it did not decrease the LL; otherwise roll the
+            # M-step back so the stored (params, smoother, LL) stay consistent.
             kwargs = self._smoother_kwargs(choices, rewards)
             result = contingency_belief_smoother(**kwargs)
-            self._smoother_result = result
-            self.smoothed_state_posterior_ = result.smoothed_state_prob
-            log_likelihoods.append(float(result.log_likelihood))
+            final_ll = float(result.log_likelihood)
+            _, is_increasing = check_converged(
+                final_ll, log_likelihoods[-1], tolerance
+            )
+            if is_increasing and np.isfinite(final_ll):
+                self._smoother_result = result
+                self.smoothed_state_posterior_ = result.smoothed_state_prob
+                log_likelihoods.append(final_ll)
+            elif last_accepted is not None:
+                for attr, value in last_accepted.items():
+                    setattr(self, attr, value)
+                kwargs = self._smoother_kwargs(choices, rewards)
+                result = contingency_belief_smoother(**kwargs)
+                self._smoother_result = result
+                self.smoothed_state_posterior_ = result.smoothed_state_prob
+                logger.warning(
+                    "Final M-step decreased the log-likelihood; rolled back to "
+                    "the previous parameters."
+                )
 
         self.log_likelihood_ = log_likelihoods[-1]
         self.log_likelihood_history_ = log_likelihoods

@@ -668,6 +668,7 @@ class CovariateChoiceModel(SGDFittableMixin):
 
         log_likelihoods = []
         converged = False
+        last_accepted: dict | None = None
 
         for iteration in range(max_iter):
             # E-step: run smoother
@@ -704,6 +705,16 @@ class CovariateChoiceModel(SGDFittableMixin):
                     converged = True
                     break
 
+            # Snapshot the parameters this accepted E-step used so a degrading
+            # final M-step can be rolled back (approximate EM can decrease LL).
+            last_accepted = {
+                "input_gain_": self.input_gain_,
+                "obs_weights_": self.obs_weights_,
+                "decay": self.decay,
+                "process_noise": self.process_noise,
+                "inverse_temperature": self.inverse_temperature,
+            }
+
             # M-step for B (input gain)
             if self.n_covariates > 0 and self._covariates is not None:
                 self.input_gain_ = m_step_input_gain(
@@ -735,22 +746,39 @@ class CovariateChoiceModel(SGDFittableMixin):
                     choices_arr, beta_grid,
                 )
 
-        # Final E-step
-        self._smoother_result = covariate_choice_smoother(
-            choices_arr, self.n_options,
-            covariates=self._covariates,
-            input_gain=self.input_gain_ if self.n_covariates > 0 else None,
-            obs_covariates=self._obs_covariates,
-            obs_weights=self.obs_weights_ if self.n_obs_covariates > 0 else None,
-            process_noise=self.process_noise,
-            inverse_temperature=self.inverse_temperature,
-            decay=self.decay,
-        )
+        def _final_smoother():
+            return covariate_choice_smoother(
+                choices_arr, self.n_options,
+                covariates=self._covariates,
+                input_gain=self.input_gain_ if self.n_covariates > 0 else None,
+                obs_covariates=self._obs_covariates,
+                obs_weights=self.obs_weights_ if self.n_obs_covariates > 0 else None,
+                process_noise=self.process_noise,
+                inverse_temperature=self.inverse_temperature,
+                decay=self.decay,
+            )
+
+        # Final E-step syncs the smoother to the last M-step's parameters.
+        # Accept it only if it did not decrease the LL; otherwise roll the last
+        # M-step back so the stored (params, smoother, LL) stay consistent.
+        self._smoother_result = _final_smoother()
         final_ll = float(self._smoother_result.marginal_log_likelihood)
-        if log_likelihoods and np.isclose(final_ll, log_likelihoods[-1]):
-            log_likelihoods[-1] = final_ll
-        else:
-            log_likelihoods.append(final_ll)
+        close = bool(log_likelihoods) and np.isclose(final_ll, log_likelihoods[-1])
+        not_worse = (not log_likelihoods) or close or final_ll >= log_likelihoods[-1]
+        if np.isfinite(final_ll) and not_worse:
+            if close:
+                log_likelihoods[-1] = final_ll
+            else:
+                log_likelihoods.append(final_ll)
+        elif last_accepted is not None:
+            for attr, value in last_accepted.items():
+                setattr(self, attr, value)
+            self._smoother_result = _final_smoother()
+            final_ll = float(self._smoother_result.marginal_log_likelihood)
+            logger.warning(
+                "Final M-step decreased the log-likelihood; rolled back to the "
+                "previous parameters."
+            )
         self.log_likelihood_ = final_ll
         self.n_iter_ = len(log_likelihoods)
         self.log_likelihood_history_ = log_likelihoods
