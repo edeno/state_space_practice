@@ -5223,7 +5223,60 @@ class TestSwitchingSpikeOscillatorModelFit:
 
         # Should return a list of log-likelihoods
         assert isinstance(log_likelihoods, list)
-        assert len(log_likelihoods) == 3
+        assert len(log_likelihoods) == 4
+
+    @pytest.mark.slow
+    def test_fit_appends_synced_final_ll(self) -> None:
+        """Final LL should match the final parameters after max_iter exhaustion."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.05, shape=(20, 2)
+        ).astype(float)
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=1,
+            n_neurons=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            separate_spike_params=False,
+        )
+
+        log_likelihoods = model.fit(spikes, max_iter=1, key=jax.random.PRNGKey(42))
+        fresh_ll = float(model._e_step(spikes))
+
+        assert len(log_likelihoods) == 2
+        assert log_likelihoods[-1] == pytest.approx(fresh_ll)
+
+    @pytest.mark.parametrize(
+        ("bad_value", "match"),
+        [(-1.0, "non-negative"), (0.5, "integer-valued"), (jnp.nan, "finite")],
+    )
+    def test_fit_rejects_invalid_spike_counts(self, bad_value, match) -> None:
+        """fit validates spike counts, matching the non-switching PointProcessModel."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        spikes = (
+            jax.random.poisson(jax.random.PRNGKey(0), 0.05, shape=(20, 2))
+            .astype(float)
+            .at[0, 0]
+            .set(bad_value)
+        )
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=1,
+            n_neurons=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            separate_spike_params=False,
+        )
+
+        with pytest.raises(ValueError, match=match):
+            model.fit(spikes, max_iter=1, key=jax.random.PRNGKey(42))
 
     @pytest.mark.slow
     def test_fit_returns_log_likelihoods_list(self) -> None:
@@ -5251,9 +5304,9 @@ class TestSwitchingSpikeOscillatorModelFit:
 
         log_likelihoods = model.fit(spikes, max_iter=max_iter, key=jax.random.PRNGKey(42))
 
-        # Should return a list of length max_iter
+        # Should return EM-iteration LLs plus the final synchronized E-step LL
         assert isinstance(log_likelihoods, list)
-        assert len(log_likelihoods) == max_iter
+        assert len(log_likelihoods) == max_iter + 1
 
         # All entries should be finite scalars
         for ll in log_likelihoods:
@@ -5438,7 +5491,7 @@ class TestSwitchingSpikeOscillatorModelFit:
         log_likelihoods = model.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
 
         # Should run without error
-        assert len(log_likelihoods) == 3
+        assert len(log_likelihoods) == 4
         for ll in log_likelihoods:
             assert jnp.isfinite(ll)
 
@@ -5466,7 +5519,7 @@ class TestSwitchingSpikeOscillatorModelFit:
         log_likelihoods = model.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
 
         # Should run without error (though results may be degenerate)
-        assert len(log_likelihoods) == 3
+        assert len(log_likelihoods) == 4
         for ll in log_likelihoods:
             assert jnp.isfinite(ll)
 
@@ -5497,7 +5550,7 @@ class TestSwitchingSpikeOscillatorModelFit:
         log_likelihoods = model.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
 
         # Should run without error
-        assert len(log_likelihoods) == 3
+        assert len(log_likelihoods) == 4
         for ll in log_likelihoods:
             assert jnp.isfinite(ll)
 
@@ -6484,7 +6537,7 @@ class TestSwitchingSpikeOscillatorModelEndToEnd:
         log_likelihoods = model.fit(spikes, max_iter=5, key=jax.random.PRNGKey(0))
 
         # Basic sanity checks
-        assert len(log_likelihoods) == 5
+        assert len(log_likelihoods) == 6
         for ll in log_likelihoods:
             assert jnp.isfinite(ll)
 
@@ -7974,7 +8027,7 @@ class TestGPB2Smoother:
         )
         lls = model.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
 
-        assert len(lls) == 3
+        assert len(lls) == 4
         for ll in lls:
             assert jnp.isfinite(ll), f"LL should be finite, got {ll}"
 

@@ -247,6 +247,56 @@ class TestStochasticPointProcessFilter:
         assert not jnp.any(jnp.isnan(filtered_mean))
         assert not jnp.any(jnp.isnan(filtered_cov))
 
+    @pytest.mark.parametrize(
+        ("bad_dt", "match"),
+        [
+            (0.0, "dt must be positive"),
+            (-0.01, "dt must be positive"),
+            (jnp.nan, "dt must be positive"),
+        ],
+    )
+    def test_rejects_invalid_dt(self, point_process_test_data, bad_dt, match) -> None:
+        """Filter should reject invalid time-bin widths before likelihood math."""
+        d = point_process_test_data
+
+        with pytest.raises(ValueError, match=match):
+            stochastic_point_process_filter(
+                d["init_mean"],
+                d["init_cov"],
+                d["design_matrix"],
+                d["spike_indicator"],
+                bad_dt,
+                d["transition_matrix"],
+                d["process_cov"],
+                log_conditional_intensity,
+            )
+
+    @pytest.mark.parametrize(
+        ("bad_spikes", "match"),
+        [
+            (jnp.array([0.0, -1.0, 0.0]), "non-negative"),
+            (jnp.array([0.0, 0.5, 0.0]), "integer-valued"),
+            (jnp.array([0.0, jnp.nan, 0.0]), "finite"),
+        ],
+    )
+    def test_rejects_invalid_spike_counts(
+        self, point_process_test_data, bad_spikes, match
+    ) -> None:
+        """Filter should reject values outside the Poisson count domain."""
+        d = point_process_test_data
+
+        with pytest.raises(ValueError, match=match):
+            stochastic_point_process_filter(
+                d["init_mean"],
+                d["init_cov"],
+                d["design_matrix"][: bad_spikes.shape[0]],
+                bad_spikes,
+                d["dt"],
+                d["transition_matrix"],
+                d["process_cov"],
+                log_conditional_intensity,
+            )
+
 
 class TestStochasticPointProcessSmoother:
     """Tests for the stochastic_point_process_smoother function."""
@@ -650,6 +700,12 @@ class TestPointProcessModel:
         # Default transition is identity
         np.testing.assert_allclose(model.transition_matrix, jnp.eye(5))
 
+    @pytest.mark.parametrize("bad_dt", [0.0, -0.01, jnp.nan])
+    def test_initialization_rejects_invalid_dt(self, bad_dt) -> None:
+        """Model should reject invalid point-process bin widths."""
+        with pytest.raises(ValueError, match="dt must be positive"):
+            PointProcessModel(n_state_dims=5, dt=bad_dt)
+
     def test_initialization_custom_params(self) -> None:
         """Model should accept custom parameters."""
         A = jnp.eye(3) * 0.95
@@ -687,6 +743,24 @@ class TestPointProcessModel:
         # max_iter iterations + 1 final E-step to sync posteriors
         assert len(ll_history) == 6
         assert all(isinstance(ll, float) for ll in ll_history)
+
+    @pytest.mark.parametrize(
+        ("bad_spikes", "match"),
+        [
+            (jnp.array([0.0, -1.0, 0.0, 1.0]), "non-negative"),
+            (jnp.array([0.0, 0.5, 0.0, 1.0]), "integer-valued"),
+            (jnp.array([0.0, jnp.nan, 0.0, 1.0]), "finite"),
+        ],
+    )
+    def test_fit_rejects_invalid_spike_counts(
+        self, simple_model_data, bad_spikes, match
+    ) -> None:
+        """fit() validates counts before running internal E-steps."""
+        d = simple_model_data
+        model = PointProcessModel(n_state_dims=d["n_basis"], dt=d["dt"])
+
+        with pytest.raises(ValueError, match=match):
+            model.fit(d["design_matrix"][: bad_spikes.shape[0]], bad_spikes, max_iter=1)
 
     def test_fit_populates_smoother_results(self, simple_model_data) -> None:
         """After fit(), smoother results should be populated."""

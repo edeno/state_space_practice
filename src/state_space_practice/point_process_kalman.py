@@ -30,6 +30,7 @@ References
 
 import functools
 import logging
+import math
 from typing import Callable, NamedTuple, Optional
 
 import jax
@@ -51,6 +52,28 @@ from state_space_practice.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_positive_scalar(value: object, name: str) -> None:
+    """Validate a public scalar argument before entering traced math."""
+    value_arr = jnp.asarray(value)
+    if value_arr.shape != ():
+        raise ValueError(f"{name} must be a scalar. Got shape {value_arr.shape}.")
+
+    value_float = float(value_arr)
+    if not math.isfinite(value_float) or value_float <= 0:
+        raise ValueError(f"{name} must be positive and finite. Got {value}.")
+
+
+def _validate_spike_counts(spike_counts: ArrayLike, name: str = "spike_indicator") -> None:
+    """Validate observed Poisson counts at public API boundaries."""
+    spike_counts = jnp.asarray(spike_counts)
+    if not bool(jnp.all(jnp.isfinite(spike_counts))):
+        raise ValueError(f"{name} must contain only finite spike counts.")
+    if not bool(jnp.all(spike_counts >= 0)):
+        raise ValueError(f"{name} must contain non-negative spike counts.")
+    if not bool(jnp.all(jnp.isclose(spike_counts, jnp.round(spike_counts)))):
+        raise ValueError(f"{name} must contain integer-valued spike counts.")
 
 
 def _validate_filter_numerics(
@@ -841,6 +864,7 @@ def poisson_family(dt: float, max_log_count: float = 20.0) -> GLMFamily:
     Returns a fresh ``GLMFamily`` (with fresh closures) on each call, so hoist it
     out of any ``jit``/``scan`` loop to keep the cache warm.
     """
+    _validate_positive_scalar(dt, "dt")
 
     def mean(eta: Array) -> Array:
         return _safe_expected_count(eta, dt, max_log_count=max_log_count)
@@ -1166,6 +1190,10 @@ def stochastic_point_process_filter(
     spike_indicator = jnp.asarray(spike_indicator)
     transition_matrix = jnp.asarray(transition_matrix)
     process_cov = jnp.asarray(process_cov)
+
+    if validate_inputs:
+        _validate_positive_scalar(dt, "dt")
+        _validate_spike_counts(spike_indicator)
 
     # Block-diagonal dispatch (opt-in via block_n_neurons / block_size).
     # The caller is responsible for calling _detect_block_diagonal_problem
@@ -1806,6 +1834,10 @@ def stochastic_point_process_smoother(
     transition_matrix = jnp.asarray(transition_matrix)
     process_cov = jnp.asarray(process_cov)
 
+    if validate_inputs:
+        _validate_positive_scalar(dt, "dt")
+        _validate_spike_counts(spike_indicator)
+
     # Block-diagonal dispatch: same opt-in contract as the filter.
     # See stochastic_point_process_filter's block-dispatch comment for
     # the full rationale. If both block_n_neurons and block_size are
@@ -2175,6 +2207,7 @@ class PointProcessModel(SGDFittableMixin):
         update_init_state: bool = True,
         max_newton_iter: int = 1,
     ):
+        _validate_positive_scalar(dt, "dt")
         self.n_state_dims = n_state_dims
         self.dt = dt
         self.max_newton_iter = max_newton_iter
@@ -2324,6 +2357,7 @@ class PointProcessModel(SGDFittableMixin):
         """
         design_matrix = jnp.asarray(design_matrix)
         spike_indicator = jnp.asarray(spike_indicator)
+        _validate_spike_counts(spike_indicator)
 
         # Numerical sanity check once at the top: validate PSD and warn
         # on f32 risk. Skips per-iteration re-validation in the E-step.
@@ -2445,6 +2479,7 @@ class PointProcessModel(SGDFittableMixin):
         """
         design_matrix = jnp.asarray(design_matrix)
         spike_indicator = jnp.asarray(spike_indicator)
+        _validate_spike_counts(spike_indicator)
         if spike_indicator.ndim == 1:
             spike_indicator = spike_indicator[:, None]
         self._sgd_n_time = spike_indicator.shape[0]

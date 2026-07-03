@@ -47,6 +47,7 @@ from state_space_practice.switching_kalman import (
     switching_kalman_smoother,
     switching_kalman_smoother_gpb2,
 )
+from state_space_practice.point_process_kalman import _validate_spike_counts
 from state_space_practice.switching_point_process import (
     QRegularizationConfig,
     SpikeObsParams,
@@ -923,6 +924,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                 f"spikes shape[1] must match n_neurons={self.n_neurons}, "
                 f"got shape {spikes.shape}"
             )
+        _validate_spike_counts(spikes)
 
         if key is None:
             key = jax.random.PRNGKey(0)
@@ -974,6 +976,18 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
         best_ll = -float("inf")
         best_params: dict | None = None
 
+        def _snapshot_params() -> dict:
+            return {
+                "init_mean": self.init_mean,
+                "init_cov": self.init_cov,
+                "init_discrete_state_prob": self.init_discrete_state_prob,
+                "discrete_transition_matrix": self.discrete_transition_matrix,
+                "continuous_transition_matrix": self.continuous_transition_matrix,
+                "process_cov": self.process_cov,
+                "spike_params": copy.deepcopy(self.spike_params),
+                "smoother_discrete_state_prob": self.smoother_discrete_state_prob,
+            }
+
         for iteration in range(max_iter):
             marginal_ll = self._e_step(spikes)
             log_likelihoods.append(float(marginal_ll))
@@ -987,16 +1001,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             # Track best parameters seen (approximate EM can decrease LL)
             if log_likelihoods[-1] > best_ll:
                 best_ll = log_likelihoods[-1]
-                best_params = {
-                    "init_mean": self.init_mean,
-                    "init_cov": self.init_cov,
-                    "init_discrete_state_prob": self.init_discrete_state_prob,
-                    "discrete_transition_matrix": self.discrete_transition_matrix,
-                    "continuous_transition_matrix": self.continuous_transition_matrix,
-                    "process_cov": self.process_cov,
-                    "spike_params": copy.deepcopy(self.spike_params),
-                    "smoother_discrete_state_prob": self.smoother_discrete_state_prob,
-                }
+                best_params = _snapshot_params()
 
             if iteration > 0:
                 is_converged, is_increasing = check_converged(
@@ -1027,7 +1032,11 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             self.converged_ = False
             logger.warning("Reached maximum iterations without converging.")
             # Final E-step to sync smoother results with current parameters
-            self._e_step(spikes)
+            final_ll = float(self._e_step(spikes))
+            log_likelihoods.append(final_ll)
+            if final_ll > best_ll:
+                best_ll = final_ll
+                best_params = _snapshot_params()
 
         # Restore best parameters if LL decreased at any point
         if best_params is not None and log_likelihoods[-1] < best_ll:
@@ -1142,6 +1151,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
         log_likelihoods : list of float
         """
         spikes = jnp.asarray(spikes)
+        _validate_spike_counts(spikes)
         self._sgd_n_time = spikes.shape[0]
 
         if not self._is_initialized():

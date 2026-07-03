@@ -222,8 +222,33 @@ class TestCommonOscillatorPointProcessModel:
             synthetic_spikes, max_iter=3, key=jax.random.PRNGKey(42)
         )
 
-        assert len(log_likelihoods) == 3
+        assert len(log_likelihoods) == 4
         assert all(np.isfinite(ll) for ll in log_likelihoods)
+
+    def test_fit_appends_synced_final_ll(self, com_pp_params, synthetic_spikes) -> None:
+        """Final LL should match the final parameters after max_iter exhaustion."""
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        log_likelihoods = model.fit(
+            synthetic_spikes, max_iter=1, key=jax.random.PRNGKey(42)
+        )
+        fresh_ll = float(model._e_step(synthetic_spikes))
+
+        assert len(log_likelihoods) == 2
+        assert log_likelihoods[-1] == pytest.approx(fresh_ll)
+
+    @pytest.mark.parametrize(
+        ("bad_value", "match"),
+        [(-1.0, "non-negative"), (0.5, "integer-valued"), (jnp.nan, "finite")],
+    )
+    def test_fit_rejects_invalid_spike_counts(
+        self, com_pp_params, synthetic_spikes, bad_value, match
+    ) -> None:
+        """Switching PP fit validates spike counts, matching PointProcessModel."""
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        bad_spikes = synthetic_spikes.astype(float).at[0, 0].set(bad_value)
+
+        with pytest.raises(ValueError, match=match):
+            model.fit(bad_spikes, max_iter=1, key=jax.random.PRNGKey(0))
 
 
 # ============================================================================
@@ -328,7 +353,7 @@ class TestCorrelatedNoisePointProcessModel:
             synthetic_spikes, max_iter=3, key=jax.random.PRNGKey(42)
         )
 
-        assert len(log_likelihoods) == 3
+        assert len(log_likelihoods) == 4
         assert all(np.isfinite(ll) for ll in log_likelihoods)
 
     def test_projection_preserves_psd(self, cnm_pp_params, synthetic_spikes) -> None:
@@ -441,7 +466,7 @@ class TestDirectedInfluencePointProcessModel:
             synthetic_spikes, max_iter=3, key=jax.random.PRNGKey(42)
         )
 
-        assert len(log_likelihoods) == 3
+        assert len(log_likelihoods) == 4
         assert all(np.isfinite(ll) for ll in log_likelihoods)
 
     @pytest.mark.slow
@@ -454,7 +479,7 @@ class TestDirectedInfluencePointProcessModel:
             synthetic_spikes, max_iter=3, key=jax.random.PRNGKey(42)
         )
 
-        assert len(log_likelihoods) == 3
+        assert len(log_likelihoods) == 4
         assert all(np.isfinite(ll) for ll in log_likelihoods)
 
     def test_projection_preserves_oscillatory_structure(

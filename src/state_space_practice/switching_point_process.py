@@ -95,7 +95,10 @@ from state_space_practice.oscillator_utils import (
     construct_common_oscillator_transition_matrix,
     project_coupled_transition_matrix,
 )
-from state_space_practice.point_process_kalman import _point_process_laplace_update
+from state_space_practice.point_process_kalman import (
+    _point_process_laplace_update,
+    _validate_spike_counts,
+)
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.switching_kalman import (
     _update_discrete_state_probabilities,
@@ -2857,6 +2860,7 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 f"spikes shape[1] must match n_neurons={self.n_neurons}, "
                 f"got shape {spikes.shape}"
             )
+        _validate_spike_counts(spikes)
 
         # Set default random key if not provided
         if key is None:
@@ -2957,6 +2961,23 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             # Project parameters to valid spaces (oscillatory structure, PSD)
             self._project_parameters()
 
+        if len(log_likelihoods) == max_iter and log_likelihoods:
+            logger.warning("Reached maximum iterations without converging.")
+            final_ll = self._e_step(spikes)
+            if jnp.isfinite(final_ll):
+                log_likelihoods.append(float(final_ll))
+            elif prev_params is not None:
+                _restore_params(prev_params)
+                self._e_step(spikes)
+                logger.warning(
+                    "Non-finite final LL after last M-step; rolled back to previous."
+                )
+            else:
+                raise ValueError(
+                    "Non-finite final log-likelihood after last M-step. "
+                    "This may indicate numerical instability."
+                )
+
         return log_likelihoods
 
     # --- SGDFittableMixin protocol ---
@@ -2987,6 +3008,7 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         log_likelihoods : list of float
         """
         spikes = jnp.asarray(spikes)
+        _validate_spike_counts(spikes)
         self._sgd_n_time = spikes.shape[0]
 
         if not hasattr(self, "continuous_transition_matrix") or \
