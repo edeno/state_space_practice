@@ -12,6 +12,8 @@ from state_space_practice.tests.recovery_helpers import (
     simulate_lfp_observations,
     state_segmentation_accuracy,
 )
+from state_space_practice.utils import divide_safe as _divide_safe
+from state_space_practice.utils import scale_likelihood as _scale_likelihood
 
 
 @pytest.fixture
@@ -114,6 +116,191 @@ class TestSwitchingHamiltonianSmooth:
             "Smoother produced identical output for symmetric vs asymmetric "
             "transition matrices — Jacobian weighting may be ignoring probabilities"
         )
+
+    def test_smoother_matches_pairwise_rts_reference(self):
+        """The continuous smoother must update all (S_t, S_{t+1}) pairs."""
+        from state_space_practice.hamiltonian_core import (
+            gaussian_measurement_update,
+            point_process_laplace_update,
+        )
+        from state_space_practice.hamiltonian_switching import (
+            SwitchingHamiltonianJointModel,
+        )
+        from state_space_practice.nonlinear_dynamics import ekf_smooth_step
+        from state_space_practice.switching_kalman import collapse_gaussian_mixture
+
+        dt = 0.05
+        model = SwitchingHamiltonianJointModel(
+            n_oscillators=1,
+            n_discrete_states=2,
+            n_lfp_sources=2,
+            n_spike_sources=1,
+            sampling_freq=1.0 / dt,
+            hidden_dims=[4],
+            seed=0,
+        )
+        model.mlp_params = jax.tree_util.tree_map(jnp.zeros_like, model.mlp_params)
+        model.omega = jnp.array([1.0, 4.0])
+        model.C_lfp = jnp.eye(2)
+        model.d_lfp = jnp.zeros(2)
+        model.C_spikes = jnp.zeros((1, 2))
+        model.d_spikes = jnp.array([-10.0])
+        model.obs_noise_std = 0.25
+        model.process_cov = jnp.stack(
+            [jnp.eye(2) * 1e-3, jnp.array([[0.02, 0.004], [0.004, 0.015]])],
+            axis=2,
+        )
+
+        params, _ = model._build_param_spec()
+        params["mlp"] = model.mlp_params
+        params["omega"] = model.omega
+        params["C_lfp"] = model.C_lfp
+        params["d_lfp"] = model.d_lfp
+        params["C_spikes"] = model.C_spikes
+        params["d_spikes"] = model.d_spikes
+        params["init_mean"] = jnp.array([[0.8, -0.6], [0.1, 0.35]])
+        params["Z"] = jnp.array([[0.05, 0.95], [0.85, 0.15]])
+        params["init_pi"] = jnp.array([0.45, 0.55])
+
+        lfp = jnp.array([[0.75, 0.05], [-0.35, 0.25]])
+        spikes = jnp.zeros((2, 1))
+        K = model.n_discrete_states
+
+        def forward_reference():
+            carry = (params["init_mean"], model.init_cov, params["init_pi"])
+            outputs = []
+            for y_lfp_t, y_spike_t in zip(lfp, spikes):
+                m_prev, P_prev, pi_prev = carry
+                (
+                    m_pred,
+                    P_pred,
+                    F_pair,
+                    joint_pi,
+                    pi_pred,
+                    m_pred_pair,
+                    P_pred_pair,
+                ) = model._per_state_pred_collapse(
+                    m_prev,
+                    P_prev,
+                    pi_prev,
+                    params["Z"],
+                    params["mlp"],
+                    params["omega"],
+                    model.process_cov,
+                    K,
+                    with_jacobian=True,
+                )
+                m_posts = []
+                P_posts = []
+                lls = []
+                for k in range(K):
+                    m_mid, P_mid, ll_lfp = gaussian_measurement_update(
+                        m_pred[:, k],
+                        P_pred[:, :, k],
+                        y_lfp_t,
+                        params["C_lfp"],
+                        params["d_lfp"],
+                        model._r_lfp(),
+                        include_normalization_const=False,
+                    )
+                    m_post, P_post, ll_spike = point_process_laplace_update(
+                        m_mid,
+                        P_mid,
+                        y_spike_t,
+                        params["C_spikes"],
+                        params["d_spikes"],
+                        model.dt,
+                    )
+                    m_posts.append(m_post)
+                    P_posts.append(P_post)
+                    lls.append(ll_lfp + ll_spike)
+
+                m_filt = jnp.stack(m_posts, axis=1)
+                P_filt = jnp.stack(P_posts, axis=2)
+                lls = jnp.stack(lls)
+                scaled_lik, _ = _scale_likelihood(lls)
+                pi_filt = _divide_safe(
+                    scaled_lik * pi_pred, jnp.sum(scaled_lik * pi_pred)
+                )
+                carry = (m_filt, P_filt, pi_filt)
+                outputs.append(
+                    (
+                        m_filt,
+                        P_filt,
+                        m_pred,
+                        P_pred,
+                        m_pred_pair,
+                        P_pred_pair,
+                        F_pair,
+                        joint_pi,
+                        pi_pred,
+                        pi_filt,
+                    )
+                )
+            return tuple(jnp.stack(items) for items in zip(*outputs))
+
+        (
+            m_filt,
+            P_filt,
+            m_pred,
+            P_pred,
+            m_pred_pair,
+            P_pred_pair,
+            F_pair,
+            joint_pi,
+            pi_pred,
+            pi_filt,
+        ) = forward_reference()
+
+        pi_s_next = pi_filt[-1]
+        backward_cond = _divide_safe(joint_pi[1], pi_pred[1][None, :])
+        joint_smooth = backward_cond * pi_s_next[None, :]
+        pi_s_t0 = _divide_safe(jnp.sum(joint_smooth, axis=1), jnp.sum(joint_smooth))
+        forward_cond = _divide_safe(joint_smooth, pi_s_t0[:, None])
+
+        def smooth_reference_i(i):
+            pair_means = []
+            pair_covs = []
+            for k in range(K):
+                m_pair, P_pair = ekf_smooth_step(
+                    m_filt[0, :, i],
+                    P_filt[0, :, :, i],
+                    m_pred_pair[1, i, k],
+                    P_pred_pair[1, i, k],
+                    m_filt[1, :, k],
+                    P_filt[1, :, :, k],
+                    F_pair[1, i, k],
+                )
+                pair_means.append(m_pair)
+                pair_covs.append(P_pair)
+            return collapse_gaussian_mixture(
+                jnp.stack(pair_means, axis=1),
+                jnp.stack(pair_covs, axis=2),
+                forward_cond[i],
+            )
+
+        expected_m0, expected_P0 = jax.vmap(smooth_reference_i)(jnp.arange(K))
+
+        def old_same_label_i(k):
+            w_jk = _divide_safe(joint_pi[1, :, k], pi_pred[1, k])
+            F_avg = jnp.sum(w_jk[:, None, None] * F_pair[1, :, k], axis=0)
+            return ekf_smooth_step(
+                m_filt[0, :, k],
+                P_filt[0, :, :, k],
+                m_pred[1, :, k],
+                P_pred[1, :, :, k],
+                m_filt[1, :, k],
+                P_filt[1, :, :, k],
+                F_avg,
+            )
+
+        old_m0, _ = jax.vmap(old_same_label_i)(jnp.arange(K))
+        m_s, P_s, pi_s = model.smooth(lfp, spikes, params)
+
+        assert not jnp.allclose(old_m0.T, expected_m0.T, atol=1e-4)
+        assert jnp.allclose(m_s[0], expected_m0.T, atol=1e-8)
+        assert jnp.allclose(P_s[0], expected_P0.transpose(1, 2, 0), atol=1e-8)
+        assert jnp.allclose(pi_s[0], pi_s_t0, atol=1e-8)
 
 
 class TestSwitchingHamiltonianBehavioral:
@@ -229,20 +416,27 @@ class TestSwitchingHamiltonianSGDRecovery:
         keys = jax.random.split(subkey, n_time)
         _, true_states = jax.lax.scan(markov_step, jnp.int32(0), keys)
 
-        # Generate latent trajectory per state
-        x_true_0, mlp_params = simulate_harmonic_oscillator(
+        # Generate one continuous latent trajectory whose transition dynamics
+        # are selected by the active state at each time bin. This matches the
+        # model convention x_t = f_{S_t}(x_{t-1}) + noise.
+        _, mlp_params = simulate_harmonic_oscillator(
             omega=omega_0, n_time=n_time, dt=dt,
             key=jax.random.PRNGKey(10), hidden_dims=[8],
         )
-        x_true_1, _ = simulate_harmonic_oscillator(
-            omega=omega_1, n_time=n_time, dt=dt,
-            key=jax.random.PRNGKey(11), hidden_dims=[8],
-        )
+        trans_params_0 = {**mlp_params, "omega": omega_0}
+        trans_params_1 = {**mlp_params, "omega": omega_1}
 
-        # Select latent trajectory based on state
-        x_true = jnp.where(
-            true_states[:, None] == 0, x_true_0, x_true_1,
-        )
+        def latent_step(x_prev, inputs):
+            state_t, key_t = inputs
+            x_next_0 = leapfrog_step(x_prev, trans_params_0, apply_mlp, dt)
+            x_next_1 = leapfrog_step(x_prev, trans_params_1, apply_mlp, dt)
+            x_next = jnp.where(state_t == 0, x_next_0, x_next_1)
+            x_next = x_next + jax.random.normal(key_t, x_prev.shape) * 1e-3
+            return x_next, x_next
+
+        x0 = jnp.array([1.0, 0.0])
+        noise_keys = jax.random.split(jax.random.PRNGKey(10), n_time)
+        _, x_true = jax.lax.scan(latent_step, x0, (true_states, noise_keys))
 
         # Generate LFP observations
         C_lfp = jnp.eye(2)

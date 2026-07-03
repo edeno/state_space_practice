@@ -134,9 +134,12 @@ def ekf_smooth_step(
     return m_smooth, P_smooth
 
 def apply_mlp(params: Dict[str, Array], x: Array) -> Array:
-    """Apply the MLP to compute scalar energy H(x).
-    
-    Includes a learnable quadratic prior and centering.
+    """Apply the MLP to compute a separable scalar Hamiltonian H(q, p).
+
+    The quadratic kinetic term depends on momentum, while the MLP residual is
+    restricted to the position coordinates so explicit leapfrog remains
+    symplectic. The residual still receives a full-length input with zeroed
+    momentum coordinates to preserve existing parameter shapes.
     """
     # Check if params is batched
     if "w0" in params and params["w0"].ndim > 2:
@@ -157,6 +160,7 @@ def apply_mlp(params: Dict[str, Array], x: Array) -> Array:
         return jnp.squeeze(curr)
 
     h_prior = 0.5 * jnp.sum(p**2) + 0.5 * (omega**2) * jnp.sum(q**2)
-    h_mlp = mlp_forward(x) - mlp_forward(jnp.zeros_like(x))
+    potential_input = jnp.concatenate([q, jnp.zeros_like(p)])
+    h_mlp = mlp_forward(potential_input) - mlp_forward(jnp.zeros_like(x))
     
     return cast(Array, h_prior + h_mlp)

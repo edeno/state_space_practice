@@ -104,8 +104,9 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         """Predict step + Gaussian-mixture collapse for the switching filter.
 
         Returns the per-state collapsed predicted mean/cov (and Jacobian
-        if requested), the joint discrete prior P(s_{t-1}, s_t), and the
-        marginal predicted prior P(s_t).
+        if requested), the joint discrete prior P(s_{t-1}, s_t), the
+        marginal predicted prior P(s_t), and the uncollapsed pair predictions
+        needed by the switching RTS smoother.
         """
 
         def predict_j_k(mj, Pj, k):
@@ -145,7 +146,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         m_p_k, P_p_k = jax.vmap(collapse_k)(jnp.arange(K_states))
         m_p_k = m_p_k.T
         P_p_k = P_p_k.transpose(1, 2, 0)
-        return m_p_k, P_p_k, F_jk, joint_pi_pred, pi_pred_k
+        return m_p_k, P_p_k, F_jk, joint_pi_pred, pi_pred_k, m_p_jk, P_p_jk
 
     @partial(jax.jit, static_argnums=(0,))
     def filter(
@@ -167,7 +168,15 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
             y_lfp_t, y_spike_t = obs_t
             m_prev, P_prev, pi_prev = carry
 
-            m_p_k, P_p_k, _, joint_pi_pred, pi_pred_k = self._per_state_pred_collapse(
+            (
+                m_p_k,
+                P_p_k,
+                _,
+                joint_pi_pred,
+                pi_pred_k,
+                _,
+                _,
+            ) = self._per_state_pred_collapse(
                 m_prev, P_prev, pi_prev,
                 Z, mlp_params, omega, Q, K_states,
                 with_jacobian=False,
@@ -238,6 +247,8 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
                 F_jk,
                 joint_pi_pred,
                 pi_pred_k,
+                m_p_jk,
+                P_p_jk,
             ) = self._per_state_pred_collapse(
                 m_prev, P_prev, pi_prev,
                 Z, mlp_params, omega, Q, K_states,
@@ -268,44 +279,86 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
             )
             return (
                 (m_f, P_f, pi_filt),
-                (m_f, P_f, m_p_k, P_p_k, F_jk, joint_pi_pred, pi_pred_k, pi_filt),
+                (
+                    m_f,
+                    P_f,
+                    m_p_jk,
+                    P_p_jk,
+                    F_jk,
+                    joint_pi_pred,
+                    pi_pred_k,
+                    pi_filt,
+                ),
             )
 
         m0 = params["init_mean"]
         P0 = self.init_cov
         pi0 = params["init_pi"]
         _, (
-            m_filt, P_filt, m_pred, P_pred, F_all, joint_pi_all, pi_pred_all, pi_filt_all,
+            m_filt,
+            P_filt,
+            m_pred_pair,
+            P_pred_pair,
+            F_all,
+            joint_pi_all,
+            pi_pred_all,
+            pi_filt_all,
         ) = jax.lax.scan(forward_step, (m0, P0, pi0), (lfp_data, spike_data))
 
-        # Backward pass: per-state EKF smoother + Kim discrete-state smoother.
-        # Cannot use ekf_rts_backward_pass directly because each discrete
-        # state has its own filtered/predicted trajectory and the
-        # transition Jacobian is averaged across (j, k) source states.
+        # Backward pass: Kim-style discrete-state smoothing plus pairwise
+        # EKF-RTS updates over (S_t=i, S_{t+1}=k), collapsed back to one
+        # Gaussian per current state.
         def backward_step(carry, inputs):
             m_s_next, P_s_next, pi_s_next = carry
             (
-                m_f_t, P_f_t, m_p_next, P_p_next, F_next_jk,
-                joint_pi_next, pi_pred_next_k, pi_filt_t,
+                m_f_t,
+                P_f_t,
+                m_p_next_jk,
+                P_p_next_jk,
+                F_next_jk,
+                joint_pi_next,
+                pi_pred_next_k,
+                _pi_filt_t,
             ) = inputs
 
-            ratio = _divide_safe(pi_s_next, pi_pred_next_k)
-            pi_s_t = pi_filt_t * (Z @ ratio)
+            backward_cond = _divide_safe(joint_pi_next, pi_pred_next_k[None, :])
+            joint_smooth = backward_cond * pi_s_next[None, :]
+            pi_s_t = jnp.sum(joint_smooth, axis=1)
             pi_s_t = _divide_safe(pi_s_t, jnp.sum(pi_s_t))
+            forward_cond = _divide_safe(joint_smooth, pi_s_t[:, None])
 
-            def smooth_k(k):
-                from state_space_practice.nonlinear_dynamics import ekf_smooth_step
+            from state_space_practice.nonlinear_dynamics import ekf_smooth_step
 
-                w_jk = _divide_safe(joint_pi_next[:, k], pi_pred_next_k[k])
-                F_avg = jnp.sum(w_jk[:, None, None] * F_next_jk[:, k, :, :], axis=0)
-                return ekf_smooth_step(
-                    m_f_t[:, k], P_f_t[:, :, k],
-                    m_p_next[:, k], P_p_next[:, :, k],
-                    m_s_next[:, k], P_s_next[:, :, k],
-                    F_avg,
+            m_s_next_k = m_s_next.T
+            P_s_next_k = P_s_next.transpose(2, 0, 1)
+            m_f_i = m_f_t.T
+            P_f_i = P_f_t.transpose(2, 0, 1)
+
+            def smooth_i(m_f_curr, P_f_curr, m_pred_i, P_pred_i, F_i):
+                return jax.vmap(
+                    lambda m_pred, P_pred, F, m_next, P_next: ekf_smooth_step(
+                        m_f_curr,
+                        P_f_curr,
+                        m_pred,
+                        P_pred,
+                        m_next,
+                        P_next,
+                        F,
+                    )
+                )(m_pred_i, P_pred_i, F_i, m_s_next_k, P_s_next_k)
+
+            pair_m, pair_P = jax.vmap(smooth_i)(
+                m_f_i, P_f_i, m_p_next_jk, P_p_next_jk, F_next_jk
+            )
+
+            def collapse_i(means_i, covs_i, weights_i):
+                return collapse_gaussian_mixture(
+                    means_i.T,
+                    covs_i.transpose(1, 2, 0),
+                    weights_i,
                 )
 
-            m_s, P_s = jax.vmap(smooth_k)(jnp.arange(K_states))
+            m_s, P_s = jax.vmap(collapse_i)(pair_m, pair_P, forward_cond)
             return (
                 (m_s.T, P_s.transpose(1, 2, 0), pi_s_t),
                 (m_s.T, P_s.transpose(1, 2, 0), pi_s_t),
@@ -314,7 +367,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         init_s = (m_filt[-1], P_filt[-1], pi_filt_all[-1])
         bw_in = (
             m_filt[:-1], P_filt[:-1],
-            m_pred[1:], P_pred[1:], F_all[1:],
+            m_pred_pair[1:], P_pred_pair[1:], F_all[1:],
             joint_pi_all[1:], pi_pred_all[1:],
             pi_filt_all[:-1],
         )

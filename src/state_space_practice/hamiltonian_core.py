@@ -29,9 +29,12 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
-from state_space_practice.kalman import joseph_form_update, psd_solve, symmetrize
+from state_space_practice.kalman import joseph_form_update, psd_solve
 from state_space_practice.nonlinear_dynamics import ekf_smooth_step
-from state_space_practice.point_process_kalman import _logdet_psd
+from state_space_practice.point_process_kalman import (
+    glm_laplace_update,
+    poisson_family,
+)
 
 
 def gaussian_measurement_update(
@@ -81,12 +84,12 @@ def point_process_laplace_update(
     *,
     compute_log_likelihood: bool = True,
 ) -> Tuple[Array, Array, Array]:
-    """Single-Newton Laplace update for Poisson observations.
+    """Single-Fisher-step Laplace update for Poisson observations.
 
     Observation model: ``y[n] ~ Poisson(exp(C[n] @ x + d[n]) * dt)``.
-    Linearises the log-likelihood at ``m_pred`` and applies one
-    information-form update; the posterior mean is the prior mean
-    plus ``P_post @ score_at_prior_mean``.
+    Delegates to the shared GLM Laplace update with ``poisson_family(dt)`` so
+    Hamiltonian point-process likelihoods use the same normalized Poisson
+    log-PMF and expected-count clipping as the generic point-process filter.
 
     Returns
     -------
@@ -97,29 +100,23 @@ def point_process_laplace_update(
         With ``compute_log_likelihood=False`` returns ``jnp.array(0.0)``
         (used in the smoother forward pass where ll is discarded).
     """
-    rate_pred = jnp.exp(C @ m_pred + d) * dt
-    grad = C.T @ (y - rate_pred)
-    H_lik = C.T @ (rate_pred[:, None] * C)
 
-    n = P_pred.shape[0]
-    eye = jnp.eye(n)
-    prior_precision = psd_solve(P_pred, eye)
-    P_post = symmetrize(psd_solve(prior_precision + H_lik, eye))
-    m_post = m_pred + P_post @ grad
+    def eta_func(x: Array) -> Array:
+        return C @ x + d
 
+    def grad_eta_func(_x: Array) -> Array:
+        return C
+
+    m_post, P_post, ll = glm_laplace_update(
+        m_pred,
+        P_pred,
+        y,
+        eta_func,
+        poisson_family(dt),
+        grad_eta_func=grad_eta_func,
+    )
     if not compute_log_likelihood:
         return m_post, P_post, jnp.array(0.0)
-
-    rate_post = jnp.exp(C @ m_post + d) * dt
-    ll_at_mode = jnp.sum(y * jnp.log(rate_post + 1e-10) - rate_post)
-    delta = m_post - m_pred
-    quad = delta @ psd_solve(P_pred, delta)
-    ll = (
-        ll_at_mode
-        - 0.5 * quad
-        - 0.5 * _logdet_psd(P_pred)
-        + 0.5 * _logdet_psd(P_post)
-    )
     return m_post, P_post, ll
 
 
