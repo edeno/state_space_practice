@@ -354,6 +354,20 @@ class TestSwitchingChoiceModel:
         with pytest.raises(ValueError, match="All choices"):
             model.fit_sgd(choices, num_steps=1)
 
+    def test_fit_log_likelihood_matches_final_parameters(self):
+        choices = jnp.array(
+            [0, 1, 1, 2, 2, 2, 0, 1, 2, 0, 2, 1],
+            dtype=jnp.int32,
+        )
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+
+        model.fit(choices, max_iter=1)
+        fresh_ll = float(
+            model._run_filter(choices, None, None).marginal_log_likelihood
+        )
+
+        assert np.isclose(model.log_likelihood_, fresh_ll)
+
 
 class TestSimulateSwitchingChoiceData:
     """Tests for the simulation helper."""

@@ -742,10 +742,16 @@ class SwitchingChoiceModel(SGDFittableMixin):
             # M-step
             self._m_step(choices, result, smoother_result)
 
+        # Final E-step with learned parameters so fitted summaries and
+        # log_likelihood_ correspond to the model state after the last M-step.
+        result = self._run_filter(choices, self._covariates, self._obs_covariates)
+        self._filter_result = result
+        smoother_result = self._run_smoother(result)
+
         self.smoothed_discrete_probs_ = smoother_result[2]
         self._smoother_state_cond_means = smoother_result[5]  # (T, K-1, S)
         self._smoother_state_cond_covs = smoother_result[6]  # (T, K-1, K-1, S)
-        self.log_likelihood_ = log_likelihoods[-1]
+        self.log_likelihood_ = float(result.marginal_log_likelihood)
         self.log_likelihood_history_ = log_likelihoods
         self._populate_uncertainty(choices)
         self._finalize_convergence(converged, max_iter)
