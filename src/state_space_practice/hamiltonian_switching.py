@@ -247,22 +247,16 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
             def update_k(k):
                 # Per-state gaussian + Laplace update. Log-likelihoods
                 # here go into _scale_likelihood for relative discrete-
-                # state weighting only — the n_lfp*log(2π) constant and
-                # the Laplace correction terms cancel in normalization,
-                # so we drop them for both observations.
+                # state weighting only, so the Gaussian normalization
+                # constant is dropped. The Laplace correction terms remain
+                # state-dependent and must be included.
                 m_mid, P_mid, ll_l = gaussian_measurement_update(
                     m_p_k[:, k], P_p_k[:, :, k], y_lfp_t, C_l, d_l, R_l,
                     include_normalization_const=False,
                 )
-                m_post, P_post, _ = point_process_laplace_update(
+                m_post, P_post, ll_s = point_process_laplace_update(
                     m_mid, P_mid, y_spike_t, C_s, d_s, self.dt,
-                    compute_log_likelihood=False,
                 )
-                # Plug-in Poisson NLL at the posterior mode (not the
-                # full Laplace marginal) — sufficient for relative
-                # weighting across discrete states.
-                rate_post = jnp.exp(C_s @ m_post + d_s) * self.dt
-                ll_s = jnp.sum(y_spike_t * jnp.log(rate_post + 1e-10) - rate_post)
                 return m_post, P_post, ll_l + ll_s
 
             m_f, P_f, lls_k = jax.vmap(update_k)(jnp.arange(K_states))

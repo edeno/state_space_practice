@@ -66,6 +66,23 @@ class TestSwitchingHamiltonianSmooth:
         assert means.shape[0] == n_time
         assert probs.shape == (n_time, switching_model.n_discrete_states)
 
+    def test_smoother_final_probability_matches_filter(self, switching_model, synthetic_data, params):
+        """The last smoothed probability should equal the filtered probability."""
+        lfp, spikes = synthetic_data
+        params = {**params, "omega": jnp.array([1.0, 8.0])}
+        switching_model.process_cov = jnp.stack(
+            [
+                jnp.eye(switching_model.n_cont_states) * 1e-4,
+                jnp.array([[0.05, 0.01], [0.01, 0.02]]),
+            ],
+            axis=2,
+        )
+
+        _, _, pi_filt, _ = switching_model.filter(lfp, spikes, params)
+        _, _, pi_smooth = switching_model.smooth(lfp, spikes, params)
+
+        assert jnp.allclose(pi_smooth[-1], pi_filt[-1], atol=1e-6)
+
     def test_smooth_sensitive_to_transition_asymmetry(self, switching_model, synthetic_data, params):
         """Smoother output should change when transition matrix changes,
         confirming Jacobian weighting uses actual probabilities."""

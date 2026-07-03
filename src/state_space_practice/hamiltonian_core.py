@@ -102,9 +102,9 @@ def point_process_laplace_update(
     H_lik = C.T @ (rate_pred[:, None] * C)
 
     n = P_pred.shape[0]
-    P_post = symmetrize(
-        P_pred - P_pred @ psd_solve(jnp.eye(n) + H_lik @ P_pred, H_lik @ P_pred)
-    )
+    eye = jnp.eye(n)
+    prior_precision = psd_solve(P_pred, eye)
+    P_post = symmetrize(psd_solve(prior_precision + H_lik, eye))
     m_post = m_pred + P_post @ grad
 
     if not compute_log_likelihood:
