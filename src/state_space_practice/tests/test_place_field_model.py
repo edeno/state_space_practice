@@ -187,6 +187,19 @@ class TestPlaceFieldModelFit:
         with pytest.raises(ValueError, match="1D.*or 2D"):
             model.fit(sim_data["position"], bad_spikes)
 
+    @pytest.mark.parametrize(
+        ("bad_value", "match"),
+        [(0.5, "integer-valued"), (np.nan, "finite")],
+    )
+    def test_fit_rejects_invalid_spike_counts(
+        self, sim_data: dict, bad_value: float, match: str
+    ) -> None:
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        spikes = np.asarray(sim_data["spikes"], dtype=float).copy()
+        spikes.reshape(-1)[0] = bad_value
+        with pytest.raises(ValueError, match=match):
+            model.fit(sim_data["position"], spikes, max_iter=1, verbose=False)
+
     def test_max_iter_warning(self, sim_data: dict, caplog) -> None:
         import logging
 
@@ -201,6 +214,43 @@ class TestPlaceFieldModelFit:
                 verbose=False,
             )
         assert "maximum iterations" in caplog.text.lower()
+
+    def test_max_iter_final_estep_matches_returned_ll(self, sim_data: dict) -> None:
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        lls = model.fit(
+            sim_data["position"], sim_data["spikes"], max_iter=1, verbose=False
+        )
+        assert model.basis_info is not None
+        design_matrix = jnp.asarray(evaluate_basis(sim_data["position"], model.basis_info))
+        spikes = jnp.asarray(sim_data["spikes"])
+        if spikes.ndim == 2 and spikes.shape[1] == 1:
+            spikes = spikes.squeeze(axis=1)
+        fresh_ll = model._e_step(design_matrix, spikes)
+        np.testing.assert_allclose(fresh_ll, lls[-1], atol=1e-6)
+
+    def test_rollback_restores_m_step_parameters(self, sim_data: dict) -> None:
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        real_e_step = model._e_step
+        ll_iter = iter([0.0, -1e6])
+
+        def fake_e_step(*args, **kwargs):
+            real_e_step(*args, **kwargs)
+            return next(ll_iter)
+
+        def bad_m_step():
+            assert model.process_cov is not None
+            model.process_cov = model.process_cov + 100.0 * jnp.eye(
+                model.process_cov.shape[0]
+            )
+
+        model._e_step = fake_e_step
+        model._m_step = bad_m_step
+        lls = model.fit(
+            sim_data["position"], sim_data["spikes"], max_iter=3, verbose=False
+        )
+        assert lls == [0.0]
+        assert model.process_cov is not None
+        assert float(jnp.max(jnp.diag(model.process_cov))) < 1.0
 
     def test_repr_fitted(self, sim_data: dict) -> None:
         model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
@@ -348,6 +398,19 @@ class TestPlaceFieldModelScore:
         )
         with pytest.raises(ValueError, match="same number of time bins"):
             model.score(sim_data["position"][:10], sim_data["spikes"])
+
+    def test_score_rejects_invalid_spike_counts(self, sim_data: dict) -> None:
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        model.fit(
+            sim_data["position"],
+            sim_data["spikes"],
+            max_iter=3,
+            verbose=False,
+        )
+        bad_spikes = np.asarray(sim_data["spikes"], dtype=float).copy()
+        bad_spikes.reshape(-1)[0] = np.nan
+        with pytest.raises(ValueError, match="finite"):
+            model.score(sim_data["position"], bad_spikes)
 
 
 # ------------------------------------------------------------------
@@ -1368,6 +1431,18 @@ class TestBlockDiagonalDispatch:
         )
         assert model._block_n_neurons == 3
         assert model._block_size == model.n_basis_per_neuron
+
+    def test_fit_sgd_rejects_invalid_spike_counts(self) -> None:
+        position, spikes = self._make_multi_neuron_data(n_neurons=3)
+        spikes = spikes.astype(float)
+        spikes[0, 0] = 0.5
+        model = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        import optax
+
+        with pytest.raises(ValueError, match="integer-valued"):
+            model.fit_sgd(
+                position, spikes, optimizer=optax.sgd(1e-4), num_steps=0
+            )
 
     def test_fit_sgd_multi_neuron_force_dense_skips_dispatch(self) -> None:
         """force_dense=True should suppress block detection."""

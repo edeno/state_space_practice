@@ -995,6 +995,35 @@ def test_m_step_transition_matrix_deterministic():
     np.testing.assert_allclose(Z_est, Z_true, atol=0.0)
 
 
+def test_m_step_rejects_sparse_transition_prior():
+    """The MAP transition update only supports non-negative pseudo-counts."""
+    T = 3
+    n_cont = 1
+    n_obs = 1
+    n_disc = 2
+    gamma = jnp.array(
+        [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]], dtype=jnp.float32
+    )
+    xi = jnp.zeros((T - 1, n_disc, n_disc), dtype=jnp.float32)
+    xi = xi.at[0, 0, 1].set(1.0)
+    xi = xi.at[1, 1, 0].set(1.0)
+    means = jnp.zeros((T, n_cont, n_disc), dtype=jnp.float32)
+    covs = jnp.zeros((T, n_cont, n_cont, n_disc), dtype=jnp.float32)
+    cross = jnp.zeros((T - 1, n_cont, n_cont, n_disc, n_disc), dtype=jnp.float32)
+    obs = jnp.zeros((T, n_obs), dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="transition_prior entries must be >= 1"):
+        switching_kalman_maximization_step(
+            obs=obs,
+            state_cond_smoother_means=means,
+            state_cond_smoother_covs=covs,
+            smoother_discrete_state_prob=gamma,
+            smoother_joint_discrete_state_prob=xi,
+            pair_cond_smoother_cross_cov=cross,
+            transition_prior=0.5 * jnp.ones((n_disc, n_disc)),
+        )
+
+
 def test_m_step_continuous_transition_matrix_estimation():
     """
     Deterministic test for the continuous-transition M-step.
@@ -5372,6 +5401,19 @@ def test_viterbi_returns_valid_states(simple_skf_model: tuple) -> None:
     n_discrete_states = init_mean.shape[-1]
     assert states.shape == (obs.shape[0],)
     assert jnp.all(states >= 0) and jnp.all(states < n_discrete_states)
+
+
+def test_viterbi_handles_one_timestep(simple_skf_model: tuple) -> None:
+    """A one-observation sequence should return the first-step MAP state."""
+    init_mean, init_cov, init_prob, obs, Z, A, Q, H, R = simple_skf_model
+    states = switching_kalman_viterbi(
+        init_mean, init_cov, init_prob, obs[:1], Z, A, Q, H, R
+    )
+    filter_result = switching_kalman_filter(
+        init_mean, init_cov, init_prob, obs[:1], Z, A, Q, H, R
+    )
+    assert states.shape == (1,)
+    assert int(states[0]) == int(jnp.argmax(filter_result[2][0]))
 
 
 def test_viterbi_agrees_with_filter_argmax(simple_skf_model: tuple) -> None:

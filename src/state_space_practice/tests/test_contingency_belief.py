@@ -523,6 +523,14 @@ class TestContingencyBeliefModel:
         model.fit(choices, rewards, max_iter=5)
         assert model.is_fitted
 
+    def test_max_iter_final_estep_matches_stored_ll(self):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=50)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        lls = model.fit(choices, rewards, max_iter=1)
+        fresh = contingency_belief_smoother(**model._smoother_kwargs(choices, rewards))
+        np.testing.assert_allclose(model.log_likelihood_, float(fresh.log_likelihood))
+        np.testing.assert_allclose(lls[-1], model.log_likelihood_)
+
     def test_em_improves_overall(self):
         """EM should improve LL overall (generalized EM with Dirichlet prior)."""
         choices, rewards, _, _ = _simulate_block_bandit(n_trials=100)
@@ -954,6 +962,28 @@ class TestContingencyBeliefValidation:
     def test_rejects_init_diagonal_above_one(self):
         with pytest.raises(ValueError, match="init_diagonal must be a probability"):
             ContingencyBeliefModel(n_states=2, n_options=2, init_diagonal=1.5)
+
+    @pytest.mark.parametrize(
+        ("choices", "rewards", "match"),
+        [
+            ([0, 2, 1], [1, 0, 1], "choices"),
+            ([0, 1, 1], [1, 2, 0], "binary"),
+            ([0, 0.5, 1], [1, 0, 1], "integer-valued"),
+            ([0, 1, 1], [1, np.nan, 0], "finite"),
+        ],
+    )
+    def test_filter_rejects_invalid_discrete_observations(
+        self, choices, rewards, match
+    ):
+        with pytest.raises(ValueError, match=match):
+            contingency_belief_filter(
+                choices=jnp.asarray(choices),
+                rewards=jnp.asarray(rewards),
+                n_states=2,
+                n_options=2,
+                reward_probs=jnp.array([[0.8, 0.2], [0.2, 0.8]]),
+                state_values=jnp.zeros((2, 2)),
+            )
 
     def test_converged_flag_reflects_convergence(self):
         # Distinct `while abs(ll-prev_ll)<tol and iteration>0` EM loop; verify

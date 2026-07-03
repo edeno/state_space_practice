@@ -19,6 +19,7 @@ References
 from __future__ import annotations
 
 import logging
+import math
 import warnings
 from dataclasses import dataclass
 from functools import partial
@@ -31,7 +32,7 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.kalman import rts_backward_scan, symmetrize
-from state_space_practice.utils import validate_covariance
+from state_space_practice.utils import validate_count_array, validate_covariance
 from state_space_practice.point_process_kalman import (
     _point_process_laplace_update,
     _safe_expected_count,
@@ -45,6 +46,27 @@ logger = logging.getLogger(__name__)
 # the exact divergence adaptive inflation exists to prevent.
 _MAX_INFLATION_MAX_ALPHA = 100.0
 _MAX_INFLATION_GAIN = 1.0e4
+
+
+def _validate_scalar(
+    value: object,
+    name: str,
+    *,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> float:
+    """Validate finite scalar decoder configuration before JAX dispatch."""
+    value_arr = np.asarray(value)
+    if value_arr.shape != ():
+        raise ValueError(f"{name} must be a scalar. Got shape {value_arr.shape}.")
+    value_float = float(value_arr)
+    if not math.isfinite(value_float):
+        raise ValueError(f"{name} must be finite. Got {value}.")
+    if positive and value_float <= 0:
+        raise ValueError(f"{name} must be positive. Got {value}.")
+    if nonnegative and value_float < 0:
+        raise ValueError(f"{name} must be non-negative. Got {value}.")
+    return value_float
 
 
 @dataclass
@@ -136,8 +158,9 @@ def build_position_dynamics(
     Q : Array, shape (n_state, n_state)
         Process noise covariance.
     """
-    if dt <= 0:
-        raise ValueError(f"dt must be positive, got {dt}")
+    dt = _validate_scalar(dt, "dt", positive=True)
+    q_pos = _validate_scalar(q_pos, "q_pos", nonnegative=True)
+    q_vel = _validate_scalar(q_vel, "q_vel", nonnegative=True)
 
     if include_velocity:
         A = jnp.array([
@@ -380,6 +403,13 @@ class PlaceFieldRateMaps:
         spike_counts = np.asarray(spike_counts)
         if spike_counts.ndim == 1:
             spike_counts = spike_counts[:, None]
+        if spike_counts.ndim != 2:
+            raise ValueError(
+                "spike_counts must be 1D (n_time,) or 2D "
+                f"(n_time, n_neurons), got shape {spike_counts.shape}"
+            )
+        validate_count_array(spike_counts, "spike_counts", allow_empty=False)
+        _validate_scalar(dt, "dt", positive=True)
 
         if position.shape[0] != spike_counts.shape[0]:
             raise ValueError(
@@ -1070,6 +1100,12 @@ def position_decoder_filter(
     spikes_arr = jnp.asarray(spikes)
     if spikes_arr.ndim == 1:
         spikes_arr = spikes_arr[:, None]
+    if spikes_arr.ndim != 2:
+        raise ValueError(
+            f"spikes must be 1D (n_time,) or 2D (n_time, n_neurons), "
+            f"got shape {spikes_arr.shape}"
+        )
+    validate_count_array(spikes_arr, "spikes", allow_empty=False)
 
     if spikes_arr.shape[1] != rate_maps.n_neurons:
         raise ValueError(
@@ -1083,6 +1119,8 @@ def position_decoder_filter(
             if rate_maps.suggested_q_pos is not None
             else 100.0
         )
+    q_pos = _validate_scalar(q_pos, "q_pos", nonnegative=True)
+    q_vel = _validate_scalar(q_vel, "q_vel", nonnegative=True)
 
     A, Q = build_position_dynamics(dt, q_pos, q_vel, include_velocity)
     n_state = A.shape[0]
@@ -1383,14 +1421,38 @@ class PositionDecoder:
         max_newton_iter: int = 3,
         adaptive_inflation: Optional[AdaptiveInflationConfig] = None,
     ):
-        self.dt = dt
-        self.q_pos = q_pos
-        self.q_vel = q_vel
+        self.dt = _validate_scalar(dt, "dt", positive=True)
+        self.q_pos = _validate_scalar(q_pos, "q_pos", nonnegative=True)
+        self.q_vel = _validate_scalar(q_vel, "q_vel", nonnegative=True)
+        n_grid_arr = np.asarray(n_grid)
+        if n_grid_arr.shape != () or not np.issubdtype(n_grid_arr.dtype, np.integer):
+            raise ValueError(f"n_grid must be an integer scalar, got {n_grid}.")
+        if n_grid <= 0:
+            raise ValueError(f"n_grid must be positive, got {n_grid}")
+        smoothing_sigma = _validate_scalar(
+            smoothing_sigma, "smoothing_sigma", positive=True
+        )
+        occupancy_tau = _validate_scalar(
+            occupancy_tau, "occupancy_tau", nonnegative=True
+        )
+        max_newton_iter_arr = np.asarray(max_newton_iter)
+        if (
+            max_newton_iter_arr.shape != ()
+            or not np.issubdtype(max_newton_iter_arr.dtype, np.integer)
+        ):
+            raise ValueError(
+                "max_newton_iter must be an integer scalar, "
+                f"got {max_newton_iter}."
+            )
+        if max_newton_iter < 0:
+            raise ValueError(
+                f"max_newton_iter must be non-negative, got {max_newton_iter}"
+            )
         self.include_velocity = include_velocity
-        self.n_grid = n_grid
+        self.n_grid = int(n_grid)
         self.smoothing_sigma = smoothing_sigma
         self.occupancy_tau = occupancy_tau
-        self.max_newton_iter = max_newton_iter
+        self.max_newton_iter = int(max_newton_iter)
         self.adaptive_inflation = adaptive_inflation
 
         self.rate_maps: Optional[PlaceFieldRateMaps] = None
@@ -1491,6 +1553,12 @@ class PositionDecoder:
         spikes_arr = jnp.asarray(spikes)
         if spikes_arr.ndim == 1:
             spikes_arr = spikes_arr[:, None]
+        if spikes_arr.ndim != 2:
+            raise ValueError(
+                f"spikes must be 1D (n_time,) or 2D (n_time, n_neurons), "
+                f"got shape {spikes_arr.shape}"
+            )
+        validate_count_array(spikes_arr, "spikes", allow_empty=False)
 
         if spikes_arr.shape[1] != self.rate_maps.n_neurons:
             raise ValueError(

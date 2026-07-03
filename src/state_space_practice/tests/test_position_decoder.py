@@ -53,6 +53,14 @@ class TestBuildPositionDynamics:
         with pytest.raises(ValueError):
             build_position_dynamics(dt=-0.01)
 
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"q_pos": -1.0}, {"q_vel": -1.0}, {"q_pos": np.nan}],
+    )
+    def test_process_noise_validation(self, kwargs):
+        with pytest.raises(ValueError):
+            build_position_dynamics(dt=0.004, **kwargs)
+
 
 class TestPlaceFieldRateMaps:
     @pytest.fixture
@@ -191,6 +199,33 @@ class TestPlaceFieldRateMaps:
                 spike_counts=spikes,
                 dt=0.004,
                 n_grid=20,
+            )
+
+    @pytest.mark.parametrize(
+        ("bad_value", "match"),
+        [(-1.0, "non-negative"), (0.5, "integer-valued"), (np.nan, "finite")],
+    )
+    def test_from_spike_position_data_rejects_invalid_counts(
+        self, bad_value, match
+    ):
+        rng = np.random.default_rng(0)
+        position = rng.standard_normal((100, 2))
+        spikes = rng.poisson(0.1, (100, 2)).astype(float)
+        spikes[0, 0] = bad_value
+        with pytest.raises(ValueError, match=match):
+            PlaceFieldRateMaps.from_spike_position_data(
+                position=position,
+                spike_counts=spikes,
+                dt=0.004,
+                n_grid=20,
+            )
+
+    def test_from_spike_position_data_rejects_invalid_dt(self):
+        position = np.zeros((10, 2))
+        spikes = np.zeros((10, 1))
+        with pytest.raises(ValueError, match="dt"):
+            PlaceFieldRateMaps.from_spike_position_data(
+                position=position, spike_counts=spikes, dt=-0.004
             )
 
     @pytest.fixture
@@ -407,6 +442,28 @@ class TestPositionDecoderFilter:
             dt=decoding_data["dt"],
         )
         assert np.isfinite(result.marginal_log_likelihood)
+
+    @pytest.mark.parametrize(
+        ("bad_value", "match"),
+        [(-1.0, "non-negative"), (0.5, "integer-valued"), (np.nan, "finite")],
+    )
+    def test_filter_rejects_invalid_spikes(self, decoding_data, bad_value, match):
+        spikes = np.asarray(decoding_data["spikes"], dtype=float).copy()
+        spikes[0, 0] = bad_value
+        with pytest.raises(ValueError, match=match):
+            position_decoder_filter(
+                spikes=spikes,
+                rate_maps=decoding_data["rate_maps"],
+                dt=decoding_data["dt"],
+            )
+
+    def test_filter_rejects_empty_spikes(self, decoding_data):
+        with pytest.raises(ValueError, match="at least one"):
+            position_decoder_filter(
+                spikes=np.zeros((0, 2)),
+                rate_maps=decoding_data["rate_maps"],
+                dt=decoding_data["dt"],
+            )
 
     def test_smoother_output_shapes(self, decoding_data):
         result = position_decoder_smoother(
@@ -692,6 +749,14 @@ class TestPositionDecoder:
             "n_neurons": n_neurons,
             "centers": centers,
         }
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"dt": -0.004}, {"dt": 0.004, "q_pos": -1.0}, {"dt": 0.004, "q_vel": -1.0}],
+    )
+    def test_constructor_rejects_invalid_scalars(self, kwargs):
+        with pytest.raises(ValueError):
+            PositionDecoder(**kwargs)
 
     def test_fit_decode_workflow(self, trajectory_data):
         decoder = PositionDecoder(dt=trajectory_data["dt"])

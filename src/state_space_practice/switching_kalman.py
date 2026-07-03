@@ -639,6 +639,8 @@ def switching_kalman_viterbi(
         measurement_matrix,
         measurement_cov,
     )
+    if obs.shape[0] == 1:
+        return jnp.array([jnp.argmax(first_discrete_prob)], dtype=jnp.int32)
 
     # --- Forward pass: collect pair log-likelihoods -----------------------
     def _step(carry, obs_t):
@@ -1705,6 +1707,21 @@ def switching_kalman_maximization_step(
     # Transition prior pseudo-counts (zeros = no prior = ML estimate)
     n_discrete_states = smoother_discrete_state_prob.shape[1]
     if transition_prior is not None:
+        transition_prior = jnp.asarray(transition_prior)
+        expected_shape = (n_discrete_states, n_discrete_states)
+        if transition_prior.shape != expected_shape:
+            raise ValueError(
+                f"transition_prior must have shape {expected_shape}, "
+                f"got {transition_prior.shape}."
+            )
+        if not bool(jnp.all(jnp.isfinite(transition_prior))):
+            raise ValueError("transition_prior must contain only finite values.")
+        if not bool(jnp.all(transition_prior >= 1.0)):
+            raise ValueError(
+                "transition_prior entries must be >= 1.0 for this MAP "
+                "update, because alpha - 1 is added as non-negative "
+                "pseudo-counts."
+            )
         transition_pseudo_counts = transition_prior - 1.0
     else:
         transition_pseudo_counts = jnp.zeros(

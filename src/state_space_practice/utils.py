@@ -230,14 +230,49 @@ def validate_choice_indices(choices: ArrayLike, n_options: int) -> None:
     choices_np = np.asarray(choices)
     if choices_np.size == 0:
         return
+    if not np.issubdtype(choices_np.dtype, np.number):
+        raise ValueError("choices must be numeric category indices.")
+    choices_float = choices_np.astype(float)
+    if not np.all(np.isfinite(choices_float)):
+        raise ValueError("choices must contain only finite category indices.")
+    if not np.all(np.isclose(choices_float, np.round(choices_float))):
+        raise ValueError("choices must contain integer-valued category indices.")
     if np.any(choices_np < 0) or np.any(choices_np >= n_options):
         raise ValueError(
             f"All choices must be in [0, {n_options}), "
-            f"got range [{int(choices_np.min())}, {int(choices_np.max())}]. "
+            f"got range [{int(choices_float.min())}, {int(choices_float.max())}]. "
             f"JAX silently maps out-of-range indices to a zero indicator "
             f"vector (= no observation), so this would otherwise produce "
             f"a normal-looking result on bad data."
         )
+
+
+def validate_count_array(
+    counts: ArrayLike,
+    name: str,
+    *,
+    allow_empty: bool = True,
+) -> None:
+    """Validate observed count data at public API boundaries.
+
+    Count-valued observation models assume finite, non-negative integer
+    counts.  Failing before JAX dispatch avoids silent float-to-int casts and
+    invalid likelihood terms that otherwise look like normal model output.
+    """
+    counts_np = np.asarray(counts)
+    if counts_np.size == 0:
+        if allow_empty:
+            return
+        raise ValueError(f"{name} must contain at least one count.")
+    if not np.issubdtype(counts_np.dtype, np.number):
+        raise ValueError(f"{name} must be numeric count data.")
+    counts_float = counts_np.astype(float)
+    if not np.all(np.isfinite(counts_float)):
+        raise ValueError(f"{name} must contain only finite counts.")
+    if not np.all(counts_float >= 0):
+        raise ValueError(f"{name} must contain non-negative counts.")
+    if not np.all(np.isclose(counts_float, np.round(counts_float))):
+        raise ValueError(f"{name} must contain integer-valued counts.")
 
 
 def _validate_filter_numerics(

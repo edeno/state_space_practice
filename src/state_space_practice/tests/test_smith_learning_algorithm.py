@@ -840,6 +840,32 @@ class TestSmithLearningModelEdgeCases:
         with pytest.raises(ValueError, match="exceeding max_possible_correct"):
             model.fit(jnp.array([0, 1, 2, 1, 0]))
 
+    @pytest.mark.parametrize(
+        ("data", "match"),
+        [
+            (jnp.array([0.0, -1.0, 1.0, 0.0]), "non-negative"),
+            (jnp.array([0.0, 0.5, 1.0, 0.0]), "integer-valued"),
+            (jnp.array([0.0, jnp.nan, 1.0, 0.0]), "finite"),
+        ],
+    )
+    def test_invalid_n_correct_counts_raise(self, data, match) -> None:
+        model = SmithLearningModel(max_possible_correct=1)
+        with pytest.raises(ValueError, match=match):
+            model.fit(data, max_iter=2)
+        with pytest.raises(ValueError, match=match):
+            model.fit_sgd(data, num_steps=1)
+        with pytest.raises(ValueError, match=match):
+            smith_learning_filter(data, max_possible_correct=1)
+
+    def test_max_iter_final_estep_matches_returned_ll(self) -> None:
+        rng = np.random.default_rng(7)
+        outcomes = jnp.asarray(rng.integers(0, 2, size=30).astype(float))
+        model = SmithLearningModel(max_possible_correct=1)
+        lls = model.fit(outcomes, max_iter=1)
+        fresh_ll = model._e_step(outcomes)
+        np.testing.assert_allclose(fresh_ll, lls[-1], atol=1e-6)
+        np.testing.assert_allclose(model.log_likelihood_, lls[-1], atol=1e-6)
+
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_all_zeros_produces_finite(self) -> None:
         """All-zero outcomes should not produce NaN/Inf."""
@@ -2110,4 +2136,36 @@ class TestSmithEMRollback:
         )
         assert_em_rolls_back_on_ll_decrease(
             model, (n_correct,), caplog,
+        )
+
+    def test_smith_em_rollback_restores_parameters(self, caplog) -> None:
+        rng = np.random.default_rng(1)
+        n_correct = jnp.asarray(rng.integers(0, 2, size=50).astype(float))
+        model = SmithLearningModel(max_possible_correct=1)
+        initial_params = (
+            model.sigma_epsilon,
+            model.init_learning_state,
+            model.init_learning_variance,
+        )
+        real_e_step = model._e_step
+        ll_iter = iter([0.0, -1e6])
+
+        def fake_e_step(*args, **kwargs):
+            real_e_step(*args, **kwargs)
+            return next(ll_iter)
+
+        model._e_step = fake_e_step
+        with caplog.at_level("WARNING"):
+            lls = model.fit(n_correct, max_iter=3)
+
+        assert lls == [0.0]
+        assert any("rolling back" in r.message.lower() for r in caplog.records)
+        np.testing.assert_allclose(
+            [
+                model.sigma_epsilon,
+                model.init_learning_state,
+                model.init_learning_variance,
+            ],
+            initial_params,
+            atol=1e-10,
         )

@@ -66,7 +66,7 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import check_converged
+from state_space_practice.utils import check_converged, validate_count_array
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +290,14 @@ def smith_learning_filter(
         One-step prediction variance ($P_{k|k-1}$).
     """
     # Resolve concrete values before JIT boundary
+    if not differentiable:
+        validate_count_array(
+            n_correct_responses, "n_correct_responses", allow_empty=False
+        )
+        if max_possible_correct is not None:
+            validate_count_array(
+                max_possible_correct, "max_possible_correct", allow_empty=False
+            )
     n_correct_responses = jnp.asarray(n_correct_responses)
     mu = jnp.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
     sigma_squared_epsilon = jnp.asarray(sigma_epsilon) ** 2
@@ -302,6 +310,9 @@ def smith_learning_filter(
 
     max_correct_arr: Array
     if isinstance(max_possible_correct, (int, float)):
+        max_possible_float = float(max_possible_correct)
+        if max_possible_float <= 0:
+            raise ValueError("max_possible_correct must be positive.")
         max_correct_arr = jnp.array(
             [max_possible_correct] * len(n_correct_responses), dtype=int
         )
@@ -311,6 +322,16 @@ def smith_learning_filter(
         )
     else:
         max_correct_arr = jnp.asarray(max_possible_correct)
+    if not differentiable:
+        if max_correct_arr.shape != n_correct_responses.shape:
+            raise ValueError(
+                f"max_possible_correct shape {max_correct_arr.shape} must match "
+                f"n_correct_responses shape {n_correct_responses.shape}."
+            )
+        if bool(jnp.any(n_correct_responses > max_correct_arr)):
+            raise ValueError(
+                "n_correct_responses contains values exceeding max_possible_correct."
+            )
 
     return _smith_learning_filter_impl(
         n_correct_responses, max_correct_arr,
@@ -1303,6 +1324,14 @@ class SmithLearningModel(SGDFittableMixin):
                 raise ValueError(
                     "max_possible_correct must be a positive integer if provided as scalar."
                 )
+            if not isinstance(max_possible_correct, int):
+                validate_count_array(
+                    max_possible_correct, "max_possible_correct", allow_empty=False
+                )
+                if np.any(np.asarray(max_possible_correct, dtype=float) <= 0):
+                    raise ValueError(
+                        "max_possible_correct must contain positive integers."
+                    )
 
         self.init_learning_state = float(init_learning_state)
         self.init_learning_variance = init_var
@@ -1381,6 +1410,11 @@ class SmithLearningModel(SGDFittableMixin):
                     f"max_possible_correct array length ({len(mpc_arr)}) "
                     f"doesn't match n_correct_responses length ({n_trials})."
                 )
+            validate_count_array(mpc, "max_possible_correct", allow_empty=False)
+            if bool(jnp.any(mpc_arr <= 0)):
+                raise ValueError(
+                    "max_possible_correct must contain positive integers."
+                )
             return mpc_arr
 
         # Infer from data
@@ -1415,6 +1449,9 @@ class SmithLearningModel(SGDFittableMixin):
             over the predictive uncertainty) but is standard practice for
             Laplace-EKF models and sufficient for EM convergence monitoring.
         """
+        validate_count_array(
+            n_correct_responses, "n_correct_responses", allow_empty=False
+        )
         resolved_trial_max_correct = self._resolve_max_possible_correct(
             n_correct_responses
         )
@@ -1582,6 +1619,9 @@ class SmithLearningModel(SGDFittableMixin):
             raise ValueError(
                 f"n_correct_responses must have at least 2 trials, got {len(n_correct_responses)}."
             )
+        validate_count_array(
+            n_correct_responses, "n_correct_responses", allow_empty=False
+        )
 
         log_likelihoods: list[float] = []
         # Snapshot keys: smoother + filter outputs the E-step produces,
@@ -1593,17 +1633,25 @@ class SmithLearningModel(SGDFittableMixin):
             "filtered_prob_correct_response",
             "filtered_learning_state_mode", "filtered_learning_state_variance",
             "filtered_one_step_mode", "filtered_one_step_variance",
+            "smoothed_learning_state_mode", "smoothed_learning_state_variance",
+            "smoothed_prob_correct_response",
             "smoother_gain",
-            "sigma_epsilon", "init_learning_variance",
+            "sigma_epsilon", "init_learning_state", "init_learning_variance",
         )
+        last_accepted_state: dict[str, object] | None = None
+        reached_max_iter = True
+
+        def _capture_state() -> dict[str, object]:
+            return {k: getattr(self, k, None) for k in _snapshot_keys}
+
+        def _restore_state(state: dict[str, object] | None) -> None:
+            if state is None:
+                return
+            for k, v in state.items():
+                if v is not None:
+                    setattr(self, k, v)
 
         for iteration in range(max_iter):
-            # Smoother / filter outputs are not assigned until the
-            # first E-step runs, so use getattr's None default. The
-            # matching `if v is not None` guard in the restore loop
-            # skips uninitialised entries.
-            prev_state = {k: getattr(self, k, None) for k in _snapshot_keys}
-
             current_log_likelihood = self._e_step(n_correct_responses)
             log_likelihoods.append(current_log_likelihood)
 
@@ -1615,6 +1663,7 @@ class SmithLearningModel(SGDFittableMixin):
                 logger.warning(msg)
                 if verbose:
                     print(f"  WARNING: {msg}")
+                reached_max_iter = False
                 break
 
             if iteration > 0:
@@ -1623,9 +1672,7 @@ class SmithLearningModel(SGDFittableMixin):
                 )
 
                 if not is_increasing:
-                    for k, v in prev_state.items():
-                        if v is not None:
-                            setattr(self, k, v)
+                    _restore_state(last_accepted_state)
                     bad_ll = log_likelihoods.pop()
                     msg = (
                         f"LL decreased: {log_likelihoods[-1]:.4f} -> "
@@ -1635,15 +1682,23 @@ class SmithLearningModel(SGDFittableMixin):
                     logger.warning(msg)
                     if verbose:
                         print(f"  WARNING: {msg}")
+                    reached_max_iter = False
                     break
 
                 if is_converged:
                     # Run final M-step to get MLE params, then E-step
                     # so stored smoother results match the converged
                     # params.
+                    last_accepted_state = _capture_state()
                     self._m_step(n_correct_responses)
                     final_ll = self._e_step(n_correct_responses)
-                    log_likelihoods.append(final_ll)
+                    _, final_is_increasing = check_converged(
+                        final_ll, log_likelihoods[-1], tolerance
+                    )
+                    if final_is_increasing and math.isfinite(final_ll):
+                        log_likelihoods.append(final_ll)
+                    else:
+                        _restore_state(last_accepted_state)
                     msg = (
                         f"Converged after {iteration + 1} iterations. "
                         f"sigma_epsilon={self.sigma_epsilon:.4g}"
@@ -1651,8 +1706,10 @@ class SmithLearningModel(SGDFittableMixin):
                     logger.info(msg)
                     if verbose:
                         print(msg)
+                    reached_max_iter = False
                     break
 
+            last_accepted_state = _capture_state()
             self._m_step(n_correct_responses)
 
             change = (
@@ -1672,11 +1729,28 @@ class SmithLearningModel(SGDFittableMixin):
                     f"delta={change:+.4f}"
                 )
 
-        if len(log_likelihoods) == max_iter:
+        if reached_max_iter and len(log_likelihoods) == max_iter:
             msg = "Reached maximum iterations without converging."
             logger.warning(msg)
             if verbose:
                 print(f"  WARNING: {msg}")
+            if log_likelihoods:
+                final_ll = self._e_step(n_correct_responses)
+                _, final_is_increasing = check_converged(
+                    final_ll, log_likelihoods[-1], tolerance
+                )
+                if final_is_increasing and math.isfinite(final_ll):
+                    log_likelihoods.append(final_ll)
+                else:
+                    _restore_state(last_accepted_state)
+                    rollback_msg = (
+                        f"Final E-step after max_iter decreased LL: "
+                        f"{log_likelihoods[-1]:.4f} -> {final_ll:.4f}; "
+                        "rolling back the last M-step."
+                    )
+                    logger.warning(rollback_msg)
+                    if verbose:
+                        print(f"  WARNING: {rollback_msg}")
 
         # Store fit diagnostics
         self.log_likelihood_ = log_likelihoods[-1] if log_likelihoods else None
@@ -1724,10 +1798,15 @@ class SmithLearningModel(SGDFittableMixin):
             raise ValueError(
                 f"Need at least 2 trials, got {len(n_correct_arr)}."
             )
+        validate_count_array(n_correct_arr, "n_correct_responses", allow_empty=False)
         self._n_trials_ = int(n_correct_arr.shape[0])
         self._resolved_max_correct = self._resolve_max_possible_correct(
             n_correct_arr
         )
+        if bool(jnp.any(n_correct_arr > self._resolved_max_correct)):
+            raise ValueError(
+                "n_correct_responses contains values exceeding max_possible_correct."
+            )
 
         return super().fit_sgd(
             n_correct_arr,

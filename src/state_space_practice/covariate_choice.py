@@ -746,7 +746,12 @@ class CovariateChoiceModel(SGDFittableMixin):
             inverse_temperature=self.inverse_temperature,
             decay=self.decay,
         )
-        self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
+        final_ll = float(self._smoother_result.marginal_log_likelihood)
+        if log_likelihoods and np.isclose(final_ll, log_likelihoods[-1]):
+            log_likelihoods[-1] = final_ll
+        else:
+            log_likelihoods.append(final_ll)
+        self.log_likelihood_ = final_ll
         self.n_iter_ = len(log_likelihoods)
         self.log_likelihood_history_ = log_likelihoods
         self._populate_uncertainty(choices_arr)

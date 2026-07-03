@@ -387,6 +387,8 @@ class TestCovariateChoiceModel:
         lls = model.fit(choices, covariates=covariates, max_iter=5)
         assert len(lls) > 0
         assert all(np.isfinite(ll) for ll in lls)
+        np.testing.assert_allclose(lls[-1], model.log_likelihood_)
+        np.testing.assert_allclose(model.log_likelihood_history_[-1], model.log_likelihood_)
 
     def test_is_fitted(self):
         model = CovariateChoiceModel(n_options=3, n_covariates=2)

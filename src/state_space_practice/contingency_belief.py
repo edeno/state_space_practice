@@ -36,8 +36,34 @@ from jax.typing import ArrayLike
 
 
 from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.utils import validate_choice_indices, validate_count_array
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_choices_rewards(
+    choices: ArrayLike,
+    rewards: ArrayLike,
+    n_options: int,
+) -> None:
+    """Validate public discrete observations before JAX integer casts."""
+    choices_np = np.asarray(choices)
+    rewards_np = np.asarray(rewards)
+    if choices_np.ndim != 1:
+        raise ValueError(f"choices must be 1D, got shape {choices_np.shape}.")
+    if rewards_np.ndim != 1:
+        raise ValueError(f"rewards must be 1D, got shape {rewards_np.shape}.")
+    if choices_np.shape[0] != rewards_np.shape[0]:
+        raise ValueError(
+            f"choices and rewards must have the same length, got "
+            f"{choices_np.shape[0]} and {rewards_np.shape[0]}."
+        )
+    if choices_np.shape[0] == 0:
+        raise ValueError("choices and rewards must contain at least one trial.")
+    validate_choice_indices(choices_np, n_options)
+    validate_count_array(rewards_np, "rewards", allow_empty=False)
+    if np.any(rewards_np.astype(float) > 1):
+        raise ValueError("rewards must be binary values in {0, 1}.")
 
 
 class ContingencyBeliefResult(NamedTuple):
@@ -355,7 +381,6 @@ def compute_choice_log_likelihood(
     return log_probs[:, choice_t]
 
 
-@functools.partial(jax.jit, static_argnames=["n_states", "n_options"])
 def contingency_belief_filter(
     choices: ArrayLike,
     rewards: ArrayLike,
@@ -416,6 +441,42 @@ def contingency_belief_filter(
         state_posterior: shape (n_trials, n_states)
         log_likelihood: scalar
     """
+    _validate_choices_rewards(choices, rewards, n_options)
+    choices = jnp.asarray(choices, dtype=jnp.int32)
+    rewards = jnp.asarray(rewards, dtype=jnp.int32)
+    return _contingency_belief_filter_jit(
+        choices=choices,
+        rewards=rewards,
+        n_states=n_states,
+        n_options=n_options,
+        reward_probs=reward_probs,
+        state_values=state_values,
+        inverse_temperature=inverse_temperature,
+        transition_logits=transition_logits,
+        transition_covariates=transition_covariates,
+        transition_weights=transition_weights,
+        init_state_prob=init_state_prob,
+        obs_design_matrix=obs_design_matrix,
+        obs_weights=obs_weights,
+    )
+
+
+@functools.partial(jax.jit, static_argnames=["n_states", "n_options"])
+def _contingency_belief_filter_jit(
+    choices: Array,
+    rewards: Array,
+    n_states: int,
+    n_options: int,
+    reward_probs: Array,
+    state_values: Array,
+    inverse_temperature: float = 1.0,
+    transition_logits: Optional[Array] = None,
+    transition_covariates: Optional[Array] = None,
+    transition_weights: Optional[Array] = None,
+    init_state_prob: Optional[Array] = None,
+    obs_design_matrix: Optional[Array] = None,
+    obs_weights: Optional[Array] = None,
+) -> ContingencyBeliefResult:
     choices = jnp.asarray(choices, dtype=jnp.int32)
     rewards = jnp.asarray(rewards, dtype=jnp.int32)
     n_trials = choices.shape[0]
@@ -516,7 +577,6 @@ class SmootherResult(NamedTuple):
     log_likelihood: Array  # scalar
 
 
-@functools.partial(jax.jit, static_argnames=["n_states", "n_options"])
 def contingency_belief_smoother(
     choices: ArrayLike,
     rewards: ArrayLike,
@@ -547,6 +607,42 @@ def contingency_belief_smoother(
         pairwise_state_prob: shape (n_trials-1, n_states, n_states)
         log_likelihood: scalar
     """
+    _validate_choices_rewards(choices, rewards, n_options)
+    choices = jnp.asarray(choices, dtype=jnp.int32)
+    rewards = jnp.asarray(rewards, dtype=jnp.int32)
+    return _contingency_belief_smoother_jit(
+        choices=choices,
+        rewards=rewards,
+        n_states=n_states,
+        n_options=n_options,
+        reward_probs=reward_probs,
+        state_values=state_values,
+        inverse_temperature=inverse_temperature,
+        transition_logits=transition_logits,
+        transition_covariates=transition_covariates,
+        transition_weights=transition_weights,
+        init_state_prob=init_state_prob,
+        obs_design_matrix=obs_design_matrix,
+        obs_weights=obs_weights,
+    )
+
+
+@functools.partial(jax.jit, static_argnames=["n_states", "n_options"])
+def _contingency_belief_smoother_jit(
+    choices: Array,
+    rewards: Array,
+    n_states: int,
+    n_options: int,
+    reward_probs: Array,
+    state_values: Array,
+    inverse_temperature: float = 1.0,
+    transition_logits: Optional[Array] = None,
+    transition_covariates: Optional[Array] = None,
+    transition_weights: Optional[Array] = None,
+    init_state_prob: Optional[Array] = None,
+    obs_design_matrix: Optional[Array] = None,
+    obs_weights: Optional[Array] = None,
+) -> SmootherResult:
     choices = jnp.asarray(choices, dtype=jnp.int32)
     rewards = jnp.asarray(rewards, dtype=jnp.int32)
     n_trials = choices.shape[0]
@@ -996,6 +1092,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
         -------
         log_likelihoods : list of float
         """
+        _validate_choices_rewards(choices, rewards, self.n_options)
         choices = jnp.asarray(choices, dtype=jnp.int32)
         rewards = jnp.asarray(rewards, dtype=jnp.int32)
         self._n_trials = int(choices.shape[0])
@@ -1026,6 +1123,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
         log_likelihoods: list[float] = []
         prev_ll = float("-inf")
         converged = False
+        params_dirty = False
 
         for iteration in range(max_iter):
             # E-step
@@ -1035,6 +1133,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
             self.smoothed_state_posterior_ = result.smoothed_state_prob
             ll = float(result.log_likelihood)
             log_likelihoods.append(ll)
+            params_dirty = False
 
             if abs(ll - prev_ll) < tolerance and iteration > 0:
                 logger.info(f"Converged at iteration {iteration + 1}")
@@ -1044,6 +1143,14 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
             # M-step
             self._m_step(choices, rewards, result)
+            params_dirty = True
+
+        if params_dirty and log_likelihoods:
+            kwargs = self._smoother_kwargs(choices, rewards)
+            result = contingency_belief_smoother(**kwargs)
+            self._smoother_result = result
+            self.smoothed_state_posterior_ = result.smoothed_state_prob
+            log_likelihoods.append(float(result.log_likelihood))
 
         self.log_likelihood_ = log_likelihoods[-1]
         self.log_likelihood_history_ = log_likelihoods
@@ -1119,6 +1226,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
         Always builds a fresh design matrix from the input length — does
         not reuse the training design matrix.
         """
+        _validate_choices_rewards(choices, rewards, self.n_options)
         choices = jnp.asarray(choices, dtype=jnp.int32)
         rewards = jnp.asarray(rewards, dtype=jnp.int32)
         n_trials = int(choices.shape[0])
@@ -1160,6 +1268,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
         SGD learns all parameters: reward_probs, state_values,
         inverse_temperature, transition_coefficients, and obs_weights.
         """
+        _validate_choices_rewards(choices, rewards, self.n_options)
         choices = jnp.asarray(choices, dtype=jnp.int32)
         rewards = jnp.asarray(rewards, dtype=jnp.int32)
         self._n_trials = int(choices.shape[0])
@@ -1259,7 +1368,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
             kwargs["obs_design_matrix"] = self._obs_design_matrix
             kwargs["obs_weights"] = params["obs_weights"]
 
-        result = contingency_belief_filter(**kwargs)
+        result = _contingency_belief_filter_jit(**kwargs)
         return -result.log_likelihood
 
     def _store_sgd_params(self, params: dict) -> None:

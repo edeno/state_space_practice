@@ -54,7 +54,7 @@ from state_space_practice.point_process_kalman import (
     stochastic_point_process_smoother,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import check_converged
+from state_space_practice.utils import check_converged, validate_count_array
 
 logger = logging.getLogger(__name__)
 
@@ -1146,11 +1146,7 @@ class PlaceFieldModel(SGDFittableMixin):
                 f"spikes must be 1D (n_time,) or 2D (n_time, n_neurons), "
                 f"got shape {spikes.shape}."
             )
-        if jnp.any(spikes < 0):
-            raise ValueError(
-                "spikes must be non-negative counts. Got negative values. "
-                "If you have continuous rates, bin them first."
-            )
+        validate_count_array(spikes, "spikes", allow_empty=False)
         if position.shape[0] != spikes.shape[0]:
             raise ValueError(
                 f"position and spikes must have the same number of time bins: "
@@ -1207,15 +1203,30 @@ class PlaceFieldModel(SGDFittableMixin):
         )
 
         self.log_likelihoods = []
+        last_accepted_state: dict[str, object] | None = None
+
+        def _capture_state() -> dict[str, object]:
+            return {
+                "smoother_mean": self.smoother_mean,
+                "smoother_cov": self.smoother_cov,
+                "smoother_cross_cov": self.smoother_cross_cov,
+                "filtered_mean": self.filtered_mean,
+                "filtered_cov": self.filtered_cov,
+                "transition_matrix": self.transition_matrix,
+                "process_cov": self.process_cov,
+                "init_mean": self.init_mean,
+                "init_cov": self.init_cov,
+                "_block_n_neurons": self._block_n_neurons,
+                "_block_size": self._block_size,
+            }
+
+        def _restore_state(state: dict[str, object] | None) -> None:
+            if state is None:
+                return
+            for key, value in state.items():
+                setattr(self, key, value)
 
         for iteration in range(max_iter):
-            # Save previous state so we can roll back on LL decrease
-            prev_smoother_mean = self.smoother_mean
-            prev_smoother_cov = self.smoother_cov
-            prev_smoother_cross_cov = self.smoother_cross_cov
-            prev_filtered_mean = self.filtered_mean
-            prev_filtered_cov = self.filtered_cov
-
             ll = self._e_step(design_matrix, spikes)
             self.log_likelihoods.append(ll)
 
@@ -1231,11 +1242,7 @@ class PlaceFieldModel(SGDFittableMixin):
                 )
                 if not is_increasing:
                     # Roll back to the previous (better) state
-                    self.smoother_mean = prev_smoother_mean
-                    self.smoother_cov = prev_smoother_cov
-                    self.smoother_cross_cov = prev_smoother_cross_cov
-                    self.filtered_mean = prev_filtered_mean
-                    self.filtered_cov = prev_filtered_cov
+                    _restore_state(last_accepted_state)
                     # Remove the bad LL so log_likelihoods[-1] matches
                     # the stored model state (used by bic/aic/summary).
                     bad_ll = self.log_likelihoods.pop()
@@ -1251,6 +1258,10 @@ class PlaceFieldModel(SGDFittableMixin):
                     _print(f"  Converged after {iteration + 1} iterations.")
                     break
 
+            # The E-step is accepted. Snapshot both posterior state and
+            # parameters before mutating parameters in the M-step, so a
+            # later rejected E-step can restore the fitted pair coherently.
+            last_accepted_state = _capture_state()
             self._m_step()
             # Re-detect block structure after the M-step, unconditionally.
             # The primary case where the M-step can break block-
@@ -1275,6 +1286,22 @@ class PlaceFieldModel(SGDFittableMixin):
             )
             _print(f"  WARNING: {msg}")
             logger.warning(msg)
+            if self.log_likelihoods:
+                final_ll = self._e_step(design_matrix, spikes)
+                is_converged, is_increasing = check_converged(
+                    final_ll, self.log_likelihoods[-1], tolerance
+                )
+                if is_increasing and np.isfinite(final_ll):
+                    self.log_likelihoods.append(final_ll)
+                else:
+                    _restore_state(last_accepted_state)
+                    rollback_msg = (
+                        f"Final E-step after max_iter decreased LL: "
+                        f"{self.log_likelihoods[-1]:.1f} -> {final_ll:.1f}; "
+                        "rolling back the last M-step."
+                    )
+                    _print(f"  WARNING: {rollback_msg}")
+                    logger.warning(rollback_msg)
 
         # Saturation diagnostic: post-hoc check on the final filtered posterior.
         # Runs after fit completes so a substantial fraction of clipped bins
@@ -1340,6 +1367,12 @@ class PlaceFieldModel(SGDFittableMixin):
         spikes = jnp.asarray(spikes)
         if spikes.ndim == 1:
             spikes = spikes[:, None]
+        if spikes.ndim != 2:
+            raise ValueError(
+                f"spikes must be 1D (n_time,) or 2D (n_time, n_neurons), "
+                f"got shape {spikes.shape}."
+            )
+        validate_count_array(spikes, "spikes", allow_empty=False)
 
         self._sgd_n_time = spikes.shape[0]
         self.n_neurons = spikes.shape[1]
@@ -1728,6 +1761,7 @@ class PlaceFieldModel(SGDFittableMixin):
                     f"Expected {self.n_neurons} spike columns (matching fitted "
                     f"n_neurons), got {spikes.shape[1]}."
                 )
+        validate_count_array(spikes, "spikes", allow_empty=False)
         if position.shape[0] != spikes.shape[0]:
             raise ValueError(
                 f"position and spikes must have the same number of time bins: "
