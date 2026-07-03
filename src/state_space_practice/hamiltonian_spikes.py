@@ -141,7 +141,7 @@ class HamiltonianSpikeModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         _, (m_f, P_f, m_p, P_p, F) = jax.lax.scan(forward_step, (m0, P0), spikes)
         return ekf_rts_backward_pass(m_f, P_f, m_p, P_p, F)
 
-    def fit_sgd(
+    def fit_sgd(  # type: ignore[override]
         self,
         observations: Array,
         key: Array | None = None,
@@ -203,11 +203,22 @@ class HamiltonianSpikeModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
 
         return lik_loss + l2_reg * mlp_l2_penalty(params["mlp"])
 
+    def fit(self, *args, **kwargs):
+        """Hamiltonian models do not support linear EM."""
+        raise NotImplementedError(
+            "HamiltonianSpikeModel does not support the linear EM path "
+            "(fit()). Please use fit_sgd() for non-linear optimization."
+        )
+
     def _store_sgd_params(self, params: Dict[str, Any]) -> None:
         self.mlp_params = params["mlp"]
         self.omega = params["omega"]
         self.C = params["C"]
         self.d = params["d"]
+        self.measurement_matrix = (
+            jnp.zeros((self.n_sources, self.n_cont_states, 1))
+            .at[:, :, 0].set(self.C)
+        )
         self.init_mean = self.init_mean.at[:, 0].set(params["init_mean"])
         if "Q" in params:
             self.process_cov = jnp.stack(

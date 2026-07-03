@@ -42,6 +42,20 @@ class TestHamiltonianSpikeModelSmoke:
         assert jnp.all(jnp.isfinite(m_s)), "Smoothed means contain non-finite values"
         assert m_s.shape[0] == spikes.shape[0]
 
+    def test_fit_raises_not_implemented(self, model_and_data):
+        model, spikes = model_and_data
+        with pytest.raises(NotImplementedError, match="fit_sgd"):
+            model.fit(spikes, max_iter=1, skip_init=True)
+
+    def test_store_sgd_params_resyncs_measurement_matrix(self, model_and_data):
+        model, _ = model_and_data
+        params, _ = model._build_param_spec()
+        params["C"] = jnp.ones_like(model.C) * 0.25
+
+        model._store_sgd_params(params)
+
+        assert jnp.allclose(model.measurement_matrix[:, :, 0], model.C)
+
 
 class TestHamiltonianSpikeMultiOscillator:
     """Tests for n_oscillators > 1."""

@@ -83,6 +83,18 @@ class TestSwitchingHamiltonianSmooth:
 
         assert jnp.allclose(pi_smooth[-1], pi_filt[-1], atol=1e-6)
 
+    def test_finalize_populates_decode_api(self, switching_model, synthetic_data):
+        """fit/finalize should populate the attributes inherited decode() uses."""
+        lfp, spikes = synthetic_data
+
+        switching_model._finalize_sgd(lfp, spikes)
+
+        decoded = switching_model.decode()
+        probs = switching_model.predict_proba()
+        assert decoded.shape == (lfp.shape[0],)
+        assert probs.shape == (lfp.shape[0], switching_model.n_discrete_states)
+        assert jnp.allclose(probs, switching_model.smoothed_discrete_probs_)
+
     def test_smooth_sensitive_to_transition_asymmetry(self, switching_model, synthetic_data, params):
         """Smoother output should change when transition matrix changes,
         confirming Jacobian weighting uses actual probabilities."""

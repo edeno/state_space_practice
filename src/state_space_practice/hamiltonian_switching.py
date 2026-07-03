@@ -349,11 +349,13 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         params: Dict[str, Any],
         lfp_data: Array,
         spike_data: Array,
+        use_filter: bool = True,
+        l2_reg: float = 1e-4,
         **kwargs,
     ) -> Array:
         _, _, _, marginal_lls = self.filter(lfp_data, spike_data, params)
         lik_loss = -jnp.sum(marginal_lls)
-        return lik_loss + kwargs.get("l2_reg", 1e-4) * mlp_l2_penalty(params["mlp"])
+        return lik_loss + l2_reg * mlp_l2_penalty(params["mlp"])
 
     def fit(self, *args, **kwargs):
         """Hamiltonian models do not support linear EM."""
@@ -399,3 +401,6 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         self.smoothed_means_ = sm_means
         self.smoothed_covs_ = sm_covs
         self.smoothed_discrete_probs_ = sm_probs
+        self.smoother_state_cond_mean = sm_means
+        self.smoother_state_cond_cov = sm_covs
+        self.smoother_discrete_state_prob = sm_probs
