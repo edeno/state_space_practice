@@ -44,8 +44,8 @@ class TestWaldTest:
         assert W[0, 0] < 0.5  # guard: genuinely in the null regime, not just p>0.5
         assert pval[0, 0] > 0.5
 
-    def test_degenerate_variance_guard(self, make_coupling_posterior):
-        """Zero variance must not divide-by-zero: W=0, p=1, no NaN."""
+    def test_zero_variance_nonzero_mean_is_significant(self, make_coupling_posterior):
+        """Zero variance floors denominator without erasing a strong signal."""
         post = make_coupling_posterior(
             beta_real_mean=[[0.5]],
             beta_imag_mean=[[0.5]],
@@ -53,9 +53,32 @@ class TestWaldTest:
             beta_imag_var=[[0.0]],
         )
         W, pval = wald_test(post)
+        assert W[0, 0] > 1e9
+        assert pval[0, 0] < 1e-12
+        assert not np.isnan(pval[0, 0])
+
+    def test_zero_variance_zero_mean_is_null(self, make_coupling_posterior):
+        """Zero variance at exactly zero mean remains a null result."""
+        post = make_coupling_posterior(
+            beta_real_mean=[[0.0]],
+            beta_imag_mean=[[0.0]],
+            beta_real_var=[[0.0]],
+            beta_imag_var=[[0.0]],
+        )
+        W, pval = wald_test(post)
         assert W[0, 0] == 0.0
         assert pval[0, 0] == 1.0
         assert not np.isnan(pval[0, 0])
+
+    def test_rejects_negative_variance(self, make_coupling_posterior):
+        post = make_coupling_posterior(
+            beta_real_mean=[[0.0]],
+            beta_imag_mean=[[0.0]],
+            beta_real_var=[[-1.0]],
+            beta_imag_var=[[1.0]],
+        )
+        with pytest.raises(ValueError, match="variance"):
+            wald_test(post)
 
 
 class TestDetectionMetrics:

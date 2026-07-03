@@ -23,6 +23,7 @@ from state_space_practice.coupling_model import (
     CouplingModelParams,
     deinterleave_coupling,
     smooth_latent_from_lfp,
+    validate_coupling_observations,
     validate_coupling_params,
 )
 from state_space_practice.coupling_validation import CouplingPosterior
@@ -63,21 +64,33 @@ def fit_coupling_ekf(
         :mod:`coupling_validation`.
     """
     validate_coupling_params(params)
-    spikes = jnp.asarray(spikes)
-    lfp = jnp.asarray(lfp)
     n_latent = 2 * int(np.shape(params.osc_frequencies)[0])
     n_neurons = int(np.shape(params.beta_real)[0])
-
-    # Cross-check shapes so a mismatch raises rather than silently broadcasting or
-    # dropping neurons (e.g. extra spike columns going unfit).
-    if spikes.ndim != 2 or spikes.shape[1] != n_neurons:
+    spikes_np, lfp_np = validate_coupling_observations(
+        spikes, lfp, n_neurons=n_neurons, n_latent=n_latent
+    )
+    sigma_beta_arr = np.asarray(sigma_beta)
+    if (
+        sigma_beta_arr.shape != ()
+        or not np.issubdtype(sigma_beta_arr.dtype, np.number)
+        or np.issubdtype(sigma_beta_arr.dtype, np.complexfloating)
+    ):
+        raise ValueError(f"sigma_beta must be finite and positive, got {sigma_beta}.")
+    sigma_beta_float = float(sigma_beta_arr)
+    if not np.isfinite(sigma_beta_float) or sigma_beta_float <= 0.0:
+        raise ValueError(f"sigma_beta must be finite and positive, got {sigma_beta}.")
+    max_iter_arr = np.asarray(max_newton_iter)
+    if (
+        max_iter_arr.shape != ()
+        or not np.issubdtype(max_iter_arr.dtype, np.integer)
+        or int(max_iter_arr) <= 0
+    ):
         raise ValueError(
-            f"spikes must have shape (T, {n_neurons}); got {tuple(spikes.shape)}"
+            "max_newton_iter must be a positive integer, "
+            f"got {max_newton_iter}."
         )
-    if lfp.shape != (spikes.shape[0], n_latent):
-        raise ValueError(
-            f"lfp must have shape ({spikes.shape[0]}, {n_latent}); got {tuple(lfp.shape)}"
-        )
+    spikes = jnp.asarray(spikes_np)
+    lfp = jnp.asarray(lfp_np)
 
     # Stage 1: Kalman-smooth the latent from the LFP (shared with the PG estimator).
     smoothed_latent = smooth_latent_from_lfp(lfp, params)
@@ -86,7 +99,7 @@ def fit_coupling_ekf(
     # eta(beta) = baseline + smoothed_latent @ beta is linear in beta, so its
     # Jacobian is the constant design smoothed_latent (passed to skip jacfwd).
     prior_mean = jnp.zeros(n_latent)
-    prior_cov = sigma_beta**2 * jnp.eye(n_latent)
+    prior_cov = sigma_beta_float**2 * jnp.eye(n_latent)
 
     def constant_jacobian(_beta):
         return smoothed_latent
@@ -106,7 +119,7 @@ def fit_coupling_ekf(
             eta,
             BERNOULLI_LOGIT_FAMILY,
             grad_eta_func=constant_jacobian,
-            max_newton_iter=max_newton_iter,
+            max_newton_iter=int(max_iter_arr),
         )
         means.append(beta_mean)
         variances.append(jnp.diag(beta_cov))

@@ -30,6 +30,21 @@ class TestGuards:
         with pytest.raises(ValueError, match="lfp_noise_var"):
             fit_coupling_ekf(sim.spikes, sim.lfp, bad)
 
+    @pytest.mark.parametrize("bad_value", [0.5, -1.0, 2.0, np.nan])
+    def test_rejects_invalid_spike_values(self, coupling_params_small, bad_value):
+        sim = simulate_coupling(coupling_params_small, n_time=200, seed=0)
+        spikes = np.asarray(sim.spikes).copy()
+        spikes[0, 0] = bad_value
+        with pytest.raises(ValueError, match="0/1"):
+            fit_coupling_ekf(spikes, sim.lfp, coupling_params_small)
+
+    def test_rejects_nonfinite_lfp(self, coupling_params_small):
+        sim = simulate_coupling(coupling_params_small, n_time=200, seed=0)
+        lfp = np.asarray(sim.lfp).copy()
+        lfp[0, 0] = np.nan
+        with pytest.raises(ValueError, match="lfp"):
+            fit_coupling_ekf(sim.spikes, lfp, coupling_params_small)
+
 
 class TestMechanics:
     def test_returns_valid_posterior(self, coupling_params_small):

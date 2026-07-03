@@ -48,6 +48,21 @@ class TestGuards:
         with pytest.raises(ValueError, match="lfp_noise_var"):
             fit_coupling_pg(sim.spikes, sim.lfp, bad, n_iter=10, burn_in=5)
 
+    def test_rejects_invalid_observation_values(self, coupling_params_small):
+        sim = simulate_coupling(coupling_params_small, n_time=200, seed=0)
+        spikes = np.asarray(sim.spikes).copy()
+        spikes[0, 0] = 0.5
+        lfp = np.asarray(sim.lfp).copy()
+        lfp[0, 0] = np.nan
+        with pytest.raises(ValueError, match="0/1"):
+            fit_coupling_pg(
+                spikes, sim.lfp, coupling_params_small, n_iter=10, burn_in=5
+            )
+        with pytest.raises(ValueError, match="lfp"):
+            fit_coupling_pg(
+                sim.spikes, lfp, coupling_params_small, n_iter=10, burn_in=5
+            )
+
 
 class TestMechanics:
     def test_returns_posterior_with_samples(self, coupling_params_small):

@@ -1,5 +1,6 @@
 """Tests for the EKF-vs-PG cross-check harness."""
 
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -52,6 +53,35 @@ class TestScore:
         sim = _fake_sim([[5.0]], [[0.0]], [[True]])
         s = _score(post, sim)
         assert s["coverage95"] == 0.5  # real component missed, imag covered
+
+    def test_all_null_mask_is_quietly_undefined(self):
+        """A zero-coupling sweep has no coupled-entry bias to average."""
+        post = CouplingPosterior(
+            beta_real_mean=np.zeros((2, 2)),
+            beta_imag_mean=np.zeros((2, 2)),
+            beta_real_var=np.ones((2, 2)),
+            beta_imag_var=np.ones((2, 2)),
+            samples=None,
+        )
+        sim = _fake_sim(
+            beta_real_true=np.zeros((2, 2)),
+            beta_imag_true=np.zeros((2, 2)),
+            mask=np.zeros((2, 2), dtype=bool),
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            score = _score(post, sim)
+            out = aggregate([
+                {
+                    "coupling_mag": 0.0,
+                    "replicate": 0,
+                    "ekf": score,
+                    "pg": score,
+                    "ekf_pg_mean_maxdiff": 0.0,
+                }
+            ])
+        assert np.isnan(score["abs_bias"])
+        assert np.isnan(out[0.0]["ekf"]["abs_bias"])
 
 
 class TestAggregate:

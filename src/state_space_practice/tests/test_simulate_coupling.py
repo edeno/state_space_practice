@@ -293,6 +293,17 @@ class TestValidation:
         with pytest.raises(ValueError, match="process_noise_var"):
             simulate_coupling(bad, n_time=100, seed=0)
 
+    @pytest.mark.parametrize(
+        "process_noise_var",
+        [jnp.array([jnp.nan, 0.02]), jnp.array([jnp.inf, 0.02])],
+    )
+    def test_rejects_nonfinite_process_noise(
+        self, coupling_params_small, process_noise_var
+    ):
+        bad = coupling_params_small._replace(process_noise_var=process_noise_var)
+        with pytest.raises(ValueError, match="process_noise_var"):
+            validate_coupling_params(bad)
+
     def test_rejects_shape_mismatch(self, coupling_params_small):
         # baseline length 1 but S = 3: previously broadcast silently
         bad = coupling_params_small._replace(baseline=jnp.zeros((1,)))
@@ -305,6 +316,10 @@ class TestValidation:
                 coupling_params_small._replace(dt=0.0), n_time=100, seed=0
             )
 
+    def test_rejects_nonfinite_dt(self, coupling_params_small):
+        with pytest.raises(ValueError, match="dt"):
+            validate_coupling_params(coupling_params_small._replace(dt=float("inf")))
+
     def test_rejects_nonpositive_n_time(self, coupling_params_small):
         with pytest.raises(ValueError, match="n_time"):
             simulate_coupling(coupling_params_small, n_time=0, seed=0)
@@ -313,4 +328,10 @@ class TestValidation:
         with pytest.raises(ValueError, match="lfp_noise_var"):
             simulate_coupling(
                 coupling_params_small._replace(lfp_noise_var=0.0), n_time=100, seed=0
+            )
+
+    def test_rejects_nonfinite_lfp_noise(self, coupling_params_small):
+        with pytest.raises(ValueError, match="lfp_noise_var"):
+            validate_coupling_params(
+                coupling_params_small._replace(lfp_noise_var=float("inf"))
             )

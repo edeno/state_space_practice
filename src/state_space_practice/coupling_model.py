@@ -128,8 +128,18 @@ def validate_coupling_params(params: CouplingModelParams) -> None:
     ValueError
         If any invariant is violated, with a message naming the offending field.
     """
-    n_bands = int(np.shape(params.osc_frequencies)[0])
-    n_neurons = int(np.shape(params.beta_real)[0])
+    freq_shape = tuple(np.shape(params.osc_frequencies))
+    beta_real_shape = tuple(np.shape(params.beta_real))
+    if len(freq_shape) != 1 or freq_shape[0] == 0:
+        raise ValueError(
+            f"osc_frequencies must have shape (J,), got {freq_shape}."
+        )
+    if len(beta_real_shape) != 2 or 0 in beta_real_shape:
+        raise ValueError(
+            f"beta_real must have shape (S, J), got {beta_real_shape}."
+        )
+    n_bands = int(freq_shape[0])
+    n_neurons = int(beta_real_shape[0])
     expected_shapes = {
         "osc_frequencies": ((n_bands,), params.osc_frequencies),
         "osc_decay": ((n_bands,), params.osc_decay),
@@ -144,6 +154,14 @@ def validate_coupling_params(params: CouplingModelParams) -> None:
                 f"{name} has shape {tuple(np.shape(arr))}, expected {shape} "
                 f"(S={n_neurons}, J={n_bands})"
             )
+        arr_np = np.asarray(arr)
+        if (
+            not np.issubdtype(arr_np.dtype, np.number)
+            or np.issubdtype(arr_np.dtype, np.complexfloating)
+        ):
+            raise ValueError(f"{name} must be real-valued numeric data.")
+        if not np.all(np.isfinite(arr_np)):
+            raise ValueError(f"{name} contains non-finite values")
 
     decay = np.asarray(params.osc_decay)
     if not np.all((decay > 0.0) & (decay < 1.0)):
@@ -153,13 +171,65 @@ def validate_coupling_params(params: CouplingModelParams) -> None:
         )
     if np.any(np.asarray(params.process_noise_var) < 0.0):
         raise ValueError("process_noise_var must be nonnegative")
-    if not params.dt > 0.0:
-        raise ValueError(f"dt must be positive, got {params.dt}")
-    if not params.lfp_noise_var > 0.0:
-        raise ValueError(f"lfp_noise_var must be positive, got {params.lfp_noise_var}")
-    for name in ("osc_frequencies", "beta_real", "beta_imag", "baseline"):
-        if not np.all(np.isfinite(np.asarray(getattr(params, name)))):
-            raise ValueError(f"{name} contains non-finite values")
+    for name, value in (
+        ("dt", params.dt),
+        ("lfp_noise_var", params.lfp_noise_var),
+    ):
+        value_arr = np.asarray(value)
+        if (
+            value_arr.shape != ()
+            or not np.issubdtype(value_arr.dtype, np.number)
+            or np.issubdtype(value_arr.dtype, np.complexfloating)
+        ):
+            raise ValueError(f"{name} must be a real-valued numeric scalar, got {value}.")
+        value_float = float(value_arr)
+        if not np.isfinite(value_float) or value_float <= 0.0:
+            raise ValueError(f"{name} must be finite and positive, got {value}.")
+
+
+def validate_coupling_observations(
+    spikes: ArrayLike,
+    lfp: ArrayLike,
+    *,
+    n_neurons: int,
+    n_latent: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Validate spike/LFP arrays shared by coupling estimators."""
+    spikes_np = np.asarray(spikes)
+    if spikes_np.ndim != 2 or spikes_np.shape[1] != n_neurons:
+        raise ValueError(
+            f"spikes must have shape (T, {n_neurons}); got {tuple(spikes_np.shape)}"
+        )
+    if spikes_np.shape[0] == 0:
+        raise ValueError("spikes and lfp must contain at least one time bin.")
+    if not (
+        (
+            np.issubdtype(spikes_np.dtype, np.number)
+            and not np.issubdtype(spikes_np.dtype, np.complexfloating)
+        )
+        or np.issubdtype(spikes_np.dtype, np.bool_)
+    ):
+        raise ValueError("spikes must be finite 0/1 indicators")
+    spikes_float = spikes_np.astype(float)
+    if not np.all(np.isfinite(spikes_float)) or not np.all(
+        (spikes_float == 0.0) | (spikes_float == 1.0)
+    ):
+        raise ValueError("spikes must be finite 0/1 indicators")
+
+    lfp_np = np.asarray(lfp)
+    if lfp_np.shape != (spikes_np.shape[0], n_latent):
+        raise ValueError(
+            f"lfp must have shape ({spikes_np.shape[0]}, {n_latent}); "
+            f"got {tuple(lfp_np.shape)}"
+        )
+    if not np.issubdtype(lfp_np.dtype, np.number) or np.issubdtype(
+        lfp_np.dtype, np.complexfloating
+    ):
+        raise ValueError("lfp must be finite")
+    lfp_float = lfp_np.astype(float)
+    if not np.all(np.isfinite(lfp_float)):
+        raise ValueError("lfp must be finite")
+    return spikes_float, lfp_float
 
 
 def build_transition(params: CouplingModelParams) -> tuple[Array, Array]:

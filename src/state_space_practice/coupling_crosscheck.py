@@ -60,18 +60,21 @@ def _score(post: CouplingPosterior, sim) -> dict:
         np.mean(np.concatenate([covered_real.ravel(), covered_imag.ravel()]))
     )
 
-    abs_bias = float(
-        np.mean(
-            np.abs(
-                np.concatenate(
-                    [
-                        (np.asarray(post.beta_real_mean) - true_real)[mask],
-                        (np.asarray(post.beta_imag_mean) - true_imag)[mask],
-                    ]
+    if mask.any():
+        abs_bias = float(
+            np.mean(
+                np.abs(
+                    np.concatenate(
+                        [
+                            (np.asarray(post.beta_real_mean) - true_real)[mask],
+                            (np.asarray(post.beta_imag_mean) - true_imag)[mask],
+                        ]
+                    )
                 )
             )
         )
-    )
+    else:
+        abs_bias = float("nan")
     width_real = summary["beta_real_ci_upper"] - summary["beta_real_ci_lower"]
     width_imag = summary["beta_imag_ci_upper"] - summary["beta_imag_ci_lower"]
     ci_width = float(np.mean(np.concatenate([width_real.ravel(), width_imag.ravel()])))
@@ -193,8 +196,17 @@ def aggregate(records: list[dict]) -> dict:
         }
         for method in ("ekf", "pg"):
             summary[method] = {
-                metric: float(np.nanmean([c[method][metric] for c in cell]))
+                metric: _mean_ignore_nan([c[method][metric] for c in cell])
                 for metric in cell[0][method]
             }
         out[mag] = summary
     return out
+
+
+def _mean_ignore_nan(values) -> float:
+    """Mean of finite values, or NaN when every value is undefined."""
+    values = np.asarray(values, dtype=float)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return float("nan")
+    return float(np.mean(finite))

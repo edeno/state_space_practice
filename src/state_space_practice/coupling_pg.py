@@ -31,6 +31,7 @@ from scipy.linalg import cho_factor, cho_solve, solve_triangular
 from state_space_practice.coupling_model import (
     CouplingModelParams,
     smooth_latent_from_lfp,
+    validate_coupling_observations,
     validate_coupling_params,
 )
 from state_space_practice.coupling_validation import CouplingPosterior
@@ -76,26 +77,24 @@ def fit_coupling_pg(
         )
     n_latent = 2 * int(np.shape(params.osc_frequencies)[0])
     n_neurons = int(np.shape(params.beta_real)[0])
-
-    spikes = np.asarray(spikes, dtype=float)
-    if spikes.ndim != 2 or spikes.shape[1] != n_neurons:
-        raise ValueError(
-            f"spikes must have shape (T, {n_neurons}); got {tuple(spikes.shape)}"
-        )
-    if not np.all(np.isfinite(spikes)) or not np.all((spikes == 0) | (spikes == 1)):
-        raise ValueError("spikes must be finite 0/1 indicators")
-    lfp = np.asarray(lfp, dtype=float)
-    if lfp.shape != (spikes.shape[0], n_latent):
-        raise ValueError(
-            f"lfp must have shape ({spikes.shape[0]}, {n_latent}); got {tuple(lfp.shape)}"
-        )
-    if not np.all(np.isfinite(lfp)):
-        raise ValueError("lfp must be finite")
+    spikes, lfp = validate_coupling_observations(
+        spikes, lfp, n_neurons=n_neurons, n_latent=n_latent
+    )
+    sigma_beta_arr = np.asarray(sigma_beta)
+    if (
+        sigma_beta_arr.shape != ()
+        or not np.issubdtype(sigma_beta_arr.dtype, np.number)
+        or np.issubdtype(sigma_beta_arr.dtype, np.complexfloating)
+    ):
+        raise ValueError(f"sigma_beta must be finite and positive, got {sigma_beta}.")
+    sigma_beta_float = float(sigma_beta_arr)
+    if not np.isfinite(sigma_beta_float) or sigma_beta_float <= 0.0:
+        raise ValueError(f"sigma_beta must be finite and positive, got {sigma_beta}.")
 
     # Stage 1: LFP-smoothed latent (shared design with the EKF estimator).
     design = np.asarray(smooth_latent_from_lfp(lfp, params))  # (T, n_latent)
     baseline = np.asarray(params.baseline, dtype=float)
-    prior_precision = np.eye(n_latent) / sigma_beta**2
+    prior_precision = np.eye(n_latent) / sigma_beta_float**2
     rng = np.random.default_rng(seed)
     n_kept = n_iter - burn_in
     samples = np.empty((n_kept, n_neurons, n_latent))  # interleaved design rows

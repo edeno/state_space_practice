@@ -27,8 +27,9 @@ from state_space_practice.circular_stats import angular_distance
 
 logger = logging.getLogger(__name__)
 
-# Variance below this is treated as degenerate: the corresponding Wald term is
-# dropped (W contribution 0, p-value 1) rather than dividing by ~0.
+# Variance below this is floored in Wald denominators. Zero mean with zero
+# variance remains null, while a nonzero collapsed estimate remains significant
+# instead of being silently converted to p=1.
 _MIN_VARIANCE = 1e-12
 
 
@@ -65,9 +66,9 @@ def wald_test(
 
         W = beta_real_mean**2 / beta_real_var + beta_imag_mean**2 / beta_imag_var
 
-    which is chi-squared(2) under the null of no coupling. A component whose
-    variance is below ``_MIN_VARIANCE`` is treated as degenerate (its term is
-    dropped, ``W`` set to 0 and the p-value to 1) rather than dividing by ~0.
+    which is chi-squared(2) under the null of no coupling. Variances below
+    ``_MIN_VARIANCE`` are floored per component rather than dropped; this avoids
+    division by zero without turning strong collapsed estimates into nulls.
 
     Parameters
     ----------
@@ -87,13 +88,23 @@ def wald_test(
     vr = np.asarray(posterior.beta_real_var, dtype=float)
     vi = np.asarray(posterior.beta_imag_var, dtype=float)
 
-    degenerate = (vr < _MIN_VARIANCE) | (vi < _MIN_VARIANCE)
-    safe_vr = np.where(vr < _MIN_VARIANCE, 1.0, vr)
-    safe_vi = np.where(vi < _MIN_VARIANCE, 1.0, vi)
+    if not (mr.shape == mi.shape == vr.shape == vi.shape):
+        raise ValueError("posterior mean and variance arrays must have matching shapes")
+    for name, arr in (
+        ("beta_real_mean", mr),
+        ("beta_imag_mean", mi),
+        ("beta_real_var", vr),
+        ("beta_imag_var", vi),
+    ):
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"{name} must contain only finite values")
+    if np.any(vr < 0.0) or np.any(vi < 0.0):
+        raise ValueError("posterior variances must be non-negative")
+
+    safe_vr = np.maximum(vr, _MIN_VARIANCE)
+    safe_vi = np.maximum(vi, _MIN_VARIANCE)
     W = mr**2 / safe_vr + mi**2 / safe_vi
-    W = np.where(degenerate, 0.0, W)
     pval = stats.chi2.sf(W, df=2)
-    pval = np.where(degenerate, 1.0, pval)
     return W, pval
 
 
