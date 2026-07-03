@@ -548,3 +548,42 @@ class TestProjectCoupledTransitionMatrixPathological:
         ])
         result = project_coupled_transition_matrix(A)
         assert jnp.all(jnp.isfinite(result))
+
+    def test_finite_input_emits_no_false_fallback_warning(self, capfd) -> None:
+        """A finite input must not emit the non-finite fallback telemetry.
+
+        The per-block ``debug_print_if`` used to live inside
+        ``_project_to_closest_rotation``, which runs under ``jax.vmap`` where
+        ``lax.cond`` lowers to ``select`` and both branches execute -- so the
+        "non-finite" warning fired for every block on every call, even on
+        perfectly finite input. Capture at the fd level (``capfd``) because
+        ``jax.debug.print`` writes past ``sys.stdout``.
+        """
+        A = jnp.array([
+            [0.9, -0.3, 0.05, 0.0],
+            [0.3, 0.9, 0.0, 0.05],
+            [0.05, 0.0, 0.8, -0.2],
+            [0.0, 0.05, 0.2, 0.8],
+        ])
+        assert jnp.all(jnp.isfinite(A))  # guard: input is finite
+        capfd.readouterr()  # drop anything buffered before the call
+        result = project_coupled_transition_matrix(A)
+        result.block_until_ready()
+        jax.effects_barrier()  # flush pending jax.debug.print effects
+        captured = capfd.readouterr()
+        assert "non-finite" not in (captured.out + captured.err).lower(), (
+            "finite input should not emit any non-finite fallback warning; "
+            f"got: {captured.out + captured.err!r}"
+        )
+
+    def test_nonfinite_input_emits_fallback_warning(self, capfd) -> None:
+        """A non-finite input must still emit exactly the fail-loud signal."""
+        A = jnp.eye(4).at[0, 0].set(jnp.nan)
+        capfd.readouterr()
+        result = project_coupled_transition_matrix(A)
+        result.block_until_ready()
+        jax.effects_barrier()
+        captured = capfd.readouterr()
+        assert "non-finite" in (captured.out + captured.err).lower(), (
+            "non-finite input should emit the damped-identity fallback warning"
+        )

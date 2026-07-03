@@ -556,23 +556,37 @@ def _project_to_closest_rotation(matrix: jax.Array) -> jax.Array:
     # Frobenius norm / sqrt(2) gives the RMS singular value, which is the
     # ideal scale for a 2x2 scaled rotation. Downstream spectral radius
     # clamping will correct the scale if needed.
+    #
+    # This helper is PURE (no telemetry): it runs under ``jax.vmap`` (see
+    # ``project_coupled_transition_matrix``), where ``lax.cond`` lowers to
+    # ``select`` and both branches execute, so a per-block ``debug_print_if``
+    # here fires on every lane regardless of the predicate. The fallback signal
+    # is emitted once, reduced with ``jnp.any``, at the non-vmapped call sites.
     is_valid = jnp.all(jnp.isfinite(projected))
     frob_norm = jnp.linalg.norm(matrix, "fro")
     fallback_scale = jnp.where(jnp.isfinite(frob_norm), frob_norm / jnp.sqrt(2.0), 0.5)
     fallback = fallback_scale * jnp.eye(matrix.shape[0])
-    # Fires once per bad block, not per filter step. Without this, the
-    # caller sees a converged-looking fit where one or more oscillation
-    # components are silently nulled (the fallback is a scaled identity =
-    # zero rotation).
-    debug_print_if(
-        ~is_valid,
-        "oscillator_utils._project_to_closest_rotation: SVD produced "
-        "non-finite entries; using damped-identity fallback (scale={s}). "
-        "This oscillation component has zero rotation until the input "
-        "is regularized.",
-        s=fallback_scale,
-    )
     return jnp.where(is_valid, projected, fallback)
+
+
+def _warn_if_rotation_projection_degenerate(transition_matrix: jax.Array) -> None:
+    """Emit ONE fallback warning if any 2x2 block would fail rotation projection.
+
+    ``_project_to_closest_rotation`` falls back to a damped identity (zero
+    rotation, silently nulling an oscillation component) exactly when its input
+    block is non-finite: the SVD of any finite 2x2 is finite, and the geometric-
+    mean scale of a finite block is finite, so a finite block never triggers the
+    fallback. The reduced predicate is therefore ``any(~isfinite(input))``,
+    computed here in the NON-vmapped caller so ``debug_print_if``'s ``lax.cond``
+    behaves conditionally instead of firing on every block.
+    """
+    debug_print_if(
+        jnp.any(~jnp.isfinite(transition_matrix)),
+        "oscillator_utils: transition matrix has non-finite entries; the "
+        "affected 2x2 oscillator block(s) were replaced by a damped-identity "
+        "(zero rotation) fallback, so those components are nulled until the "
+        "input is regularized.",
+    )
 
 
 def _get_scaling_factor_from_block(block: jax.Array, eps: float = 1e-12) -> jax.Array:
@@ -692,6 +706,9 @@ def project_coupled_transition_matrix(transition_matrix: jax.Array) -> jax.Array
     if dim % 2 != 0 or transition_matrix.shape != (dim, dim):
         raise ValueError("Input transition_matrix must be square with even dimensions.")
     n_oscillators = dim // 2
+
+    # Non-vmapped: emit one reduced fallback signal for the whole matrix.
+    _warn_if_rotation_projection_degenerate(transition_matrix)
 
     # Reshape to (n_oscillators, 2, n_oscillators, 2) for block access
     blocks = transition_matrix.reshape(n_oscillators, 2, n_oscillators, 2)
@@ -822,6 +839,8 @@ def project_matrix_blockwise(transition_matrix: jax.Array) -> jax.Array:
     if dim % 2 != 0 or transition_matrix.shape != (dim, dim):
         raise ValueError("Input transition_matrix must be square with even dimensions.")
     n_oscillators = dim // 2
+
+    _warn_if_rotation_projection_degenerate(transition_matrix)
 
     return jnp.block(
         [
