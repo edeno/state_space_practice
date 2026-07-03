@@ -241,6 +241,36 @@ class TestCorrelatedNoisePointProcessModel:
         assert model.n_neurons == cnm_pp_params["n_neurons"]
         assert model.n_discrete_states == cnm_pp_params["n_discrete_states"]
 
+    def test_lower_triangle_pair_params_are_canonicalized(self, cnm_pp_params) -> None:
+        params = dict(cnm_pp_params)
+        n_disc = params["n_discrete_states"]
+        params["phase_difference"] = (
+            jnp.zeros((2, 2, n_disc)).at[1, 0, :].set(-0.7)
+        )
+        params["coupling_strength"] = (
+            jnp.zeros((2, 2, n_disc)).at[1, 0, :].set(0.05)
+        )
+
+        model = CorrelatedNoisePointProcessModel(**params)
+
+        np.testing.assert_allclose(model.phase_difference[0, 1, :], 0.7)
+        np.testing.assert_allclose(model.coupling_strength[0, 1, :], 0.05)
+        np.testing.assert_allclose(model.phase_difference[1, 0, :], 0.0)
+        np.testing.assert_allclose(model.coupling_strength[1, 0, :], 0.0)
+
+    def test_conflicting_pair_params_raise(self, cnm_pp_params) -> None:
+        params = dict(cnm_pp_params)
+        n_disc = params["n_discrete_states"]
+        params["phase_difference"] = (
+            jnp.zeros((2, 2, n_disc)).at[0, 1, :].set(0.7).at[1, 0, :].set(0.3)
+        )
+        params["coupling_strength"] = (
+            jnp.zeros((2, 2, n_disc)).at[0, 1, :].set(0.05).at[1, 0, :].set(0.05)
+        )
+
+        with pytest.raises(ValueError, match="Conflicting correlated-noise"):
+            CorrelatedNoisePointProcessModel(**params)
+
     def test_update_flags(self, cnm_pp_params) -> None:
         """CNM-PP should update Q but not A."""
         model = CorrelatedNoisePointProcessModel(**cnm_pp_params)

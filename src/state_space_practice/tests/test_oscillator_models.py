@@ -371,6 +371,40 @@ class TestCorrelatedNoiseModel:
         with pytest.raises(ValueError, match="measurement_variance must be positive"):
             CorrelatedNoiseModel(**params)
 
+    def test_lower_triangle_pair_params_are_canonicalized(
+        self, correlated_noise_params
+    ) -> None:
+        """Lower-triangle CNM pair input is accepted and stored canonically."""
+        params = correlated_noise_params.copy()
+        n_disc = params["n_discrete_states"]
+        params["phase_difference"] = (
+            jnp.zeros((2, 2, n_disc)).at[1, 0, :].set(-0.7)
+        )
+        params["coupling_strength"] = (
+            jnp.zeros((2, 2, n_disc)).at[1, 0, :].set(0.05)
+        )
+
+        model = CorrelatedNoiseModel(**params)
+
+        np.testing.assert_allclose(model.phase_difference[0, 1, :], 0.7)
+        np.testing.assert_allclose(model.coupling_strength[0, 1, :], 0.05)
+        np.testing.assert_allclose(model.phase_difference[1, 0, :], 0.0)
+        np.testing.assert_allclose(model.coupling_strength[1, 0, :], 0.0)
+
+    def test_conflicting_pair_params_raise(self, correlated_noise_params) -> None:
+        """Full-pair CNM input must describe the same covariance both ways."""
+        params = correlated_noise_params.copy()
+        n_disc = params["n_discrete_states"]
+        params["phase_difference"] = (
+            jnp.zeros((2, 2, n_disc)).at[0, 1, :].set(0.7).at[1, 0, :].set(0.3)
+        )
+        params["coupling_strength"] = (
+            jnp.zeros((2, 2, n_disc)).at[0, 1, :].set(0.05).at[1, 0, :].set(0.05)
+        )
+
+        with pytest.raises(ValueError, match="Conflicting correlated-noise"):
+            CorrelatedNoiseModel(**params)
+
     def test_project_parameters_produces_symmetric_psd(
         self, correlated_noise_params
     ) -> None:
@@ -890,17 +924,22 @@ class TestCorrelatedNoiseModelProperties:
     def test_process_cov_symmetric_for_all_states(
         self, n_osc: int, n_disc: int
     ) -> None:
-        """Q must be symmetric even from ASYMMETRIC directed phase/coupling input.
+        """Q must be symmetric from canonical upper-triangle pair input.
 
-        A covariance is symmetric by definition; the constructor uses only the
-        upper triangle of the directed inputs and mirrors it as the transpose,
-        so a Q built from ``phase[i,j] != phase[j,i]`` / ``coupling[i,j] !=
-        coupling[j,i]`` must still come out symmetric.
+        A covariance is symmetric by definition; the model stores one
+        upper-triangle parameter per oscillator pair and mirrors it as the
+        transpose.
         """
         rng = np.random.default_rng(0)
-        # Directed inputs that are NOT symmetric across (i, j) / (j, i).
-        phase = rng.uniform(-1.0, 1.0, (n_osc, n_osc, n_disc))
-        coupling = rng.uniform(0.01, 0.05, (n_osc, n_osc, n_disc))
+        phase = np.zeros((n_osc, n_osc, n_disc))
+        coupling = np.zeros((n_osc, n_osc, n_disc))
+        upper_i, upper_j = np.triu_indices(n_osc, k=1)
+        phase[upper_i, upper_j, :] = rng.uniform(
+            -1.0, 1.0, (len(upper_i), n_disc)
+        )
+        coupling[upper_i, upper_j, :] = rng.uniform(
+            0.01, 0.05, (len(upper_i), n_disc)
+        )
         model = CorrelatedNoiseModel(
             n_oscillators=n_osc,
             n_discrete_states=n_disc,

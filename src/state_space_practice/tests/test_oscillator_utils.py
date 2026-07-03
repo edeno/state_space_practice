@@ -13,6 +13,7 @@ from state_space_practice.oscillator_utils import (
     _get_scaling_factor,
     _project_to_closest_rotation,
     _scatter_block_diagonal,
+    canonicalize_correlated_noise_pair_parameters,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
     construct_correlated_noise_measurement_matrix,
@@ -152,6 +153,48 @@ def test_construct_correlated_noise_process_covariance_nonzero_coupling():
     # directed-block constructor, which used phase[i,j] and phase[j,i]
     # independently).
     np.testing.assert_allclose(mat, mat.T, atol=1e-13)
+
+
+def test_canonicalize_correlated_noise_pair_parameters_accepts_lower_only():
+    phase = jnp.zeros((2, 2, 2)).at[1, 0, :].set(-0.7)
+    coupling = jnp.zeros((2, 2, 2)).at[1, 0, :].set(0.2)
+
+    canon_phase, canon_coupling = canonicalize_correlated_noise_pair_parameters(
+        phase, coupling
+    )
+
+    np.testing.assert_allclose(canon_phase[0, 1, :], 0.7, atol=1e-12)
+    np.testing.assert_allclose(canon_coupling[0, 1, :], 0.2, atol=1e-12)
+    np.testing.assert_allclose(canon_phase[1, 0, :], 0.0, atol=1e-12)
+    np.testing.assert_allclose(canon_coupling[1, 0, :], 0.0, atol=1e-12)
+
+
+def test_canonicalize_correlated_noise_pair_parameters_accepts_mirrored_full_pair():
+    phase = jnp.zeros((2, 2)).at[0, 1].set(0.7).at[1, 0].set(-0.7)
+    coupling = jnp.zeros((2, 2)).at[0, 1].set(0.2).at[1, 0].set(0.2)
+
+    canon_phase, canon_coupling = canonicalize_correlated_noise_pair_parameters(
+        phase, coupling
+    )
+
+    np.testing.assert_allclose(canon_phase, jnp.array([[0.0, 0.7], [0.0, 0.0]]))
+    np.testing.assert_allclose(canon_coupling, jnp.array([[0.0, 0.2], [0.0, 0.0]]))
+
+
+def test_canonicalize_correlated_noise_pair_parameters_rejects_conflict():
+    phase = jnp.zeros((2, 2)).at[0, 1].set(0.7).at[1, 0].set(0.4)
+    coupling = jnp.zeros((2, 2)).at[0, 1].set(0.2).at[1, 0].set(0.2)
+
+    with pytest.raises(ValueError, match="Conflicting correlated-noise"):
+        canonicalize_correlated_noise_pair_parameters(phase, coupling)
+
+
+def test_canonicalize_correlated_noise_pair_parameters_rejects_diagonal_coupling():
+    phase = jnp.zeros((2, 2))
+    coupling = jnp.eye(2) * 0.2
+
+    with pytest.raises(ValueError, match="diagonal"):
+        canonicalize_correlated_noise_pair_parameters(phase, coupling)
 
 
 def test_construct_correlated_noise_measurement_matrix():

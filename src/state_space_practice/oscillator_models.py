@@ -43,6 +43,7 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.oscillator_utils import (
+    canonicalize_correlated_noise_pair_parameters,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
     construct_correlated_noise_measurement_matrix,
@@ -1156,9 +1157,15 @@ class CorrelatedNoiseModel(BaseModel):
     measurement_variance : float
         Variance of the measurement noise.
     phase_difference : jax.Array, shape (n_oscillators, n_oscillators, n_discrete_states)
-        Initial phase differences for noise correlation.
+        Initial phase differences for noise correlation. Each oscillator pair may
+        be supplied in the strict upper triangle, strict lower triangle, or both
+        triangles if the two entries are opposite phases; values are stored
+        canonically in the strict upper triangle.
     coupling_strength : jax.Array, shape (n_oscillators, n_oscillators, n_discrete_states)
-        Initial coupling strengths for noise correlation.
+        Initial coupling strengths for noise correlation. Each oscillator pair
+        may be supplied in the strict upper triangle, strict lower triangle, or
+        both triangles if the two entries agree; values are stored canonically in
+        the strict upper triangle.
     """
 
     def __init__(
@@ -1218,6 +1225,12 @@ class CorrelatedNoiseModel(BaseModel):
             )
         if sampling_freq <= 0:
             raise ValueError("sampling_freq must be positive. " f"Got {sampling_freq}.")
+        phase_difference, coupling_strength = (
+            canonicalize_correlated_noise_pair_parameters(
+                phase_difference, coupling_strength
+            )
+        )
+
         self.freqs = freqs
         self.damping_coef = damping_coef
         self.process_variance = process_variance
@@ -1411,6 +1424,12 @@ class CorrelatedNoiseModel(BaseModel):
             self.phase_difference = params["phase_difference"]
         if "coupling_strength" in params:
             self.coupling_strength = params["coupling_strength"]
+        if any(k in params for k in ("phase_difference", "coupling_strength")):
+            self.phase_difference, self.coupling_strength = (
+                canonicalize_correlated_noise_pair_parameters(
+                    self.phase_difference, self.coupling_strength
+                )
+            )
         # Reconstruct Q from updated params, applying the same gradient-safe PSD
         # shift the SGD loss used (coupling_strength is UNCONSTRAINED, so the raw
         # reconstruction can be indefinite). Matching the loss's projection keeps
