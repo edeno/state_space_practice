@@ -233,6 +233,12 @@ class TestCovariateChoiceFilter:
 
         assert jnp.isfinite(result.marginal_log_likelihood)
 
+    def test_rejects_invalid_choice_index(self):
+        choices = jnp.array([0, 3, 1])
+
+        with pytest.raises(ValueError, match="All choices"):
+            covariate_choice_filter(choices, n_options=3)
+
 
 class TestCovariateChoiceSmoother:
     """Tests for covariate_choice_smoother."""
@@ -361,6 +367,19 @@ class TestCovariateChoiceModel:
     def test_invalid_init(self):
         with pytest.raises(ValueError, match="n_options"):
             CovariateChoiceModel(n_options=1, n_covariates=2)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"init_inverse_temperature": 0.0}, "init_inverse_temperature"),
+            ({"init_process_noise": -0.1}, "init_process_noise"),
+            ({"init_decay": 0.0}, "init_decay"),
+            ({"init_decay": 1.1}, "init_decay"),
+        ],
+    )
+    def test_invalid_hyperparameter_init(self, kwargs, match):
+        with pytest.raises(ValueError, match=match):
+            CovariateChoiceModel(n_options=3, **kwargs)
 
     def test_fit_returns_log_likelihoods(self):
         choices, covariates, _, _ = _generate_reward_covariate_data(n_trials=100)

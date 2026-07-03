@@ -36,9 +36,10 @@ from state_space_practice.switching_kalman import (
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture_per_discrete_state,
 )
-from state_space_practice.utils import scale_likelihood as _scale_likelihood
 from state_space_practice.utils import (
+    scale_likelihood as _scale_likelihood,
     stabilize_probability_vector as _stabilize_probability_vector,
+    validate_choice_indices,
 )
 
 logger = logging.getLogger(__name__)
@@ -174,11 +175,47 @@ class SwitchingChoiceFilterResult(NamedTuple):
     pair_cond_covs: Array         # (n_trials, K-1, K-1, S, S) for smoother
 
 
+def switching_choice_filter(
+    choices: ArrayLike,
+    n_options: int,
+    n_discrete_states: int = 2,
+    covariates: Optional[ArrayLike] = None,
+    input_gain: Optional[ArrayLike] = None,
+    obs_covariates: Optional[ArrayLike] = None,
+    obs_weights: Optional[ArrayLike] = None,
+    process_noises: Optional[ArrayLike] = None,
+    inverse_temperatures: Optional[ArrayLike] = None,
+    decays: Optional[ArrayLike] = None,
+    discrete_transition_matrix: Optional[ArrayLike] = None,
+    init_mean: Optional[ArrayLike] = None,
+    init_cov: Optional[ArrayLike] = None,
+    init_discrete_prob: Optional[ArrayLike] = None,
+) -> SwitchingChoiceFilterResult:
+    """Validate choices and run the JIT-compiled switching choice filter."""
+    validate_choice_indices(choices, n_options)
+    return _switching_choice_filter_jit(
+        choices,
+        n_options,
+        n_discrete_states,
+        covariates,
+        input_gain,
+        obs_covariates,
+        obs_weights,
+        process_noises,
+        inverse_temperatures,
+        decays,
+        discrete_transition_matrix,
+        init_mean,
+        init_cov,
+        init_discrete_prob,
+    )
+
+
 @functools.partial(
     jax.jit,
     static_argnames=["n_options", "n_discrete_states"],
 )
-def switching_choice_filter(
+def _switching_choice_filter_jit(
     choices: ArrayLike,
     n_options: int,
     n_discrete_states: int = 2,
@@ -678,6 +715,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
         -------
         log_likelihoods : list of float
         """
+        validate_choice_indices(choices, self.n_options)
         choices = jnp.asarray(choices, dtype=jnp.int32)
         self._n_trials = int(choices.shape[0])
         self._covariates = jnp.asarray(covariates) if covariates is not None else None
@@ -826,6 +864,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
         convergence_tol=None,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent."""
+        validate_choice_indices(choices, self.n_options)
         choices = jnp.asarray(choices, dtype=jnp.int32)
         self._n_trials = int(choices.shape[0])
         self._covariates = jnp.asarray(covariates) if covariates is not None else None

@@ -252,6 +252,7 @@ def covariate_choice_filter(
     -------
     ChoiceFilterResult
     """
+    validate_choice_indices(choices, n_options)
     choices_arr = jnp.asarray(choices, dtype=jnp.int32)
     k_free = n_options - 1
 
@@ -458,6 +459,21 @@ class CovariateChoiceModel(SGDFittableMixin):
     ):
         if n_options < 2:
             raise ValueError(f"n_options must be >= 2, got {n_options}")
+        if init_inverse_temperature <= 0:
+            raise ValueError(
+                "init_inverse_temperature must be > 0 (a non-positive value "
+                f"inverts choice preferences), got {init_inverse_temperature}."
+            )
+        if init_process_noise < 0:
+            raise ValueError(
+                "init_process_noise must be non-negative (Q = process_noise * I "
+                f"must be PSD), got {init_process_noise}."
+            )
+        if init_decay <= 0 or init_decay > 1:
+            raise ValueError(
+                "init_decay must lie in (0, 1] for stable latent dynamics, "
+                f"got {init_decay}."
+            )
         self.n_options = n_options
         self.n_covariates = n_covariates
         self.n_obs_covariates = n_obs_covariates

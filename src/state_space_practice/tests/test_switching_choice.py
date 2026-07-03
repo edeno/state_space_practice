@@ -182,6 +182,12 @@ class TestSwitchingChoiceFilter:
         result = switching_choice_filter(choices, n_options=3, n_discrete_states=2)
         assert jnp.isfinite(result.marginal_log_likelihood)
 
+    def test_rejects_invalid_choice_index(self):
+        choices = jnp.array([0, 3, 1])
+
+        with pytest.raises(ValueError, match="All choices"):
+            switching_choice_filter(choices, n_options=3, n_discrete_states=2)
+
     def test_single_state_matches_covariate_filter(self):
         """S=1 must produce identical filtered values to CovariateChoiceModel.
 
@@ -333,6 +339,20 @@ class TestSwitchingChoiceModel:
         model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
         model.fit_sgd(choices, num_steps=15)
         assert model.is_fitted
+
+    def test_fit_rejects_invalid_choice_index(self):
+        choices = jnp.array([0, 3, 1])
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+
+        with pytest.raises(ValueError, match="All choices"):
+            model.fit(choices, max_iter=1)
+
+    def test_fit_sgd_rejects_invalid_choice_index(self):
+        choices = jnp.array([0, 3, 1])
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+
+        with pytest.raises(ValueError, match="All choices"):
+            model.fit_sgd(choices, num_steps=1)
 
 
 class TestSimulateSwitchingChoiceData:
