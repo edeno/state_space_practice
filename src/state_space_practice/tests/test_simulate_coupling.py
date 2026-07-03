@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import state_space_practice.coupling_model as coupling_model
 from state_space_practice.circular_stats import (
     angular_distance,
     circular_mean,
@@ -281,6 +282,13 @@ class TestValidation:
     def test_accepts_canonical_params(self, coupling_params_small):
         # guard: the valid fixture passes (validation isn't rejecting good input)
         validate_coupling_params(coupling_params_small)
+
+    def test_requires_jax_x64(self, coupling_params_small, monkeypatch):
+        monkeypatch.setattr(coupling_model, "_coupling_x64_enabled", lambda: False)
+        with pytest.raises(RuntimeError, match="x64"):
+            validate_coupling_params(coupling_params_small)
+        with pytest.raises(RuntimeError, match="x64"):
+            build_transition(coupling_params_small)
 
     def test_rejects_decay_equal_one(self, coupling_params_small):
         # decay=1 has no stationary distribution -> would silently produce inf/NaN

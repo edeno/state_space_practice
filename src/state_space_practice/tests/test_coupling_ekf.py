@@ -30,6 +30,12 @@ class TestGuards:
         with pytest.raises(ValueError, match="lfp_noise_var"):
             fit_coupling_ekf(sim.spikes, sim.lfp, bad)
 
+    def test_rejects_history_kernel(self, coupling_params_small):
+        sim = simulate_coupling(coupling_params_small, n_time=200, seed=0)
+        bad = coupling_params_small._replace(history_kernel=np.zeros((3, 2)))
+        with pytest.raises(NotImplementedError, match="history_kernel"):
+            fit_coupling_ekf(sim.spikes, sim.lfp, bad)
+
     @pytest.mark.parametrize("bad_value", [0.5, -1.0, 2.0, np.nan])
     def test_rejects_invalid_spike_values(self, coupling_params_small, bad_value):
         sim = simulate_coupling(coupling_params_small, n_time=200, seed=0)
@@ -52,12 +58,14 @@ class TestMechanics:
         post = fit_coupling_ekf(sim.spikes, sim.lfp, coupling_params_small)
         n_neurons, n_bands = np.asarray(coupling_params_small.beta_real).shape
         assert post.beta_real_mean.shape == (n_neurons, n_bands)
+        assert post.beta_real_imag_cov.shape == (n_neurons, n_bands)
         assert post.samples is None
         for arr in (
             post.beta_real_mean,
             post.beta_imag_mean,
             post.beta_real_var,
             post.beta_imag_var,
+            post.beta_real_imag_cov,
         ):
             assert np.all(np.isfinite(np.asarray(arr)))
         # variances are positive (the Wald test downstream needs this)

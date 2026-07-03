@@ -48,6 +48,12 @@ class TestGuards:
         with pytest.raises(ValueError, match="lfp_noise_var"):
             fit_coupling_pg(sim.spikes, sim.lfp, bad, n_iter=10, burn_in=5)
 
+    def test_rejects_history_kernel(self, coupling_params_small):
+        sim = simulate_coupling(coupling_params_small, n_time=200, seed=0)
+        bad = coupling_params_small._replace(history_kernel=np.zeros((3, 2)))
+        with pytest.raises(NotImplementedError, match="history_kernel"):
+            fit_coupling_pg(sim.spikes, sim.lfp, bad, n_iter=10, burn_in=5)
+
     def test_rejects_invalid_observation_values(self, coupling_params_small):
         sim = simulate_coupling(coupling_params_small, n_time=200, seed=0)
         spikes = np.asarray(sim.spikes).copy()
@@ -63,6 +69,23 @@ class TestGuards:
                 sim.spikes, lfp, coupling_params_small, n_iter=10, burn_in=5
             )
 
+    @pytest.mark.parametrize(
+        ("n_iter", "burn_in"),
+        [(1.5, 0), (10, 1.5), ("10", 5)],
+    )
+    def test_rejects_noninteger_iterations(
+        self, coupling_params_small, n_iter, burn_in
+    ):
+        sim = simulate_coupling(coupling_params_small, n_time=200, seed=0)
+        with pytest.raises(ValueError, match="integers"):
+            fit_coupling_pg(
+                sim.spikes,
+                sim.lfp,
+                coupling_params_small,
+                n_iter=n_iter,
+                burn_in=burn_in,
+            )
+
 
 class TestMechanics:
     def test_returns_posterior_with_samples(self, coupling_params_small):
@@ -75,11 +98,13 @@ class TestMechanics:
         assert post.samples.shape == (30, n_neurons, n_bands)
         assert np.iscomplexobj(post.samples)
         assert post.beta_real_mean.shape == (n_neurons, n_bands)
+        assert post.beta_real_imag_cov.shape == (n_neurons, n_bands)
         for arr in (
             post.beta_real_mean,
             post.beta_imag_mean,
             post.beta_real_var,
             post.beta_imag_var,
+            post.beta_real_imag_cov,
         ):
             assert np.all(np.isfinite(np.asarray(arr)))
         assert np.all(np.asarray(post.beta_real_var) > 0)
@@ -94,6 +119,12 @@ class TestMechanics:
         np.testing.assert_allclose(post.beta_imag_mean, post.samples.imag.mean(axis=0))
         np.testing.assert_allclose(post.beta_real_var, post.samples.real.var(axis=0))
         np.testing.assert_allclose(post.beta_imag_var, post.samples.imag.var(axis=0))
+        real_resid = post.samples.real - post.samples.real.mean(axis=0)
+        imag_resid = post.samples.imag - post.samples.imag.mean(axis=0)
+        np.testing.assert_allclose(
+            post.beta_real_imag_cov,
+            (real_resid * imag_resid).mean(axis=0),
+        )
 
     def test_deterministic(self, coupling_params_small):
         """Same seed -> identical samples; different seed -> different."""

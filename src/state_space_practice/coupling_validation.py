@@ -48,6 +48,10 @@ class CouplingPosterior(NamedTuple):
         Posterior samples of ``beta_real + 1j * beta_imag``. ``None`` for a
         Gaussian (Laplace-EKF) posterior; populated by the Polya-Gamma sampler so
         percentile credible intervals are available.
+    beta_real_imag_cov : ndarray or None, shape (S, J)
+        Posterior covariance between the in-phase and quadrature components for
+        each neuron-band pair. When present, the Wald test uses the full 2-D
+        covariance; ``None`` preserves the old diagonal approximation.
     """
 
     beta_real_mean: npt.NDArray[np.floating]
@@ -55,39 +59,20 @@ class CouplingPosterior(NamedTuple):
     beta_real_var: npt.NDArray[np.floating]
     beta_imag_var: npt.NDArray[np.floating]
     samples: Optional[npt.NDArray[np.complexfloating]] = None
+    beta_real_imag_cov: Optional[npt.NDArray[np.floating]] = None
 
 
-def wald_test(
+def _posterior_mean_var_arrays(
     posterior: CouplingPosterior,
-) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
-    """Wald chi-squared(2) test for nonzero complex coupling, per (neuron, band).
-
-    Treats ``(beta_real, beta_imag)`` as a 2-vector and tests it against zero:
-
-        W = beta_real_mean**2 / beta_real_var + beta_imag_mean**2 / beta_imag_var
-
-    which is chi-squared(2) under the null of no coupling. Variances below
-    ``_MIN_VARIANCE`` are floored per component rather than dropped; this avoids
-    division by zero without turning strong collapsed estimates into nulls.
-
-    Parameters
-    ----------
-    posterior : CouplingPosterior
-        Uses ``beta_real_mean``, ``beta_imag_mean``, ``beta_real_var``,
-        ``beta_imag_var``, each shape (S, J).
-
-    Returns
-    -------
-    W : ndarray, shape (S, J)
-        Wald statistic.
-    pval : ndarray, shape (S, J)
-        Upper-tail chi-squared(2) p-value.
-    """
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Validate and return posterior mean/variance/covariance arrays."""
     mr = np.asarray(posterior.beta_real_mean, dtype=float)
     mi = np.asarray(posterior.beta_imag_mean, dtype=float)
     vr = np.asarray(posterior.beta_real_var, dtype=float)
     vi = np.asarray(posterior.beta_imag_var, dtype=float)
 
+    if mr.ndim != 2:
+        raise ValueError("posterior arrays must be 2D with shape (S, J)")
     if not (mr.shape == mi.shape == vr.shape == vi.shape):
         raise ValueError("posterior mean and variance arrays must have matching shapes")
     for name, arr in (
@@ -101,9 +86,115 @@ def wald_test(
     if np.any(vr < 0.0) or np.any(vi < 0.0):
         raise ValueError("posterior variances must be non-negative")
 
+    cov = getattr(posterior, "beta_real_imag_cov", None)
+    if cov is None:
+        cov_ri = np.zeros_like(mr)
+    else:
+        cov_ri = np.asarray(cov, dtype=float)
+        if cov_ri.shape != mr.shape:
+            raise ValueError(
+                "beta_real_imag_cov must match posterior mean/variance shape "
+                f"{mr.shape}, got {cov_ri.shape}"
+            )
+        if not np.all(np.isfinite(cov_ri)):
+            raise ValueError("beta_real_imag_cov must contain only finite values")
+        cov_limit = np.sqrt(vr * vi)
+        tol = 1e-10 + 1e-8 * cov_limit
+        if np.any(np.abs(cov_ri) > cov_limit + tol):
+            raise ValueError(
+                "posterior covariance is inconsistent with variances: expected "
+                "|beta_real_imag_cov| <= sqrt(beta_real_var * beta_imag_var)"
+            )
+    return mr, mi, vr, vi, cov_ri
+
+
+def _validate_cred_mass(cred_mass: float) -> float:
+    """Return concrete credible mass in the open interval (0, 1)."""
+    cred_arr = np.asarray(cred_mass)
+    if (
+        cred_arr.shape != ()
+        or not np.issubdtype(cred_arr.dtype, np.number)
+        or np.issubdtype(cred_arr.dtype, np.complexfloating)
+    ):
+        raise ValueError(f"cred_mass must be a finite scalar in (0, 1), got {cred_mass}.")
+    cred = float(cred_arr)
+    if not np.isfinite(cred) or not (0.0 < cred < 1.0):
+        raise ValueError(f"cred_mass must be a finite scalar in (0, 1), got {cred_mass}.")
+    return cred
+
+
+def _validate_pval_mask(
+    pval: npt.NDArray[np.floating],
+    coupling_mask: npt.NDArray[np.bool_],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Validate p-values and ground-truth masks for detection metrics."""
+    pval_arr = np.asarray(pval, dtype=float)
+    mask = np.asarray(coupling_mask, dtype=bool)
+    if pval_arr.ndim != 2:
+        raise ValueError("pval must be a 2D array with shape (S, J).")
+    if pval_arr.shape != mask.shape:
+        raise ValueError(
+            "pval and coupling_mask must have matching shapes; "
+            f"got {pval_arr.shape} and {mask.shape}."
+        )
+    if not np.all(np.isfinite(pval_arr)):
+        raise ValueError("pval must contain only finite values.")
+    if np.any((pval_arr < 0.0) | (pval_arr > 1.0)):
+        raise ValueError("pval entries must be in [0, 1].")
+    return pval_arr, mask
+
+
+def _validate_alpha(alpha: float) -> float:
+    """Return concrete test threshold in the open interval (0, 1)."""
+    alpha_arr = np.asarray(alpha)
+    if (
+        alpha_arr.shape != ()
+        or not np.issubdtype(alpha_arr.dtype, np.number)
+        or np.issubdtype(alpha_arr.dtype, np.complexfloating)
+    ):
+        raise ValueError(f"alpha must be a finite scalar in (0, 1), got {alpha}.")
+    alpha_float = float(alpha_arr)
+    if not np.isfinite(alpha_float) or not (0.0 < alpha_float < 1.0):
+        raise ValueError(f"alpha must be a finite scalar in (0, 1), got {alpha}.")
+    return alpha_float
+
+
+def wald_test(
+    posterior: CouplingPosterior,
+) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+    """Wald chi-squared(2) test for nonzero complex coupling, per (neuron, band).
+
+    Treats ``(beta_real, beta_imag)`` as a 2-vector and tests it against zero:
+
+        W = m.T @ Sigma^-1 @ m
+
+    which is chi-squared(2) under the null of no coupling. ``Sigma`` includes the
+    real/imag covariance when ``posterior.beta_real_imag_cov`` is present; otherwise
+    the diagonal approximation is used. Variances below ``_MIN_VARIANCE`` are
+    floored per component rather than dropped; this avoids division by zero without
+    turning strong collapsed estimates into nulls.
+
+    Parameters
+    ----------
+    posterior : CouplingPosterior
+        Uses ``beta_real_mean``, ``beta_imag_mean``, ``beta_real_var``,
+        ``beta_imag_var``, and optionally ``beta_real_imag_cov``, each shape (S, J).
+
+    Returns
+    -------
+    W : ndarray, shape (S, J)
+        Wald statistic.
+    pval : ndarray, shape (S, J)
+        Upper-tail chi-squared(2) p-value.
+    """
+    mr, mi, vr, vi, cov_ri = _posterior_mean_var_arrays(posterior)
+
     safe_vr = np.maximum(vr, _MIN_VARIANCE)
     safe_vi = np.maximum(vi, _MIN_VARIANCE)
-    W = mr**2 / safe_vr + mi**2 / safe_vi
+    max_abs_cov = np.sqrt(safe_vr * safe_vi) * (1.0 - 1e-12)
+    safe_cov = np.clip(cov_ri, -max_abs_cov, max_abs_cov)
+    det = safe_vr * safe_vi - safe_cov**2
+    W = (safe_vi * mr**2 - 2.0 * safe_cov * mr * mi + safe_vr * mi**2) / det
     pval = stats.chi2.sf(W, df=2)
     return W, pval
 
@@ -126,22 +217,31 @@ def summarize_posterior(posterior: CouplingPosterior, cred_mass: float = 0.95) -
         Keys ``magnitude``, ``phase`` and the interval bounds
         ``beta_real_ci_lower/upper`` and ``beta_imag_ci_lower/upper``, each (S, J).
     """
-    mr = np.asarray(posterior.beta_real_mean, dtype=float)
-    mi = np.asarray(posterior.beta_imag_mean, dtype=float)
+    cred_mass = _validate_cred_mass(cred_mass)
+    mr, mi, vr, vi, _ = _posterior_mean_var_arrays(posterior)
 
     magnitude = np.hypot(mr, mi)
     phase = np.arctan2(mi, mr)
 
     if posterior.samples is not None:
         samples = np.asarray(posterior.samples)
+        if samples.ndim != 3 or samples.shape[1:] != mr.shape:
+            raise ValueError(
+                "posterior.samples must have shape (n_samples, S, J) matching "
+                "the posterior mean arrays."
+            )
+        if samples.shape[0] == 0:
+            raise ValueError("posterior.samples must contain at least one sample.")
+        if not np.all(np.isfinite(samples)):
+            raise ValueError("posterior.samples must contain only finite values.")
         lo_pct = 100.0 * (1.0 - cred_mass) / 2.0
         hi_pct = 100.0 - lo_pct
         real_lo, real_hi = np.percentile(samples.real, [lo_pct, hi_pct], axis=0)
         imag_lo, imag_hi = np.percentile(samples.imag, [lo_pct, hi_pct], axis=0)
     else:
         z = stats.norm.ppf(0.5 + cred_mass / 2.0)
-        sd_r = np.sqrt(np.asarray(posterior.beta_real_var, dtype=float))
-        sd_i = np.sqrt(np.asarray(posterior.beta_imag_var, dtype=float))
+        sd_r = np.sqrt(vr)
+        sd_i = np.sqrt(vi)
         real_lo, real_hi = mr - z * sd_r, mr + z * sd_r
         imag_lo, imag_hi = mi - z * sd_i, mi + z * sd_i
 
@@ -184,8 +284,8 @@ def detection_metrics(
         Element-wise ``tp/fp/fn/tn``, ``sensitivity``, ``specificity``,
         ``precision``, ``f1``, and the per-band counterparts prefixed ``band_``.
     """
-    pval = np.asarray(pval, dtype=float)
-    mask = np.asarray(coupling_mask, dtype=bool)
+    alpha = _validate_alpha(alpha)
+    pval, mask = _validate_pval_mask(pval, coupling_mask)
     out = _confusion(pval < alpha, mask)
     band_detected = (pval < alpha).any(axis=0)
     band_true = mask.any(axis=0)
@@ -240,11 +340,12 @@ def roc_auc(
     float
         ROC AUC, or ``nan`` if labels are single-class.
     """
-    labels = np.asarray(coupling_mask, dtype=int).ravel()
+    pval, mask = _validate_pval_mask(pval, coupling_mask)
+    labels = mask.astype(int).ravel()
     if labels.min() == labels.max():
         logger.info("roc_auc undefined: coupling_mask is single-class; returning nan")
         return float("nan")
-    score = -np.log10(np.asarray(pval, dtype=float).ravel() + 1e-300)
+    score = -np.log10(pval.ravel() + 1e-300)
     return float(roc_auc_score(labels, score))
 
 

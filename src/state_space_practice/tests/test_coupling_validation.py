@@ -70,6 +70,19 @@ class TestWaldTest:
         assert pval[0, 0] == 1.0
         assert not np.isnan(pval[0, 0])
 
+    def test_uses_real_imag_covariance(self, make_coupling_posterior):
+        """The Wald statistic uses the full 2x2 covariance, not only marginals."""
+        post = make_coupling_posterior(
+            beta_real_mean=[[1.0]],
+            beta_imag_mean=[[1.0]],
+            beta_real_var=[[1.0]],
+            beta_imag_var=[[1.0]],
+            beta_real_imag_cov=[[0.5]],
+        )
+        W, pval = wald_test(post)
+        assert W[0, 0] == pytest.approx(4.0 / 3.0)
+        assert pval[0, 0] == pytest.approx(stats.chi2.sf(4.0 / 3.0, df=2))
+
     def test_rejects_negative_variance(self, make_coupling_posterior):
         post = make_coupling_posterior(
             beta_real_mean=[[0.0]],
@@ -78,6 +91,27 @@ class TestWaldTest:
             beta_imag_var=[[1.0]],
         )
         with pytest.raises(ValueError, match="variance"):
+            wald_test(post)
+
+    def test_rejects_inconsistent_covariance(self, make_coupling_posterior):
+        post = make_coupling_posterior(
+            beta_real_mean=[[0.0]],
+            beta_imag_mean=[[0.0]],
+            beta_real_var=[[1.0]],
+            beta_imag_var=[[1.0]],
+            beta_real_imag_cov=[[2.0]],
+        )
+        with pytest.raises(ValueError, match="covariance"):
+            wald_test(post)
+
+    def test_rejects_non_2d_posterior_arrays(self, make_coupling_posterior):
+        post = make_coupling_posterior(
+            beta_real_mean=[0.0],
+            beta_imag_mean=[0.0],
+            beta_real_var=[1.0],
+            beta_imag_var=[1.0],
+        )
+        with pytest.raises(ValueError, match="2D"):
             wald_test(post)
 
 
@@ -114,6 +148,29 @@ class TestDetectionMetrics:
         assert m["band_fp"] == 0
         assert m["band_fn"] == 0
 
+    @pytest.mark.parametrize(
+        "pval",
+        [
+            np.array([[np.nan]]),
+            np.array([[-0.1]]),
+            np.array([[1.1]]),
+        ],
+    )
+    def test_rejects_invalid_pvalues(self, pval):
+        with pytest.raises(ValueError, match="pval"):
+            detection_metrics(pval, np.array([[True]]))
+
+    def test_rejects_shape_mismatch(self):
+        pval = np.array([[0.01], [0.5]])
+        mask = np.array([[True]])
+        with pytest.raises(ValueError, match="matching shapes"):
+            detection_metrics(pval, mask)
+
+    @pytest.mark.parametrize("alpha", [-0.1, 0.0, 1.0, 1.5, np.nan])
+    def test_rejects_invalid_alpha(self, alpha):
+        with pytest.raises(ValueError, match="alpha"):
+            detection_metrics(np.array([[0.01]]), np.array([[True]]), alpha=alpha)
+
 
 class TestRocAuc:
     def test_perfect_separation(self):
@@ -127,6 +184,12 @@ class TestRocAuc:
         pval = np.array([[1e-6, 1e-6]])
         mask = np.array([[True, True]])
         assert np.isnan(roc_auc(pval, mask))
+
+    def test_rejects_invalid_pvalues(self):
+        pval = np.array([[-0.1, 0.2]])
+        mask = np.array([[True, False]])
+        with pytest.raises(ValueError, match="pval"):
+            roc_auc(pval, mask)
 
 
 class TestPhaseRecoveryMAE:
@@ -305,3 +368,37 @@ class TestSummarizePosterior:
         assert s["beta_real_ci_upper"][0, 0] == pytest.approx(1.0 + z * 0.2)
         assert s["beta_imag_ci_lower"][0, 0] == pytest.approx(2.0 - z * 0.3)
         assert s["beta_imag_ci_upper"][0, 0] == pytest.approx(2.0 + z * 0.3)
+
+    @pytest.mark.parametrize("cred_mass", [-0.1, 0.0, 1.0, 1.5, np.nan])
+    def test_rejects_invalid_cred_mass(
+        self, make_coupling_posterior, cred_mass
+    ):
+        post = make_coupling_posterior(
+            beta_real_mean=[[1.0]],
+            beta_imag_mean=[[2.0]],
+            beta_real_var=[[0.04]],
+            beta_imag_var=[[0.09]],
+        )
+        with pytest.raises(ValueError, match="cred_mass"):
+            summarize_posterior(post, cred_mass=cred_mass)
+
+    def test_rejects_negative_variance(self, make_coupling_posterior):
+        post = make_coupling_posterior(
+            beta_real_mean=[[1.0]],
+            beta_imag_mean=[[2.0]],
+            beta_real_var=[[-0.04]],
+            beta_imag_var=[[0.09]],
+        )
+        with pytest.raises(ValueError, match="variance"):
+            summarize_posterior(post)
+
+    def test_rejects_sample_shape_mismatch(self, make_coupling_posterior):
+        post = make_coupling_posterior(
+            beta_real_mean=[[1.0]],
+            beta_imag_mean=[[2.0]],
+            beta_real_var=[[0.04]],
+            beta_imag_var=[[0.09]],
+            samples=np.ones((10, 2, 1), dtype=np.complex128),
+        )
+        with pytest.raises(ValueError, match="samples"):
+            summarize_posterior(post)

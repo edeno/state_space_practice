@@ -100,12 +100,15 @@ def fit_coupling_ekf(
     # Jacobian is the constant design smoothed_latent (passed to skip jacfwd).
     prior_mean = jnp.zeros(n_latent)
     prior_cov = sigma_beta_float**2 * jnp.eye(n_latent)
+    real_indices = jnp.arange(0, n_latent, 2)
+    imag_indices = real_indices + 1
 
     def constant_jacobian(_beta):
         return smoothed_latent
 
     means = []
     variances = []
+    real_imag_covariances = []
     for neuron in range(n_neurons):
         baseline_n = params.baseline[neuron]
 
@@ -123,15 +126,18 @@ def fit_coupling_ekf(
         )
         means.append(beta_mean)
         variances.append(jnp.diag(beta_cov))
+        real_imag_covariances.append(beta_cov[real_indices, imag_indices])
 
     beta_mean_rows = jnp.stack(means)  # (S, 2J)
     beta_var_rows = jnp.stack(variances)  # (S, 2J)
+    beta_real_imag_cov = jnp.stack(real_imag_covariances)  # (S, J)
 
     # A non-finite posterior means the smoother or a logistic regression blew up
     # (e.g. ill-conditioned init, separable spikes). Fail loudly rather than
     # return silent NaNs that propagate into detection downstream.
     if not (
         jnp.all(jnp.isfinite(beta_mean_rows)) and jnp.all(jnp.isfinite(beta_var_rows))
+        and jnp.all(jnp.isfinite(beta_real_imag_cov))
     ):
         raise FloatingPointError(
             "coupling posterior contains non-finite values; check the LFP/spikes "
@@ -146,5 +152,6 @@ def fit_coupling_ekf(
         beta_imag_mean=np.asarray(beta_imag_mean),
         beta_real_var=np.asarray(beta_real_var),
         beta_imag_var=np.asarray(beta_imag_var),
+        beta_real_imag_cov=np.asarray(beta_real_imag_cov),
         samples=None,
     )

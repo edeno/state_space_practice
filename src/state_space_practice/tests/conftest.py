@@ -621,6 +621,7 @@ def make_coupling_posterior():
         beta_real_var: npt.ArrayLike,
         beta_imag_var: npt.ArrayLike,
         samples: npt.ArrayLike | None = None,
+        beta_real_imag_cov: npt.ArrayLike | None = None,
     ):
         from state_space_practice.coupling_validation import CouplingPosterior
 
@@ -630,6 +631,11 @@ def make_coupling_posterior():
             beta_real_var=np.asarray(beta_real_var, dtype=float),
             beta_imag_var=np.asarray(beta_imag_var, dtype=float),
             samples=None if samples is None else np.asarray(samples),
+            beta_real_imag_cov=(
+                None
+                if beta_real_imag_cov is None
+                else np.asarray(beta_real_imag_cov, dtype=float)
+            ),
         )
 
     return _make

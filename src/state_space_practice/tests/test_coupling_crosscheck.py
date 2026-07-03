@@ -93,6 +93,9 @@ class TestAggregate:
                 "ekf": {"abs_bias": 0.1},
                 "pg": {"abs_bias": 0.2},
                 "ekf_pg_mean_maxdiff": 0.05,
+                "latent_correlation": 0.8,
+                "latent_rmse": 0.2,
+                "latent_variance_ratio": 0.7,
             },
             {
                 "coupling_mag": 1.0,
@@ -100,6 +103,9 @@ class TestAggregate:
                 "ekf": {"abs_bias": 0.3},
                 "pg": {"abs_bias": 0.4},
                 "ekf_pg_mean_maxdiff": 0.07,
+                "latent_correlation": 0.9,
+                "latent_rmse": 0.4,
+                "latent_variance_ratio": 0.9,
             },
         ]
         agg = aggregate(records)
@@ -107,6 +113,13 @@ class TestAggregate:
         assert agg[1.0]["ekf"]["abs_bias"] == pytest.approx(0.2)
         assert agg[1.0]["pg"]["abs_bias"] == pytest.approx(0.3)
         assert agg[1.0]["ekf_pg_mean_maxdiff"] == pytest.approx(0.06)
+        assert agg[1.0]["latent_correlation"] == pytest.approx(0.85)
+        assert agg[1.0]["latent_rmse"] == pytest.approx(0.3)
+        assert agg[1.0]["latent_variance_ratio"] == pytest.approx(0.8)
+
+    def test_rejects_empty_records(self):
+        with pytest.raises(ValueError, match="records"):
+            aggregate([])
 
 
 class TestScaleCoupling:
@@ -121,6 +134,46 @@ class TestScaleCoupling:
             np.asarray(scaled.osc_frequencies),
             np.asarray(coupling_params_small.osc_frequencies),
         )
+
+    @pytest.mark.parametrize("scale", [-1.0, np.nan])
+    def test_rejects_invalid_scale(self, coupling_params_small, scale):
+        with pytest.raises(ValueError, match="scale"):
+            scale_coupling(coupling_params_small, scale)
+
+
+class TestRunCrosscheckGuards:
+    def test_rejects_empty_scales(self, coupling_params_small):
+        with pytest.raises(ValueError, match="scales"):
+            run_crosscheck(
+                coupling_params_small,
+                scales=[],
+                n_time=10,
+                n_replicates=1,
+                pg_n_iter=4,
+                pg_burn_in=2,
+            )
+
+    def test_rejects_zero_replicates(self, coupling_params_small):
+        with pytest.raises(ValueError, match="n_replicates"):
+            run_crosscheck(
+                coupling_params_small,
+                scales=[1.0],
+                n_time=10,
+                n_replicates=0,
+                pg_n_iter=4,
+                pg_burn_in=2,
+            )
+
+    def test_rejects_negative_scales(self, coupling_params_small):
+        with pytest.raises(ValueError, match="scales"):
+            run_crosscheck(
+                coupling_params_small,
+                scales=[-1.0],
+                n_time=10,
+                n_replicates=1,
+                pg_n_iter=4,
+                pg_burn_in=2,
+            )
 
 
 @pytest.mark.slow
@@ -139,6 +192,12 @@ class TestIntegration:
         for method in ("ekf", "pg"):
             for value in rec[method].values():
                 assert np.isfinite(value)
+        for key in ("latent_correlation", "latent_rmse", "latent_variance_ratio"):
+            assert np.isfinite(rec[key])
+        agg = aggregate(records)
+        agg_key = round(rec["coupling_mag"], 4)
+        for key in ("latent_correlation", "latent_rmse", "latent_variance_ratio"):
+            assert np.isfinite(agg[agg_key][key])
         # strong coupling: both detect perfectly and the two methods agree closely
         assert rec["ekf"]["detection_auc"] == 1.0
         assert rec["pg"]["detection_auc"] == 1.0

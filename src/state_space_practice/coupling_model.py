@@ -18,6 +18,7 @@ estimators. Requires float64 (the test suite enables ``jax_enable_x64``).
 
 from typing import NamedTuple, Optional
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
@@ -110,6 +111,21 @@ class SimulatedCoupling(NamedTuple):
     seed: int
 
 
+def _coupling_x64_enabled() -> bool:
+    """Return whether JAX is configured to honor float64 dtypes."""
+    return bool(jax.config.jax_enable_x64)
+
+
+def require_coupling_x64() -> None:
+    """Raise if JAX x64 is disabled for coupling simulations/estimators."""
+    if not _coupling_x64_enabled():
+        raise RuntimeError(
+            "spike-field coupling simulations and estimators require JAX x64; "
+            "enable it before constructing arrays with "
+            "jax.config.update('jax_enable_x64', True)"
+        )
+
+
 def validate_coupling_params(params: CouplingModelParams) -> None:
     """Validate the cross-field shape and range invariants; raise on violation.
 
@@ -125,9 +141,23 @@ def validate_coupling_params(params: CouplingModelParams) -> None:
 
     Raises
     ------
+    RuntimeError
+        If JAX x64 is disabled. Coupling simulations and estimators rely on
+        float64 to keep oscillator smoothing and logistic Hessians numerically
+        stable.
     ValueError
         If any invariant is violated, with a message naming the offending field.
+    NotImplementedError
+        If ``history_kernel`` is provided. The field is reserved in the parameter
+        contract but is not supported by the simulator or estimators yet.
     """
+    require_coupling_x64()
+
+    if params.history_kernel is not None:
+        raise NotImplementedError(
+            "history_kernel is not yet supported; pass history_kernel=None"
+        )
+
     freq_shape = tuple(np.shape(params.osc_frequencies))
     beta_real_shape = tuple(np.shape(params.beta_real))
     if len(freq_shape) != 1 or freq_shape[0] == 0:
@@ -242,6 +272,8 @@ def build_transition(params: CouplingModelParams) -> tuple[Array, Array]:
     process_covariance : Array, shape (2J, 2J)
         Diagonal process covariance ``diag(repeat(process_noise_var, 2))``.
     """
+    require_coupling_x64()
+
     transition_matrix = construct_common_oscillator_transition_matrix(
         jnp.asarray(params.osc_frequencies),
         jnp.asarray(params.osc_decay),

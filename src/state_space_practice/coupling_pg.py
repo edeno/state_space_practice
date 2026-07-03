@@ -25,6 +25,7 @@ convergence/mixing diagnostic is computed; the caller owns choosing ``n_iter`` a
 """
 
 import numpy as np
+import operator
 from polyagamma import random_polyagamma
 from scipy.linalg import cho_factor, cho_solve, solve_triangular
 
@@ -71,6 +72,14 @@ def fit_coupling_pg(
         mean/variance fields are the sample mean/variance.
     """
     validate_coupling_params(params)
+    try:
+        n_iter = operator.index(n_iter)
+        burn_in = operator.index(burn_in)
+    except TypeError as exc:
+        raise ValueError(
+            f"n_iter and burn_in must be integers; got n_iter={n_iter}, "
+            f"burn_in={burn_in}."
+        ) from exc
     if not 0 <= burn_in < n_iter:
         raise ValueError(
             f"need 0 <= burn_in < n_iter; got burn_in={burn_in}, n_iter={n_iter}"
@@ -128,10 +137,14 @@ def fit_coupling_pg(
             "Polya-Gamma coupling samples contain non-finite values; check the "
             "LFP/spikes and that x64 is enabled"
         )
+    real_mean = real.mean(axis=0)
+    imag_mean = imag.mean(axis=0)
+    real_imag_cov = ((real - real_mean) * (imag - imag_mean)).mean(axis=0)
     return CouplingPosterior(
-        beta_real_mean=real.mean(axis=0),
-        beta_imag_mean=imag.mean(axis=0),
+        beta_real_mean=real_mean,
+        beta_imag_mean=imag_mean,
         beta_real_var=real.var(axis=0),
         beta_imag_var=imag.var(axis=0),
+        beta_real_imag_cov=real_imag_cov,
         samples=real + 1j * imag,
     )
