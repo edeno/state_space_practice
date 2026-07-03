@@ -74,6 +74,15 @@ from state_space_practice.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _validate_nonnegative_array(name: str, value: ArrayLike) -> None:
+    """Validate finite, non-negative model parameters at public boundaries."""
+    arr = jnp.asarray(value)
+    if bool(jnp.any(~jnp.isfinite(arr))):
+        raise ValueError(f"{name} must contain only finite values.")
+    if bool(jnp.any(arr < 0)):
+        raise ValueError(f"{name} must be non-negative.")
+
+
 class BaseModel(ABC, SGDFittableMixin):
     """Abstract base class for switching oscillator models.
 
@@ -132,6 +141,19 @@ class BaseModel(ABC, SGDFittableMixin):
 
     """
 
+    _EM_SNAPSHOT_KEYS = (
+        "smoother_state_cond_mean", "smoother_state_cond_cov",
+        "smoother_discrete_state_prob", "smoother_joint_discrete_state_prob",
+        "smoother_pair_cond_cross_cov", "smoother_pair_cond_means",
+        "continuous_transition_matrix", "process_cov",
+        "measurement_matrix", "measurement_cov",
+        "init_mean", "init_cov",
+        "init_discrete_state_prob", "discrete_transition_matrix",
+        "freqs", "damping_coef", "process_variance",
+        "phase_difference", "coupling_strength",
+        "_current_osc_params", "_transition_suff_stats",
+    )
+
     def __init__(
         self,
         n_oscillators: int,
@@ -171,7 +193,21 @@ class BaseModel(ABC, SGDFittableMixin):
                 (n_discrete_states,), p_stay
             )
         else:
-            self.discrete_transition_diag = jnp.asarray(discrete_transition_diag)
+            diag = jnp.asarray(discrete_transition_diag)
+            if diag.shape != (n_discrete_states,):
+                raise ValueError(
+                    "discrete_transition_diag must have shape "
+                    f"({n_discrete_states},), got {diag.shape}."
+                )
+            if bool(jnp.any(~jnp.isfinite(diag))):
+                raise ValueError(
+                    "discrete_transition_diag must contain only finite values."
+                )
+            if bool(jnp.any((diag < 0) | (diag > 1))):
+                raise ValueError(
+                    "discrete_transition_diag entries must lie in [0, 1]."
+                )
+            self.discrete_transition_diag = diag
 
         # Dirichlet prior for transition matrix (sticky prior)
         from state_space_practice.contingency_belief import get_transition_prior
@@ -206,6 +242,21 @@ class BaseModel(ABC, SGDFittableMixin):
         self.smoother_joint_discrete_state_prob: jax.Array
         self.smoother_pair_cond_cross_cov: jax.Array
         self.smoother_pair_cond_means: jax.Array  # E[x_t | S_t=i, S_{t+1}=j]
+
+    def _snapshot_em_state(self) -> dict:
+        """Capture parameters and smoother outputs for EM rollback."""
+        import copy
+
+        return {
+            key: copy.deepcopy(getattr(self, key))
+            for key in self._EM_SNAPSHOT_KEYS
+            if hasattr(self, key)
+        }
+
+    def _restore_em_state(self, state: dict) -> None:
+        """Restore a state captured by _snapshot_em_state."""
+        for key, value in state.items():
+            setattr(self, key, value)
 
     def __repr__(self) -> str:
         """Returns an unambiguous string representation of the model.
@@ -689,35 +740,28 @@ class BaseModel(ABC, SGDFittableMixin):
             self._initialize_parameters(key)
             self._warm_initialize_states(observations)
         log_likelihoods: list[float] = []
-        # Snapshot keys: smoother outputs the E-step produces, plus the
-        # M-step parameters the subclass may overwrite. On LL decrease we
-        # restore both so the stored (params, smoother) pair is
-        # consistent with the prior iteration.
-        _snapshot_keys = (
-            "smoother_state_cond_mean", "smoother_state_cond_cov",
-            "smoother_discrete_state_prob", "smoother_joint_discrete_state_prob",
-            "smoother_pair_cond_cross_cov", "smoother_pair_cond_means",
-            "continuous_transition_matrix", "process_cov",
-            "measurement_matrix", "measurement_cov",
-            "init_mean", "init_cov",
-            "init_discrete_state_prob", "discrete_transition_matrix",
-        )
+        last_accepted_state: Optional[dict] = None
+        needs_final_e_step = False
 
         for iteration in range(max_iter):
-            # Smoother state attributes (smoother_state_cond_mean etc.)
-            # are not assigned until the first E-step runs, so use
-            # getattr's None default. The matching `if v is not None`
-            # guard in the restore loop skips uninitialised entries.
-            prev_state = {k: getattr(self, k, None) for k in _snapshot_keys}
-
             current_log_likelihood = float(self._e_step(observations))
             log_likelihoods.append(current_log_likelihood)
+            needs_final_e_step = False
 
             if not jnp.isfinite(current_log_likelihood):
-                logger.warning(
-                    f"Non-finite log-likelihood at iteration {iteration + 1}; "
-                    f"stopping EM."
-                )
+                bad_ll = log_likelihoods.pop()
+                if last_accepted_state is not None:
+                    self._restore_em_state(last_accepted_state)
+                    logger.warning(
+                        f"Non-finite log-likelihood at iteration {iteration + 1} "
+                        f"({bad_ll}); rolling back to previous E-step and "
+                        f"stopping EM."
+                    )
+                else:
+                    logger.warning(
+                        f"Non-finite log-likelihood at iteration {iteration + 1}; "
+                        f"stopping EM."
+                    )
                 self.converged_ = False
                 break
 
@@ -727,10 +771,9 @@ class BaseModel(ABC, SGDFittableMixin):
                 )
 
                 if not is_increasing:
-                    for k, v in prev_state.items():
-                        if v is not None:
-                            setattr(self, k, v)
                     bad_ll = log_likelihoods.pop()
+                    if last_accepted_state is not None:
+                        self._restore_em_state(last_accepted_state)
                     logger.warning(
                         f"LL decreased: {log_likelihoods[-1]:.4f} -> "
                         f"{bad_ll:.4f}; rolling back to previous E-step "
@@ -746,8 +789,10 @@ class BaseModel(ABC, SGDFittableMixin):
                     self.converged_ = True
                     break
 
+            last_accepted_state = self._snapshot_em_state()
             self._m_step(observations)
             self._project_parameters()
+            needs_final_e_step = True
 
             change = (
                 current_log_likelihood - log_likelihoods[-2]
@@ -765,10 +810,33 @@ class BaseModel(ABC, SGDFittableMixin):
 
         # Final E-step to sync smoother results with current parameters.
         # Without this, the stored posteriors correspond to the previous
-        # iteration's parameters after the last M-step.
-        if not self.converged_:
+        # iteration's parameters after the last M-step. If the final refresh
+        # reveals that the last M-step was bad, roll back to the last accepted
+        # E-step state instead of returning inconsistent parameters.
+        if needs_final_e_step:
             final_ll = float(self._e_step(observations))
-            log_likelihoods.append(final_ll)
+            if not jnp.isfinite(final_ll):
+                if last_accepted_state is not None:
+                    self._restore_em_state(last_accepted_state)
+                logger.warning(
+                    "Final E-step produced non-finite log-likelihood; "
+                    "rolling back to previous E-step."
+                )
+                self.converged_ = False
+            elif log_likelihoods:
+                _, is_increasing = check_converged(final_ll, log_likelihoods[-1], tol)
+                if is_increasing:
+                    log_likelihoods.append(final_ll)
+                else:
+                    if last_accepted_state is not None:
+                        self._restore_em_state(last_accepted_state)
+                    logger.warning(
+                        f"Final E-step decreased LL: {log_likelihoods[-1]:.4f} -> "
+                        f"{final_ll:.4f}; rolling back to previous E-step."
+                    )
+                    self.converged_ = False
+            else:
+                log_likelihoods.append(final_ll)
 
         return log_likelihoods
 
@@ -924,6 +992,7 @@ class CommonOscillatorModel(BaseModel):
             raise ValueError(
                 f"Shape mismatch: process_variance {process_variance.shape} vs n_oscillators {n_oscillators}"
             )
+        _validate_nonnegative_array("process_variance", process_variance)
         self.process_variance = process_variance
 
         if not isinstance(measurement_variance, (float, int)):
@@ -1204,6 +1273,7 @@ class CorrelatedNoiseModel(BaseModel):
                 "process_variance must have shape (n_oscillators, n_discrete_states)."
                 f" Got {process_variance.shape}."
             )
+        _validate_nonnegative_array("process_variance", process_variance)
         if phase_difference.shape != (n_oscillators, n_oscillators, n_discrete_states):
             raise ValueError(
                 "phase_difference must have shape (n_oscillators, n_oscillators, n_discrete_states)."
@@ -1514,6 +1584,7 @@ class DirectedInfluenceModel(BaseModel):
             raise ValueError(
                 f"Shape mismatch: process_variance {process_variance.shape} vs n_oscillators {n_oscillators}"
             )
+        _validate_nonnegative_array("process_variance", process_variance)
         self.process_variance = process_variance
 
         if not isinstance(measurement_variance, (float, int)):

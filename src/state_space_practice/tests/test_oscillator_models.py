@@ -1067,6 +1067,50 @@ class TestOscillatorModelInputValidation:
                 measurement_variance=0.05,
             )
 
+    def test_com_rejects_negative_process_variance(self) -> None:
+        """COM should reject negative process_variance."""
+        with pytest.raises(ValueError, match="process_variance must be non-negative"):
+            CommonOscillatorModel(
+                n_oscillators=2,
+                n_discrete_states=3,
+                n_sources=4,
+                sampling_freq=100.0,
+                freqs=jnp.array([10.0, 12.0]),
+                damping_coef=jnp.array([0.95, 0.95]),
+                process_variance=jnp.array([0.1, -0.1]),
+                measurement_variance=0.05,
+            )
+
+    def test_cnm_rejects_negative_process_variance(self) -> None:
+        """CNM should reject negative process_variance."""
+        with pytest.raises(ValueError, match="process_variance must be non-negative"):
+            CorrelatedNoiseModel(
+                n_oscillators=2,
+                n_discrete_states=3,
+                sampling_freq=100.0,
+                freqs=jnp.array([10.0, 12.0]),
+                damping_coef=jnp.array([0.95, 0.95]),
+                process_variance=jnp.array([[0.1, 0.1, 0.1], [0.1, -0.1, 0.1]]),
+                measurement_variance=0.05,
+                phase_difference=jnp.zeros((2, 2, 3)),
+                coupling_strength=jnp.zeros((2, 2, 3)),
+            )
+
+    def test_dim_rejects_negative_process_variance(self) -> None:
+        """DIM should reject negative process_variance."""
+        with pytest.raises(ValueError, match="process_variance must be non-negative"):
+            DirectedInfluenceModel(
+                n_oscillators=2,
+                n_discrete_states=3,
+                sampling_freq=100.0,
+                freqs=jnp.array([10.0, 12.0]),
+                damping_coef=jnp.array([0.95, 0.95]),
+                process_variance=jnp.array([0.1, -0.1]),
+                measurement_variance=0.05,
+                phase_difference=jnp.zeros((2, 2, 3)),
+                coupling_strength=jnp.zeros((2, 2, 3)),
+            )
+
     def test_cnm_rejects_negative_measurement_variance(self) -> None:
         """CNM should reject negative measurement variance."""
         with pytest.raises(ValueError, match="measurement_variance must be positive"):
@@ -1806,6 +1850,28 @@ class TestBaseModelPStayValidation:
         assert jnp.all(model.discrete_transition_diag >= 0)
         assert jnp.all(model.discrete_transition_diag <= 0.95)
 
+    @pytest.mark.parametrize(
+        "discrete_transition_diag",
+        [
+            jnp.array([1.2, 0.8]),
+            jnp.array([-0.1, 0.8]),
+            jnp.array([0.9]),
+        ],
+    )
+    def test_user_discrete_transition_diag_is_validated(
+        self, discrete_transition_diag
+    ):
+        """User-provided p_stay vector should have valid shape and range."""
+        with pytest.raises(ValueError, match="discrete_transition_diag"):
+            CommonOscillatorModel(
+                n_oscillators=2, n_discrete_states=2, n_sources=4,
+                sampling_freq=100.0, freqs=jnp.array([8.0, 12.0]),
+                damping_coef=jnp.array([0.95, 0.95]),
+                process_variance=jnp.array([0.1, 0.1]),
+                measurement_variance=0.05,
+                discrete_transition_diag=discrete_transition_diag,
+            )
+
 
 class TestOscillatorEMRollback:
     """EM loop must roll back state on LL decrease.
@@ -1834,3 +1900,41 @@ class TestOscillatorEMRollback:
         assert_em_rolls_back_on_ll_decrease(
             model, (scenario["obs"],), caplog,
         )
+
+    def test_oscillator_em_restores_rejected_parameters(self) -> None:
+        """Rollback should restore the params that produced the last good E-step."""
+        from state_space_practice.simulate.scenarios import simulate_com_scenario
+
+        scenario = simulate_com_scenario(n_time=80, seed=0)
+        p = scenario["params"]
+        model = CommonOscillatorModel(
+            n_oscillators=p["n_oscillators"],
+            n_discrete_states=p["n_discrete_states"],
+            n_sources=p["n_sources"],
+            sampling_freq=p["sampling_freq"],
+            freqs=p["freqs"],
+            damping_coef=p["damping"],
+            process_variance=p["process_variance"],
+            measurement_variance=p["measurement_variance"],
+        )
+
+        real_e_step = model._e_step
+        ll_sequence = iter([0.0, -1e6, -1e6])
+
+        def fake_e_step(*args, **kwargs):
+            real = real_e_step(*args, **kwargs)
+            return jnp.asarray(next(ll_sequence), dtype=real.dtype)
+
+        real_m_step = model._m_step
+
+        def bad_m_step(*args, **kwargs):
+            real_m_step(*args, **kwargs)
+            model.measurement_matrix = model.measurement_matrix + 100.0
+
+        model._e_step = fake_e_step
+        model._m_step = bad_m_step
+
+        log_likelihoods = model.fit(scenario["obs"], max_iter=5)
+
+        assert log_likelihoods == [0.0]
+        assert float(jnp.max(jnp.abs(model.measurement_matrix))) < 1.0
