@@ -353,6 +353,17 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         l2_reg: float = 1e-4,
         **kwargs,
     ) -> Array:
+        # The parent's deterministic-rollout surrogate (use_filter=False) is a
+        # single-trajectory warm-start with no analogue under discrete-state
+        # switching, so this model supports only the filter-based marginal loss.
+        # Reject use_filter=False loudly rather than silently ignoring it.
+        if not use_filter:
+            raise NotImplementedError(
+                "SwitchingHamiltonianJointModel supports only the filter-based "
+                "SGD loss (use_filter=True); the deterministic-rollout surrogate "
+                "used by the non-switching Hamiltonian models is not defined for "
+                "the switching model."
+            )
         _, _, _, marginal_lls = self.filter(lfp_data, spike_data, params)
         lik_loss = -jnp.sum(marginal_lls)
         return lik_loss + l2_reg * mlp_l2_penalty(params["mlp"])

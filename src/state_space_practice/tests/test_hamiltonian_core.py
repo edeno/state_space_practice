@@ -3,7 +3,6 @@
 import jax.numpy as jnp
 
 from state_space_practice.hamiltonian_core import point_process_laplace_update
-from state_space_practice.kalman import psd_solve, symmetrize
 
 
 def test_point_process_laplace_covariance_matches_information_form():
@@ -18,7 +17,9 @@ def test_point_process_laplace_covariance_matches_information_form():
 
     rate_pred = jnp.exp(C @ m_pred + d) * dt
     H_lik = C.T @ (rate_pred[:, None] * C)
-    eye = jnp.eye(P_pred.shape[0])
-    expected = symmetrize(psd_solve(psd_solve(P_pred, eye) + H_lik, eye))
+    # Independent reference: the Laplace posterior covariance is the information
+    # form (P_pred^-1 + H_lik)^-1, computed here via explicit inverses so the
+    # test does not merely mirror the implementation's psd_solve expression.
+    expected = jnp.linalg.inv(jnp.linalg.inv(P_pred) + H_lik)
 
     assert jnp.allclose(P_post, expected, rtol=1e-6, atol=1e-6)

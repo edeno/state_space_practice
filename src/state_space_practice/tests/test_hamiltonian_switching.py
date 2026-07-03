@@ -290,3 +290,26 @@ class TestSwitchingHamiltonianSGDRecovery:
             f"Omega gap {omega_gap:.3f} < 1.0 "
             f"(learned: {model.omega}; true gap is ~12.6)"
         )
+
+
+class TestSwitchingHamiltonianUseFilterGuard:
+    """The switching model has no deterministic-rollout surrogate, so
+    use_filter=False must fail loud rather than silently run the filter."""
+
+    def test_sgd_loss_rejects_use_filter_false(
+        self, switching_model, synthetic_data, params
+    ):
+        lfp, spikes = synthetic_data
+        with pytest.raises(NotImplementedError, match="use_filter=True"):
+            switching_model._sgd_loss_fn(params, lfp, spikes, use_filter=False)
+
+    def test_fit_sgd_rejects_use_filter_false_through_jit(
+        self, switching_model, synthetic_data
+    ):
+        # use_filter is a static Python bool, so the guard is a trace-time
+        # branch. fit_sgd must surface a clean NotImplementedError from inside
+        # the jitted train_step, NOT a TracerBoolConversionError — this asserts
+        # the conditional is JAX-safe.
+        lfp, spikes = synthetic_data
+        with pytest.raises(NotImplementedError, match="use_filter=True"):
+            switching_model.fit_sgd(lfp, spikes, num_steps=1, use_filter=False)
