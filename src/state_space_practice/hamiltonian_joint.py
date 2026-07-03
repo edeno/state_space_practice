@@ -67,7 +67,7 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
 
         # Shared latent dynamics (the Hamiltonian)
         self.mlp_params = init_mlp_params(self.n_cont_states, self.hidden_dims, k_mlp)
-        self.omega = 1.0
+        self.omega: float | Array = 1.0
 
         # LFP head (Gaussian)
         self.C_lfp = jax.random.normal(k_lfp, (n_lfp_sources, self.n_cont_states)) * 0.1
@@ -180,7 +180,7 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         )
         return ekf_rts_backward_pass(m_f, P_f, m_p, P_p, F)
 
-    def fit_sgd(
+    def fit_sgd(  # type: ignore[override]
         self,
         lfp_obs: Array,
         spike_obs: Array,

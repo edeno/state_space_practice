@@ -6,7 +6,7 @@ independent of the observation model.
 
 import jax
 import jax.numpy as jnp
-from typing import Dict, List, Tuple, Callable
+from typing import Callable, Dict, List, Tuple, cast
 from jax import Array
 from state_space_practice.kalman import psd_solve
 
@@ -59,7 +59,7 @@ def get_transition_jacobian(
     """
     def step_fn(state):
         return leapfrog_step(state, params, h_apply_fn, dt)
-    return jax.jacrev(step_fn)(x)
+    return cast(Array, jax.jacrev(step_fn)(x))
 
 def init_mlp_params(
     input_dim: int,
@@ -140,7 +140,7 @@ def apply_mlp(params: Dict[str, Array], x: Array) -> Array:
     """
     # Check if params is batched
     if "w0" in params and params["w0"].ndim > 2:
-        return jax.vmap(apply_mlp, in_axes=(0, None))(params, x)
+        return cast(Array, jax.vmap(apply_mlp, in_axes=(0, None))(params, x))
 
     weight_keys = sorted([k for k in params.keys() if k.startswith("w")])
     omega = params.get("omega", 1.0)
@@ -159,4 +159,4 @@ def apply_mlp(params: Dict[str, Array], x: Array) -> Array:
     h_prior = 0.5 * jnp.sum(p**2) + 0.5 * (omega**2) * jnp.sum(q**2)
     h_mlp = mlp_forward(x) - mlp_forward(jnp.zeros_like(x))
     
-    return h_prior + h_mlp
+    return cast(Array, h_prior + h_mlp)
