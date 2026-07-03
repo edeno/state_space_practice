@@ -275,27 +275,56 @@ def validate_count_array(
         raise ValueError(f"{name} must contain integer-valued counts.")
 
 
+def validate_scalar(
+    value: object,
+    name: str,
+    *,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> float:
+    """Validate a finite real scalar configuration value at a public boundary.
+
+    Returns ``value`` coerced to ``float`` so callers can store the coerced
+    result. Raises ``ValueError`` (rather than a bare ``TypeError``) on
+    non-scalar, non-finite, or out-of-range input.
+    """
+    value_arr = np.asarray(value)
+    if value_arr.shape != ():
+        raise ValueError(f"{name} must be a scalar. Got shape {value_arr.shape}.")
+    value_float = float(value_arr)
+    if not np.isfinite(value_float):
+        raise ValueError(f"{name} must be finite. Got {value}.")
+    if positive and value_float <= 0:
+        raise ValueError(f"{name} must be positive. Got {value}.")
+    if nonnegative and value_float < 0:
+        raise ValueError(f"{name} must be non-negative. Got {value}.")
+    return value_float
+
+
 def _validate_filter_numerics(
     init_covariance: Array,
     n_time: int,
     stacklevel: int = 3,
     filter_name: str = "filter",
     measurement_cov: Optional[Array] = None,
+    process_cov: Optional[Array] = None,
 ) -> None:
-    """Validate init_cov positive definiteness + warn about f32 numerical risk.
+    """Validate covariance numerics + warn about f32 numerical risk.
 
     Shared by the Laplace-EKF point-process path
     (``stochastic_point_process_filter``) and the linear-Gaussian path
     (``kalman_filter`` / ``kalman_smoother``). Both families are Cholesky-
-    based, so strictly-positive-definite ``init_cov`` is a hard requirement
-    and f32 + long-T is a documented risk.
+    based, so strictly-positive-definite ``init_cov`` and measurement covariance
+    are hard requirements, process covariance must be positive semidefinite, and
+    f32 + long-T is a documented risk.
 
     Raises
     ------
     ValueError
-        If ``init_covariance`` is non-square, not symmetric, or has a
-        non-positive minimum eigenvalue. Same check is applied to
-        ``measurement_cov`` when supplied.
+        If ``init_covariance`` is non-square, non-finite, not symmetric, or has
+        a non-positive minimum eigenvalue. Same positive-definite check is
+        applied to ``measurement_cov`` when supplied. ``process_cov`` is checked
+        as positive semidefinite when supplied.
 
     Warns
     -----
@@ -314,10 +343,22 @@ def _validate_filter_numerics(
     is incompatible with ``jax.jit`` tracing, so inner calls must bypass
     the check entirely.
     """
-    if init_covariance.ndim != 2 or init_covariance.shape[0] != init_covariance.shape[1]:
-        raise ValueError(
-            f"init_covariance must be a square 2D matrix, got shape "
-            f"{init_covariance.shape}"
+    validate_covariance(
+        init_covariance,
+        name="init_covariance",
+        require_positive_definite=True,
+    )
+    if measurement_cov is not None:
+        validate_covariance(
+            measurement_cov,
+            name="measurement_cov",
+            require_positive_definite=True,
+        )
+    if process_cov is not None:
+        validate_covariance(
+            process_cov,
+            name="process_cov",
+            require_positive_definite=False,
         )
 
     # Eigenvalue check. eigvalsh is O(d^3) but only runs once per filter
@@ -326,37 +367,6 @@ def _validate_filter_numerics(
     eigs = jnp.linalg.eigvalsh(init_cov_sym)
     min_eig = float(eigs.min())
     max_eig = float(eigs.max())
-
-    if min_eig <= 0:
-        raise ValueError(
-            f"init_covariance is not positive definite "
-            f"(min eigenvalue {min_eig:g}). The filter's Cholesky-based "
-            f"updates require strict positive definiteness; a rank-"
-            f"deficient or indefinite matrix will NaN on the first step. "
-            f"Check the warm-start or init_cov_scale parameter, or "
-            f"supply a known-PD matrix."
-        )
-
-    if measurement_cov is not None:
-        if (
-            measurement_cov.ndim != 2
-            or measurement_cov.shape[0] != measurement_cov.shape[1]
-        ):
-            raise ValueError(
-                f"measurement_cov must be a square 2D matrix, got shape "
-                f"{measurement_cov.shape}"
-            )
-        r_eigs = jnp.linalg.eigvalsh(symmetrize(measurement_cov))
-        r_min_eig = float(r_eigs.min())
-        if r_min_eig <= 0:
-            raise ValueError(
-                f"measurement_cov is not positive definite "
-                f"(min eigenvalue {r_min_eig:g}). Observation-noise "
-                f"covariance R must be strictly positive definite; a "
-                f"rank-deficient or indefinite R makes the innovation "
-                f"covariance H P H' + R singular and the filter will "
-                f"NaN on the first step. Check the R you supplied."
-            )
 
     # Condition number. Cap the denominator to avoid divide-by-zero on
     # an (already-filtered) perfectly-rank-deficient matrix.

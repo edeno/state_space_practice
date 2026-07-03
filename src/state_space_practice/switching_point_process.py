@@ -95,10 +95,7 @@ from state_space_practice.oscillator_utils import (
     construct_common_oscillator_transition_matrix,
     project_coupled_transition_matrix,
 )
-from state_space_practice.point_process_kalman import (
-    _point_process_laplace_update,
-    _validate_spike_counts,
-)
+from state_space_practice.point_process_kalman import _point_process_laplace_update
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.switching_kalman import (
     _update_discrete_state_probabilities,
@@ -111,6 +108,7 @@ from state_space_practice.utils import (
     check_converged,
     make_discrete_transition_matrix,
     stabilize_covariance,
+    validate_count_array,
 )
 from state_space_practice.utils import divide_safe as _divide_safe
 from state_space_practice.utils import scale_likelihood as _scale_likelihood
@@ -2860,7 +2858,7 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 f"spikes shape[1] must match n_neurons={self.n_neurons}, "
                 f"got shape {spikes.shape}"
             )
-        _validate_spike_counts(spikes)
+        validate_count_array(spikes, "spikes")
 
         # Set default random key if not provided
         if key is None:
@@ -3008,7 +3006,7 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         log_likelihoods : list of float
         """
         spikes = jnp.asarray(spikes)
-        _validate_spike_counts(spikes)
+        validate_count_array(spikes, "spikes")
         self._sgd_n_time = spikes.shape[0]
 
         if not hasattr(self, "continuous_transition_matrix") or \

@@ -252,7 +252,7 @@ class TestStochasticPointProcessFilter:
         [
             (0.0, "dt must be positive"),
             (-0.01, "dt must be positive"),
-            (jnp.nan, "dt must be positive"),
+            (jnp.nan, "dt must be finite"),
         ],
     )
     def test_rejects_invalid_dt(self, point_process_test_data, bad_dt, match) -> None:
@@ -700,10 +700,17 @@ class TestPointProcessModel:
         # Default transition is identity
         np.testing.assert_allclose(model.transition_matrix, jnp.eye(5))
 
-    @pytest.mark.parametrize("bad_dt", [0.0, -0.01, jnp.nan])
-    def test_initialization_rejects_invalid_dt(self, bad_dt) -> None:
+    @pytest.mark.parametrize(
+        ("bad_dt", "match"),
+        [
+            (0.0, "dt must be positive"),
+            (-0.01, "dt must be positive"),
+            (jnp.nan, "dt must be finite"),
+        ],
+    )
+    def test_initialization_rejects_invalid_dt(self, bad_dt, match) -> None:
         """Model should reject invalid point-process bin widths."""
-        with pytest.raises(ValueError, match="dt must be positive"):
+        with pytest.raises(ValueError, match=match):
             PointProcessModel(n_state_dims=5, dt=bad_dt)
 
     def test_initialization_custom_params(self) -> None:

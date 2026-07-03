@@ -19,7 +19,6 @@ References
 from __future__ import annotations
 
 import logging
-import math
 import warnings
 from dataclasses import dataclass
 from functools import partial
@@ -32,7 +31,11 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.kalman import rts_backward_scan, symmetrize
-from state_space_practice.utils import validate_count_array, validate_covariance
+from state_space_practice.utils import (
+    validate_count_array,
+    validate_covariance,
+    validate_scalar,
+)
 from state_space_practice.point_process_kalman import (
     _point_process_laplace_update,
     _safe_expected_count,
@@ -46,27 +49,6 @@ logger = logging.getLogger(__name__)
 # the exact divergence adaptive inflation exists to prevent.
 _MAX_INFLATION_MAX_ALPHA = 100.0
 _MAX_INFLATION_GAIN = 1.0e4
-
-
-def _validate_scalar(
-    value: object,
-    name: str,
-    *,
-    positive: bool = False,
-    nonnegative: bool = False,
-) -> float:
-    """Validate finite scalar decoder configuration before JAX dispatch."""
-    value_arr = np.asarray(value)
-    if value_arr.shape != ():
-        raise ValueError(f"{name} must be a scalar. Got shape {value_arr.shape}.")
-    value_float = float(value_arr)
-    if not math.isfinite(value_float):
-        raise ValueError(f"{name} must be finite. Got {value}.")
-    if positive and value_float <= 0:
-        raise ValueError(f"{name} must be positive. Got {value}.")
-    if nonnegative and value_float < 0:
-        raise ValueError(f"{name} must be non-negative. Got {value}.")
-    return value_float
 
 
 @dataclass
@@ -158,9 +140,9 @@ def build_position_dynamics(
     Q : Array, shape (n_state, n_state)
         Process noise covariance.
     """
-    dt = _validate_scalar(dt, "dt", positive=True)
-    q_pos = _validate_scalar(q_pos, "q_pos", nonnegative=True)
-    q_vel = _validate_scalar(q_vel, "q_vel", nonnegative=True)
+    dt = validate_scalar(dt, "dt", positive=True)
+    q_pos = validate_scalar(q_pos, "q_pos", nonnegative=True)
+    q_vel = validate_scalar(q_vel, "q_vel", nonnegative=True)
 
     if include_velocity:
         A = jnp.array([
@@ -409,7 +391,7 @@ class PlaceFieldRateMaps:
                 f"(n_time, n_neurons), got shape {spike_counts.shape}"
             )
         validate_count_array(spike_counts, "spike_counts", allow_empty=False)
-        _validate_scalar(dt, "dt", positive=True)
+        validate_scalar(dt, "dt", positive=True)
 
         if position.shape[0] != spike_counts.shape[0]:
             raise ValueError(
@@ -1119,8 +1101,8 @@ def position_decoder_filter(
             if rate_maps.suggested_q_pos is not None
             else 100.0
         )
-    q_pos = _validate_scalar(q_pos, "q_pos", nonnegative=True)
-    q_vel = _validate_scalar(q_vel, "q_vel", nonnegative=True)
+    q_pos = validate_scalar(q_pos, "q_pos", nonnegative=True)
+    q_vel = validate_scalar(q_vel, "q_vel", nonnegative=True)
 
     A, Q = build_position_dynamics(dt, q_pos, q_vel, include_velocity)
     n_state = A.shape[0]
@@ -1421,18 +1403,18 @@ class PositionDecoder:
         max_newton_iter: int = 3,
         adaptive_inflation: Optional[AdaptiveInflationConfig] = None,
     ):
-        self.dt = _validate_scalar(dt, "dt", positive=True)
-        self.q_pos = _validate_scalar(q_pos, "q_pos", nonnegative=True)
-        self.q_vel = _validate_scalar(q_vel, "q_vel", nonnegative=True)
+        self.dt = validate_scalar(dt, "dt", positive=True)
+        self.q_pos = validate_scalar(q_pos, "q_pos", nonnegative=True)
+        self.q_vel = validate_scalar(q_vel, "q_vel", nonnegative=True)
         n_grid_arr = np.asarray(n_grid)
         if n_grid_arr.shape != () or not np.issubdtype(n_grid_arr.dtype, np.integer):
             raise ValueError(f"n_grid must be an integer scalar, got {n_grid}.")
         if n_grid <= 0:
             raise ValueError(f"n_grid must be positive, got {n_grid}")
-        smoothing_sigma = _validate_scalar(
+        smoothing_sigma = validate_scalar(
             smoothing_sigma, "smoothing_sigma", positive=True
         )
-        occupancy_tau = _validate_scalar(
+        occupancy_tau = validate_scalar(
             occupancy_tau, "occupancy_tau", nonnegative=True
         )
         max_newton_iter_arr = np.asarray(max_newton_iter)

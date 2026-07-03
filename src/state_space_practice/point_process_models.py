@@ -47,7 +47,6 @@ from state_space_practice.switching_kalman import (
     switching_kalman_smoother,
     switching_kalman_smoother_gpb2,
 )
-from state_space_practice.point_process_kalman import _validate_spike_counts
 from state_space_practice.switching_point_process import (
     QRegularizationConfig,
     SpikeObsParams,
@@ -60,6 +59,7 @@ from state_space_practice.utils import (
     make_discrete_transition_matrix,
     shift_to_psd,
     stabilize_covariance,
+    validate_count_array,
     validate_covariance,
     validate_probability_vector,
     validate_transition_matrix,
@@ -924,7 +924,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                 f"spikes shape[1] must match n_neurons={self.n_neurons}, "
                 f"got shape {spikes.shape}"
             )
-        _validate_spike_counts(spikes)
+        validate_count_array(spikes, "spikes")
 
         if key is None:
             key = jax.random.PRNGKey(0)
@@ -1151,7 +1151,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
         log_likelihoods : list of float
         """
         spikes = jnp.asarray(spikes)
-        _validate_spike_counts(spikes)
+        validate_count_array(spikes, "spikes")
         self._sgd_n_time = spikes.shape[0]
 
         if not self._is_initialized():
