@@ -6454,6 +6454,48 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
             err_msg="Q was modified despite update_process_cov=False"
         )
 
+    def test_store_sgd_params_projects_transition_matrices(self) -> None:
+        """SGD-stored A matrices should remain in the oscillator family."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        params, _ = model._build_param_spec()
+        assert "A_blocks_0" in params
+        assert "A_0" not in params
+
+        raw_blocks = jnp.array([
+            [[3.0, 2.0], [0.7, -0.4]],
+            [[-0.3, 0.9], [4.0, 1.2]],
+        ])
+        model._store_sgd_params({
+            "A_blocks_0": raw_blocks,
+            "A_blocks_1": -raw_blocks,
+        })
+
+        for j in range(model.n_discrete_states):
+            A_j = model.continuous_transition_matrix[:, :, j]
+            spectral_radius = float(jnp.max(jnp.abs(jnp.linalg.eigvals(A_j))))
+            assert spectral_radius <= 0.999 + 1e-6
+
+            for row in range(model.n_oscillators):
+                for col in range(model.n_oscillators):
+                    block = A_j[
+                        2 * row : 2 * row + 2,
+                        2 * col : 2 * col + 2,
+                    ]
+                    np.testing.assert_allclose(block[0, 0], block[1, 1], atol=1e-6)
+                    np.testing.assert_allclose(block[0, 1], -block[1, 0], atol=1e-6)
+
 
 class TestSwitchingSpikeOscillatorModelEndToEnd:
     """End-to-end tests for SwitchingSpikeOscillatorModel (Task 7.8).

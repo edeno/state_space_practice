@@ -94,6 +94,8 @@ from jax.typing import ArrayLike
 
 from state_space_practice.kalman import symmetrize
 from state_space_practice.oscillator_utils import (
+    _matrix_to_oscillator_blocks,
+    _oscillator_blocks_to_matrix,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
     project_coupled_transition_matrix,
@@ -857,6 +859,28 @@ def _armijo_line_search(
     )
 
     return jnp.where(found, final_alpha, 0.0)
+
+
+def _transition_matrix_to_scaled_rotation_params(transition_matrix: Array) -> Array:
+    """Extract scaled-rotation block coefficients (a, b) from an even square matrix."""
+    blocks = _matrix_to_oscillator_blocks(transition_matrix)  # (n_osc, n_osc, 2, 2)
+    a = 0.5 * (blocks[..., 0, 0] + blocks[..., 1, 1])
+    b = 0.5 * (blocks[..., 1, 0] - blocks[..., 0, 1])
+    return jnp.stack([a, b], axis=-1)
+
+
+def _scaled_rotation_params_to_transition_matrix(block_params: Array) -> Array:
+    """Build a full transition matrix from scaled-rotation block coefficients (a, b)."""
+    if block_params.ndim != 3 or block_params.shape[0] != block_params.shape[1]:
+        raise ValueError("block_params must have shape (n_osc, n_osc, 2).")
+    if block_params.shape[-1] != 2:
+        raise ValueError("last axis of block_params must contain (a, b).")
+    a = block_params[..., 0]
+    b = block_params[..., 1]
+    row_0 = jnp.stack([a, -b], axis=-1)
+    row_1 = jnp.stack([b, a], axis=-1)
+    blocks = jnp.stack([row_0, row_1], axis=-2)  # (n_osc, n_osc, 2, 2)
+    return _oscillator_blocks_to_matrix(blocks)
 
 
 def _single_neuron_glm_loss(
@@ -3277,10 +3301,11 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         spec = {}
 
         if self.update_continuous_transition_matrix:
-            # Raw A matrices (no oscillator structure enforced)
             for j in range(self.n_discrete_states):
-                k = f"A_{j}"
-                params[k] = self.continuous_transition_matrix[..., j]
+                k = f"A_blocks_{j}"
+                params[k] = _transition_matrix_to_scaled_rotation_params(
+                    self.continuous_transition_matrix[..., j]
+                )
                 spec[k] = UNCONSTRAINED
 
         if self.update_process_cov:
@@ -3329,7 +3354,10 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 axis=-1,
             )
 
-        A = _recon("A", self.continuous_transition_matrix)
+        if any(k.startswith("A_blocks_") for k in params):
+            A = self._reconstruct_A_from_blocks(params)
+        else:
+            A = self.continuous_transition_matrix
         Q = _recon("Q", self.process_cov)
         P0 = _recon("init_cov", self.init_cov)
 
@@ -3356,6 +3384,28 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
 
         return loss
 
+    def _reconstruct_A_from_blocks(self, params: dict) -> Array:
+        """Rebuild the per-state transition matrix from scaled-rotation SGD blocks.
+
+        A per-state block missing from ``params`` falls back to the current
+        transition matrix's own scaled-rotation coefficients, so states that
+        were not optimized are left unchanged.
+        """
+        return jnp.stack(
+            [
+                _scaled_rotation_params_to_transition_matrix(
+                    params.get(
+                        f"A_blocks_{j}",
+                        _transition_matrix_to_scaled_rotation_params(
+                            self.continuous_transition_matrix[..., j]
+                        ),
+                    )
+                )
+                for j in range(self.n_discrete_states)
+            ],
+            axis=-1,
+        )
+
     def _store_sgd_params(self, params):
         if "discrete_transition_matrix" in params:
             self.discrete_transition_matrix = params["discrete_transition_matrix"]
@@ -3367,6 +3417,11 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 weights=params.get("spike_weights", self.spike_params.weights),
             )
 
+        if any(k.startswith("A_blocks_") for k in params):
+            self.continuous_transition_matrix = self._reconstruct_A_from_blocks(
+                params
+            )
+
         def _store_recon(prefix, attr):
             if any(k.startswith(f"{prefix}_") for k in params):
                 setattr(self, attr, jnp.stack(
@@ -3375,9 +3430,9 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                     axis=-1,
                 ))
 
-        _store_recon("A", "continuous_transition_matrix")
         _store_recon("Q", "process_cov")
         _store_recon("init_cov", "init_cov")
+        self._project_parameters()
 
     def _finalize_sgd(self, spikes):
         self._e_step(spikes)
