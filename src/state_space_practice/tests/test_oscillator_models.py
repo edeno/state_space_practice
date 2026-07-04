@@ -620,6 +620,214 @@ class TestEMAlgorithm:
         np.testing.assert_allclose(model.measurement_cov, R_before, rtol=1e-10)
 
 
+def _run_one_em_update(model, observations) -> None:
+    model._initialize_parameters(jax.random.PRNGKey(0))
+    model._e_step(observations)
+    model._m_step(observations)
+    model._project_parameters()
+
+
+def _assert_shared_measurement_covariance(model) -> None:
+    for j in range(1, model.n_discrete_states):
+        np.testing.assert_allclose(
+            model.measurement_cov[..., 0],
+            model.measurement_cov[..., j],
+            atol=1e-10,
+        )
+
+
+def _assert_scaled_rotation_block(block, atol: float = 1e-8) -> None:
+    np.testing.assert_allclose(block[0, 0], block[1, 1], atol=atol)
+    np.testing.assert_allclose(block[0, 1], -block[1, 0], atol=atol)
+
+
+class TestOscillatorPaperStructure:
+    """Regression tests for the COM/CNM/DIM constraints in Hsin et al. 2024."""
+
+    def test_em_pools_observation_covariance_across_states(
+        self, synthetic_observations
+    ) -> None:
+        """Eq. 2.18 estimates one shared R, not state-specific R_j."""
+        obs = synthetic_observations
+        models = [
+            CommonOscillatorModel(
+                n_oscillators=2,
+                n_discrete_states=2,
+                n_sources=obs.shape[1],
+                sampling_freq=100.0,
+                freqs=jnp.array([8.0, 12.0]),
+                damping_coef=jnp.array([0.95, 0.9]),
+                process_variance=jnp.array([0.1, 0.2]),
+                measurement_variance=0.05,
+            ),
+            CorrelatedNoiseModel(
+                n_oscillators=2,
+                n_discrete_states=2,
+                sampling_freq=100.0,
+                freqs=jnp.array([8.0, 12.0]),
+                damping_coef=jnp.array([0.95, 0.9]),
+                process_variance=jnp.ones((2, 2)) * 0.1,
+                measurement_variance=0.05,
+                phase_difference=jnp.zeros((2, 2, 2)),
+                coupling_strength=jnp.zeros((2, 2, 2)),
+            ),
+            DirectedInfluenceModel(
+                n_oscillators=2,
+                n_discrete_states=2,
+                sampling_freq=100.0,
+                freqs=jnp.array([8.0, 12.0]),
+                damping_coef=jnp.array([0.95, 0.9]),
+                process_variance=jnp.array([0.1, 0.2]),
+                measurement_variance=0.05,
+                phase_difference=jnp.zeros((2, 2, 2)),
+                coupling_strength=jnp.zeros((2, 2, 2)),
+            ),
+        ]
+
+        for model in models:
+            _run_one_em_update(model, obs)
+            _assert_shared_measurement_covariance(model)
+
+    def test_cnm_em_projection_preserves_covariance_structure(
+        self, synthetic_observations
+    ) -> None:
+        """CNM Q_j keeps scalar diagonal blocks and symmetric rotation links."""
+        model = CorrelatedNoiseModel(
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.9]),
+            process_variance=jnp.ones((2, 2)) * 0.1,
+            measurement_variance=0.05,
+            phase_difference=jnp.zeros((2, 2, 2)),
+            coupling_strength=jnp.zeros((2, 2, 2)),
+        )
+
+        _run_one_em_update(model, synthetic_observations)
+
+        for state in range(model.n_discrete_states):
+            Q = np.array(model.process_cov[..., state])
+            np.testing.assert_allclose(Q, Q.T, atol=1e-10)
+            assert np.linalg.eigvalsh(Q).min() >= -1e-8
+
+            for osc in range(model.n_oscillators):
+                block = Q[2 * osc:2 * osc + 2, 2 * osc:2 * osc + 2]
+                np.testing.assert_allclose(block[0, 0], block[1, 1], atol=1e-10)
+                np.testing.assert_allclose(block[0, 1], 0.0, atol=1e-10)
+                np.testing.assert_allclose(block[1, 0], 0.0, atol=1e-10)
+
+            upper = Q[0:2, 2:4]
+            lower = Q[2:4, 0:2]
+            _assert_scaled_rotation_block(upper)
+            np.testing.assert_allclose(lower, upper.T, atol=1e-10)
+
+        from state_space_practice.oscillator_utils import (
+            construct_correlated_noise_process_covariance,
+        )
+
+        reconstructed = jnp.stack(
+            [
+                construct_correlated_noise_process_covariance(
+                    model.process_variance[:, state],
+                    model.phase_difference[..., state],
+                    model.coupling_strength[..., state],
+                )
+                for state in range(model.n_discrete_states)
+            ],
+            axis=-1,
+        )
+        np.testing.assert_allclose(model.process_cov, reconstructed, atol=1e-8)
+
+    def test_dim_standard_em_projection_preserves_transition_structure(
+        self, synthetic_observations
+    ) -> None:
+        """Standard DIM EM must return oscillator-block A_j, not arbitrary A_j."""
+        model = DirectedInfluenceModel(
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.9]),
+            process_variance=jnp.array([0.1, 0.2]),
+            measurement_variance=0.05,
+            phase_difference=jnp.zeros((2, 2, 2)),
+            coupling_strength=jnp.zeros((2, 2, 2)),
+            use_reparameterized_mstep=False,
+        )
+
+        _run_one_em_update(model, synthetic_observations)
+
+        for state in range(model.n_discrete_states):
+            A = np.array(model.continuous_transition_matrix[..., state])
+            for row in range(model.n_oscillators):
+                for col in range(model.n_oscillators):
+                    block = A[2 * row:2 * row + 2, 2 * col:2 * col + 2]
+                    _assert_scaled_rotation_block(block)
+            assert np.max(np.abs(np.linalg.eigvals(A))) < 1.0
+
+        diag = jnp.diagonal(model.coupling_strength, axis1=0, axis2=1)
+        np.testing.assert_allclose(diag, 0.0, atol=1e-12)
+
+    def test_dim_standard_em_log_likelihood_does_not_decrease(
+        self, synthetic_observations
+    ) -> None:
+        """Standard projected DIM EM should keep a monotone LL trajectory."""
+        model = DirectedInfluenceModel(
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.9]),
+            process_variance=jnp.array([0.1, 0.2]),
+            measurement_variance=0.05,
+            phase_difference=jnp.zeros((2, 2, 2)),
+            coupling_strength=jnp.zeros((2, 2, 2)),
+            use_reparameterized_mstep=False,
+        )
+
+        log_likelihoods = model.fit(
+            synthetic_observations,
+            jax.random.PRNGKey(42),
+            max_iter=10,
+        )
+
+        diffs = np.diff(np.asarray(log_likelihoods, dtype=float))
+        assert np.all(diffs >= -1e-6), f"LL decreases: {diffs}"
+
+    def test_dim_rejects_nonzero_diagonal_coupling(self) -> None:
+        """DIM diagonal coupling is unused; fail loudly instead of storing it."""
+        bad_coupling = jnp.zeros((2, 2, 2)).at[0, 0, :].set(0.1)
+        with pytest.raises(ValueError, match="diagonal"):
+            DirectedInfluenceModel(
+                n_oscillators=2,
+                n_discrete_states=2,
+                sampling_freq=100.0,
+                freqs=jnp.array([8.0, 12.0]),
+                damping_coef=jnp.array([0.95, 0.9]),
+                process_variance=jnp.array([0.1, 0.2]),
+                measurement_variance=0.05,
+                phase_difference=jnp.zeros((2, 2, 2)),
+                coupling_strength=bad_coupling,
+            )
+
+    def test_dim_rejects_nonzero_diagonal_phase(self) -> None:
+        """DIM diagonal phase is unused; fail loudly instead of storing it."""
+        bad_phase = jnp.zeros((2, 2, 2)).at[0, 0, :].set(0.1)
+        with pytest.raises(ValueError, match="diagonal"):
+            DirectedInfluenceModel(
+                n_oscillators=2,
+                n_discrete_states=2,
+                sampling_freq=100.0,
+                freqs=jnp.array([8.0, 12.0]),
+                damping_coef=jnp.array([0.95, 0.9]),
+                process_variance=jnp.array([0.1, 0.2]),
+                measurement_variance=0.05,
+                phase_difference=bad_phase,
+                coupling_strength=jnp.zeros((2, 2, 2)),
+            )
+
+
 # ============================================================================
 # Tests for Single Discrete State (reduces to standard Kalman)
 # ============================================================================

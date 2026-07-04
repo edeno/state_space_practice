@@ -22,6 +22,7 @@ from state_space_practice.oscillator_utils import (
     construct_directed_influence_transition_matrix,
     extract_dim_params_from_matrix,
     get_block_slice,
+    project_correlated_noise_process_covariance,
     project_coupled_transition_matrix,
     project_matrix_blockwise,
 )
@@ -315,6 +316,55 @@ def test_project_coupled_transition_matrix_simple_case():
     projected = project_coupled_transition_matrix(mat)
 
     assert jnp.allclose(projected, expected_matrix, atol=1e-7)
+
+
+def test_project_coupled_transition_matrix_uses_scaled_rotation_blocks():
+    """Projection must not return SVD reflections inside DIM oscillator blocks."""
+    matrix = jnp.array(
+        [
+            [0.8, 0.4, 0.2, -0.7],
+            [0.1, 0.6, 0.9, 0.3],
+            [-0.5, 0.8, 0.7, -0.2],
+            [0.4, -0.6, 0.5, 0.9],
+        ]
+    )
+
+    projected = np.asarray(project_coupled_transition_matrix(matrix))
+
+    for row in range(2):
+        for col in range(2):
+            block = projected[2 * row:2 * row + 2, 2 * col:2 * col + 2]
+            np.testing.assert_allclose(block[0, 0], block[1, 1], atol=1e-8)
+            np.testing.assert_allclose(block[0, 1], -block[1, 0], atol=1e-8)
+
+
+def test_project_correlated_noise_process_covariance_preserves_structure_and_psd():
+    """CNM Q projection keeps scalar diagonal blocks and symmetric pair blocks."""
+    covariance = jnp.array(
+        [
+            [0.2, 0.04, 0.6, -0.5],
+            [0.04, 0.5, 0.2, 0.7],
+            [0.6, 0.2, 0.3, -0.02],
+            [-0.5, 0.7, -0.02, 0.4],
+        ]
+    )
+
+    projected = np.asarray(project_correlated_noise_process_covariance(covariance))
+
+    np.testing.assert_allclose(projected, projected.T, atol=1e-10)
+    assert np.linalg.eigvalsh(projected).min() >= -1e-8
+
+    for osc in range(2):
+        block = projected[2 * osc:2 * osc + 2, 2 * osc:2 * osc + 2]
+        np.testing.assert_allclose(block[0, 0], block[1, 1], atol=1e-10)
+        np.testing.assert_allclose(block[0, 1], 0.0, atol=1e-10)
+        np.testing.assert_allclose(block[1, 0], 0.0, atol=1e-10)
+
+    upper = projected[0:2, 2:4]
+    lower = projected[2:4, 0:2]
+    np.testing.assert_allclose(upper[0, 0], upper[1, 1], atol=1e-10)
+    np.testing.assert_allclose(upper[0, 1], -upper[1, 0], atol=1e-10)
+    np.testing.assert_allclose(lower, upper.T, atol=1e-10)
 
 
 def test_directed_influence_reduces_to_common_when_uncoupled():
