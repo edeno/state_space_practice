@@ -282,22 +282,42 @@ class TestPlaceFieldRateMaps:
         assert rate_maps.rate_maps.shape == (2, 20, 20)
         assert np.all(np.isfinite(rate_maps.rate_maps))
 
-    def test_from_spike_position_data_zero_occupancy_bins_are_finite(self):
-        """Unvisited bins should not become NaN when shrinkage is disabled."""
+    def test_from_spike_position_data_zero_occupancy_bins_fall_back_to_baseline(
+        self,
+    ):
+        """Unvisited bins revert to the neuron baseline rate (not 0) at tau=0.
+
+        With shrinkage disabled, bins beyond the Gaussian filter's support
+        have a 0/0 smoothed occupancy. Storing 0 would make the decoder read
+        a confident "silent here" (log-rate ~ -23 after the downstream floor)
+        at positions that carry no evidence; the correct no-data fallback is
+        the neuron's session-wide baseline rate.
+        """
         position = np.array([[0.0, 0.0], [100.0, 100.0]])
         spikes = np.array([[1.0], [0.0]])
+        dt = 0.01
 
         rate_maps = PlaceFieldRateMaps.from_spike_position_data(
             position=position,
             spike_counts=spikes,
-            dt=0.01,
+            dt=dt,
             n_grid=101,
             sigma=1.0,
             occupancy_tau=0.0,
         )
 
+        # baseline = total spikes / total time = 1 / (2 * 0.01) = 50 Hz
+        baseline = spikes.sum() / (position.shape[0] * dt)
+
         assert np.all(np.isfinite(rate_maps.rate_maps))
-        assert np.any(rate_maps.rate_maps[0] == 0.0)
+        # The center bin is ~50 bins (>> sigma) from both visited corners, so
+        # its smoothed occupancy underflows to exactly 0 and it must fall back
+        # to the baseline rate rather than 0.
+        center = rate_maps.rate_maps[0, 50, 50]
+        assert center == pytest.approx(baseline)
+        # Guard the interesting condition: the old behavior stored 0 here, so
+        # a nonzero baseline is exactly what distinguishes the fix.
+        assert center > 0.0
 
     def test_from_spike_position_data_length_mismatch(self):
         """Mismatched position/spike lengths should raise ValueError."""

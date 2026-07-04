@@ -500,12 +500,16 @@ class PlaceFieldRateMaps:
             numerator = spike_smooth + effective_tau * baseline_rates[n]
             denominator = occ_smooth + effective_tau
             # With tau=0, bins beyond the Gaussian filter's truncated support
-            # have zero smoothed occupancy; their raw rate is undefined, so
-            # store a finite zero-rate fallback instead of 0/0 NaNs.
+            # have zero smoothed occupancy and a 0/0 raw rate. These are
+            # unvisited positions with no data, so fall back to the neuron's
+            # session-wide baseline rate (the tau->inf prior) rather than 0.
+            # Storing 0 would make the decoder read a confident "neuron is
+            # silent here" (log-rate ~ -23 after the downstream floor) at
+            # positions that carry no evidence at all.
             rate_maps[n] = np.divide(
                 numerator,
                 denominator,
-                out=np.zeros_like(numerator, dtype=np.float64),
+                out=np.full_like(numerator, baseline_rates[n], dtype=np.float64),
                 where=denominator > 0.0,
             )
 
