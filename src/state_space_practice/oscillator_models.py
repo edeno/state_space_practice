@@ -1,4 +1,4 @@
-"""Implementation of the switching oscillator models
+r"""Implementation of the switching oscillator models
 
 References
 ----------
@@ -55,7 +55,6 @@ from state_space_practice.oscillator_utils import (
     project_coupled_transition_matrix,
 )
 from state_space_practice.switching_kalman import (
-    compute_transition_q_function,
     compute_transition_sufficient_stats,
     optimize_dim_transition_params,
     switching_kalman_filter,
@@ -151,7 +150,7 @@ class BaseModel(ABC, SGDFittableMixin):
         "init_discrete_state_prob", "discrete_transition_matrix",
         "freqs", "damping_coef", "process_variance",
         "phase_difference", "coupling_strength",
-        "_current_osc_params", "_transition_suff_stats",
+        "_current_osc_params",
     )
 
     def __init__(
@@ -1665,8 +1664,6 @@ class DirectedInfluenceModel(BaseModel):
     def _m_step(self, observations: ArrayLike) -> None:
         """Performs the M-step, with optional reparameterized transition update.
 
-        Caches transition sufficient statistics for Q-function-aware projection.
-
         Parameters
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
@@ -1676,14 +1673,6 @@ class DirectedInfluenceModel(BaseModel):
             self._m_step_reparameterized(observations)
         else:
             super()._m_step(observations)
-            # Cache sufficient stats for Q-function check in projection
-            self._transition_suff_stats = compute_transition_sufficient_stats(
-                state_cond_smoother_means=self.smoother_state_cond_mean,
-                state_cond_smoother_covs=self.smoother_state_cond_cov,
-                smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
-                pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
-                pair_cond_smoother_means=self.smoother_pair_cond_means,
-            )
 
     def _m_step_reparameterized(self, observations: ArrayLike) -> None:
         """M-step using reparameterized optimization for A.
@@ -1818,36 +1807,20 @@ class DirectedInfluenceModel(BaseModel):
         self.phase_difference = jnp.stack(phase_list, axis=-1)
 
     def _project_parameters(self):
-        """Projects parameters to valid space, preserving EM monotonicity.
+        """Project transition matrices to the DIM oscillator family.
 
         With reparameterized M-step, A is already valid by construction.
-        With standard M-step, projects each A_j to oscillatory block
-        structure and enforces stability (spectral radius < 1), but only
-        accepts changes that don't worsen the Q-function.
+        With standard M-step, the generic Kalman update is unconstrained; the
+        paper's M-step therefore projects each 2x2 block back to scaled-rotation
+        structure and then enforces stability.
         """
         if self.use_reparameterized_mstep:
             return
 
-        suff_stats = getattr(self, "_transition_suff_stats", None)
-
         projected = []
         for j in range(self.n_discrete_states):
             A_unc_j = self.continuous_transition_matrix[..., j]
-            A_proj_j = project_coupled_transition_matrix(A_unc_j)
-
-            if suff_stats is not None:
-                gamma1_j = suff_stats[0][:, :, j]
-                beta_j = suff_stats[1][:, :, j]
-                Q_j = self.process_cov[..., j]
-                q_unc = compute_transition_q_function(
-                    A_unc_j, gamma1_j, beta_j, process_cov=Q_j
-                )
-                q_proj = compute_transition_q_function(
-                    A_proj_j, gamma1_j, beta_j, process_cov=Q_j
-                )
-                A_j = jnp.where(q_proj <= q_unc, A_proj_j, A_unc_j)
-            else:
-                A_j = A_proj_j
+            A_j = project_coupled_transition_matrix(A_unc_j)
 
             # Enforce spectral radius < 1 for stability (unconditional).
             # Stability is a hard physical constraint: an unstable A causes

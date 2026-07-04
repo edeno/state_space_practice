@@ -662,6 +662,37 @@ def _project_to_closest_rotation(matrix: jax.Array) -> jax.Array:
     return jnp.where(is_valid, projected, fallback)
 
 
+def _project_to_scaled_rotation_matrix(matrix: jax.Array) -> jax.Array:
+    """Project a 2x2 matrix to the closest scaled rotation block.
+
+    The oscillator models use blocks of the form ``scale * R(angle)``, i.e.
+    ``[[a, -b], [b, a]]``.  This is a 2D linear subspace of 2x2 matrices, so
+    the Frobenius projection has the closed form below.  This differs from the
+    generic orthogonal Procrustes/SVD projection in
+    ``_project_to_closest_rotation``, which can return a scaled reflection.
+    """
+    if matrix.shape != (2, 2):
+        raise ValueError("Scaled-rotation projection expects a 2x2 matrix.")
+
+    a = 0.5 * (matrix[0, 0] + matrix[1, 1])
+    b = 0.5 * (matrix[1, 0] - matrix[0, 1])
+    projected = jnp.array([[a, -b], [b, a]], dtype=matrix.dtype)
+
+    is_valid = jnp.all(jnp.isfinite(projected))
+    frob_norm = jnp.linalg.norm(matrix, "fro")
+    fallback_scale = jnp.where(
+        jnp.isfinite(frob_norm), frob_norm / jnp.sqrt(2.0), 0.5
+    )
+    fallback = fallback_scale * IDENTITY_2x2.astype(matrix.dtype)
+    return jnp.where(is_valid, projected, fallback)
+
+
+def _scaled_rotation_scale_from_block(block: jax.Array) -> jax.Array:
+    """Return the coupling magnitude of the nearest scaled-rotation block."""
+    projected = _project_to_scaled_rotation_matrix(block)
+    return jnp.sqrt(projected[0, 0] ** 2 + projected[1, 0] ** 2)
+
+
 def _warn_if_rotation_projection_degenerate(transition_matrix: jax.Array) -> None:
     """Emit ONE fallback warning if any 2x2 block would fail rotation projection.
 
@@ -702,7 +733,7 @@ def _get_scaling_factor_from_block(block: jax.Array, eps: float = 1e-12) -> jax.
 
 
 def _extract_scale_and_angle(block: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Extract scaling factor and rotation angle from a 2x2 block via SVD.
+    """Extract scaling factor and rotation angle from a 2x2 oscillator block.
 
     Decomposes ``block ≈ scale * R(angle)`` where R is a rotation matrix.
 
@@ -713,16 +744,17 @@ def _extract_scale_and_angle(block: jax.Array) -> tuple[jax.Array, jax.Array]:
     Returns
     -------
     scale : jax.Array
-        Geometric mean of the singular values, floored at 1e-12 via
-        ``_get_scaling_factor`` to prevent NaN when either singular value
-        underflows to zero (e.g. zero-coupling blocks).
+        Coupling magnitude of the closest scaled-rotation block.
     angle : jax.Array
         Rotation angle in radians.
     """
-    U, s, Vh = jnp.linalg.svd(block)
-    scale = _get_scaling_factor(s)
-    R = U @ Vh
-    angle = jnp.arctan2(R[1, 0], R[0, 0])
+    projected = _project_to_scaled_rotation_matrix(block)
+    scale = jnp.sqrt(projected[0, 0] ** 2 + projected[1, 0] ** 2)
+    angle = jnp.where(
+        scale > 0.0,
+        jnp.arctan2(projected[1, 0], projected[0, 0]),
+        0.0,
+    )
     return scale, angle
 
 
@@ -744,7 +776,7 @@ def _project_diagonal_block(
         The projected diagonal block
     """
     adjusted = block + row_sum_scaling * IDENTITY_2x2
-    projected = _project_to_closest_rotation(adjusted)
+    projected = _project_to_scaled_rotation_matrix(adjusted)
     return projected - row_sum_scaling * IDENTITY_2x2
 
 
@@ -772,7 +804,7 @@ def _project_block(
     result: jax.Array = jax.lax.cond(
         is_diagonal,
         lambda b: _project_diagonal_block(b, row_sum_scaling),
-        lambda b: _project_to_closest_rotation(b),
+        lambda b: _project_to_scaled_rotation_matrix(b),
         block,
     )
     return result
@@ -811,7 +843,7 @@ def project_coupled_transition_matrix(transition_matrix: jax.Array) -> jax.Array
     # --- Pass 1: Calculate scaling factors for all blocks using vmap ---
     # vmap over both oscillator indices
     scaling_factors_all = jax.vmap(
-        jax.vmap(_get_scaling_factor_from_block, in_axes=0), in_axes=0
+        jax.vmap(_scaled_rotation_scale_from_block, in_axes=0), in_axes=0
     )(blocks)  # shape (n_oscillators, n_oscillators)
 
     # Zero out diagonal elements (we only want off-diagonal scaling factors)
