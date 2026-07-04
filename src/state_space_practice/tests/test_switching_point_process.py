@@ -7816,6 +7816,122 @@ class TestEMVerification:
             f"-Q_after={neg_Q_after:.4f}, diff={neg_Q_after - neg_Q_before:.6f}"
         )
 
+    def test_two_step_latent_dependent_filter_matches_path_oracle(self) -> None:
+        """Two-step pair filter should match explicit path enumeration.
+
+        T=2 is the exact point where the GPB pair filter has not yet collapsed
+        away any history needed for the four discrete paths. Nonzero, per-state
+        spike weights exercise the current-state emission indexing.
+        """
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            point_process_kalman_update,
+            switching_point_process_filter,
+        )
+
+        n_states = 2
+        n_latent = 1
+        dt = 0.05
+        init_mean = jnp.array([[0.25, -0.15]])
+        init_cov = jnp.array([[[0.35, 0.55]]])
+        init_prob = jnp.array([0.4, 0.6])
+        Z = jnp.array([[0.75, 0.25], [0.2, 0.8]])
+        A = jnp.array([[[0.65, -0.35]]])
+        Q = jnp.array([[[0.08, 0.05]]])
+        spikes = jnp.array([[1.0, 0.0], [0.0, 2.0]])
+        spike_params = SpikeObsParams(
+            baseline=jnp.array([[0.1, -0.25], [-0.35, 0.45]]),
+            weights=jnp.array([[[0.55, -0.3]], [[-0.45, 0.65]]]),
+        )
+
+        def log_intensity_func(state: Array, params: SpikeObsParams) -> Array:
+            return params.baseline + params.weights @ state
+
+        (
+            _,
+            _,
+            _,
+            pair_cond_filter_mean,
+            pair_cond_filter_cov,
+            pair_cond_filter_prob,
+            filter_ll,
+        ) = switching_point_process_filter(
+            init_mean,
+            init_cov,
+            init_prob,
+            spikes,
+            Z,
+            A,
+            Q,
+            dt,
+            log_intensity_func,
+            spike_params,
+            include_laplace_normalization=True,
+            max_newton_iter=3,
+        )
+
+        path_log_weights = []
+        oracle_means = []
+        oracle_covs = []
+        for i in range(n_states):
+            params_i = SpikeObsParams(
+                baseline=spike_params.baseline[:, i],
+                weights=spike_params.weights[:, :, i],
+            )
+            mean_0, cov_0, loglik_0 = point_process_kalman_update(
+                init_mean[:, i],
+                init_cov[:, :, i],
+                spikes[0],
+                dt,
+                log_intensity_func,
+                params_i,
+                include_laplace_normalization=True,
+                max_newton_iter=3,
+            )
+            for j in range(n_states):
+                pred_mean = A[:, :, j] @ mean_0
+                pred_cov = A[:, :, j] @ cov_0 @ A[:, :, j].T + Q[:, :, j]
+                params_j = SpikeObsParams(
+                    baseline=spike_params.baseline[:, j],
+                    weights=spike_params.weights[:, :, j],
+                )
+                mean_1, cov_1, loglik_1 = point_process_kalman_update(
+                    pred_mean,
+                    pred_cov,
+                    spikes[1],
+                    dt,
+                    log_intensity_func,
+                    params_j,
+                    include_laplace_normalization=True,
+                    max_newton_iter=3,
+                )
+                path_log_weights.append(
+                    jnp.log(init_prob[i]) + jnp.log(Z[i, j]) + loglik_0 + loglik_1
+                )
+                oracle_means.append(mean_1)
+                oracle_covs.append(cov_1)
+
+        path_log_weights = jnp.asarray(path_log_weights).reshape(n_states, n_states)
+        expected_ll = jax.scipy.special.logsumexp(path_log_weights)
+        expected_pair_prob = jnp.exp(path_log_weights - expected_ll)
+        expected_pair_mean = jnp.stack(oracle_means, axis=-1).reshape(
+            n_latent, n_states, n_states
+        )
+        expected_pair_cov = jnp.stack(oracle_covs, axis=-1).reshape(
+            n_latent, n_latent, n_states, n_states
+        )
+
+        np.testing.assert_allclose(filter_ll, expected_ll, rtol=1e-8, atol=1e-8)
+        np.testing.assert_allclose(
+            pair_cond_filter_prob[1], expected_pair_prob, rtol=1e-8, atol=1e-8
+        )
+        np.testing.assert_allclose(
+            pair_cond_filter_mean[1], expected_pair_mean, rtol=1e-8, atol=1e-8
+        )
+        np.testing.assert_allclose(
+            pair_cond_filter_cov[1], expected_pair_cov, rtol=1e-8, atol=1e-8
+        )
+
     def test_shared_mixture_mstep_increases_state_mixture_q(self) -> None:
         """Shared spike params should optimize the state-mixture Q-function."""
         from state_space_practice.switching_point_process import (
