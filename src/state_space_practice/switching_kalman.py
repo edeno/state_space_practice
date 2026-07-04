@@ -1127,24 +1127,26 @@ def switching_kalman_smoother(
             smoother_discrete_state_prob,  # Pr(S_t = j | y_{1:T}), shape (n_discrete_states,),  M_{t | T}(j)
         )
 
-        # 5. Collapse cross covariance
+        # 5. Collapse lag-one cross covariance. _kalman_smoother_update returns
+        # Cov(x_t, x_{t+1}), so keep x_t as the first argument throughout the
+        # mixture collapses.
         (
-            state_cond_smoother_mean_tplus1,  # E[X_{t+1} | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t+1 | T}
             smoother_mean_t_cond_Stplus1,  # E[X_t | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t | T}
-            state_cond_smoother_cross_cov,  # Cov(X_{t+1}, X_t | y_{1:T}, S_{t+1}=k), shape (n_cont_states, n_cont_states, n_discrete_states), V^k_{t+1, t | T}:
+            state_cond_smoother_mean_tplus1,  # E[X_{t+1} | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t+1 | T}
+            state_cond_smoother_cross_cov,  # Cov(X_t, X_{t+1} | y_{1:T}, S_{t+1}=k), shape (n_cont_states, n_cont_states, n_discrete_states), V^k_{t, t+1 | T}:
         ) = collapse_cross_gaussian_mixture_across_states(
-            next_pair_cond_smoother_mean,  # E[X_{t+1} | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_discrete_states, n_discrete_states), x^{j(k)}_{t+1 | T}
             pair_cond_smoother_mean,  # E[X_t | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_discrete_states, n_discrete_states), x^{(j)k}_{t | T}
-            pair_cond_smoother_cross_covs,  # Cov(X_{t+1}, X_t | y_{1:T}, S_t=j, S_{t+1}=k), shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states), V^{j(k)}_{t+1,t | T}
+            next_pair_cond_smoother_mean,  # E[X_{t+1} | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_discrete_states, n_discrete_states), x^{j(k)}_{t+1 | T}
+            pair_cond_smoother_cross_covs,  # Cov(X_t, X_{t+1} | y_{1:T}, S_t=j, S_{t+1}=k), shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states), V^{j(k)}_{t,t+1 | T}
             smoother_backward_cond_prob,  # Pr(S_t=j | S_{t+1}=k, y_{1:T}), shape (n_discrete_states, n_discrete_states), U^{j | k}_t
         )
 
         # Cross collapse to a single Gaussian
         # overall_smoother_cross_cov, shape (n_cont_states, n_cont_states)
         _, _, overall_smoother_cross_cov = collapse_gaussian_mixture_cross_covariance(
-            state_cond_smoother_mean_tplus1,  # E[X_{t+1} | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t+1 | T}
             smoother_mean_t_cond_Stplus1,  # E[X_t | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t | T}
-            state_cond_smoother_cross_cov,  # V^k_{t+1, t | T}: state-conditional smoother cross covariance
+            state_cond_smoother_mean_tplus1,  # E[X_{t+1} | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t+1 | T}
+            state_cond_smoother_cross_cov,  # V^k_{t, t+1 | T}: state-conditional smoother cross covariance
             next_smoother_discrete_prob,  # Pr(S_{t+1} = k | y_{1:T}), M_{t+1 | T}(k)
         )
 
@@ -1459,12 +1461,26 @@ def switching_kalman_smoother_gpb2(
             smoother_discrete_state_prob,
         )
 
-        # Overall lag-one cross covariance (diagnostic): E over (j,k) of the
-        # pair-conditional cross covariance.
-        overall_smoother_cross_cov = jnp.einsum(
-            "abjk,jk->ab",
-            pair_cond_smoother_cross_covs,
-            joint_smoother_discrete_prob,
+        pair_means_flat = mstep_pair_cond_means.reshape(
+            mstep_pair_cond_means.shape[0], -1
+        )
+        next_pair_means_flat = mstep_next_pair_cond_means.reshape(
+            mstep_next_pair_cond_means.shape[0], -1
+        )
+        pair_cross_flat = pair_cond_smoother_cross_covs.reshape(
+            pair_cond_smoother_cross_covs.shape[0],
+            pair_cond_smoother_cross_covs.shape[1],
+            -1,
+        )
+        joint_smoother_prob_flat = joint_smoother_discrete_prob.reshape(-1)
+
+        # Overall lag-one cross covariance Cov(x_t, x_{t+1}) via the law of
+        # total covariance over pair states (S_t, S_{t+1}).
+        _, _, overall_smoother_cross_cov = collapse_gaussian_mixture_cross_covariance(
+            pair_means_flat,
+            next_pair_means_flat,
+            pair_cross_flat,
+            joint_smoother_prob_flat,
         )
 
         # Stabilize the pair probability matrix in the carry only; the output

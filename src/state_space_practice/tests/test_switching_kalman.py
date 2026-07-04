@@ -5351,6 +5351,78 @@ def _small_exact_switching_fixture():
     return init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
 
 
+def _overall_cross_cov_from_pair_moments(
+    overall_smoother_mean,
+    smoother_joint_discrete_state_prob,
+    pair_cond_smoother_cross_cov,
+    pair_cond_smoother_means,
+    next_pair_cond_smoother_means,
+):
+    """Collapse pair-conditional Cov(x_t, x_{t+1}) by total covariance."""
+    mean_diff = pair_cond_smoother_means - overall_smoother_mean[:-1, :, None, None]
+    next_mean_diff = (
+        next_pair_cond_smoother_means - overall_smoother_mean[1:, :, None, None]
+    )
+    return jnp.einsum(
+        "tij,tabij->tab",
+        smoother_joint_discrete_state_prob,
+        pair_cond_smoother_cross_cov,
+    ) + jnp.einsum(
+        "tij,taij,tbij->tab",
+        smoother_joint_discrete_state_prob,
+        mean_diff,
+        next_mean_diff,
+    )
+
+
+class TestSwitchingSmootherCrossCovariance:
+    """Regression tests for marginal lag-one smoother cross-covariances."""
+
+    def test_gpb1_overall_cross_cov_matches_pair_total_covariance(self) -> None:
+        init_mean, init_cov, init_prob, obs, Z, A, Q, H, R = (
+            _small_exact_switching_fixture()
+        )
+        fm, fc, fp, pcm, _, _, _ = switching_kalman_filter(
+            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+        )
+        result = switching_kalman_smoother(fm, fc, fp, pcm[-1], Q, A, Z)
+
+        # GPB1 carries pair means backward. The next-time pair means used at
+        # time t are the following smoother pair means, with the terminal filter
+        # pair mean as the last carry.
+        next_pair_means = jnp.concatenate([result[8][1:], pcm[-1][None]], axis=0)
+        expected_cross = _overall_cross_cov_from_pair_moments(
+            overall_smoother_mean=result[0],
+            smoother_joint_discrete_state_prob=result[3],
+            pair_cond_smoother_cross_cov=result[7],
+            pair_cond_smoother_means=result[8],
+            next_pair_cond_smoother_means=next_pair_means,
+        )
+
+        np.testing.assert_allclose(result[4], expected_cross, rtol=1e-10, atol=1e-10)
+
+    def test_gpb2_overall_cross_cov_matches_pair_total_covariance(self) -> None:
+        from state_space_practice.switching_kalman import switching_kalman_smoother_gpb2
+
+        init_mean, init_cov, init_prob, obs, Z, A, Q, H, R = (
+            _small_exact_switching_fixture()
+        )
+        fm, fc, fp, pcm, pcc, pcp, _ = switching_kalman_filter(
+            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+        )
+        result = switching_kalman_smoother_gpb2(fm, fc, fp, pcm, pcc, pcp, Q, A)
+
+        expected_cross = _overall_cross_cov_from_pair_moments(
+            overall_smoother_mean=result[0],
+            smoother_joint_discrete_state_prob=result[3],
+            pair_cond_smoother_cross_cov=result[7],
+            pair_cond_smoother_means=result[8],
+            next_pair_cond_smoother_means=result[10],
+        )
+
+        np.testing.assert_allclose(result[4], expected_cross, rtol=1e-10, atol=1e-10)
+
+
 class TestExactEStepOracle:
     """Exact path-enumeration oracle for the linear-Gaussian switching E-step."""
 
