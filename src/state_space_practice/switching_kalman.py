@@ -148,7 +148,10 @@ def _cap_covariance_trace(
 
 
 def _warn_if_cov_cap_engaged(
-    covs: jax.Array, max_allowed_trace: jax.Array, label: str
+    covs: jax.Array,
+    max_allowed_trace: jax.Array,
+    label: str,
+    cap_multiplier: float | None = None,
 ) -> None:
     """Emit ONE divergence warning if any covariance-lane trace exceeds the cap.
 
@@ -159,11 +162,14 @@ def _warn_if_cov_cap_engaged(
     some lane), not on every fit. Called from the (non-vmapped) smoother scan
     body, so ``debug_print_if``'s ``lax.cond`` behaves conditionally.
     """
+    if cap_multiplier is None:
+        cap_multiplier = _COV_CAP_MULTIPLIER
+
     traces = jnp.trace(covs, axis1=0, axis2=1)
     debug_print_if(
         jnp.any(traces > max_allowed_trace),
         f"switching_kalman: {label} smoother covariance exceeded the "
-        f"{_COV_CAP_MULTIPLIER:.0e}x-filter cap (max trace {{m:.2e}}); the GPB "
+        f"{cap_multiplier:.0e}x-filter cap (max trace {{m:.2e}}); the GPB "
         f"smoother has diverged and the returned posterior + EM statistics are "
         f"unreliable.",
         m=jnp.max(traces),
@@ -171,6 +177,7 @@ def _warn_if_cov_cap_engaged(
 
 
 _COV_CAP_MULTIPLIER = 1e8
+_GPB2_COV_CAP_MULTIPLIER = 1e2
 _MAX_SMOOTHER_MEAN_ABS = 1e6
 
 
@@ -258,7 +265,15 @@ def _first_timestep_kalman_update(
     obs_t: jax.Array,
     measurement_matrix: jax.Array,
     measurement_cov: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+) -> tuple[
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+    jax.Array,
+]:
     """Handle first timestep with x₁ convention (measurement update only).
 
     For the first observation y₁, we treat init_state_cond_mean/cov as p(x₁ | S₁)
@@ -292,6 +307,11 @@ def _first_timestep_kalman_update(
         For smoother compatibility. At t=1 there is no S₀, so this is broadcast
         to be constant across the S₀ axis (not diagonal); the GPB2 smoother
         relies on that constant-across-i property at the first timestep.
+    pair_cond_filter_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+        Pair-conditional covariance, broadcast over the nonexistent S₀ axis.
+    pair_cond_filter_prob : jax.Array, shape (n_discrete_states, n_discrete_states)
+        Pair-filter probabilities, with P(S₀=i | S₁=j, y₁) represented as
+        uniform because S₀ does not exist under the x₁ convention.
     marginal_log_likelihood : jax.Array
         Log p(y₁) contribution (scalar array)
     """
@@ -335,6 +355,10 @@ def _first_timestep_kalman_update(
         state_cond_filter_cov[:, :, None, :],
         (*state_cond_filter_cov.shape[:2], n_discrete_states, n_discrete_states),
     )
+    pair_cond_filter_prob = jnp.broadcast_to(
+        filter_discrete_prob[None, :] / n_discrete_states,
+        (n_discrete_states, n_discrete_states),
+    )
 
     return (
         state_cond_filter_mean,
@@ -342,6 +366,7 @@ def _first_timestep_kalman_update(
         filter_discrete_prob,
         pair_cond_filter_mean,
         pair_cond_filter_cov,
+        pair_cond_filter_prob,
         marginal_log_likelihood,
     )
 
@@ -363,6 +388,7 @@ def switching_kalman_filter(
     jax.Array,  # Filtered probability of the discrete states
     jax.Array,  # Pair-conditional filter mean trajectory
     jax.Array,  # Pair-conditional filter covariance trajectory
+    jax.Array,  # Pair-conditional discrete probability trajectory
     jax.Array,  # Marginal log likelihood of the observations (scalar array)
 ]:
     """Switching Kalman filter for a linear Gaussian state space model with discrete states.
@@ -413,6 +439,11 @@ def switching_kalman_filter(
         smoother consumes the full trajectory.
     pair_cond_filter_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         Pair-conditional filter covariance trajectory Cov[x_t | S_{t-1}=i, S_t=j, y_{1:t}].
+    pair_cond_filter_prob : jax.Array, shape (n_time, n_discrete_states, n_discrete_states)
+        Pair-filter discrete probability trajectory
+        ``P(S_{t-1}=i, S_t=j | y_{1:t})``. The first timestep broadcasts over
+        the nonexistent previous state and sums to the filtered probability for
+        ``S_1``.
     marginal_log_likelihood : jax.Array
         Marginal log likelihood of the observations (scalar array)
 
@@ -422,7 +453,14 @@ def switching_kalman_filter(
         carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array], obs_t: jax.Array
     ) -> tuple[
         tuple[jax.Array, jax.Array, jax.Array, jax.Array],  # Next carry
-        tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],  # Stacked output
+        tuple[
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+        ],  # Stacked output
     ]:
         """One step of the switching Kalman filter.
 
@@ -499,6 +537,7 @@ def switching_kalman_filter(
             discrete_transition_matrix,  # P(S_t=j | S_{t-1}=i)
             prev_filter_discrete_prob,  # M_{t-1|t-1}(i)
         )
+        pair_cond_filter_prob = filter_backward_cond_prob * filter_discrete_prob[None, :]
 
         marginal_log_likelihood += ll_max + jnp.log(predictive_likelihood_term_sum)
 
@@ -524,6 +563,7 @@ def switching_kalman_filter(
             filter_discrete_prob,
             pair_cond_filter_mean,
             pair_cond_filter_cov,
+            pair_cond_filter_prob,
         )
 
     # Handle first timestep with x₁ convention: measurement update only (no dynamics)
@@ -534,6 +574,7 @@ def switching_kalman_filter(
         first_discrete_prob,
         first_pair_cond_mean,
         first_pair_cond_cov,
+        first_pair_cond_prob,
         first_log_lik,
     ) = _first_timestep_kalman_update(
         init_state_cond_mean,
@@ -554,6 +595,7 @@ def switching_kalman_filter(
         rest_filter_discrete_state_prob,
         rest_pair_cond_filter_mean,
         rest_pair_cond_filter_cov,
+        rest_pair_cond_filter_prob,
     ) = jax.lax.scan(
         _step,
         (
@@ -585,6 +627,9 @@ def switching_kalman_filter(
     pair_cond_filter_cov = jnp.concatenate(
         [first_pair_cond_cov[None, ...], rest_pair_cond_filter_cov], axis=0
     )
+    pair_cond_filter_prob = jnp.concatenate(
+        [first_pair_cond_prob[None, ...], rest_pair_cond_filter_prob], axis=0
+    )
 
     return (
         state_cond_filter_mean,
@@ -592,6 +637,7 @@ def switching_kalman_filter(
         filter_discrete_state_prob,
         pair_cond_filter_mean,
         pair_cond_filter_cov,
+        pair_cond_filter_prob,
         marginal_log_likelihood,
     )
 
@@ -628,6 +674,7 @@ def switching_kalman_viterbi(
         first_state_cond_mean,
         first_state_cond_cov,
         first_discrete_prob,
+        _,
         _,
         _,
         _,
@@ -1164,9 +1211,9 @@ def switching_kalman_smoother_gpb2(
     filter_discrete_state_prob: jax.Array,
     pair_cond_filter_mean: jax.Array,
     pair_cond_filter_cov: jax.Array,
+    pair_cond_filter_prob: jax.Array,
     process_cov: jax.Array,
     continuous_transition_matrix: jax.Array,
-    discrete_state_transition_matrix: jax.Array,
 ) -> tuple[
     jax.Array,  # overall_smoother_mean
     jax.Array,  # overall_smoother_covs
@@ -1182,25 +1229,28 @@ def switching_kalman_smoother_gpb2(
 ]:
     """GPB2 (Kim second-order) switching Kalman smoother.
 
-    Carries pair-conditional (S_t, S_{t+1}) Gaussians through the backward
-    pass instead of collapsing to state-conditional at each step (GPB1). Each
+    Carries pair-conditional (S_t, S_{t+1}) Gaussians and pair discrete
+    probabilities through the backward pass instead of collapsing to
+    state-conditional at each step (GPB1). Each
     backward step combines the pair-conditional smoother of ``x_{t+1}`` (the
     carry) with the pair-conditional *filter* of ``x_t`` to form the
     triple-conditional posterior ``E[x_t | S_{t-1}=i, S_t=j, S_{t+1}=k,
     y_{1:T}]``, which is then marginalized two ways:
 
-    * over ``S_{t+1}=k`` (weighted by ``P(S_{t+1}=k | S_t=j, y_{1:T})``) to give
-      the pair-conditional smoother ``E[x_t | S_{t-1}=i, S_t=j]`` carried to the
-      next backward step;
-    * over ``S_{t-1}=i`` (weighted by ``P(S_{t-1}=i | S_t=j, y_{1:T})``) to give
-      ``E[x_t | S_t=j, S_{t+1}=k]`` and its covariance / cross-covariance, the
-      GPB2 pair-conditional sufficient statistics the M-step consumes.
+    * over ``S_{t+1}=k`` with the carried pair smoother probabilities
+      ``P(S_t=j, S_{t+1}=k | y_{1:T})`` to give the pair-conditional smoother
+      ``E[x_t | S_{t-1}=i, S_t=j]`` carried to the next backward step;
+    * over ``S_{t-1}=i`` with pair-filter probabilities
+      ``P(S_{t-1}=i | S_t=j, y_{1:t})`` to give ``E[x_t | S_t=j, S_{t+1}=k]``
+      and its covariance / cross-covariance, the GPB2 pair-conditional
+      sufficient statistics the M-step consumes.
 
     The ``x_t -> x_{t+1}`` transition is governed by ``A[..., S_{t+1}]``,
     matching :func:`switching_kalman_filter`, :func:`switching_kalman_smoother`
     (GPB1), and the M-step. Unlike GPB1 this consumes the full pair-conditional
     filter trajectory, which is what makes the S² backward recursion
-    well-defined.
+    well-defined. This remains the GPB/Kim moment-matching approximation, not
+    exact path enumeration.
 
     Parameters
     ----------
@@ -1215,9 +1265,12 @@ def switching_kalman_smoother_gpb2(
         returned (whole trajectory) by :func:`switching_kalman_filter`.
     pair_cond_filter_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         Pair-conditional filter covariance Cov[x_t | S_{t-1}=i, S_t=j, y_{1:t}].
+    pair_cond_filter_prob : jax.Array, shape (n_time, n_discrete_states, n_discrete_states)
+        Pair-filter discrete probabilities
+        ``P(S_{t-1}=i, S_t=j | y_{1:t})``. These provide the past-state
+        conditioning weights used when marginalizing the GPB2 triple smoother.
     process_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
     continuous_transition_matrix : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-    discrete_state_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
 
     Returns
     -------
@@ -1234,14 +1287,14 @@ def switching_kalman_smoother_gpb2(
         (
             next_pair_cond_smoother_mean,  # E[x_{t+1} | S_t=j, S_{t+1}=k], (L, Sj, Sk)
             next_pair_cond_smoother_cov,  # (L, L, Sj, Sk)
-            next_smoother_discrete_prob,  # M_{t+1|T}(k), (S,)
+            next_pair_smoother_prob,  # P(S_t=j, S_{t+1}=k | y), (Sj, Sk)
         ) = carry
 
         (
             pair_filter_mean,  # E[x_t | S_{t-1}=i, S_t=j, y_{1:t}], (L, Si, Sj)
             pair_filter_cov,  # (L, L, Si, Sj)
             filter_discrete_prob,  # M_{t|t}(j), (S,)
-            prev_filter_discrete_prob,  # M_{t-1|t-1}(i), (S,); placeholder at t=0
+            pair_filter_prob,  # P(S_{t-1}=i, S_t=j | y_{1:t}), (Si, Sj)
         ) = args
 
         # 1. Triple-conditional RTS update: E[x_t | S_{t-1}=i, S_t=j, S_{t+1}=k].
@@ -1260,16 +1313,21 @@ def switching_kalman_smoother_gpb2(
             continuous_transition_matrix,  # A_k
         )
 
-        # 1b. Stabilize triple-conditional outputs. Cap the covariance trace
-        # relative to the filter covariance and clip means to prevent overflow
-        # on long sequences with extreme damping contrasts, while leaving
-        # well-conditioned problems untouched.
+        # 1b. Stabilize triple-conditional outputs. GPB2 can feed moment-matched
+        # pair covariances back through the RTS update, so apply a moderate
+        # covariance trust region relative to the pair-filter covariance. Keep the
+        # existing huge-cap warning as a separate catastrophic-divergence signal.
         pair_filter_traces = jax.vmap(
             jax.vmap(jnp.trace, in_axes=-1, out_axes=-1), in_axes=-1, out_axes=-1
         )(pair_filter_cov)  # (Si, Sj)
-        max_allowed = jnp.max(pair_filter_traces) * _COV_CAP_MULTIPLIER + 1.0
+        max_filter_trace = jnp.max(pair_filter_traces)
+        max_allowed = max_filter_trace * _GPB2_COV_CAP_MULTIPLIER + 1.0
 
-        _warn_if_cov_cap_engaged(triple_cov, max_allowed, "GPB2")
+        _warn_if_cov_cap_engaged(
+            triple_cov,
+            max_filter_trace * _COV_CAP_MULTIPLIER + 1.0,
+            "GPB2",
+        )
         _cap = partial(_cap_covariance_trace, max_allowed_trace=max_allowed)
         triple_cov = jax.vmap(
             jax.vmap(
@@ -1284,30 +1342,22 @@ def switching_kalman_smoother_gpb2(
         )
         triple_cross = jnp.clip(triple_cross, -max_allowed, max_allowed)
 
-        # 2. Discrete probabilities for the (S_t=j, S_{t+1}=k) pair.
-        (
-            smoother_discrete_state_prob,  # M_{t|T}(j)
-            _smoother_backward_cond_prob,  # P(S_t=j | S_{t+1}=k) — unused here
-            joint_smoother_discrete_prob,  # P(S_t=j, S_{t+1}=k | y_{1:T})
-            smoother_forward_cond_prob,  # W^{k|j} = P(S_{t+1}=k | S_t=j, y_{1:T})
-        ) = _update_smoother_discrete_probabilities(
-            filter_discrete_prob,
-            discrete_state_transition_matrix,
-            next_smoother_discrete_prob,
+        # 2. Discrete pair smoother probabilities for (S_t=j, S_{t+1}=k).
+        joint_smoother_discrete_prob = next_pair_smoother_prob
+        smoother_discrete_state_prob = jnp.sum(joint_smoother_discrete_prob, axis=1)
+        smoother_forward_cond_prob = _divide_safe(
+            joint_smoother_discrete_prob,
+            smoother_discrete_state_prob[:, None],
         )
 
-        # 3. Discrete backward probability for the (S_{t-1}=i, S_t=j) pair, used
-        # to marginalize the past state S_{t-1}: V^{i|j} = P(S_{t-1}=i | S_t=j).
-        # At the earliest step S_0 does not exist, but the pair-conditional
-        # filter is degenerate over S_{t-1} there, so any row-stochastic V is
-        # fine (prev_filter_discrete_prob is a harmless placeholder).
-        _, smoother_backward_cond_prob_prev, _, _ = (
-            _update_smoother_discrete_probabilities(
-                prev_filter_discrete_prob,
-                discrete_state_transition_matrix,
-                smoother_discrete_state_prob,
-            )
-        )  # V^{i|j}, shape (Si, Sj)
+        # 3. Pair-filter backward probability for (S_{t-1}=i, S_t=j). This uses
+        # the actual pair-filter posterior, including the observation likelihood
+        # at time t, instead of reconstructing P(S_{t-1}|S_t) from one-step
+        # marginals alone.
+        smoother_backward_cond_prob_prev = _divide_safe(
+            pair_filter_prob,
+            filter_discrete_prob[None, :],
+        )
 
         # 4. Carry: pair-conditional smoother E[x_t | S_{t-1}=i, S_t=j] obtained
         # by marginalizing the triple over the future S_{t+1}=k with W^{k|j}.
@@ -1344,6 +1394,10 @@ def switching_kalman_smoother_gpb2(
         )
         mstep_next_pair_cond_means = next_pair_cond_smoother_mean  # (L, Sj, Sk)
 
+        pair_smoother_prob_prev = (
+            smoother_backward_cond_prob_prev * smoother_discrete_state_prob[None, :]
+        )
+
         # 6. State-conditional smoother E[x_t | S_t=j] by marginalizing the
         # (S_t=j, S_{t+1}=k) pair over the future with W^{k|j}.
         (
@@ -1373,17 +1427,18 @@ def switching_kalman_smoother_gpb2(
             joint_smoother_discrete_prob,
         )
 
-        # Stabilize the discrete marginal in the carry only, for consistency
-        # when it is reused as next_smoother_discrete_prob; the output array
-        # stores the un-stabilized value for exact joint/marginal consistency.
-        stabilized_smoother_prob = _stabilize_probability_vector(
-            smoother_discrete_state_prob
+        # Stabilize the pair probability matrix in the carry only; the output
+        # arrays store the un-stabilized value for joint/marginal consistency.
+        stabilized_pair_smoother_prob = _stabilize_probability_vector(
+            pair_smoother_prob_prev.reshape(-1)
+        ).reshape(
+            pair_smoother_prob_prev.shape
         )
 
         return (
             carry_pair_cond_mean,  # E[x_t | S_{t-1}=i, S_t=j] — next carry
             carry_pair_cond_cov,
-            stabilized_smoother_prob,
+            stabilized_pair_smoother_prob,
         ), (
             overall_smoother_mean,
             overall_smoother_covs,
@@ -1404,16 +1459,8 @@ def switching_kalman_smoother_gpb2(
     init_carry = (
         pair_cond_filter_mean[-1],
         pair_cond_filter_cov[-1],
-        filter_discrete_state_prob[-1],
+        pair_cond_filter_prob[-1],
     )
-
-    # prev_filter_discrete_prob[t] = M_{t-1|t-1}; the earliest step (t=0) uses a
-    # placeholder because S_0 does not exist (see note in _step). Sliced to the
-    # scan length (n_time - 1) so it is empty when n_time == 1.
-    n_time = filter_discrete_state_prob.shape[0]
-    prev_filter_discrete_prob = jnp.concatenate(
-        [filter_discrete_state_prob[:1], filter_discrete_state_prob], axis=0
-    )[: n_time - 1]
 
     _, (
         overall_smoother_mean,
@@ -1434,7 +1481,7 @@ def switching_kalman_smoother_gpb2(
             pair_cond_filter_mean[:-1],
             pair_cond_filter_cov[:-1],
             filter_discrete_state_prob[:-1],
-            prev_filter_discrete_prob,
+            pair_cond_filter_prob[:-1],
         ),
         reverse=True,
     )
@@ -2437,7 +2484,7 @@ def compute_transition_sufficient_stats(
     gamma1 : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
         E[x_t x_t^T] weighted by joint probability P(S_t=i, S_{t+1}=j), summed over i.
     beta : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-        E[x_t x_{t+1}^T] weighted by joint probability.
+        E[x_{t+1} x_t^T] weighted by joint probability.
     """
     if pair_cond_smoother_means is not None:
         # gamma1[a,b,j] = sum_{t,i} w_t^{ij} * (Cov[x_t | i,j] + m_t^{ij} (m_t^{ij})^T)
@@ -2618,7 +2665,7 @@ def optimize_dim_transition_params(
     gamma1 : jax.Array, shape (n_cont, n_cont)
         Sufficient statistic E[x_t x_t^T].
     beta : jax.Array, shape (n_cont, n_cont)
-        Sufficient statistic E[x_t x_{t+1}^T].
+        Sufficient statistic E[x_{t+1} x_t^T].
     init_params : dict
         Initial parameter values (damping, freq, coupling_strength, phase_diff).
     sampling_freq : float

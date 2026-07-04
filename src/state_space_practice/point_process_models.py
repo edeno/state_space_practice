@@ -592,6 +592,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             filter_discrete_state_prob,
             pair_cond_filter_mean,
             pair_cond_filter_cov,
+            pair_cond_filter_prob,
             marginal_log_likelihood,
         ) = switching_point_process_filter(
             init_state_cond_mean=self.init_mean,
@@ -614,7 +615,6 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             filter_discrete_state_prob=filter_discrete_state_prob,
             process_cov=self.process_cov,
             continuous_transition_matrix=self.continuous_transition_matrix,
-            discrete_state_transition_matrix=self.discrete_transition_matrix,
         )
 
         if self.smoother_type == "gpb2":
@@ -634,6 +634,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                 **smoother_args,
                 pair_cond_filter_mean=pair_cond_filter_mean,
                 pair_cond_filter_cov=pair_cond_filter_cov,
+                pair_cond_filter_prob=pair_cond_filter_prob,
             )
         else:
             (
@@ -649,6 +650,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             ) = switching_kalman_smoother(
                 **smoother_args,
                 last_filter_conditional_cont_mean=pair_cond_filter_mean[-1],
+                discrete_state_transition_matrix=self.discrete_transition_matrix,
             )
             pair_cond_smoother_covs = None
             next_pair_cond_smoother_means = None
@@ -1209,7 +1211,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             log_intensity_func=_linear_log_intensity,
             spike_params=sp,
         )
-        loss = -result[5]
+        loss = -result[6]
 
         # Spike weight L2 penalty (matches EM M-step regularization)
         if self.spike_weight_l2 > 0:
@@ -1847,6 +1849,12 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
             pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
             pair_cond_smoother_means=self.smoother_pair_cond_means,
+            pair_cond_smoother_covs=getattr(
+                self, "smoother_pair_cond_covs", None
+            ),
+            next_pair_cond_smoother_means=getattr(
+                self, "smoother_next_pair_cond_means", None
+            ),
         )
 
     def _m_step_reparameterized(self) -> None:

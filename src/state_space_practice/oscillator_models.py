@@ -615,6 +615,7 @@ class BaseModel(ABC, SGDFittableMixin):
             filter_discrete_state_prob,
             pair_cond_filter_mean,
             _,  # pair_cond_filter_cov trajectory (used by GPB2 only)
+            _,  # pair_cond_filter_prob trajectory (used by GPB2 only)
             marginal_log_likelihood,
         ) = switching_kalman_filter(
             init_state_cond_mean=self.init_mean,
@@ -1195,7 +1196,7 @@ class CommonOscillatorModel(BaseModel):
             measurement_matrix=H,
             measurement_cov=R,
         )
-        return -result[5]  # scalar marginal_ll
+        return -result[6]  # scalar marginal_ll
 
     def _store_sgd_params(self, params: dict) -> None:
         super()._store_sgd_params(params)
@@ -1484,7 +1485,7 @@ class CorrelatedNoiseModel(BaseModel):
             measurement_matrix=self.measurement_matrix,
             measurement_cov=self.measurement_cov,
         )
-        return -result[5]
+        return -result[6]
 
     def _store_sgd_params(self, params: dict) -> None:
         super()._store_sgd_params(params)
@@ -2043,7 +2044,7 @@ class DirectedInfluenceModel(BaseModel):
             measurement_matrix=self.measurement_matrix,
             measurement_cov=R,
         )
-        base_loss = -result[5]
+        base_loss = -result[6]
 
         # Add connectivity penalty if configured
         penalty_config = getattr(self, "_connectivity_penalty", None)

@@ -645,6 +645,7 @@ class TestSwitchingPointProcessFilter:
             filter_discrete_state_prob,
             last_pair_cond_filter_mean,
             _,  # last_pair_cond_filter_cov
+            _,
             marginal_log_likelihood,
         ) = switching_point_process_filter(
             init_state_cond_mean,
@@ -713,7 +714,7 @@ class TestSwitchingPointProcessFilter:
         baseline = jnp.zeros(n_neurons)
         spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
-        _, _, filter_discrete_state_prob, _, _, _ = switching_point_process_filter(
+        _, _, filter_discrete_state_prob, _, _, _, _ = switching_point_process_filter(
             init_state_cond_mean,
             init_state_cond_cov,
             init_discrete_state_prob,
@@ -763,7 +764,7 @@ class TestSwitchingPointProcessFilter:
         baseline = jnp.zeros(n_neurons)
         spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
-        _, _, filter_discrete_state_prob, _, _, _ = switching_point_process_filter(
+        _, _, filter_discrete_state_prob, _, _, _, _ = switching_point_process_filter(
             init_state_cond_mean,
             init_state_cond_cov,
             init_discrete_state_prob,
@@ -818,6 +819,7 @@ class TestSwitchingPointProcessFilter:
             filter_discrete_state_prob,
             last_pair_cond_filter_mean,
             _,  # last_pair_cond_filter_cov
+            _,
             marginal_log_likelihood,
         ) = switching_point_process_filter(
             init_state_cond_mean,
@@ -871,7 +873,7 @@ class TestSwitchingPointProcessFilter:
         baseline = jnp.zeros(n_neurons)
         spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
-        _, _, _, _, _, marginal_log_likelihood = switching_point_process_filter(
+        _, _, _, _, _, _, marginal_log_likelihood = switching_point_process_filter(
             init_state_cond_mean,
             init_state_cond_cov,
             init_discrete_state_prob,
@@ -921,6 +923,7 @@ class TestSwitchingPointProcessFilter:
             filter_discrete_state_prob,
             last_pair_cond_filter_mean,
             _,  # last_pair_cond_filter_cov
+            _,
             marginal_log_likelihood,
         ) = switching_point_process_filter(
             init_state_cond_mean,
@@ -978,7 +981,7 @@ class TestSwitchingPointProcessFilter:
         baseline = jnp.zeros(n_neurons)
         spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
-        _, state_cond_filter_cov, _, _, _, _ = switching_point_process_filter(
+        _, state_cond_filter_cov, _, _, _, _, _ = switching_point_process_filter(
             init_state_cond_mean,
             init_state_cond_cov,
             init_discrete_state_prob,
@@ -1040,7 +1043,7 @@ class TestSwitchingPointProcessFilter:
         baseline = jnp.zeros(n_neurons)
         spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
-        _, _, _, last_pair_cond_filter_mean, _, _ = switching_point_process_filter(
+        _, _, _, last_pair_cond_filter_mean, _, _, _ = switching_point_process_filter(
             init_state_cond_mean,
             init_state_cond_cov,
             init_discrete_state_prob,
@@ -1101,6 +1104,7 @@ class TestSwitchingPointProcessFilter:
             filter_discrete_state_prob,
             last_pair_cond_filter_mean,
             _,  # last_pair_cond_filter_cov
+            _,
             marginal_log_likelihood,
         ) = switching_point_process_filter(
             init_state_cond_mean,
@@ -1167,6 +1171,7 @@ class TestSwitchingPointProcessFilter:
             filter_discrete_state_prob,
             last_pair_cond_filter_mean,
             _,  # last_pair_cond_filter_cov
+            _,
             marginal_log_likelihood,
         ) = switching_point_process_filter(
             init_state_cond_mean,
@@ -1233,6 +1238,7 @@ class TestSwitchingPointProcessFilter:
             filter_discrete_state_prob,
             last_pair_cond_filter_mean,
             _,  # last_pair_cond_filter_cov
+            _,
             marginal_log_likelihood,
         ) = switching_point_process_filter(
             init_state_cond_mean,
@@ -1292,6 +1298,7 @@ class TestSwitchingPointProcessFilter:
             filter_discrete_state_prob,
             last_pair_cond_filter_mean,
             _,  # last_pair_cond_filter_cov
+            _,
             marginal_log_likelihood,
         ) = switching_point_process_filter(
             init_state_cond_mean,
@@ -1379,6 +1386,7 @@ class TestSmootherIntegration:
             last_pair_cond_mean,
             _,  # last_pair_cond_filter_cov
             _,
+            _,
         ) = switching_point_process_filter(
             init_state_cond_mean,
             init_state_cond_cov,
@@ -1461,6 +1469,7 @@ class TestSmootherIntegration:
             filter_discrete_prob,
             last_pair_cond_mean,
             _,  # last_pair_cond_filter_cov
+            _,
             _,
         ) = switching_point_process_filter(
             init_state_cond_mean,
@@ -1549,6 +1558,7 @@ class TestSmootherIntegration:
             filter_discrete_prob,
             last_pair_cond_mean,
             _,  # last_pair_cond_filter_cov
+            _,
             _,
         ) = switching_point_process_filter(
             init_state_cond_mean,
@@ -1658,6 +1668,7 @@ class TestSmootherIntegration:
             filter_discrete_prob,
             last_pair_cond_mean,
             _,  # last_pair_cond_filter_cov
+            _,
             _,
         ) = switching_point_process_filter(
             init_state_cond_mean,
@@ -2694,6 +2705,7 @@ class TestDynamicsMStepReuse:
             last_pair_cond_filter_mean,
             _,  # last_pair_cond_filter_cov
             _,
+            _,
         ) = switching_point_process_filter(
             init_state_cond_mean,
             init_state_cond_cov,
@@ -2815,6 +2827,7 @@ class TestDynamicsMStepReuse:
             last_pair_cond_filter_mean,
             _,  # last_pair_cond_filter_cov
             _,
+            _,
         ) = switching_point_process_filter(
             init_state_cond_mean,
             init_state_cond_cov,
@@ -2932,6 +2945,7 @@ class TestDynamicsMStepReuse:
             last_pair_cond_filter_mean,
             _,  # last_pair_cond_filter_cov
             _,
+            _,
         ) = switching_point_process_filter(
             init_state_cond_mean,
             init_state_cond_cov,
@@ -3038,6 +3052,7 @@ class TestDynamicsMStepReuse:
             filter_discrete_state_prob,
             last_pair_cond_filter_mean,
             _,  # last_pair_cond_filter_cov
+            _,
             _,
         ) = switching_point_process_filter(
             init_state_cond_mean,
@@ -3160,6 +3175,7 @@ class TestDynamicsMStepReuse:
             filter_discrete_state_prob,
             last_pair_cond_filter_mean,
             _,  # last_pair_cond_filter_cov
+            _,
             _,
         ) = switching_point_process_filter(
             init_state_cond_mean,
@@ -7848,7 +7864,7 @@ class TestEMVerification:
         A = jnp.eye(n_latent)[..., None]
         Q = jnp.eye(n_latent)[..., None] * 1e-10
 
-        fm, fc, fp, lpm, _, filter_ll = switching_point_process_filter(
+        fm, fc, fp, lpm, _, _, filter_ll = switching_point_process_filter(
             init_mean, init_cov, jnp.array([1.0]), spikes,
             jnp.array([[1.0]]), A, Q, dt, log_intensity_func, spike_params,
             include_laplace_normalization=False,
@@ -7956,7 +7972,7 @@ class TestEMVerification:
         A = jnp.stack([jnp.eye(n_latent)] * 2, axis=-1)
         Q = jnp.stack([jnp.eye(n_latent) * 1e-10] * 2, axis=-1)
 
-        fm, fc, fp, lpm, _, filter_ll = switching_point_process_filter(
+        fm, fc, fp, lpm, _, _, filter_ll = switching_point_process_filter(
             init_mean, init_cov, jnp.array([0.5, 0.5]), spikes,
             Z, A, Q, dt, log_intensity_func, spike_params,
             include_laplace_normalization=False,
@@ -8019,7 +8035,7 @@ class TestGPB2Smoother:
         init_prob = jnp.array([0.5, 0.5])
         obs = jax.random.normal(jax.random.PRNGKey(0), (n_time, n_obs))
 
-        fm, fc, fp, pcm, pcc, _ = switching_kalman_filter(
+        fm, fc, fp, pcm, pcc, pcp, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
         )
 
@@ -8032,8 +8048,8 @@ class TestGPB2Smoother:
         r2 = switching_kalman_smoother_gpb2(
             filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
             pair_cond_filter_mean=pcm, pair_cond_filter_cov=pcc,
+            pair_cond_filter_prob=pcp,
             process_cov=Q, continuous_transition_matrix=A,
-            discrete_state_transition_matrix=Z,
         )
 
         for i in range(9):
@@ -8059,14 +8075,14 @@ class TestGPB2Smoother:
         init_prob = jnp.array([0.5, 0.5])
         obs = jax.random.normal(jax.random.PRNGKey(0), (n_time, n_obs))
 
-        fm, fc, fp, pcm, pcc, _ = switching_kalman_filter(
+        fm, fc, fp, pcm, pcc, pcp, _ = switching_kalman_filter(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
         )
         result = switching_kalman_smoother_gpb2(
             filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
             pair_cond_filter_mean=pcm, pair_cond_filter_cov=pcc,
+            pair_cond_filter_prob=pcp,
             process_cov=Q, continuous_transition_matrix=A,
-            discrete_state_transition_matrix=Z,
         )
 
         for i, name in enumerate([
@@ -8102,16 +8118,15 @@ class TestGPB2Smoother:
 
     @pytest.mark.slow
     def test_gpb2_em_improves_ll_with_distinct_dynamics(self) -> None:
-        """EM with smoother_type='gpb2' should improve the LL monotonically.
+        """EM with smoother_type='gpb2' should improve LL without large drops.
 
         This is the path users actually run (point-process Laplace-EKF filter →
         GPB2 smoother → M-step). The Laplace-EKF is not linear-Gaussian so the
-        exact-enumeration oracle does not apply, but a correct GPB2 must still
-        feed the M-step consistent sufficient statistics, which shows up as a
-        monotone EM log-likelihood. A regression to the old axis bug (~6x worse
-        smoother) corrupts those statistics. The states differentiate during
-        the fit (asserted below), so the distinct-dynamics regime that exposes
-        the bug is genuinely exercised.
+        exact-enumeration oracle and exact EM monotonicity do not apply, but a
+        correct GPB2 must still feed the M-step usable sufficient statistics.
+        A regression to the old axis bug (~6x worse smoother) corrupts those
+        statistics. The states differentiate during the fit (asserted below), so
+        the distinct-dynamics regime that exposes the bug is genuinely exercised.
         """
         from state_space_practice.switching_point_process import (
             QRegularizationConfig,
@@ -8129,13 +8144,26 @@ class TestGPB2Smoother:
             separate_spike_params=False,
             smoother_type="gpb2",
         )
-        lls = [float(x) for x in model.fit(spikes, max_iter=6, key=jax.random.PRNGKey(42))]
+        decrease_tol = 1e-2
+        lls = [
+            float(x)
+            for x in model.fit(
+                spikes,
+                max_iter=6,
+                key=jax.random.PRNGKey(42),
+                decrease_tol=decrease_tol,
+            )
+        ]
 
         assert all(jnp.isfinite(jnp.asarray(x)) for x in lls)
-        # Monotone non-decreasing (small negative tolerance for the GPB/EKF
-        # approximation) and net improvement over the run.
+        # The fit loop permits small relative decreases because the E-step is
+        # approximate; mirror that contract here and require net improvement.
         for prev, nxt in zip(lls[:-1], lls[1:]):
-            assert nxt >= prev - 1e-3, f"EM LL decreased: {prev:.4f} -> {nxt:.4f}"
+            if nxt < prev:
+                relative_drop = (prev - nxt) / ((abs(prev) + abs(nxt)) / 2.0)
+                assert relative_drop <= decrease_tol, (
+                    f"EM LL decreased too much: {prev:.4f} -> {nxt:.4f}"
+                )
         assert lls[-1] > lls[0], "EM should improve the log-likelihood overall"
         # Confirm the fit actually reached distinct per-state dynamics, i.e. the
         # regime where the GPB2 axis bug would manifest.

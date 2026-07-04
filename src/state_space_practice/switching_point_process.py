@@ -587,7 +587,7 @@ def _first_timestep_point_process_update(
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 1,
     line_search_beta: float = 0.5,
-) -> tuple[Array, Array, Array, Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
     """Handle first timestep with x₁ convention (update only, no prediction).
 
     For the first observation y₁, we treat init_state_cond_mean/cov as p(x₁ | S₁)
@@ -622,8 +622,13 @@ def _first_timestep_point_process_update(
     filter_discrete_prob : Array, shape (n_discrete_states,)
         Posterior discrete state probabilities p(S₁ | y₁)
     pair_cond_filter_mean : Array, shape (n_latent, n_discrete_states, n_discrete_states)
-        For compatibility with smoother, diagonal in first two dims
-        (no pair-conditioning at t=1 since there's no S₀)
+        For smoother compatibility. At t=1 there is no S₀, so this is broadcast
+        to be constant across the S₀ axis (not diagonal).
+    pair_cond_filter_cov : Array, shape (n_latent, n_latent, n_discrete_states, n_discrete_states)
+        Pair-conditional covariance, broadcast over the nonexistent S₀ axis.
+    pair_cond_filter_prob : Array, shape (n_discrete_states, n_discrete_states)
+        Pair-filter probabilities, with P(S₀=i | S₁=j, y₁) represented as
+        uniform because S₀ does not exist under the x₁ convention.
     marginal_log_likelihood : Array
         Log p(y₁) contribution (scalar array)
     """
@@ -671,10 +676,8 @@ def _first_timestep_point_process_update(
     # Marginal log-likelihood contribution
     marginal_log_likelihood = ll_max + jnp.log(norm_const)
 
-    # For smoother compatibility: create pair_cond_filter_mean
-    # At t=1, there's no S₀, so we create a diagonal structure where
-    # pair_cond_mean[:, i, j] = state_cond_mean[:, j] for all i
-    # This ensures the smoother sees the right structure
+    # For smoother compatibility: create pair-conditional values. At t=1,
+    # there's no S₀, so these are constant across the nonexistent S₀ axis.
     pair_cond_filter_mean = jnp.broadcast_to(
         state_cond_filter_mean[:, None, :],
         (state_cond_filter_mean.shape[0], n_discrete_states, n_discrete_states),
@@ -683,6 +686,10 @@ def _first_timestep_point_process_update(
         state_cond_filter_cov[:, :, None, :],
         (*state_cond_filter_cov.shape[:2], n_discrete_states, n_discrete_states),
     )
+    pair_cond_filter_prob = jnp.broadcast_to(
+        filter_discrete_prob[None, :] / n_discrete_states,
+        (n_discrete_states, n_discrete_states),
+    )
 
     return (
         state_cond_filter_mean,
@@ -690,6 +697,7 @@ def _first_timestep_point_process_update(
         filter_discrete_prob,
         pair_cond_filter_mean,
         pair_cond_filter_cov,
+        pair_cond_filter_prob,
         marginal_log_likelihood,
     )
 
@@ -1584,7 +1592,7 @@ def switching_point_process_filter(
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 1,
     line_search_beta: float = 0.5,
-) -> tuple[Array, Array, Array, Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
     """Switching point-process Kalman filter for spike observations.
 
     This filter implements a Switching Linear Dynamical System (SLDS) with
@@ -1646,6 +1654,11 @@ def switching_point_process_filter(
         whole trajectory; GPB1 callers use the last timestep ``[-1]``.
     pair_cond_filter_cov : Array, shape (n_time, n_latent, n_latent, n_discrete_states, n_discrete_states)
         Pair-conditional filter covariance trajectory.
+    pair_cond_filter_prob : Array, shape (n_time, n_discrete_states, n_discrete_states)
+        Pair-filter discrete probabilities
+        ``P(S_{t-1}=i, S_t=j | y_{1:t})``. The first timestep broadcasts over
+        the nonexistent previous state and sums to the filtered probability for
+        ``S_1``.
     marginal_log_likelihood : Array
         Marginal log-likelihood log p(y_{1:T}) (scalar array).
 
@@ -1708,7 +1721,10 @@ def switching_point_process_filter(
     def _step(
         carry: tuple[Array, Array, Array, Array],
         y_t: Array,
-    ) -> tuple[tuple[Array, Array, Array, Array], tuple[Array, Array, Array, Array, Array]]:
+    ) -> tuple[
+        tuple[Array, Array, Array, Array],
+        tuple[Array, Array, Array, Array, Array, Array],
+    ]:
         """One step of the switching point-process filter.
 
         Parameters
@@ -1788,6 +1804,7 @@ def switching_point_process_filter(
             discrete_transition_matrix,
             prev_filter_discrete_prob,
         )
+        pair_cond_filter_prob = filter_backward_cond_prob * filter_discrete_prob[None, :]
 
         # 4. Accumulate marginal log-likelihood
         marginal_log_likelihood += ll_max + jnp.log(predictive_likelihood_term_sum)
@@ -1813,6 +1830,7 @@ def switching_point_process_filter(
             filter_discrete_prob,
             pair_cond_filter_mean,
             pair_cond_filter_cov,
+            pair_cond_filter_prob,
         )
 
     # Handle first timestep with x₁ convention: update-only (no dynamics prediction)
@@ -1823,6 +1841,7 @@ def switching_point_process_filter(
         first_discrete_prob,
         first_pair_cond_mean,
         first_pair_cond_cov,
+        first_pair_cond_prob,
         first_log_lik,
     ) = _first_timestep_point_process_update(
         init_state_cond_mean,
@@ -1845,6 +1864,7 @@ def switching_point_process_filter(
         rest_filter_discrete_state_prob,
         rest_pair_cond_filter_mean,
         rest_pair_cond_filter_cov,
+        rest_pair_cond_filter_prob,
     ) = jax.lax.scan(
         _step,
         (
@@ -1872,6 +1892,9 @@ def switching_point_process_filter(
     pair_cond_filter_cov = jnp.concatenate(
         [first_pair_cond_cov[None, ...], rest_pair_cond_filter_cov], axis=0
     )
+    pair_cond_filter_prob = jnp.concatenate(
+        [first_pair_cond_prob[None, ...], rest_pair_cond_filter_prob], axis=0
+    )
 
     return (
         state_cond_filter_mean,
@@ -1879,6 +1902,7 @@ def switching_point_process_filter(
         filter_discrete_state_prob,
         pair_cond_filter_mean,  # full pair-conditional trajectory (GPB2 smoother)
         pair_cond_filter_cov,  # full pair-conditional cov trajectory
+        pair_cond_filter_prob,  # full pair-filter discrete trajectory
         marginal_log_likelihood,
     )
 
@@ -2489,6 +2513,7 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             filter_discrete_state_prob,
             pair_cond_filter_mean,
             pair_cond_filter_cov,
+            pair_cond_filter_prob,
             marginal_log_likelihood,
         ) = switching_point_process_filter(
             init_state_cond_mean=self.init_mean,
@@ -2513,7 +2538,6 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             filter_discrete_state_prob=filter_discrete_state_prob,
             process_cov=self.process_cov,
             continuous_transition_matrix=self.continuous_transition_matrix,
-            discrete_state_transition_matrix=self.discrete_transition_matrix,
         )
 
         if self.smoother_type == "gpb2":
@@ -2533,6 +2557,7 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 **smoother_args,
                 pair_cond_filter_mean=pair_cond_filter_mean,
                 pair_cond_filter_cov=pair_cond_filter_cov,
+                pair_cond_filter_prob=pair_cond_filter_prob,
             )
         else:
             (
@@ -2548,6 +2573,7 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             ) = switching_kalman_smoother(
                 **smoother_args,
                 last_filter_conditional_cont_mean=pair_cond_filter_mean[-1],
+                discrete_state_transition_matrix=self.discrete_transition_matrix,
             )
             pair_cond_smoother_covs = None
             next_pair_cond_smoother_means = None
@@ -3224,7 +3250,7 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             log_intensity_func=log_int,
             spike_params=sp,
         )
-        loss = -result[5]
+        loss = -result[6]
 
         # Spike weight L2 penalty (matches EM M-step regularization)
         if self.spike_weight_l2 > 0:
