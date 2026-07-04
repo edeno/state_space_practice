@@ -41,6 +41,7 @@ from state_space_practice.switching_kalman import (
     compute_elbo,
     compute_expected_complete_log_likelihood,
     compute_posterior_entropy,
+    compute_transition_q_function,
     switching_kalman_filter,
     switching_kalman_maximization_step,
     switching_kalman_smoother,
@@ -5387,6 +5388,69 @@ class TestVectorizedELBOEquivalence:
         ent_ref = _compute_posterior_entropy_reference(sm_dp, sm_jdp, sc_covs)
         ent_new = compute_posterior_entropy(sm_dp, sm_jdp, sc_covs)
         np.testing.assert_allclose(float(ent_ref), float(ent_new), atol=1e-10)
+
+    def test_single_state_elbo_matches_marginal_likelihood(self):
+        """For K=1, the trajectory-aware ELBO equals exact Kalman evidence."""
+        n_time, n_state, n_obs = 25, 2, 2
+        key = random.PRNGKey(321)
+        obs = random.normal(key, (n_time, n_obs)) * 0.5
+
+        A = jnp.array([[[0.82], [0.15]], [[-0.05], [0.76]]])
+        Q = jnp.array([[[0.2], [0.03]], [[0.03], [0.15]]])
+        H = jnp.eye(n_obs, n_state)[:, :, None]
+        R = jnp.array([[[0.4], [0.02]], [[0.02], [0.35]]])
+        m0 = jnp.zeros((n_state, 1))
+        P0 = jnp.eye(n_state)[:, :, None]
+        pi0 = jnp.array([1.0])
+        Z = jnp.array([[1.0]])
+
+        fm, fc, fp, lpm, _, mll = switching_kalman_filter(
+            m0, P0, pi0, obs, Z, A, Q, H, R
+        )
+        r = switching_kalman_smoother(fm, fc, fp, lpm[-1], Q, A, Z)
+
+        elbo = compute_elbo(
+            obs=obs,
+            state_cond_smoother_means=r[5],
+            state_cond_smoother_covs=r[6],
+            smoother_discrete_state_prob=r[2],
+            smoother_joint_discrete_state_prob=r[3],
+            pair_cond_smoother_cross_cov=r[7],
+            init_state_cond_mean=m0,
+            init_state_cond_cov=P0,
+            init_discrete_state_prob=pi0,
+            continuous_transition_matrix=A,
+            process_cov=Q,
+            measurement_matrix=H,
+            measurement_cov=R,
+            discrete_transition_matrix=Z,
+            pair_cond_smoother_means=r[8],
+        )
+
+        np.testing.assert_allclose(float(elbo), float(mll), rtol=1e-6, atol=1e-6)
+
+
+def test_transition_q_function_uses_process_covariance_weighting() -> None:
+    """Structured A objectives should be weighted by Q^{-1}, not Euclidean norm."""
+    A = jnp.array([[0.8, 0.3], [-0.2, 0.7]])
+    gamma1 = jnp.array([[3.0, 0.4], [0.4, 2.0]])
+    beta = jnp.array([[2.1, -0.3], [0.5, 1.4]])
+    Q = jnp.array([[0.5, 0.1], [0.1, 1.5]])
+
+    q_inv_A = jnp.linalg.solve(Q, A)
+    q_inv_beta = jnp.linalg.solve(Q, beta)
+    expected = 0.5 * jnp.trace(q_inv_A @ gamma1 @ A.T) - jnp.trace(
+        A.T @ q_inv_beta
+    )
+
+    got = compute_transition_q_function(A, gamma1, beta, process_cov=Q)
+    np.testing.assert_allclose(float(got), float(expected), rtol=1e-8, atol=1e-10)
+
+    identity_weighted = compute_transition_q_function(
+        A, gamma1, beta, process_cov=jnp.eye(2)
+    )
+    legacy = compute_transition_q_function(A, gamma1, beta)
+    np.testing.assert_allclose(float(identity_weighted), float(legacy), rtol=1e-8)
 
 
 # --- Viterbi tests ---

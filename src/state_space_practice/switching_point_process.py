@@ -36,7 +36,10 @@ Example::
 
     # E-step
     filter_outputs = switching_point_process_filter(...)
-    smoother_outputs = switching_kalman_smoother(*filter_outputs[:4], ...)
+    smoother_outputs = switching_kalman_smoother(
+        filter_outputs[0], filter_outputs[1], filter_outputs[2],
+        filter_outputs[3][-1], ...
+    )
 
     # M-step for dynamics (A, Q, B, initial state, discrete transitions)
     (
@@ -1200,6 +1203,101 @@ def _single_neuron_glm_step_second_order(
     return new_baseline, new_weights
 
 
+def _single_neuron_glm_step_second_order_mixture(
+    baseline: Array,
+    weights: Array,
+    y_n: Array,
+    state_cond_smoother_mean: Array,
+    state_cond_smoother_cov: Array,
+    state_weights: Array,
+    dt: float,
+    weight_l2: float = 0.0,
+    baseline_prior: Array | None = None,
+    baseline_prior_l2: float = 0.0,
+) -> tuple[Array, Array]:
+    """Single Newton step for a shared Poisson GLM under a Gaussian mixture.
+
+    This is the shared-observation-parameter M-step for a switching model:
+
+        sum_{t,j} gamma_tj E_q[log p(y_t | x_t; b, w) | S_t=j]
+
+    The exponential term is evaluated per state component before mixing, which
+    avoids the bias from collapsing the Gaussian mixture before applying exp.
+    """
+    n_latent = weights.shape[0]
+    params = jnp.concatenate([jnp.atleast_1d(baseline), weights])
+
+    b = params[0]
+    w = params[1:]
+
+    eta_lin = jnp.einsum("tls,l->ts", state_cond_smoother_mean, w)
+    quad = 0.5 * jnp.einsum("tlks,l,k->ts", state_cond_smoother_cov, w, w)
+    eta = b + eta_lin + quad
+    eta_safe = jnp.clip(eta, -20.0, 20.0)
+    mu = jnp.exp(eta_safe) * dt
+
+    weighted_mu = state_weights * mu
+    weighted_y = state_weights * y_n[:, None]
+
+    cov_w = jnp.einsum("tlks,k->tls", state_cond_smoother_cov, w)
+    mean_plus_cov_w = state_cond_smoother_mean + cov_w
+
+    grad_b = jnp.sum(weighted_mu - weighted_y)
+    grad_w = (
+        jnp.einsum("tls,ts->l", mean_plus_cov_w, weighted_mu)
+        - jnp.einsum("tls,ts->l", state_cond_smoother_mean, weighted_y)
+    )
+    grad_w += weight_l2 * w
+
+    if baseline_prior is None:
+        bp = jnp.zeros_like(b)
+    else:
+        bp = baseline_prior
+    grad_b += baseline_prior_l2 * (b - bp)
+    grad = jnp.concatenate([jnp.atleast_1d(grad_b), grad_w])
+
+    hess_bb = jnp.sum(weighted_mu) + baseline_prior_l2
+    hess_bw = jnp.einsum("tls,ts->l", mean_plus_cov_w, weighted_mu)
+    hess_ww = jnp.einsum(
+        "tls,ts,tks->lk", mean_plus_cov_w, weighted_mu, mean_plus_cov_w
+    )
+    hess_ww += jnp.einsum("tlks,ts->lk", state_cond_smoother_cov, weighted_mu)
+    hess_ww += weight_l2 * jnp.eye(n_latent)
+
+    hess = jnp.zeros((1 + n_latent, 1 + n_latent))
+    hess = hess.at[0, 0].set(hess_bb)
+    hess = hess.at[0, 1:].set(hess_bw)
+    hess = hess.at[1:, 0].set(hess_bw)
+    hess = hess.at[1:, 1:].set(hess_ww)
+
+    hess_scale = jnp.maximum(jnp.max(jnp.abs(jnp.diag(hess))), 1.0)
+    hess_reg = hess + (1e-4 * hess_scale) * jnp.eye(1 + n_latent)
+    delta = jnp.linalg.solve(hess_reg, grad)
+
+    def loss_fn(p: Array) -> Array:
+        b_trial = p[0]
+        w_trial = p[1:]
+        eta_lin_trial = jnp.einsum("tls,l->ts", state_cond_smoother_mean, w_trial)
+        quad_trial = 0.5 * jnp.einsum(
+            "tlks,l,k->ts", state_cond_smoother_cov, w_trial, w_trial
+        )
+        eta_trial = b_trial + eta_lin_trial + quad_trial
+        mu_trial = jnp.exp(jnp.clip(eta_trial, -20.0, 20.0)) * dt
+        loss = jnp.sum(
+            state_weights * (mu_trial - y_n[:, None] * (b_trial + eta_lin_trial))
+        )
+        loss += 0.5 * weight_l2 * jnp.dot(w_trial, w_trial)
+        loss += 0.5 * baseline_prior_l2 * (b_trial - bp) ** 2
+        return loss
+
+    current_loss = loss_fn(params)
+    alpha = _armijo_line_search(
+        params, delta, grad, loss_fn, current_loss, beta=0.5, max_iter=10
+    )
+    new_params = params - alpha * delta
+    return new_params[0], new_params[1:]
+
+
 def update_spike_glm_params(
     spikes: Array,
     smoother_mean: Array,
@@ -1378,6 +1476,90 @@ def update_spike_glm_params(
         )
 
     return SpikeObsParams(baseline=final_baselines, weights=final_weights)
+
+
+def update_spike_glm_params_mixture(
+    spikes: Array,
+    state_cond_smoother_mean: Array,
+    state_cond_smoother_cov: Array,
+    state_weights: Array,
+    current_params: SpikeObsParams,
+    dt: float,
+    max_iter: int = 10,
+    weight_l2: float = 0.0,
+    baseline_prior: Array | None = None,
+    baseline_prior_l2: float = 0.0,
+) -> SpikeObsParams:
+    """M-step for shared spike GLM parameters under a switching posterior.
+
+    Unlike ``update_spike_glm_params`` on a collapsed marginal Gaussian, this
+    keeps the discrete-state mixture inside the Poisson expectation:
+
+        sum_j gamma_tj exp(b + w' m_tj + 0.5 w' P_tj w).
+    """
+    spikes = jnp.asarray(spikes)
+    state_weights = jnp.asarray(state_weights)
+    n_time, n_latent, n_states = state_cond_smoother_mean.shape
+
+    if spikes.shape[0] != n_time:
+        raise ValueError(
+            f"spikes has {spikes.shape[0]} time steps, expected {n_time}."
+        )
+    if state_cond_smoother_cov.shape != (n_time, n_latent, n_latent, n_states):
+        raise ValueError(
+            "state_cond_smoother_cov shape incompatible with "
+            f"state_cond_smoother_mean: got {state_cond_smoother_cov.shape}."
+        )
+    if state_weights.shape != (n_time, n_states):
+        raise ValueError(
+            f"state_weights shape {state_weights.shape} incompatible with "
+            f"expected {(n_time, n_states)}."
+        )
+
+    baselines = current_params.baseline
+    weights = current_params.weights
+
+    for _ in range(max_iter):
+        if baseline_prior is not None:
+
+            def update_neuron(b, w, y_n, bp):
+                return _single_neuron_glm_step_second_order_mixture(
+                    b,
+                    w,
+                    y_n,
+                    state_cond_smoother_mean,
+                    state_cond_smoother_cov,
+                    state_weights,
+                    dt,
+                    weight_l2,
+                    bp,
+                    baseline_prior_l2,
+                )
+
+            baselines, weights = jax.vmap(update_neuron, in_axes=(0, 0, 1, 0))(
+                baselines, weights, spikes, baseline_prior
+            )
+        else:
+
+            def update_neuron_no_prior(b, w, y_n):
+                return _single_neuron_glm_step_second_order_mixture(
+                    b,
+                    w,
+                    y_n,
+                    state_cond_smoother_mean,
+                    state_cond_smoother_cov,
+                    state_weights,
+                    dt,
+                    weight_l2,
+                    None,
+                    baseline_prior_l2,
+                )
+
+            baselines, weights = jax.vmap(
+                update_neuron_no_prior, in_axes=(0, 0, 1)
+            )(baselines, weights, spikes)
+
+    return SpikeObsParams(baseline=baselines, weights=weights)
 
 
 @functools.partial(
@@ -1873,9 +2055,8 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             Switching smoother algorithm. Must be "gpb1" or "gpb2".
             GPB2 carries S² pair-conditional Gaussians through the backward
             pass (vs S state-conditional for GPB1), providing better numerical
-            stability for long sequences with sparse observations. The
-            dynamics M-step receives correct (S_t, S_{t+1})-conditioned
-            sufficient statistics from both smoother types.
+            stability for long sequences with sparse observations and cleaner
+            pair-conditioned transition statistics for the dynamics M-step.
 
         Raises
         ------
@@ -2522,8 +2703,7 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
     def _m_step_spikes(self, spikes: Array) -> None:
         """M-step for spike observation parameters: baseline and weights.
 
-        Updates the spike GLM parameters by calling `update_spike_glm_params`
-        with the marginalized smoother mean (averaged over discrete states).
+        Updates the spike GLM parameters from the smoother posterior.
         Parameters are only updated if `update_spike_params` is True.
 
         Parameters
@@ -2536,34 +2716,11 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         This method must be called after `_e_step()` which populates the smoother
         output attributes used here.
 
-        The spike GLM update uses the marginal smoother mean, which is computed
-        by marginalizing the state-conditional smoother means over discrete states:
-
-            E[x_t | y_{1:T}] = sum_j P(S_t=j | y_{1:T}) * E[x_t | y_{1:T}, S_t=j]
-
-        This is the standard "plug-in" M-step for the spike parameters.
-
-        If ``separate_spike_params`` is True, this method instead fits one
-        spike GLM per discrete state using state-conditional means/covariances
-        and state responsibilities as time weights.
-
-        **Limitation (shared-parameter mode)**: This approach uses a single
-        marginalized mean and ignores both the per-state posterior means and
-        the posterior covariance. For a switching model with nonlinear log-link
-        observation model, the correct EM objective would require:
-
-        1. State-conditional expectations: E_q[log p(y|x) | S_t=j] for each state
-        2. Integration over posterior covariance (second-order correction)
-
-        The current implementation can introduce bias when state-conditional
-        latents differ significantly. For improved accuracy, consider:
-
-        - ``update_spike_glm_params(..., use_second_order=True)`` with
-          aggregated state-conditional covariances (the second-order path
-          already used here for the covariance correction)
-        - Fitting separate observation parameters per discrete state
-          (``separate_spike_params=True``)
-
+        If ``separate_spike_params`` is True, this method fits one spike GLM
+        per discrete state using state responsibilities as time weights. If
+        parameters are shared, it maximizes the state-mixture expected Poisson
+        log-likelihood directly, keeping the exponential expectation inside
+        the discrete-state sum.
         """
         if not self.update_spike_params:
             return
@@ -2621,69 +2778,22 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             )
             return
 
-        # Compute marginalized smoother mean by weighting state-conditional means
-        # by discrete state probabilities
-        # smoother_state_cond_mean: (n_time, n_latent, n_discrete_states)
-        # smoother_discrete_state_prob: (n_time, n_discrete_states)
-        # Result: (n_time, n_latent)
-        smoother_mean = jnp.einsum(
-            "tls,ts->tl",
-            self.smoother_state_cond_mean,
-            self.smoother_discrete_state_prob,
-        )
+        if self.spike_baseline_prior_l2 > 0:
+            mean_counts = jnp.mean(spikes, axis=0)
+            baseline_prior = jnp.log(mean_counts / self.dt + 1e-10)
+        else:
+            baseline_prior = None
 
-        # Compute marginalized smoother covariance using law of total variance:
-        # Var[x] = E[Var[x|S]] + Var[E[x|S]]
-        #
-        # E[Var[x|S]] = sum_j P(S=j) * Cov[x|S=j]
-        # smoother_state_cond_cov: (n_time, n_latent, n_latent, n_discrete_states)
-        expected_cov = jnp.einsum(
-            "tlks,ts->tlk",
-            self.smoother_state_cond_cov,
-            self.smoother_discrete_state_prob,
-        )
-
-        # Var[E[x|S]] = sum_j P(S=j) * (m_j - m)(m_j - m)^T
-        # where m = E[x] is the marginal mean computed above
-        # smoother_state_cond_mean: (n_time, n_latent, n_discrete_states)
-        # smoother_mean: (n_time, n_latent)
-        mean_deviation = (
-            self.smoother_state_cond_mean - smoother_mean[:, :, None]
-        )  # (n_time, n_latent, n_discrete_states)
-        # Outer product weighted by state probabilities
-        var_of_mean = jnp.einsum(
-            "tls,tks,ts->tlk",
-            mean_deviation,
-            mean_deviation,
-            self.smoother_discrete_state_prob,
-        )
-
-        # Total marginal covariance
-        smoother_cov = expected_cov + var_of_mean
-
-        # Clip covariance eigenvalues to prevent numerical instability in
-        # the second-order M-step. Large covariances (from early EM iterations
-        # with poor initialization) can cause the Newton optimization to diverge.
-        # Max eigenvalue of 1.0 corresponds to std dev ~1 in latent space.
-        max_cov_eigenvalue = 1.0
-
-        def clip_cov_eigenvalues(cov: Array) -> Array:
-            cov = symmetrize(cov)
-            eigvals, eigvecs = jnp.linalg.eigh(cov)
-            eigvals_clipped = jnp.clip(eigvals, 0.0, max_cov_eigenvalue)
-            return eigvecs @ jnp.diag(eigvals_clipped) @ eigvecs.T
-
-        smoother_cov_clipped = jax.vmap(clip_cov_eigenvalues)(smoother_cov)
-
-        # Update spike GLM parameters with second-order correction
-        self.spike_params = update_spike_glm_params(
+        self.spike_params = update_spike_glm_params_mixture(
             spikes=spikes,
-            smoother_mean=smoother_mean,
+            state_cond_smoother_mean=self.smoother_state_cond_mean,
+            state_cond_smoother_cov=self.smoother_state_cond_cov,
+            state_weights=self.smoother_discrete_state_prob,
             current_params=self.spike_params,
             dt=self.dt,
             weight_l2=self.spike_weight_l2,
-            smoother_cov=smoother_cov_clipped,
-            use_second_order=True,
+            baseline_prior=baseline_prior,
+            baseline_prior_l2=self.spike_baseline_prior_l2,
         )
 
     def _project_parameters(self) -> None:

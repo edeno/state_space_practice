@@ -1194,7 +1194,7 @@ def switching_kalman_smoother_gpb2(
       next backward step;
     * over ``S_{t-1}=i`` (weighted by ``P(S_{t-1}=i | S_t=j, y_{1:T})``) to give
       ``E[x_t | S_t=j, S_{t+1}=k]`` and its covariance / cross-covariance, the
-      exact pair-conditional sufficient statistics the M-step consumes.
+      GPB2 pair-conditional sufficient statistics the M-step consumes.
 
     The ``x_t -> x_{t+1}`` transition is governed by ``A[..., S_{t+1}]``,
     matching :func:`switching_kalman_filter`, :func:`switching_kalman_smoother`
@@ -1761,9 +1761,9 @@ def _compute_expected_complete_log_likelihood_reference(
 ) -> jax.Array:
     """Compute the expected complete-data log-likelihood E_q[log p(y, x, s | θ)].
 
-    This is the Q-function that the EM algorithm maximizes. For variational EM,
-    the ELBO = Q - entropy(q), and the Q-function should increase (or stay same)
-    after each M-step.
+    This is the Q-function that the EM algorithm maximizes for a fixed
+    approximate posterior. The optional pair-conditional inputs make the
+    transition term closer to the GPB2 approximation used by the M-step.
 
     Parameters
     ----------
@@ -1782,7 +1782,7 @@ def _compute_expected_complete_log_likelihood_reference(
     measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim, n_discrete_states)
     discrete_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
     pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
-        E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses exact pair-conditional
+        E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional
         quantities for the transition Q-function term.
     pair_cond_smoother_covs : jax.Array | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         Cov[X_t | y_{1:T}, S_t=i, S_{t+1}=j].
@@ -1797,11 +1797,11 @@ def _compute_expected_complete_log_likelihood_reference(
     Notes
     -----
     When GPB2 pair-conditional quantities are provided, the transition
-    Q-function term uses exact pair-conditional means and covariances for
-    x_t, but Cov[x_{t+1} | S_t, S_{t+1}] is still approximated with
-    the state-conditional Cov[x_{t+1} | S_{t+1}] since the GPB2 smoother
-    does not produce that quantity directly. This is a minor residual
-    approximation affecting only the ELBO diagnostic, not parameter updates.
+    Q-function term uses pair-conditional means and covariances for x_t.
+    Cov[x_{t+1} | S_t, S_{t+1}] is still approximated with the
+    state-conditional Cov[x_{t+1} | S_{t+1}] since the GPB2 smoother does
+    not produce that quantity directly. This affects only diagnostics, not
+    the closed-form parameter updates.
     """
     n_time = obs.shape[0]
     n_discrete_states = smoother_discrete_state_prob.shape[1]
@@ -1849,7 +1849,7 @@ def _compute_expected_complete_log_likelihood_reference(
                 weight = smoother_joint_discrete_state_prob[t, i, j]
 
                 # E_q[(x_{t+1} - A_j x_t)(x_{t+1} - A_j x_t)^T | s_t=i, s_{t+1}=j]
-                # Use pair-conditional quantities when available (GPB2 exact),
+                # Use pair-conditional quantities when available (GPB2),
                 # otherwise fall back to state-conditional (GPB1 approximate).
                 if pair_cond_smoother_means is not None:
                     m_t_ij = pair_cond_smoother_means[t, :, i, j]
@@ -1870,14 +1870,15 @@ def _compute_expected_complete_log_likelihood_reference(
                 # separately (only Cov[x_t | S_t, S_{t+1}]). Use state-conditional.
                 V_t1_j = state_cond_smoother_covs[t + 1, :, :, j]
 
-                cross_cov_ij = pair_cond_smoother_cross_cov[t, :, :, i, j]
+                # Stored as Cov[x_t, x_{t+1} | ...] by the RTS helper.
+                cross_cov_t_t1_ij = pair_cond_smoother_cross_cov[t, :, :, i, j]
 
                 # E[x_{t+1} x_{t+1}^T | ...]
                 E_xt1_xt1 = V_t1_j + jnp.outer(m_t1_ij, m_t1_ij)
                 # E[x_t x_t^T | ...]
                 E_xt_xt = V_t_ij + jnp.outer(m_t_ij, m_t_ij)
                 # E[x_{t+1} x_t^T | ...]
-                E_xt1_xt = cross_cov_ij + jnp.outer(m_t1_ij, m_t_ij)
+                E_xt1_xt = cross_cov_t_t1_ij.T + jnp.outer(m_t1_ij, m_t_ij)
 
                 # E[(x_{t+1} - A x_t)(x_{t+1} - A x_t)^T]
                 # = E[x_{t+1} x_{t+1}^T] - A E[x_t x_{t+1}^T] - E[x_{t+1} x_t^T] A^T + A E[x_t x_t^T] A^T
@@ -2106,7 +2107,9 @@ def compute_expected_complete_log_likelihood(
         """Log-prob for a single (t, i, j) triple."""
         E_xt1_xt1 = V_t1_ij + jnp.outer(m_t1_ij, m_t1_ij)
         E_xt_xt = V_t_ij + jnp.outer(m_t_ij, m_t_ij)
-        E_xt1_xt = cross_cov_ij + jnp.outer(m_t1_ij, m_t_ij)
+        # Stored lag covariance is Cov[x_t, x_{t+1}], so transpose it for
+        # E[x_{t+1} x_t^T].
+        E_xt1_xt = cross_cov_ij.T + jnp.outer(m_t1_ij, m_t_ij)
         expected_residual = (
             E_xt1_xt1 - A_j @ E_xt1_xt.T - E_xt1_xt @ A_j.T + A_j @ E_xt_xt @ A_j.T
         )
@@ -2231,6 +2234,91 @@ def compute_posterior_entropy(
 
 
 @jax.jit
+def compute_markov_posterior_entropy(
+    smoother_discrete_state_prob: jax.Array,
+    smoother_joint_discrete_state_prob: jax.Array,
+    state_cond_smoother_covs: jax.Array,
+    pair_cond_smoother_cross_cov: jax.Array,
+    pair_cond_smoother_covs: jax.Array | None = None,
+) -> jax.Array:
+    """Approximate trajectory entropy for the switching smoother posterior.
+
+    The legacy ``compute_posterior_entropy`` sums marginal entropies
+    ``H(x_t | S_t)`` and therefore over-counts entropy for a correlated Kalman
+    trajectory. This function uses the Markov factorization
+
+        H(x_{1:T}, s_{1:T}) = H(s) + E[H(x_T | s_T)]
+            + sum_t E[H(x_t | x_{t+1}, s_t, s_{t+1})]
+
+    with the available GPB pair lag covariances. For a single-state linear
+    Gaussian model this reduces to the exact RTS trajectory entropy.
+    """
+    n_cont_states = state_cond_smoother_covs.shape[1]
+
+    # Discrete Markov-chain entropy H(s_1:T).
+    discrete_entropy = -jnp.sum(
+        smoother_discrete_state_prob[0] * _safe_log(smoother_discrete_state_prob[0])
+    )
+    marginal_prev = smoother_discrete_state_prob[:-1]
+    cond = _divide_safe(smoother_joint_discrete_state_prob, marginal_prev[:, :, None])
+    discrete_entropy -= jnp.sum(smoother_joint_discrete_state_prob * _safe_log(cond))
+
+    def _gaussian_entropy_from_cov(cov: jax.Array) -> jax.Array:
+        cov = stabilize_covariance(cov, min_eigenvalue=1e-12)
+        log_det = jnp.linalg.slogdet(cov)[1]
+        return 0.5 * (n_cont_states * (1.0 + jnp.log(2.0 * jnp.pi)) + log_det)
+
+    # Terminal entropy E[H(x_T | S_T)].
+    terminal_covs = jnp.moveaxis(state_cond_smoother_covs[-1], -1, 0)
+    terminal_entropies = jax.vmap(_gaussian_entropy_from_cov)(terminal_covs)
+    terminal_entropy = jnp.sum(
+        smoother_discrete_state_prob[-1] * terminal_entropies
+    )
+
+    if pair_cond_smoother_covs is not None:
+        cov_t = pair_cond_smoother_covs
+    else:
+        cov_t = jnp.broadcast_to(
+            state_cond_smoother_covs[:-1, :, :, :, None],
+            pair_cond_smoother_cross_cov.shape,
+        )
+
+    cov_t1 = jnp.broadcast_to(
+        state_cond_smoother_covs[1:, :, :, None, :],
+        pair_cond_smoother_cross_cov.shape,
+    )
+
+    def _conditional_entropy(
+        weight: jax.Array,
+        cov_prev: jax.Array,
+        cov_next: jax.Array,
+        cross_prev_next: jax.Array,
+    ) -> jax.Array:
+        # cross_prev_next is Cov[x_t, x_{t+1}]. The Gaussian conditional
+        # covariance is P_t - P_{t,t+1} P_{t+1}^{-1} P_{t+1,t}.
+        gain = psd_solve(cov_next, cross_prev_next.T).T
+        cond_cov = cov_prev - gain @ cross_prev_next.T
+        entropy = _gaussian_entropy_from_cov(cond_cov)
+        return jnp.where(weight > 0.0, weight * entropy, 0.0)
+
+    weights = smoother_joint_discrete_state_prob.reshape(-1)
+    flat_cov_t = jnp.transpose(cov_t, (0, 3, 4, 1, 2)).reshape(
+        -1, n_cont_states, n_cont_states
+    )
+    flat_cov_t1 = jnp.transpose(cov_t1, (0, 3, 4, 1, 2)).reshape(
+        -1, n_cont_states, n_cont_states
+    )
+    flat_cross = jnp.transpose(pair_cond_smoother_cross_cov, (0, 3, 4, 1, 2)).reshape(
+        -1, n_cont_states, n_cont_states
+    )
+    conditional_entropy = jnp.sum(
+        jax.vmap(_conditional_entropy)(weights, flat_cov_t, flat_cov_t1, flat_cross)
+    )
+
+    return discrete_entropy + terminal_entropy + conditional_entropy
+
+
+@jax.jit
 def compute_elbo(
     obs: jax.Array,
     state_cond_smoother_means: jax.Array,
@@ -2250,13 +2338,16 @@ def compute_elbo(
     pair_cond_smoother_covs: jax.Array | None = None,
     next_pair_cond_smoother_means: jax.Array | None = None,
 ) -> jax.Array:
-    """Compute the Evidence Lower Bound (ELBO) for the switching Kalman filter.
+    """Compute the GPB approximate lower-bound diagnostic.
 
     ELBO = E_q[log p(y, x, s | θ)] - E_q[log q(x, s)]
          = E_q[log p(y, x, s | θ)] + H(q)
 
-    For variational EM with the GPB1/IMM approximation, the ELBO is guaranteed
-    to increase (or stay the same) after each EM iteration.
+    The continuous entropy uses a trajectory-aware Markov Gaussian entropy
+    rather than a sum of marginal entropies. For a single-state linear Gaussian
+    model this equals the exact Kalman evidence. With GPB switching
+    approximations it remains a diagnostic, not a strict monotonicity
+    certificate.
 
     Parameters
     ----------
@@ -2275,11 +2366,11 @@ def compute_elbo(
     measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim, n_discrete_states)
     discrete_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
     pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
-        E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. Optional, for GPB2 exact Q-function.
+        E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. Optional GPB2 Q-function input.
     pair_cond_smoother_covs : jax.Array | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
-        Cov[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. Optional, for GPB2 exact Q-function.
+        Cov[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. Optional GPB2 Q-function input.
     next_pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
-        E[X_{t+1} | y_{1:T}, S_t=i, S_{t+1}=j]. Optional, for GPB2 exact Q-function.
+        E[X_{t+1} | y_{1:T}, S_t=i, S_{t+1}=j]. Optional GPB2 Q-function input.
 
     Returns
     -------
@@ -2306,10 +2397,12 @@ def compute_elbo(
         next_pair_cond_smoother_means=next_pair_cond_smoother_means,
     )
 
-    entropy = compute_posterior_entropy(
+    entropy = compute_markov_posterior_entropy(
         smoother_discrete_state_prob=smoother_discrete_state_prob,
         smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
         state_cond_smoother_covs=state_cond_smoother_covs,
+        pair_cond_smoother_cross_cov=pair_cond_smoother_cross_cov,
+        pair_cond_smoother_covs=pair_cond_smoother_covs,
     )
 
     return expected_ll + entropy
@@ -2419,11 +2512,14 @@ def compute_transition_q_function(
     A: jax.Array,
     gamma1: jax.Array,
     beta: jax.Array,
+    process_cov: jax.Array | None = None,
 ) -> jax.Array:
     """Compute the Q-function contribution from transition matrix.
 
-    The Q-function for A (ignoring constants and Q covariance) is:
+    The Q-function for A (ignoring terms independent of A) is:
         Q(A) ∝ -0.5 * tr(A^T A gamma1 - 2 A^T beta)
+    when the process covariance is the identity. For non-identity process
+    covariance this function uses the corresponding Mahalanobis weighting.
 
     We return the negative Q-function since we want to minimize.
 
@@ -2434,16 +2530,22 @@ def compute_transition_q_function(
     gamma1 : jax.Array, shape (n_cont, n_cont)
         E[x_t x_t^T] summed over time, weighted by joint discrete state probs.
     beta : jax.Array, shape (n_cont, n_cont)
-        E[x_t x_{t+1}^T] summed over time, weighted by joint discrete state probs.
+        E[x_{t+1} x_t^T] summed over time, weighted by joint discrete state probs.
+    process_cov : jax.Array | None, shape (n_cont, n_cont), optional
+        Process covariance Q for Mahalanobis weighting. If None, uses identity
+        weighting for backwards compatibility.
 
     Returns
     -------
     jax.Array
         Negative Q-function value (to be minimized, scalar array).
     """
-    # We minimize: 0.5 * tr(A^T A gamma1) - tr(A^T beta)
-    # Which is equivalent to maximizing the actual Q-function
-    return 0.5 * jnp.trace(A.T @ A @ gamma1) - jnp.trace(A.T @ beta)
+    if process_cov is None:
+        return 0.5 * jnp.trace(A.T @ A @ gamma1) - jnp.trace(A.T @ beta)
+
+    q_inv_A = psd_solve(process_cov, A)
+    q_inv_beta = psd_solve(process_cov, beta)
+    return 0.5 * jnp.trace(q_inv_A @ gamma1 @ A.T) - jnp.trace(A.T @ q_inv_beta)
 
 
 def compute_transition_q_from_params(
@@ -2454,6 +2556,7 @@ def compute_transition_q_from_params(
     sampling_freq: float,
     gamma1: jax.Array,
     beta: jax.Array,
+    process_cov: jax.Array | None = None,
 ) -> jax.Array:
     """Compute Q-function from oscillator parameters.
 
@@ -2475,6 +2578,8 @@ def compute_transition_q_from_params(
         Sufficient statistic.
     beta : jax.Array, shape (n_cont, n_cont)
         Sufficient statistic.
+    process_cov : jax.Array | None, shape (n_cont, n_cont), optional
+        Process covariance for Mahalanobis weighting.
 
     Returns
     -------
@@ -2492,7 +2597,7 @@ def compute_transition_q_from_params(
         phase_diffs=phase_diff,
         sampling_freq=sampling_freq,
     )
-    return compute_transition_q_function(A, gamma1, beta)
+    return compute_transition_q_function(A, gamma1, beta, process_cov=process_cov)
 
 
 def optimize_dim_transition_params(
@@ -2500,6 +2605,7 @@ def optimize_dim_transition_params(
     beta: jax.Array,
     init_params: dict,
     sampling_freq: float,
+    process_cov: jax.Array | None = None,
     max_iter: int = 100,
     tol: float = 1e-6,
 ) -> dict:
@@ -2517,6 +2623,9 @@ def optimize_dim_transition_params(
         Initial parameter values (damping, freq, coupling_strength, phase_diff).
     sampling_freq : float
         Sampling frequency.
+    process_cov : jax.Array | None, optional
+        Process covariance for Mahalanobis weighting of the transition
+        residual. If None, uses identity weighting.
     max_iter : int
         Maximum optimization iterations.
     tol : float
@@ -2596,6 +2705,7 @@ def optimize_dim_transition_params(
             sampling_freq=sampling_freq,
             gamma1=gamma1,
             beta=beta,
+            process_cov=process_cov,
         )
 
     # Run optimizer in unconstrained space

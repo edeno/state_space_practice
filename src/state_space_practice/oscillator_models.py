@@ -1768,6 +1768,7 @@ class DirectedInfluenceModel(BaseModel):
                     beta=beta[..., j],
                     init_params=init_params,
                     sampling_freq=self.sampling_freq,
+                    process_cov=self.process_cov[..., j],
                 )
 
                 # Store for warm start
@@ -1836,8 +1837,13 @@ class DirectedInfluenceModel(BaseModel):
             if suff_stats is not None:
                 gamma1_j = suff_stats[0][:, :, j]
                 beta_j = suff_stats[1][:, :, j]
-                q_unc = compute_transition_q_function(A_unc_j, gamma1_j, beta_j)
-                q_proj = compute_transition_q_function(A_proj_j, gamma1_j, beta_j)
+                Q_j = self.process_cov[..., j]
+                q_unc = compute_transition_q_function(
+                    A_unc_j, gamma1_j, beta_j, process_cov=Q_j
+                )
+                q_proj = compute_transition_q_function(
+                    A_proj_j, gamma1_j, beta_j, process_cov=Q_j
+                )
                 A_j = jnp.where(q_proj <= q_unc, A_proj_j, A_unc_j)
             else:
                 A_j = A_proj_j

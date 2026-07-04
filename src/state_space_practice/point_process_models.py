@@ -52,6 +52,7 @@ from state_space_practice.switching_point_process import (
     SpikeObsParams,
     switching_point_process_filter,
     update_spike_glm_params,
+    update_spike_glm_params_mixture,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import (
@@ -825,47 +826,22 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             )
             return
 
-        # Shared spike params: marginalize over discrete states
-        smoother_mean = jnp.einsum(
-            "tls,ts->tl",
-            self.smoother_state_cond_mean,
-            self.smoother_discrete_state_prob,
-        )
+        if self.spike_baseline_prior_l2 > 0:
+            mean_counts = jnp.mean(spikes, axis=0)
+            baseline_prior = jnp.log(mean_counts / self.dt + 1e-10)
+        else:
+            baseline_prior = None
 
-        expected_cov = jnp.einsum(
-            "tlks,ts->tlk",
-            self.smoother_state_cond_cov,
-            self.smoother_discrete_state_prob,
-        )
-        mean_deviation = (
-            self.smoother_state_cond_mean - smoother_mean[:, :, None]
-        )
-        var_of_mean = jnp.einsum(
-            "tls,tks,ts->tlk",
-            mean_deviation,
-            mean_deviation,
-            self.smoother_discrete_state_prob,
-        )
-        smoother_cov = expected_cov + var_of_mean
-
-        max_cov_eigenvalue = 1.0
-
-        def clip_cov_eigenvalues(cov: Array) -> Array:
-            cov = symmetrize(cov)
-            eigvals, eigvecs = jnp.linalg.eigh(cov)
-            eigvals_clipped = jnp.clip(eigvals, 0.0, max_cov_eigenvalue)
-            return eigvecs @ jnp.diag(eigvals_clipped) @ eigvecs.T
-
-        smoother_cov_clipped = jax.vmap(clip_cov_eigenvalues)(smoother_cov)
-
-        self.spike_params = update_spike_glm_params(
+        self.spike_params = update_spike_glm_params_mixture(
             spikes=spikes,
-            smoother_mean=smoother_mean,
+            state_cond_smoother_mean=self.smoother_state_cond_mean,
+            state_cond_smoother_cov=self.smoother_state_cond_cov,
+            state_weights=self.smoother_discrete_state_prob,
             current_params=self.spike_params,
             dt=self.dt,
             weight_l2=self.spike_weight_l2,
-            smoother_cov=smoother_cov_clipped,
-            use_second_order=True,
+            baseline_prior=baseline_prior,
+            baseline_prior_l2=self.spike_baseline_prior_l2,
         )
 
     @abstractmethod
@@ -1943,6 +1919,7 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
                 beta=beta[:, :, j],
                 init_params=self._current_osc_params[j],
                 sampling_freq=self.sampling_freq,
+                process_cov=self.process_cov[:, :, j],
             )
             self._current_osc_params[j] = opt_params
 
@@ -2006,8 +1983,13 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             if suff_stats is not None:
                 gamma1_j = suff_stats[0][:, :, j]
                 beta_j = suff_stats[1][:, :, j]
-                q_unc = compute_transition_q_function(A_unc_j, gamma1_j, beta_j)
-                q_proj = compute_transition_q_function(A_proj_j, gamma1_j, beta_j)
+                Q_j = self.process_cov[:, :, j]
+                q_unc = compute_transition_q_function(
+                    A_unc_j, gamma1_j, beta_j, process_cov=Q_j
+                )
+                q_proj = compute_transition_q_function(
+                    A_proj_j, gamma1_j, beta_j, process_cov=Q_j
+                )
                 # compute_transition_q_function returns negative Q (to minimize)
                 # so q_proj > q_unc means projection worsened the objective
                 A_j = jnp.where(q_proj <= q_unc, A_proj_j, A_unc_j)

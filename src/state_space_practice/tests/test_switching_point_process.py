@@ -5138,11 +5138,11 @@ class TestSwitchingSpikeOscillatorModelMStepSpikes:
         assert jnp.all(jnp.isfinite(model.spike_params.baseline))
         assert jnp.all(jnp.isfinite(model.spike_params.weights))
 
-    def test_m_step_spikes_uses_marginalized_smoother_mean(self) -> None:
-        """_m_step_spikes should use marginalized smoother mean for GLM update.
+    def test_m_step_spikes_updates_from_smoother_posterior(self) -> None:
+        """_m_step_spikes should use smoother posterior stats for GLM update.
 
-        The M-step for spike params should use the marginal smoother mean
-        (marginalized over discrete states), not the state-conditional means.
+        Shared spike parameters use the state-mixture expected Poisson
+        log-likelihood; separate parameters use state responsibilities.
         """
         from state_space_practice.switching_point_process import (
             SwitchingSpikeOscillatorModel,
@@ -7436,6 +7436,75 @@ class TestEMVerification:
         assert neg_Q_after <= neg_Q_before + 1e-6, (
             f"M-step should increase Q: -Q_before={neg_Q_before:.4f}, "
             f"-Q_after={neg_Q_after:.4f}, diff={neg_Q_after - neg_Q_before:.6f}"
+        )
+
+    def test_shared_mixture_mstep_increases_state_mixture_q(self) -> None:
+        """Shared spike params should optimize the state-mixture Q-function."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            update_spike_glm_params_mixture,
+        )
+
+        n_time, n_neurons, n_latent, n_states = 120, 2, 2, 2
+        dt = 0.01
+        key = jax.random.PRNGKey(123)
+        k_mean, k_spike = jax.random.split(key)
+
+        state_means = jax.random.normal(
+            k_mean, (n_time, n_latent, n_states)
+        ) * 0.5
+        state_means = state_means.at[:, 0, 0].add(-1.0)
+        state_means = state_means.at[:, 0, 1].add(1.0)
+        state_covs = jnp.broadcast_to(
+            0.05 * jnp.eye(n_latent)[None, :, :, None],
+            (n_time, n_latent, n_latent, n_states),
+        )
+        state_weights = jnp.tile(jnp.array([[0.35, 0.65]]), (n_time, 1))
+
+        true_baseline = jnp.array([1.2, 1.5])
+        true_weights = jnp.array([[0.3, -0.2], [-0.1, 0.25]])
+        eta = true_baseline[None, :, None] + jnp.einsum(
+            "tls,nl->tns", state_means, true_weights
+        )
+        rates = jnp.sum(state_weights[:, None, :] * jnp.exp(eta) * dt, axis=-1)
+        spikes = jax.random.poisson(k_spike, rates).astype(float)
+
+        old_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.zeros((n_neurons, n_latent)),
+        )
+
+        def neg_mixture_q(params: SpikeObsParams) -> float:
+            total = 0.0
+            for n in range(n_neurons):
+                b = params.baseline[n]
+                w = params.weights[n]
+                eta_lin = jnp.einsum("tls,l->ts", state_means, w)
+                quad = 0.5 * jnp.einsum("tlks,l,k->ts", state_covs, w, w)
+                mu = jnp.exp(b + eta_lin + quad) * dt
+                total += float(
+                    jnp.sum(
+                        state_weights
+                        * (mu - spikes[:, n, None] * (b + eta_lin))
+                    )
+                )
+            return total
+
+        neg_q_before = neg_mixture_q(old_params)
+        new_params = update_spike_glm_params_mixture(
+            spikes=spikes,
+            state_cond_smoother_mean=state_means,
+            state_cond_smoother_cov=state_covs,
+            state_weights=state_weights,
+            current_params=old_params,
+            dt=dt,
+            max_iter=1,
+        )
+        neg_q_after = neg_mixture_q(new_params)
+
+        assert neg_q_after <= neg_q_before + 1e-8, (
+            f"shared mixture M-step should decrease -Q: before={neg_q_before:.6f}, "
+            f"after={neg_q_after:.6f}"
         )
 
     @pytest.mark.slow
