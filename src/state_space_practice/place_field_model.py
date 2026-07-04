@@ -289,8 +289,8 @@ class PlaceFieldModel(SGDFittableMixin):
         Custom log-intensity function with signature
         ``(design_matrix, params) -> log_rate``. If None, uses the default
         linear function ``log(lambda) = Z @ x``. For nonlinear functions,
-        ``predict_rate_map`` uses the time-averaged weights which is an
-        approximation; consider using ``smoother_mean`` directly.
+        ``predict_rate_map`` uses the linear spline log-rate approximation
+        and is approximate; consider using ``smoother_mean`` directly.
     update_transition_matrix : bool, default=False
         Whether to learn A. Default False (keeps A = I for random walk).
     update_process_cov : bool, default=True
@@ -1373,6 +1373,11 @@ class PlaceFieldModel(SGDFittableMixin):
                 f"got shape {spikes.shape}."
             )
         validate_count_array(spikes, "spikes", allow_empty=False)
+        if position.shape[0] != spikes.shape[0]:
+            raise ValueError(
+                f"position and spikes must have the same number of time bins: "
+                f"got position ({position.shape[0]},) vs spikes ({spikes.shape[0]},)"
+            )
 
         self._sgd_n_time = spikes.shape[0]
         self.n_neurons = spikes.shape[1]
@@ -1552,6 +1557,65 @@ class PlaceFieldModel(SGDFittableMixin):
             design_matrix, self.filtered_mean, context="fit_sgd"
         )
 
+    def _posterior_rate_map_for_basis(
+        self,
+        Z_grid: np.ndarray,
+        time_slice: slice,
+        alpha: float,
+        neuron_idx: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Average posterior expected rates over a time slice.
+
+        For the linear log-intensity model and Gaussian posterior
+        ``x_t | y ~ N(m_t, P_t)``,
+
+            E[lambda_t(pos) | y] = exp(Z(pos) @ m_t + 0.5 Z(pos) @ P_t @ Z(pos).T).
+
+        The returned CI averages the per-time marginal log-normal credible
+        bounds over the slice. This is a representative interval for the
+        time-averaged map, not an exact quantile of the log-normal mixture.
+        """
+        assert self.smoother_mean is not None
+        assert self.smoother_cov is not None
+
+        s, _ = self._neuron_weights(neuron_idx)
+        means = np.asarray(self.smoother_mean[time_slice, s])
+        covs = np.asarray(self.smoother_cov[time_slice][:, s, s])
+        if means.ndim == 1:
+            means = means[None, :]
+            covs = covs[None, :, :]
+        if means.shape[0] == 0:
+            raise ValueError("time_slice selects no time bins")
+
+        z = float(jax.scipy.stats.norm.ppf(1 - alpha / 2))
+        n_time = means.shape[0]
+        n_grid = Z_grid.shape[0]
+        rate_sum = np.zeros(n_grid)
+        rate_lo_sum = np.zeros(n_grid)
+        rate_hi_sum = np.zeros(n_grid)
+        chunk_size = max(1, min(n_time, 2_000_000 // max(n_grid, 1)))
+
+        for start in range(0, n_time, chunk_size):
+            stop = min(start + chunk_size, n_time)
+            means_chunk = means[start:stop]
+            covs_chunk = covs[start:stop]
+            log_rate_mean = means_chunk @ Z_grid.T
+            var_log_rate = np.einsum(
+                "gb,tbc,gc->tg", Z_grid, covs_chunk, Z_grid
+            )
+            var_log_rate = np.maximum(var_log_rate, 0.0)
+            std_log_rate = np.sqrt(var_log_rate)
+
+            rate_sum += np.exp(log_rate_mean + 0.5 * var_log_rate).sum(axis=0)
+            rate_lo_sum += np.exp(log_rate_mean - z * std_log_rate).sum(axis=0)
+            rate_hi_sum += np.exp(log_rate_mean + z * std_log_rate).sum(axis=0)
+
+        rate = rate_sum / n_time
+        rate_lo = rate_lo_sum / n_time
+        rate_hi = rate_hi_sum / n_time
+
+        return rate, np.column_stack([rate_lo, rate_hi])
+
     def predict_rate_map(
         self,
         grid_positions: np.ndarray,
@@ -1562,14 +1626,15 @@ class PlaceFieldModel(SGDFittableMixin):
         """Predict the firing rate map at given spatial positions.
 
         Evaluates the estimated place field at a grid of positions,
-        averaging the smoothed weights over the specified time window.
+        averaging posterior expected firing rates over the specified
+        time window.
 
         Parameters
         ----------
         grid_positions : np.ndarray, shape (n_grid_points, 2)
             Spatial positions (x, y) at which to evaluate the rate.
         time_slice : slice or None, optional
-            Time window over which to average the smoothed weights.
+            Time window over which to average posterior expected firing rates.
             If None, uses the full session.
         alpha : float, default=0.05
             Significance level for credible interval (0.05 for 95% CI).
@@ -1585,13 +1650,14 @@ class PlaceFieldModel(SGDFittableMixin):
 
         Notes
         -----
-        The credible interval reflects the average per-time-step marginal
-        posterior uncertainty over the window, not the uncertainty of the
-        time-averaged weight. This gives a representative sense of how
-        uncertain the rate estimate is at each spatial location during the
-        specified period.
+        The rate is the time-average of the posterior expected firing rate,
+        ``mean_t E[exp(Z x_t) | y]``. This matters for dynamic fields because
+        ``mean_t exp(Z x_t)`` is generally not equal to
+        ``exp(Z mean_t[x_t])``. The credible interval averages the per-time
+        marginal log-normal bounds over the window, not the exact quantiles
+        of the resulting mixture distribution.
 
-        This method always uses the linear approximation ``exp(Z @ weights)``.
+        This method always uses the linear spline log-rate approximation.
         If a nonlinear ``log_intensity_func`` was set at construction, this
         prediction is an approximation. Use ``smoother_mean`` directly with
         your intensity function for exact predictions.
@@ -1610,24 +1676,12 @@ class PlaceFieldModel(SGDFittableMixin):
             )
 
         Z_grid = evaluate_basis(grid_positions, self.basis_info)
-        s, _ = self._neuron_weights(neuron_idx)
-
         if time_slice is None:
             time_slice = slice(None)
 
-        weights = np.array(self.smoother_mean[time_slice, s].mean(axis=0))
-        cov = np.array(self.smoother_cov[time_slice][:, s, s].mean(axis=0))
-
-        log_rate = Z_grid @ weights
-        var_log_rate = np.sum(Z_grid @ cov * Z_grid, axis=1)
-        std_log_rate = np.sqrt(np.maximum(var_log_rate, 0))
-
-        z = float(jax.scipy.stats.norm.ppf(1 - alpha / 2))
-        rate = np.exp(log_rate)
-        rate_lo = np.exp(log_rate - z * std_log_rate)
-        rate_hi = np.exp(log_rate + z * std_log_rate)
-
-        return rate, np.column_stack([rate_lo, rate_hi])
+        return self._posterior_rate_map_for_basis(
+            Z_grid, time_slice, alpha=alpha, neuron_idx=neuron_idx
+        )
 
     def predict_center(
         self,
@@ -1660,7 +1714,6 @@ class PlaceFieldModel(SGDFittableMixin):
         assert self.smoother_mean is not None
 
         Z_grid = evaluate_basis(grid_positions, self.basis_info)
-        s, _ = self._neuron_weights(neuron_idx)
         n_time = self.smoother_mean.shape[0]
         if n_blocks < 1 or n_blocks > n_time:
             raise ValueError(
@@ -1670,8 +1723,12 @@ class PlaceFieldModel(SGDFittableMixin):
         block_indices = np.array_split(np.arange(n_time), n_blocks)
         centers = np.zeros((n_blocks, 2))
         for i, idx in enumerate(block_indices):
-            weights = np.array(self.smoother_mean[idx][:, s].mean(axis=0))
-            rate = np.exp(Z_grid @ weights)
+            rate, _ = self._posterior_rate_map_for_basis(
+                Z_grid,
+                slice(int(idx[0]), int(idx[-1]) + 1),
+                alpha=0.05,
+                neuron_idx=neuron_idx,
+            )
             # Weighted centroid (more stable than argmax)
             rate_sum = rate.sum()
             if rate_sum > 0:
@@ -1749,14 +1806,29 @@ class PlaceFieldModel(SGDFittableMixin):
         # Validate and normalize spikes shape
         if self.n_neurons == 1:
             if spikes.ndim == 2:
+                if spikes.shape[1] != 1:
+                    raise ValueError(
+                        f"Model was fitted with n_neurons=1 but received "
+                        f"{spikes.shape[1]} spike columns."
+                    )
                 spikes = spikes.squeeze(axis=1)
+            elif spikes.ndim != 1:
+                raise ValueError(
+                    f"spikes must be 1D (n_time,) or 2D (n_time, 1), "
+                    f"got shape {spikes.shape}."
+                )
         else:
             if spikes.ndim == 1:
                 raise ValueError(
                     f"Model was fitted with n_neurons={self.n_neurons} but "
                     f"received 1D spikes. Pass (n_time, {self.n_neurons}) array."
                 )
-            if spikes.ndim == 2 and spikes.shape[1] != self.n_neurons:
+            if spikes.ndim != 2:
+                raise ValueError(
+                    f"spikes must be 2D (n_time, {self.n_neurons}) for this "
+                    f"model, got shape {spikes.shape}."
+                )
+            if spikes.shape[1] != self.n_neurons:
                 raise ValueError(
                     f"Expected {self.n_neurons} spike columns (matching fitted "
                     f"n_neurons), got {spikes.shape[1]}."
@@ -1971,7 +2043,6 @@ class PlaceFieldModel(SGDFittableMixin):
 
         grid, _, _ = self.make_grid(n_grid)
         Z_grid = evaluate_basis(grid, self.basis_info)
-        s, _ = self._neuron_weights(neuron_idx)
         n_time = self.smoother_mean.shape[0]
 
         block_indices = np.array_split(np.arange(n_time), n_blocks)
@@ -1980,8 +2051,12 @@ class PlaceFieldModel(SGDFittableMixin):
         block_times = np.zeros(n_blocks)
 
         for i, idx in enumerate(block_indices):
-            weights = np.array(self.smoother_mean[idx][:, s].mean(axis=0))
-            rate = np.exp(Z_grid @ weights)
+            rate, _ = self._posterior_rate_map_for_basis(
+                Z_grid,
+                slice(int(idx[0]), int(idx[-1]) + 1),
+                alpha=0.05,
+                neuron_idx=neuron_idx,
+            )
             rate_sum = rate.sum()
             if rate_sum > 0:
                 centers[i] = (rate[:, None] * grid).sum(axis=0) / rate_sum

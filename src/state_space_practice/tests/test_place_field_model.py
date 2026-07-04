@@ -340,6 +340,89 @@ class TestPlaceFieldModelPredict:
         assert rate.shape == (100,)
         assert np.all(np.isfinite(rate))
 
+    def test_predict_rate_map_averages_rates_not_weights(self) -> None:
+        """Dynamic rate maps must average exp(Z x_t), not exp(Z mean_t[x_t])."""
+        position = np.array([
+            [0.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [0.5, 0.5],
+            [0.2, 0.8],
+            [0.8, 0.2],
+            [0.1, 0.1],
+            [0.9, 0.9],
+            [0.3, 0.7],
+        ])
+        model = PlaceFieldModel(dt=0.02, n_interior_knots=1)
+        _, model.basis_info = build_2d_spline_basis(position, n_interior_knots=1)
+        grid = position[:1]
+        z = evaluate_basis(grid, model.basis_info)[0]
+        n_basis = z.shape[0]
+        amplitude = 1.4
+        weights = z * amplitude / np.dot(z, z)
+
+        model.n_neurons = 1
+        model.n_basis_per_neuron = n_basis
+        model.n_basis = n_basis
+        model.transition_matrix = jnp.eye(n_basis)
+        model.process_cov = jnp.eye(n_basis) * 1e-6
+        model.init_mean = jnp.zeros(n_basis)
+        model.init_cov = jnp.eye(n_basis)
+        model.smoother_mean = jnp.asarray([weights, -weights])
+        model.smoother_cov = jnp.zeros((2, n_basis, n_basis))
+
+        rate, ci = model.predict_rate_map(grid)
+        expected = 0.5 * (np.exp(amplitude) + np.exp(-amplitude))
+        np.testing.assert_allclose(rate, [expected], rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(ci, [[expected, expected]], rtol=1e-12, atol=1e-12)
+
+    def test_predict_rate_map_uses_lognormal_posterior_mean(self) -> None:
+        """For Gaussian weights, E[exp(Zx)] includes the 0.5 ZPZ term."""
+        position = np.array([
+            [0.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [0.5, 0.5],
+            [0.2, 0.8],
+            [0.8, 0.2],
+            [0.1, 0.1],
+            [0.9, 0.9],
+            [0.3, 0.7],
+        ])
+        model = PlaceFieldModel(dt=0.02, n_interior_knots=1)
+        _, model.basis_info = build_2d_spline_basis(position, n_interior_knots=1)
+        grid = position[:1]
+        z = evaluate_basis(grid, model.basis_info)[0]
+        n_basis = z.shape[0]
+        sigma2 = 0.7
+        cov = np.eye(n_basis) * sigma2
+        var_log_rate = float(z @ cov @ z)
+
+        model.n_neurons = 1
+        model.n_basis_per_neuron = n_basis
+        model.n_basis = n_basis
+        model.transition_matrix = jnp.eye(n_basis)
+        model.process_cov = jnp.eye(n_basis) * 1e-6
+        model.init_mean = jnp.zeros(n_basis)
+        model.init_cov = jnp.eye(n_basis)
+        model.smoother_mean = jnp.zeros((1, n_basis))
+        model.smoother_cov = jnp.asarray(cov[None, :, :])
+
+        alpha = 0.1
+        rate, ci = model.predict_rate_map(grid, alpha=alpha)
+        z_alpha = float(jax.scipy.stats.norm.ppf(1 - alpha / 2))
+        expected_rate = np.exp(0.5 * var_log_rate)
+        expected_ci = np.exp(
+            np.array([
+                -z_alpha * np.sqrt(var_log_rate),
+                z_alpha * np.sqrt(var_log_rate),
+            ])
+        )
+        np.testing.assert_allclose(rate, [expected_rate], rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(ci[0], expected_ci, rtol=1e-12, atol=1e-12)
+
     def test_predict_center_shapes(self, fitted_model: PlaceFieldModel) -> None:
         grid, _, _ = fitted_model.make_grid(n_grid=10)
         centers = fitted_model.predict_center(grid, n_blocks=5)
@@ -411,6 +494,20 @@ class TestPlaceFieldModelScore:
         bad_spikes.reshape(-1)[0] = np.nan
         with pytest.raises(ValueError, match="finite"):
             model.score(sim_data["position"], bad_spikes)
+
+    def test_score_single_neuron_rejects_extra_columns(
+        self, sim_data: dict
+    ) -> None:
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        model.fit(
+            sim_data["position"],
+            sim_data["spikes"],
+            max_iter=3,
+            verbose=False,
+        )
+        spikes = np.column_stack([sim_data["spikes"], sim_data["spikes"]])
+        with pytest.raises(ValueError, match="n_neurons=1"):
+            model.score(sim_data["position"], spikes)
 
 
 # ------------------------------------------------------------------
@@ -981,6 +1078,18 @@ class TestPlaceFieldSGDFitting:
         )
         assert model.smoother_mean is not None
         assert model.filtered_mean is not None
+
+    def test_sgd_mismatched_lengths_rejected(self, sim_data: dict) -> None:
+        import optax
+
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        with pytest.raises(ValueError, match="same number of time bins"):
+            model.fit_sgd(
+                sim_data["position"][:-1],
+                sim_data["spikes"],
+                optimizer=optax.adam(1e-3),
+                num_steps=0,
+            )
 
 
 class TestWarmStart:
