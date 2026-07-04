@@ -13,6 +13,7 @@ from state_space_practice.position_decoder import (
     position_decoder_filter,
     position_decoder_smoother,
 )
+from state_space_practice.point_process_kalman import _point_process_laplace_update
 
 
 class TestBuildPositionDynamics:
@@ -131,6 +132,69 @@ class TestPlaceFieldRateMaps:
             numerical = (simple_fields.log_rate(pos_p) - simple_fields.log_rate(pos_m)) / (2 * eps)
             np.testing.assert_allclose(jac[:, dim], numerical, atol=0.1)
 
+    def test_bilinear_log_rate_reproduces_affine_plane(self):
+        """Bilinear log-rate interpolation should preserve affine maps."""
+        x_edges = np.array([0.0, 1.0, 2.0])
+        y_edges = np.array([10.0, 20.0, 30.0])
+        xx, yy = np.meshgrid(x_edges, y_edges)
+        log_rate_map = 0.2 + 0.4 * xx - 0.03 * yy
+        rate_maps = PlaceFieldRateMaps(
+            rate_maps=np.exp(log_rate_map)[None, :, :],
+            x_edges=x_edges,
+            y_edges=y_edges,
+        )
+
+        position = jnp.array([0.25, 15.0])
+        expected_log_rate = 0.2 + 0.4 * position[0] - 0.03 * position[1]
+
+        np.testing.assert_allclose(
+            rate_maps.log_rate(position)[0],
+            expected_log_rate,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            rate_maps.log_rate_jacobian(position)[0],
+            jnp.array([0.4, -0.03]),
+            atol=1e-10,
+        )
+
+    def test_kde_log_rate_matches_manual_kernel_ratio(self):
+        """Analytical KDE path should use count/occupancy units correctly."""
+        x_edges = np.array([0.0, 2.0, 4.0])
+        y_edges = np.array([10.0, 13.0])
+        spike_histograms = np.array([[[1.0, 3.0, 2.0], [4.0, 0.0, 5.0]]])
+        occ_histogram = np.array([[0.2, 0.5, 0.4], [0.8, 0.1, 0.6]])
+        baseline_rates = np.array([2.5])
+        occupancy_tau = 0.3
+        sigma = 2.0
+        rate_maps = PlaceFieldRateMaps(
+            rate_maps=np.ones((1, 2, 3)),
+            x_edges=x_edges,
+            y_edges=y_edges,
+            spike_histograms=spike_histograms,
+            occ_histogram=occ_histogram,
+            kde_sigma=sigma,
+            baseline_rates=baseline_rates,
+            occupancy_tau=occupancy_tau,
+        )
+        query = jnp.array([1.5, 11.0])
+
+        xx, yy = np.meshgrid(x_edges, y_edges)
+        grid_xy = np.column_stack([xx.ravel(), yy.ravel()])
+        dist_sq = np.sum((grid_xy - np.asarray(query)[None, :]) ** 2, axis=1)
+        kernel = np.exp(-0.5 * dist_sq / sigma**2)
+        kernel = kernel / kernel.sum()
+        manual_rate = (
+            spike_histograms.reshape(1, -1) @ kernel
+            + occupancy_tau * baseline_rates
+        ) / (occ_histogram.ravel() @ kernel + occupancy_tau)
+
+        np.testing.assert_allclose(
+            np.asarray(rate_maps.log_rate(query)),
+            np.log(manual_rate),
+            atol=1e-10,
+        )
+
     def test_from_place_field_model(self):
         """Construct rate maps from a fitted PlaceFieldModel."""
         from state_space_practice.place_field_model import PlaceFieldModel
@@ -186,6 +250,23 @@ class TestPlaceFieldRateMaps:
         assert rate_maps.n_neurons == 2
         assert rate_maps.rate_maps.shape == (2, 20, 20)
         assert np.all(np.isfinite(rate_maps.rate_maps))
+
+    def test_from_spike_position_data_zero_occupancy_bins_are_finite(self):
+        """Unvisited bins should not become NaN when shrinkage is disabled."""
+        position = np.array([[0.0, 0.0], [100.0, 100.0]])
+        spikes = np.array([[1.0], [0.0]])
+
+        rate_maps = PlaceFieldRateMaps.from_spike_position_data(
+            position=position,
+            spike_counts=spikes,
+            dt=0.01,
+            n_grid=101,
+            sigma=1.0,
+            occupancy_tau=0.0,
+        )
+
+        assert np.all(np.isfinite(rate_maps.rate_maps))
+        assert np.any(rate_maps.rate_maps[0] == 0.0)
 
     def test_from_spike_position_data_length_mismatch(self):
         """Mismatched position/spike lengths should raise ValueError."""
@@ -442,6 +523,54 @@ class TestPositionDecoderFilter:
             dt=decoding_data["dt"],
         )
         assert np.isfinite(result.marginal_log_likelihood)
+
+    def test_single_bin_filter_matches_core_laplace_update(self):
+        """Position decoder should pass the predicted Gaussian to the core update."""
+        dt = 0.05
+        q_pos = 0.2
+        x_edges = np.array([0.0, 1.0, 2.0])
+        y_edges = np.array([0.0, 1.0, 2.0])
+        xx, yy = np.meshgrid(x_edges, y_edges)
+        log_rate_0 = 0.2 + 0.4 * xx - 0.1 * yy
+        log_rate_1 = -0.3 - 0.2 * xx + 0.35 * yy
+        rate_maps = PlaceFieldRateMaps(
+            rate_maps=np.exp(np.stack([log_rate_0, log_rate_1])),
+            x_edges=x_edges,
+            y_edges=y_edges,
+        )
+        init_position = jnp.array([0.8, 1.2])
+        init_cov = jnp.array([[0.3, 0.05], [0.05, 0.4]])
+        spikes = jnp.array([[1.0, 0.0]])
+
+        result = position_decoder_filter(
+            spikes=spikes,
+            rate_maps=rate_maps,
+            dt=dt,
+            q_pos=q_pos,
+            include_velocity=False,
+            init_position=init_position,
+            init_cov=init_cov,
+            max_newton_iter=5,
+        )
+        one_step_cov = init_cov + q_pos * dt * jnp.eye(2)
+        expected_mean, expected_cov, expected_ll = _point_process_laplace_update(
+            init_position,
+            one_step_cov,
+            spikes[0],
+            dt,
+            rate_maps.log_rate,
+            grad_log_intensity_func=rate_maps.log_rate_jacobian,
+            include_laplace_normalization=True,
+            max_newton_iter=5,
+        )
+
+        np.testing.assert_allclose(result.position_mean[0], expected_mean, atol=1e-10)
+        np.testing.assert_allclose(result.position_cov[0], expected_cov, atol=1e-10)
+        np.testing.assert_allclose(
+            result.marginal_log_likelihood,
+            expected_ll,
+            atol=1e-10,
+        )
 
     @pytest.mark.parametrize(
         ("bad_value", "match"),

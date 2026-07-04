@@ -986,6 +986,48 @@ class TestPlaceFieldSGDFitting:
 class TestWarmStart:
     """Tests for the stationary Poisson GLM warm-start path."""
 
+    def test_warm_start_solves_stationary_glm_map_equations(self) -> None:
+        """Warm-start MAP and covariance should match Poisson GLM equations."""
+        dt = 0.02
+        prior_precision = 0.7
+        Z_base = jnp.array([
+            [1.0, -0.4, 0.2],
+            [1.0, -0.1, -0.3],
+            [1.0, 0.2, 0.1],
+            [1.0, 0.5, -0.2],
+            [1.0, 0.8, 0.4],
+            [1.0, 1.1, -0.1],
+        ])
+        spikes = jnp.array([0.0, 1.0, 0.0, 2.0, 1.0, 3.0])
+        model = PlaceFieldModel(dt=dt, n_interior_knots=3)
+        model.n_basis_per_neuron = Z_base.shape[1]
+
+        weights, cov = model._fit_stationary_glm(
+            Z_base,
+            spikes,
+            max_iter=30,
+            prior_precision=prior_precision,
+        )
+
+        log_rate = Z_base @ weights
+        expected_count = jnp.exp(log_rate) * dt
+        gradient = Z_base.T @ (expected_count - spikes)
+        gradient = gradient + prior_precision * weights
+        hessian = Z_base.T @ (expected_count[:, None] * Z_base)
+        hessian = hessian + prior_precision * jnp.eye(Z_base.shape[1])
+
+        np.testing.assert_allclose(
+            gradient,
+            jnp.zeros_like(weights),
+            atol=1e-8,
+        )
+        np.testing.assert_allclose(
+            cov,
+            jnp.linalg.inv(hessian),
+            rtol=1e-8,
+            atol=1e-9,
+        )
+
     def test_warm_start_sets_init_mean_away_from_zero(
         self, sim_data: dict
     ) -> None:

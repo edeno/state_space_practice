@@ -463,9 +463,16 @@ class PlaceFieldRateMaps:
             spike_smooth = gaussian_filter(
                 spike_map.T, sigma_bins, mode="constant", cval=0
             )
-            rate_maps[n] = (
-                (spike_smooth + effective_tau * baseline_rates[n])
-                / (occ_smooth + effective_tau)
+            numerator = spike_smooth + effective_tau * baseline_rates[n]
+            denominator = occ_smooth + effective_tau
+            # With tau=0, bins beyond the Gaussian filter's truncated support
+            # have zero smoothed occupancy; their raw rate is undefined, so
+            # store a finite zero-rate fallback instead of 0/0 NaNs.
+            rate_maps[n] = np.divide(
+                numerator,
+                denominator,
+                out=np.zeros_like(numerator, dtype=np.float64),
+                where=denominator > 0.0,
             )
 
         # Bin centers now span [x_min, x_max] (the full data range)
