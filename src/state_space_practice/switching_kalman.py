@@ -2791,6 +2791,9 @@ def optimize_dim_transition_params(
         )
         idx += n_osc * n_osc
         phase = flat[idx : idx + n_osc * n_osc].reshape(n_osc, n_osc)
+        diag_idx = jnp.arange(n_osc)
+        coupling = coupling.at[diag_idx, diag_idx].set(0.0)
+        phase = phase.at[diag_idx, diag_idx].set(0.0)
         return {
             "damping": damping,
             "freq": freq,

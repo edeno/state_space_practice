@@ -1672,14 +1672,29 @@ class DirectedInfluenceModel(BaseModel):
                 "phase_difference must have shape (n_oscillators, n_oscillators, n_discrete_states)."
                 f" Got {phase_difference.shape}."
             )
-        self.phase_difference = phase_difference
 
         if coupling_strength.shape != (n_oscillators, n_oscillators, n_discrete_states):
             raise ValueError(
                 "coupling_strength must have shape (n_oscillators, n_oscillators, n_discrete_states)."
                 f" Got {coupling_strength.shape}."
             )
-        self.coupling_strength = coupling_strength
+        phase_difference = jnp.asarray(phase_difference)
+        coupling_strength = jnp.asarray(coupling_strength)
+        diag_idx = jnp.arange(n_oscillators)
+        diag_phase = phase_difference[diag_idx, diag_idx, :]
+        diag_coupling = coupling_strength[diag_idx, diag_idx, :]
+        if bool(jnp.any(jnp.abs(diag_phase) > 1e-8)):
+            raise ValueError(
+                "DIM phase_difference diagonal entries are ignored by the "
+                "transition model and must be zero."
+            )
+        if bool(jnp.any(jnp.abs(diag_coupling) > 1e-8)):
+            raise ValueError(
+                "DIM coupling_strength diagonal entries are ignored by the "
+                "transition model and must be zero."
+            )
+        self.phase_difference = phase_difference.at[diag_idx, diag_idx, :].set(0.0)
+        self.coupling_strength = coupling_strength.at[diag_idx, diag_idx, :].set(0.0)
 
         # DIM specific M-step update flags
         self.update_continuous_transition_matrix = True
@@ -2107,6 +2122,13 @@ class DirectedInfluenceModel(BaseModel):
             self.phase_difference = params["phase_difference"]
         if "coupling_strength" in params:
             self.coupling_strength = params["coupling_strength"]
+        diag_idx = jnp.arange(self.n_oscillators)
+        self.phase_difference = self.phase_difference.at[
+            diag_idx, diag_idx, :
+        ].set(0.0)
+        self.coupling_strength = self.coupling_strength.at[
+            diag_idx, diag_idx, :
+        ].set(0.0)
         # Reconstruct A from updated scientific params
         if "phase_difference" in params or "coupling_strength" in params:
             self.continuous_transition_matrix = jax.vmap(
