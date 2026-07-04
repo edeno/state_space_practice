@@ -7738,9 +7738,12 @@ class TestEMVerification:
         )
         neg_q_after = neg_mixture_q(new_params)
 
-        assert neg_q_after <= neg_q_before + 1e-8, (
-            f"shared mixture M-step should decrease -Q: before={neg_q_before:.6f}, "
-            f"after={neg_q_after:.6f}"
+        # Strict decrease: old_params start at all-zeros, far from the optimum
+        # (true baseline ~1.3, weights ~0.3), so one Newton step must move -Q
+        # down. A non-strict bound would pass vacuously for a no-op M-step.
+        assert neg_q_after < neg_q_before - 1e-6, (
+            f"shared mixture M-step should strictly decrease -Q: "
+            f"before={neg_q_before:.6f}, after={neg_q_after:.6f}"
         )
 
     @pytest.mark.slow

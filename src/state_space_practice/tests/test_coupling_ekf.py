@@ -51,6 +51,31 @@ class TestGuards:
         with pytest.raises(ValueError, match="lfp"):
             fit_coupling_ekf(sim.spikes, lfp, coupling_params_small)
 
+    @pytest.mark.parametrize("bad_value", [0.0, -1.0, np.nan, np.inf])
+    def test_rejects_invalid_sigma_beta(self, coupling_params_small, bad_value):
+        # sigma_beta sets the prior covariance sigma_beta**2 * I; a non-positive
+        # or non-finite value produces a degenerate / non-PSD prior.
+        sim = simulate_coupling(coupling_params_small, n_time=200, seed=0)
+        with pytest.raises(ValueError, match="sigma_beta"):
+            fit_coupling_ekf(
+                sim.spikes, sim.lfp, coupling_params_small, sigma_beta=bad_value
+            )
+
+    @pytest.mark.parametrize("bad_value", [0, -1, 2.5])
+    def test_rejects_invalid_max_newton_iter(
+        self, coupling_params_small, bad_value
+    ):
+        # Must be a positive integer: 0/-1 give no Fisher-scoring steps, and a
+        # float would silently truncate the iteration count.
+        sim = simulate_coupling(coupling_params_small, n_time=200, seed=0)
+        with pytest.raises(ValueError, match="max_newton_iter"):
+            fit_coupling_ekf(
+                sim.spikes,
+                sim.lfp,
+                coupling_params_small,
+                max_newton_iter=bad_value,
+            )
+
 
 class TestMechanics:
     def test_returns_valid_posterior(self, coupling_params_small):
@@ -69,8 +94,20 @@ class TestMechanics:
         ):
             assert np.all(np.isfinite(np.asarray(arr)))
         # variances are positive (the Wald test downstream needs this)
-        assert np.all(np.asarray(post.beta_real_var) > 0)
-        assert np.all(np.asarray(post.beta_imag_var) > 0)
+        var_r = np.asarray(post.beta_real_var)
+        var_i = np.asarray(post.beta_imag_var)
+        assert np.all(var_r > 0)
+        assert np.all(var_i > 0)
+        # The real-imag cross-covariance is the off-diagonal of the PSD
+        # posterior covariance, so it must satisfy the Cauchy-Schwarz bound
+        # cov^2 <= var_r * var_i. A shape/finiteness check alone would miss an
+        # indexing or sign error that produced an inconsistent off-diagonal.
+        cov_ri = np.asarray(post.beta_real_imag_cov)
+        assert np.all(cov_ri**2 <= var_r * var_i + 1e-12)
+        # Guard: the bound is only meaningful if the posterior actually has
+        # real-imag correlation; an all-zero cross-cov (e.g. wrong slice) would
+        # pass the bound vacuously.
+        assert np.any(np.abs(cov_ri) > 1e-6)
 
 
 @pytest.mark.slow

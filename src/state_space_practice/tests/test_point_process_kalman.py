@@ -415,6 +415,7 @@ class TestStochasticPointProcessSmoother:
         np.testing.assert_allclose(smoother_mean[-1], filtered_mean[-1], rtol=1e-5)
         np.testing.assert_allclose(smoother_cov[-1], filtered_cov[-1], rtol=1e-5)
 
+    @pytest.mark.slow
     def test_smoother_improves_latent_rmse_on_simulated_data(self) -> None:
         """Future spikes should improve latent trajectory estimates."""
         n_time = 250
