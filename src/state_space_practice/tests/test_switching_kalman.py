@@ -5316,6 +5316,41 @@ def _exact_switching_e_step_oracle(init_mean, init_cov, init_prob, obs, Z, A, Q,
     }
 
 
+def _small_exact_switching_fixture():
+    """Small distinct-dynamics fixture for exact path-enumeration tests."""
+    n_latent, n_obs = 2, 2
+    A = jnp.stack(
+        [
+            jnp.array([[0.92, -0.18], [0.18, 0.92]]),
+            jnp.array([[0.55, 0.25], [-0.25, 0.55]]),
+        ],
+        axis=-1,
+    )
+    Q = jnp.stack([jnp.eye(n_latent) * 0.04, jnp.eye(n_latent) * 0.18], axis=-1)
+    H = jnp.stack(
+        [
+            jnp.eye(n_obs),
+            jnp.array([[1.0, 0.15], [-0.1, 0.9]]),
+        ],
+        axis=-1,
+    )
+    R = jnp.stack([jnp.eye(n_obs) * 0.25, jnp.eye(n_obs) * 0.35], axis=-1)
+    Z = jnp.array([[0.82, 0.18], [0.24, 0.76]])
+    init_mean = jnp.array([[0.2, -0.3], [0.1, 0.25]])
+    init_cov = jnp.stack([jnp.eye(n_latent) * 0.5, jnp.eye(n_latent) * 0.8], axis=-1)
+    init_prob = jnp.array([0.65, 0.35])
+    obs = jnp.array(
+        [
+            [0.1, -0.2],
+            [0.35, 0.15],
+            [-0.25, 0.4],
+            [0.5, -0.1],
+            [0.05, 0.3],
+        ]
+    )
+    return init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+
+
 class TestExactEStepOracle:
     """Exact path-enumeration oracle for the linear-Gaussian switching E-step."""
 
@@ -5324,36 +5359,10 @@ class TestExactEStepOracle:
             compute_transition_sufficient_stats,
         )
 
-        n_time, n_latent, n_obs = 5, 2, 2
-        A = jnp.stack(
-            [
-                jnp.array([[0.92, -0.18], [0.18, 0.92]]),
-                jnp.array([[0.55, 0.25], [-0.25, 0.55]]),
-            ],
-            axis=-1,
+        init_mean, init_cov, init_prob, obs, Z, A, Q, H, R = (
+            _small_exact_switching_fixture()
         )
-        Q = jnp.stack([jnp.eye(n_latent) * 0.04, jnp.eye(n_latent) * 0.18], axis=-1)
-        H = jnp.stack(
-            [
-                jnp.eye(n_obs),
-                jnp.array([[1.0, 0.15], [-0.1, 0.9]]),
-            ],
-            axis=-1,
-        )
-        R = jnp.stack([jnp.eye(n_obs) * 0.25, jnp.eye(n_obs) * 0.35], axis=-1)
-        Z = jnp.array([[0.82, 0.18], [0.24, 0.76]])
-        init_mean = jnp.array([[0.2, -0.3], [0.1, 0.25]])
-        init_cov = jnp.stack([jnp.eye(n_latent) * 0.5, jnp.eye(n_latent) * 0.8], axis=-1)
-        init_prob = jnp.array([0.65, 0.35])
-        obs = jnp.array(
-            [
-                [0.1, -0.2],
-                [0.35, 0.15],
-                [-0.25, 0.4],
-                [0.5, -0.1],
-                [0.05, 0.3],
-            ]
-        )
+        n_time = obs.shape[0]
 
         exact = _exact_switching_e_step_oracle(
             init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
@@ -5417,6 +5426,131 @@ class TestExactEStepOracle:
 
         np.testing.assert_allclose(gamma1, direct_gamma1, rtol=1e-9, atol=1e-9)
         np.testing.assert_allclose(beta, direct_beta, rtol=1e-9, atol=1e-9)
+
+    def test_exact_e_step_m_step_matches_closed_form_updates(self) -> None:
+        from state_space_practice.switching_kalman import (
+            compute_transition_sufficient_stats,
+            switching_kalman_maximization_step,
+        )
+
+        init_mean, init_cov, init_prob, obs, Z, A, Q, H, R = (
+            _small_exact_switching_fixture()
+        )
+        exact = _exact_switching_e_step_oracle(
+            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+        )
+
+        (
+            mstep_A,
+            mstep_H,
+            mstep_Q,
+            mstep_R,
+            mstep_init_mean,
+            mstep_init_cov,
+            mstep_Z,
+            mstep_init_prob,
+        ) = switching_kalman_maximization_step(
+            obs=obs,
+            state_cond_smoother_means=exact["state_cond_smoother_means"],
+            state_cond_smoother_covs=exact["state_cond_smoother_covs"],
+            smoother_discrete_state_prob=exact["smoother_discrete_state_prob"],
+            smoother_joint_discrete_state_prob=exact[
+                "smoother_joint_discrete_state_prob"
+            ],
+            pair_cond_smoother_cross_cov=exact["pair_cond_smoother_cross_cov"],
+            pair_cond_smoother_means=exact["pair_cond_smoother_means"],
+            pair_cond_smoother_covs=exact["pair_cond_smoother_covs"],
+            next_pair_cond_smoother_means=exact["next_pair_cond_smoother_means"],
+        )
+
+        gamma1, beta = compute_transition_sufficient_stats(
+            state_cond_smoother_means=exact["state_cond_smoother_means"],
+            state_cond_smoother_covs=exact["state_cond_smoother_covs"],
+            smoother_joint_discrete_state_prob=exact[
+                "smoother_joint_discrete_state_prob"
+            ],
+            pair_cond_smoother_cross_cov=exact["pair_cond_smoother_cross_cov"],
+            pair_cond_smoother_means=exact["pair_cond_smoother_means"],
+            pair_cond_smoother_covs=exact["pair_cond_smoother_covs"],
+            next_pair_cond_smoother_means=exact["next_pair_cond_smoother_means"],
+        )
+
+        state_prob = exact["smoother_discrete_state_prob"]
+        state_mean = exact["state_cond_smoother_means"]
+        state_cov = exact["state_cond_smoother_covs"]
+        n_time_per_state = state_prob.sum(axis=0)
+        n_transition_dest = state_prob[1:].sum(axis=0)
+
+        gamma = jnp.einsum("tcdk,tk->cdk", state_cov, state_prob)
+        gamma += jnp.einsum("tck,tdk,tk->cdk", state_mean, state_mean, state_prob)
+        first_gamma = state_cov[0] * state_prob[0, None, None]
+        first_gamma += jnp.einsum(
+            "ck,dk,k->cdk", state_mean[0], state_mean[0], state_prob[0]
+        )
+        gamma2 = gamma - first_gamma
+        delta = jnp.einsum("to,tck,tk->ock", obs, state_mean, state_prob)
+        alpha = jnp.einsum("to,tp,tk->opk", obs, obs, state_prob)
+
+        expected_A = jnp.stack(
+            [
+                utils_module.psd_solve(gamma1[:, :, j], beta[:, :, j].T).T
+                for j in range(gamma1.shape[-1])
+            ],
+            axis=-1,
+        )
+        expected_H = jnp.stack(
+            [
+                utils_module.psd_solve(gamma[:, :, j], delta[:, :, j].T).T
+                for j in range(gamma.shape[-1])
+            ],
+            axis=-1,
+        )
+        expected_Q = jnp.stack(
+            [
+                utils_module.stabilize_covariance(
+                    (gamma2[:, :, j] - expected_A[:, :, j] @ beta[:, :, j].T)
+                    / n_transition_dest[j]
+                )
+                for j in range(gamma1.shape[-1])
+            ],
+            axis=-1,
+        )
+        expected_R = jnp.stack(
+            [
+                utils_module.stabilize_covariance(
+                    (alpha[:, :, j] - expected_H[:, :, j] @ delta[:, :, j].T)
+                    / n_time_per_state[j]
+                )
+                for j in range(gamma.shape[-1])
+            ],
+            axis=-1,
+        )
+        expected_Z_counts = exact["smoother_joint_discrete_state_prob"].sum(axis=0)
+        expected_Z = expected_Z_counts / expected_Z_counts.sum(axis=1, keepdims=True)
+
+        np.testing.assert_allclose(mstep_A, expected_A, rtol=1e-8, atol=1e-8)
+        np.testing.assert_allclose(mstep_H, expected_H, rtol=1e-8, atol=1e-8)
+        np.testing.assert_allclose(mstep_Q, expected_Q, rtol=1e-8, atol=1e-8)
+        np.testing.assert_allclose(mstep_R, expected_R, rtol=1e-8, atol=1e-8)
+        np.testing.assert_allclose(
+            mstep_init_mean,
+            exact["state_cond_smoother_means"][0],
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            mstep_init_cov,
+            exact["state_cond_smoother_covs"][0],
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(mstep_Z, expected_Z, rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(
+            mstep_init_prob,
+            exact["smoother_discrete_state_prob"][0],
+            rtol=1e-10,
+            atol=1e-10,
+        )
 
 
 class TestGPB2ExactAccuracy:
