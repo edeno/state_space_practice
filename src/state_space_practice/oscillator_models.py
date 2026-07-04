@@ -50,8 +50,10 @@ from state_space_practice.oscillator_utils import (
     construct_correlated_noise_process_covariance,
     construct_directed_influence_measurement_matrix,
     construct_directed_influence_transition_matrix,
+    extract_correlated_noise_params_from_covariance,
     extract_dim_params_from_matrix,
     get_block_slice,
+    project_correlated_noise_process_covariance,
     project_coupled_transition_matrix,
 )
 from state_space_practice.switching_kalman import (
@@ -66,7 +68,6 @@ from state_space_practice.utils import (
     check_converged,
     make_discrete_transition_matrix,
     shift_to_psd,
-    stabilize_covariance,
     validate_covariance,
 )
 
@@ -1362,22 +1363,39 @@ class CorrelatedNoiseModel(BaseModel):
         )
 
     def _project_parameters(self):
-        """Projects each per-state Q to the nearest symmetric PSD covariance.
+        """Project each per-state Q to the CNM covariance family.
 
-        The constructor already makes Q symmetric with rotation-structured
-        cross-blocks; strong coupling can still push it indefinite, so floor
-        the eigenvalues to keep it a valid covariance for the Cholesky-based
-        switching filter. (A per-block rotation projection would re-break the
-        cross-block symmetry the constructor establishes, so it is not used
-        here -- a rotation matrix is not a valid covariance block.)
+        The generic switching Kalman M-step estimates an unconstrained
+        covariance. CNM requires scalar-identity diagonal oscillator blocks and
+        symmetric scaled-rotation cross-blocks, so project back to that
+        structure and update the public scientific parameters accordingly.
         """
         self.process_cov = jnp.stack(
             [
-                stabilize_covariance(self.process_cov[..., j])
+                project_correlated_noise_process_covariance(self.process_cov[..., j])
                 for j in range(self.n_discrete_states)
             ],
             axis=-1,
         )
+        self._sync_process_covariance_params()
+
+    def _sync_process_covariance_params(self) -> None:
+        """Sync CNM scientific parameters from the structured Q stack."""
+        variances = []
+        phases = []
+        couplings = []
+        for j in range(self.n_discrete_states):
+            params = extract_correlated_noise_params_from_covariance(
+                self.process_cov[..., j],
+                self.n_oscillators,
+            )
+            variances.append(params["variance"])
+            phases.append(params["phase_difference"])
+            couplings.append(params["coupling_strength"])
+
+        self.process_variance = jnp.stack(variances, axis=-1)
+        self.phase_difference = jnp.stack(phases, axis=-1)
+        self.coupling_strength = jnp.stack(couplings, axis=-1)
 
     def fit(
         self,
@@ -1512,6 +1530,7 @@ class CorrelatedNoiseModel(BaseModel):
             self.process_cov = jax.vmap(
                 shift_to_psd, in_axes=-1, out_axes=-1
             )(Q_raw)
+            self._sync_process_covariance_params()
         self.init_cov = self._reconstruct_per_state_array(
             params, "init_cov", self.init_cov
         )

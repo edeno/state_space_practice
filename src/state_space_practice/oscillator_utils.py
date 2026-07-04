@@ -875,6 +875,107 @@ def project_coupled_transition_matrix(transition_matrix: jax.Array) -> jax.Array
     return projected_blocks.transpose(0, 2, 1, 3).reshape(dim, dim)
 
 
+def _matrix_to_oscillator_blocks(matrix: jax.Array) -> jax.Array:
+    """Reshape a ``(2n, 2n)`` matrix to ``(n, n, 2, 2)`` blocks."""
+    dim = matrix.shape[0]
+    if dim % 2 != 0 or matrix.shape != (dim, dim):
+        raise ValueError("Input matrix must be square with even dimensions.")
+    n_oscillators = dim // 2
+    return matrix.reshape(n_oscillators, 2, n_oscillators, 2).transpose(0, 2, 1, 3)
+
+
+def _oscillator_blocks_to_matrix(blocks: jax.Array) -> jax.Array:
+    """Assemble ``(n, n, 2, 2)`` oscillator blocks into a matrix."""
+    n_oscillators = blocks.shape[0]
+    return blocks.transpose(0, 2, 1, 3).reshape(
+        2 * n_oscillators, 2 * n_oscillators
+    )
+
+
+def project_correlated_noise_process_covariance(
+    process_covariance: jax.Array,
+    min_eigenvalue: float = 1e-8,
+    max_shrink_iter: int = 60,
+) -> jax.Array:
+    """Project a covariance to the CNM block structure while preserving PSD.
+
+    The Correlated Noise Model requires diagonal oscillator blocks
+    ``sigma_k * I`` and symmetric off-diagonal scaled-rotation blocks.  A
+    generic Kalman M-step produces an arbitrary covariance, so this projects the
+    blocks back to the model family and, if needed, shrinks only the off-diagonal
+    linkage blocks toward zero until the covariance is positive semidefinite.
+    """
+    cov = 0.5 * (process_covariance + process_covariance.T)
+    blocks = _matrix_to_oscillator_blocks(cov)
+    n_oscillators = blocks.shape[0]
+
+    structured_blocks = jnp.zeros_like(blocks)
+    diag_blocks = jnp.zeros_like(blocks)
+    for i in range(n_oscillators):
+        variance = jnp.maximum(0.5 * jnp.trace(blocks[i, i]), min_eigenvalue)
+        block = variance * IDENTITY_2x2.astype(cov.dtype)
+        structured_blocks = structured_blocks.at[i, i].set(block)
+        diag_blocks = diag_blocks.at[i, i].set(block)
+
+    for i in range(n_oscillators):
+        for j in range(i + 1, n_oscillators):
+            upper = _project_to_scaled_rotation_matrix(blocks[i, j])
+            structured_blocks = structured_blocks.at[i, j].set(upper)
+            structured_blocks = structured_blocks.at[j, i].set(upper.T)
+
+    structured = _oscillator_blocks_to_matrix(structured_blocks)
+    diag_only = _oscillator_blocks_to_matrix(diag_blocks)
+    min_eig = float(jnp.linalg.eigvalsh(structured).min())
+    if min_eig >= min_eigenvalue:
+        return structured
+
+    off_diag = structured - diag_only
+    lo = 0.0
+    hi = 1.0
+    for _ in range(max_shrink_iter):
+        mid = 0.5 * (lo + hi)
+        candidate = diag_only + mid * off_diag
+        candidate_min_eig = float(jnp.linalg.eigvalsh(candidate).min())
+        if candidate_min_eig >= min_eigenvalue:
+            lo = mid
+        else:
+            hi = mid
+
+    return diag_only + lo * off_diag
+
+
+def extract_correlated_noise_params_from_covariance(
+    process_covariance: jax.Array,
+    n_oscillators: int,
+) -> dict:
+    """Extract CNM scientific parameters from a structured process covariance."""
+    blocks = _matrix_to_oscillator_blocks(process_covariance)
+    if blocks.shape[0] != n_oscillators:
+        raise ValueError(
+            "n_oscillators does not match process_covariance shape: "
+            f"{n_oscillators} vs {blocks.shape[0]}."
+        )
+
+    variance = jnp.zeros((n_oscillators,), dtype=process_covariance.dtype)
+    phase_difference = jnp.zeros(
+        (n_oscillators, n_oscillators), dtype=process_covariance.dtype
+    )
+    coupling_strength = jnp.zeros_like(phase_difference)
+
+    for i in range(n_oscillators):
+        variance = variance.at[i].set(0.5 * jnp.trace(blocks[i, i]))
+        for j in range(i + 1, n_oscillators):
+            scale, angle = _extract_scale_and_angle(blocks[i, j])
+            coupling_strength = coupling_strength.at[i, j].set(scale)
+            phase_difference = phase_difference.at[i, j].set(angle)
+
+    return {
+        "variance": variance,
+        "phase_difference": phase_difference,
+        "coupling_strength": coupling_strength,
+    }
+
+
 def extract_dim_params_from_matrix(
     A: jax.Array,
     sampling_freq: float,
