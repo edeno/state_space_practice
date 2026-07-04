@@ -5516,7 +5516,8 @@ class TestSwitchingSpikeOscillatorModelFit:
 
         # Should return a list of log-likelihoods
         assert isinstance(log_likelihoods, list)
-        assert len(log_likelihoods) == 4
+        assert 1 <= len(log_likelihoods) <= 4
+        assert all(jnp.isfinite(jnp.asarray(ll)) for ll in log_likelihoods)
 
     @pytest.mark.slow
     def test_fit_appends_synced_final_ll(self) -> None:
@@ -5542,6 +5543,48 @@ class TestSwitchingSpikeOscillatorModelFit:
 
         assert len(log_likelihoods) == 2
         assert log_likelihoods[-1] == pytest.approx(fresh_ll)
+
+    def test_fit_rolls_back_bad_final_m_step(self, monkeypatch) -> None:
+        """A final E-step LL decrease should restore the pre-M-step parameters."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=1,
+            n_neurons=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            separate_spike_params=False,
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        original_A = model.continuous_transition_matrix.copy()
+        spikes = jnp.zeros((4, 2))
+        e_step_values = iter([100.0, 50.0, 100.0])
+
+        def fake_e_step(_spikes: Array) -> Array:
+            return jnp.asarray(next(e_step_values))
+
+        def bad_m_step_dynamics() -> None:
+            model.continuous_transition_matrix = (
+                model.continuous_transition_matrix + 5.0
+            )
+
+        monkeypatch.setattr(model, "_e_step", fake_e_step)
+        monkeypatch.setattr(model, "_m_step_dynamics", bad_m_step_dynamics)
+        monkeypatch.setattr(model, "_m_step_spikes", lambda _spikes: None)
+        monkeypatch.setattr(model, "_project_parameters", lambda: None)
+
+        log_likelihoods = model.fit(
+            spikes,
+            max_iter=1,
+            skip_init=True,
+            decrease_tol=1e-6,
+        )
+
+        assert log_likelihoods == [100.0]
+        np.testing.assert_allclose(model.continuous_transition_matrix, original_A)
 
     @pytest.mark.parametrize(
         ("bad_value", "match"),

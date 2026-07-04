@@ -3221,7 +3221,27 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             logger.warning("Reached maximum iterations without converging.")
             final_ll = self._e_step(spikes)
             if jnp.isfinite(final_ll):
-                log_likelihoods.append(float(final_ll))
+                _, final_is_increasing = check_converged(
+                    log_likelihood=float(final_ll),
+                    previous_log_likelihood=log_likelihoods[-1],
+                    tolerance=decrease_tol,
+                )
+                if final_is_increasing:
+                    log_likelihoods.append(float(final_ll))
+                elif prev_params is not None:
+                    _restore_params(prev_params)
+                    self._e_step(spikes)
+                    logger.warning(
+                        "Final LL decreased after last M-step (%.1f -> %.1f); "
+                        "rolled back to previous.",
+                        log_likelihoods[-1],
+                        float(final_ll),
+                    )
+                else:
+                    logger.warning(
+                        "Final LL decreased after last M-step but no previous "
+                        "parameters were available for rollback."
+                    )
             elif prev_params is not None:
                 _restore_params(prev_params)
                 self._e_step(spikes)
