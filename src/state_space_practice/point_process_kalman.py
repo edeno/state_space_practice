@@ -555,11 +555,12 @@ def _point_process_laplace_update(
     -----------------------------
     The posterior precision is built as
 
-        P_post = P_prior + J' diag(lambda * dt) J
+        Lambda_post = P_prior^{-1} + J' diag(lambda * dt) J
 
     where ``J`` is the Jacobian of ``log_intensity_func`` w.r.t. the state
-    and ``lambda`` is the conditional intensity. This is a sum of PSD
-    matrices, so ``P_post`` is PSD by construction and requires no
+    and ``lambda`` is the conditional intensity. The posterior covariance is
+    ``P_post = Lambda_post^{-1}``. This is a sum of PSD matrices, so
+    ``Lambda_post`` is PSD by construction and requires no
     eigenvalue stabilization.
 
     Full Newton would additionally subtract the observed Hessian correction
@@ -796,8 +797,11 @@ def _point_process_laplace_update(
     )
 
     if include_laplace_normalization:
-        # Laplace correction: log p(y) ≈ log p(y|x*) + log p(x*) + 0.5 log|P_post|
-        # Constant terms (d/2 * log 2π) are omitted since they cancel across states.
+        # Laplace correction:
+        #   log p(y) approx log p(y|x*) - 0.5 delta' P_prior^{-1} delta
+        #                   - 0.5 log|P_prior| + 0.5 log|P_post|
+        # The Gaussian +/- d/2 log(2*pi) terms cancel between the normalized
+        # prior density and the Laplace integral.
         delta = posterior_mean - one_step_mean
         quad = delta @ (prior_precision @ delta)
         logdet_prior = _logdet_psd(one_step_cov, diagonal_boost)
@@ -1789,7 +1793,8 @@ def stochastic_point_process_smoother(
     smoother_cov : Array, shape (n_time, n_params, n_params)
         Smoothed posterior covariances ($P_{k|T}$).
     smoother_cross_cov : Array, shape (n_time - 1, n_params, n_params)
-        Smoothed cross-covariances ($P_{k|T, k-1}$).
+        Smoothed lag-one cross-covariances, indexed as
+        ``Cov(x_t, x_{t+1} | y_{1:T})`` for ``t = 0, ..., T - 2``.
     marginal_log_likelihood : Array
         Total log-likelihood of the observations given the model (scalar array).
 
@@ -1950,7 +1955,8 @@ def dynamics_only_m_step(
     smoother_cov : ArrayLike, shape (n_time, n_cont_states, n_cont_states)
         smoother covariance.
     smoother_cross_cov : ArrayLike, shape (n_time - 1, n_cont_states, n_cont_states)
-        smoother cross-covariance.
+        Smoothed lag-one cross-covariances, indexed as
+        ``Cov(x_t, x_{t+1} | y_{1:T})`` for ``t = 0, ..., T - 2``.
 
     Returns
     -------

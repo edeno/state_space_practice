@@ -415,6 +415,79 @@ class TestStochasticPointProcessSmoother:
         np.testing.assert_allclose(smoother_mean[-1], filtered_mean[-1], rtol=1e-5)
         np.testing.assert_allclose(smoother_cov[-1], filtered_cov[-1], rtol=1e-5)
 
+    def test_smoother_improves_latent_rmse_on_simulated_data(self) -> None:
+        """Future spikes should improve latent trajectory estimates."""
+        n_time = 250
+        n_neurons = 12
+        dt = 0.02
+        transition_matrix = jnp.array([[0.95]])
+        process_cov = jnp.array([[0.03]])
+        init_mean = jnp.array([0.0])
+        init_cov = jnp.array([[0.5]])
+
+        key = jax.random.PRNGKey(2024)
+        key_init, key_state, key_spikes = jax.random.split(key, 3)
+        process_sd = jnp.sqrt(process_cov[0, 0])
+
+        def dynamics_step(x, key_t):
+            noise = jax.random.normal(key_t, (1,)) * process_sd
+            x_next = transition_matrix @ x + noise
+            return x_next, x_next
+
+        x0 = jax.random.normal(key_init, (1,)) * jnp.sqrt(init_cov[0, 0])
+        _, latent_states = jax.lax.scan(
+            dynamics_step, x0, jax.random.split(key_state, n_time)
+        )
+        latent_states = latent_states[:, 0]
+
+        baseline = jnp.full((n_time, n_neurons), 2.0)
+        weights = jnp.linspace(0.8, 1.2, n_neurons)
+        design_matrix = jnp.stack(
+            [baseline, jnp.broadcast_to(weights, (n_time, n_neurons))],
+            axis=-1,
+        )
+
+        def log_rate(design_matrix_t, state):
+            return design_matrix_t[:, 0] + design_matrix_t[:, 1] * state[0]
+
+        expected_count = jnp.exp(baseline + weights[None, :] * latent_states[:, None])
+        expected_count = expected_count * dt
+        spikes = jax.random.poisson(key_spikes, expected_count).astype(float)
+
+        (
+            smoother_mean,
+            smoother_cov,
+            _,
+            _,
+            filtered_mean,
+            filtered_cov,
+        ) = stochastic_point_process_smoother(
+            init_mean,
+            init_cov,
+            design_matrix,
+            spikes,
+            dt,
+            transition_matrix,
+            process_cov,
+            log_rate,
+            return_filtered=True,
+            max_newton_iter=5,
+        )
+
+        filter_rmse = jnp.sqrt(jnp.mean((filtered_mean[:, 0] - latent_states) ** 2))
+        smoother_rmse = jnp.sqrt(jnp.mean((smoother_mean[:, 0] - latent_states) ** 2))
+        filter_trace = jnp.trace(filtered_cov, axis1=-2, axis2=-1)
+        smoother_trace = jnp.trace(smoother_cov, axis1=-2, axis2=-1)
+
+        assert smoother_rmse < 0.9 * filter_rmse, (
+            f"Smoother should improve latent RMSE; filter={filter_rmse:.4f}, "
+            f"smoother={smoother_rmse:.4f}"
+        )
+        assert jnp.all(smoother_trace[:-1] <= filter_trace[:-1] + 1e-8)
+        np.testing.assert_allclose(
+            smoother_mean[-1], filtered_mean[-1], rtol=1e-6, atol=1e-8
+        )
+
 
 class TestKalmanMaximizationStep:
     """Tests for the dynamics_only_m_step function."""
@@ -522,6 +595,39 @@ class TestKalmanMaximizationStep:
         )
 
         np.testing.assert_allclose(init_cov, s["smoother_cov"][0], rtol=1e-10)
+
+    def test_recovers_nonsymmetric_transition_from_exact_sufficient_stats(self) -> None:
+        """M-step should recover A orientation for a noiseless 2D trajectory."""
+        n_time = 40
+        true_transition_matrix = jnp.array([[0.7, 0.25], [-0.15, 0.9]])
+        initial_state = jnp.array([1.0, -0.4])
+
+        def dynamics_step(state, _):
+            return true_transition_matrix @ state, state
+
+        _, smoother_mean = jax.lax.scan(dynamics_step, initial_state, None, n_time)
+        n_state = true_transition_matrix.shape[0]
+        smoother_cov = jnp.zeros((n_time, n_state, n_state))
+        smoother_cross_cov = jnp.zeros((n_time - 1, n_state, n_state))
+
+        estimated_transition_matrix, estimated_process_cov, _, _ = dynamics_only_m_step(
+            smoother_mean,
+            smoother_cov,
+            smoother_cross_cov,
+        )
+
+        np.testing.assert_allclose(
+            estimated_transition_matrix,
+            true_transition_matrix,
+            rtol=1e-8,
+            atol=1e-8,
+        )
+        np.testing.assert_allclose(
+            estimated_process_cov,
+            jnp.eye(n_state) * 1e-8,
+            rtol=1e-8,
+            atol=1e-10,
+        )
 
 
 class TestSteepestDescentPointProcessFilter:
@@ -1925,6 +2031,234 @@ class TestPointProcessMathCorrectness:
                 rtol=1e-4,
                 err_msg=f"Cov wrong for {label}",
             )
+
+    def test_iterative_laplace_matches_mode_hessian_and_log_evidence(self) -> None:
+        """Linear log-rates give an oracle for the mode, covariance, and LL.
+
+        With log(lambda) = b + W @ x, Fisher scoring is exact Newton because
+        second derivatives of log(lambda) vanish. At convergence, the returned
+        posterior mean should be the MAP, the covariance should be the inverse
+        negative Hessian, and the normalized log likelihood should equal the
+        independent Laplace evidence expression. The Gaussian d/2 log(2*pi)
+        constants cancel between the prior and integral; this pins that
+        convention.
+        """
+        mean = jnp.array([0.2, -0.1])
+        chol = jnp.array([[0.8, 0.0], [0.25, 0.6]])
+        cov = chol @ chol.T
+        spikes = jnp.array([1.0, 0.0, 2.0])
+        dt = 0.05
+        weights = jnp.array(
+            [[0.35, -0.2], [-0.15, 0.4], [0.2, 0.25]]
+        )
+        baseline = jnp.array([0.1, -0.3, 0.2])
+        prior_precision = jnp.linalg.inv(cov)
+
+        def log_intensity(x):
+            return baseline + weights @ x
+
+        def log_joint_without_gaussian_2pi(x):
+            log_rate = log_intensity(x)
+            expected_count = jnp.exp(log_rate) * dt
+            log_obs = jnp.sum(
+                jax.scipy.stats.poisson.logpmf(spikes, expected_count)
+            )
+            delta = x - mean
+            sign, logdet_prior = jnp.linalg.slogdet(cov)
+            assert float(sign) > 0.0
+            log_prior = -0.5 * delta @ (prior_precision @ delta)
+            log_prior = log_prior - 0.5 * logdet_prior
+            return log_obs + log_prior
+
+        post_mean, post_cov, log_lik = _point_process_laplace_update(
+            mean,
+            cov,
+            spikes,
+            dt,
+            log_intensity,
+            diagonal_boost=0.0,
+            include_laplace_normalization=True,
+            max_newton_iter=25,
+        )
+
+        def neg_log_posterior(x):
+            return -log_joint_without_gaussian_2pi(x)
+
+        gradient_at_mode = jax.grad(neg_log_posterior)(post_mean)
+        hessian_at_mode = jax.hessian(neg_log_posterior)(post_mean)
+        _, logdet_post = jnp.linalg.slogdet(post_cov)
+        expected_log_lik = (
+            log_joint_without_gaussian_2pi(post_mean) + 0.5 * logdet_post
+        )
+
+        np.testing.assert_allclose(
+            gradient_at_mode,
+            jnp.zeros_like(post_mean),
+            atol=1e-7,
+            err_msg="Laplace mean should be the MAP for linear log-intensity",
+        )
+        np.testing.assert_allclose(
+            post_cov,
+            jnp.linalg.inv(hessian_at_mode),
+            rtol=1e-8,
+            atol=1e-9,
+            err_msg="Laplace covariance should equal inverse MAP Hessian",
+        )
+        np.testing.assert_allclose(
+            log_lik,
+            expected_log_lik,
+            rtol=1e-10,
+            atol=1e-10,
+            err_msg="Laplace log evidence has wrong prior/determinant convention",
+        )
+
+    def test_laplace_interval_calibrated_against_1d_quadrature(self) -> None:
+        """Laplace covariance should give calibrated intervals in a benign regime."""
+        prior_mean = 0.2
+        prior_var = 0.7
+        baseline = 5.0
+        dt = 0.02
+        spike_count = 12.0
+
+        def log_intensity(x):
+            return jnp.array([baseline + x[0]])
+
+        post_mean, post_cov, _ = _point_process_laplace_update(
+            jnp.array([prior_mean]),
+            jnp.array([[prior_var]]),
+            jnp.array([spike_count]),
+            dt,
+            log_intensity,
+            diagonal_boost=0.0,
+            include_laplace_normalization=True,
+            max_newton_iter=25,
+        )
+        laplace_ci = get_confidence_interval(
+            post_mean[None, :],
+            post_cov[None, :, :],
+            alpha=0.05,
+        )[0, 0]
+
+        grid = jnp.linspace(-4.0, 4.0, 40001)
+        expected_count = jnp.exp(baseline + grid) * dt
+        log_likelihood = jax.scipy.stats.poisson.logpmf(
+            spike_count, expected_count
+        )
+        log_prior = jax.scipy.stats.norm.logpdf(
+            grid, prior_mean, jnp.sqrt(prior_var)
+        )
+        dx = grid[1] - grid[0]
+        log_unnormalized = log_likelihood + log_prior
+        log_normalizer = jax.scipy.special.logsumexp(
+            log_unnormalized + jnp.log(dx)
+        )
+        exact_weights = jnp.exp(log_unnormalized + jnp.log(dx) - log_normalizer)
+        exact_mean = jnp.sum(exact_weights * grid)
+        exact_var = jnp.sum(exact_weights * (grid - exact_mean) ** 2)
+        exact_mass_in_laplace_ci = jnp.sum(
+            jnp.where(
+                (grid >= laplace_ci[0]) & (grid <= laplace_ci[1]),
+                exact_weights,
+                0.0,
+            )
+        )
+
+        np.testing.assert_allclose(
+            post_cov[0, 0],
+            exact_var,
+            rtol=0.04,
+            err_msg="Laplace variance should match exact posterior variance",
+        )
+        assert jnp.abs(post_mean[0] - exact_mean) < 0.2 * jnp.sqrt(exact_var)
+        assert 0.94 <= exact_mass_in_laplace_ci <= 0.96, (
+            "Laplace 95% interval should have near-nominal exact posterior mass, "
+            f"got {exact_mass_in_laplace_ci:.4f}"
+        )
+
+    def test_filter_matches_exact_grid_filter_for_1d_sequence(self) -> None:
+        """A small 1D sequence should match independent grid Bayes filtering."""
+        dt = 0.02
+        transition_matrix = jnp.array([[0.85]])
+        process_cov = jnp.array([[0.04]])
+        init_mean = jnp.array([0.1])
+        init_cov = jnp.array([[0.3]])
+        baseline = jnp.array([5.0, 5.1, 4.9, 5.2, 5.0, 5.1])
+        weights = jnp.array([0.8, 1.0, 0.9, 1.1, 0.95, 1.05])
+        design_matrix = jnp.stack([baseline, weights], axis=1)
+        spikes = jnp.array([3.0, 4.0, 2.0, 5.0, 3.0, 4.0])
+
+        def log_rate(design_matrix_t, state):
+            return jnp.array([design_matrix_t[0] + design_matrix_t[1] * state[0]])
+
+        filtered_mean, filtered_cov, marginal_log_likelihood = (
+            stochastic_point_process_filter(
+                init_mean,
+                init_cov,
+                design_matrix,
+                spikes,
+                dt,
+                transition_matrix,
+                process_cov,
+                log_rate,
+                max_newton_iter=10,
+            )
+        )
+
+        grid = jnp.linspace(-4.0, 4.0, 2001)
+        dx = grid[1] - grid[0]
+        transition_sd = jnp.sqrt(process_cov[0, 0])
+        prior_mean = (transition_matrix @ init_mean)[0]
+        prior_var = (transition_matrix @ init_cov @ transition_matrix.T + process_cov)[
+            0, 0
+        ]
+        prior_density = jax.scipy.stats.norm.pdf(
+            grid, prior_mean, jnp.sqrt(prior_var)
+        )
+        prior_density = prior_density / jnp.sum(prior_density * dx)
+        transition_kernel = jax.scipy.stats.norm.pdf(
+            grid[:, None],
+            transition_matrix[0, 0] * grid[None, :],
+            transition_sd,
+        )
+
+        exact_means = []
+        exact_vars = []
+        exact_log_likelihood = 0.0
+        for baseline_t, weight_t, spike_t in zip(baseline, weights, spikes):
+            expected_count = jnp.exp(baseline_t + weight_t * grid) * dt
+            likelihood = jnp.exp(
+                jax.scipy.stats.poisson.logpmf(spike_t, expected_count)
+            )
+            evidence = jnp.sum(likelihood * prior_density * dx)
+            exact_log_likelihood = exact_log_likelihood + jnp.log(evidence)
+            posterior_density = likelihood * prior_density / evidence
+            exact_mean = jnp.sum(grid * posterior_density * dx)
+            exact_var = jnp.sum((grid - exact_mean) ** 2 * posterior_density * dx)
+            exact_means.append(exact_mean)
+            exact_vars.append(exact_var)
+            prior_density = jnp.sum(
+                transition_kernel * posterior_density[None, :] * dx,
+                axis=1,
+            )
+            prior_density = prior_density / jnp.sum(prior_density * dx)
+
+        exact_means = jnp.asarray(exact_means)
+        exact_vars = jnp.asarray(exact_vars)
+        standardized_mean_error = jnp.abs(filtered_mean[:, 0] - exact_means)
+        standardized_mean_error = standardized_mean_error / jnp.sqrt(exact_vars)
+
+        assert jnp.max(standardized_mean_error) < 0.12
+        np.testing.assert_allclose(
+            filtered_cov[:, 0, 0],
+            exact_vars,
+            rtol=0.02,
+            atol=1e-4,
+        )
+        np.testing.assert_allclose(
+            marginal_log_likelihood,
+            exact_log_likelihood,
+            atol=0.02,
+        )
 
     def test_zero_spike_pushes_mean_toward_lower_intensity(self) -> None:
         """y=0 should decrease the posterior mean (lower intensity)."""
