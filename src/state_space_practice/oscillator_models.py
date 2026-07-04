@@ -691,7 +691,7 @@ class BaseModel(ABC, SGDFittableMixin):
         if self.update_process_cov:
             self.process_cov = Q
         if self.update_measurement_cov:
-            self.measurement_cov = R
+            self.measurement_cov = self._pool_measurement_covariance(R)
         if self.update_init_mean:
             self.init_mean = m0
         if self.update_init_cov:
@@ -700,6 +700,55 @@ class BaseModel(ABC, SGDFittableMixin):
             self.discrete_transition_matrix = Z
         # Always update init_prob based on the first smoother probability
         self.init_discrete_state_prob = pi0
+
+    def _stack_shared_measurement_covariance(self, measurement_cov: Array) -> Array:
+        """Return a per-state stack from one shared observation covariance."""
+        cov_arr = jnp.asarray(measurement_cov)
+        if cov_arr.ndim == 3:
+            if cov_arr.shape[-1] != self.n_discrete_states:
+                raise ValueError(
+                    "measurement_cov state axis mismatch: expected "
+                    f"{self.n_discrete_states}, got {cov_arr.shape[-1]}."
+                )
+            return cov_arr
+        if cov_arr.shape != (self.n_sources, self.n_sources):
+            raise ValueError(
+                "shared measurement_cov must have shape "
+                f"({self.n_sources}, {self.n_sources}), got {cov_arr.shape}."
+            )
+        return jnp.stack([cov_arr] * self.n_discrete_states, axis=-1)
+
+    def _measurement_covariance_from_params(self, params: dict) -> Array:
+        """Get the shared observation covariance stack for SGD losses."""
+        if "measurement_cov" in params:
+            return self._stack_shared_measurement_covariance(
+                params["measurement_cov"]
+            )
+        return self.measurement_cov
+
+    def _store_shared_measurement_covariance(self, params: dict) -> None:
+        """Store a shared observation covariance optimized by SGD."""
+        if "measurement_cov" in params:
+            self.measurement_cov = self._stack_shared_measurement_covariance(
+                params["measurement_cov"]
+            )
+
+    def _pool_measurement_covariance(self, per_state_cov: Array) -> Array:
+        """Pool per-state Kalman M-step covariances into one shared R.
+
+        Eq. 2.18 of Hsin et al. (2024) estimates a single observation-noise
+        covariance, not one covariance per switching state.  The generic
+        switching Kalman M-step returns state-specific ``R_j`` values; weighting
+        them by state responsibilities recovers the pooled update.
+        """
+        state_weights = jnp.sum(self.smoother_discrete_state_prob, axis=0)
+        total_weight = jnp.maximum(jnp.sum(state_weights), 1e-12)
+        pooled = (
+            jnp.einsum("j,abj->ab", state_weights, per_state_cov)
+            / total_weight
+        )
+        pooled = 0.5 * (pooled + pooled.T)
+        return self._stack_shared_measurement_covariance(pooled)
 
     def fit(
         self,
@@ -1159,11 +1208,8 @@ class CommonOscillatorModel(BaseModel):
             params["measurement_matrix"] = self.measurement_matrix
             spec["measurement_matrix"] = UNCONSTRAINED
         if self.update_measurement_cov:
-            # Per-state R: vmap PSD transform over last axis
-            for j in range(self.n_discrete_states):
-                key = f"measurement_cov_{j}"
-                params[key] = self.measurement_cov[..., j]
-                spec[key] = PSD_MATRIX
+            params["measurement_cov"] = self.measurement_cov[..., 0]
+            spec["measurement_cov"] = PSD_MATRIX
         if self.update_discrete_transition_matrix:
             params["discrete_transition_matrix"] = self.discrete_transition_matrix
             spec["discrete_transition_matrix"] = STOCHASTIC_ROW
@@ -1182,7 +1228,7 @@ class CommonOscillatorModel(BaseModel):
         H = params.get("measurement_matrix", self.measurement_matrix)
         Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
         m0 = params.get("init_mean", self.init_mean)
-        R = self._reconstruct_per_state_array(params, "measurement_cov", self.measurement_cov)
+        R = self._measurement_covariance_from_params(params)
         P0 = self._reconstruct_per_state_array(params, "init_cov", self.init_cov)
 
         result = switching_kalman_filter(
@@ -1200,9 +1246,7 @@ class CommonOscillatorModel(BaseModel):
 
     def _store_sgd_params(self, params: dict) -> None:
         super()._store_sgd_params(params)
-        self.measurement_cov = self._reconstruct_per_state_array(
-            params, "measurement_cov", self.measurement_cov
-        )
+        self._store_shared_measurement_covariance(params)
         self.init_cov = self._reconstruct_per_state_array(
             params, "init_cov", self.init_cov
         )
@@ -1458,6 +1502,10 @@ class CorrelatedNoiseModel(BaseModel):
             params["discrete_transition_matrix"] = self.discrete_transition_matrix
             spec["discrete_transition_matrix"] = STOCHASTIC_ROW
 
+        if self.update_measurement_cov:
+            params["measurement_cov"] = self.measurement_cov[..., 0]
+            spec["measurement_cov"] = PSD_MATRIX
+
         if self.update_init_mean:
             params["init_mean"] = self.init_mean
             spec["init_mean"] = UNCONSTRAINED
@@ -1473,6 +1521,7 @@ class CorrelatedNoiseModel(BaseModel):
     def _sgd_loss_fn(self, params: dict, observations: Array) -> Array:
         Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
         m0 = params.get("init_mean", self.init_mean)
+        R = self._measurement_covariance_from_params(params)
         P0 = self._reconstruct_per_state_array(params, "init_cov", self.init_cov)
 
         # Reconstruct per-state Q from scientific params
@@ -1500,7 +1549,7 @@ class CorrelatedNoiseModel(BaseModel):
             continuous_transition_matrix=self.continuous_transition_matrix,
             process_cov=Q,
             measurement_matrix=self.measurement_matrix,
-            measurement_cov=self.measurement_cov,
+            measurement_cov=R,
         )
         return -result[6]
 
@@ -1531,6 +1580,7 @@ class CorrelatedNoiseModel(BaseModel):
                 shift_to_psd, in_axes=-1, out_axes=-1
             )(Q_raw)
             self._sync_process_covariance_params()
+        self._store_shared_measurement_covariance(params)
         self.init_cov = self._reconstruct_per_state_array(
             params, "init_cov", self.init_cov
         )
@@ -1734,7 +1784,7 @@ class DirectedInfluenceModel(BaseModel):
         if self.update_process_cov:
             self.process_cov = Q
         if self.update_measurement_cov:
-            self.measurement_cov = R
+            self.measurement_cov = self._pool_measurement_covariance(R)
         if self.update_init_mean:
             self.init_mean = m0
         if self.update_init_cov:
@@ -1937,10 +1987,8 @@ class DirectedInfluenceModel(BaseModel):
             spec["coupling_strength"] = UNCONSTRAINED
 
         if self.update_measurement_cov:
-            for j in range(self.n_discrete_states):
-                k = f"measurement_cov_{j}"
-                params[k] = self.measurement_cov[..., j]
-                spec[k] = PSD_MATRIX
+            params["measurement_cov"] = self.measurement_cov[..., 0]
+            spec["measurement_cov"] = PSD_MATRIX
 
         if self.update_discrete_transition_matrix:
             params["discrete_transition_matrix"] = self.discrete_transition_matrix
@@ -2022,7 +2070,7 @@ class DirectedInfluenceModel(BaseModel):
 
         Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
         m0 = params.get("init_mean", self.init_mean)
-        R = self._reconstruct_per_state_array(params, "measurement_cov", self.measurement_cov)
+        R = self._measurement_covariance_from_params(params)
         P0 = self._reconstruct_per_state_array(params, "init_cov", self.init_cov)
 
         result = switching_kalman_filter(
@@ -2069,9 +2117,7 @@ class DirectedInfluenceModel(BaseModel):
                 ),
                 in_axes=(-1, -1), out_axes=-1,
             )(self.phase_difference, self.coupling_strength)
-        self.measurement_cov = self._reconstruct_per_state_array(
-            params, "measurement_cov", self.measurement_cov
-        )
+        self._store_shared_measurement_covariance(params)
         self.init_cov = self._reconstruct_per_state_array(
             params, "init_cov", self.init_cov
         )
