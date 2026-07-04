@@ -5172,6 +5172,253 @@ def _exact_switching_smoother(init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
     return exact_mean, exact_cov
 
 
+def _exact_switching_e_step_oracle(init_mean, init_cov, init_prob, obs, Z, A, Q, H, R):
+    """Exact linear-Gaussian switching E-step for tiny test problems.
+
+    Enumerates all discrete state paths, runs an ordinary Kalman smoother for
+    each path, and then mixes path-conditioned Gaussian moments under the exact
+    posterior over paths. This is exponential in ``n_time`` and is intended only
+    as a correctness oracle for tests.
+    """
+    import itertools
+
+    from jax.scipy.special import logsumexp
+
+    from state_space_practice.kalman import (
+        _kalman_filter_update,
+        _kalman_smoother_update,
+        kalman_measurement_update,
+    )
+
+    n_time, n_latent = obs.shape[0], init_mean.shape[0]
+    n_states = init_prob.shape[0]
+
+    paths, log_w, all_means, all_covs, all_cross = [], [], [], [], []
+    for path in itertools.product(range(n_states), repeat=n_time):
+        s0 = path[0]
+        m, c, ll = kalman_measurement_update(
+            init_mean[:, s0], init_cov[:, :, s0], obs[0], H[:, :, s0], R[:, :, s0]
+        )
+        filter_means, filter_covs = [m], [c]
+        log_path = jnp.log(init_prob[s0]) + ll
+
+        for t in range(1, n_time):
+            s_t = path[t]
+            m, c, ll = _kalman_filter_update(
+                m, c, obs[t], A[:, :, s_t], Q[:, :, s_t], H[:, :, s_t], R[:, :, s_t]
+            )
+            filter_means.append(m)
+            filter_covs.append(c)
+            log_path = log_path + jnp.log(Z[path[t - 1], s_t]) + ll
+
+        sm_means = [None] * n_time
+        sm_covs = [None] * n_time
+        sm_cross = [jnp.zeros((n_latent, n_latent)) for _ in range(n_time - 1)]
+        sm_means[-1], sm_covs[-1] = filter_means[-1], filter_covs[-1]
+        for t in range(n_time - 2, -1, -1):
+            s_next = path[t + 1]
+            sm, sc, cross = _kalman_smoother_update(
+                sm_means[t + 1],
+                sm_covs[t + 1],
+                filter_means[t],
+                filter_covs[t],
+                Q[:, :, s_next],
+                A[:, :, s_next],
+            )
+            sm_means[t], sm_covs[t], sm_cross[t] = sm, sc, cross
+
+        paths.append(path)
+        log_w.append(log_path)
+        all_means.append(jnp.stack(sm_means))
+        all_covs.append(jnp.stack(sm_covs))
+        all_cross.append(jnp.stack(sm_cross))
+
+    path_states = jnp.asarray(paths)
+    log_w = jnp.stack(log_w)
+    path_weights = jnp.exp(log_w - logsumexp(log_w))
+    path_means = jnp.stack(all_means)
+    path_covs = jnp.stack(all_covs)
+    path_cross = jnp.stack(all_cross)
+
+    overall_mean = jnp.einsum("p,ptl->tl", path_weights, path_means)
+    overall_diff = path_means - overall_mean[None]
+    overall_cov = jnp.einsum("p,ptab->tab", path_weights, path_covs) + jnp.einsum(
+        "p,pta,ptb->tab", path_weights, overall_diff, overall_diff
+    )
+
+    smoother_discrete_prob = jnp.zeros((n_time, n_states))
+    state_cond_means = jnp.zeros((n_time, n_latent, n_states))
+    state_cond_covs = jnp.zeros((n_time, n_latent, n_latent, n_states))
+    for t in range(n_time):
+        for s in range(n_states):
+            masked_weights = jnp.where(path_states[:, t] == s, path_weights, 0.0)
+            prob = jnp.sum(masked_weights)
+            cond_weights = jnp.where(prob > 0.0, masked_weights / prob, 0.0)
+            mean = jnp.einsum("p,pl->l", cond_weights, path_means[:, t])
+            diff = path_means[:, t] - mean[None]
+            cov = jnp.einsum("p,pab->ab", cond_weights, path_covs[:, t])
+            cov += jnp.einsum("p,pa,pb->ab", cond_weights, diff, diff)
+
+            smoother_discrete_prob = smoother_discrete_prob.at[t, s].set(prob)
+            state_cond_means = state_cond_means.at[t, :, s].set(mean)
+            state_cond_covs = state_cond_covs.at[t, :, :, s].set(cov)
+
+    joint_prob = jnp.zeros((n_time - 1, n_states, n_states))
+    pair_means = jnp.zeros((n_time - 1, n_latent, n_states, n_states))
+    pair_covs = jnp.zeros((n_time - 1, n_latent, n_latent, n_states, n_states))
+    pair_cross = jnp.zeros((n_time - 1, n_latent, n_latent, n_states, n_states))
+    next_pair_means = jnp.zeros((n_time - 1, n_latent, n_states, n_states))
+    for t in range(n_time - 1):
+        for i in range(n_states):
+            for j in range(n_states):
+                mask = (path_states[:, t] == i) & (path_states[:, t + 1] == j)
+                masked_weights = jnp.where(mask, path_weights, 0.0)
+                prob = jnp.sum(masked_weights)
+                cond_weights = jnp.where(prob > 0.0, masked_weights / prob, 0.0)
+
+                mean_t = jnp.einsum("p,pl->l", cond_weights, path_means[:, t])
+                mean_next = jnp.einsum(
+                    "p,pl->l", cond_weights, path_means[:, t + 1]
+                )
+                diff_t = path_means[:, t] - mean_t[None]
+                diff_next = path_means[:, t + 1] - mean_next[None]
+
+                cov_t = jnp.einsum("p,pab->ab", cond_weights, path_covs[:, t])
+                cov_t += jnp.einsum("p,pa,pb->ab", cond_weights, diff_t, diff_t)
+                cross = jnp.einsum("p,pab->ab", cond_weights, path_cross[:, t])
+                cross += jnp.einsum(
+                    "p,pa,pb->ab", cond_weights, diff_t, diff_next
+                )
+
+                joint_prob = joint_prob.at[t, i, j].set(prob)
+                pair_means = pair_means.at[t, :, i, j].set(mean_t)
+                pair_covs = pair_covs.at[t, :, :, i, j].set(cov_t)
+                pair_cross = pair_cross.at[t, :, :, i, j].set(cross)
+                next_pair_means = next_pair_means.at[t, :, i, j].set(mean_next)
+
+    return {
+        "marginal_log_likelihood": logsumexp(log_w),
+        "overall_smoother_mean": overall_mean,
+        "overall_smoother_cov": overall_cov,
+        "state_cond_smoother_means": state_cond_means,
+        "state_cond_smoother_covs": state_cond_covs,
+        "smoother_discrete_state_prob": smoother_discrete_prob,
+        "smoother_joint_discrete_state_prob": joint_prob,
+        "pair_cond_smoother_means": pair_means,
+        "pair_cond_smoother_covs": pair_covs,
+        "pair_cond_smoother_cross_cov": pair_cross,
+        "next_pair_cond_smoother_means": next_pair_means,
+        "path_states": path_states,
+        "path_weights": path_weights,
+        "path_smoother_means": path_means,
+        "path_smoother_covs": path_covs,
+        "path_smoother_cross_covs": path_cross,
+    }
+
+
+class TestExactEStepOracle:
+    """Exact path-enumeration oracle for the linear-Gaussian switching E-step."""
+
+    def test_exact_e_step_sufficient_stats_match_path_moments(self) -> None:
+        from state_space_practice.switching_kalman import (
+            compute_transition_sufficient_stats,
+        )
+
+        n_time, n_latent, n_obs = 5, 2, 2
+        A = jnp.stack(
+            [
+                jnp.array([[0.92, -0.18], [0.18, 0.92]]),
+                jnp.array([[0.55, 0.25], [-0.25, 0.55]]),
+            ],
+            axis=-1,
+        )
+        Q = jnp.stack([jnp.eye(n_latent) * 0.04, jnp.eye(n_latent) * 0.18], axis=-1)
+        H = jnp.stack(
+            [
+                jnp.eye(n_obs),
+                jnp.array([[1.0, 0.15], [-0.1, 0.9]]),
+            ],
+            axis=-1,
+        )
+        R = jnp.stack([jnp.eye(n_obs) * 0.25, jnp.eye(n_obs) * 0.35], axis=-1)
+        Z = jnp.array([[0.82, 0.18], [0.24, 0.76]])
+        init_mean = jnp.array([[0.2, -0.3], [0.1, 0.25]])
+        init_cov = jnp.stack([jnp.eye(n_latent) * 0.5, jnp.eye(n_latent) * 0.8], axis=-1)
+        init_prob = jnp.array([0.65, 0.35])
+        obs = jnp.array(
+            [
+                [0.1, -0.2],
+                [0.35, 0.15],
+                [-0.25, 0.4],
+                [0.5, -0.1],
+                [0.05, 0.3],
+            ]
+        )
+
+        exact = _exact_switching_e_step_oracle(
+            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+        )
+        legacy_mean, legacy_cov = _exact_switching_smoother(
+            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+        )
+
+        np.testing.assert_allclose(
+            exact["overall_smoother_mean"], legacy_mean, rtol=1e-9, atol=1e-9
+        )
+        np.testing.assert_allclose(
+            exact["overall_smoother_cov"], legacy_cov, rtol=1e-9, atol=1e-9
+        )
+        np.testing.assert_allclose(
+            exact["smoother_discrete_state_prob"].sum(axis=1),
+            jnp.ones(n_time),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            exact["smoother_joint_discrete_state_prob"].sum(axis=2),
+            exact["smoother_discrete_state_prob"][:-1],
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            exact["smoother_joint_discrete_state_prob"].sum(axis=1),
+            exact["smoother_discrete_state_prob"][1:],
+            rtol=1e-10,
+            atol=1e-10,
+        )
+
+        gamma1, beta = compute_transition_sufficient_stats(
+            state_cond_smoother_means=exact["state_cond_smoother_means"],
+            state_cond_smoother_covs=exact["state_cond_smoother_covs"],
+            smoother_joint_discrete_state_prob=exact[
+                "smoother_joint_discrete_state_prob"
+            ],
+            pair_cond_smoother_cross_cov=exact["pair_cond_smoother_cross_cov"],
+            pair_cond_smoother_means=exact["pair_cond_smoother_means"],
+            pair_cond_smoother_covs=exact["pair_cond_smoother_covs"],
+            next_pair_cond_smoother_means=exact["next_pair_cond_smoother_means"],
+        )
+
+        direct_gamma1 = jnp.zeros_like(gamma1)
+        direct_beta = jnp.zeros_like(beta)
+        for p, weight in enumerate(exact["path_weights"]):
+            for t in range(n_time - 1):
+                dest_state = int(exact["path_states"][p, t + 1])
+                mean_t = exact["path_smoother_means"][p, t]
+                mean_next = exact["path_smoother_means"][p, t + 1]
+                cov_t = exact["path_smoother_covs"][p, t]
+                cross_t_next = exact["path_smoother_cross_covs"][p, t]
+                direct_gamma1 = direct_gamma1.at[:, :, dest_state].add(
+                    weight * (cov_t + jnp.outer(mean_t, mean_t))
+                )
+                direct_beta = direct_beta.at[:, :, dest_state].add(
+                    weight * (cross_t_next.T + jnp.outer(mean_next, mean_t))
+                )
+
+        np.testing.assert_allclose(gamma1, direct_gamma1, rtol=1e-9, atol=1e-9)
+        np.testing.assert_allclose(beta, direct_beta, rtol=1e-9, atol=1e-9)
+
+
 class TestGPB2ExactAccuracy:
     """GPB2 accuracy checks against an exact enumerated switching smoother.
 
