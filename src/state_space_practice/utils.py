@@ -460,6 +460,17 @@ def validate_covariance(
             f"(d, d, n_states), got shape {arr.shape}"
         )
 
+    # An empty input (0x0 matrix, or a stack with zero states / zero-dim
+    # slices) would make every per-slice check below vacuously pass -- the
+    # 3D case builds an empty `slices` list so the loop never runs, and the
+    # 2D 0x0 case satisfies the symmetry/eigenvalue checks trivially. A
+    # covariance with no entries is never a valid input; reject it loudly.
+    if arr.size == 0:
+        raise ValueError(
+            f"{name} is empty (shape {arr.shape}); a covariance must have at "
+            f"least one 1x1 slice."
+        )
+
     for state_ind, mat in slices:
         where = name if state_ind is None else f"{name}[..., {state_ind}]"
         if mat.ndim != 2 or mat.shape[0] != mat.shape[1]:
@@ -531,6 +542,14 @@ def validate_transition_matrix(
     if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
         raise ValueError(
             f"{name} must be a square 2D matrix, got shape {arr.shape}"
+        )
+    # A 0x0 matrix satisfies the square check and makes the non-negativity and
+    # row-sum reductions vacuously pass (empty `any` is False, empty `allclose`
+    # is True). A transition matrix with no states is never valid.
+    if arr.shape[0] == 0:
+        raise ValueError(
+            f"{name} is empty (shape {arr.shape}); a transition matrix must "
+            f"have at least one state."
         )
     if not bool(jnp.all(jnp.isfinite(arr))):
         raise ValueError(f"{name} has non-finite entries (NaN/Inf).")

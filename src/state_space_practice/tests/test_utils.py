@@ -424,6 +424,18 @@ class TestValidateCovariance:
         with pytest.raises(ValueError, match="non-finite"):
             validate_covariance(jnp.diag(jnp.array([jnp.inf, 1.0])))
 
+    def test_empty_matrix_raises(self) -> None:
+        # A 0x0 matrix satisfies the square check and the symmetry / eigenvalue
+        # checks vacuously; only an explicit empty guard rejects it.
+        with pytest.raises(ValueError, match="empty"):
+            validate_covariance(jnp.zeros((0, 0)))
+
+    def test_empty_state_stack_raises(self) -> None:
+        # A (d, d, 0) stack builds an empty per-slice loop, so every slice
+        # check is skipped and the input would otherwise pass silently.
+        with pytest.raises(ValueError, match="empty"):
+            validate_covariance(jnp.zeros((2, 2, 0)))
+
 
 class TestValidateTransitionMatrix:
     """Tests for validate_transition_matrix (row-stochastic guard)."""
@@ -442,6 +454,12 @@ class TestValidateTransitionMatrix:
     def test_non_finite_raises(self) -> None:
         with pytest.raises(ValueError, match="non-finite"):
             validate_transition_matrix(jnp.array([[jnp.nan, 0.0], [0.5, 0.5]]))
+
+    def test_empty_matrix_raises(self) -> None:
+        # A 0x0 matrix is square and makes the non-negativity / row-sum
+        # reductions vacuously pass; an explicit empty guard is required.
+        with pytest.raises(ValueError, match="empty"):
+            validate_transition_matrix(jnp.zeros((0, 0)))
 
 
 class TestValidateProbabilityVector:
