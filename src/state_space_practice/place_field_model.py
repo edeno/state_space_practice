@@ -859,6 +859,8 @@ class PlaceFieldModel(SGDFittableMixin):
         """
         if force_dense:
             return None, None
+        if self._log_intensity_func is not log_conditional_intensity:
+            return None, None
         structure = _detect_block_diagonal_problem(
             self.init_mean,
             self.init_cov,

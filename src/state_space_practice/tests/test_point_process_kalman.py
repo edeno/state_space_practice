@@ -3267,6 +3267,48 @@ class TestBlockDiagonalFilterEquivalence:
             float(block[2]), float(dense[2]), atol=1e-9, rtol=1e-10,
         )
 
+    def test_public_filter_uses_dense_for_custom_intensity(self) -> None:
+        """Manual block args must not bypass a custom log-intensity callable."""
+        init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
+            n_neurons=2, block_size=4, T=30
+        )
+
+        def custom_log_intensity(design_matrix_t, state):
+            return 2.0 * (design_matrix_t @ state) + 0.3
+
+        dense = stochastic_point_process_filter(
+            init_mean,
+            init_cov,
+            Z,
+            spikes,
+            dt,
+            A,
+            Q,
+            custom_log_intensity,
+            force_dense=True,
+            validate_inputs=False,
+            max_newton_iter=3,
+        )
+        requested_block = stochastic_point_process_filter(
+            init_mean,
+            init_cov,
+            Z,
+            spikes,
+            dt,
+            A,
+            Q,
+            custom_log_intensity,
+            block_n_neurons=2,
+            block_size=4,
+            validate_inputs=False,
+            max_newton_iter=3,
+        )
+
+        for actual, expected in zip(requested_block, dense):
+            np.testing.assert_allclose(
+                np.asarray(actual), np.asarray(expected), atol=1e-10, rtol=1e-10
+            )
+
     def test_matches_dense_3_neurons_longer_sequence(self) -> None:
         """Larger problem: 3 neurons, T=100, block_size=6. Tests the
         vmap + scan combo at a non-trivial scale."""
@@ -3506,6 +3548,50 @@ class TestBlockDiagonalSmootherEquivalence:
         np.testing.assert_allclose(
             float(block[3]), float(dense[3]), atol=1e-9, rtol=1e-10,
         )
+
+    def test_public_smoother_uses_dense_for_custom_intensity(self) -> None:
+        """Manual block args must not bypass custom smoother likelihoods."""
+        init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
+            n_neurons=2, block_size=4, T=30
+        )
+
+        def custom_log_intensity(design_matrix_t, state):
+            return 2.0 * (design_matrix_t @ state) + 0.3
+
+        dense = stochastic_point_process_smoother(
+            init_mean,
+            init_cov,
+            Z,
+            spikes,
+            dt,
+            A,
+            Q,
+            custom_log_intensity,
+            force_dense=True,
+            return_filtered=True,
+            validate_inputs=False,
+            max_newton_iter=3,
+        )
+        requested_block = stochastic_point_process_smoother(
+            init_mean,
+            init_cov,
+            Z,
+            spikes,
+            dt,
+            A,
+            Q,
+            custom_log_intensity,
+            block_n_neurons=2,
+            block_size=4,
+            return_filtered=True,
+            validate_inputs=False,
+            max_newton_iter=3,
+        )
+
+        for actual, expected in zip(requested_block, dense):
+            np.testing.assert_allclose(
+                np.asarray(actual), np.asarray(expected), atol=1e-10, rtol=1e-10
+            )
 
     def test_matches_dense_3_neurons_longer_sequence(self) -> None:
         """3 neurons, T=100, block_size=6 — non-trivial vmap + scan scale."""

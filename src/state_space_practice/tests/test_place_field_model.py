@@ -792,6 +792,31 @@ class TestCustomIntensity:
         assert len(lls) >= 1
         assert all(np.isfinite(ll) for ll in lls)
 
+    def test_multi_neuron_custom_func_disables_block_dispatch(
+        self, sim_data: dict
+    ) -> None:
+        base_spikes = np.asarray(sim_data["spikes"]).squeeze()
+        spikes = np.stack([base_spikes, base_spikes], axis=1)
+
+        def custom_func(design_matrix_t, state):
+            return 1.25 * (design_matrix_t @ state) + 0.1
+
+        model = PlaceFieldModel(
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            log_intensity_func=custom_func,
+        )
+        lls = model.fit(
+            sim_data["position"],
+            spikes,
+            max_iter=1,
+            verbose=False,
+        )
+        assert model._block_n_neurons is None
+        assert model._block_size is None
+        assert len(lls) >= 1
+        assert all(np.isfinite(ll) for ll in lls)
+
 
 # ------------------------------------------------------------------
 # Multi-neuron

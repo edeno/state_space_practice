@@ -477,6 +477,11 @@ def log_conditional_intensity(design_matrix: ArrayLike, params: ArrayLike) -> Ar
     return jnp.asarray(design_matrix) @ jnp.asarray(params)
 
 
+def _uses_default_linear_log_intensity(func: Callable[[ArrayLike, ArrayLike], Array]) -> bool:
+    """Return True when ``func`` is the module's default linear log-rate."""
+    return func is log_conditional_intensity
+
+
 def _logdet_psd(mat: Array, diagonal_boost: float = 1e-9) -> Array:
     """Log-determinant of a PSD matrix via Cholesky (stabilized).
 
@@ -1186,7 +1191,13 @@ def stochastic_point_process_filter(
     # (init_mean, init_cov, A, Q, design_matrix) arrays into per-neuron
     # factors. This is safe because block extraction is pure array
     # slicing — no host-side float() conversions.
-    if block_n_neurons is not None and block_size is not None and not force_dense:
+    use_block_dispatch = (
+        block_n_neurons is not None
+        and block_size is not None
+        and not force_dense
+        and _uses_default_linear_log_intensity(log_conditional_intensity)
+    )
+    if use_block_dispatch:
         if spike_indicator.ndim == 1:
             raise ValueError(
                 "block_n_neurons / block_size can only be passed for "
@@ -1828,7 +1839,13 @@ def stochastic_point_process_smoother(
     # provided (as Python ints) and force_dense is False, we short-
     # circuit to _stochastic_point_process_smoother_block_diagonal
     # which vmaps the forward and backward passes per-neuron.
-    if block_n_neurons is not None and block_size is not None and not force_dense:
+    use_block_dispatch = (
+        block_n_neurons is not None
+        and block_size is not None
+        and not force_dense
+        and _uses_default_linear_log_intensity(log_conditional_intensity)
+    )
+    if use_block_dispatch:
         if spike_indicator.ndim == 1:
             raise ValueError(
                 "block_n_neurons / block_size can only be passed for "
