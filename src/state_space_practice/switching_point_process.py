@@ -2590,7 +2590,7 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         - smoother_state_cond_cov: Cov[x_t | y_{1:T}, S_t=j]
         - smoother_discrete_state_prob: P(S_t=j | y_{1:T})
         - smoother_joint_discrete_state_prob: P(S_t=j, S_{t+1}=k | y_{1:T})
-        - smoother_pair_cond_cross_cov: Cov[x_{t+1}, x_t | y_{1:T}, S_t=j, S_{t+1}=k]
+        - smoother_pair_cond_cross_cov: Cov[x_t, x_{t+1} | y_{1:T}, S_t=j, S_{t+1}=k]
         - smoother_pair_cond_means: E[x_t | y_{1:T}, S_t=j, S_{t+1}=k]
 
         These are the sufficient statistics needed by the M-step for dynamics

@@ -152,8 +152,11 @@ def _warn_if_cov_cap_engaged(
     max_allowed_trace: jax.Array,
     label: str,
     cap_multiplier: float | None = None,
+    *,
+    upper_allowed_trace: jax.Array | None = None,
+    moderate: bool = False,
 ) -> None:
-    """Emit ONE divergence warning if any covariance-lane trace exceeds the cap.
+    """Emit ONE divergence signal if any covariance-lane trace exceeds the cap.
 
     ``covs`` has its two leading axes as the (n_cont, n_cont) covariance and any
     number of trailing discrete-state axes. Reducing to a single scalar
@@ -161,19 +164,45 @@ def _warn_if_cov_cap_engaged(
     is what makes the signal fire only on a genuine blow-up (the cap engaging on
     some lane), not on every fit. Called from the (non-vmapped) smoother scan
     body, so ``debug_print_if``'s ``lax.cond`` behaves conditionally.
+
+    Two severity tiers are supported so a caller that applies a *moderate*
+    trust-region cap (below the catastrophic threshold) can still surface that
+    the cap engaged instead of clipping EM statistics silently:
+
+    - ``moderate=False`` (default): catastrophic-divergence wording, fired when a
+      lane trace exceeds ``max_allowed_trace``.
+    - ``moderate=True``: lower-severity "trust region engaged" wording. Pass
+      ``upper_allowed_trace`` (the catastrophic threshold) to fire only in the
+      band ``(max_allowed_trace, upper_allowed_trace]`` so the moderate note and
+      a separate catastrophic warning remain mutually exclusive.
     """
     if cap_multiplier is None:
         cap_multiplier = _COV_CAP_MULTIPLIER
 
     traces = jnp.trace(covs, axis1=0, axis2=1)
-    debug_print_if(
-        jnp.any(traces > max_allowed_trace),
-        f"switching_kalman: {label} smoother covariance exceeded the "
-        f"{cap_multiplier:.0e}x-filter cap (max trace {{m:.2e}}); the GPB "
-        f"smoother has diverged and the returned posterior + EM statistics are "
-        f"unreliable.",
-        m=jnp.max(traces),
-    )
+    engaged = traces > max_allowed_trace
+    if upper_allowed_trace is not None:
+        engaged = engaged & (traces <= upper_allowed_trace)
+    if moderate:
+        debug_print_if(
+            jnp.any(engaged),
+            f"switching_kalman: {label} smoother covariance engaged the "
+            f"{cap_multiplier:.0e}x-filter trust region (max trace {{m:.2e}}); "
+            f"EM statistics at those steps were clipped. This is a "
+            f"moment-matching safety net, not necessarily divergence, but "
+            f"persistent firing means the GPB2 smoother covariances are growing "
+            f"abnormally.",
+            m=jnp.max(jnp.where(engaged, traces, -jnp.inf)),
+        )
+    else:
+        debug_print_if(
+            jnp.any(engaged),
+            f"switching_kalman: {label} smoother covariance exceeded the "
+            f"{cap_multiplier:.0e}x-filter cap (max trace {{m:.2e}}); the GPB "
+            f"smoother has diverged and the returned posterior + EM statistics "
+            f"are unreliable.",
+            m=jnp.max(traces),
+        )
 
 
 _COV_CAP_MULTIPLIER = 1e8
@@ -1032,7 +1061,7 @@ def switching_kalman_smoother(
         (
             pair_cond_smoother_mean,  # E[X_t | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_discrete_states, n_discrete_states)
             pair_cond_smoother_covs,  # Cov[X_t | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
-            pair_cond_smoother_cross_covs,  # Cov[X_{t+1}, X_t | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+            pair_cond_smoother_cross_covs,  # Cov[X_t, X_{t+1} | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         ) = _kalman_smoother_update_per_discrete_state_pair(
             next_state_cond_smoother_mean,  # E[X_{t+1} | y_{1:T}, S_t=k], shape (n_cont_states, n_discrete_states)
             next_state_cond_smoother_cov,  # Cov[X_{t+1} | y_{1:T}, S_t=k], shape (n_cont_states, n_cont_states, n_discrete_states)
@@ -1315,17 +1344,28 @@ def switching_kalman_smoother_gpb2(
 
         # 1b. Stabilize triple-conditional outputs. GPB2 can feed moment-matched
         # pair covariances back through the RTS update, so apply a moderate
-        # covariance trust region relative to the pair-filter covariance. Keep the
-        # existing huge-cap warning as a separate catastrophic-divergence signal.
+        # covariance trust region relative to the pair-filter covariance. The
+        # moderate cap is what is actually applied to triple_cov, so surface a
+        # lower-severity note when it engages instead of clipping silently; the
+        # huge-cap warning stays as a separate catastrophic-divergence signal.
         pair_filter_traces = jax.vmap(
             jax.vmap(jnp.trace, in_axes=-1, out_axes=-1), in_axes=-1, out_axes=-1
         )(pair_filter_cov)  # (Si, Sj)
         max_filter_trace = jnp.max(pair_filter_traces)
         max_allowed = max_filter_trace * _GPB2_COV_CAP_MULTIPLIER + 1.0
+        catastrophic_allowed = max_filter_trace * _COV_CAP_MULTIPLIER + 1.0
 
         _warn_if_cov_cap_engaged(
             triple_cov,
-            max_filter_trace * _COV_CAP_MULTIPLIER + 1.0,
+            max_allowed,
+            "GPB2",
+            cap_multiplier=_GPB2_COV_CAP_MULTIPLIER,
+            upper_allowed_trace=catastrophic_allowed,
+            moderate=True,
+        )
+        _warn_if_cov_cap_engaged(
+            triple_cov,
+            catastrophic_allowed,
             "GPB2",
         )
         _cap = partial(_cap_covariance_trace, max_allowed_trace=max_allowed)
