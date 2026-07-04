@@ -2094,6 +2094,63 @@ class TestSingleNeuronGLMLoss:
 class TestSingleNeuronGLMStep:
     """Tests for the _single_neuron_glm_step Newton step function (Task 5.2)."""
 
+    def test_armijo_line_search_returns_zero_when_no_step_improves(self) -> None:
+        """Failed Armijo search should leave parameters unchanged."""
+        from state_space_practice.switching_point_process import _armijo_line_search
+
+        params = jnp.array([0.0])
+        delta = jnp.array([1.0])
+        gradient = jnp.array([1.0])
+        current_loss = jnp.array(0.0)
+
+        def loss_fn(_trial_params: Array) -> Array:
+            return jnp.array(1.0)
+
+        alpha = _armijo_line_search(
+            params,
+            delta,
+            gradient,
+            loss_fn,
+            current_loss,
+            beta=0.5,
+            max_iter=4,
+        )
+
+        assert float(alpha) == 0.0
+
+    def test_armijo_line_search_rejects_non_descent_direction(self) -> None:
+        """A non-descent direction (grad . delta <= 0) must yield alpha=0.
+
+        The Armijo test ``new_loss <= current_loss - c*alpha*(grad . delta)``
+        is inverted when ``grad . delta <= 0`` -- its right-hand side exceeds
+        current_loss, so a loss-*increasing* step would pass. The descent-
+        direction guard must reject the step even when loss_fn would otherwise
+        satisfy the (meaningless) condition.
+        """
+        from state_space_practice.switching_point_process import _armijo_line_search
+
+        params = jnp.array([0.0])
+        delta = jnp.array([-1.0])
+        gradient = jnp.array([1.0])  # grad . delta = -1 <= 0 -> not descent
+        current_loss = jnp.array(0.0)
+
+        def loss_fn(_trial_params: Array) -> Array:
+            # Would satisfy the Armijo test on its own; the guard must still
+            # reject because the direction is not certified as descent.
+            return jnp.array(-10.0)
+
+        alpha = _armijo_line_search(
+            params,
+            delta,
+            gradient,
+            loss_fn,
+            current_loss,
+            beta=0.5,
+            max_iter=4,
+        )
+
+        assert float(alpha) == 0.0
+
     def test_output_shapes(self) -> None:
         """Output shapes should match input parameter shapes."""
         from state_space_practice.switching_point_process import (

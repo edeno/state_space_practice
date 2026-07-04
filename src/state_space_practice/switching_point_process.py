@@ -834,6 +834,7 @@ def _armijo_line_search(
     until the Armijo condition is satisfied or max_iter is reached.
     """
     directional_derivative = jnp.dot(gradient, delta)
+    is_descent_direction = directional_derivative > 0.0
 
     def line_search_step(carry, _):
         alpha, found = carry
@@ -843,18 +844,19 @@ def _armijo_line_search(
 
         # Armijo condition: new_loss <= current_loss - c * alpha * directional_derivative
         sufficient_decrease = found | (
-            new_loss <= current_loss - c * alpha * directional_derivative
+            is_descent_direction
+            & (new_loss <= current_loss - c * alpha * directional_derivative)
         )
 
         # Reduce alpha if not sufficient decrease
         new_alpha = jnp.where(sufficient_decrease, alpha, alpha * beta)
         return (new_alpha, sufficient_decrease), None
 
-    (final_alpha, _), _ = jax.lax.scan(
+    (final_alpha, found), _ = jax.lax.scan(
         line_search_step, (jnp.array(1.0), jnp.array(False)), None, length=max_iter
     )
 
-    return final_alpha
+    return jnp.where(found, final_alpha, 0.0)
 
 
 def _single_neuron_glm_loss(
