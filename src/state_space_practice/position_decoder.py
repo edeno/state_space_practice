@@ -225,6 +225,11 @@ class PlaceFieldRateMaps:
         # available; read by decoder entry points when ``q_pos=None``.
         self.suggested_q_pos: Optional[float] = None
 
+        if self.x_edges.ndim != 1 or self.y_edges.ndim != 1:
+            raise ValueError(
+                f"x_edges and y_edges must be 1D arrays, got shapes "
+                f"{self.x_edges.shape} and {self.y_edges.shape}"
+            )
         if len(self.x_edges) < 2 or len(self.y_edges) < 2:
             raise ValueError("x_edges and y_edges must have at least 2 points")
         if self.rate_maps.ndim != 3:
@@ -232,18 +237,40 @@ class PlaceFieldRateMaps:
                 f"rate_maps must be 3D (n_neurons, n_grid_y, n_grid_x), "
                 f"got shape {self.rate_maps.shape}"
             )
+        if self.rate_maps.shape[0] < 1:
+            raise ValueError("rate_maps must contain at least one neuron")
+        if not np.all(np.isfinite(self.rate_maps)):
+            raise ValueError("rate_maps must contain only finite values")
+        if np.any(self.rate_maps < 0.0):
+            raise ValueError("rate_maps must be non-negative firing rates")
+        if not np.all(np.isfinite(self.x_edges)) or not np.all(
+            np.isfinite(self.y_edges)
+        ):
+            raise ValueError("x_edges and y_edges must contain only finite values")
         n_grid_y, n_grid_x = self.rate_maps.shape[1], self.rate_maps.shape[2]
         if n_grid_y != len(self.y_edges) or n_grid_x != len(self.x_edges):
             raise ValueError(
                 f"rate_maps spatial dims ({n_grid_y}, {n_grid_x}) must match "
                 f"y_edges ({len(self.y_edges)}) and x_edges ({len(self.x_edges)})"
             )
+        if self.occupancy_mask is not None:
+            occupancy_mask = np.asarray(self.occupancy_mask)
+            if occupancy_mask.shape != (n_grid_y, n_grid_x):
+                raise ValueError(
+                    f"occupancy_mask shape must match rate_maps spatial dims "
+                    f"({n_grid_y}, {n_grid_x}), got {occupancy_mask.shape}"
+                )
+            if occupancy_mask.dtype != np.bool_:
+                raise ValueError("occupancy_mask must be boolean")
+            self.occupancy_mask = occupancy_mask
 
         self.n_neurons = self.rate_maps.shape[0]
 
         # Validate uniform grid spacing (bilinear interpolation assumes this)
         x_diffs = np.diff(self.x_edges)
         y_diffs = np.diff(self.y_edges)
+        if np.any(x_diffs <= 0.0) or np.any(y_diffs <= 0.0):
+            raise ValueError("x_edges and y_edges must be strictly increasing")
         if not (np.allclose(x_diffs, x_diffs[0]) and np.allclose(y_diffs, y_diffs[0])):
             raise ValueError(
                 "x_edges and y_edges must be uniformly spaced for "
@@ -382,6 +409,13 @@ class PlaceFieldRateMaps:
         from scipy.ndimage import gaussian_filter
 
         position = np.asarray(position)
+        if position.ndim != 2 or position.shape[1] != 2:
+            raise ValueError(
+                f"position must be a 2D array with shape (n_time, 2), "
+                f"got shape {position.shape}"
+            )
+        if not np.all(np.isfinite(position)):
+            raise ValueError("position must contain only finite values")
         spike_counts = np.asarray(spike_counts)
         if spike_counts.ndim == 1:
             spike_counts = spike_counts[:, None]
@@ -1127,6 +1161,31 @@ def position_decoder_filter(
             init_position = jnp.array([cx, cy, 0.0, 0.0])
         else:
             init_position = jnp.array([cx, cy])
+    else:
+        init_position = jnp.asarray(init_position)
+        if init_position.ndim != 1:
+            raise ValueError(
+                f"init_position must be a 1D vector, got shape "
+                f"{init_position.shape}"
+            )
+        if not bool(jnp.all(jnp.isfinite(init_position))):
+            raise ValueError("init_position must contain only finite values.")
+        if include_velocity:
+            if init_position.shape[0] == 2:
+                init_position = jnp.concatenate([
+                    init_position,
+                    jnp.zeros(2, dtype=init_position.dtype),
+                ])
+            elif init_position.shape[0] != 4:
+                raise ValueError(
+                    "init_position must have shape (2,) or (4,) when "
+                    f"include_velocity=True, got shape {init_position.shape}"
+                )
+        elif init_position.shape[0] != 2:
+            raise ValueError(
+                "init_position must have shape (2,) when "
+                f"include_velocity=False, got shape {init_position.shape}"
+            )
 
     if init_cov is None:
         if _init_position_supplied:
@@ -1216,9 +1275,14 @@ def position_decoder_filter(
     # all assume a symmetric PD init_cov; a non-PSD one silently produces
     # all-NaN output (and the divergence guard below is NaN-blind).
     init_cov = jnp.asarray(init_cov)
+    if init_cov.shape != (n_state, n_state):
+        raise ValueError(
+            f"init_cov shape must match decoder state dimension "
+            f"({n_state}, {n_state}), got shape {init_cov.shape}"
+        )
     validate_covariance(init_cov, "init_cov")
 
-    init_carry = (jnp.asarray(init_position), init_cov, jnp.array(0.0))
+    init_carry = (init_position, init_cov, jnp.array(0.0))
     filtered_mean, filtered_cov, marginal_ll = _run_filter_scan(
         spikes_arr,
         init_carry,

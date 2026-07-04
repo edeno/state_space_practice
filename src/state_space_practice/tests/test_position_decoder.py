@@ -92,6 +92,37 @@ class TestPlaceFieldRateMaps:
         # Neuron 0 should fire faster than neuron 1 at this location
         assert log_rate[0] > log_rate[1]
 
+    @pytest.mark.parametrize(
+        ("bad_rate", "match"),
+        [(-1.0, "non-negative"), (np.nan, "finite"), (np.inf, "finite")],
+    )
+    def test_constructor_rejects_invalid_rate_values(self, bad_rate, match):
+        rate_maps = np.ones((1, 3, 3))
+        rate_maps[0, 1, 1] = bad_rate
+        with pytest.raises(ValueError, match=match):
+            PlaceFieldRateMaps(
+                rate_maps=rate_maps,
+                x_edges=np.array([0.0, 1.0, 2.0]),
+                y_edges=np.array([0.0, 1.0, 2.0]),
+            )
+
+    def test_constructor_rejects_nonincreasing_grid(self):
+        with pytest.raises(ValueError, match="strictly increasing"):
+            PlaceFieldRateMaps(
+                rate_maps=np.ones((1, 3, 3)),
+                x_edges=np.array([0.0, 1.0, 1.0]),
+                y_edges=np.array([0.0, 1.0, 2.0]),
+            )
+
+    def test_constructor_rejects_bad_occupancy_mask_shape(self):
+        with pytest.raises(ValueError, match="occupancy_mask shape"):
+            PlaceFieldRateMaps(
+                rate_maps=np.ones((1, 3, 3)),
+                x_edges=np.array([0.0, 1.0, 2.0]),
+                y_edges=np.array([0.0, 1.0, 2.0]),
+                occupancy_mask=np.ones((2, 3), dtype=bool),
+            )
+
     def test_log_rate_away_from_field(self, simple_fields):
         """Rate should be near baseline far from field center."""
         position = jnp.array([90.0, 10.0])  # far from both fields
@@ -307,6 +338,26 @@ class TestPlaceFieldRateMaps:
         with pytest.raises(ValueError, match="dt"):
             PlaceFieldRateMaps.from_spike_position_data(
                 position=position, spike_counts=spikes, dt=-0.004
+            )
+
+    def test_from_spike_position_data_rejects_bad_position_shape(self):
+        spikes = np.zeros((10, 1))
+        with pytest.raises(ValueError, match="position"):
+            PlaceFieldRateMaps.from_spike_position_data(
+                position=np.zeros((10, 3)),
+                spike_counts=spikes,
+                dt=0.004,
+            )
+
+    def test_from_spike_position_data_rejects_nonfinite_position(self):
+        position = np.zeros((10, 2))
+        position[0, 0] = np.nan
+        spikes = np.zeros((10, 1))
+        with pytest.raises(ValueError, match="finite"):
+            PlaceFieldRateMaps.from_spike_position_data(
+                position=position,
+                spike_counts=spikes,
+                dt=0.004,
             )
 
     @pytest.fixture
@@ -571,6 +622,52 @@ class TestPositionDecoderFilter:
             expected_ll,
             atol=1e-10,
         )
+
+    def test_filter_pads_2d_init_position_with_zero_velocity(self):
+        """A 2D initial position should seed a 4D state with zero velocity."""
+        x_edges = np.array([0.0, 1.0, 2.0])
+        y_edges = np.array([0.0, 1.0, 2.0])
+        rate_maps = PlaceFieldRateMaps(
+            rate_maps=np.ones((1, 3, 3)),
+            x_edges=x_edges,
+            y_edges=y_edges,
+        )
+
+        result = position_decoder_filter(
+            spikes=np.zeros((1, 1)),
+            rate_maps=rate_maps,
+            dt=0.1,
+            q_pos=0.0,
+            q_vel=0.0,
+            include_velocity=True,
+            init_position=jnp.array([0.25, 0.75]),
+            init_cov=jnp.eye(4),
+        )
+
+        np.testing.assert_allclose(
+            result.position_mean[0],
+            jnp.array([0.25, 0.75, 0.0, 0.0]),
+            atol=1e-10,
+        )
+
+    def test_filter_rejects_init_cov_shape_mismatch(self):
+        x_edges = np.array([0.0, 1.0, 2.0])
+        y_edges = np.array([0.0, 1.0, 2.0])
+        rate_maps = PlaceFieldRateMaps(
+            rate_maps=np.ones((1, 3, 3)),
+            x_edges=x_edges,
+            y_edges=y_edges,
+        )
+
+        with pytest.raises(ValueError, match="init_cov.*shape"):
+            position_decoder_filter(
+                spikes=np.zeros((1, 1)),
+                rate_maps=rate_maps,
+                dt=0.1,
+                include_velocity=True,
+                init_position=jnp.array([0.5, 0.5]),
+                init_cov=jnp.eye(2),
+            )
 
     @pytest.mark.parametrize(
         ("bad_value", "match"),
@@ -1526,7 +1623,7 @@ class TestPositionDecoderRateMapRecovery:
 
     def test_rate_maps_have_dynamic_range(self, fitted_decoder):
         decoder, _ = fitted_decoder
-        rate_maps = np.exp(decoder.rate_maps.rate_maps)  # log -> linear
+        rate_maps = decoder.rate_maps.rate_maps
         for n in range(rate_maps.shape[0]):
             max_rate = float(np.max(rate_maps[n]))
             median_rate = float(np.median(rate_maps[n]))

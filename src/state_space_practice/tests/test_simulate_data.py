@@ -8,6 +8,7 @@ import numpy as np
 
 from state_space_practice.simulate_data import (
     receptive_field_model,
+    simulate_2d_moving_place_field,
     simulate_eden_brown_2004_jump,
     simulate_eden_brown_2004_linear,
 )
@@ -171,3 +172,31 @@ class TestSimulateEdenBrown2004Linear:
 
         assert not np.allclose(quarter_params, params[0])
         assert not np.allclose(quarter_params, params[-1])
+
+
+class TestSimulate2DMovingPlaceField:
+    """Tests for the 2D drifting place-field simulator."""
+
+    def test_spikes_are_poisson_counts_from_true_rate_times_dt(self) -> None:
+        data = simulate_2d_moving_place_field(
+            total_time=120.0,
+            dt=0.02,
+            arena_size=80.0,
+            peak_rate=30.0,
+            background_rate=1.0,
+            rng=np.random.default_rng(123),
+        )
+
+        expected_counts = data["true_rate"] * data["dt"]
+        expected_total = float(expected_counts.sum())
+        observed_total = int(data["spikes"].sum())
+
+        assert data["spikes"].shape == data["true_rate"].shape
+        assert data["design_matrix"].shape[0] == data["position"].shape[0]
+        assert np.all(data["true_rate"] > 0.0)
+
+        # For independent Poisson bins, Var(total_count) = E(total_count).
+        # Five standard deviations gives a deterministic, high-confidence
+        # check of the simulator/inference unit convention: rates are in Hz
+        # and are converted to per-bin expected counts exactly once via dt.
+        assert abs(observed_total - expected_total) < 5.0 * np.sqrt(expected_total)
