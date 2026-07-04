@@ -246,6 +246,92 @@ def _select_spike_params(
     return SpikeObsParams(baseline=baseline, weights=weights)
 
 
+def _validate_switching_point_process_filter_shapes(
+    init_state_cond_mean: Array,
+    init_state_cond_cov: Array,
+    init_discrete_state_prob: Array,
+    spikes: Array,
+    discrete_transition_matrix: Array,
+    continuous_transition_matrix: Array,
+    process_cov: Array,
+    spike_params: SpikeObsParams,
+) -> None:
+    """Validate static array layout for the switching point-process filter."""
+    if spikes.shape[0] == 0:
+        raise ValueError("spikes must contain at least one time step.")
+    if init_state_cond_mean.ndim != 2:
+        raise ValueError(
+            "init_state_cond_mean must have shape (n_latent, n_discrete_states), "
+            f"got {init_state_cond_mean.shape}."
+        )
+
+    n_latent, n_discrete_states = init_state_cond_mean.shape
+    n_neurons = spikes.shape[1]
+
+    if init_state_cond_cov.shape != (n_latent, n_latent, n_discrete_states):
+        raise ValueError(
+            "init_state_cond_cov shape incompatible with init_state_cond_mean: "
+            f"got {init_state_cond_cov.shape}, expected "
+            f"{(n_latent, n_latent, n_discrete_states)}."
+        )
+    if init_discrete_state_prob.shape != (n_discrete_states,):
+        raise ValueError(
+            "init_discrete_state_prob shape incompatible with init_state_cond_mean: "
+            f"got {init_discrete_state_prob.shape}, expected {(n_discrete_states,)}."
+        )
+    if discrete_transition_matrix.shape != (n_discrete_states, n_discrete_states):
+        raise ValueError(
+            "discrete_transition_matrix must have shape "
+            f"{(n_discrete_states, n_discrete_states)}, got "
+            f"{discrete_transition_matrix.shape}."
+        )
+    if continuous_transition_matrix.shape != (
+        n_latent,
+        n_latent,
+        n_discrete_states,
+    ):
+        raise ValueError(
+            "continuous_transition_matrix must have shape "
+            f"{(n_latent, n_latent, n_discrete_states)}, got "
+            f"{continuous_transition_matrix.shape}."
+        )
+    if process_cov.shape != (n_latent, n_latent, n_discrete_states):
+        raise ValueError(
+            f"process_cov must have shape {(n_latent, n_latent, n_discrete_states)}, "
+            f"got {process_cov.shape}."
+        )
+
+    per_state = _is_per_state_spike_params(spike_params)
+    if spike_params.baseline.shape[0] != n_neurons:
+        raise ValueError(
+            "spike_params.baseline neuron dimension must match spikes.shape[1]: "
+            f"got {spike_params.baseline.shape[0]}, expected {n_neurons}."
+        )
+    if spike_params.weights.shape[0] != n_neurons:
+        raise ValueError(
+            "spike_params.weights neuron dimension must match spikes.shape[1]: "
+            f"got {spike_params.weights.shape[0]}, expected {n_neurons}."
+        )
+    if spike_params.weights.shape[1] != n_latent:
+        raise ValueError(
+            "spike_params.weights latent dimension must match init_state_cond_mean: "
+            f"got {spike_params.weights.shape[1]}, expected {n_latent}."
+        )
+    if per_state:
+        if spike_params.baseline.shape[1] != n_discrete_states:
+            raise ValueError(
+                "spike_params.baseline state dimension must match the number of "
+                f"discrete states: got {spike_params.baseline.shape[1]}, "
+                f"expected {n_discrete_states}."
+            )
+        if spike_params.weights.shape[2] != n_discrete_states:
+            raise ValueError(
+                "spike_params.weights state dimension must match the number of "
+                f"discrete states: got {spike_params.weights.shape[2]}, "
+                f"expected {n_discrete_states}."
+            )
+
+
 @dataclass
 class QRegularizationConfig:
     """Configuration for trust-region regularization of dynamics covariances.
@@ -1717,6 +1803,16 @@ def switching_point_process_filter(
         spikes = spikes[:, None]
     elif spikes.ndim != 2:
         raise ValueError(f"spikes must be 1D or 2D array, got shape {spikes.shape}")
+    _validate_switching_point_process_filter_shapes(
+        init_state_cond_mean,
+        init_state_cond_cov,
+        init_discrete_state_prob,
+        spikes,
+        discrete_transition_matrix,
+        continuous_transition_matrix,
+        process_cov,
+        spike_params,
+    )
 
     def _step(
         carry: tuple[Array, Array, Array, Array],

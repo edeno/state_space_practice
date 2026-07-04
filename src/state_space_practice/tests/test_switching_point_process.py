@@ -1330,6 +1330,226 @@ class TestSwitchingPointProcessFilter:
             rtol=1e-5,
         )
 
+    def test_empty_spikes_raise_clear_error(self) -> None:
+        """Empty spike sequences should fail before indexing spikes[0]."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            switching_point_process_filter,
+        )
+
+        n_latent, n_neurons, n_discrete_states = 2, 3, 2
+        init_state_cond_mean = jnp.zeros((n_latent, n_discrete_states))
+        init_state_cond_cov = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        init_discrete_state_prob = jnp.array([0.5, 0.5])
+        spikes = jnp.zeros((0, n_neurons))
+        discrete_transition_matrix = jnp.array([[0.9, 0.1], [0.2, 0.8]])
+        continuous_transition_matrix = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        process_cov = jnp.stack(
+            [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
+        )
+        spike_params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons),
+            weights=jnp.zeros((n_neurons, n_latent)),
+        )
+
+        with pytest.raises(ValueError, match="spikes must contain at least one"):
+            switching_point_process_filter(
+                init_state_cond_mean,
+                init_state_cond_cov,
+                init_discrete_state_prob,
+                spikes,
+                discrete_transition_matrix,
+                continuous_transition_matrix,
+                process_cov,
+                0.02,
+                linear_log_intensity,
+                spike_params,
+            )
+
+    def test_spike_param_neuron_mismatch_raises_clear_error(self) -> None:
+        """Emission parameters must have one baseline/weight row per neuron."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            switching_point_process_filter,
+        )
+
+        n_latent, n_neurons, n_discrete_states = 2, 3, 2
+        init_state_cond_mean = jnp.zeros((n_latent, n_discrete_states))
+        init_state_cond_cov = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        init_discrete_state_prob = jnp.array([0.5, 0.5])
+        spikes = jnp.ones((4, n_neurons))
+        discrete_transition_matrix = jnp.array([[0.9, 0.1], [0.2, 0.8]])
+        continuous_transition_matrix = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        process_cov = jnp.stack(
+            [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
+        )
+        spike_params = SpikeObsParams(
+            baseline=jnp.zeros(1),
+            weights=jnp.zeros((1, n_latent)),
+        )
+
+        with pytest.raises(ValueError, match="baseline neuron dimension"):
+            switching_point_process_filter(
+                init_state_cond_mean,
+                init_state_cond_cov,
+                init_discrete_state_prob,
+                spikes,
+                discrete_transition_matrix,
+                continuous_transition_matrix,
+                process_cov,
+                0.02,
+                linear_log_intensity,
+                spike_params,
+            )
+
+    def test_per_state_spike_param_state_mismatch_raises_clear_error(self) -> None:
+        """Per-state emission parameters must align with discrete dynamics states."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            switching_point_process_filter,
+        )
+
+        n_latent, n_neurons, n_discrete_states = 2, 3, 2
+        init_state_cond_mean = jnp.zeros((n_latent, n_discrete_states))
+        init_state_cond_cov = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        init_discrete_state_prob = jnp.array([0.5, 0.5])
+        spikes = jnp.ones((4, n_neurons))
+        discrete_transition_matrix = jnp.array([[0.9, 0.1], [0.2, 0.8]])
+        continuous_transition_matrix = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        process_cov = jnp.stack(
+            [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
+        )
+        spike_params = SpikeObsParams(
+            baseline=jnp.zeros((n_neurons, 1)),
+            weights=jnp.zeros((n_neurons, n_latent, 1)),
+        )
+
+        with pytest.raises(ValueError, match="baseline state dimension"):
+            switching_point_process_filter(
+                init_state_cond_mean,
+                init_state_cond_cov,
+                init_discrete_state_prob,
+                spikes,
+                discrete_transition_matrix,
+                continuous_transition_matrix,
+                process_cov,
+                0.02,
+                linear_log_intensity,
+                spike_params,
+            )
+
+    def test_pair_filter_prob_matches_hmm_two_slice_oracle(self) -> None:
+        """Baseline-only per-state emissions should match exact HMM two-slice posteriors."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            switching_point_process_filter,
+        )
+
+        n_latent, n_neurons, n_discrete_states = 1, 2, 2
+        dt = 0.1
+        spikes = jnp.array([[0.0, 1.0], [2.0, 0.0], [1.0, 3.0]])
+        init_state_cond_mean = jnp.zeros((n_latent, n_discrete_states))
+        init_state_cond_cov = jnp.stack(
+            [jnp.eye(n_latent) * 0.25] * n_discrete_states, axis=-1
+        )
+        init_discrete_state_prob = jnp.array([0.7, 0.3])
+        discrete_transition_matrix = jnp.array([[0.8, 0.2], [0.15, 0.85]])
+        continuous_transition_matrix = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
+        process_cov = jnp.stack(
+            [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
+        )
+
+        baseline = jnp.log(jnp.array([[2.0, 11.0], [7.0, 1.5]]))
+        spike_params = SpikeObsParams(
+            baseline=baseline,
+            weights=jnp.zeros((n_neurons, n_latent, n_discrete_states)),
+        )
+
+        _, _, filter_prob, _, _, pair_prob, marginal_ll = switching_point_process_filter(
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            spikes,
+            discrete_transition_matrix,
+            continuous_transition_matrix,
+            process_cov,
+            dt,
+            linear_log_intensity,
+            spike_params,
+            include_laplace_normalization=False,
+        )
+
+        emission_ll = []
+        for t in range(spikes.shape[0]):
+            per_state_ll = []
+            for j in range(n_discrete_states):
+                expected_counts = jnp.exp(baseline[:, j]) * dt
+                per_state_ll.append(
+                    jnp.sum(jax.scipy.stats.poisson.logpmf(spikes[t], expected_counts))
+                )
+            emission_ll.append(jnp.stack(per_state_ll))
+        emission_ll = jnp.stack(emission_ll)
+
+        alphas = []
+        pair_oracle = []
+        unnorm0 = init_discrete_state_prob * jnp.exp(emission_ll[0])
+        normalizer0 = jnp.sum(unnorm0)
+        alpha = unnorm0 / normalizer0
+        alphas.append(alpha)
+        pair_oracle.append(
+            jnp.broadcast_to(
+                alpha[None, :] / n_discrete_states,
+                (n_discrete_states, n_discrete_states),
+            )
+        )
+        log_likelihood = jnp.log(normalizer0)
+
+        for t in range(1, spikes.shape[0]):
+            joint = (
+                alpha[:, None]
+                * discrete_transition_matrix
+                * jnp.exp(emission_ll[t])[None, :]
+            )
+            normalizer = jnp.sum(joint)
+            pair = joint / normalizer
+            alpha = jnp.sum(pair, axis=0)
+            alphas.append(alpha)
+            pair_oracle.append(pair)
+            log_likelihood = log_likelihood + jnp.log(normalizer)
+
+        np.testing.assert_allclose(
+            filter_prob,
+            jnp.stack(alphas),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            pair_prob,
+            jnp.stack(pair_oracle),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            marginal_ll,
+            log_likelihood,
+            rtol=1e-10,
+            atol=1e-10,
+        )
+
 
 class TestSmootherIntegration:
     """Tests verifying switching_kalman_smoother works with point-process filter outputs.
