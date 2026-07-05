@@ -14,6 +14,7 @@ from jax import Array, random
 from scipy.linalg import solve_discrete_are
 
 from state_space_practice.kalman import (
+    _kalman_smoother_update,
     joseph_form_update,
     kalman_filter,
     kalman_maximization_step,
@@ -153,6 +154,14 @@ def test_sum_of_outer_products() -> None:
     for i in range(x.shape[0]):
         expected += jnp.outer(x[i], y[i])
     np.testing.assert_allclose(out, expected, rtol=1e-6)
+
+
+def test_sum_of_outer_products_rejects_mismatched_time_axis() -> None:
+    x = jnp.ones((3, 2))
+    y = jnp.ones((4, 2))
+
+    with pytest.raises(ValueError, match="same leading time"):
+        sum_of_outer_products(x, y)
 
 
 def test_kalman_filter_values() -> None:
@@ -1626,6 +1635,82 @@ class TestParallelKalmanSmoother:
         assert jnp.all(jnp.isfinite(sm))
         assert jnp.all(jnp.isfinite(sc))
 
+    def test_time_varying_transition_matches_sequential_reference(self) -> None:
+        """Parallel smoother with A_t/Q_t should match explicit RTS recursion."""
+        T, D = 17, 3
+        key = random.PRNGKey(31)
+        k_mean, k_cov, k_A = random.split(key, 3)
+        filt_mean = random.normal(k_mean, (T, D))
+        cov_factors = random.normal(k_cov, (T, D, D))
+        filt_cov = jnp.einsum("tij,tkj->tik", cov_factors, cov_factors)
+        filt_cov = filt_cov + 0.5 * jnp.eye(D)[None]
+        A_tv = 0.75 * jnp.eye(D)[None] + 0.03 * random.normal(k_A, (T - 1, D, D))
+        q_scales = jnp.linspace(0.05, 0.2, T - 1)
+        Q_tv = q_scales[:, None, None] * jnp.eye(D)[None]
+
+        par_mean, par_cov, par_cross = parallel_kalman_smoother(
+            filt_mean, filt_cov, A_tv, Q_tv
+        )
+
+        next_mean = filt_mean[-1]
+        next_cov = filt_cov[-1]
+        seq_means = []
+        seq_covs = []
+        seq_cross = []
+        for t in reversed(range(T - 1)):
+            next_mean, next_cov, cross = _kalman_smoother_update(
+                next_mean,
+                next_cov,
+                filt_mean[t],
+                filt_cov[t],
+                Q_tv[t],
+                A_tv[t],
+            )
+            seq_means.append(next_mean)
+            seq_covs.append(next_cov)
+            seq_cross.append(cross)
+
+        seq_mean = jnp.concatenate(
+            [jnp.stack(seq_means[::-1]), filt_mean[-1][None]], axis=0
+        )
+        seq_cov = jnp.concatenate(
+            [jnp.stack(seq_covs[::-1]), filt_cov[-1][None]], axis=0
+        )
+        seq_cross = jnp.stack(seq_cross[::-1])
+
+        np.testing.assert_allclose(par_mean, seq_mean, atol=1e-8)
+        np.testing.assert_allclose(par_cov, seq_cov, atol=1e-8)
+        np.testing.assert_allclose(par_cross, seq_cross, atol=1e-8)
+
+    def test_rejects_bad_time_varying_parameter_shapes(self) -> None:
+        T, D = 5, 2
+        filt_mean = jnp.zeros((T, D))
+        filt_cov = jnp.broadcast_to(jnp.eye(D), (T, D, D))
+
+        with pytest.raises(ValueError, match="transition_matrix.*leading time axis"):
+            parallel_kalman_smoother(
+                filt_mean,
+                filt_cov,
+                jnp.broadcast_to(jnp.eye(D), (T, D, D)),
+                jnp.eye(D),
+            )
+
+        with pytest.raises(ValueError, match="process_cov.*leading time axis"):
+            parallel_kalman_smoother(
+                filt_mean,
+                filt_cov,
+                jnp.eye(D),
+                jnp.broadcast_to(jnp.eye(D), (T, D, D)),
+            )
+
+    def test_rejects_bad_filtered_covariance_shape(self) -> None:
+        T, D = 5, 2
+        filt_mean = jnp.zeros((T, D))
+        filt_cov = jnp.broadcast_to(jnp.eye(D), (T - 1, D, D))
+
+        with pytest.raises(ValueError, match="filtered_covariances"):
+            parallel_kalman_smoother(filt_mean, filt_cov, jnp.eye(D), jnp.eye(D))
+
     def test_smoothed_covariances_psd(self) -> None:
         """Smoothed covariances should be positive semi-definite."""
         key = random.PRNGKey(123)
@@ -1681,6 +1766,38 @@ class TestWoodburyKalmanGain:
         K_s, S_s = standard_kalman_gain(P, H, jnp.diag(R_diag))
 
         np.testing.assert_allclose(K_w, K_s, atol=1e-5)
+
+    def test_rank_deficient_prior_cov_matches_standard_gain(self) -> None:
+        """PSD but singular P should not NaN in the Woodbury helper."""
+        key = random.PRNGKey(11)
+        D_state, D_obs = 4, 30
+        P = jnp.diag(jnp.array([1.0, 0.4, 0.0, 0.0]))
+        H = random.normal(key, (D_obs, D_state)) * 0.2
+        R_diag = jnp.linspace(0.2, 1.0, D_obs)
+
+        K_w, S_w, S_inv_w = woodbury_kalman_gain(P, H, R_diag)
+        K_s, S_s = standard_kalman_gain(P, H, jnp.diag(R_diag))
+
+        assert jnp.all(jnp.isfinite(K_w))
+        assert jnp.all(jnp.isfinite(S_inv_w))
+        np.testing.assert_allclose(K_w, K_s, atol=1e-6)
+        np.testing.assert_allclose(S_w, S_s, atol=1e-10)
+        np.testing.assert_allclose(S_inv_w @ S_w, jnp.eye(D_obs), atol=1e-8)
+
+    def test_jit_compiles(self) -> None:
+        """Value validation should not make the helper unusable in scans/jit."""
+        key = random.PRNGKey(17)
+        D_state, D_obs = 3, 12
+        P = jnp.eye(D_state) * 0.5
+        H = random.normal(key, (D_obs, D_state)) * 0.1
+        R_diag = jnp.ones(D_obs) * 0.3
+
+        K_w, S_w, S_inv_w = jax.jit(woodbury_kalman_gain)(P, H, R_diag)
+        K_s, S_s = standard_kalman_gain(P, H, jnp.diag(R_diag))
+
+        np.testing.assert_allclose(K_w, K_s, atol=1e-8)
+        np.testing.assert_allclose(S_w, S_s, atol=1e-10)
+        np.testing.assert_allclose(S_inv_w @ S_w, jnp.eye(D_obs), atol=1e-8)
 
     def test_log_likelihood_matches(self) -> None:
         """Innovation log-likelihood should match between methods."""
@@ -1989,7 +2106,7 @@ def test_filter_time_varying_R_non_psd_slice_raises():
     """A correctly-shaped per-bin R with a negative slice is rejected."""
     init_mean, init_cov, obs, A, Q, H = _time_varying_r_model()
     R_seq = _const_r_sequence(0.2, obs.shape[0]).at[1].set(jnp.array([[-0.5]]))
-    with pytest.raises(ValueError, match="positive definite"):
+    with pytest.raises(ValueError, match="positive definite.*time step 1"):
         kalman_filter(init_mean, init_cov, obs, A, Q, H, R_seq)
 
 

@@ -31,6 +31,15 @@ from state_space_practice.utils import (  # noqa: F401 — re-exported for backw
 )
 
 
+def _contains_tracer(*values: object) -> bool:
+    """Return True if any pytree leaf is being traced by JAX."""
+    return any(
+        isinstance(leaf, jax.core.Tracer)
+        for value in values
+        for leaf in jax.tree_util.tree_leaves(value)
+    )
+
+
 def woodbury_kalman_gain(
     prior_cov: jax.Array,
     emission_matrix: jax.Array,
@@ -38,10 +47,15 @@ def woodbury_kalman_gain(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Compute Kalman gain using the Woodbury identity for diagonal R.
 
-    When the observation noise covariance R is diagonal, the standard
-    Kalman gain computation is O(D_obs^3). The Woodbury identity reduces
-    this to O(D_state^3), which is much faster when D_obs >> D_state
-    (e.g. many neurons, low-dimensional latent state).
+    When the observation noise covariance R is diagonal, the standard dense
+    Kalman gain solve is O(D_obs^3). The Woodbury identity replaces that solve
+    with O(D_obs * D_state^2 + D_state^3) work, which is much faster when
+    D_obs >> D_state (e.g. many neurons, low-dimensional latent state).
+
+    This compatibility helper still returns dense ``S`` and ``S_inv``, so its
+    output memory is O(D_obs^2). Large-observation call sites that only need a
+    gain-times-innovation action should use a factor/action API instead of
+    materializing those dense matrices.
 
     Parameters
     ----------
@@ -61,26 +75,74 @@ def woodbury_kalman_gain(
     S_inv : jax.Array, shape (D_obs, D_obs)
         Inverse of innovation covariance (via Woodbury).
     """
+    prior_cov = jnp.asarray(prior_cov)
+    emission_matrix = jnp.asarray(emission_matrix)
     emission_cov_diag = jnp.asarray(emission_cov_diag)
+
+    if prior_cov.ndim != 2 or prior_cov.shape[0] != prior_cov.shape[1]:
+        raise ValueError(
+            "prior_cov must be a square 2D covariance matrix, "
+            f"got shape {prior_cov.shape}."
+        )
+    if emission_matrix.ndim != 2:
+        raise ValueError(
+            "emission_matrix must have shape (D_obs, D_state), "
+            f"got shape {emission_matrix.shape}."
+        )
+    D = prior_cov.shape[0]
+    D_obs = emission_matrix.shape[0]
+    if emission_matrix.shape[1] != D:
+        raise ValueError(
+            "emission_matrix state dimension must match prior_cov; "
+            f"got {emission_matrix.shape[1]} and {D}."
+        )
     if emission_cov_diag.ndim != 1:
         raise ValueError(
             "emission_cov_diag must be a 1D vector of positive variances, "
             f"got shape {emission_cov_diag.shape}."
         )
-    if not bool(jnp.all(jnp.isfinite(emission_cov_diag))):
-        raise ValueError("emission_cov_diag must contain only finite values.")
-    if not bool(jnp.all(emission_cov_diag > 0.0)):
-        raise ValueError("emission_cov_diag entries must be positive.")
+    if emission_cov_diag.shape != (D_obs,):
+        raise ValueError(
+            "emission_cov_diag length must match emission_matrix rows; "
+            f"got {emission_cov_diag.shape} for D_obs={D_obs}."
+        )
+    if not _contains_tracer(prior_cov, emission_matrix, emission_cov_diag):
+        for name, arr in (
+            ("prior_cov", prior_cov),
+            ("emission_matrix", emission_matrix),
+            ("emission_cov_diag", emission_cov_diag),
+        ):
+            if not bool(jnp.all(jnp.isfinite(arr))):
+                raise ValueError(f"{name} must contain only finite values.")
+        if not bool(jnp.all(emission_cov_diag > 0.0)):
+            raise ValueError("emission_cov_diag entries must be positive.")
 
-    D = prior_cov.shape[0]
-    I_D = jnp.eye(D)
-    # U = H @ chol(P), shape (D_obs, D_state)
-    U = emission_matrix @ jnp.linalg.cholesky(prior_cov)
-    X = U / emission_cov_diag[:, None]  # R^{-1} U, shape (D_obs, D_state)
-    # Woodbury: S^{-1} = R^{-1} - X (I + U' X)^{-1} X'
-    S_inv = jnp.diag(1.0 / emission_cov_diag) - X @ psd_solve(I_D + U.T @ X, X.T)
-    K = prior_cov @ emission_matrix.T @ S_inv
-    S = jnp.diag(emission_cov_diag) + emission_matrix @ prior_cov @ emission_matrix.T
+    dtype = jnp.result_type(prior_cov, emission_matrix, emission_cov_diag)
+    prior_cov = prior_cov.astype(dtype)
+    emission_matrix = emission_matrix.astype(dtype)
+    emission_cov_diag = emission_cov_diag.astype(dtype)
+
+    r_inv = 1.0 / emission_cov_diag
+    R_inv_H = emission_matrix * r_inv[:, None]
+    Ht_R_inv_H = emission_matrix.T @ R_inv_H
+    I_D = jnp.eye(D, dtype=dtype)
+
+    # Matrix inversion lemma without factorizing P:
+    # S^{-1} = R^{-1} - R^{-1} H P (I + H' R^{-1} H P)^{-1} H' R^{-1}.
+    # This remains finite for positive-semidefinite/rank-deficient P.
+    small_inv_term = jnp.linalg.solve(I_D + Ht_R_inv_H @ prior_cov, R_inv_H.T)
+    S_inv = symmetrize(
+        jnp.diag(r_inv) - R_inv_H @ prior_cov @ small_inv_term
+    )
+
+    # Equivalent small-system expression for K = P H' S^{-1}; avoids a dense
+    # (D_obs, D_obs) multiply when callers only consume K.
+    K_rhs = jnp.linalg.solve(I_D + prior_cov @ Ht_R_inv_H, prior_cov)
+    K = (R_inv_H @ K_rhs).T
+    S = symmetrize(
+        jnp.diag(emission_cov_diag)
+        + emission_matrix @ prior_cov @ emission_matrix.T
+    )
     return K, S, S_inv
 
 
@@ -244,12 +306,16 @@ def _validate_kalman_public_inputs(
         # Per-bin R: require every slice positive definite. eigvalsh is
         # batched over the leading time axis (O(n_time * n_obs^3)) but runs
         # once per public call, since inner loops pass validate_inputs=False.
-        min_slice_eig = float(jnp.linalg.eigvalsh(symmetrize(measurement_cov)).min())
+        per_slice_min_eig = jnp.linalg.eigvalsh(
+            symmetrize(measurement_cov)
+        ).min(axis=-1)
+        worst_time = int(jnp.argmin(per_slice_min_eig))
+        min_slice_eig = float(per_slice_min_eig[worst_time])
         if not min_slice_eig > 0.0:
             raise ValueError(
                 "measurement_cov must be positive definite at every time "
-                f"step; the minimum eigenvalue across all bins is "
-                f"{min_slice_eig}."
+                f"step; the minimum eigenvalue is {min_slice_eig} at "
+                f"time step {worst_time}."
             )
         _validate_filter_numerics(
             init_cov,
@@ -368,7 +434,9 @@ def _kalman_filter_update(
     """
     # One step prediction
     one_step_mean = transition_matrix @ mean_prev
-    one_step_cov = transition_matrix @ cov_prev @ transition_matrix.T + process_cov
+    one_step_cov = symmetrize(
+        transition_matrix @ cov_prev @ transition_matrix.T + process_cov
+    )
 
     # Measurement update
     return kalman_measurement_update(
@@ -837,19 +905,61 @@ def parallel_kalman_smoother(
     Särkkä, S. & García-Fernández, Á.F. (2021). Temporal parallelization
     of Bayesian smoothers. IEEE Trans. Automatic Control 66(1), 299-306.
     """
+    filtered_means = jnp.asarray(filtered_means)
+    filtered_covariances = jnp.asarray(filtered_covariances)
+    transition_matrix = jnp.asarray(transition_matrix)
+    process_cov = jnp.asarray(process_cov)
+
+    if filtered_means.ndim != 2:
+        raise ValueError(
+            "filtered_means must have shape (T, D), "
+            f"got {filtered_means.shape}."
+        )
     T, D = filtered_means.shape
     if T == 0:
         raise ValueError("filtered_means must contain at least one time step.")
+    if filtered_covariances.shape != (T, D, D):
+        raise ValueError(
+            "filtered_covariances must have shape "
+            f"(T={T}, D={D}, D={D}), got {filtered_covariances.shape}."
+        )
+
+    def _as_transition_stack(name: str, value: jax.Array) -> jax.Array:
+        if value.ndim == 2:
+            if value.shape != (D, D):
+                raise ValueError(
+                    f"{name} must have shape ({D}, {D}) or "
+                    f"({T - 1}, {D}, {D}), got {value.shape}."
+                )
+            return jnp.broadcast_to(value, (T - 1, D, D))
+        if value.ndim == 3:
+            if value.shape != (T - 1, D, D):
+                raise ValueError(
+                    f"{name} with a leading time axis must have shape "
+                    f"({T - 1}, {D}, {D}) because entry t maps time t to "
+                    f"t+1; got {value.shape}."
+                )
+            return value
+        raise ValueError(
+            f"{name} must have shape ({D}, {D}) or ({T - 1}, {D}, {D}), "
+            f"got {value.shape}."
+        )
+
+    if not _contains_tracer(
+        filtered_means, filtered_covariances, transition_matrix, process_cov
+    ):
+        for name, arr in (
+            ("filtered_means", filtered_means),
+            ("filtered_covariances", filtered_covariances),
+            ("transition_matrix", transition_matrix),
+            ("process_cov", process_cov),
+        ):
+            if not bool(jnp.all(jnp.isfinite(arr))):
+                raise ValueError(f"{name} must contain only finite values.")
 
     # Broadcast time-invariant parameters to (T-1, D, D)
-    if transition_matrix.ndim == 2:
-        A = jnp.broadcast_to(transition_matrix, (T - 1, D, D))
-    else:
-        A = transition_matrix
-    if process_cov.ndim == 2:
-        Q = jnp.broadcast_to(process_cov, (T - 1, D, D))
-    else:
-        Q = process_cov
+    A = _as_transition_stack("transition_matrix", transition_matrix)
+    Q = _as_transition_stack("process_cov", process_cov)
 
     # Build per-timestep smoother elements for t = 0, ..., T-2
     def _build_element(filt_mean, filt_cov, A_t, Q_t):
@@ -921,6 +1031,17 @@ def sum_of_outer_products(x: jax.Array, y: jax.Array) -> jax.Array:
         The sum of outer products.
 
     """
+    x = jnp.asarray(x)
+    y = jnp.asarray(y)
+    if x.ndim != 2:
+        raise ValueError(f"x must have shape (T, N), got {x.shape}.")
+    if y.ndim != 2:
+        raise ValueError(f"y must have shape (T, M), got {y.shape}.")
+    if x.shape[0] != y.shape[0]:
+        raise ValueError(
+            "x and y must have the same leading time dimension; "
+            f"got {x.shape[0]} and {y.shape[0]}."
+        )
     return x.T @ y
 
 
