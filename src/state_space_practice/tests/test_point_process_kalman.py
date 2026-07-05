@@ -549,6 +549,19 @@ class TestKalmanMaximizationStep:
         assert not jnp.any(jnp.isnan(init_mean))
         assert not jnp.any(jnp.isnan(init_cov))
 
+    def test_rejects_one_timestep(self) -> None:
+        """Transition dynamics are not identifiable from one smoothed state."""
+        smoother_mean = jnp.zeros((1, 2))
+        smoother_cov = jnp.eye(2)[None]
+        smoother_cross_cov = jnp.zeros((0, 2, 2))
+
+        with pytest.raises(ValueError, match="at least 2 time steps"):
+            dynamics_only_m_step(
+                smoother_mean,
+                smoother_cov,
+                smoother_cross_cov,
+            )
+
     def test_process_cov_symmetric(self, smoother_outputs) -> None:
         """Process covariance should be symmetric."""
         s = smoother_outputs
@@ -767,6 +780,30 @@ class TestGetConfidenceInterval:
         # 99% CI should be wider
         assert jnp.all(width_99 > width_95)
 
+    def test_default_alpha_matches_method_at_95_percent(self) -> None:
+        """The module function and the model method share a 95% (alpha=0.05)
+        default, so switching between them does not silently change the band."""
+        import inspect
+
+        module_default = (
+            inspect.signature(get_confidence_interval).parameters["alpha"].default
+        )
+        method_default = (
+            inspect.signature(PointProcessModel.get_confidence_interval)
+            .parameters["alpha"]
+            .default
+        )
+        assert module_default == method_default == 0.05
+
+        posterior_mean = jnp.zeros((3, 2))
+        posterior_cov = jnp.stack([jnp.eye(2)] * 3)
+        default_ci = get_confidence_interval(posterior_mean, posterior_cov)
+        ci_95 = get_confidence_interval(posterior_mean, posterior_cov, alpha=0.05)
+        np.testing.assert_allclose(np.asarray(default_ci), np.asarray(ci_95))
+        # Guard: the default is genuinely 95%, not the old 99% (alpha=0.01).
+        ci_99 = get_confidence_interval(posterior_mean, posterior_cov, alpha=0.01)
+        assert not np.allclose(np.asarray(default_ci), np.asarray(ci_99))
+
 
 class TestPointProcessModel:
     """Tests for the PointProcessModel class."""
@@ -840,6 +877,21 @@ class TestPointProcessModel:
         np.testing.assert_allclose(model.process_cov, Q)
         np.testing.assert_allclose(model.init_mean, m0)
         np.testing.assert_allclose(model.init_cov, P0)
+
+    @pytest.mark.parametrize(
+        ("kwarg", "bad_value"),
+        [
+            ("transition_matrix", jnp.eye(4)),
+            ("process_cov", jnp.eye(4)),
+            ("init_mean", jnp.zeros(4)),
+            ("init_cov", jnp.eye(4)),
+        ],
+    )
+    def test_initialization_rejects_shape_mismatch(self, kwarg, bad_value) -> None:
+        """A supplied parameter whose shape disagrees with n_state_dims must
+        be rejected at construction, not deep inside the first scan."""
+        with pytest.raises(ValueError, match=kwarg):
+            PointProcessModel(n_state_dims=3, dt=0.02, **{kwarg: bad_value})
 
     def test_fit_returns_log_likelihoods(self, simple_model_data) -> None:
         """fit() should return a list of log-likelihoods."""

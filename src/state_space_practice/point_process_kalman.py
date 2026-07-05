@@ -525,7 +525,19 @@ def _safe_expected_count(
     min_log_count: float = -20.0,
     max_log_count: float = 20.0,
 ) -> Array:
-    """Convert log-rate in Hz to expected count per bin with overflow protection."""
+    """Convert log-rate in Hz to expected count per bin with overflow protection.
+
+    ``log(rate * dt)`` is clipped to ``[min_log_count, max_log_count]`` before
+    exponentiation. ``max_log_count`` guards against overflow on pathological
+    spike counts (see the calling filters' docstrings). ``min_log_count``
+    floors the expected count at ``exp(min_log_count)`` so ``log(mu)`` stays
+    finite; note this floor is not free of consequences. For any bin whose true
+    ``rate * dt`` underflows the floor, ``y * log(mu)`` biases toward
+    ``min_log_count * y`` and, because ``jnp.clip`` has zero gradient outside
+    its range, that bin contributes no gradient in ``fit_sgd`` (dead learning
+    signal). The default of ``-20`` corresponds to ~2e-9 counts/bin, so it only
+    bites when the model drives a rate implausibly low.
+    """
     dt_array = jnp.asarray(dt, dtype=log_rate.dtype)
     log_count = log_rate + jnp.log(dt_array)
     return jnp.exp(jnp.clip(log_count, min_log_count, max_log_count))
@@ -1506,9 +1518,15 @@ def _stochastic_point_process_filter_block_diagonal(
       block-diagonal.
 
     Therefore: per-neuron ``log p(y_t^j | y_{1:t-1})`` contributions
-    sum to the full-problem marginal log-likelihood. This is mathematically
-    identical (not approximately) to the dense filter's output on a
-    block-diagonal problem.
+    sum to the full-problem marginal log-likelihood.
+
+    This equivalence is exact for the default single Fisher step
+    (``max_newton_iter == 1``). For ``max_newton_iter > 1`` the two paths
+    differ: the dense update runs one *global* backtracking line search
+    (a single step size gating all neurons on the summed neg-log-posterior),
+    whereas this block path backtracks *per neuron* independently. The
+    per-neuron search is arguably better conditioned, but the resulting
+    means and log-likelihoods are no longer bit-identical to the dense path.
 
     Output shape compatibility
     --------------------------
@@ -1612,7 +1630,13 @@ def _stochastic_point_process_smoother_block_diagonal(
     structure when ``P_{t|t}``, ``A``, and ``Q`` are all block-diagonal,
     so the backward update decomposes neuron-by-neuron. Running the
     backward pass per-neuron is mathematically identical to running it
-    on the full dense state.
+    on the full dense state *given the same filtered inputs*. The forward
+    filter it consumes carries the same caveat as
+    ``_stochastic_point_process_filter_block_diagonal``: the two paths are
+    bit-identical only for ``max_newton_iter == 1``; for
+    ``max_newton_iter > 1`` the per-neuron vs global line search makes the
+    filtered moments (and hence the smoothed output) differ from the dense
+    path.
 
     Output shape compatibility
     --------------------------
@@ -2021,6 +2045,11 @@ def dynamics_only_m_step(
     smoother_cross_cov = jnp.asarray(smoother_cross_cov)
 
     n_time = smoother_mean.shape[0]
+    if n_time < 2:
+        raise ValueError(
+            "dynamics_only_m_step requires at least 2 time steps to "
+            "estimate transition dynamics."
+        )
 
     # Compute intermediate expectation terms
     gamma = jnp.sum(smoother_cov, axis=0) + sum_of_outer_products(
@@ -2070,7 +2099,7 @@ def dynamics_only_m_step(
 
 
 def get_confidence_interval(
-    posterior_mean: ArrayLike, posterior_covariance: ArrayLike, alpha: float = 0.01
+    posterior_mean: ArrayLike, posterior_covariance: ArrayLike, alpha: float = 0.05
 ) -> Array:
     """Get the confidence interval from the posterior covariance
 
@@ -2079,9 +2108,10 @@ def get_confidence_interval(
     posterior_mean : ArrayLike, shape (n_time, n_params)
     posterior_covariance : ArrayLike, shape (n_time, n_params, n_params)
     alpha : float, optional
-        Significance level in ``(0, 1)``, by default ``0.01``. Returns a
-        ``1 - alpha`` confidence interval (i.e. the default 0.01 gives a
-        99% CI, not a 1% CI).
+        Significance level in ``(0, 1)``, by default ``0.05``. Returns a
+        ``1 - alpha`` confidence interval (i.e. the default 0.05 gives a
+        95% CI, not a 5% CI). This matches the default of
+        :meth:`PointProcessModel.get_confidence_interval`.
     """
     posterior_mean = jnp.asarray(posterior_mean)
     posterior_covariance = jnp.asarray(posterior_covariance)
@@ -2274,6 +2304,21 @@ class PointProcessModel(SGDFittableMixin):
             self.init_cov = jnp.eye(n_state_dims)
         else:
             self.init_cov = jnp.asarray(init_cov)
+
+        # Validate supplied parameter shapes at the boundary rather than
+        # letting a mismatch surface as an opaque error deep in the first
+        # filter scan.
+        for name, expected_shape, arr in (
+            ("transition_matrix", (n_state_dims, n_state_dims), self.transition_matrix),
+            ("process_cov", (n_state_dims, n_state_dims), self.process_cov),
+            ("init_mean", (n_state_dims,), self.init_mean),
+            ("init_cov", (n_state_dims, n_state_dims), self.init_cov),
+        ):
+            if arr.shape != expected_shape:
+                raise ValueError(
+                    f"{name} must have shape {expected_shape} for "
+                    f"n_state_dims={n_state_dims}, got {arr.shape}."
+                )
 
         if log_intensity_func is None:
             self.log_intensity_func = log_conditional_intensity
