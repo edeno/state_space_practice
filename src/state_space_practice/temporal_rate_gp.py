@@ -296,6 +296,124 @@ def infer_log_rate(
     )
 
 
+def _infer_log_rate_batch_traced(
+    counts: Array,
+    dt: ArrayLike,
+    variance: Array,
+    lengthscale: Array,
+    mean: Array,
+    n_iter: int,
+    min_weight: float,
+) -> LaplaceRateResult:
+    """Vmapped core over neurons; ``variance``/``lengthscale``/``mean`` are
+
+    per-neuron ``(n_neurons,)`` arrays and ``counts`` is ``(n_neurons, n_time)``.
+    Safe under ``jit`` / ``grad`` (does no host-side validation).
+    """
+
+    def _one(row: Array, var: Array, ell: Array, mu: Array) -> LaplaceRateResult:
+        return _infer_log_rate_traced(row, dt, var, ell, mu, n_iter, min_weight)
+
+    return jax.vmap(_one)(counts, variance, lengthscale, mean)
+
+
+def _broadcast_hyperparameter(
+    value: ArrayLike,
+    n_neurons: int,
+    name: str,
+    positive: bool,
+) -> Array:
+    """Validate a shared scalar or per-neuron ``(n_neurons,)`` hyperparameter and
+
+    broadcast it to ``(n_neurons,)``. Concrete inputs are range-checked; tracers
+    (under ``jax.grad``) pass through unchecked, matching :func:`infer_log_rate`.
+    """
+    array = jnp.asarray(value)
+    if not isinstance(value, jax.core.Tracer):
+        if array.ndim == 0:
+            validate_scalar(value, name, positive=positive)
+        elif array.ndim == 1:
+            if array.shape[0] != n_neurons:
+                raise ValueError(
+                    f"{name} must be a scalar or have length n_neurons="
+                    f"{n_neurons}; got shape {array.shape}."
+                )
+            if not bool(jnp.all(jnp.isfinite(array))):
+                raise ValueError(f"{name} must contain only finite values.")
+            if positive and not bool(jnp.all(array > 0.0)):
+                raise ValueError(f"{name} must be strictly positive.")
+        else:
+            raise ValueError(
+                f"{name} must be a scalar or 1D (n_neurons,) array; got "
+                f"shape {array.shape}."
+            )
+    return jnp.broadcast_to(array, (n_neurons,))
+
+
+def infer_log_rate_batch(
+    counts: ArrayLike,
+    dt: ArrayLike,
+    variance: ArrayLike,
+    lengthscale: ArrayLike,
+    mean: ArrayLike = 0.0,
+    n_iter: int = 25,
+    min_weight: float = _DEFAULT_MIN_WEIGHT,
+) -> LaplaceRateResult:
+    r"""Infer per-neuron log-rates for a batch of independent spike trains.
+
+    Runs :func:`infer_log_rate` independently for each neuron (vectorized with
+    ``jax.vmap``). Each hyperparameter is either a scalar (shared across neurons)
+    or a ``(n_neurons,)`` array (one value per neuron).
+
+    Parameters
+    ----------
+    counts : ArrayLike, shape (n_neurons, n_time)
+        Non-negative integer spike counts, one row per neuron.
+    dt : ArrayLike
+        Bin width in seconds (strictly positive).
+    variance, lengthscale : ArrayLike
+        Matern-3/2 hyperparameters; scalar (shared) or ``(n_neurons,)``.
+    mean : ArrayLike, default 0.0
+        Baseline log-rate; scalar (shared) or ``(n_neurons,)``.
+    n_iter : int, default 25
+        Newton iterations per neuron.
+    min_weight : float
+        Fisher-weight floor; see :func:`poisson_log_rate_site`.
+
+    Returns
+    -------
+    LaplaceRateResult
+        Batched fields: ``log_rate_mean`` / ``log_rate_var`` of shape
+        ``(n_neurons, n_time)``, and ``log_marginal_likelihood`` /
+        ``max_abs_update`` of shape ``(n_neurons,)``.
+    """
+    counts = jnp.asarray(counts)
+    if counts.ndim != 2:
+        raise ValueError(
+            f"counts must be 2D (n_neurons, n_time), got shape {counts.shape}."
+        )
+    validate_count_array(counts, "counts")
+    try:
+        n_iter = operator.index(n_iter)
+    except TypeError as exc:
+        raise ValueError("n_iter must be a positive integer.") from exc
+    if n_iter <= 0:
+        raise ValueError("n_iter must be a positive integer.")
+
+    n_neurons = counts.shape[0]
+    if not isinstance(dt, jax.core.Tracer):
+        validate_scalar(dt, "dt", positive=True)
+    variance = _broadcast_hyperparameter(variance, n_neurons, "variance", positive=True)
+    lengthscale = _broadcast_hyperparameter(
+        lengthscale, n_neurons, "lengthscale", positive=True
+    )
+    mean = _broadcast_hyperparameter(mean, n_neurons, "mean", positive=False)
+
+    return _infer_log_rate_batch_traced(
+        counts, dt, variance, lengthscale, mean, n_iter, min_weight
+    )
+
+
 class TemporalRateGP(SGDFittableMixin):
     r"""Temporal firing-rate GP with marginal-likelihood hyperparameter learning.
 
@@ -346,6 +464,7 @@ class TemporalRateGP(SGDFittableMixin):
         update_variance: bool = True,
         update_lengthscale: bool = True,
         update_mean: bool = True,
+        share_hyperparameters: bool = True,
         min_weight: float = _DEFAULT_MIN_WEIGHT,
     ) -> None:
         self.dt = validate_scalar(dt, "dt", positive=True)
@@ -361,33 +480,39 @@ class TemporalRateGP(SGDFittableMixin):
         self.update_variance = bool(update_variance)
         self.update_lengthscale = bool(update_lengthscale)
         self.update_mean = bool(update_mean)
+        self.share_hyperparameters = bool(share_hyperparameters)
         self.min_weight = float(min_weight)
 
-        # Data and posterior, populated by fit_sgd.
+        # Data and posterior, populated by fit_sgd. _n_neurons is 1 for a 1D
+        # (single-train) fit and n_neurons for a 2D (n_neurons, n_time) fit.
         self._counts: Optional[Array] = None
+        self._n_neurons: int = 1
         self._sgd_n_time: int = 0
         self.log_rate_mean_: Optional[Array] = None
         self.log_rate_var_: Optional[Array] = None
-        self.log_marginal_likelihood_: Optional[float] = None
+        self.log_marginal_likelihood_: Optional[object] = None
 
     def __repr__(self) -> str:
         return (
-            f"TemporalRateGP(dt={self.dt}, variance={self.variance:.4g}, "
-            f"lengthscale={self.lengthscale:.4g}, mean={self.mean:.4g})"
+            f"TemporalRateGP(dt={self.dt}, n_iter={self.n_iter}, "
+            f"share_hyperparameters={self.share_hyperparameters})"
         )
 
     # -- fitted-hyperparameter accessors --------------------------------------
 
     @property
-    def variance_(self) -> float:
+    def variance_(self) -> "float | Array":
+        """Fitted Matern variance: scalar (shared) or ``(n_neurons,)`` array."""
         return self.variance
 
     @property
-    def lengthscale_(self) -> float:
+    def lengthscale_(self) -> "float | Array":
+        """Fitted Matern lengthscale: scalar (shared) or ``(n_neurons,)`` array."""
         return self.lengthscale
 
     @property
-    def mean_(self) -> float:
+    def mean_(self) -> "float | Array":
+        """Fitted baseline log-rate: scalar (single train) or ``(n_neurons,)``."""
         return self.mean
 
     # -- public fitting / prediction ------------------------------------------
@@ -405,32 +530,49 @@ class TemporalRateGP(SGDFittableMixin):
 
         Parameters
         ----------
-        counts : ArrayLike, shape (n_time,)
-            Non-negative integer spike counts per bin.
+        counts : ArrayLike, shape (n_time,) or (n_neurons, n_time)
+            Non-negative integer spike counts. A 1D array fits a single train;
+            a 2D array fits ``n_neurons`` independent trains at once. With
+            ``share_hyperparameters=True`` all neurons share ``variance`` and
+            ``lengthscale`` (each keeps its own baseline ``mean``); otherwise
+            every hyperparameter is per-neuron.
         num_steps, optimizer, verbose, convergence_tol
             Forwarded to :meth:`SGDFittableMixin.fit_sgd`.
 
         Returns
         -------
         list of float
-            Log-evidence at each optimization step.
+            Log-evidence (summed over neurons) at each optimization step.
         """
         counts = jnp.asarray(counts)
-        if counts.ndim != 1:
-            raise ValueError(f"counts must be 1D (n_time,), got shape {counts.shape}.")
+        if counts.ndim == 1:
+            n_neurons, n_time = 1, int(counts.shape[0])
+        elif counts.ndim == 2:
+            n_neurons, n_time = int(counts.shape[0]), int(counts.shape[1])
+        else:
+            raise ValueError(
+                "counts must be 1D (n_time,) or 2D (n_neurons, n_time), got "
+                f"shape {counts.shape}."
+            )
         validate_count_array(counts, "counts")
         self._counts = counts
-        self._sgd_n_time = int(counts.shape[0])
+        self._n_neurons = n_neurons
+        # Total observation count normalizes the mixin's loss so the learning
+        # rate scale is comparable across single- and multi-neuron fits.
+        self._sgd_n_time = n_time * n_neurons
 
         # Numerical-precision guard: the Laplace-EKF smoother needs float64 for
         # long sequences. Validate the stationary prior once (also warns on
-        # f32 + long T), matching the other filter entry points.
+        # f32 + long T), matching the other filter entry points. A representative
+        # scalar hyperparameter suffices for the per-neuron case.
+        representative_variance = float(jnp.mean(jnp.asarray(self.variance)))
+        representative_lengthscale = float(jnp.mean(jnp.asarray(self.lengthscale)))
         _, _, _, _, stationary_cov = matern32_continuous(
-            self.variance, self.lengthscale
+            representative_variance, representative_lengthscale
         )
         _validate_filter_numerics(
             stationary_cov,
-            n_time=self._sgd_n_time,
+            n_time=n_time,
             stacklevel=3,
             filter_name="TemporalRateGP.fit_sgd",
         )
@@ -507,10 +649,27 @@ class TemporalRateGP(SGDFittableMixin):
             frozen,
         )
 
+        n_neurons = self._n_neurons
+        # Shared variance/lengthscale stay scalar; per-neuron ones become
+        # (n_neurons,) vectors. The baseline mean is always per-neuron for a
+        # multi-neuron fit so each cell keeps its own firing level.
+        if n_neurons == 1 or self.share_hyperparameters:
+            variance_init = jnp.asarray(self.variance)
+            lengthscale_init = jnp.asarray(self.lengthscale)
+        else:
+            variance_init = jnp.broadcast_to(jnp.asarray(self.variance), (n_neurons,))
+            lengthscale_init = jnp.broadcast_to(
+                jnp.asarray(self.lengthscale), (n_neurons,)
+            )
+        if n_neurons == 1:
+            mean_init = jnp.asarray(self.mean)
+        else:
+            mean_init = jnp.broadcast_to(jnp.asarray(self.mean), (n_neurons,))
+
         params = {
-            "variance": jnp.asarray(self.variance),
-            "lengthscale": jnp.asarray(self.lengthscale),
-            "mean": jnp.asarray(self.mean),
+            "variance": variance_init,
+            "lengthscale": lengthscale_init,
+            "mean": mean_init,
         }
         spec = {
             "variance": POSITIVE if self.update_variance else frozen(POSITIVE),
@@ -520,32 +679,63 @@ class TemporalRateGP(SGDFittableMixin):
         return params, spec
 
     def _sgd_loss_fn(self, params: dict, counts: Array) -> Array:
-        result = _infer_log_rate_traced(
+        if self._n_neurons == 1:
+            result = _infer_log_rate_traced(
+                counts,
+                self.dt,
+                params["variance"],
+                params["lengthscale"],
+                params["mean"],
+                self.n_iter,
+                self.min_weight,
+            )
+            return -result.log_marginal_likelihood
+
+        n_neurons = self._n_neurons
+        result = _infer_log_rate_batch_traced(
             counts,
             self.dt,
-            params["variance"],
-            params["lengthscale"],
-            params["mean"],
+            jnp.broadcast_to(params["variance"], (n_neurons,)),
+            jnp.broadcast_to(params["lengthscale"], (n_neurons,)),
+            jnp.broadcast_to(params["mean"], (n_neurons,)),
             self.n_iter,
             self.min_weight,
         )
-        return -result.log_marginal_likelihood
+        return -jnp.sum(result.log_marginal_likelihood)
 
     def _store_sgd_params(self, params: dict) -> None:
-        self.variance = float(params["variance"])
-        self.lengthscale = float(params["lengthscale"])
-        self.mean = float(params["mean"])
+        if self._n_neurons == 1:
+            self.variance = float(params["variance"])
+            self.lengthscale = float(params["lengthscale"])
+            self.mean = float(params["mean"])
+        else:
+            # Keep shared hyperparameters scalar, per-neuron ones as vectors.
+            self.variance = params["variance"]
+            self.lengthscale = params["lengthscale"]
+            self.mean = params["mean"]
 
     def _finalize_sgd(self, counts: Array) -> None:
-        result = infer_log_rate(
-            counts,
-            self.dt,
-            self.variance,
-            self.lengthscale,
-            self.mean,
-            n_iter=self.n_iter,
-            min_weight=self.min_weight,
-        )
+        if self._n_neurons == 1:
+            result = infer_log_rate(
+                counts,
+                self.dt,
+                self.variance,
+                self.lengthscale,
+                self.mean,
+                n_iter=self.n_iter,
+                min_weight=self.min_weight,
+            )
+            self.log_marginal_likelihood_ = float(result.log_marginal_likelihood)
+        else:
+            result = infer_log_rate_batch(
+                counts,
+                self.dt,
+                self.variance,
+                self.lengthscale,
+                self.mean,
+                n_iter=self.n_iter,
+                min_weight=self.min_weight,
+            )
+            self.log_marginal_likelihood_ = result.log_marginal_likelihood
         self.log_rate_mean_ = result.log_rate_mean
         self.log_rate_var_ = result.log_rate_var
-        self.log_marginal_likelihood_ = float(result.log_marginal_likelihood)

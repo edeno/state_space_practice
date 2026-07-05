@@ -22,6 +22,7 @@ from scipy.special import gammaln
 from state_space_practice.temporal_rate_gp import (
     TemporalRateGP,
     infer_log_rate,
+    infer_log_rate_batch,
     poisson_log_rate_site,
 )
 
@@ -338,4 +339,142 @@ def test_fit_sgd_improves_evidence_and_moves_lengthscale_toward_truth():
     assert log_likelihoods[-1] > log_likelihoods[0]  # evidence improved
     # Started too smooth; learned lengthscale should shrink toward the truth.
     assert float(model.lengthscale_) < lengthscale_init
+    assert 0.4 * lengthscale_true < float(model.lengthscale_) < 3.0 * lengthscale_true
+
+
+# --- Multi-neuron batching ----------------------------------------------------
+
+
+@pytest.fixture
+def multineuron_counts() -> jnp.ndarray:
+    """Reproducible (n_neurons, n_time) counts with per-neuron baselines/phases."""
+    key = random.PRNGKey(3)
+    n_neurons, n_time, dt = 4, 24, 0.1
+    times = jnp.arange(n_time) * dt
+    keys = random.split(key, n_neurons)
+    baselines = jnp.array([0.5, 0.0, -0.3, 0.8])
+    rows = []
+    for j in range(n_neurons):
+        rate = jnp.exp(baselines[j] + 0.6 * jnp.sin(2.0 * jnp.pi * times / 1.5 + j))
+        rows.append(random.poisson(keys[j], rate * dt).astype(float))
+    return jnp.stack(rows)  # (n_neurons, n_time)
+
+
+def test_batch_inference_matches_per_neuron_loop(multineuron_counts):
+    """Batched inference with shared hyperparameters equals a per-neuron loop."""
+    dt, variance, lengthscale, mean = 0.1, 1.2, 0.4, 0.0
+    batch = infer_log_rate_batch(
+        multineuron_counts, dt, variance, lengthscale, mean, n_iter=40
+    )
+    assert batch.log_rate_mean.shape == multineuron_counts.shape
+    assert batch.log_marginal_likelihood.shape == (multineuron_counts.shape[0],)
+    for j in range(multineuron_counts.shape[0]):
+        single = infer_log_rate(
+            multineuron_counts[j], dt, variance, lengthscale, mean, n_iter=40
+        )
+        np.testing.assert_allclose(
+            np.asarray(batch.log_rate_mean[j]),
+            np.asarray(single.log_rate_mean),
+            rtol=1e-7,
+            atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            float(batch.log_marginal_likelihood[j]),
+            float(single.log_marginal_likelihood),
+            rtol=1e-7,
+        )
+
+
+def test_batch_inference_per_neuron_hyperparameters(multineuron_counts):
+    """Per-neuron (n_neurons,) hyperparameters route to the matching single fit."""
+    n_neurons = multineuron_counts.shape[0]
+    dt = 0.1
+    variance = jnp.linspace(0.8, 1.6, n_neurons)
+    lengthscale = jnp.linspace(0.2, 0.6, n_neurons)
+    mean = jnp.linspace(-0.2, 0.4, n_neurons)
+    batch = infer_log_rate_batch(
+        multineuron_counts, dt, variance, lengthscale, mean, n_iter=40
+    )
+    for j in range(n_neurons):
+        single = infer_log_rate(
+            multineuron_counts[j],
+            dt,
+            float(variance[j]),
+            float(lengthscale[j]),
+            float(mean[j]),
+            n_iter=40,
+        )
+        np.testing.assert_allclose(
+            np.asarray(batch.log_rate_mean[j]),
+            np.asarray(single.log_rate_mean),
+            rtol=1e-7,
+            atol=1e-7,
+        )
+
+
+def test_batch_inference_rejects_wrong_hyperparameter_length(multineuron_counts):
+    with pytest.raises(ValueError, match="n_neurons"):
+        infer_log_rate_batch(
+            multineuron_counts, 0.1, jnp.array([1.0, 1.0]), 0.4, 0.0, n_iter=10
+        )
+
+
+def test_fit_sgd_multineuron_shared_shapes(multineuron_counts):
+    n_neurons = multineuron_counts.shape[0]
+    model = TemporalRateGP(dt=0.1, variance=1.0, lengthscale=0.4, mean=0.0, n_iter=12)
+    model.fit_sgd(multineuron_counts, num_steps=4)
+    # Shared variance/lengthscale are scalars; baseline mean is per-neuron.
+    assert np.ndim(model.variance_) == 0
+    assert np.ndim(model.lengthscale_) == 0
+    assert np.asarray(model.mean_).shape == (n_neurons,)
+    rate = model.predict_rate()
+    assert rate.shape == multineuron_counts.shape
+    assert bool(jnp.all(rate > 0.0))
+
+
+def test_fit_sgd_multineuron_per_neuron_hyperparameters(multineuron_counts):
+    n_neurons = multineuron_counts.shape[0]
+    model = TemporalRateGP(
+        dt=0.1,
+        variance=1.0,
+        lengthscale=0.4,
+        n_iter=12,
+        share_hyperparameters=False,
+    )
+    model.fit_sgd(multineuron_counts, num_steps=4)
+    assert np.asarray(model.variance_).shape == (n_neurons,)
+    assert np.asarray(model.lengthscale_).shape == (n_neurons,)
+
+
+def test_single_neuron_path_unchanged_by_batch_support(small_counts):
+    """A 1D fit still yields scalar hyperparameters and a 1D rate."""
+    model = TemporalRateGP(dt=0.1, variance=1.0, lengthscale=0.4, n_iter=12)
+    model.fit_sgd(small_counts, num_steps=4)
+    assert np.ndim(model.variance_) == 0
+    assert model.predict_rate().shape == small_counts.shape
+
+
+@pytest.mark.slow
+def test_fit_sgd_multineuron_shared_recovers_lengthscale():
+    """Pooling neurons with a shared lengthscale recovers the true value."""
+    lengthscale_true, variance_true = 0.3, 1.0
+    n_neurons, n_time, dt, baseline = 6, 400, 0.02, 2.0
+    rows = []
+    for j in range(n_neurons):
+        latent = _sample_matern32_latent(
+            n_time, dt, variance_true, lengthscale_true, seed=j
+        )
+        rng = np.random.default_rng(100 + j)
+        rows.append(rng.poisson(np.exp(baseline + latent) * dt).astype(float))
+    counts = jnp.asarray(np.stack(rows))
+
+    model = TemporalRateGP(
+        dt=dt,
+        variance=1.0,
+        lengthscale=lengthscale_true * 4.0,
+        mean=baseline,
+        n_iter=15,
+    )
+    log_likelihoods = model.fit_sgd(counts, num_steps=100)
+    assert log_likelihoods[-1] > log_likelihoods[0]
     assert 0.4 * lengthscale_true < float(model.lengthscale_) < 3.0 * lengthscale_true
