@@ -23,6 +23,7 @@ from state_space_practice.coupling_model import (
     interleave_coupling,
     logit,
     smooth_latent_from_lfp,
+    validate_coupling_observations,
     validate_coupling_params,
 )
 from state_space_practice.simulate_coupling import simulate_coupling
@@ -342,4 +343,136 @@ class TestValidation:
         with pytest.raises(ValueError, match="lfp_noise_var"):
             validate_coupling_params(
                 coupling_params_small._replace(lfp_noise_var=float("inf"))
+            )
+
+    def test_rejects_complex_coupling(self, coupling_params_small):
+        # complex coupling is meaningless here (magnitude/phase live in the
+        # real/imag *pair*), and would silently corrupt every logit; reject it.
+        bad = coupling_params_small._replace(
+            beta_real=coupling_params_small.beta_real.astype(complex)
+        )
+        with pytest.raises(ValueError, match="real-valued"):
+            validate_coupling_params(bad)
+
+
+@pytest.fixture
+def valid_obs():
+    """A minimal valid ``(spikes, lfp)`` pair: T=3 bins, S=2 neurons, n_latent=2.
+
+    Shared by :class:`TestValidateCouplingObservations` so each raise-path test
+    perturbs one field of a known-good input rather than rebuilding it.
+    """
+    n_neurons, n_latent = 2, 2
+    spikes = jnp.array([[0.0, 1.0], [1.0, 0.0], [0.0, 0.0]])  # (T, S)
+    lfp = jnp.array([[0.1, -0.2], [0.3, 0.4], [-0.5, 0.6]])  # (T, n_latent)
+    return spikes, lfp, n_neurons, n_latent
+
+
+class TestValidateCouplingObservations:
+    """Cover the estimator input validator (used by coupling_ekf and coupling_pg).
+
+    It is the gate that keeps malformed spikes/LFP out of the coupling estimators;
+    a silent bad-input bug here would surface as garbage coupling estimates, not a
+    crash, so every raise path needs a test.
+    """
+
+    def test_accepts_and_returns_float_arrays(self, valid_obs):
+        spikes, lfp, n_neurons, n_latent = valid_obs
+        out_spikes, out_lfp = validate_coupling_observations(
+            spikes, lfp, n_neurons=n_neurons, n_latent=n_latent
+        )
+        # guard: good input passes, values are preserved and returned as float.
+        assert np.issubdtype(out_spikes.dtype, np.floating)
+        assert np.issubdtype(out_lfp.dtype, np.floating)
+        np.testing.assert_array_equal(out_spikes, np.asarray(spikes, dtype=float))
+        np.testing.assert_array_equal(out_lfp, np.asarray(lfp, dtype=float))
+
+    def test_accepts_boolean_spikes(self, valid_obs):
+        """Boolean spike masks are a distinct accepted dtype, cast to 0.0/1.0."""
+        _, lfp, n_neurons, n_latent = valid_obs
+        bool_spikes = np.array(
+            [[True, False], [False, True], [False, False]], dtype=bool
+        )
+        out_spikes, _ = validate_coupling_observations(
+            bool_spikes, lfp, n_neurons=n_neurons, n_latent=n_latent
+        )
+        np.testing.assert_array_equal(out_spikes, bool_spikes.astype(float))
+
+    def test_rejects_wrong_neuron_count(self, valid_obs):
+        spikes, lfp, n_neurons, n_latent = valid_obs
+        with pytest.raises(ValueError, match="spikes"):
+            validate_coupling_observations(
+                spikes, lfp, n_neurons=n_neurons + 1, n_latent=n_latent
+            )
+
+    def test_rejects_1d_spikes(self, valid_obs):
+        _, lfp, n_neurons, n_latent = valid_obs
+        with pytest.raises(ValueError, match="spikes"):
+            validate_coupling_observations(
+                jnp.zeros(3), lfp, n_neurons=n_neurons, n_latent=n_latent
+            )
+
+    def test_rejects_empty_time(self, valid_obs):
+        _, _, n_neurons, n_latent = valid_obs
+        with pytest.raises(ValueError, match="at least one time bin"):
+            validate_coupling_observations(
+                jnp.zeros((0, n_neurons)),
+                jnp.zeros((0, n_latent)),
+                n_neurons=n_neurons,
+                n_latent=n_latent,
+            )
+
+    def test_rejects_non_binary_spikes(self, valid_obs):
+        spikes, lfp, n_neurons, n_latent = valid_obs
+        bad = spikes.at[0, 0].set(2.0)  # a count, not a 0/1 indicator
+        with pytest.raises(ValueError, match="0/1"):
+            validate_coupling_observations(
+                bad, lfp, n_neurons=n_neurons, n_latent=n_latent
+            )
+
+    def test_rejects_nonfinite_spikes(self, valid_obs):
+        spikes, lfp, n_neurons, n_latent = valid_obs
+        bad = spikes.at[0, 0].set(jnp.nan)
+        with pytest.raises(ValueError, match="0/1"):
+            validate_coupling_observations(
+                bad, lfp, n_neurons=n_neurons, n_latent=n_latent
+            )
+
+    def test_rejects_complex_spikes(self, valid_obs):
+        _, lfp, n_neurons, n_latent = valid_obs
+        bad = np.zeros((3, n_neurons), dtype=complex)
+        with pytest.raises(ValueError, match="0/1"):
+            validate_coupling_observations(
+                bad, lfp, n_neurons=n_neurons, n_latent=n_latent
+            )
+
+    def test_rejects_wrong_lfp_latent_dim(self, valid_obs):
+        spikes, lfp, n_neurons, n_latent = valid_obs
+        with pytest.raises(ValueError, match="lfp"):
+            validate_coupling_observations(
+                spikes, lfp, n_neurons=n_neurons, n_latent=n_latent + 1
+            )
+
+    def test_rejects_lfp_time_mismatch(self, valid_obs):
+        spikes, _, n_neurons, n_latent = valid_obs
+        short_lfp = jnp.zeros((spikes.shape[0] - 1, n_latent))
+        with pytest.raises(ValueError, match="lfp"):
+            validate_coupling_observations(
+                spikes, short_lfp, n_neurons=n_neurons, n_latent=n_latent
+            )
+
+    def test_rejects_nonfinite_lfp(self, valid_obs):
+        spikes, lfp, n_neurons, n_latent = valid_obs
+        bad = lfp.at[0, 0].set(jnp.inf)
+        with pytest.raises(ValueError, match="lfp"):
+            validate_coupling_observations(
+                spikes, bad, n_neurons=n_neurons, n_latent=n_latent
+            )
+
+    def test_rejects_complex_lfp(self, valid_obs):
+        spikes, _, n_neurons, n_latent = valid_obs
+        bad = np.zeros((spikes.shape[0], n_latent), dtype=complex)
+        with pytest.raises(ValueError, match="lfp"):
+            validate_coupling_observations(
+                spikes, bad, n_neurons=n_neurons, n_latent=n_latent
             )
