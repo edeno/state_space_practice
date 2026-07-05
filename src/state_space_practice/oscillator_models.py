@@ -68,6 +68,7 @@ from state_space_practice.utils import (
     check_converged,
     make_discrete_transition_matrix,
     shift_to_psd,
+    stabilize_transition_matrix,
     validate_covariance,
 )
 
@@ -110,23 +111,15 @@ def _reject_forced_update_flags(model_name: str, kwargs: dict) -> None:
         )
 
 
-def _stabilize_transition_matrix(A: ArrayLike, max_spectral_radius: float = 0.99) -> Array:
+def _stabilize_transition_matrix(
+    A: ArrayLike, max_spectral_radius: float = 0.99
+) -> Array:
     """Scale a transition matrix so its spectral radius is <= the bound.
 
-    Eigenvalues are computed on host with NumPy: ``jnp.linalg.eigvals`` (the
-    general, non-symmetric decomposition) has no GPU/TPU lowering, and callers
-    run this in eager per-state Python loops -- not under a JIT trace -- so a
-    host computation is both safe and portable across accelerator backends.
+    Thin wrapper over :func:`state_space_practice.utils.stabilize_transition_matrix`;
+    kept for the eager per-state stability clamp in oscillator model M-steps.
     """
-    import numpy as np_cpu
-
-    A_arr = jnp.asarray(A)
-    spectral_radius = float(
-        np_cpu.max(np_cpu.abs(np_cpu.linalg.eigvals(np_cpu.asarray(A_arr))))
-    )
-    if spectral_radius > max_spectral_radius:
-        return A_arr * (max_spectral_radius / spectral_radius)
-    return A_arr
+    return stabilize_transition_matrix(A, max_spectral_radius=max_spectral_radius)
 
 
 class BaseModel(ABC, SGDFittableMixin):
@@ -193,15 +186,25 @@ class BaseModel(ABC, SGDFittableMixin):
     """
 
     _EM_SNAPSHOT_KEYS = (
-        "smoother_state_cond_mean", "smoother_state_cond_cov",
-        "smoother_discrete_state_prob", "smoother_joint_discrete_state_prob",
-        "smoother_pair_cond_cross_cov", "smoother_pair_cond_means",
-        "continuous_transition_matrix", "process_cov",
-        "measurement_matrix", "measurement_cov",
-        "init_mean", "init_cov",
-        "init_discrete_state_prob", "discrete_transition_matrix",
-        "freqs", "damping_coef", "process_variance",
-        "phase_difference", "coupling_strength",
+        "smoother_state_cond_mean",
+        "smoother_state_cond_cov",
+        "smoother_discrete_state_prob",
+        "smoother_joint_discrete_state_prob",
+        "smoother_pair_cond_cross_cov",
+        "smoother_pair_cond_means",
+        "continuous_transition_matrix",
+        "process_cov",
+        "measurement_matrix",
+        "measurement_cov",
+        "init_mean",
+        "init_cov",
+        "init_discrete_state_prob",
+        "discrete_transition_matrix",
+        "freqs",
+        "damping_coef",
+        "process_variance",
+        "phase_difference",
+        "coupling_strength",
         "_current_osc_params",
     )
 
@@ -222,9 +225,7 @@ class BaseModel(ABC, SGDFittableMixin):
         update_init_cov: bool = True,
     ):
         if sampling_freq <= 0:
-            raise ValueError(
-                f"sampling_freq must be positive. Got {sampling_freq}."
-            )
+            raise ValueError(f"sampling_freq must be positive. Got {sampling_freq}.")
         self.n_oscillators = n_oscillators
         self.n_discrete_states = n_discrete_states
         self.n_sources = n_sources
@@ -249,9 +250,7 @@ class BaseModel(ABC, SGDFittableMixin):
             # (e.g. p_stay ~= 0.999 at 1000 Hz) instead of flattening every
             # rate above 20 Hz to 0.95 (a 20-sample = 20 ms dwell at 1000 Hz).
             p_stay = min(p_stay, 1.0 - 1e-6)
-            self.discrete_transition_diag = jnp.full(
-                (n_discrete_states,), p_stay
-            )
+            self.discrete_transition_diag = jnp.full((n_discrete_states,), p_stay)
         else:
             diag = jnp.asarray(discrete_transition_diag)
             if diag.shape != (n_discrete_states,):
@@ -264,17 +263,21 @@ class BaseModel(ABC, SGDFittableMixin):
                     "discrete_transition_diag must contain only finite values."
                 )
             if bool(jnp.any((diag < 0) | (diag > 1))):
-                raise ValueError(
-                    "discrete_transition_diag entries must lie in [0, 1]."
-                )
+                raise ValueError("discrete_transition_diag entries must lie in [0, 1].")
             self.discrete_transition_diag = diag
 
         # Dirichlet prior for transition matrix (sticky prior)
         from state_space_practice.contingency_belief import get_transition_prior
-        self.transition_prior = get_transition_prior(
-            concentration=1.0, stickiness=stickiness,
-            n_states=n_discrete_states,
-        ) if stickiness > 0 else None
+
+        self.transition_prior = (
+            get_transition_prior(
+                concentration=1.0,
+                stickiness=stickiness,
+                n_states=n_discrete_states,
+            )
+            if stickiness > 0
+            else None
+        )
 
         # Store update flags
         self.update_discrete_transition_matrix = update_discrete_transition_matrix
@@ -372,9 +375,7 @@ class BaseModel(ABC, SGDFittableMixin):
 
         flags_str = ", ".join(f"Update({k})={v}" for k, v in update_flags.items())
 
-        return (
-            f"<{self.__class__.__name__}: " f"{', '.join(params)}, " f"[{flags_str}]>"
-        )
+        return f"<{self.__class__.__name__}: {', '.join(params)}, [{flags_str}]>"
 
     def decode(self) -> jax.Array:
         """Return the most likely discrete state at each time step.
@@ -389,8 +390,10 @@ class BaseModel(ABC, SGDFittableMixin):
         RuntimeError
             If called before fit() or fit_sgd().
         """
-        if not hasattr(self, "smoother_discrete_state_prob") or \
-           self.smoother_discrete_state_prob is None:
+        if (
+            not hasattr(self, "smoother_discrete_state_prob")
+            or self.smoother_discrete_state_prob is None
+        ):
             raise RuntimeError(
                 "No smoother posteriors available. Call fit() or fit_sgd() and "
                 "ensure it produced a finite log-likelihood before decode()."
@@ -410,8 +413,10 @@ class BaseModel(ABC, SGDFittableMixin):
         RuntimeError
             If called before fit() or fit_sgd().
         """
-        if not hasattr(self, "smoother_discrete_state_prob") or \
-           self.smoother_discrete_state_prob is None:
+        if (
+            not hasattr(self, "smoother_discrete_state_prob")
+            or self.smoother_discrete_state_prob is None
+        ):
             raise RuntimeError(
                 "No smoother posteriors available. Call fit() or fit_sgd() and "
                 "ensure it produced a finite log-likelihood before "
@@ -474,7 +479,8 @@ class BaseModel(ABC, SGDFittableMixin):
         if n_windows < n_states * 2:
             logger.debug(
                 "Warm init skipped: only %d windows for %d states.",
-                n_windows, n_states,
+                n_windows,
+                n_states,
             )
             return None, None, None
 
@@ -522,9 +528,7 @@ class BaseModel(ABC, SGDFittableMixin):
                     state_obs_mean = obs_np.mean(axis=0)
                 per_state_means.append(H_pinv @ state_obs_mean)
 
-            self.init_mean = jnp.stack(
-                [jnp.array(m) for m in per_state_means], axis=1
-            )
+            self.init_mean = jnp.stack([jnp.array(m) for m in per_state_means], axis=1)
 
         # Data-informed init_cov scaled to observation variance
         obs_var = np_cpu.var(obs_np, axis=0).mean()
@@ -816,9 +820,7 @@ class BaseModel(ABC, SGDFittableMixin):
     def _measurement_covariance_from_params(self, params: dict) -> Array:
         """Get the shared observation covariance stack for SGD losses."""
         if "measurement_cov" in params:
-            return self._stack_shared_measurement_covariance(
-                params["measurement_cov"]
-            )
+            return self._stack_shared_measurement_covariance(params["measurement_cov"])
         return self.measurement_cov
 
     def _store_shared_measurement_covariance(self, params: dict) -> None:
@@ -838,10 +840,7 @@ class BaseModel(ABC, SGDFittableMixin):
         """
         state_weights = jnp.sum(self.smoother_discrete_state_prob, axis=0)
         total_weight = jnp.maximum(jnp.sum(state_weights), 1e-12)
-        pooled = (
-            jnp.einsum("j,abj->ab", state_weights, per_state_cov)
-            / total_weight
-        )
+        pooled = jnp.einsum("j,abj->ab", state_weights, per_state_cov) / total_weight
         pooled = 0.5 * (pooled + pooled.T)
         return self._stack_shared_measurement_covariance(pooled)
 
@@ -939,9 +938,7 @@ class BaseModel(ABC, SGDFittableMixin):
                     break
 
                 if is_converged:
-                    logger.info(
-                        f"Converged after {iteration + 1} iterations."
-                    )
+                    logger.info(f"Converged after {iteration + 1} iterations.")
                     self.converged_ = True
                     break
 
@@ -1053,8 +1050,10 @@ class BaseModel(ABC, SGDFittableMixin):
         return self._sgd_n_time
 
     def _check_sgd_initialized(self) -> None:
-        if not hasattr(self, "continuous_transition_matrix") or \
-           self.continuous_transition_matrix is None:
+        if (
+            not hasattr(self, "continuous_transition_matrix")
+            or self.continuous_transition_matrix is None
+        ):
             raise RuntimeError(
                 "Call fit_sgd(observations, key=...) to initialize parameters."
             )
@@ -1089,8 +1088,10 @@ class BaseModel(ABC, SGDFittableMixin):
         if not any(k.startswith(f"{prefix}_") for k in params):
             return fallback
         return jnp.stack(
-            [params.get(f"{prefix}_{j}", fallback[..., j])
-             for j in range(self.n_discrete_states)],
+            [
+                params.get(f"{prefix}_{j}", fallback[..., j])
+                for j in range(self.n_discrete_states)
+            ],
             axis=-1,
         )
 
@@ -1159,7 +1160,7 @@ class CommonOscillatorModel(BaseModel):
             )
         if measurement_variance <= 0:
             raise ValueError(
-                "measurement_variance must be positive. " f"Got {measurement_variance}."
+                f"measurement_variance must be positive. Got {measurement_variance}."
             )
         self.measurement_variance = measurement_variance
 
@@ -1439,7 +1440,7 @@ class CorrelatedNoiseModel(BaseModel):
             )
         if measurement_variance <= 0:
             raise ValueError(
-                "measurement_variance must be positive. " f"Got {measurement_variance}."
+                f"measurement_variance must be positive. Got {measurement_variance}."
             )
         phase_difference, coupling_strength = (
             canonicalize_correlated_noise_pair_parameters(
@@ -1633,7 +1634,8 @@ class CorrelatedNoiseModel(BaseModel):
         # Vectorize Q construction over discrete states (last axis)
         Q = jax.vmap(
             construct_correlated_noise_process_covariance,
-            in_axes=(-1, -1, -1), out_axes=-1,
+            in_axes=(-1, -1, -1),
+            out_axes=-1,
         )(proc_var, phase_diff, coupling)
         # coupling_strength is UNCONSTRAINED, so SGD can propose a coupling that
         # makes the reconstructed Q indefinite, which NaN-poisons the filter and
@@ -1672,14 +1674,16 @@ class CorrelatedNoiseModel(BaseModel):
         # shift the SGD loss used (coupling_strength is UNCONSTRAINED, so the raw
         # reconstruction can be indefinite). Matching the loss's projection keeps
         # the stored process_cov identical to what the optimizer evaluated.
-        if any(k in params for k in ("process_variance", "phase_difference", "coupling_strength")):
+        if any(
+            k in params
+            for k in ("process_variance", "phase_difference", "coupling_strength")
+        ):
             Q_raw = jax.vmap(
                 construct_correlated_noise_process_covariance,
-                in_axes=(-1, -1, -1), out_axes=-1,
+                in_axes=(-1, -1, -1),
+                out_axes=-1,
             )(self.process_variance, self.phase_difference, self.coupling_strength)
-            self.process_cov = jax.vmap(
-                shift_to_psd, in_axes=-1, out_axes=-1
-            )(Q_raw)
+            self.process_cov = jax.vmap(shift_to_psd, in_axes=-1, out_axes=-1)(Q_raw)
             self._sync_process_covariance_params()
         self._store_shared_measurement_covariance(params)
         self.init_cov = self._reconstruct_per_state_array(
@@ -1764,7 +1768,7 @@ class DirectedInfluenceModel(BaseModel):
             )
         if measurement_variance <= 0:
             raise ValueError(
-                "measurement_variance must be positive. " f"Got {measurement_variance}."
+                f"measurement_variance must be positive. Got {measurement_variance}."
             )
         self.measurement_variance = measurement_variance
 
@@ -2162,7 +2166,8 @@ class DirectedInfluenceModel(BaseModel):
         """
         self._connectivity_penalty = connectivity_penalty
         return super().fit_sgd(
-            observations, key=key,
+            observations,
+            key=key,
             optimizer=optimizer,
             num_steps=num_steps,
             verbose=verbose,
@@ -2177,11 +2182,14 @@ class DirectedInfluenceModel(BaseModel):
         # Vectorize A construction over discrete states (last axis)
         A = jax.vmap(
             lambda pd, cs: construct_directed_influence_transition_matrix(
-                freqs=self.freqs, damping_coeffs=self.damping_coef,
-                phase_diffs=pd, coupling_strengths=cs,
+                freqs=self.freqs,
+                damping_coeffs=self.damping_coef,
+                phase_diffs=pd,
+                coupling_strengths=cs,
                 sampling_freq=self.sampling_freq,
             ),
-            in_axes=(-1, -1), out_axes=-1,
+            in_axes=(-1, -1),
+            out_axes=-1,
         )(phase_diff, coupling)
 
         Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
@@ -2208,10 +2216,12 @@ class DirectedInfluenceModel(BaseModel):
             from state_space_practice.oscillator_regularization import (
                 total_connectivity_penalty,
             )
+
             # coupling shape: (n_osc, n_osc, n_states) → (n_states, n_osc, n_osc)
             coupling_transposed = jnp.moveaxis(coupling, -1, 0)
             base_loss = base_loss + total_connectivity_penalty(
-                coupling_transposed, penalty_config,
+                coupling_transposed,
+                penalty_config,
                 n_timesteps=self._n_timesteps,
             )
 
@@ -2224,21 +2234,22 @@ class DirectedInfluenceModel(BaseModel):
         if "coupling_strength" in params:
             self.coupling_strength = params["coupling_strength"]
         diag_idx = jnp.arange(self.n_oscillators)
-        self.phase_difference = self.phase_difference.at[
-            diag_idx, diag_idx, :
-        ].set(0.0)
-        self.coupling_strength = self.coupling_strength.at[
-            diag_idx, diag_idx, :
-        ].set(0.0)
+        self.phase_difference = self.phase_difference.at[diag_idx, diag_idx, :].set(0.0)
+        self.coupling_strength = self.coupling_strength.at[diag_idx, diag_idx, :].set(
+            0.0
+        )
         # Reconstruct A from updated scientific params
         if "phase_difference" in params or "coupling_strength" in params:
             self.continuous_transition_matrix = jax.vmap(
                 lambda pd, cs: construct_directed_influence_transition_matrix(
-                    freqs=self.freqs, damping_coeffs=self.damping_coef,
-                    phase_diffs=pd, coupling_strengths=cs,
+                    freqs=self.freqs,
+                    damping_coeffs=self.damping_coef,
+                    phase_diffs=pd,
+                    coupling_strengths=cs,
                     sampling_freq=self.sampling_freq,
                 ),
-                in_axes=(-1, -1), out_axes=-1,
+                in_axes=(-1, -1),
+                out_axes=-1,
             )(self.phase_difference, self.coupling_strength)
         self._store_shared_measurement_covariance(params)
         self.init_cov = self._reconstruct_per_state_array(

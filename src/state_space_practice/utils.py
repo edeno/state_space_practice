@@ -45,6 +45,54 @@ def symmetrize(A: jax.Array) -> jax.Array:
     return 0.5 * (A + jnp.swapaxes(A, -1, -2))
 
 
+def psd_cholesky(
+    A: jax.Array,
+    diagonal_boost: float = 1e-9,
+    relative_boost: float = 1e-12,
+) -> tuple[jax.Array, bool]:
+    """Stabilized Cholesky factor of a PSD matrix.
+
+    Symmetrizes ``A`` and adds the same ``max(diagonal_boost,
+    relative_boost * max|diag(A)|)`` shift as :func:`psd_solve` before
+    factoring, then returns the ``(factor, lower)`` pair accepted by
+    :func:`jax.scipy.linalg.cho_solve`. Sharing one factorization lets a
+    caller reuse it for a linear solve, a quadratic form, and a
+    log-determinant instead of factoring the same matrix several times --
+    and guarantees all three see the *same* stabilized matrix (avoiding a
+    boosted-solve / unboosted-``slogdet`` mismatch on near-singular ``A``).
+
+    See :func:`psd_solve` for the rationale behind the two-part shift.
+
+    Parameters
+    ----------
+    A : jax.Array
+        Coefficient matrix or batch of matrices, expected positive
+        semi-definite. Only the last two axes are treated as the matrix.
+    diagonal_boost : float, optional
+        Absolute floor for the stabilization shift. Default is 1e-9.
+    relative_boost : float, optional
+        Coefficient of ``max|diag(A)|`` for the relative component of the
+        shift. Default is 1e-12. Pass ``0.0`` to disable relative scaling.
+
+    Returns
+    -------
+    tuple[jax.Array, bool]
+        The ``(factor, lower)`` tuple from :func:`jax.scipy.linalg.cho_factor`.
+        The stabilized matrix's log-determinant is
+        ``2 * sum(log(abs(diag(factor))))``.
+    """
+    A_sym = symmetrize(A)
+    n = A.shape[-1]
+    diag_abs = jnp.abs(jnp.diagonal(A_sym, axis1=-2, axis2=-1))
+    max_diag = jnp.max(diag_abs, axis=-1)
+    effective_boost = jnp.maximum(
+        jnp.asarray(diagonal_boost, dtype=A.dtype),
+        jnp.asarray(relative_boost, dtype=A.dtype) * max_diag,
+    )
+    A_stabilized = A_sym + effective_boost[..., None, None] * jnp.eye(n, dtype=A.dtype)
+    return jax.scipy.linalg.cho_factor(A_stabilized)
+
+
 def psd_solve(
     A: jax.Array,
     b: jax.Array,
@@ -112,32 +160,19 @@ def psd_solve(
         The solution x to the linear system Ax = b.
 
     """
-    A_sym = symmetrize(A)
-    n = A.shape[-1]
-    # Use the maximum absolute diagonal entry as the reference scale for
-    # the relative boost. For PSD matrices this is a tight bound on the
-    # largest eigenvalue; for slightly non-PSD matrices (floating-point
-    # drift) it is still a reasonable scale reference.
-    diag_abs = jnp.abs(jnp.diagonal(A_sym, axis1=-2, axis2=-1))
-    max_diag = jnp.max(diag_abs, axis=-1)
-    effective_boost = jnp.maximum(
-        jnp.asarray(diagonal_boost, dtype=A.dtype),
-        jnp.asarray(relative_boost, dtype=A.dtype) * max_diag,
-    )
-    A_stabilized = A_sym + effective_boost[..., None, None] * jnp.eye(
-        n, dtype=A.dtype
-    )
-    # Solve via an explicit Cholesky factor + cho_solve rather than
-    # jax.scipy.linalg.solve(assume_a="pos"). cho_solve deprecates a batch of
-    # 1D right-hand sides passed as b.ndim > 1 (ambiguous against a single 2D
-    # RHS), so give each system an explicit trailing solve axis -- exactly the
-    # b[..., None] ... .squeeze(-1) pattern the deprecation recommends -- and
-    # drop it again. The non-batched vector path is numerically unchanged, and
-    # 2D matrix right-hand sides (all internal callers) are untouched.
+    # Factor the symmetrized, diagonally-shifted matrix once (see
+    # :func:`psd_cholesky` for the shift). Solve via an explicit Cholesky
+    # factor + cho_solve rather than jax.scipy.linalg.solve(assume_a="pos").
+    # cho_solve deprecates a batch of 1D right-hand sides passed as b.ndim > 1
+    # (ambiguous against a single 2D RHS), so give each system an explicit
+    # trailing solve axis -- exactly the b[..., None] ... .squeeze(-1) pattern
+    # the deprecation recommends -- and drop it again. The non-batched vector
+    # path is numerically unchanged, and 2D matrix right-hand sides (all
+    # internal callers) are untouched.
+    cho = psd_cholesky(A, diagonal_boost=diagonal_boost, relative_boost=relative_boost)
     b = jnp.asarray(b)
-    rhs_is_vector = b.ndim == A_stabilized.ndim - 1
+    rhs_is_vector = b.ndim == A.ndim - 1
     b_mat = b[..., None] if rhs_is_vector else b
-    cho = jax.scipy.linalg.cho_factor(A_stabilized)
     x = jax.scipy.linalg.cho_solve(cho, b_mat)
     return x[..., 0] if rhs_is_vector else x
 
@@ -214,6 +249,64 @@ def shift_to_psd(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
     lambda_min = jnp.linalg.eigvalsh(cov).min()
     shift = jnp.maximum(min_eigenvalue - lambda_min, 0.0)
     return cov + shift * jnp.eye(cov.shape[-1], dtype=cov.dtype)
+
+
+def spectral_radius(matrix: ArrayLike) -> float:
+    """Largest eigenvalue magnitude of a (possibly non-symmetric) square matrix.
+
+    Computed on host with NumPy: ``jnp.linalg.eigvals`` (the general,
+    non-symmetric eigendecomposition) has no GPU/TPU lowering, so calling it on
+    an accelerator backend raises or forces an implicit host round-trip. Callers
+    use this for eager, post-optimization stability checks -- not inside a JIT
+    trace -- so a host computation is both safe and portable across backends.
+    For symmetric matrices prefer ``jnp.linalg.eigvalsh``, which is accelerated.
+
+    Parameters
+    ----------
+    matrix : ArrayLike, shape (n, n)
+        Square matrix (need not be symmetric).
+
+    Returns
+    -------
+    float
+        ``max_i |lambda_i(matrix)|``, the spectral radius.
+    """
+    eigenvalues = np.linalg.eigvals(np.asarray(matrix))
+    return float(np.max(np.abs(eigenvalues)))
+
+
+def stabilize_transition_matrix(
+    matrix: ArrayLike, max_spectral_radius: float = 0.99
+) -> Array:
+    """Uniformly scale a transition matrix so its spectral radius <= the bound.
+
+    A linear transition ``x_t = A @ x_{t-1} + ...`` is stable only when every
+    eigenvalue of ``A`` lies inside the unit circle. When the spectral radius
+    exceeds ``max_spectral_radius`` the matrix is scaled by
+    ``max_spectral_radius / spectral_radius`` (which scales every eigenvalue by
+    the same factor); otherwise it is returned unchanged.
+
+    The spectral radius is computed on host (see :func:`spectral_radius`), so
+    this is portable across accelerator backends but must be called eagerly,
+    not inside a JIT trace.
+
+    Parameters
+    ----------
+    matrix : ArrayLike, shape (n, n)
+        Transition matrix (need not be symmetric).
+    max_spectral_radius : float, default=0.99
+        Upper bound on the spectral radius.
+
+    Returns
+    -------
+    Array, shape (n, n)
+        The scaled matrix, or the input unchanged if already within the bound.
+    """
+    A = jnp.asarray(matrix)
+    radius = spectral_radius(A)
+    if radius > max_spectral_radius:
+        return A * (max_spectral_radius / radius)
+    return A
 
 
 def debug_print_if(condition: jax.Array, fmt: str, **fmt_kwargs) -> None:
@@ -405,9 +498,7 @@ def _validate_filter_numerics(
         # accumulation model over n_time bins, total roundoff ~
         # sqrt(n_time * n_state) * eps * max_eig.
         f32_eps = 1.2e-7
-        worst_roundoff = (
-            float((n_time * n_state) ** 0.5) * f32_eps * max_eig
-        )
+        worst_roundoff = float((n_time * n_state) ** 0.5) * f32_eps * max_eig
         if worst_roundoff > 0.5 * min_eig:
             warnings.warn(
                 f"{filter_name} running in float32 with "
@@ -504,9 +595,7 @@ def validate_covariance(
         # Symmetry is checked on the RAW matrix: symmetrizing first would let a
         # non-symmetric "covariance" pass undetected (the exact defect that hid
         # in CorrelatedNoiseModel's process covariance).
-        if not bool(
-            jnp.allclose(mat, mat.T, rtol=symmetry_rtol, atol=symmetry_atol)
-        ):
+        if not bool(jnp.allclose(mat, mat.T, rtol=symmetry_rtol, atol=symmetry_atol)):
             asym = float(jnp.max(jnp.abs(mat - mat.T)))
             raise ValueError(
                 f"{where} is not symmetric (max|C - C^T| = {asym:g}). A "
@@ -556,9 +645,7 @@ def validate_transition_matrix(
     """
     arr = jnp.asarray(transition_matrix)
     if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
-        raise ValueError(
-            f"{name} must be a square 2D matrix, got shape {arr.shape}"
-        )
+        raise ValueError(f"{name} must be a square 2D matrix, got shape {arr.shape}")
     # A 0x0 matrix satisfies the square check and makes the non-negativity and
     # row-sum reductions vacuously pass (empty `any` is False, empty `allclose`
     # is True). A transition matrix with no states is never valid.
@@ -767,9 +854,7 @@ def scale_likelihood(log_likelihood: jax.Array) -> tuple[jax.Array, jax.Array]:
     ll_max = jnp.where(jnp.isfinite(finite_ll_max), finite_ll_max, 0.0)
     scaled = jnp.exp(finite_log_likelihood - ll_max)
 
-    posinf_scaled = jnp.asarray(
-        log_likelihood == jnp.inf, dtype=scaled.dtype
-    )
+    posinf_scaled = jnp.asarray(log_likelihood == jnp.inf, dtype=scaled.dtype)
     scaled = jnp.where(has_posinf, posinf_scaled, scaled)
     ll_max = jnp.where(has_posinf, jnp.inf, ll_max)
 
@@ -823,7 +908,9 @@ def check_converged(
         return True, True
 
     eps = np.finfo(float).eps
-    avg_log_likelihood = (np.abs(log_likelihood) + np.abs(previous_log_likelihood) + eps) / 2
+    avg_log_likelihood = (
+        np.abs(log_likelihood) + np.abs(previous_log_likelihood) + eps
+    ) / 2
 
     relative_change = (log_likelihood - previous_log_likelihood) / avg_log_likelihood
     is_increasing = relative_change >= -tolerance
@@ -832,9 +919,7 @@ def check_converged(
     return bool(is_converged), bool(is_increasing)
 
 
-def make_discrete_transition_matrix(
-    diag: Array, n_discrete_states: int
-) -> Array:
+def make_discrete_transition_matrix(diag: Array, n_discrete_states: int) -> Array:
     """Build a row-stochastic transition matrix from diagonal values.
 
     Off-diagonal elements distribute the remaining probability mass
@@ -920,13 +1005,14 @@ def hmm_viterbi(
         return best_next_score, best_next_state
 
     best_second_score, best_next_states = jax.lax.scan(
-        _backward_step, jnp.zeros(num_states), jnp.arange(num_timesteps - 1), reverse=True
+        _backward_step,
+        jnp.zeros(num_states),
+        jnp.arange(num_timesteps - 1),
+        reverse=True,
     )
 
     # Pick the best first state
-    first_state = jnp.argmax(
-        log_initial_probs + log_likelihoods[0] + best_second_score
-    )
+    first_state = jnp.argmax(log_initial_probs + log_likelihoods[0] + best_second_score)
 
     # Forward pass: trace through pointers
     def _forward_step(state, best_next_state):

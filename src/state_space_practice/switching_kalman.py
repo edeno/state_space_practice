@@ -14,7 +14,6 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 from state_space_practice.kalman import (
     _kalman_filter_update,
@@ -27,6 +26,7 @@ from state_space_practice.utils import debug_print_if
 from state_space_practice.utils import divide_safe as _divide_safe
 from state_space_practice.utils import safe_log as _safe_log
 from state_space_practice.utils import scale_likelihood as _scale_likelihood
+from state_space_practice.utils import spectral_radius as _spectral_radius
 from state_space_practice.utils import (
     stabilize_probability_vector as _stabilize_probability_vector,
 )
@@ -249,9 +249,7 @@ def _compute_max_allowed_trace(
         The additive 1.0 prevents the cap from collapsing to zero when filter
         covariances are identically zero.
     """
-    max_filter_trace = jnp.max(
-        jax.vmap(jnp.trace, in_axes=-1)(state_cond_filter_cov)
-    )
+    max_filter_trace = jnp.max(jax.vmap(jnp.trace, in_axes=-1)(state_cond_filter_cov))
     return max_filter_trace * _COV_CAP_MULTIPLIER + 1.0
 
 
@@ -587,11 +585,11 @@ def switching_kalman_filter(
             discrete_transition_matrix,  # P(S_t=j | S_{t-1}=i)
             prev_filter_discrete_prob,  # M_{t-1|t-1}(i)
         )
-        pair_cond_filter_prob = filter_backward_cond_prob * filter_discrete_prob[None, :]
-
-        marginal_log_likelihood += ll_max + _safe_log(
-            predictive_likelihood_term_sum
+        pair_cond_filter_prob = (
+            filter_backward_cond_prob * filter_discrete_prob[None, :]
         )
+
+        marginal_log_likelihood += ll_max + _safe_log(predictive_likelihood_term_sum)
 
         # Collapse pair-conditional Gaussians P(x_t | ..., S_t=j, S_{t-1}=i)
         # over S_{t-1}=i using weights P(S_{t-1}=i | S_t=j, y_{1:t})
@@ -641,13 +639,16 @@ def switching_kalman_filter(
     # jax.lax.scan handles empty inputs (obs[1:] when n_time=1) gracefully.
     # The scan now emits the full pair-conditional filter trajectory as stacked
     # outputs (the GPB2 smoother needs every timestep, not just the last).
-    (_, _, _, marginal_log_likelihood), (
-        rest_state_cond_filter_mean,
-        rest_state_cond_filter_cov,
-        rest_filter_discrete_state_prob,
-        rest_pair_cond_filter_mean,
-        rest_pair_cond_filter_cov,
-        rest_pair_cond_filter_prob,
+    (
+        (_, _, _, marginal_log_likelihood),
+        (
+            rest_state_cond_filter_mean,
+            rest_state_cond_filter_cov,
+            rest_filter_discrete_state_prob,
+            rest_pair_cond_filter_mean,
+            rest_pair_cond_filter_cov,
+            rest_pair_cond_filter_prob,
+        ),
     ) = jax.lax.scan(
         _step,
         (
@@ -751,9 +752,13 @@ def switching_kalman_viterbi(
             pair_cond_filter_cov,
             pair_cond_log_lik,  # (K, K): log p(y_t | y_{1:t-1}, S_{t-1}=i, S_t=j)
         ) = _kalman_filter_update_per_discrete_state_pair(
-            prev_mean, prev_cov, obs_t,
-            continuous_transition_matrix, process_cov,
-            measurement_matrix, measurement_cov,
+            prev_mean,
+            prev_cov,
+            obs_t,
+            continuous_transition_matrix,
+            process_cov,
+            measurement_matrix,
+            measurement_cov,
         )
 
         # Collapse mixture (same as filter) to get state-conditional
@@ -769,20 +774,21 @@ def switching_kalman_viterbi(
             prev_prob,
         )
 
-        state_cond_mean, state_cond_cov = (
-            collapse_gaussian_mixture_per_discrete_state(
-                pair_cond_filter_mean,
-                pair_cond_filter_cov,
-                backward_cond_prob,
-            )
+        state_cond_mean, state_cond_cov = collapse_gaussian_mixture_per_discrete_state(
+            pair_cond_filter_mean,
+            pair_cond_filter_cov,
+            backward_cond_prob,
         )
 
         return (state_cond_mean, state_cond_cov, filter_prob), pair_cond_log_lik
 
     _, pair_log_liks = jax.lax.scan(
         _step,
-        (first_state_cond_mean, first_state_cond_cov,
-         _stabilize_probability_vector(first_discrete_prob)),
+        (
+            first_state_cond_mean,
+            first_state_cond_cov,
+            _stabilize_probability_vector(first_discrete_prob),
+        ),
         obs[1:],
     )
     # pair_log_liks: (T-1, K, K) where entry (t, i, j) is
@@ -950,9 +956,7 @@ def _update_smoother_discrete_probabilities(
     # Discrete smoother prob
     # P(S_t = j, S_{t+1} = k | y_{1:T})
     # Unnormalized joint P(S_t=j) * P(S_{t+1}=k | S_t=j)
-    unnormalized = (
-        filter_discrete_prob[:, None] * discrete_state_transition_matrix
-    )
+    unnormalized = filter_discrete_prob[:, None] * discrete_state_transition_matrix
     # Normalize columns to get P(S_t=j | S_{t+1}=k, y_{1:t})
     smoother_backward_cond_prob = _divide_safe(
         unnormalized, jnp.sum(unnormalized, axis=0)
@@ -1102,9 +1106,7 @@ def switching_kalman_smoother(
         # sequences (where growth reaches 10^100+).
         max_allowed_trace = _compute_max_allowed_trace(state_cond_filter_cov)
 
-        _warn_if_cov_cap_engaged(
-            pair_cond_smoother_covs, max_allowed_trace, "GPB1"
-        )
+        _warn_if_cov_cap_engaged(pair_cond_smoother_covs, max_allowed_trace, "GPB1")
         _cap = partial(_cap_covariance_trace, max_allowed_trace=max_allowed_trace)
         pair_cond_smoother_covs = jax.vmap(
             jax.vmap(_cap, in_axes=-1, out_axes=-1),
@@ -1212,16 +1214,19 @@ def switching_kalman_smoother(
         last_filter_conditional_cont_mean,  # shape (n_cont_states, n_discrete_states, n_discrete_states)
     )
 
-    _, (
-        overall_smoother_mean,
-        overall_smoother_covs,
-        smoother_discrete_state_prob,
-        smoother_joint_discrete_state_prob,
-        overall_smoother_cross_cov,
-        state_cond_smoother_means,
-        state_cond_smoother_covs,
-        pair_cond_smoother_cross_covs,
-        pair_cond_smoother_means,
+    (
+        _,
+        (
+            overall_smoother_mean,
+            overall_smoother_covs,
+            smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob,
+            overall_smoother_cross_cov,
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+            pair_cond_smoother_cross_covs,
+            pair_cond_smoother_means,
+        ),
     ) = jax.lax.scan(
         _step,
         init_carry,
@@ -1402,9 +1407,7 @@ def switching_kalman_smoother_gpb2(
         )
         _cap = partial(_cap_covariance_trace, max_allowed_trace=max_allowed)
         triple_cov = jax.vmap(
-            jax.vmap(
-                jax.vmap(_cap, in_axes=-1, out_axes=-1), in_axes=-1, out_axes=-1
-            ),
+            jax.vmap(jax.vmap(_cap, in_axes=-1, out_axes=-1), in_axes=-1, out_axes=-1),
             in_axes=-1,
             out_axes=-1,
         )(triple_cov)
@@ -1528,9 +1531,7 @@ def switching_kalman_smoother_gpb2(
         # arrays store the un-stabilized value for joint/marginal consistency.
         stabilized_pair_smoother_prob = _stabilize_probability_vector(
             pair_smoother_prob_prev.reshape(-1)
-        ).reshape(
-            pair_smoother_prob_prev.shape
-        )
+        ).reshape(pair_smoother_prob_prev.shape)
 
         return (
             carry_pair_cond_mean,  # E[x_t | S_{t-1}=i, S_t=j] — next carry
@@ -1559,18 +1560,21 @@ def switching_kalman_smoother_gpb2(
         pair_cond_filter_prob[-1],
     )
 
-    _, (
-        overall_smoother_mean,
-        overall_smoother_covs,
-        smoother_discrete_state_prob,
-        smoother_joint_discrete_state_prob,
-        overall_smoother_cross_cov,
-        state_cond_smoother_means,
-        state_cond_smoother_covs,
-        pair_cond_smoother_cross_covs,
-        pair_cond_smoother_means,
-        pair_cond_smoother_covs_mstep,
-        next_pair_cond_smoother_means,
+    (
+        _,
+        (
+            overall_smoother_mean,
+            overall_smoother_covs,
+            smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob,
+            overall_smoother_cross_cov,
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+            pair_cond_smoother_cross_covs,
+            pair_cond_smoother_means,
+            pair_cond_smoother_covs_mstep,
+            next_pair_cond_smoother_means,
+        ),
     ) = jax.lax.scan(
         _step,
         init_carry,
@@ -1880,9 +1884,7 @@ def switching_kalman_maximization_step(
                 )
         transition_pseudo_counts = transition_prior - 1.0
     else:
-        transition_pseudo_counts = jnp.zeros(
-            (n_discrete_states, n_discrete_states)
-        )
+        transition_pseudo_counts = jnp.zeros((n_discrete_states, n_discrete_states))
 
     return _switching_kalman_m_step_inner(
         obs,
@@ -2149,7 +2151,10 @@ def _compute_posterior_entropy_reference(
 
 
 def _weighted_gaussian_log_prob(
-    mean: jax.Array, cov: jax.Array, smoother_mean: jax.Array, smoother_cov: jax.Array,
+    mean: jax.Array,
+    cov: jax.Array,
+    smoother_mean: jax.Array,
+    smoother_cov: jax.Array,
     n_cont_states: int,
 ) -> jax.Array:
     """Log N(smoother_mean; mean, cov) including the expected covariance term."""
@@ -2203,9 +2208,9 @@ def compute_expected_complete_log_likelihood(
             mean_j, cov_j, sm_j, sc_j, n_cont_states
         )
     )(
-        init_state_cond_mean.T,                          # (K, n)
-        jnp.moveaxis(init_state_cond_cov, -1, 0),       # (K, n, n)
-        state_cond_smoother_means[0].T,                  # (K, n)
+        init_state_cond_mean.T,  # (K, n)
+        jnp.moveaxis(init_state_cond_cov, -1, 0),  # (K, n, n)
+        state_cond_smoother_means[0].T,  # (K, n)
         jnp.moveaxis(state_cond_smoother_covs[0], -1, 0),  # (K, n, n)
     )  # (K,)
     log_init_cont = jnp.sum(smoother_discrete_state_prob[0] * log_probs_init)
@@ -2258,8 +2263,9 @@ def compute_expected_complete_log_likelihood(
         + smoother_joint_discrete_state_prob.shape[1:],
     )
 
-    def _cont_trans_log_prob_single(weight, m_t_ij, m_t1_ij, V_t_ij, V_t1_ij,
-                                     cross_cov_ij, A_j, Q_j, log_det_Q):
+    def _cont_trans_log_prob_single(
+        weight, m_t_ij, m_t1_ij, V_t_ij, V_t1_ij, cross_cov_ij, A_j, Q_j, log_det_Q
+    ):
         """Log-prob for a single (t, i, j) triple."""
         E_xt1_xt1 = V_t1_ij + jnp.outer(m_t1_ij, m_t1_ij)
         E_xt_xt = V_t_ij + jnp.outer(m_t_ij, m_t_ij)
@@ -2294,25 +2300,36 @@ def compute_expected_complete_log_likelihood(
         cross_cov_j: (T-1, n, n, K_i)
         """
         log_det_Q = jnp.linalg.slogdet(Q_j)[1]
-        return jnp.sum(_over_ti(
-            weights_j, m_t_j, m_t1_j, V_t_j, V_t1_j, cross_cov_j,
-            A_j, Q_j, log_det_Q,
-        ))
+        return jnp.sum(
+            _over_ti(
+                weights_j,
+                m_t_j,
+                m_t1_j,
+                V_t_j,
+                V_t1_j,
+                cross_cov_j,
+                A_j,
+                Q_j,
+                log_det_Q,
+            )
+        )
 
     # vmap over j (destination state)
-    log_cont_trans = jnp.sum(jax.vmap(
-        _sum_for_j,
-        in_axes=(2, 2, 2, 3, 3, 4, 4, 4),
-    )(
-        continuous_transition_matrix,       # (:, :, j)
-        process_cov,                        # (:, :, j)
-        smoother_joint_discrete_state_prob, # (:, i, j) -> axis 1 for i-within-j
-        m_t,                                # (:, :, i, j) -> axis 3
-        m_t1,                               # (:, :, i, j) -> axis 3
-        V_t,                                # (:, :, :, i, j) -> axis 4
-        V_t1,                               # (:, :, :, i, j) -> axis 4
-        pair_cond_smoother_cross_cov,       # (:, :, :, i, j) -> axis 4
-    ))
+    log_cont_trans = jnp.sum(
+        jax.vmap(
+            _sum_for_j,
+            in_axes=(2, 2, 2, 3, 3, 4, 4, 4),
+        )(
+            continuous_transition_matrix,  # (:, :, j)
+            process_cov,  # (:, :, j)
+            smoother_joint_discrete_state_prob,  # (:, i, j) -> axis 1 for i-within-j
+            m_t,  # (:, :, i, j) -> axis 3
+            m_t1,  # (:, :, i, j) -> axis 3
+            V_t,  # (:, :, :, i, j) -> axis 4
+            V_t1,  # (:, :, :, i, j) -> axis 4
+            pair_cond_smoother_cross_cov,  # (:, :, :, i, j) -> axis 4
+        )
+    )
 
     # 5. Observations — vmap over j, vectorize over t
     def _obs_log_prob_for_j(H_j, R_j, weights_j, means_j, covs_j):
@@ -2329,20 +2346,25 @@ def compute_expected_complete_log_likelihood(
 
         return jnp.sum(jax.vmap(_single_t)(weights_j, means_j, covs_j, obs))
 
-    log_obs = jnp.sum(jax.vmap(
-        _obs_log_prob_for_j,
-        in_axes=(2, 2, 1, 2, 3),
-    )(
-        measurement_matrix,            # (n_obs, n_cont, K) -> axis 2
-        measurement_cov,               # (n_obs, n_obs, K) -> axis 2
-        smoother_discrete_state_prob,  # (T, K) -> axis 1
-        state_cond_smoother_means,     # (T, n_cont, K) -> axis 2
-        state_cond_smoother_covs,      # (T, n_cont, n_cont, K) -> axis 3
-    ))
+    log_obs = jnp.sum(
+        jax.vmap(
+            _obs_log_prob_for_j,
+            in_axes=(2, 2, 1, 2, 3),
+        )(
+            measurement_matrix,  # (n_obs, n_cont, K) -> axis 2
+            measurement_cov,  # (n_obs, n_obs, K) -> axis 2
+            smoother_discrete_state_prob,  # (T, K) -> axis 1
+            state_cond_smoother_means,  # (T, n_cont, K) -> axis 2
+            state_cond_smoother_covs,  # (T, n_cont, n_cont, K) -> axis 3
+        )
+    )
 
     return (
-        log_init_discrete + log_init_cont + log_discrete_trans
-        + log_cont_trans + log_obs
+        log_init_discrete
+        + log_init_cont
+        + log_discrete_trans
+        + log_cont_trans
+        + log_obs
     )
 
 
@@ -2368,7 +2390,7 @@ def compute_posterior_entropy(
 
     # t>0: vectorize over all time steps at once
     marginal_prev = smoother_discrete_state_prob[:-1]  # (T-1, K)
-    joint = smoother_joint_discrete_state_prob          # (T-1, K, K)
+    joint = smoother_joint_discrete_state_prob  # (T-1, K, K)
     cond = _divide_safe(joint, marginal_prev[:, :, None])  # (T-1, K, K)
     discrete_entropy -= jnp.sum(joint * _safe_log(cond))
 
@@ -2427,9 +2449,7 @@ def compute_markov_posterior_entropy(
     # Terminal entropy E[H(x_T | S_T)].
     terminal_covs = jnp.moveaxis(state_cond_smoother_covs[-1], -1, 0)
     terminal_entropies = jax.vmap(_gaussian_entropy_from_cov)(terminal_covs)
-    terminal_entropy = jnp.sum(
-        smoother_discrete_state_prob[-1] * terminal_entropies
-    )
+    terminal_entropy = jnp.sum(smoother_discrete_state_prob[-1] * terminal_entropies)
 
     if pair_cond_smoother_covs is not None:
         cov_t = pair_cond_smoother_covs
@@ -2942,11 +2962,12 @@ def optimize_dim_transition_params(
         phase_diffs=opt_params["phase_diff"],
         sampling_freq=sampling_freq,
     )
-    # jnp.linalg.eigvals (general, non-symmetric) has no GPU/TPU lowering;
-    # compute the spectral radius on host. The optimizer has already returned,
-    # so this runs eagerly (no tracing concern) and stays backend-portable.
-    spectral_radius = float(np.max(np.abs(np.linalg.eigvals(np.asarray(A_opt)))))
-    safe_scale = 0.99 / spectral_radius if spectral_radius > 0.99 else 1.0
+    # Spectral radius is computed on host (eigvals has no GPU/TPU lowering);
+    # the optimizer has already returned, so this runs eagerly and stays
+    # backend-portable. Here we scale the params (not A directly), so we need
+    # the scalar radius rather than utils.stabilize_transition_matrix.
+    radius = _spectral_radius(A_opt)
+    safe_scale = 0.99 / radius if radius > 0.99 else 1.0
     opt_params["damping"] = opt_params["damping"] * safe_scale
     opt_params["coupling_strength"] = opt_params["coupling_strength"] * safe_scale
 

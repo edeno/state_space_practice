@@ -113,6 +113,7 @@ from state_space_practice.utils import (
     check_converged,
     make_discrete_transition_matrix,
     stabilize_covariance,
+    stabilize_transition_matrix,
     validate_count_array,
 )
 from state_space_practice.utils import divide_safe as _divide_safe
@@ -168,6 +169,20 @@ jax.tree_util.register_pytree_node(
     SpikeObsParams.tree_flatten,
     SpikeObsParams.tree_unflatten,
 )
+
+
+def _linear_log_intensity(state: Array, params: SpikeObsParams) -> Array:
+    """Linear log-intensity model: ``log(lambda) = baseline + weights @ state``.
+
+    Defined once at module level rather than as a per-call closure so that it
+    has a stable object identity. ``switching_point_process_filter`` receives
+    ``log_intensity_func`` as a *static* jit argument, which JAX caches by
+    identity; a fresh closure on every E-step would miss that cache and force a
+    full retrace/recompile of the filter on every EM iteration. The observation
+    parameters flow through ``params`` (a registered pytree, passed as data), so
+    EM updates take effect without recompilation.
+    """
+    return params.baseline + params.weights @ state
 
 
 def _is_per_state_spike_params(spike_params: SpikeObsParams) -> bool:
@@ -343,27 +358,42 @@ class QRegularizationConfig:
     eigenvalue clipping prevent the GPB1 smoother's backward collapse from
     creating a positive feedback loop through init_cov.
 
+    The eigenvalue *ceilings* (``max_eigenvalue``, ``init_cov_max_eigenvalue``)
+    are absolute by design and are load-bearing anti-divergence protection: the
+    ``init_cov`` cap severs a GPB1 -> init_cov -> filter feedback loop that
+    otherwise drives the covariance to explode. They cannot be made relative to
+    the covariance scale, because init_cov is *upstream* of that scale, so a
+    relative cap grows with the very divergence it should bound. The *floor*
+    (``min_eigenvalue``) is disabled by default: a nonzero floor pins Q for slow,
+    low-noise dynamics, and numerical PSD safety is already provided by the
+    1e-8 eigenvalue floor in ``_project_parameters``.
+
     Parameters
     ----------
     trust_region_weight : float
         Blend factor for new estimates: P = w * new_P + (1 - w) * old_P.
         Applied to both Q and init_cov.
     min_eigenvalue : float | None
-        Lower bound for eigenvalues. None disables lower clipping.
+        Lower bound for Q and init_cov eigenvalues. None (default) disables
+        lower clipping and relies on the 1e-8 PSD floor applied in
+        ``_project_parameters``, so EM can learn genuinely small process noise.
+        Set a positive value only if a specific problem needs a higher floor.
     max_eigenvalue : float | None
-        Upper bound for Q eigenvalues. None disables upper clipping.
+        Upper bound for Q eigenvalues (absolute). None disables upper clipping.
     init_cov_max_eigenvalue : float | None
-        Upper bound for init_cov eigenvalues. More lenient than Q's cap
-        since init_cov represents prior uncertainty about the initial state,
+        Upper bound for init_cov eigenvalues (absolute). More lenient than Q's
+        cap since init_cov represents prior uncertainty about the initial state,
         which can legitimately exceed per-step process noise. None disables.
     enabled : bool
         Whether to apply trust-region regularization and eigenvalue clipping.
     """
 
     trust_region_weight: float = 0.3  # More conservative blending
-    min_eigenvalue: float | None = 0.01  # Process noise floor to prevent collapse
-    max_eigenvalue: float | None = 1.0  # Prevent explosion
-    init_cov_max_eigenvalue: float | None = 10.0  # Prevent GPB1 feedback loop
+    # Disabled by default: a nonzero floor pins genuinely small process noise.
+    # PSD safety is handled by the 1e-8 floor in _project_parameters.
+    min_eigenvalue: float | None = None
+    max_eigenvalue: float | None = 1.0  # Prevent explosion (absolute)
+    init_cov_max_eigenvalue: float | None = 10.0  # Break GPB1 feedback loop
     enabled: bool = True
 
 
@@ -840,7 +870,9 @@ def _armijo_line_search(
 
     def line_search_step(carry, _):
         alpha, found = carry
-        # Skip loss evaluation if we already found a good step size
+        # Under tracing loss_fn is evaluated every iteration; once a step is
+        # found, `where` selects the cached current_loss (it does not skip the
+        # call), which makes subsequent iterations inert.
         new_params_trial = params - alpha * delta
         new_loss = jnp.where(found, current_loss, loss_fn(new_params_trial))
 
@@ -898,6 +930,11 @@ def _single_neuron_glm_loss(
 
     This is the plug-in method that uses smoother_mean as a point estimate
     for the latent state x_t.
+
+    Reference implementation: this closed-form objective has no in-module call
+    sites; it is the oracle the test suite differentiates and evaluates to
+    verify the analytic gradient/Hessian used by ``_single_neuron_glm_step``.
+    Keep it consistent with that step if the objective changes.
 
     Parameters
     ----------
@@ -1021,9 +1058,13 @@ def _single_neuron_glm_step(
     # Concatenate parameters into a single vector: [baseline, weights]
     params = jnp.concatenate([jnp.atleast_1d(baseline), weights])  # (1 + n_latent,)
 
-    # Compute linear predictor and expected counts
+    # Compute linear predictor and expected counts. Clip eta before exp to
+    # prevent overflow on a bad warm start or outlier series (matches the
+    # second-order step); the unclipped eta is retained for the linear y*eta
+    # term in the loss below.
     eta = design_matrix @ params  # (n_time,)
-    mu = jnp.exp(eta) * dt  # Expected spike counts (n_time,)
+    eta_safe = jnp.clip(eta, -20.0, 20.0)
+    mu = jnp.exp(eta_safe) * dt  # Expected spike counts (n_time,)
 
     if time_weights is None:
         time_weights = jnp.ones_like(mu)
@@ -1061,7 +1102,7 @@ def _single_neuron_glm_step(
     # Define loss function for line search
     def loss_fn(p):
         eta_trial = design_matrix @ p
-        mu_trial = jnp.exp(eta_trial) * dt
+        mu_trial = jnp.exp(jnp.clip(eta_trial, -20.0, 20.0)) * dt
         weights_trial = p[1:]
         nll = jnp.sum(time_weights * (mu_trial - y_n * eta_trial))
         l2_penalty = 0.5 * weight_l2 * jnp.sum(weights_trial**2)
@@ -1092,6 +1133,11 @@ def _neg_Q_single_neuron(
     baseline_prior_l2: float = 0.0,
 ) -> Array:
     """Negative expected log-likelihood for one neuron's Poisson GLM.
+
+    Reference implementation: this exact Q-function has no in-module call sites;
+    it is the oracle the test suite uses to check the analytic gradient/Hessian
+    in ``_single_neuron_glm_step_second_order``. The live second-order step
+    reproduces this objective by hand, so keep the two in sync.
 
     This implements the exact latent-marginalized Q-function for the EM M-step:
 
@@ -1363,9 +1409,8 @@ def _single_neuron_glm_step_second_order_mixture(
     mean_plus_cov_w = state_cond_smoother_mean + cov_w
 
     grad_b = jnp.sum(weighted_mu - weighted_y)
-    grad_w = (
-        jnp.einsum("tls,ts->l", mean_plus_cov_w, weighted_mu)
-        - jnp.einsum("tls,ts->l", state_cond_smoother_mean, weighted_y)
+    grad_w = jnp.einsum("tls,ts->l", mean_plus_cov_w, weighted_mu) - jnp.einsum(
+        "tls,ts->l", state_cond_smoother_mean, weighted_y
     )
     grad_w += weight_l2 * w
 
@@ -1527,7 +1572,6 @@ def update_spike_glm_params(
     weights = current_params.weights
 
     if use_second_order:
-
         # Newton iterations for all neurons (second-order).
         # Uses analytical gradient + Hessian with adaptive ridge and Armijo
         # line search. Python loop over iterations avoids deeply nested
@@ -1622,9 +1666,7 @@ def update_spike_glm_params_mixture(
     n_time, n_latent, n_states = state_cond_smoother_mean.shape
 
     if spikes.shape[0] != n_time:
-        raise ValueError(
-            f"spikes has {spikes.shape[0]} time steps, expected {n_time}."
-        )
+        raise ValueError(f"spikes has {spikes.shape[0]} time steps, expected {n_time}.")
     if state_cond_smoother_cov.shape != (n_time, n_latent, n_latent, n_states):
         raise ValueError(
             "state_cond_smoother_cov shape incompatible with "
@@ -1675,9 +1717,9 @@ def update_spike_glm_params_mixture(
                     baseline_prior_l2,
                 )
 
-            baselines, weights = jax.vmap(
-                update_neuron_no_prior, in_axes=(0, 0, 1)
-            )(baselines, weights, spikes)
+            baselines, weights = jax.vmap(update_neuron_no_prior, in_axes=(0, 0, 1))(
+                baselines, weights, spikes
+            )
 
     return SpikeObsParams(baseline=baselines, weights=weights)
 
@@ -1800,19 +1842,15 @@ def switching_point_process_filter(
     outputs at index t represent p(x_{t+1} | y_{1:t+1}) (0-indexed in Python,
     corresponding to math time index t+1).
 
-    **Performance**: For production use, wrap this function with ``jax.jit``
-    for significant speedups. The function uses ``jax.lax.scan`` and ``vmap``
-    internally, which benefit greatly from JIT compilation::
-
-        jitted_filter = jax.jit(switching_point_process_filter, static_argnums=(8,))
-        results = jitted_filter(init_mean, init_cov, init_prob, spikes,
-                                trans_mat, cont_trans, proc_cov, dt,
-                                log_intensity, spike_params)
-
-    Note that ``log_intensity_func`` (argument 8) must be marked as static
-    since it's a Python callable. The ``spike_params`` argument (a registered
-    JAX pytree) is passed as data, so parameter updates during EM iterations
-    take effect without recompilation.
+    **Performance**: This function is already ``jax.jit``-decorated (with
+    ``log_intensity_func``, ``include_laplace_normalization``, and
+    ``max_newton_iter`` as static arguments), so callers should invoke it
+    directly. Because ``log_intensity_func`` is static, it is cached by object
+    identity: pass the *same* function object across calls (e.g. a module-level
+    function, not a per-call closure) or every call retraces and recompiles the
+    entire scan/vmap. The ``spike_params`` argument (a registered JAX pytree) is
+    passed as data, so parameter updates during EM iterations take effect
+    without recompilation.
 
     References
     ----------
@@ -1926,7 +1964,9 @@ def switching_point_process_filter(
             discrete_transition_matrix,
             prev_filter_discrete_prob,
         )
-        pair_cond_filter_prob = filter_backward_cond_prob * filter_discrete_prob[None, :]
+        pair_cond_filter_prob = (
+            filter_backward_cond_prob * filter_discrete_prob[None, :]
+        )
 
         # 4. Accumulate marginal log-likelihood
         marginal_log_likelihood += ll_max + jnp.log(predictive_likelihood_term_sum)
@@ -1980,13 +2020,16 @@ def switching_point_process_filter(
 
     # Run predict-then-update for t=2,...,T
     # jax.lax.scan handles empty inputs (spikes[1:] when n_time=1) gracefully
-    (_, _, _, marginal_log_likelihood), (
-        rest_state_cond_filter_mean,
-        rest_state_cond_filter_cov,
-        rest_filter_discrete_state_prob,
-        rest_pair_cond_filter_mean,
-        rest_pair_cond_filter_cov,
-        rest_pair_cond_filter_prob,
+    (
+        (_, _, _, marginal_log_likelihood),
+        (
+            rest_state_cond_filter_mean,
+            rest_state_cond_filter_cov,
+            rest_filter_discrete_state_prob,
+            rest_pair_cond_filter_mean,
+            rest_pair_cond_filter_cov,
+            rest_pair_cond_filter_prob,
+        ),
     ) = jax.lax.scan(
         _step,
         (
@@ -2098,8 +2141,11 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
 
     Notes
     -----
-    This model uses the exact per-state-pair structure for the switching filter,
-    which maintains EM monotonicity (up to the Laplace approximation).
+    This model uses the exact per-state-pair structure for the switching filter.
+    EM monotonicity is only approximate here: both the Laplace observation
+    approximation and the GPB mixture collapse in the smoother can produce small
+    log-likelihood decreases. ``fit`` tolerates these via ``decrease_tol`` rather
+    than treating any decrease as divergence.
 
     The smoother is observation-model agnostic and reuses
     ``switching_kalman_smoother`` from the switching_kalman module.
@@ -2307,6 +2353,9 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         self.smoother_joint_discrete_state_prob: Array
         self.smoother_pair_cond_cross_cov: Array
         self.smoother_pair_cond_means: Array
+        # Populated only by the GPB2 smoother; None under GPB1.
+        self.smoother_pair_cond_covs: Array | None
+        self.smoother_next_pair_cond_means: Array | None
 
     def __repr__(self) -> str:
         """Return string representation of the model."""
@@ -2623,12 +2672,10 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         parameter updates via `switching_kalman_maximization_step`.
         """
 
-        # Log-intensity function takes (state, params) - params passed as data, not closure
-        def log_intensity_func(state: Array, params: SpikeObsParams) -> Array:
-            """Compute log-intensity for all neurons given latent state and params."""
-            return params.baseline + params.weights @ state
-
-        # Run the switching point-process filter
+        # Run the switching point-process filter. ``_linear_log_intensity`` is a
+        # single module-level object (not a per-call closure): the filter takes
+        # it as a static jit argument cached by identity, so reusing the same
+        # object avoids recompiling the filter on every EM iteration.
         (
             state_cond_filter_mean,
             state_cond_filter_cov,
@@ -2646,7 +2693,7 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             continuous_transition_matrix=self.continuous_transition_matrix,
             process_cov=self.process_cov,
             dt=self.dt,
-            log_intensity_func=log_intensity_func,
+            log_intensity_func=_linear_log_intensity,
             spike_params=self.spike_params,
             max_newton_iter=self.max_newton_iter,
             line_search_beta=self.line_search_beta,
@@ -2833,14 +2880,12 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                     if cfg.min_eigenvalue is not None:
                         eigvals = jnp.maximum(eigvals, cfg.min_eigenvalue)
                     if cfg.init_cov_max_eigenvalue is not None:
-                        eigvals = jnp.minimum(
-                            eigvals, cfg.init_cov_max_eigenvalue
-                        )
+                        eigvals = jnp.minimum(eigvals, cfg.init_cov_max_eigenvalue)
                     return eigvecs @ jnp.diag(eigvals) @ eigvecs.T
 
-                new_init_cov = jax.vmap(
-                    _clip_init_cov, in_axes=-1, out_axes=-1
-                )(init_cov_blended)
+                new_init_cov = jax.vmap(_clip_init_cov, in_axes=-1, out_axes=-1)(
+                    init_cov_blended
+                )
 
             self.init_cov = new_init_cov
 
@@ -2985,16 +3030,12 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 A_j = project_coupled_transition_matrix(
                     self.continuous_transition_matrix[:, :, j]
                 )
-                # Clamp spectral radius to prevent unstable dynamics
-                eigvals = jnp.linalg.eigvals(A_j)
-                sr = jnp.max(jnp.abs(eigvals))
-                scale = jnp.where(
-                    sr > _MAX_SPECTRAL_RADIUS, _MAX_SPECTRAL_RADIUS / sr, 1.0
+                # Clamp spectral radius to prevent unstable dynamics. Computed on
+                # host (eigvals has no GPU/TPU lowering); this loop runs eagerly.
+                projected_A_list.append(
+                    stabilize_transition_matrix(A_j, _MAX_SPECTRAL_RADIUS)
                 )
-                projected_A_list.append(A_j * scale)
-            self.continuous_transition_matrix = jnp.stack(
-                projected_A_list, axis=-1
-            )
+            self.continuous_transition_matrix = jnp.stack(projected_A_list, axis=-1)
 
         # Project each process covariance to the nearest symmetric PSD matrix
         # (symmetrize -> eigenvalue floor at 1e-8 -> reconstruct).
@@ -3099,8 +3140,8 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         ... )
         >>> spikes = jax.random.poisson(jax.random.PRNGKey(0), 0.5, (100, 10))
         >>> log_likelihoods = model.fit(spikes, max_iter=20, key=jax.random.PRNGKey(42))
-        >>> len(log_likelihoods)  # Number of iterations
-        20
+        >>> 0 < len(log_likelihoods) <= 21  # <= max_iter, plus at most one final-E-step LL
+        True
         """
         # Convert to JAX array
         spikes = jnp.asarray(spikes)
@@ -3131,6 +3172,7 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
 
         # Snapshot parameters for rollback on LL decrease
         import copy
+
         prev_params: dict | None = None
 
         def _snapshot_params() -> dict:
@@ -3162,6 +3204,10 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             if not jnp.isfinite(marginal_ll):
                 if prev_params is not None:
                     _restore_params(prev_params)
+                    # Recompute the E-step under the restored params so the stored
+                    # smoother attributes match the parameters we return with
+                    # (the current attributes reflect the rejected iteration).
+                    self._e_step(spikes)
                     log_likelihoods.pop()
                     logger.warning(
                         "Non-finite LL at iteration %d; rolled back to previous.",
@@ -3195,6 +3241,9 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 if not is_increasing and prev_params is not None:
                     _restore_params(prev_params)
                     log_likelihoods.pop()
+                    # Recompute the E-step under the restored params so the stored
+                    # smoother attributes match the parameters we return with.
+                    self._e_step(spikes)
                     logger.warning(
                         "LL decreased at iteration %d (%.1f -> %.1f); "
                         "rolled back and stopping.",
@@ -3204,6 +3253,11 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                     )
                     break
 
+                # A decrease smaller than `decrease_tol` leaves `is_increasing`
+                # True (no rollback above); if it is also smaller than `tol` we
+                # converge and stop here, keeping the very slightly worse
+                # parameters. That residual is bounded by `tol`, so no rollback
+                # is warranted.
                 if is_converged:
                     break
 
@@ -3287,8 +3341,10 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         validate_count_array(spikes, "spikes")
         self._sgd_n_time = spikes.shape[0]
 
-        if not hasattr(self, "continuous_transition_matrix") or \
-           self.continuous_transition_matrix is None:
+        if (
+            not hasattr(self, "continuous_transition_matrix")
+            or self.continuous_transition_matrix is None
+        ):
             if key is None:
                 raise ValueError("key required for initialization")
             self._initialize_parameters(key)
@@ -3306,8 +3362,10 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         return self._sgd_n_time
 
     def _check_sgd_initialized(self):
-        if not hasattr(self, "continuous_transition_matrix") or \
-           self.continuous_transition_matrix is None:
+        if (
+            not hasattr(self, "continuous_transition_matrix")
+            or self.continuous_transition_matrix is None
+        ):
             raise RuntimeError("Call fit_sgd(spikes, key=...) first.")
 
     def _build_param_spec(self):
@@ -3369,8 +3427,10 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             if not any(k.startswith(f"{prefix}_") for k in params):
                 return fallback
             return jnp.stack(
-                [params.get(f"{prefix}_{j}", fallback[..., j])
-                 for j in range(self.n_discrete_states)],
+                [
+                    params.get(f"{prefix}_{j}", fallback[..., j])
+                    for j in range(self.n_discrete_states)
+                ],
                 axis=-1,
             )
 
@@ -3381,9 +3441,12 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         Q = _recon("Q", self.process_cov)
         P0 = _recon("init_cov", self.init_cov)
 
-        def log_int(state, p):
-            return p.baseline + p.weights @ state
-
+        # Optimize the *same* filter approximation the E-step/finalize evaluate:
+        # pass max_newton_iter and line_search_beta so a model configured with
+        # multi-step Laplace does not train against the 1-step LL and then report
+        # a different multi-step LL. Note: with max_newton_iter > 1 the SGD loss
+        # differentiates through the backtracking scan's jnp.where selections, so
+        # the gradient is valid but piecewise-constant in the step size.
         result = switching_point_process_filter(
             init_state_cond_mean=m0,
             init_state_cond_cov=P0,
@@ -3393,8 +3456,10 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             continuous_transition_matrix=A,
             process_cov=Q,
             dt=self.dt,
-            log_intensity_func=log_int,
+            log_intensity_func=_linear_log_intensity,
             spike_params=sp,
+            max_newton_iter=self.max_newton_iter,
+            line_search_beta=self.line_search_beta,
         )
         loss = -result[6]
 
@@ -3438,17 +3503,21 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             )
 
         if any(k.startswith("A_blocks_") for k in params):
-            self.continuous_transition_matrix = self._reconstruct_A_from_blocks(
-                params
-            )
+            self.continuous_transition_matrix = self._reconstruct_A_from_blocks(params)
 
         def _store_recon(prefix, attr):
             if any(k.startswith(f"{prefix}_") for k in params):
-                setattr(self, attr, jnp.stack(
-                    [params.get(f"{prefix}_{j}", getattr(self, attr)[..., j])
-                     for j in range(self.n_discrete_states)],
-                    axis=-1,
-                ))
+                setattr(
+                    self,
+                    attr,
+                    jnp.stack(
+                        [
+                            params.get(f"{prefix}_{j}", getattr(self, attr)[..., j])
+                            for j in range(self.n_discrete_states)
+                        ],
+                        axis=-1,
+                    ),
+                )
 
         _store_recon("Q", "process_cov")
         _store_recon("init_cov", "init_cov")
