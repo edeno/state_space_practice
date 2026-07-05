@@ -236,6 +236,96 @@ class TestCommonOscillatorPointProcessModel:
         assert len(log_likelihoods) == 2
         assert log_likelihoods[-1] == pytest.approx(fresh_ll)
 
+    def test_fit_rolls_back_bad_final_m_step(
+        self, com_pp_params, monkeypatch, caplog
+    ) -> None:
+        """A final E-step LL decrease should restore the accepted EM state."""
+        params = dict(com_pp_params)
+        params["n_oscillators"] = 1
+        params["n_neurons"] = 2
+        params["n_discrete_states"] = 2
+        params["freqs"] = jnp.array([8.0])
+        params["damping_coef"] = jnp.array([0.95])
+        params["process_variance"] = jnp.array([0.1])
+        model = CommonOscillatorPointProcessModel(**params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        spikes = jnp.zeros((5, 2))
+        original_A = model.continuous_transition_matrix.copy()
+        good_probs = jnp.ones((spikes.shape[0], model.n_discrete_states)) / 2.0
+        bad_probs = jnp.tile(jnp.array([[0.9, 0.1]]), (spikes.shape[0], 1))
+        e_step_values = iter([(100.0, good_probs), (50.0, bad_probs)])
+
+        def fake_e_step(_spikes):
+            ll, probs = next(e_step_values)
+            model.smoother_discrete_state_prob = probs
+            return jnp.asarray(ll)
+
+        def bad_m_step_dynamics():
+            model.continuous_transition_matrix = (
+                model.continuous_transition_matrix + 5.0
+            )
+
+        monkeypatch.setattr(model, "_e_step", fake_e_step)
+        monkeypatch.setattr(model, "_m_step_dynamics", bad_m_step_dynamics)
+        monkeypatch.setattr(model, "_m_step_spikes", lambda _spikes: None)
+        monkeypatch.setattr(model, "_project_parameters", lambda: None)
+
+        with caplog.at_level("WARNING"):
+            log_likelihoods = model.fit(spikes, max_iter=1, skip_init=True)
+
+        assert log_likelihoods == [100.0]
+        assert any(
+            "final e-step decreased ll" in record.message.lower()
+            for record in caplog.records
+        )
+        np.testing.assert_allclose(model.continuous_transition_matrix, original_A)
+        np.testing.assert_allclose(model.smoother_discrete_state_prob, good_probs)
+
+    def test_fit_rolls_back_nonfinite_final_m_step(
+        self, com_pp_params, monkeypatch, caplog
+    ) -> None:
+        """A non-finite final E-step should not leave bad state or LL history."""
+        params = dict(com_pp_params)
+        params["n_oscillators"] = 1
+        params["n_neurons"] = 2
+        params["n_discrete_states"] = 2
+        params["freqs"] = jnp.array([8.0])
+        params["damping_coef"] = jnp.array([0.95])
+        params["process_variance"] = jnp.array([0.1])
+        model = CommonOscillatorPointProcessModel(**params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        spikes = jnp.zeros((5, 2))
+        original_A = model.continuous_transition_matrix.copy()
+        good_probs = jnp.ones((spikes.shape[0], model.n_discrete_states)) / 2.0
+        bad_probs = jnp.tile(jnp.array([[0.9, 0.1]]), (spikes.shape[0], 1))
+        e_step_values = iter([(100.0, good_probs), (jnp.nan, bad_probs)])
+
+        def fake_e_step(_spikes):
+            ll, probs = next(e_step_values)
+            model.smoother_discrete_state_prob = probs
+            return jnp.asarray(ll)
+
+        def bad_m_step_dynamics():
+            model.continuous_transition_matrix = (
+                model.continuous_transition_matrix + 5.0
+            )
+
+        monkeypatch.setattr(model, "_e_step", fake_e_step)
+        monkeypatch.setattr(model, "_m_step_dynamics", bad_m_step_dynamics)
+        monkeypatch.setattr(model, "_m_step_spikes", lambda _spikes: None)
+        monkeypatch.setattr(model, "_project_parameters", lambda: None)
+
+        with caplog.at_level("WARNING"):
+            log_likelihoods = model.fit(spikes, max_iter=1, skip_init=True)
+
+        assert log_likelihoods == [100.0]
+        assert any(
+            "non-finite log-likelihood" in record.message.lower()
+            for record in caplog.records
+        )
+        np.testing.assert_allclose(model.continuous_transition_matrix, original_A)
+        np.testing.assert_allclose(model.smoother_discrete_state_prob, good_probs)
+
     @pytest.mark.parametrize(
         ("bad_value", "match"),
         [(-1.0, "non-negative"), (0.5, "integer-valued"), (jnp.nan, "finite")],
@@ -504,6 +594,100 @@ class TestDirectedInfluencePointProcessModel:
                 # Singular values should be approximately equal (scaled rotation)
                 np.testing.assert_allclose(s[0], s[1], rtol=0.1)
 
+    def test_projection_is_hard_structural_constraint(self) -> None:
+        """DIM-PP projection should not keep an out-of-family unconstrained A."""
+        model = DirectedInfluencePointProcessModel(
+            n_oscillators=1,
+            n_neurons=1,
+            n_discrete_states=1,
+            sampling_freq=100.0,
+            dt=0.01,
+            freqs=jnp.array([8.0]),
+            damping_coef=jnp.array([0.95]),
+            process_variance=jnp.array([0.1]),
+            phase_difference=jnp.zeros((1, 1, 1)),
+            coupling_strength=jnp.zeros((1, 1, 1)),
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        unconstrained_A = jnp.array([[0.8, 0.2], [0.1, 0.7]])
+        model.continuous_transition_matrix = unconstrained_A[:, :, None]
+
+        model._project_parameters()
+
+        projected = model.continuous_transition_matrix[:, :, 0]
+        assert not jnp.allclose(projected, unconstrained_A)
+        np.testing.assert_allclose(projected[0, 0], projected[1, 1], atol=1e-8)
+        np.testing.assert_allclose(projected[0, 1], -projected[1, 0], atol=1e-8)
+
+    def test_reparameterized_mstep_clips_init_state_updates(
+        self, dim_pp_params, monkeypatch
+    ) -> None:
+        """DIM-PP reparameterized M-step should share init-state regularization."""
+        import state_space_practice.point_process_models as pp_models
+
+        params = dict(dim_pp_params)
+        params["n_oscillators"] = 1
+        params["n_neurons"] = 1
+        params["n_discrete_states"] = 1
+        params["freqs"] = jnp.array([8.0])
+        params["damping_coef"] = jnp.array([0.95])
+        params["process_variance"] = jnp.array([0.1])
+        params["phase_difference"] = jnp.zeros((1, 1, 1))
+        params["coupling_strength"] = jnp.zeros((1, 1, 1))
+        model = DirectedInfluencePointProcessModel(
+            **params, use_reparameterized_mstep=True
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        n_time, n_latent, n_states = 2, model.n_latent, model.n_discrete_states
+        model.smoother_state_cond_mean = jnp.zeros((n_time, n_latent, n_states))
+        model.smoother_state_cond_cov = jnp.tile(
+            jnp.eye(n_latent)[None, :, :, None],
+            (n_time, 1, 1, n_states),
+        )
+        model.smoother_discrete_state_prob = jnp.ones((n_time, n_states))
+        model.smoother_joint_discrete_state_prob = jnp.ones((n_time - 1, 1, 1))
+        model.smoother_pair_cond_cross_cov = jnp.zeros(
+            (n_time - 1, n_latent, n_latent, 1, 1)
+        )
+        model.smoother_pair_cond_means = None
+        model.smoother_pair_cond_covs = None
+        model.smoother_next_pair_cond_means = None
+
+        def fake_m_step(**_kwargs):
+            return (
+                model.continuous_transition_matrix,
+                jnp.zeros((1, n_latent, 1)),
+                model.process_cov,
+                jnp.eye(1)[:, :, None],
+                jnp.ones((n_latent, 1)) * 100.0,
+                jnp.eye(n_latent)[:, :, None] * 100.0,
+                jnp.ones((1, 1)),
+                jnp.ones((1,)),
+            )
+
+        def fake_optimize(**_kwargs):
+            return {
+                "freq": jnp.array([8.0]),
+                "damping": jnp.array([0.95]),
+                "coupling_strength": jnp.zeros((1, 1)),
+                "phase_diff": jnp.zeros((1, 1)),
+            }
+
+        monkeypatch.setattr(
+            pp_models, "switching_kalman_maximization_step", fake_m_step
+        )
+        monkeypatch.setattr(
+            pp_models, "optimize_dim_transition_params", fake_optimize
+        )
+
+        model._m_step_reparameterized()
+
+        assert jnp.max(jnp.abs(model.init_mean)) <= 10.0
+        eigvals = jnp.linalg.eigvalsh(model.init_cov[:, :, 0])
+        assert jnp.min(eigvals) >= 1e-4 - 1e-10
+        assert jnp.max(eigvals) <= 2.0 + 1e-10
+
 
 # ============================================================================
 # Tests for input validation
@@ -551,6 +735,16 @@ class TestInputValidation:
                 damping_coef=jnp.array([0.95, 0.95]),
                 process_variance=jnp.array([0.1, 0.1]),
             )
+
+    @pytest.mark.parametrize("field", ["phase_difference", "coupling_strength"])
+    def test_dim_rejects_nonzero_diagonal_pair_params(
+        self, dim_pp_params, field
+    ) -> None:
+        params = dict(dim_pp_params)
+        params[field] = params[field].at[0, 0, :].set(0.2)
+
+        with pytest.raises(ValueError, match="diagonal"):
+            DirectedInfluencePointProcessModel(**params)
 
     def test_invalid_spikes_shape(self, com_pp_params) -> None:
         model = CommonOscillatorPointProcessModel(**com_pp_params)

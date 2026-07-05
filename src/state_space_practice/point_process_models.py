@@ -21,6 +21,7 @@ References
    Neural Computation 16, 971-998.
 """
 
+import copy
 import logging
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -40,7 +41,6 @@ from state_space_practice.oscillator_utils import (
     project_coupled_transition_matrix,
 )
 from state_space_practice.switching_kalman import (
-    compute_transition_q_function,
     compute_transition_sufficient_stats,
     optimize_dim_transition_params,
     switching_kalman_maximization_step,
@@ -737,44 +737,10 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             self.discrete_transition_matrix = new_discrete_transition
 
         if self.update_init_mean:
-            # Clip init_mean to prevent divergence. With sparse spike data,
-            # the smoother at t=0 is poorly constrained and can produce
-            # extreme estimates. The latent state is centered, so values
-            # beyond a few standard deviations are unphysical.
-            self.init_mean = jnp.clip(new_init_mean, -10.0, 10.0)
+            self.init_mean = self._regularize_init_mean_update(new_init_mean)
 
         if self.update_init_cov:
-            def clip_init_cov_eigenvalues(P: Array) -> Array:
-                P = symmetrize(P)
-                eigvals, eigvecs = jnp.linalg.eigh(P)
-                eigvals = jnp.clip(eigvals, _INIT_COV_EIGVAL_MIN, _INIT_COV_EIGVAL_MAX)
-                return eigvecs @ jnp.diag(eigvals) @ eigvecs.T
-
-            def _per_state_eigrange(P: Array) -> tuple[Array, Array]:
-                eigs = jnp.linalg.eigvalsh(symmetrize(P))
-                return jnp.min(eigs), jnp.max(eigs)
-
-            per_state_min, per_state_max = jax.vmap(
-                _per_state_eigrange, in_axes=-1
-            )(new_init_cov)
-            raw_min = float(jnp.min(per_state_min))
-            raw_max = float(jnp.max(per_state_max))
-            new_init_cov = jax.vmap(
-                clip_init_cov_eigenvalues, in_axes=-1, out_axes=-1
-            )(new_init_cov)
-            if raw_min < _INIT_COV_EIGVAL_MIN or raw_max > _INIT_COV_EIGVAL_MAX:
-                logger.info(
-                    "M-step init_cov eigenvalues clipped to [%.0e, %.1f] "
-                    "(raw range across discrete states: [%.2e, %.2e]). "
-                    "Frequent triggering indicates the smoother at t=0 is "
-                    "numerically diffuse — consider tightening the prior "
-                    "or shortening the sequence.",
-                    _INIT_COV_EIGVAL_MIN,
-                    _INIT_COV_EIGVAL_MAX,
-                    raw_min,
-                    raw_max,
-                )
-            self.init_cov = new_init_cov
+            self.init_cov = self._regularize_init_cov_update(new_init_cov)
 
         self.init_discrete_state_prob = new_init_discrete_prob
 
@@ -853,6 +819,94 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
         Subclasses define model-specific projections (e.g., oscillatory
         structure for A, PSD for Q).
         """
+
+    def _regularize_init_mean_update(self, init_mean: Array) -> Array:
+        """Clip initial mean updates to a plausible latent-state range."""
+        return jnp.clip(init_mean, -10.0, 10.0)
+
+    def _regularize_init_cov_update(self, init_cov: Array) -> Array:
+        """Clip initial covariance eigenvalues for sparse-spike EM stability."""
+
+        def clip_init_cov_eigenvalues(P: Array) -> Array:
+            P = symmetrize(P)
+            eigvals, eigvecs = jnp.linalg.eigh(P)
+            eigvals = jnp.clip(eigvals, _INIT_COV_EIGVAL_MIN, _INIT_COV_EIGVAL_MAX)
+            return eigvecs @ jnp.diag(eigvals) @ eigvecs.T
+
+        def _per_state_eigrange(P: Array) -> tuple[Array, Array]:
+            eigs = jnp.linalg.eigvalsh(symmetrize(P))
+            return jnp.min(eigs), jnp.max(eigs)
+
+        per_state_min, per_state_max = jax.vmap(
+            _per_state_eigrange, in_axes=-1
+        )(init_cov)
+        raw_min = float(jnp.min(per_state_min))
+        raw_max = float(jnp.max(per_state_max))
+        init_cov = jax.vmap(
+            clip_init_cov_eigenvalues, in_axes=-1, out_axes=-1
+        )(init_cov)
+        if raw_min < _INIT_COV_EIGVAL_MIN or raw_max > _INIT_COV_EIGVAL_MAX:
+            logger.info(
+                "M-step init_cov eigenvalues clipped to [%.0e, %.1f] "
+                "(raw range across discrete states: [%.2e, %.2e]). "
+                "Frequent triggering indicates the smoother at t=0 is "
+                "numerically diffuse -- consider tightening the prior "
+                "or shortening the sequence.",
+                _INIT_COV_EIGVAL_MIN,
+                _INIT_COV_EIGVAL_MAX,
+                raw_min,
+                raw_max,
+            )
+        return init_cov
+
+    def _snapshot_em_state(self) -> dict[str, object]:
+        """Snapshot parameters and posteriors for EM rollback.
+
+        Every JAX-array and immutable-container attribute below is *reassigned*
+        (never mutated in place) by the E/M steps, so a plain reference is a
+        valid snapshot -- restoring it later is unaffected by the reassignment.
+        Only ``_current_osc_params`` (a list mutated in place by the
+        reparameterized M-step) is deep-copied.
+        """
+        attrs = [
+            "init_mean",
+            "init_cov",
+            "init_discrete_state_prob",
+            "discrete_transition_matrix",
+            "continuous_transition_matrix",
+            "process_cov",
+            "spike_params",
+            "smoother_state_cond_mean",
+            "smoother_state_cond_cov",
+            "smoother_discrete_state_prob",
+            "smoother_joint_discrete_state_prob",
+            "smoother_pair_cond_cross_cov",
+            "smoother_pair_cond_means",
+            "smoother_pair_cond_covs",
+            "smoother_next_pair_cond_means",
+            "freqs",
+            "damping_coef",
+            "process_variance",
+            "phase_difference",
+            "coupling_strength",
+            "_current_osc_params",
+            "_transition_suff_stats",
+        ]
+        deepcopy_attrs = {"_current_osc_params"}
+        snapshot: dict[str, object] = {}
+        for attr in attrs:
+            if not hasattr(self, attr):
+                continue
+            value = getattr(self, attr)
+            snapshot[attr] = (
+                copy.deepcopy(value) if attr in deepcopy_attrs else value
+            )
+        return snapshot
+
+    def _restore_em_state(self, state: dict[str, object]) -> None:
+        """Restore a snapshot produced by ``_snapshot_em_state``."""
+        for attr, value in state.items():
+            setattr(self, attr, value)
 
     # ------------------------------------------------------------------
     # EM loop
@@ -948,27 +1002,15 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             self.smoother_next_pair_cond_means = None
             self._m_step_spikes(spikes)
 
-        import copy
-
         log_likelihoods: list[float] = []
         best_ll = -float("inf")
-        best_params: dict | None = None
-
-        def _snapshot_params() -> dict:
-            return {
-                "init_mean": self.init_mean,
-                "init_cov": self.init_cov,
-                "init_discrete_state_prob": self.init_discrete_state_prob,
-                "discrete_transition_matrix": self.discrete_transition_matrix,
-                "continuous_transition_matrix": self.continuous_transition_matrix,
-                "process_cov": self.process_cov,
-                "spike_params": copy.deepcopy(self.spike_params),
-                "smoother_discrete_state_prob": self.smoother_discrete_state_prob,
-            }
+        best_state: dict[str, object] | None = None
+        last_accepted_state: dict[str, object] | None = None
 
         for iteration in range(max_iter):
             marginal_ll = self._e_step(spikes)
-            log_likelihoods.append(float(marginal_ll))
+            current_ll = float(marginal_ll)
+            log_likelihoods.append(current_ll)
 
             if not jnp.isfinite(marginal_ll):
                 raise ValueError(
@@ -976,14 +1018,16 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                     f"{marginal_ll}. This may indicate numerical instability."
                 )
 
+            current_state = self._snapshot_em_state()
+
             # Track best parameters seen (approximate EM can decrease LL)
-            if log_likelihoods[-1] > best_ll:
-                best_ll = log_likelihoods[-1]
-                best_params = _snapshot_params()
+            if current_ll > best_ll:
+                best_ll = current_ll
+                best_state = current_state
 
             if iteration > 0:
                 is_converged, is_increasing = check_converged(
-                    log_likelihood=log_likelihoods[-1],
+                    log_likelihood=current_ll,
                     previous_log_likelihood=log_likelihoods[-2],
                     tolerance=tol,
                 )
@@ -998,6 +1042,7 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                     self.converged_ = True
                     break
 
+            last_accepted_state = current_state
             self._m_step_dynamics()
             self._m_step_spikes(spikes)
             self._project_parameters()
@@ -1011,22 +1056,49 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             logger.warning("Reached maximum iterations without converging.")
             # Final E-step to sync smoother results with current parameters
             final_ll = float(self._e_step(spikes))
-            log_likelihoods.append(final_ll)
-            if final_ll > best_ll:
-                best_ll = final_ll
-                best_params = _snapshot_params()
+            if not jnp.isfinite(final_ll):
+                if last_accepted_state is not None:
+                    self._restore_em_state(last_accepted_state)
+                logger.warning(
+                    "Final E-step produced non-finite log-likelihood; "
+                    "rolling back to previous E-step."
+                )
+            else:
+                _, final_is_increasing = check_converged(
+                    final_ll,
+                    log_likelihoods[-1],
+                    tol,
+                )
+                if final_is_increasing:
+                    log_likelihoods.append(final_ll)
+                    if final_ll > best_ll:
+                        best_ll = final_ll
+                        best_state = self._snapshot_em_state()
+                elif last_accepted_state is not None:
+                    self._restore_em_state(last_accepted_state)
+                    logger.warning(
+                        f"Final E-step decreased LL: {log_likelihoods[-1]:.4f} -> "
+                        f"{final_ll:.4f}; rolling back to previous E-step."
+                    )
+                else:
+                    logger.warning(
+                        "Final E-step decreased LL but no accepted state was "
+                        "available for rollback."
+                    )
 
         # Restore best parameters if LL decreased at any point
-        if best_params is not None and log_likelihoods[-1] < best_ll:
+        if best_state is not None and log_likelihoods and log_likelihoods[-1] < best_ll:
             logger.info(
                 f"Restoring best params from LL={best_ll:.4f} "
                 f"(final was {log_likelihoods[-1]:.4f})"
             )
-            for attr, value in best_params.items():
-                setattr(self, attr, value)
-            # Re-run E-step to populate all smoother outputs consistently
-            # with the restored parameters
-            self._e_step(spikes)
+            self._restore_em_state(best_state)
+            restored_ll = float(self._e_step(spikes))
+            if jnp.isfinite(restored_ll) and restored_ll != log_likelihoods[-1]:
+                log_likelihoods.append(restored_ll)
+
+        if log_likelihoods:
+            self.log_likelihood_ = float(log_likelihoods[-1])
 
         return log_likelihoods
 
@@ -1044,8 +1116,6 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
         The run with the highest final log-likelihood is kept, and the
         model's parameters are set to those of the best run.
         """
-        import copy
-
         best_lls: list[float] | None = None
         best_final_ll = -float("inf")
         best_state: dict | None = None
@@ -1055,22 +1125,14 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
         for restart in range(n_restarts):
             try:
                 lls = self._fit_single(spikes, max_iter, tol, keys[restart])
-                final_ll = lls[-1] if lls else -float("inf")
+                final_ll = float(
+                    getattr(self, "log_likelihood_", lls[-1] if lls else -float("inf"))
+                )
 
                 if final_ll > best_final_ll:
                     best_final_ll = final_ll
                     best_lls = lls
-                    # Save model state
-                    best_state = {
-                        "init_mean": self.init_mean,
-                        "init_cov": self.init_cov,
-                        "init_discrete_state_prob": self.init_discrete_state_prob,
-                        "discrete_transition_matrix": self.discrete_transition_matrix,
-                        "continuous_transition_matrix": self.continuous_transition_matrix,
-                        "process_cov": self.process_cov,
-                        "spike_params": copy.deepcopy(self.spike_params),
-                        "smoother_discrete_state_prob": self.smoother_discrete_state_prob,
-                    }
+                    best_state = self._snapshot_em_state()
 
                 logger.info(
                     f"Restart {restart + 1}/{n_restarts}: "
@@ -1088,11 +1150,10 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             )
 
         # Restore best model state
-        for attr, value in best_state.items():
-            setattr(self, attr, value)
+        self._restore_em_state(best_state)
 
         # Re-run E-step to populate all smoother outputs for the best params
-        self._e_step(spikes)
+        self.log_likelihood_ = float(self._e_step(spikes))
 
         return best_lls
 
@@ -1796,11 +1857,34 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
                 f"!= ({n_oscillators}, {n_oscillators}, {n_discrete_states})"
             )
 
+        phase_difference = jnp.asarray(phase_difference)
+        coupling_strength = jnp.asarray(coupling_strength)
+        if not bool(jnp.all(jnp.isfinite(phase_difference))) or not bool(
+            jnp.all(jnp.isfinite(coupling_strength))
+        ):
+            raise ValueError(
+                "phase_difference and coupling_strength must contain only finite "
+                "values."
+            )
+        diag_idx = jnp.arange(n_oscillators)
+        diag_phase = phase_difference[diag_idx, diag_idx, :]
+        diag_coupling = coupling_strength[diag_idx, diag_idx, :]
+        if bool(jnp.any(jnp.abs(diag_phase) > 1e-8)):
+            raise ValueError(
+                "DIM-PP phase_difference diagonal entries are ignored by the "
+                "transition model and must be zero."
+            )
+        if bool(jnp.any(jnp.abs(diag_coupling) > 1e-8)):
+            raise ValueError(
+                "DIM-PP coupling_strength diagonal entries are ignored by the "
+                "transition model and must be zero."
+            )
+
         self.freqs = freqs
         self.damping_coef = damping_coef
         self.process_variance = process_variance
-        self.phase_difference = phase_difference
-        self.coupling_strength = coupling_strength
+        self.phase_difference = phase_difference.at[diag_idx, diag_idx, :].set(0.0)
+        self.coupling_strength = coupling_strength.at[diag_idx, diag_idx, :].set(0.0)
         self.use_reparameterized_mstep = use_reparameterized_mstep
         self._current_osc_params: Optional[list[dict]] = None
 
@@ -1830,32 +1914,12 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         )
 
     def _m_step_dynamics(self) -> None:
-        """M-step with optional reparameterized transition update.
-
-        Caches the unconstrained A and sufficient statistics (gamma1, beta)
-        so that _project_parameters can check whether projection worsens
-        the Q-function.
-        """
+        """M-step with optional reparameterized transition update."""
         if self.use_reparameterized_mstep:
             self._m_step_reparameterized()
             return
 
         super()._m_step_dynamics()
-
-        # Cache sufficient statistics for Q-function-aware projection
-        self._transition_suff_stats = compute_transition_sufficient_stats(
-            state_cond_smoother_means=self.smoother_state_cond_mean,
-            state_cond_smoother_covs=self.smoother_state_cond_cov,
-            smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
-            pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
-            pair_cond_smoother_means=self.smoother_pair_cond_means,
-            pair_cond_smoother_covs=getattr(
-                self, "smoother_pair_cond_covs", None
-            ),
-            next_pair_cond_smoother_means=getattr(
-                self, "smoother_next_pair_cond_means", None
-            ),
-        )
 
     def _m_step_reparameterized(self) -> None:
         """M-step using reparameterized optimization for A.
@@ -1896,9 +1960,9 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         if self.update_discrete_transition_matrix:
             self.discrete_transition_matrix = new_discrete_transition
         if self.update_init_mean:
-            self.init_mean = new_init_mean
+            self.init_mean = self._regularize_init_mean_update(new_init_mean)
         if self.update_init_cov:
-            self.init_cov = new_init_cov
+            self.init_cov = self._regularize_init_cov_update(new_init_cov)
         self.init_discrete_state_prob = new_init_discrete_prob
 
         # Reparameterized optimization for A
@@ -1963,16 +2027,11 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         self.phase_difference = jnp.stack(phase_list, axis=-1)
 
     def _project_parameters(self) -> None:
-        """Project A to oscillatory block structure, preserving EM monotonicity.
+        """Project A to oscillatory block structure and enforce stability.
 
-        The unconstrained M-step maximizes the Q-function. Block projection
-        can worsen the Q-function, breaking EM monotonicity. We only accept
-        the projected A if it does not increase the Q-function loss. If
-        projection worsens the objective, we keep the unconstrained A.
-
-        After projection (or not), we enforce spectral radius < 1 for
-        stability, again only accepting the rescaled A if it doesn't
-        worsen the Q-function.
+        The directed-influence model is defined by coupled oscillator transition
+        blocks. The unconstrained switching Kalman M-step can leave that model
+        family, so projection is a hard structural constraint here.
         """
         if self.use_reparameterized_mstep:
             return  # Already valid by construction
@@ -1980,29 +2039,10 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         if not self.update_continuous_transition_matrix:
             return
 
-        suff_stats = getattr(self, "_transition_suff_stats", None)
-
         projected = []
         for j in range(self.n_discrete_states):
             A_unc_j = self.continuous_transition_matrix[:, :, j]
-            A_proj_j = project_coupled_transition_matrix(A_unc_j)
-
-            # Only accept projection if it doesn't worsen Q-function
-            if suff_stats is not None:
-                gamma1_j = suff_stats[0][:, :, j]
-                beta_j = suff_stats[1][:, :, j]
-                Q_j = self.process_cov[:, :, j]
-                q_unc = compute_transition_q_function(
-                    A_unc_j, gamma1_j, beta_j, process_cov=Q_j
-                )
-                q_proj = compute_transition_q_function(
-                    A_proj_j, gamma1_j, beta_j, process_cov=Q_j
-                )
-                # compute_transition_q_function returns negative Q (to minimize)
-                # so q_proj > q_unc means projection worsened the objective
-                A_j = jnp.where(q_proj <= q_unc, A_proj_j, A_unc_j)
-            else:
-                A_j = A_proj_j
+            A_j = project_coupled_transition_matrix(A_unc_j)
 
             # Enforce spectral radius < 1 for stability (unconditional).
             # Stability is a hard physical constraint: an unstable A causes
