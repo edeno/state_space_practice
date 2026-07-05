@@ -38,8 +38,8 @@ def symmetrize(A: jax.Array) -> jax.Array:
     >>> import jax.numpy as jnp
     >>> A = jnp.array([[1, 2], [3, 4]])
     >>> symmetrize(A)
-    DeviceArray([[1. , 2.5],
-                 [2.5, 4. ]], dtype=float32)
+    Array([[1. , 2.5],
+           [2.5, 4. ]], dtype=float32)
 
     """
     return 0.5 * (A + jnp.swapaxes(A, -1, -2))
@@ -60,9 +60,12 @@ def psd_solve(
 
     Stabilization shift
     -------------------
-    The shift added to the diagonal is::
+    The shift added to each matrix diagonal is::
 
         effective = max(diagonal_boost, relative_boost * max|diag(A)|)
+
+    For batched inputs the effective shift is computed independently for each
+    matrix in the batch.
 
     Using ``max(absolute, relative * scale)`` is standard numerics
     practice. Rationale:
@@ -90,7 +93,8 @@ def psd_solve(
     Parameters
     ----------
     A : jax.Array
-        The coefficient matrix, expected to be positive semi-definite.
+        The coefficient matrix or batch of coefficient matrices, expected to
+        be positive semi-definite.
     b : jax.Array
         The right-hand side vector or matrix.
     diagonal_boost : float, optional
@@ -114,16 +118,28 @@ def psd_solve(
     # the relative boost. For PSD matrices this is a tight bound on the
     # largest eigenvalue; for slightly non-PSD matrices (floating-point
     # drift) it is still a reasonable scale reference.
-    max_diag = jnp.max(jnp.abs(jnp.diagonal(A_sym, axis1=-2, axis2=-1)))
+    diag_abs = jnp.abs(jnp.diagonal(A_sym, axis1=-2, axis2=-1))
+    max_diag = jnp.max(diag_abs, axis=-1)
     effective_boost = jnp.maximum(
         jnp.asarray(diagonal_boost, dtype=A.dtype),
         jnp.asarray(relative_boost, dtype=A.dtype) * max_diag,
     )
-    return jax.scipy.linalg.solve(
-        A_sym + effective_boost * jnp.eye(n, dtype=A.dtype),
-        b,
-        assume_a="pos",
+    A_stabilized = A_sym + effective_boost[..., None, None] * jnp.eye(
+        n, dtype=A.dtype
     )
+    # Solve via an explicit Cholesky factor + cho_solve rather than
+    # jax.scipy.linalg.solve(assume_a="pos"). cho_solve deprecates a batch of
+    # 1D right-hand sides passed as b.ndim > 1 (ambiguous against a single 2D
+    # RHS), so give each system an explicit trailing solve axis -- exactly the
+    # b[..., None] ... .squeeze(-1) pattern the deprecation recommends -- and
+    # drop it again. The non-batched vector path is numerically unchanged, and
+    # 2D matrix right-hand sides (all internal callers) are untouched.
+    b = jnp.asarray(b)
+    rhs_is_vector = b.ndim == A_stabilized.ndim - 1
+    b_mat = b[..., None] if rhs_is_vector else b
+    cho = jax.scipy.linalg.cho_factor(A_stabilized)
+    x = jax.scipy.linalg.cho_solve(cho, b_mat)
+    return x[..., 0] if rhs_is_vector else x
 
 
 def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
@@ -385,9 +401,9 @@ def _validate_filter_numerics(
         # Rough upper bound on per-bin absolute covariance roundoff from
         # the predict-step congruence (A @ P @ A^T + Q) and the Cholesky
         # update. Error-analysis constants: conservative ~sqrt(n_state)
-        # factor, f32 machine epsilon ~1.2e-7. Accumulated over n_time
-        # bins (random-walk model), total roundoff ~
-        # n_time * sqrt(n_state) * eps * max_eig.
+        # factor, f32 machine epsilon ~1.2e-7. Under a random-walk
+        # accumulation model over n_time bins, total roundoff ~
+        # sqrt(n_time * n_state) * eps * max_eig.
         f32_eps = 1.2e-7
         worst_roundoff = (
             float((n_time * n_state) ** 0.5) * f32_eps * max_eig
@@ -591,6 +607,10 @@ def validate_probability_vector(
         If any entry is negative or the entries do not sum to 1 within ``atol``.
     """
     arr = jnp.asarray(probabilities)
+    if arr.ndim != 1:
+        raise ValueError(
+            f"{name} must be a 1D probability vector, got shape {arr.shape}."
+        )
     if not bool(jnp.all(jnp.isfinite(arr))):
         raise ValueError(f"{name} has non-finite entries (NaN/Inf).")
     if bool(jnp.any(arr < -atol)):
@@ -612,7 +632,7 @@ def validate_probability_vector(
 
 # Minimum probability threshold for numerical stability
 _LOG_PROB_FLOOR = 1e-10
-_LOG_FLOOR_VALUE = -23.0  # approximately log(1e-10)
+_LOG_FLOOR_VALUE = float(np.log(_LOG_PROB_FLOOR))
 _DISCRETE_PROB_STABILITY_FLOOR = 1e-10
 
 
@@ -633,7 +653,8 @@ def divide_safe(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
     jax.Array
         ``numerator / denominator``, with 0.0 where ``denominator == 0.0``.
     """
-    return jnp.where(denominator == 0.0, 0.0, numerator / denominator)
+    safe_denominator = jnp.where(denominator == 0.0, 1.0, denominator)
+    return jnp.where(denominator == 0.0, 0.0, numerator / safe_denominator)
 
 
 def safe_log(x: jax.Array) -> jax.Array:
@@ -652,7 +673,12 @@ def safe_log(x: jax.Array) -> jax.Array:
     jax.Array
         log(x) where x > _LOG_PROB_FLOOR, otherwise _LOG_FLOOR_VALUE.
     """
-    return jnp.where(x > _LOG_PROB_FLOOR, jnp.log(x), _LOG_FLOOR_VALUE)
+    x = jnp.asarray(x)
+    x = x.astype(jnp.result_type(x, 1.0))
+    floor = jnp.asarray(_LOG_PROB_FLOOR, dtype=x.dtype)
+    floor_value = jnp.asarray(_LOG_FLOOR_VALUE, dtype=x.dtype)
+    safe_x = jnp.where(x > floor, x, floor)
+    return jnp.where(x > floor, jnp.log(safe_x), floor_value)
 
 
 def stabilize_probability_vector(probabilities: jax.Array) -> jax.Array:
@@ -677,23 +703,40 @@ def stabilize_probability_vector(probabilities: jax.Array) -> jax.Array:
     -----
     If the input is all zeros (e.g. from complete underflow), every element
     is raised to the floor and re-normalization produces a uniform
-    distribution. This is intentional for numerical robustness, but it is
-    usually a sign of upstream numerical trouble — every iteration the
-    filter's discrete-state posterior is reset toward uniform, erasing the
-    evidence from observations. A ``jax.debug.print`` fires on the all-zero
+    distribution. Non-finite entries are also sanitized before flooring so one
+    bad scan step does not poison every later discrete posterior. These paths
+    are intentional for numerical robustness, but they are usually a sign of
+    upstream numerical trouble. A ``jax.debug.print`` fires on the fallback
     path so callers see it in filter/smoother logs without changing the
     function's return contract.
     """
+    probabilities = jnp.asarray(probabilities)
+    probabilities = probabilities.astype(jnp.result_type(probabilities, 1.0))
     floor = jnp.asarray(_DISCRETE_PROB_STABILITY_FLOOR, dtype=probabilities.dtype)
+    has_nonfinite = jnp.any(~jnp.isfinite(probabilities))
+    has_posinf = jnp.any(jnp.isposinf(probabilities))
+    positive_infinity_mass = jnp.where(
+        jnp.isposinf(probabilities),
+        jnp.ones_like(probabilities),
+        jnp.zeros_like(probabilities),
+    )
+    finite_probabilities = jnp.nan_to_num(
+        probabilities,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    cleaned = jnp.where(has_posinf, positive_infinity_mass, finite_probabilities)
+    all_nonpositive = jnp.all(cleaned <= 0)
     debug_print_if(
-        jnp.all(probabilities <= 0),
-        "utils.stabilize_probability_vector: input was all-zero (max={m}); "
-        "falling back to uniform distribution. The filter's discrete-state "
-        "posterior is being silently reset — expect the switching-model "
-        "fit to ignore observations at this step.",
+        has_nonfinite | all_nonpositive,
+        "utils.stabilize_probability_vector: input was non-finite or "
+        "all-nonpositive (max={m}); "
+        "sanitizing and flooring the discrete-state posterior. Check upstream "
+        "likelihood scaling if this repeats.",
         m=jnp.max(probabilities),
     )
-    stabilized = jnp.maximum(probabilities, floor)
+    stabilized = jnp.maximum(cleaned, floor)
     return stabilized / jnp.sum(stabilized)
 
 
@@ -712,15 +755,34 @@ def scale_likelihood(log_likelihood: jax.Array) -> tuple[jax.Array, jax.Array]:
     ll_max : jax.Array
         Maximum log likelihood (scalar array).
     """
-    ll_max = log_likelihood.max()
-    ll_max = jnp.where(jnp.isfinite(ll_max), ll_max, 0.0)
-    return jnp.exp(log_likelihood - ll_max), ll_max
+    log_likelihood = jnp.asarray(log_likelihood)
+    log_likelihood = log_likelihood.astype(jnp.result_type(log_likelihood, 1.0))
+    has_nan = jnp.any(jnp.isnan(log_likelihood))
+    has_posinf = jnp.any(jnp.isposinf(log_likelihood))
+
+    finite_log_likelihood = jnp.where(
+        jnp.isfinite(log_likelihood), log_likelihood, -jnp.inf
+    )
+    finite_ll_max = finite_log_likelihood.max()
+    ll_max = jnp.where(jnp.isfinite(finite_ll_max), finite_ll_max, 0.0)
+    scaled = jnp.exp(finite_log_likelihood - ll_max)
+
+    posinf_scaled = jnp.asarray(
+        log_likelihood == jnp.inf, dtype=scaled.dtype
+    )
+    scaled = jnp.where(has_posinf, posinf_scaled, scaled)
+    ll_max = jnp.where(has_posinf, jnp.inf, ll_max)
+
+    scaled = jnp.where(has_nan, jnp.full_like(scaled, jnp.nan), scaled)
+    ll_max = jnp.where(has_nan, jnp.nan, ll_max)
+    return scaled, ll_max
 
 
 def check_converged(
     log_likelihood: Numeric,
     previous_log_likelihood: Numeric,
     tolerance: float = 1e-4,
+    absolute_tolerance: Optional[float] = None,
 ) -> tuple[bool, bool]:
     """We have converged if the slope of the log-likelihood function falls below 'tolerance',
 
@@ -735,6 +797,9 @@ def check_converged(
         Previous log likelihood
     tolerance : float, optional
         threshold for similarity, by default 1e-4
+    absolute_tolerance : float, optional
+        Absolute change threshold used when the likelihood scale is near zero.
+        Defaults to ``tolerance``.
 
     Returns
     -------
@@ -752,6 +817,11 @@ def check_converged(
         return False, bool(is_increasing)
 
     delta_log_likelihood = np.abs(log_likelihood - previous_log_likelihood)
+    if absolute_tolerance is None:
+        absolute_tolerance = tolerance
+    if delta_log_likelihood < absolute_tolerance:
+        return True, True
+
     eps = np.finfo(float).eps
     avg_log_likelihood = (np.abs(log_likelihood) + np.abs(previous_log_likelihood) + eps) / 2
 
@@ -782,6 +852,15 @@ def make_discrete_transition_matrix(
     transition_matrix : Array, shape (n_discrete_states, n_discrete_states)
         Row-stochastic transition matrix.
     """
+    diag = jnp.asarray(diag)
+    if n_discrete_states < 1:
+        raise ValueError(
+            f"n_discrete_states must be at least 1, got {n_discrete_states}."
+        )
+    if diag.shape != (n_discrete_states,):
+        raise ValueError(
+            f"diag must have shape ({n_discrete_states},), got {diag.shape}."
+        )
     if n_discrete_states == 1:
         return jnp.array([[1.0]])
 
@@ -830,10 +909,12 @@ def hmm_viterbi(
         Most likely state sequence (integer-valued).
     """
     num_timesteps, num_states = log_likelihoods.shape
+    log_initial_probs = _zero_preserving_log(initial_probs)
+    log_transition_matrix = _zero_preserving_log(transition_matrix)
 
     # Backward pass: accumulate best future scores and store argmax pointers
     def _backward_step(best_next_score, t):
-        scores = jnp.log(transition_matrix) + best_next_score + log_likelihoods[t + 1]
+        scores = log_transition_matrix + best_next_score + log_likelihoods[t + 1]
         best_next_state = jnp.argmax(scores, axis=1)
         best_next_score = jnp.max(scores, axis=1)
         return best_next_score, best_next_state
@@ -844,7 +925,7 @@ def hmm_viterbi(
 
     # Pick the best first state
     first_state = jnp.argmax(
-        jnp.log(initial_probs) + log_likelihoods[0] + best_second_score
+        log_initial_probs + log_likelihoods[0] + best_second_score
     )
 
     # Forward pass: trace through pointers
@@ -855,6 +936,12 @@ def hmm_viterbi(
     _, states = jax.lax.scan(_forward_step, first_state, best_next_states)
 
     return jnp.concatenate([jnp.array([first_state]), states])
+
+
+def _zero_preserving_log(probabilities: Array) -> Array:
+    """Return log probabilities while keeping exact zeros at ``-inf``."""
+    safe_probabilities = jnp.where(probabilities == 0, 1.0, probabilities)
+    return jnp.where(probabilities == 0, -jnp.inf, jnp.log(safe_probabilities))
 
 
 # ---------------------------------------------------------------------------
@@ -884,14 +971,22 @@ def compute_state_overlap(
     -------
     overlap : Array, shape (K, K)
         Overlap matrix where ``K = max(z1.max(), z2.max()) + 1``.
+
+    Notes
+    -----
+    ``K`` is data-dependent, so this host-side helper is not compatible with
+    ``jax.jit``.
     """
-    K = jnp.maximum(z1.max(), z2.max()) + 1
-    overlap = jnp.sum(
-        (z1[:, None] == jnp.arange(K))[:, :, None]
-        & (z2[:, None] == jnp.arange(K))[:, None, :],
-        axis=0,
-    )
-    return overlap
+    z1 = jnp.asarray(z1)
+    z2 = jnp.asarray(z2)
+    if z1.shape != z2.shape:
+        raise ValueError(
+            f"z1 and z2 must have the same shape, got {z1.shape} and {z2.shape}."
+        )
+
+    K = int(jnp.maximum(z1.max(), z2.max())) + 1
+    overlap = jnp.zeros((K, K), dtype=jnp.int32)
+    return overlap.at[z1, z2].add(1)
 
 
 def find_permutation(

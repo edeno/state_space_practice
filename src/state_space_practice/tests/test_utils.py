@@ -7,7 +7,10 @@ import pytest
 
 from state_space_practice.utils import (
     check_converged,
+    compute_state_overlap,
     divide_safe,
+    hmm_viterbi,
+    make_discrete_transition_matrix,
     project_psd,
     psd_solve,
     safe_log,
@@ -151,6 +154,14 @@ class TestCheckConverged:
         assert is_converged is True
         assert is_increasing is True
 
+    def test_near_zero_absolute_wobble_converges(self) -> None:
+        """Near-zero likelihoods should not explode the relative-change check."""
+        is_converged, is_increasing = check_converged(
+            -1e-12, 1e-12, tolerance=1e-4
+        )
+        assert is_converged is True
+        assert is_increasing is True
+
 
 class TestLinearAlgebraUtilities:
     """Tests for linear algebra utilities moved from kalman.py."""
@@ -253,6 +264,21 @@ class TestLinearAlgebraUtilities:
         x = psd_solve(A, b)
         assert jnp.all(jnp.isfinite(x))
 
+    def test_psd_solve_batched_boost_matches_vmap(self) -> None:
+        """Direct batches should get the same per-matrix boost as vmapped calls."""
+        A = jnp.stack([jnp.eye(2), 1.0e6 * jnp.eye(2)])
+        b = jnp.stack([jnp.ones(2), jnp.ones(2)])
+
+        batched = psd_solve(A, b, diagonal_boost=0.0, relative_boost=1e-6)
+        vmapped = jax.vmap(
+            lambda A_i, b_i: psd_solve(
+                A_i, b_i, diagonal_boost=0.0, relative_boost=1e-6
+            )
+        )(A, b)
+
+        np.testing.assert_allclose(batched, vmapped, rtol=1e-6, atol=1e-12)
+        assert float(batched[0, 0]) > 0.99
+
     def test_project_psd_clips_negative_eigvals(self) -> None:
         Q = jnp.array([[1.0, 0.5], [0.5, -0.1]])  # indefinite
         Q_psd = project_psd(Q, min_eigenvalue=1e-4)
@@ -338,15 +364,28 @@ class TestProbabilityUtilities:
         result = divide_safe(num, den)
         np.testing.assert_allclose(result, jnp.array([2.0, 0.0, 2.0]))
 
+    def test_divide_safe_zero_denominator_gradient_is_finite(self) -> None:
+        grad = jax.grad(lambda d: divide_safe(jnp.array(1.0), d))(jnp.array(0.0))
+        assert float(grad) == 0.0
+
     def test_safe_log_at_floor_boundary(self) -> None:
-        """safe_log should floor small inputs to -23.0, not -inf."""
+        """safe_log should floor small inputs to log(_LOG_PROB_FLOOR), not -inf."""
         result = safe_log(jnp.array(0.0))
-        assert float(result) == -23.0
+        np.testing.assert_allclose(result, np.log(1e-10), rtol=1e-6)
 
     def test_safe_log_normal(self) -> None:
         """safe_log should match jnp.log for values above the floor."""
         x = jnp.array(0.5)
         np.testing.assert_allclose(safe_log(x), jnp.log(x), atol=1e-6)
+
+    def test_safe_log_is_monotone_at_floor(self) -> None:
+        below = safe_log(jnp.array(0.5e-10))
+        above = safe_log(jnp.array(1.01e-10))
+        assert float(below) < float(above)
+
+    def test_safe_log_zero_gradient_is_finite(self) -> None:
+        grad = jax.grad(lambda x: safe_log(x))(jnp.array(0.0))
+        assert float(grad) == 0.0
 
     def test_stabilize_probability_vector_sums_to_one(self) -> None:
         p = jnp.array([0.1, 0.2, 0.7])
@@ -366,6 +405,18 @@ class TestProbabilityUtilities:
         stabilized = stabilize_probability_vector(p)
         assert float(stabilized[0]) > 0.99
 
+    def test_stabilize_probability_vector_sanitizes_nan(self) -> None:
+        p = jnp.array([0.5, jnp.nan, 0.5])
+        stabilized = stabilize_probability_vector(p)
+        assert bool(jnp.all(jnp.isfinite(stabilized)))
+        np.testing.assert_allclose(float(jnp.sum(stabilized)), 1.0, atol=1e-12)
+        assert float(stabilized[1]) < 1e-6
+
+    def test_stabilize_probability_vector_all_nan_gives_uniform(self) -> None:
+        p = jnp.array([jnp.nan, jnp.nan, jnp.nan])
+        stabilized = stabilize_probability_vector(p)
+        np.testing.assert_allclose(stabilized, jnp.ones(3) / 3.0, atol=1e-6)
+
     def test_scale_likelihood_subtracts_max(self) -> None:
         ll = jnp.array([-10.0, -5.0, -20.0])
         scaled, ll_max = scale_likelihood(ll)
@@ -380,6 +431,12 @@ class TestProbabilityUtilities:
         assert float(ll_max) == 0.0
         # exp(-inf - 0) = 0.0
         np.testing.assert_allclose(scaled, jnp.zeros(3))
+
+    def test_scale_likelihood_positive_infinity_uses_indicator(self) -> None:
+        ll = jnp.array([1.0, jnp.inf, jnp.inf])
+        scaled, ll_max = scale_likelihood(ll)
+        assert bool(jnp.isposinf(ll_max))
+        np.testing.assert_allclose(scaled, jnp.array([0.0, 1.0, 1.0]))
 
 
 class TestValidateCovariance:
@@ -480,3 +537,48 @@ class TestValidateProbabilityVector:
         # [0.5, nan] would slip past the sum check: abs(nan - 1) > atol is False.
         with pytest.raises(ValueError, match="non-finite"):
             validate_probability_vector(jnp.array([0.5, jnp.nan]))
+
+    def test_matrix_raises(self) -> None:
+        with pytest.raises(ValueError, match="1D probability vector"):
+            validate_probability_vector(jnp.array([[0.25, 0.25], [0.25, 0.25]]))
+
+
+class TestDiscreteStateUtilities:
+    """Tests for discrete-state transition, Viterbi, and alignment helpers."""
+
+    def test_make_discrete_transition_matrix_shape_guard(self) -> None:
+        with pytest.raises(ValueError, match="diag must have shape"):
+            make_discrete_transition_matrix(jnp.array([0.9, 0.8]), 3)
+
+    def test_make_discrete_transition_matrix_requires_state(self) -> None:
+        with pytest.raises(ValueError, match="at least 1"):
+            make_discrete_transition_matrix(jnp.array([]), 0)
+
+    def test_hmm_viterbi_preserves_structural_zero_transitions(self) -> None:
+        initial_probs = jnp.array([1.0, 0.0])
+        transition_matrix = jnp.array([[0.0, 1.0], [1.0, 0.0]])
+        # Observations prefer state 0 at every time, but the transition matrix
+        # forces alternation from the known initial state.
+        log_likelihoods = jnp.array([[0.0, -10.0], [0.0, -10.0], [0.0, -10.0]])
+
+        states = hmm_viterbi(initial_probs, transition_matrix, log_likelihoods)
+
+        np.testing.assert_array_equal(np.asarray(states), np.array([0, 1, 0]))
+
+    def test_compute_state_overlap_uses_linear_memory_scatter(self) -> None:
+        z1 = jnp.array([0, 0, 1, 2, 2])
+        z2 = jnp.array([1, 1, 1, 0, 2])
+        overlap = compute_state_overlap(z1, z2)
+        expected = jnp.array(
+            [
+                [0, 2, 0],
+                [0, 1, 0],
+                [1, 0, 1],
+            ],
+            dtype=jnp.int32,
+        )
+        np.testing.assert_array_equal(overlap, expected)
+
+    def test_compute_state_overlap_shape_guard(self) -> None:
+        with pytest.raises(ValueError, match="same shape"):
+            compute_state_overlap(jnp.array([0, 1]), jnp.array([0]))
