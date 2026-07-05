@@ -142,7 +142,9 @@ def joseph_form_update(
     """
     D = prior_cov.shape[0]
     I_KH = jnp.eye(D) - kalman_gain @ emission_matrix
-    return symmetrize(I_KH @ prior_cov @ I_KH.T + kalman_gain @ emission_cov @ kalman_gain.T)
+    return symmetrize(
+        I_KH @ prior_cov @ I_KH.T + kalman_gain @ emission_cov @ kalman_gain.T
+    )
 
 
 def _validate_kalman_public_inputs(
@@ -174,19 +176,18 @@ def _validate_kalman_public_inputs(
 
     n_state = init_mean.shape[0]
     n_obs = obs.shape[1]
+    n_time = obs.shape[0]
     expected_shapes = {
         "init_cov": (n_state, n_state),
         "transition_matrix": (n_state, n_state),
         "process_cov": (n_state, n_state),
         "measurement_matrix": (n_obs, n_state),
-        "measurement_cov": (n_obs, n_obs),
     }
     actual_arrays = {
         "init_cov": init_cov,
         "transition_matrix": transition_matrix,
         "process_cov": process_cov,
         "measurement_matrix": measurement_matrix,
-        "measurement_cov": measurement_cov,
     }
     for name, expected_shape in expected_shapes.items():
         if actual_arrays[name].shape != expected_shape:
@@ -195,23 +196,77 @@ def _validate_kalman_public_inputs(
                 f"got {actual_arrays[name].shape}."
             )
 
+    # measurement_cov may be a single constant matrix (n_obs, n_obs) or a
+    # per-time-step stack with a leading time axis (n_time, n_obs, n_obs).
+    measurement_cov_is_time_varying = measurement_cov.ndim == 3
+    if measurement_cov_is_time_varying:
+        if measurement_cov.shape != (n_time, n_obs, n_obs):
+            raise ValueError(
+                "measurement_cov with a leading time axis must have shape "
+                f"(n_time={n_time}, {n_obs}, {n_obs}); "
+                f"got {measurement_cov.shape}."
+            )
+    elif measurement_cov.shape != (n_obs, n_obs):
+        raise ValueError(
+            f"measurement_cov must have shape ({n_obs}, {n_obs}) or, for "
+            f"time-varying observation noise, (n_time={n_time}, {n_obs}, "
+            f"{n_obs}); got {measurement_cov.shape}."
+        )
+
     for name, arr in (
         ("init_mean", init_mean),
         ("obs", obs),
         ("transition_matrix", transition_matrix),
         ("measurement_matrix", measurement_matrix),
+        ("measurement_cov", measurement_cov),
     ):
         if not bool(jnp.all(jnp.isfinite(arr))):
             raise ValueError(f"{name} must contain only finite values.")
 
-    _validate_filter_numerics(
-        init_cov,
-        n_time=int(obs.shape[0]),
-        stacklevel=4,
-        filter_name=filter_name,
-        measurement_cov=measurement_cov,
-        process_cov=process_cov,
-    )
+    if measurement_cov_is_time_varying:
+        if not bool(
+            jnp.allclose(
+                measurement_cov,
+                jnp.swapaxes(measurement_cov, -1, -2),
+                rtol=1e-6,
+                atol=1e-8,
+            )
+        ):
+            asym = float(
+                jnp.max(
+                    jnp.abs(measurement_cov - jnp.swapaxes(measurement_cov, -1, -2))
+                )
+            )
+            raise ValueError(
+                "measurement_cov must be symmetric at every time step "
+                f"(max|R - R.T| = {asym:g})."
+            )
+        # Per-bin R: require every slice positive definite. eigvalsh is
+        # batched over the leading time axis (O(n_time * n_obs^3)) but runs
+        # once per public call, since inner loops pass validate_inputs=False.
+        min_slice_eig = float(jnp.linalg.eigvalsh(symmetrize(measurement_cov)).min())
+        if not min_slice_eig > 0.0:
+            raise ValueError(
+                "measurement_cov must be positive definite at every time "
+                f"step; the minimum eigenvalue across all bins is "
+                f"{min_slice_eig}."
+            )
+        _validate_filter_numerics(
+            init_cov,
+            n_time=int(n_time),
+            stacklevel=4,
+            filter_name=filter_name,
+            process_cov=process_cov,
+        )
+    else:
+        _validate_filter_numerics(
+            init_cov,
+            n_time=int(n_time),
+            stacklevel=4,
+            filter_name=filter_name,
+            measurement_cov=measurement_cov,
+            process_cov=process_cov,
+        )
     return (
         init_mean,
         init_cov,
@@ -221,7 +276,6 @@ def _validate_kalman_public_inputs(
         measurement_matrix,
         measurement_cov,
     )
-
 
 
 @jax.jit
@@ -332,10 +386,22 @@ def _kalman_filter_impl(
     measurement_matrix: jax.Array,
     measurement_cov: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Jitted Kalman-filter scan. See :func:`kalman_filter` for the public API."""
+    """Jitted Kalman-filter scan. See :func:`kalman_filter` for the public API.
 
-    def _step(carry, obs_t):
+    ``measurement_cov`` may be a single ``(n_obs, n_obs)`` matrix (constant
+    observation noise) or a per-time-step stack ``(n_time, n_obs, n_obs)``. The
+    time-varying branch is selected at trace time from the static ndim, so each
+    form compiles to its own specialization.
+    """
+    time_varying_measurement_cov = measurement_cov.ndim == 3
+
+    def _step(carry, step_inputs):
         mean_prev, cov_prev, marginal_log_likelihood = carry
+        if time_varying_measurement_cov:
+            obs_t, measurement_cov_t = step_inputs
+        else:
+            obs_t = step_inputs
+            measurement_cov_t = measurement_cov
         posterior_mean, posterior_cov, marginal_log_likelihood_t = (
             _kalman_filter_update(
                 mean_prev,
@@ -344,7 +410,7 @@ def _kalman_filter_impl(
                 transition_matrix,
                 process_cov,
                 measurement_matrix,
-                measurement_cov,
+                measurement_cov_t,
             )
         )
 
@@ -355,14 +421,18 @@ def _kalman_filter_impl(
             posterior_cov,
         )
 
+    scan_inputs = (obs, measurement_cov) if time_varying_measurement_cov else obs
     marginal_log_likelihood = jnp.array(0.0)
-    (_, _, marginal_log_likelihood), (
-        filtered_mean,
-        filtered_cov,
+    (
+        (_, _, marginal_log_likelihood),
+        (
+            filtered_mean,
+            filtered_cov,
+        ),
     ) = jax.lax.scan(
         _step,
         (init_mean, init_cov, marginal_log_likelihood),
-        obs,
+        scan_inputs,
     )
 
     return filtered_mean, filtered_cov, marginal_log_likelihood
@@ -395,9 +465,12 @@ def kalman_filter(
         State noise covariance, $$ \\Sigma $$.
     measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
         Observation matrix, $$ H $$.
-    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
-        Observation noise covariance, $$ R $$. Must be strictly positive
-        definite.
+    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim) or (n_time, n_obs_dim, n_obs_dim)
+        Observation noise covariance, $$ R $$. A 2-D array is constant over
+        time; a 3-D array with a leading time axis supplies a separate
+        $$ R_t $$ per time step (used by the iterated-Laplace / IRLS smoother
+        in :mod:`state_space_practice.temporal_rate_gp`). Every slice must be
+        strictly positive definite.
     validate_inputs : bool, default=True
         If True, validate array shapes, finite observations, non-empty
         ``obs``, positive-definite ``init_cov`` / ``measurement_cov``, and
@@ -554,12 +627,17 @@ def rts_backward_scan(
         next_smoother_mean, next_smoother_cov = carry
         filter_mean, filter_cov = args
         smoother_mean, smoother_cov, smoother_cross_cov = _kalman_smoother_update(
-            next_smoother_mean, next_smoother_cov,
-            filter_mean, filter_cov,
-            process_cov, transition_matrix,
+            next_smoother_mean,
+            next_smoother_cov,
+            filter_mean,
+            filter_cov,
+            process_cov,
+            transition_matrix,
         )
         return (smoother_mean, smoother_cov), (
-            smoother_mean, smoother_cov, smoother_cross_cov,
+            smoother_mean,
+            smoother_cov,
+            smoother_cross_cov,
         )
 
     init_carry = (filtered_mean[-1], filtered_cov[-1])
@@ -588,12 +666,19 @@ def _kalman_smoother_impl(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Jitted RTS smoother. See :func:`kalman_smoother` for the public API."""
     filtered_mean, filtered_cov, marginal_log_likelihood = _kalman_filter_impl(
-        init_mean, init_cov, obs,
-        transition_matrix, process_cov,
-        measurement_matrix, measurement_cov,
+        init_mean,
+        init_cov,
+        obs,
+        transition_matrix,
+        process_cov,
+        measurement_matrix,
+        measurement_cov,
     )
     smoother_mean, smoother_cov, smoother_cross_cov = rts_backward_scan(
-        filtered_mean, filtered_cov, transition_matrix, process_cov,
+        filtered_mean,
+        filtered_cov,
+        transition_matrix,
+        process_cov,
     )
     return smoother_mean, smoother_cov, smoother_cross_cov, marginal_log_likelihood
 
@@ -625,9 +710,12 @@ def kalman_smoother(
         State noise covariance, $$ \\Sigma $$.
     measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states)
         Observation matrix, $$ H $$.
-    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim)
-        Observation noise covariance, $$ R $$. Must be strictly positive
-        definite.
+    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim) or (n_time, n_obs_dim, n_obs_dim)
+        Observation noise covariance, $$ R $$. A 2-D array is constant over
+        time; a 3-D array with a leading time axis supplies a separate
+        $$ R_t $$ per time step (used by the iterated-Laplace / IRLS smoother
+        in :mod:`state_space_practice.temporal_rate_gp`). Every slice must be
+        strictly positive definite.
     validate_inputs : bool, default=True
         If True, validate array shapes, finite observations, non-empty
         ``obs``, positive-definite ``init_cov`` / ``measurement_cov``, and
@@ -801,16 +889,16 @@ def parallel_kalman_smoother(
         L = symmetrize(E2 @ L1 @ E2.T + L2)
         return _SmootherElement(E=E, g=g, L=L)
 
-    scanned = jax.lax.associative_scan(
-        _operator, all_elements, reverse=True
-    )
+    scanned = jax.lax.associative_scan(_operator, all_elements, reverse=True)
 
     smoothed_means = scanned.g
     smoothed_covariances = scanned.L
 
     # Cross-covariances: P_{t,t+1|T} = J_t @ P_{t+1|T}
     smoother_gains = elements.E  # (T-1, D, D)
-    cross_covariances = jnp.einsum("tij,tjk->tik", smoother_gains, smoothed_covariances[1:])
+    cross_covariances = jnp.einsum(
+        "tij,tjk->tik", smoother_gains, smoothed_covariances[1:]
+    )
 
     return smoothed_means, smoothed_covariances, cross_covariances
 

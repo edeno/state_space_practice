@@ -1909,3 +1909,100 @@ class TestKalmanInputValidation:
             init_mean, init_cov, obs, A, Q, H, R
         )
         assert smoother_mean.shape == obs.shape
+
+
+# --- Time-varying measurement noise R_t ---
+
+
+def _time_varying_r_model():
+    """Small 2-state, scalar-observation linear-Gaussian model for R_t tests."""
+    init_mean = jnp.array([0.0, 0.0])
+    init_cov = jnp.eye(2)
+    A = jnp.array([[1.0, 0.1], [0.0, 0.95]])
+    Q = 0.01 * jnp.eye(2)
+    H = jnp.array([[1.0, 0.0]])
+    obs = jnp.array([[0.5], [0.3], [-0.2], [0.8], [0.1], [-0.4]])
+    return init_mean, init_cov, obs, A, Q, H
+
+
+def _const_r_sequence(r_value: float, n_time: int) -> Array:
+    return jnp.tile(jnp.array([[r_value]]), (n_time, 1, 1))
+
+
+def test_filter_time_varying_R_matches_constant_when_all_equal():
+    """A (T, 1, 1) R whose slices all equal R reproduces the constant-R filter."""
+    init_mean, init_cov, obs, A, Q, H = _time_varying_r_model()
+    R_const = jnp.array([[0.2]])
+    R_seq = _const_r_sequence(0.2, obs.shape[0])
+
+    m0, c0, ll0 = kalman_filter(init_mean, init_cov, obs, A, Q, H, R_const)
+    m1, c1, ll1 = kalman_filter(init_mean, init_cov, obs, A, Q, H, R_seq)
+
+    np.testing.assert_allclose(np.asarray(m1), np.asarray(m0), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(np.asarray(c1), np.asarray(c0), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(float(ll1), float(ll0), rtol=1e-10)
+
+
+def test_smoother_time_varying_R_matches_constant_when_all_equal():
+    """Time-varying-R smoother reproduces the constant-R smoother when R is constant."""
+    init_mean, init_cov, obs, A, Q, H = _time_varying_r_model()
+    R_const = jnp.array([[0.2]])
+    R_seq = _const_r_sequence(0.2, obs.shape[0])
+
+    sm0, sc0, scc0, ll0 = kalman_smoother(init_mean, init_cov, obs, A, Q, H, R_const)
+    sm1, sc1, scc1, ll1 = kalman_smoother(init_mean, init_cov, obs, A, Q, H, R_seq)
+
+    np.testing.assert_allclose(np.asarray(sm1), np.asarray(sm0), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(np.asarray(sc1), np.asarray(sc0), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(np.asarray(scc1), np.asarray(scc0), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(float(ll1), float(ll0), rtol=1e-10)
+
+
+def test_filter_large_R_at_one_bin_ignores_that_observation():
+    """An (almost) infinite R at one bin drives the filtered mean to the prediction.
+
+    With R -> infinity the Kalman gain -> 0, so the posterior mean at that bin
+    equals the one-step prediction A @ m_{t-1|t-1}, i.e. the observation is
+    ignored. This is the behavioral point of per-bin R.
+    """
+    init_mean, init_cov, obs, A, Q, H = _time_varying_r_model()
+    n_time = obs.shape[0]
+    R_seq = _const_r_sequence(0.2, n_time).at[2].set(jnp.array([[1e10]]))
+
+    means, _covs, _ll = kalman_filter(init_mean, init_cov, obs, A, Q, H, R_seq)
+
+    prediction_at_bin2 = A @ means[1]
+    np.testing.assert_allclose(
+        np.asarray(means[2]), np.asarray(prediction_at_bin2), rtol=1e-6, atol=1e-6
+    )
+
+
+def test_filter_time_varying_R_wrong_time_axis_raises():
+    """A (T', 1, 1) R with T' != n_time is rejected by the new validation."""
+    init_mean, init_cov, obs, A, Q, H = _time_varying_r_model()
+    R_seq = _const_r_sequence(0.2, obs.shape[0] + 1)
+    with pytest.raises(ValueError, match="leading time axis"):
+        kalman_filter(init_mean, init_cov, obs, A, Q, H, R_seq)
+
+
+def test_filter_time_varying_R_non_psd_slice_raises():
+    """A correctly-shaped per-bin R with a negative slice is rejected."""
+    init_mean, init_cov, obs, A, Q, H = _time_varying_r_model()
+    R_seq = _const_r_sequence(0.2, obs.shape[0]).at[1].set(jnp.array([[-0.5]]))
+    with pytest.raises(ValueError, match="positive definite"):
+        kalman_filter(init_mean, init_cov, obs, A, Q, H, R_seq)
+
+
+def test_filter_time_varying_R_asymmetric_slice_raises():
+    """Per-bin covariance slices must be symmetric before eigvalue checks."""
+    init_mean = jnp.zeros(2)
+    init_cov = jnp.eye(2)
+    obs = jnp.zeros((3, 2))
+    A = jnp.eye(2)
+    Q = 0.01 * jnp.eye(2)
+    H = jnp.eye(2)
+    R_seq = jnp.tile(jnp.eye(2)[None], (obs.shape[0], 1, 1))
+    R_seq = R_seq.at[1].set(jnp.array([[1.0, 0.9], [0.0, 1.0]]))
+
+    with pytest.raises(ValueError, match="symmetric"):
+        kalman_filter(init_mean, init_cov, obs, A, Q, H, R_seq)
