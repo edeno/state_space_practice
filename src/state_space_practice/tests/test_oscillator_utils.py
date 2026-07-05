@@ -78,6 +78,24 @@ def test__compute_coupling_transition_block_zero_strength():
     assert jnp.allclose(block, jnp.zeros((2, 2)), atol=1e-7)
 
 
+def test__compute_coupling_transition_block_has_gradient_at_zero_strength():
+    """Zero coupling should still be able to learn away from zero under SGD."""
+    phase = 0.7
+
+    def block_entry(coupling):
+        return _compute_coupling_transition_block(phase, coupling)[0, 0]
+
+    grad_at_zero = jax.grad(block_entry)(0.0)
+    np.testing.assert_allclose(grad_at_zero, np.cos(phase), atol=1e-7)
+
+
+def test__compute_coupling_transition_block_zero_strength_masks_nan_phase():
+    """An ignored phase on an exactly zero coupling should not create NaNs."""
+    block = _compute_coupling_transition_block(jnp.nan, 0.0)
+    assert jnp.all(jnp.isfinite(block))
+    np.testing.assert_allclose(block, jnp.zeros((2, 2)), atol=0.0)
+
+
 def test__compute_coupling_transition_block_nonzero():
     block = _compute_coupling_transition_block(jnp.pi, 2.0)
     expected = 2.0 * jnp.array([[-1.0, 0.0], [0.0, -1.0]])
@@ -239,9 +257,21 @@ def test__project_to_closest_rotation_general():
     mat = jnp.array([[1.5, 0.5], [-0.5, 1.0]])
     U, s, Vh = jnp.linalg.svd(mat)
     scale = jnp.sqrt(s[0] * s[1])
-    expected = scale * (U @ Vh)
+    det_sign = jnp.where(jnp.linalg.det(U @ Vh) < 0.0, -1.0, 1.0)
+    correction = jnp.diag(jnp.array([1.0, det_sign], dtype=mat.dtype))
+    expected = scale * (U @ correction @ Vh)
     projected = _project_to_closest_rotation(mat)
     assert jnp.allclose(projected, expected, atol=1e-7)
+
+
+def test__project_to_closest_rotation_rejects_reflection_solution():
+    """The SVD projection must stay in scaled rotations, not reflections."""
+    reflection = jnp.array([[1.0, 0.0], [0.0, -1.0]])
+    projected = _project_to_closest_rotation(reflection)
+
+    assert float(jnp.linalg.det(projected)) >= 0.0
+    np.testing.assert_allclose(projected[0, 0], projected[1, 1], atol=1e-7)
+    np.testing.assert_allclose(projected[0, 1], -projected[1, 0], atol=1e-7)
 
 
 def test__project_to_closest_rotation_pure_rotation():
@@ -336,6 +366,32 @@ def test_project_coupled_transition_matrix_uses_scaled_rotation_blocks():
             block = projected[2 * row:2 * row + 2, 2 * col:2 * col + 2]
             np.testing.assert_allclose(block[0, 0], block[1, 1], atol=1e-8)
             np.testing.assert_allclose(block[0, 1], -block[1, 0], atol=1e-8)
+
+
+def test_project_coupled_transition_matrix_matches_independent_block_projection():
+    """The coupled projection is the per-block scaled-rotation projection."""
+    matrix = jnp.array(
+        [
+            [0.8, -0.2, 0.4, 0.1],
+            [0.2, 0.8, -0.1, 0.4],
+            [0.3, -0.2, 0.7, 0.5],
+            [0.2, 0.3, -0.5, 0.7],
+        ]
+    )
+    projected = project_coupled_transition_matrix(matrix)
+    blocks = matrix.reshape(2, 2, 2, 2).transpose(0, 2, 1, 3)
+    a = 0.5 * (blocks[..., 0, 0] + blocks[..., 1, 1])
+    b = 0.5 * (blocks[..., 1, 0] - blocks[..., 0, 1])
+    expected_blocks = jnp.stack(
+        [
+            jnp.stack([a, -b], axis=-1),
+            jnp.stack([b, a], axis=-1),
+        ],
+        axis=-2,
+    )
+    expected = expected_blocks.transpose(0, 2, 1, 3).reshape(4, 4)
+
+    np.testing.assert_allclose(projected, expected, atol=1e-7)
 
 
 def test_project_correlated_noise_process_covariance_preserves_structure_and_psd():
@@ -561,6 +617,56 @@ def test_extract_dim_params_reconstructs_matrix():
 
     # Should be close
     assert jnp.allclose(A_reconstructed, A_original, atol=1e-4)
+
+
+def test_extract_dim_params_reconstructs_negative_frequency_matrix():
+    """Signed recovered frequencies must preserve clockwise rotation blocks."""
+    n_osc = 2
+    sampling_freq = 100.0
+    freqs = jnp.array([-8.0, 12.0])
+    damping = jnp.array([0.95, 0.92])
+    coupling = jnp.array([[0.0, 0.05], [0.08, 0.0]])
+    phase = jnp.array([[0.0, jnp.pi / 6], [jnp.pi / 3, 0.0]])
+
+    A_original = construct_directed_influence_transition_matrix(
+        freqs, damping, coupling, phase, sampling_freq
+    )
+    params = extract_dim_params_from_matrix(A_original, sampling_freq, n_osc)
+    A_reconstructed = construct_directed_influence_transition_matrix(
+        params["freq"],
+        params["damping"],
+        params["coupling_strength"],
+        params["phase_diff"],
+        sampling_freq,
+    )
+
+    np.testing.assert_allclose(params["freq"][0], freqs[0], atol=1e-5)
+    np.testing.assert_allclose(A_reconstructed, A_original, atol=1e-6)
+
+
+def test_extract_dim_params_canonicalizes_negative_coupling_but_reconstructs_matrix():
+    """Negative authored coupling is represented as magnitude plus shifted phase."""
+    n_osc = 2
+    sampling_freq = 100.0
+    freqs = jnp.array([8.0, -12.0])
+    damping = jnp.array([0.95, 0.92])
+    coupling = jnp.array([[0.0, -0.05], [0.08, 0.0]])
+    phase = jnp.array([[0.0, jnp.pi / 6], [jnp.pi / 3, 0.0]])
+
+    A_original = construct_directed_influence_transition_matrix(
+        freqs, damping, coupling, phase, sampling_freq
+    )
+    params = extract_dim_params_from_matrix(A_original, sampling_freq, n_osc)
+    A_reconstructed = construct_directed_influence_transition_matrix(
+        params["freq"],
+        params["damping"],
+        params["coupling_strength"],
+        params["phase_diff"],
+        sampling_freq,
+    )
+
+    assert jnp.all(params["coupling_strength"] >= 0.0)
+    np.testing.assert_allclose(A_reconstructed, A_original, atol=1e-6)
 
 
 # ============================================================================

@@ -95,9 +95,8 @@ def _compute_intrinsic_oscillation_block(
     damping_coef : float
         Controls the damping of the oscillation. A value of 1 corresponds to a
         pure oscillation, while a value of 0 corresponds to no oscillation.
-        Callers such as :func:`diag` warn and clip values outside ``[0, 1]``
-        before invoking this function, so passing an out-of-range value here
-        directly is a programming error.
+        Values outside ``[0, 1]`` are accepted here so callers can decide
+        whether to validate, clip, or optimize unconstrained parameters.
     sampling_freq : float, optional
         Samples per second, by default 1
 
@@ -145,10 +144,10 @@ def _compute_coupled_oscillator_block(
         The transition matrix at the specified frequency
 
     """
-    return (
-        _compute_intrinsic_oscillation_block(freq, damping_coef, sampling_freq)
-        - sum_incoming_coupling_strength * IDENTITY_2x2
-    )
+    eye = jnp.eye(2, dtype=jnp.result_type(freq, damping_coef, sum_incoming_coupling_strength))
+    return _compute_intrinsic_oscillation_block(
+        freq, damping_coef, sampling_freq
+    ) - sum_incoming_coupling_strength * eye
 
 
 def _compute_coupling_transition_block(
@@ -170,9 +169,12 @@ def _compute_coupling_transition_block(
         The transition matrix between the two oscillators
 
     """
-    # Calculate the potentially non-zero block
-    scaled_rotation = coupling_strength * _get_rotation_matrix(phase_difference)
-    return jnp.where(jnp.isclose(coupling_strength, 0.0), ZEROS_2x2, scaled_rotation)
+    safe_phase = jnp.where(
+        (coupling_strength == 0.0) & ~jnp.isfinite(phase_difference),
+        0.0,
+        phase_difference,
+    )
+    return coupling_strength * _get_rotation_matrix(safe_phase)
 
 
 def construct_common_oscillator_transition_matrix(
@@ -640,8 +642,13 @@ def _project_to_closest_rotation(matrix: jax.Array) -> jax.Array:
     # i.e. there is no shearing in the rotation matrix
     scale_factor = _get_scaling_factor(s)
 
-    # The rotation matrix is U @ Vh
-    projected = scale_factor * (U @ Vh)
+    # Orthogonal Procrustes with det +1. Plain U @ Vh may be a reflection when
+    # det(U @ Vh) < 0, which is outside the oscillator scaled-rotation family.
+    det_uv = jnp.linalg.det(U @ Vh)
+    det_sign = jnp.where(det_uv < 0.0, -1.0, 1.0)
+    correction = jnp.diag(jnp.array([1.0, det_sign], dtype=matrix.dtype))
+    rotation = U @ correction @ Vh
+    projected = scale_factor * rotation
 
     # If SVD produced NaN/Inf (numerical failure), fall back to a damped
     # identity (zero rotation). Returning the original matrix would defeat
@@ -658,7 +665,7 @@ def _project_to_closest_rotation(matrix: jax.Array) -> jax.Array:
     is_valid = jnp.all(jnp.isfinite(projected))
     frob_norm = jnp.linalg.norm(matrix, "fro")
     fallback_scale = jnp.where(jnp.isfinite(frob_norm), frob_norm / jnp.sqrt(2.0), 0.5)
-    fallback = fallback_scale * jnp.eye(matrix.shape[0])
+    fallback = fallback_scale * jnp.eye(matrix.shape[0], dtype=matrix.dtype)
     return jnp.where(is_valid, projected, fallback)
 
 
@@ -687,20 +694,12 @@ def _project_to_scaled_rotation_matrix(matrix: jax.Array) -> jax.Array:
     return jnp.where(is_valid, projected, fallback)
 
 
-def _scaled_rotation_scale_from_block(block: jax.Array) -> jax.Array:
-    """Return the coupling magnitude of the nearest scaled-rotation block."""
-    projected = _project_to_scaled_rotation_matrix(block)
-    return jnp.sqrt(projected[0, 0] ** 2 + projected[1, 0] ** 2)
-
-
 def _warn_if_rotation_projection_degenerate(transition_matrix: jax.Array) -> None:
     """Emit ONE fallback warning if any 2x2 block would fail rotation projection.
 
-    ``_project_to_closest_rotation`` falls back to a damped identity (zero
-    rotation, silently nulling an oscillation component) exactly when its input
-    block is non-finite: the SVD of any finite 2x2 is finite, and the geometric-
-    mean scale of a finite block is finite, so a finite block never triggers the
-    fallback. The reduced predicate is therefore ``any(~isfinite(input))``,
+    The projection helpers fall back to a damped identity (zero rotation,
+    silently nulling an oscillation component) exactly when their input block is
+    non-finite. The reduced predicate is therefore ``any(~isfinite(input))``,
     computed here in the NON-vmapped caller so ``debug_print_if``'s ``lax.cond``
     behaves conditionally instead of firing on every block.
     """
@@ -758,61 +757,8 @@ def _extract_scale_and_angle(block: jax.Array) -> tuple[jax.Array, jax.Array]:
     return scale, angle
 
 
-def _project_diagonal_block(
-    block: jax.Array, row_sum_scaling: jax.Array
-) -> jax.Array:
-    """Project a diagonal block with row sum adjustment.
-
-    Parameters
-    ----------
-    block : jax.Array, shape (2, 2)
-        The diagonal block to project
-    row_sum_scaling : jax.Array
-        The sum of scaling factors for this row
-
-    Returns
-    -------
-    jax.Array, shape (2, 2)
-        The projected diagonal block
-    """
-    adjusted = block + row_sum_scaling * IDENTITY_2x2
-    projected = _project_to_scaled_rotation_matrix(adjusted)
-    return projected - row_sum_scaling * IDENTITY_2x2
-
-
-def _project_block(
-    block: jax.Array,
-    row_sum_scaling: jax.Array,
-    is_diagonal: ArrayLike,
-) -> jax.Array:
-    """Project a single block, handling diagonal vs off-diagonal cases.
-
-    Parameters
-    ----------
-    block : jax.Array, shape (2, 2)
-        The block to project
-    row_sum_scaling : jax.Array
-        The sum of scaling factors for this row (only used for diagonal blocks)
-    is_diagonal : bool
-        Whether this is a diagonal block
-
-    Returns
-    -------
-    jax.Array, shape (2, 2)
-        The projected block
-    """
-    result: jax.Array = jax.lax.cond(
-        is_diagonal,
-        lambda b: _project_diagonal_block(b, row_sum_scaling),
-        lambda b: _project_to_scaled_rotation_matrix(b),
-        block,
-    )
-    return result
-
-
 def project_coupled_transition_matrix(transition_matrix: jax.Array) -> jax.Array:
-    """Projects each 2x2 oscillator block of the transition matrix to the closest
-    rotation matrix. This preserves the oscillatory structure of the transition matrix.
+    """Project each 2x2 block to the closest scaled-rotation oscillator block.
 
     Parameters
     ----------
@@ -840,35 +786,8 @@ def project_coupled_transition_matrix(transition_matrix: jax.Array) -> jax.Array
     # Transpose to (n_oscillators, n_oscillators, 2, 2) - (from, to, row, col)
     blocks = blocks.transpose(0, 2, 1, 3)
 
-    # --- Pass 1: Calculate scaling factors for all blocks using vmap ---
-    # vmap over both oscillator indices
-    scaling_factors_all = jax.vmap(
-        jax.vmap(_scaled_rotation_scale_from_block, in_axes=0), in_axes=0
-    )(blocks)  # shape (n_oscillators, n_oscillators)
-
-    # Zero out diagonal elements (we only want off-diagonal scaling factors)
-    diag_mask = jnp.eye(n_oscillators, dtype=bool)
-    scaling_factors = jnp.where(diag_mask, 0.0, scaling_factors_all)
-
-    # Calculate row sums for diagonal block adjustment
-    row_sum_scaling = jnp.sum(scaling_factors, axis=1)  # shape (n_oscillators,)
-
-    # --- Pass 2: Project all blocks using vmap ---
-    # Create diagonal mask for each block
-    is_diagonal = jnp.eye(n_oscillators, dtype=bool)
-
-    # Broadcast row_sum_scaling for each row
-    row_sums_broadcast = jnp.broadcast_to(
-        row_sum_scaling[:, None], (n_oscillators, n_oscillators)
-    )
-
-    # vmap _project_block over all blocks
-    project_row = jax.vmap(_project_block, in_axes=(0, 0, 0))
-    project_all = jax.vmap(project_row, in_axes=(0, 0, 0))
-
-    projected_blocks = project_all(
-        blocks, row_sums_broadcast, is_diagonal
-    )  # shape (n_oscillators, n_oscillators, 2, 2)
+    project_all = jax.vmap(jax.vmap(_project_to_scaled_rotation_matrix, in_axes=0))
+    projected_blocks = project_all(blocks)
 
     # Reshape back to (2*n_oscillators, 2*n_oscillators)
     # (from, to, row, col) -> (from, row, to, col) -> (2*n_osc, 2*n_osc)
@@ -1030,11 +949,9 @@ def extract_dim_params_from_matrix(
 
     damping, angles = jax.vmap(_extract_scale_and_angle)(adjusted)
 
-    # Convert angles to frequencies. A negative recovered frequency is folded
-    # up by sampling_freq / 2 (into [0, fs/2)), treating it as a sub-Nyquist
-    # alias of the SVD-recovered angle -- not a full-period (fs) unwrap.
+    # Convert angles to signed frequencies in [-fs/2, fs/2]. Keeping the sign is
+    # necessary for construct(extract(A)) to preserve clockwise rotations.
     freq = angles * sampling_freq / (2 * jnp.pi)
-    freq = jnp.where(freq < 0, freq + sampling_freq / 2, freq)
 
     return {
         "damping": damping,
