@@ -477,7 +477,9 @@ def log_conditional_intensity(design_matrix: ArrayLike, params: ArrayLike) -> Ar
     return jnp.asarray(design_matrix) @ jnp.asarray(params)
 
 
-def _uses_default_linear_log_intensity(func: Callable[[ArrayLike, ArrayLike], Array]) -> bool:
+def _uses_default_linear_log_intensity(
+    func: Callable[[ArrayLike, ArrayLike], Array],
+) -> bool:
     """Return True when ``func`` is the module's default linear log-rate."""
     return func is log_conditional_intensity
 
@@ -1182,6 +1184,18 @@ def stochastic_point_process_filter(
     if validate_inputs:
         validate_scalar(dt, "dt", positive=True)
         validate_count_array(spike_indicator, "spike_indicator")
+        # Numerical sanity check BEFORE the block dispatch below: raises on
+        # non-PSD init_cov, warns on f32 + long T + ill-conditioned configs.
+        # The block path (large-state / long-T) is exactly where these matter,
+        # so the check must run before dispatch, not only on the dense path.
+        # Gated behind ``validate_inputs`` so tight inner loops (e.g. SGD) can
+        # pass False after a single validation at the top of fit_sgd.
+        # stacklevel=4 so the warning points at the user's call site:
+        # user -> fit_sgd -> _sgd_loss_fn -> stochastic_point_process_filter
+        # -> _validate.
+        _validate_filter_numerics(
+            init_covariance_params, n_time=spike_indicator.shape[0], stacklevel=4
+        )
 
     # Block-diagonal dispatch (opt-in via block_n_neurons / block_size).
     # The caller is responsible for calling _detect_block_diagonal_problem
@@ -1235,16 +1249,7 @@ def stochastic_point_process_filter(
             max_newton_iter=max_newton_iter,
         )
 
-    # Numerical sanity check. Raises on non-PSD init_cov, warns on f32 +
-    # long T + ill-conditioned configurations. Gated behind
-    # ``validate_inputs`` so tight inner loops (e.g. SGD) can pass False
-    # after a single validation at the top of fit_sgd. stacklevel=4 so
-    # the warning points at the user's call site: user -> fit_sgd ->
-    # _sgd_loss_fn -> stochastic_point_process_filter -> _validate.
-    if validate_inputs:
-        _validate_filter_numerics(
-            init_covariance_params, n_time=spike_indicator.shape[0], stacklevel=4
-        )
+    # (Numerical sanity check already ran above, before block dispatch.)
 
     # Promote single-neuron spike_indicator to (n_time, 1) for consistent handling
     single_neuron = spike_indicator.ndim == 1
@@ -1832,6 +1837,14 @@ def stochastic_point_process_smoother(
     if validate_inputs:
         validate_scalar(dt, "dt", positive=True)
         validate_count_array(spike_indicator, "spike_indicator")
+        # Validate BEFORE the block dispatch below (the dense path would
+        # otherwise inherit this check from the inner filter call, but the
+        # block path returns early and would skip it). Raises on non-PSD
+        # init_cov, warns on f32 + long T. stacklevel=3: user -> smoother ->
+        # _validate.
+        _validate_filter_numerics(
+            init_covariance_params, n_time=spike_indicator.shape[0], stacklevel=3
+        )
 
     # Block-diagonal dispatch: same opt-in contract as the filter.
     # See stochastic_point_process_filter's block-dispatch comment for
@@ -1892,7 +1905,9 @@ def stochastic_point_process_smoother(
             log_conditional_intensity,
             include_laplace_normalization=include_laplace_normalization,
             max_log_count=max_log_count,
-            validate_inputs=validate_inputs,
+            # Already validated at this smoother's entry point above; skip
+            # the inner filter's redundant re-validation.
+            validate_inputs=False,
             max_newton_iter=max_newton_iter,
         )
     )
@@ -1956,6 +1971,7 @@ def dynamics_only_m_step(
     smoother_mean: ArrayLike,
     smoother_cov: ArrayLike,
     smoother_cross_cov: ArrayLike,
+    fixed_transition_matrix: Optional[ArrayLike] = None,
 ) -> tuple[Array, Array, Array, Array]:
     """Dynamics-only M-step: update (A, Q, init_mean, init_cov) from smoother outputs.
 
@@ -1974,11 +1990,20 @@ def dynamics_only_m_step(
     smoother_cross_cov : ArrayLike, shape (n_time - 1, n_cont_states, n_cont_states)
         Smoothed lag-one cross-covariances, indexed as
         ``Cov(x_t, x_{t+1} | y_{1:T})`` for ``t = 0, ..., T - 2``.
+    fixed_transition_matrix : ArrayLike or None, optional
+        If None (default), solve for the unconstrained ML transition matrix
+        ``A = beta gamma1^{-1}`` and use the Roweis-Ghahramani shortcut for
+        the process covariance ``Q = (gamma2 - A beta^T) / (T - 1)``, which is
+        exact only at that solved ``A``. If an array is supplied, ``A`` is held
+        fixed at it and returned unchanged, and ``Q`` is computed from the full
+        quadratic form ``(gamma2 - A beta^T - beta A^T + A gamma1 A^T)/(T-1)``,
+        which is the M-step optimum for the *given* (e.g. frozen) dynamics. The
+        two agree when ``A`` is the unconstrained solution.
 
     Returns
     -------
     transition_matrix : Array, shape (n_cont_states, n_cont_states)
-        Transition matrix.
+        Transition matrix (the unconstrained solve, or ``fixed_transition_matrix``).
     process_cov : Array, shape (n_cont_states, n_cont_states)
         Process covariance.
     mean_init : Array, shape (n_cont_states,)
@@ -2008,12 +2033,27 @@ def dynamics_only_m_step(
         + sum_of_outer_products(smoother_mean[:-1], smoother_mean[1:])
     ).T
 
-    # Transition matrix
-    transition_matrix = psd_solve(gamma1, beta.T).T
+    if fixed_transition_matrix is None:
+        # Unconstrained ML transition matrix; the shortcut for Q below is
+        # exact at this A because the cross terms collapse.
+        transition_matrix = psd_solve(gamma1, beta.T).T
+        process_cov_unnorm = gamma2 - transition_matrix @ beta.T
+    else:
+        # Hold A fixed and compute Q from the full quadratic form. The
+        # shortcut (gamma2 - A beta^T) is only the optimum at the solved A;
+        # using it with a frozen A yields a biased (and possibly non-PSD)
+        # noise estimate.
+        transition_matrix = jnp.asarray(fixed_transition_matrix)
+        process_cov_unnorm = (
+            gamma2
+            - transition_matrix @ beta.T
+            - beta @ transition_matrix.T
+            + transition_matrix @ gamma1 @ transition_matrix.T
+        )
 
     # Process covariance
     process_cov = stabilize_covariance(
-        (gamma2 - transition_matrix @ beta.T) / (n_time - 1),
+        process_cov_unnorm / (n_time - 1),
         min_eigenvalue=1e-8,
     )
 
@@ -2266,11 +2306,16 @@ class PointProcessModel(SGDFittableMixin):
         -------
         marginal_log_likelihood : float
         """
+        # The smoother returns the filtered moments from its single forward
+        # pass (return_filtered=True), so we don't run a second, redundant
+        # forward filter — the forward pass is the dominant per-iteration cost.
         (
             self.smoother_mean,
             self.smoother_cov,
             self.smoother_cross_cov,
             marginal_log_likelihood,
+            self.filtered_mean,
+            self.filtered_cov,
         ) = stochastic_point_process_smoother(
             init_mean_params=self.init_mean,
             init_covariance_params=self.init_cov,
@@ -2283,20 +2328,7 @@ class PointProcessModel(SGDFittableMixin):
             # fit() validates once at entry; skip re-validation on each
             # EM iteration's E-step.
             validate_inputs=False,
-            max_newton_iter=self.max_newton_iter,
-        )
-
-        # Also store filtered results
-        self.filtered_mean, self.filtered_cov, _ = stochastic_point_process_filter(
-            init_mean_params=self.init_mean,
-            init_covariance_params=self.init_cov,
-            design_matrix=design_matrix,
-            spike_indicator=spike_indicator,
-            dt=self.dt,
-            transition_matrix=self.transition_matrix,
-            process_cov=self.process_cov,
-            log_conditional_intensity=self.log_intensity_func,
-            validate_inputs=False,
+            return_filtered=True,
             max_newton_iter=self.max_newton_iter,
         )
 
@@ -2311,10 +2343,17 @@ class PointProcessModel(SGDFittableMixin):
         ):
             raise RuntimeError("Must run E-step before M-step")
 
+        # When A is frozen, the process-cov update must be taken against that
+        # frozen A via the full quadratic form; the Roweis-Ghahramani shortcut
+        # is the M-step optimum only at the freshly solved (unconstrained) A.
+        fixed_transition_matrix = (
+            None if self.update_transition_matrix else self.transition_matrix
+        )
         transition_matrix, process_cov, init_mean, init_cov = dynamics_only_m_step(
             self.smoother_mean,
             self.smoother_cov,
             self.smoother_cross_cov,
+            fixed_transition_matrix=fixed_transition_matrix,
         )
 
         if self.update_transition_matrix:
@@ -2395,20 +2434,21 @@ class PointProcessModel(SGDFittableMixin):
             self.init_cov = state["init_cov"]
 
         for iteration in range(max_iter):
-            # Snapshot state for potential rollback on LL decrease.
-            # Pattern from place_field_model.py: when an EM iteration
-            # produces a worse marginal LL than the previous one, the
-            # M-step parameters from the *previous* iteration are the
-            # ones to keep; restoring them gives a consistent
-            # (params, smoother) pair from the prior iteration.
-            prev_state = _snapshot_state()
-
             current_log_likelihood = self._e_step(design_matrix, spike_indicator)
             log_likelihoods.append(current_log_likelihood)
 
             if not jnp.isfinite(current_log_likelihood):
+                # Drop the non-finite LL so callers never see NaN/inf in the
+                # returned history, and restore the last consistent
+                # (params, smoother) pair. Without the restore the diverged
+                # E-step's NaN posteriors stay installed on the model and
+                # get_rate_estimate / get_confidence_interval serve NaN.
+                bad_ll = log_likelihoods.pop()
+                if last_accepted_state is not None:
+                    _restore_state(last_accepted_state)
                 logger.warning(
-                    f"Non-finite log-likelihood at iteration {iteration + 1}; "
+                    f"Non-finite log-likelihood ({bad_ll}) at iteration "
+                    f"{iteration + 1}; rolling back to previous E-step and "
                     f"stopping EM."
                 )
                 break
@@ -2421,9 +2461,15 @@ class PointProcessModel(SGDFittableMixin):
                 )
 
                 if not is_increasing:
-                    # Roll back to previous (better) state and stop.
-                    _restore_state(prev_state)
+                    # Roll back to the accepted state from the prior iteration.
+                    # last_accepted_state was snapshotted *before* the M-step
+                    # that produced the current (worse) parameters, so it holds
+                    # the (params, smoother) pair consistent with
+                    # log_likelihoods[-1]. Restoring the top-of-loop snapshot
+                    # instead would keep the rejected M-step's parameters.
                     bad_ll = log_likelihoods.pop()
+                    if last_accepted_state is not None:
+                        _restore_state(last_accepted_state)
                     logger.warning(
                         f"LL decreased: {log_likelihoods[-1]:.4f} -> "
                         f"{bad_ll:.4f}; rolling back to previous E-step "
@@ -2436,8 +2482,9 @@ class PointProcessModel(SGDFittableMixin):
                     break
 
             # Snapshot the accepted E-step state before the M-step changes
-            # parameters. The final E-step may reveal that this last M-step
-            # worsened the marginal LL; if so, restore this consistent state.
+            # parameters. A later E-step (next iteration or the final sync
+            # below) may reveal that this M-step worsened the marginal LL; if
+            # so, restore this consistent state.
             last_accepted_state = _snapshot_state()
             self._m_step()
 
@@ -2451,33 +2498,37 @@ class PointProcessModel(SGDFittableMixin):
                 f"Log-Likelihood: {current_log_likelihood:.4f}\t"
                 f"Change: {change:.6f}"
             )
-
-        if len(log_likelihoods) == max_iter and log_likelihoods:
-            logger.warning("Reached maximum iterations without converging.")
-            # Final E-step to sync smoother results with current parameters
-            final_ll = float(self._e_step(design_matrix, spike_indicator))
-            if not jnp.isfinite(final_ll):
-                if last_accepted_state is not None:
-                    _restore_state(last_accepted_state)
-                logger.warning(
-                    "Final E-step produced non-finite log-likelihood; "
-                    "rolling back to previous E-step."
-                )
-            else:
-                _, is_increasing = check_converged(
-                    final_ll,
-                    log_likelihoods[-1],
-                    tolerance,
-                )
-                if is_increasing:
-                    log_likelihoods.append(final_ll)
-                else:
+        else:
+            # for/else: reached only if the loop ran all max_iter iterations
+            # without breaking (no convergence, decrease, or non-finite exit).
+            # The last M-step ran without a following E-step, so sync the
+            # smoother to the current parameters — rolling back if that final
+            # E-step reveals the M-step worsened the marginal LL.
+            if log_likelihoods:
+                logger.warning("Reached maximum iterations without converging.")
+                final_ll = float(self._e_step(design_matrix, spike_indicator))
+                if not jnp.isfinite(final_ll):
                     if last_accepted_state is not None:
                         _restore_state(last_accepted_state)
                     logger.warning(
-                        f"Final E-step decreased LL: {log_likelihoods[-1]:.4f} -> "
-                        f"{final_ll:.4f}; rolling back to previous E-step."
+                        "Final E-step produced non-finite log-likelihood; "
+                        "rolling back to previous E-step."
                     )
+                else:
+                    _, is_increasing = check_converged(
+                        final_ll,
+                        log_likelihoods[-1],
+                        tolerance,
+                    )
+                    if is_increasing:
+                        log_likelihoods.append(final_ll)
+                    else:
+                        if last_accepted_state is not None:
+                            _restore_state(last_accepted_state)
+                        logger.warning(
+                            f"Final E-step decreased LL: {log_likelihoods[-1]:.4f}"
+                            f" -> {final_ll:.4f}; rolling back to previous E-step."
+                        )
 
         return log_likelihoods
 
@@ -2606,11 +2657,15 @@ class PointProcessModel(SGDFittableMixin):
             self.init_cov = params["init_cov"]
 
     def _finalize_sgd(self, design_matrix: Array, spike_indicator: Array) -> None:
+        # Take the filtered moments from the smoother's single forward pass
+        # (return_filtered=True) rather than running a second forward filter.
         (
             self.smoother_mean,
             self.smoother_cov,
             self.smoother_cross_cov,
             marginal_ll,
+            self.filtered_mean,
+            self.filtered_cov,
         ) = stochastic_point_process_smoother(
             init_mean_params=self.init_mean,
             init_covariance_params=self.init_cov,
@@ -2621,18 +2676,7 @@ class PointProcessModel(SGDFittableMixin):
             process_cov=self.process_cov,
             log_conditional_intensity=self.log_intensity_func,
             validate_inputs=False,  # validated at fit_sgd entry
-            max_newton_iter=self.max_newton_iter,
-        )
-        self.filtered_mean, self.filtered_cov, _ = stochastic_point_process_filter(
-            init_mean_params=self.init_mean,
-            init_covariance_params=self.init_cov,
-            design_matrix=design_matrix,
-            spike_indicator=spike_indicator,
-            dt=self.dt,
-            transition_matrix=self.transition_matrix,
-            process_cov=self.process_cov,
-            log_conditional_intensity=self.log_intensity_func,
-            validate_inputs=False,  # validated at fit_sgd entry
+            return_filtered=True,
             max_newton_iter=self.max_newton_iter,
         )
         self.log_likelihood_ = float(marginal_ll)
