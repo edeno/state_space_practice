@@ -42,6 +42,7 @@ from state_space_practice.switching_kalman import (
     compute_expected_complete_log_likelihood,
     compute_posterior_entropy,
     compute_transition_q_function,
+    optimize_dim_transition_params,
     switching_kalman_filter,
     switching_kalman_maximization_step,
     switching_kalman_smoother,
@@ -1028,6 +1029,60 @@ def test_m_step_rejects_sparse_transition_prior():
             pair_cond_smoother_cross_cov=cross,
             transition_prior=0.5 * jnp.ones((n_disc, n_disc)),
         )
+
+
+def test_m_step_rejects_single_timestep() -> None:
+    """The transition/process-noise M-step is undefined without lag-one pairs."""
+    n_time = 1
+    n_cont = 1
+    n_obs = 1
+    n_disc = 2
+    obs = jnp.zeros((n_time, n_obs), dtype=jnp.float32)
+    gamma = jnp.array([[0.4, 0.6]], dtype=jnp.float32)
+    xi = jnp.zeros((0, n_disc, n_disc), dtype=jnp.float32)
+    means = jnp.zeros((n_time, n_cont, n_disc), dtype=jnp.float32)
+    covs = jnp.zeros((n_time, n_cont, n_cont, n_disc), dtype=jnp.float32)
+    cross = jnp.zeros((0, n_cont, n_cont, n_disc, n_disc), dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="requires at least two time steps"):
+        switching_kalman_maximization_step(
+            obs=obs,
+            state_cond_smoother_means=means,
+            state_cond_smoother_covs=covs,
+            smoother_discrete_state_prob=gamma,
+            smoother_joint_discrete_state_prob=xi,
+            pair_cond_smoother_cross_cov=cross,
+        )
+
+
+def test_m_step_transition_prior_validation_is_jit_safe() -> None:
+    """A traced transition_prior should not hit Python bool conversion."""
+    n_time = 2
+    n_cont = 1
+    n_obs = 1
+    n_disc = 2
+    obs = jnp.zeros((n_time, n_obs), dtype=jnp.float32)
+    gamma = jnp.array([[0.6, 0.4], [0.5, 0.5]], dtype=jnp.float32)
+    xi = jnp.array([[[0.3, 0.3], [0.2, 0.2]]], dtype=jnp.float32)
+    means = jnp.zeros((n_time, n_cont, n_disc), dtype=jnp.float32)
+    covs = jnp.tile(jnp.eye(n_cont, dtype=jnp.float32)[:, :, None], (n_time, 1, 1, n_disc))
+    cross = jnp.zeros((n_time - 1, n_cont, n_cont, n_disc, n_disc), dtype=jnp.float32)
+
+    @jax.jit
+    def _jit_mstep(prior):
+        return switching_kalman_maximization_step(
+            obs=obs,
+            state_cond_smoother_means=means,
+            state_cond_smoother_covs=covs,
+            smoother_discrete_state_prob=gamma,
+            smoother_joint_discrete_state_prob=xi,
+            pair_cond_smoother_cross_cov=cross,
+            transition_prior=prior,
+        )[6]
+
+    transition = _jit_mstep(jnp.ones((n_disc, n_disc), dtype=jnp.float32))
+    assert transition.shape == (n_disc, n_disc)
+    assert jnp.all(jnp.isfinite(transition))
 
 
 def test_m_step_continuous_transition_matrix_estimation():
@@ -5387,10 +5442,20 @@ class TestSwitchingSmootherCrossCovariance:
         )
         result = switching_kalman_smoother(fm, fc, fp, pcm[-1], Q, A, Z)
 
-        # GPB1 carries pair means backward. The next-time pair means used at
-        # time t are the following smoother pair means, with the terminal filter
-        # pair mean as the last carry.
-        next_pair_means = jnp.concatenate([result[8][1:], pcm[-1][None]], axis=0)
+        # GPB1 smooths x_t with state-conditional x_{t+1}|S_{t+1}=k.
+        # Therefore the next-time means in the total covariance collapse are
+        # the state-conditional smoother means at t+1, broadcast over S_t=j.
+        next_pair_means = jnp.broadcast_to(
+            result[5][1:, :, None, :],
+            result[8].shape,
+        )
+        shifted_pair_carry_means = jnp.concatenate(
+            [result[8][1:], pcm[-1][None]], axis=0
+        )
+        assert (
+            float(jnp.max(jnp.abs(next_pair_means - shifted_pair_carry_means)))
+            > 1e-6
+        )
         expected_cross = _overall_cross_cov_from_pair_moments(
             overall_smoother_mean=result[0],
             smoother_joint_discrete_state_prob=result[3],
@@ -5923,6 +5988,95 @@ def test_transition_q_function_uses_process_covariance_weighting() -> None:
     np.testing.assert_allclose(float(identity_weighted), float(legacy), rtol=1e-8)
 
 
+def test_optimize_dim_transition_params_bounds_freq_and_uses_max_iter(monkeypatch) -> None:
+    """The DIM optimizer should pass maxiter and keep frequency below Nyquist."""
+    import jax.scipy.optimize as jax_opt
+
+    calls = {}
+
+    class FakeResult:
+        def __init__(self, x, fun):
+            self.x = x
+            self.success = jnp.array(True)
+            self.status = jnp.array(0)
+            self.fun = fun
+            self.nit = jnp.array(0)
+
+    def fake_minimize(fun, x0, args=(), *, method, tol, options):
+        del args
+        calls["method"] = method
+        calls["tol"] = tol
+        calls["options"] = options
+        calls["x0_shape"] = x0.shape
+        return FakeResult(x0, fun(x0))
+
+    monkeypatch.setattr(jax_opt, "minimize", fake_minimize)
+
+    init_params = {
+        "damping": jnp.array([0.95, 0.9]),
+        "freq": jnp.array([-5.0, 75.0]),
+        "coupling_strength": jnp.array([[2.0, 0.2], [-0.3, -4.0]]),
+        "phase_diff": jnp.array([[99.0, 0.4], [-0.7, -99.0]]),
+    }
+    opt = optimize_dim_transition_params(
+        gamma1=jnp.eye(4),
+        beta=0.8 * jnp.eye(4),
+        init_params=init_params,
+        sampling_freq=100.0,
+        max_iter=7,
+        tol=1e-5,
+    )
+
+    assert calls["method"] == "BFGS"
+    assert calls["tol"] == 1e-5
+    assert calls["options"] == {"maxiter": 7}
+    assert calls["x0_shape"] == (8,)
+    assert jnp.all(jnp.abs(opt["freq"]) < 50.0)
+    assert opt["freq"][0] < 0.0
+    assert jnp.all(opt["coupling_strength"] >= 0.0)
+    np.testing.assert_allclose(jnp.diag(opt["coupling_strength"]), 0.0, atol=0.0)
+    np.testing.assert_allclose(jnp.diag(opt["phase_diff"]), 0.0, atol=0.0)
+
+
+def test_optimize_dim_transition_params_raises_on_nonfinite_solution(monkeypatch) -> None:
+    """A non-finite optimizer result should be explicit, not silently returned.
+
+    ``success=False`` alone is not treated as a failure (JAX BFGS reports it on
+    benign line-search terminations); an unusable non-finite solution is.
+    """
+    import jax.scipy.optimize as jax_opt
+
+    class FakeResult:
+        def __init__(self, x):
+            self.x = x
+            # success=False on its own must NOT trigger the failure path.
+            self.success = jnp.array(False)
+            self.status = jnp.array(1)
+            self.fun = jnp.array(jnp.nan)
+            self.nit = jnp.array(3)
+
+    def fake_minimize(fun, x0, args=(), *, method, tol, options):
+        del fun, args, method, tol, options
+        return FakeResult(jnp.full_like(x0, jnp.nan))
+
+    monkeypatch.setattr(jax_opt, "minimize", fake_minimize)
+
+    init_params = {
+        "damping": jnp.array([0.95, 0.9]),
+        "freq": jnp.array([8.0, 12.0]),
+        "coupling_strength": jnp.zeros((2, 2)),
+        "phase_diff": jnp.zeros((2, 2)),
+    }
+    with pytest.raises(RuntimeError, match="non-finite"):
+        optimize_dim_transition_params(
+            gamma1=jnp.eye(4),
+            beta=0.8 * jnp.eye(4),
+            init_params=init_params,
+            sampling_freq=100.0,
+            raise_on_failure=True,
+        )
+
+
 # --- Viterbi tests ---
 
 
@@ -5948,6 +6102,33 @@ def test_viterbi_handles_one_timestep(simple_skf_model: tuple) -> None:
     )
     assert states.shape == (1,)
     assert int(states[0]) == int(jnp.argmax(filter_result[2][0]))
+
+
+def test_viterbi_preserves_structural_zero_transitions() -> None:
+    """Zero transition probabilities should remain impossible in the MAP path."""
+    init_mean = jnp.array([[0.0, 100.0]])
+    init_cov = jnp.stack([jnp.eye(1) * 0.1, jnp.eye(1) * 0.1], axis=-1)
+    init_prob = jnp.array([1.0, 0.0])
+    obs = jnp.array([[0.0], [100.0], [100.0]])
+    Z = jnp.eye(2)
+    A = jnp.stack([jnp.eye(1), jnp.eye(1)], axis=-1)
+    Q = jnp.stack([jnp.eye(1) * 0.01, jnp.eye(1) * 0.01], axis=-1)
+    H = jnp.stack([jnp.eye(1), jnp.eye(1)], axis=-1)
+    R = jnp.stack([jnp.eye(1) * 0.01, jnp.eye(1) * 0.01], axis=-1)
+
+    states = switching_kalman_viterbi(
+        init_mean,
+        init_cov,
+        init_prob,
+        obs,
+        Z,
+        A,
+        Q,
+        H,
+        R,
+    )
+
+    np.testing.assert_array_equal(states, jnp.array([0, 0, 0]))
 
 
 def test_viterbi_agrees_with_filter_argmax(simple_skf_model: tuple) -> None:
