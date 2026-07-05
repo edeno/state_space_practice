@@ -14,6 +14,7 @@ from state_space_practice.parameter_transforms import (
     STOCHASTIC_ROW,
     UNCONSTRAINED,
     UNIT_INTERVAL,
+    frozen,
     transform_to_constrained,
     transform_to_unconstrained,
 )
@@ -62,7 +63,7 @@ class TestUnitIntervalTransform:
 
     def test_rejects_values_outside_unit_interval(self) -> None:
         for value in (-0.1, 1.1):
-            with pytest.raises(ValueError, match="between 0 and 1"):
+            with pytest.raises(ValueError, match="between 0 and 1 inclusive"):
                 UNIT_INTERVAL.to_unconstrained(jnp.array(value))
 
     def test_endpoints_map_to_finite(self) -> None:
@@ -111,9 +112,27 @@ class TestPSDMatrixTransform:
         g = jax.grad(loss)(unc)
         assert jnp.all(jnp.isfinite(g))
 
+    def test_large_unconstrained_diagonal_does_not_overflow(self) -> None:
+        P = PSD_MATRIX.to_constrained(jnp.array([90.0], dtype=jnp.float32))
+        assert P.dtype == jnp.float32
+        assert bool(jnp.all(jnp.isfinite(P)))
+
+    def test_preserves_float32_dtype_with_x64_enabled(self) -> None:
+        P = jnp.eye(2, dtype=jnp.float32)
+        unc = PSD_MATRIX.to_unconstrained(P)
+        recovered = PSD_MATRIX.to_constrained(unc)
+        assert unc.dtype == jnp.float32
+        assert recovered.dtype == jnp.float32
+
     def test_rejects_invalid_unconstrained_length(self) -> None:
         with pytest.raises(ValueError, match="triangular"):
             PSD_MATRIX.to_constrained(jnp.array([1.0, 2.0]))
+
+    def test_rejects_empty_inputs(self) -> None:
+        with pytest.raises(ValueError, match="non-empty"):
+            PSD_MATRIX.to_unconstrained(jnp.zeros((0, 0)))
+        with pytest.raises(ValueError, match="non-empty"):
+            PSD_MATRIX.to_constrained(jnp.array([]))
 
     def test_rejects_nonsymmetric_matrix(self) -> None:
         P = jnp.array([[1.0, 0.5], [0.0, 1.0]])
@@ -191,7 +210,7 @@ class TestPositiveCappedTransform:
 
         cap = positive_capped(max_val=10.0)
         for value in (-1.0, 11.0):
-            with pytest.raises(ValueError, match="between 0 and max_val"):
+            with pytest.raises(ValueError, match="between 0 and max_val inclusive"):
                 cap.to_unconstrained(jnp.array(value))
 
 
@@ -206,10 +225,10 @@ class TestStochasticRowTransform:
         with pytest.raises(ValueError, match="non-negative"):
             STOCHASTIC_ROW.to_unconstrained(Z)
 
-    def test_allows_zero_entries(self) -> None:
+    def test_rejects_zero_entries_for_trainable_softmax_chart(self) -> None:
         Z = jnp.array([[1.0, 0.0]])
-        unc = STOCHASTIC_ROW.to_unconstrained(Z)
-        assert jnp.all(jnp.isfinite(unc))
+        with pytest.raises(ValueError, match="strictly positive"):
+            STOCHASTIC_ROW.to_unconstrained(Z)
 
     @pytest.mark.parametrize(
         "Z",
@@ -250,3 +269,33 @@ class TestDictTransforms:
 
         g = jax.grad(loss)(unc)
         assert all(jnp.isfinite(g[k]) for k in g)
+
+    def test_key_mismatch_raises_value_error(self) -> None:
+        with pytest.raises(ValueError, match="missing keys"):
+            transform_to_unconstrained(
+                {"q": jnp.array(1.0)},
+                {"q": POSITIVE, "extra": POSITIVE},
+            )
+        with pytest.raises(ValueError, match="not present in spec"):
+            transform_to_unconstrained(
+                {"q": jnp.array(1.0), "extra": jnp.array(2.0)},
+                {"q": POSITIVE},
+            )
+
+    def test_can_exclude_frozen_params_from_optimizer_tree(self) -> None:
+        spec = {"q": POSITIVE, "decay": frozen(UNIT_INTERVAL)}
+        params = {"q": jnp.array(1.0), "decay": jnp.array(1.0)}
+
+        unc = transform_to_unconstrained(
+            params,
+            spec,
+            include_non_trainable=False,
+        )
+        recovered = transform_to_constrained(
+            unc,
+            spec,
+            static_params={"decay": params["decay"]},
+        )
+
+        assert set(unc) == {"q"}
+        np.testing.assert_allclose(recovered["decay"], params["decay"], atol=0.0)

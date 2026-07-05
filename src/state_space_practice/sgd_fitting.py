@@ -121,10 +121,17 @@ class SGDFittableMixin:
         self._check_sgd_initialized()
         params, param_spec = self._build_param_spec()
 
-        if not param_spec:
+        if not param_spec or not any(spec.trainable for spec in param_spec.values()):
             raise ValueError("No learnable parameters — nothing to optimize.")
 
-        unc_params = transform_to_unconstrained(params, param_spec)
+        frozen_params = {
+            k: params[k] for k, spec in param_spec.items() if not spec.trainable
+        }
+        unc_params = transform_to_unconstrained(
+            params,
+            param_spec,
+            include_non_trainable=False,
+        )
         n_timesteps = float(self._n_timesteps)
         if not math.isfinite(n_timesteps) or n_timesteps <= 0.0:
             raise ValueError("_n_timesteps must be positive and finite for SGD fitting.")
@@ -134,22 +141,11 @@ class SGDFittableMixin:
                 "Check the model's initial parameter values."
             )
 
-        # Build trainable mask and wrap optimizer
-        # Frozen parameter handling uses two complementary mechanisms:
-        # 1. stop_gradient in transform_to_constrained() zeroes gradients
-        #    for non-trainable params — this is the correctness mechanism.
-        # 2. optax.masked prevents the optimizer from accumulating momentum/
-        #    second-moment state for frozen params — this is a resource
-        #    optimization that also prevents stale optimizer state if params
-        #    are later thawed.
-        trainable_mask = {k: spec.trainable for k, spec in param_spec.items()}
-
         if optimizer is None:
             optimizer = optax.chain(
                 optax.clip_by_global_norm(10.0),
                 optax.adam(1e-2),
             )
-        optimizer = optax.masked(optimizer, trainable_mask)
         opt_state = optimizer.init(unc_params)
 
         # jit fuses loss + grad + optimizer.update + apply_updates into a
@@ -161,7 +157,11 @@ class SGDFittableMixin:
         # mutates self attributes inside _sgd_loss_fn, jit will silently
         # freeze stale values; keep that invariant.
         def _loss_inner(unc_p):
-            p = transform_to_constrained(unc_p, param_spec)
+            p = transform_to_constrained(
+                unc_p,
+                param_spec,
+                static_params=frozen_params,
+            )
             return self._sgd_loss_fn(p, *args, **kwargs) / n_timesteps
 
         @jax.jit
@@ -253,7 +253,11 @@ class SGDFittableMixin:
             )
             unc_params = last_valid_unc_params
 
-        final_params = transform_to_constrained(unc_params, param_spec)
+        final_params = transform_to_constrained(
+            unc_params,
+            param_spec,
+            static_params=frozen_params,
+        )
         self._store_sgd_params(final_params)
         self.log_likelihood_history_ = log_likelihoods
         self._finalize_sgd(*args, **kwargs)
