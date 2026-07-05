@@ -8690,3 +8690,104 @@ class TestSwitchingSpikeOscillatorSGD:
         model.fit_sgd(spikes, key=key, num_steps=10)
         assert jnp.all(jnp.isfinite(model.continuous_transition_matrix))
         assert jnp.all(jnp.isfinite(model.spike_params.baseline))
+
+
+class TestSwitchingSpikeOscillatorEMConsistency:
+    """Regression guards for the EM cache-identity and rollback-resync fixes."""
+
+    @staticmethod
+    def _small_model():
+        from state_space_practice.switching_point_process import (
+            QRegularizationConfig,
+            SwitchingSpikeOscillatorModel,
+        )
+
+        return SwitchingSpikeOscillatorModel(
+            n_oscillators=1,
+            n_neurons=4,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            q_regularization=QRegularizationConfig(),
+            separate_spike_params=False,
+            smoother_type="gpb2",
+        )
+
+    @pytest.mark.slow
+    def test_filter_receives_stable_log_intensity_object(self, monkeypatch):
+        """Every EM iteration must pass the *same* log_intensity_func object.
+
+        ``switching_point_process_filter`` takes ``log_intensity_func`` as a
+        static jit argument cached by object identity. A fresh per-call closure
+        (the pre-fix behavior) has a different identity each E-step, forcing a
+        full scan/vmap retrace and recompile on every EM iteration. This asserts
+        the module-level singleton is reused so the compile cache stays warm.
+        """
+        import state_space_practice.switching_point_process as spp
+
+        spikes = jax.random.poisson(jax.random.PRNGKey(0), 0.5, shape=(40, 4)).astype(
+            float
+        )
+        model = self._small_model()
+
+        captured = []
+        real_filter = spp.switching_point_process_filter
+
+        def spy(*args, **kwargs):
+            captured.append(kwargs["log_intensity_func"])
+            return real_filter(*args, **kwargs)
+
+        monkeypatch.setattr(spp, "switching_point_process_filter", spy)
+        model.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
+
+        assert len(captured) >= 2, "expected filter calls across multiple E-steps"
+        assert all(f is spp._linear_log_intensity for f in captured), (
+            "each E-step must reuse the module-level _linear_log_intensity object"
+        )
+
+    @pytest.mark.slow
+    def test_em_rollback_resyncs_smoother_attributes(self, monkeypatch, caplog):
+        """After an LL-decrease rollback, smoother_* must match the returned params.
+
+        The fix reruns ``_e_step`` under the restored parameters after a rollback,
+        so the stored smoother attributes describe the parameters ``fit`` actually
+        returns with. Without it, ``smoother_state_cond_mean`` would reflect the
+        rejected M-step. We force a rollback by injecting a large LL decrease on
+        the second E-step, then assert the stored smoother is a fixed point of a
+        fresh E-step under the returned params.
+        """
+        import logging
+
+        spikes = jax.random.poisson(jax.random.PRNGKey(0), 0.5, shape=(40, 4)).astype(
+            float
+        )
+        model = self._small_model()
+
+        real_e_step = model._e_step
+        call_count = {"n": 0}
+
+        def forced_decrease_e_step(s):
+            ll = real_e_step(s)  # real E-step: populates smoother attrs
+            call_count["n"] += 1
+            # Force a large decrease on the 2nd E-step so the fit rolls back.
+            if call_count["n"] == 2:
+                return jnp.asarray(ll - 1e6)
+            return ll
+
+        monkeypatch.setattr(model, "_e_step", forced_decrease_e_step)
+
+        with caplog.at_level(
+            logging.WARNING, logger="state_space_practice.switching_point_process"
+        ):
+            model.fit(spikes, max_iter=5, key=jax.random.PRNGKey(42))
+
+        # Guard: the rollback path must have executed (else the test is vacuous).
+        assert "rolled back" in caplog.text
+
+        # The stored smoother must equal a fresh E-step under the returned params.
+        # (The two rolled-back iterations use distinct params, so a stale smoother
+        # from the rejected iteration would differ well above this tolerance.)
+        post_fit_mean = np.asarray(model.smoother_state_cond_mean)
+        real_e_step(spikes)  # recompute under the returned (restored) params
+        resynced_mean = np.asarray(model.smoother_state_cond_mean)
+        np.testing.assert_allclose(post_fit_mean, resynced_mean, rtol=1e-10, atol=1e-10)
