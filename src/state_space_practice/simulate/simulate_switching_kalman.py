@@ -96,6 +96,8 @@ def build_R(n, M, var_obs_noi):
 
 
 def simulate(A, B0, Q, R, Z, X_0, S_0, T, s=None, seed: int = 14):
+    if T <= 0:
+        raise ValueError(f"T must be positive, got {T}.")
     rng = np.random.default_rng(seed)
 
     n = R.shape[0]  # # of electrodes

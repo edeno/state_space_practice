@@ -6207,6 +6207,20 @@ def test_simulate_uses_supplied_state_path_at_first_observation() -> None:
     np.testing.assert_allclose(obs[:, 0], np.array([20.0, 20.0, 20.0]))
 
 
+def test_simulate_rejects_nonpositive_T() -> None:
+    """Gaussian switching simulation should reject empty time series explicitly."""
+    from state_space_practice.simulate.simulate_switching_kalman import simulate
+
+    A = np.eye(1)[:, :, None]
+    Q = np.eye(1)[:, :, None]
+    R = np.eye(1)[:, :, None]
+    H = np.eye(1)[:, :, None]
+    Z = np.ones((1, 1))
+
+    with pytest.raises(ValueError, match="T must be positive"):
+        simulate(A, H, Q, R, Z, np.zeros(1), S_0=0, T=0)
+
+
 def test_simulate_seed_controls_generated_randomness() -> None:
     """Different seeds should produce different simulated paths/noise."""
     from state_space_practice.simulate.simulate_switching_kalman import simulate
