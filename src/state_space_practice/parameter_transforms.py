@@ -137,13 +137,15 @@ def _psd_to_real(P: Array) -> Array:
         jnp.isclose(P, P.T, rtol=1e-7, atol=1e-9),
         "PSD_MATRIX values must be symmetric.",
     )
-    _check_array(
-        jnp.linalg.eigvalsh(P) >= -1e-9,
-        "PSD_MATRIX values must be positive semidefinite.",
-    )
     # Add jitter for numerical stability on near-singular matrices
     n = P.shape[0]
-    L = jnp.linalg.cholesky(P + 1e-9 * jnp.eye(n))
+    jitter = 1e-9
+    P_jittered = P + jitter * jnp.eye(n)
+    _check_array(
+        jnp.linalg.eigvalsh(P_jittered) > 0.0,
+        "PSD_MATRIX values must be positive semidefinite.",
+    )
+    L = jnp.linalg.cholesky(P_jittered)
     # Replace diagonal with log(diagonal) so it's unconstrained
     L = L.at[jnp.diag_indices_from(L)].set(jnp.log(jnp.diag(L)))
     return L[jnp.tril_indices_from(L)]
@@ -193,6 +195,9 @@ def _stochastic_to_real(Z: Array) -> Array:
 
 def _real_to_stochastic(logits: Array) -> Array:
     """Unconstrained logits to row-stochastic matrix via softmax."""
+    logits = jnp.asarray(logits)
+    if logits.shape[-1] == 0:
+        return jnp.ones(logits.shape[:-1] + (1,), dtype=logits.dtype)
     full_logits = jnp.concatenate(
         [logits, jnp.zeros_like(logits[..., :1])], axis=-1
     )

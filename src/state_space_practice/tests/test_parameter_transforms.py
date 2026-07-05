@@ -125,6 +125,11 @@ class TestPSDMatrixTransform:
         with pytest.raises(ValueError, match="positive semidefinite"):
             PSD_MATRIX.to_unconstrained(P)
 
+    def test_rejects_boundary_that_would_make_jittered_cholesky_singular(self) -> None:
+        P = jnp.array([[1.0, 0.0], [0.0, -1e-9]])
+        with pytest.raises(ValueError, match="positive semidefinite"):
+            PSD_MATRIX.to_unconstrained(P)
+
 
 class TestPositiveCappedTransform:
     def test_roundtrip(self) -> None:
@@ -205,6 +210,20 @@ class TestStochasticRowTransform:
         Z = jnp.array([[1.0, 0.0]])
         unc = STOCHASTIC_ROW.to_unconstrained(Z)
         assert jnp.all(jnp.isfinite(unc))
+
+    @pytest.mark.parametrize(
+        "Z",
+        [
+            jnp.array([1.0]),
+            jnp.array([[1.0]]),
+            jnp.array([[1.0], [1.0]]),
+        ],
+    )
+    def test_one_column_roundtrip_preserves_shape(self, Z: jax.Array) -> None:
+        unc = STOCHASTIC_ROW.to_unconstrained(Z)
+        recovered = STOCHASTIC_ROW.to_constrained(unc)
+        np.testing.assert_allclose(recovered, Z, atol=1e-12)
+        assert recovered.shape == Z.shape
 
 
 class TestDictTransforms:
