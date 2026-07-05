@@ -1,13 +1,18 @@
-"""Covariance-hardening checks for nonlinear_dynamics EKF steps.
+"""Covariance-hardening and input-validation checks for nonlinear_dynamics.
 
 These complement ``test_nonlinear_dynamics_symplectic.py`` (which covers the
-leapfrog symplecticity contract). Here we pin that the EKF predict/smoother
-steps return *symmetric* covariances even when the incoming carry has drifted
-out of symmetry (as accumulated float roundoff produces over a long scan).
+leapfrog symplecticity contract). Here we pin two behaviours:
+
+- the EKF predict/smoother steps return *symmetric* covariances even when the
+  incoming carry has drifted out of symmetry (as accumulated float roundoff
+  produces over a long scan), and
+- the leapfrog / MLP entry points reject odd-length states with a clear
+  boundary error instead of a confusing reshape error deep inside ``grad``.
 """
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 from state_space_practice.nonlinear_dynamics import (
     apply_mlp,
@@ -15,6 +20,7 @@ from state_space_practice.nonlinear_dynamics import (
     ekf_smooth_step,
     get_transition_jacobian,
     init_mlp_params,
+    leapfrog_step,
 )
 from state_space_practice.utils import psd_solve
 
@@ -88,3 +94,17 @@ def test_ekf_smooth_step_symmetrizes_drifted_covariance():
     )
 
     assert _asymmetry(P_smooth) < 1e-12
+
+
+def test_leapfrog_step_rejects_odd_dimension():
+    params = _params()
+    x = jnp.array([0.1, 0.2, 0.3])  # odd length: cannot split into (q, p)
+    with pytest.raises(ValueError, match="even"):
+        leapfrog_step(x, params, apply_mlp, dt=0.1)
+
+
+def test_apply_mlp_rejects_odd_dimension():
+    params = _params()
+    x = jnp.array([0.1, 0.2, 0.3])
+    with pytest.raises(ValueError, match="even"):
+        apply_mlp(params, x)

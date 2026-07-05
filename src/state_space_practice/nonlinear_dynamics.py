@@ -15,9 +15,21 @@ def leapfrog_step(
     x: Array, 
     params: Dict[str, Array], 
     h_apply_fn: Callable[[Dict[str, Array], Array], Array], 
-    dt: float = 0.1
+    dt: float,
 ) -> Array:
-    """Symplectic Leapfrog Integrator (Shared Engine)."""
+    """Symplectic leapfrog integrator (shared engine).
+
+    Symplectic **only for separable** Hamiltonians ``H(q, p) = T(p) + V(q)``.
+    The explicit kick-drift-kick scheme below evaluates ``dH/dq`` and ``dH/dp``
+    at frozen partner coordinates; for a non-separable ``H`` it is only some
+    explicit approximation with no symplecticity guarantee (a symplectic scheme
+    would require an implicit solve). ``apply_mlp`` is constructed to be
+    separable, so the shipped pairing is symplectic.
+    """
+    if x.shape[0] % 2 != 0:
+        raise ValueError(
+            f"State dimension must be even to split into (q, p); got {x.shape[0]}."
+        )
     n = x.shape[0] // 2
     q, p = x[:n], x[n:]
     
@@ -55,8 +67,10 @@ def get_transition_jacobian(
 ) -> Array:
     """Compute local Jacobian F = df/dx for EKF-style covariance propagation.
 
-    Uses reverse-mode AD (jacrev) which is more efficient than forward-mode
-    for square Jacobians since it computes all rows in a single backward pass.
+    Uses reverse-mode AD (``jacrev``). For a square D x D Jacobian reverse and
+    forward mode both cost O(D) linearizations (D vector-Jacobian products vs.
+    D Jacobian-vector products), so neither is asymptotically cheaper here;
+    ``jacfwd`` is often faster on a tall unrolled integrator step.
     """
     def step_fn(state):
         return leapfrog_step(state, params, h_apply_fn, dt)
@@ -70,7 +84,7 @@ def init_mlp_params(
     params = {}
     dims = [input_dim] + hidden_dims + [1]
     for i, (n_in, n_out) in enumerate(zip(dims[:-1], dims[1:])):
-        k1, k2, key = jax.random.split(key, 3)
+        k1, key = jax.random.split(key, 2)
         params[f"w{i}"] = jax.random.normal(k1, (n_in, n_out)) * jnp.sqrt(2 / (n_in + n_out))
         params[f"b{i}"] = jnp.zeros((n_out,))
     return params
@@ -142,11 +156,15 @@ def apply_mlp(params: Dict[str, Array], x: Array) -> Array:
     restricted to the position coordinates so explicit leapfrog remains
     symplectic. The residual still receives a full-length input with zeroed
     momentum coordinates to preserve existing parameter shapes.
-    """
-    # Check if params is batched
-    if "w0" in params and params["w0"].ndim > 2:
-        return cast(Array, jax.vmap(apply_mlp, in_axes=(0, None))(params, x))
 
+    Batch over an ensemble of parameter sets at the call site with
+    ``jax.vmap(apply_mlp, in_axes=(0, None))``; this function itself takes a
+    single parameter set and returns a scalar.
+    """
+    if x.shape[0] % 2 != 0:
+        raise ValueError(
+            f"State dimension must be even to split into (q, p); got {x.shape[0]}."
+        )
     weight_keys = sorted([k for k in params.keys() if k.startswith("w")])
     omega = params.get("omega", 1.0)
     
