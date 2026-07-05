@@ -53,6 +53,15 @@ def test_process_noise_is_psd_across_dt():
         assert min_eig >= -1e-12, f"Q not PSD at dt={dt}: min eigenvalue {min_eig}"
 
 
+def test_process_noise_tiny_dt_keeps_value_variance_positive():
+    """The O(dt^3) value-noise term should not cancel to zero/negative."""
+    for dt in (1e-6, 1e-8, 1e-10, 1e-12):
+        _A, Q = matern32_discretize(1.0, 1.0, dt)
+        Q_sym = np.asarray((Q + Q.T) / 2)
+        assert float(Q_sym[0, 0]) > 0.0
+        assert float(np.linalg.eigvalsh(Q_sym).min()) > 0.0
+
+
 def test_stationary_covariance_solves_lyapunov():
     """Pinf solves F Pinf + Pinf F.T + L Qc L.T = 0."""
     F, L, Qc, _H, Pinf = matern32_continuous(VARIANCE, LENGTHSCALE)

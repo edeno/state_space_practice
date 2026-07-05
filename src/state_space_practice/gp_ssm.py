@@ -162,8 +162,20 @@ def matern32_discretize(
     A = decay * jnp.array([[1.0 + lam_dt, dt], [-(lam**2) * dt, 1.0 - lam_dt]])
 
     # Q = Pinf - A Pinf A.T, expanded analytically for the Matern-3/2 state.
-    q11 = variance * (1.0 - decay_sq * (1.0 + 2.0 * lam_dt + 2.0 * lam_dt**2))
-    q12 = 2.0 * variance * lam**3 * dt**2 * decay_sq
-    q22 = variance * lam**2 * (1.0 - decay_sq * (1.0 - 2.0 * lam_dt + 2.0 * lam_dt**2))
+    # The q11 term is O((lambda dt)^3); the closed form subtracts nearly equal
+    # O(1) quantities at high sampling rates, so switch to its Taylor series in
+    # that regime. q22 is written with expm1 so its O(lambda dt) leading term is
+    # not lost to cancellation.
+    r = lam_dt
+    r2 = r * r
+    q11_closed = variance * (1.0 - decay_sq * (1.0 + 2.0 * r + 2.0 * r2))
+    q11_poly = 16.0 / 405.0
+    for coeff in (-2.0 / 15.0, 8.0 / 21.0, -8.0 / 9.0, 8.0 / 5.0, -2.0, 4.0 / 3.0):
+        q11_poly = coeff + r * q11_poly
+    q11_series = variance * r**3 * q11_poly
+    q11 = jnp.where(r <= 5e-2, q11_series, q11_closed)
+    q12 = 2.0 * variance * lam * r2 * decay_sq
+    q22_base = -jnp.expm1(-2.0 * r) + decay_sq * (2.0 * r - 2.0 * r2)
+    q22 = variance * lam**2 * q22_base
     Q = jnp.array([[q11, q12], [q12, q22]])
     return A, Q
