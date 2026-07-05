@@ -125,6 +125,17 @@ def test_poisson_site_matches_irls_working_response():
     np.testing.assert_allclose(working_response, g + (counts - rate) / rate, rtol=1e-8)
 
 
+@pytest.mark.parametrize("bad_min_weight", [0.0, -1.0, np.nan, np.inf])
+def test_poisson_site_rejects_invalid_min_weight(bad_min_weight):
+    with pytest.raises(ValueError, match="min_weight"):
+        poisson_log_rate_site(
+            jnp.array([0.0]),
+            jnp.array([0.0]),
+            jnp.array(0.0),
+            min_weight=bad_min_weight,
+        )
+
+
 # --- Dense-oracle correctness -------------------------------------------------
 
 
@@ -182,6 +193,17 @@ def test_laplace_iteration_converges(small_counts):
 def test_infer_log_rate_rejects_invalid_n_iter(small_counts, bad_n_iter):
     with pytest.raises(ValueError, match="n_iter"):
         infer_log_rate(small_counts, 0.1, 1.5, 0.4, n_iter=bad_n_iter)
+
+
+def test_infer_log_rate_rejects_empty_counts():
+    with pytest.raises(ValueError, match="at least one"):
+        infer_log_rate(jnp.array([]), 0.1, 1.5, 0.4)
+
+
+@pytest.mark.parametrize("bad_min_weight", [0.0, -1.0, np.nan, np.inf])
+def test_infer_log_rate_rejects_invalid_min_weight(small_counts, bad_min_weight):
+    with pytest.raises(ValueError, match="min_weight"):
+        infer_log_rate(small_counts, 0.1, 1.5, 0.4, min_weight=bad_min_weight)
 
 
 def test_nonzero_mean_offsets_log_rate(small_counts):
@@ -276,6 +298,12 @@ def test_predict_before_fit_raises():
     model = TemporalRateGP(dt=0.1)
     with pytest.raises(RuntimeError):
         model.predict_rate()
+
+
+@pytest.mark.parametrize("bad_min_weight", [0.0, -1.0, np.nan, np.inf])
+def test_temporal_rate_gp_rejects_invalid_min_weight(bad_min_weight):
+    with pytest.raises(ValueError, match="min_weight"):
+        TemporalRateGP(dt=0.1, min_weight=bad_min_weight)
 
 
 def test_predict_rate_positive_and_correct_shape(small_counts):
@@ -417,6 +445,33 @@ def test_batch_inference_rejects_wrong_hyperparameter_length(multineuron_counts)
         infer_log_rate_batch(
             multineuron_counts, 0.1, jnp.array([1.0, 1.0]), 0.4, 0.0, n_iter=10
         )
+
+
+def test_batch_inference_rejects_empty_counts():
+    with pytest.raises(ValueError, match="at least one"):
+        infer_log_rate_batch(jnp.empty((2, 0)), 0.1, 1.0, 0.4)
+    with pytest.raises(ValueError, match="at least one"):
+        infer_log_rate_batch(jnp.empty((0, 3)), 0.1, 1.0, 0.4)
+
+
+@pytest.mark.parametrize("bad_min_weight", [0.0, -1.0, np.nan, np.inf])
+def test_batch_inference_rejects_invalid_min_weight(
+    multineuron_counts, bad_min_weight
+):
+    with pytest.raises(ValueError, match="min_weight"):
+        infer_log_rate_batch(
+            multineuron_counts,
+            0.1,
+            1.0,
+            0.4,
+            min_weight=bad_min_weight,
+        )
+
+
+def test_fit_sgd_rejects_empty_counts():
+    model = TemporalRateGP(dt=0.1)
+    with pytest.raises(ValueError, match="at least one"):
+        model.fit_sgd(jnp.array([]), num_steps=0)
 
 
 def test_fit_sgd_multineuron_shared_shapes(multineuron_counts):

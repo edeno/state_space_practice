@@ -123,6 +123,8 @@ def poisson_log_rate_site(
     expected_count : Array, shape (n_time,)
         ``W = exp(g + offset)``, the expected count per bin.
     """
+    if not isinstance(min_weight, jax.core.Tracer):
+        min_weight = validate_scalar(min_weight, "min_weight", positive=True)
     latent = jnp.asarray(latent)
     counts = jnp.asarray(counts)
     expected_count = jnp.exp(latent + offset)
@@ -271,7 +273,7 @@ def infer_log_rate(
     counts = jnp.asarray(counts)
     if counts.ndim != 1:
         raise ValueError(f"counts must be 1D (n_time,), got shape {counts.shape}.")
-    validate_count_array(counts, "counts")
+    validate_count_array(counts, "counts", allow_empty=False)
     try:
         n_iter = operator.index(n_iter)
     except TypeError as exc:
@@ -290,6 +292,8 @@ def infer_log_rate(
             validate_scalar(value, name, positive=True)
     if not isinstance(mean, jax.core.Tracer):
         validate_scalar(mean, "mean")
+    if not isinstance(min_weight, jax.core.Tracer):
+        min_weight = validate_scalar(min_weight, "min_weight", positive=True)
 
     return _infer_log_rate_traced(
         counts, dt, variance, lengthscale, mean, n_iter, min_weight
@@ -392,7 +396,7 @@ def infer_log_rate_batch(
         raise ValueError(
             f"counts must be 2D (n_neurons, n_time), got shape {counts.shape}."
         )
-    validate_count_array(counts, "counts")
+    validate_count_array(counts, "counts", allow_empty=False)
     try:
         n_iter = operator.index(n_iter)
     except TypeError as exc:
@@ -408,6 +412,8 @@ def infer_log_rate_batch(
         lengthscale, n_neurons, "lengthscale", positive=True
     )
     mean = _broadcast_hyperparameter(mean, n_neurons, "mean", positive=False)
+    if not isinstance(min_weight, jax.core.Tracer):
+        min_weight = validate_scalar(min_weight, "min_weight", positive=True)
 
     return _infer_log_rate_batch_traced(
         counts, dt, variance, lengthscale, mean, n_iter, min_weight
@@ -481,7 +487,7 @@ class TemporalRateGP(SGDFittableMixin):
         self.update_lengthscale = bool(update_lengthscale)
         self.update_mean = bool(update_mean)
         self.share_hyperparameters = bool(share_hyperparameters)
-        self.min_weight = float(min_weight)
+        self.min_weight = validate_scalar(min_weight, "min_weight", positive=True)
 
         # Data and posterior, populated by fit_sgd. _n_neurons is 1 for a 1D
         # (single-train) fit and n_neurons for a 2D (n_neurons, n_time) fit.
@@ -554,7 +560,7 @@ class TemporalRateGP(SGDFittableMixin):
                 "counts must be 1D (n_time,) or 2D (n_neurons, n_time), got "
                 f"shape {counts.shape}."
             )
-        validate_count_array(counts, "counts")
+        validate_count_array(counts, "counts", allow_empty=False)
         self._counts = counts
         self._n_neurons = n_neurons
         # Total observation count normalizes the mixin's loss so the learning
