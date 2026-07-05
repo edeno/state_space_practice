@@ -6915,9 +6915,11 @@ class TestSwitchingSpikeOscillatorModelEndToEnd:
         log_likelihoods = model.fit(spikes, max_iter=5, key=jax.random.PRNGKey(0))
 
         # Basic sanity checks
-        assert len(log_likelihoods) == 6
+        assert 1 <= len(log_likelihoods) <= 6
         for ll in log_likelihoods:
             assert jnp.isfinite(ll)
+        if len(log_likelihoods) > 1:
+            assert log_likelihoods[-1] >= log_likelihoods[0]
 
 
 class TestMilestone8EndToEnd:

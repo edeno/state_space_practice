@@ -30,9 +30,17 @@ def simulate_switching_spike_oscillator(
     Generates synthetic data from a switching linear dynamical system (SLDS)
     with point-process (spike) observations. The model has:
 
+    - Initial state: x_1 ~ N(init_mean, init_cov),
+      s_1 ~ Categorical(init_discrete_prob)
     - Latent continuous dynamics: x_t = A_{s_t} @ x_{t-1} + w_t
+      for t > 1
     - Discrete state transitions: s_t ~ Categorical(Z[s_{t-1}, :])
+      for t > 1
     - Spike observations: y_{n,t} ~ Poisson(exp(b_n + c_n @ x_t) * dt)
+
+    Returned index 0 is the first observation time. No transition is applied
+    before emitting it, matching the x_1 convention used by the switching
+    point-process filter.
 
     Parameters
     ----------
@@ -86,6 +94,9 @@ def simulate_switching_spike_oscillator(
     ...     n_time, A, Q, Z, C, b, dt=0.02, key=key
     ... )
     """
+    if n_time <= 0:
+        raise ValueError(f"n_time must be positive, got {n_time}.")
+
     n_latent = transition_matrices.shape[0]
     n_discrete_states = transition_matrices.shape[-1]
 
@@ -101,7 +112,9 @@ def simulate_switching_spike_oscillator(
         init_discrete_prob = jnp.ones(n_discrete_states) / n_discrete_states
 
     # Split keys for different random operations
-    key, key_init_state, key_init_discrete = jax.random.split(key, 3)
+    key, key_init_state, key_init_discrete, key_init_spikes = jax.random.split(
+        key, 4
+    )
 
     # Sample initial continuous state
     x_0 = jax.random.multivariate_normal(key_init_state, init_mean, init_cov)
@@ -109,8 +122,30 @@ def simulate_switching_spike_oscillator(
     # Sample initial discrete state
     s_0 = jax.random.categorical(key_init_discrete, jnp.log(init_discrete_prob))
 
-    def _step(carry: tuple[Array, Array, Array], _: None) -> tuple[tuple[Array, Array, Array], tuple[Array, Array, Array]]:
-        """Single simulation step."""
+    def _sample_spikes(x_t: Array, s_t: Array, key_spikes: Array) -> Array:
+        """Sample spikes at the current state/time."""
+        # Get spike params for current discrete state (or shared)
+        if per_state_spikes:
+            b_s = spike_baseline[:, s_t]
+            c_s = spike_weights[:, :, s_t]
+        else:
+            b_s = spike_baseline
+            c_s = spike_weights
+
+        # Compute firing rates: lambda_n = exp(b_n + c_n @ x_t)
+        log_rates = b_s + c_s @ x_t
+        rates = jnp.exp(log_rates) * dt
+
+        # Sample spikes: y_n ~ Poisson(lambda_n * dt)
+        return jax.random.poisson(key_spikes, rates).astype(jnp.float64)
+
+    y_0 = _sample_spikes(x_0, s_0, key_init_spikes)
+
+    def _step(
+        carry: tuple[Array, Array, Array],
+        _: None,
+    ) -> tuple[tuple[Array, Array, Array], tuple[Array, Array, Array]]:
+        """Single transition and observation step."""
         x_prev, s_prev, key = carry
 
         # Split key for this step
@@ -129,29 +164,22 @@ def simulate_switching_spike_oscillator(
         x_mean = A_s @ x_prev
         x_t = jax.random.multivariate_normal(key_continuous, x_mean, Q_s)
 
-        # Get spike params for current discrete state (or shared)
-        if per_state_spikes:
-            b_s = spike_baseline[:, s_t]
-            c_s = spike_weights[:, :, s_t]
-        else:
-            b_s = spike_baseline
-            c_s = spike_weights
-
-        # Compute firing rates: lambda_n = exp(b_n + c_n @ x_t)
-        log_rates = b_s + c_s @ x_t
-        rates = jnp.exp(log_rates) * dt
-
-        # Sample spikes: y_n ~ Poisson(lambda_n * dt)
-        y_t = jax.random.poisson(key_spikes, rates).astype(jnp.float64)
+        y_t = _sample_spikes(x_t, s_t, key_spikes)
 
         return (x_t, s_t, key), (y_t, x_t, s_t)
 
-    # Run simulation using scan
-    _, (spikes, true_states, true_discrete_states) = jax.lax.scan(
+    # Run transitions for t=2,...,T. The initial sample is prepended below.
+    _, (spikes_rest, true_states_rest, true_discrete_states_rest) = jax.lax.scan(
         _step,
         (x_0, s_0, key),
         None,
-        length=n_time,
+        length=n_time - 1,
+    )
+
+    spikes = jnp.concatenate([y_0[None], spikes_rest], axis=0)
+    true_states = jnp.concatenate([x_0[None], true_states_rest], axis=0)
+    true_discrete_states = jnp.concatenate(
+        [jnp.asarray(s_0)[None], true_discrete_states_rest], axis=0
     )
 
     return spikes, true_states, true_discrete_states

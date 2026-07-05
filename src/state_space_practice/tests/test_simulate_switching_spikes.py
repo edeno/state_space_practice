@@ -89,6 +89,36 @@ class TestSimulateSwitchingSpikeOscillator:
         assert true_states.shape == (n_time, p["n_latent"])
         assert true_discrete_states.shape == (n_time,)
 
+    def test_first_output_uses_initial_state_before_transition(self) -> None:
+        """Returned index 0 follows the filter's x_1 convention."""
+        n_time = 4
+        transition_matrices = jnp.stack([jnp.eye(1), jnp.eye(1)], axis=-1)
+        process_covs = jnp.stack([jnp.eye(1) * 1e-12] * 2, axis=-1)
+        discrete_transition_matrix = jnp.array([[0.0, 1.0], [0.0, 1.0]])
+        spike_weights = jnp.zeros((1, 1))
+        spike_baseline = jnp.array([-20.0])
+
+        _spikes, _states, true_discrete_states = (
+            simulate_switching_spike_oscillator(
+                n_time=n_time,
+                transition_matrices=transition_matrices,
+                process_covs=process_covs,
+                discrete_transition_matrix=discrete_transition_matrix,
+                spike_weights=spike_weights,
+                spike_baseline=spike_baseline,
+                dt=0.01,
+                key=jax.random.PRNGKey(0),
+                init_mean=jnp.zeros(1),
+                init_cov=jnp.eye(1) * 1e-12,
+                init_discrete_prob=jnp.array([1.0, 0.0]),
+            )
+        )
+
+        np.testing.assert_array_equal(
+            np.asarray(true_discrete_states),
+            np.array([0, 1, 1, 1]),
+        )
+
     def test_spike_counts_nonnegative(self, switching_spike_params) -> None:
         """Spike counts should be non-negative integers."""
         spikes, _, _ = _simulate(switching_spike_params, n_time=50)
