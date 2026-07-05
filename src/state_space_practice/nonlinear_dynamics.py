@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from typing import Callable, Dict, List, Tuple, cast
 from jax import Array
 from state_space_practice.kalman import psd_solve
+from state_space_practice.utils import symmetrize
 
 def leapfrog_step(
     x: Array, 
@@ -83,8 +84,9 @@ def ekf_predict_step(
     dt: float
 ) -> Tuple[Array, Array]:
     """EKF Prediction Step: x_t = f(x_{t-1}) + w_t."""
-    m_pred, F = _leapfrog_step_and_jacobian(m_prev, params, h_apply_fn, dt)
-    P_pred = F @ P_prev @ F.T + Q
+    m_pred, P_pred, _ = ekf_predict_step_with_jacobian(
+        m_prev, P_prev, params, h_apply_fn, Q, dt
+    )
     return m_pred, P_pred
 
 
@@ -101,7 +103,7 @@ def ekf_predict_step_with_jacobian(
     Use this in smoother forward passes to avoid recomputing the Jacobian.
     """
     m_pred, F = _leapfrog_step_and_jacobian(m_prev, params, h_apply_fn, dt)
-    P_pred = F @ P_prev @ F.T + Q
+    P_pred = symmetrize(F @ P_prev @ F.T + Q)
     return m_pred, P_pred, F
 
 
@@ -130,7 +132,7 @@ def ekf_smooth_step(
     """EKF RTS Smoother Step (Backward Pass)."""
     G = psd_solve(P_pred_next, F_next @ P_filt).T
     m_smooth = m_filt + G @ (m_smooth_next - m_pred_next)
-    P_smooth = P_filt + G @ (P_smooth_next - P_pred_next) @ G.T
+    P_smooth = symmetrize(P_filt + G @ (P_smooth_next - P_pred_next) @ G.T)
     return m_smooth, P_smooth
 
 def apply_mlp(params: Dict[str, Array], x: Array) -> Array:
