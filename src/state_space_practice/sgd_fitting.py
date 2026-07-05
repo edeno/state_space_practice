@@ -95,7 +95,7 @@ class SGDFittableMixin:
         verbose : bool
             Log progress every 10 steps.
         convergence_tol : float or None
-            If set, stop early when the relative change
+            If set, stop early when the direction-agnostic relative change
             ``|ΔLL| / avg(|LL|) < tol`` for 5 consecutive steps.
             This is a dimensionless fraction (e.g., ``1e-4`` means 0.01%
             relative change), consistent with the EM convergence check.
@@ -103,6 +103,9 @@ class SGDFittableMixin:
         Returns
         -------
         log_likelihoods : list of float
+            One entry per evaluated optimization step that produced a finite
+            loss. When the final candidate is finite, the final entry is
+            rewritten to the log likelihood of the stored final parameters.
         """
         import optax
 
@@ -146,6 +149,11 @@ class SGDFittableMixin:
                 optax.clip_by_global_norm(10.0),
                 optax.adam(1e-2),
             )
+        if not hasattr(optimizer, "init") or not hasattr(optimizer, "update"):
+            raise ValueError(
+                "optimizer must be an optax GradientTransformation with "
+                "init and update methods."
+            )
         opt_state = optimizer.init(unc_params)
 
         # jit fuses loss + grad + optimizer.update + apply_updates into a
@@ -176,11 +184,8 @@ class SGDFittableMixin:
             )
             return loss, new_unc_p, new_opt_st, step_finite
 
-        @jax.jit
-        def evaluate_loss(unc_p):
-            return _loss_inner(unc_p)
-
         log_likelihoods: list[float] = []
+        converged = False
         # last_valid_unc_params tracks the most recent params that
         # produced finite loss. It is updated ONLY after the finite check
         # and BEFORE swapping in the candidate, so on NaN recovery we
@@ -205,13 +210,16 @@ class SGDFittableMixin:
                 unc_params = last_valid_unc_params
                 break
 
+            ll = -float(loss) * n_timesteps
+            log_likelihoods.append(ll)
+
             if not bool(step_finite):
+                last_valid_unc_params = unc_params
                 logger.warning(
-                    "SGD step %d: NaN/inf gradient or parameter update — restoring "
-                    "last valid params and stopping.",
+                    "SGD step %d: NaN/inf gradient or parameter update -- keeping "
+                    "the current finite-loss params and stopping.",
                     step,
                 )
-                unc_params = last_valid_unc_params
                 break
 
             # train_step just confirmed these input params are finite.
@@ -223,9 +231,6 @@ class SGDFittableMixin:
             unc_params = new_unc_params
             opt_state = new_opt_state
 
-            ll = -float(loss) * n_timesteps
-            log_likelihoods.append(ll)
-
             if verbose and (step % 10 == 0 or step == num_steps - 1):
                 print(f"SGD step {step}: LL={ll:.2f}")
 
@@ -234,7 +239,9 @@ class SGDFittableMixin:
                 # check_converged in utils.py. This avoids stalling too early
                 # for problems with large total LL.
                 avg = (abs(log_likelihoods[-1]) + abs(log_likelihoods[-2])) / 2
-                rel_change = abs(log_likelihoods[-1] - log_likelihoods[-2]) / max(avg, 1e-10)
+                rel_change = abs(log_likelihoods[-1] - log_likelihoods[-2]) / max(
+                    avg, 1e-10
+                )
                 if rel_change < convergence_tol:
                     stall_count += 1
                 else:
@@ -243,15 +250,18 @@ class SGDFittableMixin:
                     if verbose:
                         print(f"SGD converged at step {step}.")
                     logger.info("SGD converged at step %d.", step)
+                    converged = True
                     break
 
-        final_loss = evaluate_loss(unc_params)
+        final_loss = _loss_inner(unc_params)
         if not bool(jnp.isfinite(final_loss)):
             logger.warning(
                 "Final SGD parameters produced NaN/inf loss -- restoring "
                 "last valid params."
             )
             unc_params = last_valid_unc_params
+        elif log_likelihoods:
+            log_likelihoods[-1] = -float(final_loss) * n_timesteps
 
         final_params = transform_to_constrained(
             unc_params,
@@ -260,6 +270,7 @@ class SGDFittableMixin:
         )
         self._store_sgd_params(final_params)
         self.log_likelihood_history_ = log_likelihoods
+        self.converged_ = converged
         self._finalize_sgd(*args, **kwargs)
 
         return log_likelihoods

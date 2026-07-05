@@ -133,6 +133,17 @@ class _ToyModel(SGDFittableMixin):
         self.is_fitted = True
 
 
+class _UnconstrainedToyModel(_ToyModel):
+    @property
+    def _n_timesteps(self):
+        return 10
+
+    def _build_param_spec(self):
+        params = {"scale": jnp.array(self.scale)}
+        spec = {"scale": UNCONSTRAINED}
+        return params, spec
+
+
 class TestSGDFittableMixin:
     def test_basic_optimization(self) -> None:
         import optax
@@ -158,11 +169,31 @@ class TestSGDFittableMixin:
         )
         # Should converge early
         assert len(lls) < 500
+        assert model.converged_ is True
+
+    def test_converged_false_when_step_budget_exhausted(self) -> None:
+        model = _ToyModel(scale=0.1)
+        model.fit_sgd(jnp.array(5.0), num_steps=1)
+        assert model.converged_ is False
 
     def test_stores_log_likelihood_history(self) -> None:
         model = _ToyModel(scale=0.1)
         lls = model.fit_sgd(jnp.array(5.0), num_steps=20)
         assert hasattr(model, "log_likelihood_history_")
+        assert model.log_likelihood_history_ == lls
+
+    def test_history_final_entry_matches_stored_final_params(self) -> None:
+        import optax
+
+        model = _UnconstrainedToyModel(scale=0.0)
+        lls = model.fit_sgd(
+            jnp.array(1.0),
+            optimizer=optax.sgd(learning_rate=0.1),
+            num_steps=1,
+        )
+
+        np.testing.assert_allclose(model.scale, 0.2, atol=1e-7)
+        np.testing.assert_allclose(lls, [-6.4], rtol=1e-6)
         assert model.log_likelihood_history_ == lls
 
     def test_no_learnable_params_raises(self) -> None:
@@ -192,6 +223,11 @@ class TestSGDFittableMixin:
         model._initialized = False
         with pytest.raises(RuntimeError, match="Not initialized"):
             model.fit_sgd(jnp.array(5.0))
+
+    def test_invalid_optimizer_raises(self) -> None:
+        model = _ToyModel(scale=1.0)
+        with pytest.raises(ValueError, match="optimizer"):
+            model.fit_sgd(jnp.array(5.0), optimizer=object(), num_steps=1)
 
     def test_custom_optimizer(self) -> None:
         import optax
@@ -247,7 +283,7 @@ class TestSGDFittableMixin:
         with pytest.raises(ValueError, match="_n_timesteps"):
             model.fit_sgd(jnp.array(5.0), num_steps=1)
 
-    def test_nonfinite_update_restores_last_valid_params(self) -> None:
+    def test_nonfinite_update_keeps_current_finite_params(self) -> None:
         class _BadGradientAtInit(SGDFittableMixin):
             def __init__(self):
                 self.scale = 0.0
@@ -280,8 +316,9 @@ class TestSGDFittableMixin:
         model = _BadGradientAtInit()
         lls = model.fit_sgd(optimizer=optax.sgd(1.0), num_steps=1)
 
-        assert lls == []
+        np.testing.assert_allclose(lls, [0.0], atol=1e-12)
         assert model.is_fitted
+        assert model.converged_ is False
         assert np.isfinite(model.scale)
         np.testing.assert_allclose(model.scale, 0.0, atol=1e-12)
 
