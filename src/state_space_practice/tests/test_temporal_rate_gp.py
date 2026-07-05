@@ -485,6 +485,18 @@ def test_fit_sgd_multineuron_shared_shapes(multineuron_counts):
     rate = model.predict_rate()
     assert rate.shape == multineuron_counts.shape
     assert bool(jnp.all(rate > 0.0))
+    batch = infer_log_rate_batch(
+        multineuron_counts,
+        model.dt,
+        model.variance_,
+        model.lengthscale_,
+        model.mean_,
+        n_iter=model.n_iter,
+    )
+    assert np.ndim(model.log_marginal_likelihood_) == 0
+    assert model.log_marginal_likelihood_ == pytest.approx(
+        float(jnp.sum(batch.log_marginal_likelihood))
+    )
 
 
 def test_fit_sgd_multineuron_per_neuron_hyperparameters(multineuron_counts):
