@@ -19,21 +19,20 @@ from state_space_practice.oscillator_regularization import (
 
 
 class TestEdgeL1Penalty:
-    def test_near_zero_when_no_coupling(self):
+    def test_zero_when_no_coupling(self):
         coupling = jnp.zeros((2, 3, 3))
-        # Smooth L1 gives sqrt(eps) per element, so not exactly zero
-        assert float(edge_l1_penalty(coupling)) < 0.01
+        assert float(edge_l1_penalty(coupling)) == 0.0
 
     def test_positive_for_nonzero_coupling(self):
         coupling = jnp.ones((2, 3, 3)) * 0.5
         assert float(edge_l1_penalty(coupling)) > 0
 
     def test_excludes_diagonal_by_default(self):
-        # Only diagonal entries — penalty should be near zero
+        # Only diagonal entries — penalty should be exactly zero.
         coupling = jnp.zeros((2, 3, 3))
         for j in range(2):
             coupling = coupling.at[j].set(jnp.diag(jnp.ones(3)))
-        assert float(edge_l1_penalty(coupling, exclude_diagonal=True)) < 0.01
+        assert float(edge_l1_penalty(coupling, exclude_diagonal=True)) == 0.0
 
     def test_includes_diagonal_when_requested(self):
         coupling = jnp.zeros((2, 3, 3))
@@ -57,16 +56,37 @@ class TestAreaGroupPenalty:
         value = area_group_penalty(coupling, area_labels)
         assert value > 0.0
 
-    def test_zero_coupling_near_zero_penalty(self):
+    def test_zero_coupling_zero_penalty(self):
         coupling = jnp.zeros((2, 3, 3))
         area_labels = jnp.array([0, 0, 1])
-        assert float(area_group_penalty(coupling, area_labels)) < 1e-3
+        assert float(area_group_penalty(coupling, area_labels)) == 0.0
 
     def test_gradient_finite(self):
         coupling = jnp.ones((2, 3, 3)) * 0.3
         area_labels = jnp.array([0, 0, 1])
         g = jax.grad(lambda c: area_group_penalty(c, area_labels))(coupling)
         assert jnp.all(jnp.isfinite(g))
+
+    def test_jit_accepts_dynamic_area_labels(self):
+        coupling = jnp.ones((2, 3, 3)) * 0.3
+        area_labels = jnp.array([0, 0, 1])
+        expected = area_group_penalty(coupling, area_labels)
+        observed = jax.jit(area_group_penalty)(coupling, area_labels)
+        np.testing.assert_allclose(float(observed), float(expected), rtol=1e-10)
+
+    @pytest.mark.parametrize(
+        "area_labels, match",
+        [
+            (jnp.array([0, 2, 2]), "contiguous"),
+            (jnp.array([-1, 0, 1]), "non-negative"),
+            (jnp.array([0, 1]), "length"),
+            (jnp.array([0.0, 1.0, 1.0]), "integer"),
+        ],
+    )
+    def test_rejects_invalid_area_labels(self, area_labels, match):
+        coupling = jnp.zeros((2, 3, 3))
+        with pytest.raises(ValueError, match=match):
+            area_group_penalty(coupling, area_labels)
 
 
 class TestStateSharedAreaPenalty:
@@ -89,6 +109,11 @@ class TestStateSharedAreaPenalty:
         single = area_group_penalty(coupling[:1], area_labels)
         np.testing.assert_allclose(float(shared), float(single), atol=1e-6)
 
+    def test_zero_coupling_zero_penalty(self):
+        coupling = jnp.zeros((2, 3, 3))
+        area_labels = jnp.array([0, 0, 1])
+        assert float(state_shared_area_penalty(coupling, area_labels)) == 0.0
+
     def test_gradient_finite(self):
         coupling = jnp.ones((2, 3, 3)) * 0.3
         area_labels = jnp.array([0, 0, 1])
@@ -102,6 +127,19 @@ class TestOscillatorPenaltyConfig:
         assert config.edge_l1 == 0.0
         assert config.area_group_l2 == 0.0
         assert config.state_shared_group_l2 == 0.0
+
+    @pytest.mark.parametrize(
+        "kwargs, match",
+        [
+            ({"edge_l1": -1.0}, "non-negative"),
+            ({"area_group_l2": np.nan}, "finite"),
+            ({"state_shared_group_l2": jnp.array([1.0])}, "scalar"),
+            ({"area_labels": jnp.array([0, 2])}, "contiguous"),
+        ],
+    )
+    def test_invalid_config_rejected(self, kwargs, match):
+        with pytest.raises(ValueError, match=match):
+            OscillatorPenaltyConfig(**kwargs)
 
     def test_total_penalty_zero_with_default_config(self):
         config = OscillatorPenaltyConfig()
@@ -123,6 +161,17 @@ class TestOscillatorPenaltyConfig:
         coupling = jnp.ones((2, 3, 3)) * 0.5
         penalty = total_connectivity_penalty(coupling, config)
         assert float(penalty) > 0.0
+
+    def test_total_penalty_rejects_bad_coupling_shape(self):
+        config = OscillatorPenaltyConfig(edge_l1=1.0)
+        with pytest.raises(ValueError, match="coupling"):
+            total_connectivity_penalty(jnp.ones((2, 3)), config)
+
+    def test_total_penalty_rejects_nonpositive_n_timesteps(self):
+        config = OscillatorPenaltyConfig(edge_l1=1.0)
+        coupling = jnp.ones((2, 3, 3))
+        with pytest.raises(ValueError, match="n_timesteps"):
+            total_connectivity_penalty(coupling, config, n_timesteps=0)
 
     def test_length_invariant_by_default(self):
         """Default: penalty * T, so effective penalty after /T is lambda."""

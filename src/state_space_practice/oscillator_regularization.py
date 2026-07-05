@@ -9,17 +9,122 @@ Penalty families:
 - area_group_l2: group L2 (Frobenius) on area-to-area pathway blocks
 - state_shared_group_l2: group L2 that ties pathway selection across states
 
-All penalties use smooth approximations (sqrt(x² + ε)) to avoid gradient
-singularities at zero. Post-hoc thresholding can be applied after optimization
-for exact sparsity.
+All penalties use zero-centered smooth approximations
+``sqrt(x² + ε) - sqrt(ε)`` to avoid gradient singularities at zero without
+shifting the objective when all penalized couplings are zero. Post-hoc
+thresholding can be applied after optimization for exact sparsity.
 """
 
+import operator
 from dataclasses import dataclass
 from typing import Optional
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
+
+
+def _contains_tracer(*values: object) -> bool:
+    """Return True if any pytree leaf is being traced by JAX."""
+    return any(
+        isinstance(leaf, jax.core.Tracer)
+        for value in values
+        for leaf in jax.tree_util.tree_leaves(value)
+    )
+
+
+def _validate_nonnegative_weight(value: object, name: str) -> float:
+    """Validate and coerce a finite non-negative scalar penalty weight."""
+    value_arr = np.asarray(value)
+    if value_arr.shape != ():
+        raise ValueError(f"{name} must be a scalar, got shape {value_arr.shape}.")
+    value_float = float(value_arr)
+    if not np.isfinite(value_float):
+        raise ValueError(f"{name} must be finite, got {value}.")
+    if value_float < 0.0:
+        raise ValueError(f"{name} must be non-negative, got {value_float}.")
+    return value_float
+
+
+def _validate_eps(eps: float) -> Array:
+    """Validate smoothing epsilon and return it as a scalar array."""
+    eps_arr = jnp.asarray(eps)
+    if eps_arr.shape != ():
+        raise ValueError(f"eps must be a scalar, got shape {eps_arr.shape}.")
+    if not _contains_tracer(eps_arr):
+        eps_float = float(eps_arr)
+        if not np.isfinite(eps_float) or eps_float <= 0.0:
+            raise ValueError(f"eps must be positive and finite, got {eps}.")
+    return eps_arr
+
+
+def _as_coupling(coupling: Array) -> Array:
+    """Convert and validate a coupling array with convention (state, osc, osc)."""
+    arr = jnp.asarray(coupling)
+    if arr.ndim != 3:
+        raise ValueError(
+            "coupling must have shape (n_states, n_osc, n_osc), "
+            f"got {arr.shape}."
+        )
+    if arr.shape[-2] != arr.shape[-1]:
+        raise ValueError(
+            "coupling must have square oscillator axes, "
+            f"got {arr.shape[-2:]}."
+        )
+    if not _contains_tracer(arr) and not bool(jnp.all(jnp.isfinite(arr))):
+        raise ValueError("coupling must contain only finite values.")
+    return arr
+
+
+def _validate_area_labels(area_labels: Array, n_osc: int | None = None) -> Array:
+    """Validate contiguous integer area labels and return a JAX array."""
+    labels_np = np.asarray(area_labels)
+    if labels_np.ndim != 1:
+        raise ValueError(
+            "area_labels must be a 1D integer array, "
+            f"got shape {labels_np.shape}."
+        )
+    if labels_np.size == 0:
+        raise ValueError("area_labels must contain at least one label.")
+    if n_osc is not None and labels_np.shape[0] != n_osc:
+        raise ValueError(
+            "area_labels length must match the number of oscillators; "
+            f"got {labels_np.shape[0]} labels for n_osc={n_osc}."
+        )
+    if not np.issubdtype(labels_np.dtype, np.integer):
+        raise ValueError("area_labels must contain integer labels.")
+    if not np.all(np.isfinite(labels_np)):
+        raise ValueError("area_labels must contain only finite labels.")
+    if np.any(labels_np < 0):
+        raise ValueError("area_labels must be non-negative integers.")
+
+    unique_labels = np.unique(labels_np)
+    expected = np.arange(int(unique_labels[-1]) + 1)
+    if not np.array_equal(unique_labels, expected):
+        raise ValueError(
+            "area_labels must be contiguous integers starting at 0; "
+            f"got labels {unique_labels.tolist()}."
+        )
+    return jnp.asarray(labels_np, dtype=jnp.int32)
+
+
+def _area_labels_for_penalty(area_labels: Array, n_osc: int) -> Array:
+    """Validate labels when possible; keep penalty helpers jit-compatible."""
+    labels = jnp.asarray(area_labels)
+    if labels.ndim != 1:
+        raise ValueError(
+            "area_labels must be a 1D integer array, "
+            f"got shape {labels.shape}."
+        )
+    if labels.shape[0] != n_osc:
+        raise ValueError(
+            "area_labels length must match the number of oscillators; "
+            f"got {labels.shape[0]} labels for n_osc={n_osc}."
+        )
+    if _contains_tracer(labels):
+        return labels
+    return _validate_area_labels(labels, n_osc=n_osc)
 
 
 @dataclass(frozen=True)
@@ -31,7 +136,7 @@ class OscillatorPenaltyConfig:
     edge_l1 : float
         Weight for smooth L1 penalty on individual coupling strengths.
     area_group_l2 : float
-        Weight for group L2 penalty on area-to-area pathway blocks.
+        Weight for state-specific group L2 penalty on area-to-area pathway blocks.
     state_shared_group_l2 : float
         Weight for group L2 penalty shared across discrete states.
     area_labels : Array or None
@@ -58,6 +163,21 @@ class OscillatorPenaltyConfig:
     exclude_diagonal: bool = True
     scale_with_length: bool = False
 
+    def __post_init__(self) -> None:
+        for name in ("edge_l1", "area_group_l2", "state_shared_group_l2"):
+            object.__setattr__(
+                self,
+                name,
+                _validate_nonnegative_weight(getattr(self, name), name),
+            )
+
+        if self.area_labels is not None:
+            object.__setattr__(
+                self,
+                "area_labels",
+                _validate_area_labels(self.area_labels),
+            )
+
 
 def _mask_diagonal(coupling: Array, exclude: bool) -> Array:
     """Zero out diagonal entries if exclude=True."""
@@ -73,7 +193,7 @@ def edge_l1_penalty(
     eps: float = 1e-8,
     exclude_diagonal: bool = True,
 ) -> Array:
-    """Smooth L1 penalty on individual coupling strengths.
+    """Zero-centered smooth L1 penalty on individual coupling strengths.
 
     Parameters
     ----------
@@ -89,8 +209,9 @@ def edge_l1_penalty(
     Array, shape ()
         Scalar penalty value.
     """
-    c = _mask_diagonal(coupling, exclude_diagonal)
-    return jnp.sum(jnp.sqrt(c**2 + eps))
+    c = _mask_diagonal(_as_coupling(coupling), exclude_diagonal)
+    eps_arr = _validate_eps(eps).astype(c.dtype)
+    return jnp.sum(jnp.sqrt(c**2 + eps_arr) - jnp.sqrt(eps_arr))
 
 
 def _build_area_pair_masks(area_labels: Array, n_areas: int) -> Array:
@@ -115,7 +236,8 @@ def area_group_penalty(
 ) -> Array:
     """Group L2 penalty on area-to-area pathway blocks.
 
-    Sums the Frobenius norm of each area-pair block across all states.
+    Sums zero-centered smooth Frobenius norms of each state-specific
+    area-pair block.
 
     Parameters
     ----------
@@ -128,12 +250,18 @@ def area_group_penalty(
     -------
     Array, shape ()
     """
-    c = _mask_diagonal(coupling, exclude_diagonal)
-    n_areas = int(np.asarray(area_labels).max()) + 1
-    masks = _build_area_pair_masks(area_labels, n_areas)
+    c = _mask_diagonal(_as_coupling(coupling), exclude_diagonal)
+    labels = _area_labels_for_penalty(area_labels, n_osc=c.shape[-1])
+    # Use n_osc as a static upper bound so this scalar penalty remains
+    # jit-compatible when area_labels is a dynamic JAX argument. Valid labels
+    # are still checked host-side when values are available; unused area rows
+    # contribute exactly zero because the smooth norm is zero-centered.
+    n_areas = c.shape[-1]
+    masks = _build_area_pair_masks(labels, n_areas)
+    eps_arr = _validate_eps(eps).astype(c.dtype)
     # (n_states, n_areas, n_areas): sum c^2 within each area block per state
     block_sq = jnp.einsum("sij,abij->sab", c ** 2, masks.astype(c.dtype))
-    return jnp.sum(jnp.sqrt(block_sq + eps))
+    return jnp.sum(jnp.sqrt(block_sq + eps_arr) - jnp.sqrt(eps_arr))
 
 
 def state_shared_area_penalty(
@@ -144,8 +272,9 @@ def state_shared_area_penalty(
 ) -> Array:
     """Group L2 penalty shared across discrete states.
 
-    For each area pair (a, b), computes sqrt(sum_s ||C_ab^(s)||_F^2),
-    encouraging the same pathways to be active or inactive across states.
+    For each area pair (a, b), computes a zero-centered smooth version of
+    sqrt(sum_s ||C_ab^(s)||_F^2), encouraging the same pathways to be active
+    or inactive across states.
 
     Parameters
     ----------
@@ -158,13 +287,17 @@ def state_shared_area_penalty(
     -------
     Array, shape ()
     """
-    c = _mask_diagonal(coupling, exclude_diagonal)
-    n_areas = int(np.asarray(area_labels).max()) + 1
-    masks = _build_area_pair_masks(area_labels, n_areas)
+    c = _mask_diagonal(_as_coupling(coupling), exclude_diagonal)
+    labels = _area_labels_for_penalty(area_labels, n_osc=c.shape[-1])
+    n_areas = c.shape[-1]
+    masks = _build_area_pair_masks(labels, n_areas)
+    eps_arr = _validate_eps(eps).astype(c.dtype)
     # Sum c^2 within each area block per state: (n_states, n_areas, n_areas)
     block_sq = jnp.einsum("sij,abij->sab", c ** 2, masks.astype(c.dtype))
     # Sum across states, then sqrt for group penalty
-    return jnp.sum(jnp.sqrt(jnp.sum(block_sq, axis=0) + eps))
+    return jnp.sum(
+        jnp.sqrt(jnp.sum(block_sq, axis=0) + eps_arr) - jnp.sqrt(eps_arr)
+    )
 
 
 def get_area_coupling_summary(
@@ -189,15 +322,15 @@ def get_area_coupling_summary(
         block_norms : Array, shape (n_states, n_areas, n_areas)
             Frobenius norm of each area-pair coupling block per state.
         within_area_norm : Array, shape (n_states,)
-            Total within-area coupling norm per state.
+            Sum of within-area block Frobenius norms per state.
         cross_area_norm : Array, shape (n_states,)
-            Total cross-area coupling norm per state.
+            Sum of cross-area block Frobenius norms per state.
     """
-    area_labels_np = np.asarray(area_labels)
-    n_areas = int(area_labels_np.max()) + 1
+    c = _mask_diagonal(_as_coupling(coupling), exclude_diagonal)
+    labels = _validate_area_labels(area_labels, n_osc=c.shape[-1])
+    n_areas = int(np.asarray(labels).max()) + 1
 
-    c = _mask_diagonal(coupling, exclude_diagonal)
-    masks = _build_area_pair_masks(area_labels, n_areas)
+    masks = _build_area_pair_masks(labels, n_areas)
     # (n_states, n_areas, n_areas)
     block_sq = jnp.einsum("sij,abij->sab", c ** 2, masks.astype(c.dtype))
     block_norms = jnp.sqrt(block_sq)
@@ -238,7 +371,15 @@ def total_connectivity_penalty(
         multiplied by ``n_timesteps`` so that after the mixin divides
         the total loss by T, the effective penalty is exactly lambda.
     """
-    penalty = jnp.array(0.0)
+    coupling = _as_coupling(coupling)
+    try:
+        n_timesteps = operator.index(n_timesteps)
+    except TypeError as exc:
+        raise ValueError("n_timesteps must be a positive integer.") from exc
+    if n_timesteps <= 0:
+        raise ValueError("n_timesteps must be a positive integer.")
+
+    penalty = jnp.array(0.0, dtype=coupling.dtype)
 
     if config.edge_l1 > 0:
         penalty = penalty + config.edge_l1 * edge_l1_penalty(
