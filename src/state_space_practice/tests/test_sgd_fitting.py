@@ -353,6 +353,49 @@ class TestSGDFittableMixin:
         assert np.isfinite(model.scale)
         np.testing.assert_allclose(model.scale, 1.0, atol=1e-6)
 
+    def test_final_unevaluated_candidate_with_nan_loss_rolls_back(self) -> None:
+        class _NanAboveThreshold(SGDFittableMixin):
+            def __init__(self):
+                self.scale = 0.0
+                self._initialized = True
+
+            @property
+            def _n_timesteps(self):
+                return 100
+
+            def _check_sgd_initialized(self):
+                pass
+
+            def _build_param_spec(self):
+                return {"scale": jnp.array(self.scale)}, {
+                    "scale": UNCONSTRAINED
+                }
+
+            def _sgd_loss_fn(self, params):
+                return jnp.where(
+                    params["scale"] > 1.4,
+                    jnp.array(jnp.nan),
+                    -params["scale"] * self._n_timesteps,
+                )
+
+            def _store_sgd_params(self, params):
+                self.scale = float(params["scale"])
+
+            def _finalize_sgd(self):
+                pass
+
+        import optax
+
+        model = _NanAboveThreshold()
+        lls = model.fit_sgd(
+            optimizer=optax.sgd(learning_rate=0.5),
+            num_steps=3,
+        )
+
+        np.testing.assert_allclose(lls, [0.0, 50.0, 100.0], atol=1e-6)
+        assert np.isfinite(model.scale)
+        np.testing.assert_allclose(model.scale, 1.0, atol=1e-6)
+
     def test_nan_at_step_zero_is_noop_recovery(self) -> None:
         """If the very first loss evaluation returns NaN, recovery has
         nothing valid to restore — the user's init was already bad.

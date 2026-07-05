@@ -176,6 +176,10 @@ class SGDFittableMixin:
             )
             return loss, new_unc_p, new_opt_st, step_finite
 
+        @jax.jit
+        def evaluate_loss(unc_p):
+            return _loss_inner(unc_p)
+
         log_likelihoods: list[float] = []
         # last_valid_unc_params tracks the most recent params that
         # produced finite loss. It is updated ONLY after the finite check
@@ -240,6 +244,14 @@ class SGDFittableMixin:
                         print(f"SGD converged at step {step}.")
                     logger.info("SGD converged at step %d.", step)
                     break
+
+        final_loss = evaluate_loss(unc_params)
+        if not bool(jnp.isfinite(final_loss)):
+            logger.warning(
+                "Final SGD parameters produced NaN/inf loss -- restoring "
+                "last valid params."
+            )
+            unc_params = last_valid_unc_params
 
         final_params = transform_to_constrained(unc_params, param_spec)
         self._store_sgd_params(final_params)
