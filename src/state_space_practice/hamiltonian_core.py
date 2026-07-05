@@ -1,12 +1,5 @@
 """Shared EKF / Laplace-EKF kernel for the Hamiltonian model family.
 
-The four Hamiltonian model files (``hamiltonian_lfp``,
-``hamiltonian_spikes``, ``hamiltonian_joint``, ``hamiltonian_switching``)
-re-implemented the same per-step measurement-update bodies and the same
-RTS backward pass. This module exposes those building blocks as pure
-JIT-compatible functions so each model class composes them rather than
-inlining the math four times.
-
 Conventions
 -----------
 - All helpers take JAX arrays and return JAX arrays. None capture
@@ -27,14 +20,16 @@ from typing import Any, Dict, Tuple
 
 import jax
 import jax.numpy as jnp
+import jax.scipy.linalg
 from jax import Array
 
-from state_space_practice.kalman import joseph_form_update, psd_solve
+from state_space_practice.kalman import joseph_form_update
 from state_space_practice.nonlinear_dynamics import ekf_smooth_step
 from state_space_practice.point_process_kalman import (
     glm_laplace_update,
     poisson_family,
 )
+from state_space_practice.utils import psd_cholesky
 
 
 def gaussian_measurement_update(
@@ -62,12 +57,17 @@ def gaussian_measurement_update(
     """
     err = y - (C @ m_pred + d)
     S = C @ P_pred @ C.T + R
-    K = psd_solve(S, C @ P_pred).T
+    # One stabilized Cholesky of S serves the gain solve, the quadratic form,
+    # and the log-determinant, so all three see the same symmetrized + boosted
+    # matrix (avoids the boosted-solve / unboosted-slogdet mismatch on
+    # near-singular S) and S is factored once rather than three times.
+    S_cho = psd_cholesky(S)
+    K = jax.scipy.linalg.cho_solve(S_cho, C @ P_pred).T
     m_post = m_pred + K @ err
     P_post = joseph_form_update(P_pred, K, C, R)
 
-    _, logdet = jnp.linalg.slogdet(S)
-    ll = -0.5 * (err @ psd_solve(S, err) + logdet)
+    logdet = 2.0 * jnp.sum(jnp.log(jnp.abs(jnp.diag(S_cho[0]))))
+    ll = -0.5 * (err @ jax.scipy.linalg.cho_solve(S_cho, err) + logdet)
     if include_normalization_const:
         n_obs = err.shape[0]
         ll = ll - 0.5 * n_obs * jnp.log(2 * jnp.pi)
@@ -98,7 +98,9 @@ def point_process_laplace_update(
     log_likelihood : ()
         Laplace-approximated marginal ``log p(y | y_{1:t-1})``.
         With ``compute_log_likelihood=False`` returns ``jnp.array(0.0)``
-        (used in the smoother forward pass where ll is discarded).
+        and, because the log-likelihood is discarded, skips the Laplace
+        normalization (two Cholesky log-determinants per step) inside the
+        GLM update — the intended saving for the smoother forward pass.
     """
 
     def eta_func(x: Array) -> Array:
@@ -107,6 +109,9 @@ def point_process_laplace_update(
     def grad_eta_func(_x: Array) -> Array:
         return C
 
+    # The posterior mean/covariance do not depend on the normalization
+    # constant, so dropping it when the ll is discarded changes nothing but
+    # the (unused) return value while avoiding two Cholesky log-determinants.
     m_post, P_post, ll = glm_laplace_update(
         m_pred,
         P_pred,
@@ -114,6 +119,7 @@ def point_process_laplace_update(
         eta_func,
         poisson_family(dt),
         grad_eta_func=grad_eta_func,
+        include_laplace_normalization=compute_log_likelihood,
     )
     if not compute_log_likelihood:
         return m_post, P_post, jnp.array(0.0)
@@ -140,7 +146,17 @@ def ekf_rts_backward_pass(
     F : (T, n, n)
         Transition Jacobian at each forward step (``∂f/∂x`` evaluated
         at the previous filtered mean, returned by
-        ``ekf_predict_step_with_jacobian``).
+        ``ekf_predict_step_with_jacobian``). The correct alignment is the
+        one that satisfies ``P_pred[t+1] == F[t+1] @ P_filt[t] @ F[t+1].T
+        + Q`` — i.e. ``F[t+1]`` is the Jacobian *used to produce*
+        ``P_pred[t+1]``, evaluated at ``m_filt[t]``. Storing ``F`` shifted
+        by one step silently corrupts every smoother gain.
+
+    Notes
+    -----
+    Index 0 of ``m_pred``, ``P_pred`` and ``F`` is never read (the scan
+    slices ``[1:]``), because position 0 has no predecessor to smooth
+    against. Callers may leave those slots as any placeholder.
 
     Returns
     -------
@@ -152,14 +168,23 @@ def ekf_rts_backward_pass(
         m_s_next, P_s_next = carry
         m_f_t, P_f_t, m_p_next, P_p_next, F_next = inputs
         m_s, P_s = ekf_smooth_step(
-            m_f_t, P_f_t, m_p_next, P_p_next, m_s_next, P_s_next, F_next,
+            m_f_t,
+            P_f_t,
+            m_p_next,
+            P_p_next,
+            m_s_next,
+            P_s_next,
+            F_next,
         )
         return (m_s, P_s), (m_s, P_s)
 
     init_smooth = (m_filt[-1], P_filt[-1])
     bw_inputs = (m_filt[:-1], P_filt[:-1], m_pred[1:], P_pred[1:], F[1:])
     _, (m_s_rev, P_s_rev) = jax.lax.scan(
-        backward_step, init_smooth, bw_inputs, reverse=True,
+        backward_step,
+        init_smooth,
+        bw_inputs,
+        reverse=True,
     )
     m_smooth = jnp.concatenate([m_s_rev, m_filt[-1:]], axis=0)
     P_smooth = jnp.concatenate([P_s_rev, P_filt[-1:]], axis=0)
@@ -173,9 +198,7 @@ def mlp_l2_penalty(mlp_params: Dict[str, Any]) -> Array:
     ``b*``; this helper centralises the convention.
     """
     return jnp.sum(
-        jnp.array(
-            [jnp.sum(v ** 2) for k, v in mlp_params.items() if k.startswith("w")]
-        )
+        jnp.array([jnp.sum(v**2) for k, v in mlp_params.items() if k.startswith("w")])
     )
 
 
@@ -211,4 +234,8 @@ class _BaseModelStubs:
         return
 
     def _check_sgd_initialized(self) -> None:
+        # Safe no-op: unlike the lazily-initialized oscillator models (whose
+        # _check_sgd_initialized guards the "constructed but never initialized"
+        # state), every Hamiltonian model fully populates its parameters in
+        # __init__, so there is no uninitialized state to detect here.
         return
