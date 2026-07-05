@@ -89,7 +89,10 @@ def simulate_com_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
 
     rng = np.random.default_rng(seed)
     X0 = rng.standard_normal(N_LATENT)
-    obs, true_states, true_continuous = simulate(A, H, Q, R, Z, X0, 0, n_time)
+    sim_seed = int(rng.integers(np.iinfo(np.uint32).max))
+    obs, true_states, true_continuous = simulate(
+        A, H, Q, R, Z, X0, 0, n_time, seed=sim_seed
+    )
 
     return {
         "obs": obs,
@@ -156,7 +159,10 @@ def simulate_cnm_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
 
     rng = np.random.default_rng(seed)
     X0 = rng.standard_normal(N_LATENT)
-    obs, true_states, true_continuous = simulate(A, H, Q, R, Z, X0, 0, n_time)
+    sim_seed = int(rng.integers(np.iinfo(np.uint32).max))
+    obs, true_states, true_continuous = simulate(
+        A, H, Q, R, Z, X0, 0, n_time, seed=sim_seed
+    )
 
     return {
         "obs": obs,
@@ -227,7 +233,10 @@ def simulate_dim_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
 
     rng = np.random.default_rng(seed)
     X0 = rng.standard_normal(N_LATENT)
-    obs, true_states, true_continuous = simulate(A, H, Q, R, Z, X0, 0, n_time)
+    sim_seed = int(rng.integers(np.iinfo(np.uint32).max))
+    obs, true_states, true_continuous = simulate(
+        A, H, Q, R, Z, X0, 0, n_time, seed=sim_seed
+    )
 
     return {
         "obs": obs,

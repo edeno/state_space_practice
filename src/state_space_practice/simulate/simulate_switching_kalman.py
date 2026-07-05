@@ -95,8 +95,8 @@ def build_R(n, M, var_obs_noi):
     return R
 
 
-def simulate(A, B0, Q, R, Z, X_0, S_0, T, s=None):
-    rng = np.random.default_rng(14)
+def simulate(A, B0, Q, R, Z, X_0, S_0, T, s=None, seed: int = 14):
+    rng = np.random.default_rng(seed)
 
     n = R.shape[0]  # # of electrodes
     x_dim = A.shape[0]  # # of oscillators*2 == k*2 == continuous hidden state dimension
@@ -104,11 +104,17 @@ def simulate(A, B0, Q, R, Z, X_0, S_0, T, s=None):
     if blnSimS:
         s = np.zeros(T, dtype=int)
         s[0] = S_0
+    else:
+        s = np.asarray(s, dtype=int)
+        if s.shape != (T,):
+            raise ValueError(f"s must have shape ({T},), got {s.shape}.")
 
     x = np.zeros([T, x_dim])
     x[0, :] = X_0
     y = np.zeros([T, n])
-    y[0, :] = B0[:, :, S_0] @ X_0 + rng.multivariate_normal(np.zeros(n), R[:, :, S_0])
+    y[0, :] = B0[:, :, s[0]] @ X_0 + rng.multivariate_normal(
+        np.zeros(n), R[:, :, s[0]]
+    )
     for t in range(1, T):
         if blnSimS:
             s[t] = np.nonzero(rng.multinomial(1, Z[s[t - 1], :]))[0][

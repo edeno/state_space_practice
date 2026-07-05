@@ -6002,3 +6002,66 @@ def test_viterbi_uses_posterior_not_prior() -> None:
     )
     # All states should be 1
     assert jnp.all(states == 1), "All states should be 1 given obs=100"
+
+
+def test_simulate_uses_supplied_state_path_at_first_observation() -> None:
+    """When s is supplied, y[0] must use s[0], not the separate S_0 argument."""
+    from state_space_practice.simulate.simulate_switching_kalman import simulate
+
+    A = np.ones((1, 1, 2))
+    Q = np.zeros((1, 1, 2))
+    R = np.zeros((1, 1, 2))
+    Z = np.eye(2)
+    H = np.zeros((1, 1, 2))
+    H[:, :, 0] = 1.0
+    H[:, :, 1] = 10.0
+    s = np.array([1, 1, 1])
+
+    obs, states, continuous = simulate(
+        A, H, Q, R, Z, np.array([2.0]), S_0=0, T=3, s=s
+    )
+
+    np.testing.assert_array_equal(states, s)
+    np.testing.assert_allclose(continuous[0], np.array([2.0]))
+    np.testing.assert_allclose(obs[:, 0], np.array([20.0, 20.0, 20.0]))
+
+
+def test_simulate_seed_controls_generated_randomness() -> None:
+    """Different seeds should produce different simulated paths/noise."""
+    from state_space_practice.simulate.simulate_switching_kalman import simulate
+
+    A = np.stack([np.eye(1), np.eye(1)], axis=-1)
+    Q = np.stack([np.eye(1) * 0.2, np.eye(1) * 0.2], axis=-1)
+    R = np.stack([np.eye(1) * 0.2, np.eye(1) * 0.2], axis=-1)
+    H = np.stack([np.eye(1), np.eye(1)], axis=-1)
+    Z = np.array([[0.5, 0.5], [0.5, 0.5]])
+    x0 = np.zeros(1)
+
+    obs_a, states_a, continuous_a = simulate(
+        A, H, Q, R, Z, x0, S_0=0, T=25, seed=123
+    )
+    obs_b, states_b, continuous_b = simulate(
+        A, H, Q, R, Z, x0, S_0=0, T=25, seed=123
+    )
+    obs_c, states_c, continuous_c = simulate(
+        A, H, Q, R, Z, x0, S_0=0, T=25, seed=456
+    )
+
+    np.testing.assert_array_equal(states_a, states_b)
+    np.testing.assert_allclose(continuous_a, continuous_b)
+    np.testing.assert_allclose(obs_a, obs_b)
+    assert not (
+        np.array_equal(states_a, states_c)
+        and np.allclose(continuous_a, continuous_c)
+        and np.allclose(obs_a, obs_c)
+    )
+
+
+def test_gaussian_scenario_seed_changes_discrete_path() -> None:
+    """Scenario seeds should control the simulated state path, not only X0."""
+    from state_space_practice.simulate.scenarios import simulate_com_scenario
+
+    data_a = simulate_com_scenario(n_time=300, seed=1)
+    data_b = simulate_com_scenario(n_time=300, seed=2)
+
+    assert not np.array_equal(data_a["true_states"], data_b["true_states"])
