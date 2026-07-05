@@ -2046,8 +2046,8 @@ class TestBaseModelPStayValidation:
                 measurement_variance=0.05,
             )
 
-    def test_p_stay_clamped_at_boundary(self):
-        """At sampling_freq=1.0 Hz, p_stay should be clamped to valid range."""
+    def test_p_stay_at_low_boundary(self):
+        """At sampling_freq=1.0 Hz the ~1s dwell target gives p_stay=0."""
         model = CommonOscillatorModel(
             n_oscillators=2, n_discrete_states=3, n_sources=4,
             sampling_freq=1.0, freqs=jnp.array([8.0, 12.0]),
@@ -2055,8 +2055,33 @@ class TestBaseModelPStayValidation:
             process_variance=jnp.array([0.1, 0.1]),
             measurement_variance=0.05,
         )
+        # p_stay = 1 - 1/(1s * 1Hz) = 0; stays in [0, 1).
         assert jnp.all(model.discrete_transition_diag >= 0)
-        assert jnp.all(model.discrete_transition_diag <= 0.95)
+        assert jnp.all(model.discrete_transition_diag < 1.0)
+        np.testing.assert_allclose(model.discrete_transition_diag, 0.0, atol=1e-9)
+
+    @pytest.mark.parametrize("sampling_freq", [50.0, 250.0, 1000.0])
+    def test_default_p_stay_preserves_one_second_dwell(self, sampling_freq):
+        """Default p_stay must target a ~1s dwell, not flatten to 0.95.
+
+        Regression for the old ``min(0.95, ...)`` cap, which bound for any
+        sampling rate above 20 Hz and collapsed the intended ~1s dwell to a
+        20-sample dwell (e.g. 20 ms at 1000 Hz).
+        """
+        model = CommonOscillatorModel(
+            n_oscillators=2, n_discrete_states=3, n_sources=4,
+            sampling_freq=sampling_freq, freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.array([0.1, 0.1]),
+            measurement_variance=0.05,
+        )
+        expected_p_stay = 1.0 - 1.0 / sampling_freq
+        np.testing.assert_allclose(
+            model.discrete_transition_diag, expected_p_stay, rtol=1e-6
+        )
+        # Expected dwell 1/(1-p_stay) should be ~sampling_freq samples = ~1s.
+        dwell_samples = 1.0 / (1.0 - float(model.discrete_transition_diag[0]))
+        np.testing.assert_allclose(dwell_samples, sampling_freq, rtol=1e-6)
 
     @pytest.mark.parametrize(
         "discrete_transition_diag",
@@ -2146,3 +2171,227 @@ class TestOscillatorEMRollback:
 
         assert log_likelihoods == [0.0]
         assert float(jnp.max(jnp.abs(model.measurement_matrix))) < 1.0
+
+
+class TestForcedUpdateFlagsRejected:
+    """Subclasses fix which of A, H, Q are learned; overriding must raise."""
+
+    _FORCED = [
+        "update_continuous_transition_matrix",
+        "update_measurement_matrix",
+        "update_process_cov",
+    ]
+
+    @pytest.mark.parametrize("flag", _FORCED)
+    def test_com_rejects_forced_flag(self, common_oscillator_params, flag):
+        with pytest.raises(ValueError, match="cannot be overridden"):
+            CommonOscillatorModel(**common_oscillator_params, **{flag: True})
+
+    @pytest.mark.parametrize("flag", _FORCED)
+    def test_cnm_rejects_forced_flag(self, correlated_noise_params, flag):
+        with pytest.raises(ValueError, match="cannot be overridden"):
+            CorrelatedNoiseModel(**correlated_noise_params, **{flag: False})
+
+    @pytest.mark.parametrize("flag", _FORCED)
+    def test_dim_rejects_forced_flag(self, directed_influence_params, flag):
+        with pytest.raises(ValueError, match="cannot be overridden"):
+            DirectedInfluenceModel(**directed_influence_params, **{flag: True})
+
+    def test_non_forced_flag_is_accepted(self, common_oscillator_params):
+        """A flag the subclass does not fix must still be settable."""
+        model = CommonOscillatorModel(
+            **common_oscillator_params, update_measurement_cov=False
+        )
+        assert model.update_measurement_cov is False
+        # And the forced flags keep their model-defined values.
+        assert model.update_process_cov is False
+        assert model.update_continuous_transition_matrix is False
+
+
+class TestComWarmInitStateDependentH:
+    """COM's H is state-dependent, so warm init must not pinv-amplify init_mean."""
+
+    def _com(self):
+        return CommonOscillatorModel(
+            n_oscillators=2, n_discrete_states=2, n_sources=4,
+            sampling_freq=100.0, freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.array([0.1, 0.1]),
+            measurement_variance=0.05,
+        )
+
+    def test_warm_init_preserves_cold_init_mean(self):
+        model = self._com()
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        cold_mean = model.init_mean
+
+        key = jax.random.PRNGKey(1)
+        # Variance clearly != 1 so the (deterministic) init_cov rescale is visible.
+        obs = 3.0 * jax.random.normal(key, (400, 4))
+        model._warm_initialize_states(obs)
+
+        # State-dependent H -> the pinv mean step is skipped; init_mean unchanged.
+        np.testing.assert_array_equal(
+            np.array(model.init_mean), np.array(cold_mean)
+        )
+        # But warm init still ran: init_cov was rescaled to the data variance.
+        obs_var = float(np.var(np.array(obs), axis=0).mean())
+        for j in range(model.n_discrete_states):
+            np.testing.assert_allclose(
+                np.diag(np.array(model.init_cov[..., j])), obs_var, rtol=0.05
+            )
+
+    def test_shared_h_model_updates_init_mean(self):
+        """Contrast: DIM has shared H, so warm init DOES set init_mean."""
+        model = DirectedInfluenceModel(
+            n_oscillators=2, n_discrete_states=2, sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]), damping_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.array([0.1, 0.1]), measurement_variance=0.05,
+            phase_difference=jnp.zeros((2, 2, 2)),
+            coupling_strength=jnp.zeros((2, 2, 2)),
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        cold_mean = model.init_mean
+        obs = 3.0 * jax.random.normal(jax.random.PRNGKey(1), (400, 2))
+        model._warm_initialize_states(obs)
+        assert not np.allclose(np.array(model.init_mean), np.array(cold_mean))
+
+
+class TestReparameterizedPublicParamsReconstructA:
+    """After a reparameterized DIM fit, public params must reconstruct A."""
+
+    @pytest.mark.slow
+    def test_public_params_reconstruct_transition_matrix(self):
+        from state_space_practice.oscillator_models import (
+            _stabilize_transition_matrix,
+        )
+        from state_space_practice.oscillator_utils import (
+            construct_directed_influence_transition_matrix,
+        )
+
+        key = jax.random.PRNGKey(3)
+        n_time = 250
+        t = jnp.arange(n_time) / 100.0
+        obs = (
+            jnp.sin(2 * jnp.pi * 9 * t)[:, None] * jnp.ones((1, 2))
+            + 0.3 * jax.random.normal(key, (n_time, 2))
+        )
+        model = DirectedInfluenceModel(
+            n_oscillators=2, n_discrete_states=2, sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]), damping_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.array([0.1, 0.1]), measurement_variance=0.1,
+            phase_difference=jnp.zeros((2, 2, 2)),
+            coupling_strength=jnp.zeros((2, 2, 2)),
+            use_reparameterized_mstep=True,
+        )
+        model.fit(obs, jax.random.PRNGKey(7), max_iter=5)
+
+        # freqs/damping are shared (n_osc,); coupling/phase are per-state.
+        assert model.freqs.shape == (2,)
+        assert model.damping_coef.shape == (2,)
+        # The stored A must equal the stabilized reconstruction from the public
+        # (shared freq/damping + per-state coupling/phase) parameters. Before
+        # the fix, self.freqs was the cross-state mean while A used per-state
+        # freqs, so this reconstruction would not match.
+        for j in range(model.n_discrete_states):
+            A_recon = _stabilize_transition_matrix(
+                construct_directed_influence_transition_matrix(
+                    freqs=model.freqs,
+                    damping_coeffs=model.damping_coef,
+                    coupling_strengths=model.coupling_strength[..., j],
+                    phase_diffs=model.phase_difference[..., j],
+                    sampling_freq=model.sampling_freq,
+                )
+            )
+            np.testing.assert_allclose(
+                np.array(model.continuous_transition_matrix[..., j]),
+                np.array(A_recon),
+                rtol=1e-6, atol=1e-9,
+            )
+
+
+class TestFirstIterationFailureClearsPosteriors:
+    """A non-finite first E-step must not leave NaN posteriors installed."""
+
+    def test_nonfinite_first_e_step_clears_posteriors(
+        self, common_oscillator_params
+    ):
+        model = CommonOscillatorModel(**common_oscillator_params)
+        obs = jax.random.normal(
+            jax.random.PRNGKey(1), (150, common_oscillator_params["n_sources"])
+        )
+
+        real_e_step = model._e_step
+
+        def fake_e_step(observations):
+            # Install a full (but NaN) posterior like a real failed E-step,
+            # then report a non-finite log-likelihood.
+            real_e_step(observations)
+            n = observations.shape[0]
+            model.smoother_discrete_state_prob = jnp.full(
+                (n, model.n_discrete_states), jnp.nan
+            )
+            return jnp.asarray(jnp.nan)
+
+        model._e_step = fake_e_step
+        lls = model.fit(obs, jax.random.PRNGKey(0), max_iter=3)
+
+        # Nothing usable was produced.
+        assert lls == []
+        assert model.smoother_discrete_state_prob is None
+        with pytest.raises(RuntimeError, match="No smoother posteriors"):
+            model.decode()
+        with pytest.raises(RuntimeError, match="No smoother posteriors"):
+            model.predict_proba()
+
+
+class TestSamplingFrequencyRange:
+    """Models must be usable across sampling rates up to at least 1000 Hz."""
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize("sampling_freq", [100.0, 500.0, 1000.0])
+    def test_models_fit_across_sampling_frequencies(self, sampling_freq):
+        key = jax.random.PRNGKey(0)
+        n_time = 300
+        t = jnp.arange(n_time) / sampling_freq
+        obs2 = (
+            jnp.sin(2 * jnp.pi * 8 * t)[:, None] * jnp.ones((1, 2))
+            + 0.3 * jax.random.normal(key, (n_time, 2))
+        )
+        obs4 = jnp.concatenate([obs2, 0.5 * obs2], axis=1)
+
+        def _finite(values):
+            return len(values) >= 1 and all(np.isfinite(v) for v in values)
+
+        com = CommonOscillatorModel(
+            2, 2, 4, sampling_freq, freqs=jnp.array([8.0, 20.0]),
+            damping_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.array([0.1, 0.1]), measurement_variance=0.1,
+        )
+        assert _finite(com.fit(obs4, key, max_iter=3))
+
+        cnm = CorrelatedNoiseModel(
+            2, 2, sampling_freq, freqs=jnp.array([8.0, 20.0]),
+            damping_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.ones((2, 2)) * 0.1, measurement_variance=0.1,
+            phase_difference=jnp.zeros((2, 2, 2)),
+            coupling_strength=jnp.zeros((2, 2, 2)),
+        )
+        assert _finite(cnm.fit(obs2, key, max_iter=3))
+
+        dim = DirectedInfluenceModel(
+            2, 2, sampling_freq, freqs=jnp.array([8.0, 20.0]),
+            damping_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.array([0.1, 0.1]), measurement_variance=0.1,
+            phase_difference=jnp.zeros((2, 2, 2)),
+            coupling_strength=jnp.zeros((2, 2, 2)),
+            use_reparameterized_mstep=True,
+        )
+        assert _finite(dim.fit(obs2, key, max_iter=3))
+
+        # Default prior targets a ~1s dwell at every rate (regression for the
+        # old 0.95 cap that bound above 20 Hz).
+        np.testing.assert_allclose(
+            float(com.discrete_transition_diag[0]),
+            1.0 - 1.0 / sampling_freq, rtol=1e-6,
+        )

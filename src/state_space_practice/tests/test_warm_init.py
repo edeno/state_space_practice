@@ -88,7 +88,16 @@ def dim_simulation():
 
 
 def _build_model(data):
-    """Create a fresh DirectedInfluenceModel from simulation parameters."""
+    """Create a fresh DirectedInfluenceModel from simulation parameters.
+
+    The discrete transition prior is pinned to the simulation's true
+    self-transition probability (``1 - 2/sampling_freq``) rather than left to
+    the default. Warm init is a state-segmentation aid, so the transition
+    stickiness must not be a confound: at the matched prior warm init helps the
+    first E-step by a wide margin, whereas the model default would leave the
+    prior mismatched and mask the effect.
+    """
+    true_p_stay = 1.0 - 2.0 / data["sampling_freq"]
     return DirectedInfluenceModel(
         n_oscillators=data["n_osc"],
         n_discrete_states=data["n_disc"],
@@ -103,6 +112,7 @@ def _build_model(data):
         coupling_strength=jnp.zeros(
             (data["n_osc"], data["n_osc"], data["n_disc"])
         ),
+        discrete_transition_diag=jnp.full((data["n_disc"],), true_p_stay),
     )
 
 

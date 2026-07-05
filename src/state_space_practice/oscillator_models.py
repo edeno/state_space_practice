@@ -83,6 +83,52 @@ def _validate_nonnegative_array(name: str, value: ArrayLike) -> None:
         raise ValueError(f"{name} must be non-negative.")
 
 
+# Update flags each oscillator subclass fixes by model definition (which of the
+# continuous transition matrix A, measurement matrix H, and process covariance Q
+# are learned). COM, CNM, and DIM differ only in which single one is state-
+# dependent, so all three hard-set exactly these three flags.
+_FORCED_UPDATE_FLAGS = (
+    "update_continuous_transition_matrix",
+    "update_measurement_matrix",
+    "update_process_cov",
+)
+
+
+def _reject_forced_update_flags(model_name: str, kwargs: dict) -> None:
+    """Reject update flags a subclass fixes by model definition.
+
+    Each subclass hard-sets which of A, H, and Q are learned. Silently
+    accepting and then discarding a user-supplied override (e.g.
+    ``update_process_cov=True`` on a model that fixes Q) is worse than
+    refusing it, so raise instead.
+    """
+    conflicting = sorted(k for k in _FORCED_UPDATE_FLAGS if k in kwargs)
+    if conflicting:
+        raise ValueError(
+            f"{model_name} fixes {', '.join(conflicting)} by model definition; "
+            "these update flags cannot be overridden."
+        )
+
+
+def _stabilize_transition_matrix(A: ArrayLike, max_spectral_radius: float = 0.99) -> Array:
+    """Scale a transition matrix so its spectral radius is <= the bound.
+
+    Eigenvalues are computed on host with NumPy: ``jnp.linalg.eigvals`` (the
+    general, non-symmetric decomposition) has no GPU/TPU lowering, and callers
+    run this in eager per-state Python loops -- not under a JIT trace -- so a
+    host computation is both safe and portable across accelerator backends.
+    """
+    import numpy as np_cpu
+
+    A_arr = jnp.asarray(A)
+    spectral_radius = float(
+        np_cpu.max(np_cpu.abs(np_cpu.linalg.eigvals(np_cpu.asarray(A_arr))))
+    )
+    if spectral_radius > max_spectral_radius:
+        return A_arr * (max_spectral_radius / spectral_radius)
+    return A_arr
+
+
 class BaseModel(ABC, SGDFittableMixin):
     """Abstract base class for switching oscillator models.
 
@@ -105,6 +151,11 @@ class BaseModel(ABC, SGDFittableMixin):
     discrete_transition_diag : Optional[jax.Array], default=None
         Diagonal elements of the discrete transition matrix (Z).
         If None, initializes Z with a default based on `n_discrete_states`.
+    stickiness : float, default=0.0
+        Self-transition bias of a symmetric sticky Dirichlet prior on the
+        discrete transition matrix. If > 0, this prior regularizes the M-step
+        update of Z toward staying in the current state (concentration is fixed
+        at 1.0); 0.0 disables the prior entirely.
     update_discrete_transition_matrix : bool, default=True
         Flag to update Z during M-step.
     update_continuous_transition_matrix : bool, default=True
@@ -170,6 +221,10 @@ class BaseModel(ABC, SGDFittableMixin):
         update_init_mean: bool = True,
         update_init_cov: bool = True,
     ):
+        if sampling_freq <= 0:
+            raise ValueError(
+                f"sampling_freq must be positive. Got {sampling_freq}."
+            )
         self.n_oscillators = n_oscillators
         self.n_discrete_states = n_discrete_states
         self.n_sources = n_sources
@@ -188,7 +243,12 @@ class BaseModel(ABC, SGDFittableMixin):
                     f"Require sampling_freq >= {1.0 / expected_dwell_sec} Hz."
                 )
             p_stay = 1.0 - 1.0 / (expected_dwell_sec * sampling_freq)
-            p_stay = max(0.0, min(0.95, p_stay))
+            # Cap just below 1 to avoid a numerically absorbing state at very
+            # high sampling rates. The formula already keeps p_stay in [0, 1)
+            # for valid sampling_freq, so this preserves the ~1s dwell target
+            # (e.g. p_stay ~= 0.999 at 1000 Hz) instead of flattening every
+            # rate above 20 Hz to 0.95 (a 20-sample = 20 ms dwell at 1000 Hz).
+            p_stay = min(p_stay, 1.0 - 1e-6)
             self.discrete_transition_diag = jnp.full(
                 (n_discrete_states,), p_stay
             )
@@ -244,19 +304,44 @@ class BaseModel(ABC, SGDFittableMixin):
         self.smoother_pair_cond_means: jax.Array  # E[x_t | S_t=i, S_{t+1}=j]
 
     def _snapshot_em_state(self) -> dict:
-        """Capture parameters and smoother outputs for EM rollback."""
+        """Capture parameters and smoother outputs for EM rollback.
+
+        Snapshotted values are JAX arrays (immutable), so a reference copy is
+        sufficient -- except ``_current_osc_params``, a list of dicts that the
+        reparameterized M-step mutates in place, which needs a deep copy.
+        """
         import copy
 
-        return {
-            key: copy.deepcopy(getattr(self, key))
-            for key in self._EM_SNAPSHOT_KEYS
-            if hasattr(self, key)
-        }
+        snapshot: dict = {}
+        for key in self._EM_SNAPSHOT_KEYS:
+            if not hasattr(self, key):
+                continue
+            value = getattr(self, key)
+            snapshot[key] = (
+                copy.deepcopy(value) if key == "_current_osc_params" else value
+            )
+        return snapshot
 
     def _restore_em_state(self, state: dict) -> None:
         """Restore a state captured by _snapshot_em_state."""
         for key, value in state.items():
             setattr(self, key, value)
+
+    def _clear_smoother_state(self) -> None:
+        """Drop smoother posteriors so decode()/predict_proba() fail loudly.
+
+        Used when EM cannot produce a usable posterior (e.g. a non-finite
+        first E-step with no earlier accepted state to roll back to). Without
+        this the NaN posteriors installed by the failed E-step would remain,
+        and decode()/predict_proba() -- which only guard on attribute
+        existence -- would silently return garbage (argmax of NaN).
+        """
+        self.smoother_discrete_state_prob = None
+        self.smoother_joint_discrete_state_prob = None
+        self.smoother_state_cond_mean = None
+        self.smoother_state_cond_cov = None
+        self.smoother_pair_cond_cross_cov = None
+        self.smoother_pair_cond_means = None
 
     def __repr__(self) -> str:
         """Returns an unambiguous string representation of the model.
@@ -307,7 +392,8 @@ class BaseModel(ABC, SGDFittableMixin):
         if not hasattr(self, "smoother_discrete_state_prob") or \
            self.smoother_discrete_state_prob is None:
             raise RuntimeError(
-                "Call fit() or fit_sgd() before decode()."
+                "No smoother posteriors available. Call fit() or fit_sgd() and "
+                "ensure it produced a finite log-likelihood before decode()."
             )
         return jnp.argmax(self.smoother_discrete_state_prob, axis=1)
 
@@ -327,7 +413,9 @@ class BaseModel(ABC, SGDFittableMixin):
         if not hasattr(self, "smoother_discrete_state_prob") or \
            self.smoother_discrete_state_prob is None:
             raise RuntimeError(
-                "Call fit() or fit_sgd() before predict_proba()."
+                "No smoother posteriors available. Call fit() or fit_sgd() and "
+                "ensure it produced a finite log-likelihood before "
+                "predict_proba()."
             )
         return self.smoother_discrete_state_prob
 
@@ -336,13 +424,14 @@ class BaseModel(ABC, SGDFittableMixin):
 
         Uses windowed cross-covariance features clustered with a Gaussian
         mixture model to break symmetry before the first E-step.  Sets
-        ``init_mean`` to per-state latent estimates (via H pseudo-inverse)
-        and ``init_discrete_state_prob`` from GMM mixing weights.
-        Also scales ``init_cov`` to match data variance.
+        ``init_discrete_state_prob`` from GMM mixing weights and scales
+        ``init_cov`` to match data variance.  For models with a single shared
+        measurement matrix it also sets per-state ``init_mean`` via the H
+        pseudo-inverse; models with a state-dependent H (e.g. COM) keep their
+        cold ``init_mean`` (see ``_apply_warm_init``).
 
-        Subclasses may override to use model-specific features (e.g.
-        spectral features for COM).  The shared post-GMM logic lives
-        in ``_apply_warm_init``.
+        Subclasses may override to use model-specific features.  The shared
+        post-GMM logic lives in ``_apply_warm_init``.
 
         Parameters
         ----------
@@ -350,7 +439,7 @@ class BaseModel(ABC, SGDFittableMixin):
         """
         import numpy as np_cpu
 
-        n_time, n_sources = observations.shape
+        n_sources = observations.shape[1]
         n_states = self.n_discrete_states
         obs_np = np_cpu.array(observations)
 
@@ -399,8 +488,12 @@ class BaseModel(ABC, SGDFittableMixin):
         Called by ``_warm_initialize_states`` (and subclass overrides)
         after model-specific features have been constructed.
 
-        Assumes ``self.measurement_matrix`` is already initialized
-        (H is constant across states for CNM and DIM).
+        Requires ``self.measurement_matrix`` to be initialized. The per-state
+        ``init_mean`` step assumes a single shared H (as in CNM and DIM); when
+        H is state-dependent (COM, whose H is small and random at init),
+        ``pinv(H[..., 0])`` is arbitrary and would amplify the cluster means
+        through the inverse of noise, so that step is skipped and ``init_mean``
+        is left at its cold value.
         """
         import numpy as np_cpu
         from sklearn.mixture import GaussianMixture
@@ -414,22 +507,24 @@ class BaseModel(ABC, SGDFittableMixin):
         gmm.fit(features)
         labels = gmm.predict(features)
 
-        # Per-state init_mean via H pseudo-inverse
-        H = np_cpu.array(self.measurement_matrix[:, :, 0])
-        H_pinv = np_cpu.linalg.pinv(H)
+        # Per-state init_mean via H pseudo-inverse -- only meaningful when H is
+        # shared across discrete states. For state-dependent H (COM), skip it.
+        H_all = np_cpu.array(self.measurement_matrix)
+        h_is_shared = bool(np_cpu.allclose(H_all, H_all[:, :, :1]))
+        if h_is_shared:
+            H_pinv = np_cpu.linalg.pinv(H_all[:, :, 0])
+            per_state_means = []
+            for j in range(n_states):
+                mask = labels == j
+                if mask.any():
+                    state_obs_mean = windowed[mask].mean(axis=(0, 1))
+                else:
+                    state_obs_mean = obs_np.mean(axis=0)
+                per_state_means.append(H_pinv @ state_obs_mean)
 
-        per_state_means = []
-        for j in range(n_states):
-            mask = labels == j
-            if mask.any():
-                state_obs_mean = windowed[mask].mean(axis=(0, 1))
-            else:
-                state_obs_mean = obs_np.mean(axis=0)
-            per_state_means.append(H_pinv @ state_obs_mean)
-
-        self.init_mean = jnp.stack(
-            [jnp.array(m) for m in per_state_means], axis=1
-        )
+            self.init_mean = jnp.stack(
+                [jnp.array(m) for m in per_state_means], axis=1
+            )
 
         # Data-informed init_cov scaled to observation variance
         obs_var = np_cpu.var(obs_np, axis=0).mean()
@@ -808,14 +903,25 @@ class BaseModel(ABC, SGDFittableMixin):
                         f"stopping EM."
                     )
                 else:
+                    # No earlier accepted state to roll back to: the failed
+                    # E-step already installed NaN posteriors, so drop them
+                    # rather than let decode()/predict_proba() return garbage.
+                    self._clear_smoother_state()
                     logger.warning(
-                        f"Non-finite log-likelihood at iteration {iteration + 1}; "
+                        f"Non-finite log-likelihood at iteration {iteration + 1} "
+                        f"with no usable previous state; clearing posteriors and "
                         f"stopping EM."
                     )
                 self.converged_ = False
                 break
 
             if iteration > 0:
+                # The GPB1 E-step is approximate, so exact monotonicity is not
+                # guaranteed. We deliberately stop on the first LL decrease:
+                # within-tol decreases fall through to the is_converged check
+                # below (treated as a plateau), while larger decreases roll
+                # back to the last accepted state. Continuing past a real
+                # decrease would risk drifting away from a good iterate.
                 is_converged, is_increasing = check_converged(
                     current_log_likelihood, log_likelihoods[-2], tol
                 )
@@ -1023,6 +1129,7 @@ class CommonOscillatorModel(BaseModel):
         measurement_variance: float,
         **kwargs,
     ):
+        _reject_forced_update_flags("CommonOscillatorModel", kwargs)
         super().__init__(
             n_oscillators, n_discrete_states, n_sources, sampling_freq, **kwargs
         )
@@ -1055,9 +1162,6 @@ class CommonOscillatorModel(BaseModel):
                 "measurement_variance must be positive. " f"Got {measurement_variance}."
             )
         self.measurement_variance = measurement_variance
-
-        if sampling_freq <= 0:
-            raise ValueError("sampling_freq must be positive. " f"Got {sampling_freq}.")
 
         # COM specific M-step update flags
         self.update_continuous_transition_matrix = False
@@ -1295,7 +1399,8 @@ class CorrelatedNoiseModel(BaseModel):
         coupling_strength: jax.Array,
         **kwargs,
     ):
-        # n_sources must equal n_oscillators for CNM/DIM
+        # n_sources is fixed to n_oscillators for CNM (passed to super below).
+        _reject_forced_update_flags("CorrelatedNoiseModel", kwargs)
         super().__init__(
             n_oscillators,
             n_discrete_states,
@@ -1303,8 +1408,6 @@ class CorrelatedNoiseModel(BaseModel):
             sampling_freq,
             **kwargs,
         )
-        if n_oscillators != self.n_sources:
-            raise ValueError("For CNM, n_sources must equal n_oscillators.")
         if freqs.shape != (n_oscillators,):
             raise ValueError(
                 f"Shape mismatch: freqs {freqs.shape} vs n_oscillators {n_oscillators}"
@@ -1338,8 +1441,6 @@ class CorrelatedNoiseModel(BaseModel):
             raise ValueError(
                 "measurement_variance must be positive. " f"Got {measurement_variance}."
             )
-        if sampling_freq <= 0:
-            raise ValueError("sampling_freq must be positive. " f"Got {sampling_freq}.")
         phase_difference, coupling_strength = (
             canonicalize_correlated_noise_pair_parameters(
                 phase_difference, coupling_strength
@@ -1629,6 +1730,8 @@ class DirectedInfluenceModel(BaseModel):
         use_reparameterized_mstep: bool = False,
         **kwargs,
     ):
+        # n_sources is fixed to n_oscillators for DIM (passed to super below).
+        _reject_forced_update_flags("DirectedInfluenceModel", kwargs)
         super().__init__(
             n_oscillators,
             n_discrete_states,
@@ -1636,8 +1739,6 @@ class DirectedInfluenceModel(BaseModel):
             sampling_freq,
             **kwargs,
         )
-        if n_oscillators != self.n_sources:
-            raise ValueError("For DIM, n_sources must equal n_oscillators.")
 
         if freqs.shape != (n_oscillators,):
             raise ValueError(
@@ -1830,56 +1931,64 @@ class DirectedInfluenceModel(BaseModel):
                     )
                     self._current_osc_params.append(params)
 
-            # Optimize for each discrete state
-            A_list = []
+            # Optimize each discrete state's oscillator parameters (warm-started
+            # from the previous iteration).
             for j in range(self.n_discrete_states):
-                # Get initial params (warm start from previous iteration)
-                init_params = self._current_osc_params[j]
-
-                # Optimize
-                opt_params = optimize_dim_transition_params(
+                self._current_osc_params[j] = optimize_dim_transition_params(
                     gamma1=gamma1[..., j],
                     beta=beta[..., j],
-                    init_params=init_params,
+                    init_params=self._current_osc_params[j],
                     sampling_freq=self.sampling_freq,
                     process_cov=self.process_cov[..., j],
                 )
 
-                # Store for warm start
-                self._current_osc_params[j] = opt_params
-
-                # Reconstruct A from optimized parameters
-                A_j = construct_directed_influence_transition_matrix(
-                    freqs=opt_params["freq"],
-                    damping_coeffs=opt_params["damping"],
-                    coupling_strengths=opt_params["coupling_strength"],
-                    phase_diffs=opt_params["phase_diff"],
-                    sampling_freq=self.sampling_freq,
-                )
-                A_list.append(A_j)
-
-            self.continuous_transition_matrix = jnp.stack(A_list, axis=-1)
-
-            # Update public oscillator attributes to reflect optimized values
+            # Sync public attributes. In the DIM model freq/damping are
+            # intrinsic (shared across states) and only coupling/phase are
+            # state-dependent, so freq/damping collapse to a shared value here.
             self._update_public_oscillator_params()
+
+            # Rebuild A from the SHARED freq/damping (plus per-state coupling/
+            # phase) so the stored transition matrix is exactly reconstructable
+            # from the public parameters. Without this, public freqs would be
+            # the cross-state mean while A used per-state freqs, so anyone
+            # rebuilding A -- including the fit_sgd warm start, which freezes
+            # self.freqs -- would get a different matrix than EM actually fit.
+            # Stability is re-enforced on host (see _stabilize_transition_matrix);
+            # in the rare case the clamp triggers, reconstruction holds up to
+            # that per-state scalar.
+            self.continuous_transition_matrix = jnp.stack(
+                [
+                    _stabilize_transition_matrix(
+                        construct_directed_influence_transition_matrix(
+                            freqs=self.freqs,
+                            damping_coeffs=self.damping_coef,
+                            coupling_strengths=self.coupling_strength[..., j],
+                            phase_diffs=self.phase_difference[..., j],
+                            sampling_freq=self.sampling_freq,
+                        )
+                    )
+                    for j in range(self.n_discrete_states)
+                ],
+                axis=-1,
+            )
 
     def _update_public_oscillator_params(self) -> None:
         """Update public oscillator attributes from optimized parameters.
 
-        After the reparameterized M-step, syncs the private _current_osc_params
-        to the public attributes (freqs, damping_coef, coupling_strength,
-        phase_difference) so downstream code can inspect the learned network.
+        After the reparameterized M-step, syncs the private
+        ``_current_osc_params`` to the public attributes so downstream code can
+        inspect the learned network. ``freqs``/``damping_coef`` are intrinsic
+        to the DIM model (shared across states, shape ``(n_osc,)``), so the
+        slightly different per-state optimizer outputs are collapsed to their
+        mean; ``coupling_strength``/``phase_difference`` stay per-state.
         """
         if self._current_osc_params is None:
             return
 
-        # Stack per-state values into arrays with state as last dimension
-        # freqs and damping: shape (n_osc,) averaged across states
-        # (they should be similar across states, so we average)
         freqs_list = [p["freq"] for p in self._current_osc_params]
         damping_list = [p["damping"] for p in self._current_osc_params]
 
-        # For freqs and damping, take mean across states (they're per-oscillator params)
+        # freqs/damping are shared oscillator properties -> collapse to the mean
         self.freqs = jnp.mean(jnp.stack(freqs_list, axis=-1), axis=-1)
         self.damping_coef = jnp.mean(jnp.stack(damping_list, axis=-1), axis=-1)
 
@@ -1910,15 +2019,7 @@ class DirectedInfluenceModel(BaseModel):
             # Stability is a hard physical constraint: an unstable A causes
             # state divergence and invalidates the E-step posteriors. Unlike
             # the block structure projection above, this is not optional.
-            max_spectral_radius = 0.99
-            eigvals = jnp.linalg.eigvals(A_j)
-            spectral_radius = jnp.max(jnp.abs(eigvals))
-            scale = jnp.where(
-                spectral_radius > max_spectral_radius,
-                max_spectral_radius / spectral_radius,
-                1.0,
-            )
-            A_j = A_j * scale
+            A_j = _stabilize_transition_matrix(A_j, max_spectral_radius=0.99)
 
             projected.append(A_j)
         self.continuous_transition_matrix = jnp.stack(projected, axis=-1)
