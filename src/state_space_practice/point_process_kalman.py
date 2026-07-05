@@ -2368,6 +2368,31 @@ class PointProcessModel(SGDFittableMixin):
         )
 
         log_likelihoods: list[float] = []
+        last_accepted_state: dict[str, object] | None = None
+
+        def _snapshot_state() -> dict[str, object]:
+            return {
+                "smoother_mean": self.smoother_mean,
+                "smoother_cov": self.smoother_cov,
+                "smoother_cross_cov": self.smoother_cross_cov,
+                "filtered_mean": self.filtered_mean,
+                "filtered_cov": self.filtered_cov,
+                "transition_matrix": self.transition_matrix,
+                "process_cov": self.process_cov,
+                "init_mean": self.init_mean,
+                "init_cov": self.init_cov,
+            }
+
+        def _restore_state(state: dict[str, object]) -> None:
+            self.smoother_mean = state["smoother_mean"]
+            self.smoother_cov = state["smoother_cov"]
+            self.smoother_cross_cov = state["smoother_cross_cov"]
+            self.filtered_mean = state["filtered_mean"]
+            self.filtered_cov = state["filtered_cov"]
+            self.transition_matrix = state["transition_matrix"]
+            self.process_cov = state["process_cov"]
+            self.init_mean = state["init_mean"]
+            self.init_cov = state["init_cov"]
 
         for iteration in range(max_iter):
             # Snapshot state for potential rollback on LL decrease.
@@ -2376,15 +2401,7 @@ class PointProcessModel(SGDFittableMixin):
             # M-step parameters from the *previous* iteration are the
             # ones to keep; restoring them gives a consistent
             # (params, smoother) pair from the prior iteration.
-            prev_smoother_mean = self.smoother_mean
-            prev_smoother_cov = self.smoother_cov
-            prev_smoother_cross_cov = self.smoother_cross_cov
-            prev_filtered_mean = self.filtered_mean
-            prev_filtered_cov = self.filtered_cov
-            prev_transition_matrix = self.transition_matrix
-            prev_process_cov = self.process_cov
-            prev_init_mean = self.init_mean
-            prev_init_cov = self.init_cov
+            prev_state = _snapshot_state()
 
             current_log_likelihood = self._e_step(design_matrix, spike_indicator)
             log_likelihoods.append(current_log_likelihood)
@@ -2405,15 +2422,7 @@ class PointProcessModel(SGDFittableMixin):
 
                 if not is_increasing:
                     # Roll back to previous (better) state and stop.
-                    self.smoother_mean = prev_smoother_mean
-                    self.smoother_cov = prev_smoother_cov
-                    self.smoother_cross_cov = prev_smoother_cross_cov
-                    self.filtered_mean = prev_filtered_mean
-                    self.filtered_cov = prev_filtered_cov
-                    self.transition_matrix = prev_transition_matrix
-                    self.process_cov = prev_process_cov
-                    self.init_mean = prev_init_mean
-                    self.init_cov = prev_init_cov
+                    _restore_state(prev_state)
                     bad_ll = log_likelihoods.pop()
                     logger.warning(
                         f"LL decreased: {log_likelihoods[-1]:.4f} -> "
@@ -2426,6 +2435,10 @@ class PointProcessModel(SGDFittableMixin):
                     logger.info(f"Converged after {iteration + 1} iterations.")
                     break
 
+            # Snapshot the accepted E-step state before the M-step changes
+            # parameters. The final E-step may reveal that this last M-step
+            # worsened the marginal LL; if so, restore this consistent state.
+            last_accepted_state = _snapshot_state()
             self._m_step()
 
             change = (
@@ -2439,11 +2452,32 @@ class PointProcessModel(SGDFittableMixin):
                 f"Change: {change:.6f}"
             )
 
-        if len(log_likelihoods) == max_iter:
+        if len(log_likelihoods) == max_iter and log_likelihoods:
             logger.warning("Reached maximum iterations without converging.")
             # Final E-step to sync smoother results with current parameters
             final_ll = float(self._e_step(design_matrix, spike_indicator))
-            log_likelihoods.append(final_ll)
+            if not jnp.isfinite(final_ll):
+                if last_accepted_state is not None:
+                    _restore_state(last_accepted_state)
+                logger.warning(
+                    "Final E-step produced non-finite log-likelihood; "
+                    "rolling back to previous E-step."
+                )
+            else:
+                _, is_increasing = check_converged(
+                    final_ll,
+                    log_likelihoods[-1],
+                    tolerance,
+                )
+                if is_increasing:
+                    log_likelihoods.append(final_ll)
+                else:
+                    if last_accepted_state is not None:
+                        _restore_state(last_accepted_state)
+                    logger.warning(
+                        f"Final E-step decreased LL: {log_likelihoods[-1]:.4f} -> "
+                        f"{final_ll:.4f}; rolling back to previous E-step."
+                    )
 
         return log_likelihoods
 

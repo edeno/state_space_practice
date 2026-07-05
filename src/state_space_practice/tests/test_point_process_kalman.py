@@ -3934,3 +3934,100 @@ class TestEMRollbackOnDecrease:
         assert_em_rolls_back_on_ll_decrease(
             model, (design_matrix, spikes), caplog,
         )
+
+    def test_point_process_em_rolls_back_bad_final_m_step(
+        self, monkeypatch, caplog
+    ) -> None:
+        """A final E-step LL decrease should restore the pre-M-step state."""
+        n_time, n_basis = 4, 2
+        design_matrix = jnp.zeros((n_time, n_basis))
+        spikes = jnp.zeros(n_time)
+        model = PointProcessModel(n_state_dims=n_basis, dt=0.02)
+
+        original_transition = model.transition_matrix.copy()
+        original_process_cov = model.process_cov.copy()
+        original_init_mean = model.init_mean.copy()
+        original_init_cov = model.init_cov.copy()
+
+        accepted_smoother_mean = jnp.ones((n_time, n_basis))
+        accepted_smoother_cov = jnp.tile(jnp.eye(n_basis)[None], (n_time, 1, 1))
+        accepted_smoother_cross_cov = jnp.zeros((n_time - 1, n_basis, n_basis))
+        accepted_filtered_mean = 2.0 * accepted_smoother_mean
+        accepted_filtered_cov = 2.0 * accepted_smoother_cov
+
+        final_smoother_mean = -accepted_smoother_mean
+        final_smoother_cov = 3.0 * accepted_smoother_cov
+        final_smoother_cross_cov = jnp.ones((n_time - 1, n_basis, n_basis))
+        final_filtered_mean = -accepted_filtered_mean
+        final_filtered_cov = 4.0 * accepted_smoother_cov
+
+        e_step_values = iter(
+            [
+                (
+                    100.0,
+                    accepted_smoother_mean,
+                    accepted_smoother_cov,
+                    accepted_smoother_cross_cov,
+                    accepted_filtered_mean,
+                    accepted_filtered_cov,
+                ),
+                (
+                    50.0,
+                    final_smoother_mean,
+                    final_smoother_cov,
+                    final_smoother_cross_cov,
+                    final_filtered_mean,
+                    final_filtered_cov,
+                ),
+            ]
+        )
+
+        def fake_e_step(_design_matrix, _spike_indicator) -> float:
+            (
+                ll,
+                smoother_mean,
+                smoother_cov,
+                smoother_cross_cov,
+                filtered_mean,
+                filtered_cov,
+            ) = next(e_step_values)
+            model.smoother_mean = smoother_mean
+            model.smoother_cov = smoother_cov
+            model.smoother_cross_cov = smoother_cross_cov
+            model.filtered_mean = filtered_mean
+            model.filtered_cov = filtered_cov
+            return ll
+
+        def bad_m_step() -> None:
+            model.transition_matrix = 5.0 * jnp.eye(n_basis)
+            model.process_cov = 6.0 * jnp.eye(n_basis)
+            model.init_mean = jnp.ones(n_basis) * 7.0
+            model.init_cov = 8.0 * jnp.eye(n_basis)
+
+        monkeypatch.setattr(model, "_e_step", fake_e_step)
+        monkeypatch.setattr(model, "_m_step", bad_m_step)
+
+        with caplog.at_level("WARNING"):
+            log_likelihoods = model.fit(
+                design_matrix,
+                spikes,
+                max_iter=1,
+                tolerance=1e-6,
+            )
+
+        assert log_likelihoods == [100.0]
+        assert any(
+            "final e-step decreased ll" in record.message.lower()
+            for record in caplog.records
+        )
+        np.testing.assert_allclose(model.transition_matrix, original_transition)
+        np.testing.assert_allclose(model.process_cov, original_process_cov)
+        np.testing.assert_allclose(model.init_mean, original_init_mean)
+        np.testing.assert_allclose(model.init_cov, original_init_cov)
+        np.testing.assert_allclose(model.smoother_mean, accepted_smoother_mean)
+        np.testing.assert_allclose(model.smoother_cov, accepted_smoother_cov)
+        np.testing.assert_allclose(
+            model.smoother_cross_cov, accepted_smoother_cross_cov
+        )
+        np.testing.assert_allclose(model.filtered_mean, accepted_filtered_mean)
+        np.testing.assert_allclose(model.filtered_cov, accepted_filtered_cov)
