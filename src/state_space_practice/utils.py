@@ -758,14 +758,19 @@ def safe_log(x: jax.Array) -> jax.Array:
     Returns
     -------
     jax.Array
-        log(x) where x > _LOG_PROB_FLOOR, otherwise _LOG_FLOOR_VALUE.
+        log(x) where x > _LOG_PROB_FLOOR, otherwise _LOG_FLOOR_VALUE. A NaN
+        argument is propagated as NaN (not floored): a NaN here signals genuine
+        upstream divergence, and masking it to a finite value would defeat
+        non-finite-based EM rollback. Finite non-positive inputs are treated as
+        underflow and floored as before.
     """
     x = jnp.asarray(x)
     x = x.astype(jnp.result_type(x, 1.0))
     floor = jnp.asarray(_LOG_PROB_FLOOR, dtype=x.dtype)
     floor_value = jnp.asarray(_LOG_FLOOR_VALUE, dtype=x.dtype)
     safe_x = jnp.where(x > floor, x, floor)
-    return jnp.where(x > floor, jnp.log(safe_x), floor_value)
+    result = jnp.where(x > floor, jnp.log(safe_x), floor_value)
+    return jnp.where(jnp.isnan(x), jnp.nan, result)
 
 
 def stabilize_probability_vector(probabilities: jax.Array) -> jax.Array:
@@ -815,10 +820,15 @@ def stabilize_probability_vector(probabilities: jax.Array) -> jax.Array:
     )
     cleaned = jnp.where(has_posinf, positive_infinity_mass, finite_probabilities)
     all_nonpositive = jnp.all(cleaned <= 0)
+    # A single negative-but-finite entry (a genuine upstream sign error) is
+    # otherwise silently floored while a positive sibling survives, producing a
+    # valid-looking distribution -- surface it too, not just the all-nonpositive
+    # case.
+    has_negative = jnp.any(cleaned < 0.0)
     debug_print_if(
-        has_nonfinite | all_nonpositive,
-        "utils.stabilize_probability_vector: input was non-finite or "
-        "all-nonpositive (max={m}); "
+        has_nonfinite | all_nonpositive | has_negative,
+        "utils.stabilize_probability_vector: input was non-finite, "
+        "all-nonpositive, or contained a negative entry (max={m}); "
         "sanitizing and flooring the discrete-state posterior. Check upstream "
         "likelihood scaling if this repeats.",
         m=jnp.max(probabilities),

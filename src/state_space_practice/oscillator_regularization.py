@@ -177,6 +177,11 @@ class OscillatorPenaltyConfig:
                 "area_labels",
                 _validate_area_labels(self.area_labels),
             )
+        elif self.area_group_l2 > 0.0 or self.state_shared_group_l2 > 0.0:
+            raise ValueError(
+                "area_labels is required when area_group_l2 or "
+                "state_shared_group_l2 > 0."
+            )
 
 
 def _mask_diagonal(coupling: Array, exclude: bool) -> Array:

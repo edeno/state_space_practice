@@ -1412,11 +1412,37 @@ def switching_kalman_smoother_gpb2(
             out_axes=-1,
         )(triple_cov)
 
+        debug_print_if(
+            jnp.any(jnp.abs(triple_mean) > _MAX_SMOOTHER_MEAN_ABS),
+            "switching_kalman: GPB2 smoother mean hit the "
+            f"+/-{_MAX_SMOOTHER_MEAN_ABS:.0e} clip (max |mean| {{m:.2e}}); the "
+            "smoother mean has diverged and EM statistics at those steps were "
+            "clipped.",
+            m=jnp.max(jnp.abs(triple_mean)),
+        )
         triple_mean = jnp.clip(
             triple_mean, -_MAX_SMOOTHER_MEAN_ABS, _MAX_SMOOTHER_MEAN_ABS
         )
+
+        # The cross-covariance is capped by its own Frobenius norm, so the bound
+        # must be Frobenius-scaled from the pair-filter covariances -- not the
+        # trace-scaled ``max_allowed`` used for the covariance-trace cap above
+        # (trace and Frobenius norm are different quantities).
+        max_allowed_cross = (
+            jnp.max(jnp.linalg.norm(pair_filter_cov, axis=(0, 1)))
+            * _GPB2_COV_CAP_MULTIPLIER
+            + 1.0
+        )
+        cross_frobs = jnp.linalg.norm(triple_cross, axis=(0, 1))
+        debug_print_if(
+            jnp.any(cross_frobs > max_allowed_cross),
+            "switching_kalman: GPB2 smoother cross-covariance engaged the "
+            f"{_GPB2_COV_CAP_MULTIPLIER:.0e}x-filter Frobenius cap (max "
+            "||C||_F {m:.2e}); EM lag-one statistics at those steps were clipped.",
+            m=jnp.max(cross_frobs),
+        )
         _cap_cross = partial(
-            _cap_cross_covariance_frobenius, max_allowed_norm=max_allowed
+            _cap_cross_covariance_frobenius, max_allowed_norm=max_allowed_cross
         )
         triple_cross = jax.vmap(
             jax.vmap(
