@@ -1,9 +1,14 @@
 """Tests for the Laplace-EKF coupling estimator (LFP smooth + Bernoulli regress)."""
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from state_space_practice.coupling_ekf import fit_coupling_ekf
+from state_space_practice.coupling_model import (
+    CouplingModelParams,
+    smooth_latent_from_lfp,
+)
 from state_space_practice.coupling_validation import (
     detection_metrics,
     phase_recovery_mae,
@@ -62,9 +67,7 @@ class TestGuards:
             )
 
     @pytest.mark.parametrize("bad_value", [0, -1, 2.5])
-    def test_rejects_invalid_max_newton_iter(
-        self, coupling_params_small, bad_value
-    ):
+    def test_rejects_invalid_max_newton_iter(self, coupling_params_small, bad_value):
         # Must be a positive integer: 0/-1 give no Fisher-scoring steps, and a
         # float would silently truncate the iteration count.
         sim = simulate_coupling(coupling_params_small, n_time=200, seed=0)
@@ -142,3 +145,66 @@ class TestRecovery:
         # coupled magnitude ~2 (the fixture's strong coupling); controls near zero
         np.testing.assert_allclose(mag[mask], 2.0, atol=0.4)
         assert np.all(mag[~mask] < 0.5)
+
+
+@pytest.mark.slow
+class TestPosteriorCorrectness:
+    """Validate the returned posterior IS the exact Laplace approximation."""
+
+    def test_returns_correct_map_and_inverse_hessian_covariance(self):
+        """Posterior mean is the penalized MAP; covariance is its inverse Hessian.
+
+        The recovery test only exercises the strong regime. Here, on a
+        1-neuron/1-band problem, check the two Laplace defining properties against
+        an independent reference computed from the *same* LFP-smoothed design:
+        (1) the penalized Bernoulli-logit gradient vanishes at the returned mean
+        (it is the MAP), and (2) the returned covariance equals
+        ``inv(prior_precision + Xᵀ diag(p(1-p)) X)`` at that mean. Because (1) is
+        an exact optimality residual using ``prior_precision = I / sigma_beta**2``,
+        it pins the exact prior power (a ``1 / sigma_beta`` bug leaves a large
+        residual), independent of how strongly the prior shifts the mean.
+        """
+        baseline_logit = float(np.log(0.15 / 0.85))
+        params = CouplingModelParams(
+            osc_frequencies=jnp.array([8.0]),
+            osc_decay=jnp.array([0.98]),
+            process_noise_var=jnp.array([1.0 - 0.98**2]),
+            beta_real=jnp.array([[1.2]]),
+            beta_imag=jnp.array([[-0.8]]),
+            baseline=jnp.array([baseline_logit]),
+            dt=1e-3,
+        )
+        sim = simulate_coupling(params, n_time=500, seed=3)
+        sigma_beta = 1.5
+        post = fit_coupling_ekf(sim.spikes, sim.lfp, params, sigma_beta=sigma_beta)
+
+        design = np.asarray(smooth_latent_from_lfp(sim.lfp, params))  # (T, 2)
+        y = np.asarray(sim.spikes)[:, 0]
+        beta_map = np.array(
+            [float(post.beta_real_mean[0, 0]), float(post.beta_imag_mean[0, 0])]
+        )
+        prior_precision = np.eye(2) / sigma_beta**2
+
+        eta = baseline_logit + design @ beta_map
+        p = 1.0 / (1.0 + np.exp(-eta))
+
+        # guard: the MAP is genuinely data-informed (moved off the prior mean 0)
+        assert np.linalg.norm(beta_map) > 0.3
+
+        # (1) MAP optimality: penalized log-posterior gradient ~ 0 at the mean.
+        grad = design.T @ (y - p) - prior_precision @ beta_map
+        assert np.max(np.abs(grad)) < 1e-4
+
+        # (2) covariance == inverse Fisher/Hessian at the MAP.
+        hess = design.T @ ((p * (1.0 - p))[:, None] * design) + prior_precision
+        cov_ref = np.linalg.inv(hess)
+        np.testing.assert_allclose(
+            [float(post.beta_real_var[0, 0]), float(post.beta_imag_var[0, 0])],
+            np.diag(cov_ref),
+            rtol=1e-4,
+        )
+        np.testing.assert_allclose(
+            float(post.beta_real_imag_cov[0, 0]), cov_ref[0, 1], atol=1e-6
+        )
+        # guard: the cross-covariance is non-trivial (check isn't vacuous at ~0).
+        assert abs(cov_ref[0, 1]) > 1e-3
