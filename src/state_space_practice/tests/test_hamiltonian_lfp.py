@@ -14,13 +14,15 @@ from state_space_practice.tests.recovery_helpers import (
 
 
 class TestHamiltonianLFPSmoke:
-
     @pytest.fixture
     def model_and_data(self):
         n_sources = 4
         n_time = 50
         model = HamiltonianLFPModel(
-            n_sources=n_sources, n_oscillators=1, hidden_dims=[16], seed=0,
+            n_sources=n_sources,
+            n_oscillators=1,
+            hidden_dims=[16],
+            seed=0,
             sampling_freq=1000.0,
         )
         lfp = jax.random.normal(jax.random.PRNGKey(42), (n_time, n_sources))
@@ -60,10 +62,12 @@ class TestHamiltonianLFPSmoke:
 
 
 class TestHamiltonianLFPMultiOscillator:
-
     def test_construction_n_oscillators_2(self):
         model = HamiltonianLFPModel(
-            n_sources=4, n_oscillators=2, hidden_dims=[16], seed=0,
+            n_sources=4,
+            n_oscillators=2,
+            hidden_dims=[16],
+            seed=0,
             sampling_freq=1000.0,
         )
         assert model.n_cont_states == 4
@@ -74,7 +78,10 @@ class TestHamiltonianLFPMultiOscillator:
 
     def test_filter_n_oscillators_2(self):
         model = HamiltonianLFPModel(
-            n_sources=4, n_oscillators=2, hidden_dims=[16], seed=0,
+            n_sources=4,
+            n_oscillators=2,
+            hidden_dims=[16],
+            seed=0,
             sampling_freq=1000.0,
         )
         lfp = jax.random.normal(jax.random.PRNGKey(0), (50, 4))
@@ -97,7 +104,10 @@ class TestHamiltonianLFPBehavioral:
 
         # Create model with known parameters
         model = HamiltonianLFPModel(
-            n_sources=n_sources, n_oscillators=1, hidden_dims=[8], seed=0,
+            n_sources=n_sources,
+            n_oscillators=1,
+            hidden_dims=[8],
+            seed=0,
             sampling_freq=1.0 / dt,
         )
 
@@ -121,14 +131,19 @@ class TestHamiltonianLFPBehavioral:
 
         def sim_step(x, key):
             x_next = leapfrog_step(x, trans_params, apply_mlp, dt)
-            x_next = x_next + jax.random.normal(key, x.shape) * 1e-3  # tiny process noise
+            x_next = (
+                x_next + jax.random.normal(key, x.shape) * 1e-3
+            )  # tiny process noise
             return x_next, x_next
 
         keys = jax.random.split(jax.random.PRNGKey(42), n_time)
         _, x_true = jax.lax.scan(sim_step, x0, keys)  # (n_time, 2)
 
         # Generate noisy observations
-        obs_noise = jax.random.normal(jax.random.PRNGKey(99), (n_time, n_sources)) * model.obs_noise_std
+        obs_noise = (
+            jax.random.normal(jax.random.PRNGKey(99), (n_time, n_sources))
+            * model.obs_noise_std
+        )
         lfp = x_true @ model.C.T + model.d + obs_noise
 
         # Run smoother
@@ -144,7 +159,7 @@ class TestHamiltonianLFPBehavioral:
 
         # Smoother MSE should be much lower than prior (zero) MSE
         smoother_mse = jnp.mean((m_s - x_true) ** 2)
-        prior_mse = jnp.mean(x_true ** 2)  # prior mean is near zero
+        prior_mse = jnp.mean(x_true**2)  # prior mean is near zero
 
         assert smoother_mse < prior_mse * 0.5, (
             f"Smoother MSE ({smoother_mse:.4f}) should be much less than "
@@ -167,26 +182,37 @@ class TestHamiltonianLFPSGDRecovery:
         n_time = 300
 
         x_true, mlp_params = simulate_harmonic_oscillator(
-            omega=omega_true, n_time=n_time, dt=dt,
-            key=jax.random.PRNGKey(42), hidden_dims=[8],
+            omega=omega_true,
+            n_time=n_time,
+            dt=dt,
+            key=jax.random.PRNGKey(42),
+            hidden_dims=[8],
         )
 
         C_true = jnp.eye(2)
         d_true = jnp.zeros(2)
         lfp = simulate_lfp_observations(
-            x_true, C_true, d_true, noise_std=0.3,
+            x_true,
+            C_true,
+            d_true,
+            noise_std=0.3,
             key=jax.random.PRNGKey(99),
         )
 
         # Initialise model with perturbed omega
         model = HamiltonianLFPModel(
-            n_sources=2, n_oscillators=1, hidden_dims=[8], seed=0,
+            n_sources=2,
+            n_oscillators=1,
+            hidden_dims=[8],
+            seed=0,
             sampling_freq=1.0 / dt,
         )
         model.omega = omega_true * 1.3  # 30% off
 
         lls = model.fit_sgd(
-            lfp, key=jax.random.PRNGKey(1), num_steps=200,
+            lfp,
+            key=jax.random.PRNGKey(1),
+            num_steps=200,
         )
         return model, x_true, omega_true, lfp, lls
 
@@ -207,9 +233,7 @@ class TestHamiltonianLFPSGDRecovery:
         params, _ = model._build_param_spec()
         m_s, _ = model.smooth(lfp, params)
         corr = float(jnp.corrcoef(m_s[:, 0], x_true[:, 0])[0, 1])
-        assert corr > 0.7, (
-            f"Post-learning smoother correlation {corr:.3f} < 0.7"
-        )
+        assert corr > 0.7, f"Post-learning smoother correlation {corr:.3f} < 0.7"
 
     def test_q_is_learned(self, fitted):
         """Process covariance Q should change from its initial value after SGD."""
