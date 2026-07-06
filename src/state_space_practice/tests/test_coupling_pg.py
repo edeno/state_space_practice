@@ -1,10 +1,15 @@
 """Tests for the Polya-Gamma Gibbs coupling estimator."""
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from polyagamma import random_polyagamma
 
 from state_space_practice.coupling_ekf import fit_coupling_ekf
+from state_space_practice.coupling_model import (
+    CouplingModelParams,
+    smooth_latent_from_lfp,
+)
 from state_space_practice.coupling_pg import fit_coupling_pg
 from state_space_practice.coupling_validation import (
     detection_metrics,
@@ -84,6 +89,35 @@ class TestGuards:
                 coupling_params_small,
                 n_iter=n_iter,
                 burn_in=burn_in,
+            )
+
+    @pytest.mark.parametrize("bad_sigma", [0.0, -1.0, float("inf"), float("nan")])
+    def test_rejects_nonpositive_or_nonfinite_sigma_beta(
+        self, coupling_params_small, bad_sigma
+    ):
+        # A nonpositive or non-finite prior std is not a valid Gaussian prior;
+        # left unchecked it would silently produce a non-PD prior precision.
+        sim = simulate_coupling(coupling_params_small, n_time=200, seed=0)
+        with pytest.raises(ValueError, match="sigma_beta"):
+            fit_coupling_pg(
+                sim.spikes,
+                sim.lfp,
+                coupling_params_small,
+                n_iter=10,
+                burn_in=5,
+                sigma_beta=bad_sigma,
+            )
+
+    def test_rejects_nonscalar_sigma_beta(self, coupling_params_small):
+        sim = simulate_coupling(coupling_params_small, n_time=200, seed=0)
+        with pytest.raises(ValueError, match="sigma_beta"):
+            fit_coupling_pg(
+                sim.spikes,
+                sim.lfp,
+                coupling_params_small,
+                n_iter=10,
+                burn_in=5,
+                sigma_beta=np.array([1.0, 2.0]),
             )
 
 
@@ -204,3 +238,96 @@ class TestRecovery:
         np.testing.assert_allclose(
             np.asarray(a.beta_imag_mean), np.asarray(b.beta_imag_mean), atol=0.05
         )
+
+
+@pytest.mark.slow
+class TestPosteriorCorrectness:
+    """Validate the Gibbs kernel targets the correct posterior, not just recovery."""
+
+    def test_tighter_prior_shrinks_coupling(self, coupling_params_small):
+        """A smaller sigma_beta regularizes the coupling estimate toward zero.
+
+        Behavioral check that the Gaussian prior is wired in with the right sign
+        (tighter prior => more shrinkage). The exact ``1 / sigma_beta**2`` power is
+        pinned by ``test_gibbs_targets_exact_posterior_on_small_problem``.
+        """
+        sim = simulate_coupling(coupling_params_small, n_time=1500, seed=0)
+        kw = dict(n_iter=150, burn_in=75, seed=0)
+        tight = fit_coupling_pg(
+            sim.spikes, sim.lfp, coupling_params_small, sigma_beta=0.05, **kw
+        )
+        loose = fit_coupling_pg(
+            sim.spikes, sim.lfp, coupling_params_small, sigma_beta=5.0, **kw
+        )
+        mask = np.asarray(sim.coupling_mask)
+        tight_mag = np.sqrt(
+            np.asarray(tight.beta_real_mean) ** 2
+            + np.asarray(tight.beta_imag_mean) ** 2
+        )[mask]
+        loose_mag = np.sqrt(
+            np.asarray(loose.beta_real_mean) ** 2
+            + np.asarray(loose.beta_imag_mean) ** 2
+        )[mask]
+        # guard: the loose fit genuinely found strong coupling (non-vacuous)
+        assert np.all(loose_mag > 1.0)
+        assert np.all(tight_mag < loose_mag)
+
+    def test_gibbs_targets_exact_posterior_on_small_problem(self):
+        """PG sample mean/covariance match the exact grid-integrated posterior.
+
+        On a 1-neuron, 1-band problem the coupling posterior is 2-D and can be
+        integrated on a grid. Conditioning on the *same* LFP-smoothed design the
+        sampler uses, the PG posterior must match the exact Bayes posterior --
+        this validates the Gibbs update equations directly, independent of the
+        EKF (itself a Laplace approximation). A tight prior (below the coupling
+        magnitude) keeps the posterior genuinely prior-influenced, so the test is
+        sensitive to the exact ``1 / sigma_beta**2`` precision, not only the
+        likelihood terms.
+        """
+        baseline_logit = float(np.log(0.15 / 0.85))
+        params = CouplingModelParams(
+            osc_frequencies=jnp.array([8.0]),
+            osc_decay=jnp.array([0.98]),
+            process_noise_var=jnp.array([1.0 - 0.98**2]),
+            beta_real=jnp.array([[1.2]]),
+            beta_imag=jnp.array([[-0.8]]),
+            baseline=jnp.array([baseline_logit]),
+            dt=1e-3,
+        )
+        sim = simulate_coupling(params, n_time=500, seed=3)
+        sigma_beta = 0.25
+
+        pg = fit_coupling_pg(
+            sim.spikes,
+            sim.lfp,
+            params,
+            n_iter=3000,
+            burn_in=1000,
+            sigma_beta=sigma_beta,
+            seed=0,
+        )
+        pg_beta = np.stack([pg.samples.real[:, 0, 0], pg.samples.imag[:, 0, 0]], axis=1)
+        pg_mean = pg_beta.mean(axis=0)
+        pg_sd = pg_beta.std(axis=0)
+
+        # Exact posterior on a grid, using the SAME design the sampler conditions on.
+        design = np.asarray(smooth_latent_from_lfp(sim.lfp, params))  # (T, 2)
+        y = np.asarray(sim.spikes)[:, 0]
+        grid = np.linspace(-5.0, 5.0, 201)
+        b0, b1 = np.meshgrid(grid, grid, indexing="ij")
+        betas = np.stack([b0.ravel(), b1.ravel()], axis=1)  # (G, 2)
+        eta = baseline_logit + design @ betas.T  # (T, G)
+        # Bernoulli-logit log-likelihood: sum_t [y_t * eta - softplus(eta)].
+        loglik = (y[:, None] * eta - np.logaddexp(0.0, eta)).sum(axis=0)
+        logprior = -0.5 * (betas**2).sum(axis=1) / sigma_beta**2
+        weights = np.exp((loglik + logprior) - (loglik + logprior).max())
+        weights /= weights.sum()
+        grid_mean = (weights[:, None] * betas).sum(axis=0)
+        diff = betas - grid_mean
+        grid_var = (weights[:, None] * diff**2).sum(axis=0)
+        grid_sd = np.sqrt(grid_var)
+
+        # guard: posterior is genuinely data-informed (moved off the prior mean 0)
+        assert np.linalg.norm(grid_mean) > 0.3
+        np.testing.assert_allclose(pg_mean, grid_mean, atol=0.05)
+        np.testing.assert_allclose(pg_sd, grid_sd, rtol=0.2)
