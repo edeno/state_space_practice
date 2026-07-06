@@ -41,14 +41,18 @@ from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.multinomial_choice import (
     ChoiceFilterResult,
     ChoiceSmootherResult,
-    _rts_smoother_pass,
     _softmax_update_core,
 )
-from state_space_practice.utils import validate_choice_indices
+from state_space_practice.utils import symmetrize, validate_choice_indices
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_BETA_GRID = (0.1, 0.3, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0)
+
+# Tolerance below which a marginal-LL decrease between EM iterations is treated
+# as an overshoot of the approximate (Laplace-EKF) M-step and triggers a rollback
+# to the last accepted parameters.
+_EM_MONOTONICITY_TOL = 1e-6
 
 
 def covariate_predict(
@@ -358,6 +362,48 @@ def _covariate_choice_filter_jit(
     )
 
 
+def _rts_smoother_pass_with_predictions(
+    filtered_values: Array,
+    filtered_covariances: Array,
+    predicted_values: Array,
+    predicted_covariances: Array,
+    A: Array,
+) -> tuple[Array, Array, Array]:
+    """RTS backward smoother that consumes the filter's stored one-step predictions.
+
+    Unlike :func:`multinomial_choice._rts_smoother_pass`, which recomputes the
+    one-step prediction as ``A @ m_filt`` (valid only for control-free dynamics),
+    this uses ``predicted_values`` / ``predicted_covariances`` from the forward
+    filter. Those already include the control input ``input_gain @ u_t``, so the
+    smoothed means stay consistent with the filter when dynamics covariates are
+    present. The gain/covariance recursion is the standard RTS update (the control
+    input does not affect covariances), so with no control input this reduces
+    exactly to ``_rts_smoother_pass``.
+    """
+
+    def _smooth_step(carry, inputs):
+        next_sm_mean, next_sm_cov = carry
+        f_mean, f_cov, p_mean_next, p_cov_next = inputs
+        gain = psd_solve(p_cov_next, A @ f_cov).T
+        sm_mean = f_mean + gain @ (next_sm_mean - p_mean_next)
+        sm_cov = symmetrize(f_cov + gain @ (next_sm_cov - p_cov_next) @ gain.T)
+        cross_cov = gain @ next_sm_cov
+        return (sm_mean, sm_cov), (sm_mean, sm_cov, cross_cov)
+
+    _, (sm_means, sm_covs, cross_covs) = jax.lax.scan(
+        _smooth_step,
+        (filtered_values[-1], filtered_covariances[-1]),
+        (
+            filtered_values[:-1],
+            filtered_covariances[:-1],
+            predicted_values[1:],
+            predicted_covariances[1:],
+        ),
+        reverse=True,
+    )
+    return sm_means, sm_covs, cross_covs
+
+
 def covariate_choice_smoother(
     choices: ArrayLike,
     n_options: int,
@@ -386,11 +432,18 @@ def covariate_choice_smoother(
     )
 
     k_free = n_options - 1
-    Q = jnp.eye(k_free) * process_noise
     A = jnp.eye(k_free) * decay
 
-    sm_means, sm_covs, cross_covs = _rts_smoother_pass(
-        filt.filtered_values, filt.filtered_covariances, Q, A,
+    # Control-aware RTS: consume the filter's stored one-step predictions (which
+    # include the control input input_gain @ u_t) instead of recomputing
+    # A @ m_filt, so the smoothed means are consistent with the filter when
+    # dynamics covariates are present.
+    sm_means, sm_covs, cross_covs = _rts_smoother_pass_with_predictions(
+        filt.filtered_values,
+        filt.filtered_covariances,
+        filt.predicted_values,
+        filt.predicted_covariances,
+        A,
     )
 
     smoothed_values = jnp.concatenate([sm_means, filt.filtered_values[-1:]])
@@ -683,6 +736,21 @@ class CovariateChoiceModel(SGDFittableMixin):
                 decay=self.decay,
             )
             ll = float(smooth.marginal_log_likelihood)
+
+            # GEM monotonicity guard: if the previous M-step decreased the marginal
+            # LL, the approximate (Laplace-EKF) M-step overshot. Restore the last
+            # accepted parameters and stop, so fit() returns the best iterate and
+            # the LL history stays non-decreasing. (Exact EM is monotone; the
+            # Laplace approximation is not, so this guard is required.)
+            if (
+                log_likelihoods
+                and last_accepted is not None
+                and ll < log_likelihoods[-1] - _EM_MONOTONICITY_TOL
+            ):
+                for attr, value in last_accepted.items():
+                    setattr(self, attr, value)
+                break
+
             log_likelihoods.append(ll)
 
             if verbose:

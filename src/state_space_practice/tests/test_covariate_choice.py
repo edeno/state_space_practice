@@ -277,6 +277,49 @@ class TestCovariateChoiceSmoother:
         )
         assert jnp.all(smooth_traces <= filt_traces + 1e-6)
 
+    def test_smoother_beats_filter_with_dynamics_covariates(self):
+        """With a nonzero input gain, the smoothed mean must be at least as
+        accurate as the filtered mean. The control term ``input_gain @ u_t`` has
+        to be in the backward pass; dropping it (recomputing ``A @ m_filt``)
+        biases the smoothed means and makes them *worse* than the filter.
+        """
+        rng = np.random.default_rng(0)
+        T, n_options = 300, 3
+        k_free = n_options - 1
+        decay, gain, q = 0.9, 0.8, 0.02
+        u = rng.standard_normal((T, k_free)) * 0.5  # dynamics covariates
+        # simulate the latent: x_t = decay * x_{t-1} + gain * u_t + noise
+        x = np.zeros(k_free)
+        x_true = np.zeros((T, k_free))
+        for t in range(T):
+            x = decay * x + gain * u[t] + rng.standard_normal(k_free) * np.sqrt(q)
+            x_true[t] = x
+        eta = np.concatenate([np.zeros((T, 1)), 2.0 * x_true], axis=1)
+        p = np.exp(eta - eta.max(axis=1, keepdims=True))
+        p /= p.sum(axis=1, keepdims=True)
+        choices = jnp.asarray([rng.choice(n_options, p=p[t]) for t in range(T)])
+
+        kw = dict(
+            n_options=n_options,
+            covariates=jnp.asarray(u),
+            input_gain=jnp.eye(k_free) * gain,
+            process_noise=q,
+            inverse_temperature=2.0,
+            decay=decay,
+        )
+        filt = covariate_choice_filter(choices, **kw)
+        smooth = covariate_choice_smoother(choices, **kw)
+        rmse_f = float(
+            np.sqrt(np.mean((np.asarray(filt.filtered_values) - x_true) ** 2))
+        )
+        rmse_s = float(
+            np.sqrt(np.mean((np.asarray(smooth.smoothed_values) - x_true) ** 2))
+        )
+        # guard: the control input genuinely drives the latent (non-vacuous)
+        assert np.abs(x_true).mean() > 0.3
+        # the smoother must not be worse than the filter (it was ~16x worse before)
+        assert rmse_s <= rmse_f + 0.02
+
     def test_last_trial_matches_filter(self):
         """Smoother[-1] should equal filter[-1]."""
         rng = np.random.default_rng(42)
