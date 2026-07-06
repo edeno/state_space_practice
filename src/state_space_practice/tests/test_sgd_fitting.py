@@ -265,6 +265,41 @@ class TestSGDFittableMixin:
         model.fit_sgd(jnp.array(1.0), num_steps=0)
         assert model.decay == 1.0
 
+    def test_frozen_boundary_param_stays_fixed_over_real_steps(self) -> None:
+        # The num_steps=0 test above proves round-trip identity but not that the
+        # frozen param stays put *while a trainable one moves* under real updates.
+        import optax
+
+        class _FrozenBoundaryModel(_ToyModel):
+            def __init__(self):
+                super().__init__(scale=1.0)
+                self.decay = 1.0
+
+            def _build_param_spec(self):
+                return {
+                    "scale": jnp.array(self.scale),
+                    "decay": jnp.array(self.decay),
+                }, {
+                    "scale": POSITIVE,
+                    "decay": frozen(UNIT_INTERVAL),
+                }
+
+            def _sgd_loss_fn(self, params, target):
+                return (
+                    (params["scale"] - target) ** 2 + params["decay"]
+                ) * self._n_timesteps
+
+            def _store_sgd_params(self, params):
+                self.scale = float(params["scale"])
+                self.decay = float(params["decay"])
+
+        model = _FrozenBoundaryModel()
+        model.fit_sgd(jnp.array(4.0), optimizer=optax.adam(2e-1), num_steps=100)
+        # frozen param is exactly unchanged despite 100 optimizer steps...
+        assert model.decay == 1.0
+        # ...while the trainable param converged toward the target (non-vacuous).
+        assert model.scale == pytest.approx(4.0, abs=0.3)
+
     def test_num_steps_rejects_negative_and_non_integer(self) -> None:
         # 0 is a valid setup-only fit (no optimization steps); only negative or
         # non-integer values are rejected.

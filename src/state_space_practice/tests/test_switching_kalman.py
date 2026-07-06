@@ -6260,3 +6260,46 @@ def test_gaussian_scenario_seed_changes_discrete_path() -> None:
     data_b = simulate_com_scenario(n_time=300, seed=2)
 
     assert not np.array_equal(data_a["true_states"], data_b["true_states"])
+
+
+class TestCovarianceCaps:
+    """Direct unit tests for the pure GPB smoother cap helpers.
+
+    The cap-engaged path is not otherwise exercised (the GPB2 accuracy tests run
+    in the healthy regime), so a mis-scaled cap could go unnoticed.
+    """
+
+    def test_cross_covariance_frobenius_rescales_when_over(self):
+        from state_space_practice.switching_kalman import (
+            _cap_cross_covariance_frobenius,
+        )
+
+        cross = jnp.array([[3.0, 0.0], [4.0, 0.0]])  # Frobenius norm 5.0
+        capped = _cap_cross_covariance_frobenius(cross, max_allowed_norm=jnp.array(1.0))
+        # Rescaled to exactly the cap, direction preserved.
+        assert float(jnp.linalg.norm(capped)) == pytest.approx(1.0, rel=1e-6)
+        np.testing.assert_allclose(
+            np.asarray(capped), np.asarray(cross) / 5.0, rtol=1e-6
+        )
+
+    def test_cross_covariance_frobenius_noop_when_within_bound(self):
+        from state_space_practice.switching_kalman import (
+            _cap_cross_covariance_frobenius,
+        )
+
+        cross = jnp.array([[0.3, 0.0], [0.4, 0.0]])  # norm 0.5 < 10
+        capped = _cap_cross_covariance_frobenius(
+            cross, max_allowed_norm=jnp.array(10.0)
+        )
+        np.testing.assert_array_equal(np.asarray(capped), np.asarray(cross))
+
+    def test_covariance_trace_caps_when_over(self):
+        from state_space_practice.switching_kalman import _cap_covariance_trace
+
+        cov = jnp.diag(jnp.array([3.0, 5.0]))  # trace 8.0
+        capped = _cap_covariance_trace(cov, max_allowed_trace=jnp.array(2.0))
+        assert float(jnp.trace(capped)) == pytest.approx(2.0, rel=1e-6)
+        # Uniform down-scale preserves PSD structure.
+        np.testing.assert_allclose(
+            np.asarray(capped), np.asarray(cov) * (2.0 / 8.0), rtol=1e-6
+        )

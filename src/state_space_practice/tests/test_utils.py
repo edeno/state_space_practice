@@ -16,8 +16,10 @@ from state_space_practice.utils import (
     safe_log,
     scale_likelihood,
     shift_to_psd,
+    spectral_radius,
     stabilize_covariance,
     stabilize_probability_vector,
+    stabilize_transition_matrix,
     symmetrize,
     validate_covariance,
     validate_probability_vector,
@@ -582,3 +584,38 @@ class TestDiscreteStateUtilities:
     def test_compute_state_overlap_shape_guard(self) -> None:
         with pytest.raises(ValueError, match="same shape"):
             compute_state_overlap(jnp.array([0, 1]), jnp.array([0]))
+
+
+def _scaled_rotation(scale: float, theta: float) -> jnp.ndarray:
+    """A non-symmetric 2x2 block ``scale * R(theta)`` with eigenvalue magnitude
+    ``scale`` (complex conjugate pair) -- the case that motivates using
+    ``eigvals`` over ``eigvalsh``."""
+    c, s = jnp.cos(theta), jnp.sin(theta)
+    return scale * jnp.array([[c, -s], [s, c]])
+
+
+class TestSpectralRadius:
+    def test_matches_eigenvalue_magnitude_on_nonsymmetric_matrix(self) -> None:
+        A = _scaled_rotation(scale=1.7, theta=0.6)
+        # guard: A is genuinely non-symmetric, so eigvalsh would be wrong here.
+        assert not np.allclose(np.asarray(A), np.asarray(A).T)
+        assert float(spectral_radius(A)) == pytest.approx(1.7, rel=1e-6)
+
+
+class TestStabilizeTransitionMatrix:
+    def test_scales_unstable_matrix_exactly_to_the_bound(self) -> None:
+        A = _scaled_rotation(scale=2.0, theta=0.4)  # radius 2.0 > 0.99
+        stabilized = stabilize_transition_matrix(A, max_spectral_radius=0.99)
+        # radius pulled to exactly the bound...
+        assert float(spectral_radius(stabilized)) == pytest.approx(0.99, rel=1e-6)
+        # ...by a uniform scale (every entry * 0.99/2.0), preserving structure.
+        np.testing.assert_allclose(
+            np.asarray(stabilized), np.asarray(A) * (0.99 / 2.0), rtol=1e-6
+        )
+
+    def test_leaves_stable_matrix_unchanged(self) -> None:
+        A = _scaled_rotation(scale=0.5, theta=0.4)  # radius 0.5 < 0.99
+        # guard: input is genuinely within the bound (test isn't vacuous).
+        assert float(spectral_radius(A)) < 0.99
+        stabilized = stabilize_transition_matrix(A, max_spectral_radius=0.99)
+        np.testing.assert_array_equal(np.asarray(stabilized), np.asarray(A))
