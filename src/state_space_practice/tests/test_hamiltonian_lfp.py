@@ -257,6 +257,7 @@ class TestHamiltonianLFPSGDRecovery:
         )
 
 
+@pytest.mark.slow
 class TestHamiltonianLFPLinearLimit:
     """With a zeroed MLP the dynamics are linear, so the EKF must reduce to the
     exact linear Kalman filter/smoother.
