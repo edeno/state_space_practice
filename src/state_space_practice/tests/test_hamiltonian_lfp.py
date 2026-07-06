@@ -2,10 +2,16 @@
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from state_space_practice.hamiltonian_lfp import HamiltonianLFPModel
-from state_space_practice.nonlinear_dynamics import apply_mlp, leapfrog_step
+from state_space_practice.kalman import kalman_filter, kalman_smoother
+from state_space_practice.nonlinear_dynamics import (
+    apply_mlp,
+    get_transition_jacobian,
+    leapfrog_step,
+)
 from state_space_practice.tests.recovery_helpers import (
     assert_ll_improves,
     simulate_harmonic_oscillator,
@@ -249,3 +255,69 @@ class TestHamiltonianLFPSGDRecovery:
         assert jnp.all(eigvals > 0), (
             f"Learned Q should be PSD, but has eigenvalues {eigvals}"
         )
+
+
+class TestHamiltonianLFPLinearLimit:
+    """With a zeroed MLP the dynamics are linear, so the EKF must reduce to the
+    exact linear Kalman filter/smoother.
+
+    The core F-alignment test validates ``ekf_rts_backward_pass`` for
+    hand-constructed inputs; this pins the *model-level* forward-scan wiring --
+    that ``filter``/``smooth`` actually produce correctly-aligned
+    ``m_pred``/``P_pred``/``F`` per step. ``kalman_filter`` uses the same
+    predict-then-update-from-init convention as the model, so the match is exact.
+    """
+
+    def test_matches_kalman_filter_and_smoother(self):
+        model = HamiltonianLFPModel(
+            n_oscillators=2, n_sources=3, sampling_freq=100.0, seed=0
+        )
+        params, _ = model._build_param_spec()
+        # Zero the MLP -> linear (harmonic) leapfrog; zero offset d so the linear
+        # observation y ~ N(C x, R) matches kalman_filter's (offset-free) model.
+        params = dict(params)
+        params["mlp"] = jax.tree_util.tree_map(jnp.zeros_like, params["mlp"])
+        params["d"] = jnp.zeros_like(params["d"])
+
+        # Constant transition matrix = the zeroed-MLP leapfrog Jacobian.
+        trans_params = {**params["mlp"], "omega": params["omega"]}
+        F = get_transition_jacobian(
+            params["init_mean"], trans_params, apply_mlp, model.dt
+        )
+
+        lfp = jax.random.normal(jax.random.PRNGKey(1), (40, 3)) * 0.5
+        init_mean = params["init_mean"]
+        init_cov = model.init_cov[:, :, 0]
+        Q = params["Q"]
+        C = params["C"]
+        R = jnp.eye(3) * model.obs_noise_std**2
+
+        # sanity: the zeroed-MLP transition really is the linear map f(x) = F @ x.
+        probe = jnp.array([0.3, -0.4, 0.2, 0.6])
+        np.testing.assert_allclose(
+            np.asarray(model.transition_func(probe, trans_params)),
+            np.asarray(F @ probe),
+            atol=1e-10,
+        )
+
+        m_filt, P_filt, lls = model.filter(lfp, params)
+        m_smooth, P_smooth = model.smooth(lfp, params)
+
+        ref_fm, ref_fc, ref_ll = kalman_filter(init_mean, init_cov, lfp, F, Q, C, R)
+        ref_sm, ref_sc, _, _ = kalman_smoother(init_mean, init_cov, lfp, F, Q, C, R)
+
+        np.testing.assert_allclose(
+            np.asarray(m_filt), np.asarray(ref_fm), rtol=1e-6, atol=1e-8
+        )
+        np.testing.assert_allclose(
+            np.asarray(P_filt), np.asarray(ref_fc), rtol=1e-6, atol=1e-8
+        )
+        np.testing.assert_allclose(float(jnp.sum(lls)), float(ref_ll), rtol=1e-6)
+        np.testing.assert_allclose(
+            np.asarray(m_smooth), np.asarray(ref_sm), rtol=1e-6, atol=1e-8
+        )
+        np.testing.assert_allclose(
+            np.asarray(P_smooth), np.asarray(ref_sc), rtol=1e-6, atol=1e-8
+        )
+        # guard: the smoother genuinely differs from the filter (non-vacuous).
+        assert float(jnp.max(jnp.abs(m_smooth - m_filt))) > 1e-3
