@@ -336,8 +336,9 @@ class BaseModel(ABC, SGDFittableMixin):
         Used when EM cannot produce a usable posterior (e.g. a non-finite
         first E-step with no earlier accepted state to roll back to). Without
         this the NaN posteriors installed by the failed E-step would remain,
-        and decode()/predict_proba() -- which only guard on attribute
-        existence -- would silently return garbage (argmax of NaN).
+        and decode()/predict_proba() -- whose guards catch a missing/None
+        attribute but not a NaN-filled array -- would silently return garbage
+        (argmax of NaN). Setting the attributes to None makes those guards fire.
         """
         self.smoother_discrete_state_prob = None
         self.smoother_joint_discrete_state_prob = None

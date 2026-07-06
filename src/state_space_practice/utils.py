@@ -891,7 +891,11 @@ def check_converged(
     is_converged : bool
         True if the relative change < tolerance.
     is_increasing : bool
-        True if the relative decrease does not exceed tolerance.
+        True if the relative decrease does not exceed tolerance. Note: when the
+        absolute change is below ``absolute_tolerance`` (the near-zero-scale
+        regime) this returns ``True`` even for a genuine decrease within that
+        tolerance -- intentional, to suppress spurious rollbacks on sub-tolerance
+        EM fluctuations from the Laplace/GPB approximation.
 
     """
     # Handle infinite values (e.g., first iteration when previous is -inf)

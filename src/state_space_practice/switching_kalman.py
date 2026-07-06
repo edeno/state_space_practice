@@ -160,7 +160,7 @@ def _cap_cross_covariance_frobenius(
 
 
 def _log_prob_preserve_zeros(prob: jax.Array) -> jax.Array:
-    """Compute log probabilities while keeping exact zeros impossible."""
+    """Log-probabilities mapping exact zeros to ``-inf`` (impossible stays impossible)."""
     prob = jnp.asarray(prob)
     if not jnp.issubdtype(prob.dtype, jnp.inexact):
         prob = prob.astype(jnp.float32)
@@ -1091,7 +1091,7 @@ def switching_kalman_smoother(
             pair_cond_smoother_cross_covs,  # Cov[X_t, X_{t+1} | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         ) = _kalman_smoother_update_per_discrete_state_pair(
             next_state_cond_smoother_mean,  # E[X_{t+1} | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states)
-            next_state_cond_smoother_cov,  # Cov[X_{t+1} | y_{1:T}, S_t=k], shape (n_cont_states, n_cont_states, n_discrete_states)
+            next_state_cond_smoother_cov,  # Cov[X_{t+1} | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_cont_states, n_discrete_states)
             state_cond_filter_mean,  # E[X_t | y_{1:t}, S_t=j], shape (n_cont_states, n_discrete_states)
             state_cond_filter_cov,  # Cov[X_t | y_{1:t}, S_t=j], shape (n_cont_states, n_cont_states, n_discrete_states)
             process_cov,  # Cov[X_{t+1} | X_t], shape (n_cont_states, n_cont_states, n_discrete_states)

@@ -676,7 +676,9 @@ def _project_to_scaled_rotation_matrix(matrix: jax.Array) -> jax.Array:
     ``[[a, -b], [b, a]]``.  This is a 2D linear subspace of 2x2 matrices, so
     the Frobenius projection has the closed form below.  This differs from the
     generic orthogonal Procrustes/SVD projection in
-    ``_project_to_closest_rotation``, which can return a scaled reflection.
+    ``_project_to_closest_rotation``: that routine forces a proper rotation
+    (det +1) via a determinant correction, while this closed form additionally
+    constrains the block to the exact ``scale * R(angle)`` form.
     """
     if matrix.shape != (2, 2):
         raise ValueError("Scaled-rotation projection expects a 2x2 matrix.")
