@@ -37,6 +37,7 @@ from state_space_practice.switching_kalman import (
     collapse_gaussian_mixture_per_discrete_state,
 )
 from state_space_practice.utils import (
+    safe_log as _safe_log,
     scale_likelihood as _scale_likelihood,
     stabilize_probability_vector as _stabilize_probability_vector,
     validate_choice_indices,
@@ -292,10 +293,14 @@ def _switching_choice_filter_jit(
     else:
         init_discrete_prob = jnp.asarray(init_discrete_prob)
 
-    # Covariates
+    # Covariates. Require covariates and input_gain both-or-neither (matching the
+    # obs branch below); silently zeroing the covariates when input_gain is
+    # omitted would drop the dynamics input without any signal.
     if covariates is not None:
+        if input_gain is None:
+            raise ValueError("covariates provided but input_gain is None")
         cov_arr = jnp.asarray(covariates)
-        ig_arr = jnp.asarray(input_gain) if input_gain is not None else jnp.zeros((k_free, 1))
+        ig_arr = jnp.asarray(input_gain)
     else:
         if input_gain is not None:
             raise ValueError("input_gain provided but covariates is None")
@@ -357,7 +362,7 @@ def _switching_choice_filter_jit(
     first_discrete_prob, _, first_pred_sum = _update_discrete_state_probabilities(
         first_ll_scaled, jnp.eye(S), init_discrete_prob,
     )
-    first_marginal_ll = first_ll_max + jnp.log(first_pred_sum)
+    first_marginal_ll = first_ll_max + _safe_log(first_pred_sum)
 
     # Pair-conditional for smoother: diagonal (no pair structure at t=0)
     first_pair_mean = jnp.stack([first_means] * S, axis=-1)  # (K-1, S, S)
@@ -398,7 +403,7 @@ def _switching_choice_filter_jit(
         )
 
         # Accumulate LL
-        new_ll = accum_ll + ll_max + jnp.log(pred_sum)
+        new_ll = accum_ll + ll_max + _safe_log(pred_sum)
 
         # Collapse mixtures
         state_mean, state_cov = collapse_gaussian_mixture_per_discrete_state(

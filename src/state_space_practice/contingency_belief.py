@@ -854,6 +854,13 @@ class ContingencyBeliefModel(SGDFittableMixin):
         stickiness: float = 0.0,
         transition_regularization: float = 1e-5,
     ):
+        if n_states < 2:
+            raise ValueError(
+                f"n_states must be >= 2 (a single state has nothing to infer); "
+                f"got {n_states}."
+            )
+        if n_options < 2:
+            raise ValueError(f"n_options must be >= 2; got {n_options}.")
         self.n_states = n_states
         self.n_options = n_options
         self.n_obs_covariates = n_obs_covariates
