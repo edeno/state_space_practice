@@ -310,11 +310,30 @@ class TestMultinomialChoiceModel:
         choices = np.where(rng.random(200) < 0.7, 1, rng.integers(0, 3, size=200))
         model = MultinomialChoiceModel(n_options=3)
         lls = model.fit(choices, max_iter=15)
-        # Allow small decreases due to grid discretization
+        # The GEM monotonicity guard rolls back a decreasing M-step, so the LL
+        # history is non-decreasing (up to the guard's 1e-6 tolerance).
         for i in range(1, len(lls)):
-            assert lls[i] >= lls[i - 1] - 0.5, (
-                f"LL decreased by {lls[i-1] - lls[i]:.4f} at iter {i}"
+            assert lls[i] >= lls[i - 1] - 1e-5, (
+                f"LL decreased by {lls[i-1] - lls[i]:.6f} at iter {i}"
             )
+
+    def test_em_monotonicity_guard_rolls_back_overshoot(self):
+        """On data where the Laplace-EKF Q M-step overshoots and would decrease
+        the marginal LL, the guard restores the best iterate: fit() stays
+        monotone and never returns a fit worse than an earlier iteration.
+        Without the guard this trace decreases over many iterations.
+        """
+        sim = simulate_choice_data(
+            n_trials=400, process_noise=0.05, inverse_temperature=2.5, seed=7
+        )
+        model = MultinomialChoiceModel(n_options=4)
+        lls = model.fit(sim.choices, max_iter=40)
+        for i in range(1, len(lls)):
+            assert lls[i] >= lls[i - 1] - 1e-6, (
+                f"LL decreased by {lls[i-1] - lls[i]:.6f} at iter {i}"
+            )
+        # guard: the reported final LL is the best iterate, not a degraded one.
+        assert model.log_likelihood_ >= max(lls) - 1e-6
 
     def test_invalid_choice_raises(self):
         model = MultinomialChoiceModel(n_options=3)

@@ -380,6 +380,11 @@ def multinomial_choice_smoother(
 
 _DEFAULT_BETA_GRID = (0.1, 0.3, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0)
 
+# Tolerance below which a marginal-LL decrease between EM iterations is treated
+# as an overshoot of the approximate (Laplace-EKF) M-step and triggers a rollback
+# to the last accepted parameters.
+_EM_MONOTONICITY_TOL = 1e-6
+
 
 class MultinomialChoiceModel(SGDFittableMixin):
     """Multi-armed bandit choice model with evolving option values.
@@ -574,6 +579,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
 
         log_likelihoods = []
         converged = False
+        last_accepted: dict | None = None
 
         for iteration in range(max_iter):
             # E-step: run smoother with current parameters
@@ -583,6 +589,20 @@ class MultinomialChoiceModel(SGDFittableMixin):
                 inverse_temperature=self.inverse_temperature,
             )
             ll = float(smooth.marginal_log_likelihood)
+
+            # GEM monotonicity guard: the approximate (Laplace-EKF) M-step can
+            # decrease the marginal LL. On a decrease beyond tolerance, restore the
+            # last accepted parameters and stop, so fit() returns the best iterate
+            # and the LL history stays non-decreasing.
+            if (
+                log_likelihoods
+                and last_accepted is not None
+                and ll < log_likelihoods[-1] - _EM_MONOTONICITY_TOL
+            ):
+                for attr, value in last_accepted.items():
+                    setattr(self, attr, value)
+                break
+
             log_likelihoods.append(ll)
 
             if verbose:
@@ -604,6 +624,13 @@ class MultinomialChoiceModel(SGDFittableMixin):
                         logger.info("Converged at iteration %d", iteration + 1)
                     converged = True
                     break
+
+            # Snapshot the parameters this accepted E-step used, so the
+            # monotonicity guard above can roll back a degrading M-step.
+            last_accepted = {
+                "process_noise": self.process_noise,
+                "inverse_temperature": self.inverse_temperature,
+            }
 
             # M-step for process noise Q
             if self.learn_process_noise:
