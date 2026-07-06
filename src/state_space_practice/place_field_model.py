@@ -1922,6 +1922,15 @@ class PlaceFieldModel(SGDFittableMixin):
         where k is the number of free parameters and n is the number of
         time bins.
 
+        ``n`` is the trajectory length (``n_time``), not the observation count
+        ``n_time * n_neurons``, because the free parameters ``k`` counted by
+        ``n_free_params`` are all latent-dynamics parameters (``Q``, ``A``,
+        initial mean/covariance) describing an ``n_time``-length trajectory --
+        the spline weights are integrated-out latent state, not free parameters.
+        Adding neurons sharpens the per-timestep latent estimate but does not add
+        trajectory points, so ``n_time`` is the sample size relevant to those
+        parameters.
+
         Returns
         -------
         float
