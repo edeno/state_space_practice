@@ -766,18 +766,24 @@ def _contingency_belief_smoother_jit(
         [smoothed_interior, filter_beliefs[-1:]], axis=0
     )
 
-    # --- Pairwise state probabilities P(s_{t-1}=i, s_t=j | data) ---
+    # --- Pairwise state probabilities P(s_t=i, s_{t+1}=j | data) ---
     def _pairwise(step_data):
-        smooth_t, predicted_tp1, trans_tp1, smooth_tp1 = step_data
-        # P(s_t=i, s_{t+1}=j | data) = smooth[t,i] * T[i,j] * smooth[t+1,j] / predicted[t+1,j]
+        filter_t, predicted_tp1, trans_tp1, smooth_tp1 = step_data
+        # Two-slice HMM identity:
+        #   P(s_t=i, s_{t+1}=j | data)
+        #     = P(s_t=i | y_{1:t}) * T[i,j] * P(s_{t+1}=j | data) / P(s_{t+1}=j | y_{1:t})
+        # The "from" factor is the FILTER posterior alpha_t(i) (past data only),
+        # NOT the smoothed marginal (which conditions on future data too); using
+        # the smoothed marginal breaks the marginalization identity
+        # sum_j P(s_t=i, s_{t+1}=j) = P(s_t=i | data).
         ratio = smooth_tp1 / jnp.maximum(predicted_tp1, 1e-30)
-        joint = smooth_t[:, None] * trans_tp1 * ratio[None, :]
+        joint = filter_t[:, None] * trans_tp1 * ratio[None, :]
         # Normalize
         joint = joint / jnp.maximum(joint.sum(), 1e-30)
         return joint
 
     pairwise_inputs = (
-        smoothed[:-1],
+        filter_beliefs[:-1],
         predicted_beliefs[1:],
         trans_matrices[1:],
         smoothed[1:],

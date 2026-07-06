@@ -243,6 +243,26 @@ class TestContingencyBeliefSmoother:
         sums = result.pairwise_state_prob.sum(axis=(1, 2))
         np.testing.assert_allclose(sums, 1.0, atol=1e-6)
 
+    def test_pairwise_marginalizes_to_smoothed(self, block_data):
+        """Two-slice HMM identity: the pairwise joint must marginalize back to the
+        smoothed marginals. Summing out the next state gives P(s_t | data);
+        summing out the current state gives P(s_{t+1} | data). This fails if the
+        'from' factor uses the smoothed marginal instead of the filter posterior.
+        """
+        result = contingency_belief_smoother(**block_data)
+        pairwise = np.asarray(result.pairwise_state_prob)  # (T-1, S, S): [t,i,j]
+        smoothed = np.asarray(result.smoothed_state_prob)  # (T, S)
+        # sum over next state j -> P(s_t=i | data) for t = 0..T-2
+        np.testing.assert_allclose(pairwise.sum(axis=2), smoothed[:-1], atol=1e-6)
+        # sum over current state i -> P(s_{t+1}=j | data)
+        np.testing.assert_allclose(pairwise.sum(axis=1), smoothed[1:], atol=1e-6)
+        # guard: the data actually induces a switch, so the joint is non-trivial
+        # (off-diagonal mass is present) -- otherwise marginalization is vacuous.
+        off_diag = pairwise.sum(axis=(1, 2)) - np.trace(
+            pairwise, axis1=1, axis2=2
+        )
+        assert off_diag.max() > 0.05
+
     def test_smoother_sharper_than_filter(self, block_data):
         """Smoother should be at least as confident as filter."""
         filter_result = contingency_belief_filter(**block_data)
@@ -986,11 +1006,15 @@ class TestContingencyBeliefValidation:
             )
 
     def test_converged_flag_reflects_convergence(self):
-        # Distinct `while abs(ll-prev_ll)<tol and iteration>0` EM loop; verify
-        # converged_ here as well as in multinomial.
+        # Verify the converged_ flag mechanism. Use data with a real contingency
+        # switch (option 0 rewarded, then option 1) so EM has a genuine target and
+        # converges reliably; random no-signal data has no target and convergence
+        # in a fixed iteration budget is arbitrary.
         rng = np.random.default_rng(0)
-        choices = rng.integers(0, 2, size=200)
-        rewards = rng.integers(0, 2, size=200)
+        n_trials = 200
+        choices = rng.integers(0, 2, size=n_trials)
+        correct = np.where(np.arange(n_trials) < n_trials // 2, 0, 1)
+        rewards = (choices == correct).astype(int)
         m1 = ContingencyBeliefModel(n_states=2, n_options=2)
         m1.fit(choices, rewards, max_iter=1)
         assert m1.converged_ is False  # cannot converge in one iteration
