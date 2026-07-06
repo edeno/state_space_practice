@@ -14,7 +14,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `_project_parameters`. Callers that relied on the old floor should pass
   `min_eigenvalue=0.01` explicitly to reproduce prior fits.
 
-- **`get_confidence_interval` default `alpha` `0.01` → `0.05`**
-  (`point_process_kalman.py`, both the free function and the `PlaceFieldModel`
-  method). The default interval is now **95%** (was 99%). Pass `alpha=0.01`
-  explicitly for the previous 99% interval.
+- **`get_confidence_interval` default `alpha` `0.01` → `0.05`** in both
+  `point_process_kalman.py` (the free function and the `PlaceFieldModel` method)
+  and `models.py` (the legacy free function, now aligned). The default interval
+  is now **95%** (was 99%). Pass `alpha=0.01` explicitly for the previous 99%
+  interval.
