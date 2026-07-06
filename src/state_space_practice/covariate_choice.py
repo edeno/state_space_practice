@@ -1149,7 +1149,10 @@ class CovariateChoiceModel(SGDFittableMixin):
         if self.n_covariates > 0:
             n += (self.n_options - 1) * self.n_covariates  # B matrix
         if self.n_obs_covariates > 0 and self.learn_obs_weights:
-            n += self.n_options * self.n_obs_covariates  # Theta matrix
+            # (K-1), not K: adding a constant to a full Theta column shifts every
+            # option's logit equally (softmax-invariant), so one row per obs
+            # covariate is non-identifiable and must not be counted.
+            n += (self.n_options - 1) * self.n_obs_covariates  # Theta matrix
         if self.learn_decay:
             n += 1  # scalar decay
         return n
@@ -1403,12 +1406,16 @@ def simulate_rl_choice_data(
     process_noise: float = 0.005,
     inverse_temperature: float = 2.0,
     reward_prob: float = 0.7,
+    decay: float = 0.95,
     seed: int = 42,
 ) -> SimulatedRLChoiceData:
     """Simulate multi-armed bandit data with covariate-driven value evolution.
 
     Generates choices from a softmax model where option values evolve
-    according to ``x_t = x_{t-1} + B @ u_t + noise``. Covariates follow
+    according to ``x_t = decay * x_{t-1} + B @ u_t + noise``. The ``decay < 1``
+    forgetting factor keeps values bounded; without it a repeatedly-rewarded
+    option's value would accumulate without bound (a near-deterministic runaway
+    rather than a realistic bandit). Covariates follow
     the filter convention: ``u_t`` drives the prediction at trial t
     (i.e., the transition x_{t-1} -> x_t). For reward covariates, this
     means the reward earned on trial t-1 appears as ``u_t``.
@@ -1449,7 +1456,7 @@ def simulate_rl_choice_data(
         # (covariates[0] is zero — no prior reward before first trial)
         if t > 0:
             values[t] = (
-                values[t - 1]
+                decay * values[t - 1]
                 + B @ covariates[t]
                 + rng.normal(0, np.sqrt(process_noise), k_free)
             )

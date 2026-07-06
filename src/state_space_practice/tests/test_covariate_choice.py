@@ -872,14 +872,16 @@ class TestObservationCovariates:
         assert m.obs_weights_.shape == (4, 3)
 
     def test_n_free_params_includes_obs_weights(self):
-        """BIC should count Theta parameters."""
+        """BIC counts the identifiable Theta parameters."""
         m = CovariateChoiceModel(
             n_options=3, n_obs_covariates=2,
             learn_process_noise=True,
             learn_inverse_temperature=True,
         )
-        # Q(1) + beta(1) + Theta(3*2=6) = 8
-        assert m.n_free_params == 8
+        # Q(1) + beta(1) + Theta((K-1)*d_obs = 2*2 = 4) = 6. Only (K-1) rows per
+        # obs covariate are identifiable -- adding a constant to a full Theta
+        # column is softmax-invariant -- so the reference row is not counted.
+        assert m.n_free_params == 6
 
     def test_choice_probabilities_include_obs_offset(self):
         """choice_probabilities should include Theta @ z_t."""
