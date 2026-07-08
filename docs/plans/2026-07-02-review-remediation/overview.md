@@ -2,6 +2,10 @@
 
 [← back to PLAN.md](PLAN.md)
 
+> **Reconciled 2026-07-08:** This overview is a historical map of the review
+> remediation phases. Most fixes have landed; use the phase files for audit
+> context and for deferred hygiene/in-jit guard follow-ups.
+
 Findings and evidence live in the review report
 ([`docs/reviews/2026-07-02-comprehensive-review.md`](../../reviews/2026-07-02-comprehensive-review.md));
 this file covers only what the executor needs to sequence and scope the fixes.

@@ -2,15 +2,23 @@
 
 ## Overview
 
-Apply the `SwitchingSpikeOscillatorModel` to real hippocampal CA1 recordings to:
+Apply the `SwitchingSpikeOscillatorModel` to real hippocampal CA1 recordings as
+an exploratory spike-only segmentation analysis to:
 
-1. Segment theta-on vs theta-off states from spikes alone
-2. Recover theta phase and amplitude from spike activity
+1. Segment candidate theta-on vs theta-off states from spikes alone
+2. Explore latent oscillator phase and amplitude inferred from spike activity
 3. Validate against behavioral correlates (running vs immobility)
 4. Demonstrate downstream applications (phase-locking analysis)
 
 **Note**: No LFP data is available in the current dataset. Validation will rely on
 behavioral correlates (speed/running) rather than LFP theta power/phase.
+
+**Science caveat (2026-07-08 reconciliation)**: Spike-only switching oscillator
+fits are useful for exploratory segmentation and diagnostics, but they are not
+evidence of identifiable theta phase, theta amplitude, or cross-region coupling
+unless an observed field signal such as LFP, or another independent phase anchor,
+pins the latent. Behavioral correlates are not a substitute for LFP phase/power
+validation.
 
 ## Data Source
 
@@ -340,25 +348,26 @@ model_2osc = SwitchingSpikeOscillatorModel(
 
 ## Key Metrics for Success
 
-### Minimum Viable Demo
+### Minimum Viable Exploratory Demo
 
 - [ ] Model fits without numerical issues
 - [ ] P(theta-on) correlates with running epochs (r > 0.5 or AUC > 0.7)
-- [ ] Inferred frequency is in theta range (6-10 Hz)
-- [ ] Amplitude is higher during running vs immobility
+- [ ] Latent frequency is in theta range (6-10 Hz), reported as unvalidated without LFP
+- [ ] Latent amplitude is higher during running vs immobility
 
-### Strong Demo
+### Strong Exploratory Demo
 
 - [ ] Clear separation of theta-on/off states in discrete probability
-- [ ] Phase-locked neurons show consistent preferred phases
+- [ ] Neurons show consistent preferred phases relative to the inferred latent
 - [ ] Learned dynamics show expected pattern (low damping for theta-on)
 - [ ] Visual spike rasters show rhythmic firing during theta-on
 
-### Publication-Ready Demo
+### Publication-Ready Demo Requires an Anchor
 
+- [ ] LFP or another independent theta anchor validates phase, power, and frequency
 - [ ] Behavioral validation shows strong running/theta correlation
-- [ ] Spike-inferred phase predicts spiking (phase regressor improves GLM)
-- [ ] Novel insights: neuron-level phase preferences from spikes alone
+- [ ] Anchored phase predicts spiking (phase regressor improves GLM)
+- [ ] Novel insights: neuron-level phase preferences relative to validated theta
 
 ---
 

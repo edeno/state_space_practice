@@ -2,6 +2,12 @@
 
 > For Claude: Execute plans in this exact order within each track. Do not start a downstream plan until all entry and exit gates for upstream dependencies pass.
 
+> **Reconciled 2026-07-08:** This roadmap now reflects the checked-in source and
+> the 2026-06-21 spike-field identifiability finding. Completed plans are listed
+> as existing capabilities, not active work. Spike-only latent-oscillator coupling
+> plans are blocked as scientific estimators unless an observed field such as LFP
+> anchors the latent.
+
 ## Purpose
 
 This roadmap provides the authoritative implementation queue for all plans in docs/plans/, organized into two tracks:
@@ -9,11 +15,13 @@ This roadmap provides the authoritative implementation queue for all plans in do
 - **Infrastructure track:** Core models and utilities that form the computational foundation
 - **Scientific track:** Neuroscience-specific models that build on the infrastructure to test scientific hypotheses about CA1/mPFC replay, theta sequences, and value-modulated neural coding
 
-Both tracks share the same dependency graph. The scientific track has a "minimum publishable path" — the shortest route to a novel scientific claim.
+Both tracks share the same dependency constraints. The scientific track has a "minimum publishable path" — the shortest route to a novel scientific claim.
 
 ## Global Rules
 
-1. Run all commands in the conda environment state_space_practice.
+1. Run all commands through `uv run` from the repository root. Older plan snippets
+   may still say `conda run -n state_space_practice`; treat those as historical
+   and translate them to `uv run`.
 2. Use test-first sequencing inside each plan task.
 3. Never run two high-risk plans in parallel.
 4. If any gate fails, stop and fix before continuing.
@@ -29,140 +37,68 @@ Both tracks share the same dependency graph. The scientific track has a "minimum
 | RL Covariates | **DONE** (covariate_choice.py, 55 tests — dynamics covariates, obs covariates, decay) |
 | Computational Improvements | **DONE** (parallel smoother, Woodbury, Joseph form, parameter constraints, SGD for choice models) |
 | SGD Fitting All Models | **DONE** (fit_sgd() on all model classes, 80+ SGD tests, eigendecomp→Cholesky PSD fix) |
+| Contingency Belief | **DONE** (`contingency_belief.py`, EM + SGD + uncertainty summaries) |
+| Uncertainty-Aware Behavioral Modeling | **DONE** (`behavioral_uncertainty.py`; summaries/surprise exposed on behavioral models) |
+| Switching Choice | **DONE** (`switching_choice.py`, per-state beta/Q/decay, EM + SGD) |
+| Regularized Oscillator Connectivity | **DONE** (`oscillator_regularization.py`, DIM SGD penalties) |
 | Hamiltonian Oscillator SSM | **DONE** (hamiltonian_spikes/lfp/joint/switching.py, 34 tests, nonlinear>linear baseline verified) |
 | Hamiltonian Review Fixes | **DONE** (all 7 phases: runtime crashes, state layout, PRNG split, Phase 4 weighted-Jacobian smoother, smoke tests, API cleanup) |
-| All others | Not started |
+| Review Remediation | **PARTIAL/DONE IN CODE** (fast suite green; remaining items are deferred hygiene, not blockers) |
+| Spike-field coupling cross-check | **DONE** (`coupling_*` modules; LFP-conditioned two-stage path validated) |
+| Cross-region oscillator coupling | **BLOCKED AS SPECIFIED** (spike-only latent + loading inference is degenerate; requires LFP-conditioned rewrite) |
+| Switching spike oscillator plan | **CODED, SCIENCE CAVEAT** (numerically tested, but spike-only joint latent/loading interpretation is not identifiable) |
+| Remaining additive modules | Not started unless listed below (`cross_session_drift.py`, `adaptive_decoder.py`, `ca1_represented_state.py`, `value_gated_sequence.py`, `dynamic_spike_coupling.py`, etc. do not exist yet) |
 
 ## Current Priority Queue
 
-The following six plans are the current implementation priorities, ordered by interest and respecting dependencies:
+The previous P1/P2/P2.5/P3/P6 queue has shipped. The current queue should start
+from genuinely missing modules and from plans de-risked by the latest findings:
 
 | Priority | Plan | Feasibility | Risk | Depends On | Notes |
 |---|---|---|---|---|---|
-| **P1** | sgd-fitting-all-models.md | **DONE** | — | Computational Improvements (DONE) | All model classes have fit_sgd() |
-| **P2** | contingency-belief-latent-task-state.md | **DONE** | — | Multinomial Choice (DONE) | Input-output HMM with EM + SGD |
-| **P2.5** | uncertainty-aware-behavioral-modeling.md | **DONE** | — | RL Covariates (DONE) + Contingency Belief (DONE) | Uncertainty summaries + surprise on all behavioral models |
-| **P3** | switching-choice-model.md | **DONE** | — | RL Covariates (DONE) + switching_kalman | Per-state beta/Q/decay, GPB2 filter, EM + SGD |
-| **P4** | joint-learning-drift.md | SPECULATIVE | High | Smith + PlaceField + switching_kalman (all exist) | Prototype first; high integration complexity |
-| **P5** | adaptive-decoder.md | PARTIAL | Med | Position Decoding (DONE) | Can start in parallel with P1-P3 |
-| **P6** | regularized-oscillator-connectivity.md | **DONE** | — | SGD Fitting (P1, **DONE**) | Edge L1, area group L2, state-shared penalties |
+| **N1** | dynamic-neuron-coupling.md | READY-ish | Medium | PointProcessModel + SGD (DONE) | Safe from bilinear latent degeneracy because regressors are observed lagged spikes; reuse `glm_laplace_update`. |
+| **N2** | ca1-represented-state-switching.md | READY-ish | Medium | Position decoder + switching Kalman + point-process update (DONE) | Best first step toward replay/value scientific claims. |
+| **N3** | gaussian-sum-filter-replay.md | PLANNED | Med-High | Position decoder (DONE) | Strong replay decoder extension; bigger implementation due to GSF smoother/mixture management. |
+| **N4** | cross-session-drift.md | READY | Low-Med | PlaceFieldModel + Kalman (DONE) | Additive module for long-timescale remapping. |
+| **N5** | sgd-v2-improvements.md | PLANNED | Low-Med | SGDFittableMixin (DONE) | Do `log_det_jacobian` first; benchmark-gate chunked `lax.scan`. |
+| **N6** | adaptive-decoder.md | READY-ish | Medium | Position decoder + PlaceFieldModel (DONE) | Useful for long recordings; implement semi-supervised MVP only. |
+| **N7** | joint-learning-drift.md | SPECULATIVE | High | Smith + PlaceField + switching_kalman (DONE) | Prototype first; high integration complexity. |
 
 ### Parallelism Opportunities
 
-P2.5 can proceed as soon as P2 and the RL covariate work are complete. P3-P5 remain parallelizable:
-
-```
-                                ┌─────────────────────────┐
-                                │  Completed Foundation    │
-                                │  (Stability, Comp Impr,  │
-                                │   Pos Dec, Choice, RL)   │
-                                └────────┬────────────────┘
-                                               │
-                                ┌────────▼────────┐
-                                │      P2         │
-                                │  Contingency    │
-                                │    Belief       │
-                                └────────┬────────┘
-                                               │
-                                ┌────────▼────────┐
-                                │     P2.5        │
-                                │  Uncertainty    │
-                                │    Modeling     │
-                                └─────┬─────┬─────┘
-                                          │     │
-       ┌───────────┬────────┘     └───────────┬────────────┐
-       │           │                           │            │
-       ▼           ▼                           ▼            ▼
-  ┌──────┐   ┌──────┐                    ┌──────┐     ┌──────┐
-  │ P3   │   │ P4   │                    │ P5   │     │ P1   │
-  │Switch│   │Joint │                    │Adapt │     │ SGD  │
-  │Choice│   │Learn │                    │Decode│     │Fittin│
-  │Model │   │+Drift│                    │  r   │     │  g   │
-  └──────┘   └──────┘                    └──────┘     └──┬───┘
-                                                                                               │
-                                                                                               │ (after oscillator SGD tasks 5-6)
-                                                                                               ▼
-                                                                                          ┌──────┐
-                                                                                          │ P6   │
-                                                                                          │Regul.│
-                                                                                          │Oscil.│
-                                                                                          └──────┘
-```
+N1, N4, and N5 are mostly independent. N2 should precede S2/S3/S4 scientific
+plans. N3 can proceed in parallel with N2 if replay decoding is the immediate
+priority. Avoid running N2 and N3 in the same work session unless the task is
+only shared test/data scaffolding.
 
 ### Suggested Execution Strategy
 
-- **Phase A (parallel):** Start P1 (SGD Fitting) and P2 (Contingency Belief) simultaneously. P1 is the largest infrastructure investment and unblocks P6. P2 is a self-contained new module.
-- **Phase B (after P2):** Start P2.5 (Uncertainty-Aware Behavioral Modeling) — low-risk leverage on existing posterior quantities and the cleanest scientist-facing output upgrade.
-- **Phase C (after P2 or P2.5):** Start P3 (Switching Choice) — benefits from uncertainty summaries already existing for later state-dependent policies.
-- **Phase D (after Phase A/B/C):** Start P5 (Adaptive Decoder) — independent but lower priority.
-- **Phase E (after P1 tasks 5-6):** Start P6 (Regularized Oscillator) — blocked until oscillator SGD exists.
-- **Phase F (after Phase B/C validation):** Start P4 (Joint Learning+Drift) — SPECULATIVE, prototype-first. Benefits from uncertainty-aware behavioral outputs.
+- **Phase A:** Pick one concrete missing module: dynamic spike-history coupling
+  (N1) if the target is functional connectivity, or CA1 represented-state
+  switching (N2) if the target is replay/value content.
+- **Phase B:** If replay events are the bottleneck, implement Gaussian-sum replay
+  decoding (N3) after or alongside N2 with strict K=1 parity tests.
+- **Phase C:** Land cross-session drift (N4) before any covariate-driven drift or
+  hierarchical multi-timescale work.
+- **Phase D:** Add `log_det_jacobian` from SGD v2 (N5). Only implement chunked
+  `lax.scan` SGD if benchmarks show meaningful speedup.
+- **Phase E:** Keep joint-learning/drift and dual-latent CA1-mPFC plans
+  prototype-first until their prerequisites exist as checked-in modules.
 
-## Dependency Graph (Full)
+## Dependency Notes
 
-```
-                    ┌─────────────────────────┐
-                    │  0. Numerical Stability  │
-                    │     (infrastructure)     │
-                    └────────┬────────────────┘
-                             │
-        ┌────────────────────┼────────────────────┐
-        │                    │                     │
-        ▼                    ▼                     ▼
-  ┌──────────┐      ┌──────────────┐      ┌──────────────┐
-  │ 1. Pos   │      │ 2. Cross-    │      │ 3. Multinomial│
-  │ Decoding │      │ Session Drift│      │ Choice       │
-  │ ✅ DONE  │      │              │      │ ✅ DONE      │
-  └────┬─────┘      └──────┬───────┘      └──┬───────────┘
-       │                   │                  │
-       │                   │          ┌───────┼────────────┐
-       │                   │          │       │            │
-       ▼                   │          ▼       ▼            ▼
-  ┌──────────┐             │   ┌──────────┐ ┌──────┐ ┌──────────┐
-  │P5 Adapt. │             │   │ 3.5 RL   │ │P2    │ │ 4. Joint │
-  │ Decoder  │             │   │ Covariates│ │Contin│ │ Belief   │
-  └──────────┘             │   │ ✅ DONE  │ │gency │ │ Decoder  │
-       │                   │   └─────┬────┘ └──────┘ └──────┬───┘
-       │                   │         │                       │
-       │                   │    ┌────┴────┐                  │
-       │                   │    │         │                  │
-       │                   │    ▼         ▼                  │
-       │                   │  ┌──────┐ ┌──────┐              │
-       │                   │  │P3    │ │P4    │              │
-       │                   │  │Switch│ │Joint │              │
-       │                   │  │Choice│ │Learn │              │
-       │                   │  └──────┘ │+Drift│              │
-       │                   │           └──────┘              │
-       │                   ▼                                 │
-       │            ┌────────────┐                           │
-       │            │ 6. Covar.  │                           │
-       │            │ Drift      │                           │
-       │            └────────────┘                           │
-       │                   │                                 │
-       ▼                   ▼              ▼                  ▼
-  ┌─────────────────────────────────────────────────────────┐
-  │              Integration Plans (7-9)                     │
-  │  7. Spatial-Value  8. Joint Learn+Drift  9. X-Region    │
-  └─────────────────────────────────────────────────────────┘
-
-  Infrastructure / Oscillator Track:
-
-  0.5 Comp. Improvements ──► P1 SGD Fitting ──► P6 Regularized Oscillator
-       ✅ DONE
-
-  Scientific Track (builds on infrastructure):
-
-  1. Pos Decoding ──► CA1 Represented-State Switching
-       ✅ DONE              │
-                             ▼
-  3. Multinomial ──► Value-Gated Sequence Expression
-     Choice                  │
-     ✅ DONE                 ▼
-                     Coupled Dual-Latent CA1-mPFC
-                             │
-                             ▼
-                     Hierarchical Multi-Timescale
-```
+- Behavioral foundations (`multinomial_choice.py`, `covariate_choice.py`,
+  `contingency_belief.py`, `behavioral_uncertainty.py`, `switching_choice.py`)
+  are complete.
+- Replay/value work now starts with `ca1-represented-state-switching.md`, then
+  `value-gated-sequence-expression.md`, then dual-latent or hierarchical plans.
+- Long-timescale remapping should start with `cross-session-drift.md` before
+  covariate-driven drift or hierarchical multi-timescale modeling.
+- Dynamic spike-history coupling is safe to pursue because its regressors are
+  observed lagged spikes. Spike-only latent oscillator coupling is blocked as a
+  scientific estimator unless an observed field anchors the latent.
+- Gaussian-sum replay decoding is additive to the existing position decoder and
+  should keep a K=1 parity gate against `position_decoder.py`.
 
 ## Ordered Queue
 
@@ -188,23 +124,23 @@ Order 0.6: **DONE.** SGD fitting mixin for all model classes. SGDFittableMixin w
 | 2 | cross-session-drift.md | READY | Low-Med | 1-2 weeks | None | Not started (deferred) |
 | 3 | multinomial-choice-model.md | READY | Low-Med | 2-3 weeks | None | **DONE** |
 | 3.5 | rl-state-space-covariates.md | READY | Low-Med | 1-2 weeks | Multinomial Choice | **DONE** |
-| 3.6 | contingency-belief-latent-task-state.md | PARTIAL | Medium | 2-3 weeks | Multinomial Choice | **P2** |
-| 3.65 | uncertainty-aware-behavioral-modeling.md | READY | Low-Med | 1-2 weeks | RL Covariates + Contingency Belief | **P2.5** |
-| 3.7 | switching-choice-model.md | READY | Medium | 1-2 weeks | RL Covariates + Switching Kalman | **P3** |
+| 3.6 | contingency-belief-latent-task-state.md | DONE | — | — | Multinomial Choice | **DONE** |
+| 3.65 | uncertainty-aware-behavioral-modeling.md | DONE | — | — | RL Covariates + Contingency Belief | **DONE** |
+| 3.7 | switching-choice-model.md | DONE | — | — | RL Covariates + Switching Kalman | **DONE** |
 | 4 | joint-belief-state-decoder.md | PARTIAL | Medium | 2-3 weeks | Multinomial Choice | Not started (deferred) |
-| 5 | adaptive-decoder.md | PARTIAL | Medium | 2 weeks | Position Decoding | **P5** |
+| 5 | adaptive-decoder.md | READY-ish | Medium | 2 weeks | Position Decoding | Not started |
 | 6 | covariate-driven-drift.md | PARTIAL | Medium | 2-3 weeks | Cross-Session Drift | Not started (deferred) |
 | 7 | spatial-value-model.md | PARTIAL | Med-High | 2-3 weeks | Multinomial Choice + Joint Belief | Not started (deferred) |
 | 8 | joint-learning-drift.md | SPECULATIVE | High | 3+ weeks | Smith + PlaceField + Switching Kalman | **P4** |
-| 9 | cross-region-coupling.md | SPECULATIVE | High | 3+ weeks | Switching point-process + oscillator | Not started (deferred) |
+| 9 | cross-region-coupling.md | BLOCKED AS SPECIFIED | High | rewrite needed | LFP-conditioned coupling stack | Spike-only version is degenerate; require per-region LFP/two-stage rewrite. |
 
 ### Oscillator Track
 
 | Order | Plan | Feasibility | Risk | Effort | Depends On | Status |
 |---|---|---|---|---|---|---|
 | O1 | regularized-oscillator-connectivity.md | **DONE** | — | — | SGD Fitting (**DONE**) | **P6** — complete |
-| O2 | dynamic-neuron-coupling.md | PARTIAL | Med | 2-3 weeks | SGD Fitting (**DONE**) | Not started — unblocked |
-| O3 | principled-stabilization-refactor.md | PARTIAL | Med | 2-3 weeks | None | Not started (deferred) |
+| O2 | dynamic-neuron-coupling.md | READY-ish | Med | 2-3 weeks | SGD Fitting (**DONE**) | Not started — unblocked and de-risked by observed regressors |
+| O3 | principled-stabilization-refactor.md | PARTIAL | Med | 2-3 weeks | None | Partly superseded by 2026-07 remediation; defer remaining in-jit guard work |
 
 ### Hamiltonian Track (standalone, nonlinear dynamics)
 
@@ -246,11 +182,11 @@ Claim: "CA1 alternates between local and nonlocal represented content, and laten
 - **P1 (SGD Fitting)** is **DONE** — all model classes have `fit_sgd()`.
 - **P6 (Regularized Oscillator)** is **DONE** — edge L1, area group L2, state-shared group L2 penalties on DIM coupling.
 - **P2 (Contingency Belief)** is **DONE** — input-output HMM with centered softmax, Dirichlet prior, design-matrix transitions, EM + SGD.
-- **P2.5 (Uncertainty-Aware Behavioral Modeling)** is the next low-risk behavioral upgrade — it exposes uncertainty summaries as first-class outputs and adds an uncertainty-sensitive policy path that will transfer naturally to switching models later.
-- **P3 (Switching Choice)** is the first switching behavioral model with per-state value dynamics.
+- **P2.5 (Uncertainty-Aware Behavioral Modeling)** is **DONE** — uncertainty summaries and surprise are already first-class outputs.
+- **P3 (Switching Choice)** is **DONE** — the behavioral switching layer is available for downstream plans.
 - **P4 (Joint Learning+Drift)** is SPECULATIVE but scientifically important — links learning rate and representational drift through shared discrete states.
 - **P5 (Adaptive Decoder)** enables long-duration decoding without retraining.
-- **P6 (Regularized Oscillator)** adds structured sparsity penalties to oscillator coupling — blocked until P1 oscillator tasks complete.
+- **P6 (Regularized Oscillator)** is **DONE** — it is no longer blocked.
 - **H1/H2 (Hamiltonian Track)** are **DONE**. Symplectic nonlinear latent dynamics (leapfrog + EKF linearization) with Gaussian and point-process observations, plus a switching variant. Standalone from `BaseModel` EM; SGD-only fitting. No downstream plan currently depends on this track, so it ran on its own schedule outside the priority queue.
 - **S1-S2** form the minimum publishable path using infrastructure already built (currently deferred).
 - **S3-S4** are ambitious cross-region and multi-timescale models for later.
@@ -269,15 +205,15 @@ The following plans share identical mathematical patterns and should use shared 
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_kalman.py src/state_space_practice/tests/test_switching_kalman.py src/state_space_practice/tests/test_point_process_kalman.py -v
+uv run pytest src/state_space_practice/tests/test_kalman.py src/state_space_practice/tests/test_switching_kalman.py src/state_space_practice/tests/test_point_process_kalman.py -v
 ```
 
 Exit gate:
 
 ```bash
 # Same tests must still pass, plus new stability regression tests
-conda run -n state_space_practice pytest src/state_space_practice/tests/ -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/ -v
+uv run ruff check src/state_space_practice
 ```
 
 Stop condition:
@@ -293,14 +229,14 @@ Stop condition:
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_place_field_model.py src/state_space_practice/tests/test_kalman.py -v
+uv run pytest src/state_space_practice/tests/test_place_field_model.py src/state_space_practice/tests/test_kalman.py -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_cross_session_drift.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/test_cross_session_drift.py -v
+uv run ruff check src/state_space_practice
 ```
 
 Stop condition:
@@ -320,14 +256,14 @@ Stop condition:
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/ -v
+uv run pytest src/state_space_practice/tests/ -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/ -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/ -v
+uv run ruff check src/state_space_practice
 ```
 
 Stop conditions:
@@ -340,14 +276,14 @@ Stop conditions:
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_multinomial_choice.py src/state_space_practice/tests/test_covariate_choice.py src/state_space_practice/tests/test_switching_kalman.py -v
+uv run pytest src/state_space_practice/tests/test_multinomial_choice.py src/state_space_practice/tests/test_covariate_choice.py src/state_space_practice/tests/test_switching_kalman.py -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_contingency_belief.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/test_contingency_belief.py -v
+uv run ruff check src/state_space_practice
 ```
 
 Stop condition:
@@ -359,14 +295,14 @@ Stop condition:
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_covariate_choice.py src/state_space_practice/tests/test_multinomial_choice.py src/state_space_practice/tests/test_switching_kalman.py -v
+uv run pytest src/state_space_practice/tests/test_covariate_choice.py src/state_space_practice/tests/test_multinomial_choice.py src/state_space_practice/tests/test_switching_kalman.py -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_switching_choice.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/test_switching_choice.py -v
+uv run ruff check src/state_space_practice
 ```
 
 Stop conditions:
@@ -379,14 +315,14 @@ Stop conditions:
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_smith_learning_algorithm.py src/state_space_practice/tests/test_place_field_model.py src/state_space_practice/tests/test_switching_kalman.py -v
+uv run pytest src/state_space_practice/tests/test_smith_learning_algorithm.py src/state_space_practice/tests/test_place_field_model.py src/state_space_practice/tests/test_switching_kalman.py -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_state_dependent_learning.py src/state_space_practice/tests/test_joint_discrete_state.py src/state_space_practice/tests/test_state_dependent_drift.py src/state_space_practice/tests/test_joint_learning_drift_model.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/test_state_dependent_learning.py src/state_space_practice/tests/test_joint_discrete_state.py src/state_space_practice/tests/test_state_dependent_drift.py src/state_space_practice/tests/test_joint_learning_drift_model.py -v
+uv run ruff check src/state_space_practice
 ```
 
 Stop condition:
@@ -398,14 +334,14 @@ Stop condition:
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_position_decoder.py -v
+uv run pytest src/state_space_practice/tests/test_position_decoder.py -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_adaptive_decoder.py src/state_space_practice/tests/test_position_decoder.py src/state_space_practice/tests/test_place_field_model.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/test_adaptive_decoder.py src/state_space_practice/tests/test_position_decoder.py src/state_space_practice/tests/test_place_field_model.py -v
+uv run ruff check src/state_space_practice
 ```
 
 Stop condition:
@@ -417,15 +353,15 @@ Stop condition:
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_oscillator_models.py src/state_space_practice/tests/test_oscillator_utils.py -v
+uv run pytest src/state_space_practice/tests/test_oscillator_models.py src/state_space_practice/tests/test_oscillator_utils.py -v
 # AND: P1 oscillator SGD tasks 5-6 must be complete
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_oscillator_regularization.py src/state_space_practice/tests/test_oscillator_models.py src/state_space_practice/tests/test_oscillator_utils.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/test_oscillator_regularization.py src/state_space_practice/tests/test_oscillator_models.py src/state_space_practice/tests/test_oscillator_utils.py -v
+uv run ruff check src/state_space_practice
 ```
 
 Stop condition:
@@ -437,14 +373,14 @@ Stop condition:
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_multinomial_choice.py src/state_space_practice/tests/test_place_field_model.py src/state_space_practice/tests/test_point_process_kalman.py -v
+uv run pytest src/state_space_practice/tests/test_multinomial_choice.py src/state_space_practice/tests/test_place_field_model.py src/state_space_practice/tests/test_point_process_kalman.py -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_joint_belief_decoder.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/test_joint_belief_decoder.py -v
+uv run ruff check src/state_space_practice
 ```
 
 Stop condition:
@@ -456,14 +392,14 @@ Stop condition:
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_cross_session_drift.py src/state_space_practice/tests/test_place_field_model.py -v
+uv run pytest src/state_space_practice/tests/test_cross_session_drift.py src/state_space_practice/tests/test_place_field_model.py -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_covariate_drift.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/test_covariate_drift.py -v
+uv run ruff check src/state_space_practice
 ```
 
 Stop condition:
@@ -475,14 +411,14 @@ Stop condition:
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_multinomial_choice.py src/state_space_practice/tests/test_place_field_model.py -v
+uv run pytest src/state_space_practice/tests/test_multinomial_choice.py src/state_space_practice/tests/test_place_field_model.py -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_spatial_value_model.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/test_spatial_value_model.py -v
+uv run ruff check src/state_space_practice
 ```
 
 Stop condition:
@@ -494,14 +430,14 @@ Stop condition:
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_switching_point_process.py src/state_space_practice/tests/test_oscillator_utils.py -v
+uv run pytest src/state_space_practice/tests/test_switching_point_process.py src/state_space_practice/tests/test_oscillator_utils.py -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_multi_region_model.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/test_multi_region_model.py -v
+uv run ruff check src/state_space_practice
 ```
 
 Stop condition:
@@ -515,7 +451,7 @@ Stop condition:
 Exit gate (passes as of 2026-04-16):
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_hamiltonian_spikes.py src/state_space_practice/tests/test_hamiltonian_lfp.py src/state_space_practice/tests/test_hamiltonian_joint.py -v
+uv run pytest src/state_space_practice/tests/test_hamiltonian_spikes.py src/state_space_practice/tests/test_hamiltonian_lfp.py src/state_space_practice/tests/test_hamiltonian_joint.py -v
 ```
 
 34 tests pass, including `TestHamiltonianVsLinearBaseline::test_nonlinear_beats_linear_on_duffing_oscillator` which closes V1 plan success criterion 5.
@@ -525,7 +461,7 @@ conda run -n state_space_practice pytest src/state_space_practice/tests/test_ham
 Exit gate (passes as of 2026-04-16):
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_hamiltonian_switching.py -v
+uv run pytest src/state_space_practice/tests/test_hamiltonian_switching.py -v
 ```
 
 All Phase 1–6 items verified: runtime-crash fixes, multi-oscillator state layout, PRNG split, probability-weighted Jacobian in switching smoother (verified by `test_smooth_sensitive_to_transition_asymmetry`), smoke tests for LFP/Joint, API cleanup.
@@ -537,14 +473,14 @@ All Phase 1–6 items verified: runtime-crash fixes, multi-oscillator state layo
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_position_decoder.py src/state_space_practice/tests/test_switching_kalman.py src/state_space_practice/tests/test_point_process_kalman.py -v
+uv run pytest src/state_space_practice/tests/test_position_decoder.py src/state_space_practice/tests/test_switching_kalman.py src/state_space_practice/tests/test_point_process_kalman.py -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_ca1_represented_state.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/test_ca1_represented_state.py -v
+uv run ruff check src/state_space_practice
 ```
 
 Stop condition:
@@ -556,14 +492,14 @@ Stop condition:
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_ca1_represented_state.py src/state_space_practice/tests/test_multinomial_choice.py -v
+uv run pytest src/state_space_practice/tests/test_ca1_represented_state.py src/state_space_practice/tests/test_multinomial_choice.py -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_value_gated_sequence.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/test_value_gated_sequence.py -v
+uv run ruff check src/state_space_practice
 ```
 
 Stop condition:
@@ -575,14 +511,14 @@ Stop condition:
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_ca1_represented_state.py src/state_space_practice/tests/test_joint_belief_decoder.py -v
+uv run pytest src/state_space_practice/tests/test_ca1_represented_state.py src/state_space_practice/tests/test_joint_belief_decoder.py -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_dual_latent_coupling.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/test_dual_latent_coupling.py -v
+uv run ruff check src/state_space_practice
 ```
 
 #### S4: Hierarchical Multi-Timescale (deferred)
@@ -590,14 +526,14 @@ conda run -n state_space_practice ruff check src/state_space_practice
 Entry gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_ca1_represented_state.py src/state_space_practice/tests/test_multinomial_choice.py -v
+uv run pytest src/state_space_practice/tests/test_ca1_represented_state.py src/state_space_practice/tests/test_multinomial_choice.py -v
 ```
 
 Exit gate:
 
 ```bash
-conda run -n state_space_practice pytest src/state_space_practice/tests/test_hierarchical_timescale.py -v
-conda run -n state_space_practice ruff check src/state_space_practice
+uv run pytest src/state_space_practice/tests/test_hierarchical_timescale.py -v
+uv run ruff check src/state_space_practice
 ```
 
 ## Completion Definition

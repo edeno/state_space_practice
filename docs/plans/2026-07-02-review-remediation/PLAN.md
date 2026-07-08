@@ -1,14 +1,18 @@
 # Review-Remediation Implementation Plan
 
-**Status:** Not started.
+**Status:** Mostly shipped in code. Fast suite green on 2026-07-08
+(`1777 passed, 184 deselected` with `uv run pytest -m "not slow" --tb=short`).
+This plan is retained as the historical phase plan; remaining items are deferred
+hygiene or in-jit guard follow-ups, not active blockers.
 
-Fixes the findings from the 2026-07-02 comprehensive library review
+Tracks remediation for the findings from the 2026-07-02 comprehensive library review
 ([report](../../reviews/2026-07-02-comprehensive-review.md)). The library's core math
-was verified correct; this work restores a green test suite, fixes one latent
-correctness bug (`CorrelatedNoiseModel` builds an invalid covariance), makes silent
-numerical-divergence handling loud, applies covariance/probability invariant validation
-consistently, and clears a backlog of statistical-validity, documentation, and
-behavior-preserving simplification items. Each phase ships as an independent PR.
+was verified correct; this work restored a green test suite, fixed one latent
+correctness bug (`CorrelatedNoiseModel` built an invalid covariance), made silent
+numerical-divergence handling louder, applied covariance/probability invariant
+validation more consistently, and cleared a backlog of statistical-validity,
+documentation, and behavior-preserving simplification items. The phase files
+remain useful for audit context and deferred cleanup.
 
 ## Reading order
 
