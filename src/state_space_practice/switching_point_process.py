@@ -2937,6 +2937,22 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         # obs argument is required but not used for dynamics updates
         # We pass a dummy array since we don't use measurement_matrix/cov outputs
         n_time = self.smoother_state_cond_mean.shape[0]
+
+        if n_time < 2:
+            # A single time bin carries no transition information, so A, Q, and
+            # the discrete transition matrix are unidentifiable and are left
+            # unchanged (switching_kalman_maximization_step would raise). The
+            # initial-state quantities are still well defined: they are just the
+            # smoother posterior at t=0, so honor their update flags here and
+            # skip the transition/process-noise estimator entirely. This lets a
+            # spike-only one-bin fit (all dynamics flags disabled) proceed.
+            if self.update_init_mean:
+                self.init_mean = self.smoother_state_cond_mean[0]
+            if self.update_init_cov:
+                self.init_cov = self.smoother_state_cond_cov[0]
+            self.init_discrete_state_prob = self.smoother_discrete_state_prob[0]
+            return
+
         dummy_obs = jnp.zeros((n_time, 1))
 
         (

@@ -3119,6 +3119,67 @@ class TestSecondOrderClippedWarmStart:
         assert abs(float(baseline) - optimum) < 0.05
 
 
+class TestOneTimestepDynamicsMStep:
+    """A one-bin fit must not crash in the dynamics M-step.
+
+    ``switching_kalman_maximization_step`` needs >= 2 timesteps to estimate
+    transition and process-noise parameters, but a single time bin carries no
+    transition information. ``_m_step_dynamics`` must skip that estimator for
+    one-bin data instead of calling it unconditionally, which raised even when
+    every dynamics/initial-state update flag was disabled and only the spike
+    GLM needed fitting.
+    """
+
+    @staticmethod
+    def _one_bin_model(**overrides):
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        kwargs = dict(
+            n_oscillators=1,
+            n_neurons=2,
+            n_discrete_states=1,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+        kwargs.update(overrides)
+        return SwitchingSpikeOscillatorModel(**kwargs)
+
+    def test_spike_only_one_bin_fit_completes(self) -> None:
+        model = self._one_bin_model(
+            update_continuous_transition_matrix=False,
+            update_process_cov=False,
+            update_discrete_transition_matrix=False,
+            update_init_mean=False,
+            update_init_cov=False,
+            update_spike_params=True,
+        )
+        one_bin = jax.random.poisson(jax.random.PRNGKey(0), 1.0, shape=(1, 2)).astype(
+            float
+        )
+        log_likelihoods = model.fit(one_bin, max_iter=1, key=jax.random.PRNGKey(1))
+        assert len(log_likelihoods) >= 1
+        assert all(jnp.isfinite(ll) for ll in log_likelihoods)
+
+    def test_one_bin_updates_estimable_initial_state(self) -> None:
+        """With one bin, A/Q/Z are unidentifiable but the initial state is not:
+        the initial mean must be set to the smoother posterior at t=0."""
+        model = self._one_bin_model(update_init_mean=True)
+        one_bin = jax.random.poisson(jax.random.PRNGKey(2), 1.0, shape=(1, 2)).astype(
+            float
+        )
+        model._initialize_parameters(jax.random.PRNGKey(3))
+        model._e_step(one_bin)
+        init_mean_before = model.init_mean
+        expected_init_mean = model.smoother_state_cond_mean[0]
+        model._m_step_dynamics()
+
+        # Guard: the smoother actually moved the mean, so equality is non-vacuous.
+        assert not jnp.allclose(init_mean_before, expected_init_mean)
+        np.testing.assert_allclose(model.init_mean, expected_init_mean)
+
+
 class TestDynamicsMStepReuse:
     """Tests for dynamics M-step reuse with point-process observations.
 
