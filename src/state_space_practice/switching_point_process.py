@@ -349,6 +349,66 @@ def _validate_switching_point_process_filter_shapes(
             )
 
 
+def _validate_discrete_state_transitions(
+    discrete_transition_matrix: Array,
+    init_discrete_state_prob: Array,
+    dt: float,
+    tol: float = 1e-6,
+) -> None:
+    """Validate discrete-state probabilities and ``dt`` before the jitted filter.
+
+    Shape checks live inside the jitted filter (they run at trace time on
+    static shapes). Value checks cannot: under ``jax.jit`` / ``grad`` the arrays
+    are tracers with no concrete value, so a Python-level ``raise`` is
+    impossible. This helper runs eagerly and is a deliberate no-op when handed
+    tracers -- i.e. when it is reached from inside a traced hot path such as the
+    SGD loss, whose transition matrix is re-projected to be row-stochastic on
+    every step.
+
+    Guards against silent likelihood corruption: an unnormalized transition
+    matrix whose rows sum to ``s`` inflates the reported marginal
+    log-likelihood by ``(T - 1) * log(s)`` with no other visible symptom,
+    because the HMM forward recursion renormalizes the discrete posterior at
+    every step.
+    """
+    # Skip while tracing: tracers carry no concrete value to check, and traced
+    # callers pass parameters that are kept normalized by construction.
+    if isinstance(discrete_transition_matrix, jax.core.Tracer) or isinstance(
+        init_discrete_state_prob, jax.core.Tracer
+    ):
+        return
+
+    dt_arr = jnp.asarray(dt)
+    if not bool(jnp.isfinite(dt_arr)) or float(dt_arr) <= 0.0:
+        raise ValueError(f"dt must be a positive, finite value, got {dt}.")
+
+    Z = jnp.asarray(discrete_transition_matrix)
+    if not bool(jnp.all(jnp.isfinite(Z))):
+        raise ValueError("discrete_transition_matrix must be finite.")
+    if bool(jnp.any(Z < -tol)) or bool(jnp.any(Z > 1.0 + tol)):
+        raise ValueError(
+            "discrete_transition_matrix entries must be probabilities in [0, 1]."
+        )
+    row_sums = jnp.sum(Z, axis=1)
+    if not bool(jnp.all(jnp.abs(row_sums - 1.0) <= tol)):
+        raise ValueError(
+            "discrete_transition_matrix rows must each sum to 1; got row sums "
+            f"{list(map(float, row_sums))}."
+        )
+
+    pi = jnp.asarray(init_discrete_state_prob)
+    if not bool(jnp.all(jnp.isfinite(pi))):
+        raise ValueError("init_discrete_state_prob must be finite.")
+    if bool(jnp.any(pi < -tol)) or bool(jnp.any(pi > 1.0 + tol)):
+        raise ValueError(
+            "init_discrete_state_prob entries must be probabilities in [0, 1]."
+        )
+    if not bool(jnp.abs(jnp.sum(pi) - 1.0) <= tol):
+        raise ValueError(
+            f"init_discrete_state_prob must sum to 1; got {float(jnp.sum(pi))}."
+        )
+
+
 @dataclass
 class QRegularizationConfig:
     """Configuration for trust-region regularization of dynamics covariances.
@@ -1755,7 +1815,7 @@ def update_spike_glm_params_mixture(
         "max_newton_iter",
     ],
 )
-def switching_point_process_filter(
+def _switching_point_process_filter_jit(
     init_state_cond_mean: Array,
     init_state_cond_cov: Array,
     init_discrete_state_prob: Array,
@@ -2092,6 +2152,64 @@ def switching_point_process_filter(
         pair_cond_filter_cov,  # full pair-conditional cov trajectory
         pair_cond_filter_prob,  # full pair-filter discrete trajectory
         marginal_log_likelihood,
+    )
+
+
+def switching_point_process_filter(
+    init_state_cond_mean: Array,
+    init_state_cond_cov: Array,
+    init_discrete_state_prob: Array,
+    spikes: Array,
+    discrete_transition_matrix: Array,
+    continuous_transition_matrix: Array,
+    process_cov: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
+    include_laplace_normalization: bool = True,
+    max_newton_iter: int = 1,
+    line_search_beta: float = 0.5,
+) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
+    """Switching point-process Kalman filter for spike observations.
+
+    Thin, eagerly-evaluated wrapper around the jitted core
+    ``_switching_point_process_filter_jit`` (see that function for the full
+    algorithm, time-indexing convention, return-value layout, and performance
+    notes -- in particular, pass the *same* ``log_intensity_func`` object across
+    calls so the core stays cached). The core carries the ``jax.jit``
+    decoration; this wrapper adds one thing before delegating: it validates the
+    discrete-state probabilities and ``dt`` via
+    ``_validate_discrete_state_transitions``.
+
+    That validation cannot live inside the jitted core because value checks on
+    traced arrays cannot raise. It runs here, eagerly, and is skipped when the
+    inputs are tracers (e.g. when this wrapper is reached from inside a traced
+    SGD loss), so differentiating through the filter is unaffected. Without it,
+    an unnormalized transition matrix silently inflates the reported marginal
+    log-likelihood by ``(T - 1) * log(row_sum)``.
+
+    Returns
+    -------
+    tuple of Array
+        Same 7-tuple as ``_switching_point_process_filter_jit``.
+    """
+    _validate_discrete_state_transitions(
+        discrete_transition_matrix, init_discrete_state_prob, dt
+    )
+    return _switching_point_process_filter_jit(
+        init_state_cond_mean,
+        init_state_cond_cov,
+        init_discrete_state_prob,
+        spikes,
+        discrete_transition_matrix,
+        continuous_transition_matrix,
+        process_cov,
+        dt,
+        log_intensity_func,
+        spike_params,
+        include_laplace_normalization=include_laplace_normalization,
+        max_newton_iter=max_newton_iter,
+        line_search_beta=line_search_beta,
     )
 
 

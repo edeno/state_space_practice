@@ -1478,6 +1478,75 @@ class TestSwitchingPointProcessFilter:
                 spike_params,
             )
 
+    @staticmethod
+    def _valid_filter_inputs():
+        """Minimal valid two-state inputs for the filter (dt=0.02)."""
+        n_latent, n_neurons, n_discrete_states = 2, 3, 2
+        return dict(
+            init_state_cond_mean=jnp.zeros((n_latent, n_discrete_states)),
+            init_state_cond_cov=jnp.stack(
+                [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+            ),
+            init_discrete_state_prob=jnp.array([0.5, 0.5]),
+            spikes=jnp.ones((5, n_neurons)),
+            discrete_transition_matrix=jnp.array([[0.9, 0.1], [0.2, 0.8]]),
+            continuous_transition_matrix=jnp.stack(
+                [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+            ),
+            process_cov=jnp.stack(
+                [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
+            ),
+            dt=0.02,
+            log_intensity_func=linear_log_intensity,
+            spike_params=SpikeObsParams(
+                baseline=jnp.zeros(n_neurons),
+                weights=jnp.zeros((n_neurons, n_latent)),
+            ),
+        )
+
+    def test_non_stochastic_transition_matrix_raises(self) -> None:
+        """A transition row that does not sum to 1 must raise, not silently
+        inflate the marginal log-likelihood by (T-1)*log(row_sum)."""
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        kwargs = self._valid_filter_inputs()
+        # Row 0 sums to 2.0 -> would inflate the reported LL if unchecked.
+        kwargs["discrete_transition_matrix"] = jnp.array([[1.0, 1.0], [0.2, 0.8]])
+        with pytest.raises(ValueError, match="row"):
+            switching_point_process_filter(**kwargs)
+
+    def test_init_discrete_prob_not_summing_to_one_raises(self) -> None:
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        kwargs = self._valid_filter_inputs()
+        kwargs["init_discrete_state_prob"] = jnp.array([0.5, 0.9])
+        with pytest.raises(ValueError, match="init_discrete_state_prob"):
+            switching_point_process_filter(**kwargs)
+
+    def test_nonpositive_dt_raises(self) -> None:
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        kwargs = self._valid_filter_inputs()
+        kwargs["dt"] = 0.0
+        with pytest.raises(ValueError, match="dt"):
+            switching_point_process_filter(**kwargs)
+
+    def test_valid_transition_matrix_still_runs(self) -> None:
+        """Guard: the validated path must not reject legitimate inputs."""
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        kwargs = self._valid_filter_inputs()
+        result = switching_point_process_filter(**kwargs)
+        assert jnp.isfinite(result[6])
+
     def test_pair_filter_prob_matches_hmm_two_slice_oracle(self) -> None:
         """Baseline-only per-state emissions should match exact HMM two-slice posteriors."""
         from state_space_practice.switching_point_process import (
