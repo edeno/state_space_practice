@@ -1547,6 +1547,67 @@ class TestSwitchingPointProcessFilter:
         result = switching_point_process_filter(**kwargs)
         assert jnp.isfinite(result[6])
 
+    @pytest.mark.parametrize(
+        "field, value, match",
+        [
+            (
+                "discrete_transition_matrix",
+                jnp.array([[jnp.nan, 0.0], [0.2, 0.8]]),
+                "finite",
+            ),
+            (
+                "discrete_transition_matrix",
+                jnp.array([[1.2, -0.2], [0.2, 0.8]]),  # row sums to 1 but out of [0,1]
+                "probabilities",
+            ),
+            ("init_discrete_state_prob", jnp.array([jnp.nan, 0.5]), "finite"),
+            ("init_discrete_state_prob", jnp.array([1.5, -0.5]), "probabilities"),
+            ("dt", float("nan"), "dt"),
+        ],
+    )
+    def test_filter_rejects_invalid_probability_inputs(
+        self, field, value, match
+    ) -> None:
+        """Each value-validation branch raises its own clear error."""
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        kwargs = self._valid_filter_inputs()
+        kwargs[field] = value
+        with pytest.raises(ValueError, match=match):
+            switching_point_process_filter(**kwargs)
+
+    def test_validation_skipped_under_trace(self) -> None:
+        """The value validator must be a no-op on tracers, so the wrapper stays
+        jittable/differentiable (the SGD-loss path). A jitted+grad call on valid
+        inputs must succeed without a tracer-concretization error."""
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        kwargs = self._valid_filter_inputs()
+
+        @jax.jit
+        def marginal_ll(Z):
+            out = switching_point_process_filter(
+                init_state_cond_mean=kwargs["init_state_cond_mean"],
+                init_state_cond_cov=kwargs["init_state_cond_cov"],
+                init_discrete_state_prob=kwargs["init_discrete_state_prob"],
+                spikes=kwargs["spikes"],
+                discrete_transition_matrix=Z,
+                continuous_transition_matrix=kwargs["continuous_transition_matrix"],
+                process_cov=kwargs["process_cov"],
+                dt=kwargs["dt"],
+                log_intensity_func=kwargs["log_intensity_func"],
+                spike_params=kwargs["spike_params"],
+            )
+            return out[6]
+
+        Z = kwargs["discrete_transition_matrix"]
+        assert jnp.isfinite(marginal_ll(Z))  # traced Z -> validator skipped
+        assert jnp.all(jnp.isfinite(jax.grad(marginal_ll)(Z)))
+
     def test_pair_filter_prob_matches_hmm_two_slice_oracle(self) -> None:
         """Baseline-only per-state emissions should match exact HMM two-slice posteriors."""
         from state_space_practice.switching_point_process import (
@@ -3077,12 +3138,12 @@ class TestSecondOrderClippedWarmStart:
         smoother_mean = jnp.zeros((n_time, 1))  # zero latent -> eta = baseline
         smoother_cov = jnp.zeros((n_time, 1, 1))
 
-        # Guard: the warm start really is in the previously-clipped region.
-        assert 25.0 > 20.0
-
+        # Warm start baseline=25 sits above the old +/-20 clip, where the update
+        # used to freeze. Newton drops eta by ~1 per step, so ~30 steps reach the
+        # optimum; 60 leaves margin. (The step is not jitted, so keep this small.)
         baseline = jnp.asarray(25.0)
         weights = jnp.zeros((1,))
-        for _ in range(200):
+        for _ in range(60):
             baseline, weights = _single_neuron_glm_step_second_order(
                 baseline, weights, y_n, smoother_mean, smoother_cov, dt
             )
@@ -3105,7 +3166,7 @@ class TestSecondOrderClippedWarmStart:
 
         baseline = jnp.asarray(25.0)
         weights = jnp.zeros((1,))
-        for _ in range(200):
+        for _ in range(60):
             baseline, weights = _single_neuron_glm_step_second_order_mixture(
                 baseline,
                 weights,
@@ -3117,6 +3178,32 @@ class TestSecondOrderClippedWarmStart:
             )
 
         assert abs(float(baseline) - optimum) < 0.05
+
+    def test_exp_safe_clip_tracks_dtype_overflow_limit(self) -> None:
+        """The bound must be the dtype's overflow limit (~708 for f64, ~88 for
+        f32), not a small fixed value -- a fixed bound > 25 would pass the
+        convergence tests above while reintroducing the freeze for larger warm
+        starts."""
+        from state_space_practice.switching_point_process import _exp_safe_clip
+
+        # float64 (tests run under x64): bound ~ log(finfo.max) - 1 ~ 708.8.
+        f64_bound = float(_exp_safe_clip(jnp.asarray(1e6)))
+        assert 700.0 < f64_bound < 709.0
+        assert jnp.isfinite(jnp.exp(_exp_safe_clip(jnp.asarray(1e6))))
+        assert jnp.isfinite(jnp.exp(_exp_safe_clip(jnp.asarray(-1e6))))
+
+        # Adapts to dtype: float32 overflow is far lower (~88).
+        f32_bound = float(_exp_safe_clip(jnp.asarray(1e6, dtype=jnp.float32)))
+        assert 80.0 < f32_bound < 89.0
+        assert jnp.isfinite(
+            jnp.exp(_exp_safe_clip(jnp.asarray(1e6, dtype=jnp.float32)))
+        )
+
+        # Values inside the representable range pass through unchanged, so the
+        # convex objective is undistorted where the optimizer operates (100 > the
+        # old +/-20 clip but far below the overflow bound).
+        for eta in (-30.0, 0.0, 25.0, 100.0):
+            assert float(_exp_safe_clip(jnp.asarray(eta))) == pytest.approx(eta)
 
 
 class TestOneTimestepDynamicsMStep:
@@ -3146,6 +3233,7 @@ class TestOneTimestepDynamicsMStep:
         kwargs.update(overrides)
         return SwitchingSpikeOscillatorModel(**kwargs)
 
+    @pytest.mark.slow
     def test_spike_only_one_bin_fit_completes(self) -> None:
         model = self._one_bin_model(
             update_continuous_transition_matrix=False,
@@ -3164,20 +3252,27 @@ class TestOneTimestepDynamicsMStep:
 
     def test_one_bin_updates_estimable_initial_state(self) -> None:
         """With one bin, A/Q/Z are unidentifiable but the initial state is not:
-        the initial mean must be set to the smoother posterior at t=0."""
-        model = self._one_bin_model(update_init_mean=True)
+        init mean and cov must be set to the smoother posterior at t=0, and the
+        initial discrete prob must be renormalized to sum to 1."""
+        model = self._one_bin_model(update_init_mean=True, update_init_cov=True)
         one_bin = jax.random.poisson(jax.random.PRNGKey(2), 1.0, shape=(1, 2)).astype(
             float
         )
         model._initialize_parameters(jax.random.PRNGKey(3))
         model._e_step(one_bin)
         init_mean_before = model.init_mean
+        init_cov_before = model.init_cov
         expected_init_mean = model.smoother_state_cond_mean[0]
+        expected_init_cov = model.smoother_state_cond_cov[0]
         model._m_step_dynamics()
 
-        # Guard: the smoother actually moved the mean, so equality is non-vacuous.
+        # Guards: the smoother actually moved mean and cov, so equality below is
+        # non-vacuous.
         assert not jnp.allclose(init_mean_before, expected_init_mean)
+        assert not jnp.allclose(init_cov_before, expected_init_cov)
         np.testing.assert_allclose(model.init_mean, expected_init_mean)
+        np.testing.assert_allclose(model.init_cov, expected_init_cov)
+        np.testing.assert_allclose(float(jnp.sum(model.init_discrete_state_prob)), 1.0)
 
 
 class TestDynamicsMStepReuse:
@@ -9191,6 +9286,53 @@ class TestSwitchingSpikeOscillatorSGD:
 
         delta = sgd_loss(prior_l2) - sgd_loss(0.0)
         assert expected_penalty > 1.0  # guard: the penalty is actually meaningful
+        assert delta == pytest.approx(expected_penalty, rel=1e-5)
+
+    def test_sgd_loss_baseline_prior_per_state_broadcast(self):
+        """With per-state baselines (separate_spike_params=True), the (n_neurons,)
+        prior is reshaped to (n_neurons, 1) and broadcast across the discrete-
+        state axis -- the same per-neuron prior applied to every state, matching
+        EM. n_neurons != n_discrete_states so a wrong reshape raises instead of
+        silently mis-broadcasting."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            SwitchingSpikeOscillatorModel,
+        )
+
+        dt = 0.01
+        n_neurons, n_states = 3, 2
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(4), 2.0, shape=(20, n_neurons)
+        ).astype(float)
+        prior_l2 = 500.0
+        far_baseline = 25.0
+
+        def sgd_loss(l2):
+            model = SwitchingSpikeOscillatorModel(
+                n_oscillators=1,
+                n_neurons=n_neurons,
+                n_discrete_states=n_states,
+                sampling_freq=100.0,
+                dt=dt,
+                separate_spike_params=True,
+                spike_baseline_prior_l2=l2,
+            )
+            model._initialize_parameters(jax.random.PRNGKey(0))
+            model.spike_params = SpikeObsParams(
+                baseline=jnp.full_like(model.spike_params.baseline, far_baseline),
+                weights=model.spike_params.weights,
+            )
+            params, _ = model._build_param_spec()
+            return float(model._sgd_loss_fn(params, spikes))
+
+        baseline_prior = jnp.log(jnp.mean(spikes, axis=0) / dt + 1e-10)  # (n_neurons,)
+        full = jnp.full((n_neurons, n_states), far_baseline)
+        expected_penalty = float(
+            0.5 * prior_l2 * jnp.sum((full - baseline_prior[:, None]) ** 2)
+        )
+
+        delta = sgd_loss(prior_l2) - sgd_loss(0.0)
+        assert expected_penalty > 1.0
         assert delta == pytest.approx(expected_penalty, rel=1e-5)
 
 

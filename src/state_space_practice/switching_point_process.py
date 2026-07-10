@@ -175,9 +175,11 @@ def _linear_log_intensity(state: Array, params: SpikeObsParams) -> Array:
     """Linear log-intensity model: ``log(lambda) = baseline + weights @ state``.
 
     Defined once at module level rather than as a per-call closure so that it
-    has a stable object identity. ``switching_point_process_filter`` receives
-    ``log_intensity_func`` as a *static* jit argument, which JAX caches by
-    identity; a fresh closure on every E-step would miss that cache and force a
+    has a stable object identity. The jitted filter core
+    ``_switching_point_process_filter_jit`` receives ``log_intensity_func`` as a
+    *static* jit argument, which JAX caches by identity (the public
+    ``switching_point_process_filter`` wrapper forwards the object unchanged); a
+    fresh closure on every E-step would miss that cache and force a
     full retrace/recompile of the filter on every EM iteration. The observation
     parameters flow through ``params`` (a registered pytree, passed as data), so
     EM updates take effect without recompilation.
@@ -2814,9 +2816,9 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         """
 
         # Run the switching point-process filter. ``_linear_log_intensity`` is a
-        # single module-level object (not a per-call closure): the filter takes
-        # it as a static jit argument cached by identity, so reusing the same
-        # object avoids recompiling the filter on every EM iteration.
+        # single module-level object (not a per-call closure): the jitted filter
+        # core takes it as a static jit argument cached by identity, so reusing
+        # the same object avoids recompiling the filter on every EM iteration.
         (
             state_cond_filter_mean,
             state_cond_filter_cov,
@@ -2950,7 +2952,10 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 self.init_mean = self.smoother_state_cond_mean[0]
             if self.update_init_cov:
                 self.init_cov = self.smoother_state_cond_cov[0]
-            self.init_discrete_state_prob = self.smoother_discrete_state_prob[0]
+            # Renormalize as the >=2-step M-step does, so the vector fed back
+            # into the next E-step's input validator sums to exactly 1.
+            init_prob = self.smoother_discrete_state_prob[0]
+            self.init_discrete_state_prob = init_prob / jnp.sum(init_prob)
             return
 
         dummy_obs = jnp.zeros((n_time, 1))
