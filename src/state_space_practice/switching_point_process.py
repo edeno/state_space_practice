@@ -820,6 +820,28 @@ def _first_timestep_point_process_update(
     )
 
 
+def _exp_safe_clip(eta: Array) -> Array:
+    """Clip a log-rate to the range where ``exp`` stays finite for its dtype.
+
+    The Poisson GLM Q-function is globally convex, so Newton + Armijo line
+    search converge from any finite warm start. The sole purpose of bounding
+    ``eta`` before ``exp`` is to stop ``exp(eta)`` overflowing to ``+inf``, which
+    would poison the gradient and Hessian with NaNs. A small fixed bound such
+    as ``+/-20`` instead truncates ``exp`` hundreds of orders of magnitude below
+    the true overflow point; above the bound the analytic gradient/Hessian
+    (which assume ``d mu / d eta = mu``) disagree with the clipped objective the
+    line search evaluates, so a warm start beyond the bound silently freezes
+    (the Newton descent direction is rejected by every backtracked step).
+
+    Bounding at the dtype's actual overflow limit keeps the objective and its
+    derivatives consistent across the whole representable range while still
+    preventing overflow. The ``- 1.0`` margin leaves headroom for the ``* dt``
+    scaling applied to ``exp(eta)``.
+    """
+    bound = jnp.log(jnp.finfo(eta.dtype).max) - 1.0
+    return jnp.clip(eta, -bound, bound)
+
+
 def _armijo_line_search(
     params: Array,
     delta: Array,
@@ -1058,12 +1080,12 @@ def _single_neuron_glm_step(
     # Concatenate parameters into a single vector: [baseline, weights]
     params = jnp.concatenate([jnp.atleast_1d(baseline), weights])  # (1 + n_latent,)
 
-    # Compute linear predictor and expected counts. Clip eta before exp to
-    # prevent overflow on a bad warm start or outlier series (matches the
-    # second-order step); the unclipped eta is retained for the linear y*eta
-    # term in the loss below.
+    # Compute linear predictor and expected counts. Bound eta at the dtype's
+    # overflow limit before exp (see _exp_safe_clip) so a bad warm start cannot
+    # produce inf/NaN while leaving the convex objective undistorted; the
+    # unclipped eta is retained for the linear y*eta term in the loss below.
     eta = design_matrix @ params  # (n_time,)
-    eta_safe = jnp.clip(eta, -20.0, 20.0)
+    eta_safe = _exp_safe_clip(eta)
     mu = jnp.exp(eta_safe) * dt  # Expected spike counts (n_time,)
 
     if time_weights is None:
@@ -1102,7 +1124,7 @@ def _single_neuron_glm_step(
     # Define loss function for line search
     def loss_fn(p):
         eta_trial = design_matrix @ p
-        mu_trial = jnp.exp(jnp.clip(eta_trial, -20.0, 20.0)) * dt
+        mu_trial = jnp.exp(_exp_safe_clip(eta_trial)) * dt
         weights_trial = p[1:]
         nll = jnp.sum(time_weights * (mu_trial - y_n * eta_trial))
         l2_penalty = 0.5 * weight_l2 * jnp.sum(weights_trial**2)
@@ -1188,13 +1210,14 @@ def _neg_Q_single_neuron(
     else:
         # Second-order: 0.5 * w^T P_t w for each t
         # This term can be large when smoother covariance P is large, but the
-        # eta clip below (at [-20, 20]) prevents exp overflow regardless.
+        # eta bound below (see _exp_safe_clip) prevents exp overflow regardless.
         quad = 0.5 * jnp.einsum("tij,i,j->t", smoother_cov, w, w)
 
     # Full log-intensity expectation: b + w^T m_t + 0.5 * w^T P_t w
     eta = b + eta_lin + quad  # (n_time,)
-    # Clip eta to prevent overflow: exp(20) ≈ 5e8 (reasonable max count per bin)
-    eta_safe = jnp.clip(eta, -20.0, 20.0)
+    # Bound eta at the dtype's overflow limit to keep exp finite (see
+    # _exp_safe_clip); the convex objective is left undistorted below it.
+    eta_safe = _exp_safe_clip(eta)
     mu = jnp.exp(eta_safe) * dt  # expected counts, (n_time,)
 
     if time_weights is None:
@@ -1284,7 +1307,7 @@ def _single_neuron_glm_step_second_order(
     eta_lin = smoother_mean @ w  # (T,)
     quad = 0.5 * jnp.einsum("tij,i,j->t", smoother_cov, w, w)  # (T,)
     eta = b + eta_lin + quad
-    eta_safe = jnp.clip(eta, -20.0, 20.0)
+    eta_safe = _exp_safe_clip(eta)
     mu = jnp.exp(eta_safe) * dt  # (T,)
 
     if time_weights is None:
@@ -1348,7 +1371,7 @@ def _single_neuron_glm_step_second_order(
         eta_lin_trial = smoother_mean @ w_trial
         quad_trial = 0.5 * jnp.einsum("tij,i,j->t", smoother_cov, w_trial, w_trial)
         eta_trial = b_trial + eta_lin_trial + quad_trial
-        eta_trial_safe = jnp.clip(eta_trial, -20.0, 20.0)
+        eta_trial_safe = _exp_safe_clip(eta_trial)
         mu_trial = jnp.exp(eta_trial_safe) * dt
         loss = jnp.sum(time_weights_val * (mu_trial - y_n * (b_trial + eta_lin_trial)))
         loss += 0.5 * weight_l2 * jnp.dot(w_trial, w_trial)
@@ -1399,7 +1422,7 @@ def _single_neuron_glm_step_second_order_mixture(
     eta_lin = jnp.einsum("tls,l->ts", state_cond_smoother_mean, w)
     quad = 0.5 * jnp.einsum("tlks,l,k->ts", state_cond_smoother_cov, w, w)
     eta = b + eta_lin + quad
-    eta_safe = jnp.clip(eta, -20.0, 20.0)
+    eta_safe = _exp_safe_clip(eta)
     mu = jnp.exp(eta_safe) * dt
 
     weighted_mu = state_weights * mu
@@ -1447,7 +1470,7 @@ def _single_neuron_glm_step_second_order_mixture(
             "tlks,l,k->ts", state_cond_smoother_cov, w_trial, w_trial
         )
         eta_trial = b_trial + eta_lin_trial + quad_trial
-        mu_trial = jnp.exp(jnp.clip(eta_trial, -20.0, 20.0)) * dt
+        mu_trial = jnp.exp(_exp_safe_clip(eta_trial)) * dt
         loss = jnp.sum(
             state_weights * (mu_trial - y_n[:, None] * (b_trial + eta_lin_trial))
         )

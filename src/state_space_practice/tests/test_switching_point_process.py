@@ -2985,6 +2985,71 @@ class TestUpdateSpikeGLMParamsSecondOrder:
             )
 
 
+class TestSecondOrderClippedWarmStart:
+    """Newton M-step must converge from warm starts with a large log-rate.
+
+    The Poisson GLM Q-function is globally convex, so Newton + Armijo line
+    search should converge from any finite warm start. A fixed eta clip at
+    +/-20 truncated exp far below the float overflow point, which made the
+    line-search objective disagree with the analytic gradient/Hessian above
+    the threshold and silently froze the update (regression guard for the
+    clipped-objective / Newton-derivative mismatch).
+    """
+
+    def test_single_neuron_converges_from_clipped_warm_start(self) -> None:
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_step_second_order,
+        )
+
+        n_time = 200
+        dt = 1.0
+        y_n = jnp.full((n_time,), 100.0)  # Poisson MLE baseline = log(100)
+        optimum = float(jnp.log(jnp.mean(y_n) / dt))
+        smoother_mean = jnp.zeros((n_time, 1))  # zero latent -> eta = baseline
+        smoother_cov = jnp.zeros((n_time, 1, 1))
+
+        # Guard: the warm start really is in the previously-clipped region.
+        assert 25.0 > 20.0
+
+        baseline = jnp.asarray(25.0)
+        weights = jnp.zeros((1,))
+        for _ in range(200):
+            baseline, weights = _single_neuron_glm_step_second_order(
+                baseline, weights, y_n, smoother_mean, smoother_cov, dt
+            )
+
+        assert abs(float(baseline) - optimum) < 0.05
+
+    def test_mixture_converges_from_clipped_warm_start(self) -> None:
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_step_second_order_mixture,
+        )
+
+        n_time = 200
+        dt = 1.0
+        y_n = jnp.full((n_time,), 100.0)
+        optimum = float(jnp.log(jnp.mean(y_n) / dt))
+        # Single discrete state: shapes (T, L, S), (T, L, L, S), (T, S).
+        state_cond_mean = jnp.zeros((n_time, 1, 1))
+        state_cond_cov = jnp.zeros((n_time, 1, 1, 1))
+        state_weights = jnp.ones((n_time, 1))
+
+        baseline = jnp.asarray(25.0)
+        weights = jnp.zeros((1,))
+        for _ in range(200):
+            baseline, weights = _single_neuron_glm_step_second_order_mixture(
+                baseline,
+                weights,
+                y_n,
+                state_cond_mean,
+                state_cond_cov,
+                state_weights,
+                dt,
+            )
+
+        assert abs(float(baseline) - optimum) < 0.05
+
+
 class TestDynamicsMStepReuse:
     """Tests for dynamics M-step reuse with point-process observations.
 
