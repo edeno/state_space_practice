@@ -3624,6 +3624,17 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         if self.spike_weight_l2 > 0:
             loss = loss + 0.5 * self.spike_weight_l2 * jnp.sum(weights**2)
 
+        # Spike baseline shrinkage prior (matches EM M-step regularization):
+        # shrink baselines toward the empirical per-neuron log-rate. Without
+        # this term the SGD objective and the EM M-step regularize different
+        # models, so fit() and fit_sgd() would converge to different baselines.
+        if self.spike_baseline_prior_l2 > 0:
+            baseline_prior = jnp.log(jnp.mean(spikes, axis=0) / self.dt + 1e-10)
+            baseline_prior = baseline_prior.reshape((-1,) + (1,) * (baseline.ndim - 1))
+            loss = loss + 0.5 * self.spike_baseline_prior_l2 * jnp.sum(
+                (baseline - baseline_prior) ** 2
+            )
+
         return loss
 
     def _reconstruct_A_from_blocks(self, params: dict) -> Array:

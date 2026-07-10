@@ -9145,6 +9145,54 @@ class TestSwitchingSpikeOscillatorSGD:
         assert jnp.all(jnp.isfinite(model.continuous_transition_matrix))
         assert jnp.all(jnp.isfinite(model.spike_params.baseline))
 
+    def test_sgd_loss_applies_baseline_prior(self):
+        """fit_sgd must optimize the same regularized objective as fit().
+
+        The SGD loss previously added only the weight L2 penalty and ignored
+        ``spike_baseline_prior_l2``, so ``fit`` and ``fit_sgd`` regularized
+        different models. The SGD loss must increase by exactly the baseline
+        shrinkage penalty ``0.5 * l2 * sum((b - b_prior)^2)`` when the prior is
+        enabled and the baseline sits far from the empirical log-rate.
+        """
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            SwitchingSpikeOscillatorModel,
+        )
+
+        dt = 0.01
+        spikes = jax.random.poisson(jax.random.PRNGKey(1), 2.0, shape=(20, 1)).astype(
+            float
+        )
+        prior_l2 = 1000.0
+        far_baseline = 25.0
+
+        def sgd_loss(l2):
+            model = SwitchingSpikeOscillatorModel(
+                n_oscillators=1,
+                n_neurons=1,
+                n_discrete_states=1,
+                sampling_freq=100.0,
+                dt=dt,
+                separate_spike_params=False,
+                spike_baseline_prior_l2=l2,
+            )
+            model._initialize_parameters(jax.random.PRNGKey(0))
+            model.spike_params = SpikeObsParams(
+                baseline=jnp.full_like(model.spike_params.baseline, far_baseline),
+                weights=model.spike_params.weights,
+            )
+            params, _ = model._build_param_spec()
+            return float(model._sgd_loss_fn(params, spikes))
+
+        baseline_prior = jnp.log(jnp.mean(spikes, axis=0) / dt + 1e-10)
+        expected_penalty = float(
+            0.5 * prior_l2 * jnp.sum((far_baseline - baseline_prior) ** 2)
+        )
+
+        delta = sgd_loss(prior_l2) - sgd_loss(0.0)
+        assert expected_penalty > 1.0  # guard: the penalty is actually meaningful
+        assert delta == pytest.approx(expected_penalty, rel=1e-5)
+
 
 class TestSwitchingSpikeOscillatorEMConsistency:
     """Regression guards for the EM cache-identity and rollback-resync fixes."""
