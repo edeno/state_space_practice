@@ -19,9 +19,7 @@ from state_space_practice.switching_point_process import SpikeObsParams
 jax.config.update("jax_enable_x64", True)
 
 
-def linear_log_intensity(
-    state: Array, params: SpikeObsParams
-) -> Array:
+def linear_log_intensity(state: Array, params: SpikeObsParams) -> Array:
     """Linear log-intensity function for testing.
 
     Parameters
@@ -233,7 +231,9 @@ class TestPointProcessKalmanUpdate:
             one_step_mean, one_step_cov, y_t, dt, linear_log_intensity, spike_params
         )
 
-        np.testing.assert_allclose(posterior_cov, posterior_cov.T, rtol=1e-5, atol=1e-10)
+        np.testing.assert_allclose(
+            posterior_cov, posterior_cov.T, rtol=1e-5, atol=1e-10
+        )
 
     def test_covariance_is_positive_definite(self) -> None:
         """Posterior covariance should be positive semi-definite."""
@@ -312,12 +312,22 @@ class TestPointProcessKalmanUpdate:
 
         # Low spikes
         posterior_mean_low, _, _ = point_process_kalman_update(
-            one_step_mean, one_step_cov, jnp.array([0.0]), dt, linear_log_intensity, spike_params
+            one_step_mean,
+            one_step_cov,
+            jnp.array([0.0]),
+            dt,
+            linear_log_intensity,
+            spike_params,
         )
 
         # High spikes
         posterior_mean_high, _, _ = point_process_kalman_update(
-            one_step_mean, one_step_cov, jnp.array([5.0]), dt, linear_log_intensity, spike_params
+            one_step_mean,
+            one_step_cov,
+            jnp.array([5.0]),
+            dt,
+            linear_log_intensity,
+            spike_params,
         )
 
         # With positive weights, high spikes should lead to higher log-intensity
@@ -454,7 +464,9 @@ class TestPointProcessUpdatePerStatePair:
         # Shape: (n_latent, n_discrete_states)
         prev_state_cond_mean = jnp.zeros((n_latent, n_discrete_states))
         # Shape: (n_latent, n_latent, n_discrete_states)
-        prev_state_cond_cov = jnp.stack([jnp.eye(n_latent)] * n_discrete_states, axis=-1)
+        prev_state_cond_cov = jnp.stack(
+            [jnp.eye(n_latent)] * n_discrete_states, axis=-1
+        )
 
         y_t = jnp.ones(n_neurons)
 
@@ -484,7 +496,12 @@ class TestPointProcessUpdatePerStatePair:
 
         # Output shapes should be (n_latent, n_discrete_states, n_discrete_states)
         assert pair_mean.shape == (n_latent, n_discrete_states, n_discrete_states)
-        assert pair_cov.shape == (n_latent, n_latent, n_discrete_states, n_discrete_states)
+        assert pair_cov.shape == (
+            n_latent,
+            n_latent,
+            n_discrete_states,
+            n_discrete_states,
+        )
         assert pair_ll.shape == (n_discrete_states, n_discrete_states)
 
     def test_single_state_matches_base_function(self) -> None:
@@ -511,7 +528,14 @@ class TestPointProcessUpdatePerStatePair:
 
         # Non-vmapped result
         expected_mean, expected_cov, expected_ll = _point_process_predict_and_update(
-            prev_mean_single, prev_cov_single, y_t, A_single, Q_single, dt, linear_log_intensity, spike_params
+            prev_mean_single,
+            prev_cov_single,
+            y_t,
+            A_single,
+            Q_single,
+            dt,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Vmapped result with state dimension
@@ -521,7 +545,14 @@ class TestPointProcessUpdatePerStatePair:
         Q_batched = Q_single[:, :, None]  # (n_latent, n_latent, 1)
 
         pair_mean, pair_cov, pair_ll = _point_process_update_per_discrete_state_pair(
-            prev_mean_batched, prev_cov_batched, y_t, A_batched, Q_batched, dt, linear_log_intensity, spike_params
+            prev_mean_batched,
+            prev_cov_batched,
+            y_t,
+            A_batched,
+            Q_batched,
+            dt,
+            linear_log_intensity,
+            spike_params,
         )
 
         # Should match single result
@@ -548,8 +579,14 @@ class TestPointProcessUpdatePerStatePair:
         prev_cov = jnp.stack([jnp.eye(n_latent) * 0.1] * n_discrete_states, axis=-1)
         y_t = jnp.array([0.0, 1.0, 2.0, 0.0, 1.0])
 
-        A = jnp.stack([jnp.eye(n_latent) * (0.9 + 0.02 * i) for i in range(n_discrete_states)], axis=-1)
-        Q = jnp.stack([jnp.eye(n_latent) * (0.01 + 0.005 * i) for i in range(n_discrete_states)], axis=-1)
+        A = jnp.stack(
+            [jnp.eye(n_latent) * (0.9 + 0.02 * i) for i in range(n_discrete_states)],
+            axis=-1,
+        )
+        Q = jnp.stack(
+            [jnp.eye(n_latent) * (0.01 + 0.005 * i) for i in range(n_discrete_states)],
+            axis=-1,
+        )
 
         weights = jax.random.normal(k2, (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
@@ -706,9 +743,7 @@ class TestSwitchingPointProcessFilter:
             [jnp.eye(n_latent) * (0.9 + 0.03 * i) for i in range(n_discrete_states)],
             axis=-1,
         )
-        process_cov = jnp.stack(
-            [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
-        )
+        process_cov = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
@@ -998,9 +1033,9 @@ class TestSwitchingPointProcessFilter:
         for t in range(n_time):
             for s in range(n_discrete_states):
                 eigvals = jnp.linalg.eigvalsh(state_cond_filter_cov[t, :, :, s])
-                assert jnp.all(
-                    eigvals >= -1e-6
-                ), f"Negative eigenvalue at t={t}, s={s}: {eigvals}"
+                assert jnp.all(eigvals >= -1e-6), (
+                    f"Negative eigenvalue at t={t}, s={s}: {eigvals}"
+                )
 
     def test_pair_conditional_shapes(self) -> None:
         """last_pair_cond_filter_mean should have correct shape for smoother."""
@@ -1025,7 +1060,8 @@ class TestSwitchingPointProcessFilter:
         spikes = jax.random.poisson(key, 0.5, shape=(n_time, n_neurons)).astype(float)
 
         discrete_transition_matrix = (
-            jnp.eye(n_discrete_states) * 0.8 + jnp.ones((n_discrete_states, n_discrete_states)) * 0.2 / n_discrete_states
+            jnp.eye(n_discrete_states) * 0.8
+            + jnp.ones((n_discrete_states, n_discrete_states)) * 0.2 / n_discrete_states
         )
         discrete_transition_matrix = discrete_transition_matrix / jnp.sum(
             discrete_transition_matrix, axis=1, keepdims=True
@@ -1035,9 +1071,7 @@ class TestSwitchingPointProcessFilter:
             [jnp.eye(n_latent) * (0.9 + 0.03 * i) for i in range(n_discrete_states)],
             axis=-1,
         )
-        process_cov = jnp.stack(
-            [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
-        )
+        process_cov = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
@@ -1348,9 +1382,7 @@ class TestSwitchingPointProcessFilter:
         continuous_transition_matrix = jnp.stack(
             [jnp.eye(n_latent)] * n_discrete_states, axis=-1
         )
-        process_cov = jnp.stack(
-            [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
-        )
+        process_cov = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
         spike_params = SpikeObsParams(
             baseline=jnp.zeros(n_neurons),
             weights=jnp.zeros((n_neurons, n_latent)),
@@ -1388,9 +1420,7 @@ class TestSwitchingPointProcessFilter:
         continuous_transition_matrix = jnp.stack(
             [jnp.eye(n_latent)] * n_discrete_states, axis=-1
         )
-        process_cov = jnp.stack(
-            [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
-        )
+        process_cov = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
         spike_params = SpikeObsParams(
             baseline=jnp.zeros(1),
             weights=jnp.zeros((1, n_latent)),
@@ -1428,9 +1458,7 @@ class TestSwitchingPointProcessFilter:
         continuous_transition_matrix = jnp.stack(
             [jnp.eye(n_latent)] * n_discrete_states, axis=-1
         )
-        process_cov = jnp.stack(
-            [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
-        )
+        process_cov = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
         spike_params = SpikeObsParams(
             baseline=jnp.zeros((n_neurons, 1)),
             weights=jnp.zeros((n_neurons, n_latent, 1)),
@@ -1469,9 +1497,7 @@ class TestSwitchingPointProcessFilter:
         continuous_transition_matrix = jnp.stack(
             [jnp.eye(n_latent)] * n_discrete_states, axis=-1
         )
-        process_cov = jnp.stack(
-            [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
-        )
+        process_cov = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
 
         baseline = jnp.log(jnp.array([[2.0, 11.0], [7.0, 1.5]]))
         spike_params = SpikeObsParams(
@@ -1479,18 +1505,20 @@ class TestSwitchingPointProcessFilter:
             weights=jnp.zeros((n_neurons, n_latent, n_discrete_states)),
         )
 
-        _, _, filter_prob, _, _, pair_prob, marginal_ll = switching_point_process_filter(
-            init_state_cond_mean,
-            init_state_cond_cov,
-            init_discrete_state_prob,
-            spikes,
-            discrete_transition_matrix,
-            continuous_transition_matrix,
-            process_cov,
-            dt,
-            linear_log_intensity,
-            spike_params,
-            include_laplace_normalization=False,
+        _, _, filter_prob, _, _, pair_prob, marginal_ll = (
+            switching_point_process_filter(
+                init_state_cond_mean,
+                init_state_cond_cov,
+                init_discrete_state_prob,
+                spikes,
+                discrete_transition_matrix,
+                continuous_transition_matrix,
+                process_cov,
+                dt,
+                linear_log_intensity,
+                spike_params,
+                include_laplace_normalization=False,
+            )
         )
 
         emission_ll = []
@@ -1873,9 +1901,7 @@ class TestSmootherIntegration:
             [jnp.eye(n_latent) * (0.9 + 0.03 * i) for i in range(n_discrete_states)],
             axis=-1,
         )
-        process_cov = jnp.stack(
-            [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
-        )
+        process_cov = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
 
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
         baseline = jnp.zeros(n_neurons)
@@ -1971,7 +1997,9 @@ class TestSingleNeuronGLMLoss:
         y_n = jax.random.poisson(jax.random.PRNGKey(0), 1.0, shape=(n_time,)).astype(
             float
         )
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
 
         baseline = 0.0
         weights = jnp.ones(n_latent) * 0.1
@@ -2032,7 +2060,9 @@ class TestSingleNeuronGLMLoss:
         y_n = jax.random.poisson(jax.random.PRNGKey(0), 0.5, shape=(n_time,)).astype(
             float
         )
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
 
         baseline = 0.0
         weights = jnp.zeros(n_latent)
@@ -2057,7 +2087,9 @@ class TestSingleNeuronGLMLoss:
         dt = 0.02
 
         y_n = jnp.zeros(n_time)  # No spikes
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
 
         baseline = 0.0
         weights = jnp.ones(n_latent) * 0.1
@@ -2080,7 +2112,9 @@ class TestSingleNeuronGLMLoss:
         y_n = jax.random.poisson(jax.random.PRNGKey(0), 20.0, shape=(n_time,)).astype(
             float
         )
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
 
         # Higher baseline to match
         baseline = 3.0
@@ -2189,7 +2223,9 @@ class TestSingleNeuronGLMStep:
         y_n = jax.random.poisson(jax.random.PRNGKey(0), 1.0, shape=(n_time,)).astype(
             float
         )
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
 
         baseline = 0.0
         weights = jnp.ones(n_latent) * 0.1
@@ -2294,7 +2330,9 @@ class TestSingleNeuronGLMStep:
         dt = 0.02
 
         y_n = jnp.zeros(n_time)  # No spikes
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
 
         baseline = 0.0
         weights = jnp.ones(n_latent) * 0.1
@@ -2320,7 +2358,9 @@ class TestSingleNeuronGLMStep:
         y_n = jax.random.poisson(jax.random.PRNGKey(0), 20.0, shape=(n_time,)).astype(
             float
         )
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
 
         baseline = 3.0
         weights = jnp.ones(n_latent) * 0.1
@@ -2353,7 +2393,9 @@ class TestUpdateSpikeGLMParams:
         spikes = jax.random.poisson(key, 0.5, shape=(n_time, n_neurons)).astype(float)
 
         # Smoother mean
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
 
         # Current params
         current_params = SpikeObsParams(
@@ -2383,7 +2425,9 @@ class TestUpdateSpikeGLMParams:
 
         key = jax.random.PRNGKey(0)
         spikes = jax.random.poisson(key, 1.0, shape=(n_time, n_neurons)).astype(float)
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
 
         current_params = SpikeObsParams(
             baseline=jnp.zeros(n_neurons),
@@ -2412,9 +2456,13 @@ class TestUpdateSpikeGLMParams:
 
         # Generate data from known params
         true_baseline = jnp.array([1.0, 0.5, 0.0])
-        true_weights = jax.random.normal(jax.random.PRNGKey(0), (n_neurons, n_latent)) * 0.3
+        true_weights = (
+            jax.random.normal(jax.random.PRNGKey(0), (n_neurons, n_latent)) * 0.3
+        )
 
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
 
         # Generate spikes
         eta = true_baseline[None, :] + smoother_mean @ true_weights.T
@@ -2472,7 +2520,9 @@ class TestUpdateSpikeGLMParams:
         true_baseline = jnp.array([1.0, 0.5])
         true_weights = jnp.array([[0.3, -0.2], [-0.1, 0.4]])
 
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
 
         # Generate spikes from true model
         eta = true_baseline[None, :] + smoother_mean @ true_weights.T
@@ -2494,9 +2544,7 @@ class TestUpdateSpikeGLMParams:
         np.testing.assert_allclose(
             new_params.baseline, true_baseline, atol=0.3, rtol=0.3
         )
-        np.testing.assert_allclose(
-            new_params.weights, true_weights, atol=0.3, rtol=0.3
-        )
+        np.testing.assert_allclose(new_params.weights, true_weights, atol=0.3, rtol=0.3)
 
     def test_single_neuron(self) -> None:
         """Should work with a single neuron."""
@@ -2513,7 +2561,9 @@ class TestUpdateSpikeGLMParams:
         spikes = jax.random.poisson(
             jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
         ).astype(float)
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
 
         current_params = SpikeObsParams(
             baseline=jnp.zeros(n_neurons),
@@ -2542,7 +2592,9 @@ class TestUpdateSpikeGLMParams:
         dt = 0.02
 
         spikes = jnp.zeros((n_time, n_neurons))  # All silent neurons
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
 
         current_params = SpikeObsParams(
             baseline=jnp.zeros(n_neurons),
@@ -2571,9 +2623,7 @@ class TestUpdateSpikeGLMParamsSecondOrder:
     ) -> jax.Array:
         """Negative log-likelihood with second-order expectation correction."""
         eta = baseline + smoother_mean @ weights
-        var_corrections = jax.vmap(lambda P: 0.5 * weights @ P @ weights)(
-            smoother_cov
-        )
+        var_corrections = jax.vmap(lambda P: 0.5 * weights @ P @ weights)(smoother_cov)
         mu = jnp.exp(eta + var_corrections) * dt
         return jnp.sum(mu - y_n * eta)
 
@@ -2592,7 +2642,9 @@ class TestUpdateSpikeGLMParamsSecondOrder:
         spikes = jax.random.poisson(
             jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
         ).astype(float)
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
         smoother_cov = jnp.stack([jnp.eye(n_latent) * 0.1] * n_time, axis=0)
 
         current_params = SpikeObsParams(
@@ -2628,7 +2680,9 @@ class TestUpdateSpikeGLMParamsSecondOrder:
         spikes = jax.random.poisson(
             jax.random.PRNGKey(0), 1.0, shape=(n_time, n_neurons)
         ).astype(float)
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
         smoother_cov = jnp.stack([jnp.eye(n_latent) * 0.1] * n_time, axis=0)
 
         current_params = SpikeObsParams(
@@ -2664,9 +2718,13 @@ class TestUpdateSpikeGLMParamsSecondOrder:
 
         # Generate data
         true_baseline = jnp.array([1.0, 0.5, 0.0])
-        true_weights = jax.random.normal(jax.random.PRNGKey(0), (n_neurons, n_latent)) * 0.3
+        true_weights = (
+            jax.random.normal(jax.random.PRNGKey(0), (n_neurons, n_latent)) * 0.3
+        )
 
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
         smoother_cov = jnp.stack([jnp.eye(n_latent) * 0.05] * n_time, axis=0)
 
         eta = true_baseline[None, :] + smoother_mean @ true_weights.T
@@ -2730,9 +2788,9 @@ class TestUpdateSpikeGLMParamsSecondOrder:
         smoother_cov = jnp.stack([jnp.eye(n_latent) * 0.1] * n_time, axis=0)
 
         true_baseline = jnp.array([0.4, -0.2])
-        true_weights = jax.random.normal(
-            jax.random.PRNGKey(2), (n_neurons, n_latent)
-        ) * 0.3
+        true_weights = (
+            jax.random.normal(jax.random.PRNGKey(2), (n_neurons, n_latent)) * 0.3
+        )
         eta = true_baseline[None, :] + smoother_mean @ true_weights.T
         rates = jnp.exp(eta) * dt
         spikes = jax.random.poisson(jax.random.PRNGKey(3), rates).astype(float)
@@ -2817,7 +2875,9 @@ class TestUpdateSpikeGLMParamsSecondOrder:
         spikes = jax.random.poisson(
             jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
         ).astype(float)
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
         # Zero covariance = deterministic state
         smoother_cov = jnp.zeros((n_time, n_latent, n_latent))
 
@@ -2868,7 +2928,9 @@ class TestUpdateSpikeGLMParamsSecondOrder:
         spikes = jax.random.poisson(
             jax.random.PRNGKey(0), 1.0, shape=(n_time, n_neurons)
         ).astype(float)
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
 
         current_params = SpikeObsParams(
             baseline=jnp.zeros(n_neurons),
@@ -2899,9 +2961,13 @@ class TestUpdateSpikeGLMParamsSecondOrder:
         spikes = jax.random.poisson(
             jax.random.PRNGKey(0), 1.0, shape=(n_time, n_neurons)
         ).astype(float)
-        smoother_mean = jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        smoother_mean = (
+            jax.random.normal(jax.random.PRNGKey(1), (n_time, n_latent)) * 0.5
+        )
         # Wrong shape: (n_time, n_latent) instead of (n_time, n_latent, n_latent)
-        smoother_cov_wrong = jax.random.normal(jax.random.PRNGKey(2), (n_time, n_latent))
+        smoother_cov_wrong = jax.random.normal(
+            jax.random.PRNGKey(2), (n_time, n_latent)
+        )
 
         current_params = SpikeObsParams(
             baseline=jnp.zeros(n_neurons),
@@ -3079,17 +3145,18 @@ class TestDynamicsMStepReuse:
         spikes = jax.random.poisson(key, 0.5, shape=(n_time, n_neurons)).astype(float)
 
         # Dynamics parameters
-        discrete_transition_matrix = jnp.eye(n_discrete_states) * 0.9 + 0.1 / n_discrete_states
-        discrete_transition_matrix = discrete_transition_matrix / discrete_transition_matrix.sum(
-            axis=1, keepdims=True
+        discrete_transition_matrix = (
+            jnp.eye(n_discrete_states) * 0.9 + 0.1 / n_discrete_states
+        )
+        discrete_transition_matrix = (
+            discrete_transition_matrix
+            / discrete_transition_matrix.sum(axis=1, keepdims=True)
         )
         continuous_transition_matrix = jnp.stack(
             [jnp.eye(n_latent) * (0.95 + 0.01 * i) for i in range(n_discrete_states)],
             axis=-1,
         )
-        process_cov = jnp.stack(
-            [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
-        )
+        process_cov = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
 
         # Spike observation parameters
         weights = jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)) * 0.1
@@ -3395,9 +3462,7 @@ class TestDynamicsMStepReuse:
         assert jnp.all(new_discrete_transition_matrix >= 0)
 
         # Initial probabilities should sum to 1
-        np.testing.assert_allclose(
-            new_init_discrete_state_prob.sum(), 1.0, rtol=1e-5
-        )
+        np.testing.assert_allclose(new_init_discrete_state_prob.sum(), 1.0, rtol=1e-5)
         # All probabilities should be non-negative
         assert jnp.all(new_init_discrete_state_prob >= 0)
 
@@ -3806,7 +3871,9 @@ class TestSwitchingSpikeOscillatorModelInit:
         )
 
         # Test value > 1
-        with pytest.raises(ValueError, match="discrete_transition_diag values must be probabilities"):
+        with pytest.raises(
+            ValueError, match="discrete_transition_diag values must be probabilities"
+        ):
             SwitchingSpikeOscillatorModel(
                 n_oscillators=2,
                 n_neurons=5,
@@ -3817,7 +3884,9 @@ class TestSwitchingSpikeOscillatorModelInit:
             )
 
         # Test value < 0
-        with pytest.raises(ValueError, match="discrete_transition_diag values must be probabilities"):
+        with pytest.raises(
+            ValueError, match="discrete_transition_diag values must be probabilities"
+        ):
             SwitchingSpikeOscillatorModel(
                 n_oscillators=2,
                 n_neurons=5,
@@ -4195,7 +4264,9 @@ class TestSwitchingSpikeOscillatorModelInitializeParameters:
         model2._initialize_parameters(key)
 
         np.testing.assert_allclose(model1.init_mean, model2.init_mean)
-        np.testing.assert_allclose(model1.spike_params.weights, model2.spike_params.weights)
+        np.testing.assert_allclose(
+            model1.spike_params.weights, model2.spike_params.weights
+        )
 
     def test_initialize_parameters_different_with_different_key(self) -> None:
         """_initialize_parameters should produce different values with different keys."""
@@ -4223,7 +4294,9 @@ class TestSwitchingSpikeOscillatorModelInitializeParameters:
 
         # Random components should differ
         assert not jnp.allclose(model1.init_mean, model2.init_mean)
-        assert not jnp.allclose(model1.spike_params.weights, model2.spike_params.weights)
+        assert not jnp.allclose(
+            model1.spike_params.weights, model2.spike_params.weights
+        )
 
 
 class TestSwitchingSpikeOscillatorModelEStep:
@@ -4853,7 +4926,9 @@ class TestSwitchingSpikeOscillatorModelMStepDynamics:
         model._m_step_dynamics()
 
         # Z should NOT have been updated
-        np.testing.assert_allclose(model.discrete_transition_matrix, Z_before, rtol=1e-10)
+        np.testing.assert_allclose(
+            model.discrete_transition_matrix, Z_before, rtol=1e-10
+        )
 
     def test_m_step_dynamics_updates_init_mean(self) -> None:
         """_m_step_dynamics should update init_mean when flag is True."""
@@ -5022,7 +5097,9 @@ class TestSwitchingSpikeOscillatorModelMStepDynamics:
             Q_j = model.process_cov[:, :, j]
             eigvals = jnp.linalg.eigvalsh(Q_j)
             # All eigenvalues should be non-negative (allowing small numerical error)
-            assert jnp.all(eigvals >= -1e-8), f"Q[{j}] has negative eigenvalue: {eigvals.min()}"
+            assert jnp.all(eigvals >= -1e-8), (
+                f"Q[{j}] has negative eigenvalue: {eigvals.min()}"
+            )
 
     def test_m_step_dynamics_single_discrete_state(self) -> None:
         """_m_step_dynamics should work with single discrete state."""
@@ -5133,9 +5210,13 @@ class TestSwitchingSpikeOscillatorModelMStepDynamics:
         model._m_step_dynamics()
 
         # Nothing should have changed
-        np.testing.assert_allclose(model.continuous_transition_matrix, A_before, rtol=1e-10)
+        np.testing.assert_allclose(
+            model.continuous_transition_matrix, A_before, rtol=1e-10
+        )
         np.testing.assert_allclose(model.process_cov, Q_before, rtol=1e-10)
-        np.testing.assert_allclose(model.discrete_transition_matrix, Z_before, rtol=1e-10)
+        np.testing.assert_allclose(
+            model.discrete_transition_matrix, Z_before, rtol=1e-10
+        )
         np.testing.assert_allclose(model.init_mean, m0_before, rtol=1e-10)
         np.testing.assert_allclose(model.init_cov, P0_before, rtol=1e-10)
 
@@ -5526,9 +5607,9 @@ class TestSwitchingSpikeOscillatorModelFit:
             SwitchingSpikeOscillatorModel,
         )
 
-        spikes = jax.random.poisson(
-            jax.random.PRNGKey(0), 0.05, shape=(20, 2)
-        ).astype(float)
+        spikes = jax.random.poisson(jax.random.PRNGKey(0), 0.05, shape=(20, 2)).astype(
+            float
+        )
         model = SwitchingSpikeOscillatorModel(
             n_oscillators=1,
             n_neurons=2,
@@ -5638,7 +5719,9 @@ class TestSwitchingSpikeOscillatorModelFit:
             jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
         ).astype(float)
 
-        log_likelihoods = model.fit(spikes, max_iter=max_iter, key=jax.random.PRNGKey(42))
+        log_likelihoods = model.fit(
+            spikes, max_iter=max_iter, key=jax.random.PRNGKey(42)
+        )
 
         # Should return EM-iteration LLs plus the final synchronized E-step LL
         assert isinstance(log_likelihoods, list)
@@ -5708,7 +5791,9 @@ class TestSwitchingSpikeOscillatorModelFit:
             jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
         ).astype(float)
 
-        log_likelihoods = model.fit(spikes, max_iter=max_iter, key=jax.random.PRNGKey(42))
+        log_likelihoods = model.fit(
+            spikes, max_iter=max_iter, key=jax.random.PRNGKey(42)
+        )
 
         # Test 1: Final log-likelihood should be higher than initial
         initial_ll = log_likelihoods[0]
@@ -5731,7 +5816,7 @@ class TestSwitchingSpikeOscillatorModelFit:
         min_improving = (len(log_likelihoods) - 1) // 2
         assert n_improving_or_stable >= min_improving, (
             f"Too many iterations with significant LL decrease: "
-            f"{n_improving_or_stable}/{len(log_likelihoods)-1} improving/stable "
+            f"{n_improving_or_stable}/{len(log_likelihoods) - 1} improving/stable "
             f"(need at least {min_improving})"
         )
 
@@ -6103,10 +6188,12 @@ class TestSwitchingSpikeOscillatorModelFit:
 
         # Set custom transition matrix with distinct values
         # Shape: (n_latent, n_latent, n_discrete_states) = (2, 2, 2)
-        custom_A = jnp.array([
-            [[0.9, 0.8], [0.1, 0.0]],
-            [[-0.1, 0.0], [0.9, 0.8]],
-        ])
+        custom_A = jnp.array(
+            [
+                [[0.9, 0.8], [0.1, 0.0]],
+                [[-0.1, 0.0], [0.9, 0.8]],
+            ]
+        )
         model.continuous_transition_matrix = custom_A
 
         # Set custom init_discrete_state_prob
@@ -6201,9 +6288,9 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
         model._initialize_parameters(jax.random.PRNGKey(0))
 
         # Perturb Q to potentially break PSD property
-        perturbation = jax.random.normal(
-            jax.random.PRNGKey(1), model.process_cov.shape
-        ) * 0.1
+        perturbation = (
+            jax.random.normal(jax.random.PRNGKey(1), model.process_cov.shape) * 0.1
+        )
         model.process_cov = model.process_cov + perturbation
 
         # After projection, Q should be PSD for each discrete state
@@ -6324,9 +6411,12 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
         model._initialize_parameters(jax.random.PRNGKey(0))
 
         # Perturb A slightly to break perfect structure
-        perturbation = jax.random.normal(
-            jax.random.PRNGKey(1), model.continuous_transition_matrix.shape
-        ) * 0.05
+        perturbation = (
+            jax.random.normal(
+                jax.random.PRNGKey(1), model.continuous_transition_matrix.shape
+            )
+            * 0.05
+        )
         model.continuous_transition_matrix = (
             model.continuous_transition_matrix + perturbation
         )
@@ -6342,13 +6432,17 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
                 block = A_j[2 * i : 2 * i + 2, 2 * i : 2 * i + 2]
                 # Diagonal elements should be equal: a, a
                 np.testing.assert_allclose(
-                    block[0, 0], block[1, 1], rtol=1e-5,
-                    err_msg=f"Diagonal block {i} for state {j} has unequal diagonals"
+                    block[0, 0],
+                    block[1, 1],
+                    rtol=1e-5,
+                    err_msg=f"Diagonal block {i} for state {j} has unequal diagonals",
                 )
                 # Off-diagonal elements should be negatives: -b, b
                 np.testing.assert_allclose(
-                    block[0, 1], -block[1, 0], rtol=1e-5,
-                    err_msg=f"Diagonal block {i} for state {j} has incorrect off-diagonals"
+                    block[0, 1],
+                    -block[1, 0],
+                    rtol=1e-5,
+                    err_msg=f"Diagonal block {i} for state {j} has incorrect off-diagonals",
                 )
 
     def test_project_parameters_ensures_symmetric_process_cov(self) -> None:
@@ -6386,8 +6480,10 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
         for j in range(model.n_discrete_states):
             Q_j = model.process_cov[:, :, j]
             np.testing.assert_allclose(
-                Q_j, Q_j.T, rtol=1e-10,
-                err_msg=f"Q for state {j} is not symmetric after projection"
+                Q_j,
+                Q_j.T,
+                rtol=1e-10,
+                err_msg=f"Q for state {j} is not symmetric after projection",
             )
 
     @pytest.mark.slow
@@ -6429,13 +6525,17 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
                 block = A_j[2 * i : 2 * i + 2, 2 * i : 2 * i + 2]
                 # Diagonal elements should be equal
                 np.testing.assert_allclose(
-                    block[0, 0], block[1, 1], rtol=1e-4,
-                    err_msg=f"After fit: diagonal block {i} for state {j} broken"
+                    block[0, 0],
+                    block[1, 1],
+                    rtol=1e-4,
+                    err_msg=f"After fit: diagonal block {i} for state {j} broken",
                 )
                 # Off-diagonal elements should be negatives
                 np.testing.assert_allclose(
-                    block[0, 1], -block[1, 0], rtol=1e-4,
-                    err_msg=f"After fit: off-diagonal block {i} for state {j} broken"
+                    block[0, 1],
+                    -block[1, 0],
+                    rtol=1e-4,
+                    err_msg=f"After fit: off-diagonal block {i} for state {j} broken",
                 )
 
         # Process covariance should be PSD
@@ -6466,9 +6566,12 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
         model._initialize_parameters(jax.random.PRNGKey(0))
 
         # Perturb parameters slightly (simulating what might happen in M-step)
-        perturbation_A = jax.random.normal(
-            jax.random.PRNGKey(1), model.continuous_transition_matrix.shape
-        ) * 0.05
+        perturbation_A = (
+            jax.random.normal(
+                jax.random.PRNGKey(1), model.continuous_transition_matrix.shape
+            )
+            * 0.05
+        )
         model.continuous_transition_matrix = (
             model.continuous_transition_matrix + perturbation_A
         )
@@ -6489,12 +6592,14 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
 
         # Parameters should remain unchanged (perturbed values preserved)
         np.testing.assert_array_equal(
-            model.continuous_transition_matrix, perturbed_A,
-            err_msg="A was modified despite update_continuous_transition_matrix=False"
+            model.continuous_transition_matrix,
+            perturbed_A,
+            err_msg="A was modified despite update_continuous_transition_matrix=False",
         )
         np.testing.assert_array_equal(
-            model.process_cov, perturbed_Q,
-            err_msg="Q was modified despite update_process_cov=False"
+            model.process_cov,
+            perturbed_Q,
+            err_msg="Q was modified despite update_process_cov=False",
         )
 
     def test_store_sgd_params_projects_transition_matrices(self) -> None:
@@ -6516,14 +6621,18 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
         assert "A_blocks_0" in params
         assert "A_0" not in params
 
-        raw_blocks = jnp.array([
-            [[3.0, 2.0], [0.7, -0.4]],
-            [[-0.3, 0.9], [4.0, 1.2]],
-        ])
-        model._store_sgd_params({
-            "A_blocks_0": raw_blocks,
-            "A_blocks_1": -raw_blocks,
-        })
+        raw_blocks = jnp.array(
+            [
+                [[3.0, 2.0], [0.7, -0.4]],
+                [[-0.3, 0.9], [4.0, 1.2]],
+            ]
+        )
+        model._store_sgd_params(
+            {
+                "A_blocks_0": raw_blocks,
+                "A_blocks_1": -raw_blocks,
+            }
+        )
 
         for j in range(model.n_discrete_states):
             A_j = model.continuous_transition_matrix[:, :, j]
@@ -6634,7 +6743,9 @@ class TestSwitchingSpikeOscillatorModelEndToEnd:
         assert len(log_likelihoods) > 2, "EM should run multiple iterations"
 
         # Get smoothed discrete state probabilities
-        inferred_probs = model.smoother_discrete_state_prob  # (n_time, n_discrete_states)
+        inferred_probs = (
+            model.smoother_discrete_state_prob
+        )  # (n_time, n_discrete_states)
 
         # Compute accuracy for direct assignment
         inferred_states_direct = jnp.argmax(inferred_probs, axis=1)
@@ -6700,7 +6811,9 @@ class TestSwitchingSpikeOscillatorModelEndToEnd:
 
         # True spike observation parameters - conservative for stability
         key_weights, _ = jax.random.split(key_sim)
-        spike_weights_true = jax.random.normal(key_weights, (n_neurons, n_latent)) * 0.05
+        spike_weights_true = (
+            jax.random.normal(key_weights, (n_neurons, n_latent)) * 0.05
+        )
         spike_baseline_true = jnp.ones(n_neurons) * 2.0  # Higher baseline
 
         # Simulate data
@@ -6743,16 +6856,20 @@ class TestSwitchingSpikeOscillatorModelEndToEnd:
         # (due to _project_parameters forcing this structure)
         # Check that diagonal blocks have the rotation-like structure
         for i in range(n_oscillators):
-            block_fitted = A_fitted[2*i:2*i+2, 2*i:2*i+2]
+            block_fitted = A_fitted[2 * i : 2 * i + 2, 2 * i : 2 * i + 2]
             # Diagonal elements should be similar
             np.testing.assert_allclose(
-                block_fitted[0, 0], block_fitted[1, 1], rtol=0.15,
-                err_msg=f"Fitted block {i}: diagonals should be similar"
+                block_fitted[0, 0],
+                block_fitted[1, 1],
+                rtol=0.15,
+                err_msg=f"Fitted block {i}: diagonals should be similar",
             )
             # Off-diagonal should be anti-symmetric
             np.testing.assert_allclose(
-                block_fitted[0, 1], -block_fitted[1, 0], rtol=0.15,
-                err_msg=f"Fitted block {i}: off-diagonals should be anti-symmetric"
+                block_fitted[0, 1],
+                -block_fitted[1, 0],
+                rtol=0.15,
+                err_msg=f"Fitted block {i}: off-diagonals should be anti-symmetric",
             )
 
         # 2. Process covariance should be positive definite
@@ -6763,8 +6880,12 @@ class TestSwitchingSpikeOscillatorModelEndToEnd:
         # 3. All parameters should be finite
         assert jnp.all(jnp.isfinite(A_fitted)), "A should be finite"
         assert jnp.all(jnp.isfinite(Q_fitted)), "Q should be finite"
-        assert jnp.all(jnp.isfinite(model.spike_params.weights)), "Weights should be finite"
-        assert jnp.all(jnp.isfinite(model.spike_params.baseline)), "Baseline should be finite"
+        assert jnp.all(jnp.isfinite(model.spike_params.weights)), (
+            "Weights should be finite"
+        )
+        assert jnp.all(jnp.isfinite(model.spike_params.baseline)), (
+            "Baseline should be finite"
+        )
 
         # 4. Quantitative recovery: transition matrix spectral radius
         # True A has all eigenvalues = 0.95 (diagonal), so spectral radius ≈ 0.95
@@ -6773,8 +6894,10 @@ class TestSwitchingSpikeOscillatorModelEndToEnd:
         fitted_spectral_radius = float(jnp.max(jnp.abs(fitted_eigenvalues)))
         # Allow generous tolerance for point-process estimation
         np.testing.assert_allclose(
-            fitted_spectral_radius, true_spectral_radius, rtol=0.3,
-            err_msg="Fitted A spectral radius should be approximately correct"
+            fitted_spectral_radius,
+            true_spectral_radius,
+            rtol=0.3,
+            err_msg="Fitted A spectral radius should be approximately correct",
         )
 
     @pytest.mark.slow
@@ -7027,7 +7150,9 @@ class TestMilestone8EndToEnd:
 
         # Test 1: All log-likelihoods should be finite (numerical stability)
         for i, ll in enumerate(log_likelihoods):
-            assert jnp.isfinite(ll), f"Log-likelihood at iteration {i} is not finite: {ll}"
+            assert jnp.isfinite(ll), (
+                f"Log-likelihood at iteration {i} is not finite: {ll}"
+            )
 
         # Test 2: Overall improvement is required
         # This is the fundamental EM guarantee (up to approximation)
@@ -7094,7 +7219,9 @@ class TestMilestone8EndToEnd:
         dt = 0.01
         sampling_freq = 100.0
 
-        key = jax.random.PRNGKey(3)  # Seed chosen for numerical stability and good recovery
+        key = jax.random.PRNGKey(
+            3
+        )  # Seed chosen for numerical stability and good recovery
         key_sim, key_fit = jax.random.split(key)
 
         # True transition matrices with different spectral properties
@@ -7114,7 +7241,9 @@ class TestMilestone8EndToEnd:
 
         # True spike observation parameters
         key_weights, key_sim2 = jax.random.split(key_sim)
-        spike_weights_true = jax.random.normal(key_weights, (n_neurons, n_latent)) * 0.05
+        spike_weights_true = (
+            jax.random.normal(key_weights, (n_neurons, n_latent)) * 0.05
+        )
         spike_baseline_true = jnp.ones(n_neurons) * 2.0
 
         # Simulate data
@@ -7164,16 +7293,20 @@ class TestMilestone8EndToEnd:
         # Allow generous tolerance due to finite sample size and Laplace approximation
         true_diag = jnp.diag(discrete_transition_matrix_true)
         np.testing.assert_allclose(
-            diag_values, true_diag, atol=0.20,
+            diag_values,
+            true_diag,
+            atol=0.20,
             err_msg=f"Discrete transition diagonal should recover true values. "
-            f"True: {true_diag}, Fitted: {diag_values}"
+            f"True: {true_diag}, Fitted: {diag_values}",
         )
 
         # Test 1c: Should sum to 1 (valid stochastic matrix)
         row_sums = jnp.sum(Z_fitted, axis=1)
         np.testing.assert_allclose(
-            row_sums, jnp.ones(n_discrete_states), rtol=1e-5,
-            err_msg="Discrete transition matrix rows should sum to 1"
+            row_sums,
+            jnp.ones(n_discrete_states),
+            rtol=1e-5,
+            err_msg="Discrete transition matrix rows should sum to 1",
         )
 
         # Test 2: Continuous transition matrix spectral properties
@@ -7238,25 +7371,39 @@ class TestMilestone8EndToEnd:
             model.smoother_state_cond_mean,
             model.smoother_discrete_state_prob,
         )
-        assert jnp.all(jnp.isfinite(smoother_mean)), "Marginalized smoother mean should be finite"
+        assert jnp.all(jnp.isfinite(smoother_mean)), (
+            "Marginalized smoother mean should be finite"
+        )
         assert smoother_mean.shape == (n_time, n_latent), (
             f"Smoother mean shape mismatch: {smoother_mean.shape} vs expected ({n_time}, {n_latent})"
         )
 
         # Test 5: All fitted parameters should be finite
-        assert jnp.all(jnp.isfinite(model.continuous_transition_matrix)), "A should be finite"
+        assert jnp.all(jnp.isfinite(model.continuous_transition_matrix)), (
+            "A should be finite"
+        )
         assert jnp.all(jnp.isfinite(model.process_cov)), "Q should be finite"
-        assert jnp.all(jnp.isfinite(model.discrete_transition_matrix)), "Z should be finite"
-        assert jnp.all(jnp.isfinite(model.spike_params.weights)), "Weights should be finite"
-        assert jnp.all(jnp.isfinite(model.spike_params.baseline)), "Baseline should be finite"
+        assert jnp.all(jnp.isfinite(model.discrete_transition_matrix)), (
+            "Z should be finite"
+        )
+        assert jnp.all(jnp.isfinite(model.spike_params.weights)), (
+            "Weights should be finite"
+        )
+        assert jnp.all(jnp.isfinite(model.spike_params.baseline)), (
+            "Baseline should be finite"
+        )
 
         # Test 6: Initial state distribution should be valid probability
         init_prob = model.init_discrete_state_prob
         np.testing.assert_allclose(
-            jnp.sum(init_prob), 1.0, rtol=1e-5,
-            err_msg="Initial discrete state prob should sum to 1"
+            jnp.sum(init_prob),
+            1.0,
+            rtol=1e-5,
+            err_msg="Initial discrete state prob should sum to 1",
         )
-        assert jnp.all(init_prob >= 0), "Initial discrete state prob should be non-negative"
+        assert jnp.all(init_prob >= 0), (
+            "Initial discrete state prob should be non-negative"
+        )
 
     @pytest.mark.slow
     def test_spike_params_end_to_end(self) -> None:
@@ -7314,14 +7461,18 @@ class TestMilestone8EndToEnd:
         assert model.spike_params.weights.shape == (n_neurons, n_latent)
         assert model.spike_params.baseline.shape == (n_neurons,)
         assert jnp.all(jnp.isfinite(model.spike_params.weights)), "Spike weights finite"
-        assert jnp.all(jnp.isfinite(model.spike_params.baseline)), "Spike baseline finite"
+        assert jnp.all(jnp.isfinite(model.spike_params.baseline)), (
+            "Spike baseline finite"
+        )
 
         # Test 4: Discrete transition matrix valid stochastic matrix
         Z_fitted = model.discrete_transition_matrix
         row_sums = jnp.sum(Z_fitted, axis=1)
         np.testing.assert_allclose(
-            row_sums, jnp.ones(n_discrete_states), rtol=1e-5,
-            err_msg="Discrete transition matrix rows should sum to 1"
+            row_sums,
+            jnp.ones(n_discrete_states),
+            rtol=1e-5,
+            err_msg="Discrete transition matrix rows should sum to 1",
         )
         assert jnp.all(Z_fitted >= 0), "Transition probs should be non-negative"
 
@@ -7393,6 +7544,7 @@ class TestMilestone8EndToEnd:
         # in both models and call _e_step directly (bypassing fit() which
         # would re-initialize parameters).
         from state_space_practice.switching_point_process import SpikeObsParams
+
         switching_model = SwitchingSpikeOscillatorModel(
             n_oscillators=n_oscillators,
             n_neurons=n_neurons,
@@ -7463,7 +7615,9 @@ class TestMilestone8EndToEnd:
         )
 
         nonswitching_smoother = nonswitching_model.smoother_mean
-        assert nonswitching_smoother is not None, "Non-switching smoother mean should not be None"
+        assert nonswitching_smoother is not None, (
+            "Non-switching smoother mean should not be None"
+        )
         assert jnp.all(jnp.isfinite(nonswitching_smoother)), (
             "Non-switching smoother mean should be finite"
         )
@@ -7480,9 +7634,9 @@ class TestMilestone8EndToEnd:
         # The latent space is now identifiable because all parameters are fixed.
         correlations = []
         for i in range(n_latent):
-            corr = jnp.corrcoef(
-                switching_smoother[:, i], nonswitching_smoother[:, i]
-            )[0, 1]
+            corr = jnp.corrcoef(switching_smoother[:, i], nonswitching_smoother[:, i])[
+                0, 1
+            ]
             correlations.append(float(corr))
 
         mean_correlation = jnp.mean(jnp.array(correlations))
@@ -7503,7 +7657,7 @@ class TestMilestone8EndToEnd:
             switching_model.smoother_discrete_state_prob,
             jnp.ones((n_time, 1)),
             rtol=1e-5,
-            err_msg="With S=1, all discrete state probs should be 1.0"
+            err_msg="With S=1, all discrete state probs should be 1.0",
         )
 
     def test_collapse_to_state_conditional(self) -> None:
@@ -7536,17 +7690,19 @@ class TestMilestone8EndToEnd:
         # Create known pair-conditional means: E[X | S_{t-1}=i, S_t=j]
         # Shape: (n_latent, n_prev_states, n_next_states)
         # For testing, make them clearly different
-        pair_cond_means = jnp.array([
-            # X dim 0
-            [[1.0, 2.0],   # i=0: j=0, j=1
-             [3.0, 4.0]],  # i=1: j=0, j=1
-            # X dim 1
-            [[0.5, 1.5],
-             [2.5, 3.5]],
-            # X dim 2
-            [[-1.0, -2.0],
-             [-3.0, -4.0]],
-        ])  # Shape: (3, 2, 2)
+        pair_cond_means = jnp.array(
+            [
+                # X dim 0
+                [
+                    [1.0, 2.0],  # i=0: j=0, j=1
+                    [3.0, 4.0],
+                ],  # i=1: j=0, j=1
+                # X dim 1
+                [[0.5, 1.5], [2.5, 3.5]],
+                # X dim 2
+                [[-1.0, -2.0], [-3.0, -4.0]],
+            ]
+        )  # Shape: (3, 2, 2)
 
         # Create known pair-conditional covariances: Cov[X | S_{t-1}=i, S_t=j]
         # Shape: (n_latent, n_latent, n_prev_states, n_next_states)
@@ -7561,14 +7717,18 @@ class TestMilestone8EndToEnd:
         # Mixing weights: P(S_{t-1}=i | S_t=j) for each j
         # These are the backward conditional probabilities
         # Shape: (n_prev_states, n_next_states)
-        mixing_weights = jnp.array([
-            [0.7, 0.3],  # For j=0: P(i=0|j=0)=0.7, P(i=1|j=0)=0.3
-            [0.4, 0.6],  # For j=1: P(i=0|j=1)=0.4, P(i=1|j=1)=0.6
-        ]).T  # Transpose to (n_prev_states, n_next_states)
+        mixing_weights = jnp.array(
+            [
+                [0.7, 0.3],  # For j=0: P(i=0|j=0)=0.7, P(i=1|j=0)=0.3
+                [0.4, 0.6],  # For j=1: P(i=0|j=1)=0.4, P(i=1|j=1)=0.6
+            ]
+        ).T  # Transpose to (n_prev_states, n_next_states)
 
         # Run the collapse function
-        state_cond_means, state_cond_covs = collapse_gaussian_mixture_per_discrete_state(
-            pair_cond_means, pair_cond_covs, mixing_weights
+        state_cond_means, state_cond_covs = (
+            collapse_gaussian_mixture_per_discrete_state(
+                pair_cond_means, pair_cond_covs, mixing_weights
+            )
         )
 
         # Manually compute expected state-conditional means
@@ -7600,21 +7760,27 @@ class TestMilestone8EndToEnd:
 
         # Test 1: State-conditional means match expected
         np.testing.assert_allclose(
-            state_cond_means, expected_means, rtol=1e-5,
-            err_msg="Collapsed means should match expected values"
+            state_cond_means,
+            expected_means,
+            rtol=1e-5,
+            err_msg="Collapsed means should match expected values",
         )
 
         # Test 2: State-conditional covariances match expected
         np.testing.assert_allclose(
-            state_cond_covs, expected_covs, rtol=1e-5,
-            err_msg="Collapsed covariances should match expected values"
+            state_cond_covs,
+            expected_covs,
+            rtol=1e-5,
+            err_msg="Collapsed covariances should match expected values",
         )
 
         # Test 3: Collapsed covariances should be symmetric
         for j in range(n_next_states):
             np.testing.assert_allclose(
-                state_cond_covs[:, :, j], state_cond_covs[:, :, j].T, rtol=1e-10,
-                err_msg=f"Collapsed covariance for state {j} should be symmetric"
+                state_cond_covs[:, :, j],
+                state_cond_covs[:, :, j].T,
+                rtol=1e-10,
+                err_msg=f"Collapsed covariance for state {j} should be symmetric",
             )
 
         # Test 4: Collapsed covariances should be PSD
@@ -7651,8 +7817,10 @@ class TestMilestone8EndToEnd:
         for j in range(n_next_states):
             expected_uniform_mean = jnp.mean(pair_cond_means[:, :, j], axis=1)
             np.testing.assert_allclose(
-                uniform_means[:, j], expected_uniform_mean, rtol=1e-5,
-                err_msg=f"Uniform weights: mean for state {j} should be simple average"
+                uniform_means[:, j],
+                expected_uniform_mean,
+                rtol=1e-5,
+                err_msg=f"Uniform weights: mean for state {j} should be simple average",
             )
 
         # Test 7: Edge case - deterministic (one-hot) mixing weights
@@ -7665,12 +7833,16 @@ class TestMilestone8EndToEnd:
         for j in range(n_next_states):
             # When P(i=j | S_t=j) = 1, collapsed = pair(i=j, j)
             np.testing.assert_allclose(
-                det_means[:, j], pair_cond_means[:, j, j], rtol=1e-5,
-                err_msg="Deterministic weights: mean should equal diagonal pair"
+                det_means[:, j],
+                pair_cond_means[:, j, j],
+                rtol=1e-5,
+                err_msg="Deterministic weights: mean should equal diagonal pair",
             )
             np.testing.assert_allclose(
-                det_covs[:, :, j], pair_cond_covs[:, :, j, j], rtol=1e-5,
-                err_msg="Deterministic weights: cov should equal diagonal pair"
+                det_covs[:, :, j],
+                pair_cond_covs[:, :, j, j],
+                rtol=1e-5,
+                err_msg="Deterministic weights: cov should equal diagonal pair",
             )
 
 
@@ -7738,8 +7910,10 @@ class TestEMVerification:
         expected_baseline = jnp.log(mean_counts / dt + 1e-10)
 
         np.testing.assert_allclose(
-            updated.baseline, expected_baseline, rtol=0.05,
-            err_msg="Baseline should converge to log(mean_rate)"
+            updated.baseline,
+            expected_baseline,
+            rtol=0.05,
+            err_msg="Baseline should converge to log(mean_rate)",
         )
 
         # Weights should remain near zero (no signal from constant state)
@@ -7770,9 +7944,7 @@ class TestEMVerification:
 
         # Generate synthetic smoother outputs
         smoother_mean = jax.random.normal(k1, (n_time, n_latent)) * 0.5
-        smoother_cov = jnp.tile(
-            jnp.eye(n_latent) * 0.1, (n_time, 1, 1)
-        )
+        smoother_cov = jnp.tile(jnp.eye(n_latent) * 0.1, (n_time, 1, 1))
 
         # Generate spikes from known params
         true_baseline = jnp.array([1.0, 2.0])
@@ -7791,10 +7963,14 @@ class TestEMVerification:
         def compute_total_Q(params):
             total = 0.0
             for n in range(n_neurons):
-                p = jnp.concatenate([jnp.atleast_1d(params.baseline[n]), params.weights[n]])
-                total += float(_neg_Q_single_neuron(
-                    p, spikes[:, n], smoother_mean, smoother_cov, dt, 0.0
-                ))
+                p = jnp.concatenate(
+                    [jnp.atleast_1d(params.baseline[n]), params.weights[n]]
+                )
+                total += float(
+                    _neg_Q_single_neuron(
+                        p, spikes[:, n], smoother_mean, smoother_cov, dt, 0.0
+                    )
+                )
             return total  # This is the negative Q, so lower is better
 
         neg_Q_before = compute_total_Q(old_params)
@@ -7946,9 +8122,7 @@ class TestEMVerification:
         key = jax.random.PRNGKey(123)
         k_mean, k_spike = jax.random.split(key)
 
-        state_means = jax.random.normal(
-            k_mean, (n_time, n_latent, n_states)
-        ) * 0.5
+        state_means = jax.random.normal(k_mean, (n_time, n_latent, n_states)) * 0.5
         state_means = state_means.at[:, 0, 0].add(-1.0)
         state_means = state_means.at[:, 0, 1].add(1.0)
         state_covs = jnp.broadcast_to(
@@ -7979,10 +8153,7 @@ class TestEMVerification:
                 quad = 0.5 * jnp.einsum("tlks,l,k->ts", state_covs, w, w)
                 mu = jnp.exp(b + eta_lin + quad) * dt
                 total += float(
-                    jnp.sum(
-                        state_weights
-                        * (mu - spikes[:, n, None] * (b + eta_lin))
-                    )
+                    jnp.sum(state_weights * (mu - spikes[:, n, None] * (b + eta_lin)))
                 )
             return total
 
@@ -8030,12 +8201,14 @@ class TestEMVerification:
         k1, k2 = jax.random.split(key)
 
         # True discrete states: blocks of ~100 time steps each
-        true_states = jnp.concatenate([
-            jnp.zeros(100, dtype=int),
-            jnp.ones(100, dtype=int),
-            jnp.zeros(100, dtype=int),
-            jnp.ones(100, dtype=int),
-        ])
+        true_states = jnp.concatenate(
+            [
+                jnp.zeros(100, dtype=int),
+                jnp.ones(100, dtype=int),
+                jnp.zeros(100, dtype=int),
+                jnp.ones(100, dtype=int),
+            ]
+        )
 
         # State 0: low firing (~2 Hz), State 1: high firing (~20 Hz)
         low_rate = 2.0 * dt
@@ -8081,8 +8254,12 @@ class TestEMVerification:
 
         # Check discrete state segmentation (handle label swapping)
         smoother_prob = np.array(model.smoother_discrete_state_prob)
-        corr_0 = np.corrcoef(np.array(true_states, dtype=float), smoother_prob[:, 0])[0, 1]
-        corr_1 = np.corrcoef(np.array(true_states, dtype=float), smoother_prob[:, 1])[0, 1]
+        corr_0 = np.corrcoef(np.array(true_states, dtype=float), smoother_prob[:, 0])[
+            0, 1
+        ]
+        corr_1 = np.corrcoef(np.array(true_states, dtype=float), smoother_prob[:, 1])[
+            0, 1
+        ]
         best_corr = max(abs(corr_0), abs(corr_1))
 
         assert best_corr > 0.4, (
@@ -8110,9 +8287,7 @@ class TestEMVerification:
         dt = 0.01
 
         key = jax.random.PRNGKey(42)
-        spikes = jax.random.poisson(
-            key, 0.5, shape=(n_time, n_neurons)
-        ).astype(float)
+        spikes = jax.random.poisson(key, 0.5, shape=(n_time, n_neurons)).astype(float)
 
         model = SwitchingSpikeOscillatorModel(
             n_oscillators=n_oscillators,
@@ -8141,27 +8316,37 @@ class TestEMVerification:
         # (default 30% blend) means even at convergence there can be small
         # parameter drift. Use generous tolerance.
         np.testing.assert_allclose(
-            model.continuous_transition_matrix, A_converged, atol=0.06,
-            err_msg="A should be near fixed point"
+            model.continuous_transition_matrix,
+            A_converged,
+            atol=0.06,
+            err_msg="A should be near fixed point",
         )
         np.testing.assert_allclose(
-            model.process_cov, Q_converged, atol=0.05,
-            err_msg="Q should be near fixed point"
+            model.process_cov,
+            Q_converged,
+            atol=0.05,
+            err_msg="Q should be near fixed point",
         )
         np.testing.assert_allclose(
-            model.discrete_transition_matrix, Z_converged, atol=0.02,
-            err_msg="Z should be near fixed point"
+            model.discrete_transition_matrix,
+            Z_converged,
+            atol=0.02,
+            err_msg="Z should be near fixed point",
         )
         # Spike params can drift more at convergence because the GLM M-step
         # uses Newton iterations that may not reach the exact optimum.
         # States with very low firing (baseline << 0) are especially noisy.
         np.testing.assert_allclose(
-            model.spike_params.baseline, baseline_converged, atol=0.1,
-            err_msg="Baseline should be near fixed point"
+            model.spike_params.baseline,
+            baseline_converged,
+            atol=0.1,
+            err_msg="Baseline should be near fixed point",
         )
         np.testing.assert_allclose(
-            model.spike_params.weights, weights_converged, atol=0.1,
-            err_msg="Weights should be near fixed point"
+            model.spike_params.weights,
+            weights_converged,
+            atol=0.1,
+            err_msg="Weights should be near fixed point",
         )
 
     @pytest.mark.slow
@@ -8210,23 +8395,19 @@ class TestEMVerification:
 
         # Moderate spike coupling for good SNR
         key_weights, key_sim2 = jax.random.split(key_sim)
-        spike_weights_true = jax.random.normal(
-            key_weights, (n_neurons, n_latent)
-        ) * 0.1
+        spike_weights_true = jax.random.normal(key_weights, (n_neurons, n_latent)) * 0.1
         spike_baseline_true = jnp.ones(n_neurons) * 2.5  # ~12 Hz baseline
 
         # Simulate
-        spikes, true_states, true_discrete_states = (
-            simulate_switching_spike_oscillator(
-                n_time=n_time,
-                transition_matrices=transition_matrices_true,
-                process_covs=process_covs_true,
-                discrete_transition_matrix=Z_true,
-                spike_weights=spike_weights_true,
-                spike_baseline=spike_baseline_true,
-                dt=dt,
-                key=key_sim2,
-            )
+        spikes, true_states, true_discrete_states = simulate_switching_spike_oscillator(
+            n_time=n_time,
+            transition_matrices=transition_matrices_true,
+            process_covs=process_covs_true,
+            discrete_transition_matrix=Z_true,
+            spike_weights=spike_weights_true,
+            spike_baseline=spike_baseline_true,
+            dt=dt,
+            key=key_sim2,
         )
 
         # Fit model
@@ -8257,12 +8438,20 @@ class TestEMVerification:
         )
 
         # 3. Spectral radii: sort to handle label permutation
-        fitted_spectral_radii = sorted([
-            float(jnp.max(jnp.abs(
-                jnp.linalg.eigvals(model.continuous_transition_matrix[:, :, j])
-            )))
-            for j in range(n_discrete_states)
-        ])
+        fitted_spectral_radii = sorted(
+            [
+                float(
+                    jnp.max(
+                        jnp.abs(
+                            jnp.linalg.eigvals(
+                                model.continuous_transition_matrix[:, :, j]
+                            )
+                        )
+                    )
+                )
+                for j in range(n_discrete_states)
+            ]
+        )
 
         # Both should be approximately stable (allow small numerical margin)
         for sr in fitted_spectral_radii:
@@ -8274,8 +8463,7 @@ class TestEMVerification:
         # We check that the two states have different spectral radii (the model
         # learned distinct dynamics) and both are in a reasonable range.
         assert fitted_spectral_radii[1] > fitted_spectral_radii[0] + 0.02, (
-            f"States should have distinct spectral radii: "
-            f"{fitted_spectral_radii}"
+            f"States should have distinct spectral radii: {fitted_spectral_radii}"
         )
         for sr in fitted_spectral_radii:
             assert 0.3 < sr < 1.0, f"Spectral radius out of range: {sr}"
@@ -8319,9 +8507,14 @@ class TestEMVerification:
         true_state = jnp.array([0.5, -0.3])
 
         baseline = jnp.array([1.0, 2.0, 1.5, 2.5])
-        weights = jnp.array([
-            [0.5, 0.3], [-0.2, 0.4], [0.1, -0.5], [0.3, 0.2],
-        ])
+        weights = jnp.array(
+            [
+                [0.5, 0.3],
+                [-0.2, 0.4],
+                [0.1, -0.5],
+                [0.3, 0.2],
+            ]
+        )
         spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
         # True rates at the known state
@@ -8334,9 +8527,9 @@ class TestEMVerification:
         ).astype(float)
 
         # True log-likelihood (analytical)
-        true_ll = float(jnp.sum(
-            jax.scipy.stats.poisson.logpmf(spikes, true_rates[None, :])
-        ))
+        true_ll = float(
+            jnp.sum(jax.scipy.stats.poisson.logpmf(spikes, true_rates[None, :]))
+        )
 
         def log_intensity_func(state, params):
             return params.baseline + params.weights @ state
@@ -8348,15 +8541,25 @@ class TestEMVerification:
         Q = jnp.eye(n_latent)[..., None] * 1e-10
 
         fm, fc, fp, lpm, _, _, filter_ll = switching_point_process_filter(
-            init_mean, init_cov, jnp.array([1.0]), spikes,
-            jnp.array([[1.0]]), A, Q, dt, log_intensity_func, spike_params,
+            init_mean,
+            init_cov,
+            jnp.array([1.0]),
+            spikes,
+            jnp.array([[1.0]]),
+            A,
+            Q,
+            dt,
+            log_intensity_func,
+            spike_params,
             include_laplace_normalization=False,
         )
 
         # LL should match analytically computed value
         np.testing.assert_allclose(
-            float(filter_ll), true_ll, atol=0.01,
-            err_msg="Filter LL should match true Poisson LL"
+            float(filter_ll),
+            true_ll,
+            atol=0.01,
+            err_msg="Filter LL should match true Poisson LL",
         )
 
         # Filter mean should stay at true state
@@ -8366,7 +8569,8 @@ class TestEMVerification:
 
         # Smoother should also stay at true state
         (_, _, _, _, _, scsm, _, _, _) = switching_kalman_smoother(
-            filter_mean=fm, filter_cov=fc,
+            filter_mean=fm,
+            filter_cov=fc,
             filter_discrete_state_prob=fp,
             last_filter_conditional_cont_mean=lpm[-1],
             process_cov=Q,
@@ -8398,8 +8602,8 @@ class TestEMVerification:
         n_time, n_neurons, n_latent, dt = 500, 4, 2, 0.01
 
         # Very distinct per-state rates: ~1 Hz vs ~30 Hz
-        baseline_0 = jnp.zeros(n_neurons)          # exp(0) = 1 Hz
-        baseline_1 = jnp.ones(n_neurons) * 3.4     # exp(3.4) ≈ 30 Hz
+        baseline_0 = jnp.zeros(n_neurons)  # exp(0) = 1 Hz
+        baseline_1 = jnp.ones(n_neurons) * 3.4  # exp(3.4) ≈ 30 Hz
         weights = jnp.zeros((n_neurons, n_latent))  # no state coupling
 
         spike_params = SpikeObsParams(
@@ -8408,16 +8612,18 @@ class TestEMVerification:
         )
 
         # Known discrete state sequence: blocks of 125
-        true_disc = np.concatenate([
-            np.zeros(125, dtype=int), np.ones(125, dtype=int),
-            np.zeros(125, dtype=int), np.ones(125, dtype=int),
-        ])
+        true_disc = np.concatenate(
+            [
+                np.zeros(125, dtype=int),
+                np.ones(125, dtype=int),
+                np.zeros(125, dtype=int),
+                np.ones(125, dtype=int),
+            ]
+        )
 
         rates_0 = jnp.exp(baseline_0) * dt
         rates_1 = jnp.exp(baseline_1) * dt
-        true_rates = jnp.where(
-            jnp.array(true_disc)[:, None] == 0, rates_0, rates_1
-        )
+        true_rates = jnp.where(jnp.array(true_disc)[:, None] == 0, rates_0, rates_1)
 
         key = jax.random.PRNGKey(42)
         spikes = jax.random.poisson(key, true_rates).astype(float)
@@ -8428,22 +8634,17 @@ class TestEMVerification:
         log_alpha = np.zeros((n_time, 2))
         for j in range(2):
             r = rates_0 if j == 0 else rates_1
-            log_alpha[0, j] = np.log(0.5) + float(jnp.sum(
-                jax.scipy.stats.poisson.logpmf(spikes[0], r)
-            ))
+            log_alpha[0, j] = np.log(0.5) + float(
+                jnp.sum(jax.scipy.stats.poisson.logpmf(spikes[0], r))
+            )
         for t in range(1, n_time):
             for j in range(2):
                 r = rates_0 if j == 0 else rates_1
-                obs_ll = float(jnp.sum(
-                    jax.scipy.stats.poisson.logpmf(spikes[t], r)
-                ))
-                log_trans = np.array([
-                    log_alpha[t - 1, i] + np.log(float(Z[i, j]))
-                    for i in range(2)
-                ])
-                log_alpha[t, j] = obs_ll + np.logaddexp(
-                    log_trans[0], log_trans[1]
+                obs_ll = float(jnp.sum(jax.scipy.stats.poisson.logpmf(spikes[t], r)))
+                log_trans = np.array(
+                    [log_alpha[t - 1, i] + np.log(float(Z[i, j])) for i in range(2)]
                 )
+                log_alpha[t, j] = obs_ll + np.logaddexp(log_trans[0], log_trans[1])
         true_marginal_ll = float(np.logaddexp(log_alpha[-1, 0], log_alpha[-1, 1]))
 
         # Run switching filter
@@ -8456,15 +8657,25 @@ class TestEMVerification:
         Q = jnp.stack([jnp.eye(n_latent) * 1e-10] * 2, axis=-1)
 
         fm, fc, fp, lpm, _, _, filter_ll = switching_point_process_filter(
-            init_mean, init_cov, jnp.array([0.5, 0.5]), spikes,
-            Z, A, Q, dt, log_intensity_func, spike_params,
+            init_mean,
+            init_cov,
+            jnp.array([0.5, 0.5]),
+            spikes,
+            Z,
+            A,
+            Q,
+            dt,
+            log_intensity_func,
+            spike_params,
             include_laplace_normalization=False,
         )
 
         # LL should match HMM forward algorithm
         np.testing.assert_allclose(
-            float(filter_ll), true_marginal_ll, atol=0.1,
-            err_msg="Filter LL should match HMM forward algorithm"
+            float(filter_ll),
+            true_marginal_ll,
+            atol=0.1,
+            err_msg="Filter LL should match HMM forward algorithm",
         )
 
         # Discrete state recovery
@@ -8473,16 +8684,16 @@ class TestEMVerification:
             abs(np.corrcoef(true_disc.astype(float), prob[:, j])[0, 1])
             for j in range(2)
         )
-        assert corr > 0.9, (
-            f"Filter should recover discrete states: |corr|={corr:.3f}"
-        )
+        assert corr > 0.9, f"Filter should recover discrete states: |corr|={corr:.3f}"
 
         # Smoother should improve on filter
         (_, _, sdsp, _, _, _, _, _, _) = switching_kalman_smoother(
-            filter_mean=fm, filter_cov=fc,
+            filter_mean=fm,
+            filter_cov=fc,
             filter_discrete_state_prob=fp,
             last_filter_conditional_cont_mean=lpm[-1],
-            process_cov=Q, continuous_transition_matrix=A,
+            process_cov=Q,
+            continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
         )
         smoother_prob = np.array(sdsp)
@@ -8519,20 +8730,35 @@ class TestGPB2Smoother:
         obs = jax.random.normal(jax.random.PRNGKey(0), (n_time, n_obs))
 
         fm, fc, fp, pcm, pcc, pcp, _ = switching_kalman_filter(
-            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
+            init_mean,
+            init_cov,
+            init_prob,
+            obs,
+            Z,
+            A,
+            Q,
+            H,
+            R,
         )
 
         r1 = switching_kalman_smoother(
-            filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
+            filter_mean=fm,
+            filter_cov=fc,
+            filter_discrete_state_prob=fp,
             last_filter_conditional_cont_mean=pcm[-1],
-            process_cov=Q, continuous_transition_matrix=A,
+            process_cov=Q,
+            continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
         )
         r2 = switching_kalman_smoother_gpb2(
-            filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
-            pair_cond_filter_mean=pcm, pair_cond_filter_cov=pcc,
+            filter_mean=fm,
+            filter_cov=fc,
+            filter_discrete_state_prob=fp,
+            pair_cond_filter_mean=pcm,
+            pair_cond_filter_cov=pcc,
             pair_cond_filter_prob=pcp,
-            process_cov=Q, continuous_transition_matrix=A,
+            process_cov=Q,
+            continuous_transition_matrix=A,
         )
 
         for i in range(9):
@@ -8559,19 +8785,40 @@ class TestGPB2Smoother:
         obs = jax.random.normal(jax.random.PRNGKey(0), (n_time, n_obs))
 
         fm, fc, fp, pcm, pcc, pcp, _ = switching_kalman_filter(
-            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R,
+            init_mean,
+            init_cov,
+            init_prob,
+            obs,
+            Z,
+            A,
+            Q,
+            H,
+            R,
         )
         result = switching_kalman_smoother_gpb2(
-            filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
-            pair_cond_filter_mean=pcm, pair_cond_filter_cov=pcc,
+            filter_mean=fm,
+            filter_cov=fc,
+            filter_discrete_state_prob=fp,
+            pair_cond_filter_mean=pcm,
+            pair_cond_filter_cov=pcc,
             pair_cond_filter_prob=pcp,
-            process_cov=Q, continuous_transition_matrix=A,
+            process_cov=Q,
+            continuous_transition_matrix=A,
         )
 
-        for i, name in enumerate([
-            "overall_mean", "overall_cov", "disc_prob", "joint_disc",
-            "cross_cov", "state_mean", "state_cov", "pair_cross", "pair_mean",
-        ]):
+        for i, name in enumerate(
+            [
+                "overall_mean",
+                "overall_cov",
+                "disc_prob",
+                "joint_disc",
+                "cross_cov",
+                "state_mean",
+                "state_cov",
+                "pair_cross",
+                "pair_mean",
+            ]
+        ):
             assert jnp.all(jnp.isfinite(result[i])), f"GPB2 {name} not finite"
 
     @pytest.mark.slow
@@ -8582,13 +8829,16 @@ class TestGPB2Smoother:
             SwitchingSpikeOscillatorModel,
         )
 
-        spikes = jax.random.poisson(
-            jax.random.PRNGKey(0), 0.5, shape=(50, 5)
-        ).astype(float)
+        spikes = jax.random.poisson(jax.random.PRNGKey(0), 0.5, shape=(50, 5)).astype(
+            float
+        )
 
         model = SwitchingSpikeOscillatorModel(
-            n_oscillators=1, n_neurons=5, n_discrete_states=2,
-            sampling_freq=100.0, dt=0.01,
+            n_oscillators=1,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
             q_regularization=QRegularizationConfig(),
             separate_spike_params=False,
             smoother_type="gpb2",
@@ -8616,13 +8866,16 @@ class TestGPB2Smoother:
             SwitchingSpikeOscillatorModel,
         )
 
-        spikes = jax.random.poisson(
-            jax.random.PRNGKey(0), 0.5, shape=(80, 5)
-        ).astype(float)
+        spikes = jax.random.poisson(jax.random.PRNGKey(0), 0.5, shape=(80, 5)).astype(
+            float
+        )
 
         model = SwitchingSpikeOscillatorModel(
-            n_oscillators=1, n_neurons=5, n_discrete_states=2,
-            sampling_freq=100.0, dt=0.01,
+            n_oscillators=1,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
             q_regularization=QRegularizationConfig(),
             separate_spike_params=False,
             smoother_type="gpb2",
@@ -8666,8 +8919,11 @@ class TestSwitchingSpikeOscillatorSGD:
         )
 
         model = SwitchingSpikeOscillatorModel(
-            n_oscillators=2, n_neurons=4, n_discrete_states=2,
-            sampling_freq=100.0, dt=0.01,
+            n_oscillators=2,
+            n_neurons=4,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
         )
         key = jax.random.PRNGKey(42)
         spikes = jax.random.poisson(key, jnp.ones((100, 4)) * 0.01)
@@ -8682,8 +8938,11 @@ class TestSwitchingSpikeOscillatorSGD:
         )
 
         model = SwitchingSpikeOscillatorModel(
-            n_oscillators=2, n_neurons=4, n_discrete_states=2,
-            sampling_freq=100.0, dt=0.01,
+            n_oscillators=2,
+            n_neurons=4,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
         )
         key = jax.random.PRNGKey(42)
         spikes = jax.random.poisson(key, jnp.ones((100, 4)) * 0.01)
