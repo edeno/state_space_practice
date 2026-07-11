@@ -576,9 +576,11 @@ def _soft_expected_count(
     push toward the cap that decays with the overshoot but never vanishes or
     NaNs. Value and first derivative match ``exp`` at the cap.
 
-    Unlike :func:`_safe_expected_count` there is no lower clip: SGD callers floor
-    ``log(mu)`` on the rate they read back, so the underflow direction needs no
-    guard here.
+    Unlike :func:`_safe_expected_count` there is no lower clip: the only consumer
+    that needs ``log(mu)``, :func:`_soft_expected_count_and_log`, returns the
+    analytic log directly, so the underflow direction needs no guard here. A
+    value-only caller that needs ``log(mu)`` should read it from that companion
+    rather than flooring ``log(count + eps)``.
 
     Parameters
     ----------
@@ -595,6 +597,49 @@ def _soft_expected_count(
         Expected count per bin, finite (value and gradient) for every finite
         ``log_rate``.
     """
+    count, _ = _soft_expected_count_and_log(log_rate, dt, max_log_count)
+    return count
+
+
+def _soft_expected_count_and_log(
+    log_rate: Array,
+    dt: float,
+    max_log_count: float = 20.0,
+) -> tuple[Array, Array]:
+    """Soft-capped expected count and its exact log, from one decomposition.
+
+    Returns ``(count, log_count)`` where ``count`` is :func:`_soft_expected_count`
+    and ``log_count`` equals ``log(count)`` **analytically** -- derived from the
+    same ``capped``/``overshoot`` terms, so the two share one cap and cannot
+    drift out of the ``log_count == log(count)`` identity.
+
+    A Poisson surrogate that needs ``log(mu)`` must read it from here rather than
+    forming ``log(count + eps)``: once ``count`` underflows to ``0`` the ``+eps``
+    floor pins the log at ``log(eps)``, zeroing the restoring gradient for
+    positive spike counts. ``log_count`` stays finite and exact for every finite
+    ``log_rate`` because it never exponentiates the (possibly very negative)
+    capped log-count. See :func:`_soft_expected_count` for the overflow-side
+    rationale behind the logarithmic continuation.
+
+    Parameters
+    ----------
+    log_rate : Array
+        Log firing rate in Hz.
+    dt : float
+        Bin width in seconds.
+    max_log_count : float, default 20.0
+        Log expected-count above which ``exp`` is continued logarithmically.
+
+    Returns
+    -------
+    count : Array
+        Expected count per bin, finite (value and gradient) for every finite
+        ``log_rate``.
+    log_count : Array
+        The analytic ``log(rate * dt)`` under the same cap: equals ``log(count)``
+        wherever ``count`` is representable and positive, and stays finite where
+        ``count`` underflows to 0 (where ``log(count)`` itself would be ``-inf``).
+    """
     dt_array = jnp.asarray(dt, dtype=log_rate.dtype)
     log_count = log_rate + jnp.log(dt_array)
     # exp is evaluated ONLY on the capped argument, so it never overflows. Above
@@ -603,7 +648,12 @@ def _soft_expected_count(
     # the gradient is finite (a linear ``overshoot`` here would NaN it).
     capped = jnp.minimum(log_count, max_log_count)
     overshoot = jnp.maximum(log_count - max_log_count, 0.0)
-    return jnp.exp(capped) * (1.0 + jnp.log1p(overshoot))
+    count = jnp.exp(capped) * (1.0 + jnp.log1p(overshoot))
+    # log(count) = capped + log(1 + log1p(overshoot)); log1p(log1p(...)) keeps it
+    # exact without forming ``count`` first, so an underflowed count still yields
+    # a finite, correctly-signed Poisson gradient.
+    log_count_out = capped + jnp.log1p(jnp.log1p(overshoot))
+    return count, log_count_out
 
 
 def _point_process_laplace_update(

@@ -52,6 +52,33 @@ def test_sgd_surrogate_loss_finite_under_rate_overflow():
     assert bool(jnp.all(grad["d"] > 0.0))
 
 
+def test_sgd_surrogate_preserves_gradient_under_rate_underflow():
+    """Positive counts retain a restoring gradient at tiny predicted rates."""
+    model = HamiltonianSpikeModel(
+        n_sources=2,
+        n_oscillators=1,
+        hidden_dims=[4],
+        seed=0,
+        sampling_freq=100.0,
+    )
+    spikes = jnp.ones((5, 2))
+    params, _ = model._build_param_spec()
+    params = {
+        **params,
+        "C": jnp.zeros_like(params["C"]),
+        "d": jnp.full_like(params["d"], -1000.0),
+    }
+
+    def loss_fn(p):
+        return model._sgd_loss_fn(p, spikes, use_filter=False)
+
+    grad = jax.grad(loss_fn)(params)
+
+    assert bool(jnp.isfinite(loss_fn(params)))
+    assert bool(jnp.all(jnp.isfinite(grad["d"])))
+    assert bool(jnp.all(grad["d"] < 0.0))
+
+
 class TestHamiltonianSpikeModelSmoke:
     """Smoke tests: instantiation, filter, smooth all run without error."""
 
@@ -97,6 +124,39 @@ class TestHamiltonianSpikeModelSmoke:
         model._store_sgd_params(params)
 
         assert jnp.allclose(model.measurement_matrix[:, :, 0], model.C)
+
+    @pytest.mark.parametrize(
+        "spikes, match",
+        [
+            (jnp.zeros((5,)), "shape"),
+            (jnp.zeros((5, 1)), "8 sources"),
+            (jnp.full((5, 8), -1.0), "non-negative"),
+            (jnp.full((5, 8), 0.5), "integer-valued"),
+            (jnp.empty((0, 8)), "at least one count"),
+        ],
+    )
+    def test_fit_sgd_rejects_invalid_spikes(self, model_and_data, spikes, match):
+        model, _ = model_and_data
+        with pytest.raises(ValueError, match=match):
+            model.fit_sgd(spikes, num_steps=0)
+
+    def test_filter_covariance_defaults_are_not_stale(self, model_and_data):
+        model, spikes = model_and_data
+        params, _ = model._build_param_spec()
+        params.pop("Q")
+        params.pop("init_cov")
+
+        _, covs_before, _ = model.filter(spikes, params)
+        model.process_cov = jnp.stack([jnp.eye(model.n_cont_states) * 10.0], axis=2)
+        model.init_cov = jnp.stack([jnp.eye(model.n_cont_states) * 5.0], axis=2)
+        _, covs_after, _ = model.filter(spikes, params)
+
+        assert not jnp.allclose(covs_before, covs_after)
+
+    def test_fit_sgd_rejects_removed_key_argument(self, model_and_data):
+        model, spikes = model_and_data
+        with pytest.raises(TypeError, match="unexpected keyword argument 'key'"):
+            model.fit_sgd(spikes, key=jax.random.PRNGKey(1), num_steps=0)
 
 
 class TestHamiltonianSpikeMultiOscillator:
@@ -237,7 +297,6 @@ class TestHamiltonianSpikeSGDRecovery:
 
         lls = model.fit_sgd(
             spikes,
-            key=jax.random.PRNGKey(1),
             num_steps=200,
             use_filter=False,
         )
@@ -262,6 +321,61 @@ class TestHamiltonianSpikeSGDRecovery:
         m_s, _ = model.smooth(spikes, params)
         assert jnp.all(jnp.isfinite(m_s)), "Smoother produced non-finite values"
         assert m_s.shape == x_true.shape
+
+
+@pytest.mark.slow
+class TestHamiltonianSpikeSGDFilterDefault:
+    """The default fit_sgd path (use_filter=True) optimizes the marginal
+    Laplace-EKF likelihood and learns the process covariance Q.
+
+    The recovery tests above pin use_filter=False explicitly, so this is the
+    only coverage of the default. Asserting Q *changed* is deliberate: the
+    deterministic-rollout surrogate (use_filter=False) never references Q, so
+    its gradient w.r.t. Q is exactly zero and Q stays at its initial value.
+    This test therefore fails if the default ever regresses back to False.
+    """
+
+    def test_default_fit_improves_ll_and_learns_psd_Q(self):
+        dt = 0.01
+        n_time = 100
+        n_sources = 4
+
+        x_true, _ = simulate_harmonic_oscillator(
+            omega=2 * jnp.pi,
+            n_time=n_time,
+            dt=dt,
+            key=jax.random.PRNGKey(0),
+            hidden_dims=[8],
+        )
+        C_true = jax.random.normal(jax.random.PRNGKey(1), (n_sources, 2)) * 0.3
+        d_true = -2.0 * jnp.ones(n_sources)
+        spikes = simulate_poisson_spikes(
+            x_true, C_true, d_true, dt=dt, key=jax.random.PRNGKey(2)
+        )
+
+        model = HamiltonianSpikeModel(
+            n_sources=n_sources,
+            n_oscillators=1,
+            hidden_dims=[8],
+            seed=0,
+            sampling_freq=1.0 / dt,
+        )
+        Q_before = model.process_cov[:, :, 0]
+
+        # No use_filter argument -> exercises the default (use_filter=True):
+        # differentiates through the Laplace-EKF filter and learns Q.
+        lls = model.fit_sgd(spikes, num_steps=40)
+
+        assert_ll_improves(lls, label="HamiltonianSpike filter-default SGD")
+
+        Q_after = model.process_cov[:, :, 0]
+        assert not jnp.allclose(Q_before, Q_after), (
+            "Q was not updated -- the filter path did not run "
+            "(did the fit_sgd default regress to use_filter=False?)"
+        )
+        assert jnp.allclose(Q_after, Q_after.T), "learned Q is not symmetric"
+        min_eig = float(jnp.linalg.eigvalsh(Q_after).min())
+        assert min_eig > 0.0, f"learned Q is not PSD (min eigenvalue {min_eig:.2e})"
 
 
 @pytest.mark.slow
@@ -327,7 +441,6 @@ class TestHamiltonianVsLinearBaseline:
         nonlinear.omega = omega  # seed frequency near truth
         nonlinear.fit_sgd(
             spikes,
-            key=jax.random.PRNGKey(1),
             num_steps=200,
             use_filter=False,
         )
