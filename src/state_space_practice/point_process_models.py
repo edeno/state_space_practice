@@ -1010,10 +1010,28 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             log_likelihoods.append(current_ll)
 
             if not jnp.isfinite(marginal_ll):
-                raise ValueError(
-                    f"Non-finite log-likelihood at iteration {iteration}: "
-                    f"{marginal_ll}. This may indicate numerical instability."
+                bad_ll = log_likelihoods.pop()
+                if last_accepted_state is None:
+                    # Non-finite on the very first E-step: the initial parameters
+                    # are unusable and there is nothing to roll back to.
+                    raise ValueError(
+                        f"Non-finite log-likelihood at iteration {iteration}: "
+                        f"{bad_ll}. This may indicate numerical instability."
+                    )
+                # The GPB smoother signals divergence by propagating a non-finite
+                # marginal LL (see switching_kalman's divergence cap). Honor that
+                # "roll the step back" contract -- as the final-E-step and
+                # LL-decrease handling below and PointProcessModel._fit_single do
+                # -- restoring the last accepted E-step and stopping, rather than
+                # raising and discarding the fitted parameters.
+                self._restore_em_state(last_accepted_state)
+                self.converged_ = False
+                logger.warning(
+                    f"Non-finite log-likelihood ({bad_ll}) at iteration "
+                    f"{iteration + 1}; rolling back to the previous E-step and "
+                    f"stopping EM."
                 )
+                break
 
             current_state = self._snapshot_em_state()
 

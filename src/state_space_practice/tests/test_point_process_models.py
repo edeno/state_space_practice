@@ -326,6 +326,57 @@ class TestCommonOscillatorPointProcessModel:
         np.testing.assert_allclose(model.continuous_transition_matrix, original_A)
         np.testing.assert_allclose(model.smoother_discrete_state_prob, good_probs)
 
+    def test_fit_rolls_back_nonfinite_mid_loop(
+        self, com_pp_params, monkeypatch, caplog
+    ) -> None:
+        """A non-finite E-step *mid-EM* (e.g. GPB smoother divergence poisoning a
+        later E-step) must roll back to the last accepted state and stop, not
+        raise -- the smoother signals divergence via a non-finite marginal LL."""
+        params = dict(com_pp_params)
+        params["n_oscillators"] = 1
+        params["n_neurons"] = 2
+        params["n_discrete_states"] = 2
+        params["freqs"] = jnp.array([8.0])
+        params["damping_coef"] = jnp.array([0.95])
+        params["process_variance"] = jnp.array([0.1])
+        model = CommonOscillatorPointProcessModel(**params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        spikes = jnp.zeros((5, 2))
+        original_A = model.continuous_transition_matrix.copy()
+        good_probs = jnp.ones((spikes.shape[0], model.n_discrete_states)) / 2.0
+        bad_probs = jnp.tile(jnp.array([[0.9, 0.1]]), (spikes.shape[0], 1))
+        # iter 0 finite (accepted); iter 1 non-finite -> exercises the mid-loop
+        # branch (max_iter=2), not the final-sync path.
+        e_step_values = iter([(100.0, good_probs), (jnp.nan, bad_probs)])
+
+        def fake_e_step(_spikes):
+            ll, probs = next(e_step_values)
+            model.smoother_discrete_state_prob = probs
+            return jnp.asarray(ll)
+
+        def bad_m_step_dynamics():
+            model.continuous_transition_matrix = (
+                model.continuous_transition_matrix + 5.0
+            )
+
+        monkeypatch.setattr(model, "_e_step", fake_e_step)
+        monkeypatch.setattr(model, "_m_step_dynamics", bad_m_step_dynamics)
+        monkeypatch.setattr(model, "_m_step_spikes", lambda _spikes: None)
+        monkeypatch.setattr(model, "_project_parameters", lambda: None)
+
+        with caplog.at_level("WARNING"):
+            log_likelihoods = model.fit(spikes, max_iter=2, skip_init=True)
+
+        assert log_likelihoods == [100.0]  # the NaN was dropped, not raised
+        assert model.converged_ is False
+        assert any(
+            "non-finite log-likelihood" in record.message.lower()
+            and "rolling back" in record.message.lower()
+            for record in caplog.records
+        )
+        np.testing.assert_allclose(model.continuous_transition_matrix, original_A)
+        np.testing.assert_allclose(model.smoother_discrete_state_prob, good_probs)
+
     @pytest.mark.parametrize(
         ("bad_value", "match"),
         [(-1.0, "non-negative"), (0.5, "integer-valued"), (jnp.nan, "finite")],
@@ -359,12 +410,8 @@ class TestCorrelatedNoisePointProcessModel:
     def test_lower_triangle_pair_params_are_canonicalized(self, cnm_pp_params) -> None:
         params = dict(cnm_pp_params)
         n_disc = params["n_discrete_states"]
-        params["phase_difference"] = (
-            jnp.zeros((2, 2, n_disc)).at[1, 0, :].set(-0.7)
-        )
-        params["coupling_strength"] = (
-            jnp.zeros((2, 2, n_disc)).at[1, 0, :].set(0.05)
-        )
+        params["phase_difference"] = jnp.zeros((2, 2, n_disc)).at[1, 0, :].set(-0.7)
+        params["coupling_strength"] = jnp.zeros((2, 2, n_disc)).at[1, 0, :].set(0.05)
 
         model = CorrelatedNoisePointProcessModel(**params)
 
@@ -677,9 +724,7 @@ class TestDirectedInfluencePointProcessModel:
         monkeypatch.setattr(
             pp_models, "switching_kalman_maximization_step", fake_m_step
         )
-        monkeypatch.setattr(
-            pp_models, "optimize_dim_transition_params", fake_optimize
-        )
+        monkeypatch.setattr(pp_models, "optimize_dim_transition_params", fake_optimize)
 
         model._m_step_reparameterized()
 
@@ -837,7 +882,10 @@ class TestSwitchingPPSGDFitting:
         key = jax.random.PRNGKey(0)
         config = OscillatorPenaltyConfig(edge_l1=0.5)
         lls = model.fit_sgd(
-            spikes, key=key, num_steps=15, connectivity_penalty=config,
+            spikes,
+            key=key,
+            num_steps=15,
+            connectivity_penalty=config,
         )
         assert len(lls) > 1
         assert jnp.all(jnp.isfinite(model.coupling_strength))
@@ -876,7 +924,9 @@ class TestSwitchingPPSGDFitting:
         model_reg = _make()
         config = OscillatorPenaltyConfig(edge_l1=1.0)
         model_reg.fit_sgd(
-            scenario["spikes"], key=key, num_steps=20,
+            scenario["spikes"],
+            key=key,
+            num_steps=20,
             connectivity_penalty=config,
         )
         norm_reg = float(jnp.sum(jnp.abs(model_reg.coupling_strength)))
