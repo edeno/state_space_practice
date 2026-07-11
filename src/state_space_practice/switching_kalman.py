@@ -550,9 +550,19 @@ def _update_discrete_state_probabilities(
     )
     # Floor supported-but-underflowed marginals in the RETURNED value so the GPB
     # smoothers (which read the support from the marginal's zeros) do not mistake
-    # a reachable underflowed state for an impossible one. The backward columns
-    # sum to 1, so pair = W * floored_marginal remains consistent.
-    filter_discrete_prob = _floor_supported_marginal(filter_discrete_prob, next_support)
+    # a reachable *underflowed* state (finite but tiny log_marginal) for an
+    # impossible one; those columns have a per-column-normalized backward that
+    # sums to 1, so pair = W * floored_marginal stays consistent.
+    #
+    # A reachable destination the data *rules out* this step (its likelihood
+    # column is all -inf, so log_marginal[j] = -inf) is NOT floored: its backward
+    # column is all zero (the observation is impossible for j), so its Bayes
+    # marginal is exactly 0. Leaving it at 0 keeps pair.sum(axis=0) == marginal
+    # (0 == 0) -- flooring it to 1e-10 against a zero backward column would make
+    # the GPB collapse fabricate a zero-weight posterior for a state with mass.
+    # (It re-enters the support next step via the log-prior floor if reachable.)
+    floorable = next_support & jnp.isfinite(log_marginal)
+    filter_discrete_prob = _floor_supported_marginal(filter_discrete_prob, floorable)
     # Floor a degenerate -inf contribution so the marginal LL stays finite for
     # EM; keep honest finite (even very negative) values and propagate NaN.
     log_predictive = jnp.where(
@@ -610,12 +620,33 @@ def _first_timestep_discrete_update(
     )
     log_unnorm = state_cond_log_lik + log_prior
     marginal_log_likelihood = logsumexp(log_unnorm)
-    filter_discrete_prob = jnp.exp(log_unnorm - marginal_log_likelihood)
+    # Degenerate recovery (mirrors the later-timestep dynamics fallback in
+    # _update_discrete_state_probabilities): an impossible first observation
+    # (every state's likelihood -inf) makes exp(log_unnorm - marginal) =
+    # exp(-inf - -inf) = NaN. With no dynamics at t=1, the "prediction" is the
+    # prior itself, so drop the likelihood and fall back to the normalized prior.
+    # ``logsumexp(log_prior) == log(sum prior) == 0`` (the prior is normalized),
+    # so ``exp(log_prior - 0)`` returns the prior (structural zeros preserved).
+    # A malformed (NaN) prior keeps marginal NaN -> stays on this branch -> NaN
+    # posterior, so it still fails loud.
+    obs_impossible = ~jnp.isfinite(marginal_log_likelihood)
+    posterior_log_unnorm = jnp.where(obs_impossible, log_prior, log_unnorm)
+    posterior_log_norm = jnp.where(
+        obs_impossible, logsumexp(log_prior), marginal_log_likelihood
+    )
+    filter_discrete_prob = jnp.exp(posterior_log_unnorm - posterior_log_norm)
     # Floor supported-but-underflowed marginals so a value-based consumer (the
     # GPB smoothers) can tell a reachable underflowed state from an impossible
     # one; forbidden states stay exactly 0. Malformed (NaN) propagates.
     filter_discrete_prob = _floor_supported_marginal(
         filter_discrete_prob, init_discrete_state_prob > 0.0
+    )
+    # Floor a degenerate -inf contribution so the marginal LL stays finite for
+    # EM accumulation (matching the scan body); NaN (malformed prior) propagates.
+    marginal_log_likelihood = jnp.where(
+        jnp.isneginf(marginal_log_likelihood),
+        _LOG_DISCRETE_STABILITY_FLOOR,
+        marginal_log_likelihood,
     )
     return filter_discrete_prob, marginal_log_likelihood
 
@@ -947,10 +978,15 @@ def switching_kalman_filter(
     # jax.lax.scan handles empty inputs (obs[1:] when n_time=1) gracefully.
     # The scan now emits the full pair-conditional filter trajectory as stacked
     # outputs (the GPB2 smoother needs every timestep, not just the last).
-    # Structural support S_1 from the caller's prior (nonzero entries). Threaded
-    # through the scan and advanced one transition per step, so an underflowed
-    # reachable state is not mistaken for a structurally impossible one.
-    first_support = jnp.asarray(init_discrete_state_prob) > 0.0
+    # Structural support S_1 from the *sanitized* prior (the same normalization
+    # _first_timestep_discrete_update applies before forming the posterior), not
+    # the raw prior. Otherwise a non-finite prior entry (e.g. +inf) that the
+    # sanitizer clamps to 0 would be marked reachable here and resurrected to
+    # ~1e-10 at the next step via the log-prior floor, disagreeing with its
+    # exactly-0 first-step posterior. Threaded through the scan and advanced one
+    # transition per step, so an underflowed reachable state is not mistaken for
+    # a structurally impossible one.
+    first_support = _normalize_initial_discrete_prob(init_discrete_state_prob) > 0.0
     (
         (_, _, _, marginal_log_likelihood, _),
         (

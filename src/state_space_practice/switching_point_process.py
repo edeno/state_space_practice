@@ -104,6 +104,7 @@ from state_space_practice.point_process_kalman import _point_process_laplace_upd
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.switching_kalman import (
     _first_timestep_discrete_update,
+    _normalize_initial_discrete_prob,
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture_per_discrete_state,
     switching_kalman_maximization_step,
@@ -2095,8 +2096,12 @@ def _switching_point_process_filter_jit(
         line_search_beta,
     )
 
-    # Structural support S_1 (nonzero prior entries), threaded through the scan.
-    first_support = jnp.asarray(init_discrete_state_prob) > 0.0
+    # Structural support S_1 from the *sanitized* prior (matching the
+    # normalization _first_timestep_discrete_update applies before forming the
+    # first-step posterior), not the raw prior -- else a non-finite prior entry
+    # (e.g. +inf) that the sanitizer clamps to 0 would be marked reachable and
+    # resurrected to ~1e-10 at the next step. Threaded through the scan.
+    first_support = _normalize_initial_discrete_prob(init_discrete_state_prob) > 0.0
     # Run predict-then-update for t=2,...,T
     # jax.lax.scan handles empty inputs (spikes[1:] when n_time=1) gracefully
     (

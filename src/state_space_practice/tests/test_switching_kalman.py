@@ -29,6 +29,7 @@ from state_space_practice.kalman import (
 from state_space_practice.switching_kalman import (
     _compute_expected_complete_log_likelihood_reference,
     _compute_posterior_entropy_reference,
+    _first_timestep_discrete_update,
     _kalman_filter_update_per_discrete_state_pair,
     _kalman_smoother_update_per_discrete_state_pair,
     _update_discrete_state_probabilities,
@@ -278,14 +279,24 @@ def test_update_discrete_probs_pair_marginal_consistency_on_underflow() -> None:
 
 
 def test_update_discrete_probs_supported_all_inf_column_no_nan_backward() -> None:
-    """A supported destination whose likelihood is all -inf must not NaN.
+    """A supported destination whose likelihood is all -inf: no NaN, and its
+    marginal stays exactly 0 so pair.sum(axis=0) == marginal.
 
     Reachable in the point-process filter at zero intensity: state 1 is
     structurally reachable (fully-connected Z) but its observation
-    log-likelihood underflows to -inf for every source. The backward weights
-    must stay finite -- not exp(-inf - -inf) = NaN -- since a NaN there would
-    propagate silently into the collapsed state-conditional mean while the
-    marginal log-likelihood still looks healthy.
+    log-likelihood is -inf for every source (the data rules it out this step).
+    Two properties must hold:
+
+    1. The backward weights stay finite -- not exp(-inf - -inf) = NaN -- since a
+       NaN there would poison the collapsed state-conditional mean while the
+       marginal log-likelihood still looks healthy.
+    2. Its marginal is exactly 0 (the Bayes-correct p(S_t=1 | y_{1:t}) when the
+       observation is impossible for state 1), NOT floored to 1e-10. Flooring it
+       while the backward column sums to 0 would break pair = W * marginal, and
+       the GPB mixture collapse would fabricate a zero-weight mean/covariance for
+       a state carrying (fabricated) positive mass. This is distinct from a
+       *finite* underflow (see the underflow test above), which IS floored to
+       stay recoverable.
     """
     log_likelihood = jnp.array([[0.0, -jnp.inf], [0.0, -jnp.inf]])
     Z = jnp.array([[0.5, 0.5], [0.5, 0.5]])  # state 1 is structurally reachable
@@ -299,8 +310,69 @@ def test_update_discrete_probs_supported_all_inf_column_no_nan_backward() -> Non
     assert not bool(jnp.any(jnp.isnan(w)))  # no NaN backward weights
     assert not bool(jnp.any(jnp.isnan(m_t)))
     assert bool(jnp.isfinite(log_pred))  # state 0 keeps the predictive finite
-    # State 1's observation is impossible -> ~0 marginal, backward column finite.
-    assert float(m_t[1]) < 1e-6
+    # State 1's observation is impossible -> marginal exactly 0 (not floored).
+    assert float(m_t[1]) == 0.0
+    # pair = W * marginal is column-consistent (0 == 0 for the ruled-out column).
+    pair = w * m_t[None, :]
+    np.testing.assert_allclose(
+        np.asarray(pair.sum(axis=0)), np.asarray(m_t), atol=1e-12
+    )
+
+
+def test_first_timestep_impossible_obs_falls_back_to_prior() -> None:
+    """An impossible first observation falls back to the normalized prior.
+
+    When every first-timestep state-conditional log-likelihood is -inf (the
+    observation is impossible under all states), the naive posterior is
+    exp(-inf - -inf) = NaN, silently poisoning the discrete filter. At t=1 there
+    is no dynamics prediction, so the prior itself is the "prediction": dropping
+    the impossible likelihood must recover the normalized prior, mirroring the
+    later-timestep dynamics fallback. Structural zeros in the prior stay 0 and
+    the returned marginal log-likelihood stays finite (floored) for EM.
+    """
+    state_cond_log_lik = jnp.array([-jnp.inf, -jnp.inf, -jnp.inf])
+    prior = jnp.array([0.6, 0.0, 0.4])  # state 1 structurally impossible
+
+    prob, marginal_ll = _first_timestep_discrete_update(state_cond_log_lik, prior)
+
+    assert not bool(jnp.any(jnp.isnan(prob)))
+    # Posterior recovers the (already normalized) prior; structural zero preserved.
+    np.testing.assert_allclose(np.asarray(prob), np.array([0.6, 0.0, 0.4]), rtol=1e-6)
+    assert float(prob[1]) == 0.0
+    # Marginal LL stays finite for EM accumulation, not -inf.
+    assert bool(jnp.isfinite(marginal_ll))
+
+
+def test_first_support_uses_sanitized_prior_no_plus_inf_resurrection() -> None:
+    """A +inf prior entry sanitized to 0 must not be resurrected via the support.
+
+    ``_normalize_initial_discrete_prob`` maps a +inf prior entry to 0, so state
+    1's first-step posterior is exactly 0. If the scan's threaded structural
+    support were derived from the RAW prior (``+inf > 0`` is True) rather than
+    the sanitized one, state 1 would be marked reachable; under an identity
+    transition (which forbids entering state 1 from state 0) it would be
+    resurrected to ~1e-10 at t>=2 via the log-prior floor. Support must come
+    from the sanitized prior so a sanitized-away state stays dead.
+    """
+    init_mean = jnp.array([[0.0, 0.0]])  # (n_cont=1, n_disc=2)
+    init_cov = jnp.array([[[1.0, 1.0]]])  # (1, 1, 2)
+    init_prob = jnp.array([1.0, jnp.inf])  # state 1 prior is +inf (malformed)
+    Z = jnp.eye(2)  # 0->1 forbidden: state 1 reachable only through its prior
+    A = jnp.array([[[1.0, 1.0]]])  # (1, 1, 2)
+    Q = jnp.array([[[0.1, 0.1]]])  # (1, 1, 2)
+    H = jnp.array([[[1.0, 1.0]]])  # (1, 1, 2)
+    R = jnp.array([[[1.0, 1.0]]])  # (1, 1, 2)
+    obs = jnp.array([[0.0], [0.0], [0.0]])  # (n_time=3, n_obs=1)
+
+    _, _, filter_discrete_state_prob, *_ = switching_kalman_filter(
+        init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+    )
+
+    # State 1 is sanitized out at t=1 and cannot be entered from state 0, so it
+    # stays exactly 0 for every t -- not resurrected to ~1e-10 at t>=2.
+    np.testing.assert_array_equal(
+        np.asarray(filter_discrete_state_prob[:, 1]), np.zeros(3)
+    )
 
 
 def test_update_smoother_discrete_probabilities() -> None:
