@@ -551,16 +551,28 @@ def _soft_expected_count(
     """Expected count per bin with a *gradient-preserving* overflow cap.
 
     Equals :func:`_safe_expected_count` (``exp(log_rate*dt)``) below
-    ``max_log_count``, but above the cap it continues ``exp`` **linearly** --
-    value and first derivative matched at the cap -- instead of hard-clipping.
+    ``max_log_count``, but above the cap it continues ``exp``
+    **logarithmically** -- ``exp(cap) * (1 + log1p(overshoot))`` -- instead of
+    hard-clipping.
 
     A hard ``jnp.clip`` has exactly zero gradient above the cap, so an SGD
     surrogate loss that overshoots it freezes with no signal to return: a
     dead-gradient stall, no better than the NaN a raw ``exp`` overflow would
     cause (see ``parameter_transforms.positive_capped`` for the same
-    anti-pattern). The linear continuation never overflows (the value grows only
-    linearly past the cap) yet keeps a strictly positive gradient of order
-    ``exp(max_log_count)`` that pushes an over-large log-rate back down.
+    anti-pattern).
+
+    A *linear* continuation ``exp(cap)*(1 + overshoot)`` fixes the gradient but
+    reintroduces overflow: the value overflows for large finite inputs (e.g.
+    float32 ``log_rate=1e30``, and even float64 well before ``+inf``), and its
+    VJP sends a cotangent of order ``exp(cap)*overshoot`` back through ``exp``,
+    which itself overflows to inf and then ``inf*0 = NaN`` at the clamped
+    ``minimum``. The *logarithmic* continuation keeps the value finite for every
+    finite ``log_rate`` (``log1p`` grows so slowly the product stays well under
+    the dtype max) and the VJP cotangent bounded (order ``exp(cap)*log1p``), so
+    both the value and the gradient are finite across the dtype range. The
+    gradient ``exp(cap)/(1 + overshoot)`` stays strictly positive -- a restoring
+    push toward the cap that decays with the overshoot but never vanishes or
+    NaNs. Value and first derivative match ``exp`` at the cap.
 
     Unlike :func:`_safe_expected_count` there is no lower clip: SGD callers floor
     ``log(mu)`` on the rate they read back, so the underflow direction needs no
@@ -573,24 +585,23 @@ def _soft_expected_count(
     dt : float
         Bin width in seconds.
     max_log_count : float, default 20.0
-        Log expected-count above which ``exp`` is continued linearly.
+        Log expected-count above which ``exp`` is continued logarithmically.
 
     Returns
     -------
     Array
-        Expected count per bin, finite for every finite ``log_rate``.
+        Expected count per bin, finite (value and gradient) for every finite
+        ``log_rate``.
     """
     dt_array = jnp.asarray(dt, dtype=log_rate.dtype)
     log_count = log_rate + jnp.log(dt_array)
-    # exp is evaluated ONLY on the capped argument, so it never overflows; above
-    # the cap the linear ``overshoot`` term carries the (exp(cap)-scale)
-    # gradient. Both jnp.where branches are finite, so the gradient is NaN-free.
+    # exp is evaluated ONLY on the capped argument, so it never overflows. Above
+    # the cap, ``log1p(overshoot)`` carries a bounded, positive gradient; because
+    # log1p grows slowly, neither the value nor the VJP cotangent overflows, so
+    # the gradient is finite (a linear ``overshoot`` here would NaN it).
     capped = jnp.minimum(log_count, max_log_count)
-    capped_exp = jnp.exp(capped)
-    overshoot = log_count - max_log_count
-    return jnp.where(
-        log_count > max_log_count, capped_exp * (1.0 + overshoot), capped_exp
-    )
+    overshoot = jnp.maximum(log_count - max_log_count, 0.0)
+    return jnp.exp(capped) * (1.0 + jnp.log1p(overshoot))
 
 
 def _point_process_laplace_update(

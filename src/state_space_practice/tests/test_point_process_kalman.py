@@ -16,6 +16,8 @@ from state_space_practice.point_process_kalman import (
     _is_block_diagonal,
     _logdet_psd,
     _point_process_laplace_update,
+    _safe_expected_count,
+    _soft_expected_count,
     _stochastic_point_process_filter_block_diagonal,
     _stochastic_point_process_smoother_block_diagonal,
     _validate_filter_numerics,
@@ -29,6 +31,36 @@ from state_space_practice.point_process_kalman import (
 
 # Enable 64-bit precision for numerical stability
 jax.config.update("jax_enable_x64", True)
+
+
+def test_soft_expected_count_finite_across_dtype_and_matches_below_cap():
+    """_soft_expected_count keeps value AND gradient finite for any finite
+    log-rate (across dtypes), and equals _safe_expected_count below the cap.
+
+    A linear continuation ``exp(cap)*(1+overshoot)`` overflows for large finite
+    inputs -- float32 ``log_rate=1e30`` (and even float64 ``1e300``) -> inf
+    value -- and its VJP sends a huge cotangent back through ``exp``, overflowing
+    to inf and then ``inf*0 = NaN`` gradient. The logarithmic continuation
+    ``exp(cap)*(1+log1p(overshoot))`` stays finite (log grows slowly) and keeps a
+    strictly positive, finite restoring gradient.
+    """
+    # Below the cap it must equal the hard-clip expected count exactly.
+    z = jnp.array([-10.0, -3.0, 0.0, 5.0])
+    np.testing.assert_allclose(
+        np.asarray(_soft_expected_count(z, 0.001)),
+        np.asarray(_safe_expected_count(z, 0.001)),
+        rtol=1e-12,
+    )
+    # Large finite inputs across dtypes: value and restoring gradient stay finite.
+    for dt, log_rate in [
+        (jnp.float32(0.001), jnp.float32(1e30)),
+        (jnp.float64(0.001), jnp.float64(1e300)),
+    ]:
+        value = _soft_expected_count(log_rate, dt)
+        grad = jax.grad(lambda x, dt=dt: _soft_expected_count(x, dt).sum())(log_rate)
+        assert bool(jnp.isfinite(value)), f"value not finite ({log_rate.dtype})"
+        assert bool(jnp.isfinite(grad)), f"grad not finite ({log_rate.dtype})"
+        assert float(grad) > 0.0, f"restoring gradient not positive ({log_rate.dtype})"
 
 
 class TestLogConditionalIntensity:
