@@ -33,6 +33,7 @@ from jax import Array
 from state_space_practice.kalman import symmetrize
 from state_space_practice.oscillator_utils import (
     canonicalize_correlated_noise_pair_parameters,
+    compute_directed_influence_stability_scale,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
     construct_correlated_noise_process_covariance,
@@ -42,7 +43,7 @@ from state_space_practice.oscillator_utils import (
 )
 from state_space_practice.switching_kalman import (
     compute_transition_sufficient_stats,
-    optimize_dim_transition_params,
+    optimize_dim_transition_params_joint,
     switching_kalman_maximization_step,
     switching_kalman_smoother,
     switching_kalman_smoother_gpb2,
@@ -1891,7 +1892,7 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         self.phase_difference = phase_difference.at[diag_idx, diag_idx, :].set(0.0)
         self.coupling_strength = coupling_strength.at[diag_idx, diag_idx, :].set(0.0)
         self.use_reparameterized_mstep = use_reparameterized_mstep
-        self._current_osc_params: Optional[list[dict]] = None
+        self._current_osc_params: Optional[dict] = None
 
     def _initialize_continuous_transition_matrix(self) -> None:
         """A varies across states: directed influence coupling structure."""
@@ -1975,55 +1976,65 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             pair_cond_smoother_means=self.smoother_pair_cond_means,
         )
 
+        # Initialize the joint warm start from the current shared/public
+        # scientific parameters (matching the Gaussian DirectedInfluenceModel).
         if self._current_osc_params is None:
-            self._current_osc_params = []
-            for j in range(self.n_discrete_states):
-                params = extract_dim_params_from_matrix(
-                    self.continuous_transition_matrix[:, :, j],
-                    self.sampling_freq,
-                    self.n_oscillators,
-                )
-                self._current_osc_params.append(params)
+            self._current_osc_params = {
+                "freq": self.freqs,
+                "damping": self.damping_coef,
+                "coupling_strength": self.coupling_strength,
+                "phase_diff": self.phase_difference,
+            }
 
-        A_list = []
-        for j in range(self.n_discrete_states):
-            opt_params = optimize_dim_transition_params(
-                gamma1=gamma1[:, :, j],
-                beta=beta[:, :, j],
-                init_params=self._current_osc_params[j],
-                sampling_freq=self.sampling_freq,
-                process_cov=self.process_cov[:, :, j],
-            )
-            self._current_osc_params[j] = opt_params
-
-            A_j = construct_directed_influence_transition_matrix(
-                freqs=opt_params["freq"],
-                damping_coeffs=opt_params["damping"],
-                coupling_strengths=opt_params["coupling_strength"],
-                phase_diffs=opt_params["phase_diff"],
-                sampling_freq=self.sampling_freq,
-            )
-            A_list.append(A_j)
-
-        self.continuous_transition_matrix = jnp.stack(A_list, axis=-1)
+        # Jointly optimize the shared frequency/damping and per-state
+        # coupling/phase in ONE objective, rather than optimizing each state
+        # independently and averaging the inconsistent shared parameters.
+        self._current_osc_params = optimize_dim_transition_params_joint(
+            gamma1=gamma1,
+            beta=beta,
+            init_params=self._current_osc_params,
+            sampling_freq=self.sampling_freq,
+            process_cov=self.process_cov,
+        )
         self._update_public_oscillator_params()
 
+        # Build A from the effective (globally stabilized) parameters -- the same
+        # differentiable stability scale the joint objective used. Public
+        # freq/damping/coupling stay intrinsic; A re-applies the scale, so it is
+        # reconstructable via compute_directed_influence_stability_scale.
+        scale = compute_directed_influence_stability_scale(
+            self.freqs,
+            self.damping_coef,
+            self.coupling_strength,
+            self.sampling_freq,
+        )
+        effective_damping = self.damping_coef * scale
+        effective_coupling = self.coupling_strength * scale
+        A_list = [
+            construct_directed_influence_transition_matrix(
+                freqs=self.freqs,
+                damping_coeffs=effective_damping,
+                coupling_strengths=effective_coupling[:, :, j],
+                phase_diffs=self.phase_difference[:, :, j],
+                sampling_freq=self.sampling_freq,
+            )
+            for j in range(self.n_discrete_states)
+        ]
+        self.continuous_transition_matrix = jnp.stack(A_list, axis=-1)
+
     def _update_public_oscillator_params(self) -> None:
-        """Sync optimized oscillator params to public attributes."""
+        """Sync the joint optimizer solution to the public attributes.
+
+        Frequency/damping are already shared (one joint solution); coupling and
+        phase retain their discrete-state axis. No post-hoc averaging.
+        """
         if self._current_osc_params is None:
             return
 
-        freqs_list = [p["freq"] for p in self._current_osc_params]
-        damping_list = [p["damping"] for p in self._current_osc_params]
-
-        self.freqs = jnp.mean(jnp.stack(freqs_list, axis=-1), axis=-1)
-        self.damping_coef = jnp.mean(jnp.stack(damping_list, axis=-1), axis=-1)
-
-        coupling_list = [p["coupling_strength"] for p in self._current_osc_params]
-        phase_list = [p["phase_diff"] for p in self._current_osc_params]
-
-        self.coupling_strength = jnp.stack(coupling_list, axis=-1)
-        self.phase_difference = jnp.stack(phase_list, axis=-1)
+        self.freqs = self._current_osc_params["freq"]
+        self.damping_coef = self._current_osc_params["damping"]
+        self.coupling_strength = self._current_osc_params["coupling_strength"]
+        self.phase_difference = self._current_osc_params["phase_diff"]
 
     def _project_parameters(self) -> None:
         """Project A to oscillatory block structure and enforce stability.

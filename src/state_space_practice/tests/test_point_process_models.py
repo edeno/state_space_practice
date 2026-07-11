@@ -714,17 +714,21 @@ class TestDirectedInfluencePointProcessModel:
             )
 
         def fake_optimize(**_kwargs):
+            # The joint optimizer returns shared freq/damping and per-state
+            # (n_osc, n_osc, n_states) coupling/phase.
             return {
                 "freq": jnp.array([8.0]),
                 "damping": jnp.array([0.95]),
-                "coupling_strength": jnp.zeros((1, 1)),
-                "phase_diff": jnp.zeros((1, 1)),
+                "coupling_strength": jnp.zeros((1, 1, 1)),
+                "phase_diff": jnp.zeros((1, 1, 1)),
             }
 
         monkeypatch.setattr(
             pp_models, "switching_kalman_maximization_step", fake_m_step
         )
-        monkeypatch.setattr(pp_models, "optimize_dim_transition_params", fake_optimize)
+        monkeypatch.setattr(
+            pp_models, "optimize_dim_transition_params_joint", fake_optimize
+        )
 
         model._m_step_reparameterized()
 
@@ -732,6 +736,54 @@ class TestDirectedInfluencePointProcessModel:
         eigvals = jnp.linalg.eigvalsh(model.init_cov[:, :, 0])
         assert jnp.min(eigvals) >= 1e-4 - 1e-10
         assert jnp.max(eigvals) <= 2.0 + 1e-10
+
+    def test_reparameterized_mstep_produces_stable_reconstructable_A(
+        self, dim_pp_params
+    ) -> None:
+        """The joint reparameterized M-step must leave a stable A that
+        reconstructs from the intrinsic public params via the shared scale
+        (no damping drift; A applies the global stability scale)."""
+        from state_space_practice.oscillator_utils import (
+            compute_directed_influence_stability_scale,
+            construct_directed_influence_transition_matrix,
+        )
+
+        params = dict(dim_pp_params)
+        params["coupling_strength"] = (
+            jnp.zeros_like(params["coupling_strength"])
+            .at[0, 1, :]
+            .set(0.4)
+            .at[1, 0, :]
+            .set(0.4)
+        )
+        model = DirectedInfluencePointProcessModel(
+            **params, use_reparameterized_mstep=True
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(1), 0.3, (150, model.n_neurons)
+        ).astype(float)
+        model.fit(spikes, max_iter=5, key=jax.random.PRNGKey(0))
+
+        assert isinstance(model._current_osc_params, dict)  # joint (not per-state)
+        assert bool(jnp.all((model.damping_coef >= 0) & (model.damping_coef <= 1)))
+        scale = compute_directed_influence_stability_scale(
+            model.freqs,
+            model.damping_coef,
+            model.coupling_strength,
+            model.sampling_freq,
+        )
+        for j in range(model.n_discrete_states):
+            A = model.continuous_transition_matrix[:, :, j]
+            assert float(jnp.max(jnp.abs(jnp.linalg.eigvals(A)))) <= 0.99 + 1e-6
+            recon = construct_directed_influence_transition_matrix(
+                freqs=model.freqs,
+                damping_coeffs=model.damping_coef * scale,
+                coupling_strengths=model.coupling_strength[:, :, j] * scale,
+                phase_diffs=model.phase_difference[:, :, j],
+                sampling_freq=model.sampling_freq,
+            )
+            np.testing.assert_allclose(A, recon, atol=1e-9)
 
 
 # ============================================================================
