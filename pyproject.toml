@@ -39,6 +39,9 @@ dynamic = ["version"]
 [project.optional-dependencies]
 test = ["black", "pytest", "pytest-cov", "hypothesis", "ruff", "mypy"]
 coupling = ["polyagamma"]
+# Graph place-field substrate (graph_place_field). Optional so core installs stay
+# reproducible until neurospatial 0.8.0 is published to PyPI (see [tool.uv.sources]).
+spatial = ["neurospatial>=0.8.0"]
 gpu = ["jax[cuda]"]
 viz = ["sortingview"]
 
@@ -87,3 +90,9 @@ packages = ["state_space_practice"]
 ignore_missing_imports = true
 warn_return_any = true
 warn_unused_ignores = true
+
+[tool.uv.sources]
+# Temporary: neurospatial 0.8.0 (the version the `spatial` extra requires) is not yet
+# on PyPI. Remove this local editable override once 0.8.0 is published; the `>=0.8.0`
+# pin in the `spatial` optional-dependency then resolves from PyPI.
+neurospatial = { path = "../neurospatial", editable = true }
