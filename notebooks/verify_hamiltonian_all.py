@@ -81,7 +81,7 @@ def run_verification():
     # 1. VERIFY LFP MODEL
     print("\n[1/4] Verifying LFP-only Model...")
     m_lfp = HamiltonianLFPModel(1, 1, sampling_freq)
-    m_lfp.fit_sgd(lfp, key=jax.random.PRNGKey(2), num_steps=200, verbose=False)
+    m_lfp.fit_sgd(lfp, num_steps=200, verbose=False)
     p_lfp, _ = m_lfp._build_param_spec()
     res_lfp = compute_metrics(m_lfp, x_true, p_lfp)
     res_lfp["Model"] = "LFP-only"
@@ -90,7 +90,7 @@ def run_verification():
     # 2. VERIFY SPIKE MODEL
     print("[2/4] Verifying Spike-only Model...")
     m_spk = HamiltonianSpikeModel(1, 10, sampling_freq)
-    m_spk.fit_sgd(spikes, key=jax.random.PRNGKey(3), num_steps=200, verbose=False)
+    m_spk.fit_sgd(spikes, num_steps=200, verbose=False)
     p_spk, _ = m_spk._build_param_spec()
     res_spk = compute_metrics(m_spk, x_true, p_spk)
     res_spk["Model"] = "Spike-only"
@@ -99,7 +99,7 @@ def run_verification():
     # 3. VERIFY JOINT MODEL
     print("[3/4] Verifying Joint Model...")
     m_jnt = JointHamiltonianModel(1, 1, 10, sampling_freq)
-    m_jnt.fit_sgd(lfp, spikes, key=jax.random.PRNGKey(4), num_steps=200, verbose=False)
+    m_jnt.fit_sgd(lfp, spikes, num_steps=200, verbose=False)
     p_jnt, _ = m_jnt._build_param_spec()
     res_jnt = compute_metrics(m_jnt, x_true, p_jnt)
     res_jnt["Model"] = "Joint (LFP+Spk)"
@@ -108,7 +108,7 @@ def run_verification():
     # 4. VERIFY SWITCHING MODEL
     print("[4/4] Verifying Switching Model...")
     m_swi = SwitchingHamiltonianJointModel(1, 2, 1, 10, sampling_freq)
-    m_swi.fit_sgd(lfp, spikes, key=jax.random.PRNGKey(5), num_steps=200, verbose=False)
+    m_swi.fit_sgd(lfp, spikes, num_steps=200, verbose=False)
     p_swi, _ = m_swi._build_param_spec()
     res_swi = compute_metrics(m_swi, x_true, p_swi)
     res_swi["Model"] = "Switching (K=2)"

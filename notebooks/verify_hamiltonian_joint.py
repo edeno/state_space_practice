@@ -47,9 +47,9 @@ def main():
     
     print("Fitting JointHamiltonianModel (LFP + Spikes)...")
     # Pre-train deterministic
-    model.fit_sgd(lfp, spikes, key=jax.random.PRNGKey(2), num_steps=200, use_filter=False, verbose=True)
+    model.fit_sgd(lfp, spikes, num_steps=200, use_filter=False, verbose=True)
     # Fine-tune Filtered
-    model.fit_sgd(lfp, spikes, key=jax.random.PRNGKey(3), num_steps=100, use_filter=True, verbose=True)
+    model.fit_sgd(lfp, spikes, num_steps=100, use_filter=True, verbose=True)
     
     # Evaluate
     params, _ = model._build_param_spec()

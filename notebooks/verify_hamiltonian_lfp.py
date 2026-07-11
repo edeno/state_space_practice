@@ -57,18 +57,18 @@ def main():
         n_sources=1,
         sampling_freq=sampling_freq,
         hidden_dims=[32, 32],
-        seed=42
+        seed=42,
+        obs_noise_std=0.05,
     )
-    model.obs_noise_std = 0.05 # Slightly higher than true for robustness
     model._sgd_n_time = n_time
     
     print("Fitting HamiltonianLFPModel (EKF-based SGD)...")
     # Pre-train for 100 steps with deterministic rollout (faster)
-    history_det = model.fit_sgd(lfp, key=jax.random.PRNGKey(2), num_steps=200, use_filter=False, verbose=True)
+    history_det = model.fit_sgd(lfp, num_steps=200, use_filter=False, verbose=True)
     
     # Fine-tune with EKF for 100 steps
     print("Fine-tuning with EKF marginal likelihood...")
-    history_ekf = model.fit_sgd(lfp, key=jax.random.PRNGKey(3), num_steps=100, use_filter=True, verbose=True)
+    history_ekf = model.fit_sgd(lfp, num_steps=100, use_filter=True, verbose=True)
     
     # 3. Filter the data to get latent estimates
     params, _ = model._build_param_spec()

@@ -70,11 +70,11 @@ def main():
     
     print("Fitting HamiltonianSpikeModel (Deterministic -> Laplace-EKF)...")
     # 1. Faster deterministic pre-training
-    model.fit_sgd(spikes_train, key=jax.random.PRNGKey(2), num_steps=200, verbose=True, l2_reg=1e-3, use_filter=False)
+    model.fit_sgd(spikes_train, num_steps=200, verbose=True, l2_reg=1e-3, use_filter=False)
     
     # 2. Refined Laplace-EKF fine-tuning
     print("Fine-tuning with Laplace-EKF...")
-    model.fit_sgd(spikes_train, key=jax.random.PRNGKey(3), num_steps=100, verbose=True, l2_reg=1e-3, use_filter=True)
+    model.fit_sgd(spikes_train, num_steps=100, verbose=True, l2_reg=1e-3, use_filter=True)
     
     # 1. EVALUATE METRICS
     params, _ = model._build_param_spec()
