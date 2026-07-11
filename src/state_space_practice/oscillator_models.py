@@ -63,6 +63,7 @@ from state_space_practice.switching_kalman import (
     switching_kalman_filter,
     switching_kalman_maximization_step,
     switching_kalman_smoother,
+    switching_kalman_smoother_gpb2,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import (
@@ -243,6 +244,9 @@ class BaseModel(ABC, SGDFittableMixin):
         Flag to update initial mean during M-step.
     update_init_cov : bool, default=True
         Flag to update initial covariance during M-step.
+    smoother_type : {"gpb1", "gpb2"}, default="gpb1"
+        Approximate switching smoother. GPB2 retains pair-conditioned
+        continuous-state statistics and is more accurate but more expensive.
 
     Attributes
     ----------
@@ -272,6 +276,8 @@ class BaseModel(ABC, SGDFittableMixin):
         "smoother_joint_discrete_state_prob",
         "smoother_pair_cond_cross_cov",
         "smoother_pair_cond_means",
+        "smoother_pair_cond_covs",
+        "smoother_next_pair_cond_means",
         "continuous_transition_matrix",
         "process_cov",
         "measurement_matrix",
@@ -303,12 +309,18 @@ class BaseModel(ABC, SGDFittableMixin):
         update_measurement_cov: bool = True,
         update_init_mean: bool = True,
         update_init_cov: bool = True,
+        smoother_type: str = "gpb1",
     ):
         _validate_positive_scalar("sampling_freq", sampling_freq)
+        if smoother_type not in ("gpb1", "gpb2"):
+            raise ValueError(
+                f"smoother_type must be 'gpb1' or 'gpb2', got {smoother_type!r}."
+            )
         self.n_oscillators = n_oscillators
         self.n_discrete_states = n_discrete_states
         self.n_sources = n_sources
         self.sampling_freq = sampling_freq
+        self.smoother_type = smoother_type
         self.n_cont_states = 2 * n_oscillators
 
         # Set default diagonal if not provided.
@@ -378,7 +390,7 @@ class BaseModel(ABC, SGDFittableMixin):
         self.measurement_cov: jax.Array
 
         # Placeholders for smoother results (Expected Sufficient Statistics - ESS).
-        # Optional because a failed E-step reset (see _reset_smoother_outputs)
+        # Optional because a failed E-step reset (see _clear_smoother_state)
         # sets them to None so decode()/predict_proba() guards fire.
         self.smoother_state_cond_mean: Optional[jax.Array]
         self.smoother_state_cond_cov: Optional[jax.Array]
@@ -386,6 +398,8 @@ class BaseModel(ABC, SGDFittableMixin):
         self.smoother_joint_discrete_state_prob: Optional[jax.Array]
         self.smoother_pair_cond_cross_cov: Optional[jax.Array]
         self.smoother_pair_cond_means: Optional[jax.Array]  # E[x|S_t=i,S_{t+1}=j]
+        self.smoother_pair_cond_covs: Optional[jax.Array]
+        self.smoother_next_pair_cond_means: Optional[jax.Array]
 
     def _snapshot_em_state(self) -> dict:
         """Capture parameters and smoother outputs for EM rollback.
@@ -427,6 +441,8 @@ class BaseModel(ABC, SGDFittableMixin):
         self.smoother_state_cond_cov = None
         self.smoother_pair_cond_cross_cov = None
         self.smoother_pair_cond_means = None
+        self.smoother_pair_cond_covs = None
+        self.smoother_next_pair_cond_means = None
 
     def __repr__(self) -> str:
         """Returns an unambiguous string representation of the model.
@@ -442,6 +458,7 @@ class BaseModel(ABC, SGDFittableMixin):
             f"n_discrete_states={self.n_discrete_states}",
             f"n_sources={self.n_sources}",
             f"sampling_freq={self.sampling_freq}",
+            f"smoother_type={self.smoother_type!r}",
         ]
 
         # Add update flags for clarity
@@ -773,11 +790,10 @@ class BaseModel(ABC, SGDFittableMixin):
     def _e_step(self, observations: ArrayLike) -> jax.Array:
         """Performs the Expectation (E) step of the approximate EM algorithm.
 
-        Runs the switching Kalman filter and GPB1/IMM approximate smoother
-        to compute collapsed sufficient statistics and the marginal
-        log-likelihood.  Because the smoother collapses K^2 mixture
-        components to K at each step, the sufficient statistics are
-        approximate and exact EM monotonicity does not hold.
+        Runs the switching Kalman filter and the configured GPB1 or GPB2
+        approximate smoother to compute sufficient statistics and the marginal
+        log-likelihood. Both smoothers use moment matching, so exact EM
+        monotonicity does not hold.
 
         Parameters
         ----------
@@ -795,8 +811,8 @@ class BaseModel(ABC, SGDFittableMixin):
             filter_cov,
             filter_discrete_state_prob,
             pair_cond_filter_mean,
-            _,  # pair_cond_filter_cov trajectory (used by GPB2 only)
-            _,  # pair_cond_filter_prob trajectory (used by GPB2 only)
+            pair_cond_filter_cov,
+            pair_cond_filter_prob,
             marginal_log_likelihood,
         ) = switching_kalman_filter(
             init_state_cond_mean=self.init_mean,
@@ -810,25 +826,51 @@ class BaseModel(ABC, SGDFittableMixin):
             measurement_cov=self.measurement_cov,
         )
 
-        (
-            _,  # smoother_mean (marginal)
-            _,  # smoother_cov (marginal)
-            self.smoother_discrete_state_prob,
-            self.smoother_joint_discrete_state_prob,
-            _,  # smoother_cross_cov (marginal)
-            self.smoother_state_cond_mean,
-            self.smoother_state_cond_cov,
-            self.smoother_pair_cond_cross_cov,
-            self.smoother_pair_cond_means,  # E[x_t | S_t=i, S_{t+1}=j]
-        ) = switching_kalman_smoother(
+        smoother_args = dict(
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_discrete_state_prob,
-            last_filter_conditional_cont_mean=pair_cond_filter_mean[-1],
             process_cov=self.process_cov,
             continuous_transition_matrix=self.continuous_transition_matrix,
-            discrete_state_transition_matrix=self.discrete_transition_matrix,
         )
+
+        if self.smoother_type == "gpb2":
+            (
+                _,  # smoother_mean (marginal)
+                _,  # smoother_cov (marginal)
+                self.smoother_discrete_state_prob,
+                self.smoother_joint_discrete_state_prob,
+                _,  # smoother_cross_cov (marginal)
+                self.smoother_state_cond_mean,
+                self.smoother_state_cond_cov,
+                self.smoother_pair_cond_cross_cov,
+                self.smoother_pair_cond_means,
+                self.smoother_pair_cond_covs,
+                self.smoother_next_pair_cond_means,
+            ) = switching_kalman_smoother_gpb2(
+                **smoother_args,
+                pair_cond_filter_mean=pair_cond_filter_mean,
+                pair_cond_filter_cov=pair_cond_filter_cov,
+                pair_cond_filter_prob=pair_cond_filter_prob,
+            )
+        else:
+            (
+                _,  # smoother_mean (marginal)
+                _,  # smoother_cov (marginal)
+                self.smoother_discrete_state_prob,
+                self.smoother_joint_discrete_state_prob,
+                _,  # smoother_cross_cov (marginal)
+                self.smoother_state_cond_mean,
+                self.smoother_state_cond_cov,
+                self.smoother_pair_cond_cross_cov,
+                self.smoother_pair_cond_means,
+            ) = switching_kalman_smoother(
+                **smoother_args,
+                last_filter_conditional_cont_mean=pair_cond_filter_mean[-1],
+                discrete_state_transition_matrix=self.discrete_transition_matrix,
+            )
+            self.smoother_pair_cond_covs = None
+            self.smoother_next_pair_cond_means = None
 
         return jnp.asarray(marginal_log_likelihood)
 
@@ -868,6 +910,8 @@ class BaseModel(ABC, SGDFittableMixin):
             smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
             pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
             pair_cond_smoother_means=self.smoother_pair_cond_means,
+            pair_cond_smoother_covs=self.smoother_pair_cond_covs,
+            next_pair_cond_smoother_means=self.smoother_next_pair_cond_means,
             transition_prior=self.transition_prior,
         )
 
@@ -2018,6 +2062,8 @@ class DirectedInfluenceModel(BaseModel):
             smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
             pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
             pair_cond_smoother_means=self.smoother_pair_cond_means,
+            pair_cond_smoother_covs=self.smoother_pair_cond_covs,
+            next_pair_cond_smoother_means=self.smoother_next_pair_cond_means,
             transition_prior=self.transition_prior,
         )
 
@@ -2045,6 +2091,8 @@ class DirectedInfluenceModel(BaseModel):
                 smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
                 pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
                 pair_cond_smoother_means=self.smoother_pair_cond_means,
+                pair_cond_smoother_covs=self.smoother_pair_cond_covs,
+                next_pair_cond_smoother_means=self.smoother_next_pair_cond_means,
             )
 
             # Initialize current_osc_params if not already done

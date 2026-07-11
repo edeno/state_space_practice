@@ -2109,6 +2109,132 @@ class TestDirectedInfluenceRegularizedSGD:
 # ============================================================================
 
 
+class TestOscillatorSmootherSelection:
+    """Oscillator models should expose the shared GPB1/GPB2 implementations."""
+
+    def test_invalid_smoother_type_raises(self, common_oscillator_params) -> None:
+        with pytest.raises(ValueError, match="smoother_type"):
+            CommonOscillatorModel(
+                **common_oscillator_params,
+                smoother_type="exact",
+            )
+
+    def test_gpb1_leaves_gpb2_only_statistics_empty(
+        self, common_oscillator_params
+    ) -> None:
+        model = CommonOscillatorModel(
+            **common_oscillator_params,
+            smoother_type="gpb1",
+        )
+        obs = jax.random.normal(jax.random.PRNGKey(0), (20, model.n_sources))
+        model._initialize_parameters(jax.random.PRNGKey(1))
+        model._e_step(obs)
+
+        assert model.smoother_pair_cond_covs is None
+        assert model.smoother_next_pair_cond_means is None
+
+    def test_gpb2_statistics_reach_generic_mstep(
+        self, common_oscillator_params, monkeypatch
+    ) -> None:
+        import state_space_practice.oscillator_models as oscillator_models
+
+        model = CommonOscillatorModel(
+            **common_oscillator_params,
+            smoother_type="gpb2",
+        )
+        obs = jax.random.normal(jax.random.PRNGKey(2), (20, model.n_sources))
+        model._initialize_parameters(jax.random.PRNGKey(3))
+        ll = model._e_step(obs)
+
+        n_time = obs.shape[0]
+        n_cont = model.n_cont_states
+        n_states = model.n_discrete_states
+        assert jnp.isfinite(ll)
+        assert model.smoother_pair_cond_covs is not None
+        assert model.smoother_next_pair_cond_means is not None
+        assert model.smoother_pair_cond_covs.shape == (
+            n_time - 1,
+            n_cont,
+            n_cont,
+            n_states,
+            n_states,
+        )
+        assert model.smoother_next_pair_cond_means.shape == (
+            n_time - 1,
+            n_cont,
+            n_states,
+            n_states,
+        )
+
+        real_mstep = oscillator_models.switching_kalman_maximization_step
+        captured = {}
+
+        def capture_mstep(**kwargs):
+            captured.update(kwargs)
+            return real_mstep(**kwargs)
+
+        monkeypatch.setattr(
+            oscillator_models,
+            "switching_kalman_maximization_step",
+            capture_mstep,
+        )
+        model._m_step(obs)
+
+        assert captured["pair_cond_smoother_covs"] is model.smoother_pair_cond_covs
+        assert (
+            captured["next_pair_cond_smoother_means"]
+            is model.smoother_next_pair_cond_means
+        )
+        assert jnp.all(jnp.isfinite(model.measurement_matrix))
+
+    def test_gpb2_statistics_reach_reparameterized_dim_update(
+        self, monkeypatch
+    ) -> None:
+        import state_space_practice.oscillator_models as oscillator_models
+
+        model = DirectedInfluenceModel(
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.9]),
+            process_variance=jnp.array([0.1, 0.1]),
+            measurement_variance=0.05,
+            phase_difference=jnp.zeros((2, 2, 2)),
+            coupling_strength=jnp.zeros((2, 2, 2)),
+            use_reparameterized_mstep=True,
+            smoother_type="gpb2",
+        )
+        obs = jax.random.normal(jax.random.PRNGKey(4), (20, model.n_sources))
+        model._initialize_parameters(jax.random.PRNGKey(5))
+        model._e_step(obs)
+
+        real_stats = oscillator_models.compute_transition_sufficient_stats
+        captured = {}
+
+        def capture_stats(**kwargs):
+            captured.update(kwargs)
+            return real_stats(**kwargs)
+
+        monkeypatch.setattr(
+            oscillator_models,
+            "compute_transition_sufficient_stats",
+            capture_stats,
+        )
+        monkeypatch.setattr(
+            oscillator_models,
+            "optimize_dim_transition_params",
+            lambda **kwargs: kwargs["init_params"],
+        )
+        model._m_step_reparameterized(obs)
+
+        assert captured["pair_cond_smoother_covs"] is model.smoother_pair_cond_covs
+        assert (
+            captured["next_pair_cond_smoother_means"]
+            is model.smoother_next_pair_cond_means
+        )
+
+
 class TestBaseModelStickiness:
     """Test that stickiness parameter biases transition matrix toward self-transitions."""
 
