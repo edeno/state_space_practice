@@ -43,6 +43,7 @@ from state_space_practice.switching_kalman import (
     compute_posterior_entropy,
     compute_transition_q_function,
     optimize_dim_transition_params,
+    optimize_dim_transition_params_joint,
     switching_kalman_filter,
     switching_kalman_maximization_step,
     switching_kalman_smoother,
@@ -6382,6 +6383,157 @@ def test_optimize_dim_transition_params_raises_on_nonfinite_solution(
             sampling_freq=100.0,
             raise_on_failure=True,
         )
+
+
+def test_joint_dim_optimizer_packs_shared_and_state_specific_params(
+    monkeypatch,
+) -> None:
+    """The joint optimizer should run one BFGS solve with shared f/d params."""
+    import jax.scipy.optimize as jax_opt
+
+    calls = {}
+
+    class FakeResult:
+        def __init__(self, x, fun):
+            self.x = x
+            self.status = jnp.array(0)
+            self.fun = fun
+            self.nit = jnp.array(0)
+
+    def fake_minimize(fun, x0, args=(), *, method, tol, options):
+        del args
+        calls["method"] = method
+        calls["tol"] = tol
+        calls["options"] = options
+        calls["x0_shape"] = x0.shape
+        return FakeResult(x0, fun(x0))
+
+    monkeypatch.setattr(jax_opt, "minimize", fake_minimize)
+
+    n_states = 3
+    init_params = {
+        "damping": jnp.array([0.95, 0.9]),
+        "freq": jnp.array([8.0, 12.0]),
+        "coupling_strength": jnp.zeros((2, 2, n_states)),
+        "phase_diff": jnp.zeros((2, 2, n_states)),
+    }
+    opt = optimize_dim_transition_params_joint(
+        gamma1=jnp.stack([jnp.eye(4)] * n_states, axis=-1),
+        beta=jnp.stack([0.8 * jnp.eye(4)] * n_states, axis=-1),
+        init_params=init_params,
+        sampling_freq=100.0,
+        max_iter=7,
+        tol=1e-5,
+    )
+
+    assert calls == {
+        "method": "BFGS",
+        "tol": 1e-5,
+        "options": {"maxiter": 7},
+        # shared damping/frequency: 4; two directed edges x three states,
+        # with one magnitude and phase each: 12.
+        "x0_shape": (16,),
+    }
+    assert opt["damping"].shape == (2,)
+    assert opt["freq"].shape == (2,)
+    assert opt["coupling_strength"].shape == (2, 2, n_states)
+    assert opt["phase_diff"].shape == (2, 2, n_states)
+
+
+def test_joint_dim_optimizer_improves_total_q_and_returns_stable_dynamics() -> None:
+    """The accepted joint candidate should improve Q across all states."""
+    from state_space_practice.oscillator_utils import (
+        compute_directed_influence_stability_scale,
+        construct_directed_influence_transition_matrix,
+    )
+
+    sampling_freq = 100.0
+    n_states = 2
+    target_freq = jnp.array([8.0, 13.0])
+    target_damping = jnp.array([0.9, 0.86])
+    target_coupling = jnp.zeros((2, 2, n_states))
+    target_coupling = target_coupling.at[0, 1, :].set(jnp.array([0.04, 0.08]))
+    target_coupling = target_coupling.at[1, 0, :].set(jnp.array([0.03, 0.06]))
+    target_phase = jnp.zeros_like(target_coupling)
+    target_phase = target_phase.at[0, 1, :].set(jnp.array([0.2, -0.4]))
+    target_phase = target_phase.at[1, 0, :].set(jnp.array([-0.1, 0.3]))
+
+    target_A = jax.vmap(
+        lambda coupling, phase: construct_directed_influence_transition_matrix(
+            target_freq,
+            target_damping,
+            coupling,
+            phase,
+            sampling_freq,
+        ),
+        in_axes=(-1, -1),
+        out_axes=-1,
+    )(target_coupling, target_phase)
+    gamma1 = jnp.stack([jnp.eye(4)] * n_states, axis=-1)
+    beta = target_A
+    process_cov = jnp.stack([jnp.eye(4)] * n_states, axis=-1)
+    init_params = {
+        "damping": jnp.array([0.72, 0.75]),
+        "freq": jnp.array([5.0, 10.0]),
+        "coupling_strength": jnp.full((2, 2, n_states), 0.01)
+        .at[jnp.arange(2), jnp.arange(2), :]
+        .set(0.0),
+        "phase_diff": jnp.zeros((2, 2, n_states)),
+    }
+
+    def total_q(params):
+        scale = compute_directed_influence_stability_scale(
+            params["freq"],
+            params["damping"],
+            params["coupling_strength"],
+            sampling_freq,
+        )
+        effective_damping = params["damping"] * scale
+        effective_coupling = params["coupling_strength"] * scale
+        A = jax.vmap(
+            lambda coupling, phase: construct_directed_influence_transition_matrix(
+                params["freq"],
+                effective_damping,
+                coupling,
+                phase,
+                sampling_freq,
+            ),
+            in_axes=(-1, -1),
+            out_axes=-1,
+        )(effective_coupling, params["phase_diff"])
+        return sum(
+            compute_transition_q_function(
+                A[..., j], gamma1[..., j], beta[..., j], process_cov[..., j]
+            )
+            for j in range(n_states)
+        )
+
+    initial_q = float(total_q(init_params))
+    opt = optimize_dim_transition_params_joint(
+        gamma1=gamma1,
+        beta=beta,
+        init_params=init_params,
+        sampling_freq=sampling_freq,
+        process_cov=process_cov,
+        max_iter=100,
+    )
+    optimized_q = float(total_q(opt))
+
+    assert optimized_q <= initial_q + 1e-6
+    assert opt["damping"].shape == (2,)
+    assert opt["freq"].shape == (2,)
+    scale = compute_directed_influence_stability_scale(
+        opt["freq"], opt["damping"], opt["coupling_strength"], sampling_freq
+    )
+    for j in range(n_states):
+        A = construct_directed_influence_transition_matrix(
+            opt["freq"],
+            opt["damping"] * scale,
+            opt["coupling_strength"][..., j] * scale,
+            opt["phase_diff"][..., j],
+            sampling_freq,
+        )
+        assert float(jnp.max(jnp.abs(jnp.linalg.eigvals(A)))) <= 0.99 + 1e-6
 
 
 # --- Viterbi tests ---

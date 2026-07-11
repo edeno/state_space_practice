@@ -2221,10 +2221,16 @@ class TestOscillatorSmootherSelection:
             "compute_transition_sufficient_stats",
             capture_stats,
         )
+        optimizer_calls = []
+
+        def fake_joint_optimizer(**kwargs):
+            optimizer_calls.append(kwargs)
+            return kwargs["init_params"]
+
         monkeypatch.setattr(
             oscillator_models,
-            "optimize_dim_transition_params",
-            lambda **kwargs: kwargs["init_params"],
+            "optimize_dim_transition_params_joint",
+            fake_joint_optimizer,
         )
         model._m_step_reparameterized(obs)
 
@@ -2233,6 +2239,9 @@ class TestOscillatorSmootherSelection:
             captured["next_pair_cond_smoother_means"]
             is model.smoother_next_pair_cond_means
         )
+        assert len(optimizer_calls) == 1
+        assert optimizer_calls[0]["gamma1"].shape[-1] == model.n_discrete_states
+        assert optimizer_calls[0]["beta"].shape[-1] == model.n_discrete_states
 
 
 class TestBaseModelStickiness:

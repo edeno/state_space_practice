@@ -49,6 +49,7 @@ from state_space_practice.oscillator_utils import (
     construct_common_oscillator_transition_matrix,
     construct_correlated_noise_measurement_matrix,
     construct_correlated_noise_process_covariance,
+    compute_directed_influence_stability_scale,
     construct_directed_influence_measurement_matrix,
     construct_directed_influence_transition_matrix,
     extract_correlated_noise_params_from_covariance,
@@ -59,7 +60,7 @@ from state_space_practice.oscillator_utils import (
 )
 from state_space_practice.switching_kalman import (
     compute_transition_sufficient_stats,
-    optimize_dim_transition_params,
+    optimize_dim_transition_params_joint,
     switching_kalman_filter,
     switching_kalman_maximization_step,
     switching_kalman_smoother,
@@ -124,44 +125,13 @@ def _dim_stability_scale(
     sampling_freq: float,
     max_spectral_radius: float = 0.99,
 ) -> Array:
-    """Return a JAX-safe global scale guaranteeing stable DIM dynamics.
-
-    The block-row norm bounds the spectral radius.  A single global scale is
-    applied to damping and coupling so frequencies remain shared across states
-    and the resulting transition matrices remain exactly reconstructable from
-    the public scientific parameters.
-    """
-    freqs_arr = jnp.asarray(freqs)
-    damping_arr = jnp.asarray(damping_coef)
-    coupling_arr = jnp.asarray(coupling_strength)
-    if coupling_arr.ndim == 2:
-        coupling_arr = coupling_arr[..., None]
-
-    n_oscillators = damping_arr.shape[0]
-    off_diagonal = ~jnp.eye(n_oscillators, dtype=bool)
-    coupling_off = jnp.where(off_diagonal[..., None], coupling_arr, 0.0)
-    incoming_sum = jnp.sum(coupling_off, axis=1)
-    incoming_abs_sum = jnp.sum(jnp.abs(coupling_off), axis=1)
-
-    angles = 2.0 * jnp.pi * freqs_arr / sampling_freq
-    damping_by_state = damping_arr[:, None]
-    # The diagonal block is damping * R(angle) - incoming_sum * I. Its
-    # operator norm has this closed form because it is a scaled rotation.
-    diagonal_norm_sq = (
-        damping_by_state**2
-        + incoming_sum**2
-        - 2.0 * damping_by_state * incoming_sum * jnp.cos(angles)[:, None]
-    )
-    # Floor the radicand at machine epsilon so the sqrt gradient stays finite at
-    # the degenerate point damping == incoming_sum with angle == 0 (e.g. freq ==
-    # 0), where diagonal_norm_sq == 0 and sqrt'(0) would be infinite (NaN grad).
-    eps = jnp.finfo(jnp.result_type(diagonal_norm_sq, 1.0)).eps
-    diagonal_norm = jnp.sqrt(jnp.maximum(diagonal_norm_sq, eps))
-    max_block_row_norm = jnp.max(diagonal_norm + incoming_abs_sum)
-    tiny = jnp.finfo(jnp.result_type(max_block_row_norm, 1.0)).tiny
-    return jnp.minimum(
-        1.0,
-        max_spectral_radius / jnp.maximum(max_block_row_norm, tiny),
+    """Compatibility wrapper for the shared differentiable DIM stability bound."""
+    return compute_directed_influence_stability_scale(
+        freqs,
+        damping_coef,
+        coupling_strength,
+        sampling_freq,
+        max_spectral_radius,
     )
 
 
@@ -405,7 +375,7 @@ class BaseModel(ABC, SGDFittableMixin):
         """Capture parameters and smoother outputs for EM rollback.
 
         Snapshotted values are JAX arrays (immutable), so a reference copy is
-        sufficient -- except ``_current_osc_params``, a list of dicts that the
+        sufficient -- except ``_current_osc_params``, a dict that the
         reparameterized M-step mutates in place, which needs a deep copy.
         """
         import copy
@@ -1928,7 +1898,7 @@ class DirectedInfluenceModel(BaseModel):
         # Reparameterized M-step option
         self.use_reparameterized_mstep = use_reparameterized_mstep
         # Store current oscillator params for warm-starting optimizer
-        self._current_osc_params: Optional[list[dict]] = None
+        self._current_osc_params: Optional[dict] = None
 
     def _initialize_measurement_matrix(self, key: Array | None = None):
         """Initializes H with [1/sqrt(2), 1/sqrt(2)] blocks, constant across states."""
@@ -1993,15 +1963,12 @@ class DirectedInfluenceModel(BaseModel):
         )(self.phase_difference, effective_coupling)
 
         if self._current_osc_params is not None:
-            self._current_osc_params = [
-                {
-                    "freq": self.freqs,
-                    "damping": self.damping_coef,
-                    "coupling_strength": self.coupling_strength[..., j],
-                    "phase_diff": self.phase_difference[..., j],
-                }
-                for j in range(self.n_discrete_states)
-            ]
+            self._current_osc_params = {
+                "freq": self.freqs,
+                "damping": self.damping_coef,
+                "coupling_strength": self.coupling_strength,
+                "phase_diff": self.phase_difference,
+            }
 
     def _initialize_process_covariance(self):
         """Initializes Q based on variance, constant across discrete states."""
@@ -2082,7 +2049,7 @@ class DirectedInfluenceModel(BaseModel):
             self.discrete_transition_matrix = Z
         self.init_discrete_state_prob = pi0
 
-        # Now optimize A in parameter space for each discrete state
+        # Now optimize all state-specific A matrices in one shared parameter space.
         if self.update_continuous_transition_matrix:
             # Compute sufficient statistics for transition matrix
             gamma1, beta = compute_transition_sufficient_stats(
@@ -2095,31 +2062,27 @@ class DirectedInfluenceModel(BaseModel):
                 next_pair_cond_smoother_means=self.smoother_next_pair_cond_means,
             )
 
-            # Initialize current_osc_params if not already done
+            # Initialize the joint warm start from the current shared/public
+            # scientific parameters. The joint objective applies the same
+            # effective stability scale used to construct A.
             if self._current_osc_params is None:
-                self._current_osc_params = []
-                for j in range(self.n_discrete_states):
-                    params = extract_dim_params_from_matrix(
-                        self.continuous_transition_matrix[..., j],
-                        self.sampling_freq,
-                        self.n_oscillators,
-                    )
-                    self._current_osc_params.append(params)
+                self._current_osc_params = {
+                    "freq": self.freqs,
+                    "damping": self.damping_coef,
+                    "coupling_strength": self.coupling_strength,
+                    "phase_diff": self.phase_difference,
+                }
 
-            # Optimize each discrete state's oscillator parameters (warm-started
-            # from the previous iteration).
-            for j in range(self.n_discrete_states):
-                self._current_osc_params[j] = optimize_dim_transition_params(
-                    gamma1=gamma1[..., j],
-                    beta=beta[..., j],
-                    init_params=self._current_osc_params[j],
-                    sampling_freq=self.sampling_freq,
-                    process_cov=self.process_cov[..., j],
-                )
+            self._current_osc_params = optimize_dim_transition_params_joint(
+                gamma1=gamma1,
+                beta=beta,
+                init_params=self._current_osc_params,
+                sampling_freq=self.sampling_freq,
+                process_cov=self.process_cov,
+            )
 
-            # Sync public attributes. In the DIM model freq/damping are
-            # intrinsic (shared across states) and only coupling/phase are
-            # state-dependent, so freq/damping collapse to a shared value here.
+            # Sync the one joint solution directly; no post-hoc averaging of
+            # independently optimized state-specific frequency/damping values.
             self._update_public_oscillator_params()
 
             # Rebuild from the shared intrinsic parameters and enforce one
@@ -2129,29 +2092,17 @@ class DirectedInfluenceModel(BaseModel):
     def _update_public_oscillator_params(self) -> None:
         """Update public oscillator attributes from optimized parameters.
 
-        After the reparameterized M-step, syncs the private
-        ``_current_osc_params`` to the public attributes so downstream code can
-        inspect the learned network. ``freqs``/``damping_coef`` are intrinsic
-        to the DIM model (shared across states, shape ``(n_osc,)``), so the
-        slightly different per-state optimizer outputs are collapsed to their
-        mean; ``coupling_strength``/``phase_difference`` stay per-state.
+        After the joint reparameterized M-step, syncs the private optimizer
+        result to the public attributes. Frequency/damping are already shared;
+        coupling/phase retain their discrete-state axis.
         """
         if self._current_osc_params is None:
             return
 
-        freqs_list = [p["freq"] for p in self._current_osc_params]
-        damping_list = [p["damping"] for p in self._current_osc_params]
-
-        # freqs/damping are shared oscillator properties -> collapse to the mean
-        self.freqs = jnp.mean(jnp.stack(freqs_list, axis=-1), axis=-1)
-        self.damping_coef = jnp.mean(jnp.stack(damping_list, axis=-1), axis=-1)
-
-        # coupling_strength and phase_diff: shape (n_osc, n_osc, n_discrete_states)
-        coupling_list = [p["coupling_strength"] for p in self._current_osc_params]
-        phase_list = [p["phase_diff"] for p in self._current_osc_params]
-
-        self.coupling_strength = jnp.stack(coupling_list, axis=-1)
-        self.phase_difference = jnp.stack(phase_list, axis=-1)
+        self.freqs = self._current_osc_params["freq"]
+        self.damping_coef = self._current_osc_params["damping"]
+        self.coupling_strength = self._current_osc_params["coupling_strength"]
+        self.phase_difference = self._current_osc_params["phase_diff"]
 
     def _project_parameters(self):
         """Project transition matrices to the DIM oscillator family.

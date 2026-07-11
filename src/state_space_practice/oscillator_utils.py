@@ -33,7 +33,9 @@ def _scatter_block_diagonal(blocks: jax.Array) -> jax.Array:
     offsets = jnp.array([0, 1, size, size + 1])  # within-block offsets in flat matrix
     base = 2 * jnp.arange(n) * (size + 1)  # diagonal starting positions
     indices = base[:, None] + offsets[None, :]  # (n, 4)
-    return jnp.zeros(size * size).at[indices.ravel()].set(flat.ravel()).reshape(size, size)
+    return (
+        jnp.zeros(size * size).at[indices.ravel()].set(flat.ravel()).reshape(size, size)
+    )
 
 
 def get_block_slice(from_oscillator: int, to_oscillator: int) -> tuple:
@@ -144,10 +146,13 @@ def _compute_coupled_oscillator_block(
         The transition matrix at the specified frequency
 
     """
-    eye = jnp.eye(2, dtype=jnp.result_type(freq, damping_coef, sum_incoming_coupling_strength))
-    return _compute_intrinsic_oscillation_block(
-        freq, damping_coef, sampling_freq
-    ) - sum_incoming_coupling_strength * eye
+    eye = jnp.eye(
+        2, dtype=jnp.result_type(freq, damping_coef, sum_incoming_coupling_strength)
+    )
+    return (
+        _compute_intrinsic_oscillation_block(freq, damping_coef, sampling_freq)
+        - sum_incoming_coupling_strength * eye
+    )
 
 
 def _compute_coupling_transition_block(
@@ -212,9 +217,7 @@ def construct_common_oscillator_transition_matrix(
     """
     n_oscillators = freqs.shape[0]
     if not damping_coef.shape == (n_oscillators,):
-        raise ValueError(
-            "damping_coef must be a 1D array of shape (n_oscillators,)"
-        )
+        raise ValueError("damping_coef must be a 1D array of shape (n_oscillators,)")
     # Warn and clamp out-of-range values (JIT-compatible via pre-trace check)
     if not isinstance(damping_coef, jax.core.Tracer):
         if jnp.any(jnp.logical_or(damping_coef > 1, damping_coef < 0)):
@@ -226,9 +229,9 @@ def construct_common_oscillator_transition_matrix(
     damping_coef = jnp.clip(damping_coef, 0.0, 1.0)
 
     # Vectorized: compute all 2x2 blocks at once, then scatter into block-diagonal
-    blocks = jax.vmap(
-        _compute_intrinsic_oscillation_block, in_axes=(0, 0, None)
-    )(freqs, damping_coef, sampling_freq)
+    blocks = jax.vmap(_compute_intrinsic_oscillation_block, in_axes=(0, 0, None))(
+        freqs, damping_coef, sampling_freq
+    )
     # blocks: (n_oscillators, 2, 2)
     return _scatter_block_diagonal(blocks)
 
@@ -325,9 +328,7 @@ def canonicalize_correlated_noise_pair_parameters(
             has_both = has_upper & has_lower
 
             coupling_conflict = has_both & (jnp.abs(upper_c - lower_c) > atol)
-            phase_conflict = has_both & (
-                jnp.abs(_wrap_angle(upper_p + lower_p)) > atol
-            )
+            phase_conflict = has_both & (jnp.abs(_wrap_angle(upper_p + lower_p)) > atol)
             if bool(jnp.any(coupling_conflict | phase_conflict)):
                 raise ValueError(
                     "Conflicting correlated-noise pair parameters for pair "
@@ -413,9 +414,7 @@ def construct_correlated_noise_process_covariance(
     all_blocks = all_blocks.at[diag_idx, diag_idx].set(diag_blocks)
 
     # Reshape (n, n, 2, 2) -> (2n, 2n)
-    return all_blocks.swapaxes(1, 2).reshape(
-        2 * n_oscillators, 2 * n_oscillators
-    )
+    return all_blocks.swapaxes(1, 2).reshape(2 * n_oscillators, 2 * n_oscillators)
 
 
 def construct_correlated_noise_measurement_matrix(
@@ -536,6 +535,52 @@ def construct_directed_influence_transition_matrix(
     )
 
     return transition_matrix
+
+
+def compute_directed_influence_stability_scale(
+    freqs: ArrayLike,
+    damping_coef: ArrayLike,
+    coupling_strength: ArrayLike,
+    sampling_freq: float,
+    max_spectral_radius: float = 0.99,
+) -> jax.Array:
+    """Return a differentiable global scale guaranteeing stable DIM dynamics.
+
+    The maximum block-row operator norm bounds the spectral radius. Scaling
+    damping and coupling by the same scalar scales the complete directed-
+    influence transition matrix by that scalar, while leaving frequency and
+    phase unchanged. ``coupling_strength`` may be one matrix or a stack with a
+    final discrete-state axis; one shared scale is returned for the full stack.
+    """
+    freqs_arr = jnp.asarray(freqs)
+    damping_arr = jnp.asarray(damping_coef)
+    coupling_arr = jnp.asarray(coupling_strength)
+    if coupling_arr.ndim == 2:
+        coupling_arr = coupling_arr[..., None]
+
+    n_oscillators = damping_arr.shape[0]
+    off_diagonal = ~jnp.eye(n_oscillators, dtype=bool)
+    coupling_off = jnp.where(off_diagonal[..., None], coupling_arr, 0.0)
+    incoming_sum = jnp.sum(coupling_off, axis=1)
+    incoming_abs_sum = jnp.sum(jnp.abs(coupling_off), axis=1)
+
+    angles = 2.0 * jnp.pi * freqs_arr / sampling_freq
+    damping_by_state = damping_arr[:, None]
+    diagonal_norm_sq = (
+        damping_by_state**2
+        + incoming_sum**2
+        - 2.0 * damping_by_state * incoming_sum * jnp.cos(angles)[:, None]
+    )
+    # Avoid sqrt'(0) at a degenerate block while conservatively preserving the
+    # upper bound to floating-point precision.
+    eps = jnp.finfo(jnp.result_type(diagonal_norm_sq, 1.0)).eps
+    diagonal_norm = jnp.sqrt(jnp.maximum(diagonal_norm_sq, eps))
+    max_block_row_norm = jnp.max(diagonal_norm + incoming_abs_sum)
+    tiny = jnp.finfo(jnp.result_type(max_block_row_norm, 1.0)).tiny
+    return jnp.minimum(
+        1.0,
+        max_spectral_radius / jnp.maximum(max_block_row_norm, tiny),
+    )
 
 
 def construct_directed_influence_measurement_matrix(
@@ -689,9 +734,7 @@ def _project_to_scaled_rotation_matrix(matrix: jax.Array) -> jax.Array:
 
     is_valid = jnp.all(jnp.isfinite(projected))
     frob_norm = jnp.linalg.norm(matrix, "fro")
-    fallback_scale = jnp.where(
-        jnp.isfinite(frob_norm), frob_norm / jnp.sqrt(2.0), 0.5
-    )
+    fallback_scale = jnp.where(jnp.isfinite(frob_norm), frob_norm / jnp.sqrt(2.0), 0.5)
     fallback = fallback_scale * IDENTITY_2x2.astype(matrix.dtype)
     return jnp.where(is_valid, projected, fallback)
 
@@ -808,9 +851,7 @@ def _matrix_to_oscillator_blocks(matrix: jax.Array) -> jax.Array:
 def _oscillator_blocks_to_matrix(blocks: jax.Array) -> jax.Array:
     """Assemble ``(n, n, 2, 2)`` oscillator blocks into a matrix."""
     n_oscillators = blocks.shape[0]
-    return blocks.transpose(0, 2, 1, 3).reshape(
-        2 * n_oscillators, 2 * n_oscillators
-    )
+    return blocks.transpose(0, 2, 1, 3).reshape(2 * n_oscillators, 2 * n_oscillators)
 
 
 def project_correlated_noise_process_covariance(
