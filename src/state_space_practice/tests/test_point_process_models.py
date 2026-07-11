@@ -976,6 +976,49 @@ class TestDirectedInfluencePointProcessModel:
             )
             np.testing.assert_allclose(A, recon, atol=1e-8)
 
+    def test_rebuild_refreshes_joint_optimizer_cache(self, dim_pp_params) -> None:
+        """Changing public dynamics via a rebuild (e.g. an SGD store) must
+        refresh the joint-optimizer warm-start cache, so a later
+        reparameterized M-step does not warm-start from -- or, on BFGS
+        fallback, restore -- stale pre-change dynamics."""
+        n_osc = dim_pp_params["n_oscillators"]
+        n_disc = dim_pp_params["n_discrete_states"]
+
+        # A fresh init leaves the cache empty (no spurious warm start).
+        fresh = DirectedInfluencePointProcessModel(**dim_pp_params)
+        fresh._initialize_parameters(jax.random.PRNGKey(0))
+        assert fresh._current_osc_params is None
+
+        model = DirectedInfluencePointProcessModel(**dim_pp_params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        # Simulate a prior joint M-step having cached (now stale) zero coupling.
+        model._current_osc_params = {
+            "freq": model.freqs,
+            "damping": model.damping_coef,
+            "coupling_strength": jnp.zeros((n_osc, n_osc, n_disc)),
+            "phase_diff": jnp.zeros((n_osc, n_osc, n_disc)),
+        }
+        strong = (
+            jnp.zeros((n_osc, n_osc, n_disc)).at[0, 1, :].set(0.4).at[1, 0, :].set(0.4)
+        )
+        model._store_sgd_params(
+            {
+                "coupling_strength": strong,
+                "phase_difference": jnp.zeros((n_osc, n_osc, n_disc)),
+            }
+        )
+
+        # Guard: the public coupling genuinely changed away from the cached zeros.
+        assert float(jnp.max(jnp.abs(model.coupling_strength))) > 0.0
+        # The cache now tracks the updated public params, not the stale zeros.
+        assert model._current_osc_params is not None
+        np.testing.assert_allclose(
+            model._current_osc_params["coupling_strength"], model.coupling_strength
+        )
+        np.testing.assert_allclose(
+            model._current_osc_params["damping"], model.damping_coef
+        )
+
 
 # ============================================================================
 # Tests for input validation

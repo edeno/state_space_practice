@@ -1967,6 +1967,18 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             axis=2,
         )
 
+        # Refresh the joint-optimizer warm-start cache so a later reparameterized
+        # M-step does not warm-start (or, on BFGS fallback, restore) stale
+        # pre-rebuild dynamics after the public params changed via SGD / standard
+        # EM. Left untouched (None) before the first joint solve.
+        if self._current_osc_params is not None:
+            self._current_osc_params = {
+                "freq": self.freqs,
+                "damping": self.damping_coef,
+                "coupling_strength": self.coupling_strength,
+                "phase_diff": self.phase_difference,
+            }
+
     def _initialize_process_covariance(self) -> None:
         """Q is constant across states: block-diagonal from process_variance."""
         process_cov = construct_common_oscillator_process_covariance(
