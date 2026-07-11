@@ -38,6 +38,14 @@ class TestHamiltonianLFPSmoke:
         model, _ = model_and_data
         assert model.n_cont_states == 2
 
+    def test_obs_noise_std_property_summarizes_measurement_cov(self, model_and_data):
+        """Read-only scalar summary sqrt(mean(diag(R))); default 0.1 -> 0.1."""
+        model, _ = model_and_data
+        assert model.obs_noise_std == pytest.approx(0.1)
+        # It is read-only (no isotropic-reset setter, unlike the joint model).
+        with pytest.raises(AttributeError):
+            model.obs_noise_std = 0.5
+
     def test_filter_runs(self, model_and_data):
         model, lfp = model_and_data
         params, _ = model._build_param_spec()
@@ -65,6 +73,50 @@ class TestHamiltonianLFPSmoke:
         model._store_sgd_params(params)
 
         assert jnp.allclose(model.measurement_matrix[:, :, 0], model.C)
+
+    def test_store_sgd_params_resyncs_measurement_covariance(self, model_and_data):
+        model, _ = model_and_data
+        params, _ = model._build_param_spec()
+        params["R"] = jnp.eye(model.n_sources) * 0.25
+
+        model._store_sgd_params(params)
+
+        assert jnp.allclose(model.measurement_cov[:, :, 0], params["R"])
+
+    @pytest.mark.parametrize(
+        "lfp, match",
+        [
+            (jnp.zeros((5,)), "shape"),
+            (jnp.zeros((5, 1)), "4 sources"),
+            (jnp.full((5, 4), jnp.nan), "finite"),
+            (jnp.full((5, 4), jnp.inf), "finite"),
+            (jnp.empty((0, 4)), "at least one observation"),
+        ],
+    )
+    def test_fit_sgd_rejects_invalid_lfp(self, model_and_data, lfp, match):
+        model, _ = model_and_data
+        with pytest.raises(ValueError, match=match):
+            model.fit_sgd(lfp, num_steps=0)
+
+    def test_filter_covariance_defaults_are_not_stale(self, model_and_data):
+        model, lfp = model_and_data
+        params, _ = model._build_param_spec()
+        params.pop("R")
+        params.pop("Q")
+        params.pop("init_cov")
+
+        _, covs_before, _ = model.filter(lfp, params)
+        model.measurement_cov = jnp.stack([jnp.eye(model.n_sources) * 10.0], axis=2)
+        model.process_cov = jnp.stack([jnp.eye(model.n_cont_states) * 10.0], axis=2)
+        model.init_cov = jnp.stack([jnp.eye(model.n_cont_states) * 5.0], axis=2)
+        _, covs_after, _ = model.filter(lfp, params)
+
+        assert not jnp.allclose(covs_before, covs_after)
+
+    def test_fit_sgd_rejects_removed_key_argument(self, model_and_data):
+        model, lfp = model_and_data
+        with pytest.raises(TypeError, match="unexpected keyword argument 'key'"):
+            model.fit_sgd(lfp, key=jax.random.PRNGKey(1), num_steps=0)
 
 
 class TestHamiltonianLFPMultiOscillator:
@@ -115,6 +167,7 @@ class TestHamiltonianLFPBehavioral:
             hidden_dims=[8],
             seed=0,
             sampling_freq=1.0 / dt,
+            obs_noise_std=0.3,
         )
 
         # Zero out MLP weights so dynamics are a pure harmonic oscillator
@@ -128,7 +181,6 @@ class TestHamiltonianLFPBehavioral:
         # Known observation matrix: observe q and p directly
         model.C = jnp.eye(n_sources)  # n_sources must equal n_cont_states=2
         model.d = jnp.zeros(n_sources)
-        model.obs_noise_std = 0.3
         model.measurement_matrix = jnp.stack([model.C], axis=2)
 
         # Simulate ground truth trajectory
@@ -146,10 +198,7 @@ class TestHamiltonianLFPBehavioral:
         _, x_true = jax.lax.scan(sim_step, x0, keys)  # (n_time, 2)
 
         # Generate noisy observations
-        obs_noise = (
-            jax.random.normal(jax.random.PRNGKey(99), (n_time, n_sources))
-            * model.obs_noise_std
-        )
+        obs_noise = jax.random.normal(jax.random.PRNGKey(99), (n_time, n_sources)) * 0.3
         lfp = x_true @ model.C.T + model.d + obs_noise
 
         # Run smoother
@@ -217,7 +266,6 @@ class TestHamiltonianLFPSGDRecovery:
 
         lls = model.fit_sgd(
             lfp,
-            key=jax.random.PRNGKey(1),
             num_steps=200,
         )
         return model, x_true, omega_true, lfp, lls
@@ -256,6 +304,19 @@ class TestHamiltonianLFPSGDRecovery:
             f"Learned Q should be PSD, but has eigenvalues {eigvals}"
         )
 
+    def test_r_is_learned(self, fitted):
+        """Measurement covariance R should be learned and remain PSD."""
+        model, _, _, _, _ = fitted
+        R_learned = model.measurement_cov[:, :, 0]
+        R_init = jnp.eye(model.n_sources) * 0.1**2
+        assert not jnp.allclose(R_learned, R_init, atol=1e-6), (
+            "R should have changed from its initial value after SGD"
+        )
+        eigvals = jnp.linalg.eigvalsh(R_learned)
+        assert jnp.all(eigvals > 0), (
+            f"Learned R should be PSD, but has eigenvalues {eigvals}"
+        )
+
 
 @pytest.mark.slow
 class TestHamiltonianLFPLinearLimit:
@@ -291,7 +352,7 @@ class TestHamiltonianLFPLinearLimit:
         init_cov = model.init_cov[:, :, 0]
         Q = params["Q"]
         C = params["C"]
-        R = jnp.eye(3) * model.obs_noise_std**2
+        R = params["R"]
 
         # sanity: the zeroed-MLP transition really is the linear map f(x) = F @ x.
         probe = jnp.array([0.3, -0.4, 0.2, 0.6])
