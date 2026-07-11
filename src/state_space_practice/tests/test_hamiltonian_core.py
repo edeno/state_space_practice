@@ -1,5 +1,6 @@
 """Tests for shared Hamiltonian EKF/Laplace helpers."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from scipy.stats import multivariate_normal
@@ -123,6 +124,30 @@ def test_point_process_laplace_compute_log_likelihood_false_keeps_update():
     assert float(ll) == 0.0
 
 
+def test_point_process_laplace_can_be_jitted_with_static_configuration():
+    m_pred = jnp.array([0.2, -0.4])
+    P_pred = jnp.array([[1.3, 0.2], [0.2, 0.7]])
+    y = jnp.array([0.0, 3.0])
+    C = jnp.array([[1.0, -0.5], [0.2, 0.8]])
+    d = jnp.array([0.1, -0.2])
+    dt = 0.1
+
+    expected = point_process_laplace_update(m_pred, P_pred, y, C, d, dt)
+    jitted_update = jax.jit(
+        point_process_laplace_update,
+        static_argnames=("dt", "compute_log_likelihood"),
+    )
+    actual = jitted_update(m_pred, P_pred, y, C, d, dt=dt)
+
+    for actual_arr, expected_arr in zip(actual, expected):
+        np.testing.assert_allclose(
+            np.asarray(actual_arr),
+            np.asarray(expected_arr),
+            rtol=1e-10,
+            atol=1e-10,
+        )
+
+
 def test_gaussian_measurement_update_matches_independent_reference():
     m_pred = jnp.array([0.5, -1.0, 0.2])
     prior_root = jnp.array([[1.2, 0.3, -0.2], [0.3, 0.9, 0.1], [-0.2, 0.1, 1.5]])
@@ -159,6 +184,23 @@ def test_gaussian_measurement_update_matches_independent_reference():
     np.testing.assert_allclose(
         float(ll_no_const) - float(ll), expected_gap, rtol=1e-6, atol=1e-6
     )
+
+
+def test_gaussian_measurement_update_with_no_observations_is_identity():
+    m_pred = jnp.array([0.5, -1.0])
+    P_pred = jnp.array([[1.2, 0.3], [0.3, 0.9]])
+    y = jnp.empty((0,), dtype=m_pred.dtype)
+    C = jnp.empty((0, 2), dtype=m_pred.dtype)
+    d = jnp.empty((0,), dtype=m_pred.dtype)
+    R = jnp.empty((0, 0), dtype=m_pred.dtype)
+
+    m_post, P_post, ll = jax.jit(gaussian_measurement_update)(
+        m_pred, P_pred, y, C, d, R
+    )
+
+    np.testing.assert_array_equal(np.asarray(m_post), np.asarray(m_pred))
+    np.testing.assert_array_equal(np.asarray(P_post), np.asarray(P_pred))
+    assert float(ll) == 0.0
 
 
 def test_ekf_rts_backward_pass_alignment_matches_textbook_recursion():
@@ -202,6 +244,22 @@ def test_ekf_rts_backward_pass_alignment_matches_textbook_recursion():
     # Terminal step is the un-smoothed filter posterior.
     np.testing.assert_allclose(np.asarray(m_s[-1]), m_filt[-1])
     np.testing.assert_allclose(np.asarray(P_s[-1]), P_filt[-1])
+
+
+def test_ekf_rts_backward_pass_returns_empty_trajectory_for_zero_steps():
+    n = 3
+    m_filt = jnp.empty((0, n))
+    P_filt = jnp.empty((0, n, n))
+    m_pred = jnp.empty((0, n))
+    P_pred = jnp.empty((0, n, n))
+    F = jnp.empty((0, n, n))
+
+    m_smooth, P_smooth = jax.jit(ekf_rts_backward_pass)(
+        m_filt, P_filt, m_pred, P_pred, F
+    )
+
+    assert m_smooth.shape == (0, n)
+    assert P_smooth.shape == (0, n, n)
 
 
 def test_basemodel_stubs_cover_all_abstract_hooks():

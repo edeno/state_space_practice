@@ -2,9 +2,12 @@
 
 Conventions
 -----------
-- All helpers take JAX arrays and return JAX arrays. None capture
-  Python state; closures over external arrays inside ``jax.lax.scan``
-  bodies must come from the caller, not from this module.
+- State, covariance, and observation arguments are JAX arrays. Configuration
+  arguments such as ``dt`` and likelihood-control booleans are static Python
+  values; declare them static when JIT-compiling a helper directly.
+- Helpers return JAX arrays and do not capture Python state; closures over
+  external arrays inside ``jax.lax.scan`` bodies must come from the caller,
+  not from this module.
 - Log-likelihoods returned here are the per-step contribution. Callers
   accumulate via the scan ``carry`` or via ``jnp.sum`` over the scan
   output, depending on filter/smoother convention.
@@ -55,6 +58,14 @@ def gaussian_measurement_update(
         (e.g. discrete-state softmax in switching models) where the
         constant cancels in normalization.
     """
+    # The Gaussian density over an empty observation vector is the empty
+    # product: it contributes zero log-likelihood and leaves the prior
+    # unchanged. Besides being mathematically natural, this avoids asking
+    # psd_cholesky to reduce over a 0 x 0 innovation covariance.
+    if y.shape[0] == 0:
+        ll_dtype = jnp.result_type(m_pred, P_pred, 0.0)
+        return m_pred, P_pred, jnp.zeros((), dtype=ll_dtype)
+
     err = y - (C @ m_pred + d)
     S = C @ P_pred @ C.T + R
     # One stabilized Cholesky of S serves the gain solve, the quadratic form,
@@ -90,6 +101,13 @@ def point_process_laplace_update(
     Delegates to the shared GLM Laplace update with ``poisson_family(dt)`` so
     Hamiltonian point-process likelihoods use the same normalized Poisson
     log-PMF and expected-count clipping as the generic point-process filter.
+
+    ``dt`` and ``compute_log_likelihood`` are configuration values and must be
+    declared static when this helper is JIT-compiled directly, for example
+    ``jax.jit(point_process_laplace_update,
+    static_argnames=("dt", "compute_log_likelihood"))``. Hamiltonian model
+    methods already capture ``self.dt`` statically through their static model
+    instance.
 
     Returns
     -------
@@ -163,6 +181,11 @@ def ekf_rts_backward_pass(
     m_smooth, P_smooth : (T, n) and (T, n, n)
         The final time step is not re-smoothed (``m_smooth[-1] == m_filt[-1]``).
     """
+    # A zero-length filtered trajectory has no terminal state from which to
+    # initialize the reverse scan. Its smoother is therefore the same empty
+    # trajectory. The time dimension is static, so this branch is JIT-safe.
+    if m_filt.shape[0] == 0:
+        return m_filt, P_filt
 
     def backward_step(carry, inputs):
         m_s_next, P_s_next = carry
