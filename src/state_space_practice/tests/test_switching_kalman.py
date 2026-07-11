@@ -344,6 +344,33 @@ def test_update_discrete_probs_plus_inf_likelihood_not_dynamics_recovered() -> N
     assert bool(jnp.any(jnp.isnan(m_t)))
 
 
+def test_update_discrete_probs_impossible_lane_nan_does_not_poison() -> None:
+    """A NaN likelihood in a structurally impossible lane must not poison the
+    supported lanes' posterior.
+
+    prev_support = [True, False] makes state 1 impossible as a source, so its
+    entire likelihood row is irrelevant. But log_joint = lik + log_Z + log_prev
+    adds ``NaN + (-inf) = NaN`` (and likewise ``+inf + -inf = NaN``) in that
+    lane, so garbage in an impossible row would poison the logsumexp and NaN the
+    whole posterior despite a perfectly valid supported row. Impossible lanes
+    must be masked to a finite placeholder before the likelihood is combined.
+    """
+    log_likelihood = jnp.array([[0.0, 0.0], [jnp.nan, jnp.nan]])  # row 1 impossible
+    Z = jnp.array([[0.5, 0.5], [0.5, 0.5]])
+    prev = jnp.array([1.0, 0.0])
+    support = jnp.array([True, False])
+
+    m_t, w, log_pred, _ = _update_discrete_state_probabilities(
+        log_likelihood, Z, prev, support
+    )
+
+    assert not bool(jnp.any(jnp.isnan(m_t)))
+    assert not bool(jnp.any(jnp.isnan(w)))
+    assert bool(jnp.isfinite(log_pred))
+    # Supported row 0 reaches both destinations equally under the uniform Z.
+    np.testing.assert_allclose(np.asarray(m_t), np.array([0.5, 0.5]), rtol=1e-6)
+
+
 def test_first_timestep_ruled_out_state_not_floored() -> None:
     """A first-step state the data rules out (-inf likelihood) keeps marginal 0.
 
@@ -377,6 +404,25 @@ def test_first_timestep_plus_inf_likelihood_not_prior_recovered() -> None:
     prob, _ = _first_timestep_discrete_update(state_cond_log_lik, prior)
 
     assert bool(jnp.any(jnp.isnan(prob)))
+
+
+def test_first_timestep_impossible_lane_nan_does_not_poison() -> None:
+    """A NaN likelihood on a structural-zero-prior state must not poison the
+    first-step posterior of the supported states.
+
+    A zero-prior state is impossible at t=1 (log_prior = -inf), so its likelihood
+    is irrelevant -- but log_unnorm = lik + log_prior adds ``NaN + (-inf) = NaN``,
+    poisoning the logsumexp. The impossible lane must be masked before the add.
+    This is distinct from a malformed (all-zero) prior, which stays fail-loud.
+    """
+    state_cond_log_lik = jnp.array([0.0, jnp.nan])  # state 1 has a NaN likelihood
+    prior = jnp.array([1.0, 0.0])  # state 1 is structurally impossible
+
+    prob, marginal_ll = _first_timestep_discrete_update(state_cond_log_lik, prior)
+
+    assert not bool(jnp.any(jnp.isnan(prob)))
+    assert bool(jnp.isfinite(marginal_ll))
+    np.testing.assert_allclose(np.asarray(prob), np.array([1.0, 0.0]), rtol=1e-6)
 
 
 def test_first_timestep_impossible_obs_falls_back_to_prior() -> None:

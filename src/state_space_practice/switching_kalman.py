@@ -498,7 +498,19 @@ def _update_discrete_state_probabilities(
         -jnp.inf,
     )
     log_transition = _log_prob_preserve_zeros(discrete_transition_matrix)
-    log_joint = pair_cond_marginal_log_likelihood + log_transition + log_prev[:, None]
+    # Structural log-prior over pairs: -inf on any structurally impossible pair
+    # (forbidden source, or zero transition). Once a pair is impossible its
+    # likelihood is irrelevant -- but ``NaN + (-inf) = NaN`` and
+    # ``+inf + (-inf) = NaN``, so a garbage likelihood in an impossible lane
+    # would poison the logsumexp and NaN the whole posterior despite valid
+    # supported lanes. Substitute a finite placeholder into impossible lanes
+    # BEFORE adding, so the -inf structural prior cleanly zeros them out.
+    dynamics_log_joint = log_transition + log_prev[:, None]
+    impossible_pair = jnp.isneginf(dynamics_log_joint)
+    safe_pair_log_lik = jnp.where(
+        impossible_pair, 0.0, pair_cond_marginal_log_likelihood
+    )
+    log_joint = safe_pair_log_lik + dynamics_log_joint
 
     # log p(y_t | y_{1:t-1}): the reference is a logsumexp over supported pairs
     # only (impossible pairs are -inf), so no impossible state can win it.
@@ -513,7 +525,6 @@ def _update_discrete_state_probabilities(
     # observation, so it must not be silently discarded for the dynamics
     # prediction; it flows through and surfaces as a fail-loud NaN below. A NaN
     # predictive likewise propagates rather than being masked by the dynamics.
-    dynamics_log_joint = log_transition + log_prev[:, None]
     log_joint = jnp.where(jnp.isneginf(log_predictive), dynamics_log_joint, log_joint)
 
     next_support = jnp.any(
@@ -623,7 +634,15 @@ def _first_timestep_discrete_update(
         jnp.nan,
         _log_prob_preserve_zeros(init_discrete_state_prob),
     )
-    log_unnorm = state_cond_log_lik + log_prior
+    # A structural-zero-prior state (log_prior = -inf) is impossible at t=1; its
+    # likelihood is irrelevant, but ``NaN/+inf lik + (-inf) = NaN`` would poison
+    # the logsumexp and NaN the whole posterior despite valid supported states.
+    # Substitute a finite placeholder into those impossible lanes before adding.
+    # (A NaN log_prior is the malformed-prior fail-loud signal -- isneginf is
+    # False there -- so it is preserved, not masked.)
+    impossible = jnp.isneginf(log_prior)
+    safe_state_cond_log_lik = jnp.where(impossible, 0.0, state_cond_log_lik)
+    log_unnorm = safe_state_cond_log_lik + log_prior
     marginal_log_likelihood = logsumexp(log_unnorm)
     # Degenerate recovery (mirrors the later-timestep dynamics fallback in
     # _update_discrete_state_probabilities): an impossible first observation
