@@ -377,12 +377,8 @@ class TestCorrelatedNoiseModel:
         """Lower-triangle CNM pair input is accepted and stored canonically."""
         params = correlated_noise_params.copy()
         n_disc = params["n_discrete_states"]
-        params["phase_difference"] = (
-            jnp.zeros((2, 2, n_disc)).at[1, 0, :].set(-0.7)
-        )
-        params["coupling_strength"] = (
-            jnp.zeros((2, 2, n_disc)).at[1, 0, :].set(0.05)
-        )
+        params["phase_difference"] = jnp.zeros((2, 2, n_disc)).at[1, 0, :].set(-0.7)
+        params["coupling_strength"] = jnp.zeros((2, 2, n_disc)).at[1, 0, :].set(0.05)
 
         model = CorrelatedNoiseModel(**params)
 
@@ -712,7 +708,7 @@ class TestOscillatorPaperStructure:
             assert np.linalg.eigvalsh(Q).min() >= -1e-8
 
             for osc in range(model.n_oscillators):
-                block = Q[2 * osc:2 * osc + 2, 2 * osc:2 * osc + 2]
+                block = Q[2 * osc : 2 * osc + 2, 2 * osc : 2 * osc + 2]
                 np.testing.assert_allclose(block[0, 0], block[1, 1], atol=1e-10)
                 np.testing.assert_allclose(block[0, 1], 0.0, atol=1e-10)
                 np.testing.assert_allclose(block[1, 0], 0.0, atol=1e-10)
@@ -762,7 +758,7 @@ class TestOscillatorPaperStructure:
             A = np.array(model.continuous_transition_matrix[..., state])
             for row in range(model.n_oscillators):
                 for col in range(model.n_oscillators):
-                    block = A[2 * row:2 * row + 2, 2 * col:2 * col + 2]
+                    block = A[2 * row : 2 * row + 2, 2 * col : 2 * col + 2]
                     _assert_scaled_rotation_block(block)
             assert np.max(np.abs(np.linalg.eigvals(A))) < 1.0
 
@@ -1142,12 +1138,8 @@ class TestCorrelatedNoiseModelProperties:
         phase = np.zeros((n_osc, n_osc, n_disc))
         coupling = np.zeros((n_osc, n_osc, n_disc))
         upper_i, upper_j = np.triu_indices(n_osc, k=1)
-        phase[upper_i, upper_j, :] = rng.uniform(
-            -1.0, 1.0, (len(upper_i), n_disc)
-        )
-        coupling[upper_i, upper_j, :] = rng.uniform(
-            0.01, 0.05, (len(upper_i), n_disc)
-        )
+        phase[upper_i, upper_j, :] = rng.uniform(-1.0, 1.0, (len(upper_i), n_disc))
+        coupling[upper_i, upper_j, :] = rng.uniform(0.01, 0.05, (len(upper_i), n_disc))
         model = CorrelatedNoiseModel(
             n_oscillators=n_osc,
             n_discrete_states=n_disc,
@@ -1232,6 +1224,49 @@ class TestDirectedInfluenceModelProperties:
 
 class TestOscillatorModelInputValidation:
     """Tests for input validation in oscillator models."""
+
+    @pytest.mark.parametrize("sampling_freq", [jnp.nan, jnp.inf, -jnp.inf])
+    def test_com_rejects_nonfinite_sampling_frequency(
+        self, common_oscillator_params, sampling_freq
+    ) -> None:
+        params = {**common_oscillator_params, "sampling_freq": sampling_freq}
+        with pytest.raises(ValueError, match="sampling_freq.*finite"):
+            CommonOscillatorModel(**params)
+
+    @pytest.mark.parametrize("measurement_variance", [float("nan"), float("inf")])
+    def test_com_rejects_nonfinite_measurement_variance(
+        self, common_oscillator_params, measurement_variance
+    ) -> None:
+        params = {
+            **common_oscillator_params,
+            "measurement_variance": measurement_variance,
+        }
+        with pytest.raises(ValueError, match="measurement_variance.*finite"):
+            CommonOscillatorModel(**params)
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("freqs", jnp.array([8.0, jnp.nan])),
+            ("damping_coef", jnp.array([0.95, jnp.inf])),
+            ("damping_coef", jnp.array([0.95, 1.01])),
+        ],
+    )
+    def test_com_rejects_invalid_dynamics_parameter(
+        self, common_oscillator_params, name, value
+    ) -> None:
+        params = {**common_oscillator_params, name: value}
+        with pytest.raises(ValueError, match=name):
+            CommonOscillatorModel(**params)
+
+    @pytest.mark.parametrize("name", ["phase_difference", "coupling_strength"])
+    def test_dim_rejects_nonfinite_network_parameter(
+        self, directed_influence_params, name
+    ) -> None:
+        value = directed_influence_params[name].at[0, 1, 0].set(jnp.nan)
+        params = {**directed_influence_params, name: value}
+        with pytest.raises(ValueError, match=f"{name}.*finite"):
+            DirectedInfluenceModel(**params)
 
     def test_com_rejects_mismatched_freqs(self) -> None:
         """COM should reject freqs with wrong shape."""
@@ -1576,9 +1611,7 @@ class TestReparameterizedMstep:
 class TestDIMStabilityEnforcement:
     """Tests that spectral radius clamping is unconditional."""
 
-    def test_projection_enforces_stability(
-        self, directed_influence_params
-    ) -> None:
+    def test_projection_enforces_stability(self, directed_influence_params) -> None:
         """An unstable A must always be clamped, regardless of Q-function."""
         model = DirectedInfluenceModel(**directed_influence_params)
         model._initialize_parameters(jax.random.PRNGKey(0))
@@ -1586,11 +1619,9 @@ class TestDIMStabilityEnforcement:
         # Inject an unstable transition matrix (spectral radius > 1)
         n_latent = 2 * model.n_oscillators
         for j in range(model.n_discrete_states):
-            model.continuous_transition_matrix = (
-                model.continuous_transition_matrix.at[:, :, j].set(
-                    jnp.eye(n_latent) * 1.5
-                )
-            )
+            model.continuous_transition_matrix = model.continuous_transition_matrix.at[
+                :, :, j
+            ].set(jnp.eye(n_latent) * 1.5)
 
         model._project_parameters()
 
@@ -1598,9 +1629,196 @@ class TestDIMStabilityEnforcement:
             A_j = model.continuous_transition_matrix[:, :, j]
             eigvals = jnp.linalg.eigvals(A_j)
             sr = float(jnp.max(jnp.abs(eigvals)))
-            assert sr < 1.0, (
-                f"State {j}: spectral radius {sr} >= 1.0 after projection"
+            assert sr < 1.0, f"State {j}: spectral radius {sr} >= 1.0 after projection"
+
+    def test_initialization_scales_strong_coupling_and_remains_reconstructable(
+        self, directed_influence_params
+    ) -> None:
+        """The first E-step must receive stable, scientifically coherent A."""
+        from state_space_practice.oscillator_utils import (
+            construct_directed_influence_transition_matrix,
+        )
+
+        strong = jnp.zeros_like(directed_influence_params["coupling_strength"])
+        strong = strong.at[0, 1, :].set(2.0).at[1, 0, :].set(2.0)
+        model = DirectedInfluenceModel(
+            **{**directed_influence_params, "coupling_strength": strong}
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        # Public params are the intrinsic values; A applies the global stability
+        # scale, so reconstruction re-applies it via _effective_dim_scale().
+        scale = model._effective_dim_scale()
+        for j in range(model.n_discrete_states):
+            A = model.continuous_transition_matrix[..., j]
+            assert float(jnp.max(jnp.abs(jnp.linalg.eigvals(A)))) <= 0.99 + 1e-6
+            reconstructed = construct_directed_influence_transition_matrix(
+                model.freqs,
+                model.damping_coef * scale,
+                model.coupling_strength[..., j] * scale,
+                model.phase_difference[..., j],
+                model.sampling_freq,
             )
+            np.testing.assert_allclose(A, reconstructed, atol=1e-10)
+
+    def test_standard_projection_syncs_all_public_parameters(
+        self, directed_influence_params
+    ) -> None:
+        """Standard EM's public params must exactly reconstruct stored A."""
+        from state_space_practice.oscillator_utils import (
+            construct_directed_influence_transition_matrix,
+        )
+
+        model = DirectedInfluenceModel(**directed_influence_params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        fitted = []
+        for j in range(model.n_discrete_states):
+            fitted.append(
+                construct_directed_influence_transition_matrix(
+                    freqs=jnp.array([2.0 + j, 4.0 + j]),
+                    damping_coeffs=jnp.array([0.55 + 0.05 * j, 0.65]),
+                    coupling_strengths=jnp.array([[0.0, 0.02], [0.03, 0.0]]),
+                    phase_diffs=jnp.zeros((2, 2)),
+                    sampling_freq=model.sampling_freq,
+                )
+            )
+        model.continuous_transition_matrix = jnp.stack(fitted, axis=-1)
+        model._project_parameters()
+
+        for j in range(model.n_discrete_states):
+            reconstructed = construct_directed_influence_transition_matrix(
+                model.freqs,
+                model.damping_coef,
+                model.coupling_strength[..., j],
+                model.phase_difference[..., j],
+                model.sampling_freq,
+            )
+            np.testing.assert_allclose(
+                model.continuous_transition_matrix[..., j],
+                reconstructed,
+                rtol=1e-7,
+                atol=1e-9,
+            )
+
+    def test_sgd_storage_scales_unstable_candidate(
+        self, directed_influence_params
+    ) -> None:
+        """SGD candidates must not leave an unstable matrix on the model."""
+        from state_space_practice.oscillator_utils import (
+            construct_directed_influence_transition_matrix,
+        )
+
+        model = DirectedInfluenceModel(**directed_influence_params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        strong = jnp.zeros_like(model.coupling_strength)
+        strong = strong.at[0, 1, :].set(2.0).at[1, 0, :].set(2.0)
+        model._store_sgd_params(
+            {
+                "phase_difference": model.phase_difference,
+                "coupling_strength": strong,
+            }
+        )
+
+        # Public damping stays intrinsic (not shrunk); A applies the scale.
+        assert bool(
+            jnp.allclose(model.damping_coef, directed_influence_params["damping_coef"])
+        )
+        scale = model._effective_dim_scale()
+        for j in range(model.n_discrete_states):
+            A = model.continuous_transition_matrix[..., j]
+            assert float(jnp.max(jnp.abs(jnp.linalg.eigvals(A)))) <= 0.99 + 1e-6
+            reconstructed = construct_directed_influence_transition_matrix(
+                model.freqs,
+                model.damping_coef * scale,
+                model.coupling_strength[..., j] * scale,
+                model.phase_difference[..., j],
+                model.sampling_freq,
+            )
+            np.testing.assert_allclose(A, reconstructed, atol=1e-10)
+
+    def test_repeated_store_does_not_drift_damping(
+        self, directed_influence_params
+    ) -> None:
+        """Re-storing the same strong coupling must not shrink the intrinsic
+        damping: the stability scale must not compound into the public params."""
+        model = DirectedInfluenceModel(**directed_influence_params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        strong = jnp.zeros_like(model.coupling_strength)
+        strong = strong.at[0, 1, :].set(2.0).at[1, 0, :].set(2.0)
+
+        damps = []
+        for _ in range(4):
+            model._store_sgd_params(
+                {
+                    "phase_difference": model.phase_difference,
+                    "coupling_strength": strong,
+                }
+            )
+            damps.append(model.damping_coef)
+            for j in range(model.n_discrete_states):
+                A = model.continuous_transition_matrix[..., j]
+                assert float(jnp.max(jnp.abs(jnp.linalg.eigvals(A)))) <= 0.99 + 1e-6
+
+        for d in damps[1:]:
+            assert bool(jnp.allclose(d, damps[0])), "damping drifted across stores"
+        assert bool(
+            jnp.allclose(damps[0], directed_influence_params["damping_coef"])
+        ), "intrinsic damping was silently reduced"
+
+    def test_stability_scale_gradient_finite_at_degenerate_block(self) -> None:
+        """diagonal_norm_sq == 0 (damping == signed incoming-sum with freq == 0)
+        must not yield a NaN gradient from sqrt'(0)."""
+        from state_space_practice.oscillator_models import _dim_stability_scale
+
+        def scale_of(c):
+            freqs = jnp.array([0.0, 5.0, 5.0])  # freq 0 -> rotation angle 0
+            damping = jnp.array([0.5, 0.5, 0.5])
+            coupling = (
+                jnp.zeros((3, 3))
+                .at[0, 1]
+                .set(1.5)
+                .at[0, 2]
+                .set(-1.0 + c)  # signed incoming for osc 0 == 0.5 == damping at c=0
+                .at[1, 0]
+                .set(0.1)
+                .at[2, 0]
+                .set(0.1)
+            )
+            return _dim_stability_scale(freqs, damping, coupling, 100.0)
+
+        assert bool(jnp.isfinite(scale_of(0.0)))
+        assert bool(jnp.isfinite(jax.grad(scale_of)(0.0)))
+
+    def test_sgd_loss_never_sends_unstable_candidate_to_filter(
+        self, directed_influence_params, monkeypatch
+    ) -> None:
+        """The differentiated loss must stabilize A before filtering."""
+        model = DirectedInfluenceModel(**directed_influence_params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        strong = jnp.zeros_like(model.coupling_strength)
+        strong = strong.at[0, 1, :].set(2.0).at[1, 0, :].set(2.0)
+        captured = {}
+
+        def fake_filter(**kwargs):
+            captured["A"] = kwargs["continuous_transition_matrix"]
+            return (None, None, None, None, None, None, jnp.array(0.0))
+
+        monkeypatch.setattr(
+            "state_space_practice.oscillator_models.switching_kalman_filter",
+            fake_filter,
+        )
+        loss = model._sgd_loss_fn(
+            {
+                "phase_difference": model.phase_difference,
+                "coupling_strength": strong,
+            },
+            jnp.zeros((10, model.n_sources)),
+        )
+
+        assert float(loss) == 0.0
+        for j in range(model.n_discrete_states):
+            radius = jnp.max(jnp.abs(jnp.linalg.eigvals(captured["A"][..., j])))
+            assert float(radius) <= 0.99 + 1e-6
 
     def test_stable_matrix_unchanged_by_projection(
         self, directed_influence_params
@@ -1621,9 +1839,7 @@ class TestDIMStabilityEnforcement:
         model._project_parameters()
 
         # Spectral radius should remain at ~0.8 (not scaled further)
-        eigvals = jnp.linalg.eigvals(
-            model.continuous_transition_matrix[:, :, 0]
-        )
+        eigvals = jnp.linalg.eigvals(model.continuous_transition_matrix[:, :, 0])
         sr = float(jnp.max(jnp.abs(eigvals)))
         assert 0.75 < sr < 0.85, f"Stable matrix was unnecessarily scaled: sr={sr}"
 
@@ -1760,9 +1976,7 @@ class TestCorrelatedNoiseSGDFitting:
         assert jnp.all(model.process_variance > 0)
 
     @pytest.mark.slow
-    def test_sgd_loss_finite_and_differentiable_at_indefinite_coupling(
-        self, cnm_setup
-    ):
+    def test_sgd_loss_finite_and_differentiable_at_indefinite_coupling(self, cnm_setup):
         # coupling_strength is UNCONSTRAINED during SGD, so the optimizer can
         # propose a coupling whose reconstructed Q is indefinite. The loss must
         # stay finite AND differentiable there (via the gradient-safe PSD shift);
@@ -1847,7 +2061,10 @@ class TestDirectedInfluenceRegularizedSGD:
         model_reg = _make_model()
         config = OscillatorPenaltyConfig(edge_l1=0.5)
         model_reg.fit_sgd(
-            scenario["obs"], key=key, num_steps=30, connectivity_penalty=config,
+            scenario["obs"],
+            key=key,
+            num_steps=30,
+            connectivity_penalty=config,
         )
         norm_reg = float(jnp.sum(jnp.abs(model_reg.coupling_strength)))
 
@@ -1866,10 +2083,14 @@ class TestDirectedInfluenceRegularizedSGD:
         # 2 oscillators, 2 areas (one per oscillator)
         area_labels = jnp.array([0, 1])
         config = OscillatorPenaltyConfig(
-            area_group_l2=1.0, area_labels=area_labels,
+            area_group_l2=1.0,
+            area_labels=area_labels,
         )
         lls = model.fit_sgd(
-            obs, key=key, num_steps=30, connectivity_penalty=config,
+            obs,
+            key=key,
+            num_steps=30,
+            connectivity_penalty=config,
         )
         # Should still produce finite results
         assert all(np.isfinite(ll) for ll in lls)
@@ -1902,8 +2123,11 @@ class TestBaseModelStickiness:
         obs = jnp.sin(2 * jnp.pi * 10 * t)[:, None] + noise
 
         model_no_sticky = CorrelatedNoiseModel(
-            n_oscillators=2, n_discrete_states=2, sampling_freq=100.0,
-            freqs=jnp.array([8.0, 12.0]), damping_coef=jnp.array([0.95, 0.95]),
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.95]),
             process_variance=jnp.ones((2, 2)) * 0.1,
             measurement_variance=0.05,
             phase_difference=jnp.zeros((2, 2, 2)),
@@ -1911,8 +2135,11 @@ class TestBaseModelStickiness:
             stickiness=0.0,
         )
         model_sticky = CorrelatedNoiseModel(
-            n_oscillators=2, n_discrete_states=2, sampling_freq=100.0,
-            freqs=jnp.array([8.0, 12.0]), damping_coef=jnp.array([0.95, 0.95]),
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.95]),
             process_variance=jnp.ones((2, 2)) * 0.1,
             measurement_variance=0.05,
             phase_difference=jnp.zeros((2, 2, 2)),
@@ -1934,8 +2161,11 @@ class TestBaseModelStickiness:
     def test_stickiness_zero_has_no_prior(self):
         """stickiness=0 should produce no transition_prior."""
         model = CommonOscillatorModel(
-            n_oscillators=2, n_discrete_states=3, n_sources=4,
-            sampling_freq=100.0, freqs=jnp.array([8.0, 12.0]),
+            n_oscillators=2,
+            n_discrete_states=3,
+            n_sources=4,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
             damping_coef=jnp.array([0.95, 0.95]),
             process_variance=jnp.array([0.1, 0.1]),
             measurement_variance=0.05,
@@ -1946,8 +2176,11 @@ class TestBaseModelStickiness:
     def test_stickiness_positive_creates_prior(self):
         """stickiness>0 should produce a non-None transition_prior."""
         model = CommonOscillatorModel(
-            n_oscillators=2, n_discrete_states=3, n_sources=4,
-            sampling_freq=100.0, freqs=jnp.array([8.0, 12.0]),
+            n_oscillators=2,
+            n_discrete_states=3,
+            n_sources=4,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
             damping_coef=jnp.array([0.95, 0.95]),
             process_variance=jnp.array([0.1, 0.1]),
             measurement_variance=0.05,
@@ -1962,8 +2195,11 @@ class TestBaseModelDecodeAndPredictProba:
     def test_decode_before_fit_raises(self):
         """decode() before fit should raise RuntimeError."""
         model = CommonOscillatorModel(
-            n_oscillators=2, n_discrete_states=3, n_sources=4,
-            sampling_freq=100.0, freqs=jnp.array([8.0, 12.0]),
+            n_oscillators=2,
+            n_discrete_states=3,
+            n_sources=4,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
             damping_coef=jnp.array([0.95, 0.95]),
             process_variance=jnp.array([0.1, 0.1]),
             measurement_variance=0.05,
@@ -1974,8 +2210,11 @@ class TestBaseModelDecodeAndPredictProba:
     def test_predict_proba_before_fit_raises(self):
         """predict_proba() before fit should raise RuntimeError."""
         model = CommonOscillatorModel(
-            n_oscillators=2, n_discrete_states=3, n_sources=4,
-            sampling_freq=100.0, freqs=jnp.array([8.0, 12.0]),
+            n_oscillators=2,
+            n_discrete_states=3,
+            n_sources=4,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
             damping_coef=jnp.array([0.95, 0.95]),
             process_variance=jnp.array([0.1, 0.1]),
             measurement_variance=0.05,
@@ -1994,8 +2233,11 @@ class TestBaseModelDecodeAndPredictProba:
         obs = jnp.sin(2 * jnp.pi * 10 * t)[:, None] + noise
 
         model = CorrelatedNoiseModel(
-            n_oscillators=2, n_discrete_states=2, sampling_freq=100.0,
-            freqs=jnp.array([8.0, 12.0]), damping_coef=jnp.array([0.95, 0.95]),
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.95]),
             process_variance=jnp.ones((2, 2)) * 0.1,
             measurement_variance=0.05,
             phase_difference=jnp.zeros((2, 2, 2)),
@@ -2018,8 +2260,11 @@ class TestBaseModelDecodeAndPredictProba:
         obs = jnp.sin(2 * jnp.pi * 10 * t)[:, None] + noise
 
         model = CorrelatedNoiseModel(
-            n_oscillators=2, n_discrete_states=2, sampling_freq=100.0,
-            freqs=jnp.array([8.0, 12.0]), damping_coef=jnp.array([0.95, 0.95]),
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.95]),
             process_variance=jnp.ones((2, 2)) * 0.1,
             measurement_variance=0.05,
             phase_difference=jnp.zeros((2, 2, 2)),
@@ -2039,8 +2284,11 @@ class TestBaseModelPStayValidation:
         """sampling_freq < 1.0 Hz should raise ValueError."""
         with pytest.raises(ValueError, match="sampling_freq"):
             CommonOscillatorModel(
-                n_oscillators=2, n_discrete_states=3, n_sources=4,
-                sampling_freq=0.5, freqs=jnp.array([8.0, 12.0]),
+                n_oscillators=2,
+                n_discrete_states=3,
+                n_sources=4,
+                sampling_freq=0.5,
+                freqs=jnp.array([8.0, 12.0]),
                 damping_coef=jnp.array([0.95, 0.95]),
                 process_variance=jnp.array([0.1, 0.1]),
                 measurement_variance=0.05,
@@ -2049,8 +2297,11 @@ class TestBaseModelPStayValidation:
     def test_p_stay_at_low_boundary(self):
         """At sampling_freq=1.0 Hz the ~1s dwell target gives p_stay=0."""
         model = CommonOscillatorModel(
-            n_oscillators=2, n_discrete_states=3, n_sources=4,
-            sampling_freq=1.0, freqs=jnp.array([8.0, 12.0]),
+            n_oscillators=2,
+            n_discrete_states=3,
+            n_sources=4,
+            sampling_freq=1.0,
+            freqs=jnp.array([8.0, 12.0]),
             damping_coef=jnp.array([0.95, 0.95]),
             process_variance=jnp.array([0.1, 0.1]),
             measurement_variance=0.05,
@@ -2069,8 +2320,11 @@ class TestBaseModelPStayValidation:
         20-sample dwell (e.g. 20 ms at 1000 Hz).
         """
         model = CommonOscillatorModel(
-            n_oscillators=2, n_discrete_states=3, n_sources=4,
-            sampling_freq=sampling_freq, freqs=jnp.array([8.0, 12.0]),
+            n_oscillators=2,
+            n_discrete_states=3,
+            n_sources=4,
+            sampling_freq=sampling_freq,
+            freqs=jnp.array([8.0, 12.0]),
             damping_coef=jnp.array([0.95, 0.95]),
             process_variance=jnp.array([0.1, 0.1]),
             measurement_variance=0.05,
@@ -2091,14 +2345,15 @@ class TestBaseModelPStayValidation:
             jnp.array([0.9]),
         ],
     )
-    def test_user_discrete_transition_diag_is_validated(
-        self, discrete_transition_diag
-    ):
+    def test_user_discrete_transition_diag_is_validated(self, discrete_transition_diag):
         """User-provided p_stay vector should have valid shape and range."""
         with pytest.raises(ValueError, match="discrete_transition_diag"):
             CommonOscillatorModel(
-                n_oscillators=2, n_discrete_states=2, n_sources=4,
-                sampling_freq=100.0, freqs=jnp.array([8.0, 12.0]),
+                n_oscillators=2,
+                n_discrete_states=2,
+                n_sources=4,
+                sampling_freq=100.0,
+                freqs=jnp.array([8.0, 12.0]),
                 damping_coef=jnp.array([0.95, 0.95]),
                 process_variance=jnp.array([0.1, 0.1]),
                 measurement_variance=0.05,
@@ -2131,7 +2386,9 @@ class TestOscillatorEMRollback:
             measurement_variance=p["measurement_variance"],
         )
         assert_em_rolls_back_on_ll_decrease(
-            model, (scenario["obs"],), caplog,
+            model,
+            (scenario["obs"],),
+            caplog,
         )
 
     def test_oscillator_em_restores_rejected_parameters(self) -> None:
@@ -2213,8 +2470,11 @@ class TestComWarmInitStateDependentH:
 
     def _com(self):
         return CommonOscillatorModel(
-            n_oscillators=2, n_discrete_states=2, n_sources=4,
-            sampling_freq=100.0, freqs=jnp.array([8.0, 12.0]),
+            n_oscillators=2,
+            n_discrete_states=2,
+            n_sources=4,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
             damping_coef=jnp.array([0.95, 0.95]),
             process_variance=jnp.array([0.1, 0.1]),
             measurement_variance=0.05,
@@ -2231,9 +2491,7 @@ class TestComWarmInitStateDependentH:
         model._warm_initialize_states(obs)
 
         # State-dependent H -> the pinv mean step is skipped; init_mean unchanged.
-        np.testing.assert_array_equal(
-            np.array(model.init_mean), np.array(cold_mean)
-        )
+        np.testing.assert_array_equal(np.array(model.init_mean), np.array(cold_mean))
         # But warm init still ran: init_cov was rescaled to the data variance.
         obs_var = float(np.var(np.array(obs), axis=0).mean())
         for j in range(model.n_discrete_states):
@@ -2244,9 +2502,13 @@ class TestComWarmInitStateDependentH:
     def test_shared_h_model_updates_init_mean(self):
         """Contrast: DIM has shared H, so warm init DOES set init_mean."""
         model = DirectedInfluenceModel(
-            n_oscillators=2, n_discrete_states=2, sampling_freq=100.0,
-            freqs=jnp.array([8.0, 12.0]), damping_coef=jnp.array([0.95, 0.95]),
-            process_variance=jnp.array([0.1, 0.1]), measurement_variance=0.05,
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.array([0.1, 0.1]),
+            measurement_variance=0.05,
             phase_difference=jnp.zeros((2, 2, 2)),
             coupling_strength=jnp.zeros((2, 2, 2)),
         )
@@ -2272,14 +2534,17 @@ class TestReparameterizedPublicParamsReconstructA:
         key = jax.random.PRNGKey(3)
         n_time = 250
         t = jnp.arange(n_time) / 100.0
-        obs = (
-            jnp.sin(2 * jnp.pi * 9 * t)[:, None] * jnp.ones((1, 2))
-            + 0.3 * jax.random.normal(key, (n_time, 2))
-        )
+        obs = jnp.sin(2 * jnp.pi * 9 * t)[:, None] * jnp.ones(
+            (1, 2)
+        ) + 0.3 * jax.random.normal(key, (n_time, 2))
         model = DirectedInfluenceModel(
-            n_oscillators=2, n_discrete_states=2, sampling_freq=100.0,
-            freqs=jnp.array([8.0, 12.0]), damping_coef=jnp.array([0.95, 0.95]),
-            process_variance=jnp.array([0.1, 0.1]), measurement_variance=0.1,
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.array([0.1, 0.1]),
+            measurement_variance=0.1,
             phase_difference=jnp.zeros((2, 2, 2)),
             coupling_strength=jnp.zeros((2, 2, 2)),
             use_reparameterized_mstep=True,
@@ -2306,16 +2571,15 @@ class TestReparameterizedPublicParamsReconstructA:
             np.testing.assert_allclose(
                 np.array(model.continuous_transition_matrix[..., j]),
                 np.array(A_recon),
-                rtol=1e-6, atol=1e-9,
+                rtol=1e-6,
+                atol=1e-9,
             )
 
 
 class TestFirstIterationFailureClearsPosteriors:
     """A non-finite first E-step must not leave NaN posteriors installed."""
 
-    def test_nonfinite_first_e_step_clears_posteriors(
-        self, common_oscillator_params
-    ):
+    def test_nonfinite_first_e_step_clears_posteriors(self, common_oscillator_params):
         model = CommonOscillatorModel(**common_oscillator_params)
         obs = jax.random.normal(
             jax.random.PRNGKey(1), (150, common_oscillator_params["n_sources"])
@@ -2354,35 +2618,47 @@ class TestSamplingFrequencyRange:
         key = jax.random.PRNGKey(0)
         n_time = 300
         t = jnp.arange(n_time) / sampling_freq
-        obs2 = (
-            jnp.sin(2 * jnp.pi * 8 * t)[:, None] * jnp.ones((1, 2))
-            + 0.3 * jax.random.normal(key, (n_time, 2))
-        )
+        obs2 = jnp.sin(2 * jnp.pi * 8 * t)[:, None] * jnp.ones(
+            (1, 2)
+        ) + 0.3 * jax.random.normal(key, (n_time, 2))
         obs4 = jnp.concatenate([obs2, 0.5 * obs2], axis=1)
 
         def _finite(values):
             return len(values) >= 1 and all(np.isfinite(v) for v in values)
 
         com = CommonOscillatorModel(
-            2, 2, 4, sampling_freq, freqs=jnp.array([8.0, 20.0]),
+            2,
+            2,
+            4,
+            sampling_freq,
+            freqs=jnp.array([8.0, 20.0]),
             damping_coef=jnp.array([0.95, 0.95]),
-            process_variance=jnp.array([0.1, 0.1]), measurement_variance=0.1,
+            process_variance=jnp.array([0.1, 0.1]),
+            measurement_variance=0.1,
         )
         assert _finite(com.fit(obs4, key, max_iter=3))
 
         cnm = CorrelatedNoiseModel(
-            2, 2, sampling_freq, freqs=jnp.array([8.0, 20.0]),
+            2,
+            2,
+            sampling_freq,
+            freqs=jnp.array([8.0, 20.0]),
             damping_coef=jnp.array([0.95, 0.95]),
-            process_variance=jnp.ones((2, 2)) * 0.1, measurement_variance=0.1,
+            process_variance=jnp.ones((2, 2)) * 0.1,
+            measurement_variance=0.1,
             phase_difference=jnp.zeros((2, 2, 2)),
             coupling_strength=jnp.zeros((2, 2, 2)),
         )
         assert _finite(cnm.fit(obs2, key, max_iter=3))
 
         dim = DirectedInfluenceModel(
-            2, 2, sampling_freq, freqs=jnp.array([8.0, 20.0]),
+            2,
+            2,
+            sampling_freq,
+            freqs=jnp.array([8.0, 20.0]),
             damping_coef=jnp.array([0.95, 0.95]),
-            process_variance=jnp.array([0.1, 0.1]), measurement_variance=0.1,
+            process_variance=jnp.array([0.1, 0.1]),
+            measurement_variance=0.1,
             phase_difference=jnp.zeros((2, 2, 2)),
             coupling_strength=jnp.zeros((2, 2, 2)),
             use_reparameterized_mstep=True,
@@ -2393,5 +2669,6 @@ class TestSamplingFrequencyRange:
         # old 0.95 cap that bound above 20 Hz).
         np.testing.assert_allclose(
             float(com.discrete_transition_diag[0]),
-            1.0 - 1.0 / sampling_freq, rtol=1e-6,
+            1.0 - 1.0 / sampling_freq,
+            rtol=1e-6,
         )
