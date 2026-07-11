@@ -508,8 +508,13 @@ def _update_discrete_state_probabilities(
     # impossible observation), fall back to the dynamics prediction (drop the
     # likelihood) for the posterior so the discrete state follows the transition
     # structure instead of zero-locking, without leaking onto impossible states.
+    # Gate on -inf specifically, NOT on ~isfinite: a +inf pair likelihood (a
+    # pathological zero-variance-like observation) is not an *impossible*
+    # observation, so it must not be silently discarded for the dynamics
+    # prediction; it flows through and surfaces as a fail-loud NaN below. A NaN
+    # predictive likewise propagates rather than being masked by the dynamics.
     dynamics_log_joint = log_transition + log_prev[:, None]
-    log_joint = jnp.where(jnp.isfinite(log_predictive), log_joint, dynamics_log_joint)
+    log_joint = jnp.where(jnp.isneginf(log_predictive), dynamics_log_joint, log_joint)
 
     next_support = jnp.any(
         prev_support[:, None] & (discrete_transition_matrix > 0.0), axis=0
@@ -627,20 +632,23 @@ def _first_timestep_discrete_update(
     # prior itself, so drop the likelihood and fall back to the normalized prior.
     # ``logsumexp(log_prior) == log(sum prior) == 0`` (the prior is normalized),
     # so ``exp(log_prior - 0)`` returns the prior (structural zeros preserved).
-    # A malformed (NaN) prior keeps marginal NaN -> stays on this branch -> NaN
-    # posterior, so it still fails loud.
-    obs_impossible = ~jnp.isfinite(marginal_log_likelihood)
+    # Gate on -inf specifically: a +inf likelihood (pathological, not impossible)
+    # or a NaN marginal (malformed prior) must NOT be recovered to the prior --
+    # it flows through and surfaces as a fail-loud NaN posterior below.
+    obs_impossible = jnp.isneginf(marginal_log_likelihood)
     posterior_log_unnorm = jnp.where(obs_impossible, log_prior, log_unnorm)
     posterior_log_norm = jnp.where(
         obs_impossible, logsumexp(log_prior), marginal_log_likelihood
     )
     filter_discrete_prob = jnp.exp(posterior_log_unnorm - posterior_log_norm)
-    # Floor supported-but-underflowed marginals so a value-based consumer (the
-    # GPB smoothers) can tell a reachable underflowed state from an impossible
-    # one; forbidden states stay exactly 0. Malformed (NaN) propagates.
-    filter_discrete_prob = _floor_supported_marginal(
-        filter_discrete_prob, init_discrete_state_prob > 0.0
-    )
+    # Floor only reachable states with a *finite* posterior log-unnorm (genuine
+    # underflow, recoverable). A state whose likelihood is -inf (the data rules
+    # it out at t=1) or whose prior is a structural zero has posterior_log_unnorm
+    # = -inf and stays exactly 0 -- matching the scan body's
+    # ``floorable = support & isfinite(log_marginal)``, so a data-ruled-out
+    # first state is not fabricated to 1e-10. (NaN -> not floorable, propagates.)
+    floorable = jnp.isfinite(posterior_log_unnorm)
+    filter_discrete_prob = _floor_supported_marginal(filter_discrete_prob, floorable)
     # Floor a degenerate -inf contribution so the marginal LL stays finite for
     # EM accumulation (matching the scan body); NaN (malformed prior) propagates.
     marginal_log_likelihood = jnp.where(

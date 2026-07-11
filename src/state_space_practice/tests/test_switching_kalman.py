@@ -319,6 +319,66 @@ def test_update_discrete_probs_supported_all_inf_column_no_nan_backward() -> Non
     )
 
 
+def test_update_discrete_probs_plus_inf_likelihood_not_dynamics_recovered() -> None:
+    """A +inf pair likelihood must NOT be routed to the dynamics recovery.
+
+    The impossible-observation recovery (drop the likelihood, follow the
+    dynamics) is for -inf: an observation no state can explain. A +inf
+    log-likelihood is the opposite -- a pathological, zero-variance-like
+    observation that a pair explains *infinitely* well. Falling back to the
+    dynamics prediction there silently discards the observation and returns a
+    plausible-looking posterior. Recovery is restricted to -inf; a +inf instead
+    propagates as a fail-loud NaN (surfacing in the EM objective) rather than the
+    finite dynamics prediction [0.5, 0.5].
+    """
+    log_likelihood = jnp.array([[jnp.inf, 0.0], [0.0, 0.0]])  # pair (0,0) is +inf
+    Z = jnp.array([[0.5, 0.5], [0.5, 0.5]])
+    prev = jnp.array([0.5, 0.5])
+    support = jnp.array([True, True])
+
+    m_t, _, _, _ = _update_discrete_state_probabilities(
+        log_likelihood, Z, prev, support
+    )
+
+    # Fail loud: NaN, not the silent dynamics prediction [0.5, 0.5].
+    assert bool(jnp.any(jnp.isnan(m_t)))
+
+
+def test_first_timestep_ruled_out_state_not_floored() -> None:
+    """A first-step state the data rules out (-inf likelihood) keeps marginal 0.
+
+    With likelihoods [0, -inf] and a uniform prior [0.5, 0.5], state 1 is
+    structurally reachable (positive prior) but the observation is impossible for
+    it, so its Bayes posterior is exactly 0. Flooring it to 1e-10 -- as flooring
+    on mere prior support does -- fabricates mass on a data-contradicted state,
+    contradicting the corrected scan-body behavior. The floor must key off the
+    (finite) posterior log-unnorm, not the prior support.
+    """
+    state_cond_log_lik = jnp.array([0.0, -jnp.inf])
+    prior = jnp.array([0.5, 0.5])
+
+    prob, _ = _first_timestep_discrete_update(state_cond_log_lik, prior)
+
+    np.testing.assert_allclose(np.asarray(prob), np.array([1.0, 0.0]), atol=1e-12)
+    assert float(prob[1]) == 0.0
+
+
+def test_first_timestep_plus_inf_likelihood_not_prior_recovered() -> None:
+    """A +inf first-step likelihood must NOT be routed to the prior fallback.
+
+    Like the scan body, the first-step recovery is for -inf (impossible
+    observation) only. A +inf likelihood is a pathological observation, not an
+    impossible one, so it must not silently return the prior; it propagates as a
+    fail-loud NaN.
+    """
+    state_cond_log_lik = jnp.array([jnp.inf, 0.0])
+    prior = jnp.array([0.5, 0.5])
+
+    prob, _ = _first_timestep_discrete_update(state_cond_log_lik, prior)
+
+    assert bool(jnp.any(jnp.isnan(prob)))
+
+
 def test_first_timestep_impossible_obs_falls_back_to_prior() -> None:
     """An impossible first observation falls back to the normalized prior.
 
