@@ -1964,10 +1964,10 @@ def _switching_point_process_filter_jit(
     )
 
     def _step(
-        carry: tuple[Array, Array, Array, Array],
+        carry: tuple[Array, Array, Array, Array, Array],
         y_t: Array,
     ) -> tuple[
-        tuple[Array, Array, Array, Array],
+        tuple[Array, Array, Array, Array, Array],
         tuple[Array, Array, Array, Array, Array, Array],
     ]:
         """One step of the switching point-process filter.
@@ -2012,6 +2012,7 @@ def _switching_point_process_filter_jit(
             prev_state_cond_filter_cov,
             prev_filter_discrete_prob,
             marginal_log_likelihood,
+            prev_support,
         ) = carry
 
         # 1. Compute pair-conditional posteriors p(x_t | y_{1:t}, S_{t-1}=i, S_t=j)
@@ -2034,27 +2035,25 @@ def _switching_point_process_filter_jit(
             line_search_beta,
         )
 
-        # 2. Scale likelihood for numerical stability
-        pair_cond_likelihood_scaled, ll_max = _scale_likelihood(
-            pair_cond_log_likelihood
-        )
-
-        # 3. Update discrete state probabilities (HMM forward step)
+        # 2-3. Log-space, support-masked discrete update (HMM forward step; see
+        #      switching_kalman._update_discrete_state_probabilities).
         (
             filter_discrete_prob,
             filter_backward_cond_prob,
-            predictive_likelihood_term_sum,
+            log_predictive,
+            next_support,
         ) = _update_discrete_state_probabilities(
-            pair_cond_likelihood_scaled,
+            pair_cond_log_likelihood,
             discrete_transition_matrix,
             prev_filter_discrete_prob,
+            prev_support,
         )
         pair_cond_filter_prob = (
             filter_backward_cond_prob * filter_discrete_prob[None, :]
         )
 
         # 4. Accumulate marginal log-likelihood
-        marginal_log_likelihood += ll_max + jnp.log(predictive_likelihood_term_sum)
+        marginal_log_likelihood += log_predictive
 
         # 5. Collapse pair-conditional Gaussians to state-conditional
         #    p(x_t | y_{1:t}, S_t=j) by marginalizing over S_{t-1}=i
@@ -2071,6 +2070,7 @@ def _switching_point_process_filter_jit(
             state_cond_filter_cov,
             filter_discrete_prob,
             marginal_log_likelihood,
+            next_support,
         ), (
             state_cond_filter_mean,
             state_cond_filter_cov,
@@ -2103,10 +2103,12 @@ def _switching_point_process_filter_jit(
         line_search_beta,
     )
 
+    # Structural support S_1 (nonzero prior entries), threaded through the scan.
+    first_support = jnp.asarray(init_discrete_state_prob) > 0.0
     # Run predict-then-update for t=2,...,T
     # jax.lax.scan handles empty inputs (spikes[1:] when n_time=1) gracefully
     (
-        (_, _, _, marginal_log_likelihood),
+        (_, _, _, marginal_log_likelihood, _),
         (
             rest_state_cond_filter_mean,
             rest_state_cond_filter_cov,
@@ -2122,6 +2124,7 @@ def _switching_point_process_filter_jit(
             first_state_cond_cov,
             first_discrete_prob,
             first_log_lik,
+            first_support,
         ),
         spikes[1:],
     )

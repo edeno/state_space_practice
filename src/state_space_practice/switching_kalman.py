@@ -9,11 +9,13 @@ References
 5. https://github.com/Stephen-Lab-BU/Switching_Oscillator_Networks
 """
 
+import math
 import warnings
 from functools import partial
 
 import jax
 import jax.numpy as jnp
+from jax.scipy.special import logsumexp
 
 from state_space_practice.kalman import (
     _kalman_filter_update,
@@ -25,7 +27,6 @@ from state_space_practice.kalman import (
 from state_space_practice.utils import debug_print_if
 from state_space_practice.utils import divide_safe as _divide_safe
 from state_space_practice.utils import safe_log as _safe_log
-from state_space_practice.utils import scale_likelihood as _scale_likelihood
 from state_space_practice.utils import spectral_radius as _spectral_radius
 from state_space_practice.utils import (
     stabilize_probability_vector as _stabilize_probability_vector,
@@ -136,8 +137,14 @@ collapse_cross_gaussian_mixture_across_states = jax.vmap(
 def _cap_covariance_trace(
     cov: jax.Array,
     max_allowed_trace: jax.Array,
-) -> jax.Array:
-    """Cap a single covariance matrix so its trace does not exceed max_allowed_trace.
+) -> tuple[jax.Array, jax.Array]:
+    """Cap a covariance so its trace does not exceed ``max_allowed_trace``.
+
+    Returns the capped covariance *and* the multiplicative scale ``alpha`` in
+    (0, 1] that was applied (``cov * alpha``). The caller needs ``alpha`` to
+    rescale the paired lag-one cross-covariance by ``sqrt(alpha)`` -- a
+    congruence transform of the joint block ``[[P_t, C], [C^T, P_{t+1}]]`` --
+    so capping ``P_t`` cannot leave the joint indefinite.
 
     Pure (no telemetry): this runs under ``jax.vmap``, where ``lax.cond`` lowers
     to ``select`` and both branches execute, so a per-element ``debug_print_if``
@@ -145,18 +152,9 @@ def _cap_covariance_trace(
     signal is emitted once at the call site via ``_warn_if_cov_cap_engaged``.
     """
     trace = jnp.trace(cov)
-    ratio = trace / max_allowed_trace
-    return jnp.where(ratio > 1.0, cov / ratio, cov)
-
-
-def _cap_cross_covariance_frobenius(
-    cross_cov: jax.Array,
-    max_allowed_norm: jax.Array,
-) -> jax.Array:
-    """Rescale a cross-covariance matrix when its Frobenius norm is too large."""
-    norm = jnp.linalg.norm(cross_cov)
-    ratio = norm / max_allowed_norm
-    return jnp.where(ratio > 1.0, cross_cov / ratio, cross_cov)
+    # scale = min(1, max/trace); guard trace==0 (then no scaling is needed).
+    scale = jnp.minimum(1.0, max_allowed_trace / jnp.where(trace > 0.0, trace, 1.0))
+    return scale * cov, scale
 
 
 def _log_prob_preserve_zeros(prob: jax.Array) -> jax.Array:
@@ -166,6 +164,53 @@ def _log_prob_preserve_zeros(prob: jax.Array) -> jax.Array:
         prob = prob.astype(jnp.float32)
     tiny = jnp.finfo(prob.dtype).tiny
     return jnp.where(prob > 0.0, jnp.log(jnp.maximum(prob, tiny)), -jnp.inf)
+
+
+def _normalize_initial_discrete_prob(prob: jax.Array) -> jax.Array:
+    """Normalize a caller-supplied initial discrete-state prior, preserving zeros.
+
+    The initial distribution is a user *input*, not a computed posterior. An
+    exact zero declares a state impossible at t=1 and must survive into the
+    posterior. Unlike :func:`stabilize_probability_vector` -- which floors
+    underflowed *computed* posteriors back above zero to prevent permanent
+    state lockout -- this must NOT floor zeros, otherwise the first-observation
+    likelihood can resurrect a state the caller declared impossible (and, via
+    ``_log_prob_preserve_zeros``, the Viterbi first state too).
+
+    Genuinely malformed input (non-finite or negative entries, or a vector that
+    does not sum to a positive value) is sanitized rather than silently
+    repaired into a plausible-looking distribution, with a divergence signal so
+    it is visible in filter/smoother logs.
+
+    Parameters
+    ----------
+    prob : jax.Array, shape (n_discrete_states,)
+        Caller-supplied prior ``p(S_1)``; exact zeros are structural.
+
+    Returns
+    -------
+    jax.Array, shape (n_discrete_states,)
+        ``prob`` normalized to sum 1 with structural zeros preserved.
+    """
+    prob = jnp.asarray(prob)
+    prob = prob.astype(jnp.result_type(prob, 1.0))
+    # Sanitize non-finite entries and clamp sign errors to zero (an invalid
+    # negative probability must not pull mass onto a state) without flooring
+    # legitimate structural zeros.
+    cleaned = jnp.maximum(jnp.nan_to_num(prob, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
+    total = jnp.sum(cleaned)
+    debug_print_if(
+        jnp.any(~jnp.isfinite(prob)) | jnp.any(prob < 0.0) | (total <= 0.0),
+        "switching_kalman: initial_discrete_state_prob was non-finite, "
+        "negative, or summed to <= 0 (sum={s:.2e}); structural zeros in an "
+        "otherwise valid prior are preserved, but an all-zero / non-positive "
+        "prior is rejected as NaN.",
+        s=total,
+    )
+    # A prior that does not sum to a positive value is not a distribution.
+    # Fail loud with NaN so the caller's non-finite check rejects it, rather
+    # than returning an all-zero "posterior" that looks finite downstream.
+    return jnp.where(total > 0.0, _divide_safe(cleaned, total), jnp.nan)
 
 
 def _warn_if_cov_cap_engaged(
@@ -228,7 +273,6 @@ def _warn_if_cov_cap_engaged(
 
 _COV_CAP_MULTIPLIER = 1e8
 _GPB2_COV_CAP_MULTIPLIER = 1e2
-_MAX_SMOOTHER_MEAN_ABS = 1e6
 
 
 def _compute_max_allowed_trace(
@@ -253,20 +297,134 @@ def _compute_max_allowed_trace(
     return max_filter_trace * _COV_CAP_MULTIPLIER + 1.0
 
 
-def _update_discrete_state_probabilities(
-    pair_cond_marginal_likelihood_scaled: jax.Array,
-    discrete_transition_matrix: jax.Array,
-    prev_filter_discrete_prob: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Update the discrete state probabilities using the discrete transition matrix.
+def _guard_smoother_mean(mean: jax.Array, label: str) -> jax.Array:
+    """Preserve finite, representable smoother means; fail loud otherwise.
+
+    A smoother mean has no valid magnitude threshold: future observations can
+    legitimately move it arbitrarily far from the current filtered mean, so any
+    local cap (absolute or scale-relative) can corrupt a correct RTS posterior.
+    Finite, representable means are therefore returned unchanged.
+
+    The only genuine failure is a mean that is non-finite, or so large that
+    squaring it (as the M-step second-moment statistics do) would overflow the
+    dtype. Those are replaced with NaN so the EM loop's non-finite check rolls
+    the step back instead of consuming a fabricated posterior. The value is
+    never saturated at a threshold -- a clipped mean is still a fabricated
+    posterior.
 
     Parameters
     ----------
-    pair_cond_marginal_likelihood_scaled : jax.Array, shape (n_discrete_states, n_discrete_states)
+    mean : jax.Array
+        Smoother mean array (any shape).
+    label : str
+        Smoother label (``"GPB1"`` / ``"GPB2"``) for the telemetry message.
+
+    Returns
+    -------
+    jax.Array
+        ``mean`` unchanged when finite and representable; otherwise all-NaN.
+    """
+    # sqrt(max) is the largest magnitude whose square is still representable.
+    safe_second_moment_abs = jnp.sqrt(jnp.finfo(mean.dtype).max)
+    unrepresentable = jnp.any(~jnp.isfinite(mean)) | jnp.any(
+        jnp.abs(mean) > safe_second_moment_abs
+    )
+    debug_print_if(
+        unrepresentable,
+        f"switching_kalman: {label} smoother mean is non-finite or too large to "
+        "square without overflow (max |mean| {m:.2e}); propagating NaN so the EM "
+        "loop rolls this step back.",
+        m=jnp.max(jnp.abs(mean)),
+    )
+    return jnp.where(unrepresentable, jnp.nan, mean)
+
+
+def _stabilize_probability_vector_preserving_zeros(
+    probabilities: jax.Array,
+) -> jax.Array:
+    """Floor underflow only on currently-nonzero entries; hold exact zeros at 0.
+
+    An exact zero is *structural*: a state the model cannot occupy at this
+    timestep, because either the prior or every transition into it is zero.
+    Flooring it -- as :func:`stabilize_probability_vector` does unconditionally
+    -- resurrects an impossible state, and (across a deterministic transition)
+    leaks that mass onto the wrong state at the next step.
+
+    Crucially, a probability vector's exact zeros are *time-indexed*: the
+    posterior/marginal at time ``t`` is exactly 0 precisely at the states not in
+    the structural support ``S_t``, so masking on ``value > 0`` gives the
+    per-timestep support without any separate reachability computation. Nonzero
+    entries are still floored (then renormalized) to recover from numerical
+    underflow; in the healthy all-positive regime this equals
+    :func:`stabilize_probability_vector` exactly.
+    """
+    probabilities = jnp.asarray(probabilities)
+    support = probabilities > 0.0
+    stabilized = _stabilize_probability_vector(probabilities)
+    # Preserve structural zeros when some state has positive mass; if the whole
+    # vector underflowed to zero there is no support left to distinguish, so
+    # fall back to stabilize_probability_vector's uniform recovery.
+    masked = jnp.where(
+        jnp.any(support), jnp.where(support, stabilized, 0.0), stabilized
+    )
+    return _divide_safe(masked, jnp.sum(masked))
+
+
+# Log-space floor for a structurally-supported discrete state (matches the
+# linear _DISCRETE_PROB_STABILITY_FLOOR = 1e-10 in utils). A supported state
+# whose posterior underflows to 0 is floored here so it is recovered rather than
+# locked out; a structurally forbidden state is masked to -inf instead.
+_LOG_DISCRETE_STABILITY_FLOOR = math.log(1e-10)
+_DISCRETE_STABILITY_FLOOR = 1e-10
+
+
+def _floor_supported_marginal(prob: jax.Array, support: jax.Array) -> jax.Array:
+    """Lift a supported state that underflowed to *exactly 0* to the stability floor.
+
+    The GPB smoothers read the *filter marginal* and infer the structural
+    support from its zeros. A supported state whose forward posterior underflowed
+    to exactly 0 would then be lost (mistaken for impossible) even though future
+    data supports it, so it is lifted to ``_DISCRETE_STABILITY_FLOOR`` to stay
+    strictly positive and recoverable. A legitimately tiny *positive* marginal
+    (e.g. from a small caller-supplied prior like 1e-12) is preserved exactly --
+    lifting only exact zeros avoids inflating it. Structurally forbidden states
+    (``support`` False) stay exactly 0, and a NaN marginal (malformed/diverged)
+    propagates rather than being masked to 0.
+    """
+    lifted = jnp.where(prob > 0.0, prob, _DISCRETE_STABILITY_FLOOR)
+    floored = jnp.where(support, lifted, 0.0)
+    result = _divide_safe(floored, jnp.sum(floored))
+    return jnp.where(jnp.any(jnp.isnan(prob)), jnp.nan, result)
+
+
+def _update_discrete_state_probabilities(
+    pair_cond_marginal_log_likelihood: jax.Array,
+    discrete_transition_matrix: jax.Array,
+    prev_filter_discrete_prob: jax.Array,
+    prev_support: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Update the discrete state probabilities in log space with a support mask.
+
+    Works entirely with log-likelihoods and normalizes with ``logsumexp`` over
+    the structurally-supported ``(S_{t-1}=i, S_t=j)`` pairs. This is what lets a
+    state whose posterior underflowed to exactly 0 be recovered (its Boolean
+    support, not its value, keeps it alive) and prevents a structurally
+    impossible state -- prior/transition zero -- from setting the scaling
+    reference or pulling any mass.
+
+    Parameters
+    ----------
+    pair_cond_marginal_log_likelihood : jax.Array, shape (n_discrete_states, n_discrete_states)
+        ``log p(y_t | y_{1:t-1}, S_{t-1}=i, S_t=j)`` (NOT pre-scaled).
     discrete_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
         Z(i, j) = P(S_t=j | S_{t-1}=i)
     prev_filter_discrete_prob : jax.Array, shape (n_discrete_states,)
         M_{t-1|t-1}(i) = Pr(S_{t-1}=i | y_{1:t-1})
+    prev_support : jax.Array, shape (n_discrete_states,)
+        Boolean structural support ``S_{t-1}`` (states reachable from the prior
+        through the transition structure by t-1). Threaded through the scan
+        rather than inferred from ``prev_filter_discrete_prob`` values, which
+        cannot distinguish an underflowed reachable state from an impossible one.
 
     Returns
     -------
@@ -274,35 +432,85 @@ def _update_discrete_state_probabilities(
         Updated discrete state probabilities, M_{t|t}(j) = Pr(S_t=j | y_{1:t})
     filter_backward_cond_prob : jax.Array, shape (n_discrete_states, n_discrete_states)
         Mixing weights for the discrete states, W^{i|j} = Pr(S_{t-1}=i | S_t=j, y_{1:t})
-    predictive_likelihood_term_sum : jax.Array
-        Scaled predictive likelihood sum (scalar array)
+    log_predictive : jax.Array
+        ``log p(y_t | y_{1:t-1})`` contribution to the marginal log-likelihood.
+    next_support : jax.Array, shape (n_discrete_states,)
+        Boolean structural support ``S_t`` for the next step.
     """
-    # joint discrete state prob between time steps
-    # M_{t-1,t | t}(i, j) = P(S_{t-1}=i, S_t=j | y_{1:t})
-    prev_filter_discrete_prob = _stabilize_probability_vector(prev_filter_discrete_prob)
-
-    joint_discrete_state_prob = (
-        pair_cond_marginal_likelihood_scaled  # L(i, j)
-        * discrete_transition_matrix  # Z(i, j)
-        * prev_filter_discrete_prob[:, None]  # M_{t-1|t-1}(i)
+    # Log-prior over the previous state. The Boolean support decides possibility,
+    # not the value: a structurally forbidden state is -inf, while a supported
+    # state whose posterior underflowed to exactly 0 is floored (recovered).
+    log_prev = jnp.where(
+        prev_support,
+        jnp.maximum(
+            _log_prob_preserve_zeros(prev_filter_discrete_prob),
+            _LOG_DISCRETE_STABILITY_FLOOR,
+        ),
+        -jnp.inf,
     )
-    predictive_likelihood_term_sum = jnp.sum(joint_discrete_state_prob)
+    log_transition = _log_prob_preserve_zeros(discrete_transition_matrix)
+    log_joint = pair_cond_marginal_log_likelihood + log_transition + log_prev[:, None]
 
-    joint_discrete_state_prob = _divide_safe(
-        joint_discrete_state_prob, predictive_likelihood_term_sum
+    # log p(y_t | y_{1:t-1}): the reference is a logsumexp over supported pairs
+    # only (impossible pairs are -inf), so no impossible state can win it.
+    log_predictive = logsumexp(log_joint)
+
+    # Degenerate recovery: if every supported pair has -inf likelihood (an
+    # impossible observation), fall back to the dynamics prediction (drop the
+    # likelihood) for the posterior so the discrete state follows the transition
+    # structure instead of zero-locking, without leaking onto impossible states.
+    dynamics_log_joint = log_transition + log_prev[:, None]
+    log_joint = jnp.where(jnp.isfinite(log_predictive), log_joint, dynamics_log_joint)
+
+    next_support = jnp.any(
+        prev_support[:, None] & (discrete_transition_matrix > 0.0), axis=0
     )
+    supported_col = next_support[None, :]  # (1, n_states)
 
+    # Per-destination-state (S_t=j) marginal and backward conditional, BOTH from
+    # the log joint. Computing W^{i|j} as a per-column softmax keeps the mixing
+    # weights well-defined even when a destination column underflows in linear
+    # space (its relative weights are still finite), so W^{i|j} columns sum to 1
+    # for every supported state -- and the caller's pair = W * marginal then stays
+    # column-consistent with the (possibly floored) marginal.
+    #
+    # A structurally-forbidden destination column (j not in next_support) is all
+    # -inf. Substitute a finite placeholder into those columns BEFORE the column
+    # reductions, then mask the results back: otherwise JAX differentiates through
+    # ``-inf - -inf`` and returns NaN gradients even though the forward value is
+    # masked (this breaks differentiable callers like switching-choice SGD).
+    safe_log_joint = jnp.where(supported_col, log_joint, 0.0)
+    log_marginal = jnp.where(
+        next_support, logsumexp(safe_log_joint, axis=0), -jnp.inf
+    )  # (n_states,), over S_{t-1}=i
+    log_norm = logsumexp(log_marginal)  # scalar (over supported columns)
     # M_{t|t}(j) = Pr(S_t=j | y_{1:t})
-    filter_discrete_prob = jnp.sum(joint_discrete_state_prob, axis=0)
-    # W^{i|j} = Pr(S_{t-1}=i | S_t=j, y_{1:t})
-    filter_backward_cond_prob = _divide_safe(
-        joint_discrete_state_prob, filter_discrete_prob[None, :]
+    filter_discrete_prob = jnp.where(
+        next_support, jnp.exp(log_marginal - log_norm), 0.0
     )
-
+    # W^{i|j} = Pr(S_{t-1}=i | S_t=j, y_{1:t}); forbidden columns -> 0. The safe
+    # (finite-in-forbidden-columns) marginal keeps exp(...) NaN-free for gradients.
+    safe_log_marginal = jnp.where(next_support, log_marginal, 0.0)
+    filter_backward_cond_prob = jnp.where(
+        supported_col,
+        jnp.exp(log_joint - safe_log_marginal[None, :]),
+        0.0,
+    )
+    # Floor supported-but-underflowed marginals in the RETURNED value so the GPB
+    # smoothers (which read the support from the marginal's zeros) do not mistake
+    # a reachable underflowed state for an impossible one. The backward columns
+    # sum to 1, so pair = W * floored_marginal remains consistent.
+    filter_discrete_prob = _floor_supported_marginal(filter_discrete_prob, next_support)
+    # Floor a degenerate -inf contribution so the marginal LL stays finite for
+    # EM; keep honest finite (even very negative) values and propagate NaN.
+    log_predictive = jnp.where(
+        jnp.isneginf(log_predictive), _LOG_DISCRETE_STABILITY_FLOOR, log_predictive
+    )
     return (
         filter_discrete_prob,
         filter_backward_cond_prob,
-        predictive_likelihood_term_sum,
+        log_predictive,
+        next_support,
     )
 
 
@@ -380,18 +588,35 @@ def _first_timestep_kalman_update(
         measurement_cov,
     )
 
-    init_discrete_state_prob = _stabilize_probability_vector(init_discrete_state_prob)
+    # Preserve structural zeros in the caller-supplied prior (an exact zero
+    # means "impossible at t=1"); do NOT floor it like a computed posterior,
+    # or the likelihood below could resurrect an excluded state.
+    init_discrete_state_prob = _normalize_initial_discrete_prob(
+        init_discrete_state_prob
+    )
 
-    # Update discrete state probabilities using observation likelihood
-    # At t=1, there's no transition from S₀, so we just use:
-    # p(S₁=j | y₁) ∝ p(y₁ | S₁=j) * p(S₁=j)
-    scaled_lik, ll_max = _scale_likelihood(state_cond_log_lik)
-    unnorm_prob = scaled_lik * init_discrete_state_prob
-    norm_const = jnp.sum(unnorm_prob)
-    filter_discrete_prob = _divide_safe(unnorm_prob, norm_const)
-
-    # Marginal log-likelihood contribution
-    marginal_log_likelihood = ll_max + _safe_log(norm_const)
+    # Update discrete state probabilities in log space, masking structurally
+    # impossible states (prior 0 -> -inf) BEFORE normalizing. This keeps an
+    # impossible-but-well-fitting state from setting the logsumexp reference and
+    # underflowing every supported state.
+    # p(S₁=j | y₁) = softmax_j( log p(y₁|S₁=j) + log p(S₁=j) ).
+    # Use _log_prob_preserve_zeros (exact zero -> -inf; positive -> its true log,
+    # floored only at the dtype's tiny, NOT at 1e-10) so a legitimately tiny
+    # caller prior like 1e-12 is represented faithfully rather than inflated.
+    log_prior = jnp.where(
+        jnp.isnan(init_discrete_state_prob),
+        jnp.nan,  # malformed prior -> NaN (fail loud)
+        _log_prob_preserve_zeros(init_discrete_state_prob),
+    )
+    log_unnorm = state_cond_log_lik + log_prior
+    marginal_log_likelihood = logsumexp(log_unnorm)
+    filter_discrete_prob = jnp.exp(log_unnorm - marginal_log_likelihood)
+    # Floor supported-but-underflowed marginals so a value-based consumer (the
+    # GPB smoothers) can tell a reachable underflowed state from an impossible
+    # one; forbidden states stay exactly 0. Malformed (NaN) propagates.
+    filter_discrete_prob = _floor_supported_marginal(
+        filter_discrete_prob, init_discrete_state_prob > 0.0
+    )
 
     # For smoother compatibility: create pair_cond_filter_mean and cov
     # At t=1, there's no S₀, so broadcast to be constant across the S₀ axis
@@ -498,9 +723,10 @@ def switching_kalman_filter(
     """
 
     def _step(
-        carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array], obs_t: jax.Array
+        carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+        obs_t: jax.Array,
     ) -> tuple[
-        tuple[jax.Array, jax.Array, jax.Array, jax.Array],  # Next carry
+        tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],  # Next carry
         tuple[
             jax.Array,
             jax.Array,
@@ -552,6 +778,7 @@ def switching_kalman_filter(
             prev_state_cond_filter_cov,
             prev_filter_discrete_prob,
             marginal_log_likelihood,
+            prev_support,
         ) = carry
 
         # Kalman update for each pair of discrete states
@@ -571,25 +798,22 @@ def switching_kalman_filter(
             measurement_cov,  # R
         )
 
-        # Make sure the likelihood is normalized to max 1 for numerical stability
-        pair_cond_marginal_likelihood_scaled, ll_max = _scale_likelihood(
-            pair_cond_marginal_log_likelihood
-        )
-
         (
             filter_discrete_prob,  # M_{t|t}(j) = P(S_t=j | y_{1:t})
             filter_backward_cond_prob,  # P(S_{t-1}=i | S_t=j, y_{1:t})
-            predictive_likelihood_term_sum,  # Sum over i,j of unnormalized joint prob
+            log_predictive,  # log p(y_t | y_{1:t-1})
+            next_support,  # S_t
         ) = _update_discrete_state_probabilities(
-            pair_cond_marginal_likelihood_scaled,  # shape (n_discrete_states, n_discrete_states)
+            pair_cond_marginal_log_likelihood,  # shape (n_discrete_states, n_discrete_states)
             discrete_transition_matrix,  # P(S_t=j | S_{t-1}=i)
             prev_filter_discrete_prob,  # M_{t-1|t-1}(i)
+            prev_support,  # S_{t-1}
         )
         pair_cond_filter_prob = (
             filter_backward_cond_prob * filter_discrete_prob[None, :]
         )
 
-        marginal_log_likelihood += ll_max + _safe_log(predictive_likelihood_term_sum)
+        marginal_log_likelihood += log_predictive
 
         # Collapse pair-conditional Gaussians P(x_t | ..., S_t=j, S_{t-1}=i)
         # over S_{t-1}=i using weights P(S_{t-1}=i | S_t=j, y_{1:t})
@@ -607,6 +831,7 @@ def switching_kalman_filter(
             state_cond_filter_cov,
             filter_discrete_prob,
             marginal_log_likelihood,
+            next_support,
         ), (
             state_cond_filter_mean,
             state_cond_filter_cov,
@@ -639,8 +864,12 @@ def switching_kalman_filter(
     # jax.lax.scan handles empty inputs (obs[1:] when n_time=1) gracefully.
     # The scan now emits the full pair-conditional filter trajectory as stacked
     # outputs (the GPB2 smoother needs every timestep, not just the last).
+    # Structural support S_1 from the caller's prior (nonzero entries). Threaded
+    # through the scan and advanced one transition per step, so an underflowed
+    # reachable state is not mistaken for a structurally impossible one.
+    first_support = jnp.asarray(init_discrete_state_prob) > 0.0
     (
-        (_, _, _, marginal_log_likelihood),
+        (_, _, _, marginal_log_likelihood, _),
         (
             rest_state_cond_filter_mean,
             rest_state_cond_filter_cov,
@@ -656,6 +885,7 @@ def switching_kalman_filter(
             first_state_cond_cov,
             first_discrete_prob,
             first_log_lik,
+            first_support,
         ),
         obs[1:],
     )
@@ -722,6 +952,19 @@ def switching_kalman_viterbi(
     """
     n_discrete_states = init_state_cond_mean.shape[-1]
 
+    # Viterbi is not JIT-decorated, so reject a malformed prior loudly here
+    # rather than returning an arbitrary path from a NaN/degenerate posterior.
+    _init_prob = jnp.asarray(init_discrete_state_prob)
+    if not (
+        bool(jnp.all(jnp.isfinite(_init_prob)))
+        and bool(jnp.sum(jnp.where(_init_prob > 0.0, _init_prob, 0.0)) > 0.0)
+    ):
+        raise ValueError(
+            "switching_kalman_viterbi: init_discrete_state_prob must be finite "
+            "and sum to a positive value (it defines the initial support); got "
+            f"{jnp.asarray(_init_prob)}."
+        )
+
     # --- First timestep: measurement update only (x₁ convention) -----------
     (
         first_state_cond_mean,
@@ -744,7 +987,7 @@ def switching_kalman_viterbi(
 
     # --- Forward pass: collect pair log-likelihoods -----------------------
     def _step(carry, obs_t):
-        prev_mean, prev_cov, prev_prob = carry
+        prev_mean, prev_cov, prev_prob, prev_support = carry
 
         # Pair-conditional Kalman update (same as in the filter)
         (
@@ -762,16 +1005,17 @@ def switching_kalman_viterbi(
         )
 
         # Collapse mixture (same as filter) to get state-conditional
-        # means/covs for the next step
-        pair_cond_lik_scaled, _ = _scale_likelihood(pair_cond_log_lik)
+        # means/covs for the next step (log-space, support-masked).
         (
             filter_prob,
             backward_cond_prob,
             _,
+            next_support,
         ) = _update_discrete_state_probabilities(
-            pair_cond_lik_scaled,
+            pair_cond_log_lik,
             discrete_transition_matrix,
             prev_prob,
+            prev_support,
         )
 
         state_cond_mean, state_cond_cov = collapse_gaussian_mixture_per_discrete_state(
@@ -780,14 +1024,20 @@ def switching_kalman_viterbi(
             backward_cond_prob,
         )
 
-        return (state_cond_mean, state_cond_cov, filter_prob), pair_cond_log_lik
+        return (
+            state_cond_mean,
+            state_cond_cov,
+            filter_prob,
+            next_support,
+        ), pair_cond_log_lik
 
     _, pair_log_liks = jax.lax.scan(
         _step,
         (
             first_state_cond_mean,
             first_state_cond_cov,
-            _stabilize_probability_vector(first_discrete_prob),
+            first_discrete_prob,
+            jnp.asarray(init_discrete_state_prob) > 0.0,  # S_1
         ),
         obs[1:],
     )
@@ -951,7 +1201,9 @@ def _update_smoother_discrete_probabilities(
     # Note: next_smoother_discrete_prob is NOT stabilized here — it is
     # stabilized in the carry output so that the stored smoother_prob[t+1]
     # and the value used to compute joint_prob[t] are always identical.
-    filter_discrete_prob = _stabilize_probability_vector(filter_discrete_prob)
+    filter_discrete_prob = _stabilize_probability_vector_preserving_zeros(
+        filter_discrete_prob
+    )
 
     # Discrete smoother prob
     # P(S_t = j, S_{t+1} = k | y_{1:T})
@@ -1108,17 +1360,27 @@ def switching_kalman_smoother(
 
         _warn_if_cov_cap_engaged(pair_cond_smoother_covs, max_allowed_trace, "GPB1")
         _cap = partial(_cap_covariance_trace, max_allowed_trace=max_allowed_trace)
-        pair_cond_smoother_covs = jax.vmap(
-            jax.vmap(_cap, in_axes=-1, out_axes=-1),
+        pair_cond_smoother_covs, cov_scales = jax.vmap(
+            jax.vmap(_cap, in_axes=-1, out_axes=(-1, -1)),
             in_axes=-1,
-            out_axes=-1,
-        )(pair_cond_smoother_covs)
+            out_axes=(-1, -1),
+        )(pair_cond_smoother_covs)  # cov_scales: (n_discrete_states, n_discrete_states)
 
-        pair_cond_smoother_mean = jnp.clip(
-            pair_cond_smoother_mean,
-            -_MAX_SMOOTHER_MEAN_ABS,
-            _MAX_SMOOTHER_MEAN_ABS,
+        # Rescale the lag-one cross-covariance coherently with the covariance
+        # cap: if ``P_t`` was scaled by ``alpha`` per (S_t, S_{t+1}) lane, scale
+        # ``C`` by ``sqrt(alpha)``. This is a congruence transform of the joint
+        # block ``[[P_t, C], [C^T, P_{t+1}]]``, so a PSD joint (guaranteed by the
+        # RTS smoother pre-cap) stays PSD -- unlike an independent Frobenius cap,
+        # which can leave the joint indefinite and corrupt the M-step ``beta``.
+        pair_cond_smoother_cross_covs = (
+            jnp.sqrt(cov_scales) * pair_cond_smoother_cross_covs
         )
+
+        # Never clip a finite smoother mean: future data can legitimately move
+        # it far from the current filtered mean, so there is no valid magnitude
+        # threshold. Only fail loud (propagate NaN) on a non-finite or
+        # overflow-prone mean, letting the EM loop roll the step back.
+        pair_cond_smoother_mean = _guard_smoother_mean(pair_cond_smoother_mean, "GPB1")
 
         # 2. Compute discrete state intermediates
         (
@@ -1186,7 +1448,9 @@ def switching_kalman_smoother(
         # so it is consistent when used as next_smoother_discrete_prob
         # in the next backward step. The output arrays store the
         # un-stabilized version for exact joint/marginal consistency.
-        stabilized_smoother_prob = _stabilize_probability_vector(
+        # Preserve structural zeros (a state impossible at this timestep must
+        # not be resurrected to 1e-10).
+        stabilized_smoother_prob = _stabilize_probability_vector_preserving_zeros(
             smoother_discrete_state_prob
         )
 
@@ -1238,8 +1502,12 @@ def switching_kalman_smoother(
         reverse=True,
     )
 
+    # Guard the terminal mean (appended outside the scan, so the per-step
+    # _guard_smoother_mean does not cover it): a finite-but-unrepresentable
+    # terminal mean must fail loud like the interior, not pass straight through.
+    last_filter_mean = _guard_smoother_mean(filter_mean[-1], "GPB1")
     last_smoother_mean, last_smoother_cov = collapse_gaussian_mixture(
-        filter_mean[-1], filter_cov[-1], filter_discrete_state_prob[-1]
+        last_filter_mean, filter_cov[-1], filter_discrete_state_prob[-1]
     )
     overall_smoother_mean = jnp.concatenate(
         [overall_smoother_mean, last_smoother_mean[None]], axis=0
@@ -1251,7 +1519,7 @@ def switching_kalman_smoother(
         [smoother_discrete_state_prob, filter_discrete_state_prob[-1][None]], axis=0
     )
     state_cond_smoother_means = jnp.concatenate(
-        [state_cond_smoother_means, filter_mean[-1][None]], axis=0
+        [state_cond_smoother_means, last_filter_mean[None]], axis=0
     )
     state_cond_smoother_covs = jnp.concatenate(
         [state_cond_smoother_covs, filter_cov[-1][None]], axis=0
@@ -1406,53 +1674,25 @@ def switching_kalman_smoother_gpb2(
             "GPB2",
         )
         _cap = partial(_cap_covariance_trace, max_allowed_trace=max_allowed)
-        triple_cov = jax.vmap(
-            jax.vmap(jax.vmap(_cap, in_axes=-1, out_axes=-1), in_axes=-1, out_axes=-1),
-            in_axes=-1,
-            out_axes=-1,
-        )(triple_cov)
-
-        debug_print_if(
-            jnp.any(jnp.abs(triple_mean) > _MAX_SMOOTHER_MEAN_ABS),
-            "switching_kalman: GPB2 smoother mean hit the "
-            f"+/-{_MAX_SMOOTHER_MEAN_ABS:.0e} clip (max |mean| {{m:.2e}}); the "
-            "smoother mean has diverged and EM statistics at those steps were "
-            "clipped.",
-            m=jnp.max(jnp.abs(triple_mean)),
-        )
-        triple_mean = jnp.clip(
-            triple_mean, -_MAX_SMOOTHER_MEAN_ABS, _MAX_SMOOTHER_MEAN_ABS
-        )
-
-        # The cross-covariance is capped by its own Frobenius norm, so the bound
-        # must be Frobenius-scaled from the pair-filter covariances -- not the
-        # trace-scaled ``max_allowed`` used for the covariance-trace cap above
-        # (trace and Frobenius norm are different quantities).
-        max_allowed_cross = (
-            jnp.max(jnp.linalg.norm(pair_filter_cov, axis=(0, 1)))
-            * _GPB2_COV_CAP_MULTIPLIER
-            + 1.0
-        )
-        cross_frobs = jnp.linalg.norm(triple_cross, axis=(0, 1))
-        debug_print_if(
-            jnp.any(cross_frobs > max_allowed_cross),
-            "switching_kalman: GPB2 smoother cross-covariance engaged the "
-            f"{_GPB2_COV_CAP_MULTIPLIER:.0e}x-filter Frobenius cap (max "
-            "||C||_F {m:.2e}); EM lag-one statistics at those steps were clipped.",
-            m=jnp.max(cross_frobs),
-        )
-        _cap_cross = partial(
-            _cap_cross_covariance_frobenius, max_allowed_norm=max_allowed_cross
-        )
-        triple_cross = jax.vmap(
+        triple_cov, triple_cov_scales = jax.vmap(
             jax.vmap(
-                jax.vmap(_cap_cross, in_axes=-1, out_axes=-1),
+                jax.vmap(_cap, in_axes=-1, out_axes=(-1, -1)),
                 in_axes=-1,
-                out_axes=-1,
+                out_axes=(-1, -1),
             ),
             in_axes=-1,
-            out_axes=-1,
-        )(triple_cross)
+            out_axes=(-1, -1),
+        )(triple_cov)  # triple_cov_scales: (Si, Sj, Sk)
+
+        # Never clip a finite smoother mean (see GPB1 above / _guard_smoother_mean):
+        # only fail loud on a non-finite or overflow-prone mean.
+        triple_mean = _guard_smoother_mean(triple_mean, "GPB2")
+
+        # Rescale the cross-covariance coherently with the covariance cap (see
+        # GPB1): C scaled by sqrt(alpha) where alpha scaled the triple
+        # covariance. This congruence transform keeps the joint block PSD,
+        # unlike an independent Frobenius cross-cap.
+        triple_cross = jnp.sqrt(triple_cov_scales) * triple_cross
 
         # 2. Discrete pair smoother probabilities for (S_t=j, S_{t+1}=k).
         joint_smoother_discrete_prob = next_pair_smoother_prob
@@ -1555,7 +1795,9 @@ def switching_kalman_smoother_gpb2(
 
         # Stabilize the pair probability matrix in the carry only; the output
         # arrays store the un-stabilized value for joint/marginal consistency.
-        stabilized_pair_smoother_prob = _stabilize_probability_vector(
+        # Preserve structural zeros so an impossible (S_t, S_{t+1}) pair is not
+        # resurrected.
+        stabilized_pair_smoother_prob = _stabilize_probability_vector_preserving_zeros(
             pair_smoother_prob_prev.reshape(-1)
         ).reshape(pair_smoother_prob_prev.shape)
 
@@ -1613,9 +1855,11 @@ def switching_kalman_smoother_gpb2(
         reverse=True,
     )
 
-    # Append last timestep (same as GPB1)
+    # Append last timestep (same as GPB1). Guard the terminal mean too, since
+    # the per-step _guard_smoother_mean does not cover this appended value.
+    last_filter_mean = _guard_smoother_mean(filter_mean[-1], "GPB2")
     last_overall_mean, last_overall_cov = collapse_gaussian_mixture(
-        filter_mean[-1],
+        last_filter_mean,
         filter_cov[-1],
         filter_discrete_state_prob[-1],
     )
@@ -1629,7 +1873,7 @@ def switching_kalman_smoother_gpb2(
         [smoother_discrete_state_prob, filter_discrete_state_prob[-1][None]], axis=0
     )
     state_cond_smoother_means = jnp.concatenate(
-        [state_cond_smoother_means, filter_mean[-1][None]], axis=0
+        [state_cond_smoother_means, last_filter_mean[None]], axis=0
     )
     state_cond_smoother_covs = jnp.concatenate(
         [state_cond_smoother_covs, filter_cov[-1][None]], axis=0
