@@ -36,6 +36,7 @@ from state_space_practice.parameter_transforms import (
     UNCONSTRAINED,
     ParameterTransform,
 )
+from state_space_practice.point_process_kalman import _safe_expected_count
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import stabilize_covariance
 
@@ -75,7 +76,9 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         self.obs_noise_std = 0.1
 
         # Spike head (Poisson)
-        self.C_spikes = jax.random.normal(k_spk, (n_spike_sources, self.n_cont_states)) * 0.1
+        self.C_spikes = (
+            jax.random.normal(k_spk, (n_spike_sources, self.n_cont_states)) * 0.1
+        )
         self.d_spikes = jnp.zeros((n_spike_sources,))
 
         self._initialize_parameters(k_init)
@@ -92,15 +95,13 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         self.continuous_transition_matrix = jnp.stack(
             [jnp.eye(self.n_cont_states)], axis=2
         )
-        self.process_cov = jnp.stack(
-            [jnp.eye(self.n_cont_states) * 1e-4], axis=2
-        )
+        self.process_cov = jnp.stack([jnp.eye(self.n_cont_states) * 1e-4], axis=2)
 
     def transition_func(self, x: Array, params: Dict[str, Array]) -> Array:
         return leapfrog_step(x, params, apply_mlp, self.dt)
 
     def _r_lfp(self) -> Array:
-        return jnp.eye(self.n_lfp) * self.obs_noise_std ** 2
+        return jnp.eye(self.n_lfp) * self.obs_noise_std**2
 
     @partial(jax.jit, static_argnums=(0,))
     def filter(
@@ -129,17 +130,29 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
             # marginal because the observations are conditionally
             # independent given x_t.
             m_mid, P_mid, ll_lfp = gaussian_measurement_update(
-                m_pred, P_pred, y_lfp_t, C_l, d_l, R_l,
+                m_pred,
+                P_pred,
+                y_lfp_t,
+                C_l,
+                d_l,
+                R_l,
             )
             m_post, P_post, ll_spike = point_process_laplace_update(
-                m_mid, P_mid, y_spike_t, C_s, d_s, self.dt,
+                m_mid,
+                P_mid,
+                y_spike_t,
+                C_s,
+                d_s,
+                self.dt,
             )
             return (m_post, P_post), (m_post, P_post, ll_lfp + ll_spike)
 
         m0 = params["init_mean"]
         P0 = self.init_cov[:, :, 0]
         _, (means, covs, lls) = jax.lax.scan(
-            step, (m0, P0), (lfp_data, spike_data),
+            step,
+            (m0, P0),
+            (lfp_data, spike_data),
         )
         return means, covs, lls
 
@@ -164,11 +177,21 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
                 m_prev, P_prev, trans_params, apply_mlp, Q, self.dt
             )
             m_mid, P_mid, _ = gaussian_measurement_update(
-                m_pred, P_pred, y_lfp_t, C_l, d_l, R_l,
+                m_pred,
+                P_pred,
+                y_lfp_t,
+                C_l,
+                d_l,
+                R_l,
                 include_normalization_const=False,
             )
             m_post, P_post, _ = point_process_laplace_update(
-                m_mid, P_mid, y_spike_t, C_s, d_s, self.dt,
+                m_mid,
+                P_mid,
+                y_spike_t,
+                C_s,
+                d_s,
+                self.dt,
                 compute_log_likelihood=False,
             )
             return (m_post, P_post), (m_post, P_post, m_pred, P_pred, F_t)
@@ -176,7 +199,9 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         m0 = params["init_mean"]
         P0 = self.init_cov[:, :, 0]
         _, (m_f, P_f, m_p, P_p, F) = jax.lax.scan(
-            forward_step, (m0, P0), (lfp_data, spike_data),
+            forward_step,
+            (m0, P0),
+            (lfp_data, spike_data),
         )
         return ekf_rts_backward_pass(m_f, P_f, m_p, P_p, F)
 
@@ -194,25 +219,37 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
     ) -> list[float]:
         self._sgd_n_time = lfp_obs.shape[0]
         return SGDFittableMixin.fit_sgd(
-            self, lfp_obs, spike_obs,
-            optimizer=optimizer, num_steps=num_steps, verbose=verbose,
-            convergence_tol=convergence_tol, use_filter=use_filter, **kwargs,
+            self,
+            lfp_obs,
+            spike_obs,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+            use_filter=use_filter,
+            **kwargs,
         )
 
     def _build_param_spec(
         self,
     ) -> Tuple[Dict[str, Any], Dict[str, ParameterTransform]]:
         params = {
-            "mlp": self.mlp_params, "omega": self.omega,
-            "C_lfp": self.C_lfp, "d_lfp": self.d_lfp,
-            "C_spikes": self.C_spikes, "d_spikes": self.d_spikes,
+            "mlp": self.mlp_params,
+            "omega": self.omega,
+            "C_lfp": self.C_lfp,
+            "d_lfp": self.d_lfp,
+            "C_spikes": self.C_spikes,
+            "d_spikes": self.d_spikes,
             "init_mean": self.init_mean[:, 0],
             "Q": self.process_cov[:, :, 0],
         }
         spec = {
-            "mlp": UNCONSTRAINED, "omega": POSITIVE,
-            "C_lfp": UNCONSTRAINED, "d_lfp": UNCONSTRAINED,
-            "C_spikes": UNCONSTRAINED, "d_spikes": UNCONSTRAINED,
+            "mlp": UNCONSTRAINED,
+            "omega": POSITIVE,
+            "C_lfp": UNCONSTRAINED,
+            "d_lfp": UNCONSTRAINED,
+            "C_spikes": UNCONSTRAINED,
+            "d_spikes": UNCONSTRAINED,
             "init_mean": UNCONSTRAINED,
             "Q": PSD_MATRIX,
         }
@@ -248,7 +285,11 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
 
             mse_l = jnp.sum((lfp_data - (x_traj @ C_l.T + d_l)) ** 2)
             log_lambda = x_traj @ C_s.T + d_s
-            rates = jnp.exp(log_lambda) * self.dt
+            # Clip log(rate*dt) before exp (matching the filter path's
+            # _safe_expected_count): an unclipped exp overflows to +inf on a
+            # divergent rollout, and then 0*log(inf) / (inf-inf) = NaN poisons
+            # the whole loss and its gradient, killing SGD.
+            rates = _safe_expected_count(log_lambda, self.dt)
             nll_s = -jnp.sum(spike_data * jnp.log(rates + 1e-10) - rates)
             lik_loss = mse_l + nll_s
 
@@ -270,15 +311,15 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         self.d_spikes = params["d_spikes"]
         self.init_mean = self.init_mean.at[:, 0].set(params["init_mean"])
         if "Q" in params:
-            self.process_cov = jnp.stack(
-                [stabilize_covariance(params["Q"])], axis=2
-            )
+            self.process_cov = jnp.stack([stabilize_covariance(params["Q"])], axis=2)
 
         # Resync BaseModel measurement_matrix with the two heads.
         self.measurement_matrix = (
             jnp.zeros((self.n_sources, self.n_cont_states, 1))
-            .at[: self.n_lfp, :, 0].set(self.C_lfp)
-            .at[self.n_lfp :, :, 0].set(self.C_spikes)
+            .at[: self.n_lfp, :, 0]
+            .set(self.C_lfp)
+            .at[self.n_lfp :, :, 0]
+            .set(self.C_spikes)
         )
 
     def _finalize_sgd(self, lfp_data, spike_data=None, **kwargs):

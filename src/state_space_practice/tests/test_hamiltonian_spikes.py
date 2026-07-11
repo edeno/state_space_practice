@@ -13,6 +13,37 @@ from state_space_practice.tests.recovery_helpers import (
 )
 
 
+def test_sgd_surrogate_loss_finite_under_rate_overflow():
+    """The default (use_filter=False) SGD surrogate loss stays finite when a
+    parameter drives the log-rate past exp() overflow.
+
+    A divergent rollout -- or, equivalently here, a large log-rate offset ``d``
+    -- makes ``log_lambda`` huge, so ``rates = exp(log_lambda)`` overflows to
+    +inf. Then a zero-spike bin gives ``0 * log(inf) = NaN`` and a spiking bin
+    gives ``inf - inf = NaN``, poisoning the whole ``jnp.sum`` -> NaN loss and
+    gradient that kill SGD. The rate must be clipped before exp, matching the
+    filter path's ``_safe_expected_count``.
+    """
+    model = HamiltonianSpikeModel(
+        n_sources=8,
+        n_oscillators=1,
+        hidden_dims=[16],
+        seed=0,
+        sampling_freq=1000.0,
+    )
+    spikes = jax.random.poisson(jax.random.PRNGKey(0), jnp.ones((20, 8)) * 0.5)
+    params, _ = model._build_param_spec()
+    # Large log-rate offset -> exp(log_lambda) overflows without the clip.
+    params = {**params, "d": jnp.full_like(params["d"], 1000.0)}
+
+    def loss_fn(p):
+        return model._sgd_loss_fn(p, spikes, use_filter=False)
+
+    assert bool(jnp.isfinite(loss_fn(params)))
+    grad = jax.grad(loss_fn)(params)
+    assert bool(jnp.all(jnp.isfinite(grad["d"])))
+
+
 class TestHamiltonianSpikeModelSmoke:
     """Smoke tests: instantiation, filter, smooth all run without error."""
 
@@ -21,7 +52,10 @@ class TestHamiltonianSpikeModelSmoke:
         n_sources = 8
         n_time = 50
         model = HamiltonianSpikeModel(
-            n_sources=n_sources, n_oscillators=1, hidden_dims=[16], seed=0,
+            n_sources=n_sources,
+            n_oscillators=1,
+            hidden_dims=[16],
+            seed=0,
             sampling_freq=1000.0,
         )
         key = jax.random.PRNGKey(42)
@@ -101,7 +135,10 @@ class TestHamiltonianSpikeBehavioral:
         omega = 2 * jnp.pi  # ~1 Hz
 
         model = HamiltonianSpikeModel(
-            n_sources=n_sources, n_oscillators=1, hidden_dims=[8], seed=0,
+            n_sources=n_sources,
+            n_oscillators=1,
+            hidden_dims=[8],
+            seed=0,
             sampling_freq=1.0 / dt,
         )
 
@@ -164,25 +201,36 @@ class TestHamiltonianSpikeSGDRecovery:
         n_sources = 4
 
         x_true, mlp_params = simulate_harmonic_oscillator(
-            omega=omega_true, n_time=n_time, dt=dt,
-            key=jax.random.PRNGKey(42), hidden_dims=[8],
+            omega=omega_true,
+            n_time=n_time,
+            dt=dt,
+            key=jax.random.PRNGKey(42),
+            hidden_dims=[8],
         )
 
         C_true = jax.random.normal(jax.random.PRNGKey(10), (n_sources, 2)) * 0.3
         d_true = -2.0 * jnp.ones(n_sources)
         spikes = simulate_poisson_spikes(
-            x_true, C_true, d_true, dt=dt,
+            x_true,
+            C_true,
+            d_true,
+            dt=dt,
             key=jax.random.PRNGKey(77),
         )
 
         model = HamiltonianSpikeModel(
-            n_sources=n_sources, n_oscillators=1, hidden_dims=[8], seed=0,
+            n_sources=n_sources,
+            n_oscillators=1,
+            hidden_dims=[8],
+            seed=0,
             sampling_freq=1.0 / dt,
         )
         model.omega = omega_true * 1.3
 
         lls = model.fit_sgd(
-            spikes, key=jax.random.PRNGKey(1), num_steps=200,
+            spikes,
+            key=jax.random.PRNGKey(1),
+            num_steps=200,
             use_filter=False,
         )
         return model, x_true, omega_true, spikes, lls
@@ -233,7 +281,7 @@ class TestHamiltonianVsLinearBaseline:
         # H = p^2/2 + omega^2 q^2/2 + alpha q^4/4
         def duffing_step(x, key_i):
             q, p = x[0], x[1]
-            p_new = p + dt * (-(omega ** 2) * q - alpha * q ** 3)
+            p_new = p + dt * (-(omega**2) * q - alpha * q**3)
             q_new = q + dt * p_new
             x_new = jnp.array([q_new, p_new])
             x_new = x_new + jax.random.normal(key_i, (2,)) * 1e-3
@@ -247,7 +295,11 @@ class TestHamiltonianVsLinearBaseline:
         C_true = jax.random.normal(jax.random.PRNGKey(10), (n_sources, 2)) * 0.5
         d_true = -1.5 * jnp.ones(n_sources)
         spikes = simulate_poisson_spikes(
-            x_true, C_true, d_true, dt=dt, key=jax.random.PRNGKey(77),
+            x_true,
+            C_true,
+            d_true,
+            dt=dt,
+            key=jax.random.PRNGKey(77),
         )
 
         # --- Nonlinear Hamiltonian fit ---
@@ -255,7 +307,10 @@ class TestHamiltonianVsLinearBaseline:
         # baseline gets for free via the design matrix. The comparison isolates
         # the dynamics prior — both models share the same readout knowledge.
         nonlinear = HamiltonianSpikeModel(
-            n_sources=n_sources, n_oscillators=1, hidden_dims=[8], seed=0,
+            n_sources=n_sources,
+            n_oscillators=1,
+            hidden_dims=[8],
+            seed=0,
             sampling_freq=1.0 / dt,
         )
         nonlinear.C = C_true
@@ -263,7 +318,9 @@ class TestHamiltonianVsLinearBaseline:
         nonlinear.init_mean = x0[:, None]
         nonlinear.omega = omega  # seed frequency near truth
         nonlinear.fit_sgd(
-            spikes, key=jax.random.PRNGKey(1), num_steps=200,
+            spikes,
+            key=jax.random.PRNGKey(1),
+            num_steps=200,
             use_filter=False,
         )
         nonlinear_ll = float(nonlinear.log_likelihood_)
@@ -271,12 +328,16 @@ class TestHamiltonianVsLinearBaseline:
         # --- Linear random-walk fit ---
         # Intercept absorbed as a constant third latent dimension:
         # log_rate[t, n] = C_true[n, :] @ q_p_t + 1.0 * bias_t.
-        design_matrix = jnp.concatenate([
-            jnp.broadcast_to(C_true[None, :, :], (n_time, n_sources, 2)),
-            jnp.ones((n_time, n_sources, 1)),
-        ], axis=-1)
+        design_matrix = jnp.concatenate(
+            [
+                jnp.broadcast_to(C_true[None, :, :], (n_time, n_sources, 2)),
+                jnp.ones((n_time, n_sources, 1)),
+            ],
+            axis=-1,
+        )
         linear = PointProcessModel(
-            n_state_dims=3, dt=dt,
+            n_state_dims=3,
+            dt=dt,
             init_mean=jnp.array([x0[0], x0[1], float(d_true[0])]),
             init_cov=jnp.eye(3) * 0.1,
             process_cov=jnp.eye(3) * 1e-3,

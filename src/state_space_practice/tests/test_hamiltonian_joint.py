@@ -14,8 +14,40 @@ from state_space_practice.tests.recovery_helpers import (
 )
 
 
-class TestJointHamiltonianSmoke:
+def test_sgd_surrogate_loss_finite_under_rate_overflow():
+    """The (use_filter=False) SGD surrogate loss stays finite when a parameter
+    drives the spike log-rate past exp() overflow.
 
+    A large spike log-rate offset ``d_spikes`` makes ``log_lambda`` huge, so
+    ``rates = exp(log_lambda)`` overflows to +inf; then a zero-spike bin gives
+    ``0 * log(inf) = NaN`` and a spiking bin gives ``inf - inf = NaN``,
+    poisoning the whole ``jnp.sum`` -> NaN loss and gradient. The spike rate
+    must be clipped before exp, matching the filter path's
+    ``_safe_expected_count``.
+    """
+    model = JointHamiltonianModel(
+        n_lfp_sources=4,
+        n_spike_sources=8,
+        n_oscillators=1,
+        hidden_dims=[16],
+        seed=0,
+        sampling_freq=1000.0,
+    )
+    k1, k2 = jax.random.split(jax.random.PRNGKey(0))
+    lfp = jax.random.normal(k1, (20, 4))
+    spikes = jax.random.poisson(k2, jnp.ones((20, 8)) * 0.5)
+    params, _ = model._build_param_spec()
+    params = {**params, "d_spikes": jnp.full_like(params["d_spikes"], 1000.0)}
+
+    def loss_fn(p):
+        return model._sgd_loss_fn(p, lfp, spikes, use_filter=False)
+
+    assert bool(jnp.isfinite(loss_fn(params)))
+    grad = jax.grad(loss_fn)(params)
+    assert bool(jnp.all(jnp.isfinite(grad["d_spikes"])))
+
+
+class TestJointHamiltonianSmoke:
     @pytest.fixture
     def model_and_data(self):
         n_lfp = 4
@@ -55,11 +87,14 @@ class TestJointHamiltonianSmoke:
 
 
 class TestJointHamiltonianMultiOscillator:
-
     def test_construction_n_oscillators_2(self):
         model = JointHamiltonianModel(
-            n_lfp_sources=4, n_spike_sources=8, n_oscillators=2,
-            hidden_dims=[16], seed=0, sampling_freq=1000.0,
+            n_lfp_sources=4,
+            n_spike_sources=8,
+            n_oscillators=2,
+            hidden_dims=[16],
+            seed=0,
+            sampling_freq=1000.0,
         )
         assert model.n_cont_states == 4
         assert model.init_mean.shape == (4, 1)
@@ -69,8 +104,12 @@ class TestJointHamiltonianMultiOscillator:
 
     def test_filter_n_oscillators_2(self):
         model = JointHamiltonianModel(
-            n_lfp_sources=4, n_spike_sources=8, n_oscillators=2,
-            hidden_dims=[16], seed=0, sampling_freq=1000.0,
+            n_lfp_sources=4,
+            n_spike_sources=8,
+            n_oscillators=2,
+            hidden_dims=[16],
+            seed=0,
+            sampling_freq=1000.0,
         )
         key = jax.random.PRNGKey(0)
         k1, k2 = jax.random.split(key)
@@ -128,9 +167,9 @@ class TestJointHamiltonianBehavioral:
         C_lfp = model.C_lfp
         d_lfp = model.d_lfp
         obs_noise_std = model.obs_noise_std
-        lfp_noise = jax.random.normal(
-            jax.random.PRNGKey(99), (n_time, n_lfp)
-        ) * obs_noise_std
+        lfp_noise = (
+            jax.random.normal(jax.random.PRNGKey(99), (n_time, n_lfp)) * obs_noise_std
+        )
         lfp = x_true @ C_lfp.T + d_lfp + lfp_noise
 
         # Generate spikes
@@ -171,33 +210,48 @@ class TestJointHamiltonianSGDRecovery:
         n_spikes = 4
 
         x_true, mlp_params = simulate_harmonic_oscillator(
-            omega=omega_true, n_time=n_time, dt=dt,
-            key=jax.random.PRNGKey(42), hidden_dims=[8],
+            omega=omega_true,
+            n_time=n_time,
+            dt=dt,
+            key=jax.random.PRNGKey(42),
+            hidden_dims=[8],
         )
 
         C_lfp = jnp.eye(2)
         d_lfp = jnp.zeros(n_lfp)
         lfp = simulate_lfp_observations(
-            x_true, C_lfp, d_lfp, noise_std=0.3,
+            x_true,
+            C_lfp,
+            d_lfp,
+            noise_std=0.3,
             key=jax.random.PRNGKey(99),
         )
 
         C_spikes = jax.random.normal(jax.random.PRNGKey(10), (n_spikes, 2)) * 0.3
         d_spikes = -2.0 * jnp.ones(n_spikes)
         spikes = simulate_poisson_spikes(
-            x_true, C_spikes, d_spikes, dt=dt,
+            x_true,
+            C_spikes,
+            d_spikes,
+            dt=dt,
             key=jax.random.PRNGKey(77),
         )
 
         model = JointHamiltonianModel(
-            n_lfp_sources=n_lfp, n_spike_sources=n_spikes,
-            n_oscillators=1, hidden_dims=[8], seed=0,
+            n_lfp_sources=n_lfp,
+            n_spike_sources=n_spikes,
+            n_oscillators=1,
+            hidden_dims=[8],
+            seed=0,
             sampling_freq=1.0 / dt,
         )
         model.omega = omega_true * 1.3
 
         lls = model.fit_sgd(
-            lfp, spikes, key=jax.random.PRNGKey(1), num_steps=200,
+            lfp,
+            spikes,
+            key=jax.random.PRNGKey(1),
+            num_steps=200,
         )
         return model, x_true, omega_true, lfp, spikes, lls
 
@@ -218,6 +272,4 @@ class TestJointHamiltonianSGDRecovery:
         params, _ = model._build_param_spec()
         m_s, _ = model.smooth(lfp, spikes, params)
         corr = float(jnp.corrcoef(m_s[:, 0], x_true[:, 0])[0, 1])
-        assert corr > 0.7, (
-            f"Post-learning smoother correlation {corr:.3f} < 0.7"
-        )
+        assert corr > 0.7, f"Post-learning smoother correlation {corr:.3f} < 0.7"
