@@ -316,12 +316,13 @@ def _bin_ids(
     trajectory = np.asarray(trajectory, dtype=float)
     if trajectory.ndim == 1:
         trajectory = trajectory[:, None]
-    return np.asarray(
-        env.bin_sequence(
-            np.asarray(times, dtype=float), trajectory, dedup=False, outside_value=-1
-        ),
-        dtype=int,
+    # neurospatial types bin_sequence with a ``Self: EnvironmentProtocol`` bound
+    # that mypy does not recognize the concrete Environment as satisfying; the
+    # call is valid at runtime.
+    ids = env.bin_sequence(  # type: ignore[misc]
+        np.asarray(times, dtype=float), trajectory, dedup=False, outside_value=-1
     )
+    return np.asarray(ids, dtype=np.int_)
 
 
 def graph_design_matrix(
