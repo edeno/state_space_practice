@@ -509,6 +509,53 @@ class TestDirectedInfluenceModel:
         with pytest.raises(ValueError, match="phase_difference must have shape"):
             DirectedInfluenceModel(**params)
 
+    def test_custom_max_spectral_radius_scales_transition_matrix(
+        self, directed_influence_params
+    ) -> None:
+        """A smaller ``max_spectral_radius`` should shrink the achieved radius
+        of the constructed transition matrix in exact proportion.
+
+        With strong coupling the block-row operator norm exceeds both bounds, so
+        the differentiable stability scale is active and ``A = scale * A_intrinsic``
+        with ``scale = max_spectral_radius / norm``. The spectral radius is
+        therefore linear in ``max_spectral_radius``.
+        """
+        n_osc = directed_influence_params["n_oscillators"]
+        n_disc = directed_influence_params["n_discrete_states"]
+        strong_coupling = (
+            jnp.zeros((n_osc, n_osc, n_disc)).at[0, 1, :].set(0.4).at[1, 0, :].set(0.4)
+        )
+        params = {**directed_influence_params, "coupling_strength": strong_coupling}
+
+        model_high = DirectedInfluenceModel(**params, max_spectral_radius=0.99)
+        model_low = DirectedInfluenceModel(**params, max_spectral_radius=0.5)
+        model_high._initialize_parameters(jax.random.PRNGKey(0))
+        model_low._initialize_parameters(jax.random.PRNGKey(0))
+
+        # Guard: scaling must actually be active for both, otherwise the
+        # proportionality below would be vacuously satisfied by scale == 1.
+        assert float(model_high._effective_dim_scale()) < 1.0
+        assert float(model_low._effective_dim_scale()) < 1.0
+
+        for j in range(n_disc):
+            A_high = np.asarray(model_high.continuous_transition_matrix[..., j])
+            A_low = np.asarray(model_low.continuous_transition_matrix[..., j])
+            radius_high = float(np.max(np.abs(np.linalg.eigvals(A_high))))
+            radius_low = float(np.max(np.abs(np.linalg.eigvals(A_low))))
+
+            assert radius_high <= 0.99 + 1e-6
+            assert radius_low <= 0.5 + 1e-6
+            np.testing.assert_allclose(
+                radius_low, radius_high * (0.5 / 0.99), rtol=1e-5
+            )
+
+    def test_rejects_invalid_stability_bounds(self, directed_influence_params) -> None:
+        """Stability bounds outside ``(0, 1)`` should raise at construction."""
+        with pytest.raises(ValueError, match="max_spectral_radius must lie in"):
+            DirectedInfluenceModel(**directed_influence_params, max_spectral_radius=1.5)
+        with pytest.raises(ValueError, match="max_damping must lie in"):
+            DirectedInfluenceModel(**directed_influence_params, max_damping=0.0)
+
 
 # ============================================================================
 # Tests for EM Algorithm (E-step and M-step)

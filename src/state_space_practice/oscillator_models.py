@@ -1811,6 +1811,15 @@ class DirectedInfluenceModel(BaseModel):
         parameters (damping, freq, coupling_strength, phase_diff) to maximize
         the Q-function. This guarantees valid oscillator structure and monotonic
         log-likelihood increase. If False, use standard M-step with projection.
+    max_spectral_radius : float, default=0.99
+        Target upper bound on the spectral radius of each state's transition
+        matrix. The differentiable stability scale shrinks damping and coupling
+        so the block-row operator-norm bound stays at or below this value. Lower
+        it to resolve slower rhythms (e.g. delta) at high sampling rates, where
+        the default admits only broad, overdamped bands. Must lie in ``(0, 1)``.
+    max_damping : float, default=0.995
+        Upper bound on the intrinsic per-oscillator damping used by the
+        reparameterized M-step's bounded optimizer. Must lie in ``(0, 1)``.
     """
 
     def __init__(
@@ -1825,6 +1834,8 @@ class DirectedInfluenceModel(BaseModel):
         phase_difference: jax.Array,
         coupling_strength: jax.Array,
         use_reparameterized_mstep: bool = False,
+        max_spectral_radius: float = 0.99,
+        max_damping: float = 0.995,
         **kwargs,
     ):
         # n_sources is fixed to n_oscillators for DIM (passed to super below).
@@ -1900,6 +1911,14 @@ class DirectedInfluenceModel(BaseModel):
         # Store current oscillator params for warm-starting optimizer
         self._current_osc_params: Optional[dict] = None
 
+        # Stability bounds applied when rebuilding transition matrices.
+        if not 0.0 < max_spectral_radius < 1.0:
+            raise ValueError("max_spectral_radius must lie in (0, 1).")
+        if not 0.0 < max_damping < 1.0:
+            raise ValueError("max_damping must lie in (0, 1).")
+        self.max_spectral_radius = max_spectral_radius
+        self.max_damping = max_damping
+
     def _initialize_measurement_matrix(self, key: Array | None = None):
         """Initializes H with [1/sqrt(2), 1/sqrt(2)] blocks, constant across states."""
         measurement_matrix = construct_directed_influence_measurement_matrix(
@@ -1932,6 +1951,7 @@ class DirectedInfluenceModel(BaseModel):
             self.damping_coef,
             self.coupling_strength,
             self.sampling_freq,
+            max_spectral_radius=self.max_spectral_radius,
         )
 
     def _rebuild_stable_transition_matrix(self) -> None:
@@ -2079,6 +2099,8 @@ class DirectedInfluenceModel(BaseModel):
                 init_params=self._current_osc_params,
                 sampling_freq=self.sampling_freq,
                 process_cov=self.process_cov,
+                max_spectral_radius=self.max_spectral_radius,
+                max_damping=self.max_damping,
             )
 
             # Sync the one joint solution directly; no post-hoc averaging of
@@ -2124,7 +2146,9 @@ class DirectedInfluenceModel(BaseModel):
             # Stability is a hard physical constraint: an unstable A causes
             # state divergence and invalidates the E-step posteriors. Unlike
             # the block structure projection above, this is not optional.
-            A_j = _stabilize_transition_matrix(A_j, max_spectral_radius=0.99)
+            A_j = _stabilize_transition_matrix(
+                A_j, max_spectral_radius=self.max_spectral_radius
+            )
 
             projected.append(A_j)
         self.continuous_transition_matrix = jnp.stack(projected, axis=-1)
@@ -2296,6 +2320,7 @@ class DirectedInfluenceModel(BaseModel):
             self.damping_coef,
             coupling,
             self.sampling_freq,
+            max_spectral_radius=self.max_spectral_radius,
         )
         effective_damping = self.damping_coef * stability_scale
         effective_coupling = coupling * stability_scale

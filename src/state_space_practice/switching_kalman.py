@@ -3396,6 +3396,8 @@ def optimize_dim_transition_params_joint(
     init_params: dict,
     sampling_freq: float,
     process_cov: jax.Array | None = None,
+    max_spectral_radius: float = 0.99,
+    max_damping: float = 0.995,
     max_iter: int = 100,
     tol: float = 1e-6,
     max_backtracking_steps: int = 20,
@@ -3423,6 +3425,13 @@ def optimize_dim_transition_params_joint(
     process_cov : jax.Array | None
         Per-state process covariance stack. Identity weighting is used when
         omitted.
+    max_spectral_radius : float
+        Target upper bound on the spectral radius of each state's transition
+        matrix; passed to the differentiable stability scale. Must lie in
+        ``(0, 1)``.
+    max_damping : float
+        Upper bound on the intrinsic per-oscillator damping in the bounded
+        reparameterization. Must lie in ``(0, 1)``.
     max_iter, tol : int, float
         BFGS controls.
     max_backtracking_steps : int
@@ -3457,6 +3466,10 @@ def optimize_dim_transition_params_joint(
         raise ValueError("max_iter must be positive.")
     if max_backtracking_steps < 0:
         raise ValueError("max_backtracking_steps must be non-negative.")
+    if not 0.0 < max_spectral_radius < 1.0:
+        raise ValueError("max_spectral_radius must lie in (0, 1).")
+    if not 0.0 < max_damping < 1.0:
+        raise ValueError("max_damping must lie in (0, 1).")
     if gamma1.ndim != 3 or beta.shape != gamma1.shape:
         raise ValueError(
             "gamma1 and beta must have matching shape "
@@ -3497,7 +3510,6 @@ def optimize_dim_transition_params_joint(
     if not all(bool(jnp.all(jnp.isfinite(x))) for x in arrays_to_check):
         raise ValueError("Joint DIM optimizer inputs must contain only finite values.")
 
-    max_damping = 0.995
     max_freq = 0.5 * float(sampling_freq)
     max_coupling = 0.5
     offdiag_i, offdiag_j = jnp.where(~jnp.eye(n_osc, dtype=bool))
@@ -3577,6 +3589,7 @@ def optimize_dim_transition_params_joint(
             params["damping"],
             params["coupling_strength"],
             sampling_freq,
+            max_spectral_radius=max_spectral_radius,
         )
         effective_damping = params["damping"] * scale
         effective_coupling = params["coupling_strength"] * scale

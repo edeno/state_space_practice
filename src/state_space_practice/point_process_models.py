@@ -1810,6 +1810,15 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
     use_reparameterized_mstep : bool, default=False
         If True, optimize oscillator parameters directly (guarantees valid
         oscillator structure). If False, use standard M-step with projection.
+    max_spectral_radius : float, default=0.99
+        Target upper bound on the spectral radius of each state's transition
+        matrix. The differentiable stability scale shrinks damping and coupling
+        so the block-row operator-norm bound stays at or below this value. Lower
+        it to resolve slower rhythms (e.g. delta) at high sampling rates, where
+        the default admits only broad, overdamped bands. Must lie in ``(0, 1)``.
+    max_damping : float, default=0.995
+        Upper bound on the intrinsic per-oscillator damping used by the
+        reparameterized M-step's bounded optimizer. Must lie in ``(0, 1)``.
     """
 
     def __init__(
@@ -1825,6 +1834,8 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         phase_difference: jax.Array,
         coupling_strength: jax.Array,
         use_reparameterized_mstep: bool = False,
+        max_spectral_radius: float = 0.99,
+        max_damping: float = 0.995,
         **kwargs,
     ):
         # Force DIM-specific update flags
@@ -1893,6 +1904,14 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         self.coupling_strength = coupling_strength.at[diag_idx, diag_idx, :].set(0.0)
         self.use_reparameterized_mstep = use_reparameterized_mstep
         self._current_osc_params: Optional[dict] = None
+
+        # Stability bounds applied when rebuilding transition matrices.
+        if not 0.0 < max_spectral_radius < 1.0:
+            raise ValueError("max_spectral_radius must lie in (0, 1).")
+        if not 0.0 < max_damping < 1.0:
+            raise ValueError("max_damping must lie in (0, 1).")
+        self.max_spectral_radius = max_spectral_radius
+        self.max_damping = max_damping
 
     def _initialize_continuous_transition_matrix(self) -> None:
         """A varies across states: directed influence coupling structure."""
@@ -1995,6 +2014,8 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             init_params=self._current_osc_params,
             sampling_freq=self.sampling_freq,
             process_cov=self.process_cov,
+            max_spectral_radius=self.max_spectral_radius,
+            max_damping=self.max_damping,
         )
         self._update_public_oscillator_params()
 
@@ -2007,6 +2028,7 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             self.damping_coef,
             self.coupling_strength,
             self.sampling_freq,
+            max_spectral_radius=self.max_spectral_radius,
         )
         effective_damping = self.damping_coef * scale
         effective_coupling = self.coupling_strength * scale
@@ -2059,7 +2081,9 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             # state divergence and invalidates the E-step posteriors. Unlike
             # the block structure projection above, this is not optional.
             # Computed on host (eigvals has no GPU/TPU lowering); eager loop.
-            A_j = stabilize_transition_matrix(A_j, max_spectral_radius=0.99)
+            A_j = stabilize_transition_matrix(
+                A_j, max_spectral_radius=self.max_spectral_radius
+            )
 
             projected.append(A_j)
         self.continuous_transition_matrix = jnp.stack(projected, axis=-1)

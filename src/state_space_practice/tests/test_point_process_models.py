@@ -785,6 +785,73 @@ class TestDirectedInfluencePointProcessModel:
             )
             np.testing.assert_allclose(A, recon, atol=1e-9)
 
+    def test_rejects_invalid_stability_bounds(self, dim_pp_params) -> None:
+        """Stability bounds outside ``(0, 1)`` should raise at construction."""
+        with pytest.raises(ValueError, match="max_spectral_radius must lie in"):
+            DirectedInfluencePointProcessModel(**dim_pp_params, max_spectral_radius=1.5)
+        with pytest.raises(ValueError, match="max_damping must lie in"):
+            DirectedInfluencePointProcessModel(**dim_pp_params, max_damping=0.0)
+
+    @pytest.mark.slow
+    def test_custom_max_spectral_radius_bounds_reparameterized_A(
+        self, dim_pp_params
+    ) -> None:
+        """A custom ``max_spectral_radius`` must bind the reparameterized M-step.
+
+        The fitted transition matrix must (a) stay within the tightened radius
+        and (b) reconstruct from the intrinsic public params via the *same*
+        custom scale -- reconstruction with the default 0.99 scale would not
+        match, so this proves the bound is threaded end-to-end.
+        """
+        from state_space_practice.oscillator_utils import (
+            compute_directed_influence_stability_scale,
+            construct_directed_influence_transition_matrix,
+        )
+
+        max_spectral_radius = 0.7
+        params = dict(dim_pp_params)
+        params["coupling_strength"] = (
+            jnp.zeros_like(params["coupling_strength"])
+            .at[0, 1, :]
+            .set(0.4)
+            .at[1, 0, :]
+            .set(0.4)
+        )
+        model = DirectedInfluencePointProcessModel(
+            **params,
+            use_reparameterized_mstep=True,
+            max_spectral_radius=max_spectral_radius,
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(1), 0.3, (150, model.n_neurons)
+        ).astype(float)
+        model.fit(spikes, max_iter=5, key=jax.random.PRNGKey(0))
+
+        scale = compute_directed_influence_stability_scale(
+            model.freqs,
+            model.damping_coef,
+            model.coupling_strength,
+            model.sampling_freq,
+            max_spectral_radius=max_spectral_radius,
+        )
+        # Guard: the tightened bound must actually bind (scale < 1), else the
+        # radius checks below would pass trivially for an unscaled matrix.
+        assert float(scale) < 1.0
+        for j in range(model.n_discrete_states):
+            A = model.continuous_transition_matrix[:, :, j]
+            assert float(jnp.max(jnp.abs(jnp.linalg.eigvals(A)))) <= (
+                max_spectral_radius + 1e-6
+            )
+            recon = construct_directed_influence_transition_matrix(
+                freqs=model.freqs,
+                damping_coeffs=model.damping_coef * scale,
+                coupling_strengths=model.coupling_strength[:, :, j] * scale,
+                phase_diffs=model.phase_difference[:, :, j],
+                sampling_freq=model.sampling_freq,
+            )
+            np.testing.assert_allclose(A, recon, atol=1e-9)
+
 
 # ============================================================================
 # Tests for input validation
