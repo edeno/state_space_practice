@@ -543,6 +543,56 @@ def _safe_expected_count(
     return jnp.exp(jnp.clip(log_count, min_log_count, max_log_count))
 
 
+def _soft_expected_count(
+    log_rate: Array,
+    dt: float,
+    max_log_count: float = 20.0,
+) -> Array:
+    """Expected count per bin with a *gradient-preserving* overflow cap.
+
+    Equals :func:`_safe_expected_count` (``exp(log_rate*dt)``) below
+    ``max_log_count``, but above the cap it continues ``exp`` **linearly** --
+    value and first derivative matched at the cap -- instead of hard-clipping.
+
+    A hard ``jnp.clip`` has exactly zero gradient above the cap, so an SGD
+    surrogate loss that overshoots it freezes with no signal to return: a
+    dead-gradient stall, no better than the NaN a raw ``exp`` overflow would
+    cause (see ``parameter_transforms.positive_capped`` for the same
+    anti-pattern). The linear continuation never overflows (the value grows only
+    linearly past the cap) yet keeps a strictly positive gradient of order
+    ``exp(max_log_count)`` that pushes an over-large log-rate back down.
+
+    Unlike :func:`_safe_expected_count` there is no lower clip: SGD callers floor
+    ``log(mu)`` on the rate they read back, so the underflow direction needs no
+    guard here.
+
+    Parameters
+    ----------
+    log_rate : Array
+        Log firing rate in Hz.
+    dt : float
+        Bin width in seconds.
+    max_log_count : float, default 20.0
+        Log expected-count above which ``exp`` is continued linearly.
+
+    Returns
+    -------
+    Array
+        Expected count per bin, finite for every finite ``log_rate``.
+    """
+    dt_array = jnp.asarray(dt, dtype=log_rate.dtype)
+    log_count = log_rate + jnp.log(dt_array)
+    # exp is evaluated ONLY on the capped argument, so it never overflows; above
+    # the cap the linear ``overshoot`` term carries the (exp(cap)-scale)
+    # gradient. Both jnp.where branches are finite, so the gradient is NaN-free.
+    capped = jnp.minimum(log_count, max_log_count)
+    capped_exp = jnp.exp(capped)
+    overshoot = log_count - max_log_count
+    return jnp.where(
+        log_count > max_log_count, capped_exp * (1.0 + overshoot), capped_exp
+    )
+
+
 def _point_process_laplace_update(
     one_step_mean: Array,
     one_step_cov: Array,

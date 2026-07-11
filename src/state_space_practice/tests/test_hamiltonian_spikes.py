@@ -18,11 +18,16 @@ def test_sgd_surrogate_loss_finite_under_rate_overflow():
     parameter drives the log-rate past exp() overflow.
 
     A divergent rollout -- or, equivalently here, a large log-rate offset ``d``
-    -- makes ``log_lambda`` huge, so ``rates = exp(log_lambda)`` overflows to
-    +inf. Then a zero-spike bin gives ``0 * log(inf) = NaN`` and a spiking bin
-    gives ``inf - inf = NaN``, poisoning the whole ``jnp.sum`` -> NaN loss and
-    gradient that kill SGD. The rate must be clipped before exp, matching the
-    filter path's ``_safe_expected_count``.
+    -- makes ``log_lambda`` huge, so an unguarded ``exp(log_lambda)`` overflows
+    to +inf and ``0*log(inf)`` / ``inf-inf`` NaN-poisons the loss.
+
+    The guard must ALSO preserve the gradient: a hard clip (``jnp.clip``) has
+    exactly zero gradient above the cap, so once SGD overshoots it the surrogate
+    freezes with no signal to return -- a dead-gradient stall, no better than the
+    NaN. Here the rate is far above the spike counts, so the correctly-signed
+    Poisson-NLL gradient is strictly positive (SGD lowers ``d``, lowering the
+    rate); the loss and gradient must be finite AND that restoring gradient must
+    be nonzero.
     """
     model = HamiltonianSpikeModel(
         n_sources=8,
@@ -33,7 +38,7 @@ def test_sgd_surrogate_loss_finite_under_rate_overflow():
     )
     spikes = jax.random.poisson(jax.random.PRNGKey(0), jnp.ones((20, 8)) * 0.5)
     params, _ = model._build_param_spec()
-    # Large log-rate offset -> exp(log_lambda) overflows without the clip.
+    # Large log-rate offset -> exp(log_lambda) overflows without the guard.
     params = {**params, "d": jnp.full_like(params["d"], 1000.0)}
 
     def loss_fn(p):
@@ -42,6 +47,9 @@ def test_sgd_surrogate_loss_finite_under_rate_overflow():
     assert bool(jnp.isfinite(loss_fn(params)))
     grad = jax.grad(loss_fn)(params)
     assert bool(jnp.all(jnp.isfinite(grad["d"])))
+    # A hard clip would leave grad["d"] == 0 (dead-gradient stall); a
+    # gradient-preserving cap keeps a nonzero, correctly-signed restoring push.
+    assert bool(jnp.all(grad["d"] > 0.0))
 
 
 class TestHamiltonianSpikeModelSmoke:

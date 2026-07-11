@@ -18,12 +18,16 @@ def test_sgd_surrogate_loss_finite_under_rate_overflow():
     """The (use_filter=False) SGD surrogate loss stays finite when a parameter
     drives the spike log-rate past exp() overflow.
 
-    A large spike log-rate offset ``d_spikes`` makes ``log_lambda`` huge, so
-    ``rates = exp(log_lambda)`` overflows to +inf; then a zero-spike bin gives
-    ``0 * log(inf) = NaN`` and a spiking bin gives ``inf - inf = NaN``,
-    poisoning the whole ``jnp.sum`` -> NaN loss and gradient. The spike rate
-    must be clipped before exp, matching the filter path's
-    ``_safe_expected_count``.
+    A large spike log-rate offset ``d_spikes`` makes ``log_lambda`` huge, so an
+    unguarded ``exp(log_lambda)`` overflows to +inf and ``0*log(inf)`` /
+    ``inf-inf`` NaN-poisons the loss.
+
+    The guard must ALSO preserve the gradient: a hard clip (``jnp.clip``) has
+    exactly zero gradient above the cap, so once SGD overshoots it the surrogate
+    freezes with no signal to return -- a dead-gradient stall. Here the rate is
+    far above the spike counts, so the correctly-signed Poisson-NLL gradient is
+    strictly positive; the loss and gradient must be finite AND that restoring
+    gradient must be nonzero.
     """
     model = JointHamiltonianModel(
         n_lfp_sources=4,
@@ -45,6 +49,9 @@ def test_sgd_surrogate_loss_finite_under_rate_overflow():
     assert bool(jnp.isfinite(loss_fn(params)))
     grad = jax.grad(loss_fn)(params)
     assert bool(jnp.all(jnp.isfinite(grad["d_spikes"])))
+    # A hard clip would leave grad["d_spikes"] == 0 (dead-gradient stall); a
+    # gradient-preserving cap keeps a nonzero, correctly-signed restoring push.
+    assert bool(jnp.all(grad["d_spikes"] > 0.0))
 
 
 class TestJointHamiltonianSmoke:

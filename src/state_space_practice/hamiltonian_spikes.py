@@ -34,7 +34,7 @@ from state_space_practice.parameter_transforms import (
     UNCONSTRAINED,
     ParameterTransform,
 )
-from state_space_practice.point_process_kalman import _safe_expected_count
+from state_space_practice.point_process_kalman import _soft_expected_count
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import stabilize_covariance
 
@@ -214,11 +214,12 @@ class HamiltonianSpikeModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
 
             _, x_traj = jax.lax.scan(scan_fn, x0, jnp.arange(spikes.shape[0]))
             log_lambda = x_traj @ C.T + d
-            # Clip log(rate*dt) before exp (matching the filter path's
-            # _safe_expected_count): an unclipped exp overflows to +inf on a
-            # divergent rollout, and then 0*log(inf) / (inf-inf) = NaN poisons
-            # the whole loss and its gradient, killing SGD.
-            rates = _safe_expected_count(log_lambda, self.dt)
+            # Overflow-safe, gradient-preserving rate: an unclipped exp overflows
+            # to +inf on a divergent rollout (0*log(inf) / (inf-inf) = NaN), but
+            # a hard clip would zero the gradient above the cap and freeze SGD.
+            # _soft_expected_count continues exp linearly past the cap: finite
+            # value, nonzero restoring gradient.
+            rates = _soft_expected_count(log_lambda, self.dt)
             lik_loss = -jnp.sum(spikes * jnp.log(rates + 1e-10) - rates)
 
         return lik_loss + l2_reg * mlp_l2_penalty(params["mlp"])
