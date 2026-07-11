@@ -550,10 +550,12 @@ def _soft_expected_count(
 ) -> Array:
     """Expected count per bin with a *gradient-preserving* overflow cap.
 
-    Equals :func:`_safe_expected_count` (``exp(log_rate*dt)``) below
-    ``max_log_count``, but above the cap it continues ``exp``
-    **logarithmically** -- ``exp(cap) * (1 + log1p(overshoot))`` -- instead of
-    hard-clipping.
+    Equals :func:`_safe_expected_count` (``exp(log_rate*dt)``) only in the band
+    ``-20 <= log_count <= max_log_count`` -- where neither function's clip is
+    active. Above ``max_log_count`` it continues ``exp`` **logarithmically** --
+    ``exp(cap) * (1 + log1p(overshoot))`` -- instead of hard-clipping. Below
+    ``-20`` the two differ: ``_safe_expected_count`` floors ``log_count`` at its
+    ``min_log_count`` while this function does not (see the no-lower-clip note).
 
     A hard ``jnp.clip`` has exactly zero gradient above the cap, so an SGD
     surrogate loss that overshoots it freezes with no signal to return: a

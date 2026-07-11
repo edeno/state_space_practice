@@ -33,9 +33,10 @@ from state_space_practice.point_process_kalman import (
 jax.config.update("jax_enable_x64", True)
 
 
-def test_soft_expected_count_finite_across_dtype_and_matches_below_cap():
+def test_soft_expected_count_finite_across_dtype_and_matches_in_band():
     """_soft_expected_count keeps value AND gradient finite for any finite
-    log-rate (across dtypes), and equals _safe_expected_count below the cap.
+    log-rate (across dtypes), and equals _safe_expected_count in the unclipped
+    band -20 <= log_count <= max_log_count.
 
     A linear continuation ``exp(cap)*(1+overshoot)`` overflows for large finite
     inputs -- float32 ``log_rate=1e30`` (and even float64 ``1e300``) -> inf
@@ -44,12 +45,21 @@ def test_soft_expected_count_finite_across_dtype_and_matches_below_cap():
     ``exp(cap)*(1+log1p(overshoot))`` stays finite (log grows slowly) and keeps a
     strictly positive, finite restoring gradient.
     """
-    # Below the cap it must equal the hard-clip expected count exactly.
-    z = jnp.array([-10.0, -3.0, 0.0, 5.0])
+    # In the band [-20, max_log_count] neither function clips, so they agree
+    # exactly (dt=1 => log_count == log_rate; endpoints -20 and 20 included).
+    log_count_in_band = jnp.array([-20.0, -10.0, 0.0, 20.0])
     np.testing.assert_allclose(
-        np.asarray(_soft_expected_count(z, 0.001)),
-        np.asarray(_safe_expected_count(z, 0.001)),
+        np.asarray(_soft_expected_count(log_count_in_band, 1.0)),
+        np.asarray(_safe_expected_count(log_count_in_band, 1.0)),
         rtol=1e-12,
+    )
+    # Below -20 the two DIFFER: _safe_expected_count floors log_count at its
+    # min_log_count (-20), while _soft_expected_count has no lower clip.
+    assert float(_safe_expected_count(jnp.array(-100.0), 1.0)) == pytest.approx(
+        float(jnp.exp(-20.0))
+    )
+    assert float(_soft_expected_count(jnp.array(-100.0), 1.0)) == pytest.approx(
+        float(jnp.exp(-100.0))
     )
     # Large finite inputs across dtypes: value and restoring gradient stay finite.
     for dt, log_rate in [
