@@ -118,9 +118,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
                 return ekf_predict_step_with_jacobian(
                     mj, Pj, trans_k, apply_mlp, Q_all[:, :, k], self.dt
                 )
-            return ekf_predict_step(
-                mj, Pj, trans_k, apply_mlp, Q_all[:, :, k], self.dt
-            )
+            return ekf_predict_step(mj, Pj, trans_k, apply_mlp, Q_all[:, :, k], self.dt)
 
         v_predict = jax.vmap(
             jax.vmap(predict_j_k, in_axes=(None, None, 0)),
@@ -177,18 +175,34 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
                 _,
                 _,
             ) = self._per_state_pred_collapse(
-                m_prev, P_prev, pi_prev,
-                Z, mlp_params, omega, Q, K_states,
+                m_prev,
+                P_prev,
+                pi_prev,
+                Z,
+                mlp_params,
+                omega,
+                Q,
+                K_states,
                 with_jacobian=False,
             )
             del joint_pi_pred  # not used in filter (only smoother needs it)
 
             def update_k(k):
                 m_mid, P_mid, ll_l = gaussian_measurement_update(
-                    m_p_k[:, k], P_p_k[:, :, k], y_lfp_t, C_l, d_l, R_l,
+                    m_p_k[:, k],
+                    P_p_k[:, :, k],
+                    y_lfp_t,
+                    C_l,
+                    d_l,
+                    R_l,
                 )
                 m_post, P_post, ll_s = point_process_laplace_update(
-                    m_mid, P_mid, y_spike_t, C_s, d_s, self.dt,
+                    m_mid,
+                    P_mid,
+                    y_spike_t,
+                    C_s,
+                    d_s,
+                    self.dt,
                 )
                 return m_post, P_post, ll_l + ll_s
 
@@ -210,7 +224,9 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         P0 = self.init_cov
         pi0 = params["init_pi"]
         _, (means, covs, probs, marginal_lls) = jax.lax.scan(
-            step, (m0, P0, pi0), (lfp_data, spike_data),
+            step,
+            (m0, P0, pi0),
+            (lfp_data, spike_data),
         )
         return means, covs, probs, marginal_lls
 
@@ -250,8 +266,14 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
                 m_p_jk,
                 P_p_jk,
             ) = self._per_state_pred_collapse(
-                m_prev, P_prev, pi_prev,
-                Z, mlp_params, omega, Q, K_states,
+                m_prev,
+                P_prev,
+                pi_prev,
+                Z,
+                mlp_params,
+                omega,
+                Q,
+                K_states,
                 with_jacobian=True,
             )
 
@@ -262,11 +284,21 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
                 # constant is dropped. The Laplace correction terms remain
                 # state-dependent and must be included.
                 m_mid, P_mid, ll_l = gaussian_measurement_update(
-                    m_p_k[:, k], P_p_k[:, :, k], y_lfp_t, C_l, d_l, R_l,
+                    m_p_k[:, k],
+                    P_p_k[:, :, k],
+                    y_lfp_t,
+                    C_l,
+                    d_l,
+                    R_l,
                     include_normalization_const=False,
                 )
                 m_post, P_post, ll_s = point_process_laplace_update(
-                    m_mid, P_mid, y_spike_t, C_s, d_s, self.dt,
+                    m_mid,
+                    P_mid,
+                    y_spike_t,
+                    C_s,
+                    d_s,
+                    self.dt,
                 )
                 return m_post, P_post, ll_l + ll_s
 
@@ -294,16 +326,29 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         m0 = params["init_mean"]
         P0 = self.init_cov
         pi0 = params["init_pi"]
-        _, (
-            m_filt,
-            P_filt,
-            m_pred_pair,
-            P_pred_pair,
-            F_all,
-            joint_pi_all,
-            pi_pred_all,
-            pi_filt_all,
+        (
+            _,
+            (
+                m_filt,
+                P_filt,
+                m_pred_pair,
+                P_pred_pair,
+                F_all,
+                joint_pi_all,
+                pi_pred_all,
+                pi_filt_all,
+            ),
         ) = jax.lax.scan(forward_step, (m0, P0, pi0), (lfp_data, spike_data))
+
+        # Empty sequence: no terminal filtered state to seed the reverse scan
+        # (``m_filt[-1]`` below would index axis 0 of size 0). The smoother of an
+        # empty trajectory is that same empty trajectory -- matching
+        # ``ekf_rts_backward_pass`` / ``gaussian_measurement_update`` in
+        # hamiltonian_core. ``m_filt``/``P_filt``/``pi_filt_all`` already carry
+        # the exact ``(0, ...)`` output shapes and dtypes. The time dimension is
+        # static, so this branch is JIT-safe.
+        if lfp_data.shape[0] == 0:
+            return m_filt, P_filt, pi_filt_all
 
         # Backward pass: Kim-style discrete-state smoothing plus pairwise
         # EKF-RTS updates over (S_t=i, S_{t+1}=k), collapsed back to one
@@ -366,13 +411,20 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
 
         init_s = (m_filt[-1], P_filt[-1], pi_filt_all[-1])
         bw_in = (
-            m_filt[:-1], P_filt[:-1],
-            m_pred_pair[1:], P_pred_pair[1:], F_all[1:],
-            joint_pi_all[1:], pi_pred_all[1:],
+            m_filt[:-1],
+            P_filt[:-1],
+            m_pred_pair[1:],
+            P_pred_pair[1:],
+            F_all[1:],
+            joint_pi_all[1:],
+            pi_pred_all[1:],
             pi_filt_all[:-1],
         )
         _, (m_smooth_rev, P_smooth_rev, pi_smooth_rev) = jax.lax.scan(
-            backward_step, init_s, bw_in, reverse=True,
+            backward_step,
+            init_s,
+            bw_in,
+            reverse=True,
         )
         m_s = jnp.concatenate([m_smooth_rev, m_filt[-1:]], axis=0)
         P_s = jnp.concatenate([P_smooth_rev, P_filt[-1:]], axis=0)

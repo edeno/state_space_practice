@@ -18,7 +18,10 @@ from state_space_practice.utils import scale_likelihood as _scale_likelihood
 
 @pytest.fixture
 def switching_model():
-    from state_space_practice.hamiltonian_switching import SwitchingHamiltonianJointModel
+    from state_space_practice.hamiltonian_switching import (
+        SwitchingHamiltonianJointModel,
+    )
+
     return SwitchingHamiltonianJointModel(
         n_oscillators=1,
         n_discrete_states=2,
@@ -36,7 +39,9 @@ def synthetic_data(switching_model):
     n_time = 20
     k1, k2 = jax.random.split(key)
     lfp = jax.random.normal(k1, (n_time, switching_model.n_lfp))
-    spikes = jax.random.poisson(k2, 0.5, (n_time, switching_model.n_spikes)).astype(jnp.float32)
+    spikes = jax.random.poisson(k2, 0.5, (n_time, switching_model.n_spikes)).astype(
+        jnp.float32
+    )
     return lfp, spikes
 
 
@@ -60,6 +65,26 @@ class TestSwitchingHamiltonianSmooth:
         assert P_s.shape == (n_time, n_lat, n_lat, n_k)
         assert pi_s.shape == (n_time, n_k)
 
+    def test_smooth_empty_sequence_returns_empty(self, switching_model, params):
+        """smooth() on a zero-length sequence returns empty trajectories.
+
+        hamiltonian_core's shared RTS pass and gaussian_measurement_update
+        handle T=0 (empty-in -> empty-out); the switching smoother's own
+        backward pass must match, not IndexError while seeding the reverse scan
+        from ``m_filt[-1]`` on an empty forward trajectory.
+        """
+        n_lat = switching_model.n_cont_states
+        n_k = switching_model.n_discrete_states
+        n_lfp, n_spikes = 2, 3
+        lfp = jnp.zeros((0, n_lfp))
+        spikes = jnp.zeros((0, n_spikes))
+
+        m_s, P_s, pi_s = switching_model.smooth(lfp, spikes, params)
+
+        assert m_s.shape == (0, n_lat, n_k)
+        assert P_s.shape == (0, n_lat, n_lat, n_k)
+        assert pi_s.shape == (0, n_k)
+
     def test_filter_runs(self, switching_model, synthetic_data, params):
         """filter() should run without error."""
         lfp, spikes = synthetic_data
@@ -68,7 +93,9 @@ class TestSwitchingHamiltonianSmooth:
         assert means.shape[0] == n_time
         assert probs.shape == (n_time, switching_model.n_discrete_states)
 
-    def test_smoother_final_probability_matches_filter(self, switching_model, synthetic_data, params):
+    def test_smoother_final_probability_matches_filter(
+        self, switching_model, synthetic_data, params
+    ):
         """The last smoothed probability should equal the filtered probability."""
         lfp, spikes = synthetic_data
         params = {**params, "omega": jnp.array([1.0, 8.0])}
@@ -97,7 +124,9 @@ class TestSwitchingHamiltonianSmooth:
         assert probs.shape == (lfp.shape[0], switching_model.n_discrete_states)
         assert jnp.allclose(probs, switching_model.smoothed_discrete_probs_)
 
-    def test_smooth_sensitive_to_transition_asymmetry(self, switching_model, synthetic_data, params):
+    def test_smooth_sensitive_to_transition_asymmetry(
+        self, switching_model, synthetic_data, params
+    ):
         """Smoother output should change when transition matrix changes,
         confirming Jacobian weighting uses actual probabilities."""
         lfp, spikes = synthetic_data
@@ -309,7 +338,9 @@ class TestSwitchingHamiltonianBehavioral:
     def test_smoother_discriminates_modes_from_observations(self):
         """Two states with very different frequencies. Generate data from
         state 0 only. The smoother should assign high probability to state 0."""
-        from state_space_practice.hamiltonian_switching import SwitchingHamiltonianJointModel
+        from state_space_practice.hamiltonian_switching import (
+            SwitchingHamiltonianJointModel,
+        )
 
         n_lfp = 2
         n_spikes = 1  # minimal spike source with zero observations
@@ -348,7 +379,10 @@ class TestSwitchingHamiltonianBehavioral:
         model.measurement_matrix = jnp.stack([C_full, C_full], axis=2)
 
         # Simulate from STATE 0 (slow oscillator, omega=1)
-        trans_params_0 = {**jax.tree_util.tree_map(lambda x: x[0], model.mlp_params), "omega": model.omega[0]}
+        trans_params_0 = {
+            **jax.tree_util.tree_map(lambda x: x[0], model.mlp_params),
+            "omega": model.omega[0],
+        }
         x0 = jnp.array([1.0, 0.0])
 
         def sim_step(x, key):
@@ -359,7 +393,10 @@ class TestSwitchingHamiltonianBehavioral:
         _, x_true = jax.lax.scan(sim_step, x0, keys)
 
         # Generate LFP observations + zero spikes
-        obs_noise = jax.random.normal(jax.random.PRNGKey(99), (n_time, n_lfp)) * model.obs_noise_std
+        obs_noise = (
+            jax.random.normal(jax.random.PRNGKey(99), (n_time, n_lfp))
+            * model.obs_noise_std
+        )
         lfp = x_true @ model.C_lfp.T + model.d_lfp + obs_noise
         spikes = jnp.zeros((n_time, n_spikes))
 
@@ -394,14 +431,16 @@ class TestSwitchingHamiltonianSGDRecovery:
 
     @pytest.fixture(scope="class")
     def fitted(self):
-        from state_space_practice.hamiltonian_switching import SwitchingHamiltonianJointModel
+        from state_space_practice.hamiltonian_switching import (
+            SwitchingHamiltonianJointModel,
+        )
 
         dt = 0.01
         n_time = 500
         n_lfp = 2
         n_spikes = 1
-        omega_0 = 2 * jnp.pi   # ~1 Hz
-        omega_1 = 6 * jnp.pi   # ~3 Hz
+        omega_0 = 2 * jnp.pi  # ~1 Hz
+        omega_1 = 6 * jnp.pi  # ~3 Hz
 
         # Generate switching state sequence (Z diagonal=0.95)
         Z = jnp.array([[0.95, 0.05], [0.05, 0.95]])
@@ -420,8 +459,11 @@ class TestSwitchingHamiltonianSGDRecovery:
         # are selected by the active state at each time bin. This matches the
         # model convention x_t = f_{S_t}(x_{t-1}) + noise.
         _, mlp_params = simulate_harmonic_oscillator(
-            omega=omega_0, n_time=n_time, dt=dt,
-            key=jax.random.PRNGKey(10), hidden_dims=[8],
+            omega=omega_0,
+            n_time=n_time,
+            dt=dt,
+            key=jax.random.PRNGKey(10),
+            hidden_dims=[8],
         )
         trans_params_0 = {**mlp_params, "omega": omega_0}
         trans_params_1 = {**mlp_params, "omega": omega_1}
@@ -442,15 +484,22 @@ class TestSwitchingHamiltonianSGDRecovery:
         C_lfp = jnp.eye(2)
         d_lfp = jnp.zeros(n_lfp)
         lfp = simulate_lfp_observations(
-            x_true, C_lfp, d_lfp, noise_std=0.2,
+            x_true,
+            C_lfp,
+            d_lfp,
+            noise_std=0.2,
             key=jax.random.PRNGKey(99),
         )
         spikes = jnp.zeros((n_time, n_spikes))
 
         model = SwitchingHamiltonianJointModel(
-            n_oscillators=1, n_discrete_states=2,
-            n_lfp_sources=n_lfp, n_spike_sources=n_spikes,
-            sampling_freq=1.0 / dt, hidden_dims=[8], seed=0,
+            n_oscillators=1,
+            n_discrete_states=2,
+            n_lfp_sources=n_lfp,
+            n_spike_sources=n_spikes,
+            sampling_freq=1.0 / dt,
+            hidden_dims=[8],
+            seed=0,
         )
         # Initialise both omegas close together so the model must learn
         # to separate them (avoids a vacuously true distinguishability test)
@@ -458,7 +507,10 @@ class TestSwitchingHamiltonianSGDRecovery:
         model.omega = jnp.array([mid_omega, mid_omega * 1.05])
 
         lls = model.fit_sgd(
-            lfp, spikes, key=jax.random.PRNGKey(1), num_steps=200,
+            lfp,
+            spikes,
+            key=jax.random.PRNGKey(1),
+            num_steps=200,
         )
         return model, true_states, lfp, spikes, lls
 
@@ -471,11 +523,10 @@ class TestSwitchingHamiltonianSGDRecovery:
         params, _ = model._build_param_spec()
         _, _, pi_s = model.smooth(lfp, spikes, params)
         acc = state_segmentation_accuracy(
-            np.array(true_states), np.array(pi_s),
+            np.array(true_states),
+            np.array(pi_s),
         )
-        assert acc >= 0.65, (
-            f"State segmentation accuracy {acc:.3f} < 0.65"
-        )
+        assert acc >= 0.65, f"State segmentation accuracy {acc:.3f} < 0.65"
 
     def test_omegas_distinguishable(self, fitted):
         model, _, _, _, _ = fitted
