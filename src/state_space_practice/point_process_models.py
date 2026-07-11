@@ -1860,6 +1860,25 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             raise ValueError(
                 f"process_variance shape {process_variance.shape} != ({n_oscillators},)"
             )
+
+        # Value validation mirroring the Gaussian DirectedInfluenceModel: reject
+        # non-finite frequencies, damping outside [0, 1] (e.g. negative), and
+        # negative process variance -- otherwise these flow into a NaN or
+        # unstable transition matrix undetected.
+        freqs = jnp.asarray(freqs)
+        damping_coef = jnp.asarray(damping_coef)
+        process_variance = jnp.asarray(process_variance)
+        if not bool(jnp.all(jnp.isfinite(freqs))):
+            raise ValueError("freqs must contain only finite values.")
+        if not bool(jnp.all(jnp.isfinite(damping_coef))):
+            raise ValueError("damping_coef must contain only finite values.")
+        if bool(jnp.any((damping_coef < 0) | (damping_coef > 1))):
+            raise ValueError("damping_coef entries must lie in [0, 1].")
+        if not bool(jnp.all(jnp.isfinite(process_variance))):
+            raise ValueError("process_variance must contain only finite values.")
+        if bool(jnp.any(process_variance < 0)):
+            raise ValueError("process_variance must be non-negative.")
+
         if phase_difference.shape != (
             n_oscillators,
             n_oscillators,

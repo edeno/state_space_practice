@@ -1178,6 +1178,35 @@ class TestInputValidation:
         with pytest.raises(ValueError, match="diagonal"):
             DirectedInfluencePointProcessModel(**params)
 
+    @pytest.mark.parametrize("bad_damping", [[-0.1, 0.95], [0.95, 1.5]])
+    def test_dim_pp_rejects_damping_outside_unit_interval(
+        self, dim_pp_params, bad_damping
+    ) -> None:
+        """Damping outside [0, 1] (e.g. negative) must be rejected, mirroring
+        the Gaussian DIM."""
+        params = dict(dim_pp_params)
+        params["damping_coef"] = jnp.array(bad_damping)
+        with pytest.raises(ValueError, match=r"damping_coef entries must lie in"):
+            DirectedInfluencePointProcessModel(**params)
+
+    def test_dim_pp_rejects_nonfinite_freqs(self, dim_pp_params) -> None:
+        params = dict(dim_pp_params)
+        params["freqs"] = jnp.array([8.0, jnp.nan])
+        with pytest.raises(ValueError, match=r"freqs must contain only finite"):
+            DirectedInfluencePointProcessModel(**params)
+
+    def test_dim_pp_rejects_nonfinite_damping(self, dim_pp_params) -> None:
+        params = dict(dim_pp_params)
+        params["damping_coef"] = jnp.array([0.95, jnp.inf])
+        with pytest.raises(ValueError, match=r"damping_coef must contain only finite"):
+            DirectedInfluencePointProcessModel(**params)
+
+    def test_dim_pp_rejects_negative_process_variance(self, dim_pp_params) -> None:
+        params = dict(dim_pp_params)
+        params["process_variance"] = jnp.array([0.1, -0.1])
+        with pytest.raises(ValueError, match=r"process_variance must be non-negative"):
+            DirectedInfluencePointProcessModel(**params)
+
     def test_invalid_spikes_shape(self, com_pp_params) -> None:
         model = CommonOscillatorPointProcessModel(**com_pp_params)
         wrong_spikes = jnp.zeros((100, 3))  # Wrong n_neurons
