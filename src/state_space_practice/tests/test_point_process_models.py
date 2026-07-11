@@ -737,6 +737,107 @@ class TestDirectedInfluencePointProcessModel:
         assert jnp.min(eigvals) >= 1e-4 - 1e-10
         assert jnp.max(eigvals) <= 2.0 + 1e-10
 
+    def test_reparameterized_mstep_forwards_gpb2_pair_conditioned_stats(
+        self, dim_pp_params, monkeypatch
+    ) -> None:
+        """Under GPB2, the reparameterized M-step must forward the
+        pair-conditioned covariance and next-step means to the sufficient-stat
+        computation, not silently fall back to the state-conditioned form (which
+        would discard GPB2's accuracy)."""
+        import state_space_practice.point_process_models as pp_models
+
+        params = dict(dim_pp_params)
+        params["n_oscillators"] = 1
+        params["n_neurons"] = 1
+        params["n_discrete_states"] = 1
+        params["freqs"] = jnp.array([8.0])
+        params["damping_coef"] = jnp.array([0.95])
+        params["process_variance"] = jnp.array([0.1])
+        params["phase_difference"] = jnp.zeros((1, 1, 1))
+        params["coupling_strength"] = jnp.zeros((1, 1, 1))
+        model = DirectedInfluencePointProcessModel(
+            **params, use_reparameterized_mstep=True
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        n_time, n_latent, n_states = 3, model.n_latent, model.n_discrete_states
+        model.smoother_state_cond_mean = jnp.zeros((n_time, n_latent, n_states))
+        model.smoother_state_cond_cov = jnp.tile(
+            jnp.eye(n_latent)[None, :, :, None], (n_time, 1, 1, n_states)
+        )
+        model.smoother_discrete_state_prob = jnp.ones((n_time, n_states))
+        model.smoother_joint_discrete_state_prob = jnp.ones(
+            (n_time - 1, n_states, n_states)
+        )
+        model.smoother_pair_cond_cross_cov = jnp.zeros(
+            (n_time - 1, n_latent, n_latent, n_states, n_states)
+        )
+        model.smoother_pair_cond_means = jnp.zeros(
+            (n_time - 1, n_latent, n_states, n_states)
+        )
+        # Distinct, non-None GPB2 pair-conditioned arrays, so forwarding them is
+        # observably different from the state-conditioned fallback.
+        pair_cond_covs = (
+            jnp.tile(
+                jnp.eye(n_latent)[None, :, :, None, None],
+                (n_time - 1, 1, 1, n_states, n_states),
+            )
+            * 2.0
+        )
+        next_pair_means = jnp.ones((n_time - 1, n_latent, n_states, n_states)) * 3.0
+        model.smoother_pair_cond_covs = pair_cond_covs
+        model.smoother_next_pair_cond_means = next_pair_means
+
+        captured: dict = {}
+
+        def fake_stats(**kwargs):
+            captured.update(kwargs)
+            n_cont = kwargs["state_cond_smoother_means"].shape[1]
+            n_disc = kwargs["state_cond_smoother_means"].shape[2]
+            zeros = jnp.zeros((n_cont, n_cont, n_disc))
+            return zeros, zeros
+
+        def fake_optimize(**_kwargs):
+            return {
+                "freq": model.freqs,
+                "damping": model.damping_coef,
+                "coupling_strength": model.coupling_strength,
+                "phase_diff": model.phase_difference,
+            }
+
+        def fake_m_step(**_kwargs):
+            return (
+                model.continuous_transition_matrix,
+                jnp.zeros((1, n_latent, 1)),
+                model.process_cov,
+                jnp.eye(1)[:, :, None],
+                jnp.zeros((n_latent, n_states)),
+                jnp.tile(jnp.eye(n_latent)[:, :, None], (1, 1, n_states)),
+                jnp.ones((n_states, n_states)),
+                jnp.ones((n_states,)),
+            )
+
+        monkeypatch.setattr(
+            pp_models, "compute_transition_sufficient_stats", fake_stats
+        )
+        monkeypatch.setattr(
+            pp_models, "optimize_dim_transition_params_joint", fake_optimize
+        )
+        monkeypatch.setattr(
+            pp_models, "switching_kalman_maximization_step", fake_m_step
+        )
+
+        model._m_step_reparameterized()
+
+        assert captured["pair_cond_smoother_covs"] is not None
+        assert captured["next_pair_cond_smoother_means"] is not None
+        np.testing.assert_array_equal(
+            captured["pair_cond_smoother_covs"], pair_cond_covs
+        )
+        np.testing.assert_array_equal(
+            captured["next_pair_cond_smoother_means"], next_pair_means
+        )
+
     def test_reparameterized_mstep_produces_stable_reconstructable_A(
         self, dim_pp_params
     ) -> None:

@@ -2036,13 +2036,21 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             self.init_cov = self._regularize_init_cov_update(new_init_cov)
         self.init_discrete_state_prob = new_init_discrete_prob
 
-        # Reparameterized optimization for A
+        # Reparameterized optimization for A. Forward GPB2's pair-conditioned
+        # covariance and next-step means when available; otherwise
+        # compute_transition_sufficient_stats falls back to the state-conditioned
+        # approximation. Omitting them would silently discard GPB2's accuracy
+        # here (the standard M-step and the Gaussian DIM both pass them).
         gamma1, beta = compute_transition_sufficient_stats(
             state_cond_smoother_means=self.smoother_state_cond_mean,
             state_cond_smoother_covs=self.smoother_state_cond_cov,
             smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
             pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
             pair_cond_smoother_means=self.smoother_pair_cond_means,
+            pair_cond_smoother_covs=getattr(self, "smoother_pair_cond_covs", None),
+            next_pair_cond_smoother_means=getattr(
+                self, "smoother_next_pair_cond_means", None
+            ),
         )
 
         # Initialize the joint warm start from the current shared/public
