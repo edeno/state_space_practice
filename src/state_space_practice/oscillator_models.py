@@ -1814,9 +1814,14 @@ class DirectedInfluenceModel(BaseModel):
     max_spectral_radius : float, default=0.99
         Target upper bound on the spectral radius of each state's transition
         matrix. The differentiable stability scale shrinks damping and coupling
-        so the block-row operator-norm bound stays at or below this value. Lower
-        it to resolve slower rhythms (e.g. delta) at high sampling rates, where
-        the default admits only broad, overdamped bands. Must lie in ``(0, 1)``.
+        so the block-row operator-norm bound stays at or below this value. A
+        larger radius (closer to one) permits longer memory and a narrower
+        spectral peak: the resolvable half-power bandwidth is
+        ``delta_f ~= (1 - radius) * fs / pi``, so at ``fs = 1 kHz`` the default
+        ``0.99`` floors the bandwidth near ``3.2 Hz`` -- too broad to isolate a
+        slow, narrow-band rhythm such as delta. Raise it toward ``0.999`` to
+        resolve such rhythms; lowering it increases damping (broader, more
+        overdamped bands). Must lie in ``(0, 1)``.
     max_damping : float, default=0.995
         Upper bound on the intrinsic per-oscillator damping used by the
         reparameterized M-step's bounded optimizer. Must lie in ``(0, 1)``.

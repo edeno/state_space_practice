@@ -1813,9 +1813,14 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
     max_spectral_radius : float, default=0.99
         Target upper bound on the spectral radius of each state's transition
         matrix. The differentiable stability scale shrinks damping and coupling
-        so the block-row operator-norm bound stays at or below this value. Lower
-        it to resolve slower rhythms (e.g. delta) at high sampling rates, where
-        the default admits only broad, overdamped bands. Must lie in ``(0, 1)``.
+        so the block-row operator-norm bound stays at or below this value. A
+        larger radius (closer to one) permits longer memory and a narrower
+        spectral peak: the resolvable half-power bandwidth is
+        ``delta_f ~= (1 - radius) * fs / pi``, so at ``fs = 1 kHz`` the default
+        ``0.99`` floors the bandwidth near ``3.2 Hz`` -- too broad to isolate a
+        slow, narrow-band rhythm such as delta. Raise it toward ``0.999`` to
+        resolve such rhythms; lowering it increases damping (broader, more
+        overdamped bands). Must lie in ``(0, 1)``.
     max_damping : float, default=0.995
         Upper bound on the intrinsic per-oscillator damping used by the
         reparameterized M-step's bounded optimizer. Must lie in ``(0, 1)``.
@@ -1914,13 +1919,46 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         self.max_damping = max_damping
 
     def _initialize_continuous_transition_matrix(self) -> None:
-        """A varies across states: directed influence coupling structure."""
+        """A varies across states: directed influence coupling structure.
+
+        Built through the shared stability scale so the initial matrices honor
+        ``max_spectral_radius`` before the first E-step runs (matching the
+        Gaussian ``DirectedInfluenceModel``).
+        """
+        self._rebuild_stable_transition_matrix()
+
+    def _effective_dim_scale(self) -> Array:
+        """Global stability scale for the current (intrinsic) DIM parameters.
+
+        ``continuous_transition_matrix`` is built from ``damping_coef * scale``
+        and ``coupling_strength * scale``; reconstructing it from the public
+        parameters requires re-applying this same scale.
+        """
+        return compute_directed_influence_stability_scale(
+            self.freqs,
+            self.damping_coef,
+            self.coupling_strength,
+            self.sampling_freq,
+            max_spectral_radius=self.max_spectral_radius,
+        )
+
+    def _rebuild_stable_transition_matrix(self) -> None:
+        """Rebuild A from the intrinsic public params via the shared scale.
+
+        The scale is applied only to the *effective* damping/coupling used to
+        build ``A``; the public ``damping_coef`` / ``coupling_strength`` stay
+        intrinsic so the rebuild is idempotent and ``A`` is reconstructable
+        (see :meth:`_effective_dim_scale`).
+        """
+        scale = self._effective_dim_scale()
+        effective_damping = jnp.asarray(self.damping_coef) * scale
+        effective_coupling = jnp.asarray(self.coupling_strength) * scale
         self.continuous_transition_matrix = jnp.stack(
             [
                 construct_directed_influence_transition_matrix(
                     freqs=self.freqs,
-                    damping_coeffs=self.damping_coef,
-                    coupling_strengths=self.coupling_strength[:, :, state_ind],
+                    damping_coeffs=effective_damping,
+                    coupling_strengths=effective_coupling[:, :, state_ind],
                     phase_diffs=self.phase_difference[:, :, state_ind],
                     sampling_freq=self.sampling_freq,
                 )
@@ -2023,26 +2061,7 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         # differentiable stability scale the joint objective used. Public
         # freq/damping/coupling stay intrinsic; A re-applies the scale, so it is
         # reconstructable via compute_directed_influence_stability_scale.
-        scale = compute_directed_influence_stability_scale(
-            self.freqs,
-            self.damping_coef,
-            self.coupling_strength,
-            self.sampling_freq,
-            max_spectral_radius=self.max_spectral_radius,
-        )
-        effective_damping = self.damping_coef * scale
-        effective_coupling = self.coupling_strength * scale
-        A_list = [
-            construct_directed_influence_transition_matrix(
-                freqs=self.freqs,
-                damping_coeffs=effective_damping,
-                coupling_strengths=effective_coupling[:, :, j],
-                phase_diffs=self.phase_difference[:, :, j],
-                sampling_freq=self.sampling_freq,
-            )
-            for j in range(self.n_discrete_states)
-        ]
-        self.continuous_transition_matrix = jnp.stack(A_list, axis=-1)
+        self._rebuild_stable_transition_matrix()
 
     def _update_public_oscillator_params(self) -> None:
         """Sync the joint optimizer solution to the public attributes.
@@ -2088,16 +2107,23 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
             projected.append(A_j)
         self.continuous_transition_matrix = jnp.stack(projected, axis=-1)
 
-        # Sync coupling_strength and phase_difference from the projected A
+        # Sync all four scientific params from the projected A
         self._sync_coupling_from_transition_matrix()
 
     def _sync_coupling_from_transition_matrix(self) -> None:
-        """Extract coupling/phase params from the current transition matrix.
+        """Sync all four scientific params from the current transition matrix.
 
-        Called after standard EM projection so that ``coupling_strength``
-        and ``phase_difference`` reflect the fitted A, not just the
-        initial values.
+        Called after standard EM projection so the public
+        frequency/damping/coupling/phase reflect the fitted A -- not just the
+        initial values. Frequency and damping are shared across states
+        (averaged); coupling and phase keep their discrete-state axis. ``A`` is
+        then rebuilt through the shared stability scale so it stays
+        reconstructable from the public params (matching the Gaussian
+        ``DirectedInfluenceModel``). Extracting only coupling/phase would leave
+        frequency/damping stale, so ``A`` could not be reconstructed.
         """
+        freq_list = []
+        damping_list = []
         coupling_list = []
         phase_list = []
         for j in range(self.n_discrete_states):
@@ -2106,10 +2132,15 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
                 self.sampling_freq,
                 self.n_oscillators,
             )
+            freq_list.append(params["freq"])
+            damping_list.append(params["damping"])
             coupling_list.append(params["coupling_strength"])
             phase_list.append(params["phase_diff"])
+        self.freqs = jnp.mean(jnp.stack(freq_list, axis=-1), axis=-1)
+        self.damping_coef = jnp.mean(jnp.stack(damping_list, axis=-1), axis=-1)
         self.coupling_strength = jnp.stack(coupling_list, axis=-1)
         self.phase_difference = jnp.stack(phase_list, axis=-1)
+        self._rebuild_stable_transition_matrix()
 
     # --- SGDFittableMixin: DIM-PP specific ---
 
@@ -2198,13 +2229,28 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         phase_diff = params.get("phase_difference", self.phase_difference)
         coupling = params.get("coupling_strength", self.coupling_strength)
 
+        # Apply the shared differentiable stability scale so SGD optimizes only
+        # over transition matrices that honor max_spectral_radius, matching the
+        # Gaussian DIM SGD loss and the EM path. Damping is fixed during SGD
+        # (only coupling/phase are free), so the scale depends on the free
+        # coupling and the fixed damping.
+        scale = compute_directed_influence_stability_scale(
+            self.freqs,
+            self.damping_coef,
+            coupling,
+            self.sampling_freq,
+            max_spectral_radius=self.max_spectral_radius,
+        )
+        effective_damping = self.damping_coef * scale
+        effective_coupling = coupling * scale
+
         A_list = []
         for j in range(self.n_discrete_states):
             A_j = construct_directed_influence_transition_matrix(
                 freqs=self.freqs,
-                damping_coeffs=self.damping_coef,
+                damping_coeffs=effective_damping,
                 phase_diffs=phase_diff[..., j],
-                coupling_strengths=coupling[..., j],
+                coupling_strengths=effective_coupling[..., j],
                 sampling_freq=self.sampling_freq,
             )
             A_list.append(A_j)
@@ -2237,17 +2283,9 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         if "coupling_strength" in params:
             self.coupling_strength = params["coupling_strength"]
         if "phase_difference" in params or "coupling_strength" in params:
-            A_list = []
-            for j in range(self.n_discrete_states):
-                A_j = construct_directed_influence_transition_matrix(
-                    freqs=self.freqs,
-                    damping_coeffs=self.damping_coef,
-                    phase_diffs=self.phase_difference[..., j],
-                    coupling_strengths=self.coupling_strength[..., j],
-                    sampling_freq=self.sampling_freq,
-                )
-                A_list.append(A_j)
-            self.continuous_transition_matrix = jnp.stack(A_list, axis=-1)
+            # Rebuild through the shared stability scale so stored matrices honor
+            # max_spectral_radius and stay reconstructable from the public params.
+            self._rebuild_stable_transition_matrix()
         self.init_cov = self._reconstruct_per_state_array(
             params, "init_cov", self.init_cov
         )

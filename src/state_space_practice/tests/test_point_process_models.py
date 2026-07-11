@@ -852,6 +852,130 @@ class TestDirectedInfluencePointProcessModel:
             )
             np.testing.assert_allclose(A, recon, atol=1e-9)
 
+    def test_initialization_respects_max_spectral_radius(self, dim_pp_params) -> None:
+        """The initial transition matrices must honor ``max_spectral_radius``
+        before the first E-step (matching the Gaussian DIM)."""
+        from state_space_practice.oscillator_utils import (
+            construct_directed_influence_transition_matrix,
+        )
+
+        params = dict(dim_pp_params)
+        params["coupling_strength"] = (
+            jnp.zeros_like(params["coupling_strength"])
+            .at[0, 1, :]
+            .set(0.4)
+            .at[1, 0, :]
+            .set(0.4)
+        )
+        model = DirectedInfluencePointProcessModel(**params, max_spectral_radius=0.7)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        # Guard: raw (unscaled) construction would exceed the bound, so the
+        # scale must actually be doing work here.
+        raw = construct_directed_influence_transition_matrix(
+            freqs=model.freqs,
+            damping_coeffs=model.damping_coef,
+            coupling_strengths=model.coupling_strength[:, :, 0],
+            phase_diffs=model.phase_difference[:, :, 0],
+            sampling_freq=model.sampling_freq,
+        )
+        assert float(jnp.max(jnp.abs(jnp.linalg.eigvals(raw)))) > 0.7
+        for j in range(model.n_discrete_states):
+            A = model.continuous_transition_matrix[:, :, j]
+            assert float(jnp.max(jnp.abs(jnp.linalg.eigvals(A)))) <= 0.7 + 1e-6
+
+    def test_store_sgd_params_respects_max_spectral_radius(self, dim_pp_params) -> None:
+        """Storing SGD parameters must rebuild A through the stability scale so
+        stored matrices honor the bound and stay reconstructable."""
+        from state_space_practice.oscillator_utils import (
+            compute_directed_influence_stability_scale,
+            construct_directed_influence_transition_matrix,
+        )
+
+        model = DirectedInfluencePointProcessModel(
+            **dim_pp_params, max_spectral_radius=0.7
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        n_osc, n_disc = model.n_oscillators, model.n_discrete_states
+        strong = (
+            jnp.zeros((n_osc, n_osc, n_disc)).at[0, 1, :].set(0.4).at[1, 0, :].set(0.4)
+        )
+        model._store_sgd_params(
+            {
+                "coupling_strength": strong,
+                "phase_difference": jnp.zeros((n_osc, n_osc, n_disc)),
+            }
+        )
+
+        scale = compute_directed_influence_stability_scale(
+            model.freqs,
+            model.damping_coef,
+            model.coupling_strength,
+            model.sampling_freq,
+            max_spectral_radius=0.7,
+        )
+        assert float(scale) < 1.0  # guard: the bound binds for this coupling
+        for j in range(n_disc):
+            A = model.continuous_transition_matrix[:, :, j]
+            assert float(jnp.max(jnp.abs(jnp.linalg.eigvals(A)))) <= 0.7 + 1e-6
+            recon = construct_directed_influence_transition_matrix(
+                freqs=model.freqs,
+                damping_coeffs=model.damping_coef * scale,
+                coupling_strengths=model.coupling_strength[:, :, j] * scale,
+                phase_diffs=model.phase_difference[:, :, j],
+                sampling_freq=model.sampling_freq,
+            )
+            np.testing.assert_allclose(A, recon, atol=1e-9)
+
+    @pytest.mark.slow
+    def test_default_em_leaves_reconstructable_transition_matrix(
+        self, dim_pp_params
+    ) -> None:
+        """The default (non-reparameterized) EM must sync all four scientific
+        parameters so the fitted A reconstructs from the public params."""
+        from state_space_practice.oscillator_utils import (
+            compute_directed_influence_stability_scale,
+            construct_directed_influence_transition_matrix,
+        )
+
+        params = dict(dim_pp_params)
+        params["coupling_strength"] = (
+            jnp.zeros_like(params["coupling_strength"])
+            .at[0, 1, :]
+            .set(0.4)
+            .at[1, 0, :]
+            .set(0.4)
+        )
+        model = DirectedInfluencePointProcessModel(
+            **params, use_reparameterized_mstep=False
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(1), 0.3, (150, model.n_neurons)
+        ).astype(float)
+        model.fit(spikes, max_iter=5, key=jax.random.PRNGKey(0))
+
+        scale = compute_directed_influence_stability_scale(
+            model.freqs,
+            model.damping_coef,
+            model.coupling_strength,
+            model.sampling_freq,
+            max_spectral_radius=model.max_spectral_radius,
+        )
+        for j in range(model.n_discrete_states):
+            A = model.continuous_transition_matrix[:, :, j]
+            assert float(jnp.max(jnp.abs(jnp.linalg.eigvals(A)))) <= (
+                model.max_spectral_radius + 1e-6
+            )
+            recon = construct_directed_influence_transition_matrix(
+                freqs=model.freqs,
+                damping_coeffs=model.damping_coef * scale,
+                coupling_strengths=model.coupling_strength[:, :, j] * scale,
+                phase_diffs=model.phase_difference[:, :, j],
+                sampling_freq=model.sampling_freq,
+            )
+            np.testing.assert_allclose(A, recon, atol=1e-8)
+
 
 # ============================================================================
 # Tests for input validation
