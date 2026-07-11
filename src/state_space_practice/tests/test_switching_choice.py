@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 """Tests for the switching_choice module."""
+
 import jax
 
 jax.config.update("jax_enable_x64", True)
@@ -31,7 +32,16 @@ class TestSoftmaxPredictAndUpdate:
         obs_offset = jnp.zeros(3)
 
         post_mean, post_cov, ll = _softmax_predict_and_update(
-            mean, cov, jnp.int32(0), A, Q, 3, 1.0, B, u, obs_offset,
+            mean,
+            cov,
+            jnp.int32(0),
+            A,
+            Q,
+            3,
+            1.0,
+            B,
+            u,
+            obs_offset,
         )
         assert post_mean.shape == (k_free,)
         assert post_cov.shape == (k_free, k_free)
@@ -48,7 +58,16 @@ class TestSoftmaxPredictAndUpdate:
         obs_offset = jnp.zeros(3)
 
         _, _, ll = _softmax_predict_and_update(
-            mean, cov, jnp.int32(1), A, Q, 3, 2.0, B, u, obs_offset,
+            mean,
+            cov,
+            jnp.int32(1),
+            A,
+            Q,
+            3,
+            2.0,
+            B,
+            u,
+            obs_offset,
         )
         assert jnp.isfinite(ll)
 
@@ -63,7 +82,16 @@ class TestSoftmaxPredictAndUpdate:
         obs_offset = jnp.zeros(3)
 
         _, post_cov, _ = _softmax_predict_and_update(
-            mean, cov, jnp.int32(0), A, Q, 3, 1.0, B, u, obs_offset,
+            mean,
+            cov,
+            jnp.int32(0),
+            A,
+            Q,
+            3,
+            1.0,
+            B,
+            u,
+            obs_offset,
         )
         eigvals = jnp.linalg.eigvalsh(post_cov)
         assert jnp.all(eigvals > -1e-10)
@@ -85,7 +113,16 @@ class TestSoftmaxUpdatePerStatePair:
         obs_offset = jnp.zeros(3)
 
         pair_mean, pair_cov, pair_ll = _softmax_update_per_state_pair(
-            mean, cov, jnp.int32(0), A, Q, 3, betas, B, u, obs_offset,
+            mean,
+            cov,
+            jnp.int32(0),
+            A,
+            Q,
+            3,
+            betas,
+            B,
+            u,
+            obs_offset,
         )
         assert pair_mean.shape == (k_free, S, S)
         assert pair_cov.shape == (k_free, k_free, S, S)
@@ -104,12 +141,29 @@ class TestSoftmaxUpdatePerStatePair:
         obs_offset = jnp.zeros(3)
 
         pair_mean, pair_cov, pair_ll = _softmax_update_per_state_pair(
-            mean, cov, jnp.int32(1), A, Q, 3, betas, B, u, obs_offset,
+            mean,
+            cov,
+            jnp.int32(1),
+            A,
+            Q,
+            3,
+            betas,
+            B,
+            u,
+            obs_offset,
         )
 
         ref_mean, ref_cov, ref_ll = _softmax_predict_and_update(
-            mean[:, 0], cov[:, :, 0], jnp.int32(1),
-            A[:, :, 0], Q[:, :, 0], 3, 2.0, B, u, obs_offset,
+            mean[:, 0],
+            cov[:, :, 0],
+            jnp.int32(1),
+            A[:, :, 0],
+            Q[:, :, 0],
+            3,
+            2.0,
+            B,
+            u,
+            obs_offset,
         )
 
         np.testing.assert_allclose(pair_mean[:, 0, 0], ref_mean, atol=1e-10)
@@ -129,7 +183,16 @@ class TestSoftmaxUpdatePerStatePair:
         obs_offset = jnp.zeros(3)
 
         pair_mean, _, _ = _softmax_update_per_state_pair(
-            mean, cov, jnp.int32(0), A, Q, 3, betas, B, u, obs_offset,
+            mean,
+            cov,
+            jnp.int32(0),
+            A,
+            Q,
+            3,
+            betas,
+            B,
+            u,
+            obs_offset,
         )
         # Posteriors should differ across next-state axis
         assert not jnp.allclose(pair_mean[:, 0, 0], pair_mean[:, 0, 1])
@@ -147,7 +210,16 @@ class TestSoftmaxUpdatePerStatePair:
         obs_offset = jnp.zeros(3)
 
         _, _, pair_ll = _softmax_update_per_state_pair(
-            mean, cov, jnp.int32(0), A, Q, 3, betas, B, u, obs_offset,
+            mean,
+            cov,
+            jnp.int32(0),
+            A,
+            Q,
+            3,
+            betas,
+            B,
+            u,
+            obs_offset,
         )
         assert jnp.all(jnp.isfinite(pair_ll))
 
@@ -159,7 +231,9 @@ class TestSwitchingChoiceFilter:
         n_trials, K, S = 50, 3, 2
         choices = jax.random.randint(jax.random.PRNGKey(0), (n_trials,), 0, K)
         result = switching_choice_filter(
-            choices, n_options=K, n_discrete_states=S,
+            choices,
+            n_options=K,
+            n_discrete_states=S,
         )
         assert result.filtered_values.shape == (n_trials, K - 1, S)
         assert result.filtered_covs.shape == (n_trials, K - 1, K - 1, S)
@@ -181,6 +255,48 @@ class TestSwitchingChoiceFilter:
         choices = jax.random.randint(jax.random.PRNGKey(0), (100,), 0, 3)
         result = switching_choice_filter(choices, n_options=3, n_discrete_states=2)
         assert jnp.isfinite(result.marginal_log_likelihood)
+
+    def test_preserves_structural_zero_prior(self):
+        """A structurally-impossible state (prior 0 + identity Z) stays exactly 0.
+
+        The support mask must be derived from the RAW prior; if the prior is
+        floored (`_stabilize_probability_vector`) before the support is computed,
+        state 1 is resurrected to ~1e-10 and persists under identity transitions.
+        """
+        choices = jnp.array([0, 1, 0, 1, 0])
+        result = switching_choice_filter(
+            choices,
+            n_options=2,
+            n_discrete_states=2,
+            init_discrete_prob=jnp.array([1.0, 0.0]),
+            discrete_transition_matrix=jnp.eye(2),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(result.discrete_state_probs[:, 1]), np.zeros(len(choices))
+        )
+
+    def test_marginal_ll_gradient_finite_with_structural_zeros(self):
+        """jax.grad through the choice filter with a forbidden column is not NaN.
+
+        Prior [1, 0] + identity transitions make state 1's destination column
+        all -inf at t>=2; the gradient-safe -inf handling must keep the gradient
+        finite for the SGD path.
+        """
+        choices = jnp.array([0, 0, 1, 0])
+
+        def marginal_ll(beta):
+            return switching_choice_filter(
+                choices,
+                n_options=2,
+                n_discrete_states=2,
+                inverse_temperatures=jnp.array([beta, beta]),
+                init_discrete_prob=jnp.array([1.0, 0.0]),
+                discrete_transition_matrix=jnp.eye(2),
+            ).marginal_log_likelihood
+
+        grad = jax.grad(marginal_ll)(1.0)
+        assert bool(jnp.isfinite(marginal_ll(1.0)))
+        assert bool(jnp.isfinite(grad))
 
     def test_rejects_invalid_choice_index(self):
         choices = jnp.array([0, 3, 1])
@@ -209,7 +325,9 @@ class TestSwitchingChoiceFilter:
 
         # Switching filter with S=1
         result_sw = switching_choice_filter(
-            choices, n_options=4, n_discrete_states=1,
+            choices,
+            n_options=4,
+            n_discrete_states=1,
             process_noises=jnp.array([q]),
             inverse_temperatures=jnp.array([beta]),
             decays=jnp.array([decay]),
@@ -221,12 +339,15 @@ class TestSwitchingChoiceFilter:
 
         # Non-switching CovariateChoiceModel filter
         result_cov = _covariate_choice_filter_jit(
-            choices, 4,
+            choices,
+            4,
             covariates,
             input_gain,
             jnp.zeros((100, 1)),  # obs_covariates
             jnp.zeros((4, 1)),  # obs_weights
-            q, beta, decay,
+            q,
+            beta,
+            decay,
             init_mean,
             init_cov,
         )
@@ -246,7 +367,9 @@ class TestSwitchingChoiceFilter:
         choices = jnp.concatenate([exploit, explore])
 
         result = switching_choice_filter(
-            choices, n_options=3, n_discrete_states=2,
+            choices,
+            n_options=3,
+            n_discrete_states=2,
             inverse_temperatures=jnp.array([5.0, 0.5]),  # high vs low beta
             process_noises=jnp.array([0.001, 0.05]),
         )
@@ -299,7 +422,8 @@ class TestSwitchingChoiceModel:
         choices = jax.random.randint(jax.random.PRNGKey(0), (100,), 0, 3)
         # Start with equal betas
         model = SwitchingChoiceModel(
-            n_options=3, n_discrete_states=2,
+            n_options=3,
+            n_discrete_states=2,
             init_inverse_temperatures=jnp.array([2.0, 2.0]),
         )
         model.fit(choices, max_iter=5)
@@ -314,7 +438,8 @@ class TestSwitchingChoiceModel:
         )
 
         sim = simulate_switching_choice_data(
-            n_trials=200, n_options=3,
+            n_trials=200,
+            n_options=3,
             inverse_temperatures=jnp.array([5.0, 0.5]),
             process_noises=jnp.array([0.001, 0.05]),
             seed=42,
@@ -322,7 +447,10 @@ class TestSwitchingChoiceModel:
         model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
         model.fit_sgd(sim.choices, num_steps=100)
         # Per-state betas should differ after SGD
-        assert abs(float(model.inverse_temperatures_[0] - model.inverse_temperatures_[1])) > 0.1
+        assert (
+            abs(float(model.inverse_temperatures_[0] - model.inverse_temperatures_[1]))
+            > 0.1
+        )
 
     def test_sgd_improves_ll(self):
         from state_space_practice.switching_choice import SwitchingChoiceModel
@@ -362,9 +490,7 @@ class TestSwitchingChoiceModel:
         model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
 
         model.fit(choices, max_iter=1)
-        fresh_ll = float(
-            model._run_filter(choices, None, None).marginal_log_likelihood
-        )
+        fresh_ll = float(model._run_filter(choices, None, None).marginal_log_likelihood)
 
         assert np.isclose(model.log_likelihood_, fresh_ll)
 
@@ -392,7 +518,10 @@ class TestSimulateSwitchingChoiceData:
         from state_space_practice.switching_choice import simulate_switching_choice_data
 
         sim = simulate_switching_choice_data(
-            n_trials=200, n_options=3, n_discrete_states=3, seed=0,
+            n_trials=200,
+            n_options=3,
+            n_discrete_states=3,
+            seed=0,
             process_noises=jnp.array([0.001, 0.01, 0.05]),
             inverse_temperatures=jnp.array([5.0, 2.0, 0.5]),
         )
@@ -418,7 +547,9 @@ class TestModelComparison:
         )
 
         sim = simulate_switching_choice_data(
-            n_trials=200, n_options=3, n_discrete_states=2,
+            n_trials=200,
+            n_options=3,
+            n_discrete_states=2,
             inverse_temperatures=jnp.array([5.0, 0.5]),
             process_noises=jnp.array([0.001, 0.05]),
             seed=42,
@@ -493,11 +624,10 @@ def fitted_switching_choice_model(request):
 
     n_options, n_discrete_states = request.param
     n_trials = 40
-    choices = jax.random.randint(
-        jax.random.PRNGKey(0), (n_trials,), 0, n_options
-    )
+    choices = jax.random.randint(jax.random.PRNGKey(0), (n_trials,), 0, n_options)
     model = SwitchingChoiceModel(
-        n_options=n_options, n_discrete_states=n_discrete_states,
+        n_options=n_options,
+        n_discrete_states=n_discrete_states,
     )
     model.fit_sgd(choices, num_steps=5)
     return model, choices, n_trials, n_options, n_discrete_states
@@ -525,21 +655,29 @@ class TestSwitchingChoiceUncertaintyShapes:
         assert model.predicted_choice_entropy_.shape == (T,)
 
     def test_reference_option_variance_is_zero(
-        self, fitted_switching_choice_model,
+        self,
+        fitted_switching_choice_model,
     ):
         model, *_ = fitted_switching_choice_model
         np.testing.assert_allclose(
-            model.predicted_option_variances_[:, 0], 0.0, atol=1e-8,
+            model.predicted_option_variances_[:, 0],
+            0.0,
+            atol=1e-8,
         )
         np.testing.assert_allclose(
-            model.smoothed_option_variances_[:, 0], 0.0, atol=1e-8,
+            model.smoothed_option_variances_[:, 0],
+            0.0,
+            atol=1e-8,
         )
         np.testing.assert_allclose(
-            model.per_state_predicted_variances_[:, 0, :], 0.0, atol=1e-8,
+            model.per_state_predicted_variances_[:, 0, :],
+            0.0,
+            atol=1e-8,
         )
 
     def test_variances_finite_and_nonnegative(
-        self, fitted_switching_choice_model,
+        self,
+        fitted_switching_choice_model,
     ):
         model, *_ = fitted_switching_choice_model
         assert jnp.all(jnp.isfinite(model.predicted_option_variances_))
@@ -548,7 +686,8 @@ class TestSwitchingChoiceUncertaintyShapes:
         assert jnp.all(model.smoothed_option_variances_ >= -1e-8)
 
     def test_predicted_uses_prior_not_posterior(
-        self, fitted_switching_choice_model,
+        self,
+        fitted_switching_choice_model,
     ):
         """Predicted (prior) variance should be >= filtered (posterior)."""
         model, *_ = fitted_switching_choice_model
@@ -557,21 +696,23 @@ class TestSwitchingChoiceUncertaintyShapes:
 
         # Extract filtered covariance diagonals independently: (T, K-1, S).
         # Use explicit einsum to avoid the jnp.diagonal axis-ordering pitfall.
-        filt_diag = jnp.einsum(
-            "tiis->tis", model._filter_result.filtered_covs
-        )
+        filt_diag = jnp.einsum("tiis->tis", model._filter_result.filtered_covs)
         # Reconstruct predicted (prior) state probs the same way the model does.
         disc_probs = model._filter_result.discrete_state_probs  # (T, S)
         init_prob = jnp.ones(model.n_discrete_states) / model.n_discrete_states
-        predicted_disc = jnp.concatenate([
-            init_prob[None, :],
-            disc_probs[:-1] @ model.discrete_transition_matrix_,
-        ], axis=0)
+        predicted_disc = jnp.concatenate(
+            [
+                init_prob[None, :],
+                disc_probs[:-1] @ model.discrete_transition_matrix_,
+            ],
+            axis=0,
+        )
         filt_var = jnp.einsum("tks,ts->tk", filt_diag, predicted_disc).mean()
         assert float(pred_var) >= float(filt_var) - 1e-6
 
     def test_variance_law_of_total_variance(
-        self, fitted_switching_choice_model,
+        self,
+        fitted_switching_choice_model,
     ):
         """``predicted_option_variances_`` must equal E[Var(x|s)] + Var(E[x|s]).
 
@@ -594,10 +735,13 @@ class TestSwitchingChoiceUncertaintyShapes:
         disc_probs = np.asarray(result.discrete_state_probs)  # (T, S)
         trans = np.asarray(model.discrete_transition_matrix_)  # (S, S)
         init_prob = np.ones(S) / S
-        predicted_disc = np.concatenate([
-            init_prob[None, :],
-            disc_probs[:-1] @ trans,
-        ], axis=0)  # (T, S)
+        predicted_disc = np.concatenate(
+            [
+                init_prob[None, :],
+                disc_probs[:-1] @ trans,
+            ],
+            axis=0,
+        )  # (T, S)
 
         expected_total = np.zeros((T, K))
         for t in range(T):
@@ -662,9 +806,7 @@ class TestSwitchingChoiceRecovery:
         betas = np.asarray(model.inverse_temperatures_)  # (S,)
 
         # Per-state choice probabilities
-        zero_ref = np.zeros(
-            (filt_values.shape[0], 1, filt_values.shape[2])
-        )
+        zero_ref = np.zeros((filt_values.shape[0], 1, filt_values.shape[2]))
         full_vals = np.concatenate([zero_ref, filt_values], axis=1)  # (T, K, S)
         per_state_logits = betas[None, None, :] * full_vals  # (T, K, S)
         per_state_logits -= per_state_logits.max(axis=1, keepdims=True)
@@ -710,12 +852,17 @@ class TestSwitchingChoiceRecovery:
         overall recovery quality.
         """
         sim = simulate_switching_choice_data(
-            n_trials=300, n_options=3, n_discrete_states=2, seed=21,
+            n_trials=300,
+            n_options=3,
+            n_discrete_states=2,
+            seed=21,
         )
         model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
         model.fit_sgd(sim.choices, num_steps=100)
         # Per-state betas should differ (true gap is 4.5)
-        gap = float(abs(model.inverse_temperatures_[0] - model.inverse_temperatures_[1]))
+        gap = float(
+            abs(model.inverse_temperatures_[0] - model.inverse_temperatures_[1])
+        )
         assert gap > 0.1, (
             f"Per-state beta gap {gap:.3f} < 0.1 after SGD "
             f"(learned: {model.inverse_temperatures_})"
@@ -730,14 +877,17 @@ class TestSwitchingChoiceValidation:
             ValueError, match="inverse_temperatures must be strictly positive"
         ):
             SwitchingChoiceModel(
-                n_options=3, n_discrete_states=2,
+                n_options=3,
+                n_discrete_states=2,
                 init_inverse_temperatures=[-1.0, 1.0],
             )
 
     def test_rejects_decay_outside_unit_interval(self):
         with pytest.raises(ValueError, match="decays must lie in"):
             SwitchingChoiceModel(
-                n_options=3, n_discrete_states=2, init_decays=[1.5, 0.9],
+                n_options=3,
+                n_discrete_states=2,
+                init_decays=[1.5, 0.9],
             )
 
     def test_converged_flag_false_when_not_converged(self):

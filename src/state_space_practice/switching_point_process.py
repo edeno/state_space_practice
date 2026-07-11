@@ -103,6 +103,7 @@ from state_space_practice.oscillator_utils import (
 from state_space_practice.point_process_kalman import _point_process_laplace_update
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.switching_kalman import (
+    _first_timestep_discrete_update,
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture_per_discrete_state,
     switching_kalman_maximization_step,
@@ -115,11 +116,6 @@ from state_space_practice.utils import (
     stabilize_covariance,
     stabilize_transition_matrix,
     validate_count_array,
-)
-from state_space_practice.utils import divide_safe as _divide_safe
-from state_space_practice.utils import scale_likelihood as _scale_likelihood
-from state_space_practice.utils import (
-    stabilize_probability_vector as _stabilize_probability_vector,
 )
 
 logger = logging.getLogger(__name__)
@@ -814,8 +810,6 @@ def _first_timestep_point_process_update(
     """
     n_discrete_states = init_state_cond_mean.shape[-1]
 
-    init_discrete_state_prob = _stabilize_probability_vector(init_discrete_state_prob)
-
     # Apply point-process update directly to the prior (no dynamics prediction)
     # vmap over discrete states j with per-state spike params if provided
     state_indices = jnp.arange(n_discrete_states)
@@ -845,16 +839,14 @@ def _first_timestep_point_process_update(
         init_state_cond_mean, init_state_cond_cov, state_indices
     )
 
-    # Update discrete state probabilities using observation likelihood
-    # At t=1, there's no transition from S₀, so we just use:
-    # p(S₁=j | y₁) ∝ p(y₁ | S₁=j) * p(S₁=j)
-    scaled_lik, ll_max = _scale_likelihood(state_cond_log_lik)
-    unnorm_prob = scaled_lik * init_discrete_state_prob
-    norm_const = jnp.sum(unnorm_prob)
-    filter_discrete_prob = _divide_safe(unnorm_prob, norm_const)
-
-    # Marginal log-likelihood contribution
-    marginal_log_likelihood = ll_max + jnp.log(norm_const)
+    # Zero-preserving log-space discrete posterior, shared with the Gaussian
+    # first-step (switching_kalman._first_timestep_discrete_update): honors a
+    # structural-zero prior (impossible state stays 0), keeps a tiny prior
+    # faithful, and fails loud (NaN) on a malformed prior -- consistent with the
+    # log-space scan body below.
+    filter_discrete_prob, marginal_log_likelihood = _first_timestep_discrete_update(
+        state_cond_log_lik, init_discrete_state_prob
+    )
 
     # For smoother compatibility: create pair-conditional values. At t=1,
     # there's no S₀, so these are constant across the nonexistent S₀ axis.

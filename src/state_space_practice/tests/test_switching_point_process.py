@@ -714,6 +714,69 @@ class TestSwitchingPointProcessFilter:
         )
         assert marginal_log_likelihood.shape == ()
 
+    @staticmethod
+    def _two_state_args(prior, discrete_transition_matrix, n_time=3):
+        """Minimal 2-state, uninformative-observation point-process filter args.
+
+        Zero weights/baseline make the observation likelihood identical across
+        states, so the discrete posterior is driven purely by the prior and
+        transition structure.
+        """
+        from state_space_practice.switching_point_process import SpikeObsParams
+
+        n_latent, n_neurons, n_disc = 2, 2, 2
+        init_mean = jnp.zeros((n_latent, n_disc))
+        init_cov = jnp.stack([jnp.eye(n_latent)] * n_disc, axis=-1)
+        spikes = jnp.zeros((n_time, n_neurons))
+        A = jnp.stack([jnp.eye(n_latent)] * n_disc, axis=-1)
+        Q = jnp.stack([jnp.eye(n_latent) * 0.01] * n_disc, axis=-1)
+        params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons), weights=jnp.zeros((n_neurons, n_latent))
+        )
+        return (
+            init_mean,
+            init_cov,
+            jnp.asarray(prior),
+            spikes,
+            jnp.asarray(discrete_transition_matrix),
+            A,
+            Q,
+            0.02,
+            linear_log_intensity,
+            params,
+        )
+
+    def test_preserves_structural_zero_prior(self) -> None:
+        """A prior 0 + identity Z keeps the impossible state exactly 0 at every t.
+
+        The first-timestep discrete update must preserve structural zeros (not
+        floor them to ~1e-10, which the old linear path did), consistently with
+        the scan body and with switching_kalman.
+        """
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        args = self._two_state_args([1.0, 0.0], jnp.eye(2))
+        _, _, fp, _, _, _, _ = switching_point_process_filter(*args)
+        np.testing.assert_array_equal(np.asarray(fp[:, 1]), np.zeros(fp.shape[0]))
+
+    def test_fails_loud_on_all_zero_prior(self) -> None:
+        """A malformed all-zero prior is rejected loudly, not silently repaired.
+
+        The public filter's host-side validation raises before the first-step
+        update; the internal first-step is separately hardened (below) to
+        NaN-fail-loud so it is consistent even if called directly.
+        """
+        from state_space_practice.switching_point_process import (
+            switching_point_process_filter,
+        )
+
+        with pytest.raises(ValueError, match="sum to 1"):
+            switching_point_process_filter(
+                *self._two_state_args([0.0, 0.0], jnp.eye(2))
+            )
+
     def test_discrete_probs_sum_to_one(self) -> None:
         """Discrete state probabilities should sum to 1 at each timestep."""
         from state_space_practice.switching_point_process import (

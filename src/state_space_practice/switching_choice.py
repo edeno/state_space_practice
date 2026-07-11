@@ -344,6 +344,10 @@ def _switching_choice_filter_jit(
     init_state_cond_mean = jnp.stack([init_mean] * S, axis=-1)  # (K-1, S)
     init_state_cond_cov = jnp.stack([init_cov] * S, axis=-1)  # (K-1, K-1, S)
 
+    # Structural support S_1 from the RAW prior (before stabilization floors its
+    # exact zeros to 1e-10), so a caller-declared impossible state (prior 0) stays
+    # impossible: the support mask, not the floored value, decides.
+    first_support = jnp.asarray(init_discrete_prob) > 0.0
     init_discrete_prob = _stabilize_probability_vector(init_discrete_prob)
 
     # --- First timestep: predict + update (x₀ convention) ---
@@ -381,11 +385,10 @@ def _switching_choice_filter_jit(
     )
     # first_means: (K-1, S), first_pred_means: (K-1, S), etc.
 
-    # Log-space, support-masked discrete update for the first timestep. The
-    # Boolean support S_1 (nonzero prior entries) is threaded through the scan so
-    # an impossible state cannot set the log-sum-exp reference nor be resurrected.
+    # Log-space, support-masked discrete update for the first timestep. `first_support`
+    # (from the RAW prior, computed above) is threaded through the scan so an
+    # impossible state cannot set the log-sum-exp reference nor be resurrected.
     first_pair_ll = first_lls[None, :] * jnp.ones((S, 1))  # (S, S) broadcast
-    first_support = jnp.asarray(init_discrete_prob) > 0.0
     (
         first_discrete_prob,
         _,

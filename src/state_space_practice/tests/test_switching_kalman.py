@@ -277,6 +277,32 @@ def test_update_discrete_probs_pair_marginal_consistency_on_underflow() -> None:
     np.testing.assert_allclose(np.asarray(pair.sum(axis=0)), np.asarray(m_t), rtol=1e-6)
 
 
+def test_update_discrete_probs_supported_all_inf_column_no_nan_backward() -> None:
+    """A supported destination whose likelihood is all -inf must not NaN.
+
+    Reachable in the point-process filter at zero intensity: state 1 is
+    structurally reachable (fully-connected Z) but its observation
+    log-likelihood underflows to -inf for every source. The backward weights
+    must stay finite -- not exp(-inf - -inf) = NaN -- since a NaN there would
+    propagate silently into the collapsed state-conditional mean while the
+    marginal log-likelihood still looks healthy.
+    """
+    log_likelihood = jnp.array([[0.0, -jnp.inf], [0.0, -jnp.inf]])
+    Z = jnp.array([[0.5, 0.5], [0.5, 0.5]])  # state 1 is structurally reachable
+    prev = jnp.array([0.5, 0.5])
+    support = jnp.array([True, True])
+
+    m_t, w, log_pred, _ = _update_discrete_state_probabilities(
+        log_likelihood, Z, prev, support
+    )
+
+    assert not bool(jnp.any(jnp.isnan(w)))  # no NaN backward weights
+    assert not bool(jnp.any(jnp.isnan(m_t)))
+    assert bool(jnp.isfinite(log_pred))  # state 0 keeps the predictive finite
+    # State 1's observation is impossible -> ~0 marginal, backward column finite.
+    assert float(m_t[1]) < 1e-6
+
+
 def test_update_smoother_discrete_probabilities() -> None:
     """Tests the calculation of smoother discrete probabilities."""
     filter_prob = jnp.array([0.6, 0.4])
@@ -6971,3 +6997,69 @@ def test_gpb1_cap_preserves_joint_covariance_psd() -> None:
     assert min_eig >= -1e-6 * scale, (
         f"joint covariance indefinite: min eig {min_eig:.3e}"
     )
+
+
+def test_gpb2_cap_preserves_joint_covariance_psd() -> None:
+    """A cap-engaged GPB2 step returns a PSD joint block (triple-cov congruence).
+
+    GPB2 has a different structure (triple covs, three discrete axes) than GPB1,
+    so the congruence cross-cov scaling is wired differently; this exercises it
+    end-to-end. Single discrete state, contractive dynamics + tiny interior /
+    large correlated carry filter covariance engages the (moderate) trace cap.
+    """
+    from state_space_practice.switching_kalman import switching_kalman_smoother_gpb2
+
+    n_cont, n_disc, n_time = 2, 1, 2
+    interior = jnp.eye(n_cont) * 1e-2
+    carry = jnp.array([[1.0, 0.999], [0.999, 1.0]]) * 1e2
+    filter_cov = jnp.stack([interior[..., None], carry[..., None]], axis=0)
+    filter_mean = jnp.zeros((n_time, n_cont, n_disc))
+    filter_prob = jnp.ones((n_time, n_disc))
+    pair_mean = jnp.zeros((n_time, n_cont, n_disc, n_disc))
+    pair_cov = jnp.broadcast_to(
+        filter_cov[..., None], (n_time, n_cont, n_cont, n_disc, n_disc)
+    )
+    pair_prob = jnp.ones((n_time, n_disc, n_disc))
+    Q = (jnp.eye(n_cont) * 1e-10)[..., None]
+    A = (jnp.eye(n_cont) * 1e-3)[..., None]  # contractive -> large smoother gain
+
+    out = switching_kalman_smoother_gpb2(
+        filter_mean, filter_cov, filter_prob, pair_mean, pair_cov, pair_prob, Q, A
+    )
+    P_t = np.asarray(out[1][0])
+    P_tp1 = np.asarray(out[1][1])
+    C = np.asarray(out[4][0])
+
+    # Guard (non-vacuous): the smoother covariance is inflated far above the tiny
+    # interior filter covariance (trace 2e-2), so the cap regime is active.
+    assert np.trace(P_t) > 1.0
+
+    joint = np.block([[P_t, C], [C.T, P_tp1]])
+    min_eig = float(np.linalg.eigvalsh(joint).min())
+    scale = max(1.0, np.trace(P_t), np.trace(P_tp1))
+    assert min_eig >= -1e-6 * scale, f"joint indefinite: min eig {min_eig:.3e}"
+
+
+def test_filter_follows_dynamics_on_impossible_observation() -> None:
+    """A mid-sequence observation impossible under all states -> follow dynamics.
+
+    Exercises the degenerate dynamics-fallback branch in a real multi-step filter
+    run (not just the helper). The filter must not zero-lock, NaN, or leak onto
+    impossible states: every posterior stays a valid distribution and the
+    marginal LL stays finite.
+    """
+    init_mean = jnp.array([[0.0], [100.0]]).T
+    init_cov = jnp.array([[[0.01]], [[0.01]]]).T
+    A = jnp.array([[[1.0]], [[1.0]]]).T
+    Q = jnp.array([[[0.01]], [[0.01]]]).T
+    H = jnp.array([[[1.0]], [[1.0]]]).T
+    R = jnp.array([[[0.01]], [[0.01]]]).T
+    Z = jnp.eye(2)
+    obs = jnp.array([[0.0], [1.0e6], [0.0]])  # t=2 impossible under both states
+
+    _, _, fp, _, _, _, mll = switching_kalman_filter(
+        init_mean, init_cov, jnp.array([0.5, 0.5]), obs, Z, A, Q, H, R
+    )
+    assert bool(jnp.all(jnp.isfinite(fp)))  # no zero-lock / NaN
+    np.testing.assert_allclose(np.asarray(fp.sum(axis=1)), 1.0, rtol=1e-6)
+    assert bool(jnp.isfinite(mll))

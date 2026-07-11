@@ -150,6 +150,20 @@ def _cap_covariance_trace(
     to ``select`` and both branches execute, so a per-element ``debug_print_if``
     here would fire on every lane regardless of the predicate. The divergence
     signal is emitted once at the call site via ``_warn_if_cov_cap_engaged``.
+
+    Parameters
+    ----------
+    cov : jax.Array, shape (n_cont_states, n_cont_states)
+        A single (per-lane) covariance matrix.
+    max_allowed_trace : jax.Array
+        Scalar trace cap.
+
+    Returns
+    -------
+    capped_cov : jax.Array, shape (n_cont_states, n_cont_states)
+        ``cov`` scaled by ``alpha`` so its trace is at most ``max_allowed_trace``.
+    alpha : jax.Array
+        The applied scale in (0, 1] (``sqrt(alpha)`` rescales the cross-cov).
     """
     trace = jnp.trace(cov)
     # scale = min(1, max/trace); guard trace==0 (then no scaling is needed).
@@ -177,10 +191,13 @@ def _normalize_initial_discrete_prob(prob: jax.Array) -> jax.Array:
     likelihood can resurrect a state the caller declared impossible (and, via
     ``_log_prob_preserve_zeros``, the Viterbi first state too).
 
-    Genuinely malformed input (non-finite or negative entries, or a vector that
-    does not sum to a positive value) is sanitized rather than silently
-    repaired into a plausible-looking distribution, with a divergence signal so
-    it is visible in filter/smoother logs.
+    Malformed input is handled by severity, with a divergence signal
+    (``debug_print_if``) in every case: a vector that does not sum to a positive
+    value (all-zero / all-non-positive) is *rejected* as NaN (fail loud); a
+    non-finite or negative *entry* alongside an otherwise-positive sum is
+    *clamped to 0 and renormalized* (a sign error must not pull mass onto a
+    state) rather than rejected -- so this is defense-in-depth telemetry, not a
+    hard rejection of every stray negative.
 
     Parameters
     ----------
@@ -190,7 +207,8 @@ def _normalize_initial_discrete_prob(prob: jax.Array) -> jax.Array:
     Returns
     -------
     jax.Array, shape (n_discrete_states,)
-        ``prob`` normalized to sum 1 with structural zeros preserved.
+        ``prob`` normalized to sum 1 with structural zeros preserved; all-NaN
+        when the (sanitized) vector does not sum to a positive value.
     """
     prob = jnp.asarray(prob)
     prob = prob.astype(jnp.result_type(prob, 1.0))
@@ -307,10 +325,16 @@ def _guard_smoother_mean(mean: jax.Array, label: str) -> jax.Array:
 
     The only genuine failure is a mean that is non-finite, or so large that
     squaring it (as the M-step second-moment statistics do) would overflow the
-    dtype. Those are replaced with NaN so the EM loop's non-finite check rolls
-    the step back instead of consuming a fabricated posterior. The value is
-    never saturated at a threshold -- a clipped mean is still a fabricated
-    posterior.
+    dtype. Those are replaced with NaN rather than consumed as a fabricated
+    posterior. The value is never saturated at a threshold -- a clipped mean is
+    still a fabricated posterior.
+
+    Propagating NaN is a fail-loud signal, not a rollback: what the caller does
+    with it is caller-dependent. ``PlaceFieldModel``-style point-process ``fit``
+    loops guard on a non-finite log-likelihood and roll the EM step back;
+    callers without that guard (e.g. ``SwitchingChoiceModel.fit``) instead
+    surface the NaN in their reported objective. Either way the fabricated
+    posterior never silently overwrites the parameters.
 
     Parameters
     ----------
@@ -332,8 +356,8 @@ def _guard_smoother_mean(mean: jax.Array, label: str) -> jax.Array:
     debug_print_if(
         unrepresentable,
         f"switching_kalman: {label} smoother mean is non-finite or too large to "
-        "square without overflow (max |mean| {m:.2e}); propagating NaN so the EM "
-        "loop rolls this step back.",
+        "square without overflow (max |mean| {m:.2e}); propagating NaN as a "
+        "fail-loud signal (a non-finite-guarded EM loop rolls the step back).",
         m=jnp.max(jnp.abs(mean)),
     )
     return jnp.where(unrepresentable, jnp.nan, mean)
@@ -357,6 +381,17 @@ def _stabilize_probability_vector_preserving_zeros(
     entries are still floored (then renormalized) to recover from numerical
     underflow; in the healthy all-positive regime this equals
     :func:`stabilize_probability_vector` exactly.
+
+    Parameters
+    ----------
+    probabilities : jax.Array, shape (n_discrete_states,)
+        A discrete probability vector whose exact zeros are structural.
+
+    Returns
+    -------
+    jax.Array, shape (n_discrete_states,)
+        Renormalized vector with exact zeros preserved and nonzero entries
+        floored; uniform recovery if the whole vector underflowed to zero.
     """
     probabilities = jnp.asarray(probabilities)
     support = probabilities > 0.0
@@ -385,11 +420,25 @@ def _floor_supported_marginal(prob: jax.Array, support: jax.Array) -> jax.Array:
     support from its zeros. A supported state whose forward posterior underflowed
     to exactly 0 would then be lost (mistaken for impossible) even though future
     data supports it, so it is lifted to ``_DISCRETE_STABILITY_FLOOR`` to stay
-    strictly positive and recoverable. A legitimately tiny *positive* marginal
-    (e.g. from a small caller-supplied prior like 1e-12) is preserved exactly --
-    lifting only exact zeros avoids inflating it. Structurally forbidden states
+    strictly positive and recoverable. Only *exact* zeros are lifted, so a
+    legitimately tiny *positive* marginal (e.g. from a small caller-supplied prior
+    like 1e-12) is not inflated -- it is preserved up to the final
+    renormalization (dividing by the new sum). Structurally forbidden states
     (``support`` False) stay exactly 0, and a NaN marginal (malformed/diverged)
     propagates rather than being masked to 0.
+
+    Parameters
+    ----------
+    prob : jax.Array, shape (n_discrete_states,)
+        The (linear-space) filter marginal ``M_{t|t}(j)``.
+    support : jax.Array, shape (n_discrete_states,)
+        Boolean structural support ``S_t``.
+
+    Returns
+    -------
+    jax.Array, shape (n_discrete_states,)
+        Renormalized marginal with supported exact-zeros lifted to the floor and
+        forbidden states at exactly 0; all-NaN if ``prob`` contains any NaN.
     """
     lifted = jnp.where(prob > 0.0, prob, _DISCRETE_STABILITY_FLOOR)
     floored = jnp.where(support, lifted, 0.0)
@@ -488,9 +537,12 @@ def _update_discrete_state_probabilities(
     filter_discrete_prob = jnp.where(
         next_support, jnp.exp(log_marginal - log_norm), 0.0
     )
-    # W^{i|j} = Pr(S_{t-1}=i | S_t=j, y_{1:t}); forbidden columns -> 0. The safe
-    # (finite-in-forbidden-columns) marginal keeps exp(...) NaN-free for gradients.
-    safe_log_marginal = jnp.where(next_support, log_marginal, 0.0)
+    # W^{i|j} = Pr(S_{t-1}=i | S_t=j, y_{1:t}); forbidden columns -> 0. Substitute
+    # a finite placeholder into ANY all -inf column -- structurally forbidden OR a
+    # supported column whose likelihood underflowed to -inf (reachable in the
+    # point-process filter at zero intensity). This keeps exp(...) NaN-free (both
+    # the forward value and the gradient); such a column's weights are then 0.
+    safe_log_marginal = jnp.where(jnp.isfinite(log_marginal), log_marginal, 0.0)
     filter_backward_cond_prob = jnp.where(
         supported_col,
         jnp.exp(log_joint - safe_log_marginal[None, :]),
@@ -512,6 +564,60 @@ def _update_discrete_state_probabilities(
         log_predictive,
         next_support,
     )
+
+
+def _first_timestep_discrete_update(
+    state_cond_log_lik: jax.Array,
+    init_discrete_state_prob: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """First-timestep discrete posterior in log space, preserving structural zeros.
+
+    Shared by the Gaussian (:func:`_first_timestep_kalman_update`) and
+    point-process first-timestep updates so both honor a caller's structural
+    zero (an impossible state stays exactly 0), represent a legitimately tiny
+    prior faithfully, and fail loud (NaN) on a malformed all-zero prior. At t=1
+    there is no transition from S₀, so masking structurally impossible states
+    (prior 0 -> -inf) BEFORE normalizing keeps an impossible-but-well-fitting
+    state from setting the ``logsumexp`` reference and underflowing every
+    supported state:
+
+    ``p(S_1=j | y_1) = softmax_j( log p(y_1 | S_1=j) + log p(S_1=j) )``.
+
+    Parameters
+    ----------
+    state_cond_log_lik : jax.Array, shape (n_discrete_states,)
+        ``log p(y_1 | S_1=j)`` for each discrete state.
+    init_discrete_state_prob : jax.Array, shape (n_discrete_states,)
+        Caller-supplied prior ``p(S_1)``; exact zeros are structural.
+
+    Returns
+    -------
+    filter_discrete_prob : jax.Array, shape (n_discrete_states,)
+        Posterior ``p(S_1=j | y_1)``; a structural zero stays exactly 0.
+    marginal_log_likelihood : jax.Array
+        ``log p(y_1)`` contribution (scalar array); NaN on a malformed prior.
+    """
+    init_discrete_state_prob = _normalize_initial_discrete_prob(
+        init_discrete_state_prob
+    )
+    # ``_log_prob_preserve_zeros``: exact zero -> -inf; positive -> its true log,
+    # floored only at the dtype's tiny (NOT 1e-10), so a tiny prior like 1e-12 is
+    # faithful. Malformed (NaN) prior -> NaN, so the posterior/LL fail loud.
+    log_prior = jnp.where(
+        jnp.isnan(init_discrete_state_prob),
+        jnp.nan,
+        _log_prob_preserve_zeros(init_discrete_state_prob),
+    )
+    log_unnorm = state_cond_log_lik + log_prior
+    marginal_log_likelihood = logsumexp(log_unnorm)
+    filter_discrete_prob = jnp.exp(log_unnorm - marginal_log_likelihood)
+    # Floor supported-but-underflowed marginals so a value-based consumer (the
+    # GPB smoothers) can tell a reachable underflowed state from an impossible
+    # one; forbidden states stay exactly 0. Malformed (NaN) propagates.
+    filter_discrete_prob = _floor_supported_marginal(
+        filter_discrete_prob, init_discrete_state_prob > 0.0
+    )
+    return filter_discrete_prob, marginal_log_likelihood
 
 
 def _first_timestep_kalman_update(
@@ -588,34 +694,11 @@ def _first_timestep_kalman_update(
         measurement_cov,
     )
 
-    # Preserve structural zeros in the caller-supplied prior (an exact zero
-    # means "impossible at t=1"); do NOT floor it like a computed posterior,
-    # or the likelihood below could resurrect an excluded state.
-    init_discrete_state_prob = _normalize_initial_discrete_prob(
-        init_discrete_state_prob
-    )
-
-    # Update discrete state probabilities in log space, masking structurally
-    # impossible states (prior 0 -> -inf) BEFORE normalizing. This keeps an
-    # impossible-but-well-fitting state from setting the logsumexp reference and
-    # underflowing every supported state.
-    # p(S₁=j | y₁) = softmax_j( log p(y₁|S₁=j) + log p(S₁=j) ).
-    # Use _log_prob_preserve_zeros (exact zero -> -inf; positive -> its true log,
-    # floored only at the dtype's tiny, NOT at 1e-10) so a legitimately tiny
-    # caller prior like 1e-12 is represented faithfully rather than inflated.
-    log_prior = jnp.where(
-        jnp.isnan(init_discrete_state_prob),
-        jnp.nan,  # malformed prior -> NaN (fail loud)
-        _log_prob_preserve_zeros(init_discrete_state_prob),
-    )
-    log_unnorm = state_cond_log_lik + log_prior
-    marginal_log_likelihood = logsumexp(log_unnorm)
-    filter_discrete_prob = jnp.exp(log_unnorm - marginal_log_likelihood)
-    # Floor supported-but-underflowed marginals so a value-based consumer (the
-    # GPB smoothers) can tell a reachable underflowed state from an impossible
-    # one; forbidden states stay exactly 0. Malformed (NaN) propagates.
-    filter_discrete_prob = _floor_supported_marginal(
-        filter_discrete_prob, init_discrete_state_prob > 0.0
+    # Zero-preserving log-space discrete posterior (shared with the
+    # point-process first-step): honors a structural-zero prior, keeps a tiny
+    # prior faithful, and fails loud (NaN) on a malformed prior.
+    filter_discrete_prob, marginal_log_likelihood = _first_timestep_discrete_update(
+        state_cond_log_lik, init_discrete_state_prob
     )
 
     # For smoother compatibility: create pair_cond_filter_mean and cov
