@@ -30,7 +30,7 @@ References
 
 import functools
 import logging
-from typing import Callable, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -1337,6 +1337,9 @@ def stochastic_point_process_filter(
         and _uses_default_linear_log_intensity(log_conditional_intensity)
     )
     if use_block_dispatch:
+        # use_block_dispatch is only True when both are set (see its definition);
+        # assert so mypy narrows block_n_neurons / block_size from int | None to int.
+        assert block_n_neurons is not None and block_size is not None
         if spike_indicator.ndim == 1:
             raise ValueError(
                 "block_n_neurons / block_size can only be passed for "
@@ -1381,7 +1384,9 @@ def stochastic_point_process_filter(
     if single_neuron:
         spike_indicator = spike_indicator[:, None]
 
-    return _stochastic_point_process_filter_impl(
+    # jax.jit erases the wrapped function's return type to Any; the typed
+    # binding restores it so the declared return type is honored.
+    result: tuple[Array, Array, Array] = _stochastic_point_process_filter_impl(
         init_mean_params,
         init_covariance_params,
         design_matrix,
@@ -1394,6 +1399,7 @@ def stochastic_point_process_filter(
         max_log_count=max_log_count,
         max_newton_iter=max_newton_iter,
     )
+    return result
 
 
 @functools.partial(
@@ -1419,6 +1425,15 @@ def _stochastic_point_process_filter_impl(
     max_newton_iter: int = 1,
 ) -> tuple[Array, Array, Array]:
     """JIT-compiled inner implementation of the point process filter."""
+    # Coerce the ArrayLike inputs to Array (identity on the arrays the public
+    # entry point already passes) so the array algebra and the scan carry below
+    # type as Array rather than the ArrayLike scalar union.
+    init_mean_params = jnp.asarray(init_mean_params)
+    init_covariance_params = jnp.asarray(init_covariance_params)
+    design_matrix = jnp.asarray(design_matrix)
+    spike_indicator = jnp.asarray(spike_indicator)
+    transition_matrix = jnp.asarray(transition_matrix)
+    process_cov = jnp.asarray(process_cov)
 
     # Pre-compute gradient function outside the scan.
     def _log_intensity_with_design(design_matrix_t, x):
@@ -1518,7 +1533,7 @@ def _run_forward_block_diagonal(
     A_block = structure.A_block
     Q_block = structure.Q_block
 
-    def _step_one_neuron(carry, args):
+    def _step_one_neuron(carry, args: tuple[Array, Array]):
         mean_prev, cov_prev, ll_acc = carry
         z_row_t, y_t = args
         one_step_mean = A_block @ mean_prev
@@ -1563,11 +1578,13 @@ def _run_forward_block_diagonal(
         )
         return means_j, covs_j, ll_j
 
-    return jax.vmap(_run_one_neuron, in_axes=(0, 0, 1))(
+    # jax.vmap erases the return type to Any; the typed binding restores it.
+    fwd: tuple[Array, Array, Array] = jax.vmap(_run_one_neuron, in_axes=(0, 0, 1))(
         structure.init_means_per_neuron,
         structure.init_covs_per_neuron,
         spike_indicator,
     )
+    return fwd
 
 
 def _assemble_block_diagonal_covs(
@@ -1996,6 +2013,9 @@ def stochastic_point_process_smoother(
         and _uses_default_linear_log_intensity(log_conditional_intensity)
     )
     if use_block_dispatch:
+        # use_block_dispatch is only True when both are set (see its definition);
+        # assert so mypy narrows block_n_neurons / block_size from int | None to int.
+        assert block_n_neurons is not None and block_size is not None
         if spike_indicator.ndim == 1:
             raise ValueError(
                 "block_n_neurons / block_size can only be passed for "
@@ -2565,9 +2585,9 @@ class PointProcessModel(SGDFittableMixin):
         )
 
         log_likelihoods: list[float] = []
-        last_accepted_state: dict[str, object] | None = None
+        last_accepted_state: dict[str, Any] | None = None
 
-        def _snapshot_state() -> dict[str, object]:
+        def _snapshot_state() -> dict[str, Any]:
             return {
                 "smoother_mean": self.smoother_mean,
                 "smoother_cov": self.smoother_cov,
@@ -2580,7 +2600,7 @@ class PointProcessModel(SGDFittableMixin):
                 "init_cov": self.init_cov,
             }
 
-        def _restore_state(state: dict[str, object]) -> None:
+        def _restore_state(state: dict[str, Any]) -> None:
             self.smoother_mean = state["smoother_mean"]
             self.smoother_cov = state["smoother_cov"]
             self.smoother_cross_cov = state["smoother_cross_cov"]
@@ -2692,7 +2712,13 @@ class PointProcessModel(SGDFittableMixin):
 
     # --- SGDFittableMixin protocol ---
 
-    def fit_sgd(
+    # The mixin declares a generic ``fit_sgd(self, *args, **kwargs)`` that forwards
+    # to ``_sgd_loss_fn``; this concrete override names its two data arguments.
+    # mypy (correctly, per strict LSP) cannot see a fixed-arity signature as a
+    # substitute for ``*args, **kwargs``, and there is no signature that both
+    # keeps the explicit parameters and satisfies the check -- so the override
+    # is suppressed here, as in the sibling Hamiltonian models.
+    def fit_sgd(  # type: ignore[override]
         self,
         design_matrix: ArrayLike,
         spike_indicator: ArrayLike,
