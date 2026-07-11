@@ -34,7 +34,7 @@ def _asymmetry(matrix: jax.Array) -> jax.Array:
 
 
 def _params() -> dict:
-    return init_mlp_params(input_dim=4, hidden_dims=[4], key=jax.random.PRNGKey(0))
+    return init_mlp_params(input_dim=2, hidden_dims=[4], key=jax.random.PRNGKey(0))
 
 
 # An asymmetric-but-diagonally-dominant covariance, standing in for a filtered
@@ -113,6 +113,66 @@ def test_apply_mlp_rejects_odd_dimension():
         apply_mlp(params, x)
 
 
+@pytest.mark.parametrize("shape", [(2, 2), (1, 4)])
+def test_state_entry_points_reject_non_vector_input(shape):
+    params = _params()
+    x = jnp.ones(shape)
+    with pytest.raises(ValueError, match="one-dimensional"):
+        apply_mlp(params, x)
+    with pytest.raises(ValueError, match="one-dimensional"):
+        leapfrog_step(x, params, apply_mlp, dt=0.1)
+
+
+@pytest.mark.parametrize(
+    "input_dim, hidden_dims",
+    [(0, [4]), (-1, [4]), (1.5, [4]), (2, [0]), (2, [-1]), (2, [1.5])],
+)
+def test_init_mlp_params_rejects_invalid_dimensions(input_dim, hidden_dims):
+    with pytest.raises(ValueError, match="dimensions|input_dim|hidden_dims"):
+        init_mlp_params(input_dim, hidden_dims, jax.random.PRNGKey(0))
+
+
+def test_apply_mlp_rejects_malformed_layer_structure():
+    params = _params()
+    params.pop("b0")
+    with pytest.raises(ValueError, match="bias keys"):
+        apply_mlp(params, jnp.ones(4))
+
+
+def test_potential_network_has_only_active_position_inputs():
+    params = _params()
+    x = jnp.array([0.2, -0.3, 0.5, -0.1])
+
+    def energy_from_first_weight(weight):
+        return apply_mlp({**params, "w0": weight}, x)
+
+    gradient = jax.grad(energy_from_first_weight)(params["w0"])
+    assert params["w0"].shape[0] == x.shape[0] // 2
+    assert jnp.all(jnp.linalg.norm(gradient, axis=1) > 0.0)
+
+
+def test_step_and_jacobian_share_one_primal_evaluation():
+    calls = {"count": 0}
+
+    def harmonic_energy(_params, state):
+        calls["count"] += 1
+        return 0.5 * jnp.sum(state**2)
+
+    x = jnp.array([1.0, 0.0])
+    m_pred, _, F = ekf_predict_step_with_jacobian(
+        x,
+        jnp.eye(2),
+        {},
+        harmonic_energy,
+        jnp.zeros((2, 2)),
+        dt=0.1,
+    )
+
+    assert calls["count"] == 3
+    assert m_pred.shape == (2,)
+    assert F.shape == (2, 2)
+
+
 def _zero_mlp_harmonic_params(dim: int, omega: float, key: jax.Array) -> dict:
     """Params for which ``apply_mlp`` reduces to H = p^2/2 + omega^2 q^2/2.
 
@@ -120,7 +180,7 @@ def _zero_mlp_harmonic_params(dim: int, omega: float, key: jax.Array) -> dict:
     only the separable quadratic prior -- i.e. an exact linear harmonic
     oscillator, whose leapfrog flow has a closed form.
     """
-    params = init_mlp_params(input_dim=dim, hidden_dims=[4], key=key)
+    params = init_mlp_params(input_dim=dim // 2, hidden_dims=[4], key=key)
     params = jax.tree_util.tree_map(jnp.zeros_like, params)
     return {**params, "omega": jnp.array(omega)}
 

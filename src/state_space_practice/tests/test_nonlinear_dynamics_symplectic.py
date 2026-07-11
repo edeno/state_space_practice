@@ -31,7 +31,7 @@ def _full_state_nonseparable_hamiltonian(_params, state):
 
 def test_default_random_mlp_transition_jacobian_is_symplectic():
     params = init_mlp_params(
-        input_dim=4,
+        input_dim=2,
         hidden_dims=[5, 4],
         key=jax.random.PRNGKey(0),
     )
@@ -45,7 +45,7 @@ def test_default_random_mlp_transition_jacobian_is_symplectic():
 
 def test_zero_mlp_transition_jacobian_is_symplectic():
     params = init_mlp_params(
-        input_dim=4,
+        input_dim=2,
         hidden_dims=[5, 4],
         key=jax.random.PRNGKey(1),
     )
