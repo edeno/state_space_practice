@@ -54,6 +54,28 @@ def params(switching_model):
 class TestSwitchingHamiltonianSmooth:
     """Smoke tests for SwitchingHamiltonianJointModel.smooth()."""
 
+    def test_combined_base_fields_initialized_for_every_state(self, switching_model):
+        n_k = switching_model.n_discrete_states
+        assert switching_model.measurement_matrix.shape == (
+            switching_model.n_sources,
+            switching_model.n_cont_states,
+            n_k,
+        )
+        assert switching_model.measurement_cov.shape == (
+            switching_model.n_sources,
+            switching_model.n_sources,
+            n_k,
+        )
+        for k in range(n_k):
+            assert jnp.allclose(
+                switching_model.measurement_matrix[: switching_model.n_lfp, :, k],
+                switching_model.C_lfp,
+            )
+            assert jnp.allclose(
+                switching_model.measurement_matrix[switching_model.n_lfp :, :, k],
+                switching_model.C_spikes,
+            )
+
     def test_smooth_runs(self, switching_model, synthetic_data, params):
         """smooth() should run without error and return arrays of correct shape."""
         lfp, spikes = synthetic_data
@@ -92,6 +114,48 @@ class TestSwitchingHamiltonianSmooth:
         n_time = lfp.shape[0]
         assert means.shape[0] == n_time
         assert probs.shape == (n_time, switching_model.n_discrete_states)
+
+    def test_filter_covariance_defaults_are_not_stale(
+        self, switching_model, synthetic_data, params
+    ):
+        """Mutating the per-state covariances between filter calls must take
+        effect. On the old jit-with-static-self filter, R_lfp/process_cov/init_cov
+        were baked into the compilation cache and silently reused."""
+        lfp, spikes = synthetic_data
+        n = switching_model.n_cont_states
+        n_k = switching_model.n_discrete_states
+
+        _, covs_before, _, _ = switching_model.filter(lfp, spikes, params)
+        switching_model.R_lfp = jnp.eye(switching_model.n_lfp) * 10.0
+        switching_model.process_cov = jnp.stack([jnp.eye(n) * 10.0] * n_k, axis=2)
+        switching_model.init_cov = jnp.stack([jnp.eye(n) * 5.0] * n_k, axis=2)
+        _, covs_after, _, _ = switching_model.filter(lfp, spikes, params)
+
+        assert not jnp.allclose(covs_before, covs_after)
+
+    @pytest.mark.parametrize(
+        "bad_spikes, match",
+        [
+            (jnp.full((20, 3), -1.0), "non-negative"),
+            (jnp.full((20, 3), 0.5), "integer-valued"),
+        ],
+    )
+    def test_filter_validates_spike_counts(
+        self, switching_model, synthetic_data, params, bad_spikes, match
+    ):
+        """The public filter must reject invalid spike counts loudly, like the
+        non-switching siblings, rather than silently consuming them."""
+        lfp, _ = synthetic_data
+        with pytest.raises(ValueError, match=match):
+            switching_model.filter(lfp, bad_spikes, params)
+
+    def test_param_spec_drops_covariances(self, switching_model):
+        """Q/init_cov/R_lfp are fixed model config for the switching model, not
+        learnable params; a future accidental re-add would be silent."""
+        params, spec = switching_model._build_param_spec()
+        for key in ("Q", "init_cov", "R_lfp"):
+            assert key not in params, f"{key} unexpectedly in switching params"
+            assert key not in spec, f"{key} unexpectedly in switching spec"
 
     def test_smoother_final_probability_matches_filter(
         self, switching_model, synthetic_data, params
@@ -509,7 +573,6 @@ class TestSwitchingHamiltonianSGDRecovery:
         lls = model.fit_sgd(
             lfp,
             spikes,
-            key=jax.random.PRNGKey(1),
             num_steps=200,
         )
         return model, true_states, lfp, spikes, lls
