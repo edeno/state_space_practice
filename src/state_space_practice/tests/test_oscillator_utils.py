@@ -14,6 +14,7 @@ from state_space_practice.oscillator_utils import (
     _project_to_closest_rotation,
     _scatter_block_diagonal,
     canonicalize_correlated_noise_pair_parameters,
+    constrain_correlated_noise_process_covariance,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
     construct_correlated_noise_measurement_matrix,
@@ -26,6 +27,33 @@ from state_space_practice.oscillator_utils import (
     project_coupled_transition_matrix,
     project_matrix_blockwise,
 )
+
+
+def test_constrain_correlated_noise_covariance_is_structured_psd() -> None:
+    """The exact CNM constraint keeps PSD and yields reconstructable blocks."""
+    raw_factor = jnp.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.3, 0.8, 0.0, 0.0],
+            [0.2, -0.1, 0.7, 0.0],
+            [0.4, 0.2, -0.3, 0.6],
+        ]
+    )
+    residual_cov = raw_factor @ raw_factor.T
+    constrained = constrain_correlated_noise_process_covariance(residual_cov)
+
+    np.testing.assert_allclose(constrained, constrained.T, atol=1e-12)
+    assert float(jnp.min(jnp.linalg.eigvalsh(constrained))) >= 1e-8 - 1e-12
+
+    blocks = constrained.reshape(2, 2, 2, 2).transpose(0, 2, 1, 3)
+    for i in range(2):
+        np.testing.assert_allclose(
+            blocks[i, i], 0.5 * jnp.trace(blocks[i, i]) * jnp.eye(2), atol=1e-12
+        )
+    upper = blocks[0, 1]
+    np.testing.assert_allclose(upper[0, 0], upper[1, 1], atol=1e-12)
+    np.testing.assert_allclose(upper[0, 1], -upper[1, 0], atol=1e-12)
+    np.testing.assert_allclose(blocks[1, 0], upper.T, atol=1e-12)
 
 
 def test_get_block_slice():

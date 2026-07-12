@@ -407,6 +407,40 @@ class TestCorrelatedNoisePointProcessModel:
         assert model.n_neurons == cnm_pp_params["n_neurons"]
         assert model.n_discrete_states == cnm_pp_params["n_discrete_states"]
 
+    def test_constrained_mstep_is_opt_in(self, cnm_pp_params) -> None:
+        default = CorrelatedNoisePointProcessModel(**cnm_pp_params)
+        constrained = CorrelatedNoisePointProcessModel(
+            **cnm_pp_params, use_reparameterized_mstep=True
+        )
+        assert default.use_reparameterized_mstep is False
+        assert constrained.use_reparameterized_mstep is True
+
+    @pytest.mark.slow
+    def test_constrained_mstep_fits_psd_reconstructable_q(
+        self, cnm_pp_params, synthetic_spikes
+    ) -> None:
+        model = CorrelatedNoisePointProcessModel(
+            **cnm_pp_params, use_reparameterized_mstep=True
+        )
+        log_likelihoods = model.fit(
+            synthetic_spikes, max_iter=3, key=jax.random.PRNGKey(0)
+        )
+        assert all(np.isfinite(log_likelihoods))
+
+        from state_space_practice.oscillator_utils import (
+            construct_correlated_noise_process_covariance,
+        )
+
+        for j in range(model.n_discrete_states):
+            Q = model.process_cov[..., j]
+            assert float(jnp.min(jnp.linalg.eigvalsh(Q))) >= 1e-8 - 1e-10
+            reconstructed = construct_correlated_noise_process_covariance(
+                model.process_variance[..., j],
+                model.phase_difference[..., j],
+                model.coupling_strength[..., j],
+            )
+            np.testing.assert_allclose(Q, reconstructed, atol=1e-8)
+
     def test_lower_triangle_pair_params_are_canonicalized(self, cnm_pp_params) -> None:
         params = dict(cnm_pp_params)
         n_disc = params["n_discrete_states"]
@@ -494,7 +528,11 @@ class TestCorrelatedNoisePointProcessModel:
         assert all(np.isfinite(ll) for ll in log_likelihoods)
 
     def test_projection_preserves_psd(self, cnm_pp_params, synthetic_spikes) -> None:
-        """After projection, Q should remain PSD."""
+        """Default projection leaves a PSD Q reconstructable from public params."""
+        from state_space_practice.oscillator_utils import (
+            construct_correlated_noise_process_covariance,
+        )
+
         model = CorrelatedNoisePointProcessModel(**cnm_pp_params)
         model._initialize_parameters(jax.random.PRNGKey(0))
 
@@ -504,8 +542,15 @@ class TestCorrelatedNoisePointProcessModel:
         model._project_parameters()
 
         for j in range(model.n_discrete_states):
-            eigvals = jnp.linalg.eigvalsh(model.process_cov[..., j])
+            Q = model.process_cov[..., j]
+            eigvals = jnp.linalg.eigvalsh(Q)
             assert jnp.all(eigvals >= -1e-10)
+            reconstructed = construct_correlated_noise_process_covariance(
+                model.process_variance[..., j],
+                model.phase_difference[..., j],
+                model.coupling_strength[..., j],
+            )
+            np.testing.assert_allclose(Q, reconstructed, atol=1e-8)
 
     @pytest.mark.slow
     def test_sgd_loss_finite_and_differentiable_at_indefinite_coupling(

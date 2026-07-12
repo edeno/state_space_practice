@@ -295,6 +295,40 @@ class TestCorrelatedNoiseModel:
         assert model.n_oscillators == correlated_noise_params["n_oscillators"]
         assert model.n_sources == model.n_oscillators  # CNM constraint
 
+    def test_constrained_mstep_is_opt_in(self, correlated_noise_params) -> None:
+        default = CorrelatedNoiseModel(**correlated_noise_params)
+        constrained = CorrelatedNoiseModel(
+            **correlated_noise_params, use_reparameterized_mstep=True
+        )
+        assert default.use_reparameterized_mstep is False
+        assert constrained.use_reparameterized_mstep is True
+
+    @pytest.mark.slow
+    def test_constrained_mstep_fits_psd_reconstructable_q(
+        self, correlated_noise_params, synthetic_observations
+    ) -> None:
+        model = CorrelatedNoiseModel(
+            **correlated_noise_params, use_reparameterized_mstep=True
+        )
+        log_likelihoods = model.fit(
+            synthetic_observations, key=jax.random.PRNGKey(0), max_iter=3
+        )
+        assert all(np.isfinite(log_likelihoods))
+
+        from state_space_practice.oscillator_utils import (
+            construct_correlated_noise_process_covariance,
+        )
+
+        for j in range(model.n_discrete_states):
+            Q = model.process_cov[..., j]
+            assert float(jnp.min(jnp.linalg.eigvalsh(Q))) >= 1e-8 - 1e-10
+            reconstructed = construct_correlated_noise_process_covariance(
+                model.process_variance[..., j],
+                model.phase_difference[..., j],
+                model.coupling_strength[..., j],
+            )
+            np.testing.assert_allclose(Q, reconstructed, atol=1e-9)
+
     def test_n_sources_equals_n_oscillators(self, correlated_noise_params) -> None:
         """For CNM, n_sources must equal n_oscillators."""
         model = CorrelatedNoiseModel(**correlated_noise_params)
@@ -404,14 +438,7 @@ class TestCorrelatedNoiseModel:
     def test_project_parameters_produces_symmetric_psd(
         self, correlated_noise_params
     ) -> None:
-        """_project_parameters must yield a valid (symmetric PSD) covariance.
-
-        The M-step can perturb Q off symmetry and off the PSD cone; the
-        projection symmetrizes and floors the eigenvalues so the result is a
-        covariance the Cholesky-based switching filter can consume. (A per-block
-        rotation projection is deliberately not used -- a rotation is not a valid
-        covariance block and would re-break the cross-block symmetry.)
-        """
+        """Projection must restore the structured symmetric PSD CNM family."""
         model = CorrelatedNoiseModel(**correlated_noise_params)
         model._initialize_parameters(jax.random.PRNGKey(0))
 

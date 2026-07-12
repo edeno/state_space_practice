@@ -906,6 +906,51 @@ def project_correlated_noise_process_covariance(
     return diag_only + lo * off_diag
 
 
+def constrain_correlated_noise_process_covariance(
+    process_covariance: jax.Array,
+    min_eigenvalue: float = 1e-8,
+) -> jax.Array:
+    """Return the exact PSD CNM projection of a residual covariance.
+
+    CNM covariances are the real representation of a proper complex covariance:
+    every diagonal 2x2 block is ``variance * I`` and every upper cross-block is
+    ``coupling * R(phase)``, with its transpose in the lower block.  The
+    orthogonal projection onto that linear family is the group average
+
+    ``0.5 * (S + J @ S @ J.T)``,
+
+    where ``J`` is block diagonal with a 90-degree rotation in each oscillator
+    block.  Because this is an average of two PSD matrices, it preserves PSD
+    whenever ``S`` is PSD.  It is also the exact constrained covariance M-step:
+    for a CNM covariance ``Q``, ``Q**-1`` is in the same linear family, so the
+    Gaussian covariance objective depends on ``S`` only through this projection.
+
+    A final isotropic lift handles roundoff or slightly indefinite approximate
+    GPB sufficient statistics without leaving the CNM family.
+    """
+    cov = jnp.asarray(process_covariance)
+    if cov.ndim != 2 or cov.shape[0] != cov.shape[1] or cov.shape[0] % 2:
+        raise ValueError(
+            "process_covariance must be a square 2D matrix with even dimensions."
+        )
+    if min_eigenvalue < 0.0:
+        raise ValueError("min_eigenvalue must be non-negative.")
+
+    cov = 0.5 * (cov + cov.T)
+    n_oscillators = cov.shape[0] // 2
+    quarter_turn = jnp.array([[0.0, -1.0], [1.0, 0.0]], dtype=cov.dtype)
+    complex_structure = jnp.kron(jnp.eye(n_oscillators, dtype=cov.dtype), quarter_turn)
+    constrained = 0.5 * (cov + complex_structure @ cov @ complex_structure.T)
+    constrained = 0.5 * (constrained + constrained.T)
+
+    min_eig = jnp.min(jnp.linalg.eigvalsh(constrained))
+    lift = jnp.maximum(
+        jnp.asarray(min_eigenvalue, dtype=cov.dtype) - min_eig,
+        jnp.asarray(0.0, dtype=cov.dtype),
+    )
+    return constrained + lift * jnp.eye(constrained.shape[0], dtype=cov.dtype)
+
+
 def extract_correlated_noise_params_from_covariance(
     process_covariance: jax.Array,
     n_oscillators: int,

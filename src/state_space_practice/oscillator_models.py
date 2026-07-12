@@ -45,6 +45,7 @@ from jax.typing import ArrayLike
 
 from state_space_practice.oscillator_utils import (
     canonicalize_correlated_noise_pair_parameters,
+    constrain_correlated_noise_process_covariance,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
     construct_correlated_noise_measurement_matrix,
@@ -59,6 +60,7 @@ from state_space_practice.oscillator_utils import (
     project_coupled_transition_matrix,
 )
 from state_space_practice.switching_kalman import (
+    compute_process_covariance_sufficient_stats,
     compute_transition_sufficient_stats,
     optimize_dim_transition_params_joint,
     switching_kalman_filter,
@@ -1484,6 +1486,12 @@ class CorrelatedNoiseModel(BaseModel):
         may be supplied in the strict upper triangle, strict lower triangle, or
         both triangles if the two entries agree; values are stored canonically in
         the strict upper triangle.
+    use_reparameterized_mstep : bool, default=False
+        If True, use the exact joint constrained CNM covariance M-step. It
+        updates variance, coupling, and phase together from the fixed-transition
+        residual covariance while guaranteeing CNM block structure and positive
+        semidefiniteness. If False, retain the generic covariance M-step followed
+        by structural projection.
     """
 
     def __init__(
@@ -1497,6 +1505,7 @@ class CorrelatedNoiseModel(BaseModel):
         measurement_variance: float,
         phase_difference: jax.Array,
         coupling_strength: jax.Array,
+        use_reparameterized_mstep: bool = False,
         **kwargs,
     ):
         # n_sources is fixed to n_oscillators for CNM (passed to super below).
@@ -1547,6 +1556,7 @@ class CorrelatedNoiseModel(BaseModel):
         self.measurement_variance = measurement_variance
         self.phase_difference = phase_difference
         self.coupling_strength = coupling_strength
+        self.use_reparameterized_mstep = use_reparameterized_mstep
 
         # CNM specific M-step update flags
         self.update_continuous_transition_matrix = False
@@ -1609,6 +1619,10 @@ class CorrelatedNoiseModel(BaseModel):
         symmetric scaled-rotation cross-blocks, so project back to that
         structure and update the public scientific parameters accordingly.
         """
+        if self.use_reparameterized_mstep:
+            self._m_step_constrained_process_covariance()
+            return
+
         self.process_cov = jnp.stack(
             [
                 project_correlated_noise_process_covariance(self.process_cov[..., j])
@@ -1616,6 +1630,46 @@ class CorrelatedNoiseModel(BaseModel):
             ],
             axis=-1,
         )
+        self._sync_process_covariance_params()
+
+    def _m_step_constrained_process_covariance(self) -> None:
+        """Install the exact fixed-A, PSD, jointly constrained CNM Q update."""
+        assert self.smoother_state_cond_mean is not None
+        assert self.smoother_state_cond_cov is not None
+        assert self.smoother_discrete_state_prob is not None
+        assert self.smoother_joint_discrete_state_prob is not None
+        assert self.smoother_pair_cond_cross_cov is not None
+
+        residual_scatter, state_counts = compute_process_covariance_sufficient_stats(
+            continuous_transition_matrix=self.continuous_transition_matrix,
+            state_cond_smoother_means=self.smoother_state_cond_mean,
+            state_cond_smoother_covs=self.smoother_state_cond_cov,
+            smoother_discrete_state_prob=self.smoother_discrete_state_prob,
+            smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
+            pair_cond_smoother_means=self.smoother_pair_cond_means,
+            pair_cond_smoother_covs=self.smoother_pair_cond_covs,
+            next_pair_cond_smoother_means=self.smoother_next_pair_cond_means,
+        )
+
+        previous = jnp.stack(
+            [
+                construct_correlated_noise_process_covariance(
+                    variance=self.process_variance[..., j],
+                    phase_difference=self.phase_difference[..., j],
+                    coupling_strength=self.coupling_strength[..., j],
+                )
+                for j in range(self.n_discrete_states)
+            ],
+            axis=-1,
+        )
+        updated = []
+        for j in range(self.n_discrete_states):
+            count = state_counts[j]
+            target = residual_scatter[..., j] / jnp.maximum(count, 1e-12)
+            constrained = constrain_correlated_noise_process_covariance(target)
+            updated.append(jnp.where(count > 1e-8, constrained, previous[..., j]))
+        self.process_cov = jnp.stack(updated, axis=-1)
         self._sync_process_covariance_params()
 
     def _sync_process_covariance_params(self) -> None:

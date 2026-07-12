@@ -41,6 +41,7 @@ from state_space_practice.switching_kalman import (
     compute_elbo,
     compute_expected_complete_log_likelihood,
     compute_posterior_entropy,
+    compute_process_covariance_sufficient_stats,
     compute_transition_q_function,
     optimize_dim_transition_params,
     optimize_dim_transition_params_joint,
@@ -50,6 +51,39 @@ from state_space_practice.switching_kalman import (
     switching_kalman_viterbi,
     weighted_sum_of_outer_products,
 )
+
+
+def test_process_covariance_stats_use_the_fixed_transition_matrix() -> None:
+    """CNM residual scatter must use its fixed A, not the unconstrained A MLE."""
+    means = jnp.array(
+        [
+            [[1.0], [0.0]],
+            [[0.5], [1.0]],
+            [[-0.25], [0.75]],
+        ]
+    )
+    covs = jnp.zeros((3, 2, 2, 1))
+    probs = jnp.ones((3, 1))
+    joint = jnp.ones((2, 1, 1))
+    cross_cov = jnp.zeros((2, 2, 2, 1, 1))
+    A = jnp.array([[0.8, -0.2], [0.2, 0.8]])[:, :, None]
+
+    scatter, counts = compute_process_covariance_sufficient_stats(
+        continuous_transition_matrix=A,
+        state_cond_smoother_means=means,
+        state_cond_smoother_covs=covs,
+        smoother_discrete_state_prob=probs,
+        smoother_joint_discrete_state_prob=joint,
+        pair_cond_smoother_cross_cov=cross_cov,
+    )
+
+    residuals = jnp.stack(
+        [means[t + 1, :, 0] - A[:, :, 0] @ means[t, :, 0] for t in range(2)]
+    )
+    expected = residuals.T @ residuals
+    np.testing.assert_allclose(scatter[..., 0], expected, atol=1e-12)
+    np.testing.assert_allclose(counts, jnp.array([2.0]), atol=0.0)
+
 
 # --- Fixtures ---
 

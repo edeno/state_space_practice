@@ -3100,6 +3100,63 @@ def compute_transition_sufficient_stats(
     return gamma1, beta
 
 
+def compute_process_covariance_sufficient_stats(
+    continuous_transition_matrix: jax.Array,
+    state_cond_smoother_means: jax.Array,
+    state_cond_smoother_covs: jax.Array,
+    smoother_discrete_state_prob: jax.Array,
+    smoother_joint_discrete_state_prob: jax.Array,
+    pair_cond_smoother_cross_cov: jax.Array,
+    pair_cond_smoother_means: jax.Array | None = None,
+    pair_cond_smoother_covs: jax.Array | None = None,
+    next_pair_cond_smoother_means: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Compute fixed-transition residual scatter for a constrained Q M-step.
+
+    The generic switching M-step estimates ``A`` and then uses the simplifying
+    identity valid at that unconstrained optimum.  Models such as CNM keep ``A``
+    fixed, so their process-noise update instead needs the complete residual
+    second moment
+
+    ``S = Gamma2 - A Beta.T - Beta A.T + A Gamma1 A.T``.
+
+    Returns the unnormalized per-state residual scatter and the corresponding
+    destination-state counts.  Optional GPB2 pair-conditioned statistics are
+    forwarded to the shared transition-statistics implementation.
+    """
+    gamma1, beta = compute_transition_sufficient_stats(
+        state_cond_smoother_means=state_cond_smoother_means,
+        state_cond_smoother_covs=state_cond_smoother_covs,
+        smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
+        pair_cond_smoother_cross_cov=pair_cond_smoother_cross_cov,
+        pair_cond_smoother_means=pair_cond_smoother_means,
+        pair_cond_smoother_covs=pair_cond_smoother_covs,
+        next_pair_cond_smoother_means=next_pair_cond_smoother_means,
+    )
+
+    weights = smoother_discrete_state_prob[1:]
+    gamma2 = jnp.sum(
+        state_cond_smoother_covs[1:] * weights[:, None, None, :], axis=0
+    ) + jnp.einsum(
+        "tai,tbi,ti->abi",
+        state_cond_smoother_means[1:],
+        state_cond_smoother_means[1:],
+        weights,
+    )
+    state_counts = jnp.sum(weights, axis=0)
+
+    def residual_scatter(
+        A: jax.Array, gamma1_j: jax.Array, beta_j: jax.Array, gamma2_j: jax.Array
+    ) -> jax.Array:
+        residual = gamma2_j - A @ beta_j.T - beta_j @ A.T + A @ gamma1_j @ A.T
+        return 0.5 * (residual + residual.T)
+
+    scatter = jax.vmap(residual_scatter, in_axes=(-1, -1, -1, -1), out_axes=-1)(
+        continuous_transition_matrix, gamma1, beta, gamma2
+    )
+    return scatter, state_counts
+
+
 def compute_transition_q_function(
     A: jax.Array,
     gamma1: jax.Array,
