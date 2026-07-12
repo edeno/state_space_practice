@@ -1712,6 +1712,12 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
 
     def _m_step_constrained_process_covariance(self) -> None:
         """Install the exact fixed-A, PSD, jointly constrained CNM Q update."""
+        assert self.smoother_state_cond_mean is not None
+        assert self.smoother_state_cond_cov is not None
+        assert self.smoother_discrete_state_prob is not None
+        assert self.smoother_joint_discrete_state_prob is not None
+        assert self.smoother_pair_cond_cross_cov is not None
+
         residual_scatter, state_counts = compute_process_covariance_sufficient_stats(
             continuous_transition_matrix=self.continuous_transition_matrix,
             state_cond_smoother_means=self.smoother_state_cond_mean,

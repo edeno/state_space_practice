@@ -314,6 +314,10 @@ class TestCorrelatedNoiseModel:
             synthetic_observations, key=jax.random.PRNGKey(0), max_iter=3
         )
         assert all(np.isfinite(log_likelihoods))
+        # The constrained covariance update is the exact M-step optimum, so EM
+        # log-likelihood is non-decreasing.
+        diffs = np.diff(np.asarray(log_likelihoods, dtype=float))
+        assert np.all(diffs >= -1e-6), f"LL decreases: {diffs}"
 
         from state_space_practice.oscillator_utils import (
             construct_correlated_noise_process_covariance,
