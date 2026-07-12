@@ -84,6 +84,33 @@ def _linear_log_intensity(state: Array, params: SpikeObsParams) -> Array:
     return params.baseline + params.weights @ state
 
 
+def _validate_oscillator_parameters(
+    freqs: Array, damping_coef: Array, process_variance: Array
+) -> None:
+    """Validate shared oscillator parameters at public model boundaries.
+
+    Mirrors the Gaussian oscillator models (``CommonOscillatorModel``,
+    ``CorrelatedNoiseModel``, ``DirectedInfluenceModel``): frequencies must be
+    finite, damping must be finite and lie in ``[0, 1]``, and process variance
+    must be finite and non-negative. Otherwise these flow into a NaN or
+    unstable transition/process matrix undetected. Shape validation is left to
+    the caller (it is model-specific).
+    """
+    freqs = jnp.asarray(freqs)
+    damping_coef = jnp.asarray(damping_coef)
+    process_variance = jnp.asarray(process_variance)
+    if not bool(jnp.all(jnp.isfinite(freqs))):
+        raise ValueError("freqs must contain only finite values.")
+    if not bool(jnp.all(jnp.isfinite(damping_coef))):
+        raise ValueError("damping_coef must contain only finite values.")
+    if bool(jnp.any((damping_coef < 0) | (damping_coef > 1))):
+        raise ValueError("damping_coef entries must lie in [0, 1].")
+    if not bool(jnp.all(jnp.isfinite(process_variance))):
+        raise ValueError("process_variance must contain only finite values.")
+    if bool(jnp.any(process_variance < 0)):
+        raise ValueError("process_variance must be non-negative.")
+
+
 class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
     """Abstract base class for switching oscillator models with spike observations.
 
@@ -1374,6 +1401,7 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
             raise ValueError(
                 f"process_variance shape {process_variance.shape} != ({n_oscillators},)"
             )
+        _validate_oscillator_parameters(freqs, damping_coef, process_variance)
 
         self.freqs = freqs
         self.damping_coef = damping_coef
@@ -1609,6 +1637,7 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
                 f"coupling_strength shape {coupling_strength.shape} "
                 f"!= ({n_oscillators}, {n_oscillators}, {n_discrete_states})"
             )
+        _validate_oscillator_parameters(freqs, damping_coef, process_variance)
 
         phase_difference, coupling_strength = (
             canonicalize_correlated_noise_pair_parameters(
@@ -1861,23 +1890,7 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
                 f"process_variance shape {process_variance.shape} != ({n_oscillators},)"
             )
 
-        # Value validation mirroring the Gaussian DirectedInfluenceModel: reject
-        # non-finite frequencies, damping outside [0, 1] (e.g. negative), and
-        # negative process variance -- otherwise these flow into a NaN or
-        # unstable transition matrix undetected.
-        freqs = jnp.asarray(freqs)
-        damping_coef = jnp.asarray(damping_coef)
-        process_variance = jnp.asarray(process_variance)
-        if not bool(jnp.all(jnp.isfinite(freqs))):
-            raise ValueError("freqs must contain only finite values.")
-        if not bool(jnp.all(jnp.isfinite(damping_coef))):
-            raise ValueError("damping_coef must contain only finite values.")
-        if bool(jnp.any((damping_coef < 0) | (damping_coef > 1))):
-            raise ValueError("damping_coef entries must lie in [0, 1].")
-        if not bool(jnp.all(jnp.isfinite(process_variance))):
-            raise ValueError("process_variance must contain only finite values.")
-        if bool(jnp.any(process_variance < 0)):
-            raise ValueError("process_variance must be non-negative.")
+        _validate_oscillator_parameters(freqs, damping_coef, process_variance)
 
         if phase_difference.shape != (
             n_oscillators,

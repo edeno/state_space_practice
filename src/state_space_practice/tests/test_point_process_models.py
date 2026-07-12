@@ -1207,6 +1207,57 @@ class TestInputValidation:
         with pytest.raises(ValueError, match=r"process_variance must be non-negative"):
             DirectedInfluencePointProcessModel(**params)
 
+    @pytest.mark.parametrize(
+        "field, bad_value, match",
+        [
+            ("damping_coef", [-0.1, 0.95], r"damping_coef entries must lie in"),
+            ("damping_coef", [0.95, 1.5], r"damping_coef entries must lie in"),
+            (
+                "damping_coef",
+                [0.95, float("inf")],
+                r"damping_coef must contain only finite",
+            ),
+            ("freqs", [8.0, float("nan")], r"freqs must contain only finite"),
+        ],
+    )
+    def test_com_pp_rejects_invalid_oscillator_params(
+        self, com_pp_params, field, bad_value, match
+    ) -> None:
+        """COM-PP must reject out-of-range/non-finite oscillator params at
+        construction, mirroring the Gaussian CommonOscillatorModel."""
+        params = dict(com_pp_params)
+        params[field] = jnp.array(bad_value)
+        with pytest.raises(ValueError, match=match):
+            CommonOscillatorPointProcessModel(**params)
+
+    @pytest.mark.parametrize(
+        "field, bad_value, match",
+        [
+            ("damping_coef", [-0.1, 0.95], r"damping_coef entries must lie in"),
+            ("damping_coef", [0.95, 1.5], r"damping_coef entries must lie in"),
+            (
+                "damping_coef",
+                [0.95, float("inf")],
+                r"damping_coef must contain only finite",
+            ),
+            ("freqs", [8.0, float("nan")], r"freqs must contain only finite"),
+            (
+                "process_variance",
+                [[-0.1, 0.1, 0.1], [0.1, 0.1, 0.1]],
+                r"process_variance must be non-negative",
+            ),
+        ],
+    )
+    def test_cnm_pp_rejects_invalid_oscillator_params(
+        self, cnm_pp_params, field, bad_value, match
+    ) -> None:
+        """CNM-PP must reject out-of-range/non-finite oscillator params at
+        construction, mirroring the Gaussian CorrelatedNoiseModel."""
+        params = dict(cnm_pp_params)
+        params[field] = jnp.array(bad_value)
+        with pytest.raises(ValueError, match=match):
+            CorrelatedNoisePointProcessModel(**params)
+
     def test_invalid_spikes_shape(self, com_pp_params) -> None:
         model = CommonOscillatorPointProcessModel(**com_pp_params)
         wrong_spikes = jnp.zeros((100, 3))  # Wrong n_neurons
@@ -1399,14 +1450,12 @@ class TestPointProcessValidation:
             CommonOscillatorPointProcessModel(**params)
 
     def test_rejects_negative_process_variance(self, com_pp_params):
-        # Negative variance -> indefinite diagonal Q. process_cov is built and
-        # validated in _initialize_parameters (fit-time setup), before the EM
-        # loop, so it is caught there rather than at __init__.
+        # Negative variance is now rejected at construction by the shared
+        # oscillator-parameter validator, before process_cov is ever built.
         params = dict(com_pp_params)
         params["process_variance"] = jnp.array([-0.1, 0.1])
-        model = CommonOscillatorPointProcessModel(**params)
-        with pytest.raises(ValueError, match="process_cov"):
-            model._initialize_parameters(jax.random.PRNGKey(0))
+        with pytest.raises(ValueError, match="process_variance must be non-negative"):
+            CommonOscillatorPointProcessModel(**params)
 
     def test_cnm_rejects_indefinite_process_cov(self, cnm_pp_params):
         # Coupling magnitude above the process variance makes the (symmetric)
