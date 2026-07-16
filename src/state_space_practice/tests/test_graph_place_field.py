@@ -407,3 +407,46 @@ def test_static_glm_multineuron_matches_per_neuron(small_grid_env):
     for j in range(3):
         w_j, _ = fit_static_graph_glm(counts[:, j], occ, basis.eigvecs, prec)
         np.testing.assert_allclose(np.asarray(w_multi[j]), np.asarray(w_j), atol=1e-8)
+
+
+# --------------------------------------------------------------------------- evidence
+from state_space_practice.graph_place_field import (  # noqa: E402
+    select_tau2_by_evidence,
+    static_log_evidence,
+)
+
+
+def _simulate_smooth_counts(basis, rng, tau2_gen, occ_val=5.0):
+    """Per-bin counts from w ~ N(0, tau2_gen * S), rate = exp(Phi w)."""
+    from state_space_practice.graph_place_field import spectral_shape
+
+    S = spectral_shape(basis.eigvals, kappa2=1e-2, alpha=1.0)
+    rank = basis.eigvecs.shape[1]
+    w = rng.standard_normal(rank) * np.sqrt(tau2_gen * S)
+    eta = basis.eigvecs @ w
+    n_bins = basis.eigvecs.shape[0]
+    occ = np.full(n_bins, occ_val)
+    counts = rng.poisson(np.exp(eta) * occ).astype(float)
+    return counts, occ
+
+
+def test_evidence_is_maximized_near_selected_tau2(small_grid_env):
+    from state_space_practice.graph_place_field import build_graph_basis
+
+    basis = build_graph_basis(small_grid_env, rank=12)
+    rng = np.random.default_rng(3)
+    counts, occ = _simulate_smooth_counts(basis, rng, tau2_gen=1.0)
+    tau2_hat = select_tau2_by_evidence(counts, occ, basis, kappa2=1e-2, alpha=1.0)
+    ev_at = static_log_evidence(
+        counts, occ, basis.eigvecs, basis.eigvals, tau2=tau2_hat, kappa2=1e-2
+    )
+    # The selected tau2 beats both a 10x-too-large and a 10x-too-small amplitude.
+    ev_hi = static_log_evidence(
+        counts, occ, basis.eigvecs, basis.eigvals, tau2=10 * tau2_hat, kappa2=1e-2
+    )
+    ev_lo = static_log_evidence(
+        counts, occ, basis.eigvecs, basis.eigvals, tau2=0.1 * tau2_hat, kappa2=1e-2
+    )
+    assert ev_at >= ev_hi
+    assert ev_at >= ev_lo
+    assert 1e-4 < tau2_hat < 1e4  # inside the search bounds (not railed)

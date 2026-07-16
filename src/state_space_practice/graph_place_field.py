@@ -40,6 +40,7 @@ import jax.numpy as jnp
 import networkx as nx
 import numpy as np
 import scipy.linalg
+import scipy.optimize
 import scipy.sparse as sp
 from jax import Array
 from jax.typing import ArrayLike
@@ -65,6 +66,8 @@ __all__ = [
     "spectral_precision",
     "parity_penalty",
     "fit_static_graph_glm",
+    "static_log_evidence",
+    "select_tau2_by_evidence",
 ]
 
 # Attribute used to cache the full eigensystem on an Environment instance (keyed by the
@@ -727,3 +730,77 @@ def fit_static_graph_glm(
     if single:
         return weights[0], cov[0]
     return weights, cov
+
+
+def static_log_evidence(
+    counts: ArrayLike,
+    occupancy: ArrayLike,
+    eigvecs: ArrayLike,
+    eigvals: ArrayLike,
+    *,
+    tau2: float,
+    kappa2: float,
+    alpha: float = 1.0,
+) -> float:
+    """Laplace log-evidence of the static graph GLM at amplitude ``tau2``.
+
+    ``log Z(tau2) ~ [y.eta - mu] - 0.5 w^T Lam w + 0.5 logdet(Lam) - 0.5 logdet(H)``
+    evaluated at the MAP ``w``, with ``Lam = P0^{-1}`` the spectral precision and
+    ``H = Phi^T diag(mu) Phi + Lam``. Constant ``log(count!)`` terms are dropped (they
+    do not depend on ``tau2``). Summed over neurons for multi-neuron ``counts``.
+    """
+    Phi = jnp.asarray(eigvecs)
+    occ = jnp.asarray(occupancy)
+    counts_arr = jnp.asarray(counts)
+    single = counts_arr.ndim == 1
+    counts_2d = counts_arr[:, None] if single else counts_arr
+    prec = jnp.asarray(spectral_precision(np.asarray(eigvals), tau2, kappa2, alpha))
+    Lam = jnp.diag(prec)
+    weights, _ = fit_static_graph_glm(counts_arr, occ, Phi, prec)
+    weights_2d = weights[None, :] if single else weights
+    visited = occ > 0
+    log_occ = jnp.where(visited, jnp.log(jnp.where(visited, occ, 1.0)), 0.0)
+    # logdet(Lam) is constant across neurons; sign of prec is positive.
+    logdet_lam = jnp.sum(jnp.log(prec))
+
+    def _one(w: Array, y: Array) -> Array:
+        eta = Phi @ w + log_occ
+        mu = jnp.where(visited, jnp.exp(eta), 0.0)
+        data_term = jnp.sum(jnp.where(visited, y * eta - mu, 0.0))
+        hess = Phi.T @ (mu[:, None] * Phi) + Lam
+        _, logdet_h = jnp.linalg.slogdet(hess)
+        return data_term - 0.5 * (w @ (prec * w)) + 0.5 * logdet_lam - 0.5 * logdet_h
+
+    ev = jax.vmap(_one, in_axes=(0, 1))(weights_2d, counts_2d.astype(Phi.dtype))
+    return float(jnp.sum(ev))
+
+
+def select_tau2_by_evidence(
+    counts: ArrayLike,
+    occupancy: ArrayLike,
+    basis: GraphBasis,
+    *,
+    kappa2: float,
+    alpha: float = 1.0,
+    bounds: tuple[float, float] = (1e-4, 1e4),
+) -> float:
+    """Return the ``tau2`` maximizing :func:`static_log_evidence`.
+
+    Optimizes over ``log tau2`` with a bounded scalar optimizer (the evidence is smooth
+    and unimodal in ``log tau2`` for a fixed ``kappa2``).
+    """
+    lo, hi = np.log(bounds[0]), np.log(bounds[1])
+
+    def _neg_ev(log_tau2: float) -> float:
+        return -static_log_evidence(
+            counts,
+            occupancy,
+            basis.eigvecs,
+            basis.eigvals,
+            tau2=float(np.exp(log_tau2)),
+            kappa2=kappa2,
+            alpha=alpha,
+        )
+
+    result = scipy.optimize.minimize_scalar(_neg_ev, bounds=(lo, hi), method="bounded")
+    return float(np.exp(result.x))
