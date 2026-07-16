@@ -450,3 +450,71 @@ def test_evidence_is_maximized_near_selected_tau2(small_grid_env):
     assert ev_at >= ev_hi
     assert ev_at >= ev_lo
     assert 1e-4 < tau2_hat < 1e4  # inside the search bounds (not railed)
+
+
+# --------------------------------------------------------------------------- Task 3: validation
+@pytest.mark.slow
+def test_newton_map_matches_independent_optimizer(small_grid_env):
+    """Our Newton MAP equals a scipy L-BFGS optimum on the identical penalized NLL."""
+    import scipy.optimize
+
+    from state_space_practice.graph_place_field import build_graph_basis
+
+    basis = build_graph_basis(small_grid_env, rank=10)
+    rng = np.random.default_rng(5)
+    occ = np.full(small_grid_env.n_bins, 4.0)
+    w_true = np.zeros(10)
+    w_true[:4] = rng.standard_normal(4)
+    counts = rng.poisson(np.exp(basis.eigvecs @ w_true) * occ).astype(float)
+    prec = spectral_precision(basis.eigvals, tau2=50.0, kappa2=1e-2, alpha=1.0)
+
+    Phi = np.asarray(basis.eigvecs)
+    log_occ = np.log(occ)
+
+    def nll(w):
+        eta = Phi @ w + log_occ
+        return float(np.sum(np.exp(eta) - counts * eta) + 0.5 * np.sum(prec * w**2))
+
+    def grad(w):
+        eta = Phi @ w + log_occ
+        mu = np.exp(eta)
+        return Phi.T @ (mu - counts) + prec * w
+
+    ref = scipy.optimize.minimize(nll, np.zeros(10), jac=grad, method="L-BFGS-B")
+    w_hat, _ = fit_static_graph_glm(counts, occ, basis.eigvecs, prec)
+    np.testing.assert_allclose(np.asarray(w_hat), ref.x, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.slow
+def test_static_field_recovers_wmaze_place_cells(w_maze_env):
+    """Recovered rate map correlates with the true place fields on the W-maze."""
+    from neurospatial.simulation import simulate_session
+
+    from state_space_practice.graph_place_field import build_graph_basis
+    from state_space_practice.preprocessing import bin_spike_times
+
+    session = simulate_session(
+        w_maze_env, duration=600.0, n_cells=6, seed=7, show_progress=False
+    )
+    dt = float(np.median(np.diff(session.times)))
+    # Bin each cell's spike times onto the position time grid.
+    counts_tc = bin_spike_times(session.spike_trains, session.times).astype(float)
+
+    basis = build_graph_basis(w_maze_env, sigma=15.0)  # bandwidth-truncated rank
+    counts_bin = bin_spike_counts(
+        w_maze_env, counts_tc, session.times, session.positions, basis
+    )
+    occ = bin_occupancy(w_maze_env, session.times, session.positions, dt)
+    tau2 = select_tau2_by_evidence(counts_bin, occ, basis, kappa2=1e-2)
+    prec = spectral_precision(basis.eigvals, tau2=tau2, kappa2=1e-2)
+    w_hat, _ = fit_static_graph_glm(counts_bin, occ, basis.eigvecs, prec)
+
+    bin_centers = np.asarray(w_maze_env.bin_centers)
+    visited = occ > 0
+    corrs = []
+    for j, model in enumerate(session.models):
+        rate_true = np.asarray(model.firing_rate(bin_centers))
+        rate_hat = np.exp(np.asarray(basis.eigvecs @ w_hat[j]))
+        corrs.append(np.corrcoef(rate_hat[visited], rate_true[visited])[0, 1])
+    # The graph-GP field tracks the true place fields on the maze.
+    assert np.median(corrs) > 0.6
