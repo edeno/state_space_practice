@@ -19,9 +19,11 @@ from state_space_practice.graph_place_field import (  # noqa: E402
     bin_occupancy,
     bin_spike_counts,
     build_graph_basis,
+    build_graph_laplacian,
     graph_design_matrix,
     laplacian_matches_distance_weight,
     spectral_shape,
+    validate_graph_laplacian,
 )
 
 
@@ -61,6 +63,62 @@ def test_laplacian_is_distance_weighted(small_grid_env):
     D = small_grid_env.get_differential_operator()
     L = (D @ D.T).toarray()
     assert not np.allclose(L, L_unw)  # guard: distance-weighting actually matters
+
+
+def test_default_laplacian_convention_is_explicit_and_backward_compatible(
+    small_grid_env,
+):
+    L_default = build_graph_laplacian(small_grid_env)
+    D = small_grid_env.get_differential_operator()
+    L_public = (D @ D.T).toarray()
+
+    np.testing.assert_allclose(L_default.toarray(), L_public, atol=1e-12)
+    basis = build_graph_basis(small_grid_env, rank=8)
+    assert basis.laplacian_convention == "distance"
+
+
+def test_inverse_distance_laplacian_uses_conductance_weights(small_grid_env):
+    L_distance = build_graph_laplacian(small_grid_env, convention="distance")
+    L_inverse = build_graph_laplacian(small_grid_env, convention="inverse_distance")
+
+    graph = small_grid_env.connectivity.copy()
+    for _source, _target, edge_data in graph.edges(data=True):
+        edge_data["test_conductance"] = 1.0 / float(edge_data["distance"])
+    expected = nx.laplacian_matrix(
+        graph,
+        nodelist=range(small_grid_env.n_bins),
+        weight="test_conductance",
+    ).toarray()
+
+    np.testing.assert_allclose(L_inverse.toarray(), expected, atol=1e-12)
+    assert not np.allclose(L_inverse.toarray(), L_distance.toarray())
+    basis = build_graph_basis(
+        small_grid_env,
+        rank=8,
+        laplacian_convention="inverse_distance",
+    )
+    assert basis.laplacian_convention == "inverse_distance"
+
+
+@pytest.mark.parametrize("convention", ["distance", "inverse_distance"])
+def test_constructed_laplacians_pass_structural_validation(small_grid_env, convention):
+    laplacian = build_graph_laplacian(small_grid_env, convention=convention)
+    validate_graph_laplacian(laplacian, n_bins=small_grid_env.n_bins)
+
+
+def test_laplacian_convention_validation_rejects_unknown_value(small_grid_env):
+    with pytest.raises(ValueError, match="laplacian convention"):
+        build_graph_laplacian(small_grid_env, convention="finite_volume")
+
+
+def test_graph_laplacian_validation_rejects_non_laplacian_matrix():
+    nonsymmetric = np.array([[1.0, -1.0], [0.0, 0.0]])
+    with pytest.raises(ValueError, match="symmetric"):
+        validate_graph_laplacian(nonsymmetric, n_bins=2)
+
+    nonzero_rows = np.array([[2.0, -1.0], [-1.0, 2.0]])
+    with pytest.raises(ValueError, match="row sums"):
+        validate_graph_laplacian(nonzero_rows, n_bins=2)
 
 
 def test_wmaze_is_connected(w_maze_env):

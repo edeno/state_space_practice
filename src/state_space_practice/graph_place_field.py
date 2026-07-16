@@ -14,21 +14,26 @@ array here — scattering to a dense plotting grid is a ``neurospatial`` concern
 
 Laplacian choice
 ----------------
-The basis is built from the **public** ``Environment.get_differential_operator()``,
-whose documented identity is ``L = D @ D.T`` — a Laplacian **weighted by edge
-``"distance"``** (``D`` uses ``sqrt(distance)`` per edge). Note ``neurospatial``'s *own*
-diffusion smoothing (``Environment.smooth``/``diffuse``) uses a different, **finite
--volume** Laplacian (exposed only privately via ``Environment._diffusion_geometry``),
-whose spectrum differs materially. We deliberately use the public, well-defined
-distance-weighted operator; if a future goal is to match ``neurospatial``'s diffusion
-convention exactly, switch to the finite-volume operator (and ideally ask upstream to
-expose it publicly). Parity checks against external estimators (e.g. the ``non_local
-_detector`` MRF) feed *our* basis to both sides, so they are robust to this choice.
+The convention is explicit rather than hidden inside the basis builder:
+
+``"distance"`` (default)
+    The public ``Environment.get_differential_operator()`` convention,
+    ``L = D @ D.T``. Its edge weights are ``distance`` because ``D`` uses
+    ``sqrt(distance)`` per edge. This preserves the original substrate behavior.
+``"inverse_distance"``
+    A conductance graph whose edge weights are ``1 / distance``. This is useful
+    for sensitivity checks because nearby bins are coupled more strongly.
+
+Both constructions are validated as finite symmetric graph Laplacians and the
+selected convention is stored in ``GraphBasis``. ``neurospatial``'s own diffusion
+smoothing uses a different finite-volume operator that is currently exposed only
+through a private API. It is deliberately not copied here under a misleading
+public name.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, cast
 
 import networkx as nx
 import numpy as np
@@ -42,16 +47,26 @@ if TYPE_CHECKING:
 
 __all__ = [
     "GraphBasis",
+    "LaplacianConvention",
+    "SUPPORTED_LAPLACIAN_CONVENTIONS",
+    "build_graph_laplacian",
     "build_graph_basis",
     "spectral_shape",
     "graph_design_matrix",
     "bin_occupancy",
     "bin_spike_counts",
+    "validate_graph_laplacian",
 ]
 
 # Attribute used to cache the full eigensystem on an Environment instance (keyed by the
 # Laplacian's identity so a re-fit environment does not reuse a stale basis).
 _CACHE_ATTR = "_graph_place_field_basis_cache"
+
+LaplacianConvention = Literal["distance", "inverse_distance"]
+SUPPORTED_LAPLACIAN_CONVENTIONS: tuple[LaplacianConvention, ...] = (
+    "distance",
+    "inverse_distance",
+)
 
 
 class GraphBasis(NamedTuple):
@@ -60,10 +75,10 @@ class GraphBasis(NamedTuple):
     Attributes
     ----------
     eigvecs : NDArray, shape (n_bins, rank)
-        Smoothest eigenvectors of ``L = D @ D.T`` as columns, ordered by ascending
-        eigenvalue. Row ``i`` is active bin ``i`` (same space as ``env.bin_sequence``).
-        On a disconnected graph the eigenvectors are component-local (zero outside
-        their connected component).
+        Smoothest eigenvectors of the selected graph Laplacian as columns,
+        ordered by ascending eigenvalue. Row ``i`` is active bin ``i`` (same
+        space as ``env.bin_sequence``). On a disconnected graph the eigenvectors
+        are component-local (zero outside their connected component).
     eigvals : NDArray, shape (rank,)
         Corresponding eigenvalues (ascending, clipped to be non-negative). The first
         ``n_components`` entries are the null modes (0 up to eigensolver round-off;
@@ -75,12 +90,12 @@ class GraphBasis(NamedTuple):
         Per-bin volume (``env.bin_sizes``) for integration/density. **Not** exposure.
     n_components : int
         Number of connected components (= number of retained null modes).
+    laplacian_convention : {"distance", "inverse_distance"}
+        Edge-weight convention used to construct the Laplacian and eigenbasis.
     env_key : tuple
-        Identity fingerprint ``(n_bins, nnz, |L|-sum)`` of the environment's Laplacian
-        this basis was built from. Consumers (:func:`graph_design_matrix`,
-        :func:`bin_spike_counts`) check it to refuse a basis built for a different
-        (or since-refit) environment, which would otherwise return silently wrong
-        design rows / counts.
+        Identity fingerprint ``(convention, n_bins, nnz, |L|-sum)`` of the
+        environment's Laplacian this basis was built from. Consumers refuse a
+        basis built for a different environment or convention.
     """
 
     eigvecs: NDArray[np.float64]
@@ -88,31 +103,152 @@ class GraphBasis(NamedTuple):
     component_labels: NDArray[np.int_]
     bin_sizes: NDArray[np.float64]
     n_components: int
-    env_key: tuple[int, int, float]
+    laplacian_convention: LaplacianConvention
+    env_key: tuple[str, int, int, float]
+
+
+def _validate_laplacian_convention(convention: str) -> LaplacianConvention:
+    """Return a supported convention or raise at the public boundary."""
+    if convention not in SUPPORTED_LAPLACIAN_CONVENTIONS:
+        supported = ", ".join(repr(value) for value in SUPPORTED_LAPLACIAN_CONVENTIONS)
+        raise ValueError(
+            f"laplacian convention must be one of {supported}; got {convention!r}. "
+            "The finite-volume operator is not exposed by neurospatial's public API."
+        )
+    return cast(LaplacianConvention, convention)
+
+
+def validate_graph_laplacian(
+    laplacian: sp.spmatrix | NDArray[np.float64],
+    *,
+    n_bins: Optional[int] = None,
+    atol: float = 1e-10,
+) -> None:
+    """Validate the structural invariants of a weighted graph Laplacian.
+
+    A finite symmetric matrix with zero row sums, non-negative diagonal, and
+    non-positive off-diagonal entries is a symmetric diagonally dominant graph
+    Laplacian and therefore positive semidefinite. These structural checks avoid
+    performing another dense eigendecomposition solely for validation.
+    """
+    if not np.isfinite(atol) or atol < 0:
+        raise ValueError(f"atol must be finite and non-negative, got {atol}.")
+    matrix = sp.csr_matrix(laplacian, dtype=float)
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError(f"graph Laplacian must be square; got shape {matrix.shape}.")
+    if matrix.shape[0] == 0:
+        raise ValueError("graph Laplacian must contain at least one bin.")
+    if n_bins is not None and matrix.shape != (n_bins, n_bins):
+        raise ValueError(
+            f"graph Laplacian must have shape ({n_bins}, {n_bins}); got {matrix.shape}."
+        )
+    if matrix.data.size and not np.all(np.isfinite(matrix.data)):
+        raise ValueError("graph Laplacian must contain only finite values.")
+
+    max_abs = float(np.max(np.abs(matrix.data))) if matrix.data.size else 0.0
+    threshold = atol * max(1.0, max_abs)
+
+    skew = matrix - matrix.T
+    skew_max = float(np.max(np.abs(skew.data))) if skew.data.size else 0.0
+    if skew_max > threshold:
+        raise ValueError(
+            f"graph Laplacian must be symmetric; maximum asymmetry is {skew_max:.3g}."
+        )
+
+    row_sums = np.asarray(matrix.sum(axis=1)).ravel()
+    row_sum_max = float(np.max(np.abs(row_sums)))
+    if row_sum_max > threshold:
+        raise ValueError(
+            "graph Laplacian row sums must be zero; "
+            f"maximum absolute row sum is {row_sum_max:.3g}."
+        )
+
+    diagonal = matrix.diagonal()
+    if np.any(diagonal < -threshold):
+        raise ValueError("graph Laplacian diagonal entries must be non-negative.")
+    coo = matrix.tocoo()
+    off_diagonal = coo.data[coo.row != coo.col]
+    if off_diagonal.size and np.any(off_diagonal > threshold):
+        raise ValueError("graph Laplacian off-diagonal entries must be non-positive.")
+
+
+def _inverse_distance_laplacian(env: "Environment") -> sp.csr_matrix:
+    """Construct a conductance Laplacian with edge weight ``1 / distance``."""
+    graph = env.connectivity.copy()
+    if graph.is_directed():
+        raise ValueError("environment connectivity must be an undirected graph.")
+    weight_name = "_state_space_practice_inverse_distance"
+    for source, target, edge_data in graph.edges(data=True):
+        if "distance" not in edge_data:
+            raise ValueError(
+                f"edge ({source}, {target}) is missing the required 'distance' "
+                "attribute for inverse-distance weighting."
+            )
+        distance = float(edge_data["distance"])
+        if not np.isfinite(distance) or distance <= 0:
+            raise ValueError(
+                f"edge ({source}, {target}) distance must be positive and finite; "
+                f"got {distance}."
+            )
+        edge_data[weight_name] = 1.0 / distance
+    return sp.csr_matrix(
+        nx.laplacian_matrix(
+            graph,
+            nodelist=range(env.n_bins),
+            weight=weight_name,
+        ),
+        dtype=float,
+    )
+
+
+def build_graph_laplacian(
+    env: "Environment",
+    convention: LaplacianConvention = "distance",
+) -> sp.csr_matrix:
+    """Build and validate the environment graph Laplacian.
+
+    ``"distance"`` uses the public ``D @ D.T`` operator and preserves the
+    original substrate behavior. ``"inverse_distance"`` treats reciprocal edge
+    distance as graph conductance.
+    """
+    convention = _validate_laplacian_convention(convention)
+    if convention == "distance":
+        differential_operator = env.get_differential_operator()
+        laplacian = sp.csr_matrix(
+            differential_operator @ differential_operator.T, dtype=float
+        )
+    else:
+        laplacian = _inverse_distance_laplacian(env)
+    validate_graph_laplacian(laplacian, n_bins=env.n_bins)
+    return laplacian
 
 
 def _distance_weighted_laplacian(env: "Environment") -> sp.csr_matrix:
-    """Return ``L = D @ D.T`` (distance-weighted graph Laplacian) as CSR."""
-    D = env.get_differential_operator()
-    return (D @ D.T).tocsr()
+    """Compatibility helper for the default ``L = D @ D.T`` convention."""
+    return build_graph_laplacian(env, convention="distance")
 
 
-def _laplacian_key(laplacian: sp.spmatrix) -> tuple[int, int, float]:
-    """Cheap identity fingerprint of a Laplacian: ``(n_bins, nnz, |data|-sum)``.
+def _laplacian_key(
+    laplacian: sp.spmatrix, convention: LaplacianConvention
+) -> tuple[str, int, int, float]:
+    """Cheap identity fingerprint including the selected convention.
 
     ``abs`` because a graph Laplacian's signed entries sum to ~0; the absolute-value
     sum distinguishes different edge weightings at the same sparsity pattern.
     """
     return (
+        convention,
         int(laplacian.shape[0]),
         int(laplacian.nnz),
         float(np.round(np.abs(laplacian.data).sum(), 6)),
     )
 
 
-def _env_key(env: "Environment") -> tuple[int, int, float]:
-    """Fingerprint of ``env``'s current distance-weighted Laplacian."""
-    return _laplacian_key(_distance_weighted_laplacian(env))
+def _env_key(
+    env: "Environment", convention: LaplacianConvention
+) -> tuple[str, int, int, float]:
+    """Fingerprint of ``env`` under the requested Laplacian convention."""
+    return _laplacian_key(build_graph_laplacian(env, convention), convention)
 
 
 def _check_basis_matches_env(env: "Environment", basis: GraphBasis) -> None:
@@ -129,7 +265,7 @@ def _check_basis_matches_env(env: "Environment", basis: GraphBasis) -> None:
             "active bins; the basis was built for a different environment. "
             "Rebuild it with build_graph_basis(env)."
         )
-    env_key = _env_key(env)
+    env_key = _env_key(env, basis.laplacian_convention)
     if basis.env_key != env_key:
         raise ValueError(
             "basis.env_key does not match this environment's Laplacian "
@@ -207,13 +343,15 @@ def build_graph_basis(
     *,
     sigma: Optional[float] = None,
     tol: float = 1e-6,
+    laplacian_convention: LaplacianConvention = "distance",
 ) -> GraphBasis:
     """Build (and cache) the truncated graph-Laplacian eigenbasis for ``env``.
 
-    Uses the public distance-weighted Laplacian ``L = D @ D.T`` from
-    ``env.get_differential_operator()`` (see the module docstring on the Laplacian
-    choice). ``neurospatial`` does not expose its diffusion eigenbasis publicly
-    (``Environment._diffusion_eigenbasis`` is private), so the basis is built here.
+    The default uses the public distance-weighted Laplacian ``L = D @ D.T`` from
+    ``env.get_differential_operator()``; ``laplacian_convention`` can instead
+    request inverse-distance conductance (see the module docstring). The basis is
+    built locally because ``neurospatial`` does not expose its diffusion
+    eigenbasis publicly.
 
     Parameters
     ----------
@@ -229,19 +367,23 @@ def build_graph_basis(
         ``exp(-(sigma**2/2) * lambda) >= tol`` is kept (floored at ``n_components``).
     tol : float, optional
         Heat-kernel weight cutoff for bandwidth-driven truncation, by default 1e-6.
+    laplacian_convention : {"distance", "inverse_distance"}, optional
+        Explicit edge-weight convention. The default ``"distance"`` preserves
+        the original ``Environment.get_differential_operator()`` behavior.
 
     Returns
     -------
     GraphBasis
         The truncated eigenbasis; arrays are read-only and cached on ``env``.
     """
-    laplacian = _distance_weighted_laplacian(env)
+    laplacian_convention = _validate_laplacian_convention(laplacian_convention)
+    laplacian = build_graph_laplacian(env, laplacian_convention)
     n_components, labels = connected_components(laplacian, directed=False)
 
     # Cache the full sorted eigensystem keyed by the Laplacian's identity (shape + nnz +
     # data checksum); a cached full basis serves any smaller rank by slicing.
     cache = getattr(env, _CACHE_ATTR, None)
-    key = _laplacian_key(laplacian)
+    key = _laplacian_key(laplacian, laplacian_convention)
     if cache is None or cache.get("key") != key:
         eigvals, eigvecs = _full_eigensystem(laplacian, labels, int(n_components))
         cache = {"key": key, "eigvals": eigvals, "eigvecs": eigvecs, "labels": labels}
@@ -262,6 +404,7 @@ def build_graph_basis(
         component_labels=np.asarray(cache["labels"]),
         bin_sizes=bin_sizes,
         n_components=int(n_components),
+        laplacian_convention=laplacian_convention,
         env_key=key,
     )
     for arr in (basis.eigvecs, basis.eigvals, basis.component_labels, basis.bin_sizes):
@@ -466,7 +609,7 @@ def laplacian_matches_distance_weight(env: "Environment") -> bool:
     A cheap invariant check (used by the contract test): ``D @ D.T`` must equal
     ``nx.laplacian_matrix(env.connectivity, weight="distance")``.
     """
-    L = _distance_weighted_laplacian(env).toarray()
+    L = build_graph_laplacian(env, convention="distance").toarray()
     L_nx = nx.laplacian_matrix(
         env.connectivity, nodelist=range(env.n_bins), weight="distance"
     ).toarray()
