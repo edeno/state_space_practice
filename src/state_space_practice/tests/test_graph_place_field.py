@@ -314,3 +314,96 @@ def test_spectral_shape_rejects_nonpositive_alpha():
 def test_build_graph_basis_rejects_nonpositive_sigma(small_grid_env):
     with pytest.raises(ValueError, match="sigma"):
         build_graph_basis(small_grid_env, sigma=0.0)
+
+
+# --------------------------------------------------------------------------- Stage 1: static GLM
+import jax  # noqa: E402
+
+jax.config.update("jax_enable_x64", True)
+
+from state_space_practice.graph_place_field import (  # noqa: E402
+    fit_static_graph_glm,
+    parity_penalty,
+    spectral_precision,
+)
+
+
+def test_spectral_precision_matches_inverse_prior():
+    eigvals = np.array([0.0, 0.5, 2.0])
+    tau2, kappa2, alpha = 0.7, 0.25, 1.0
+    prec = spectral_precision(eigvals, tau2=tau2, kappa2=kappa2, alpha=alpha)
+    # precision is the reciprocal of the prior variance tau2 * S
+    from state_space_practice.graph_place_field import spectral_shape
+
+    S = spectral_shape(eigvals, kappa2, alpha)
+    np.testing.assert_allclose(prec, 1.0 / (tau2 * S))
+    assert np.all(np.isfinite(prec))  # null mode finite (kappa2 > 0)
+
+
+def test_parity_penalty_leaves_null_modes_unpenalized():
+    eigvals = np.array([0.0, 0.0, 0.8, 3.0])  # two null modes
+    pen = parity_penalty(eigvals, n_components=2)
+    assert np.all(pen[:2] == 0.0)  # per-component intercepts, unpenalized
+    np.testing.assert_allclose(
+        pen[2:], eigvals[2:]
+    )  # positive modes penalized by lambda
+
+
+def test_static_glm_recovers_smooth_field(small_grid_env):
+    # Simulate per-bin Poisson counts from a KNOWN smooth field in the eigenbasis,
+    # then check the penalized GLM recovers the field (log-rate) it was generated from.
+    # NOTE: small_grid_env is only ~25 bins; rank and exposure are calibrated so a
+    # correct solver clears corr > 0.95 with margin (empirically mean 0.99 / min 0.97
+    # across seeds) while a broken gradient/Hessian still fails. Offset-bug sensitivity
+    # is covered separately by the independent-optimizer parity test (Task 3), which
+    # uses the real log(occupancy) offset; with uniform occupancy a correlation test
+    # cannot see offset bugs.
+    from state_space_practice.graph_place_field import build_graph_basis
+
+    basis = build_graph_basis(small_grid_env, rank=6)
+    rng = np.random.default_rng(0)
+    # A smooth field: energy only in the low modes.
+    w_true = np.zeros(6)
+    w_true[:4] = rng.standard_normal(4)
+    eta_true = basis.eigvecs @ w_true  # (n_bins,) log-rate
+    occ = np.full(small_grid_env.n_bins, 300.0)  # uniform exposure (s) per bin
+    counts = rng.poisson(np.exp(eta_true) * occ)
+
+    # Weak ridge on the rough modes; recovery should be accurate where data is dense.
+    prec = spectral_precision(basis.eigvals, tau2=100.0, kappa2=1e-2, alpha=1.0)
+    w_hat, cov = fit_static_graph_glm(counts, occ, basis.eigvecs, prec)
+    eta_hat = basis.eigvecs @ np.asarray(w_hat)
+    # Correlation between recovered and true log-rate is high.
+    corr = np.corrcoef(eta_hat, eta_true)[0, 1]
+    assert corr > 0.95
+    # Laplace covariance is PSD.
+    assert np.all(np.linalg.eigvalsh(np.asarray(cov)) > -1e-8)
+
+
+def test_static_glm_ignores_unvisited_bins(small_grid_env):
+    from state_space_practice.graph_place_field import build_graph_basis
+
+    basis = build_graph_basis(small_grid_env, rank=8)
+    occ = np.zeros(small_grid_env.n_bins)
+    occ[: small_grid_env.n_bins // 2] = 3.0  # only half the bins visited
+    counts = np.zeros(small_grid_env.n_bins)
+    counts[: small_grid_env.n_bins // 2] = 1.0
+    prec = spectral_precision(basis.eigvals, tau2=10.0, kappa2=1.0, alpha=1.0)
+    w_hat, _ = fit_static_graph_glm(counts, occ, basis.eigvecs, prec)
+    # Unvisited bins must not blow up the fit (finite, no NaN).
+    assert np.all(np.isfinite(np.asarray(w_hat)))
+
+
+def test_static_glm_multineuron_matches_per_neuron(small_grid_env):
+    from state_space_practice.graph_place_field import build_graph_basis
+
+    basis = build_graph_basis(small_grid_env, rank=8)
+    rng = np.random.default_rng(1)
+    occ = np.full(small_grid_env.n_bins, 4.0)
+    counts = rng.poisson(0.3, size=(small_grid_env.n_bins, 3)).astype(float)
+    prec = spectral_precision(basis.eigvals, tau2=10.0, kappa2=1.0, alpha=1.0)
+    w_multi, _ = fit_static_graph_glm(counts, occ, basis.eigvecs, prec)
+    assert w_multi.shape == (3, 8)
+    for j in range(3):
+        w_j, _ = fit_static_graph_glm(counts[:, j], occ, basis.eigvecs, prec)
+        np.testing.assert_allclose(np.asarray(w_multi[j]), np.asarray(w_j), atol=1e-8)

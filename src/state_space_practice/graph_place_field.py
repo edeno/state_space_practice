@@ -35,12 +35,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, cast
 
+import jax
+import jax.numpy as jnp
 import networkx as nx
 import numpy as np
 import scipy.linalg
 import scipy.sparse as sp
+from jax import Array
+from jax.typing import ArrayLike
 from numpy.typing import NDArray
 from scipy.sparse.csgraph import connected_components
+
+from state_space_practice.kalman import psd_solve, symmetrize
 
 if TYPE_CHECKING:
     from neurospatial import Environment
@@ -56,6 +62,9 @@ __all__ = [
     "bin_occupancy",
     "bin_spike_counts",
     "validate_graph_laplacian",
+    "spectral_precision",
+    "parity_penalty",
+    "fit_static_graph_glm",
 ]
 
 # Attribute used to cache the full eigensystem on an Environment instance (keyed by the
@@ -614,3 +623,107 @@ def laplacian_matches_distance_weight(env: "Environment") -> bool:
         env.connectivity, nodelist=range(env.n_bins), weight="distance"
     ).toarray()
     return bool(np.allclose(L, L_nx, atol=1e-9))
+
+
+def spectral_precision(
+    eigvals: NDArray[np.float64],
+    tau2: float,
+    kappa2: float,
+    alpha: float = 1.0,
+) -> NDArray[np.float64]:
+    """Diagonal prior precision ``P0^{-1} = diag((kappa2 + lambda)^alpha / tau2)``.
+
+    The reciprocal of the prior variance ``tau2 * S`` with ``S`` the spectral shape.
+    Finite at the null modes because ``kappa2 > 0``.
+    """
+    if not tau2 > 0:
+        raise ValueError(f"tau2 (prior amplitude) must be positive, got {tau2}.")
+    shape = spectral_shape(eigvals, kappa2, alpha)  # validates kappa2, alpha > 0
+    return 1.0 / (tau2 * shape)
+
+
+def parity_penalty(
+    eigvals: NDArray[np.float64], n_components: int
+) -> NDArray[np.float64]:
+    """Pure ``diag(lambda)`` penalty with the null modes left unpenalized.
+
+    The first ``n_components`` entries (the per-component null modes, ordered first by
+    :func:`build_graph_basis`) are set to zero so they act as unpenalized per-component
+    intercepts. This is the MRF-parity configuration: the penalty is the eigenvalues
+    themselves and the REML counterpart counts only positive eigenvalues.
+    """
+    penalty = np.array(eigvals, dtype=float)
+    if n_components < 0 or n_components > penalty.shape[0]:
+        raise ValueError(
+            f"n_components={n_components} out of range for {penalty.shape[0]} modes."
+        )
+    penalty[:n_components] = 0.0
+    return penalty
+
+
+def fit_static_graph_glm(
+    counts: ArrayLike,
+    occupancy: ArrayLike,
+    eigvecs: ArrayLike,
+    penalty_diag: ArrayLike,
+    *,
+    max_iter: int = 25,
+) -> tuple[Array, Array]:
+    """Penalized per-bin Poisson GLM in the eigenbasis (Newton / Fisher scoring).
+
+    Fits ``count_i ~ Poisson(exp(Phi_i w) * occ_i)`` with a diagonal quadratic penalty
+    ``0.5 * w^T diag(penalty_diag) w``. Grouping the per-time Poisson likelihood by bin
+    with a ``log(occupancy)`` offset makes this the exact ``Q -> 0`` static limit of the
+    drifting model, and the MRF-parity target.
+
+    Parameters
+    ----------
+    counts : ArrayLike, shape (n_bins,) or (n_bins, n_neurons)
+        Per-active-bin spike counts (from :func:`bin_spike_counts`).
+    occupancy : ArrayLike, shape (n_bins,)
+        Per-active-bin exposure in seconds (from :func:`bin_occupancy`).
+    eigvecs : ArrayLike, shape (n_bins, rank)
+        The basis ``Phi`` (``GraphBasis.eigvecs``).
+    penalty_diag : ArrayLike, shape (rank,)
+        Diagonal penalty ``P0^{-1}`` (from :func:`spectral_precision` or
+        :func:`parity_penalty`).
+    max_iter : int, optional
+        Newton iterations (the objective is convex; ~15 suffice), by default 25.
+
+    Returns
+    -------
+    weights : Array, shape (rank,) or (n_neurons, rank)
+        MAP coefficients.
+    cov : Array, shape (rank, rank) or (n_neurons, rank, rank)
+        Laplace posterior covariance (inverse Fisher + penalty) at the MAP.
+    """
+    Phi = jnp.asarray(eigvecs)
+    occ = jnp.asarray(occupancy)
+    counts_arr = jnp.asarray(counts)
+    single = counts_arr.ndim == 1
+    counts_2d = counts_arr[:, None] if single else counts_arr
+    rank = Phi.shape[1]
+    Lam = jnp.diag(jnp.asarray(penalty_diag))
+    eye = jnp.eye(rank)
+    visited = occ > 0
+    # log-offset; unvisited bins contribute nothing (mu forced to 0 there).
+    log_occ = jnp.where(visited, jnp.log(jnp.where(visited, occ, 1.0)), 0.0)
+
+    def _fit_one(y: Array) -> tuple[Array, Array]:
+        y = y.astype(Phi.dtype)
+
+        def _step(w: Array, _: None) -> tuple[Array, None]:
+            mu = jnp.where(visited, jnp.exp(Phi @ w + log_occ), 0.0)
+            grad = Phi.T @ (mu - y) + Lam @ w
+            hess = Phi.T @ (mu[:, None] * Phi) + Lam
+            return w - psd_solve(hess, grad), None
+
+        w, _ = jax.lax.scan(_step, jnp.zeros(rank), None, length=max_iter)
+        mu = jnp.where(visited, jnp.exp(Phi @ w + log_occ), 0.0)
+        cov = psd_solve(Phi.T @ (mu[:, None] * Phi) + Lam, eye)
+        return w, symmetrize(cov)
+
+    weights, cov = jax.vmap(_fit_one, in_axes=1)(counts_2d)
+    if single:
+        return weights[0], cov[0]
+    return weights, cov
