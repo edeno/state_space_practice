@@ -518,3 +518,36 @@ def test_static_field_recovers_wmaze_place_cells(w_maze_env):
         corrs.append(np.corrcoef(rate_hat[visited], rate_true[visited])[0, 1])
     # The graph-GP field tracks the true place fields on the maze.
     assert np.median(corrs) > 0.6
+
+
+# --------------------------------------------------------------------------- Task 4: model
+from state_space_practice.graph_place_field import GraphPlaceFieldModel  # noqa: E402
+
+
+def test_model_builds_diagonal_psd_prior_and_drift(small_grid_env):
+    model = GraphPlaceFieldModel(
+        small_grid_env, dt=0.02, rank=10, kappa2=0.5, alpha=1.0, tau2=2.0
+    )
+    assert model.rank == 10
+    P0 = np.asarray(model.prior_cov())
+    # P0 = tau2 * S, diagonal, strictly PSD (kappa2 > 0 keeps null modes finite).
+    assert np.allclose(P0, np.diag(np.diag(P0)))
+    assert np.all(np.linalg.eigvalsh(P0) > 0)
+    from state_space_practice.graph_place_field import spectral_shape
+
+    S = spectral_shape(model.basis.eigvals, 0.5, 1.0)
+    np.testing.assert_allclose(np.diag(P0), 2.0 * S)
+    Q = np.asarray(model.drift_cov(0.01))
+    np.testing.assert_allclose(np.diag(Q), 0.01 * S)
+    assert np.all(np.linalg.eigvalsh(Q) > 0)
+
+
+def test_model_rejects_bad_hyperparameters(small_grid_env):
+    with pytest.raises(ValueError, match="dt"):
+        GraphPlaceFieldModel(small_grid_env, dt=0.0)
+    with pytest.raises(ValueError, match="kappa2"):
+        GraphPlaceFieldModel(small_grid_env, dt=0.02, kappa2=0.0)
+    with pytest.raises(ValueError, match="tau2"):
+        GraphPlaceFieldModel(small_grid_env, dt=0.02, tau2=-1.0)
+    with pytest.raises(ValueError, match="alpha"):
+        GraphPlaceFieldModel(small_grid_env, dt=0.02, alpha=0.0)

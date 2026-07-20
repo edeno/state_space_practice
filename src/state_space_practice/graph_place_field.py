@@ -33,6 +33,7 @@ public name.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, cast
 
 import jax
@@ -48,9 +49,13 @@ from numpy.typing import NDArray
 from scipy.sparse.csgraph import connected_components
 
 from state_space_practice.kalman import psd_solve, symmetrize
+from state_space_practice.point_process_kalman import log_conditional_intensity
+from state_space_practice.sgd_fitting import SGDFittableMixin
 
 if TYPE_CHECKING:
     from neurospatial import Environment
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "GraphBasis",
@@ -68,6 +73,7 @@ __all__ = [
     "fit_static_graph_glm",
     "static_log_evidence",
     "select_tau2_by_evidence",
+    "GraphPlaceFieldModel",
 ]
 
 # Attribute used to cache the full eigensystem on an Environment instance (keyed by the
@@ -804,3 +810,102 @@ def select_tau2_by_evidence(
 
     result = scipy.optimize.minimize_scalar(_neg_ev, bounds=(lo, hi), method="bounded")
     return float(np.exp(result.x))
+
+
+class GraphPlaceFieldModel(SGDFittableMixin):
+    """Drifting place-field model over a graph-Laplacian eigenbasis.
+
+    Latent state per neuron ``c`` is ``w_{c,t} in R^rank``, the coefficients on the
+    smoothest ``rank`` eigenvectors ``Phi`` of the environment graph Laplacian. The
+    log-rate map is ``eta_{c,t} = Phi w_{c,t}``; at the animal's position ``z_t = Phi[bin(t)]``
+    the point-process log-intensity is ``z_t^T w_{c,t}`` and spikes are Poisson with rate
+    ``exp(z_t^T w_{c,t}) * dt``. The coefficients drift as a random walk
+    ``w_{c,t} = w_{c,t-1} + eps_t``, ``eps_t ~ N(0, q_c * S)`` with the spectral shape
+    ``S = (kappa2 I + diag(lambda))^(-alpha)`` shared by the prior ``P0 = tau2 * S``.
+
+    x64 is required (see the module and repo CLAUDE.md notes).
+    """
+
+    def __init__(
+        self,
+        env: "Environment",
+        dt: float,
+        *,
+        rank: Optional[int] = None,
+        sigma: Optional[float] = None,
+        kappa2: float = 1.0,
+        alpha: float = 1.0,
+        tau2: float = 1.0,
+        init_drift_scale: float = 1e-3,
+        interpolation: str = "nearest",
+        laplacian_convention: LaplacianConvention = "distance",
+        update_drift_scale: bool = True,
+        update_amplitude: bool = True,
+        update_init_mean: bool = True,
+        max_firing_rate_hz: float = 500.0,
+        max_newton_iter: int = 1,
+    ) -> None:
+        if not dt > 0:
+            raise ValueError(f"dt must be positive, got {dt}.")
+        if not kappa2 > 0:
+            raise ValueError(f"kappa2 must be positive, got {kappa2}.")
+        if not tau2 > 0:
+            raise ValueError(f"tau2 must be positive, got {tau2}.")
+        if not alpha > 0:
+            raise ValueError(f"alpha must be positive, got {alpha}.")
+        if not init_drift_scale >= 0:
+            raise ValueError(f"init_drift_scale must be >= 0, got {init_drift_scale}.")
+        if max_firing_rate_hz <= 0:
+            raise ValueError(
+                f"max_firing_rate_hz must be positive, got {max_firing_rate_hz}."
+            )
+
+        self.env = env
+        self.dt = dt
+        self.basis = build_graph_basis(
+            env, rank=rank, sigma=sigma, laplacian_convention=laplacian_convention
+        )
+        self.rank = int(self.basis.eigvecs.shape[1])
+        self.kappa2 = kappa2
+        self.alpha = alpha
+        self.tau2 = tau2
+        self.init_drift_scale = init_drift_scale
+        self.interpolation = interpolation
+        self.max_firing_rate_hz = max_firing_rate_hz
+        self.max_newton_iter = max_newton_iter
+        self.update_drift_scale = update_drift_scale
+        self.update_amplitude = update_amplitude
+        self.update_init_mean = update_init_mean
+        self._log_intensity_func = log_conditional_intensity
+
+        # Spectral shape S (diagonal, in the eigenbasis). Fixed unless kappa2 changes.
+        self.spectral_S = jnp.asarray(spectral_shape(self.basis.eigvals, kappa2, alpha))
+        self.transition_matrix = jnp.eye(self.rank)
+
+        # Populated during fit.
+        self.n_neurons: int = 1
+        self.drift_scale: Optional[Array] = None  # (n_neurons,)
+        self.init_mean: Optional[Array] = None  # (n_neurons, rank)
+        self.smoother_mean: Optional[Array] = None  # (n_neurons, n_time, rank)
+        self.smoother_cov: Optional[Array] = None
+        self.smoother_cross_cov: Optional[Array] = None
+        self.filtered_mean: Optional[Array] = None
+        self.filtered_cov: Optional[Array] = None
+        self.log_likelihoods: list[float] = []
+        self._n_time: int = 0
+
+    @property
+    def _max_log_count(self) -> float:
+        return float(np.log(self.max_firing_rate_hz * self.dt))
+
+    def _spectral_shape_current(self) -> Array:
+        """S at the current kappa2 (recomputed so SGD updates to kappa2 take effect)."""
+        return jnp.asarray(spectral_shape(self.basis.eigvals, self.kappa2, self.alpha))
+
+    def prior_cov(self) -> Array:
+        """Prior / initial covariance ``P0 = tau2 * diag(S)``, shape (rank, rank)."""
+        return jnp.diag(self.tau2 * self._spectral_shape_current())
+
+    def drift_cov(self, q_c: float) -> Array:
+        """Per-neuron drift covariance ``Q_c = q_c * diag(S)``, shape (rank, rank)."""
+        return jnp.diag(q_c * self._spectral_shape_current())
