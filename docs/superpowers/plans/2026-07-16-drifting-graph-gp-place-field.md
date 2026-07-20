@@ -567,7 +567,7 @@ git commit -m "test(graph-pp): static-field parity vs independent optimizer + W-
 
 **Interfaces:**
 - Consumes: `build_graph_basis`, `spectral_shape`, `GraphBasis`; `SGDFittableMixin` from `state_space_practice.sgd_fitting`.
-- Produces: `GraphPlaceFieldModel(env, dt, *, rank=None, sigma=None, kappa2=1.0, alpha=1.0, tau2=1.0, init_drift_scale=1e-3, interpolation="nearest", laplacian_convention="distance", update_drift_scale=True, update_amplitude=True, update_init_mean=True, max_firing_rate_hz=500.0, max_newton_iter=1)`. After construction: `self.basis` (`GraphBasis`), `self.rank` (int), `self.spectral_S` (`Array (rank,)`), and `self.prior_cov()` / `self.drift_cov(q_c)` helpers returning `(rank, rank)` diagonal PSD matrices. Later tasks rely on: `self.spectral_S`, `self.rank`, `self.kappa2`, `self.alpha`, `self.tau2`, `self.dt`, `self.basis.eigvecs`, `self.transition_matrix` (`= I(rank)`), `self._log_intensity_func`, `self.max_newton_iter`, `self._max_log_count`.
+- Produces: `GraphPlaceFieldModel(env, dt, *, rank=None, sigma=None, kappa2=1.0, alpha=1.0, tau2=1.0, init_drift_scale=1e-3, interpolation="nearest", laplacian_convention="distance", update_drift_scale=True, update_amplitude=True, update_init_mean=True, max_firing_rate_hz=500.0, max_newton_iter=1)`. After construction: `self.basis` (`GraphBasis`), `self.rank` (int), and `self.prior_cov()` / `self.drift_cov(q_c)` helpers returning `(rank, rank)` diagonal PSD matrices. Later tasks rely on: `self._spectral_shape_current()`, `self.rank`, `self.kappa2`, `self.alpha`, `self.tau2`, `self.dt`, `self.basis.eigvecs`, `self.transition_matrix` (`= I(rank)`), `self._log_intensity_func`, `self.max_newton_iter`, `self._max_log_count`. **The spectral shape `S` is never cached on the instance** — `kappa2` is fittable, so a snapshot would go stale; always derive `S` from `_spectral_shape_current()`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -680,10 +680,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         self.update_init_mean = update_init_mean
         self._log_intensity_func = log_conditional_intensity
 
-        # Spectral shape S (diagonal, in the eigenbasis). Fixed unless kappa2 changes.
-        self.spectral_S = jnp.asarray(
-            spectral_shape(self.basis.eigvals, kappa2, alpha)
-        )
+        # The spectral shape S is deliberately NOT cached on the instance: kappa2 is
+        # fittable (SGD), so a snapshot taken here would go stale. Always derive it
+        # from the current kappa2 via _spectral_shape_current().
         self.transition_matrix = jnp.eye(self.rank)
 
         # Populated during fit.
@@ -1255,7 +1254,6 @@ Add to `GraphPlaceFieldModel`:
             self.tau2 = float(params["tau2"])
         if "kappa2" in params:
             self.kappa2 = float(params["kappa2"])
-            self.spectral_S = self._spectral_shape_current()
         if "init_mean" in params:
             self.init_mean = params["init_mean"]
 
@@ -1523,7 +1521,7 @@ These are preferred via SGD (`fit_sgd`) because they add parameters without clea
 
 **2. Placeholder scan.** No "TBD"/"add validation"/"handle edge cases" placeholders; every code step shows real code; every test step shows real assertions.
 
-**3. Type consistency.** Names are consistent across tasks: `spectral_precision`/`parity_penalty`/`fit_static_graph_glm` (Task 1) are reused verbatim in Tasks 2, 3, 6, 8; `GraphPlaceFieldModel` attributes (`spectral_S`, `rank`, `drift_scale`, `init_mean`, `smoother_mean`, `tau2`, `kappa2`, `transition_matrix`, `_log_intensity_func`, `_max_log_count`) are defined in Task 4 and consumed by Tasks 5–8; `_design_and_spikes`/`_e_step` (Task 5) are consumed by `fit` (Task 6), `_finalize_sgd`/`score` (Tasks 7–8). `drift_scale` (not `q_c`) is the canonical per-neuron array name throughout. The SGD protocol hooks match `SGDFittableMixin`'s required surface (`_build_param_spec`, `_sgd_loss_fn`, `_store_sgd_params`, `_finalize_sgd`, `_check_sgd_initialized`, `_n_timesteps`).
+**3. Type consistency.** Names are consistent across tasks: `spectral_precision`/`parity_penalty`/`fit_static_graph_glm` (Task 1) are reused verbatim in Tasks 2, 3, 6, 8; `GraphPlaceFieldModel` attributes (`rank`, `drift_scale`, `init_mean`, `smoother_mean`, `tau2`, `kappa2`, `transition_matrix`, `_log_intensity_func`, `_max_log_count`) and the `_spectral_shape_current()` accessor (the spectral shape `S` is never cached — `kappa2` is fittable) are defined in Task 4 and consumed by Tasks 5–8; `_design_and_spikes`/`_e_step` (Task 5) are consumed by `fit` (Task 6), `_finalize_sgd`/`score` (Tasks 7–8). `drift_scale` (not `q_c`) is the canonical per-neuron array name throughout. The SGD protocol hooks match `SGDFittableMixin`'s required surface (`_build_param_spec`, `_sgd_loss_fn`, `_store_sgd_params`, `_finalize_sgd`, `_check_sgd_initialized`, `_n_timesteps`).
 
 **Known soft spots (flag for the executor, not blockers):**
 - Statistical thresholds (correlation `> 0.6`, drift-scale factor-of-3, EM↔SGD `< 2%`) are set conservatively but may need one round of tuning against real runs. If one fails, first check coverage/`n_time`/seed and confirm it is not a genuine bug before adjusting the threshold — and never adjust a threshold to hide a real regression.

@@ -878,8 +878,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         self.update_init_mean = update_init_mean
         self._log_intensity_func = log_conditional_intensity
 
-        # Spectral shape S (diagonal, in the eigenbasis). Fixed unless kappa2 changes.
-        self.spectral_S = jnp.asarray(spectral_shape(self.basis.eigvals, kappa2, alpha))
+        # The spectral shape S is deliberately NOT cached on the instance: kappa2 is
+        # fittable (SGD), so a snapshot taken here would go stale. Always derive it
+        # from the current kappa2 via _spectral_shape_current().
         self.transition_matrix = jnp.eye(self.rank)
 
         # Populated during fit.
