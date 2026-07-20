@@ -599,3 +599,102 @@ def test_estep_neurons_are_independent(small_grid_env):
     Z2, spk2 = model._design_and_spikes(times, traj, spikes2)
     model._e_step(Z2, spk2)
     np.testing.assert_allclose(sm0, np.asarray(model.smoother_mean[0]), atol=1e-9)
+
+
+# --------------------------------------------------------------------------- Task 6: fit (EM)
+def _simulate_drifting_spikes(env, basis, dt, n_time, q_c, tau2, kappa2, seed):
+    """Poisson spikes from a coefficient random walk w_t = w_{t-1} + N(0, q_c*S)."""
+    from state_space_practice.graph_place_field import spectral_shape
+
+    rng = np.random.default_rng(seed)
+    centers = np.asarray(env.bin_centers)
+    idx = rng.integers(0, centers.shape[0], size=n_time)
+    times = np.arange(n_time, dtype=float) * dt
+    traj = centers[idx]
+    S = spectral_shape(basis.eigvals, kappa2, 1.0)
+    rank = basis.eigvecs.shape[1]
+    w = rng.standard_normal(rank) * np.sqrt(tau2 * S)  # w_0 ~ N(0, tau2 S)
+    Z = basis.eigvecs[idx]  # (n_time, rank), design at visited bins
+    spikes = np.zeros(n_time)
+    for t in range(n_time):
+        if t > 0:
+            w = w + rng.standard_normal(rank) * np.sqrt(q_c * S)
+        rate = np.exp(Z[t] @ w)
+        spikes[t] = rng.poisson(rate * dt)
+    return times, traj, spikes
+
+
+@pytest.mark.slow
+def test_fit_em_is_monotone_under_rollback(small_grid_env):
+    from state_space_practice.graph_place_field import build_graph_basis
+
+    basis = build_graph_basis(small_grid_env, rank=8)
+    times, traj, spikes = _simulate_drifting_spikes(
+        small_grid_env,
+        basis,
+        dt=0.02,
+        n_time=800,
+        q_c=1e-3,
+        tau2=1.0,
+        kappa2=1e-2,
+        seed=0,
+    )
+    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=8, kappa2=1e-2)
+    lls = model.fit(times, traj, spikes, max_iter=30, verbose=False)
+    diffs = np.diff(lls)
+    # GEM rollback guarantees the accepted LL sequence never decreases.
+    assert np.all(diffs >= -1e-6)
+    assert len(lls) >= 2  # guard: EM actually iterated
+
+
+# NOTE: a drift-scale recovery test (EM recovers the simulated q_c) is deliberately
+# absent pending a design decision. Investigation showed the Laplace-EKF marginal
+# log-likelihood computed here is monotonically increasing in q_c rather than peaking
+# at the generating value, so q_c is not identified by this objective and EM returns
+# approximately whatever q_c it was initialized with. The M-step algebra itself is
+# correct: fed the exact generative trajectory it recovers q_c to ~1%. See
+# .superpowers/sdd/task-6-report.md for the full evidence.
+
+
+@pytest.mark.slow
+def test_static_limit_matches_static_estimator(small_grid_env):
+    """With q_c pinned to ~0, the smoothed field equals the static GLM MAP."""
+    from state_space_practice.graph_place_field import (
+        build_graph_basis,
+        fit_static_graph_glm,
+        spectral_precision,
+    )
+
+    basis = build_graph_basis(small_grid_env, rank=8)
+    times, traj, spikes = _simulate_drifting_spikes(
+        small_grid_env,
+        basis,
+        dt=0.02,
+        n_time=1500,
+        q_c=0.0,
+        tau2=1.0,
+        kappa2=1e-2,
+        seed=2,  # no drift
+    )
+    model = GraphPlaceFieldModel(
+        small_grid_env,
+        dt=0.02,
+        rank=8,
+        kappa2=1e-2,
+        tau2=1.0,
+        init_drift_scale=1e-12,
+        update_drift_scale=False,
+        update_amplitude=False,
+    )
+    model.fit(times, traj, spikes, warm_start=True, max_iter=5, verbose=False)
+    # Static estimator on the same aggregated data with the matching penalty.
+    counts = bin_spike_counts(small_grid_env, spikes, times, traj, basis)
+    occ = bin_occupancy(small_grid_env, times, traj, dt=0.02)
+    prec = spectral_precision(basis.eigvals, tau2=1.0, kappa2=1e-2)
+    w_static, _ = fit_static_graph_glm(counts, occ, basis.eigvecs, prec)
+    # Time-averaged smoothed coefficients ~ the static MAP (drift-free limit).
+    w_dyn = np.asarray(model.smoother_mean[0]).mean(axis=0)
+    corr = np.corrcoef(
+        np.asarray(basis.eigvecs @ w_dyn), np.asarray(basis.eigvecs @ w_static[0])
+    )[0, 1]
+    assert corr > 0.95

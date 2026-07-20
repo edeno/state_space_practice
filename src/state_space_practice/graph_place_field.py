@@ -48,12 +48,14 @@ from jax.typing import ArrayLike
 from numpy.typing import NDArray
 from scipy.sparse.csgraph import connected_components
 
-from state_space_practice.kalman import psd_solve, symmetrize
+from state_space_practice.kalman import psd_solve, sum_of_outer_products, symmetrize
 from state_space_practice.point_process_kalman import (
+    _validate_filter_numerics,
     log_conditional_intensity,
     stochastic_point_process_smoother,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.utils import check_converged, validate_count_array
 
 if TYPE_CHECKING:
     from neurospatial import Environment
@@ -970,3 +972,129 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             self.filtered_cov,
         ) = jax.vmap(_one, in_axes=(0, 0, 0))(self.init_mean, spikes, self.drift_scale)
         return float(jnp.sum(marginal_ll))
+
+    def _warm_start(self, times, trajectory, spikes) -> None:
+        """Set per-neuron init_mean from the static GLM MAP on aggregated bins."""
+        counts = bin_spike_counts(self.env, spikes, times, trajectory, self.basis)
+        occ = bin_occupancy(self.env, times, trajectory, self.dt)
+        prec = spectral_precision(
+            self.basis.eigvals, self.tau2, self.kappa2, self.alpha
+        )
+        w0, _ = fit_static_graph_glm(counts, occ, self.basis.eigvecs, prec)
+        w0 = jnp.atleast_2d(w0)  # (n_neurons, rank)
+        self.init_mean = w0
+
+    def _m_step(self) -> None:
+        """Closed-form scalar updates of per-neuron q_c and shared tau2."""
+        assert self.smoother_mean is not None
+        assert self.smoother_cov is not None
+        assert self.smoother_cross_cov is not None
+        S = self._spectral_shape_current()
+
+        def _stats(sm, sc, scc):
+            # sm (T, rank), sc (T, rank, rank), scc (T-1, rank, rank)
+            n_time = sm.shape[0]
+            gamma = jnp.sum(sc, axis=0) + sum_of_outer_products(sm, sm)
+            gamma1 = gamma - jnp.outer(sm[-1], sm[-1]) - sc[-1]
+            gamma2 = gamma - jnp.outer(sm[0], sm[0]) - sc[0]
+            beta = (scc.sum(axis=0) + sum_of_outer_products(sm[:-1], sm[1:])).T
+            q_inc = (gamma2 - beta.T - beta + gamma1) / (n_time - 1)  # E[dw dw^T]
+            return jnp.diag(q_inc), jnp.diag(sc[0])  # (rank,), (rank,) diagonals
+
+        diag_q_inc, diag_v0 = jax.vmap(_stats)(
+            self.smoother_mean, self.smoother_cov, self.smoother_cross_cov
+        )
+        if self.update_drift_scale:
+            # q_c* = mean_j( diag(E[dw dw^T])_j / S_j )
+            self.drift_scale = jnp.maximum(
+                jnp.mean(diag_q_inc / S[None, :], axis=1), 1e-12
+            )
+        if self.update_amplitude:
+            # tau2* = mean over neurons and modes of diag(V0)_j / S_j
+            self.tau2 = float(jnp.maximum(jnp.mean(diag_v0 / S[None, :]), 1e-12))
+        if self.update_init_mean:
+            self.init_mean = self.smoother_mean[:, 0, :]
+
+    def fit(
+        self,
+        times: NDArray[np.float64],
+        trajectory: NDArray[np.float64],
+        spikes: ArrayLike,
+        *,
+        max_iter: int = 100,
+        tolerance: float = 1e-4,
+        warm_start: bool = True,
+        verbose: bool = True,
+    ) -> list[float]:
+        """Fit by EM (GEM with rollback). Returns the accepted marginal-LL history."""
+        spikes_arr = jnp.asarray(spikes)
+        if spikes_arr.ndim == 1:
+            spikes_arr = spikes_arr[:, None]
+        validate_count_array(spikes_arr, "spikes", allow_empty=False)
+        self.n_neurons = int(spikes_arr.shape[1])
+        Z, spk = self._design_and_spikes(times, trajectory, spikes_arr)
+        self._n_time = int(Z.shape[0])
+
+        if warm_start:
+            self._warm_start(times, trajectory, spikes_arr)
+        elif self.init_mean is None:
+            self.init_mean = jnp.zeros((self.n_neurons, self.rank))
+        self.drift_scale = jnp.full(self.n_neurons, self.init_drift_scale)
+
+        _validate_filter_numerics(self.prior_cov(), n_time=self._n_time)
+
+        def _log(msg: str) -> None:
+            if verbose:
+                print(msg)
+
+        self.log_likelihoods = []
+        last_state: Optional[dict] = None
+
+        def _capture() -> dict:
+            return {
+                k: getattr(self, k)
+                for k in (
+                    "smoother_mean",
+                    "smoother_cov",
+                    "smoother_cross_cov",
+                    "filtered_mean",
+                    "filtered_cov",
+                    "drift_scale",
+                    "init_mean",
+                    "tau2",
+                )
+            }
+
+        def _restore(state: Optional[dict]) -> None:
+            if state is not None:
+                for k, v in state.items():
+                    setattr(self, k, v)
+
+        for iteration in range(max_iter):
+            ll = self._e_step(Z, spk)
+            self.log_likelihoods.append(ll)
+            _log(f"  EM iter {iteration + 1}/{max_iter}: LL = {ll:.2f}")
+            if not np.isfinite(ll):
+                _log("  WARNING: non-finite LL; stopping.")
+                self.log_likelihoods.pop()
+                _restore(last_state)
+                break
+            if iteration > 0:
+                converged, increasing = check_converged(
+                    ll, self.log_likelihoods[-2], tolerance
+                )
+                if not increasing:
+                    _restore(last_state)
+                    bad = self.log_likelihoods.pop()
+                    _log(
+                        f"  WARNING: LL decreased {self.log_likelihoods[-1]:.2f} -> "
+                        f"{bad:.2f}; rolling back and stopping."
+                    )
+                    break
+                if converged:
+                    _log(f"  Converged after {iteration + 1} iterations.")
+                    break
+            last_state = _capture()
+            self._m_step()
+
+        return self.log_likelihoods
