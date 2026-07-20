@@ -318,6 +318,7 @@ def test_build_graph_basis_rejects_nonpositive_sigma(small_grid_env):
 
 # --------------------------------------------------------------------------- Stage 1: static GLM
 import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
 
 jax.config.update("jax_enable_x64", True)
 
@@ -551,3 +552,48 @@ def test_model_rejects_bad_hyperparameters(small_grid_env):
         GraphPlaceFieldModel(small_grid_env, dt=0.02, tau2=-1.0)
     with pytest.raises(ValueError, match="alpha"):
         GraphPlaceFieldModel(small_grid_env, dt=0.02, alpha=0.0)
+
+
+# --------------------------------------------------------------------------- Task 5: E-step
+def _toy_trajectory(env, n_time, seed=0):
+    """A trajectory that visits real bin centers (so all rows are in-bounds)."""
+    rng = np.random.default_rng(seed)
+    centers = np.asarray(env.bin_centers)
+    idx = rng.integers(0, centers.shape[0], size=n_time)
+    times = np.arange(n_time, dtype=float) * 0.02
+    return times, centers[idx]
+
+
+def test_estep_returns_finite_total_ll_and_stores_posteriors(small_grid_env):
+    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=8)
+    n_time = 150
+    times, traj = _toy_trajectory(small_grid_env, n_time, seed=1)
+    rng = np.random.default_rng(2)
+    spikes = rng.poisson(0.05, size=(n_time, 3)).astype(float)
+    model.n_neurons = 3
+    model.drift_scale = jnp.full(3, 1e-3)
+    model.init_mean = jnp.zeros((3, model.rank))
+    Z, spk = model._design_and_spikes(times, traj, spikes)
+    ll = model._e_step(Z, spk)
+    assert np.isfinite(ll)
+    assert model.smoother_mean.shape == (3, n_time, model.rank)
+
+
+def test_estep_neurons_are_independent(small_grid_env):
+    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=8)
+    n_time = 120
+    times, traj = _toy_trajectory(small_grid_env, n_time, seed=3)
+    rng = np.random.default_rng(4)
+    spikes = rng.poisson(0.05, size=(n_time, 2)).astype(float)
+    model.n_neurons = 2
+    model.drift_scale = jnp.full(2, 1e-3)
+    model.init_mean = jnp.zeros((2, model.rank))
+    Z, spk = model._design_and_spikes(times, traj, spikes)
+    model._e_step(Z, spk)
+    sm0 = np.asarray(model.smoother_mean[0]).copy()
+    # Perturb neuron 1's spikes only; neuron 0's smoothed trajectory must not change.
+    spikes2 = spikes.copy()
+    spikes2[:, 1] += 1.0
+    Z2, spk2 = model._design_and_spikes(times, traj, spikes2)
+    model._e_step(Z2, spk2)
+    np.testing.assert_allclose(sm0, np.asarray(model.smoother_mean[0]), atol=1e-9)

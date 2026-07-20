@@ -49,7 +49,10 @@ from numpy.typing import NDArray
 from scipy.sparse.csgraph import connected_components
 
 from state_space_practice.kalman import psd_solve, symmetrize
-from state_space_practice.point_process_kalman import log_conditional_intensity
+from state_space_practice.point_process_kalman import (
+    log_conditional_intensity,
+    stochastic_point_process_smoother,
+)
 from state_space_practice.sgd_fitting import SGDFittableMixin
 
 if TYPE_CHECKING:
@@ -910,3 +913,60 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     def drift_cov(self, q_c: float) -> Array:
         """Per-neuron drift covariance ``Q_c = q_c * diag(S)``, shape (rank, rank)."""
         return jnp.diag(q_c * self._spectral_shape_current())
+
+    def _design_and_spikes(
+        self,
+        times: NDArray[np.float64],
+        trajectory: NDArray[np.float64],
+        spikes: ArrayLike,
+    ) -> tuple[Array, Array]:
+        """Build the in-bounds design matrix Z and aligned per-neuron spikes.
+
+        Returns ``Z`` of shape ``(n_valid, rank)`` and ``spikes`` of shape
+        ``(n_neurons, n_valid)`` (neuron axis first, ready for ``vmap``). Out-of-bounds
+        samples are dropped consistently from both.
+        """
+        Z_full, valid = graph_design_matrix(
+            self.env, self.basis, times, trajectory, interpolation=self.interpolation
+        )
+        spikes_arr = jnp.asarray(spikes)
+        if spikes_arr.ndim == 1:
+            spikes_arr = spikes_arr[:, None]
+        Z = jnp.asarray(Z_full)[valid]
+        spikes_valid = spikes_arr[valid]  # (n_valid, n_neurons)
+        return Z, spikes_valid.T  # (n_valid, rank), (n_neurons, n_valid)
+
+    def _e_step(self, Z: Array, spikes: Array) -> float:
+        """Per-neuron vmap Laplace-EKF smoother; returns total marginal LL."""
+        assert self.init_mean is not None
+        assert self.drift_scale is not None
+        S = self._spectral_shape_current()
+        P0 = jnp.diag(self.tau2 * S)
+        A = self.transition_matrix
+
+        def _one(m0: Array, spk: Array, q_c: Array):
+            Q = jnp.diag(q_c * S)
+            return stochastic_point_process_smoother(
+                init_mean_params=m0,
+                init_covariance_params=P0,
+                design_matrix=Z,
+                spike_indicator=spk,
+                dt=self.dt,
+                transition_matrix=A,
+                process_cov=Q,
+                log_conditional_intensity=self._log_intensity_func,
+                return_filtered=True,
+                max_log_count=self._max_log_count,
+                validate_inputs=False,
+                max_newton_iter=self.max_newton_iter,
+            )
+
+        (
+            self.smoother_mean,
+            self.smoother_cov,
+            self.smoother_cross_cov,
+            marginal_ll,
+            self.filtered_mean,
+            self.filtered_cov,
+        ) = jax.vmap(_one, in_axes=(0, 0, 0))(self.init_mean, spikes, self.drift_scale)
+        return float(jnp.sum(marginal_ll))
