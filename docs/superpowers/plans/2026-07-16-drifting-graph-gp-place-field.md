@@ -797,7 +797,7 @@ Expected: FAIL with `AttributeError: 'GraphPlaceFieldModel' object has no attrib
 
 - [ ] **Step 3: Implement `_design_and_spikes` and `_e_step`**
 
-Add these methods to `GraphPlaceFieldModel` (add `stochastic_point_process_smoother`, `stochastic_point_process_filter`, `_validate_filter_numerics` to the `point_process_kalman` import):
+Add these methods to `GraphPlaceFieldModel` (add only `stochastic_point_process_smoother` to the `point_process_kalman` import — import `_validate_filter_numerics` and `stochastic_point_process_filter` in the tasks that first use them, Tasks 6 and 7, so every commit stays `ruff check` clean):
 
 ```python
     def _design_and_spikes(
@@ -990,7 +990,7 @@ Expected: FAIL with `AttributeError: 'GraphPlaceFieldModel' object has no attrib
 
 - [ ] **Step 3: Implement the warm-start, `_m_step`, and `fit`**
 
-Add to `GraphPlaceFieldModel` (add `from state_space_practice.kalman import psd_solve, symmetrize, sum_of_outer_products` — `psd_solve`/`symmetrize` already imported in Task 1; add `sum_of_outer_products`; add `from state_space_practice.utils import check_converged, validate_count_array`):
+Add to `GraphPlaceFieldModel` (add `sum_of_outer_products` to the existing `from state_space_practice.kalman import psd_solve, symmetrize` line; add `from state_space_practice.utils import check_converged, validate_count_array`; add `_validate_filter_numerics` to the existing `from state_space_practice.point_process_kalman import ...` line — this task is its first use):
 
 ```python
     def _warm_start(self, times, trajectory, spikes) -> None:
@@ -1185,7 +1185,7 @@ Expected: FAIL with `AttributeError` (no `fit_sgd` / protocol hooks).
 
 - [ ] **Step 3: Implement the SGD protocol and `fit_sgd`**
 
-Add to `GraphPlaceFieldModel`:
+Add to `GraphPlaceFieldModel` (add `stochastic_point_process_filter` to the existing `from state_space_practice.point_process_kalman import ...` line — this task is its first use):
 
 ```python
     # --- SGDFittableMixin protocol ---
