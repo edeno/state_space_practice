@@ -564,6 +564,7 @@ def _toy_trajectory(env, n_time, seed=0):
     return times, centers[idx]
 
 
+@pytest.mark.slow
 def test_estep_returns_finite_total_ll_and_stores_posteriors(small_grid_env):
     model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=8)
     n_time = 150
@@ -579,6 +580,7 @@ def test_estep_returns_finite_total_ll_and_stores_posteriors(small_grid_env):
     assert model.smoother_mean.shape == (3, n_time, model.rank)
 
 
+@pytest.mark.slow
 def test_estep_neurons_are_independent(small_grid_env):
     model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=8)
     n_time = 120
