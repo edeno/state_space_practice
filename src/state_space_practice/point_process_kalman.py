@@ -1222,9 +1222,19 @@ def stochastic_point_process_filter(
     Parameters
     ----------
     init_mean_params : ArrayLike, shape (n_params,)
-        Initial mean of the latent state ($x_0$).
+        Initial mean of the latent state ($x_0$). Convention: a predict step
+        ($A x$, $A P A^\\top + Q$) is applied before **every** observation
+        update, including the first. So ``(init_mean, init_covariance)`` is the
+        prior *before* the first predict, and the effective prior against which
+        the first observation is conditioned is $N(A\\,x_0,\\ A P_0 A^\\top + Q)$
+        (i.e. $N(x_0, P_0 + Q)$ when $A = I$), not $N(x_0, P_0)$. For long
+        sequences with small $Q$ this boundary term is negligible, but it
+        matters when $P_0$ is a deliberately informative prior on a short
+        sequence; condition the first observation on $x_0$ directly only if you
+        pre-deflate $P_0$ accordingly.
     init_covariance_params : ArrayLike, shape (n_params, n_params)
-        Initial covariance of the latent state ($P_0$).
+        Initial covariance of the latent state ($P_0$). See ``init_mean_params``
+        for the predict-before-first-update convention.
     design_matrix : ArrayLike, shape (n_time, ...) or (n_time, n_neurons, n_params)
         Design matrix ($Z_k$) used in the intensity function.
         Shape depends on the log_conditional_intensity function.
@@ -1932,9 +1942,19 @@ def stochastic_point_process_smoother(
     Parameters
     ----------
     init_mean_params : ArrayLike, shape (n_params,)
-        Initial mean of the latent state ($x_0$).
+        Initial mean of the latent state ($x_0$). Convention: a predict step
+        ($A x$, $A P A^\\top + Q$) is applied before **every** observation
+        update, including the first. So ``(init_mean, init_covariance)`` is the
+        prior *before* the first predict, and the effective prior against which
+        the first observation is conditioned is $N(A\\,x_0,\\ A P_0 A^\\top + Q)$
+        (i.e. $N(x_0, P_0 + Q)$ when $A = I$), not $N(x_0, P_0)$. For long
+        sequences with small $Q$ this boundary term is negligible, but it
+        matters when $P_0$ is a deliberately informative prior on a short
+        sequence; condition the first observation on $x_0$ directly only if you
+        pre-deflate $P_0$ accordingly.
     init_covariance_params : ArrayLike, shape (n_params, n_params)
-        Initial covariance of the latent state ($P_0$).
+        Initial covariance of the latent state ($P_0$). See ``init_mean_params``
+        for the predict-before-first-update convention.
     design_matrix : ArrayLike, shape (n_time, ...) or (n_time, n_neurons, n_params)
         Design matrix ($Z_k$) used in the intensity function.
         Shape depends on the log_conditional_intensity function.
