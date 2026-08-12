@@ -1585,3 +1585,100 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             verbose=verbose,
             convergence_tol=convergence_tol,
         )
+
+    # --- prediction / scoring ---
+
+    def _check_fitted(self, method: str) -> None:
+        if self.smoother_mean is None:
+            raise RuntimeError(f"Model not fitted; call fit(...) before {method}().")
+
+    def predict_rate_map(
+        self, neuron_idx: int = 0, time_slice: Optional[slice] = None
+    ) -> NDArray[np.float64]:
+        """Per-active-bin firing rate (Hz), the log-normal posterior mean over time.
+
+        For the linear log-intensity model and Gaussian posterior
+        ``w_{c,t} | y ~ N(m_{c,t}, V_{c,t})``,
+
+            E[rate_i | y] = mean_t exp(Phi_i m_{c,t} + 0.5 Phi_i V_{c,t} Phi_i^T),
+
+        the exact posterior expected firing rate at active bin ``i``, averaged over the
+        requested time window. This uses ``mean_t E[exp(...)]`` (not ``exp(mean_t ...)``),
+        which matters for a drifting field because the two differ.
+
+        Parameters
+        ----------
+        neuron_idx : int, optional
+            Which neuron's map to return, by default 0.
+        time_slice : slice or None, optional
+            Time window to average over; the whole session when ``None``.
+
+        Returns
+        -------
+        NDArray, shape (n_bins,)
+            Estimated firing rate (Hz) at each active bin.
+        """
+        self._check_fitted("predict_rate_map")
+        assert self.smoother_mean is not None
+        assert self.smoother_cov is not None
+        if neuron_idx < 0 or neuron_idx >= self.n_neurons:
+            raise ValueError(
+                f"neuron_idx={neuron_idx} out of range for n_neurons={self.n_neurons}."
+            )
+        if time_slice is None:
+            time_slice = slice(None)
+        Phi = np.asarray(self.basis.eigvecs)  # (n_bins, rank)
+        means = np.asarray(self.smoother_mean[neuron_idx][time_slice])  # (T, rank)
+        covs = np.asarray(self.smoother_cov[neuron_idx][time_slice])  # (T, rank, rank)
+        if means.shape[0] == 0:
+            raise ValueError("time_slice selects no time bins.")
+        log_rate = means @ Phi.T  # (T, n_bins)
+        var = np.einsum("br,trs,bs->tb", Phi, covs, Phi)  # (T, n_bins)
+        rate = np.exp(log_rate + 0.5 * np.maximum(var, 0.0))
+        return cast(NDArray[np.float64], rate.mean(axis=0))
+
+    def score(
+        self,
+        times: NDArray[np.float64],
+        trajectory: NDArray[np.float64],
+        spikes: ArrayLike,
+    ) -> float:
+        """Held-out total marginal log-likelihood (forward filter, fitted parameters).
+
+        Runs the same masked forward filter as the E-step (no smoothing, no parameter
+        updates) with the current parameters, summed over neurons. On the training data
+        this matches the fit's final marginal log-likelihood.
+        """
+        self._check_fitted("score")
+        assert self.init_mean is not None
+        assert self.drift_scale is not None
+        spikes_arr = jnp.asarray(spikes)
+        if spikes_arr.ndim == 1:
+            spikes_arr = spikes_arr[:, None]
+        validate_count_array(spikes_arr, "spikes", allow_empty=False)
+        if spikes_arr.shape[1] != self.n_neurons:
+            raise ValueError(
+                f"spikes has {spikes_arr.shape[1]} neurons but the model was fitted "
+                f"with n_neurons={self.n_neurons}."
+            )
+        Z, spk, valid = self._design_and_spikes(times, trajectory, spikes_arr)
+        S = self._spectral_shape_current()
+        P0 = jnp.diag(self.tau2 * S)
+
+        def _one(m0: Array, spike_row: Array, q_c: Array) -> Array:
+            _, _, marginal_ll = _masked_graph_point_process_filter(
+                m0,
+                P0,
+                Z,
+                spike_row,
+                valid,
+                self.transition_matrix,
+                jnp.diag(q_c * S),
+                dt=self.dt,
+                max_log_count=self._max_log_count,
+                max_newton_iter=self.max_newton_iter,
+            )
+            return marginal_ll
+
+        lls = jax.vmap(_one, in_axes=(0, 0, 0))(self.init_mean, spk, self.drift_scale)
+        return float(jnp.sum(lls))

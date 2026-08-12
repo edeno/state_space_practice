@@ -900,3 +900,175 @@ def test_static_limit_matches_static_estimator(small_grid_env):
         np.asarray(basis.eigvecs @ w_dyn), np.asarray(basis.eigvecs @ w_static[0])
     )[0, 1]
     assert corr > 0.95
+
+
+# ------------------------------------------------- Task 8: prediction & drift ordering
+def _simulate_field_drift_spikes(env, basis, dt, n_time, q_c, seed, rate_hz=30.0):
+    """Poisson spikes from a field that drifts in the non-null modes only.
+
+    The null (constant/baseline) mode is pinned so the overall firing rate is stable
+    and only the spatial pattern drifts -- the identifiable, physiological regime (a
+    freely drifting baseline is both unrealistic and makes q_c unidentifiable). Returns
+    per-time truth so tests can score tracking. Uses the model's spectral shape S for
+    the drift so the simulation matches the model's Q_c = q_c * S on the field modes.
+    """
+    rng = np.random.default_rng(seed)
+    S = spectral_shape(basis.eigvals, kappa2=1.0, alpha=1.0)
+    n_components = basis.n_components
+    s_drift = np.asarray(S).copy()
+    s_drift[:n_components] = 0.0  # baseline does not drift
+    rank = basis.eigvecs.shape[1]
+    centers = np.asarray(env.bin_centers)
+    idx = rng.integers(0, centers.shape[0], size=n_time)
+    times = np.arange(n_time, dtype=float) * dt
+    traj = centers[idx]
+    w = rng.standard_normal(rank) * np.sqrt(np.asarray(S))
+    w[0] = np.log(rate_hz) / float(basis.eigvecs[0, 0])  # pin the baseline log-rate
+    step_sd = np.sqrt(q_c * s_drift)
+    Z = np.asarray(basis.eigvecs)[idx]
+    spikes = np.zeros(n_time)
+    eta_true = np.zeros(n_time)
+    w_traj = np.zeros((n_time, rank))
+    for t in range(n_time):
+        if t > 0:
+            w = w + rng.standard_normal(rank) * step_sd
+        w_traj[t] = w
+        eta_true[t] = Z[t] @ w
+        spikes[t] = rng.poisson(np.exp(eta_true[t]) * dt)
+    return times, traj, spikes, eta_true, w_traj
+
+
+def test_predict_rate_map_requires_fit_and_valid_neuron(small_grid_env):
+    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=6)
+    with pytest.raises(RuntimeError, match="not fitted"):
+        model.predict_rate_map()
+
+
+@pytest.mark.slow
+def test_predict_rate_map_recovers_static_field(small_grid_env):
+    from state_space_practice.graph_place_field import build_graph_basis
+
+    basis = build_graph_basis(small_grid_env, rank=8)
+    # q_c = 0 -> a static field; predict_rate_map should recover its rate map.
+    times, traj, spikes, _eta, w_traj = _simulate_field_drift_spikes(
+        small_grid_env, basis, dt=0.02, n_time=2000, q_c=0.0, seed=3
+    )
+    model = GraphPlaceFieldModel(
+        small_grid_env,
+        dt=0.02,
+        rank=8,
+        kappa2=1.0,
+        tau2=1.0,
+        update_drift_scale=False,
+        update_amplitude=False,
+    )
+    model.fit(times, traj, spikes, max_iter=8, verbose=False)
+    rate_hat = model.predict_rate_map(neuron_idx=0)
+    rate_true = np.exp(np.asarray(basis.eigvecs @ w_traj[0]))  # static (Hz)
+    occ = bin_occupancy(small_grid_env, times, traj, dt=0.02)
+    visited = occ > 0
+    corr = np.corrcoef(rate_hat[visited], rate_true[visited])[0, 1]
+    assert corr > 0.9
+    # Range check on the fitted model.
+    with pytest.raises(ValueError, match="neuron_idx"):
+        model.predict_rate_map(neuron_idx=1)
+
+
+@pytest.mark.slow
+def test_score_matches_fit_marginal_ll(small_grid_env):
+    times, traj = _toy_trajectory(small_grid_env, 120, seed=41)
+    spikes = np.random.default_rng(42).poisson(0.05, size=120).astype(float)
+    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=6)
+    lls = model.fit(times, traj, spikes, max_iter=3, verbose=False)
+    held = model.score(times, traj, spikes)
+    # score() reruns the same masked forward filter with the fitted parameters, so on
+    # the training data it reproduces the fit's final marginal log-likelihood.
+    assert held == pytest.approx(lls[-1], rel=1e-6, abs=1e-4)
+    # Wrong neuron count is rejected.
+    with pytest.raises(ValueError, match="neurons"):
+        model.score(times, traj, np.zeros((120, 2)))
+
+
+@pytest.mark.slow
+def test_smoother_beats_filter_beats_static_on_drifting_data(small_grid_env):
+    from state_space_practice.graph_place_field import build_graph_basis
+
+    basis = build_graph_basis(small_grid_env, rank=8)
+    dt, kappa2, q_true = 0.02, 1.0, 1e-2
+    times, traj, spikes, eta_true, _w = _simulate_field_drift_spikes(
+        small_grid_env, basis, dt=dt, n_time=3000, q_c=q_true, seed=0
+    )
+    # Per-time design at the visited bins (same binning the model uses internally).
+    Zt = np.asarray(basis.eigvecs)[_bin_ids_for_test(small_grid_env, times, traj)]
+    # Fit with q fixed at the true drift scale: validate tracking, not learning.
+    model = GraphPlaceFieldModel(
+        small_grid_env,
+        dt=dt,
+        rank=8,
+        kappa2=kappa2,
+        tau2=1.0,
+        init_drift_scale=q_true,
+        update_drift_scale=False,
+        update_amplitude=False,
+    )
+    model.fit(times, traj, spikes, max_iter=10, verbose=False)
+
+    eta_sm = np.einsum("tr,tr->t", Zt, np.asarray(model.smoother_mean[0]))
+    eta_fi = np.einsum("tr,tr->t", Zt, np.asarray(model.filtered_mean[0]))
+    counts = bin_spike_counts(small_grid_env, spikes[:, None], times, traj, basis)
+    occ = bin_occupancy(small_grid_env, times, traj, dt)
+    prec = spectral_precision(basis.eigvals, tau2=1.0, kappa2=kappa2)
+    w_static, _ = fit_static_graph_glm(counts, occ, basis.eigvecs, prec)
+    eta_st = Zt @ np.asarray(w_static[0])
+
+    rmse_sm = np.sqrt(np.mean((eta_sm - eta_true) ** 2))
+    rmse_fi = np.sqrt(np.mean((eta_fi - eta_true) ** 2))
+    rmse_st = np.sqrt(np.mean((eta_st - eta_true) ** 2))
+    assert rmse_sm < rmse_fi  # smoothing (future data) beats causal filtering
+    assert rmse_fi < rmse_st  # tracking drift beats a single static field
+
+
+@pytest.mark.slow
+def test_graph_basis_does_not_smear_across_wmaze_arms(w_maze_env):
+    """A field smooth in the graph basis stays on its connected arm: it leaks far less
+    to a Euclidean-near bin on a different arm (across a wall) than to a graph-adjacent
+    bin. This is the geometry-aware property tensor-product splines lack."""
+    from scipy.sparse.csgraph import shortest_path
+
+    centers = np.asarray(w_maze_env.bin_centers)
+    n = w_maze_env.n_bins
+    laplacian = build_graph_laplacian(w_maze_env, convention="distance").toarray()
+    adjacency = (laplacian < -1e-12).astype(float)  # off-diagonal negatives are edges
+    hops = shortest_path(adjacency, method="D", directed=False)
+    eucl = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=2)
+
+    # Euclidean-nearest pair that is far apart on the graph (opposite arms).
+    far = np.isfinite(hops) & (hops > 8)
+    cand = np.where(far, eucl, np.inf)
+    np.fill_diagonal(cand, np.inf)
+    i, j = np.unravel_index(np.argmin(cand), cand.shape)
+    assert hops[i, j] > 8 and eucl[i, j] < 20  # guard: pair is genuinely near + far
+    # a graph-adjacent reference bin to i (as Euclidean-far as possible within 3 hops)
+    near = (hops[i] > 0) & (hops[i] <= 3)
+    k = int(np.flatnonzero(near)[np.argmax(eucl[i][near])])
+
+    basis = build_graph_basis(w_maze_env, rank=15)
+    Phi = np.asarray(basis.eigvecs)
+    bump = np.zeros(n)
+    bump[i] = 1.0
+    recon = Phi @ (Phi.T @ bump)  # low-rank graph reconstruction of a delta at bin i
+    leak_far = abs(recon[j]) / abs(recon[i])  # to the graph-far / Euclidean-near bin
+    leak_near = abs(recon[k]) / abs(recon[i])  # to the graph-adjacent bin
+    assert leak_far < 0.1  # almost no mass crosses to the other arm
+    assert leak_far < 0.3 * leak_near  # and far less than to a graph-adjacent bin
+
+
+def _bin_ids_for_test(env, times, trajectory):
+    """Active-bin ids on the time grid (mirrors the module's internal binning)."""
+    traj = np.asarray(trajectory, dtype=float)
+    if traj.ndim == 1:
+        traj = traj[:, None]
+    ids = env.bin_sequence(
+        np.asarray(times, dtype=float), traj, dedup=False, outside_value=-1
+    )
+    return np.asarray(ids, dtype=int)
