@@ -48,11 +48,17 @@ from jax.typing import ArrayLike
 from numpy.typing import NDArray
 from scipy.sparse.csgraph import connected_components
 
-from state_space_practice.kalman import psd_solve, sum_of_outer_products, symmetrize
+from state_space_practice.kalman import (
+    psd_solve,
+    rts_backward_scan,
+    sum_of_outer_products,
+    symmetrize,
+)
 from state_space_practice.point_process_kalman import (
     _validate_filter_numerics,
+    glm_laplace_update,
     log_conditional_intensity,
-    stochastic_point_process_smoother,
+    poisson_family,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import check_converged, validate_count_array
@@ -682,8 +688,9 @@ def fit_static_graph_glm(
     penalty_diag: ArrayLike,
     *,
     max_iter: int = 25,
+    tol: float = 1e-8,
 ) -> tuple[Array, Array]:
-    """Penalized per-bin Poisson GLM in the eigenbasis (Newton / Fisher scoring).
+    """Penalized per-bin Poisson GLM in the eigenbasis (damped Newton).
 
     Fits ``count_i ~ Poisson(exp(Phi_i w) * occ_i)`` with a diagonal quadratic penalty
     ``0.5 * w^T diag(penalty_diag) w``. Grouping the per-time Poisson likelihood by bin
@@ -702,7 +709,9 @@ def fit_static_graph_glm(
         Diagonal penalty ``P0^{-1}`` (from :func:`spectral_precision` or
         :func:`parity_penalty`).
     max_iter : int, optional
-        Newton iterations (the objective is convex; ~15 suffice), by default 25.
+        Maximum Newton iterations, by default 25.
+    tol : float, optional
+        Relative gradient convergence tolerance, by default ``1e-8``.
 
     Returns
     -------
@@ -711,28 +720,150 @@ def fit_static_graph_glm(
     cov : Array, shape (rank, rank) or (n_neurons, rank, rank)
         Laplace posterior covariance (inverse Fisher + penalty) at the MAP.
     """
-    Phi = jnp.asarray(eigvecs)
-    occ = jnp.asarray(occupancy)
-    counts_arr = jnp.asarray(counts)
+    counts_np = np.asarray(counts)
+    validate_count_array(counts_np, "counts", allow_empty=False)
+    if counts_np.ndim not in (1, 2):
+        raise ValueError(
+            "counts must have shape (n_bins,) or (n_bins, n_neurons); "
+            f"got shape {counts_np.shape}."
+        )
+
+    Phi_np = np.asarray(eigvecs, dtype=float)
+    if Phi_np.ndim != 2 or min(Phi_np.shape) == 0:
+        raise ValueError(
+            "eigvecs must be a non-empty array with shape (n_bins, rank); "
+            f"got shape {Phi_np.shape}."
+        )
+    if not np.all(np.isfinite(Phi_np)):
+        raise ValueError("eigvecs must contain only finite values.")
+
+    occ_np = np.asarray(occupancy, dtype=float)
+    if occ_np.ndim != 1 or occ_np.shape[0] != Phi_np.shape[0]:
+        raise ValueError(
+            "occupancy must have shape (n_bins,) matching eigvecs; "
+            f"got {occ_np.shape} and {Phi_np.shape}."
+        )
+    if not np.all(np.isfinite(occ_np)) or np.any(occ_np < 0):
+        raise ValueError("occupancy must contain only finite, non-negative values.")
+    if counts_np.shape[0] != Phi_np.shape[0]:
+        raise ValueError(
+            "counts and eigvecs must have the same n_bins; "
+            f"got {counts_np.shape[0]} and {Phi_np.shape[0]}."
+        )
+
+    penalty_np = np.asarray(penalty_diag, dtype=float)
+    rank = Phi_np.shape[1]
+    if penalty_np.shape != (rank,):
+        raise ValueError(
+            f"penalty_diag must have shape ({rank},); got {penalty_np.shape}."
+        )
+    if not np.all(np.isfinite(penalty_np)) or np.any(penalty_np < 0):
+        raise ValueError("penalty_diag must contain only finite, non-negative values.")
+    if isinstance(max_iter, (bool, np.bool_)) or not isinstance(
+        max_iter, (int, np.integer)
+    ):
+        raise ValueError(f"max_iter must be a positive integer; got {max_iter!r}.")
+    if max_iter <= 0:
+        raise ValueError(f"max_iter must be a positive integer; got {max_iter!r}.")
+    tol_arr = np.asarray(tol)
+    if tol_arr.shape != () or not np.isfinite(tol_arr) or float(tol_arr) <= 0:
+        raise ValueError(f"tol must be a finite positive scalar; got {tol!r}.")
+
+    counts_2d_np = counts_np[:, None] if counts_np.ndim == 1 else counts_np
+    if np.any((occ_np == 0) & np.any(counts_2d_np > 0, axis=1)):
+        raise ValueError("counts must be zero in bins with zero occupancy.")
+
+    dtype = jnp.result_type(Phi_np, occ_np, penalty_np, jnp.float32)
+    Phi = jnp.asarray(Phi_np, dtype=dtype)
+    occ = jnp.asarray(occ_np, dtype=dtype)
+    counts_arr = jnp.asarray(counts_np, dtype=dtype)
     single = counts_arr.ndim == 1
     counts_2d = counts_arr[:, None] if single else counts_arr
-    rank = Phi.shape[1]
-    Lam = jnp.diag(jnp.asarray(penalty_diag))
-    eye = jnp.eye(rank)
+    penalty = jnp.asarray(penalty_np, dtype=dtype)
+    Lam = jnp.diag(penalty)
+    eye = jnp.eye(rank, dtype=dtype)
     visited = occ > 0
     # log-offset; unvisited bins contribute nothing (mu forced to 0 there).
     log_occ = jnp.where(visited, jnp.log(jnp.where(visited, occ, 1.0)), 0.0)
+    tolerance = jnp.asarray(float(tol_arr), dtype=dtype)
+
+    def _loss(w: Array, y: Array) -> Array:
+        eta = Phi @ w + log_occ
+        mu = jnp.where(visited, jnp.exp(eta), 0.0)
+        poisson_nll = jnp.sum(jnp.where(visited, mu - y * eta, 0.0))
+        return poisson_nll + 0.5 * (w @ (penalty * w))
+
+    def _derivatives(w: Array, y: Array) -> tuple[Array, Array]:
+        mu = jnp.where(visited, jnp.exp(Phi @ w + log_occ), 0.0)
+        grad = Phi.T @ (mu - y) + penalty * w
+        hess = Phi.T @ (mu[:, None] * Phi) + Lam
+        return grad, hess
 
     def _fit_one(y: Array) -> tuple[Array, Array]:
-        y = y.astype(Phi.dtype)
+        gradient_scale = 1.0 + jnp.sum(y)
 
-        def _step(w: Array, _: None) -> tuple[Array, None]:
-            mu = jnp.where(visited, jnp.exp(Phi @ w + log_occ), 0.0)
-            grad = Phi.T @ (mu - y) + Lam @ w
-            hess = Phi.T @ (mu[:, None] * Phi) + Lam
-            return w - psd_solve(hess, grad), None
+        def _step(
+            carry: tuple[Array, Array], _: None
+        ) -> tuple[tuple[Array, Array], None]:
+            w, converged = carry
+            current_loss = _loss(w, y)
+            grad, hess = _derivatives(w, y)
+            delta = psd_solve(hess, grad)
+            directional_derivative = grad @ delta
+            is_descent = (
+                (~converged)
+                & jnp.isfinite(directional_derivative)
+                & (directional_derivative > 0.0)
+            )
 
-        w, _ = jax.lax.scan(_step, jnp.zeros(rank), None, length=max_iter)
+            def _backtrack(
+                line_carry: tuple[Array, Array, Array], _: None
+            ) -> tuple[tuple[Array, Array, Array], None]:
+                step_size, accepted, accepted_w = line_carry
+                trial_w = w - step_size * delta
+                trial_loss = _loss(trial_w, y)
+                sufficient_decrease = (
+                    (~accepted)
+                    & is_descent
+                    & jnp.isfinite(trial_loss)
+                    & (
+                        trial_loss
+                        <= current_loss - 1e-4 * step_size * directional_derivative
+                    )
+                )
+                accepted_w = jnp.where(sufficient_decrease, trial_w, accepted_w)
+                accepted = accepted | sufficient_decrease
+                step_size = jnp.where(accepted, step_size, 0.5 * step_size)
+                return (step_size, accepted, accepted_w), None
+
+            (_step_size, accepted, candidate_w), _backtrack_history = jax.lax.scan(
+                _backtrack,
+                (
+                    jnp.asarray(1.0, dtype=dtype),
+                    jnp.asarray(False),
+                    w,
+                ),
+                None,
+                length=60,
+            )
+            new_w = jnp.where(accepted & (~converged), candidate_w, w)
+            new_grad, _new_hessian = _derivatives(new_w, y)
+            new_converged = converged | (
+                jnp.max(jnp.abs(new_grad)) <= tolerance * gradient_scale
+            )
+            return (new_w, new_converged), None
+
+        initial_w = jnp.zeros(rank, dtype=dtype)
+        initial_grad, _ = _derivatives(initial_w, y)
+        initially_converged = (
+            jnp.max(jnp.abs(initial_grad)) <= tolerance * gradient_scale
+        )
+        (w, _), _ = jax.lax.scan(
+            _step,
+            (initial_w, initially_converged),
+            None,
+            length=max_iter,
+        )
         mu = jnp.where(visited, jnp.exp(Phi @ w + log_occ), 0.0)
         cov = psd_solve(Phi.T @ (mu[:, None] * Phi) + Lam, eye)
         return w, symmetrize(cov)
@@ -780,7 +911,10 @@ def static_log_evidence(
         data_term = jnp.sum(jnp.where(visited, y * eta - mu, 0.0))
         hess = Phi.T @ (mu[:, None] * Phi) + Lam
         _, logdet_h = jnp.linalg.slogdet(hess)
-        return data_term - 0.5 * (w @ (prec * w)) + 0.5 * logdet_lam - 0.5 * logdet_h
+        return cast(
+            Array,
+            data_term - 0.5 * (w @ (prec * w)) + 0.5 * logdet_lam - 0.5 * logdet_h,
+        )
 
     ev = jax.vmap(_one, in_axes=(0, 1))(weights_2d, counts_2d.astype(Phi.dtype))
     return float(jnp.sum(ev))
@@ -800,7 +934,18 @@ def select_tau2_by_evidence(
     Optimizes over ``log tau2`` with a bounded scalar optimizer (the evidence is smooth
     and unimodal in ``log tau2`` for a fixed ``kappa2``).
     """
-    lo, hi = np.log(bounds[0]), np.log(bounds[1])
+    bounds_arr = np.asarray(bounds, dtype=float)
+    if (
+        bounds_arr.shape != (2,)
+        or not np.all(np.isfinite(bounds_arr))
+        or np.any(bounds_arr <= 0)
+        or bounds_arr[0] >= bounds_arr[1]
+    ):
+        raise ValueError(
+            "bounds must be two finite positive values with lower < upper; "
+            f"got {bounds!r}."
+        )
+    lo, hi = np.log(bounds_arr)
 
     def _neg_ev(log_tau2: float) -> float:
         return -static_log_evidence(
@@ -814,7 +959,104 @@ def select_tau2_by_evidence(
         )
 
     result = scipy.optimize.minimize_scalar(_neg_ev, bounds=(lo, hi), method="bounded")
+    if not result.success or not np.isfinite(result.x) or not np.isfinite(result.fun):
+        raise RuntimeError(f"tau2 evidence optimization failed: {result.message}")
     return float(np.exp(result.x))
+
+
+def _masked_graph_point_process_filter(
+    init_mean: Array,
+    init_cov: Array,
+    design_matrix: Array,
+    spikes: Array,
+    valid: Array,
+    transition_matrix: Array,
+    process_cov: Array,
+    *,
+    dt: float,
+    max_log_count: float,
+    max_newton_iter: int,
+) -> tuple[Array, Array, Array]:
+    """Filter one neuron on the full time grid with masked observations.
+
+    Unlike :func:`stochastic_point_process_filter`, the first observation is
+    conditioned directly on ``(init_mean, init_cov)``.  Subsequent rows receive one
+    dynamics transition each.  A row whose position is invalid skips only the
+    observation update; its dynamics propagation remains in the state trajectory.
+    """
+    family = poisson_family(dt, max_log_count=max_log_count)
+
+    def _observation_update(
+        prior_mean: Array,
+        prior_cov: Array,
+        design_row: Array,
+        spike_count: Array,
+        is_valid: Array,
+    ) -> tuple[Array, Array, Array]:
+        def _observed(_: None) -> tuple[Array, Array, Array]:
+            def _eta(state: Array) -> Array:
+                return jnp.atleast_1d(log_conditional_intensity(design_row, state))
+
+            def _grad_eta(_state: Array) -> Array:
+                return design_row[None, :]
+
+            return glm_laplace_update(
+                prior_mean,
+                prior_cov,
+                jnp.atleast_1d(spike_count),
+                _eta,
+                family,
+                grad_eta_func=_grad_eta,
+                max_newton_iter=max_newton_iter,
+            )
+
+        def _missing(_: None) -> tuple[Array, Array, Array]:
+            return prior_mean, prior_cov, jnp.zeros((), dtype=prior_mean.dtype)
+
+        return cast(
+            tuple[Array, Array, Array],
+            jax.lax.cond(is_valid, _observed, _missing, operand=None),
+        )
+
+    first_mean, first_cov, first_ll = _observation_update(
+        init_mean,
+        init_cov,
+        design_matrix[0],
+        spikes[0],
+        valid[0],
+    )
+
+    def _step(
+        carry: tuple[Array, Array, Array],
+        args: tuple[Array, Array, Array],
+    ) -> tuple[tuple[Array, Array, Array], tuple[Array, Array]]:
+        previous_mean, previous_cov, marginal_ll = carry
+        design_row, spike_count, is_valid = args
+        prior_mean = transition_matrix @ previous_mean
+        prior_cov = symmetrize(
+            transition_matrix @ previous_cov @ transition_matrix.T + process_cov
+        )
+        posterior_mean, posterior_cov, log_likelihood = _observation_update(
+            prior_mean,
+            prior_cov,
+            design_row,
+            spike_count,
+            is_valid,
+        )
+        marginal_ll = marginal_ll + log_likelihood
+        return (posterior_mean, posterior_cov, marginal_ll), (
+            posterior_mean,
+            posterior_cov,
+        )
+
+    (_, _, marginal_ll), (remaining_mean, remaining_cov) = jax.lax.scan(
+        _step,
+        (first_mean, first_cov, first_ll),
+        (design_matrix[1:], spikes[1:], valid[1:]),
+    )
+    filtered_mean = jnp.concatenate((first_mean[None, :], remaining_mean), axis=0)
+    filtered_cov = jnp.concatenate((first_cov[None, :, :], remaining_cov), axis=0)
+    return filtered_mean, filtered_cov, marginal_ll
 
 
 class GraphPlaceFieldModel(SGDFittableMixin):
@@ -827,6 +1069,11 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     ``exp(z_t^T w_{c,t}) * dt``. The coefficients drift as a random walk
     ``w_{c,t} = w_{c,t-1} + eps_t``, ``eps_t ~ N(0, q_c * S)`` with the spectral shape
     ``S = (kappa2 I + diag(lambda))^(-alpha)`` shared by the prior ``P0 = tau2 * S``.
+
+    Drift-scale learning is disabled by default because the approximate Laplace-EKF
+    marginal likelihood does not reliably identify ``q_c`` from spike observations.
+    Setting ``update_drift_scale=True`` enables the closed-form update as an explicit
+    experimental opt-in.
 
     x64 is required (see the module and repo CLAUDE.md notes).
     """
@@ -844,7 +1091,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         init_drift_scale: float = 1e-3,
         interpolation: str = "nearest",
         laplacian_convention: LaplacianConvention = "distance",
-        update_drift_scale: bool = True,
+        update_drift_scale: bool = False,
         update_amplitude: bool = True,
         update_init_mean: bool = True,
         max_firing_rate_hz: float = 500.0,
@@ -878,6 +1125,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         self.interpolation = interpolation
         self.max_firing_rate_hz = max_firing_rate_hz
         self.max_newton_iter = max_newton_iter
+        # The approximate Laplace-EKF marginal likelihood does not reliably
+        # identify q_c from spike observations. Keep it fixed by default; the
+        # closed-form update remains available as an explicit experimental opt-in.
         self.update_drift_scale = update_drift_scale
         self.update_amplitude = update_amplitude
         self.update_init_mean = update_init_mean
@@ -921,12 +1171,13 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         times: NDArray[np.float64],
         trajectory: NDArray[np.float64],
         spikes: ArrayLike,
-    ) -> tuple[Array, Array]:
-        """Build the in-bounds design matrix Z and aligned per-neuron spikes.
+    ) -> tuple[Array, Array, Array]:
+        """Build the full-grid design, aligned spikes, and observation mask.
 
-        Returns ``Z`` of shape ``(n_valid, rank)`` and ``spikes`` of shape
-        ``(n_neurons, n_valid)`` (neuron axis first, ready for ``vmap``). Out-of-bounds
-        samples are dropped consistently from both.
+        Returns ``Z`` of shape ``(n_time, rank)``, ``spikes`` of shape
+        ``(n_neurons, n_time)`` (neuron axis first, ready for ``vmap``), and a
+        ``valid`` mask. Out-of-bounds rows retain their place in the time grid so the
+        latent random walk still advances; only their observation update is skipped.
         """
         Z_full, valid = graph_design_matrix(
             self.env, self.basis, times, trajectory, interpolation=self.interpolation
@@ -934,33 +1185,57 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         spikes_arr = jnp.asarray(spikes)
         if spikes_arr.ndim == 1:
             spikes_arr = spikes_arr[:, None]
-        Z = jnp.asarray(Z_full)[valid]
-        spikes_valid = spikes_arr[valid]  # (n_valid, n_neurons)
-        return Z, spikes_valid.T  # (n_valid, rank), (n_neurons, n_valid)
+        if spikes_arr.ndim != 2:
+            raise ValueError(
+                "spikes must be 1D (n_time,) or 2D (n_time, n_neurons); "
+                f"got shape {spikes_arr.shape}."
+            )
+        if spikes_arr.shape[0] != Z_full.shape[0]:
+            raise ValueError(
+                "spikes and trajectory/times must have the same number of rows; "
+                f"got {spikes_arr.shape[0]} and {Z_full.shape[0]}."
+            )
+        return jnp.asarray(Z_full), spikes_arr.T, jnp.asarray(valid)
 
-    def _e_step(self, Z: Array, spikes: Array) -> float:
+    def _e_step(self, Z: Array, spikes: Array, valid: Optional[Array] = None) -> float:
         """Per-neuron vmap Laplace-EKF smoother; returns total marginal LL."""
         assert self.init_mean is not None
         assert self.drift_scale is not None
+        if valid is None:
+            valid = jnp.ones((Z.shape[0],), dtype=bool)
         S = self._spectral_shape_current()
         P0 = jnp.diag(self.tau2 * S)
         A = self.transition_matrix
 
         def _one(m0: Array, spk: Array, q_c: Array):
             Q = jnp.diag(q_c * S)
-            return stochastic_point_process_smoother(
-                init_mean_params=m0,
-                init_covariance_params=P0,
-                design_matrix=Z,
-                spike_indicator=spk,
-                dt=self.dt,
-                transition_matrix=A,
-                process_cov=Q,
-                log_conditional_intensity=self._log_intensity_func,
-                return_filtered=True,
-                max_log_count=self._max_log_count,
-                validate_inputs=False,
-                max_newton_iter=self.max_newton_iter,
+            filtered_mean, filtered_cov, marginal_ll = (
+                _masked_graph_point_process_filter(
+                    m0,
+                    P0,
+                    Z,
+                    spk,
+                    valid,
+                    A,
+                    Q,
+                    dt=self.dt,
+                    max_log_count=self._max_log_count,
+                    max_newton_iter=self.max_newton_iter,
+                )
+            )
+            smoother_mean, smoother_cov, smoother_cross_cov = rts_backward_scan(
+                filtered_mean,
+                filtered_cov,
+                A,
+                Q,
+            )
+            return (
+                smoother_mean,
+                smoother_cov,
+                smoother_cross_cov,
+                marginal_ll,
+                filtered_mean,
+                filtered_cov,
             )
 
         (
@@ -989,29 +1264,50 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         assert self.smoother_mean is not None
         assert self.smoother_cov is not None
         assert self.smoother_cross_cov is not None
+        assert self.init_mean is not None
         S = self._spectral_shape_current()
 
-        def _stats(sm, sc, scc):
-            # sm (T, rank), sc (T, rank, rank), scc (T-1, rank, rank)
-            n_time = sm.shape[0]
-            gamma = jnp.sum(sc, axis=0) + sum_of_outer_products(sm, sm)
-            gamma1 = gamma - jnp.outer(sm[-1], sm[-1]) - sc[-1]
-            gamma2 = gamma - jnp.outer(sm[0], sm[0]) - sc[0]
-            beta = (scc.sum(axis=0) + sum_of_outer_products(sm[:-1], sm[1:])).T
-            q_inc = (gamma2 - beta.T - beta + gamma1) / (n_time - 1)  # E[dw dw^T]
-            return jnp.diag(q_inc), jnp.diag(sc[0])  # (rank,), (rank,) diagonals
-
-        diag_q_inc, diag_v0 = jax.vmap(_stats)(
-            self.smoother_mean, self.smoother_cov, self.smoother_cross_cov
-        )
         if self.update_drift_scale:
+            n_time = int(self.smoother_mean.shape[1])
+            if n_time < 2:
+                raise ValueError(
+                    "at least two time rows are required to update drift_scale."
+                )
+
+            def _increment_stats(sm, sc, scc):
+                # sm (T, rank), sc (T, rank, rank), scc (T-1, rank, rank)
+                gamma = jnp.sum(sc, axis=0) + sum_of_outer_products(sm, sm)
+                gamma1 = gamma - jnp.outer(sm[-1], sm[-1]) - sc[-1]
+                gamma2 = gamma - jnp.outer(sm[0], sm[0]) - sc[0]
+                beta = (scc.sum(axis=0) + sum_of_outer_products(sm[:-1], sm[1:])).T
+                q_inc = (gamma2 - beta.T - beta + gamma1) / (n_time - 1)
+                return jnp.diag(q_inc)
+
+            diag_q_inc = jax.vmap(_increment_stats)(
+                self.smoother_mean,
+                self.smoother_cov,
+                self.smoother_cross_cov,
+            )
             # q_c* = mean_j( diag(E[dw dw^T])_j / S_j )
             self.drift_scale = jnp.maximum(
                 jnp.mean(diag_q_inc / S[None, :], axis=1), 1e-12
             )
         if self.update_amplitude:
-            # tau2* = mean over neurons and modes of diag(V0)_j / S_j
-            self.tau2 = float(jnp.maximum(jnp.mean(diag_v0 / S[None, :]), 1e-12))
+            diag_initial_second_moment = jnp.diagonal(
+                self.smoother_cov[:, 0], axis1=-2, axis2=-1
+            )
+            if not self.update_init_mean:
+                mean_residual = self.smoother_mean[:, 0, :] - self.init_mean
+                diag_initial_second_moment = (
+                    diag_initial_second_moment + mean_residual**2
+                )
+            # tau2* = mean over neurons/modes of E[(w0-m0)^2] / S.
+            self.tau2 = float(
+                jnp.maximum(
+                    jnp.mean(diag_initial_second_moment / S[None, :]),
+                    1e-12,
+                )
+            )
         if self.update_init_mean:
             self.init_mean = self.smoother_mean[:, 0, :]
 
@@ -1027,17 +1323,51 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         verbose: bool = True,
     ) -> list[float]:
         """Fit by EM (GEM with rollback). Returns the accepted marginal-LL history."""
+        if isinstance(max_iter, (bool, np.bool_)) or not isinstance(
+            max_iter, (int, np.integer)
+        ):
+            raise ValueError(f"max_iter must be a positive integer; got {max_iter!r}.")
+        if max_iter <= 0:
+            raise ValueError(f"max_iter must be a positive integer; got {max_iter!r}.")
+        tolerance_arr = np.asarray(tolerance)
+        if (
+            tolerance_arr.shape != ()
+            or not np.isfinite(tolerance_arr)
+            or float(tolerance_arr) <= 0
+        ):
+            raise ValueError(
+                f"tolerance must be a finite positive scalar; got {tolerance!r}."
+            )
+
         spikes_arr = jnp.asarray(spikes)
         if spikes_arr.ndim == 1:
             spikes_arr = spikes_arr[:, None]
         validate_count_array(spikes_arr, "spikes", allow_empty=False)
+        if spikes_arr.ndim != 2:
+            raise ValueError(
+                "spikes must be 1D (n_time,) or 2D (n_time, n_neurons); "
+                f"got shape {spikes_arr.shape}."
+            )
         self.n_neurons = int(spikes_arr.shape[1])
-        Z, spk = self._design_and_spikes(times, trajectory, spikes_arr)
+        Z, spk, valid = self._design_and_spikes(times, trajectory, spikes_arr)
         self._n_time = int(Z.shape[0])
+        n_valid = int(jnp.sum(valid))
+        if n_valid == 0:
+            raise ValueError(
+                "trajectory contains no in-bounds observations for this environment."
+            )
+        if self.update_drift_scale and self._n_time < 2:
+            raise ValueError(
+                "at least two time rows are required to update "
+                "drift_scale; set update_drift_scale=False to keep it fixed."
+            )
 
         if warm_start:
             self._warm_start(times, trajectory, spikes_arr)
-        elif self.init_mean is None:
+        elif self.init_mean is None or self.init_mean.shape != (
+            self.n_neurons,
+            self.rank,
+        ):
             self.init_mean = jnp.zeros((self.n_neurons, self.rank))
         self.drift_scale = jnp.full(self.n_neurons, self.init_drift_scale)
 
@@ -1049,6 +1379,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
 
         self.log_likelihoods = []
         last_state: Optional[dict] = None
+        converged = False
 
         def _capture() -> dict:
             return {
@@ -1071,7 +1402,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                     setattr(self, k, v)
 
         for iteration in range(max_iter):
-            ll = self._e_step(Z, spk)
+            ll = self._e_step(Z, spk, valid)
             self.log_likelihoods.append(ll)
             _log(f"  EM iter {iteration + 1}/{max_iter}: LL = {ll:.2f}")
             if not np.isfinite(ll):
@@ -1096,5 +1427,161 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                     break
             last_state = _capture()
             self._m_step()
+        else:
+            # The loop ends immediately after an M-step. Evaluate that candidate so
+            # returned parameters, posteriors, and LL all describe the same state.
+            final_ll = self._e_step(Z, spk, valid)
+            final_is_finite = np.isfinite(final_ll)
+            final_converged, final_increasing = check_converged(
+                final_ll, self.log_likelihoods[-1], tolerance
+            )
+            if final_is_finite and final_increasing:
+                self.log_likelihoods.append(final_ll)
+                converged = bool(final_converged)
+            else:
+                _restore(last_state)
+                _log("  WARNING: final E-step rejected the last M-step; rolling back.")
 
+        self._finalize_convergence(bool(converged), max_iter)
         return self.log_likelihoods
+
+    # --- SGDFittableMixin protocol ---
+
+    @property
+    def _n_timesteps(self) -> int:
+        return self._n_time
+
+    def _check_sgd_initialized(self) -> None:
+        if self.init_mean is None or self.drift_scale is None or self._n_time <= 0:
+            raise RuntimeError(
+                "Model not initialized. Call fit_sgd(times, trajectory, spikes), "
+                "not SGDFittableMixin.fit_sgd() directly."
+            )
+
+    def _build_param_spec(self) -> tuple[dict, dict]:
+        from state_space_practice.parameter_transforms import POSITIVE, UNCONSTRAINED
+
+        assert self.init_mean is not None
+        assert self.drift_scale is not None
+        params: dict = {"kappa2": jnp.asarray(self.kappa2)}
+        spec: dict = {"kappa2": POSITIVE}
+        if self.update_drift_scale:
+            params["drift_scale"] = self.drift_scale
+            spec["drift_scale"] = POSITIVE
+        if self.update_amplitude:
+            params["tau2"] = jnp.asarray(self.tau2)
+            spec["tau2"] = POSITIVE
+        if self.update_init_mean:
+            params["init_mean"] = self.init_mean
+            spec["init_mean"] = UNCONSTRAINED
+        return params, spec
+
+    def _sgd_loss_fn(
+        self, params: dict, Z: Array, spikes: Array, valid: Array
+    ) -> Array:
+        assert self.init_mean is not None
+        assert self.drift_scale is not None
+        kappa2 = params.get("kappa2", self.kappa2)
+        tau2 = params.get("tau2", self.tau2)
+        drift_scale = params.get("drift_scale", self.drift_scale)
+        init_mean = params.get("init_mean", self.init_mean)
+        eigvals = jnp.asarray(self.basis.eigvals)
+        S = (kappa2 + eigvals) ** (-self.alpha)
+        P0 = jnp.diag(tau2 * S)
+
+        def _one(m0: Array, spk: Array, q_c: Array) -> Array:
+            _, _, marginal_ll = _masked_graph_point_process_filter(
+                m0,
+                P0,
+                Z,
+                spk,
+                valid,
+                self.transition_matrix,
+                jnp.diag(q_c * S),
+                dt=self.dt,
+                max_log_count=self._max_log_count,
+                max_newton_iter=self.max_newton_iter,
+            )
+            return marginal_ll
+
+        marginal_ll = jax.vmap(_one, in_axes=(0, 0, 0))(init_mean, spikes, drift_scale)
+        return -jnp.sum(marginal_ll)
+
+    def _store_sgd_params(self, params: dict) -> None:
+        if "drift_scale" in params:
+            self.drift_scale = params["drift_scale"]
+        if "tau2" in params:
+            self.tau2 = float(params["tau2"])
+        if "kappa2" in params:
+            self.kappa2 = float(params["kappa2"])
+        if "init_mean" in params:
+            self.init_mean = params["init_mean"]
+
+    def _finalize_sgd(self, Z: Array, spikes: Array, valid: Array) -> None:
+        self.log_likelihoods = [self._e_step(Z, spikes, valid)]
+
+    def fit_sgd(  # type: ignore[override]
+        self,
+        times: NDArray[np.float64],
+        trajectory: NDArray[np.float64],
+        spikes: ArrayLike,
+        *,
+        optimizer: Optional[object] = None,
+        num_steps: int = 200,
+        verbose: bool = False,
+        convergence_tol: Optional[float] = None,
+        warm_start: bool = True,
+    ) -> list[float]:
+        """Fit graph hyperparameters by minimizing the negative marginal LL."""
+        spikes_arr = jnp.asarray(spikes)
+        if spikes_arr.ndim == 1:
+            spikes_arr = spikes_arr[:, None]
+        validate_count_array(spikes_arr, "spikes", allow_empty=False)
+        if spikes_arr.ndim != 2:
+            raise ValueError(
+                "spikes must be 1D (n_time,) or 2D (n_time, n_neurons); "
+                f"got shape {spikes_arr.shape}."
+            )
+        self.n_neurons = int(spikes_arr.shape[1])
+        Z, spk, valid = self._design_and_spikes(times, trajectory, spikes_arr)
+        self._n_time = int(Z.shape[0])
+        n_valid = int(jnp.sum(valid))
+        if n_valid == 0:
+            raise ValueError(
+                "trajectory contains no in-bounds observations for this environment."
+            )
+        if self.update_drift_scale and self._n_time < 2:
+            raise ValueError(
+                "at least two time rows are required to update "
+                "drift_scale; set update_drift_scale=False to keep it fixed."
+            )
+
+        state_shape_matches = self.init_mean is not None and self.init_mean.shape == (
+            self.n_neurons,
+            self.rank,
+        )
+        if warm_start:
+            self._warm_start(times, trajectory, spikes_arr)
+        elif not state_shape_matches:
+            self.init_mean = jnp.zeros((self.n_neurons, self.rank))
+
+        drift_shape_matches = (
+            self.drift_scale is not None and self.drift_scale.shape == (self.n_neurons,)
+        )
+        if warm_start or not drift_shape_matches:
+            initial_drift = self.init_drift_scale
+            if self.update_drift_scale:
+                initial_drift = max(initial_drift, 1e-12)
+            self.drift_scale = jnp.full(self.n_neurons, initial_drift)
+
+        _validate_filter_numerics(self.prior_cov(), n_time=self._n_time)
+
+        return super().fit_sgd(
+            Z,
+            spk,
+            valid,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+        )

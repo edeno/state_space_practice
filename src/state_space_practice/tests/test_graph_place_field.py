@@ -410,6 +410,33 @@ def test_static_glm_multineuron_matches_per_neuron(small_grid_env):
         np.testing.assert_allclose(np.asarray(w_multi[j]), np.asarray(w_j), atol=1e-8)
 
 
+def test_static_glm_damps_high_count_newton_step():
+    """A high-count intercept must not take the divergent full Newton steps."""
+    from state_space_practice.graph_place_field import static_log_evidence
+
+    counts = np.array([100.0])
+    occupancy = np.array([1.0])
+    eigvecs = np.array([[1.0]])
+    penalty = np.array([0.1])
+
+    weights, cov = fit_static_graph_glm(counts, occupancy, eigvecs, penalty)
+
+    # The MAP solves exp(w) + 0.1 w = 100. A full first Newton step is about 90,
+    # so this regression specifically requires damping/backtracking.
+    np.testing.assert_allclose(np.asarray(weights), [4.600559011835084], atol=1e-8)
+    assert np.all(np.isfinite(np.asarray(cov)))
+
+    evidence = static_log_evidence(
+        counts,
+        occupancy,
+        eigvecs,
+        np.array([0.0]),
+        tau2=10.0,
+        kappa2=1.0,
+    )
+    assert np.isfinite(evidence)
+
+
 # --------------------------------------------------------------------------- evidence
 from state_space_practice.graph_place_field import (  # noqa: E402
     select_tau2_by_evidence,
@@ -574,8 +601,8 @@ def test_estep_returns_finite_total_ll_and_stores_posteriors(small_grid_env):
     model.n_neurons = 3
     model.drift_scale = jnp.full(3, 1e-3)
     model.init_mean = jnp.zeros((3, model.rank))
-    Z, spk = model._design_and_spikes(times, traj, spikes)
-    ll = model._e_step(Z, spk)
+    Z, spk, valid = model._design_and_spikes(times, traj, spikes)
+    ll = model._e_step(Z, spk, valid)
     assert np.isfinite(ll)
     assert model.smoother_mean.shape == (3, n_time, model.rank)
 
@@ -590,15 +617,63 @@ def test_estep_neurons_are_independent(small_grid_env):
     model.n_neurons = 2
     model.drift_scale = jnp.full(2, 1e-3)
     model.init_mean = jnp.zeros((2, model.rank))
-    Z, spk = model._design_and_spikes(times, traj, spikes)
-    model._e_step(Z, spk)
+    Z, spk, valid = model._design_and_spikes(times, traj, spikes)
+    model._e_step(Z, spk, valid)
     sm0 = np.asarray(model.smoother_mean[0]).copy()
     # Perturb neuron 1's spikes only; neuron 0's smoothed trajectory must not change.
     spikes2 = spikes.copy()
     spikes2[:, 1] += 1.0
-    Z2, spk2 = model._design_and_spikes(times, traj, spikes2)
-    model._e_step(Z2, spk2)
+    Z2, spk2, valid2 = model._design_and_spikes(times, traj, spikes2)
+    model._e_step(Z2, spk2, valid2)
     np.testing.assert_allclose(sm0, np.asarray(model.smoother_mean[0]), atol=1e-9)
+
+
+def test_graph_filter_uses_p0_at_row_zero_and_propagates_masked_rows():
+    from state_space_practice.graph_place_field import (
+        _masked_graph_point_process_filter,
+    )
+
+    _, filtered_cov, _ = _masked_graph_point_process_filter(
+        init_mean=jnp.zeros(1),
+        init_cov=jnp.array([[2.0]]),
+        design_matrix=jnp.zeros((3, 1)),
+        spikes=jnp.zeros(3),
+        valid=jnp.array([True, False, True]),
+        transition_matrix=jnp.eye(1),
+        process_cov=jnp.array([[3.0]]),
+        dt=0.02,
+        max_log_count=20.0,
+        max_newton_iter=1,
+    )
+
+    # Zero design rows carry no state information. Row zero therefore keeps P0
+    # exactly, while the masked middle row still advances the random walk.
+    np.testing.assert_allclose(
+        np.asarray(filtered_cov[:, 0, 0]), [2.0, 5.0, 8.0], atol=1e-7
+    )
+
+
+def test_tau_mstep_includes_fixed_prior_mean_residual(small_grid_env):
+    model = GraphPlaceFieldModel(
+        small_grid_env,
+        dt=0.02,
+        rank=1,
+        kappa2=1.0,
+        update_drift_scale=False,
+        update_amplitude=True,
+        update_init_mean=False,
+    )
+    model.init_mean = jnp.zeros((1, 1))
+    model.drift_scale = jnp.array([1e-3])
+    model.smoother_mean = jnp.array([[[10.0]]])
+    model.smoother_cov = jnp.array([[[[1.0]]]])
+    model.smoother_cross_cov = jnp.zeros((1, 0, 1, 1))
+
+    shape = float(model._spectral_shape_current()[0])
+    model._m_step()
+
+    assert model.tau2 == pytest.approx((1.0 + 10.0**2) / shape)
+    np.testing.assert_array_equal(np.asarray(model.init_mean), [[0.0]])
 
 
 # --------------------------------------------------------------------------- Task 6: fit (EM)
@@ -645,6 +720,133 @@ def test_fit_em_is_monotone_under_rollback(small_grid_env):
     # GEM rollback guarantees the accepted LL sequence never decreases.
     assert np.all(diffs >= -1e-6)
     assert len(lls) >= 2  # guard: EM actually iterated
+
+
+@pytest.mark.slow
+def test_terminal_mstep_returns_matching_ll_and_posteriors(small_grid_env):
+    times, traj = _toy_trajectory(small_grid_env, 60, seed=11)
+    spikes = np.random.default_rng(12).poisson(0.05, size=60).astype(float)
+    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
+
+    lls = model.fit(times, traj, spikes, max_iter=1, verbose=False)
+    stored_mean = np.asarray(model.smoother_mean).copy()
+    Z, spk, valid = model._design_and_spikes(times, traj, spikes)
+    fresh_ll = model._e_step(Z, spk, valid)
+
+    assert lls[-1] == pytest.approx(fresh_ll, abs=1e-8)
+    np.testing.assert_allclose(stored_mean, np.asarray(model.smoother_mean), atol=1e-8)
+
+
+@pytest.mark.slow
+def test_missing_positions_keep_timeline_and_validate_observation_count(
+    small_grid_env,
+):
+    center = np.asarray(small_grid_env.bin_centers[0])
+    outside = np.full_like(center, 1e9)
+    times = np.arange(3, dtype=float) * 0.02
+    one_valid_trajectory = np.stack((center, outside, outside))
+    spikes = np.zeros(3)
+
+    frozen = GraphPlaceFieldModel(
+        small_grid_env,
+        dt=0.02,
+        rank=3,
+        update_amplitude=False,
+        update_init_mean=False,
+    )
+    frozen.fit(
+        times,
+        one_valid_trajectory,
+        spikes,
+        max_iter=1,
+        warm_start=False,
+        verbose=False,
+    )
+    assert frozen.smoother_mean.shape[1] == 3
+    assert np.all(np.isfinite(np.asarray(frozen.drift_scale)))
+
+    updating = GraphPlaceFieldModel(
+        small_grid_env,
+        dt=0.02,
+        rank=3,
+        update_drift_scale=True,
+    )
+    updating.fit(times, one_valid_trajectory, spikes, max_iter=1, verbose=False)
+    assert np.all(np.isfinite(np.asarray(updating.drift_scale)))
+
+    with pytest.raises(ValueError, match="at least two time rows"):
+        updating.fit(
+            times[:1],
+            one_valid_trajectory[:1],
+            spikes[:1],
+            max_iter=1,
+            verbose=False,
+        )
+
+    with pytest.raises(ValueError, match="no in-bounds"):
+        frozen.fit(
+            times,
+            np.stack((outside, outside, outside)),
+            spikes,
+            max_iter=1,
+            verbose=False,
+        )
+
+
+@pytest.mark.slow
+def test_cold_start_fit_resets_init_mean_when_neuron_count_changes(small_grid_env):
+    times, traj = _toy_trajectory(small_grid_env, 10, seed=31)
+    model = GraphPlaceFieldModel(
+        small_grid_env,
+        dt=0.02,
+        rank=3,
+        update_amplitude=False,
+        update_init_mean=False,
+    )
+    model.fit(
+        times,
+        traj,
+        np.zeros(10),
+        max_iter=1,
+        warm_start=False,
+        verbose=False,
+    )
+    model.fit(
+        times,
+        traj,
+        np.zeros((10, 2)),
+        max_iter=1,
+        warm_start=False,
+        verbose=False,
+    )
+
+    assert model.init_mean.shape == (2, model.rank)
+    assert model.smoother_mean.shape[0] == 2
+
+
+@pytest.mark.slow
+def test_fit_sgd_runs_and_default_keeps_drift_fixed(small_grid_env):
+    times, traj = _toy_trajectory(small_grid_env, 30, seed=21)
+    spikes = np.random.default_rng(22).poisson(0.05, size=30).astype(float)
+    model = GraphPlaceFieldModel(
+        small_grid_env,
+        dt=0.02,
+        rank=3,
+        init_drift_scale=2e-3,
+    )
+
+    lls = model.fit_sgd(
+        times,
+        traj,
+        spikes,
+        num_steps=1,
+        warm_start=False,
+        verbose=False,
+    )
+
+    assert lls and np.all(np.isfinite(lls))
+    np.testing.assert_allclose(np.asarray(model.drift_scale), [2e-3], atol=0.0)
+    assert model.smoother_mean is not None
 
 
 # NOTE: a drift-scale recovery test (EM recovers the simulated q_c) is deliberately
