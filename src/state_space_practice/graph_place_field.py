@@ -650,6 +650,22 @@ def spectral_precision(
 
     The reciprocal of the prior variance ``tau2 * S`` with ``S`` the spectral shape.
     Finite at the null modes because ``kappa2 > 0``.
+
+    Parameters
+    ----------
+    eigvals : NDArray, shape (rank,)
+        Laplacian eigenvalues (non-negative).
+    tau2 : float
+        Prior amplitude; must be positive.
+    kappa2 : float
+        Inverse-lengthscale squared; must be positive.
+    alpha : float, optional
+        Smoothness exponent, by default 1.0; must be positive.
+
+    Returns
+    -------
+    NDArray, shape (rank,)
+        Diagonal prior precision.
     """
     if not tau2 > 0:
         raise ValueError(f"tau2 (prior amplitude) must be positive, got {tau2}.")
@@ -666,6 +682,18 @@ def parity_penalty(
     :func:`build_graph_basis`) are set to zero so they act as unpenalized per-component
     intercepts. This is the MRF-parity configuration: the penalty is the eigenvalues
     themselves and the REML counterpart counts only positive eigenvalues.
+
+    Parameters
+    ----------
+    eigvals : NDArray, shape (rank,)
+        Laplacian eigenvalues (non-negative, ascending).
+    n_components : int
+        Number of leading null modes to zero out.
+
+    Returns
+    -------
+    NDArray, shape (rank,)
+        ``eigvals`` with the first ``n_components`` entries set to zero.
     """
     penalty = np.array(eigvals, dtype=float)
     if n_components < 0 or n_components > penalty.shape[0]:
@@ -899,6 +927,28 @@ def static_log_evidence(
     evaluated at the MAP ``w``, with ``Lam = P0^{-1}`` the spectral precision and
     ``H = Phi^T diag(mu) Phi + Lam``. Constant ``log(count!)`` terms are dropped (they
     do not depend on ``tau2``). Summed over neurons for multi-neuron ``counts``.
+
+    Parameters
+    ----------
+    counts : ArrayLike, shape (n_bins,) or (n_bins, n_neurons)
+        Per-active-bin spike counts (from :func:`bin_spike_counts`).
+    occupancy : ArrayLike, shape (n_bins,)
+        Per-active-bin exposure in seconds (from :func:`bin_occupancy`).
+    eigvecs : ArrayLike, shape (n_bins, rank)
+        The basis ``Phi`` (``GraphBasis.eigvecs``).
+    eigvals : ArrayLike, shape (rank,)
+        Laplacian eigenvalues (``GraphBasis.eigvals``).
+    tau2 : float
+        Prior amplitude; must be positive.
+    kappa2 : float
+        Inverse-lengthscale squared; must be positive.
+    alpha : float, optional
+        Smoothness exponent, by default 1.0.
+
+    Returns
+    -------
+    float
+        Laplace log-evidence, summed over neurons for multi-neuron ``counts``.
     """
     Phi = jnp.asarray(eigvecs)
     occ = jnp.asarray(occupancy)
@@ -942,6 +992,27 @@ def select_tau2_by_evidence(
 
     Optimizes over ``log tau2`` with a bounded scalar optimizer (the evidence is smooth
     and unimodal in ``log tau2`` for a fixed ``kappa2``).
+
+    Parameters
+    ----------
+    counts : ArrayLike, shape (n_bins,) or (n_bins, n_neurons)
+        Per-active-bin spike counts (from :func:`bin_spike_counts`).
+    occupancy : ArrayLike, shape (n_bins,)
+        Per-active-bin exposure in seconds (from :func:`bin_occupancy`).
+    basis : GraphBasis
+        Supplies ``eigvecs`` and ``eigvals`` for the evidence evaluation.
+    kappa2 : float
+        Inverse-lengthscale squared; must be positive.
+    alpha : float, optional
+        Smoothness exponent, by default 1.0.
+    bounds : tuple[float, float], optional
+        Search interval for ``tau2``, by default ``(1e-4, 1e4)``; both endpoints
+        must be finite and positive, with the lower strictly below the upper.
+
+    Returns
+    -------
+    float
+        The evidence-maximizing ``tau2``.
     """
     bounds_arr = np.asarray(bounds, dtype=float)
     if (
@@ -992,6 +1063,40 @@ def _masked_graph_point_process_filter(
     conditioned directly on ``(init_mean, init_cov)``.  Subsequent rows receive one
     dynamics transition each.  A row whose position is invalid skips only the
     observation update; its dynamics propagation remains in the state trajectory.
+
+    Parameters
+    ----------
+    init_mean : Array, shape (rank,)
+        Prior mean conditioning the first observation.
+    init_cov : Array, shape (rank, rank)
+        Prior covariance conditioning the first observation.
+    design_matrix : Array, shape (n_time, rank)
+        Per-time design rows ``Z`` (basis evaluated at the animal's position).
+    spikes : Array, shape (n_time,)
+        Per-time spike counts for this neuron.
+    valid : Array, shape (n_time,)
+        Boolean mask; ``False`` rows skip the observation update but still
+        receive a dynamics transition.
+    transition_matrix : Array, shape (rank, rank)
+        State transition matrix ``A``.
+    process_cov : Array, shape (rank, rank)
+        Process noise covariance ``Q``.
+    dt : float
+        Sampling interval in seconds, passed to the Poisson observation family.
+    max_log_count : float
+        Clamp on the log conditional intensity, passed to the Poisson
+        observation family.
+    max_newton_iter : int
+        Maximum Newton iterations for each per-time Laplace update.
+
+    Returns
+    -------
+    filtered_mean : Array, shape (n_time, rank)
+        Filtered state means.
+    filtered_cov : Array, shape (n_time, rank, rank)
+        Filtered state covariances.
+    marginal_ll : Array, scalar
+        Total marginal log-likelihood summed over time bins.
     """
     family = poisson_family(dt, max_log_count=max_log_count)
 
@@ -1107,6 +1212,62 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         max_firing_rate_hz: float = 500.0,
         max_newton_iter: int = 1,
     ) -> None:
+        """Build the graph basis and initialize model hyperparameters.
+
+        Parameters
+        ----------
+        env : neurospatial.Environment
+            A fitted environment; supplies the graph substrate for
+            :func:`build_graph_basis`.
+        dt : float
+            Sampling interval in seconds; must be positive.
+        rank : int or None, optional
+            Number of smoothest graph-Laplacian modes to keep, forwarded to
+            :func:`build_graph_basis`. ``None`` (default) keeps all modes unless
+            ``sigma`` is given.
+        sigma : float or None, optional
+            Smoothing bandwidth, forwarded to :func:`build_graph_basis`.
+        kappa2 : float, optional
+            Inverse-lengthscale squared in the spectral shape
+            ``S = (kappa2 + lambda) ** (-alpha)``, by default 1.0; must be
+            positive.
+        alpha : float, optional
+            Smoothness exponent, by default 1.0; must be positive.
+        tau2 : float, optional
+            Initial prior/initial-state amplitude ``P0 = tau2 * S``, by default
+            1.0; must be positive.
+        init_drift_scale : float, optional
+            Initial per-neuron drift scale ``q_c`` used to seed ``drift_scale``
+            before fitting, by default 1e-3; must be non-negative.
+        interpolation : {"nearest"}, optional
+            Design-matrix lookup mode forwarded to :func:`graph_design_matrix`,
+            by default ``"nearest"``. ``"linear"`` is accepted by the signature
+            but not implemented.
+        laplacian_convention : {"distance", "inverse_distance"}, optional
+            Edge-weight convention forwarded to :func:`build_graph_basis`, by
+            default ``"distance"``.
+        update_drift_scale : bool, optional
+            Whether ``fit``'s M-step updates the per-neuron drift scale ``q_c``,
+            by default **False**. The approximate Laplace-EKF marginal
+            likelihood does not reliably identify ``q_c`` from spike
+            observations, so learning it is an explicit opt-in.
+        update_amplitude : bool, optional
+            Whether ``fit``'s M-step updates ``tau2``, by default True.
+        update_init_mean : bool, optional
+            Whether ``fit``'s M-step updates the per-neuron initial state mean,
+            by default True.
+        update_kappa2 : bool, optional
+            Whether ``fit_sgd`` optimizes ``kappa2``, by default True.
+            ``kappa2`` reshapes the spectral shape nonlinearly, so it has no
+            closed-form EM M-step and is learnable by ``fit_sgd`` only.
+        max_firing_rate_hz : float, optional
+            Maximum firing rate (Hz) used to clamp the log conditional
+            intensity for numerical stability, by default 500.0; must be
+            positive.
+        max_newton_iter : int, optional
+            Maximum Newton iterations per time-step Laplace update in the
+            filter, by default 1.
+        """
         if not dt > 0:
             raise ValueError(f"dt must be positive, got {dt}.")
         if not kappa2 > 0:
@@ -1337,7 +1498,31 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         warm_start: bool = True,
         verbose: bool = True,
     ) -> list[float]:
-        """Fit by EM (GEM with rollback). Returns the accepted marginal-LL history."""
+        """Fit by EM (GEM with rollback). Returns the accepted marginal-LL history.
+
+        Parameters
+        ----------
+        times : NDArray, shape (n_time,)
+            Sample times in seconds.
+        trajectory : NDArray, shape (n_time,) or (n_time, n_dims)
+            Animal position at each time sample.
+        spikes : ArrayLike, shape (n_time,) or (n_time, n_neurons)
+            Per-time spike counts.
+        max_iter : int, optional
+            Maximum EM iterations, by default 100.
+        tolerance : float, optional
+            Relative marginal-LL convergence tolerance, by default 1e-4.
+        warm_start : bool, optional
+            Initialize ``init_mean`` from the static GLM MAP on aggregated bins
+            (and reset ``drift_scale`` to ``init_drift_scale``), by default True.
+        verbose : bool, optional
+            Print per-iteration marginal LL, by default True.
+
+        Returns
+        -------
+        list[float]
+            Accepted marginal log-likelihood at each EM iteration.
+        """
         if isinstance(max_iter, (bool, np.bool_)) or not isinstance(
             max_iter, (int, np.integer)
         ):
@@ -1579,7 +1764,37 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         convergence_tol: Optional[float] = None,
         warm_start: bool = True,
     ) -> list[float]:
-        """Fit graph hyperparameters by minimizing the negative marginal LL."""
+        """Fit graph hyperparameters by minimizing the negative marginal LL.
+
+        Parameters
+        ----------
+        times : NDArray, shape (n_time,)
+            Sample times in seconds.
+        trajectory : NDArray, shape (n_time,) or (n_time, n_dims)
+            Animal position at each time sample.
+        spikes : ArrayLike, shape (n_time,) or (n_time, n_neurons)
+            Per-time spike counts.
+        optimizer : optax optimizer or None, optional
+            Gradient transformation to use; ``None`` (default) uses
+            ``adam(1e-2)`` with gradient clipping.
+        num_steps : int, optional
+            Number of optimization steps, by default 200.
+        verbose : bool, optional
+            Log progress every 10 steps, by default False.
+        convergence_tol : float or None, optional
+            If set, stop early once the relative change in marginal LL falls
+            below this tolerance for 5 consecutive steps; ``None`` (default)
+            disables early stopping.
+        warm_start : bool, optional
+            Initialize ``init_mean`` from the static GLM MAP on aggregated bins
+            (and reset ``drift_scale``), by default True.
+
+        Returns
+        -------
+        list[float]
+            Marginal log-likelihood at each evaluated optimization step that
+            produced a finite loss.
+        """
         spikes_arr = jnp.asarray(spikes)
         if spikes_arr.ndim == 1:
             spikes_arr = spikes_arr[:, None]
@@ -1695,6 +1910,21 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         Runs the same masked forward filter as the E-step (no smoothing, no parameter
         updates) with the current parameters, summed over neurons. On the training data
         this matches the fit's final marginal log-likelihood.
+
+        Parameters
+        ----------
+        times : NDArray, shape (n_time,)
+            Sample times in seconds.
+        trajectory : NDArray, shape (n_time,) or (n_time, n_dims)
+            Animal position at each time sample.
+        spikes : ArrayLike, shape (n_time,) or (n_time, n_neurons)
+            Per-time spike counts; the neuron axis must match the fitted
+            ``n_neurons``.
+
+        Returns
+        -------
+        float
+            Total marginal log-likelihood, summed over neurons.
         """
         self._check_fitted("score")
         assert self.init_mean is not None

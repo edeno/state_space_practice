@@ -1,9 +1,10 @@
-"""Phase-0 contract tests for the graph-Laplacian spatial substrate.
+"""Tests for the graph-Laplacian place-field model and its spatial substrate.
 
-These exercise the seam between ``neurospatial`` and this package: the eigenbasis
-build, the spectral shape, and the trajectory -> (design matrix, occupancy, spike
-counts) helpers. They are the tripwires for the interface bugs (row misalignment,
-wrong Laplacian weighting, off-by-component null modes) called out in the plan.
+These exercise the seam between ``neurospatial`` and this package (eigenbasis build,
+spectral shape, and the trajectory -> (design matrix, occupancy, spike counts)
+helpers) plus the static and drifting model on top of it. The substrate tests are
+tripwires for the interface bugs that silently corrupt place fields: row
+misalignment, wrong Laplacian weighting, and off-by-component null modes.
 """
 
 import networkx as nx
@@ -316,7 +317,7 @@ def test_build_graph_basis_rejects_nonpositive_sigma(small_grid_env):
         build_graph_basis(small_grid_env, sigma=0.0)
 
 
-# --------------------------------------------------------------------------- Stage 1: static GLM
+# --------------------------------------------------------------------------- static GLM
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 
@@ -356,7 +357,7 @@ def test_static_glm_recovers_smooth_field(small_grid_env):
     # NOTE: small_grid_env is only ~25 bins; rank and exposure are calibrated so a
     # correct solver clears corr > 0.95 with margin (empirically mean 0.99 / min 0.97
     # across seeds) while a broken gradient/Hessian still fails. Offset-bug sensitivity
-    # is covered separately by the independent-optimizer parity test (Task 3), which
+    # is covered separately by test_newton_map_matches_independent_optimizer, which
     # uses the real log(occupancy) offset; with uniform occupancy a correlation test
     # cannot see offset bugs.
     from state_space_practice.graph_place_field import build_graph_basis
@@ -480,7 +481,7 @@ def test_evidence_is_maximized_near_selected_tau2(small_grid_env):
     assert 1e-4 < tau2_hat < 1e4  # inside the search bounds (not railed)
 
 
-# --------------------------------------------------------------------------- Task 3: validation
+# ------------------------------------------------- static parity + W-maze recovery
 @pytest.mark.slow
 def test_newton_map_matches_independent_optimizer(small_grid_env):
     """Our Newton MAP equals a scipy L-BFGS optimum on the identical penalized NLL."""
@@ -548,7 +549,7 @@ def test_static_field_recovers_wmaze_place_cells(w_maze_env):
     assert np.median(corrs) > 0.6
 
 
-# --------------------------------------------------------------------------- Task 4: model
+# --------------------------------------------------------------- model construction
 from state_space_practice.graph_place_field import GraphPlaceFieldModel  # noqa: E402
 
 
@@ -581,7 +582,7 @@ def test_model_rejects_bad_hyperparameters(small_grid_env):
         GraphPlaceFieldModel(small_grid_env, dt=0.02, alpha=0.0)
 
 
-# --------------------------------------------------------------------------- Task 5: E-step
+# -------------------------------------------------------- E-step (masked filter)
 def _toy_trajectory(env, n_time, seed=0):
     """A trajectory that visits real bin centers (so all rows are in-bounds)."""
     rng = np.random.default_rng(seed)
@@ -676,7 +677,7 @@ def test_tau_mstep_includes_fixed_prior_mean_residual(small_grid_env):
     np.testing.assert_array_equal(np.asarray(model.init_mean), [[0.0]])
 
 
-# --------------------------------------------------------------------------- Task 6: fit (EM)
+# --------------------------------------------------------------------------- fit (EM)
 def _simulate_drifting_spikes(env, basis, dt, n_time, q_c, tau2, kappa2, seed):
     """Poisson spikes from a coefficient random walk w_t = w_{t-1} + N(0, q_c*S)."""
     from state_space_practice.graph_place_field import spectral_shape
@@ -849,13 +850,15 @@ def test_fit_sgd_runs_and_default_keeps_drift_fixed(small_grid_env):
     assert model.smoother_mean is not None
 
 
-# NOTE: a drift-scale recovery test (EM recovers the simulated q_c) is deliberately
-# absent pending a design decision. Investigation showed the Laplace-EKF marginal
-# log-likelihood computed here is monotonically increasing in q_c rather than peaking
-# at the generating value, so q_c is not identified by this objective and EM returns
-# approximately whatever q_c it was initialized with. The M-step algebra itself is
-# correct: fed the exact generative trajectory it recovers q_c to ~1%. See
-# .superpowers/sdd/task-6-report.md for the full evidence.
+# NOTE: there is deliberately no q_c-recovery test (EM/SGD recovering the simulated
+# drift scale). The Laplace-EKF marginal log-likelihood used here is monotonically
+# increasing in q_c rather than peaking at the generating value, so q_c is not
+# identified by this objective and EM returns approximately its initialization -- a
+# recovery test would assert a false claim. This is why update_drift_scale defaults
+# to False. The M-step algebra itself is correct (verified below in
+# test_drift_scale_mstep_matches_closed_form, and by feeding the exact generative
+# w_{c,t} trajectory into the M-step, which recovers q_c to ~1%). Drift *tracking*
+# (not learning) is validated by test_smoother_beats_filter_beats_static_on_drifting_data.
 
 
 @pytest.mark.slow
@@ -902,7 +905,7 @@ def test_static_limit_matches_static_estimator(small_grid_env):
     assert corr > 0.95
 
 
-# ------------------------------------------------- Task 8: prediction & drift ordering
+# ------------------------------------------- prediction, scoring & drift/geometry
 def _simulate_field_drift_spikes(env, basis, dt, n_time, q_c, seed, rate_hz=30.0):
     """Poisson spikes from a field that drifts in the non-null modes only.
 
@@ -1072,3 +1075,168 @@ def _bin_ids_for_test(env, times, trajectory):
         np.asarray(times, dtype=float), traj, dedup=False, outside_value=-1
     )
     return np.asarray(ids, dtype=int)
+
+
+# ------------------------------------------------- multi-neuron, scoring & config gaps
+@pytest.mark.slow
+def test_multineuron_fit_recovers_distinct_per_neuron_fields(small_grid_env):
+    """The vmap warm-start + M-step must keep neurons separate: each neuron recovers
+    ITS own field, not a mix. A neuron-axis transposition would fail the cross guard."""
+    basis = build_graph_basis(small_grid_env, rank=8)
+    centers = np.asarray(small_grid_env.bin_centers)
+    n_time = 2500
+    rng = np.random.default_rng(7)
+    idx = rng.integers(0, centers.shape[0], size=n_time)
+    times = np.arange(n_time, dtype=float) * 0.02
+    traj = centers[idx]
+    Z = np.asarray(basis.eigvecs)[idx]
+
+    def make_field(seed):
+        r = np.random.default_rng(seed)
+        w = np.zeros(8)
+        w[1:5] = r.standard_normal(4)
+        w[0] = np.log(25.0) / float(basis.eigvecs[0, 0])
+        return w
+
+    w0, w1 = make_field(1), make_field(2)
+    spikes = np.stack(
+        [rng.poisson(np.exp(Z @ w0) * 0.02), rng.poisson(np.exp(Z @ w1) * 0.02)],
+        axis=1,
+    ).astype(float)
+
+    model = GraphPlaceFieldModel(
+        small_grid_env,
+        dt=0.02,
+        rank=8,
+        kappa2=1.0,
+        tau2=1.0,
+        update_drift_scale=False,
+        update_amplitude=False,
+    )
+    model.fit(times, traj, spikes, max_iter=8, verbose=False)
+    assert model.smoother_mean.shape[0] == 2
+
+    occ = bin_occupancy(small_grid_env, times, traj, 0.02)
+    visited = occ > 0
+    true0 = np.exp(np.asarray(basis.eigvecs @ w0))
+    true1 = np.exp(np.asarray(basis.eigvecs @ w1))
+    r00 = np.corrcoef(model.predict_rate_map(0)[visited], true0[visited])[0, 1]
+    r11 = np.corrcoef(model.predict_rate_map(1)[visited], true1[visited])[0, 1]
+    r01 = np.corrcoef(model.predict_rate_map(0)[visited], true1[visited])[0, 1]
+    assert r00 > 0.9 and r11 > 0.9  # each neuron recovers its own field
+    assert r00 > r01 + 0.2  # and not the other's (guard against neuron-axis mixup)
+
+
+@pytest.mark.slow
+def test_score_uses_heldout_spikes_and_positions(small_grid_env):
+    """score() must actually run the filter on its arguments: a genuinely held-out,
+    correctly aligned spike train scores higher than a shifted (mis-aligned) one."""
+    basis = build_graph_basis(small_grid_env, rank=8)
+    times, traj, spikes, _eta, _w = _simulate_field_drift_spikes(
+        small_grid_env, basis, dt=0.02, n_time=2400, q_c=0.0, seed=5
+    )
+    half = 1200
+    model = GraphPlaceFieldModel(
+        small_grid_env,
+        dt=0.02,
+        rank=8,
+        kappa2=1.0,
+        tau2=1.0,
+        update_drift_scale=False,
+        update_amplitude=False,
+    )
+    model.fit(times[:half], traj[:half], spikes[:half], max_iter=8, verbose=False)
+    ll_aligned = model.score(times[half:], traj[half:], spikes[half:])
+    # Rolling the held-out spikes by a large shift breaks the position<->rate
+    # alignment; the fitted field must assign it a lower likelihood.
+    ll_shifted = model.score(times[half:], traj[half:], np.roll(spikes[half:], 600))
+    assert np.isfinite(ll_aligned)
+    assert ll_aligned > ll_shifted
+
+
+def test_drift_scale_mstep_matches_closed_form(small_grid_env):
+    """The closed-form drift_scale M-step q* = mean_j(diag(E[dw dw^T])_j / S_j),
+    pinned to a hand-computed value on a 1-mode, 2-step problem (mirrors the tau2 test).
+    """
+    model = GraphPlaceFieldModel(
+        small_grid_env,
+        dt=0.02,
+        rank=1,
+        kappa2=2.0,
+        update_drift_scale=True,
+        update_amplitude=False,
+        update_init_mean=False,
+    )
+    model.init_mean = jnp.zeros((1, 1))
+    # a=Var_0=1, b=Var_1=3, d=mean_1=2 (mean_0=0), c=cross-cov=0.5.
+    model.smoother_mean = jnp.array([[[0.0], [2.0]]])  # (n_neurons=1, T=2, rank=1)
+    model.smoother_cov = jnp.array([[[[1.0]], [[3.0]]]])  # (1, 2, 1, 1)
+    model.smoother_cross_cov = jnp.array([[[[0.5]]]])  # (1, T-1=1, 1, 1)
+    model.drift_scale = jnp.array([1e-3])
+    shape = float(model._spectral_shape_current()[0])
+    model._m_step()
+    # E[dw dw^T] = a + b + d^2 - 2c = 1 + 3 + 4 - 1 = 7 ; q* = 7 / S.
+    assert float(model.drift_scale[0]) == pytest.approx(7.0 / shape)
+
+
+@pytest.mark.slow
+def test_fit_sgd_improves_marginal_ll(small_grid_env):
+    """fit_sgd must actually optimize: the marginal LL at the end is >= the start.
+    Catches a sign error in the loss or a broken parameter-transform wiring."""
+    times, traj = _toy_trajectory(small_grid_env, 250, seed=9)
+    spikes = np.random.default_rng(10).poisson(0.1, size=250).astype(float)
+    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=6)
+    lls = model.fit_sgd(
+        times, traj, spikes, num_steps=60, warm_start=True, verbose=False
+    )
+    assert np.all(np.isfinite(lls))
+    assert (
+        lls[-1] >= lls[0]
+    )  # marginal LL improved (or held); returned LLs, higher=better
+
+
+# ------------------------------------------------- regression guards for review fixes
+def test_constructor_rejects_nan_max_firing_rate(small_grid_env):
+    with pytest.raises(ValueError, match="max_firing_rate_hz"):
+        GraphPlaceFieldModel(small_grid_env, dt=0.02, max_firing_rate_hz=float("nan"))
+
+
+def test_fit_sgd_all_frozen_raises(small_grid_env):
+    times, traj = _toy_trajectory(small_grid_env, 20, seed=1)
+    spikes = np.zeros(20)
+    model = GraphPlaceFieldModel(
+        small_grid_env,
+        dt=0.02,
+        rank=3,
+        update_kappa2=False,
+        update_drift_scale=False,
+        update_amplitude=False,
+        update_init_mean=False,
+    )
+    with pytest.raises(ValueError, match="nothing to optimize"):
+        model.fit_sgd(times, traj, spikes, num_steps=1, warm_start=False, verbose=False)
+
+
+def test_update_kappa2_false_freezes_kappa2_under_sgd(small_grid_env):
+    times, traj = _toy_trajectory(small_grid_env, 40, seed=2)
+    spikes = np.random.default_rng(3).poisson(0.1, size=40).astype(float)
+    model = GraphPlaceFieldModel(
+        small_grid_env, dt=0.02, rank=4, kappa2=1.5, update_kappa2=False
+    )
+    model.fit_sgd(times, traj, spikes, num_steps=5, warm_start=True, verbose=False)
+    assert model.kappa2 == 1.5  # frozen exactly
+
+
+@pytest.mark.slow
+def test_fit_preserves_learned_drift_scale_on_repeat(small_grid_env):
+    times, traj = _toy_trajectory(small_grid_env, 60, seed=4)
+    spikes = np.random.default_rng(5).poisson(0.1, size=60).astype(float)
+    model = GraphPlaceFieldModel(
+        small_grid_env, dt=0.02, rank=4, update_drift_scale=True, init_drift_scale=2e-3
+    )
+    model.fit(times, traj, spikes, max_iter=3, verbose=False)
+    learned = np.asarray(model.drift_scale).copy()
+    assert not np.allclose(learned, 2e-3)  # guard: EM actually moved it
+    # A second fit(warm_start=False) must NOT reset drift_scale to init_drift_scale.
+    model.fit(times, traj, spikes, max_iter=1, warm_start=False, verbose=False)
+    assert not np.allclose(np.asarray(model.drift_scale), 2e-3)
