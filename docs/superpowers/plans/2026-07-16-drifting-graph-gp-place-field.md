@@ -8,6 +8,26 @@
 
 **Tech Stack:** Python 3.10–3.12, JAX (x64), `neurospatial` (spatial substrate), `optax` (SGD), `scipy` (eigensolve, independent-optimizer parity check), `pytest` + `hypothesis`. Managed by `uv`.
 
+---
+
+## Implementation status & amendments (post-implementation reconciliation)
+
+**Status:** Stages 0–2 (Tasks 1–8) are **implemented and committed** on `feat/graph-place-field`. The committed code in `graph_place_field.py` / `test_graph_place_field.py` is authoritative; several task sections **below describe the original design and were superseded during implementation** — the amendments here take precedence over the task text and code blocks that follow.
+
+1. **Drift scale `q_c` is a FIXED hyperparameter by default; drift *learning* is experimental/deferred.** `update_drift_scale` defaults to **`False`** (the plan/task text below shows `True`). The approximate Laplace-EKF marginal likelihood used here **does not identify `q_c`**: profiled with all else fixed, the marginal LL is monotone in `q_c` rather than peaking at the generating value, and the closed-form Gaussian M-step is a self-confirming fixed point (returns ~its initialization; the same is true of the sibling `PlaceFieldModel`). Enabling `update_drift_scale=True` (EM) or learning `q_c` via `fit_sgd` is an explicit, experimental opt-in and is **not** validated to recover the true drift scale. There is therefore **no `q_c`-recovery test** — adding one merely to satisfy the original plan would assert a false claim. What *is* validated is drift **tracking** at a fixed `q_c` (`test_smoother_beats_filter_beats_static_on_drifting_data`) and the M-step *algebra* (`test_drift_scale_mstep_matches_closed_form`). Making `q_c` identifiable in future likely needs a **redesigned drift model**: pin the null/intercept mode (so the baseline rate does not drift freely), separate baseline vs. spatial drift, and/or add regularization or cross-validation. A validated redesign candidate (drift confined to the non-null modes) exists but was not adopted.
+
+2. **Architecture: a masked full-grid filter, not the library smoother.** The E-step, `fit`, `fit_sgd`, and `score` use a new local `_masked_graph_point_process_filter` (`glm_laplace_update` + `poisson_family`) plus `rts_backward_scan`, **not** `stochastic_point_process_filter/_smoother`. It runs each neuron on the **full** time grid: out-of-bounds trajectory rows advance the latent random walk but **skip their observation update** (rather than being dropped, as the original design had it). Row 0 is conditioned **directly on `(init_mean, P₀)`** (no predict-before-first-update; see the `point_process_kalman` docstring note documenting the library filter's differing convention). `_design_and_spikes` returns `(Z, spikes, valid)`.
+
+3. **`update_kappa2` flag added** (default `True`): `κ²` is learnable by `fit_sgd` only (it reshapes `S` nonlinearly and has no EM M-step). `fit_sgd` raises if all `update_*` flags are `False`.
+
+4. **Static-limit parity is APPROXIMATE, not exact.** The per-bin aggregated GLM = per-time static-limit *objective* is exact algebra (unchanged). But the sequential Laplace-EKF smoother reproduces the batch static-GLM **MAP** only approximately (coefficients agree to <1% relative RMS; field log-rate to ~6%). The parity test is non-circular (zero fixed prior mean, not warm-started to the static MAP) and asserts coefficient/field error, not correlation.
+
+5. **Offline comparisons are DEFERRED, not complete.** The MRF / `non_local_detector` parity and the full spline-vs-graph (`PlaceFieldModel`) cross-arm head-to-head are **not implemented** in this branch; they remain offline-notebook follow-ups. The in-suite geometry test is the graph-vs-Euclidean leakage check (`test_graph_basis_does_not_smear_across_wmaze_arms`).
+
+6. **CNM working-tree WIP excluded.** Unrelated `CorrelatedNoisePointProcessModel` changes that were in the working tree are stashed, not part of this branch.
+
+---
+
 ## Global Constraints
 
 Every task's requirements implicitly include this section. Values copied verbatim from the spec and repo `CLAUDE.md`.
@@ -65,7 +85,7 @@ The static (drift-free) estimator: a penalized Poisson GLM in the eigenbasis wit
   - `parity_penalty(eigvals: NDArray, n_components: int) -> NDArray` — pure `diag(λ)` penalty with the first `n_components` (null) modes set to `0.0`, shape `(rank,)`.
   - `fit_static_graph_glm(counts: ArrayLike, occupancy: ArrayLike, eigvecs: ArrayLike, penalty_diag: ArrayLike, *, max_iter: int = 25) -> tuple[Array, Array]` — returns `(weights, cov)` where `weights` is `(rank,)` (single neuron) or `(n_neurons, rank)`, and `cov` is the Laplace posterior covariance `(rank, rank)` or `(n_neurons, rank, rank)`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `test_graph_place_field.py`:
 
@@ -160,12 +180,12 @@ def test_static_glm_multineuron_matches_per_neuron(small_grid_env):
         np.testing.assert_allclose(np.asarray(w_multi[j]), np.asarray(w_j), atol=1e-8)
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "spectral_precision or parity_penalty or static_glm" -q`
 Expected: FAIL with `ImportError: cannot import name 'fit_static_graph_glm'`.
 
-- [ ] **Step 3: Implement the penalty builders and solver**
+- [x] **Step 3: Implement the penalty builders and solver**
 
 Append to `graph_place_field.py` (add `import jax`, `import jax.numpy as jnp`, `from jax import Array`, `from jax.typing import ArrayLike`, and `from state_space_practice.kalman import psd_solve, symmetrize` to the imports; add the three new names to `__all__`):
 
@@ -274,12 +294,12 @@ def fit_static_graph_glm(
     return weights, cov
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "spectral_precision or parity_penalty or static_glm" -q`
 Expected: PASS (5 tests).
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 uv run --no-sync ruff format src/state_space_practice/graph_place_field.py src/state_space_practice/tests/test_graph_place_field.py
@@ -301,7 +321,7 @@ git commit -m "feat(graph-pp): static penalized-Poisson estimator in the eigenba
   - `static_log_evidence(counts, occupancy, eigvecs, eigvals, *, tau2, kappa2, alpha=1.0) -> float` — the Laplace log-evidence (summed over neurons), constant `log(count!)` terms dropped.
   - `select_tau2_by_evidence(counts, occupancy, basis, *, kappa2, alpha=1.0, bounds=(1e-4, 1e4)) -> float` — the `τ²` maximizing `static_log_evidence` via `scipy.optimize.minimize_scalar` over `log τ²`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 from state_space_practice.graph_place_field import (  # noqa: E402
@@ -346,12 +366,12 @@ def test_evidence_is_maximized_near_selected_tau2(small_grid_env):
     assert 1e-4 < tau2_hat < 1e4  # inside the search bounds (not railed)
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "evidence" -q`
 Expected: FAIL with `ImportError: cannot import name 'select_tau2_by_evidence'`.
 
-- [ ] **Step 3: Implement the evidence and selection**
+- [x] **Step 3: Implement the evidence and selection**
 
 Append to `graph_place_field.py` (add `import scipy.optimize` to imports; add both names to `__all__`):
 
@@ -432,12 +452,12 @@ def select_tau2_by_evidence(
     return float(np.exp(result.x))
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "evidence" -q`
 Expected: PASS.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 uv run --no-sync ruff format src/state_space_practice/graph_place_field.py src/state_space_practice/tests/test_graph_place_field.py
@@ -457,7 +477,7 @@ No new source. This task validates Task 1/2 against (a) an independent optimizer
 **Interfaces:**
 - Consumes: `fit_static_graph_glm`, `spectral_precision`, `select_tau2_by_evidence`, `bin_spike_counts`, `bin_occupancy`, `build_graph_basis`; `neurospatial.simulation.simulate_session`; `state_space_practice.preprocessing.bin_spike_times`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 import pytest  # (already imported at top; shown for clarity)
@@ -530,21 +550,21 @@ def test_static_field_recovers_wmaze_place_cells(w_maze_env):
     assert np.median(corrs) > 0.6
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "independent_optimizer or wmaze_place_cells" -q`
 Expected: both tests present and FAIL only on the assertions if thresholds are wrong; if a helper name is off they error. (If `neurospatial` is missing they SKIP — install `--extra spatial`.)
 
 Note on thresholds: the correlation floor (`0.6`) is deliberately conservative for a truncated basis + 600 s of OU coverage on a branching maze. If it fails on the real run, first confirm coverage (`(occ > 0).mean()`) and raise `duration`/lower `sigma` before weakening the assertion — a genuinely low correlation is a real bug, not a threshold to relax.
 
-- [ ] **Step 3: (implementation already exists)** — this task is validation only. If a test reveals a bug in Task 1/2, fix it there with a regression test, then return here.
+- [x] **Step 3: (implementation already exists)** — this task is validation only. If a test reveals a bug in Task 1/2, fix it there with a regression test, then return here.
 
-- [ ] **Step 4: Run to verify they pass**
+- [x] **Step 4: Run to verify they pass**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "independent_optimizer or wmaze_place_cells" -q`
 Expected: PASS (2 tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/state_space_practice/tests/test_graph_place_field.py
@@ -557,7 +577,7 @@ git commit -m "test(graph-pp): static-field parity vs independent optimizer + W-
 
 # Stage 2 — Drifting field
 
-`GraphPlaceFieldModel`: the coefficients drift as a random walk with per-neuron `Q_c = q_c·S`, inferred by the per-neuron `vmap` Laplace-EKF with EM (and SGD) learning of `q_c`, `τ²`, and (SGD only) `κ²`.
+`GraphPlaceFieldModel`: the coefficients drift as a random walk with per-neuron `Q_c = q_c·S`, inferred by the per-neuron `vmap` Laplace-EKF. EM/`fit_sgd` learn `τ²` (and `κ²` via SGD, `init_mean`); **`q_c` is a fixed hyperparameter by default** (learning it is an experimental opt-in — see Amendment 1: the marginal LL does not identify `q_c`).
 
 ## Task 4: `GraphPlaceFieldModel.__init__` and prior/`Q` construction
 
@@ -569,7 +589,7 @@ git commit -m "test(graph-pp): static-field parity vs independent optimizer + W-
 - Consumes: `build_graph_basis`, `spectral_shape`, `GraphBasis`; `SGDFittableMixin` from `state_space_practice.sgd_fitting`.
 - Produces: `GraphPlaceFieldModel(env, dt, *, rank=None, sigma=None, kappa2=1.0, alpha=1.0, tau2=1.0, init_drift_scale=1e-3, interpolation="nearest", laplacian_convention="distance", update_drift_scale=True, update_amplitude=True, update_init_mean=True, max_firing_rate_hz=500.0, max_newton_iter=1)`. After construction: `self.basis` (`GraphBasis`), `self.rank` (int), and `self.prior_cov()` / `self.drift_cov(q_c)` helpers returning `(rank, rank)` diagonal PSD matrices. Later tasks rely on: `self._spectral_shape_current()`, `self.rank`, `self.kappa2`, `self.alpha`, `self.tau2`, `self.dt`, `self.basis.eigvecs`, `self.transition_matrix` (`= I(rank)`), `self._log_intensity_func`, `self.max_newton_iter`, `self._max_log_count`. **The spectral shape `S` is never cached on the instance** — `kappa2` is fittable, so a snapshot would go stale; always derive `S` from `_spectral_shape_current()`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 from state_space_practice.graph_place_field import GraphPlaceFieldModel  # noqa: E402
@@ -604,12 +624,12 @@ def test_model_rejects_bad_hyperparameters(small_grid_env):
         GraphPlaceFieldModel(small_grid_env, dt=0.02, alpha=0.0)
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "builds_diagonal_psd or bad_hyperparameters" -q`
 Expected: FAIL with `ImportError: cannot import name 'GraphPlaceFieldModel'`.
 
-- [ ] **Step 3: Implement `__init__` and the covariance helpers**
+- [x] **Step 3: Implement `__init__` and the covariance helpers**
 
 Append to `graph_place_field.py` (add `import logging`, `from state_space_practice.sgd_fitting import SGDFittableMixin`, `from state_space_practice.point_process_kalman import log_conditional_intensity`; add `GraphPlaceFieldModel` to `__all__`; add `logger = logging.getLogger(__name__)` near the top of the module if not present):
 
@@ -714,12 +734,12 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         return jnp.diag(q_c * self._spectral_shape_current())
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "builds_diagonal_psd or bad_hyperparameters" -q`
 Expected: PASS.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 uv run --no-sync ruff format src/state_space_practice/graph_place_field.py src/state_space_practice/tests/test_graph_place_field.py
@@ -743,7 +763,7 @@ git commit -m "feat(graph-pp): GraphPlaceFieldModel constructor and spectral pri
 
 The per-neuron smoother is `jax.vmap`ped over `init_mean` (`0`), `spikes` (`0`), `process_cov` (`0`) with `design_matrix`/`transition_matrix`/`init_cov` shared (`None`). This was validated to give per-neuron independence and finite total LL.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 def _toy_trajectory(env, n_time, seed=0):
@@ -792,12 +812,12 @@ def test_estep_neurons_are_independent(small_grid_env):
     np.testing.assert_allclose(sm0, np.asarray(model.smoother_mean[0]), atol=1e-9)
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "estep" -q`
 Expected: FAIL with `AttributeError: 'GraphPlaceFieldModel' object has no attribute '_design_and_spikes'`.
 
-- [ ] **Step 3: Implement `_design_and_spikes` and `_e_step`**
+- [x] **Step 3: Implement `_design_and_spikes` and `_e_step`**
 
 Add these methods to `GraphPlaceFieldModel` (add only `stochastic_point_process_smoother` to the `point_process_kalman` import — import `_validate_filter_numerics` and `stochastic_point_process_filter` in the tasks that first use them, Tasks 6 and 7, so every commit stays `ruff check` clean):
 
@@ -862,12 +882,12 @@ Add these methods to `GraphPlaceFieldModel` (add only `stochastic_point_process_
         return float(jnp.sum(marginal_ll))
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "estep" -q`
 Expected: PASS (2 tests).
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 uv run --no-sync ruff format src/state_space_practice/graph_place_field.py src/state_space_practice/tests/test_graph_place_field.py
@@ -891,7 +911,7 @@ git commit -m "feat(graph-pp): per-neuron vmap Laplace-EKF E-step"
 
 **M-step derivation (recorded so the implementer can verify):** for `A = I` and `Q_c = q_c·S`, the complete-data increment term is `-0.5 Σ_t [(1/q_c) tr(S^{-1} E[Δw Δw^T]) + rank·log q_c]`, giving `q_c* = tr(S^{-1} M_c) / (rank·(T-1))` where `M_c = Σ_t E[Δw Δw^T]`. Since `S` is diagonal this is `mean_j(diag(M_c/(T-1))_j / S_j)`. The per-neuron increment covariance `M_c/(T-1)` is computed with the exact `gamma/beta` algebra proven in `PlaceFieldModel._m_step`. `τ²` scales the init prior `P0 = τ²S`; its update is `mean_{c,j}(diag(V0_c)_j / S_j)` (the mean term drops when `init_mean_c := m0_c`).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 def _simulate_drifting_spikes(env, basis, dt, n_time, q_c, tau2, kappa2, seed):
@@ -985,12 +1005,12 @@ def test_static_limit_matches_static_estimator(small_grid_env):
     assert corr > 0.95
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "fit_em or recovers_drift or static_limit" -q`
 Expected: FAIL with `AttributeError: 'GraphPlaceFieldModel' object has no attribute 'fit'`.
 
-- [ ] **Step 3: Implement the warm-start, `_m_step`, and `fit`**
+- [x] **Step 3: Implement the warm-start, `_m_step`, and `fit`**
 
 Add to `GraphPlaceFieldModel` (add `sum_of_outer_products` to the existing `from state_space_practice.kalman import psd_solve, symmetrize` line; add `from state_space_practice.utils import check_converged, validate_count_array`; add `_validate_filter_numerics` to the existing `from state_space_practice.point_process_kalman import ...` line — this task is its first use):
 
@@ -1115,12 +1135,12 @@ Add to `GraphPlaceFieldModel` (add `sum_of_outer_products` to the existing `from
         return self.log_likelihoods
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "fit_em or recovers_drift or static_limit" -q`
 Expected: PASS (3 tests). These are slow (EM over ~800–2500 bins); allow a couple of minutes.
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 uv run --no-sync ruff format src/state_space_practice/graph_place_field.py src/state_space_practice/tests/test_graph_place_field.py
@@ -1140,7 +1160,7 @@ git commit -m "feat(graph-pp): EM fit with scalar q_c/tau2 M-step and GEM rollba
 - Consumes: `SGDFittableMixin.fit_sgd` (base); `POSITIVE` from `state_space_practice.parameter_transforms`.
 - Produces `GraphPlaceFieldModel.fit_sgd(times, trajectory, spikes, *, optimizer=None, num_steps=200, verbose=False, convergence_tol=None, warm_start=True) -> list[float]` plus the required protocol hooks: `_n_timesteps` (property), `_check_sgd_initialized`, `_build_param_spec`, `_sgd_loss_fn`, `_store_sgd_params`, `_finalize_sgd`. Parameters optimized: `log q_c` (per neuron), `log τ²`, `log κ²` — all softplus-positive via `POSITIVE`. Because `Q_c = q_c·diag(S)` is diagonal, it is PSD for any `q_c, κ² > 0`, so the eigendecomp→Cholesky gradient-NaN issue that affects dense-`Q` SGD models does not arise here.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 @pytest.mark.slow
@@ -1180,12 +1200,12 @@ def test_em_and_sgd_agree_on_marginal_ll(small_grid_env):
     assert abs(ll_em - ll_sgd) / abs(ll_em) < 0.02
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "fit_sgd_recovers or em_and_sgd" -q`
 Expected: FAIL with `AttributeError` (no `fit_sgd` / protocol hooks).
 
-- [ ] **Step 3: Implement the SGD protocol and `fit_sgd`**
+- [x] **Step 3: Implement the SGD protocol and `fit_sgd`**
 
 Add to `GraphPlaceFieldModel` (add `stochastic_point_process_filter` to the existing `from state_space_practice.point_process_kalman import ...` line — this task is its first use):
 
@@ -1302,12 +1322,12 @@ Add to `GraphPlaceFieldModel` (add `stochastic_point_process_filter` to the exis
         )
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "fit_sgd_recovers or em_and_sgd" -q`
 Expected: PASS (2 tests, slow).
 
-- [ ] **Step 5: Format and commit**
+- [x] **Step 5: Format and commit**
 
 ```bash
 uv run --no-sync ruff format src/state_space_practice/graph_place_field.py src/state_space_practice/tests/test_graph_place_field.py
@@ -1328,7 +1348,7 @@ git commit -m "feat(graph-pp): SGD fit over q_c, tau2, kappa2 with EM<->SGD pari
   - `GraphPlaceFieldModel.predict_rate_map(neuron_idx=0, time_slice=None) -> NDArray` — per-active-bin firing rate (Hz), the log-normal posterior mean `mean_t exp(Φ m_{c,t} + 0.5 Φ V_{c,t} Φ^T)` over the window. Shape `(n_bins,)`.
   - `GraphPlaceFieldModel.score(times, trajectory, spikes) -> float` — held-out total marginal LL (filter only, fitted parameters).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 @pytest.mark.slow
@@ -1403,12 +1423,12 @@ def test_graph_basis_does_not_smear_across_wmaze_arms(w_maze_env):
 
 Note: the head-to-head *against splines* (showing `PlaceFieldModel`'s tensor-product splines leak across arms where the graph basis does not) is a stronger but heavier comparison. Keep the in-suite test to the graph-basis locality assertion above; put the full spline-vs-graph side-by-side (fitting both models on the same W-maze session and comparing cross-arm rate leakage) in an offline notebook, since it fits two full models and is inherently slow.
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "smoother_beats_filter or smear_across" -q`
 Expected: `smoother_beats_filter` FAILs with `AttributeError` if `predict_rate_map`/`score` are referenced before defined; `smear_across` may already pass (uses only the substrate) — that is fine, it is a guardrail on the basis.
 
-- [ ] **Step 3: Implement `predict_rate_map` and `score`**
+- [x] **Step 3: Implement `predict_rate_map` and `score`**
 
 Add to `GraphPlaceFieldModel`:
 
@@ -1472,12 +1492,12 @@ Add to `GraphPlaceFieldModel`:
         return float(jnp.sum(lls))
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -k "smoother_beats_filter or smear_across" -q`
 Expected: PASS (2 tests, slow).
 
-- [ ] **Step 5: Full-suite regression + commit**
+- [x] **Step 5: Full-suite regression + commit**
 
 ```bash
 uv run --no-sync pytest src/state_space_practice/tests/test_graph_place_field.py -q

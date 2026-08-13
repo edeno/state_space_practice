@@ -629,6 +629,7 @@ def test_estep_neurons_are_independent(small_grid_env):
     np.testing.assert_allclose(sm0, np.asarray(model.smoother_mean[0]), atol=1e-9)
 
 
+@pytest.mark.slow
 def test_graph_filter_uses_p0_at_row_zero_and_propagates_masked_rows():
     from state_space_practice.graph_place_field import (
         _masked_graph_point_process_filter,
@@ -862,8 +863,15 @@ def test_fit_sgd_runs_and_default_keeps_drift_fixed(small_grid_env):
 
 
 @pytest.mark.slow
-def test_static_limit_matches_static_estimator(small_grid_env):
-    """With q_c pinned to ~0, the smoothed field equals the static GLM MAP."""
+@pytest.mark.slow
+def test_static_limit_approximates_static_estimator(small_grid_env):
+    """Non-circular static-limit contract: with a ZERO fixed prior mean (deliberately
+    NOT warm-started to the static MAP), a fixed near-zero drift, and no parameter
+    updates, the sequential Laplace-EKF smoother reproduces the independent batch
+    static-GLM MAP to within a small tolerance -- a close spatial agreement, not a
+    bit-exact identity (the Laplace-EKF is a sequential Gaussian approximation of the
+    batch Newton MAP). Asserts coefficient AND field error, not correlation alone.
+    """
     from state_space_practice.graph_place_field import (
         build_graph_basis,
         fit_static_graph_glm,
@@ -871,38 +879,47 @@ def test_static_limit_matches_static_estimator(small_grid_env):
     )
 
     basis = build_graph_basis(small_grid_env, rank=8)
-    times, traj, spikes = _simulate_drifting_spikes(
-        small_grid_env,
-        basis,
-        dt=0.02,
-        n_time=1500,
-        q_c=0.0,
-        tau2=1.0,
-        kappa2=1e-2,
-        seed=2,  # no drift
+    # q_c=0 -> a static field with a pinned, healthy baseline rate (well-conditioned,
+    # unlike an unpinned null mode that yields near-zero spike counts).
+    times, traj, spikes, _eta, _w = _simulate_field_drift_spikes(
+        small_grid_env, basis, dt=0.02, n_time=2000, q_c=0.0, seed=2
     )
     model = GraphPlaceFieldModel(
         small_grid_env,
         dt=0.02,
         rank=8,
-        kappa2=1e-2,
+        kappa2=1.0,  # matches _simulate_field_drift_spikes' generating shape
         tau2=1.0,
-        init_drift_scale=1e-12,
+        init_drift_scale=1e-10,  # fixed near-zero drift
         update_drift_scale=False,
         update_amplitude=False,
+        update_init_mean=False,  # prior mean stays at zero, not the static MAP
     )
-    model.fit(times, traj, spikes, warm_start=True, max_iter=5, verbose=False)
-    # Static estimator on the same aggregated data with the matching penalty.
+    # warm_start=False leaves init_mean at its zero default: the reference (static MAP)
+    # is NOT reused as the prior mean, so the agreement is a genuine parity check.
+    model.fit(times, traj, spikes, warm_start=False, max_iter=1, verbose=False)
+
     counts = bin_spike_counts(small_grid_env, spikes, times, traj, basis)
     occ = bin_occupancy(small_grid_env, times, traj, dt=0.02)
-    prec = spectral_precision(basis.eigvals, tau2=1.0, kappa2=1e-2)
-    w_static, _ = fit_static_graph_glm(counts, occ, basis.eigvecs, prec)
-    # Time-averaged smoothed coefficients ~ the static MAP (drift-free limit).
-    w_dyn = np.asarray(model.smoother_mean[0]).mean(axis=0)
-    corr = np.corrcoef(
-        np.asarray(basis.eigvecs @ w_dyn), np.asarray(basis.eigvecs @ w_static[0])
-    )[0, 1]
-    assert corr > 0.95
+    # Same penalty (tau2, kappa2) as the model's prior so the two estimators match.
+    prec = spectral_precision(basis.eigvals, tau2=1.0, kappa2=1.0)
+    w_static_all, _ = fit_static_graph_glm(counts, occ, basis.eigvecs, prec)
+    w_static = np.asarray(w_static_all[0])  # neuron 0, shape (rank,)
+    w_dyn = np.asarray(model.smoother_mean[0]).mean(
+        axis=0
+    )  # ~constant (near-zero drift)
+
+    field_static = np.asarray(basis.eigvecs @ w_static)
+    field_dyn = np.asarray(basis.eigvecs @ w_dyn)
+    coef_rel_err = np.sqrt(np.mean((w_dyn - w_static) ** 2)) / np.linalg.norm(w_static)
+    field_rmse = np.sqrt(np.mean((field_dyn - field_static) ** 2))  # log-rate nats
+    # The coefficient agreement is the tight, meaningful metric (measured ~0.006, i.e.
+    # <1% relative RMS across seeds); a broken dynamic prior/filter would blow it up.
+    # The field RMSE (~0.06 nats, ~6% multiplicative rate) is a looser gross-error guard:
+    # the sequential Laplace-EKF is a close APPROXIMATION of the batch Newton MAP, not a
+    # bit-exact identity.
+    assert coef_rel_err < 0.02
+    assert field_rmse < 0.15
 
 
 # ------------------------------------------- prediction, scoring & drift/geometry
@@ -1217,6 +1234,7 @@ def test_fit_sgd_all_frozen_raises(small_grid_env):
         model.fit_sgd(times, traj, spikes, num_steps=1, warm_start=False, verbose=False)
 
 
+@pytest.mark.slow
 def test_update_kappa2_false_freezes_kappa2_under_sgd(small_grid_env):
     times, traj = _toy_trajectory(small_grid_env, 40, seed=2)
     spikes = np.random.default_rng(3).poisson(0.1, size=40).astype(float)
@@ -1240,3 +1258,49 @@ def test_fit_preserves_learned_drift_scale_on_repeat(small_grid_env):
     # A second fit(warm_start=False) must NOT reset drift_scale to init_drift_scale.
     model.fit(times, traj, spikes, max_iter=1, warm_start=False, verbose=False)
     assert not np.allclose(np.asarray(model.drift_scale), 2e-3)
+
+
+# ------------------------------------------------- API guardrails
+@pytest.mark.parametrize("bad", [0, -1, 2.0, True, 1.5])
+def test_constructor_rejects_bad_max_newton_iter(small_grid_env, bad):
+    with pytest.raises(ValueError, match="max_newton_iter"):
+        GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=3, max_newton_iter=bad)
+
+
+def test_predict_and_score_require_fit(small_grid_env):
+    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
+    assert model._is_fitted is False
+    with pytest.raises(RuntimeError, match="not fitted"):
+        model.predict_rate_map()
+    times, traj = _toy_trajectory(small_grid_env, 5, seed=0)
+    with pytest.raises(RuntimeError, match="not fitted"):
+        model.score(times, traj, np.zeros(5))
+
+
+@pytest.mark.slow
+def test_score_rejects_all_out_of_bounds_trajectory(small_grid_env):
+    times, traj = _toy_trajectory(small_grid_env, 40, seed=1)
+    spikes = np.random.default_rng(2).poisson(0.1, size=40).astype(float)
+    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
+    model.fit(times, traj, spikes, max_iter=2, verbose=False)
+    assert model._is_fitted is True
+    outside = np.full((40, 2), 1e9)
+    with pytest.raises(ValueError, match="no in-bounds"):
+        model.score(times, outside, spikes)
+
+
+@pytest.mark.slow
+def test_failed_first_estep_clears_posteriors_and_stays_unfitted(small_grid_env):
+    """A non-finite first E-step must raise, drop the NaN posteriors, and leave the
+    model not-fitted (so predict/score refuse rather than return NaN)."""
+    times, traj = _toy_trajectory(small_grid_env, 30, seed=3)
+    spikes = np.random.default_rng(4).poisson(0.1, size=30).astype(float)
+    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
+    # Inject a non-finite initial mean so the first E-step's LL is non-finite.
+    model.init_mean = jnp.full((1, model.rank), jnp.inf)
+    with pytest.raises(RuntimeError, match="first E-step"):
+        model.fit(times, traj, spikes, warm_start=False, verbose=False)
+    assert model._is_fitted is False
+    assert model.smoother_mean is None  # NaN posteriors cleared
+    with pytest.raises(RuntimeError, match="not fitted"):
+        model.predict_rate_map()

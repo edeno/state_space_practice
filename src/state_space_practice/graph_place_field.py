@@ -1282,6 +1282,15 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             raise ValueError(
                 f"max_firing_rate_hz must be positive, got {max_firing_rate_hz}."
             )
+        if isinstance(max_newton_iter, bool) or not isinstance(
+            max_newton_iter, (int, np.integer)
+        ):
+            raise ValueError(
+                f"max_newton_iter must be a positive integer, got {max_newton_iter!r}."
+            )
+        if max_newton_iter < 1:
+            # 0 would make the Laplace update a no-op (observation ignored) silently.
+            raise ValueError(f"max_newton_iter must be >= 1, got {max_newton_iter}.")
 
         self.env = env
         self.dt = dt
@@ -1318,6 +1327,10 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         self.smoother_cross_cov: Optional[Array] = None
         self.filtered_mean: Optional[Array] = None
         self.filtered_cov: Optional[Array] = None
+        # Set True only after a fit/fit_sgd that finished with finite, accepted
+        # posteriors; the sole gate for _check_fitted. A failed fit that leaves NaN
+        # posteriors behind must not read as fitted.
+        self._is_fitted: bool = False
         self.log_likelihoods: list[float] = []
         self._n_time: int = 0
 
@@ -1583,6 +1596,8 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             if verbose:
                 print(msg)
 
+        # A new fit attempt: not fitted until it finishes with accepted posteriors.
+        self._is_fitted = False
         self.log_likelihoods = []
         last_state: Optional[dict] = None
         converged = False
@@ -1615,9 +1630,10 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 self.log_likelihoods.pop()
                 if last_state is None:
                     # First E-step is non-finite: there is no accepted state to fall
-                    # back to, and leaving the NaN posteriors in place would let
-                    # _check_fitted pass and predict_rate_map/score return NaN
-                    # silently. Fail loud instead.
+                    # back to. Clear the NaN posteriors and fail loud (the model is
+                    # left not-fitted via self._is_fitted, so predict_rate_map/score
+                    # will refuse rather than return NaN).
+                    self._clear_posteriors()
                     raise RuntimeError(
                         "GraphPlaceFieldModel.fit: the first E-step produced a "
                         "non-finite marginal log-likelihood; the fit cannot proceed. "
@@ -1666,6 +1682,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 _log(f"  WARNING: {msg}")
 
         self._finalize_convergence(bool(converged), max_iter)
+        # Reached only via a normal loop exit (converge/rollback/max-iter), all of
+        # which leave finite, accepted posteriors; the iteration-0 failure raises above.
+        self._is_fitted = True
         return self.log_likelihoods
 
     # --- SGDFittableMixin protocol ---
@@ -1750,7 +1769,16 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             self.init_mean = params["init_mean"]
 
     def _finalize_sgd(self, Z: Array, spikes: Array, valid: Array) -> None:
-        self.log_likelihoods = [self._e_step(Z, spikes, valid)]
+        final_ll = self._e_step(Z, spikes, valid)
+        self.log_likelihoods = [final_ll]
+        if np.isfinite(final_ll):
+            self._is_fitted = True
+        else:
+            self._clear_posteriors()
+            raise RuntimeError(
+                "GraphPlaceFieldModel.fit_sgd: the final E-step produced a non-finite "
+                "marginal log-likelihood; the model was not fitted."
+            )
 
     def fit_sgd(  # type: ignore[override]
         self,
@@ -1838,6 +1866,8 @@ class GraphPlaceFieldModel(SGDFittableMixin):
 
         _validate_filter_numerics(self.prior_cov(), n_time=self._n_time)
 
+        # Not fitted until _finalize_sgd confirms a finite final log-likelihood.
+        self._is_fitted = False
         return super().fit_sgd(
             Z,
             spk,
@@ -1850,9 +1880,20 @@ class GraphPlaceFieldModel(SGDFittableMixin):
 
     # --- prediction / scoring ---
 
+    def _clear_posteriors(self) -> None:
+        """Drop any (possibly NaN) posterior arrays left by a failed fit."""
+        self.smoother_mean = None
+        self.smoother_cov = None
+        self.smoother_cross_cov = None
+        self.filtered_mean = None
+        self.filtered_cov = None
+
     def _check_fitted(self, method: str) -> None:
-        if self.smoother_mean is None:
-            raise RuntimeError(f"Model not fitted; call fit(...) before {method}().")
+        if not self._is_fitted:
+            raise RuntimeError(
+                f"Model not fitted (or the last fit failed); call fit(...)/fit_sgd(...) "
+                f"successfully before {method}()."
+            )
 
     def predict_rate_map(
         self, neuron_idx: int = 0, time_slice: Optional[slice] = None
@@ -1939,6 +1980,11 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 f"with n_neurons={self.n_neurons}."
             )
         Z, spk, valid = self._design_and_spikes(times, trajectory, spikes_arr)
+        if int(jnp.sum(valid)) == 0:
+            raise ValueError(
+                "trajectory contains no in-bounds observations for this environment; "
+                "the marginal log-likelihood would depend on no data."
+            )
         S = self._spectral_shape_current()
         P0 = jnp.diag(self.tau2 * S)
 
