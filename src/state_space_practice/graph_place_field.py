@@ -1188,7 +1188,7 @@ def _masked_graph_point_process_filter(
 
 
 class GraphPlaceFieldModel(SGDFittableMixin):
-    """Drifting place-field model over a graph-Laplacian eigenbasis.
+    """Track a drifting place-field over a graph-Laplacian eigenbasis.
 
     Latent state per neuron ``c`` is ``w_{c,t} in R^rank``, the coefficients on the
     smoothest ``rank`` eigenvectors ``Phi`` of the environment graph Laplacian. The
@@ -1198,6 +1198,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
     ``w_{c,t} = w_{c,t-1} + eps_t``, ``eps_t ~ N(0, q_c * S)`` with the spectral shape
     ``S = (kappa2 I + diag(lambda))^(-alpha)`` shared by the prior ``P0 = tau2 * S``.
 
+    The primary output is the posterior trajectory of the spatial log-rate field,
+    available from :meth:`predict_log_rate_trajectory`. ``q_c`` controls how quickly
+    that field may drift; recovering its generating value is not required for tracking.
     Drift-scale learning is disabled by default because the approximate Laplace-EKF
     marginal likelihood does not reliably identify ``q_c`` from spike observations.
     Setting ``update_drift_scale=True`` enables the closed-form update as an explicit
@@ -1915,6 +1918,40 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 f"Model not fitted (or the last fit failed); call fit(...)/fit_sgd(...) "
                 f"successfully before {method}()."
             )
+
+    def predict_log_rate_trajectory(
+        self, neuron_idx: int = 0, time_slice: Optional[slice] = None
+    ) -> NDArray[np.float64]:
+        """Posterior-mean log-rate field over time and active graph bins.
+
+        This is the model's primary drift-tracking output. For posterior coefficient
+        means ``m_{c,t}``, it returns ``m_{c,t} @ Phi.T`` without averaging over time.
+
+        Parameters
+        ----------
+        neuron_idx : int, optional
+            Which neuron's trajectory to return, by default 0.
+        time_slice : slice or None, optional
+            Time window to return; the whole fitted session when ``None``.
+
+        Returns
+        -------
+        NDArray, shape (n_selected_times, n_bins)
+            Posterior-mean log firing rate at every active graph bin and selected
+            time point.
+        """
+        self._check_fitted("predict_log_rate_trajectory")
+        assert self.smoother_mean is not None
+        if neuron_idx < 0 or neuron_idx >= self.n_neurons:
+            raise ValueError(
+                f"neuron_idx={neuron_idx} out of range for n_neurons={self.n_neurons}."
+            )
+        if time_slice is None:
+            time_slice = slice(None)
+        means = np.asarray(self.smoother_mean[neuron_idx][time_slice])
+        if means.shape[0] == 0:
+            raise ValueError("time_slice selects no time bins.")
+        return cast(NDArray[np.float64], means @ np.asarray(self.basis.eigvecs).T)
 
     def predict_rate_map(
         self, neuron_idx: int = 0, time_slice: Optional[slice] = None

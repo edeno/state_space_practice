@@ -898,7 +898,7 @@ def test_fit_sgd_runs_and_default_keeps_drift_fixed(small_grid_env):
 # to False. The M-step algebra itself is correct (verified below in
 # test_drift_scale_mstep_matches_closed_form, and by feeding the exact generative
 # w_{c,t} trajectory into the M-step, which recovers q_c to ~1%). Drift *tracking*
-# (not learning) is validated by test_smoother_beats_filter_beats_static_on_drifting_data.
+# (not q_c learning) is validated by test_default_model_tracks_drifting_field_over_time.
 
 
 @pytest.mark.slow
@@ -1000,6 +1000,8 @@ def test_predict_rate_map_requires_fit_and_valid_neuron(small_grid_env):
     model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=6)
     with pytest.raises(RuntimeError, match="not fitted"):
         model.predict_rate_map()
+    with pytest.raises(RuntimeError, match="not fitted"):
+        model.predict_log_rate_trajectory()
 
 
 @pytest.mark.slow
@@ -1030,6 +1032,10 @@ def test_predict_rate_map_recovers_static_field(small_grid_env):
     # Range check on the fitted model.
     with pytest.raises(ValueError, match="neuron_idx"):
         model.predict_rate_map(neuron_idx=1)
+    with pytest.raises(ValueError, match="neuron_idx"):
+        model.predict_log_rate_trajectory(neuron_idx=1)
+    with pytest.raises(ValueError, match="selects no time bins"):
+        model.predict_log_rate_trajectory(time_slice=slice(10, 10))
 
 
 @pytest.mark.slow
@@ -1048,42 +1054,78 @@ def test_score_matches_fit_marginal_ll(small_grid_env):
 
 
 @pytest.mark.slow
-def test_smoother_beats_filter_beats_static_on_drifting_data(small_grid_env):
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_default_model_tracks_drifting_field_over_time(small_grid_env, seed):
+    """The default model recovers evolving spatial structure over the full graph."""
     from state_space_practice.graph_place_field import build_graph_basis
 
     basis = build_graph_basis(small_grid_env, rank=8)
     dt, kappa2, q_true = 0.02, 1.0, 1e-2
-    times, traj, spikes, eta_true, _w = _simulate_field_drift_spikes(
-        small_grid_env, basis, dt=dt, n_time=3000, q_c=q_true, seed=0
+    times, traj, spikes, _eta_true, w_true = _simulate_field_drift_spikes(
+        small_grid_env, basis, dt=dt, n_time=3000, q_c=q_true, seed=seed
     )
-    # Per-time design at the visited bins (same binning the model uses internally).
-    Zt = np.asarray(basis.eigvecs)[_bin_ids_for_test(small_grid_env, times, traj)]
-    # Fit with q fixed at the true drift scale: validate tracking, not learning.
+    # Fit with the constructor's default q_c=1e-3, deliberately 10x below q_true. A
+    # cold start and fixed initial mean keep filtered_mean genuinely causal; burn-in
+    # below gives the filter time to learn the initially unknown firing-rate baseline.
     model = GraphPlaceFieldModel(
         small_grid_env,
         dt=dt,
         rank=8,
         kappa2=kappa2,
         tau2=1.0,
-        init_drift_scale=q_true,
         update_drift_scale=False,
         update_amplitude=False,
+        update_init_mean=False,
     )
-    model.fit(times, traj, spikes, max_iter=10, verbose=False)
+    model.fit(times, traj, spikes, warm_start=False, max_iter=1, verbose=False)
 
-    eta_sm = np.einsum("tr,tr->t", Zt, np.asarray(model.smoother_mean[0]))
-    eta_fi = np.einsum("tr,tr->t", Zt, np.asarray(model.filtered_mean[0]))
+    burn_in = 500
+    phi = np.asarray(basis.eigvecs)
+    field_true = w_true[burn_in:] @ phi.T
+    field_sm = model.predict_log_rate_trajectory(time_slice=slice(burn_in, None))
+    assert field_sm.shape == field_true.shape
+    field_fi = np.asarray(model.filtered_mean[0, burn_in:]) @ phi.T
     counts = bin_spike_counts(small_grid_env, spikes[:, None], times, traj, basis)
     occ = bin_occupancy(small_grid_env, times, traj, dt)
     prec = spectral_precision(basis.eigvals, tau2=1.0, kappa2=kappa2)
     w_static, _ = fit_static_graph_glm(counts, occ, basis.eigvecs, prec)
-    eta_st = Zt @ np.asarray(w_static[0])
+    field_st = np.broadcast_to(phi @ np.asarray(w_static[0]), field_true.shape)
 
-    rmse_sm = np.sqrt(np.mean((eta_sm - eta_true) ** 2))
-    rmse_fi = np.sqrt(np.mean((eta_fi - eta_true) ** 2))
-    rmse_st = np.sqrt(np.mean((eta_st - eta_true) ** 2))
-    assert rmse_sm < rmse_fi  # smoothing (future data) beats causal filtering
-    assert rmse_fi < rmse_st  # tracking drift beats a single static field
+    def rmse(estimate):
+        return np.sqrt(np.mean((estimate - field_true) ** 2))
+
+    rmse_sm = rmse(field_sm)
+    rmse_fi = rmse(field_fi)
+    rmse_st = rmse(field_st)
+
+    # Remove the common rate baseline at every time and then each bin's time average.
+    # Static spatial structure is therefore exactly absent from these drift metrics.
+    def isolate_spatial_drift(field):
+        spatial = field - field.mean(axis=1, keepdims=True)
+        return spatial - spatial.mean(axis=0, keepdims=True)
+
+    drift_true = isolate_spatial_drift(field_true)
+    drift_sm = isolate_spatial_drift(field_sm)
+    drift_fi = isolate_spatial_drift(field_fi)
+    drift_st = isolate_spatial_drift(field_st)
+    truth_rms = np.std(drift_true)
+    drift_rmse_sm = np.sqrt(np.mean((drift_sm - drift_true) ** 2))
+    drift_rmse_fi = np.sqrt(np.mean((drift_fi - drift_true) ** 2))
+    drift_rmse_st = np.sqrt(np.mean((drift_st - drift_true) ** 2))
+    drift_nrmse = drift_rmse_sm / truth_rms
+    drift_corr = np.corrcoef(drift_sm.ravel(), drift_true.ravel())[0, 1]
+    drift_amplitude_ratio = np.linalg.norm(drift_sm) / np.linalg.norm(drift_true)
+
+    # Absolute gates prevent negligible truth or three uniformly poor estimators from
+    # passing. These require real change-over-time recovery with a misspecified q_c.
+    assert truth_rms > 0.2
+    assert drift_nrmse < 0.75
+    assert drift_corr > 0.7
+    assert 0.4 < drift_amplitude_ratio < 1.2
+    # The causal estimate must also recover temporal structure; smoothing is judged by
+    # the absolute truth gates above rather than forced to win on every random draw.
+    assert drift_rmse_fi < 0.9 * drift_rmse_st
+    assert rmse_sm < rmse_fi < rmse_st
 
 
 @pytest.mark.slow
@@ -1119,17 +1161,6 @@ def test_graph_basis_does_not_smear_across_wmaze_arms(w_maze_env):
     leak_near = abs(recon[k]) / abs(recon[i])  # to the graph-adjacent bin
     assert leak_far < 0.1  # almost no mass crosses to the other arm
     assert leak_far < 0.3 * leak_near  # and far less than to a graph-adjacent bin
-
-
-def _bin_ids_for_test(env, times, trajectory):
-    """Active-bin ids on the time grid (mirrors the module's internal binning)."""
-    traj = np.asarray(trajectory, dtype=float)
-    if traj.ndim == 1:
-        traj = traj[:, None]
-    ids = env.bin_sequence(
-        np.asarray(times, dtype=float), traj, dedup=False, outside_value=-1
-    )
-    return np.asarray(ids, dtype=int)
 
 
 # ------------------------------------------------- multi-neuron, scoring & config gaps
