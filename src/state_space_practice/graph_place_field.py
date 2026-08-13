@@ -252,11 +252,6 @@ def build_graph_laplacian(
     return laplacian
 
 
-def _distance_weighted_laplacian(env: "Environment") -> sp.csr_matrix:
-    """Compatibility helper for the default ``L = D @ D.T`` convention."""
-    return build_graph_laplacian(env, convention="distance")
-
-
 def _laplacian_key(
     laplacian: sp.spmatrix, convention: LaplacianConvention
 ) -> tuple[str, int, int, float]:
@@ -799,7 +794,7 @@ def fit_static_graph_glm(
         hess = Phi.T @ (mu[:, None] * Phi) + Lam
         return grad, hess
 
-    def _fit_one(y: Array) -> tuple[Array, Array]:
+    def _fit_one(y: Array) -> tuple[Array, Array, Array]:
         gradient_scale = 1.0 + jnp.sum(y)
 
         def _step(
@@ -858,7 +853,7 @@ def fit_static_graph_glm(
         initially_converged = (
             jnp.max(jnp.abs(initial_grad)) <= tolerance * gradient_scale
         )
-        (w, _), _ = jax.lax.scan(
+        (w, converged), _ = jax.lax.scan(
             _step,
             (initial_w, initially_converged),
             None,
@@ -866,9 +861,23 @@ def fit_static_graph_glm(
         )
         mu = jnp.where(visited, jnp.exp(Phi @ w + log_occ), 0.0)
         cov = psd_solve(Phi.T @ (mu[:, None] * Phi) + Lam, eye)
-        return w, symmetrize(cov)
+        return w, symmetrize(cov), converged
 
-    weights, cov = jax.vmap(_fit_one, in_axes=1)(counts_2d)
+    weights, cov, converged = jax.vmap(_fit_one, in_axes=1)(counts_2d)
+    n_unconverged = int(jnp.sum(~converged))
+    if n_unconverged:
+        # A non-converged solve returns a MAP far from the optimum and a Laplace
+        # covariance evaluated off the stationary point; surface it rather than let
+        # it silently poison tau2 selection or the EM warm-start.
+        logger.warning(
+            "fit_static_graph_glm: %d/%d neuron(s) did not reach the gradient "
+            "tolerance %.1e within max_iter=%d; raise max_iter or check the "
+            "conditioning of penalty_diag / counts.",
+            n_unconverged,
+            counts_2d.shape[1],
+            float(tol_arr),
+            max_iter,
+        )
     if single:
         return weights[0], cov[0]
     return weights, cov
@@ -1094,6 +1103,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         update_drift_scale: bool = False,
         update_amplitude: bool = True,
         update_init_mean: bool = True,
+        update_kappa2: bool = True,
         max_firing_rate_hz: float = 500.0,
         max_newton_iter: int = 1,
     ) -> None:
@@ -1107,7 +1117,7 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             raise ValueError(f"alpha must be positive, got {alpha}.")
         if not init_drift_scale >= 0:
             raise ValueError(f"init_drift_scale must be >= 0, got {init_drift_scale}.")
-        if max_firing_rate_hz <= 0:
+        if not max_firing_rate_hz > 0:  # also rejects NaN, matching the checks above
             raise ValueError(
                 f"max_firing_rate_hz must be positive, got {max_firing_rate_hz}."
             )
@@ -1131,11 +1141,11 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         self.update_drift_scale = update_drift_scale
         self.update_amplitude = update_amplitude
         self.update_init_mean = update_init_mean
+        # kappa2 is learnable by fit_sgd only (it reshapes S nonlinearly, so it has no
+        # closed-form EM M-step); default on to preserve prior behavior.
+        self.update_kappa2 = update_kappa2
         self._log_intensity_func = log_conditional_intensity
 
-        # The spectral shape S is deliberately NOT cached on the instance: kappa2 is
-        # fittable (SGD), so a snapshot taken here would go stale. Always derive it
-        # from the current kappa2 via _spectral_shape_current().
         self.transition_matrix = jnp.eye(self.rank)
 
         # Populated during fit.
@@ -1155,7 +1165,12 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         return float(np.log(self.max_firing_rate_hz * self.dt))
 
     def _spectral_shape_current(self) -> Array:
-        """S at the current kappa2 (recomputed so SGD updates to kappa2 take effect)."""
+        """Spectral shape ``S`` at the current ``kappa2``.
+
+        Recomputed on every call rather than cached: ``kappa2`` is fittable by
+        ``fit_sgd``, so a construction-time snapshot would silently go stale. All
+        consumers of ``S`` (prior, drift, filter, M-step) must call this.
+        """
         return jnp.asarray(spectral_shape(self.basis.eigvals, self.kappa2, self.alpha))
 
     def prior_cov(self) -> Array:
@@ -1369,7 +1384,13 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             self.rank,
         ):
             self.init_mean = jnp.zeros((self.n_neurons, self.rank))
-        self.drift_scale = jnp.full(self.n_neurons, self.init_drift_scale)
+        # Reset drift_scale only on a warm start or a neuron-count change, matching
+        # fit_sgd: a repeated fit(warm_start=False) preserves a learned drift_scale.
+        drift_shape_matches = (
+            self.drift_scale is not None and self.drift_scale.shape == (self.n_neurons,)
+        )
+        if warm_start or not drift_shape_matches:
+            self.drift_scale = jnp.full(self.n_neurons, self.init_drift_scale)
 
         _validate_filter_numerics(self.prior_cov(), n_time=self._n_time)
 
@@ -1406,9 +1427,22 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             self.log_likelihoods.append(ll)
             _log(f"  EM iter {iteration + 1}/{max_iter}: LL = {ll:.2f}")
             if not np.isfinite(ll):
-                _log("  WARNING: non-finite LL; stopping.")
                 self.log_likelihoods.pop()
+                if last_state is None:
+                    # First E-step is non-finite: there is no accepted state to fall
+                    # back to, and leaving the NaN posteriors in place would let
+                    # _check_fitted pass and predict_rate_map/score return NaN
+                    # silently. Fail loud instead.
+                    raise RuntimeError(
+                        "GraphPlaceFieldModel.fit: the first E-step produced a "
+                        "non-finite marginal log-likelihood; the fit cannot proceed. "
+                        "Check init_mean/tau2/kappa2, trajectory coverage, and that "
+                        "x64 is enabled."
+                    )
                 _restore(last_state)
+                msg = "non-finite marginal LL; rolling back to the last accepted state."
+                logger.warning("GraphPlaceFieldModel.fit: %s", msg)
+                _log(f"  WARNING: {msg}")
                 break
             if iteration > 0:
                 converged, increasing = check_converged(
@@ -1417,10 +1451,12 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 if not increasing:
                     _restore(last_state)
                     bad = self.log_likelihoods.pop()
-                    _log(
-                        f"  WARNING: LL decreased {self.log_likelihoods[-1]:.2f} -> "
-                        f"{bad:.2f}; rolling back and stopping."
+                    msg = (
+                        f"LL decreased {self.log_likelihoods[-1]:.2f} -> {bad:.2f}; "
+                        "rolling back and stopping."
                     )
+                    logger.warning("GraphPlaceFieldModel.fit: %s", msg)
+                    _log(f"  WARNING: {msg}")
                     break
                 if converged:
                     _log(f"  Converged after {iteration + 1} iterations.")
@@ -1440,7 +1476,9 @@ class GraphPlaceFieldModel(SGDFittableMixin):
                 converged = bool(final_converged)
             else:
                 _restore(last_state)
-                _log("  WARNING: final E-step rejected the last M-step; rolling back.")
+                msg = "final E-step rejected the last M-step; rolling back."
+                logger.warning("GraphPlaceFieldModel.fit: %s", msg)
+                _log(f"  WARNING: {msg}")
 
         self._finalize_convergence(bool(converged), max_iter)
         return self.log_likelihoods
@@ -1463,8 +1501,11 @@ class GraphPlaceFieldModel(SGDFittableMixin):
 
         assert self.init_mean is not None
         assert self.drift_scale is not None
-        params: dict = {"kappa2": jnp.asarray(self.kappa2)}
-        spec: dict = {"kappa2": POSITIVE}
+        params: dict = {}
+        spec: dict = {}
+        if self.update_kappa2:
+            params["kappa2"] = jnp.asarray(self.kappa2)
+            spec["kappa2"] = POSITIVE
         if self.update_drift_scale:
             params["drift_scale"] = self.drift_scale
             spec["drift_scale"] = POSITIVE
@@ -1474,6 +1515,12 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         if self.update_init_mean:
             params["init_mean"] = self.init_mean
             spec["init_mean"] = UNCONSTRAINED
+        if not params:
+            raise ValueError(
+                "fit_sgd has nothing to optimize: all of update_kappa2, "
+                "update_drift_scale, update_amplitude, and update_init_mean are "
+                "False. Enable at least one, or use fit() for EM."
+            )
         return params, spec
 
     def _sgd_loss_fn(
