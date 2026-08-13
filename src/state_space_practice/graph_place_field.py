@@ -33,6 +33,7 @@ public name.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, cast
 
@@ -122,9 +123,9 @@ class GraphBasis(NamedTuple):
     laplacian_convention : {"distance", "inverse_distance"}
         Edge-weight convention used to construct the Laplacian and eigenbasis.
     env_key : tuple
-        Identity fingerprint ``(convention, n_bins, nnz, |L|-sum)`` of the
-        environment's Laplacian this basis was built from. Consumers refuse a
-        basis built for a different environment or convention.
+        Identity fingerprint ``(convention, n_rows, n_cols, sha256)`` of the
+        environment's canonical CSR Laplacian. Consumers refuse a basis built
+        for a different environment or convention.
     """
 
     eigvecs: NDArray[np.float64]
@@ -133,7 +134,7 @@ class GraphBasis(NamedTuple):
     bin_sizes: NDArray[np.float64]
     n_components: int
     laplacian_convention: LaplacianConvention
-    env_key: tuple[str, int, int, float]
+    env_key: tuple[str, int, int, str]
 
 
 def _validate_laplacian_convention(convention: str) -> LaplacianConvention:
@@ -254,23 +255,36 @@ def build_graph_laplacian(
 
 def _laplacian_key(
     laplacian: sp.spmatrix, convention: LaplacianConvention
-) -> tuple[str, int, int, float]:
-    """Cheap identity fingerprint including the selected convention.
+) -> tuple[str, int, int, str]:
+    """Collision-resistant identity of the canonical CSR matrix and convention."""
+    matrix = sp.csr_matrix(laplacian, dtype=np.float64, copy=True)
+    matrix.sum_duplicates()
+    matrix.eliminate_zeros()
+    matrix.sort_indices()
 
-    ``abs`` because a graph Laplacian's signed entries sum to ~0; the absolute-value
-    sum distinguishes different edge weightings at the same sparsity pattern.
-    """
+    # Fixed-width little-endian buffers make the digest independent of SciPy's
+    # platform-specific sparse-index dtype and canonicalize negative signed zero.
+    shape = np.asarray(matrix.shape, dtype="<i8")
+    indptr = np.asarray(matrix.indptr, dtype="<i8")
+    indices = np.asarray(matrix.indices, dtype="<i8")
+    data = np.asarray(matrix.data, dtype="<f8").copy()
+    data[data == 0.0] = 0.0
+
+    digest = hashlib.sha256()
+    for buffer in (shape, indptr, indices, data):
+        digest.update(np.asarray(buffer.size, dtype="<i8").tobytes())
+        digest.update(buffer.tobytes(order="C"))
     return (
         convention,
-        int(laplacian.shape[0]),
-        int(laplacian.nnz),
-        float(np.round(np.abs(laplacian.data).sum(), 6)),
+        int(matrix.shape[0]),
+        int(matrix.shape[1]),
+        digest.hexdigest(),
     )
 
 
 def _env_key(
     env: "Environment", convention: LaplacianConvention
-) -> tuple[str, int, int, float]:
+) -> tuple[str, int, int, str]:
     """Fingerprint of ``env`` under the requested Laplacian convention."""
     return _laplacian_key(build_graph_laplacian(env, convention), convention)
 
@@ -404,8 +418,8 @@ def build_graph_basis(
     laplacian = build_graph_laplacian(env, laplacian_convention)
     n_components, labels = connected_components(laplacian, directed=False)
 
-    # Cache the full sorted eigensystem keyed by the Laplacian's identity (shape + nnz +
-    # data checksum); a cached full basis serves any smaller rank by slicing.
+    # Cache the full sorted eigensystem under the canonical sparse-matrix fingerprint;
+    # a cached full basis serves any smaller rank by slicing.
     cache = getattr(env, _CACHE_ATTR, None)
     key = _laplacian_key(laplacian, laplacian_convention)
     if cache is None or cache.get("key") != key:

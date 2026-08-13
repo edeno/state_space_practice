@@ -267,6 +267,45 @@ def test_basis_cache_invalidates_on_laplacian_change(monkeypatch):
     assert not np.allclose(basis0.eigvals, basis1.eigvals)
 
 
+def test_basis_fingerprint_distinguishes_equal_aggregate_graphs():
+    """Different topologies must not collide merely because n/nnz/sum(abs(L)) match."""
+
+    class TinyGraphEnv:
+        def __init__(self, edges):
+            self.n_bins = 4
+            self.bin_sizes = np.ones(self.n_bins)
+            self.connectivity = nx.Graph()
+            self.connectivity.add_nodes_from(range(self.n_bins))
+            self.connectivity.add_edges_from(
+                (source, target, {"distance": 1.0}) for source, target in edges
+            )
+
+        def bin_sequence(self, times, trajectory, *, dedup, outside_value):
+            del trajectory, dedup, outside_value
+            return np.zeros(len(times), dtype=int)
+
+    path_env = TinyGraphEnv([(0, 1), (1, 2), (2, 3)])
+    star_env = TinyGraphEnv([(0, 1), (0, 2), (0, 3)])
+    path_laplacian = build_graph_laplacian(path_env, convention="inverse_distance")
+    star_laplacian = build_graph_laplacian(star_env, convention="inverse_distance")
+    # These graphs collided under the former aggregate-only fingerprint.
+    assert path_laplacian.nnz == star_laplacian.nnz
+    assert np.sum(np.abs(path_laplacian.data)) == pytest.approx(
+        np.sum(np.abs(star_laplacian.data))
+    )
+    path_basis = build_graph_basis(path_env, laplacian_convention="inverse_distance")
+    star_basis = build_graph_basis(star_env, laplacian_convention="inverse_distance")
+
+    assert path_basis.env_key != star_basis.env_key
+    with pytest.raises(ValueError, match="different"):
+        graph_design_matrix(
+            star_env,
+            path_basis,
+            np.array([0.0]),
+            np.zeros((1, 2)),
+        )
+
+
 def test_consumers_reject_mismatched_env(small_grid_env, two_component_env):
     """A basis built for one env must not be silently used with another."""
     basis = build_graph_basis(small_grid_env)
@@ -863,7 +902,6 @@ def test_fit_sgd_runs_and_default_keeps_drift_fixed(small_grid_env):
 
 
 @pytest.mark.slow
-@pytest.mark.slow
 def test_static_limit_approximates_static_estimator(small_grid_env):
     """Non-circular static-limit contract: with a ZERO fixed prior mean (deliberately
     NOT warm-started to the static MAP), a fixed near-zero drift, and no parameter
@@ -911,14 +949,14 @@ def test_static_limit_approximates_static_estimator(small_grid_env):
 
     field_static = np.asarray(basis.eigvecs @ w_static)
     field_dyn = np.asarray(basis.eigvecs @ w_dyn)
-    coef_rel_err = np.sqrt(np.mean((w_dyn - w_static) ** 2)) / np.linalg.norm(w_static)
+    coef_rel_err = np.linalg.norm(w_dyn - w_static) / np.linalg.norm(w_static)
     field_rmse = np.sqrt(np.mean((field_dyn - field_static) ** 2))  # log-rate nats
-    # The coefficient agreement is the tight, meaningful metric (measured ~0.006, i.e.
-    # <1% relative RMS across seeds); a broken dynamic prior/filter would blow it up.
+    # The coefficient agreement is the tight, meaningful metric (relative L2 error
+    # measured ~0.018 on this fixture); a broken dynamic prior/filter would blow it up.
     # The field RMSE (~0.06 nats, ~6% multiplicative rate) is a looser gross-error guard:
     # the sequential Laplace-EKF is a close APPROXIMATION of the batch Newton MAP, not a
     # bit-exact identity.
-    assert coef_rel_err < 0.02
+    assert coef_rel_err < 0.025
     assert field_rmse < 0.15
 
 
@@ -1198,18 +1236,24 @@ def test_drift_scale_mstep_matches_closed_form(small_grid_env):
 
 @pytest.mark.slow
 def test_fit_sgd_improves_marginal_ll(small_grid_env):
-    """fit_sgd must actually optimize: the marginal LL at the end is >= the start.
+    """fit_sgd must actually optimize: the marginal LL increases from the start.
     Catches a sign error in the loss or a broken parameter-transform wiring."""
     times, traj = _toy_trajectory(small_grid_env, 250, seed=9)
     spikes = np.random.default_rng(10).poisson(0.1, size=250).astype(float)
     model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=6)
+    initial_tau2 = model.tau2
+    initial_kappa2 = model.kappa2
     lls = model.fit_sgd(
         times, traj, spikes, num_steps=60, warm_start=True, verbose=False
     )
+    assert len(lls) == 60  # convergence_tol=None, so every requested step must run
     assert np.all(np.isfinite(lls))
-    assert (
-        lls[-1] >= lls[0]
-    )  # marginal LL improved (or held); returned LLs, higher=better
+    relative_gain = (lls[-1] - lls[0]) / max(abs(lls[0]), 1.0)
+    assert relative_gain > 1e-3
+    assert not (
+        np.isclose(model.tau2, initial_tau2)
+        and np.isclose(model.kappa2, initial_kappa2)
+    )
 
 
 # ------------------------------------------------- regression guards for review fixes

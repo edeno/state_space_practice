@@ -1230,8 +1230,9 @@ def stochastic_point_process_filter(
         (i.e. $N(x_0, P_0 + Q)$ when $A = I$), not $N(x_0, P_0)$. For long
         sequences with small $Q$ this boundary term is negligible, but it
         matters when $P_0$ is a deliberately informative prior on a short
-        sequence; condition the first observation on $x_0$ directly only if you
-        pre-deflate $P_0$ accordingly.
+        sequence. This API does not support conditioning the first observation
+        directly on $N(x_0, P_0)$; callers that require that convention must
+        perform the first observation update separately.
     init_covariance_params : ArrayLike, shape (n_params, n_params)
         Initial covariance of the latent state ($P_0$). See ``init_mean_params``
         for the predict-before-first-update convention.
@@ -1950,8 +1951,9 @@ def stochastic_point_process_smoother(
         (i.e. $N(x_0, P_0 + Q)$ when $A = I$), not $N(x_0, P_0)$. For long
         sequences with small $Q$ this boundary term is negligible, but it
         matters when $P_0$ is a deliberately informative prior on a short
-        sequence; condition the first observation on $x_0$ directly only if you
-        pre-deflate $P_0$ accordingly.
+        sequence. This API does not support conditioning the first observation
+        directly on $N(x_0, P_0)$; callers that require that convention must
+        perform the first observation update separately.
     init_covariance_params : ArrayLike, shape (n_params, n_params)
         Initial covariance of the latent state ($P_0$). See ``init_mean_params``
         for the predict-before-first-update convention.
