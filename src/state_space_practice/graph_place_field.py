@@ -1536,6 +1536,11 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         list[float]
             Accepted marginal log-likelihood at each EM iteration.
         """
+        # Reset before any validation or attribute mutation: a re-fit that fails (bad
+        # args, no in-bounds rows, non-finite E-step) must not leave the model reading
+        # as fitted with stale posteriors for a previous neuron count.
+        self._is_fitted = False
+        self._clear_posteriors()
         if isinstance(max_iter, (bool, np.bool_)) or not isinstance(
             max_iter, (int, np.integer)
         ):
@@ -1596,8 +1601,6 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             if verbose:
                 print(msg)
 
-        # A new fit attempt: not fitted until it finishes with accepted posteriors.
-        self._is_fitted = False
         self.log_likelihoods = []
         last_state: Optional[dict] = None
         converged = False
@@ -1823,6 +1826,10 @@ class GraphPlaceFieldModel(SGDFittableMixin):
             Marginal log-likelihood at each evaluated optimization step that
             produced a finite loss.
         """
+        # Reset before any validation or attribute mutation (see fit()): a failed
+        # re-fit must not leave the model reading as fitted with stale posteriors.
+        self._is_fitted = False
+        self._clear_posteriors()
         spikes_arr = jnp.asarray(spikes)
         if spikes_arr.ndim == 1:
             spikes_arr = spikes_arr[:, None]
@@ -1866,8 +1873,8 @@ class GraphPlaceFieldModel(SGDFittableMixin):
 
         _validate_filter_numerics(self.prior_cov(), n_time=self._n_time)
 
-        # Not fitted until _finalize_sgd confirms a finite final log-likelihood.
-        self._is_fitted = False
+        # _is_fitted stays False (set at entry) until _finalize_sgd confirms a
+        # finite final log-likelihood.
         return super().fit_sgd(
             Z,
             spk,
@@ -1974,6 +1981,11 @@ class GraphPlaceFieldModel(SGDFittableMixin):
         if spikes_arr.ndim == 1:
             spikes_arr = spikes_arr[:, None]
         validate_count_array(spikes_arr, "spikes", allow_empty=False)
+        if spikes_arr.ndim != 2:
+            raise ValueError(
+                "spikes must be 1D (n_time,) or 2D (n_time, n_neurons); "
+                f"got shape {spikes_arr.shape}."
+            )
         if spikes_arr.shape[1] != self.n_neurons:
             raise ValueError(
                 f"spikes has {spikes_arr.shape[1]} neurons but the model was fitted "

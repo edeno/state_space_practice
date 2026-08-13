@@ -1304,3 +1304,37 @@ def test_failed_first_estep_clears_posteriors_and_stays_unfitted(small_grid_env)
     assert model.smoother_mean is None  # NaN posteriors cleared
     with pytest.raises(RuntimeError, match="not fitted"):
         model.predict_rate_map()
+
+
+@pytest.mark.slow
+def test_rejected_refit_leaves_model_cleanly_unfitted(small_grid_env):
+    """A successful fit followed by a re-fit that fails validation must not leave the
+    model reading as fitted with stale posteriors for the previous neuron count."""
+    times, traj = _toy_trajectory(small_grid_env, 40, seed=1)
+    spikes = np.random.default_rng(2).poisson(0.1, size=40).astype(float)
+    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
+    model.fit(times, traj, spikes, max_iter=2, verbose=False)
+    assert model._is_fitted is True and model.predict_rate_map(0).shape[0] > 0
+
+    # Re-fit with a 2-neuron, all-out-of-bounds trajectory: fails the n_valid==0 check
+    # AFTER n_neurons would change. The model must end up not-fitted, not inconsistent.
+    outside = np.full((40, 2), 1e9)
+    two_neuron = np.random.default_rng(3).poisson(0.1, size=(40, 2)).astype(float)
+    with pytest.raises(ValueError, match="no in-bounds"):
+        model.fit(times, outside, two_neuron, max_iter=1, verbose=False)
+    assert model._is_fitted is False
+    assert model.smoother_mean is None
+    with pytest.raises(RuntimeError, match="not fitted"):
+        model.predict_rate_map(0)
+
+
+@pytest.mark.slow
+def test_score_rejects_wrong_ndim_spikes(small_grid_env):
+    times, traj = _toy_trajectory(small_grid_env, 40, seed=4)
+    spikes = np.random.default_rng(5).poisson(0.1, size=40).astype(float)
+    model = GraphPlaceFieldModel(small_grid_env, dt=0.02, rank=4)
+    model.fit(times, traj, spikes, max_iter=2, verbose=False)
+    with pytest.raises(ValueError, match="spikes must be 1D"):
+        model.score(times, traj, np.float64(3.0))  # 0-d scalar
+    with pytest.raises(ValueError, match="spikes must be 1D"):
+        model.score(times, traj, np.zeros((40, 1, 1)))  # 3-d
