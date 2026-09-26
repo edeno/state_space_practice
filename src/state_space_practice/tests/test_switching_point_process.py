@@ -3354,12 +3354,22 @@ class TestSecondOrderNewtonScan:
 
     @staticmethod
     def _run_update(pb: dict, method: str, current: SpikeObsParams, cast):
-        """Run one public second-order update, casting the data arrays."""
+        """Run one public GLM update, casting the data arrays."""
         from state_space_practice.switching_point_process import (
             update_spike_glm_params,
             update_spike_glm_params_mixture,
         )
 
+        if method == "plug_in":
+            return update_spike_glm_params(
+                spikes=cast(pb["spikes"]),
+                smoother_mean=cast(pb["smoother_mean"]),
+                current_params=current,
+                dt=pb["dt"],
+                max_iter=3,
+                weight_l2=0.1,
+                time_weights=cast(pb["time_weights"]),
+            )
         if method == "second_order":
             return update_spike_glm_params(
                 spikes=cast(pb["spikes"]),
@@ -3387,7 +3397,7 @@ class TestSecondOrderNewtonScan:
             baseline_prior_l2=0.5,
         )
 
-    @pytest.mark.parametrize("method", ["second_order", "mixture"])
+    @pytest.mark.parametrize("method", ["plug_in", "second_order", "mixture"])
     @pytest.mark.parametrize("all_float32", [False, True])
     def test_float32_params_keep_their_dtype(
         self, method: str, all_float32: bool

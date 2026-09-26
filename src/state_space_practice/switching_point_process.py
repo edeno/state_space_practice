@@ -1729,10 +1729,10 @@ def update_spike_glm_params(
     Returns
     -------
     SpikeObsParams
-        Updated baseline and weights for all neurons. With
-        ``use_second_order=True`` they keep the dtypes of ``current_params``
-        (e.g. float32 parameters stay float32 under ``jax_enable_x64``, while
-        each Newton solve runs in the promoted precision).
+        Updated baseline and weights for all neurons. They keep the dtypes
+        of ``current_params`` (e.g. float32 parameters stay float32 under
+        ``jax_enable_x64``, while each Newton solve runs in the promoted
+        precision).
 
     Notes
     -----
@@ -1814,7 +1814,10 @@ def update_spike_glm_params(
                 baselines, weights, spikes
             )
 
-            return (new_baselines, new_weights), None
+            return (
+                _cast_like_carry(new_baselines, new_weights, baselines, weights),
+                None,
+            )
 
         (final_baselines, final_weights), _ = jax.lax.scan(
             iterate_all_neurons, (baselines, weights), None, length=max_iter
