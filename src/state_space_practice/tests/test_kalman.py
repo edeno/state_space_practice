@@ -14,14 +14,18 @@ from jax import Array, random
 from scipy.linalg import solve_discrete_are
 
 from state_space_practice.kalman import (
+    InitialStatePrior,
     _kalman_smoother_update,
     joseph_form_update,
     kalman_filter,
     kalman_maximization_step,
     kalman_measurement_update,
     kalman_smoother,
+    measurement_cov_residual_form,
     parallel_kalman_smoother,
+    process_cov_residual_form,
     psd_solve,
+    smooth_initial_state,
     standard_kalman_gain,
     sum_of_outer_products,
     symmetrize,
@@ -2123,3 +2127,317 @@ def test_filter_time_varying_R_asymmetric_slice_raises():
 
     with pytest.raises(ValueError, match="symmetric"):
         kalman_filter(init_mean, init_cov, obs, A, Q, H, R_seq)
+
+
+# --- Initial-state M-step (smoothed x_0), residual forms, relative floors ---
+
+
+@pytest.fixture(scope="module")
+def contractive_1d_problem() -> dict:
+    """1-D model with a contractive A (A=0.5, Q=0.1, R=0.05) and a short
+    observation sequence offset from the prior mean, where updating the
+    init prior to the smoothed x_1 (instead of x_0) decreases the LL."""
+    rng = np.random.default_rng(0)
+    return {
+        "obs": jnp.asarray(rng.normal(size=(5, 1)) + 2.0),
+        "A": jnp.array([[0.5]]),
+        "Q": jnp.array([[0.1]]),
+        "H": jnp.array([[1.0]]),
+        "R": jnp.array([[0.05]]),
+        "init_mean": jnp.zeros(1),
+        "init_cov": jnp.eye(1),
+    }
+
+
+def _init_only_em(problem: dict, n_iter: int, use_prior: bool) -> list[float]:
+    """EM that updates only (init_mean, init_cov); returns the LL history."""
+    m0, P0 = problem["init_mean"], problem["init_cov"]
+    A, Q, H, R = problem["A"], problem["Q"], problem["H"], problem["R"]
+    lls = []
+    for _ in range(n_iter):
+        sm, sc, scc, ll = kalman_smoother(m0, P0, problem["obs"], A, Q, H, R)
+        lls.append(float(ll))
+        prior = InitialStatePrior(m0, P0, A, Q) if use_prior else None
+        *_, m0, P0 = kalman_maximization_step(problem["obs"], sm, sc, scc, prior)
+    return lls
+
+
+def _dense_x0_posterior(problem: dict) -> tuple[float, float]:
+    """E[x_0 | y] and Var[x_0 | y] for the 1-D model by dense Gaussian
+    conditioning of the joint (x_0, ..., x_T, y_1, ..., y_T) -- independent
+    of the RTS recursion."""
+    a = float(problem["A"][0, 0])
+    q = float(problem["Q"][0, 0])
+    r = float(problem["R"][0, 0])
+    m0 = float(problem["init_mean"][0])
+    p0 = float(problem["init_cov"][0, 0])
+    y = np.asarray(problem["obs"])[:, 0]
+    T = y.shape[0]
+    # x = L @ [x_0 - m0, w_1, ..., w_T] + mean, with x_t = a x_{t-1} + w_t.
+    L = np.zeros((T + 1, T + 1))
+    for t in range(T + 1):
+        for s in range(t + 1):
+            L[t, s] = a ** (t - s)
+    noise_cov = np.diag([p0] + [q] * T)
+    x_mean = np.array([a**t * m0 for t in range(T + 1)])
+    x_cov = L @ noise_cov @ L.T
+    y_mean = x_mean[1:]
+    y_cov = x_cov[1:, 1:] + r * np.eye(T)
+    cross = x_cov[0, 1:]
+    gain = np.linalg.solve(y_cov, cross)
+    return float(x_mean[0] + gain @ (y - y_mean)), float(x_cov[0, 0] - gain @ cross)
+
+
+class TestInitialStateMStep:
+    """The filter predicts before its first update, so ``init_mean`` /
+    ``init_cov`` are the prior of x_0 and their EM update is the smoothed
+    x_0 (one RTS step behind the smoother output, which starts at x_1)."""
+
+    def test_init_only_em_is_monotone(self, contractive_1d_problem) -> None:
+        lls = _init_only_em(contractive_1d_problem, n_iter=6, use_prior=True)
+        assert np.all(np.diff(lls) >= -1e-10), lls
+        # guard: the problem is one where the legacy x_1 update is not an EM
+        # step -- its LL decreases after the first iteration.
+        legacy = _init_only_em(contractive_1d_problem, n_iter=6, use_prior=False)
+        assert np.any(np.diff(legacy) < -1e-3), legacy
+
+    def test_init_update_matches_grid_maximiser(self, contractive_1d_problem) -> None:
+        """The M-step's (init_mean, init_cov) maximise the EM auxiliary
+        function E[log N(x_0; m, P) | y], evaluated with the x_0 posterior
+        from dense conditioning, over a (m, P) grid."""
+        p = contractive_1d_problem
+        sm, sc, scc, _ = kalman_smoother(
+            p["init_mean"], p["init_cov"], p["obs"], p["A"], p["Q"], p["H"], p["R"]
+        )
+        prior = InitialStatePrior(p["init_mean"], p["init_cov"], p["A"], p["Q"])
+        *_, m_new, P_new = kalman_maximization_step(p["obs"], sm, sc, scc, prior)
+
+        post_mean, post_var = _dense_x0_posterior(p)
+        m_grid = np.linspace(-1.0, 3.0, 2001)
+        P_grid = np.linspace(0.01, 1.0, 991)
+        M, P = np.meshgrid(m_grid, P_grid, indexing="ij")
+        aux = -0.5 * np.log(P) - 0.5 * (post_var + (post_mean - M) ** 2) / P
+        i, j = np.unravel_index(np.argmax(aux), aux.shape)
+        np.testing.assert_allclose(float(m_new[0]), m_grid[i], atol=2e-3)
+        np.testing.assert_allclose(float(P_new[0, 0]), P_grid[j], atol=1e-3)
+        # guard: x_0's posterior differs from x_1's, which the legacy update
+        # would install.
+        assert abs(float(sm[0, 0]) - m_grid[i]) > 0.1
+
+    def test_smooth_initial_state_is_rts_step_to_prior(self) -> None:
+        """m_{0|T} = m_0 + J_0 (m_{1|T} - A m_0), P_{0|T} = P_0 + J_0 (P_{1|T} -
+        P_{1|0}) J_0^T with J_0 = P_0 A^T P_{1|0}^{-1}, in 2-D."""
+        A = jnp.array([[0.9, 0.2], [-0.1, 0.7]])
+        Q = jnp.array([[0.3, 0.05], [0.05, 0.2]])
+        m0 = jnp.array([1.0, -0.5])
+        P0 = jnp.array([[2.0, 0.3], [0.3, 1.0]])
+        m1, P1 = jnp.array([0.2, 0.4]), jnp.array([[0.5, 0.1], [0.1, 0.4]])
+        m, P = smooth_initial_state(InitialStatePrior(m0, P0, A, Q), m1, P1)
+
+        P_pred = np.asarray(A @ P0 @ A.T + Q)
+        J = np.asarray(P0 @ A.T) @ np.linalg.inv(P_pred)
+        # rtol covers psd_solve's 1e-9 diagonal jitter in the gain.
+        np.testing.assert_allclose(
+            m, np.asarray(m0) + J @ np.asarray(m1 - A @ m0), rtol=1e-7
+        )
+        np.testing.assert_allclose(
+            P, np.asarray(P0) + J @ (np.asarray(P1) - P_pred) @ J.T, rtol=1e-7
+        )
+
+    def test_full_em_with_prior_is_monotone(self) -> None:
+        """Full EM (all parameters) with the smoothed-x_0 init update keeps a
+        non-decreasing LL on a 2-D model."""
+        A_true = _make_asymmetric_stable_A(2, seed=15)
+        H_true = jnp.array([[1.0, 0.3], [-0.2, 0.9]])
+        obs, _ = _simulate_from_model(
+            A_true, jnp.eye(2) * 0.2, H_true, jnp.eye(2) * 0.5,
+            jnp.zeros(2), jnp.eye(2), 200, seed=42,
+        )
+        A, Q, H, R = jnp.eye(2) * 0.5, jnp.eye(2), jnp.eye(2), jnp.eye(2) * 2.0
+        m0, P0 = jnp.ones(2) * 3.0, jnp.eye(2) * 2.0
+        lls = []
+        for _ in range(10):
+            sm, sc, scc, ll = kalman_smoother(m0, P0, obs, A, Q, H, R)
+            lls.append(float(ll))
+            prior = InitialStatePrior(m0, P0, A, Q)
+            A, H, Q, R, m0, P0 = kalman_maximization_step(obs, sm, sc, scc, prior)
+        assert np.all(np.diff(lls) >= -1e-6), lls
+        assert lls[-1] > lls[0] + 1.0
+
+
+class TestResidualFormMStep:
+    """R and Q use centred residual forms, PSD by construction."""
+
+    @pytest.fixture(scope="class")
+    def smoothed_3d(self) -> tuple:
+        A = jnp.array([[0.9, 0.1, 0.0], [0.0, 0.8, 0.1], [0.0, 0.0, 0.7]])
+        Q = jnp.eye(3) * 0.2
+        H = jnp.array([[1.0, 0.5, 0.0], [0.0, 1.0, 0.3]])
+        R = jnp.eye(2) * 0.5
+        obs, _ = _simulate_from_model(
+            A, Q, H, R, jnp.zeros(3), jnp.eye(3), 400, seed=3
+        )
+        sm, sc, scc, _ = kalman_smoother(jnp.zeros(3), jnp.eye(3), obs, A, Q, H, R)
+        return obs, sm, sc, scc
+
+    def test_residual_forms_equal_classical_forms(self, smoothed_3d) -> None:
+        """At the exact solves H = delta gamma^{-1}, A = beta gamma1^{-1} the
+        residual forms equal (alpha - H delta^T)/T and (gamma2 - A beta^T)/(T-1)."""
+        obs, sm, sc, scc = (np.asarray(a) for a in smoothed_3d)
+        T = obs.shape[0]
+        gamma = sc.sum(0) + sm.T @ sm
+        delta = obs.T @ sm
+        alpha = obs.T @ obs
+        gamma1 = gamma - np.outer(sm[-1], sm[-1]) - sc[-1]
+        gamma2 = gamma - np.outer(sm[0], sm[0]) - sc[0]
+        beta = (scc.sum(0) + sm[:-1].T @ sm[1:]).T
+        H = np.linalg.solve(gamma, delta.T).T
+        A = np.linalg.solve(gamma1, beta.T).T
+
+        R_res = measurement_cov_residual_form(
+            jnp.asarray(obs), jnp.asarray(sm), jnp.asarray(sc.sum(0)), jnp.asarray(H)
+        )
+        Q_res = process_cov_residual_form(
+            jnp.asarray(sm),
+            sum_next_cov=jnp.asarray(sc[1:].sum(0)),
+            sum_prev_cov=jnp.asarray(sc[:-1].sum(0)),
+            sum_cross_cov=jnp.asarray(scc.sum(0)),
+            transition_matrix=jnp.asarray(A),
+        )
+        np.testing.assert_allclose(R_res, (alpha - H @ delta.T) / T, rtol=1e-12)
+        np.testing.assert_allclose(Q_res, (gamma2 - A @ beta.T) / (T - 1), rtol=1e-12)
+
+    def test_m_step_matches_classical_forms(self, smoothed_3d) -> None:
+        """The M-step's R and Q agree with the classical shortcut forms at
+        its own (jittered-solve) H and A to ~1e-10 relative on well-scaled
+        data."""
+        obs, sm, sc, scc = smoothed_3d
+        A, H, Q, R, _, _ = kalman_maximization_step(obs, sm, sc, scc)
+        obs, sm, sc, scc = (np.asarray(a) for a in (obs, sm, sc, scc))
+        T = obs.shape[0]
+        gamma = sc.sum(0) + sm.T @ sm
+        gamma2 = gamma - np.outer(sm[0], sm[0]) - sc[0]
+        beta = (scc.sum(0) + sm[:-1].T @ sm[1:]).T
+        R_old = (obs.T @ obs - np.asarray(H) @ (obs.T @ sm).T) / T
+        Q_old = (gamma2 - np.asarray(A) @ beta.T) / (T - 1)
+        np.testing.assert_allclose(R, R_old, rtol=1e-10, atol=1e-12)
+        np.testing.assert_allclose(Q, Q_old, rtol=1e-10, atol=1e-12)
+
+    def test_residual_form_is_accurate_with_a_large_offset(self) -> None:
+        """Observations with a large constant offset (absorbed by a constant
+        latent) make the uncentred alpha - H delta^T cancel catastrophically;
+        the residual form keeps R accurate and PSD."""
+        rng = np.random.default_rng(1)
+        T, offset, r_true = 500, 1e7, 1e-4
+        states = np.stack([np.full(T, offset), rng.normal(size=T)], axis=1)
+        H = np.array([[1.0, 1.0]])
+        obs = states @ H.T + rng.normal(size=(T, 1)) * np.sqrt(r_true)
+        R_res = measurement_cov_residual_form(
+            jnp.asarray(obs),
+            jnp.asarray(states),
+            jnp.zeros((2, 2)),
+            jnp.asarray(H),
+        )
+        empirical = float(np.mean((obs - states @ H.T) ** 2))
+        np.testing.assert_allclose(float(R_res[0, 0]), empirical, rtol=1e-8)
+        # guard: the uncentred form really loses the answer here.
+        R_old = (obs.T @ obs - H @ (obs.T @ states).T) / T
+        assert abs(float(R_old[0, 0]) - empirical) > 10 * empirical
+
+
+class TestRelativeEigenvalueFloor:
+    """M-step covariance floors are relative to the matrix scale."""
+
+    def test_m_step_recovers_tiny_measurement_noise(self) -> None:
+        """At a 1e-3 signal scale with R = Q = 1e-10 (volts), exact state
+        inputs give R, Q ~ 1e-10 instead of an absolute 1e-8 floor."""
+        rng = np.random.default_rng(0)
+        T, var = 4000, 1e-10
+        x = np.zeros(T)
+        x[0] = 1e-3
+        for t in range(1, T):
+            x[t] = 0.99 * x[t - 1] + rng.normal() * np.sqrt(var)
+        obs = jnp.asarray((x + rng.normal(size=T) * np.sqrt(var))[:, None])
+        sm = jnp.asarray(x[:, None])
+        sc = jnp.zeros((T, 1, 1))
+        scc = jnp.zeros((T - 1, 1, 1))
+        A, H, Q, R, _, _ = kalman_maximization_step(obs, sm, sc, scc)
+        np.testing.assert_allclose(float(R[0, 0]), var, rtol=0.1)
+        np.testing.assert_allclose(float(Q[0, 0]), var, rtol=0.1)
+
+    def test_floor_logs_when_it_changes_an_eigenvalue(self, caplog) -> None:
+        """A rank-deficient R (two identical noiseless channels) is floored,
+        and the projection is reported through the logger."""
+        rng = np.random.default_rng(2)
+        T = 50
+        sm = jnp.asarray(rng.normal(size=(T, 1)))
+        obs = jnp.concatenate([sm, sm], axis=1)
+        sc = jnp.full((T, 1, 1), 1e-2)
+        scc = jnp.zeros((T - 1, 1, 1))
+        with caplog.at_level("WARNING", logger="state_space_practice.utils"):
+            _, _, _, R, _, _ = kalman_maximization_step(obs, sm, sc, scc)
+            jax.block_until_ready(R)
+            jax.effects_barrier()
+        eigs = np.linalg.eigvalsh(np.asarray(R))
+        assert eigs.min() > 0.0
+        assert eigs.min() < 1e-6 * eigs.max()
+        assert any("measurement_cov" in rec.getMessage() for rec in caplog.records)
+
+
+class TestKalmanTraceability:
+    """Public filters trace under jit/grad with the default validate_inputs."""
+
+    @pytest.fixture(scope="class")
+    def problem(self) -> tuple:
+        A = jnp.array([[0.9, 0.1], [0.0, 0.8]])
+        Q = jnp.eye(2) * 0.1
+        H = jnp.eye(2)
+        R = jnp.eye(2) * 0.5
+        obs, _ = _simulate_from_model(A, Q, H, R, jnp.zeros(2), jnp.eye(2), 30, seed=5)
+        return jnp.zeros(2), jnp.eye(2), obs, A, Q, H, R
+
+    def test_kalman_filter_jits_with_default_validation(self, problem) -> None:
+        m0, P0, obs, A, Q, H, R = problem
+        eager = kalman_filter(m0, P0, obs, A, Q, H, R)[2]
+        jitted = jax.jit(lambda m: kalman_filter(m, P0, obs, A, Q, H, R)[2])(m0)
+        np.testing.assert_allclose(jitted, eager, rtol=1e-12)
+
+    def test_kalman_filter_grad_wrt_init_cov(self, problem) -> None:
+        m0, P0, obs, A, Q, H, R = problem
+
+        def loss(P):
+            return kalman_filter(m0, P, obs, A, Q, H, R)[2]
+
+        grad = jax.grad(loss)(P0)
+        eps = 1e-6
+        E = jnp.zeros((2, 2)).at[0, 0].set(1.0)
+        fd = (loss(P0 + eps * E) - loss(P0 - eps * E)) / (2 * eps)
+        np.testing.assert_allclose(grad[0, 0], fd, rtol=1e-5)
+        assert abs(float(grad[0, 0])) > 1e-6
+
+    def test_kalman_smoother_jits_with_default_validation(self, problem) -> None:
+        m0, P0, obs, A, Q, H, R = problem
+        eager = kalman_smoother(m0, P0, obs, A, Q, H, R)[0]
+        jitted = jax.jit(lambda P: kalman_smoother(m0, P, obs, A, Q, H, R)[0])(P0)
+        np.testing.assert_allclose(jitted, eager, rtol=1e-12)
+
+    def test_eager_validation_still_raises(self, problem) -> None:
+        m0, _, obs, A, Q, H, R = problem
+        with pytest.raises(ValueError, match="not positive definite"):
+            kalman_filter(m0, -jnp.eye(2), obs, A, Q, H, R)
+
+    def test_float32_init_with_float64_params(self, problem) -> None:
+        """A float32 init with float64 parameters promotes the scan carry
+        instead of failing on a carry-type mismatch."""
+        m0, P0, obs, A, Q, H, R = problem
+        mean, cov, ll = kalman_filter(
+            m0.astype(jnp.float32), P0.astype(jnp.float32), obs, A, Q, H, R
+        )
+        assert mean.dtype == jnp.float64 and cov.dtype == jnp.float64
+        ref = kalman_filter(m0, P0, obs, A, Q, H, R)
+        np.testing.assert_allclose(mean, ref[0], rtol=1e-12)
+        np.testing.assert_allclose(ll, ref[2], rtol=1e-12)
+        sm = kalman_smoother(
+            m0.astype(jnp.float32), P0.astype(jnp.float32), obs, A, Q, H, R
+        )[0]
+        np.testing.assert_allclose(sm, kalman_smoother(m0, P0, obs, A, Q, H, R)[0])
