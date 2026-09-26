@@ -429,6 +429,8 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         )
         self.n_discrete_states = n_discrete_states
 
+        # ``self.key`` was advanced past the parent's MLP / C_lfp / C_spikes /
+        # init keys, so these per-state keys are fresh.
         keys = jax.random.split(self.key, n_discrete_states)
         self.mlp_params = jax.vmap(
             partial(init_mlp_params, self.n_oscillators, self.hidden_dims)

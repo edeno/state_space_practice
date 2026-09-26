@@ -54,6 +54,59 @@ def params(switching_model):
     return params
 
 
+class TestSwitchingHamiltonianKeys:
+    """Per-state MLP initialization draws fresh randomness."""
+
+    @pytest.mark.parametrize("n_discrete_states", [2, 4])
+    def test_per_state_mlp_keys_differ_from_parent_keys(self, n_discrete_states):
+        """The parent consumes ``split(PRNGKey(seed), 4)`` for its MLP, C_lfp,
+        C_spikes and init keys. Under JAX's partitionable threefry
+        ``split(key, n)[i]`` does not depend on ``n``, so re-splitting the same
+        key handed state i the parent's key i (state 0's MLP was the parent's
+        MLP, state 1's was drawn from C_lfp's key)."""
+        from state_space_practice.hamiltonian_joint import JointHamiltonianModel
+        from state_space_practice.hamiltonian_switching import (
+            SwitchingHamiltonianJointModel,
+        )
+        from state_space_practice.nonlinear_dynamics import init_mlp_params
+
+        kwargs = dict(
+            n_oscillators=1,
+            n_lfp_sources=2,
+            n_spike_sources=3,
+            sampling_freq=100.0,
+            hidden_dims=[8, 8],
+            seed=0,
+        )
+        model = SwitchingHamiltonianJointModel(
+            n_discrete_states=n_discrete_states, **kwargs
+        )
+        parent_keys = jax.random.split(jax.random.PRNGKey(0), 4)
+        parent_mlps = [init_mlp_params(1, [8, 8], k) for k in parent_keys]
+
+        def first_layer(mlp):
+            return np.asarray(mlp["w0"])  # the biases start at zero
+
+        state_layers = [
+            np.asarray(model.mlp_params["w0"][s]) for s in range(n_discrete_states)
+        ]
+        for layer in state_layers:
+            for parent in parent_mlps:
+                assert not np.allclose(layer, first_layer(parent))
+        # states are initialized differently from one another
+        for a in range(n_discrete_states):
+            for b in range(a + 1, n_discrete_states):
+                assert not np.allclose(state_layers[a], state_layers[b])
+        # guard: the parent's own draws are unchanged by advancing the key
+        joint = JointHamiltonianModel(**kwargs)
+        np.testing.assert_array_equal(model.C_lfp, joint.C_lfp)
+        np.testing.assert_array_equal(model.C_spikes, joint.C_spikes)
+        # guard: the comparison would catch a collision
+        np.testing.assert_array_equal(
+            first_layer(joint.mlp_params), first_layer(parent_mlps[0])
+        )
+
+
 class TestSwitchingHamiltonianSmooth:
     """Smoke tests for SwitchingHamiltonianJointModel.smooth()."""
 

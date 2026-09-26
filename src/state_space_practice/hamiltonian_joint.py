@@ -71,6 +71,12 @@ class JointHamiltonianModel(HamiltonianModelBase):
         self.n_lfp = n_lfp_sources
         self.n_spikes = n_spike_sources
         k_mlp, k_lfp, k_spk, k_init = jax.random.split(self.key, 4)
+        # Advance ``self.key`` past the four keys consumed above, so a subclass
+        # that needs more randomness draws from a fresh key. Re-splitting the
+        # old key would not do: under JAX's default partitionable threefry
+        # ``split(key, n)[i]`` does not depend on ``n``, so ``split(key, 2)``
+        # returns ``k_mlp, k_lfp`` again.
+        self.key = jax.random.fold_in(self.key, 4)
 
         # Shared latent dynamics (the Hamiltonian)
         self.mlp_params = init_mlp_params(self.n_oscillators, self.hidden_dims, k_mlp)
