@@ -648,18 +648,35 @@ class TestSwitchingHamiltonianSGDRecovery:
         )
 
 
-def test_switching_cores_are_shared_across_model_instances():
+def test_switching_cores_are_shared_across_model_instances(monkeypatch):
     """A second instance with the same shapes and dt reuses the compilation.
 
     The switching filter/smoother are module-level ``jax.jit`` functions with
     only ``dt`` static (the state count follows from the array shapes); a
-    different ``dt`` compiles again, keeping the equality checks non-vacuous.
+    never-seen ``dt`` traces again, keeping the reuse check non-vacuous.
+
+    Compilations are observed as traces (``switching_predict_collapse`` runs
+    only while a core is traced), not as absolute ``_cache_size()`` counts:
+    those depend on what earlier tests compiled, and JAX's jit cache is a
+    global LRU whose evictions can hide a new entry in a long run.
     """
+    from state_space_practice import hamiltonian_switching
     from state_space_practice.hamiltonian_switching import (
         SwitchingHamiltonianJointModel,
         switching_hamiltonian_filter,
         switching_hamiltonian_smoother,
     )
+
+    traces: list = []
+    original = hamiltonian_switching.switching_predict_collapse
+
+    def counting(*args, **kwargs):
+        traces.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hamiltonian_switching, "switching_predict_collapse", counting)
+    # Sampling rates no other test uses, so the first run must compile.
+    sampling_freq, other_sampling_freq = 7907.0, 7909.0
 
     k1, k2 = jax.random.split(jax.random.PRNGKey(5))
     lfp = jax.random.normal(k1, (6, 2))
@@ -679,17 +696,19 @@ def test_switching_cores_are_shared_across_model_instances():
         model.filter(lfp, spikes, params)
         model.smooth(lfp, spikes, params)
 
-    run(seed=0, sampling_freq=200.0)
+    run(seed=0, sampling_freq=sampling_freq)
     n_filter = switching_hamiltonian_filter._cache_size()
     n_smooth = switching_hamiltonian_smoother._cache_size()
+    assert traces  # guard: this dt really was compiled here
 
-    run(seed=1, sampling_freq=200.0)
+    traces.clear()
+    run(seed=1, sampling_freq=sampling_freq)
+    assert traces == []
     assert switching_hamiltonian_filter._cache_size() == n_filter
     assert switching_hamiltonian_smoother._cache_size() == n_smooth
 
-    run(seed=0, sampling_freq=100.0)
-    assert switching_hamiltonian_filter._cache_size() == n_filter + 1
-    assert switching_hamiltonian_smoother._cache_size() == n_smooth + 1
+    run(seed=0, sampling_freq=other_sampling_freq)
+    assert traces
 
 
 class TestSwitchingHamiltonianUseFilterGuard:

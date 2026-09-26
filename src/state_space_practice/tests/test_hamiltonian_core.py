@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from scipy.stats import multivariate_normal
 
+from state_space_practice import hamiltonian_core
 from state_space_practice.hamiltonian_core import (
     HamiltonianModelBase,
     ekf_rts_backward_pass,
@@ -334,31 +335,50 @@ def _joint_case(seed, sampling_freq):
 
 
 @pytest.mark.parametrize("make_case", [_lfp_case, _spike_case, _joint_case])
-def test_jitted_cores_are_shared_across_model_instances(make_case):
+def test_jitted_cores_are_shared_across_model_instances(make_case, monkeypatch):
     """A second instance with the same shapes and dt reuses the compilation.
 
     The cores are module-level ``jax.jit`` functions keyed on array shapes plus
     the static ``dt`` / observation-model name, not on the model object. A
-    different ``dt`` must compile again, which keeps the equality checks from
-    being vacuous.
+    never-seen ``dt`` must trace again, which keeps the reuse check from being
+    vacuous.
+
+    Compilations are observed as traces (``_observation_updates`` runs only
+    while a core is traced), not as absolute ``_cache_size()`` counts: those
+    depend on what earlier tests compiled, and JAX's jit cache is a global
+    LRU whose evictions can hide a new entry in a long run.
     """
+    traces: list = []
+    original = hamiltonian_core._observation_updates
+
+    def counting(*args, **kwargs):
+        traces.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hamiltonian_core, "_observation_updates", counting)
+    # Sampling rates no other test uses, so the first run must compile (the
+    # parametrized cases differ in the static observation-model name).
+    sampling_freq, other_sampling_freq = 7919.0, 7927.0
 
     def run(model, data):
         params = model._build_param_spec()[0]
         model.filter(*data, params)
         model.smooth(*data, params)
 
-    run(*make_case(seed=0, sampling_freq=200.0))
+    run(*make_case(seed=0, sampling_freq=sampling_freq))
     n_filter = hamiltonian_ekf_filter._cache_size()
     n_smooth = hamiltonian_ekf_smoother._cache_size()
+    # Guard: a dt no earlier test used really was compiled here.
+    assert len(traces) == 2  # filter + smoother
 
-    run(*make_case(seed=1, sampling_freq=200.0))
+    traces.clear()
+    run(*make_case(seed=1, sampling_freq=sampling_freq))
+    assert traces == []
     assert hamiltonian_ekf_filter._cache_size() == n_filter
     assert hamiltonian_ekf_smoother._cache_size() == n_smooth
 
-    run(*make_case(seed=0, sampling_freq=100.0))
-    assert hamiltonian_ekf_filter._cache_size() == n_filter + 1
-    assert hamiltonian_ekf_smoother._cache_size() == n_smooth + 1
+    run(*make_case(seed=0, sampling_freq=other_sampling_freq))
+    assert len(traces) == 2
 
 
 @pytest.mark.parametrize("make_case", [_lfp_case, _spike_case, _joint_case])
