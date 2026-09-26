@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg
 import jax.scipy.stats.multivariate_normal
+from jax.typing import ArrayLike
 
 from state_space_practice.utils import (  # noqa: F401 — re-exported for backward compat
     _validate_filter_numerics,
@@ -34,9 +35,9 @@ from state_space_practice.utils import (  # noqa: F401 — re-exported for backw
 
 
 def woodbury_kalman_gain(
-    prior_cov: jax.Array,
-    emission_matrix: jax.Array,
-    emission_cov_diag: jax.Array,
+    prior_cov: ArrayLike,
+    emission_matrix: ArrayLike,
+    emission_cov_diag: ArrayLike,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Compute Kalman gain using the Woodbury identity for diagonal R.
 
@@ -52,11 +53,11 @@ def woodbury_kalman_gain(
 
     Parameters
     ----------
-    prior_cov : jax.Array, shape (D_state, D_state)
+    prior_cov : ArrayLike, shape (D_state, D_state)
         Prior (predicted) state covariance P.
-    emission_matrix : jax.Array, shape (D_obs, D_state)
+    emission_matrix : ArrayLike, shape (D_obs, D_state)
         Observation matrix H.
-    emission_cov_diag : jax.Array, shape (D_obs,)
+    emission_cov_diag : ArrayLike, shape (D_obs,)
         Diagonal of observation noise covariance R.
 
     Returns
@@ -976,10 +977,10 @@ class _SmootherElement(NamedTuple):
 
 
 def parallel_kalman_smoother(
-    filtered_means: jax.Array,
-    filtered_covariances: jax.Array,
-    transition_matrix: jax.Array,
-    process_cov: jax.Array,
+    filtered_means: ArrayLike,
+    filtered_covariances: ArrayLike,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """RTS smoother via parallel associative scan.
 
@@ -989,15 +990,15 @@ def parallel_kalman_smoother(
 
     Parameters
     ----------
-    filtered_means : jax.Array, shape (T, D)
+    filtered_means : ArrayLike, shape (T, D)
         Filtered state means from the forward Kalman filter.
-    filtered_covariances : jax.Array, shape (T, D, D)
+    filtered_covariances : ArrayLike, shape (T, D, D)
         Filtered state covariances from the forward Kalman filter.
-    transition_matrix : jax.Array, shape (D, D) or (T-1, D, D)
+    transition_matrix : ArrayLike, shape (D, D) or (T-1, D, D)
         State transition matrix. If 2-D, the same matrix is used at every
         time step. If 3-D, ``transition_matrix[t]`` is used for the
         transition from time ``t`` to ``t+1``.
-    process_cov : jax.Array, shape (D, D) or (T-1, D, D)
+    process_cov : ArrayLike, shape (D, D) or (T-1, D, D)
         Process noise covariance. Broadcasting rules follow
         ``transition_matrix``.
 
@@ -1122,16 +1123,16 @@ def parallel_kalman_smoother(
     return smoothed_means, smoothed_covariances, cross_covariances
 
 
-def sum_of_outer_products(x: jax.Array, y: jax.Array) -> jax.Array:
+def sum_of_outer_products(x: ArrayLike, y: ArrayLike) -> jax.Array:
     """Compute the sum of outer products between corresponding vectors.
 
     Computes $$ S = \\sum_{t=1}^T x_t y_t^T $$.
 
     Parameters
     ----------
-    x : jax.Array, shape (T, N)
+    x : ArrayLike, shape (T, N)
         First sequence of vectors.
-    y : jax.Array, shape (T, M)
+    y : ArrayLike, shape (T, M)
         Second sequence of vectors.
 
     Returns
