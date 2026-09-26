@@ -30,6 +30,7 @@ References
 
 import functools
 import logging
+import operator
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -215,16 +216,23 @@ class BlockDiagonalCovariance:
     :meth:`diagonal` (marginal variances / confidence intervals).
 
     ``shape``, ``ndim`` and ``len`` report the dense geometry so shape checks
-    written against the dense array keep working. :meth:`to_dense` -- also
-    reached through ``np.asarray`` / ``jnp.asarray`` and non-integer
-    indexing -- builds the dense array on demand for consumers that need it.
+    written against the dense array keep working. Integer time indexing
+    follows ndarray rules (negative indices allowed, out-of-range raises
+    ``IndexError``, a bool is rejected with ``TypeError``); any other index
+    expression (slices, tuples, masks) is applied to the dense array.
+    Operations whose ndarray meaning the container does not implement raise
+    rather than return something different (e.g. ``sum`` requires
+    ``axis=0``).
 
-    Trade-off: this is not a ``jax.Array``. ``jax.numpy`` functions do not
-    accept it directly; convert with ``jnp.asarray`` (materialising the dense
-    array) or use the block-local methods, which is what the hot paths do.
+    This is not a ``jax.Array``: ``jax.numpy`` functions (``jnp.sum(cov)``,
+    ``jnp.diagonal(cov)``, arithmetic) and ``jax.jit`` raise when handed the
+    container. ``jnp.asarray(cov)``, ``np.asarray(cov)`` and
+    :meth:`to_dense` are the supported ways to materialise the dense array;
+    the hot paths use the block-local methods instead. ``blocks`` is
+    read-only.
     """
 
-    __slots__ = ("blocks",)
+    __slots__ = ("_blocks",)
 
     def __init__(self, blocks: ArrayLike):
         blocks = jnp.asarray(blocks)
@@ -233,19 +241,24 @@ class BlockDiagonalCovariance:
                 "blocks must have shape (n_neurons, n_time, block_size, "
                 f"block_size), got {blocks.shape}."
             )
-        self.blocks = blocks
+        self._blocks = blocks
+
+    @property
+    def blocks(self) -> Array:
+        """The ``(n_neurons, n_time, block_size, block_size)`` diagonal blocks."""
+        return self._blocks
 
     @property
     def n_neurons(self) -> int:
-        return self.blocks.shape[0]
+        return self._blocks.shape[0]
 
     @property
     def n_time(self) -> int:
-        return self.blocks.shape[1]
+        return self._blocks.shape[1]
 
     @property
     def block_size(self) -> int:
-        return self.blocks.shape[-1]
+        return self._blocks.shape[-1]
 
     @property
     def n_state(self) -> int:
@@ -262,7 +275,7 @@ class BlockDiagonalCovariance:
 
     @property
     def dtype(self) -> jnp.dtype:
-        return self.blocks.dtype
+        return self._blocks.dtype
 
     def __len__(self) -> int:
         return self.n_time
@@ -273,48 +286,65 @@ class BlockDiagonalCovariance:
             f"n_time={self.n_time}, block_size={self.block_size})"
         )
 
-    def neuron_blocks(
-        self, neuron_idx: int, time_slice: slice = slice(None)
-    ) -> Array:
+    def neuron_blocks(self, neuron_idx: int, time_slice: slice = slice(None)) -> Array:
         """One neuron's ``(n_t, block_size, block_size)`` diagonal blocks.
 
         Equals ``dense[time_slice, s, s]`` for that neuron's state slice
         ``s``, read with a single gather from the block storage.
         """
-        return self.blocks[neuron_idx, time_slice]
+        return self._blocks[neuron_idx, time_slice]
 
     def diagonal(self) -> Array:
-        """Marginal variances ``(n_time, n_state)``: ``dense.diagonal(1, 2)``."""
-        var = jnp.diagonal(self.blocks, axis1=-2, axis2=-1)  # (n_neurons, T, nb)
+        """Marginal variances, shape ``(n_time, n_state)``.
+
+        Takes no arguments; equals ``dense.diagonal(axis1=1, axis2=2)``.
+        """
+        var = jnp.diagonal(self._blocks, axis1=-2, axis2=-1)  # (n_neurons, T, nb)
         return jnp.transpose(var, (1, 0, 2)).reshape(self.n_time, self.n_state)
 
-    def sum(self, axis: int = 0) -> Array:
+    def sum(self, axis: int) -> Array:
         """Sum over time, a dense ``(n_state, n_state)`` matrix (``dense.sum(0)``).
 
-        Only the time axis is supported: it is the reduction the EM M-step
-        needs, and it stays block-local (one small dense matrix is built,
-        never the ``(n_time, n_state, n_state)`` sequence).
+        Only the time axis is supported (``axis=0``, or ``-3``), and it must
+        be passed explicitly: it is the reduction the EM M-step needs, and it
+        stays block-local (one small dense matrix is built, never the
+        ``(n_time, n_state, n_state)`` sequence).
         """
         if axis not in (0, -3):
-            raise ValueError(
-                "BlockDiagonalCovariance.sum only supports axis=0 (time)."
+            raise ValueError("BlockDiagonalCovariance.sum only supports axis=0 (time).")
+        return _assemble_block_diagonal_matrix(self._blocks.sum(axis=1))
+
+    def _time_index(self, t: Any) -> int:
+        """Normalise an integer time index; ndarray bounds, bool rejected."""
+        if isinstance(t, (bool, np.bool_)):
+            raise TypeError(
+                "BlockDiagonalCovariance time index must be an integer, not a bool."
             )
-        return _assemble_block_diagonal_matrix(self.blocks.sum(axis=1))
+        idx = operator.index(t)
+        if not -self.n_time <= idx < self.n_time:
+            raise IndexError(
+                f"time index {idx} is out of bounds for n_time={self.n_time}."
+            )
+        return idx
 
     def at_time(self, t: int) -> Array:
         """Dense ``(n_state, n_state)`` covariance of one time bin (``dense[t]``)."""
-        return _assemble_block_diagonal_matrix(self.blocks[:, t])
+        return _assemble_block_diagonal_matrix(self._blocks[:, self._time_index(t)])
 
     def __getitem__(self, index):
-        if isinstance(index, (int, np.integer)):
-            return self.at_time(int(index))
-        # Any other indexing (slices, tuples, masks) goes through the dense
-        # array -- correct for every index expression, at the dense cost.
-        return self.to_dense()[index]
+        if not isinstance(index, (bool, np.bool_)):
+            try:
+                operator.index(index)
+            except TypeError:
+                # Any non-integer indexing (slices, tuples, masks) goes through
+                # the dense array -- correct for every index expression, at
+                # the dense cost.
+                return self.to_dense()[index]
+        return self.at_time(index)
 
     def to_dense(self) -> Array:
         """Materialise the dense ``(n_time, n_state, n_state)`` array."""
-        return jax.vmap(_assemble_block_diagonal_matrix, in_axes=1)(self.blocks)
+        return jax.vmap(_assemble_block_diagonal_matrix, in_axes=1)(self._blocks)
 
     def __array__(self, dtype=None, copy=None) -> np.ndarray:
         return np.asarray(self.to_dense(), dtype=dtype)

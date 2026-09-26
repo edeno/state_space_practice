@@ -4063,6 +4063,96 @@ class TestBlockDiagonalSmootherEquivalence:
         np.testing.assert_allclose(float(block[3]), float(dense[3]), atol=1e-9)
 
 
+class TestBlockDiagonalCovarianceContainer:
+    """``BlockDiagonalCovariance`` follows ndarray semantics or raises.
+
+    The container stands in for a dense ``(n_time, n_state, n_state)``
+    array, so every operation it supports must agree with the dense array
+    and every operation that would silently diverge from it must raise.
+    """
+
+    N_NEURONS, N_TIME, NB = 3, 5, 2
+
+    @pytest.fixture
+    def cov_and_dense(self):
+        rng = np.random.default_rng(0)
+        blocks = rng.normal(size=(self.N_NEURONS, self.N_TIME, self.NB, self.NB))
+        # Independent dense reference: scipy's block_diag per time bin.
+        from scipy.linalg import block_diag
+
+        dense = np.stack(
+            [block_diag(*blocks[:, t]) for t in range(self.N_TIME)]
+        )
+        return BlockDiagonalCovariance(jnp.asarray(blocks)), dense
+
+    def test_sum_requires_axis(self, cov_and_dense) -> None:
+        """``dense.sum()`` is a scalar; the container only supports the
+        time sum, so an axis-less call must not quietly return a matrix."""
+        cov, dense = cov_and_dense
+        with pytest.raises(TypeError):
+            cov.sum()
+        np.testing.assert_allclose(
+            np.asarray(cov.sum(axis=0)), dense.sum(axis=0), atol=1e-12
+        )
+        with pytest.raises(ValueError, match="axis=0"):
+            cov.sum(axis=1)
+
+    @pytest.mark.parametrize("index", [N_TIME, N_TIME + 3, -N_TIME - 1])
+    def test_out_of_range_time_index_raises(self, cov_and_dense, index) -> None:
+        cov, dense = cov_and_dense
+        with pytest.raises(IndexError):
+            dense[index]  # guard: the dense array rejects this index
+        with pytest.raises(IndexError):
+            cov[index]
+        with pytest.raises(IndexError):
+            cov.at_time(index)
+
+    @pytest.mark.parametrize(
+        "index",
+        [0, -1, -N_TIME, N_TIME - 1, np.int64(2), np.int32(-2), jnp.array(1)],
+        ids=["0", "-1", "-n_time", "n_time-1", "np.int64", "np.int32", "jnp-0d"],
+    )
+    def test_integer_time_index_matches_dense(self, cov_and_dense, index) -> None:
+        cov, dense = cov_and_dense
+        expected = dense[int(index)]
+        np.testing.assert_allclose(np.asarray(cov[index]), expected, atol=1e-12)
+        np.testing.assert_allclose(
+            np.asarray(cov.at_time(index)), expected, atol=1e-12
+        )
+
+    @pytest.mark.parametrize("index", [True, False, np.bool_(True)])
+    def test_bool_index_rejected(self, cov_and_dense, index) -> None:
+        """A bool is not a time index (it would otherwise be read as 0 / 1)."""
+        cov, _ = cov_and_dense
+        with pytest.raises(TypeError):
+            cov[index]
+        with pytest.raises(TypeError):
+            cov.at_time(index)
+
+    def test_blocks_are_read_only(self, cov_and_dense) -> None:
+        cov, dense = cov_and_dense
+        with pytest.raises(AttributeError):
+            cov.blocks = jnp.zeros_like(cov.blocks)
+        np.testing.assert_allclose(np.asarray(cov), dense, atol=1e-12)
+
+    def test_asarray_is_the_densify_path(self, cov_and_dense) -> None:
+        """``jnp.asarray`` / ``np.asarray`` materialise the dense array; other
+        ``jax.numpy`` functions and ``jax.jit`` reject the container."""
+        cov, dense = cov_and_dense
+        np.testing.assert_allclose(np.asarray(jnp.asarray(cov)), dense, atol=1e-12)
+        np.testing.assert_allclose(np.asarray(cov), dense, atol=1e-12)
+        np.testing.assert_allclose(np.asarray(cov.to_dense()), dense, atol=1e-12)
+        np.testing.assert_allclose(
+            np.asarray(cov.diagonal()),
+            np.diagonal(dense, axis1=1, axis2=2),
+            atol=1e-12,
+        )
+        with pytest.raises((TypeError, ValueError)):
+            jnp.sum(cov)
+        with pytest.raises((TypeError, ValueError)):
+            jax.jit(lambda x: x)(cov)
+
+
 # ============================================================================
 # Integration: PointProcessModel parameter + trajectory recovery
 # ============================================================================
