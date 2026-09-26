@@ -397,6 +397,50 @@ class TestSwitchingHamiltonianSmooth:
         assert jnp.allclose(pi_s[0], pi_s_t0, atol=1e-8)
 
 
+class TestSwitchingHamiltonianFailLoud:
+    """Malformed discrete predictions and impossible observations must surface
+    as non-finite outputs, so a divergent SGD step stops ``fit_sgd`` instead of
+    being sanitized into a finite loss."""
+
+    def test_nan_transition_entry_gives_non_finite_step(
+        self, switching_model, synthetic_data, params
+    ):
+        """A NaN in Z poisons the predicted discrete distribution at the very
+        first step; it must not be zeroed out and renormalized away."""
+        from state_space_practice.hamiltonian_switching import (
+            switching_hamiltonian_filter,
+        )
+
+        lfp, spikes = synthetic_data
+        complete = switching_model._complete_filter_params(params)
+        good = switching_hamiltonian_filter(
+            (lfp, spikes), complete, dt=switching_model.dt
+        )
+        assert jnp.all(jnp.isfinite(good[2])) and jnp.all(jnp.isfinite(good[3]))
+
+        bad_Z = complete["Z"].at[0, 1].set(jnp.nan)
+        _, _, probs, lls = switching_hamiltonian_filter(
+            (lfp, spikes), {**complete, "Z": bad_Z}, dt=switching_model.dt
+        )
+        assert not jnp.isfinite(lls[0])
+        assert not jnp.all(jnp.isfinite(probs[0]))
+
+    def test_impossible_observation_gives_non_finite_sgd_loss(
+        self, switching_model, synthetic_data, params
+    ):
+        """A step that every discrete state rules out (log-likelihood -inf in
+        each state) must make the SGD loss non-finite, not floor that step's
+        contribution to a finite constant. A negative spike count has zero
+        Poisson probability; it bypasses the public filter's validation here
+        because ``_sgd_loss_fn`` calls the jitted core directly."""
+        lfp, spikes = synthetic_data
+        assert jnp.isfinite(switching_model._sgd_loss_fn(params, lfp, spikes))
+
+        impossible_spikes = spikes.at[5].set(-1.0)
+        loss = switching_model._sgd_loss_fn(params, lfp, impossible_spikes)
+        assert not jnp.isfinite(loss)
+
+
 class TestSwitchingHamiltonianBehavioral:
     """Behavioral test: smoother should discriminate modes from observations."""
 

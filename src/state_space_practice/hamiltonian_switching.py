@@ -34,11 +34,9 @@ from state_space_practice.parameter_transforms import (
     ParameterTransform,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.switching_kalman import (
-    _first_timestep_discrete_update,
-    collapse_gaussian_mixture,
-)
+from state_space_practice.switching_kalman import collapse_gaussian_mixture
 from state_space_practice.utils import divide_safe as _divide_safe
+from state_space_practice.utils import scale_likelihood as _scale_likelihood
 
 
 def switching_predict_collapse(
@@ -177,12 +175,11 @@ def switching_hamiltonian_filter(
             return m_post, P_post, ll_l + ll_s
 
         m_filt, P_filt, lls_k = jax.vmap(update_k)(jnp.arange(K_states))
-        # Log-space, support-masked discrete update shared with the other
-        # switching filters; the mixed prediction ``pi_pred_k`` plays the prior,
-        # so an exact zero stays zero and underflow cannot lock a state out.
-        pi_filt, marginal_ll = _first_timestep_discrete_update(lls_k, pi_pred_k)
+        scaled_lik, ll_max = _scale_likelihood(lls_k)
+        pi_filt = _divide_safe(scaled_lik * pi_pred_k, jnp.sum(scaled_lik * pi_pred_k))
         m_filt_T = m_filt.T
         P_filt_T = P_filt.transpose(1, 2, 0)
+        marginal_ll = ll_max + jnp.log(jnp.sum(scaled_lik * pi_pred_k))
 
         return (
             (m_filt_T, P_filt_T, pi_filt),
@@ -251,10 +248,11 @@ def switching_hamiltonian_smoother(
         )
 
         def update_k(k):
-            # Per-state gaussian + Laplace update. Log-likelihoods here
-            # only weight the discrete states relative to each other, so
-            # the Gaussian normalization constant is dropped. The Laplace
-            # correction terms remain state-dependent and must be included.
+            # Per-state gaussian + Laplace update. Log-likelihoods
+            # here go into _scale_likelihood for relative discrete-
+            # state weighting only, so the Gaussian normalization
+            # constant is dropped. The Laplace correction terms remain
+            # state-dependent and must be included.
             m_mid, P_mid, ll_l = gaussian_measurement_update(
                 m_p_k[:, k],
                 P_p_k[:, :, k],
@@ -277,7 +275,8 @@ def switching_hamiltonian_smoother(
         m_f, P_f, lls_k = jax.vmap(update_k)(jnp.arange(K_states))
         m_f = m_f.T
         P_f = P_f.transpose(1, 2, 0)
-        pi_filt, _ = _first_timestep_discrete_update(lls_k, pi_pred_k)
+        scaled_lik, _ = _scale_likelihood(lls_k)
+        pi_filt = _divide_safe(scaled_lik * pi_pred_k, jnp.sum(scaled_lik * pi_pred_k))
         return (
             (m_f, P_f, pi_filt),
             (
