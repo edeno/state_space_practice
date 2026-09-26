@@ -1874,6 +1874,7 @@ class TestBlockDiagonalDispatch:
             "not flip the dispatch to dense"
         )
 
+    @pytest.mark.slow
     def test_block_path_never_expands_the_design_matrix(self, monkeypatch) -> None:
         """On the block path the filter works from Z_base; the
         ``(n_time, n_neurons, n_neurons * n_basis)`` expansion is never built
@@ -1899,6 +1900,7 @@ class TestBlockDiagonalDispatch:
         assert model_sgd._block_n_neurons == 3
         assert all(np.isfinite(ll) for ll in lls_sgd)
 
+    @pytest.mark.slow
     def test_block_path_stores_block_covariances_matching_dense(self) -> None:
         """Block-path covariances are BlockDiagonalCovariance containers and
         every consumer (rate maps, credible intervals, state CIs, drift
@@ -1952,6 +1954,7 @@ class TestBlockDiagonalDispatch:
             rtol=1e-4,
         )
 
+    @pytest.mark.slow
     def test_detect_block_structure_tracks_parameter_matrices(self) -> None:
         """Dispatch follows the parameter matrices alone (the design structure
         is fixed by construction): a dense A flips it off, restoring A flips
