@@ -70,7 +70,8 @@ from state_space_practice.parameter_transforms import (
     UNCONSTRAINED,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import check_converged, validate_count_array
+from state_space_practice.em_driver import run_em
+from state_space_practice.utils import validate_count_array
 
 logger = logging.getLogger(__name__)
 
@@ -1625,134 +1626,66 @@ class SmithLearningModel(SGDFittableMixin):
             n_correct_responses, "n_correct_responses", allow_empty=False
         )
 
-        log_likelihoods: list[float] = []
-        # Snapshot keys: smoother + filter outputs the E-step produces,
-        # plus the M-step parameters (sigma_epsilon and the
-        # initial-variance derivative). On LL decrease we restore both
-        # so the stored (params, smoother) pair is consistent with the
-        # prior iteration.
-        _snapshot_keys = (
+        # Snapshot keys: smoother + filter outputs the E-step produces, plus
+        # the M-step parameters (sigma_epsilon and the initial-variance
+        # derivative). On a rejected step both are restored so the stored
+        # (params, smoother) pair stays consistent with the prior iteration.
+        snapshot_keys = (
             "filtered_prob_correct_response",
-            "filtered_learning_state_mode", "filtered_learning_state_variance",
-            "filtered_one_step_mode", "filtered_one_step_variance",
-            "smoothed_learning_state_mode", "smoothed_learning_state_variance",
+            "filtered_learning_state_mode",
+            "filtered_learning_state_variance",
+            "filtered_one_step_mode",
+            "filtered_one_step_variance",
+            "smoothed_learning_state_mode",
+            "smoothed_learning_state_variance",
             "smoothed_prob_correct_response",
             "smoother_gain",
-            "sigma_epsilon", "init_learning_state", "init_learning_variance",
+            "sigma_epsilon",
+            "init_learning_state",
+            "init_learning_variance",
         )
-        last_accepted_state: dict[str, object] | None = None
-        reached_max_iter = True
 
         def _capture_state() -> dict[str, object]:
-            return {k: getattr(self, k, None) for k in _snapshot_keys}
+            return {k: getattr(self, k, None) for k in snapshot_keys}
 
-        def _restore_state(state: dict[str, object] | None) -> None:
-            if state is None:
-                return
+        def _restore_state(state: dict[str, object]) -> None:
             for k, v in state.items():
                 if v is not None:
                     setattr(self, k, v)
 
-        for iteration in range(max_iter):
-            current_log_likelihood = self._e_step(n_correct_responses)
-            log_likelihoods.append(current_log_likelihood)
-
-            if not jnp.isfinite(current_log_likelihood):
-                msg = (
-                    f"Non-finite log-likelihood at iteration {iteration + 1}; "
-                    f"stopping EM."
-                )
-                logger.warning(msg)
-                if verbose:
-                    print(f"  WARNING: {msg}")
-                reached_max_iter = False
-                break
-
-            if iteration > 0:
-                is_converged, is_increasing = check_converged(
-                    current_log_likelihood, log_likelihoods[-2], tolerance
-                )
-
-                if not is_increasing:
-                    _restore_state(last_accepted_state)
-                    bad_ll = log_likelihoods.pop()
-                    msg = (
-                        f"LL decreased: {log_likelihoods[-1]:.4f} -> "
-                        f"{bad_ll:.4f}; rolling back to previous E-step "
-                        f"and stopping EM."
-                    )
-                    logger.warning(msg)
-                    if verbose:
-                        print(f"  WARNING: {msg}")
-                    reached_max_iter = False
-                    break
-
-                if is_converged:
-                    # Run final M-step to get MLE params, then E-step
-                    # so stored smoother results match the converged
-                    # params.
-                    last_accepted_state = _capture_state()
-                    self._m_step(n_correct_responses)
-                    final_ll = self._e_step(n_correct_responses)
-                    _, final_is_increasing = check_converged(
-                        final_ll, log_likelihoods[-1], tolerance
-                    )
-                    if final_is_increasing and math.isfinite(final_ll):
-                        log_likelihoods.append(final_ll)
-                    else:
-                        _restore_state(last_accepted_state)
-                    msg = (
-                        f"Converged after {iteration + 1} iterations. "
-                        f"sigma_epsilon={self.sigma_epsilon:.4g}"
-                    )
-                    logger.info(msg)
-                    if verbose:
-                        print(msg)
-                    reached_max_iter = False
-                    break
-
-            last_accepted_state = _capture_state()
-            self._m_step(n_correct_responses)
-
-            change = (
-                current_log_likelihood - log_likelihoods[-2]
-                if iteration > 0
-                else float("nan")
-            )
-            logger.info(
-                f"Iteration {iteration + 1}/{max_iter}\t"
-                f"Log-Likelihood: {current_log_likelihood:.4f}\t"
-                f"Change: {change:.4f}"
-            )
-            if verbose:
-                print(
-                    f"  Iter {iteration + 1}/{max_iter}  "
-                    f"LL={current_log_likelihood:.4f}  "
-                    f"delta={change:+.4f}"
-                )
-
-        if reached_max_iter and len(log_likelihoods) == max_iter:
-            msg = "Reached maximum iterations without converging."
+        def _warn(msg: str) -> None:
             logger.warning(msg)
             if verbose:
                 print(f"  WARNING: {msg}")
-            if log_likelihoods:
-                final_ll = self._e_step(n_correct_responses)
-                _, final_is_increasing = check_converged(
-                    final_ll, log_likelihoods[-1], tolerance
+
+        def _on_iteration(iteration: int, ll: float, change: float) -> None:
+            logger.info(
+                f"Iteration {iteration + 1}/{max_iter}\t"
+                f"Log-Likelihood: {ll:.4f}\tChange: {change:.4f}"
+            )
+            if verbose:
+                print(
+                    f"  Iter {iteration + 1}/{max_iter}  LL={ll:.4f}  "
+                    f"delta={change:+.4f}"
                 )
-                if final_is_increasing and math.isfinite(final_ll):
-                    log_likelihoods.append(final_ll)
-                else:
-                    _restore_state(last_accepted_state)
-                    rollback_msg = (
-                        f"Final E-step after max_iter decreased LL: "
-                        f"{log_likelihoods[-1]:.4f} -> {final_ll:.4f}; "
-                        "rolling back the last M-step."
-                    )
-                    logger.warning(rollback_msg)
-                    if verbose:
-                        print(f"  WARNING: {rollback_msg}")
+
+        # On convergence the driver runs one more M-step (the MLE parameters)
+        # and a synchronising E-step so the stored results match them.
+        result = run_em(
+            lambda: float(self._e_step(n_correct_responses)),
+            lambda: self._m_step(n_correct_responses),
+            _capture_state,
+            _restore_state,
+            max_iter=max_iter,
+            tol=tolerance,
+            m_step_on_convergence=True,
+            logger=logger,
+            on_iteration=_on_iteration,
+            warn=_warn,
+        )
+        log_likelihoods = result.log_likelihoods
+        if result.converged and verbose:
+            print(f"Converged. sigma_epsilon={self.sigma_epsilon:.4g}")
 
         # Store fit diagnostics
         self.log_likelihood_ = log_likelihoods[-1] if log_likelihoods else None
