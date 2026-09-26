@@ -21,7 +21,6 @@ from typing import NamedTuple
 import numpy as np
 import numpy.typing as npt
 from scipy import stats
-from sklearn.metrics import roc_auc_score
 
 from state_space_practice.circular_stats import angular_distance
 
@@ -349,6 +348,8 @@ def roc_auc(
     if labels.min() == labels.max():
         logger.info("roc_auc undefined: coupling_mask is single-class; returning nan")
         return float("nan")
+    from sklearn.metrics import roc_auc_score  # deferred: slow import
+
     score = -np.log10(pval.ravel() + 1e-300)
     return float(roc_auc_score(labels, score))
 

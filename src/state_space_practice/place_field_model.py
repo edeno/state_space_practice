@@ -41,7 +41,6 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
-from patsy import dmatrix
 
 from state_space_practice.kalman import (
     InitialStatePrior,
@@ -143,6 +142,8 @@ def build_2d_spline_basis(
         "y_hi": y_hi,
     }
 
+    from patsy import dmatrix  # deferred: slow import
+
     design_matrix = np.asarray(dmatrix(formula, {"x": x, "y": y, **env}))
 
     basis_info = {
@@ -183,6 +184,8 @@ def evaluate_basis(
     env = {
         k: basis_info[k] for k in ("knots_x", "knots_y", "x_lo", "x_hi", "y_lo", "y_hi")
     }
+    from patsy import dmatrix  # deferred: slow import
+
     return np.asarray(dmatrix(basis_info["formula"], {"x": x, "y": y, **env}))
 
 

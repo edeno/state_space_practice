@@ -9,7 +9,6 @@ import jax.scipy.linalg
 import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
-from scipy.optimize import linear_sum_assignment
 
 logger = logging.getLogger(__name__)
 
@@ -1688,6 +1687,8 @@ def find_permutation(
         Permutation such that ``jnp.take(permutation, z1)`` best aligns
         with ``z2``.  ``K = max(z1.max(), z2.max()) + 1``.
     """
+    from scipy.optimize import linear_sum_assignment  # deferred: slow import
+
     overlap = compute_state_overlap(z1, z2)
     _, perm = linear_sum_assignment(-np.asarray(overlap))
     return perm
