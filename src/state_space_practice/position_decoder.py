@@ -29,12 +29,13 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.kalman import rts_backward_scan, symmetrize
+from state_space_practice.kalman import rts_backward_scan
 from state_space_practice.point_process_kalman import (
     _point_process_laplace_update,
     _safe_expected_count,
 )
 from state_space_practice.utils import (
+    symmetrize,
     validate_count_array,
     validate_covariance,
     validate_scalar,

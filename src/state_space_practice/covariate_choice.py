@@ -35,7 +35,6 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.kalman import psd_solve
 from state_space_practice.multinomial_choice import (
     ChoiceFilterResult,
     ChoiceSmootherResult,
@@ -46,7 +45,7 @@ from state_space_practice.parameter_transforms import (
     UNCONSTRAINED,
     UNIT_INTERVAL,
 )
-from state_space_practice.utils import symmetrize, validate_choice_indices
+from state_space_practice.utils import psd_solve, symmetrize, validate_choice_indices
 
 logger = logging.getLogger(__name__)
 

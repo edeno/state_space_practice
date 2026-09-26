@@ -30,7 +30,6 @@ import jax.numpy as jnp
 from jax import Array
 
 from state_space_practice.em_driver import run_em
-from state_space_practice.kalman import symmetrize
 from state_space_practice.oscillator_utils import (
     DirectedInfluenceDynamicsMixin,
     canonicalize_correlated_noise_pair_parameters,
@@ -56,6 +55,7 @@ from state_space_practice.switching_point_process import (
 from state_space_practice.utils import (
     clip_eigenvalues,
     shift_to_psd,
+    symmetrize,
     validate_count_array,
     validate_finite_array,
     validate_nonnegative_array,

@@ -93,7 +93,7 @@ import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.kalman import symmetrize
+from state_space_practice.em_driver import run_em
 from state_space_practice.oscillator_utils import (
     _matrix_to_oscillator_blocks,
     _oscillator_blocks_to_matrix,
@@ -107,7 +107,6 @@ from state_space_practice.parameter_transforms import (
     UNCONSTRAINED,
 )
 from state_space_practice.point_process_kalman import _point_process_laplace_update
-from state_space_practice.em_driver import run_em
 from state_space_practice.sgd_fitting import (
     SGDFittableMixin,
     reconstruct_per_state_array,
@@ -122,10 +121,11 @@ from state_space_practice.switching_kalman import (
     switching_kalman_smoother_gpb2,
 )
 from state_space_practice.utils import (
-    contains_tracer,
     clip_eigenvalues,
+    contains_tracer,
     make_discrete_transition_matrix,
     stabilize_covariance,
+    symmetrize,
     validate_count_array,
     validate_covariance,
     validate_probability_vector,

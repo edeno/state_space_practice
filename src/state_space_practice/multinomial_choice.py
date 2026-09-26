@@ -28,15 +28,11 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.kalman import (
-    psd_cholesky,
-    psd_solve,
-    rts_backward_scan,
-    symmetrize,
-)
+from state_space_practice.kalman import rts_backward_scan
 from state_space_practice.parameter_transforms import POSITIVE
 from state_space_practice.point_process_kalman import _logdet_psd
 from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.utils import psd_cholesky, psd_solve, symmetrize
 from state_space_practice.utils import validate_choice_indices as _validate_choices
 
 

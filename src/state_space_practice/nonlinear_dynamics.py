@@ -12,8 +12,7 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
-from state_space_practice.kalman import psd_solve
-from state_space_practice.utils import symmetrize
+from state_space_practice.utils import psd_solve, symmetrize
 
 
 def _validate_state_vector(x: Array) -> Array:

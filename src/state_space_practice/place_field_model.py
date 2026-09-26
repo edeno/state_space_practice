@@ -43,7 +43,8 @@ from jax import Array
 from jax.typing import ArrayLike
 from patsy import dmatrix
 
-from state_space_practice.kalman import psd_solve, sum_of_outer_products, symmetrize
+from state_space_practice.kalman import sum_of_outer_products
+from state_space_practice.em_driver import run_em
 from state_space_practice.parameter_transforms import (
     POSITIVE,
     PSD_MATRIX,
@@ -60,7 +61,11 @@ from state_space_practice.point_process_kalman import (
     stochastic_point_process_smoother,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import check_converged, validate_count_array
+from state_space_practice.utils import (
+    psd_solve,
+    symmetrize,
+    validate_count_array,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1263,8 +1268,9 @@ class PlaceFieldModel(SGDFittableMixin):
             f"total_spikes={self._total_spikes}{block_str}"
         )
 
-        self.log_likelihoods = []
-        last_accepted_state: dict[str, object] | None = None
+        # The block/dense dispatch can flip after an M-step, so the E-step
+        # reads the design form through a holder the M-step may update.
+        design_holder = {"design_matrix": design_matrix}
 
         def _capture_state() -> dict[str, object]:
             return {
@@ -1281,48 +1287,14 @@ class PlaceFieldModel(SGDFittableMixin):
                 "_block_size": self._block_size,
             }
 
-        def _restore_state(state: dict[str, object] | None) -> None:
-            if state is None:
-                return
+        def _restore_state(state: dict[str, object]) -> None:
             for key, value in state.items():
                 setattr(self, key, value)
 
-        for iteration in range(max_iter):
-            ll = self._e_step(design_matrix, spikes)
-            self.log_likelihoods.append(ll)
+        def _e_step() -> float:
+            return float(self._e_step(design_holder["design_matrix"], spikes))
 
-            _print(f"  EM iter {iteration + 1:>{len(str(max_iter))}}/{max_iter}: LL = {ll:.1f}")
-
-            if not jnp.isfinite(ll):
-                _print(f"  WARNING: Non-finite LL at iteration {iteration + 1}")
-                break
-
-            if iteration > 0:
-                is_converged, is_increasing = check_converged(
-                    ll, self.log_likelihoods[-2], tolerance
-                )
-                if not is_increasing:
-                    # Roll back to the previous (better) state
-                    _restore_state(last_accepted_state)
-                    # Remove the bad LL so log_likelihoods[-1] matches
-                    # the stored model state (used by bic/aic/summary).
-                    bad_ll = self.log_likelihoods.pop()
-                    msg = (
-                        f"LL decreased: "
-                        f"{self.log_likelihoods[-1]:.1f} -> {bad_ll:.1f}; "
-                        f"stopping EM and rolling back to previous E-step."
-                    )
-                    _print(f"  WARNING: {msg}")
-                    logger.warning(msg)
-                    break
-                if is_converged:
-                    _print(f"  Converged after {iteration + 1} iterations.")
-                    break
-
-            # The E-step is accepted. Snapshot both posterior state and
-            # parameters before mutating parameters in the M-step, so a
-            # later rejected E-step can restore the fitted pair coherently.
-            last_accepted_state = _capture_state()
+        def _m_step() -> None:
             self._m_step()
             # Re-detect block structure after the M-step, unconditionally.
             # The primary case where the M-step can break block-
@@ -1333,37 +1305,38 @@ class PlaceFieldModel(SGDFittableMixin):
             # future M-step extension that breaks structure without
             # touching update_transition_matrix.
             dispatch_before = self._block_n_neurons
-            self._block_n_neurons, self._block_size = (
-                self._detect_block_structure(force_dense=force_dense)
+            self._block_n_neurons, self._block_size = self._detect_block_structure(
+                force_dense=force_dense
             )
             if self._block_n_neurons != dispatch_before:
                 # The path changed (block -> dense fallback): hand the next
                 # E-step the design form that path consumes.
-                design_matrix = self._filter_design_matrix(Z_base)
-        else:
-            msg = (
-                f"EM reached maximum iterations ({max_iter}) without "
-                f"converging. Consider increasing max_iter or loosening "
-                f"tolerance."
-            )
+                design_holder["design_matrix"] = self._filter_design_matrix(Z_base)
+
+        def _warn(msg: str) -> None:
             _print(f"  WARNING: {msg}")
             logger.warning(msg)
-            if self.log_likelihoods:
-                final_ll = self._e_step(design_matrix, spikes)
-                is_converged, is_increasing = check_converged(
-                    final_ll, self.log_likelihoods[-1], tolerance
-                )
-                if is_increasing and np.isfinite(final_ll):
-                    self.log_likelihoods.append(final_ll)
-                else:
-                    _restore_state(last_accepted_state)
-                    rollback_msg = (
-                        f"Final E-step after max_iter decreased LL: "
-                        f"{self.log_likelihoods[-1]:.1f} -> {final_ll:.1f}; "
-                        "rolling back the last M-step."
-                    )
-                    _print(f"  WARNING: {rollback_msg}")
-                    logger.warning(rollback_msg)
+
+        def _on_iteration(iteration: int, ll: float, change: float) -> None:
+            _print(
+                f"  EM iter {iteration + 1:>{len(str(max_iter))}}/{max_iter}: "
+                f"LL = {ll:.1f}"
+            )
+
+        result = run_em(
+            _e_step,
+            _m_step,
+            _capture_state,
+            _restore_state,
+            max_iter=max_iter,
+            tol=tolerance,
+            logger=logger,
+            on_iteration=_on_iteration,
+            warn=_warn,
+        )
+        self.log_likelihoods = result.log_likelihoods
+        if result.converged:
+            _print(f"  Converged after {len(self.log_likelihoods)} iterations.")
 
         # Saturation diagnostic: post-hoc check on the final filtered posterior.
         # Runs after fit completes so a substantial fraction of clipped bins

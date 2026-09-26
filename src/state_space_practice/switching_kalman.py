@@ -22,15 +22,19 @@ from state_space_practice.kalman import (
     _kalman_filter_update,
     _kalman_smoother_update,
     kalman_measurement_update,
+)
+from state_space_practice.utils import (
+    contains_tracer,
+    debug_print_if,
     psd_solve,
     stabilize_covariance,
+    symmetrize,
+    zero_preserving_log,
 )
-from state_space_practice.utils import debug_print_if, symmetrize, zero_preserving_log
 from state_space_practice.utils import divide_safe as _divide_safe
 from state_space_practice.utils import safe_log as _safe_log
 from state_space_practice.utils import spectral_radius as _spectral_radius
 from state_space_practice.utils import (
-    contains_tracer,
     stabilize_probability_vector as _stabilize_probability_vector,
 )
 

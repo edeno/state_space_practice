@@ -39,15 +39,8 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.kalman import (
-    _kalman_smoother_update,
-    psd_cholesky,
-    psd_logdet,
-    psd_solve,
-    stabilize_covariance,
-    sum_of_outer_products,
-    symmetrize,
-)
+from state_space_practice.kalman import _kalman_smoother_update, sum_of_outer_products
+from state_space_practice.em_driver import run_em
 from state_space_practice.parameter_transforms import (
     PSD_MATRIX,
     UNCONSTRAINED,
@@ -57,7 +50,11 @@ from state_space_practice.utils import (
     _validate_filter_numerics as _validate_filter_numerics_impl,
 )
 from state_space_practice.utils import (
-    check_converged,
+    psd_cholesky,
+    psd_logdet,
+    psd_solve,
+    stabilize_covariance,
+    symmetrize,
     validate_count_array,
     validate_scalar,
 )
@@ -2872,9 +2869,6 @@ class PointProcessModel(SGDFittableMixin):
             jnp.asarray(self.init_cov), n_time=spike_indicator.shape[0]
         )
 
-        log_likelihoods: list[float] = []
-        last_accepted_state: dict[str, Any] | None = None
-
         def _snapshot_state() -> dict[str, Any]:
             return {
                 "smoother_mean": self.smoother_mean,
@@ -2889,114 +2883,22 @@ class PointProcessModel(SGDFittableMixin):
             }
 
         def _restore_state(state: dict[str, Any]) -> None:
-            self.smoother_mean = state["smoother_mean"]
-            self.smoother_cov = state["smoother_cov"]
-            self.smoother_cross_cov = state["smoother_cross_cov"]
-            self.filtered_mean = state["filtered_mean"]
-            self.filtered_cov = state["filtered_cov"]
-            self.transition_matrix = state["transition_matrix"]
-            self.process_cov = state["process_cov"]
-            self.init_mean = state["init_mean"]
-            self.init_cov = state["init_cov"]
+            for key, value in state.items():
+                setattr(self, key, value)
 
-        for iteration in range(max_iter):
-            current_log_likelihood = self._e_step(design_matrix, spike_indicator)
-            log_likelihoods.append(current_log_likelihood)
-
-            if not jnp.isfinite(current_log_likelihood):
-                # Drop the non-finite LL so callers never see NaN/inf in the
-                # returned history, and restore the last consistent
-                # (params, smoother) pair. Without the restore the diverged
-                # E-step's NaN posteriors stay installed on the model and
-                # get_rate_estimate / get_confidence_interval serve NaN.
-                bad_ll = log_likelihoods.pop()
-                if last_accepted_state is not None:
-                    _restore_state(last_accepted_state)
-                logger.warning(
-                    f"Non-finite log-likelihood ({bad_ll}) at iteration "
-                    f"{iteration + 1}; rolling back to previous E-step and "
-                    f"stopping EM."
-                )
-                break
-
-            if iteration > 0:
-                is_converged, is_increasing = check_converged(
-                    current_log_likelihood,
-                    log_likelihoods[-2],
-                    tolerance,
-                )
-
-                if not is_increasing:
-                    # Roll back to the accepted state from the prior iteration.
-                    # last_accepted_state was snapshotted *before* the M-step
-                    # that produced the current (worse) parameters, so it holds
-                    # the (params, smoother) pair consistent with
-                    # log_likelihoods[-1]. Restoring the top-of-loop snapshot
-                    # instead would keep the rejected M-step's parameters.
-                    bad_ll = log_likelihoods.pop()
-                    if last_accepted_state is not None:
-                        _restore_state(last_accepted_state)
-                    logger.warning(
-                        f"LL decreased: {log_likelihoods[-1]:.4f} -> "
-                        f"{bad_ll:.4f}; rolling back to previous E-step "
-                        f"and stopping EM."
-                    )
-                    break
-
-                if is_converged:
-                    logger.info(f"Converged after {iteration + 1} iterations.")
-                    break
-
-            # Snapshot the accepted E-step state before the M-step changes
-            # parameters. A later E-step (next iteration or the final sync
-            # below) may reveal that this M-step worsened the marginal LL; if
-            # so, restore this consistent state.
-            last_accepted_state = _snapshot_state()
-            self._m_step()
-
-            change = (
-                current_log_likelihood - log_likelihoods[-2]
-                if iteration > 0
-                else float("nan")
-            )
-            logger.info(
-                f"Iteration {iteration + 1}/{max_iter}\t"
-                f"Log-Likelihood: {current_log_likelihood:.4f}\t"
-                f"Change: {change:.6f}"
-            )
-        else:
-            # for/else: reached only if the loop ran all max_iter iterations
-            # without breaking (no convergence, decrease, or non-finite exit).
-            # The last M-step ran without a following E-step, so sync the
-            # smoother to the current parameters — rolling back if that final
-            # E-step reveals the M-step worsened the marginal LL.
-            if log_likelihoods:
-                logger.warning("Reached maximum iterations without converging.")
-                final_ll = float(self._e_step(design_matrix, spike_indicator))
-                if not jnp.isfinite(final_ll):
-                    if last_accepted_state is not None:
-                        _restore_state(last_accepted_state)
-                    logger.warning(
-                        "Final E-step produced non-finite log-likelihood; "
-                        "rolling back to previous E-step."
-                    )
-                else:
-                    _, is_increasing = check_converged(
-                        final_ll,
-                        log_likelihoods[-1],
-                        tolerance,
-                    )
-                    if is_increasing:
-                        log_likelihoods.append(final_ll)
-                    else:
-                        if last_accepted_state is not None:
-                            _restore_state(last_accepted_state)
-                        logger.warning(
-                            f"Final E-step decreased LL: {log_likelihoods[-1]:.4f}"
-                            f" -> {final_ll:.4f}; rolling back to previous E-step."
-                        )
-
-        return log_likelihoods
+        # A rejected E-step (non-finite or decreasing LL) restores the last
+        # accepted (parameters, smoother) pair so get_rate_estimate /
+        # get_confidence_interval never serve a diverged posterior.
+        result = run_em(
+            lambda: float(self._e_step(design_matrix, spike_indicator)),
+            self._m_step,
+            _snapshot_state,
+            _restore_state,
+            max_iter=max_iter,
+            tol=tolerance,
+            logger=logger,
+        )
+        return result.log_likelihoods
 
     # --- SGDFittableMixin protocol ---
 

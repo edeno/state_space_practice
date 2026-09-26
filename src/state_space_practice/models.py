@@ -6,12 +6,12 @@ import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.kalman import psd_solve, stabilize_covariance
 from state_space_practice.point_process_kalman import (  # noqa: F401 -- re-exports
     _safe_expected_count,
     get_confidence_interval,
     steepest_descent_point_process_filter,
 )
+from state_space_practice.utils import psd_solve, stabilize_covariance
 
 
 def log_receptive_field_model(position: ArrayLike, params: ArrayLike) -> Array:
