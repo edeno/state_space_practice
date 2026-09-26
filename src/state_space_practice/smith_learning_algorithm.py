@@ -65,6 +65,7 @@ import scipy.special
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.parameter_transforms import (
     POSITIVE,
     UNCONSTRAINED,
@@ -2407,7 +2408,8 @@ class SmithLearningModel(SGDFittableMixin):
                 else:
                     warnings.warn(
                         "Observed fraction correct overlay is typically used with plot_type='probability'.",
-                        UserWarning,
+                        StateSpaceWarning,
+                        stacklevel=2,
                     )
             # If only observed_n_correct is given, assume binary if all are 0 or 1
             elif jnp.all((observed_n_correct == 0) | (observed_n_correct == 1)):
@@ -2424,13 +2426,15 @@ class SmithLearningModel(SGDFittableMixin):
                 else:
                     warnings.warn(
                         "Observed binary success overlay is typically used with plot_type='probability'.",
-                        UserWarning,
+                        StateSpaceWarning,
+                        stacklevel=2,
                     )
             else:
                 warnings.warn(
                     "observed_n_correct provided without observed_max_possible, "
                     "and data is not strictly binary. Skipping observed data plot.",
-                    UserWarning,
+                    StateSpaceWarning,
+                    stacklevel=2,
                 )
 
         ax.set_xlabel(xlabel, fontsize=12)

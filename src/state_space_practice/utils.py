@@ -10,6 +10,8 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.exceptions import StateSpaceWarning
+
 logger = logging.getLogger(__name__)
 
 # Type alias for numeric values (scalars, numpy arrays, JAX arrays)
@@ -1073,7 +1075,7 @@ def _validate_filter_numerics(
                 f"    import jax\n"
                 f"    jax.config.update('jax_enable_x64', True)\n"
                 f"    # now import state_space_practice models",
-                UserWarning,
+                StateSpaceWarning,
                 stacklevel=stacklevel,
             )
 

@@ -16,6 +16,8 @@ import numpy as np
 import numpy.typing as npt
 from numpy.typing import ArrayLike, NDArray
 
+from state_space_practice.exceptions import StateSpaceWarning
+
 
 def _warn_if_out_of_window(
     spike_times_list: list[NDArray[np.floating]],
@@ -46,7 +48,7 @@ def _warn_if_out_of_window(
             f"Check that time_bins covers the full spike time range, "
             f"or filter with clip_spike_times_to_window first. "
             f"Pass warn_on_drops=False to suppress this warning.",
-            UserWarning,
+            StateSpaceWarning,
             stacklevel=stacklevel,
         )
 

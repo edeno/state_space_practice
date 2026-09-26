@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 
+from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.utils import (
     contains_tracer,
     debug_print_if,
@@ -235,7 +236,7 @@ def construct_common_oscillator_transition_matrix(
         if jnp.any(jnp.logical_or(damping_coef > 1, damping_coef < 0)):
             warnings.warn(
                 "damping_coef values outside [0, 1] will be clipped",
-                UserWarning,
+                StateSpaceWarning,
                 stacklevel=2,
             )
     damping_coef = jnp.clip(damping_coef, 0.0, 1.0)

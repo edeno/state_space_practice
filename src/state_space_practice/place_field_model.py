@@ -42,6 +42,7 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.kalman import (
     InitialStatePrior,
     process_cov_residual_form,
@@ -977,7 +978,7 @@ class PlaceFieldModel(SGDFittableMixin):
                 f"ceiling is genuinely too tight for your neuron population."
             )
             logger.warning(msg)
-            warnings.warn(msg, UserWarning, stacklevel=2)
+            warnings.warn(msg, StateSpaceWarning, stacklevel=2)
 
     def _e_step(self, design_matrix: Array, spikes: Array) -> float:
         """E-step: run filter and smoother.
@@ -1765,6 +1766,7 @@ class PlaceFieldModel(SGDFittableMixin):
                 "predict_rate_map uses the linear approximation exp(Z @ x). "
                 "For the nonlinear log_intensity_func set on this model, "
                 "use smoother_mean directly with your intensity function.",
+                StateSpaceWarning,
                 stacklevel=2,
             )
 

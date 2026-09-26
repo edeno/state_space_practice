@@ -29,6 +29,7 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.kalman import rts_backward_scan_with_predictions
 from state_space_practice.point_process_kalman import (
     _point_process_laplace_update,
@@ -1459,7 +1460,8 @@ def _position_decoder_filter_with_predictions(
             f"(first escape at t={first_out}, max overshoot "
             f"{max_escape:.1f} cm).  This usually indicates a divergent "
             f"filter — check q_pos, adaptive_inflation, and init_cov.",
-            UserWarning,
+            StateSpaceWarning,
+            # Two frames below the public filter/smoother entry point.
             stacklevel=3,
         )
 

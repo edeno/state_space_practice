@@ -15,6 +15,7 @@ import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.hamiltonian_core import (
     HamiltonianModelBase,
     default_init_mean,
@@ -156,7 +157,7 @@ class JointHamiltonianModel(HamiltonianModelBase):
                     "measurement covariance (e.g. one learned by fit_sgd). Set "
                     "obs_noise_std before fitting, or assign self.R_lfp directly "
                     "to keep a full covariance.",
-                    UserWarning,
+                    StateSpaceWarning,
                     stacklevel=2,
                 )
         self._obs_noise_std = value
