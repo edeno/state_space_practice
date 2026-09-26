@@ -526,7 +526,9 @@ class SGDFittableMixin:
         num_steps : int
             Number of optimization steps.
         verbose : bool
-            Log progress every 10 steps.
+            Log progress every 10 steps at INFO level on the
+            ``state_space_practice.sgd_fitting`` logger (enable with e.g.
+            ``logging.basicConfig(level=logging.INFO)``).
         convergence_tol : float or None
             If set, stop early when the direction-agnostic relative change
             ``|ΔLL| / avg(|LL|) < tol`` for 5 consecutive steps.
@@ -679,7 +681,7 @@ class SGDFittableMixin:
             opt_state = new_opt_state
 
             if verbose and (step % 10 == 0 or step == num_steps - 1):
-                print(f"SGD step {step}: LL={ll:.2f}")
+                logger.info("SGD step %d: LL=%.2f", step, ll)
 
             if convergence_tol is not None and len(log_likelihoods) >= 2:
                 # Use relative change for convergence, consistent with EM's
@@ -694,8 +696,6 @@ class SGDFittableMixin:
                 else:
                     stall_count = 0
                 if stall_count >= 5:
-                    if verbose:
-                        print(f"SGD converged at step {step}.")
                     logger.info("SGD converged at step %d.", step)
                     converged = True
                     break

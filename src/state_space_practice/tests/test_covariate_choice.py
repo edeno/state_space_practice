@@ -1388,17 +1388,23 @@ class TestSGDFitting:
         assert model.is_fitted
         assert model.smoothed_values.shape[0] == 100
 
-    def test_sgd_verbose(self, capsys):
-        """Verbose mode should print progress to stdout."""
+    def test_sgd_verbose(self, caplog):
+        """Verbose mode should log progress at INFO; quiet mode should not."""
+        import logging
+
         rng = np.random.default_rng(42)
-        model = CovariateChoiceModel(n_options=3)
-        model.fit_sgd(
-            rng.integers(0, 3, size=50),
-            num_steps=15,
-            verbose=True,
-        )
-        captured = capsys.readouterr()
-        assert "SGD step" in captured.out
+        choices = rng.integers(0, 3, size=50)
+        sgd_logger = "state_space_practice.sgd_fitting"
+        with caplog.at_level(logging.INFO, logger=sgd_logger):
+            CovariateChoiceModel(n_options=3).fit_sgd(
+                choices, num_steps=15, verbose=False,
+            )
+        assert "SGD step" not in caplog.text
+        with caplog.at_level(logging.INFO, logger=sgd_logger):
+            CovariateChoiceModel(n_options=3).fit_sgd(
+                choices, num_steps=15, verbose=True,
+            )
+        assert "SGD step 0" in caplog.text
 
 
 class TestCovariateUncertaintySummaries:

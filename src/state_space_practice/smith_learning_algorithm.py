@@ -1626,7 +1626,10 @@ class SmithLearningModel(SGDFittableMixin):
         tolerance : float, optional
             Convergence tolerance for log-likelihood, by default 1e-4.
         verbose : bool, optional
-            If True, print convergence progress to stdout. Default is False.
+            If True, log per-iteration progress and convergence at INFO level
+            on the ``state_space_practice.smith_learning_algorithm`` logger
+            (enable with e.g. ``logging.basicConfig(level=logging.INFO)``);
+            otherwise per-iteration records are DEBUG. Default is False.
 
         Returns
         -------
@@ -1690,19 +1693,17 @@ class SmithLearningModel(SGDFittableMixin):
 
         def _warn(msg: str) -> None:
             logger.warning(msg)
-            if verbose:
-                print(f"  WARNING: {msg}")
 
         def _on_iteration(iteration: int, ll: float, change: float) -> None:
-            logger.info(
-                f"Iteration {iteration + 1}/{max_iter}\t"
-                f"Log-Likelihood: {ll:.4f}\tChange: {change:.4f}"
+            # verbose=True surfaces per-iteration progress at INFO; otherwise DEBUG.
+            logger.log(
+                logging.INFO if verbose else logging.DEBUG,
+                "Iteration %d/%d\tLog-Likelihood: %.4f\tChange: %+.4f",
+                iteration + 1,
+                max_iter,
+                ll,
+                change,
             )
-            if verbose:
-                print(
-                    f"  Iter {iteration + 1}/{max_iter}  LL={ll:.4f}  "
-                    f"delta={change:+.4f}"
-                )
 
         # On convergence the driver runs one more M-step (the MLE parameters)
         # and a synchronising E-step so the stored results match them.
@@ -1722,7 +1723,7 @@ class SmithLearningModel(SGDFittableMixin):
         )
         log_likelihoods = result.log_likelihoods
         if result.converged and verbose:
-            print(f"Converged. sigma_epsilon={self.sigma_epsilon:.4g}")
+            logger.info("Converged. sigma_epsilon=%.4g", self.sigma_epsilon)
 
         # Store fit diagnostics
         self.log_likelihood_ = log_likelihoods[-1] if log_likelihoods else None

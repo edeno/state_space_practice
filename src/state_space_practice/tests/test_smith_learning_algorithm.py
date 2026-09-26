@@ -754,14 +754,19 @@ class TestSmithLearningModelClass:
         plt.close(fig)
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
-    def test_fit_verbose_prints_output(self, capsys: pytest.CaptureFixture) -> None:
-        """fit(verbose=True) should print convergence info to stdout."""
+    def test_fit_verbose_logs_progress(self, caplog: pytest.LogCaptureFixture) -> None:
+        """fit(verbose=True) logs per-iteration progress at INFO; quiet does not."""
+        import logging
+
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
-        model = SmithLearningModel()
-        model.fit(outcomes, max_iter=5, verbose=True)
-        captured = capsys.readouterr()
-        assert "LL=" in captured.out or "Converged" in captured.out
+        smith_logger = "state_space_practice.smith_learning_algorithm"
+        with caplog.at_level(logging.INFO, logger=smith_logger):
+            SmithLearningModel().fit(outcomes, max_iter=5, verbose=False)
+        assert "Log-Likelihood" not in caplog.text
+        with caplog.at_level(logging.INFO, logger=smith_logger):
+            SmithLearningModel().fit(outcomes, max_iter=5, verbose=True)
+        assert "Iteration 1/5" in caplog.text
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_fit_final_estep_after_convergence(self) -> None:

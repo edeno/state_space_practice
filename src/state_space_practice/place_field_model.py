@@ -1205,7 +1205,9 @@ class PlaceFieldModel(SGDFittableMixin):
         knots_y : np.ndarray or None, optional
             Explicit interior knot locations for y dimension.
         verbose : bool, default=True
-            Print progress to stdout during fitting.
+            Log progress at INFO level on the
+            ``state_space_practice.place_field_model`` logger during fitting
+            (enable with e.g. ``logging.basicConfig(level=logging.INFO)``).
         warm_start : bool, default=True
             If True (default), initialize ``init_mean`` and ``init_cov``
             from the Laplace approximation of a stationary Poisson GLM
@@ -1292,7 +1294,7 @@ class PlaceFieldModel(SGDFittableMixin):
 
         def _print(msg: str) -> None:
             if verbose:
-                print(msg)
+                logger.info("%s", msg)
 
         neurons_str = f", n_neurons={self.n_neurons}" if self.n_neurons > 1 else ""
         block_str = (
@@ -1362,7 +1364,6 @@ class PlaceFieldModel(SGDFittableMixin):
                 design_holder["design_matrix"] = self._filter_design_matrix(Z_base)
 
         def _warn(msg: str) -> None:
-            _print(f"  WARNING: {msg}")
             logger.warning(msg)
 
         def _on_iteration(iteration: int, ll: float, change: float) -> None:
