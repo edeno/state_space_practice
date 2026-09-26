@@ -2919,3 +2919,36 @@ class TestBaseModelSGDStorage:
         np.testing.assert_array_equal(model.init_mean, new_m0)
         # Keys absent from params are left untouched.
         assert model.init_cov is old_init_cov
+
+    @pytest.mark.parametrize(
+        "model_cls, params_fixture",
+        [
+            (CommonOscillatorModel, "common_oscillator_params"),
+            (CorrelatedNoiseModel, "correlated_noise_params"),
+            (DirectedInfluenceModel, "directed_influence_params"),
+        ],
+    )
+    def test_store_sgd_params_restacks_per_state_covariances(
+        self, request, model_cls, params_fixture
+    ) -> None:
+        """The spec optimizes one shared (s, s) measurement_cov and per-state
+        init_cov_{j} keys; storing them must rebuild the (..., K) stacks."""
+        model = model_cls(**request.getfixturevalue(params_fixture))
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        s, n, k = model.n_sources, model.n_cont_states, model.n_discrete_states
+        old_init_cov = model.init_cov
+        new_R = jnp.eye(s) * 0.7
+        new_P1 = jnp.eye(n) * 3.0
+        # Guard: the new values differ from the initialized ones.
+        assert not bool(jnp.allclose(new_R, model.measurement_cov[..., 0]))
+        assert not bool(jnp.allclose(new_P1, old_init_cov[..., 1]))
+
+        model._store_sgd_params({"measurement_cov": new_R, "init_cov_1": new_P1})
+
+        assert model.measurement_cov.shape == (s, s, k)
+        for j in range(k):
+            np.testing.assert_array_equal(model.measurement_cov[..., j], new_R)
+        assert model.init_cov.shape == (n, n, k)
+        np.testing.assert_array_equal(model.init_cov[..., 1], new_P1)
+        for j in (0, 2):
+            np.testing.assert_array_equal(model.init_cov[..., j], old_init_cov[..., j])

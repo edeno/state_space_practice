@@ -397,14 +397,14 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
     See :class:`OscillatorParameterBase` for the parameter attributes.
     """
 
-    # Plain SGD parameters stored by the default ``_store_sgd_params``;
-    # subclasses store their additional params (coupling, etc.) in overrides.
+    # Plain SGD parameters stored by the mapping-driven default; the shared
+    # ``measurement_cov`` and per-state ``init_cov_{j}`` keys are restacked by
+    # ``BaseModel._store_sgd_params``, and subclasses store their additional
+    # params (coupling, etc.) in overrides.
     _sgd_param_attrs = {
         "measurement_matrix": "measurement_matrix",
-        "measurement_cov": "measurement_cov",
         "discrete_transition_matrix": "discrete_transition_matrix",
         "init_mean": "init_mean",
-        "init_cov": "init_cov",
         "init_discrete_state_prob": "init_discrete_state_prob",
     }
 
@@ -1084,6 +1084,20 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
                 "Call fit_sgd(observations, key=...) to initialize parameters."
             )
 
+    def _store_sgd_params(self, params: dict) -> None:
+        """Store the plain keys, then rebuild the per-state covariance stacks.
+
+        The param specs optimize one shared ``(n_sources, n_sources)``
+        ``measurement_cov`` and one ``init_cov_{j}`` per discrete state; both
+        are restacked here into their ``(..., n_discrete_states)`` containers.
+        Subclasses store their model-specific params on top.
+        """
+        super()._store_sgd_params(params)
+        self._store_shared_measurement_covariance(params)
+        self.init_cov = self._reconstruct_per_state_array(
+            params, "init_cov", self.init_cov
+        )
+
     def _finalize_sgd(self, observations: ArrayLike) -> None:
         self._e_step(observations)
 
@@ -1328,13 +1342,6 @@ class CommonOscillatorModel(BaseModel):
             measurement_cov=R,
         )
         return -jnp.asarray(result[6])  # scalar marginal_ll
-
-    def _store_sgd_params(self, params: dict) -> None:
-        super()._store_sgd_params(params)
-        self._store_shared_measurement_covariance(params)
-        self.init_cov = self._reconstruct_per_state_array(
-            params, "init_cov", self.init_cov
-        )
 
 
 class CorrelatedNoiseModel(BaseModel):
@@ -1704,10 +1711,6 @@ class CorrelatedNoiseModel(BaseModel):
             )(self.process_variance, self.phase_difference, self.coupling_strength)
             self.process_cov = jax.vmap(shift_to_psd, in_axes=-1, out_axes=-1)(Q_raw)
             self._sync_process_covariance_params()
-        self._store_shared_measurement_covariance(params)
-        self.init_cov = self._reconstruct_per_state_array(
-            params, "init_cov", self.init_cov
-        )
 
 
 class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
@@ -2185,7 +2188,3 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         # stability scale evaluated by the SGD loss.
         if "phase_difference" in params or "coupling_strength" in params:
             self._rebuild_stable_transition_matrix()
-        self._store_shared_measurement_covariance(params)
-        self.init_cov = self._reconstruct_per_state_array(
-            params, "init_cov", self.init_cov
-        )
