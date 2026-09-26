@@ -1,4 +1,4 @@
-"""Bayesian State-Space Model for Learning using Laplace Approximation.
+r"""Bayesian State-Space Model for Learning using Laplace Approximation.
 
 This module implements a Bayesian filter and smoother designed to track a
 latent learning state over trials, based on binomial (correct/incorrect)
@@ -202,7 +202,7 @@ def _log_posterior_objective(
     max_possible_correct: ArrayLike,
     bias: ArrayLike,
 ) -> Array:
-    """Objective function for the log posterior distribution at one step.
+    r"""Objective function for the log posterior distribution at one step.
 
     Parameters
     ----------
@@ -246,7 +246,7 @@ def smith_learning_filter(
     max_possible_correct: ArrayLike | None = None,
     differentiable: bool = False,
 ) -> tuple[Array, Array, Array, Array, Array]:
-    """Applies a non-linear Bayesian filter (Laplace approximation) for learning.
+    r"""Applies a non-linear Bayesian filter (Laplace approximation) for learning.
 
     Assumes a random walk model for the latent learning state ($x_k$) and
     a Binomial observation model with a sigmoid link function.
@@ -765,7 +765,7 @@ def simulate_learning_data(
     inflection_point: float = 25.0,
     seed: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Simulates learning data with a sigmoid probability curve.
+    r"""Simulates learning data with a sigmoid probability curve.
 
     Generates binary outcomes (0 or 1) for a specified number of trials.
     The probability of success (outcome 1) for each trial follows a
