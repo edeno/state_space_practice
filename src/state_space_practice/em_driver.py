@@ -66,7 +66,6 @@ def run_em(
     refresh_after_restore: bool = False,
     track_best: bool = False,
     m_step_on_convergence: bool = False,
-    final_e_step: bool = True,
     logger: logging.Logger | None = None,
     on_iteration: Callable[[int, float, float], None] | None = None,
     warn: Callable[[str], None] | None = None,
@@ -115,9 +114,6 @@ def run_em(
     m_step_on_convergence : bool
         On convergence, run one more M-step plus a synchronising E-step,
         rolling back if that final E-step does not improve.
-    final_e_step : bool
-        After ``max_iter`` is exhausted, run one more E-step so the stored
-        posteriors match the last M-step, rolling back if it got worse.
     logger : logging.Logger or None
         Logger for info messages; defaults to this module's logger.
     on_iteration : callable or None
@@ -258,7 +254,7 @@ def run_em(
 
     if reached_max_iter:
         emit_warning("Reached maximum iterations without converging.")
-        if final_e_step and log_likelihoods:
+        if log_likelihoods:
             # The last M-step ran without a following E-step: sync the stored
             # posteriors with the current parameters, rolling back if that
             # reveals the M-step made things worse.

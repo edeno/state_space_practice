@@ -252,11 +252,6 @@ def test_final_e_step_after_max_iter_appends_or_rolls_back():
     assert worsening.params == 1  # last M-step rolled back
     assert worsening.posterior == ("posterior-for-params", 1)
 
-    skipped = ScriptedModel([-100.0, -90.0, -80.0])
-    result = skipped.run(max_iter=2, tol=1e-4, final_e_step=False)
-    assert result.log_likelihoods == [-100.0, -90.0]
-    assert skipped.e_calls == 2
-
 
 def test_final_e_step_nonfinite_rolls_back(caplog):
     model = ScriptedModel([-100.0, -90.0, np.nan])
