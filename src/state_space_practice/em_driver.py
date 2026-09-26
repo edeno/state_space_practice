@@ -236,7 +236,7 @@ def run_em(
                     m_step()
                     final_ll = float(e_step())
                     _, final_is_increasing = check_converged(
-                        final_ll, log_likelihoods[-1], tol
+                        final_ll, log_likelihoods[-1], decrease_tolerance
                     )
                     if final_is_increasing and math.isfinite(final_ll):
                         log_likelihoods.append(final_ll)

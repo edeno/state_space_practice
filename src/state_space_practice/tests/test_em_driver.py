@@ -298,6 +298,17 @@ def test_m_step_on_convergence_rolls_back_and_warns(bad_ll):
     assert len(warnings) == 1 and "rolling back" in warnings[0]
 
 
+def test_m_step_on_convergence_uses_decrease_tol():
+    # A post-convergence decrease within decrease_tol is noise, not a rollback.
+    model = ScriptedModel([-100.0, -50.0, -50.0, -50.1])
+    result = model.run(
+        max_iter=10, tol=1e-6, decrease_tol=1e-2, m_step_on_convergence=True
+    )
+
+    assert result.log_likelihoods == [-100.0, -50.0, -50.0, -50.1]
+    assert model.params == 3
+
+
 def test_iteration_and_warning_hooks_receive_messages():
     seen = []
     warnings = []
