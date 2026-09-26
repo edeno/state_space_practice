@@ -3,8 +3,8 @@
 Unifies continuous voltage (LFP) and sparse point-processes (Spikes)
 under a single shared Hamiltonian latent trajectory.
 
-See docs/hamiltonian_architecture.md for why this family is standalone
-(no linear-Gaussian EM integration, SGD-only fitting).
+See docs/hamiltonian_architecture.md for why this family has no
+linear-Gaussian EM integration and is fit by SGD only.
 """
 
 import warnings

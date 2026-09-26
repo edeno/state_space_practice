@@ -3,8 +3,8 @@
 Combines multiple Hamiltonian energy landscapes with switching discrete states,
 sharing a single multimodal (LFP + Spikes) observation head.
 
-See docs/hamiltonian_architecture.md for why this family is standalone
-(no linear-Gaussian EM integration, SGD-only fitting).
+See docs/hamiltonian_architecture.md for why this family has no
+linear-Gaussian EM integration and is fit by SGD only.
 """
 
 from functools import partial
