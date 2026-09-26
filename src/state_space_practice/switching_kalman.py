@@ -17,6 +17,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.scipy.special import logsumexp
 
 from state_space_practice.kalman import (
@@ -3326,6 +3327,132 @@ def _inv_scaled_tanh(y: jax.Array, scale: float) -> jax.Array:
     return jnp.arctanh(ratio)
 
 
+# Upper bound on the (non-negative) coupling magnitude in the bounded DIM
+# reparameterization, shared by both optimizers.
+_DIM_MAX_COUPLING = 0.5
+
+
+def _pack_dim_params(
+    damping: jax.Array,
+    freq: jax.Array,
+    coupling: jax.Array,
+    phase: jax.Array,
+    max_damping: jax.Array,
+    max_freq: jax.Array,
+) -> jax.Array:
+    """Map physical DIM params to the flat unconstrained coordinates.
+
+    ``coupling`` / ``phase`` have shape ``(n_osc, n_osc)`` or
+    ``(n_osc, n_osc, n_states)``; only off-diagonal entries are packed. A
+    negative coupling is folded into ``|coupling|`` with a ``pi`` phase shift.
+    """
+    n_osc = damping.shape[0]
+    offdiag_i, offdiag_j = np.where(~np.eye(n_osc, dtype=bool))
+    offdiag_coupling = coupling[offdiag_i, offdiag_j]
+    offdiag_phase = phase[offdiag_i, offdiag_j]
+    offdiag_phase = jnp.where(
+        offdiag_coupling < 0.0, offdiag_phase + jnp.pi, offdiag_phase
+    )
+    offdiag_coupling = jnp.abs(offdiag_coupling)
+    return jnp.concatenate(
+        [
+            _inv_scaled_sigmoid(damping, max_damping),
+            _inv_scaled_tanh(freq, max_freq),
+            _inv_scaled_sigmoid(offdiag_coupling, _DIM_MAX_COUPLING).reshape(-1),
+            offdiag_phase.reshape(-1),
+        ]
+    )
+
+
+def _unpack_dim_params(
+    flat: jax.Array,
+    n_osc: int,
+    n_states: int | None,
+    max_damping: jax.Array,
+    max_freq: jax.Array,
+) -> dict:
+    """Inverse of :func:`_pack_dim_params` (``n_states=None``: one state)."""
+    offdiag_i, offdiag_j = np.where(~np.eye(n_osc, dtype=bool))
+    n_offdiag = n_osc * (n_osc - 1)
+    state_shape = () if n_states is None else (n_states,)
+    network_size = n_offdiag * (1 if n_states is None else n_states)
+    idx = 0
+    damping = _scaled_sigmoid(flat[idx : idx + n_osc], max_damping)
+    idx += n_osc
+    freq = _scaled_tanh(flat[idx : idx + n_osc], max_freq)
+    idx += n_osc
+    coupling_values = _scaled_sigmoid(
+        flat[idx : idx + network_size], _DIM_MAX_COUPLING
+    ).reshape((n_offdiag, *state_shape))
+    idx += network_size
+    phase_values = flat[idx : idx + network_size].reshape((n_offdiag, *state_shape))
+    network_shape = (n_osc, n_osc, *state_shape)
+    coupling = jnp.zeros(network_shape, dtype=flat.dtype)
+    coupling = coupling.at[offdiag_i, offdiag_j].set(coupling_values)
+    phase = jnp.zeros(network_shape, dtype=flat.dtype)
+    phase = phase.at[offdiag_i, offdiag_j].set(phase_values)
+    return {
+        "damping": damping,
+        "freq": freq,
+        "coupling_strength": coupling,
+        "phase_diff": phase,
+    }
+
+
+@functools.partial(jax.jit, static_argnames=("tol", "max_iter", "has_process_cov"))
+def _optimize_dim_single_core(
+    damping0: jax.Array,
+    freq0: jax.Array,
+    coupling0: jax.Array,
+    phase0: jax.Array,
+    gamma1: jax.Array,
+    beta: jax.Array,
+    process_cov: jax.Array,
+    sampling_freq: jax.Array,
+    tol: float,
+    max_iter: int,
+    has_process_cov: bool,
+) -> dict:
+    """Jitted numeric core of :func:`optimize_dim_transition_params`.
+
+    Shapes and the static controls (``tol``, ``max_iter``) form the
+    compilation key; ``sampling_freq`` is traced, so repeated EM iterations
+    reuse one executable.
+    """
+    from jax.scipy.optimize import minimize
+
+    n_osc = damping0.shape[0]
+    max_damping = jnp.asarray(0.995, dtype=gamma1.dtype)
+    max_freq = 0.5 * sampling_freq
+
+    def loss(flat_params: jax.Array) -> jax.Array:
+        params = _unpack_dim_params(flat_params, n_osc, None, max_damping, max_freq)
+        return compute_transition_q_from_params(
+            damping=params["damping"],
+            freq=params["freq"],
+            coupling_strength=params["coupling_strength"],
+            phase_diff=params["phase_diff"],
+            sampling_freq=sampling_freq,
+            gamma1=gamma1,
+            beta=beta,
+            process_cov=process_cov if has_process_cov else None,
+        )
+
+    init_flat = _pack_dim_params(
+        damping0, freq0, coupling0, phase0, max_damping, max_freq
+    )
+    result = minimize(
+        loss, init_flat, method="BFGS", tol=tol, options={"maxiter": max_iter}
+    )
+    return {
+        "params": _unpack_dim_params(result.x, n_osc, None, max_damping, max_freq),
+        "solution_finite": jnp.all(jnp.isfinite(result.x)),
+        "fun": result.fun,
+        "status": result.status,
+        "nit": result.nit,
+    }
+
+
 def optimize_dim_transition_params(
     gamma1: jax.Array,
     beta: jax.Array,
@@ -3335,10 +3462,13 @@ def optimize_dim_transition_params(
     max_iter: int = 100,
     tol: float = 1e-6,
     raise_on_failure: bool = False,
+    max_spectral_radius: float = 0.99,
 ) -> dict:
     """Optimize oscillator parameters to maximize Q-function.
 
-    Uses JAX autodiff + BFGS optimizer.
+    Uses JAX autodiff + BFGS optimizer. The numeric core (reparameterization
+    and ``jax.scipy.optimize.minimize``) runs in one module-level ``jax.jit``,
+    so repeated calls with the same shapes do not recompile.
 
     Parameters
     ----------
@@ -3364,120 +3494,58 @@ def optimize_dim_transition_params(
         BFGS's ``success=False`` flag alone is not treated as a failure, since
         it fires on benign line-search terminations that still yield a good
         solution.
+    max_spectral_radius : float, default=0.99
+        Bound on the spectral radius of the reconstructed ``A``, enforced after
+        optimization. For uncoupled oscillators only the offending
+        oscillator's damping is reduced; with coupling, damping and coupling
+        are scaled uniformly. A ``UserWarning`` reports any clamp. See
+        :func:`~state_space_practice.utils.stabilize_transition_matrix` for
+        choosing it from the sampling rate and the narrowest bandwidth.
 
     Returns
     -------
     dict
         Optimized parameters with keys: damping, freq, coupling_strength, phase_diff.
     """
-    from jax.scipy.optimize import minimize
-
     from state_space_practice.oscillator_utils import (
         construct_directed_influence_transition_matrix,
     )
-
-    n_osc = len(init_params["damping"])
 
     if sampling_freq <= 0.0:
         raise ValueError("sampling_freq must be positive.")
     if max_iter <= 0:
         raise ValueError("max_iter must be positive.")
+    if not 0.0 < max_spectral_radius < 1.0:
+        raise ValueError("max_spectral_radius must lie in (0, 1).")
 
-    # Optimize in transformed coordinates for stability:
-    # - damping: sigmoid maps (-inf, inf) -> (0, max_damping)
-    # - frequency: tanh maps (-inf, inf) -> (-Nyquist, Nyquist)
-    # - coupling_strength: sigmoid maps (-inf, inf) -> (0, max_coupling)
-    # - phase_diff: unconstrained, with diagonal entries excluded
-    max_damping = 0.995
-    max_freq = 0.5 * float(sampling_freq)
-    max_coupling = 0.5
-    offdiag_i, offdiag_j = jnp.where(~jnp.eye(n_osc, dtype=bool))
-
-    _sigmoid = functools.partial(_scaled_sigmoid, scale=max_damping)
-    _inv_sigmoid = functools.partial(_inv_scaled_sigmoid, scale=max_damping)
-    _bounded_freq = functools.partial(_scaled_tanh, scale=max_freq)
-    _inv_bounded_freq = functools.partial(_inv_scaled_tanh, scale=max_freq)
-    _bounded_coupling = functools.partial(_scaled_sigmoid, scale=max_coupling)
-    _inv_bounded_coupling = functools.partial(_inv_scaled_sigmoid, scale=max_coupling)
-
-    def pack_unconstrained(params: dict) -> jax.Array:
-        """Map physical params to unconstrained coordinates."""
-        damping = jnp.asarray(params["damping"])
-        freq = jnp.asarray(params["freq"])
-        coupling = jnp.asarray(params["coupling_strength"])
-        phase = jnp.asarray(params["phase_diff"])
-        offdiag_coupling = coupling[offdiag_i, offdiag_j]
-        offdiag_phase = phase[offdiag_i, offdiag_j]
-        offdiag_phase = jnp.where(
-            offdiag_coupling < 0.0,
-            offdiag_phase + jnp.pi,
-            offdiag_phase,
-        )
-        offdiag_coupling = jnp.abs(offdiag_coupling)
-        return jnp.concatenate(
-            [
-                _inv_sigmoid(damping),
-                _inv_bounded_freq(freq),
-                _inv_bounded_coupling(offdiag_coupling),
-                offdiag_phase,
-            ]
-        )
-
-    def unpack_constrained(flat: jax.Array) -> dict:
-        """Map unconstrained coordinates to physical params."""
-        idx = 0
-        damping = _sigmoid(flat[idx : idx + n_osc])
-        idx += n_osc
-        freq = _bounded_freq(flat[idx : idx + n_osc])
-        idx += n_osc
-        n_offdiag = n_osc * (n_osc - 1)
-        coupling = jnp.zeros((n_osc, n_osc), dtype=flat.dtype)
-        coupling = coupling.at[offdiag_i, offdiag_j].set(
-            _bounded_coupling(flat[idx : idx + n_offdiag])
-        )
-        idx += n_offdiag
-        phase = jnp.zeros((n_osc, n_osc), dtype=flat.dtype)
-        phase = phase.at[offdiag_i, offdiag_j].set(flat[idx : idx + n_offdiag])
-        return {
-            "damping": damping,
-            "freq": freq,
-            "coupling_strength": coupling,
-            "phase_diff": phase,
-        }
-
-    def loss(flat_params: jax.Array) -> jax.Array:
-        params = unpack_constrained(flat_params)
-        return compute_transition_q_from_params(
-            damping=params["damping"],
-            freq=params["freq"],
-            coupling_strength=params["coupling_strength"],
-            phase_diff=params["phase_diff"],
-            sampling_freq=sampling_freq,
-            gamma1=gamma1,
-            beta=beta,
-            process_cov=process_cov,
-        )
-
-    # Run optimizer in unconstrained space
-    init_flat = pack_unconstrained(init_params)
-    result = minimize(
-        loss,
-        init_flat,
-        method="BFGS",
-        tol=tol,
-        options={"maxiter": max_iter},
+    gamma1 = jnp.asarray(gamma1)
+    beta = jnp.asarray(beta)
+    dtype = jnp.result_type(gamma1, beta, float)
+    has_process_cov = process_cov is not None
+    out = _optimize_dim_single_core(
+        jnp.asarray(init_params["damping"], dtype=dtype),
+        jnp.asarray(init_params["freq"], dtype=dtype),
+        jnp.asarray(init_params["coupling_strength"], dtype=dtype),
+        jnp.asarray(init_params["phase_diff"], dtype=dtype),
+        gamma1,
+        beta,
+        jnp.asarray(process_cov) if has_process_cov else jnp.zeros_like(gamma1),
+        jnp.asarray(sampling_freq, dtype=dtype),
+        tol=float(tol),
+        max_iter=max_iter,
+        has_process_cov=has_process_cov,
     )
     # JAX's BFGS sets ``success=False`` for benign line-search terminations even
     # when the returned iterate is a good solution (a very common outcome on this
     # reparameterized objective), so that flag alone is not an actionable failure
     # signal. Treat the optimization as failed only when it returns a non-finite
     # solution or objective, which is unambiguously unusable downstream.
-    solution_finite = bool(jax.device_get(jnp.all(jnp.isfinite(result.x))))
-    objective_finite = bool(jax.device_get(jnp.isfinite(result.fun)))
+    solution_finite = bool(jax.device_get(out["solution_finite"]))
+    objective_finite = bool(jax.device_get(jnp.isfinite(out["fun"])))
     if not (solution_finite and objective_finite):
-        status = int(jax.device_get(result.status))
-        nit = int(jax.device_get(result.nit))
-        fun = float(jax.device_get(result.fun))
+        status = int(jax.device_get(out["status"]))
+        nit = int(jax.device_get(out["nit"]))
+        fun = float(jax.device_get(out["fun"]))
         message = (
             "DIM transition parameter optimization produced a non-finite "
             f"solution (status={status}, nit={nit}, objective={fun:.6g})."
@@ -3486,11 +3554,11 @@ def optimize_dim_transition_params(
             raise RuntimeError(message)
         warnings.warn(message, RuntimeWarning, stacklevel=2)
 
-    opt_params = unpack_constrained(result.x)
+    opt_params = dict(out["params"])
 
-    # Post-check: verify spectral radius of resulting A matrix.
-    # If unstable, uniformly scale damping AND coupling so the
-    # spectral radius of the reconstructed A is <= 0.99.
+    # Post-check: verify the spectral radius of the resulting A. Spectral
+    # radius is computed on host (eigvals has no GPU/TPU lowering); the
+    # optimizer has already returned, so this runs eagerly.
     A_opt = construct_directed_influence_transition_matrix(
         freqs=opt_params["freq"],
         damping_coeffs=opt_params["damping"],
@@ -3498,16 +3566,155 @@ def optimize_dim_transition_params(
         phase_diffs=opt_params["phase_diff"],
         sampling_freq=sampling_freq,
     )
-    # Spectral radius is computed on host (eigvals has no GPU/TPU lowering);
-    # the optimizer has already returned, so this runs eagerly and stays
-    # backend-portable. Here we scale the params (not A directly), so we need
-    # the scalar radius rather than utils.stabilize_transition_matrix.
-    radius = _spectral_radius(A_opt)
-    safe_scale = 0.99 / radius if radius > 0.99 else 1.0
-    opt_params["damping"] = opt_params["damping"] * safe_scale
-    opt_params["coupling_strength"] = opt_params["coupling_strength"] * safe_scale
+    radius = _spectral_radius(A_opt) if solution_finite else float("nan")
+    if radius > max_spectral_radius:
+        uncoupled = not bool(jnp.any(opt_params["coupling_strength"] != 0.0))
+        if uncoupled:
+            # Uncoupled blocks are damping * R(theta): each oscillator's
+            # eigenvalue modulus is its own damping, so clamp only those.
+            damping = opt_params["damping"]
+            clamped = jnp.minimum(damping, max_spectral_radius)
+            detail = (
+                "oscillator damping clamped per block "
+                f"{jax.device_get(damping).tolist()} -> "
+                f"{jax.device_get(clamped).tolist()}"
+            )
+            opt_params["damping"] = clamped
+        else:
+            safe_scale = max_spectral_radius / radius
+            detail = f"damping and coupling scaled by {safe_scale:.6g}"
+            opt_params["damping"] = opt_params["damping"] * safe_scale
+            opt_params["coupling_strength"] = (
+                opt_params["coupling_strength"] * safe_scale
+            )
+        warnings.warn(
+            f"optimize_dim_transition_params: spectral radius {radius:.6g} "
+            f"exceeded max_spectral_radius={max_spectral_radius:g}; {detail}.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     return opt_params
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("tol", "max_iter", "max_backtracking_steps", "has_process_cov"),
+)
+def _optimize_dim_joint_core(
+    damping0: jax.Array,
+    freq0: jax.Array,
+    coupling0: jax.Array,
+    phase0: jax.Array,
+    gamma1: jax.Array,
+    beta: jax.Array,
+    process_cov: jax.Array,
+    sampling_freq: jax.Array,
+    max_spectral_radius: jax.Array,
+    max_damping: jax.Array,
+    tol: float,
+    max_iter: int,
+    max_backtracking_steps: int,
+    has_process_cov: bool,
+) -> dict:
+    """Jitted numeric core of :func:`optimize_dim_transition_params_joint`.
+
+    Packs the initial point, runs BFGS, evaluates the candidate objective and
+    -- only when the candidate is worse than the start -- the backtracking
+    trials between the start and the candidate, all in one executable. The
+    oscillator/state counts come from the array shapes and the solver controls
+    (``tol``, iteration limits) are static, while ``sampling_freq``,
+    ``max_spectral_radius`` and ``max_damping`` are traced, so successive EM
+    iterations reuse the compiled optimizer. Host-side code only inspects the returned flags to
+    raise or warn.
+    """
+    from jax.scipy.optimize import minimize
+
+    from state_space_practice.oscillator_utils import (
+        compute_directed_influence_stability_scale,
+    )
+
+    n_osc = damping0.shape[0]
+    n_states = gamma1.shape[-1]
+    max_freq = 0.5 * sampling_freq
+
+    def unpack(flat: jax.Array) -> dict:
+        return _unpack_dim_params(flat, n_osc, n_states, max_damping, max_freq)
+
+    def loss(flat_params: jax.Array) -> jax.Array:
+        params = unpack(flat_params)
+        scale = compute_directed_influence_stability_scale(
+            params["freq"],
+            params["damping"],
+            params["coupling_strength"],
+            sampling_freq,
+            max_spectral_radius=max_spectral_radius,
+            phase_difference=params["phase_diff"],
+        )
+        effective_damping = params["damping"] * scale
+        effective_coupling = params["coupling_strength"] * scale
+
+        def per_state(coupling, phase, gamma, cross, cov):
+            return compute_transition_q_from_params(
+                damping=effective_damping,
+                freq=params["freq"],
+                coupling_strength=coupling,
+                phase_diff=phase,
+                sampling_freq=sampling_freq,
+                gamma1=gamma,
+                beta=cross,
+                process_cov=cov if has_process_cov else None,
+            )
+
+        return jnp.sum(
+            jax.vmap(per_state, in_axes=(-1, -1, -1, -1, -1))(
+                effective_coupling, params["phase_diff"], gamma1, beta, process_cov
+            )
+        )
+
+    init_flat = _pack_dim_params(
+        damping0, freq0, coupling0, phase0, max_damping, max_freq
+    )
+    init_loss = loss(init_flat)
+    result = minimize(
+        loss, init_flat, method="BFGS", tol=tol, options={"maxiter": max_iter}
+    )
+    solution_finite = jnp.all(jnp.isfinite(result.x))
+    candidate_loss = jnp.where(
+        solution_finite,
+        loss(jnp.where(solution_finite, result.x, init_flat)),
+        jnp.nan,
+    )
+    objective_slack = tol * jnp.maximum(1.0, jnp.abs(init_loss))
+    threshold = init_loss + objective_slack
+
+    def backtrack(_: None) -> jax.Array:
+        direction = result.x - init_flat
+        steps = 0.5 ** jnp.arange(1, max_backtracking_steps + 1, dtype=init_flat.dtype)
+
+        def body(carry, step):
+            accepted, found = carry
+            trial_flat = init_flat + step * direction
+            trial_loss = loss(trial_flat)
+            take = (~found) & jnp.isfinite(trial_loss) & (trial_loss <= threshold)
+            return (jnp.where(take, trial_flat, accepted), found | take), None
+
+        (accepted, _), _ = jax.lax.scan(body, (init_flat, jnp.array(False)), steps)
+        return accepted
+
+    accepted_flat = jax.lax.cond(
+        candidate_loss > threshold, backtrack, lambda _: result.x, None
+    )
+    return {
+        "params": unpack(accepted_flat),
+        "init_params": unpack(init_flat),
+        "init_loss": init_loss,
+        "candidate_loss": candidate_loss,
+        "solution_finite": solution_finite,
+        "fun": result.fun,
+        "status": result.status,
+        "nit": result.nit,
+    }
 
 
 def optimize_dim_transition_params_joint(
@@ -3530,7 +3737,9 @@ def optimize_dim_transition_params_joint(
     coupling and phase remain state-specific. Every objective evaluation uses
     the same differentiable global stability scale as ``DirectedInfluenceModel``
     so the optimized objective matches the transition matrices installed by the
-    model.
+    model. The numeric core runs in one module-level ``jax.jit``
+    (:func:`_optimize_dim_joint_core`), so the second and later EM iterations
+    reuse the compiled optimizer instead of re-tracing BFGS.
 
     Parameters
     ----------
@@ -3567,12 +3776,6 @@ def optimize_dim_transition_params_joint(
         Shared ``damping``/``freq`` and state-specific
         ``coupling_strength``/``phase_diff``.
     """
-    from jax.scipy.optimize import minimize
-
-    from state_space_practice.oscillator_utils import (
-        compute_directed_influence_stability_scale,
-    )
-
     gamma1 = jnp.asarray(gamma1)
     beta = jnp.asarray(beta)
     damping0 = jnp.asarray(init_params["damping"])
@@ -3630,148 +3833,42 @@ def optimize_dim_transition_params_joint(
     if not all(bool(jnp.all(jnp.isfinite(x))) for x in arrays_to_check):
         raise ValueError("Joint DIM optimizer inputs must contain only finite values.")
 
-    max_freq = 0.5 * float(sampling_freq)
-    max_coupling = 0.5
-    offdiag_i, offdiag_j = jnp.where(~jnp.eye(n_osc, dtype=bool))
-    n_offdiag = n_osc * (n_osc - 1)
+    dtype = jnp.result_type(gamma1, beta, float)
+    has_process_cov = process_cov_arr is not None
+    out = _optimize_dim_joint_core(
+        damping0.astype(dtype),
+        freq0.astype(dtype),
+        coupling0.astype(dtype),
+        phase0.astype(dtype),
+        gamma1.astype(dtype),
+        beta.astype(dtype),
+        (
+            process_cov_arr.astype(dtype)
+            if has_process_cov
+            else jnp.zeros(expected_stats_shape, dtype=dtype)
+        ),
+        jnp.asarray(sampling_freq, dtype=dtype),
+        jnp.asarray(max_spectral_radius, dtype=dtype),
+        jnp.asarray(max_damping, dtype=dtype),
+        tol=float(tol),
+        max_iter=max_iter,
+        max_backtracking_steps=max_backtracking_steps,
+        has_process_cov=has_process_cov,
+    )
 
-    _bounded_damping = functools.partial(_scaled_sigmoid, scale=max_damping)
-    _inv_bounded_damping = functools.partial(_inv_scaled_sigmoid, scale=max_damping)
-    _bounded_freq = functools.partial(_scaled_tanh, scale=max_freq)
-    _inv_bounded_freq = functools.partial(_inv_scaled_tanh, scale=max_freq)
-    _bounded_coupling = functools.partial(_scaled_sigmoid, scale=max_coupling)
-    _inv_bounded_coupling = functools.partial(_inv_scaled_sigmoid, scale=max_coupling)
-
-    def pack_unconstrained(params: dict) -> jax.Array:
-        damping = jnp.asarray(params["damping"])
-        freq = jnp.asarray(params["freq"])
-        coupling = jnp.asarray(params["coupling_strength"])
-        phase = jnp.asarray(params["phase_diff"])
-        offdiag_coupling = coupling[offdiag_i, offdiag_j, :]
-        offdiag_phase = phase[offdiag_i, offdiag_j, :]
-        offdiag_phase = jnp.where(
-            offdiag_coupling < 0.0,
-            offdiag_phase + jnp.pi,
-            offdiag_phase,
-        )
-        offdiag_coupling = jnp.abs(offdiag_coupling)
-        return jnp.concatenate(
-            [
-                _inv_bounded_damping(damping),
-                _inv_bounded_freq(freq),
-                _inv_bounded_coupling(offdiag_coupling).reshape(-1),
-                offdiag_phase.reshape(-1),
-            ]
-        )
-
-    def unpack_constrained(flat: jax.Array) -> dict:
-        idx = 0
-        damping = _bounded_damping(flat[idx : idx + n_osc])
-        idx += n_osc
-        freq = _bounded_freq(flat[idx : idx + n_osc])
-        idx += n_osc
-        network_size = n_offdiag * n_states
-        coupling_values = _bounded_coupling(flat[idx : idx + network_size]).reshape(
-            n_offdiag, n_states
-        )
-        idx += network_size
-        phase_values = flat[idx : idx + network_size].reshape(n_offdiag, n_states)
-
-        coupling = jnp.zeros(expected_network_shape, dtype=flat.dtype)
-        coupling = coupling.at[offdiag_i, offdiag_j, :].set(coupling_values)
-        phase = jnp.zeros(expected_network_shape, dtype=flat.dtype)
-        phase = phase.at[offdiag_i, offdiag_j, :].set(phase_values)
-        return {
-            "damping": damping,
-            "freq": freq,
-            "coupling_strength": coupling,
-            "phase_diff": phase,
-        }
-
-    def loss(flat_params: jax.Array) -> jax.Array:
-        params = unpack_constrained(flat_params)
-        scale = compute_directed_influence_stability_scale(
-            params["freq"],
-            params["damping"],
-            params["coupling_strength"],
-            sampling_freq,
-            max_spectral_radius=max_spectral_radius,
-            phase_difference=params["phase_diff"],
-        )
-        effective_damping = params["damping"] * scale
-        effective_coupling = params["coupling_strength"] * scale
-
-        if process_cov_arr is None:
-            per_state = jax.vmap(
-                lambda coupling, phase, gamma, cross: compute_transition_q_from_params(
-                    damping=effective_damping,
-                    freq=params["freq"],
-                    coupling_strength=coupling,
-                    phase_diff=phase,
-                    sampling_freq=sampling_freq,
-                    gamma1=gamma,
-                    beta=cross,
-                ),
-                in_axes=(-1, -1, -1, -1),
-            )(
-                effective_coupling,
-                params["phase_diff"],
-                gamma1,
-                beta,
-            )
-        else:
-            per_state = jax.vmap(
-                lambda coupling, phase, gamma, cross, cov: (
-                    compute_transition_q_from_params(
-                        damping=effective_damping,
-                        freq=params["freq"],
-                        coupling_strength=coupling,
-                        phase_diff=phase,
-                        sampling_freq=sampling_freq,
-                        gamma1=gamma,
-                        beta=cross,
-                        process_cov=cov,
-                    )
-                ),
-                in_axes=(-1, -1, -1, -1, -1),
-            )(
-                effective_coupling,
-                params["phase_diff"],
-                gamma1,
-                beta,
-                process_cov_arr,
-            )
-        return jnp.sum(per_state)
-
-    init_params_stacked = {
-        "damping": damping0,
-        "freq": freq0,
-        "coupling_strength": coupling0,
-        "phase_diff": phase0,
-    }
-    init_flat = pack_unconstrained(init_params_stacked)
-    init_loss = float(jax.device_get(loss(init_flat)))
+    init_loss = float(jax.device_get(out["init_loss"]))
     if not math.isfinite(init_loss):
         raise ValueError("Initial joint DIM parameters produce a non-finite objective.")
-    result = minimize(
-        loss,
-        init_flat,
-        method="BFGS",
-        tol=tol,
-        options={"maxiter": max_iter},
-    )
 
-    solution_finite = bool(jax.device_get(jnp.all(jnp.isfinite(result.x))))
-    candidate_loss = (
-        float(jax.device_get(loss(result.x))) if solution_finite else float("nan")
-    )
-    objective_finite = bool(jax.device_get(jnp.isfinite(result.fun))) and math.isfinite(
-        candidate_loss
+    solution_finite = bool(jax.device_get(out["solution_finite"]))
+    candidate_loss = float(jax.device_get(out["candidate_loss"]))
+    objective_finite = bool(jax.device_get(jnp.isfinite(out["fun"]))) and (
+        math.isfinite(candidate_loss)
     )
     if not (solution_finite and objective_finite):
-        status = int(jax.device_get(result.status))
-        nit = int(jax.device_get(result.nit))
-        fun = float(jax.device_get(result.fun))
+        status = int(jax.device_get(out["status"]))
+        nit = int(jax.device_get(out["nit"]))
+        fun = float(jax.device_get(out["fun"]))
         message = (
             "Joint DIM transition optimization produced a non-finite solution "
             f"(status={status}, nit={nit}, objective={fun:.6g})."
@@ -3783,19 +3880,6 @@ def optimize_dim_transition_params_joint(
             RuntimeWarning,
             stacklevel=2,
         )
-        return unpack_constrained(init_flat)
+        return dict(out["init_params"])
 
-    accepted_flat = result.x
-    accepted_loss = candidate_loss
-    objective_slack = tol * max(1.0, abs(init_loss))
-    if accepted_loss > init_loss + objective_slack:
-        accepted_flat = init_flat
-        direction = result.x - init_flat
-        for step in range(1, max_backtracking_steps + 1):
-            trial_flat = init_flat + (0.5**step) * direction
-            trial_loss = float(jax.device_get(loss(trial_flat)))
-            if math.isfinite(trial_loss) and trial_loss <= init_loss + objective_slack:
-                accepted_flat = trial_flat
-                break
-
-    return unpack_constrained(accepted_flat)
+    return dict(out["params"])

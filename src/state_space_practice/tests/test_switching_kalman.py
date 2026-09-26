@@ -31,6 +31,8 @@ from state_space_practice.switching_kalman import (
     _first_timestep_discrete_update,
     _kalman_filter_update_per_discrete_state_pair,
     _kalman_smoother_update_per_discrete_state_pair,
+    _optimize_dim_joint_core,
+    _optimize_dim_single_core,
     _update_discrete_state_probabilities,
     _update_smoother_discrete_probabilities,
     collapse_gaussian_mixture,
@@ -6623,14 +6625,22 @@ def test_optimize_dim_transition_params_bounds_freq_and_uses_max_iter(
         "coupling_strength": jnp.array([[2.0, 0.2], [-0.3, -4.0]]),
         "phase_diff": jnp.array([[99.0, 0.4], [-0.7, -99.0]]),
     }
-    opt = optimize_dim_transition_params(
-        gamma1=jnp.eye(4),
-        beta=0.8 * jnp.eye(4),
-        init_params=init_params,
-        sampling_freq=100.0,
-        max_iter=7,
-        tol=1e-5,
-    )
+    # The optimizer core is jitted: drop cached executables so the fake is
+    # traced now, and again afterwards so no later test reuses the fake.
+    _optimize_dim_single_core.clear_cache()
+    try:
+        # The unoptimized start is unstable, so the post-check clamps it.
+        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+            opt = optimize_dim_transition_params(
+                gamma1=jnp.eye(4),
+                beta=0.8 * jnp.eye(4),
+                init_params=init_params,
+                sampling_freq=100.0,
+                max_iter=7,
+                tol=1e-5,
+            )
+    finally:
+        _optimize_dim_single_core.clear_cache()
 
     assert calls["method"] == "BFGS"
     assert calls["tol"] == 1e-5
@@ -6674,14 +6684,18 @@ def test_optimize_dim_transition_params_raises_on_nonfinite_solution(
         "coupling_strength": jnp.zeros((2, 2)),
         "phase_diff": jnp.zeros((2, 2)),
     }
-    with pytest.raises(RuntimeError, match="non-finite"):
-        optimize_dim_transition_params(
-            gamma1=jnp.eye(4),
-            beta=0.8 * jnp.eye(4),
-            init_params=init_params,
-            sampling_freq=100.0,
-            raise_on_failure=True,
-        )
+    _optimize_dim_single_core.clear_cache()  # trace the fake (jitted core)
+    try:
+        with pytest.raises(RuntimeError, match="non-finite"):
+            optimize_dim_transition_params(
+                gamma1=jnp.eye(4),
+                beta=0.8 * jnp.eye(4),
+                init_params=init_params,
+                sampling_freq=100.0,
+                raise_on_failure=True,
+            )
+    finally:
+        _optimize_dim_single_core.clear_cache()
 
 
 def test_joint_dim_optimizer_packs_shared_and_state_specific_params(
@@ -6716,14 +6730,20 @@ def test_joint_dim_optimizer_packs_shared_and_state_specific_params(
         "coupling_strength": jnp.zeros((2, 2, n_states)),
         "phase_diff": jnp.zeros((2, 2, n_states)),
     }
-    opt = optimize_dim_transition_params_joint(
-        gamma1=jnp.stack([jnp.eye(4)] * n_states, axis=-1),
-        beta=jnp.stack([0.8 * jnp.eye(4)] * n_states, axis=-1),
-        init_params=init_params,
-        sampling_freq=100.0,
-        max_iter=7,
-        tol=1e-5,
-    )
+    # The optimizer core is jitted: drop cached executables so the fake is
+    # traced now, and again afterwards so no later test reuses the fake.
+    _optimize_dim_joint_core.clear_cache()
+    try:
+        opt = optimize_dim_transition_params_joint(
+            gamma1=jnp.stack([jnp.eye(4)] * n_states, axis=-1),
+            beta=jnp.stack([0.8 * jnp.eye(4)] * n_states, axis=-1),
+            init_params=init_params,
+            sampling_freq=100.0,
+            max_iter=7,
+            tol=1e-5,
+        )
+    finally:
+        _optimize_dim_joint_core.clear_cache()
 
     assert calls == {
         "method": "BFGS",
@@ -7920,3 +7940,30 @@ def test_posterior_entropy_fails_loud_on_indefinite_covariance() -> None:
 
     indefinite = covs.at[1, :, :, 0].set(jnp.diag(jnp.array([0.5, -2.0])))
     assert bool(jnp.isnan(compute_posterior_entropy(prob, joint, indefinite)))
+
+
+def test_joint_dim_optimizer_compiles_once_across_em_iterations() -> None:
+    """The jitted BFGS core is reused by later calls with new statistics and a
+    new sampling rate (only shapes and iteration limits are static)."""
+    rng = np.random.default_rng(5)
+    n_osc, n_states = 2, 2
+    n_cont = 2 * n_osc
+
+    def stats(seed_shift):
+        X = rng.normal(size=(400, n_cont))
+        gamma1 = np.stack([X[:-1].T @ X[:-1]] * n_states, axis=-1)
+        beta = np.stack([(0.9 + seed_shift) * X[1:].T @ X[:-1]] * n_states, axis=-1)
+        return jnp.asarray(gamma1), jnp.asarray(beta)
+
+    init = {
+        "damping": jnp.array([0.9, 0.85]),
+        "freq": jnp.array([8.0, 12.0]),
+        "coupling_strength": jnp.zeros((n_osc, n_osc, n_states)).at[0, 1].set(0.05),
+        "phase_diff": jnp.zeros((n_osc, n_osc, n_states)),
+    }
+    g1, b1 = stats(0.0)
+    optimize_dim_transition_params_joint(g1, b1, init, 100.0, max_iter=5)
+    size_after_first = _optimize_dim_joint_core._cache_size()
+    g2, b2 = stats(0.01)
+    optimize_dim_transition_params_joint(g2, b2, init, 125.0, max_iter=5)
+    assert _optimize_dim_joint_core._cache_size() == size_after_first
