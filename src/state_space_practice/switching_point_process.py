@@ -1597,12 +1597,27 @@ def _second_order_newton_iterations(
         new_baselines, new_weights = jax.vmap(update_neuron, in_axes=(0, 0, 1, 0))(
             baselines, weights, spikes, baseline_prior
         )
-        return (new_baselines, new_weights), None
+        return _cast_like_carry(new_baselines, new_weights, baselines, weights), None
 
     (final_baselines, final_weights), _ = jax.lax.scan(
         iterate_all_neurons, (baselines, weights), None, length=max_iter
     )
     return final_baselines, final_weights
+
+
+def _cast_like_carry(
+    new_baselines: Array, new_weights: Array, baselines: Array, weights: Array
+) -> tuple[Array, Array]:
+    """Cast a Newton step's output back to the dtypes of the scan carry.
+
+    The per-neuron Newton step assembles its Hessian with default-dtype
+    constructors (``jnp.zeros``/``jnp.eye``), so under ``jax_enable_x64`` it
+    promotes float32 parameters to float64. ``lax.scan`` requires the carry
+    dtype to be invariant, so each step's result is cast back: the solve runs
+    in the promoted precision and the parameters keep their input dtype. For
+    float64 parameters the cast is a no-op.
+    """
+    return new_baselines.astype(baselines.dtype), new_weights.astype(weights.dtype)
 
 
 @functools.partial(jax.jit, static_argnames=("max_iter",))
@@ -1645,7 +1660,7 @@ def _mixture_newton_iterations(
         new_baselines, new_weights = jax.vmap(update_neuron, in_axes=(0, 0, 1, 0))(
             baselines, weights, spikes, baseline_prior
         )
-        return (new_baselines, new_weights), None
+        return _cast_like_carry(new_baselines, new_weights, baselines, weights), None
 
     (final_baselines, final_weights), _ = jax.lax.scan(
         iterate_all_neurons, (baselines, weights), None, length=max_iter
@@ -1714,7 +1729,10 @@ def update_spike_glm_params(
     Returns
     -------
     SpikeObsParams
-        Updated baseline and weights for all neurons.
+        Updated baseline and weights for all neurons. With
+        ``use_second_order=True`` they keep the dtypes of ``current_params``
+        (e.g. float32 parameters stay float32 under ``jax_enable_x64``, while
+        each Newton solve runs in the promoted precision).
 
     Notes
     -----
@@ -1823,6 +1841,10 @@ def update_spike_glm_params_mixture(
     keeps the discrete-state mixture inside the Poisson expectation:
 
         sum_j gamma_tj exp(b + w' m_tj + 0.5 w' P_tj w).
+
+    The returned baseline and weights keep the dtypes of ``current_params``
+    (e.g. float32 parameters stay float32 under ``jax_enable_x64``, while each
+    Newton solve runs in the promoted precision).
     """
     spikes = jnp.asarray(spikes)
     state_weights = jnp.asarray(state_weights)

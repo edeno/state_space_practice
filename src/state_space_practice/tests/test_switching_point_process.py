@@ -3352,6 +3352,86 @@ class TestSecondOrderNewtonScan:
             np.testing.assert_allclose(updated.baseline[n], b, rtol=1e-10, atol=1e-12)
             np.testing.assert_allclose(updated.weights[n], w, rtol=1e-10, atol=1e-12)
 
+    @staticmethod
+    def _run_update(pb: dict, method: str, current: SpikeObsParams, cast):
+        """Run one public second-order update, casting the data arrays."""
+        from state_space_practice.switching_point_process import (
+            update_spike_glm_params,
+            update_spike_glm_params_mixture,
+        )
+
+        if method == "second_order":
+            return update_spike_glm_params(
+                spikes=cast(pb["spikes"]),
+                smoother_mean=cast(pb["smoother_mean"]),
+                current_params=current,
+                dt=pb["dt"],
+                max_iter=3,
+                smoother_cov=cast(pb["smoother_cov"]),
+                use_second_order=True,
+                weight_l2=0.1,
+                time_weights=cast(pb["time_weights"]),
+                baseline_prior=cast(pb["baseline_prior"]),
+                baseline_prior_l2=0.5,
+            )
+        return update_spike_glm_params_mixture(
+            spikes=cast(pb["spikes"]),
+            state_cond_smoother_mean=cast(pb["state_mean"]),
+            state_cond_smoother_cov=cast(pb["state_cov"]),
+            state_weights=cast(pb["state_weights"]),
+            current_params=current,
+            dt=pb["dt"],
+            max_iter=3,
+            weight_l2=0.1,
+            baseline_prior=cast(pb["baseline_prior"]),
+            baseline_prior_l2=0.5,
+        )
+
+    @pytest.mark.parametrize("method", ["second_order", "mixture"])
+    @pytest.mark.parametrize("all_float32", [False, True])
+    def test_float32_params_keep_their_dtype(
+        self, method: str, all_float32: bool
+    ) -> None:
+        """float32 parameters under x64 run and come back as float32.
+
+        The Newton solver promotes to float64 internally; the scan carry must
+        still keep the parameters' dtype. The result matches the float64
+        update started from the same (float32-representable) values up to
+        float32 rounding of the per-iteration carry.
+        """
+        pb = self._problem()
+        to_f32 = lambda x: jnp.asarray(x, dtype=jnp.float32)  # noqa: E731
+        to_f64 = lambda x: jnp.asarray(x, dtype=jnp.float64)  # noqa: E731
+        # Round the data through float32 so both runs see identical values.
+        pb = {
+            k: (to_f64(to_f32(v)) if isinstance(v, jax.Array) else v)
+            for k, v in pb.items()
+        }
+        current_f32 = SpikeObsParams(
+            baseline=to_f32(pb["current"].baseline),
+            weights=to_f32(pb["current"].weights),
+        )
+        current_f64 = SpikeObsParams(
+            baseline=to_f64(current_f32.baseline),
+            weights=to_f64(current_f32.weights),
+        )
+
+        updated = self._run_update(
+            pb, method, current_f32, to_f32 if all_float32 else to_f64
+        )
+        reference = self._run_update(pb, method, current_f64, to_f64)
+
+        assert updated.baseline.dtype == jnp.float32
+        assert updated.weights.dtype == jnp.float32
+        # Guard: the solve moved the parameters, so the match is non-vacuous.
+        assert not jnp.allclose(reference.weights, current_f64.weights)
+        np.testing.assert_allclose(
+            updated.baseline, reference.baseline, rtol=1e-4, atol=1e-5
+        )
+        np.testing.assert_allclose(
+            updated.weights, reference.weights, rtol=1e-4, atol=1e-5
+        )
+
 
 class TestSecondOrderClippedWarmStart:
     """Newton M-step must converge from warm starts with a large log-rate.
