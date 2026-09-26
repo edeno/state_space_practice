@@ -236,17 +236,16 @@ class PlaceFieldModel(SGDFittableMixin):
 
     On the block path the model hands the filter the shared spline basis
     ``Z_base`` of shape ``(n_time, n_basis_per_neuron)`` directly -- the
-    block-expanded ``(n_time, n_neurons, n_neurons * n_basis)`` design
+    block-expanded ``(n_time, n_neurons, n_neurons * n_basis_per_neuron)`` design
     matrix (>99% structural zeros) is only ever built for the dense
     fallback -- and stores the posterior covariances as
     :class:`~state_space_practice.point_process_kalman.BlockDiagonalCovariance`
     containers of per-neuron blocks rather than dense zero-padded arrays
     (see the attribute notes below).
 
-    Numerical note: forward-pass equivalence between the dense and
-    block paths is bit-identical (``atol=1e-9`` in the regression
-    tests). Gradient equivalence is bit-identical for ``init_mean``,
-    ``process_cov``, and ``transition_matrix``, but NOT for
+    Numerical note: the dense and block forward passes agree to roundoff
+    (``atol=1e-9`` in the regression tests). Gradients agree to roundoff
+    for ``init_mean``, ``process_cov``, and ``transition_matrix``, but NOT for
     ``init_cov`` — the dense path's autodiff produces spurious
     non-zero gradients on off-block entries of ``init_cov`` that the
     block path never computes (because the block filter only reads
@@ -255,7 +254,7 @@ class PlaceFieldModel(SGDFittableMixin):
     gradient for the block-diagonal parameterization, while the dense
     path has extra off-block noise that EM's M-step projects away.
     For ``fit`` (EM), the two paths agree to ``atol=1e-5``; for
-    ``fit_sgd``, step-0 LL is bit-identical and subsequent steps may
+    ``fit_sgd``, step-0 LL agrees to roundoff and subsequent steps may
     diverge by ~``1e-3`` in LL over tens of iterations without
     meaningful algorithmic difference.
 
@@ -321,11 +320,11 @@ class PlaceFieldModel(SGDFittableMixin):
     Attributes (set after fit)
     --------------------------
     smoother_mean : Array, shape (n_time, n_state)
-        Smoothed weight estimates. For multi-neuron, n_state = n_neurons * n_basis.
+        Smoothed weight estimates. For multi-neuron, n_state = n_neurons * n_basis_per_neuron.
     smoother_cov : Array or BlockDiagonalCovariance, shape (n_time, n_state, n_state)
         Smoothed weight covariances. On the block-diagonal path this is a
         ``BlockDiagonalCovariance`` holding the per-neuron
-        ``(n_neurons, n_time, n_basis, n_basis)`` blocks: it reports the
+        ``(n_neurons, n_time, n_basis_per_neuron, n_basis_per_neuron)`` blocks: it reports the
         dense ``shape``, supports integer time indexing, ``.sum(axis=0)``,
         ``.diagonal()`` and ``.neuron_blocks(j)`` without building the dense
         array, and ``np.asarray`` / ``.to_dense()`` materialise it on demand.
@@ -589,8 +588,8 @@ class PlaceFieldModel(SGDFittableMixin):
         """Expand a per-neuron spline basis into the full design matrix.
 
         For single-neuron, returns ``Z_base`` unchanged (shape
-        ``(n_time, n_basis)``). For multi-neuron, block-diagonalizes into
-        ``(n_time, n_neurons, n_neurons * n_basis)`` so each neuron's
+        ``(n_time, n_basis_per_neuron)``). For multi-neuron, block-diagonalizes into
+        ``(n_time, n_neurons, n_neurons * n_basis_per_neuron)`` so each neuron's
         log-intensity row selects its own weight slice.
 
         Also sets ``self.n_basis``.
@@ -609,7 +608,7 @@ class PlaceFieldModel(SGDFittableMixin):
         Single-neuron models and the block-diagonal path hand the filter the
         shared basis ``Z_base`` ``(n_time, n_basis_per_neuron)`` directly: the
         block-diagonal filter works per neuron from ``Z_base`` and the block
-        ints, so the ``(n_time, n_neurons, n_neurons * n_basis)`` expansion --
+        ints, so the ``(n_time, n_neurons, n_neurons * n_basis_per_neuron)`` expansion --
         more than 99% structural zeros -- is never built on that path. Only
         the dense multi-neuron fallback (``force_dense=True``, a custom
         ``log_intensity_func``, or an M-step that broke the block structure)
@@ -627,8 +626,8 @@ class PlaceFieldModel(SGDFittableMixin):
     ) -> Array:
         """Build the spline design matrix from position data.
 
-        For single-neuron: returns shape (n_time, n_basis).
-        For multi-neuron: returns shape (n_time, n_neurons, n_neurons * n_basis)
+        For single-neuron: returns shape (n_time, n_basis_per_neuron).
+        For multi-neuron: returns shape (n_time, n_neurons, n_neurons * n_basis_per_neuron)
         as a block-diagonal matrix where each neuron selects its own weight slice.
         """
         Z_base = self._build_spline_basis_matrix(position, knots_x, knots_y)
@@ -930,7 +929,7 @@ class PlaceFieldModel(SGDFittableMixin):
 
         Parameters
         ----------
-        design_matrix : Array, shape (n_time, n_basis) or (n_time, n_neurons, n_basis)
+        design_matrix : Array, shape (n_time, n_basis_per_neuron) or (n_time, n_neurons, n_basis)
             Same design matrix passed to the filter/smoother: the shared
             basis ``Z_base`` on the single-neuron and block-diagonal paths,
             the block-expanded matrix on the dense multi-neuron path.
@@ -1228,7 +1227,7 @@ class PlaceFieldModel(SGDFittableMixin):
         # Build the shared spline basis, then (optionally) warm-start. The
         # filter works from Z_base directly on the single-neuron and
         # block-diagonal paths; only the dense multi-neuron fallback expands
-        # it to the (n_time, n_neurons, n_neurons * n_basis) design matrix
+        # it to the (n_time, n_neurons, n_neurons * n_basis_per_neuron) design matrix
         # (see _filter_design_matrix).
         Z_base = self._build_spline_basis_matrix(position, knots_x, knots_y)
         self.n_basis = self.n_neurons * self.n_basis_per_neuron
@@ -1435,9 +1434,8 @@ class PlaceFieldModel(SGDFittableMixin):
 
         # Build the shared spline basis, then (optionally) warm-start.
         #
-        # The ``elif self.init_mean is None`` guard on the cold-start path
-        # is preserved from the pre-refactor behavior. Unlike ``fit`` (EM),
-        # which always resets init state, repeated ``fit_sgd(..., warm_start=
+        # The ``elif self.init_mean is None`` guard on the cold-start path:
+        # unlike ``fit`` (EM), which always resets init state, repeated ``fit_sgd(..., warm_start=
         # False)`` calls on the same model reuse the existing init state —
         # this is intentional for users who want to resume optimization
         # from a previous fit_sgd result without a warm-start reset.

@@ -685,10 +685,7 @@ def _fisher_scoring_line_search(
     the objective *at the current point*. Both are computed exactly once, when
     a point is accepted, and reused as the next iteration's search direction
     and loss reference; the precision at the last accepted point is the
-    returned posterior precision. Compared with recomputing them at the top
-    of every iteration (and once more at the end "for consistency") this is
-    the same arithmetic on the same inputs -- identical numbers -- with one
-    Jacobian / Cholesky per accepted point instead of two.
+    returned posterior precision.
 
     Returns
     -------
@@ -1270,10 +1267,13 @@ def stochastic_point_process_filter(
         Design matrix ($Z_k$) used in the intensity function.
         Shape depends on the log_conditional_intensity function.
         For multi-neuron with default linear intensity, use (n_time, n_neurons, n_params).
-        On the block-diagonal path (``block_n_neurons`` / ``block_size``
-        given) the shared per-neuron basis ``Z_base`` of shape
-        ``(n_time, block_size)`` may be passed instead of the block-expanded
-        matrix; the block filter works from ``Z_base`` directly.
+        On the block-diagonal path -- ``block_n_neurons`` / ``block_size``
+        given, ``force_dense=False`` and the default linear
+        :func:`log_conditional_intensity` -- the shared per-neuron basis
+        ``Z_base`` of shape ``(n_time, block_size)`` may be passed instead of
+        the block-expanded matrix; the block filter works from ``Z_base``
+        directly. Any other configuration takes the dense path, which needs
+        the design matrix in the form ``log_conditional_intensity`` expects.
     spike_indicator : ArrayLike, shape (n_time,) or (n_time, n_neurons)
         Observed spike counts or indicators ($y_k$).
         For single neuron: (n_time,)
@@ -1700,9 +1700,10 @@ def _block_diagonal_smoother_core(
 ) -> tuple[Array, Array, Array, Array, Array, Array]:
     """JIT-compiled per-neuron forward filter plus backward RTS pass.
 
-    Same compile-once contract as :func:`_block_diagonal_forward_core`;
-    the forward core is inlined here so filter and smoother share one
-    compilation per EM iteration.
+    Same compile-once contract as :func:`_block_diagonal_forward_core`:
+    the forward core is inlined, so the forward and backward passes run as
+    one executable, compiled once per (shapes, dtypes, options) and reused
+    on every call.
 
     Returns ``(fwd_means, fwd_covs, lls_per_neuron, smoother_means,
     smoother_covs, smoother_cross_covs)``, all per neuron: means are
@@ -1837,7 +1838,8 @@ def _stochastic_point_process_filter_block_diagonal(
     (a single step size gating all neurons on the summed neg-log-posterior),
     whereas this block path backtracks *per neuron* independently. The
     per-neuron search is arguably better conditioned, but the resulting
-    means and log-likelihoods are no longer bit-identical to the dense path.
+    means and log-likelihoods no longer agree with the dense path to
+    roundoff.
 
     Output shape compatibility
     --------------------------
@@ -1934,8 +1936,8 @@ def _stochastic_point_process_smoother_block_diagonal(
     backward pass per-neuron is mathematically identical to running it
     on the full dense state *given the same filtered inputs*. The forward
     filter it consumes carries the same caveat as
-    ``_stochastic_point_process_filter_block_diagonal``: the two paths are
-    bit-identical only for ``max_newton_iter == 1``; for
+    ``_stochastic_point_process_filter_block_diagonal``: the two paths
+    agree to roundoff only for ``max_newton_iter == 1``; for
     ``max_newton_iter > 1`` the per-neuron vs global line search makes the
     filtered moments (and hence the smoothed output) differ from the dense
     path.
@@ -2059,7 +2061,10 @@ def stochastic_point_process_smoother(
         Initial covariance of the latent state ($P_0$).
     design_matrix : ArrayLike, shape (n_time, ...) or (n_time, n_neurons, n_params)
         Design matrix ($Z_k$) used in the intensity function.
-        Shape depends on the log_conditional_intensity function.
+        Shape depends on the log_conditional_intensity function. On the
+        block-diagonal path the shared per-neuron basis ``Z_base`` of shape
+        ``(n_time, block_size)`` may be passed instead (see
+        :func:`stochastic_point_process_filter`).
     spike_indicator : ArrayLike, shape (n_time,) or (n_time, n_neurons)
         Observed spike counts or indicators ($y_k$).
         For single neuron: (n_time,)
@@ -2087,13 +2092,22 @@ def stochastic_point_process_smoother(
     -------
     smoother_mean : Array, shape (n_time, n_params)
         Smoothed posterior means ($x_{k|T}$).
-    smoother_cov : Array, shape (n_time, n_params, n_params)
-        Smoothed posterior covariances ($P_{k|T}$).
-    smoother_cross_cov : Array, shape (n_time - 1, n_params, n_params)
+    smoother_cov : Array or BlockDiagonalCovariance, shape (n_time, n_params, n_params)
+        Smoothed posterior covariances ($P_{k|T}$); a
+        :class:`BlockDiagonalCovariance` of the same dense shape when
+        ``return_block_covariances`` applies.
+    smoother_cross_cov : Array or BlockDiagonalCovariance, shape (n_time - 1, n_params, n_params)
         Smoothed lag-one cross-covariances, indexed as
-        ``Cov(x_t, x_{t+1} | y_{1:T})`` for ``t = 0, ..., T - 2``.
+        ``Cov(x_t, x_{t+1} | y_{1:T})`` for ``t = 0, ..., T - 2``; a
+        :class:`BlockDiagonalCovariance` when ``return_block_covariances``
+        applies.
     marginal_log_likelihood : Array
         Total log-likelihood of the observations given the model (scalar array).
+    filtered_mean, filtered_cov : Array, optional
+        Only with ``return_filtered=True``: the filter output, as returned by
+        :func:`stochastic_point_process_filter` (``filtered_cov`` is a
+        :class:`BlockDiagonalCovariance` when ``return_block_covariances``
+        applies).
 
     Notes
     -----
@@ -2367,7 +2381,10 @@ def get_confidence_interval(
     Parameters
     ----------
     posterior_mean : ArrayLike, shape (n_time, n_params)
-    posterior_covariance : ArrayLike, shape (n_time, n_params, n_params)
+    posterior_covariance : ArrayLike or BlockDiagonalCovariance, shape (n_time, n_params, n_params)
+        Dense covariances, or a :class:`BlockDiagonalCovariance` (whose
+        marginal variances are read from the per-neuron blocks without
+        materialising the dense array).
     alpha : float, optional
         Significance level in ``(0, 1)``, by default ``0.05``. Returns a
         ``1 - alpha`` confidence interval (i.e. the default 0.05 gives a
