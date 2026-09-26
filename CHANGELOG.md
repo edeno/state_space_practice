@@ -7,6 +7,31 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Public API and version at package level**: `state_space_practice.__version__`
+  and lazily loaded (PEP 562) entry points — `kalman_filter`, `kalman_smoother`,
+  `switching_kalman_filter`, `switching_kalman_smoother`, `run_em`,
+  `PointProcessModel`, `PlaceFieldModel`, `PositionDecoder`,
+  `CommonOscillatorModel`, `CorrelatedNoiseModel`, `DirectedInfluenceModel`,
+  `SwitchingSpikeOscillatorModel`, `MultinomialChoiceModel`,
+  `CovariateChoiceModel`, `SwitchingChoiceModel`, `ContingencyBeliefModel`,
+  `SmithLearningModel`. `import state_space_practice` imports only JAX.
+- **`state_space_practice.exceptions`**: `StateSpaceWarning` (a `UserWarning`
+  subclass; all library `UserWarning`s now use it) and `NotFittedError` (a
+  `RuntimeError` subclass).
+- **Float64 import warning**: importing the package with `jax_enable_x64` off
+  emits a `StateSpaceWarning` with the enable-x64 recipe.
+- **`kalman.kalman_filter_update` / `kalman.kalman_smoother_update`**: public
+  names for the single-step Kalman updates.
+- **Optional extras** `plot` (matplotlib) and `notebooks` (matplotlib, pandas).
+- **Tooling**: GitHub Actions CI (ruff, ruff format, mypy on the type-clean
+  modules, fast tests on Python 3.10-3.12, nightly full suite),
+  `.pre-commit-config.yaml` (ruff, ruff-format, nbstripout), `[tool.ruff]`
+  config, and `HYPOTHESIS_PROFILE` selection in the test conftest. mypy gates
+  the 24 modules listed in `[tool.mypy] files`; `mypy src/state_space_practice`
+  still reports 142 errors in the other 21 modules (was 150 before the
+  `fit_sgd` override fix).
+- Tests that call `.fit(` / `.fit_sgd(` / `run_em(` (outside `pytest.raises`)
+  are marked `slow` automatically at collection.
 - **`em_driver.run_em`**: the shared EM loop (E-step, convergence, rollback,
   M-step) used by the oscillator models, `PointProcessModel`, `PlaceFieldModel`,
   the switching point-process models and `SmithLearningModel`. Invalid option
@@ -25,6 +50,26 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **Runtime dependencies trimmed** to what the package imports: numpy, scipy,
+  jax, optax, patsy, networkx, scikit-learn (with minimum versions).
+  matplotlib moved to the `plot` extra; pandas to `notebooks`; jaxlib (pulled
+  in by jax), xarray, tqdm, track_linearization and seaborn are no longer
+  dependencies. Install `state_space_practice[plot]` for the `plot_*` helpers.
+- **The wheel no longer ships the test suite** (`state_space_practice.tests`).
+- **`verbose=True` progress** in `fit_sgd` (all models), `PlaceFieldModel.fit`
+  and `SmithLearningModel.fit` is logged at INFO on the module logger instead
+  of printed to stdout (enable with `logging.basicConfig(level=logging.INFO)`).
+  `SmithLearningModel`'s per-iteration record is DEBUG unless `verbose=True`.
+- **Not-fitted errors are `NotFittedError`** (still a `RuntimeError`) in
+  `PlaceFieldModel`, `TemporalRateGP`, the oscillator models, the switching
+  point-process models' `decode` / `predict_proba` and the choice models.
+  `PlaceFieldModel.n_free_params` on an unfitted model raises it instead of
+  an `AssertionError`.
+- **`SGDFittableMixin.fit_sgd` is declared `(*args, **kwargs)`**; the optimizer
+  settings (`optimizer`, `num_steps`, `verbose`, `convergence_tol`) are still
+  keyword-only with the same defaults.
+- **pytest no longer ignores all `DeprecationWarning`s**; they are errors like
+  every other warning.
 - **`PlaceFieldModel.smoother_cov` / `smoother_cross_cov` / `filtered_cov`**
   hold a `BlockDiagonalCovariance` when a multi-neuron model runs on the
   block-diagonal path (dense arrays otherwise). Integer/slice indexing,
@@ -60,7 +105,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `time_bins` length that does not match the number of bins (previously
   accepted silently).
 
+### Deprecated
+
+- **`models.stochastic_point_process_filter`** (observed-Hessian SSPPF) will be
+  removed in **0.2.0**; use `point_process_kalman.stochastic_point_process_filter`.
+  The warning and docstring now state the removal version.
+
 ### Removed
+
+- `environment.yml` / `environment_gpu.yml` (superseded by `pyproject.toml` +
+  `uv.lock`) and `black` from the `test` extra.
+- `scripts/_test_gaussian_boundary.py` (assertion-free scipy exploration).
 
 - **`switching_kalman_smoother(last_filter_conditional_cont_mean=...)`**: the
   argument was never read. Drop it from calls.
@@ -73,6 +128,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`simulate.simulate_switching_kalman.simulate_challenging_states`**: unused.
 
 ### Fixed
+
+- **Fresh clones install**: the `neurospatial` source no longer points at a
+  sibling `../neurospatial` checkout; uv resolves it from a git commit that
+  declares version 0.8.0 (neurospatial 0.8.0 is not on PyPI yet, so pip users
+  of the `spatial` extra must install it from GitHub first; see README).
+- `import state_space_practice.kalman` no longer imports `scipy.optimize`,
+  `patsy` or `sklearn` (deferred to the functions that use them); its import
+  time roughly halves.
+- `warnings.warn` calls in the library pass `stacklevel=2`.
 
 - **`PlaceFieldModel` block-diagonal path uses each neuron's own A and Q
   blocks.** Previously it required identical blocks, so `fit_sgd` trained only
