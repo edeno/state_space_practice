@@ -1,12 +1,13 @@
 """Shared EM driver: the E-step / convergence / rollback / M-step loop.
 
-Every EM-fitted model in the library runs the same skeleton -- E-step,
-non-finite check, convergence and log-likelihood-decrease checks, snapshot,
-M-step, and a final E-step that re-syncs the posteriors with the last M-step
--- but the models had each grown their own copy of it, with slightly different
-rollback policies.  :func:`run_em` is that skeleton written once; the policy
-differences are explicit keyword options so each model's ``fit`` states what
-it does instead of re-implementing the loop.
+:func:`run_em` implements the EM skeleton -- E-step, non-finite check,
+convergence and log-likelihood-decrease checks, snapshot, M-step, and a final
+E-step that re-syncs the posteriors with the last M-step -- once, with the
+rollback-policy differences between models exposed as keyword options.  The
+oscillator, point-process, place-field, switching point-process and Smith
+learning models fit through it.  The choice and belief models
+(``multinomial_choice``, ``covariate_choice``, ``switching_choice``,
+``contingency_belief``) still run their own EM loops.
 
 The driver never touches model attributes directly.  It talks to the model
 through four callables (``e_step``, ``m_step``, ``snapshot``, ``restore``) so
@@ -37,10 +38,14 @@ class EMResult:
     Attributes
     ----------
     log_likelihoods : list[float]
-        Marginal log-likelihood of every *accepted* E-step, in order.  A
-        non-finite or rolled-back E-step is never left in the history.
+        Marginal log-likelihood of every *accepted* E-step, in order,
+        including an accepted post-convergence, post-``max_iter`` or
+        best-state E-step.  A non-finite or rolled-back E-step is never left
+        in the history; with ``stop_on_decrease=False`` a decreasing E-step
+        is accepted and stays in it.
     converged : bool
-        True when the relative change fell below ``tol`` before ``max_iter``.
+        True when the relative change fell below ``tol`` before ``max_iter``
+        (still True if the ``m_step_on_convergence`` step was rolled back).
     reached_max_iter : bool
         True when the loop ran all ``max_iter`` iterations without stopping.
     """
@@ -75,50 +80,81 @@ def run_em(
     Each iteration calls ``e_step`` (which must install the posteriors on the
     model and return the marginal log-likelihood), checks the result, takes a
     ``snapshot`` of the accepted (parameters, posteriors) pair, then calls
-    ``m_step``.  A later E-step that is non-finite or decreases the
-    log-likelihood ``restore``\\ s that snapshot, so the model is always left
-    with a parameter set and posteriors that belong together.
+    ``m_step``.  If ``max_iter`` is exhausted, one more E-step syncs the
+    posteriors with the last M-step.
+
+    What the model holds when ``run_em`` returns:
+
+    - After a *rollback* -- a non-finite E-step once a step has been accepted,
+      a decrease beyond ``decrease_tol`` with ``stop_on_decrease=True``, or a
+      rejected post-convergence / post-``max_iter`` E-step -- the last
+      accepted snapshot is ``restore``\\ d, so parameters and posteriors belong
+      together (with ``refresh_after_restore`` the posteriors are recomputed,
+      and a non-finite recomputation is warned about).
+    - If the *first* E-step is non-finite there is nothing to roll back to:
+      ``"break"`` and ``"raise"`` leave that E-step's non-finite posteriors
+      installed; ``"clear"`` calls ``clear_state`` to remove them.
+    - With ``stop_on_decrease=False`` a decreasing E-step is kept, so the
+      model holds the latest iterate, not the best one, unless
+      ``track_best`` restores the best accepted state at the end.
 
     Parameters
     ----------
     e_step, m_step, snapshot, restore : callable
         The model hooks.  ``restore`` receives whatever ``snapshot`` returned.
+        ``snapshot`` must return a value that later ``m_step``/``e_step``
+        calls cannot change: immutable JAX arrays can be referenced, but a
+        container that ``m_step`` mutates in place must be copied (the
+        oscillator models deep-copy ``_current_osc_params`` for this reason),
+        or a rollback silently restores the mutated state.
     max_iter : int
-        Maximum number of EM iterations.
+        Maximum number of EM iterations (at least 1).
     tol : float
         Relative log-likelihood change below which EM has converged (see
         :func:`state_space_practice.utils.check_converged`).
     decrease_tol : float or None
-        Relative decrease that counts as a rejected step.  Defaults to ``tol``.
-        Approximate E-steps (Laplace, GPB) can set a more lenient value so
-        sub-tolerance decreases are treated as noise instead of divergence.
+        Relative decrease beyond which an E-step counts as a decrease (rolled
+        back, or only warned about when ``stop_on_decrease=False``).
+        Defaults to ``tol``.  Approximate E-steps (Laplace, GPB) can set a
+        more lenient value so sub-tolerance decreases are treated as noise
+        instead of divergence.
     on_first_nonfinite : {"break", "raise", "clear"}
         What to do when an E-step is non-finite before any step was accepted:
-        stop quietly, raise ``ValueError``, or call ``clear_state`` (drop the
-        NaN posteriors) and stop.  With an accepted step available the driver
-        always rolls back to it and stops.
+        warn and stop, raise ``ValueError``, or call ``clear_state``, warn and
+        stop.  Once a step has been accepted, a non-finite E-step always rolls
+        back to it, warns, and stops, whatever this policy.
     clear_state : callable or None
-        Used by the ``"clear"`` policy.
+        Removes the non-finite posteriors under the ``"clear"`` policy.
+        Required with ``"clear"`` and not allowed with the other policies.
     stop_on_decrease : bool
         Roll back and stop on a decrease (default) or warn and continue.
     require_increase_to_converge : bool
-        Only declare convergence on a non-decreasing step (used together
-        with ``stop_on_decrease=False``).
+        Do not declare convergence on a step that is itself a decrease
+        (used together with ``stop_on_decrease=False``).  A step within
+        ``tol`` can only be a decrease beyond ``decrease_tol`` when
+        ``decrease_tol < tol``, so this has no effect otherwise.
     refresh_after_restore : bool
-        Re-run ``e_step`` after every ``restore`` so posteriors stored by the
-        E-step are recomputed under the restored parameters (for models whose
-        snapshot holds parameters only).
+        Re-run ``e_step`` after every rollback ``restore`` so posteriors
+        stored by the E-step are recomputed under the restored parameters
+        (for models whose snapshot holds parameters only).
     track_best : bool
-        Remember the best accepted state and restore it at the end if the
-        final log-likelihood is below it (for approximate EM that may drift).
+        Remember the highest-log-likelihood E-step's snapshot and, if the
+        final log-likelihood is below it, restore that snapshot, re-run
+        ``e_step`` under it and append that log-likelihood when it is finite
+        and differs from the last entry (for approximate EM that may drift).
     m_step_on_convergence : bool
         On convergence, run one more M-step plus a synchronising E-step,
-        rolling back if that final E-step does not improve.
+        and roll back to the converged iterate if that E-step is non-finite
+        or decreases the log-likelihood by more than ``decrease_tol``.
     logger : logging.Logger or None
         Logger for info messages; defaults to this module's logger.
     on_iteration : callable or None
         ``on_iteration(iteration, log_likelihood, change)`` progress hook,
-        called after every E-step.  Defaults to a ``logger.info`` line.
+        called after each main-loop E-step (before it is checked, so also
+        for one that is then rejected), where ``change`` is the difference
+        from the previous main-loop E-step and NaN on the first iteration.
+        It is not called for the refresh, post-convergence, post-``max_iter``
+        or best-state E-steps.  Defaults to a ``logger.info`` line.
     warn : callable or None
         Sink for warning messages; defaults to ``logger.warning``.  Models
         that also print progress pass a hook that does both.
@@ -126,6 +162,16 @@ def run_em(
     Returns
     -------
     EMResult
+        The accepted log-likelihood history and whether EM converged or ran
+        out of iterations.
+
+    Raises
+    ------
+    ValueError
+        If ``max_iter < 1``, ``on_first_nonfinite`` is not one of the three
+        policies, or ``clear_state`` is given without (or missing with) the
+        ``"clear"`` policy -- all checked before any E-step.  Also raised by
+        the ``"raise"`` policy when the first E-step is non-finite.
     """
     if max_iter < 1:
         raise ValueError(f"max_iter must be at least 1, got {max_iter}.")
