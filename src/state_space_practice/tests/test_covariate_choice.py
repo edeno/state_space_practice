@@ -979,6 +979,53 @@ class TestObservationCovariates:
             m.fit(np.array([0, 1, 2, 1, 0]))
 
 
+class TestChoiceInputValidation:
+    """Choices are validated once, through ``_prepare_choices``, with a clear
+    ValueError for malformed shapes."""
+
+    @pytest.mark.parametrize("method", ["fit", "fit_sgd"])
+    @pytest.mark.parametrize(
+        "choices", [np.int64(1), np.array(1), np.zeros((4, 2), dtype=int)],
+        ids=["numpy_scalar", "0d_array", "2d_array"],
+    )
+    def test_non_1d_choices_raise_value_error(self, method, choices):
+        model = CovariateChoiceModel(n_options=3, n_covariates=1)
+        with pytest.raises(ValueError, match="choices must be a 1-D array"):
+            getattr(model, method)(choices, covariates=np.zeros((4, 1)))
+        assert model._covariates is None  # nothing was bound
+
+    def test_multinomial_0d_choices_raise_value_error(self):
+        with pytest.raises(ValueError, match="choices must be a 1-D array"):
+            MultinomialChoiceModel(n_options=3).fit(np.array(2))
+
+    def test_non_2d_covariates_raise_value_error(self):
+        model = CovariateChoiceModel(n_options=3, n_covariates=1)
+        with pytest.raises(ValueError, match="covariates must be a 2-D"):
+            model.fit(np.zeros(10, dtype=int), covariates=np.zeros(10))
+
+    @pytest.mark.parametrize("method", ["fit", "fit_sgd"])
+    def test_choices_validated_once(self, method, monkeypatch):
+        from state_space_practice import multinomial_choice
+
+        calls = []
+        original = multinomial_choice._validate_choices
+
+        def counting(*args, **kwargs):
+            calls.append(None)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(multinomial_choice, "_validate_choices", counting)
+        rng = np.random.default_rng(0)
+        model = CovariateChoiceModel(n_options=3, n_covariates=1)
+        kwargs = {"max_iter": 1} if method == "fit" else {"num_steps": 0}
+        getattr(model, method)(
+            rng.integers(0, 3, 20), covariates=rng.standard_normal((20, 1)),
+            **kwargs,
+        )
+        assert len(calls) == 1
+        assert model._n_trials == 20
+
+
 class TestRejectedFitPreservesState:
     """A fit / fit_sgd call that fails validation leaves the previous fit intact.
 

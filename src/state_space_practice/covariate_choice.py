@@ -475,6 +475,11 @@ def _coerce_covariates(
             f"{method}()"
         )
     arr = jnp.asarray(values)
+    if arr.ndim != 2:
+        raise ValueError(
+            f"{name} must be a 2-D (n_trials, {size_name}) array, got shape "
+            f"{arr.shape}"
+        )
     if arr.shape[1] != n_expected:
         raise ValueError(
             f"{name} has {arr.shape[1]} columns but model expects "
@@ -685,12 +690,13 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         covariates: ArrayLike | None,
         obs_covariates: ArrayLike | None,
         method: str,
-    ) -> None:
+    ) -> Array:
         """Validate the fit inputs, then store the covariates used by the fit.
 
-        Everything (covariates and choices) is validated before anything is
-        assigned, so a call rejected by validation leaves a previous fit's
-        covariates and trial count untouched.
+        Everything (covariates, then choices through the shared
+        ``_prepare_choices``) is validated before anything is assigned, so a
+        call rejected by validation leaves a previous fit's covariates and
+        trial count untouched. Returns the validated int32 choices.
         """
         covariates_arr = _coerce_covariates(
             covariates, self.n_covariates, "covariates", "n_covariates", method
@@ -699,14 +705,12 @@ class CovariateChoiceModel(MultinomialChoiceModel):
             obs_covariates, self.n_obs_covariates, "obs_covariates",
             "n_obs_covariates", method,
         )
-        n_trials = np.asarray(choices).shape[0]
-        if n_trials < 2:
-            raise ValueError(
-                f"{method}() needs at least 2 trials, got {n_trials}"
-            )
-        validate_choice_indices(choices, self.n_options)
+        choices_arr = self._prepare_choices(
+            choices, "EM" if method == "fit" else "SGD"
+        )
         self._covariates = covariates_arr
         self._obs_covariates = obs_covariates_arr
+        return choices_arr
 
     def fit(
         self,
@@ -742,14 +746,10 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         -------
         log_likelihoods : list of float
         """
-        self._bind_covariates(choices, covariates, obs_covariates, "fit")
-        return super().fit(
-            choices,
-            max_iter=max_iter,
-            tolerance=tolerance,
-            verbose=verbose,
-            beta_grid=beta_grid,
+        choices_arr = self._bind_covariates(
+            choices, covariates, obs_covariates, "fit"
         )
+        return self._fit_em(choices_arr, max_iter, tolerance, verbose, beta_grid)
 
     def fit_sgd(
         self,
@@ -784,13 +784,11 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         -------
         log_likelihoods : list of float
         """
-        self._bind_covariates(choices, covariates, obs_covariates, "fit_sgd")
-        return super().fit_sgd(
-            choices,
-            optimizer=optimizer,
-            num_steps=num_steps,
-            verbose=verbose,
-            convergence_tol=convergence_tol,
+        choices_arr = self._bind_covariates(
+            choices, covariates, obs_covariates, "fit_sgd"
+        )
+        return self._fit_sgd_validated(
+            choices_arr, optimizer, num_steps, verbose, convergence_tol
         )
 
     # --- SGDFittableMixin protocol ---

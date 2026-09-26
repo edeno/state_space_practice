@@ -594,18 +594,32 @@ class MultinomialChoiceModel(SGDFittableMixin):
         self.surprise_ = compute_surprise(pred_probs, choices)
 
     def _prepare_choices(self, choices: ArrayLike, method: str) -> Array:
-        """Validate ``choices`` for fitting, record ``_n_trials``, return int32."""
-        choices_arr = jnp.asarray(choices, dtype=jnp.int32)
-        n_trials = int(choices_arr.shape[0])
+        """Validate ``choices`` for fitting, record ``_n_trials``, return int32.
 
+        The single validation point for ``fit`` / ``fit_sgd`` (subclasses
+        route through it too). Nothing is recorded unless every check passes.
+
+        Raises
+        ------
+        ValueError
+            If ``choices`` is not 1-D, has fewer than 2 trials, or contains
+            indices outside ``[0, n_options)``.
+        """
+        choices_np = np.asarray(choices)
+        if choices_np.ndim != 1:
+            raise ValueError(
+                f"choices must be a 1-D array with one entry per trial, got "
+                f"shape {choices_np.shape}."
+            )
+        n_trials = int(choices_np.shape[0])
         if n_trials < 2:
             raise ValueError(
                 f"Need at least 2 trials for {method} fitting, got {n_trials}"
             )
 
-        _validate_choices(choices, self.n_options)
+        _validate_choices(choices_np, self.n_options)
         self._n_trials = n_trials
-        return choices_arr
+        return jnp.asarray(choices_np, dtype=jnp.int32)
 
     def fit(
         self,
@@ -637,7 +651,17 @@ class MultinomialChoiceModel(SGDFittableMixin):
             Log-likelihood at each EM iteration.
         """
         choices_arr = self._prepare_choices(choices, "EM")
+        return self._fit_em(choices_arr, max_iter, tolerance, verbose, beta_grid)
 
+    def _fit_em(
+        self,
+        choices_arr: Array,
+        max_iter: int,
+        tolerance: float,
+        verbose: bool,
+        beta_grid: ArrayLike | None,
+    ) -> list[float]:
+        """EM loop on choices already validated by ``_prepare_choices``."""
         if beta_grid is None:
             beta_grid = jnp.array(_DEFAULT_BETA_GRID)
         else:
@@ -731,7 +755,19 @@ class MultinomialChoiceModel(SGDFittableMixin):
         log_likelihoods : list of float
         """
         choices_arr = self._prepare_choices(choices, "SGD")
+        return self._fit_sgd_validated(
+            choices_arr, optimizer, num_steps, verbose, convergence_tol
+        )
 
+    def _fit_sgd_validated(
+        self,
+        choices_arr: Array,
+        optimizer: object | None,
+        num_steps: int,
+        verbose: bool,
+        convergence_tol: float | None,
+    ) -> list[float]:
+        """SGD fit on choices already validated by ``_prepare_choices``."""
         return super().fit_sgd(
             choices_arr,
             optimizer=optimizer,
