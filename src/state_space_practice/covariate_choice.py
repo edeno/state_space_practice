@@ -566,6 +566,19 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         learn_decay: bool = False,
         learn_obs_weights: bool = True,
     ):
+        """Initialize parameters (see the class docstring for arguments).
+
+        ``input_gain_`` (shape ``(n_options - 1, max(n_covariates, 1))``) and
+        ``obs_weights_`` (shape ``(n_options, max(n_obs_covariates, 1))``)
+        start at zero, so the untrained model is the plain random walk.
+
+        Raises
+        ------
+        ValueError
+            If ``init_decay`` is outside ``(0, 1]``, or for the base-class
+            checks (``n_options < 2``, ``init_inverse_temperature <= 0``,
+            ``init_process_noise < 0``).
+        """
         super().__init__(
             n_options,
             init_inverse_temperature=init_inverse_temperature,
@@ -947,9 +960,27 @@ class CovariateChoiceModel(MultinomialChoiceModel):
     def plot_input_gains(self, option_labels=None, covariate_labels=None, ax=None):
         """Bar plot of the learned input-gain matrix B.
 
+        Requires the ``plot`` extra (matplotlib).
+
+        Parameters
+        ----------
+        option_labels : list of str or None
+            Labels for the ``n_options - 1`` non-reference options (rows of
+            B). Default ``"Option 1"``, ``"Option 2"``, ...
+        covariate_labels : list of str or None
+            Labels for the covariates (columns of B). Default ``"Cov 0"``, ...
+        ax : matplotlib Axes or None
+            Axes to draw into; a new figure is created when None.
+
         Returns
         -------
-        fig, ax
+        fig : matplotlib Figure
+        ax : matplotlib Axes
+
+        Raises
+        ------
+        NotFittedError
+            If the model has not been fitted.
         """
         import matplotlib.pyplot as plt
 
@@ -986,9 +1017,27 @@ class CovariateChoiceModel(MultinomialChoiceModel):
     def plot_summary(self, observed_choices=None, option_labels=None):
         """3-panel diagnostic: values, input gains, convergence.
 
+        Requires the ``plot`` extra (matplotlib).
+
+        Parameters
+        ----------
+        observed_choices : ArrayLike or None
+            Accepted for signature compatibility with
+            :meth:`MultinomialChoiceModel.plot_summary`; not drawn here.
+        option_labels : list of str or None
+            One label per option (including the reference option 0).
+            Default ``"Option 0"``, ``"Option 1"``, ...
+
         Returns
         -------
-        fig, axes : array of 3 Axes
+        fig : matplotlib Figure
+        axes : np.ndarray of 3 matplotlib Axes
+            Smoothed values, input gains and log-likelihood convergence.
+
+        Raises
+        ------
+        NotFittedError
+            If the model has not been fitted.
         """
         import matplotlib.pyplot as plt
         from matplotlib.gridspec import GridSpec

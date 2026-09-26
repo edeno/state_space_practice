@@ -977,7 +977,33 @@ class SwitchingChoiceModel(SGDFittableMixin):
         verbose: bool = False,
         convergence_tol=None,
     ) -> list[float]:
-        """Fit by minimizing negative marginal LL via gradient descent."""
+        """Fit by minimizing negative marginal LL via gradient descent.
+
+        Parameters
+        ----------
+        choices : ArrayLike, shape (n_trials,)
+            Observed choices, integers in ``[0, n_options)``.
+        covariates : ArrayLike or None, shape (n_trials, n_covariates)
+            Dynamics covariates driving the per-state value updates. None =
+            no covariate drive.
+        obs_covariates : ArrayLike or None, shape (n_trials, n_obs_covariates)
+            Observation covariates biasing choice probabilities. None = no
+            bias.
+        optimizer : optax optimizer or None
+            Default: adam(1e-2) with gradient clipping.
+        num_steps : int
+            Number of optimization steps.
+        verbose : bool
+            Log progress every 10 steps (INFO level).
+        convergence_tol : float or None
+            Stop early when the relative LL change stays below this for 5
+            consecutive steps.
+
+        Returns
+        -------
+        log_likelihoods : list of float
+            Marginal log-likelihood per optimization step.
+        """
         validate_choice_indices(choices, self.n_options)
         choices = jnp.asarray(choices, dtype=jnp.int32)
         self._n_trials = int(choices.shape[0])

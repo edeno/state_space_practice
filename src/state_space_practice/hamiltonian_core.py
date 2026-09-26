@@ -73,11 +73,31 @@ def gaussian_measurement_update(
 ) -> tuple[Array, Array, Array]:
     """Standard Kalman update for a linear-Gaussian observation y ~ N(C x + d, R).
 
+    Parameters
+    ----------
+    m_pred : Array, shape (n,)
+        Predicted (prior) state mean.
+    P_pred : Array, shape (n, n)
+        Predicted (prior) state covariance.
+    y : Array, shape (n_obs,)
+        Observation at this step. ``n_obs = 0`` is allowed and returns the
+        prior unchanged with zero log-likelihood.
+    C : Array, shape (n_obs, n)
+        Observation matrix.
+    d : Array, shape (n_obs,)
+        Observation offset.
+    R : Array, shape (n_obs, n_obs)
+        Observation noise covariance (positive definite).
+    include_normalization_const : bool, default True
+        Whether to include the ``-0.5 * n_obs * log(2π)`` term in the
+        log-likelihood.
+
     Returns
     -------
-    m_post : (n,)
-    P_post : (n, n) — Joseph-form for PSD preservation
-    log_likelihood : ()
+    m_post : Array, shape (n,)
+    P_post : Array, shape (n, n)
+        Joseph-form update, for PSD preservation.
+    log_likelihood : Array, shape ()
         Per-step Gaussian marginal log-likelihood. Set
         ``include_normalization_const=False`` to drop the
         ``n_obs * log(2π)`` constant — useful for *relative* likelihoods

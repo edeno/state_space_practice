@@ -44,6 +44,31 @@ class HamiltonianLFPModel(HamiltonianModelBase):
         seed: int = 42,
         obs_noise_std: float = 0.1,
     ):
+        """Build the model with random initial weights.
+
+        Parameters
+        ----------
+        n_oscillators : int
+            Number of latent oscillators; the state holds one position and
+            one momentum per oscillator (``n_cont_states = 2 * n_oscillators``).
+        n_sources : int
+            Number of LFP channels.
+        sampling_freq : float
+            Sampling rate in Hz; the leapfrog step is ``1 / sampling_freq``.
+        hidden_dims : list of int or None
+            Hidden-layer widths of the MLP that parameterizes the Hamiltonian
+            (default ``[32, 32]``).
+        seed : int
+            Seed for the initial MLP and observation weights.
+        obs_noise_std : float
+            Initial LFP noise standard deviation; the measurement covariance
+            starts at ``obs_noise_std**2 * I`` and is learned by ``fit_sgd``.
+
+        Raises
+        ------
+        ValueError
+            If ``obs_noise_std`` is not a positive finite scalar.
+        """
         super().__init__(
             n_oscillators=n_oscillators,
             n_discrete_states=1,

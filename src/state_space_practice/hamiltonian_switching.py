@@ -419,6 +419,28 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         hidden_dims: list[int] | None = None,
         seed: int = 42,
     ):
+        """Build the model with one Hamiltonian (MLP, omega) per discrete state.
+
+        Parameters
+        ----------
+        n_oscillators : int
+            Number of latent oscillators (``n_cont_states = 2 * n_oscillators``).
+        n_discrete_states : int
+            Number of dynamical regimes, each with its own energy landscape.
+            The discrete transition matrix starts at ``0.95 * I + 0.05 / S``
+            and the initial regime distribution is uniform.
+        n_lfp_sources : int
+            Number of LFP channels (Gaussian head, shared across regimes).
+        n_spike_sources : int
+            Number of neurons (Poisson head, shared across regimes).
+        sampling_freq : float
+            Sampling rate in Hz, common to both modalities.
+        hidden_dims : list of int or None
+            Hidden-layer widths of the MLP that parameterizes the Hamiltonian
+            (default ``[32, 32]``).
+        seed : int
+            Seed for the initial MLP and observation weights.
+        """
         super().__init__(
             n_oscillators=n_oscillators,
             n_lfp_sources=n_lfp_sources,

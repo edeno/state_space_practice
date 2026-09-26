@@ -50,6 +50,23 @@ class HamiltonianSpikeModel(HamiltonianModelBase):
         hidden_dims: list[int] | None = None,
         seed: int = 42,
     ):
+        """Build the model with random initial weights.
+
+        Parameters
+        ----------
+        n_oscillators : int
+            Number of latent oscillators; the state holds one position and
+            one momentum per oscillator (``n_cont_states = 2 * n_oscillators``).
+        n_sources : int
+            Number of neurons (spike-count channels).
+        sampling_freq : float
+            Sampling rate in Hz; also the bin rate of the spike counts.
+        hidden_dims : list of int or None
+            Hidden-layer widths of the MLP that parameterizes the Hamiltonian
+            (default ``[32, 32]``).
+        seed : int
+            Seed for the initial MLP and observation weights.
+        """
         super().__init__(
             n_oscillators=n_oscillators,
             n_discrete_states=1,

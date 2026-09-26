@@ -911,6 +911,20 @@ class ContingencyBeliefModel(SGDFittableMixin):
         transition_regularization: float = 1e-5,
         seed: int | None = None,
     ):
+        """Initialize parameters (see the class docstring for arguments).
+
+        ``reward_probs_`` start near 0.5 with a small fixed-seed per-state
+        perturbation, ``state_values_`` near 0, and the transition
+        coefficients encode a diagonal transition matrix with self-transition
+        probability ``init_diagonal``.
+
+        Raises
+        ------
+        ValueError
+            If ``n_states < 2``, ``n_options < 2``,
+            ``init_inverse_temperature <= 0``, ``init_diagonal`` is outside
+            ``[0, 1]``, ``concentration <= 0`` or ``stickiness < 0``.
+        """
         if n_states < 2:
             raise ValueError(
                 f"n_states must be >= 2 (a single state has nothing to infer); "
@@ -1315,7 +1329,27 @@ class ContingencyBeliefModel(SGDFittableMixin):
         """Predict smoothed state posterior for given data.
 
         Always builds a fresh design matrix from the input length — does
-        not reuse the training design matrix.
+        not reuse the training design matrix. The fitted parameters are
+        used as-is; the model's stored design matrices are restored
+        afterwards.
+
+        Parameters
+        ----------
+        choices : ArrayLike, shape (n_trials,)
+            Chosen option per trial, integers in ``[0, n_options)``.
+        rewards : ArrayLike, shape (n_trials,)
+            Binary reward per trial.
+        transition_covariates : ArrayLike or None, shape (n_trials, d_h)
+            Covariates for the transition design matrix; must match the
+            covariates used in fitting. None = intercept-only.
+        obs_design_matrix : ArrayLike or None, shape (n_trials, n_obs_covariates)
+            Observation covariates for action biases. None = no
+            observation offset.
+
+        Returns
+        -------
+        smoothed_state_prob : Array, shape (n_trials, n_states)
+            ``P(s_t = k | choices, rewards)`` for each trial.
         """
         _validate_choices_rewards(choices, rewards, self.n_options)
         choices = jnp.asarray(choices, dtype=jnp.int32)
@@ -1358,6 +1392,39 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
         SGD learns all parameters: reward_probs, state_values,
         inverse_temperature, transition_coefficients, and obs_weights.
+
+        Parameters
+        ----------
+        choices : ArrayLike, shape (n_trials,)
+            Chosen option per trial, integers in ``[0, n_options)``.
+        rewards : ArrayLike, shape (n_trials,)
+            Binary reward per trial.
+        transition_covariates : ArrayLike or None, shape (n_trials, d_h)
+            Covariates for the transition design matrix. None =
+            intercept-only (stationary transitions).
+        obs_design_matrix : ArrayLike or None, shape (n_trials, n_obs_covariates)
+            Observation covariates for action biases. Required when the
+            model was built with ``n_obs_covariates > 0``.
+        optimizer : optax optimizer or None
+            Default: adam(1e-2) with gradient clipping.
+        num_steps : int
+            Number of optimization steps.
+        verbose : bool
+            Log progress every 10 steps (INFO level).
+        convergence_tol : float or None
+            Stop early when the relative LL change stays below this for 5
+            consecutive steps.
+
+        Returns
+        -------
+        log_likelihoods : list of float
+            Marginal log-likelihood per optimization step.
+
+        Raises
+        ------
+        ValueError
+            If the choices/rewards are invalid or ``obs_design_matrix`` is
+            missing while ``n_obs_covariates > 0``.
         """
         _validate_choices_rewards(choices, rewards, self.n_options)
         choices = jnp.asarray(choices, dtype=jnp.int32)

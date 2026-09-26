@@ -61,6 +61,28 @@ class JointHamiltonianModel(HamiltonianModelBase):
         seed: int = 42,
         obs_noise_std: float = 0.1,
     ):
+        """Build the model with random initial weights for both heads.
+
+        Parameters
+        ----------
+        n_oscillators : int
+            Number of latent oscillators shared by both observation heads
+            (``n_cont_states = 2 * n_oscillators``).
+        n_lfp_sources : int
+            Number of LFP channels (Gaussian head).
+        n_spike_sources : int
+            Number of neurons (Poisson head).
+        sampling_freq : float
+            Sampling rate in Hz, common to both modalities.
+        hidden_dims : list of int or None
+            Hidden-layer widths of the MLP that parameterizes the Hamiltonian
+            (default ``[32, 32]``).
+        seed : int
+            Seed for the initial MLP and observation weights.
+        obs_noise_std : float
+            Initial LFP noise standard deviation; sets ``R_lfp`` to
+            ``obs_noise_std**2 * I`` (see the ``obs_noise_std`` property).
+        """
         super().__init__(
             n_oscillators=n_oscillators,
             n_discrete_states=1,
