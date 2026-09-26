@@ -46,8 +46,9 @@ Modules:
   the switching variant returns a 4-tuple from `filter` while the
   single-regime variants return a 3-tuple — that divergence is expected, not
   a defect.
-- Fitting is **SGD only**. Calling `.fit(...)` (EM) raises `NotImplementedError`
-  by design; use `.fit_sgd(...)`.
+- Fitting is **SGD only**. The Hamiltonian models no longer inherit the EM
+  layer, so there is no `.fit(...)` method (calling it is an `AttributeError`);
+  use `.fit_sgd(...)`.
 - If a future Hamiltonian variant needs to participate in the linear-Gaussian
   EM pipeline (e.g., to share M-step code with a non-Hamiltonian peer), the
   right move is to extract shared helpers — not to force Hamiltonian models
