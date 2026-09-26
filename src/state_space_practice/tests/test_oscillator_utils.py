@@ -1117,6 +1117,57 @@ def test_cnm_projection_matches_bisection_reference_and_is_jittable():
     )
 
 
+def _near_singular_cnm_covariance(rng, n_oscillators):
+    """CNM covariance whose pairwise coherences sit near +/-1, plus small noise.
+
+    Coherences within ``1e-7``-``1e-1`` of +/-1 put the structured projection
+    at or just past the PSD boundary, where the shrink factor is most sensitive
+    to roundoff.
+    """
+    dim = 2 * n_oscillators
+    variance = np.exp(rng.uniform(-2.0, 2.0, n_oscillators))
+    cov = np.kron(np.diag(variance), np.eye(2))
+    for i in range(n_oscillators):
+        for j in range(i + 1, n_oscillators):
+            rho = rng.choice([-1.0, 1.0]) * (1.0 - 10.0 ** rng.uniform(-7.0, -1.0))
+            phase = rng.uniform(0.0, 2.0 * np.pi)
+            rotation = np.array(
+                [[np.cos(phase), -np.sin(phase)], [np.sin(phase), np.cos(phase)]]
+            )
+            block = rho * np.sqrt(variance[i] * variance[j]) * rotation
+            cov[2 * i : 2 * i + 2, 2 * j : 2 * j + 2] = block
+            cov[2 * j : 2 * j + 2, 2 * i : 2 * i + 2] = block.T
+    return cov + 1e-3 * rng.normal(size=(dim, dim))
+
+
+@pytest.mark.parametrize("min_eigenvalue", [1e-8, 1e-4])
+def test_cnm_projection_keeps_eigenvalue_floor_in_float32(min_eigenvalue):
+    """In float32 the shrunk covariance still has min eigenvalue >= the floor.
+
+    The safety margin on the closed-form shrink factor must exceed float32
+    roundoff (``1 - 1e-9 == 1`` in float32). The eigenvalues are those of the
+    stored float32 matrix, computed in float64 so the check itself does not add
+    float32 roundoff; the floor is compared at its float32 value.
+    """
+    rng = np.random.default_rng(3)
+    covariances = [
+        np.asarray(_random_cnm_covariance(rng, int(rng.integers(2, 5)), 3.0))
+        for _ in range(40)
+    ] + [_near_singular_cnm_covariance(rng, int(rng.integers(2, 5))) for _ in range(40)]
+    floor = float(np.float32(min_eigenvalue))
+    n_shrunk = 0
+    for cov in covariances:
+        cov32 = jnp.asarray(cov, dtype=jnp.float32)
+        projected = project_correlated_noise_process_covariance(cov32, min_eigenvalue)
+        assert projected.dtype == jnp.float32
+        structured, _ = _cnm_structured_projection(cov32, min_eigenvalue)
+        n_shrunk += not np.array_equal(np.asarray(projected), np.asarray(structured))
+        min_eig = np.linalg.eigvalsh(np.asarray(projected, dtype=np.float64)).min()
+        assert min_eig >= floor
+    # Guard: the floor is only at risk when the linkage was actually shrunk.
+    assert n_shrunk >= 40
+
+
 def test_cnm_shrink_factor_handles_variance_at_the_floor():
     """Blocks whose variance sits exactly at the floor cannot carry linkage.
 

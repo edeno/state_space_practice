@@ -881,7 +881,7 @@ def _cnm_psd_shrink_factor(
     structured: jax.Array,
     diag_only: jax.Array,
     min_eigenvalue: float,
-    safety_margin: float = 1e-9,
+    safety_margin: float | None = None,
 ) -> jax.Array:
     """Largest ``t`` in ``[0, 1]`` with ``diag_only + t * O >= min_eigenvalue * I``.
 
@@ -903,11 +903,15 @@ def _cnm_psd_shrink_factor(
     row is zero -- it is decoupled -- and otherwise forces ``t = 0``, since
     any ``t > 0`` would make ``S + t O`` indefinite in that coordinate.
 
-    ``safety_margin`` shrinks an interior ``t*`` by a relative ``1e-9`` so
-    that the floating-point minimum eigenvalue of the result stays at or
-    above ``min_eigenvalue``: the exact ``t*`` puts it there only up to the
+    ``safety_margin`` shrinks ``t*`` by that relative amount so that the
+    floating-point minimum eigenvalue of the result stays at or above
+    ``min_eigenvalue``: the exact ``t*`` puts it there only up to the
     eigen-solver's roundoff. (The minimum eigenvalue is concave in ``t``, so
-    the margin lifts it by at least ``safety_margin * min(S_ii)``.)
+    the margin lifts it by at least ``safety_margin * min(S_ii)``.) It also
+    applies when the computed ``t*`` lands just above 1, where roundoff can
+    hide a structured covariance sitting just past the floor. The default,
+    ``max(1e-9, 64 * eps)`` for the input dtype, is ``1e-9`` in float64 and
+    about ``7.6e-6`` in float32, where ``1 - 1e-9`` rounds to 1.
     """
     dtype = structured.dtype
     off_diag = structured - diag_only
@@ -917,10 +921,12 @@ def _cnm_psd_shrink_factor(
     scaled = -(inv_sqrt[:, None] * off_diag * inv_sqrt[None, :])
     lam_max = jnp.max(jnp.linalg.eigvalsh(symmetrize(scaled)))
     needs_shrink = lam_max > 0
-    t = jnp.where(needs_shrink, 1.0 / jnp.where(needs_shrink, lam_max, 1.0), 1.0)
+    if safety_margin is None:
+        safety_margin = max(1e-9, 64.0 * float(jnp.finfo(dtype).eps))
+    t_exact = 1.0 / jnp.where(needs_shrink, lam_max, 1.0)
+    t = jnp.where(needs_shrink, t_exact * (1.0 - safety_margin), 1.0)
     pinned = jnp.any((~positive) & (jnp.max(jnp.abs(off_diag), axis=1) > 0))
     t = jnp.where(pinned, 0.0, t)
-    t = jnp.where(t >= 1.0, 1.0, t * (1.0 - safety_margin))
     return jnp.clip(t, 0.0, 1.0)
 
 
