@@ -381,6 +381,83 @@ class TestSwitchingChoiceFilter:
         assert not jnp.allclose(first_half, second_half, atol=0.05)
 
 
+class TestSwitchingChoiceInitialDiscretePrior:
+    """First-trial handling of the caller-supplied discrete prior ``p(S_1)``.
+
+    Contract (``_normalize_initial_discrete_prob`` +
+    ``_first_timestep_discrete_update``): a prior that does not sum to a
+    positive value fails loud with NaN; a tiny positive prior is used as is,
+    not floored; a NaN, infinite or negative entry in an otherwise valid prior
+    is clamped to a structural zero and the rest renormalized.
+    """
+
+    CHOICES = jnp.array([1, 0, 1, 1])
+
+    def _filter(self, prior):
+        """Filter with state-dependent first-trial likelihoods (distinct betas)."""
+        n_states = len(prior)
+        return switching_choice_filter(
+            self.CHOICES,
+            n_options=2,
+            n_discrete_states=n_states,
+            inverse_temperatures=jnp.linspace(0.5, 4.0, n_states),
+            init_mean=jnp.array([2.0]),
+            init_discrete_prob=jnp.asarray(prior),
+            discrete_transition_matrix=jnp.eye(n_states),
+        )
+
+    @pytest.mark.parametrize(
+        "prior",
+        [[0.0, 0.0], [-0.5, 0.0], [np.nan, np.nan]],
+        ids=["all_zero", "non_positive", "all_nan"],
+    )
+    def test_prior_without_positive_mass_fails_loud(self, prior):
+        result = self._filter(prior)
+        assert np.isnan(float(result.marginal_log_likelihood))
+        assert np.all(np.isnan(np.asarray(result.discrete_state_probs[0])))
+
+    def test_tiny_prior_is_not_floored(self):
+        """Posterior odds = likelihood ratio x prior odds, with prior odds 1e-12.
+
+        Flooring the prior to the 1e-10 stability floor would inflate the
+        posterior odds of state 1 a hundredfold.
+        """
+        tiny = 1e-12
+        posterior_uniform = np.asarray(self._filter([0.5, 0.5]).discrete_state_probs[0])
+        posterior_tiny = np.asarray(
+            self._filter([1.0 - tiny, tiny]).discrete_state_probs[0]
+        )
+        likelihood_ratio = posterior_uniform[1] / posterior_uniform[0]
+        # Guard: the states' first-trial likelihoods differ, so the odds are
+        # informative about how the prior entered.
+        assert abs(np.log(likelihood_ratio)) > 0.1
+        np.testing.assert_allclose(
+            posterior_tiny[1] / posterior_tiny[0],
+            likelihood_ratio * tiny / (1.0 - tiny),
+            rtol=1e-6,
+        )
+
+    @pytest.mark.parametrize(
+        "bad_entry", [np.nan, np.inf, -0.2], ids=["nan", "inf", "negative"]
+    )
+    def test_invalid_entry_becomes_structural_zero(self, bad_entry):
+        """``[0.3, bad, 0.1]`` behaves exactly like ``[0.75, 0, 0.25]``."""
+        result = self._filter([0.3, bad_entry, 0.1])
+        reference = self._filter([0.75, 0.0, 0.25])
+        assert np.isfinite(float(reference.marginal_log_likelihood))  # guard
+
+        probs = np.asarray(result.discrete_state_probs)
+        np.testing.assert_array_equal(probs[:, 1], np.zeros(len(self.CHOICES)))
+        np.testing.assert_allclose(
+            probs, np.asarray(reference.discrete_state_probs), rtol=1e-12, atol=0.0
+        )
+        np.testing.assert_allclose(
+            float(result.marginal_log_likelihood),
+            float(reference.marginal_log_likelihood),
+            rtol=1e-12,
+        )
+
+
 class TestSwitchingChoiceModel:
     """Tests for the SwitchingChoiceModel class."""
 
