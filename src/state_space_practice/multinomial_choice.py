@@ -28,6 +28,7 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.kalman import rts_backward_scan
 from state_space_practice.parameter_transforms import POSITIVE
 from state_space_practice.point_process_kalman import _logdet_psd
@@ -468,7 +469,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
 
     def _check_fitted(self, method: str) -> None:
         if not self.is_fitted:
-            raise RuntimeError(
+            raise NotFittedError(
                 f"{type(self).__name__}.{method}() called before fitting. "
                 f"Call model.fit(choices) first."
             )
