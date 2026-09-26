@@ -19,6 +19,7 @@ from state_space_practice.point_process_kalman import (
     glm_laplace_update,
     poisson_family,
 )
+from state_space_practice.utils import psd_cholesky, psd_solve, symmetrize
 
 # Fixed, deterministic setup (no RNG): 3 latent dims, 4 observations.
 _MEAN = jnp.array([0.2, -0.1, 0.3])
@@ -210,4 +211,108 @@ class TestFamilyConsistency:
         weight = family.fisher_weight(eta, mu)
         np.testing.assert_allclose(
             np.asarray(weight), np.asarray(dmean_deta), atol=1e-10
+        )
+
+
+class TestCarriedLineSearch:
+    """The iterative branch carries each accepted point's Fisher step and loss.
+
+    ``_fisher_scoring_line_search`` computes the Fisher direction, posterior
+    precision and negative log-posterior once per accepted point and reuses
+    them as the next iteration's direction and loss reference (instead of
+    recomputing them at the top of every iteration). Pin the result against
+    a plain Python reference that recomputes everything at every iterate --
+    the two must agree to roundoff, for both families, on problems where the
+    backtracking actually shortens steps.
+    """
+
+    @staticmethod
+    def _reference(
+        one_step_mean,
+        one_step_cov,
+        y,
+        eta_func,
+        family,
+        max_newton_iter,
+        line_search_beta=0.5,
+        diagonal_boost=1e-9,
+    ):
+        """Recomputing Fisher scoring with the same 10-step backtracking rule."""
+        identity = jnp.eye(one_step_mean.shape[0])
+        prior_cho = psd_cholesky(one_step_cov, diagonal_boost=diagonal_boost)
+        prior_precision = jax.scipy.linalg.cho_solve(prior_cho, identity)
+
+        def neg_log_posterior(x):
+            eta = eta_func(x)
+            mu = family.mean(eta)
+            delta = x - one_step_mean
+            log_prior = -0.5 * delta @ (prior_precision @ delta)
+            return -(family.loglik_plugin(y, eta, mu) + log_prior)
+
+        def fisher_step(x):
+            eta = eta_func(x)
+            mu = family.mean(eta)
+            jacobian = jax.jacfwd(eta_func)(x)
+            gradient = jacobian.T @ (y - mu) - prior_precision @ (x - one_step_mean)
+            weight = family.fisher_weight(eta, mu)
+            post_prec = symmetrize(
+                prior_precision + jacobian.T @ (weight[:, None] * jacobian)
+            )
+            delta = psd_solve(post_prec, gradient, diagonal_boost=diagonal_boost)
+            return delta, post_prec
+
+        x = one_step_mean
+        n_shortened = 0
+        for _ in range(max_newton_iter):
+            delta, _ = fisher_step(x)
+            loss = neg_log_posterior(x)
+            alpha, improved = 1.0, False
+            for _ in range(10):
+                improved = bool(neg_log_posterior(x + alpha * delta) < loss)
+                if not improved:
+                    alpha *= line_search_beta
+            if improved:
+                n_shortened += alpha < 1.0
+                x = x + alpha * delta
+        _, post_prec = fisher_step(x)
+        post_cho = psd_cholesky(post_prec, diagonal_boost=diagonal_boost)
+        post_cov = symmetrize(jax.scipy.linalg.cho_solve(post_cho, identity))
+        return x, post_cov, n_shortened
+
+    @pytest.mark.parametrize("max_newton_iter", [2, 4])
+    def test_poisson_matches_recomputing_reference(self, max_newton_iter):
+        # Weak prior + large counts: the full Fisher step overshoots, so the
+        # backtracking shortens it and the carried loss / direction matter.
+        cov = 100.0 * jnp.eye(3)
+        spikes = jnp.array([40.0, 0.0, 55.0, 3.0])
+        ref_mean, ref_cov, n_shortened = self._reference(
+            _MEAN, cov, spikes, _eta, poisson_family(_DT), max_newton_iter
+        )
+        assert n_shortened > 0  # guard: the line search actually backtracked
+        post_mean, post_cov, _ = _point_process_laplace_update(
+            _MEAN, cov, spikes, _DT, _eta, max_newton_iter=max_newton_iter
+        )
+        np.testing.assert_allclose(
+            np.asarray(post_mean), np.asarray(ref_mean), rtol=1e-12, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            np.asarray(post_cov), np.asarray(ref_cov), rtol=1e-11, atol=1e-12
+        )
+
+    @pytest.mark.parametrize("max_newton_iter", [2, 4])
+    def test_bernoulli_matches_recomputing_reference(self, max_newton_iter):
+        cov = 400.0 * jnp.eye(3)
+        y = jnp.array([1.0, 1.0, 0.0, 1.0])
+        ref_mean, ref_cov, _ = self._reference(
+            _MEAN, cov, y, _eta, BERNOULLI_LOGIT_FAMILY, max_newton_iter
+        )
+        assert float(jnp.max(jnp.abs(ref_mean - _MEAN))) > 1.0  # guard: moved
+        post_mean, post_cov, _ = glm_laplace_update(
+            _MEAN, cov, y, _eta, BERNOULLI_LOGIT_FAMILY, max_newton_iter=max_newton_iter
+        )
+        np.testing.assert_allclose(
+            np.asarray(post_mean), np.asarray(ref_mean), rtol=1e-12, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            np.asarray(post_cov), np.asarray(ref_cov), rtol=1e-11, atol=1e-12
         )

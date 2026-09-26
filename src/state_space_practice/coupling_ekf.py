@@ -16,8 +16,12 @@ degeneracy in *this estimator* (a spikes-only joint fit would be degenerate):
 Requires float64 (the test suite enables ``jax_enable_x64``).
 """
 
+import functools
+
+import jax
 import jax.numpy as jnp
 import numpy as np
+from jax import Array
 
 from state_space_practice.coupling_model import (
     CouplingModelParams,
@@ -31,6 +35,63 @@ from state_space_practice.point_process_kalman import (
     BERNOULLI_LOGIT_FAMILY,
     glm_laplace_update,
 )
+
+
+@functools.partial(jax.jit, static_argnames=("max_newton_iter",))
+def _regress_coupling_all_neurons(
+    spikes: Array,
+    smoothed_latent: Array,
+    baseline: Array,
+    prior_mean: Array,
+    prior_cov: Array,
+    *,
+    max_newton_iter: int,
+) -> tuple[Array, Array]:
+    """Bernoulli Laplace regression of every neuron's spikes on the latent.
+
+    The neurons share the prior and the constant design ``smoothed_latent``
+    and differ only in their spike column and baseline, so the whole
+    population is one ``jax.vmap`` over neurons under one ``jax.jit``: the
+    Newton / line-search scan inside :func:`glm_laplace_update` is traced
+    and compiled once for the population instead of once per neuron in a
+    Python loop of un-jitted calls.
+
+    Parameters
+    ----------
+    spikes : Array, shape (T, S)
+    smoothed_latent : Array, shape (T, 2J)
+    baseline : Array, shape (S,)
+    prior_mean : Array, shape (2J,)
+    prior_cov : Array, shape (2J, 2J)
+    max_newton_iter : int
+
+    Returns
+    -------
+    beta_mean : Array, shape (S, 2J)
+    beta_cov : Array, shape (S, 2J, 2J)
+    """
+
+    def constant_jacobian(_beta: Array) -> Array:
+        # eta(beta) = baseline + smoothed_latent @ beta is linear in beta, so
+        # its Jacobian is the constant design (passed to skip jacfwd).
+        return smoothed_latent
+
+    def _fit_one(spikes_n: Array, baseline_n: Array) -> tuple[Array, Array]:
+        def eta(beta: Array) -> Array:
+            return baseline_n + smoothed_latent @ beta
+
+        beta_mean, beta_cov, _ = glm_laplace_update(
+            prior_mean,
+            prior_cov,
+            spikes_n,
+            eta,
+            BERNOULLI_LOGIT_FAMILY,
+            grad_eta_func=constant_jacobian,
+            max_newton_iter=max_newton_iter,
+        )
+        return beta_mean, beta_cov
+
+    return jax.vmap(_fit_one, in_axes=(1, 0))(spikes, baseline)
 
 
 def fit_coupling_ekf(
@@ -95,42 +156,23 @@ def fit_coupling_ekf(
     # Stage 1: Kalman-smooth the latent from the LFP (shared with the PG estimator).
     smoothed_latent = smooth_latent_from_lfp(lfp, params)
 
-    # Stage 2: per-neuron Bernoulli logistic regression of spikes on smoothed x.
-    # eta(beta) = baseline + smoothed_latent @ beta is linear in beta, so its
-    # Jacobian is the constant design smoothed_latent (passed to skip jacfwd).
+    # Stage 2: Bernoulli logistic regression of every neuron's spikes on the
+    # smoothed x, vmapped over neurons under one jit (shared prior, constant
+    # Jacobian).
     prior_mean = jnp.zeros(n_latent)
     prior_cov = sigma_beta_float**2 * jnp.eye(n_latent)
+    beta_mean_rows, beta_covs = _regress_coupling_all_neurons(
+        spikes,
+        smoothed_latent,
+        jnp.asarray(params.baseline),
+        prior_mean,
+        prior_cov,
+        max_newton_iter=int(max_iter_arr),
+    )  # (S, 2J), (S, 2J, 2J)
     real_indices = jnp.arange(0, n_latent, 2)
     imag_indices = real_indices + 1
-
-    def constant_jacobian(_beta):
-        return smoothed_latent
-
-    means = []
-    variances = []
-    real_imag_covariances = []
-    for neuron in range(n_neurons):
-        baseline_n = params.baseline[neuron]
-
-        def eta(beta, baseline_n=baseline_n):
-            return baseline_n + smoothed_latent @ beta
-
-        beta_mean, beta_cov, _ = glm_laplace_update(
-            prior_mean,
-            prior_cov,
-            spikes[:, neuron],
-            eta,
-            BERNOULLI_LOGIT_FAMILY,
-            grad_eta_func=constant_jacobian,
-            max_newton_iter=int(max_iter_arr),
-        )
-        means.append(beta_mean)
-        variances.append(jnp.diag(beta_cov))
-        real_imag_covariances.append(beta_cov[real_indices, imag_indices])
-
-    beta_mean_rows = jnp.stack(means)  # (S, 2J)
-    beta_var_rows = jnp.stack(variances)  # (S, 2J)
-    beta_real_imag_cov = jnp.stack(real_imag_covariances)  # (S, J)
+    beta_var_rows = jnp.diagonal(beta_covs, axis1=1, axis2=2)  # (S, 2J)
+    beta_real_imag_cov = beta_covs[:, real_indices, imag_indices]  # (S, J)
 
     # A non-finite posterior means the smoother or a logistic regression blew up
     # (e.g. ill-conditioned init, separable spikes). Fail loudly rather than

@@ -10,8 +10,11 @@ import numpy as np
 import pytest
 
 from state_space_practice.point_process_kalman import (
+    BlockDiagonalCovariance,
     BlockDiagonalStructure,
     PointProcessModel,
+    _block_diagonal_parameters_ok,
+    _block_diagonal_smoother_core,
     _detect_block_diagonal_problem,
     _is_block_diagonal,
     _logdet_psd,
@@ -3271,6 +3274,32 @@ class TestDetectBlockDiagonalProblem:
         assert result.n_neurons == 3
         assert result.block_size == model.n_basis_per_neuron
 
+    def test_parameter_check_is_the_vectorised_half_of_detection(self) -> None:
+        """``_block_diagonal_parameters_ok`` accepts and rejects exactly like
+        the full detector on the parameter matrices (one fused check, one
+        host sync -- what PlaceFieldModel runs after every M-step)."""
+        _m, P, A, Q, _Z, _ = self._make_block_problem(n_neurons=3, block_size=4)
+        ok = _block_diagonal_parameters_ok(P, A, Q, n_neurons=3, block_size=4)
+        assert bool(ok)
+        # Off-block entry in A, heterogeneous Q blocks, dense init_cov: rejected.
+        A_dense = A.at[0, 5].set(1e-3)
+        assert not bool(
+            _block_diagonal_parameters_ok(P, A_dense, Q, n_neurons=3, block_size=4)
+        )
+        Q_het = Q.at[8:12, 8:12].set(Q[8:12, 8:12] * 2.0)
+        assert not bool(
+            _block_diagonal_parameters_ok(P, A, Q_het, n_neurons=3, block_size=4)
+        )
+        P_dense = P + 1e-3
+        assert not bool(
+            _block_diagonal_parameters_ok(P_dense, A, Q, n_neurons=3, block_size=4)
+        )
+        # Tolerance model: relative to the matrix magnitude, as in detection.
+        A_noise = A + 1e-13 * jnp.ones_like(A)
+        assert bool(
+            _block_diagonal_parameters_ok(P, A_noise, Q, n_neurons=3, block_size=4)
+        )
+
 
 class TestBlockDiagonalFilterEquivalence:
     """Prove the block-diagonal filter produces identical output to the
@@ -3823,6 +3852,104 @@ class TestBlockDiagonalSmootherEquivalence:
                     assert float(jnp.max(jnp.abs(sub))) < 1e-12, (
                         f"cross_cov off-block ({j},{k}) at t={t} is nonzero"
                     )
+
+    def test_shared_basis_input_and_block_covariances_match_dense(self) -> None:
+        """Z_base + block ints through the public API, covariances as blocks.
+
+        PlaceFieldModel hands the smoother the shared ``(n_time, block_size)``
+        basis instead of the block-expanded design and asks for
+        ``BlockDiagonalCovariance`` outputs. Every block-local view the
+        consumers use (time sum, integer time index, marginal variances, a
+        neuron's blocks, dense materialisation) must equal the dense path.
+        """
+        init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
+            n_neurons=3, block_size=4, T=30
+        )
+        n_neurons, nb = 3, 4
+        Z_base = Z[:, 0, :nb]
+        dense = stochastic_point_process_smoother(
+            init_mean, init_cov, Z, spikes, dt, A, Q, log_conditional_intensity,
+            validate_inputs=False, force_dense=True, return_filtered=True,
+        )
+        block = stochastic_point_process_smoother(
+            init_mean, init_cov, Z_base, spikes, dt, A, Q, log_conditional_intensity,
+            validate_inputs=False, block_n_neurons=n_neurons, block_size=nb,
+            return_filtered=True, return_block_covariances=True,
+        )
+        for block_mean, dense_mean in ((block[0], dense[0]), (block[4], dense[4])):
+            np.testing.assert_allclose(
+                np.asarray(block_mean), np.asarray(dense_mean), atol=1e-10
+            )
+        np.testing.assert_allclose(float(block[3]), float(dense[3]), atol=1e-9)
+
+        pairs = ((block[1], dense[1]), (block[2], dense[2]), (block[5], dense[5]))
+        for cov, dense_cov in pairs:
+            assert isinstance(cov, BlockDiagonalCovariance)
+            assert cov.shape == dense_cov.shape and len(cov) == dense_cov.shape[0]
+            assert cov.blocks.shape == (n_neurons, dense_cov.shape[0], nb, nb)
+            dense_np = np.asarray(dense_cov)
+            np.testing.assert_allclose(np.asarray(cov.to_dense()), dense_np, atol=1e-10)
+            np.testing.assert_allclose(np.asarray(cov), dense_np, atol=1e-10)
+            np.testing.assert_allclose(
+                np.asarray(cov.sum(axis=0)), dense_np.sum(axis=0), atol=1e-10
+            )
+            np.testing.assert_allclose(np.asarray(cov[0]), dense_np[0], atol=1e-10)
+            np.testing.assert_allclose(np.asarray(cov[-1]), dense_np[-1], atol=1e-10)
+            np.testing.assert_allclose(np.asarray(cov[3:7]), dense_np[3:7], atol=1e-10)
+            np.testing.assert_allclose(
+                np.asarray(cov.diagonal()),
+                np.diagonal(dense_np, axis1=1, axis2=2),
+                atol=1e-10,
+            )
+            for j in range(n_neurons):
+                s = slice(j * nb, (j + 1) * nb)
+                np.testing.assert_allclose(
+                    np.asarray(cov.neuron_blocks(j)), dense_np[:, s, s], atol=1e-10
+                )
+                np.testing.assert_allclose(
+                    np.asarray(cov.neuron_blocks(j, slice(5, 9))),
+                    dense_np[5:9, s, s],
+                    atol=1e-10,
+                )
+        # Confidence intervals read the marginal variances from the blocks.
+        np.testing.assert_allclose(
+            np.asarray(get_confidence_interval(block[0], block[1])),
+            np.asarray(get_confidence_interval(dense[0], dense[1])),
+            atol=1e-10,
+        )
+        with pytest.raises(ValueError, match="axis=0"):
+            block[1].sum(axis=1)
+
+    def test_block_cores_compile_once_across_repeated_calls(self) -> None:
+        """The block cores are jitted with the option flags static, so calls
+        with identical shapes (every EM iteration) reuse one compilation even
+        when the parameter values, ``dt`` and ``max_log_count`` change."""
+        # A shape no other test uses, so the cache delta is attributable.
+        init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
+            n_neurons=2, block_size=5, T=23, seed=3
+        )
+        structure = _detect_block_diagonal_problem(init_mean, init_cov, A, Q, Z)
+        assert structure is not None
+
+        def run(q_scale: float, dt_value: float, max_log_count: float):
+            return _stochastic_point_process_smoother_block_diagonal(
+                structure._replace(Q_block=structure.Q_block * q_scale),
+                spikes,
+                dt_value,
+                max_log_count=max_log_count,
+                return_block_covariances=True,
+            )
+
+        run(1.0, dt, 20.0)
+        after_first = _block_diagonal_smoother_core._cache_size()
+        run(2.0, dt, 20.0)
+        run(0.5, 0.03, 15.0)
+        assert _block_diagonal_smoother_core._cache_size() == after_first
+        # A different static option is a different compilation.
+        _stochastic_point_process_smoother_block_diagonal(
+            structure, spikes, dt, include_laplace_normalization=False
+        )
+        assert _block_diagonal_smoother_core._cache_size() == after_first + 1
 
     def test_shape_mismatch_guard(self) -> None:
         """Block dispatch with wrong n_neurons * block_size raises ValueError.

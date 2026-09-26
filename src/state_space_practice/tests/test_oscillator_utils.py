@@ -7,6 +7,9 @@ from state_space_practice.oscillator_utils import (
     IDENTITY_2x2,
     ZEROS_2x2,
     DirectedInfluenceDynamicsMixin,
+
+    _cnm_psd_shrink_factor,
+    _cnm_structured_projection,
     _compute_coupled_oscillator_block,
     _compute_coupling_transition_block,
     _compute_intrinsic_oscillation_block,
@@ -1022,3 +1025,135 @@ def test_directed_influence_mixin_rebuild_refreshes_optimizer_cache_only_once_se
     host._current_osc_params["freq"] = jnp.array([5.0, 9.0])
     host._update_public_oscillator_params()
     np.testing.assert_allclose(host.freqs, [5.0, 9.0])
+
+# CNM covariance projection: closed-form PSD shrink factor vs. bisection
+# ---------------------------------------------------------------------------
+
+
+def _bisection_shrink_factor(structured, diag_only, min_eigenvalue=1e-8, max_iter=60):
+    """Reference: the pre-closed-form host-side bisection on the min eigenvalue."""
+    if float(jnp.linalg.eigvalsh(structured).min()) >= min_eigenvalue:
+        return 1.0
+    off_diag = structured - diag_only
+    lo, hi = 0.0, 1.0
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        candidate = diag_only + mid * off_diag
+        if float(jnp.linalg.eigvalsh(candidate).min()) >= min_eigenvalue:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _random_cnm_covariance(rng, n_oscillators, linkage_scale):
+    """Random symmetric covariance with inflated linkage blocks.
+
+    Inflating the off-diagonal blocks makes the block-wise CNM projection
+    indefinite for most draws, so the shrink factor is genuinely exercised.
+    """
+    dim = 2 * n_oscillators
+    factor = rng.normal(size=(dim, dim))
+    cov = factor @ factor.T / dim
+    scale = np.full((dim, dim), linkage_scale)
+    for i in range(n_oscillators):
+        scale[2 * i : 2 * i + 2, 2 * i : 2 * i + 2] = 1.0
+    return jnp.asarray(cov * scale)
+
+
+def test_cnm_shrink_factor_matches_bisection_on_random_covariances():
+    """The closed-form shrink factor agrees with the 60-step bisection it replaced.
+
+    Also pins the PSD guarantee: the shrunk covariance's minimum eigenvalue
+    stays at or above ``min_eigenvalue`` (the bisection accepted only
+    candidates that passed that floating-point check; the closed form's
+    relative safety margin keeps the same property).
+    """
+    min_eigenvalue = 1e-8
+    rng = np.random.default_rng(0)
+    n_shrunk = 0
+    for _ in range(30):
+        n_oscillators = int(rng.integers(2, 6))
+        cov = _random_cnm_covariance(rng, n_oscillators, rng.uniform(1.5, 4.0))
+        structured, diag_only = _cnm_structured_projection(cov, min_eigenvalue)
+        t_ref = _bisection_shrink_factor(structured, diag_only, min_eigenvalue)
+        t_new = float(_cnm_psd_shrink_factor(structured, diag_only, min_eigenvalue))
+        np.testing.assert_allclose(t_new, t_ref, rtol=1e-6)
+        shrunk = diag_only + t_new * (structured - diag_only)
+        assert float(jnp.linalg.eigvalsh(shrunk).min()) >= min_eigenvalue
+        n_shrunk += t_ref < 1.0
+    # Guard: the comparison is only meaningful if shrinking actually happened.
+    assert n_shrunk >= 10
+
+
+def test_cnm_projection_matches_bisection_reference_and_is_jittable():
+    """The public projection equals ``diag + t_bisect * off`` and traces under jit."""
+    rng = np.random.default_rng(1)
+    cov = _random_cnm_covariance(rng, n_oscillators=4, linkage_scale=3.0)
+    structured, diag_only = _cnm_structured_projection(cov, 1e-8)
+    t_ref = _bisection_shrink_factor(structured, diag_only, 1e-8)
+    assert t_ref < 1.0  # guard: this draw needs shrinking
+    expected = np.asarray(diag_only + t_ref * (structured - diag_only))
+
+    projected = np.asarray(project_correlated_noise_process_covariance(cov))
+    np.testing.assert_allclose(projected, expected, rtol=1e-6, atol=1e-9)
+    assert np.linalg.eigvalsh(projected).min() >= 1e-8
+
+    # Inside a larger jitted computation (no host syncs to break the trace).
+    jitted = np.asarray(
+        jax.jit(lambda c: 2.0 * project_correlated_noise_process_covariance(c))(cov)
+    )
+    np.testing.assert_allclose(jitted, 2.0 * projected, rtol=1e-12, atol=1e-14)
+
+    # An already-PSD structured covariance is returned unshrunk.
+    diag_strong = np.asarray(diag_only) * 50.0
+    structured_psd = jnp.asarray(diag_strong) + (structured - diag_only)
+    assert float(jnp.linalg.eigvalsh(structured_psd).min()) >= 1e-8  # guard
+    np.testing.assert_allclose(
+        np.asarray(project_correlated_noise_process_covariance(structured_psd)),
+        np.asarray(structured_psd),
+        rtol=1e-12,
+        atol=1e-14,
+    )
+
+
+def test_cnm_shrink_factor_handles_variance_at_the_floor():
+    """Blocks whose variance sits exactly at the floor cannot carry linkage.
+
+    ``S = diag_only - min_eigenvalue * I`` then has a zero diagonal entry: a
+    non-zero linkage row there forces ``t = 0``; a zero row is decoupled and
+    the factor is that of the remaining oscillators.
+    """
+    min_eigenvalue = 1e-8
+    rng = np.random.default_rng(2)
+    n_oscillators = 4
+    cov = np.asarray(_random_cnm_covariance(rng, n_oscillators, 3.0))
+    # Zero out oscillator 1 entirely: its variance is floored, its linkage vanishes.
+    decoupled = cov.copy()
+    decoupled[2:4, :] = 0.0
+    decoupled[:, 2:4] = 0.0
+    structured, diag_only = _cnm_structured_projection(
+        jnp.asarray(decoupled), min_eigenvalue
+    )
+    assert float(diag_only[2, 2]) == min_eigenvalue  # guard: floored block
+    t_decoupled = float(_cnm_psd_shrink_factor(structured, diag_only, min_eigenvalue))
+    keep = [0, 1, 4, 5, 6, 7]
+    reduced = jnp.asarray(decoupled[np.ix_(keep, keep)])
+    structured_r, diag_only_r = _cnm_structured_projection(reduced, min_eigenvalue)
+    t_reduced = float(_cnm_psd_shrink_factor(structured_r, diag_only_r, min_eigenvalue))
+    assert t_reduced < 1.0  # guard: the remaining oscillators need shrinking
+    np.testing.assert_allclose(t_decoupled, t_reduced, rtol=1e-10)
+
+    # Floored block WITH linkage: no positive t keeps the covariance PSD.
+    pinned = decoupled.copy()
+    pinned[2, 4] = pinned[4, 2] = 0.3
+    structured_p, diag_only_p = _cnm_structured_projection(
+        jnp.asarray(pinned), min_eigenvalue
+    )
+    t_pinned = float(_cnm_psd_shrink_factor(structured_p, diag_only_p, min_eigenvalue))
+    assert t_pinned == 0.0
+    np.testing.assert_allclose(
+        np.asarray(project_correlated_noise_process_covariance(jnp.asarray(pinned))),
+        np.asarray(diag_only_p),
+        atol=1e-15,
+    )

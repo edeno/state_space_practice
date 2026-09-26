@@ -837,10 +837,97 @@ def _oscillator_blocks_to_matrix(blocks: jax.Array) -> jax.Array:
     return blocks.transpose(0, 2, 1, 3).reshape(2 * n_oscillators, 2 * n_oscillators)
 
 
+def _cnm_structured_projection(
+    process_covariance: jax.Array, min_eigenvalue: float
+) -> tuple[jax.Array, jax.Array]:
+    """Project a covariance onto the CNM block family, block by block.
+
+    Returns ``(structured, diag_only)``: ``structured`` has ``variance_k * I``
+    diagonal blocks (variance floored at ``min_eigenvalue``) and symmetric
+    scaled-rotation off-diagonal blocks; ``diag_only`` keeps only the
+    diagonal blocks. Every block is projected in one vectorised pass (no
+    per-block ``.at[].set`` chain), so the function is a handful of fused
+    ops whether run eagerly or under ``jit``.
+    """
+    cov = symmetrize(process_covariance)
+    blocks = _matrix_to_oscillator_blocks(cov)  # (n, n, 2, 2)
+    n_oscillators = blocks.shape[0]
+    eye = jnp.eye(n_oscillators, dtype=cov.dtype)
+
+    # Diagonal blocks: variance_k * I, variance floored at min_eigenvalue.
+    variance = jnp.maximum(
+        0.5 * jnp.trace(blocks, axis1=-2, axis2=-1).diagonal(), min_eigenvalue
+    )
+    diag_blocks = (eye * variance[:, None])[:, :, None, None] * IDENTITY_2x2.astype(
+        cov.dtype
+    )
+
+    # Off-diagonal blocks: scaled-rotation projection of every upper block,
+    # mirrored (transposed) into the lower triangle.
+    projected = jax.vmap(jax.vmap(_project_to_scaled_rotation_matrix))(blocks)
+    upper = jnp.triu(jnp.ones((n_oscillators, n_oscillators), dtype=cov.dtype), k=1)
+    upper_blocks = upper[:, :, None, None] * projected
+    structured_blocks = (
+        diag_blocks + upper_blocks + jnp.transpose(upper_blocks, (1, 0, 3, 2))
+    )
+
+    return (
+        _oscillator_blocks_to_matrix(structured_blocks),
+        _oscillator_blocks_to_matrix(diag_blocks),
+    )
+
+
+def _cnm_psd_shrink_factor(
+    structured: jax.Array,
+    diag_only: jax.Array,
+    min_eigenvalue: float,
+    safety_margin: float = 1e-9,
+) -> jax.Array:
+    """Largest ``t`` in ``[0, 1]`` with ``diag_only + t * O >= min_eigenvalue * I``.
+
+    ``O = structured - diag_only`` holds the linkage blocks. Write
+    ``S = diag_only - min_eigenvalue * I``: diagonal, with entries ``>= 0``
+    because the block variances are floored at ``min_eigenvalue``. For
+    ``S > 0`` the constraint is a congruence away from an eigenvalue bound::
+
+        S + t O >= 0   <=>   I + t M >= 0,   M = S^{-1/2} O S^{-1/2}
+
+    which holds iff ``t * lambda_max(-M) <= 1``. So ``t* = 1 /
+    lambda_max(-M)`` when that eigenvalue is positive and ``t* = 1`` (no
+    shrink needed) otherwise -- one symmetric eigendecomposition, traceable
+    under ``jit``, in place of a bisection of up to 60 eigendecompositions
+    with a host sync each.
+
+    A coordinate whose variance sits exactly at the floor has ``S_ii = 0``.
+    It drops out of ``M`` (its scale factor is set to 0) when its linkage
+    row is zero -- it is decoupled -- and otherwise forces ``t = 0``, since
+    any ``t > 0`` would make ``S + t O`` indefinite in that coordinate.
+
+    ``safety_margin`` shrinks an interior ``t*`` by a relative ``1e-9`` so
+    that the floating-point minimum eigenvalue of the result stays at or
+    above ``min_eigenvalue``: the exact ``t*`` puts it there only up to the
+    eigen-solver's roundoff. (The minimum eigenvalue is concave in ``t``, so
+    the margin lifts it by at least ``safety_margin * min(S_ii)``.)
+    """
+    dtype = structured.dtype
+    off_diag = structured - diag_only
+    shift = jnp.diagonal(diag_only) - jnp.asarray(min_eigenvalue, dtype=dtype)
+    positive = shift > 0
+    inv_sqrt = jnp.where(positive, 1.0 / jnp.sqrt(jnp.where(positive, shift, 1.0)), 0.0)
+    scaled = -(inv_sqrt[:, None] * off_diag * inv_sqrt[None, :])
+    lam_max = jnp.max(jnp.linalg.eigvalsh(symmetrize(scaled)))
+    needs_shrink = lam_max > 0
+    t = jnp.where(needs_shrink, 1.0 / jnp.where(needs_shrink, lam_max, 1.0), 1.0)
+    pinned = jnp.any((~positive) & (jnp.max(jnp.abs(off_diag), axis=1) > 0))
+    t = jnp.where(pinned, 0.0, t)
+    t = jnp.where(t >= 1.0, 1.0, t * (1.0 - safety_margin))
+    return jnp.clip(t, 0.0, 1.0)
+
+
+@jax.jit
 def project_correlated_noise_process_covariance(
     process_covariance: jax.Array,
     min_eigenvalue: float = 1e-8,
-    max_shrink_iter: int = 60,
 ) -> jax.Array:
     """Project a covariance to the CNM block structure while preserving PSD.
 
@@ -848,45 +935,20 @@ def project_correlated_noise_process_covariance(
     ``sigma_k * I`` and symmetric off-diagonal scaled-rotation blocks.  A
     generic Kalman M-step produces an arbitrary covariance, so this projects the
     blocks back to the model family and, if needed, shrinks only the off-diagonal
-    linkage blocks toward zero until the covariance is positive semidefinite.
+    linkage blocks toward zero -- by the closed-form factor of
+    :func:`_cnm_psd_shrink_factor` -- until the covariance is positive
+    semidefinite with minimum eigenvalue ``min_eigenvalue``.  Fully traceable
+    (one eigendecomposition, no host syncs): the function is jit-compiled, so
+    the per-EM-iteration callers pay one compile per covariance shape instead
+    of a bisection of up to 60 eigendecompositions and host syncs per call.
     """
-    cov = symmetrize(process_covariance)
-    blocks = _matrix_to_oscillator_blocks(cov)
-    n_oscillators = blocks.shape[0]
-
-    structured_blocks = jnp.zeros_like(blocks)
-    diag_blocks = jnp.zeros_like(blocks)
-    for i in range(n_oscillators):
-        variance = jnp.maximum(0.5 * jnp.trace(blocks[i, i]), min_eigenvalue)
-        block = variance * IDENTITY_2x2.astype(cov.dtype)
-        structured_blocks = structured_blocks.at[i, i].set(block)
-        diag_blocks = diag_blocks.at[i, i].set(block)
-
-    for i in range(n_oscillators):
-        for j in range(i + 1, n_oscillators):
-            upper = _project_to_scaled_rotation_matrix(blocks[i, j])
-            structured_blocks = structured_blocks.at[i, j].set(upper)
-            structured_blocks = structured_blocks.at[j, i].set(upper.T)
-
-    structured = _oscillator_blocks_to_matrix(structured_blocks)
-    diag_only = _oscillator_blocks_to_matrix(diag_blocks)
-    min_eig = float(jnp.linalg.eigvalsh(structured).min())
-    if min_eig >= min_eigenvalue:
-        return structured
-
-    off_diag = structured - diag_only
-    lo = 0.0
-    hi = 1.0
-    for _ in range(max_shrink_iter):
-        mid = 0.5 * (lo + hi)
-        candidate = diag_only + mid * off_diag
-        candidate_min_eig = float(jnp.linalg.eigvalsh(candidate).min())
-        if candidate_min_eig >= min_eigenvalue:
-            lo = mid
-        else:
-            hi = mid
-
-    return diag_only + lo * off_diag
+    structured, diag_only = _cnm_structured_projection(
+        process_covariance, min_eigenvalue
+    )
+    shrink = _cnm_psd_shrink_factor(structured, diag_only, min_eigenvalue)
+    return jnp.where(
+        shrink >= 1.0, structured, diag_only + shrink * (structured - diag_only)
+    )
 
 
 def constrain_correlated_noise_process_covariance(

@@ -1786,6 +1786,101 @@ class TestBlockDiagonalDispatch:
                 "flip the dispatch to dense"
             )
 
+    def test_block_path_never_expands_the_design_matrix(self, monkeypatch) -> None:
+        """On the block path the filter works from Z_base; the
+        ``(n_time, n_neurons, n_neurons * n_basis)`` expansion is never built
+        -- not by fit (EM loop + saturation check), fit_sgd, or score."""
+        import optax
+
+        position, spikes = self._make_multi_neuron_data(n_neurons=3, n_time=120)
+
+        def _boom(self_, Z_base):
+            raise AssertionError("dense design matrix built on the block path")
+
+        monkeypatch.setattr(PlaceFieldModel, "_expand_to_block_diagonal", _boom)
+        model = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        lls = model.fit(position, spikes, max_iter=2, verbose=False)
+        assert model._block_n_neurons == 3  # guard: the block path was taken
+        assert all(np.isfinite(ll) for ll in lls)
+        assert np.isfinite(model.score(position, spikes))
+
+        model_sgd = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        lls_sgd = model_sgd.fit_sgd(
+            position, spikes, optimizer=optax.sgd(1e-4), num_steps=2
+        )
+        assert model_sgd._block_n_neurons == 3
+        assert all(np.isfinite(ll) for ll in lls_sgd)
+
+    def test_block_path_stores_block_covariances_matching_dense(self) -> None:
+        """Block-path covariances are BlockDiagonalCovariance containers and
+        every consumer (rate maps, credible intervals, state CIs, drift
+        summary, M-step output) matches the dense path."""
+        from state_space_practice.point_process_kalman import (
+            BlockDiagonalCovariance,
+        )
+
+        position, spikes = self._make_multi_neuron_data(n_neurons=2, n_time=200)
+        m_block = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        m_block.fit(position, spikes, max_iter=3, verbose=False)
+        m_dense = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        m_dense.fit(position, spikes, max_iter=3, verbose=False, force_dense=True)
+        assert m_block._block_n_neurons == 2 and m_dense._block_n_neurons is None
+
+        for name in ("smoother_cov", "smoother_cross_cov", "filtered_cov"):
+            block_cov = getattr(m_block, name)
+            dense_cov = getattr(m_dense, name)
+            assert isinstance(block_cov, BlockDiagonalCovariance)
+            assert block_cov.shape == dense_cov.shape
+            np.testing.assert_allclose(
+                np.asarray(block_cov), np.asarray(dense_cov), atol=1e-7
+            )
+
+        grid = m_block.make_grid(8)[0]
+        for neuron_idx in range(2):
+            rate_b, ci_b = m_block.predict_rate_map(grid, neuron_idx=neuron_idx)
+            rate_d, ci_d = m_dense.predict_rate_map(grid, neuron_idx=neuron_idx)
+            assert rate_d.max() > 1.0  # guard: a non-trivial map
+            np.testing.assert_allclose(rate_b, rate_d, rtol=1e-6)
+            np.testing.assert_allclose(ci_b, ci_d, rtol=1e-6)
+        np.testing.assert_allclose(
+            np.asarray(m_block.get_state_confidence_interval()),
+            np.asarray(m_dense.get_state_confidence_interval()),
+            rtol=1e-6,
+            atol=1e-8,
+        )
+        np.testing.assert_allclose(
+            m_block.drift_summary(n_grid=8, n_blocks=3)["centers"],
+            m_dense.drift_summary(n_grid=8, n_blocks=3)["centers"],
+            rtol=1e-6,
+        )
+        # The M-step consumed the block sufficient statistics: same Q. The
+        # tolerance is looser here because Q (~1e-6) is a difference of
+        # O(n_time) sufficient statistics, so roundoff-level differences in
+        # the time sums are amplified by the cancellation; a wrong statistic
+        # would change Q by orders of magnitude.
+        np.testing.assert_allclose(
+            np.asarray(jnp.diag(m_block.process_cov)),
+            np.asarray(jnp.diag(m_dense.process_cov)),
+            rtol=1e-4,
+        )
+
+    def test_detect_block_structure_tracks_parameter_matrices(self) -> None:
+        """Dispatch follows the parameter matrices alone (the design structure
+        is fixed by construction): a dense A flips it off, restoring A flips
+        it back, force_dense always wins."""
+        position, spikes = self._make_multi_neuron_data(n_neurons=2, n_time=100)
+        model = PlaceFieldModel(dt=0.02, n_interior_knots=3)
+        model.fit(position, spikes, max_iter=1, verbose=False)
+        assert model._detect_block_structure() == (2, model.n_basis_per_neuron)
+        assert model._detect_block_structure(force_dense=True) == (None, None)
+
+        block_A = model.transition_matrix
+        nb = model.n_basis_per_neuron
+        model.transition_matrix = block_A.at[0, nb].set(0.1)  # off-block entry
+        assert model._detect_block_structure() == (None, None)
+        model.transition_matrix = block_A
+        assert model._detect_block_structure() == (2, nb)
+
     def test_score_reuses_fit_time_dispatch(self) -> None:
         """score() should reuse the block dispatch decision made at fit time
         without re-detecting. This keeps score() fast — detection is
