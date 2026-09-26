@@ -307,6 +307,7 @@ def _compute_posterior_entropy_reference(
 
     return discrete_entropy + cont_entropy
 
+
 def test_process_covariance_stats_use_the_fixed_transition_matrix() -> None:
     """CNM residual scatter must use its fixed A, not the unconstrained A MLE."""
     means = jnp.array(
@@ -658,6 +659,35 @@ def test_update_discrete_probs_impossible_lane_nan_does_not_poison() -> None:
     assert bool(jnp.isfinite(log_pred))
     # Supported row 0 reaches both destinations equally under the uniform Z.
     np.testing.assert_allclose(np.asarray(m_t), np.array([0.5, 0.5]), rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "nan_input", ["transition_entry", "supported_prev_prob"], ids=lambda s: s
+)
+def test_update_discrete_probs_nan_dynamics_input_fails_loud(nan_input: str) -> None:
+    """A NaN transition entry or supported previous probability propagates NaN.
+
+    ``zero_preserving_log`` maps only an exact zero to ``-inf``; NaN (and
+    negative) inputs give NaN. A NaN in the dynamics is malformed input, not a
+    structural zero, so it must not be silently treated as an impossible pair
+    (which would return a finite, plausible-looking posterior) -- it surfaces
+    as NaN in the posterior and the log-predictive.
+    """
+    log_likelihood = jnp.log(jnp.array([[0.9, 0.1], [0.2, 0.8]]))
+    Z = jnp.array([[0.95, 0.05], [0.1, 0.9]])
+    prev = jnp.array([0.7, 0.3])
+    support = jnp.array([True, True])
+    if nan_input == "transition_entry":
+        Z = Z.at[0, 1].set(jnp.nan)
+    else:
+        prev = prev.at[1].set(jnp.nan)
+
+    m_t, _, log_pred, _ = _update_discrete_state_probabilities(
+        log_likelihood, Z, prev, support
+    )
+
+    assert bool(jnp.all(jnp.isnan(m_t)))
+    assert bool(jnp.isnan(log_pred))
 
 
 def test_first_timestep_ruled_out_state_not_floored() -> None:

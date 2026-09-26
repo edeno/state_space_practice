@@ -623,9 +623,9 @@ def _first_timestep_discrete_update(
     init_discrete_state_prob = _normalize_initial_discrete_prob(
         init_discrete_state_prob
     )
-    # ``zero_preserving_log``: exact zero -> -inf; positive -> its true log,
-    # floored only at the dtype's tiny (NOT 1e-10), so a tiny prior like 1e-12 is
-    # faithful. Malformed (NaN) prior -> NaN, so the posterior/LL fail loud.
+    # ``zero_preserving_log``: exact zero -> -inf; positive -> its true log with
+    # no floor, so a tiny prior like 1e-12 is faithful. Malformed (NaN) prior ->
+    # NaN, so the posterior/LL fail loud.
     log_prior = jnp.where(
         jnp.isnan(init_discrete_state_prob),
         jnp.nan,
@@ -2993,7 +2993,6 @@ def compute_transition_q_from_params(
     return compute_transition_q_function(A, gamma1, beta, process_cov=process_cov)
 
 
-
 # Bounded coordinate maps shared by the DIM transition-parameter optimizers:
 # damping / coupling live in ``(0, scale)`` via a scaled sigmoid, frequency in
 # ``(-scale, scale)`` via a scaled tanh. The inverses clip an ``1e-6`` margin
@@ -3017,6 +3016,7 @@ def _scaled_tanh(x: jax.Array, scale: float) -> jax.Array:
 def _inv_scaled_tanh(y: jax.Array, scale: float) -> jax.Array:
     ratio = jnp.clip(y / scale, -1.0 + _OPEN_INTERVAL_EPS, 1.0 - _OPEN_INTERVAL_EPS)
     return jnp.arctanh(ratio)
+
 
 def optimize_dim_transition_params(
     gamma1: jax.Array,

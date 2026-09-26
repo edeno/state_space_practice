@@ -1133,7 +1133,24 @@ def hmm_viterbi(
 
 
 def zero_preserving_log(probabilities: Array) -> Array:
-    """Return log probabilities while keeping exact zeros at ``-inf``."""
+    """Elementwise log of probabilities that keeps exact zeros at ``-inf``.
+
+    There is no floor: an exact zero maps to ``-inf`` (an impossible state or
+    transition stays impossible), and every positive value maps to its true
+    log (e.g. ``1e-300 -> -690.8``; note XLA may flush subnormals to zero).
+    Malformed inputs are not masked: NaN and negative entries give NaN, so
+    they propagate (fail loud) instead of being mistaken for a structural zero.
+
+    Parameters
+    ----------
+    probabilities : Array, shape (...)
+        Probabilities (any shape).
+
+    Returns
+    -------
+    log_probabilities : Array, shape (...)
+        ``log(probabilities)`` with ``0 -> -inf`` and ``NaN``/negative -> NaN.
+    """
     safe_probabilities = jnp.where(probabilities == 0, 1.0, probabilities)
     return jnp.where(probabilities == 0, -jnp.inf, jnp.log(safe_probabilities))
 

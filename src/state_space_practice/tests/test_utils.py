@@ -24,6 +24,7 @@ from state_space_practice.utils import (
     validate_covariance,
     validate_probability_vector,
     validate_transition_matrix,
+    zero_preserving_log,
 )
 
 
@@ -158,9 +159,7 @@ class TestCheckConverged:
 
     def test_near_zero_absolute_wobble_converges(self) -> None:
         """Near-zero likelihoods should not explode the relative-change check."""
-        is_converged, is_increasing = check_converged(
-            -1e-12, 1e-12, tolerance=1e-4
-        )
+        is_converged, is_increasing = check_converged(-1e-12, 1e-12, tolerance=1e-4)
         assert is_converged is True
         assert is_increasing is True
 
@@ -207,8 +206,11 @@ class TestLinearAlgebraUtilities:
         # relative signal.
         x = psd_solve(A, b)
         np.testing.assert_allclose(
-            np.asarray(x), expected, rtol=1e-5, atol=0,
-            err_msg="relative boost should not swamp the signal"
+            np.asarray(x),
+            expected,
+            rtol=1e-5,
+            atol=0,
+            err_msg="relative boost should not swamp the signal",
         )
 
     def test_psd_solve_small_scale_unchanged(self) -> None:
@@ -327,7 +329,9 @@ class TestShiftToPsd:
         Q = _degenerate_block_cov(0.5)
         lifted = shift_to_psd(Q)
         # Only the diagonal is shifted (by a single scalar); off-diagonals unchanged.
-        np.testing.assert_allclose(lifted - Q, jnp.diag(jnp.diag(lifted - Q)), atol=1e-12)
+        np.testing.assert_allclose(
+            lifted - Q, jnp.diag(jnp.diag(lifted - Q)), atol=1e-12
+        )
         diag_shift = jnp.diag(lifted - Q)
         np.testing.assert_allclose(diag_shift, diag_shift[0], atol=1e-12)
         np.testing.assert_allclose(lifted, lifted.T, atol=1e-12)
@@ -345,7 +349,13 @@ class TestShiftToPsd:
         assert bool(jnp.isfinite(grad))
         # The eigenvector-reconstruction projection NaNs here -- this is the bug
         # shift_to_psd exists to avoid.
-        assert not bool(jnp.isfinite(jax.grad(lambda c: stabilize_covariance(_degenerate_block_cov(c)).sum())(c_eval)))
+        assert not bool(
+            jnp.isfinite(
+                jax.grad(
+                    lambda c: stabilize_covariance(_degenerate_block_cov(c)).sum()
+                )(c_eval)
+            )
+        )
 
 
 class TestProbabilityUtilities:
@@ -439,6 +449,16 @@ class TestProbabilityUtilities:
         scaled, ll_max = scale_likelihood(ll)
         assert bool(jnp.isposinf(ll_max))
         np.testing.assert_allclose(scaled, jnp.array([0.0, 1.0, 1.0]))
+
+    def test_zero_preserving_log_contract(self) -> None:
+        """Exact zero -> -inf, positive -> exact log (no floor), NaN/neg -> NaN."""
+        p = jnp.array([0.0, 0.25, 1e-300, jnp.nan, -0.1])
+        result = np.asarray(zero_preserving_log(p))
+
+        assert result[0] == -np.inf
+        # Unfloored: 1e-300 keeps its true log (far below e.g. log(1e-10)).
+        np.testing.assert_allclose(result[1:3], np.log([0.25, 1e-300]))
+        assert np.isnan(result[3]) and np.isnan(result[4])
 
 
 class TestValidateCovariance:
