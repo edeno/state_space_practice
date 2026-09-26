@@ -1,4 +1,19 @@
-"""Shared EKF / Laplace-EKF kernel for the Hamiltonian model family.
+"""Shared EKF / Laplace-EKF machinery for the Hamiltonian model family.
+
+Contents
+--------
+- Stateless per-step helpers: :func:`gaussian_measurement_update`,
+  :func:`point_process_laplace_update`, :func:`ekf_rts_backward_pass`, the
+  scan drivers :func:`run_ekf_filter` / :func:`run_ekf_smoother`, and the
+  loss helpers :func:`mlp_l2_penalty` / :func:`poisson_rollout_nll`.
+- Module-level jitted cores :func:`hamiltonian_ekf_filter` /
+  :func:`hamiltonian_ekf_smoother` for the single-regime models. They take
+  every mutable quantity in a ``params`` dict and only ``dt`` and the
+  observation-model name as static arguments, so model instances with the
+  same configuration share one compilation.
+- :class:`HamiltonianModelBase`, the scaffold the LFP, spike, joint and
+  switching models inherit: ``OscillatorParameterBase`` containers plus
+  ``SGDFittableMixin``, with the shared ``fit_sgd`` hooks.
 
 Conventions
 -----------
@@ -8,13 +23,12 @@ Conventions
 - Helpers return JAX arrays and do not capture Python state; closures over
   external arrays inside ``jax.lax.scan`` bodies must come from the caller,
   not from this module.
-- Log-likelihoods returned here are the per-step contribution. Callers
-  accumulate via the scan ``carry`` or via ``jnp.sum`` over the scan
-  output, depending on filter/smoother convention.
+- Log-likelihoods returned by the per-step helpers are that step's
+  contribution. Callers accumulate via the scan ``carry`` or via ``jnp.sum``
+  over the scan output, depending on filter/smoother convention.
 
-See docs/hamiltonian_architecture.md for the broader rationale (why the
-Hamiltonian family is standalone — no linear-Gaussian EM integration,
-SGD-only fitting).
+See docs/hamiltonian_architecture.md for the design rationale (no
+linear-Gaussian EM integration, SGD-only fitting).
 """
 
 from __future__ import annotations
@@ -248,9 +262,34 @@ def run_ekf_filter(
 ) -> tuple[Array, Array, Array]:
     """Scan an EKF (Hamiltonian predict + ``update_fn``) over ``observations``.
 
-    ``observations`` is any pytree whose leaves share a leading time axis (one
-    array, or a tuple of arrays for multi-modality models); ``update_fn(m_pred,
-    P_pred, y_t)`` returns ``(m_post, P_post, log_likelihood_t)``.
+    Parameters
+    ----------
+    observations : pytree of Array
+        Leaves share a leading time axis of length ``n_time``: one
+        ``(n_time, n_obs)`` array, or a tuple of such arrays for the
+        multi-modality models (e.g. ``(lfp, spikes)``).
+    init_mean : Array, shape (n_latent,)
+        Prior mean of the state before the first prediction.
+    init_cov : Array, shape (n_latent, n_latent)
+        Prior covariance of the state before the first prediction.
+    trans_params : dict
+        MLP parameters plus ``"omega"`` for the leapfrog transition.
+    process_cov : Array, shape (n_latent, n_latent)
+        Additive process-noise covariance ``Q``.
+    dt : float
+        Leapfrog step (static when jitted).
+    update_fn : callable
+        ``update_fn(m_pred, P_pred, y_t) -> (m_post, P_post,
+        log_likelihood_t)`` with ``y_t`` the time-``t`` slice of
+        ``observations``.
+
+    Returns
+    -------
+    filtered_means : Array, shape (n_time, n_latent)
+    filtered_covs : Array, shape (n_time, n_latent, n_latent)
+    log_likelihoods : Array, shape (n_time,)
+        Per-step contributions ``log p(y_t | y_{1:t-1})`` as returned by
+        ``update_fn``.
     """
 
     def step(carry, y_t):
@@ -276,8 +315,18 @@ def run_ekf_smoother(
 ) -> tuple[Array, Array]:
     """EKF forward pass (with Jacobians) followed by the RTS backward pass.
 
-    Same conventions as :func:`run_ekf_filter`, except ``update_fn`` returns
-    only ``(m_post, P_post)`` (no log-likelihood is needed for smoothing).
+    Parameters
+    ----------
+    observations, init_mean, init_cov, trans_params, process_cov, dt
+        As in :func:`run_ekf_filter`.
+    update_fn : callable
+        ``update_fn(m_pred, P_pred, y_t) -> (m_post, P_post)``; no
+        log-likelihood is needed for smoothing.
+
+    Returns
+    -------
+    smoothed_means : Array, shape (n_time, n_latent)
+    smoothed_covs : Array, shape (n_time, n_latent, n_latent)
     """
 
     def forward_step(carry, y_t):
@@ -436,6 +485,11 @@ def hamiltonian_ekf_smoother(
 def poisson_rollout_nll(log_lambda: Array, spikes: Array, dt: float) -> Array:
     """Overflow-safe, gradient-preserving Poisson negative log-likelihood.
 
+    Computes ``sum(mu - y * log(mu) + log(y!))`` with expected counts
+    ``mu = exp(log_lambda) * dt``, i.e. the full normalized Poisson NLL
+    (``log(y!)`` enters as ``gammaln(y + 1)``), so it is on the same scale as
+    the Gaussian NLL it is added to in the joint surrogate.
+
     An unclipped ``exp`` overflows to ``+inf`` on a divergent rollout
     (``0 * log(inf)`` / ``inf - inf`` give NaN); a hard clip would zero the
     gradient above the cap and freeze SGD. ``_soft_expected_count_and_log``
@@ -444,6 +498,20 @@ def poisson_rollout_nll(log_lambda: Array, spikes: Array, dt: float) -> Array:
     wherever ``rates`` is representable and positive, and stays finite (not
     ``-inf``) where ``rates`` underflows to 0, so a positive spike count keeps
     a finite restoring gradient there that ``log(rates + eps)`` would kill.
+
+    Parameters
+    ----------
+    log_lambda : Array, shape (n_time, n_neurons)
+        Log firing rate in Hz.
+    spikes : Array, shape (n_time, n_neurons)
+        Spike counts per bin.
+    dt : float
+        Bin width in seconds.
+
+    Returns
+    -------
+    nll : Array, shape ()
+        Negative log-likelihood summed over time and neurons.
     """
     rates, log_rates = _soft_expected_count_and_log(log_lambda, dt)
     return jnp.sum(rates - spikes * log_rates + jax.scipy.special.gammaln(spikes + 1.0))
