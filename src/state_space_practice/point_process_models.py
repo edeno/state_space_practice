@@ -421,8 +421,9 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         Every JAX-array and immutable-container attribute below is *reassigned*
         (never mutated in place) by the E/M steps, so a plain reference is a
         valid snapshot -- restoring it later is unaffected by the reassignment.
-        Only ``_current_osc_params`` (a list mutated in place by the
-        reparameterized M-step) is deep-copied.
+        Only ``_current_osc_params`` (a mutable ``dict | None`` warm-start
+        cache for the reparameterized M-step) is deep-copied, so an in-place
+        edit of the live dict cannot leak into the snapshot.
         """
         attrs = [
             "init_mean",

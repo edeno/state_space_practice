@@ -1968,8 +1968,8 @@ def _switching_point_process_filter_jit(
         Filtered discrete state probabilities p(S_t = j | y_{1:t}).
     pair_cond_filter_mean : Array, shape (n_time, n_latent, n_discrete_states, n_discrete_states)
         Pair-conditional filter mean trajectory. Entry [t, :, i, j] is the mean
-        for p(x_t | y_{1:t}, S_{t-1}=i, S_t=j). The GPB2 smoother consumes the
-        whole trajectory; GPB1 callers use the last timestep ``[-1]``.
+        for p(x_t | y_{1:t}, S_{t-1}=i, S_t=j). Only the GPB2 smoother consumes
+        it (the whole trajectory); the GPB1 smoother does not use it.
     pair_cond_filter_cov : Array, shape (n_time, n_latent, n_latent, n_discrete_states, n_discrete_states)
         Pair-conditional filter covariance trajectory.
     pair_cond_filter_prob : Array, shape (n_time, n_discrete_states, n_discrete_states)
@@ -2319,8 +2319,13 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
     how the continuous transition matrix and process covariance are
     initialized and projected (abstract hooks below), in how the M-step's
     initial-state estimates are regularized (``_regularize_init_mean_update``
-    / ``_regularize_init_cov_update``) and in their EM driver, so each
-    concrete model defines its own ``fit``.
+    / ``_regularize_init_cov_update``) and in their EM rollback policy. Both
+    ``fit`` implementations run :func:`~state_space_practice.em_driver.run_em`
+    with different options: :meth:`SwitchingSpikeOscillatorModel.fit` rolls
+    back and stops on a decrease beyond ``decrease_tol``, while
+    ``BaseSwitchingPointProcessModel.fit`` (inherited unchanged by the
+    COM/CNM/DIM point-process models) logs decreases, keeps iterating and
+    restores the best iterate at the end.
 
     The constructor validates and stores the parameters common to every
     model. Concrete classes expose their own public signature (defaults
@@ -2939,7 +2944,12 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         self.init_discrete_state_prob = new_init_discrete_prob
 
     def _regularize_process_cov_update(self, process_cov: Array) -> Array:
-        """Trust-region blend and eigenvalue clip of the M-step Q estimate."""
+        """Trust-region blend and eigenvalue clip of the M-step Q estimate.
+
+        Called before the result is assigned, so ``self.process_cov`` still
+        holds the previous iterate's Q; the trust-region blend mixes the new
+        estimate with it.
+        """
         cfg = self.q_regularization
         if not cfg.enabled:
             return process_cov
@@ -2958,7 +2968,12 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         )(Q_blended)
 
     def _regularize_init_mean_update(self, init_mean: Array) -> Array:
-        """Hook applied to the M-step init_mean estimate (identity by default)."""
+        """Hook applied to the M-step init_mean estimate (identity by default).
+
+        Called before the result is assigned, so ``self.init_mean`` still
+        holds the previous iterate's value, available to an override that
+        blends with it.
+        """
         return init_mean
 
     def _regularize_init_cov_update(self, init_cov: Array) -> Array:
@@ -2970,6 +2985,10 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         init_cov -> weak filter constraint -> even larger smoother cov -> even
         larger init_cov. Trust-region blending and the absolute
         ``init_cov_max_eigenvalue`` cap break the cycle.
+
+        Called before the result is assigned, so ``self.init_cov`` still
+        holds the previous iterate's value; the trust-region blend mixes the
+        new estimate with it.
         """
         cfg = self.q_regularization
         if not cfg.enabled:
@@ -3321,7 +3340,11 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
     max_spectral_radius : float, default=0.999
         Upper bound on the spectral radius of each state's transition matrix
         enforced by ``_project_parameters`` after the M-step (and after an SGD
-        parameter store). Must lie in ``(0, 1)``.
+        parameter store). Must lie in ``(0, 1)``. Only enforced when
+        ``update_continuous_transition_matrix=True`` (a fixed A is never
+        projected). The initial A (spectral radius up to 0.98, see
+        ``_initialize_continuous_transition_matrix``) is not clamped, so a
+        bound below 0.98 only takes effect from the first projection on.
 
     Attributes
     ----------
@@ -3442,7 +3465,10 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
             stability for long sequences with sparse observations and cleaner
             pair-conditioned transition statistics for the dynamics M-step.
         max_spectral_radius : float, default=0.999
-            Spectral-radius bound applied to each projected transition matrix.
+            Spectral-radius bound applied to each projected transition matrix
+            (after each M-step / SGD store, and only when
+            ``update_continuous_transition_matrix=True``). The initial A
+            (radius up to 0.98) is not clamped.
 
         Raises
         ------
@@ -3632,7 +3658,10 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         ------
         ValueError
             If spikes has wrong shape (must be 2D with n_neurons columns).
-            If log-likelihood becomes non-finite during iteration.
+            If the first E-step's log-likelihood is non-finite (the initial
+            parameters are unusable). A later non-finite E-step does not
+            raise: EM rolls back to the previous accepted iterate, logs a
+            warning and stops.
 
         Notes
         -----
