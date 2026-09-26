@@ -505,22 +505,18 @@ class SGDFittableMixin:
                 cache.pop(next(iter(cache)))
         return entry.train_step, entry, cache, key
 
-    def fit_sgd(
-        self,
-        *args,
-        optimizer: object | None = None,
-        num_steps: int = 200,
-        verbose: bool = False,
-        convergence_tol: float | None = None,
-        **kwargs,
-    ) -> list[float]:
+    # Declared as ``(*args, **kwargs)`` so subclasses can replace the data
+    # arguments with their own signature without an [override] violation.
+    # The optimizer settings are keyword-only, exactly as before.
+    def fit_sgd(self, *args: Any, **kwargs: Any) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
 
         Parameters
         ----------
         *args, **kwargs
-            Passed through ``_prepare_sgd_data`` and then to _sgd_loss_fn
-            and _finalize_sgd.
+            Data arguments, passed through ``_prepare_sgd_data`` and then to
+            _sgd_loss_fn and _finalize_sgd. The settings below are
+            keyword-only and are removed from ``kwargs`` first.
         optimizer : optax optimizer or None
             Default: adam(1e-2) with gradient clipping.
         num_steps : int
@@ -542,6 +538,11 @@ class SGDFittableMixin:
             loss. When the final candidate is finite, the final entry is
             rewritten to the log likelihood of the stored final parameters.
         """
+        optimizer: object | None = kwargs.pop("optimizer", None)
+        num_steps: int = kwargs.pop("num_steps", 200)
+        verbose: bool = kwargs.pop("verbose", False)
+        convergence_tol: float | None = kwargs.pop("convergence_tol", None)
+
         # Validate the plain settings before the hook: ``_prepare_sgd_data`` may
         # mutate the model (e.g. record the sequence length).
         num_steps = validate_int(num_steps, "num_steps", nonnegative=True)

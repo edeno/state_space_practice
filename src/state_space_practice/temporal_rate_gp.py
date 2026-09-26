@@ -515,7 +515,7 @@ class TemporalRateGP(SGDFittableMixin):
 
     # -- public fitting / prediction ------------------------------------------
 
-    def fit_sgd(  # type: ignore[override]
+    def fit_sgd(
         self,
         counts: ArrayLike,
         *,

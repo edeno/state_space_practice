@@ -109,7 +109,7 @@ class HamiltonianSpikeModel(HamiltonianModelBase):
         validate_count_array(spikes, "spikes", allow_empty=allow_empty)
         return spikes
 
-    def fit_sgd(  # type: ignore[override]
+    def fit_sgd(
         self,
         observations: ArrayLike,
         optimizer: object | None = None,

@@ -738,7 +738,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         self._obs_covariates = obs_covariates_arr
         return choices_arr
 
-    def fit(
+    def fit(  # type: ignore[override]  # covariates inserted positionally after choices
         self,
         choices: ArrayLike,
         covariates: ArrayLike | None = None,
@@ -779,7 +779,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         choices_arr = self._bind_covariates(choices, covariates, obs_covariates, "fit")
         return self._fit_em(choices_arr, max_iter, tolerance, verbose, beta_grid)
 
-    def fit_sgd(
+    def fit_sgd(  # type: ignore[override]  # covariates inserted positionally after choices
         self,
         choices: ArrayLike,
         covariates: ArrayLike | None = None,

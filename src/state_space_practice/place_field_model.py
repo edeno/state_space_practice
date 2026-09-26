@@ -1401,7 +1401,7 @@ class PlaceFieldModel(SGDFittableMixin):
 
     # --- SGDFittableMixin protocol ---
 
-    def fit_sgd(  # type: ignore[override]
+    def fit_sgd(
         self,
         position: ArrayLike,
         spikes: ArrayLike,

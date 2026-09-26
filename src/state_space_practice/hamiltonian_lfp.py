@@ -123,7 +123,7 @@ class HamiltonianLFPModel(HamiltonianModelBase):
             raise ValueError("lfp_data must contain only finite values.")
         return lfp_data
 
-    def fit_sgd(  # type: ignore[override]
+    def fit_sgd(
         self,
         observations: ArrayLike,
         optimizer: object | None = None,

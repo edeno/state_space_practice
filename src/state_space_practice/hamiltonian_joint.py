@@ -230,7 +230,7 @@ class JointHamiltonianModel(HamiltonianModelBase):
         validate_count_array(spike_data, "spike_data", allow_empty=allow_empty)
         return lfp_data, spike_data
 
-    def fit_sgd(  # type: ignore[override]
+    def fit_sgd(
         self,
         lfp_obs: ArrayLike,
         spike_obs: ArrayLike,

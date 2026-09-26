@@ -3035,7 +3035,7 @@ class PointProcessModel(SGDFittableMixin):
     # substitute for ``*args, **kwargs``, and there is no signature that both
     # keeps the explicit parameters and satisfies the check -- so the override
     # is suppressed here, as in the sibling Hamiltonian models.
-    def fit_sgd(  # type: ignore[override]
+    def fit_sgd(
         self,
         design_matrix: ArrayLike,
         spike_indicator: ArrayLike,

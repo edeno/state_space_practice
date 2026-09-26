@@ -1063,7 +1063,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
 
     # --- SGDFittableMixin protocol (shared by all oscillator subclasses) ---
 
-    def fit_sgd(  # type: ignore[override]  # concrete signature vs mixin *args/**kwargs
+    def fit_sgd(
         self,
         observations: ArrayLike,
         key: Array | None = None,
@@ -2110,7 +2110,7 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
 
         return params, spec
 
-    def fit_sgd(  # type: ignore[override]  # concrete signature vs mixin *args/**kwargs
+    def fit_sgd(  # type: ignore[override]  # connectivity_penalty inserted before skip_init
         self,
         observations: ArrayLike,
         key: Array | None = None,
