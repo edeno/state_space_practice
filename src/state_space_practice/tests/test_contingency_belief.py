@@ -1114,3 +1114,44 @@ class TestTransitionMStep:
         # direction of the same row. A switch covariate opposes stickiness.
         assert np.all(np.sign(weight) == -np.sign(intercept)), (weight, intercept)
         assert np.all(np.abs(weight) > 2.0), weight
+
+    def test_m_step_optimizer_compiles_once_across_em_iterations(
+        self, monkeypatch
+    ):
+        """The per-row BFGS runs in one module-level jitted program, so EM
+        iterations with identical shapes reuse a single compilation."""
+        from state_space_practice import contingency_belief as cb
+
+        traces: list = []
+        original = cb.dirichlet_neg_log_likelihood
+
+        def counting(*args, **kwargs):
+            # Called only while _optimize_transition_rows is being traced.
+            traces.append(None)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(cb, "dirichlet_neg_log_likelihood", counting)
+        choices, rewards, cov, _, reward_probs = _simulate_switch_covariate_iohmm(
+            n_trials=150
+        )
+        choices, rewards = jnp.asarray(choices), jnp.asarray(rewards)
+
+        # Calls made while tracing the optimizer once.
+        cb._optimize_transition_rows.clear_cache()
+        model = _true_switch_model(cov, reward_probs)
+        posterior = contingency_belief_smoother(
+            **model._smoother_kwargs(choices, rewards)
+        )
+        model._m_step(choices, rewards, posterior)
+        per_trace = len(traces)
+        assert per_trace > 0  # guard: the first call after clearing traced
+
+        cb._optimize_transition_rows.clear_cache()
+        traces.clear()
+        em_model = ContingencyBeliefModel(n_states=2, n_options=2)
+        lls = em_model.fit(
+            choices, rewards, transition_covariates=cov, max_iter=4,
+            tolerance=0.0,
+        )
+        assert len(lls) >= 4  # guard: several M-steps ran
+        assert len(traces) == per_trace

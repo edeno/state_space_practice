@@ -811,6 +811,52 @@ def _contingency_belief_smoother_jit(
     )
 
 
+@jax.jit
+def _optimize_transition_rows(
+    x0_all: Array,
+    response_all: Array,
+    alpha_all: Array,
+    design: Array,
+    l2_penalty: Array,
+) -> Array:
+    """BFGS-optimize the transition coefficients of every from-state row.
+
+    Module-level and jitted so that every EM iteration reuses one compiled
+    program (the optimizer is re-traced only when the shapes change).
+
+    Parameters
+    ----------
+    x0_all : Array, shape (n_states, n_coefficients * (n_states - 1))
+        Starting coefficients, one flattened row per from-state.
+    response_all : Array, shape (n_states, n_trials - 1, n_states)
+        Expected transition counts ``xi[t, i, j]`` rearranged from-state first.
+    alpha_all : Array, shape (n_states, n_states)
+        Dirichlet-style pseudo-counts per from-state row.
+    design : Array, shape (n_trials - 1, n_coefficients)
+        Transition design matrix row paired with each ``xi[t]``.
+    l2_penalty : Array, shape ()
+        L2 penalty on the non-intercept coefficients.
+
+    Returns
+    -------
+    Array, shape (n_states, n_coefficients * (n_states - 1))
+        Optimized flattened coefficients per from-state.
+    """
+
+    def _optimize_one_row(x0_flat, response_row, alpha_row):
+        def loss(c):
+            return dirichlet_neg_log_likelihood(
+                c, design, response_row, alpha_row, l2_penalty
+            )
+
+        result_opt = jax.scipy.optimize.minimize(
+            loss, x0_flat, method="BFGS", options={"maxiter": 50}
+        )
+        return result_opt.x
+
+    return jax.vmap(_optimize_one_row)(x0_all, response_all, alpha_all)
+
+
 class ContingencyBeliefModel(SGDFittableMixin):
     """Contingency-belief model for multi-armed bandit behavior.
 
@@ -825,7 +871,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
     an intercept column.
 
     EM M-step for transitions uses per-row optimization with
-    Dirichlet-Multinomial loss (Newton-CG via scipy). SGD optimizes
+    Dirichlet-Multinomial loss (BFGS via ``jax.scipy.optimize``). SGD optimizes
     all parameters jointly including transition coefficients.
 
     Parameters
@@ -1241,28 +1287,19 @@ class ContingencyBeliefModel(SGDFittableMixin):
         # ``transition_covariates[1:]``), so the response xi[t] pairs with
         # design row t+1.
         design = jnp.asarray(self._transition_design_matrix[1:])  # (T-1, d)
-        l2_pen = self.transition_regularization
-
-        def _optimize_one_row(x0_flat, response_row, alpha_row):
-            """Optimize transition coefficients for one from-state."""
-            def loss(c):
-                return dirichlet_neg_log_likelihood(
-                    c, design, response_row, alpha_row, l2_pen
-                )
-            result_opt = jax.scipy.optimize.minimize(
-                loss, x0_flat, method="BFGS",
-                options={"maxiter": 50},
-            )
-            return result_opt.x
-
         # vmap over from_state dimension
         x0_all = self.transition_coefficients_.transpose(1, 0, 2).reshape(
             self.n_states, -1
         )  # (n_states, n_coef * (n_states - 1))
         response_all = xi.transpose(1, 0, 2)  # (n_states, T-1, n_states)
-        alpha_all = alpha  # (n_states, n_states)
 
-        optimized = jax.vmap(_optimize_one_row)(x0_all, response_all, alpha_all)
+        optimized = _optimize_transition_rows(
+            x0_all,
+            response_all,
+            alpha,
+            design,
+            jnp.asarray(self.transition_regularization, dtype=design.dtype),
+        )
         # optimized: (n_states, n_coef * (n_states - 1))
         n_coef = design.shape[1]
         self.transition_coefficients_ = optimized.reshape(
