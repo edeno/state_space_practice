@@ -26,8 +26,6 @@ import jax.scipy.stats.multivariate_normal
 from state_space_practice.utils import (  # noqa: F401 — re-exported for backward compat
     _validate_filter_numerics,
     contains_tracer,
-    psd_cholesky,
-    psd_logdet,
     psd_solve,
     stabilize_covariance,
     symmetrize,
