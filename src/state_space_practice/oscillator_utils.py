@@ -7,11 +7,15 @@ from jax.typing import ArrayLike
 from state_space_practice.utils import (
     contains_tracer,
     debug_print_if,
+    differentiable_spectral_radius,
     stabilize_transition_matrix,
     symmetrize,
 )
 
 IDENTITY_2x2 = jnp.identity(2)
+# Relative tolerance above ``max_spectral_radius`` tolerated by the DIM stability
+# scale before it engages (absorbs round-off of an already clamped matrix).
+_STABILITY_SCALE_RTOL = 1e-10
 ZEROS_2x2 = jnp.zeros((2, 2))
 
 
@@ -546,43 +550,68 @@ def compute_directed_influence_stability_scale(
     coupling_strength: ArrayLike,
     sampling_freq: float,
     max_spectral_radius: float = 0.99,
+    *,
+    phase_difference: ArrayLike,
 ) -> jax.Array:
     """Return a differentiable global scale guaranteeing stable DIM dynamics.
 
-    The maximum block-row operator norm bounds the spectral radius. Scaling
-    damping and coupling by the same scalar scales the complete directed-
-    influence transition matrix by that scalar, while leaving frequency and
-    phase unchanged. ``coupling_strength`` may be one matrix or a stack with a
-    final discrete-state axis; one shared scale is returned for the full stack.
+    Scaling damping and coupling by the same scalar ``s`` scales the complete
+    directed-influence transition matrix by ``s`` (frequency and phase are
+    unchanged), so its spectral radius scales by ``s`` too. The returned scale
+    is ``min(1, max_spectral_radius / max_j rho(A_j))`` with ``rho`` the
+    *actual* spectral radius of each state's unscaled matrix
+    (:func:`~state_space_practice.utils.differentiable_spectral_radius`): it is
+    exactly ``1`` -- and has zero gradient -- whenever every ``A_j`` already
+    honors the bound, so stable parameters are a fixed point of the
+    construction. (A norm-based upper bound would engage for stable matrices
+    and over-damp them.) ``coupling_strength`` / ``phase_difference`` may be
+    one matrix or a stack with a final discrete-state axis; one shared scale is
+    returned for the full stack.
+
+    Parameters
+    ----------
+    freqs : ArrayLike, shape (n_oscillators,)
+    damping_coef : ArrayLike, shape (n_oscillators,)
+    coupling_strength : ArrayLike, shape (n_osc, n_osc[, n_discrete_states])
+    sampling_freq : float
+    max_spectral_radius : float, default=0.99
+    phase_difference : ArrayLike, same shape as ``coupling_strength``
+        Required: the spectral radius depends on the coupling phases.
+
+    Returns
+    -------
+    jax.Array, scalar
+        Scale in ``(0, 1]``.
     """
     freqs_arr = jnp.asarray(freqs)
     damping_arr = jnp.asarray(damping_coef)
     coupling_arr = jnp.asarray(coupling_strength)
+    phase_arr = jnp.asarray(phase_difference)
     if coupling_arr.ndim == 2:
         coupling_arr = coupling_arr[..., None]
+    if phase_arr.ndim == 2:
+        phase_arr = phase_arr[..., None]
+    phase_arr = jnp.broadcast_to(phase_arr, coupling_arr.shape)
 
-    n_oscillators = damping_arr.shape[0]
-    off_diagonal = ~jnp.eye(n_oscillators, dtype=bool)
-    coupling_off = jnp.where(off_diagonal[..., None], coupling_arr, 0.0)
-    incoming_sum = jnp.sum(coupling_off, axis=1)
-    incoming_abs_sum = jnp.sum(jnp.abs(coupling_off), axis=1)
-
-    angles = 2.0 * jnp.pi * freqs_arr / sampling_freq
-    damping_by_state = damping_arr[:, None]
-    diagonal_norm_sq = (
-        damping_by_state**2
-        + incoming_sum**2
-        - 2.0 * damping_by_state * incoming_sum * jnp.cos(angles)[:, None]
-    )
-    # Avoid sqrt'(0) at a degenerate block while conservatively preserving the
-    # upper bound to floating-point precision.
-    eps = jnp.finfo(jnp.result_type(diagonal_norm_sq, 1.0)).eps
-    diagonal_norm = jnp.sqrt(jnp.maximum(diagonal_norm_sq, eps))
-    max_block_row_norm = jnp.max(diagonal_norm + incoming_abs_sum)
-    tiny = jnp.finfo(jnp.result_type(max_block_row_norm, 1.0)).tiny
-    return jnp.minimum(
-        1.0,
-        max_spectral_radius / jnp.maximum(max_block_row_norm, tiny),
+    transition_stack = jax.vmap(
+        lambda coupling, phase: construct_directed_influence_transition_matrix(
+            freqs=freqs_arr,
+            damping_coeffs=damping_arr,
+            coupling_strengths=coupling,
+            phase_diffs=phase,
+            sampling_freq=sampling_freq,
+        ),
+        in_axes=(-1, -1),
+    )(coupling_arr, phase_arr)
+    radius = jnp.max(differentiable_spectral_radius(transition_stack))
+    tiny = jnp.finfo(jnp.result_type(radius, 1.0)).tiny
+    # Relative slack so an extract -> construct round-trip of a matrix already
+    # clamped to exactly the bound is not re-scaled by floating-point noise.
+    threshold = max_spectral_radius * (1.0 + _STABILITY_SCALE_RTOL)
+    return jnp.where(
+        radius > threshold,
+        max_spectral_radius / jnp.maximum(radius, tiny),
+        jnp.ones_like(radius),
     )
 
 
@@ -1172,6 +1201,7 @@ def construct_stable_directed_influence_transition_stack(
         coupling_strength,
         sampling_freq,
         max_spectral_radius=max_spectral_radius,
+        phase_difference=phase_difference,
     )
     effective_damping = jnp.asarray(damping_coef) * scale
     effective_coupling = jnp.asarray(coupling_strength) * scale
@@ -1194,11 +1224,15 @@ def project_transition_matrix_stack(
     """Project each state's transition matrix onto the coupled-oscillator family.
 
     Every ``A_j`` is projected block-wise to scaled-rotation structure
-    (:func:`project_coupled_transition_matrix`) and then uniformly scaled so
-    its spectral radius is at most ``max_spectral_radius``
-    (:func:`~state_space_practice.utils.stabilize_transition_matrix`). The
-    stability clamp is unconditional: an unstable ``A_j`` diverges the latent
-    state and invalidates the E-step posteriors. It is computed on host
+    (:func:`project_coupled_transition_matrix`) and then its spectral radius is
+    clamped to at most ``max_spectral_radius``
+    (:func:`~state_space_practice.utils.stabilize_transition_matrix` with
+    ``block_size=2``). The clamp is local to the strongly connected components
+    of the oscillator coupling graph: for uncoupled (or one-directionally
+    coupled) oscillators only the offending oscillator block is rescaled, so a
+    single unstable rhythm does not damp every other rhythm; for fully coupled
+    oscillators it is the uniform scale. The clamp emits a ``UserWarning``
+    reporting the radius and scale whenever it engages. It is computed on host
     (``eigvals`` has no accelerator lowering), so this runs eagerly.
 
     Parameters
@@ -1206,6 +1240,9 @@ def project_transition_matrix_stack(
     transition_matrices : jax.Array, shape (n_latent, n_latent, n_discrete_states)
         Per-state transition matrices, ``n_latent = 2 * n_oscillators``.
     max_spectral_radius : float, default=0.99
+        See :func:`~state_space_practice.utils.stabilize_transition_matrix` for
+        how to choose it from the sampling rate and the narrowest bandwidth
+        that must remain representable.
 
     Returns
     -------
@@ -1216,6 +1253,7 @@ def project_transition_matrix_stack(
             stabilize_transition_matrix(
                 project_coupled_transition_matrix(transition_matrices[..., j]),
                 max_spectral_radius=max_spectral_radius,
+                block_size=2,
             )
             for j in range(transition_matrices.shape[-1])
         ],
@@ -1318,6 +1356,7 @@ class DirectedInfluenceDynamicsMixin:
             self.coupling_strength,
             self.sampling_freq,
             max_spectral_radius=self.max_spectral_radius,
+            phase_difference=self.phase_difference,
         )
 
     def _intrinsic_osc_params(self) -> dict:
@@ -1349,6 +1388,18 @@ class DirectedInfluenceDynamicsMixin:
                 max_spectral_radius=self.max_spectral_radius,
             )
         )
+        scale = float(self._effective_dim_scale())
+        if scale < 1.0:
+            warnings.warn(
+                "DIM transition matrix exceeded max_spectral_radius="
+                f"{self.max_spectral_radius:g} (radius="
+                f"{self.max_spectral_radius / scale:.6g}); effective damping and "
+                f"coupling were scaled by {scale:.6g}. The public parameters "
+                "stay intrinsic; raise max_spectral_radius toward "
+                "1 - pi * bandwidth / sampling_freq for narrow-band rhythms.",
+                UserWarning,
+                stacklevel=2,
+            )
         if self._current_osc_params is not None:
             self._current_osc_params = self._intrinsic_osc_params()
 
@@ -1392,10 +1443,16 @@ class DirectedInfluenceDynamicsMixin:
 
         Called after the standard EM projection so the public
         frequency/damping/coupling/phase reflect the fitted A -- not just the
-        initial values. ``A`` is then rebuilt through the shared stability
-        scale so it stays reconstructable from the public params. Extracting
-        only coupling/phase would leave frequency/damping stale, so ``A``
-        could not be reconstructed.
+        initial values. ``A`` is then rebuilt from the public params so it
+        stays reconstructable from them. Extracting only coupling/phase would
+        leave frequency/damping stale, so ``A`` could not be reconstructed.
+
+        The projection has already clamped each state's *actual* spectral
+        radius and the extract -> construct round-trip of a single state is
+        exact, so the rebuild's stability scale (which engages only when the
+        actual radius exceeds the bound) is the identity here. It re-engages
+        only when averaging the shared frequency/damping across disagreeing
+        states pushes a rebuilt ``A_j`` past the bound.
         """
         params = extract_dim_params_from_matrix_stack(
             self.continuous_transition_matrix, self.sampling_freq, self.n_oscillators

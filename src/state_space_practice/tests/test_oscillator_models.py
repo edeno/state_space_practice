@@ -546,22 +546,25 @@ class TestDirectedInfluenceModel:
         """A smaller ``max_spectral_radius`` should shrink the achieved radius
         of the constructed transition matrix in exact proportion.
 
-        With strong coupling the block-row operator norm exceeds both bounds, so
+        With strong coupling the actual spectral radius exceeds both bounds, so
         the differentiable stability scale is active and ``A = scale * A_intrinsic``
-        with ``scale = max_spectral_radius / norm``. The spectral radius is
+        with ``scale = max_spectral_radius / radius``. The spectral radius is
         therefore linear in ``max_spectral_radius``.
         """
         n_osc = directed_influence_params["n_oscillators"]
         n_disc = directed_influence_params["n_discrete_states"]
         strong_coupling = (
-            jnp.zeros((n_osc, n_osc, n_disc)).at[0, 1, :].set(0.4).at[1, 0, :].set(0.4)
+            jnp.zeros((n_osc, n_osc, n_disc)).at[0, 1, :].set(1.5).at[1, 0, :].set(1.5)
         )
         params = {**directed_influence_params, "coupling_strength": strong_coupling}
 
         model_high = DirectedInfluenceModel(**params, max_spectral_radius=0.99)
         model_low = DirectedInfluenceModel(**params, max_spectral_radius=0.5)
-        model_high._initialize_parameters(jax.random.PRNGKey(0))
-        model_low._initialize_parameters(jax.random.PRNGKey(0))
+        # The clamp engages for both bounds and must say so.
+        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+            model_high._initialize_parameters(jax.random.PRNGKey(0))
+        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+            model_low._initialize_parameters(jax.random.PRNGKey(0))
 
         # Guard: scaling must actually be active for both, otherwise the
         # proportionality below would be vacuously satisfied by scale == 1.
@@ -1701,7 +1704,8 @@ class TestDIMStabilityEnforcement:
                 :, :, j
             ].set(jnp.eye(n_latent) * 1.5)
 
-        model._project_parameters()
+        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+            model._project_parameters()
 
         for j in range(model.n_discrete_states):
             A_j = model.continuous_transition_matrix[:, :, j]
@@ -1722,7 +1726,8 @@ class TestDIMStabilityEnforcement:
         model = DirectedInfluenceModel(
             **{**directed_influence_params, "coupling_strength": strong}
         )
-        model._initialize_parameters(jax.random.PRNGKey(0))
+        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+            model._initialize_parameters(jax.random.PRNGKey(0))
 
         # Public params are the intrinsic values; A applies the global stability
         # scale, so reconstruction re-applies it via _effective_dim_scale().
@@ -1790,12 +1795,13 @@ class TestDIMStabilityEnforcement:
         model._initialize_parameters(jax.random.PRNGKey(0))
         strong = jnp.zeros_like(model.coupling_strength)
         strong = strong.at[0, 1, :].set(2.0).at[1, 0, :].set(2.0)
-        model._store_sgd_params(
-            {
-                "phase_difference": model.phase_difference,
-                "coupling_strength": strong,
-            }
-        )
+        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+            model._store_sgd_params(
+                {
+                    "phase_difference": model.phase_difference,
+                    "coupling_strength": strong,
+                }
+            )
 
         # Public damping stays intrinsic (not shrunk); A applies the scale.
         assert bool(
@@ -1826,12 +1832,13 @@ class TestDIMStabilityEnforcement:
 
         damps = []
         for _ in range(4):
-            model._store_sgd_params(
-                {
-                    "phase_difference": model.phase_difference,
-                    "coupling_strength": strong,
-                }
-            )
+            with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+                model._store_sgd_params(
+                    {
+                        "phase_difference": model.phase_difference,
+                        "coupling_strength": strong,
+                    }
+                )
             damps.append(model.damping_coef)
             for j in range(model.n_discrete_states):
                 A = model.continuous_transition_matrix[..., j]
@@ -1865,7 +1872,7 @@ class TestDIMStabilityEnforcement:
                 .set(0.1)
             )
             return compute_directed_influence_stability_scale(
-                freqs, damping, coupling, 100.0
+                freqs, damping, coupling, 100.0, phase_difference=jnp.zeros((3, 3))
             )
 
         assert bool(jnp.isfinite(scale_of(0.0)))
@@ -2952,3 +2959,46 @@ class TestBaseModelSGDStorage:
         np.testing.assert_array_equal(model.init_cov[..., 1], new_P1)
         for j in (0, 2):
             np.testing.assert_array_equal(model.init_cov[..., j], old_init_cov[..., j])
+
+
+# ============================================================================
+# DIM fixed point at the truth
+# ============================================================================
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("use_reparameterized_mstep", [False, True])
+def test_dim_em_started_at_truth_does_not_roll_back(use_reparameterized_mstep) -> None:
+    """At the true DIM scenario parameters the initial A is exactly A_true and
+    EM improves the likelihood instead of over-damping A and rolling back (the
+    old loose stability scale shrank A to 0.76x: LL -2331 -> -6839)."""
+    from state_space_practice.simulate.scenarios import simulate_dim_scenario
+
+    data = simulate_dim_scenario(n_time=1000)
+    p = data["params"]
+    model = DirectedInfluenceModel(
+        n_oscillators=2,
+        n_discrete_states=2,
+        sampling_freq=p["sampling_freq"],
+        freqs=jnp.asarray(p["freqs"]),
+        damping_coef=jnp.asarray(p["damping"]),
+        process_variance=jnp.asarray(p["process_variance"]),
+        measurement_variance=p["measurement_variance"],
+        phase_difference=jnp.asarray(p["phase_difference"]),
+        coupling_strength=jnp.asarray(p["coupling_strength"]),
+        max_spectral_radius=0.999,  # the true radius is 0.9962
+        use_reparameterized_mstep=use_reparameterized_mstep,
+    )
+    model._initialize_parameters(jax.random.PRNGKey(0))
+    model.discrete_transition_matrix = jnp.asarray(p["Z"])
+    A_true = np.asarray(p["A"])
+    assert (
+        np.max(np.abs(np.asarray(model.continuous_transition_matrix) - A_true)) < 1e-8
+    )
+
+    lls = np.asarray(model.fit(jnp.asarray(data["obs"]), max_iter=3, skip_init=True))
+    assert lls[1] > lls[0]
+    assert np.all(np.diff(lls) > -1e-4 * np.abs(lls[:-1])), np.diff(lls)
+    assert (
+        np.max(np.abs(np.asarray(model.continuous_transition_matrix) - A_true)) < 0.05
+    )

@@ -858,14 +858,18 @@ def test_project_transition_matrix_stack_projects_blocks_and_clamps_each_state()
     for j in range(2):
         assert _spectral_radius(project_coupled_transition_matrix(raw[..., j])) > bound
 
-    projected = project_transition_matrix_stack(raw, max_spectral_radius=bound)
+    with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+        projected = project_transition_matrix_stack(raw, max_spectral_radius=bound)
 
     assert projected.shape == raw.shape
     for j in range(3):
         assert _spectral_radius(projected[..., j]) <= bound + 1e-8
         _assert_scaled_rotation_blocks(projected[..., j], n_osc, atol=1e-10)
         expected = stabilize_transition_matrix(
-            project_coupled_transition_matrix(raw[..., j]), max_spectral_radius=bound
+            project_coupled_transition_matrix(raw[..., j]),
+            max_spectral_radius=bound,
+            block_size=2,
+            warn=False,
         )
         np.testing.assert_allclose(projected[..., j], expected, atol=1e-12)
     np.testing.assert_allclose(projected[..., 2], stable, atol=1e-10)
@@ -885,7 +889,7 @@ def test_construct_stable_directed_influence_transition_stack_applies_one_scale(
         freqs, damping, strong, phase, fs, max_spectral_radius=bound
     )
     scale = compute_directed_influence_stability_scale(
-        freqs, damping, strong, fs, max_spectral_radius=bound
+        freqs, damping, strong, fs, max_spectral_radius=bound, phase_difference=phase
     )
 
     assert float(scale) < 1.0  # guard: stabilization engaged
@@ -901,7 +905,9 @@ def test_construct_stable_directed_influence_transition_stack_applies_one_scale(
     # scaling: the stack is the plain construction.
     weak = 0.01 * strong
     assert float(
-        compute_directed_influence_stability_scale(freqs, damping, weak, fs)
+        compute_directed_influence_stability_scale(
+            freqs, damping, weak, fs, phase_difference=phase
+        )
     ) == 1.0
     stack_weak = construct_stable_directed_influence_transition_stack(
         freqs, damping, weak, phase, fs
@@ -965,7 +971,8 @@ def test_directed_influence_mixin_projection_syncs_public_params_and_rebuilds():
     params; the reparameterized path leaves A untouched."""
     strong = jnp.zeros((2, 2, 2)).at[0, 1, :].set(2.0).at[1, 0, :].set(2.0)
     host = _DIMHost(strong)
-    host._initialize_continuous_transition_matrix()
+    with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+        host._initialize_continuous_transition_matrix()
     assert float(host._effective_dim_scale()) < 1.0  # guard: scale engaged
     for j in range(2):
         assert _spectral_radius(host.continuous_transition_matrix[..., j]) <= 0.9 + 1e-6
@@ -1000,7 +1007,8 @@ def test_directed_influence_mixin_projection_syncs_public_params_and_rebuilds():
         )
 
     reparam = _DIMHost(strong, use_reparameterized_mstep=True)
-    reparam._initialize_continuous_transition_matrix()
+    with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+        reparam._initialize_continuous_transition_matrix()
     unconstrained = jnp.full((4, 4, 2), 0.3)
     reparam.continuous_transition_matrix = unconstrained
     reparam._project_parameters()
@@ -1207,4 +1215,171 @@ def test_cnm_shrink_factor_handles_variance_at_the_floor():
         np.asarray(project_correlated_noise_process_covariance(jnp.asarray(pinned))),
         np.asarray(diag_only_p),
         atol=1e-15,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tight DIM stability scale and block-local spectral-radius clamp
+# ---------------------------------------------------------------------------
+
+
+def _dim_pair(coupling: float, freqs=(8.0, 20.0), damping=0.95, n_states=2):
+    """Two oscillators with one-directional coupling that reverses by state."""
+    coupling_stack = jnp.zeros((2, 2, n_states))
+    coupling_stack = coupling_stack.at[1, 0, 0].set(coupling)
+    if n_states > 1:
+        coupling_stack = coupling_stack.at[0, 1, 1].set(coupling)
+    return (
+        jnp.asarray(freqs),
+        jnp.full(2, damping),
+        coupling_stack,
+        jnp.zeros((2, 2, n_states)),
+    )
+
+
+def test_stability_scale_leaves_stable_dim_matrices_untouched() -> None:
+    """A stable DIM network is rebuilt exactly: the scale is 1, not a loose bound.
+
+    The previous block-row operator-norm bound returned ~0.82 for this pair
+    (actual radius 0.85), over-damping every rebuilt matrix by up to 0.16.
+    """
+    freqs, damping, coupling, phase = _dim_pair(0.3)
+    fs = 100.0
+    plain = jnp.stack(
+        [
+            construct_directed_influence_transition_matrix(
+                freqs, damping, coupling[..., j], phase[..., j], fs
+            )
+            for j in range(2)
+        ],
+        axis=-1,
+    )
+    radius = max(_spectral_radius(plain[..., j]) for j in range(2))
+    assert radius < 0.99  # guard: genuinely stable under the default bound
+
+    scale = compute_directed_influence_stability_scale(
+        freqs, damping, coupling, fs, phase_difference=phase
+    )
+    assert float(scale) == 1.0
+    stack = construct_stable_directed_influence_transition_stack(
+        freqs, damping, coupling, phase, fs
+    )
+    np.testing.assert_allclose(stack, plain, atol=1e-14)
+
+
+def test_stability_scale_clamps_actual_radius_exactly_and_is_differentiable() -> None:
+    """When engaged, the scale puts the actual radius exactly on the bound and its
+    gradient matches finite differences; below the bound its gradient is zero."""
+    freqs, damping, coupling, phase = _dim_pair(1.5, damping=0.85)
+    fs = 100.0
+    bound = 0.9
+
+    def scale_of(c):
+        return compute_directed_influence_stability_scale(
+            freqs, damping, c, fs, max_spectral_radius=bound, phase_difference=phase
+        )
+
+    scale = float(scale_of(coupling))
+    assert scale < 1.0  # guard: engaged
+    stack = construct_stable_directed_influence_transition_stack(
+        freqs, damping, coupling, phase, fs, max_spectral_radius=bound
+    )
+    radii = [_spectral_radius(stack[..., j]) for j in range(2)]
+    np.testing.assert_allclose(max(radii), bound, rtol=1e-10)
+
+    direction = jnp.zeros_like(coupling).at[1, 0, 0].set(1.0)
+    grad = jax.jit(jax.grad(scale_of))(coupling)
+    h = 1e-6
+    fd = (float(scale_of(coupling + h * direction)) - float(
+        scale_of(coupling - h * direction)
+    )) / (2 * h)
+    np.testing.assert_allclose(float(jnp.sum(grad * direction)), fd, rtol=1e-5)
+
+    weak = _dim_pair(0.05, damping=0.85)[2]
+    grad_weak = jax.grad(scale_of)(weak)
+    assert float(scale_of(weak)) == 1.0
+    np.testing.assert_array_equal(np.asarray(grad_weak), 0.0)
+
+
+def test_dim_scenario_truth_is_a_fixed_point_of_init_and_projection() -> None:
+    """The repo's DIM scenario parameters survive init and the standard-EM
+    projection/sync unchanged (the old loose scale shrank them to 0.76x)."""
+    from state_space_practice.simulate.scenarios import simulate_dim_scenario
+
+    params = simulate_dim_scenario(n_time=10)["params"]
+    host = _DIMHost(jnp.asarray(params["coupling_strength"]))
+    host.freqs = jnp.asarray(params["freqs"])
+    host.damping_coef = jnp.asarray(params["damping"])
+    host.phase_difference = jnp.asarray(params["phase_difference"])
+    host.sampling_freq = params["sampling_freq"]
+    host.max_spectral_radius = 0.999  # true radius is 0.9962
+    A_true = np.asarray(params["A"])
+
+    host._initialize_continuous_transition_matrix()
+    assert np.max(np.abs(np.asarray(host.continuous_transition_matrix) - A_true)) < 1e-8
+
+    host.continuous_transition_matrix = jnp.asarray(A_true)
+    host._project_parameters()  # no clamp warning may fire (warnings are errors)
+    assert np.max(np.abs(np.asarray(host.continuous_transition_matrix) - A_true)) < 1e-8
+    np.testing.assert_allclose(host.damping_coef, params["damping"], atol=1e-10)
+    np.testing.assert_allclose(
+        host.coupling_strength, params["coupling_strength"], atol=1e-10
+    )
+
+
+def test_project_stack_clamps_only_the_unstable_uncoupled_block() -> None:
+    """For uncoupled oscillators the clamp rescales only the offending block,
+    leaves the stable rhythm untouched, and reports what it did."""
+    unstable = 1.2 * _get_rotation_matrix(2.0 * jnp.pi * 8.0 / 100.0)
+    stable = 0.5 * _get_rotation_matrix(2.0 * jnp.pi * 20.0 / 100.0)
+    A = jnp.zeros((4, 4)).at[:2, :2].set(unstable).at[2:, 2:].set(stable)
+    bound = 0.95
+
+    with pytest.warns(UserWarning, match=r"radius=1\.2.*scale=0\.791667"):
+        projected = project_transition_matrix_stack(A[..., None], bound)[..., 0]
+
+    np.testing.assert_allclose(projected[2:, 2:], stable, atol=1e-14)
+    np.testing.assert_allclose(projected[:2, :2], unstable * (bound / 1.2), atol=1e-14)
+    np.testing.assert_array_equal(np.asarray(projected[:2, 2:]), 0.0)
+    np.testing.assert_allclose(_spectral_radius(projected), bound, rtol=1e-12)
+
+
+def test_stabilize_transition_matrix_block_clamp_follows_coupling_graph() -> None:
+    """One-directional coupling keeps the blocks' spectra separate, so only the
+    unstable source block is scaled; mutual coupling falls back to one scale."""
+    source = 1.1 * _get_rotation_matrix(0.3)
+    target = 0.6 * _get_rotation_matrix(0.9)
+    link = 0.2 * _get_rotation_matrix(0.1)
+    one_way = jnp.zeros((4, 4)).at[:2, :2].set(source).at[2:, 2:].set(target)
+    one_way = one_way.at[2:, :2].set(link)
+
+    with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+        clamped = stabilize_transition_matrix(one_way, 0.9, block_size=2)
+    np.testing.assert_allclose(clamped[2:, 2:], target, atol=1e-14)
+    np.testing.assert_allclose(clamped[2:, :2], link, atol=1e-14)
+    np.testing.assert_allclose(_spectral_radius(clamped), 0.9, rtol=1e-12)
+
+    mutual = one_way.at[:2, 2:].set(link)
+    radius = _spectral_radius(mutual)
+    with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+        clamped_mutual = stabilize_transition_matrix(mutual, 0.9, block_size=2)
+    np.testing.assert_allclose(clamped_mutual, mutual * (0.9 / radius), atol=1e-14)
+
+    # Already stable: returned unchanged and silent.
+    np.testing.assert_array_equal(
+        np.asarray(stabilize_transition_matrix(0.5 * one_way, 0.9, block_size=2)),
+        np.asarray(0.5 * one_way),
+    )
+
+
+def test_differentiable_spectral_radius_matches_numpy_under_jit_and_vmap() -> None:
+    from state_space_practice.utils import differentiable_spectral_radius
+
+    mats = jax.random.normal(jax.random.PRNGKey(3), (3, 5, 5))
+    expected = [np.max(np.abs(np.linalg.eigvals(np.asarray(m)))) for m in mats]
+    np.testing.assert_allclose(
+        jax.jit(differentiable_spectral_radius)(mats), expected, rtol=1e-12
+    )
+    np.testing.assert_allclose(
+        jax.vmap(differentiable_spectral_radius)(mats), expected, rtol=1e-12
     )

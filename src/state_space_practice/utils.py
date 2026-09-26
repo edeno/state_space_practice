@@ -316,6 +316,8 @@ def spectral_radius(matrix: ArrayLike) -> float:
     use this for eager, post-optimization stability checks -- not inside a JIT
     trace -- so a host computation is both safe and portable across backends.
     For symmetric matrices prefer ``jnp.linalg.eigvalsh``, which is accelerated.
+    Inside a traced / differentiated computation use
+    :func:`differentiable_spectral_radius` instead.
 
     Parameters
     ----------
@@ -331,16 +333,143 @@ def spectral_radius(matrix: ArrayLike) -> float:
     return float(np.max(np.abs(eigenvalues)))
 
 
+def _host_spectral_radius_and_gradient(
+    matrices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Spectral radius and its gradient for a batch of real square matrices.
+
+    For the dominant eigenvalue ``lambda = V[:, i]``-eigenpair of ``A = V D
+    V^{-1}``, first-order perturbation gives ``d lambda = (V^{-1} dA V)_{ii}``
+    and ``d|lambda| = Re(conj(lambda) d lambda) / |lambda|``, so
+    ``d|lambda| / dA_{ab} = Re(conj(lambda) / |lambda| * Vinv[i, a] * V[b, i])``.
+    The gradient is zeroed where it is undefined (``lambda == 0``) or not finite
+    (defective / numerically non-diagonalizable ``A``).
+    """
+    matrices = np.asarray(matrices)
+    batch_shape = matrices.shape[:-2]
+    n = matrices.shape[-1]
+    flat = matrices.reshape((-1, n, n))
+    radii = np.zeros(flat.shape[0], dtype=matrices.dtype)
+    grads = np.zeros_like(flat)
+    for k, A in enumerate(flat):
+        if not np.all(np.isfinite(A)):
+            radii[k] = np.nan
+            continue
+        eigenvalues, V = np.linalg.eig(A)
+        i = int(np.argmax(np.abs(eigenvalues)))
+        lam = eigenvalues[i]
+        radii[k] = np.abs(lam)
+        if radii[k] == 0.0:
+            continue
+        try:
+            V_inv = np.linalg.inv(V)
+        except np.linalg.LinAlgError:
+            continue
+        grad = np.real((np.conj(lam) / np.abs(lam)) * np.outer(V_inv[i, :], V[:, i]))
+        if np.all(np.isfinite(grad)):
+            grads[k] = grad
+    return radii.reshape(batch_shape), grads.reshape(matrices.shape)
+
+
+def _spectral_radius_callback(matrices: jax.Array) -> tuple[jax.Array, jax.Array]:
+    dtype = matrices.dtype
+    result_shape = (
+        jax.ShapeDtypeStruct(matrices.shape[:-2], dtype),
+        jax.ShapeDtypeStruct(matrices.shape, dtype),
+    )
+    return jax.pure_callback(
+        _host_spectral_radius_and_gradient,
+        result_shape,
+        matrices,
+        vmap_method="sequential",
+    )
+
+
+@jax.custom_jvp
+def differentiable_spectral_radius(matrices: ArrayLike) -> Array:
+    """Exact, differentiable spectral radius usable inside JIT / ``grad``.
+
+    The eigen-decomposition runs on host through ``jax.pure_callback`` (the
+    general ``eigvals`` has no portable accelerator lowering), and a custom JVP
+    supplies the first-order perturbation derivative of the dominant eigenvalue
+    magnitude. Unlike a norm-based upper bound, the value is the actual
+    ``max |lambda|``, so a clamp built on it engages only when the dynamics
+    really exceed the bound.
+
+    The derivative is exact wherever the dominant eigenvalue (or conjugate
+    pair) is simple; at a crossing of two dominant moduli it is one
+    subgradient, and it is zero for a defective matrix.
+
+    Parameters
+    ----------
+    matrices : ArrayLike, shape (..., n, n)
+        Real square matrix or batch of matrices.
+
+    Returns
+    -------
+    Array, shape (...)
+        Spectral radius of each matrix.
+    """
+    radii, _ = _spectral_radius_callback(jnp.asarray(matrices))
+    return radii
+
+
+@differentiable_spectral_radius.defjvp
+def _differentiable_spectral_radius_jvp(primals, tangents):
+    (matrices,) = primals
+    (d_matrices,) = tangents
+    matrices = jnp.asarray(matrices)
+    radii, grads = _spectral_radius_callback(matrices)
+    return radii, jnp.sum(grads * d_matrices, axis=(-2, -1))
+
+
+def _strongly_connected_blocks(matrix: np.ndarray, block_size: int) -> list:
+    """Group ``block_size`` diagonal blocks into strongly connected components.
+
+    Block ``(i, j)`` is an edge when it has any nonzero entry. The spectrum of
+    ``matrix`` is the union of the spectra of the principal submatrices of its
+    strongly connected components (a permutation brings it to block-triangular
+    form), so each component can be stabilized on its own.
+    """
+    from scipy.sparse.csgraph import connected_components
+
+    n_blocks = matrix.shape[0] // block_size
+    blocks = matrix.reshape(n_blocks, block_size, n_blocks, block_size)
+    adjacency = np.any(blocks != 0.0, axis=(1, 3))
+    n_components, labels = connected_components(
+        adjacency, directed=True, connection="strong"
+    )
+    return [np.flatnonzero(labels == c) for c in range(n_components)]
+
+
 def stabilize_transition_matrix(
-    matrix: ArrayLike, max_spectral_radius: float = 0.99
+    matrix: ArrayLike,
+    max_spectral_radius: float = 0.99,
+    block_size: int | None = None,
+    warn: bool = True,
 ) -> Array:
-    """Uniformly scale a transition matrix so its spectral radius <= the bound.
+    """Scale a transition matrix so its spectral radius is <= the bound.
 
     A linear transition ``x_t = A @ x_{t-1} + ...`` is stable only when every
     eigenvalue of ``A`` lies inside the unit circle. When the spectral radius
     exceeds ``max_spectral_radius`` the matrix is scaled by
-    ``max_spectral_radius / spectral_radius`` (which scales every eigenvalue by
-    the same factor); otherwise it is returned unchanged.
+    ``max_spectral_radius / spectral_radius``; otherwise it is returned
+    unchanged.
+
+    With ``block_size`` (e.g. ``2`` for oscillator blocks) the clamp is local:
+    the ``block_size x block_size`` blocks are grouped into strongly connected
+    components of the block coupling graph, whose principal submatrices carry
+    disjoint parts of the spectrum, and only the components whose own spectral
+    radius exceeds the bound are scaled. For uncoupled oscillators this rescales
+    only the offending oscillator instead of damping every rhythm; for a fully
+    coupled matrix it reduces to the uniform scale.
+
+    Choosing ``max_spectral_radius``: an oscillator block with radius ``r`` at
+    sampling rate ``fs`` has a spectral peak of half-power bandwidth
+    ``Delta f ~= (1 - r) * fs / pi``. To keep rhythms as narrow as
+    ``Delta f_min`` representable use ``max_spectral_radius >= 1 - pi *
+    Delta f_min / fs`` (e.g. ``fs = 100`` Hz and ``Delta f_min = 0.3`` Hz gives
+    ``0.99``; ``fs = 1000`` Hz needs ``0.999``).
 
     The spectral radius is computed on host (see :func:`spectral_radius`), so
     this is portable across accelerator backends but must be called eagerly,
@@ -352,17 +481,55 @@ def stabilize_transition_matrix(
         Transition matrix (need not be symmetric).
     max_spectral_radius : float, default=0.99
         Upper bound on the spectral radius.
+    block_size : int or None, default=None
+        Size of the structural diagonal blocks. ``None`` applies one uniform
+        scale to the whole matrix.
+    warn : bool, default=True
+        Emit a ``UserWarning`` reporting the radius and applied scale whenever
+        the clamp engages.
 
     Returns
     -------
     Array, shape (n, n)
-        The scaled matrix, or the input unchanged if already within the bound.
+        The stabilized matrix, or the input unchanged if already within the
+        bound.
     """
     A = jnp.asarray(matrix)
-    radius = spectral_radius(A)
-    if radius > max_spectral_radius:
-        return A * (max_spectral_radius / radius)
-    return A
+    A_host = np.asarray(A)
+    n = A_host.shape[0]
+    if block_size is None or block_size <= 0 or n % block_size != 0:
+        components = [np.arange(n)]
+    else:
+        components = [
+            (block_size * comp[:, None] + np.arange(block_size)[None, :]).ravel()
+            for comp in _strongly_connected_blocks(A_host, block_size)
+        ]
+
+    stabilized = A_host.copy()
+    applied = []
+    for idx in components:
+        sub = A_host[np.ix_(idx, idx)]
+        radius = spectral_radius(sub)
+        if radius > max_spectral_radius:
+            scale = max_spectral_radius / radius
+            stabilized[np.ix_(idx, idx)] = sub * scale
+            applied.append((idx, radius, scale))
+    if not applied:
+        return A
+    if warn:
+        details = "; ".join(
+            f"rows {idx.tolist()}: radius={radius:.6g}, scale={scale:.6g}"
+            for idx, radius, scale in applied
+        )
+        warnings.warn(
+            f"Transition matrix spectral radius exceeded max_spectral_radius="
+            f"{max_spectral_radius:g}; clamped ({details}). If a narrow-band "
+            "rhythm is expected, raise max_spectral_radius toward "
+            "1 - pi * bandwidth / sampling_freq.",
+            UserWarning,
+            stacklevel=2,
+        )
+    return jnp.asarray(stabilized, dtype=A.dtype)
 
 
 def contains_tracer(*values: object) -> bool:

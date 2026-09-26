@@ -3437,6 +3437,7 @@ def optimize_dim_transition_params_joint(
             params["coupling_strength"],
             sampling_freq,
             max_spectral_radius=max_spectral_radius,
+            phase_difference=params["phase_diff"],
         )
         effective_damping = params["damping"] * scale
         effective_coupling = params["coupling_strength"] * scale

@@ -7303,12 +7303,13 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
                 [[-0.3, 0.9], [4.0, 1.2]],
             ]
         )
-        model._store_sgd_params(
-            {
-                "A_blocks_0": raw_blocks,
-                "A_blocks_1": -raw_blocks,
-            }
-        )
+        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+            model._store_sgd_params(
+                {
+                    "A_blocks_0": raw_blocks,
+                    "A_blocks_1": -raw_blocks,
+                }
+            )
 
         for j in range(model.n_discrete_states):
             A_j = model.continuous_transition_matrix[:, :, j]
@@ -7351,7 +7352,8 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
         model.continuous_transition_matrix = jnp.stack(
             [jnp.eye(n_latent) * 1.5] * model.n_discrete_states, axis=-1
         )
-        model._project_parameters()
+        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+            model._project_parameters()
 
         expected = 0.999 if max_spectral_radius is None else max_spectral_radius
         assert model.max_spectral_radius == expected
@@ -9809,7 +9811,8 @@ class TestSwitchingSpikeOscillatorSGD:
         raw_radii = self._state_radii(model._reconstruct_A_from_blocks(params))
         assert raw_radii.max() > bound + 1e-3
 
-        model._store_sgd_params(params)
+        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+            model._store_sgd_params(params)
 
         radii = self._state_radii(model.continuous_transition_matrix)
         assert np.all(radii <= bound + 1e-9)

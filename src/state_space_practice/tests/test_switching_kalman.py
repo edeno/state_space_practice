@@ -6786,6 +6786,7 @@ def test_joint_dim_optimizer_improves_total_q_and_returns_stable_dynamics() -> N
             params["damping"],
             params["coupling_strength"],
             sampling_freq,
+            phase_difference=params["phase_diff"],
         )
         effective_damping = params["damping"] * scale
         effective_coupling = params["coupling_strength"] * scale
@@ -6822,7 +6823,11 @@ def test_joint_dim_optimizer_improves_total_q_and_returns_stable_dynamics() -> N
     assert opt["damping"].shape == (2,)
     assert opt["freq"].shape == (2,)
     scale = compute_directed_influence_stability_scale(
-        opt["freq"], opt["damping"], opt["coupling_strength"], sampling_freq
+        opt["freq"],
+        opt["damping"],
+        opt["coupling_strength"],
+        sampling_freq,
+        phase_difference=opt["phase_diff"],
     )
     for j in range(n_states):
         A = construct_directed_influence_transition_matrix(

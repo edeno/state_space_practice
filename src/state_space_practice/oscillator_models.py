@@ -2121,6 +2121,7 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
             coupling,
             self.sampling_freq,
             max_spectral_radius=self.max_spectral_radius,
+            phase_difference=phase_diff,
         )
         effective_damping = self.damping_coef * stability_scale
         effective_coupling = coupling * stability_scale

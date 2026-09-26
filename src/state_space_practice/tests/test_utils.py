@@ -661,7 +661,8 @@ class TestSpectralRadius:
 class TestStabilizeTransitionMatrix:
     def test_scales_unstable_matrix_exactly_to_the_bound(self) -> None:
         A = _scaled_rotation(scale=2.0, theta=0.4)  # radius 2.0 > 0.99
-        stabilized = stabilize_transition_matrix(A, max_spectral_radius=0.99)
+        with pytest.warns(UserWarning, match=r"radius=2, scale=0\.495"):
+            stabilized = stabilize_transition_matrix(A, max_spectral_radius=0.99)
         # radius pulled to exactly the bound...
         assert float(spectral_radius(stabilized)) == pytest.approx(0.99, rel=1e-6)
         # ...by a uniform scale (every entry * 0.99/2.0), preserving structure.
