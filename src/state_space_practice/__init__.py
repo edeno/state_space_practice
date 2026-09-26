@@ -129,7 +129,7 @@ _X64_RECIPE = (
 def _warn_if_x64_disabled() -> None:
     import jax
 
-    if not jax.config.jax_enable_x64:
+    if not jax.config.read("jax_enable_x64"):
         warnings.warn(_X64_RECIPE, StateSpaceWarning, stacklevel=3)
 
 

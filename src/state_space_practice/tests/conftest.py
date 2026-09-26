@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 """Shared fixtures and Hypothesis strategies for state space model tests."""
 
+import os
 from typing import Tuple
 
 import jax
@@ -21,7 +22,8 @@ from jax import Array, random
 settings.register_profile("ci", max_examples=100, deadline=None, derandomize=True)
 # Dev profile: Faster iteration during development
 settings.register_profile("dev", max_examples=10, deadline=None)
-settings.load_profile("dev")
+# Select with HYPOTHESIS_PROFILE=ci (CI sets this); defaults to "dev".
+settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))
 
 
 # --- Hypothesis Strategies for State Space Models ---
