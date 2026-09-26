@@ -1034,6 +1034,51 @@ class TestDecayDynamics:
         # Should learn decay < 1
         assert model.decay < 0.99, f"decay={model.decay:.3f}, expected < 0.99"
 
+    def test_decay_m_step_minimizes_expected_squared_residual(self):
+        """The decay M-step is the exact minimizer of the expected residual.
+
+        For isotropic Q the M-step for a scalar decay ``a`` minimizes
+        ``sum_t E||x_t - a x_{t-1} - B u_t||^2 | y``, whose expectation needs
+        the smoother's lag-one cross-covariance:
+        ``||r_t||^2 + tr P_t + a^2 tr P_{t-1} - 2 a tr C_{t-1,t}``. Dropping
+        ``tr C`` biased the estimate (0.8952 instead of 0.8999 here).
+        """
+        data = simulate_rl_choice_data(n_trials=400, decay=0.9, seed=42)
+        model = CovariateChoiceModel(
+            n_options=3, n_covariates=2, init_decay=0.9, learn_decay=True,
+            init_inverse_temperature=2.0, init_process_noise=0.005,
+        )
+        model._bind_covariates(data.choices, data.covariates, None, "fit")
+        model.input_gain_ = jnp.eye(2) * 0.5  # simulation truth
+        smooth = model._run_smoother(jnp.asarray(data.choices))
+        estimate = model._m_step_decay(smooth)
+
+        m = np.asarray(smooth.smoothed_values)
+        P = np.asarray(smooth.smoothed_covariances)
+        C = np.asarray(smooth.smoother_cross_cov)
+        control = np.asarray(model._control_input())
+        tr_P = np.trace(P, axis1=1, axis2=2)
+        tr_C = np.trace(C, axis1=1, axis2=2).sum()
+
+        grid = np.linspace(0.8, 1.0, 20001)  # step 1e-5
+        resid = m[1:, None, :] - grid[None, :, None] * m[:-1, None, :] - (
+            control[:, None, :]
+        )
+        expected_sq_resid = (
+            (resid**2).sum(axis=(0, 2))
+            + tr_P[1:].sum()
+            + grid**2 * tr_P[:-1].sum()
+            - 2 * grid * tr_C
+        )
+        grid_argmin = grid[np.argmin(expected_sq_resid)]
+        # guard: the minimizer is interior and the cross-covariance matters
+        assert 0.8 < grid_argmin < 1.0
+        without_cross = (np.sum((m[1:] - control) * m[:-1])) / (
+            np.sum(m[:-1] ** 2) + tr_P[:-1].sum()
+        )
+        assert abs(without_cross - grid_argmin) > 2e-3
+        np.testing.assert_allclose(estimate, grid_argmin, atol=2e-5)
+
     def test_decay_with_covariates(self):
         """Decay should work alongside dynamics covariates."""
         rng = np.random.default_rng(42)

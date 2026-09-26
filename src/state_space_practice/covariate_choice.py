@@ -846,21 +846,32 @@ class CovariateChoiceModel(MultinomialChoiceModel):
     def _m_step_decay(self, smooth: ChoiceSmootherResult) -> float:
         """M-step: update scalar decay from smoother statistics.
 
-        For x_t = a * x_{t-1} + B u_t + w_t, the M-step for scalar a is:
-            a = sum_t [m_t - B u_t]' m_{t-1} / sum_t [m_{t-1}' m_{t-1} + tr(P_{t-1})]
-        This is a weighted regression of (m_t - B u_t) on m_{t-1}.
+        For x_t = a * x_{t-1} + B u_t + w_t with isotropic Q, maximizing the
+        expected complete-data log-likelihood over the scalar a gives
+
+            a = sum_t [(m_t - B u_t)' m_{t-1} + tr C_{t-1,t}]
+                / sum_t [m_{t-1}' m_{t-1} + tr P_{t-1}],
+
+        where ``E[x_t' x_{t-1}] = m_t' m_{t-1} + tr C_{t-1,t}`` and
+        C_{t-1,t} = Cov(x_{t-1}, x_t | y_{1:T}) is the smoother's lag-one
+        cross-covariance (``smoother_cross_cov[t-1]``; the trace is the same
+        for either orientation). Dropping the ``tr C`` term biases the
+        estimate towards zero.
         """
         m = smooth.smoothed_values  # (T, K-1)
         P = smooth.smoothed_covariances  # (T, K-1, K-1)
+        C = smooth.smoother_cross_cov  # (T-1, K-1, K-1)
 
         target = m[1:]  # (T-1, K-1)
         control_input = self._control_input()
         if control_input is not None:
             target = target - control_input
 
-        # Numerator: sum_t (target_t)' m_{t-1}
-        numer = jnp.sum(target * m[:-1])
-        # Denominator: sum_t (m_{t-1}' m_{t-1} + tr(P_{t-1}))
+        # Numerator: sum_t E[(x_t - B u_t)' x_{t-1}]
+        numer = jnp.sum(target * m[:-1]) + jnp.sum(
+            jnp.trace(C, axis1=1, axis2=2)
+        )
+        # Denominator: sum_t E[x_{t-1}' x_{t-1}]
         denom = jnp.sum(m[:-1] ** 2) + jnp.sum(
             jnp.trace(P[:-1], axis1=1, axis2=2)
         )
