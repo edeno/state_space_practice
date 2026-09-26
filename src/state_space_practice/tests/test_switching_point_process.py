@@ -6238,6 +6238,44 @@ class TestSwitchingSpikeOscillatorModelFit:
         assert len(log_likelihoods) == 2
         assert log_likelihoods[-1] == pytest.approx(fresh_ll)
 
+    @pytest.mark.slow
+    def test_fit_converging_on_last_iteration_has_no_duplicate_final_ll(
+        self,
+    ) -> None:
+        """Converging on iteration ``max_iter`` is convergence, not exhaustion.
+
+        No M-step follows a converged E-step, so re-running the E-step would
+        only re-evaluate the same parameters. The history must hold one LL per
+        E-step (``max_iter`` entries), not a duplicated final LL. A huge
+        ``tol`` / ``decrease_tol`` forces convergence exactly on the second
+        (= last) iteration.
+        """
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        spikes = jax.random.poisson(jax.random.PRNGKey(0), 0.05, shape=(20, 2)).astype(
+            float
+        )
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=1,
+            n_neurons=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            separate_spike_params=False,
+        )
+
+        log_likelihoods = model.fit(
+            spikes, max_iter=2, tol=10.0, decrease_tol=10.0, key=jax.random.PRNGKey(42)
+        )
+
+        assert len(log_likelihoods) == 2
+        # Guard: the one M-step changed the parameters, so the two entries are
+        # distinct E-steps rather than a re-evaluation of the same point.
+        assert log_likelihoods[0] != log_likelihoods[1]
+        assert log_likelihoods[-1] == pytest.approx(float(model._e_step(spikes)))
+
     def test_fit_rolls_back_bad_final_m_step(self, monkeypatch) -> None:
         """A final E-step LL decrease should restore the pre-M-step parameters."""
         from state_space_practice.switching_point_process import (
