@@ -9934,7 +9934,7 @@ class TestSwitchingSpikeOscillatorEMConsistency:
 
 
 # ---------------------------------------------------------------------------
-# Newton ridge / fallback, occupancy gate
+# Newton ridge / fallback, occupancy gate, default dtype
 # ---------------------------------------------------------------------------
 
 
@@ -10053,3 +10053,16 @@ def test_spike_glm_update_warns_on_newton_fallback(monkeypatch) -> None:
             spikes, smoother_mean, params0, dt=0.01, max_iter=3
         )
     assert float(jnp.max(jnp.abs(updated.baseline - params0.baseline))) > 0.0
+
+
+def test_spike_oscillator_default_transition_diag_uses_default_float() -> None:
+    from state_space_practice.switching_point_process import (
+        SwitchingSpikeOscillatorModel,
+    )
+
+    model = SwitchingSpikeOscillatorModel(
+        n_oscillators=1, n_neurons=2, n_discrete_states=2, sampling_freq=100.0, dt=0.01
+    )
+    diag = model._default_discrete_transition_diag()
+    assert diag.dtype == jnp.result_type(float)  # float64 under x64, not float32
+    np.testing.assert_array_equal(np.asarray(diag), 0.95)

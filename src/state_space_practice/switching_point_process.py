@@ -3695,7 +3695,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
 
     def _default_discrete_transition_diag(self) -> Array:
         """0.95 self-transition probability for every discrete state."""
-        return jnp.full((self.n_discrete_states,), 0.95, dtype=jnp.float32)
+        return jnp.full((self.n_discrete_states,), 0.95)
 
     def _initialize_continuous_transition_matrix(self) -> None:
         """Initialize continuous state transition matrices.
