@@ -84,6 +84,7 @@ References
 
 import functools
 import logging
+from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -98,7 +99,7 @@ from state_space_practice.oscillator_utils import (
     _oscillator_blocks_to_matrix,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
-    project_coupled_transition_matrix,
+    project_transition_matrix_stack,
 )
 from state_space_practice.parameter_transforms import (
     PSD_MATRIX,
@@ -124,8 +125,10 @@ from state_space_practice.utils import (
     clip_eigenvalues,
     make_discrete_transition_matrix,
     stabilize_covariance,
-    stabilize_transition_matrix,
     validate_count_array,
+    validate_covariance,
+    validate_probability_vector,
+    validate_transition_matrix,
 )
 
 logger = logging.getLogger(__name__)
@@ -1550,6 +1553,107 @@ def _single_neuron_glm_step_second_order_mixture(
     return new_params[0], new_params[1:]
 
 
+@functools.partial(jax.jit, static_argnames=("max_iter",))
+def _second_order_newton_iterations(
+    baselines: Array,
+    weights: Array,
+    spikes: Array,
+    smoother_mean: Array,
+    smoother_cov: Array,
+    dt: float,
+    time_weights: Array,
+    weight_l2: float,
+    baseline_prior: Array,
+    baseline_prior_l2: float,
+    max_iter: int,
+) -> tuple[Array, Array]:
+    """``max_iter`` second-order Newton steps for every neuron in one jitted scan.
+
+    Mirrors the plug-in branch of :func:`update_spike_glm_params`: the
+    per-neuron step (including its Armijo line-search scan) is traced once and
+    iterated with ``lax.scan`` instead of being re-traced by a Python loop on
+    every iteration. ``baseline_prior`` is always an array here (a zero vector
+    is the neutral default) and ``time_weights`` always a vector (ones when
+    unweighted), which is exactly what the per-neuron step substitutes for
+    ``None``, so the computation is unchanged.
+    """
+
+    def iterate_all_neurons(carry, _):
+        baselines, weights = carry
+
+        def update_neuron(b, w, y_n, bp):
+            return _single_neuron_glm_step_second_order(
+                b,
+                w,
+                y_n,
+                smoother_mean,
+                smoother_cov,
+                dt,
+                time_weights,
+                weight_l2,
+                bp,
+                baseline_prior_l2,
+            )
+
+        new_baselines, new_weights = jax.vmap(update_neuron, in_axes=(0, 0, 1, 0))(
+            baselines, weights, spikes, baseline_prior
+        )
+        return (new_baselines, new_weights), None
+
+    (final_baselines, final_weights), _ = jax.lax.scan(
+        iterate_all_neurons, (baselines, weights), None, length=max_iter
+    )
+    return final_baselines, final_weights
+
+
+@functools.partial(jax.jit, static_argnames=("max_iter",))
+def _mixture_newton_iterations(
+    baselines: Array,
+    weights: Array,
+    spikes: Array,
+    state_cond_smoother_mean: Array,
+    state_cond_smoother_cov: Array,
+    state_weights: Array,
+    dt: float,
+    weight_l2: float,
+    baseline_prior: Array,
+    baseline_prior_l2: float,
+    max_iter: int,
+) -> tuple[Array, Array]:
+    """``max_iter`` mixture Newton steps for every neuron in one jitted scan.
+
+    The shared-parameter counterpart of :func:`_second_order_newton_iterations`
+    for :func:`update_spike_glm_params_mixture`.
+    """
+
+    def iterate_all_neurons(carry, _):
+        baselines, weights = carry
+
+        def update_neuron(b, w, y_n, bp):
+            return _single_neuron_glm_step_second_order_mixture(
+                b,
+                w,
+                y_n,
+                state_cond_smoother_mean,
+                state_cond_smoother_cov,
+                state_weights,
+                dt,
+                weight_l2,
+                bp,
+                baseline_prior_l2,
+            )
+
+        new_baselines, new_weights = jax.vmap(update_neuron, in_axes=(0, 0, 1, 0))(
+            baselines, weights, spikes, baseline_prior
+        )
+        return (new_baselines, new_weights), None
+
+    (final_baselines, final_weights), _ = jax.lax.scan(
+        iterate_all_neurons, (baselines, weights), None, length=max_iter
+    )
+    return final_baselines, final_weights
+
+
 def update_spike_glm_params(
     spikes: Array,
     smoother_mean: Array,
@@ -1659,51 +1763,24 @@ def update_spike_glm_params(
     weights = current_params.weights
 
     if use_second_order:
-        # Newton iterations for all neurons (second-order).
-        # Uses analytical gradient + Hessian with adaptive ridge and Armijo
-        # line search. Python loop over iterations avoids deeply nested
-        # lax.scan which causes slow JIT compilation.
-        for _ in range(max_iter):
-            if baseline_prior is not None:
-
-                def update_neuron(b, w, y_n, bp):
-                    return _single_neuron_glm_step_second_order(
-                        b,
-                        w,
-                        y_n,
-                        smoother_mean,
-                        smoother_cov,
-                        dt,
-                        time_weights,
-                        weight_l2,
-                        bp,
-                        baseline_prior_l2,
-                    )
-
-                baselines, weights = jax.vmap(update_neuron, in_axes=(0, 0, 1, 0))(
-                    baselines, weights, spikes, baseline_prior
-                )
-            else:
-
-                def update_neuron_no_prior(b, w, y_n):
-                    return _single_neuron_glm_step_second_order(
-                        b,
-                        w,
-                        y_n,
-                        smoother_mean,
-                        smoother_cov,
-                        dt,
-                        time_weights,
-                        weight_l2,
-                        None,
-                        baseline_prior_l2,
-                    )
-
-                baselines, weights = jax.vmap(
-                    update_neuron_no_prior, in_axes=(0, 0, 1)
-                )(baselines, weights, spikes)
-
-        final_baselines, final_weights = baselines, weights
+        # Newton iterations for all neurons (second-order): one jitted scan
+        # over max_iter vmapped steps, mirroring the plug-in branch below. A
+        # zero-centered prior is the neutral default for baseline_prior.
+        if baseline_prior is None:
+            baseline_prior = jnp.zeros_like(baselines)
+        final_baselines, final_weights = _second_order_newton_iterations(
+            baselines,
+            weights,
+            spikes,
+            smoother_mean,
+            smoother_cov,
+            dt,
+            time_weights,
+            weight_l2,
+            jnp.asarray(baseline_prior),
+            baseline_prior_l2,
+            max_iter=max_iter,
+        )
     else:
         # Run Newton iterations for all neurons (plug-in)
         # vmap directly over neuron-axis data.
@@ -1768,47 +1845,23 @@ def update_spike_glm_params_mixture(
     baselines = current_params.baseline
     weights = current_params.weights
 
-    for _ in range(max_iter):
-        if baseline_prior is not None:
-
-            def update_neuron(b, w, y_n, bp):
-                return _single_neuron_glm_step_second_order_mixture(
-                    b,
-                    w,
-                    y_n,
-                    state_cond_smoother_mean,
-                    state_cond_smoother_cov,
-                    state_weights,
-                    dt,
-                    weight_l2,
-                    bp,
-                    baseline_prior_l2,
-                )
-
-            baselines, weights = jax.vmap(update_neuron, in_axes=(0, 0, 1, 0))(
-                baselines, weights, spikes, baseline_prior
-            )
-        else:
-
-            def update_neuron_no_prior(b, w, y_n):
-                return _single_neuron_glm_step_second_order_mixture(
-                    b,
-                    w,
-                    y_n,
-                    state_cond_smoother_mean,
-                    state_cond_smoother_cov,
-                    state_weights,
-                    dt,
-                    weight_l2,
-                    None,
-                    baseline_prior_l2,
-                )
-
-            baselines, weights = jax.vmap(update_neuron_no_prior, in_axes=(0, 0, 1))(
-                baselines, weights, spikes
-            )
-
-    return SpikeObsParams(baseline=baselines, weights=weights)
+    # A zero-centered prior is the neutral default for baseline_prior.
+    if baseline_prior is None:
+        baseline_prior = jnp.zeros_like(baselines)
+    final_baselines, final_weights = _mixture_newton_iterations(
+        baselines,
+        weights,
+        spikes,
+        state_cond_smoother_mean,
+        state_cond_smoother_cov,
+        state_weights,
+        dt,
+        weight_l2,
+        jnp.asarray(baseline_prior),
+        baseline_prior_l2,
+        max_iter=max_iter,
+    )
+    return SpikeObsParams(baseline=final_baselines, weights=final_weights)
 
 
 @functools.partial(
@@ -2224,116 +2277,41 @@ def switching_point_process_filter(
     )
 
 
-class SwitchingSpikeOscillatorModel(SGDFittableMixin):
-    """Switching oscillator network with spike-based observations.
+class SwitchingPointProcessBase(ABC, SGDFittableMixin):
+    """Shared EM and SGD machinery for switching point-process oscillator models.
 
-    This model combines:
-    - Oscillator network dynamics (DIM/CNM style transition matrices)
-    - Switching discrete states for different coupling patterns
-    - Point-process (spike) observations via Laplace-EKF
+    :class:`SwitchingSpikeOscillatorModel` (this module) and the structured
+    COM/CNM/DIM point-process models in
+    ``state_space_practice.point_process_models`` are all switching linear
+    dynamical systems observed through Poisson spike counts with a log-linear
+    intensity::
 
-    The latent state x_t has dimension 2 * n_oscillators (amplitude and phase
-    for each oscillator). The dynamics switch between n_discrete_states
-    different configurations, each with potentially different coupling patterns.
-
-    The observation model is a Poisson point-process with log-linear intensity:
         log(lambda_n(t)) = baseline_n + weights_n @ x_t
 
-    Parameters
-    ----------
-    n_oscillators : int
-        Number of latent oscillators. Must be positive. State dimension will
-        be 2 * n_oscillators (amplitude and phase for each).
-    n_neurons : int
-        Number of observed neurons (spike trains). Must be positive.
-    n_discrete_states : int
-        Number of discrete network states (coupling configurations). Must be
-        positive.
-    sampling_freq : float
-        Sampling frequency in Hz. Must be positive.
-    dt : float
-        Time bin width in seconds. Must be positive. Typically dt <= 1/sampling_freq
-        for numerical stability.
-    discrete_transition_diag : Array | None, optional
-        Diagonal elements of the discrete transition matrix (self-transition
-        probabilities). Values should be in [0, 1]. Shape must be (n_discrete_states,)
-        if provided. If None, defaults to 0.95 for all states.
-    update_continuous_transition_matrix : bool, default=True
-        Whether to update A (dynamics) during M-step.
-    update_process_cov : bool, default=True
-        Whether to update Q (process noise) during M-step.
-    update_discrete_transition_matrix : bool, default=True
-        Whether to update Z (discrete transitions) during M-step.
-    update_spike_params : bool, default=True
-        Whether to update spike GLM parameters (baseline, weights) during M-step.
-    separate_spike_params : bool, default=True
-        Whether to fit separate spike GLM parameters per discrete state.
-    update_init_mean : bool, default=True
-        Whether to update initial mean during M-step.
-    update_init_cov : bool, default=True
-        Whether to update initial covariance during M-step.
-    q_regularization : QRegularizationConfig | None, optional
-        Trust-region and eigenvalue clipping configuration for Q updates.
-    spike_weight_l2 : float, default=100.0
-        L2 regularization strength on the spike GLM weights (not baseline).
-        Adds 0.5 * spike_weight_l2 * ||weights||^2 to the M-step objective
-        for each neuron. This is an absolute penalty that must be scaled
-        relative to the data likelihood, which grows with sequence length
-        and firing rate. The default (100.0) keeps weight norms ~O(1),
-        corresponding to realistic theta modulation depths of ~2-10x in
-        firing rate. For short sequences or low-rate neurons, reduce
-        proportionally.
+    They share the Laplace-EKF filter and GPB smoother (``_e_step``), the
+    dynamics M-step (``_m_step_dynamics``), the spike-GLM M-step
+    (``_m_step_spikes``), parameter initialization and validation, and the
+    ``SGDFittableMixin`` protocol, all implemented once here. They differ in
+    how the continuous transition matrix and process covariance are
+    initialized and projected (abstract hooks below), in how the M-step's
+    initial-state estimates are regularized (``_regularize_init_mean_update``
+    / ``_regularize_init_cov_update``) and in their EM driver, so each
+    concrete model defines its own ``fit``.
 
-    Attributes
-    ----------
-    n_latent : int
-        Dimension of the continuous latent state (2 * n_oscillators).
-    discrete_transition_diag : Array
-        Diagonal of discrete transition matrix.
-
-    Notes
-    -----
-    This model uses the exact per-state-pair structure for the switching filter.
-    EM monotonicity is only approximate here: both the Laplace observation
-    approximation and the GPB mixture collapse in the smoother can produce small
-    log-likelihood decreases. ``fit`` tolerates these via ``decrease_tol`` rather
-    than treating any decrease as divergence.
-
-    The smoother is observation-model agnostic and reuses
-    ``switching_kalman_smoother`` from the switching_kalman module.
-
-    Examples
-    --------
-    Separate spike GLM parameters per discrete state (default):
-
-    >>> import jax.numpy as jnp
-    >>> model = SwitchingSpikeOscillatorModel(
-    ...     n_oscillators=2,
-    ...     n_neurons=10,
-    ...     n_discrete_states=3,
-    ...     sampling_freq=100.0,
-    ...     dt=0.01,
-    ... )
-    >>> model.n_latent
-    4
-    >>> model.n_discrete_states
-    3
-    >>> model.separate_spike_params
-    True
-
-    Shared spike GLM parameters across all discrete states:
-
-    >>> model_shared = SwitchingSpikeOscillatorModel(
-    ...     n_oscillators=2,
-    ...     n_neurons=10,
-    ...     n_discrete_states=3,
-    ...     sampling_freq=100.0,
-    ...     dt=0.01,
-    ...     separate_spike_params=False,
-    ... )
-    >>> model_shared.separate_spike_params
-    False
+    The constructor validates and stores the parameters common to every
+    model. Concrete classes expose their own public signature (defaults
+    differ, e.g. ``spike_weight_l2``) and forward it here by keyword.
     """
+
+    #: Update-flag attribute -> label shown by ``__repr__``, in display order.
+    _REPR_UPDATE_FLAG_LABELS: dict[str, str] = {
+        "update_continuous_transition_matrix": "A",
+        "update_process_cov": "Q",
+        "update_discrete_transition_matrix": "Z",
+        "update_spike_params": "spike",
+        "update_init_mean": "m0",
+        "update_init_cov": "P0",
+    }
 
     def __init__(
         self,
@@ -2342,74 +2320,22 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         n_discrete_states: int,
         sampling_freq: float,
         dt: float,
-        discrete_transition_diag: Array | None = None,
-        update_continuous_transition_matrix: bool = True,
-        update_process_cov: bool = True,
-        update_discrete_transition_matrix: bool = True,
-        update_spike_params: bool = True,
-        separate_spike_params: bool = True,
-        update_init_mean: bool = True,
-        update_init_cov: bool = True,
-        q_regularization: QRegularizationConfig | None = None,
-        spike_weight_l2: float = 100.0,
-        spike_baseline_prior_l2: float = 0.0,
-        max_newton_iter: int = 1,
-        line_search_beta: float = 0.5,
-        smoother_type: str = "gpb1",
+        *,
+        discrete_transition_diag: Array | None,
+        update_continuous_transition_matrix: bool,
+        update_process_cov: bool,
+        update_discrete_transition_matrix: bool,
+        update_spike_params: bool,
+        separate_spike_params: bool,
+        update_init_mean: bool,
+        update_init_cov: bool,
+        q_regularization: QRegularizationConfig | None,
+        spike_weight_l2: float,
+        spike_baseline_prior_l2: float,
+        max_newton_iter: int,
+        line_search_beta: float,
+        smoother_type: str,
     ) -> None:
-        """Initialize the switching spike oscillator model.
-
-        Parameters
-        ----------
-        n_oscillators : int
-            Number of latent oscillators.
-        n_neurons : int
-            Number of observed neurons.
-        n_discrete_states : int
-            Number of discrete network states.
-        sampling_freq : float
-            Sampling frequency in Hz.
-        dt : float
-            Time bin width in seconds.
-        discrete_transition_diag : Array | None, optional
-            Diagonal of discrete transition matrix. Defaults to 0.95.
-        update_continuous_transition_matrix : bool, default=True
-            Update A during M-step.
-        update_process_cov : bool, default=True
-            Update Q during M-step.
-        update_discrete_transition_matrix : bool, default=True
-            Update Z during M-step.
-        update_spike_params : bool, default=True
-            Update spike GLM params during M-step.
-        separate_spike_params : bool, default=True
-            If True, fit a separate spike GLM (baseline, weights) per discrete state.
-        update_init_mean : bool, default=True
-            Update initial mean during M-step.
-        update_init_cov : bool, default=True
-            Update initial covariance during M-step.
-        q_regularization : QRegularizationConfig | None, optional
-            Trust-region and eigenvalue clipping configuration for Q updates.
-        spike_weight_l2 : float, default=100.0
-            L2 regularization strength on the spike GLM weights.
-        spike_baseline_prior_l2 : float, default=0.0
-            L2 regularization strength shrinking spike baselines toward the
-            empirical log-rate (computed per neuron from mean spike counts).
-            Setting to 0.0 disables the prior.
-        smoother_type : str, default="gpb1"
-            Switching smoother algorithm. Must be "gpb1" or "gpb2".
-            GPB2 carries S² pair-conditional Gaussians through the backward
-            pass (vs S state-conditional for GPB1), providing better numerical
-            stability for long sequences with sparse observations and cleaner
-            pair-conditioned transition statistics for the dynamics M-step.
-
-        Raises
-        ------
-        ValueError
-            If any of n_oscillators, n_neurons, n_discrete_states, sampling_freq,
-            or dt is not positive. Also if discrete_transition_diag has wrong shape
-            or spike_weight_l2 is negative.
-        """
-        # Validate input parameters
         if n_oscillators <= 0:
             raise ValueError(f"n_oscillators must be positive. Got {n_oscillators}.")
         if n_neurons <= 0:
@@ -2440,11 +2366,19 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             raise ValueError(
                 f"spike_weight_l2 must be non-negative. Got {spike_weight_l2}."
             )
+        if spike_baseline_prior_l2 < 0:
+            raise ValueError(
+                f"spike_baseline_prior_l2 must be non-negative, got {spike_baseline_prior_l2}"
+            )
         if q_regularization is not None:
             if not (0.0 <= q_regularization.trust_region_weight <= 1.0):
                 raise ValueError(
                     "q_regularization.trust_region_weight must be in [0, 1]."
                 )
+        if smoother_type not in ("gpb1", "gpb2"):
+            raise ValueError(
+                f"smoother_type must be 'gpb1' or 'gpb2', got '{smoother_type}'"
+            )
 
         self.n_oscillators = n_oscillators
         self.n_neurons = n_neurons
@@ -2453,15 +2387,18 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         self.dt = dt
         self.n_latent = 2 * n_oscillators
 
-        # Set default discrete transition diagonal if not provided
-        if discrete_transition_diag is None:
-            self.discrete_transition_diag = jnp.full(
-                (n_discrete_states,), 0.95, dtype=jnp.float32
-            )
-        else:
-            self.discrete_transition_diag = discrete_transition_diag
+        self.discrete_transition_diag = (
+            self._default_discrete_transition_diag()
+            if discrete_transition_diag is None
+            else discrete_transition_diag
+        )
 
-        # Store update flags for M-step
+        # Optional Dirichlet (sticky) prior on the discrete transition matrix,
+        # passed to the dynamics M-step. Subclasses that support it assign the
+        # prior after calling this constructor.
+        self.transition_prior: Array | None = None
+
+        # Update flags for the M-step
         self.update_continuous_transition_matrix = update_continuous_transition_matrix
         self.update_process_cov = update_process_cov
         self.update_discrete_transition_matrix = update_discrete_transition_matrix
@@ -2472,20 +2409,12 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
 
         # Regularization parameters
         self.spike_weight_l2 = spike_weight_l2
+        self.spike_baseline_prior_l2 = spike_baseline_prior_l2
         self.q_regularization = q_regularization or QRegularizationConfig()
 
-        # Newton iteration parameters for point-process update
+        # Laplace-EKF Newton iteration parameters and smoother selection
         self.max_newton_iter = max_newton_iter
-        if spike_baseline_prior_l2 < 0:
-            raise ValueError(
-                f"spike_baseline_prior_l2 must be non-negative, got {spike_baseline_prior_l2}"
-            )
-        self.spike_baseline_prior_l2 = spike_baseline_prior_l2
         self.line_search_beta = line_search_beta
-        if smoother_type not in ("gpb1", "gpb2"):
-            raise ValueError(
-                f"smoother_type must be 'gpb1' or 'gpb2', got '{smoother_type}'"
-            )
         self.smoother_type = smoother_type
 
         # Placeholders for model parameters (initialized by _initialize_parameters)
@@ -2498,7 +2427,6 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         self.spike_params: SpikeObsParams
 
         # Placeholders for smoother results (computed in E-step)
-        # Only state-conditional statistics are stored (needed for M-step)
         self.smoother_state_cond_mean: Array
         self.smoother_state_cond_cov: Array
         self.smoother_discrete_state_prob: Array
@@ -2518,19 +2446,58 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             f"sampling_freq={self.sampling_freq}",
             f"dt={self.dt}",
         ]
-
-        update_flags = {
-            "A": self.update_continuous_transition_matrix,
-            "Q": self.update_process_cov,
-            "Z": self.update_discrete_transition_matrix,
-            "spike": self.update_spike_params,
-            "m0": self.update_init_mean,
-            "P0": self.update_init_cov,
-        }
-
-        flags_str = ", ".join(f"Update({k})={v}" for k, v in update_flags.items())
-
+        flags_str = ", ".join(
+            f"Update({label})={getattr(self, attr)}"
+            for attr, label in self._REPR_UPDATE_FLAG_LABELS.items()
+        )
         return f"<{self.__class__.__name__}: {', '.join(params)}, [{flags_str}]>"
+
+    # ------------------------------------------------------------------
+    # Model-specific hooks
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def _default_discrete_transition_diag(self) -> Array:
+        """Self-transition probabilities used when none are supplied.
+
+        Returns
+        -------
+        Array, shape (n_discrete_states,)
+        """
+
+    @abstractmethod
+    def _initialize_continuous_transition_matrix(self) -> None:
+        """Initialize the continuous state transition matrix (A).
+
+        Subclasses define whether A is constant across states or varies.
+        """
+
+    @abstractmethod
+    def _initialize_process_covariance(self) -> None:
+        """Initialize the process noise covariance (Q).
+
+        Subclasses define whether Q is constant across states or varies.
+        """
+
+    @abstractmethod
+    def _project_parameters(self) -> None:
+        """Project parameters onto valid spaces after the M-step.
+
+        Subclasses define model-specific projections (e.g., oscillatory
+        structure for A, PSD for Q).
+        """
+
+    def _warm_initialize_states(self, spikes: Array) -> None:
+        """Seed the discrete-state posteriors before the first M-step.
+
+        No-op by default. Subclasses may override to set
+        ``smoother_discrete_state_prob`` / ``smoother_joint_discrete_state_prob``
+        from spike statistics (symmetry breaking) before EM or SGD starts.
+        """
+
+    # ------------------------------------------------------------------
+    # Initialization
+    # ------------------------------------------------------------------
 
     def _initialize_parameters(self, key: Array) -> None:
         """Initialize all model parameters.
@@ -2554,33 +2521,17 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         - Initial state covariance: identity matrix for each discrete state
         - Initial discrete state probabilities: uniform across states
         - Discrete transition matrix: based on `discrete_transition_diag`
-        - Continuous transition matrix: uncoupled oscillators with default
-          frequencies and damping coefficients
-        - Process covariance: identity scaled by 0.01
+        - Continuous transition matrix / process covariance: model specific
         - Spike baseline: zero (corresponding to 1 Hz baseline rate)
         - Spike weights: small random values (scaled by 0.1)
         """
         k1, k2 = jax.random.split(key)
-
-        # Initialize discrete state probabilities (uniform)
         self._initialize_discrete_state_prob()
-
-        # Initialize discrete transition matrix
         self._initialize_discrete_transition_matrix()
-
-        # Initialize continuous state (mean and covariance)
         self._initialize_continuous_state(k1)
-
-        # Initialize continuous transition matrix
         self._initialize_continuous_transition_matrix()
-
-        # Initialize process covariance
         self._initialize_process_covariance()
-
-        # Initialize spike observation parameters
         self._initialize_spike_params(k2)
-
-        # Validate all shapes
         self._validate_parameter_shapes()
 
     def _initialize_discrete_state_prob(self) -> None:
@@ -2590,111 +2541,37 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         )
 
     def _initialize_discrete_transition_matrix(self) -> None:
-        """Initialize discrete state transition matrix.
+        """Initialize discrete state transition matrix from its diagonal.
 
-        Constructs the transition matrix based on `discrete_transition_diag`.
-        Off-diagonal elements are set to distribute the remaining probability
-        mass equally among other states.
+        Off-diagonal elements distribute the remaining probability mass
+        equally among the other states.
         """
         self.discrete_transition_matrix = make_discrete_transition_matrix(
             self.discrete_transition_diag, self.n_discrete_states
         )
 
     def _initialize_continuous_state(self, key: Array) -> None:
-        """Initialize continuous state mean and covariance.
+        """Initialize the continuous state: random per-state mean, identity cov.
 
-        Parameters
-        ----------
-        key : Array
-            Random key for sampling initial mean.
-
-        Notes
-        -----
         Each discrete state gets a different random initial mean to break
         symmetry and allow EM to differentiate between states.
         """
-        # Initial mean: sample independently for each discrete state to break symmetry
         keys = jax.random.split(key, self.n_discrete_states)
         means = jax.vmap(
             lambda k: jax.random.multivariate_normal(
                 key=k, mean=jnp.zeros(self.n_latent), cov=jnp.eye(self.n_latent)
             )
         )(keys)
-        self.init_mean = means.T  # Shape: (n_latent, n_discrete_states)
-
-        # Initial covariance: identity for each discrete state
+        self.init_mean = means.T  # (n_latent, n_discrete_states)
         self.init_cov = jnp.stack(
             [jnp.eye(self.n_latent)] * self.n_discrete_states, axis=2
         )
 
-    def _initialize_continuous_transition_matrix(self) -> None:
-        """Initialize continuous state transition matrices.
-
-        Uses uncoupled oscillator dynamics with default frequencies
-        (uniform in [5, 15] Hz) and damping coefficients that vary slightly
-        across discrete states to break symmetry.
-
-        Notes
-        -----
-        Each discrete state gets slightly different damping coefficients
-        (ranging from 0.90 to 0.98) to break symmetry and allow EM to
-        differentiate between states based on dynamics stability.
-        """
-        # Default frequencies: spread across a reasonable range
-        default_freqs = jnp.linspace(5.0, 15.0, self.n_oscillators)
-
-        # Damping varies per state to break symmetry: from 0.90 to 0.98
-        damping_values = jnp.linspace(0.90, 0.98, self.n_discrete_states)
-
-        # Construct transition matrix for each discrete state
-        transition_matrices = []
-        for i in range(self.n_discrete_states):
-            damping = jnp.full(self.n_oscillators, damping_values[i])
-            A = construct_common_oscillator_transition_matrix(
-                freqs=default_freqs,
-                damping_coef=damping,
-                sampling_freq=self.sampling_freq,
-            )
-            transition_matrices.append(A)
-
-        self.continuous_transition_matrix = jnp.stack(transition_matrices, axis=2)
-
-    def _initialize_process_covariance(self) -> None:
-        """Initialize process noise covariances.
-
-        Uses block-diagonal structure with variance that varies across
-        discrete states to break symmetry.
-
-        Notes
-        -----
-        Each discrete state gets different process noise variance
-        (ranging from 0.005 to 0.02) to break symmetry and allow EM to
-        differentiate between states based on noise level.
-        """
-        # Variance varies per state to break symmetry: from 0.005 to 0.02
-        variance_values = jnp.linspace(0.005, 0.02, self.n_discrete_states)
-
-        # Construct process covariance for each discrete state
-        process_covs = []
-        for i in range(self.n_discrete_states):
-            variance = jnp.full(self.n_oscillators, variance_values[i])
-            Q = construct_common_oscillator_process_covariance(variance=variance)
-            process_covs.append(Q)
-
-        self.process_cov = jnp.stack(process_covs, axis=2)
-
     def _initialize_spike_params(self, key: Array) -> None:
-        """Initialize spike observation parameters.
-
-        Parameters
-        ----------
-        key : Array
-            Random key for sampling initial weights.
-        """
+        """Initialize spike observation parameters (baseline and weights)."""
         if self.separate_spike_params:
             # Baseline: zero (exp(0) = 1 Hz baseline firing rate)
             baseline = jnp.zeros((self.n_neurons, self.n_discrete_states))
-
             # Weights: small random values, per discrete state (axis last)
             weights = (
                 jax.random.normal(
@@ -2703,21 +2580,21 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 * 0.1
             )
         else:
-            # Baseline: zero (exp(0) = 1 Hz baseline firing rate)
             baseline = jnp.zeros(self.n_neurons)
-
-            # Weights: small random values
             weights = jax.random.normal(key, (self.n_neurons, self.n_latent)) * 0.1
 
         self.spike_params = SpikeObsParams(baseline=baseline, weights=weights)
 
     def _validate_parameter_shapes(self) -> None:
-        """Validate that all initialized parameters have correct shapes.
+        """Validate that all parameters have correct shapes and are well formed.
 
         Raises
         ------
         ValueError
-            If any parameter has an incorrect shape.
+            If any parameter has an incorrect shape, ``init_cov`` is not
+            symmetric positive definite, ``process_cov`` is not symmetric PSD,
+            ``init_discrete_state_prob`` is not a probability vector, or
+            ``discrete_transition_matrix`` is not row-stochastic.
         """
         if self.init_mean.shape != (self.n_latent, self.n_discrete_states):
             raise ValueError(
@@ -2735,12 +2612,18 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 f"({self.n_latent}, {self.n_latent}, {self.n_discrete_states}), "
                 f"got {self.init_cov.shape}."
             )
+        # init_cov must be symmetric PD per discrete state; the Cholesky-based
+        # Laplace-EKF NaNs on a non-PSD prior.
+        validate_covariance(self.init_cov, "init_cov")
         if self.init_discrete_state_prob.shape != (self.n_discrete_states,):
             raise ValueError(
                 f"init_discrete_state_prob shape mismatch: expected "
                 f"({self.n_discrete_states},), "
                 f"got {self.init_discrete_state_prob.shape}."
             )
+        validate_probability_vector(
+            self.init_discrete_state_prob, "init_discrete_state_prob"
+        )
         if self.discrete_transition_matrix.shape != (
             self.n_discrete_states,
             self.n_discrete_states,
@@ -2750,6 +2633,9 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 f"({self.n_discrete_states}, {self.n_discrete_states}), "
                 f"got {self.discrete_transition_matrix.shape}."
             )
+        validate_transition_matrix(
+            self.discrete_transition_matrix, "discrete_transition_matrix"
+        )
         if self.continuous_transition_matrix.shape != (
             self.n_latent,
             self.n_latent,
@@ -2770,6 +2656,12 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 f"({self.n_latent}, {self.n_latent}, {self.n_discrete_states}), "
                 f"got {self.process_cov.shape}."
             )
+        # process_cov must be symmetric PSD per state; a too-strong correlated-
+        # noise coupling yields a symmetric-but-indefinite Q that would reach the
+        # Cholesky-based filter on EM iteration 0 (before _project_parameters).
+        validate_covariance(
+            self.process_cov, "process_cov", require_positive_definite=False
+        )
         if self.separate_spike_params:
             expected_baseline = (self.n_neurons, self.n_discrete_states)
             expected_weights = (
@@ -2791,6 +2683,10 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 f"spike_params.weights shape mismatch: expected "
                 f"{expected_weights}, got {self.spike_params.weights.shape}."
             )
+
+    # ------------------------------------------------------------------
+    # E-step
+    # ------------------------------------------------------------------
 
     def _e_step(self, spikes: Array) -> Array:
         """E-step: Run filter and smoother, store posterior statistics.
@@ -2819,11 +2715,12 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         - smoother_joint_discrete_state_prob: P(S_t=j, S_{t+1}=k | y_{1:T})
         - smoother_pair_cond_cross_cov: Cov[x_t, x_{t+1} | y_{1:T}, S_t=j, S_{t+1}=k]
         - smoother_pair_cond_means: E[x_t | y_{1:T}, S_t=j, S_{t+1}=k]
+        - smoother_pair_cond_covs / smoother_next_pair_cond_means: GPB2 only
+          (None under GPB1)
 
         These are the sufficient statistics needed by the M-step for dynamics
         parameter updates via `switching_kalman_maximization_step`.
         """
-
         # Run the switching point-process filter. ``_linear_log_intensity`` is a
         # single module-level object (not a per-call closure): the jitted filter
         # core takes it as a static jit argument cached by identity, so reusing
@@ -2910,6 +2807,10 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
 
         return marginal_log_likelihood
 
+    # ------------------------------------------------------------------
+    # M-step
+    # ------------------------------------------------------------------
+
     def _m_step_dynamics(self) -> None:
         """M-step for dynamics parameters: A, Q, discrete transitions, initial state.
 
@@ -2931,21 +2832,21 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         This method must be called after `_e_step()` which populates the smoother
         output attributes used here.
 
-        The process covariance Q and initial covariance P0 can be regularized
-        via a trust-region blend and eigenvalue clipping (see
-        ``QRegularizationConfig``) to stabilize updates when the Laplace-EKF
-        approximation produces unreliable estimates. The P0 regularization is
-        particularly important for the GPB1 smoother, whose backward collapse
-        step inflates the smoother covariance at t=0, creating a positive
-        feedback loop through init_cov if left unchecked.
+        The process covariance Q is regularized via a trust-region blend and
+        eigenvalue clipping (see ``QRegularizationConfig``) to stabilize
+        updates when the Laplace-EKF approximation produces unreliable
+        estimates. The initial-state estimates pass through the
+        ``_regularize_init_mean_update`` / ``_regularize_init_cov_update``
+        hooks; the default init_cov policy is the same trust-region blend and
+        (init_cov-specific) eigenvalue cap, which is particularly important for
+        the GPB1 smoother, whose backward collapse step inflates the smoother
+        covariance at t=0, creating a positive feedback loop through init_cov
+        if left unchecked.
 
         The measurement_matrix and measurement_cov returns from
         `switching_kalman_maximization_step` are ignored since they assume
         Gaussian observations, which don't apply to point-process models.
         """
-        # Call the switching Kalman M-step for dynamics parameters
-        # obs argument is required but not used for dynamics updates
-        # We pass a dummy array since we don't use measurement_matrix/cov outputs
         n_time = self.smoother_state_cond_mean.shape[0]
 
         if n_time < 2:
@@ -2966,6 +2867,8 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             self.init_discrete_state_prob = init_prob / jnp.sum(init_prob)
             return
 
+        # obs is required but unused for the dynamics updates (the
+        # measurement_matrix / measurement_cov outputs are ignored).
         dummy_obs = jnp.zeros((n_time, 1))
 
         (
@@ -2985,77 +2888,81 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
             pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
             pair_cond_smoother_means=self.smoother_pair_cond_means,
-            pair_cond_smoother_covs=self.smoother_pair_cond_covs,
-            next_pair_cond_smoother_means=self.smoother_next_pair_cond_means,
+            pair_cond_smoother_covs=getattr(self, "smoother_pair_cond_covs", None),
+            next_pair_cond_smoother_means=getattr(
+                self, "smoother_next_pair_cond_means", None
+            ),
+            transition_prior=self.transition_prior,
         )
 
-        # Update continuous transition matrix if flag is True
         if self.update_continuous_transition_matrix:
             self.continuous_transition_matrix = new_A
 
-        # Update process covariance if flag is True
         if self.update_process_cov:
-            cfg = self.q_regularization
-            if cfg.enabled:
-                # Blend new Q with previous Q (trust region)
-                Q_blended = (
-                    cfg.trust_region_weight * new_Q
-                    + (1 - cfg.trust_region_weight) * self.process_cov
-                )
+            self.process_cov = self._regularize_process_cov_update(new_Q)
 
-                # Clip eigenvalues per state
-                Q_clipped = jax.vmap(
-                    functools.partial(
-                        clip_eigenvalues,
-                        min_eigenvalue=cfg.min_eigenvalue,
-                        max_eigenvalue=cfg.max_eigenvalue,
-                    ),
-                    in_axes=-1,
-                    out_axes=-1,
-                )(Q_blended)
-                self.process_cov = Q_clipped
-            else:
-                self.process_cov = new_Q
-
-        # Update discrete transition matrix if flag is True
         if self.update_discrete_transition_matrix:
             self.discrete_transition_matrix = new_discrete_transition
 
-        # Update initial mean if flag is True
         if self.update_init_mean:
-            self.init_mean = new_init_mean
+            self.init_mean = self._regularize_init_mean_update(new_init_mean)
 
-        # Update initial covariance if flag is True
         if self.update_init_cov:
-            # The GPB1 smoother backward collapse inflates the covariance at
-            # t=0 well beyond the filter covariance. This inflated value, when
-            # used directly as init_cov for the next EM iteration, creates a
-            # positive feedback loop: large init_cov → weak filter constraint
-            # → even larger smoother cov → even larger init_cov. Apply
-            # trust-region blending and eigenvalue clipping to break
-            # this cycle.
-            cfg = self.q_regularization
-            if cfg.enabled:
-                init_cov_blended = (
-                    cfg.trust_region_weight * new_init_cov
-                    + (1 - cfg.trust_region_weight) * self.init_cov
-                )
-
-                new_init_cov = jax.vmap(
-                    functools.partial(
-                        clip_eigenvalues,
-                        min_eigenvalue=cfg.min_eigenvalue,
-                        max_eigenvalue=cfg.init_cov_max_eigenvalue,
-                    ),
-                    in_axes=-1,
-                    out_axes=-1,
-                )(init_cov_blended)
-
-            self.init_cov = new_init_cov
+            self.init_cov = self._regularize_init_cov_update(new_init_cov)
 
         # Always update initial discrete state probabilities
         # (from smoother posterior at t=0)
         self.init_discrete_state_prob = new_init_discrete_prob
+
+    def _regularize_process_cov_update(self, process_cov: Array) -> Array:
+        """Trust-region blend and eigenvalue clip of the M-step Q estimate."""
+        cfg = self.q_regularization
+        if not cfg.enabled:
+            return process_cov
+        Q_blended = (
+            cfg.trust_region_weight * process_cov
+            + (1 - cfg.trust_region_weight) * self.process_cov
+        )
+        return jax.vmap(
+            functools.partial(
+                clip_eigenvalues,
+                min_eigenvalue=cfg.min_eigenvalue,
+                max_eigenvalue=cfg.max_eigenvalue,
+            ),
+            in_axes=-1,
+            out_axes=-1,
+        )(Q_blended)
+
+    def _regularize_init_mean_update(self, init_mean: Array) -> Array:
+        """Hook applied to the M-step init_mean estimate (identity by default)."""
+        return init_mean
+
+    def _regularize_init_cov_update(self, init_cov: Array) -> Array:
+        """Trust-region blend and eigenvalue cap of the M-step init_cov estimate.
+
+        The GPB1 smoother backward collapse inflates the covariance at t=0
+        well beyond the filter covariance. Used directly as init_cov for the
+        next EM iteration, this creates a positive feedback loop: large
+        init_cov -> weak filter constraint -> even larger smoother cov -> even
+        larger init_cov. Trust-region blending and the absolute
+        ``init_cov_max_eigenvalue`` cap break the cycle.
+        """
+        cfg = self.q_regularization
+        if not cfg.enabled:
+            return init_cov
+        init_cov_blended = (
+            cfg.trust_region_weight * init_cov
+            + (1 - cfg.trust_region_weight) * self.init_cov
+        )
+        return jax.vmap(
+            functools.partial(
+                clip_eigenvalues,
+                min_eigenvalue=cfg.min_eigenvalue,
+                max_eigenvalue=cfg.init_cov_max_eigenvalue,
+            ),
+            in_axes=-1,
+            out_axes=-1,
+        )(init_cov_blended)
 
     def _m_step_spikes(self, spikes: Array) -> None:
         """M-step for spike observation parameters: baseline and weights.
@@ -3082,23 +2989,22 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         if not self.update_spike_params:
             return
 
+        # Baseline prior: empirical log-rate per neuron (average across states).
+        # This prevents baselines from drifting to extreme values for neurons
+        # with near-zero rate in one state.
+        if self.spike_baseline_prior_l2 > 0:
+            mean_counts = jnp.mean(spikes, axis=0)
+            baseline_prior = jnp.log(mean_counts / self.dt + 1e-10)
+        else:
+            baseline_prior = None
+
         if self.separate_spike_params:
             # Minimum total weight required to update parameters for a state.
             # States with less weight keep their current parameters unchanged.
             MIN_STATE_WEIGHT = 1e-8
 
-            # Baseline prior: empirical log-rate per neuron (average across states).
-            # This prevents baselines from drifting to extreme values for neurons
-            # with near-zero rate in one state.
-            if self.spike_baseline_prior_l2 > 0:
-                mean_counts = jnp.mean(spikes, axis=0)
-                baseline_prior = jnp.log(mean_counts / self.dt + 1e-10)
-            else:
-                baseline_prior = None
-
-            # Python loop over discrete states (typically 2-4).
-            # Avoids vmap → lax.cond → lax.scan → vmap nesting that causes
-            # prohibitive JIT compilation times.
+            # Python loop over discrete states (typically 2-4); each state's
+            # update reuses the same compiled per-state Newton solve.
             new_baselines = []
             new_weights = []
             for j in range(self.n_discrete_states):
@@ -3135,12 +3041,6 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             )
             return
 
-        if self.spike_baseline_prior_l2 > 0:
-            mean_counts = jnp.mean(spikes, axis=0)
-            baseline_prior = jnp.log(mean_counts / self.dt + 1e-10)
-        else:
-            baseline_prior = None
-
         self.spike_params = update_spike_glm_params_mixture(
             spikes=spikes,
             state_cond_smoother_mean=self.smoother_state_cond_mean,
@@ -3153,6 +3053,465 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             baseline_prior_l2=self.spike_baseline_prior_l2,
         )
 
+    # ------------------------------------------------------------------
+    # SGDFittableMixin protocol
+    # ------------------------------------------------------------------
+
+    def fit_sgd(
+        self,
+        spikes: Array,
+        key: Array | None = None,
+        optimizer: object | None = None,
+        num_steps: int = 200,
+        verbose: bool = False,
+        convergence_tol: float | None = None,
+    ) -> list[float]:
+        """Fit by minimizing negative marginal LL via gradient descent.
+
+        Parameters
+        ----------
+        spikes : Array, shape (n_time, n_neurons)
+            Observed spike counts.
+        key : Array or None
+            JAX random key for initialization. Required on first call.
+        optimizer : optax optimizer or None
+            Default: adam(1e-2) with gradient clipping.
+        num_steps : int
+            Number of optimization steps.
+        verbose : bool
+            Log progress every 10 steps.
+        convergence_tol : float or None
+            If set, stop early when |ΔLL| < tol for 5 consecutive steps.
+
+        Returns
+        -------
+        log_likelihoods : list of float
+        """
+        spikes = jnp.asarray(spikes)
+        validate_count_array(spikes, "spikes")
+        self._sgd_n_time = spikes.shape[0]
+
+        if not self._is_initialized():
+            if key is None:
+                raise ValueError("key required for initialization on first call")
+            self._initialize_parameters(key)
+            self._warm_initialize_states(spikes)
+
+        return super().fit_sgd(
+            spikes,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+        )
+
+    def _is_initialized(self) -> bool:
+        return (
+            hasattr(self, "continuous_transition_matrix")
+            and self.continuous_transition_matrix is not None
+            and hasattr(self, "spike_params")
+            and self.spike_params is not None
+        )
+
+    @property
+    def _n_timesteps(self) -> int:
+        return self._sgd_n_time
+
+    def _check_sgd_initialized(self) -> None:
+        if not self._is_initialized():
+            raise RuntimeError(
+                "Call fit_sgd(spikes, key=...) to initialize parameters."
+            )
+
+    def _shared_sgd_param_spec(self) -> tuple[dict, dict]:
+        """SGD parameters every switching point-process model optimizes.
+
+        Spike GLM parameters, the discrete transition matrix, the initial mean
+        and the per-state initial covariances, each gated by its update flag.
+        Subclasses add their model-specific dynamics parameters.
+        """
+        params: dict = {}
+        spec: dict = {}
+
+        if self.update_spike_params:
+            params["spike_baseline"] = self.spike_params.baseline
+            spec["spike_baseline"] = UNCONSTRAINED
+            params["spike_weights"] = self.spike_params.weights
+            spec["spike_weights"] = UNCONSTRAINED
+
+        if self.update_discrete_transition_matrix:
+            params["discrete_transition_matrix"] = self.discrete_transition_matrix
+            spec["discrete_transition_matrix"] = STOCHASTIC_ROW
+
+        if self.update_init_mean:
+            params["init_mean"] = self.init_mean
+            spec["init_mean"] = UNCONSTRAINED
+
+        if self.update_init_cov:
+            for j in range(self.n_discrete_states):
+                k = f"init_cov_{j}"
+                params[k] = self.init_cov[..., j]
+                spec[k] = PSD_MATRIX
+
+        return params, spec
+
+    def _sgd_loss_fn(self, params: dict, spikes: Array) -> Array:
+        """Negative marginal LL (plus the EM M-step's penalties) for SGD.
+
+        Subclasses that optimize structured dynamics reconstruct the per-state
+        transition matrix / process covariance from their scientific
+        parameters and inject them under the reserved ``"_A"`` / ``"_Q"`` keys
+        before delegating here; absent those keys the model's current
+        matrices are used.
+        """
+        Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
+        m0 = params.get("init_mean", self.init_mean)
+        A = params.get("_A", self.continuous_transition_matrix)
+        Q = params.get("_Q", self.process_cov)
+
+        baseline = params.get("spike_baseline", self.spike_params.baseline)
+        weights = params.get("spike_weights", self.spike_params.weights)
+        sp = SpikeObsParams(baseline=baseline, weights=weights)
+
+        P0 = reconstruct_per_state_array(
+            params, "init_cov", self.init_cov, self.n_discrete_states
+        )
+
+        # Optimize the *same* filter approximation the E-step/finalize evaluate:
+        # pass max_newton_iter and line_search_beta so a model configured with
+        # multi-step Laplace does not train against the 1-step LL and then report
+        # a different multi-step LL. Note: with max_newton_iter > 1 the SGD loss
+        # differentiates through the backtracking scan's jnp.where selections, so
+        # the gradient is valid but piecewise-constant in the step size.
+        result = switching_point_process_filter(
+            init_state_cond_mean=m0,
+            init_state_cond_cov=P0,
+            init_discrete_state_prob=self.init_discrete_state_prob,
+            spikes=spikes,
+            discrete_transition_matrix=Z,
+            continuous_transition_matrix=A,
+            process_cov=Q,
+            dt=self.dt,
+            log_intensity_func=_linear_log_intensity,
+            spike_params=sp,
+            max_newton_iter=self.max_newton_iter,
+            line_search_beta=self.line_search_beta,
+        )
+        loss = -result[6]
+
+        # Spike weight L2 penalty (matches EM M-step regularization)
+        if self.spike_weight_l2 > 0:
+            loss = loss + 0.5 * self.spike_weight_l2 * jnp.sum(weights**2)
+
+        # Spike baseline shrinkage prior (matches EM M-step regularization):
+        # shrink baselines toward the empirical per-neuron log-rate. Without
+        # this term the SGD objective and the EM M-step regularize different
+        # models, so fit() and fit_sgd() would converge to different baselines.
+        if self.spike_baseline_prior_l2 > 0:
+            baseline_prior = jnp.log(jnp.mean(spikes, axis=0) / self.dt + 1e-10)
+            baseline_prior = baseline_prior.reshape((-1,) + (1,) * (baseline.ndim - 1))
+            loss = loss + 0.5 * self.spike_baseline_prior_l2 * jnp.sum(
+                (baseline - baseline_prior) ** 2
+            )
+
+        return loss
+
+    def _store_sgd_params(self, params: dict) -> None:
+        """Store the shared SGD parameters; subclasses add their own after."""
+        if "discrete_transition_matrix" in params:
+            self.discrete_transition_matrix = params["discrete_transition_matrix"]
+        if "init_mean" in params:
+            self.init_mean = params["init_mean"]
+        if "spike_baseline" in params or "spike_weights" in params:
+            self.spike_params = SpikeObsParams(
+                baseline=params.get("spike_baseline", self.spike_params.baseline),
+                weights=params.get("spike_weights", self.spike_params.weights),
+            )
+        self.init_cov = reconstruct_per_state_array(
+            params, "init_cov", self.init_cov, self.n_discrete_states
+        )
+
+    def _finalize_sgd(self, spikes: Array) -> None:
+        self._e_step(spikes)
+
+
+class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
+    """Switching oscillator network with spike-based observations.
+
+    This model combines:
+    - Oscillator network dynamics (DIM/CNM style transition matrices)
+    - Switching discrete states for different coupling patterns
+    - Point-process (spike) observations via Laplace-EKF
+
+    The latent state x_t has dimension 2 * n_oscillators (amplitude and phase
+    for each oscillator). The dynamics switch between n_discrete_states
+    different configurations, each with potentially different coupling patterns.
+
+    The observation model is a Poisson point-process with log-linear intensity:
+        log(lambda_n(t)) = baseline_n + weights_n @ x_t
+
+    Parameters
+    ----------
+    n_oscillators : int
+        Number of latent oscillators. Must be positive. State dimension will
+        be 2 * n_oscillators (amplitude and phase for each).
+    n_neurons : int
+        Number of observed neurons (spike trains). Must be positive.
+    n_discrete_states : int
+        Number of discrete network states (coupling configurations). Must be
+        positive.
+    sampling_freq : float
+        Sampling frequency in Hz. Must be positive.
+    dt : float
+        Time bin width in seconds. Must be positive. Typically dt <= 1/sampling_freq
+        for numerical stability.
+    discrete_transition_diag : Array | None, optional
+        Diagonal elements of the discrete transition matrix (self-transition
+        probabilities). Values should be in [0, 1]. Shape must be (n_discrete_states,)
+        if provided. If None, defaults to 0.95 for all states.
+    update_continuous_transition_matrix : bool, default=True
+        Whether to update A (dynamics) during M-step.
+    update_process_cov : bool, default=True
+        Whether to update Q (process noise) during M-step.
+    update_discrete_transition_matrix : bool, default=True
+        Whether to update Z (discrete transitions) during M-step.
+    update_spike_params : bool, default=True
+        Whether to update spike GLM parameters (baseline, weights) during M-step.
+    separate_spike_params : bool, default=True
+        Whether to fit separate spike GLM parameters per discrete state.
+    update_init_mean : bool, default=True
+        Whether to update initial mean during M-step.
+    update_init_cov : bool, default=True
+        Whether to update initial covariance during M-step.
+    q_regularization : QRegularizationConfig | None, optional
+        Trust-region and eigenvalue clipping configuration for Q updates.
+    spike_weight_l2 : float, default=100.0
+        L2 regularization strength on the spike GLM weights (not baseline).
+        Adds 0.5 * spike_weight_l2 * ||weights||^2 to the M-step objective
+        for each neuron. This is an absolute penalty that must be scaled
+        relative to the data likelihood, which grows with sequence length
+        and firing rate. The default (100.0) keeps weight norms ~O(1),
+        corresponding to realistic theta modulation depths of ~2-10x in
+        firing rate. For short sequences or low-rate neurons, reduce
+        proportionally.
+    max_spectral_radius : float, default=0.999
+        Upper bound on the spectral radius of each state's transition matrix
+        enforced by ``_project_parameters`` after the M-step (and after an SGD
+        parameter store). Must lie in ``(0, 1)``.
+
+    Attributes
+    ----------
+    n_latent : int
+        Dimension of the continuous latent state (2 * n_oscillators).
+    discrete_transition_diag : Array
+        Diagonal of discrete transition matrix.
+
+    Notes
+    -----
+    This model uses the exact per-state-pair structure for the switching filter.
+    EM monotonicity is only approximate here: both the Laplace observation
+    approximation and the GPB mixture collapse in the smoother can produce small
+    log-likelihood decreases. ``fit`` tolerates these via ``decrease_tol`` rather
+    than treating any decrease as divergence.
+
+    The smoother is observation-model agnostic and reuses
+    ``switching_kalman_smoother`` from the switching_kalman module.
+
+    Examples
+    --------
+    Separate spike GLM parameters per discrete state (default):
+
+    >>> import jax.numpy as jnp
+    >>> model = SwitchingSpikeOscillatorModel(
+    ...     n_oscillators=2,
+    ...     n_neurons=10,
+    ...     n_discrete_states=3,
+    ...     sampling_freq=100.0,
+    ...     dt=0.01,
+    ... )
+    >>> model.n_latent
+    4
+    >>> model.n_discrete_states
+    3
+    >>> model.separate_spike_params
+    True
+
+    Shared spike GLM parameters across all discrete states:
+
+    >>> model_shared = SwitchingSpikeOscillatorModel(
+    ...     n_oscillators=2,
+    ...     n_neurons=10,
+    ...     n_discrete_states=3,
+    ...     sampling_freq=100.0,
+    ...     dt=0.01,
+    ...     separate_spike_params=False,
+    ... )
+    >>> model_shared.separate_spike_params
+    False
+    """
+
+    def __init__(
+        self,
+        n_oscillators: int,
+        n_neurons: int,
+        n_discrete_states: int,
+        sampling_freq: float,
+        dt: float,
+        discrete_transition_diag: Array | None = None,
+        update_continuous_transition_matrix: bool = True,
+        update_process_cov: bool = True,
+        update_discrete_transition_matrix: bool = True,
+        update_spike_params: bool = True,
+        separate_spike_params: bool = True,
+        update_init_mean: bool = True,
+        update_init_cov: bool = True,
+        q_regularization: QRegularizationConfig | None = None,
+        spike_weight_l2: float = 100.0,
+        spike_baseline_prior_l2: float = 0.0,
+        max_newton_iter: int = 1,
+        line_search_beta: float = 0.5,
+        smoother_type: str = "gpb1",
+        max_spectral_radius: float = 0.999,
+    ) -> None:
+        """Initialize the switching spike oscillator model.
+
+        Parameters
+        ----------
+        n_oscillators : int
+            Number of latent oscillators.
+        n_neurons : int
+            Number of observed neurons.
+        n_discrete_states : int
+            Number of discrete network states.
+        sampling_freq : float
+            Sampling frequency in Hz.
+        dt : float
+            Time bin width in seconds.
+        discrete_transition_diag : Array | None, optional
+            Diagonal of discrete transition matrix. Defaults to 0.95.
+        update_continuous_transition_matrix : bool, default=True
+            Update A during M-step.
+        update_process_cov : bool, default=True
+            Update Q during M-step.
+        update_discrete_transition_matrix : bool, default=True
+            Update Z during M-step.
+        update_spike_params : bool, default=True
+            Update spike GLM params during M-step.
+        separate_spike_params : bool, default=True
+            If True, fit a separate spike GLM (baseline, weights) per discrete state.
+        update_init_mean : bool, default=True
+            Update initial mean during M-step.
+        update_init_cov : bool, default=True
+            Update initial covariance during M-step.
+        q_regularization : QRegularizationConfig | None, optional
+            Trust-region and eigenvalue clipping configuration for Q updates.
+        spike_weight_l2 : float, default=100.0
+            L2 regularization strength on the spike GLM weights.
+        spike_baseline_prior_l2 : float, default=0.0
+            L2 regularization strength shrinking spike baselines toward the
+            empirical log-rate (computed per neuron from mean spike counts).
+            Setting to 0.0 disables the prior.
+        smoother_type : str, default="gpb1"
+            Switching smoother algorithm. Must be "gpb1" or "gpb2".
+            GPB2 carries S² pair-conditional Gaussians through the backward
+            pass (vs S state-conditional for GPB1), providing better numerical
+            stability for long sequences with sparse observations and cleaner
+            pair-conditioned transition statistics for the dynamics M-step.
+        max_spectral_radius : float, default=0.999
+            Spectral-radius bound applied to each projected transition matrix.
+
+        Raises
+        ------
+        ValueError
+            If any of n_oscillators, n_neurons, n_discrete_states, sampling_freq,
+            or dt is not positive. Also if discrete_transition_diag has wrong shape,
+            spike_weight_l2 is negative, or max_spectral_radius is outside (0, 1).
+        """
+        super().__init__(
+            n_oscillators,
+            n_neurons,
+            n_discrete_states,
+            sampling_freq,
+            dt,
+            discrete_transition_diag=discrete_transition_diag,
+            update_continuous_transition_matrix=update_continuous_transition_matrix,
+            update_process_cov=update_process_cov,
+            update_discrete_transition_matrix=update_discrete_transition_matrix,
+            update_spike_params=update_spike_params,
+            separate_spike_params=separate_spike_params,
+            update_init_mean=update_init_mean,
+            update_init_cov=update_init_cov,
+            q_regularization=q_regularization,
+            spike_weight_l2=spike_weight_l2,
+            spike_baseline_prior_l2=spike_baseline_prior_l2,
+            max_newton_iter=max_newton_iter,
+            line_search_beta=line_search_beta,
+            smoother_type=smoother_type,
+        )
+        if not 0.0 < max_spectral_radius < 1.0:
+            raise ValueError("max_spectral_radius must lie in (0, 1).")
+        self.max_spectral_radius = max_spectral_radius
+
+    def _default_discrete_transition_diag(self) -> Array:
+        """0.95 self-transition probability for every discrete state."""
+        return jnp.full((self.n_discrete_states,), 0.95, dtype=jnp.float32)
+
+    def _initialize_continuous_transition_matrix(self) -> None:
+        """Initialize continuous state transition matrices.
+
+        Uses uncoupled oscillator dynamics with default frequencies
+        (uniform in [5, 15] Hz) and damping coefficients that vary slightly
+        across discrete states to break symmetry.
+
+        Notes
+        -----
+        Each discrete state gets slightly different damping coefficients
+        (ranging from 0.90 to 0.98) to break symmetry and allow EM to
+        differentiate between states based on dynamics stability.
+        """
+        # Default frequencies: spread across a reasonable range
+        default_freqs = jnp.linspace(5.0, 15.0, self.n_oscillators)
+
+        # Damping varies per state to break symmetry: from 0.90 to 0.98
+        damping_values = jnp.linspace(0.90, 0.98, self.n_discrete_states)
+
+        # Construct transition matrix for each discrete state
+        transition_matrices = []
+        for i in range(self.n_discrete_states):
+            damping = jnp.full(self.n_oscillators, damping_values[i])
+            A = construct_common_oscillator_transition_matrix(
+                freqs=default_freqs,
+                damping_coef=damping,
+                sampling_freq=self.sampling_freq,
+            )
+            transition_matrices.append(A)
+
+        self.continuous_transition_matrix = jnp.stack(transition_matrices, axis=2)
+
+    def _initialize_process_covariance(self) -> None:
+        """Initialize process noise covariances.
+
+        Uses block-diagonal structure with variance that varies across
+        discrete states to break symmetry.
+
+        Notes
+        -----
+        Each discrete state gets different process noise variance
+        (ranging from 0.005 to 0.02) to break symmetry and allow EM to
+        differentiate between states based on noise level.
+        """
+        # Variance varies per state to break symmetry: from 0.005 to 0.02
+        variance_values = jnp.linspace(0.005, 0.02, self.n_discrete_states)
+
+        # Construct process covariance for each discrete state
+        process_covs = []
+        for i in range(self.n_discrete_states):
+            variance = jnp.full(self.n_oscillators, variance_values[i])
+            Q = construct_common_oscillator_process_covariance(variance=variance)
+            process_covs.append(Q)
+
+        self.process_cov = jnp.stack(process_covs, axis=2)
+
     def _project_parameters(self) -> None:
         """Project estimated parameters onto valid parameter spaces.
 
@@ -3160,9 +3519,10 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         constraints after the M-step:
 
         1. **Transition matrix projection**: Projects each A_j to preserve
-           oscillatory block structure using `project_coupled_transition_matrix`.
-           Each 2x2 diagonal block is projected to the closest scaled rotation
-           matrix [[a, -b], [b, a]], which preserves oscillatory dynamics.
+           oscillatory block structure using `project_coupled_transition_matrix`
+           (each 2x2 block becomes the closest scaled rotation matrix
+           [[a, -b], [b, a]]) and clamps its spectral radius to at most
+           ``max_spectral_radius`` (see ``project_transition_matrix_stack``).
 
         2. **Process covariance projection**: Ensures each Q_j is:
            - Symmetric: Q_j = (Q_j + Q_j.T) / 2
@@ -3185,21 +3545,10 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         The projections respect update flags: if `update_continuous_transition_matrix`
         or `update_process_cov` is False, the corresponding projection is skipped.
         """
-        # Project each transition matrix to preserve oscillatory block structure
-        # and clamp spectral radius to < 1 for stability
         if self.update_continuous_transition_matrix:
-            _MAX_SPECTRAL_RADIUS = 0.999
-            projected_A_list = []
-            for j in range(self.n_discrete_states):
-                A_j = project_coupled_transition_matrix(
-                    self.continuous_transition_matrix[:, :, j]
-                )
-                # Clamp spectral radius to prevent unstable dynamics. Computed on
-                # host (eigvals has no GPU/TPU lowering); this loop runs eagerly.
-                projected_A_list.append(
-                    stabilize_transition_matrix(A_j, _MAX_SPECTRAL_RADIUS)
-                )
-            self.continuous_transition_matrix = jnp.stack(projected_A_list, axis=-1)
+            self.continuous_transition_matrix = project_transition_matrix_stack(
+                self.continuous_transition_matrix, self.max_spectral_radius
+            )
 
         # Project each process covariance to the nearest symmetric PSD matrix
         # (symmetrize -> eigenvalue floor at 1e-8 -> reconstruct).
@@ -3474,67 +3823,10 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
 
         return log_likelihoods
 
-    # --- SGDFittableMixin protocol ---
-
-    def fit_sgd(
-        self,
-        spikes,
-        key=None,
-        optimizer=None,
-        num_steps=200,
-        verbose=False,
-        convergence_tol=None,
-    ):
-        """Fit by minimizing negative marginal LL via gradient descent.
-
-        Parameters
-        ----------
-        spikes : Array, shape (n_time, n_neurons)
-        key : Array or None
-            JAX random key for initialization on first call.
-        optimizer : optax optimizer or None
-        num_steps : int
-        verbose : bool
-        convergence_tol : float or None
-
-        Returns
-        -------
-        log_likelihoods : list of float
-        """
-        spikes = jnp.asarray(spikes)
-        validate_count_array(spikes, "spikes")
-        self._sgd_n_time = spikes.shape[0]
-
-        if (
-            not hasattr(self, "continuous_transition_matrix")
-            or self.continuous_transition_matrix is None
-        ):
-            if key is None:
-                raise ValueError("key required for initialization")
-            self._initialize_parameters(key)
-
-        return super().fit_sgd(
-            spikes,
-            optimizer=optimizer,
-            num_steps=num_steps,
-            verbose=verbose,
-            convergence_tol=convergence_tol,
-        )
-
-    @property
-    def _n_timesteps(self):
-        return self._sgd_n_time
-
-    def _check_sgd_initialized(self):
-        if (
-            not hasattr(self, "continuous_transition_matrix")
-            or self.continuous_transition_matrix is None
-        ):
-            raise RuntimeError("Call fit_sgd(spikes, key=...) first.")
+    # --- SGDFittableMixin protocol: model-specific dynamics parameters ---
 
     def _build_param_spec(self):
-        params = {}
-        spec = {}
+        params, spec = self._shared_sgd_param_spec()
 
         if self.update_continuous_transition_matrix:
             for j in range(self.n_discrete_states):
@@ -3550,86 +3842,18 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                 params[k] = self.process_cov[..., j]
                 spec[k] = PSD_MATRIX
 
-        if self.update_spike_params:
-            params["spike_baseline"] = self.spike_params.baseline
-            spec["spike_baseline"] = UNCONSTRAINED
-            params["spike_weights"] = self.spike_params.weights
-            spec["spike_weights"] = UNCONSTRAINED
-
-        if self.update_discrete_transition_matrix:
-            params["discrete_transition_matrix"] = self.discrete_transition_matrix
-            spec["discrete_transition_matrix"] = STOCHASTIC_ROW
-
-        if self.update_init_mean:
-            params["init_mean"] = self.init_mean
-            spec["init_mean"] = UNCONSTRAINED
-
-        if self.update_init_cov:
-            for j in range(self.n_discrete_states):
-                k = f"init_cov_{j}"
-                params[k] = self.init_cov[..., j]
-                spec[k] = PSD_MATRIX
-
         return params, spec
 
     def _sgd_loss_fn(self, params, spikes):
-        Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
-        m0 = params.get("init_mean", self.init_mean)
-
-        baseline = params.get("spike_baseline", self.spike_params.baseline)
-        weights = params.get("spike_weights", self.spike_params.weights)
-        sp = SpikeObsParams(baseline=baseline, weights=weights)
-
-        # Reconstruct per-state arrays
+        # Reconstruct the per-state dynamics from the scaled-rotation blocks and
+        # per-state Q parameters, then evaluate the shared filter loss.
+        params_with_dynamics = dict(params)
         if any(k.startswith("A_blocks_") for k in params):
-            A = self._reconstruct_A_from_blocks(params)
-        else:
-            A = self.continuous_transition_matrix
-        Q = reconstruct_per_state_array(
+            params_with_dynamics["_A"] = self._reconstruct_A_from_blocks(params)
+        params_with_dynamics["_Q"] = reconstruct_per_state_array(
             params, "Q", self.process_cov, self.n_discrete_states
         )
-        P0 = reconstruct_per_state_array(
-            params, "init_cov", self.init_cov, self.n_discrete_states
-        )
-
-        # Optimize the *same* filter approximation the E-step/finalize evaluate:
-        # pass max_newton_iter and line_search_beta so a model configured with
-        # multi-step Laplace does not train against the 1-step LL and then report
-        # a different multi-step LL. Note: with max_newton_iter > 1 the SGD loss
-        # differentiates through the backtracking scan's jnp.where selections, so
-        # the gradient is valid but piecewise-constant in the step size.
-        result = switching_point_process_filter(
-            init_state_cond_mean=m0,
-            init_state_cond_cov=P0,
-            init_discrete_state_prob=self.init_discrete_state_prob,
-            spikes=spikes,
-            discrete_transition_matrix=Z,
-            continuous_transition_matrix=A,
-            process_cov=Q,
-            dt=self.dt,
-            log_intensity_func=_linear_log_intensity,
-            spike_params=sp,
-            max_newton_iter=self.max_newton_iter,
-            line_search_beta=self.line_search_beta,
-        )
-        loss = -result[6]
-
-        # Spike weight L2 penalty (matches EM M-step regularization)
-        if self.spike_weight_l2 > 0:
-            loss = loss + 0.5 * self.spike_weight_l2 * jnp.sum(weights**2)
-
-        # Spike baseline shrinkage prior (matches EM M-step regularization):
-        # shrink baselines toward the empirical per-neuron log-rate. Without
-        # this term the SGD objective and the EM M-step regularize different
-        # models, so fit() and fit_sgd() would converge to different baselines.
-        if self.spike_baseline_prior_l2 > 0:
-            baseline_prior = jnp.log(jnp.mean(spikes, axis=0) / self.dt + 1e-10)
-            baseline_prior = baseline_prior.reshape((-1,) + (1,) * (baseline.ndim - 1))
-            loss = loss + 0.5 * self.spike_baseline_prior_l2 * jnp.sum(
-                (baseline - baseline_prior) ** 2
-            )
-
-        return loss
+        return super()._sgd_loss_fn(params_with_dynamics, spikes)
 
     def _reconstruct_A_from_blocks(self, params: dict) -> Array:
         """Rebuild the per-state transition matrix from scaled-rotation SGD blocks.
@@ -3654,31 +3878,12 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         )
 
     def _store_sgd_params(self, params):
-        if "discrete_transition_matrix" in params:
-            self.discrete_transition_matrix = params["discrete_transition_matrix"]
-        if "init_mean" in params:
-            self.init_mean = params["init_mean"]
-        if "spike_baseline" in params or "spike_weights" in params:
-            self.spike_params = SpikeObsParams(
-                baseline=params.get("spike_baseline", self.spike_params.baseline),
-                weights=params.get("spike_weights", self.spike_params.weights),
-            )
+        super()._store_sgd_params(params)
 
         if any(k.startswith("A_blocks_") for k in params):
             self.continuous_transition_matrix = self._reconstruct_A_from_blocks(params)
 
-        def _store_recon(prefix, attr):
-            setattr(
-                self,
-                attr,
-                reconstruct_per_state_array(
-                    params, prefix, getattr(self, attr), self.n_discrete_states
-                ),
-            )
-
-        _store_recon("Q", "process_cov")
-        _store_recon("init_cov", "init_cov")
+        self.process_cov = reconstruct_per_state_array(
+            params, "Q", self.process_cov, self.n_discrete_states
+        )
         self._project_parameters()
-
-    def _finalize_sgd(self, spikes):
-        self._e_step(spikes)

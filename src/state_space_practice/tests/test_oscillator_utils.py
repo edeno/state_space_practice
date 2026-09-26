@@ -6,6 +6,7 @@ import pytest
 from state_space_practice.oscillator_utils import (
     IDENTITY_2x2,
     ZEROS_2x2,
+    DirectedInfluenceDynamicsMixin,
     _compute_coupled_oscillator_block,
     _compute_coupling_transition_block,
     _compute_intrinsic_oscillation_block,
@@ -14,6 +15,7 @@ from state_space_practice.oscillator_utils import (
     _project_to_closest_rotation,
     _scatter_block_diagonal,
     canonicalize_correlated_noise_pair_parameters,
+    compute_directed_influence_stability_scale,
     constrain_correlated_noise_process_covariance,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
@@ -21,12 +23,16 @@ from state_space_practice.oscillator_utils import (
     construct_correlated_noise_process_covariance,
     construct_directed_influence_measurement_matrix,
     construct_directed_influence_transition_matrix,
+    construct_stable_directed_influence_transition_stack,
     extract_dim_params_from_matrix,
+    extract_dim_params_from_matrix_stack,
     get_block_slice,
     project_correlated_noise_process_covariance,
     project_coupled_transition_matrix,
     project_matrix_blockwise,
+    project_transition_matrix_stack,
 )
+from state_space_practice.utils import stabilize_transition_matrix
 
 
 def test_constrain_correlated_noise_covariance_is_structured_psd() -> None:
@@ -814,3 +820,205 @@ class TestProjectCoupledTransitionMatrixPathological:
         assert "non-finite" in (captured.out + captured.err).lower(), (
             "non-finite input should emit the damped-identity fallback warning"
         )
+
+
+# ---------------------------------------------------------------------------
+# Shared directed-influence transition-stack helpers
+# ---------------------------------------------------------------------------
+
+
+def _spectral_radius(A) -> float:
+    return float(jnp.max(jnp.abs(jnp.linalg.eigvals(A))))
+
+
+def _assert_scaled_rotation_blocks(A, n_oscillators: int, atol: float) -> None:
+    for row in range(n_oscillators):
+        for col in range(n_oscillators):
+            block = A[2 * row : 2 * row + 2, 2 * col : 2 * col + 2]
+            np.testing.assert_allclose(block[0, 0], block[1, 1], atol=atol)
+            np.testing.assert_allclose(block[0, 1], -block[1, 0], atol=atol)
+
+
+def test_project_transition_matrix_stack_projects_blocks_and_clamps_each_state():
+    """Every state is projected to scaled-rotation blocks and clamped to the bound;
+    a state already inside the family and the bound passes through unchanged."""
+    n_osc = 2
+    bound = 0.9
+    raw = 3.0 * jax.random.normal(jax.random.PRNGKey(0), (2 * n_osc, 2 * n_osc, 3))
+    stable = construct_common_oscillator_transition_matrix(
+        freqs=jnp.array([8.0, 12.0]),
+        damping_coef=jnp.array([0.8, 0.7]),
+        sampling_freq=100.0,
+    )
+    raw = raw.at[..., 2].set(stable)
+    # Guard: the clamp is exercised on the random states (non-vacuous below).
+    for j in range(2):
+        assert _spectral_radius(project_coupled_transition_matrix(raw[..., j])) > bound
+
+    projected = project_transition_matrix_stack(raw, max_spectral_radius=bound)
+
+    assert projected.shape == raw.shape
+    for j in range(3):
+        assert _spectral_radius(projected[..., j]) <= bound + 1e-8
+        _assert_scaled_rotation_blocks(projected[..., j], n_osc, atol=1e-10)
+        expected = stabilize_transition_matrix(
+            project_coupled_transition_matrix(raw[..., j]), max_spectral_radius=bound
+        )
+        np.testing.assert_allclose(projected[..., j], expected, atol=1e-12)
+    np.testing.assert_allclose(projected[..., 2], stable, atol=1e-10)
+
+
+def test_construct_stable_directed_influence_transition_stack_applies_one_scale():
+    """Each state is the DIM construction under the shared stability scale, so the
+    stack honors the bound and is reconstructable from the intrinsic params."""
+    freqs = jnp.array([8.0, 12.0])
+    damping = jnp.array([0.95, 0.9])
+    fs = 100.0
+    strong = jnp.zeros((2, 2, 2)).at[0, 1, :].set(2.0).at[1, 0, 0].set(1.5)
+    phase = jnp.zeros((2, 2, 2)).at[0, 1, :].set(0.4)
+    bound = 0.9
+
+    stack = construct_stable_directed_influence_transition_stack(
+        freqs, damping, strong, phase, fs, max_spectral_radius=bound
+    )
+    scale = compute_directed_influence_stability_scale(
+        freqs, damping, strong, fs, max_spectral_radius=bound
+    )
+
+    assert float(scale) < 1.0  # guard: stabilization engaged
+    assert stack.shape == (4, 4, 2)
+    for j in range(2):
+        assert _spectral_radius(stack[..., j]) <= bound + 1e-6
+        expected = construct_directed_influence_transition_matrix(
+            freqs, damping * scale, strong[..., j] * scale, phase[..., j], fs
+        )
+        np.testing.assert_allclose(stack[..., j], expected, atol=1e-12)
+
+    # Weak coupling under the default bound (0.99 > max damping 0.95) needs no
+    # scaling: the stack is the plain construction.
+    weak = 0.01 * strong
+    assert float(
+        compute_directed_influence_stability_scale(freqs, damping, weak, fs)
+    ) == 1.0
+    stack_weak = construct_stable_directed_influence_transition_stack(
+        freqs, damping, weak, phase, fs
+    )
+    for j in range(2):
+        expected = construct_directed_influence_transition_matrix(
+            freqs, damping, weak[..., j], phase[..., j], fs
+        )
+        np.testing.assert_allclose(stack_weak[..., j], expected, atol=1e-12)
+
+
+def test_extract_dim_params_from_matrix_stack_recovers_shared_and_per_state_params():
+    """Shared freq/damping come back averaged over states; coupling/phase keep
+    their state axis."""
+    freqs = jnp.array([6.0, 11.0])
+    damping = jnp.array([0.9, 0.8])
+    fs = 100.0
+    coupling = jnp.zeros((2, 2, 2)).at[0, 1, 0].set(0.05).at[1, 0, 1].set(0.08)
+    phase = jnp.zeros((2, 2, 2)).at[0, 1, 0].set(0.3).at[1, 0, 1].set(-0.7)
+    stack = construct_stable_directed_influence_transition_stack(
+        freqs, damping, coupling, phase, fs
+    )
+
+    params = extract_dim_params_from_matrix_stack(stack, fs, 2)
+
+    np.testing.assert_allclose(params["freq"], freqs, atol=1e-8)
+    np.testing.assert_allclose(params["damping"], damping, atol=1e-8)
+    np.testing.assert_allclose(params["coupling_strength"], coupling, atol=1e-8)
+    np.testing.assert_allclose(params["phase_diff"], phase, atol=1e-8)
+
+    # Disagreeing per-state matrices: the shared params are the state average.
+    other = construct_directed_influence_transition_matrix(
+        freqs + 2.0, damping - 0.1, coupling[..., 1], phase[..., 1], fs
+    )
+    params_avg = extract_dim_params_from_matrix_stack(
+        stack.at[..., 1].set(other), fs, 2
+    )
+    np.testing.assert_allclose(params_avg["freq"], freqs + 1.0, atol=1e-8)
+    np.testing.assert_allclose(params_avg["damping"], damping - 0.05, atol=1e-8)
+
+
+class _DIMHost(DirectedInfluenceDynamicsMixin):
+    """Minimal host exposing the attributes the mixin documents as required."""
+
+    def __init__(self, coupling, use_reparameterized_mstep=False):
+        self.freqs = jnp.array([8.0, 12.0])
+        self.damping_coef = jnp.array([0.95, 0.9])
+        self.coupling_strength = coupling
+        self.phase_difference = jnp.zeros_like(coupling)
+        self.sampling_freq = 100.0
+        self.max_spectral_radius = 0.9
+        self.n_oscillators = 2
+        self.n_discrete_states = coupling.shape[-1]
+        self.use_reparameterized_mstep = use_reparameterized_mstep
+        self.update_continuous_transition_matrix = True
+        self._current_osc_params = None
+
+
+def test_directed_influence_mixin_projection_syncs_public_params_and_rebuilds():
+    """Standard-EM projection leaves A reconstructable from the synced public
+    params; the reparameterized path leaves A untouched."""
+    strong = jnp.zeros((2, 2, 2)).at[0, 1, :].set(2.0).at[1, 0, :].set(2.0)
+    host = _DIMHost(strong)
+    host._initialize_continuous_transition_matrix()
+    assert float(host._effective_dim_scale()) < 1.0  # guard: scale engaged
+    for j in range(2):
+        assert _spectral_radius(host.continuous_transition_matrix[..., j]) <= 0.9 + 1e-6
+
+    # A generic (out-of-family) M-step estimate must be projected and synced.
+    host.continuous_transition_matrix = jnp.stack(
+        [
+            construct_directed_influence_transition_matrix(
+                jnp.array([2.0 + j, 4.0 + j]),
+                jnp.array([0.55 + 0.05 * j, 0.65]),
+                jnp.array([[0.0, 0.02], [0.03, 0.0]]),
+                jnp.zeros((2, 2)),
+                100.0,
+            )
+            for j in range(2)
+        ],
+        axis=-1,
+    )
+    host._project_parameters()
+    np.testing.assert_allclose(host.freqs, [2.5, 4.5], atol=1e-8)
+    np.testing.assert_allclose(host.damping_coef, [0.575, 0.65], atol=1e-8)
+    for j in range(2):
+        reconstructed = construct_directed_influence_transition_matrix(
+            host.freqs,
+            host.damping_coef,
+            host.coupling_strength[..., j],
+            host.phase_difference[..., j],
+            host.sampling_freq,
+        )
+        np.testing.assert_allclose(
+            host.continuous_transition_matrix[..., j], reconstructed, atol=1e-9
+        )
+
+    reparam = _DIMHost(strong, use_reparameterized_mstep=True)
+    reparam._initialize_continuous_transition_matrix()
+    unconstrained = jnp.full((4, 4, 2), 0.3)
+    reparam.continuous_transition_matrix = unconstrained
+    reparam._project_parameters()
+    np.testing.assert_array_equal(reparam.continuous_transition_matrix, unconstrained)
+
+
+def test_directed_influence_mixin_rebuild_refreshes_optimizer_cache_only_once_set():
+    strong = jnp.zeros((2, 2, 2)).at[0, 1, :].set(0.5)
+    host = _DIMHost(strong)
+    host._rebuild_stable_transition_matrix()
+    assert host._current_osc_params is None
+
+    host._current_osc_params = {
+        "freq": host.freqs,
+        "damping": host.damping_coef,
+        "coupling_strength": jnp.zeros_like(strong),
+        "phase_diff": jnp.zeros_like(strong),
+    }
+    host._rebuild_stable_transition_matrix()
+    np.testing.assert_allclose(host._current_osc_params["coupling_strength"], strong)
+
+    host._current_osc_params["freq"] = jnp.array([5.0, 9.0])
+    host._update_public_oscillator_params()
+    np.testing.assert_allclose(host.freqs, [5.0, 9.0])

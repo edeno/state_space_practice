@@ -1519,3 +1519,82 @@ class TestPointProcessValidation:
         model = CorrelatedNoisePointProcessModel(**params)
         with pytest.raises(ValueError, match="process_cov"):
             model._initialize_parameters(jax.random.PRNGKey(0))
+
+
+class TestSharedSwitchingPointProcessBase:
+    """The structured models reuse ``SwitchingSpikeOscillatorModel``'s EM core."""
+
+    def test_em_core_is_inherited_from_the_shared_base(self) -> None:
+        from state_space_practice.point_process_models import (
+            BaseSwitchingPointProcessModel,
+        )
+        from state_space_practice.switching_point_process import (
+            SwitchingPointProcessBase,
+            SwitchingSpikeOscillatorModel,
+        )
+
+        assert issubclass(BaseSwitchingPointProcessModel, SwitchingPointProcessBase)
+        for name in ("_e_step", "_m_step_dynamics", "_m_step_spikes", "fit_sgd"):
+            assert getattr(BaseSwitchingPointProcessModel, name) is getattr(
+                SwitchingSpikeOscillatorModel, name
+            ), name
+
+    def test_one_bin_m_step_updates_only_the_initial_state(self, com_pp_params) -> None:
+        """A single time bin carries no transition information: the dynamics
+        M-step must leave A/Q/Z alone and set the initial state from the
+        smoother posterior at t=0 instead of raising."""
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        model._initialize_parameters(jax.random.PRNGKey(3))
+        one_bin = jax.random.poisson(
+            jax.random.PRNGKey(2), 1.0, shape=(1, model.n_neurons)
+        ).astype(float)
+        model._e_step(one_bin)
+
+        A_before = model.continuous_transition_matrix
+        Z_before = model.discrete_transition_matrix
+        expected_mean = model.smoother_state_cond_mean[0]
+        expected_cov = model.smoother_state_cond_cov[0]
+        # Guard: the smoother moved the initial state, so equality is non-vacuous.
+        assert not jnp.allclose(model.init_mean, expected_mean)
+
+        model._m_step_dynamics()
+
+        np.testing.assert_allclose(model.init_mean, expected_mean)
+        np.testing.assert_allclose(model.init_cov, expected_cov)
+        np.testing.assert_array_equal(model.continuous_transition_matrix, A_before)
+        np.testing.assert_array_equal(model.discrete_transition_matrix, Z_before)
+        np.testing.assert_allclose(float(jnp.sum(model.init_discrete_state_prob)), 1.0)
+
+    @pytest.mark.slow
+    def test_e_step_reuses_module_level_log_intensity(self, monkeypatch) -> None:
+        """Every E-step must pass the single ``_linear_log_intensity`` object,
+        which the jitted filter caches by identity (see the matching
+        ``SwitchingSpikeOscillatorModel`` regression test)."""
+        import state_space_practice.switching_point_process as spp
+
+        spikes = jax.random.poisson(jax.random.PRNGKey(0), 0.5, shape=(40, 5)).astype(
+            float
+        )
+        model = CommonOscillatorPointProcessModel(
+            n_oscillators=1,
+            n_neurons=5,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            freqs=jnp.array([8.0]),
+            damping_coef=jnp.array([0.95]),
+            process_variance=jnp.array([0.1]),
+        )
+
+        captured = []
+        real_filter = spp.switching_point_process_filter
+
+        def spy(*args, **kwargs):
+            captured.append(kwargs["log_intensity_func"])
+            return real_filter(*args, **kwargs)
+
+        monkeypatch.setattr(spp, "switching_point_process_filter", spy)
+        model.fit(spikes, max_iter=2, key=jax.random.PRNGKey(42))
+
+        assert len(captured) >= 2
+        assert all(f is spp._linear_log_intensity for f in captured)

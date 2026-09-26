@@ -43,6 +43,7 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.oscillator_utils import (
+    DirectedInfluenceDynamicsMixin,
     canonicalize_correlated_noise_pair_parameters,
     compute_directed_influence_stability_scale,
     constrain_correlated_noise_process_covariance,
@@ -53,10 +54,8 @@ from state_space_practice.oscillator_utils import (
     construct_directed_influence_measurement_matrix,
     construct_directed_influence_transition_matrix,
     extract_correlated_noise_params_from_covariance,
-    extract_dim_params_from_matrix,
     get_block_slice,
     project_correlated_noise_process_covariance,
-    project_coupled_transition_matrix,
 )
 from state_space_practice.parameter_transforms import (
     POSITIVE,
@@ -81,7 +80,6 @@ from state_space_practice.utils import (
     check_converged,
     make_discrete_transition_matrix,
     shift_to_psd,
-    stabilize_transition_matrix,
     symmetrize,
     validate_covariance,
     validate_finite_array,
@@ -1792,7 +1790,7 @@ class CorrelatedNoiseModel(BaseModel):
         )
 
 
-class DirectedInfluenceModel(BaseModel):
+class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
     """Directed Influence Model (DIM).
 
     In this model, the **continuous transition matrix (A)** depends on the
@@ -1948,62 +1946,6 @@ class DirectedInfluenceModel(BaseModel):
             [measurement_cov] * self.n_discrete_states, axis=2
         )
 
-    def _initialize_continuous_transition_matrix(self):
-        """Initializes A based on initial params, varying across discrete states."""
-        self._rebuild_stable_transition_matrix()
-
-    def _effective_dim_scale(self) -> Array:
-        """Global stability scale for the current (intrinsic) DIM parameters.
-
-        ``continuous_transition_matrix`` is built from ``damping_coef * scale``
-        and ``coupling_strength * scale``; reconstructing it from the public
-        parameters requires re-applying this same scale.
-        """
-        return compute_directed_influence_stability_scale(
-            self.freqs,
-            self.damping_coef,
-            self.coupling_strength,
-            self.sampling_freq,
-            max_spectral_radius=self.max_spectral_radius,
-        )
-
-    def _rebuild_stable_transition_matrix(self) -> None:
-        """Rebuild stable DIM matrices from the intrinsic scientific params.
-
-        The stability scale is applied only to the *effective* damping and
-        coupling used to build ``A``; it is deliberately NOT written back onto
-        ``self.damping_coef`` / ``self.coupling_strength``. Keeping the public
-        parameters as the intrinsic source makes the rebuild idempotent --
-        re-stabilizing already-stable params is a no-op -- so damping does not
-        drift toward zero across successive fits with strong coupling (the scale
-        would otherwise compound into the accumulating public damping). ``A`` is
-        reconstructable from the public params by re-applying the same
-        :func:`compute_directed_influence_stability_scale` (see
-        ``_effective_dim_scale``).
-        """
-        scale = self._effective_dim_scale()
-        effective_damping = jnp.asarray(self.damping_coef) * scale
-        effective_coupling = jnp.asarray(self.coupling_strength) * scale
-        self.continuous_transition_matrix = jax.vmap(
-            lambda phase, coupling: construct_directed_influence_transition_matrix(
-                freqs=self.freqs,
-                damping_coeffs=effective_damping,
-                coupling_strengths=coupling,
-                phase_diffs=phase,
-                sampling_freq=self.sampling_freq,
-            ),
-            in_axes=(-1, -1),
-            out_axes=-1,
-        )(self.phase_difference, effective_coupling)
-
-        if self._current_osc_params is not None:
-            self._current_osc_params = {
-                "freq": self.freqs,
-                "damping": self.damping_coef,
-                "coupling_strength": self.coupling_strength,
-                "phase_diff": self.phase_difference,
-            }
-
     def _initialize_process_covariance(self):
         """Initializes Q based on variance, constant across discrete states."""
         process_cov = construct_common_oscillator_process_covariance(
@@ -2124,79 +2066,6 @@ class DirectedInfluenceModel(BaseModel):
             # Rebuild from the shared intrinsic parameters and enforce one
             # global stability scale, preserving exact reconstructability.
             self._rebuild_stable_transition_matrix()
-
-    def _update_public_oscillator_params(self) -> None:
-        """Update public oscillator attributes from optimized parameters.
-
-        After the joint reparameterized M-step, syncs the private optimizer
-        result to the public attributes. Frequency/damping are already shared;
-        coupling/phase retain their discrete-state axis.
-        """
-        if self._current_osc_params is None:
-            return
-
-        self.freqs = self._current_osc_params["freq"]
-        self.damping_coef = self._current_osc_params["damping"]
-        self.coupling_strength = self._current_osc_params["coupling_strength"]
-        self.phase_difference = self._current_osc_params["phase_diff"]
-
-    def _project_parameters(self):
-        """Project transition matrices to the DIM oscillator family.
-
-        With reparameterized M-step, A is already valid by construction.
-        With standard M-step, the generic Kalman update is unconstrained; the
-        paper's M-step therefore projects each 2x2 block back to scaled-rotation
-        structure and then enforces stability.
-        """
-        if self.use_reparameterized_mstep:
-            return
-
-        projected = []
-        for j in range(self.n_discrete_states):
-            A_unc_j = self.continuous_transition_matrix[..., j]
-            A_j = project_coupled_transition_matrix(A_unc_j)
-
-            # Enforce spectral radius < 1 for stability (unconditional).
-            # Stability is a hard physical constraint: an unstable A causes
-            # state divergence and invalidates the E-step posteriors. Unlike
-            # the block structure projection above, this is not optional.
-            A_j = stabilize_transition_matrix(
-                A_j, max_spectral_radius=self.max_spectral_radius
-            )
-
-            projected.append(A_j)
-        self.continuous_transition_matrix = jnp.stack(projected, axis=-1)
-
-        # Sync all scientific parameters, then rebuild A so the public shared
-        # frequency/damping plus per-state coupling/phase exactly represent it.
-        self._sync_coupling_from_transition_matrix()
-
-    def _sync_coupling_from_transition_matrix(self) -> None:
-        """Synchronize scientific parameters from the current transition matrix.
-
-        Called after standard EM projection so shared frequency/damping and
-        per-state coupling/phase all reflect the fitted A rather than the
-        initial values.
-        """
-        frequency_list = []
-        damping_list = []
-        coupling_list = []
-        phase_list = []
-        for j in range(self.n_discrete_states):
-            params = extract_dim_params_from_matrix(
-                self.continuous_transition_matrix[..., j],
-                self.sampling_freq,
-                self.n_oscillators,
-            )
-            frequency_list.append(params["freq"])
-            damping_list.append(params["damping"])
-            coupling_list.append(params["coupling_strength"])
-            phase_list.append(params["phase_diff"])
-        self.freqs = jnp.mean(jnp.stack(frequency_list, axis=-1), axis=-1)
-        self.damping_coef = jnp.mean(jnp.stack(damping_list, axis=-1), axis=-1)
-        self.coupling_strength = jnp.stack(coupling_list, axis=-1)
-        self.phase_difference = jnp.stack(phase_list, axis=-1)
-        self._rebuild_stable_transition_matrix()
 
     def fit(
         self,
