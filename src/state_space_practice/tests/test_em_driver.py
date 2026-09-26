@@ -44,9 +44,21 @@ class ScriptedModel:
         self.posterior = None
 
     def run(self, **kwargs):
-        return run_em(
-            self.e_step, self.m_step, self.snapshot, self.restore, **kwargs
-        )
+        return run_em(self.e_step, self.m_step, self.snapshot, self.restore, **kwargs)
+
+
+class ParamScriptedModel(ScriptedModel):
+    """A ScriptedModel whose log-likelihood is a function of the parameters.
+
+    ``lls[k]`` is the log-likelihood after ``k`` M-steps, so re-running the
+    E-step under restored parameters reproduces that iterate's value, as a
+    real model would.
+    """
+
+    def e_step(self):
+        self.e_calls += 1
+        self.posterior = ("posterior-for-params", self.params)
+        return self.lls[self.params]
 
 
 def test_converges_and_keeps_consistent_state():
@@ -83,20 +95,54 @@ def test_lenient_decrease_tol_continues_on_small_decrease():
 
 
 def test_continue_on_decrease_restores_best_state():
-    model = ScriptedModel([-100.0, -40.0, -60.0, -70.0, -70.0])
+    # LL after 0..4 M-steps; the best iterate is params=1.
+    model = ParamScriptedModel([-100.0, -40.0, -60.0, -70.0, -65.0])
+    warnings = []
     result = model.run(
-        max_iter=5,
+        max_iter=4,
         tol=1e-4,
         stop_on_decrease=False,
         require_increase_to_converge=True,
         track_best=True,
+        warn=warnings.append,
     )
 
-    # Every E-step stays in the history; the best (params=1) state is
-    # restored at the end and its E-step LL is appended.
-    assert result.log_likelihoods[:5] == [-100.0, -40.0, -60.0, -70.0, -70.0]
+    # Decreases are warned about but kept; the final E-step (params=4, -65)
+    # is appended; then the best state (params=1) is restored and the
+    # E-step re-run under it appends its LL.
+    assert result.log_likelihoods == [-100.0, -40.0, -60.0, -70.0, -65.0, -40.0]
+    assert result.reached_max_iter and not result.converged
+    assert sum("decreased" in w for w in warnings) == 2
     assert model.params == 1
     assert model.posterior == ("posterior-for-params", 1)
+
+
+def test_require_increase_to_converge_rejects_converged_decrease():
+    # -50 -> -50.005 is within tol (converged) but a decrease beyond
+    # decrease_tol; it must not end EM.
+    lls = [-100.0, -50.0, -50.005, -40.0, -40.0]
+    kwargs = {
+        "max_iter": 10,
+        "tol": 1e-2,
+        "decrease_tol": 1e-6,
+        "stop_on_decrease": False,
+    }
+    warnings = []
+
+    model = ScriptedModel(lls)
+    result = model.run(
+        require_increase_to_converge=True, warn=warnings.append, **kwargs
+    )
+    assert any("decreased at iteration 3" in w for w in warnings)
+    assert result.converged
+    assert result.log_likelihoods == lls
+    assert model.params == 4
+
+    # Without the flag the same decrease counts as convergence.
+    baseline = ScriptedModel(lls)
+    result = baseline.run(require_increase_to_converge=False, **kwargs)
+    assert result.converged and result.log_likelihoods == lls[:3]
+    assert baseline.params == 2
 
 
 @pytest.mark.parametrize("policy", ["break", "clear"])
@@ -179,6 +225,18 @@ def test_final_e_step_after_max_iter_appends_or_rolls_back():
     result = skipped.run(max_iter=2, tol=1e-4, final_e_step=False)
     assert result.log_likelihoods == [-100.0, -90.0]
     assert skipped.e_calls == 2
+
+
+def test_final_e_step_nonfinite_rolls_back(caplog):
+    model = ScriptedModel([-100.0, -90.0, np.nan])
+    with caplog.at_level(logging.WARNING):
+        result = model.run(max_iter=2, tol=1e-4)
+
+    assert model.e_calls == 3  # the final E-step ran
+    assert result.log_likelihoods == [-100.0, -90.0]
+    assert model.params == 1
+    assert model.posterior == ("posterior-for-params", 1)
+    assert any("final e-step" in r.message.lower() for r in caplog.records)
 
 
 def test_m_step_on_convergence_runs_extra_m_step():
