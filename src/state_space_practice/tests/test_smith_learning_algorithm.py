@@ -2188,3 +2188,49 @@ class TestSmithEMRollback:
         assert not model.is_fitted
         assert model.smoothed_prob_correct_response is None
         assert model.filtered_prob_correct_response is None
+
+    @pytest.mark.slow
+    def test_nonfinite_later_e_step_rolls_back_to_last_accepted(self, caplog) -> None:
+        rng = np.random.default_rng(3)
+        n_correct = jnp.asarray(rng.integers(0, 2, size=30).astype(float))
+        model = SmithLearningModel(max_possible_correct=1)
+        real_e_step = model._e_step
+        calls = []
+
+        def e_step_nan_on_third_call(*args, **kwargs):
+            ll = real_e_step(*args, **kwargs)
+            calls.append(
+                {
+                    "ll": ll,
+                    "sigma_epsilon": model.sigma_epsilon,
+                    "init_learning_variance": model.init_learning_variance,
+                    "smoothed_mode": np.asarray(model.smoothed_learning_state_mode),
+                }
+            )
+            if len(calls) == 3:
+                model.smoothed_learning_state_mode = jnp.full_like(
+                    model.smoothed_learning_state_mode, jnp.nan
+                )
+                return float("nan")
+            return ll
+
+        model._e_step = e_step_nan_on_third_call
+        with caplog.at_level("WARNING"):
+            lls = model.fit(n_correct, max_iter=10, tolerance=1e-12)
+
+        assert len(calls) == 3  # the NaN E-step was reached
+        accepted = calls[1]
+        # The M-step between E-steps 2 and 3 changed the parameters, so
+        # restoring them is observable.
+        param_keys = ("sigma_epsilon", "init_learning_variance")
+        assert [accepted[k] for k in param_keys] != [calls[2][k] for k in param_keys]
+        assert lls == [calls[0]["ll"], accepted["ll"]]
+        assert np.all(np.isfinite(lls))
+        assert model.log_likelihood_ == accepted["ll"]
+        assert model.n_iter_ == 2
+        assert model.sigma_epsilon == accepted["sigma_epsilon"]
+        assert model.init_learning_variance == accepted["init_learning_variance"]
+        np.testing.assert_array_equal(
+            model.smoothed_learning_state_mode, accepted["smoothed_mode"]
+        )
+        assert any("rolling back" in r.message.lower() for r in caplog.records)
