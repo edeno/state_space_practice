@@ -1612,6 +1612,11 @@ class SmithLearningModel(SGDFittableMixin):
             A list of marginal log-likelihoods at each iteration. On
             convergence, a final entry is appended from a post-convergence
             E-step that ensures stored results match the MLE parameters.
+            A non-finite E-step is never recorded: EM warns, rolls the
+            parameters and filter/smoother outputs back to the last accepted
+            iteration and stops. If the very first E-step is non-finite the
+            list is empty and the filter/smoother outputs are cleared, so
+            ``is_fitted`` is False.
         """
         n_correct_responses = jnp.asarray(n_correct_responses)
         if n_correct_responses.ndim != 1:
@@ -1630,7 +1635,7 @@ class SmithLearningModel(SGDFittableMixin):
         # the M-step parameters (sigma_epsilon and the initial-variance
         # derivative). On a rejected step both are restored so the stored
         # (params, smoother) pair stays consistent with the prior iteration.
-        snapshot_keys = (
+        posterior_keys = (
             "filtered_prob_correct_response",
             "filtered_learning_state_mode",
             "filtered_learning_state_variance",
@@ -1640,6 +1645,8 @@ class SmithLearningModel(SGDFittableMixin):
             "smoothed_learning_state_variance",
             "smoothed_prob_correct_response",
             "smoother_gain",
+        )
+        snapshot_keys = posterior_keys + (
             "sigma_epsilon",
             "init_learning_state",
             "init_learning_variance",
@@ -1652,6 +1659,12 @@ class SmithLearningModel(SGDFittableMixin):
             for k, v in state.items():
                 if v is not None:
                     setattr(self, k, v)
+
+        def _clear_posteriors() -> None:
+            # A non-finite first E-step leaves nothing to roll back to: drop
+            # its NaN filter/smoother outputs so the model reads as unfitted.
+            for k in posterior_keys:
+                setattr(self, k, None)
 
         def _warn(msg: str) -> None:
             logger.warning(msg)
@@ -1678,6 +1691,8 @@ class SmithLearningModel(SGDFittableMixin):
             _restore_state,
             max_iter=max_iter,
             tol=tolerance,
+            on_first_nonfinite="clear",
+            clear_state=_clear_posteriors,
             m_step_on_convergence=True,
             logger=logger,
             on_iteration=_on_iteration,

@@ -2169,3 +2169,22 @@ class TestSmithEMRollback:
             initial_params,
             atol=1e-10,
         )
+
+    @pytest.mark.slow
+    def test_nonfinite_first_e_step_leaves_model_unfitted(self, caplog) -> None:
+        rng = np.random.default_rng(2)
+        n_correct = jnp.asarray(rng.integers(0, 2, size=30).astype(float))
+        model = SmithLearningModel(max_possible_correct=1)
+        # A NaN parameter makes the very first E-step non-finite.
+        model.sigma_epsilon = float("nan")
+
+        with caplog.at_level("WARNING"):
+            lls = model.fit(n_correct, max_iter=5)
+
+        assert any("non-finite" in r.message.lower() for r in caplog.records)
+        assert lls == []
+        assert model.log_likelihood_ is None and model.n_iter_ == 0
+        # The NaN posteriors are cleared rather than left looking fitted.
+        assert not model.is_fitted
+        assert model.smoothed_prob_correct_response is None
+        assert model.filtered_prob_correct_response is None
