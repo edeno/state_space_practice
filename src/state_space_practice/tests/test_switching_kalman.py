@@ -7905,3 +7905,18 @@ def test_mstep_keeps_previous_params_for_near_empty_state(random_mstep_stats):
         assert not np.allclose(
             np.asarray(value[..., 0]), np.asarray(previous[name][..., 0])
         )
+
+
+def test_posterior_entropy_fails_loud_on_indefinite_covariance() -> None:
+    """The entropy uses a Cholesky log-determinant: it agrees with slogdet on
+    PSD input and returns NaN (not |det| of an indefinite matrix) otherwise."""
+    T, n, K = 4, 2, 1
+    prob = jnp.ones((T, K))
+    joint = jnp.ones((T - 1, K, K))
+    covs = jnp.stack([jnp.diag(jnp.array([0.5, 2.0]))] * T)[..., None]
+    H = compute_posterior_entropy(prob, joint, covs)
+    expected = T * 0.5 * (n * (1 + np.log(2 * np.pi)) + np.log(1.0))
+    np.testing.assert_allclose(H, expected, rtol=1e-8)
+
+    indefinite = covs.at[1, :, :, 0].set(jnp.diag(jnp.array([0.5, -2.0])))
+    assert bool(jnp.isnan(compute_posterior_entropy(prob, joint, indefinite)))

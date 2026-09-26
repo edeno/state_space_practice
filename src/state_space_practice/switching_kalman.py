@@ -27,6 +27,8 @@ from state_space_practice.kalman import (
 from state_space_practice.utils import (
     contains_tracer,
     debug_print_if,
+    psd_cholesky,
+    psd_logdet,
     psd_solve,
     stabilize_covariance,
     symmetrize,
@@ -2577,7 +2579,7 @@ def _weighted_gaussian_log_prob(
     """Log N(smoother_mean; mean, cov) including the expected covariance term."""
     diff = smoother_mean - mean
     expected_outer = smoother_cov + jnp.outer(diff, diff)
-    log_det = jnp.linalg.slogdet(cov)[1]
+    log_det = psd_logdet(psd_cholesky(cov))
     trace_term = jnp.trace(psd_solve(cov, expected_outer))
     return -0.5 * (n_cont_states * jnp.log(2 * jnp.pi) + log_det + trace_term)
 
@@ -2754,7 +2756,7 @@ def compute_expected_complete_log_likelihood(
         V_t_j:     (T-1, n, n, K_i)
         cross_cov_j: (T-1, n, n, K_i)
         """
-        log_det_Q = jnp.linalg.slogdet(Q_j)[1]
+        log_det_Q = psd_logdet(psd_cholesky(Q_j))
         return jnp.sum(
             _over_ti(
                 weights_j,
@@ -2789,7 +2791,7 @@ def compute_expected_complete_log_likelihood(
     # 5. Observations — vmap over j, vectorize over t
     def _obs_log_prob_for_j(H_j, R_j, weights_j, means_j, covs_j):
         """Sum observation log-probs over t for a single state j."""
-        log_det_R = jnp.linalg.slogdet(R_j)[1]
+        log_det_R = psd_logdet(psd_cholesky(R_j))
 
         def _single_t(weight, m_t_j, V_t_j, y_t):
             pred_mean = H_j @ m_t_j
@@ -2860,12 +2862,12 @@ def compute_posterior_entropy(
     cond = _divide_safe(joint, marginal_prev[:, :, None])  # (T-1, K, K)
     discrete_entropy -= jnp.sum(joint * _safe_log(cond))
 
-    # 2. Continuous entropy: vmap slogdet over (T, K)
+    # 2. Continuous entropy: batched Cholesky log-determinant over (T, K)
     # state_cond_smoother_covs: (T, n, n, K) -> need (T, K, n, n) for vmap
     covs_tk = jnp.moveaxis(state_cond_smoother_covs, -1, 1)  # (T, K, n, n)
     T, K = covs_tk.shape[:2]
     covs_flat = covs_tk.reshape(T * K, n_cont_states, n_cont_states)
-    log_dets = jax.vmap(lambda c: jnp.linalg.slogdet(c)[1])(covs_flat)
+    log_dets = psd_logdet(psd_cholesky(covs_flat))
     log_dets = log_dets.reshape(T, K)  # (T, K)
 
     gaussian_entropies = 0.5 * (
@@ -2909,7 +2911,7 @@ def compute_markov_posterior_entropy(
 
     def _gaussian_entropy_from_cov(cov: jax.Array) -> jax.Array:
         cov = stabilize_covariance(cov, min_eigenvalue=1e-12)
-        log_det = jnp.linalg.slogdet(cov)[1]
+        log_det = psd_logdet(psd_cholesky(cov))
         return 0.5 * (n_cont_states * (1.0 + jnp.log(2.0 * jnp.pi)) + log_det)
 
     # Terminal entropy E[H(x_T | S_T)].
