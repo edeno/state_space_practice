@@ -9708,7 +9708,7 @@ class TestSwitchingSpikeOscillatorEMConsistency:
             model.fit(spikes, max_iter=5, key=jax.random.PRNGKey(42))
 
         # Guard: the rollback path must have executed (else the test is vacuous).
-        assert "rolled back" in caplog.text
+        assert "rolling back" in caplog.text
 
         # The stored smoother must equal a fresh E-step under the returned params.
         # (The two rolled-back iterations use distinct params, so a stale smoother

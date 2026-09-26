@@ -107,6 +107,7 @@ from state_space_practice.parameter_transforms import (
     UNCONSTRAINED,
 )
 from state_space_practice.point_process_kalman import _point_process_laplace_update
+from state_space_practice.em_driver import run_em
 from state_space_practice.sgd_fitting import (
     SGDFittableMixin,
     reconstruct_per_state_array,
@@ -121,7 +122,6 @@ from state_space_practice.switching_kalman import (
     switching_kalman_smoother_gpb2,
 )
 from state_space_practice.utils import (
-    check_converged,
     clip_eigenvalues,
     make_discrete_transition_matrix,
     stabilize_covariance,
@@ -3680,13 +3680,8 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         if not skip_init:
             self._initialize_parameters(key)
 
-        # Track log-likelihoods across iterations
-        log_likelihoods: list[float] = []
-
-        # Snapshot parameters for rollback on LL decrease
+        # Snapshot parameters for rollback on a rejected step
         import copy
-
-        prev_params: dict | None = None
 
         def _snapshot_params() -> dict:
             return {
@@ -3708,120 +3703,28 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
             self.init_discrete_state_prob = params["init_discrete_state_prob"]
             self.spike_params = params["spike_params"]
 
-        for iteration in range(max_iter):
-            # E-step: compute posteriors
-            marginal_ll = self._e_step(spikes)
-            log_likelihoods.append(float(marginal_ll))
-
-            # Check for numerical issues
-            if not jnp.isfinite(marginal_ll):
-                if prev_params is not None:
-                    _restore_params(prev_params)
-                    # Recompute the E-step under the restored params so the stored
-                    # smoother attributes match the parameters we return with
-                    # (the current attributes reflect the rejected iteration).
-                    self._e_step(spikes)
-                    log_likelihoods.pop()
-                    logger.warning(
-                        "Non-finite LL at iteration %d; rolled back to previous.",
-                        iteration,
-                    )
-                    break
-                raise ValueError(
-                    f"Non-finite log-likelihood at iteration {iteration}: "
-                    f"{marginal_ll}. This may indicate numerical instability."
-                )
-
-            # Check convergence and LL decrease (after at least 2 iterations)
-            if iteration > 0:
-                is_converged, _ = check_converged(
-                    log_likelihood=log_likelihoods[-1],
-                    previous_log_likelihood=log_likelihoods[-2],
-                    tolerance=tol,
-                )
-
-                # Use a lenient tolerance for the LL decrease check.
-                # The Laplace-EKF E-step is approximate, so small LL
-                # decreases (~0.1%) are expected and acceptable. Only
-                # roll back on substantial decreases that indicate true
-                # divergence, not Laplace approximation noise.
-                _, is_increasing = check_converged(
-                    log_likelihood=log_likelihoods[-1],
-                    previous_log_likelihood=log_likelihoods[-2],
-                    tolerance=decrease_tol,
-                )
-
-                if not is_increasing and prev_params is not None:
-                    _restore_params(prev_params)
-                    log_likelihoods.pop()
-                    # Recompute the E-step under the restored params so the stored
-                    # smoother attributes match the parameters we return with.
-                    self._e_step(spikes)
-                    logger.warning(
-                        "LL decreased at iteration %d (%.1f -> %.1f); "
-                        "rolled back and stopping.",
-                        iteration,
-                        log_likelihoods[-1],
-                        float(marginal_ll),
-                    )
-                    break
-
-                # A decrease smaller than `decrease_tol` leaves `is_increasing`
-                # True (no rollback above); if it is also smaller than `tol` we
-                # converge and stop here, keeping the very slightly worse
-                # parameters. That residual is bounded by `tol`, so no rollback
-                # is warranted.
-                if is_converged:
-                    break
-
-            # Snapshot before M-step modifies parameters
-            prev_params = _snapshot_params()
-
-            # M-step: update parameters
+        def _m_step() -> None:
             self._m_step_dynamics()
             self._m_step_spikes(spikes)
-
-            # Project parameters to valid spaces (oscillatory structure, PSD)
             self._project_parameters()
 
-        if len(log_likelihoods) == max_iter and log_likelihoods:
-            logger.warning("Reached maximum iterations without converging.")
-            final_ll = self._e_step(spikes)
-            if jnp.isfinite(final_ll):
-                _, final_is_increasing = check_converged(
-                    log_likelihood=float(final_ll),
-                    previous_log_likelihood=log_likelihoods[-1],
-                    tolerance=decrease_tol,
-                )
-                if final_is_increasing:
-                    log_likelihoods.append(float(final_ll))
-                elif prev_params is not None:
-                    _restore_params(prev_params)
-                    self._e_step(spikes)
-                    logger.warning(
-                        "Final LL decreased after last M-step (%.1f -> %.1f); "
-                        "rolled back to previous.",
-                        log_likelihoods[-1],
-                        float(final_ll),
-                    )
-                else:
-                    logger.warning(
-                        "Final LL decreased after last M-step but no previous "
-                        "parameters were available for rollback."
-                    )
-            elif prev_params is not None:
-                _restore_params(prev_params)
-                self._e_step(spikes)
-                logger.warning(
-                    "Non-finite final LL after last M-step; rolled back to previous."
-                )
-            else:
-                raise ValueError(
-                    "Non-finite final log-likelihood after last M-step. "
-                    "This may indicate numerical instability."
-                )
-
-        return log_likelihoods
+        # The Laplace-EKF E-step is approximate: convergence uses ``tol`` but a
+        # step only counts as a decrease beyond ``decrease_tol``. The snapshot
+        # holds parameters only, so the E-step is re-run after every rollback
+        # to bring the stored posteriors back in line with them.
+        result = run_em(
+            lambda: float(self._e_step(spikes)),
+            _m_step,
+            _snapshot_params,
+            _restore_params,
+            max_iter=max_iter,
+            tol=tol,
+            decrease_tol=decrease_tol,
+            on_first_nonfinite="raise",
+            refresh_after_restore=True,
+            logger=logger,
+        )
+        return result.log_likelihoods
 
     # --- SGDFittableMixin protocol: model-specific dynamics parameters ---
 

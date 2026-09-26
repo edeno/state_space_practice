@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 from jax import Array
 
+from state_space_practice.em_driver import run_em
 from state_space_practice.kalman import symmetrize
 from state_space_practice.oscillator_utils import (
     DirectedInfluenceDynamicsMixin,
@@ -53,7 +54,6 @@ from state_space_practice.switching_point_process import (
     SwitchingPointProcessBase,
 )
 from state_space_practice.utils import (
-    check_converged,
     clip_eigenvalues,
     shift_to_psd,
     validate_count_array,
@@ -554,119 +554,30 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
             self.smoother_next_pair_cond_means = None
             self._m_step_spikes(spikes)
 
-        log_likelihoods: list[float] = []
-        best_ll = -float("inf")
-        best_state: dict[str, object] | None = None
-        last_accepted_state: dict[str, object] | None = None
-
-        for iteration in range(max_iter):
-            marginal_ll = self._e_step(spikes)
-            current_ll = float(marginal_ll)
-            log_likelihoods.append(current_ll)
-
-            if not jnp.isfinite(marginal_ll):
-                bad_ll = log_likelihoods.pop()
-                if last_accepted_state is None:
-                    # Non-finite on the very first E-step: the initial parameters
-                    # are unusable and there is nothing to roll back to.
-                    raise ValueError(
-                        f"Non-finite log-likelihood at iteration {iteration}: "
-                        f"{bad_ll}. This may indicate numerical instability."
-                    )
-                # The GPB smoother signals divergence by propagating a non-finite
-                # marginal LL (see switching_kalman's divergence cap). Honor that
-                # "roll the step back" contract -- as the final-E-step and
-                # LL-decrease handling below and PointProcessModel._fit_single do
-                # -- restoring the last accepted E-step and stopping, rather than
-                # raising and discarding the fitted parameters.
-                self._restore_em_state(last_accepted_state)
-                self.converged_ = False
-                logger.warning(
-                    f"Non-finite log-likelihood ({bad_ll}) at iteration "
-                    f"{iteration + 1}; rolling back to the previous E-step and "
-                    f"stopping EM."
-                )
-                break
-
-            current_state = self._snapshot_em_state()
-
-            # Track best parameters seen (approximate EM can decrease LL)
-            if current_ll > best_ll:
-                best_ll = current_ll
-                best_state = current_state
-
-            if iteration > 0:
-                is_converged, is_increasing = check_converged(
-                    log_likelihood=current_ll,
-                    previous_log_likelihood=log_likelihoods[-2],
-                    tolerance=tol,
-                )
-                if not is_increasing:
-                    logger.warning(
-                        f"Log-likelihood decreased at iteration {iteration + 1}: "
-                        f"{log_likelihoods[-2]:.4f} -> {log_likelihoods[-1]:.4f}"
-                    )
-                # Only declare convergence if LL is not decreasing
-                if is_converged and is_increasing:
-                    logger.info(f"Converged after {iteration + 1} iterations.")
-                    self.converged_ = True
-                    break
-
-            last_accepted_state = current_state
+        def _m_step() -> None:
             self._m_step_dynamics()
             self._m_step_spikes(spikes)
             self._project_parameters()
 
-            logger.info(
-                f"Iteration {iteration + 1}/{max_iter}\t"
-                f"Log-Likelihood: {log_likelihoods[-1]:.4f}"
-            )
-        else:
-            self.converged_ = False
-            logger.warning("Reached maximum iterations without converging.")
-            # Final E-step to sync smoother results with current parameters
-            final_ll = float(self._e_step(spikes))
-            if not jnp.isfinite(final_ll):
-                if last_accepted_state is not None:
-                    self._restore_em_state(last_accepted_state)
-                logger.warning(
-                    "Final E-step produced non-finite log-likelihood; "
-                    "rolling back to previous E-step."
-                )
-            else:
-                _, final_is_increasing = check_converged(
-                    final_ll,
-                    log_likelihoods[-1],
-                    tol,
-                )
-                if final_is_increasing:
-                    log_likelihoods.append(final_ll)
-                    if final_ll > best_ll:
-                        best_ll = final_ll
-                        best_state = self._snapshot_em_state()
-                elif last_accepted_state is not None:
-                    self._restore_em_state(last_accepted_state)
-                    logger.warning(
-                        f"Final E-step decreased LL: {log_likelihoods[-1]:.4f} -> "
-                        f"{final_ll:.4f}; rolling back to previous E-step."
-                    )
-                else:
-                    logger.warning(
-                        "Final E-step decreased LL but no accepted state was "
-                        "available for rollback."
-                    )
-
-        # Restore best parameters if LL decreased at any point
-        if best_state is not None and log_likelihoods and log_likelihoods[-1] < best_ll:
-            logger.info(
-                f"Restoring best params from LL={best_ll:.4f} "
-                f"(final was {log_likelihoods[-1]:.4f})"
-            )
-            self._restore_em_state(best_state)
-            restored_ll = float(self._e_step(spikes))
-            if jnp.isfinite(restored_ll) and restored_ll != log_likelihoods[-1]:
-                log_likelihoods.append(restored_ll)
-
+        # Approximate (GPB) EM: a decrease is logged but iteration continues,
+        # convergence needs a non-decreasing step, and the best accepted state
+        # is restored at the end if the final iterate is worse. A non-finite
+        # first E-step means the initial parameters are unusable.
+        result = run_em(
+            lambda: float(self._e_step(spikes)),
+            _m_step,
+            self._snapshot_em_state,
+            self._restore_em_state,
+            max_iter=max_iter,
+            tol=tol,
+            on_first_nonfinite="raise",
+            stop_on_decrease=False,
+            require_increase_to_converge=True,
+            track_best=True,
+            logger=logger,
+        )
+        self.converged_ = result.converged
+        log_likelihoods = result.log_likelihoods
         if log_likelihoods:
             self.log_likelihood_ = float(log_likelihoods[-1])
 
