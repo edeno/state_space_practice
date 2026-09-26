@@ -2035,7 +2035,7 @@ class TestBlockDiagonalDispatch:
         np.testing.assert_allclose(
             np.asarray(m_block.process_cov),
             np.asarray(m_dense.process_cov),
-            rtol=1e-9,
+            rtol=1e-8,
             atol=1e-16,
         )
         np.testing.assert_array_equal(

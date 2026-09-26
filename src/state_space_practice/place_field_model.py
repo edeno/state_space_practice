@@ -238,20 +238,26 @@ class PlaceFieldModel(SGDFittableMixin):
     containers of per-neuron blocks rather than dense zero-padded arrays
     (see the attribute notes below).
 
+    Each neuron runs with its own diagonal blocks of ``transition_matrix``,
+    ``process_cov`` and ``init_cov``, so per-neuron parameters -- e.g. the
+    per-neuron process noise EM and ``fit_sgd`` learn -- stay on the block
+    path. Only off-block entries break it: when the EM M-step writes back a
+    dense ``transition_matrix`` (``update_transition_matrix=True``) the next
+    E-step falls back to the dense filter.
+
     Numerical note: the dense and block forward passes agree to roundoff
-    (``atol=1e-9`` in the regression tests). Gradients agree to roundoff
-    for ``init_mean``, ``process_cov``, and ``transition_matrix``, but NOT for
-    ``init_cov`` — the dense path's autodiff produces spurious
-    non-zero gradients on off-block entries of ``init_cov`` that the
-    block path never computes (because the block filter only reads
-    diagonal blocks). As a result, multi-step ``fit_sgd`` trajectories
-    can drift subtly between paths; the block path is the correct
-    gradient for the block-diagonal parameterization, while the dense
-    path has extra off-block noise that EM's M-step projects away.
-    For ``fit`` (EM), the two paths agree to ``atol=1e-5``; for
-    ``fit_sgd``, step-0 LL agrees to roundoff and subsequent steps may
-    diverge by ~``1e-3`` in LL over tens of iterations without
-    meaningful algorithmic difference.
+    (``atol=1e-9`` in the regression tests), and so do gradients with
+    respect to ``init_mean``, ``process_cov`` (per neuron) and the diagonal
+    blocks of ``transition_matrix`` and ``init_cov``. The block filter reads
+    only diagonal blocks, so the *off-block* entries of a matrix trained as
+    a full matrix get a gradient only on the dense path (the Laplace
+    quadratic terms couple neurons through them). Hence ``fit_sgd``
+    dispatches dense when ``update_transition_matrix=True``. ``init_cov``
+    is trained as a full PSD matrix too: with ``update_init_state=True``
+    its off-block entries are learned only on the dense path, so multi-step
+    ``fit_sgd`` trajectories drift slightly between paths (step-0 LL agrees
+    to roundoff). For ``fit`` (EM), whose M-step keeps ``init_cov``
+    diagonal, the two paths agree to roundoff.
 
     Parameters
     ----------
@@ -861,8 +867,8 @@ class PlaceFieldModel(SGDFittableMixin):
         The design half of the block-diagonal contract holds by construction
         -- every neuron reads its own weight slice against the same shared
         ``Z_base`` -- so only the parameter half is checked: ``init_cov``,
-        ``transition_matrix`` and ``process_cov`` block-diagonal with
-        identical per-neuron ``A`` and ``Q`` blocks. The check is one fused
+        ``transition_matrix`` and ``process_cov`` block-diagonal (their
+        diagonal blocks may differ per neuron). The check is one fused
         device computation (``_block_diagonal_parameters_ok``) with a single
         host sync, cheap enough to run after every EM M-step: the M-step
         can write back a non-block-diagonal ``A`` when
@@ -1388,6 +1394,9 @@ class PlaceFieldModel(SGDFittableMixin):
         force_dense : bool, default=False
             Skip the block-diagonal filter dispatch even when the problem
             structure would allow it. See ``fit`` docstring for details.
+            With ``update_transition_matrix=True`` the dense path is always
+            used (the full transition matrix is trained, and only the dense
+            filter gives its off-block entries a gradient).
 
         Returns
         -------
@@ -1442,9 +1451,11 @@ class PlaceFieldModel(SGDFittableMixin):
         # (jit'd) _sgd_loss_fn. Since n_neurons/block_size are Python
         # ints (not traced), passing them into the filter is safe. The
         # block path consumes Z_base itself; only the dense fallback
-        # expands it (see _filter_design_matrix).
+        # expands it (see _filter_design_matrix). A trained transition
+        # matrix is a full matrix whose off-block entries only the dense
+        # filter gives a gradient, so it always takes the dense path.
         self._block_n_neurons, self._block_size = self._detect_block_structure(
-            force_dense=force_dense
+            force_dense=force_dense or self.update_transition_matrix
         )
         design_matrix = self._filter_design_matrix(Z_base)
 

@@ -3121,8 +3121,12 @@ class TestBlockDiagonalParametersOk:
         result = _block_structure(m, P, A, Q, Z)
         assert result.n_neurons == 3
         assert result.block_size == 4
-        np.testing.assert_allclose(np.asarray(result.A_block), np.eye(4))
-        np.testing.assert_allclose(np.asarray(result.Q_block), 1e-4 * np.eye(4))
+        np.testing.assert_allclose(
+            np.asarray(result.A_blocks), np.broadcast_to(np.eye(4), (3, 4, 4))
+        )
+        np.testing.assert_allclose(
+            np.asarray(result.Q_blocks), np.broadcast_to(1e-4 * np.eye(4), (3, 4, 4))
+        )
         # Z_base is neuron 0's own slice of the expanded design.
         np.testing.assert_allclose(np.asarray(result.Z_base), np.asarray(Z_base_ref))
         np.testing.assert_allclose(
@@ -3151,22 +3155,23 @@ class TestBlockDiagonalParametersOk:
         _m, P, A, Q, _Z, _ = problem
         assert not self._ok(P, A, Q.at[0, 5].set(1e-5).at[5, 0].set(1e-5))
 
-    def test_heterogeneous_a_blocks_rejected(self, problem) -> None:
-        """Per-neuron A-block mismatch must be rejected.
-
-        CRITICAL regression test: if A is block-diagonal but its diagonal
-        blocks differ across neurons, the block-diagonal filter would apply
-        block 0's A to every neuron, silently producing wrong results.
-        """
-        _m, P, A, Q, _Z, _ = problem
+    def test_heterogeneous_blocks_accepted_and_kept_per_neuron(self, problem) -> None:
+        """Per-neuron A and Q blocks may differ: the check accepts them and
+        the structure keeps each neuron's own blocks (the block filter runs
+        neuron j with ``A_blocks[j]`` / ``Q_blocks[j]``)."""
+        m, P, A, Q, Z, _ = problem
         A_het = A.at[4:8, 4:8].set(A[4:8, 4:8] * 1.05)
-        assert not self._ok(P, A_het, Q)
-
-    def test_heterogeneous_q_blocks_rejected(self, problem) -> None:
-        """Per-neuron Q-block mismatch must be rejected (same failure mode)."""
-        _m, P, A, Q, _Z, _ = problem
         Q_het = Q.at[8:12, 8:12].set(Q[8:12, 8:12] * 2.0)
-        assert not self._ok(P, A, Q_het)
+        assert self._ok(P, A_het, Q_het)
+        result = _block_structure(m, P, A_het, Q_het, Z)
+        for j in range(3):
+            s = slice(4 * j, 4 * (j + 1))
+            np.testing.assert_array_equal(
+                np.asarray(result.A_blocks[j]), np.asarray(A_het[s, s])
+            )
+            np.testing.assert_array_equal(
+                np.asarray(result.Q_blocks[j]), np.asarray(Q_het[s, s])
+            )
 
     def test_tolerance_allows_small_off_block_noise(self, problem) -> None:
         """Off-block entries within ``atol`` count as zero; a tighter
@@ -3426,7 +3431,7 @@ class TestBlockDiagonalFilterEquivalence:
         silently change optimization behavior.
 
         We differentiate the marginal log-likelihood with respect to a
-        scalar multiplier on Q_block. The structure check happens OUTSIDE
+        scalar multiplier on the Q blocks. The structure check happens OUTSIDE
         jax.grad (it reads its verdict back on the host and is not
         trace-compatible), and the block filter consumes a pre-built
         ``BlockDiagonalStructure`` with the scaled Q block substituted
@@ -3460,11 +3465,12 @@ class TestBlockDiagonalFilterEquivalence:
             return -mll
 
         def block_loss(q_scale):
-            # Substitute the scaled Q_block into the pre-detected
-            # structure. All other fields (A_block, init_*, Z_base,
+            # Substitute the scaled Q blocks into the pre-detected
+            # structure. All other fields (A_blocks, init_*, Z_base,
             # n_neurons, block_size) are unchanged.
-            Q_block_scaled = ref_structure.Q_block * q_scale
-            structure = ref_structure._replace(Q_block=Q_block_scaled)
+            structure = ref_structure._replace(
+                Q_blocks=ref_structure.Q_blocks * q_scale
+            )
             _, _, mll = _stochastic_point_process_filter_block_diagonal(
                 structure,
                 spikes,
@@ -3495,7 +3501,7 @@ class TestBlockDiagonalFilterEquivalence:
 
         def run(q_scale: float, dt_value: float, max_log_count: float):
             return _stochastic_point_process_filter_block_diagonal(
-                structure._replace(Q_block=structure.Q_block * q_scale),
+                structure._replace(Q_blocks=structure.Q_blocks * q_scale),
                 spikes,
                 dt_value,
                 max_log_count=max_log_count,
@@ -3514,6 +3520,44 @@ class TestBlockDiagonalFilterEquivalence:
             structure, spikes, dt, include_laplace_normalization=False
         )
         assert _block_diagonal_forward_core._cache_size() == after_first + 1
+
+    def test_per_neuron_process_noise_gradient_matches_dense(self) -> None:
+        """The gradient of the marginal LL w.r.t. each neuron's own process
+        noise scale, through the public filter's block dispatch (Z_base +
+        block ints, traced Q), equals the dense gradient -- what fit_sgd
+        relies on to train per-neuron Q on the block path."""
+        n_neurons, nb = 3, 4
+        init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
+            n_neurons=n_neurons, block_size=nb, T=30, seed=7
+        )
+        Z_base = Z[:, 0, :nb]
+
+        def loss(q_scales, design, **block_kwargs):
+            Q_scaled = Q * jnp.repeat(q_scales, nb)[:, None]
+            _, _, mll = stochastic_point_process_filter(
+                init_mean,
+                init_cov,
+                design,
+                spikes,
+                dt,
+                A,
+                Q_scaled,
+                log_conditional_intensity,
+                validate_inputs=False,
+                **block_kwargs,
+            )
+            return -mll
+
+        q_scales = jnp.array([1.0, 3.0, 0.5])
+        grad_dense = jax.grad(loss)(q_scales, Z)
+        grad_block = jax.grad(loss)(
+            q_scales, Z_base, block_n_neurons=n_neurons, block_size=nb
+        )
+        # guard: the neurons' gradients differ, so a shared block would fail
+        assert float(jnp.max(jnp.abs(grad_dense - grad_dense[0]))) > 1e-6
+        np.testing.assert_allclose(
+            np.asarray(grad_block), np.asarray(grad_dense), rtol=1e-8, atol=1e-10
+        )
 
     def test_filtered_cov_is_block_diagonal(self) -> None:
         """The block filter's reassembled filtered_cov should be
@@ -3938,7 +3982,7 @@ class TestBlockDiagonalSmootherEquivalence:
 
         def run(q_scale: float, dt_value: float, max_log_count: float):
             return _stochastic_point_process_smoother_block_diagonal(
-                structure._replace(Q_block=structure.Q_block * q_scale),
+                structure._replace(Q_blocks=structure.Q_blocks * q_scale),
                 spikes,
                 dt_value,
                 max_log_count=max_log_count,
