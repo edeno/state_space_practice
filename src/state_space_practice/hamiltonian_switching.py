@@ -582,10 +582,15 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         return lik_loss + l2_reg * mlp_l2_penalty(params["mlp"])
 
     def _store_sgd_params(self, params: dict[str, Any]) -> None:
-        # The switching spec optimizes the full (n_cont_states, K) init_mean
-        # stack and drops Q, so the single-regime slot-0 / Q handling of
-        # HamiltonianModelBase does not apply: store every key through the
-        # mapping-driven default and resync the per-state measurement matrix.
+        # Deliberately skips the JointHamiltonianModel and HamiltonianModelBase
+        # overrides and calls the mapping-driven default directly:
+        # - HamiltonianModelBase writes ``init_mean`` into slot 0 as a
+        #   single-regime (n_cont_states,) vector, but this spec optimizes the
+        #   full (n_cont_states, K) stack, which the mapping stores whole.
+        # - The rest of those overrides (re-stabilizing Q and R_lfp) has
+        #   nothing to act on: this spec drops Q, R_lfp and init_cov.
+        # If this spec ever optimizes Q, R_lfp or init_cov, store them here;
+        # test_store_sgd_params_after_fit_covers_the_switching_spec guards it.
         SGDFittableMixin._store_sgd_params(self, params)
         self.measurement_matrix = self._measurement_matrix_all_states()
 

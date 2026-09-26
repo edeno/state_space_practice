@@ -737,3 +737,45 @@ def test_fit_sgd_accepts_named_data_and_positional_optimizer(
     assert positional.fit_sgd(lfp, spikes, optimizer, 2) == lls_ref
     assert jnp.array_equal(named.omega, ref.omega)
     assert jnp.array_equal(positional.omega, ref.omega)
+
+
+@pytest.mark.slow
+def test_store_sgd_params_after_fit_covers_the_switching_spec(
+    switching_model, synthetic_data
+):
+    """The switching model stores optimized params through the mapping-driven
+    default, bypassing the single-regime overrides. Every optimized key must
+    therefore be mapped, the per-state containers must keep their
+    discrete-state axis, and the fixed covariances must stay untouched."""
+    model = switching_model
+    lfp, spikes = synthetic_data
+    n, k = model.n_cont_states, model.n_discrete_states
+    _, spec = model._build_param_spec()
+    unmapped = set(spec) - set(model._sgd_param_attrs)
+    assert not unmapped, f"optimized keys without storage: {unmapped}"
+    fixed = {
+        name: getattr(model, name) for name in ("process_cov", "init_cov", "R_lfp")
+    }
+    omega_before = model.omega
+
+    model.fit_sgd(lfp, spikes, num_steps=3)
+
+    # Guard: the fit moved the parameters, so the checks below see stored values.
+    assert not jnp.allclose(model.omega, omega_before)
+    assert model.omega.shape == (k,)
+    assert model.init_mean.shape == (n, k)
+    assert model.discrete_transition_matrix.shape == (k, k)
+    np.testing.assert_allclose(model.discrete_transition_matrix.sum(axis=1), 1.0)
+    assert model.init_discrete_state_prob.shape == (k,)
+    np.testing.assert_allclose(model.init_discrete_state_prob.sum(), 1.0)
+    for leaf in jax.tree_util.tree_leaves(model.mlp_params):
+        assert leaf.shape[0] == k
+    # The combined readout is resynced with the fitted heads in every state.
+    assert model.measurement_matrix.shape == (model.n_sources, n, k)
+    for j in range(k):
+        np.testing.assert_array_equal(
+            model.measurement_matrix[:, :, j],
+            jnp.concatenate([model.C_lfp, model.C_spikes], axis=0),
+        )
+    for name, value in fixed.items():
+        np.testing.assert_array_equal(getattr(model, name), value)
