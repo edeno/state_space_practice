@@ -23,6 +23,7 @@ from state_space_practice.point_process_kalman import (
     _safe_expected_count,
     _soft_expected_count,
     _stochastic_point_process_filter_block_diagonal,
+    _fisher_scoring_line_search,
     _stochastic_point_process_smoother_block_diagonal,
     _validate_filter_numerics,
     get_confidence_interval,
@@ -682,12 +683,10 @@ class TestKalmanMaximizationStep:
             rtol=1e-8,
             atol=1e-8,
         )
-        np.testing.assert_allclose(
-            estimated_process_cov,
-            jnp.eye(n_state) * 1e-8,
-            rtol=1e-8,
-            atol=1e-10,
-        )
+        # Noiseless dynamics: Q is ~0. The eigenvalue floor is relative to
+        # the matrix scale (no absolute 1e-8 clamp), so it stays ~0 but PSD.
+        np.testing.assert_allclose(estimated_process_cov, 0.0, atol=1e-12)
+        assert np.linalg.eigvalsh(np.asarray(estimated_process_cov)).min() > 0.0
 
 
 class TestSteepestDescentPointProcessFilter:
@@ -4794,3 +4793,307 @@ class TestBlockDispatchValidatesInputs:
         mean, cov, ll = stochastic_point_process_filter(**kwargs, validate_inputs=True)
         assert mean.shape == (5, 2)
         assert bool(jnp.isfinite(ll))
+
+
+
+# ---------------------------------------------------------------------------
+# Initial-state M-step, traceability, carry dtype, Laplace normaliser, Armijo
+# ---------------------------------------------------------------------------
+
+
+class TestPointProcessInitialStateMStep:
+    """``dynamics_only_m_step`` / ``PointProcessModel`` update the x_0 prior
+    to the smoothed x_0 (the filter predicts before its first update)."""
+
+    @pytest.fixture(scope="class")
+    def constant_rate_problem(self) -> dict:
+        rng = np.random.default_rng(0)
+        n_time = 40
+        return {
+            "design_matrix": jnp.ones((n_time, 1, 1)),
+            "spikes": jnp.asarray(rng.poisson(np.exp(3.0) * 0.1, size=(n_time, 1))),
+        }
+
+    def test_m_step_init_is_smoothed_x0(self, constant_rate_problem) -> None:
+        from state_space_practice.kalman import (
+            InitialStatePrior,
+            smooth_initial_state,
+        )
+
+        A, Q = jnp.eye(1) * 0.5, jnp.eye(1) * 0.1
+        m0, P0 = jnp.zeros(1), jnp.eye(1)
+        sm, sc, scc, _ = stochastic_point_process_smoother(
+            m0, P0, constant_rate_problem["design_matrix"],
+            constant_rate_problem["spikes"], 0.1, A, Q, log_conditional_intensity,
+        )
+        prior = InitialStatePrior(m0, P0, A, Q)
+        _, _, init_mean, init_cov = dynamics_only_m_step(
+            sm, sc, scc, initial_state_prior=prior
+        )
+        expected_mean, expected_cov = smooth_initial_state(prior, sm[0], sc[0])
+        np.testing.assert_allclose(init_mean, expected_mean, rtol=1e-12)
+        np.testing.assert_allclose(init_cov, expected_cov, rtol=1e-12)
+        # guard: x_0's posterior is not x_1's (A = 0.5 halves the mean).
+        assert abs(float(init_mean[0]) - float(sm[0, 0])) > 0.5
+
+    def test_init_only_em_is_monotone(self, constant_rate_problem) -> None:
+        """With A = 0.5 (contractive) and only the initial state updated, the
+        Laplace log-likelihood increases every iteration (it decreased from
+        the second iteration when the smoothed x_1 was installed)."""
+        model = PointProcessModel(
+            1,
+            dt=0.1,
+            transition_matrix=jnp.eye(1) * 0.5,
+            process_cov=jnp.eye(1) * 0.1,
+            update_transition_matrix=False,
+            update_process_cov=False,
+        )
+        lls = []
+        for _ in range(6):
+            lls.append(
+                model._e_step(
+                    constant_rate_problem["design_matrix"],
+                    constant_rate_problem["spikes"],
+                )
+            )
+            model._m_step()
+        assert np.all(np.diff(lls) > 0.0), lls
+        assert lls[-1] > lls[0] + 5.0
+
+
+class TestPointProcessTraceability:
+    """Public filters trace under jit/grad with the default validate_inputs,
+    and mixed-precision inputs promote the scan carry."""
+
+    @pytest.fixture(scope="class")
+    def problem(self) -> tuple:
+        rng = np.random.default_rng(3)
+        n_time, n_state = 30, 3
+        Z = jnp.asarray(rng.normal(size=(n_time, 2, n_state)) * 0.3)
+        y = jnp.asarray(rng.poisson(1.0, size=(n_time, 2)))
+        return Z, y, jnp.eye(n_state) * 0.95, jnp.eye(n_state) * 0.01
+
+    def test_filter_jits_with_default_validation(self, problem) -> None:
+        Z, y, A, Q = problem
+
+        def ll(m0):
+            return stochastic_point_process_filter(
+                m0, jnp.eye(3), Z, y, 0.1, A, Q, log_conditional_intensity
+            )[2]
+
+        np.testing.assert_allclose(jax.jit(ll)(jnp.zeros(3)), ll(jnp.zeros(3)))
+
+    def test_filter_grad_wrt_init_cov(self, problem) -> None:
+        Z, y, A, Q = problem
+
+        def ll(P0):
+            return stochastic_point_process_filter(
+                jnp.zeros(3), P0, Z, y, 0.1, A, Q, log_conditional_intensity
+            )[2]
+
+        grad = jax.grad(ll)(jnp.eye(3))
+        eps = 1e-6
+        E = jnp.zeros((3, 3)).at[1, 1].set(1.0)
+        fd = (ll(jnp.eye(3) + eps * E) - ll(jnp.eye(3) - eps * E)) / (2 * eps)
+        np.testing.assert_allclose(grad[1, 1], fd, rtol=1e-5)
+        assert abs(float(grad[1, 1])) > 1e-6
+
+    def test_smoother_jits_with_default_validation(self, problem) -> None:
+        Z, y, A, Q = problem
+
+        def sm(P0):
+            return stochastic_point_process_smoother(
+                jnp.zeros(3), P0, Z, y, 0.1, A, Q, log_conditional_intensity
+            )[0]
+
+        np.testing.assert_allclose(jax.jit(sm)(jnp.eye(3)), sm(jnp.eye(3)))
+
+    def test_eager_validation_still_raises(self, problem) -> None:
+        Z, y, A, Q = problem
+        with pytest.raises(ValueError, match="not positive definite"):
+            stochastic_point_process_filter(
+                jnp.zeros(3), -jnp.eye(3), Z, y, 0.1, A, Q, log_conditional_intensity
+            )
+
+    @pytest.mark.parametrize("max_newton_iter", [1, 3])
+    def test_float32_init_with_float64_params(self, problem, max_newton_iter) -> None:
+        Z, y, A, Q = problem
+        kwargs = dict(max_newton_iter=max_newton_iter)
+        mean, cov, ll = stochastic_point_process_filter(
+            jnp.zeros(3, jnp.float32), jnp.eye(3, dtype=jnp.float32),
+            Z, y, 0.1, A, Q, log_conditional_intensity, **kwargs,
+        )
+        assert mean.dtype == jnp.float64 and cov.dtype == jnp.float64
+        ref = stochastic_point_process_filter(
+            jnp.zeros(3), jnp.eye(3), Z, y, 0.1, A, Q, log_conditional_intensity,
+            **kwargs,
+        )
+        np.testing.assert_allclose(mean, ref[0], rtol=1e-12)
+        np.testing.assert_allclose(ll, ref[2], rtol=1e-12)
+
+
+class TestLaplaceNormaliser:
+    """The Laplace normaliser uses the same jittered factors as the update."""
+
+    def test_uninformative_observation_leaves_marginal_likelihood(self) -> None:
+        """If the rate does not depend on the state, the posterior is the
+        prior and log p(y_t | y_{1:t-1}) is the plain Poisson log-pmf -- also
+        for a tiny-scale prior (P = 1e-8 I), where log|P_post| computed from
+        a re-jittered posterior covariance used to add a spurious
+        ~log(1.1) per dimension."""
+        dt, rate = 0.1, 5.0
+        y = jnp.array([2.0])
+
+        def log_rate(x):
+            return jnp.array([jnp.log(rate)]) + 0.0 * x[0]
+
+        _, post_cov, ll = _point_process_laplace_update(
+            jnp.zeros(2),
+            jnp.eye(2) * 1e-8,
+            y,
+            dt,
+            log_rate,
+            grad_log_intensity_func=lambda x: jnp.zeros((1, 2)),
+        )
+        expected = jax.scipy.stats.poisson.logpmf(y, rate * dt).sum()
+        np.testing.assert_allclose(ll, expected, rtol=1e-9, atol=1e-9)
+        # guard: the prior really is at the scale of the absolute jitter.
+        assert float(post_cov[0, 0]) < 2e-8
+
+    def test_legacy_logdet_helper_unchanged(self) -> None:
+        """_logdet_psd (used by multinomial_choice) keeps its semantics."""
+        mat = jnp.diag(jnp.array([2.0, 3.0]))
+        np.testing.assert_allclose(
+            _logdet_psd(mat), np.log(2.0 + 1e-9) + np.log(3.0 + 1e-9), rtol=1e-12
+        )
+
+
+class TestArmijoLineSearch:
+    """The Fisher-scoring line search enforces sufficient decrease and counts
+    exhausted backtracks."""
+
+    @staticmethod
+    def _quadratic(precision_scale: float, gradient_sign: float = 1.0):
+        """f(x) = 0.5 |x|^2 with a Fisher precision ``precision_scale * I``
+        (1.0 is the exact Hessian) and optionally a sign-flipped gradient."""
+
+        def fisher_step_at(x):
+            gradient = -gradient_sign * x
+            post_prec = precision_scale * jnp.eye(x.shape[0])
+            return gradient / precision_scale, post_prec, gradient
+
+        def neg_log_posterior(x):
+            return 0.5 * x @ x
+
+        return fisher_step_at, neg_log_posterior
+
+    def test_full_step_accepted_unchanged(self) -> None:
+        step, f = self._quadratic(1.0)
+        x0 = jnp.array([1.0, -2.0])
+        x, _, n_failed = _fisher_scoring_line_search(
+            x0, jnp.eye(2), step, f, max_newton_iter=1, line_search_beta=0.5
+        )
+        np.testing.assert_allclose(x, 0.0, atol=1e-15)
+        assert int(n_failed) == 0
+
+    def test_insufficient_decrease_is_backtracked(self) -> None:
+        """A curvature underestimate of 2x makes the full step land at -0.9999
+        x0: a strict decrease of only ~1e-4 of the predicted one. Armijo
+        rejects it and the halved step lands near the minimum."""
+        step, f = self._quadratic(0.50005)
+        x0 = jnp.array([1.0, -2.0])
+        x, _, n_failed = _fisher_scoring_line_search(
+            x0, jnp.eye(2), step, f, max_newton_iter=1, line_search_beta=0.5
+        )
+        assert float(f(x)) < 1e-6 * float(f(x0))
+        assert int(n_failed) == 0
+        # guard: the full step alone is a (tiny) strict decrease that a pure
+        # decrease test would have accepted.
+        full = x0 + step(x0)[0]
+        assert float(f(full)) < float(f(x0))
+        assert float(f(full)) > 0.99 * float(f(x0))
+
+    def test_exhausted_backtracking_is_counted(self) -> None:
+        """An ascent direction (sign-flipped gradient) exhausts every
+        backtrack: x is kept and each iteration counts as a failure."""
+        step, f = self._quadratic(1.0, gradient_sign=-1.0)
+        x0 = jnp.array([1.0, -2.0])
+        x, _, n_failed = _fisher_scoring_line_search(
+            x0, jnp.eye(2), step, f, max_newton_iter=3, line_search_beta=0.5
+        )
+        np.testing.assert_allclose(x, x0)
+        assert int(n_failed) == 3
+
+    def test_converged_point_is_not_a_failure(self) -> None:
+        step, f = self._quadratic(1.0)
+        _, _, n_failed = _fisher_scoring_line_search(
+            jnp.zeros(2), jnp.eye(2), step, f, max_newton_iter=3,
+            line_search_beta=0.5,
+        )
+        assert int(n_failed) == 0
+
+    def test_filter_logs_when_many_bins_fail(self, caplog) -> None:
+        """A log-intensity whose derivative has the wrong sign makes every
+        bin's line search fail; the public filter logs one warning."""
+
+        @jax.custom_jvp
+        def bad_log_rate(design, x):
+            return design @ x
+
+        @bad_log_rate.defjvp
+        def _bad_jvp(primals, tangents):
+            design, x = primals
+            _, dx = tangents
+            return design @ x, -(design @ dx)
+
+        rng = np.random.default_rng(0)
+        n_time = 30
+        Z = jnp.asarray(rng.normal(size=(n_time, 2, 2)))
+        y = jnp.asarray(rng.poisson(3.0, size=(n_time, 2)))
+        args = (jnp.zeros(2), jnp.eye(2), Z, y, 0.1, jnp.eye(2), jnp.eye(2) * 0.1)
+        with caplog.at_level("WARNING", logger="state_space_practice.point_process_kalman"):
+            stochastic_point_process_filter(*args, bad_log_rate, max_newton_iter=3)
+        assert any("line search" in r.getMessage() for r in caplog.records)
+        # guard: a correct intensity with the same data does not warn.
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="state_space_practice.point_process_kalman"):
+            stochastic_point_process_filter(
+                *args, log_conditional_intensity, max_newton_iter=3
+            )
+        assert not any("line search" in r.getMessage() for r in caplog.records)
+
+
+class TestPointProcessModelNonFiniteFirstEStep:
+    def test_non_finite_first_e_step_leaves_model_unfitted(self, caplog) -> None:
+        """A first E-step with a non-finite LL has no accepted state to roll
+        back to: the posteriors it installed are cleared, EM stops with an
+        empty history, a warning is logged and the model reads as unfitted."""
+        rng = np.random.default_rng(0)
+        n_time = 20
+        Z = jnp.ones((n_time, 1, 1))
+        y = jnp.asarray(rng.poisson(1.0, size=(n_time, 1)))
+        model = PointProcessModel(1, dt=0.1)
+        real_e_step = model._e_step
+        n_calls = []
+
+        def nan_e_step(*args, **kwargs):
+            real_e_step(*args, **kwargs)  # installs posteriors
+            n_calls.append(1)
+            return float("nan")
+
+        model._e_step = nan_e_step
+        with caplog.at_level("WARNING"):
+            lls = model.fit(Z, y, max_iter=3)
+        assert len(n_calls) == 1  # guard: the injected E-step ran, EM stopped
+        assert lls == []
+        assert "non-finite" in caplog.text.lower()
+        for attr in (
+            "smoother_mean",
+            "smoother_cov",
+            "smoother_cross_cov",
+            "filtered_mean",
+            "filtered_cov",
+        ):
+            assert getattr(model, attr) is None, attr
+        with pytest.raises(RuntimeError, match="not been fitted"):
+            model.get_rate_estimate(Z)

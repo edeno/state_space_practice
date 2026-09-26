@@ -237,7 +237,7 @@ class TestCarriedLineSearch:
         line_search_beta=0.5,
         diagonal_boost=1e-9,
     ):
-        """Recomputing Fisher scoring with the same 10-step backtracking rule."""
+        """Recomputing Fisher scoring with the same 10-step Armijo backtracking."""
         identity = jnp.eye(one_step_mean.shape[0])
         prior_cho = psd_cholesky(one_step_cov, diagonal_boost=diagonal_boost)
         prior_precision = jax.scipy.linalg.cho_solve(prior_cho, identity)
@@ -259,16 +259,21 @@ class TestCarriedLineSearch:
                 prior_precision + jacobian.T @ (weight[:, None] * jacobian)
             )
             delta = psd_solve(post_prec, gradient, diagonal_boost=diagonal_boost)
-            return delta, post_prec
+            return delta, post_prec, gradient
 
         x = one_step_mean
         n_shortened = n_rejected = 0
         for _ in range(max_newton_iter):
-            delta, _ = fisher_step(x)
+            delta, _, gradient = fisher_step(x)
+            slope = float(gradient @ delta)
             loss = neg_log_posterior(x)
             alpha, improved = 1.0, False
             for _ in range(10):
-                improved = bool(neg_log_posterior(x + alpha * delta) < loss)
+                # Strict decrease plus the Armijo sufficient-decrease test.
+                new_loss = neg_log_posterior(x + alpha * delta)
+                improved = bool(
+                    (new_loss < loss) & (new_loss <= loss - 1e-4 * alpha * slope)
+                )
                 if not improved:
                     alpha *= line_search_beta
             if improved:
@@ -276,7 +281,7 @@ class TestCarriedLineSearch:
                 x = x + alpha * delta
             else:
                 n_rejected += 1
-        _, post_prec = fisher_step(x)
+        _, post_prec, _ = fisher_step(x)
         post_cho = psd_cholesky(post_prec, diagonal_boost=diagonal_boost)
         post_cov = symmetrize(jax.scipy.linalg.cho_solve(post_cho, identity))
         return x, post_cov, n_shortened, n_rejected
