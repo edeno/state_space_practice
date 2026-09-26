@@ -697,7 +697,6 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                 pair_cond_smoother_means,
             ) = switching_kalman_smoother(
                 **smoother_args,
-                last_filter_conditional_cont_mean=pair_cond_filter_mean[-1],
                 discrete_state_transition_matrix=self.discrete_transition_matrix,
             )
             pair_cond_smoother_covs = None

@@ -1375,7 +1375,6 @@ def switching_kalman_smoother(
     filter_mean: jax.Array,
     filter_cov: jax.Array,
     filter_discrete_state_prob: jax.Array,
-    last_filter_conditional_cont_mean: jax.Array,
     process_cov: jax.Array,
     continuous_transition_matrix: jax.Array,
     discrete_state_transition_matrix: jax.Array,
@@ -1403,7 +1402,6 @@ def switching_kalman_smoother(
     filter_mean : jax.Array, shape (n_time, n_cont_states, n_discrete_states)
     filter_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
     filter_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
-    last_filter_conditional_cont_mean : jax.Array, shape (n_cont_states, n_discrete_states, n_discrete_states)
     process_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
     continuous_transition_matrix : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
     discrete_state_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
@@ -1459,7 +1457,6 @@ def switching_kalman_smoother(
             next_state_cond_smoother_mean : jax.Array, shape (n_cont_states, n_discrete_states)
             next_state_cond_smoother_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
             next_smoother_discrete_prob : jax.Array, shape (n_discrete_states,)
-            next_pair_cond_smoother_mean : jax.Array, unused compatibility slot
         args : tuple
             state_cond_filter_mean : jax.Array, shape (n_cont_states, n_discrete_states)
             state_cond_filter_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
@@ -1469,7 +1466,6 @@ def switching_kalman_smoother(
             next_state_cond_smoother_mean,
             next_state_cond_smoother_cov,
             next_smoother_discrete_prob,
-            _unused_next_pair_cond_smoother_mean,
         ) = carry
 
         state_cond_filter_mean, state_cond_filter_cov, filter_discrete_prob = args
@@ -1596,7 +1592,6 @@ def switching_kalman_smoother(
             state_cond_smoother_means,
             state_cond_smoother_covs,
             stabilized_smoother_prob,
-            next_pair_cond_smoother_mean,
         ), (
             overall_smoother_mean,
             overall_smoother_covs,
@@ -1613,7 +1608,6 @@ def switching_kalman_smoother(
         filter_mean[-1],  # shape (n_cont_states, n_discrete_states)
         filter_cov[-1],  # shape (n_cont_states, n_cont_states, n_discrete_states)
         filter_discrete_state_prob[-1],  # shape (n_discrete_states,)
-        last_filter_conditional_cont_mean,  # shape (n_cont_states, n_discrete_states, n_discrete_states)
     )
 
     (

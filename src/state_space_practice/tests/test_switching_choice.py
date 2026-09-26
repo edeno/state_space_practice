@@ -259,9 +259,10 @@ class TestSwitchingChoiceFilter:
     def test_preserves_structural_zero_prior(self):
         """A structurally-impossible state (prior 0 + identity Z) stays exactly 0.
 
-        The support mask must be derived from the RAW prior; if the prior is
-        floored (`_stabilize_probability_vector`) before the support is computed,
-        state 1 is resurrected to ~1e-10 and persists under identity transitions.
+        The support mask must come from the sanitized prior's exact zeros
+        (`_normalize_initial_discrete_prob` keeps them); flooring the prior to
+        ~1e-10 first would resurrect state 1, which then persists under identity
+        transitions.
         """
         choices = jnp.array([0, 1, 0, 1, 0])
         result = switching_choice_filter(

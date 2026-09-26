@@ -40,11 +40,10 @@ from state_space_practice.parameter_transforms import (
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.switching_kalman import (
+    _first_timestep_discrete_update,
+    _normalize_initial_discrete_prob,
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture_per_discrete_state,
-)
-from state_space_practice.utils import (
-    stabilize_probability_vector as _stabilize_probability_vector,
 )
 from state_space_practice.utils import (
     validate_choice_indices,
@@ -353,11 +352,12 @@ def _switching_choice_filter_jit(
     init_state_cond_mean = jnp.stack([init_mean] * S, axis=-1)  # (K-1, S)
     init_state_cond_cov = jnp.stack([init_cov] * S, axis=-1)  # (K-1, K-1, S)
 
-    # Structural support S_1 from the RAW prior (before stabilization floors its
-    # exact zeros to 1e-10), so a caller-declared impossible state (prior 0) stays
-    # impossible: the support mask, not the floored value, decides.
-    first_support = jnp.asarray(init_discrete_prob) > 0.0
-    init_discrete_prob = _stabilize_probability_vector(init_discrete_prob)
+    # Sanitize the caller-supplied prior exactly as the switching-Kalman and
+    # switching point-process filters do: exact zeros are structural (an
+    # impossible state stays impossible), NaN / negative entries are clamped to
+    # 0, and the structural support S_1 is read from the sanitized prior.
+    init_discrete_prob = _normalize_initial_discrete_prob(init_discrete_prob)
+    first_support = init_discrete_prob > 0.0
 
     # --- First timestep: predict + update (x₀ convention) ---
     # This uses the x₀ convention (predict+update at t=0) to match the
@@ -394,18 +394,14 @@ def _switching_choice_filter_jit(
     )
     # first_means: (K-1, S), first_pred_means: (K-1, S), etc.
 
-    # Log-space, support-masked discrete update for the first timestep. `first_support`
-    # (from the RAW prior, computed above) is threaded through the scan so an
-    # impossible state cannot set the log-sum-exp reference nor be resurrected.
-    first_pair_ll = first_lls[None, :] * jnp.ones((S, 1))  # (S, S) broadcast
-    (
-        first_discrete_prob,
-        _,
-        first_marginal_ll,
-        first_next_support,
-    ) = _update_discrete_state_probabilities(
-        first_pair_ll, jnp.eye(S), init_discrete_prob, first_support
+    # Log-space, support-masked discrete update for the first timestep, shared
+    # with the other switching filters: a structural zero stays exactly 0, a
+    # tiny prior is represented faithfully, and an all-zero prior fails loud.
+    # There is no transition at t=0, so the support carried into the scan is S_1.
+    first_discrete_prob, first_marginal_ll = _first_timestep_discrete_update(
+        first_lls, init_discrete_prob
     )
+    first_next_support = first_support
 
     # Pair-conditional for smoother: diagonal (no pair structure at t=0)
     first_pair_mean = jnp.stack([first_means] * S, axis=-1)  # (K-1, S, S)
@@ -847,7 +843,6 @@ class SwitchingChoiceModel(SGDFittableMixin):
             filter_mean=filter_result.filtered_values,
             filter_cov=filter_result.filtered_covs,
             filter_discrete_state_prob=filter_result.discrete_state_probs,
-            last_filter_conditional_cont_mean=filter_result.pair_cond_means[-1],
             process_cov=jnp.stack(
                 [q * jnp.eye(k_free) for q in self.process_noises_],
                 axis=-1,

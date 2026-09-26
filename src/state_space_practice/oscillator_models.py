@@ -799,7 +799,6 @@ class BaseModel(ABC, SGDFittableMixin):
                 self.smoother_pair_cond_means,
             ) = switching_kalman_smoother(
                 **smoother_args,
-                last_filter_conditional_cont_mean=pair_cond_filter_mean[-1],
                 discrete_state_transition_matrix=self.discrete_transition_matrix,
             )
             self.smoother_pair_cond_covs = None
