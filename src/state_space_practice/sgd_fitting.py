@@ -62,6 +62,27 @@ def reconstruct_per_state_array(
     (``"init_cov_0"``, ``"init_cov_1"``, ...). If ``params`` holds none of
     them the ``fallback`` array is returned unchanged; otherwise each state's
     slice comes from ``params`` when present and from ``fallback`` otherwise.
+
+    Parameters
+    ----------
+    params : dict
+        Optimized parameters; the per-state entries are keyed
+        ``f"{prefix}_{j}"`` and each has shape ``fallback.shape[:-1]``, e.g.
+        ``(n_latent, n_latent)`` for ``init_cov``.
+    prefix : str
+        Key prefix of the per-state entries, e.g. ``"init_cov"``.
+    fallback : Array, shape (..., n_discrete_states)
+        Current stacked array, discrete-state axis last, e.g.
+        ``(n_latent, n_latent, n_discrete_states)``. Supplies every state
+        slice absent from ``params``.
+    n_discrete_states : int
+        Number of discrete states (length of the trailing axis).
+
+    Returns
+    -------
+    Array, shape (..., n_discrete_states)
+        ``fallback`` itself (same object) when ``params`` has no
+        ``f"{prefix}_*"`` key, else the restacked array.
     """
     if not any(k.startswith(f"{prefix}_") for k in params):
         return fallback
