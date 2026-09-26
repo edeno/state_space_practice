@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice import point_process_kalman
 from state_space_practice.point_process_kalman import (
     BlockDiagonalCovariance,
     BlockDiagonalStructure,
@@ -3049,6 +3050,26 @@ def _block_structure(init_mean, init_cov, A, Q, Z) -> BlockDiagonalStructure:
     )
 
 
+def _count_traces(monkeypatch, helper_name: str) -> list:
+    """Record each call of a ``point_process_kalman`` helper that the jitted
+    block cores invoke only while being traced.
+
+    A cached compilation never calls it, so an empty list after a call means
+    no retrace. This observes compilations directly instead of through
+    ``_cache_size()``, whose counts depend on what earlier tests compiled and
+    on evictions from JAX's global jit cache in a long run.
+    """
+    traces: list = []
+    original = getattr(point_process_kalman, helper_name)
+
+    def counting(*args, **kwargs):
+        traces.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(point_process_kalman, helper_name, counting)
+    return traces
+
+
 class TestBlockDiagonalParametersOk:
     """Tests for ``_block_diagonal_parameters_ok``, the live dispatch check.
 
@@ -3488,15 +3509,15 @@ class TestBlockDiagonalFilterEquivalence:
             rtol=1e-9,
         )
 
-    def test_forward_core_compiles_once_across_repeated_calls(self) -> None:
+    def test_forward_core_compiles_once_across_repeated_calls(
+        self, monkeypatch
+    ) -> None:
         """The block filter's jitted forward core keeps the option flags
         static, so calls with identical shapes (every SGD step / EM
         iteration) reuse one compilation even when the parameter values,
         ``dt`` and ``max_log_count`` change.
-
-        The cache is cleared first, so the counts below do not depend on
-        what other tests (or earlier runs of this one) already compiled.
         """
+        traces = _count_traces(monkeypatch, "_point_process_laplace_update")
         init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
             n_neurons=2, block_size=5, T=27, seed=4
         )
@@ -3513,18 +3534,19 @@ class TestBlockDiagonalFilterEquivalence:
 
         _block_diagonal_forward_core.clear_cache()
         first = run(1.0, dt, 20.0)
-        assert _block_diagonal_forward_core._cache_size() == 1
+        # guard: the first call after clearing the cache really compiled
+        assert traces
+        traces.clear()
         second = run(2.0, dt, 20.0)
         run(0.5, 0.03, 15.0)
-        assert _block_diagonal_forward_core._cache_size() == 1
+        assert traces == []
         # guard: the reused compilation really saw the new parameter values
         assert not np.allclose(np.asarray(first[1]), np.asarray(second[1]))
-        # guard: the counter does register new compilations -- a different
-        # static option is one.
+        # guard: a different static option does retrace
         _stochastic_point_process_filter_block_diagonal(
             structure, spikes, dt, include_laplace_normalization=False
         )
-        assert _block_diagonal_forward_core._cache_size() == 2
+        assert traces
 
     def test_per_neuron_process_noise_gradient_matches_dense(self) -> None:
         """The gradient of the marginal LL w.r.t. each neuron's own process
@@ -3975,14 +3997,14 @@ class TestBlockDiagonalSmootherEquivalence:
         with pytest.raises(ValueError, match="axis=0"):
             block[1].sum(axis=1)
 
-    def test_block_cores_compile_once_across_repeated_calls(self) -> None:
+    def test_block_cores_compile_once_across_repeated_calls(
+        self, monkeypatch
+    ) -> None:
         """The block cores are jitted with the option flags static, so calls
         with identical shapes (every EM iteration) reuse one compilation even
         when the parameter values, ``dt`` and ``max_log_count`` change.
-
-        The cache is cleared first, so the counts below do not depend on
-        what other tests (or earlier runs of this one) already compiled.
         """
+        traces = _count_traces(monkeypatch, "_kalman_smoother_update")
         init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
             n_neurons=2, block_size=5, T=23, seed=3
         )
@@ -3999,18 +4021,19 @@ class TestBlockDiagonalSmootherEquivalence:
 
         _block_diagonal_smoother_core.clear_cache()
         first = run(1.0, dt, 20.0)
-        assert _block_diagonal_smoother_core._cache_size() == 1
+        # guard: the first call after clearing the cache really compiled
+        assert traces
+        traces.clear()
         second = run(2.0, dt, 20.0)
         run(0.5, 0.03, 15.0)
-        assert _block_diagonal_smoother_core._cache_size() == 1
+        assert traces == []
         # guard: the reused compilation really saw the new parameter values
         assert not np.allclose(np.asarray(first[1]), np.asarray(second[1]))
-        # guard: the counter does register new compilations -- a different
-        # static option is one.
+        # guard: a different static option does retrace
         _stochastic_point_process_smoother_block_diagonal(
             structure, spikes, dt, include_laplace_normalization=False
         )
-        assert _block_diagonal_smoother_core._cache_size() == 2
+        assert traces
 
     def test_shape_mismatch_guard(self) -> None:
         """Block dispatch with wrong n_neurons * block_size raises ValueError.
