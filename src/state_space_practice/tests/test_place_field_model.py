@@ -1823,6 +1823,59 @@ class TestBlockDiagonalDispatch:
             atol=1e-5, rtol=1e-6,
         )
 
+    @pytest.mark.slow
+    def test_fit_em_update_transition_matrix_block_vs_dense(self) -> None:
+        """With ``update_transition_matrix=True`` the block-path fit (block
+        E-step, block-covariance M-step, then the dense fallback once A is
+        dense) must learn the same A, Q and LL history as a dense-only fit."""
+        position, spikes = self._make_multi_neuron_data(n_neurons=2, n_time=200)
+
+        def fit(force_dense: bool) -> tuple[PlaceFieldModel, list, list]:
+            model = PlaceFieldModel(
+                dt=0.02, n_interior_knots=3, update_transition_matrix=True
+            )
+            real_e_step = model._e_step
+            dispatch: list = []
+
+            def e_step(*args, **kwargs):
+                dispatch.append(model._block_n_neurons)
+                return real_e_step(*args, **kwargs)
+
+            model._e_step = e_step
+            lls = model.fit(
+                position, spikes, max_iter=3, verbose=False, force_dense=force_dense
+            )
+            return model, lls, dispatch
+
+        m_block, lls_block, dispatch_block = fit(force_dense=False)
+        m_dense, lls_dense, dispatch_dense = fit(force_dense=True)
+        # guard: the block fit really started on the block path and the
+        # learned A then moved it to dense; the dense fit never dispatched.
+        assert dispatch_block[0] == 2 and dispatch_block[-1] is None
+        assert set(dispatch_dense) == {None}
+        # guard: A was actually learned
+        assert not np.allclose(
+            np.asarray(m_dense.transition_matrix), np.eye(m_dense.n_basis)
+        )
+
+        assert len(lls_block) == len(lls_dense)
+        np.testing.assert_allclose(lls_block, lls_dense, rtol=0, atol=1e-8)
+        # A stays close to I (learned deviations ~1e-5), so compare A - I
+        # at an absolute tolerance well below the learned change.
+        eye = np.eye(m_dense.n_basis)
+        np.testing.assert_allclose(
+            np.asarray(m_block.transition_matrix) - eye,
+            np.asarray(m_dense.transition_matrix) - eye,
+            rtol=0,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            np.asarray(m_block.process_cov),
+            np.asarray(m_dense.process_cov),
+            rtol=1e-6,
+            atol=1e-14,
+        )
+
     def test_em_falls_back_to_dense_when_m_step_breaks_structure(self) -> None:
         """When update_transition_matrix=True, the M-step writes back a
         dense A that breaks block-diagonal structure. The next E-step
