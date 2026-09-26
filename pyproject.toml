@@ -78,10 +78,11 @@ exclude = ["src/state_space_practice/tests"]
 [tool.pytest.ini_options]
 testpaths = ["src/state_space_practice/tests"]
 addopts = "-v --tb=short"
+# Warnings are errors. Ignore only specific, known upstream deprecations here
+# (none currently fire in the suite); the library's own deprecated
+# models.stochastic_point_process_filter is silenced where tested.
 filterwarnings = [
     "error",
-    "ignore::DeprecationWarning",
-    "ignore::PendingDeprecationWarning",
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",

@@ -25,6 +25,23 @@ logger = logging.getLogger(__name__)
 
 
 def log_receptive_field_model(position: ArrayLike, params: ArrayLike) -> Array:
+    """Log firing rate of a 1D Gaussian place field.
+
+    ``log(rate) = log_max_rate - (position - center)**2 / (2 * scale**2)``.
+
+    Parameters
+    ----------
+    position : ArrayLike, scalar or shape (n_time,)
+        Position(s) at which to evaluate the field.
+    params : ArrayLike, shape (3,)
+        ``(log_max_rate, place_field_center, scale)``: log of the peak rate,
+        field center (same units as ``position``) and Gaussian width.
+
+    Returns
+    -------
+    log_rate : Array, same shape as ``position``
+        Log firing rate at each position.
+    """
     params_arr = jnp.asarray(params)
     log_max_rate, place_field_center, scale = params_arr
     result: Array = log_max_rate - (jnp.asarray(position) - place_field_center) ** 2 / (
@@ -46,12 +63,12 @@ def stochastic_point_process_filter(
 ) -> tuple[Array, Array]:
     """Stochastic State Point Process Filter (SSPPF).
 
-    .. deprecated::
+    .. deprecated:: 0.1.0
         This implementation uses the **observed Hessian** (not Fisher scoring)
         and may produce indefinite posterior precision matrices. Use
         :func:`point_process_kalman.stochastic_point_process_filter` instead,
         which uses Fisher scoring and is numerically more stable. This function
-        will be removed in a future version.
+        will be removed in version 0.2.0.
 
     Parameters
     ----------
@@ -86,7 +103,8 @@ def stochastic_point_process_filter(
     warnings.warn(
         "stochastic_point_process_filter in models.py uses the observed Hessian "
         "(not Fisher scoring) and may produce indefinite posterior precision. "
-        "Use point_process_kalman.stochastic_point_process_filter instead.",
+        "Use point_process_kalman.stochastic_point_process_filter instead. "
+        "It will be removed in version 0.2.0.",
         DeprecationWarning,
         stacklevel=2,
     )

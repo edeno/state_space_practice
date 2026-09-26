@@ -135,8 +135,28 @@ def simple_point_process_model():
     }
 
 
+# The legacy filter is deprecated; these tests pin its numerics until removal.
+@pytest.mark.filterwarnings(
+    "ignore:stochastic_point_process_filter in models.py:DeprecationWarning"
+)
 class TestStochasticPointProcessFilter:
     """Tests for the stochastic_point_process_filter function."""
+
+    def test_emits_deprecation_warning_naming_removal_version(
+        self, simple_point_process_model
+    ) -> None:
+        m = simple_point_process_model
+        with pytest.warns(DeprecationWarning, match=r"removed in version 0\.2\.0"):
+            stochastic_point_process_filter(
+                m["init_mode"],
+                m["init_cov"],
+                m["position"],
+                m["spike_indicator"],
+                m["dt"],
+                m["transition_matrix"],
+                m["latent_state_cov"],
+                log_receptive_field_model,
+            )
 
     def test_output_shapes(self, simple_point_process_model) -> None:
         """Filter should output correct shapes."""
