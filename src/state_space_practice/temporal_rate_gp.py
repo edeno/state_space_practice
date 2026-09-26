@@ -51,6 +51,7 @@ from jax import Array
 from jax.scipy.special import gammaln, ndtri
 from jax.typing import ArrayLike
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.gp_ssm import matern32_continuous, matern32_discretize
 from state_space_practice.kalman import kalman_smoother
 from state_space_practice.parameter_transforms import (
@@ -584,7 +585,7 @@ class TemporalRateGP(SGDFittableMixin):
 
     def _check_fitted(self) -> None:
         if self.log_rate_mean_ is None:
-            raise RuntimeError("Model is not fitted. Call fit_sgd(counts) first.")
+            raise NotFittedError("Model is not fitted. Call fit_sgd(counts) first.")
 
     def predict_log_rate(self) -> tuple[Array, Array]:
         """Posterior mode and variance of the log-rate ``f`` (after fitting)."""

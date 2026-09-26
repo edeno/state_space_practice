@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.oscillator_models import (
     CommonOscillatorModel,
     CorrelatedNoiseModel,
@@ -2431,7 +2432,7 @@ class TestBaseModelDecodeAndPredictProba:
             process_variance=jnp.array([0.1, 0.1]),
             measurement_variance=0.05,
         )
-        with pytest.raises(RuntimeError, match="fit"):
+        with pytest.raises(NotFittedError, match="fit"):
             model.decode()
 
     def test_predict_proba_before_fit_raises(self):
@@ -2446,7 +2447,7 @@ class TestBaseModelDecodeAndPredictProba:
             process_variance=jnp.array([0.1, 0.1]),
             measurement_variance=0.05,
         )
-        with pytest.raises(RuntimeError, match="fit"):
+        with pytest.raises(NotFittedError, match="fit"):
             model.predict_proba()
 
     @pytest.mark.slow

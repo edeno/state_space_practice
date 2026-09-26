@@ -42,6 +42,7 @@ import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.oscillator_utils import (
     DirectedInfluenceDynamicsMixin,
     canonicalize_correlated_noise_pair_parameters,
@@ -277,7 +278,7 @@ class OscillatorParameterBase:
         ):
             # Worded without naming a fitting method: the EM models fit with
             # ``fit`` / ``fit_sgd``, the Hamiltonian family with ``fit_sgd`` only.
-            raise RuntimeError(
+            raise NotFittedError(
                 "No smoother posteriors available. Fit the model first and "
                 f"ensure the fit produced a finite log-likelihood before {caller}()."
             )

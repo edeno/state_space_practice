@@ -19,6 +19,7 @@ import pytest
 from jax import random
 from scipy.special import gammaln
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.temporal_rate_gp import (
     TemporalRateGP,
     infer_log_rate,
@@ -296,7 +297,7 @@ def test_evidence_gradient_matches_finite_difference(small_counts):
 
 def test_predict_before_fit_raises():
     model = TemporalRateGP(dt=0.1)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(NotFittedError, match="fit_sgd"):
         model.predict_rate()
 
 

@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.place_field_model import (
     PlaceFieldModel,
     build_2d_spline_basis,
@@ -300,7 +301,7 @@ class TestPlaceFieldModelFit:
         for attr in self._POSTERIOR_ATTRS:
             assert getattr(model, attr) is None, attr
         assert "fitted=False" in repr(model)
-        with pytest.raises(RuntimeError, match="Call model.fit"):
+        with pytest.raises(NotFittedError, match="Call model.fit"):
             model.bic()
         with pytest.raises(RuntimeError, match="Call model.fit"):
             model.summary()
@@ -809,19 +810,15 @@ class TestModelComparison:
 
     def test_bic_not_fitted(self) -> None:
         model = PlaceFieldModel(dt=0.004)
-        with pytest.raises(RuntimeError, match="Call model.fit"):
+        with pytest.raises(NotFittedError, match="Call model.fit"):
             model.bic()
 
-    def test_n_free_params(self) -> None:
+    def test_n_free_params_before_fit_raises_not_fitted(self) -> None:
+        # n_basis is only known after fit; the property must say so instead of
+        # tripping a bare assert (which ``python -O`` would strip).
         m = PlaceFieldModel(dt=0.004, n_interior_knots=3)
-        # Before fit, n_basis is None — but n_free_params uses it
-        # After fit, it should be n_basis (diagonal Q) + 2*n_basis (init)
-        # With default settings: update_process_cov=True (diagonal), update_init_state=True
-        # n_free_params = n_basis + n_basis + n_basis = 3 * n_basis
-        # We can only test after fit, but let's verify the property logic
-        assert m.update_process_cov is True
-        assert m.update_init_state is True
-        assert m.update_transition_matrix is False
+        with pytest.raises(NotFittedError, match="n_free_params"):
+            _ = m.n_free_params
 
     def test_n_free_params_after_fit(self, sim_data: dict) -> None:
         model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)

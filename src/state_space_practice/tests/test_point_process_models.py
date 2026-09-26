@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.point_process_models import (
     CommonOscillatorPointProcessModel,
     CorrelatedNoisePointProcessModel,
@@ -127,6 +128,12 @@ class TestCommonOscillatorPointProcessModel:
         assert model.n_neurons == com_pp_params["n_neurons"]
         assert model.n_discrete_states == com_pp_params["n_discrete_states"]
         assert model.n_latent == 2 * com_pp_params["n_oscillators"]
+
+    @pytest.mark.parametrize("method", ["decode", "predict_proba"])
+    def test_posterior_before_fit_raises_not_fitted(self, com_pp_params, method):
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        with pytest.raises(NotFittedError, match=f"before {method}"):
+            getattr(model, method)()
 
     def test_repr(self, com_pp_params) -> None:
         """__repr__ should include class name and key parameters."""

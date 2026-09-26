@@ -42,7 +42,7 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.exceptions import StateSpaceWarning
+from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.kalman import (
     InitialStatePrior,
     process_cov_residual_form,
@@ -550,7 +550,7 @@ class PlaceFieldModel(SGDFittableMixin):
     def _check_fitted(self, method_name: str) -> None:
         """Raise if the model has not been fitted."""
         if self.smoother_mean is None:
-            raise RuntimeError(
+            raise NotFittedError(
                 f"Model has not been fitted. "
                 f"Call model.fit(position, spikes) before {method_name}()."
             )
@@ -1993,7 +1993,8 @@ class PlaceFieldModel(SGDFittableMixin):
         Counts diagonal entries of Q (or 1 for isotropic), A entries if
         learned, and initial mean + diagonal covariance if learned.
         """
-        assert self.n_basis is not None, "Model not initialized"
+        self._check_fitted("n_free_params")
+        assert self.n_basis is not None  # narrowed by _check_fitted
         nb = self.n_basis
         n = 0
         if self.update_process_cov:

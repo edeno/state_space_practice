@@ -30,6 +30,7 @@ import jax.numpy as jnp
 from jax import Array
 
 from state_space_practice.em_driver import run_em
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.oscillator_utils import (
     DirectedInfluenceDynamicsMixin,
     canonicalize_correlated_noise_pair_parameters,
@@ -258,7 +259,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
             not hasattr(self, "smoother_discrete_state_prob")
             or self.smoother_discrete_state_prob is None
         ):
-            raise RuntimeError("Call fit() or fit_sgd() before decode().")
+            raise NotFittedError("Call fit() or fit_sgd() before decode().")
         return jnp.argmax(self.smoother_discrete_state_prob, axis=1)
 
     def predict_proba(self) -> Array:
@@ -278,7 +279,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
             not hasattr(self, "smoother_discrete_state_prob")
             or self.smoother_discrete_state_prob is None
         ):
-            raise RuntimeError("Call fit() or fit_sgd() before predict_proba().")
+            raise NotFittedError("Call fit() or fit_sgd() before predict_proba().")
         return self.smoother_discrete_state_prob
 
     # ------------------------------------------------------------------
