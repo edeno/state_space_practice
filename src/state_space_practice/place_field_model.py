@@ -1291,6 +1291,16 @@ class PlaceFieldModel(SGDFittableMixin):
             for key, value in state.items():
                 setattr(self, key, value)
 
+        def _clear_posteriors() -> None:
+            # A non-finite first E-step has no accepted state to roll back
+            # to: drop the posteriors it installed so the model reads as
+            # unfitted (``_check_fitted``) instead of holding NaN output.
+            self.smoother_mean = None
+            self.smoother_cov = None
+            self.smoother_cross_cov = None
+            self.filtered_mean = None
+            self.filtered_cov = None
+
         def _e_step() -> float:
             return float(self._e_step(design_holder["design_matrix"], spikes))
 
@@ -1330,6 +1340,8 @@ class PlaceFieldModel(SGDFittableMixin):
             _restore_state,
             max_iter=max_iter,
             tol=tolerance,
+            on_first_nonfinite="clear",
+            clear_state=_clear_posteriors,
             logger=logger,
             on_iteration=_on_iteration,
             warn=_warn,

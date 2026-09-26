@@ -252,6 +252,50 @@ class TestPlaceFieldModelFit:
         assert model.process_cov is not None
         assert float(jnp.max(jnp.diag(model.process_cov))) < 1.0
 
+    _POSTERIOR_ATTRS = (
+        "smoother_mean",
+        "smoother_cov",
+        "smoother_cross_cov",
+        "filtered_mean",
+        "filtered_cov",
+    )
+
+    @pytest.mark.slow
+    def test_non_finite_first_e_step_leaves_model_unfitted(
+        self, sim_data: dict, caplog
+    ) -> None:
+        """A first E-step with a non-finite LL has no accepted state to roll
+        back to: the posteriors it installed are dropped, so the model is
+        visibly unfitted (bic/summary raise the not-fitted error rather than
+        an IndexError on the empty history) and a warning is logged."""
+        import logging
+
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        real_e_step = model._e_step
+        n_calls = []
+
+        def nan_e_step(*args, **kwargs):
+            real_e_step(*args, **kwargs)  # installs posteriors
+            n_calls.append(1)
+            return float("nan")
+
+        model._e_step = nan_e_step
+        with caplog.at_level(logging.WARNING):
+            lls = model.fit(
+                sim_data["position"], sim_data["spikes"], max_iter=3, verbose=False
+            )
+        assert len(n_calls) == 1  # guard: the injected E-step ran, EM stopped
+        assert lls == []
+        assert model.log_likelihoods == []
+        assert "non-finite" in caplog.text.lower()
+        for attr in self._POSTERIOR_ATTRS:
+            assert getattr(model, attr) is None, attr
+        assert "fitted=False" in repr(model)
+        with pytest.raises(RuntimeError, match="Call model.fit"):
+            model.bic()
+        with pytest.raises(RuntimeError, match="Call model.fit"):
+            model.summary()
+
     def test_repr_fitted(self, sim_data: dict) -> None:
         model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
         model.fit(
