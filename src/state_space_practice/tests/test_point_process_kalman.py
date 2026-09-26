@@ -3492,8 +3492,11 @@ class TestBlockDiagonalFilterEquivalence:
         """The block filter's jitted forward core keeps the option flags
         static, so calls with identical shapes (every SGD step / EM
         iteration) reuse one compilation even when the parameter values,
-        ``dt`` and ``max_log_count`` change."""
-        # A shape no other test uses, so the cache delta is attributable.
+        ``dt`` and ``max_log_count`` change.
+
+        The cache is cleared first, so the counts below do not depend on
+        what other tests (or earlier runs of this one) already compiled.
+        """
         init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
             n_neurons=2, block_size=5, T=27, seed=4
         )
@@ -3508,18 +3511,20 @@ class TestBlockDiagonalFilterEquivalence:
                 return_block_covariances=True,
             )
 
+        _block_diagonal_forward_core.clear_cache()
         first = run(1.0, dt, 20.0)
-        after_first = _block_diagonal_forward_core._cache_size()
+        assert _block_diagonal_forward_core._cache_size() == 1
         second = run(2.0, dt, 20.0)
         run(0.5, 0.03, 15.0)
-        assert _block_diagonal_forward_core._cache_size() == after_first
+        assert _block_diagonal_forward_core._cache_size() == 1
         # guard: the reused compilation really saw the new parameter values
         assert not np.allclose(np.asarray(first[1]), np.asarray(second[1]))
-        # A different static option is a different compilation.
+        # guard: the counter does register new compilations -- a different
+        # static option is one.
         _stochastic_point_process_filter_block_diagonal(
             structure, spikes, dt, include_laplace_normalization=False
         )
-        assert _block_diagonal_forward_core._cache_size() == after_first + 1
+        assert _block_diagonal_forward_core._cache_size() == 2
 
     def test_per_neuron_process_noise_gradient_matches_dense(self) -> None:
         """The gradient of the marginal LL w.r.t. each neuron's own process
@@ -3973,8 +3978,11 @@ class TestBlockDiagonalSmootherEquivalence:
     def test_block_cores_compile_once_across_repeated_calls(self) -> None:
         """The block cores are jitted with the option flags static, so calls
         with identical shapes (every EM iteration) reuse one compilation even
-        when the parameter values, ``dt`` and ``max_log_count`` change."""
-        # A shape no other test uses, so the cache delta is attributable.
+        when the parameter values, ``dt`` and ``max_log_count`` change.
+
+        The cache is cleared first, so the counts below do not depend on
+        what other tests (or earlier runs of this one) already compiled.
+        """
         init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
             n_neurons=2, block_size=5, T=23, seed=3
         )
@@ -3989,16 +3997,20 @@ class TestBlockDiagonalSmootherEquivalence:
                 return_block_covariances=True,
             )
 
-        run(1.0, dt, 20.0)
-        after_first = _block_diagonal_smoother_core._cache_size()
-        run(2.0, dt, 20.0)
+        _block_diagonal_smoother_core.clear_cache()
+        first = run(1.0, dt, 20.0)
+        assert _block_diagonal_smoother_core._cache_size() == 1
+        second = run(2.0, dt, 20.0)
         run(0.5, 0.03, 15.0)
-        assert _block_diagonal_smoother_core._cache_size() == after_first
-        # A different static option is a different compilation.
+        assert _block_diagonal_smoother_core._cache_size() == 1
+        # guard: the reused compilation really saw the new parameter values
+        assert not np.allclose(np.asarray(first[1]), np.asarray(second[1]))
+        # guard: the counter does register new compilations -- a different
+        # static option is one.
         _stochastic_point_process_smoother_block_diagonal(
             structure, spikes, dt, include_laplace_normalization=False
         )
-        assert _block_diagonal_smoother_core._cache_size() == after_first + 1
+        assert _block_diagonal_smoother_core._cache_size() == 2
 
     def test_shape_mismatch_guard(self) -> None:
         """Block dispatch with wrong n_neurons * block_size raises ValueError.
