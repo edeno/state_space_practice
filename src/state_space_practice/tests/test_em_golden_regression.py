@@ -497,15 +497,20 @@ EXPECTED: dict[str, FitResult] = {
             -155.23717657612875,
             -154.05010589987342,
         ],
+        # Recorded after the per-neuron block fix, not on the reference commit:
+        # there the block path smoothed every neuron with neuron 0's Q once the
+        # per-neuron Q differed by less than the equal-blocks tolerance, which
+        # put Q ~1e-13 off the dense path. These values agree with
+        # ``fit(..., force_dense=True)`` to ~1e-15.
         "process_cov_diag": [
-            1.0079999925098095e-06,
-            1.0079999879509389e-06,
-            1.0079999925098095e-06,
-            1.0079999895180506e-06,
-            1.0079999925098095e-06,
-            1.0079999892331212e-06,
-            1.0079999925098095e-06,
-            1.0080000140219807e-06,
+            1.007999991370092e-06,
+            1.0079999888057273e-06,
+            1.007999991370092e-06,
+            1.0079999906577684e-06,
+            1.007999991370092e-06,
+            1.0079999912276272e-06,
+            1.007999991370092e-06,
+            1.0080001194458653e-06,
         ],
         "transition_diag": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         "last_smoother_mean": [
