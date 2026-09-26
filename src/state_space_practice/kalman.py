@@ -373,24 +373,18 @@ def kalman_measurement_update(
     )
 
     residual_error = obs - obs_mean
-    # One stabilized factor of the innovation covariance serves the gain
-    # solve, the quadratic form and the log-determinant, so the likelihood
-    # sees the same matrix as the gain.
-    obs_cov_cho = psd_cholesky(obs_cov)
-    kalman_gain = jax.scipy.linalg.cho_solve(
-        obs_cov_cho, measurement_matrix @ prior_cov
-    ).T
+    kalman_gain = psd_solve(obs_cov, measurement_matrix @ prior_cov).T
 
     posterior_mean = prior_mean + kalman_gain @ residual_error
     posterior_cov = joseph_form_update(
         prior_cov, kalman_gain, measurement_matrix, measurement_cov
     )
 
-    n_obs = obs.shape[0]
-    marginal_log_likelihood = -0.5 * (
-        residual_error @ jax.scipy.linalg.cho_solve(obs_cov_cho, residual_error)
-        + psd_logdet(obs_cov_cho)
-        + n_obs * jnp.log(2.0 * jnp.pi)
+    # Evaluated on the unboosted innovation covariance (the stabilised solve
+    # above adds a tiny diagonal shift); keeping the two separate matches the
+    # established likelihood values that the EM convergence checks depend on.
+    marginal_log_likelihood = jnp.asarray(
+        jax.scipy.stats.multivariate_normal.logpdf(x=obs, mean=obs_mean, cov=obs_cov)
     )
 
     return posterior_mean, posterior_cov, marginal_log_likelihood

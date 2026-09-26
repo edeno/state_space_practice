@@ -801,10 +801,7 @@ def _point_process_laplace_update(
     # Prior precision via psd_solve for numerical stability
     n_latent = one_step_mean.shape[0]
     identity = jnp.eye(n_latent)
-    # One stabilized factor of the prior covariance serves both the prior
-    # precision and (under the Laplace correction) its log-determinant.
-    prior_cho = psd_cholesky(one_step_cov, diagonal_boost=diagonal_boost)
-    prior_precision = jax.scipy.linalg.cho_solve(prior_cho, identity)
+    prior_precision = psd_solve(one_step_cov, identity, diagonal_boost=diagonal_boost)
 
     def _neg_log_posterior(x: Array) -> Array:
         """Negative log-posterior for line search."""
@@ -942,8 +939,8 @@ def _point_process_laplace_update(
         # prior density and the Laplace integral.
         delta = posterior_mean - one_step_mean
         quad = delta @ (prior_precision @ delta)
-        logdet_prior = psd_logdet(prior_cho)
-        logdet_post = -psd_logdet(post_cho)  # log|P_post| = -log|precision|
+        logdet_prior = _logdet_psd(one_step_cov, diagonal_boost)
+        logdet_post = _logdet_psd(posterior_cov, diagonal_boost)
         log_prior = -0.5 * quad - 0.5 * logdet_prior
         log_likelihood = log_likelihood + log_prior + 0.5 * logdet_post
 
@@ -1086,10 +1083,7 @@ def glm_laplace_update(
 
     n_latent = one_step_mean.shape[0]
     identity = jnp.eye(n_latent)
-    # One stabilized factor of the prior covariance serves both the prior
-    # precision and (under the Laplace correction) its log-determinant.
-    prior_cho = psd_cholesky(one_step_cov, diagonal_boost=diagonal_boost)
-    prior_precision = jax.scipy.linalg.cho_solve(prior_cho, identity)
+    prior_precision = psd_solve(one_step_cov, identity, diagonal_boost=diagonal_boost)
 
     def _neg_log_posterior(x: Array) -> Array:
         eta = eta_func(x)
@@ -1164,8 +1158,8 @@ def glm_laplace_update(
     if include_laplace_normalization:
         delta = posterior_mean - one_step_mean
         quad = delta @ (prior_precision @ delta)
-        logdet_prior = psd_logdet(prior_cho)
-        logdet_post = -psd_logdet(post_cho)  # log|P_post| = -log|precision|
+        logdet_prior = _logdet_psd(one_step_cov, diagonal_boost)
+        logdet_post = _logdet_psd(posterior_cov, diagonal_boost)
         log_prior = -0.5 * quad - 0.5 * logdet_prior
         log_likelihood = log_likelihood + log_prior + 0.5 * logdet_post
 

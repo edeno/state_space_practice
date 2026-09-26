@@ -30,14 +30,12 @@ from jax.typing import ArrayLike
 
 from state_space_practice.kalman import (
     psd_cholesky,
-    psd_logdet,
     psd_solve,
     rts_backward_scan,
     symmetrize,
 )
-from state_space_practice.parameter_transforms import (
-    POSITIVE,
-)
+from state_space_practice.parameter_transforms import POSITIVE
+from state_space_practice.point_process_kalman import _logdet_psd
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import validate_choice_indices as _validate_choices
 
@@ -80,10 +78,8 @@ def _softmax_update_core(
     beta_sq = beta**2
     _obs_offset = obs_offset if obs_offset is not None else jnp.zeros(n_options)
 
-    # One stabilized factor of the prior covariance serves the precision and
-    # (below) its log-determinant.
-    prior_cho = psd_cholesky(prior_cov)
-    prior_precision = jax.scipy.linalg.cho_solve(prior_cho, eye_k)
+    # Prior precision
+    prior_precision = psd_solve(prior_cov, eye_k)
 
     # Fixed Newton iterations (unrolled for JIT compatibility)
     x = prior_mean
@@ -114,8 +110,8 @@ def _softmax_update_core(
     log_lik_at_mode = jax.nn.log_softmax(beta * v + _obs_offset)[choice]
     delta = x - prior_mean
     quad = delta @ (prior_precision @ delta)
-    logdet_prior = psd_logdet(prior_cho)
-    logdet_post = -psd_logdet(post_cho)  # log|Σ_post| = -log|precision|
+    logdet_prior = _logdet_psd(prior_cov)
+    logdet_post = _logdet_psd(posterior_cov)
     log_lik = log_lik_at_mode - 0.5 * quad - 0.5 * logdet_prior + 0.5 * logdet_post
 
     return x, posterior_cov, log_lik
