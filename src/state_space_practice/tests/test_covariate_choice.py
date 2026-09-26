@@ -902,6 +902,78 @@ class TestObservationCovariates:
             m.fit(np.array([0, 1, 2, 1, 0]))
 
 
+class TestRejectedFitPreservesState:
+    """A fit / fit_sgd call that fails validation leaves the previous fit intact.
+
+    The covariates bound by a fit feed ``choice_probabilities`` (via the
+    observation-covariate offsets) and the control input ``B u_t``, and the
+    trial count feeds ``bic``, so a rejected refit must not overwrite any of
+    them.
+    """
+
+    N_TRIALS = 60
+
+    @pytest.fixture
+    def fitted(self):
+        rng = np.random.default_rng(0)
+        choices = rng.integers(0, 3, size=self.N_TRIALS)
+        covariates = rng.standard_normal((self.N_TRIALS, 2))
+        obs_covariates = rng.standard_normal((self.N_TRIALS, 2))
+        model = CovariateChoiceModel(n_options=3, n_covariates=2, n_obs_covariates=2)
+        model.fit(
+            choices, covariates=covariates, obs_covariates=obs_covariates, max_iter=3
+        )
+        return (
+            model,
+            np.asarray(model.choice_probabilities()),
+            np.asarray(model._control_input()),
+            model.bic(),
+        )
+
+    @staticmethod
+    def _bad_call(case, rng, n_trials):
+        """Arguments for a refit rejected by validation (same-length inputs)."""
+        choices = rng.integers(0, 3, size=n_trials)
+        covariates = rng.standard_normal((n_trials, 2))
+        obs_covariates = rng.standard_normal((n_trials, 2))
+        if case == "invalid_choice":
+            choices[5] = 7
+        elif case == "too_few_trials":
+            choices, covariates, obs_covariates = (
+                choices[:1], covariates[:1], obs_covariates[:1]
+            )
+        elif case == "bad_covariates":
+            covariates = rng.standard_normal((n_trials, 3))
+        elif case == "bad_obs_covariates":
+            obs_covariates = rng.standard_normal((n_trials, 3))
+        return choices, covariates, obs_covariates
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize("method", ["fit", "fit_sgd"])
+    @pytest.mark.parametrize(
+        "case",
+        ["invalid_choice", "too_few_trials", "bad_covariates", "bad_obs_covariates"],
+    )
+    def test_rejected_refit_keeps_previous_fit(self, fitted, method, case):
+        model, probs_before, control_before, bic_before = fitted
+        choices, covariates, obs_covariates = self._bad_call(
+            case, np.random.default_rng(1), self.N_TRIALS
+        )
+
+        with pytest.raises(ValueError):
+            getattr(model, method)(
+                choices, covariates=covariates, obs_covariates=obs_covariates
+            )
+
+        np.testing.assert_array_equal(
+            np.asarray(model.choice_probabilities()), probs_before
+        )
+        np.testing.assert_array_equal(
+            np.asarray(model._control_input()), control_before
+        )
+        assert model.bic() == bic_before
+
+
 class TestDecayDynamics:
     """Tests for mean-reverting value decay (A = decay * I)."""
 

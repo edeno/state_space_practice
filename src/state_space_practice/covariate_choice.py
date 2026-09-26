@@ -676,18 +676,32 @@ class CovariateChoiceModel(MultinomialChoiceModel):
 
     def _bind_covariates(
         self,
+        choices: ArrayLike,
         covariates: ArrayLike | None,
         obs_covariates: ArrayLike | None,
         method: str,
     ) -> None:
-        """Store (and validate) the covariates used by the next fit."""
-        self._covariates = _coerce_covariates(
+        """Validate the fit inputs, then store the covariates used by the fit.
+
+        Everything (covariates and choices) is validated before anything is
+        assigned, so a call rejected by validation leaves a previous fit's
+        covariates and trial count untouched.
+        """
+        covariates_arr = _coerce_covariates(
             covariates, self.n_covariates, "covariates", "n_covariates", method
         )
-        self._obs_covariates = _coerce_covariates(
+        obs_covariates_arr = _coerce_covariates(
             obs_covariates, self.n_obs_covariates, "obs_covariates",
             "n_obs_covariates", method,
         )
+        n_trials = np.asarray(choices).shape[0]
+        if n_trials < 2:
+            raise ValueError(
+                f"{method}() needs at least 2 trials, got {n_trials}"
+            )
+        validate_choice_indices(choices, self.n_options)
+        self._covariates = covariates_arr
+        self._obs_covariates = obs_covariates_arr
 
     def fit(
         self,
@@ -723,7 +737,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         -------
         log_likelihoods : list of float
         """
-        self._bind_covariates(covariates, obs_covariates, "fit")
+        self._bind_covariates(choices, covariates, obs_covariates, "fit")
         return super().fit(
             choices,
             max_iter=max_iter,
@@ -765,7 +779,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         -------
         log_likelihoods : list of float
         """
-        self._bind_covariates(covariates, obs_covariates, "fit_sgd")
+        self._bind_covariates(choices, covariates, obs_covariates, "fit_sgd")
         return super().fit_sgd(
             choices,
             optimizer=optimizer,
