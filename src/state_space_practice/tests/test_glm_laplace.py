@@ -316,3 +316,59 @@ class TestCarriedLineSearch:
         np.testing.assert_allclose(
             np.asarray(post_cov), np.asarray(ref_cov), rtol=1e-11, atol=1e-12
         )
+
+
+class TestZeroNewtonIterations:
+    """``max_newton_iter=0`` performs no measurement update: the prior is returned.
+
+    ``PositionDecoder`` accepts ``max_newton_iter=0``. With no Fisher step the
+    posterior must be the prior itself -- mean *and* covariance -- and the
+    Laplace log-evidence collapses to the log-likelihood at the prior mean
+    (the ``log|P_post| - log|P_prior|`` normalization term cancels). A
+    covariance shrunk by the Fisher information at an unmoved mean would be
+    an inconsistent posterior.
+    """
+
+    _Y_POISSON = jnp.array([0.0, 1.0, 2.0, 0.0])
+    _Y_BERNOULLI = jnp.array([1.0, 0.0, 1.0, 1.0])
+
+    def _assert_prior_returned(self, post_mean, post_cov, ll, expected_ll):
+        np.testing.assert_array_equal(np.asarray(post_mean), np.asarray(_MEAN))
+        # The covariance is the prior precision inverted back, each inversion
+        # regularized by diagonal_boost=1e-9, so it matches to ~1e-9.
+        np.testing.assert_allclose(
+            np.asarray(post_cov), np.asarray(_COV), rtol=1e-8, atol=1e-10
+        )
+        # Same regularization residue in 0.5 * (log|P_post| - log|P_prior|).
+        np.testing.assert_allclose(float(ll), float(expected_ll), rtol=1e-8, atol=1e-8)
+
+    def test_point_process_update_returns_prior(self):
+        post_mean, post_cov, ll = _point_process_laplace_update(
+            _MEAN, _COV, self._Y_POISSON, _DT, _eta, max_newton_iter=0
+        )
+        expected_ll = jnp.sum(
+            jax.scipy.stats.poisson.logpmf(self._Y_POISSON, jnp.exp(_eta(_MEAN)) * _DT)
+        )
+        self._assert_prior_returned(post_mean, post_cov, ll, expected_ll)
+
+    @pytest.mark.parametrize(
+        "family, y",
+        [(poisson_family(_DT), _Y_POISSON), (BERNOULLI_LOGIT_FAMILY, _Y_BERNOULLI)],
+        ids=["poisson", "bernoulli"],
+    )
+    def test_glm_update_returns_prior(self, family, y):
+        post_mean, post_cov, ll = glm_laplace_update(
+            _MEAN, _COV, y, _eta, family, max_newton_iter=0
+        )
+        eta = _eta(_MEAN)
+        expected_ll = family.loglik_normalized(y, eta, family.mean(eta))
+        self._assert_prior_returned(post_mean, post_cov, ll, expected_ll)
+
+    def test_one_iteration_does_update(self):
+        """Guard: the same data does move the posterior with one Fisher step,
+        so the zero-iteration assertions above are not vacuous."""
+        post_mean, post_cov, _ = _point_process_laplace_update(
+            _MEAN, _COV, self._Y_POISSON, _DT, _eta, max_newton_iter=1
+        )
+        assert float(jnp.max(jnp.abs(post_mean - _MEAN))) > 1e-3
+        assert float(jnp.trace(post_cov)) < float(jnp.trace(_COV)) - 1e-3

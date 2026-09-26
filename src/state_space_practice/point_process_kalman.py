@@ -826,6 +826,7 @@ def _soft_expected_count_and_log(
 
 def _fisher_scoring_line_search(
     x0: Array,
+    prior_precision: Array,
     fisher_step_at: Callable[[Array], tuple[Array, Array, Array]],
     neg_log_posterior: Callable[[Array], Array],
     max_newton_iter: int,
@@ -838,6 +839,9 @@ def _fisher_scoring_line_search(
     ``(delta, post_prec, gradient)`` -- the Fisher direction and posterior
     precision at ``x`` -- and ``neg_log_posterior(x)`` the objective the
     line search decreases.
+
+    With ``max_newton_iter == 0`` no measurement update is made: the prior
+    ``(x0, prior_precision)`` is returned unchanged.
 
     The scan carries ``(x, delta, post_prec, loss)``, i.e. the Fisher step and
     the objective *at the current point*. Both are computed exactly once, when
@@ -896,6 +900,8 @@ def _fisher_scoring_line_search(
         new_delta, new_post_prec, _ = fisher_step_at(new_x)
         return (new_x, new_delta, new_post_prec, new_loss), None
 
+    if max_newton_iter == 0:
+        return x0, prior_precision
     delta0, post_prec0, _ = fisher_step_at(x0)
     (x, _, post_prec, _), _ = jax.lax.scan(
         _line_search_step,
@@ -1117,9 +1123,11 @@ def _point_process_laplace_update(
         post_cho = psd_cholesky(posterior_precision, diagonal_boost=diagonal_boost)
         posterior_mean = one_step_mean + jax.scipy.linalg.cho_solve(post_cho, gradient)
     else:
-        # Iterative Fisher scoring with line search, started at the prior mean.
+        # Iterative Fisher scoring with line search, started at the prior mean
+        # (zero iterations return the prior unchanged).
         posterior_mean, posterior_precision = _fisher_scoring_line_search(
             one_step_mean,
+            prior_precision,
             _fisher_step_at,
             _neg_log_posterior,
             max_newton_iter,
@@ -1334,6 +1342,7 @@ def glm_laplace_update(
     else:
         posterior_mean, posterior_precision = _fisher_scoring_line_search(
             one_step_mean,
+            prior_precision,
             _fisher_step_at,
             _neg_log_posterior,
             max_newton_iter,
