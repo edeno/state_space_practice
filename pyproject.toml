@@ -4,31 +4,36 @@ build-backend = "hatchling.build"
 
 [project]
 name = "state_space_practice"
-description = ""
+description = "State-space models in JAX: Kalman, point-process (Laplace-EKF), switching (SLDS) and coupled-oscillator models for neural data."
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = { file = "LICENSE" }
+keywords = [
+    "state-space models",
+    "kalman filter",
+    "point process",
+    "switching linear dynamical system",
+    "neural decoding",
+    "oscillators",
+    "jax",
+    "neuroscience",
+]
 authors = [{ name = "Eric Denovellis", email = "eric.denovellis@ucsf.edu" }]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
+# Only what the package imports. Floors are the lowest versions in uv.lock (the
+# Python 3.10 resolution), i.e. the oldest versions CI actually exercises.
 dependencies = [
-    "numpy",
-    "scipy",
-    "jax",
-    "jaxlib",
-    "pandas",
-    "networkx",
-    "xarray",
-    "scikit-learn",
-    "patsy",
-    "tqdm",
-    "track_linearization",
-    "matplotlib",
-    "seaborn",
-    "optax",
+    "numpy>=2.2.6",
+    "scipy>=1.15.3",
+    "jax>=0.6.2",
+    "optax>=0.2.8",
+    "patsy>=1.0.2",
+    "networkx>=3.4.2",
+    "scikit-learn>=1.7.2",
 ]
 dynamic = ["version"]
 
@@ -37,10 +42,22 @@ dynamic = ["version"]
 "Bug Tracker" = "https://github.com/edeno/state_space_practice/issues"
 
 [project.optional-dependencies]
-test = ["black", "pytest", "pytest-cov", "hypothesis", "ruff", "mypy"]
-coupling = ["polyagamma"]
-# Graph place-field substrate (graph_place_field). Optional so core installs stay
-# reproducible until neurospatial 0.8.0 is published to PyPI (see [tool.uv.sources]).
+test = [
+    "pytest>=9.1",
+    "pytest-cov>=7.1",
+    "hypothesis>=6.155",
+    "ruff>=0.15.18",
+    "mypy>=2.1",
+    "matplotlib>=3.10.9",
+]
+coupling = ["polyagamma>=2.0.2"]
+# All plotting helpers import matplotlib lazily, inside the plot functions.
+plot = ["matplotlib>=3.10.9"]
+# Extra packages used by the exploratory scripts in notebooks/ (not by the library).
+notebooks = ["matplotlib>=3.10.9", "pandas>=2.3.3"]
+# Graph place-field substrate (graph_place_field). neurospatial 0.8.0 is not on PyPI
+# yet; uv resolves it from the pinned git source below. With pip, install
+# neurospatial from GitHub first (see README).
 spatial = ["neurospatial>=0.8.0"]
 gpu = ["jax[cuda]"]
 viz = ["sortingview"]
@@ -56,6 +73,7 @@ exclude = [".git_archival.txt"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/state_space_practice"]
+exclude = ["src/state_space_practice/tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["src/state_space_practice/tests"]
@@ -92,7 +110,7 @@ warn_return_any = true
 warn_unused_ignores = true
 
 [tool.uv.sources]
-# Temporary: neurospatial 0.8.0 (the version the `spatial` extra requires) is not yet
-# on PyPI. Remove this local editable override once 0.8.0 is published; the `>=0.8.0`
-# pin in the `spatial` optional-dependency then resolves from PyPI.
-neurospatial = { path = "../neurospatial", editable = true }
+# neurospatial 0.8.0 (required by the `spatial` extra) is not yet on PyPI and the
+# upstream repo has no v0.8.0 tag, so pin the commit on main whose pyproject declares
+# version 0.8.0. Replace with a plain PyPI requirement once 0.8.0 is published.
+neurospatial = { git = "https://github.com/edeno/neurospatial", rev = "e81dec62dbada29c70cfb3640488f429cae20608" }
