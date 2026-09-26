@@ -13,6 +13,7 @@ from state_space_practice.point_process_kalman import (
     BlockDiagonalCovariance,
     BlockDiagonalStructure,
     PointProcessModel,
+    _block_diagonal_forward_core,
     _block_diagonal_parameters_ok,
     _block_diagonal_smoother_core,
     _build_block_structure_from_traced,
@@ -3482,6 +3483,39 @@ class TestBlockDiagonalFilterEquivalence:
             atol=1e-8,
             rtol=1e-9,
         )
+
+    def test_forward_core_compiles_once_across_repeated_calls(self) -> None:
+        """The block filter's jitted forward core keeps the option flags
+        static, so calls with identical shapes (every SGD step / EM
+        iteration) reuse one compilation even when the parameter values,
+        ``dt`` and ``max_log_count`` change."""
+        # A shape no other test uses, so the cache delta is attributable.
+        init_mean, init_cov, A, Q, Z, spikes, dt = self._make_problem(
+            n_neurons=2, block_size=5, T=27, seed=4
+        )
+        structure = _block_structure(init_mean, init_cov, A, Q, Z)
+
+        def run(q_scale: float, dt_value: float, max_log_count: float):
+            return _stochastic_point_process_filter_block_diagonal(
+                structure._replace(Q_block=structure.Q_block * q_scale),
+                spikes,
+                dt_value,
+                max_log_count=max_log_count,
+                return_block_covariances=True,
+            )
+
+        first = run(1.0, dt, 20.0)
+        after_first = _block_diagonal_forward_core._cache_size()
+        second = run(2.0, dt, 20.0)
+        run(0.5, 0.03, 15.0)
+        assert _block_diagonal_forward_core._cache_size() == after_first
+        # guard: the reused compilation really saw the new parameter values
+        assert not np.allclose(np.asarray(first[1]), np.asarray(second[1]))
+        # A different static option is a different compilation.
+        _stochastic_point_process_filter_block_diagonal(
+            structure, spikes, dt, include_laplace_normalization=False
+        )
+        assert _block_diagonal_forward_core._cache_size() == after_first + 1
 
     def test_filtered_cov_is_block_diagonal(self) -> None:
         """The block filter's reassembled filtered_cov should be
