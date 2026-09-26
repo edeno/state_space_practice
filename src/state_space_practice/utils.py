@@ -99,6 +99,18 @@ def psd_logdet(cho: tuple[jax.Array, bool]) -> jax.Array:
     ``2 * sum(log|diag(factor)|)`` for the stabilized matrix that was
     factored, so a caller reusing one factor for a solve and a
     log-determinant sees the same matrix in both.
+
+    Parameters
+    ----------
+    cho : tuple[jax.Array, bool]
+        The ``(factor, lower)`` tuple returned by :func:`psd_cholesky`;
+        ``factor`` has shape ``(..., n, n)`` (a single matrix or a batch).
+
+    Returns
+    -------
+    logdet : jax.Array, shape (...)
+        Log-determinant of each stabilized matrix (a scalar array for a
+        single ``(n, n)`` factor).
     """
     diag = jnp.diagonal(cho[0], axis1=-2, axis2=-1)
     return 2.0 * jnp.sum(jnp.log(jnp.abs(diag)), axis=-1)
@@ -203,8 +215,15 @@ def clip_eigenvalues(
     Parameters
     ----------
     mat : jax.Array, shape (n, n)
+        Matrix to clip; only its symmetric part is used.
     min_eigenvalue, max_eigenvalue : float or None
         Lower / upper bound on the eigenvalues; ``None`` leaves that side open.
+
+    Returns
+    -------
+    clipped : jax.Array, shape (n, n)
+        Symmetric matrix with the same eigenvectors as ``symmetrize(mat)`` and
+        its eigenvalues clipped into ``[min_eigenvalue, max_eigenvalue]``.
     """
     eigvals, eigvecs = jnp.linalg.eigh(symmetrize(mat))
     if min_eigenvalue is not None:
@@ -431,14 +450,45 @@ def validate_count_array(
 
 
 def validate_finite_array(name: str, value: ArrayLike) -> None:
-    """Validate finite model parameters at public boundaries."""
+    """Validate finite model parameters at public boundaries.
+
+    Host-side check (it forces a device-to-host sync), so call it on concrete
+    values before JIT dispatch, not inside traced code.
+
+    Parameters
+    ----------
+    name : str
+        Parameter name used in the error message.
+    value : ArrayLike, any shape
+        Values to check.
+
+    Raises
+    ------
+    ValueError
+        If any entry is NaN or infinite.
+    """
     arr = jnp.asarray(value)
     if bool(jnp.any(~jnp.isfinite(arr))):
         raise ValueError(f"{name} must contain only finite values.")
 
 
 def validate_nonnegative_array(name: str, value: ArrayLike) -> None:
-    """Validate finite, non-negative model parameters at public boundaries."""
+    """Validate finite, non-negative model parameters at public boundaries.
+
+    Host-side check; see :func:`validate_finite_array`.
+
+    Parameters
+    ----------
+    name : str
+        Parameter name used in the error message.
+    value : ArrayLike, any shape
+        Values to check.
+
+    Raises
+    ------
+    ValueError
+        If any entry is non-finite or negative.
+    """
     arr = jnp.asarray(value)
     validate_finite_array(name, arr)
     if bool(jnp.any(arr < 0)):
@@ -446,7 +496,22 @@ def validate_nonnegative_array(name: str, value: ArrayLike) -> None:
 
 
 def validate_unit_interval_array(name: str, value: ArrayLike) -> None:
-    """Validate finite parameters constrained to the closed unit interval."""
+    """Validate finite parameters constrained to the closed unit interval.
+
+    Host-side check; see :func:`validate_finite_array`.
+
+    Parameters
+    ----------
+    name : str
+        Parameter name used in the error message.
+    value : ArrayLike, any shape
+        Values to check.
+
+    Raises
+    ------
+    ValueError
+        If any entry is non-finite or outside ``[0, 1]``.
+    """
     arr = jnp.asarray(value)
     validate_finite_array(name, arr)
     if bool(jnp.any((arr < 0) | (arr > 1))):
@@ -462,9 +527,32 @@ def validate_int(
 ) -> int:
     """Validate an integer configuration value at a public boundary.
 
-    Accepts anything ``operator.index`` accepts (Python / NumPy integers, not
-    floats or arrays) and returns it as a plain ``int``. Raises ``ValueError``
-    on non-integers and on values outside the requested range.
+    Accepts exactly what ``operator.index`` accepts: Python and NumPy
+    integers, 0-d integer NumPy / JAX arrays, and ``bool`` (``True`` -> 1,
+    since ``bool`` subclasses ``int``). Floats (even integer-valued ones) and
+    arrays with ``ndim >= 1`` are rejected.
+
+    Parameters
+    ----------
+    value : object
+        Value to validate.
+    name : str
+        Parameter name used in the error message.
+    positive : bool, default=False
+        Require ``value > 0``.
+    nonnegative : bool, default=False
+        Require ``value >= 0``.
+
+    Returns
+    -------
+    value_int : int
+        ``value`` as a plain Python ``int``.
+
+    Raises
+    ------
+    ValueError
+        If ``value`` is not an integer (as above) or is outside the requested
+        range.
     """
     kind = "positive" if positive else "non-negative" if nonnegative else "an"
     article = "a " if kind != "an" else ""

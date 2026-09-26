@@ -22,6 +22,7 @@ from state_space_practice.utils import (
     stabilize_transition_matrix,
     symmetrize,
     validate_covariance,
+    validate_int,
     validate_probability_vector,
     validate_transition_matrix,
     zero_preserving_log,
@@ -563,6 +564,41 @@ class TestValidateProbabilityVector:
     def test_matrix_raises(self) -> None:
         with pytest.raises(ValueError, match="1D probability vector"):
             validate_probability_vector(jnp.array([[0.25, 0.25], [0.25, 0.25]]))
+
+
+class TestValidateInt:
+    """validate_int accepts exactly what ``operator.index`` accepts."""
+
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            (3, 3),
+            (np.int32(3), 3),
+            (np.array(3), 3),
+            (jnp.array(3), 3),
+            (True, 1),
+        ],
+        ids=["int", "np_int32", "np_0d", "jax_0d", "bool"],
+    )
+    def test_accepts_integer_like(self, value, expected: int) -> None:
+        result = validate_int(value, "n")
+        assert type(result) is int and result == expected
+
+    @pytest.mark.parametrize(
+        "value",
+        [3.0, np.float64(3.0), np.array([3]), "3", None],
+        ids=["float", "np_float", "1d_array", "str", "none"],
+    )
+    def test_rejects_non_integers(self, value) -> None:
+        with pytest.raises(ValueError, match="n must be an integer"):
+            validate_int(value, "n")
+
+    def test_range_checks(self) -> None:
+        assert validate_int(0, "n", nonnegative=True) == 0
+        with pytest.raises(ValueError, match="n must be a positive integer"):
+            validate_int(0, "n", positive=True)
+        with pytest.raises(ValueError, match="n must be a non-negative integer"):
+            validate_int(-1, "n", nonnegative=True)
 
 
 class TestDiscreteStateUtilities:
