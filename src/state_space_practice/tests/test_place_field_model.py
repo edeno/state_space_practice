@@ -1760,31 +1760,32 @@ class TestBlockDiagonalDispatch:
         )
         lls = model.fit(position, spikes, max_iter=2, verbose=False)
 
-        # After the first M-step, A may no longer be block-diagonal
-        # (the M-step formula produces a full matrix when
-        # update_transition_matrix=True). The re-detect logic should
-        # set _block_n_neurons=None in that case, falling back to dense.
-        # We don't strictly require the fall-back to happen (if the
-        # learned A happens to be block-diagonal by luck, detection
-        # still succeeds), but the fit must complete without crashing.
+        # After the first M-step A is no longer block-diagonal (the
+        # M-step formula produces a full matrix when
+        # update_transition_matrix=True). The re-detect logic must set
+        # _block_n_neurons=None, falling back to dense, and the fit must
+        # complete.
         assert len(lls) >= 1
         assert all(np.isfinite(ll) for ll in lls)
         assert model.smoother_mean is not None
-        # If the M-step did produce a non-block-diagonal A, verify
-        # that fall-back happened and the dense path produced the fit.
         from state_space_practice.point_process_kalman import (
-            _is_block_diagonal,
+            _block_diagonal_parameters_ok,
         )
 
-        if not _is_block_diagonal(
-            model.transition_matrix,
-            n_blocks=2,
-            block_size=model.n_basis_per_neuron,
-        ):
-            assert model._block_n_neurons is None, (
-                "A became non-block-diagonal but re-detect did not "
-                "flip the dispatch to dense"
+        # Guard: the learned parameters really broke the block structure.
+        assert not bool(
+            _block_diagonal_parameters_ok(
+                model.init_cov,
+                model.transition_matrix,
+                model.process_cov,
+                n_neurons=2,
+                block_size=model.n_basis_per_neuron,
             )
+        )
+        assert model._block_n_neurons is None, (
+            "the parameters broke the block structure but re-detect did "
+            "not flip the dispatch to dense"
+        )
 
     def test_block_path_never_expands_the_design_matrix(self, monkeypatch) -> None:
         """On the block path the filter works from Z_base; the

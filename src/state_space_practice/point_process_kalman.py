@@ -84,61 +84,6 @@ def _validate_filter_numerics(
     )
 
 
-def _is_block_diagonal(
-    mat: Array,
-    n_blocks: int,
-    block_size: int,
-    atol: float = 1e-10,
-) -> bool:
-    """Check whether a square matrix has block-diagonal structure.
-
-    Returns True iff ``mat`` is a ``(n_blocks*block_size, n_blocks*block_size)``
-    matrix whose off-diagonal blocks are all zero within ``atol``.
-
-    Parameters
-    ----------
-    mat : Array, shape (n, n) where n = n_blocks * block_size
-        Matrix to check.
-    n_blocks : int
-        Number of diagonal blocks.
-    block_size : int
-        Size of each block (matching block size across all blocks).
-    atol : float, default=1e-10
-        Absolute tolerance for zero off-diagonal blocks, applied to
-        ``max|off_block_entries|``. The default is conservative for f64;
-        callers on f32 should pass a larger value.
-
-    Returns
-    -------
-    bool
-        True if the off-diagonal blocks are all zero within tolerance.
-        False otherwise (including shape mismatches — non-square or wrong
-        total size returns False, not an error).
-    """
-    if mat.ndim != 2 or mat.shape[0] != mat.shape[1]:
-        return False
-    expected = n_blocks * block_size
-    if mat.shape[0] != expected:
-        return False
-    if n_blocks == 1:
-        # Trivially block-diagonal: single block IS the whole matrix.
-        return True
-
-    # Materialize an off-block mask (n, n) that is True outside the
-    # block-diagonal structure. This is cheap vs the alternative of
-    # iterating over all (n_blocks choose 2) off-block positions.
-    #
-    # jnp.kron rejects bool dtype, so we build the mask with int32
-    # and convert to bool for jnp.where.
-    eye_blocks = jnp.eye(n_blocks, dtype=jnp.int32)
-    ones_block = jnp.ones((block_size, block_size), dtype=jnp.int32)
-    # Kronecker-expand: entries are 1 where the block-diagonal structure
-    # allows, 0 elsewhere. Convert to bool for masked-where.
-    block_mask = jnp.kron(eye_blocks, ones_block).astype(bool)
-    off_block_max = float(jnp.max(jnp.abs(jnp.where(block_mask, 0.0, mat))))
-    return off_block_max <= atol
-
-
 class BlockDiagonalStructure(NamedTuple):
     """Factored block-diagonal filter problem.
 
@@ -146,6 +91,19 @@ class BlockDiagonalStructure(NamedTuple):
     where ``A``, ``Q``, ``init_cov``, and the design matrix ``Z`` are all
     block-diagonal across neurons with the same per-neuron block size,
     AND the ``A`` and ``Q`` diagonal blocks are identical across neurons.
+
+    The block-diagonal contract, for ``n_neurons`` blocks of ``block_size``:
+
+    1. Design: every neuron row ``Z[t, j]`` is zero outside its own state
+       slice ``[j*block_size : (j+1)*block_size]`` and the in-slice part is
+       the same shared basis ``Z_base[t]`` for all neurons, with the default
+       linear log-intensity ``Z_base[t] @ x_j``. Not checked by the library:
+       it holds by construction for ``PlaceFieldModel``, which builds every
+       neuron's row from one spline basis.
+    2. Parameters: ``init_cov``, ``A`` and ``Q`` are block-diagonal and every
+       diagonal block of ``A`` (and of ``Q``) equals block 0. Checked by
+       :func:`_block_diagonal_parameters_ok`. ``init_cov`` may differ per
+       neuron.
 
     The dense-form filter can be replaced by a vmapped per-neuron scan
     using these components — see ``_stochastic_point_process_filter_
@@ -156,20 +114,17 @@ class BlockDiagonalStructure(NamedTuple):
     Attributes
     ----------
     A_block : Array, shape (block_size, block_size)
-        Per-neuron transition matrix (same across neurons — verified
-        at detection time).
+        Per-neuron transition matrix (same across neurons, contract item 2).
     Q_block : Array, shape (block_size, block_size)
-        Per-neuron process noise covariance (same across neurons —
-        verified at detection time).
+        Per-neuron process noise covariance (same across neurons, contract
+        item 2).
     init_means_per_neuron : Array, shape (n_neurons, block_size)
         Per-neuron initial mean, sliced out of the concatenated state vector.
     init_covs_per_neuron : Array, shape (n_neurons, block_size, block_size)
         Per-neuron initial covariance, sliced out of the block-diagonal
         init_cov.
     Z_base : Array, shape (n_time, block_size)
-        Shared spline basis. Identical across neurons because the
-        upstream design_matrix was built by block-diagonalizing a
-        single Z_base — verified at detection time.
+        Shared spline basis, identical across neurons (contract item 1).
     n_neurons : int
         Number of neurons.
     block_size : int
@@ -388,12 +343,17 @@ def _block_diagonal_parameters_ok(
     True iff ``init_cov``, ``transition_matrix`` and ``process_cov`` are
     block-diagonal with ``n_neurons`` blocks of ``block_size`` and every
     diagonal block of ``transition_matrix`` (and of ``process_cov``) equals
-    its block 0 -- requirements 3 and 4 of
-    :func:`_detect_block_diagonal_problem`, under the same tolerance model
-    (``atol * max(1, max|mat|)`` per matrix). One fused device computation
-    returning a boolean scalar, so a caller pays a single host sync
-    (``bool(...)``) instead of a Python loop of ``float()`` syncs;
-    ``PlaceFieldModel`` runs it after every EM M-step.
+    its block 0 -- item 2 of the :class:`BlockDiagonalStructure` contract.
+    One fused device computation returning a boolean scalar, so a caller
+    pays a single host sync (``bool(...)``) instead of a Python loop of
+    ``float()`` syncs; ``PlaceFieldModel`` runs it at fit entry and after
+    every EM M-step.
+
+    Tolerance model: the off-block-zero and block-equality checks for each
+    matrix use ``atol * max(1, max|mat|)``, so matrices with O(1) entries
+    use the absolute floor while large-magnitude covariances get a
+    proportionally larger tolerance. For f32 inputs pass a larger ``atol``
+    (typically ``1e-6`` to ``1e-5``).
     """
     off_block = ~jnp.eye(n_neurons, dtype=bool)
 
@@ -415,158 +375,6 @@ def _block_diagonal_parameters_ok(
     return ok
 
 
-@functools.partial(
-    jax.jit, static_argnames=("n_neurons", "block_size", "atol")
-)
-def _shared_block_basis_ok(
-    design_matrix: Array,
-    *,
-    n_neurons: int,
-    block_size: int,
-    atol: float = 1e-10,
-) -> Array:
-    """Vectorised check of the design half of the block-diagonal contract.
-
-    True iff every neuron row ``design_matrix[t, j]`` is zero outside its
-    own state slice and the in-slice part is the same for all neurons (a
-    shared ``Z_base``) -- requirement 2 of
-    :func:`_detect_block_diagonal_problem`, with its tolerance model.
-    """
-    n_time = design_matrix.shape[0]
-    blocks = design_matrix.reshape(n_time, n_neurons, n_neurons, block_size)
-    off_block = ~jnp.eye(n_neurons, dtype=bool)
-    tol = _scaled_atol(design_matrix, atol)
-    off_max = jnp.max(jnp.where(off_block[None, :, :, None], jnp.abs(blocks), 0.0))
-    idx = jnp.arange(n_neurons)
-    own_slices = blocks[:, idx, idx]  # (n_time, n_neurons, block_size)
-    spread = jnp.max(jnp.abs(own_slices - own_slices[:, :1]))
-    return (off_max <= tol) & (spread <= tol)
-
-
-def _detect_block_diagonal_problem(
-    init_mean: Array,
-    init_cov: Array,
-    transition_matrix: Array,
-    process_cov: Array,
-    design_matrix: Array,
-    atol: float = 1e-10,
-) -> BlockDiagonalStructure | None:
-    """Detect whether a filter problem has block-diagonal structure.
-
-    Returns a ``BlockDiagonalStructure`` with the per-neuron factors if
-    the problem is block-diagonal, or ``None`` otherwise. Call sites use
-    a non-None return as a green light to dispatch to the block-diagonal
-    filter path.
-
-    Requirements for detection to succeed:
-
-    1. ``design_matrix`` has shape ``(n_time, n_neurons, n_state)`` with
-       ``n_state = n_neurons * block_size`` — i.e., the multi-neuron
-       block-diagonal shape produced by
-       ``PlaceFieldModel._build_block_diagonal``.
-    2. For every time bin, each neuron row ``design_matrix[t, j]`` is
-       zero outside the slice ``[j*block_size : (j+1)*block_size]``, and
-       the non-zero slice is identical *across neurons* (same shared
-       spline basis used by every neuron).
-    3. ``transition_matrix``, ``process_cov``, and ``init_cov`` are all
-       block-diagonal with matching ``block_size``.
-    4. All neurons share the same per-neuron transition and process
-       matrices — i.e., every diagonal block of ``A`` (and of ``Q``) is
-       equal to the block-0 slice. Heterogeneous per-neuron dynamics
-       are not detected as block-diagonal even though they technically
-       qualify — that case would require storing
-       ``(n_neurons, block_size, block_size)`` A/Q arrays and is deferred
-       until there's a caller that needs it.
-
-    This is pure detection logic with no side effects — always safe to
-    call, returns None on any shape mismatch or non-block-diagonal input.
-
-    Tolerance model
-    ---------------
-    The off-block-zero and block-equality checks use a relative-absolute
-    mix: ``effective_atol = atol * max(1, max|mat|)``. This scales the
-    absolute ``atol`` (default ``1e-10``) up for matrices with large
-    entries (e.g. transition matrices with O(1) entries still use the
-    absolute floor, while covariance matrices with O(1e6) entries get a
-    proportionally larger tolerance). For f32 callers, pass a larger
-    ``atol`` — typical values are ``1e-6`` to ``1e-5``.
-
-    Parameters
-    ----------
-    init_mean : Array, shape (n_state,)
-    init_cov : Array, shape (n_state, n_state)
-    transition_matrix : Array, shape (n_state, n_state)
-    process_cov : Array, shape (n_state, n_state)
-    design_matrix : Array
-        If ndim == 2, treated as single-neuron ``(n_time, n_state)`` and
-        returns ``None`` (no block structure to exploit).
-        If ndim == 3, must be ``(n_time, n_neurons, n_state)``.
-    atol : float, default=1e-10
-        Absolute tolerance floor; scaled by ``max(1, max|mat|)`` per-check
-        for relative robustness to matrix magnitude.
-
-    Returns
-    -------
-    BlockDiagonalStructure or None
-    """
-    # Single-neuron design matrices are (n_time, n_state), not
-    # (n_time, 1, n_state). The block-diagonal filter gives no benefit
-    # at n_neurons=1 (block_size == n_state, same as the dense filter),
-    # so return None to dispatch to dense.
-    if design_matrix.ndim != 3:
-        return None
-
-    _n_time, n_neurons, n_state = design_matrix.shape
-    if n_neurons < 2:
-        # Genuinely single-neuron problem — dense filter is optimal.
-        return None
-    if n_state % n_neurons != 0:
-        return None
-    block_size = n_state // n_neurons
-    square = (n_state, n_state)
-    if (
-        init_mean.shape != (n_state,)
-        or init_cov.shape != square
-        or transition_matrix.shape != square
-        or process_cov.shape != square
-    ):
-        return None
-
-    # Both halves of the contract as fused device computations: the
-    # parameter matrices (block-diagonal, identical A / Q blocks) and the
-    # design matrix (zero outside each neuron's own slice, shared Z_base).
-    # One host sync for the combined verdict instead of a Python loop of
-    # per-block float() conversions.
-    ok = _block_diagonal_parameters_ok(
-        init_cov,
-        transition_matrix,
-        process_cov,
-        n_neurons=n_neurons,
-        block_size=block_size,
-        atol=atol,
-    ) & _shared_block_basis_ok(
-        design_matrix, n_neurons=n_neurons, block_size=block_size, atol=atol
-    )
-    if not bool(ok):
-        return None
-
-    # A_block / Q_block from the (0, 0) slice — verified above to equal
-    # every other diagonal block. init_cov is allowed to have DIFFERENT
-    # diagonal blocks per neuron (the warm-start fits a separate stationary
-    # GLM per neuron and produces a block-diagonal cov where each block is
-    # that neuron's Laplace posterior), so it is kept per neuron. Z_base is
-    # neuron 0's own slice (verified to be shared by all neurons).
-    return BlockDiagonalStructure(
-        A_block=transition_matrix[:block_size, :block_size],
-        Q_block=process_cov[:block_size, :block_size],
-        init_means_per_neuron=init_mean.reshape(n_neurons, block_size),
-        init_covs_per_neuron=_diagonal_blocks(init_cov, n_neurons, block_size),
-        Z_base=design_matrix[:, 0, 0:block_size],
-        n_neurons=n_neurons,
-        block_size=block_size,
-    )
-
-
 def _build_block_structure_from_traced(
     init_mean: Array,
     init_cov: Array,
@@ -578,9 +386,9 @@ def _build_block_structure_from_traced(
 ) -> BlockDiagonalStructure:
     """Build a BlockDiagonalStructure from traced arrays using pure slicing.
 
-    Unlike the detection helpers -- whose verdict must be read back on the
-    host (``bool(...)``) and which therefore cannot run inside ``jax.jit``
-    / ``jax.grad`` -- this helper assumes the caller has ALREADY verified
+    Unlike :func:`_block_diagonal_parameters_ok` -- whose verdict must be
+    read back on the host (``bool(...)``) and which therefore cannot gate a
+    branch inside ``jax.jit`` / ``jax.grad`` -- this helper assumes the caller has ALREADY verified
     block-diagonal structure (at fit entry time, with concrete arrays) and
     simply extracts the per-neuron factors via static slicing. It runs
     safely inside the jit boundary because ``n_neurons`` and ``block_size``
@@ -589,8 +397,8 @@ def _build_block_structure_from_traced(
 
     Used by ``stochastic_point_process_filter``'s auto-dispatch path:
     the caller verifies the structure once at fit entry
-    (``_detect_block_diagonal_problem``, or ``PlaceFieldModel``'s
-    parameter-only ``_block_diagonal_parameters_ok`` check) to get
+    (``PlaceFieldModel._detect_block_structure``, which runs
+    ``_block_diagonal_parameters_ok``) to get
     ``n_neurons`` / ``block_size``, then passes those integers into the
     jit-compiled loss function. Inside the loss function, the traced
     (init_mean, init_cov, A, Q, Z) arrays may differ from the
@@ -1570,8 +1378,9 @@ def stochastic_point_process_filter(
 
     # Block-diagonal dispatch (opt-in via block_n_neurons / block_size).
     # The caller is responsible for verifying the block structure ONCE at
-    # fit entry time (outside jax.jit / jax.grad; see
-    # _detect_block_diagonal_problem) to determine these integers. Inside
+    # fit entry time (outside jax.jit / jax.grad; see the
+    # BlockDiagonalStructure contract and _block_diagonal_parameters_ok) to
+    # determine these integers. Inside
     # the jit boundary they are Python constants, not traced, so we can use
     # them for static slicing of the traced (init_mean, init_cov, A, Q,
     # design_matrix-or-Z_base) arrays into per-neuron factors. This is safe
@@ -1601,9 +1410,9 @@ def stochastic_point_process_filter(
                 f"block dispatch shape mismatch: block_n_neurons="
                 f"{block_n_neurons} * block_size={block_size} = "
                 f"{expected_state_dim}, but init_cov has shape "
-                f"{init_covariance_params.shape}. Re-run "
-                f"_detect_block_diagonal_problem to refresh the "
-                f"dispatch integers."
+                f"{init_covariance_params.shape}. Pass the block "
+                f"structure of the current problem (PlaceFieldModel "
+                f"re-derives it with _detect_block_structure)."
             )
         structure = _build_block_structure_from_traced(
             init_mean_params,
@@ -1787,11 +1596,11 @@ def _block_diagonal_forward_core(
 
         def _grad(_x_block: Array) -> Array:
             # Analytical gradient: d(log_intensity)/dx = z_row_t.
-            # Safe because _detect_block_diagonal_problem's contract
-            # requires a Z_base-block design matrix, which produces a
-            # strictly linear log_intensity. The block-diagonal path
-            # cannot receive a nonlinear intensity (e.g. PositionDecoder's
-            # KDE rate map) — detection rejects ndim==2 design matrices.
+            # Safe because the public filter / smoother only dispatch to
+            # the block path when the log-intensity is the default linear
+            # one (the ``_uses_default_linear_log_intensity`` term of
+            # ``use_block_dispatch``); a nonlinear intensity (e.g.
+            # PositionDecoder's KDE rate map) always takes the dense path.
             return z_row_t[None, :]
 
         post_mean, post_cov, log_lik_step = _point_process_laplace_update(
@@ -1996,7 +1805,7 @@ def _stochastic_point_process_filter_block_diagonal(
     """Block-diagonal Laplace-EKF filter via vmapped per-neuron scans.
 
     Consumes a ``BlockDiagonalStructure`` (from
-    ``_detect_block_diagonal_problem``) and runs ``n_neurons`` independent
+    ``_build_block_structure_from_traced``) and runs ``n_neurons`` independent
     filters in parallel via ``jax.vmap``. Each per-neuron filter operates
     at ``d=block_size`` state dimension rather than ``d=n_neurons*block_size``,
     giving ~``n_neurons^2`` speedup on the per-step Cholesky.
@@ -2345,9 +2154,9 @@ def stochastic_point_process_smoother(
                 f"block dispatch shape mismatch: block_n_neurons="
                 f"{block_n_neurons} * block_size={block_size} = "
                 f"{expected_state_dim}, but init_cov has shape "
-                f"{init_covariance_params.shape}. Re-run "
-                f"_detect_block_diagonal_problem to refresh the "
-                f"dispatch integers."
+                f"{init_covariance_params.shape}. Pass the block "
+                f"structure of the current problem (PlaceFieldModel "
+                f"re-derives it with _detect_block_structure)."
             )
         structure = _build_block_structure_from_traced(
             init_mean_params,
