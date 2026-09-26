@@ -63,6 +63,7 @@ from state_space_practice.parameter_transforms import (
     STOCHASTIC_ROW,
     UNCONSTRAINED,
 )
+from state_space_practice.em_driver import run_em
 from state_space_practice.sgd_fitting import (
     SGDFittableMixin,
     reconstruct_per_state_array,
@@ -77,7 +78,6 @@ from state_space_practice.switching_kalman import (
     switching_kalman_smoother_gpb2,
 )
 from state_space_practice.utils import (
-    check_converged,
     make_discrete_transition_matrix,
     shift_to_psd,
     symmetrize,
@@ -993,115 +993,27 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         if not skip_init:
             self._initialize_parameters(key)
             self._warm_initialize_states(observations)
-        log_likelihoods: list[float] = []
-        last_accepted_state: dict | None = None
-        needs_final_e_step = False
-
-        for iteration in range(max_iter):
-            current_log_likelihood = float(self._e_step(observations))
-            log_likelihoods.append(current_log_likelihood)
-            needs_final_e_step = False
-
-            if not jnp.isfinite(current_log_likelihood):
-                bad_ll = log_likelihoods.pop()
-                if last_accepted_state is not None:
-                    self._restore_em_state(last_accepted_state)
-                    logger.warning(
-                        f"Non-finite log-likelihood at iteration {iteration + 1} "
-                        f"({bad_ll}); rolling back to previous E-step and "
-                        f"stopping EM."
-                    )
-                else:
-                    # No earlier accepted state to roll back to: the failed
-                    # E-step already installed NaN posteriors, so drop them
-                    # rather than let decode()/predict_proba() return garbage.
-                    self._clear_smoother_state()
-                    logger.warning(
-                        f"Non-finite log-likelihood at iteration {iteration + 1} "
-                        f"with no usable previous state; clearing posteriors and "
-                        f"stopping EM."
-                    )
-                self.converged_ = False
-                break
-
-            if iteration > 0:
-                # The GPB1 E-step is approximate, so exact monotonicity is not
-                # guaranteed. We deliberately stop on the first LL decrease:
-                # within-tol decreases fall through to the is_converged check
-                # below (treated as a plateau), while larger decreases roll
-                # back to the last accepted state. Continuing past a real
-                # decrease would risk drifting away from a good iterate.
-                is_converged, is_increasing = check_converged(
-                    current_log_likelihood, log_likelihoods[-2], tol
-                )
-
-                if not is_increasing:
-                    bad_ll = log_likelihoods.pop()
-                    if last_accepted_state is not None:
-                        self._restore_em_state(last_accepted_state)
-                    logger.warning(
-                        f"LL decreased: {log_likelihoods[-1]:.4f} -> "
-                        f"{bad_ll:.4f}; rolling back to previous E-step "
-                        f"and stopping EM."
-                    )
-                    self.converged_ = False
-                    break
-
-                if is_converged:
-                    logger.info(f"Converged after {iteration + 1} iterations.")
-                    self.converged_ = True
-                    break
-
-            last_accepted_state = self._snapshot_em_state()
+        def _m_step_and_project() -> None:
             self._m_step(observations)
             self._project_parameters()
-            needs_final_e_step = True
 
-            change = (
-                current_log_likelihood - log_likelihoods[-2]
-                if iteration > 0
-                else float("nan")
-            )
-            logger.info(
-                f"Iteration {iteration + 1}/{max_iter}\t"
-                f"Log-Likelihood: {current_log_likelihood:.4f}\t"
-                f"Change: {change:.4f}"
-            )
-        else:
-            self.converged_ = False
-            logger.warning("Reached maximum iterations without converging.")
-
-        # Final E-step to sync smoother results with current parameters.
-        # Without this, the stored posteriors correspond to the previous
-        # iteration's parameters after the last M-step. If the final refresh
-        # reveals that the last M-step was bad, roll back to the last accepted
-        # E-step state instead of returning inconsistent parameters.
-        if needs_final_e_step:
-            final_ll = float(self._e_step(observations))
-            if not jnp.isfinite(final_ll):
-                if last_accepted_state is not None:
-                    self._restore_em_state(last_accepted_state)
-                logger.warning(
-                    "Final E-step produced non-finite log-likelihood; "
-                    "rolling back to previous E-step."
-                )
-                self.converged_ = False
-            elif log_likelihoods:
-                _, is_increasing = check_converged(final_ll, log_likelihoods[-1], tol)
-                if is_increasing:
-                    log_likelihoods.append(final_ll)
-                else:
-                    if last_accepted_state is not None:
-                        self._restore_em_state(last_accepted_state)
-                    logger.warning(
-                        f"Final E-step decreased LL: {log_likelihoods[-1]:.4f} -> "
-                        f"{final_ll:.4f}; rolling back to previous E-step."
-                    )
-                    self.converged_ = False
-            else:
-                log_likelihoods.append(final_ll)
-
-        return log_likelihoods
+        # The GPB1 E-step is approximate, so the driver stops on the first
+        # rejected step (non-finite or decreasing LL) and rolls back to the
+        # last accepted (parameters, posteriors) pair; with no accepted state
+        # yet, the NaN posteriors the failed E-step installed are cleared.
+        result = run_em(
+            lambda: float(self._e_step(observations)),
+            _m_step_and_project,
+            self._snapshot_em_state,
+            self._restore_em_state,
+            max_iter=max_iter,
+            tol=tol,
+            on_first_nonfinite="clear",
+            clear_state=self._clear_smoother_state,
+            logger=logger,
+        )
+        self.converged_ = result.converged
+        return result.log_likelihoods
 
     # --- SGDFittableMixin protocol (shared by all oscillator subclasses) ---
 
