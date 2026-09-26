@@ -691,3 +691,20 @@ class TestMultinomialChoiceValidation:
         m2 = MultinomialChoiceModel(n_options=3)
         m2.fit(choices, max_iter=100)
         assert m2.converged_ is True
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize(
+        "bad_choices",
+        [np.array([0, 1, 7, 2]), np.array([1])],
+        ids=["out_of_range", "too_few_trials"],
+    )
+    def test_rejected_refit_preserves_fitted_state(self, bad_choices):
+        rng = np.random.default_rng(1)
+        model = MultinomialChoiceModel(n_options=3)
+        model.fit(rng.integers(0, 3, size=60), max_iter=3)
+        bic_before = model.bic()
+        with pytest.raises(ValueError):
+            model.fit(bad_choices, max_iter=3)
+        # Guard: the rejected call would change n_trials if it leaked through.
+        assert len(bad_choices) != 60
+        assert model.bic() == bic_before

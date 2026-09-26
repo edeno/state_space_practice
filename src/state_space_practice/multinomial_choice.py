@@ -596,14 +596,15 @@ class MultinomialChoiceModel(SGDFittableMixin):
     def _prepare_choices(self, choices: ArrayLike, method: str) -> Array:
         """Validate ``choices`` for fitting, record ``_n_trials``, return int32."""
         choices_arr = jnp.asarray(choices, dtype=jnp.int32)
-        self._n_trials = int(choices_arr.shape[0])
+        n_trials = int(choices_arr.shape[0])
 
-        if self._n_trials < 2:
+        if n_trials < 2:
             raise ValueError(
-                f"Need at least 2 trials for {method} fitting, got {self._n_trials}"
+                f"Need at least 2 trials for {method} fitting, got {n_trials}"
             )
 
         _validate_choices(choices, self.n_options)
+        self._n_trials = n_trials
         return choices_arr
 
     def fit(
