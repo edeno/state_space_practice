@@ -86,6 +86,7 @@ def covariate_predict(
     return pred_mean, pred_cov
 
 
+@jax.jit
 def m_step_input_gain(
     smoothed_values: Array,
     covariates: Array,
@@ -130,6 +131,7 @@ def m_step_input_gain(
     return psd_solve(gram.T, cross.T).T
 
 
+@partial(jax.jit, static_argnames=("n_options", "max_newton_steps"))
 def m_step_obs_weights(
     smoothed_values: Array,
     choices: Array,
@@ -151,10 +153,13 @@ def m_step_obs_weights(
     choices : Array, shape (T,) int
     obs_covariates : Array, shape (T, d_obs)
     n_options : int
+        Number of options K (static under ``jax.jit``).
     inverse_temperature : float
     current_obs_weights : Array, shape (K, d_obs)
         Current Theta estimate (warm start).
     max_newton_steps : int
+        Number of damped Newton steps (static under ``jax.jit``; the loop
+        is unrolled at trace time).
 
     Returns
     -------

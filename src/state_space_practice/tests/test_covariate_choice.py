@@ -2,6 +2,7 @@
 
 import numpy as np
 
+import jax
 import jax.numpy as jnp
 
 import pytest
@@ -142,6 +143,82 @@ class TestMStepInputGain:
         var_without = float(jnp.mean(jnp.var(residual_without_B, axis=0)))
 
         assert var_with < var_without * 0.1  # B should explain most variance
+
+
+class TestMStepHelpersCompileOnce:
+    """The M-step helpers are jitted (``n_options`` / ``max_newton_steps``
+    static), so EM iterations with fixed shapes reuse one compilation even
+    though the smoothed values, decay, beta and warm start change."""
+
+    @staticmethod
+    def _count_psd_solve(monkeypatch) -> list:
+        from state_space_practice import covariate_choice
+
+        traces: list = []
+        original = covariate_choice.psd_solve
+
+        def counting(*args, **kwargs):
+            # Reached only while a helper is being traced.
+            traces.append(None)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(covariate_choice, "psd_solve", counting)
+        return traces
+
+    def test_input_gain_compiles_once_and_matches_eager(self, monkeypatch):
+        traces = self._count_psd_solve(monkeypatch)
+        rng = np.random.default_rng(0)
+        u = jnp.asarray(rng.standard_normal((80, 2)))
+        values = [jnp.asarray(rng.standard_normal((80, 2))) for _ in range(3)]
+
+        m_step_input_gain.clear_cache()
+        first = m_step_input_gain(values[0], u, 0.9)
+        assert traces  # guard: the first call after clearing traced
+        traces.clear()
+        second = m_step_input_gain(values[1], u, 0.8)
+        m_step_input_gain(values[2], u, 1.0)
+        assert traces == []
+        assert not np.allclose(first, second)  # guard: new values were used
+        with jax.disable_jit():
+            eager = m_step_input_gain(values[1], u, 0.8)
+        np.testing.assert_allclose(second, eager, rtol=1e-10, atol=1e-12)
+
+    def test_obs_weights_compiles_once_and_matches_eager(self, monkeypatch):
+        from state_space_practice.covariate_choice import m_step_obs_weights
+
+        traces = self._count_psd_solve(monkeypatch)
+        rng = np.random.default_rng(1)
+        T, K, d_obs = 120, 3, 2
+        z = jnp.asarray(rng.standard_normal((T, d_obs)))
+        choices = jnp.asarray(rng.integers(0, K, T))
+        theta0 = jnp.zeros((K, d_obs))
+
+        def call(seed, beta):
+            values = jnp.asarray(
+                np.random.default_rng(seed).standard_normal((T, K - 1))
+            )
+            return m_step_obs_weights(values, choices, z, K, beta, theta0)
+
+        m_step_obs_weights.clear_cache()
+        first = call(2, 1.0)
+        assert traces  # guard
+        traces.clear()
+        second = call(3, 2.5)
+        call(4, 0.5)
+        assert traces == []
+        assert not np.allclose(first, second)
+        # a different static option does retrace
+        m_step_obs_weights(
+            jnp.zeros((T, K - 1)), choices, z, K, 1.0, theta0,
+            max_newton_steps=2,
+        )
+        assert traces
+        with jax.disable_jit():
+            values = jnp.asarray(
+                np.random.default_rng(3).standard_normal((T, K - 1))
+            )
+            eager = m_step_obs_weights(values, choices, z, K, 2.5, theta0)
+        np.testing.assert_allclose(second, eager, rtol=1e-8, atol=1e-10)
 
 
 class TestCovariateChoiceFilter:
