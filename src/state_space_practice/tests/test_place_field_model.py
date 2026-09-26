@@ -296,6 +296,49 @@ class TestPlaceFieldModelFit:
         with pytest.raises(RuntimeError, match="Call model.fit"):
             model.summary()
 
+    @pytest.mark.slow
+    def test_non_finite_later_e_step_rolls_back_to_last_accepted(
+        self, sim_data: dict
+    ) -> None:
+        """A non-finite third E-step rolls back to the (parameters, posteriors)
+        pair of the second, drops the NaN from the history and stops EM."""
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        real_e_step = model._e_step
+        calls: list[dict] = []
+
+        def e_step(*args, **kwargs):
+            ll = real_e_step(*args, **kwargs)
+            calls.append(
+                {
+                    "ll": ll,
+                    "process_cov": model.process_cov,
+                    "init_mean": model.init_mean,
+                    "smoother_mean": model.smoother_mean,
+                }
+            )
+            return float("nan") if len(calls) == 3 else ll
+
+        model._e_step = e_step
+        lls = model.fit(
+            sim_data["position"],
+            sim_data["spikes"],
+            max_iter=10,
+            tolerance=1e-12,
+            verbose=False,
+        )
+        assert len(calls) == 3  # guard: EM accepted two steps and ran a third
+        # guard: the rejected E-step ran under different (M-step) parameters
+        assert not np.array_equal(
+            np.asarray(calls[2]["process_cov"]), np.asarray(calls[1]["process_cov"])
+        )
+        assert lls == [calls[0]["ll"], calls[1]["ll"]]
+        assert all(np.isfinite(lls))
+        for key in ("process_cov", "init_mean", "smoother_mean"):
+            np.testing.assert_array_equal(
+                np.asarray(getattr(model, key)), np.asarray(calls[1][key]), key
+            )
+        assert np.isfinite(model.bic())
+
     def test_repr_fitted(self, sim_data: dict) -> None:
         model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
         model.fit(
