@@ -20,12 +20,14 @@ SGD-only fitting).
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from functools import partial
+from typing import Any, ClassVar, cast
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg
 from jax import Array
+from jax.typing import ArrayLike
 
 from state_space_practice.kalman import joseph_form_update
 from state_space_practice.nonlinear_dynamics import (
@@ -33,13 +35,16 @@ from state_space_practice.nonlinear_dynamics import (
     ekf_predict_step,
     ekf_predict_step_with_jacobian,
     ekf_smooth_step,
+    leapfrog_step,
 )
+from state_space_practice.oscillator_models import OscillatorParameterBase
 from state_space_practice.point_process_kalman import (
     _soft_expected_count_and_log,
     glm_laplace_update,
     poisson_family,
 )
-from state_space_practice.utils import psd_cholesky, psd_logdet
+from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.utils import psd_cholesky, psd_logdet, stabilize_covariance
 
 
 def gaussian_measurement_update(
@@ -112,9 +117,9 @@ def point_process_laplace_update(
     ``dt`` and ``compute_log_likelihood`` are configuration values and must be
     declared static when this helper is JIT-compiled directly, for example
     ``jax.jit(point_process_laplace_update,
-    static_argnames=("dt", "compute_log_likelihood"))``. Hamiltonian model
-    methods already capture ``self.dt`` statically through their static model
-    instance.
+    static_argnames=("dt", "compute_log_likelihood"))``. The Hamiltonian
+    models pass ``dt`` as a static argument of the module-level jitted cores
+    (:func:`hamiltonian_ekf_filter` and friends), which bind it here.
 
     Returns
     -------
@@ -289,6 +294,145 @@ def run_ekf_smoother(
     return ekf_rts_backward_pass(m_f, P_f, m_p, P_p, F)
 
 
+OBSERVATION_MODELS = ("gaussian", "poisson", "joint")
+
+
+FilterUpdate = Callable[[Array, Array, Any], tuple[Array, Array, Array]]
+SmootherUpdate = Callable[[Array, Array, Any], tuple[Array, Array]]
+
+
+def _observation_updates(
+    observation_model: str, params: dict[str, Any], dt: float
+) -> tuple[FilterUpdate, SmootherUpdate]:
+    """Build the per-step ``(filter_update, smoother_update)`` closures.
+
+    ``observation_model`` names the readout of a single-regime Hamiltonian
+    model: ``"gaussian"`` (LFP; reads ``C``, ``d``, ``R``), ``"poisson"``
+    (spikes; ``C``, ``d``) or ``"joint"`` (an LFP update followed by a spike
+    update on the same latent state; ``C_lfp``, ``d_lfp``, ``R_lfp``,
+    ``C_spikes``, ``d_spikes``). The filter update returns
+    ``(m_post, P_post, log_likelihood)``; the smoother update returns
+    ``(m_post, P_post)`` and skips the likelihood normalization constants,
+    which the RTS pass never reads.
+    """
+    if observation_model == "gaussian":
+        C, d, R = params["C"], params["d"], params["R"]
+
+        def filter_update(m, P, y):
+            return gaussian_measurement_update(m, P, y, C, d, R)
+
+        def smoother_update(m, P, y):
+            return gaussian_measurement_update(
+                m, P, y, C, d, R, include_normalization_const=False
+            )[:2]
+
+    elif observation_model == "poisson":
+        C, d = params["C"], params["d"]
+
+        def filter_update(m, P, y):
+            return point_process_laplace_update(m, P, y, C, d, dt)
+
+        def smoother_update(m, P, y):
+            return point_process_laplace_update(
+                m, P, y, C, d, dt, compute_log_likelihood=False
+            )[:2]
+
+    elif observation_model == "joint":
+        C_l, d_l, R_l = params["C_lfp"], params["d_lfp"], params["R_lfp"]
+        C_s, d_s = params["C_spikes"], params["d_spikes"]
+
+        def filter_update(m, P, y):
+            # Sequential: LFP update first, then point-process update on the
+            # LFP posterior. The two log-likelihoods sum to the joint marginal
+            # because the observations are conditionally independent given x_t.
+            y_lfp, y_spike = y
+            m_mid, P_mid, ll_lfp = gaussian_measurement_update(
+                m, P, y_lfp, C_l, d_l, R_l
+            )
+            m_post, P_post, ll_spike = point_process_laplace_update(
+                m_mid, P_mid, y_spike, C_s, d_s, dt
+            )
+            return m_post, P_post, ll_lfp + ll_spike
+
+        def smoother_update(m, P, y):
+            y_lfp, y_spike = y
+            m_mid, P_mid, _ = gaussian_measurement_update(
+                m, P, y_lfp, C_l, d_l, R_l, include_normalization_const=False
+            )
+            m_post, P_post, _ = point_process_laplace_update(
+                m_mid, P_mid, y_spike, C_s, d_s, dt, compute_log_likelihood=False
+            )
+            return m_post, P_post
+
+    else:
+        raise ValueError(
+            f"observation_model must be one of {OBSERVATION_MODELS}, "
+            f"got {observation_model!r}."
+        )
+    return filter_update, smoother_update
+
+
+@partial(jax.jit, static_argnames=("dt", "observation_model"))
+def hamiltonian_ekf_filter(
+    observations: Any,
+    params: dict[str, Any],
+    *,
+    dt: float,
+    observation_model: str,
+) -> tuple[Array, Array, Array]:
+    """JIT-compiled EKF filter shared by the single-regime Hamiltonian models.
+
+    ``observations`` is the per-step observation pytree (one array, or an
+    ``(lfp, spikes)`` tuple for ``"joint"``). ``params`` carries every
+    mutable quantity: ``mlp``, ``omega``, the readout parameters named in
+    :func:`_observation_updates`, ``init_mean``, ``init_cov`` and ``Q``.
+    Only ``dt`` and ``observation_model`` are static, so the compile cache is
+    keyed on array shapes/dtypes plus those two hashable scalars: model
+    instances with the same configuration share one compilation, and nothing
+    read from a model object can go stale inside the cache.
+
+    Returns ``(filtered_means, filtered_covs, log_likelihoods)``, each with a
+    leading time axis.
+    """
+    trans_params = {**params["mlp"], "omega": params["omega"]}
+    filter_update, _ = _observation_updates(observation_model, params, dt)
+    return run_ekf_filter(
+        observations,
+        params["init_mean"],
+        params["init_cov"],
+        trans_params,
+        params["Q"],
+        dt,
+        filter_update,
+    )
+
+
+@partial(jax.jit, static_argnames=("dt", "observation_model"))
+def hamiltonian_ekf_smoother(
+    observations: Any,
+    params: dict[str, Any],
+    *,
+    dt: float,
+    observation_model: str,
+) -> tuple[Array, Array]:
+    """JIT-compiled EKF-RTS smoother shared by the single-regime models.
+
+    Same conventions and caching behaviour as :func:`hamiltonian_ekf_filter`.
+    Returns ``(smoothed_means, smoothed_covs)``.
+    """
+    trans_params = {**params["mlp"], "omega": params["omega"]}
+    _, smoother_update = _observation_updates(observation_model, params, dt)
+    return run_ekf_smoother(
+        observations,
+        params["init_mean"],
+        params["init_cov"],
+        trans_params,
+        params["Q"],
+        dt,
+        smoother_update,
+    )
+
+
 def poisson_rollout_nll(log_lambda: Array, spikes: Array, dt: float) -> Array:
     """Overflow-safe, gradient-preserving Poisson negative log-likelihood.
 
@@ -312,29 +456,56 @@ def default_init_mean(n_oscillators: int) -> Array:
     )
 
 
-class _BaseModelStubs:
-    """Mixin providing no-op implementations of BaseModel's abstract hooks.
+class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
+    """Shared scaffold of the SGD-only Hamiltonian model family.
 
-    The Hamiltonian family is SGD-only — the linear-Gaussian EM hooks
-    (``_initialize_measurement_matrix`` etc.) are not used by any
-    Hamiltonian model. Each class previously defined six identical
-    one-line ``pass`` stubs; this mixin defines them once.
+    Combines the oscillator parameter containers with ``SGDFittableMixin``
+    and nothing else: no EM layer, no abstract initialization hooks and no
+    ``fit`` -- ``fit_sgd`` is the only fitting entry point. Concrete models
+    add their observation head(s), the validating ``filter`` / ``smooth``
+    wrappers, ``_build_param_spec``, ``_sgd_loss_fn`` and
+    ``_validate_fit_data``, and name their readout in ``_observation_model``.
+
+    ``fit_sgd(*observations, use_filter=True, l2_reg=1e-4, **sgd_kwargs)``
+    takes, besides the ``SGDFittableMixin`` optimizer settings, two family
+    keywords handled by ``_prepare_sgd_data``:
+
+    - ``use_filter``: ``True`` (default) optimizes the marginal (Laplace-)EKF
+      log-likelihood and learns the process covariance; ``False`` optimizes a
+      deterministic-rollout surrogate that drops the process prior and the
+      latent uncertainty, useful for warm-starting the dynamics.
+    - ``l2_reg``: weight of the L2 penalty on the MLP weights.
     """
 
-    def _initialize_measurement_matrix(self, key=None) -> None:
-        return
+    #: Readout name passed to the module-level jitted cores.
+    _observation_model: ClassVar[str]
 
-    def _initialize_measurement_covariance(self) -> None:
-        return
+    _sgd_param_attrs = {"mlp": "mlp_params", "omega": "omega"}
 
-    def _initialize_continuous_transition_matrix(self) -> None:
-        return
+    def __init__(
+        self,
+        n_oscillators: int,
+        n_discrete_states: int,
+        n_sources: int,
+        sampling_freq: float,
+        hidden_dims: list[int] | None,
+        seed: int,
+    ):
+        super().__init__(
+            n_oscillators=n_oscillators,
+            n_discrete_states=n_discrete_states,
+            n_sources=n_sources,
+            sampling_freq=sampling_freq,
+        )
+        # A plain float: ``dt`` is a hashable static argument of the jitted
+        # cores, so every instance with the same rate shares their cache.
+        self.dt = 1.0 / float(sampling_freq)
+        self.hidden_dims = hidden_dims or [32, 32]
+        self.key = jax.random.PRNGKey(seed)
 
-    def _initialize_process_covariance(self) -> None:
-        return
-
-    def _project_parameters(self) -> None:
-        return
+    def transition_func(self, x: Array, params: dict[str, Array]) -> Array:
+        """Deterministic Hamiltonian transition."""
+        return leapfrog_step(x, params, apply_mlp, self.dt)
 
     def _rollout_trajectory(self, params: dict[str, Any], n_time: int) -> Array:
         """Deterministic Hamiltonian rollout of ``n_time`` steps from ``init_mean``.
@@ -350,14 +521,75 @@ class _BaseModelStubs:
             return x_next, x_next
 
         _, x_traj = jax.lax.scan(scan_fn, params["init_mean"], None, length=n_time)
-        return x_traj
+        return cast(Array, x_traj)
 
-    def fit(self, *args, **kwargs):
-        """Hamiltonian models do not support linear EM."""
-        raise NotImplementedError(
-            f"{type(self).__name__} does not support the linear EM path "
-            "(fit()). Please use fit_sgd() for non-linear optimization."
+    def _filter_jit(
+        self, observations: Any, params: dict[str, Any]
+    ) -> tuple[Array, Array, Array]:
+        """Run the jitted filter core on validated data and completed params."""
+        return cast(
+            tuple[Array, Array, Array],
+            hamiltonian_ekf_filter(
+                observations,
+                params,
+                dt=self.dt,
+                observation_model=self._observation_model,
+            ),
         )
+
+    def _smooth_jit(
+        self, observations: Any, params: dict[str, Any]
+    ) -> tuple[Array, Array]:
+        """Run the jitted smoother core on validated data and completed params."""
+        return cast(
+            tuple[Array, Array],
+            hamiltonian_ekf_smoother(
+                observations,
+                params,
+                dt=self.dt,
+                observation_model=self._observation_model,
+            ),
+        )
+
+    def _validate_fit_data(self, *data: Any, **kwargs: Any) -> tuple[Array, ...]:
+        """Validate the observation arrays given to ``fit_sgd`` (non-empty).
+
+        Each model declares its own positional layout (``observations`` or
+        ``lfp_obs, spike_obs``) and returns the validated arrays as a tuple.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _validate_fit_data."
+        )
+
+    def _prepare_sgd_data(
+        self,
+        *data: ArrayLike,
+        use_filter: bool = True,
+        l2_reg: float = 1e-4,
+    ) -> tuple[tuple[Array, ...], dict[str, Any]]:
+        """Validate the data for ``fit_sgd`` and record its length.
+
+        Any other keyword (e.g. the EM models' ``key``) is rejected here with
+        a ``TypeError``: the Hamiltonian models allocate their parameters in
+        ``__init__`` and take no initialization key.
+        """
+        validated = self._validate_fit_data(*data)
+        self._sgd_n_time = validated[0].shape[0]
+        return validated, {"use_filter": use_filter, "l2_reg": l2_reg}
+
+    def _store_sgd_params(self, params: dict) -> None:
+        """Store the plain keys, then the single-regime derived ones.
+
+        ``init_mean`` is optimized as the ``(n_cont_states,)`` slice of the
+        single discrete state and written back into slot 0; ``Q`` is the
+        single-state process covariance, re-stabilized after the unconstrained
+        round trip. Subclasses resync their observation containers on top.
+        """
+        super()._store_sgd_params(params)
+        if "init_mean" in params:
+            self.init_mean = self.init_mean.at[:, 0].set(params["init_mean"])
+        if "Q" in params:
+            self.process_cov = jnp.stack([stabilize_covariance(params["Q"])], axis=2)
 
     def _finalize_sgd(self, *data, **kwargs):
         """Run filter + smoother to populate fitted states after SGD.
@@ -374,4 +606,3 @@ class _BaseModelStubs:
         sm_means, sm_covs = self.smooth(*data, params)
         self.smoothed_means_ = sm_means
         self.smoothed_covs_ = sm_covs
-

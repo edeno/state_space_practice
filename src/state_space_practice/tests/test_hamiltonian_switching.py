@@ -218,6 +218,7 @@ class TestSwitchingHamiltonianSmooth:
         )
         from state_space_practice.hamiltonian_switching import (
             SwitchingHamiltonianJointModel,
+            switching_predict_collapse,
         )
         from state_space_practice.nonlinear_dynamics import ekf_smooth_step
         from state_space_practice.switching_kalman import collapse_gaussian_mixture
@@ -272,7 +273,7 @@ class TestSwitchingHamiltonianSmooth:
                     pi_pred,
                     m_pred_pair,
                     P_pred_pair,
-                ) = model._per_state_pred_collapse(
+                ) = switching_predict_collapse(
                     m_prev,
                     P_prev,
                     pi_prev,
@@ -280,7 +281,7 @@ class TestSwitchingHamiltonianSmooth:
                     params["mlp"],
                     params["omega"],
                     model.process_cov,
-                    K,
+                    model.dt,
                     with_jacobian=True,
                 )
                 m_posts = []
@@ -598,6 +599,50 @@ class TestSwitchingHamiltonianSGDRecovery:
             f"Omega gap {omega_gap:.3f} < 1.0 "
             f"(learned: {model.omega}; true gap is ~12.6)"
         )
+
+
+def test_switching_cores_are_shared_across_model_instances():
+    """A second instance with the same shapes and dt reuses the compilation.
+
+    The switching filter/smoother are module-level ``jax.jit`` functions with
+    only ``dt`` static (the state count follows from the array shapes); a
+    different ``dt`` compiles again, keeping the equality checks non-vacuous.
+    """
+    from state_space_practice.hamiltonian_switching import (
+        SwitchingHamiltonianJointModel,
+        switching_hamiltonian_filter,
+        switching_hamiltonian_smoother,
+    )
+
+    k1, k2 = jax.random.split(jax.random.PRNGKey(5))
+    lfp = jax.random.normal(k1, (6, 2))
+    spikes = jax.random.poisson(k2, 0.5, (6, 3))
+
+    def run(seed, sampling_freq):
+        model = SwitchingHamiltonianJointModel(
+            n_oscillators=1,
+            n_discrete_states=2,
+            n_lfp_sources=2,
+            n_spike_sources=3,
+            sampling_freq=sampling_freq,
+            hidden_dims=[4],
+            seed=seed,
+        )
+        params = model._build_param_spec()[0]
+        model.filter(lfp, spikes, params)
+        model.smooth(lfp, spikes, params)
+
+    run(seed=0, sampling_freq=200.0)
+    n_filter = switching_hamiltonian_filter._cache_size()
+    n_smooth = switching_hamiltonian_smoother._cache_size()
+
+    run(seed=1, sampling_freq=200.0)
+    assert switching_hamiltonian_filter._cache_size() == n_filter
+    assert switching_hamiltonian_smoother._cache_size() == n_smooth
+
+    run(seed=0, sampling_freq=100.0)
+    assert switching_hamiltonian_filter._cache_size() == n_filter + 1
+    assert switching_hamiltonian_smoother._cache_size() == n_smooth + 1
 
 
 class TestSwitchingHamiltonianUseFilterGuard:

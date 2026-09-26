@@ -8,29 +8,19 @@ See docs/hamiltonian_architecture.md for why this family is standalone
 """
 
 import warnings
-from functools import partial
-from typing import Any, cast
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 from jax import Array
 
 from state_space_practice.hamiltonian_core import (
-    _BaseModelStubs,
+    HamiltonianModelBase,
     default_init_mean,
-    gaussian_measurement_update,
     mlp_l2_penalty,
-    point_process_laplace_update,
     poisson_rollout_nll,
-    run_ekf_filter,
-    run_ekf_smoother,
 )
-from state_space_practice.nonlinear_dynamics import (
-    apply_mlp,
-    init_mlp_params,
-    leapfrog_step,
-)
-from state_space_practice.oscillator_models import BaseModel
+from state_space_practice.nonlinear_dynamics import init_mlp_params
 from state_space_practice.parameter_transforms import (
     POSITIVE,
     PSD_MATRIX,
@@ -38,7 +28,6 @@ from state_space_practice.parameter_transforms import (
     ParameterTransform,
     frozen,
 )
-from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import (
     psd_cholesky,
     psd_logdet,
@@ -48,8 +37,17 @@ from state_space_practice.utils import (
 )
 
 
-class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
+class JointHamiltonianModel(HamiltonianModelBase):
     """Joint Model combining Gaussian LFP and Poisson Spikes."""
+
+    _observation_model = "joint"
+    _sgd_param_attrs = {
+        **HamiltonianModelBase._sgd_param_attrs,
+        "C_lfp": "C_lfp",
+        "d_lfp": "d_lfp",
+        "C_spikes": "C_spikes",
+        "d_spikes": "d_spikes",
+    }
 
     def __init__(
         self,
@@ -66,12 +64,11 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
             n_discrete_states=1,
             n_sources=n_lfp_sources + n_spike_sources,
             sampling_freq=sampling_freq,
+            hidden_dims=hidden_dims,
+            seed=seed,
         )
-        self.dt = 1.0 / sampling_freq
         self.n_lfp = n_lfp_sources
         self.n_spikes = n_spike_sources
-        self.hidden_dims = hidden_dims or [32, 32]
-        self.key = jax.random.PRNGKey(seed)
         k_mlp, k_lfp, k_spk, k_init = jax.random.split(self.key, 4)
 
         # Shared latent dynamics (the Hamiltonian)
@@ -90,7 +87,28 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         self.d_spikes = jnp.zeros((n_spike_sources,))
 
         self._initialize_parameters(k_init)
-        self._sgd_n_time = 0
+
+    def _measurement_matrix_all_states(self) -> Array:
+        """Stack ``[C_lfp; C_spikes]`` once per discrete state, axis last."""
+        C = jnp.concatenate([self.C_lfp, self.C_spikes], axis=0)
+        return jnp.broadcast_to(
+            C[:, :, None], (self.n_sources, self.n_cont_states, self.n_discrete_states)
+        )
+
+    def _measurement_cov_all_states(self) -> Array:
+        """Combined observation covariance per discrete state, axis last.
+
+        Only the LFP block is Gaussian; the spike block stays zero.
+        """
+        R_all_states = jnp.broadcast_to(
+            self.R_lfp[:, :, None],
+            (self.n_lfp, self.n_lfp, self.n_discrete_states),
+        )
+        return (
+            jnp.zeros((self.n_sources, self.n_sources, self.n_discrete_states))
+            .at[: self.n_lfp, : self.n_lfp, :]
+            .set(R_all_states)
+        )
 
     def _initialize_parameters(self, key: Array) -> None:
         self.init_discrete_state_prob = jnp.ones((1,))
@@ -99,25 +117,12 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         self.init_mean = jnp.stack([m0], axis=1)
         self.init_cov = jnp.stack([jnp.eye(self.n_cont_states) * 0.1], axis=2)
 
-        self.measurement_matrix = (
-            jnp.zeros((self.n_sources, self.n_cont_states, 1))
-            .at[: self.n_lfp, :, 0]
-            .set(self.C_lfp)
-            .at[self.n_lfp :, :, 0]
-            .set(self.C_spikes)
-        )
-        self.measurement_cov = (
-            jnp.zeros((self.n_sources, self.n_sources, 1))
-            .at[: self.n_lfp, : self.n_lfp, 0]
-            .set(self.R_lfp)
-        )
+        self.measurement_matrix = self._measurement_matrix_all_states()
+        self.measurement_cov = self._measurement_cov_all_states()
         self.continuous_transition_matrix = jnp.stack(
             [jnp.eye(self.n_cont_states)], axis=2
         )
         self.process_cov = jnp.stack([jnp.eye(self.n_cont_states) * 1e-4], axis=2)
-
-    def transition_func(self, x: Array, params: dict[str, Array]) -> Array:
-        return leapfrog_step(x, params, apply_mlp, self.dt)
 
     @property
     def obs_noise_std(self) -> float:
@@ -169,49 +174,8 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
     ) -> tuple[Array, Array, Array]:
         """Hybrid EKF: sequentially update from LFP then Spikes."""
         lfp_data, spike_data = self._validate_joint_data(lfp_data, spike_data)
-        return cast(
-            tuple[Array, Array, Array],
-            self._filter_jit(
-                lfp_data,
-                spike_data,
-                self._complete_filter_params(params),
-            ),
-        )
-
-    @partial(jax.jit, static_argnums=(0,))
-    def _filter_jit(
-        self,
-        lfp_data: Array,
-        spike_data: Array,
-        params: dict[str, Any],
-    ) -> tuple[Array, Array, Array]:
-        """JIT-compiled filter core with mutable inputs passed explicitly."""
-        trans_params = {**params["mlp"], "omega": params["omega"]}
-        C_l, d_l, R_l = params["C_lfp"], params["d_lfp"], params["R_lfp"]
-        C_s, d_s = params["C_spikes"], params["d_spikes"]
-
-        def update(m_pred, P_pred, obs_t):
-            # Sequential: LFP update first, then point-process update on
-            # the LFP posterior. The two log-likelihoods sum to the joint
-            # marginal because the observations are conditionally
-            # independent given x_t.
-            y_lfp_t, y_spike_t = obs_t
-            m_mid, P_mid, ll_lfp = gaussian_measurement_update(
-                m_pred, P_pred, y_lfp_t, C_l, d_l, R_l
-            )
-            m_post, P_post, ll_spike = point_process_laplace_update(
-                m_mid, P_mid, y_spike_t, C_s, d_s, self.dt
-            )
-            return m_post, P_post, ll_lfp + ll_spike
-
-        return run_ekf_filter(
-            (lfp_data, spike_data),
-            params["init_mean"],
-            params["init_cov"],
-            trans_params,
-            params["Q"],
-            self.dt,
-            update,
+        return self._filter_jit(
+            (lfp_data, spike_data), self._complete_filter_params(params)
         )
 
     def smooth(
@@ -222,51 +186,8 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
     ) -> tuple[Array, Array]:
         """Apply EKF-RTS Smoother to joint data."""
         lfp_data, spike_data = self._validate_joint_data(lfp_data, spike_data)
-        return cast(
-            tuple[Array, Array],
-            self._smooth_jit(
-                lfp_data,
-                spike_data,
-                self._complete_filter_params(params),
-            ),
-        )
-
-    @partial(jax.jit, static_argnums=(0,))
-    def _smooth_jit(
-        self,
-        lfp_data: Array,
-        spike_data: Array,
-        params: dict[str, Any],
-    ) -> tuple[Array, Array]:
-        """JIT-compiled smoother core with mutable inputs passed explicitly."""
-        trans_params = {**params["mlp"], "omega": params["omega"]}
-        C_l, d_l, R_l = params["C_lfp"], params["d_lfp"], params["R_lfp"]
-        C_s, d_s = params["C_spikes"], params["d_spikes"]
-
-        def update(m_pred, P_pred, obs_t):
-            y_lfp_t, y_spike_t = obs_t
-            m_mid, P_mid, _ = gaussian_measurement_update(
-                m_pred,
-                P_pred,
-                y_lfp_t,
-                C_l,
-                d_l,
-                R_l,
-                include_normalization_const=False,
-            )
-            m_post, P_post, _ = point_process_laplace_update(
-                m_mid, P_mid, y_spike_t, C_s, d_s, self.dt, compute_log_likelihood=False
-            )
-            return m_post, P_post
-
-        return run_ekf_smoother(
-            (lfp_data, spike_data),
-            params["init_mean"],
-            params["init_cov"],
-            trans_params,
-            params["Q"],
-            self.dt,
-            update,
+        return self._smooth_jit(
+            (lfp_data, spike_data), self._complete_filter_params(params)
         )
 
     def _validate_joint_data(
@@ -301,40 +222,23 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         validate_count_array(spike_data, "spike_data", allow_empty=allow_empty)
         return lfp_data, spike_data
 
+    def _validate_fit_data(
+        self, lfp_obs: Array, spike_obs: Array
+    ) -> tuple[Array, ...]:
+        return self._validate_joint_data(lfp_obs, spike_obs, allow_empty=False)
+
     def _complete_filter_params(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Fill covariance defaults before entering a JIT-compiled method."""
+        """Fill covariance defaults before entering the jitted cores.
+
+        The compiled cores read only ``params``, so the current model
+        covariances must travel with it rather than be captured from ``self``
+        (which would freeze stale values into the compile cache).
+        """
         complete = dict(params)
         complete.setdefault("R_lfp", self.R_lfp)
         complete.setdefault("Q", self.process_cov[:, :, 0])
         complete.setdefault("init_cov", self.init_cov[:, :, 0])
         return complete
-
-    def fit_sgd(  # type: ignore[override]
-        self,
-        lfp_obs: Array,
-        spike_obs: Array,
-        optimizer: object | None = None,
-        num_steps: int = 200,
-        verbose: bool = False,
-        convergence_tol: float | None = None,
-        use_filter: bool = True,
-        l2_reg: float = 1e-4,
-    ) -> list[float]:
-        lfp_obs, spike_obs = self._validate_joint_data(
-            lfp_obs, spike_obs, allow_empty=False
-        )
-        self._sgd_n_time = lfp_obs.shape[0]
-        return SGDFittableMixin.fit_sgd(
-            self,
-            lfp_obs,
-            spike_obs,
-            optimizer=optimizer,
-            num_steps=num_steps,
-            verbose=verbose,
-            convergence_tol=convergence_tol,
-            use_filter=use_filter,
-            l2_reg=l2_reg,
-        )
 
     def _build_param_spec(
         self,
@@ -375,7 +279,7 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         **kwargs,
     ) -> Array:
         if use_filter:
-            _, _, lls = self._filter_jit(lfp_data, spike_data, params)
+            _, _, lls = self._filter_jit((lfp_data, spike_data), params)
             lik_loss = -jnp.sum(lls)
         else:
             # Surrogate loss: deterministic rollout. NOT the joint
@@ -400,30 +304,11 @@ class JointHamiltonianModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         return lik_loss + l2_reg * mlp_l2_penalty(params["mlp"])
 
     def _store_sgd_params(self, params: dict[str, Any]) -> None:
-        self.mlp_params = params["mlp"]
-        self.omega = params["omega"]
-        self.C_lfp = params["C_lfp"]
-        self.d_lfp = params["d_lfp"]
-        self.C_spikes = params["C_spikes"]
-        self.d_spikes = params["d_spikes"]
-        self.init_mean = self.init_mean.at[:, 0].set(params["init_mean"])
+        super()._store_sgd_params(params)
         if "R_lfp" in params:
             self.R_lfp = stabilize_covariance(params["R_lfp"])
             self._obs_noise_std = float(jnp.sqrt(jnp.mean(jnp.diag(self.R_lfp))))
-        if "Q" in params:
-            self.process_cov = jnp.stack([stabilize_covariance(params["Q"])], axis=2)
 
-        # Resync BaseModel measurement_matrix with the two heads.
-        self.measurement_matrix = (
-            jnp.zeros((self.n_sources, self.n_cont_states, 1))
-            .at[: self.n_lfp, :, 0]
-            .set(self.C_lfp)
-            .at[self.n_lfp :, :, 0]
-            .set(self.C_spikes)
-        )
-        self.measurement_cov = (
-            jnp.zeros((self.n_sources, self.n_sources, 1))
-            .at[: self.n_lfp, : self.n_lfp, 0]
-            .set(self.R_lfp)
-        )
-
+        # Resync the combined observation containers with the two heads.
+        self.measurement_matrix = self._measurement_matrix_all_states()
+        self.measurement_cov = self._measurement_cov_all_states()

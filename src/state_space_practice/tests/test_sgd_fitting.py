@@ -538,3 +538,121 @@ class TestSGDFittableMixin:
         lls = model.fit_sgd(jnp.array(0.0), num_steps=10)
         assert lls == []
         np.testing.assert_allclose(model.scale, 2.0, atol=1e-6)
+
+
+class TestSGDParamAttrsDefaultStore:
+    """``SGDFittableMixin._store_sgd_params`` driven by ``_sgd_param_attrs``."""
+
+    def test_mapped_keys_are_stored_and_absent_keys_skipped(self) -> None:
+        class _Mapped(SGDFittableMixin):
+            _sgd_param_attrs = {"scale": "scale", "shift": "offset"}
+
+            def __init__(self):
+                self.scale = 1.0
+                self.offset = 0.0
+
+        model = _Mapped()
+        model._store_sgd_params({"scale": jnp.array(3.0), "other": jnp.array(9.0)})
+        assert float(model.scale) == 3.0
+        assert model.offset == 0.0  # "shift" absent from params: left alone
+        assert not hasattr(model, "other")  # unmapped keys are ignored
+
+        model._store_sgd_params({"shift": jnp.array(-2.0)})
+        assert float(model.offset) == -2.0
+        assert float(model.scale) == 3.0
+
+    def test_empty_mapping_without_override_raises(self) -> None:
+        class _Unmapped(SGDFittableMixin):
+            pass
+
+        with pytest.raises(NotImplementedError, match="_sgd_param_attrs"):
+            _Unmapped()._store_sgd_params({"scale": jnp.array(1.0)})
+
+    def test_subclass_mapping_replaces_parent_mapping(self) -> None:
+        class _Parent(SGDFittableMixin):
+            _sgd_param_attrs = {"a": "a"}
+
+        class _Extending(_Parent):
+            _sgd_param_attrs = {**_Parent._sgd_param_attrs, "b": "b"}
+
+        class _Replacing(_Parent):
+            _sgd_param_attrs = {"b": "b"}
+
+        extending = _Extending()
+        extending._store_sgd_params({"a": 1, "b": 2})
+        assert (extending.a, extending.b) == (1, 2)
+
+        replacing = _Replacing()
+        replacing._store_sgd_params({"a": 1, "b": 2})
+        assert replacing.b == 2
+        assert not hasattr(replacing, "a")
+
+    def test_fit_sgd_stores_through_the_mapping(self) -> None:
+        """A model with only the mapping (no override) keeps its optimized value."""
+        import optax
+
+        class _MappedToy(SGDFittableMixin):
+            _sgd_param_attrs = {"scale": "scale"}
+            _n_timesteps = 100
+
+            def __init__(self):
+                self.scale = 0.1
+
+            def _build_param_spec(self):
+                return {"scale": jnp.array(self.scale)}, {"scale": POSITIVE}
+
+            def _sgd_loss_fn(self, params, target):
+                return ((params["scale"] - target) ** 2) * self._n_timesteps
+
+            def _finalize_sgd(self, target):
+                self.is_fitted = True
+
+        model = _MappedToy()
+        model.fit_sgd(jnp.array(5.0), optimizer=optax.adam(1e-1), num_steps=200)
+        assert abs(float(model.scale) - 5.0) < 0.5
+        assert model.is_fitted
+
+
+class TestPrepareSGDDataHook:
+    def test_default_hook_is_the_identity(self) -> None:
+        args, kwargs = _ToyModel()._prepare_sgd_data(1, 2, key="v")
+        assert args == (1, 2)
+        assert kwargs == {"key": "v"}
+
+    def test_hook_runs_before_param_spec_and_feeds_loss_and_finalize(self) -> None:
+        import optax
+
+        calls: list[str] = []
+
+        class _Prepared(_ToyModel):
+            def _prepare_sgd_data(self, target, *, target_scale=1.0):
+                calls.append("prepare")
+                return (jnp.asarray(target) * target_scale,), {}
+
+            def _build_param_spec(self):
+                calls.append("spec")
+                return super()._build_param_spec()
+
+            def _finalize_sgd(self, target):
+                self.finalized_with = target
+
+        model = _Prepared(scale=1.0)
+        model.fit_sgd(
+            jnp.array(2.0),
+            target_scale=2.0,
+            optimizer=optax.adam(1e-1),
+            num_steps=200,
+        )
+        assert calls[:2] == ["prepare", "spec"]
+        # The loss and the finalizer both saw the *prepared* target (4.0), not
+        # the raw 2.0, and the hook consumed its own keyword.
+        np.testing.assert_allclose(model.finalized_with, 4.0)
+        assert abs(model.scale - 4.0) < 0.5
+
+    def test_hook_with_concrete_signature_rejects_unknown_keywords(self) -> None:
+        class _Strict(_ToyModel):
+            def _prepare_sgd_data(self, target):
+                return (target,), {}
+
+        with pytest.raises(TypeError, match="unexpected keyword argument 'key'"):
+            _Strict().fit_sgd(jnp.array(1.0), key=1, num_steps=0)

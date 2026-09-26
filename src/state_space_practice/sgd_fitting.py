@@ -7,14 +7,19 @@ finalization.
 Models must implement:
 - _build_param_spec() -> tuple[dict, dict]
 - _sgd_loss_fn(params, *args, **kwargs) -> Array
-- _store_sgd_params(params: dict) -> None
 - _finalize_sgd(*args, **kwargs) -> None
-- _check_sgd_initialized() -> None
 - _n_timesteps: int (property or attribute)
+
+and either declare ``_sgd_param_attrs`` (param key -> attribute name, used by
+the default ``_store_sgd_params``) or override ``_store_sgd_params``.
+Optional hooks: ``_check_sgd_initialized`` (default no-op) and
+``_prepare_sgd_data`` (default: pass the data through unchanged).
 """
 
 import logging
 import math
+from collections.abc import Mapping
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -75,17 +80,64 @@ class SGDFittableMixin:
     Models must implement:
     - _build_param_spec() -> tuple[dict, dict]
     - _sgd_loss_fn(params, *args, **kwargs) -> Array
-    - _store_sgd_params(params: dict) -> None
     - _finalize_sgd(*args, **kwargs) -> None
     - _n_timesteps: int (property or attribute)
+
+    and store the optimized parameters either by declaring
+    ``_sgd_param_attrs`` (consumed by the default ``_store_sgd_params``) or
+    by overriding ``_store_sgd_params``.
 
     Models whose parameters are allocated lazily (e.g. on the first ``fit``)
     may override ``_check_sgd_initialized`` to raise before optimization
     starts; the default is a no-op for models that allocate in ``__init__``.
+    Models that need to validate or canonicalize the data ``fit_sgd``
+    receives (or record its length for ``_n_timesteps``) override
+    ``_prepare_sgd_data`` instead of re-declaring ``fit_sgd``.
     """
+
+    #: Optimized-parameter key -> model attribute name, consumed by the
+    #: default ``_store_sgd_params``. A subclass attribute *replaces* (does
+    #: not merge with) the parent's mapping; extend it explicitly with
+    #: ``{**Parent._sgd_param_attrs, "key": "attr"}``.
+    _sgd_param_attrs: ClassVar[Mapping[str, str]] = {}
 
     def _check_sgd_initialized(self) -> None:
         return
+
+    def _prepare_sgd_data(
+        self, *args: Any, **kwargs: Any
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Validate / canonicalize the data passed to ``fit_sgd``.
+
+        Called first thing in ``fit_sgd`` with the positional data and any
+        model-specific keyword arguments (everything except the optimizer
+        settings). The returned ``(args, kwargs)`` replace the originals and
+        are forwarded to ``_sgd_loss_fn`` and ``_finalize_sgd``, so a model
+        can coerce inputs to arrays, reject malformed data before any JAX
+        work, or record the sequence length that ``_n_timesteps`` reports,
+        without overriding ``fit_sgd`` itself. The default is the identity.
+        """
+        return args, kwargs
+
+    def _store_sgd_params(self, params: dict) -> None:
+        """Copy the optimized parameters onto the model.
+
+        Default implementation driven by ``_sgd_param_attrs``: every mapped
+        key present in ``params`` is assigned to its attribute; absent keys
+        are skipped, so a param spec may drop entries. Models with derived
+        storage (a per-state slot, a re-stabilized covariance, a matrix
+        rebuilt from scientific parameters) override this method and call
+        ``super()._store_sgd_params(params)`` for the plain keys.
+        """
+        attrs = self._sgd_param_attrs
+        if not attrs:
+            raise NotImplementedError(
+                f"{type(self).__name__} must declare `_sgd_param_attrs` or "
+                "override `_store_sgd_params` to store optimized parameters."
+            )
+        for key, attr in attrs.items():
+            if key in params:
+                setattr(self, attr, params[key])
 
     def _finalize_convergence(self, converged: bool, max_iter: int) -> None:
         """Record the EM convergence flag and warn if the fit did not converge.
@@ -119,7 +171,8 @@ class SGDFittableMixin:
         Parameters
         ----------
         *args, **kwargs
-            Passed to _sgd_loss_fn and _finalize_sgd.
+            Passed through ``_prepare_sgd_data`` and then to _sgd_loss_fn
+            and _finalize_sgd.
         optimizer : optax optimizer or None
             Default: adam(1e-2) with gradient clipping.
         num_steps : int
@@ -141,7 +194,7 @@ class SGDFittableMixin:
         """
         import optax
 
-
+        args, kwargs = self._prepare_sgd_data(*args, **kwargs)
         num_steps = validate_int(num_steps, "num_steps", nonnegative=True)
 
         self._check_sgd_initialized()

@@ -3,15 +3,24 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from scipy.stats import multivariate_normal
 
 from state_space_practice.hamiltonian_core import (
-    _BaseModelStubs,
+    HamiltonianModelBase,
     ekf_rts_backward_pass,
     gaussian_measurement_update,
+    hamiltonian_ekf_filter,
+    hamiltonian_ekf_smoother,
     point_process_laplace_update,
 )
+from state_space_practice.hamiltonian_joint import JointHamiltonianModel
+from state_space_practice.hamiltonian_lfp import HamiltonianLFPModel
+from state_space_practice.hamiltonian_spikes import HamiltonianSpikeModel
+from state_space_practice.hamiltonian_switching import SwitchingHamiltonianJointModel
+from state_space_practice.oscillator_models import BaseModel, OscillatorParameterBase
 from state_space_practice.point_process_kalman import glm_laplace_update, poisson_family
+from state_space_practice.sgd_fitting import SGDFittableMixin
 
 
 def test_point_process_laplace_covariance_matches_information_form():
@@ -262,12 +271,81 @@ def test_ekf_rts_backward_pass_returns_empty_trajectory_for_zero_steps():
     assert P_smooth.shape == (0, n, n)
 
 
-def test_basemodel_stubs_cover_all_abstract_hooks():
-    """_BaseModelStubs must stub every BaseModel abstract hook (catches renames)."""
-    from state_space_practice.oscillator_models import BaseModel
-
-    stubbed = {name for name in vars(_BaseModelStubs) if not name.startswith("__")}
-    # Guard: the check is only meaningful if BaseModel actually declares hooks.
+@pytest.mark.parametrize(
+    "model_cls",
+    [
+        HamiltonianLFPModel,
+        HamiltonianSpikeModel,
+        JointHamiltonianModel,
+        SwitchingHamiltonianJointModel,
+    ],
+)
+def test_hamiltonian_models_do_not_inherit_the_em_layer(model_cls):
+    """SGD-only family: parameter base + SGDFittableMixin, no EM hooks or fit()."""
+    # Guard: BaseModel is still the EM layer, so the absence checks below mean
+    # something.
     assert BaseModel.__abstractmethods__, "BaseModel declares no abstract hooks"
-    missing = set(BaseModel.__abstractmethods__) - stubbed
-    assert not missing, f"_BaseModelStubs is missing stubs for {missing}"
+    assert hasattr(BaseModel, "fit") and hasattr(BaseModel, "_e_step")
+
+    assert issubclass(model_cls, HamiltonianModelBase)
+    assert issubclass(model_cls, OscillatorParameterBase)
+    assert issubclass(model_cls, SGDFittableMixin)
+    assert not issubclass(model_cls, BaseModel)
+    for name in ("fit", "_e_step", "_m_step", *BaseModel.__abstractmethods__):
+        assert not hasattr(model_cls, name), f"{model_cls.__name__} exposes {name}"
+
+
+def _lfp_case(seed, sampling_freq):
+    model = HamiltonianLFPModel(
+        n_oscillators=1, n_sources=2, sampling_freq=sampling_freq, hidden_dims=[4],
+        seed=seed,
+    )
+    return model, (jax.random.normal(jax.random.PRNGKey(3), (6, 2)),)
+
+
+def _spike_case(seed, sampling_freq):
+    model = HamiltonianSpikeModel(
+        n_oscillators=1, n_sources=3, sampling_freq=sampling_freq, hidden_dims=[4],
+        seed=seed,
+    )
+    return model, (jax.random.poisson(jax.random.PRNGKey(3), 0.5, (6, 3)),)
+
+
+def _joint_case(seed, sampling_freq):
+    model = JointHamiltonianModel(
+        n_oscillators=1, n_lfp_sources=2, n_spike_sources=3,
+        sampling_freq=sampling_freq, hidden_dims=[4], seed=seed,
+    )
+    k1, k2 = jax.random.split(jax.random.PRNGKey(3))
+    return model, (
+        jax.random.normal(k1, (6, 2)),
+        jax.random.poisson(k2, 0.5, (6, 3)),
+    )
+
+
+@pytest.mark.parametrize("make_case", [_lfp_case, _spike_case, _joint_case])
+def test_jitted_cores_are_shared_across_model_instances(make_case):
+    """A second instance with the same shapes and dt reuses the compilation.
+
+    The cores are module-level ``jax.jit`` functions keyed on array shapes plus
+    the static ``dt`` / observation-model name, not on the model object. A
+    different ``dt`` must compile again, which keeps the equality checks from
+    being vacuous.
+    """
+
+    def run(model, data):
+        params = model._build_param_spec()[0]
+        model.filter(*data, params)
+        model.smooth(*data, params)
+
+    run(*make_case(seed=0, sampling_freq=200.0))
+    n_filter = hamiltonian_ekf_filter._cache_size()
+    n_smooth = hamiltonian_ekf_smoother._cache_size()
+
+    run(*make_case(seed=1, sampling_freq=200.0))
+    assert hamiltonian_ekf_filter._cache_size() == n_filter
+    assert hamiltonian_ekf_smoother._cache_size() == n_smooth
+
+    run(*make_case(seed=0, sampling_freq=100.0))
+    assert hamiltonian_ekf_filter._cache_size() == n_filter + 1
+    assert hamiltonian_ekf_smoother._cache_size() == n_smooth + 1

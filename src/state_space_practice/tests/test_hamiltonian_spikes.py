@@ -111,9 +111,11 @@ class TestHamiltonianSpikeModelSmoke:
         assert jnp.all(jnp.isfinite(m_s)), "Smoothed means contain non-finite values"
         assert m_s.shape[0] == spikes.shape[0]
 
-    def test_fit_raises_not_implemented(self, model_and_data):
+    def test_em_fit_is_not_available(self, model_and_data):
+        """SGD-only: the EM ``fit`` is not inherited; ``fit_sgd`` is the entry."""
         model, spikes = model_and_data
-        with pytest.raises(NotImplementedError, match="fit_sgd"):
+        assert callable(model.fit_sgd)
+        with pytest.raises(AttributeError, match="fit"):
             model.fit(spikes, max_iter=1, skip_init=True)
 
     def test_store_sgd_params_resyncs_measurement_matrix(self, model_and_data):

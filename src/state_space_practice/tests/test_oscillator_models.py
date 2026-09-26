@@ -2887,3 +2887,35 @@ class TestSamplingFrequencyRange:
             1.0 - 1.0 / sampling_freq,
             rtol=1e-6,
         )
+
+
+class TestBaseModelSGDStorage:
+    """BaseModel stores its plain SGD keys through the mapping-driven default."""
+
+    def test_store_sgd_params_writes_plain_keys_and_leaves_others(
+        self, common_oscillator_params
+    ) -> None:
+        model = CommonOscillatorModel(**common_oscillator_params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        n_states = model.n_discrete_states
+        old_init_cov = model.init_cov
+        new_Z = jnp.full((n_states, n_states), 1.0 / n_states)
+        new_pi = jnp.full((n_states,), 1.0 / n_states)
+        new_m0 = model.init_mean + 1.0
+        # Guard: the new values differ from the initialized ones.
+        assert not bool(jnp.allclose(new_Z, model.discrete_transition_matrix))
+        assert not bool(jnp.allclose(new_m0, model.init_mean))
+
+        model._store_sgd_params(
+            {
+                "discrete_transition_matrix": new_Z,
+                "init_discrete_state_prob": new_pi,
+                "init_mean": new_m0,
+            }
+        )
+
+        np.testing.assert_array_equal(model.discrete_transition_matrix, new_Z)
+        np.testing.assert_array_equal(model.init_discrete_state_prob, new_pi)
+        np.testing.assert_array_equal(model.init_mean, new_m0)
+        # Keys absent from params are left untouched.
+        assert model.init_cov is old_init_cov

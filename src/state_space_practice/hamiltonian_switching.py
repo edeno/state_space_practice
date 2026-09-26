@@ -15,6 +15,7 @@ import jax.numpy as jnp
 from jax import Array
 
 from state_space_practice.hamiltonian_core import (
+    default_init_mean,
     gaussian_measurement_update,
     mlp_l2_penalty,
     point_process_laplace_update,
@@ -24,6 +25,7 @@ from state_space_practice.nonlinear_dynamics import (
     apply_mlp,
     ekf_predict_step,
     ekf_predict_step_with_jacobian,
+    ekf_smooth_step,
     init_mlp_params,
 )
 from state_space_practice.parameter_transforms import (
@@ -31,13 +33,380 @@ from state_space_practice.parameter_transforms import (
     UNCONSTRAINED,
     ParameterTransform,
 )
+from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.switching_kalman import collapse_gaussian_mixture
 from state_space_practice.utils import divide_safe as _divide_safe
 from state_space_practice.utils import scale_likelihood as _scale_likelihood
 
 
+def switching_predict_collapse(
+    m_prev: Array,
+    P_prev: Array,
+    pi_prev: Array,
+    Z: Array,
+    mlp_params: dict[str, Any],
+    omega: Array,
+    Q_all: Array,
+    dt: float,
+    *,
+    with_jacobian: bool,
+):
+    """Predict step + Gaussian-mixture collapse for the switching filter.
+
+    Every previous-state Gaussian ``j`` is propagated through every
+    Hamiltonian ``k`` (``dt`` is the leapfrog step), then collapsed per
+    current state ``k`` under the joint discrete prior ``P(s_{t-1}, s_t)``.
+
+    Returns the per-state collapsed predicted mean/cov (and Jacobian if
+    requested), the joint discrete prior P(s_{t-1}, s_t), the marginal
+    predicted prior P(s_t), and the uncollapsed pair predictions needed by
+    the switching RTS smoother.
+    """
+    K_states = Z.shape[0]
+
+    def predict_j_k(mj, Pj, k):
+        trans_k = {
+            **jax.tree_util.tree_map(lambda x: x[k], mlp_params),
+            "omega": omega[k],
+        }
+        if with_jacobian:
+            return ekf_predict_step_with_jacobian(
+                mj, Pj, trans_k, apply_mlp, Q_all[:, :, k], dt
+            )
+        return ekf_predict_step(mj, Pj, trans_k, apply_mlp, Q_all[:, :, k], dt)
+
+    v_predict = jax.vmap(
+        jax.vmap(predict_j_k, in_axes=(None, None, 0)),
+        in_axes=(1, 2, None),
+    )
+    if with_jacobian:
+        m_p_jk, P_p_jk, F_jk = v_predict(m_prev, P_prev, jnp.arange(K_states))
+    else:
+        m_p_jk, P_p_jk = v_predict(m_prev, P_prev, jnp.arange(K_states))
+        F_jk = None
+
+    joint_pi_pred = pi_prev[:, None] * Z
+    pi_pred_k = jnp.sum(joint_pi_pred, axis=0)
+
+    def collapse_k(k):
+        w_jk = _divide_safe(joint_pi_pred[:, k], pi_pred_k[k])
+        return collapse_gaussian_mixture(
+            m_p_jk[:, k, :].T,
+            P_p_jk[:, k, :, :].transpose(1, 2, 0),
+            w_jk,
+        )
+
+    m_p_k, P_p_k = jax.vmap(collapse_k)(jnp.arange(K_states))
+    m_p_k = m_p_k.T
+    P_p_k = P_p_k.transpose(1, 2, 0)
+    return m_p_k, P_p_k, F_jk, joint_pi_pred, pi_pred_k, m_p_jk, P_p_jk
+
+
+@partial(jax.jit, static_argnames=("dt",))
+def switching_hamiltonian_filter(
+    observations: tuple[Array, Array],
+    params: dict[str, Any],
+    *,
+    dt: float,
+) -> tuple[Array, Array, Array, Array]:
+    """JIT-compiled switching EKF with Gaussian collapse (Kim filter).
+
+    ``observations`` is ``(lfp_data, spike_data)``; ``params`` carries the
+    per-state dynamics (``mlp``, ``omega``, ``Q``, ``init_mean``,
+    ``init_cov``), the discrete-state parameters (``Z``, ``init_pi``) and the
+    shared readout (``C_lfp``, ``d_lfp``, ``R_lfp``, ``C_spikes``,
+    ``d_spikes``). Only ``dt`` is static (the number of discrete states
+    follows from the array shapes), so the compile cache is shared by every
+    model instance with the same configuration.
+
+    Returns ``(means, covs, discrete_probs, marginal_lls)`` with shapes
+    ``(n_time, n_latent, K)``, ``(n_time, n_latent, n_latent, K)``,
+    ``(n_time, K)`` and ``(n_time,)``.
+    """
+    mlp_params, omega = params["mlp"], params["omega"]
+    Z = params["Z"]
+    C_l, d_l = params["C_lfp"], params["d_lfp"]
+    C_s, d_s = params["C_spikes"], params["d_spikes"]
+    R_l = params["R_lfp"]
+    Q = params["Q"]
+    K_states = Z.shape[0]
+
+    def step(carry, obs_t):
+        y_lfp_t, y_spike_t = obs_t
+        m_prev, P_prev, pi_prev = carry
+
+        (
+            m_p_k,
+            P_p_k,
+            _,
+            _joint_pi_pred,  # only the smoother needs the joint prior
+            pi_pred_k,
+            _,
+            _,
+        ) = switching_predict_collapse(
+            m_prev,
+            P_prev,
+            pi_prev,
+            Z,
+            mlp_params,
+            omega,
+            Q,
+            dt,
+            with_jacobian=False,
+        )
+
+        def update_k(k):
+            m_mid, P_mid, ll_l = gaussian_measurement_update(
+                m_p_k[:, k],
+                P_p_k[:, :, k],
+                y_lfp_t,
+                C_l,
+                d_l,
+                R_l,
+            )
+            m_post, P_post, ll_s = point_process_laplace_update(
+                m_mid,
+                P_mid,
+                y_spike_t,
+                C_s,
+                d_s,
+                dt,
+            )
+            return m_post, P_post, ll_l + ll_s
+
+        m_filt, P_filt, lls_k = jax.vmap(update_k)(jnp.arange(K_states))
+        scaled_lik, ll_max = _scale_likelihood(lls_k)
+        pi_filt = _divide_safe(scaled_lik * pi_pred_k, jnp.sum(scaled_lik * pi_pred_k))
+        m_filt_T = m_filt.T
+        P_filt_T = P_filt.transpose(1, 2, 0)
+        marginal_ll = ll_max + jnp.log(jnp.sum(scaled_lik * pi_pred_k))
+
+        return (
+            (m_filt_T, P_filt_T, pi_filt),
+            (m_filt_T, P_filt_T, pi_filt, marginal_ll),
+        )
+
+    m0 = params["init_mean"]
+    P0 = params["init_cov"]
+    pi0 = params["init_pi"]
+    _, (means, covs, probs, marginal_lls) = jax.lax.scan(
+        step,
+        (m0, P0, pi0),
+        observations,
+    )
+    return means, covs, probs, marginal_lls
+
+
+@partial(jax.jit, static_argnames=("dt",))
+def switching_hamiltonian_smoother(
+    observations: tuple[Array, Array],
+    params: dict[str, Any],
+    *,
+    dt: float,
+) -> tuple[Array, Array, Array]:
+    """JIT-compiled switching EKF-RTS smoother with Kim-style state smoothing.
+
+    Same inputs and caching behaviour as :func:`switching_hamiltonian_filter`.
+
+    Returns
+    -------
+    smoothed_means : (n_time, n_latent, n_discrete_states)
+    smoothed_covs : (n_time, n_latent, n_latent, n_discrete_states)
+    smoothed_probs : (n_time, n_discrete_states)
+    """
+    lfp_data, _ = observations
+    mlp_params, omega = params["mlp"], params["omega"]
+    Z = params["Z"]
+    C_l, d_l = params["C_lfp"], params["d_lfp"]
+    C_s, d_s = params["C_spikes"], params["d_spikes"]
+    R_l = params["R_lfp"]
+    Q = params["Q"]
+    K_states = Z.shape[0]
+
+    def forward_step(carry, obs_t):
+        y_lfp_t, y_spike_t = obs_t
+        m_prev, P_prev, pi_prev = carry
+
+        (
+            m_p_k,
+            P_p_k,
+            F_jk,
+            joint_pi_pred,
+            pi_pred_k,
+            m_p_jk,
+            P_p_jk,
+        ) = switching_predict_collapse(
+            m_prev,
+            P_prev,
+            pi_prev,
+            Z,
+            mlp_params,
+            omega,
+            Q,
+            dt,
+            with_jacobian=True,
+        )
+
+        def update_k(k):
+            # Per-state gaussian + Laplace update. Log-likelihoods
+            # here go into _scale_likelihood for relative discrete-
+            # state weighting only, so the Gaussian normalization
+            # constant is dropped. The Laplace correction terms remain
+            # state-dependent and must be included.
+            m_mid, P_mid, ll_l = gaussian_measurement_update(
+                m_p_k[:, k],
+                P_p_k[:, :, k],
+                y_lfp_t,
+                C_l,
+                d_l,
+                R_l,
+                include_normalization_const=False,
+            )
+            m_post, P_post, ll_s = point_process_laplace_update(
+                m_mid,
+                P_mid,
+                y_spike_t,
+                C_s,
+                d_s,
+                dt,
+            )
+            return m_post, P_post, ll_l + ll_s
+
+        m_f, P_f, lls_k = jax.vmap(update_k)(jnp.arange(K_states))
+        m_f = m_f.T
+        P_f = P_f.transpose(1, 2, 0)
+        scaled_lik, _ = _scale_likelihood(lls_k)
+        pi_filt = _divide_safe(scaled_lik * pi_pred_k, jnp.sum(scaled_lik * pi_pred_k))
+        return (
+            (m_f, P_f, pi_filt),
+            (
+                m_f,
+                P_f,
+                m_p_jk,
+                P_p_jk,
+                F_jk,
+                joint_pi_pred,
+                pi_pred_k,
+                pi_filt,
+            ),
+        )
+
+    m0 = params["init_mean"]
+    P0 = params["init_cov"]
+    pi0 = params["init_pi"]
+    (
+        _,
+        (
+            m_filt,
+            P_filt,
+            m_pred_pair,
+            P_pred_pair,
+            F_all,
+            joint_pi_all,
+            pi_pred_all,
+            pi_filt_all,
+        ),
+    ) = jax.lax.scan(forward_step, (m0, P0, pi0), observations)
+
+    # Empty sequence: no terminal filtered state to seed the reverse scan
+    # (``m_filt[-1]`` below would index axis 0 of size 0). The smoother of an
+    # empty trajectory is that same empty trajectory -- matching
+    # ``ekf_rts_backward_pass`` / ``gaussian_measurement_update`` in
+    # hamiltonian_core. ``m_filt``/``P_filt``/``pi_filt_all`` already carry
+    # the exact ``(0, ...)`` output shapes and dtypes. The time dimension is
+    # static, so this branch is JIT-safe.
+    if lfp_data.shape[0] == 0:
+        return m_filt, P_filt, pi_filt_all
+
+    # Backward pass: Kim-style discrete-state smoothing plus pairwise
+    # EKF-RTS updates over (S_t=i, S_{t+1}=k), collapsed back to one
+    # Gaussian per current state.
+    def backward_step(carry, inputs):
+        m_s_next, P_s_next, pi_s_next = carry
+        (
+            m_f_t,
+            P_f_t,
+            m_p_next_jk,
+            P_p_next_jk,
+            F_next_jk,
+            joint_pi_next,
+            pi_pred_next_k,
+            _pi_filt_t,
+        ) = inputs
+
+        backward_cond = _divide_safe(joint_pi_next, pi_pred_next_k[None, :])
+        joint_smooth = backward_cond * pi_s_next[None, :]
+        pi_s_t = jnp.sum(joint_smooth, axis=1)
+        pi_s_t = _divide_safe(pi_s_t, jnp.sum(pi_s_t))
+        forward_cond = _divide_safe(joint_smooth, pi_s_t[:, None])
+
+        m_s_next_k = m_s_next.T
+        P_s_next_k = P_s_next.transpose(2, 0, 1)
+        m_f_i = m_f_t.T
+        P_f_i = P_f_t.transpose(2, 0, 1)
+
+        def smooth_i(m_f_curr, P_f_curr, m_pred_i, P_pred_i, F_i):
+            return jax.vmap(
+                lambda m_pred, P_pred, F, m_next, P_next: ekf_smooth_step(
+                    m_f_curr,
+                    P_f_curr,
+                    m_pred,
+                    P_pred,
+                    m_next,
+                    P_next,
+                    F,
+                )
+            )(m_pred_i, P_pred_i, F_i, m_s_next_k, P_s_next_k)
+
+        pair_m, pair_P = jax.vmap(smooth_i)(
+            m_f_i, P_f_i, m_p_next_jk, P_p_next_jk, F_next_jk
+        )
+
+        def collapse_i(means_i, covs_i, weights_i):
+            return collapse_gaussian_mixture(
+                means_i.T,
+                covs_i.transpose(1, 2, 0),
+                weights_i,
+            )
+
+        m_s, P_s = jax.vmap(collapse_i)(pair_m, pair_P, forward_cond)
+        return (
+            (m_s.T, P_s.transpose(1, 2, 0), pi_s_t),
+            (m_s.T, P_s.transpose(1, 2, 0), pi_s_t),
+        )
+
+    init_s = (m_filt[-1], P_filt[-1], pi_filt_all[-1])
+    bw_in = (
+        m_filt[:-1],
+        P_filt[:-1],
+        m_pred_pair[1:],
+        P_pred_pair[1:],
+        F_all[1:],
+        joint_pi_all[1:],
+        pi_pred_all[1:],
+        pi_filt_all[:-1],
+    )
+    _, (m_smooth_rev, P_smooth_rev, pi_smooth_rev) = jax.lax.scan(
+        backward_step,
+        init_s,
+        bw_in,
+        reverse=True,
+    )
+    m_s = jnp.concatenate([m_smooth_rev, m_filt[-1:]], axis=0)
+    P_s = jnp.concatenate([P_smooth_rev, P_filt[-1:]], axis=0)
+    pi_s = jnp.concatenate([pi_smooth_rev, pi_filt_all[-1:]], axis=0)
+    return m_s, P_s, pi_s
+
+
 class SwitchingHamiltonianJointModel(JointHamiltonianModel):
     """Switching Model with multiple Hamiltonian energy landscapes."""
+
+    _sgd_param_attrs = {
+        **JointHamiltonianModel._sgd_param_attrs,
+        "init_mean": "init_mean",
+        "Z": "discrete_transition_matrix",
+        "init_pi": "init_discrete_state_prob",
+    }
 
     def __init__(
         self,
@@ -74,16 +443,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
 
         self._initialize_parameters(self.key)
 
-    def _measurement_matrix_all_states(self) -> Array:
-        """Stack ``[C_lfp; C_spikes]`` once per discrete state, axis last."""
-        C = jnp.concatenate([self.C_lfp, self.C_spikes], axis=0)
-        return jnp.broadcast_to(
-            C[:, :, None], (self.n_sources, self.n_cont_states, self.n_discrete_states)
-        )
-
     def _initialize_parameters(self, key: Array) -> None:
-        from state_space_practice.hamiltonian_core import default_init_mean
-
         self.init_discrete_state_prob = (
             jnp.ones((self.n_discrete_states,)) / self.n_discrete_states
         )
@@ -96,75 +456,10 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
             [jnp.eye(self.n_cont_states) * 1e-4] * self.n_discrete_states, axis=2
         )
         self.measurement_matrix = self._measurement_matrix_all_states()
-        R_all_states = jnp.broadcast_to(
-            self.R_lfp[:, :, None],
-            (self.n_lfp, self.n_lfp, self.n_discrete_states),
-        )
-        self.measurement_cov = (
-            jnp.zeros((self.n_sources, self.n_sources, self.n_discrete_states))
-            .at[: self.n_lfp, : self.n_lfp, :]
-            .set(R_all_states)
-        )
+        self.measurement_cov = self._measurement_cov_all_states()
         self.continuous_transition_matrix = jnp.stack(
             [jnp.eye(self.n_cont_states)] * self.n_discrete_states, axis=2
         )
-
-    def _per_state_pred_collapse(
-        self,
-        m_prev: Array,
-        P_prev: Array,
-        pi_prev: Array,
-        Z: Array,
-        mlp_params: dict[str, Any],
-        omega: Array,
-        Q_all: Array,
-        K_states: int,
-        with_jacobian: bool,
-    ):
-        """Predict step + Gaussian-mixture collapse for the switching filter.
-
-        Returns the per-state collapsed predicted mean/cov (and Jacobian
-        if requested), the joint discrete prior P(s_{t-1}, s_t), the
-        marginal predicted prior P(s_t), and the uncollapsed pair predictions
-        needed by the switching RTS smoother.
-        """
-
-        def predict_j_k(mj, Pj, k):
-            trans_k = {
-                **jax.tree_util.tree_map(lambda x: x[k], mlp_params),
-                "omega": omega[k],
-            }
-            if with_jacobian:
-                return ekf_predict_step_with_jacobian(
-                    mj, Pj, trans_k, apply_mlp, Q_all[:, :, k], self.dt
-                )
-            return ekf_predict_step(mj, Pj, trans_k, apply_mlp, Q_all[:, :, k], self.dt)
-
-        v_predict = jax.vmap(
-            jax.vmap(predict_j_k, in_axes=(None, None, 0)),
-            in_axes=(1, 2, None),
-        )
-        if with_jacobian:
-            m_p_jk, P_p_jk, F_jk = v_predict(m_prev, P_prev, jnp.arange(K_states))
-        else:
-            m_p_jk, P_p_jk = v_predict(m_prev, P_prev, jnp.arange(K_states))
-            F_jk = None
-
-        joint_pi_pred = pi_prev[:, None] * Z
-        pi_pred_k = jnp.sum(joint_pi_pred, axis=0)
-
-        def collapse_k(k):
-            w_jk = _divide_safe(joint_pi_pred[:, k], pi_pred_k[k])
-            return collapse_gaussian_mixture(
-                m_p_jk[:, k, :].T,
-                P_p_jk[:, k, :, :].transpose(1, 2, 0),
-                w_jk,
-            )
-
-        m_p_k, P_p_k = jax.vmap(collapse_k)(jnp.arange(K_states))
-        m_p_k = m_p_k.T
-        P_p_k = P_p_k.transpose(1, 2, 0)
-        return m_p_k, P_p_k, F_jk, joint_pi_pred, pi_pred_k, m_p_jk, P_p_jk
 
     def filter(  # type: ignore[override]
         self,
@@ -174,96 +469,18 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
     ) -> tuple[Array, Array, Array, Array]:
         """Switching EKF with Gaussian Collapse (Kim Filter)."""
         lfp_data, spike_data = self._validate_joint_data(lfp_data, spike_data)
+        return self._filter_jit(
+            (lfp_data, spike_data), self._complete_filter_params(params)
+        )
+
+    def _filter_jit(  # type: ignore[override]
+        self, observations: Any, params: dict[str, Any]
+    ) -> tuple[Array, Array, Array, Array]:
+        """Switching filter core: ``(means, covs, discrete_probs, marginal_lls)``."""
         return cast(
             tuple[Array, Array, Array, Array],
-            self._filter_jit(
-                lfp_data, spike_data, self._complete_filter_params(params)
-            ),
+            switching_hamiltonian_filter(observations, params, dt=self.dt),
         )
-
-    @partial(jax.jit, static_argnums=(0,))
-    def _filter_jit(
-        self,
-        lfp_data: Array,
-        spike_data: Array,
-        params: dict[str, Any],
-    ) -> tuple[Array, Array, Array, Array]:
-        """JIT-compiled switching filter core; covariances passed explicitly."""
-        mlp_params, omega = params["mlp"], params["omega"]
-        Z = params["Z"]
-        C_l, d_l = params["C_lfp"], params["d_lfp"]
-        C_s, d_s = params["C_spikes"], params["d_spikes"]
-        R_l = params["R_lfp"]
-        Q = params["Q"]
-        K_states = self.n_discrete_states
-
-        def step(carry, obs_t):
-            y_lfp_t, y_spike_t = obs_t
-            m_prev, P_prev, pi_prev = carry
-
-            (
-                m_p_k,
-                P_p_k,
-                _,
-                joint_pi_pred,
-                pi_pred_k,
-                _,
-                _,
-            ) = self._per_state_pred_collapse(
-                m_prev,
-                P_prev,
-                pi_prev,
-                Z,
-                mlp_params,
-                omega,
-                Q,
-                K_states,
-                with_jacobian=False,
-            )
-            del joint_pi_pred  # not used in filter (only smoother needs it)
-
-            def update_k(k):
-                m_mid, P_mid, ll_l = gaussian_measurement_update(
-                    m_p_k[:, k],
-                    P_p_k[:, :, k],
-                    y_lfp_t,
-                    C_l,
-                    d_l,
-                    R_l,
-                )
-                m_post, P_post, ll_s = point_process_laplace_update(
-                    m_mid,
-                    P_mid,
-                    y_spike_t,
-                    C_s,
-                    d_s,
-                    self.dt,
-                )
-                return m_post, P_post, ll_l + ll_s
-
-            m_filt, P_filt, lls_k = jax.vmap(update_k)(jnp.arange(K_states))
-            scaled_lik, ll_max = _scale_likelihood(lls_k)
-            pi_filt = _divide_safe(
-                scaled_lik * pi_pred_k, jnp.sum(scaled_lik * pi_pred_k)
-            )
-            m_filt_T = m_filt.T
-            P_filt_T = P_filt.transpose(1, 2, 0)
-            marginal_ll = ll_max + jnp.log(jnp.sum(scaled_lik * pi_pred_k))
-
-            return (
-                (m_filt_T, P_filt_T, pi_filt),
-                (m_filt_T, P_filt_T, pi_filt, marginal_ll),
-            )
-
-        m0 = params["init_mean"]
-        P0 = params["init_cov"]
-        pi0 = params["init_pi"]
-        _, (means, covs, probs, marginal_lls) = jax.lax.scan(
-            step,
-            (m0, P0, pi0),
-            (lfp_data, spike_data),
-        )
-        return means, covs, probs, marginal_lls
 
     def smooth(  # type: ignore[override]
         self,
@@ -280,216 +497,29 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         smoothed_probs : (n_time, n_discrete_states)
         """
         lfp_data, spike_data = self._validate_joint_data(lfp_data, spike_data)
+        return self._smooth_jit(
+            (lfp_data, spike_data), self._complete_filter_params(params)
+        )
+
+    def _smooth_jit(  # type: ignore[override]
+        self, observations: Any, params: dict[str, Any]
+    ) -> tuple[Array, Array, Array]:
+        """Switching smoother core: ``(means, covs, discrete_probs)``."""
         return cast(
             tuple[Array, Array, Array],
-            self._smooth_jit(
-                lfp_data, spike_data, self._complete_filter_params(params)
-            ),
+            switching_hamiltonian_smoother(observations, params, dt=self.dt),
         )
-
-    @partial(jax.jit, static_argnums=(0,))
-    def _smooth_jit(
-        self,
-        lfp_data: Array,
-        spike_data: Array,
-        params: dict[str, Any],
-    ) -> tuple[Array, Array, Array]:
-        """JIT-compiled switching smoother core; covariances passed explicitly."""
-        mlp_params, omega = params["mlp"], params["omega"]
-        Z = params["Z"]
-        C_l, d_l = params["C_lfp"], params["d_lfp"]
-        C_s, d_s = params["C_spikes"], params["d_spikes"]
-        R_l = params["R_lfp"]
-        Q = params["Q"]
-        K_states = self.n_discrete_states
-
-        def forward_step(carry, obs_t):
-            y_lfp_t, y_spike_t = obs_t
-            m_prev, P_prev, pi_prev = carry
-
-            (
-                m_p_k,
-                P_p_k,
-                F_jk,
-                joint_pi_pred,
-                pi_pred_k,
-                m_p_jk,
-                P_p_jk,
-            ) = self._per_state_pred_collapse(
-                m_prev,
-                P_prev,
-                pi_prev,
-                Z,
-                mlp_params,
-                omega,
-                Q,
-                K_states,
-                with_jacobian=True,
-            )
-
-            def update_k(k):
-                # Per-state gaussian + Laplace update. Log-likelihoods
-                # here go into _scale_likelihood for relative discrete-
-                # state weighting only, so the Gaussian normalization
-                # constant is dropped. The Laplace correction terms remain
-                # state-dependent and must be included.
-                m_mid, P_mid, ll_l = gaussian_measurement_update(
-                    m_p_k[:, k],
-                    P_p_k[:, :, k],
-                    y_lfp_t,
-                    C_l,
-                    d_l,
-                    R_l,
-                    include_normalization_const=False,
-                )
-                m_post, P_post, ll_s = point_process_laplace_update(
-                    m_mid,
-                    P_mid,
-                    y_spike_t,
-                    C_s,
-                    d_s,
-                    self.dt,
-                )
-                return m_post, P_post, ll_l + ll_s
-
-            m_f, P_f, lls_k = jax.vmap(update_k)(jnp.arange(K_states))
-            m_f = m_f.T
-            P_f = P_f.transpose(1, 2, 0)
-            scaled_lik, _ = _scale_likelihood(lls_k)
-            pi_filt = _divide_safe(
-                scaled_lik * pi_pred_k, jnp.sum(scaled_lik * pi_pred_k)
-            )
-            return (
-                (m_f, P_f, pi_filt),
-                (
-                    m_f,
-                    P_f,
-                    m_p_jk,
-                    P_p_jk,
-                    F_jk,
-                    joint_pi_pred,
-                    pi_pred_k,
-                    pi_filt,
-                ),
-            )
-
-        m0 = params["init_mean"]
-        P0 = params["init_cov"]
-        pi0 = params["init_pi"]
-        (
-            _,
-            (
-                m_filt,
-                P_filt,
-                m_pred_pair,
-                P_pred_pair,
-                F_all,
-                joint_pi_all,
-                pi_pred_all,
-                pi_filt_all,
-            ),
-        ) = jax.lax.scan(forward_step, (m0, P0, pi0), (lfp_data, spike_data))
-
-        # Empty sequence: no terminal filtered state to seed the reverse scan
-        # (``m_filt[-1]`` below would index axis 0 of size 0). The smoother of an
-        # empty trajectory is that same empty trajectory -- matching
-        # ``ekf_rts_backward_pass`` / ``gaussian_measurement_update`` in
-        # hamiltonian_core. ``m_filt``/``P_filt``/``pi_filt_all`` already carry
-        # the exact ``(0, ...)`` output shapes and dtypes. The time dimension is
-        # static, so this branch is JIT-safe.
-        if lfp_data.shape[0] == 0:
-            return m_filt, P_filt, pi_filt_all
-
-        # Backward pass: Kim-style discrete-state smoothing plus pairwise
-        # EKF-RTS updates over (S_t=i, S_{t+1}=k), collapsed back to one
-        # Gaussian per current state.
-        def backward_step(carry, inputs):
-            m_s_next, P_s_next, pi_s_next = carry
-            (
-                m_f_t,
-                P_f_t,
-                m_p_next_jk,
-                P_p_next_jk,
-                F_next_jk,
-                joint_pi_next,
-                pi_pred_next_k,
-                _pi_filt_t,
-            ) = inputs
-
-            backward_cond = _divide_safe(joint_pi_next, pi_pred_next_k[None, :])
-            joint_smooth = backward_cond * pi_s_next[None, :]
-            pi_s_t = jnp.sum(joint_smooth, axis=1)
-            pi_s_t = _divide_safe(pi_s_t, jnp.sum(pi_s_t))
-            forward_cond = _divide_safe(joint_smooth, pi_s_t[:, None])
-
-            from state_space_practice.nonlinear_dynamics import ekf_smooth_step
-
-            m_s_next_k = m_s_next.T
-            P_s_next_k = P_s_next.transpose(2, 0, 1)
-            m_f_i = m_f_t.T
-            P_f_i = P_f_t.transpose(2, 0, 1)
-
-            def smooth_i(m_f_curr, P_f_curr, m_pred_i, P_pred_i, F_i):
-                return jax.vmap(
-                    lambda m_pred, P_pred, F, m_next, P_next: ekf_smooth_step(
-                        m_f_curr,
-                        P_f_curr,
-                        m_pred,
-                        P_pred,
-                        m_next,
-                        P_next,
-                        F,
-                    )
-                )(m_pred_i, P_pred_i, F_i, m_s_next_k, P_s_next_k)
-
-            pair_m, pair_P = jax.vmap(smooth_i)(
-                m_f_i, P_f_i, m_p_next_jk, P_p_next_jk, F_next_jk
-            )
-
-            def collapse_i(means_i, covs_i, weights_i):
-                return collapse_gaussian_mixture(
-                    means_i.T,
-                    covs_i.transpose(1, 2, 0),
-                    weights_i,
-                )
-
-            m_s, P_s = jax.vmap(collapse_i)(pair_m, pair_P, forward_cond)
-            return (
-                (m_s.T, P_s.transpose(1, 2, 0), pi_s_t),
-                (m_s.T, P_s.transpose(1, 2, 0), pi_s_t),
-            )
-
-        init_s = (m_filt[-1], P_filt[-1], pi_filt_all[-1])
-        bw_in = (
-            m_filt[:-1],
-            P_filt[:-1],
-            m_pred_pair[1:],
-            P_pred_pair[1:],
-            F_all[1:],
-            joint_pi_all[1:],
-            pi_pred_all[1:],
-            pi_filt_all[:-1],
-        )
-        _, (m_smooth_rev, P_smooth_rev, pi_smooth_rev) = jax.lax.scan(
-            backward_step,
-            init_s,
-            bw_in,
-            reverse=True,
-        )
-        m_s = jnp.concatenate([m_smooth_rev, m_filt[-1:]], axis=0)
-        P_s = jnp.concatenate([P_smooth_rev, P_filt[-1:]], axis=0)
-        pi_s = jnp.concatenate([pi_smooth_rev, pi_filt_all[-1:]], axis=0)
-        return m_s, P_s, pi_s
 
     def _complete_filter_params(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Fill per-state covariance defaults before a JIT-compiled method.
+        """Fill per-state covariance defaults before entering the jitted cores.
 
         Unlike the single-regime parent, the switching filter carries per-state
         ``(n_latent, n_latent, n_discrete_states)`` process and initial
         covariances, so it passes the *full* stacks (not a ``[:, :, 0]`` slice)
-        as dynamic filter inputs. Routing them through ``params`` keeps JIT from
-        baking stale ``self`` covariances into the compilation cache -- the same
-        guard the non-switching Hamiltonian models use.
+        as dynamic filter inputs. The compiled cores read only ``params``, so
+        routing the covariances through it is what keeps stale ``self`` values
+        out of the compile cache -- the same guard the non-switching
+        Hamiltonian models use.
         """
         complete = dict(params)
         complete.setdefault("R_lfp", self.R_lfp)
@@ -545,23 +575,17 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         # the switching param spec drops Q/init_cov/R_lfp, so complete them from
         # self before dispatch. Validation already ran once in fit_sgd.
         _, _, _, marginal_lls = self._filter_jit(
-            lfp_data, spike_data, self._complete_filter_params(params)
+            (lfp_data, spike_data), self._complete_filter_params(params)
         )
         lik_loss = -jnp.sum(marginal_lls)
         return lik_loss + l2_reg * mlp_l2_penalty(params["mlp"])
 
     def _store_sgd_params(self, params: dict[str, Any]) -> None:
-        self.mlp_params = params["mlp"]
-        self.omega = params["omega"]
-        self.C_lfp = params["C_lfp"]
-        self.d_lfp = params["d_lfp"]
-        self.C_spikes = params["C_spikes"]
-        self.d_spikes = params["d_spikes"]
-        self.init_mean = params["init_mean"]
-        self.discrete_transition_matrix = params["Z"]
-        self.init_discrete_state_prob = params["init_pi"]
-
-        # Resync BaseModel measurement_matrix across all discrete states.
+        # The switching spec optimizes the full (n_cont_states, K) init_mean
+        # stack and drops Q, so the single-regime slot-0 / Q handling of
+        # HamiltonianModelBase does not apply: store every key through the
+        # mapping-driven default and resync the per-state measurement matrix.
+        SGDFittableMixin._store_sgd_params(self, params)
         self.measurement_matrix = self._measurement_matrix_all_states()
 
     def _finalize_sgd(self, lfp_data, spike_data, **kwargs):
