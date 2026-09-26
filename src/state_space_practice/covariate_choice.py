@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import math
 from functools import partial
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -37,12 +37,17 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.kalman import psd_solve
-from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.multinomial_choice import (
     ChoiceFilterResult,
     ChoiceSmootherResult,
     _softmax_update_core,
 )
+from state_space_practice.parameter_transforms import (
+    POSITIVE,
+    UNCONSTRAINED,
+    UNIT_INTERVAL,
+)
+from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import symmetrize, validate_choice_indices
 
 logger = logging.getLogger(__name__)
@@ -132,8 +137,7 @@ def m_step_input_gain(
     # Covariate gram matrix: sum u_t u_t'
     gram = jnp.einsum("ti,tj->ij", u, u)  # (d, d)
 
-    B_hat = psd_solve(gram.T, cross.T).T
-    return B_hat
+    return psd_solve(gram.T, cross.T).T
 
 
 def m_step_obs_weights(
@@ -193,13 +197,12 @@ def m_step_obs_weights(
         grad = jnp.einsum("tk,td->kd", residuals, obs_covariates)  # (K, d_obs)
         grad_flat = grad.ravel()
 
-        # Block-diagonal Fisher approximation for Hessian
-        hess_diag_blocks = []
-        for k in range(K):
-            w = probs[:, k] * (1 - probs[:, k])  # (T,)
-            Hk = jnp.einsum("t,td,te->de", w, obs_covariates, obs_covariates)
-            hess_diag_blocks.append(Hk)
-        hess = jax.scipy.linalg.block_diag(*hess_diag_blocks)
+        # Block-diagonal Fisher approximation for Hessian: one (d_obs, d_obs)
+        # block per option, weighted by p_k (1 - p_k).
+        hess_blocks = jnp.einsum(
+            "tk,td,te->kde", probs * (1 - probs), obs_covariates, obs_covariates
+        )
+        hess = jax.scipy.linalg.block_diag(*hess_blocks)
 
         # Damped Newton step (0.5 step size for stability)
         step = psd_solve(hess, grad_flat)
@@ -211,15 +214,15 @@ def m_step_obs_weights(
 def covariate_choice_filter(
     choices: ArrayLike,
     n_options: int,
-    covariates: Optional[ArrayLike] = None,
-    input_gain: Optional[ArrayLike] = None,
-    obs_covariates: Optional[ArrayLike] = None,
-    obs_weights: Optional[ArrayLike] = None,
+    covariates: ArrayLike | None = None,
+    input_gain: ArrayLike | None = None,
+    obs_covariates: ArrayLike | None = None,
+    obs_weights: ArrayLike | None = None,
     process_noise: float = 0.01,
     inverse_temperature: float = 1.0,
     decay: float = 1.0,
-    init_mean: Optional[ArrayLike] = None,
-    init_cov: Optional[ArrayLike] = None,
+    init_mean: ArrayLike | None = None,
+    init_cov: ArrayLike | None = None,
 ) -> ChoiceFilterResult:
     """Forward filter for covariate-driven choice model.
 
@@ -371,14 +374,14 @@ def _rts_smoother_pass_with_predictions(
 ) -> tuple[Array, Array, Array]:
     """RTS backward smoother that consumes the filter's stored one-step predictions.
 
-    Unlike :func:`multinomial_choice._rts_smoother_pass`, which recomputes the
+    Unlike :func:`kalman.rts_backward_scan`, which recomputes the
     one-step prediction as ``A @ m_filt`` (valid only for control-free dynamics),
     this uses ``predicted_values`` / ``predicted_covariances`` from the forward
     filter. Those already include the control input ``input_gain @ u_t``, so the
     smoothed means stay consistent with the filter when dynamics covariates are
     present. The gain/covariance recursion is the standard RTS update (the control
     input does not affect covariances), so with no control input this reduces
-    exactly to ``_rts_smoother_pass``.
+    exactly to ``rts_backward_scan``.
     """
 
     def _smooth_step(carry, inputs):
@@ -407,15 +410,15 @@ def _rts_smoother_pass_with_predictions(
 def covariate_choice_smoother(
     choices: ArrayLike,
     n_options: int,
-    covariates: Optional[ArrayLike] = None,
-    input_gain: Optional[ArrayLike] = None,
-    obs_covariates: Optional[ArrayLike] = None,
-    obs_weights: Optional[ArrayLike] = None,
+    covariates: ArrayLike | None = None,
+    input_gain: ArrayLike | None = None,
+    obs_covariates: ArrayLike | None = None,
+    obs_weights: ArrayLike | None = None,
     process_noise: float = 0.01,
     inverse_temperature: float = 1.0,
     decay: float = 1.0,
-    init_mean: Optional[ArrayLike] = None,
-    init_cov: Optional[ArrayLike] = None,
+    init_mean: ArrayLike | None = None,
+    init_cov: ArrayLike | None = None,
 ) -> ChoiceSmootherResult:
     """Forward filter + RTS backward smoother for covariate-driven choice model.
 
@@ -543,20 +546,20 @@ class CovariateChoiceModel(SGDFittableMixin):
         self.obs_weights_: Array = jnp.zeros((n_options, max(n_obs_covariates, 1)))
 
         # Fitted state
-        self._smoother_result: Optional[ChoiceSmootherResult] = None
-        self.log_likelihood_: Optional[float] = None
-        self.n_iter_: Optional[int] = None
-        self.converged_: Optional[bool] = None
-        self.log_likelihood_history_: Optional[list[float]] = None
-        self._n_trials: Optional[int] = None
-        self._covariates: Optional[Array] = None
-        self._obs_covariates: Optional[Array] = None
+        self._smoother_result: ChoiceSmootherResult | None = None
+        self.log_likelihood_: float | None = None
+        self.n_iter_: int | None = None
+        self.converged_: bool | None = None
+        self.log_likelihood_history_: list[float] | None = None
+        self._n_trials: int | None = None
+        self._covariates: Array | None = None
+        self._obs_covariates: Array | None = None
 
         # Uncertainty summaries
-        self.predicted_option_variances_: Optional[Array] = None
-        self.smoothed_option_variances_: Optional[Array] = None
-        self.predicted_choice_entropy_: Optional[Array] = None
-        self.surprise_: Optional[Array] = None
+        self.predicted_option_variances_: Array | None = None
+        self.smoothed_option_variances_: Array | None = None
+        self.predicted_choice_entropy_: Array | None = None
+        self.surprise_: Array | None = None
 
     def __repr__(self) -> str:
         fitted = self.is_fitted
@@ -641,12 +644,12 @@ class CovariateChoiceModel(SGDFittableMixin):
     def fit(
         self,
         choices: ArrayLike,
-        covariates: Optional[ArrayLike] = None,
-        obs_covariates: Optional[ArrayLike] = None,
+        covariates: ArrayLike | None = None,
+        obs_covariates: ArrayLike | None = None,
         max_iter: int = 50,
         tolerance: float = 1e-4,
         verbose: bool = False,
-        beta_grid: Optional[ArrayLike] = None,
+        beta_grid: ArrayLike | None = None,
     ) -> list[float]:
         """Fit the model via EM algorithm.
 
@@ -858,12 +861,12 @@ class CovariateChoiceModel(SGDFittableMixin):
     def fit_sgd(
         self,
         choices: ArrayLike,
-        covariates: Optional[ArrayLike] = None,
-        obs_covariates: Optional[ArrayLike] = None,
-        optimizer: Optional[object] = None,
+        covariates: ArrayLike | None = None,
+        obs_covariates: ArrayLike | None = None,
+        optimizer: object | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
 
@@ -933,16 +936,7 @@ class CovariateChoiceModel(SGDFittableMixin):
     def _n_timesteps(self) -> int:
         return self._n_trials
 
-    def _check_sgd_initialized(self) -> None:
-        pass  # Parameters are allocated at construction time
-
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            POSITIVE,
-            UNCONSTRAINED,
-            UNIT_INTERVAL,
-        )
-
         params: dict = {}
         spec: dict = {}
         if self.learn_process_noise:
@@ -1038,8 +1032,7 @@ class CovariateChoiceModel(SGDFittableMixin):
         denom = jnp.sum(m[:-1] ** 2) + jnp.sum(
             jnp.trace(P[:-1], axis1=1, axis2=2)
         )
-        a = float(jnp.clip(numer / jnp.maximum(denom, 1e-10), 0.01, 1.0))
-        return a
+        return float(jnp.clip(numer / jnp.maximum(denom, 1e-10), 0.01, 1.0))
 
     def _m_step_process_noise(self, smooth: ChoiceSmootherResult) -> float:
         """M-step: update scalar process noise from smoother statistics.
@@ -1068,8 +1061,7 @@ class CovariateChoiceModel(SGDFittableMixin):
             + a**2 * jnp.sum(P[:-1], axis=0)
             - 2 * a * jnp.sum(C, axis=0)
         ) / T_minus_1
-        q = float(jnp.maximum(jnp.mean(jnp.diag(Q_hat)), 1e-8))
-        return q
+        return float(jnp.maximum(jnp.mean(jnp.diag(Q_hat)), 1e-8))
 
     def _m_step_beta(
         self,
@@ -1402,7 +1394,7 @@ class SimulatedRLChoiceData(NamedTuple):
 def simulate_rl_choice_data(
     n_trials: int = 200,
     n_options: int = 3,
-    input_gain: Optional[ArrayLike] = None,
+    input_gain: ArrayLike | None = None,
     process_noise: float = 0.005,
     inverse_temperature: float = 2.0,
     reward_prob: float = 0.7,

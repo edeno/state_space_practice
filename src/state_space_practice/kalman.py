@@ -25,19 +25,13 @@ import jax.scipy.stats.multivariate_normal
 
 from state_space_practice.utils import (  # noqa: F401 — re-exported for backward compat
     _validate_filter_numerics,
+    contains_tracer,
+    psd_cholesky,
+    psd_logdet,
     psd_solve,
     stabilize_covariance,
     symmetrize,
 )
-
-
-def _contains_tracer(*values: object) -> bool:
-    """Return True if any pytree leaf is being traced by JAX."""
-    return any(
-        isinstance(leaf, jax.core.Tracer)
-        for value in values
-        for leaf in jax.tree_util.tree_leaves(value)
-    )
 
 
 def woodbury_kalman_gain(
@@ -106,7 +100,7 @@ def woodbury_kalman_gain(
             "emission_cov_diag length must match emission_matrix rows; "
             f"got {emission_cov_diag.shape} for D_obs={D_obs}."
         )
-    if not _contains_tracer(prior_cov, emission_matrix, emission_cov_diag):
+    if not contains_tracer(prior_cov, emission_matrix, emission_cov_diag):
         for name, arr in (
             ("prior_cov", prior_cov),
             ("emission_matrix", emission_matrix),
@@ -379,15 +373,24 @@ def kalman_measurement_update(
     )
 
     residual_error = obs - obs_mean
-    kalman_gain = psd_solve(obs_cov, measurement_matrix @ prior_cov).T
+    # One stabilized factor of the innovation covariance serves the gain
+    # solve, the quadratic form and the log-determinant, so the likelihood
+    # sees the same matrix as the gain.
+    obs_cov_cho = psd_cholesky(obs_cov)
+    kalman_gain = jax.scipy.linalg.cho_solve(
+        obs_cov_cho, measurement_matrix @ prior_cov
+    ).T
 
     posterior_mean = prior_mean + kalman_gain @ residual_error
     posterior_cov = joseph_form_update(
         prior_cov, kalman_gain, measurement_matrix, measurement_cov
     )
 
-    marginal_log_likelihood = jnp.asarray(
-        jax.scipy.stats.multivariate_normal.logpdf(x=obs, mean=obs_mean, cov=obs_cov)
+    n_obs = obs.shape[0]
+    marginal_log_likelihood = -0.5 * (
+        residual_error @ jax.scipy.linalg.cho_solve(obs_cov_cho, residual_error)
+        + psd_logdet(obs_cov_cho)
+        + n_obs * jnp.log(2.0 * jnp.pi)
     )
 
     return posterior_mean, posterior_cov, marginal_log_likelihood
@@ -945,7 +948,7 @@ def parallel_kalman_smoother(
             f"got {value.shape}."
         )
 
-    if not _contains_tracer(
+    if not contains_tracer(
         filtered_means, filtered_covariances, transition_matrix, process_cov
     ):
         for name, arr in (

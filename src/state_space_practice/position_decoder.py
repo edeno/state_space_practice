@@ -22,7 +22,6 @@ import logging
 import warnings
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -31,14 +30,14 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.kalman import rts_backward_scan, symmetrize
+from state_space_practice.point_process_kalman import (
+    _point_process_laplace_update,
+    _safe_expected_count,
+)
 from state_space_practice.utils import (
     validate_count_array,
     validate_covariance,
     validate_scalar,
-)
-from state_space_practice.point_process_kalman import (
-    _point_process_laplace_update,
-    _safe_expected_count,
 )
 
 logger = logging.getLogger(__name__)
@@ -210,11 +209,11 @@ class PlaceFieldRateMaps:
         rate_maps: ArrayLike,
         x_edges: ArrayLike,
         y_edges: ArrayLike,
-        occupancy_mask: Optional[np.ndarray] = None,
-        spike_histograms: Optional[np.ndarray] = None,
-        occ_histogram: Optional[np.ndarray] = None,
-        kde_sigma: Optional[float] = None,
-        baseline_rates: Optional[np.ndarray] = None,
+        occupancy_mask: np.ndarray | None = None,
+        spike_histograms: np.ndarray | None = None,
+        occ_histogram: np.ndarray | None = None,
+        kde_sigma: float | None = None,
+        baseline_rates: np.ndarray | None = None,
         occupancy_tau: float = 0.0,
     ):
         self.rate_maps = np.asarray(rate_maps)
@@ -223,7 +222,7 @@ class PlaceFieldRateMaps:
         self.occupancy_mask = occupancy_mask
         # Set by ``from_spike_position_data`` when position data is
         # available; read by decoder entry points when ``q_pos=None``.
-        self.suggested_q_pos: Optional[float] = None
+        self.suggested_q_pos: float | None = None
 
         if self.x_edges.ndim != 1 or self.y_edges.ndim != 1:
             raise ValueError(
@@ -324,7 +323,7 @@ class PlaceFieldRateMaps:
         cls,
         model,
         n_grid: int = 50,
-        time_slice: Optional[slice] = None,
+        time_slice: slice | None = None,
     ) -> PlaceFieldRateMaps:
         """Construct rate maps from a fitted PlaceFieldModel.
 
@@ -359,7 +358,7 @@ class PlaceFieldRateMaps:
         n_grid: int = 50,
         sigma: float = 5.0,
         occupancy_tau: float = 0.0,
-        occupancy_mask: Optional[np.ndarray] = None,
+        occupancy_mask: np.ndarray | None = None,
     ) -> PlaceFieldRateMaps:
         """Estimate rate maps from position and spike data using KDE.
 
@@ -782,13 +781,12 @@ def _bilinear_log_rate(
     fy = yi - y0
 
     # Vectorized over neurons (axis 0)
-    val = (
+    return (
         log_rate_maps[:, y0, x0] * (1 - fx) * (1 - fy)
         + log_rate_maps[:, y0, x1] * fx * (1 - fy)
         + log_rate_maps[:, y1, x0] * (1 - fx) * fy
         + log_rate_maps[:, y1, x1] * fx * fy
     )
-    return val
 
 
 def _bilinear_log_rate_jacobian(
@@ -1066,15 +1064,15 @@ def position_decoder_filter(
     spikes: ArrayLike,
     rate_maps: PlaceFieldRateMaps,
     dt: float,
-    q_pos: Optional[float] = None,
+    q_pos: float | None = None,
     q_vel: float = 10.0,
     include_velocity: bool = True,
-    init_position: Optional[ArrayLike] = None,
-    init_cov: Optional[ArrayLike] = None,
-    track_penalty: Optional[Array] = None,
+    init_position: ArrayLike | None = None,
+    init_cov: ArrayLike | None = None,
+    track_penalty: Array | None = None,
     sigma_track: float = 5.0,
     max_newton_iter: int = 3,
-    adaptive_inflation: Optional[AdaptiveInflationConfig] = None,
+    adaptive_inflation: AdaptiveInflationConfig | None = None,
 ) -> DecoderResult:
     """Decode position from spikes using Laplace-EKF filter.
 
@@ -1364,15 +1362,15 @@ def position_decoder_smoother(
     spikes: ArrayLike,
     rate_maps: PlaceFieldRateMaps,
     dt: float,
-    q_pos: Optional[float] = None,
+    q_pos: float | None = None,
     q_vel: float = 10.0,
     include_velocity: bool = True,
-    init_position: Optional[ArrayLike] = None,
-    init_cov: Optional[ArrayLike] = None,
-    track_penalty: Optional[Array] = None,
+    init_position: ArrayLike | None = None,
+    init_cov: ArrayLike | None = None,
+    track_penalty: Array | None = None,
     sigma_track: float = 5.0,
     max_newton_iter: int = 3,
-    adaptive_inflation: Optional[AdaptiveInflationConfig] = None,
+    adaptive_inflation: AdaptiveInflationConfig | None = None,
 ) -> DecoderResult:
     """Decode position from spikes using Laplace-EKF + RTS smoother.
 
@@ -1476,7 +1474,7 @@ class PositionDecoder:
         smoothing_sigma: float = 5.0,
         occupancy_tau: float = 0.0,
         max_newton_iter: int = 3,
-        adaptive_inflation: Optional[AdaptiveInflationConfig] = None,
+        adaptive_inflation: AdaptiveInflationConfig | None = None,
     ):
         self.dt = validate_scalar(dt, "dt", positive=True)
         self.q_pos = validate_scalar(q_pos, "q_pos", nonnegative=True)
@@ -1512,7 +1510,7 @@ class PositionDecoder:
         self.max_newton_iter = int(max_newton_iter)
         self.adaptive_inflation = adaptive_inflation
 
-        self.rate_maps: Optional[PlaceFieldRateMaps] = None
+        self.rate_maps: PlaceFieldRateMaps | None = None
 
     def __repr__(self) -> str:
         fitted = self.rate_maps is not None
@@ -1552,8 +1550,8 @@ class PositionDecoder:
     def fit_from_model(
         self,
         model,
-        n_grid: Optional[int] = None,
-        time_slice: Optional[slice] = None,
+        n_grid: int | None = None,
+        time_slice: slice | None = None,
     ) -> None:
         """Use rate maps from a fitted PlaceFieldModel.
 
@@ -1580,8 +1578,8 @@ class PositionDecoder:
         self,
         spikes: ArrayLike,
         method: str = "smoother",
-        init_position: Optional[ArrayLike] = None,
-        init_cov: Optional[ArrayLike] = None,
+        init_position: ArrayLike | None = None,
+        init_cov: ArrayLike | None = None,
     ) -> DecoderResult:
         """Decode position from spike trains.
 
@@ -1648,7 +1646,7 @@ class PositionDecoder:
     def plot_decoding(
         self,
         result: DecoderResult,
-        true_position: Optional[np.ndarray] = None,
+        true_position: np.ndarray | None = None,
         ax=None,
     ):
         """Plot decoded vs true position trajectory.

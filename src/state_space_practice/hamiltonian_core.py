@@ -19,7 +19,8 @@ SGD-only fitting).
 
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -27,12 +28,18 @@ import jax.scipy.linalg
 from jax import Array
 
 from state_space_practice.kalman import joseph_form_update
-from state_space_practice.nonlinear_dynamics import ekf_smooth_step
+from state_space_practice.nonlinear_dynamics import (
+    apply_mlp,
+    ekf_predict_step,
+    ekf_predict_step_with_jacobian,
+    ekf_smooth_step,
+)
 from state_space_practice.point_process_kalman import (
+    _soft_expected_count_and_log,
     glm_laplace_update,
     poisson_family,
 )
-from state_space_practice.utils import psd_cholesky
+from state_space_practice.utils import psd_cholesky, psd_logdet
 
 
 def gaussian_measurement_update(
@@ -44,7 +51,7 @@ def gaussian_measurement_update(
     R: Array,
     *,
     include_normalization_const: bool = True,
-) -> Tuple[Array, Array, Array]:
+) -> tuple[Array, Array, Array]:
     """Standard Kalman update for a linear-Gaussian observation y ~ N(C x + d, R).
 
     Returns
@@ -77,7 +84,7 @@ def gaussian_measurement_update(
     m_post = m_pred + K @ err
     P_post = joseph_form_update(P_pred, K, C, R)
 
-    logdet = 2.0 * jnp.sum(jnp.log(jnp.abs(jnp.diag(S_cho[0]))))
+    logdet = psd_logdet(S_cho)
     ll = -0.5 * (err @ jax.scipy.linalg.cho_solve(S_cho, err) + logdet)
     if include_normalization_const:
         n_obs = err.shape[0]
@@ -94,7 +101,7 @@ def point_process_laplace_update(
     dt: float,
     *,
     compute_log_likelihood: bool = True,
-) -> Tuple[Array, Array, Array]:
+) -> tuple[Array, Array, Array]:
     """Single-Fisher-step Laplace update for Poisson observations.
 
     Observation model: ``y[n] ~ Poisson(exp(C[n] @ x + d[n]) * dt)``.
@@ -150,7 +157,7 @@ def ekf_rts_backward_pass(
     m_pred: Array,
     P_pred: Array,
     F: Array,
-) -> Tuple[Array, Array]:
+) -> tuple[Array, Array]:
     """EKF-RTS backward smoother given a forward pass's filtered + predicted state.
 
     Parameters
@@ -214,7 +221,7 @@ def ekf_rts_backward_pass(
     return m_smooth, P_smooth
 
 
-def mlp_l2_penalty(mlp_params: Dict[str, Any]) -> Array:
+def mlp_l2_penalty(mlp_params: dict[str, Any]) -> Array:
     """Sum of squared MLP weights (entries whose key starts with 'w').
 
     The Hamiltonian models all penalise weights ``w*`` but not biases
@@ -223,6 +230,79 @@ def mlp_l2_penalty(mlp_params: Dict[str, Any]) -> Array:
     return jnp.sum(
         jnp.array([jnp.sum(v**2) for k, v in mlp_params.items() if k.startswith("w")])
     )
+
+
+def run_ekf_filter(
+    observations: Any,
+    init_mean: Array,
+    init_cov: Array,
+    trans_params: dict[str, Any],
+    process_cov: Array,
+    dt: float,
+    update_fn: Callable[[Array, Array, Any], tuple[Array, Array, Array]],
+) -> tuple[Array, Array, Array]:
+    """Scan an EKF (Hamiltonian predict + ``update_fn``) over ``observations``.
+
+    ``observations`` is any pytree whose leaves share a leading time axis (one
+    array, or a tuple of arrays for multi-modality models); ``update_fn(m_pred,
+    P_pred, y_t)`` returns ``(m_post, P_post, log_likelihood_t)``.
+    """
+
+    def step(carry, y_t):
+        m_prev, P_prev = carry
+        m_pred, P_pred = ekf_predict_step(
+            m_prev, P_prev, trans_params, apply_mlp, process_cov, dt
+        )
+        m_post, P_post, ll = update_fn(m_pred, P_pred, y_t)
+        return (m_post, P_post), (m_post, P_post, ll)
+
+    _, (means, covs, lls) = jax.lax.scan(step, (init_mean, init_cov), observations)
+    return means, covs, lls
+
+
+def run_ekf_smoother(
+    observations: Any,
+    init_mean: Array,
+    init_cov: Array,
+    trans_params: dict[str, Any],
+    process_cov: Array,
+    dt: float,
+    update_fn: Callable[[Array, Array, Any], tuple[Array, Array]],
+) -> tuple[Array, Array]:
+    """EKF forward pass (with Jacobians) followed by the RTS backward pass.
+
+    Same conventions as :func:`run_ekf_filter`, except ``update_fn`` returns
+    only ``(m_post, P_post)`` (no log-likelihood is needed for smoothing).
+    """
+
+    def forward_step(carry, y_t):
+        m_prev, P_prev = carry
+        m_pred, P_pred, F_t = ekf_predict_step_with_jacobian(
+            m_prev, P_prev, trans_params, apply_mlp, process_cov, dt
+        )
+        m_post, P_post = update_fn(m_pred, P_pred, y_t)
+        return (m_post, P_post), (m_post, P_post, m_pred, P_pred, F_t)
+
+    _, (m_f, P_f, m_p, P_p, F) = jax.lax.scan(
+        forward_step, (init_mean, init_cov), observations
+    )
+    return ekf_rts_backward_pass(m_f, P_f, m_p, P_p, F)
+
+
+def poisson_rollout_nll(log_lambda: Array, spikes: Array, dt: float) -> Array:
+    """Overflow-safe, gradient-preserving Poisson negative log-likelihood.
+
+    An unclipped ``exp`` overflows to ``+inf`` on a divergent rollout
+    (``0 * log(inf)`` / ``inf - inf`` give NaN); a hard clip would zero the
+    gradient above the cap and freeze SGD. ``_soft_expected_count_and_log``
+    continues ``exp`` logarithmically past the cap and returns ``log(mu)``
+    analytically under that same cap: ``log_rates`` equals ``log(rates)``
+    wherever ``rates`` is representable and positive, and stays finite (not
+    ``-inf``) where ``rates`` underflows to 0, so a positive spike count keeps
+    a finite restoring gradient there that ``log(rates + eps)`` would kill.
+    """
+    rates, log_rates = _soft_expected_count_and_log(log_lambda, dt)
+    return jnp.sum(rates - spikes * log_rates + jax.scipy.special.gammaln(spikes + 1.0))
 
 
 def default_init_mean(n_oscillators: int) -> Array:
@@ -256,9 +336,42 @@ class _BaseModelStubs:
     def _project_parameters(self) -> None:
         return
 
-    def _check_sgd_initialized(self) -> None:
-        # Safe no-op: unlike the lazily-initialized oscillator models (whose
-        # _check_sgd_initialized guards the "constructed but never initialized"
-        # state), every Hamiltonian model fully populates its parameters in
-        # __init__, so there is no uninitialized state to detect here.
-        return
+    def _rollout_trajectory(self, params: dict[str, Any], n_time: int) -> Array:
+        """Deterministic Hamiltonian rollout of ``n_time`` steps from ``init_mean``.
+
+        Used by the ``use_filter=False`` surrogate SGD loss, which scores the
+        noise-free trajectory against the observations (no process prior, no
+        latent uncertainty) to warm-start the dynamics.
+        """
+        trans_params = {**params["mlp"], "omega": params["omega"]}
+
+        def scan_fn(x_prev, _):
+            x_next = self.transition_func(x_prev, trans_params)
+            return x_next, x_next
+
+        _, x_traj = jax.lax.scan(scan_fn, params["init_mean"], None, length=n_time)
+        return x_traj
+
+    def fit(self, *args, **kwargs):
+        """Hamiltonian models do not support linear EM."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support the linear EM path "
+            "(fit()). Please use fit_sgd() for non-linear optimization."
+        )
+
+    def _finalize_sgd(self, *data, **kwargs):
+        """Run filter + smoother to populate fitted states after SGD.
+
+        ``data`` is whatever ``fit_sgd`` passed positionally (one observation
+        array for the single-modality models, LFP and spikes for the joint
+        model); ``filter`` and ``smooth`` take the same positional layout.
+        """
+        params = self._build_param_spec()[0]
+        means, covs, lls = self.filter(*data, params)
+        self.filtered_means_ = means
+        self.filtered_covs_ = covs
+        self.log_likelihood_ = float(jnp.sum(lls))
+        sm_means, sm_covs = self.smooth(*data, params)
+        self.smoothed_means_ = sm_means
+        self.smoothed_covs_ = sm_covs
+

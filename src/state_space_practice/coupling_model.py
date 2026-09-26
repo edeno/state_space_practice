@@ -16,7 +16,7 @@ two deterministic maps (transition, logit) shared by the simulator and the
 estimators. Requires float64 (the test suite enables ``jax_enable_x64``).
 """
 
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -71,7 +71,7 @@ class CouplingModelParams(NamedTuple):
     beta_imag: Array
     baseline: Array
     dt: float
-    history_kernel: Optional[Array] = None
+    history_kernel: Array | None = None
     lfp_noise_var: float = 0.25
 
 

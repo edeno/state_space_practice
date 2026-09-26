@@ -1846,7 +1846,9 @@ class TestDIMStabilityEnforcement:
     def test_stability_scale_gradient_finite_at_degenerate_block(self) -> None:
         """diagonal_norm_sq == 0 (damping == signed incoming-sum with freq == 0)
         must not yield a NaN gradient from sqrt'(0)."""
-        from state_space_practice.oscillator_models import _dim_stability_scale
+        from state_space_practice.oscillator_utils import (
+            compute_directed_influence_stability_scale,
+        )
 
         def scale_of(c):
             freqs = jnp.array([0.0, 5.0, 5.0])  # freq 0 -> rotation angle 0
@@ -1862,7 +1864,9 @@ class TestDIMStabilityEnforcement:
                 .at[2, 0]
                 .set(0.1)
             )
-            return _dim_stability_scale(freqs, damping, coupling, 100.0)
+            return compute_directed_influence_stability_scale(
+                freqs, damping, coupling, 100.0
+            )
 
         assert bool(jnp.isfinite(scale_of(0.0)))
         assert bool(jnp.isfinite(jax.grad(scale_of)(0.0)))
@@ -2737,12 +2741,10 @@ class TestReparameterizedPublicParamsReconstructA:
 
     @pytest.mark.slow
     def test_public_params_reconstruct_transition_matrix(self):
-        from state_space_practice.oscillator_models import (
-            _stabilize_transition_matrix,
-        )
         from state_space_practice.oscillator_utils import (
             construct_directed_influence_transition_matrix,
         )
+        from state_space_practice.utils import stabilize_transition_matrix
 
         key = jax.random.PRNGKey(3)
         n_time = 250
@@ -2772,7 +2774,7 @@ class TestReparameterizedPublicParamsReconstructA:
         # the fix, self.freqs was the cross-state mean while A used per-state
         # freqs, so this reconstruction would not match.
         for j in range(model.n_discrete_states):
-            A_recon = _stabilize_transition_matrix(
+            A_recon = stabilize_transition_matrix(
                 construct_directed_influence_transition_matrix(
                     freqs=model.freqs,
                     damping_coeffs=model.damping_coef,

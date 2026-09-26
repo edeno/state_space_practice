@@ -7,7 +7,7 @@ See docs/hamiltonian_architecture.md for why this family is standalone
 """
 
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -16,26 +16,25 @@ from jax import Array
 from state_space_practice.hamiltonian_core import (
     _BaseModelStubs,
     default_init_mean,
-    ekf_rts_backward_pass,
     mlp_l2_penalty,
     point_process_laplace_update,
+    poisson_rollout_nll,
+    run_ekf_filter,
+    run_ekf_smoother,
 )
 from state_space_practice.nonlinear_dynamics import (
     apply_mlp,
-    ekf_predict_step,
-    ekf_predict_step_with_jacobian,
     init_mlp_params,
     leapfrog_step,
 )
 from state_space_practice.oscillator_models import BaseModel
 from state_space_practice.parameter_transforms import (
-    PSD_MATRIX,
     POSITIVE,
+    PSD_MATRIX,
     UNCONSTRAINED,
     ParameterTransform,
     frozen,
 )
-from state_space_practice.point_process_kalman import _soft_expected_count_and_log
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import stabilize_covariance, validate_count_array
 
@@ -48,7 +47,7 @@ class HamiltonianSpikeModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         n_oscillators: int,
         n_sources: int,  # n_neurons
         sampling_freq: float,
-        hidden_dims: Optional[List[int]] = None,
+        hidden_dims: list[int] | None = None,
         seed: int = 42,
     ):
         super().__init__(
@@ -88,84 +87,61 @@ class HamiltonianSpikeModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
             [jnp.eye(self.n_cont_states)], axis=2
         )
 
-    def transition_func(self, x: Array, params: Dict[str, Array]) -> Array:
+    def transition_func(self, x: Array, params: dict[str, Array]) -> Array:
         """Deterministic Hamiltonian transition."""
         return leapfrog_step(x, params, apply_mlp, self.dt)
 
     def filter(
-        self, spikes: Array, params: Dict[str, Any]
-    ) -> Tuple[Array, Array, Array]:
+        self, spikes: Array, params: dict[str, Any]
+    ) -> tuple[Array, Array, Array]:
         """Apply Point-Process EKF (Laplace-EKF) to spikes."""
         spikes = self._validate_spikes(spikes)
         return cast(
-            Tuple[Array, Array, Array],
+            tuple[Array, Array, Array],
             self._filter_jit(spikes, self._complete_filter_params(params)),
         )
 
     @partial(jax.jit, static_argnums=(0,))
     def _filter_jit(
-        self, spikes: Array, params: Dict[str, Any]
-    ) -> Tuple[Array, Array, Array]:
+        self, spikes: Array, params: dict[str, Any]
+    ) -> tuple[Array, Array, Array]:
         """JIT-compiled filter core with all mutable inputs passed explicitly."""
         trans_params = {**params["mlp"], "omega": params["omega"]}
         C, d = params["C"], params["d"]
-        Q = params["Q"]
+        return run_ekf_filter(
+            spikes,
+            params["init_mean"],
+            params["init_cov"],
+            trans_params,
+            params["Q"],
+            self.dt,
+            lambda m, P, y: point_process_laplace_update(m, P, y, C, d, self.dt),
+        )
 
-        def step(carry, y_t):
-            m_prev, P_prev = carry
-            m_pred, P_pred = ekf_predict_step(
-                m_prev, P_prev, trans_params, apply_mlp, Q, self.dt
-            )
-            m_post, P_post, ll = point_process_laplace_update(
-                m_pred,
-                P_pred,
-                y_t,
-                C,
-                d,
-                self.dt,
-            )
-            return (m_post, P_post), (m_post, P_post, ll)
-
-        m0 = params["init_mean"]
-        P0 = params["init_cov"]
-        _, (means, covs, lls) = jax.lax.scan(step, (m0, P0), spikes)
-        return means, covs, lls
-
-    def smooth(self, spikes: Array, params: Dict[str, Any]) -> Tuple[Array, Array]:
+    def smooth(self, spikes: Array, params: dict[str, Any]) -> tuple[Array, Array]:
         """Apply Point-Process RTS Smoother to spikes."""
         spikes = self._validate_spikes(spikes)
         return cast(
-            Tuple[Array, Array],
+            tuple[Array, Array],
             self._smooth_jit(spikes, self._complete_filter_params(params)),
         )
 
     @partial(jax.jit, static_argnums=(0,))
-    def _smooth_jit(self, spikes: Array, params: Dict[str, Any]) -> Tuple[Array, Array]:
+    def _smooth_jit(self, spikes: Array, params: dict[str, Any]) -> tuple[Array, Array]:
         """JIT-compiled smoother core with mutable inputs passed explicitly."""
         trans_params = {**params["mlp"], "omega": params["omega"]}
         C, d = params["C"], params["d"]
-        Q = params["Q"]
-
-        def forward_step(carry, y_t):
-            m_prev, P_prev = carry
-            m_pred, P_pred, F_t = ekf_predict_step_with_jacobian(
-                m_prev, P_prev, trans_params, apply_mlp, Q, self.dt
-            )
-            m_post, P_post, _ = point_process_laplace_update(
-                m_pred,
-                P_pred,
-                y_t,
-                C,
-                d,
-                self.dt,
-                compute_log_likelihood=False,
-            )
-            return (m_post, P_post), (m_post, P_post, m_pred, P_pred, F_t)
-
-        m0 = params["init_mean"]
-        P0 = params["init_cov"]
-        _, (m_f, P_f, m_p, P_p, F) = jax.lax.scan(forward_step, (m0, P0), spikes)
-        return ekf_rts_backward_pass(m_f, P_f, m_p, P_p, F)
+        return run_ekf_smoother(
+            spikes,
+            params["init_mean"],
+            params["init_cov"],
+            trans_params,
+            params["Q"],
+            self.dt,
+            lambda m, P, y: point_process_laplace_update(
+                m, P, y, C, d, self.dt, compute_log_likelihood=False
+            )[:2],
+        )
 
     def _validate_spikes(self, spikes: Array, *, allow_empty: bool = True) -> Array:
         """Validate public spike input and return it as a JAX array."""
@@ -181,7 +157,7 @@ class HamiltonianSpikeModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         validate_count_array(spikes, "spikes", allow_empty=allow_empty)
         return spikes
 
-    def _complete_filter_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _complete_filter_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Fill covariance defaults before entering a JIT-compiled method.
 
         ``self`` is static in the compiled cores, so reading mutable covariance
@@ -195,10 +171,10 @@ class HamiltonianSpikeModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
     def fit_sgd(  # type: ignore[override]
         self,
         observations: Array,
-        optimizer: Optional[object] = None,
+        optimizer: object | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
         use_filter: bool = True,
         l2_reg: float = 1e-4,
     ) -> list[float]:
@@ -224,7 +200,7 @@ class HamiltonianSpikeModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
 
     def _build_param_spec(
         self,
-    ) -> Tuple[Dict[str, Any], Dict[str, ParameterTransform]]:
+    ) -> tuple[dict[str, Any], dict[str, ParameterTransform]]:
         params = {
             "mlp": self.mlp_params,
             "omega": self.omega,
@@ -249,7 +225,7 @@ class HamiltonianSpikeModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
 
     def _sgd_loss_fn(
         self,
-        params: Dict[str, Any],
+        params: dict[str, Any],
         spikes: Array,
         use_filter: bool = True,
         l2_reg: float = 1e-4,
@@ -259,40 +235,15 @@ class HamiltonianSpikeModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
             _, _, lls = self._filter_jit(spikes, params)
             lik_loss = -jnp.sum(lls)
         else:
-            trans_params = {**params["mlp"], "omega": params["omega"]}
+            # Surrogate loss: deterministic rollout scored under the Poisson
+            # observation model (no process prior, no latent uncertainty).
             C, d = params["C"], params["d"]
-            x0 = params["init_mean"]
-
-            def scan_fn(x_prev, _):
-                x_next = self.transition_func(x_prev, trans_params)
-                return x_next, x_next
-
-            _, x_traj = jax.lax.scan(scan_fn, x0, jnp.arange(spikes.shape[0]))
-            log_lambda = x_traj @ C.T + d
-            # Overflow-safe, gradient-preserving Poisson NLL. An unclipped exp
-            # overflows to +inf on a divergent rollout (0*log(inf) / (inf-inf) =
-            # NaN); a hard clip would zero the gradient above the cap and freeze
-            # SGD. _soft_expected_count_and_log continues exp logarithmically past
-            # the cap and returns log(mu) analytically under that same cap.
-            # log_rates equals log(rates) wherever rates is representable and
-            # positive, and stays finite (not -inf) where rates underflows to 0 --
-            # so a positive spike count keeps a finite restoring gradient there
-            # that log(rates + eps) would kill.
-            rates, log_rates = _soft_expected_count_and_log(log_lambda, self.dt)
-            lik_loss = jnp.sum(
-                rates - spikes * log_rates + jax.scipy.special.gammaln(spikes + 1.0)
-            )
+            x_traj = self._rollout_trajectory(params, spikes.shape[0])
+            lik_loss = poisson_rollout_nll(x_traj @ C.T + d, spikes, self.dt)
 
         return lik_loss + l2_reg * mlp_l2_penalty(params["mlp"])
 
-    def fit(self, *args, **kwargs):
-        """Hamiltonian models do not support linear EM."""
-        raise NotImplementedError(
-            "HamiltonianSpikeModel does not support the linear EM path "
-            "(fit()). Please use fit_sgd() for non-linear optimization."
-        )
-
-    def _store_sgd_params(self, params: Dict[str, Any]) -> None:
+    def _store_sgd_params(self, params: dict[str, Any]) -> None:
         self.mlp_params = params["mlp"]
         self.omega = params["omega"]
         self.C = params["C"]
@@ -304,13 +255,3 @@ class HamiltonianSpikeModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         if "Q" in params:
             self.process_cov = jnp.stack([stabilize_covariance(params["Q"])], axis=2)
 
-    def _finalize_sgd(self, spikes, **kwargs):
-        """Run filter + smoother to populate fitted states after SGD."""
-        params = self._build_param_spec()[0]
-        means, covs, lls = self.filter(spikes, params)
-        self.filtered_means_ = means
-        self.filtered_covs_ = covs
-        self.log_likelihood_ = float(jnp.sum(lls))
-        sm_means, sm_covs = self.smooth(spikes, params)
-        self.smoothed_means_ = sm_means
-        self.smoothed_covs_ = sm_covs

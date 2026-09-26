@@ -82,10 +82,10 @@ References
 3. Murphy, K.P. (1998). Switching Kalman Filters.
 """
 
-import logging
-from dataclasses import dataclass
 import functools
-from typing import Callable
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
@@ -100,8 +100,16 @@ from state_space_practice.oscillator_utils import (
     construct_common_oscillator_transition_matrix,
     project_coupled_transition_matrix,
 )
+from state_space_practice.parameter_transforms import (
+    PSD_MATRIX,
+    STOCHASTIC_ROW,
+    UNCONSTRAINED,
+)
 from state_space_practice.point_process_kalman import _point_process_laplace_update
-from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.sgd_fitting import (
+    SGDFittableMixin,
+    reconstruct_per_state_array,
+)
 from state_space_practice.switching_kalman import (
     _first_timestep_discrete_update,
     _normalize_initial_discrete_prob,
@@ -113,6 +121,7 @@ from state_space_practice.switching_kalman import (
 )
 from state_space_practice.utils import (
     check_converged,
+    clip_eigenvalues,
     make_discrete_transition_matrix,
     stabilize_covariance,
     stabilize_transition_matrix,
@@ -2844,13 +2853,13 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
 
         # Run the switching Kalman smoother (observation-model agnostic)
         # The smoother operates on Gaussian posteriors regardless of observation model
-        smoother_args = dict(
-            filter_mean=state_cond_filter_mean,
-            filter_cov=state_cond_filter_cov,
-            filter_discrete_state_prob=filter_discrete_state_prob,
-            process_cov=self.process_cov,
-            continuous_transition_matrix=self.continuous_transition_matrix,
-        )
+        smoother_args = {
+            "filter_mean": state_cond_filter_mean,
+            "filter_cov": state_cond_filter_cov,
+            "filter_discrete_state_prob": filter_discrete_state_prob,
+            "process_cov": self.process_cov,
+            "continuous_transition_matrix": self.continuous_transition_matrix,
+        }
 
         if self.smoother_type == "gpb2":
             (
@@ -2995,19 +3004,16 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                     + (1 - cfg.trust_region_weight) * self.process_cov
                 )
 
-                def clip_eigenvalues(Q: Array) -> Array:
-                    Q = symmetrize(Q)
-                    eigvals, eigvecs = jnp.linalg.eigh(Q)
-                    if cfg.min_eigenvalue is not None:
-                        eigvals = jnp.maximum(eigvals, cfg.min_eigenvalue)
-                    if cfg.max_eigenvalue is not None:
-                        eigvals = jnp.minimum(eigvals, cfg.max_eigenvalue)
-                    return eigvecs @ jnp.diag(eigvals) @ eigvecs.T
-
                 # Clip eigenvalues per state
-                Q_clipped = jax.vmap(clip_eigenvalues, in_axes=-1, out_axes=-1)(
-                    Q_blended
-                )
+                Q_clipped = jax.vmap(
+                    functools.partial(
+                        clip_eigenvalues,
+                        min_eigenvalue=cfg.min_eigenvalue,
+                        max_eigenvalue=cfg.max_eigenvalue,
+                    ),
+                    in_axes=-1,
+                    out_axes=-1,
+                )(Q_blended)
                 self.process_cov = Q_clipped
             else:
                 self.process_cov = new_Q
@@ -3036,18 +3042,15 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
                     + (1 - cfg.trust_region_weight) * self.init_cov
                 )
 
-                def _clip_init_cov(P: Array) -> Array:
-                    P = symmetrize(P)
-                    eigvals, eigvecs = jnp.linalg.eigh(P)
-                    if cfg.min_eigenvalue is not None:
-                        eigvals = jnp.maximum(eigvals, cfg.min_eigenvalue)
-                    if cfg.init_cov_max_eigenvalue is not None:
-                        eigvals = jnp.minimum(eigvals, cfg.init_cov_max_eigenvalue)
-                    return eigvecs @ jnp.diag(eigvals) @ eigvecs.T
-
-                new_init_cov = jax.vmap(_clip_init_cov, in_axes=-1, out_axes=-1)(
-                    init_cov_blended
-                )
+                new_init_cov = jax.vmap(
+                    functools.partial(
+                        clip_eigenvalues,
+                        min_eigenvalue=cfg.min_eigenvalue,
+                        max_eigenvalue=cfg.init_cov_max_eigenvalue,
+                    ),
+                    in_axes=-1,
+                    out_axes=-1,
+                )(init_cov_blended)
 
             self.init_cov = new_init_cov
 
@@ -3531,12 +3534,6 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             raise RuntimeError("Call fit_sgd(spikes, key=...) first.")
 
     def _build_param_spec(self):
-        from state_space_practice.parameter_transforms import (
-            PSD_MATRIX,
-            STOCHASTIC_ROW,
-            UNCONSTRAINED,
-        )
-
         params = {}
         spec = {}
 
@@ -3585,23 +3582,16 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
         sp = SpikeObsParams(baseline=baseline, weights=weights)
 
         # Reconstruct per-state arrays
-        def _recon(prefix, fallback):
-            if not any(k.startswith(f"{prefix}_") for k in params):
-                return fallback
-            return jnp.stack(
-                [
-                    params.get(f"{prefix}_{j}", fallback[..., j])
-                    for j in range(self.n_discrete_states)
-                ],
-                axis=-1,
-            )
-
         if any(k.startswith("A_blocks_") for k in params):
             A = self._reconstruct_A_from_blocks(params)
         else:
             A = self.continuous_transition_matrix
-        Q = _recon("Q", self.process_cov)
-        P0 = _recon("init_cov", self.init_cov)
+        Q = reconstruct_per_state_array(
+            params, "Q", self.process_cov, self.n_discrete_states
+        )
+        P0 = reconstruct_per_state_array(
+            params, "init_cov", self.init_cov, self.n_discrete_states
+        )
 
         # Optimize the *same* filter approximation the E-step/finalize evaluate:
         # pass max_newton_iter and line_search_beta so a model configured with
@@ -3679,18 +3669,13 @@ class SwitchingSpikeOscillatorModel(SGDFittableMixin):
             self.continuous_transition_matrix = self._reconstruct_A_from_blocks(params)
 
         def _store_recon(prefix, attr):
-            if any(k.startswith(f"{prefix}_") for k in params):
-                setattr(
-                    self,
-                    attr,
-                    jnp.stack(
-                        [
-                            params.get(f"{prefix}_{j}", getattr(self, attr)[..., j])
-                            for j in range(self.n_discrete_states)
-                        ],
-                        axis=-1,
-                    ),
-                )
+            setattr(
+                self,
+                attr,
+                reconstruct_per_state_array(
+                    params, prefix, getattr(self, attr), self.n_discrete_states
+                ),
+            )
 
         _store_recon("Q", "process_cov")
         _store_recon("init_cov", "init_cov")

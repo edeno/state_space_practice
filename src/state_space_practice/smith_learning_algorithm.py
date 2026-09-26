@@ -52,7 +52,7 @@ import math
 import warnings
 from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import matplotlib.pyplot as plt
@@ -65,6 +65,10 @@ import scipy.special
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.parameter_transforms import (
+    POSITIVE,
+    UNCONSTRAINED,
+)
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import check_converged, validate_count_array
 
@@ -235,10 +239,10 @@ def _log_posterior_objective(
 def smith_learning_filter(
     n_correct_responses: ArrayLike,
     init_learning_state: float = 0.0,
-    init_learning_variance: Optional[float] = None,
+    init_learning_variance: float | None = None,
     sigma_epsilon: float = DEFAULT_SIGMA_EPSILON,
     prob_correct_by_chance: float = 0.5,
-    max_possible_correct: Optional[ArrayLike] = None,
+    max_possible_correct: ArrayLike | None = None,
     differentiable: bool = False,
 ) -> tuple[Array, Array, Array, Array, Array]:
     """Applies a non-linear Bayesian filter (Laplace approximation) for learning.
@@ -570,9 +574,9 @@ def calculate_probability_confidence_limits(
     smoothed_learning_state_variance: ArrayLike,
     prob_correct_by_chance: float,
     n_samples: int = 10000,
-    percentiles: Optional[ArrayLike] = None,
+    percentiles: ArrayLike | None = None,
     return_prob_above_chance: bool = False,
-) -> tuple[Array, Optional[Array]]:
+) -> tuple[Array, Array | None]:
     """Calculates confidence limits for the probability of a correct response.
 
     This is achieved by sampling from the smoothed posterior distribution of
@@ -661,7 +665,7 @@ def find_min_consecutive_successes(
     sequence_length: int,
     min_run_length: int = 2,
     max_run_length: int = 35,
-) -> Optional[int]:
+) -> int | None:
     """
     Finds the minimum number of consecutive successes (run_length) in a sequence of
     `sequence_length` Bernoulli trials (with success probability `prob_correct_by_chance`)
@@ -758,7 +762,7 @@ def simulate_learning_data(
     prob_success_final: float = 0.6,
     learning_rate: float = 0.2,
     inflection_point: float = 25.0,
-    seed: Optional[int] = None,
+    seed: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Simulates learning data with a sigmoid probability curve.
 
@@ -922,9 +926,8 @@ def compute_cross_covariance_matrix(
     # But our formula computes Cov(x_i, x_j) = product(A_i:A_{j-1}) * P_j
     # which is only valid for i <= j. For i > j, we need to use the transpose.
     upper_tri = jnp.triu(cross_cov_matrix)
-    cross_cov_matrix = upper_tri + upper_tri.T - jnp.diag(jnp.diag(upper_tri))
+    return upper_tri + upper_tri.T - jnp.diag(jnp.diag(upper_tri))
 
-    return cross_cov_matrix
 
 
 def compute_trial_comparison_matrix(
@@ -934,7 +937,7 @@ def compute_trial_comparison_matrix(
     smoother_gain: ArrayLike,
     n_samples: int = 10000,
     compare_probability: bool = False,
-    prob_correct_by_chance: Optional[float] = None,
+    prob_correct_by_chance: float | None = None,
 ) -> Array:
     """Compute pairwise comparison matrix for all trials (vectorized).
 
@@ -1003,13 +1006,12 @@ def compute_trial_comparison_matrix(
         0.5,
         comparison_matrix,
     )
-    comparison_matrix = jnp.where(
+    return jnp.where(
         jnp.tril(jnp.ones((n_trials, n_trials), dtype=bool), k=-1),
         jnp.nan,
         comparison_matrix,
     )
 
-    return comparison_matrix
 
 
 def compare_two_trials(
@@ -1021,7 +1023,7 @@ def compare_two_trials(
     trial2: int,
     n_samples: int = 10000,
     compare_probability: bool = False,
-    prob_correct_by_chance: Optional[float] = None,
+    prob_correct_by_chance: float | None = None,
 ) -> float:
     """Compute the probability that learning state at trial1 > trial2.
 
@@ -1093,7 +1095,7 @@ def find_first_significant_trial(
     comparison_matrix: ArrayLike,
     reference_trial: int = 0,
     significance_level: float = 0.05,
-) -> Optional[int]:
+) -> int | None:
     """Find the first trial significantly different from a reference trial.
 
     Parameters
@@ -1131,7 +1133,7 @@ def calculate_latent_state_percentiles(
     smoothed_learning_state_mode: ArrayLike,  # shape: (n_trials,)
     smoothed_learning_state_variance: ArrayLike,  # shape: (n_trials,)
     n_samples: int = 10000,
-    percentiles: Optional[ArrayLike] = None,
+    percentiles: ArrayLike | None = None,
 ) -> Array:
     """Calculates confidence percentiles for the smoothed latent state.
 
@@ -1256,10 +1258,10 @@ class SmithLearningModel(SGDFittableMixin):
     def __init__(
         self,
         init_learning_state: float = 0.0,
-        init_learning_variance: Optional[float] = None,
+        init_learning_variance: float | None = None,
         sigma_epsilon: float = DEFAULT_SIGMA_EPSILON,
         prob_correct_by_chance: float = 0.5,
-        max_possible_correct: Optional[int] = None,
+        max_possible_correct: int | None = None,
         initial_state_method: str = "reestimate_initial_from_data",
     ):
         """Initializes the Smith Learning Algorithm parameters.
@@ -1344,22 +1346,22 @@ class SmithLearningModel(SGDFittableMixin):
         self.initial_state_method = initial_state_method
 
         # Attributes to store filter/smoother outputs
-        self.filtered_prob_correct_response: Optional[jax.Array] = None
-        self.filtered_learning_state_mode: Optional[jax.Array] = None
-        self.filtered_learning_state_variance: Optional[jax.Array] = None
-        self.filtered_one_step_mode: Optional[jax.Array] = None
-        self.filtered_one_step_variance: Optional[jax.Array] = None
+        self.filtered_prob_correct_response: jax.Array | None = None
+        self.filtered_learning_state_mode: jax.Array | None = None
+        self.filtered_learning_state_variance: jax.Array | None = None
+        self.filtered_one_step_mode: jax.Array | None = None
+        self.filtered_one_step_variance: jax.Array | None = None
 
-        self.smoothed_learning_state_mode: Optional[jax.Array] = None
-        self.smoothed_learning_state_variance: Optional[jax.Array] = None
-        self.smoothed_prob_correct_response: Optional[jax.Array] = None
-        self.smoother_gain: Optional[jax.Array] = None  # Has shape (n_trials-1,)
+        self.smoothed_learning_state_mode: jax.Array | None = None
+        self.smoothed_learning_state_variance: jax.Array | None = None
+        self.smoothed_prob_correct_response: jax.Array | None = None
+        self.smoother_gain: jax.Array | None = None  # Has shape (n_trials-1,)
 
         # Fit diagnostics
-        self.log_likelihood_: Optional[float] = None
-        self.n_iter_: Optional[int] = None
-        self.log_likelihood_history_: Optional[list[float]] = None
-        self._n_trials_: Optional[int] = None
+        self.log_likelihood_: float | None = None
+        self.n_iter_: int | None = None
+        self.log_likelihood_history_: list[float] | None = None
+        self._n_trials_: int | None = None
 
     def __repr__(self) -> str:
         fitted = "fitted" if self.is_fitted else "not fitted"
@@ -1765,10 +1767,10 @@ class SmithLearningModel(SGDFittableMixin):
     def fit_sgd(
         self,
         n_correct_responses: ArrayLike,
-        optimizer: Optional[object] = None,
+        optimizer: object | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
 
@@ -1820,15 +1822,7 @@ class SmithLearningModel(SGDFittableMixin):
     def _n_timesteps(self) -> int:
         return self._n_trials_
 
-    def _check_sgd_initialized(self) -> None:
-        pass  # Parameters allocated at construction time
-
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            POSITIVE,
-            UNCONSTRAINED,
-        )
-
         params: dict = {}
         spec: dict = {}
 
@@ -1944,9 +1938,9 @@ class SmithLearningModel(SGDFittableMixin):
         self,
         key: Array,
         n_samples: int = 10000,
-        percentiles: Optional[jax.Array] = None,
+        percentiles: jax.Array | None = None,
         return_prob_above_chance: bool = False,
-    ) -> tuple[jax.Array, Optional[jax.Array]]:
+    ) -> tuple[jax.Array, jax.Array | None]:
         """
         Calculates the smoothed learning curve (probability of correct response)
         and its confidence limits.
@@ -1998,7 +1992,7 @@ class SmithLearningModel(SGDFittableMixin):
         self,
         key: Array,
         n_samples: int = 10000,
-        percentiles: Optional[jax.Array] = None,
+        percentiles: jax.Array | None = None,
     ) -> jax.Array:
         """
         Calculates confidence percentiles for the smoothed latent learning state x_k|T.
@@ -2039,11 +2033,11 @@ class SmithLearningModel(SGDFittableMixin):
     def find_critical_run_length(
         self,
         sequence_length: int,
-        prob_correct_by_chance: Optional[float] = None,
+        prob_correct_by_chance: float | None = None,
         critical_probability_threshold: float = 0.05,
         min_run_length: int = 2,
         max_run_length: int = 35,
-    ) -> Optional[int]:
+    ) -> int | None:
         """Determines the minimum length of a run of consecutive successes
         that would be statistically significant under a null hypothesis.
 
@@ -2099,11 +2093,11 @@ class SmithLearningModel(SGDFittableMixin):
     def find_significant_runs(
         self,
         observed_binary_responses: ArrayLike,
-        prob_correct_by_chance: Optional[float] = None,
+        prob_correct_by_chance: float | None = None,
         critical_probability_threshold: float = 0.05,
         min_run_length_for_j_crit: int = 2,  # Parameter for j_crit calculation
         max_run_length_for_j_crit: int = 35,  # Parameter for j_crit calculation
-    ) -> tuple[Optional[int], list[tuple[int, int]]]:
+    ) -> tuple[int | None, list[tuple[int, int]]]:
         """
         Identifies significant runs of successes in observed binary data.
 
@@ -2194,7 +2188,7 @@ class SmithLearningModel(SGDFittableMixin):
         key: Array,
         alpha: float = 0.05,
         n_samples: int = 10000,
-    ) -> Optional[int]:
+    ) -> int | None:
         """Determines the first trial where learning is reliably above chance.
 
         Uses the Smith et al. (2004) criterion: finds the first trial k
@@ -2281,13 +2275,13 @@ class SmithLearningModel(SGDFittableMixin):
         self,
         key: Array,
         plot_type: str = "probability",
-        observed_n_correct: Optional[jax.Array] = None,
-        observed_max_possible: Optional[jax.Array] = None,
+        observed_n_correct: jax.Array | None = None,
+        observed_max_possible: jax.Array | None = None,
         confidence_bounds: tuple[float, float] = (5.0, 95.0),
         n_samples: int = 10000,
-        title: Optional[str] = None,
+        title: str | None = None,
         xlabel: str = "Trial",
-        ylabel_override: Optional[str] = None,
+        ylabel_override: str | None = None,
     ) -> tuple[plt.Figure, plt.Axes]:
         """Plots the smoothed learning process with confidence intervals.
 
@@ -2625,7 +2619,7 @@ class SmithLearningModel(SGDFittableMixin):
         significance_level: float = 0.05,
         n_samples: int = 10000,
         compare_probability: bool = False,
-    ) -> Optional[int]:
+    ) -> int | None:
         """Find the first trial with significantly higher learning than reference.
 
         This identifies the earliest trial where the learning state is
@@ -2703,7 +2697,7 @@ class SmithLearningModel(SGDFittableMixin):
 
     def compare_to_null(
         self,
-        n_correct_responses: Optional[ArrayLike] = None,
+        n_correct_responses: ArrayLike | None = None,
     ) -> dict:
         """Compare the fitted model to a null (no-learning) model.
 
@@ -2776,8 +2770,8 @@ class SmithLearningModel(SGDFittableMixin):
 
     def summary(
         self,
-        key: Optional[Array] = None,
-        n_correct_responses: Optional[ArrayLike] = None,
+        key: Array | None = None,
+        n_correct_responses: ArrayLike | None = None,
     ) -> str:
         """Return a text summary of the fitted model.
 
@@ -2843,7 +2837,7 @@ class SmithLearningModel(SGDFittableMixin):
         n_samples: int = 10000,
         compare_probability: bool = False,
         significance_level: float = 0.05,
-        title: Optional[str] = None,
+        title: str | None = None,
         cmap: str = "bone",
     ) -> tuple[plt.Figure, plt.Axes]:
         """Plot the trial-to-trial comparison matrix with significant points.
@@ -2994,7 +2988,7 @@ class SmithLearningModel(SGDFittableMixin):
     def plot_summary(
         self,
         key: Array,
-        observed_n_correct: Optional[ArrayLike] = None,
+        observed_n_correct: ArrayLike | None = None,
         n_samples: int = 10000,
     ) -> tuple[plt.Figure, np.ndarray]:
         """Multi-panel diagnostic figure summarizing the fitted model.

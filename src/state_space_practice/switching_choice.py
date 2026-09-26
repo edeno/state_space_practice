@@ -21,9 +21,9 @@ References
     experiments. J Neuroscience 24(2), 447-461.
 """
 
-import logging
 import functools
-from typing import NamedTuple, Optional
+import logging
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -31,6 +31,13 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.multinomial_choice import _softmax_update_core
+from state_space_practice.parameter_transforms import (
+    POSITIVE,
+    STOCHASTIC_ROW,
+    UNCONSTRAINED,
+    UNIT_INTERVAL,
+    positive_capped,
+)
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.switching_kalman import (
     _update_discrete_state_probabilities,
@@ -38,6 +45,8 @@ from state_space_practice.switching_kalman import (
 )
 from state_space_practice.utils import (
     stabilize_probability_vector as _stabilize_probability_vector,
+)
+from state_space_practice.utils import (
     validate_choice_indices,
 )
 
@@ -195,17 +204,17 @@ def switching_choice_filter(
     choices: ArrayLike,
     n_options: int,
     n_discrete_states: int = 2,
-    covariates: Optional[ArrayLike] = None,
-    input_gain: Optional[ArrayLike] = None,
-    obs_covariates: Optional[ArrayLike] = None,
-    obs_weights: Optional[ArrayLike] = None,
-    process_noises: Optional[ArrayLike] = None,
-    inverse_temperatures: Optional[ArrayLike] = None,
-    decays: Optional[ArrayLike] = None,
-    discrete_transition_matrix: Optional[ArrayLike] = None,
-    init_mean: Optional[ArrayLike] = None,
-    init_cov: Optional[ArrayLike] = None,
-    init_discrete_prob: Optional[ArrayLike] = None,
+    covariates: ArrayLike | None = None,
+    input_gain: ArrayLike | None = None,
+    obs_covariates: ArrayLike | None = None,
+    obs_weights: ArrayLike | None = None,
+    process_noises: ArrayLike | None = None,
+    inverse_temperatures: ArrayLike | None = None,
+    decays: ArrayLike | None = None,
+    discrete_transition_matrix: ArrayLike | None = None,
+    init_mean: ArrayLike | None = None,
+    init_cov: ArrayLike | None = None,
+    init_discrete_prob: ArrayLike | None = None,
 ) -> SwitchingChoiceFilterResult:
     """Validate choices and run the JIT-compiled switching choice filter."""
     validate_choice_indices(choices, n_options)
@@ -235,17 +244,17 @@ def _switching_choice_filter_jit(
     choices: ArrayLike,
     n_options: int,
     n_discrete_states: int = 2,
-    covariates: Optional[ArrayLike] = None,
-    input_gain: Optional[ArrayLike] = None,
-    obs_covariates: Optional[ArrayLike] = None,
-    obs_weights: Optional[ArrayLike] = None,
-    process_noises: Optional[ArrayLike] = None,
-    inverse_temperatures: Optional[ArrayLike] = None,
-    decays: Optional[ArrayLike] = None,
-    discrete_transition_matrix: Optional[ArrayLike] = None,
-    init_mean: Optional[ArrayLike] = None,
-    init_cov: Optional[ArrayLike] = None,
-    init_discrete_prob: Optional[ArrayLike] = None,
+    covariates: ArrayLike | None = None,
+    input_gain: ArrayLike | None = None,
+    obs_covariates: ArrayLike | None = None,
+    obs_weights: ArrayLike | None = None,
+    process_noises: ArrayLike | None = None,
+    inverse_temperatures: ArrayLike | None = None,
+    decays: ArrayLike | None = None,
+    discrete_transition_matrix: ArrayLike | None = None,
+    init_mean: ArrayLike | None = None,
+    init_cov: ArrayLike | None = None,
+    init_discrete_prob: ArrayLike | None = None,
 ) -> SwitchingChoiceFilterResult:
     """Switching choice filter with GPB1/IMM approximation.
 
@@ -539,9 +548,9 @@ class SwitchingChoiceModel(SGDFittableMixin):
         n_discrete_states: int = 2,
         n_covariates: int = 0,
         n_obs_covariates: int = 0,
-        init_inverse_temperatures: Optional[ArrayLike] = None,
-        init_process_noises: Optional[ArrayLike] = None,
-        init_decays: Optional[ArrayLike] = None,
+        init_inverse_temperatures: ArrayLike | None = None,
+        init_process_noises: ArrayLike | None = None,
+        init_decays: ArrayLike | None = None,
     ):
         self.n_options = n_options
         self.n_discrete_states = n_discrete_states
@@ -599,19 +608,19 @@ class SwitchingChoiceModel(SGDFittableMixin):
             self.obs_weights_ = None
 
         # Fitted state
-        self.converged_: Optional[bool] = None
-        self._filter_result: Optional[SwitchingChoiceFilterResult] = None
-        self.smoothed_discrete_probs_: Optional[Array] = None
-        self.log_likelihood_: Optional[float] = None
-        self.log_likelihood_history_: Optional[list[float]] = None
-        self._n_trials: Optional[int] = None
+        self.converged_: bool | None = None
+        self._filter_result: SwitchingChoiceFilterResult | None = None
+        self.smoothed_discrete_probs_: Array | None = None
+        self.log_likelihood_: float | None = None
+        self.log_likelihood_history_: list[float] | None = None
+        self._n_trials: int | None = None
 
         # Uncertainty summaries
-        self.predicted_option_variances_: Optional[Array] = None
-        self.smoothed_option_variances_: Optional[Array] = None
-        self.predicted_choice_entropy_: Optional[Array] = None
-        self.surprise_: Optional[Array] = None
-        self.per_state_predicted_variances_: Optional[Array] = None
+        self.predicted_option_variances_: Array | None = None
+        self.smoothed_option_variances_: Array | None = None
+        self.predicted_choice_entropy_: Array | None = None
+        self.surprise_: Array | None = None
+        self.per_state_predicted_variances_: Array | None = None
 
     @property
     def is_fitted(self) -> bool:
@@ -736,17 +745,17 @@ class SwitchingChoiceModel(SGDFittableMixin):
 
     def _run_filter(self, choices, covariates=None, obs_covariates=None):
         """Run the switching choice filter with current parameters."""
-        kwargs = dict(
-            choices=choices,
-            n_options=self.n_options,
-            n_discrete_states=self.n_discrete_states,
-            process_noises=self.process_noises_,
-            inverse_temperatures=self.inverse_temperatures_,
-            decays=self.decays_,
-            discrete_transition_matrix=self.discrete_transition_matrix_,
-            init_mean=self.init_mean_,
-            init_cov=self.init_cov_,
-        )
+        kwargs = {
+            "choices": choices,
+            "n_options": self.n_options,
+            "n_discrete_states": self.n_discrete_states,
+            "process_noises": self.process_noises_,
+            "inverse_temperatures": self.inverse_temperatures_,
+            "decays": self.decays_,
+            "discrete_transition_matrix": self.discrete_transition_matrix_,
+            "init_mean": self.init_mean_,
+            "init_cov": self.init_cov_,
+        }
         if covariates is not None and self.input_gain_ is not None:
             kwargs["covariates"] = covariates
             kwargs["input_gain"] = self.input_gain_
@@ -758,8 +767,8 @@ class SwitchingChoiceModel(SGDFittableMixin):
     def fit(
         self,
         choices: ArrayLike,
-        covariates: Optional[ArrayLike] = None,
-        obs_covariates: Optional[ArrayLike] = None,
+        covariates: ArrayLike | None = None,
+        obs_covariates: ArrayLike | None = None,
         max_iter: int = 50,
         tolerance: float = 1e-4,
     ) -> list[float]:
@@ -939,8 +948,8 @@ class SwitchingChoiceModel(SGDFittableMixin):
     def fit_sgd(
         self,
         choices: ArrayLike,
-        covariates: Optional[ArrayLike] = None,
-        obs_covariates: Optional[ArrayLike] = None,
+        covariates: ArrayLike | None = None,
+        obs_covariates: ArrayLike | None = None,
         optimizer=None,
         num_steps: int = 200,
         verbose: bool = False,
@@ -967,18 +976,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
     def _n_timesteps(self) -> int:
         return self._n_trials
 
-    def _check_sgd_initialized(self) -> None:
-        pass
-
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            POSITIVE,
-            STOCHASTIC_ROW,
-            UNCONSTRAINED,
-            UNIT_INTERVAL,
-            positive_capped,
-        )
-
         params = {
             "process_noises": self.process_noises_,
             "inverse_temperatures": self.inverse_temperatures_,
@@ -1005,17 +1003,17 @@ class SwitchingChoiceModel(SGDFittableMixin):
         return params, spec
 
     def _sgd_loss_fn(self, params: dict, choices: Array) -> Array:
-        kwargs = dict(
-            choices=choices,
-            n_options=self.n_options,
-            n_discrete_states=self.n_discrete_states,
-            process_noises=params["process_noises"],
-            inverse_temperatures=params["inverse_temperatures"],
-            decays=params["decays"],
-            discrete_transition_matrix=params["discrete_transition_matrix"],
-            init_mean=params["init_mean"],
-            init_cov=self.init_cov_,
-        )
+        kwargs = {
+            "choices": choices,
+            "n_options": self.n_options,
+            "n_discrete_states": self.n_discrete_states,
+            "process_noises": params["process_noises"],
+            "inverse_temperatures": params["inverse_temperatures"],
+            "decays": params["decays"],
+            "discrete_transition_matrix": params["discrete_transition_matrix"],
+            "init_mean": params["init_mean"],
+            "init_cov": self.init_cov_,
+        }
         if self._covariates is not None and "input_gain" in params:
             kwargs["covariates"] = self._covariates
             kwargs["input_gain"] = params["input_gain"]
@@ -1061,10 +1059,10 @@ def simulate_switching_choice_data(
     n_trials: int = 200,
     n_options: int = 3,
     n_discrete_states: int = 2,
-    process_noises: Optional[ArrayLike] = None,
-    inverse_temperatures: Optional[ArrayLike] = None,
-    decays: Optional[ArrayLike] = None,
-    transition_matrix: Optional[ArrayLike] = None,
+    process_noises: ArrayLike | None = None,
+    inverse_temperatures: ArrayLike | None = None,
+    decays: ArrayLike | None = None,
+    transition_matrix: ArrayLike | None = None,
     seed: int = 42,
 ) -> SimulatedSwitchingChoiceData:
     """Simulate switching multi-armed bandit choice data.

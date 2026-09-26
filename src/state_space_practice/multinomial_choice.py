@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import math
 from functools import partial
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -28,14 +28,17 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.sgd_fitting import SGDFittableMixin
-
 from state_space_practice.kalman import (
-    _kalman_smoother_update,
+    psd_cholesky,
+    psd_logdet,
     psd_solve,
+    rts_backward_scan,
     symmetrize,
 )
-from state_space_practice.point_process_kalman import _logdet_psd
+from state_space_practice.parameter_transforms import (
+    POSITIVE,
+)
+from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import validate_choice_indices as _validate_choices
 
 logger = logging.getLogger(__name__)
@@ -48,7 +51,7 @@ def _softmax_update_core(
     n_options: int,
     inverse_temperature: float,
     max_newton_steps: int = 3,
-    obs_offset: Optional[Array] = None,
+    obs_offset: Array | None = None,
 ) -> tuple[Array, Array, Array]:
     """JIT-compatible Laplace-EKF update for softmax observation.
 
@@ -79,8 +82,10 @@ def _softmax_update_core(
     beta_sq = beta**2
     _obs_offset = obs_offset if obs_offset is not None else jnp.zeros(n_options)
 
-    # Prior precision
-    prior_precision = psd_solve(prior_cov, eye_k)
+    # One stabilized factor of the prior covariance serves the precision and
+    # (below) its log-determinant.
+    prior_cho = psd_cholesky(prior_cov)
+    prior_precision = jax.scipy.linalg.cho_solve(prior_cho, eye_k)
 
     # Fixed Newton iterations (unrolled for JIT compatibility)
     x = prior_mean
@@ -100,7 +105,8 @@ def _softmax_update_core(
     p_free = jax.nn.softmax(beta * v + _obs_offset)[1:]
     neg_hessian = beta_sq * (jnp.diag(p_free) - jnp.outer(p_free, p_free))
     posterior_precision = prior_precision + neg_hessian
-    posterior_cov = symmetrize(psd_solve(posterior_precision, eye_k))
+    post_cho = psd_cholesky(posterior_precision)
+    posterior_cov = symmetrize(jax.scipy.linalg.cho_solve(post_cho, eye_k))
 
     # Laplace-approximated marginal log-likelihood log p(c_t | y_{1:t-1}):
     #   ≈ log p(c_t | x*) + log p(x* | y_{1:t-1}) + ½ log|Σ_post| + const
@@ -110,8 +116,8 @@ def _softmax_update_core(
     log_lik_at_mode = jax.nn.log_softmax(beta * v + _obs_offset)[choice]
     delta = x - prior_mean
     quad = delta @ (prior_precision @ delta)
-    logdet_prior = _logdet_psd(prior_cov)
-    logdet_post = _logdet_psd(posterior_cov)
+    logdet_prior = psd_logdet(prior_cho)
+    logdet_post = -psd_logdet(post_cho)  # log|Σ_post| = -log|precision|
     log_lik = log_lik_at_mode - 0.5 * quad - 0.5 * logdet_prior + 0.5 * logdet_post
 
     return x, posterior_cov, log_lik
@@ -208,8 +214,8 @@ def multinomial_choice_filter(
     n_options: int,
     process_noise: float = 0.01,
     inverse_temperature: float = 1.0,
-    init_mean: Optional[ArrayLike] = None,
-    init_cov: Optional[ArrayLike] = None,
+    init_mean: ArrayLike | None = None,
+    init_cov: ArrayLike | None = None,
 ) -> ChoiceFilterResult:
     """Forward filter for multinomial choice model.
 
@@ -302,49 +308,13 @@ def _multinomial_choice_filter_jit(
     )
 
 
-@jax.jit
-def _rts_smoother_pass(
-    filtered_values: Array,
-    filtered_covariances: Array,
-    Q: Array,
-    A: Optional[Array] = None,
-) -> tuple[Array, Array, Array]:
-    """JIT-compiled RTS backward smoother.
-
-    Parameters
-    ----------
-    A : Array or None
-        Transition matrix. None defaults to identity (random walk).
-    """
-    A = A if A is not None else jnp.eye(Q.shape[0])
-
-    def _smooth_step(carry, inputs):
-        next_sm_mean, next_sm_cov = carry
-        f_mean, f_cov = inputs
-
-        sm_mean, sm_cov, cross_cov = _kalman_smoother_update(
-            next_sm_mean, next_sm_cov,
-            f_mean, f_cov,
-            Q, A,
-        )
-        return (sm_mean, sm_cov), (sm_mean, sm_cov, cross_cov)
-
-    _, (sm_means, sm_covs, cross_covs) = jax.lax.scan(
-        _smooth_step,
-        (filtered_values[-1], filtered_covariances[-1]),
-        (filtered_values[:-1], filtered_covariances[:-1]),
-        reverse=True,
-    )
-    return sm_means, sm_covs, cross_covs
-
-
 def multinomial_choice_smoother(
     choices: ArrayLike,
     n_options: int,
     process_noise: float = 0.01,
     inverse_temperature: float = 1.0,
-    init_mean: Optional[ArrayLike] = None,
-    init_cov: Optional[ArrayLike] = None,
+    init_mean: ArrayLike | None = None,
+    init_cov: ArrayLike | None = None,
 ) -> ChoiceSmootherResult:
     """Forward filter + RTS backward smoother for multinomial choice model.
 
@@ -362,13 +332,11 @@ def multinomial_choice_smoother(
     k_free = n_options - 1
     Q = jnp.eye(k_free) * process_noise
 
-    sm_means, sm_covs, cross_covs = _rts_smoother_pass(
-        filt.filtered_values, filt.filtered_covariances, Q,
+    # Random-walk latent (identity transition); the shared RTS scan appends the
+    # last filtered state itself (smoother[-1] == filter[-1]).
+    smoothed_values, smoothed_covs, cross_covs = rts_backward_scan(
+        filt.filtered_values, filt.filtered_covariances, jnp.eye(k_free), Q
     )
-
-    # Append last filtered state (smoother[-1] == filter[-1])
-    smoothed_values = jnp.concatenate([sm_means, filt.filtered_values[-1:]])
-    smoothed_covs = jnp.concatenate([sm_covs, filt.filtered_covariances[-1:]])
 
     return ChoiceSmootherResult(
         smoothed_values=smoothed_values,
@@ -444,18 +412,18 @@ class MultinomialChoiceModel(SGDFittableMixin):
         self.learn_process_noise = learn_process_noise
 
         # Fitted state (populated by fit())
-        self._smoother_result: Optional[ChoiceSmootherResult] = None
-        self.log_likelihood_: Optional[float] = None
-        self.n_iter_: Optional[int] = None
-        self.converged_: Optional[bool] = None
-        self.log_likelihood_history_: Optional[list[float]] = None
-        self._n_trials: Optional[int] = None
+        self._smoother_result: ChoiceSmootherResult | None = None
+        self.log_likelihood_: float | None = None
+        self.n_iter_: int | None = None
+        self.converged_: bool | None = None
+        self.log_likelihood_history_: list[float] | None = None
+        self._n_trials: int | None = None
 
         # Uncertainty summaries (populated after fitting)
-        self.predicted_option_variances_: Optional[Array] = None
-        self.smoothed_option_variances_: Optional[Array] = None
-        self.predicted_choice_entropy_: Optional[Array] = None
-        self.surprise_: Optional[Array] = None
+        self.predicted_option_variances_: Array | None = None
+        self.smoothed_option_variances_: Array | None = None
+        self.predicted_choice_entropy_: Array | None = None
+        self.surprise_: Array | None = None
 
     def __repr__(self) -> str:
         fitted = self.is_fitted
@@ -539,7 +507,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         max_iter: int = 50,
         tolerance: float = 1e-4,
         verbose: bool = False,
-        beta_grid: Optional[ArrayLike] = None,
+        beta_grid: ArrayLike | None = None,
     ) -> list[float]:
         """Fit the model via EM algorithm.
 
@@ -659,10 +627,10 @@ class MultinomialChoiceModel(SGDFittableMixin):
     def fit_sgd(
         self,
         choices: ArrayLike,
-        optimizer: Optional[object] = None,
+        optimizer: object | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
 
@@ -712,12 +680,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
     def _n_timesteps(self) -> int:
         return self._n_trials
 
-    def _check_sgd_initialized(self) -> None:
-        pass  # Parameters are allocated at construction time
-
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import POSITIVE
-
         params: dict = {}
         spec: dict = {}
         if self.learn_process_noise:
@@ -779,8 +742,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
             - 2 * jnp.sum(C, axis=0)
         ) / T_minus_1
         # Scalar Q: mean of diagonal, clamped
-        q = float(jnp.maximum(jnp.mean(jnp.diag(Q_hat)), 1e-8))
-        return q
+        return float(jnp.maximum(jnp.mean(jnp.diag(Q_hat)), 1e-8))
 
     def _m_step_beta(
         self,

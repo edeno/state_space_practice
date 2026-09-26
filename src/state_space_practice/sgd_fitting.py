@@ -15,11 +15,16 @@ Models must implement:
 
 import logging
 import math
-import operator
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
+from jax import Array
+
+from state_space_practice.parameter_transforms import (
+    transform_to_constrained,
+    transform_to_unconstrained,
+)
+from state_space_practice.utils import validate_int
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +48,27 @@ def _tree_all_finite_array(tree: object) -> jax.Array:
     return jnp.all(jnp.stack(checks))
 
 
+def reconstruct_per_state_array(
+    params: dict, prefix: str, fallback: Array, n_discrete_states: int
+) -> Array:
+    """Reassemble a ``(..., n_discrete_states)`` array from per-state SGD params.
+
+    Per-state PSD parameters are exposed to the optimizer as separate keys
+    (``"init_cov_0"``, ``"init_cov_1"``, ...). If ``params`` holds none of
+    them the ``fallback`` array is returned unchanged; otherwise each state's
+    slice comes from ``params`` when present and from ``fallback`` otherwise.
+    """
+    if not any(k.startswith(f"{prefix}_") for k in params):
+        return fallback
+    return jnp.stack(
+        [
+            params.get(f"{prefix}_{j}", fallback[..., j])
+            for j in range(n_discrete_states)
+        ],
+        axis=-1,
+    )
+
+
 class SGDFittableMixin:
     """Mixin providing fit_sgd() for state-space models.
 
@@ -51,9 +77,15 @@ class SGDFittableMixin:
     - _sgd_loss_fn(params, *args, **kwargs) -> Array
     - _store_sgd_params(params: dict) -> None
     - _finalize_sgd(*args, **kwargs) -> None
-    - _check_sgd_initialized() -> None
     - _n_timesteps: int (property or attribute)
+
+    Models whose parameters are allocated lazily (e.g. on the first ``fit``)
+    may override ``_check_sgd_initialized`` to raise before optimization
+    starts; the default is a no-op for models that allocate in ``__init__``.
     """
+
+    def _check_sgd_initialized(self) -> None:
+        return
 
     def _finalize_convergence(self, converged: bool, max_iter: int) -> None:
         """Record the EM convergence flag and warn if the fit did not converge.
@@ -76,10 +108,10 @@ class SGDFittableMixin:
     def fit_sgd(
         self,
         *args,
-        optimizer: Optional[object] = None,
+        optimizer: object | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
         **kwargs,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
@@ -109,17 +141,8 @@ class SGDFittableMixin:
         """
         import optax
 
-        from state_space_practice.parameter_transforms import (
-            transform_to_constrained,
-            transform_to_unconstrained,
-        )
 
-        try:
-            num_steps = operator.index(num_steps)
-        except TypeError as exc:
-            raise ValueError("num_steps must be a non-negative integer.") from exc
-        if num_steps < 0:
-            raise ValueError("num_steps must be a non-negative integer.")
+        num_steps = validate_int(num_steps, "num_steps", nonnegative=True)
 
         self._check_sgd_initialized()
         params, param_spec = self._build_param_spec()
@@ -201,7 +224,10 @@ class SGDFittableMixin:
                 unc_params, opt_state
             )
 
-            if not bool(jnp.isfinite(loss)):
+            # One device->host round trip per step; ``float`` / ``bool`` on
+            # each value separately would block three times.
+            loss_host, step_finite_host = jax.device_get((loss, step_finite))
+            if not math.isfinite(loss_host):
                 logger.warning(
                     "SGD step %d: NaN/inf loss — restoring last valid params "
                     "and stopping.",
@@ -210,10 +236,10 @@ class SGDFittableMixin:
                 unc_params = last_valid_unc_params
                 break
 
-            ll = -float(loss) * n_timesteps
+            ll = -float(loss_host) * n_timesteps
             log_likelihoods.append(ll)
 
-            if not bool(step_finite):
+            if not bool(step_finite_host):
                 last_valid_unc_params = unc_params
                 logger.warning(
                     "SGD step %d: NaN/inf gradient or parameter update -- keeping "

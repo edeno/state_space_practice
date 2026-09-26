@@ -8,7 +8,7 @@ See docs/hamiltonian_architecture.md for why this family is standalone
 """
 
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -46,7 +46,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         n_lfp_sources: int,
         n_spike_sources: int,
         sampling_freq: float,
-        hidden_dims: Optional[List[int]] = None,
+        hidden_dims: list[int] | None = None,
         seed: int = 42,
     ):
         super().__init__(
@@ -74,6 +74,13 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
 
         self._initialize_parameters(self.key)
 
+    def _measurement_matrix_all_states(self) -> Array:
+        """Stack ``[C_lfp; C_spikes]`` once per discrete state, axis last."""
+        C = jnp.concatenate([self.C_lfp, self.C_spikes], axis=0)
+        return jnp.broadcast_to(
+            C[:, :, None], (self.n_sources, self.n_cont_states, self.n_discrete_states)
+        )
+
     def _initialize_parameters(self, key: Array) -> None:
         from state_space_practice.hamiltonian_core import default_init_mean
 
@@ -88,11 +95,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         self.process_cov = jnp.stack(
             [jnp.eye(self.n_cont_states) * 1e-4] * self.n_discrete_states, axis=2
         )
-        mm = jnp.zeros((self.n_sources, self.n_cont_states, self.n_discrete_states))
-        for k in range(self.n_discrete_states):
-            mm = mm.at[: self.n_lfp, :, k].set(self.C_lfp)
-            mm = mm.at[self.n_lfp :, :, k].set(self.C_spikes)
-        self.measurement_matrix = mm
+        self.measurement_matrix = self._measurement_matrix_all_states()
         R_all_states = jnp.broadcast_to(
             self.R_lfp[:, :, None],
             (self.n_lfp, self.n_lfp, self.n_discrete_states),
@@ -112,7 +115,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         P_prev: Array,
         pi_prev: Array,
         Z: Array,
-        mlp_params: Dict[str, Any],
+        mlp_params: dict[str, Any],
         omega: Array,
         Q_all: Array,
         K_states: int,
@@ -167,12 +170,12 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         self,
         lfp_data: Array,
         spike_data: Array,
-        params: Dict[str, Any],
-    ) -> Tuple[Array, Array, Array, Array]:
+        params: dict[str, Any],
+    ) -> tuple[Array, Array, Array, Array]:
         """Switching EKF with Gaussian Collapse (Kim Filter)."""
         lfp_data, spike_data = self._validate_joint_data(lfp_data, spike_data)
         return cast(
-            Tuple[Array, Array, Array, Array],
+            tuple[Array, Array, Array, Array],
             self._filter_jit(
                 lfp_data, spike_data, self._complete_filter_params(params)
             ),
@@ -183,8 +186,8 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         self,
         lfp_data: Array,
         spike_data: Array,
-        params: Dict[str, Any],
-    ) -> Tuple[Array, Array, Array, Array]:
+        params: dict[str, Any],
+    ) -> tuple[Array, Array, Array, Array]:
         """JIT-compiled switching filter core; covariances passed explicitly."""
         mlp_params, omega = params["mlp"], params["omega"]
         Z = params["Z"]
@@ -266,8 +269,8 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         self,
         lfp_data: Array,
         spike_data: Array,
-        params: Dict[str, Any],
-    ) -> Tuple[Array, Array, Array]:
+        params: dict[str, Any],
+    ) -> tuple[Array, Array, Array]:
         """Switching EKF-RTS smoother with Kim-style discrete-state smoothing.
 
         Returns
@@ -278,7 +281,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         """
         lfp_data, spike_data = self._validate_joint_data(lfp_data, spike_data)
         return cast(
-            Tuple[Array, Array, Array],
+            tuple[Array, Array, Array],
             self._smooth_jit(
                 lfp_data, spike_data, self._complete_filter_params(params)
             ),
@@ -289,8 +292,8 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         self,
         lfp_data: Array,
         spike_data: Array,
-        params: Dict[str, Any],
-    ) -> Tuple[Array, Array, Array]:
+        params: dict[str, Any],
+    ) -> tuple[Array, Array, Array]:
         """JIT-compiled switching smoother core; covariances passed explicitly."""
         mlp_params, omega = params["mlp"], params["omega"]
         Z = params["Z"]
@@ -478,7 +481,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         pi_s = jnp.concatenate([pi_smooth_rev, pi_filt_all[-1:]], axis=0)
         return m_s, P_s, pi_s
 
-    def _complete_filter_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _complete_filter_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Fill per-state covariance defaults before a JIT-compiled method.
 
         Unlike the single-regime parent, the switching filter carries per-state
@@ -496,7 +499,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
 
     def _build_param_spec(
         self,
-    ) -> Tuple[Dict[str, Any], Dict[str, ParameterTransform]]:
+    ) -> tuple[dict[str, Any], dict[str, ParameterTransform]]:
         params, spec = super()._build_param_spec()
         # Drop the inherited single-matrix Q: this model uses a per-state
         # process_cov (n x n x K) read directly from self.process_cov in
@@ -520,7 +523,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
 
     def _sgd_loss_fn(
         self,
-        params: Dict[str, Any],
+        params: dict[str, Any],
         lfp_data: Array,
         spike_data: Array,
         use_filter: bool = True,
@@ -547,14 +550,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         lik_loss = -jnp.sum(marginal_lls)
         return lik_loss + l2_reg * mlp_l2_penalty(params["mlp"])
 
-    def fit(self, *args, **kwargs):
-        """Hamiltonian models do not support linear EM."""
-        raise NotImplementedError(
-            "SwitchingHamiltonianJointModel does not support the linear EM path "
-            "(fit()). Please use fit_sgd() for non-linear optimization."
-        )
-
-    def _store_sgd_params(self, params: Dict[str, Any]) -> None:
+    def _store_sgd_params(self, params: dict[str, Any]) -> None:
         self.mlp_params = params["mlp"]
         self.omega = params["omega"]
         self.C_lfp = params["C_lfp"]
@@ -566,21 +562,15 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         self.init_discrete_state_prob = params["init_pi"]
 
         # Resync BaseModel measurement_matrix across all discrete states.
-        mm = jnp.zeros((self.n_sources, self.n_cont_states, self.n_discrete_states))
-        for k in range(self.n_discrete_states):
-            mm = mm.at[: self.n_lfp, :, k].set(self.C_lfp)
-            mm = mm.at[self.n_lfp :, :, k].set(self.C_spikes)
-        self.measurement_matrix = mm
+        self.measurement_matrix = self._measurement_matrix_all_states()
 
-    def _finalize_sgd(self, lfp_data, spike_data=None, **kwargs):
+    def _finalize_sgd(self, lfp_data, spike_data, **kwargs):
         """Run filter + smoother to populate fitted states after SGD.
 
         Overrides the single-regime parent: the switching filter returns
         four arrays (means, covs, discrete_probs, marginal_lls) and the
         smoother returns three (means, covs, discrete_probs).
         """
-        if spike_data is None:
-            raise ValueError("spike_data required for _finalize_sgd")
         params = self._build_param_spec()[0]
         means, covs, probs, lls = self.filter(lfp_data, spike_data, params)
         self.filtered_means_ = means

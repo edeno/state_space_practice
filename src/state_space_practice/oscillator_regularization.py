@@ -15,36 +15,13 @@ shifting the objective when all penalized couplings are zero. Post-hoc
 thresholding can be applied after optimization for exact sparsity.
 """
 
-import operator
 from dataclasses import dataclass
-from typing import Optional
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-
-def _contains_tracer(*values: object) -> bool:
-    """Return True if any pytree leaf is being traced by JAX."""
-    return any(
-        isinstance(leaf, jax.core.Tracer)
-        for value in values
-        for leaf in jax.tree_util.tree_leaves(value)
-    )
-
-
-def _validate_nonnegative_weight(value: object, name: str) -> float:
-    """Validate and coerce a finite non-negative scalar penalty weight."""
-    value_arr = np.asarray(value)
-    if value_arr.shape != ():
-        raise ValueError(f"{name} must be a scalar, got shape {value_arr.shape}.")
-    value_float = float(value_arr)
-    if not np.isfinite(value_float):
-        raise ValueError(f"{name} must be finite, got {value}.")
-    if value_float < 0.0:
-        raise ValueError(f"{name} must be non-negative, got {value_float}.")
-    return value_float
+from state_space_practice.utils import contains_tracer, validate_int, validate_scalar
 
 
 def _validate_eps(eps: float) -> Array:
@@ -52,7 +29,7 @@ def _validate_eps(eps: float) -> Array:
     eps_arr = jnp.asarray(eps)
     if eps_arr.shape != ():
         raise ValueError(f"eps must be a scalar, got shape {eps_arr.shape}.")
-    if not _contains_tracer(eps_arr):
+    if not contains_tracer(eps_arr):
         eps_float = float(eps_arr)
         if not np.isfinite(eps_float) or eps_float <= 0.0:
             raise ValueError(f"eps must be positive and finite, got {eps}.")
@@ -72,7 +49,7 @@ def _as_coupling(coupling: Array) -> Array:
             "coupling must have square oscillator axes, "
             f"got {arr.shape[-2:]}."
         )
-    if not _contains_tracer(arr) and not bool(jnp.all(jnp.isfinite(arr))):
+    if not contains_tracer(arr) and not bool(jnp.all(jnp.isfinite(arr))):
         raise ValueError("coupling must contain only finite values.")
     return arr
 
@@ -122,7 +99,7 @@ def _area_labels_for_penalty(area_labels: Array, n_osc: int) -> Array:
             "area_labels length must match the number of oscillators; "
             f"got {labels.shape[0]} labels for n_osc={n_osc}."
         )
-    if _contains_tracer(labels):
+    if contains_tracer(labels):
         return labels
     return _validate_area_labels(labels, n_osc=n_osc)
 
@@ -159,7 +136,7 @@ class OscillatorPenaltyConfig:
     edge_l1: float = 0.0
     area_group_l2: float = 0.0
     state_shared_group_l2: float = 0.0
-    area_labels: Optional[Array] = None
+    area_labels: Array | None = None
     exclude_diagonal: bool = True
     scale_with_length: bool = False
 
@@ -168,7 +145,7 @@ class OscillatorPenaltyConfig:
             object.__setattr__(
                 self,
                 name,
-                _validate_nonnegative_weight(getattr(self, name), name),
+                validate_scalar(getattr(self, name), name, nonnegative=True),
             )
 
         if self.area_labels is not None:
@@ -377,12 +354,7 @@ def total_connectivity_penalty(
         the total loss by T, the effective penalty is exactly lambda.
     """
     coupling = _as_coupling(coupling)
-    try:
-        n_timesteps = operator.index(n_timesteps)
-    except TypeError as exc:
-        raise ValueError("n_timesteps must be a positive integer.") from exc
-    if n_timesteps <= 0:
-        raise ValueError("n_timesteps must be a positive integer.")
+    n_timesteps = validate_int(n_timesteps, "n_timesteps", positive=True)
 
     penalty = jnp.array(0.0, dtype=coupling.dtype)
 

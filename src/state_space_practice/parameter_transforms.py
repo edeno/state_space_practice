@@ -17,8 +17,8 @@ Usage::
 """
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 import jax
 import jax.numpy as jnp
@@ -272,7 +272,7 @@ def _validate_matching_keys(
     *,
     values_name: str,
     allow_missing_non_trainable: bool = False,
-    static_params: Optional[dict] = None,
+    static_params: dict | None = None,
 ) -> None:
     value_keys = set(values)
     spec_keys = set(spec)
@@ -315,7 +315,7 @@ def transform_to_constrained(
     unc_params: dict,
     spec: dict,
     *,
-    static_params: Optional[dict] = None,
+    static_params: dict | None = None,
 ) -> dict:
     """Transform a dict of unconstrained parameters back to constrained space.
 

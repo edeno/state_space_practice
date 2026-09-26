@@ -7,7 +7,7 @@ See docs/hamiltonian_architecture.md for why this family is standalone
 """
 
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -16,21 +16,20 @@ from jax import Array
 from state_space_practice.hamiltonian_core import (
     _BaseModelStubs,
     default_init_mean,
-    ekf_rts_backward_pass,
     gaussian_measurement_update,
     mlp_l2_penalty,
+    run_ekf_filter,
+    run_ekf_smoother,
 )
 from state_space_practice.nonlinear_dynamics import (
     apply_mlp,
-    ekf_predict_step,
-    ekf_predict_step_with_jacobian,
     init_mlp_params,
     leapfrog_step,
 )
 from state_space_practice.oscillator_models import BaseModel
 from state_space_practice.parameter_transforms import (
-    PSD_MATRIX,
     POSITIVE,
+    PSD_MATRIX,
     UNCONSTRAINED,
     ParameterTransform,
     frozen,
@@ -47,7 +46,7 @@ class HamiltonianLFPModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         n_oscillators: int,
         n_sources: int,
         sampling_freq: float,
-        hidden_dims: Optional[List[int]] = None,
+        hidden_dims: list[int] | None = None,
         seed: int = 42,
         obs_noise_std: float = 0.1,
     ):
@@ -109,81 +108,63 @@ class HamiltonianLFPModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         R = self.measurement_cov[:, :, 0]
         return float(jnp.sqrt(jnp.mean(jnp.diag(R))))
 
-    def transition_func(self, x: Array, params: Dict[str, Array]) -> Array:
+    def transition_func(self, x: Array, params: dict[str, Array]) -> Array:
         """Deterministic Hamiltonian transition."""
         return leapfrog_step(x, params, apply_mlp, self.dt)
 
     def filter(
-        self, lfp_data: Array, params: Dict[str, Any]
-    ) -> Tuple[Array, Array, Array]:
+        self, lfp_data: Array, params: dict[str, Any]
+    ) -> tuple[Array, Array, Array]:
         """Apply EKF filter to LFP data."""
         lfp_data = self._validate_lfp_data(lfp_data)
         return cast(
-            Tuple[Array, Array, Array],
+            tuple[Array, Array, Array],
             self._filter_jit(lfp_data, self._complete_filter_params(params)),
         )
 
     @partial(jax.jit, static_argnums=(0,))
     def _filter_jit(
-        self, lfp_data: Array, params: Dict[str, Any]
-    ) -> Tuple[Array, Array, Array]:
+        self, lfp_data: Array, params: dict[str, Any]
+    ) -> tuple[Array, Array, Array]:
         """JIT-compiled filter core with all mutable inputs passed explicitly."""
         trans_params = {**params["mlp"], "omega": params["omega"]}
-        C, d = params["C"], params["d"]
-        R, Q = params["R"], params["Q"]
+        C, d, R = params["C"], params["d"], params["R"]
+        return run_ekf_filter(
+            lfp_data,
+            params["init_mean"],
+            params["init_cov"],
+            trans_params,
+            params["Q"],
+            self.dt,
+            lambda m, P, y: gaussian_measurement_update(m, P, y, C, d, R),
+        )
 
-        def step(carry, y_t):
-            m_prev, P_prev = carry
-            m_pred, P_pred = ekf_predict_step(
-                m_prev, P_prev, trans_params, apply_mlp, Q, self.dt
-            )
-            m_post, P_post, ll = gaussian_measurement_update(
-                m_pred, P_pred, y_t, C, d, R
-            )
-            return (m_post, P_post), (m_post, P_post, ll)
-
-        m0 = params["init_mean"]
-        P0 = params["init_cov"]
-        _, (means, covs, lls) = jax.lax.scan(step, (m0, P0), lfp_data)
-        return means, covs, lls
-
-    def smooth(self, lfp_data: Array, params: Dict[str, Any]) -> Tuple[Array, Array]:
+    def smooth(self, lfp_data: Array, params: dict[str, Any]) -> tuple[Array, Array]:
         """Apply EKF-RTS Smoother to LFP data."""
         lfp_data = self._validate_lfp_data(lfp_data)
         return cast(
-            Tuple[Array, Array],
+            tuple[Array, Array],
             self._smooth_jit(lfp_data, self._complete_filter_params(params)),
         )
 
     @partial(jax.jit, static_argnums=(0,))
     def _smooth_jit(
-        self, lfp_data: Array, params: Dict[str, Any]
-    ) -> Tuple[Array, Array]:
+        self, lfp_data: Array, params: dict[str, Any]
+    ) -> tuple[Array, Array]:
         """JIT-compiled smoother core with all mutable inputs passed explicitly."""
         trans_params = {**params["mlp"], "omega": params["omega"]}
-        C, d = params["C"], params["d"]
-        R, Q = params["R"], params["Q"]
-
-        def forward_step(carry, y_t):
-            m_prev, P_prev = carry
-            m_pred, P_pred, F_t = ekf_predict_step_with_jacobian(
-                m_prev, P_prev, trans_params, apply_mlp, Q, self.dt
-            )
-            m_post, P_post, _ = gaussian_measurement_update(
-                m_pred,
-                P_pred,
-                y_t,
-                C,
-                d,
-                R,
-                include_normalization_const=False,
-            )
-            return (m_post, P_post), (m_post, P_post, m_pred, P_pred, F_t)
-
-        m0 = params["init_mean"]
-        P0 = params["init_cov"]
-        _, (m_f, P_f, m_p, P_p, F) = jax.lax.scan(forward_step, (m0, P0), lfp_data)
-        return ekf_rts_backward_pass(m_f, P_f, m_p, P_p, F)
+        C, d, R = params["C"], params["d"], params["R"]
+        return run_ekf_smoother(
+            lfp_data,
+            params["init_mean"],
+            params["init_cov"],
+            trans_params,
+            params["Q"],
+            self.dt,
+            lambda m, P, y: gaussian_measurement_update(
+                m, P, y, C, d, R, include_normalization_const=False
+            )[:2],
+        )
 
     def _validate_lfp_data(self, lfp_data: Array, *, allow_empty: bool = True) -> Array:
         """Validate public LFP input and return it as a JAX array."""
@@ -202,7 +183,7 @@ class HamiltonianLFPModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
             raise ValueError("lfp_data must contain only finite values.")
         return lfp_data
 
-    def _complete_filter_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _complete_filter_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Fill covariance defaults before entering a JIT-compiled method."""
         complete = dict(params)
         complete.setdefault("R", self.measurement_cov[:, :, 0])
@@ -212,7 +193,7 @@ class HamiltonianLFPModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
 
     def _build_param_spec(
         self,
-    ) -> Tuple[Dict[str, Any], Dict[str, ParameterTransform]]:
+    ) -> tuple[dict[str, Any], dict[str, ParameterTransform]]:
         params = {
             "mlp": self.mlp_params,
             "omega": self.omega,
@@ -238,10 +219,10 @@ class HamiltonianLFPModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
     def fit_sgd(  # type: ignore[override]
         self,
         observations: Array,
-        optimizer: Optional[object] = None,
+        optimizer: object | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
         use_filter: bool = True,
         l2_reg: float = 1e-4,
     ) -> list[float]:
@@ -260,7 +241,7 @@ class HamiltonianLFPModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
 
     def _sgd_loss_fn(
         self,
-        params: Dict[str, Any],
+        params: dict[str, Any],
         lfp_data: Array,
         use_filter: bool = True,
         l2_reg: float = 1e-4,
@@ -274,27 +255,13 @@ class HamiltonianLFPModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
             # Gaussian state-space marginal — drops observation noise,
             # process prior, and latent uncertainty. Useful for
             # warm-starting dynamics before switching to use_filter=True.
-            trans_params = {**params["mlp"], "omega": params["omega"]}
             C, d = params["C"], params["d"]
-            x0 = params["init_mean"]
-
-            def scan_fn(x_prev, _):
-                x_next = self.transition_func(x_prev, trans_params)
-                return x_next, x_next
-
-            _, x_traj = jax.lax.scan(scan_fn, x0, jnp.arange(lfp_data.shape[0]))
+            x_traj = self._rollout_trajectory(params, lfp_data.shape[0])
             lik_loss = jnp.sum((lfp_data - (x_traj @ C.T + d)) ** 2)
 
         return lik_loss + l2_reg * mlp_l2_penalty(params["mlp"])
 
-    def fit(self, *args, **kwargs):
-        """Hamiltonian models do not support linear EM."""
-        raise NotImplementedError(
-            "HamiltonianLFPModel does not support the linear EM path "
-            "(fit()). Please use fit_sgd() for non-linear optimization."
-        )
-
-    def _store_sgd_params(self, params: Dict[str, Any]) -> None:
+    def _store_sgd_params(self, params: dict[str, Any]) -> None:
         self.mlp_params = params["mlp"]
         self.omega = params["omega"]
         self.C = params["C"]
@@ -310,13 +277,3 @@ class HamiltonianLFPModel(_BaseModelStubs, BaseModel, SGDFittableMixin):
         if "Q" in params:
             self.process_cov = jnp.stack([stabilize_covariance(params["Q"])], axis=2)
 
-    def _finalize_sgd(self, lfp_data, **kwargs):
-        """Run filter + smoother to populate fitted states after SGD."""
-        params = self._build_param_spec()[0]
-        means, covs, lls = self.filter(lfp_data, params)
-        self.filtered_means_ = means
-        self.filtered_covs_ = covs
-        self.log_likelihood_ = float(jnp.sum(lls))
-        sm_means, sm_covs = self.smooth(lfp_data, params)
-        self.smoothed_means_ = sm_means
-        self.smoothed_covs_ = sm_covs

@@ -34,7 +34,7 @@ References
 
 import logging
 import warnings
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -44,6 +44,11 @@ from jax.typing import ArrayLike
 from patsy import dmatrix
 
 from state_space_practice.kalman import psd_solve, sum_of_outer_products, symmetrize
+from state_space_practice.parameter_transforms import (
+    POSITIVE,
+    PSD_MATRIX,
+    UNCONSTRAINED,
+)
 from state_space_practice.point_process_kalman import (
     _detect_block_diagonal_problem,
     _safe_expected_count,
@@ -62,8 +67,8 @@ logger = logging.getLogger(__name__)
 def build_2d_spline_basis(
     position: np.ndarray,
     n_interior_knots: int = 5,
-    knots_x: Optional[np.ndarray] = None,
-    knots_y: Optional[np.ndarray] = None,
+    knots_x: np.ndarray | None = None,
+    knots_y: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Build a 2D tensor-product B-spline design matrix from position data.
 
@@ -329,7 +334,7 @@ class PlaceFieldModel(SGDFittableMixin):
         process_noise_structure: str = "diagonal",
         init_process_noise: float = 1e-6,
         init_cov_scale: float = 0.01,
-        log_intensity_func: Optional[Callable[[ArrayLike, ArrayLike], Array]] = None,
+        log_intensity_func: Callable[[ArrayLike, ArrayLike], Array] | None = None,
         update_transition_matrix: bool = False,
         update_process_cov: bool = True,
         update_init_state: bool = True,
@@ -368,24 +373,24 @@ class PlaceFieldModel(SGDFittableMixin):
         self.update_init_state = update_init_state
 
         # Populated during fit
-        self.basis_info: Optional[dict] = None
-        self.n_basis_per_neuron: Optional[int] = None
-        self.n_basis: Optional[int] = None  # total state dim
+        self.basis_info: dict | None = None
+        self.n_basis_per_neuron: int | None = None
+        self.n_basis: int | None = None  # total state dim
         self.n_neurons: int = 1
-        self.transition_matrix: Optional[Array] = None
-        self.process_cov: Optional[Array] = None
-        self.init_mean: Optional[Array] = None
-        self.init_cov: Optional[Array] = None
-        self.smoother_mean: Optional[Array] = None
-        self.smoother_cov: Optional[Array] = None
-        self.smoother_cross_cov: Optional[Array] = None
+        self.transition_matrix: Array | None = None
+        self.process_cov: Array | None = None
+        self.init_mean: Array | None = None
+        self.init_cov: Array | None = None
+        self.smoother_mean: Array | None = None
+        self.smoother_cov: Array | None = None
+        self.smoother_cross_cov: Array | None = None
         # Block-diagonal dispatch: populated at fit/fit_sgd entry via
         # _detect_block_structure. If both are ints, the filter/smoother
         # dispatch to the block-diagonal fast path. None means dense.
-        self._block_n_neurons: Optional[int] = None
-        self._block_size: Optional[int] = None
-        self.filtered_mean: Optional[Array] = None
-        self.filtered_cov: Optional[Array] = None
+        self._block_n_neurons: int | None = None
+        self._block_size: int | None = None
+        self.filtered_mean: Array | None = None
+        self.filtered_cov: Array | None = None
         self.log_likelihoods: list[float] = []
         self._total_spikes: int = 0
         self._n_time: int = 0
@@ -507,10 +512,9 @@ class PlaceFieldModel(SGDFittableMixin):
         # Z_full[t, j, :] = kron(e_j, Z_base[t]) — non-zero only at j*nb:(j+1)*nb
         eye_n = jnp.eye(self.n_neurons)  # (n_neurons, n_neurons)
         # (1, n_neurons, n_neurons, 1) * (n_time, 1, 1, nb) -> (n_time, n_neurons, n_neurons, nb)
-        Z_full = (eye_n[None, :, :, None] * Z_base_jnp[:, None, None, :]).reshape(
+        return (eye_n[None, :, :, None] * Z_base_jnp[:, None, None, :]).reshape(
             n_time, self.n_neurons, self.n_neurons * nb
         )
-        return Z_full
 
     def _check_fitted(self, method_name: str) -> None:
         """Raise if the model has not been fitted."""
@@ -532,8 +536,8 @@ class PlaceFieldModel(SGDFittableMixin):
     def _build_spline_basis_matrix(
         self,
         position: np.ndarray,
-        knots_x: Optional[np.ndarray] = None,
-        knots_y: Optional[np.ndarray] = None,
+        knots_x: np.ndarray | None = None,
+        knots_y: np.ndarray | None = None,
     ) -> Array:
         """Build the base 2D spline basis matrix and cache basis metadata.
 
@@ -577,8 +581,8 @@ class PlaceFieldModel(SGDFittableMixin):
     def _build_design_matrix(
         self,
         position: np.ndarray,
-        knots_x: Optional[np.ndarray] = None,
-        knots_y: Optional[np.ndarray] = None,
+        knots_x: np.ndarray | None = None,
+        knots_y: np.ndarray | None = None,
     ) -> Array:
         """Build the spline design matrix from position data.
 
@@ -602,7 +606,7 @@ class PlaceFieldModel(SGDFittableMixin):
         self,
         Z_base: Array,
         spikes: Array,
-        window: Optional[slice] = None,
+        window: slice | None = None,
         max_iter: int = 15,
         prior_precision: float = 1.0,
     ) -> tuple[Array, Array]:
@@ -773,7 +777,7 @@ class PlaceFieldModel(SGDFittableMixin):
         self,
         Z_base: Array,
         spikes: Array,
-        window: Optional[slice],
+        window: slice | None,
     ) -> None:
         """Warm-start ``init_mean`` and ``init_cov`` from a stationary GLM.
 
@@ -822,7 +826,7 @@ class PlaceFieldModel(SGDFittableMixin):
 
     def _detect_block_structure(
         self, design_matrix: Array, force_dense: bool = False
-    ) -> tuple[Optional[int], Optional[int]]:
+    ) -> tuple[int | None, int | None]:
         """Detect block-diagonal structure of the current filter problem.
 
         Returns ``(n_neurons, block_size)`` integers if the problem
@@ -1079,11 +1083,11 @@ class PlaceFieldModel(SGDFittableMixin):
         spikes: ArrayLike,
         max_iter: int = 100,
         tolerance: float = 1e-4,
-        knots_x: Optional[np.ndarray] = None,
-        knots_y: Optional[np.ndarray] = None,
+        knots_x: np.ndarray | None = None,
+        knots_y: np.ndarray | None = None,
         verbose: bool = True,
         warm_start: bool = True,
-        warm_start_window: Optional[slice] = None,
+        warm_start_window: slice | None = None,
         force_dense: bool = False,
     ) -> list[float]:
         """Fit the model to spike data and position using EM.
@@ -1321,12 +1325,12 @@ class PlaceFieldModel(SGDFittableMixin):
         self,
         position: ArrayLike,
         spikes: ArrayLike,
-        optimizer: Optional[object] = None,
+        optimizer: object | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
         warm_start: bool = True,
-        warm_start_window: Optional[slice] = None,
+        warm_start_window: slice | None = None,
         force_dense: bool = False,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
@@ -1441,12 +1445,6 @@ class PlaceFieldModel(SGDFittableMixin):
             )
 
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            POSITIVE,
-            PSD_MATRIX,
-            UNCONSTRAINED,
-        )
-
         params: dict = {}
         spec: dict = {}
 
@@ -1582,7 +1580,7 @@ class PlaceFieldModel(SGDFittableMixin):
 
         s, _ = self._neuron_weights(neuron_idx)
         means = np.asarray(self.smoother_mean[time_slice, s])
-        covs = np.asarray(self.smoother_cov[time_slice][:, s, s])
+        covs = np.asarray(self.smoother_cov[time_slice, s, s])
         if means.ndim == 1:
             means = means[None, :]
             covs = covs[None, :, :]
@@ -1621,7 +1619,7 @@ class PlaceFieldModel(SGDFittableMixin):
     def predict_rate_map(
         self,
         grid_positions: np.ndarray,
-        time_slice: Optional[slice] = None,
+        time_slice: slice | None = None,
         alpha: float = 0.05,
         neuron_idx: int = 0,
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -2095,7 +2093,7 @@ class PlaceFieldModel(SGDFittableMixin):
         n_time_bins: int = 3,
         n_grid: int = 50,
         neuron_idx: int = 0,
-        ax: Optional[np.ndarray] = None,
+        ax: np.ndarray | None = None,
     ):
         """Plot estimated rate maps in temporal bins.
 

@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 
-from state_space_practice.utils import debug_print_if
+from state_space_practice.utils import debug_print_if, symmetrize
 
 IDENTITY_2x2 = jnp.identity(2)
 ZEROS_2x2 = jnp.zeros((2, 2))
@@ -444,9 +444,8 @@ def construct_correlated_noise_measurement_matrix(
     col_indices = jnp.arange(0, 2 * n_oscillators, 2)
 
     # Set the [1, 0] blocks
-    measurement_matrix = measurement_matrix.at[row_indices, col_indices].set(1.0)
+    return measurement_matrix.at[row_indices, col_indices].set(1.0)
 
-    return measurement_matrix
 
 
 def construct_directed_influence_transition_matrix(
@@ -530,11 +529,10 @@ def construct_directed_influence_transition_matrix(
 
     # 5. Reshape and transpose to final matrix form
     # (n1, n2, 2, 2) -> (n1, 2, n2, 2) -> (2 * n1, 2 * n2)
-    transition_matrix = all_blocks.swapaxes(1, 2).reshape(
+    return all_blocks.swapaxes(1, 2).reshape(
         2 * n_oscillators, 2 * n_oscillators
     )
 
-    return transition_matrix
 
 
 def compute_directed_influence_stability_scale(
@@ -623,11 +621,10 @@ def construct_directed_influence_measurement_matrix(
     measurement_matrix = measurement_matrix.at[row_indices, col_indices_x].set(
         block_coefficient
     )
-    measurement_matrix = measurement_matrix.at[row_indices, col_indices_y].set(
+    return measurement_matrix.at[row_indices, col_indices_y].set(
         block_coefficient
     )
 
-    return measurement_matrix
 
 
 def _get_scaling_factor(s: jax.Array, eps: float = 1e-12) -> jax.Array:
@@ -757,25 +754,6 @@ def _warn_if_rotation_projection_degenerate(transition_matrix: jax.Array) -> Non
     )
 
 
-def _get_scaling_factor_from_block(block: jax.Array, eps: float = 1e-12) -> jax.Array:
-    """Compute scaling factor from a 2x2 block via SVD.
-
-    Parameters
-    ----------
-    block : jax.Array, shape (2, 2)
-        The block to compute the scaling factor for
-    eps : float, optional
-        Minimum singular value, by default 1e-12
-
-    Returns
-    -------
-    jax.Array
-        The geometric mean of the singular values
-    """
-    _, s, _ = jnp.linalg.svd(block)
-    return _get_scaling_factor(s, eps)
-
-
 def _extract_scale_and_angle(block: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Extract scaling factor and rotation angle from a 2x2 oscillator block.
 
@@ -867,7 +845,7 @@ def project_correlated_noise_process_covariance(
     blocks back to the model family and, if needed, shrinks only the off-diagonal
     linkage blocks toward zero until the covariance is positive semidefinite.
     """
-    cov = 0.5 * (process_covariance + process_covariance.T)
+    cov = symmetrize(process_covariance)
     blocks = _matrix_to_oscillator_blocks(cov)
     n_oscillators = blocks.shape[0]
 
@@ -936,12 +914,12 @@ def constrain_correlated_noise_process_covariance(
     if min_eigenvalue < 0.0:
         raise ValueError("min_eigenvalue must be non-negative.")
 
-    cov = 0.5 * (cov + cov.T)
+    cov = symmetrize(cov)
     n_oscillators = cov.shape[0] // 2
     quarter_turn = jnp.array([[0.0, -1.0], [1.0, 0.0]], dtype=cov.dtype)
     complex_structure = jnp.kron(jnp.eye(n_oscillators, dtype=cov.dtype), quarter_turn)
     constrained = 0.5 * (cov + complex_structure @ cov @ complex_structure.T)
-    constrained = 0.5 * (constrained + constrained.T)
+    constrained = symmetrize(constrained)
 
     min_eig = jnp.min(jnp.linalg.eigvalsh(constrained))
     lift = jnp.maximum(

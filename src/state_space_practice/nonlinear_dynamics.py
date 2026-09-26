@@ -5,7 +5,8 @@ independent of the observation model.
 """
 
 import operator
-from typing import Callable, Dict, List, Tuple, cast
+from collections.abc import Callable
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -32,8 +33,8 @@ def _validate_state_vector(x: Array) -> Array:
 
 def leapfrog_step(
     x: Array,
-    params: Dict[str, Array],
-    h_apply_fn: Callable[[Dict[str, Array], Array], Array],
+    params: dict[str, Array],
+    h_apply_fn: Callable[[dict[str, Array], Array], Array],
     dt: float,
 ) -> Array:
     """Symplectic leapfrog integrator (shared engine).
@@ -55,7 +56,7 @@ def leapfrog_step(
     # Compute gradient function once, reuse for all three evaluations
     grad_H = jax.grad(H_func)
 
-    def get_grads(state: Array) -> Tuple[Array, Array]:
+    def get_grads(state: Array) -> tuple[Array, Array]:
         grads = grad_H(state)
         return grads[:n], grads[n:]
 
@@ -78,7 +79,7 @@ def leapfrog_step(
 
 def get_transition_jacobian(
     x: Array,
-    params: Dict[str, Array],
+    params: dict[str, Array],
     h_apply_fn: Callable,
     dt: float,
 ) -> Array:
@@ -93,8 +94,8 @@ def get_transition_jacobian(
 
 
 def init_mlp_params(
-    input_dim: int, hidden_dims: List[int], key: Array
-) -> Dict[str, Array]:
+    input_dim: int, hidden_dims: list[int], key: Array
+) -> dict[str, Array]:
     """Initialize a scalar MLP over position coordinates."""
     try:
         input_dim = operator.index(input_dim)
@@ -120,11 +121,11 @@ def init_mlp_params(
 def ekf_predict_step(
     m_prev: Array,
     P_prev: Array,
-    params: Dict[str, Array],
+    params: dict[str, Array],
     h_apply_fn: Callable,
     Q: Array,
     dt: float,
-) -> Tuple[Array, Array]:
+) -> tuple[Array, Array]:
     """EKF Prediction Step: x_t = f(x_{t-1}) + w_t."""
     m_pred, P_pred, _ = ekf_predict_step_with_jacobian(
         m_prev, P_prev, params, h_apply_fn, Q, dt
@@ -135,11 +136,11 @@ def ekf_predict_step(
 def ekf_predict_step_with_jacobian(
     m_prev: Array,
     P_prev: Array,
-    params: Dict[str, Array],
+    params: dict[str, Array],
     h_apply_fn: Callable,
     Q: Array,
     dt: float,
-) -> Tuple[Array, Array, Array]:
+) -> tuple[Array, Array, Array]:
     """EKF Prediction Step that also returns the transition Jacobian.
 
     Use this in smoother forward passes to avoid recomputing the Jacobian.
@@ -151,10 +152,10 @@ def ekf_predict_step_with_jacobian(
 
 def _leapfrog_step_and_jacobian(
     x: Array,
-    params: Dict[str, Array],
+    params: dict[str, Array],
     h_apply_fn: Callable,
     dt: float,
-) -> Tuple[Array, Array]:
+) -> tuple[Array, Array]:
     """Compute leapfrog step and its Jacobian in a single pass."""
 
     def step_fn(state):
@@ -176,7 +177,7 @@ def ekf_smooth_step(
     m_smooth_next: Array,
     P_smooth_next: Array,
     F_next: Array,
-) -> Tuple[Array, Array]:
+) -> tuple[Array, Array]:
     """EKF RTS Smoother Step (Backward Pass)."""
     G = psd_solve(P_pred_next, F_next @ P_filt).T
     m_smooth = m_filt + G @ (m_smooth_next - m_pred_next)
@@ -184,7 +185,7 @@ def ekf_smooth_step(
     return m_smooth, P_smooth
 
 
-def _mlp_layer_count(params: Dict[str, Array], input_dim: int) -> int:
+def _mlp_layer_count(params: dict[str, Array], input_dim: int) -> int:
     """Validate a contiguous scalar-output MLP and return its layer count."""
     weight_indices = sorted(
         int(key[1:]) for key in params if key.startswith("w") and key[1:].isdigit()
@@ -228,7 +229,7 @@ def _mlp_layer_count(params: Dict[str, Array], input_dim: int) -> int:
     return len(expected)
 
 
-def apply_mlp(params: Dict[str, Array], x: Array) -> Array:
+def apply_mlp(params: dict[str, Array], x: Array) -> Array:
     """Apply the MLP to compute a separable scalar Hamiltonian H(q, p).
 
     The quadratic kinetic term depends on momentum, while the MLP residual is

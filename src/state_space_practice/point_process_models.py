@@ -22,9 +22,9 @@ References
 """
 
 import copy
+import functools
 import logging
 from abc import ABC, abstractmethod
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -33,8 +33,8 @@ from jax import Array
 from state_space_practice.kalman import symmetrize
 from state_space_practice.oscillator_utils import (
     canonicalize_correlated_noise_pair_parameters,
-    constrain_correlated_noise_process_covariance,
     compute_directed_influence_stability_scale,
+    constrain_correlated_noise_process_covariance,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
     construct_correlated_noise_process_covariance,
@@ -43,6 +43,16 @@ from state_space_practice.oscillator_utils import (
     extract_dim_params_from_matrix,
     project_correlated_noise_process_covariance,
     project_coupled_transition_matrix,
+)
+from state_space_practice.parameter_transforms import (
+    POSITIVE,
+    PSD_MATRIX,
+    STOCHASTIC_ROW,
+    UNCONSTRAINED,
+)
+from state_space_practice.sgd_fitting import (
+    SGDFittableMixin,
+    reconstruct_per_state_array,
 )
 from state_space_practice.switching_kalman import (
     compute_process_covariance_sufficient_stats,
@@ -59,16 +69,19 @@ from state_space_practice.switching_point_process import (
     update_spike_glm_params,
     update_spike_glm_params_mixture,
 )
-from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import (
     check_converged,
+    clip_eigenvalues,
     make_discrete_transition_matrix,
     shift_to_psd,
     stabilize_transition_matrix,
     validate_count_array,
     validate_covariance,
+    validate_finite_array,
+    validate_nonnegative_array,
     validate_probability_vector,
     validate_transition_matrix,
+    validate_unit_interval_array,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,19 +112,9 @@ def _validate_oscillator_parameters(
     unstable transition/process matrix undetected. Shape validation is left to
     the caller (it is model-specific).
     """
-    freqs = jnp.asarray(freqs)
-    damping_coef = jnp.asarray(damping_coef)
-    process_variance = jnp.asarray(process_variance)
-    if not bool(jnp.all(jnp.isfinite(freqs))):
-        raise ValueError("freqs must contain only finite values.")
-    if not bool(jnp.all(jnp.isfinite(damping_coef))):
-        raise ValueError("damping_coef must contain only finite values.")
-    if bool(jnp.any((damping_coef < 0) | (damping_coef > 1))):
-        raise ValueError("damping_coef entries must lie in [0, 1].")
-    if not bool(jnp.all(jnp.isfinite(process_variance))):
-        raise ValueError("process_variance must contain only finite values.")
-    if bool(jnp.any(process_variance < 0)):
-        raise ValueError("process_variance must be non-negative.")
+    validate_finite_array("freqs", freqs)
+    validate_unit_interval_array("damping_coef", damping_coef)
+    validate_nonnegative_array("process_variance", process_variance)
 
 
 class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
@@ -384,20 +387,12 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             Observed spike counts.
         """
         import numpy as np_cpu
-        from sklearn.mixture import GaussianMixture
 
         n_time = spikes.shape[0]
         n_states = self.n_discrete_states
         spikes_np = np_cpu.array(spikes)
 
-        # Window size: ~50 timesteps (0.5s at 100Hz) for good balance
-        # between temporal resolution and statistical stability.
-        # Short enough to resolve oscillator frequencies (8-25Hz).
-        window = min(50, n_time // (2 * n_states))
-        window = max(window, 10)
-
-        # Compute windowed features: per-neuron mean and variance
-        n_windows = n_time // window
+        window, n_windows = self._warm_init_windows(n_time)
         if n_windows < n_states * 2:
             # Not enough windows — fall back to uniform
             self.smoother_discrete_state_prob = jnp.ones((n_time, n_states)) / n_states
@@ -415,8 +410,33 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
         variances = windowed.var(axis=1)  # (n_windows, n_neurons)
 
         features = np_cpu.concatenate([means, variances], axis=1)
+        self._set_state_probs_from_window_features(features, window, n_time)
 
-        # Fit GMM
+    def _warm_init_windows(self, n_time: int) -> tuple[int, int]:
+        """Window length and count for warm-init feature extraction.
+
+        ~50 timesteps (0.5 s at 100 Hz) balances temporal resolution against
+        statistical stability and is short enough to resolve 8-25 Hz
+        oscillators; the floor of 10 keeps very short recordings usable.
+        """
+        window = max(min(50, n_time // (2 * self.n_discrete_states)), 10)
+        return window, n_time // window
+
+    def _set_state_probs_from_window_features(
+        self, features, window: int, n_time: int
+    ) -> None:
+        """Cluster windowed features with a GMM and store per-timestep state probs.
+
+        Window-level responsibilities are expanded to every timestep in the
+        window (the last window's row is tiled over any remainder), softened
+        to a minimum probability of ``0.05`` for numerical safety, and the
+        joint adjacent-timestep probabilities are set from the marginals.
+        """
+        import numpy as np_cpu
+        from sklearn.mixture import GaussianMixture
+
+        n_states = self.n_discrete_states
+        n_windows = features.shape[0]
         gmm = GaussianMixture(
             n_components=n_states,
             covariance_type="full",
@@ -426,23 +446,17 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
         gmm.fit(features)
         window_probs = gmm.predict_proba(features)  # (n_windows, n_states)
 
-        # Expand window probabilities to per-timestep
         probs_np = np_cpu.repeat(window_probs, window, axis=0)
-        # Handle remainder timesteps
         if n_time > n_windows * window:
             remainder = n_time - n_windows * window
             probs_np = np_cpu.concatenate(
                 [probs_np, np_cpu.tile(window_probs[-1], (remainder, 1))]
             )
         probs = jnp.array(probs_np[:n_time])
-
-        # Soften to avoid numerical issues (min prob 0.05)
         probs = probs * 0.9 + 0.05 / n_states
         probs = probs / probs.sum(axis=1, keepdims=True)
 
         self.smoother_discrete_state_prob = probs
-
-        # Joint probabilities from adjacent timestep marginals
         joint = probs[:-1, :, None] * probs[1:, None, :]
         joint = joint / jnp.sum(joint, axis=(1, 2), keepdims=True)
         self.smoother_joint_discrete_state_prob = joint
@@ -643,13 +657,13 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
             line_search_beta=self.line_search_beta,
         )
 
-        smoother_args = dict(
-            filter_mean=state_cond_filter_mean,
-            filter_cov=state_cond_filter_cov,
-            filter_discrete_state_prob=filter_discrete_state_prob,
-            process_cov=self.process_cov,
-            continuous_transition_matrix=self.continuous_transition_matrix,
-        )
+        smoother_args = {
+            "filter_mean": state_cond_filter_mean,
+            "filter_cov": state_cond_filter_cov,
+            "filter_discrete_state_prob": filter_discrete_state_prob,
+            "process_cov": self.process_cov,
+            "continuous_transition_matrix": self.continuous_transition_matrix,
+        }
 
         if self.smoother_type == "gpb2":
             (
@@ -749,18 +763,15 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
                     + (1 - cfg.trust_region_weight) * self.process_cov
                 )
 
-                def clip_eigenvalues(Q: Array) -> Array:
-                    Q = symmetrize(Q)
-                    eigvals, eigvecs = jnp.linalg.eigh(Q)
-                    if cfg.min_eigenvalue is not None:
-                        eigvals = jnp.maximum(eigvals, cfg.min_eigenvalue)
-                    if cfg.max_eigenvalue is not None:
-                        eigvals = jnp.minimum(eigvals, cfg.max_eigenvalue)
-                    return eigvecs @ jnp.diag(eigvals) @ eigvecs.T
-
-                Q_clipped = jax.vmap(clip_eigenvalues, in_axes=-1, out_axes=-1)(
-                    Q_blended
-                )
+                Q_clipped = jax.vmap(
+                    functools.partial(
+                        clip_eigenvalues,
+                        min_eigenvalue=cfg.min_eigenvalue,
+                        max_eigenvalue=cfg.max_eigenvalue,
+                    ),
+                    in_axes=-1,
+                    out_axes=-1,
+                )(Q_blended)
                 self.process_cov = Q_clipped
             else:
                 self.process_cov = new_Q
@@ -859,11 +870,11 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
     def _regularize_init_cov_update(self, init_cov: Array) -> Array:
         """Clip initial covariance eigenvalues for sparse-spike EM stability."""
 
-        def clip_init_cov_eigenvalues(P: Array) -> Array:
-            P = symmetrize(P)
-            eigvals, eigvecs = jnp.linalg.eigh(P)
-            eigvals = jnp.clip(eigvals, _INIT_COV_EIGVAL_MIN, _INIT_COV_EIGVAL_MAX)
-            return eigvecs @ jnp.diag(eigvals) @ eigvecs.T
+        clip_init_cov_eigenvalues = functools.partial(
+            clip_eigenvalues,
+            min_eigenvalue=_INIT_COV_EIGVAL_MIN,
+            max_eigenvalue=_INIT_COV_EIGVAL_MAX,
+        )
 
         def _per_state_eigrange(P: Array) -> tuple[Array, Array]:
             eigs = jnp.linalg.eigvalsh(symmetrize(P))
@@ -1207,11 +1218,11 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
     def fit_sgd(
         self,
         spikes: Array,
-        key: Optional[Array] = None,
-        optimizer: Optional[object] = None,
+        key: Array | None = None,
+        optimizer: object | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
 
@@ -1326,15 +1337,9 @@ class BaseSwitchingPointProcessModel(ABC, SGDFittableMixin):
     def _reconstruct_per_state_array(
         self, params: dict, prefix: str, fallback: Array
     ) -> Array:
-        """Reconstruct a (…, n_discrete_states) array from per-state params."""
-        if not any(k.startswith(f"{prefix}_") for k in params):
-            return fallback
-        return jnp.stack(
-            [
-                params.get(f"{prefix}_{j}", fallback[..., j])
-                for j in range(self.n_discrete_states)
-            ],
-            axis=-1,
+        """See :func:`state_space_practice.sgd_fitting.reconstruct_per_state_array`."""
+        return reconstruct_per_state_array(
+            params, prefix, fallback, self.n_discrete_states
         )
 
 
@@ -1436,15 +1441,12 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
         are better features than rate alone.
         """
         import numpy as np_cpu
-        from sklearn.mixture import GaussianMixture
 
         n_time = spikes.shape[0]
         n_states = self.n_discrete_states
         spikes_np = np_cpu.array(spikes)
 
-        window = min(50, n_time // (2 * n_states))
-        window = max(window, 10)
-        n_windows = n_time // window
+        window, n_windows = self._warm_init_windows(n_time)
         if n_windows < n_states * 2:
             super()._warm_initialize_states(spikes)
             return
@@ -1477,41 +1479,13 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
         else:
             features = means
 
-        gmm = GaussianMixture(
-            n_components=n_states,
-            covariance_type="full",
-            n_init=5,
-            random_state=0,
-        )
-        gmm.fit(features)
-        window_probs = gmm.predict_proba(features)
-
-        probs_np = np_cpu.repeat(window_probs, window, axis=0)
-        if n_time > n_windows * window:
-            remainder = n_time - n_windows * window
-            probs_np = np_cpu.concatenate(
-                [probs_np, np_cpu.tile(window_probs[-1], (remainder, 1))]
-            )
-        probs = jnp.array(probs_np[:n_time])
-        probs = probs * 0.9 + 0.05 / n_states
-        probs = probs / probs.sum(axis=1, keepdims=True)
-
-        self.smoother_discrete_state_prob = probs
-        joint = probs[:-1, :, None] * probs[1:, None, :]
-        joint = joint / jnp.sum(joint, axis=(1, 2), keepdims=True)
-        self.smoother_joint_discrete_state_prob = joint
+        self._set_state_probs_from_window_features(features, window, n_time)
 
     def _project_parameters(self) -> None:
         """No projection needed — A and Q are not updated."""
         pass
 
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            PSD_MATRIX,
-            STOCHASTIC_ROW,
-            UNCONSTRAINED,
-        )
-
         params: dict = {}
         spec: dict = {}
 
@@ -1757,12 +1731,9 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
                     + (1.0 - cfg.trust_region_weight) * previous[..., j]
                 )
                 if cfg.min_eigenvalue is not None or cfg.max_eigenvalue is not None:
-                    eigvals, eigvecs = jnp.linalg.eigh(0.5 * (candidate + candidate.T))
-                    if cfg.min_eigenvalue is not None:
-                        eigvals = jnp.maximum(eigvals, cfg.min_eigenvalue)
-                    if cfg.max_eigenvalue is not None:
-                        eigvals = jnp.minimum(eigvals, cfg.max_eigenvalue)
-                    candidate = eigvecs @ jnp.diag(eigvals) @ eigvecs.T
+                    candidate = clip_eigenvalues(
+                        candidate, cfg.min_eigenvalue, cfg.max_eigenvalue
+                    )
                 candidate = constrain_correlated_noise_process_covariance(candidate)
             candidate = jnp.where(count > 1e-8, candidate, previous[..., j])
             updated.append(candidate)
@@ -1789,13 +1760,6 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
     # --- SGDFittableMixin: CNM-PP specific ---
 
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            PSD_MATRIX,
-            POSITIVE,
-            STOCHASTIC_ROW,
-            UNCONSTRAINED,
-        )
-
         params: dict = {}
         spec: dict = {}
 
@@ -2031,7 +1995,7 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
         self.phase_difference = phase_difference.at[diag_idx, diag_idx, :].set(0.0)
         self.coupling_strength = coupling_strength.at[diag_idx, diag_idx, :].set(0.0)
         self.use_reparameterized_mstep = use_reparameterized_mstep
-        self._current_osc_params: Optional[dict] = None
+        self._current_osc_params: dict | None = None
 
         # Stability bounds applied when rebuilding transition matrices.
         if not 0.0 < max_spectral_radius < 1.0:
@@ -2288,12 +2252,6 @@ class DirectedInfluencePointProcessModel(BaseSwitchingPointProcessModel):
     # --- SGDFittableMixin: DIM-PP specific ---
 
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            PSD_MATRIX,
-            STOCHASTIC_ROW,
-            UNCONSTRAINED,
-        )
-
         params: dict = {}
         spec: dict = {}
 

@@ -9,6 +9,7 @@ References
 5. https://github.com/Stephen-Lab-BU/Switching_Oscillator_Networks
 """
 
+import functools
 import math
 import warnings
 from functools import partial
@@ -24,7 +25,7 @@ from state_space_practice.kalman import (
     psd_solve,
     stabilize_covariance,
 )
-from state_space_practice.utils import debug_print_if
+from state_space_practice.utils import debug_print_if, symmetrize, zero_preserving_log
 from state_space_practice.utils import divide_safe as _divide_safe
 from state_space_practice.utils import safe_log as _safe_log
 from state_space_practice.utils import spectral_radius as _spectral_radius
@@ -171,15 +172,6 @@ def _cap_covariance_trace(
     return scale * cov, scale
 
 
-def _log_prob_preserve_zeros(prob: jax.Array) -> jax.Array:
-    """Log-probabilities mapping exact zeros to ``-inf`` (impossible stays impossible)."""
-    prob = jnp.asarray(prob)
-    if not jnp.issubdtype(prob.dtype, jnp.inexact):
-        prob = prob.astype(jnp.float32)
-    tiny = jnp.finfo(prob.dtype).tiny
-    return jnp.where(prob > 0.0, jnp.log(jnp.maximum(prob, tiny)), -jnp.inf)
-
-
 def _normalize_initial_discrete_prob(prob: jax.Array) -> jax.Array:
     """Normalize a caller-supplied initial discrete-state prior, preserving zeros.
 
@@ -189,7 +181,7 @@ def _normalize_initial_discrete_prob(prob: jax.Array) -> jax.Array:
     underflowed *computed* posteriors back above zero to prevent permanent
     state lockout -- this must NOT floor zeros, otherwise the first-observation
     likelihood can resurrect a state the caller declared impossible (and, via
-    ``_log_prob_preserve_zeros``, the Viterbi first state too).
+    ``zero_preserving_log``, the Viterbi first state too).
 
     Malformed input is handled by severity, with a divergence signal
     (``debug_print_if``) in every case: a vector that does not sum to a positive
@@ -492,12 +484,12 @@ def _update_discrete_state_probabilities(
     log_prev = jnp.where(
         prev_support,
         jnp.maximum(
-            _log_prob_preserve_zeros(prev_filter_discrete_prob),
+            zero_preserving_log(prev_filter_discrete_prob),
             _LOG_DISCRETE_STABILITY_FLOOR,
         ),
         -jnp.inf,
     )
-    log_transition = _log_prob_preserve_zeros(discrete_transition_matrix)
+    log_transition = zero_preserving_log(discrete_transition_matrix)
     # Structural log-prior over pairs: -inf on any structurally impossible pair
     # (forbidden source, or zero transition). Once a pair is impossible its
     # likelihood is irrelevant -- but ``NaN + (-inf) = NaN`` and
@@ -626,13 +618,13 @@ def _first_timestep_discrete_update(
     init_discrete_state_prob = _normalize_initial_discrete_prob(
         init_discrete_state_prob
     )
-    # ``_log_prob_preserve_zeros``: exact zero -> -inf; positive -> its true log,
+    # ``zero_preserving_log``: exact zero -> -inf; positive -> its true log,
     # floored only at the dtype's tiny (NOT 1e-10), so a tiny prior like 1e-12 is
     # faithful. Malformed (NaN) prior -> NaN, so the posterior/LL fail loud.
     log_prior = jnp.where(
         jnp.isnan(init_discrete_state_prob),
         jnp.nan,
-        _log_prob_preserve_zeros(init_discrete_state_prob),
+        zero_preserving_log(init_discrete_state_prob),
     )
     # A structural-zero-prior state (log_prior = -inf) is impossible at t=1; its
     # likelihood is irrelevant, but ``NaN/+inf lik + (-inf) = NaN`` would poison
@@ -1192,7 +1184,7 @@ def switching_kalman_viterbi(
 
     # --- Pairwise Viterbi -------------------------------------------------
     # Backward pass: accumulate best future scores with pair log-likelihoods
-    log_trans = _log_prob_preserve_zeros(discrete_transition_matrix)
+    log_trans = zero_preserving_log(discrete_transition_matrix)
 
     def _viterbi_backward(best_next_score, t):
         # scores[i, j] = log A(i,j) + pair_log_lik(t, i, j) + best_future(j)
@@ -1212,7 +1204,7 @@ def switching_kalman_viterbi(
     # Best first state: first_discrete_prob is already p(S_1 | y_1),
     # so the first-obs likelihood is already encoded — do not add it again.
     first_state = jnp.argmax(
-        _log_prob_preserve_zeros(first_discrete_prob) + best_second_score
+        zero_preserving_log(first_discrete_prob) + best_second_score
     )
 
     # Forward trace
@@ -2314,253 +2306,6 @@ def switching_kalman_maximization_step(
     )
 
 
-def _compute_expected_complete_log_likelihood_reference(
-    obs: jax.Array,
-    state_cond_smoother_means: jax.Array,
-    state_cond_smoother_covs: jax.Array,
-    smoother_discrete_state_prob: jax.Array,
-    smoother_joint_discrete_state_prob: jax.Array,
-    pair_cond_smoother_cross_cov: jax.Array,
-    init_state_cond_mean: jax.Array,
-    init_state_cond_cov: jax.Array,
-    init_discrete_state_prob: jax.Array,
-    continuous_transition_matrix: jax.Array,
-    process_cov: jax.Array,
-    measurement_matrix: jax.Array,
-    measurement_cov: jax.Array,
-    discrete_transition_matrix: jax.Array,
-    pair_cond_smoother_means: jax.Array | None = None,
-    pair_cond_smoother_covs: jax.Array | None = None,
-    next_pair_cond_smoother_means: jax.Array | None = None,
-) -> jax.Array:
-    """Compute the expected complete-data log-likelihood E_q[log p(y, x, s | θ)].
-
-    This is the Q-function that the EM algorithm maximizes for a fixed
-    approximate posterior. The optional pair-conditional inputs make the
-    transition term closer to the GPB2 approximation used by the M-step.
-
-    Parameters
-    ----------
-    obs : jax.Array, shape (n_time, n_obs_dim)
-    state_cond_smoother_means : jax.Array, shape (n_time, n_cont_states, n_discrete_states)
-    state_cond_smoother_covs : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
-    smoother_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
-    smoother_joint_discrete_state_prob : jax.Array, shape (n_time - 1, n_discrete_states, n_discrete_states)
-    pair_cond_smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
-    init_state_cond_mean : jax.Array, shape (n_cont_states, n_discrete_states)
-    init_state_cond_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-    init_discrete_state_prob : jax.Array, shape (n_discrete_states,)
-    continuous_transition_matrix : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-    process_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states, n_discrete_states)
-    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim, n_discrete_states)
-    discrete_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
-    pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
-        E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional
-        quantities for the transition Q-function term.
-    pair_cond_smoother_covs : jax.Array | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
-        Cov[X_t | y_{1:T}, S_t=i, S_{t+1}=j].
-    next_pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
-        E[X_{t+1} | y_{1:T}, S_t=i, S_{t+1}=j].
-
-    Returns
-    -------
-    expected_complete_ll : jax.Array
-        E_q[log p(y, x, s | θ)] (scalar array)
-
-    Notes
-    -----
-    When GPB2 pair-conditional quantities are provided, the transition
-    Q-function term uses pair-conditional means and covariances for x_t.
-    Cov[x_{t+1} | S_t, S_{t+1}] is still approximated with the
-    state-conditional Cov[x_{t+1} | S_{t+1}] since the GPB2 smoother does
-    not produce that quantity directly. This affects only diagnostics, not
-    the closed-form parameter updates.
-    """
-    n_time = obs.shape[0]
-    n_discrete_states = smoother_discrete_state_prob.shape[1]
-    n_cont_states = state_cond_smoother_means.shape[1]
-
-    # 1. E_q[log p(s_1)] - initial discrete state
-    log_init_discrete = jnp.sum(
-        smoother_discrete_state_prob[0] * _safe_log(init_discrete_state_prob)
-    )
-
-    # 2. E_q[log p(x_1 | s_1)] - initial continuous state
-    log_init_cont = jnp.zeros(())
-    for j in range(n_discrete_states):
-        # E_q[log N(x_1; μ_0^j, Σ_0^j) | s_1=j]
-        # = -0.5 * (log|Σ_0^j| + tr(Σ_0^j^{-1} E_q[(x_1 - μ_0^j)(x_1 - μ_0^j)^T | s_1=j]))
-        mean_j = init_state_cond_mean[:, j]
-        cov_j = init_state_cond_cov[:, :, j]
-
-        # E_q[(x_1 - μ_0^j)(x_1 - μ_0^j)^T | s_1=j]
-        smoother_mean_j = state_cond_smoother_means[0, :, j]
-        smoother_cov_j = state_cond_smoother_covs[0, :, :, j]
-        diff = smoother_mean_j - mean_j
-        expected_outer = smoother_cov_j + jnp.outer(diff, diff)
-
-        log_det = jnp.linalg.slogdet(cov_j)[1]
-        trace_term = jnp.trace(psd_solve(cov_j, expected_outer))
-        log_prob_j = -0.5 * (n_cont_states * jnp.log(2 * jnp.pi) + log_det + trace_term)
-        log_init_cont += smoother_discrete_state_prob[0, j] * log_prob_j
-
-    # 3. E_q[sum_t log p(s_t | s_{t-1})] - discrete state transitions
-    log_discrete_trans = jnp.sum(
-        smoother_joint_discrete_state_prob * _safe_log(discrete_transition_matrix)
-    )
-
-    # 4. E_q[sum_t log p(x_t | x_{t-1}, s_t)] - continuous state transitions
-    log_cont_trans = jnp.zeros(())
-    for j in range(n_discrete_states):
-        A_j = continuous_transition_matrix[:, :, j]
-        Q_j = process_cov[:, :, j]
-        log_det_Q = jnp.linalg.slogdet(Q_j)[1]
-
-        for t in range(n_time - 1):
-            # Sum over source states i weighted by P(s_t=i, s_{t+1}=j | y_{1:T})
-            for i in range(n_discrete_states):
-                weight = smoother_joint_discrete_state_prob[t, i, j]
-
-                # E_q[(x_{t+1} - A_j x_t)(x_{t+1} - A_j x_t)^T | s_t=i, s_{t+1}=j]
-                # Use pair-conditional quantities when available (GPB2),
-                # otherwise fall back to state-conditional (GPB1 approximate).
-                if pair_cond_smoother_means is not None:
-                    m_t_ij = pair_cond_smoother_means[t, :, i, j]
-                else:
-                    m_t_ij = state_cond_smoother_means[t, :, i]
-
-                if next_pair_cond_smoother_means is not None:
-                    m_t1_ij = next_pair_cond_smoother_means[t, :, i, j]
-                else:
-                    m_t1_ij = state_cond_smoother_means[t + 1, :, j]
-
-                if pair_cond_smoother_covs is not None:
-                    V_t_ij = pair_cond_smoother_covs[t, :, :, i, j]
-                else:
-                    V_t_ij = state_cond_smoother_covs[t, :, :, i]
-
-                # For V_{t+1}, we don't have pair-conditional Cov[x_{t+1} | S_t, S_{t+1}]
-                # separately (only Cov[x_t | S_t, S_{t+1}]). Use state-conditional.
-                V_t1_j = state_cond_smoother_covs[t + 1, :, :, j]
-
-                # Stored as Cov[x_t, x_{t+1} | ...] by the RTS helper.
-                cross_cov_t_t1_ij = pair_cond_smoother_cross_cov[t, :, :, i, j]
-
-                # E[x_{t+1} x_{t+1}^T | ...]
-                E_xt1_xt1 = V_t1_j + jnp.outer(m_t1_ij, m_t1_ij)
-                # E[x_t x_t^T | ...]
-                E_xt_xt = V_t_ij + jnp.outer(m_t_ij, m_t_ij)
-                # E[x_{t+1} x_t^T | ...]
-                E_xt1_xt = cross_cov_t_t1_ij.T + jnp.outer(m_t1_ij, m_t_ij)
-
-                # E[(x_{t+1} - A x_t)(x_{t+1} - A x_t)^T]
-                # = E[x_{t+1} x_{t+1}^T] - A E[x_t x_{t+1}^T] - E[x_{t+1} x_t^T] A^T + A E[x_t x_t^T] A^T
-                expected_residual = (
-                    E_xt1_xt1
-                    - A_j @ E_xt1_xt.T
-                    - E_xt1_xt @ A_j.T
-                    + A_j @ E_xt_xt @ A_j.T
-                )
-
-                trace_term = jnp.trace(psd_solve(Q_j, expected_residual))
-                log_prob = -0.5 * (
-                    n_cont_states * jnp.log(2 * jnp.pi) + log_det_Q + trace_term
-                )
-                log_cont_trans += jnp.where(weight > 0, weight * log_prob, 0.0)
-
-    # 5. E_q[sum_t log p(y_t | x_t, s_t)] - observations
-    log_obs = jnp.zeros(())
-    for j in range(n_discrete_states):
-        H_j = measurement_matrix[:, :, j]
-        R_j = measurement_cov[:, :, j]
-        log_det_R = jnp.linalg.slogdet(R_j)[1]
-        n_obs = obs.shape[1]
-
-        for t in range(n_time):
-            weight = smoother_discrete_state_prob[t, j]
-
-            m_t_j = state_cond_smoother_means[t, :, j]
-            V_t_j = state_cond_smoother_covs[t, :, :, j]
-
-            # E[(y_t - H x_t)(y_t - H x_t)^T | s_t=j]
-            pred_mean = H_j @ m_t_j
-            diff = obs[t] - pred_mean
-            # E[x_t x_t^T | s_t=j]
-            E_xt_xt = V_t_j + jnp.outer(m_t_j, m_t_j)
-            # E[(y - Hx)(y - Hx)^T] = (y - H m)(y - H m)^T + H V H^T
-            expected_residual = jnp.outer(diff, diff) + H_j @ V_t_j @ H_j.T
-
-            trace_term = jnp.trace(psd_solve(R_j, expected_residual))
-            log_prob = -0.5 * (n_obs * jnp.log(2 * jnp.pi) + log_det_R + trace_term)
-            log_obs += jnp.where(weight > 0, weight * log_prob, 0.0)
-
-    return (
-        log_init_discrete
-        + log_init_cont
-        + log_discrete_trans
-        + log_cont_trans
-        + log_obs
-    )
-
-
-def _compute_posterior_entropy_reference(
-    smoother_discrete_state_prob: jax.Array,
-    smoother_joint_discrete_state_prob: jax.Array,
-    state_cond_smoother_covs: jax.Array,
-) -> jax.Array:
-    """Compute the entropy of the approximate posterior H(q).
-
-    For the switching Kalman filter with mixture collapse approximation:
-    H(q) = H(q(s)) + E_q(s)[H(q(x|s))]
-
-    Parameters
-    ----------
-    smoother_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
-    smoother_joint_discrete_state_prob : jax.Array, shape (n_time - 1, n_discrete_states, n_discrete_states)
-    state_cond_smoother_covs : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
-
-    Returns
-    -------
-    entropy : jax.Array
-        H(q(x, s)) (scalar array)
-    """
-    n_time = smoother_discrete_state_prob.shape[0]
-    n_discrete_states = smoother_discrete_state_prob.shape[1]
-    n_cont_states = state_cond_smoother_covs.shape[1]
-
-    # 1. Entropy of discrete state sequence
-    # H(q(s)) = -sum_t E_q[log q(s_t | s_{t-1})]
-    # For t=1: -sum_j q(s_1=j) log q(s_1=j)
-    discrete_entropy = -jnp.sum(
-        smoother_discrete_state_prob[0] * _safe_log(smoother_discrete_state_prob[0])
-    )
-
-    # For t>1: -sum_{t,i,j} q(s_{t-1}=i, s_t=j) log q(s_t=j | s_{t-1}=i)
-    # q(s_t=j | s_{t-1}=i) = q(s_{t-1}=i, s_t=j) / q(s_{t-1}=i)
-    for t in range(n_time - 1):
-        marginal_prev = smoother_discrete_state_prob[t]
-        joint = smoother_joint_discrete_state_prob[t]
-        cond = _divide_safe(joint, marginal_prev[:, None])
-        discrete_entropy -= jnp.sum(joint * _safe_log(cond))
-
-    # 2. Entropy of continuous states given discrete states
-    # H(q(x|s)) = sum_t sum_j q(s_t=j) * H(q(x_t | s_t=j))
-    # For Gaussian: H(N(μ, Σ)) = 0.5 * (k + k*log(2π) + log|Σ|)
-    cont_entropy = jnp.zeros(())
-    for j in range(n_discrete_states):
-        for t in range(n_time):
-            weight = smoother_discrete_state_prob[t, j]
-            cov_j = state_cond_smoother_covs[t, :, :, j]
-            log_det = jnp.linalg.slogdet(cov_j)[1]
-            gaussian_entropy = 0.5 * (
-                n_cont_states * (1 + jnp.log(2 * jnp.pi)) + log_det
-            )
-            cont_entropy += jnp.where(weight > 0, weight * gaussian_entropy, 0.0)
-
-    return discrete_entropy + cont_entropy
-
-
 # ---------------------------------------------------------------------------
 # Vectorized ELBO functions (JIT-compatible, no Python loops)
 # ---------------------------------------------------------------------------
@@ -3149,7 +2894,7 @@ def compute_process_covariance_sufficient_stats(
         A: jax.Array, gamma1_j: jax.Array, beta_j: jax.Array, gamma2_j: jax.Array
     ) -> jax.Array:
         residual = gamma2_j - A @ beta_j.T - beta_j @ A.T + A @ gamma1_j @ A.T
-        return 0.5 * (residual + residual.T)
+        return symmetrize(residual)
 
     scatter = jax.vmap(residual_scatter, in_axes=(-1, -1, -1, -1), out_axes=-1)(
         continuous_transition_matrix, gamma1, beta, gamma2
@@ -3249,6 +2994,31 @@ def compute_transition_q_from_params(
     return compute_transition_q_function(A, gamma1, beta, process_cov=process_cov)
 
 
+
+# Bounded coordinate maps shared by the DIM transition-parameter optimizers:
+# damping / coupling live in ``(0, scale)`` via a scaled sigmoid, frequency in
+# ``(-scale, scale)`` via a scaled tanh. The inverses clip an ``1e-6`` margin
+# inside the open interval so a boundary value stays finite.
+_OPEN_INTERVAL_EPS = 1e-6
+
+
+def _scaled_sigmoid(x: jax.Array, scale: float) -> jax.Array:
+    return scale * jax.nn.sigmoid(x)
+
+
+def _inv_scaled_sigmoid(y: jax.Array, scale: float) -> jax.Array:
+    ratio = jnp.clip(y / scale, _OPEN_INTERVAL_EPS, 1.0 - _OPEN_INTERVAL_EPS)
+    return jnp.log(ratio) - jnp.log1p(-ratio)
+
+
+def _scaled_tanh(x: jax.Array, scale: float) -> jax.Array:
+    return scale * jnp.tanh(x)
+
+
+def _inv_scaled_tanh(y: jax.Array, scale: float) -> jax.Array:
+    ratio = jnp.clip(y / scale, -1.0 + _OPEN_INTERVAL_EPS, 1.0 - _OPEN_INTERVAL_EPS)
+    return jnp.arctanh(ratio)
+
 def optimize_dim_transition_params(
     gamma1: jax.Array,
     beta: jax.Array,
@@ -3316,26 +3086,12 @@ def optimize_dim_transition_params(
     max_coupling = 0.5
     offdiag_i, offdiag_j = jnp.where(~jnp.eye(n_osc, dtype=bool))
 
-    def _sigmoid(x: jax.Array) -> jax.Array:
-        return max_damping * jax.nn.sigmoid(x)
-
-    def _inv_sigmoid(y: jax.Array) -> jax.Array:
-        y_clipped = jnp.clip(y / max_damping, 1e-6, 1.0 - 1e-6)
-        return jnp.log(y_clipped / (1.0 - y_clipped))
-
-    def _bounded_freq(x: jax.Array) -> jax.Array:
-        return max_freq * jnp.tanh(x)
-
-    def _inv_bounded_freq(y: jax.Array) -> jax.Array:
-        y_clipped = jnp.clip(y / max_freq, -1.0 + 1e-6, 1.0 - 1e-6)
-        return jnp.arctanh(y_clipped)
-
-    def _bounded_coupling(x: jax.Array) -> jax.Array:
-        return max_coupling * jax.nn.sigmoid(x)
-
-    def _inv_bounded_coupling(y: jax.Array) -> jax.Array:
-        y_clipped = jnp.clip(y / max_coupling, 1e-6, 1.0 - 1e-6)
-        return jnp.log(y_clipped / (1.0 - y_clipped))
+    _sigmoid = functools.partial(_scaled_sigmoid, scale=max_damping)
+    _inv_sigmoid = functools.partial(_inv_scaled_sigmoid, scale=max_damping)
+    _bounded_freq = functools.partial(_scaled_tanh, scale=max_freq)
+    _inv_bounded_freq = functools.partial(_inv_scaled_tanh, scale=max_freq)
+    _bounded_coupling = functools.partial(_scaled_sigmoid, scale=max_coupling)
+    _inv_bounded_coupling = functools.partial(_inv_scaled_sigmoid, scale=max_coupling)
 
     def pack_unconstrained(params: dict) -> jax.Array:
         """Map physical params to unconstrained coordinates."""
@@ -3572,26 +3328,12 @@ def optimize_dim_transition_params_joint(
     offdiag_i, offdiag_j = jnp.where(~jnp.eye(n_osc, dtype=bool))
     n_offdiag = n_osc * (n_osc - 1)
 
-    def _bounded_damping(x: jax.Array) -> jax.Array:
-        return max_damping * jax.nn.sigmoid(x)
-
-    def _inv_bounded_damping(y: jax.Array) -> jax.Array:
-        ratio = jnp.clip(y / max_damping, 1e-6, 1.0 - 1e-6)
-        return jnp.log(ratio) - jnp.log1p(-ratio)
-
-    def _bounded_freq(x: jax.Array) -> jax.Array:
-        return max_freq * jnp.tanh(x)
-
-    def _inv_bounded_freq(y: jax.Array) -> jax.Array:
-        ratio = jnp.clip(y / max_freq, -1.0 + 1e-6, 1.0 - 1e-6)
-        return jnp.arctanh(ratio)
-
-    def _bounded_coupling(x: jax.Array) -> jax.Array:
-        return max_coupling * jax.nn.sigmoid(x)
-
-    def _inv_bounded_coupling(y: jax.Array) -> jax.Array:
-        ratio = jnp.clip(y / max_coupling, 1e-6, 1.0 - 1e-6)
-        return jnp.log(ratio) - jnp.log1p(-ratio)
+    _bounded_damping = functools.partial(_scaled_sigmoid, scale=max_damping)
+    _inv_bounded_damping = functools.partial(_inv_scaled_sigmoid, scale=max_damping)
+    _bounded_freq = functools.partial(_scaled_tanh, scale=max_freq)
+    _inv_bounded_freq = functools.partial(_inv_scaled_tanh, scale=max_freq)
+    _bounded_coupling = functools.partial(_scaled_sigmoid, scale=max_coupling)
+    _inv_bounded_coupling = functools.partial(_inv_scaled_sigmoid, scale=max_coupling)
 
     def pack_unconstrained(params: dict) -> jax.Array:
         damping = jnp.asarray(params["damping"])

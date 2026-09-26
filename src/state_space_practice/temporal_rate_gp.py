@@ -43,8 +43,7 @@ Nickisch, H., Solin, A. & Grigorevskiy, A. (2018). State Space Gaussian Processe
     with Non-Gaussian Likelihood. ICML, PMLR 80:3789-3798.
 """
 
-import operator
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -54,10 +53,16 @@ from jax.typing import ArrayLike
 
 from state_space_practice.gp_ssm import matern32_continuous, matern32_discretize
 from state_space_practice.kalman import kalman_smoother
+from state_space_practice.parameter_transforms import (
+    POSITIVE,
+    UNCONSTRAINED,
+    frozen,
+)
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import (
     _validate_filter_numerics,
     validate_count_array,
+    validate_int,
     validate_scalar,
 )
 
@@ -274,12 +279,7 @@ def infer_log_rate(
     if counts.ndim != 1:
         raise ValueError(f"counts must be 1D (n_time,), got shape {counts.shape}.")
     validate_count_array(counts, "counts", allow_empty=False)
-    try:
-        n_iter = operator.index(n_iter)
-    except TypeError as exc:
-        raise ValueError("n_iter must be a positive integer.") from exc
-    if n_iter <= 0:
-        raise ValueError("n_iter must be a positive integer.")
+    n_iter = validate_int(n_iter, "n_iter", positive=True)
     # Validate scalar hyperparameters only when concrete: under jax.grad they
     # arrive as tracers, and host-side float() checks would break tracing. The
     # model layer constrains them positive via parameter_transforms.
@@ -397,12 +397,7 @@ def infer_log_rate_batch(
             f"counts must be 2D (n_neurons, n_time), got shape {counts.shape}."
         )
     validate_count_array(counts, "counts", allow_empty=False)
-    try:
-        n_iter = operator.index(n_iter)
-    except TypeError as exc:
-        raise ValueError("n_iter must be a positive integer.") from exc
-    if n_iter <= 0:
-        raise ValueError("n_iter must be a positive integer.")
+    n_iter = validate_int(n_iter, "n_iter", positive=True)
 
     n_neurons = counts.shape[0]
     if not isinstance(dt, jax.core.Tracer):
@@ -477,12 +472,7 @@ class TemporalRateGP(SGDFittableMixin):
         self.variance = validate_scalar(variance, "variance", positive=True)
         self.lengthscale = validate_scalar(lengthscale, "lengthscale", positive=True)
         self.mean = validate_scalar(mean, "mean")
-        try:
-            self.n_iter = operator.index(n_iter)
-        except TypeError as exc:
-            raise ValueError("n_iter must be a positive integer.") from exc
-        if self.n_iter <= 0:
-            raise ValueError("n_iter must be a positive integer.")
+        self.n_iter = validate_int(n_iter, "n_iter", positive=True)
         self.update_variance = bool(update_variance)
         self.update_lengthscale = bool(update_lengthscale)
         self.update_mean = bool(update_mean)
@@ -491,12 +481,12 @@ class TemporalRateGP(SGDFittableMixin):
 
         # Data and posterior, populated by fit_sgd. _n_neurons is 1 for a 1D
         # (single-train) fit and n_neurons for a 2D (n_neurons, n_time) fit.
-        self._counts: Optional[Array] = None
+        self._counts: Array | None = None
         self._n_neurons: int = 1
         self._sgd_n_time: int = 0
-        self.log_rate_mean_: Optional[Array] = None
-        self.log_rate_var_: Optional[Array] = None
-        self.log_marginal_likelihood_: Optional[float] = None
+        self.log_rate_mean_: Array | None = None
+        self.log_rate_var_: Array | None = None
+        self.log_marginal_likelihood_: float | None = None
 
     def __repr__(self) -> str:
         return (
@@ -528,9 +518,9 @@ class TemporalRateGP(SGDFittableMixin):
         counts: ArrayLike,
         *,
         num_steps: int = 200,
-        optimizer: Optional[object] = None,
+        optimizer: object | None = None,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
     ) -> list[float]:
         """Learn hyperparameters by maximizing the Laplace log-evidence.
 
@@ -649,12 +639,6 @@ class TemporalRateGP(SGDFittableMixin):
             )
 
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            POSITIVE,
-            UNCONSTRAINED,
-            frozen,
-        )
-
         n_neurons = self._n_neurons
         # Shared variance/lengthscale stay scalar; per-neuron ones become
         # (n_neurons,) vectors. The baseline mean is always per-neuron for a

@@ -355,26 +355,18 @@ def interpolate_to_new_times(
     """
     from scipy.interpolate import interp1d
 
-    if values.ndim == 1:
-        interpolator = interp1d(
-            original_times, values, kind=kind, bounds_error=False, fill_value="extrapolate"
-        )
-        result: npt.NDArray[np.floating] = interpolator(new_times)
-        return result
-    else:
-        # Handle multi-dimensional case
-        n_features = values.shape[1]
-        result_arr: npt.NDArray[np.floating] = np.zeros((len(new_times), n_features))
-        for i in range(n_features):
-            interpolator = interp1d(
-                original_times,
-                values[:, i],
-                kind=kind,
-                bounds_error=False,
-                fill_value="extrapolate",
-            )
-            result_arr[:, i] = interpolator(new_times)
-        return result_arr
+    # ``axis=0`` interpolates every feature column at once and also handles
+    # the 1-D case.
+    interpolator = interp1d(
+        original_times,
+        values,
+        kind=kind,
+        axis=0,
+        bounds_error=False,
+        fill_value="extrapolate",
+    )
+    result: npt.NDArray[np.floating] = interpolator(new_times)
+    return result
 
 
 def get_spike_times_subset(
@@ -459,13 +451,8 @@ def binned_to_spike_times(
     time_bins = np.asarray(time_bins)
 
     def extract_spike_times_single(spike_counts: NDArray[np.int_]) -> NDArray[np.floating]:
-        """Extract spike times for a single neuron."""
-        spike_times_list = []
-        for t_idx in np.where(spike_counts > 0)[0]:
-            # Add spike time for each spike in the bin
-            for _ in range(spike_counts[t_idx]):
-                spike_times_list.append(time_bins[t_idx])
-        return np.array(spike_times_list)
+        """Extract spike times for a single neuron (one entry per spike)."""
+        return np.repeat(time_bins, spike_counts)
 
     if neuron_idx is not None:
         return extract_spike_times_single(binned_spikes[:, neuron_idx])

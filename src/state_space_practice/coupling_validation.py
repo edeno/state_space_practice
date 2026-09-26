@@ -16,7 +16,7 @@ not part of the JAX inference path.
 """
 
 import logging
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 import numpy as np
 import numpy.typing as npt
@@ -58,8 +58,8 @@ class CouplingPosterior(NamedTuple):
     beta_imag_mean: npt.NDArray[np.floating]
     beta_real_var: npt.NDArray[np.floating]
     beta_imag_var: npt.NDArray[np.floating]
-    samples: Optional[npt.NDArray[np.complexfloating]] = None
-    beta_real_imag_cov: Optional[npt.NDArray[np.floating]] = None
+    samples: npt.NDArray[np.complexfloating] | None = None
+    beta_real_imag_cov: npt.NDArray[np.floating] | None = None
 
 
 def _posterior_mean_var_arrays(

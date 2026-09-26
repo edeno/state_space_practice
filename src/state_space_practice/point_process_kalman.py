@@ -30,7 +30,8 @@ References
 
 import functools
 import logging
-from typing import Any, Callable, NamedTuple, Optional
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -39,14 +40,22 @@ from jax.typing import ArrayLike
 
 from state_space_practice.kalman import (
     _kalman_smoother_update,
+    psd_cholesky,
+    psd_logdet,
     psd_solve,
     stabilize_covariance,
     sum_of_outer_products,
     symmetrize,
 )
+from state_space_practice.parameter_transforms import (
+    PSD_MATRIX,
+    UNCONSTRAINED,
+)
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import (
     _validate_filter_numerics as _validate_filter_numerics_impl,
+)
+from state_space_practice.utils import (
     check_converged,
     validate_count_array,
     validate_scalar,
@@ -184,7 +193,7 @@ def _detect_block_diagonal_problem(
     process_cov: Array,
     design_matrix: Array,
     atol: float = 1e-10,
-) -> Optional[BlockDiagonalStructure]:
+) -> BlockDiagonalStructure | None:
     """Detect whether a filter problem has block-diagonal structure.
 
     Returns a ``BlockDiagonalStructure`` with the per-neuron factors if
@@ -513,10 +522,7 @@ def _logdet_psd(mat: Array, diagonal_boost: float = 1e-9) -> Array:
     Array
         Scalar log-determinant.
     """
-    n = mat.shape[-1]
-    stabilized = symmetrize(mat) + diagonal_boost * jnp.eye(n, dtype=mat.dtype)
-    chol = jnp.linalg.cholesky(stabilized)
-    return 2.0 * jnp.sum(jnp.log(jnp.diag(chol)))
+    return psd_logdet(psd_cholesky(mat, diagonal_boost, relative_boost=0.0))
 
 
 def _safe_expected_count(
@@ -663,7 +669,7 @@ def _point_process_laplace_update(
     dt: float,
     log_intensity_func: Callable[[Array], Array],
     diagonal_boost: float = 1e-9,
-    grad_log_intensity_func: Optional[Callable[[Array], Array]] = None,
+    grad_log_intensity_func: Callable[[Array], Array] | None = None,
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 1,
     line_search_beta: float = 0.5,
@@ -795,7 +801,10 @@ def _point_process_laplace_update(
     # Prior precision via psd_solve for numerical stability
     n_latent = one_step_mean.shape[0]
     identity = jnp.eye(n_latent)
-    prior_precision = psd_solve(one_step_cov, identity, diagonal_boost=diagonal_boost)
+    # One stabilized factor of the prior covariance serves both the prior
+    # precision and (under the Laplace correction) its log-determinant.
+    prior_cho = psd_cholesky(one_step_cov, diagonal_boost=diagonal_boost)
+    prior_precision = jax.scipy.linalg.cho_solve(prior_cho, identity)
 
     def _neg_log_posterior(x: Array) -> Array:
         """Negative log-posterior for line search."""
@@ -902,22 +911,19 @@ def _point_process_laplace_update(
         gradient = likelihood_gradient + prior_gradient
         fisher_info = jacobian.T @ (conditional_intensity[:, None] * jacobian)
         posterior_precision = symmetrize(prior_precision + fisher_info)
-        posterior_mean = one_step_mean + psd_solve(
-            posterior_precision, gradient, diagonal_boost=diagonal_boost
-        )
+        post_cho = psd_cholesky(posterior_precision, diagonal_boost=diagonal_boost)
+        posterior_mean = one_step_mean + jax.scipy.linalg.cho_solve(post_cho, gradient)
     else:
         # Iterative Fisher scoring with line search
         (posterior_mean, posterior_precision), _ = jax.lax.scan(
             _line_search_step, (x, prior_precision), None, length=max_newton_iter
         )
+        post_cho = psd_cholesky(posterior_precision, diagonal_boost=diagonal_boost)
 
-    # Posterior covariance via psd_solve. No post-hoc stabilization needed
-    # because posterior_precision is PSD by construction (sum of two PSD
-    # matrices). psd_solve itself adds a small diagonal boost for Cholesky
-    # conditioning.
-    posterior_cov = symmetrize(
-        psd_solve(posterior_precision, identity, diagonal_boost=diagonal_boost)
-    )
+    # Posterior covariance from the same factor. No post-hoc stabilization
+    # needed because posterior_precision is PSD by construction (sum of two
+    # PSD matrices); psd_cholesky adds a small diagonal boost for conditioning.
+    posterior_cov = symmetrize(jax.scipy.linalg.cho_solve(post_cho, identity))
 
     # Log-likelihood at posterior mode (approximate)
     log_lambda_mode = log_intensity_func(posterior_mean)
@@ -936,8 +942,8 @@ def _point_process_laplace_update(
         # prior density and the Laplace integral.
         delta = posterior_mean - one_step_mean
         quad = delta @ (prior_precision @ delta)
-        logdet_prior = _logdet_psd(one_step_cov, diagonal_boost)
-        logdet_post = _logdet_psd(posterior_cov, diagonal_boost)
+        logdet_prior = psd_logdet(prior_cho)
+        logdet_post = -psd_logdet(post_cho)  # log|P_post| = -log|precision|
         log_prior = -0.5 * quad - 0.5 * logdet_prior
         log_likelihood = log_likelihood + log_prior + 0.5 * logdet_post
 
@@ -1036,7 +1042,7 @@ def glm_laplace_update(
     eta_func: Callable[[Array], Array],
     family: GLMFamily,
     diagonal_boost: float = 1e-9,
-    grad_eta_func: Optional[Callable[[Array], Array]] = None,
+    grad_eta_func: Callable[[Array], Array] | None = None,
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 1,
     line_search_beta: float = 0.5,
@@ -1080,7 +1086,10 @@ def glm_laplace_update(
 
     n_latent = one_step_mean.shape[0]
     identity = jnp.eye(n_latent)
-    prior_precision = psd_solve(one_step_cov, identity, diagonal_boost=diagonal_boost)
+    # One stabilized factor of the prior covariance serves both the prior
+    # precision and (under the Laplace correction) its log-determinant.
+    prior_cho = psd_cholesky(one_step_cov, diagonal_boost=diagonal_boost)
+    prior_precision = jax.scipy.linalg.cho_solve(prior_cho, identity)
 
     def _neg_log_posterior(x: Array) -> Array:
         eta = eta_func(x)
@@ -1138,17 +1147,15 @@ def glm_laplace_update(
         weight = family.fisher_weight(eta, mu)
         fisher_info = jacobian.T @ (weight[:, None] * jacobian)
         posterior_precision = symmetrize(prior_precision + fisher_info)
-        posterior_mean = one_step_mean + psd_solve(
-            posterior_precision, gradient, diagonal_boost=diagonal_boost
-        )
+        post_cho = psd_cholesky(posterior_precision, diagonal_boost=diagonal_boost)
+        posterior_mean = one_step_mean + jax.scipy.linalg.cho_solve(post_cho, gradient)
     else:
         (posterior_mean, posterior_precision), _ = jax.lax.scan(
             _line_search_step, (x, prior_precision), None, length=max_newton_iter
         )
+        post_cho = psd_cholesky(posterior_precision, diagonal_boost=diagonal_boost)
 
-    posterior_cov = symmetrize(
-        psd_solve(posterior_precision, identity, diagonal_boost=diagonal_boost)
-    )
+    posterior_cov = symmetrize(jax.scipy.linalg.cho_solve(post_cho, identity))
 
     eta_mode = eta_func(posterior_mean)
     mu_mode = family.mean(eta_mode)
@@ -1157,8 +1164,8 @@ def glm_laplace_update(
     if include_laplace_normalization:
         delta = posterior_mean - one_step_mean
         quad = delta @ (prior_precision @ delta)
-        logdet_prior = _logdet_psd(one_step_cov, diagonal_boost)
-        logdet_post = _logdet_psd(posterior_cov, diagonal_boost)
+        logdet_prior = psd_logdet(prior_cho)
+        logdet_post = -psd_logdet(post_cho)  # log|P_post| = -log|precision|
         log_prior = -0.5 * quad - 0.5 * logdet_prior
         log_likelihood = log_likelihood + log_prior + 0.5 * logdet_post
 
@@ -1177,8 +1184,8 @@ def stochastic_point_process_filter(
     include_laplace_normalization: bool = True,
     max_log_count: float = 20.0,
     validate_inputs: bool = True,
-    block_n_neurons: Optional[int] = None,
-    block_size: Optional[int] = None,
+    block_n_neurons: int | None = None,
+    block_size: int | None = None,
     force_dense: bool = False,
     max_newton_iter: int = 1,
 ) -> tuple[Array, Array, Array]:
@@ -1908,8 +1915,8 @@ def stochastic_point_process_smoother(
     return_filtered: bool = False,
     max_log_count: float = 20.0,
     validate_inputs: bool = True,
-    block_n_neurons: Optional[int] = None,
-    block_size: Optional[int] = None,
+    block_n_neurons: int | None = None,
+    block_size: int | None = None,
     force_dense: bool = False,
     max_newton_iter: int = 1,
 ) -> tuple[Array, ...]:
@@ -2128,7 +2135,7 @@ def dynamics_only_m_step(
     smoother_mean: ArrayLike,
     smoother_cov: ArrayLike,
     smoother_cross_cov: ArrayLike,
-    fixed_transition_matrix: Optional[ArrayLike] = None,
+    fixed_transition_matrix: ArrayLike | None = None,
 ) -> tuple[Array, Array, Array, Array]:
     """Dynamics-only M-step: update (A, Q, init_mean, init_cov) from smoother outputs.
 
@@ -2402,11 +2409,11 @@ class PointProcessModel(SGDFittableMixin):
         self,
         n_state_dims: int,
         dt: float,
-        transition_matrix: Optional[ArrayLike] = None,
-        process_cov: Optional[ArrayLike] = None,
-        init_mean: Optional[ArrayLike] = None,
-        init_cov: Optional[ArrayLike] = None,
-        log_intensity_func: Optional[Callable] = None,
+        transition_matrix: ArrayLike | None = None,
+        process_cov: ArrayLike | None = None,
+        init_mean: ArrayLike | None = None,
+        init_cov: ArrayLike | None = None,
+        log_intensity_func: Callable | None = None,
         update_transition_matrix: bool = True,
         update_process_cov: bool = True,
         update_init_state: bool = True,
@@ -2464,11 +2471,11 @@ class PointProcessModel(SGDFittableMixin):
         self.update_init_state = update_init_state
 
         # Results (populated after fit)
-        self.smoother_mean: Optional[Array] = None
-        self.smoother_cov: Optional[Array] = None
-        self.smoother_cross_cov: Optional[Array] = None
-        self.filtered_mean: Optional[Array] = None
-        self.filtered_cov: Optional[Array] = None
+        self.smoother_mean: Array | None = None
+        self.smoother_cov: Array | None = None
+        self.smoother_cross_cov: Array | None = None
+        self.filtered_mean: Array | None = None
+        self.filtered_cov: Array | None = None
 
     def _e_step(self, design_matrix: ArrayLike, spike_indicator: ArrayLike) -> float:
         """E-step: Run filter and smoother to estimate latent states.
@@ -2722,10 +2729,10 @@ class PointProcessModel(SGDFittableMixin):
         self,
         design_matrix: ArrayLike,
         spike_indicator: ArrayLike,
-        optimizer: Optional[object] = None,
+        optimizer: object | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
 
@@ -2778,15 +2785,7 @@ class PointProcessModel(SGDFittableMixin):
     def _n_timesteps(self) -> int:
         return self._sgd_n_time
 
-    def _check_sgd_initialized(self) -> None:
-        pass  # Parameters allocated at construction time
-
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            PSD_MATRIX,
-            UNCONSTRAINED,
-        )
-
         params: dict = {}
         spec: dict = {}
 
@@ -2936,9 +2935,8 @@ class PointProcessModel(SGDFittableMixin):
             # Time-aligned evaluation: design_matrix[t] with state_estimate[t]
             log_rate = jax.vmap(self.log_intensity_func)(design_matrix, state_estimate)
 
-        rate = jnp.exp(log_rate)
+        return jnp.exp(log_rate)
 
-        return rate
 
     def get_confidence_interval(
         self, alpha: float = 0.05, use_smoothed: bool = True

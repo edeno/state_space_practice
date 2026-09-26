@@ -36,7 +36,6 @@ Models
 import logging
 import math
 from abc import ABC, abstractmethod
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -45,12 +44,12 @@ from jax.typing import ArrayLike
 
 from state_space_practice.oscillator_utils import (
     canonicalize_correlated_noise_pair_parameters,
+    compute_directed_influence_stability_scale,
     constrain_correlated_noise_process_covariance,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
     construct_correlated_noise_measurement_matrix,
     construct_correlated_noise_process_covariance,
-    compute_directed_influence_stability_scale,
     construct_directed_influence_measurement_matrix,
     construct_directed_influence_transition_matrix,
     extract_correlated_noise_params_from_covariance,
@@ -58,6 +57,16 @@ from state_space_practice.oscillator_utils import (
     get_block_slice,
     project_correlated_noise_process_covariance,
     project_coupled_transition_matrix,
+)
+from state_space_practice.parameter_transforms import (
+    POSITIVE,
+    PSD_MATRIX,
+    STOCHASTIC_ROW,
+    UNCONSTRAINED,
+)
+from state_space_practice.sgd_fitting import (
+    SGDFittableMixin,
+    reconstruct_per_state_array,
 )
 from state_space_practice.switching_kalman import (
     compute_process_covariance_sufficient_stats,
@@ -68,39 +77,19 @@ from state_space_practice.switching_kalman import (
     switching_kalman_smoother,
     switching_kalman_smoother_gpb2,
 )
-from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import (
     check_converged,
     make_discrete_transition_matrix,
     shift_to_psd,
     stabilize_transition_matrix,
+    symmetrize,
     validate_covariance,
+    validate_finite_array,
+    validate_nonnegative_array,
+    validate_unit_interval_array,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _validate_finite_array(name: str, value: ArrayLike) -> None:
-    """Validate finite model parameters at public boundaries."""
-    arr = jnp.asarray(value)
-    if bool(jnp.any(~jnp.isfinite(arr))):
-        raise ValueError(f"{name} must contain only finite values.")
-
-
-def _validate_nonnegative_array(name: str, value: ArrayLike) -> None:
-    """Validate finite, non-negative model parameters at public boundaries."""
-    arr = jnp.asarray(value)
-    _validate_finite_array(name, arr)
-    if bool(jnp.any(arr < 0)):
-        raise ValueError(f"{name} must be non-negative.")
-
-
-def _validate_unit_interval_array(name: str, value: ArrayLike) -> None:
-    """Validate finite parameters constrained to the closed unit interval."""
-    arr = jnp.asarray(value)
-    _validate_finite_array(name, arr)
-    if bool(jnp.any((arr < 0) | (arr > 1))):
-        raise ValueError(f"{name} entries must lie in [0, 1].")
 
 
 def _validate_positive_scalar(name: str, value: ArrayLike) -> None:
@@ -118,23 +107,6 @@ def _validate_positive_scalar(name: str, value: ArrayLike) -> None:
         raise ValueError(f"{name} must be a real scalar. Got {value!r}.") from None
     if not math.isfinite(numeric) or numeric <= 0:
         raise ValueError(f"{name} must be positive and finite. Got {value}.")
-
-
-def _dim_stability_scale(
-    freqs: ArrayLike,
-    damping_coef: ArrayLike,
-    coupling_strength: ArrayLike,
-    sampling_freq: float,
-    max_spectral_radius: float = 0.99,
-) -> Array:
-    """Compatibility wrapper for the shared differentiable DIM stability bound."""
-    return compute_directed_influence_stability_scale(
-        freqs,
-        damping_coef,
-        coupling_strength,
-        sampling_freq,
-        max_spectral_radius,
-    )
 
 
 # Update flags each oscillator subclass fixes by model definition (which of the
@@ -162,17 +134,6 @@ def _reject_forced_update_flags(model_name: str, kwargs: dict) -> None:
             f"{model_name} fixes {', '.join(conflicting)} by model definition; "
             "these update flags cannot be overridden."
         )
-
-
-def _stabilize_transition_matrix(
-    A: ArrayLike, max_spectral_radius: float = 0.99
-) -> Array:
-    """Scale a transition matrix so its spectral radius is <= the bound.
-
-    Thin wrapper over :func:`state_space_practice.utils.stabilize_transition_matrix`;
-    kept for the eager per-state stability clamp in oscillator model M-steps.
-    """
-    return stabilize_transition_matrix(A, max_spectral_radius=max_spectral_radius)
 
 
 class BaseModel(ABC, SGDFittableMixin):
@@ -272,7 +233,7 @@ class BaseModel(ABC, SGDFittableMixin):
         n_discrete_states: int,
         n_sources: int,
         sampling_freq: float,
-        discrete_transition_diag: Optional[jax.Array] = None,
+        discrete_transition_diag: jax.Array | None = None,
         stickiness: float = 0.0,
         update_discrete_transition_matrix: bool = True,
         update_continuous_transition_matrix: bool = True,
@@ -364,14 +325,14 @@ class BaseModel(ABC, SGDFittableMixin):
         # Placeholders for smoother results (Expected Sufficient Statistics - ESS).
         # Optional because a failed E-step reset (see _clear_smoother_state)
         # sets them to None so decode()/predict_proba() guards fire.
-        self.smoother_state_cond_mean: Optional[jax.Array]
-        self.smoother_state_cond_cov: Optional[jax.Array]
-        self.smoother_discrete_state_prob: Optional[jax.Array]
-        self.smoother_joint_discrete_state_prob: Optional[jax.Array]
-        self.smoother_pair_cond_cross_cov: Optional[jax.Array]
-        self.smoother_pair_cond_means: Optional[jax.Array]  # E[x|S_t=i,S_{t+1}=j]
-        self.smoother_pair_cond_covs: Optional[jax.Array]
-        self.smoother_next_pair_cond_means: Optional[jax.Array]
+        self.smoother_state_cond_mean: jax.Array | None
+        self.smoother_state_cond_cov: jax.Array | None
+        self.smoother_discrete_state_prob: jax.Array | None
+        self.smoother_joint_discrete_state_prob: jax.Array | None
+        self.smoother_pair_cond_cross_cov: jax.Array | None
+        self.smoother_pair_cond_means: jax.Array | None  # E[x|S_t=i,S_{t+1}=j]
+        self.smoother_pair_cond_covs: jax.Array | None
+        self.smoother_next_pair_cond_means: jax.Array | None
 
     def _snapshot_em_state(self) -> dict:
         """Capture parameters and smoother outputs for EM rollback.
@@ -798,13 +759,13 @@ class BaseModel(ABC, SGDFittableMixin):
             measurement_cov=self.measurement_cov,
         )
 
-        smoother_args = dict(
-            filter_mean=filter_mean,
-            filter_cov=filter_cov,
-            filter_discrete_state_prob=filter_discrete_state_prob,
-            process_cov=self.process_cov,
-            continuous_transition_matrix=self.continuous_transition_matrix,
-        )
+        smoother_args = {
+            "filter_mean": filter_mean,
+            "filter_cov": filter_cov,
+            "filter_discrete_state_prob": filter_discrete_state_prob,
+            "process_cov": self.process_cov,
+            "continuous_transition_matrix": self.continuous_transition_matrix,
+        }
 
         if self.smoother_type == "gpb2":
             (
@@ -948,7 +909,7 @@ class BaseModel(ABC, SGDFittableMixin):
         state_weights = jnp.sum(self.smoother_discrete_state_prob, axis=0)
         total_weight = jnp.maximum(jnp.sum(state_weights), 1e-12)
         pooled = jnp.einsum("j,abj->ab", state_weights, per_state_cov) / total_weight
-        pooled = 0.5 * (pooled + pooled.T)
+        pooled = symmetrize(pooled)
         return self._stack_shared_measurement_covariance(pooled)
 
     def fit(
@@ -991,7 +952,7 @@ class BaseModel(ABC, SGDFittableMixin):
             self._initialize_parameters(key)
             self._warm_initialize_states(observations)
         log_likelihoods: list[float] = []
-        last_accepted_state: Optional[dict] = None
+        last_accepted_state: dict | None = None
         needs_final_e_step = False
 
         for iteration in range(max_iter):
@@ -1106,10 +1067,10 @@ class BaseModel(ABC, SGDFittableMixin):
         self,
         observations: ArrayLike,
         key: Array | None = None,
-        optimizer: Optional[object] = None,
+        optimizer: object | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
         skip_init: bool = False,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
@@ -1186,20 +1147,9 @@ class BaseModel(ABC, SGDFittableMixin):
     def _reconstruct_per_state_array(
         self, params: dict, prefix: str, fallback: Array
     ) -> Array:
-        """Reconstruct a (…, n_discrete_states) array from per-state PSD params.
-
-        Used by subclass _sgd_loss_fn and _store_sgd_params to reassemble
-        arrays like measurement_cov and init_cov from per-state keys
-        (e.g. "measurement_cov_0", "measurement_cov_1", ...).
-        """
-        if not any(k.startswith(f"{prefix}_") for k in params):
-            return fallback
-        return jnp.stack(
-            [
-                params.get(f"{prefix}_{j}", fallback[..., j])
-                for j in range(self.n_discrete_states)
-            ],
-            axis=-1,
+        """See :func:`state_space_practice.sgd_fitting.reconstruct_per_state_array`."""
+        return reconstruct_per_state_array(
+            params, prefix, fallback, self.n_discrete_states
         )
 
     # Subclasses must implement _build_param_spec and _sgd_loss_fn
@@ -1245,21 +1195,21 @@ class CommonOscillatorModel(BaseModel):
             raise ValueError(
                 f"Shape mismatch: freqs {freqs.shape} vs n_oscillators {n_oscillators}"
             )
-        _validate_finite_array("freqs", freqs)
+        validate_finite_array("freqs", freqs)
         self.freqs = freqs
 
         if damping_coef.shape != (n_oscillators,):
             raise ValueError(
                 f"Shape mismatch: damping_coef {damping_coef.shape} vs n_oscillators {n_oscillators}"
             )
-        _validate_unit_interval_array("damping_coef", damping_coef)
+        validate_unit_interval_array("damping_coef", damping_coef)
         self.damping_coef = damping_coef
 
         if process_variance.shape != (n_oscillators,):
             raise ValueError(
                 f"Shape mismatch: process_variance {process_variance.shape} vs n_oscillators {n_oscillators}"
             )
-        _validate_nonnegative_array("process_variance", process_variance)
+        validate_nonnegative_array("process_variance", process_variance)
         self.process_variance = process_variance
 
         _validate_positive_scalar("measurement_variance", measurement_variance)
@@ -1401,12 +1351,6 @@ class CommonOscillatorModel(BaseModel):
     # --- SGDFittableMixin: COM-specific param spec and loss ---
 
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            PSD_MATRIX,
-            STOCHASTIC_ROW,
-            UNCONSTRAINED,
-        )
-
         params: dict = {}
         spec: dict = {}
 
@@ -1530,9 +1474,9 @@ class CorrelatedNoiseModel(BaseModel):
                 "process_variance must have shape (n_oscillators, n_discrete_states)."
                 f" Got {process_variance.shape}."
             )
-        _validate_finite_array("freqs", freqs)
-        _validate_unit_interval_array("damping_coef", damping_coef)
-        _validate_nonnegative_array("process_variance", process_variance)
+        validate_finite_array("freqs", freqs)
+        validate_unit_interval_array("damping_coef", damping_coef)
+        validate_nonnegative_array("process_variance", process_variance)
         if phase_difference.shape != (n_oscillators, n_oscillators, n_discrete_states):
             raise ValueError(
                 "phase_difference must have shape (n_oscillators, n_oscillators, n_discrete_states)."
@@ -1729,13 +1673,6 @@ class CorrelatedNoiseModel(BaseModel):
     # --- SGDFittableMixin: CNM-specific param spec and loss ---
 
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            PSD_MATRIX,
-            POSITIVE,
-            STOCHASTIC_ROW,
-            UNCONSTRAINED,
-        )
-
         params: dict = {}
         spec: dict = {}
 
@@ -1911,19 +1848,19 @@ class DirectedInfluenceModel(BaseModel):
             raise ValueError(
                 f"Shape mismatch: freqs {freqs.shape} vs n_oscillators {n_oscillators}"
             )
-        _validate_finite_array("freqs", freqs)
+        validate_finite_array("freqs", freqs)
         self.freqs = freqs
         if damping_coef.shape != (n_oscillators,):
             raise ValueError(
                 f"Shape mismatch: damping_coef {damping_coef.shape} vs n_oscillators {n_oscillators}"
             )
-        _validate_unit_interval_array("damping_coef", damping_coef)
+        validate_unit_interval_array("damping_coef", damping_coef)
         self.damping_coef = damping_coef
         if process_variance.shape != (n_oscillators,):
             raise ValueError(
                 f"Shape mismatch: process_variance {process_variance.shape} vs n_oscillators {n_oscillators}"
             )
-        _validate_nonnegative_array("process_variance", process_variance)
+        validate_nonnegative_array("process_variance", process_variance)
         self.process_variance = process_variance
 
         _validate_positive_scalar("measurement_variance", measurement_variance)
@@ -1942,8 +1879,8 @@ class DirectedInfluenceModel(BaseModel):
             )
         phase_difference = jnp.asarray(phase_difference)
         coupling_strength = jnp.asarray(coupling_strength)
-        _validate_finite_array("phase_difference", phase_difference)
-        _validate_finite_array("coupling_strength", coupling_strength)
+        validate_finite_array("phase_difference", phase_difference)
+        validate_finite_array("coupling_strength", coupling_strength)
         diag_idx = jnp.arange(n_oscillators)
         diag_phase = phase_difference[diag_idx, diag_idx, :]
         diag_coupling = coupling_strength[diag_idx, diag_idx, :]
@@ -1968,7 +1905,7 @@ class DirectedInfluenceModel(BaseModel):
         # Reparameterized M-step option
         self.use_reparameterized_mstep = use_reparameterized_mstep
         # Store current oscillator params for warm-starting optimizer
-        self._current_osc_params: Optional[dict] = None
+        self._current_osc_params: dict | None = None
 
         # Stability bounds applied when rebuilding transition matrices.
         if not 0.0 < max_spectral_radius < 1.0:
@@ -2005,7 +1942,7 @@ class DirectedInfluenceModel(BaseModel):
         and ``coupling_strength * scale``; reconstructing it from the public
         parameters requires re-applying this same scale.
         """
-        return _dim_stability_scale(
+        return compute_directed_influence_stability_scale(
             self.freqs,
             self.damping_coef,
             self.coupling_strength,
@@ -2024,7 +1961,8 @@ class DirectedInfluenceModel(BaseModel):
         drift toward zero across successive fits with strong coupling (the scale
         would otherwise compound into the accumulating public damping). ``A`` is
         reconstructable from the public params by re-applying the same
-        :func:`_dim_stability_scale` (see ``_effective_dim_scale``).
+        :func:`compute_directed_influence_stability_scale` (see
+        ``_effective_dim_scale``).
         """
         scale = self._effective_dim_scale()
         effective_damping = jnp.asarray(self.damping_coef) * scale
@@ -2205,7 +2143,7 @@ class DirectedInfluenceModel(BaseModel):
             # Stability is a hard physical constraint: an unstable A causes
             # state divergence and invalidates the E-step posteriors. Unlike
             # the block structure projection above, this is not optional.
-            A_j = _stabilize_transition_matrix(
+            A_j = stabilize_transition_matrix(
                 A_j, max_spectral_radius=self.max_spectral_radius
             )
 
@@ -2282,12 +2220,6 @@ class DirectedInfluenceModel(BaseModel):
     # --- SGDFittableMixin: DIM-specific param spec and loss ---
 
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            PSD_MATRIX,
-            STOCHASTIC_ROW,
-            UNCONSTRAINED,
-        )
-
         params: dict = {}
         spec: dict = {}
 
@@ -2321,11 +2253,11 @@ class DirectedInfluenceModel(BaseModel):
         self,
         observations: ArrayLike,
         key: Array | None = None,
-        optimizer: Optional[object] = None,
+        optimizer: object | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
-        connectivity_penalty: Optional[object] = None,
+        convergence_tol: float | None = None,
+        connectivity_penalty: object | None = None,
         skip_init: bool = False,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
@@ -2374,7 +2306,7 @@ class DirectedInfluenceModel(BaseModel):
     def _sgd_loss_fn(self, params: dict, observations) -> jax.Array:
         phase_diff = params.get("phase_difference", self.phase_difference)
         coupling = params.get("coupling_strength", self.coupling_strength)
-        stability_scale = _dim_stability_scale(
+        stability_scale = compute_directed_influence_stability_scale(
             self.freqs,
             self.damping_coef,
             coupling,

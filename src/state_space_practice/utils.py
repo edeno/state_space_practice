@@ -1,5 +1,5 @@
+import operator
 import warnings
-from typing import Optional, Union
 
 import jax
 import jax.numpy as jnp
@@ -10,7 +10,7 @@ from jax.typing import ArrayLike
 from scipy.optimize import linear_sum_assignment
 
 # Type alias for numeric values (scalars, numpy arrays, JAX arrays)
-Numeric = Union[float, int, np.ndarray, jax.Array]
+Numeric = float | int | np.ndarray | jax.Array
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +91,17 @@ def psd_cholesky(
     )
     A_stabilized = A_sym + effective_boost[..., None, None] * jnp.eye(n, dtype=A.dtype)
     return jax.scipy.linalg.cho_factor(A_stabilized)
+
+
+def psd_logdet(cho: tuple[jax.Array, bool]) -> jax.Array:
+    """Log-determinant from a :func:`psd_cholesky` factor.
+
+    ``2 * sum(log|diag(factor)|)`` for the stabilized matrix that was
+    factored, so a caller reusing one factor for a solve and a
+    log-determinant sees the same matrix in both.
+    """
+    diag = jnp.diagonal(cho[0], axis1=-2, axis2=-1)
+    return 2.0 * jnp.sum(jnp.log(jnp.abs(diag)), axis=-1)
 
 
 def psd_solve(
@@ -175,6 +186,32 @@ def psd_solve(
     b_mat = b[..., None] if rhs_is_vector else b
     x = jax.scipy.linalg.cho_solve(cho, b_mat)
     return x[..., 0] if rhs_is_vector else x
+
+
+def clip_eigenvalues(
+    mat: jax.Array,
+    min_eigenvalue: float | None = None,
+    max_eigenvalue: float | None = None,
+) -> jax.Array:
+    """Clip the eigenvalues of a symmetric matrix into ``[min, max]``.
+
+    Symmetrizes ``mat``, eigendecomposes it, clips the spectrum (each bound is
+    skipped when ``None``) and reconstructs the matrix. Used by the EM
+    trust-region updates to keep process / initial covariances inside a
+    configured eigenvalue range.
+
+    Parameters
+    ----------
+    mat : jax.Array, shape (n, n)
+    min_eigenvalue, max_eigenvalue : float or None
+        Lower / upper bound on the eigenvalues; ``None`` leaves that side open.
+    """
+    eigvals, eigvecs = jnp.linalg.eigh(symmetrize(mat))
+    if min_eigenvalue is not None:
+        eigvals = jnp.maximum(eigvals, min_eigenvalue)
+    if max_eigenvalue is not None:
+        eigvals = jnp.minimum(eigvals, max_eigenvalue)
+    return eigvecs @ jnp.diag(eigvals) @ eigvecs.T
 
 
 def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
@@ -309,6 +346,15 @@ def stabilize_transition_matrix(
     return A
 
 
+def contains_tracer(*values: object) -> bool:
+    """Return True if any pytree leaf is being traced by JAX."""
+    return any(
+        isinstance(leaf, jax.core.Tracer)
+        for value in values
+        for leaf in jax.tree_util.tree_leaves(value)
+    )
+
+
 def debug_print_if(condition: jax.Array, fmt: str, **fmt_kwargs) -> None:
     """Fire ``jax.debug.print(fmt, **fmt_kwargs)`` only when ``condition`` is True.
 
@@ -384,6 +430,54 @@ def validate_count_array(
         raise ValueError(f"{name} must contain integer-valued counts.")
 
 
+def validate_finite_array(name: str, value: ArrayLike) -> None:
+    """Validate finite model parameters at public boundaries."""
+    arr = jnp.asarray(value)
+    if bool(jnp.any(~jnp.isfinite(arr))):
+        raise ValueError(f"{name} must contain only finite values.")
+
+
+def validate_nonnegative_array(name: str, value: ArrayLike) -> None:
+    """Validate finite, non-negative model parameters at public boundaries."""
+    arr = jnp.asarray(value)
+    validate_finite_array(name, arr)
+    if bool(jnp.any(arr < 0)):
+        raise ValueError(f"{name} must be non-negative.")
+
+
+def validate_unit_interval_array(name: str, value: ArrayLike) -> None:
+    """Validate finite parameters constrained to the closed unit interval."""
+    arr = jnp.asarray(value)
+    validate_finite_array(name, arr)
+    if bool(jnp.any((arr < 0) | (arr > 1))):
+        raise ValueError(f"{name} entries must lie in [0, 1].")
+
+
+def validate_int(
+    value: object,
+    name: str,
+    *,
+    positive: bool = False,
+    nonnegative: bool = False,
+) -> int:
+    """Validate an integer configuration value at a public boundary.
+
+    Accepts anything ``operator.index`` accepts (Python / NumPy integers, not
+    floats or arrays) and returns it as a plain ``int``. Raises ``ValueError``
+    on non-integers and on values outside the requested range.
+    """
+    kind = "positive" if positive else "non-negative" if nonnegative else "an"
+    article = "a " if kind != "an" else ""
+    message = f"{name} must be {article}{kind} integer."
+    try:
+        value_int = operator.index(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError(message) from exc
+    if (positive and value_int <= 0) or (nonnegative and value_int < 0):
+        raise ValueError(message)
+    return value_int
+
+
 def validate_scalar(
     value: object,
     name: str,
@@ -415,8 +509,8 @@ def _validate_filter_numerics(
     n_time: int,
     stacklevel: int = 3,
     filter_name: str = "filter",
-    measurement_cov: Optional[Array] = None,
-    process_cov: Optional[Array] = None,
+    measurement_cov: Array | None = None,
+    process_cov: Array | None = None,
 ) -> None:
     """Validate covariance numerics + warn about f32 numerical risk.
 
@@ -558,7 +652,7 @@ def validate_covariance(
     """
     arr = jnp.asarray(covariance)
     if arr.ndim == 2:
-        slices: list[tuple[Optional[int], Array]] = [(None, arr)]
+        slices: list[tuple[int | None, Array]] = [(None, arr)]
     elif arr.ndim == 3:
         slices = [(k, arr[..., k]) for k in range(arr.shape[-1])]
     else:
@@ -877,7 +971,7 @@ def check_converged(
     log_likelihood: Numeric,
     previous_log_likelihood: Numeric,
     tolerance: float = 1e-4,
-    absolute_tolerance: Optional[float] = None,
+    absolute_tolerance: float | None = None,
 ) -> tuple[bool, bool]:
     """We have converged if the slope of the log-likelihood function falls below 'tolerance',
 
@@ -1008,8 +1102,8 @@ def hmm_viterbi(
         Most likely state sequence (integer-valued).
     """
     num_timesteps, num_states = log_likelihoods.shape
-    log_initial_probs = _zero_preserving_log(initial_probs)
-    log_transition_matrix = _zero_preserving_log(transition_matrix)
+    log_initial_probs = zero_preserving_log(initial_probs)
+    log_transition_matrix = zero_preserving_log(transition_matrix)
 
     # Backward pass: accumulate best future scores and store argmax pointers
     def _backward_step(best_next_score, t):
@@ -1038,7 +1132,7 @@ def hmm_viterbi(
     return jnp.concatenate([jnp.array([first_state]), states])
 
 
-def _zero_preserving_log(probabilities: Array) -> Array:
+def zero_preserving_log(probabilities: Array) -> Array:
     """Return log probabilities while keeping exact zeros at ``-inf``."""
     safe_probabilities = jnp.where(probabilities == 0, 1.0, probabilities)
     return jnp.where(probabilities == 0, -jnp.inf, jnp.log(safe_probabilities))

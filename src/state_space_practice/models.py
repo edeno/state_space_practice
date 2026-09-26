@@ -1,5 +1,5 @@
 import warnings
-from typing import Callable
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -7,7 +7,11 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.kalman import psd_solve, stabilize_covariance
-from state_space_practice.point_process_kalman import _safe_expected_count
+from state_space_practice.point_process_kalman import (  # noqa: F401 -- re-exports
+    _safe_expected_count,
+    get_confidence_interval,
+    steepest_descent_point_process_filter,
+)
 
 
 def log_receptive_field_model(position: ArrayLike, params: ArrayLike) -> Array:
@@ -158,96 +162,3 @@ def stochastic_point_process_filter(
         (init_mode_params_arr, init_covariance_params_arr),
         (x_arr, spike_indicator_arr),
     )[1]
-
-
-def get_confidence_interval(
-    posterior_mode: ArrayLike, posterior_covariance: ArrayLike, alpha: float = 0.05
-) -> Array:
-    """Get the confidence interval from the posterior covariance
-
-    Parameters
-    ----------
-    posterior_mode : ArrayLike, shape (n_time, n_params)
-    posterior_covariance : ArrayLike, shape (n_time, n_params, n_params)
-    alpha : float, optional
-        Significance level in ``(0, 1)``, by default ``0.05``. Returns a
-        ``1 - alpha`` confidence interval (i.e. the default 0.05 gives a
-        95% CI, not a 5% CI). Matches the default in
-        :func:`point_process_kalman.get_confidence_interval`.
-    """
-    posterior_mode = jnp.asarray(posterior_mode)
-    posterior_covariance = jnp.asarray(posterior_covariance)
-    z = jax.scipy.stats.norm.ppf(1 - alpha / 2)
-    ci = z * jnp.sqrt(
-        jnp.diagonal(posterior_covariance, axis1=-2, axis2=-1)
-    )  # shape (n_time, n_params)
-
-    return jnp.stack((posterior_mode - ci, posterior_mode + ci), axis=-1)
-
-
-def steepest_descent_point_process_filter(
-    init_mean_params: ArrayLike,
-    x: ArrayLike,
-    spike_indicator: ArrayLike,
-    dt: float,
-    epsilon: ArrayLike,
-    log_receptive_field_model: Callable[[ArrayLike, ArrayLike], Array],
-) -> Array:
-    """Steepest Descent Point Process Filter (SDPPF)
-
-    Parameters
-    ----------
-    init_mean_params : ArrayLike, shape (n_params,)
-    x : ArrayLike, shape (n_time,)
-        Continuous-valued input signal
-    spike_indicator : ArrayLike, shape (n_time,)
-        Spike count
-    dt : float
-        Time step
-    epsilon : ArrayLike, shape (n_params, n_params)
-        Learning rate
-    log_receptive_field_model : callable
-        Function that takes in `x` and parameters and returns the log spike rate
-
-    Returns
-    -------
-    posterior_mode : Array, shape (n_time, n_params)
-
-    References
-    ----------
-    .. [1] Brown, E.N., Nguyen, D.P., Frank, L.M., Wilson, M.A., and Solo, V. (2001).
-    An analysis of neural receptive field plasticity by point process adaptive filtering.
-    Proceedings of the National Academy of Sciences 98, 12261–12266.
-    https://doi.org/10.1073/pnas.201409398.
-
-    .. [2] Eden, U. T., Frank, L. M., Barbieri, R., Solo, V. & Brown, E. N.
-      Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
-      Neural Computation 16, 971-998 (2004).
-
-    Notes
-    -----
-    Equation in [1] is for the likelihood while in [2] it is for the log likelihood.
-    This implementation follows the formulation in [2].
-
-    """
-    # Convert ArrayLike inputs to Array for internal use
-    init_mean_params_arr: Array = jnp.asarray(init_mean_params)
-    x_arr: Array = jnp.asarray(x)
-    spike_indicator_arr: Array = jnp.asarray(spike_indicator)
-    epsilon_arr: Array = jnp.asarray(epsilon)
-
-    grad_log_receptive_field_model = jax.grad(log_receptive_field_model, argnums=1)
-
-    def _update(mode_prev: Array, args: tuple[Array, Array]) -> tuple[Array, Array]:
-        """Steepest Descent Point Process Filter update step"""
-        x_t, spike_indicator_t = args
-        conditional_intensity = _safe_expected_count(
-            log_receptive_field_model(x_t, mode_prev), dt
-        )
-        innovation = spike_indicator_t - conditional_intensity
-        one_step_grad = grad_log_receptive_field_model(x_t, mode_prev)
-        posterior_mode = mode_prev + epsilon_arr @ one_step_grad * innovation
-
-        return posterior_mode, posterior_mode
-
-    return jax.lax.scan(_update, init_mean_params_arr, (x_arr, spike_indicator_arr))[1]
