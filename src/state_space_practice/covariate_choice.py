@@ -26,7 +26,6 @@ References
 from __future__ import annotations
 
 import logging
-import math
 from functools import partial
 from typing import NamedTuple
 
@@ -40,24 +39,16 @@ from state_space_practice.kalman import psd_solve
 from state_space_practice.multinomial_choice import (
     ChoiceFilterResult,
     ChoiceSmootherResult,
+    MultinomialChoiceModel,
     _softmax_update_core,
 )
 from state_space_practice.parameter_transforms import (
-    POSITIVE,
     UNCONSTRAINED,
     UNIT_INTERVAL,
 )
-from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import symmetrize, validate_choice_indices
 
 logger = logging.getLogger(__name__)
-
-_DEFAULT_BETA_GRID = (0.1, 0.3, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0)
-
-# Tolerance below which a marginal-LL decrease between EM iterations is treated
-# as an overshoot of the approximate (Laplace-EKF) M-step and triggers a rollback
-# to the last accepted parameters.
-_EM_MONOTONICITY_TOL = 1e-6
 
 
 def covariate_predict(
@@ -460,7 +451,35 @@ def covariate_choice_smoother(
     )
 
 
-class CovariateChoiceModel(SGDFittableMixin):
+def _coerce_covariates(
+    values: ArrayLike | None,
+    n_expected: int,
+    name: str,
+    size_name: str,
+    method: str,
+) -> Array | None:
+    """Validate a covariate matrix passed to ``fit`` / ``fit_sgd``.
+
+    Returns None when the model declares no such covariates
+    (``n_expected == 0``); an array passed in that case is ignored.
+    """
+    if n_expected == 0:
+        return None
+    if values is None:
+        raise ValueError(
+            f"Model has {size_name}={n_expected} but no {name} were passed to "
+            f"{method}()"
+        )
+    arr = jnp.asarray(values)
+    if arr.shape[1] != n_expected:
+        raise ValueError(
+            f"{name} has {arr.shape[1]} columns but model expects "
+            f"{size_name}={n_expected}"
+        )
+    return arr
+
+
+class CovariateChoiceModel(MultinomialChoiceModel):
     """Multi-armed bandit with covariate-driven value dynamics and
     observation-level choice biases.
 
@@ -474,6 +493,10 @@ class CovariateChoiceModel(SGDFittableMixin):
 
     When n_covariates=0 and n_obs_covariates=0, reduces to
     MultinomialChoiceModel (pure random walk).
+
+    The EM driver, uncertainty summaries, BIC and plots are inherited; this
+    class overrides the hooks listed in :class:`MultinomialChoiceModel`
+    (filter selection, dynamics, logit offsets, M-steps, final E-step).
 
     Parameters
     ----------
@@ -513,31 +536,21 @@ class CovariateChoiceModel(SGDFittableMixin):
         learn_decay: bool = False,
         learn_obs_weights: bool = True,
     ):
-        if n_options < 2:
-            raise ValueError(f"n_options must be >= 2, got {n_options}")
-        if init_inverse_temperature <= 0:
-            raise ValueError(
-                "init_inverse_temperature must be > 0 (a non-positive value "
-                f"inverts choice preferences), got {init_inverse_temperature}."
-            )
-        if init_process_noise < 0:
-            raise ValueError(
-                "init_process_noise must be non-negative (Q = process_noise * I "
-                f"must be PSD), got {init_process_noise}."
-            )
+        super().__init__(
+            n_options,
+            init_inverse_temperature=init_inverse_temperature,
+            init_process_noise=init_process_noise,
+            learn_inverse_temperature=learn_inverse_temperature,
+            learn_process_noise=learn_process_noise,
+        )
         if init_decay <= 0 or init_decay > 1:
             raise ValueError(
                 "init_decay must lie in (0, 1] for stable latent dynamics, "
                 f"got {init_decay}."
             )
-        self.n_options = n_options
         self.n_covariates = n_covariates
         self.n_obs_covariates = n_obs_covariates
-        self.inverse_temperature = init_inverse_temperature
-        self.process_noise = init_process_noise
         self.decay = init_decay
-        self.learn_inverse_temperature = learn_inverse_temperature
-        self.learn_process_noise = learn_process_noise
         self.learn_decay = learn_decay
         self.learn_obs_weights = learn_obs_weights
 
@@ -545,21 +558,9 @@ class CovariateChoiceModel(SGDFittableMixin):
         self.input_gain_: Array = jnp.zeros((k_free, max(n_covariates, 1)))
         self.obs_weights_: Array = jnp.zeros((n_options, max(n_obs_covariates, 1)))
 
-        # Fitted state
-        self._smoother_result: ChoiceSmootherResult | None = None
-        self.log_likelihood_: float | None = None
-        self.n_iter_: int | None = None
-        self.converged_: bool | None = None
-        self.log_likelihood_history_: list[float] | None = None
-        self._n_trials: int | None = None
+        # Covariates bound by fit() / fit_sgd()
         self._covariates: Array | None = None
         self._obs_covariates: Array | None = None
-
-        # Uncertainty summaries
-        self.predicted_option_variances_: Array | None = None
-        self.smoothed_option_variances_: Array | None = None
-        self.predicted_choice_entropy_: Array | None = None
-        self.surprise_: Array | None = None
 
     def __repr__(self) -> str:
         fitted = self.is_fitted
@@ -571,75 +572,123 @@ class CovariateChoiceModel(SGDFittableMixin):
             f"decay={self.decay:.4f}, fitted={fitted})"
         )
 
-    @property
-    def is_fitted(self) -> bool:
-        return self._smoother_result is not None
+    # --- Hooks (see MultinomialChoiceModel) ---
 
-    def _populate_uncertainty(self, choices: Array) -> None:
-        """Compute uncertainty summaries from filter + smoother results."""
-        from state_space_practice.behavioral_uncertainty import (
-            append_reference_option,
-            categorical_entropy,
-            compute_surprise,
-            option_variances_from_covariances,
-        )
-
-        filt = covariate_choice_filter(
-            choices, self.n_options,
+    def _filter_kwargs(self) -> dict:
+        kwargs = super()._filter_kwargs()
+        kwargs.update(
             covariates=self._covariates,
             input_gain=self.input_gain_ if self.n_covariates > 0 else None,
             obs_covariates=self._obs_covariates,
             obs_weights=self.obs_weights_ if self.n_obs_covariates > 0 else None,
-            process_noise=self.process_noise,
-            inverse_temperature=self.inverse_temperature,
             decay=self.decay,
         )
+        return kwargs
 
-        # Option values (full K with reference option appended)
-        self.predicted_option_values_ = append_reference_option(filt.predicted_values)
-        self.filtered_option_values_ = append_reference_option(filt.filtered_values)
-        self.smoothed_option_values_ = append_reference_option(
-            self._smoother_result.smoothed_values
+    def _run_filter(self, choices: Array, **overrides) -> ChoiceFilterResult:
+        kwargs = {**self._filter_kwargs(), **overrides}
+        return covariate_choice_filter(choices, self.n_options, **kwargs)
+
+    def _run_smoother(self, choices: Array) -> ChoiceSmootherResult:
+        return covariate_choice_smoother(
+            choices, self.n_options, **self._filter_kwargs()
         )
 
-        # Option variances (full K options)
-        self.predicted_option_variances_ = option_variances_from_covariances(
-            filt.predicted_covariances
-        )
-        self.filtered_option_variances_ = option_variances_from_covariances(
-            filt.filtered_covariances
-        )
-        self.smoothed_option_variances_ = option_variances_from_covariances(
-            self._smoother_result.smoothed_covariances
-        )
+    def _transition_decay(self) -> float:
+        return self.decay
 
-        # Predicted choice entropy — include obs offset Theta @ z_t
-        logits = self.inverse_temperature * self.predicted_option_values_
-        if self.obs_weights_ is not None and self._obs_covariates is not None:
-            obs_offsets = self._obs_covariates @ self.obs_weights_.T  # (T, K)
-            logits = logits + obs_offsets
-        pred_probs = jax.nn.softmax(logits, axis=1)
-        self.predicted_choice_entropy_ = categorical_entropy(pred_probs)
-        self.surprise_ = compute_surprise(pred_probs, choices)
+    def _control_input(self) -> Array | None:
+        """``B u_t`` for each transition t-1 -> t, shape (T-1, K-1), or None."""
+        if self.n_covariates > 0 and self._covariates is not None:
+            return self._covariates[1:] @ self.input_gain_.T
+        return None
 
-    @property
-    def smoothed_values(self) -> Array:
-        """Smoothed option values, shape (n_trials, K-1)."""
-        self._check_fitted("smoothed_values")
-        return self._smoother_result.smoothed_values
+    def _observation_logit_offsets(self) -> Array | None:
+        """``Theta @ z_t`` per trial, shape (T, K); None without obs covariates."""
+        if self._obs_covariates is None:
+            return None
+        return self._obs_covariates @ self.obs_weights_.T
 
-    @property
-    def smoothed_covariances(self) -> Array:
-        """Smoothed covariances, shape (n_trials, K-1, K-1)."""
-        self._check_fitted("smoothed_covariances")
-        return self._smoother_result.smoothed_covariances
+    def _em_parameter_names(self) -> tuple[str, ...]:
+        return ("input_gain_", "obs_weights_", "decay") + super()._em_parameter_names()
 
-    def _check_fitted(self, method: str) -> None:
-        if not self.is_fitted:
-            raise RuntimeError(
-                f"CovariateChoiceModel.{method}() called before fitting. "
-                f"Call model.fit(choices) first."
+    def _em_progress(self) -> str:
+        return super()._em_progress() + f", decay={self.decay:.4f}"
+
+    def _m_step(
+        self, smooth: ChoiceSmootherResult, choices: Array, beta_grid: Array
+    ) -> None:
+        # M-step for B (input gain)
+        if self.n_covariates > 0 and self._covariates is not None:
+            self.input_gain_ = m_step_input_gain(
+                smooth.smoothed_values, self._covariates,
+                decay=self.decay,
             )
+
+        # M-step for Theta (observation weights)
+        if (self.learn_obs_weights
+                and self.n_obs_covariates > 0
+                and self._obs_covariates is not None):
+            self.obs_weights_ = m_step_obs_weights(
+                smooth.smoothed_values, choices,
+                self._obs_covariates, self.n_options,
+                self.inverse_temperature, self.obs_weights_,
+            )
+
+        # M-step for decay
+        if self.learn_decay:
+            self.decay = self._m_step_decay(smooth)
+
+        # M-steps for process noise Q and inverse temperature beta
+        super()._m_step(smooth, choices, beta_grid)
+
+    def _final_e_step(
+        self,
+        choices: Array,
+        log_likelihoods: list[float],
+        last_accepted: dict | None,
+    ) -> float:
+        """Final E-step, kept only if it did not decrease the log-likelihood.
+
+        The final E-step syncs the smoother to the last M-step's parameters. It
+        is accepted (its LL replacing or extending the history) when that LL is
+        finite and not worse than the last accepted iterate; otherwise the last
+        M-step is rolled back so the stored (params, smoother, LL) stay
+        consistent.
+        """
+        final_ll = super()._final_e_step(choices, log_likelihoods, last_accepted)
+        close = bool(log_likelihoods) and np.isclose(final_ll, log_likelihoods[-1])
+        not_worse = (not log_likelihoods) or close or final_ll >= log_likelihoods[-1]
+        if np.isfinite(final_ll) and not_worse:
+            if close:
+                log_likelihoods[-1] = final_ll
+            else:
+                log_likelihoods.append(final_ll)
+        elif last_accepted is not None:
+            self._restore_parameters(last_accepted)
+            final_ll = super()._final_e_step(
+                choices, log_likelihoods, last_accepted
+            )
+            logger.warning(
+                "Final M-step decreased the log-likelihood; rolled back to the "
+                "previous parameters."
+            )
+        return final_ll
+
+    def _bind_covariates(
+        self,
+        covariates: ArrayLike | None,
+        obs_covariates: ArrayLike | None,
+        method: str,
+    ) -> None:
+        """Store (and validate) the covariates used by the next fit."""
+        self._covariates = _coerce_covariates(
+            covariates, self.n_covariates, "covariates", "n_covariates", method
+        )
+        self._obs_covariates = _coerce_covariates(
+            obs_covariates, self.n_obs_covariates, "obs_covariates",
+            "n_obs_covariates", method,
+        )
 
     def fit(
         self,
@@ -675,188 +724,14 @@ class CovariateChoiceModel(SGDFittableMixin):
         -------
         log_likelihoods : list of float
         """
-        choices_arr = jnp.asarray(choices, dtype=jnp.int32)
-        self._n_trials = int(choices_arr.shape[0])
-
-        if self._n_trials < 2:
-            raise ValueError(
-                f"Need at least 2 trials for EM fitting, got {self._n_trials}"
-            )
-
-        validate_choice_indices(choices, self.n_options)
-
-        # Dynamics covariates
-        if self.n_covariates > 0 and covariates is not None:
-            self._covariates = jnp.asarray(covariates)
-            if self._covariates.shape[1] != self.n_covariates:
-                raise ValueError(
-                    f"covariates has {self._covariates.shape[1]} columns but "
-                    f"model expects n_covariates={self.n_covariates}"
-                )
-        elif self.n_covariates > 0 and covariates is None:
-            raise ValueError(
-                f"Model has n_covariates={self.n_covariates} but no "
-                f"covariates were passed to fit()"
-            )
-        else:
-            self._covariates = None
-
-        # Observation covariates
-        if self.n_obs_covariates > 0 and obs_covariates is not None:
-            self._obs_covariates = jnp.asarray(obs_covariates)
-            if self._obs_covariates.shape[1] != self.n_obs_covariates:
-                raise ValueError(
-                    f"obs_covariates has {self._obs_covariates.shape[1]} columns "
-                    f"but model expects n_obs_covariates={self.n_obs_covariates}"
-                )
-        elif self.n_obs_covariates > 0 and obs_covariates is None:
-            raise ValueError(
-                f"Model has n_obs_covariates={self.n_obs_covariates} but no "
-                f"obs_covariates were passed to fit()"
-            )
-        else:
-            self._obs_covariates = None
-
-        if beta_grid is None:
-            beta_grid = jnp.array(_DEFAULT_BETA_GRID)
-        else:
-            beta_grid = jnp.asarray(beta_grid)
-
-        log_likelihoods = []
-        converged = False
-        last_accepted: dict | None = None
-
-        for iteration in range(max_iter):
-            # E-step: run smoother
-            smooth = covariate_choice_smoother(
-                choices_arr, self.n_options,
-                covariates=self._covariates,
-                input_gain=self.input_gain_ if self.n_covariates > 0 else None,
-                obs_covariates=self._obs_covariates,
-                obs_weights=self.obs_weights_ if self.n_obs_covariates > 0 else None,
-                process_noise=self.process_noise,
-                inverse_temperature=self.inverse_temperature,
-                decay=self.decay,
-            )
-            ll = float(smooth.marginal_log_likelihood)
-
-            # GEM monotonicity guard: if the previous M-step decreased the marginal
-            # LL, the approximate (Laplace-EKF) M-step overshot. Restore the last
-            # accepted parameters and stop, so fit() returns the best iterate and
-            # the LL history stays non-decreasing. (Exact EM is monotone; the
-            # Laplace approximation is not, so this guard is required.)
-            if (
-                log_likelihoods
-                and last_accepted is not None
-                and ll < log_likelihoods[-1] - _EM_MONOTONICITY_TOL
-            ):
-                for attr, value in last_accepted.items():
-                    setattr(self, attr, value)
-                break
-
-            log_likelihoods.append(ll)
-
-            if verbose:
-                logger.info(
-                    "EM iter %d: LL=%.2f, beta=%.3f, Q=%.6f, decay=%.4f",
-                    iteration + 1, ll,
-                    self.inverse_temperature, self.process_noise, self.decay,
-                )
-
-            # Check convergence
-            if len(log_likelihoods) > 1:
-                prev_ll = log_likelihoods[-2]
-                if abs(prev_ll) > 0:
-                    rel_change = abs(ll - prev_ll) / abs(prev_ll)
-                else:
-                    rel_change = abs(ll - prev_ll)
-                if rel_change < tolerance:
-                    if verbose:
-                        logger.info("Converged at iteration %d", iteration + 1)
-                    converged = True
-                    break
-
-            # Snapshot the parameters this accepted E-step used so a degrading
-            # final M-step can be rolled back (approximate EM can decrease LL).
-            last_accepted = {
-                "input_gain_": self.input_gain_,
-                "obs_weights_": self.obs_weights_,
-                "decay": self.decay,
-                "process_noise": self.process_noise,
-                "inverse_temperature": self.inverse_temperature,
-            }
-
-            # M-step for B (input gain)
-            if self.n_covariates > 0 and self._covariates is not None:
-                self.input_gain_ = m_step_input_gain(
-                    smooth.smoothed_values, self._covariates,
-                    decay=self.decay,
-                )
-
-            # M-step for Theta (observation weights)
-            if (self.learn_obs_weights
-                    and self.n_obs_covariates > 0
-                    and self._obs_covariates is not None):
-                self.obs_weights_ = m_step_obs_weights(
-                    smooth.smoothed_values, choices_arr,
-                    self._obs_covariates, self.n_options,
-                    self.inverse_temperature, self.obs_weights_,
-                )
-
-            # M-step for decay
-            if self.learn_decay:
-                self.decay = self._m_step_decay(smooth)
-
-            # M-step for process noise Q
-            if self.learn_process_noise:
-                self.process_noise = self._m_step_process_noise(smooth)
-
-            # M-step for inverse temperature beta
-            if self.learn_inverse_temperature:
-                self.inverse_temperature = self._m_step_beta(
-                    choices_arr, beta_grid,
-                )
-
-        def _final_smoother():
-            return covariate_choice_smoother(
-                choices_arr, self.n_options,
-                covariates=self._covariates,
-                input_gain=self.input_gain_ if self.n_covariates > 0 else None,
-                obs_covariates=self._obs_covariates,
-                obs_weights=self.obs_weights_ if self.n_obs_covariates > 0 else None,
-                process_noise=self.process_noise,
-                inverse_temperature=self.inverse_temperature,
-                decay=self.decay,
-            )
-
-        # Final E-step syncs the smoother to the last M-step's parameters.
-        # Accept it only if it did not decrease the LL; otherwise roll the last
-        # M-step back so the stored (params, smoother, LL) stay consistent.
-        self._smoother_result = _final_smoother()
-        final_ll = float(self._smoother_result.marginal_log_likelihood)
-        close = bool(log_likelihoods) and np.isclose(final_ll, log_likelihoods[-1])
-        not_worse = (not log_likelihoods) or close or final_ll >= log_likelihoods[-1]
-        if np.isfinite(final_ll) and not_worse:
-            if close:
-                log_likelihoods[-1] = final_ll
-            else:
-                log_likelihoods.append(final_ll)
-        elif last_accepted is not None:
-            for attr, value in last_accepted.items():
-                setattr(self, attr, value)
-            self._smoother_result = _final_smoother()
-            final_ll = float(self._smoother_result.marginal_log_likelihood)
-            logger.warning(
-                "Final M-step decreased the log-likelihood; rolled back to the "
-                "previous parameters."
-            )
-        self.log_likelihood_ = final_ll
-        self.n_iter_ = len(log_likelihoods)
-        self.log_likelihood_history_ = log_likelihoods
-        self._populate_uncertainty(choices_arr)
-        self._finalize_convergence(converged, max_iter)
-
-        return log_likelihoods
+        self._bind_covariates(covariates, obs_covariates, "fit")
+        return super().fit(
+            choices,
+            max_iter=max_iter,
+            tolerance=tolerance,
+            verbose=verbose,
+            beta_grid=beta_grid,
+        )
 
     def fit_sgd(
         self,
@@ -891,39 +766,9 @@ class CovariateChoiceModel(SGDFittableMixin):
         -------
         log_likelihoods : list of float
         """
-        # --- Validate inputs ---
-        choices_arr = jnp.asarray(choices, dtype=jnp.int32)
-        self._n_trials = int(choices_arr.shape[0])
-
-        if self._n_trials < 2:
-            raise ValueError(
-                f"Need at least 2 trials for SGD fitting, got {self._n_trials}"
-            )
-
-        validate_choice_indices(choices, self.n_options)
-
-        if self.n_covariates > 0 and covariates is not None:
-            self._covariates = jnp.asarray(covariates)
-        elif self.n_covariates > 0:
-            raise ValueError(
-                f"Model has n_covariates={self.n_covariates} but no "
-                f"covariates were passed"
-            )
-        else:
-            self._covariates = None
-
-        if self.n_obs_covariates > 0 and obs_covariates is not None:
-            self._obs_covariates = jnp.asarray(obs_covariates)
-        elif self.n_obs_covariates > 0:
-            raise ValueError(
-                f"Model has n_obs_covariates={self.n_obs_covariates} but no "
-                f"obs_covariates were passed"
-            )
-        else:
-            self._obs_covariates = None
-
+        self._bind_covariates(covariates, obs_covariates, "fit_sgd")
         return super().fit_sgd(
-            choices_arr,
+            choices,
             optimizer=optimizer,
             num_steps=num_steps,
             verbose=verbose,
@@ -932,19 +777,8 @@ class CovariateChoiceModel(SGDFittableMixin):
 
     # --- SGDFittableMixin protocol ---
 
-    @property
-    def _n_timesteps(self) -> int:
-        return self._n_trials
-
     def _build_param_spec(self) -> tuple[dict, dict]:
-        params: dict = {}
-        spec: dict = {}
-        if self.learn_process_noise:
-            params["process_noise"] = jnp.array(self.process_noise)
-            spec["process_noise"] = POSITIVE
-        if self.learn_inverse_temperature:
-            params["inverse_temperature"] = jnp.array(self.inverse_temperature)
-            spec["inverse_temperature"] = POSITIVE
+        params, spec = super()._build_param_spec()
         if self.learn_decay:
             params["decay"] = jnp.array(self.decay)
             spec["decay"] = UNIT_INTERVAL
@@ -986,10 +820,7 @@ class CovariateChoiceModel(SGDFittableMixin):
         return -result.marginal_log_likelihood
 
     def _store_sgd_params(self, params: dict) -> None:
-        if "process_noise" in params:
-            self.process_noise = float(params["process_noise"])
-        if "inverse_temperature" in params:
-            self.inverse_temperature = float(params["inverse_temperature"])
+        super()._store_sgd_params(params)
         if "decay" in params:
             self.decay = float(params["decay"])
         if "input_gain" in params:
@@ -997,19 +828,7 @@ class CovariateChoiceModel(SGDFittableMixin):
         if "obs_weights" in params:
             self.obs_weights_ = params["obs_weights"]
 
-    def _finalize_sgd(self, choices: Array) -> None:
-        self._smoother_result = covariate_choice_smoother(
-            choices, self.n_options,
-            covariates=self._covariates,
-            input_gain=self.input_gain_ if self.n_covariates > 0 else None,
-            obs_covariates=self._obs_covariates,
-            obs_weights=self.obs_weights_ if self.n_obs_covariates > 0 else None,
-            process_noise=self.process_noise,
-            inverse_temperature=self.inverse_temperature,
-            decay=self.decay,
-        )
-        self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
-        self._populate_uncertainty(choices)
+    # --- M-steps specific to this model ---
 
     def _m_step_decay(self, smooth: ChoiceSmootherResult) -> float:
         """M-step: update scalar decay from smoother statistics.
@@ -1022,9 +841,9 @@ class CovariateChoiceModel(SGDFittableMixin):
         P = smooth.smoothed_covariances  # (T, K-1, K-1)
 
         target = m[1:]  # (T-1, K-1)
-        if self.n_covariates > 0 and self._covariates is not None:
-            u = self._covariates[1:]
-            target = target - u @ self.input_gain_.T
+        control_input = self._control_input()
+        if control_input is not None:
+            target = target - control_input
 
         # Numerator: sum_t (target_t)' m_{t-1}
         numer = jnp.sum(target * m[:-1])
@@ -1034,110 +853,10 @@ class CovariateChoiceModel(SGDFittableMixin):
         )
         return float(jnp.clip(numer / jnp.maximum(denom, 1e-10), 0.01, 1.0))
 
-    def _m_step_process_noise(self, smooth: ChoiceSmootherResult) -> float:
-        """M-step: update scalar process noise from smoother statistics.
-
-        Accounts for transition matrix A and dynamics covariates B.
-        Residual: m_t - A m_{t-1} - B u_t.
-        """
-        m = smooth.smoothed_values
-        P = smooth.smoothed_covariances
-        C = smooth.smoother_cross_cov
-        a = self.decay
-
-        T_minus_1 = m.shape[0] - 1
-        diff = m[1:] - a * m[:-1]  # (T-1, K-1)
-
-        # Subtract covariate contribution if present
-        if self.n_covariates > 0 and self._covariates is not None:
-            u = self._covariates[1:]
-            diff = diff - u @ self.input_gain_.T
-
-        # Q_hat with transition: E[(x_t - A x_{t-1})(...)'] =
-        #   diff diff' + P_t + a^2 P_{t-1} - 2a C_{t-1,t}
-        Q_hat = (
-            jnp.einsum("ti,tj->ij", diff, diff)
-            + jnp.sum(P[1:], axis=0)
-            + a**2 * jnp.sum(P[:-1], axis=0)
-            - 2 * a * jnp.sum(C, axis=0)
-        ) / T_minus_1
-        return float(jnp.maximum(jnp.mean(jnp.diag(Q_hat)), 1e-8))
-
-    def _m_step_beta(
-        self,
-        choices: Array,
-        beta_grid: Array,
-    ) -> float:
-        """M-step: grid search + golden-section refinement for beta."""
-        def _eval_beta(beta):
-            result = covariate_choice_filter(
-                choices, self.n_options,
-                covariates=self._covariates,
-                input_gain=self.input_gain_ if self.n_covariates > 0 else None,
-                obs_covariates=self._obs_covariates,
-                obs_weights=self.obs_weights_ if self.n_obs_covariates > 0 else None,
-                process_noise=self.process_noise,
-                inverse_temperature=beta,
-                decay=self.decay,
-            )
-            return result.marginal_log_likelihood
-
-        lls = jax.vmap(
-            lambda b: _eval_beta(b),
-            in_axes=0,
-        )(beta_grid)
-
-        best_idx = int(jnp.argmax(lls))
-        best_beta = float(beta_grid[best_idx])
-
-        lo_idx = max(0, best_idx - 1)
-        hi_idx = min(len(beta_grid) - 1, best_idx + 1)
-        lo = float(beta_grid[lo_idx])
-        hi = float(beta_grid[hi_idx])
-
-        if hi - lo < 1e-10:
-            return best_beta
-
-        gr = (math.sqrt(5) + 1) / 2
-        for _ in range(10):
-            c = hi - (hi - lo) / gr
-            d = lo + (hi - lo) / gr
-            ll_c = float(_eval_beta(c))
-            ll_d = float(_eval_beta(d))
-            if ll_c > ll_d:
-                hi = d
-            else:
-                lo = c
-
-        return (lo + hi) / 2
-
-    def choice_probabilities(self) -> Array:
-        """Softmax choice probabilities from smoothed values.
-
-        Includes observation covariate offsets if present.
-
-        Returns
-        -------
-        probs : Array, shape (n_trials, K)
-        """
-        self._check_fitted("choice_probabilities")
-        zeros = jnp.zeros((self._smoother_result.smoothed_values.shape[0], 1))
-        full_values = jnp.concatenate(
-            [zeros, self._smoother_result.smoothed_values], axis=1,
-        )
-        logits = self.inverse_temperature * full_values
-        if self.n_obs_covariates > 0 and self._obs_covariates is not None:
-            logits = logits + self._obs_covariates @ self.obs_weights_.T
-        return jax.nn.softmax(logits, axis=1)
-
     @property
     def n_free_params(self) -> int:
         """Number of free parameters learned by EM."""
-        n = 0
-        if self.learn_process_noise:
-            n += 1
-        if self.learn_inverse_temperature:
-            n += 1
+        n = super().n_free_params
         if self.n_covariates > 0:
             n += (self.n_options - 1) * self.n_covariates  # B matrix
         if self.n_obs_covariates > 0 and self.learn_obs_weights:
@@ -1149,52 +868,13 @@ class CovariateChoiceModel(SGDFittableMixin):
             n += 1  # scalar decay
         return n
 
-    def bic(self) -> float:
-        """Bayesian Information Criterion."""
-        self._check_fitted("bic")
-        return (
-            -2.0 * self.log_likelihood_
-            + self.n_free_params * math.log(self._n_trials)
-        )
-
-    def compare_to_null(self) -> dict:
-        """Compare fitted model to a null (uniform 1/K) model."""
-        self._check_fitted("compare_to_null")
-        null_ll_per_trial = math.log(1.0 / self.n_options)
-        null_ll = null_ll_per_trial * self._n_trials
-        null_bic = -2.0 * null_ll
-
-        model_bic = self.bic()
-        delta_bic = null_bic - model_bic
-
-        return {
-            "model_ll": self.log_likelihood_,
-            "null_ll": null_ll,
-            "model_bic": model_bic,
-            "null_bic": null_bic,
-            "delta_bic": delta_bic,
-            "learning_detected": delta_bic > 2.0,
-        }
+    def _summary_dimension_rows(self) -> list[tuple[str, object]]:
+        rows = super()._summary_dimension_rows()
+        return rows + [("n_covariates", self.n_covariates)]
 
     def summary(self) -> str:
-        """Text summary of fitted model."""
-        self._check_fitted("summary")
-        comparison = self.compare_to_null()
-        lines = [
-            "CovariateChoiceModel Summary",
-            "=" * 40,
-            f"  n_options:             {self.n_options}",
-            f"  n_covariates:          {self.n_covariates}",
-            f"  inverse_temperature:   {self.inverse_temperature:.4f}",
-            f"  process_noise:         {self.process_noise:.6f}",
-            f"  n_trials:              {self._n_trials}",
-            f"  n_em_iterations:       {self.n_iter_}",
-            f"  log_likelihood:        {self.log_likelihood_:.2f}",
-            f"  BIC:                   {self.bic():.2f}",
-            f"  null_ll (uniform):     {comparison['null_ll']:.2f}",
-            f"  delta_BIC:             {comparison['delta_bic']:.2f}",
-            f"  learning_detected:     {comparison['learning_detected']}",
-        ]
+        """Text summary of fitted model, including the input-gain matrix B."""
+        lines = [super().summary()]
         if self.n_covariates > 0:
             lines.append("  input_gain (B):")
             B = np.array(self.input_gain_)
@@ -1204,62 +884,6 @@ class CovariateChoiceModel(SGDFittableMixin):
                     + ", ".join(f"{B[i, j]:.4f}" for j in range(B.shape[1]))
                 )
         return "\n".join(lines)
-
-    def plot_values(self, observed_choices=None, option_labels=None, ax=None):
-        """Plot smoothed option values and choice probabilities.
-
-        Returns
-        -------
-        fig, axes
-        """
-        import matplotlib.pyplot as plt
-
-        self._check_fitted("plot_values")
-
-        if option_labels is None:
-            option_labels = [f"Option {i}" for i in range(self.n_options)]
-
-        vals = np.array(self._smoother_result.smoothed_values)
-        covs = np.array(self._smoother_result.smoothed_covariances)
-        probs = np.array(self.choice_probabilities())
-        trials = np.arange(vals.shape[0])
-
-        if ax is None:
-            fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-        else:
-            axes = np.atleast_1d(ax)
-            fig = axes[0].figure
-
-        for k in range(self.n_options - 1):
-            std = np.sqrt(covs[:, k, k])
-            axes[0].plot(trials, vals[:, k], label=option_labels[k + 1])
-            axes[0].fill_between(
-                trials, vals[:, k] - 1.96 * std, vals[:, k] + 1.96 * std,
-                alpha=0.2,
-            )
-        axes[0].axhline(0, color="gray", linestyle="--", alpha=0.5,
-                         label=f"{option_labels[0]} (ref)")
-        axes[0].set_ylabel("Relative value")
-        axes[0].set_title("Smoothed Option Values")
-        axes[0].legend(fontsize=8)
-
-        axes[1].stackplot(trials, probs.T, labels=option_labels, alpha=0.7)
-        if observed_choices is not None:
-            choices_np = np.asarray(observed_choices)
-            for k in range(self.n_options):
-                chosen_trials = trials[choices_np == k]
-                if len(chosen_trials) > 0:
-                    axes[1].eventplot(
-                        chosen_trials, lineoffsets=1.02 - k * 0.03,
-                        linelengths=0.02, colors="k", alpha=0.4,
-                    )
-        axes[1].set_ylabel("Choice probability")
-        axes[1].set_xlabel("Trial")
-        axes[1].set_title("Choice Probabilities")
-        axes[1].legend(fontsize=8, loc="upper right")
-
-        fig.tight_layout()
-        return fig, axes
 
     def plot_input_gains(self, option_labels=None, covariate_labels=None, ax=None):
         """Bar plot of the learned input-gain matrix B.
@@ -1300,31 +924,6 @@ class CovariateChoiceModel(SGDFittableMixin):
         fig.tight_layout()
         return fig, ax
 
-    def plot_convergence(self, ax=None):
-        """Plot EM log-likelihood convergence.
-
-        Returns
-        -------
-        fig, ax
-        """
-        import matplotlib.pyplot as plt
-
-        self._check_fitted("plot_convergence")
-
-        if ax is None:
-            fig, ax = plt.subplots(figsize=(6, 4))
-        else:
-            fig = ax.figure
-
-        ax.plot(range(1, len(self.log_likelihood_history_) + 1),
-                self.log_likelihood_history_, "o-")
-        ax.set_xlabel("EM Iteration")
-        ax.set_ylabel("Log-Likelihood")
-        ax.set_title("EM Convergence")
-
-        fig.tight_layout()
-        return fig, ax
-
     def plot_summary(self, observed_choices=None, option_labels=None):
         """3-panel diagnostic: values, input gains, convergence.
 
@@ -1337,26 +936,14 @@ class CovariateChoiceModel(SGDFittableMixin):
 
         self._check_fitted("plot_summary")
 
+        option_labels = self._resolve_option_labels(option_labels)
+
         fig = plt.figure(figsize=(15, 4))
         gs = GridSpec(1, 3, figure=fig)
 
         # Panel 1: latent values
         ax0 = fig.add_subplot(gs[0, 0])
-        vals = np.array(self._smoother_result.smoothed_values)
-        covs = np.array(self._smoother_result.smoothed_covariances)
-        if option_labels is None:
-            option_labels = [f"Option {i}" for i in range(self.n_options)]
-        trials = np.arange(vals.shape[0])
-        for k in range(self.n_options - 1):
-            std = np.sqrt(covs[:, k, k])
-            ax0.plot(trials, vals[:, k], label=option_labels[k + 1])
-            ax0.fill_between(trials, vals[:, k] - 1.96 * std,
-                             vals[:, k] + 1.96 * std, alpha=0.2)
-        ax0.axhline(0, color="gray", linestyle="--", alpha=0.5,
-                     label=f"{option_labels[0]} (ref)")
-        ax0.set_ylabel("Relative value")
-        ax0.set_title("Smoothed Values")
-        ax0.legend(fontsize=7)
+        self._plot_smoothed_values(ax0, option_labels, "Smoothed Values", 7)
 
         # Panel 2: input gains
         ax1 = fig.add_subplot(gs[0, 1])

@@ -41,8 +41,6 @@ from state_space_practice.parameter_transforms import (
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import validate_choice_indices as _validate_choices
 
-logger = logging.getLogger(__name__)
-
 
 def _softmax_update_core(
     prior_mean: Array,
@@ -383,6 +381,27 @@ class MultinomialChoiceModel(SGDFittableMixin):
         Whether to learn beta via EM.
     learn_process_noise : bool
         Whether to learn Q via EM.
+
+    Notes
+    -----
+    ``CovariateChoiceModel`` (``covariate_choice.py``) subclasses this model.
+    The EM driver, the beta / process-noise M-steps, the SGD protocol, the
+    uncertainty summaries, BIC and the plots live here; a subclass changes
+    only what genuinely differs, through these hooks:
+
+    - ``_run_filter()`` / ``_run_smoother()`` (which filter and smoother to
+      run) and ``_filter_kwargs()`` (the keyword arguments selecting the
+      current parameters that both pass on).
+    - ``_transition_decay()`` / ``_control_input()``: the latent dynamics
+      ``x_t = a x_{t-1} + b_t + w_t`` seen by the process-noise M-step.
+    - ``_observation_logit_offsets()``: additive logit offsets applied to
+      choice probabilities, predicted entropy and surprise.
+    - ``_m_step()``, ``_em_parameter_names()``, ``_em_progress()`` and
+      ``_final_e_step()``: the per-iteration parameter updates, the
+      attributes the monotonicity guard snapshots, the verbose log line
+      and the final E-step policy.
+    - ``n_free_params`` and ``_summary_dimension_rows()``: parameter
+      counting for BIC and the leading rows of ``summary()``.
     """
 
     def __init__(
@@ -437,6 +456,107 @@ class MultinomialChoiceModel(SGDFittableMixin):
     def is_fitted(self) -> bool:
         return self._smoother_result is not None
 
+    def _check_fitted(self, method: str) -> None:
+        if not self.is_fitted:
+            raise RuntimeError(
+                f"{type(self).__name__}.{method}() called before fitting. "
+                f"Call model.fit(choices) first."
+            )
+
+    @property
+    def smoothed_values(self) -> Array:
+        """Smoothed option values, shape (n_trials, K-1)."""
+        self._check_fitted("smoothed_values")
+        return self._smoother_result.smoothed_values
+
+    @property
+    def smoothed_covariances(self) -> Array:
+        """Smoothed covariances, shape (n_trials, K-1, K-1)."""
+        self._check_fitted("smoothed_covariances")
+        return self._smoother_result.smoothed_covariances
+
+    # --- Hooks: which filter to run, with which parameters ---
+
+    def _filter_kwargs(self) -> dict:
+        """Keyword arguments selecting the current parameters for the filter.
+
+        ``_run_filter`` and ``_run_smoother`` pass these on, after ``choices``
+        and ``n_options``, to the filter / smoother functions they call.
+        """
+        return {
+            "process_noise": self.process_noise,
+            "inverse_temperature": self.inverse_temperature,
+        }
+
+    def _run_filter(self, choices: Array, **overrides) -> ChoiceFilterResult:
+        """Forward filter at the current parameters; ``overrides`` replace any."""
+        kwargs = {**self._filter_kwargs(), **overrides}
+        return multinomial_choice_filter(choices, self.n_options, **kwargs)
+
+    def _run_smoother(self, choices: Array) -> ChoiceSmootherResult:
+        """Forward filter + RTS smoother at the current parameters."""
+        return multinomial_choice_smoother(
+            choices, self.n_options, **self._filter_kwargs()
+        )
+
+    # --- Hooks: latent dynamics and observation model ---
+
+    def _transition_decay(self) -> float:
+        """Scalar ``a`` of the dynamics ``x_t = a x_{t-1} + ...`` (1 = random walk)."""
+        return 1.0
+
+    def _control_input(self) -> Array | None:
+        """Known input ``b_t`` of each transition t-1 -> t, (T-1, K-1), or None."""
+        return None
+
+    def _observation_logit_offsets(self) -> Array | None:
+        """Additive per-trial logit offsets, shape (n_trials, K), or None."""
+        return None
+
+    # --- Hooks: EM loop ---
+
+    def _em_parameter_names(self) -> tuple[str, ...]:
+        """Attributes the EM monotonicity guard snapshots before each M-step."""
+        return ("process_noise", "inverse_temperature")
+
+    def _em_progress(self) -> str:
+        """Current-parameter summary for the verbose per-iteration log line."""
+        return f"beta={self.inverse_temperature:.3f}, Q={self.process_noise:.6f}"
+
+    def _restore_parameters(self, snapshot: dict) -> None:
+        for attr, value in snapshot.items():
+            setattr(self, attr, value)
+
+    def _m_step(
+        self, smooth: ChoiceSmootherResult, choices: Array, beta_grid: Array
+    ) -> None:
+        """One EM M-step: update every learned parameter in place."""
+        # M-step for process noise Q
+        if self.learn_process_noise:
+            self.process_noise = self._m_step_process_noise(smooth)
+
+        # M-step for inverse temperature beta
+        if self.learn_inverse_temperature:
+            self.inverse_temperature = self._m_step_beta(choices, beta_grid)
+
+    def _final_e_step(
+        self,
+        choices: Array,
+        log_likelihoods: list[float],
+        last_accepted: dict | None,
+    ) -> float:
+        """Sync ``_smoother_result`` / ``log_likelihood_`` to the final parameters.
+
+        Runs once after the EM loop and returns the final log-likelihood.
+        ``log_likelihoods`` is the per-iteration history and ``last_accepted``
+        the parameter snapshot taken before the last M-step (None if no M-step
+        ran); subclasses may use them to amend the history or roll a degrading
+        final M-step back.
+        """
+        self._smoother_result = self._run_smoother(choices)
+        self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
+        return self.log_likelihood_
+
     def _populate_uncertainty(self, choices: Array) -> None:
         """Compute uncertainty summaries from filter + smoother results.
 
@@ -450,10 +570,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
             option_variances_from_covariances,
         )
 
-        filt = multinomial_choice_filter(
-            choices, self.n_options,
-            self.process_noise, self.inverse_temperature,
-        )
+        filt = self._run_filter(choices)
 
         # Option values (full K with reference option appended)
         self.predicted_option_values_ = append_reference_option(filt.predicted_values)
@@ -473,33 +590,29 @@ class MultinomialChoiceModel(SGDFittableMixin):
             self._smoother_result.smoothed_covariances
         )
 
-        # Predicted choice entropy
-        pred_probs = jax.nn.softmax(
-            self.inverse_temperature * self.predicted_option_values_, axis=1
-        )
+        # Predicted choice entropy (including any observation-covariate offsets)
+        logits = self.inverse_temperature * self.predicted_option_values_
+        obs_offsets = self._observation_logit_offsets()
+        if obs_offsets is not None:
+            logits = logits + obs_offsets
+        pred_probs = jax.nn.softmax(logits, axis=1)
         self.predicted_choice_entropy_ = categorical_entropy(pred_probs)
 
         # Surprise
         self.surprise_ = compute_surprise(pred_probs, choices)
 
-    @property
-    def smoothed_values(self) -> Array:
-        """Smoothed option values, shape (n_trials, K-1)."""
-        self._check_fitted("smoothed_values")
-        return self._smoother_result.smoothed_values
+    def _prepare_choices(self, choices: ArrayLike, method: str) -> Array:
+        """Validate ``choices`` for fitting, record ``_n_trials``, return int32."""
+        choices_arr = jnp.asarray(choices, dtype=jnp.int32)
+        self._n_trials = int(choices_arr.shape[0])
 
-    @property
-    def smoothed_covariances(self) -> Array:
-        """Smoothed covariances, shape (n_trials, K-1, K-1)."""
-        self._check_fitted("smoothed_covariances")
-        return self._smoother_result.smoothed_covariances
-
-    def _check_fitted(self, method: str) -> None:
-        if not self.is_fitted:
-            raise RuntimeError(
-                f"MultinomialChoiceModel.{method}() called before fitting. "
-                f"Call model.fit(choices) first."
+        if self._n_trials < 2:
+            raise ValueError(
+                f"Need at least 2 trials for {method} fitting, got {self._n_trials}"
             )
+
+        _validate_choices(choices, self.n_options)
+        return choices_arr
 
     def fit(
         self,
@@ -530,32 +643,22 @@ class MultinomialChoiceModel(SGDFittableMixin):
         log_likelihoods : list of float
             Log-likelihood at each EM iteration.
         """
-        choices_arr = jnp.asarray(choices, dtype=jnp.int32)
-        self._n_trials = int(choices_arr.shape[0])
-
-        if self._n_trials < 2:
-            raise ValueError(
-                f"Need at least 2 trials for EM fitting, got {self._n_trials}"
-            )
-
-        _validate_choices(choices, self.n_options)
+        choices_arr = self._prepare_choices(choices, "EM")
 
         if beta_grid is None:
             beta_grid = jnp.array(_DEFAULT_BETA_GRID)
         else:
             beta_grid = jnp.asarray(beta_grid)
 
-        log_likelihoods = []
+        # Subclasses log under their own module (as _finalize_convergence does).
+        log = logging.getLogger(type(self).__module__)
+        log_likelihoods: list[float] = []
         converged = False
         last_accepted: dict | None = None
 
         for iteration in range(max_iter):
             # E-step: run smoother with current parameters
-            smooth = multinomial_choice_smoother(
-                choices_arr, self.n_options,
-                process_noise=self.process_noise,
-                inverse_temperature=self.inverse_temperature,
-            )
+            smooth = self._run_smoother(choices_arr)
             ll = float(smooth.marginal_log_likelihood)
 
             # GEM monotonicity guard: the approximate (Laplace-EKF) M-step can
@@ -567,17 +670,14 @@ class MultinomialChoiceModel(SGDFittableMixin):
                 and last_accepted is not None
                 and ll < log_likelihoods[-1] - _EM_MONOTONICITY_TOL
             ):
-                for attr, value in last_accepted.items():
-                    setattr(self, attr, value)
+                self._restore_parameters(last_accepted)
                 break
 
             log_likelihoods.append(ll)
 
             if verbose:
-                logger.info(
-                    "EM iter %d: LL=%.2f, beta=%.3f, Q=%.6f",
-                    iteration + 1, ll,
-                    self.inverse_temperature, self.process_noise,
+                log.info(
+                    "EM iter %d: LL=%.2f, %s", iteration + 1, ll, self._em_progress()
                 )
 
             # Check convergence
@@ -589,34 +689,20 @@ class MultinomialChoiceModel(SGDFittableMixin):
                     rel_change = abs(ll - prev_ll)
                 if rel_change < tolerance:
                     if verbose:
-                        logger.info("Converged at iteration %d", iteration + 1)
+                        log.info("Converged at iteration %d", iteration + 1)
                     converged = True
                     break
 
             # Snapshot the parameters this accepted E-step used, so the
             # monotonicity guard above can roll back a degrading M-step.
             last_accepted = {
-                "process_noise": self.process_noise,
-                "inverse_temperature": self.inverse_temperature,
+                name: getattr(self, name) for name in self._em_parameter_names()
             }
 
-            # M-step for process noise Q
-            if self.learn_process_noise:
-                self.process_noise = self._m_step_process_noise(smooth)
-
-            # M-step for inverse temperature beta
-            if self.learn_inverse_temperature:
-                self.inverse_temperature = self._m_step_beta(
-                    choices_arr, beta_grid,
-                )
+            self._m_step(smooth, choices_arr, beta_grid)
 
         # Final E-step with learned parameters
-        self._smoother_result = multinomial_choice_smoother(
-            choices_arr, self.n_options,
-            process_noise=self.process_noise,
-            inverse_temperature=self.inverse_temperature,
-        )
-        self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
+        self._final_e_step(choices_arr, log_likelihoods, last_accepted)
         self.n_iter_ = len(log_likelihoods)
         self.log_likelihood_history_ = log_likelihoods
         self._populate_uncertainty(choices_arr)
@@ -651,20 +737,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         -------
         log_likelihoods : list of float
         """
-        choices_arr = jnp.asarray(choices, dtype=jnp.int32)
-        self._n_trials = int(choices_arr.shape[0])
-
-        if self._n_trials < 2:
-            raise ValueError(
-                f"Need at least 2 trials for SGD fitting, got {self._n_trials}"
-            )
-
-        choices_np = np.asarray(choices)
-        if np.any(choices_np < 0) or np.any(choices_np >= self.n_options):
-            raise ValueError(
-                f"All choices must be in [0, {self.n_options}), "
-                f"got range [{choices_np.min()}, {choices_np.max()}]"
-            )
+        choices_arr = self._prepare_choices(choices, "SGD")
 
         return super().fit_sgd(
             choices_arr,
@@ -709,37 +782,43 @@ class MultinomialChoiceModel(SGDFittableMixin):
             self.inverse_temperature = float(params["inverse_temperature"])
 
     def _finalize_sgd(self, choices: Array) -> None:
-        self._smoother_result = multinomial_choice_smoother(
-            choices, self.n_options,
-            process_noise=self.process_noise,
-            inverse_temperature=self.inverse_temperature,
-        )
+        self._smoother_result = self._run_smoother(choices)
         self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
         self._populate_uncertainty(choices)
+
+    # --- M-steps ---
 
     def _m_step_process_noise(self, smooth: ChoiceSmootherResult) -> float:
         """M-step: update scalar process noise from smoother statistics.
 
-        Uses the standard EM formula for a random walk (A=I):
+        For dynamics x_t = a x_{t-1} + b_t + w_t with a = ``_transition_decay()``
+        and known input b_t = ``_control_input()`` (the random walk a = 1,
+        b_t = 0 for this model), the EM update is
             Q_hat = (1/(T-1)) * sum_{t=1}^{T-1} [
-                (m_t - m_{t-1})(m_t - m_{t-1})'
-                + P_t + P_{t-1} - 2 * C_{t-1,t}
-            ]
+                r_t r_t' + P_t + a^2 P_{t-1} - 2 a C_{t-1,t}
+            ],    r_t = m_t - a m_{t-1} - b_t,
         where C_{t-1,t} = Cov(x_{t-1}, x_t | y_{1:T}) from the smoother.
         Convention: smoother_cross_cov[t] = Cov(x_t, x_{t+1} | y_{1:T}),
-        which pairs with diff[t] = m[t+1] - m[t].
+        which pairs with diff[t] = m[t+1] - a * m[t].
         """
         m = smooth.smoothed_values       # (T, K-1)
         P = smooth.smoothed_covariances  # (T, K-1, K-1)
         C = smooth.smoother_cross_cov    # (T-1, K-1, K-1)
+        a = self._transition_decay()
 
         T_minus_1 = m.shape[0] - 1
-        diff = m[1:] - m[:-1]  # (T-1, K-1)
+        diff = m[1:] - a * m[:-1]  # (T-1, K-1)
+
+        # Subtract the known control input if present
+        control_input = self._control_input()
+        if control_input is not None:
+            diff = diff - control_input
+
         Q_hat = (
             jnp.einsum("ti,tj->ij", diff, diff)
             + jnp.sum(P[1:], axis=0)
-            + jnp.sum(P[:-1], axis=0)
-            - 2 * jnp.sum(C, axis=0)
+            + a**2 * jnp.sum(P[:-1], axis=0)
+            - 2 * a * jnp.sum(C, axis=0)
         ) / T_minus_1
         # Scalar Q: mean of diagonal, clamped
         return float(jnp.maximum(jnp.mean(jnp.diag(Q_hat)), 1e-8))
@@ -750,19 +829,15 @@ class MultinomialChoiceModel(SGDFittableMixin):
         beta_grid: Array,
     ) -> float:
         """M-step: grid search + golden-section refinement for beta."""
-        # Coarse grid search: evaluate filter LL at each candidate beta
         def _eval_beta(beta):
-            result = multinomial_choice_filter(
-                choices, self.n_options,
-                process_noise=self.process_noise,
-                inverse_temperature=beta,
-            )
+            result = self._run_filter(choices, inverse_temperature=beta)
             return result.marginal_log_likelihood
 
-        lls = jax.vmap(
-            lambda b: _eval_beta(b),
-            in_axes=0,
-        )(beta_grid)
+        # One batched filter pass evaluates the LL at every candidate beta.
+        _eval_betas = jax.vmap(_eval_beta)
+
+        # Coarse grid search
+        lls = _eval_betas(beta_grid)
 
         best_idx = int(jnp.argmax(lls))
         best_beta = float(beta_grid[best_idx])
@@ -781,8 +856,8 @@ class MultinomialChoiceModel(SGDFittableMixin):
         for _ in range(10):
             c = hi - (hi - lo) / gr
             d = lo + (hi - lo) / gr
-            ll_c = float(_eval_beta(c))
-            ll_d = float(_eval_beta(d))
+            # Both candidates in one batched pass: a single device sync.
+            ll_c, ll_d = np.asarray(_eval_betas(jnp.array([c, d])))
             if ll_c > ll_d:
                 hi = d
             else:
@@ -792,6 +867,8 @@ class MultinomialChoiceModel(SGDFittableMixin):
 
     def choice_probabilities(self) -> Array:
         """Softmax choice probabilities from smoothed values.
+
+        Includes observation-covariate logit offsets when the model has them.
 
         Returns
         -------
@@ -804,7 +881,11 @@ class MultinomialChoiceModel(SGDFittableMixin):
         full_values = jnp.concatenate(
             [zeros, self._smoother_result.smoothed_values], axis=1
         )
-        return jax.nn.softmax(self.inverse_temperature * full_values, axis=1)
+        logits = self.inverse_temperature * full_values
+        obs_offsets = self._observation_logit_offsets()
+        if obs_offsets is not None:
+            logits = logits + obs_offsets
+        return jax.nn.softmax(logits, axis=1)
 
     @property
     def n_free_params(self) -> int:
@@ -852,25 +933,53 @@ class MultinomialChoiceModel(SGDFittableMixin):
             "learning_detected": delta_bic > 2.0,
         }
 
+    def _summary_dimension_rows(self) -> list[tuple[str, object]]:
+        """``(label, value)`` rows describing the model's size, first in summary()."""
+        return [("n_options", self.n_options)]
+
     def summary(self) -> str:
         """Text summary of fitted model including null comparison."""
         self._check_fitted("summary")
         comparison = self.compare_to_null()
-        lines = [
-            "MultinomialChoiceModel Summary",
-            "=" * 40,
-            f"  n_options:             {self.n_options}",
-            f"  inverse_temperature:   {self.inverse_temperature:.4f}",
-            f"  process_noise:         {self.process_noise:.6f}",
-            f"  n_trials:              {self._n_trials}",
-            f"  n_em_iterations:       {self.n_iter_}",
-            f"  log_likelihood:        {self.log_likelihood_:.2f}",
-            f"  BIC:                   {self.bic():.2f}",
-            f"  null_ll (uniform):     {comparison['null_ll']:.2f}",
-            f"  delta_BIC:             {comparison['delta_bic']:.2f}",
-            f"  learning_detected:     {comparison['learning_detected']}",
+        rows = self._summary_dimension_rows() + [
+            ("inverse_temperature", f"{self.inverse_temperature:.4f}"),
+            ("process_noise", f"{self.process_noise:.6f}"),
+            ("n_trials", self._n_trials),
+            ("n_em_iterations", self.n_iter_),
+            ("log_likelihood", f"{self.log_likelihood_:.2f}"),
+            ("BIC", f"{self.bic():.2f}"),
+            ("null_ll (uniform)", f"{comparison['null_ll']:.2f}"),
+            ("delta_BIC", f"{comparison['delta_bic']:.2f}"),
+            ("learning_detected", comparison["learning_detected"]),
         ]
+        lines = [f"{type(self).__name__} Summary", "=" * 40]
+        lines += [f"  {label + ':':<23}{value}" for label, value in rows]
         return "\n".join(lines)
+
+    # --- Plotting ---
+
+    def _resolve_option_labels(self, option_labels):
+        if option_labels is None:
+            return [f"Option {i}" for i in range(self.n_options)]
+        return option_labels
+
+    def _plot_smoothed_values(self, ax, option_labels, title, legend_fontsize):
+        """Draw smoothed relative values with 95% bands on ``ax``."""
+        vals = np.array(self._smoother_result.smoothed_values)
+        covs = np.array(self._smoother_result.smoothed_covariances)
+        trials = np.arange(vals.shape[0])
+        for k in range(self.n_options - 1):
+            std = np.sqrt(covs[:, k, k])
+            ax.plot(trials, vals[:, k], label=option_labels[k + 1])
+            ax.fill_between(
+                trials, vals[:, k] - 1.96 * std, vals[:, k] + 1.96 * std,
+                alpha=0.2,
+            )
+        ax.axhline(0, color="gray", linestyle="--", alpha=0.5,
+                   label=f"{option_labels[0]} (ref)")
+        ax.set_ylabel("Relative value")
+        ax.set_title(title)
+        ax.legend(fontsize=legend_fontsize)
 
     def plot_values(self, observed_choices=None, option_labels=None, ax=None):
         """Plot smoothed option values and choice probabilities.
@@ -892,13 +1001,9 @@ class MultinomialChoiceModel(SGDFittableMixin):
 
         self._check_fitted("plot_values")
 
-        if option_labels is None:
-            option_labels = [f"Option {i}" for i in range(self.n_options)]
-
-        vals = np.array(self._smoother_result.smoothed_values)
-        covs = np.array(self._smoother_result.smoothed_covariances)
+        option_labels = self._resolve_option_labels(option_labels)
         probs = np.array(self.choice_probabilities())
-        trials = np.arange(vals.shape[0])
+        trials = np.arange(probs.shape[0])
 
         if ax is None:
             fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
@@ -907,18 +1012,9 @@ class MultinomialChoiceModel(SGDFittableMixin):
             fig = axes[0].figure
 
         # Top: latent values with CI
-        for k in range(self.n_options - 1):
-            std = np.sqrt(covs[:, k, k])
-            axes[0].plot(trials, vals[:, k], label=option_labels[k + 1])
-            axes[0].fill_between(
-                trials, vals[:, k] - 1.96 * std, vals[:, k] + 1.96 * std,
-                alpha=0.2,
-            )
-        axes[0].axhline(0, color="gray", linestyle="--", alpha=0.5,
-                         label=f"{option_labels[0]} (ref)")
-        axes[0].set_ylabel("Relative value")
-        axes[0].set_title("Smoothed Option Values")
-        axes[0].legend(fontsize=8)
+        self._plot_smoothed_values(
+            axes[0], option_labels, "Smoothed Option Values", 8
+        )
 
         # Bottom: choice probabilities (stacked area)
         axes[1].stackplot(trials, probs.T, labels=option_labels, alpha=0.7)
@@ -977,26 +1073,14 @@ class MultinomialChoiceModel(SGDFittableMixin):
 
         self._check_fitted("plot_summary")
 
+        option_labels = self._resolve_option_labels(option_labels)
+
         fig = plt.figure(figsize=(15, 4))
         gs = GridSpec(1, 3, figure=fig)
 
         # Panel 1: latent values (single axis)
         ax0 = fig.add_subplot(gs[0, 0])
-        vals = np.array(self._smoother_result.smoothed_values)
-        covs = np.array(self._smoother_result.smoothed_covariances)
-        if option_labels is None:
-            option_labels = [f"Option {i}" for i in range(self.n_options)]
-        trials = np.arange(vals.shape[0])
-        for k in range(self.n_options - 1):
-            std = np.sqrt(covs[:, k, k])
-            ax0.plot(trials, vals[:, k], label=option_labels[k + 1])
-            ax0.fill_between(trials, vals[:, k] - 1.96 * std,
-                             vals[:, k] + 1.96 * std, alpha=0.2)
-        ax0.axhline(0, color="gray", linestyle="--", alpha=0.5,
-                     label=f"{option_labels[0]} (ref)")
-        ax0.set_ylabel("Relative value")
-        ax0.set_title("Smoothed Values")
-        ax0.legend(fontsize=7)
+        self._plot_smoothed_values(ax0, option_labels, "Smoothed Values", 7)
 
         # Panel 2: convergence
         ax1 = fig.add_subplot(gs[0, 1])
@@ -1005,6 +1089,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         # Panel 3: choice probabilities
         ax2 = fig.add_subplot(gs[0, 2])
         probs = np.array(self.choice_probabilities())
+        trials = np.arange(probs.shape[0])
         ax2.stackplot(trials, probs.T, labels=option_labels, alpha=0.7)
         ax2.set_xlabel("Trial")
         ax2.set_ylabel("Probability")
