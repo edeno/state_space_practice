@@ -47,6 +47,7 @@ uv run mypy src/state_space_practice/
 ```
 src/state_space_practice/
 ├── kalman.py                  # Core Kalman filter/smoother, EM utilities
+├── em_driver.py               # Shared EM loop (run_em): convergence, rollback
 ├── switching_kalman.py        # Switching (SLDS) Kalman filter/smoother
 ├── point_process_kalman.py    # Point-process observation model (Laplace-EKF)
 ├── switching_point_process.py # Switching point-process model (in development)
