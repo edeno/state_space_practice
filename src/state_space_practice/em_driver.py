@@ -159,7 +159,13 @@ def run_em(
     def _restore_last_accepted() -> None:
         restore(last_accepted)
         if refresh_after_restore:
-            e_step()
+            refresh_ll = float(e_step())
+            if not np.isfinite(refresh_ll):
+                emit_warning(
+                    f"Re-running the E-step after restoring the previous "
+                    f"parameters gave a non-finite log-likelihood ({refresh_ll}); "
+                    f"the stored posteriors are not usable."
+                )
 
     def _report(iteration: int, ll: float) -> None:
         change = ll - log_likelihoods[-2] if iteration > 0 else math.nan
@@ -236,6 +242,12 @@ def run_em(
                         log_likelihoods.append(final_ll)
                     else:
                         _restore_last_accepted()
+                        emit_warning(
+                            f"Post-convergence M-step gave log-likelihood "
+                            f"{final_ll:.4f} (converged at "
+                            f"{log_likelihoods[-1]:.4f}); rolling back to the "
+                            f"converged E-step."
+                        )
                 log.info(f"Converged after {iteration + 1} iterations.")
                 converged = True
                 reached_max_iter = False
@@ -290,7 +302,13 @@ def run_em(
         )
         restore(best_state)
         restored_ll = float(e_step())
-        if np.isfinite(restored_ll) and restored_ll != log_likelihoods[-1]:
+        if not np.isfinite(restored_ll):
+            emit_warning(
+                f"Re-running the E-step under the restored best parameters gave "
+                f"a non-finite log-likelihood ({restored_ll}); the stored "
+                f"posteriors are not usable."
+            )
+        elif restored_ll != log_likelihoods[-1]:
             log_likelihoods.append(restored_ll)
 
     return EMResult(log_likelihoods, converged, reached_max_iter)

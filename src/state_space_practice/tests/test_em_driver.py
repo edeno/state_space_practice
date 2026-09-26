@@ -117,6 +117,25 @@ def test_continue_on_decrease_restores_best_state():
     assert model.posterior == ("posterior-for-params", 1)
 
 
+def test_track_best_warns_when_restored_e_step_is_nonfinite():
+    model = ScriptedModel([-100.0, -40.0, -60.0, -70.0, -70.0, np.nan])
+    warnings = []
+    result = model.run(
+        max_iter=4,
+        tol=1e-4,
+        stop_on_decrease=False,
+        track_best=True,
+        warn=warnings.append,
+    )
+
+    # The best state (params=1) was restored, but its re-run E-step is NaN:
+    # nothing non-finite enters the history and the failure is reported.
+    assert model.params == 1
+    assert model.e_calls == 6
+    assert result.log_likelihoods == [-100.0, -40.0, -60.0, -70.0, -70.0]
+    assert any("best" in w and "non-finite" in w for w in warnings)
+
+
 def test_require_increase_to_converge_rejects_converged_decrease():
     # -50 -> -50.005 is within tol (converged) but a decrease beyond
     # decrease_tol; it must not end EM.
@@ -198,6 +217,18 @@ def test_later_nonfinite_rolls_back(caplog):
     )
 
 
+def test_refresh_after_restore_warns_on_nonfinite_refresh():
+    model = ScriptedModel([-100.0, -50.0, -80.0, np.nan])
+    warnings = []
+    result = model.run(
+        max_iter=10, tol=1e-4, refresh_after_restore=True, warn=warnings.append
+    )
+
+    assert result.log_likelihoods == [-100.0, -50.0]
+    assert model.e_calls == 4  # the refresh E-step ran
+    assert any("non-finite" in w and "restor" in w for w in warnings)
+
+
 def test_refresh_after_restore_recomputes_posteriors():
     model = ScriptedModel([-100.0, -50.0, -80.0, -55.0])
     result = model.run(max_iter=10, tol=1e-4, refresh_after_restore=True)
@@ -248,6 +279,23 @@ def test_m_step_on_convergence_runs_extra_m_step():
     assert result.log_likelihoods == [-100.0, -50.0, -50.0, -45.0]
     assert model.params == 3
     assert model.posterior == ("posterior-for-params", 3)
+
+
+@pytest.mark.parametrize("bad_ll", [-80.0, np.nan])
+def test_m_step_on_convergence_rolls_back_and_warns(bad_ll):
+    model = ScriptedModel([-100.0, -50.0, -50.0, bad_ll])
+    warnings = []
+    result = model.run(
+        max_iter=10, tol=1e-4, m_step_on_convergence=True, warn=warnings.append
+    )
+
+    assert model.e_calls == 4  # the post-convergence E-step ran
+    assert result.converged
+    assert result.log_likelihoods == [-100.0, -50.0, -50.0]
+    # Back to the converged iterate, with the posterior of those parameters.
+    assert model.params == 2
+    assert model.posterior == ("posterior-for-params", 2)
+    assert len(warnings) == 1 and "rolling back" in warnings[0]
 
 
 def test_iteration_and_warning_hooks_receive_messages():
