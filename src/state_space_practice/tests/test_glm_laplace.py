@@ -262,7 +262,7 @@ class TestCarriedLineSearch:
             return delta, post_prec
 
         x = one_step_mean
-        n_shortened = 0
+        n_shortened = n_rejected = 0
         for _ in range(max_newton_iter):
             delta, _ = fisher_step(x)
             loss = neg_log_posterior(x)
@@ -274,10 +274,12 @@ class TestCarriedLineSearch:
             if improved:
                 n_shortened += alpha < 1.0
                 x = x + alpha * delta
+            else:
+                n_rejected += 1
         _, post_prec = fisher_step(x)
         post_cho = psd_cholesky(post_prec, diagonal_boost=diagonal_boost)
         post_cov = symmetrize(jax.scipy.linalg.cho_solve(post_cho, identity))
-        return x, post_cov, n_shortened
+        return x, post_cov, n_shortened, n_rejected
 
     @pytest.mark.parametrize("max_newton_iter", [2, 4])
     def test_poisson_matches_recomputing_reference(self, max_newton_iter):
@@ -285,7 +287,7 @@ class TestCarriedLineSearch:
         # backtracking shortens it and the carried loss / direction matter.
         cov = 100.0 * jnp.eye(3)
         spikes = jnp.array([40.0, 0.0, 55.0, 3.0])
-        ref_mean, ref_cov, n_shortened = self._reference(
+        ref_mean, ref_cov, n_shortened, _ = self._reference(
             _MEAN, cov, spikes, _eta, poisson_family(_DT), max_newton_iter
         )
         assert n_shortened > 0  # guard: the line search actually backtracked
@@ -303,7 +305,7 @@ class TestCarriedLineSearch:
     def test_bernoulli_matches_recomputing_reference(self, max_newton_iter):
         cov = 400.0 * jnp.eye(3)
         y = jnp.array([1.0, 1.0, 0.0, 1.0])
-        ref_mean, ref_cov, _ = self._reference(
+        ref_mean, ref_cov, _, _ = self._reference(
             _MEAN, cov, y, _eta, BERNOULLI_LOGIT_FAMILY, max_newton_iter
         )
         assert float(jnp.max(jnp.abs(ref_mean - _MEAN))) > 1.0  # guard: moved
@@ -316,6 +318,68 @@ class TestCarriedLineSearch:
         np.testing.assert_allclose(
             np.asarray(post_cov), np.asarray(ref_cov), rtol=1e-11, atol=1e-12
         )
+
+
+    # One neuron whose expected count saturates the ``max_log_count`` clip:
+    # beyond the clip the Poisson term is flat in x while the Fisher step
+    # still points further up (y exceeds the clipped count), so no step size
+    # decreases the objective and every backtracking search is rejected.
+    _C1 = jnp.array([[0.5, 0.3, 0.2]])
+
+    @classmethod
+    def _eta1(cls, x):
+        return cls._C1 @ x
+
+    def _check_rejected_steps(self, one_step_mean, max_log_count, expect_accepted):
+        cov = 100.0 * jnp.eye(3)
+        spikes = jnp.array([5.0])
+        max_newton_iter = 4
+        ref_mean, ref_cov, _, n_rejected = self._reference(
+            one_step_mean,
+            cov,
+            spikes,
+            self._eta1,
+            poisson_family(_DT, max_log_count=max_log_count),
+            max_newton_iter,
+        )
+        # guard: the rejected-step branch is exercised
+        assert n_rejected == max_newton_iter - expect_accepted
+        post_mean, post_cov, _ = _point_process_laplace_update(
+            one_step_mean,
+            cov,
+            spikes,
+            _DT,
+            self._eta1,
+            max_newton_iter=max_newton_iter,
+            max_log_count=max_log_count,
+        )
+        np.testing.assert_allclose(
+            np.asarray(post_mean), np.asarray(ref_mean), rtol=1e-12, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            np.asarray(post_cov), np.asarray(ref_cov), rtol=1e-11, atol=1e-12
+        )
+        return post_mean
+
+    def test_all_steps_rejected_keeps_the_start_point(self):
+        """Starting inside the saturated region, every iteration is rejected:
+        the point never moves (and so neither does the carried loss), and the
+        precision is the one at the start point."""
+        start = jnp.array([6.0, 0.0, 0.0])  # log count 0.70 > max_log_count 0
+        post_mean = self._check_rejected_steps(
+            start, max_log_count=0.0, expect_accepted=0
+        )
+        np.testing.assert_array_equal(np.asarray(post_mean), np.asarray(start))
+
+    def test_rejections_after_an_accepted_step_keep_the_accepted_point(self):
+        """The first (shortened) step is accepted and lands in the saturated
+        region; the remaining iterations are rejected and must keep the
+        accepted point, with the loss and direction carried from it."""
+        start = jnp.array([-2.0, 0.0, 0.0])  # log count -3.3 < max_log_count -2
+        post_mean = self._check_rejected_steps(
+            start, max_log_count=-2.0, expect_accepted=1
+        )
+        assert float(jnp.max(jnp.abs(post_mean - start))) > 1.0  # guard: moved
 
 
 class TestZeroNewtonIterations:
