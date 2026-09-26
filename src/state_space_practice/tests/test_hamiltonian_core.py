@@ -297,7 +297,10 @@ def test_hamiltonian_models_do_not_inherit_the_em_layer(model_cls):
 
 def _lfp_case(seed, sampling_freq):
     model = HamiltonianLFPModel(
-        n_oscillators=1, n_sources=2, sampling_freq=sampling_freq, hidden_dims=[4],
+        n_oscillators=1,
+        n_sources=2,
+        sampling_freq=sampling_freq,
+        hidden_dims=[4],
         seed=seed,
     )
     return model, (jax.random.normal(jax.random.PRNGKey(3), (6, 2)),)
@@ -305,7 +308,10 @@ def _lfp_case(seed, sampling_freq):
 
 def _spike_case(seed, sampling_freq):
     model = HamiltonianSpikeModel(
-        n_oscillators=1, n_sources=3, sampling_freq=sampling_freq, hidden_dims=[4],
+        n_oscillators=1,
+        n_sources=3,
+        sampling_freq=sampling_freq,
+        hidden_dims=[4],
         seed=seed,
     )
     return model, (jax.random.poisson(jax.random.PRNGKey(3), 0.5, (6, 3)),)
@@ -313,8 +319,12 @@ def _spike_case(seed, sampling_freq):
 
 def _joint_case(seed, sampling_freq):
     model = JointHamiltonianModel(
-        n_oscillators=1, n_lfp_sources=2, n_spike_sources=3,
-        sampling_freq=sampling_freq, hidden_dims=[4], seed=seed,
+        n_oscillators=1,
+        n_lfp_sources=2,
+        n_spike_sources=3,
+        sampling_freq=sampling_freq,
+        hidden_dims=[4],
+        seed=seed,
     )
     k1, k2 = jax.random.split(jax.random.PRNGKey(3))
     return model, (
@@ -349,3 +359,37 @@ def test_jitted_cores_are_shared_across_model_instances(make_case):
     run(*make_case(seed=0, sampling_freq=100.0))
     assert hamiltonian_ekf_filter._cache_size() == n_filter + 1
     assert hamiltonian_ekf_smoother._cache_size() == n_smooth + 1
+
+
+@pytest.mark.parametrize("make_case", [_lfp_case, _spike_case, _joint_case])
+def test_single_regime_models_reject_discrete_state_decoding(make_case):
+    """A single-regime model has no discrete-state posterior to decode, so after
+    a completed fit decode/predict_proba must say that (and point at the
+    switching model) rather than ask for a fit that already happened."""
+    model, data = make_case(seed=0, sampling_freq=200.0)
+    model._finalize_sgd(*data)
+    # Guard: the fit's finalize step actually populated the smoother output.
+    assert bool(jnp.all(jnp.isfinite(model.smoothed_means_)))
+
+    for method in (model.decode, model.predict_proba):
+        with pytest.raises(NotImplementedError, match="SwitchingHamiltonianJointModel"):
+            method()
+
+
+def test_unfitted_decode_message_does_not_name_a_missing_fit_method():
+    """The Hamiltonian family has no ``fit``; the not-yet-fitted error inherited
+    from the parameter base must not tell the user to call it."""
+    model = SwitchingHamiltonianJointModel(
+        n_oscillators=1,
+        n_discrete_states=2,
+        n_lfp_sources=2,
+        n_spike_sources=3,
+        sampling_freq=100.0,
+        hidden_dims=[4],
+        seed=0,
+    )
+    assert not hasattr(model, "fit")
+    for method in (model.decode, model.predict_proba):
+        with pytest.raises(RuntimeError, match="No smoother posteriors") as excinfo:
+            method()
+        assert "fit()" not in str(excinfo.value)

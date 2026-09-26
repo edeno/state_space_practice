@@ -401,6 +401,7 @@ def switching_hamiltonian_smoother(
 class SwitchingHamiltonianJointModel(JointHamiltonianModel):
     """Switching Model with multiple Hamiltonian energy landscapes."""
 
+    _has_discrete_states = True
     _sgd_param_attrs = {
         **JointHamiltonianModel._sgd_param_attrs,
         "init_mean": "init_mean",

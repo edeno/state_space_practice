@@ -477,6 +477,11 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
     #: Readout name passed to the module-level jitted cores.
     _observation_model: ClassVar[str]
 
+    #: Whether the model infers a discrete-state posterior. The single-regime
+    #: models have one dynamical regime and nothing for ``decode`` /
+    #: ``predict_proba`` to report; only the switching model sets this.
+    _has_discrete_states: ClassVar[bool] = False
+
     _sgd_param_attrs = {"mlp": "mlp_params", "omega": "omega"}
 
     def __init__(
@@ -519,6 +524,22 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
 
         _, x_traj = jax.lax.scan(scan_fn, params["init_mean"], None, length=n_time)
         return cast(Array, x_traj)
+
+    def _discrete_state_posterior(self, caller: str) -> Array:
+        """Reject discrete-state decoding on a single-regime model.
+
+        Raises
+        ------
+        NotImplementedError
+            If the model has a single dynamical regime.
+        """
+        if not self._has_discrete_states:
+            raise NotImplementedError(
+                f"{type(self).__name__} has a single dynamical regime and no "
+                f"discrete-state posterior, so {caller}() is undefined. Use "
+                "SwitchingHamiltonianJointModel to infer regime switches."
+            )
+        return super()._discrete_state_posterior(caller)
 
     def _filter_jit(
         self, observations: Any, params: dict[str, Any]

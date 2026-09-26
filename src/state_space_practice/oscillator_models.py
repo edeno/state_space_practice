@@ -238,17 +238,9 @@ class OscillatorParameterBase:
         Raises
         ------
         RuntimeError
-            If called before fit() or fit_sgd().
+            If the model has not been fitted successfully.
         """
-        if (
-            not hasattr(self, "smoother_discrete_state_prob")
-            or self.smoother_discrete_state_prob is None
-        ):
-            raise RuntimeError(
-                "No smoother posteriors available. Call fit() or fit_sgd() and "
-                "ensure it produced a finite log-likelihood before decode()."
-            )
-        return jnp.argmax(self.smoother_discrete_state_prob, axis=1)
+        return jnp.argmax(self._discrete_state_posterior("decode"), axis=1)
 
     def predict_proba(self) -> jax.Array:
         """Return smoothed discrete state probabilities.
@@ -261,16 +253,31 @@ class OscillatorParameterBase:
         Raises
         ------
         RuntimeError
-            If called before fit() or fit_sgd().
+            If the model has not been fitted successfully.
+        """
+        return self._discrete_state_posterior("predict_proba")
+
+    def _discrete_state_posterior(self, caller: str) -> jax.Array:
+        """Return ``smoother_discrete_state_prob`` or raise if it is unset.
+
+        Parameters
+        ----------
+        caller : str
+            Public method name quoted in the error message.
+
+        Returns
+        -------
+        jax.Array, shape (n_time, n_discrete_states)
         """
         if (
             not hasattr(self, "smoother_discrete_state_prob")
             or self.smoother_discrete_state_prob is None
         ):
+            # Worded without naming a fitting method: the EM models fit with
+            # ``fit`` / ``fit_sgd``, the Hamiltonian family with ``fit_sgd`` only.
             raise RuntimeError(
-                "No smoother posteriors available. Call fit() or fit_sgd() and "
-                "ensure it produced a finite log-likelihood before "
-                "predict_proba()."
+                "No smoother posteriors available. Fit the model first and "
+                f"ensure the fit produced a finite log-likelihood before {caller}()."
             )
         return self.smoother_discrete_state_prob
 
@@ -993,6 +1000,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         if not skip_init:
             self._initialize_parameters(key)
             self._warm_initialize_states(observations)
+
         def _m_step_and_project() -> None:
             self._m_step(observations)
             self._project_parameters()
