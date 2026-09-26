@@ -1615,9 +1615,21 @@ def _cast_like_carry(
     promotes float32 parameters to float64. ``lax.scan`` requires the carry
     dtype to be invariant, so each step's result is cast back: the solve runs
     in the promoted precision and the parameters keep their input dtype. For
-    float64 parameters the cast is a no-op.
+    float64 parameters the cast is a no-op. The carry must already be
+    floating point (see :func:`_as_float`), or the cast would truncate.
     """
     return new_baselines.astype(baselines.dtype), new_weights.astype(weights.dtype)
+
+
+def _as_float(x: ArrayLike) -> Array:
+    """Promote an integer or boolean array to the default float dtype.
+
+    Floating-point inputs keep their dtype, so float32 parameters stay float32.
+    """
+    x = jnp.asarray(x)
+    if jnp.issubdtype(x.dtype, jnp.inexact):
+        return x
+    return x.astype(jnp.result_type(float))
 
 
 @functools.partial(jax.jit, static_argnames=("max_iter",))
@@ -1776,8 +1788,8 @@ def update_spike_glm_params(
             )
 
     # Initialize with current parameters
-    baselines = current_params.baseline
-    weights = current_params.weights
+    baselines = _as_float(current_params.baseline)
+    weights = _as_float(current_params.weights)
 
     if use_second_order:
         # Newton iterations for all neurons (second-order): one jitted scan
@@ -1866,8 +1878,8 @@ def update_spike_glm_params_mixture(
             f"expected {(n_time, n_states)}."
         )
 
-    baselines = current_params.baseline
-    weights = current_params.weights
+    baselines = _as_float(current_params.baseline)
+    weights = _as_float(current_params.weights)
 
     # A zero-centered prior is the neutral default for baseline_prior.
     if baseline_prior is None:

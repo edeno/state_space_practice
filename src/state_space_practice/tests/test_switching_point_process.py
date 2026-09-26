@@ -3442,6 +3442,31 @@ class TestSecondOrderNewtonScan:
             updated.weights, reference.weights, rtol=1e-4, atol=1e-5
         )
 
+    @pytest.mark.parametrize("method", ["second_order", "mixture"])
+    def test_integer_params_are_promoted_not_truncated(self, method: str) -> None:
+        """Integer initial parameters give the float64 update, not a
+        truncated one: the carry dtype is fixed only after promoting ints."""
+        pb = self._problem()
+        to_f64 = lambda x: jnp.asarray(x, dtype=jnp.float64)  # noqa: E731
+        current_int = SpikeObsParams(
+            baseline=jnp.zeros_like(pb["current"].baseline, dtype=jnp.int32),
+            weights=jnp.zeros_like(pb["current"].weights, dtype=jnp.int32),
+        )
+        current_f64 = SpikeObsParams(
+            baseline=to_f64(current_int.baseline),
+            weights=to_f64(current_int.weights),
+        )
+
+        updated = self._run_update(pb, method, current_int, to_f64)
+        reference = self._run_update(pb, method, current_f64, to_f64)
+
+        assert jnp.issubdtype(updated.baseline.dtype, jnp.floating)
+        # Guard: the float update moves off the integer lattice, so a
+        # truncating carry could not reproduce it.
+        assert not np.allclose(reference.baseline, np.round(reference.baseline))
+        np.testing.assert_allclose(updated.baseline, reference.baseline, rtol=1e-12)
+        np.testing.assert_allclose(updated.weights, reference.weights, rtol=1e-12)
+
 
 class TestSecondOrderClippedWarmStart:
     """Newton M-step must converge from warm starts with a large log-rate.
