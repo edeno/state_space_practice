@@ -131,6 +131,20 @@ def run_em(
     -------
     EMResult
     """
+    if max_iter < 1:
+        raise ValueError(f"max_iter must be at least 1, got {max_iter}.")
+    if on_first_nonfinite not in ("break", "raise", "clear"):
+        raise ValueError(
+            "on_first_nonfinite must be 'break', 'raise' or 'clear', got "
+            f"{on_first_nonfinite!r}."
+        )
+    if (on_first_nonfinite == "clear") != (clear_state is not None):
+        raise ValueError(
+            "clear_state must be given exactly when on_first_nonfinite='clear' "
+            f"(got on_first_nonfinite={on_first_nonfinite!r}, clear_state="
+            f"{'None' if clear_state is None else 'a callable'})."
+        )
+
     log = logger if logger is not None else _logger
     emit_warning = warn if warn is not None else log.warning
     decrease_tolerance = tol if decrease_tol is None else decrease_tol
@@ -170,7 +184,7 @@ def run_em(
                         f"Non-finite log-likelihood at iteration {iteration + 1}: "
                         f"{bad_ll}. This may indicate numerical instability."
                     )
-                if on_first_nonfinite == "clear" and clear_state is not None:
+                if clear_state is not None:
                     clear_state()
                 emit_warning(
                     f"Non-finite log-likelihood ({bad_ll}) at iteration "

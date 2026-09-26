@@ -103,7 +103,10 @@ def test_continue_on_decrease_restores_best_state():
 def test_first_nonfinite_policies(policy):
     model = ScriptedModel([np.nan])
     result = model.run(
-        max_iter=3, tol=1e-4, on_first_nonfinite=policy, clear_state=model.clear
+        max_iter=3,
+        tol=1e-4,
+        on_first_nonfinite=policy,
+        clear_state=model.clear if policy == "clear" else None,
     )
 
     assert result.log_likelihoods == []  # never a NaN in the history
@@ -115,6 +118,24 @@ def test_first_nonfinite_raise_policy():
     model = ScriptedModel([np.inf])
     with pytest.raises(ValueError, match="Non-finite"):
         model.run(max_iter=3, tol=1e-4, on_first_nonfinite="raise")
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"on_first_nonfinite": "clear"}, "clear_state"),
+        ({"on_first_nonfinite": "break", "clear_state": lambda: None}, "clear_state"),
+        ({"on_first_nonfinite": "raise", "clear_state": lambda: None}, "clear_state"),
+        ({"on_first_nonfinite": "ignore"}, "on_first_nonfinite"),
+        ({"max_iter": 0}, "max_iter"),
+    ],
+)
+def test_invalid_arguments_raise_before_any_e_step(kwargs, match):
+    model = ScriptedModel([-100.0, -50.0])
+    run_kwargs = {"max_iter": 3, "tol": 1e-4, **kwargs}
+    with pytest.raises(ValueError, match=match):
+        model.run(**run_kwargs)
+    assert model.e_calls == 0
 
 
 def test_later_nonfinite_rolls_back(caplog):
