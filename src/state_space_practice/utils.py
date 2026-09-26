@@ -1,3 +1,5 @@
+import functools
+import logging
 import operator
 import warnings
 
@@ -8,6 +10,8 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 from scipy.optimize import linear_sum_assignment
+
+logger = logging.getLogger(__name__)
 
 # Type alias for numeric values (scalars, numpy arrays, JAX arrays)
 Numeric = float | int | np.ndarray | jax.Array
@@ -263,6 +267,204 @@ def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
 def stabilize_covariance(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
     """Symmetrize a covariance-like matrix and project it to the PSD cone."""
     return project_psd(symmetrize(cov), min_eigenvalue=min_eigenvalue)
+
+
+#: Default relative eigenvalue floor for M-step covariance projections: an
+#: eigenvalue below ``PSD_RELATIVE_FLOOR * max|eigenvalue|`` is raised to it.
+PSD_RELATIVE_FLOOR = 1e-8
+#: Absolute floor under the relative one; only binds for an (all-)zero matrix.
+PSD_ABSOLUTE_FLOOR = 1e-30
+
+
+def relative_psd_floor(
+    eigenvalues: Array,
+    relative_floor: float = PSD_RELATIVE_FLOOR,
+    absolute_floor: float = PSD_ABSOLUTE_FLOOR,
+) -> Array:
+    """Scale-relative lower bound for the eigenvalues of a covariance.
+
+    Returns ``max(absolute_floor, rel * max|eigenvalues|)`` with
+    ``rel = max(relative_floor, 10 * eps)`` for the dtype, so the floor
+    scales with the matrix: a covariance in volts (entries ~1e-10) is not
+    clamped to the same absolute value as one in centimetres. The ``10 *
+    eps`` term keeps the floor above the roundoff of an eigen-reconstruction
+    in low precision.
+
+    Parameters
+    ----------
+    eigenvalues : Array, shape (..., n)
+        Eigenvalues (or the diagonal of a diagonal covariance).
+    relative_floor : float, default=PSD_RELATIVE_FLOOR
+        Floor as a fraction of the largest eigenvalue magnitude.
+    absolute_floor : float, default=PSD_ABSOLUTE_FLOOR
+        Lower bound on the floor itself (binds only for a ~zero matrix).
+
+    Returns
+    -------
+    floor : Array, shape (...)
+        The eigenvalue floor for each matrix.
+    """
+    eigenvalues = jnp.asarray(eigenvalues)
+    dtype = (
+        eigenvalues.dtype
+        if jnp.issubdtype(eigenvalues.dtype, jnp.floating)
+        else jnp.result_type(float)
+    )
+    rel = max(float(relative_floor), 10.0 * float(jnp.finfo(dtype).eps))
+    scale = jnp.max(jnp.abs(eigenvalues), axis=-1)
+    return jnp.maximum(jnp.asarray(absolute_floor, dtype=dtype), rel * scale)
+
+
+def _log_floored_eigenvalues(n_floored: Array, floor: Array, *, name: str) -> None:
+    """Host-side logger for :func:`project_psd_relative` (via debug callback)."""
+    n = int(np.sum(np.asarray(n_floored)))
+    if n > 0:
+        logger.warning(
+            "%s: raised %d eigenvalue(s) to the scale-relative PSD floor "
+            "%.3g. The estimate is (numerically) rank deficient; check for "
+            "a degenerate latent dimension or an over-parameterised model.",
+            name,
+            n,
+            float(np.min(np.asarray(floor))),
+        )
+
+
+def warn_if_floored(n_floored: Array, floor: Array, name: str) -> None:
+    """Log (host side, jit-safe) that ``n_floored`` eigenvalues were floored.
+
+    Emits a ``logger.warning`` from :mod:`state_space_practice.utils` when
+    ``n_floored > 0``. Works eagerly and inside ``jax.jit`` / ``lax.scan``
+    (through :func:`jax.debug.callback`), so jitted M-steps can report a
+    projection without a host sync of their own.
+
+    Parameters
+    ----------
+    n_floored : Array
+        Number of eigenvalues (or variances) that were raised to the floor.
+    floor : Array
+        The floor that was applied.
+    name : str
+        Name of the quantity, used in the log message.
+    """
+    jax.debug.callback(
+        functools.partial(_log_floored_eigenvalues, name=name), n_floored, floor
+    )
+
+
+def clip_eigenvalues_relative(
+    cov: Array,
+    relative_floor: float = PSD_RELATIVE_FLOOR,
+    absolute_floor: float = PSD_ABSOLUTE_FLOOR,
+) -> tuple[Array, Array]:
+    """Clip eigenvalues at a relative floor and count how many were raised.
+
+    The silent core of :func:`project_psd_relative`, for callers that report
+    the count themselves (e.g. accumulated over a ``lax.scan``).
+
+    Parameters
+    ----------
+    cov : Array, shape (n, n)
+        Covariance-like matrix; only its symmetric part is used.
+    relative_floor, absolute_floor : float
+        See :func:`relative_psd_floor`.
+
+    Returns
+    -------
+    projected : Array, shape (n, n)
+        Symmetric matrix whose eigenvalues are all ``>= floor``.
+    n_floored : Array
+        Number of eigenvalues that were raised to the floor (int scalar).
+    """
+    projected, n_floored, _ = _clip_eigenvalues_relative(
+        cov, relative_floor, absolute_floor
+    )
+    return projected, n_floored
+
+
+def _clip_eigenvalues_relative(
+    cov: Array, relative_floor: float, absolute_floor: float
+) -> tuple[Array, Array, Array]:
+    """:func:`clip_eigenvalues_relative` that also returns the floor used."""
+    cov = symmetrize(jnp.asarray(cov))
+    eigvals, eigvecs = jnp.linalg.eigh(cov)
+    floor = relative_psd_floor(eigvals, relative_floor, absolute_floor)
+    floored = eigvals < floor
+    eigvals = jnp.where(floored, floor, eigvals)
+    projected = symmetrize((eigvecs * eigvals[None, :]) @ eigvecs.T)
+    return projected, jnp.sum(floored, dtype=jnp.int32), floor
+
+
+def project_psd_relative(
+    cov: Array,
+    relative_floor: float = PSD_RELATIVE_FLOOR,
+    absolute_floor: float = PSD_ABSOLUTE_FLOOR,
+    name: str = "covariance",
+    warn: bool = True,
+) -> Array:
+    """Symmetrize a covariance and clip its eigenvalues at a relative floor.
+
+    The scale-aware replacement for ``stabilize_covariance(cov,
+    min_eigenvalue=<absolute>)`` in the EM M-steps: eigenvalues below
+    :func:`relative_psd_floor` of the matrix are raised to it, the rest are
+    left untouched, so a well-conditioned covariance passes through exactly
+    (up to the eigen-reconstruction roundoff).
+
+    Parameters
+    ----------
+    cov : Array, shape (n, n)
+        Covariance estimate; only its symmetric part is used.
+    relative_floor, absolute_floor : float
+        See :func:`relative_psd_floor`.
+    name : str, default="covariance"
+        Name used in the log message.
+    warn : bool, default=True
+        If True, log a warning (see :func:`warn_if_floored`) whenever the
+        projection changes an eigenvalue.
+
+    Returns
+    -------
+    projected : Array, shape (n, n)
+        Symmetric matrix whose eigenvalues are all ``>= floor``.
+    """
+    projected, n_floored, floor = _clip_eigenvalues_relative(
+        cov, relative_floor, absolute_floor
+    )
+    if warn:
+        warn_if_floored(n_floored, floor, name)
+    return projected
+
+
+def floor_variances_relative(
+    variances: Array,
+    relative_floor: float = PSD_RELATIVE_FLOOR,
+    absolute_floor: float = PSD_ABSOLUTE_FLOOR,
+    name: str = "variances",
+    warn: bool = True,
+) -> Array:
+    """Diagonal-covariance counterpart of :func:`project_psd_relative`.
+
+    Parameters
+    ----------
+    variances : Array, shape (n,)
+        Diagonal of a diagonal covariance.
+    relative_floor, absolute_floor : float
+        See :func:`relative_psd_floor`.
+    name : str, default="variances"
+        Name used in the log message.
+    warn : bool, default=True
+        If True, log a warning when any variance is raised to the floor.
+
+    Returns
+    -------
+    floored : Array, shape (n,)
+        ``maximum(variances, floor)``.
+    """
+    variances = jnp.asarray(variances)
+    floor = relative_psd_floor(variances, relative_floor, absolute_floor)
+    floored = variances < floor
+    if warn:
+        warn_if_floored(jnp.sum(floored, dtype=jnp.int32), floor, name)
+    return jnp.where(floored, floor, variances)
 
 
 def shift_to_psd(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
@@ -799,10 +1001,17 @@ def _validate_filter_numerics(
     This helper runs at the top of each public entry point (``fit``,
     ``fit_sgd``, or the public filter/smoother wrappers) once per call,
     then inner call sites pass ``validate_inputs=False`` to skip
-    re-validation. The ``eigvalsh → float(...)`` conversion used here
-    is incompatible with ``jax.jit`` tracing, so inner calls must bypass
-    the check entirely.
+    re-validation. The ``eigvalsh → float(...)`` conversion used here needs
+    concrete values, so the whole check is skipped when any covariance is a
+    JAX tracer (the public filter called under ``jax.jit`` / ``jax.grad`` /
+    ``jax.vmap``): a traced value cannot be inspected host-side, and raising
+    would make the public filters untraceable with their default arguments.
+    Callers that trace other inputs must skip the call themselves, since any
+    ``jnp`` operation inside an active trace is staged (see
+    ``contains_tracer`` checks in the public filters).
     """
+    if contains_tracer(init_covariance, measurement_cov, process_cov):
+        return
     validate_covariance(
         init_covariance,
         name="init_covariance",

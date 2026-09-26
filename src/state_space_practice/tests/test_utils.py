@@ -6,13 +6,18 @@ import numpy as np
 import pytest
 
 from state_space_practice.utils import (
+    _validate_filter_numerics,
     check_converged,
+    clip_eigenvalues_relative,
     compute_state_overlap,
     divide_safe,
+    floor_variances_relative,
     hmm_viterbi,
     make_discrete_transition_matrix,
     project_psd,
+    project_psd_relative,
     psd_solve,
+    relative_psd_floor,
     safe_log,
     scale_likelihood,
     shift_to_psd,
@@ -675,3 +680,75 @@ class TestStabilizeTransitionMatrix:
         assert float(spectral_radius(A)) < 0.99
         stabilized = stabilize_transition_matrix(A, max_spectral_radius=0.99)
         np.testing.assert_array_equal(np.asarray(stabilized), np.asarray(A))
+
+
+
+class TestRelativePsdFloor:
+    """Scale-relative eigenvalue floors for M-step covariance projections."""
+
+    @pytest.mark.parametrize("scale", [1e-12, 1.0, 1e8])
+    def test_floor_scales_with_matrix(self, scale) -> None:
+        eigs = jnp.array([1.0, 1e-3, -1e-20]) * scale
+        np.testing.assert_allclose(relative_psd_floor(eigs), 1e-8 * scale, rtol=1e-12)
+
+    def test_zero_matrix_uses_absolute_floor(self) -> None:
+        assert float(relative_psd_floor(jnp.zeros(3))) == pytest.approx(1e-30)
+
+    @pytest.mark.parametrize("scale", [1e-10, 1.0, 1e6])
+    def test_well_conditioned_matrix_passes_through(self, scale) -> None:
+        cov = jnp.array([[2.0, 0.5], [0.5, 1.0]]) * scale
+        projected, n_floored = clip_eigenvalues_relative(cov)
+        np.testing.assert_allclose(projected, cov, rtol=1e-12)
+        assert int(n_floored) == 0
+
+    def test_small_scale_matrix_is_not_clamped_to_an_absolute_floor(self) -> None:
+        """A covariance in volts^2 (~1e-10) keeps its value; the former
+        ``stabilize_covariance(min_eigenvalue=1e-8)`` returned 1e-8 I."""
+        cov = jnp.eye(2) * 1e-10
+        np.testing.assert_allclose(project_psd_relative(cov), cov, rtol=1e-12)
+        # guard: the absolute floor really clamps this matrix.
+        np.testing.assert_allclose(stabilize_covariance(cov), jnp.eye(2) * 1e-8)
+
+    def test_indefinite_matrix_is_floored_and_logged(self, caplog) -> None:
+        cov = jnp.array([[1.0, 0.0], [0.0, -0.5]])
+        with caplog.at_level("WARNING", logger="state_space_practice.utils"):
+            projected = project_psd_relative(cov, name="test_cov")
+            jax.effects_barrier()
+        eigs = np.linalg.eigvalsh(np.asarray(projected))
+        np.testing.assert_allclose(eigs, [1e-8, 1.0], rtol=1e-6)
+        assert any("test_cov" in r.getMessage() for r in caplog.records)
+
+    def test_no_log_when_nothing_changes(self, caplog) -> None:
+        with caplog.at_level("WARNING", logger="state_space_practice.utils"):
+            project_psd_relative(jnp.eye(2), name="test_cov")
+            jax.effects_barrier()
+        assert not caplog.records
+
+    def test_logging_works_under_jit(self, caplog) -> None:
+        with caplog.at_level("WARNING", logger="state_space_practice.utils"):
+            out = jax.jit(lambda c: project_psd_relative(c, name="jit_cov"))(
+                jnp.diag(jnp.array([1.0, 0.0]))
+            )
+            jax.block_until_ready(out)
+            jax.effects_barrier()
+        assert any("jit_cov" in r.getMessage() for r in caplog.records)
+
+    def test_floor_variances_relative(self) -> None:
+        v = jnp.array([1e-6, 1e-20, 2e-6])
+        np.testing.assert_allclose(
+            floor_variances_relative(v, warn=False), [1e-6, 2e-14, 2e-6]
+        )
+
+
+class TestValidateFilterNumericsTracing:
+    def test_skipped_under_tracing(self) -> None:
+        """Host-side checks cannot inspect a tracer; they are skipped so the
+        public filters stay traceable (an eager call still validates)."""
+
+        def f(cov):
+            _validate_filter_numerics(cov, n_time=10)
+            return jnp.sum(cov)
+
+        assert float(jax.jit(f)(-jnp.eye(2))) == -2.0
+        with pytest.raises(ValueError, match="not positive definite"):
+            f(-jnp.eye(2))
