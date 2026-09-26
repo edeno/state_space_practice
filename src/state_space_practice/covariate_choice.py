@@ -736,7 +736,11 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         max_iter : int
             Maximum EM iterations.
         tolerance : float
-            Convergence tolerance on relative log-likelihood change.
+            Convergence tolerance on the relative log-likelihood change
+            ``|LL_k - LL_{k-1}| / |LL_{k-1}| < tolerance`` (inherited from
+            :meth:`MultinomialChoiceModel.fit`; normalized by the previous LL,
+            not by the two-iterate average used by
+            :func:`state_space_practice.utils.check_converged`).
         verbose : bool
             Print progress each iteration.
         beta_grid : ArrayLike or None

@@ -638,7 +638,11 @@ class MultinomialChoiceModel(SGDFittableMixin):
         max_iter : int
             Maximum EM iterations.
         tolerance : float
-            Convergence tolerance on relative log-likelihood change.
+            Convergence tolerance on the relative log-likelihood change
+            ``|LL_k - LL_{k-1}| / |LL_{k-1}| < tolerance`` (the absolute change
+            ``|LL_k - LL_{k-1}|`` when ``LL_{k-1} == 0``). This normalizes by the
+            previous LL only, not by the average of the two as
+            :func:`state_space_practice.utils.check_converged` does.
         verbose : bool
             Print progress each iteration.
         beta_grid : ArrayLike or None

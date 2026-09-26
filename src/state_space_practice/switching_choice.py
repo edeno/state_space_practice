@@ -801,7 +801,13 @@ class SwitchingChoiceModel(SGDFittableMixin):
         covariates : ArrayLike or None, shape (n_trials, d_dyn)
         obs_covariates : ArrayLike or None, shape (n_trials, d_obs)
         max_iter : int
+            Maximum EM iterations.
         tolerance : float
+            Convergence threshold on the *absolute* log-likelihood change
+            between successive E-steps, ``|LL_k - LL_{k-1}| < tolerance``
+            (nats; not the relative criterion of
+            :func:`state_space_practice.utils.check_converged`), so it should
+            be scaled with the number of trials.
 
         Returns
         -------

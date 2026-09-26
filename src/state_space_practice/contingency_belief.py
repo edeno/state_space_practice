@@ -1168,7 +1168,14 @@ class ContingencyBeliefModel(SGDFittableMixin):
         rewards : ArrayLike, shape (n_trials,)
         transition_covariates : ArrayLike or None, shape (n_trials, d_h)
         max_iter : int
+            Maximum EM iterations.
         tolerance : float
+            Convergence threshold on the *absolute* log-likelihood change
+            between successive E-steps, ``|LL_k - LL_{k-1}| < tolerance``
+            (nats; not the relative criterion of
+            :func:`state_space_practice.utils.check_converged`, which is only
+            used to accept or roll back the final M-step), so it should be
+            scaled with the number of trials.
 
         Returns
         -------
