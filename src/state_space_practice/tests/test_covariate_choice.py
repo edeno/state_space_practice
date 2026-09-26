@@ -1,10 +1,8 @@
 """Tests for covariate-driven choice model."""
 
-import numpy as np
-
 import jax
 import jax.numpy as jnp
-
+import numpy as np
 import pytest
 
 from state_space_practice.covariate_choice import (
@@ -1397,12 +1395,16 @@ class TestSGDFitting:
         sgd_logger = "state_space_practice.sgd_fitting"
         with caplog.at_level(logging.INFO, logger=sgd_logger):
             CovariateChoiceModel(n_options=3).fit_sgd(
-                choices, num_steps=15, verbose=False,
+                choices,
+                num_steps=15,
+                verbose=False,
             )
         assert "SGD step" not in caplog.text
         with caplog.at_level(logging.INFO, logger=sgd_logger):
             CovariateChoiceModel(n_options=3).fit_sgd(
-                choices, num_steps=15, verbose=True,
+                choices,
+                num_steps=15,
+                verbose=True,
             )
         assert "SGD step 0" in caplog.text
 

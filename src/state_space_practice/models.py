@@ -8,12 +8,12 @@ import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.point_process_kalman import (
-    get_confidence_interval as _get_confidence_interval,
-)
 from state_space_practice.point_process_kalman import (  # noqa: F401 -- re-exports
     _safe_expected_count,
     steepest_descent_point_process_filter,
+)
+from state_space_practice.point_process_kalman import (
+    get_confidence_interval as _get_confidence_interval,
 )
 from state_space_practice.utils import (
     clip_eigenvalues_relative,

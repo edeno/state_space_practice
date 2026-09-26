@@ -42,6 +42,7 @@ import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.em_driver import run_em
 from state_space_practice.exceptions import NotFittedError
 from state_space_practice.oscillator_utils import (
     DirectedInfluenceDynamicsMixin,
@@ -64,7 +65,6 @@ from state_space_practice.parameter_transforms import (
     STOCHASTIC_ROW,
     UNCONSTRAINED,
 )
-from state_space_practice.em_driver import run_em
 from state_space_practice.sgd_fitting import (
     SGDFittableMixin,
     reconstruct_per_state_array,

@@ -1,5 +1,4 @@
 # ruff: noqa: E402
-from typing import Tuple
 
 import jax
 
@@ -189,7 +188,7 @@ def test_kalman_filter_values() -> None:
 
 
 @pytest.fixture(scope="module")
-def kalman_m_step_test_data() -> Tuple[Array, Array, Array, Array, Array, Array, Array]:
+def kalman_m_step_test_data() -> tuple[Array, Array, Array, Array, Array, Array, Array]:
     """Provides parameters and simulated data for M-step testing."""
     key = random.PRNGKey(42)
     n_time = 200
@@ -286,7 +285,7 @@ def test_kalman_maximization_step_rejects_one_timestep() -> None:
 
 
 @pytest.fixture(scope="module")
-def multi_dim_model() -> Tuple[
+def multi_dim_model() -> tuple[
     Array,
     Array,
     Array,

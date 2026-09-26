@@ -65,13 +65,13 @@ import scipy.special
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.em_driver import run_em
 from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.parameter_transforms import (
     POSITIVE,
     UNCONSTRAINED,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.em_driver import run_em
 from state_space_practice.utils import validate_count_array
 
 logger = logging.getLogger(__name__)

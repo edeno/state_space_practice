@@ -12,7 +12,6 @@ import jax
 # Enable 64-bit precision for tests that require it.
 jax.config.update("jax_enable_x64", True)
 
-from typing import Tuple
 
 import jax.numpy as jnp
 import numpy as np
@@ -346,7 +345,7 @@ def test_process_covariance_stats_use_the_fixed_transition_matrix() -> None:
 
 
 @pytest.fixture(scope="module")
-def simple_skf_model() -> Tuple[
+def simple_skf_model() -> tuple[
     Array, Array, Array, Array, Array, Array, Array, Array, Array
 ]:
     """
@@ -392,7 +391,7 @@ def simple_skf_model() -> Tuple[
     key, s_key, x_key, y_key = random.split(key, 4)
 
     s_t = [int(random.choice(s_key, jnp.arange(n_discrete_states), p=init_prob))]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         s_t.append(
             int(random.choice(subkey, jnp.arange(n_discrete_states), p=Z[s_t[-1]]))
@@ -426,7 +425,7 @@ def simple_skf_model() -> Tuple[
 
 
 @pytest.fixture(scope="module")
-def simple_2_state_params() -> Tuple[Array, Array, Array, Array, int, int, int]:
+def simple_2_state_params() -> tuple[Array, Array, Array, Array, int, int, int]:
     """
     Provides parameters for a simple 1D, 2-state model without data.
 
@@ -2144,7 +2143,7 @@ def test_em_monotonic_distinguishable_states() -> None:
     key, s_key = random.split(key)
 
     true_states_list: list[int] = [0]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         true_states_list.append(
             int(random.choice(subkey, jnp.arange(2), p=Z_true[true_states_list[-1]]))
@@ -2286,7 +2285,7 @@ def test_em_increases_log_likelihood(simple_skf_model: tuple) -> None:
     current_R = R
     current_Z = Z
 
-    for iteration in range(n_iterations):
+    for _iteration in range(n_iterations):
         # E-step: Run filter and smoother
         (
             filter_mean,
@@ -2511,7 +2510,7 @@ def test_elbo_monotonic_two_states() -> None:
     key, s_key = random.split(key)
 
     true_states_list: list[int] = [0]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         true_states_list.append(
             int(random.choice(subkey, jnp.arange(2), p=Z_true[true_states_list[-1]]))
@@ -3143,7 +3142,7 @@ def test_discrete_state_recovery_easy() -> None:
     # Simulate data
     key, s_key, x_key, y_key = random.split(key, 4)
     s_t = [int(random.choice(s_key, jnp.arange(n_discrete_states), p=init_prob))]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         s_t.append(
             int(random.choice(subkey, jnp.arange(n_discrete_states), p=Z[s_t[-1]]))
@@ -3228,7 +3227,7 @@ def test_discrete_state_recovery_moderate() -> None:
     # Simulate data
     key, s_key, x_key, y_key = random.split(key, 4)
     s_t = [int(random.choice(s_key, jnp.arange(n_discrete_states), p=init_prob))]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         s_t.append(
             int(random.choice(subkey, jnp.arange(n_discrete_states), p=Z[s_t[-1]]))
@@ -3308,7 +3307,7 @@ def test_discrete_state_recovery_with_smoother() -> None:
     # Simulate data
     key, s_key, x_key, y_key = random.split(key, 4)
     s_t = [int(random.choice(s_key, jnp.arange(n_discrete_states), p=init_prob))]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         s_t.append(
             int(random.choice(subkey, jnp.arange(n_discrete_states), p=Z[s_t[-1]]))
@@ -3541,7 +3540,7 @@ def test_continuous_state_mse_filter() -> None:
     # Simulate data
     key, s_key, x_key, y_key = random.split(key, 4)
     s_t = [int(random.choice(s_key, jnp.arange(n_discrete_states), p=init_prob))]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         s_t.append(
             int(random.choice(subkey, jnp.arange(n_discrete_states), p=Z[s_t[-1]]))
@@ -3630,7 +3629,7 @@ def test_continuous_state_mse_smoother() -> None:
     # Simulate data
     key, s_key, x_key, y_key = random.split(key, 4)
     s_t = [int(random.choice(s_key, jnp.arange(n_discrete_states), p=init_prob))]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         s_t.append(
             int(random.choice(subkey, jnp.arange(n_discrete_states), p=Z[s_t[-1]]))
@@ -3744,7 +3743,7 @@ def test_continuous_state_mse_vs_standard_kalman() -> None:
     # Simulate data
     key, s_key, x_key, y_key = random.split(key, 4)
     s_t = [int(random.choice(s_key, jnp.arange(n_discrete_states), p=init_prob))]
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         s_key, subkey = random.split(s_key)
         s_t.append(
             int(random.choice(subkey, jnp.arange(n_discrete_states), p=Z[s_t[-1]]))

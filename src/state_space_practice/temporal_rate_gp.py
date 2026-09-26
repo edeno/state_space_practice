@@ -61,8 +61,8 @@ from state_space_practice.parameter_transforms import (
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import (
-    contains_tracer,
     _validate_filter_numerics,
+    contains_tracer,
     validate_count_array,
     validate_int,
     validate_scalar,

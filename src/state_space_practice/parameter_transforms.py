@@ -22,9 +22,9 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+from jax import Array
 
 from state_space_practice.utils import contains_tracer
-from jax import Array
 
 
 @dataclass(frozen=True)

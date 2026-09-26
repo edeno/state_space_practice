@@ -9,8 +9,8 @@ is set before importing this module (see conftest.py).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from itertools import permutations
-from typing import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -19,7 +19,6 @@ from jax import Array
 from numpy.typing import ArrayLike
 
 from state_space_practice.nonlinear_dynamics import apply_mlp, leapfrog_step
-
 
 # ---------------------------------------------------------------------------
 # State segmentation

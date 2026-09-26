@@ -102,6 +102,29 @@ exclude_lines = [
 ]
 show_missing = true
 
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+# Notebooks are kept output-free by nbstripout and not linted/formatted.
+extend-exclude = ["*.ipynb"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "NPY"]
+ignore = [
+    "E501", # line length is owned by `ruff format`; long strings/comments remain
+]
+# Exploratory scripts are formatted but not linted.
+exclude = ["notebooks/**", "scripts/**"]
+# TODO: enable "D" (pydocstyle, numpy convention). Currently ~1350 violations
+# in src/, mostly D209/D401/D101; needs a dedicated docstring pass.
+
+[tool.ruff.lint.per-file-ignores]
+# zip(..., strict=True) would turn silent truncation into an error: a behaviour
+# change to review per call site, not a mechanical fix.
+"src/state_space_practice/{nonlinear_dynamics,place_field_model,preprocessing,smith_learning_algorithm}.py" = ["B905"]
+"src/state_space_practice/simulate/simulate_switching_kalman.py" = ["B905", "NPY002"]
+"src/state_space_practice/tests/**" = ["B905", "NPY002"]
+
 [tool.mypy]
 python_version = "3.10"
 mypy_path = "src"

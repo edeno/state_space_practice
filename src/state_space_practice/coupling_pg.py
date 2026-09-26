@@ -24,8 +24,9 @@ convergence/mixing diagnostic is computed; the caller owns choosing ``n_iter`` a
 ``jax_enable_x64``). Needs the ``coupling`` optional dependency (``polyagamma``).
 """
 
-import numpy as np
 import operator
+
+import numpy as np
 from polyagamma import random_polyagamma
 from scipy.linalg import cho_factor, cho_solve, solve_triangular
 

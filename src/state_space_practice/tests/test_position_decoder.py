@@ -8,6 +8,10 @@ import pytest
 
 from state_space_practice import position_decoder
 from state_space_practice.kalman import rts_backward_scan
+from state_space_practice.point_process_kalman import (
+    _point_process_laplace_update,
+    _safe_expected_count,
+)
 from state_space_practice.position_decoder import (
     AdaptiveInflationConfig,
     DecoderResult,
@@ -18,10 +22,6 @@ from state_space_practice.position_decoder import (
     build_position_dynamics,
     position_decoder_filter,
     position_decoder_smoother,
-)
-from state_space_practice.point_process_kalman import (
-    _point_process_laplace_update,
-    _safe_expected_count,
 )
 
 

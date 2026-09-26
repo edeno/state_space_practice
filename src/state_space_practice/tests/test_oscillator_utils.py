@@ -4,9 +4,9 @@ import numpy as np
 import pytest
 
 from state_space_practice.oscillator_utils import (
+    DirectedInfluenceDynamicsMixin,
     IDENTITY_2x2,
     ZEROS_2x2,
-    DirectedInfluenceDynamicsMixin,
     _cnm_psd_shrink_factor,
     _cnm_structured_projection,
     _compute_coupled_oscillator_block,

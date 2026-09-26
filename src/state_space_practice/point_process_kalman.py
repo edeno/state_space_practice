@@ -40,6 +40,7 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.em_driver import run_em
 from state_space_practice.kalman import (
     InitialStatePrior,
     _kalman_smoother_update,
@@ -47,7 +48,6 @@ from state_space_practice.kalman import (
     smooth_initial_state,
     sum_of_outer_products,
 )
-from state_space_practice.em_driver import run_em
 from state_space_practice.parameter_transforms import (
     PSD_MATRIX,
     UNCONSTRAINED,
