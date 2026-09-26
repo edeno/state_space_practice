@@ -7691,3 +7691,217 @@ def test_filter_follows_dynamics_on_impossible_observation() -> None:
     assert bool(jnp.all(jnp.isfinite(fp)))  # no zero-lock / NaN
     np.testing.assert_allclose(np.asarray(fp.sum(axis=1)), 1.0, rtol=1e-6)
     assert bool(jnp.isfinite(mll))
+
+
+# ---------------------------------------------------------------------------
+# M-step residual forms, fixed H / A, relative floors, occupancy gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def random_mstep_stats() -> dict:
+    """Well-scaled synthetic smoother statistics for M-step identities."""
+    rng = np.random.default_rng(11)
+    T, n, n_obs, K = 300, 3, 2, 2
+    means = rng.normal(size=(T, n, K))
+    factors = 0.3 * rng.normal(size=(T, n, n, K))
+    covs = (
+        np.einsum("tabk,tcbk->tack", factors, factors)
+        + 0.05 * np.eye(n)[None, :, :, None]
+    )
+    prob = rng.dirichlet(np.ones(K), size=T)
+    joint = prob[:-1, :, None] * prob[1:, None, :]
+    cross = 0.05 * rng.normal(size=(T - 1, n, n, K, K))
+    obs = means[:, :2, 0] @ rng.normal(size=(2, n_obs)) + 0.3 * rng.normal(
+        size=(T, n_obs)
+    )
+    return {
+        "obs": jnp.asarray(obs),
+        "state_cond_smoother_means": jnp.asarray(means),
+        "state_cond_smoother_covs": jnp.asarray(covs),
+        "smoother_discrete_state_prob": jnp.asarray(prob),
+        "smoother_joint_discrete_state_prob": jnp.asarray(joint),
+        "pair_cond_smoother_cross_cov": jnp.asarray(cross),
+    }
+
+
+def _manual_mstep_moments(stats: dict) -> dict:
+    """Aggregated weighted moments with plain NumPy (the textbook shortcuts)."""
+    y = np.asarray(stats["obs"])
+    m = np.asarray(stats["state_cond_smoother_means"])
+    P = np.asarray(stats["state_cond_smoother_covs"])
+    w = np.asarray(stats["smoother_discrete_state_prob"])
+    gamma = np.einsum("tabk,tk->abk", P, w) + np.einsum("tak,tbk,tk->abk", m, m, w)
+    delta = np.einsum("ta,tbk,tk->abk", y, m, w)
+    alpha = np.einsum("ta,tb,tk->abk", y, y, w)
+    first = P[0] * w[0] + np.einsum("ak,bk,k->abk", m[0], m[0], w[0])
+    return {
+        "gamma": gamma,
+        "delta": delta,
+        "alpha": alpha,
+        "gamma2": gamma - first,
+        "n": w.sum(0),
+        "n1": w[1:].sum(0),
+        "sum_P": np.einsum("tabk,tk->abk", P, w),
+    }
+
+
+def test_mstep_residual_forms_match_shortcuts_and_are_psd(random_mstep_stats):
+    """At the solved H*/A* the residual (centred) forms equal the textbook
+    shortcuts R = (alpha - H* delta^T)/n and Q = (gamma2 - A* beta^T)/n."""
+    from state_space_practice.switching_kalman import (
+        compute_transition_sufficient_stats,
+    )
+
+    A, H, Q, R, *_ = switching_kalman_maximization_step(**random_mstep_stats)
+    mom = _manual_mstep_moments(random_mstep_stats)
+    gamma1, beta = compute_transition_sufficient_stats(
+        state_cond_smoother_means=random_mstep_stats["state_cond_smoother_means"],
+        state_cond_smoother_covs=random_mstep_stats["state_cond_smoother_covs"],
+        smoother_joint_discrete_state_prob=random_mstep_stats[
+            "smoother_joint_discrete_state_prob"
+        ],
+        pair_cond_smoother_cross_cov=random_mstep_stats["pair_cond_smoother_cross_cov"],
+    )
+    for k in range(2):
+        H_star = np.linalg.solve(mom["gamma"][..., k], mom["delta"][..., k].T).T
+        R_short = (mom["alpha"][..., k] - H_star @ mom["delta"][..., k].T) / mom["n"][k]
+        A_star = np.linalg.solve(
+            np.asarray(gamma1[..., k]), np.asarray(beta[..., k]).T
+        ).T
+        Q_short = (mom["gamma2"][..., k] - A_star @ np.asarray(beta[..., k]).T) / mom[
+            "n1"
+        ][k]
+        np.testing.assert_allclose(H[..., k], H_star, rtol=1e-9)
+        np.testing.assert_allclose(A[..., k], A_star, rtol=1e-9)
+        np.testing.assert_allclose(R[..., k], 0.5 * (R_short + R_short.T), rtol=1e-12)
+        np.testing.assert_allclose(Q[..., k], 0.5 * (Q_short + Q_short.T), rtol=1e-12)
+        assert np.linalg.eigvalsh(np.asarray(R[..., k])).min() > 0.0
+        assert np.linalg.eigvalsh(np.asarray(Q[..., k])).min() > 0.0
+
+
+def test_mstep_fixed_measurement_matrix_installs_fixed_h_optimum(random_mstep_stats):
+    """With H held fixed (misspecified), R is the optimum for that H -- the
+    full quadratic form -- not the shortcut that assumes the solved H*."""
+    mom = _manual_mstep_moments(random_mstep_stats)
+    H_fixed = jnp.stack([jnp.eye(2, 3), 0.5 * jnp.eye(2, 3)], axis=-1)
+    _, H, _, R, *_ = switching_kalman_maximization_step(
+        **random_mstep_stats, fixed_measurement_matrix=H_fixed
+    )
+    np.testing.assert_array_equal(np.asarray(H), np.asarray(H_fixed))
+
+    y = np.asarray(random_mstep_stats["obs"])
+    m = np.asarray(random_mstep_stats["state_cond_smoother_means"])
+    w = np.asarray(random_mstep_stats["smoother_discrete_state_prob"])
+    for k in range(2):
+        Hk = np.asarray(H_fixed[..., k])
+        resid = y - m[..., k] @ Hk.T
+        R_opt = (
+            np.einsum("ta,tb,t->ab", resid, resid, w[:, k])
+            + Hk @ mom["sum_P"][..., k] @ Hk.T
+        ) / mom["n"][k]
+        H_star = np.linalg.solve(mom["gamma"][..., k], mom["delta"][..., k].T).T
+        R_shortcut = (mom["alpha"][..., k] - Hk @ mom["delta"][..., k].T) / mom["n"][k]
+        np.testing.assert_allclose(R[..., k], R_opt, rtol=1e-11)
+        # Guard: the fixed H is genuinely misspecified, so the answers differ.
+        assert np.max(np.abs(Hk - H_star)) > 0.1
+        assert np.max(np.abs(np.asarray(R[..., k]) - R_shortcut)) > 1e-2
+
+
+def test_mstep_fixed_transition_matrix_matches_residual_scatter(random_mstep_stats):
+    """With A held fixed, Q equals the fixed-A residual scatter / counts used by
+    the constrained CNM update."""
+    A_fixed = jnp.stack([0.9 * jnp.eye(3), 0.5 * jnp.eye(3)], axis=-1)
+    A, _, Q, *_ = switching_kalman_maximization_step(
+        **random_mstep_stats, fixed_continuous_transition_matrix=A_fixed
+    )
+    scatter, counts = compute_process_covariance_sufficient_stats(
+        continuous_transition_matrix=A_fixed,
+        **{k: v for k, v in random_mstep_stats.items() if k != "obs"},
+    )
+    np.testing.assert_array_equal(np.asarray(A), np.asarray(A_fixed))
+    np.testing.assert_allclose(Q, scatter / counts[None, None, :], rtol=1e-12)
+
+
+def test_mstep_covariances_are_scale_equivariant(random_mstep_stats):
+    """Relative eigenvalue floors: rescaling the latent units by c rescales Q by
+    c^2 exactly (the old absolute 1e-8 floor distorted small-scale problems)."""
+    c = 1e-6
+    scaled = dict(random_mstep_stats)
+    scaled["state_cond_smoother_means"] = (
+        c * random_mstep_stats["state_cond_smoother_means"]
+    )
+    scaled["state_cond_smoother_covs"] = (
+        c**2 * random_mstep_stats["state_cond_smoother_covs"]
+    )
+    scaled["pair_cond_smoother_cross_cov"] = (
+        c**2 * random_mstep_stats["pair_cond_smoother_cross_cov"]
+    )
+    scaled["obs"] = c * random_mstep_stats["obs"]
+    _, _, Q, R, *_ = switching_kalman_maximization_step(**random_mstep_stats)
+    _, _, Q_s, R_s, *_ = switching_kalman_maximization_step(**scaled)
+    assert float(jnp.max(Q_s)) < 1e-8  # guard: below the old absolute floor
+    np.testing.assert_allclose(Q_s, c**2 * Q, rtol=1e-8)
+    np.testing.assert_allclose(R_s, c**2 * R, rtol=1e-8)
+
+
+def test_mstep_floor_engages_relatively_and_is_logged(random_mstep_stats, caplog):
+    """A genuinely singular Q (noise-free latent) is floored relative to its own
+    scale and the floor is reported; a regular Q is left untouched."""
+    with caplog.at_level("WARNING"):
+        switching_kalman_maximization_step(**random_mstep_stats)
+    assert "relative eigenvalue floor" not in caplog.text
+
+    stats = dict(random_mstep_stats)
+    # Latent collapsed onto one direction: every Q_j is (numerically) rank one.
+    means = np.asarray(stats["state_cond_smoother_means"])
+    stats["state_cond_smoother_means"] = jnp.asarray(
+        means[:, :1, :] * np.array([1.0, 2.0, -1.0])[None, :, None]
+    )
+    stats["state_cond_smoother_covs"] = jnp.zeros_like(
+        stats["state_cond_smoother_covs"]
+    )
+    stats["pair_cond_smoother_cross_cov"] = jnp.zeros_like(
+        stats["pair_cond_smoother_cross_cov"]
+    )
+    with caplog.at_level("WARNING"):
+        _, _, Q, *_ = switching_kalman_maximization_step(**stats)
+    assert "relative eigenvalue floor" in caplog.text
+    for k in range(2):
+        eig = np.linalg.eigvalsh(np.asarray(Q[..., k]))
+        np.testing.assert_allclose(eig[0], 1e-10 * eig.sum() / 3, rtol=1e-4)
+
+
+def test_mstep_keeps_previous_params_for_near_empty_state(random_mstep_stats):
+    """A state with expected occupancy ~1e-7 keeps its previous A/Q/H/R, the
+    occupied state is still updated, and a warning names the gated state."""
+    stats = dict(random_mstep_stats)
+    T = stats["smoother_discrete_state_prob"].shape[0]
+    prob = jnp.stack([jnp.ones(T) - 1e-7 / T, jnp.full(T, 1e-7 / T)], axis=-1)
+    stats["smoother_discrete_state_prob"] = prob
+    stats["smoother_joint_discrete_state_prob"] = prob[:-1, :, None] * prob[1:, None, :]
+    previous = {
+        "continuous_transition_matrix": jnp.stack([0.3 * jnp.eye(3)] * 2, axis=-1),
+        "measurement_matrix": jnp.stack([jnp.eye(2, 3)] * 2, axis=-1),
+        "process_cov": jnp.stack([0.7 * jnp.eye(3)] * 2, axis=-1),
+        "measurement_cov": jnp.stack([0.2 * jnp.eye(2)] * 2, axis=-1),
+    }
+    with pytest.warns(UserWarning, match=r"discrete state\(s\) \[1\]"):
+        A, H, Q, R, *_ = switching_kalman_maximization_step(
+            **stats, previous_params=previous
+        )
+    for name, value in zip(
+        [
+            "continuous_transition_matrix",
+            "measurement_matrix",
+            "process_cov",
+            "measurement_cov",
+        ],
+        [A, H, Q, R],
+    ):
+        np.testing.assert_array_equal(
+            np.asarray(value[..., 1]), np.asarray(previous[name][..., 1])
+        )
+        assert not np.allclose(
+            np.asarray(value[..., 0]), np.asarray(previous[name][..., 0])
+        )

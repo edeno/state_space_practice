@@ -407,13 +407,15 @@ class TestCorrelatedNoisePointProcessModel:
         assert model.n_neurons == cnm_pp_params["n_neurons"]
         assert model.n_discrete_states == cnm_pp_params["n_discrete_states"]
 
-    def test_constrained_mstep_is_opt_in(self, cnm_pp_params) -> None:
+    def test_constrained_mstep_is_the_default(self, cnm_pp_params) -> None:
+        """The exact fixed-A constrained Q update is the default M-step; the
+        generic estimate-then-project path is opt-out."""
         default = CorrelatedNoisePointProcessModel(**cnm_pp_params)
-        constrained = CorrelatedNoisePointProcessModel(
-            **cnm_pp_params, use_reparameterized_mstep=True
+        generic = CorrelatedNoisePointProcessModel(
+            **cnm_pp_params, use_reparameterized_mstep=False
         )
-        assert default.use_reparameterized_mstep is False
-        assert constrained.use_reparameterized_mstep is True
+        assert default.use_reparameterized_mstep is True
+        assert generic.use_reparameterized_mstep is False
 
     @pytest.mark.slow
     def test_constrained_mstep_fits_psd_reconstructable_q(
@@ -1606,3 +1608,42 @@ class TestSharedSwitchingPointProcessBase:
 
         assert len(captured) >= 2
         assert all(f is spp._linear_log_intensity for f in captured)
+
+
+class TestRelativeInitCovClip:
+    """The M-step init_cov clip is relative to the latent scale."""
+
+    def test_bounds_follow_the_latent_units(self, com_pp_params, caplog) -> None:
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        n, k = model.n_latent, model.n_discrete_states
+        eye = jnp.stack([jnp.eye(n)] * k, axis=-1)
+
+        # Latent state expressed in units 100x smaller: variances 1e-4x.
+        model.init_cov = 1e-4 * eye
+        model._record_init_cov_latent_scale()
+        small = 1e-6 * eye  # would be raised to 1e-4 by an absolute floor
+        with caplog.at_level("WARNING"):
+            np.testing.assert_allclose(
+                model._regularize_init_cov_update(small), small, rtol=1e-12
+            )
+        assert "init_cov eigenvalues clipped" not in caplog.text
+
+        with caplog.at_level("WARNING"):
+            clipped = model._regularize_init_cov_update(eye)  # 1.0 > 2e-4 cap
+        np.testing.assert_allclose(clipped, 2e-4 * eye, rtol=1e-10)
+        assert "init_cov eigenvalues clipped" in caplog.text
+
+    def test_default_identity_init_cov_keeps_the_absolute_bounds(
+        self, com_pp_params
+    ) -> None:
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        assert model._record_init_cov_latent_scale() == 1.0
+        n, k = model.n_latent, model.n_discrete_states
+        big = jnp.stack([5.0 * jnp.eye(n)] * k, axis=-1)
+        np.testing.assert_allclose(
+            model._regularize_init_cov_update(big),
+            jnp.stack([2.0 * jnp.eye(n)] * k, axis=-1),
+            rtol=1e-10,
+        )

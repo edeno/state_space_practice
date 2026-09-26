@@ -71,11 +71,13 @@ from state_space_practice.sgd_fitting import (
 from state_space_practice.switching_kalman import (
     compute_process_covariance_sufficient_stats,
     compute_transition_sufficient_stats,
+    minimum_state_occupancy,
     optimize_dim_transition_params_joint,
     switching_kalman_filter,
     switching_kalman_maximization_step,
     switching_kalman_smoother,
     switching_kalman_smoother_gpb2,
+    warn_low_occupancy_states,
 )
 from state_space_practice.utils import (
     make_discrete_transition_matrix,
@@ -925,6 +927,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
             pair_cond_smoother_covs=self.smoother_pair_cond_covs,
             next_pair_cond_smoother_means=self.smoother_next_pair_cond_means,
             transition_prior=self.transition_prior,
+            **self._m_step_fixed_and_previous_params(),
         )
 
         # Update parameters based on flags
@@ -944,6 +947,40 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
             self.discrete_transition_matrix = Z
         # Always update init_prob based on the first smoother probability
         self.init_discrete_state_prob = pi0
+
+    def _m_step_fixed_and_previous_params(
+        self, transition_matrix_fixed: bool | None = None
+    ) -> dict:
+        """Keyword arguments tying the generic M-step to this model's structure.
+
+        A matrix the model does not learn (``update_*`` False) is passed as
+        fixed, so the covariance installed alongside it is the optimum *for that
+        matrix* (not the shortcut that assumes the unconstrained solution). The
+        current parameters are forwarded so an under-occupied discrete state
+        keeps them instead of receiving an unidentified estimate.
+
+        Parameters
+        ----------
+        transition_matrix_fixed : bool or None
+            Override for whether ``A`` is held fixed during the covariance
+            update (defaults to ``not update_continuous_transition_matrix``).
+        """
+        if transition_matrix_fixed is None:
+            transition_matrix_fixed = not self.update_continuous_transition_matrix
+        return {
+            "fixed_measurement_matrix": (
+                None if self.update_measurement_matrix else self.measurement_matrix
+            ),
+            "fixed_continuous_transition_matrix": (
+                self.continuous_transition_matrix if transition_matrix_fixed else None
+            ),
+            "previous_params": {
+                "continuous_transition_matrix": self.continuous_transition_matrix,
+                "measurement_matrix": self.measurement_matrix,
+                "process_cov": self.process_cov,
+                "measurement_cov": self.measurement_cov,
+            },
+        }
 
     def _pool_measurement_covariance(self, per_state_cov: Array) -> Array:
         """Pool per-state Kalman M-step covariances into one shared R.
@@ -1372,12 +1409,13 @@ class CorrelatedNoiseModel(BaseModel):
         may be supplied in the strict upper triangle, strict lower triangle, or
         both triangles if the two entries agree; values are stored canonically in
         the strict upper triangle.
-    use_reparameterized_mstep : bool, default=False
-        If True, use the exact joint constrained CNM covariance M-step. It
-        updates variance, coupling, and phase together from the fixed-transition
-        residual covariance while guaranteeing CNM block structure and positive
-        semidefiniteness. If False, retain the generic covariance M-step followed
-        by structural projection.
+    use_reparameterized_mstep : bool, default=True
+        If True (default), use the exact joint constrained CNM covariance
+        M-step. It updates variance, coupling, and phase together from the
+        fixed-transition residual covariance while guaranteeing CNM block
+        structure and positive semidefiniteness. If False, use the generic
+        covariance M-step (evaluated at the fixed ``A`` and ``H``) followed by
+        structural projection.
     """
 
     def __init__(
@@ -1391,7 +1429,7 @@ class CorrelatedNoiseModel(BaseModel):
         measurement_variance: float,
         phase_difference: jax.Array,
         coupling_strength: jax.Array,
-        use_reparameterized_mstep: bool = False,
+        use_reparameterized_mstep: bool = True,
         **kwargs,
     ):
         # n_sources is fixed to n_oscillators for CNM (passed to super below).
@@ -1549,12 +1587,21 @@ class CorrelatedNoiseModel(BaseModel):
             ],
             axis=-1,
         )
+        # A state with fewer than n_cont_states + 1 expected transitions has an
+        # unidentified residual covariance: keep its previous Q (and warn).
+        min_count = minimum_state_occupancy(residual_scatter.shape[0])
+        warn_low_occupancy_states(
+            state_counts,
+            min_count,
+            "CorrelatedNoiseModel constrained Q M-step",
+            "their process covariance kept its previous value",
+        )
         updated = []
         for j in range(self.n_discrete_states):
             count = state_counts[j]
             target = residual_scatter[..., j] / jnp.maximum(count, 1e-12)
             constrained = constrain_correlated_noise_process_covariance(target)
-            updated.append(jnp.where(count > 1e-8, constrained, previous[..., j]))
+            updated.append(jnp.where(count >= min_count, constrained, previous[..., j]))
         self.process_cov = jnp.stack(updated, axis=-1)
         self._sync_process_covariance_params()
 
@@ -1931,6 +1978,10 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
             pair_cond_smoother_covs=self.smoother_pair_cond_covs,
             next_pair_cond_smoother_means=self.smoother_next_pair_cond_means,
             transition_prior=self.transition_prior,
+            # ECM: Q is updated for the current A (held fixed here); A is then
+            # optimized for that Q below. Using the unconstrained A* for Q would
+            # install a covariance that is optimal for a matrix never used.
+            **self._m_step_fixed_and_previous_params(transition_matrix_fixed=True),
         )
 
         # Update non-A parameters based on flags (same as standard M-step)

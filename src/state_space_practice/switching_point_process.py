@@ -116,9 +116,11 @@ from state_space_practice.switching_kalman import (
     _normalize_initial_discrete_prob,
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture_per_discrete_state,
+    minimum_state_occupancy,
     switching_kalman_maximization_step,
     switching_kalman_smoother,
     switching_kalman_smoother_gpb2,
+    warn_low_occupancy_states,
 )
 from state_space_practice.utils import (
     clip_eigenvalues,
@@ -2934,6 +2936,18 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
                 self, "smoother_next_pair_cond_means", None
             ),
             transition_prior=self.transition_prior,
+            # A model that keeps A fixed (e.g. CNM-PP) needs the Q optimal for
+            # that A, not for the unconstrained A* it never installs.
+            fixed_continuous_transition_matrix=(
+                None
+                if self.update_continuous_transition_matrix
+                else self.continuous_transition_matrix
+            ),
+            previous_params={
+                "continuous_transition_matrix": self.continuous_transition_matrix,
+                "process_cov": self.process_cov,
+            },
+            estimate_measurement_params=False,
         )
 
         if self.update_continuous_transition_matrix:
@@ -3054,9 +3068,19 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
             baseline_prior = None
 
         if self.separate_spike_params:
-            # Minimum total weight required to update parameters for a state.
-            # States with less weight keep their current parameters unchanged.
-            MIN_STATE_WEIGHT = 1e-8
+            # Minimum expected occupancy required to update a state's GLM: the
+            # per-state regression on n_latent regressors (+ baseline) is
+            # unidentified with fewer than n_latent + 1 effective bins. States
+            # below it keep their current parameters unchanged (and warn).
+            min_state_weight = minimum_state_occupancy(
+                self.smoother_state_cond_mean.shape[1]
+            )
+            low_states = warn_low_occupancy_states(
+                jnp.sum(self.smoother_discrete_state_prob, axis=0),
+                min_state_weight,
+                "spike GLM M-step",
+                "their spike parameters kept their previous values",
+            )
 
             # Python loop over discrete states (typically 2-4); each state's
             # update reuses the same compiled per-state Newton solve.
@@ -3064,9 +3088,8 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
             new_weights = []
             for j in range(self.n_discrete_states):
                 state_weights = self.smoother_discrete_state_prob[:, j]
-                total_weight = float(jnp.sum(state_weights))
 
-                if total_weight < MIN_STATE_WEIGHT:
+                if j in low_states:
                     new_baselines.append(self.spike_params.baseline[:, j])
                     new_weights.append(self.spike_params.weights[:, :, j])
                     continue

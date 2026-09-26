@@ -15,6 +15,9 @@ from state_space_practice.oscillator_models import (
     CorrelatedNoiseModel,
     DirectedInfluenceModel,
 )
+from state_space_practice.oscillator_utils import (
+    construct_common_oscillator_transition_matrix,
+)
 
 # Enable 64-bit precision for numerical stability
 jax.config.update("jax_enable_x64", True)
@@ -295,13 +298,15 @@ class TestCorrelatedNoiseModel:
         assert model.n_oscillators == correlated_noise_params["n_oscillators"]
         assert model.n_sources == model.n_oscillators  # CNM constraint
 
-    def test_constrained_mstep_is_opt_in(self, correlated_noise_params) -> None:
+    def test_constrained_mstep_is_the_default(self, correlated_noise_params) -> None:
+        """The exact fixed-A constrained Q update is the default M-step; the
+        generic estimate-then-project path is opt-out."""
         default = CorrelatedNoiseModel(**correlated_noise_params)
-        constrained = CorrelatedNoiseModel(
-            **correlated_noise_params, use_reparameterized_mstep=True
+        generic = CorrelatedNoiseModel(
+            **correlated_noise_params, use_reparameterized_mstep=False
         )
-        assert default.use_reparameterized_mstep is False
-        assert constrained.use_reparameterized_mstep is True
+        assert default.use_reparameterized_mstep is True
+        assert generic.use_reparameterized_mstep is False
 
     @pytest.mark.slow
     def test_constrained_mstep_fits_psd_reconstructable_q(
@@ -443,7 +448,11 @@ class TestCorrelatedNoiseModel:
         self, correlated_noise_params
     ) -> None:
         """Projection must restore the structured symmetric PSD CNM family."""
-        model = CorrelatedNoiseModel(**correlated_noise_params)
+        # The generic estimate-then-project path (the default constrained path
+        # recomputes Q from the smoother instead of projecting it).
+        model = CorrelatedNoiseModel(
+            **correlated_noise_params, use_reparameterized_mstep=False
+        )
         model._initialize_parameters(jax.random.PRNGKey(0))
 
         # Perturb Q the way an M-step might: asymmetrically and off the PSD cone.
@@ -721,6 +730,9 @@ def _assert_scaled_rotation_block(block, atol: float = 1e-8) -> None:
 class TestOscillatorPaperStructure:
     """Regression tests for the COM/CNM/DIM constraints in Hsin et al. 2024."""
 
+    # Tiny data leave some discrete states nearly empty; the occupancy gate
+    # keeps their parameters and warns, which is not what this test checks.
+    @pytest.mark.filterwarnings("ignore:.*expected occupancy:UserWarning")
     def test_em_pools_observation_covariance_across_states(
         self, synthetic_observations
     ) -> None:
@@ -960,6 +972,9 @@ class TestSingleDiscreteState:
 class TestEdgeCases:
     """Tests for edge cases and error handling."""
 
+    # Tiny data leave some discrete states nearly empty; the occupancy gate
+    # keeps their parameters and warns, which is not what this test checks.
+    @pytest.mark.filterwarnings("ignore:.*expected occupancy:UserWarning")
     def test_very_short_sequence(self, common_oscillator_params) -> None:
         """Model should handle very short observation sequences."""
         params = common_oscillator_params.copy()
@@ -2222,6 +2237,9 @@ class TestOscillatorSmootherSelection:
         assert model.smoother_pair_cond_covs is None
         assert model.smoother_next_pair_cond_means is None
 
+    # Tiny data leave some discrete states nearly empty; the occupancy gate
+    # keeps their parameters and warns, which is not what this test checks.
+    @pytest.mark.filterwarnings("ignore:.*expected occupancy:UserWarning")
     def test_gpb2_statistics_reach_generic_mstep(
         self, common_oscillator_params, monkeypatch
     ) -> None:
@@ -2962,8 +2980,70 @@ class TestBaseModelSGDStorage:
 
 
 # ============================================================================
-# DIM fixed point at the truth
+# Fixed-H covariance update and DIM fixed point at the truth
 # ============================================================================
+
+
+@pytest.fixture(scope="module")
+def misspecified_h_observations():
+    """Two-oscillator data observed through an H the CNM does not use."""
+    rng = np.random.default_rng(4)
+    n_time = 400
+    A = np.asarray(
+        construct_common_oscillator_transition_matrix(
+            freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.95]),
+            sampling_freq=100.0,
+        )
+    )
+    x = np.zeros((n_time, 4))
+    for t in range(1, n_time):
+        x[t] = A @ x[t - 1] + np.sqrt(0.1) * rng.normal(size=4)
+    # CNM's fixed H reads the x-component; the data mix in the y-component too.
+    H_true = np.array([[1.0, 0.8, 0.0, 0.0], [0.0, 0.0, 1.0, 0.8]])
+    return jnp.asarray(x @ H_true.T + np.sqrt(0.05) * rng.normal(size=(n_time, 2)))
+
+
+@pytest.mark.slow
+def test_cnm_fixed_h_installs_fixed_h_optimal_r_and_em_is_monotone(
+    misspecified_h_observations,
+) -> None:
+    """CNM keeps H fixed, so the installed R must be the optimum for that H
+    (not the shortcut built from the unused H*), and with one discrete state
+    (exact Kalman EM) the log-likelihood never decreases."""
+    obs = misspecified_h_observations
+    model = CorrelatedNoiseModel(
+        n_oscillators=2,
+        n_discrete_states=1,
+        sampling_freq=100.0,
+        freqs=jnp.array([8.0, 12.0]),
+        damping_coef=jnp.array([0.95, 0.95]),
+        process_variance=jnp.full((2, 1), 0.1),
+        measurement_variance=0.05,
+        phase_difference=jnp.zeros((2, 2, 1)),
+        coupling_strength=jnp.zeros((2, 2, 1)),
+    )
+    model._initialize_parameters(jax.random.PRNGKey(0))
+    model._e_step(obs)
+    H = np.asarray(model.measurement_matrix[..., 0])
+    m = np.asarray(model.smoother_state_cond_mean[..., 0])
+    P = np.asarray(model.smoother_state_cond_cov[..., 0])
+    y = np.asarray(obs)
+    resid = y - m @ H.T
+    R_fixed_h = (resid.T @ resid + H @ P.sum(0) @ H.T) / len(y)
+    gamma = P.sum(0) + m.T @ m
+    delta = y.T @ m
+    R_shortcut = (y.T @ y - H @ delta.T) / len(y)  # old: assumes H = H*
+    assert np.max(np.abs(np.linalg.solve(gamma, delta.T).T - H)) > 0.1  # guard
+
+    model._m_step(obs)
+    np.testing.assert_allclose(model.measurement_cov[..., 0], R_fixed_h, rtol=1e-8)
+    assert np.max(np.abs(np.asarray(model.measurement_cov[..., 0]) - R_shortcut)) > 1e-2
+
+    model._initialize_parameters(jax.random.PRNGKey(0))
+    lls = np.asarray(model.fit(obs, max_iter=6, skip_init=True, tol=1e-12))
+    assert len(lls) >= 4  # guard: EM actually iterated
+    assert np.all(np.diff(lls) >= -1e-8 * np.abs(lls[:-1])), np.diff(lls)
 
 
 @pytest.mark.slow

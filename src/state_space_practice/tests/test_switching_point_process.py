@@ -9931,3 +9931,55 @@ class TestSwitchingSpikeOscillatorEMConsistency:
         real_e_step(spikes)  # recompute under the returned (restored) params
         resynced_mean = np.asarray(model.smoother_state_cond_mean)
         np.testing.assert_allclose(post_fit_mean, resynced_mean, rtol=1e-10, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Occupancy gate
+# ---------------------------------------------------------------------------
+
+
+def test_separate_spike_glm_keeps_params_of_near_empty_state() -> None:
+    """A state with expected occupancy 1e-7 keeps its spike GLM parameters and
+    warns; the occupied state is still refit."""
+    from state_space_practice.switching_point_process import (
+        SwitchingSpikeOscillatorModel,
+    )
+
+    model = SwitchingSpikeOscillatorModel(
+        n_oscillators=1,
+        n_neurons=3,
+        n_discrete_states=2,
+        sampling_freq=100.0,
+        dt=0.01,
+        separate_spike_params=True,
+    )
+    model._initialize_parameters(jax.random.PRNGKey(0))
+    rng = np.random.default_rng(2)
+    n_time = 300
+    means = rng.normal(size=(n_time, 2))
+    model.smoother_state_cond_mean = jnp.asarray(np.stack([means, means], axis=-1))
+    model.smoother_state_cond_cov = jnp.broadcast_to(
+        0.1 * jnp.eye(2)[None, :, :, None], (n_time, 2, 2, 2)
+    )
+    prob = jnp.stack(
+        [jnp.ones(n_time) - 1e-7 / n_time, jnp.full(n_time, 1e-7 / n_time)], axis=-1
+    )
+    model.smoother_discrete_state_prob = prob
+    spikes = jnp.asarray(rng.poisson(np.exp(2.0 + means[:, :1]) * 0.01, (n_time, 3)))
+    before = model.spike_params
+
+    with pytest.warns(UserWarning, match=r"discrete state\(s\) \[1\]"):
+        model._m_step_spikes(spikes)
+
+    np.testing.assert_array_equal(
+        np.asarray(model.spike_params.baseline[:, 1]),
+        np.asarray(before.baseline[:, 1]),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(model.spike_params.weights[..., 1]),
+        np.asarray(before.weights[..., 1]),
+    )
+    assert not np.allclose(
+        np.asarray(model.spike_params.baseline[:, 0]),
+        np.asarray(before.baseline[:, 0]),
+    )

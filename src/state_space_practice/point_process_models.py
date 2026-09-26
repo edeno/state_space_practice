@@ -45,8 +45,10 @@ from state_space_practice.parameter_transforms import POSITIVE, UNCONSTRAINED
 from state_space_practice.switching_kalman import (
     compute_process_covariance_sufficient_stats,
     compute_transition_sufficient_stats,
+    minimum_state_occupancy,
     optimize_dim_transition_params_joint,
     switching_kalman_maximization_step,
+    warn_low_occupancy_states,
 )
 from state_space_practice.switching_point_process import (
     QRegularizationConfig,
@@ -65,10 +67,13 @@ from state_space_practice.utils import (
 logger = logging.getLogger(__name__)
 
 # Bounds for the M-step init_cov eigenvalue clip in switching point-process
-# models. Lower bound prevents the smoother at t=0 from collapsing to a
-# point estimate; upper bound prevents a positive feedback loop with sparse
-# observations (large init_cov → diffuse filter → larger smoother
-# uncertainty → larger init_cov).
+# models, *relative to the latent scale* (the mean per-dimension variance
+# ``trace(init_cov) / n_latent`` of the initial init_cov of the fit; 1 for the
+# default identity init_cov). Lower bound prevents the smoother at t=0 from
+# collapsing to a point estimate; upper bound prevents a positive feedback loop
+# with sparse observations (large init_cov → diffuse filter → larger smoother
+# uncertainty → larger init_cov). Relative bounds keep the clip meaning the
+# same whatever units the latent state is expressed in.
 _INIT_COV_EIGVAL_MIN = 1e-4
 _INIT_COV_EIGVAL_MAX = 2.0
 
@@ -376,13 +381,42 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         """Clip initial mean updates to a plausible latent-state range."""
         return jnp.clip(init_mean, -10.0, 10.0)
 
-    def _regularize_init_cov_update(self, init_cov: Array) -> Array:
-        """Clip initial covariance eigenvalues for sparse-spike EM stability."""
+    def _init_cov_latent_scale(self) -> float:
+        """Latent scale the init_cov clip bounds are relative to.
 
+        The mean per-dimension variance ``trace(init_cov) / n_latent`` of the
+        init_cov the current fit started from (recorded by ``_fit_single``);
+        falls back to the current init_cov when no fit has recorded it.
+        """
+        scale = getattr(self, "_init_cov_reference_scale", None)
+        if scale is None:
+            scale = self._record_init_cov_latent_scale()
+        return scale
+
+    def _record_init_cov_latent_scale(self) -> float:
+        """Record ``mean_j trace(init_cov_j) / n_latent`` as the latent scale."""
+        traces = jnp.trace(jnp.asarray(self.init_cov), axis1=0, axis2=1)
+        scale = float(jnp.mean(traces)) / self.n_latent
+        if not (scale > 0.0 and jnp.isfinite(scale)):
+            scale = 1.0
+        self._init_cov_reference_scale = scale
+        return scale
+
+    def _regularize_init_cov_update(self, init_cov: Array) -> Array:
+        """Clip initial covariance eigenvalues for sparse-spike EM stability.
+
+        The bounds are ``[_INIT_COV_EIGVAL_MIN, _INIT_COV_EIGVAL_MAX]`` times
+        the latent scale (:meth:`_init_cov_latent_scale`), so the clip is
+        invariant to the units of the latent state. A warning is logged when
+        the clip changes an eigenvalue.
+        """
+        latent_scale = self._init_cov_latent_scale()
+        eig_min = _INIT_COV_EIGVAL_MIN * latent_scale
+        eig_max = _INIT_COV_EIGVAL_MAX * latent_scale
         clip_init_cov_eigenvalues = functools.partial(
             clip_eigenvalues,
-            min_eigenvalue=_INIT_COV_EIGVAL_MIN,
-            max_eigenvalue=_INIT_COV_EIGVAL_MAX,
+            min_eigenvalue=eig_min,
+            max_eigenvalue=eig_max,
         )
 
         def _per_state_eigrange(P: Array) -> tuple[Array, Array]:
@@ -397,15 +431,18 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         init_cov = jax.vmap(clip_init_cov_eigenvalues, in_axes=-1, out_axes=-1)(
             init_cov
         )
-        if raw_min < _INIT_COV_EIGVAL_MIN or raw_max > _INIT_COV_EIGVAL_MAX:
-            logger.info(
-                "M-step init_cov eigenvalues clipped to [%.0e, %.1f] "
-                "(raw range across discrete states: [%.2e, %.2e]). "
-                "Frequent triggering indicates the smoother at t=0 is "
-                "numerically diffuse -- consider tightening the prior "
-                "or shortening the sequence.",
+        if raw_min < eig_min or raw_max > eig_max:
+            logger.warning(
+                "M-step init_cov eigenvalues clipped to [%.2e, %.2e] "
+                "(= [%.0e, %.1f] x latent scale %.3g; raw range across "
+                "discrete states: [%.2e, %.2e]). Frequent triggering indicates "
+                "the smoother at t=0 is numerically diffuse -- consider "
+                "tightening the prior or shortening the sequence.",
+                eig_min,
+                eig_max,
                 _INIT_COV_EIGVAL_MIN,
                 _INIT_COV_EIGVAL_MAX,
+                latent_scale,
                 raw_min,
                 raw_max,
             )
@@ -533,6 +570,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         if not skip_init:
             self._initialize_parameters(key)
             self._warm_initialize_states(spikes)
+            self._record_init_cov_latent_scale()
             # Set placeholder smoother outputs needed by spike M-step
             n_time = spikes.shape[0]
             self.smoother_state_cond_mean = jnp.zeros(
@@ -554,6 +592,8 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
             self.smoother_pair_cond_covs = None
             self.smoother_next_pair_cond_means = None
             self._m_step_spikes(spikes)
+        else:
+            self._record_init_cov_latent_scale()
 
         def _m_step() -> None:
             self._m_step_dynamics()
@@ -829,12 +869,13 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         supplied in the strict upper triangle, strict lower triangle, or both
         triangles if the two entries agree; values are stored canonically in the
         strict upper triangle.
-    use_reparameterized_mstep : bool, default=False
-        If True, use the exact joint constrained CNM covariance M-step. It
-        updates variance, coupling, and phase together from the fixed-transition
-        residual covariance while guaranteeing CNM block structure and positive
-        semidefiniteness. If False, retain the generic covariance M-step followed
-        by structural projection.
+    use_reparameterized_mstep : bool, default=True
+        If True (default), use the exact joint constrained CNM covariance
+        M-step. It updates variance, coupling, and phase together from the
+        fixed-transition residual covariance while guaranteeing CNM block
+        structure and positive semidefiniteness. If False, use the generic
+        covariance M-step (evaluated at the fixed ``A``) followed by structural
+        projection.
     """
 
     def __init__(
@@ -849,7 +890,7 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         process_variance: jax.Array,
         phase_difference: jax.Array,
         coupling_strength: jax.Array,
-        use_reparameterized_mstep: bool = False,
+        use_reparameterized_mstep: bool = True,
         **kwargs,
     ):
         # Force CNM-specific update flags
@@ -984,13 +1025,22 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
             ],
             axis=-1,
         )
+        # A state with fewer than n_cont_states + 1 expected transitions has an
+        # unidentified residual covariance: keep its previous Q (and warn).
+        min_count = minimum_state_occupancy(residual_scatter.shape[0])
+        warn_low_occupancy_states(
+            state_counts,
+            min_count,
+            "CorrelatedNoisePointProcessModel constrained Q M-step",
+            "their process covariance kept its previous value",
+        )
         updated = []
         cfg = self.q_regularization
         for j in range(self.n_discrete_states):
             count = state_counts[j]
             target = residual_scatter[..., j] / jnp.maximum(count, 1e-12)
             constrained = constrain_correlated_noise_process_covariance(target)
-            candidate = jnp.where(count > 1e-8, constrained, previous[..., j])
+            candidate = jnp.where(count >= min_count, constrained, previous[..., j])
 
             if cfg.enabled:
                 candidate = (
@@ -1002,7 +1052,7 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
                         candidate, cfg.min_eigenvalue, cfg.max_eigenvalue
                     )
                 candidate = constrain_correlated_noise_process_covariance(candidate)
-            candidate = jnp.where(count > 1e-8, candidate, previous[..., j])
+            candidate = jnp.where(count >= min_count, candidate, previous[..., j])
             updated.append(candidate)
 
         self.process_cov = jnp.stack(updated, axis=-1)
@@ -1297,6 +1347,8 @@ class DirectedInfluencePointProcessModel(
                 self, "smoother_next_pair_cond_means", None
             ),
             transition_prior=self.transition_prior,
+            fixed_continuous_transition_matrix=self.continuous_transition_matrix,
+            estimate_measurement_params=False,
         )
 
         if self.update_discrete_transition_matrix:

@@ -10,6 +10,7 @@ References
 """
 
 import functools
+import logging
 import math
 import warnings
 from functools import partial
@@ -37,6 +38,8 @@ from state_space_practice.utils import spectral_radius as _spectral_radius
 from state_space_practice.utils import (
     stabilize_probability_vector as _stabilize_probability_vector,
 )
+
+logger = logging.getLogger(__name__)
 
 _kalman_filter_update_per_discrete_state_pair = jax.vmap(
     jax.vmap(
@@ -2052,18 +2055,107 @@ def weighted_sum_of_outer_products(
     return jnp.einsum("tcm, tdm, tm -> cdm", x, y, weights)
 
 
-psd_solve_per_discrete_state = jax.vmap(
-    lambda x, y: psd_solve(x, y.T).T, in_axes=(-1, -1), out_axes=-1
-)
+def minimum_state_occupancy(n_cont_states: int) -> float:
+    """Minimum expected bins for a discrete state's per-state M-step updates.
 
-cov_solve_per_discrete_state = jax.vmap(
-    lambda x, y, z, n: stabilize_covariance(_divide_safe(x - y @ z.T, n)),
-    in_axes=(-1, -1, -1, -1),
+    A per-state regression of ``n_cont_states`` regressors needs at least
+    ``n_cont_states + 1`` effective samples; below that the per-state ``A``,
+    ``H``, ``Q``, ``R`` (or spike GLM) are unidentified and a state should keep
+    its previous parameters.
+    """
+    return float(n_cont_states + 1)
+
+
+def warn_low_occupancy_states(
+    occupancy: jax.Array, min_occupancy: float, context: str, action: str
+) -> list[int]:
+    """Warn (host-side) about discrete states below the occupancy gate.
+
+    Parameters
+    ----------
+    occupancy : jax.Array, shape (n_discrete_states,)
+        Expected number of bins in each discrete state.
+    min_occupancy : float
+        Gate, e.g. :func:`minimum_state_occupancy`.
+    context : str
+        Name of the calling update, used as the warning prefix.
+    action : str
+        What happened to the gated states' parameters.
+
+    Returns
+    -------
+    list of int
+        Indices of the gated states (empty when none).
+    """
+    occupancy_host = [float(x) for x in jax.device_get(occupancy)]
+    low = [j for j, count in enumerate(occupancy_host) if count < min_occupancy]
+    if low:
+        warnings.warn(
+            f"{context}: discrete state(s) {low} have expected occupancy "
+            f"{[occupancy_host[j] for j in low]} bins, below the minimum "
+            f"{min_occupancy:g} (n_cont_states + 1); {action}.",
+            UserWarning,
+            stacklevel=3,
+        )
+    return low
+
+
+# The per-state regression solves (H*, A*) use a purely relative Cholesky shift
+# (1e-12 * max|diag|; the absolute part only keeps an all-zero Gram matrix of an
+# empty state factorizable) so the solution does not depend on the units of
+# the latent state -- psd_solve's default absolute 1e-9 floor would dominate a
+# Gram matrix of scale 1e-9.
+psd_solve_per_discrete_state = jax.vmap(
+    lambda x, y: psd_solve(x, y.T, diagonal_boost=1e-300, relative_boost=1e-12).T,
+    in_axes=(-1, -1),
     out_axes=-1,
 )
 
+# Relative eigenvalue floor for the M-step covariance estimates: an eigenvalue
+# below ``_MSTEP_COV_RELATIVE_FLOOR * trace(cov) / n`` is raised to that value.
+# Relative (not absolute) so the floor means the same thing in any latent or
+# observation units.
+_MSTEP_COV_RELATIVE_FLOOR = 1e-10
 
-@jax.jit
+
+def _floor_covariance_relative(
+    cov: jax.Array, relative_floor: float = _MSTEP_COV_RELATIVE_FLOOR
+) -> tuple[jax.Array, jax.Array]:
+    """Symmetrize and floor eigenvalues relative to the covariance's own scale.
+
+    Parameters
+    ----------
+    cov : jax.Array, shape (n, n)
+    relative_floor : float
+        Eigenvalues below ``relative_floor * trace(cov) / n`` are raised to it.
+
+    Returns
+    -------
+    floored : jax.Array, shape (n, n)
+        ``symmetrize(cov)`` unchanged when no eigenvalue is below the floor
+        (no eigen-reconstruction round-off), otherwise the floored matrix.
+    changed : jax.Array, bool scalar
+        Whether any eigenvalue was raised.
+    """
+    cov = symmetrize(cov)
+    n = cov.shape[-1]
+    tiny = jnp.finfo(cov.dtype).tiny
+    floor = relative_floor * jnp.maximum(jnp.trace(cov) / n, tiny)
+    eigvals, eigvecs = jnp.linalg.eigh(cov)
+    changed = jnp.any(eigvals < floor)
+    projected = symmetrize((eigvecs * jnp.maximum(eigvals, floor)[None, :]) @ eigvecs.T)
+    return jnp.where(changed, projected, cov), changed
+
+
+_floor_covariance_relative_per_discrete_state = jax.vmap(
+    _floor_covariance_relative, in_axes=(-1,), out_axes=(-1, 0)
+)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("use_fixed_measurement_matrix", "use_fixed_transition_matrix"),
+)
 def _switching_kalman_m_step_inner(
     obs: jax.Array,
     state_cond_smoother_means: jax.Array,
@@ -2073,7 +2165,13 @@ def _switching_kalman_m_step_inner(
     gamma1: jax.Array,
     beta: jax.Array,
     transition_pseudo_counts: jax.Array,
+    fixed_measurement_matrix: jax.Array,
+    fixed_continuous_transition_matrix: jax.Array,
+    use_fixed_measurement_matrix: bool = False,
+    use_fixed_transition_matrix: bool = False,
 ) -> tuple[
+    jax.Array,
+    jax.Array,
     jax.Array,
     jax.Array,
     jax.Array,
@@ -2094,24 +2192,36 @@ def _switching_kalman_m_step_inner(
     an approximation because the smoother does not expose next-time pair
     covariances for a fully pair-consistent Q update.
     ``transition_pseudo_counts`` is zeros for ML or ``(alpha - 1)`` for MAP.
+
+    ``R`` and ``Q`` are computed from the residual (centred) forms evaluated at
+    the ``H`` / ``A`` actually installed -- the solved ``H*`` / ``A*``, or the
+    fixed matrices when ``use_fixed_*`` is set:
+
+    - ``R_j = sum_t w_tj [(y_t - H m_tj)(y_t - H m_tj)^T + H P_tj H^T] / n_j``
+      (a weighted sum of PSD terms), and
+    - ``Q_j = [I, -A] [[Gamma2, Beta], [Beta^T, Gamma1]] [I, -A]^T / n_j``
+      (a congruence of a PSD second-moment matrix).
+
+    Both are PSD by construction and equal the textbook shortcuts
+    ``(alpha - H* delta^T) / n`` and ``(Gamma2 - A* Beta^T) / n`` at the
+    unconstrained optimum, but stay correct when ``H`` or ``A`` is held fixed.
+    The last two outputs flag, per state, whether a relative eigenvalue floor
+    changed ``R`` / ``Q``.
     """
     n_time = smoother_discrete_state_prob.sum(axis=0)
     n_time_1 = smoother_discrete_state_prob[1:].sum(axis=0)
 
-    # Compute intermediate expectation terms
-    gamma = jnp.sum(
+    # Weighted smoother moments.
+    weighted_cov_sum = jnp.sum(
         state_cond_smoother_covs * smoother_discrete_state_prob[:, None, None], axis=0
-    ) + weighted_sum_of_outer_products(
+    )
+    gamma = weighted_cov_sum + weighted_sum_of_outer_products(
         state_cond_smoother_means,
         state_cond_smoother_means,
         smoother_discrete_state_prob,
     )
-
     delta = weighted_sum_of_outer_products(
         obs[..., None], state_cond_smoother_means, smoother_discrete_state_prob
-    )
-    alpha = weighted_sum_of_outer_products(
-        obs[..., None], obs[..., None], smoother_discrete_state_prob
     )
 
     first_gamma = (
@@ -2123,18 +2233,44 @@ def _switching_kalman_m_step_inner(
     )
     gamma2 = gamma - first_gamma
 
-    # Measurement matrix and covariance
-    measurement_matrix = psd_solve_per_discrete_state(gamma, delta)
-    measurement_cov = cov_solve_per_discrete_state(
-        alpha, measurement_matrix, delta, n_time
+    # Measurement matrix: solved optimum, or the fixed matrix the model keeps.
+    if use_fixed_measurement_matrix:
+        measurement_matrix = fixed_measurement_matrix
+    else:
+        measurement_matrix = psd_solve_per_discrete_state(gamma, delta)
+
+    # Measurement covariance, residual form at the installed H.
+    predicted_obs = jnp.einsum(
+        "okj,tkj->toj", measurement_matrix, state_cond_smoother_means
+    )
+    obs_residual = obs[..., None] - predicted_obs
+    measurement_scatter = weighted_sum_of_outer_products(
+        obs_residual, obs_residual, smoother_discrete_state_prob
+    ) + jnp.einsum(
+        "okj,klj,plj->opj", measurement_matrix, weighted_cov_sum, measurement_matrix
+    )
+    measurement_cov, measurement_cov_floored = (
+        _floor_covariance_relative_per_discrete_state(
+            _divide_safe(measurement_scatter, n_time)
+        )
     )
 
-    # Transition matrix
-    continuous_transition_matrix = psd_solve_per_discrete_state(gamma1, beta)
+    # Transition matrix: solved optimum, or the fixed matrix the model keeps.
+    if use_fixed_transition_matrix:
+        continuous_transition_matrix = fixed_continuous_transition_matrix
+    else:
+        continuous_transition_matrix = psd_solve_per_discrete_state(gamma1, beta)
 
-    # Process covariance
-    process_cov = cov_solve_per_discrete_state(
-        gamma2, continuous_transition_matrix, beta, n_time_1
+    # Process covariance, residual form at the installed A.
+    def _process_scatter(A, gamma1_j, beta_j, gamma2_j):
+        cross = A @ beta_j.T
+        return gamma2_j - cross - cross.T + A @ gamma1_j @ A.T
+
+    process_scatter = jax.vmap(_process_scatter, in_axes=(-1, -1, -1, -1), out_axes=-1)(
+        continuous_transition_matrix, gamma1, beta, gamma2
+    )
+    process_cov, process_cov_floored = _floor_covariance_relative_per_discrete_state(
+        _divide_safe(process_scatter, n_time_1)
     )
 
     # Initial mean and covariance
@@ -2164,6 +2300,8 @@ def _switching_kalman_m_step_inner(
         init_state_cond_cov,
         discrete_state_transition,
         init_discrete_state_prob,
+        measurement_cov_floored,
+        process_cov_floored,
     )
 
 
@@ -2178,6 +2316,10 @@ def switching_kalman_maximization_step(
     pair_cond_smoother_covs: jax.Array | None = None,
     next_pair_cond_smoother_means: jax.Array | None = None,
     transition_prior: jax.Array | None = None,
+    fixed_measurement_matrix: jax.Array | None = None,
+    fixed_continuous_transition_matrix: jax.Array | None = None,
+    previous_params: dict | None = None,
+    estimate_measurement_params: bool = True,
 ) -> tuple[
     jax.Array,
     jax.Array,
@@ -2219,6 +2361,30 @@ def switching_kalman_maximization_step(
         counts (MAP estimate). Use ``get_transition_prior(concentration, stickiness,
         n_states)`` from ``contingency_belief`` to construct. If None, uses the
         standard ML estimate.
+    fixed_measurement_matrix : jax.Array | None
+        Shape ``(n_obs_dim, n_cont_states, n_discrete_states)``. The
+        measurement matrix the caller keeps fixed (e.g. a structured model
+        with ``update_measurement_matrix=False``). When given, it is returned
+        as ``measurement_matrix`` and ``measurement_cov`` is the optimum *for
+        this H* (full residual quadratic form) rather than the shortcut that
+        assumes the solved ``H*``.
+    fixed_continuous_transition_matrix : jax.Array | None
+        Shape ``(n_cont_states, n_cont_states, n_discrete_states)``. The
+        transition matrix the caller keeps fixed; ``process_cov`` is then the
+        fixed-``A`` residual optimum.
+    previous_params : dict | None
+        Current parameter values, keyed by any of
+        ``"continuous_transition_matrix"``, ``"measurement_matrix"``,
+        ``"process_cov"``, ``"measurement_cov"``. A discrete state whose
+        expected occupancy is below ``n_cont_states + 1`` bins carries too
+        little information to estimate its per-state parameters; it keeps the
+        previous values given here and a warning is emitted. Without
+        ``previous_params`` the raw estimates are returned ungated.
+    estimate_measurement_params : bool, default=True
+        Set False when the caller ignores ``measurement_matrix`` /
+        ``measurement_cov`` (e.g. point-process models passing dummy
+        observations): their occupancy gate and eigenvalue-floor warnings are
+        then skipped.
 
     Returns
     -------
@@ -2293,7 +2459,33 @@ def switching_kalman_maximization_step(
     else:
         transition_pseudo_counts = jnp.zeros((n_discrete_states, n_discrete_states))
 
-    return _switching_kalman_m_step_inner(
+    n_cont_states = state_cond_smoother_means.shape[1]
+    use_fixed_h = fixed_measurement_matrix is not None
+    use_fixed_a = fixed_continuous_transition_matrix is not None
+    dtype = jnp.result_type(state_cond_smoother_means)
+    fixed_h = (
+        jnp.asarray(fixed_measurement_matrix, dtype=dtype)
+        if use_fixed_h
+        else jnp.zeros((obs.shape[1], n_cont_states, n_discrete_states), dtype)
+    )
+    fixed_a = (
+        jnp.asarray(fixed_continuous_transition_matrix, dtype=dtype)
+        if use_fixed_a
+        else jnp.zeros((n_cont_states, n_cont_states, n_discrete_states), dtype)
+    )
+
+    (
+        continuous_transition_matrix,
+        measurement_matrix,
+        process_cov,
+        measurement_cov,
+        init_state_cond_mean,
+        init_state_cond_cov,
+        discrete_state_transition,
+        init_discrete_state_prob,
+        measurement_cov_floored,
+        process_cov_floored,
+    ) = _switching_kalman_m_step_inner(
         obs,
         state_cond_smoother_means,
         state_cond_smoother_covs,
@@ -2302,6 +2494,71 @@ def switching_kalman_maximization_step(
         gamma1,
         beta,
         transition_pseudo_counts,
+        fixed_h,
+        fixed_a,
+        use_fixed_measurement_matrix=use_fixed_h,
+        use_fixed_transition_matrix=use_fixed_a,
+    )
+
+    # Near-empty discrete states: with fewer than n_cont_states + 1 expected
+    # bins the per-state regressions are unidentified, so keep the previous
+    # per-state parameters (when supplied) instead of installing noise.
+    min_occupancy = minimum_state_occupancy(n_cont_states)
+    occupancy = jnp.sum(smoother_discrete_state_prob, axis=0)
+    transition_occupancy = jnp.sum(smoother_discrete_state_prob[1:], axis=0)
+    obs_ok = occupancy >= min_occupancy
+    if not estimate_measurement_params:
+        obs_ok = jnp.ones_like(obs_ok)
+        measurement_cov_floored = jnp.zeros_like(measurement_cov_floored)
+    trans_ok = transition_occupancy >= min_occupancy
+    previous = {} if previous_params is None else previous_params
+
+    def _keep_previous(name: str, new: jax.Array, ok: jax.Array) -> jax.Array:
+        if previous.get(name) is None:
+            return new
+        return jnp.where(ok, new, jnp.asarray(previous[name], dtype=new.dtype))
+
+    continuous_transition_matrix = _keep_previous(
+        "continuous_transition_matrix", continuous_transition_matrix, trans_ok
+    )
+    process_cov = _keep_previous("process_cov", process_cov, trans_ok)
+    measurement_matrix = _keep_previous(
+        "measurement_matrix", measurement_matrix, obs_ok
+    )
+    measurement_cov = _keep_previous("measurement_cov", measurement_cov, obs_ok)
+
+    # Inside an outer trace the inner jit's outputs are tracers even when the
+    # caller's inputs are concrete, so check the flags themselves.
+    if not contains_tracer(measurement_cov_floored, process_cov_floored, occupancy):
+        if previous:
+            warn_low_occupancy_states(
+                jnp.where(obs_ok, transition_occupancy, occupancy),
+                min_occupancy,
+                "switching_kalman_maximization_step",
+                "their per-state A/Q/H/R kept their previous values",
+            )
+        floored = (measurement_cov_floored & obs_ok) | (process_cov_floored & trans_ok)
+        floored_states = [int(j) for j in jax.device_get(jnp.flatnonzero(floored))]
+        if floored_states:
+            # Logged, not raised as a Python warning: tiny or noise-free data
+            # legitimately produce singular per-state R/Q.
+            logger.warning(
+                "switching_kalman_maximization_step: the relative eigenvalue "
+                "floor (%g x trace / n) raised an eigenvalue of R or Q for "
+                "discrete state(s) %s; the estimate was (numerically) singular.",
+                _MSTEP_COV_RELATIVE_FLOOR,
+                floored_states,
+            )
+
+    return (
+        continuous_transition_matrix,
+        measurement_matrix,
+        process_cov,
+        measurement_cov,
+        init_state_cond_mean,
+        init_state_cond_cov,
+        discrete_state_transition,
+        init_discrete_state_prob,
     )
 
 
