@@ -3788,6 +3788,58 @@ class TestBlockDiagonalSmootherEquivalence:
                         f"cross_cov off-block ({j},{k}) at t={t} is nonzero"
                     )
 
+    def test_heterogeneous_per_neuron_dynamics_match_dense(self) -> None:
+        """Each neuron may have its own A and Q block: the block smoother
+        (Z_base + block ints through the public API) must use neuron j's
+        blocks for neuron j and match the dense smoother."""
+        init_mean, init_cov, _, _, Z, spikes, dt = self._make_problem(
+            n_neurons=3, block_size=4, T=30
+        )
+        n_neurons, nb = 3, 4
+        key = jax.random.PRNGKey(11)
+        A = jnp.zeros((12, 12))
+        Q = jnp.zeros((12, 12))
+        for j in range(n_neurons):
+            s = slice(j * nb, (j + 1) * nb)
+            noise = jax.random.normal(jax.random.fold_in(key, j), (nb, nb))
+            A = A.at[s, s].set((0.9 + 0.04 * j) * jnp.eye(nb) + 0.02 * noise)
+            Q = Q.at[s, s].set(jnp.eye(nb) * 1e-3 * (1 + 3 * j))
+        dense = stochastic_point_process_smoother(
+            init_mean,
+            init_cov,
+            Z,
+            spikes,
+            dt,
+            A,
+            Q,
+            log_conditional_intensity,
+            validate_inputs=False,
+            force_dense=True,
+        )
+        block = stochastic_point_process_smoother(
+            init_mean,
+            init_cov,
+            Z[:, 0, :nb],
+            spikes,
+            dt,
+            A,
+            Q,
+            log_conditional_intensity,
+            validate_inputs=False,
+            block_n_neurons=n_neurons,
+            block_size=nb,
+        )
+        for name, b, d in zip(("mean", "cov", "cross_cov"), block[:3], dense[:3]):
+            np.testing.assert_allclose(
+                np.asarray(b), np.asarray(d), atol=1e-10, err_msg=name
+            )
+        np.testing.assert_allclose(float(block[3]), float(dense[3]), atol=1e-9)
+        assert bool(
+            _block_diagonal_parameters_ok(
+                init_cov, A, Q, n_neurons=n_neurons, block_size=nb
+            )
+        )
+
     def test_shared_basis_input_and_block_covariances_match_dense(self) -> None:
         """Z_base + block ints through the public API, covariances as blocks.
 

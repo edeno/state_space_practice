@@ -1979,6 +1979,116 @@ class TestBlockDiagonalDispatch:
             atol=1e-14,
         )
 
+    @staticmethod
+    def _distinct_two_neuron_data(total_time: float) -> tuple:
+        """A place cell and an unrelated Poisson neuron: their fitted
+        per-neuron process noise genuinely differs."""
+        sim = simulate_2d_moving_place_field(
+            total_time=total_time, dt=0.02, rng=np.random.default_rng(1)
+        )
+        base = np.asarray(sim["spikes"]).squeeze()
+        other = np.random.default_rng(0).poisson(1.0, base.shape)
+        spikes = np.stack([base, other], axis=-1).astype(np.int64)
+        return sim["position"], spikes
+
+    @staticmethod
+    def _record_dispatch(model: PlaceFieldModel) -> list:
+        """Record the block dispatch in effect at every E-step."""
+        real_e_step = model._e_step
+        dispatch: list = []
+
+        def e_step(*args, **kwargs):
+            dispatch.append(model._block_n_neurons)
+            return real_e_step(*args, **kwargs)
+
+        model._e_step = e_step
+        return dispatch
+
+    @pytest.mark.slow
+    def test_fit_em_per_neuron_process_noise_stays_on_block_path(self) -> None:
+        """EM learns a different Q for each neuron. The block path must keep
+        running (each neuron with its own Q block) and match a dense fit to
+        roundoff in LL history, Q and A."""
+        position, spikes = self._distinct_two_neuron_data(total_time=8.0)
+        fits = {}
+        for force_dense in (False, True):
+            model = PlaceFieldModel(
+                dt=0.02, n_interior_knots=2, init_process_noise=1e-4
+            )
+            dispatch = self._record_dispatch(model)
+            lls = model.fit(
+                position, spikes, max_iter=3, verbose=False, force_dense=force_dense
+            )
+            fits[force_dense] = (model, lls, dispatch)
+
+        m_block, lls_block, dispatch_block = fits[False]
+        m_dense, lls_dense, dispatch_dense = fits[True]
+        assert set(dispatch_block) == {2}  # every E-step on the block path
+        assert set(dispatch_dense) == {None}
+        q_dense = np.asarray(jnp.diag(m_dense.process_cov))
+        nb = q_dense.size // 2
+        # guard: the neurons' learned Q really differ
+        assert np.max(np.abs(q_dense[:nb] - q_dense[nb:]) / q_dense[:nb]) > 1e-4
+
+        assert len(lls_block) == len(lls_dense)
+        np.testing.assert_allclose(lls_block, lls_dense, rtol=0, atol=1e-8)
+        np.testing.assert_allclose(
+            np.asarray(m_block.process_cov),
+            np.asarray(m_dense.process_cov),
+            rtol=1e-9,
+            atol=1e-16,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(m_block.transition_matrix),
+            np.asarray(m_dense.transition_matrix),
+        )
+
+    @pytest.mark.slow
+    def test_fit_sgd_block_path_learns_per_neuron_process_noise(self) -> None:
+        """fit_sgd on the block path trains every neuron's Q block (not just
+        neuron 0's) and matches a dense fit."""
+        import optax
+
+        position, spikes = self._distinct_two_neuron_data(total_time=6.0)
+        q, dispatch = {}, {}
+        for force_dense in (False, True):
+            # init state fixed: its full-PSD SGD parameterization has
+            # off-block gradients only the dense path sees.
+            model = PlaceFieldModel(
+                dt=0.02, n_interior_knots=2, update_init_state=False
+            )
+            model.fit_sgd(
+                position,
+                spikes,
+                optimizer=optax.adam(1e-1),
+                num_steps=5,
+                force_dense=force_dense,
+            )
+            q[force_dense] = np.asarray(jnp.diag(model.process_cov))
+            dispatch[force_dense] = model._block_n_neurons
+        assert dispatch == {False: 2, True: None}
+        nb = q[True].size // 2
+        # guard: the dense fit learns different Q for the two neurons
+        assert np.max(np.abs(q[True][:nb] - q[True][nb:])) > 1e-8
+        np.testing.assert_allclose(q[False], q[True], rtol=1e-6)
+
+    @pytest.mark.slow
+    def test_fit_sgd_update_transition_matrix_dispatches_dense(self) -> None:
+        """SGD learns the full A, whose off-block entries only the dense
+        filter gives gradients to, so fit_sgd must not take the block path."""
+        import optax
+
+        position, spikes = self._distinct_two_neuron_data(total_time=4.0)
+        model = PlaceFieldModel(
+            dt=0.02, n_interior_knots=2, update_transition_matrix=True
+        )
+        model.fit_sgd(position, spikes, optimizer=optax.sgd(1e-4), num_steps=0)
+        assert model._block_n_neurons is None
+        # guard: the same data without A updates does take the block path
+        model = PlaceFieldModel(dt=0.02, n_interior_knots=2)
+        model.fit_sgd(position, spikes, optimizer=optax.sgd(1e-4), num_steps=0)
+        assert model._block_n_neurons == 2
+
     def test_em_falls_back_to_dense_when_m_step_breaks_structure(self) -> None:
         """When update_transition_matrix=True, the M-step writes back a
         dense A that breaks block-diagonal structure. The next E-step
