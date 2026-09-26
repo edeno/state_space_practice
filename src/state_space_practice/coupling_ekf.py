@@ -53,8 +53,7 @@ def _regress_coupling_all_neurons(
     and differ only in their spike column and baseline, so the whole
     population is one ``jax.vmap`` over neurons under one ``jax.jit``: the
     Newton / line-search scan inside :func:`glm_laplace_update` is traced
-    and compiled once for the population instead of once per neuron in a
-    Python loop of un-jitted calls.
+    and compiled once for the whole population.
 
     Parameters
     ----------

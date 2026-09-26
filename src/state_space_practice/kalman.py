@@ -666,9 +666,9 @@ def rts_backward_scan(
     This is the observable-agnostic backward pass: it consumes filtered
     state estimates from any forward filter (linear-Gaussian, point-
     process / Laplace-EKF, oscillator) and produces smoothed estimates.
-    Both :func:`_kalman_smoother_impl` and the position-decoder
-    smoother call this helper so the RTS recurrence is implemented
-    once.
+    :func:`_kalman_smoother_impl`, the position-decoder smoother and
+    :func:`~state_space_practice.multinomial_choice.multinomial_choice_smoother`
+    all call this helper so the RTS recurrence is implemented once.
 
     Parameters
     ----------

@@ -895,8 +895,7 @@ def _cnm_psd_shrink_factor(
     which holds iff ``t * lambda_max(-M) <= 1``. So ``t* = 1 /
     lambda_max(-M)`` when that eigenvalue is positive and ``t* = 1`` (no
     shrink needed) otherwise -- one symmetric eigendecomposition, traceable
-    under ``jit``, in place of a bisection of up to 60 eigendecompositions
-    with a host sync each.
+    under ``jit``.
 
     A coordinate whose variance sits exactly at the floor has ``S_ii = 0``.
     It drops out of ``M`` (its scale factor is set to 0) when its linkage
@@ -944,9 +943,8 @@ def project_correlated_noise_process_covariance(
     linkage blocks toward zero -- by the closed-form factor of
     :func:`_cnm_psd_shrink_factor` -- until the covariance is positive
     semidefinite with minimum eigenvalue ``min_eigenvalue``.  Fully traceable
-    (one eigendecomposition, no host syncs): the function is jit-compiled, so
-    the per-EM-iteration callers pay one compile per covariance shape instead
-    of a bisection of up to 60 eigendecompositions and host syncs per call.
+    (one eigendecomposition, no host syncs) and jit-compiled, so per-EM-iteration
+    callers pay one compile per covariance shape.
     """
     structured, diag_only = _cnm_structured_projection(
         process_covariance, min_eigenvalue
@@ -1300,9 +1298,11 @@ class DirectedInfluenceDynamicsMixin:
     _current_osc_params: dict | None
 
     def _initialize_continuous_transition_matrix(self) -> None:
-        """A varies across states: built from the intrinsic params via the
-        shared stability scale, so the initial matrices already honor
-        ``max_spectral_radius`` before the first E-step runs."""
+        """Build the per-state A from the intrinsic params via the stability scale.
+
+        The initial matrices therefore already honor ``max_spectral_radius``
+        before the first E-step runs.
+        """
         self._rebuild_stable_transition_matrix()
 
     def _effective_dim_scale(self) -> jax.Array:
@@ -1371,8 +1371,10 @@ class DirectedInfluenceDynamicsMixin:
 
         The unconstrained switching Kalman M-step can leave the directed
         influence model family, so this projection is a hard structural
-        constraint (see :func:`project_transition_matrix_stack`). With the
-        reparameterized M-step ``A`` is already valid by construction.
+        constraint (see :func:`project_transition_matrix_stack`). Returns
+        without changes when ``A`` is not being learned
+        (``update_continuous_transition_matrix`` is False) or when the
+        reparameterized M-step already produced a valid ``A`` by construction.
         """
         if self.use_reparameterized_mstep:
             return
