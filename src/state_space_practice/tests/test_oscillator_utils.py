@@ -858,8 +858,7 @@ def test_project_transition_matrix_stack_projects_blocks_and_clamps_each_state()
     for j in range(2):
         assert _spectral_radius(project_coupled_transition_matrix(raw[..., j])) > bound
 
-    with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-        projected = project_transition_matrix_stack(raw, max_spectral_radius=bound)
+    projected = project_transition_matrix_stack(raw, max_spectral_radius=bound)
 
     assert projected.shape == raw.shape
     for j in range(3):
@@ -971,8 +970,7 @@ def test_directed_influence_mixin_projection_syncs_public_params_and_rebuilds():
     params; the reparameterized path leaves A untouched."""
     strong = jnp.zeros((2, 2, 2)).at[0, 1, :].set(2.0).at[1, 0, :].set(2.0)
     host = _DIMHost(strong)
-    with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-        host._initialize_continuous_transition_matrix()
+    host._initialize_continuous_transition_matrix()
     assert float(host._effective_dim_scale()) < 1.0  # guard: scale engaged
     for j in range(2):
         assert _spectral_radius(host.continuous_transition_matrix[..., j]) <= 0.9 + 1e-6
@@ -1007,8 +1005,7 @@ def test_directed_influence_mixin_projection_syncs_public_params_and_rebuilds():
         )
 
     reparam = _DIMHost(strong, use_reparameterized_mstep=True)
-    with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-        reparam._initialize_continuous_transition_matrix()
+    reparam._initialize_continuous_transition_matrix()
     unconstrained = jnp.full((4, 4, 2), 0.3)
     reparam.continuous_transition_matrix = unconstrained
     reparam._project_parameters()
@@ -1301,7 +1298,7 @@ def test_stability_scale_clamps_actual_radius_exactly_and_is_differentiable() ->
     np.testing.assert_array_equal(np.asarray(grad_weak), 0.0)
 
 
-def test_dim_scenario_truth_is_a_fixed_point_of_init_and_projection() -> None:
+def test_dim_scenario_truth_is_a_fixed_point_of_init_and_projection(caplog) -> None:
     """The repo's DIM scenario parameters survive init and the standard-EM
     projection/sync unchanged (the old loose scale shrank them to 0.76x)."""
     from state_space_practice.simulate.scenarios import simulate_dim_scenario
@@ -1319,7 +1316,9 @@ def test_dim_scenario_truth_is_a_fixed_point_of_init_and_projection() -> None:
     assert np.max(np.abs(np.asarray(host.continuous_transition_matrix) - A_true)) < 1e-8
 
     host.continuous_transition_matrix = jnp.asarray(A_true)
-    host._project_parameters()  # no clamp warning may fire (warnings are errors)
+    with caplog.at_level("WARNING"):
+        host._project_parameters()
+    assert "exceeded max_spectral_radius" not in caplog.text  # no clamp engaged
     assert np.max(np.abs(np.asarray(host.continuous_transition_matrix) - A_true)) < 1e-8
     np.testing.assert_allclose(host.damping_coef, params["damping"], atol=1e-10)
     np.testing.assert_allclose(
@@ -1327,7 +1326,7 @@ def test_dim_scenario_truth_is_a_fixed_point_of_init_and_projection() -> None:
     )
 
 
-def test_project_stack_clamps_only_the_unstable_uncoupled_block() -> None:
+def test_project_stack_clamps_only_the_unstable_uncoupled_block(caplog) -> None:
     """For uncoupled oscillators the clamp rescales only the offending block,
     leaves the stable rhythm untouched, and reports what it did."""
     unstable = 1.2 * _get_rotation_matrix(2.0 * jnp.pi * 8.0 / 100.0)
@@ -1335,8 +1334,10 @@ def test_project_stack_clamps_only_the_unstable_uncoupled_block() -> None:
     A = jnp.zeros((4, 4)).at[:2, :2].set(unstable).at[2:, 2:].set(stable)
     bound = 0.95
 
-    with pytest.warns(UserWarning, match=r"radius=1\.2.*scale=0\.791667"):
+    with caplog.at_level("WARNING"):
         projected = project_transition_matrix_stack(A[..., None], bound)[..., 0]
+    assert "rows [0, 1]: radius=1.2, scale=0.791667" in caplog.text
+    assert "rows [2, 3]" not in caplog.text
 
     np.testing.assert_allclose(projected[2:, 2:], stable, atol=1e-14)
     np.testing.assert_allclose(projected[:2, :2], unstable * (bound / 1.2), atol=1e-14)
@@ -1344,7 +1345,9 @@ def test_project_stack_clamps_only_the_unstable_uncoupled_block() -> None:
     np.testing.assert_allclose(_spectral_radius(projected), bound, rtol=1e-12)
 
 
-def test_stabilize_transition_matrix_block_clamp_follows_coupling_graph() -> None:
+def test_stabilize_transition_matrix_block_clamp_follows_coupling_graph(
+    caplog,
+) -> None:
     """One-directional coupling keeps the blocks' spectra separate, so only the
     unstable source block is scaled; mutual coupling falls back to one scale."""
     source = 1.1 * _get_rotation_matrix(0.3)
@@ -1353,23 +1356,24 @@ def test_stabilize_transition_matrix_block_clamp_follows_coupling_graph() -> Non
     one_way = jnp.zeros((4, 4)).at[:2, :2].set(source).at[2:, 2:].set(target)
     one_way = one_way.at[2:, :2].set(link)
 
-    with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
+    with caplog.at_level("WARNING"):
         clamped = stabilize_transition_matrix(one_way, 0.9, block_size=2)
+    assert "rows [0, 1]: radius=1.1" in caplog.text
     np.testing.assert_allclose(clamped[2:, 2:], target, atol=1e-14)
     np.testing.assert_allclose(clamped[2:, :2], link, atol=1e-14)
     np.testing.assert_allclose(_spectral_radius(clamped), 0.9, rtol=1e-12)
 
     mutual = one_way.at[:2, 2:].set(link)
     radius = _spectral_radius(mutual)
-    with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-        clamped_mutual = stabilize_transition_matrix(mutual, 0.9, block_size=2)
+    clamped_mutual = stabilize_transition_matrix(mutual, 0.9, block_size=2)
     np.testing.assert_allclose(clamped_mutual, mutual * (0.9 / radius), atol=1e-14)
 
     # Already stable: returned unchanged and silent.
-    np.testing.assert_array_equal(
-        np.asarray(stabilize_transition_matrix(0.5 * one_way, 0.9, block_size=2)),
-        np.asarray(0.5 * one_way),
-    )
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        unchanged = stabilize_transition_matrix(0.5 * one_way, 0.9, block_size=2)
+    np.testing.assert_array_equal(np.asarray(unchanged), np.asarray(0.5 * one_way))
+    assert caplog.text == ""
 
 
 def test_differentiable_spectral_radius_matches_numpy_under_jit_and_vmap() -> None:

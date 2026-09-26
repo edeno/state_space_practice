@@ -7303,13 +7303,12 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
                 [[-0.3, 0.9], [4.0, 1.2]],
             ]
         )
-        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-            model._store_sgd_params(
-                {
-                    "A_blocks_0": raw_blocks,
-                    "A_blocks_1": -raw_blocks,
-                }
-            )
+        model._store_sgd_params(
+            {
+                "A_blocks_0": raw_blocks,
+                "A_blocks_1": -raw_blocks,
+            }
+        )
 
         for j in range(model.n_discrete_states):
             A_j = model.continuous_transition_matrix[:, :, j]
@@ -7352,8 +7351,7 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
         model.continuous_transition_matrix = jnp.stack(
             [jnp.eye(n_latent) * 1.5] * model.n_discrete_states, axis=-1
         )
-        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-            model._project_parameters()
+        model._project_parameters()
 
         expected = 0.999 if max_spectral_radius is None else max_spectral_radius
         assert model.max_spectral_radius == expected
@@ -9811,8 +9809,7 @@ class TestSwitchingSpikeOscillatorSGD:
         raw_radii = self._state_radii(model._reconstruct_A_from_blocks(params))
         assert raw_radii.max() > bound + 1e-3
 
-        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-            model._store_sgd_params(params)
+        model._store_sgd_params(params)
 
         radii = self._state_radii(model.continuous_transition_matrix)
         assert np.all(radii <= bound + 1e-9)
@@ -9938,7 +9935,7 @@ class TestSwitchingSpikeOscillatorEMConsistency:
 # ---------------------------------------------------------------------------
 
 
-def test_separate_spike_glm_keeps_params_of_near_empty_state() -> None:
+def test_separate_spike_glm_keeps_params_of_near_empty_state(caplog) -> None:
     """A state with expected occupancy 1e-7 keeps its spike GLM parameters and
     warns; the occupied state is still refit."""
     from state_space_practice.switching_point_process import (
@@ -9968,8 +9965,9 @@ def test_separate_spike_glm_keeps_params_of_near_empty_state() -> None:
     spikes = jnp.asarray(rng.poisson(np.exp(2.0 + means[:, :1]) * 0.01, (n_time, 3)))
     before = model.spike_params
 
-    with pytest.warns(UserWarning, match=r"discrete state\(s\) \[1\]"):
+    with caplog.at_level("WARNING"):
         model._m_step_spikes(spikes)
+    assert "discrete state(s) [1] have expected occupancy" in caplog.text
 
     np.testing.assert_array_equal(
         np.asarray(model.spike_params.baseline[:, 1]),

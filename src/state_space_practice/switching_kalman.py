@@ -2072,7 +2072,10 @@ def minimum_state_occupancy(n_cont_states: int) -> float:
 def warn_low_occupancy_states(
     occupancy: jax.Array, min_occupancy: float, context: str, action: str
 ) -> list[int]:
-    """Warn (host-side) about discrete states below the occupancy gate.
+    """Log a warning (host-side) about discrete states below the occupancy gate.
+
+    Logged rather than raised with ``warnings.warn``: EM legitimately drives a
+    discrete state towards zero occupancy, and the gate runs every iteration.
 
     Parameters
     ----------
@@ -2093,12 +2096,14 @@ def warn_low_occupancy_states(
     occupancy_host = [float(x) for x in jax.device_get(occupancy)]
     low = [j for j, count in enumerate(occupancy_host) if count < min_occupancy]
     if low:
-        warnings.warn(
-            f"{context}: discrete state(s) {low} have expected occupancy "
-            f"{[occupancy_host[j] for j in low]} bins, below the minimum "
-            f"{min_occupancy:g} (n_cont_states + 1); {action}.",
-            UserWarning,
-            stacklevel=3,
+        logger.warning(
+            "%s: discrete state(s) %s have expected occupancy %s bins, below the "
+            "minimum %g (n_cont_states + 1); %s.",
+            context,
+            low,
+            [occupancy_host[j] for j in low],
+            min_occupancy,
+            action,
         )
     return low
 
@@ -3498,7 +3503,7 @@ def optimize_dim_transition_params(
         Bound on the spectral radius of the reconstructed ``A``, enforced after
         optimization. For uncoupled oscillators only the offending
         oscillator's damping is reduced; with coupling, damping and coupling
-        are scaled uniformly. A ``UserWarning`` reports any clamp. See
+        are scaled uniformly. A logged warning reports any clamp. See
         :func:`~state_space_practice.utils.stabilize_transition_matrix` for
         choosing it from the sampling rate and the narrowest bandwidth.
 
@@ -3587,11 +3592,12 @@ def optimize_dim_transition_params(
             opt_params["coupling_strength"] = (
                 opt_params["coupling_strength"] * safe_scale
             )
-        warnings.warn(
-            f"optimize_dim_transition_params: spectral radius {radius:.6g} "
-            f"exceeded max_spectral_radius={max_spectral_radius:g}; {detail}.",
-            UserWarning,
-            stacklevel=2,
+        logger.warning(
+            "optimize_dim_transition_params: spectral radius %.6g exceeded "
+            "max_spectral_radius=%g; %s.",
+            radius,
+            max_spectral_radius,
+            detail,
         )
 
     return opt_params

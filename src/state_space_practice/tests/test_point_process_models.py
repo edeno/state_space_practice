@@ -1022,8 +1022,7 @@ class TestDirectedInfluencePointProcessModel:
             .set(0.4)
         )
         model = DirectedInfluencePointProcessModel(**params, max_spectral_radius=0.7)
-        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-            model._initialize_parameters(jax.random.PRNGKey(0))
+        model._initialize_parameters(jax.random.PRNGKey(0))
 
         # Guard: raw (unscaled) construction would exceed the bound, so the
         # scale must actually be doing work here.
@@ -1051,19 +1050,17 @@ class TestDirectedInfluencePointProcessModel:
             **dim_pp_params, max_spectral_radius=0.7
         )
         # Damping 0.95 already exceeds the 0.7 bound, so every rebuild clamps.
-        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-            model._initialize_parameters(jax.random.PRNGKey(0))
+        model._initialize_parameters(jax.random.PRNGKey(0))
         n_osc, n_disc = model.n_oscillators, model.n_discrete_states
         strong = (
             jnp.zeros((n_osc, n_osc, n_disc)).at[0, 1, :].set(0.4).at[1, 0, :].set(0.4)
         )
-        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-            model._store_sgd_params(
-                {
-                    "coupling_strength": strong,
-                    "phase_difference": jnp.zeros((n_osc, n_osc, n_disc)),
-                }
-            )
+        model._store_sgd_params(
+            {
+                "coupling_strength": strong,
+                "phase_difference": jnp.zeros((n_osc, n_osc, n_disc)),
+            }
+        )
 
         scale = compute_directed_influence_stability_scale(
             model.freqs,

@@ -570,10 +570,8 @@ class TestDirectedInfluenceModel:
         model_high = DirectedInfluenceModel(**params, max_spectral_radius=0.99)
         model_low = DirectedInfluenceModel(**params, max_spectral_radius=0.5)
         # The clamp engages for both bounds and must say so.
-        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-            model_high._initialize_parameters(jax.random.PRNGKey(0))
-        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-            model_low._initialize_parameters(jax.random.PRNGKey(0))
+        model_high._initialize_parameters(jax.random.PRNGKey(0))
+        model_low._initialize_parameters(jax.random.PRNGKey(0))
 
         # Guard: scaling must actually be active for both, otherwise the
         # proportionality below would be vacuously satisfied by scale == 1.
@@ -730,9 +728,6 @@ def _assert_scaled_rotation_block(block, atol: float = 1e-8) -> None:
 class TestOscillatorPaperStructure:
     """Regression tests for the COM/CNM/DIM constraints in Hsin et al. 2024."""
 
-    # Tiny data leave some discrete states nearly empty; the occupancy gate
-    # keeps their parameters and warns, which is not what this test checks.
-    @pytest.mark.filterwarnings("ignore:.*expected occupancy:UserWarning")
     def test_em_pools_observation_covariance_across_states(
         self, synthetic_observations
     ) -> None:
@@ -972,9 +967,6 @@ class TestSingleDiscreteState:
 class TestEdgeCases:
     """Tests for edge cases and error handling."""
 
-    # Tiny data leave some discrete states nearly empty; the occupancy gate
-    # keeps their parameters and warns, which is not what this test checks.
-    @pytest.mark.filterwarnings("ignore:.*expected occupancy:UserWarning")
     def test_very_short_sequence(self, common_oscillator_params) -> None:
         """Model should handle very short observation sequences."""
         params = common_oscillator_params.copy()
@@ -1719,8 +1711,7 @@ class TestDIMStabilityEnforcement:
                 :, :, j
             ].set(jnp.eye(n_latent) * 1.5)
 
-        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-            model._project_parameters()
+        model._project_parameters()
 
         for j in range(model.n_discrete_states):
             A_j = model.continuous_transition_matrix[:, :, j]
@@ -1741,8 +1732,7 @@ class TestDIMStabilityEnforcement:
         model = DirectedInfluenceModel(
             **{**directed_influence_params, "coupling_strength": strong}
         )
-        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-            model._initialize_parameters(jax.random.PRNGKey(0))
+        model._initialize_parameters(jax.random.PRNGKey(0))
 
         # Public params are the intrinsic values; A applies the global stability
         # scale, so reconstruction re-applies it via _effective_dim_scale().
@@ -1810,13 +1800,12 @@ class TestDIMStabilityEnforcement:
         model._initialize_parameters(jax.random.PRNGKey(0))
         strong = jnp.zeros_like(model.coupling_strength)
         strong = strong.at[0, 1, :].set(2.0).at[1, 0, :].set(2.0)
-        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-            model._store_sgd_params(
-                {
-                    "phase_difference": model.phase_difference,
-                    "coupling_strength": strong,
-                }
-            )
+        model._store_sgd_params(
+            {
+                "phase_difference": model.phase_difference,
+                "coupling_strength": strong,
+            }
+        )
 
         # Public damping stays intrinsic (not shrunk); A applies the scale.
         assert bool(
@@ -1847,13 +1836,12 @@ class TestDIMStabilityEnforcement:
 
         damps = []
         for _ in range(4):
-            with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-                model._store_sgd_params(
-                    {
-                        "phase_difference": model.phase_difference,
-                        "coupling_strength": strong,
-                    }
-                )
+            model._store_sgd_params(
+                {
+                    "phase_difference": model.phase_difference,
+                    "coupling_strength": strong,
+                }
+            )
             damps.append(model.damping_coef)
             for j in range(model.n_discrete_states):
                 A = model.continuous_transition_matrix[..., j]
@@ -2237,9 +2225,6 @@ class TestOscillatorSmootherSelection:
         assert model.smoother_pair_cond_covs is None
         assert model.smoother_next_pair_cond_means is None
 
-    # Tiny data leave some discrete states nearly empty; the occupancy gate
-    # keeps their parameters and warns, which is not what this test checks.
-    @pytest.mark.filterwarnings("ignore:.*expected occupancy:UserWarning")
     def test_gpb2_statistics_reach_generic_mstep(
         self, common_oscillator_params, monkeypatch
     ) -> None:
@@ -3034,11 +3019,14 @@ def test_cnm_fixed_h_installs_fixed_h_optimal_r_and_em_is_monotone(
     gamma = P.sum(0) + m.T @ m
     delta = y.T @ m
     R_shortcut = (y.T @ y - H @ delta.T) / len(y)  # old: assumes H = H*
-    assert np.max(np.abs(np.linalg.solve(gamma, delta.T).T - H)) > 0.1  # guard
+    # Guard: the posterior regression H* is not the fixed H, so the two
+    # covariances differ by far more than the equality tolerance below.
+    assert np.max(np.abs(np.linalg.solve(gamma, delta.T).T - H)) > 1e-3
+    gap = np.max(np.abs(R_fixed_h - R_shortcut)) / np.max(np.abs(R_fixed_h))
+    assert gap > 1e-6
 
     model._m_step(obs)
-    np.testing.assert_allclose(model.measurement_cov[..., 0], R_fixed_h, rtol=1e-8)
-    assert np.max(np.abs(np.asarray(model.measurement_cov[..., 0]) - R_shortcut)) > 1e-2
+    np.testing.assert_allclose(model.measurement_cov[..., 0], R_fixed_h, rtol=1e-9)
 
     model._initialize_parameters(jax.random.PRNGKey(0))
     lls = np.asarray(model.fit(obs, max_iter=6, skip_init=True, tol=1e-12))

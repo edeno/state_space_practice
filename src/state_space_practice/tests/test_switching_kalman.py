@@ -6630,15 +6630,14 @@ def test_optimize_dim_transition_params_bounds_freq_and_uses_max_iter(
     _optimize_dim_single_core.clear_cache()
     try:
         # The unoptimized start is unstable, so the post-check clamps it.
-        with pytest.warns(UserWarning, match="exceeded max_spectral_radius"):
-            opt = optimize_dim_transition_params(
-                gamma1=jnp.eye(4),
-                beta=0.8 * jnp.eye(4),
-                init_params=init_params,
-                sampling_freq=100.0,
-                max_iter=7,
-                tol=1e-5,
-            )
+        opt = optimize_dim_transition_params(
+            gamma1=jnp.eye(4),
+            beta=0.8 * jnp.eye(4),
+            init_params=init_params,
+            sampling_freq=100.0,
+            max_iter=7,
+            tol=1e-5,
+        )
     finally:
         _optimize_dim_single_core.clear_cache()
 
@@ -7892,7 +7891,7 @@ def test_mstep_floor_engages_relatively_and_is_logged(random_mstep_stats, caplog
         np.testing.assert_allclose(eig[0], 1e-10 * eig.sum() / 3, rtol=1e-4)
 
 
-def test_mstep_keeps_previous_params_for_near_empty_state(random_mstep_stats):
+def test_mstep_keeps_previous_params_for_near_empty_state(random_mstep_stats, caplog):
     """A state with expected occupancy ~1e-7 keeps its previous A/Q/H/R, the
     occupied state is still updated, and a warning names the gated state."""
     stats = dict(random_mstep_stats)
@@ -7906,10 +7905,11 @@ def test_mstep_keeps_previous_params_for_near_empty_state(random_mstep_stats):
         "process_cov": jnp.stack([0.7 * jnp.eye(3)] * 2, axis=-1),
         "measurement_cov": jnp.stack([0.2 * jnp.eye(2)] * 2, axis=-1),
     }
-    with pytest.warns(UserWarning, match=r"discrete state\(s\) \[1\]"):
+    with caplog.at_level("WARNING"):
         A, H, Q, R, *_ = switching_kalman_maximization_step(
             **stats, previous_params=previous
         )
+    assert "discrete state(s) [1] have expected occupancy" in caplog.text
     for name, value in zip(
         [
             "continuous_transition_matrix",

@@ -485,8 +485,9 @@ def stabilize_transition_matrix(
         Size of the structural diagonal blocks. ``None`` applies one uniform
         scale to the whole matrix.
     warn : bool, default=True
-        Emit a ``UserWarning`` reporting the radius and applied scale whenever
-        the clamp engages.
+        Log a warning (``logging``, host-side) reporting the radius and applied
+        scale whenever the clamp engages. Logging rather than
+        ``warnings.warn`` because EM calls this every iteration.
 
     Returns
     -------
@@ -517,17 +518,18 @@ def stabilize_transition_matrix(
     if not applied:
         return A
     if warn:
+        import logging
+
         details = "; ".join(
             f"rows {idx.tolist()}: radius={radius:.6g}, scale={scale:.6g}"
             for idx, radius, scale in applied
         )
-        warnings.warn(
-            f"Transition matrix spectral radius exceeded max_spectral_radius="
-            f"{max_spectral_radius:g}; clamped ({details}). If a narrow-band "
-            "rhythm is expected, raise max_spectral_radius toward "
-            "1 - pi * bandwidth / sampling_freq.",
-            UserWarning,
-            stacklevel=2,
+        logging.getLogger(__name__).warning(
+            "Transition matrix spectral radius exceeded max_spectral_radius="
+            "%g; clamped (%s). If a narrow-band rhythm is expected, raise "
+            "max_spectral_radius toward 1 - pi * bandwidth / sampling_freq.",
+            max_spectral_radius,
+            details,
         )
     return jnp.asarray(stabilized, dtype=A.dtype)
 

@@ -1,3 +1,4 @@
+import logging
 import warnings
 
 import jax
@@ -11,6 +12,8 @@ from state_space_practice.utils import (
     stabilize_transition_matrix,
     symmetrize,
 )
+
+logger = logging.getLogger(__name__)
 
 IDENTITY_2x2 = jnp.identity(2)
 # Relative tolerance above ``max_spectral_radius`` tolerated by the DIM stability
@@ -1319,7 +1322,9 @@ class DirectedInfluenceDynamicsMixin:
     The public ``damping_coef`` / ``coupling_strength`` are *intrinsic*: the
     stability scale is applied only to the effective values used to build
     ``A``, never written back, so rebuilding is idempotent and damping does not
-    drift toward zero across successive fits with strong coupling.
+    drift toward zero across successive fits with strong coupling. (The
+    standard-EM sync is the exception: there the public values are estimates
+    extracted from ``A`` itself, see :meth:`_sync_coupling_from_transition_matrix`.)
     """
 
     freqs: jax.Array
@@ -1390,15 +1395,16 @@ class DirectedInfluenceDynamicsMixin:
         )
         scale = float(self._effective_dim_scale())
         if scale < 1.0:
-            warnings.warn(
-                "DIM transition matrix exceeded max_spectral_radius="
-                f"{self.max_spectral_radius:g} (radius="
-                f"{self.max_spectral_radius / scale:.6g}); effective damping and "
-                f"coupling were scaled by {scale:.6g}. The public parameters "
-                "stay intrinsic; raise max_spectral_radius toward "
-                "1 - pi * bandwidth / sampling_freq for narrow-band rhythms.",
-                UserWarning,
-                stacklevel=2,
+            # Logged (not warnings.warn): EM and SGD rebuild A every step.
+            logger.warning(
+                "DIM transition matrix exceeded max_spectral_radius=%g "
+                "(radius=%.6g); effective damping and coupling were scaled by "
+                "%.6g. The public parameters stay intrinsic; raise "
+                "max_spectral_radius toward 1 - pi * bandwidth / sampling_freq "
+                "for narrow-band rhythms.",
+                self.max_spectral_radius,
+                self.max_spectral_radius / scale,
+                scale,
             )
         if self._current_osc_params is not None:
             self._current_osc_params = self._intrinsic_osc_params()
@@ -1449,10 +1455,12 @@ class DirectedInfluenceDynamicsMixin:
 
         The projection has already clamped each state's *actual* spectral
         radius and the extract -> construct round-trip of a single state is
-        exact, so the rebuild's stability scale (which engages only when the
-        actual radius exceeds the bound) is the identity here. It re-engages
-        only when averaging the shared frequency/damping across disagreeing
-        states pushes a rebuilt ``A_j`` past the bound.
+        exact, so ``A`` is not re-scaled here. Only when averaging the shared
+        frequency/damping across disagreeing states pushes a rebuilt ``A_j``
+        past the bound are the extracted damping and coupling scaled by the
+        exact factor -- written into the public parameters, which here are
+        estimates of ``A`` rather than user-supplied intrinsic values -- so the
+        public parameters reconstruct ``A`` with a stability scale of 1.
         """
         params = extract_dim_params_from_matrix_stack(
             self.continuous_transition_matrix, self.sampling_freq, self.n_oscillators
@@ -1461,4 +1469,7 @@ class DirectedInfluenceDynamicsMixin:
         self.damping_coef = params["damping"]
         self.coupling_strength = params["coupling_strength"]
         self.phase_difference = params["phase_diff"]
+        scale = self._effective_dim_scale()
+        self.damping_coef = self.damping_coef * scale
+        self.coupling_strength = self.coupling_strength * scale
         self._rebuild_stable_transition_matrix()
