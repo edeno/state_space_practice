@@ -194,8 +194,10 @@ class SGDFittableMixin:
         """
         import optax
 
-        args, kwargs = self._prepare_sgd_data(*args, **kwargs)
+        # Validate the plain settings before the hook: ``_prepare_sgd_data`` may
+        # mutate the model (e.g. record the sequence length).
         num_steps = validate_int(num_steps, "num_steps", nonnegative=True)
+        args, kwargs = self._prepare_sgd_data(*args, **kwargs)
 
         self._check_sgd_initialized()
         params, param_spec = self._build_param_spec()
@@ -213,7 +215,9 @@ class SGDFittableMixin:
         )
         n_timesteps = float(self._n_timesteps)
         if not math.isfinite(n_timesteps) or n_timesteps <= 0.0:
-            raise ValueError("_n_timesteps must be positive and finite for SGD fitting.")
+            raise ValueError(
+                "_n_timesteps must be positive and finite for SGD fitting."
+            )
         if not _tree_all_finite(unc_params):
             raise ValueError(
                 "Initial unconstrained SGD parameters contain NaN or inf. "

@@ -164,9 +164,7 @@ class TestSGDFittableMixin:
 
     def test_convergence_tol(self) -> None:
         model = _ToyModel(scale=4.9)
-        lls = model.fit_sgd(
-            jnp.array(5.0), num_steps=500, convergence_tol=1e-8
-        )
+        lls = model.fit_sgd(jnp.array(5.0), num_steps=500, convergence_tol=1e-8)
         # Should converge early
         assert len(lls) < 500
         assert model.converged_ is True
@@ -333,9 +331,7 @@ class TestSGDFittableMixin:
                 pass
 
             def _build_param_spec(self):
-                return {"scale": jnp.array(self.scale)}, {
-                    "scale": UNCONSTRAINED
-                }
+                return {"scale": jnp.array(self.scale)}, {"scale": UNCONSTRAINED}
 
             def _sgd_loss_fn(self, params):
                 return jnp.sqrt(params["scale"])
@@ -397,9 +393,7 @@ class TestSGDFittableMixin:
                 pass
 
             def _build_param_spec(self):
-                return {"scale": jnp.array(self.scale)}, {
-                    "scale": UNCONSTRAINED
-                }
+                return {"scale": jnp.array(self.scale)}, {"scale": UNCONSTRAINED}
 
             def _sgd_loss_fn(self, params, _target):
                 # Loss = -scale (maximize scale). NaN once scale > 1.4.
@@ -439,9 +433,7 @@ class TestSGDFittableMixin:
         model = _NanAboveThreshold()
         optimizer = optax.sgd(learning_rate=0.5)
 
-        lls = model.fit_sgd(
-            jnp.array(0.0), optimizer=optimizer, num_steps=10
-        )
+        lls = model.fit_sgd(jnp.array(0.0), optimizer=optimizer, num_steps=10)
 
         # Finite LL for steps 0, 1, 2 (loss = 0, -0.5, -1.0 → LL = 0, 50, 100)
         assert len(lls) == 3, f"expected 3 finite steps, got {len(lls)}"
@@ -468,9 +460,7 @@ class TestSGDFittableMixin:
                 pass
 
             def _build_param_spec(self):
-                return {"scale": jnp.array(self.scale)}, {
-                    "scale": UNCONSTRAINED
-                }
+                return {"scale": jnp.array(self.scale)}, {"scale": UNCONSTRAINED}
 
             def _sgd_loss_fn(self, params):
                 return jnp.where(
@@ -517,9 +507,7 @@ class TestSGDFittableMixin:
                 pass
 
             def _build_param_spec(self):
-                return {"scale": jnp.array(self.scale)}, {
-                    "scale": UNCONSTRAINED
-                }
+                return {"scale": jnp.array(self.scale)}, {"scale": UNCONSTRAINED}
 
             def _sgd_loss_fn(self, params, _target):
                 return jnp.where(
@@ -656,3 +644,21 @@ class TestPrepareSGDDataHook:
 
         with pytest.raises(TypeError, match="unexpected keyword argument 'key'"):
             _Strict().fit_sgd(jnp.array(1.0), key=1, num_steps=0)
+
+    def test_invalid_num_steps_is_rejected_before_the_hook_runs(self) -> None:
+        """``_prepare_sgd_data`` may have side effects (e.g. recording the
+        sequence length); an invalid ``num_steps`` must fail before it runs."""
+        calls: list[str] = []
+
+        class _Recording(_ToyModel):
+            def _prepare_sgd_data(self, target):
+                calls.append("prepare")
+                return (target,), {}
+
+        _Recording().fit_sgd(jnp.array(1.0), num_steps=0)
+        assert calls == ["prepare"]  # guard: the hook is reached when valid
+
+        calls.clear()
+        with pytest.raises(ValueError, match="num_steps"):
+            _Recording().fit_sgd(jnp.array(1.0), num_steps=-1)
+        assert calls == []
