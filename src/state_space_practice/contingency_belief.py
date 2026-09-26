@@ -1236,7 +1236,11 @@ class ContingencyBeliefModel(SGDFittableMixin):
         alpha = get_transition_prior(
             self.concentration, self.stickiness, self.n_states
         )
-        design = jnp.asarray(self._transition_design_matrix[:-1])  # (T-1, d)
+        # xi[t] = P(s_t, s_{t+1} | data) and the filter/smoother drive the
+        # s_t -> s_{t+1} transition with covariate row t+1 (they scan over
+        # ``transition_covariates[1:]``), so the response xi[t] pairs with
+        # design row t+1.
+        design = jnp.asarray(self._transition_design_matrix[1:])  # (T-1, d)
         l2_pen = self.transition_regularization
 
         def _optimize_one_row(x0_flat, response_row, alpha_row):

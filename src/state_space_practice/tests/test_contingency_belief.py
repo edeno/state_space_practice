@@ -1021,3 +1021,96 @@ class TestContingencyBeliefValidation:
         m2 = ContingencyBeliefModel(n_states=2, n_options=2)
         m2.fit(choices, rewards, max_iter=100)
         assert m2.converged_ is True
+
+
+# ---------------------------------------------------------------------------
+# Transition M-step: covariate alignment, compile-once, seeding
+# ---------------------------------------------------------------------------
+
+# Sticky 2-state IO-HMM whose switch covariate flips the preferred next state.
+# Centered logits (last state is the reference): row i is the logit of moving
+# from state i to state 0.
+_SWITCH_INTERCEPT = np.array([[3.4], [-3.4]])
+_SWITCH_WEIGHT = np.array([[-6.8], [6.8]])
+
+
+def _simulate_switch_covariate_iohmm(n_trials=600, switch_rate=0.08, seed=0):
+    """Simulate the contingency model with a transition 'switch' covariate.
+
+    Covariate row ``t`` drives the ``s_{t-1} -> s_t`` transition (the
+    filter's convention). Choices are uniform and carry no state information;
+    rewards are strongly state-dependent so the posterior is sharp.
+    """
+    rng = np.random.default_rng(seed)
+    switch = (rng.random(n_trials) < switch_rate).astype(float)
+    switch[0] = 0.0
+    states = np.zeros(n_trials, dtype=int)
+    for t in range(1, n_trials):
+        prev = states[t - 1]
+        logit = _SWITCH_INTERCEPT[prev, 0] + _SWITCH_WEIGHT[prev, 0] * switch[t]
+        p_to_zero = 1.0 / (1.0 + np.exp(-logit))
+        states[t] = 0 if rng.random() < p_to_zero else 1
+    reward_probs = np.array([[0.9, 0.1], [0.1, 0.9]])
+    choices = rng.integers(0, 2, size=n_trials)
+    rewards = (rng.random(n_trials) < reward_probs[states, choices]).astype(int)
+    return choices, rewards, switch[:, None], states, reward_probs
+
+
+def _true_switch_model(covariates, reward_probs):
+    model = ContingencyBeliefModel(n_states=2, n_options=2)
+    model.reward_probs_ = jnp.asarray(reward_probs)
+    model.state_values_ = jnp.zeros((2, 2))
+    model.transition_coefficients_ = jnp.asarray(
+        np.stack([_SWITCH_INTERCEPT, _SWITCH_WEIGHT])  # (n_coef, S, S-1)
+    )
+    model._transition_design_matrix = model._build_design_matrix(
+        covariates.shape[0], jnp.asarray(covariates)
+    )
+    return model
+
+
+class TestTransitionMStep:
+    def test_m_step_recovers_switch_covariate_weights(self):
+        """One M-step from the true posterior recovers the covariate weights.
+
+        ``xi[t]`` is the posterior of the ``s_t -> s_{t+1}`` transition, which
+        the filter/smoother drive with covariate row ``t + 1``. Pairing it with
+        row ``t`` regresses each transition on the *previous* trial's
+        covariate, which is independent of it, and returns weights near 0.
+        """
+        choices, rewards, cov, states, reward_probs = (
+            _simulate_switch_covariate_iohmm()
+        )
+        model = _true_switch_model(cov, reward_probs)
+        posterior = contingency_belief_smoother(
+            **model._smoother_kwargs(jnp.asarray(choices), jnp.asarray(rewards))
+        )
+        # guard: the true-parameter posterior is informative about the states
+        accuracy = np.mean(
+            np.asarray(posterior.smoothed_state_prob).argmax(axis=1) == states
+        )
+        assert accuracy > 0.9
+
+        # Start the M-step from uninformed (zero) transition coefficients.
+        model.transition_coefficients_ = jnp.zeros((2, 2, 1))
+        model._m_step(jnp.asarray(choices), jnp.asarray(rewards), posterior)
+        weight = np.asarray(model.transition_coefficients_[1, :, 0])
+        intercept = np.asarray(model.transition_coefficients_[0, :, 0])
+
+        # Right sign and within a factor of two of the true +-6.8.
+        assert weight[0] < -3.4 and weight[1] > 3.4, weight
+        assert np.all(np.abs(weight) < 13.6), weight
+        # Stickiness recovered too: from state 0 prefer 0, from state 1 prefer 1.
+        assert intercept[0] > 1.5 and intercept[1] < -1.5, intercept
+
+    def test_em_with_switch_covariate_learns_sign(self):
+        """Full EM (same alignment as the filter) learns the switch effect."""
+        choices, rewards, cov, _, _ = _simulate_switch_covariate_iohmm(seed=1)
+        model = ContingencyBeliefModel(n_states=2, n_options=2)
+        model.fit(choices, rewards, transition_covariates=cov, max_iter=40)
+        weight = np.asarray(model.transition_coefficients_[1, :, 0])
+        intercept = np.asarray(model.transition_coefficients_[0, :, 0])
+        # State labels are arbitrary: compare the weight with the stickiness
+        # direction of the same row. A switch covariate opposes stickiness.
+        assert np.all(np.sign(weight) == -np.sign(intercept)), (weight, intercept)
+        assert np.all(np.abs(weight) > 2.0), weight
