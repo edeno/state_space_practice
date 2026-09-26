@@ -4,7 +4,7 @@ This module tests the switching point-process Kalman filter and smoother
 for spike-based observations with discrete state switching.
 """
 
-from typing import Callable
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -3747,7 +3747,14 @@ class TestDynamicsMStepReuse:
             pair_cond_smoother_means=pair_cond_smoother_means,
         )
 
-        # This should run without error - that's the main test
+        # The dynamics estimates must be valid parameters: a row-stochastic
+        # discrete transition matrix and a PSD process covariance per state.
+        np.testing.assert_allclose(
+            new_discrete_transition_matrix.sum(axis=1), 1.0, atol=1e-10
+        )
+        assert jnp.all(new_discrete_transition_matrix >= 0.0)
+        for j in range(n_discrete_states):
+            assert jnp.linalg.eigvalsh(new_process_cov[..., j]).min() > -1e-10
 
     def test_dynamics_mstep_returns_correct_shapes(self) -> None:
         """Dynamics M-step returns should have correct shapes for dynamics parameters.
@@ -4553,7 +4560,16 @@ class TestSwitchingSpikeOscillatorModelInitializeParameters:
         )
 
         key = jax.random.PRNGKey(42)
-        model._initialize_parameters(key)  # Should not raise
+        model._initialize_parameters(key)
+
+        # The initial parameters must already be valid: row-stochastic Z,
+        # a normalized initial discrete distribution and PSD per-state Q.
+        np.testing.assert_allclose(
+            model.discrete_transition_matrix.sum(axis=1), 1.0, atol=1e-10
+        )
+        np.testing.assert_allclose(model.init_discrete_state_prob.sum(), 1.0)
+        for j in range(model.n_discrete_states):
+            assert jnp.linalg.eigvalsh(model.process_cov[..., j]).min() > 0.0
 
     def test_initialize_parameters_sets_init_mean(self) -> None:
         """_initialize_parameters should set init_mean with correct shape."""
@@ -5347,8 +5363,14 @@ class TestSwitchingSpikeOscillatorModelMStepDynamics:
         # Run E-step first (required before M-step)
         model._e_step(spikes)
 
-        # M-step dynamics should not raise
         model._m_step_dynamics()
+
+        # Post-condition: the updated dynamics are still valid parameters.
+        np.testing.assert_allclose(
+            model.discrete_transition_matrix.sum(axis=1), 1.0, atol=1e-10
+        )
+        for j in range(model.n_discrete_states):
+            assert jnp.linalg.eigvalsh(model.process_cov[..., j]).min() > 0.0
 
     def test_m_step_dynamics_updates_continuous_transition_matrix(self) -> None:
         """_m_step_dynamics should update continuous_transition_matrix when flag is True."""
@@ -5887,9 +5909,16 @@ class TestSwitchingSpikeOscillatorModelMStepSpikes:
 
         # Run E-step first (required before M-step)
         model._e_step(spikes)
+        weights_before = model.spike_params.weights
 
-        # M-step spikes should not raise
         model._m_step_spikes(spikes)
+
+        # update_spike_params defaults to True: the GLM weights must move and
+        # stay finite.
+        assert model.update_spike_params
+        assert jnp.all(jnp.isfinite(model.spike_params.weights))
+        assert jnp.all(jnp.isfinite(model.spike_params.baseline))
+        assert not jnp.allclose(model.spike_params.weights, weights_before)
 
     def test_m_step_spikes_updates_spike_params_when_enabled(self) -> None:
         """_m_step_spikes should update spike_params when flag is True."""
@@ -6944,8 +6973,17 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
 
         model._initialize_parameters(jax.random.PRNGKey(0))
 
-        # Should not raise any exceptions
         model._project_parameters()
+        A_once = model.continuous_transition_matrix
+        Q_once = model.process_cov
+
+        # A projection is idempotent: projecting already-valid parameters
+        # again must leave them unchanged.
+        model._project_parameters()
+        np.testing.assert_allclose(
+            model.continuous_transition_matrix, A_once, rtol=1e-10, atol=1e-12
+        )
+        np.testing.assert_allclose(model.process_cov, Q_once, rtol=1e-10, atol=1e-12)
 
     def test_project_parameters_ensures_psd_process_cov(self) -> None:
         """_project_parameters() should ensure process covariance is PSD."""
@@ -9223,11 +9261,11 @@ class TestEMVerification:
         3. The filter doesn't corrupt the state when initialized at truth
         4. The smoother preserves the filter output when state is fixed
         """
+        from state_space_practice.switching_kalman import switching_kalman_smoother
         from state_space_practice.switching_point_process import (
             SpikeObsParams,
             switching_point_process_filter,
         )
-        from state_space_practice.switching_kalman import switching_kalman_smoother
 
         n_time, n_neurons, n_latent, dt = 1000, 4, 2, 0.01
 
@@ -9320,11 +9358,11 @@ class TestEMVerification:
         discrete state probability updates, likelihood scaling, and
         log-likelihood accumulation.
         """
+        from state_space_practice.switching_kalman import switching_kalman_smoother
         from state_space_practice.switching_point_process import (
             SpikeObsParams,
             switching_point_process_filter,
         )
-        from state_space_practice.switching_kalman import switching_kalman_smoother
 
         n_time, n_neurons, n_latent, dt = 500, 4, 2, 0.01
 

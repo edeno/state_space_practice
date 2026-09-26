@@ -472,10 +472,17 @@ class TestValidateCovariance:
 
     def test_symmetric_pd_passes(self) -> None:
         validate_covariance(jnp.eye(3))  # should not raise
+        # Guard: the check is live for this input -- flipping one diagonal
+        # entry's sign makes it indefinite and must be rejected.
+        with pytest.raises(ValueError, match="not positive definite"):
+            validate_covariance(jnp.eye(3).at[0, 0].set(-1.0))
 
     def test_per_state_stack_passes(self) -> None:
         cov = jnp.stack([jnp.eye(2), 2.0 * jnp.eye(2)], axis=-1)  # (2, 2, 2)
         validate_covariance(cov)
+        # Guard: every slice is checked, not just the first.
+        with pytest.raises(ValueError, match=r"\[\.\.\., 1\]"):
+            validate_covariance(cov.at[0, 0, 1].set(-2.0))
 
     def test_asymmetric_raises(self) -> None:
         # Symmetric eigvalsh would NOT catch this; the raw-matrix check must.
@@ -526,7 +533,11 @@ class TestValidateTransitionMatrix:
     """Tests for validate_transition_matrix (row-stochastic guard)."""
 
     def test_row_stochastic_passes(self) -> None:
-        validate_transition_matrix(jnp.array([[0.9, 0.1], [0.2, 0.8]]))
+        valid = jnp.array([[0.9, 0.1], [0.2, 0.8]])
+        validate_transition_matrix(valid)
+        # Guard: perturbing one row off the simplex must be rejected.
+        with pytest.raises(ValueError, match="sum to 1"):
+            validate_transition_matrix(valid.at[1, 1].set(0.9))
 
     def test_rows_not_summing_to_one_raises(self) -> None:
         with pytest.raises(ValueError, match="sum to 1"):
@@ -551,7 +562,11 @@ class TestValidateProbabilityVector:
     """Tests for validate_probability_vector (simplex guard)."""
 
     def test_valid_simplex_passes(self) -> None:
-        validate_probability_vector(jnp.array([0.2, 0.3, 0.5]))
+        valid = jnp.array([0.2, 0.3, 0.5])
+        validate_probability_vector(valid)
+        # Guard: a vector 0.1 off the simplex must be rejected.
+        with pytest.raises(ValueError, match="sum to 1"):
+            validate_probability_vector(valid.at[2].set(0.6))
 
     def test_unnormalized_raises(self) -> None:
         with pytest.raises(ValueError, match="sum to 1"):

@@ -26,8 +26,8 @@ from state_space_practice.point_process_kalman import (
     _fisher_scoring_line_search,
     _stochastic_point_process_smoother_block_diagonal,
     _validate_filter_numerics,
-    get_confidence_interval,
     dynamics_only_m_step,
+    get_confidence_interval,
     log_conditional_intensity,
     steepest_descent_point_process_filter,
     stochastic_point_process_filter,
@@ -2909,9 +2909,10 @@ class TestValidateFilterNumerics:
 
         init_cov = jnp.eye(36) * 0.5  # cond=1, min_eig=0.5
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")  # any warning would raise
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             _validate_filter_numerics(init_cov, n_time=10_000)
+        assert [str(w.message) for w in caught] == []
 
     def test_no_warning_in_f64_on_long_ill_conditioned(self) -> None:
         """f64 mode: even Problem B conditioning does NOT trigger a warning.
@@ -2933,10 +2934,14 @@ class TestValidateFilterNumerics:
         )
         U, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(2), (n, n)))
         init_cov = (U * eigs) @ U.T
+        # Guard: this really exercises the f64 path (the same matrix in f32
+        # warns, see test_warns_on_f32_long_ill_conditioned).
+        assert init_cov.dtype == jnp.float64
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             _validate_filter_numerics(init_cov, n_time=28_373)
+        assert [str(w.message) for w in caught] == []
 
     def test_warns_on_f32_long_ill_conditioned(self) -> None:
         """f32 init_cov on a long / ill-conditioned problem must warn.
@@ -2972,9 +2977,11 @@ class TestValidateFilterNumerics:
         import warnings
 
         init_cov_f32 = (jnp.eye(10) * 0.5).astype(jnp.float32)
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
+        assert init_cov_f32.dtype == jnp.float32  # guard: the f32 branch runs
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             _validate_filter_numerics(init_cov_f32, n_time=100)
+        assert [str(w.message) for w in caught] == []
 
     def test_validate_inputs_false_skips_check(self) -> None:
         """``validate_inputs=False`` bypasses the validation layer.

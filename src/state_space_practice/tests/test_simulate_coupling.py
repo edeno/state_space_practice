@@ -283,6 +283,11 @@ class TestValidation:
     def test_accepts_canonical_params(self, coupling_params_small):
         # guard: the valid fixture passes (validation isn't rejecting good input)
         validate_coupling_params(coupling_params_small)
+        # ...and the validated parameters build a stable latent transition
+        # (spectral radius = the per-band decay 0.99 < 1).
+        transition_matrix, _ = build_transition(coupling_params_small)
+        spectral_radius = np.abs(np.linalg.eigvals(np.asarray(transition_matrix))).max()
+        np.testing.assert_allclose(spectral_radius, 0.99, rtol=1e-10)
 
     def test_requires_jax_x64(self, coupling_params_small, monkeypatch):
         monkeypatch.setattr(coupling_model, "_coupling_x64_enabled", lambda: False)

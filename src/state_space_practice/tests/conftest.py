@@ -1,8 +1,11 @@
 # ruff: noqa: E402
 """Shared fixtures and Hypothesis strategies for state space model tests."""
 
+import ast
+import functools
+import inspect
 import os
-from typing import Tuple
+import textwrap
 
 import jax
 
@@ -24,6 +27,76 @@ settings.register_profile("ci", max_examples=100, deadline=None, derandomize=Tru
 settings.register_profile("dev", max_examples=10, deadline=None)
 # Select with HYPOTHESIS_PROFILE=ci (CI sets this); defaults to "dev".
 settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))
+
+
+# --- Automatic ``slow`` marking ---------------------------------------------
+#
+# CLAUDE.md: any test that runs EM, SGD or a full fit must be marked slow so the
+# fast suite (``-m "not slow"``) stays quick. Rather than rely on every author
+# remembering the decorator, a test is marked slow at collection time when
+#
+# 1. its own source calls ``.fit(``, ``.fit_sgd(`` or ``run_em(`` outside a
+#    ``with pytest.raises(...)`` block (input-validation tests that expect
+#    ``fit`` to raise before doing any work stay in the fast suite), or
+# 2. its node id contains an entry of ``_SLOW_TEST_REGISTRY`` (for tests whose
+#    fitting happens in helpers or fixtures, which the source scan can't see).
+#
+# Explicit ``@pytest.mark.slow`` keeps working as before.
+
+_FIT_METHODS = frozenset({"fit", "fit_sgd"})
+_FIT_FUNCTIONS = frozenset({"run_em"})
+
+# Node-id substrings (``file.py::Class`` or ``file.py::Class::test``).
+_SLOW_TEST_REGISTRY: tuple[str, ...] = ()
+
+
+def _is_fit_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return func.attr in _FIT_METHODS or func.attr in _FIT_FUNCTIONS
+    return isinstance(func, ast.Name) and func.id in _FIT_FUNCTIONS
+
+
+def _is_pytest_raises_block(node: ast.AST) -> bool:
+    if not isinstance(node, ast.With):
+        return False
+    for item in node.items:
+        expr = item.context_expr
+        if isinstance(expr, ast.Call):
+            expr = expr.func
+        if isinstance(expr, ast.Attribute) and expr.attr == "raises":
+            return True
+    return False
+
+
+def _calls_fit_outside_raises(node: ast.AST) -> bool:
+    if _is_pytest_raises_block(node):
+        return False
+    if _is_fit_call(node):
+        return True
+    return any(_calls_fit_outside_raises(child) for child in ast.iter_child_nodes(node))
+
+
+@functools.cache
+def _function_runs_fit(function) -> bool:
+    try:
+        source = textwrap.dedent(inspect.getsource(function))
+        tree = ast.parse(source)
+    except (OSError, TypeError, SyntaxError):
+        return False
+    return _calls_fit_outside_raises(tree)
+
+
+def pytest_collection_modifyitems(config, items):
+    for item in items:
+        if item.get_closest_marker("slow") is not None:
+            continue
+        function = getattr(item, "function", None)
+        in_registry = any(entry in item.nodeid for entry in _SLOW_TEST_REGISTRY)
+        if in_registry or (function is not None and _function_runs_fit(function)):
+            item.add_marker(pytest.mark.slow)
 
 
 # --- Hypothesis Strategies for State Space Models ---
@@ -512,7 +585,7 @@ def to_jax(*arrays: np.ndarray) -> tuple[jax.Array, ...]:
 
 
 @pytest.fixture(scope="session")
-def simple_1d_model() -> Tuple[Array, Array, Array, Array, Array, Array, Array]:
+def simple_1d_model() -> tuple[Array, Array, Array, Array, Array, Array, Array]:
     """Provides parameters and data for a simple 1D random walk model.
 
     Used by both test_kalman.py and test_switching_kalman.py.
@@ -533,7 +606,7 @@ def simple_1d_model() -> Tuple[Array, Array, Array, Array, Array, Array, Array]:
     obs = []
     k1, k2 = random.split(key)
 
-    for t in range(1, n_time):
+    for _t in range(1, n_time):
         w = random.multivariate_normal(k1, jnp.zeros(n_cont_states), process_cov)
         true_states.append(transition_matrix @ true_states[-1] + w)
         k1, _ = random.split(k1)
