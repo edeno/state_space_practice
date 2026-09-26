@@ -1798,15 +1798,16 @@ class SmithLearningModel(SGDFittableMixin):
     def _sgd_loss_fn(
         self, params: dict, n_correct_responses: Array
     ) -> Array:
-        sigma_eps = params.get(
-            "sigma_epsilon", jnp.array(self.sigma_epsilon)
-        )
-        init_state = params.get(
-            "init_learning_state", jnp.array(self.init_learning_state)
-        )
-        init_var = params.get(
-            "init_learning_variance", jnp.array(self.init_learning_variance)
-        )
+        # Read a model attribute only when the parameter is not optimized:
+        # ``params.get(key, self.attr)`` reads it regardless, and fit_sgd only
+        # reuses a compiled step while the attributes the loss read at trace
+        # time are unchanged (these are rewritten by every fit).
+        def _param(key: str) -> Array:
+            return params[key] if key in params else jnp.array(getattr(self, key))
+
+        sigma_eps = _param("sigma_epsilon")
+        init_state = _param("init_learning_state")
+        init_var = _param("init_learning_variance")
 
         (
             _prob_correct,

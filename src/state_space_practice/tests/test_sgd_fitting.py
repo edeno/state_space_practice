@@ -662,3 +662,173 @@ class TestPrepareSGDDataHook:
         with pytest.raises(ValueError, match="num_steps"):
             _Recording().fit_sgd(jnp.array(1.0), num_steps=-1)
         assert calls == []
+
+
+class _CallCounter:
+    """Mutable counter; the model holds one object, so reading the attribute
+    returns the same (identity-fingerprinted) value however often it counts."""
+
+    def __init__(self) -> None:
+        self.n = 0
+
+
+class _CountingToyModel(SGDFittableMixin):
+    """Toy model whose loss reads a model attribute and counts its calls.
+
+    ``_sgd_loss_fn`` runs once per trace of the compiled step plus once for
+    the (eager) final-loss evaluation of every ``fit_sgd`` call, so a call
+    that reuses the compiled step adds exactly one to ``loss_calls``.
+    """
+
+    def __init__(self, scale: float = 1.0, offset: float = 0.0):
+        self.scale = scale
+        self.offset = offset
+        self.counter = _CallCounter()
+
+    _n_timesteps = 10
+
+    @property
+    def loss_calls(self) -> int:
+        return self.counter.n
+
+    @loss_calls.setter
+    def loss_calls(self, value: int) -> None:
+        self.counter.n = value
+
+    def _build_param_spec(self):
+        return {"scale": jnp.array(self.scale)}, {"scale": UNCONSTRAINED}
+
+    def _sgd_loss_fn(self, params, target):
+        self.counter.n += 1
+        return jnp.sum((params["scale"] - target - self.offset) ** 2)
+
+    def _store_sgd_params(self, params):
+        self.scale = float(params["scale"])
+
+    def _finalize_sgd(self, target):
+        pass
+
+
+class TestCompiledStepCache:
+    """fit_sgd reuses its compiled step across calls on the same model."""
+
+    def test_second_call_with_same_shapes_does_not_retrace(self) -> None:
+        model = _CountingToyModel()
+        model.fit_sgd(jnp.array([1.0, 2.0]), num_steps=3)
+        first_calls = model.loss_calls
+        assert first_calls >= 2  # guard: at least one trace + the final loss
+        model.loss_calls = 0
+        model.fit_sgd(jnp.array([3.0, 4.0]), num_steps=3)
+        assert model.loss_calls == 1  # final loss only: no new trace
+
+    def test_no_recompile_logged_on_second_call(self, caplog) -> None:
+        import logging
+
+        model = _CountingToyModel()
+
+        def compiles(target):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="jax"):
+                with jax.log_compiles():
+                    model.fit_sgd(target, num_steps=3)
+            return [
+                r for r in caplog.records
+                if "Compiling" in r.getMessage()
+                and "_sgd_train_step" in r.getMessage()
+            ]
+
+        assert compiles(jnp.array([1.0, 2.0]))  # guard: the log is observed
+        assert compiles(jnp.array([5.0, 6.0])) == []
+
+    def test_cached_step_gives_identical_results(self) -> None:
+        """Reusing the compiled step is bit-identical to compiling afresh, and
+        the data are arguments (a new target is honoured without retracing)."""
+        from state_space_practice import sgd_fitting
+
+        data = [jnp.array([1.0, 2.0]), jnp.array([-3.0, 0.5])]
+        cached = _CountingToyModel(scale=0.5)
+        fresh = _CountingToyModel(scale=0.5)
+        cached_lls, fresh_lls = [], []
+        for target in data:
+            cached_lls.append(cached.fit_sgd(target, num_steps=5))
+            sgd_fitting._SGD_STEP_CACHE.pop(id(fresh), None)
+            fresh_lls.append(fresh.fit_sgd(target, num_steps=5))
+        assert cached_lls == fresh_lls
+        assert cached.scale == fresh.scale
+        # guard: the second fit really optimized toward the new target
+        assert cached_lls[1] != cached_lls[0]
+
+    def test_changed_model_attribute_read_by_loss_retraces(self) -> None:
+        """jit bakes attributes the loss reads; a cached step must not be
+        reused once such an attribute changes."""
+        import optax
+
+        # loss = (scale - offset)^2 / 10: lr 2.5 halves the error each step
+        optimizer = optax.sgd(2.5)
+        model = _CountingToyModel(scale=0.0, offset=0.0)
+        model.fit_sgd(jnp.array([0.0]), optimizer=optimizer, num_steps=40)
+        np.testing.assert_allclose(model.scale, 0.0, atol=1e-6)
+
+        model.offset = 2.0
+        model.loss_calls = 0
+        model.fit_sgd(jnp.array([0.0]), optimizer=optimizer, num_steps=40)
+        assert model.loss_calls > 1  # retraced
+        np.testing.assert_allclose(model.scale, 2.0, atol=1e-3)
+
+        model.loss_calls = 0
+        model.fit_sgd(jnp.array([0.0]), optimizer=optimizer, num_steps=1)
+        assert model.loss_calls == 1  # unchanged attribute: reused again
+
+    def test_new_optimizer_or_shape_compiles_new_step(self) -> None:
+        import optax
+
+        model = _CountingToyModel()
+        model.fit_sgd(jnp.array([1.0]), num_steps=2)
+        model.loss_calls = 0
+        model.fit_sgd(jnp.array([1.0]), optimizer=optax.adam(1e-2), num_steps=2)
+        assert model.loss_calls > 1
+        model.loss_calls = 0
+        model.fit_sgd(jnp.array([1.0, 2.0, 3.0]), num_steps=2)
+        assert model.loss_calls > 1
+
+    def test_cache_entry_released_with_model(self) -> None:
+        import gc
+
+        from state_space_practice import sgd_fitting
+
+        model = _CountingToyModel()
+        model.fit_sgd(jnp.array([1.0]), num_steps=2)
+        model_id = id(model)
+        assert model_id in sgd_fitting._SGD_STEP_CACHE
+        del model
+        gc.collect()
+        assert model_id not in sgd_fitting._SGD_STEP_CACHE
+
+    def test_models_remain_deep_copyable_after_fit(self) -> None:
+        import copy
+
+        model = _CountingToyModel()
+        model.fit_sgd(jnp.array([1.0]), num_steps=2)
+        clone = copy.deepcopy(model)
+        clone.loss_calls = 0
+        clone.fit_sgd(jnp.array([1.0]), num_steps=2)
+        assert clone.loss_calls > 1  # own cache, compiled for the clone
+
+    def test_loss_needing_concrete_data_falls_back_to_baked_data(self) -> None:
+        """A loss that inspects its data on the host (here ``np.asarray``)
+        cannot take the data as a traced argument; fit_sgd falls back to
+        baking it in as constants, as before the cache existed."""
+        import optax
+
+        class _HostValidating(_CountingToyModel):
+            def _sgd_loss_fn(self, params, target):
+                if np.any(np.asarray(target) < -100):  # host-side check
+                    raise ValueError("bad target")
+                return super()._sgd_loss_fn(params, target)
+
+        model = _HostValidating(scale=0.0)
+        model.fit_sgd(jnp.array([2.0]), optimizer=optax.sgd(2.5), num_steps=40)
+        np.testing.assert_allclose(model.scale, 2.0, atol=1e-6)
+        # a second call with new data is honoured (the fallback is uncached)
+        model.fit_sgd(jnp.array([-1.0]), optimizer=optax.sgd(2.5), num_steps=40)
+        np.testing.assert_allclose(model.scale, -1.0, atol=1e-6)

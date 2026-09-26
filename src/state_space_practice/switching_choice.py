@@ -1037,7 +1037,9 @@ class SwitchingChoiceModel(SGDFittableMixin):
             kwargs["obs_covariates"] = self._obs_covariates
             kwargs["obs_weights"] = params["obs_weights"]
 
-        result = switching_choice_filter(**kwargs)
+        # The jitted core, not the validating public wrapper: fit_sgd already
+        # validated the choices, which are a traced jit argument here.
+        result = _switching_choice_filter_jit(**kwargs)
         return -result.marginal_log_likelihood
 
     def _store_sgd_params(self, params: dict) -> None:

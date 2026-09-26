@@ -16,13 +16,18 @@ Optional hooks: ``_check_sgd_initialized`` (default no-op) and
 ``_prepare_sgd_data`` (default: pass the data through unchanged).
 """
 
+import contextlib
+import hashlib
 import logging
 import math
-from collections.abc import Mapping
-from typing import Any, ClassVar
+import weakref
+from collections.abc import Callable, Hashable, Iterator, Mapping
+from typing import Any, ClassVar, cast
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import optax
 from jax import Array
 
 from state_space_practice.parameter_transforms import (
@@ -32,6 +37,197 @@ from state_space_practice.parameter_transforms import (
 from state_space_practice.utils import validate_int
 
 logger = logging.getLogger(__name__)
+
+
+#: Default optimizer for ``fit_sgd``. A single module-level instance, so the
+#: per-model compiled-step cache (keyed on the optimizer's identity) is reused
+#: by every ``fit_sgd`` call that does not pass its own optimizer.
+_DEFAULT_OPTIMIZER = optax.chain(
+    optax.clip_by_global_norm(10.0),
+    optax.adam(1e-2),
+)
+
+#: Compiled SGD steps kept per model instance (least recently used evicted).
+_MAX_CACHED_STEPS_PER_MODEL = 4
+
+#: ``id(model) -> {cache key -> _CompiledSGDStep}``. Keyed by id (models need
+#: not be hashable) and emptied by a ``weakref.finalize`` when the model is
+#: collected; the compiled steps only hold a weak reference to their model.
+#: Kept outside the instance so models stay deep-copyable and picklable.
+_SGD_STEP_CACHE: dict[int, dict[Hashable, "_CompiledSGDStep"]] = {}
+
+_MISSING = object()
+
+
+class _Uncacheable(Exception):
+    """A value whose identity cannot be captured by a fingerprint."""
+
+
+def _fingerprint(value: object, keepalive: list[object]) -> Hashable:
+    """Hashable summary of ``value`` that changes whenever its content does.
+
+    Arrays are summarized by shape, dtype and a digest of their bytes; plain
+    scalars and strings by value (floats by ``repr``, so ``-0.0`` and ``nan``
+    compare as themselves); containers recursively. Any other object is
+    summarized by identity and appended to ``keepalive`` so its id cannot be
+    reused while the fingerprint is alive.
+
+    Raises
+    ------
+    _Uncacheable
+        If ``value`` contains a JAX tracer.
+    """
+    if value is _MISSING or value is None:
+        return ("const", value is None)
+    if isinstance(value, jax.core.Tracer):
+        raise _Uncacheable
+    if isinstance(value, (jax.Array, np.ndarray, np.generic)):
+        try:
+            arr = np.asarray(value)
+        except (TypeError, ValueError):  # e.g. typed PRNG keys
+            keepalive.append(value)
+            return ("object", id(value))
+        digest = hashlib.blake2b(
+            np.ascontiguousarray(arr).tobytes(), digest_size=16
+        ).digest()
+        return ("array", arr.shape, arr.dtype.str, digest)
+    if isinstance(value, (bool, int, str, bytes)):
+        return ("value", type(value), value)
+    if isinstance(value, (float, complex)):
+        return ("value", type(value), repr(value))
+    if isinstance(value, (tuple, list)):
+        return (type(value), tuple(_fingerprint(v, keepalive) for v in value))
+    if isinstance(value, dict):
+        return (
+            dict,
+            tuple((k, _fingerprint(v, keepalive)) for k, v in value.items()),
+        )
+    keepalive.append(value)
+    return ("object", id(value))
+
+
+@contextlib.contextmanager
+def _recording_attribute_reads(obj: object, reads: set[str]) -> Iterator[bool]:
+    """Record the attribute names read on ``obj`` inside the block.
+
+    Temporarily swaps ``obj.__class__`` for a subclass whose
+    ``__getattribute__`` logs each name, so reads made by any method or
+    property of the model are captured. Yields ``False`` (and records
+    nothing) when the class cannot be swapped, e.g. for ``__slots__`` layouts.
+    """
+    cls = type(obj)
+
+    def __getattribute__(self: object, name: str) -> Any:
+        reads.add(name)
+        return cls.__getattribute__(self, name)
+
+    swapped = False
+    try:
+        obj.__class__ = cast(Any, type(cls))(
+            cls.__name__,
+            (cls,),
+            {
+                "__getattribute__": __getattribute__,
+                "__module__": cls.__module__,
+                "__qualname__": cls.__qualname__,
+            },
+        )
+        swapped = True
+    except TypeError:
+        pass
+    try:
+        yield swapped
+    finally:
+        if swapped:
+            obj.__class__ = cls
+
+
+#: ``(treedef, is_array_mask, static_leaves)`` from :func:`_split_leaves`.
+_LeafStructure = tuple[Any, tuple[bool, ...], tuple[Any, ...]]
+
+
+def _split_leaves(tree: object) -> tuple[list[Any], _LeafStructure]:
+    """Split a pytree into its array leaves and a hashable static remainder.
+
+    Array leaves become jit arguments; every other leaf (Python scalars,
+    strings, ...) stays a compile-time constant and is part of the returned
+    structure, which keys the compiled-step cache.
+    """
+    leaves, treedef = jax.tree_util.tree_flatten(tree)
+    is_array = tuple(isinstance(leaf, (jax.Array, np.ndarray)) for leaf in leaves)
+    dynamic = [leaf for leaf, dyn in zip(leaves, is_array) if dyn]
+    static = tuple(leaf for leaf, dyn in zip(leaves, is_array) if not dyn)
+    return dynamic, (treedef, is_array, static)
+
+
+def _merge_leaves(dynamic: list[Any], structure: _LeafStructure) -> Any:
+    """Inverse of :func:`_split_leaves`."""
+    treedef, is_array, static = structure
+    dynamic_iter, static_iter = iter(dynamic), iter(static)
+    leaves = [next(dynamic_iter) if dyn else next(static_iter) for dyn in is_array]
+    return jax.tree_util.tree_unflatten(treedef, leaves)
+
+
+def _unbuilt_step(*args: Any) -> Any:
+    raise RuntimeError("SGD step used before it was built.")
+
+
+class _CompiledSGDStep:
+    """A jitted SGD step plus the model state its traces baked in.
+
+    ``_sgd_loss_fn`` may read model attributes (design matrices, fixed
+    hyperparameters, ...); jit freezes whatever values those reads returned
+    while tracing. Each trace therefore records the attributes it read and a
+    fingerprint of their values, and the step is reused only while every
+    recorded attribute still has the same fingerprint.
+    """
+
+    def __init__(self, keepalive: list[object]) -> None:
+        self.train_step: Callable[..., Any] = _unbuilt_step
+        self.state_fingerprints: dict[str, Hashable] = {}
+        self.cacheable = True
+        self.keepalive = keepalive
+
+    def record_trace(self, model: object, reads: set[str], recorded: bool) -> None:
+        """Fingerprint the attributes one trace read (called while tracing)."""
+        if not recorded:
+            self.cacheable = False
+            return
+        instance_dict = vars(model)
+        try:
+            for name in reads:
+                if name.startswith("__"):
+                    continue
+                self.state_fingerprints[name] = _fingerprint(
+                    instance_dict.get(name, _MISSING), self.keepalive
+                )
+        except _Uncacheable:
+            self.cacheable = False
+
+    def matches(self, model: object) -> bool:
+        """Whether ``model``'s recorded attributes still hold the traced values."""
+        instance_dict = vars(model)
+        scratch: list[object] = []
+        try:
+            return all(
+                _fingerprint(instance_dict.get(name, _MISSING), scratch) == fp
+                for name, fp in self.state_fingerprints.items()
+            )
+        except _Uncacheable:
+            return False
+
+
+def _model_step_cache(model: object) -> dict[Hashable, _CompiledSGDStep] | None:
+    """Per-model compiled-step cache, or None if the model is not weakref-able."""
+    model_id = id(model)
+    cache = _SGD_STEP_CACHE.get(model_id)
+    if cache is None:
+        try:
+            weakref.finalize(model, _SGD_STEP_CACHE.pop, model_id, None)
+        except TypeError:
+            return None
+        cache = _SGD_STEP_CACHE[model_id] = {}
+    return cache
 
 
 def _tree_all_finite(tree: object) -> bool:
@@ -93,6 +289,66 @@ def reconstruct_per_state_array(
         ],
         axis=-1,
     )
+
+
+#: Errors raised when a loss needs concrete values of its data (e.g. host-side
+#: validation of the data inside ``_sgd_loss_fn``).
+_DATA_TRACING_ERRORS = (
+    jax.errors.ConcretizationTypeError,
+    jax.errors.TracerArrayConversionError,
+    jax.errors.TracerBoolConversionError,
+    jax.errors.TracerIntegerConversionError,
+)
+
+
+def _build_sgd_step(
+    model_ref: Callable[[], Any],
+    optimizer: Any,
+    param_spec: dict,
+    n_timesteps: float,
+    data_structure: _LeafStructure,
+    frozen_structure: _LeafStructure,
+    baked_leaves: tuple[list[Any], list[Any]] | None = None,
+) -> _CompiledSGDStep:
+    """Build the jitted SGD step ``(unc_p, opt_st, frozen_leaves, data_leaves)``.
+
+    With ``baked_leaves=(frozen_leaves, data_leaves)`` those values are closed
+    over as compile-time constants and the corresponding arguments are
+    ignored -- the fallback for losses that need concrete data while tracing.
+    """
+    # Keep the optimizer (and hence its id) alive as long as the entry.
+    entry = _CompiledSGDStep(keepalive=[optimizer])
+
+    def _loss_inner(unc_p, frozen_leaves, data_leaves):
+        model = model_ref()
+        frozen = _merge_leaves(frozen_leaves, frozen_structure)
+        args, kwargs = _merge_leaves(data_leaves, data_structure)
+        p = transform_to_constrained(unc_p, param_spec, static_params=frozen)
+        return model._sgd_loss_fn(p, *args, **kwargs) / n_timesteps
+
+    def _sgd_train_step(unc_p, opt_st, frozen_leaves, data_leaves):
+        if baked_leaves is not None:
+            frozen_leaves, data_leaves = baked_leaves
+        # Runs only while tracing: record which model attributes the loss
+        # reads, so a cached step is never reused with stale values.
+        model = model_ref()
+        reads: set[str] = set()
+        with _recording_attribute_reads(model, reads) as recorded:
+            loss, grads = jax.value_and_grad(_loss_inner)(
+                unc_p, frozen_leaves, data_leaves
+            )
+        entry.record_trace(model, reads, recorded)
+        updates, new_opt_st = optimizer.update(grads, opt_st, unc_p)
+        new_unc_p = optax.apply_updates(unc_p, updates)
+        step_finite = (
+            _tree_all_finite_array(grads)
+            & _tree_all_finite_array(updates)
+            & _tree_all_finite_array(new_unc_p)
+        )
+        return loss, new_unc_p, new_opt_st, step_finite
+
+    entry.train_step = jax.jit(_sgd_train_step)
+    return entry
 
 
 class SGDFittableMixin:
@@ -178,6 +434,77 @@ class SGDFittableMixin:
                 max_iter,
             )
 
+    def _compiled_sgd_step(
+        self,
+        optimizer: Any,
+        param_spec: dict,
+        n_timesteps: float,
+        data_structure: _LeafStructure,
+        frozen_structure: _LeafStructure,
+    ) -> tuple[
+        Callable[..., Any],
+        _CompiledSGDStep,
+        dict[Hashable, _CompiledSGDStep] | None,
+        Hashable,
+    ]:
+        """Return a jitted SGD step, reusing this model's cached one if valid.
+
+        The step fuses loss + grad + ``optimizer.update`` + ``apply_updates``
+        into one compiled graph; without jit the optimizer update and the
+        softplus/adam primitives dispatch one at a time through Python (~65x
+        slower on CPU; worse on GPU due to per-primitive sync). It takes
+        ``(unc_params, opt_state, frozen_leaves, data_leaves)``.
+
+        Steps are cached per model instance under ``(id(optimizer),
+        param_spec, n_timesteps, static data / frozen structure)``; jit's own
+        cache handles new array shapes. Because ``_sgd_loss_fn`` may read
+        model attributes, which jit freezes at trace time, a cached step is
+        reused only while every attribute its traces read still holds the
+        same value (see :class:`_CompiledSGDStep`). Nothing on the model may
+        change *during* one ``fit_sgd`` loop: ``_store_sgd_params`` only runs
+        after it.
+
+        Returns
+        -------
+        train_step : callable
+        entry : _CompiledSGDStep
+        cache : dict or None
+            The model's step cache (None when the model cannot be cached).
+        key : hashable or None
+            The entry's key in ``cache``.
+        """
+        cache = _model_step_cache(self)
+        key: Hashable = None
+        if cache is not None:
+            key = (
+                id(optimizer),
+                tuple(sorted(param_spec.items())),
+                n_timesteps,
+                data_structure,
+                frozen_structure,
+            )
+            try:
+                cached = cache.pop(key, None)
+            except TypeError:  # an unhashable static leaf or transform
+                cache, key, cached = None, None, None
+            if cache is not None and cached is not None and cached.matches(self):
+                cache[key] = cached  # re-insert as most recently used
+                return cached.train_step, cached, cache, key
+
+        entry = _build_sgd_step(
+            weakref.ref(self) if cache is not None else (lambda: self),
+            optimizer,
+            param_spec,
+            n_timesteps,
+            data_structure,
+            frozen_structure,
+        )
+        if cache is not None:
+            cache[key] = entry
+            while len(cache) > _MAX_CACHED_STEPS_PER_MODEL:
+                cache.pop(next(iter(cache)))
+        return entry.train_step, entry, cache, key
+
     def fit_sgd(
         self,
         *args,
@@ -213,8 +540,6 @@ class SGDFittableMixin:
             loss. When the final candidate is finite, the final entry is
             rewritten to the log likelihood of the stored final parameters.
         """
-        import optax
-
         # Validate the plain settings before the hook: ``_prepare_sgd_data`` may
         # mutate the model (e.g. record the sequence length).
         num_steps = validate_int(num_steps, "num_steps", nonnegative=True)
@@ -246,10 +571,7 @@ class SGDFittableMixin:
             )
 
         if optimizer is None:
-            optimizer = optax.chain(
-                optax.clip_by_global_norm(10.0),
-                optax.adam(1e-2),
-            )
+            optimizer = _DEFAULT_OPTIMIZER
         if not hasattr(optimizer, "init") or not hasattr(optimizer, "update"):
             raise ValueError(
                 "optimizer must be an optax GradientTransformation with "
@@ -257,14 +579,6 @@ class SGDFittableMixin:
             )
         opt_state = optimizer.init(unc_params)
 
-        # jit fuses loss + grad + optimizer.update + apply_updates into a
-        # single compiled graph. Without this the optimizer update and the
-        # softplus/adam primitives dispatch one at a time through Python
-        # (~65x slower on CPU; worse on GPU due to per-primitive sync).
-        # Safe because nothing inside self mutates during the SGD loop —
-        # _store_sgd_params only runs after the loop. If a subclass ever
-        # mutates self attributes inside _sgd_loss_fn, jit will silently
-        # freeze stale values; keep that invariant.
         def _loss_inner(unc_p):
             p = transform_to_constrained(
                 unc_p,
@@ -273,17 +587,15 @@ class SGDFittableMixin:
             )
             return self._sgd_loss_fn(p, *args, **kwargs) / n_timesteps
 
-        @jax.jit
-        def train_step(unc_p, opt_st):
-            loss, grads = jax.value_and_grad(_loss_inner)(unc_p)
-            updates, new_opt_st = optimizer.update(grads, opt_st, unc_p)
-            new_unc_p = optax.apply_updates(unc_p, updates)
-            step_finite = (
-                _tree_all_finite_array(grads)
-                & _tree_all_finite_array(updates)
-                & _tree_all_finite_array(new_unc_p)
-            )
-            return loss, new_unc_p, new_opt_st, step_finite
+        # The data and the frozen parameters are jit *arguments* (array leaves
+        # only; other leaves stay compile-time constants and key the cache),
+        # so a later fit_sgd call on this model with same-shaped data reuses
+        # the compiled step instead of re-tracing and re-compiling it.
+        data_dynamic, data_structure = _split_leaves((args, kwargs))
+        frozen_dynamic, frozen_structure = _split_leaves(frozen_params)
+        train_step, step_entry, step_cache, cache_key = self._compiled_sgd_step(
+            optimizer, param_spec, n_timesteps, data_structure, frozen_structure
+        )
 
         log_likelihoods: list[float] = []
         converged = False
@@ -294,13 +606,44 @@ class SGDFittableMixin:
         # not the post-update params that then produced NaN.
         last_valid_unc_params = unc_params
         stall_count = 0
+        data_baked = False
 
         # Python loop (not lax.scan) to support NaN checks and verbose
         # logging without JIT closure issues with self.
         for step in range(num_steps):
-            loss, new_unc_params, new_opt_state, step_finite = train_step(
-                unc_params, opt_state
-            )
+            try:
+                loss, new_unc_params, new_opt_state, step_finite = train_step(
+                    unc_params, opt_state, frozen_dynamic, data_dynamic
+                )
+            except _DATA_TRACING_ERRORS:
+                if step > 0 or data_baked:
+                    raise
+                data_baked = True
+                # The loss needs concrete data while tracing (e.g. it validates
+                # its inputs on the host): bake the data in as constants for
+                # this call instead, uncached (the pre-cache behaviour).
+                logger.debug(
+                    "%s._sgd_loss_fn needs concrete data; compiling an uncached "
+                    "SGD step with the data baked in.",
+                    type(self).__name__,
+                )
+                if step_cache is not None:
+                    step_cache.pop(cache_key, None)
+                step_cache = None
+                step_entry = _build_sgd_step(
+                    lambda: self,
+                    optimizer,
+                    param_spec,
+                    n_timesteps,
+                    data_structure,
+                    frozen_structure,
+                    baked_leaves=(frozen_dynamic, data_dynamic),
+                )
+                step_entry.cacheable = False
+                train_step = step_entry.train_step
+                loss, new_unc_params, new_opt_state, step_finite = train_step(
+                    unc_params, opt_state, frozen_dynamic, data_dynamic
+                )
 
             # One device->host round trip per step; ``float`` / ``bool`` on
             # each value separately would block three times.
@@ -356,6 +699,10 @@ class SGDFittableMixin:
                     logger.info("SGD converged at step %d.", step)
                     converged = True
                     break
+
+        if step_cache is not None and not step_entry.cacheable:
+            # A trace read state that cannot be fingerprinted: never reuse it.
+            step_cache.pop(cache_key, None)
 
         final_loss = _loss_inner(unc_params)
         if not bool(jnp.isfinite(final_loss)):
