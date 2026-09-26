@@ -6,9 +6,11 @@ import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.point_process_kalman import (
+    get_confidence_interval as _get_confidence_interval,
+)
 from state_space_practice.point_process_kalman import (  # noqa: F401 -- re-exports
     _safe_expected_count,
-    get_confidence_interval,
     steepest_descent_point_process_filter,
 )
 from state_space_practice.utils import psd_solve, stabilize_covariance
@@ -162,3 +164,26 @@ def stochastic_point_process_filter(
         (init_mode_params_arr, init_covariance_params_arr),
         (x_arr, spike_indicator_arr),
     )[1]
+
+
+def get_confidence_interval(
+    posterior_mode: ArrayLike, posterior_covariance: ArrayLike, alpha: float = 0.05
+) -> Array:
+    """Get the confidence interval from the posterior covariance
+
+    Parameters
+    ----------
+    posterior_mode : ArrayLike, shape (n_time, n_params)
+    posterior_covariance : ArrayLike, shape (n_time, n_params, n_params)
+    alpha : float, optional
+        Significance level in ``(0, 1)``, by default ``0.05``. Returns a
+        ``1 - alpha`` confidence interval (i.e. the default 0.05 gives a
+        95% CI, not a 5% CI). Matches the default in
+        :func:`point_process_kalman.get_confidence_interval`, which computes it.
+
+    Returns
+    -------
+    ci : Array, shape (n_time, n_params, 2)
+        Lower and upper bounds, ``posterior_mode -/+ z * sqrt(diag(cov))``.
+    """
+    return _get_confidence_interval(posterior_mode, posterior_covariance, alpha=alpha)

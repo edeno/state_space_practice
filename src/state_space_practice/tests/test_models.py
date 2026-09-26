@@ -472,3 +472,19 @@ class TestGetConfidenceInterval:
 
         np.testing.assert_allclose(lower, posterior_mode, rtol=1e-10)
         np.testing.assert_allclose(upper, posterior_mode, rtol=1e-10)
+
+    def test_keyword_arguments(self) -> None:
+        """The documented keyword names give a mode +/- z * sd interval."""
+        posterior_mode = jnp.array([[1.0, -2.0], [0.5, 3.0]])
+        variances = jnp.array([[4.0, 0.25], [1.0, 9.0]])
+        posterior_cov = jax.vmap(jnp.diag)(variances)
+
+        ci = get_confidence_interval(
+            posterior_mode=posterior_mode,
+            posterior_covariance=posterior_cov,
+            alpha=0.05,
+        )
+
+        half_width = 1.959963984540054 * jnp.sqrt(variances)
+        np.testing.assert_allclose(ci[..., 0], posterior_mode - half_width)
+        np.testing.assert_allclose(ci[..., 1], posterior_mode + half_width)
