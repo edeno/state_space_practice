@@ -1114,19 +1114,21 @@ def find_first_significant_trial(
         The first trial index that is significantly different from the reference,
         or None if no such trial exists.
     """
-    n_trials = comparison_matrix.shape[0]
-
     # For trials after reference, check if P(ref > trial) < alpha/2
-    # (i.e., trial is significantly HIGHER than reference)
+    # (i.e., trial is significantly HIGHER than reference). One host transfer
+    # and a vectorized comparison instead of a device sync per trial.
     threshold_high = significance_level / 2  # e.g., 0.025
 
-    for j in range(reference_trial + 1, n_trials):
-        p_val = comparison_matrix[reference_trial, j]
-        # P(ref > j) < 0.025 means j is significantly higher
-        if p_val < threshold_high:
-            return j
-
-    return None
+    comparison = np.asarray(comparison_matrix)
+    first_candidate = reference_trial + 1
+    if first_candidate >= comparison.shape[0]:
+        return None
+    row = comparison[reference_trial, first_candidate:]
+    # P(ref > j) < 0.025 means j is significantly higher (NaN never qualifies)
+    significant = np.flatnonzero(row < threshold_high)
+    if significant.size == 0:
+        return None
+    return int(first_candidate + significant[0])
 
 
 def calculate_latent_state_percentiles(

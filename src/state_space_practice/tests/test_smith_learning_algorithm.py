@@ -1630,6 +1630,35 @@ class TestFindFirstSignificantTrial:
         assert result_strict is None
 
 
+    @staticmethod
+    def _reference_loop(matrix, reference_trial, significance_level):
+        """The original per-trial loop, kept as the behavioural reference."""
+        for j in range(reference_trial + 1, matrix.shape[0]):
+            if matrix[reference_trial, j] < significance_level / 2:
+                return j
+        return None
+
+    @pytest.mark.parametrize("seed", range(5))
+    def test_matches_per_trial_loop(self, seed) -> None:
+        """The vectorized search returns exactly what the per-trial loop did,
+        including NaN entries (never significant) and every reference trial."""
+        rng = np.random.default_rng(seed)
+        n_trials = 30
+        matrix = rng.uniform(0.0, 0.2, size=(n_trials, n_trials))
+        matrix[rng.random((n_trials, n_trials)) < 0.2] = np.nan
+        found_some = False
+        for reference_trial in [-1, 0, 1, 7, n_trials - 2, n_trials - 1, n_trials]:
+            for level in (0.01, 0.05, 0.2):
+                expected = self._reference_loop(matrix, reference_trial, level)
+                found_some |= expected is not None
+                result = find_first_significant_trial(
+                    jnp.asarray(matrix), reference_trial, level
+                )
+                assert result == expected
+                assert result is None or type(result) is int
+        assert found_some  # guard: the comparison covered positive cases
+
+
 class TestSmithLearningModelTrialComparison:
     """Tests for trial comparison methods on SmithLearningModel class."""
 
