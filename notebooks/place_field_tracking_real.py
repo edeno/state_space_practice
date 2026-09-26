@@ -5,15 +5,13 @@
 # in real hippocampal recordings. Single neuron at a time.
 
 # %%
-import sys
 
-import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 from patsy import dmatrix
 
-sys.path.insert(0, "..")
+# data/ holds local, gitignored loaders; run from the repo root with PYTHONPATH=.
 from data.load_bandit_data import load_neural_recording_from_files
 from state_space_practice.point_process_kalman import (
     kalman_maximization_step,

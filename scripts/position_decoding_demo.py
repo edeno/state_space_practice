@@ -7,7 +7,6 @@ and saves an MP4 movie showing true vs decoded position on the 2D track.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import jax
@@ -18,12 +17,10 @@ from matplotlib.patches import Ellipse
 
 jax.config.update("jax_enable_x64", True)
 
-# Add project root to path so imports work when running as a script
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
-sys.path.insert(0, str(PROJECT_ROOT / "data"))
 
-from load_bandit_data import load_neural_recording_from_files
+# data/ holds local, gitignored loaders; run from the repo root with PYTHONPATH=.
+from data.load_bandit_data import load_neural_recording_from_files
 from state_space_practice.position_decoder import PositionDecoder
 from state_space_practice.preprocessing import (
     bin_spike_times,

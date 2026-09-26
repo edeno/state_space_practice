@@ -1,5 +1,8 @@
 """Phase 1 baseline + Phase 2 ablation ladder for the PositionDecoder
-debugging plan (docs/plans/2026-04-10-position-decoder-tracking-fix.md).
+tracking investigation. (The plan document this was written for was never
+committed; the resulting fix and its regression tests are
+``TestPositionDecoder.trajectory_data`` and ``TestRawOccupancyMask`` in
+``src/state_space_practice/tests/test_position_decoder.py``.)
 
 Runs the broken trajectory_data fixture and the working
 circular_trajectory_2d fixture side by side, plus the ablation ladder
@@ -8,8 +11,6 @@ that interpolates between them.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 
 import jax
 
@@ -17,9 +18,6 @@ jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from state_space_practice.position_decoder import (  # noqa: E402
     PlaceFieldRateMaps,

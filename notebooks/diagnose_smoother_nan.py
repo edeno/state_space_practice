@@ -20,9 +20,9 @@ jax.config.update("jax_enable_x64", True)
 from scipy.linalg import solve_discrete_are
 
 from state_space_practice.kalman import (
-    _kalman_smoother_update,
     kalman_filter,
     kalman_smoother,
+    kalman_smoother_update,
     psd_solve,
     symmetrize,
 )

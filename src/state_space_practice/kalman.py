@@ -1435,3 +1435,9 @@ def kalman_maximization_step(
         init_mean,
         init_cov,
     )
+
+
+# Public names for the single-step updates (used by the notebooks); the
+# underscore names remain the implementation.
+kalman_filter_update = _kalman_filter_update
+kalman_smoother_update = _kalman_smoother_update

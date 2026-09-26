@@ -39,21 +39,11 @@ jax.config.update("jax_enable_x64", True)
 
 # %%
 # Imports
-import sys
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 
-# Add project root to path for imports
-# Handle both running from notebooks/ directory and from project root
-if Path.cwd().name == "notebooks":
-    project_root = Path.cwd().parent
-else:
-    project_root = Path.cwd()
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
+# data/ holds local, gitignored loaders; run from the repo root with PYTHONPATH=.
 
 from data.load_bandit_data import load_neural_recording_from_files
 from state_space_practice.preprocessing import (

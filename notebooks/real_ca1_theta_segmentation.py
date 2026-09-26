@@ -39,22 +39,13 @@ jax.config.update("jax_enable_x64", True)
 # %%
 # Imports
 import pickle
-import sys
-from pathlib import Path
 
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix
 
-# Add project root to path for imports
-# Handle both running from notebooks/ directory and from project root
-if Path.cwd().name == "notebooks":
-    project_root = Path.cwd().parent
-else:
-    project_root = Path.cwd()
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
+# data/ holds local, gitignored loaders; run from the repo root with PYTHONPATH=.
 
 from state_space_practice.switching_point_process import SwitchingSpikeOscillatorModel
 
