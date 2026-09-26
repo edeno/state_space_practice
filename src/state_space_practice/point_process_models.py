@@ -600,10 +600,13 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
             self._m_step_spikes(spikes)
             self._project_parameters()
 
-        # Approximate (GPB) EM: a decrease is logged but iteration continues,
-        # convergence needs a non-decreasing step, and the best accepted state
-        # is restored at the end if the final iterate is worse. A non-finite
-        # first E-step means the initial parameters are unusable.
+        # Approximate (GPB) EM: a decrease beyond ``tol`` is logged but
+        # iteration continues, and the best accepted state is restored at the
+        # end if the final iterate is worse. A non-finite first E-step means
+        # the initial parameters are unusable. ``require_increase_to_converge``
+        # is not passed: with ``decrease_tol == tol`` it is a no-op (a step
+        # within ``tol`` can never be a decrease beyond ``tol``), so omitting it
+        # states what the call actually does without changing behavior.
         result = run_em(
             lambda: float(self._e_step(spikes)),
             _m_step,
@@ -613,7 +616,6 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
             tol=tol,
             on_first_nonfinite="raise",
             stop_on_decrease=False,
-            require_increase_to_converge=True,
             track_best=True,
             logger=logger,
         )
