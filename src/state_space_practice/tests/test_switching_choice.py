@@ -679,6 +679,42 @@ class TestSwitchingChoiceUncertainty:
         assert jnp.all(model.surprise_ >= 0)
 
 
+class TestBetweenStateVariance:
+    """Law-of-total-variance between-state term used by the uncertainty
+    summaries (``predicted_option_variances_`` / ``smoothed_...``)."""
+
+    def test_no_cancellation_for_large_nearby_means(self):
+        """Means ~1e5 that differ by 1e-4: E[m^2] - E[m]^2 cancels to noise
+        of order eps * 1e10 ~ 1e-6, while the true variance is 2.5e-9."""
+        from state_space_practice.switching_choice import _between_state_variance
+
+        means = jnp.array([[[1e5, 1e5 + 1e-4]]])  # (T=1, K=1, S=2)
+        probs = jnp.array([[0.5, 0.5]])
+        exact = 0.25 * (1e-4) ** 2  # p (1 - p) (m_1 - m_0)^2
+        var = float(_between_state_variance(means, probs)[0, 0])
+        np.testing.assert_allclose(var, exact, rtol=1e-3)
+        # guard: the uncentred formula really is catastrophically wrong here
+        e_mean = jnp.einsum("tks,ts->tk", means, probs)
+        e_mean_sq = jnp.einsum("tks,ts->tk", means**2, probs)
+        uncentred = float((e_mean_sq - e_mean**2)[0, 0])
+        # (it returns 0 or noise of either sign: >= 50% relative error)
+        assert abs(uncentred - exact) > 0.5 * exact
+
+    def test_matches_direct_definition_and_is_nonnegative(self):
+        from state_space_practice.switching_choice import _between_state_variance
+
+        rng = np.random.default_rng(0)
+        means = rng.standard_normal((6, 3, 4)) * 5 + 50
+        probs = rng.dirichlet(np.ones(4), size=6)
+        var = np.asarray(
+            _between_state_variance(jnp.asarray(means), jnp.asarray(probs))
+        )
+        mbar = np.einsum("tks,ts->tk", means, probs)
+        direct = np.einsum("tks,ts->tk", (means - mbar[..., None]) ** 2, probs)
+        np.testing.assert_allclose(var, direct, rtol=1e-12)
+        assert np.all(var >= 0)
+
+
 # Shape combinations for parametrized uncertainty tests. Crucially includes
 # at least one non-square (K-1 != S) config — square configs like (3, 2) can
 # hide axis-ordering bugs because dimensions are numerically indistinguishable.

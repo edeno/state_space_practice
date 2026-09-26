@@ -514,6 +514,31 @@ def _switching_choice_filter_jit(
     )
 
 
+def _between_state_variance(means: Array, probs: Array) -> Array:
+    """Between-state term ``Var_s(E[x | s])`` of the law of total variance.
+
+    Uses the centred form ``sum_s p_s (m_s - m_bar)^2`` rather than
+    ``E[m^2] - E[m]^2``, which cancels catastrophically when the per-state
+    means are large relative to their spread (the same reason
+    ``collapse_gaussian_mixture`` centres its spread-of-means term).
+
+    Parameters
+    ----------
+    means : Array, shape (n_time, n_options, n_discrete_states)
+        Per-state conditional means.
+    probs : Array, shape (n_time, n_discrete_states)
+        Discrete-state mixing weights (each row sums to 1).
+
+    Returns
+    -------
+    Array, shape (n_time, n_options)
+        Non-negative variance of the per-state means under ``probs``.
+    """
+    mixture_mean = jnp.einsum("tks,ts->tk", means, probs)
+    centred = means - mixture_mean[..., None]
+    return jnp.einsum("tks,ts->tk", centred**2, probs)
+
+
 class SwitchingChoiceModel(SGDFittableMixin):
     """Switching multi-armed bandit with per-state learning dynamics.
 
@@ -672,9 +697,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
         # Law of total variance: Var(x) = E[Var(x|s)] + Var(E[x|s])
         # Use PREDICTED (prior) state probs for weighting.
         e_var = jnp.einsum("tks,ts->tk", full_vars, predicted_disc)  # E[Var(x|s)]
-        e_mean = jnp.einsum("tks,ts->tk", full_means, predicted_disc)  # E[E[x|s]]
-        e_mean_sq = jnp.einsum("tks,ts->tk", full_means**2, predicted_disc)
-        var_mean = e_mean_sq - e_mean**2  # Var(E[x|s])
+        var_mean = _between_state_variance(full_means, predicted_disc)
         self.predicted_option_variances_ = e_var + var_mean
 
         # Smoothed variances: law of total variance with smoother quantities
@@ -703,9 +726,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
                 )  # (T, K, S)
                 sm_disc = self.smoothed_discrete_probs_
                 sm_e_var = jnp.einsum("tks,ts->tk", full_sm_vars, sm_disc)
-                sm_e_mean = jnp.einsum("tks,ts->tk", full_sm_means, sm_disc)
-                sm_e_mean_sq = jnp.einsum("tks,ts->tk", full_sm_means**2, sm_disc)
-                sm_var_mean = sm_e_mean_sq - sm_e_mean**2
+                sm_var_mean = _between_state_variance(full_sm_means, sm_disc)
                 self.smoothed_option_variances_ = sm_e_var + sm_var_mean
             else:
                 # Fallback: no between-state term
