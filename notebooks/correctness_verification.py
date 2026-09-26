@@ -104,7 +104,7 @@ init_cov = jnp.stack([jnp.eye(n_latent) * 1e-10] * 2, axis=-1)
 A = jnp.stack([jnp.eye(n_latent)] * 2, axis=-1)
 Q = jnp.stack([jnp.eye(n_latent) * 1e-10] * 2, axis=-1)
 
-fm, fc, fp, _, filter_ll = switching_point_process_filter(
+fm, fc, fp, _, _, _, filter_ll = switching_point_process_filter(
     init_mean, init_cov, jnp.array([0.5, 0.5]), spikes,
     Z, A, Q, dt, log_intensity_func, spike_params,
     include_laplace_normalization=False,
@@ -210,7 +210,7 @@ init_cov_s = jnp.eye(n_latent)[..., None] * 1e-10
 A_s = jnp.eye(n_latent)[..., None]
 Q_s = jnp.eye(n_latent)[..., None] * 1e-10
 
-fm_s, fc_s, _, _, filter_ll_s = switching_point_process_filter(
+fm_s, fc_s, _, _, _, _, filter_ll_s = switching_point_process_filter(
     init_mean_s, init_cov_s, jnp.array([1.0]), spikes_single,
     jnp.array([[1.0]]), A_s, Q_s, dt, log_intensity_func, spike_params_single,
     include_laplace_normalization=False,

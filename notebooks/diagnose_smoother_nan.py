@@ -446,7 +446,7 @@ for r_off_sw, r_on_sw, q_var_sw in [
     init_prob_sw = jnp.array([0.5, 0.5])
 
     # Switching filter (Gaussian observations — fast)
-    fm_sw, fc_sw, fp_sw, _, mll_sw = switching_kalman_filter(
+    fm_sw, fc_sw, fp_sw, _, _, _, mll_sw = switching_kalman_filter(
         init_mean_sw, init_cov_sw, init_prob_sw, obs_sw,
         Z_sw, A_sw, Q_sw, H_sw, R_sw,
     )
