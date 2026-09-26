@@ -104,7 +104,7 @@ init_cov = jnp.stack([jnp.eye(n_latent) * 1e-10] * 2, axis=-1)
 A = jnp.stack([jnp.eye(n_latent)] * 2, axis=-1)
 Q = jnp.stack([jnp.eye(n_latent) * 1e-10] * 2, axis=-1)
 
-fm, fc, fp, lpm, filter_ll = switching_point_process_filter(
+fm, fc, fp, _, filter_ll = switching_point_process_filter(
     init_mean, init_cov, jnp.array([0.5, 0.5]), spikes,
     Z, A, Q, dt, log_intensity_func, spike_params,
     include_laplace_normalization=False,
@@ -112,8 +112,7 @@ fm, fc, fp, lpm, filter_ll = switching_point_process_filter(
 
 # Smoother
 (_, _, sdsp, _, _, scsm, _, _, _) = switching_kalman_smoother(
-    filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp,
-    last_filter_conditional_cont_mean=lpm, process_cov=Q,
+    filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp, process_cov=Q,
     continuous_transition_matrix=A, discrete_state_transition_matrix=Z,
 )
 

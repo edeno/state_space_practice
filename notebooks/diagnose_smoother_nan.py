@@ -446,7 +446,7 @@ for r_off_sw, r_on_sw, q_var_sw in [
     init_prob_sw = jnp.array([0.5, 0.5])
 
     # Switching filter (Gaussian observations — fast)
-    fm_sw, fc_sw, fp_sw, lpm_sw, mll_sw = switching_kalman_filter(
+    fm_sw, fc_sw, fp_sw, _, mll_sw = switching_kalman_filter(
         init_mean_sw, init_cov_sw, init_prob_sw, obs_sw,
         Z_sw, A_sw, Q_sw, H_sw, R_sw,
     )
@@ -456,7 +456,6 @@ for r_off_sw, r_on_sw, q_var_sw in [
     result_sw = switching_kalman_smoother(
         filter_mean=fm_sw, filter_cov=fc_sw,
         filter_discrete_state_prob=fp_sw,
-        last_filter_conditional_cont_mean=lpm_sw,
         process_cov=Q_sw, continuous_transition_matrix=A_sw,
         discrete_state_transition_matrix=Z_sw,
     )
