@@ -1,3 +1,5 @@
+import functools
+import logging
 import warnings
 from collections.abc import Callable
 
@@ -13,7 +15,13 @@ from state_space_practice.point_process_kalman import (  # noqa: F401 -- re-expo
     _safe_expected_count,
     steepest_descent_point_process_filter,
 )
-from state_space_practice.utils import psd_solve, stabilize_covariance
+from state_space_practice.utils import (
+    clip_eigenvalues_relative,
+    contains_tracer,
+    psd_solve,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def log_receptive_field_model(position: ArrayLike, params: ArrayLike) -> Array:
@@ -82,23 +90,63 @@ def stochastic_point_process_filter(
         DeprecationWarning,
         stacklevel=2,
     )
-    # Convert ArrayLike inputs to Array for internal use
-    init_mode_params_arr: Array = jnp.asarray(init_mode_params)
-    init_covariance_params_arr: Array = jnp.asarray(init_covariance_params)
-    x_arr: Array = jnp.asarray(x)
-    spike_indicator_arr: Array = jnp.asarray(spike_indicator)
-    transition_matrix_arr: Array = jnp.asarray(transition_matrix)
-    latent_state_covariance_arr: Array = jnp.asarray(latent_state_covariance)
+    posterior_mode, posterior_covariance, n_floored = (
+        _stochastic_point_process_filter_impl(
+            jnp.asarray(init_mode_params),
+            jnp.asarray(init_covariance_params),
+            jnp.asarray(x),
+            jnp.asarray(spike_indicator),
+            dt,
+            jnp.asarray(transition_matrix),
+            jnp.asarray(latent_state_covariance),
+            log_receptive_field_model=log_receptive_field_model,
+        )
+    )
+    if not contains_tracer(n_floored) and int(n_floored) > 0:
+        logger.warning(
+            "models.stochastic_point_process_filter: raised %d eigenvalue(s) "
+            "of the posterior precision / covariance to the scale-relative "
+            "PSD floor (the observed-Hessian update was indefinite). Use "
+            "point_process_kalman.stochastic_point_process_filter instead.",
+            int(n_floored),
+        )
+    return posterior_mode, posterior_covariance
 
+
+@functools.partial(jax.jit, static_argnames=("log_receptive_field_model",))
+def _stochastic_point_process_filter_impl(
+    init_mode_params: Array,
+    init_covariance_params: Array,
+    x: Array,
+    spike_indicator: Array,
+    dt: float,
+    transition_matrix: Array,
+    latent_state_covariance: Array,
+    *,
+    log_receptive_field_model: Callable[[ArrayLike, ArrayLike], Array],
+) -> tuple[Array, Array, Array]:
+    """Jitted scan of the deprecated observed-Hessian SSPPF.
+
+    ``log_receptive_field_model`` is static (hashed by identity), so repeated
+    calls with the same model function reuse one compilation; ``dt`` and all
+    arrays are traced.
+
+    Returns
+    -------
+    posterior_mode : Array, shape (n_time, n_params)
+    posterior_covariance : Array, shape (n_time, n_params, n_params)
+    n_floored : Array
+        Total number of eigenvalues raised to the relative PSD floor.
+    """
     # Compute the gradient and hessian of the log receptive field model
     grad_log_receptive_field_model = jax.grad(log_receptive_field_model, argnums=1)
     hess_log_receptive_field_model = jax.hessian(log_receptive_field_model, argnums=1)
 
     # Define the update step
     def _update(
-        params_prev: tuple[Array, Array],
+        params_prev: tuple[Array, Array, Array],
         args: tuple[Array, Array],
-    ) -> tuple[tuple[Array, Array], tuple[Array, Array]]:
+    ) -> tuple[tuple[Array, Array, Array], tuple[Array, Array]]:
         """Point Process Adaptive Filter update step
 
         F : transition matrix
@@ -110,14 +158,14 @@ def stochastic_point_process_filter(
         """
 
         # Unpack previous parameters
-        mode_prev, covariance_prev = params_prev
+        mode_prev, covariance_prev, n_floored = params_prev
         x_t, spike_indicator_t = args
 
         # One-step prediction
-        one_step_mean = transition_matrix_arr @ mode_prev
+        one_step_mean = transition_matrix @ mode_prev
         one_step_variance = (
-            transition_matrix_arr @ covariance_prev @ transition_matrix_arr.T
-            + latent_state_covariance_arr
+            transition_matrix @ covariance_prev @ transition_matrix.T
+            + latent_state_covariance
         )
 
         # Compute the conditional intensity and innovation
@@ -140,30 +188,31 @@ def stochastic_point_process_filter(
             + (one_step_grad.T * conditional_intensity @ one_step_grad)
             - innovation * one_step_hess
         )
-        inverse_posterior_covariance = stabilize_covariance(
-            inverse_posterior_covariance, min_eigenvalue=1e-9
+        # Scale-relative eigenvalue floors (the observed Hessian can make the
+        # precision indefinite); counted and reported once after the scan.
+        inverse_posterior_covariance, n_prec = clip_eigenvalues_relative(
+            inverse_posterior_covariance
         )
         posterior_covariance = psd_solve(inverse_posterior_covariance, identity)
-        posterior_covariance = stabilize_covariance(
-            posterior_covariance, min_eigenvalue=1e-9
-        )
+        posterior_covariance, n_cov = clip_eigenvalues_relative(posterior_covariance)
 
         # sum over one_step_grad.squeeze() * innovation if multiple neurons
         posterior_mode = one_step_mean + posterior_covariance @ (
             one_step_grad.squeeze() * innovation
         )
 
-        return (posterior_mode, posterior_covariance), (
+        return (posterior_mode, posterior_covariance, n_floored + n_prec + n_cov), (
             posterior_mode,
             posterior_covariance,
         )
 
     # Run the SSPPF
-    return jax.lax.scan(
+    (_, _, n_floored), (posterior_mode, posterior_covariance) = jax.lax.scan(
         _update,
-        (init_mode_params_arr, init_covariance_params_arr),
-        (x_arr, spike_indicator_arr),
-    )[1]
+        (init_mode_params, init_covariance_params, jnp.zeros((), dtype=jnp.int32)),
+        (x, spike_indicator),
+    )
+    return posterior_mode, posterior_covariance, n_floored
 
 
 def get_confidence_interval(

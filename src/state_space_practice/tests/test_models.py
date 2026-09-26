@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice import models
 from state_space_practice.models import (
     get_confidence_interval,
     log_receptive_field_model,
@@ -488,3 +489,62 @@ class TestGetConfidenceInterval:
         half_width = 1.959963984540054 * jnp.sqrt(variances)
         np.testing.assert_allclose(ci[..., 0], posterior_mode - half_width)
         np.testing.assert_allclose(ci[..., 1], posterior_mode + half_width)
+
+
+class TestDeprecatedFilterJitAndFloors:
+    """The deprecated observed-Hessian filter runs as one jitted scan and
+    floors eigenvalues relative to the matrix scale."""
+
+    def test_compiles_once_across_calls(self, simple_point_process_model, monkeypatch):
+        m = simple_point_process_model
+        traces: list = []
+        original = models._safe_expected_count
+
+        def counting(*args, **kwargs):
+            traces.append(None)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(models, "_safe_expected_count", counting)
+        args = (
+            m["init_mode"], m["init_cov"], m["position"], m["spike_indicator"],
+        )
+        models._stochastic_point_process_filter_impl.clear_cache()
+        first, _ = stochastic_point_process_filter(
+            *args, m["dt"], m["transition_matrix"], m["latent_state_cov"],
+            log_receptive_field_model,
+        )
+        # guard: the first call after clearing the cache traced the scan once.
+        assert len(traces) == 1
+        second, _ = stochastic_point_process_filter(
+            *args, 0.5 * m["dt"], m["transition_matrix"], 2 * m["latent_state_cov"],
+            log_receptive_field_model,
+        )
+        assert len(traces) == 1
+        # guard: the cached compilation saw the new dt / process noise.
+        assert not np.allclose(first, second)
+
+    def test_indefinite_precision_is_floored_relatively_and_logged(
+        self, caplog
+    ) -> None:
+        """Zero spikes at a very high rate make the observed-Hessian precision
+        indefinite. Its negative eigenvalue is raised to a floor relative to
+        the precision's scale (1e-8 * lambda_max, giving a posterior variance
+        ~4e5 here instead of the ~1e9 an absolute 1e-9 floor gave), and one
+        warning is logged for the whole scan."""
+        init_mode = jnp.array([jnp.log(1e4), 150.0, 10.0])
+        with caplog.at_level("WARNING", logger="state_space_practice.models"):
+            _, posterior_cov = stochastic_point_process_filter(
+                init_mode,
+                jnp.eye(3) * 10.0,
+                jnp.array([150.0, 150.0]),
+                jnp.zeros(2),
+                0.02,
+                jnp.eye(3),
+                jnp.eye(3) * 1e-3,
+                log_receptive_field_model,
+            )
+        eigs = np.linalg.eigvalsh(np.asarray(posterior_cov[-1]))
+        assert np.all(np.isfinite(eigs)) and eigs.min() > 0.0
+        assert 1e4 < eigs.max() < 1e7
+        floor_logs = [r for r in caplog.records if "PSD floor" in r.getMessage()]
+        assert len(floor_logs) == 1
