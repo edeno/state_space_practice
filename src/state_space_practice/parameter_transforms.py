@@ -22,6 +22,8 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+
+from state_space_practice.utils import contains_tracer
 from jax import Array
 
 
@@ -50,14 +52,9 @@ def _dtype_tiny(x: Array) -> Array:
 
 def _check_array(condition: Array, message: str) -> None:
     """Validate concrete arrays while leaving traced JAX values jittable."""
-    try:
-        ok = bool(jnp.all(condition))
-    except (
-        jax.errors.ConcretizationTypeError,
-        jax.errors.TracerBoolConversionError,
-    ):
+    if contains_tracer(condition):
         return
-    if not ok:
+    if not bool(jnp.all(condition)):
         raise ValueError(message)
 
 

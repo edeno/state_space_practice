@@ -30,6 +30,7 @@ from state_space_practice.utils import divide_safe as _divide_safe
 from state_space_practice.utils import safe_log as _safe_log
 from state_space_practice.utils import spectral_radius as _spectral_radius
 from state_space_practice.utils import (
+    contains_tracer,
     stabilize_probability_vector as _stabilize_probability_vector,
 )
 
@@ -2275,7 +2276,7 @@ def switching_kalman_maximization_step(
                 f"transition_prior must have shape {expected_shape}, "
                 f"got {transition_prior.shape}."
             )
-        if not isinstance(transition_prior, jax.core.Tracer):
+        if not contains_tracer(transition_prior):
             if not bool(jnp.all(jnp.isfinite(transition_prior))):
                 raise ValueError("transition_prior must contain only finite values.")
             if not bool(jnp.all(transition_prior >= 1.0)):

@@ -60,6 +60,7 @@ from state_space_practice.parameter_transforms import (
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import (
+    contains_tracer,
     _validate_filter_numerics,
     validate_count_array,
     validate_int,
@@ -128,7 +129,7 @@ def poisson_log_rate_site(
     expected_count : Array, shape (n_time,)
         ``W = exp(g + offset)``, the expected count per bin.
     """
-    if not isinstance(min_weight, jax.core.Tracer):
+    if not contains_tracer(min_weight):
         min_weight = validate_scalar(min_weight, "min_weight", positive=True)
     latent = jnp.asarray(latent)
     counts = jnp.asarray(counts)
@@ -288,11 +289,11 @@ def infer_log_rate(
         (variance, "variance"),
         (lengthscale, "lengthscale"),
     ):
-        if not isinstance(value, jax.core.Tracer):
+        if not contains_tracer(value):
             validate_scalar(value, name, positive=True)
-    if not isinstance(mean, jax.core.Tracer):
+    if not contains_tracer(mean):
         validate_scalar(mean, "mean")
-    if not isinstance(min_weight, jax.core.Tracer):
+    if not contains_tracer(min_weight):
         min_weight = validate_scalar(min_weight, "min_weight", positive=True)
 
     return _infer_log_rate_traced(
@@ -333,7 +334,7 @@ def _broadcast_hyperparameter(
     (under ``jax.grad``) pass through unchecked, matching :func:`infer_log_rate`.
     """
     array = jnp.asarray(value)
-    if not isinstance(value, jax.core.Tracer):
+    if not contains_tracer(value):
         if array.ndim == 0:
             validate_scalar(value, name, positive=positive)
         elif array.ndim == 1:
@@ -400,14 +401,14 @@ def infer_log_rate_batch(
     n_iter = validate_int(n_iter, "n_iter", positive=True)
 
     n_neurons = counts.shape[0]
-    if not isinstance(dt, jax.core.Tracer):
+    if not contains_tracer(dt):
         validate_scalar(dt, "dt", positive=True)
     variance = _broadcast_hyperparameter(variance, n_neurons, "variance", positive=True)
     lengthscale = _broadcast_hyperparameter(
         lengthscale, n_neurons, "lengthscale", positive=True
     )
     mean = _broadcast_hyperparameter(mean, n_neurons, "mean", positive=False)
-    if not isinstance(min_weight, jax.core.Tracer):
+    if not contains_tracer(min_weight):
         min_weight = validate_scalar(min_weight, "min_weight", positive=True)
 
     return _infer_log_rate_batch_traced(

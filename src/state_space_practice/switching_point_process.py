@@ -122,6 +122,7 @@ from state_space_practice.switching_kalman import (
     switching_kalman_smoother_gpb2,
 )
 from state_space_practice.utils import (
+    contains_tracer,
     clip_eigenvalues,
     make_discrete_transition_matrix,
     stabilize_covariance,
@@ -384,9 +385,7 @@ def _validate_discrete_state_transitions(
     """
     # Skip while tracing: tracers carry no concrete value to check, and traced
     # callers pass parameters that are kept normalized by construction.
-    if isinstance(discrete_transition_matrix, jax.core.Tracer) or isinstance(
-        init_discrete_state_prob, jax.core.Tracer
-    ):
+    if contains_tracer(discrete_transition_matrix, init_discrete_state_prob):
         return
 
     dt_arr = jnp.asarray(dt)
