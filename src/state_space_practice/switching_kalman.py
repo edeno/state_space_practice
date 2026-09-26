@@ -846,8 +846,8 @@ def switching_kalman_filter(
     pair_cond_filter_mean : jax.Array, shape (n_time, n_cont_states, n_discrete_states, n_discrete_states)
         Pair-conditional filter mean trajectory E[x_t | S_{t-1}=i, S_t=j, y_{1:t}].
         The first timestep uses the x_1 convention (broadcast over the
-        nonexistent S_0). GPB1 callers use the last timestep ``[-1]``; the GPB2
-        smoother consumes the full trajectory.
+        nonexistent S_0). Only the GPB2 smoother consumes it (the full
+        trajectory); the GPB1 smoother does not use it.
     pair_cond_filter_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         Pair-conditional filter covariance trajectory Cov[x_t | S_{t-1}=i, S_t=j, y_{1:t}].
     pair_cond_filter_prob : jax.Array, shape (n_time, n_discrete_states, n_discrete_states)
@@ -1045,8 +1045,8 @@ def switching_kalman_filter(
     )
     # Full pair-conditional filter trajectories, E[x_t | S_{t-1}=i, S_t=j, y_{1:t}]
     # and its covariance. The first timestep uses the x_1 convention (broadcast
-    # over the nonexistent S_0). The GPB2 smoother needs the whole trajectory;
-    # GPB1 callers take the last timestep, ``pair_cond_filter_mean[-1]``.
+    # over the nonexistent S_0). Only the GPB2 smoother consumes these (the
+    # whole trajectory); the GPB1 smoother does not use them.
     pair_cond_filter_mean = jnp.concatenate(
         [first_pair_cond_mean[None, ...], rest_pair_cond_filter_mean], axis=0
     )
@@ -2347,12 +2347,50 @@ def compute_expected_complete_log_likelihood(
 ) -> jax.Array:
     """Vectorized expected complete-data log-likelihood E_q[log p(y, x, s | θ)].
 
-    Equivalent to ``_compute_expected_complete_log_likelihood_reference`` but
-    uses vectorized JAX operations instead of Python loops, making it
-    JIT-compilable and significantly faster for long sequences.
+    This is the Q-function that the EM algorithm maximizes for a fixed
+    approximate posterior. The optional pair-conditional inputs make the
+    transition term closer to the GPB2 approximation used by the M-step.
+    Vectorized and JIT-compilable; the test suite checks it against a
+    Python-loop reference implementation (``tests/test_switching_kalman.py``).
 
-    See ``_compute_expected_complete_log_likelihood_reference`` for full
-    parameter documentation.
+    Parameters
+    ----------
+    obs : jax.Array, shape (n_time, n_obs_dim)
+    state_cond_smoother_means : jax.Array, shape (n_time, n_cont_states, n_discrete_states)
+    state_cond_smoother_covs : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
+    smoother_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
+    smoother_joint_discrete_state_prob : jax.Array, shape (n_time - 1, n_discrete_states, n_discrete_states)
+    pair_cond_smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+        Cov[x_t, x_{t+1} | y_{1:T}, S_t=i, S_{t+1}=j].
+    init_state_cond_mean : jax.Array, shape (n_cont_states, n_discrete_states)
+    init_state_cond_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
+    init_discrete_state_prob : jax.Array, shape (n_discrete_states,)
+    continuous_transition_matrix : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
+    process_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
+    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states, n_discrete_states)
+    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim, n_discrete_states)
+    discrete_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
+    pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+        E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional
+        quantities for the transition Q-function term.
+    pair_cond_smoother_covs : jax.Array | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+        Cov[X_t | y_{1:T}, S_t=i, S_{t+1}=j].
+    next_pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+        E[X_{t+1} | y_{1:T}, S_t=i, S_{t+1}=j].
+
+    Returns
+    -------
+    expected_complete_ll : jax.Array
+        E_q[log p(y, x, s | θ)] (scalar array)
+
+    Notes
+    -----
+    When GPB2 pair-conditional quantities are provided, the transition
+    Q-function term uses pair-conditional means and covariances for x_t.
+    Cov[x_{t+1} | S_t, S_{t+1}] is still approximated with the
+    state-conditional Cov[x_{t+1} | S_{t+1}] since the GPB2 smoother does
+    not produce that quantity directly. This affects only diagnostics, not
+    the closed-form parameter updates.
     """
     n_cont_states = state_cond_smoother_means.shape[1]
     n_obs = obs.shape[1]
@@ -2536,10 +2574,21 @@ def compute_posterior_entropy(
 ) -> jax.Array:
     """Vectorized posterior entropy H(q).
 
-    Equivalent to ``_compute_posterior_entropy_reference`` but uses vectorized
-    JAX operations instead of Python loops.
+    For the switching Kalman filter with mixture collapse approximation:
+    H(q) = H(q(s)) + E_q(s)[H(q(x|s))]. Vectorized and JIT-compilable; the
+    test suite checks it against a Python-loop reference implementation
+    (``tests/test_switching_kalman.py``).
 
-    See ``_compute_posterior_entropy_reference`` for full parameter documentation.
+    Parameters
+    ----------
+    smoother_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
+    smoother_joint_discrete_state_prob : jax.Array, shape (n_time - 1, n_discrete_states, n_discrete_states)
+    state_cond_smoother_covs : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
+
+    Returns
+    -------
+    entropy : jax.Array
+        H(q(x, s)) (scalar array)
     """
     n_cont_states = state_cond_smoother_covs.shape[1]
 

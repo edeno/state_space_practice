@@ -1372,7 +1372,7 @@ def test_m_step_two_identical_states(
         skf_fm,  # state_cond_filter_mean
         skf_fc,  # state_cond_filter_cov
         skf_fp,  # filter_discrete_state_prob
-        _,  # pair_cond_filter_means[-1] (no longer needed by the smoother)
+        _,  # pair_cond_filter_mean (unused by the GPB1 smoother)
         _,  # last_pair_cond_filter_cov
         _,
         _,  # mll
@@ -3340,7 +3340,7 @@ def test_discrete_state_recovery_with_smoother() -> None:
         state_cond_filter_mean,
         state_cond_filter_cov,
         filter_discrete_state_prob,
-        _,  # pair_cond_filter_means[-1] (no longer needed by the smoother)
+        _,  # pair_cond_filter_mean (unused by the GPB1 smoother)
         _,  # last_pair_cond_filter_cov
         _,
         marginal_log_likelihood,
@@ -3662,7 +3662,7 @@ def test_continuous_state_mse_smoother() -> None:
         state_cond_filter_mean,
         state_cond_filter_cov,
         filter_discrete_state_prob,
-        _,  # pair_cond_filter_means[-1] (no longer needed by the smoother)
+        _,  # pair_cond_filter_mean (unused by the GPB1 smoother)
         _,  # last_pair_cond_filter_cov
         _,
         _,
@@ -3870,7 +3870,7 @@ def test_continuous_state_mse_multivariate() -> None:
         state_cond_filter_mean,
         state_cond_filter_cov,
         filter_discrete_state_prob,
-        _,  # pair_cond_filter_means[-1] (no longer needed by the smoother)
+        _,  # pair_cond_filter_mean (unused by the GPB1 smoother)
         _,  # last_pair_cond_filter_cov
         _,
         _,
@@ -3979,7 +3979,7 @@ def run_em(
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            _,  # pair_cond_filter_means[-1] (no longer needed by the smoother)
+            _,  # pair_cond_filter_mean (unused by the GPB1 smoother)
             _,  # last_pair_cond_filter_cov
             _,
             marginal_ll,
@@ -4550,7 +4550,7 @@ def run_em_partial(
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            _,  # pair_cond_filter_means[-1] (no longer needed by the smoother)
+            _,  # pair_cond_filter_mean (unused by the GPB1 smoother)
             _,  # last_pair_cond_filter_cov
             _,
             marginal_ll,
