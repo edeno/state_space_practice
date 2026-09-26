@@ -310,9 +310,7 @@ class BlockDiagonalCovariance:
 
 def _matrix_blocks(mat: Array, n_blocks: int, block_size: int) -> Array:
     """View an ``(n, n)`` matrix as ``(n_blocks, n_blocks, nb, nb)`` blocks."""
-    return mat.reshape(n_blocks, block_size, n_blocks, block_size).transpose(
-        0, 2, 1, 3
-    )
+    return mat.reshape(n_blocks, block_size, n_blocks, block_size).transpose(0, 2, 1, 3)
 
 
 def _diagonal_blocks(mat: Array, n_blocks: int, block_size: int) -> Array:
@@ -326,9 +324,7 @@ def _scaled_atol(mat: Array, atol: float) -> Array:
     return atol * jnp.maximum(1.0, jnp.max(jnp.abs(mat)))
 
 
-@functools.partial(
-    jax.jit, static_argnames=("n_neurons", "block_size", "atol")
-)
+@functools.partial(jax.jit, static_argnames=("n_neurons", "block_size", "atol"))
 def _block_diagonal_parameters_ok(
     init_cov: Array,
     transition_matrix: Array,
@@ -2397,9 +2393,7 @@ def get_confidence_interval(
         # per-neuron blocks; no dense (n_time, n_params, n_params) array.
         variances = posterior_covariance.diagonal()
     else:
-        variances = jnp.diagonal(
-            jnp.asarray(posterior_covariance), axis1=-2, axis2=-1
-        )
+        variances = jnp.diagonal(jnp.asarray(posterior_covariance), axis1=-2, axis2=-1)
     z = jax.scipy.stats.norm.ppf(1 - alpha / 2)
     ci = z * jnp.sqrt(variances)  # shape (n_time, n_params)
 
@@ -2984,7 +2978,6 @@ class PointProcessModel(SGDFittableMixin):
             log_rate = jax.vmap(self.log_intensity_func)(design_matrix, state_estimate)
 
         return jnp.exp(log_rate)
-
 
     def get_confidence_interval(
         self, alpha: float = 0.05, use_smoothed: bool = True

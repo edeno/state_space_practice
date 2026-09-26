@@ -40,8 +40,15 @@ class TestBuild2dSplineBasis:
     def test_basis_info_keys(self, position: np.ndarray) -> None:
         _, info = build_2d_spline_basis(position, n_interior_knots=3)
         required = {
-            "knots_x", "knots_y", "x_lo", "x_hi",
-            "y_lo", "y_hi", "formula", "n_basis", "n_interior_knots",
+            "knots_x",
+            "knots_y",
+            "x_lo",
+            "x_hi",
+            "y_lo",
+            "y_hi",
+            "formula",
+            "n_basis",
+            "n_interior_knots",
         }
         assert required.issubset(info.keys())
 
@@ -221,7 +228,9 @@ class TestPlaceFieldModelFit:
             sim_data["position"], sim_data["spikes"], max_iter=1, verbose=False
         )
         assert model.basis_info is not None
-        design_matrix = jnp.asarray(evaluate_basis(sim_data["position"], model.basis_info))
+        design_matrix = jnp.asarray(
+            evaluate_basis(sim_data["position"], model.basis_info)
+        )
         spikes = jnp.asarray(sim_data["spikes"])
         if spikes.ndim == 2 and spikes.shape[1] == 1:
             spikes = spikes.squeeze(axis=1)
@@ -429,18 +438,20 @@ class TestPlaceFieldModelPredict:
 
     def test_predict_rate_map_averages_rates_not_weights(self) -> None:
         """Dynamic rate maps must average exp(Z x_t), not exp(Z mean_t[x_t])."""
-        position = np.array([
-            [0.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 0.0],
-            [1.0, 1.0],
-            [0.5, 0.5],
-            [0.2, 0.8],
-            [0.8, 0.2],
-            [0.1, 0.1],
-            [0.9, 0.9],
-            [0.3, 0.7],
-        ])
+        position = np.array(
+            [
+                [0.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 0.0],
+                [1.0, 1.0],
+                [0.5, 0.5],
+                [0.2, 0.8],
+                [0.8, 0.2],
+                [0.1, 0.1],
+                [0.9, 0.9],
+                [0.3, 0.7],
+            ]
+        )
         model = PlaceFieldModel(dt=0.02, n_interior_knots=1)
         _, model.basis_info = build_2d_spline_basis(position, n_interior_knots=1)
         grid = position[:1]
@@ -466,18 +477,20 @@ class TestPlaceFieldModelPredict:
 
     def test_predict_rate_map_uses_lognormal_posterior_mean(self) -> None:
         """For Gaussian weights, E[exp(Zx)] includes the 0.5 ZPZ term."""
-        position = np.array([
-            [0.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 0.0],
-            [1.0, 1.0],
-            [0.5, 0.5],
-            [0.2, 0.8],
-            [0.8, 0.2],
-            [0.1, 0.1],
-            [0.9, 0.9],
-            [0.3, 0.7],
-        ])
+        position = np.array(
+            [
+                [0.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 0.0],
+                [1.0, 1.0],
+                [0.5, 0.5],
+                [0.2, 0.8],
+                [0.8, 0.2],
+                [0.1, 0.1],
+                [0.9, 0.9],
+                [0.3, 0.7],
+            ]
+        )
         model = PlaceFieldModel(dt=0.02, n_interior_knots=1)
         _, model.basis_info = build_2d_spline_basis(position, n_interior_knots=1)
         grid = position[:1]
@@ -502,10 +515,12 @@ class TestPlaceFieldModelPredict:
         z_alpha = float(jax.scipy.stats.norm.ppf(1 - alpha / 2))
         expected_rate = np.exp(0.5 * var_log_rate)
         expected_ci = np.exp(
-            np.array([
-                -z_alpha * np.sqrt(var_log_rate),
-                z_alpha * np.sqrt(var_log_rate),
-            ])
+            np.array(
+                [
+                    -z_alpha * np.sqrt(var_log_rate),
+                    z_alpha * np.sqrt(var_log_rate),
+                ]
+            )
         )
         np.testing.assert_allclose(rate, [expected_rate], rtol=1e-12, atol=1e-12)
         np.testing.assert_allclose(ci[0], expected_ci, rtol=1e-12, atol=1e-12)
@@ -582,9 +597,7 @@ class TestPlaceFieldModelScore:
         with pytest.raises(ValueError, match="finite"):
             model.score(sim_data["position"], bad_spikes)
 
-    def test_score_single_neuron_rejects_extra_columns(
-        self, sim_data: dict
-    ) -> None:
+    def test_score_single_neuron_rejects_extra_columns(self, sim_data: dict) -> None:
         model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
         model.fit(
             sim_data["position"],
@@ -1020,9 +1033,12 @@ class TestMultiNeuron:
             model.score(sim_data["position"], sim_data["spikes"])
         # Wrong number of columns
         with pytest.raises(ValueError, match="Expected 2"):
-            model.score(sim_data["position"], np.column_stack(
-                [sim_data["spikes"], sim_data["spikes"], sim_data["spikes"]]
-            ))
+            model.score(
+                sim_data["position"],
+                np.column_stack(
+                    [sim_data["spikes"], sim_data["spikes"], sim_data["spikes"]]
+                ),
+            )
 
     def test_neuron_idx_out_of_range(self, sim_data: dict) -> None:
         model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
@@ -1042,15 +1058,18 @@ class TestNFreeParamsVariations:
 
     def test_no_updates(self, sim_data: dict) -> None:
         model = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3,
-            update_process_cov=False, update_init_state=False,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            update_process_cov=False,
+            update_init_state=False,
         )
         model.fit(sim_data["position"], sim_data["spikes"], max_iter=3, verbose=False)
         assert model.n_free_params == 0
 
     def test_isotropic(self, sim_data: dict) -> None:
         model = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
             process_noise_structure="isotropic",
         )
         model.fit(sim_data["position"], sim_data["spikes"], max_iter=3, verbose=False)
@@ -1059,13 +1078,14 @@ class TestNFreeParamsVariations:
 
     def test_with_transition(self, sim_data: dict) -> None:
         model = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
             update_transition_matrix=True,
         )
         model.fit(sim_data["position"], sim_data["spikes"], max_iter=3, verbose=False)
         nb = model.n_basis
         # diagonal Q (nb) + A (nb^2) + init_mean (nb) + init_cov_diag (nb) = nb^2 + 3*nb
-        assert model.n_free_params == nb ** 2 + 3 * nb
+        assert model.n_free_params == nb**2 + 3 * nb
 
 
 # ------------------------------------------------------------------
@@ -1083,7 +1103,8 @@ class TestNonlinearWarning:
             return dm @ params  # same as default but different object
 
         model = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
             log_intensity_func=custom_func,
         )
         model.fit(sim_data["position"], sim_data["spikes"], max_iter=3, verbose=False)
@@ -1132,7 +1153,13 @@ class TestPlaceFieldSGDGradientStability:
         def loss_fn(unc_p):
             p = transform_to_constrained(unc_p, spec)
             _, _, mll = stochastic_point_process_filter(
-                m0, P0, dm, spikes, 0.001, A, jnp.diag(p["q_diag"]),
+                m0,
+                P0,
+                dm,
+                spikes,
+                0.001,
+                A,
+                jnp.diag(p["q_diag"]),
                 log_conditional_intensity,
             )
             return -mll
@@ -1148,14 +1175,19 @@ class TestPlaceFieldSGDFitting:
         import optax
 
         model = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-3,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-3,
         )
         optimizer = optax.chain(
-            optax.clip_by_global_norm(10.0), optax.adam(1e-3),
+            optax.clip_by_global_norm(10.0),
+            optax.adam(1e-3),
         )
         lls = model.fit_sgd(
-            sim_data["position"], sim_data["spikes"],
-            optimizer=optimizer, num_steps=30,
+            sim_data["position"],
+            sim_data["spikes"],
+            optimizer=optimizer,
+            num_steps=30,
         )
         assert len(lls) > 1
         assert all(np.isfinite(ll) for ll in lls)
@@ -1164,14 +1196,19 @@ class TestPlaceFieldSGDFitting:
         import optax
 
         model = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-3,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-3,
         )
         optimizer = optax.chain(
-            optax.clip_by_global_norm(10.0), optax.adam(1e-3),
+            optax.clip_by_global_norm(10.0),
+            optax.adam(1e-3),
         )
         model.fit_sgd(
-            sim_data["position"], sim_data["spikes"],
-            optimizer=optimizer, num_steps=20,
+            sim_data["position"],
+            sim_data["spikes"],
+            optimizer=optimizer,
+            num_steps=20,
         )
         assert jnp.all(jnp.diag(model.process_cov) > 0)
 
@@ -1179,14 +1216,19 @@ class TestPlaceFieldSGDFitting:
         import optax
 
         model = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-3,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-3,
         )
         optimizer = optax.chain(
-            optax.clip_by_global_norm(10.0), optax.adam(1e-3),
+            optax.clip_by_global_norm(10.0),
+            optax.adam(1e-3),
         )
         model.fit_sgd(
-            sim_data["position"], sim_data["spikes"],
-            optimizer=optimizer, num_steps=10,
+            sim_data["position"],
+            sim_data["spikes"],
+            optimizer=optimizer,
+            num_steps=10,
         )
         assert model.smoother_mean is not None
         assert model.filtered_mean is not None
@@ -1211,14 +1253,16 @@ class TestWarmStart:
         """Warm-start MAP and covariance should match Poisson GLM equations."""
         dt = 0.02
         prior_precision = 0.7
-        Z_base = jnp.array([
-            [1.0, -0.4, 0.2],
-            [1.0, -0.1, -0.3],
-            [1.0, 0.2, 0.1],
-            [1.0, 0.5, -0.2],
-            [1.0, 0.8, 0.4],
-            [1.0, 1.1, -0.1],
-        ])
+        Z_base = jnp.array(
+            [
+                [1.0, -0.4, 0.2],
+                [1.0, -0.1, -0.3],
+                [1.0, 0.2, 0.1],
+                [1.0, 0.5, -0.2],
+                [1.0, 0.8, 0.4],
+                [1.0, 1.1, -0.1],
+            ]
+        )
         spikes = jnp.array([0.0, 1.0, 0.0, 2.0, 1.0, 3.0])
         model = PlaceFieldModel(dt=dt, n_interior_knots=3)
         model.n_basis_per_neuron = Z_base.shape[1]
@@ -1249,9 +1293,7 @@ class TestWarmStart:
             atol=1e-9,
         )
 
-    def test_warm_start_sets_init_mean_away_from_zero(
-        self, sim_data: dict
-    ) -> None:
+    def test_warm_start_sets_init_mean_away_from_zero(self, sim_data: dict) -> None:
         """Warm-start must produce a non-trivial init_mean from spikes.
 
         With zero spikes the MAP collapses to the prior mean (zeros). With
@@ -1260,16 +1302,22 @@ class TestWarmStart:
         therefore have ``|init_mean| > 0``.
         """
         model = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-5,
         )
         # Run fit_sgd with warm_start=True but 0 optimizer steps: that sets
         # init_mean / init_cov from the warm-start path without letting SGD
         # drift from them.
         import optax
+
         opt = optax.adam(1e-3)
         model.fit_sgd(
-            sim_data["position"], sim_data["spikes"],
-            optimizer=opt, num_steps=0, warm_start=True,
+            sim_data["position"],
+            sim_data["spikes"],
+            optimizer=opt,
+            num_steps=0,
+            warm_start=True,
         )
         assert model.init_mean is not None
         assert model.init_cov is not None
@@ -1277,9 +1325,7 @@ class TestWarmStart:
             "warm-start init_mean should move away from zero on real data"
         )
 
-    def test_warm_start_improves_marginal_ll_at_init(
-        self, sim_data: dict
-    ) -> None:
+    def test_warm_start_improves_marginal_ll_at_init(self, sim_data: dict) -> None:
         """Warm-start must improve the marginal LL evaluated at init_mean/init_cov.
 
         This is the direct test of the warm-start's value proposition:
@@ -1301,19 +1347,29 @@ class TestWarmStart:
 
         # Warm-started model: init_mean / init_cov set by Laplace-GLM fit.
         m_warm = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-5,
         )
         m_warm.fit_sgd(
-            sim_data["position"], sim_data["spikes"],
-            optimizer=opt, num_steps=0, warm_start=True,
+            sim_data["position"],
+            sim_data["spikes"],
+            optimizer=opt,
+            num_steps=0,
+            warm_start=True,
         )
         # Cold-started: init_mean=zeros, init_cov=init_cov_scale*I
         m_cold = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-5,
         )
         m_cold.fit_sgd(
-            sim_data["position"], sim_data["spikes"],
-            optimizer=opt, num_steps=0, warm_start=False,
+            sim_data["position"],
+            sim_data["spikes"],
+            optimizer=opt,
+            num_steps=0,
+            warm_start=False,
         )
 
         # Evaluate the filter directly at each model's init state —
@@ -1327,14 +1383,24 @@ class TestWarmStart:
             spikes = spikes.squeeze(axis=1)
 
         _, _, ll_warm = stochastic_point_process_filter(
-            m_warm.init_mean, m_warm.init_cov, design_matrix, spikes,
-            m_warm.dt, m_warm.transition_matrix, m_warm.process_cov,
+            m_warm.init_mean,
+            m_warm.init_cov,
+            design_matrix,
+            spikes,
+            m_warm.dt,
+            m_warm.transition_matrix,
+            m_warm.process_cov,
             log_conditional_intensity,
             max_log_count=m_warm._max_log_count,
         )
         _, _, ll_cold = stochastic_point_process_filter(
-            m_cold.init_mean, m_cold.init_cov, design_matrix, spikes,
-            m_cold.dt, m_cold.transition_matrix, m_cold.process_cov,
+            m_cold.init_mean,
+            m_cold.init_cov,
+            design_matrix,
+            spikes,
+            m_cold.dt,
+            m_cold.transition_matrix,
+            m_cold.process_cov,
             log_conditional_intensity,
             max_log_count=m_cold._max_log_count,
         )
@@ -1357,19 +1423,30 @@ class TestWarmStart:
         n_time = len(sim_data["spikes"])
 
         m_whole = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-5,
         )
         m_whole.fit_sgd(
-            sim_data["position"], sim_data["spikes"],
-            optimizer=opt, num_steps=0, warm_start=True, warm_start_window=None,
+            sim_data["position"],
+            sim_data["spikes"],
+            optimizer=opt,
+            num_steps=0,
+            warm_start=True,
+            warm_start_window=None,
         )
 
         m_half = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-5,
         )
         m_half.fit_sgd(
-            sim_data["position"], sim_data["spikes"],
-            optimizer=opt, num_steps=0, warm_start=True,
+            sim_data["position"],
+            sim_data["spikes"],
+            optimizer=opt,
+            num_steps=0,
+            warm_start=True,
             warm_start_window=slice(0, n_time // 2),
         )
 
@@ -1388,34 +1465,35 @@ class TestWarmStart:
         import optax
 
         model = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3,
-            init_process_noise=1e-5, init_cov_scale=0.5,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-5,
+            init_cov_scale=0.5,
         )
         opt = optax.adam(1e-3)
         model.fit_sgd(
-            sim_data["position"], sim_data["spikes"],
-            optimizer=opt, num_steps=0, warm_start=False,
+            sim_data["position"],
+            sim_data["spikes"],
+            optimizer=opt,
+            num_steps=0,
+            warm_start=False,
         )
         assert jnp.allclose(model.init_mean, jnp.zeros(model.n_basis))
-        assert jnp.allclose(
-            model.init_cov, jnp.eye(model.n_basis) * 0.5, atol=1e-10
-        )
+        assert jnp.allclose(model.init_cov, jnp.eye(model.n_basis) * 0.5, atol=1e-10)
 
-    def test_warm_start_converges_at_low_max_iter(
-        self, sim_data: dict
-    ) -> None:
+    def test_warm_start_converges_at_low_max_iter(self, sim_data: dict) -> None:
         """With the intercept-matching initial guess, Newton converges to
         machine precision in ~8 iterations. Max_iter=3 should already be
         within 20% relative error of the machine-precision fit, proving
         the initial guess is close to the MAP.
         """
         model = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-5,
         )
         model.n_neurons = 1
-        Z_base = model._build_spline_basis_matrix(
-            np.asarray(sim_data["position"])
-        )
+        Z_base = model._build_spline_basis_matrix(np.asarray(sim_data["position"]))
         spikes = jnp.asarray(sim_data["spikes"])
         if spikes.ndim == 2 and spikes.shape[1] == 1:
             spikes = spikes.squeeze(axis=1)
@@ -1433,9 +1511,7 @@ class TestWarmStart:
             f"reference in 3 iterations; got relative error {err:.3f}"
         )
 
-    def test_warm_start_initial_rate_matches_mean(
-        self, sim_data: dict
-    ) -> None:
+    def test_warm_start_initial_rate_matches_mean(self, sim_data: dict) -> None:
         """The warm-start's initial weights (before Newton even runs) should
         produce predicted rates that match the empirical mean firing rate.
 
@@ -1448,12 +1524,12 @@ class TestWarmStart:
         the initial guess directly, not the post-Newton MAP.
         """
         model = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-5,
         )
         model.n_neurons = 1
-        Z_base = model._build_spline_basis_matrix(
-            np.asarray(sim_data["position"])
-        )
+        Z_base = model._build_spline_basis_matrix(np.asarray(sim_data["position"]))
         spikes = jnp.asarray(sim_data["spikes"])
         if spikes.ndim == 2 and spikes.shape[1] == 1:
             spikes = spikes.squeeze(axis=1)
@@ -1472,9 +1548,7 @@ class TestWarmStart:
             f"to observed {observed_rate:.3f}; relative error {rel_err:.3f}"
         )
 
-    def test_warm_start_multi_neuron_block_diagonal_cov(
-        self, sim_data: dict
-    ) -> None:
+    def test_warm_start_multi_neuron_block_diagonal_cov(self, sim_data: dict) -> None:
         """Multi-neuron warm-start must produce a block-diagonal init_cov.
 
         The design matrix is block-diagonal across neurons (each neuron's
@@ -1489,13 +1563,13 @@ class TestWarmStart:
         spikes_multi = np.stack([spikes_single, spikes_single[::-1]], axis=-1)
 
         model = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3, init_process_noise=1e-5,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-5,
         )
         # Populate n_neurons and warm-start directly (avoid running SGD)
         model.n_neurons = 2
-        Z_base = model._build_spline_basis_matrix(
-            np.asarray(sim_data["position"])
-        )
+        Z_base = model._build_spline_basis_matrix(np.asarray(sim_data["position"]))
         model._warm_start_parameters(Z_base, jnp.asarray(spikes_multi), None)
 
         nb = model.n_basis_per_neuron
@@ -1522,13 +1596,9 @@ class TestMaxFiringRateHz:
     def test_invalid_max_firing_rate_rejected(self) -> None:
         """Non-positive max_firing_rate_hz must raise."""
         with pytest.raises(ValueError, match="max_firing_rate_hz must be positive"):
-            PlaceFieldModel(
-                dt=0.02, n_interior_knots=3, max_firing_rate_hz=0.0
-            )
+            PlaceFieldModel(dt=0.02, n_interior_knots=3, max_firing_rate_hz=0.0)
         with pytest.raises(ValueError, match="max_firing_rate_hz must be positive"):
-            PlaceFieldModel(
-                dt=0.02, n_interior_knots=3, max_firing_rate_hz=-10.0
-            )
+            PlaceFieldModel(dt=0.02, n_interior_knots=3, max_firing_rate_hz=-10.0)
 
     def test_ceiling_caps_marginal_ll_on_pathological_bin(self) -> None:
         """Pathological outlier bin must not drive marginal LL to -1e8.
@@ -1567,13 +1637,25 @@ class TestMaxFiringRateHz:
 
         # WITH the physiological ceiling (max_log_count = log(500 * 0.2) ≈ 4.6)
         _, _, mll_capped = stochastic_point_process_filter(
-            m0, P0, Z, spikes, dt, A, Q,
+            m0,
+            P0,
+            Z,
+            spikes,
+            dt,
+            A,
+            Q,
             log_conditional_intensity,
             max_log_count=float(np.log(500.0 * dt)),
         )
         # WITHOUT (default of 20) — the old catastrophic-LL path
         _, _, mll_default = stochastic_point_process_filter(
-            m0, P0, Z, spikes, dt, A, Q,
+            m0,
+            P0,
+            Z,
+            spikes,
+            dt,
+            A,
+            Q,
             log_conditional_intensity,
         )
 
@@ -1592,9 +1674,7 @@ class TestMaxFiringRateHz:
             f"default={float(mll_default):.2e}"
         )
 
-    def test_saturation_warning_machinery_does_not_crash(
-        self, sim_data: dict
-    ) -> None:
+    def test_saturation_warning_machinery_does_not_crash(self, sim_data: dict) -> None:
         """The saturation check must run cleanly on the ``fit_sgd`` forward path.
 
         Note: this test does NOT assert that the warning fires. With a
@@ -1624,18 +1704,23 @@ class TestMaxFiringRateHz:
         spikes[bad_idx] = 1000  # far above any physiological rate
 
         model = PlaceFieldModel(
-            dt=sim_data["dt"], n_interior_knots=3,
-            init_process_noise=1e-5, init_cov_scale=0.01,
+            dt=sim_data["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-5,
+            init_cov_scale=0.01,
             max_firing_rate_hz=500.0,
         )
         optimizer = optax.chain(
-            optax.clip_by_global_norm(10.0), optax.adam(1e-3),
+            optax.clip_by_global_norm(10.0),
+            optax.adam(1e-3),
         )
         with warnings.catch_warnings(record=True) as captured:
             warnings.simplefilter("always")
             lls = model.fit_sgd(
-                sim_data["position"], spikes,
-                optimizer=optimizer, num_steps=5,
+                sim_data["position"],
+                spikes,
+                optimizer=optimizer,
+                num_steps=5,
             )
         # Core assertion: the forward path completed and returned finite LLs.
         assert all(np.isfinite(ll) for ll in lls), (
@@ -1643,8 +1728,7 @@ class TestMaxFiringRateHz:
         )
         # If the warning fired, it must name the configured ceiling.
         saturation_warnings = [
-            w for w in captured
-            if "saturated" in str(w.message).lower()
+            w for w in captured if "saturated" in str(w.message).lower()
         ]
         for w in saturation_warnings:
             assert "max_firing_rate_hz" in str(w.message)
@@ -1689,9 +1773,7 @@ class TestBlockDiagonalDispatch:
         model = PlaceFieldModel(dt=0.02, n_interior_knots=3)
         import optax
 
-        model.fit_sgd(
-            position, spikes, optimizer=optax.sgd(1e-4), num_steps=0
-        )
+        model.fit_sgd(position, spikes, optimizer=optax.sgd(1e-4), num_steps=0)
         assert model._block_n_neurons == 3
         assert model._block_size == model.n_basis_per_neuron
 
@@ -1703,9 +1785,7 @@ class TestBlockDiagonalDispatch:
         import optax
 
         with pytest.raises(ValueError, match="integer-valued"):
-            model.fit_sgd(
-                position, spikes, optimizer=optax.sgd(1e-4), num_steps=0
-            )
+            model.fit_sgd(position, spikes, optimizer=optax.sgd(1e-4), num_steps=0)
 
     def test_fit_sgd_multi_neuron_force_dense_skips_dispatch(self) -> None:
         """force_dense=True should suppress block detection."""
@@ -1714,8 +1794,11 @@ class TestBlockDiagonalDispatch:
         import optax
 
         model.fit_sgd(
-            position, spikes, optimizer=optax.sgd(1e-4),
-            num_steps=0, force_dense=True,
+            position,
+            spikes,
+            optimizer=optax.sgd(1e-4),
+            num_steps=0,
+            force_dense=True,
         )
         assert model._block_n_neurons is None
         assert model._block_size is None
@@ -1728,8 +1811,10 @@ class TestBlockDiagonalDispatch:
         import optax
 
         model.fit_sgd(
-            sim["position"], sim["spikes"],
-            optimizer=optax.sgd(1e-4), num_steps=0,
+            sim["position"],
+            sim["spikes"],
+            optimizer=optax.sgd(1e-4),
+            num_steps=0,
         )
         assert model._block_n_neurons is None
         assert model._block_size is None
@@ -1764,14 +1849,20 @@ class TestBlockDiagonalDispatch:
 
         m_block = PlaceFieldModel(dt=0.02, n_interior_knots=3)
         lls_block = m_block.fit_sgd(
-            position, spikes, optimizer=optax.sgd(1e-4), num_steps=5,
+            position,
+            spikes,
+            optimizer=optax.sgd(1e-4),
+            num_steps=5,
             force_dense=False,
         )
         assert m_block._block_n_neurons == 3
 
         m_dense = PlaceFieldModel(dt=0.02, n_interior_knots=3)
         lls_dense = m_dense.fit_sgd(
-            position, spikes, optimizer=optax.sgd(1e-4), num_steps=5,
+            position,
+            spikes,
+            optimizer=optax.sgd(1e-4),
+            num_steps=5,
             force_dense=True,
         )
         assert m_dense._block_n_neurons is None
@@ -1779,8 +1870,10 @@ class TestBlockDiagonalDispatch:
         # Step 0 LL must match bit-exactly (both paths run the filter
         # on identical warm-started init state).
         np.testing.assert_allclose(
-            float(lls_block[0]), float(lls_dense[0]),
-            atol=1e-9, rtol=1e-10,
+            float(lls_block[0]),
+            float(lls_dense[0]),
+            atol=1e-9,
+            rtol=1e-10,
         )
 
         # Both paths must produce finite LLs throughout — no NaN drift.
@@ -1808,19 +1901,29 @@ class TestBlockDiagonalDispatch:
 
         m_block = PlaceFieldModel(dt=0.02, n_interior_knots=3)
         lls_block = m_block.fit(
-            position, spikes, max_iter=3, verbose=False, force_dense=False,
+            position,
+            spikes,
+            max_iter=3,
+            verbose=False,
+            force_dense=False,
         )
         assert m_block._block_n_neurons == 2
 
         m_dense = PlaceFieldModel(dt=0.02, n_interior_knots=3)
         lls_dense = m_dense.fit(
-            position, spikes, max_iter=3, verbose=False, force_dense=True,
+            position,
+            spikes,
+            max_iter=3,
+            verbose=False,
+            force_dense=True,
         )
         assert m_dense._block_n_neurons is None
 
         np.testing.assert_allclose(
-            np.asarray(lls_block), np.asarray(lls_dense),
-            atol=1e-5, rtol=1e-6,
+            np.asarray(lls_block),
+            np.asarray(lls_dense),
+            atol=1e-5,
+            rtol=1e-6,
         )
 
     @pytest.mark.slow
@@ -1890,9 +1993,7 @@ class TestBlockDiagonalDispatch:
         after the first M-step, AND that the fit completes without
         crashing (the dense path handles the dense A correctly).
         """
-        position, spikes = self._make_multi_neuron_data(
-            n_neurons=2, n_time=300
-        )
+        position, spikes = self._make_multi_neuron_data(n_neurons=2, n_time=300)
         model = PlaceFieldModel(
             dt=0.02,
             n_interior_knots=3,
@@ -2065,7 +2166,10 @@ class TestPlaceFieldModelRecovery:
         )
         model = PlaceFieldModel(dt=data["dt"], n_interior_knots=4)
         lls = model.fit(
-            data["position"], data["spikes"], max_iter=20, verbose=False,
+            data["position"],
+            data["spikes"],
+            max_iter=20,
+            verbose=False,
         )
         return model, data, lls
 
@@ -2082,9 +2186,7 @@ class TestPlaceFieldModelRecovery:
         # Correlate predicted rate at observed positions with true rate
         pred_rate_at_pos, _ = model.predict_rate_map(data["position"])
         corr = float(np.corrcoef(pred_rate_at_pos, data["true_rate"])[0, 1])
-        assert corr > 0.6, (
-            f"Predicted-vs-true rate correlation {corr:.3f} < 0.6"
-        )
+        assert corr > 0.6, f"Predicted-vs-true rate correlation {corr:.3f} < 0.6"
 
     def test_rate_map_peak_near_true_center(self, fitted):
         model, data, _ = fitted

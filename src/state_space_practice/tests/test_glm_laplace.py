@@ -319,7 +319,6 @@ class TestCarriedLineSearch:
             np.asarray(post_cov), np.asarray(ref_cov), rtol=1e-11, atol=1e-12
         )
 
-
     # One neuron whose expected count saturates the ``max_log_count`` clip:
     # beyond the clip the Poisson term is flat in x while the Fisher step
     # still points further up (y exceeds the clipped count), so no step size

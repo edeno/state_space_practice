@@ -112,9 +112,7 @@ def build_2d_spline_basis(
     """
     position = np.asarray(position)
     if position.ndim != 2 or position.shape[1] != 2:
-        raise ValueError(
-            f"position must be (n_time, 2), got shape {position.shape}"
-        )
+        raise ValueError(f"position must be (n_time, 2), got shape {position.shape}")
 
     x, y = position[:, 0], position[:, 1]
 
@@ -173,14 +171,11 @@ def evaluate_basis(
     """
     position = np.asarray(position)
     if position.ndim != 2 or position.shape[1] != 2:
-        raise ValueError(
-            f"position must be (n_points, 2), got shape {position.shape}"
-        )
+        raise ValueError(f"position must be (n_points, 2), got shape {position.shape}")
     x = np.clip(position[:, 0], basis_info["x_lo"], basis_info["x_hi"])
     y = np.clip(position[:, 1], basis_info["y_lo"], basis_info["y_hi"])
     env = {
-        k: basis_info[k]
-        for k in ("knots_x", "knots_y", "x_lo", "x_hi", "y_lo", "y_hi")
+        k: basis_info[k] for k in ("knots_x", "knots_y", "x_lo", "x_hi", "y_lo", "y_hi")
     }
     return np.asarray(dmatrix(basis_info["formula"], {"x": x, "y": y, **env}))
 
@@ -364,9 +359,7 @@ class PlaceFieldModel(SGDFittableMixin):
         if dt <= 0:
             raise ValueError(f"dt must be positive, got {dt}")
         if n_interior_knots < 1:
-            raise ValueError(
-                f"n_interior_knots must be >= 1, got {n_interior_knots}"
-            )
+            raise ValueError(f"n_interior_knots must be >= 1, got {n_interior_knots}")
         if process_noise_structure not in ("diagonal", "isotropic"):
             raise ValueError(
                 f"process_noise_structure must be 'diagonal' or 'isotropic', "
@@ -385,7 +378,8 @@ class PlaceFieldModel(SGDFittableMixin):
         self.max_firing_rate_hz = max_firing_rate_hz
         self.max_newton_iter = max_newton_iter
         self._log_intensity_func = (
-            log_intensity_func if log_intensity_func is not None
+            log_intensity_func
+            if log_intensity_func is not None
             else log_conditional_intensity
         )
         self.update_transition_matrix = update_transition_matrix
@@ -499,14 +493,11 @@ class PlaceFieldModel(SGDFittableMixin):
 
         return cls(dt=dt, n_interior_knots=n_interior_knots, **kwargs)
 
-    def _neuron_weights(
-        self, neuron_idx: int = 0
-    ) -> tuple[slice, int]:
+    def _neuron_weights(self, neuron_idx: int = 0) -> tuple[slice, int]:
         """Return the slice into the state vector for a given neuron."""
         if neuron_idx < 0 or neuron_idx >= self.n_neurons:
             raise ValueError(
-                f"neuron_idx={neuron_idx} out of range for "
-                f"n_neurons={self.n_neurons}"
+                f"neuron_idx={neuron_idx} out of range for n_neurons={self.n_neurons}"
             )
         assert self.n_basis_per_neuron is not None, "Model not initialized"
         nb = self.n_basis_per_neuron
@@ -838,9 +829,7 @@ class PlaceFieldModel(SGDFittableMixin):
         self.transition_matrix = jnp.eye(n)
         self.process_cov = jnp.eye(n) * self.init_process_noise
 
-        init_mean, init_cov = self._fit_stationary_glm(
-            Z_base, spikes, window=window
-        )
+        init_mean, init_cov = self._fit_stationary_glm(Z_base, spikes, window=window)
         self.init_mean = init_mean
         self.init_cov = init_cov
 
@@ -975,9 +964,7 @@ class PlaceFieldModel(SGDFittableMixin):
             logger.warning(msg)
             warnings.warn(msg, UserWarning, stacklevel=2)
 
-    def _e_step(
-        self, design_matrix: Array, spikes: Array
-    ) -> float:
+    def _e_step(self, design_matrix: Array, spikes: Array) -> float:
         """E-step: run filter and smoother.
 
         ``design_matrix`` is whatever ``_filter_design_matrix`` produced for
@@ -1048,9 +1035,7 @@ class PlaceFieldModel(SGDFittableMixin):
         gamma = sc.sum(axis=0) + sum_of_outer_products(sm, sm)
         gamma1 = gamma - jnp.outer(sm[-1], sm[-1]) - sc[-1]
         gamma2 = gamma - jnp.outer(sm[0], sm[0]) - sc[0]
-        beta = (
-            scc.sum(axis=0) + sum_of_outer_products(sm[:-1], sm[1:])
-        ).T
+        beta = (scc.sum(axis=0) + sum_of_outer_products(sm[:-1], sm[1:])).T
 
         if self.update_transition_matrix:
             A_new = psd_solve(gamma1, beta.T).T
@@ -1464,7 +1449,8 @@ class PlaceFieldModel(SGDFittableMixin):
         design_matrix = self._filter_design_matrix(Z_base)
 
         return super().fit_sgd(
-            design_matrix, spikes,
+            design_matrix,
+            spikes,
             optimizer=optimizer,
             num_steps=num_steps,
             verbose=verbose,
@@ -1509,9 +1495,7 @@ class PlaceFieldModel(SGDFittableMixin):
 
         return params, spec
 
-    def _sgd_loss_fn(
-        self, params: dict, design_matrix: Array, spikes: Array
-    ) -> Array:
+    def _sgd_loss_fn(self, params: dict, design_matrix: Array, spikes: Array) -> Array:
         A = params.get("transition_matrix", self.transition_matrix)
         m0 = params.get("init_mean", self.init_mean)
         P0 = params.get("init_cov", self.init_cov)
@@ -1560,9 +1544,7 @@ class PlaceFieldModel(SGDFittableMixin):
         if "init_cov" in params:
             self.init_cov = params["init_cov"]
 
-    def _finalize_sgd(
-        self, design_matrix: Array, spikes: Array
-    ) -> None:
+    def _finalize_sgd(self, design_matrix: Array, spikes: Array) -> None:
         (
             self.smoother_mean,
             self.smoother_cov,
@@ -1655,9 +1637,7 @@ class PlaceFieldModel(SGDFittableMixin):
             means_chunk = means[start:stop]
             covs_chunk = covs[start:stop]
             log_rate_mean = means_chunk @ Z_grid.T
-            var_log_rate = np.einsum(
-                "gb,tbc,gc->tg", Z_grid, covs_chunk, Z_grid
-            )
+            var_log_rate = np.einsum("gb,tbc,gc->tg", Z_grid, covs_chunk, Z_grid)
             var_log_rate = np.maximum(var_log_rate, 0.0)
             std_log_rate = np.sqrt(var_log_rate)
 
@@ -1921,9 +1901,7 @@ class PlaceFieldModel(SGDFittableMixin):
         )
         return float(marginal_ll)
 
-    def get_state_confidence_interval(
-        self, alpha: float = 0.05
-    ) -> Array:
+    def get_state_confidence_interval(self, alpha: float = 0.05) -> Array:
         """Get confidence intervals for the latent weight estimates.
 
         Parameters
@@ -1960,7 +1938,7 @@ class PlaceFieldModel(SGDFittableMixin):
         if self.update_process_cov:
             n += nb if self.process_noise_structure == "diagonal" else 1
         if self.update_transition_matrix:
-            n += nb ** 2
+            n += nb**2
         if self.update_init_state:
             n += nb  # mean
             n += nb  # diagonal of covariance (effective)
@@ -2021,7 +1999,9 @@ class PlaceFieldModel(SGDFittableMixin):
 
         n_time = self.smoother_mean.shape[0]
         session_duration = n_time * self.dt
-        mean_rate = self._total_spikes / session_duration if session_duration > 0 else 0.0
+        mean_rate = (
+            self._total_spikes / session_duration if session_duration > 0 else 0.0
+        )
 
         q_diag = jnp.diag(self.process_cov)
 
@@ -2058,13 +2038,15 @@ class PlaceFieldModel(SGDFittableMixin):
 
         try:
             drift = self.drift_summary(n_blocks=10)
-            lines.extend([
-                "",
-                "Drift",
-                "-" * 50,
-                f"  total (start-to-end):     {drift['total_drift']:.2f} cm",
-                f"  cumulative (path):        {drift['cumulative_drift']:.2f} cm",
-            ])
+            lines.extend(
+                [
+                    "",
+                    "Drift",
+                    "-" * 50,
+                    f"  total (start-to-end):     {drift['total_drift']:.2f} cm",
+                    f"  cumulative (path):        {drift['cumulative_drift']:.2f} cm",
+                ]
+            )
         except (ValueError, RuntimeError) as e:
             logger.debug("drift_summary unavailable in summary: %s", e)
 
@@ -2179,13 +2161,15 @@ class PlaceFieldModel(SGDFittableMixin):
             1: ["Full session"],
             2: ["First half", "Second half"],
             3: ["Early", "Middle", "Late"],
-        }.get(n_time_bins, [f"Block {i+1}" for i in range(n_time_bins)])
+        }.get(n_time_bins, [f"Block {i + 1}" for i in range(n_time_bins)])
 
         # Compute all rate maps first to get shared color scale
         rate_maps = []
         for idx in block_indices:
             rate, _ = self.predict_rate_map(
-                grid, time_slice=slice(idx[0], idx[-1] + 1), neuron_idx=neuron_idx,
+                grid,
+                time_slice=slice(idx[0], idx[-1] + 1),
+                neuron_idx=neuron_idx,
             )
             rate_maps.append(rate.reshape(n_grid, n_grid))
 

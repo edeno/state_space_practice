@@ -3115,9 +3115,7 @@ class TestBlockDiagonalParametersOk:
     def problem(self):
         return self._make_block_problem(n_neurons=self.N_NEURONS, block_size=self.NB)
 
-    def test_accepts_genuine_block_diagonal_and_extracts_factors(
-        self, problem
-    ) -> None:
+    def test_accepts_genuine_block_diagonal_and_extracts_factors(self, problem) -> None:
         m, P, A, Q, Z, Z_base_ref = problem
         assert self._ok(P, A, Q)
         result = _block_structure(m, P, A, Q, Z)
@@ -3805,13 +3803,32 @@ class TestBlockDiagonalSmootherEquivalence:
         n_neurons, nb = 3, 4
         Z_base = Z[:, 0, :nb]
         dense = stochastic_point_process_smoother(
-            init_mean, init_cov, Z, spikes, dt, A, Q, log_conditional_intensity,
-            validate_inputs=False, force_dense=True, return_filtered=True,
+            init_mean,
+            init_cov,
+            Z,
+            spikes,
+            dt,
+            A,
+            Q,
+            log_conditional_intensity,
+            validate_inputs=False,
+            force_dense=True,
+            return_filtered=True,
         )
         block = stochastic_point_process_smoother(
-            init_mean, init_cov, Z_base, spikes, dt, A, Q, log_conditional_intensity,
-            validate_inputs=False, block_n_neurons=n_neurons, block_size=nb,
-            return_filtered=True, return_block_covariances=True,
+            init_mean,
+            init_cov,
+            Z_base,
+            spikes,
+            dt,
+            A,
+            Q,
+            log_conditional_intensity,
+            validate_inputs=False,
+            block_n_neurons=n_neurons,
+            block_size=nb,
+            return_filtered=True,
+            return_block_covariances=True,
         )
         for block_mean, dense_mean in ((block[0], dense[0]), (block[4], dense[4])):
             np.testing.assert_allclose(
@@ -4016,9 +4033,7 @@ class TestBlockDiagonalCovarianceContainer:
         # Independent dense reference: scipy's block_diag per time bin.
         from scipy.linalg import block_diag
 
-        dense = np.stack(
-            [block_diag(*blocks[:, t]) for t in range(self.N_TIME)]
-        )
+        dense = np.stack([block_diag(*blocks[:, t]) for t in range(self.N_TIME)])
         return BlockDiagonalCovariance(jnp.asarray(blocks)), dense
 
     def test_sum_requires_axis(self, cov_and_dense) -> None:
@@ -4052,9 +4067,7 @@ class TestBlockDiagonalCovarianceContainer:
         cov, dense = cov_and_dense
         expected = dense[int(index)]
         np.testing.assert_allclose(np.asarray(cov[index]), expected, atol=1e-12)
-        np.testing.assert_allclose(
-            np.asarray(cov.at_time(index)), expected, atol=1e-12
-        )
+        np.testing.assert_allclose(np.asarray(cov.at_time(index)), expected, atol=1e-12)
 
     @pytest.mark.parametrize("index", [True, False, np.bool_(True)])
     def test_bool_index_rejected(self, cov_and_dense, index) -> None:
