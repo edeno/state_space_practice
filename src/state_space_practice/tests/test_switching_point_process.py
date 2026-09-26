@@ -9707,6 +9707,64 @@ class TestSwitchingSpikeOscillatorSGD:
         assert expected_penalty > 1.0
         assert delta == pytest.approx(expected_penalty, rel=1e-5)
 
+    @staticmethod
+    def _bounded_model(max_spectral_radius: float):
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        return SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=4,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            max_spectral_radius=max_spectral_radius,
+        )
+
+    @staticmethod
+    def _state_radii(transition_matrix) -> np.ndarray:
+        from state_space_practice.utils import spectral_radius
+
+        return np.array(
+            [
+                float(spectral_radius(transition_matrix[..., j]))
+                for j in range(transition_matrix.shape[-1])
+            ]
+        )
+
+    def test_sgd_store_respects_non_default_spectral_radius(self):
+        """_store_sgd_params projects A onto a non-default max_spectral_radius."""
+        bound = 0.93
+        model = self._bounded_model(bound)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        params, _ = model._build_param_spec()
+
+        # Guard: the unprojected SGD transition matrix violates the bound
+        # (the initial damping runs 0.90 -> 0.98 across states), so the
+        # assertion below is non-vacuous.
+        raw_radii = self._state_radii(model._reconstruct_A_from_blocks(params))
+        assert raw_radii.max() > bound + 1e-3
+
+        model._store_sgd_params(params)
+
+        radii = self._state_radii(model.continuous_transition_matrix)
+        assert np.all(radii <= bound + 1e-9)
+        # The violating state is clamped onto the bound; the stable one is kept.
+        np.testing.assert_allclose(radii, np.minimum(raw_radii, bound), atol=1e-9)
+
+    @pytest.mark.slow
+    def test_fit_sgd_respects_non_default_spectral_radius(self):
+        bound = 0.93
+        model = self._bounded_model(bound)
+        key = jax.random.PRNGKey(42)
+        spikes = jax.random.poisson(key, jnp.ones((100, 4)) * 0.01)
+        model.fit_sgd(spikes, key=key, num_steps=3)
+
+        radii = self._state_radii(model.continuous_transition_matrix)
+        assert np.all(np.isfinite(radii))
+        assert np.all(radii <= bound + 1e-9)
+
 
 class TestSwitchingSpikeOscillatorEMConsistency:
     """Regression guards for the EM cache-identity and rollback-resync fixes."""
