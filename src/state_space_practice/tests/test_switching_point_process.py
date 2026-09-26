@@ -9934,7 +9934,7 @@ class TestSwitchingSpikeOscillatorEMConsistency:
 
 
 # ---------------------------------------------------------------------------
-# Occupancy gate
+# Newton ridge / fallback, occupancy gate
 # ---------------------------------------------------------------------------
 
 
@@ -9983,3 +9983,73 @@ def test_separate_spike_glm_keeps_params_of_near_empty_state() -> None:
         np.asarray(model.spike_params.baseline[:, 0]),
         np.asarray(before.baseline[:, 0]),
     )
+
+
+def test_ridged_newton_direction_uses_one_relative_ridge_policy() -> None:
+    """Every GLM Newton solve adds 1e-4 * max(max|diag H|, 1) (relative for a
+    large Hessian) and solves by Cholesky."""
+    from state_space_practice.switching_point_process import (
+        _ridged_newton_direction,
+    )
+
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(50, 3))
+    for scale in (1e-3, 1e6):
+        hess = scale * X.T @ X
+        grad = rng.normal(size=3)
+        ridge = 1e-4 * max(np.max(np.abs(np.diag(hess))), 1.0)
+        expected = np.linalg.solve(hess + ridge * np.eye(3), grad)
+        np.testing.assert_allclose(
+            _ridged_newton_direction(jnp.asarray(hess), jnp.asarray(grad)),
+            expected,
+            rtol=1e-10,
+        )
+
+
+def test_descent_step_falls_back_to_gradient_for_non_descent_direction() -> None:
+    """g^T delta <= 0 (or a NaN direction) no longer yields a silent alpha = 0:
+    the step moves along -g and decreases the loss."""
+    from state_space_practice.switching_point_process import _descent_step
+
+    def loss_fn(p):
+        return jnp.sum((p - 1.0) ** 2)
+
+    params = jnp.array([0.0, 0.0])
+    grad = jax.grad(loss_fn)(params)
+    for bad_delta in (-grad, jnp.array([jnp.nan, 0.0])):
+        new_params, fell_back = _descent_step(
+            params, bad_delta, grad, loss_fn, loss_fn(params)
+        )
+        assert bool(fell_back)
+        assert float(loss_fn(new_params)) < float(loss_fn(params))
+
+    new_params, fell_back = _descent_step(params, grad, grad, loss_fn, loss_fn(params))
+    assert not bool(fell_back)
+    # Stationary point: nothing to do, and not counted as a fallback.
+    _, fell_back_zero = _descent_step(
+        jnp.ones(2), jnp.zeros(2), jnp.zeros(2), loss_fn, jnp.array(0.0)
+    )
+    assert not bool(fell_back_zero)
+
+
+def test_spike_glm_update_warns_on_newton_fallback(monkeypatch) -> None:
+    """The per-neuron fallbacks are aggregated into one host-side warning, and
+    the update still improves the objective instead of freezing."""
+    import state_space_practice.switching_point_process as spp
+
+    rng = np.random.default_rng(1)
+    n_time, n_latent, n_neurons = 200, 2, 3
+    smoother_mean = jnp.asarray(rng.normal(size=(n_time, n_latent)))
+    true_w = rng.normal(size=(n_neurons, n_latent))
+    rates = np.exp(1.0 + smoother_mean @ true_w.T) * 0.01
+    spikes = jnp.asarray(rng.poisson(rates))
+    params0 = SpikeObsParams(
+        baseline=jnp.zeros(n_neurons), weights=jnp.zeros((n_neurons, n_latent))
+    )
+    # Corrupt the Newton direction so it points uphill.
+    monkeypatch.setattr(spp, "_ridged_newton_direction", lambda hess, grad: -grad)
+    with pytest.warns(UserWarning, match="fell back to the gradient direction"):
+        updated = spp.update_spike_glm_params(
+            spikes, smoother_mean, params0, dt=0.01, max_iter=3
+        )
+    assert float(jnp.max(jnp.abs(updated.baseline - params0.baseline))) > 0.0

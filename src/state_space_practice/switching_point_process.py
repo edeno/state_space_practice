@@ -84,6 +84,7 @@ References
 
 import functools
 import logging
+import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -126,6 +127,7 @@ from state_space_practice.utils import (
     clip_eigenvalues,
     contains_tracer,
     make_discrete_transition_matrix,
+    psd_solve,
     stabilize_covariance,
     symmetrize,
     validate_count_array,
@@ -983,6 +985,81 @@ def _armijo_line_search(
     return jnp.where(found, final_alpha, 0.0)
 
 
+# Relative Newton ridge shared by every spike-GLM Newton solve: the Hessian gets
+# ``_NEWTON_RELATIVE_RIDGE * max(max|diag(H)|, 1)`` added to its diagonal, which
+# keeps degenerate (near-silent) neurons well conditioned while perturbing a
+# well-determined Hessian by only a relative 1e-4.
+_NEWTON_RELATIVE_RIDGE = 1e-4
+
+
+def _ridged_newton_direction(hessian: Array, gradient: Array) -> Array:
+    """Newton direction ``(H + ridge I)^{-1} g`` for an SPD GLM Hessian.
+
+    Solved by Cholesky (:func:`~state_space_practice.utils.psd_solve`) rather
+    than LU: the ridged Hessian is symmetric positive definite, and a failed
+    factorization surfaces as NaN instead of a silently wrong LU solve.
+    """
+    hess_scale = jnp.maximum(jnp.max(jnp.abs(jnp.diag(hessian))), 1.0)
+    ridge = _NEWTON_RELATIVE_RIDGE * hess_scale
+    ridged = hessian + ridge * jnp.eye(hessian.shape[-1], dtype=hessian.dtype)
+    return psd_solve(ridged, gradient, diagonal_boost=0.0, relative_boost=0.0)
+
+
+def _descent_step(
+    params: Array,
+    delta: Array,
+    gradient: Array,
+    loss_fn: Callable[[Array], Array],
+    current_loss: Array,
+    beta: float = 0.5,
+    max_iter: int = 20,
+) -> tuple[Array, Array]:
+    """Armijo step along ``delta``, falling back to the gradient direction.
+
+    If ``delta`` is not a descent direction (``g^T delta <= 0``, e.g. a Newton
+    direction corrupted by an ill-conditioned Hessian), the Armijo search
+    along it can only return ``alpha = 0`` -- a silent no-op update. The
+    steepest-descent direction ``g`` is used instead.
+
+    Returns
+    -------
+    new_params : Array
+        ``params - alpha * direction``.
+    fell_back : Array, bool scalar
+        Whether the gradient fallback was used (aggregated host-side by the
+        callers into one warning).
+    """
+    # NaN in delta (e.g. a failed Cholesky) also triggers the fallback. A zero
+    # gradient is a stationary point, not a failure, so it is not counted.
+    fell_back = ~(jnp.dot(gradient, delta) > 0.0) & (jnp.dot(gradient, gradient) > 0.0)
+    direction = jnp.where(fell_back, gradient, delta)
+    alpha = _armijo_line_search(
+        params,
+        direction,
+        gradient,
+        loss_fn,
+        current_loss,
+        beta=beta,
+        max_iter=max_iter,
+    )
+    return params - alpha * direction, fell_back
+
+
+def _warn_newton_fallbacks(n_fallbacks: Array, context: str) -> None:
+    """Host-side aggregate warning for gradient-direction fallbacks."""
+    if contains_tracer(n_fallbacks):
+        return
+    count = int(jax.device_get(n_fallbacks))
+    if count > 0:
+        warnings.warn(
+            f"{context}: the Newton direction was not a descent direction in "
+            f"{count} neuron-iteration(s) (ill-conditioned Hessian); fell back "
+            "to the gradient direction for those steps.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
 def _transition_matrix_to_scaled_rotation_params(transition_matrix: Array) -> Array:
     """Extract scaled-rotation block coefficients (a, b) from an even square matrix."""
     blocks = _matrix_to_oscillator_blocks(transition_matrix)  # (n_osc, n_osc, 2, 2)
@@ -1087,6 +1164,22 @@ def _single_neuron_glm_step(
     time_weights: Array | None = None,
     weight_l2: float = 0.0,
 ) -> tuple[Array, Array]:
+    """Single plug-in Newton step; see :func:`_single_neuron_glm_step_with_flag`."""
+    new_baseline, new_weights, _ = _single_neuron_glm_step_with_flag(
+        baseline, weights, y_n, smoother_mean, dt, time_weights, weight_l2
+    )
+    return new_baseline, new_weights
+
+
+def _single_neuron_glm_step_with_flag(
+    baseline: ArrayLike,
+    weights: Array,
+    y_n: Array,
+    smoother_mean: Array,
+    dt: float,
+    time_weights: Array | None = None,
+    weight_l2: float = 0.0,
+) -> tuple[Array, Array, Array]:
     """Single Newton-Raphson step for Poisson GLM parameter optimization.
 
     Takes one Newton step to minimize the negative log-likelihood
@@ -1121,6 +1214,9 @@ def _single_neuron_glm_step(
         Updated baseline after Newton step (0-D array).
     new_weights : Array, shape (n_latent,)
         Updated weights after Newton step.
+    fell_back : Array, bool scalar
+        Whether the Newton direction was not a descent direction and the step
+        used the gradient direction instead (see :func:`_descent_step`).
 
     Notes
     -----
@@ -1177,12 +1273,8 @@ def _single_neuron_glm_step(
     l2_hess_diag = jnp.concatenate([jnp.zeros(1), jnp.ones(n_latent) * weight_l2])
     hessian = hessian + jnp.diag(l2_hess_diag)
 
-    # Add small regularization for numerical stability
-    reg = 1e-6 * jnp.eye(1 + n_latent)
-    hessian = hessian + reg
-
-    # Newton direction: delta = H^{-1} @ g
-    delta = jnp.linalg.solve(hessian, gradient)
+    # Newton direction: delta = (H + ridge I)^{-1} @ g (shared relative ridge)
+    delta = _ridged_newton_direction(hessian, gradient)
 
     # Current loss for backtracking line search (NLL + L2 penalty)
     current_loss = jnp.sum(time_weights * (mu - y_n * eta)) + 0.5 * weight_l2 * jnp.sum(
@@ -1198,17 +1290,17 @@ def _single_neuron_glm_step(
         l2_penalty = 0.5 * weight_l2 * jnp.sum(weights_trial**2)
         return nll + l2_penalty
 
-    # Backtracking line search with Armijo condition
-    final_alpha = _armijo_line_search(params, delta, gradient, loss_fn, current_loss)
-
-    # Apply final step
-    new_params = params - final_alpha * delta
+    # Backtracking line search with Armijo condition (gradient fallback when
+    # the Newton direction is not a descent direction).
+    new_params, fell_back = _descent_step(
+        params, delta, gradient, loss_fn, current_loss
+    )
 
     # Extract updated baseline and weights
     new_baseline = new_params[0]
     new_weights = new_params[1:]
 
-    return new_baseline, new_weights
+    return new_baseline, new_weights, fell_back
 
 
 def _neg_Q_single_neuron(
@@ -1320,6 +1412,34 @@ def _single_neuron_glm_step_second_order(
     baseline_prior: Array | None = None,
     baseline_prior_l2: float = 0.0,
 ) -> tuple[Array, Array]:
+    """Second-order Newton step; see the ``_with_flag`` variant."""
+    new_baseline, new_weights, _ = _single_neuron_glm_step_second_order_with_flag(
+        baseline,
+        weights,
+        y_n,
+        smoother_mean,
+        smoother_cov,
+        dt,
+        time_weights,
+        weight_l2,
+        baseline_prior,
+        baseline_prior_l2,
+    )
+    return new_baseline, new_weights
+
+
+def _single_neuron_glm_step_second_order_with_flag(
+    baseline: Array,
+    weights: Array,
+    y_n: Array,
+    smoother_mean: Array,
+    smoother_cov: Array,
+    dt: float,
+    time_weights: Array | None = None,
+    weight_l2: float = 0.0,
+    baseline_prior: Array | None = None,
+    baseline_prior_l2: float = 0.0,
+) -> tuple[Array, Array, Array]:
     """Single Newton step for Poisson GLM with second-order expectation.
 
     Uses JAX autodiff to compute exact gradient and Hessian of the
@@ -1360,6 +1480,8 @@ def _single_neuron_glm_step_second_order(
         Updated baseline.
     new_weights : Array, shape (n_latent,)
         Updated weights.
+    fell_back : Array, bool scalar
+        Whether the step fell back to the gradient direction.
     """
     n_latent = weights.shape[0]
     params = jnp.concatenate([jnp.atleast_1d(baseline), weights])
@@ -1422,13 +1544,8 @@ def _single_neuron_glm_step_second_order(
     hess = hess.at[1:, 0].set(hess_bw)
     hess = hess.at[1:, 1:].set(hess_ww)
 
-    # Adaptive ridge: scale with Hessian magnitude for degenerate neurons
-    hess_scale = jnp.maximum(jnp.max(jnp.abs(jnp.diag(hess))), 1.0)
-    ridge = 1e-4 * hess_scale
-    hess_reg = hess + ridge * jnp.eye(1 + n_latent)
-
-    # Newton direction
-    delta = jnp.linalg.solve(hess_reg, grad)
+    # Newton direction with the shared relative ridge (degenerate neurons).
+    delta = _ridged_newton_direction(hess, grad)
 
     # Armijo backtracking line search to guarantee sufficient decrease.
     # The second-order Poisson GLM objective is non-quadratic, so full
@@ -1450,14 +1567,13 @@ def _single_neuron_glm_step_second_order(
         return loss
 
     current_loss = loss_fn(params)
-    alpha = _armijo_line_search(
+    new_params, fell_back = _descent_step(
         params, delta, grad, loss_fn, current_loss, beta=0.5, max_iter=10
     )
-    new_params = params - alpha * delta
     new_baseline = new_params[0]
     new_weights = new_params[1:]
 
-    return new_baseline, new_weights
+    return new_baseline, new_weights, fell_back
 
 
 def _single_neuron_glm_step_second_order_mixture(
@@ -1472,6 +1588,34 @@ def _single_neuron_glm_step_second_order_mixture(
     baseline_prior: Array | None = None,
     baseline_prior_l2: float = 0.0,
 ) -> tuple[Array, Array]:
+    """Shared-parameter mixture Newton step; see the ``_with_flag`` variant."""
+    new_b, new_w, _ = _single_neuron_glm_step_second_order_mixture_with_flag(
+        baseline,
+        weights,
+        y_n,
+        state_cond_smoother_mean,
+        state_cond_smoother_cov,
+        state_weights,
+        dt,
+        weight_l2,
+        baseline_prior,
+        baseline_prior_l2,
+    )
+    return new_b, new_w
+
+
+def _single_neuron_glm_step_second_order_mixture_with_flag(
+    baseline: Array,
+    weights: Array,
+    y_n: Array,
+    state_cond_smoother_mean: Array,
+    state_cond_smoother_cov: Array,
+    state_weights: Array,
+    dt: float,
+    weight_l2: float = 0.0,
+    baseline_prior: Array | None = None,
+    baseline_prior_l2: float = 0.0,
+) -> tuple[Array, Array, Array]:
     """Single Newton step for a shared Poisson GLM under a Gaussian mixture.
 
     This is the shared-observation-parameter M-step for a switching model:
@@ -1480,6 +1624,13 @@ def _single_neuron_glm_step_second_order_mixture(
 
     The exponential term is evaluated per state component before mixing, which
     avoids the bias from collapsing the Gaussian mixture before applying exp.
+
+    Returns
+    -------
+    new_baseline : Array, shape ()
+    new_weights : Array, shape (n_latent,)
+    fell_back : Array, bool scalar
+        Whether the step fell back to the gradient direction.
     """
     n_latent = weights.shape[0]
     params = jnp.concatenate([jnp.atleast_1d(baseline), weights])
@@ -1526,9 +1677,7 @@ def _single_neuron_glm_step_second_order_mixture(
     hess = hess.at[1:, 0].set(hess_bw)
     hess = hess.at[1:, 1:].set(hess_ww)
 
-    hess_scale = jnp.maximum(jnp.max(jnp.abs(jnp.diag(hess))), 1.0)
-    hess_reg = hess + (1e-4 * hess_scale) * jnp.eye(1 + n_latent)
-    delta = jnp.linalg.solve(hess_reg, grad)
+    delta = _ridged_newton_direction(hess, grad)
 
     def loss_fn(p: Array) -> Array:
         b_trial = p[0]
@@ -1547,11 +1696,10 @@ def _single_neuron_glm_step_second_order_mixture(
         return loss
 
     current_loss = loss_fn(params)
-    alpha = _armijo_line_search(
+    new_params, fell_back = _descent_step(
         params, delta, grad, loss_fn, current_loss, beta=0.5, max_iter=10
     )
-    new_params = params - alpha * delta
-    return new_params[0], new_params[1:]
+    return new_params[0], new_params[1:], fell_back
 
 
 @functools.partial(jax.jit, static_argnames=("max_iter",))
@@ -1567,7 +1715,7 @@ def _second_order_newton_iterations(
     baseline_prior: Array,
     baseline_prior_l2: float,
     max_iter: int,
-) -> tuple[Array, Array]:
+) -> tuple[Array, Array, Array]:
     """``max_iter`` second-order Newton steps for every neuron in one jitted scan.
 
     Mirrors the plug-in branch of :func:`update_spike_glm_params`: the
@@ -1576,14 +1724,15 @@ def _second_order_newton_iterations(
     every iteration. ``baseline_prior`` is always an array here (a zero vector
     is the neutral default) and ``time_weights`` always a vector (ones when
     unweighted), which is exactly what the per-neuron step substitutes for
-    ``None``, so the computation is unchanged.
+    ``None``, so the computation is unchanged. The third output counts the
+    neuron-iterations whose Newton direction fell back to the gradient.
     """
 
     def iterate_all_neurons(carry, _):
         baselines, weights = carry
 
         def update_neuron(b, w, y_n, bp):
-            return _single_neuron_glm_step_second_order(
+            return _single_neuron_glm_step_second_order_with_flag(
                 b,
                 w,
                 y_n,
@@ -1596,15 +1745,18 @@ def _second_order_newton_iterations(
                 baseline_prior_l2,
             )
 
-        new_baselines, new_weights = jax.vmap(update_neuron, in_axes=(0, 0, 1, 0))(
-            baselines, weights, spikes, baseline_prior
+        new_baselines, new_weights, fell_back = jax.vmap(
+            update_neuron, in_axes=(0, 0, 1, 0)
+        )(baselines, weights, spikes, baseline_prior)
+        return (
+            _cast_like_carry(new_baselines, new_weights, baselines, weights),
+            jnp.sum(fell_back),
         )
-        return _cast_like_carry(new_baselines, new_weights, baselines, weights), None
 
-    (final_baselines, final_weights), _ = jax.lax.scan(
+    (final_baselines, final_weights), n_fallbacks = jax.lax.scan(
         iterate_all_neurons, (baselines, weights), None, length=max_iter
     )
-    return final_baselines, final_weights
+    return final_baselines, final_weights, jnp.sum(n_fallbacks)
 
 
 def _cast_like_carry(
@@ -1647,7 +1799,7 @@ def _mixture_newton_iterations(
     baseline_prior: Array,
     baseline_prior_l2: float,
     max_iter: int,
-) -> tuple[Array, Array]:
+) -> tuple[Array, Array, Array]:
     """``max_iter`` mixture Newton steps for every neuron in one jitted scan.
 
     The shared-parameter counterpart of :func:`_second_order_newton_iterations`
@@ -1658,7 +1810,7 @@ def _mixture_newton_iterations(
         baselines, weights = carry
 
         def update_neuron(b, w, y_n, bp):
-            return _single_neuron_glm_step_second_order_mixture(
+            return _single_neuron_glm_step_second_order_mixture_with_flag(
                 b,
                 w,
                 y_n,
@@ -1671,15 +1823,18 @@ def _mixture_newton_iterations(
                 baseline_prior_l2,
             )
 
-        new_baselines, new_weights = jax.vmap(update_neuron, in_axes=(0, 0, 1, 0))(
-            baselines, weights, spikes, baseline_prior
+        new_baselines, new_weights, fell_back = jax.vmap(
+            update_neuron, in_axes=(0, 0, 1, 0)
+        )(baselines, weights, spikes, baseline_prior)
+        return (
+            _cast_like_carry(new_baselines, new_weights, baselines, weights),
+            jnp.sum(fell_back),
         )
-        return _cast_like_carry(new_baselines, new_weights, baselines, weights), None
 
-    (final_baselines, final_weights), _ = jax.lax.scan(
+    (final_baselines, final_weights), n_fallbacks = jax.lax.scan(
         iterate_all_neurons, (baselines, weights), None, length=max_iter
     )
-    return final_baselines, final_weights
+    return final_baselines, final_weights, jnp.sum(n_fallbacks)
 
 
 def update_spike_glm_params(
@@ -1799,7 +1954,7 @@ def update_spike_glm_params(
         # zero-centered prior is the neutral default for baseline_prior.
         if baseline_prior is None:
             baseline_prior = jnp.zeros_like(baselines)
-        final_baselines, final_weights = _second_order_newton_iterations(
+        final_baselines, final_weights, n_fallbacks = _second_order_newton_iterations(
             baselines,
             weights,
             spikes,
@@ -1819,24 +1974,24 @@ def update_spike_glm_params(
             baselines, weights = carry
 
             def update_neuron(b, w, y_n):
-                new_b, new_w = _single_neuron_glm_step(
+                return _single_neuron_glm_step_with_flag(
                     b, w, y_n, smoother_mean, dt, time_weights, weight_l2
                 )
-                return new_b, new_w
 
-            new_baselines, new_weights = jax.vmap(update_neuron, in_axes=(0, 0, 1))(
-                baselines, weights, spikes
-            )
+            new_baselines, new_weights, fell_back = jax.vmap(
+                update_neuron, in_axes=(0, 0, 1)
+            )(baselines, weights, spikes)
 
             return (
                 _cast_like_carry(new_baselines, new_weights, baselines, weights),
-                None,
+                jnp.sum(fell_back),
             )
 
-        (final_baselines, final_weights), _ = jax.lax.scan(
+        (final_baselines, final_weights), n_fallbacks = jax.lax.scan(
             iterate_all_neurons, (baselines, weights), None, length=max_iter
         )
 
+    _warn_newton_fallbacks(jnp.sum(n_fallbacks), "update_spike_glm_params")
     return SpikeObsParams(baseline=final_baselines, weights=final_weights)
 
 
@@ -1886,7 +2041,7 @@ def update_spike_glm_params_mixture(
     # A zero-centered prior is the neutral default for baseline_prior.
     if baseline_prior is None:
         baseline_prior = jnp.zeros_like(baselines)
-    final_baselines, final_weights = _mixture_newton_iterations(
+    final_baselines, final_weights, n_fallbacks = _mixture_newton_iterations(
         baselines,
         weights,
         spikes,
@@ -1899,6 +2054,7 @@ def update_spike_glm_params_mixture(
         baseline_prior_l2,
         max_iter=max_iter,
     )
+    _warn_newton_fallbacks(n_fallbacks, "update_spike_glm_params_mixture")
     return SpikeObsParams(baseline=final_baselines, weights=final_weights)
 
 
