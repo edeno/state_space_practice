@@ -466,15 +466,12 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
     wrappers, ``_build_param_spec``, ``_sgd_loss_fn`` and
     ``_validate_fit_data``, and name their readout in ``_observation_model``.
 
-    ``fit_sgd(*observations, use_filter=True, l2_reg=1e-4, **sgd_kwargs)``
-    takes, besides the ``SGDFittableMixin`` optimizer settings, two family
-    keywords handled by ``_prepare_sgd_data``:
-
-    - ``use_filter``: ``True`` (default) optimizes the marginal (Laplace-)EKF
-      log-likelihood and learns the process covariance; ``False`` optimizes a
-      deterministic-rollout surrogate that drops the process prior and the
-      latent uncertainty, useful for warm-starting the dynamics.
-    - ``l2_reg``: weight of the L2 penalty on the MLP weights.
+    Each concrete model also declares a thin public ``fit_sgd`` with its own
+    named data arguments (``observations`` or ``lfp_obs, spike_obs``) followed
+    by ``optimizer, num_steps, verbose, convergence_tol, use_filter, l2_reg``,
+    so the data can be passed by name and the optimizer positionally. It
+    only forwards to ``SGDFittableMixin.fit_sgd``; validation happens once in
+    ``_prepare_sgd_data``.
     """
 
     #: Readout name passed to the module-level jitted cores.
@@ -569,9 +566,10 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
     ) -> tuple[tuple[Array, ...], dict[str, Any]]:
         """Validate the data for ``fit_sgd`` and record its length.
 
-        Any other keyword (e.g. the EM models' ``key``) is rejected here with
-        a ``TypeError``: the Hamiltonian models allocate their parameters in
-        ``__init__`` and take no initialization key.
+        ``use_filter`` and ``l2_reg`` are forwarded to ``_sgd_loss_fn``. The
+        Hamiltonian models allocate their parameters in ``__init__`` and take
+        no initialization ``key``; the public ``fit_sgd`` signatures reject it
+        with a ``TypeError``.
         """
         validated = self._validate_fit_data(*data)
         self._sgd_n_time = validated[0].shape[0]

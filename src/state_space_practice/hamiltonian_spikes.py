@@ -11,6 +11,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from jax import Array
+from jax.typing import ArrayLike
 
 from state_space_practice.hamiltonian_core import (
     HamiltonianModelBase,
@@ -107,6 +108,54 @@ class HamiltonianSpikeModel(HamiltonianModelBase):
             )
         validate_count_array(spikes, "spikes", allow_empty=allow_empty)
         return spikes
+
+    def fit_sgd(  # type: ignore[override]
+        self,
+        observations: ArrayLike,
+        optimizer: object | None = None,
+        num_steps: int = 200,
+        verbose: bool = False,
+        convergence_tol: float | None = None,
+        use_filter: bool = True,
+        l2_reg: float = 1e-4,
+    ) -> list[float]:
+        """Fit by gradient descent on the negative log-likelihood.
+
+        Parameters
+        ----------
+        observations : ArrayLike, shape (n_time, n_sources)
+            Non-negative integer spike counts.
+        optimizer : optax.GradientTransformation or None, optional
+            Default: ``adam(1e-2)`` with global-norm gradient clipping.
+        num_steps : int, optional
+            Number of optimization steps.
+        verbose : bool, optional
+            Print progress every 10 steps.
+        convergence_tol : float or None, optional
+            Stop early once the relative LL change stays below this for 5
+            consecutive steps.
+        use_filter : bool, optional
+            ``True`` optimizes the marginal Laplace-EKF log-likelihood and
+            learns the process covariance; ``False`` optimizes a
+            deterministic-rollout surrogate (no process prior, no latent
+            uncertainty) for warm starts.
+        l2_reg : float, optional
+            Weight of the L2 penalty on the MLP weights.
+
+        Returns
+        -------
+        log_likelihoods : list of float
+            Log-likelihood (or surrogate) per accepted optimization step.
+        """
+        return super().fit_sgd(
+            observations,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+            use_filter=use_filter,
+            l2_reg=l2_reg,
+        )
 
     def _validate_fit_data(self, observations: Array) -> tuple[Array, ...]:
         return (self._validate_spikes(observations, allow_empty=False),)
