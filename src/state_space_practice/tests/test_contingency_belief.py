@@ -1155,3 +1155,28 @@ class TestTransitionMStep:
         )
         assert len(lls) >= 4  # guard: several M-steps ran
         assert len(traces) == per_trace
+
+
+class TestContingencyBeliefSeed:
+    def test_default_seed_keeps_historical_initialization(self):
+        model = ContingencyBeliefModel(n_states=3, n_options=2)
+        expected_values = jax.random.normal(jax.random.PRNGKey(0), (3, 2)) * 0.1
+        expected_rewards = jnp.clip(
+            0.5 + 0.05 * jax.random.normal(jax.random.PRNGKey(1), (3, 2)),
+            0.01, 0.99,
+        )
+        np.testing.assert_array_equal(model.state_values_, expected_values)
+        np.testing.assert_array_equal(model.reward_probs_, expected_rewards)
+
+    def test_different_seeds_initialize_differently(self):
+        a = ContingencyBeliefModel(n_states=2, n_options=3, seed=1)
+        b = ContingencyBeliefModel(n_states=2, n_options=3, seed=2)
+        same = ContingencyBeliefModel(n_states=2, n_options=3, seed=1)
+        assert not np.allclose(a.state_values_, b.state_values_)
+        assert not np.allclose(a.reward_probs_, b.reward_probs_)
+        np.testing.assert_array_equal(a.state_values_, same.state_values_)
+        np.testing.assert_array_equal(a.reward_probs_, same.reward_probs_)
+        # the two parameters use independent keys
+        assert not np.allclose(
+            a.state_values_ / 0.1, (a.reward_probs_ - 0.5) / 0.05
+        )

@@ -900,6 +900,13 @@ class ContingencyBeliefModel(SGDFittableMixin):
         Extra Dirichlet concentration on diagonal (self-transitions).
     transition_regularization : float
         L2 penalty on non-intercept transition coefficients.
+    seed : int or None
+        Seed for the random initialization of ``reward_probs_`` and
+        ``state_values_``. ``None`` (default) keeps the historical fixed keys
+        (``PRNGKey(1)`` for ``reward_probs_``, ``PRNGKey(0)`` for
+        ``state_values_``), so existing fits are unchanged; an integer splits
+        ``PRNGKey(seed)`` into one key per parameter, so different seeds give
+        different EM starting points.
     """
 
     def __init__(
@@ -913,6 +920,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
         concentration: float = 1.0,
         stickiness: float = 0.0,
         transition_regularization: float = 1e-5,
+        seed: int | None = None,
     ):
         if n_states < 2:
             raise ValueError(
@@ -948,17 +956,20 @@ class ContingencyBeliefModel(SGDFittableMixin):
             raise ValueError(f"stickiness must be >= 0, got {stickiness}.")
 
         # Initialize parameters. reward_probs_ is perturbed off 0.5 per state
-        # (distinct seed from state_values_) so EM does not start at a saddle
+        # (distinct key from state_values_) so EM does not start at a saddle
         # where the reward channel provides no state-discriminating signal --
         # the failure mode when states differ mainly in reward contingency.
+        if seed is None:
+            reward_key, values_key = jax.random.PRNGKey(1), jax.random.PRNGKey(0)
+        else:
+            reward_key, values_key = jax.random.split(jax.random.PRNGKey(seed))
+        self.seed = seed
         self.reward_probs_ = jnp.clip(
-            0.5 + 0.05 * jax.random.normal(
-                jax.random.PRNGKey(1), (n_states, n_options)
-            ),
+            0.5 + 0.05 * jax.random.normal(reward_key, (n_states, n_options)),
             0.01, 0.99,
         )
         self.state_values_ = jax.random.normal(
-            jax.random.PRNGKey(0), (n_states, n_options)
+            values_key, (n_states, n_options)
         ) * 0.1
 
         # Transition coefficients: (n_coefficients, n_states, n_states - 1)
