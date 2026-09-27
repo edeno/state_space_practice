@@ -36,16 +36,14 @@ from state_space_practice.utils import (  # noqa: F401 — re-exported for backw
 )
 
 # Gain solves (Kalman gain ``S^{-1} H P``, RTS gain ``P_pred^{-1} A P``) and the
-# M-step regression solves use a purely scale-relative Cholesky shift: the
+# M-step regression solves use a purely scale-relative Cholesky shift. The
 # linear-Gaussian recursions are equivariant under a change of units
-# (x -> c x, covariances -> c^2 cov), and an absolute shift breaks that. With
-# psd_solve's default absolute 1e-9 floor, a model whose covariances are
-# ~1e-8 (e.g. voltages) got posterior means off by >1 posterior standard
-# deviation, and n_obs > n_latent with R ~ 1e-6 by ~2 standard deviations
-# (tests/test_oracle_kalman.py). The matrices solved here are positive
-# definite whenever the inputs are valid (R > 0 makes S > 0), so the shift only
-# guards against round-off; the tiny absolute part only keeps an all-zero
-# matrix factorizable. The relative shift is never below the dtype's machine
+# (x -> c x, covariances -> c^2 cov); an absolute shift breaks that, perturbing
+# the posterior of any model whose covariances are comparable to or smaller
+# than the shift. The matrices solved here are positive definite whenever the
+# inputs are valid (R > 0 makes S > 0), so the shift only guards against
+# round-off; the tiny absolute part only keeps an all-zero matrix
+# factorizable. The relative shift is never below the dtype's machine
 # epsilon: in float32 a 1e-14 relative shift rounds away entirely, and a
 # singular predicted covariance (rank-deficient dynamics, zero process noise)
 # then fails Cholesky.
@@ -1393,7 +1391,9 @@ def process_cov_residual_form(
 ) -> jax.Array:
     """Centred (residual) M-step estimate of the process covariance.
 
-    ``Q = (1/(T-1)) sum_t E[(x_{t+1} - A x_t)(x_{t+1} - A x_t)^T]``, i.e.::
+    ``Q = sum_t E[(x_{t+1} - A x_t)(x_{t+1} - A x_t)^T]`` divided by the number
+    of transitions (``n_time - 1``, ``n_time = smoother_mean.shape[0]``), where
+    the sum is::
 
         sum_t [(m_{t+1} - A m_t)(.)^T + P_{t+1} - A C_t - C_t^T A^T + A P_t A^T]
 

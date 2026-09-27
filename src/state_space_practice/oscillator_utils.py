@@ -1229,7 +1229,7 @@ def project_transition_matrix_stack(
     of the oscillator coupling graph: for uncoupled (or one-directionally
     coupled) oscillators only the offending oscillator block is rescaled, so a
     single unstable rhythm does not damp every other rhythm; for fully coupled
-    oscillators it is the uniform scale. The clamp emits a ``UserWarning``
+    oscillators it is the uniform scale. The clamp logs a warning (``logging``)
     reporting the radius and scale whenever it engages. It is computed on host
     (``eigvals`` has no accelerator lowering), so this runs eagerly.
 

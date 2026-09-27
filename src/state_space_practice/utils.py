@@ -218,8 +218,8 @@ def psd_solve(
     whole or block by block). ``sqrt(tiny)`` (``~1.5e-154`` in float64) is a
     last-resort floor that only keeps an all-zero matrix finite.
 
-    An absolute floor (the former default ``diagonal_boost=1e-9``) is *not*
-    scale-equivariant: it dominates the shift for matrices below ~1e-3 in
+    An absolute floor (``diagonal_boost > 0``) is *not* scale-equivariant:
+    ``diagonal_boost=1e-9`` dominates the shift for matrices below ~1e-3 in
     scale and swamps covariances below ~1e-7 entirely. Callers that want one
     anyway (e.g. to regularise a matrix that is structurally rank-deficient,
     or in fixed physical units) can still pass ``diagonal_boost``;

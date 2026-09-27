@@ -2110,10 +2110,10 @@ def warn_low_occupancy_states(
 
 
 # The per-state regression solves (H*, A*) use a purely relative Cholesky shift
-# (1e-12 * max|diag|; the absolute part only keeps an all-zero Gram matrix of an
-# empty state factorizable) so the solution does not depend on the units of
-# the latent state -- psd_solve's default absolute 1e-9 floor would dominate a
-# Gram matrix of scale 1e-9.
+# (1e-12 times each diagonal entry; the absolute part only keeps an all-zero Gram
+# matrix of an empty state factorizable) so the solution does not depend on the
+# units of the latent state: an absolute shift would dominate a Gram matrix
+# whose scale is comparable to or below it.
 psd_solve_per_discrete_state = jax.vmap(
     lambda x, y: psd_solve(x, y.T, diagonal_boost=1e-300, relative_boost=1e-12).T,
     in_axes=(-1, -1),
@@ -2412,8 +2412,8 @@ def switching_kalman_maximization_step(
     *exact* posterior statistics (state- and pair-conditional moments), every
     returned parameter -- including the fixed-``H`` / fixed-``A`` constrained
     ``R`` / ``Q`` -- is the exact maximiser of the expected complete-data
-    log-likelihood (checked against discrete-path enumeration in
-    ``tests/test_oracle_switching_kalman.py``); with GPB smoother statistics
+    log-likelihood (checked against discrete-path enumeration in the test
+    suite); with GPB smoother statistics
     it inherits the GPB approximation of the posterior.
 
     References
@@ -2642,7 +2642,7 @@ def compute_expected_complete_log_likelihood(
     approximate posterior. The optional pair-conditional inputs make the
     transition term closer to the GPB2 approximation used by the M-step.
     Vectorized and JIT-compilable; the test suite checks it against a
-    Python-loop reference implementation (``tests/test_switching_kalman.py``).
+    Python-loop reference implementation.
 
     Parameters
     ----------
@@ -2867,8 +2867,7 @@ def compute_posterior_entropy(
 
     For the switching Kalman filter with mixture collapse approximation:
     H(q) = H(q(s)) + E_q(s)[H(q(x|s))]. Vectorized and JIT-compilable; the
-    test suite checks it against a Python-loop reference implementation
-    (``tests/test_switching_kalman.py``).
+    test suite checks it against a Python-loop reference implementation.
 
     Parameters
     ----------

@@ -1871,7 +1871,8 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
     max_spectral_radius : float, default=0.99
         Target upper bound on the spectral radius of each state's transition
         matrix. The differentiable stability scale shrinks damping and coupling
-        so the block-row operator-norm bound stays at or below this value. A
+        so the spectral radius of every state's transition matrix stays at or
+        below this value. A
         larger radius (closer to one) permits longer memory and a narrower
         spectral peak: the resolvable half-power bandwidth is
         ``delta_f ~= (1 - radius) * fs / pi``, so at ``fs = 1 kHz`` the default
