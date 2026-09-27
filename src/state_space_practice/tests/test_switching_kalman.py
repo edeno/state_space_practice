@@ -3010,25 +3010,26 @@ class TestWeightedSumOfOuterProductsProperties:
         st.integers(min_value=1, max_value=3),
         st.integers(min_value=1, max_value=3),
     )
-    @settings(max_examples=30, deadline=None)
     def test_matches_einsum_definition(
         self, n_time: int, n_dims: int, n_states: int
     ) -> None:
         """Result should match the einsum definition."""
-        key = random.PRNGKey(42)
-        x = random.normal(key, (n_time, n_dims, n_states))
-        y = random.normal(random.fold_in(key, 1), (n_time, n_dims, n_states))
-        weights = jnp.abs(random.normal(random.fold_in(key, 2), (n_time, n_states)))
+        rng = np.random.default_rng(42)
+        x = rng.normal(size=(n_time, n_dims, n_states))
+        y = rng.normal(size=(n_time, n_dims, n_states))
+        weights = np.abs(rng.normal(size=(n_time, n_states)))
         weights = weights / weights.sum(axis=0, keepdims=True)
 
-        result = weighted_sum_of_outer_products(x, y, weights)
+        result = weighted_sum_of_outer_products(
+            jnp.asarray(x), jnp.asarray(y), jnp.asarray(weights)
+        )
 
-        # Compute expected via loop
-        expected = jnp.zeros((n_dims, n_dims, n_states))
+        # Reference: explicit NumPy loop over time and state (eager JAX ops
+        # here would compile per shape and dominate the test's run time)
+        expected = np.zeros((n_dims, n_dims, n_states))
         for t in range(n_time):
             for s in range(n_states):
-                outer_prod = weights[t, s] * jnp.outer(x[t, :, s], y[t, :, s])
-                expected = expected.at[:, :, s].add(outer_prod)
+                expected[:, :, s] += weights[t, s] * np.outer(x[t, :, s], y[t, :, s])
 
         np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-10)
 
