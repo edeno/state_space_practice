@@ -458,18 +458,14 @@ def warn_if_floored(
         Minimum eigenvalue and largest eigenvalue magnitude of the matrix
         before flooring (on the scale the floor was applied on).
     """
-    if min_eigenvalue is None or max_abs_eigenvalue is None:
-        jax.debug.callback(
-            functools.partial(_log_floored_eigenvalues, name=name), n_floored, floor
-        )
-    else:
-        jax.debug.callback(
-            functools.partial(_log_floored_eigenvalues, name=name),
-            n_floored,
-            floor,
-            min_eigenvalue,
-            max_abs_eigenvalue,
-        )
+    # None is an empty pytree, so it reaches the host logger unchanged.
+    jax.debug.callback(
+        functools.partial(_log_floored_eigenvalues, name=name),
+        n_floored,
+        floor,
+        min_eigenvalue,
+        max_abs_eigenvalue,
+    )
 
 
 def clip_eigenvalues_relative(
