@@ -1,5 +1,7 @@
 """Tests for the utils module."""
 
+import logging
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -761,6 +763,27 @@ class TestStabilizeTransitionMatrix:
         assert float(spectral_radius(A)) < 0.99
         stabilized = stabilize_transition_matrix(A, max_spectral_radius=0.99)
         np.testing.assert_array_equal(np.asarray(stabilized), np.asarray(A))
+
+    def test_integer_matrix_is_scaled_not_truncated(self) -> None:
+        A = jnp.array([[2, 1], [0, 2]])  # integer dtype, radius 2
+        assert jnp.issubdtype(A.dtype, jnp.integer)
+        stabilized = stabilize_transition_matrix(A, max_spectral_radius=0.99)
+        assert jnp.issubdtype(stabilized.dtype, jnp.floating)
+        np.testing.assert_allclose(
+            np.asarray(stabilized), [[0.99, 0.495], [0.0, 0.99]], rtol=1e-12
+        )
+
+    def test_block_size_not_dividing_n_warns_about_uniform_fallback(
+        self, caplog
+    ) -> None:
+        A = jnp.diag(jnp.array([2.0, 0.5, 0.5]))
+        with caplog.at_level(logging.WARNING, logger="state_space_practice.utils"):
+            stabilized = stabilize_transition_matrix(
+                A, max_spectral_radius=0.99, block_size=2
+            )
+        assert any("does not divide" in r.getMessage() for r in caplog.records)
+        # the fallback is one uniform scale over the whole matrix
+        np.testing.assert_allclose(np.asarray(stabilized), np.asarray(A) * 0.495)
 
 
 class TestRelativePsdFloor:

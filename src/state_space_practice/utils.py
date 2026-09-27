@@ -748,12 +748,15 @@ def stabilize_transition_matrix(
     Parameters
     ----------
     matrix : ArrayLike, shape (n, n)
-        Transition matrix (need not be symmetric).
+        Transition matrix (need not be symmetric). Integer and boolean inputs
+        are promoted to the default floating dtype before scaling.
     max_spectral_radius : float, default=0.99
         Upper bound on the spectral radius.
     block_size : int or None, default=None
         Size of the structural diagonal blocks. ``None`` applies one uniform
-        scale to the whole matrix.
+        scale to the whole matrix. A positive ``block_size`` that does not
+        divide ``n`` also falls back to the uniform scale (logged at WARNING
+        when ``warn=True``).
     warn : bool, default=True
         Log a warning (``logging``, host-side) reporting the radius and applied
         scale whenever the clamp engages. Logging rather than
@@ -762,13 +765,23 @@ def stabilize_transition_matrix(
     Returns
     -------
     Array, shape (n, n)
-        The stabilized matrix, or the input unchanged if already within the
-        bound.
+        The stabilized matrix, or the (dtype-promoted) input unchanged if
+        already within the bound.
     """
     A = jnp.asarray(matrix)
+    if not jnp.issubdtype(A.dtype, jnp.inexact):
+        A = A.astype(jnp.result_type(float))
     A_host = np.asarray(A)
     n = A_host.shape[0]
     if block_size is None or block_size <= 0 or n % block_size != 0:
+        if warn and block_size is not None and block_size > 0:
+            logger.warning(
+                "stabilize_transition_matrix: block_size=%d does not divide "
+                "the matrix size %d; clamping with one uniform scale over the "
+                "whole matrix instead of per block.",
+                block_size,
+                n,
+            )
         components = [np.arange(n)]
     else:
         components = [
@@ -788,13 +801,11 @@ def stabilize_transition_matrix(
     if not applied:
         return A
     if warn:
-        import logging
-
         details = "; ".join(
             f"rows {idx.tolist()}: radius={radius:.6g}, scale={scale:.6g}"
             for idx, radius, scale in applied
         )
-        logging.getLogger(__name__).warning(
+        logger.warning(
             "Transition matrix spectral radius exceeded max_spectral_radius="
             "%g; clamped (%s). If a narrow-band rhythm is expected, raise "
             "max_spectral_radius toward 1 - pi * bandwidth / sampling_freq.",
