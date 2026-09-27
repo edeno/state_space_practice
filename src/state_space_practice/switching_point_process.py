@@ -3069,6 +3069,30 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         # measurement_matrix / measurement_cov outputs are ignored).
         dummy_obs = jnp.zeros((n_time, 1))
 
+        def _maximize(fixed_transition_matrix: Array | None) -> tuple[Array, ...]:
+            return switching_kalman_maximization_step(
+                obs=dummy_obs,
+                state_cond_smoother_means=self.smoother_state_cond_mean,
+                state_cond_smoother_covs=self.smoother_state_cond_cov,
+                smoother_discrete_state_prob=self.smoother_discrete_state_prob,
+                smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
+                pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
+                pair_cond_smoother_means=self.smoother_pair_cond_means,
+                pair_cond_smoother_covs=getattr(self, "smoother_pair_cond_covs", None),
+                next_pair_cond_smoother_means=getattr(
+                    self, "smoother_next_pair_cond_means", None
+                ),
+                transition_prior=self.transition_prior,
+                fixed_continuous_transition_matrix=fixed_transition_matrix,
+                previous_params={
+                    "continuous_transition_matrix": self.continuous_transition_matrix,
+                    "process_cov": self.process_cov,
+                },
+                estimate_measurement_params=False,
+            )
+
+        # A model that keeps A fixed (e.g. CNM-PP) needs the Q optimal for that
+        # A, not for the unconstrained A* it never installs.
         (
             new_A,
             _,  # measurement_matrix - ignored for point-process
@@ -3078,31 +3102,10 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
             new_init_cov,
             new_discrete_transition,
             new_init_discrete_prob,
-        ) = switching_kalman_maximization_step(
-            obs=dummy_obs,
-            state_cond_smoother_means=self.smoother_state_cond_mean,
-            state_cond_smoother_covs=self.smoother_state_cond_cov,
-            smoother_discrete_state_prob=self.smoother_discrete_state_prob,
-            smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
-            pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
-            pair_cond_smoother_means=self.smoother_pair_cond_means,
-            pair_cond_smoother_covs=getattr(self, "smoother_pair_cond_covs", None),
-            next_pair_cond_smoother_means=getattr(
-                self, "smoother_next_pair_cond_means", None
-            ),
-            transition_prior=self.transition_prior,
-            # A model that keeps A fixed (e.g. CNM-PP) needs the Q optimal for
-            # that A, not for the unconstrained A* it never installs.
-            fixed_continuous_transition_matrix=(
-                None
-                if self.update_continuous_transition_matrix
-                else self.continuous_transition_matrix
-            ),
-            previous_params={
-                "continuous_transition_matrix": self.continuous_transition_matrix,
-                "process_cov": self.process_cov,
-            },
-            estimate_measurement_params=False,
+        ) = _maximize(
+            None
+            if self.update_continuous_transition_matrix
+            else self.continuous_transition_matrix
         )
 
         if self.update_continuous_transition_matrix:
@@ -3112,28 +3115,7 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
                 # unconstrained A*, a matrix the model never installs. Recompute
                 # it at the projected A actually installed, so the (A, Q) pair
                 # is consistent: Q is then the exact M-step optimum given A.
-                (_, _, new_Q, *_) = switching_kalman_maximization_step(
-                    obs=dummy_obs,
-                    state_cond_smoother_means=self.smoother_state_cond_mean,
-                    state_cond_smoother_covs=self.smoother_state_cond_cov,
-                    smoother_discrete_state_prob=self.smoother_discrete_state_prob,
-                    smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
-                    pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
-                    pair_cond_smoother_means=self.smoother_pair_cond_means,
-                    pair_cond_smoother_covs=getattr(
-                        self, "smoother_pair_cond_covs", None
-                    ),
-                    next_pair_cond_smoother_means=getattr(
-                        self, "smoother_next_pair_cond_means", None
-                    ),
-                    transition_prior=self.transition_prior,
-                    fixed_continuous_transition_matrix=projected_A,
-                    previous_params={
-                        "continuous_transition_matrix": self.continuous_transition_matrix,
-                        "process_cov": self.process_cov,
-                    },
-                    estimate_measurement_params=False,
-                )
+                (_, _, new_Q, *_) = _maximize(projected_A)
             self.continuous_transition_matrix = projected_A
 
         if self.update_process_cov:
