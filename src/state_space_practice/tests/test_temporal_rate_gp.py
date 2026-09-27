@@ -213,6 +213,80 @@ def test_default_iterations_converge_when_baseline_is_far_below_data():
     assert abs(float(jnp.mean(default.log_rate_mean)) - np.log(50.0)) < 0.5
 
 
+def _far_baseline_counts() -> np.ndarray:
+    """A 50 Hz train in 4 ms bins: far above the default baseline 0, so a
+    single Newton step does not reach the mode."""
+    rng = np.random.default_rng(0)
+    return rng.poisson(50.0 * 0.004, size=200).astype(float)
+
+
+def test_unconverged_iteration_warns():
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    counts = _far_baseline_counts()
+    with pytest.warns(StateSpaceWarning, match="did not reach the posterior mode"):
+        result = infer_log_rate(counts, 0.004, 1.0, 1.0, mean=0.0, n_iter=1)
+    assert float(result.max_abs_update) > 1e-3  # guard: genuinely unconverged
+
+
+def test_unconverged_batch_counts_trains():
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    counts = np.stack([_far_baseline_counts(), _far_baseline_counts()])
+    with pytest.warns(StateSpaceWarning, match="for 2/2 spike train"):
+        infer_log_rate_batch(counts, 0.004, 1.0, 1.0, mean=0.0, n_iter=1)
+
+
+def test_fitted_model_warns_when_final_inference_is_unconverged():
+    """``fit_sgd`` reads the convergence diagnostic of its final inference."""
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    model = TemporalRateGP(dt=0.004, variance=1.0, lengthscale=1.0, n_iter=1)
+    with pytest.warns(StateSpaceWarning, match="did not reach the posterior mode"):
+        model.fit_sgd(_far_baseline_counts(), num_steps=1)
+
+
+def test_nonfinite_merit_fallback_is_counted_and_warns(small_counts, monkeypatch):
+    """A non-finite prior quadratic form (a lost Cholesky factor) makes the
+    merit non-finite: the full step is taken, counted and reported."""
+    import state_space_practice.temporal_rate_gp as trg
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    monkeypatch.setattr(
+        trg,
+        "_prior_whitened_residuals",
+        lambda states, *_: jnp.full(states.size, jnp.nan),
+    )
+    # The fallback steps need not reach the mode, so a non-convergence
+    # warning may accompany the fallback warning.
+    with pytest.warns(StateSpaceWarning) as record:
+        result = infer_log_rate(small_counts, 0.1, 1.5, 0.4, n_iter=3)
+    assert any("fell back in 3 iteration" in str(w.message) for w in record)
+    assert int(result.n_nonfinite_merit) == 3
+    assert int(result.n_unaccepted_steps) == 0
+
+
+def test_unaccepted_step_fallback_is_counted_and_warns(small_counts, monkeypatch):
+    """When no trial step passes the Armijo test the smallest one is taken;
+    that fallback is counted and reported."""
+    import state_space_practice.temporal_rate_gp as trg
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    # A negative slack larger than any achievable increase rejects every step.
+    monkeypatch.setattr(trg, "_MERIT_RTOL", -1.0)
+    with pytest.warns(StateSpaceWarning) as record:
+        result = infer_log_rate(small_counts, 0.1, 1.5, 0.4, n_iter=3)
+    assert any("in 3 iteration(s) where no step" in str(w.message) for w in record)
+    assert int(result.n_unaccepted_steps) == 3
+    assert int(result.n_nonfinite_merit) == 0
+
+
+def test_converged_inference_reports_no_fallbacks(small_counts):
+    result = infer_log_rate(small_counts, 0.1, 1.5, 0.4, n_iter=40)
+    assert int(result.n_nonfinite_merit) == 0
+    assert int(result.n_unaccepted_steps) == 0
+
+
 def test_laplace_iteration_converges(small_counts):
     """The reported final Newton update is at the mode (near machine zero)."""
     result = infer_log_rate(small_counts, 0.1, 1.5, 0.4, n_iter=40)

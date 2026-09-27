@@ -45,16 +45,18 @@ Nickisch, H., Solin, A. & Grigorevskiy, A. (2018). State Space Gaussian Processe
     with Non-Gaussian Likelihood. ICML, PMLR 80:3789-3798.
 """
 
+import warnings
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jax.scipy.linalg import solve_triangular
 from jax.scipy.special import gammaln, ndtri
 from jax.typing import ArrayLike
 
-from state_space_practice.exceptions import NotFittedError
+from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.gp_ssm import matern32_continuous, matern32_discretize
 from state_space_practice.kalman import kalman_smoother
 from state_space_practice.parameter_transforms import (
@@ -127,12 +129,62 @@ class LaplaceRateResult(NamedTuple):
     max_abs_update : Array, shape ()
         Infinity-norm of the final Newton update to ``g`` (a convergence
         diagnostic; small means the iteration reached the mode).
+    n_nonfinite_merit : Array, shape ()
+        Newton iterations whose log-posterior merit was not finite, so the
+        line search could not run and the full undamped step was taken (int32).
+    n_unaccepted_steps : Array, shape ()
+        Newton iterations in which no trial step length satisfied the Armijo
+        condition, so the smallest trial step was taken although it does not
+        increase the log-posterior sufficiently (int32).
     """
 
     log_rate_mean: Array
     log_rate_var: Array
     log_marginal_likelihood: Array
     max_abs_update: Array
+    n_nonfinite_merit: Array
+    n_unaccepted_steps: Array
+
+
+def _warn_laplace_diagnostics(result: LaplaceRateResult, name: str) -> None:
+    """Warn (host side) about non-convergence or line-search fallbacks.
+
+    The mode counts as converged when the final Newton update satisfies
+    ``max_abs_update <= sqrt(eps) * (1 + max|log_rate_mean|)``: Newton
+    converges quadratically near the mode, so a converged iteration's last
+    update is at round-off level, far below this. Skipped under tracing (e.g.
+    inside an SGD loss); the fitted model's final :func:`infer_log_rate` call
+    reports instead. Handles single-train and batched (``(n_neurons,)``
+    diagnostic) results.
+    """
+    if contains_tracer(result):
+        return
+    max_abs_update = np.atleast_1d(np.asarray(result.max_abs_update))
+    log_rate_mean = np.asarray(result.log_rate_mean).reshape(max_abs_update.size, -1)
+    eps = np.finfo(log_rate_mean.dtype).eps
+    tolerance = np.sqrt(eps) * (1.0 + np.max(np.abs(log_rate_mean), axis=1))
+    not_converged = ~(max_abs_update <= tolerance)
+    if np.any(not_converged):
+        warnings.warn(
+            f"{name}: the Laplace Newton iteration did not reach the posterior "
+            f"mode for {int(np.sum(not_converged))}/{max_abs_update.size} spike "
+            f"train(s) (largest final update {float(np.max(max_abs_update)):.3g}); "
+            "the mode, variance and evidence are unconverged. Increase n_iter.",
+            StateSpaceWarning,
+            stacklevel=3,
+        )
+    n_nonfinite = int(np.sum(np.asarray(result.n_nonfinite_merit)))
+    n_unaccepted = int(np.sum(np.asarray(result.n_unaccepted_steps)))
+    if n_nonfinite > 0 or n_unaccepted > 0:
+        warnings.warn(
+            f"{name}: the Newton line search fell back in {n_nonfinite} "
+            "iteration(s) with a non-finite log-posterior (full undamped step "
+            f"taken) and in {n_unaccepted} iteration(s) where no step length "
+            "passed the Armijo test (smallest trial step taken). Check the "
+            "hyperparameters (very small dt or lengthscale) and enable float64.",
+            StateSpaceWarning,
+            stacklevel=3,
+        )
 
 
 def poisson_log_rate_site(
@@ -275,9 +327,12 @@ def _infer_log_rate_traced(
         # Largest accepted step; the smallest trial step if none is accepted.
         # If the merit itself is not finite (e.g. a Cholesky factor of Q lost
         # to float32 round-off at tiny dt) fall back to the full Newton step.
+        # Both fallbacks are counted and reported by the public entry points.
+        merit_finite = jnp.isfinite(psi_current)
+        any_accepted = jnp.any(accept)
         index = jnp.where(
-            jnp.isfinite(psi_current),
-            jnp.where(jnp.any(accept), jnp.argmax(accept), _N_BACKTRACK - 1),
+            merit_finite,
+            jnp.where(any_accepted, jnp.argmax(accept), _N_BACKTRACK - 1),
             0,
         )
         # The step length is a discrete choice: keep it out of the gradient
@@ -285,9 +340,13 @@ def _infer_log_rate_traced(
         # derivative of the evidence is the fixed-point derivative).
         step = jax.lax.stop_gradient(backtrack_steps[index])
         new_states = states + step * direction
-        return new_states, jnp.max(jnp.abs(new_states[:, 0] - g))
+        return new_states, (
+            jnp.max(jnp.abs(new_states[:, 0] - g)),
+            ~merit_finite,
+            merit_finite & ~any_accepted,
+        )
 
-    states_mode, updates = jax.lax.scan(
+    states_mode, (updates, nonfinite_merit, unaccepted) = jax.lax.scan(
         _newton_step, jnp.zeros((n_time, 2)), None, length=n_iter
     )
     g_mode = states_mode[:, 0]
@@ -329,6 +388,8 @@ def _infer_log_rate_traced(
         log_rate_var=log_rate_var,
         log_marginal_likelihood=log_marginal_likelihood,
         max_abs_update=max_abs_update,
+        n_nonfinite_merit=jnp.sum(nonfinite_merit, dtype=jnp.int32),
+        n_unaccepted_steps=jnp.sum(unaccepted, dtype=jnp.int32),
     )
 
 
@@ -372,7 +433,15 @@ def infer_log_rate(
     Returns
     -------
     LaplaceRateResult
-        Posterior mode, variance, log-evidence, and convergence diagnostic.
+        Posterior mode, variance, log-evidence, and convergence diagnostics.
+
+    Warns
+    -----
+    StateSpaceWarning
+        With concrete inputs, when the iteration did not reach the mode (see
+        :func:`_warn_laplace_diagnostics`) or a Newton step fell back because
+        the log-posterior merit was non-finite or no step length passed the
+        Armijo test.
 
     Notes
     -----
@@ -402,9 +471,11 @@ def infer_log_rate(
     if not contains_tracer(min_weight):
         min_weight = validate_scalar(min_weight, "min_weight", positive=True)
 
-    return _infer_log_rate_traced(
+    result = _infer_log_rate_traced(
         counts, dt, variance, lengthscale, mean, n_iter, min_weight
     )
+    _warn_laplace_diagnostics(result, "infer_log_rate")
+    return result
 
 
 def _infer_log_rate_batch_traced(
@@ -495,8 +566,13 @@ def infer_log_rate_batch(
     -------
     LaplaceRateResult
         Batched fields: ``log_rate_mean`` / ``log_rate_var`` of shape
-        ``(n_neurons, n_time)``, and ``log_marginal_likelihood`` /
-        ``max_abs_update`` of shape ``(n_neurons,)``.
+        ``(n_neurons, n_time)``, and ``log_marginal_likelihood``,
+        ``max_abs_update`` and the fallback counts of shape ``(n_neurons,)``.
+
+    Warns
+    -----
+    StateSpaceWarning
+        As :func:`infer_log_rate`, aggregated over neurons.
     """
     counts = jnp.asarray(counts)
     if counts.ndim != 2:
@@ -517,9 +593,11 @@ def infer_log_rate_batch(
     if not contains_tracer(min_weight):
         min_weight = validate_scalar(min_weight, "min_weight", positive=True)
 
-    return _infer_log_rate_batch_traced(
+    result = _infer_log_rate_batch_traced(
         counts, dt, variance, lengthscale, mean, n_iter, min_weight
     )
+    _warn_laplace_diagnostics(result, "infer_log_rate_batch")
+    return result
 
 
 class TemporalRateGP(SGDFittableMixin):
