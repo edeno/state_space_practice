@@ -3592,14 +3592,18 @@ def optimize_dim_transition_params(
     # Post-check: verify the spectral radius of the resulting A. Spectral
     # radius is computed on host (eigvals has no GPU/TPU lowering); the
     # optimizer has already returned, so this runs eagerly.
-    A_opt = construct_directed_influence_transition_matrix(
-        freqs=opt_params["freq"],
-        damping_coeffs=opt_params["damping"],
-        coupling_strengths=opt_params["coupling_strength"],
-        phase_diffs=opt_params["phase_diff"],
-        sampling_freq=sampling_freq,
-    )
-    radius = _spectral_radius(A_opt) if solution_finite else float("nan")
+    def _radius(params: dict) -> float:
+        return _spectral_radius(
+            construct_directed_influence_transition_matrix(
+                freqs=params["freq"],
+                damping_coeffs=params["damping"],
+                coupling_strengths=params["coupling_strength"],
+                phase_diffs=params["phase_diff"],
+                sampling_freq=sampling_freq,
+            )
+        )
+
+    radius = _radius(opt_params) if solution_finite else float("nan")
     if radius > max_spectral_radius:
         # The optimizer's coupling is a scaled sigmoid and is never exactly
         # zero, so "uncoupled" is decided from the caller's coupling.
@@ -3621,15 +3625,7 @@ def optimize_dim_transition_params(
             opt_params["damping"] = clamped
             # The residual coupling the optimizer returns can still leave the
             # radius above the bound; the uniform scale below covers that.
-            remaining_radius = _spectral_radius(
-                construct_directed_influence_transition_matrix(
-                    freqs=opt_params["freq"],
-                    damping_coeffs=opt_params["damping"],
-                    coupling_strengths=opt_params["coupling_strength"],
-                    phase_diffs=opt_params["phase_diff"],
-                    sampling_freq=sampling_freq,
-                )
-            )
+            remaining_radius = _radius(opt_params)
         if remaining_radius > max_spectral_radius:
             safe_scale = max_spectral_radius / remaining_radius
             details.append(f"damping and coupling scaled by {safe_scale:.6g}")
