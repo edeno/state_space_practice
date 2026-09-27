@@ -290,8 +290,8 @@ def detection_metrics(
     alpha = _validate_alpha(alpha)
     pval, mask = _validate_pval_mask(pval, coupling_mask)
     out = _confusion(pval < alpha, mask)
-    band_detected = (pval < alpha).any(axis=0)
-    band_true = mask.any(axis=0)
+    band_detected = np.asarray((pval < alpha).any(axis=0), dtype=bool)
+    band_true = np.asarray(mask.any(axis=0), dtype=bool)
     out.update(
         {f"band_{k}": v for k, v in _confusion(band_detected, band_true).items()}
     )
@@ -433,3 +433,49 @@ def magnitude_recovery(
         "pearson_r": float(stats.pearsonr(recovered_mag, true_mag).statistic),
         "spearman_r": float(stats.spearmanr(recovered_mag, true_mag).statistic),
     }
+
+
+def batch_means_mcse(samples: npt.ArrayLike, n_batches: int = 20) -> np.ndarray:
+    """Monte Carlo standard error of a chain's sample mean, by batch means.
+
+    The ``n`` draws along axis 0 are truncated to ``n_batches * b`` with
+    ``b = n // n_batches`` and split into ``n_batches`` consecutive batches of
+    length ``b``. The MCSE of the full-chain mean is the standard deviation of
+    the batch means (``ddof=1``) divided by ``sqrt(n_batches)``. This is
+    consistent for an autocorrelated chain when the batch length is long
+    compared with the integrated autocorrelation time; for i.i.d. draws it
+    reduces to the usual ``sd / sqrt(n)`` up to sampling noise.
+
+    Parameters
+    ----------
+    samples : array_like, shape (n, ...)
+        Real-valued draws, chain index first.
+    n_batches : int, default 20
+        Number of batches (at least 2, at most ``n``).
+
+    Returns
+    -------
+    ndarray, shape samples.shape[1:]
+        MCSE of the mean for every trailing index.
+    """
+    draws = np.asarray(samples, dtype=float)
+    if draws.ndim == 0:
+        raise ValueError("samples must have a leading chain axis.")
+    if not np.all(np.isfinite(draws)):
+        raise ValueError("samples must contain only finite values.")
+    if (
+        isinstance(n_batches, bool)
+        or not isinstance(n_batches, (int, np.integer))
+        or n_batches < 2
+    ):
+        raise ValueError(f"n_batches must be an integer >= 2, got {n_batches}.")
+    batch_len = draws.shape[0] // n_batches
+    if batch_len < 1:
+        raise ValueError(
+            f"need at least n_batches={n_batches} draws, got {draws.shape[0]}."
+        )
+    batches = draws[: n_batches * batch_len].reshape(
+        n_batches, batch_len, *draws.shape[1:]
+    )
+    mcse: np.ndarray = batches.mean(axis=1).std(axis=0, ddof=1) / np.sqrt(n_batches)
+    return mcse

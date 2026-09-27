@@ -206,8 +206,9 @@ class TestPosteriorCorrectness:
         np.testing.assert_allclose(
             float(post.beta_real_imag_cov[0, 0]), cov_ref[0, 1], atol=1e-6
         )
-        # guard: the cross-covariance is non-trivial (check isn't vacuous at ~0).
-        assert abs(cov_ref[0, 1]) > 1e-3
+        # guard: the cross-covariance is non-trivial relative to the atol=1e-6
+        # above (check isn't vacuous at ~0); it is ~9e-4 on this seed.
+        assert abs(cov_ref[0, 1]) > 1e-4
 
 
 class TestVectorisedRegression:

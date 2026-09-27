@@ -113,7 +113,7 @@ class SimulatedCoupling(NamedTuple):
 
 def _coupling_x64_enabled() -> bool:
     """Return whether JAX is configured to honor float64 dtypes."""
-    return bool(jax.config.jax_enable_x64)
+    return bool(jax.config.read("jax_enable_x64"))
 
 
 def require_coupling_x64() -> None:

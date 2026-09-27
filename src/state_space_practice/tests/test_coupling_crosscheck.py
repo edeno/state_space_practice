@@ -7,12 +7,19 @@ import numpy as np
 import pytest
 
 from state_space_practice.coupling_crosscheck import (
+    _mean_disagreement,
     _score,
     aggregate,
     run_crosscheck,
     scale_coupling,
 )
-from state_space_practice.coupling_validation import CouplingPosterior
+from state_space_practice.coupling_ekf import fit_coupling_ekf
+from state_space_practice.coupling_pg import fit_coupling_pg
+from state_space_practice.coupling_validation import (
+    CouplingPosterior,
+    batch_means_mcse,
+)
+from state_space_practice.simulate_coupling import simulate_coupling
 
 
 def _fake_sim(beta_real_true, beta_imag_true, mask):
@@ -204,3 +211,107 @@ class TestIntegration:
         assert rec["ekf"]["detection_auc"] == 1.0
         assert rec["pg"]["detection_auc"] == 1.0
         assert rec["ekf_pg_mean_maxdiff"] < 0.15
+
+
+def _posterior_from_samples(samples):
+    return CouplingPosterior(
+        beta_real_mean=samples.real.mean(0),
+        beta_imag_mean=samples.imag.mean(0),
+        beta_real_var=samples.real.var(0),
+        beta_imag_var=samples.imag.var(0),
+        samples=samples,
+    )
+
+
+class TestMeanDisagreement:
+    def test_z_is_difference_over_batch_means_mcse(self):
+        rng = np.random.default_rng(0)
+        samples = rng.normal(size=(400, 2, 1)) + 1j * rng.normal(size=(400, 2, 1))
+        pg = _posterior_from_samples(samples)
+        shift = np.array([[0.3], [-0.05]])
+        ekf = pg._replace(beta_real_mean=pg.beta_real_mean + shift, samples=None)
+        out = _mean_disagreement(ekf, pg)
+        mcse_real = batch_means_mcse(samples.real, 20)
+        mcse_imag = batch_means_mcse(samples.imag, 20)
+        assert out["ekf_pg_mean_maxdiff"] == pytest.approx(0.3)
+        assert out["pg_mean_mcse_max"] == pytest.approx(
+            max(mcse_real.max(), mcse_imag.max())
+        )
+        # imaginary parts agree exactly, so the max z is the real part's
+        assert out["ekf_pg_mean_max_z"] == pytest.approx(
+            np.max(np.abs(shift) / mcse_real)
+        )
+        assert out["ekf_pg_mean_max_z"] > 4.0  # guard: 0.3 >> MCSE ~ 0.05
+
+    def test_mcse_undefined_without_enough_samples(self):
+        rng = np.random.default_rng(1)
+        pg = _posterior_from_samples(rng.normal(size=(39, 1, 1)) + 0j)
+        out = _mean_disagreement(pg, pg)
+        assert out["ekf_pg_mean_maxdiff"] == 0.0
+        assert np.isnan(out["pg_mean_mcse_max"])
+        assert np.isnan(out["ekf_pg_mean_max_z"])
+
+
+@pytest.mark.slow
+class TestAgreementTracksWhereApproximationsCoincide:
+    """The cross-check must pass where EKF == PG and fail where they differ.
+
+    Both arms fit the *same* static model on the same design, so they differ
+    only by the Laplace approximation. With lots of data (T = 4000, ~500 spikes
+    per neuron) the posterior is Gaussian to within ~0.05 sd, so the EKF mean
+    should sit within PG Monte Carlo error: each of the 12 per-component
+    z = |EKF - PG| / MCSE is ~|N(0, 1)|, and max z > 4.5 has probability
+    ~1e-4. With ~20 spikes per neuron (T = 150) the posterior is skewed; the
+    mode (EKF) and the mean (PG) differ by ~0.1-0.3 sd, which a long chain
+    resolves at many MCSE. Measured: max z 2.4 (maxdiff 0.009, MCSE 0.005) on
+    the long static cell; max z 10.8 (maxdiff 0.24, MCSE 0.05) on the short one.
+    """
+
+    def test_static_long_data_agrees_within_monte_carlo_error(
+        self, coupling_params_small
+    ):
+        (rec,) = run_crosscheck(
+            coupling_params_small,
+            scales=[1.0],
+            n_time=4000,
+            n_replicates=1,
+            pg_n_iter=1000,
+            pg_burn_in=200,
+        )
+        # guard: the MCSE is small, so "agreement" is a sharp statement
+        assert rec["pg_mean_mcse_max"] < 0.01, rec
+        assert rec["ekf_pg_mean_max_z"] < 4.5, rec
+
+    def test_short_data_disagreement_exceeds_monte_carlo_error(
+        self, coupling_params_small
+    ):
+        (rec,) = run_crosscheck(
+            coupling_params_small,
+            scales=[1.0],
+            n_time=150,
+            n_replicates=1,
+            pg_n_iter=8000,
+            pg_burn_in=200,
+        )
+        assert np.isfinite(rec["pg_mean_mcse_max"]), rec
+        assert rec["ekf_pg_mean_max_z"] > 5.0, rec
+
+    def test_record_reproduces_independent_fits(self, coupling_params_small):
+        """Record == fits rerun with the documented seeds (cell seed = seed + r)."""
+        (rec,) = run_crosscheck(
+            coupling_params_small,
+            scales=[1.0],
+            n_time=300,
+            n_replicates=1,
+            seed=7,
+            pg_n_iter=100,
+            pg_burn_in=50,
+        )
+        sim = simulate_coupling(coupling_params_small, n_time=300, seed=7)
+        ekf = fit_coupling_ekf(sim.spikes, sim.lfp, coupling_params_small)
+        pg = fit_coupling_pg(
+            sim.spikes, sim.lfp, coupling_params_small, n_iter=100, burn_in=50, seed=7
+        )
+        ref = _mean_disagreement(ekf, pg)
+        for key, value in ref.items():
+            assert rec[key] == pytest.approx(value, rel=1e-12), key

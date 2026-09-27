@@ -54,10 +54,13 @@ def simulate_coupling(
     n_latent = transition_matrix.shape[0]
 
     base_key = jax.random.PRNGKey(seed)
-    init_key, noise_key, spike_key = jax.random.split(base_key, 3)
-    # Derive the LFP key independently so adding the field does not perturb the
-    # latent/spike RNG stream (existing seeds reproduce their prior values).
-    lfp_key = jax.random.fold_in(base_key, 1)
+    # Four distinct keys. The LFP key used to be ``fold_in(base_key, 1)``, which
+    # under JAX's (default) partitionable threefry is *the same key* as
+    # ``split(base_key, 3)[1]`` = ``noise_key``: the LFP observation noise was a
+    # scaled copy of the process noise (corr(lfp - x, w) = 1). With partitionable
+    # threefry ``split(k, 4)[:3] == split(k, 3)``, so the latent and spike
+    # streams of every seed are unchanged; only the LFP noise is new.
+    init_key, noise_key, spike_key, lfp_key = jax.random.split(base_key, 4)
 
     # Start from the oscillator stationary distribution so early bins are not a
     # warm-up transient: each component has variance var / (1 - decay**2).

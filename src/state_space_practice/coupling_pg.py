@@ -20,7 +20,12 @@ sample (percentile) intervals rather than Gaussian. Both estimators share the
 stage-1 plug-in latent, so PG is "exact" only in stage 2 — it removes the EKF's
 Laplace approximation of the coupling posterior, not the smoother plug-in. No
 convergence/mixing diagnostic is computed; the caller owns choosing ``n_iter`` and
-``burn_in`` large enough for the chain to mix. Requires float64 (tests enable
+``burn_in`` large enough for the chain to mix (``coupling_validation.batch_means_mcse``
+gives the Monte Carlo error of the posterior means). Mixing is slow when the data
+are nearly separable under a diffuse prior (few spikes, large ``sigma_beta``): at
+T = 30 bins, a 5% base rate and ``sigma_beta = 5`` the 90% intervals of 500-draw
+chains covered prior-drawn couplings only ~87% of the time (4000 sweeps: 91%), so
+the defaults are too short there. Requires float64 (tests enable
 ``jax_enable_x64``). Needs the ``coupling`` optional dependency (``polyagamma``).
 """
 
@@ -37,6 +42,61 @@ from state_space_practice.coupling_model import (
     validate_coupling_params,
 )
 from state_space_practice.coupling_validation import CouplingPosterior
+
+
+def pg_gibbs_sweep(
+    beta: np.ndarray,
+    design: np.ndarray,
+    kappa: np.ndarray,
+    offset: float,
+    prior_precision: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """One two-block Polya-Gamma Gibbs sweep for a Bernoulli-logit regression.
+
+    The target is ``p(beta | y) ∝ N(beta; 0, prior_precision^-1)
+    prod_k sigmoid(eta_k)^y_k (1 - sigmoid(eta_k))^(1 - y_k)`` with
+    ``eta = offset + design @ beta``. The sweep draws
+    ``omega_k | beta ~ PG(1, eta_k)`` and then
+    ``beta | omega ~ N(mu, P^-1)`` with ``P = prior_precision + X' diag(omega) X``
+    and ``P mu = X' (kappa - omega * offset)``; this kernel leaves the target
+    invariant (Polson, Scott & Windle, 2013). It is the kernel
+    :func:`fit_coupling_pg` iterates, exposed so its invariance can be tested
+    directly (e.g. a Geweke successive-conditional test).
+
+    Parameters
+    ----------
+    beta : ndarray, shape (P,)
+        Current coefficients.
+    design : ndarray, shape (T, P)
+    kappa : ndarray, shape (T,)
+        ``y - 1/2`` for 0/1 observations ``y``.
+    offset : float
+        Known logit intercept added to every bin.
+    prior_precision : ndarray, shape (P, P)
+        Precision of the zero-mean Gaussian prior on ``beta``.
+    rng : numpy.random.Generator
+        Consumed in a fixed order (``T`` PG draws, then ``P`` normals).
+
+    Returns
+    -------
+    ndarray, shape (P,)
+        The next state of the chain.
+    """
+    n_coef = design.shape[1]
+    eta = offset + design @ beta
+    omega = random_polyagamma(h=1.0, z=eta, random_state=rng)
+    # beta | omega ~ N(mu, prec^-1), prec = prior + X' diag(omega) X
+    precision = prior_precision + design.T @ (omega[:, None] * design)
+    precision = 0.5 * (precision + precision.T) + 1e-10 * np.eye(n_coef)
+    chol = cho_factor(precision, lower=True)
+    mean = cho_solve(chol, design.T @ (kappa - omega * offset))
+    # sample: beta = mean + L^{-T} z  (cov = (L L^T)^{-1})
+    standard_normal = rng.standard_normal(n_coef)
+    next_beta: np.ndarray = mean + solve_triangular(
+        chol[0], standard_normal, lower=True, trans="T"
+    )
+    return next_beta
 
 
 def fit_coupling_pg(
@@ -110,23 +170,11 @@ def fit_coupling_pg(
     samples = np.empty((n_kept, n_neurons, n_latent))  # interleaved design rows
 
     for neuron in range(n_neurons):
-        y = spikes[:, neuron]
-        kappa = y - 0.5
+        kappa = spikes[:, neuron] - 0.5
         offset = baseline[neuron]
         beta = np.zeros(n_latent)
         for sweep in range(n_iter):
-            eta = offset + design @ beta
-            omega = random_polyagamma(h=1.0, z=eta, random_state=rng)
-            # beta | omega ~ N(mu, prec^-1), prec = prior + X' diag(omega) X
-            precision = prior_precision + design.T @ (omega[:, None] * design)
-            precision = 0.5 * (precision + precision.T) + 1e-10 * np.eye(n_latent)
-            chol = cho_factor(precision, lower=True)
-            mean = cho_solve(chol, design.T @ (kappa - omega * offset))
-            # sample: beta = mean + L^{-T} z  (cov = (L L^T)^{-1})
-            standard_normal = rng.standard_normal(n_latent)
-            beta = mean + solve_triangular(
-                chol[0], standard_normal, lower=True, trans="T"
-            )
+            beta = pg_gibbs_sweep(beta, design, kappa, offset, prior_precision, rng)
             if sweep >= burn_in:
                 samples[sweep - burn_in, neuron] = beta
 

@@ -13,6 +13,18 @@ degeneracy in *this estimator* (a spikes-only joint fit would be degenerate):
    (Fisher-scoring) approximation; its bias is quantified by the Polya-Gamma
    cross-check (:mod:`coupling_pg` / :mod:`coupling_crosscheck`).
 
+Stage 2 is exactly a MAP logistic regression with a known intercept
+(``params.baseline``) and a static coupling: the returned mean is the penalised
+MLE and the covariance the inverse observed information at it (the canonical
+link makes Fisher scoring and Newton coincide). There are no coupling dynamics.
+
+The posterior is conditional on the smoothed latent *mean*: the smoother's
+uncertainty is ignored (errors-in-variables). Against simulated truth
+(``|beta| = 1.8``, T = 3000, 60 seeds) the posterior mean of the magnitude stays
+unbiased (within ~1%) but the intervals are too narrow as the field gets noisier:
+90% coverage ~0.89 / 0.86 / 0.69 at ``lfp_noise_var`` = 0.01 / 0.25 (default) /
+4.0. The Polya-Gamma arm shares this plug-in.
+
 Requires float64 (the test suite enables ``jax_enable_x64``).
 """
 
