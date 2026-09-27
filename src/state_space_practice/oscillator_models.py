@@ -773,15 +773,19 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
 
         snapshot = self._snapshot_em_state()
         observations = jnp.asarray(obs_np)
-        log_likelihood = float(self._e_step(observations))
+        # Seeding is initialization, not an EM iteration: call the class's
+        # E-/M-step implementations so instance-level instrumentation of the
+        # EM loop (e.g. a wrapped ``model._e_step``) sees only EM iterations.
+        cls = type(self)
+        log_likelihood = float(cls._e_step(self, observations))
         if not math.isfinite(log_likelihood):
             logger.debug("Warm-init seeding skipped: non-finite E-step.")
             self._restore_em_state(snapshot)
             return
         self.smoother_discrete_state_prob = jnp.asarray(probs)
         self.smoother_joint_discrete_state_prob = jnp.asarray(joint)
-        self._m_step(observations)
-        self._project_parameters()
+        cls._m_step(self, observations)
+        cls._project_parameters(self)
         for name in (
             "discrete_transition_matrix",
             "init_discrete_state_prob",
