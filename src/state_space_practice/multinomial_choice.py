@@ -1096,15 +1096,21 @@ class MultinomialChoiceModel(SGDFittableMixin):
         best_idx = int(jnp.argmax(lls))
         best_beta = float(beta_grid[best_idx])
 
-        # Golden-section refinement around the best grid point
+        # Golden-section refinement over the bracket around the best grid
+        # point ([g0, g1] at a grid edge).
         lo_idx = max(0, best_idx - 1)
         hi_idx = min(len(beta_grid) - 1, best_idx + 1)
         lo = float(beta_grid[lo_idx])
         hi = float(beta_grid[hi_idx])
+        current = float(self.inverse_temperature)
+        candidates = [(float(lls[best_idx]), best_beta)]
 
-        # If at grid edge, bracket collapses — skip refinement
+        # The bracket is empty only for a one-point grid: nothing to refine,
+        # but the grid point must still be compared with the current beta.
         if hi - lo < 1e-10:
-            return best_beta
+            ll_current = float(_eval_betas(jnp.array([current]))[0])
+            candidates.append((ll_current, current))
+            return max(candidates, key=lambda pair: pair[0])[1]
 
         gr = (math.sqrt(5) + 1) / 2
         for _ in range(10):
@@ -1122,13 +1128,8 @@ class MultinomialChoiceModel(SGDFittableMixin):
         # return) or than the current beta: keep whichever of the three has
         # the highest marginal LL, so the M-step never decreases it.
         refined = (lo + hi) / 2
-        current = float(self.inverse_temperature)
         ll_refined, ll_current = np.asarray(_eval_betas(jnp.array([refined, current])))
-        candidates = [
-            (float(lls[best_idx]), best_beta),
-            (float(ll_refined), refined),
-            (float(ll_current), current),
-        ]
+        candidates += [(float(ll_refined), refined), (float(ll_current), current)]
         return max(candidates, key=lambda pair: pair[0])[1]
 
     def choice_probabilities(self) -> Array:

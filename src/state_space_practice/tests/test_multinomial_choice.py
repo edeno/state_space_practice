@@ -961,6 +961,31 @@ class TestMultinomialMStepExactness:
                 smooth, q_new
             )
 
+    def test_one_point_grid_keeps_better_current_beta(self):
+        """A one-point grid has no bracket to refine; the M-step must still
+        compare the grid point with the current beta."""
+        sim = simulate_choice_data(
+            n_trials=40,
+            n_options=3,
+            process_noise=0.05,
+            inverse_temperature=1.0,
+            seed=0,
+        )
+        choices = jnp.asarray(sim.choices)
+        model = MultinomialChoiceModel(
+            n_options=3, init_process_noise=0.05, init_inverse_temperature=1.0
+        )
+
+        def ll(beta):
+            return float(
+                multinomial_choice_filter(
+                    choices, 3, process_noise=0.05, inverse_temperature=beta
+                ).marginal_log_likelihood
+            )
+
+        assert ll(1.0) > ll(12.0) + 1.0  # guard: the grid point is worse
+        assert model._m_step_beta(choices, jnp.array([12.0])) == 1.0
+
     @pytest.mark.slow
     @given(seed=st.integers(0, 10_000), beta_init=st.floats(0.3, 6.0))
     @example(seed=4, beta_init=1.0)  # maximum at the top edge of the grid
