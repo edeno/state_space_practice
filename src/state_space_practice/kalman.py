@@ -1242,7 +1242,47 @@ def smooth_initial_state(
     init_smoother_cov : jax.Array, shape (n_cont_states, n_cont_states)
         $$ P_{0|T} $$, the exact EM update of the initial covariance.
     """
-    mean, cov, _ = _kalman_smoother_update(
+    mean, cov, _ = smooth_initial_state_with_cross_cov(
+        prior, first_smoother_mean, first_smoother_cov
+    )
+    return mean, cov
+
+
+def smooth_initial_state_with_cross_cov(
+    prior: InitialStatePrior,
+    first_smoother_mean: jax.Array,
+    first_smoother_cov: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Smoothed ``x_0`` moments and the lag-one cross-covariance ``Cov(x_0, x_1 | y)``.
+
+    As :func:`smooth_initial_state`, plus::
+
+        C_{0,1} = Cov(x_0, x_1 | y_{1:T}) = J_0 P_{1|T},
+        J_0 = P_0 A^T P_{1|0}^{-1},   P_{1|0} = A P_0 A^T + Q,
+
+    the same convention (earlier state first) as the smoother's
+    ``smoother_cross_cov``. These are the statistics the ``x_0 -> x_1``
+    transition contributes to the EM update of ``A`` and ``Q``.
+
+    Parameters
+    ----------
+    prior : InitialStatePrior
+        Initial-state prior and dynamics the E-step ran with.
+    first_smoother_mean : jax.Array, shape (n_cont_states,)
+        $$ m_{1|T} $$.
+    first_smoother_cov : jax.Array, shape (n_cont_states, n_cont_states)
+        $$ P_{1|T} $$.
+
+    Returns
+    -------
+    init_smoother_mean : jax.Array, shape (n_cont_states,)
+        $$ m_{0|T} $$.
+    init_smoother_cov : jax.Array, shape (n_cont_states, n_cont_states)
+        $$ P_{0|T} $$.
+    init_cross_cov : jax.Array, shape (n_cont_states, n_cont_states)
+        $$ C_{0,1} = Cov(x_0, x_1 | y_{1:T}) $$.
+    """
+    return _kalman_smoother_update(
         jnp.asarray(first_smoother_mean),
         jnp.asarray(first_smoother_cov),
         jnp.asarray(prior.init_mean),
@@ -1250,7 +1290,6 @@ def smooth_initial_state(
         jnp.asarray(prior.process_cov),
         jnp.asarray(prior.transition_matrix),
     )
-    return mean, cov
 
 
 def measurement_cov_residual_form(
@@ -1361,12 +1400,15 @@ def kalman_maximization_step(
     initial_state_prior : InitialStatePrior or None, optional
         The initial-state prior and dynamics the E-step ran with. The filter
         predicts before its first update, so ``init_mean`` / ``init_cov``
-        are the prior of ``x_0`` and their exact EM update is the smoothed
-        ``x_0`` (:func:`smooth_initial_state`), which needs these
-        parameters. Pass them for a monotone EM. If None (legacy), the
-        returned initial moments are the smoothed moments of ``x_1``, which
-        is not an EM step for the filter's ``x_0`` prior and can decrease
-        the log-likelihood (e.g. with a contractive ``A``).
+        are the prior of ``x_0``; with these parameters the M-step recovers
+        the smoothed ``x_0`` (:func:`smooth_initial_state_with_cross_cov`)
+        and is the exact maximiser of the expected complete-data
+        log-likelihood of the filter's model (see Notes). Pass them for a
+        monotone EM. If None (legacy), the returned initial moments are the
+        smoothed moments of ``x_1`` and ``A`` / ``Sigma`` use only the
+        ``T - 1`` transitions within ``x_{1:T}``: the exact M-step of a model
+        whose prior sits on ``x_1``, which is not the filter's model and can
+        decrease the log-likelihood (e.g. with a contractive ``A``).
 
     Returns
     -------
@@ -1387,16 +1429,31 @@ def kalman_maximization_step(
 
     Notes
     -----
+    With ``initial_state_prior`` the transition statistics include the
+    ``x_0 -> x_1`` transition, so ``A`` and ``Sigma`` are estimated from all
+    ``T`` transitions of the filter's model. With ``m_{0|T}``, ``P_{0|T}``
+    from the RTS step back to ``x_0`` and ``C_{t,t+1} = Cov(x_t, x_{t+1} | y)``
+    (``C_{0,1} = J_0 P_{1|T}``, ``J_0 = P_0 A^T (A P_0 A^T + Sigma)^{-1}``)::
+
+        S_t    = P_{t|T} + m_{t|T} m_{t|T}^T                   t = 0..T
+        gamma1 = sum_{t=0}^{T-1} S_t
+        beta   = sum_{t=0}^{T-1} (C_{t,t+1} + m_{t|T} m_{t+1|T}^T)^T
+        A      = beta gamma1^{-1}
+        Sigma  = (1/T) sum_{t=1}^{T} E[(x_t - A x_{t-1})(x_t - A x_{t-1})^T]
+
+    (the last in the centred residual form of :func:`process_cov_residual_form`
+    over ``x_{0:T}``). ``H`` and ``R`` use the ``T`` observations as before.
+    Without ``initial_state_prior`` the sums run over ``x_{1:T}`` only
+    (``T - 1`` transitions, ``Sigma`` divided by ``T - 1``).
+
     ``R`` and ``Sigma`` use the centred residual forms
     (:func:`measurement_cov_residual_form`, :func:`process_cov_residual_form`),
     which are PSD by construction; they equal the classical
-    ``(alpha - H delta^T) / T`` and ``(gamma2 - A beta^T) / (T - 1)`` at the
-    solved ``H`` / ``A`` up to roundoff. Eigenvalues are then floored at a
-    scale-relative level (:func:`~state_space_practice.utils.project_psd_relative`),
-    which logs a warning when it changes the estimate.
-
-    ``A`` and ``Sigma`` are estimated from the ``T - 1`` transitions within
-    ``x_{1:T}``; the ``x_0 -> x_1`` transition is not included.
+    ``(alpha - H delta^T) / T`` and ``(gamma2 - A beta^T) / n_transitions``
+    at the solved ``H`` / ``A`` up to roundoff. Eigenvalues are then floored
+    at a scale-relative level
+    (:func:`~state_space_practice.utils.project_psd_relative`), which logs a
+    warning when it changes the estimate.
 
     References
     ----------
@@ -1411,15 +1468,10 @@ def kalman_maximization_step(
             "estimate transition dynamics."
         )
 
-    # Compute intermediate expectation terms
+    # Observation statistics over x_{1:T}.
     sum_cov = jnp.sum(smoother_cov, axis=0)
     gamma = sum_cov + sum_of_outer_products(smoother_mean, smoother_mean)
     delta = sum_of_outer_products(obs, smoother_mean)
-    gamma1 = gamma - jnp.outer(smoother_mean[-1], smoother_mean[-1]) - smoother_cov[-1]
-    beta = (
-        smoother_cross_cov.sum(axis=0)
-        + sum_of_outer_products(smoother_mean[:-1], smoother_mean[1:])
-    ).T
 
     # Measurement matrix and covariance
     measurement_matrix = _gain_solve(gamma, delta.T).T
@@ -1428,29 +1480,43 @@ def kalman_maximization_step(
         name="kalman_maximization_step measurement_cov",
     )
 
+    # Transition statistics: over x_{0:T} (all T transitions of the filter's
+    # model) when the E-step's initial-state prior is known, else over x_{1:T}.
+    if initial_state_prior is None:
+        init_mean = smoother_mean[0]
+        init_cov = smoother_cov[0]
+        trans_mean = smoother_mean
+        trans_cov = smoother_cov
+        trans_cross_cov = smoother_cross_cov
+    else:
+        init_mean, init_cov, init_cross_cov = smooth_initial_state_with_cross_cov(
+            initial_state_prior, smoother_mean[0], smoother_cov[0]
+        )
+        trans_mean = jnp.concatenate((init_mean[None], smoother_mean))
+        trans_cov = jnp.concatenate((init_cov[None], smoother_cov))
+        trans_cross_cov = jnp.concatenate((init_cross_cov[None], smoother_cross_cov))
+
+    sum_trans_cov = jnp.sum(trans_cov, axis=0)
+    sum_cross_cov = jnp.sum(trans_cross_cov, axis=0)
+    gamma1 = (sum_trans_cov - trans_cov[-1]) + sum_of_outer_products(
+        trans_mean[:-1], trans_mean[:-1]
+    )
+    beta = (sum_cross_cov + sum_of_outer_products(trans_mean[:-1], trans_mean[1:])).T
+
     # Transition matrix
     transition_matrix = _gain_solve(gamma1, beta.T).T
 
     # Process covariance
     process_cov = project_psd_relative(
         process_cov_residual_form(
-            smoother_mean,
-            sum_next_cov=sum_cov - smoother_cov[0],
-            sum_prev_cov=sum_cov - smoother_cov[-1],
-            sum_cross_cov=smoother_cross_cov.sum(axis=0),
+            trans_mean,
+            sum_next_cov=sum_trans_cov - trans_cov[0],
+            sum_prev_cov=sum_trans_cov - trans_cov[-1],
+            sum_cross_cov=sum_cross_cov,
             transition_matrix=transition_matrix,
         ),
         name="kalman_maximization_step process_cov",
     )
-
-    # Initial mean and covariance
-    if initial_state_prior is None:
-        init_mean = smoother_mean[0]
-        init_cov = smoother_cov[0]
-    else:
-        init_mean, init_cov = smooth_initial_state(
-            initial_state_prior, smoother_mean[0], smoother_cov[0]
-        )
 
     return (
         transition_matrix,

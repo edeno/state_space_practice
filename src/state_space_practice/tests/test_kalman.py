@@ -25,6 +25,7 @@ from state_space_practice.kalman import (
     process_cov_residual_form,
     psd_solve,
     smooth_initial_state,
+    smooth_initial_state_with_cross_cov,
     standard_kalman_gain,
     sum_of_outer_products,
     symmetrize,
@@ -2268,6 +2269,66 @@ class TestInitialStateMStep:
             A, H, Q, R, m0, P0 = kalman_maximization_step(obs, sm, sc, scc, prior)
         assert np.all(np.diff(lls) >= -1e-6), lls
         assert lls[-1] > lls[0] + 1.0
+
+
+class TestInitialTransitionInMStep:
+    """With ``initial_state_prior`` the M-step's A and Q statistics include
+    the x_0 -> x_1 transition (T transitions), using the smoothed x_0 and
+    ``Cov(x_0, x_1 | y) = J_0 P_{1|T}``. Exactness against the dense oracle is
+    in ``test_oracle_kalman.py``; these pin the formulas."""
+
+    @pytest.fixture
+    def problem(self) -> dict:
+        A = jnp.array([[0.8, 0.2], [-0.1, 0.7]])
+        Q = jnp.array([[0.3, 0.05], [0.05, 0.2]])
+        H = jnp.array([[1.0, 0.4]])
+        R = jnp.array([[0.2]])
+        m0, P0 = jnp.array([0.5, -1.0]), jnp.array([[1.5, 0.2], [0.2, 0.8]])
+        obs, _ = _simulate_from_model(A, Q, H, R, m0, P0, 12, seed=4)
+        sm, sc, scc, _ = kalman_smoother(m0, P0, obs, A, Q, H, R)
+        return {
+            "obs": obs,
+            "sm": sm,
+            "sc": sc,
+            "scc": scc,
+            "prior": InitialStatePrior(m0, P0, A, Q),
+        }
+
+    def test_cross_cov_is_j0_times_p1(self, problem) -> None:
+        prior = problem["prior"]
+        m1, P1 = problem["sm"][0], problem["sc"][0]
+        m00, P00, C01 = smooth_initial_state_with_cross_cov(prior, m1, P1)
+        A, P0 = np.asarray(prior.transition_matrix), np.asarray(prior.init_cov)
+        P_pred = A @ P0 @ A.T + np.asarray(prior.process_cov)
+        J0 = P0 @ A.T @ np.linalg.inv(P_pred)
+        np.testing.assert_allclose(C01, J0 @ np.asarray(P1), rtol=1e-10)
+        m_b, P_b = smooth_initial_state(prior, m1, P1)
+        np.testing.assert_array_equal(m_b, m00)
+        np.testing.assert_array_equal(P_b, P00)
+
+    def test_transition_statistics_span_x0_to_xT(self, problem) -> None:
+        obs, sm, sc, scc = problem["obs"], problem["sm"], problem["sc"], problem["scc"]
+        prior = problem["prior"]
+        A, H, Q, R, m00, P00 = kalman_maximization_step(obs, sm, sc, scc, prior)
+        _, _, C01 = smooth_initial_state_with_cross_cov(prior, sm[0], sc[0])
+        means = np.concatenate([np.asarray(m00)[None], np.asarray(sm)])
+        covs = np.concatenate([np.asarray(P00)[None], np.asarray(sc)])
+        cross = np.concatenate([np.asarray(C01)[None], np.asarray(scc)])
+        T = obs.shape[0]
+        S = covs + np.einsum("ta,tb->tab", means, means)
+        gamma1 = S[:-1].sum(0)
+        gamma2 = S[1:].sum(0)
+        beta = (cross + np.einsum("ta,tb->tab", means[:-1], means[1:])).sum(0).T
+        A_ref = beta @ np.linalg.inv(gamma1)
+        np.testing.assert_allclose(A, A_ref, rtol=1e-9)
+        np.testing.assert_allclose(Q, (gamma2 - A_ref @ beta.T) / T, rtol=1e-8)
+        # H and R still use the T observations of x_{1:T} only.
+        H_legacy, R_legacy = kalman_maximization_step(obs, sm, sc, scc)[1::2][:2]
+        np.testing.assert_allclose(H, H_legacy, rtol=1e-12)
+        np.testing.assert_allclose(R, R_legacy, rtol=1e-12)
+        # guard: including x_0 -> x_1 changes A here
+        A_legacy = kalman_maximization_step(obs, sm, sc, scc)[0]
+        assert np.max(np.abs(np.asarray(A) - np.asarray(A_legacy))) > 1e-3
 
 
 class TestResidualFormMStep:
