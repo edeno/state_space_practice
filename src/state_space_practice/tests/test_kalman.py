@@ -2273,7 +2273,7 @@ class TestInitialStateMStep:
 class TestResidualFormMStep:
     """R and Q use centred residual forms, PSD by construction."""
 
-    @pytest.fixture(scope="class")
+    @pytest.fixture
     def smoothed_3d(self) -> tuple:
         A = jnp.array([[0.9, 0.1, 0.0], [0.0, 0.8, 0.1], [0.0, 0.0, 0.7]])
         Q = jnp.eye(3) * 0.2
@@ -2390,7 +2390,7 @@ class TestRelativeEigenvalueFloor:
 class TestKalmanTraceability:
     """Public filters trace under jit/grad with the default validate_inputs."""
 
-    @pytest.fixture(scope="class")
+    @pytest.fixture
     def problem(self) -> tuple:
         A = jnp.array([[0.9, 0.1], [0.0, 0.8]])
         Q = jnp.eye(2) * 0.1

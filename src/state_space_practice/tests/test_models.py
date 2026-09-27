@@ -511,6 +511,9 @@ class TestGetConfidenceInterval:
         np.testing.assert_allclose(ci[..., 1], posterior_mode + half_width)
 
 
+@pytest.mark.filterwarnings(
+    "ignore:stochastic_point_process_filter in models.py:DeprecationWarning"
+)
 class TestDeprecatedFilterJitAndFloors:
     """The deprecated observed-Hessian filter runs as one jitted scan and
     floors eigenvalues relative to the matrix scale."""
