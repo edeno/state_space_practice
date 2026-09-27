@@ -7929,6 +7929,23 @@ def test_mstep_keeps_previous_params_for_near_empty_state(random_mstep_stats, ca
         )
 
 
+def test_mstep_warns_for_near_empty_state_without_previous_params(
+    random_mstep_stats, caplog
+):
+    """Without previous_params the gate cannot keep anything: the unidentified
+    parameters of the near-empty state are installed, and that is reported."""
+    stats = dict(random_mstep_stats)
+    T = stats["smoother_discrete_state_prob"].shape[0]
+    prob = jnp.stack([jnp.ones(T) - 1e-7 / T, jnp.full(T, 1e-7 / T)], axis=-1)
+    stats["smoother_discrete_state_prob"] = prob
+    stats["smoother_joint_discrete_state_prob"] = prob[:-1, :, None] * prob[1:, None, :]
+    with caplog.at_level("WARNING"):
+        switching_kalman_maximization_step(**stats)
+    assert "discrete state(s) [1] have expected occupancy" in caplog.text
+    assert "unidentified" in caplog.text
+    assert "kept their previous values" not in caplog.text
+
+
 def test_posterior_entropy_fails_loud_on_indefinite_covariance() -> None:
     """The entropy uses a Cholesky log-determinant: it agrees with slogdet on
     PSD input and returns NaN (not |det| of an indefinite matrix) otherwise."""

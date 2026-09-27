@@ -2540,13 +2540,36 @@ def switching_kalman_maximization_step(
     # Inside an outer trace the inner jit's outputs are tracers even when the
     # caller's inputs are concrete, so check the flags themselves.
     if not contains_tracer(measurement_cov_floored, process_cov_floored, occupancy):
-        if previous:
-            warn_low_occupancy_states(
-                jnp.where(obs_ok, transition_occupancy, occupancy),
-                min_occupancy,
-                "switching_kalman_maximization_step",
-                "their per-state A/Q/H/R kept their previous values",
+        kept = [
+            label
+            for label, name in (
+                ("A", "continuous_transition_matrix"),
+                ("Q", "process_cov"),
+                ("H", "measurement_matrix"),
+                ("R", "measurement_cov"),
             )
+            if previous.get(name) is not None
+        ]
+        if len(kept) == 4:
+            action = "their per-state A/Q/H/R kept their previous values"
+        elif kept:
+            action = (
+                f"their per-state {'/'.join(kept)} kept their previous values; "
+                "the other per-state parameters were estimated from too few "
+                "bins and are unidentified"
+            )
+        else:
+            action = (
+                "their per-state A/Q/H/R were estimated from too few bins and "
+                "are unidentified (pass previous_params to keep the previous "
+                "values)"
+            )
+        warn_low_occupancy_states(
+            jnp.where(obs_ok, transition_occupancy, occupancy),
+            min_occupancy,
+            "switching_kalman_maximization_step",
+            action,
+        )
         floored = (measurement_cov_floored & obs_ok) | (process_cov_floored & trans_ok)
         floored_states = [int(j) for j in jax.device_get(jnp.flatnonzero(floored))]
         if floored_states:
