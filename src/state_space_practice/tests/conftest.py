@@ -11,15 +11,16 @@ import jax
 
 jax.config.update("jax_enable_x64", True)
 
-# Persistent XLA compilation cache: every test module runs in its own pytest
-# process and re-traces the same jitted filters, so most of the suite's wall
-# time is compilation. Caching compiled executables on disk lets later
-# processes (and later runs) reuse them. Override the location with
-# SSP_JAX_CACHE_DIR; set it empty to disable.
-_cache_dir = os.environ.get(
-    "SSP_JAX_CACHE_DIR",
-    os.path.join(os.path.expanduser("~"), ".cache", "state_space_practice_jax"),
-)
+# Opt-in persistent XLA compilation cache. Much of the suite's wall time is
+# compiling the same jitted filters; setting SSP_JAX_CACHE_DIR to a directory
+# stores compiled executables there so that a *later, separate* pytest run
+# reuses them instead of recompiling. It is off by default because the cache
+# is not safe for concurrent writers: two pytest runs sharing one directory
+# can leave truncated entries, which JAX reports as "Error reading persistent
+# compilation cache entry" (a warning that ``filterwarnings = error`` turns
+# into a test failure). Give concurrent runs separate directories, and clear
+# the directory if it grows too large -- every compiled entry is kept.
+_cache_dir = os.environ.get("SSP_JAX_CACHE_DIR", "")
 if _cache_dir:
     jax.config.update("jax_compilation_cache_dir", _cache_dir)
     jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
@@ -45,8 +46,8 @@ settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))
 
 # --- Automatic ``slow`` marking ---------------------------------------------
 #
-# CLAUDE.md: any test that runs EM, SGD or a full fit must be marked slow so the
-# fast suite (``-m "not slow"``) stays quick. Rather than rely on every author
+# Any test that runs EM, SGD or a full fit must be marked slow so the fast
+# suite (``-m "not slow"``) stays quick. Rather than rely on every author
 # remembering the decorator, a test is marked slow at collection time when
 #
 # 1. its own source, or the source of any fixture it (transitively) requests,
