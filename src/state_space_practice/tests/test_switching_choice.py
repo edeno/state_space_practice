@@ -1114,3 +1114,102 @@ class TestSwitchingChoiceValidation:
         model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
         model.fit(choices, max_iter=1)
         assert model.converged_ is False
+
+
+class TestSwitchingChoiceMStepExactness:
+    """The EM M-step maximises its (GPB1-approximate) expected objective.
+
+    With ``joint[t, i, s] = P(s_t=i, s_{t+1}=s | y)`` and the smoother's
+    state-conditional moments, the process-noise objective of state ``s`` is
+
+        Q_s(q) = -sum_t w_t(s) [ k/2 log q + e_t(s) / (2 q) ],
+        w_t(s) = sum_i joint[t, i, s],
+        e_t(s) = ||m_{t+1,s} - a_s m_{t,s} - b_{t+1}||^2 + tr P_{t+1,s}
+                 + a_s^2 tr P_{t,s} - 2 a_s tr C_t(s),
+        C_t(s) = sum_i joint[t, i, s] C_t(i, s) / w_t(s),
+
+    and the transition objective is ``sum_t sum_ij joint[t,i,j] log Z_ij``.
+    Both are written out here with explicit loops; the returned parameters
+    must be stationary (Lagrange condition for the simplex rows).
+    """
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def em_inputs(cls):
+        from state_space_practice.covariate_choice import simulate_rl_choice_data
+
+        data = simulate_rl_choice_data(
+            n_trials=60, n_options=3, seed=5, inverse_temperature=1.0
+        )
+        model = SwitchingChoiceModel(
+            n_options=3,
+            n_discrete_states=2,
+            n_covariates=2,
+            init_inverse_temperatures=[0.7, 2.5],
+            init_process_noises=[0.02, 0.2],
+            init_decays=[1.0, 0.85],
+        )
+        model.input_gain_ = 0.4 * jnp.eye(2)
+        model._covariates = data.covariates
+        filt = model._run_filter(data.choices, data.covariates)
+        smooth = model._run_smoother(filt)
+        return model, data, filt, smooth
+
+    def _q_objective(self, model, data, smooth, s, q):
+        joint = np.asarray(smooth[3])
+        means = np.asarray(smooth[5])
+        covs = np.asarray(smooth[6])
+        cross = np.asarray(smooth[7])
+        b = np.asarray(data.covariates) @ np.asarray(model.input_gain_).T
+        a = float(model.decays_[s])
+        k = means.shape[1]
+        total = 0.0
+        for t in range(joint.shape[0]):
+            w = joint[t, :, s].sum()
+            C = sum(joint[t, i, s] * cross[t, :, :, i, s] for i in range(2)) / w
+            r = means[t + 1, :, s] - a * means[t, :, s] - b[t + 1]
+            e = (
+                r @ r
+                + np.trace(covs[t + 1, :, :, s])
+                + a**2 * np.trace(covs[t, :, :, s])
+                - 2 * a * np.trace(C)
+            )
+            total -= w * (0.5 * k * np.log(q) + e / (2 * q))
+        return total
+
+    def test_process_noise_per_state_is_stationary(self, em_inputs):
+        model, data, filt, smooth = em_inputs
+        q_old = np.asarray(model.process_noises_).copy()
+        fresh = SwitchingChoiceModel(
+            n_options=3,
+            n_discrete_states=2,
+            n_covariates=2,
+            init_inverse_temperatures=model.inverse_temperatures_,
+            init_process_noises=q_old,
+            init_decays=model.decays_,
+        )
+        fresh.input_gain_ = model.input_gain_
+        fresh._covariates = data.covariates
+        fresh._m_step(jnp.asarray(data.choices), filt, smooth)
+        q_new = np.asarray(fresh.process_noises_)
+        for s in range(2):
+            eps = 1e-6 * q_new[s]
+            g = (
+                self._q_objective(model, data, smooth, s, q_new[s] + eps)
+                - self._q_objective(model, data, smooth, s, q_new[s] - eps)
+            ) / (2 * eps)
+            f = self._q_objective(model, data, smooth, s, q_new[s])
+            assert abs(g) < 1e-6 * abs(f) / q_new[s], (s, g)
+            assert f >= self._q_objective(model, data, smooth, s, q_old[s])
+        # Guard: the two states' estimates differ (the weights matter).
+        assert abs(np.log(q_new[0] / q_new[1])) > 0.1, q_new
+
+        # Transition rows: grad_ij of sum N_ij log Z_ij is N_ij / Z_ij, which
+        # the Lagrange condition requires to equal the row's total count.
+        joint = np.asarray(smooth[3])
+        N = joint.sum(axis=0)
+        Z = np.asarray(fresh.discrete_transition_matrix_)
+        np.testing.assert_allclose(Z.sum(axis=1), 1.0, atol=1e-12)
+        np.testing.assert_allclose(
+            N / Z, np.broadcast_to(N.sum(axis=1, keepdims=True), N.shape), rtol=1e-8
+        )

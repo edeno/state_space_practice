@@ -3,6 +3,8 @@
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from state_space_practice.multinomial_choice import (
     ChoiceFilterResult,
@@ -760,3 +762,108 @@ class TestMultinomialChoiceValidation:
         # Guard: the rejected call would change n_trials if it leaked through.
         assert len(bad_choices) != 60
         assert model.bic() == bic_before
+
+
+class TestMultinomialMStepExactness:
+    """Each EM M-step returns the optimum of the objective it claims.
+
+    - Process noise: the expected complete-data log-likelihood of the random
+      walk ``x_t = x_{t-1} + w_t, w_t ~ N(0, q I)`` in the scalar ``q``,
+
+          Q(q) = -(T-1) k / 2 log q - S / (2 q),
+          S = sum_t E||x_t - x_{t-1}||^2 = sum_t ||m_t - m_{t-1}||^2
+              + tr P_t + tr P_{t-1} - 2 tr C_{t-1,t},
+
+      written out here from the smoother moments.
+    - Inverse temperature: no closed form; the M-step maximises the filter's
+      marginal log-likelihood by grid search + 10 golden-section steps, so the
+      returned beta must lie within the final bracket of the true maximiser.
+    """
+
+    @staticmethod
+    def _q_objective(smooth, q):
+        m = np.asarray(smooth.smoothed_values)
+        P = np.asarray(smooth.smoothed_covariances)
+        C = np.asarray(smooth.smoother_cross_cov)
+        n, k = m.shape[0] - 1, m.shape[1]
+        S = (
+            np.sum((m[1:] - m[:-1]) ** 2)
+            + np.trace(P[1:], axis1=1, axis2=2).sum()
+            + np.trace(P[:-1], axis1=1, axis2=2).sum()
+            - 2 * np.trace(C, axis1=1, axis2=2).sum()
+        )
+        return -0.5 * n * k * np.log(q) - S / (2 * q)
+
+    @pytest.mark.slow
+    @given(
+        seed=st.integers(0, 10_000),
+        q_init=st.floats(0.005, 0.5),
+        beta=st.floats(0.5, 3.0),
+    )
+    @settings(max_examples=6, deadline=None)
+    def test_process_noise_is_stationary_and_ascends(self, seed, q_init, beta):
+        sim = simulate_choice_data(
+            n_trials=40,
+            n_options=3,
+            process_noise=0.05,
+            inverse_temperature=beta,
+            seed=seed,
+        )
+        model = MultinomialChoiceModel(
+            n_options=3, init_process_noise=q_init, init_inverse_temperature=beta
+        )
+        smooth = model._run_smoother(jnp.asarray(sim.choices))
+        q_new = model._m_step_process_noise(smooth)
+        eps = 1e-6 * q_new
+        grad = (
+            self._q_objective(smooth, q_new + eps)
+            - self._q_objective(smooth, q_new - eps)
+        ) / (2 * eps)
+        scale = abs(self._q_objective(smooth, q_new)) / q_new
+        assert abs(grad) < 1e-6 * scale, (grad, q_new)
+        assert self._q_objective(smooth, q_new) >= self._q_objective(smooth, q_init)
+        # Strictly a maximum: moving 10% either way lowers Q.
+        for f in (0.9, 1.1):
+            assert self._q_objective(smooth, f * q_new) < self._q_objective(
+                smooth, q_new
+            )
+
+    @pytest.mark.slow
+    @given(seed=st.integers(0, 10_000), beta_init=st.floats(0.3, 6.0))
+    @settings(max_examples=5, deadline=None)
+    def test_beta_reaches_marginal_ll_maximum_within_bracket(self, seed, beta_init):
+        from scipy.optimize import minimize_scalar
+
+        from state_space_practice.multinomial_choice import _DEFAULT_BETA_GRID
+
+        sim = simulate_choice_data(
+            n_trials=40,
+            n_options=3,
+            process_noise=0.05,
+            inverse_temperature=2.0,
+            seed=seed,
+        )
+        choices = jnp.asarray(sim.choices)
+        model = MultinomialChoiceModel(
+            n_options=3, init_process_noise=0.05, init_inverse_temperature=beta_init
+        )
+        grid = np.array(_DEFAULT_BETA_GRID)
+        beta_new = model._m_step_beta(choices, jnp.asarray(grid))
+
+        def ll(beta):
+            return float(
+                multinomial_choice_filter(
+                    choices, 3, process_noise=0.05, inverse_temperature=beta
+                ).marginal_log_likelihood
+            )
+
+        grid_lls = np.array([ll(b) for b in grid])
+        i = int(np.argmax(grid_lls))
+        lo, hi = grid[max(i - 1, 0)], grid[min(i + 1, grid.size - 1)]
+        ref = minimize_scalar(
+            lambda b: -ll(b), bounds=(lo, hi), method="bounded", options={"xatol": 1e-8}
+        )
+        # 10 golden-section steps shrink the bracket to 0.618^10 = 0.8%.
+        assert abs(beta_new - ref.x) <= 0.005 * (hi - lo) + 1e-6, (beta_new, ref.x)
+        assert ll(beta_new) >= grid_lls.max() - 1e-9
+        assert ll(beta_new) >= ll(beta_init) - 1e-9

@@ -4,6 +4,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from state_space_practice.covariate_choice import (
     CovariateChoiceModel,
@@ -1565,3 +1567,123 @@ class TestInputGainNeverRewardedOption:
         model_dead = CovariateChoiceModel(n_options=3, n_covariates=2)
         model_dead.fit_sgd(data.choices, covariates=cov_dead, num_steps=60)
         np.testing.assert_array_equal(np.asarray(model_dead.input_gain_)[:, 0], 0.0)
+
+
+class TestCovariateMStepExactness:
+    """Input gain, decay and observation weights maximise their objectives.
+
+    With ``x_t = a x_{t-1} + B u_t + w_t`` the expected complete-data
+    log-likelihood depends on ``(a, B)`` only through
+
+        S(a, B) = sum_t E||x_t - a x_{t-1} - B u_t||^2
+                = sum_t ||m_t - a m_{t-1} - B u_t||^2 + tr P_t
+                  + a^2 tr P_{t-1} - 2 a tr C_{t-1,t},
+
+    so the B M-step (given a) and the a M-step (given B) must each be a
+    stationary point of ``-S``. The observation-weight M-step maximises the
+    documented plug-in objective ``sum_t log softmax(beta [0, m_t] +
+    Theta z_t)[c_t]`` with a few damped Newton steps (a generalised M-step
+    that EM warm-starts from the previous Theta).
+    """
+
+    @staticmethod
+    def _S(smooth, a, B, u):
+        m = np.asarray(smooth.smoothed_values)
+        P = np.asarray(smooth.smoothed_covariances)
+        C = np.asarray(smooth.smoother_cross_cov)
+        r = m[1:] - a * m[:-1] - np.asarray(u)[1:] @ np.asarray(B).T
+        return (
+            np.sum(r**2)
+            + np.trace(P[1:], axis1=1, axis2=2).sum()
+            + a**2 * np.trace(P[:-1], axis1=1, axis2=2).sum()
+            - 2 * a * np.trace(C, axis1=1, axis2=2).sum()
+        )
+
+    @staticmethod
+    def _fitted_smoother(seed, decay, gain):
+        data = simulate_rl_choice_data(
+            n_trials=80, n_options=3, seed=seed, inverse_temperature=1.0, decay=0.9
+        )
+        model = CovariateChoiceModel(
+            n_options=3, n_covariates=2, init_decay=decay, learn_decay=True
+        )
+        model._bind_covariates(data.choices, data.covariates, None, "fit")
+        model.input_gain_ = gain * jnp.eye(2)
+        return model, data, model._run_smoother(jnp.asarray(data.choices))
+
+    @pytest.mark.slow
+    @given(
+        seed=st.integers(0, 10_000),
+        decay=st.floats(0.6, 1.0),
+        gain=st.floats(-0.5, 1.0),
+    )
+    @settings(max_examples=6, deadline=None)
+    def test_input_gain_and_decay_are_stationary(self, seed, decay, gain):
+        model, data, smooth = self._fitted_smoother(seed, decay, gain)
+        u = np.asarray(data.covariates)
+        B_hat = np.asarray(
+            m_step_input_gain(smooth.smoothed_values, data.covariates, decay)
+        )
+        # Gradient of S in B by central differences; S is quadratic in B so
+        # the stationary point is the global minimum.
+        eps = 1e-6
+        for i in range(2):
+            for j in range(2):
+                if u[1:, j].sum() == 0:
+                    continue  # unidentified column (see TestInputGainNever...)
+                E = np.zeros_like(B_hat)
+                E[i, j] = eps
+                g = (
+                    self._S(smooth, decay, B_hat + E, u)
+                    - self._S(smooth, decay, B_hat - E, u)
+                ) / (2 * eps)
+                assert abs(g) < 1e-5, (i, j, g)
+        assert (
+            self._S(smooth, decay, B_hat, u)
+            <= self._S(smooth, decay, gain * np.eye(2), u) + 1e-10
+        )
+
+        # Decay given the current B.
+        a_hat = model._m_step_decay(smooth)
+        B_cur = np.asarray(model.input_gain_)
+        g_a = (
+            self._S(smooth, a_hat + eps, B_cur, u)
+            - self._S(smooth, a_hat - eps, B_cur, u)
+        ) / (2 * eps)
+        if 0.01 < a_hat < 1.0:
+            assert abs(g_a) < 1e-5, (a_hat, g_a)
+        elif a_hat == 1.0:
+            assert g_a <= 1e-8  # KKT at the upper clip: S still decreasing
+        assert (
+            self._S(smooth, a_hat, B_cur, u) <= self._S(smooth, decay, B_cur, u) + 1e-10
+        )
+
+    def test_obs_weights_newton_converges_to_stationary_point(self):
+        from state_space_practice.covariate_choice import m_step_obs_weights
+
+        rng = np.random.default_rng(0)
+        T, K, d = 120, 3, 2
+        m = jnp.asarray(rng.normal(size=(T, K - 1)).cumsum(axis=0) * 0.2)
+        z = jnp.asarray(rng.normal(size=(T, d)))
+        choices = jnp.asarray(rng.integers(0, K, T))
+        beta = 1.3
+
+        def objective(theta):
+            logits = beta * jnp.concatenate([jnp.zeros((T, 1)), m], 1) + z @ theta.T
+            return jnp.sum(jax.nn.log_softmax(logits, 1)[jnp.arange(T), choices])
+
+        grad = jax.grad(objective)
+        theta0 = jnp.zeros((K, d))
+        theta1 = m_step_obs_weights(m, choices, z, K, beta, theta0)
+        g0 = float(jnp.linalg.norm(grad(theta0)))
+        g1 = float(jnp.linalg.norm(grad(theta1)))
+        # One M-step removes > 99% of the gradient (observed 0.24%) and
+        # increases the objective.
+        assert g1 < 0.01 * g0, (g0, g1)
+        assert float(objective(theta1)) > float(objective(theta0))
+        # Warm-started repetitions (what EM does) converge to the optimum.
+        theta = theta1
+        for _ in range(5):
+            theta = m_step_obs_weights(m, choices, z, K, beta, theta)
+        assert float(jnp.linalg.norm(grad(theta))) < 1e-8
+        assert float(objective(theta)) >= float(objective(theta1))

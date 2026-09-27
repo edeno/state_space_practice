@@ -1219,3 +1219,84 @@ class TestContingencyBeliefSeed:
         np.testing.assert_array_equal(a.reward_probs_, same.reward_probs_)
         # the two parameters use independent keys
         assert not np.allclose(a.state_values_ / 0.1, (a.reward_probs_ - 0.5) / 0.05)
+
+
+class TestContingencyMStepExactness:
+    """Reward-probability and transition M-steps reach their optima.
+
+    Reward probabilities: the expected complete-data log-likelihood
+    ``sum_t sum_s gamma_ts [r_t log rho[s, c_t] + (1 - r_t) log(1 - rho[s, c_t])]``
+    has a closed-form maximiser; its finite-difference gradient must vanish.
+    Transitions: per-row BFGS on :func:`dirichlet_neg_log_likelihood`; the
+    returned coefficients must be a stationary point of that loss, and for an
+    intercept-only model with a flat prior (alpha = 1) the optimum is the
+    Baum-Welch count ratio ``sum_t xi_t(i, j) / sum_t gamma_t(i)``.
+    """
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def e_step(cls):
+        rng = np.random.default_rng(11)
+        n_trials, K = 120, 3
+        states = (np.arange(n_trials) // 30) % 2
+        best = np.array([0, 2])[states]
+        choices = np.where(
+            rng.random(n_trials) < 0.75, best, rng.integers(0, K, n_trials)
+        )
+        p_true = np.array([[0.8, 0.2, 0.2], [0.2, 0.2, 0.8]])
+        rewards = (rng.random(n_trials) < p_true[states, choices]).astype(int)
+        model = ContingencyBeliefModel(n_states=2, n_options=K, seed=0)
+        model._transition_design_matrix = model._build_design_matrix(n_trials)
+        choices, rewards = jnp.asarray(choices), jnp.asarray(rewards)
+        post = contingency_belief_smoother(**model._smoother_kwargs(choices, rewards))
+        return model, choices, rewards, post
+
+    def test_reward_probs_are_stationary(self, e_step):
+        model, choices, rewards, post = e_step
+        gamma = np.asarray(post.smoothed_state_prob)
+        c, r = np.asarray(choices), np.asarray(rewards)
+
+        def objective(rho):
+            p = rho[:, c].T  # (T, S)
+            return np.sum(
+                gamma * (r[:, None] * np.log(p) + (1 - r[:, None]) * np.log1p(-p))
+            )
+
+        model._m_step(choices, rewards, post)
+        rho = np.asarray(model.reward_probs_)
+        eps = 1e-7
+        for s in range(2):
+            for k in range(3):
+                E = np.zeros_like(rho)
+                E[s, k] = eps
+                g = (objective(rho + E) - objective(rho - E)) / (2 * eps)
+                assert abs(g) < 1e-4, (s, k, g)
+        assert objective(rho) > objective(np.full_like(rho, 0.5))
+
+    def test_transition_rows_are_stationary_and_match_baum_welch(self, e_step):
+        from state_space_practice.contingency_belief import (
+            dirichlet_neg_log_likelihood,
+        )
+
+        model, choices, rewards, post = e_step
+        xi = np.asarray(post.pairwise_state_prob)
+        x0 = model.transition_coefficients_.transpose(1, 0, 2).reshape(2, -1)
+        model._m_step(choices, rewards, post)
+        coefs = model.transition_coefficients_
+        design = jnp.ones((xi.shape[0], 1))
+        alpha = jnp.ones((2, 2))  # concentration=1, stickiness=0
+        for i in range(2):
+            row = coefs[:, i, :].reshape(-1)
+            resp = jnp.asarray(xi[:, i, :])
+            g = jax.grad(dirichlet_neg_log_likelihood)(
+                row, design, resp, alpha[i], 1e-5
+            )
+            assert float(jnp.max(jnp.abs(g))) < 1e-5, g
+            loss_new = dirichlet_neg_log_likelihood(row, design, resp, alpha[i], 1e-5)
+            loss_old = dirichlet_neg_log_likelihood(x0[i], design, resp, alpha[i], 1e-5)
+            assert float(loss_new) <= float(loss_old)
+        Z = np.asarray(centered_softmax(coefs[0]))
+        counts = xi.sum(axis=0)
+        np.testing.assert_allclose(
+            Z, counts / counts.sum(axis=1, keepdims=True), atol=1e-5
+        )
