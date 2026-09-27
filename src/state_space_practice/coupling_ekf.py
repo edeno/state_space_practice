@@ -45,6 +45,7 @@ from state_space_practice.coupling_model import (
 from state_space_practice.coupling_validation import CouplingPosterior
 from state_space_practice.point_process_kalman import (
     BERNOULLI_LOGIT_FAMILY,
+    _warn_line_search_failures,
     glm_laplace_update,
 )
 
@@ -65,7 +66,8 @@ def _regress_coupling_all_neurons(
     and differ only in their spike column and baseline, so the whole
     population is one ``jax.vmap`` over neurons under one ``jax.jit``: the
     Newton / line-search scan inside :func:`glm_laplace_update` is traced
-    and compiled once for the whole population.
+    and compiled once for the whole population. A warning is logged when more
+    than 10% of the regressions exhaust their line search.
 
     Parameters
     ----------
@@ -91,7 +93,7 @@ def _regress_coupling_all_neurons(
         def eta(beta: Array) -> Array:
             return baseline_n + smoothed_latent @ beta
 
-        beta_mean, beta_cov, _ = glm_laplace_update(
+        beta_mean, beta_cov, _, n_failed = glm_laplace_update(
             prior_mean,
             prior_cov,
             spikes_n,
@@ -99,10 +101,19 @@ def _regress_coupling_all_neurons(
             BERNOULLI_LOGIT_FAMILY,
             grad_eta_func=constant_jacobian,
             max_newton_iter=max_newton_iter,
+            return_line_search_failures=True,
         )
-        return beta_mean, beta_cov
+        return beta_mean, beta_cov, n_failed
 
-    return jax.vmap(_fit_one, in_axes=(1, 0))(spikes, baseline)
+    beta_mean, beta_cov, n_failed = jax.vmap(_fit_one, in_axes=(1, 0))(spikes, baseline)
+    _warn_line_search_failures(
+        jnp.sum(n_failed > 0),
+        spikes.shape[1],
+        max_newton_iter,
+        "fit_coupling_ekf",
+        unit="neuron regressions",
+    )
+    return beta_mean, beta_cov
 
 
 def fit_coupling_ekf(

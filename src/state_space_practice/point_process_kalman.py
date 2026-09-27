@@ -802,34 +802,72 @@ def _fisher_scoring_line_search(
     return x, post_prec, n_failed
 
 
-def _warn_line_search_failures(
-    n_failed_bins: Array, n_bins: int, max_newton_iter: int, filter_name: str
+def _log_line_search_failures(
+    n_failed: Array, *, n_units: int, max_newton_iter: int, name: str, unit: str
 ) -> None:
-    """Log once (host side) when many bins exhausted the line search.
-
-    ``n_failed_bins`` counts the time bins (summed over neurons on the block
-    path) in which at least one Fisher iteration exhausted its backtracking
-    with a non-negligible predicted decrease. Silent under tracing and for
-    ``max_newton_iter <= 1`` (no line search runs).
-    """
-    if max_newton_iter <= 1 or n_bins == 0 or contains_tracer(n_failed_bins):
-        return
-    n_failed = int(n_failed_bins)
-    frac = n_failed / n_bins
+    """Host-side logger for :func:`_warn_line_search_failures`."""
+    n = int(np.sum(np.asarray(n_failed)))
+    frac = n / n_units
     if frac > _LINE_SEARCH_FAIL_WARN_FRAC:
         logger.warning(
             "%s: the Fisher-scoring line search exhausted its %d backtracking "
-            "steps in %d/%d (%.1f%%) time bins with max_newton_iter=%d; those "
-            "bins kept a non-converged posterior mode. This usually means a "
+            "steps in %d/%d (%.1f%%) %s with max_newton_iter=%d; those "
+            "updates kept a non-converged posterior mode. This usually means a "
             "poorly scaled or misspecified intensity (check the design matrix "
             "and max_log_count).",
-            filter_name,
+            name,
             _LINE_SEARCH_MAX_BACKTRACKS,
-            n_failed,
-            n_bins,
+            n,
+            n_units,
             100.0 * frac,
+            unit,
             max_newton_iter,
         )
+
+
+def _warn_line_search_failures(
+    n_failed_bins: Array,
+    n_bins: int,
+    max_newton_iter: int,
+    filter_name: str,
+    unit: str = "time bins",
+) -> None:
+    """Log (host side, jit-safe) when many updates exhausted the line search.
+
+    ``n_failed_bins`` counts the updates (time bins, summed over neurons on
+    the block path; or independent regressions) in which at least one Fisher
+    iteration exhausted its backtracking with a non-negligible predicted
+    decrease. A warning is logged when ``n_failed_bins / n_bins`` exceeds
+    ``_LINE_SEARCH_FAIL_WARN_FRAC``. The check runs through
+    :func:`jax.debug.callback`, so it reports eagerly and from inside
+    ``jax.jit`` / ``jax.grad`` (e.g. an SGD loss) alike. Silent for
+    ``max_newton_iter <= 1`` (no line search runs).
+
+    Parameters
+    ----------
+    n_failed_bins : Array
+        Integer scalar count of failed updates.
+    n_bins : int
+        Number of updates the count is out of (static).
+    max_newton_iter : int
+        Fisher-scoring iterations per update (static).
+    filter_name : str
+        Name of the calling routine, used in the log message.
+    unit : str, default="time bins"
+        What one update is, used in the log message.
+    """
+    if max_newton_iter <= 1 or n_bins == 0:
+        return
+    jax.debug.callback(
+        functools.partial(
+            _log_line_search_failures,
+            n_units=n_bins,
+            max_newton_iter=max_newton_iter,
+            name=filter_name,
+            unit=unit,
+        ),
+        n_failed_bins,
+    )
 
 
 def _point_process_laplace_update(
@@ -1211,7 +1249,8 @@ def glm_laplace_update(
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
-) -> tuple[Array, Array, Array]:
+    return_line_search_failures: bool = False,
+) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]:
     """Family-generic Laplace measurement update via Fisher scoring.
 
     Generalizes :func:`_point_process_laplace_update` to any :class:`GLMFamily`
@@ -1235,7 +1274,7 @@ def glm_laplace_update(
     family : GLMFamily
         Observation family (e.g. :data:`BERNOULLI_LOGIT_FAMILY`).
     diagonal_boost, grad_eta_func, include_laplace_normalization, max_newton_iter,
-    line_search_beta
+    line_search_beta, return_line_search_failures
         As in :func:`_point_process_laplace_update`.
 
     Returns
@@ -1244,6 +1283,10 @@ def glm_laplace_update(
     posterior_cov : Array, shape (n_latent, n_latent)
     log_likelihood : Array
         Approximate ``log p(y_t | y_{1:t-1})`` (Laplace expansion) if normalized.
+    n_line_search_failures : Array, optional
+        Only with ``return_line_search_failures=True`` (int32 scalar): the
+        Fisher iterations whose backtracking was exhausted (see
+        :func:`_fisher_scoring_line_search`).
     """
     if grad_eta_func is None:
         grad_eta_func = jax.jacfwd(eta_func)
@@ -1294,14 +1337,17 @@ def glm_laplace_update(
         posterior_precision = symmetrize(prior_precision + fisher_info)
         post_cho = psd_cholesky(posterior_precision, diagonal_boost=diagonal_boost)
         posterior_mean = one_step_mean + jax.scipy.linalg.cho_solve(post_cho, gradient)
+        n_line_search_failures = jnp.zeros((), dtype=jnp.int32)
     else:
-        posterior_mean, posterior_precision, _ = _fisher_scoring_line_search(
-            one_step_mean,
-            prior_precision,
-            _fisher_step_at,
-            _neg_log_posterior,
-            max_newton_iter,
-            line_search_beta,
+        posterior_mean, posterior_precision, n_line_search_failures = (
+            _fisher_scoring_line_search(
+                one_step_mean,
+                prior_precision,
+                _fisher_step_at,
+                _neg_log_posterior,
+                max_newton_iter,
+                line_search_beta,
+            )
         )
         post_cho = psd_cholesky(posterior_precision, diagonal_boost=diagonal_boost)
 
@@ -1321,6 +1367,8 @@ def glm_laplace_update(
         log_prior = -0.5 * quad - 0.5 * logdet_prior
         log_likelihood = log_likelihood + log_prior + 0.5 * logdet_post
 
+    if return_line_search_failures:
+        return posterior_mean, posterior_cov, log_likelihood, n_line_search_failures
     return posterior_mean, posterior_cov, log_likelihood
 
 

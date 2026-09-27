@@ -108,7 +108,10 @@ from state_space_practice.parameter_transforms import (
     STOCHASTIC_ROW,
     UNCONSTRAINED,
 )
-from state_space_practice.point_process_kalman import _point_process_laplace_update
+from state_space_practice.point_process_kalman import (
+    _point_process_laplace_update,
+    _warn_line_search_failures,
+)
 from state_space_practice.sgd_fitting import (
     SGDFittableMixin,
     reconstruct_per_state_array,
@@ -484,7 +487,8 @@ def point_process_kalman_update(
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
-) -> tuple[Array, Array, Array]:
+    return_line_search_failures: bool = False,
+) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]:
     """Single point-process Laplace-EKF update for multiple neurons.
 
     Performs a Bayesian update of the latent state posterior given observed
@@ -529,6 +533,10 @@ def point_process_kalman_update(
         If True, include the Laplace normalization and prior terms to approximate
         log p(y_t | y_{1:t-1}). If False, return the plug-in log-likelihood
         at the posterior mode without normalization.
+    return_line_search_failures : bool, default=False
+        If True, also return the number of Fisher iterations whose
+        backtracking line search was exhausted (int32 scalar; always 0 for
+        ``max_newton_iter <= 1``).
 
     Returns
     -------
@@ -538,6 +546,8 @@ def point_process_kalman_update(
         Updated state covariance after incorporating spike observations
     log_likelihood : Array
         Log p(y_t | y_{1:t-1}) approximated at posterior mode (scalar array)
+    n_line_search_failures : Array, optional
+        Only with ``return_line_search_failures=True``.
 
     Notes
     -----
@@ -585,6 +595,7 @@ def point_process_kalman_update(
         include_laplace_normalization=include_laplace_normalization,
         max_newton_iter=max_newton_iter,
         line_search_beta=line_search_beta,
+        return_line_search_failures=return_line_search_failures,
     )
 
 
@@ -601,7 +612,8 @@ def _point_process_predict_and_update(
     max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
     grad_log_intensity_func: Callable[[Array, SpikeObsParams], Array] | None = None,
-) -> tuple[Array, Array, Array]:
+    return_line_search_failures: bool = False,
+) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]:
     """Predict with dynamics, then update with spike observations.
 
     This function combines the one-step prediction (using dynamics parameters)
@@ -634,6 +646,8 @@ def _point_process_predict_and_update(
         If None, computed inside the update via jax.jacfwd.
         Pre-computing and passing this avoids redundant autodiff
         when called inside scan + vmap.
+    return_line_search_failures : bool, default=False
+        As in :func:`point_process_kalman_update`.
 
     Returns
     -------
@@ -666,6 +680,7 @@ def _point_process_predict_and_update(
         include_laplace_normalization=include_laplace_normalization,
         max_newton_iter=max_newton_iter,
         line_search_beta=line_search_beta,
+        return_line_search_failures=return_line_search_failures,
     )
 
 
@@ -681,7 +696,8 @@ def _point_process_update_per_discrete_state_pair(
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
-) -> tuple[Array, Array, Array]:
+    return_line_search_failures: bool = False,
+) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]:
     """Compute pair-conditional posteriors for all (i, j) state pairs.
 
     This function vmaps over both:
@@ -709,6 +725,8 @@ def _point_process_update_per_discrete_state_pair(
         Function mapping (state, params) to log-intensities (n_neurons,).
     spike_params : SpikeObsParams
         Spike observation parameters (baseline, weights).
+    return_line_search_failures : bool, default=False
+        As in :func:`point_process_kalman_update`.
 
     Returns
     -------
@@ -720,6 +738,8 @@ def _point_process_update_per_discrete_state_pair(
     pair_cond_log_likelihood : Array, shape (n_discrete_states, n_discrete_states)
         Pair-conditional log-likelihoods. pair_cond_log_likelihood[i, j] is
         log p(y_t | y_{1:t-1}, S_{t-1}=i, S_t=j).
+    pair_n_line_search_failures : Array, shape (n_discrete_states, n_discrete_states)
+        Only with ``return_line_search_failures=True`` (int32).
     """
 
     n_discrete_states = continuous_transition_matrix.shape[-1]
@@ -745,11 +765,12 @@ def _point_process_update_per_discrete_state_pair(
             max_newton_iter,
             line_search_beta,
             grad_log_intensity_func=_grad_log_intensity,
+            return_line_search_failures=return_line_search_failures,
         )
 
     def _update_for_state_j(
         state_index: Array, A: Array, Q: Array
-    ) -> tuple[Array, Array, Array]:
+    ) -> tuple[Array, ...]:
         """Update for a single next-state j, vmapped over previous states i."""
         params_j = _select_spike_params(spike_params, state_index)
         return jax.vmap(
@@ -765,8 +786,8 @@ def _point_process_update_per_discrete_state_pair(
         out_axes=-1,
     )
 
-    result: tuple[Array, Array, Array] = vmapped_update(
-        state_indices, continuous_transition_matrix, process_cov
+    result: tuple[Array, Array, Array] | tuple[Array, Array, Array, Array] = (
+        vmapped_update(state_indices, continuous_transition_matrix, process_cov)
     )
     return result
 
@@ -782,7 +803,7 @@ def _first_timestep_point_process_update(
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
-) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array, Array, Array, Array, Array]:
     """Handle first timestep with x₁ convention (update only, no prediction).
 
     For the first observation y₁, we treat init_state_cond_mean/cov as p(x₁ | S₁)
@@ -826,6 +847,9 @@ def _first_timestep_point_process_update(
         uniform because S₀ does not exist under the x₁ convention.
     marginal_log_likelihood : Array
         Log p(y₁) contribution (scalar array)
+    n_line_search_failures : Array, shape (n_discrete_states,)
+        Per-state number of Fisher iterations whose backtracking was
+        exhausted (int32).
     """
     n_discrete_states = init_state_cond_mean.shape[-1]
 
@@ -835,7 +859,7 @@ def _first_timestep_point_process_update(
 
     def _update_for_state_j(
         prior_mean: Array, prior_cov: Array, state_index: Array
-    ) -> tuple[Array, Array, Array]:
+    ) -> tuple[Array, ...]:
         """Apply observation update for a single discrete state j."""
         params_j = _select_spike_params(spike_params, state_index)
         return point_process_kalman_update(
@@ -848,15 +872,19 @@ def _first_timestep_point_process_update(
             include_laplace_normalization=include_laplace_normalization,
             max_newton_iter=max_newton_iter,
             line_search_beta=line_search_beta,
+            return_line_search_failures=True,
         )
 
     # vmap over discrete states
     vmapped_update = jax.vmap(
-        _update_for_state_j, in_axes=(-1, -1, 0), out_axes=(-1, -1, -1)
+        _update_for_state_j, in_axes=(-1, -1, 0), out_axes=(-1, -1, -1, -1)
     )
-    state_cond_filter_mean, state_cond_filter_cov, state_cond_log_lik = vmapped_update(
-        init_state_cond_mean, init_state_cond_cov, state_indices
-    )
+    (
+        state_cond_filter_mean,
+        state_cond_filter_cov,
+        state_cond_log_lik,
+        n_line_search_failures,
+    ) = vmapped_update(init_state_cond_mean, init_state_cond_cov, state_indices)
 
     # Zero-preserving log-space discrete posterior, shared with the Gaussian
     # first-step (switching_kalman._first_timestep_discrete_update): honors a
@@ -890,6 +918,7 @@ def _first_timestep_point_process_update(
         pair_cond_filter_cov,
         pair_cond_filter_prob,
         marginal_log_likelihood,
+        n_line_search_failures,
     )
 
 
@@ -2221,10 +2250,10 @@ def _switching_point_process_filter_jit(
     )
 
     def _step(
-        carry: tuple[Array, Array, Array, Array, Array],
+        carry: tuple[Array, Array, Array, Array, Array, Array],
         y_t: Array,
     ) -> tuple[
-        tuple[Array, Array, Array, Array, Array],
+        tuple[Array, Array, Array, Array, Array, Array],
         tuple[Array, Array, Array, Array, Array, Array],
     ]:
         """One step of the switching point-process filter.
@@ -2240,6 +2269,11 @@ def _switching_point_process_filter_jit(
                 Previous discrete state probabilities.
             marginal_log_likelihood : Array
                 Accumulated marginal log-likelihood (scalar array).
+            prev_support : Array, shape (n_discrete_states,)
+                Structural support of the previous discrete state.
+            n_failed_bins : Array
+                Time bins so far in which some pair update exhausted its
+                line search (int32 scalar).
         y_t : Array, shape (n_neurons,)
             Spike counts at current timestep.
 
@@ -2254,6 +2288,8 @@ def _switching_point_process_filter_jit(
                 Posterior discrete state probabilities.
             marginal_log_likelihood : Array
                 Updated accumulated marginal log-likelihood (scalar array).
+            next_support, n_failed_bins : Array
+                Updated support and failed-bin count.
         stack : tuple
             state_cond_filter_mean : Array, shape (n_latent, n_discrete_states)
                 Posterior state-conditional means.
@@ -2270,6 +2306,7 @@ def _switching_point_process_filter_jit(
             prev_filter_discrete_prob,
             marginal_log_likelihood,
             prev_support,
+            n_failed_bins,
         ) = carry
 
         # 1. Compute pair-conditional posteriors p(x_t | y_{1:t}, S_{t-1}=i, S_t=j)
@@ -2278,6 +2315,7 @@ def _switching_point_process_filter_jit(
             pair_cond_filter_mean,
             pair_cond_filter_cov,
             pair_cond_log_likelihood,
+            pair_n_failed,
         ) = _point_process_update_per_discrete_state_pair(
             prev_state_cond_filter_mean,
             prev_state_cond_filter_cov,
@@ -2290,7 +2328,9 @@ def _switching_point_process_filter_jit(
             include_laplace_normalization,
             max_newton_iter,
             line_search_beta,
+            return_line_search_failures=True,
         )
+        n_failed_bins = n_failed_bins + jnp.any(pair_n_failed > 0).astype(jnp.int32)
 
         # 2-3. Log-space, support-masked discrete update (HMM forward step; see
         #      switching_kalman._update_discrete_state_probabilities).
@@ -2328,6 +2368,7 @@ def _switching_point_process_filter_jit(
             filter_discrete_prob,
             marginal_log_likelihood,
             next_support,
+            n_failed_bins,
         ), (
             state_cond_filter_mean,
             state_cond_filter_cov,
@@ -2347,6 +2388,7 @@ def _switching_point_process_filter_jit(
         first_pair_cond_cov,
         first_pair_cond_prob,
         first_log_lik,
+        first_n_failed,
     ) = _first_timestep_point_process_update(
         init_state_cond_mean,
         init_state_cond_cov,
@@ -2369,7 +2411,7 @@ def _switching_point_process_filter_jit(
     # Run predict-then-update for t=2,...,T
     # jax.lax.scan handles empty inputs (spikes[1:] when n_time=1) gracefully
     (
-        (_, _, _, marginal_log_likelihood, _),
+        (_, _, _, marginal_log_likelihood, _, n_failed_bins),
         (
             rest_state_cond_filter_mean,
             rest_state_cond_filter_cov,
@@ -2386,8 +2428,15 @@ def _switching_point_process_filter_jit(
             first_discrete_prob,
             first_log_lik,
             first_support,
+            jnp.any(first_n_failed > 0).astype(jnp.int32),
         ),
         spikes[1:],
+    )
+    _warn_line_search_failures(
+        n_failed_bins,
+        spikes.shape[0],
+        max_newton_iter,
+        "switching_point_process_filter",
     )
 
     # Prepend first timestep results

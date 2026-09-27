@@ -34,6 +34,7 @@ from state_space_practice.kalman import rts_backward_scan_with_predictions
 from state_space_practice.point_process_kalman import (
     _point_process_laplace_update,
     _safe_expected_count,
+    _warn_line_search_failures,
 )
 from state_space_practice.utils import (
     psd_solve,
@@ -985,6 +986,9 @@ def _run_filter_scan(
     ``sigma_track`` or ``dt`` grid search) reuses one compilation; only the
     shapes and the static structural flags trigger a retrace.
 
+    Logs a warning (from inside the jitted scan) when more than 10% of the
+    time bins exhaust the Fisher-scoring line search.
+
     Returns
     -------
     filtered_mean : Array, shape (n_time, n_state)
@@ -1064,7 +1068,7 @@ def _run_filter_scan(
     _penalty_value_fn = _penalty_at
 
     def _step(carry, spike_t):
-        mean_prev, cov_prev, total_ll = carry
+        mean_prev, cov_prev, total_ll, n_failed_bins = carry
 
         # Prediction
         one_step_mean = A @ mean_prev
@@ -1111,7 +1115,7 @@ def _run_filter_scan(
             # (alpha - 1) A P A' + alpha Q), so the smoother must see it.
             dynamics_cov = dynamics_cov * alpha_t
 
-        post_mean, post_cov, ll = _point_process_laplace_update(
+        post_mean, post_cov, ll, n_failed = _point_process_laplace_update(
             one_step_mean,
             one_step_cov,
             spike_t,
@@ -1121,10 +1125,12 @@ def _run_filter_scan(
             diagonal_boost=_DECODER_DIAGONAL_BOOST,
             include_laplace_normalization=True,
             max_newton_iter=max_newton_iter,
+            return_line_search_failures=True,
         )
 
         total_ll = total_ll + ll
-        return (post_mean, post_cov, total_ll), (
+        n_failed_bins = n_failed_bins + (n_failed > 0).astype(jnp.int32)
+        return (post_mean, post_cov, total_ll, n_failed_bins), (
             post_mean,
             post_cov,
             dynamics_mean,
@@ -1132,14 +1138,20 @@ def _run_filter_scan(
         )
 
     (
-        (_, _, marginal_ll),
+        (_, _, marginal_ll, n_failed_bins),
         (
             filtered_mean,
             filtered_cov,
             predicted_mean,
             predicted_cov,
         ),
-    ) = jax.lax.scan(_step, init_carry, spikes_arr)
+    ) = jax.lax.scan(_step, (*init_carry, jnp.zeros((), dtype=jnp.int32)), spikes_arr)
+    _warn_line_search_failures(
+        n_failed_bins,
+        spikes_arr.shape[0],
+        max_newton_iter,
+        "position_decoder_filter",
+    )
     return filtered_mean, filtered_cov, marginal_ll, predicted_mean, predicted_cov
 
 

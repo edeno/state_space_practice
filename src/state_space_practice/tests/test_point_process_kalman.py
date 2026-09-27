@@ -29,9 +29,12 @@ from state_space_practice.point_process_kalman import (
     _stochastic_point_process_filter_block_diagonal,
     _stochastic_point_process_smoother_block_diagonal,
     _validate_filter_numerics,
+    _warn_line_search_failures,
     dynamics_only_m_step,
     get_confidence_interval,
+    glm_laplace_update,
     log_conditional_intensity,
+    poisson_family,
     steepest_descent_point_process_filter,
     stochastic_point_process_filter,
     stochastic_point_process_smoother,
@@ -4995,6 +4998,36 @@ class TestLaplaceNormaliser:
         )
 
 
+@jax.custom_jvp
+def _sign_flipped_log_rate(design, x):
+    """Linear log-rate ``design @ x`` whose derivative has the wrong sign, so
+    every Fisher step points uphill and each line search is exhausted."""
+    return design @ x
+
+
+@_sign_flipped_log_rate.defjvp
+def _sign_flipped_log_rate_jvp(primals, tangents):
+    design, x = primals
+    _, dx = tangents
+    return design @ x, -(design @ dx)
+
+
+def _line_search_failure_problem(n_time: int = 30):
+    """Positional filter arguments (before the log-intensity) for a small
+    two-neuron, two-state problem."""
+    rng = np.random.default_rng(0)
+    Z = jnp.asarray(rng.normal(size=(n_time, 2, 2)))
+    y = jnp.asarray(rng.poisson(3.0, size=(n_time, 2)))
+    return (jnp.zeros(2), jnp.eye(2), Z, y, 0.1, jnp.eye(2), jnp.eye(2) * 0.1)
+
+
+_PPK_LOGGER = "state_space_practice.point_process_kalman"
+
+
+def _line_search_warned(caplog) -> bool:
+    return any("line search" in r.getMessage() for r in caplog.records)
+
+
 class TestArmijoLineSearch:
     """The Fisher-scoring line search enforces sufficient decrease and counts
     exhausted backtracks."""
@@ -5066,36 +5099,91 @@ class TestArmijoLineSearch:
     def test_filter_logs_when_many_bins_fail(self, caplog) -> None:
         """A log-intensity whose derivative has the wrong sign makes every
         bin's line search fail; the public filter logs one warning."""
-
-        @jax.custom_jvp
-        def bad_log_rate(design, x):
-            return design @ x
-
-        @bad_log_rate.defjvp
-        def _bad_jvp(primals, tangents):
-            design, x = primals
-            _, dx = tangents
-            return design @ x, -(design @ dx)
-
-        rng = np.random.default_rng(0)
-        n_time = 30
-        Z = jnp.asarray(rng.normal(size=(n_time, 2, 2)))
-        y = jnp.asarray(rng.poisson(3.0, size=(n_time, 2)))
-        args = (jnp.zeros(2), jnp.eye(2), Z, y, 0.1, jnp.eye(2), jnp.eye(2) * 0.1)
-        with caplog.at_level(
-            "WARNING", logger="state_space_practice.point_process_kalman"
-        ):
-            stochastic_point_process_filter(*args, bad_log_rate, max_newton_iter=3)
-        assert any("line search" in r.getMessage() for r in caplog.records)
+        args = _line_search_failure_problem()
+        with caplog.at_level("WARNING", logger=_PPK_LOGGER):
+            stochastic_point_process_filter(
+                *args, _sign_flipped_log_rate, max_newton_iter=3
+            )
+        assert _line_search_warned(caplog)
         # guard: a correct intensity with the same data does not warn.
         caplog.clear()
-        with caplog.at_level(
-            "WARNING", logger="state_space_practice.point_process_kalman"
-        ):
+        with caplog.at_level("WARNING", logger=_PPK_LOGGER):
             stochastic_point_process_filter(
                 *args, log_conditional_intensity, max_newton_iter=3
             )
-        assert not any("line search" in r.getMessage() for r in caplog.records)
+        assert not _line_search_warned(caplog)
+
+    @pytest.mark.parametrize(
+        ("n_failed", "n_bins", "max_newton_iter", "warns"),
+        [
+            (10, 100, 3, False),  # exactly 10%: not above the threshold
+            (11, 100, 3, True),
+            (100, 100, 1, False),  # no line search runs at one iteration
+            (0, 0, 3, False),
+        ],
+    )
+    def test_warning_threshold(
+        self, caplog, n_failed, n_bins, max_newton_iter, warns
+    ) -> None:
+        with caplog.at_level("WARNING", logger=_PPK_LOGGER):
+            _warn_line_search_failures(
+                jnp.asarray(n_failed, dtype=jnp.int32), n_bins, max_newton_iter, "f"
+            )
+        assert _line_search_warned(caplog) is warns
+        if warns:
+            assert f"{n_failed}/{n_bins}" in caplog.text
+
+    def test_warning_threshold_under_jit(self, caplog) -> None:
+        @jax.jit
+        def report(n_failed):
+            _warn_line_search_failures(n_failed, 100, 3, "f")
+            return n_failed
+
+        with caplog.at_level("WARNING", logger=_PPK_LOGGER):
+            report(jnp.asarray(10, dtype=jnp.int32))
+        assert not _line_search_warned(caplog)
+        with caplog.at_level("WARNING", logger=_PPK_LOGGER):
+            report(jnp.asarray(11, dtype=jnp.int32))
+        assert _line_search_warned(caplog)
+
+    def test_traced_filter_reports_failures(self, caplog) -> None:
+        """Under ``jax.jit`` / ``jax.grad`` (an SGD loss) the filter still
+        reports exhausted line searches."""
+        init_mean, *rest = _line_search_failure_problem()
+
+        def neg_ll(mean0):
+            _, _, ll = stochastic_point_process_filter(
+                mean0, *rest, _sign_flipped_log_rate, max_newton_iter=3
+            )
+            return -ll
+
+        with caplog.at_level("WARNING", logger=_PPK_LOGGER):
+            jax.jit(jax.grad(neg_ll))(init_mean)
+        assert _line_search_warned(caplog)
+
+    def test_glm_laplace_update_returns_failure_count(self) -> None:
+        rng = np.random.default_rng(0)
+        design = jnp.asarray(rng.normal(size=(2, 2)))
+        y = jnp.asarray(rng.poisson(3.0, size=2)).astype(float)
+        common = (jnp.zeros(2), jnp.eye(2), y)
+        family = poisson_family(0.1)
+
+        *_, n_bad = glm_laplace_update(
+            *common,
+            lambda x: _sign_flipped_log_rate(design, x),
+            family,
+            max_newton_iter=3,
+            return_line_search_failures=True,
+        )
+        *_, n_good = glm_laplace_update(
+            *common,
+            lambda x: design @ x,
+            family,
+            max_newton_iter=3,
+            return_line_search_failures=True,
+        )
+        assert int(n_bad) == 3
+        assert int(n_good) == 0
 
 
 class TestPointProcessModelNonFiniteFirstEStep:

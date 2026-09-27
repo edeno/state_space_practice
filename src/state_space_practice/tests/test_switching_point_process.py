@@ -10104,6 +10104,66 @@ def test_spike_glm_update_warns_on_newton_fallback(monkeypatch) -> None:
     assert float(jnp.max(jnp.abs(updated.baseline - params0.baseline))) > 0.0
 
 
+@jax.custom_jvp
+def _sign_flipped_switching_log_rate(state: Array, params: SpikeObsParams) -> Array:
+    """Linear log-rate whose state derivative has the wrong sign, so every
+    Fisher step points uphill and each line search is exhausted."""
+    return params.baseline + params.weights @ state
+
+
+@_sign_flipped_switching_log_rate.defjvp
+def _sign_flipped_switching_log_rate_jvp(primals, tangents):
+    state, params = primals
+    d_state, _ = tangents
+    return (
+        params.baseline + params.weights @ state,
+        -(params.weights @ d_state),
+    )
+
+
+def test_switching_filter_reports_line_search_failures(caplog) -> None:
+    """The (jitted) switching filter logs when most bins exhaust the line
+    search, and stays silent for a well-posed intensity on the same data."""
+    from state_space_practice.switching_point_process import (
+        _linear_log_intensity,
+        switching_point_process_filter,
+    )
+
+    rng = np.random.default_rng(0)
+    n_time, n_latent, n_neurons, n_disc = 30, 2, 3, 2
+    params = SpikeObsParams(
+        baseline=jnp.full(n_neurons, 3.0),
+        weights=jnp.asarray(rng.normal(size=(n_neurons, n_latent))),
+    )
+    spikes = jnp.asarray(rng.poisson(2.0, size=(n_time, n_neurons))).astype(float)
+
+    def run(log_rate):
+        return switching_point_process_filter(
+            jnp.zeros((n_latent, n_disc)),
+            jnp.stack([jnp.eye(n_latent)] * n_disc, axis=-1),
+            jnp.full(n_disc, 1.0 / n_disc),
+            spikes,
+            jnp.array([[0.9, 0.1], [0.1, 0.9]]),
+            jnp.stack([0.9 * jnp.eye(n_latent)] * n_disc, axis=-1),
+            jnp.stack([0.1 * jnp.eye(n_latent)] * n_disc, axis=-1),
+            0.1,
+            log_rate,
+            params,
+            max_newton_iter=3,
+        )
+
+    logger_name = "state_space_practice.point_process_kalman"
+    with caplog.at_level("WARNING", logger=logger_name):
+        run(_sign_flipped_switching_log_rate)
+    assert "switching_point_process_filter: the Fisher-scoring line search" in (
+        caplog.text
+    )
+    caplog.clear()
+    with caplog.at_level("WARNING", logger=logger_name):
+        run(_linear_log_intensity)
+    assert "line search" not in caplog.text
+
+
 def test_spike_oscillator_default_transition_diag_uses_default_float() -> None:
     from state_space_practice.switching_point_process import (
         SwitchingSpikeOscillatorModel,
