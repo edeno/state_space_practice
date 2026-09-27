@@ -1875,9 +1875,6 @@ class SmithLearningModel(SGDFittableMixin):
             for k in posterior_keys:
                 setattr(self, k, None)
 
-        def _warn(msg: str) -> None:
-            logger.warning(msg)
-
         def _on_iteration(iteration: int, ll: float, change: float) -> None:
             # verbose=True surfaces per-iteration progress at INFO; otherwise DEBUG.
             logger.log(
@@ -1903,7 +1900,6 @@ class SmithLearningModel(SGDFittableMixin):
             m_step_on_convergence=True,
             logger=logger,
             on_iteration=_on_iteration,
-            warn=_warn,
         )
         log_likelihoods = result.log_likelihoods
         if result.converged and verbose:
