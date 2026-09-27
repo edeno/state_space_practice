@@ -4,6 +4,8 @@ This module tests point process filters and smoothers for neural encoding,
 including stochastic filters, smoothers, and steepest descent methods.
 """
 
+import warnings
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -4231,10 +4233,17 @@ class TestBlockDiagonalCovarianceContainer:
             np.diagonal(dense, axis1=1, axis2=2),
             atol=1e-12,
         )
-        with pytest.raises((TypeError, ValueError)):
-            jnp.sum(cov)
-        with pytest.raises((TypeError, ValueError)):
-            jax.jit(lambda x: x)(cov)
+        # jax >= 0.7 rejects the container outright; jax 0.6 (the Python 3.10
+        # resolution) instead densifies it through the deprecated
+        # ``__jax_array__`` abstractification path and warns, which the test
+        # configuration turns into an error. Both count as "rejected".
+        rejected = (TypeError, ValueError, DeprecationWarning)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            with pytest.raises(rejected):
+                jnp.sum(cov)
+            with pytest.raises(rejected):
+                jax.jit(lambda x: x)(cov)
 
 
 # ============================================================================
