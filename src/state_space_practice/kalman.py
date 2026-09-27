@@ -311,11 +311,7 @@ def _validate_kalman_public_inputs(
             f"{n_obs}); got {measurement_cov.shape}."
         )
 
-    # Value checks need concrete arrays: skip them when any input is traced
-    # (bool()/float() on a tracer raises), but still report a
-    # non-positive-definite init_cov from inside the computation. The shape
-    # checks above are static and always run.
-    if contains_tracer(
+    arrays = (
         init_mean,
         init_cov,
         obs,
@@ -323,19 +319,17 @@ def _validate_kalman_public_inputs(
         process_cov,
         measurement_matrix,
         measurement_cov,
-    ):
+    )
+
+    # Value checks need concrete arrays: skip them when any input is traced
+    # (bool()/float() on a tracer raises), but still report a
+    # non-positive-definite init_cov from inside the computation. The shape
+    # checks above are static and always run.
+    if contains_tracer(*arrays):
         warn_if_not_positive_definite_in_graph(
             init_cov, name="init_cov", filter_name=filter_name
         )
-        return (
-            init_mean,
-            init_cov,
-            obs,
-            transition_matrix,
-            process_cov,
-            measurement_matrix,
-            measurement_cov,
-        )
+        return arrays
 
     # Inside an active trace (concrete constants closed over by a jitted
     # caller) evaluate eagerly so the results stay concrete.
@@ -382,31 +376,18 @@ def _validate_kalman_public_inputs(
                     f"step; the minimum eigenvalue is {min_slice_eig} at "
                     f"time step {worst_time}."
                 )
-            _validate_filter_numerics(
-                init_cov,
-                n_time=int(n_time),
-                stacklevel=4,
-                filter_name=filter_name,
-                process_cov=process_cov,
-            )
-        else:
-            _validate_filter_numerics(
-                init_cov,
-                n_time=int(n_time),
-                stacklevel=4,
-                filter_name=filter_name,
-                measurement_cov=measurement_cov,
-                process_cov=process_cov,
-            )
-    return (
-        init_mean,
-        init_cov,
-        obs,
-        transition_matrix,
-        process_cov,
-        measurement_matrix,
-        measurement_cov,
-    )
+        _validate_filter_numerics(
+            init_cov,
+            n_time=int(n_time),
+            stacklevel=4,
+            filter_name=filter_name,
+            # A time-varying R was checked slice by slice above.
+            measurement_cov=(
+                None if measurement_cov_is_time_varying else measurement_cov
+            ),
+            process_cov=process_cov,
+        )
+    return arrays
 
 
 @jax.jit
