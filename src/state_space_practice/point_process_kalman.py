@@ -673,7 +673,8 @@ def _soft_expected_count_and_log(
 
 #: Armijo sufficient-decrease constant of the Fisher-scoring line search.
 _ARMIJO_C = 1e-4
-#: Number of step halvings (x ``line_search_beta``) tried per Fisher iteration.
+#: Number of trial step sizes ``1, beta, ..., beta**(N - 1)`` (``beta`` is
+#: ``line_search_beta``) evaluated per Fisher iteration.
 _LINE_SEARCH_MAX_BACKTRACKS = 10
 #: Fraction of time bins whose backtracking may be exhausted before the public
 #: filters log a warning.
@@ -697,9 +698,9 @@ def _fisher_scoring_line_search(
     ``gradient`` the gradient of the log-posterior -- and
     ``neg_log_posterior(x)`` the objective ``f`` the line search decreases.
 
-    A step size ``alpha`` (``1, beta, beta^2, ...``, at most
-    ``_LINE_SEARCH_MAX_BACKTRACKS`` halvings) is accepted when it satisfies
-    the Armijo condition ``f(x + alpha delta) <= f(x) - c alpha gradient'
+    The trial step sizes are ``alpha = 1, beta, ..., beta^(N-1)`` with
+    ``N = _LINE_SEARCH_MAX_BACKTRACKS``; the largest is accepted that
+    satisfies the Armijo condition ``f(x + alpha delta) <= f(x) - c alpha gradient'
     delta`` with ``c = _ARMIJO_C``, up to a round-off slack of
     ``1e-12 (1 + |f(x)|)`` so a converged point still takes its (negligible)
     full step instead of freezing. Because ``post_prec`` is positive definite,
@@ -811,8 +812,8 @@ def _log_line_search_failures(
     frac = n / n_units
     if frac > _LINE_SEARCH_FAIL_WARN_FRAC:
         logger.warning(
-            "%s: the Fisher-scoring line search exhausted its %d backtracking "
-            "steps in %d/%d (%.1f%%) %s with max_newton_iter=%d; those "
+            "%s: the Fisher-scoring line search rejected all %d trial step "
+            "sizes in %d/%d (%.1f%%) %s with max_newton_iter=%d; those "
             "updates kept a non-converged posterior mode. This usually means a "
             "poorly scaled or misspecified intensity (check the design matrix "
             "and max_log_count).",
@@ -942,8 +943,8 @@ def _point_process_laplace_update(
         :func:`~state_space_practice.utils.psd_cholesky` (``1e-12 * |A_ii|``
         in float64), which keeps the update scale-equivariant: rescaling the
         latent state by ``c`` (all covariances by ``c**2``, the design by
-        ``1/c``) rescales the output exactly. A positive value (the former default was ``1e-9``) breaks
-        that for covariances below ``~diagonal_boost / 1e-12`` in scale.
+        ``1/c``) rescales the output exactly. A positive value breaks that
+        for covariances below ``~diagonal_boost / 1e-12`` in scale.
     grad_log_intensity_func : Callable[[Array], Array] | None, optional
         Pre-computed gradient function (Jacobian) of log_intensity_func.
         If None, computed via jax.jacfwd(log_intensity_func).
@@ -959,9 +960,13 @@ def _point_process_laplace_update(
         (Named ``max_newton_iter`` for backwards compatibility; the inner
         iterations are Fisher steps, not full Newton.)
     line_search_beta : float, default=0.5
-        Step size reduction factor for backtracking line search. Only used
-        when max_newton_iter > 1. At each iteration, step size is halved
-        until the negative log-posterior decreases or minimum alpha reached.
+        Step size reduction factor for the backtracking line search. Only
+        used when max_newton_iter > 1. Each iteration tries the step sizes
+        ``1, beta, ..., beta**(N - 1)`` (``N = _LINE_SEARCH_MAX_BACKTRACKS``)
+        and takes the largest that satisfies the Armijo sufficient-decrease
+        condition on the negative log-posterior, up to a relative round-off
+        slack; if none does, the iterate is kept (see
+        :func:`_fisher_scoring_line_search`).
     max_log_count : float, default=20.0
         Ceiling on ``log(rate * dt)`` applied inside ``_safe_expected_count``
         to prevent overflow when the Fisher step produces implausibly large
@@ -989,9 +994,10 @@ def _point_process_laplace_update(
 
     Notes
     -----
-    The Laplace approximation uses the predicted mean as the expansion point
-    for a single Fisher scoring step. For multiple neurons, the gradients
-    and Jacobians are summed across neurons.
+    The Fisher-scoring iteration starts at the predicted mean; with
+    ``max_newton_iter == 1`` it is a single step from there, otherwise up to
+    ``max_newton_iter`` line-searched steps toward the posterior mode. For
+    multiple neurons, the gradients and Jacobians are summed across neurons.
 
     For Poisson likelihood with log-link:
         log p(y | x) = sum_n [y_n * log(lambda_n * dt) - lambda_n * dt - log(y_n!)]
@@ -1403,8 +1409,8 @@ def stochastic_point_process_filter(
     $$ y_{n,k} \\sim \\text{Poisson}(\\lambda_{n,k} \\Delta t) $$
 
     The filter uses a local Gaussian approximation (Laplace-EKF approach)
-    at each update step. It implements a single Fisher-scoring step per
-    time bin: the update uses the *expected* Hessian
+    at each update step, built by ``max_newton_iter`` Fisher-scoring
+    iterations per time bin (default 3): the update uses the *expected* Hessian
     $E[\\nabla^2 \\log p]$ of the Poisson log-likelihood (equivalently, the
     negative of the inverse-intensity-weighted outer product) rather than
     the observed Hessian, which is what makes this Fisher scoring rather
@@ -1412,10 +1418,10 @@ def stochastic_point_process_filter(
     negative semidefinite, so no damping or trust-region safeguarding is
     needed for PSD of the covariance update.
 
-    If ``max_newton_iter > 1`` the same Fisher-scoring step is iterated
-    per time bin with a fixed-length Armijo backtracking scan
-    (:func:`_fisher_scoring_line_search`); when more than 10% of the bins
-    exhaust it, one warning is logged per call. For a true Newton
+    With ``max_newton_iter > 1`` each iteration is gated by a fixed-length
+    Armijo backtracking scan (:func:`_fisher_scoring_line_search`); when more
+    than 10% of the bins exhaust it, one warning is logged per call.
+    ``max_newton_iter == 1`` is a single Fisher step without line search. For a true Newton
     step with observed Hessian + Armijo line search, see
     :func:`switching_point_process._single_neuron_glm_step_second_order`.
 

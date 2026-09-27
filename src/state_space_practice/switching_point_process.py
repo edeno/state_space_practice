@@ -499,8 +499,10 @@ def point_process_kalman_update(
     The observation model is:
         y_n ~ Poisson(exp(log_intensity_func(x, spike_params)[n]) * dt)
 
-    The update uses a single Fisher scoring step from the prior mean to
-    approximate the posterior.
+    The update runs ``max_newton_iter`` Fisher-scoring iterations from the
+    prior mean (a single step for ``max_newton_iter == 1``, otherwise each
+    gated by an Armijo backtracking line search) to approximate the posterior
+    mode.
 
     Parameters
     ----------
@@ -533,6 +535,13 @@ def point_process_kalman_update(
         If True, include the Laplace normalization and prior terms to approximate
         log p(y_t | y_{1:t-1}). If False, return the plug-in log-likelihood
         at the posterior mode without normalization.
+    max_newton_iter : int, default=3
+        Number of Fisher-scoring iterations; 1 is a single step without line
+        search (see
+        :func:`~state_space_practice.point_process_kalman._point_process_laplace_update`).
+    line_search_beta : float, default=0.5
+        Step size reduction factor of the backtracking line search (used when
+        ``max_newton_iter > 1``).
     return_line_search_failures : bool, default=False
         If True, also return the number of Fisher iterations whose
         backtracking line search was exhausted (int32 scalar; always 0 for
@@ -551,9 +560,8 @@ def point_process_kalman_update(
 
     Notes
     -----
-    The Laplace approximation uses the predicted mean as the expansion point
-    for a single Fisher scoring step. For multiple neurons, the gradients and
-    Jacobians are summed across neurons.
+    The Fisher-scoring iteration starts at the predicted mean. For multiple
+    neurons, the gradients and Jacobians are summed across neurons.
 
     The log-likelihood is evaluated at the approximate posterior mode. When
     ``include_laplace_normalization`` is True, prior and normalization terms
@@ -2092,6 +2100,12 @@ def _switching_point_process_filter_jit(
     include_laplace_normalization : bool, default=True
         If True, include Laplace normalization and prior terms in the
         observation log-likelihood used for discrete-state updates.
+    max_newton_iter : int, default=3
+        Fisher-scoring iterations per pair-conditional Laplace update; 1 is a
+        single step without line search. When more than 10% of the time bins
+        exhaust the line search in some pair update, a warning is logged.
+    line_search_beta : float, default=0.5
+        Step size reduction factor of the backtracking line search.
 
     Returns
     -------
@@ -3672,6 +3686,12 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
             L2 regularization strength shrinking spike baselines toward the
             empirical log-rate (computed per neuron from mean spike counts).
             Setting to 0.0 disables the prior.
+        max_newton_iter : int, default=3
+            Fisher-scoring iterations per Laplace-EKF observation update in
+            the filter; 1 is a single step without line search.
+        line_search_beta : float, default=0.5
+            Step size reduction factor of the observation update's
+            backtracking line search (used when ``max_newton_iter > 1``).
         smoother_type : str, default="gpb1"
             Switching smoother algorithm. Must be "gpb1" or "gpb2".
             GPB2 carries S² pair-conditional Gaussians through the backward

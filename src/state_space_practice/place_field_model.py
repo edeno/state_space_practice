@@ -1162,9 +1162,9 @@ class PlaceFieldModel(SGDFittableMixin):
         time_bins : np.ndarray, shape (n_time,)
             Left edges of time bins (e.g., from ``np.arange(t_start, t_end, dt)``).
         warn_on_drops : bool, default=True
-            Emit a warning if spikes fall outside the bin window. Prevents
-            the silent-funnel-to-last-bin failure mode that used to occur
-            when callers passed a sub-window of the spike time range.
+            Emit a warning if spikes fall outside the bin window, so a
+            sub-window of the spike time range does not silently drop
+            spikes.
 
         Returns
         -------

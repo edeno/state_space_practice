@@ -52,10 +52,9 @@ logger = logging.getLogger(__name__)
 # physical units and its KDE rate surrogate can produce very large Fisher
 # information near the edge of the occupied region: on a realistic circular
 # track the filtered position variance collapses to ~1e-8 cm^2 in places.
-# A 1e-9 cm^2 floor (the library's former absolute default) caps the
-# posterior precision there; without it the decoded trajectory on such data
-# changes by several cm. Positions are always in cm, so a fixed-unit floor is
-# appropriate here.
+# A 1e-9 cm^2 absolute floor caps the posterior precision there; without it
+# the decoded trajectory on such data changes by several cm. Positions are
+# always in cm, so a fixed-unit floor is appropriate here.
 _DECODER_DIAGONAL_BOOST = 1e-9
 
 # Upper bounds for AdaptiveInflationConfig. The per-step multiplier compounds
