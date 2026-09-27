@@ -73,6 +73,8 @@ def test_point_process_laplace_matches_glm_poisson_for_counts_above_one():
         lambda x: C @ x + d,
         poisson_family(dt),
         grad_eta_func=lambda _x: C,
+        # The Hamiltonian update is the single-Fisher-step form.
+        max_newton_iter=1,
     )
 
     for actual_arr, expected_arr in zip(actual, expected):

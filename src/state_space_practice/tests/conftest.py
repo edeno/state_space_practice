@@ -11,6 +11,20 @@ import jax
 
 jax.config.update("jax_enable_x64", True)
 
+# Persistent XLA compilation cache: every test module runs in its own pytest
+# process and re-traces the same jitted filters, so most of the suite's wall
+# time is compilation. Caching compiled executables on disk lets later
+# processes (and later runs) reuse them. Override the location with
+# SSP_JAX_CACHE_DIR; set it empty to disable.
+_cache_dir = os.environ.get(
+    "SSP_JAX_CACHE_DIR",
+    os.path.join(os.path.expanduser("~"), ".cache", "state_space_practice_jax"),
+)
+if _cache_dir:
+    jax.config.update("jax_compilation_cache_dir", _cache_dir)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+
 import jax.numpy as jnp
 import numpy as np
 import numpy.typing as npt

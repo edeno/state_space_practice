@@ -184,6 +184,10 @@ def point_process_laplace_update(
         poisson_family(dt),
         grad_eta_func=grad_eta_func,
         include_laplace_normalization=compute_log_likelihood,
+        # This update is documented (and pinned against particle-filter
+        # references) as the single-Fisher-step form; keep it explicit now that
+        # glm_laplace_update's default is 3 iterations.
+        max_newton_iter=1,
     )
     if not compute_log_likelihood:
         return m_post, P_post, jnp.array(0.0)
