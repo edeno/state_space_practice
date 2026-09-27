@@ -38,9 +38,13 @@ uv run pytest --cov=src/state_space_practice --cov-report=term-missing
 uv run ruff check src/
 uv run ruff format src/
 
-# Run type checker
-uv run mypy src/state_space_practice/
+# Run type checker (checks the modules listed in [tool.mypy] files, as CI does)
+uv run mypy
 ```
+
+Test-run environment variables: `HYPOTHESIS_PROFILE` (`dev` default, `ci` for more
+examples) and `SSP_JAX_CACHE_DIR=<dir>` to opt into a persistent XLA compilation
+cache (reused across runs; don't share one directory between concurrent runs).
 
 ## Project Structure
 
@@ -54,7 +58,8 @@ src/state_space_practice/
 ├── oscillator_utils.py        # Oscillator transition matrix construction
 ├── oscillator_models.py       # Coupled oscillator model classes
 ├── models.py                  # General state-space model classes
-├── utils.py                   # Shared utilities
+├── utils.py                   # Shared utilities (PSD floors, validation)
+├── exceptions.py              # StateSpaceWarning, NotFittedError
 ├── simulate_data.py           # Data simulation utilities
 ├── simulate/                  # Additional simulation modules
 └── tests/                     # pytest test suite
@@ -81,7 +86,8 @@ src/state_space_practice/
 - Tests use `pytest` with fixtures in `conftest.py`
 - Use `hypothesis` for property-based testing where appropriate
 - Test numerical properties (PSD covariances, probabilities sum to 1, etc.)
-- Mark any test that runs EM, SGD, or full filter/smoother pipelines with `@pytest.mark.slow`. Fast suite (`-m "not slow"`) should finish in under a minute.
+- Mark any test that runs EM, SGD, or full filter/smoother pipelines with `@pytest.mark.slow`. Fast suite (`-m "not slow"`) should finish in under a minute. `conftest.py` also marks tests that call `.fit(` / `.fit_sgd(` / `run_em(` slow automatically at collection.
+- Library warnings are `StateSpaceWarning` (a `UserWarning` subclass); unfitted-model access raises `NotFittedError` (a `RuntimeError` subclass). Assert those classes in tests, not the base classes. pytest turns every warning into an error.
 - **Prefer behavioral assertions over shape/type checks.** A test that only checks `.shape` or `isinstance` on a deterministic constructor will never catch a real bug. Instead test *meaning*: "smoother estimate is closer to truth than prior", "chosen option value increases", "LL improves over iterations".
 - **Use fixtures for shared setup.** If 3+ tests construct the same parameters, extract a fixture. Don't duplicate 20 lines of boilerplate per test.
 - **Statistical tests must actually test statistics.** Don't assert `0 < mean < 1` and call it a Poisson test. Use `assert_allclose` with a meaningful tolerance, or a proper goodness-of-fit test.
@@ -108,12 +114,18 @@ jax.config.update("jax_enable_x64", True)
 from state_space_practice import PlaceFieldModel
 ```
 
-The filter validates `init_cov` at the top of every public entry
-point. On a non-PSD prior it raises `ValueError` (the filter is
-guaranteed to NaN). On f32 + long T + ill-conditioned `init_cov` it
-emits a `UserWarning` pointing at the import-order recipe above.
+Importing the package with x64 off emits a `StateSpaceWarning` with
+this recipe.
+
+The filters validate `init_cov` at the top of every public entry
+point when it is concrete (including constants closed over by a jitted
+function). On a non-PSD prior they raise `ValueError` (the filter is
+guaranteed to NaN). When an input is traced, the host-side checks are
+skipped and a non-positive-definite `init_cov` is reported by an
+in-graph `StateSpaceWarning` when the computation runs. On f32 + long T
++ ill-conditioned `init_cov` they emit a `StateSpaceWarning` pointing
+at the import-order recipe above.
 
 Test suites always run with x64 enabled (see `jax.config.update` in
 `tests/conftest.py`), so regression tests do not exercise the f32 NaN
-path. Production users who omit the x64 flag will see the warning on
-their first `fit` / `fit_sgd` call if their problem is at risk.
+path.

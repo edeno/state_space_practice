@@ -71,9 +71,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   hard-coded 0.99.
 - **`ContingencyBeliefModel(seed=None)`**; `None` keeps the historical
   initialization.
-- **`kalman.smooth_initial_state_with_cross_cov`** (also exposed as
-  `point_process_kalman.smoothed_initial_transition_moments`): smoothed
-  ``x_0`` moments plus ``Cov(x_0, x_1 | y) = J_0 P_{1|T}``.
+- **`kalman.smooth_initial_state_with_cross_cov`**: smoothed ``x_0`` moments
+  plus ``Cov(x_0, x_1 | y) = J_0 P_{1|T}``.
 - **`oscillator_utils.optimize_dim_transition_params_joint_until_stationary`**:
   restarts the DIM joint BFGS solve until it stops moving.
 - **`smith_learning_algorithm.smith_laplace_log_likelihood`**: the per-step
@@ -132,7 +131,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Tests that call `.fit(` / `.fit_sgd(` / `run_em(` (outside `pytest.raises`),
   directly or through a fixture, are marked `slow` automatically at collection.
 - The test suite treats `DeprecationWarning`s as errors like every other
-  warning.
+  warning. The persistent XLA compilation cache is opt-in
+  (`SSP_JAX_CACHE_DIR=<dir>`); a shared default directory was corrupted by
+  concurrent runs. The EM golden-value tests use an absolute floor scaled to
+  each parameter array, so cross-platform round-off passes and an
+  algorithm-sized change fails. The Smith property tests caught every
+  exception, including their own assertion failures; they can fail now.
 
 ### Changed — behavior (may affect existing callers)
 
@@ -148,7 +152,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `SmithLearningModel`'s per-iteration record is DEBUG unless `verbose=True`.
 - **Not-fitted errors are `NotFittedError`** (still a `RuntimeError`) in
   `PlaceFieldModel`, `TemporalRateGP`, the oscillator models, the switching
-  point-process models' `decode` / `predict_proba` and the choice models.
+  point-process models' `decode` / `predict_proba`, the choice models and
+  `SmithLearningModel`.
   `PlaceFieldModel.n_free_params` on an unfitted model raises it instead of
   an `AssertionError`.
 - **`SGDFittableMixin.fit_sgd` is declared `(*args, **kwargs)`**; the optimizer
@@ -192,18 +197,28 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `PlaceFieldModel`, and the Kalman M-step when `initial_state_prior` is
   passed). Init-only EM is now monotone; fitted `init_mean` / `init_cov` and
   later log-likelihoods change.
-- **Covariance floors are relative to the matrix scale** (`1e-8 * lambda_max`,
-  `1e-10 * trace / n` in the switching M-step) instead of absolute constants,
-  so M-steps at scale `1e-3` or below are no longer pinned. A warning is logged
-  when a floor binds. The point-process `init_cov` clip bounds are multiples of
-  the fit's initial latent scale.
+- **M-step covariance floors act on the correlation scale**: the eigenvalues
+  of ``D^{-1/2} C D^{-1/2}`` (``D`` the diagonal of ``C``) are floored at
+  `1e-8` of the largest (`1e-10` in the switching M-step) and the result is
+  rescaled, instead of flooring ``C`` at an absolute constant. Floors no
+  longer pin M-steps at scale `1e-3` or below, nor inflate a small-variance
+  coordinate next to a large one. A warning is logged when a floor binds; a
+  materially negative eigenvalue (an inconsistent estimate, not rank
+  deficiency) gets its own warning naming the minimum eigenvalue. The
+  point-process `init_cov` clip bounds are multiples of the latent scale
+  recorded when the fit initialises (kept across `fit(skip_init=True)`
+  refits).
 - **Laplace-EKF marginal log-likelihood** takes both log-determinants from the
   Cholesky factors the update used (one jitter policy). Values move for small
   or ill-conditioned posterior covariances; the switching point-process models
   share this path.
 - **Fisher-scoring line search** (`max_newton_iter > 1`) requires an Armijo
   decrease and logs a warning when more than 10% of bins exhaust the
-  backtracking. The spike-GLM Newton steps use one relative ridge and a
+  backtracking — from every Laplace-EKF caller (point-process filter and
+  smoother, switching point-process filter, position decoder, coupling EKF),
+  including inside `jax.jit` / `jax.grad`. `glm_laplace_update` and
+  `switching_point_process.point_process_kalman_update` take
+  `return_line_search_failures=`. The spike-GLM Newton steps use one relative ridge and a
   Cholesky solve; a non-descent direction falls back to the gradient with one
   warning instead of a silent zero step.
 - **Directed-influence stability scale** is the exact spectral radius (was a
@@ -261,6 +276,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the predictive variance and biased `fit_sgd` towards too little process
   noise. `log_likelihood_`, `bic()`, `compare_to_null` and the SGD loss
   change accordingly.
+- **Laplace-mode Newton convergence is checked** (choice models, Smith): each
+  filter call warns (`StateSpaceWarning`) when an update ends more than
+  `multinomial_choice.NEWTON_GAP_TOL` (1e-6) nats below its mode by the
+  Newton-decrement estimate. The line search takes the Armijo-acceptable step
+  with the highest log posterior (the full step within round-off), which
+  stops the zig-zag that left ~1 in 2000 updates unconverged.
+- **More fitting fallbacks are reported**: `temporal_rate_gp.infer_log_rate`
+  / `infer_log_rate_batch` warn on a non-finite merit, an unaccepted step or
+  a non-converged mode (`LaplaceRateResult` gains `n_nonfinite_merit` and
+  `n_unaccepted_steps`); the position decoder warns when more than 10% of
+  bins hit `max_alpha`; the switching M-step warns about near-empty states
+  even without `previous_params`; a rejected DIM projected M-step and a
+  skipped warm-init seeding are logged at WARNING (were INFO / DEBUG).
 - **Warm init of COM / CNM / DIM** seeds each discrete state's parameters
   with one M-step on its GMM window cluster; it previously only set the
   first-step probabilities and initial state, which has no effect at a
@@ -304,6 +332,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`models.stochastic_point_process_filter`** (observed-Hessian SSPPF) will be
   removed in **0.2.0**; use `point_process_kalman.stochastic_point_process_filter`.
   The warning and docstring now state the removal version.
+- **`kalman_maximization_step(initial_state_prior=None)`** and
+  **`point_process_kalman.dynamics_only_m_step(initial_state_prior=None)`**
+  (the ``x_1``-prior update, which is not an EM step) warn and will be
+  removed in **0.2.0**; pass an `InitialStatePrior`.
 
 ### Removed
 
@@ -319,6 +351,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`project_correlated_noise_process_covariance(max_shrink_iter=...)`**: no
   longer needed by the closed-form shrink.
 - **`simulate.simulate_switching_kalman.simulate_challenging_states`**: unused.
+- **`point_process_kalman.smoothed_initial_transition_moments`**: an alias of
+  `kalman.smooth_initial_state_with_cross_cov`; call that instead.
 
 ### Fixed
 
@@ -345,8 +379,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `\text` were being rendered as control characters).
 - **`kalman_filter`, `kalman_smoother`, `stochastic_point_process_filter`
   and `stochastic_point_process_smoother` work under `jax.jit` / `jax.grad`
-  with the default `validate_inputs=True`** (host-side checks are skipped when
-  an input is a tracer). A float32 `init_mean` / `init_cov` with float64
+  with the default `validate_inputs=True`**. Concrete inputs, including
+  constants closed over by a jitted function, are validated on the host;
+  when an input is traced the host checks are skipped and a non-positive-
+  definite `init_cov` is reported by an in-graph `StateSpaceWarning` at run
+  time. A float32 `init_mean` / `init_cov` with float64
   parameters no longer fails with "scan carry types differ".
 - **`ContingencyBeliefModel` EM** regressed each transition posterior on the
   previous trial's covariate row, so transition-covariate effects were not
@@ -387,6 +424,25 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   update used scale-relative shifts, so the evidence was not invariant to the
   units of the latent state (0.29 nats per trial at prior variance 1e-10).
   Both log-determinants now come from the update's own Cholesky factors.
+- **float32 Kalman / RTS gain solves** could return NaN (e.g. rank-deficient
+  dynamics with zero process noise): the ``1e-14`` relative shift rounded
+  away; it is now at least machine epsilon of the dtype.
+- **`stabilize_transition_matrix`** truncated integer inputs (``[[2, 1],
+  [0, 2]]`` became zeros); integers are promoted first. A `block_size` that
+  does not divide the dimension is logged before the uniform-scale fallback.
+- **`softmax_observation_update`** raised a scan-carry `TypeError` for integer
+  or float32 (with x64 on) priors; `multinomial_choice_filter` and
+  `smith_learning_filter` likewise for integer / float32 initial states.
+  Inputs are promoted to one float dtype (float32 stays float32).
+- **`MultinomialChoiceModel`**'s one-point-grid inverse-temperature M-step
+  skipped the comparison with the current value.
+- **`optimize_dim_transition_params`** never applied its per-oscillator
+  spectral clamp (the sigmoid-parameterised coupling is never exactly 0); the
+  uncoupled case is now decided from the caller's coupling.
+- **Point-process `init_cov` clip ceiling** was re-anchored on each
+  `fit(skip_init=True)`, so it doubled on every warm restart.
+- The spike-GLM gradient-fallback warning is a `StateSpaceWarning` (was a
+  plain `UserWarning`).
 - **Point-process Fisher line search** froze at a converged mode (strict
   decrease test), so reverse-mode gradients through the scan carried a 2%
   error; a round-off slack accepts the negligible full step.
