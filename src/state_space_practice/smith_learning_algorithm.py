@@ -67,6 +67,7 @@ from jax.typing import ArrayLike
 
 from state_space_practice.em_driver import run_em
 from state_space_practice.exceptions import StateSpaceWarning
+from state_space_practice.multinomial_choice import _armijo_slack
 from state_space_practice.parameter_transforms import (
     POSITIVE,
     UNCONSTRAINED,
@@ -176,6 +177,9 @@ def _approximate_gaussian_newton(
     covariance : Array, shape (1, 1)
     """
     x0_arr = jnp.asarray(x0)
+    # Integer initial guesses are promoted to the default float (jax.grad
+    # needs a floating input); float32 stays float32.
+    x0_arr = x0_arr.astype(jnp.result_type(x0_arr, 1.0))
     if x0_arr.squeeze().ndim != 0:
         raise ValueError(
             "_approximate_gaussian_newton only supports 1D states, "
@@ -187,7 +191,7 @@ def _approximate_gaussian_newton(
 
     grad_fn = jax.grad(neg_log_posterior)
     hess_fn = jax.grad(grad_fn)
-    step_sizes = jnp.asarray(_NEWTON_STEP_SIZES)
+    step_sizes = jnp.asarray(_NEWTON_STEP_SIZES, dtype=x0_arr.dtype)
     batched_objective = jax.vmap(neg_log_posterior)
 
     def newton_step(x, _):
@@ -207,7 +211,7 @@ def _approximate_gaussian_newton(
         # Round-off slack: at a converged mode the tiny full step must still
         # be taken, or gradients through the scan miss the Newton map's
         # contraction (see multinomial_choice._softmax_update_core).
-        slack = 1e-12 * (1.0 + jnp.abs(f_x))
+        slack = _armijo_slack(x0_arr.dtype) * (1.0 + jnp.abs(f_x))
         sufficient = (
             f_candidates <= f_x + _ARMIJO_C * step_sizes * (g * direction) + slack
         )
@@ -422,13 +426,17 @@ def smith_learning_filter(
                 "n_correct_responses contains values exceeding max_possible_correct."
             )
 
+    # One floating dtype for the scan carry: an integer initial state is
+    # promoted to the default float, float32 inputs stay float32.
+    init_state = jnp.asarray(init_learning_state)
+    dtype = jnp.result_type(init_state, init_var, sigma_squared_epsilon, 1.0)
     return _smith_learning_filter_impl(
         n_correct_responses,
         max_correct_arr,
-        jnp.asarray(init_learning_state),
-        init_var,
-        sigma_squared_epsilon,
-        mu,
+        init_state.astype(dtype),
+        init_var.astype(dtype),
+        sigma_squared_epsilon.astype(dtype),
+        mu.astype(dtype),
         differentiable=differentiable,
     )
 

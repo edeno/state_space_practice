@@ -140,6 +140,54 @@ class TestSoftmaxObservationUpdate:
             softmax_observation_update(prior_mean, prior_cov, choice=-1, n_options=3)
 
 
+class TestInputDtypes:
+    """Integer inputs are promoted to the default float; float32 stays float32."""
+
+    def test_integer_prior_mean_matches_float(self):
+        post_int = softmax_observation_update(jnp.array([0, 0]), jnp.eye(2), 1, 3)
+        post_float = softmax_observation_update(jnp.zeros(2), jnp.eye(2), 1, 3)
+        for a, b in zip(post_int, post_float):
+            assert a.dtype == jnp.float64
+            np.testing.assert_allclose(a, b, rtol=1e-12)
+        np.testing.assert_allclose(post_int[2], -1.0762705, rtol=1e-6)
+
+    def test_float32_update_stays_float32(self):
+        prior_mean = jnp.array([0.3, -0.2])
+        prior_cov = jnp.array([[1.0, 0.2], [0.2, 0.5]])
+        ref = softmax_observation_update(prior_mean, prior_cov, 2, 3, 2.0)
+        out = softmax_observation_update(
+            prior_mean.astype(jnp.float32), prior_cov.astype(jnp.float32), 2, 3, 2.0
+        )
+        for a, b in zip(out, ref):
+            assert a.dtype == jnp.float32
+            np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-6)
+
+    @pytest.mark.parametrize("init_mean", [np.array([0, 1]), [0, 1]])
+    def test_filter_integer_init_mean_matches_float(self, init_mean):
+        choices = np.array([0, 1, 2, 1, 1, 0])
+        out_int = multinomial_choice_filter(choices, 3, init_mean=init_mean)
+        out_float = multinomial_choice_filter(
+            choices, 3, init_mean=np.array([0.0, 1.0])
+        )
+        for a, b in zip(out_int, out_float):
+            assert a.dtype == jnp.float64
+            np.testing.assert_allclose(a, b, rtol=1e-12)
+
+    def test_filter_float32_stays_float32(self):
+        choices = np.array([0, 1, 2, 1, 1, 0])
+        ref = multinomial_choice_filter(choices, 3, inverse_temperature=2.0)
+        out = multinomial_choice_filter(
+            choices,
+            3,
+            inverse_temperature=2.0,
+            init_mean=np.zeros(2, np.float32),
+            init_cov=np.eye(2, dtype=np.float32),
+        )
+        for a, b in zip(out, ref):
+            assert a.dtype == jnp.float32
+            np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-6)
+
+
 class TestMultinomialChoiceFilter:
     def test_output_shapes(self):
         """100 trials, 4 options -> filtered_values shape (100, 3)."""

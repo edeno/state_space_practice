@@ -46,6 +46,15 @@ _NEWTON_STEP_SIZES = tuple(0.5**i for i in range(8))
 _ARMIJO_C = 1e-4
 
 
+def _armijo_slack(dtype) -> float:
+    """Relative round-off slack of the Armijo test in ``dtype``.
+
+    ``1e-12`` in float64 and ``16 * eps`` in lower precision, where a
+    ``1e-12`` relative change is below round-off.
+    """
+    return max(1e-12, 16 * float(jnp.finfo(dtype).eps))
+
+
 def _softmax_update_core(
     prior_mean: Array,
     prior_cov: Array,
@@ -88,17 +97,29 @@ def _softmax_update_core(
         These shift choice probabilities without changing the
         latent value state. None means no offset.
     """
-    beta = inverse_temperature
+    # One floating dtype for every carried and constant array: integer inputs
+    # are promoted to the default float, float32 inputs stay float32.
+    float_inputs = [prior_mean, prior_cov, inverse_temperature]
+    if obs_offset is not None:
+        float_inputs.append(obs_offset)
+    dtype = jnp.result_type(*float_inputs, 1.0)
+    prior_mean = jnp.asarray(prior_mean, dtype=dtype)
+    prior_cov = jnp.asarray(prior_cov, dtype=dtype)
+    _obs_offset = (
+        jnp.zeros(n_options, dtype=dtype)
+        if obs_offset is None
+        else jnp.asarray(obs_offset, dtype=dtype)
+    )
+    beta = jnp.asarray(inverse_temperature, dtype=dtype)
     k_free = n_options - 1
 
     # Precompute constants
-    e_k = jnp.zeros(n_options).at[choice].set(1.0)
+    e_k = jnp.zeros(n_options, dtype=dtype).at[choice].set(1.0)
     e_k_free = e_k[1:]
-    eye_k = jnp.eye(k_free)
-    zero_ref = jnp.zeros(1)
+    eye_k = jnp.eye(k_free, dtype=dtype)
+    zero_ref = jnp.zeros(1, dtype=dtype)
     beta_sq = beta**2
-    _obs_offset = obs_offset if obs_offset is not None else jnp.zeros(n_options)
-    step_sizes = jnp.asarray(_NEWTON_STEP_SIZES)
+    step_sizes = jnp.asarray(_NEWTON_STEP_SIZES, dtype=dtype)
 
     # Prior precision from one Cholesky factor of the prior covariance; the
     # same factor supplies log|P_prior| below, so the evidence sees exactly
@@ -108,7 +129,7 @@ def _softmax_update_core(
 
     def log_posterior(x):
         """Unnormalised log posterior at x, shape (..., K-1) -> (...)."""
-        zeros = jnp.zeros(x.shape[:-1] + (1,))
+        zeros = jnp.zeros(x.shape[:-1] + (1,), dtype=x.dtype)
         logits = beta * jnp.concatenate([zeros, x], axis=-1) + _obs_offset
         delta = x - prior_mean
         return jax.nn.log_softmax(logits, axis=-1)[..., choice] - 0.5 * jnp.einsum(
@@ -135,7 +156,7 @@ def _softmax_update_core(
         # rejecting it would freeze x, and reverse-mode gradients through
         # the scan would then miss the Newton map's contraction and carry
         # the error of an earlier, unconverged iterate.
-        slack = 1e-12 * (1.0 + jnp.abs(f_x))
+        slack = _armijo_slack(dtype) * (1.0 + jnp.abs(f_x))
         sufficient = (
             f_candidates >= f_x + _ARMIJO_C * step_sizes * (rhs @ direction) - slack
         )
@@ -304,15 +325,23 @@ def multinomial_choice_filter(
     choices_arr = jnp.asarray(choices, dtype=jnp.int32)
     k_free = n_options - 1
 
-    # Resolve defaults before JIT boundary
+    # Resolve defaults before JIT boundary, in one floating dtype so the scan
+    # carry keeps its type: integer inputs are promoted to the default float,
+    # float32 inputs stay float32.
+    float_inputs = [
+        jnp.asarray(x)
+        for x in (init_mean, init_cov, process_noise, inverse_temperature)
+        if x is not None
+    ]
+    dtype = jnp.result_type(*float_inputs, 1.0)
     if init_mean is None:
-        init_mean = jnp.zeros(k_free)
+        init_mean = jnp.zeros(k_free, dtype=dtype)
     else:
-        init_mean = jnp.asarray(init_mean)
+        init_mean = jnp.asarray(init_mean, dtype=dtype)
     if init_cov is None:
-        init_cov = jnp.eye(k_free)
+        init_cov = jnp.eye(k_free, dtype=dtype)
     else:
-        init_cov = jnp.asarray(init_cov)
+        init_cov = jnp.asarray(init_cov, dtype=dtype)
 
     return _multinomial_choice_filter_jit(
         choices_arr,
@@ -335,7 +364,7 @@ def _multinomial_choice_filter_jit(
 ) -> ChoiceFilterResult:
     """JIT-compiled filter core."""
     k_free = n_options - 1
-    Q = jnp.eye(k_free) * process_noise
+    Q = jnp.eye(k_free, dtype=init_mean.dtype) * process_noise
 
     def _step(carry, choice_t):
         filt_mean, filt_cov, total_ll = carry
@@ -361,7 +390,7 @@ def _multinomial_choice_filter_jit(
             pred_cov,
         )
 
-    init_carry = (init_mean, init_cov, jnp.array(0.0))
+    init_carry = (init_mean, init_cov, jnp.zeros((), dtype=init_mean.dtype))
     (_, _, marginal_ll), (filt_vals, filt_covs, pred_vals, pred_covs) = jax.lax.scan(
         _step, init_carry, choices
     )

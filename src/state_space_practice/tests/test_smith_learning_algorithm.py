@@ -243,6 +243,44 @@ class TestSmithLearningFilter:
         # Average variance should be higher with higher sigma_epsilon
         assert jnp.mean(var_high) > jnp.mean(var_low)
 
+    @pytest.mark.parametrize("differentiable", [False, True])
+    def test_integer_initial_state_matches_float(
+        self, simulated_data, differentiable
+    ) -> None:
+        """An integer initial state is promoted to float, not a TypeError."""
+        outcomes, _ = simulated_data
+        out_int = smith_learning_filter(
+            outcomes,
+            init_learning_state=1,
+            max_possible_correct=1,
+            differentiable=differentiable,
+        )
+        out_float = smith_learning_filter(
+            outcomes,
+            init_learning_state=1.0,
+            max_possible_correct=1,
+            differentiable=differentiable,
+        )
+        for a, b in zip(out_int, out_float):
+            assert a.dtype == jnp.float64
+            np.testing.assert_allclose(a, b, rtol=1e-12)
+
+    def test_float32_inputs_stay_float32(self, simulated_data) -> None:
+        outcomes, _ = simulated_data
+        kwargs = dict(init_learning_variance=0.3, max_possible_correct=1)
+        ref = smith_learning_filter(
+            outcomes, init_learning_state=0.5, sigma_epsilon=0.2, **kwargs
+        )
+        out = smith_learning_filter(
+            outcomes,
+            init_learning_state=np.float32(0.5),
+            sigma_epsilon=np.float32(0.2),
+            **kwargs,
+        )
+        for a, b in zip(out, ref):
+            assert a.dtype == jnp.float32
+            np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-6)
+
 
 class TestSmithLearningSmoother:
     """Tests for the smith_learning_smoother function."""
