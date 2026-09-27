@@ -35,11 +35,12 @@ settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))
 # fast suite (``-m "not slow"``) stays quick. Rather than rely on every author
 # remembering the decorator, a test is marked slow at collection time when
 #
-# 1. its own source calls ``.fit(``, ``.fit_sgd(`` or ``run_em(`` outside a
+# 1. its own source, or the source of any fixture it (transitively) requests,
+#    calls ``.fit(``, ``.fit_sgd(`` or ``run_em(`` outside a
 #    ``with pytest.raises(...)`` block (input-validation tests that expect
 #    ``fit`` to raise before doing any work stay in the fast suite), or
 # 2. its node id contains an entry of ``_SLOW_TEST_REGISTRY`` (for tests whose
-#    fitting happens in helpers or fixtures, which the source scan can't see).
+#    fitting happens in helper functions, which the source scan can't see).
 #
 # Explicit ``@pytest.mark.slow`` keeps working as before.
 
@@ -89,13 +90,31 @@ def _function_runs_fit(function) -> bool:
     return _calls_fit_outside_raises(tree)
 
 
+def _fixture_functions(item):
+    """Functions of the fixtures ``item`` requests (closure), best effort."""
+    fixtureinfo = getattr(item, "_fixtureinfo", None)
+    if fixtureinfo is None:
+        return []
+    functions = []
+    for name in fixtureinfo.names_closure:
+        fixturedefs = fixtureinfo.name2fixturedefs.get(name) or ()
+        functions.extend(getattr(fd, "func", None) for fd in fixturedefs)
+    return [f for f in functions if f is not None]
+
+
+def _item_runs_fit(item) -> bool:
+    function = getattr(item, "function", None)
+    if function is not None and _function_runs_fit(function):
+        return True
+    return any(_function_runs_fit(f) for f in _fixture_functions(item))
+
+
 def pytest_collection_modifyitems(config, items):
     for item in items:
         if item.get_closest_marker("slow") is not None:
             continue
-        function = getattr(item, "function", None)
         in_registry = any(entry in item.nodeid for entry in _SLOW_TEST_REGISTRY)
-        if in_registry or (function is not None and _function_runs_fit(function)):
+        if in_registry or _item_runs_fit(item):
             item.add_marker(pytest.mark.slow)
 
 
