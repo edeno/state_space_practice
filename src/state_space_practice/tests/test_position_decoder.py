@@ -1207,6 +1207,112 @@ class TestPositionDecoder:
         assert f"n_neurons={trajectory_data['n_neurons']}" in repr(decoder)
 
 
+# Decoding quality on the realistic-trajectory fixture varies with the seed
+# because the smoother transiently loses track when the filtered variance
+# collapses (see CHANGELOG, known limits). Over seeds 0-19 and 42 the per-axis
+# correlation ranged 0.64-0.97 (mean 0.85; above 0.85 on only about half the
+# seeds), the median error 4.1-5.8 cm and the raw / all-True-mask error ratio
+# 0.34-0.50. The claims are therefore asserted across seeds; the thresholds
+# hold for every 5-seed subset of those 21 seeds.
+_REALISTIC_SEEDS = (0, 1, 2, 3, 4)
+
+
+def _realistic_trajectory(seed: int) -> dict:
+    """Circular trajectory with ~1 cm tracking noise, matching the natural
+    jitter of LED- or DLC-based position tracking, and Poisson spikes from a
+    4 x 4 grid of Gaussian place fields.
+
+    Returns
+    -------
+    dict
+        ``position`` (n_time, 2), ``spikes`` (n_time, 16) and ``dt``.
+    """
+    rng = np.random.default_rng(seed)
+    n_time = 7500  # 30 s at dt=0.004
+    dt = 0.004
+
+    t = np.arange(n_time) * dt
+    true_x = 50 + 20 * np.cos(2 * np.pi * t / 2.0)
+    true_y = 50 + 20 * np.sin(2 * np.pi * t / 2.0)
+    position = np.column_stack(
+        [
+            true_x + rng.normal(0.0, 1.0, size=n_time),
+            true_y + rng.normal(0.0, 1.0, size=n_time),
+        ]
+    )
+
+    grid_xs = np.linspace(28, 72, 4)
+    grid_ys = np.linspace(28, 72, 4)
+    centers = np.array([(cx, cy) for cx in grid_xs for cy in grid_ys])
+    n_neurons = len(centers)
+    sigma_rf = 8.0
+    peak_rate = 30.0
+
+    spikes = np.zeros((n_time, n_neurons))
+    for n in range(n_neurons):
+        dist_sq = np.sum((position - centers[n]) ** 2, axis=1)
+        rate = peak_rate * np.exp(-dist_sq / (2 * sigma_rf**2)) + 0.5
+        spikes[:, n] = rng.poisson(rate * dt)
+
+    return {"position": position, "spikes": spikes, "dt": dt}
+
+
+@pytest.fixture(scope="module")
+def realistic_decoding() -> dict[str, np.ndarray]:
+    """Decode each seed's realistic trajectory with the raw-mask default and
+    with an all-True mask (no restoring force anywhere).
+
+    Returns
+    -------
+    dict of np.ndarray, each of shape (n_seeds,)
+        ``corr_x``, ``corr_y``: per-axis correlation of the raw-mask decode
+        with the true position; ``error_raw``, ``error_all``: median decoding
+        error (cm) with the raw and the all-True mask.
+    """
+    warmup = 500
+    metrics: dict[str, list[float]] = {
+        "corr_x": [],
+        "corr_y": [],
+        "error_raw": [],
+        "error_all": [],
+    }
+    for seed in _REALISTIC_SEEDS:
+        data = _realistic_trajectory(seed)
+        position, spikes, dt = data["position"], data["spikes"], data["dt"]
+        true = position[warmup:]
+
+        def _decode(rate_maps, position=position, spikes=spikes, dt=dt):
+            result = position_decoder_smoother(
+                spikes=spikes,
+                rate_maps=rate_maps,
+                dt=dt,
+                q_pos=500.0,
+                include_velocity=False,
+                init_position=jnp.asarray(position[0]),
+            )
+            return np.array(result.position_mean[:, :2])[warmup:]
+
+        rm_raw = PlaceFieldRateMaps.from_spike_position_data(
+            position=position, spike_counts=spikes, dt=dt
+        )
+        decoded = _decode(rm_raw)
+        metrics["corr_x"].append(np.corrcoef(decoded[:, 0], true[:, 0])[0, 1])
+        metrics["corr_y"].append(np.corrcoef(decoded[:, 1], true[:, 1])[0, 1])
+        metrics["error_raw"].append(np.median(np.linalg.norm(decoded - true, axis=1)))
+
+        rm_all_true = PlaceFieldRateMaps.from_spike_position_data(
+            position=position,
+            spike_counts=spikes,
+            dt=dt,
+            occupancy_mask=np.ones_like(rm_raw.occupancy_mask),
+        )
+        decoded_all = _decode(rm_all_true)
+        metrics["error_all"].append(
+            np.median(np.linalg.norm(decoded_all - true, axis=1))
+        )
+    return {name: np.asarray(values) for name, values in metrics.items()}
+
+
 class TestRawOccupancyMask:
     """Tests for the raw-histogram track mask introduced when the
     default changed from ``occ_smooth > 0`` to ``occ > 0``.
@@ -1218,113 +1324,33 @@ class TestRawOccupancyMask:
     and verify the default behaves correctly there.
     """
 
-    @pytest.fixture
-    def realistic_trajectory_data(self):
-        """Circular trajectory with ~1 cm tracking noise, matching the
-        natural jitter of LED- or DLC-based position tracking.
+    @pytest.mark.slow
+    def test_decoder_tracks_realistic_trajectory(self, realistic_decoding):
+        """With natural position jitter, the raw-mask default tracks the
+        animal: across seeds the per-axis correlation is high on average and
+        the median error stays below the 8 cm place-field width.
         """
-        rng = np.random.default_rng(42)
-        n_time = 7500  # 30 s at dt=0.004
-        dt = 0.004
+        corr = np.stack([realistic_decoding["corr_x"], realistic_decoding["corr_y"]])
+        error = realistic_decoding["error_raw"]
+        summary = f"corr={np.round(corr, 3).tolist()}, error={np.round(error, 2)}"
 
-        t = np.arange(n_time) * dt
-        true_x = 50 + 20 * np.cos(2 * np.pi * t / 2.0)
-        true_y = 50 + 20 * np.sin(2 * np.pi * t / 2.0)
-        position = np.column_stack(
-            [
-                true_x + rng.normal(0.0, 1.0, size=n_time),
-                true_y + rng.normal(0.0, 1.0, size=n_time),
-            ]
-        )
-
-        grid_xs = np.linspace(28, 72, 4)
-        grid_ys = np.linspace(28, 72, 4)
-        centers = np.array([(cx, cy) for cx in grid_xs for cy in grid_ys])
-        n_neurons = len(centers)
-        sigma_rf = 8.0
-        peak_rate = 30.0
-
-        spikes = np.zeros((n_time, n_neurons))
-        for n in range(n_neurons):
-            dist_sq = np.sum((position - centers[n]) ** 2, axis=1)
-            rate = peak_rate * np.exp(-dist_sq / (2 * sigma_rf**2)) + 0.5
-            spikes[:, n] = rng.poisson(rate * dt)
-
-        return {
-            "position": position,
-            "spikes": spikes,
-            "dt": dt,
-            "n_time": n_time,
-        }
+        assert np.mean(corr) > 0.75, summary
+        assert np.all(corr > 0.5), summary
+        assert np.median(error) < 6.0, summary
+        assert np.all(error < 7.0), summary
 
     @pytest.mark.slow
-    def test_decoder_tracks_realistic_trajectory(self, realistic_trajectory_data):
-        """With natural position jitter, the raw-mask default gives
-        good correlation and sub-sigma-track median error.
-
-        Also verifies that the raw mask is *doing real work* by
-        decoding the same data with an all-True mask (no penalty)
-        and asserting the raw-mask median error is meaningfully
-        smaller.  Without this guard, the test would pass whenever
-        the decoder happens to work on noisy data, regardless of
-        mask quality.
+    def test_raw_mask_beats_all_true_mask_on_realistic_trajectory(
+        self, realistic_decoding
+    ):
+        """The raw mask is *doing real work*: on every seed its median error
+        is meaningfully smaller than with an all-True mask (penalty has no
+        restoring force anywhere). Without this guard, the tracking test
+        would pass whenever the decoder happens to work on noisy data,
+        regardless of mask quality.
         """
-        position = realistic_trajectory_data["position"]
-        spikes = realistic_trajectory_data["spikes"]
-        dt = realistic_trajectory_data["dt"]
-
-        def _decode(rate_maps):
-            init = jnp.asarray(position[0])
-            result = position_decoder_smoother(
-                spikes=spikes,
-                rate_maps=rate_maps,
-                dt=dt,
-                q_pos=500.0,
-                include_velocity=False,
-                init_position=init,
-            )
-            decoded = np.array(result.position_mean[:, :2])
-            warmup = 500
-            return decoded[warmup:], position[warmup:]
-
-        # Raw-mask default.
-        rm_raw = PlaceFieldRateMaps.from_spike_position_data(
-            position=position,
-            spike_counts=spikes,
-            dt=dt,
-        )
-        decoded_warm, true_warm = _decode(rm_raw)
-
-        corr_x = np.corrcoef(decoded_warm[:, 0], true_warm[:, 0])[0, 1]
-        corr_y = np.corrcoef(decoded_warm[:, 1], true_warm[:, 1])[0, 1]
-        error_raw = np.median(np.linalg.norm(decoded_warm - true_warm, axis=1))
-
-        # The per-axis correlation is seed-sensitive on this fixture (0.59 to
-        # 0.95 across seeds 0-9 and 42): the smoother transiently loses track
-        # when the filtered variance collapses (see CHANGELOG, known limits).
-        # The median error and the mask-advantage check below are the
-        # meaningful, seed-stable assertions; the correlation is a sanity bound.
-        assert corr_x > 0.7, f"corr_x={corr_x:.3f}"
-        assert corr_y > 0.7, f"corr_y={corr_y:.3f}"
-        assert error_raw < 6.0, f"median error {error_raw:.2f} cm"
-
-        # Same data with an all-True mask (penalty has no restoring
-        # force anywhere).  The raw mask should produce meaningfully
-        # better decoding.
-        rm_all_true = PlaceFieldRateMaps.from_spike_position_data(
-            position=position,
-            spike_counts=spikes,
-            dt=dt,
-            occupancy_mask=np.ones_like(rm_raw.occupancy_mask),
-        )
-        decoded_all, true_all = _decode(rm_all_true)
-        error_all = np.median(np.linalg.norm(decoded_all - true_all, axis=1))
-
-        assert error_raw < 0.75 * error_all, (
-            f"raw-mask median error {error_raw:.2f} cm is not "
-            f"meaningfully better than all-True-mask "
-            f"{error_all:.2f} cm — the penalty is not doing work."
-        )
+        ratio = realistic_decoding["error_raw"] / realistic_decoding["error_all"]
+        assert np.all(ratio < 0.75), f"raw / all-True error ratio {np.round(ratio, 2)}"
 
     def test_multi_arm_mask_does_not_bridge_arms(self):
         """On a disjoint multi-arm track, the raw-mask default must
