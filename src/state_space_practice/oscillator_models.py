@@ -604,10 +604,13 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         return f"<{self.__class__.__name__}: {', '.join(params)}, [{flags_str}]>"
 
     def _warm_initialize_states(self, observations: ArrayLike) -> None:
-        """Warm-initialize discrete state priors and per-state init_mean.
+        """Warm-initialize the per-state parameters and discrete state priors.
 
         Uses windowed cross-covariance features clustered with a Gaussian
-        mixture model to break symmetry before the first E-step.  Sets
+        mixture model to break symmetry before the first E-step.  The window
+        responsibilities seed one M-step, so every state's learned parameters
+        start from its own windows (see
+        ``_seed_state_parameters_from_windows``).  Sets
         ``init_discrete_state_prob`` from GMM mixing weights and scales
         ``init_cov`` to match data variance.  For models with a single shared
         measurement matrix it also sets per-state ``init_mean`` via the H
@@ -691,6 +694,9 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         )
         gmm.fit(features)
         labels = gmm.predict(features)
+        self._seed_state_parameters_from_windows(
+            gmm.predict_proba(features), obs_np, windowed.shape[1]
+        )
 
         # Per-state init_mean via H pseudo-inverse -- only meaningful when H is
         # shared across discrete states. For state-dependent H (COM), skip it.
@@ -722,6 +728,70 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         smoothed = weights * (1.0 - eps) + eps / n_states
         smoothed = smoothed / smoothed.sum()
         self.init_discrete_state_prob = jnp.array(smoothed)
+
+    def _seed_state_parameters_from_windows(
+        self, window_state_prob, obs_np, window: int
+    ) -> None:
+        """Seed the per-state parameters with one M-step on the window clusters.
+
+        Without this, warm initialization only touched the prior of the first
+        discrete state, ``init_mean`` and ``init_cov``: at a symmetric start
+        (e.g. DIM with zero initial coupling, so every ``A_j`` is identical)
+        the first E-step posterior is then the Markov-chain prior whatever the
+        clustering found, and warm and cold starts segment at chance.  Here
+        the window responsibilities (expanded to every time step, softened to
+        a 0.05 floor) replace the discrete posterior of an E-step run at the
+        current parameters, and one M-step fits each state's parameters (A, H,
+        Q, R as the model learns them) to its own windows.  The discrete
+        transition matrix, the initial discrete distribution and the initial
+        continuous state are left as they were: a joint posterior built from
+        independent window labels carries no dwell-time information, and the
+        initial-state quantities are set by the rest of warm initialization.
+        The seeding is skipped (parameters restored) if the E-step fails.
+
+        Parameters
+        ----------
+        window_state_prob : array, shape (n_windows, n_discrete_states)
+            GMM responsibilities of each window.
+        obs_np : array, shape (n_time, n_sources)
+        window : int
+            Window length in time steps.
+        """
+        import numpy as np_cpu
+
+        n_time = obs_np.shape[0]
+        n_states = self.n_discrete_states
+        probs = np_cpu.repeat(np_cpu.asarray(window_state_prob), window, axis=0)
+        if probs.shape[0] < n_time:
+            probs = np_cpu.concatenate(
+                [probs, np_cpu.tile(probs[-1], (n_time - probs.shape[0], 1))]
+            )
+        probs = probs[:n_time] * 0.9 + 0.05 / n_states
+        probs = probs / probs.sum(axis=1, keepdims=True)
+        joint = probs[:-1, :, None] * probs[1:, None, :]
+        joint = joint / joint.sum(axis=(1, 2), keepdims=True)
+
+        snapshot = self._snapshot_em_state()
+        observations = jnp.asarray(obs_np)
+        log_likelihood = float(self._e_step(observations))
+        if not math.isfinite(log_likelihood):
+            logger.debug("Warm-init seeding skipped: non-finite E-step.")
+            self._restore_em_state(snapshot)
+            return
+        self.smoother_discrete_state_prob = jnp.asarray(probs)
+        self.smoother_joint_discrete_state_prob = jnp.asarray(joint)
+        self._m_step(observations)
+        self._project_parameters()
+        for name in (
+            "discrete_transition_matrix",
+            "init_discrete_state_prob",
+            "init_mean",
+            "init_cov",
+        ):
+            setattr(self, name, snapshot[name])
+        # The smoother outputs belong to an E-step with overridden weights;
+        # drop them so nothing downstream mistakes them for a posterior.
+        self._clear_smoother_state()
 
     def _initialize_discrete_state_prob(self) -> None:
         """Initializes the starting probability for each discrete state."""
