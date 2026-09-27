@@ -58,7 +58,7 @@ def _dense_laplace_lgcp(
     lengthscale: float,
     mean: float = 0.0,
     n_newton: int = 300,
-    jitter: float = 1e-9,
+    jitter: float = 0.0,
     min_weight: float = 1e-9,
 ) -> tuple[np.ndarray, float]:
     """Return (posterior mode of the zero-mean latent g, Laplace log-evidence).
@@ -148,8 +148,9 @@ def test_posterior_mode_matches_dense_gp_laplace(small_counts):
     )
     result = infer_log_rate(small_counts, dt, variance, lengthscale, n_iter=40)
     # mean=0, so the returned log-rate mean IS the zero-mean latent g.
+    # Observed agreement ~1e-14 (the SSM prior reproduces the Gram exactly).
     np.testing.assert_allclose(
-        np.asarray(result.log_rate_mean), dense_g, atol=1e-4, rtol=1e-4
+        np.asarray(result.log_rate_mean), dense_g, atol=1e-10, rtol=1e-8
     )
 
 
@@ -160,9 +161,10 @@ def test_log_evidence_matches_dense_gp_laplace(small_counts):
         np.asarray(small_counts), dt, variance, lengthscale
     )
     result = infer_log_rate(small_counts, dt, variance, lengthscale, n_iter=40)
-    # An O(1)-or-worse error (the failure mode of an approximate energy) would
-    # blow past this; require agreement to a few 1e-2 on an O(10) quantity.
-    assert abs(float(result.log_marginal_likelihood) - dense_evidence) < 2e-2
+    # Observed agreement ~1e-14; an approximate energy would be off by O(1).
+    np.testing.assert_allclose(
+        float(result.log_marginal_likelihood), dense_evidence, rtol=1e-8
+    )
 
 
 def test_evidence_prefers_true_lengthscale_over_dense(small_counts):
@@ -182,6 +184,33 @@ def test_evidence_prefers_true_lengthscale_over_dense(small_counts):
         for ell in lengthscales
     ]
     assert int(np.argmax(ssm)) == int(np.argmax(dense))
+
+
+def test_default_iterations_converge_when_baseline_is_far_below_data():
+    """Regression: Newton is line-searched, so a low baseline cannot derail it.
+
+    With ``mean=0`` (the ``TemporalRateGP`` default) and a 50 Hz train in 4 ms
+    bins, the undamped first step overshot far above the mode and the default
+    25 iterations stopped with ``max_abs_update ~ 1``, a mean log-rate of 5.57
+    (converged: 4.15) and an evidence of -192.1 (converged: -144.2).
+    """
+    rng = np.random.default_rng(0)
+    counts = rng.poisson(50.0 * 0.004, size=200).astype(float)
+    default = infer_log_rate(counts, 0.004, 1.0, 1.0, mean=0.0)
+    reference = infer_log_rate(counts, 0.004, 1.0, 1.0, mean=0.0, n_iter=200)
+    assert float(default.max_abs_update) < 1e-10
+    np.testing.assert_allclose(
+        np.asarray(default.log_rate_mean),
+        np.asarray(reference.log_rate_mean),
+        atol=1e-10,
+    )
+    np.testing.assert_allclose(
+        float(default.log_marginal_likelihood),
+        float(reference.log_marginal_likelihood),
+        rtol=1e-10,
+    )
+    # the fitted log-rate sits near log(50 Hz), far from the baseline 0
+    assert abs(float(jnp.mean(default.log_rate_mean)) - np.log(50.0)) < 0.5
 
 
 def test_laplace_iteration_converges(small_counts):
@@ -220,7 +249,7 @@ def test_nonzero_mean_offsets_log_rate(small_counts):
     )
     # Returned log-rate mean is f = mean + g.
     np.testing.assert_allclose(
-        np.asarray(result.log_rate_mean), mean + dense_g, atol=1e-4, rtol=1e-4
+        np.asarray(result.log_rate_mean), mean + dense_g, atol=1e-10, rtol=1e-8
     )
 
 

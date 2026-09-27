@@ -44,19 +44,28 @@ def option_variances_from_covariances(covariances: Array) -> Array:
 
 
 def categorical_entropy(probs: Array) -> Array:
-    """Entropy of a categorical distribution.
+    """Entropy of a categorical distribution, in nats.
+
+    ``H(p) = -sum_k p_k log p_k`` with the convention ``0 log 0 = 0``, i.e.
+    ``scipy.stats.entropy(p, axis=-1)`` for normalised ``p`` (this function
+    does not renormalise). Entries ``<= 0`` contribute exactly zero, so a
+    deterministic distribution has entropy exactly 0; the gradient stays finite
+    at zero entries.
 
     Parameters
     ----------
     probs : Array, shape (..., K)
+        Probabilities summing to one over the last axis.
 
     Returns
     -------
     Array, shape (...)
     """
-    eps = 1e-10
-    safe_probs = jnp.clip(probs, eps, 1.0)
-    return -jnp.sum(safe_probs * jnp.log(safe_probs), axis=-1)
+    probs = jnp.asarray(probs)
+    positive = probs > 0.0
+    # double-where: log is never evaluated at 0, so gradients stay finite
+    safe_probs = jnp.where(positive, probs, 1.0)
+    return -jnp.sum(jnp.where(positive, probs * jnp.log(safe_probs), 0.0), axis=-1)
 
 
 def belief_entropy(state_probs: Array) -> Array:
@@ -86,7 +95,10 @@ def compute_surprise(predicted_probs: Array, choices: Array) -> Array:
     Returns
     -------
     Array, shape (T,)
-        -log P(actual choice | predicted). Higher = more surprising.
+        -log P(actual choice | predicted). Higher = more surprising. The
+        probability is floored at ``1e-10``, so the surprise of a choice the
+        model deemed impossible is capped at ``-log(1e-10) ~ 23.03`` nats
+        instead of ``inf``.
     """
     eps = 1e-10
     p = jnp.clip(predicted_probs[jnp.arange(len(choices)), choices], eps, 1.0)
@@ -146,16 +158,18 @@ def bernoulli_mixture_mean_variance(
     variance : Array, shape (T, K)
         Reward variance per option (includes both Bernoulli variance
         and mixture uncertainty).
+
+    Notes
+    -----
+    By the law of total variance,
+    ``Var[r] = E_s[rho (1 - rho)] + Var_s[rho]``, and since ``r`` is binary this
+    sums to ``mean * (1 - mean)``: the marginal of a Bernoulli mixture is itself
+    Bernoulli. The closed form is used directly, with ``mean`` clipped to
+    ``[0, 1]`` against round-off, so unlike the two-term sum (whose
+    ``E_s[rho^2] - mean^2`` cancels) it is never negative.
     """
     # E[r | option k] = sum_s P(s) * rho[s, k]
     mean = state_probs @ reward_probs  # (T, K)
-
-    # E[r^2 | option k] = E[r | option k] (since r is binary)
-    # Var[r | option k] = E_s[rho(1-rho)] + Var_s[rho]
-    # = sum_s P(s) * rho_sk * (1 - rho_sk) + sum_s P(s) * (rho_sk - mean_k)^2
-    bernoulli_var = state_probs @ (reward_probs * (1 - reward_probs))  # (T, K)
-    mean_sq = state_probs @ (reward_probs**2)  # (T, K)
-    mixture_var = mean_sq - mean**2  # Var_s[rho]
-    variance = bernoulli_var + mixture_var  # Total variance
-
+    bounded_mean = jnp.clip(mean, 0.0, 1.0)  # mean can exceed 1 by an ulp
+    variance = bounded_mean * (1.0 - bounded_mean)
     return mean, variance

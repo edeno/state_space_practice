@@ -44,6 +44,13 @@ def leapfrog_step(
     explicit approximation with no symplecticity guarantee (a symplectic scheme
     would require an implicit solve). ``apply_mlp`` is constructed to be
     separable, so the shipped pairing is symplectic.
+
+    For a separable ``H`` the scheme is the Stormer-Verlet method: second-order
+    accurate (global error ``O(dt^2)``), time-reversible (``dt`` steps are undone
+    by ``-dt`` steps to round-off), volume- and symplectic-form-preserving, and
+    its energy error stays bounded at ``O(dt^2)`` without secular drift. These
+    are checked against ``scipy.integrate.solve_ivp`` and RK4 in
+    ``tests/test_oracle_dynamics.py``.
     """
     x = _validate_state_vector(x)
     n = x.shape[0] // 2
