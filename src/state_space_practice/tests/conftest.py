@@ -74,7 +74,7 @@ _SLOW_TEST_REGISTRY: tuple[str, ...] = (
     "test_em_pools_observation_covariance_across_states",
     "test_switching_kalman.py::TestSwitchingEMMonotonicity::",
     "test_switching_kalman.py::test_joint_dim_optimizer_improves_total_q_and_",
-    "test_switching_point_process.py::TestMilestone8EndToEnd::",
+    "test_switching_point_process.py::TestSwitchingSpikeOscillatorFitValidation::",
     "test_switching_point_process.py::TestSecondOrderClippedWarmStart::"
     "test_single_neuron_converges_from_clipped_warm_start",
     "test_switching_point_process.py::TestSecondOrderClippedWarmStart::"

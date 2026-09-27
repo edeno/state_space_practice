@@ -48,7 +48,7 @@ class TestPublicAPI:
         with pytest.raises(AttributeError, match="no_such_name"):
             ssp.no_such_name  # noqa: B018
 
-    def test_claude_md_import_example(self):
+    def test_top_level_place_field_model_is_the_defining_class(self):
         from state_space_practice import PlaceFieldModel
         from state_space_practice.place_field_model import (
             PlaceFieldModel as Direct,

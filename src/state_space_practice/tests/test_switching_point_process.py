@@ -7811,8 +7811,8 @@ class TestSwitchingSpikeOscillatorModelEndToEnd:
             assert log_likelihoods[-1] >= log_likelihoods[0]
 
 
-class TestMilestone8EndToEnd:
-    """Milestone 8: End-to-End Tests for full pipeline validation.
+class TestSwitchingSpikeOscillatorFitValidation:
+    """End-to-end validation of the switching spike oscillator fit.
 
     These tests comprehensively validate the switching spike oscillator model:
     - EM per-iteration monotonicity (with Laplace approximation tolerance)
@@ -7820,12 +7820,13 @@ class TestMilestone8EndToEnd:
     - Comparison to non-switching baseline
     - Gaussian mixture collapse correctness
 
-    Note: These tests build on Task 7.8 tests but with stricter validation.
+    They extend ``TestSwitchingSpikeOscillatorModelEndToEnd`` with stricter
+    validation.
     """
 
     @pytest.mark.slow
     def test_switching_spike_oscillator_em_monotonic(self) -> None:
-        """Task 8.1: EM convergence properties with Laplace approximation.
+        """EM convergence properties with Laplace approximation.
 
         Tests the EM algorithm's convergence behavior for the switching spike
         oscillator model. Due to the Laplace approximation used for point-process
@@ -7952,7 +7953,7 @@ class TestMilestone8EndToEnd:
 
     @pytest.mark.slow
     def test_switching_spike_oscillator_recovers_parameters(self) -> None:
-        """Task 8.2: Model should recover parameters from simulated data.
+        """Model should recover parameters from simulated data.
 
         Tests comprehensive parameter recovery including:
         1. Discrete transition matrix structure (high self-transition)
@@ -8129,7 +8130,7 @@ class TestMilestone8EndToEnd:
         #    the smoother has very little information to infer latent states
         # 2. The fitted model's latent space may be rotated/sign-flipped relative to
         #    the generative model (latent space is not identifiable)
-        # 3. Task 8.2 focuses on PARAMETER recovery, not STATE recovery
+        # 3. this test targets on PARAMETER recovery, not STATE recovery
         #
         # Instead, we verify the smoother outputs are well-formed:
         smoother_mean = jnp.einsum(
@@ -8243,7 +8244,7 @@ class TestMilestone8EndToEnd:
         assert jnp.all(Z_fitted >= 0), "Transition probs should be non-negative"
 
     def test_switching_spike_oscillator_vs_non_switching(self) -> None:
-        """Task 8.3: Switching model with S=1 should behave like non-switching model.
+        """Switching model with S=1 should behave like non-switching model.
 
         Tests that when n_discrete_states=1, the SwitchingSpikeOscillatorModel
         produces similar smoothed means as the non-switching PointProcessModel.
@@ -8427,7 +8428,7 @@ class TestMilestone8EndToEnd:
         )
 
     def test_collapse_to_state_conditional(self) -> None:
-        """Task 8.4: Verify Gaussian mixture collapse math is correct.
+        """Verify Gaussian mixture collapse math is correct.
 
         Tests that `collapse_gaussian_mixture_per_discrete_state` correctly
         computes state-conditional moments from pair-conditional moments.
