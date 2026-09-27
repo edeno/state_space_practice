@@ -3231,12 +3231,6 @@ class PointProcessModel(SGDFittableMixin):
 
     # --- SGDFittableMixin protocol ---
 
-    # The mixin declares a generic ``fit_sgd(self, *args, **kwargs)`` that forwards
-    # to ``_sgd_loss_fn``; this concrete override names its two data arguments.
-    # mypy (correctly, per strict LSP) cannot see a fixed-arity signature as a
-    # substitute for ``*args, **kwargs``, and there is no signature that both
-    # keeps the explicit parameters and satisfies the check -- so the override
-    # is suppressed here, as in the sibling Hamiltonian models.
     def fit_sgd(
         self,
         design_matrix: ArrayLike,
