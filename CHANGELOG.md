@@ -100,6 +100,25 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `fit_sgd` now use).
 - **`switching_choice.switching_choice_smoother`**: GPB1 backward pass that
   accounts for the covariate input ``B u_t``.
+- **Property-test suites**: `test_invariances.py` (exact invariances under
+  latent coordinate changes, unit rescaling, channel / neuron / option /
+  state relabelling, phase shifts, time reversal and arena translation for
+  every non-GP model), `test_likelihood_identities.py` (each filter's LL
+  equals the sum of its own one-step predictive densities; smoother equals
+  filter at ``T``; cross-covariance and Schur-complement identities; discrete
+  marginal sums; ELBO identity; chain rule by restart), `test_sbc_ranks.py`
+  (rank-histogram simulation-based calibration with a power guard) and
+  `test_approximation_trends.py` (each documented approximation gap shrinks
+  monotonically in the direction theory predicts).
+- **Coupling estimators verified against ground truth**
+  (`test_oracle_coupling.py`, `test_calibration_coupling.py`): stage-1
+  smoother vs dense Gaussian conditioning (1e-10), the Laplace estimator vs a
+  closed-form Newton MAP (2e-9), the Pólya-Gamma sampler vs the exact
+  quadrature posterior, a Geweke successive-conditional test of the Gibbs
+  kernel, PG-draw moments vs closed forms, calibration, and multi-seed
+  recovery. `coupling_pg.pg_gibbs_sweep` (the Gibbs kernel, bit-identical
+  output) and `coupling_validation.batch_means_mcse` are public; crosscheck
+  records carry `pg_mean_mcse_max` and `ekf_pg_mean_max_z`.
 
 ### Changed — behavior (may affect existing callers)
 
@@ -333,6 +352,21 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Two vacuous recovery tests were removed (`test_random_walk_recovery`,
   whose spikes did not depend on the state, and a transition-matrix recovery
   test that passed without recovering anything).
+- **`simulate_coupling` LFP noise** used a PRNG key that collides with the
+  process-noise key under JAX's partitionable threefry
+  (``fold_in(k, 1) == split(k, 3)[1]``), so the simulated LFP noise was a
+  scaled copy of the process noise. Latent and spikes per seed are unchanged;
+  the LFP differs. Experiment write-ups produced with the old simulator
+  (`experiments/coupling_ekf_vs_pg/conclusion.md`,
+  `docs/plans/2026-06-21-spike-field-coupling-findings.md`) need re-running.
+- **Softmax Laplace evidence** (multinomial, covariate and switching choice)
+  took its log-determinants through an absolute ``1e-9`` shift while the
+  update used scale-relative shifts, so the evidence was not invariant to the
+  units of the latent state (0.29 nats per trial at prior variance 1e-10).
+  Both log-determinants now come from the update's own Cholesky factors.
+- **Point-process Fisher line search** froze at a converged mode (strict
+  decrease test), so reverse-mode gradients through the scan carried a 2%
+  error; a round-off slack accepts the negligible full step.
 
 ### Changed — default behavior (may affect existing callers)
 
@@ -370,3 +404,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `utils.debug_print_if` fires on every element under `jax.vmap` (both
   `lax.cond` branches run), so vmapped switching filters emit spurious
   warnings; values are unaffected.
+- The coupling estimators fit a static Bernoulli-logit regression on the
+  plug-in smoothed LFP; ignoring the smoother's uncertainty costs calibration
+  (90% coverage 0.86 at the default ``lfp_noise_var``, 0.69 at 4.0) but not
+  location. The PG chain mixes slowly under near-separation with a diffuse
+  prior (500 draws cover 0.87; 4000 sweeps 0.91).
+- The Smith model with zero process noise matches the static binomial MAP
+  only to ~0.1 posterior sd: each sequential Laplace step carries its
+  approximation forward (the gap shrinks with ``T``).
