@@ -1,5 +1,6 @@
 import logging
 import warnings
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -1299,6 +1300,79 @@ def extract_dim_params_from_matrix_stack(
     }
 
 
+def optimize_dim_transition_params_joint_until_stationary(
+    gamma1: jax.Array,
+    beta: jax.Array,
+    init_params: dict,
+    sampling_freq: float,
+    process_cov: jax.Array | None,
+    max_spectral_radius: float,
+    max_damping: float,
+    max_restarts: int = 5,
+    param_tol: float = 1e-8,
+    optimizer: Callable[..., dict] | None = None,
+) -> dict:
+    """Run the joint DIM optimizer, restarting BFGS until it stops moving.
+
+    :func:`~state_space_practice.switching_kalman.optimize_dim_transition_params_joint`
+    runs one ``jax.scipy`` BFGS solve, which terminates as soon as a line
+    search fails (``status=3``) -- this happens well before the gradient
+    tolerance on ordinary DIM problems (e.g. after 13 iterations with an
+    objective gradient of 67 in the damping coordinate), leaving the M-step
+    at a non-stationary point.  Restarting from the returned point resets
+    the inverse-Hessian approximation and the line-search bracket; each call
+    never accepts a worse objective than its start (the optimizer backtracks),
+    so the restarts can only improve the M-step objective.  Iteration stops
+    once a restart moves no parameter by more than ``param_tol``.
+
+    Parameters
+    ----------
+    gamma1, beta, init_params, sampling_freq, process_cov, max_spectral_radius,
+    max_damping
+        As for ``optimize_dim_transition_params_joint``.
+    max_restarts : int, default=5
+        Additional BFGS solves after the first.
+    param_tol : float, default=1e-8
+        Largest parameter change of a solve that counts as converged (a first
+        solve that does not move needs no restart).
+    optimizer : callable, optional
+        The single-solve optimizer, called with the keyword arguments of
+        ``optimize_dim_transition_params_joint`` (the default).
+
+    Returns
+    -------
+    dict
+        Shared ``damping``/``freq`` and state-specific
+        ``coupling_strength``/``phase_diff``.
+    """
+    if optimizer is None:
+        from state_space_practice.switching_kalman import (
+            optimize_dim_transition_params_joint as optimizer,
+        )
+
+    params = dict(init_params)
+    for _ in range(max_restarts + 1):
+        updated = optimizer(
+            gamma1=gamma1,
+            beta=beta,
+            init_params=params,
+            sampling_freq=sampling_freq,
+            process_cov=process_cov,
+            max_spectral_radius=max_spectral_radius,
+            max_damping=max_damping,
+        )
+        change = max(
+            float(
+                jnp.max(jnp.abs(jnp.asarray(updated[key]) - jnp.asarray(params[key])))
+            )
+            for key in ("freq", "damping", "coupling_strength", "phase_diff")
+        )
+        params = updated
+        if change <= param_tol:
+            break
+    return params
+
+
 class DirectedInfluenceDynamicsMixin:
     """Transition-matrix machinery shared by the directed influence models.
 
@@ -1333,6 +1407,15 @@ class DirectedInfluenceDynamicsMixin:
     use_reparameterized_mstep: bool
     update_continuous_transition_matrix: bool
     _current_osc_params: dict | None
+    process_cov: jax.Array
+
+    _PUBLIC_DYNAMICS_ATTRS = (
+        "continuous_transition_matrix",
+        "freqs",
+        "damping_coef",
+        "coupling_strength",
+        "phase_difference",
+    )
 
     def _initialize_continuous_transition_matrix(self) -> None:
         """Build the per-state A from the intrinsic params via the stability scale.
@@ -1427,6 +1510,9 @@ class DirectedInfluenceDynamicsMixin:
         (``update_continuous_transition_matrix`` is False) or when the
         reparameterized M-step already produced a valid ``A`` by construction.
         """
+        previous = getattr(self, "_pre_m_step_dynamics", None)
+        self._pre_m_step_dynamics = None
+
         if self.use_reparameterized_mstep:
             return
 
@@ -1437,6 +1523,79 @@ class DirectedInfluenceDynamicsMixin:
             self.continuous_transition_matrix, self.max_spectral_radius
         )
         self._sync_coupling_from_transition_matrix()
+        if previous is not None:
+            self._keep_previous_dynamics_if_objective_decreased(previous)
+
+    # --- Generalized-EM safeguard for the standard (projected) M-step -------
+
+    def _remember_pre_m_step_dynamics(self) -> None:
+        """Record ``A`` and its public parameters before a standard M-step.
+
+        The next :meth:`_project_parameters` compares the projected ``A``
+        against this previous iterate on the M-step objective (see
+        :meth:`_keep_previous_dynamics_if_objective_decreased`).
+        """
+        self._pre_m_step_dynamics = {
+            name: getattr(self, name) for name in self._PUBLIC_DYNAMICS_ATTRS
+        }
+
+    def _transition_objective(self, transition_matrix: jax.Array) -> float:
+        """A-dependent part of the expected complete-data log-likelihood.
+
+        ``-1/2 sum_j tr(Q_j^{-1} (A_j Gamma1_j A_j^T - A_j Beta_j^T - Beta_j A_j^T))``
+        with the current E-step's transition statistics (the ``A``-free
+        ``Gamma2`` and ``log|Q|`` terms are omitted; ``Q`` is fixed in DIM).
+        """
+        from state_space_practice.switching_kalman import (
+            compute_transition_q_function,
+            compute_transition_sufficient_stats,
+        )
+
+        gamma1, beta = compute_transition_sufficient_stats(
+            state_cond_smoother_means=self.smoother_state_cond_mean,  # type: ignore[attr-defined]
+            state_cond_smoother_covs=self.smoother_state_cond_cov,  # type: ignore[attr-defined]
+            smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,  # type: ignore[attr-defined]
+            pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,  # type: ignore[attr-defined]
+            pair_cond_smoother_means=self.smoother_pair_cond_means,  # type: ignore[attr-defined]
+            pair_cond_smoother_covs=getattr(self, "smoother_pair_cond_covs", None),
+            next_pair_cond_smoother_means=getattr(
+                self, "smoother_next_pair_cond_means", None
+            ),
+        )
+        negative = jax.vmap(compute_transition_q_function, in_axes=-1)(
+            transition_matrix, gamma1, beta, self.process_cov
+        )
+        return -float(jnp.sum(negative))
+
+    def _keep_previous_dynamics_if_objective_decreased(self, previous: dict) -> None:
+        """Make the standard DIM M-step a generalized EM step.
+
+        The standard M-step solves the unconstrained ``A*`` and then projects
+        it (Frobenius-closest scaled rotations, spectral clamp, shared
+        frequency/damping averaged across states). That projection ignores
+        the ``Q^{-1} (x) Gamma1`` metric of the objective, so the projected
+        ``A`` can score *below* the previous iterate -- e.g. by 0.2-0.8 nats
+        when EM starts from the constrained optimum. When it does, the
+        previous (already valid) dynamics are kept, so the M-step never
+        decreases the expected complete-data log-likelihood.
+        """
+        new_objective = self._transition_objective(self.continuous_transition_matrix)
+        old_objective = self._transition_objective(
+            previous["continuous_transition_matrix"]
+        )
+        slack = 1e-10 * max(1.0, abs(old_objective))
+        if new_objective >= old_objective - slack:
+            return
+        logger.info(
+            "DIM standard M-step: the projected transition matrix lowers the "
+            "M-step objective (%.6g -> %.6g); keeping the previous dynamics.",
+            old_objective,
+            new_objective,
+        )
+        for name, value in previous.items():
+            setattr(self, name, value)
+        if self._current_osc_params is not None:
+            self._current_osc_params = self._intrinsic_osc_params()
 
     def _sync_coupling_from_transition_matrix(self) -> None:
         """Sync all four scientific params from the current transition matrix.

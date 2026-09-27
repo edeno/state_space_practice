@@ -40,6 +40,7 @@ from state_space_practice.oscillator_utils import (
     construct_correlated_noise_process_covariance,
     construct_stable_directed_influence_transition_stack,
     extract_correlated_noise_params_from_covariance,
+    optimize_dim_transition_params_joint_until_stationary,
     project_correlated_noise_process_covariance,
 )
 from state_space_practice.parameter_transforms import POSITIVE, UNCONSTRAINED
@@ -1316,6 +1317,8 @@ class DirectedInfluencePointProcessModel(
             self._m_step_reparameterized()
             return
 
+        if self.update_continuous_transition_matrix:
+            self._remember_pre_m_step_dynamics()
         super()._m_step_dynamics()
 
     def _m_step_reparameterized(self) -> None:
@@ -1387,14 +1390,17 @@ class DirectedInfluencePointProcessModel(
         # Jointly optimize the shared frequency/damping and per-state
         # coupling/phase in ONE objective, rather than optimizing each state
         # independently and averaging the inconsistent shared parameters.
-        self._current_osc_params = optimize_dim_transition_params_joint(
-            gamma1=gamma1,
-            beta=beta,
-            init_params=self._current_osc_params,
-            sampling_freq=self.sampling_freq,
-            process_cov=self.process_cov,
-            max_spectral_radius=self.max_spectral_radius,
-            max_damping=self.max_damping,
+        self._current_osc_params = (
+            optimize_dim_transition_params_joint_until_stationary(
+                gamma1=gamma1,
+                beta=beta,
+                init_params=self._current_osc_params,
+                sampling_freq=self.sampling_freq,
+                process_cov=self.process_cov,
+                max_spectral_radius=self.max_spectral_radius,
+                max_damping=self.max_damping,
+                optimizer=optimize_dim_transition_params_joint,
+            )
         )
         self._update_public_oscillator_params()
 

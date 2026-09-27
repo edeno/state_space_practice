@@ -3185,3 +3185,526 @@ class TestCalibrationAtTrueParameters:
         assert coverage_range[0] < stats["coverage90"] < coverage_range[1], stats[
             "coverage90"
         ]
+
+
+# ============================================================================
+# M-step exactness: stationarity of the constrained expected objective
+# ============================================================================
+
+_MSTEP_PARAM_NAMES = (
+    "continuous_transition_matrix",
+    "process_cov",
+    "measurement_matrix",
+    "measurement_cov",
+    "init_mean",
+    "init_cov",
+    "discrete_transition_matrix",
+    "init_discrete_state_prob",
+)
+
+
+def _mstep_params(model) -> dict:
+    return {name: getattr(model, name) for name in _MSTEP_PARAM_NAMES}
+
+
+def _expected_complete_objective(params: dict, obs, stats: dict) -> float:
+    from state_space_practice.tests import recovery_helpers as rh
+
+    return float(
+        rh.transition_objective(
+            params["continuous_transition_matrix"], params["process_cov"], stats
+        )
+        + rh.observation_objective(
+            params["measurement_matrix"], params["measurement_cov"], obs, stats
+        )
+        + rh.initial_state_objective(params["init_mean"], params["init_cov"], stats)
+        + rh.discrete_objective(
+            params["discrete_transition_matrix"],
+            params["init_discrete_state_prob"],
+            stats,
+        )
+    )
+
+
+def _run_one_mstep(
+    kind: str, perturb, perturb_init_and_z: bool = True, **model_kwargs
+) -> dict:
+    """E-step at perturbed parameters, then one M-step (+ projection).
+
+    Returns the model, data, the E-step statistics and the parameters before
+    and after the M-step.  GPB2 is used so every statistic in the objective
+    is an exact posterior expectation.
+    """
+    from state_space_practice.tests import recovery_helpers as rh
+
+    model = rh.oscillator_model_at_truth(
+        kind, 2, switching=True, smoother_type="gpb2", **model_kwargs
+    )
+    _, y, _ = rh.simulate_from_oscillator_model(model, 400, np.random.default_rng(5))
+    obs = jnp.asarray(y)
+    perturb(model)
+    model.measurement_cov = model.measurement_cov * 1.5
+    if perturb_init_and_z:
+        model.init_mean = model.init_mean + 0.5
+        model.discrete_transition_matrix = jnp.array([[0.9, 0.1], [0.2, 0.8]])
+    model._e_step(obs)
+    stats = rh.switching_posterior_stats(model)
+    before = _mstep_params(model)
+    model._m_step(obs)
+    model._project_parameters()
+    return {
+        "model": model,
+        "obs": obs,
+        "stats": stats,
+        "before": before,
+        "after": _mstep_params(model),
+    }
+
+
+def _symmetric_gradient(f, base: np.ndarray) -> np.ndarray:
+    """FD gradient of f(base + sum_k c_k E_k) over the symmetric basis E_k."""
+    from state_space_practice.tests import recovery_helpers as rh
+
+    basis = np.array(rh.symmetric_basis(base.shape[0]))
+    return rh.central_difference_gradient(
+        lambda c: f(base + np.einsum("k,kab->ab", c, basis)), np.zeros(len(basis)), 1e-7
+    )
+
+
+def _assert_stationary(grad_after, grad_before, label: str, rtol: float = 1e-6):
+    after = float(np.max(np.abs(grad_after)))
+    before = float(np.max(np.abs(grad_before)))
+    assert before > 1.0, f"{label}: guard -- the start must be far from optimal"
+    assert after < rtol * before, (
+        f"{label}: |grad| {after:.3e} at the M-step output vs {before:.3e} before"
+    )
+
+
+def _perturb_com(model) -> None:
+    model.measurement_matrix = model.measurement_matrix + 0.3
+
+
+def _perturb_cnm(model) -> None:
+    model.coupling_strength = model.coupling_strength.at[0, 1, 1].set(0.2)
+    model.process_variance = model.process_variance * 1.3
+    model._initialize_process_covariance()
+
+
+def _perturb_dim(model) -> None:
+    model.coupling_strength = (
+        model.coupling_strength.at[0, 1, 0].set(0.15).at[1, 0, 1].set(0.1)
+    )
+    model.freqs = model.freqs + jnp.array([0.4, -0.3])
+    model.damping_coef = model.damping_coef * 0.98
+    model._rebuild_stable_transition_matrix()
+
+
+def _cnm_process_cov(theta: np.ndarray) -> jax.Array:
+    """CNM Q stack from theta = per state (variance_0, variance_1, coupling, phase)."""
+    from state_space_practice.oscillator_utils import (
+        construct_correlated_noise_process_covariance,
+    )
+
+    stack = []
+    for j in range(2):
+        v, c, p = theta[4 * j : 4 * j + 2], theta[4 * j + 2], theta[4 * j + 3]
+        coupling = jnp.zeros((2, 2)).at[0, 1].set(c)
+        phase = jnp.zeros((2, 2)).at[0, 1].set(p)
+        stack.append(
+            construct_correlated_noise_process_covariance(
+                variance=jnp.asarray(v),
+                phase_difference=phase,
+                coupling_strength=coupling,
+            )
+        )
+    return jnp.stack(stack, axis=-1)
+
+
+def _cnm_theta(model) -> np.ndarray:
+    return np.concatenate(
+        [
+            np.r_[
+                np.asarray(model.process_variance)[:, j],
+                np.asarray(model.coupling_strength)[0, 1, j],
+                np.asarray(model.phase_difference)[0, 1, j],
+            ]
+            for j in range(2)
+        ]
+    )
+
+
+def _dim_transition(theta: np.ndarray, model) -> jax.Array:
+    """DIM A stack (with the stability scale) from the joint parametrisation."""
+    from state_space_practice.oscillator_utils import (
+        construct_stable_directed_influence_transition_stack,
+    )
+
+    coupling = jnp.zeros((2, 2, 2)).at[0, 1].set(theta[4:6]).at[1, 0].set(theta[6:8])
+    phase = jnp.zeros((2, 2, 2)).at[0, 1].set(theta[8:10]).at[1, 0].set(theta[10:12])
+    return construct_stable_directed_influence_transition_stack(
+        jnp.asarray(theta[0:2]),
+        jnp.asarray(theta[2:4]),
+        coupling,
+        phase,
+        model.sampling_freq,
+        max_spectral_radius=model.max_spectral_radius,
+    )
+
+
+def _dim_theta(model) -> np.ndarray:
+    c = np.asarray(model.coupling_strength)
+    p = np.asarray(model.phase_difference)
+    return np.concatenate(
+        [
+            np.asarray(model.freqs),
+            np.asarray(model.damping_coef),
+            c[0, 1],
+            c[1, 0],
+            p[0, 1],
+            p[1, 0],
+        ]
+    )
+
+
+@pytest.mark.slow
+class TestMStepIsConstrainedStationaryPoint:
+    """The M-step output maximizes the expected complete-data objective.
+
+    The objective is written out in ``recovery_helpers`` from the definitions
+    (not from the library's M-step).  Gradients are central finite
+    differences in each model's *constrained* parametrisation: COM's free
+    per-state H and shared R; CNM's (variance, coupling, phase) noise family;
+    DIM's shared (frequency, damping) and per-state (coupling, phase) with
+    the stability scale.  Stationarity is asserted relative to the gradient
+    at the pre-M-step parameters.
+    """
+
+    def test_com_update_is_stationary_and_increases_objective(self):
+        from state_space_practice.tests import recovery_helpers as rh
+
+        run = _run_one_mstep("COM", _perturb_com)
+        obs, stats, before, after = (
+            run[k] for k in ("obs", "stats", "before", "after")
+        )
+        H, H0 = (
+            np.asarray(after["measurement_matrix"]),
+            np.asarray(before["measurement_matrix"]),
+        )
+
+        def f_H(R):
+            return lambda h: rh.observation_objective(
+                jnp.asarray(h.reshape(H.shape)), R, obs, stats
+            )
+
+        _assert_stationary(
+            rh.central_difference_gradient(f_H(after["measurement_cov"]), H.ravel()),
+            rh.central_difference_gradient(f_H(before["measurement_cov"]), H0.ravel()),
+            "COM H",
+        )
+
+        def f_R(H_stack):
+            return lambda R: rh.observation_objective(
+                H_stack, jnp.asarray(R)[..., None].repeat(2, -1), obs, stats
+            )
+
+        _assert_stationary(
+            _symmetric_gradient(
+                f_R(after["measurement_matrix"]),
+                np.asarray(after["measurement_cov"][..., 0]),
+            ),
+            _symmetric_gradient(
+                f_R(after["measurement_matrix"]),
+                np.asarray(before["measurement_cov"][..., 0]),
+            ),
+            "COM shared R",
+        )
+        np.testing.assert_allclose(
+            after["measurement_cov"][..., 0], after["measurement_cov"][..., 1]
+        )
+        gain = _expected_complete_objective(
+            after, obs, stats
+        ) - _expected_complete_objective(before, obs, stats)
+        assert gain > 1.0, gain
+
+    def test_initial_state_and_discrete_updates_are_stationary(self):
+        """init_mean / init_cov (x_1 convention) and Z maximize their terms."""
+        from state_space_practice.tests import recovery_helpers as rh
+
+        run = _run_one_mstep("COM", _perturb_com)
+        stats, before, after = run["stats"], run["before"], run["after"]
+        m0 = np.asarray(after["init_mean"])
+
+        def f_m0(v):
+            return rh.initial_state_objective(
+                jnp.asarray(v.reshape(m0.shape)), after["init_cov"], stats
+            )
+
+        _assert_stationary(
+            rh.central_difference_gradient(f_m0, m0.ravel()),
+            rh.central_difference_gradient(
+                f_m0, np.asarray(before["init_mean"]).ravel()
+            ),
+            "init_mean",
+        )
+        for j in range(2):
+            # Relative to the w_1j-scaled curvature: this state's weight at
+            # t=1 can be tiny, so compare against its own pre-M-step gradient.
+            def f_P0(P, j=j):
+                return rh.initial_state_objective(
+                    after["init_mean"], after["init_cov"].at[..., j].set(P), stats
+                )
+
+            grad_after = _symmetric_gradient(
+                f_P0, np.asarray(after["init_cov"][..., j])
+            )
+            grad_before = _symmetric_gradient(
+                f_P0, np.asarray(before["init_cov"][..., j])
+            )
+            assert np.max(np.abs(grad_after)) < 1e-6 * max(
+                np.max(np.abs(grad_before)), 1e-3
+            ), (j, grad_after, grad_before)
+        Z = np.asarray(after["discrete_transition_matrix"])
+
+        def f_Z(d, base):
+            step = np.array([[d[0], -d[0]], [-d[1], d[1]]])
+            return rh.discrete_objective(
+                jnp.asarray(base + step), after["init_discrete_state_prob"], stats
+            )
+
+        _assert_stationary(
+            rh.central_difference_gradient(lambda d: f_Z(d, Z), np.zeros(2), 1e-7),
+            rh.central_difference_gradient(
+                lambda d: f_Z(d, np.asarray(before["discrete_transition_matrix"])),
+                np.zeros(2),
+                1e-7,
+            ),
+            "Z (simplex directions)",
+        )
+
+    def test_init_state_update_is_smoothed_x1(self):
+        """The switching filter starts at x_1 (no prediction before the first
+        update), so the exact init update is the smoothed x_1 moments -- not the
+        smoothed x_0 of the predict-first filters in ``kalman.py``."""
+        from state_space_practice.kalman import kalman_measurement_update
+
+        run = _run_one_mstep("COM", _perturb_com)
+        model, stats, before = run["model"], run["stats"], run["before"]
+        np.testing.assert_allclose(model.init_mean, stats["mean"][0], atol=1e-12)
+        np.testing.assert_allclose(model.init_cov, stats["cov"][0], atol=1e-12)
+
+        # The E-step's first filtered moment is the measurement update of the
+        # prior itself (x_1 convention).
+        from state_space_practice.switching_kalman import switching_kalman_filter
+
+        filt = switching_kalman_filter(
+            before["init_mean"],
+            before["init_cov"],
+            before["init_discrete_state_prob"],
+            run["obs"],
+            before["discrete_transition_matrix"],
+            before["continuous_transition_matrix"],
+            before["process_cov"],
+            before["measurement_matrix"],
+            before["measurement_cov"],
+        )
+        mean0, cov0, _ = kalman_measurement_update(
+            before["init_mean"][:, 1],
+            before["init_cov"][..., 1],
+            run["obs"][0],
+            before["measurement_matrix"][..., 1],
+            before["measurement_cov"][..., 1],
+        )
+        np.testing.assert_allclose(filt[0][0, :, 1], mean0, atol=1e-10)
+        np.testing.assert_allclose(filt[1][0, :, :, 1], cov0, atol=1e-10)
+
+    @pytest.mark.parametrize("use_reparameterized_mstep", [True, False])
+    def test_cnm_noise_family_update_is_stationary(self, use_reparameterized_mstep):
+        """Both CNM paths land on the constrained optimum: the CNM family is the
+        real form of complex Hermitian matrices, closed under inversion, so the
+        projected residual covariance is exactly the constrained MLE."""
+        from state_space_practice.tests import recovery_helpers as rh
+
+        run = _run_one_mstep(
+            "CNM", _perturb_cnm, use_reparameterized_mstep=use_reparameterized_mstep
+        )
+        model, obs, stats, before, after = (
+            run[k] for k in ("model", "obs", "stats", "before", "after")
+        )
+        theta = _cnm_theta(model)
+        np.testing.assert_allclose(
+            _cnm_process_cov(theta), model.process_cov, atol=1e-12
+        )
+        A = after["continuous_transition_matrix"]
+
+        def f(t):
+            return rh.transition_objective(A, _cnm_process_cov(t), stats)
+
+        grad_after = rh.central_difference_gradient(f, theta, 1e-7)
+        # Reference gradient at the pre-M-step CNM parameters (perturbed start).
+        start = rh.oscillator_model_at_truth(
+            "CNM", 2, switching=True, smoother_type="gpb2"
+        )
+        _perturb_cnm(start)
+        grad_before = rh.central_difference_gradient(f, _cnm_theta(start), 1e-7)
+        _assert_stationary(grad_after, grad_before, "CNM (variance, coupling, phase)")
+
+        def f_R(R):
+            return rh.observation_objective(
+                after["measurement_matrix"],
+                jnp.asarray(R)[..., None].repeat(2, -1),
+                obs,
+                stats,
+            )
+
+        _assert_stationary(
+            _symmetric_gradient(f_R, np.asarray(after["measurement_cov"][..., 0])),
+            _symmetric_gradient(f_R, np.asarray(before["measurement_cov"][..., 0])),
+            "CNM shared R",
+        )
+        assert _expected_complete_objective(
+            after, obs, stats
+        ) > _expected_complete_objective(before, obs, stats)
+
+    def test_dim_joint_optimizer_reaches_stationary_point(self):
+        """The reparameterized DIM M-step is a stationary point of the joint
+        (shared frequency/damping, per-state coupling/phase, stability-scaled)
+        objective.  A single BFGS solve stops on a line-search failure at
+        |grad| = 67 here; the restarted solve converges."""
+        from state_space_practice.switching_kalman import (
+            optimize_dim_transition_params_joint,
+        )
+        from state_space_practice.tests import recovery_helpers as rh
+
+        run = _run_one_mstep(
+            "DIM",
+            _perturb_dim,
+            perturb_init_and_z=False,
+            use_reparameterized_mstep=True,
+        )
+        model, obs, stats, before, after = (
+            run[k] for k in ("model", "obs", "stats", "before", "after")
+        )
+        theta = _dim_theta(model)
+        np.testing.assert_allclose(
+            _dim_transition(theta, model),
+            model.continuous_transition_matrix,
+            atol=1e-12,
+        )
+        # Guard: interior solution (no bound or stability-scale kink active).
+        assert float(model._effective_dim_scale()) == 1.0
+        assert np.all(np.asarray(model.damping_coef) < model.max_damping - 1e-3)
+        assert np.all(theta[4:8] > 1e-3)
+
+        def f(t):
+            return rh.transition_objective(
+                _dim_transition(t, model), after["process_cov"], stats
+            )
+
+        grad_after = rh.central_difference_gradient(f, theta, 1e-6)
+        start = rh.oscillator_model_at_truth("DIM", 2, switching=True)
+        _perturb_dim(start)
+        grad_before = rh.central_difference_gradient(f, _dim_theta(start), 1e-6)
+        # Guard: a single BFGS solve from the same start is NOT stationary.
+        single = optimize_dim_transition_params_joint(
+            gamma1=jnp.asarray(stats["gamma1"]),
+            beta=jnp.asarray(stats["beta"]),
+            init_params=start._intrinsic_osc_params(),
+            sampling_freq=model.sampling_freq,
+            process_cov=after["process_cov"],
+            max_spectral_radius=model.max_spectral_radius,
+            max_damping=model.max_damping,
+        )
+        start.freqs, start.damping_coef = single["freq"], single["damping"]
+        start.coupling_strength = single["coupling_strength"]
+        start.phase_difference = single["phase_diff"]
+        grad_single = rh.central_difference_gradient(f, _dim_theta(start), 1e-6)
+        assert np.max(np.abs(grad_single)) > 1.0, np.max(np.abs(grad_single))
+        # BFGS gradient tolerance is 1e-6 in its bounded coordinates; allow the
+        # FD / coordinate-map slack.
+        _assert_stationary(grad_after, grad_before, "DIM joint", rtol=1e-4)
+        assert _expected_complete_objective(
+            after, obs, stats
+        ) > _expected_complete_objective(before, obs, stats)
+
+    def test_dim_standard_mstep_is_generalized_em(self):
+        """The standard DIM M-step (A* -> Frobenius projection) is not the
+        constrained optimum.  From a perturbed start it still improves the
+        objective, but it is not stationary; started *at* the constrained
+        optimum the projection would lower the objective (by 0.46 here), so the
+        model keeps the previous dynamics and the objective never decreases."""
+        from state_space_practice.oscillator_utils import (
+            optimize_dim_transition_params_joint_until_stationary,
+        )
+        from state_space_practice.tests import recovery_helpers as rh
+
+        run = _run_one_mstep("DIM", _perturb_dim)
+        model, obs, stats, before, after = (
+            run[k] for k in ("model", "obs", "stats", "before", "after")
+        )
+        A_before = before["continuous_transition_matrix"]
+        Q = after["process_cov"]
+        obj_before = float(rh.transition_objective(A_before, Q, stats))
+        obj_after = float(
+            rh.transition_objective(after["continuous_transition_matrix"], Q, stats)
+        )
+        assert obj_after > obj_before + 1.0
+        grad = rh.central_difference_gradient(
+            lambda t: rh.transition_objective(_dim_transition(t, model), Q, stats),
+            _dim_theta(model),
+            1e-6,
+        )
+        assert np.max(np.abs(grad)) > 1.0, "documented: projection is not stationary"
+
+        # Start the standard M-step at the constrained optimum for these stats.
+        optimum = optimize_dim_transition_params_joint_until_stationary(
+            gamma1=jnp.asarray(stats["gamma1"]),
+            beta=jnp.asarray(stats["beta"]),
+            init_params=model._intrinsic_osc_params(),
+            sampling_freq=model.sampling_freq,
+            process_cov=Q,
+            max_spectral_radius=model.max_spectral_radius,
+            max_damping=model.max_damping,
+        )
+        model.freqs, model.damping_coef = optimum["freq"], optimum["damping"]
+        model.coupling_strength = optimum["coupling_strength"]
+        model.phase_difference = optimum["phase_diff"]
+        model._rebuild_stable_transition_matrix()
+        A_opt = model.continuous_transition_matrix
+        obj_opt = float(rh.transition_objective(A_opt, Q, stats))
+
+        # What the bare projection would install (the old behaviour).
+        from state_space_practice.oscillator_utils import (
+            extract_dim_params_from_matrix_stack,
+            project_transition_matrix_stack,
+        )
+
+        A_star = jnp.stack(
+            [
+                jnp.linalg.solve(stats["gamma1"][..., j].T, stats["beta"][..., j].T).T
+                for j in range(2)
+            ],
+            axis=-1,
+        )
+        projected = project_transition_matrix_stack(A_star, model.max_spectral_radius)
+        p = extract_dim_params_from_matrix_stack(projected, model.sampling_freq, 2)
+        from state_space_practice.oscillator_utils import (
+            construct_stable_directed_influence_transition_stack,
+        )
+
+        A_proj = construct_stable_directed_influence_transition_stack(
+            p["freq"],
+            p["damping"],
+            p["coupling_strength"],
+            p["phase_diff"],
+            model.sampling_freq,
+            max_spectral_radius=model.max_spectral_radius,
+        )
+        decrease = obj_opt - float(rh.transition_objective(A_proj, Q, stats))
+        assert decrease > 1e-2, f"guard: the projection must lose here ({decrease})"
+
+        model._m_step(obs)  # same E-step statistics
+        model._project_parameters()
+        obj_guarded = float(
+            rh.transition_objective(model.continuous_transition_matrix, Q, stats)
+        )
+        assert obj_guarded >= obj_opt - 1e-9 * abs(obj_opt), (obj_guarded, obj_opt)

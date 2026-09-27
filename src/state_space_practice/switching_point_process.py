@@ -3112,7 +3112,35 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         )
 
         if self.update_continuous_transition_matrix:
-            self.continuous_transition_matrix = new_A
+            projected_A = self._project_transition_matrix_update(new_A)
+            if self.update_process_cov and projected_A is not new_A:
+                # The Q returned above is the residual-form optimum for the
+                # unconstrained A*, a matrix the model never installs. Recompute
+                # it at the projected A actually installed, so the (A, Q) pair
+                # is consistent: Q is then the exact M-step optimum given A.
+                (_, _, new_Q, *_) = switching_kalman_maximization_step(
+                    obs=dummy_obs,
+                    state_cond_smoother_means=self.smoother_state_cond_mean,
+                    state_cond_smoother_covs=self.smoother_state_cond_cov,
+                    smoother_discrete_state_prob=self.smoother_discrete_state_prob,
+                    smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
+                    pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
+                    pair_cond_smoother_means=self.smoother_pair_cond_means,
+                    pair_cond_smoother_covs=getattr(
+                        self, "smoother_pair_cond_covs", None
+                    ),
+                    next_pair_cond_smoother_means=getattr(
+                        self, "smoother_next_pair_cond_means", None
+                    ),
+                    transition_prior=self.transition_prior,
+                    fixed_continuous_transition_matrix=projected_A,
+                    previous_params={
+                        "continuous_transition_matrix": self.continuous_transition_matrix,
+                        "process_cov": self.process_cov,
+                    },
+                    estimate_measurement_params=False,
+                )
+            self.continuous_transition_matrix = projected_A
 
         if self.update_process_cov:
             self.process_cov = self._regularize_process_cov_update(new_Q)
@@ -3129,6 +3157,16 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         # Always update initial discrete state probabilities
         # (from smoother posterior at t=0)
         self.init_discrete_state_prob = new_init_discrete_prob
+
+    def _project_transition_matrix_update(self, transition_matrix: Array) -> Array:
+        """Constraint applied to the M-step's unconstrained ``A*`` (identity here).
+
+        A model whose ``_project_parameters`` restricts ``A`` to a structured
+        family overrides this with the same projection, so the dynamics
+        M-step can compute ``Q`` at the ``A`` that is actually installed.
+        Return the input object itself when nothing changes.
+        """
+        return transition_matrix
 
     def _regularize_process_cov_update(self, process_cov: Array) -> Array:
         """Trust-region blend and eigenvalue clip of the M-step Q estimate.
@@ -3757,6 +3795,17 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
             process_covs.append(Q)
 
         self.process_cov = jnp.stack(process_covs, axis=2)
+
+    def _project_transition_matrix_update(self, transition_matrix: Array) -> Array:
+        """Project the M-step ``A*`` onto the oscillator family before Q is set.
+
+        Same projection as :meth:`_project_parameters`, applied inside the
+        dynamics M-step so the process covariance is re-estimated at the
+        projected ``A`` (making the installed ``(A, Q)`` pair consistent).
+        """
+        return project_transition_matrix_stack(
+            transition_matrix, self.max_spectral_radius
+        )
 
     def _project_parameters(self) -> None:
         """Project estimated parameters onto valid parameter spaces.

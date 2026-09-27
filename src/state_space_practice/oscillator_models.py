@@ -57,6 +57,7 @@ from state_space_practice.oscillator_utils import (
     construct_directed_influence_transition_matrix,
     extract_correlated_noise_params_from_covariance,
     get_block_slice,
+    optimize_dim_transition_params_joint_until_stationary,
     project_correlated_noise_process_covariance,
 )
 from state_space_practice.parameter_transforms import (
@@ -1935,6 +1936,8 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         if self.use_reparameterized_mstep:
             self._m_step_reparameterized(observations)
         else:
+            if self.update_continuous_transition_matrix:
+                self._remember_pre_m_step_dynamics()
             super()._m_step(observations)
 
     def _m_step_reparameterized(self, observations: ArrayLike) -> None:
@@ -2024,14 +2027,17 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
                     "phase_diff": self.phase_difference,
                 }
 
-            self._current_osc_params = optimize_dim_transition_params_joint(
-                gamma1=gamma1,
-                beta=beta,
-                init_params=self._current_osc_params,
-                sampling_freq=self.sampling_freq,
-                process_cov=self.process_cov,
-                max_spectral_radius=self.max_spectral_radius,
-                max_damping=self.max_damping,
+            self._current_osc_params = (
+                optimize_dim_transition_params_joint_until_stationary(
+                    gamma1=gamma1,
+                    beta=beta,
+                    init_params=self._current_osc_params,
+                    sampling_freq=self.sampling_freq,
+                    process_cov=self.process_cov,
+                    max_spectral_radius=self.max_spectral_radius,
+                    max_damping=self.max_damping,
+                    optimizer=optimize_dim_transition_params_joint,
+                )
             )
 
             # Sync the one joint solution directly; no post-hoc averaging of

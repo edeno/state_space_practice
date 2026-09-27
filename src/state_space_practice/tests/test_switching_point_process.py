@@ -10112,3 +10112,210 @@ def test_spike_oscillator_default_transition_diag_uses_default_float() -> None:
     diag = model._default_discrete_transition_diag()
     assert diag.dtype == jnp.result_type(float)  # float64 under x64, not float32
     np.testing.assert_array_equal(np.asarray(diag), 0.95)
+
+
+# ============================================================================
+# M-step exactness for the spike-oscillator model
+# ============================================================================
+
+
+def _expected_poisson_objective(
+    b, w, spikes_n, means, covs, weights, dt, weight_l2, b_prior=0.0, b_prior_l2=0.0
+):
+    """Expected Poisson log-likelihood of one neuron under Gaussian posteriors.
+
+    ``sum_{t,j} weights_tj [y_t (b + w.m_tj) - dt exp(b + w.m_tj + w'P_tj w / 2)]``
+    minus the ridge penalties.  ``means`` (T, n, S), ``covs`` (T, n, n, S) and
+    ``weights`` (T, S); a single-state GLM passes S = 1.  Written from the
+    definition (Gaussian moment generating function), independently of the
+    library's Newton step.
+    """
+    lin = b + jnp.einsum("tkj,k->tj", means, w)
+    quad = 0.5 * jnp.einsum("tklj,k,l->tj", covs, w, w)
+    ll = jnp.sum(weights * (spikes_n[:, None] * lin - dt * jnp.exp(lin + quad)))
+    return ll - 0.5 * weight_l2 * jnp.sum(w**2) - 0.5 * b_prior_l2 * (b - b_prior) ** 2
+
+
+def _spike_oscillator_em_problem(separate_spike_params: bool = True, **kwargs):
+    """One E-step of SwitchingSpikeOscillatorModel on simulated switching data."""
+    from state_space_practice.oscillator_utils import (
+        construct_common_oscillator_transition_matrix,
+    )
+    from state_space_practice.simulate.simulate_switching_spikes import (
+        simulate_switching_spike_oscillator,
+    )
+    from state_space_practice.switching_point_process import (
+        QRegularizationConfig,
+        SwitchingSpikeOscillatorModel,
+    )
+
+    A = jnp.stack(
+        [
+            construct_common_oscillator_transition_matrix(
+                freqs=jnp.array([8.0]),
+                damping_coef=jnp.array([d]),
+                sampling_freq=100.0,
+            )
+            for d in (0.97, 0.85)
+        ],
+        axis=-1,
+    )
+    Q = jnp.stack([0.05 * jnp.eye(2), 0.02 * jnp.eye(2)], axis=-1)
+    weights = jax.random.normal(jax.random.PRNGKey(3), (6, 2)) * 0.8
+    spikes, _, _ = simulate_switching_spike_oscillator(
+        n_time=400,
+        transition_matrices=A,
+        process_covs=Q,
+        discrete_transition_matrix=jnp.array([[0.98, 0.02], [0.02, 0.98]]),
+        spike_weights=weights,
+        spike_baseline=jnp.full(6, 3.0),
+        dt=0.01,
+        key=jax.random.PRNGKey(11),
+    )
+    model = SwitchingSpikeOscillatorModel(
+        n_oscillators=1,
+        n_neurons=6,
+        n_discrete_states=2,
+        sampling_freq=100.0,
+        dt=0.01,
+        separate_spike_params=separate_spike_params,
+        smoother_type="gpb2",
+        q_regularization=QRegularizationConfig(enabled=False),
+        spike_weight_l2=1.0,
+        **kwargs,
+    )
+    model._initialize_parameters(jax.random.PRNGKey(0))
+    model.spike_params = SpikeObsParams(
+        baseline=model.spike_params.baseline + 2.5,
+        weights=model.spike_params.weights,
+    )
+    model._e_step(spikes)
+    return model, spikes
+
+
+@pytest.mark.slow
+class TestSpikeOscillatorMStepStationarity:
+    """The spike-GLM and dynamics M-steps land on stationary points of the
+    expected complete-data objective (written out in the test)."""
+
+    @pytest.mark.parametrize("separate_spike_params", [True, False])
+    def test_spike_glm_update_is_stationary(self, separate_spike_params):
+        from state_space_practice.tests import recovery_helpers as rh
+
+        model, spikes = _spike_oscillator_em_problem(separate_spike_params)
+        before = model.spike_params
+        model._m_step_spikes(spikes)
+        after = model.spike_params
+        means = model.smoother_state_cond_mean
+        covs = model.smoother_state_cond_cov
+        probs = model.smoother_discrete_state_prob
+
+        def objective(params, n, j):
+            b, w = params[0], jnp.asarray(params[1:])
+            if separate_spike_params:
+                return _expected_poisson_objective(
+                    b,
+                    w,
+                    spikes[:, n],
+                    means[..., j : j + 1],
+                    covs[..., j : j + 1],
+                    probs[:, j : j + 1],
+                    model.dt,
+                    model.spike_weight_l2,
+                )
+            return _expected_poisson_objective(
+                b, w, spikes[:, n], means, covs, probs, model.dt, model.spike_weight_l2
+            )
+
+        def flat(params, n, j):
+            if separate_spike_params:
+                return np.r_[params.baseline[n, j], np.asarray(params.weights[n, :, j])]
+            return np.r_[params.baseline[n], np.asarray(params.weights[n])]
+
+        states = range(2) if separate_spike_params else [None]
+        for j in states:
+            for n in range(spikes.shape[1]):
+                grad_after = rh.central_difference_gradient(
+                    lambda p, n=n, j=j: objective(p, n, j), flat(after, n, j), 1e-6
+                )
+                grad_before = rh.central_difference_gradient(
+                    lambda p, n=n, j=j: objective(p, n, j), flat(before, n, j), 1e-6
+                )
+                assert np.max(np.abs(grad_before)) > 1.0, (n, j, grad_before)
+                assert np.max(np.abs(grad_after)) < 1e-5 * np.max(
+                    np.abs(grad_before)
+                ), (n, j, grad_after, grad_before)
+
+    def test_dynamics_update_installs_q_for_the_projected_a(self):
+        """A is projected onto the oscillator family inside the M-step and Q is
+        re-estimated there, so Q is the exact optimum *given the installed A*
+        (it used to be the optimum for the never-installed A*)."""
+        from state_space_practice.oscillator_utils import (
+            project_transition_matrix_stack,
+        )
+        from state_space_practice.tests import recovery_helpers as rh
+
+        model, _ = _spike_oscillator_em_problem()
+        stats = rh.switching_posterior_stats(model)
+        A_old, Q_old = model.continuous_transition_matrix, model.process_cov
+        model._m_step_dynamics()
+        A_new, Q_new = model.continuous_transition_matrix, model.process_cov
+
+        A_star = jnp.stack(
+            [
+                jnp.linalg.solve(stats["gamma1"][..., j].T, stats["beta"][..., j].T).T
+                for j in range(2)
+            ],
+            axis=-1,
+        )
+        np.testing.assert_allclose(
+            A_new,
+            project_transition_matrix_stack(A_star, model.max_spectral_radius),
+            atol=1e-10,
+        )
+        # Guard: the projection genuinely moved A.
+        assert float(jnp.max(jnp.abs(A_new - A_star))) > 1e-3
+
+        def residual_q(A):
+            scatter = [
+                stats["gamma2"][..., j]
+                - A[..., j] @ stats["beta"][..., j].T
+                - stats["beta"][..., j] @ A[..., j].T
+                + A[..., j] @ stats["gamma1"][..., j] @ A[..., j].T
+                for j in range(2)
+            ]
+            return jnp.stack(scatter, axis=-1) / stats["n_trans"]
+
+        np.testing.assert_allclose(Q_new, residual_q(A_new), rtol=1e-8, atol=1e-12)
+        basis = np.array(rh.symmetric_basis(2))
+        for j in range(2):
+
+            def f(Qj, j=j):
+                return rh.transition_objective(A_new, Q_new.at[..., j].set(Qj), stats)
+
+            grad = rh.central_difference_gradient(
+                lambda c, j=j: f(
+                    np.asarray(Q_new[..., j]) + np.einsum("k,kab->ab", c, basis)
+                ),
+                np.zeros(len(basis)),
+                1e-8,
+            )
+            grad_old = rh.central_difference_gradient(
+                lambda c, j=j: f(
+                    np.asarray(Q_old[..., j]) + np.einsum("k,kab->ab", c, basis)
+                ),
+                np.zeros(len(basis)),
+                1e-8,
+            )
+            assert np.max(np.abs(grad)) < 1e-6 * np.max(np.abs(grad_old)), (
+                grad,
+                grad_old,
+            )
+
+        obj_new = float(rh.transition_objective(A_new, Q_new, stats))
+        obj_mismatched = float(
+            rh.transition_objective(A_new, residual_q(A_star), stats)
+        )
+        obj_old = float(rh.transition_objective(A_old, Q_old, stats))
+        assert obj_new > obj_mismatched, (obj_new, obj_mismatched)
+        assert obj_new > obj_old, (obj_new, obj_old)

@@ -1651,3 +1651,192 @@ class TestRelativeInitCovClip:
             jnp.stack([2.0 * jnp.eye(n)] * k, axis=-1),
             rtol=1e-10,
         )
+
+
+# ============================================================================
+# M-step exactness for the structured point-process models
+# ============================================================================
+
+
+def _pp_model_after_e_step(model):
+    """Simulate spikes from the model's own dynamics and run one E-step."""
+    from state_space_practice.simulate.simulate_switching_spikes import (
+        simulate_switching_spike_oscillator,
+    )
+    from state_space_practice.switching_point_process import SpikeObsParams
+
+    n_latent = model.n_latent
+    weights = jax.random.normal(jax.random.PRNGKey(3), (8, n_latent)) * 0.6
+    spikes, _, _ = simulate_switching_spike_oscillator(
+        n_time=400,
+        transition_matrices=model.continuous_transition_matrix,
+        process_covs=model.process_cov,
+        discrete_transition_matrix=jnp.array([[0.98, 0.02], [0.02, 0.98]]),
+        spike_weights=weights,
+        spike_baseline=jnp.full(8, 3.0),
+        dt=model.dt,
+        key=jax.random.PRNGKey(11),
+    )
+    model.spike_params = SpikeObsParams(
+        baseline=jnp.full((8, 2), 3.0),
+        weights=jnp.stack([weights, weights], axis=-1),
+    )
+    model.discrete_transition_matrix = jnp.array([[0.98, 0.02], [0.02, 0.98]])
+    return spikes
+
+
+@pytest.mark.slow
+class TestStructuredPointProcessMStepStationarity:
+    """Dynamics M-steps of CNM-PP / DIM-PP versus the expected objective
+    written out in ``recovery_helpers`` (GPB2 posterior, no Q regularization)."""
+
+    def test_cnm_pp_constrained_q_is_stationary(self):
+        from state_space_practice.oscillator_utils import (
+            construct_correlated_noise_process_covariance,
+        )
+        from state_space_practice.switching_point_process import (
+            QRegularizationConfig,
+        )
+        from state_space_practice.tests import recovery_helpers as rh
+
+        coupling = jnp.zeros((2, 2, 2)).at[0, 1, 0].set(0.03)
+        phase = jnp.zeros((2, 2, 2)).at[0, 1, 0].set(0.5)
+        model = CorrelatedNoisePointProcessModel(
+            n_oscillators=2,
+            n_neurons=8,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            freqs=jnp.array([6.0, 11.0]),
+            damping_coef=jnp.array([0.95, 0.9]),
+            process_variance=jnp.array([[0.06, 0.02], [0.05, 0.02]]),
+            phase_difference=phase,
+            coupling_strength=coupling,
+            smoother_type="gpb2",
+            q_regularization=QRegularizationConfig(enabled=False),
+            update_spike_params=False,
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        spikes = _pp_model_after_e_step(model)
+        # Start the Q update from a perturbed noise structure.
+        model.process_variance = model.process_variance * 1.5
+        model.coupling_strength = model.coupling_strength.at[0, 1, 1].set(0.01)
+        model._initialize_process_covariance()
+        model._e_step(spikes)
+        stats = rh.switching_posterior_stats(model)
+        Q_before = model.process_cov
+        model._m_step_dynamics()
+        model._project_parameters()
+
+        def Q_of(theta):
+            return jnp.stack(
+                [
+                    construct_correlated_noise_process_covariance(
+                        variance=jnp.asarray(theta[4 * j : 4 * j + 2]),
+                        phase_difference=jnp.zeros((2, 2))
+                        .at[0, 1]
+                        .set(theta[4 * j + 3]),
+                        coupling_strength=jnp.zeros((2, 2))
+                        .at[0, 1]
+                        .set(theta[4 * j + 2]),
+                    )
+                    for j in range(2)
+                ],
+                axis=-1,
+            )
+
+        theta = np.concatenate(
+            [
+                np.r_[
+                    np.asarray(model.process_variance)[:, j],
+                    np.asarray(model.coupling_strength)[0, 1, j],
+                    np.asarray(model.phase_difference)[0, 1, j],
+                ]
+                for j in range(2)
+            ]
+        )
+        np.testing.assert_allclose(Q_of(theta), model.process_cov, atol=1e-12)
+        A = model.continuous_transition_matrix
+
+        def f(t):
+            return rh.transition_objective(A, Q_of(t), stats)
+
+        grad = rh.central_difference_gradient(f, theta, 1e-8)
+        scale = np.max(np.abs(theta[[0, 1, 4, 5]]))
+        grad_start = rh.central_difference_gradient(
+            lambda c: rh.transition_objective(A, Q_before * (1.0 + c[0]), stats),
+            np.zeros(1),
+            1e-7,
+        )
+        assert abs(grad_start[0]) > 1.0, "guard: the start is not optimal"
+        # Relative to the objective's own scale (n_trans / variance).
+        assert np.max(np.abs(grad)) * scale < 1e-6 * stats["n_trans"].sum(), grad
+        assert float(rh.transition_objective(A, model.process_cov, stats)) > float(
+            rh.transition_objective(A, Q_before, stats)
+        )
+
+    @pytest.mark.parametrize("use_reparameterized_mstep", [False, True])
+    def test_dim_pp_transition_update_never_lowers_objective(
+        self, use_reparameterized_mstep
+    ):
+        """Start at a constrained point that beats the bare projection: the
+        standard DIM-PP M-step must keep it (generalized-EM safeguard) and the
+        reparameterized M-step must not lose objective."""
+        from state_space_practice.oscillator_utils import (
+            optimize_dim_transition_params_joint_until_stationary,
+        )
+        from state_space_practice.switching_point_process import (
+            QRegularizationConfig,
+        )
+        from state_space_practice.tests import recovery_helpers as rh
+
+        coupling = jnp.zeros((2, 2, 2)).at[1, 0, 0].set(0.3).at[0, 1, 1].set(0.3)
+        phase = jnp.zeros((2, 2, 2)).at[1, 0, 0].set(0.4).at[0, 1, 1].set(-0.4)
+        model = DirectedInfluencePointProcessModel(
+            n_oscillators=2,
+            n_neurons=8,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            freqs=jnp.array([6.0, 11.0]),
+            damping_coef=jnp.array([0.95, 0.9]),
+            process_variance=jnp.array([0.05, 0.03]),
+            phase_difference=phase,
+            coupling_strength=coupling,
+            smoother_type="gpb2",
+            q_regularization=QRegularizationConfig(enabled=False),
+            update_spike_params=False,
+            use_reparameterized_mstep=use_reparameterized_mstep,
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        spikes = _pp_model_after_e_step(model)
+        model._e_step(spikes)
+        stats = rh.switching_posterior_stats(model)
+        Q = model.process_cov
+
+        projected = rh.dim_projected_mstep_parameters(stats, model)
+        obj_projected = float(
+            rh.transition_objective(projected["transition_matrix"], Q, stats)
+        )
+        polished = optimize_dim_transition_params_joint_until_stationary(
+            gamma1=jnp.asarray(stats["gamma1"]),
+            beta=jnp.asarray(stats["beta"]),
+            init_params=projected,
+            sampling_freq=model.sampling_freq,
+            process_cov=Q,
+            max_spectral_radius=model.max_spectral_radius,
+            max_damping=model.max_damping,
+        )
+        rh.set_dim_public_params(model, polished)
+        obj_start = float(
+            rh.transition_objective(model.continuous_transition_matrix, Q, stats)
+        )
+        # Guard: the bare projection would lower the objective from this start.
+        assert obj_start > obj_projected + 1e-3, (obj_start, obj_projected)
+
+        model._m_step_dynamics()
+        model._project_parameters()
+        obj_after = float(
+            rh.transition_objective(model.continuous_transition_matrix, Q, stats)
+        )
+        assert obj_after >= obj_start - 1e-8 * abs(obj_start), (obj_after, obj_start)

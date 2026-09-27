@@ -409,3 +409,190 @@ def standardized_errors(
     z = err / np.sqrt(np.einsum("tkk->tk", cov))
     mahalanobis = np.einsum("tk,tkl,tl->t", err, np.linalg.inv(cov), err)
     return z, mahalanobis
+
+
+# ---------------------------------------------------------------------------
+# Expected complete-data objective of the switching LGSSM M-step
+# ---------------------------------------------------------------------------
+#
+# Written out from the definitions, independently of the library's M-step, so
+# tests can check that an installed M-step output is a stationary point (in
+# the model's constrained parametrisation) and that it does not decrease the
+# objective.  The posterior moments are the E-step's; with the GPB2 smoother
+# the pair-conditional moments are available and every statistic below is the
+# exact expectation under that (approximate) posterior.
+
+
+def switching_posterior_stats(model) -> dict:
+    """Posterior sufficient statistics of a fitted switching LGSSM model.
+
+    Requires the GPB2 smoother outputs (``smoother_pair_cond_covs`` and
+    ``smoother_next_pair_cond_means``).
+
+    Returns
+    -------
+    dict with
+        ``w`` (T, S)             P(S_t = j | y)
+        ``xi`` (T-1, S, S)       P(S_t = i, S_{t+1} = j | y)
+        ``mean`` (T, n, S), ``cov`` (T, n, n, S)  state-conditional moments
+        ``gamma1`` (n, n, S)     sum_{t,i} xi_t(i,j) E[x_t x_t^T | i, j]
+        ``beta`` (n, n, S)       sum_{t,i} xi_t(i,j) E[x_{t+1} x_t^T | i, j]
+        ``gamma2`` (n, n, S)     sum_{t>=2} w_tj E[x_t x_t^T | j]
+        ``n_trans`` (S,)         sum_{t>=2} w_tj
+    """
+    if model.smoother_pair_cond_covs is None:
+        raise ValueError("switching_posterior_stats needs the GPB2 smoother outputs")
+    w = np.asarray(model.smoother_discrete_state_prob)
+    xi = np.asarray(model.smoother_joint_discrete_state_prob)
+    mean = np.asarray(model.smoother_state_cond_mean)
+    cov = np.asarray(model.smoother_state_cond_cov)
+    pm = np.asarray(model.smoother_pair_cond_means)  # E[x_t | i, j]
+    pc = np.asarray(model.smoother_pair_cond_covs)  # Cov[x_t | i, j]
+    nm = np.asarray(model.smoother_next_pair_cond_means)  # E[x_{t+1} | i, j]
+    cc = np.asarray(model.smoother_pair_cond_cross_cov)  # Cov[x_t, x_{t+1} | i, j]
+    second = pc + np.einsum("taij,tbij->tabij", pm, pm)
+    cross = np.swapaxes(cc, 1, 2) + np.einsum("taij,tbij->tabij", nm, pm)
+    gamma1 = np.einsum("tij,tabij->abj", xi, second)
+    beta = np.einsum("tij,tabij->abj", xi, cross)
+    gamma2 = np.einsum("tj,tabj->abj", w[1:], cov[1:]) + np.einsum(
+        "tj,taj,tbj->abj", w[1:], mean[1:], mean[1:]
+    )
+    return {
+        "w": w,
+        "xi": xi,
+        "mean": mean,
+        "cov": cov,
+        "gamma1": gamma1,
+        "beta": beta,
+        "gamma2": gamma2,
+        "n_trans": w[1:].sum(axis=0),
+    }
+
+
+def _logdet(m):
+    return jnp.linalg.slogdet(m)[1]
+
+
+def transition_objective(A, Q, stats: dict):
+    """sum_j E[log N(x_{t+1}; A_j x_t, Q_j)] over transitions into state j (+const)."""
+    total = 0.0
+    for j in range(A.shape[-1]):
+        Aj, Qj = A[..., j], Q[..., j]
+        G1, B, G2 = (
+            stats["gamma1"][..., j],
+            stats["beta"][..., j],
+            stats["gamma2"][..., j],
+        )
+        scatter = G2 - Aj @ B.T - B @ Aj.T + Aj @ G1 @ Aj.T
+        total += -0.5 * (
+            stats["n_trans"][j] * _logdet(Qj) + jnp.trace(jnp.linalg.solve(Qj, scatter))
+        )
+    return total
+
+
+def observation_objective(H, R, obs, stats: dict):
+    """sum_{t,j} w_tj E[log N(y_t; H_j x_t, R_j) | S_t = j] (+const)."""
+    obs = jnp.asarray(obs)
+    total = 0.0
+    for j in range(H.shape[-1]):
+        Hj, Rj = H[..., j], R[..., j]
+        w = stats["w"][:, j]
+        resid = obs - stats["mean"][:, :, j] @ Hj.T
+        scatter = (
+            jnp.einsum("t,ta,tb->ab", w, resid, resid)
+            + Hj @ jnp.einsum("t,tab->ab", w, stats["cov"][..., j]) @ Hj.T
+        )
+        total += -0.5 * (
+            w.sum() * _logdet(Rj) + jnp.trace(jnp.linalg.solve(Rj, scatter))
+        )
+    return total
+
+
+def initial_state_objective(m0, P0, stats: dict):
+    """sum_j w_1j E[log N(x_1; m0_j, P0_j) | S_1 = j] (x_1 convention, +const)."""
+    total = 0.0
+    for j in range(m0.shape[-1]):
+        w1 = stats["w"][0, j]
+        d = stats["mean"][0, :, j] - m0[:, j]
+        scatter = stats["cov"][0, :, :, j] + jnp.outer(d, d)
+        total += (
+            -0.5
+            * w1
+            * (_logdet(P0[..., j]) + jnp.trace(jnp.linalg.solve(P0[..., j], scatter)))
+        )
+    return total
+
+
+def discrete_objective(Z, pi0, stats: dict):
+    """sum_t sum_ij xi_t(i,j) log Z_ij + sum_j w_1j log pi_j."""
+    counts = stats["xi"].sum(axis=0)
+    return jnp.sum(counts * jnp.log(Z)) + jnp.sum(stats["w"][0] * jnp.log(pi0))
+
+
+def central_difference_gradient(f, theta: np.ndarray, step: float = 1e-5) -> np.ndarray:
+    """Central finite-difference gradient of scalar ``f`` at flat ``theta``."""
+    theta = np.asarray(theta, dtype=float)
+    grad = np.zeros_like(theta)
+    for k in range(theta.size):
+        e = np.zeros_like(theta)
+        e[k] = step
+        grad[k] = (float(f(theta + e)) - float(f(theta - e))) / (2 * step)
+    return grad
+
+
+def symmetric_basis(n: int) -> list[np.ndarray]:
+    """Basis of the symmetric n x n matrices (for directional derivatives)."""
+    basis = []
+    for a in range(n):
+        for b in range(a, n):
+            e = np.zeros((n, n))
+            e[a, b] = e[b, a] = 1.0
+            basis.append(e)
+    return basis
+
+
+def dim_projected_mstep_parameters(stats: dict, model) -> dict:
+    """What the bare standard DIM M-step installs for these statistics.
+
+    Unconstrained per-state ``A* = Beta Gamma1^{-1}``, projected onto the
+    oscillator family (``project_transition_matrix_stack``), with the shared
+    frequency/damping averaged across states -- i.e. the standard M-step
+    *without* the generalized-EM safeguard.  Returns the public parameters in
+    the joint optimizer's layout plus the rebuilt ``transition_matrix``.
+    """
+    from state_space_practice.oscillator_utils import (
+        construct_stable_directed_influence_transition_stack,
+        extract_dim_params_from_matrix_stack,
+        project_transition_matrix_stack,
+    )
+
+    n_states = stats["gamma1"].shape[-1]
+    a_star = jnp.stack(
+        [
+            jnp.linalg.solve(stats["gamma1"][..., j].T, stats["beta"][..., j].T).T
+            for j in range(n_states)
+        ],
+        axis=-1,
+    )
+    projected = project_transition_matrix_stack(a_star, model.max_spectral_radius)
+    params = extract_dim_params_from_matrix_stack(
+        projected, model.sampling_freq, model.n_oscillators
+    )
+    params["transition_matrix"] = construct_stable_directed_influence_transition_stack(
+        params["freq"],
+        params["damping"],
+        params["coupling_strength"],
+        params["phase_diff"],
+        model.sampling_freq,
+        max_spectral_radius=model.max_spectral_radius,
+    )
+    return params
+
+
+def set_dim_public_params(model, params: dict) -> None:
+    """Install joint-optimizer-layout DIM parameters and rebuild ``A``."""
+    model.freqs = jnp.asarray(params["freq"])
+    model.damping_coef = jnp.asarray(params["damping"])
+    model.coupling_strength = jnp.asarray(params["coupling_strength"])
+    model.phase_difference = jnp.asarray(params["phase_diff"])
+    model._rebuild_stable_transition_matrix()
