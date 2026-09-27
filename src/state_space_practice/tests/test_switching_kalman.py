@@ -7865,8 +7865,8 @@ def test_mstep_covariances_are_scale_equivariant(random_mstep_stats):
 
 
 def test_mstep_floor_engages_relatively_and_is_logged(random_mstep_stats, caplog):
-    """A genuinely singular Q (noise-free latent) is floored relative to its own
-    scale and the floor is reported; a regular Q is left untouched."""
+    """A genuinely singular Q (noise-free latent) is floored on its own
+    correlation scale and the floor is reported; a regular Q is left untouched."""
     with caplog.at_level("WARNING"):
         switching_kalman_maximization_step(**random_mstep_stats)
     assert "relative eigenvalue floor" not in caplog.text
@@ -7887,8 +7887,10 @@ def test_mstep_floor_engages_relatively_and_is_logged(random_mstep_stats, caplog
         _, _, Q, *_ = switching_kalman_maximization_step(**stats)
     assert "relative eigenvalue floor" in caplog.text
     for k in range(2):
-        eig = np.linalg.eigvalsh(np.asarray(Q[..., k]))
-        np.testing.assert_allclose(eig[0], 1e-10 * eig.sum() / 3, rtol=1e-4)
+        Q_k = np.asarray(Q[..., k])
+        d = np.sqrt(np.diag(Q_k))
+        eig = np.linalg.eigvalsh(Q_k / np.outer(d, d))
+        np.testing.assert_allclose(eig[0], 1e-10 * eig[-1], rtol=1e-4)
 
 
 def test_mstep_keeps_previous_params_for_near_empty_state(random_mstep_stats, caplog):

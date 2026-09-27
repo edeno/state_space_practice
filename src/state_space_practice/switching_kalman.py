@@ -26,6 +26,7 @@ from state_space_practice.kalman import (
     kalman_measurement_update,
 )
 from state_space_practice.utils import (
+    clip_eigenvalues_relative,
     contains_tracer,
     debug_print_if,
     psd_cholesky,
@@ -2119,40 +2120,25 @@ psd_solve_per_discrete_state = jax.vmap(
     out_axes=-1,
 )
 
-# Relative eigenvalue floor for the M-step covariance estimates: an eigenvalue
-# below ``_MSTEP_COV_RELATIVE_FLOOR * trace(cov) / n`` is raised to that value.
-# Relative (not absolute) so the floor means the same thing in any latent or
-# observation units.
+# Relative eigenvalue floor for the M-step covariance estimates, applied on the
+# correlation scale (see utils.project_psd_relative): an eigenvalue of
+# D^{-1/2} C D^{-1/2} below ``_MSTEP_COV_RELATIVE_FLOOR`` times the largest one
+# is raised to it. Correlation-scale (not absolute, not relative to the largest
+# eigenvalue of C) so the floor means the same thing in any latent or
+# observation units, per coordinate.
 _MSTEP_COV_RELATIVE_FLOOR = 1e-10
 
 
-def _floor_covariance_relative(
-    cov: jax.Array, relative_floor: float = _MSTEP_COV_RELATIVE_FLOOR
-) -> tuple[jax.Array, jax.Array]:
-    """Symmetrize and floor eigenvalues relative to the covariance's own scale.
+def _floor_covariance_relative(cov: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """``clip_eigenvalues_relative`` at the M-step floor, with a changed flag.
 
-    Parameters
-    ----------
-    cov : jax.Array, shape (n, n)
-    relative_floor : float
-        Eigenvalues below ``relative_floor * trace(cov) / n`` are raised to it.
-
-    Returns
-    -------
-    floored : jax.Array, shape (n, n)
-        ``symmetrize(cov)`` unchanged when no eigenvalue is below the floor
-        (no eigen-reconstruction round-off), otherwise the floored matrix.
-    changed : jax.Array, bool scalar
-        Whether any eigenvalue was raised.
+    Returns ``(floored, changed)``: ``floored`` is ``symmetrize(cov)`` exactly
+    when nothing was floored; ``changed`` is a bool scalar.
     """
-    cov = symmetrize(cov)
-    n = cov.shape[-1]
-    tiny = jnp.finfo(cov.dtype).tiny
-    floor = relative_floor * jnp.maximum(jnp.trace(cov) / n, tiny)
-    eigvals, eigvecs = jnp.linalg.eigh(cov)
-    changed = jnp.any(eigvals < floor)
-    projected = symmetrize((eigvecs * jnp.maximum(eigvals, floor)[None, :]) @ eigvecs.T)
-    return jnp.where(changed, projected, cov), changed
+    floored, n_floored = clip_eigenvalues_relative(
+        cov, relative_floor=_MSTEP_COV_RELATIVE_FLOOR
+    )
+    return floored, n_floored > 0
 
 
 _floor_covariance_relative_per_discrete_state = jax.vmap(
@@ -2568,7 +2554,8 @@ def switching_kalman_maximization_step(
             # legitimately produce singular per-state R/Q.
             logger.warning(
                 "switching_kalman_maximization_step: the relative eigenvalue "
-                "floor (%g x trace / n) raised an eigenvalue of R or Q for "
+                "floor (%g x the largest eigenvalue, on the correlation scale) "
+                "raised an eigenvalue of R or Q for "
                 "discrete state(s) %s; the estimate was (numerically) singular.",
                 _MSTEP_COV_RELATIVE_FLOOR,
                 floored_states,

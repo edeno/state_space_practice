@@ -836,6 +836,50 @@ class TestRelativePsdFloor:
             jax.effects_barrier()
         assert any("jit_cov" in r.getMessage() for r in caplog.records)
 
+    def test_small_variance_next_to_large_one_is_unchanged(self) -> None:
+        """The floor is per-coordinate: a PD matrix with variances 1e4 and
+        1e-5 (ratio 1e-9, below 1e-8 * lambda_max) is left as it is."""
+        cov = jnp.diag(jnp.array([1e4, 1e-5]))
+        projected, n_floored = clip_eigenvalues_relative(cov)
+        np.testing.assert_array_equal(projected, cov)
+        assert int(n_floored) == 0
+
+    @pytest.mark.parametrize(
+        "cov",
+        [
+            # rank one (two perfectly correlated coordinates + an independent one)
+            [[1.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, 2.0]],
+            # indefinite
+            [[1.0, 0.9, 0.3], [0.9, 0.5, 0.0], [0.3, 0.0, 1.0]],
+        ],
+    )
+    def test_floor_is_equivariant_under_diagonal_rescaling(self, cov) -> None:
+        cov = jnp.asarray(cov)
+        s = jnp.array([1e-6, 1.0, 1e6])
+        scaled_then_floored, n_scaled = clip_eigenvalues_relative(
+            s[:, None] * cov * s[None, :]
+        )
+        floored, n = clip_eigenvalues_relative(cov)
+        # guard: the floor actually binds for this matrix.
+        assert int(n) > 0 and int(n_scaled) == int(n)
+        np.testing.assert_allclose(
+            scaled_then_floored / (s[:, None] * s[None, :]), floored, rtol=1e-9
+        )
+        assert np.linalg.eigvalsh(np.asarray(floored)).min() > 0.0
+
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_well_conditioned_psd_matrix_is_returned_unchanged(self, seed) -> None:
+        rng = np.random.default_rng(seed)
+        X = rng.normal(size=(4, 4))
+        cov = jnp.asarray(X @ X.T + 0.5 * np.eye(4))
+        cov = jnp.asarray(
+            np.diag([1e-3, 1.0, 1e2, 1e5]) @ cov @ np.diag([1e-3, 1.0, 1e2, 1e5])
+        )
+        cov = 0.5 * (cov + cov.T)
+        projected, n_floored = clip_eigenvalues_relative(cov)
+        assert int(n_floored) == 0
+        np.testing.assert_array_equal(projected, cov)
+
     def test_floor_variances_relative(self) -> None:
         v = jnp.array([1e-6, 1e-20, 2e-6])
         np.testing.assert_allclose(

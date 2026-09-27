@@ -424,24 +424,28 @@ def clip_eigenvalues_relative(
     relative_floor: float = PSD_RELATIVE_FLOOR,
     absolute_floor: float = PSD_ABSOLUTE_FLOOR,
 ) -> tuple[Array, Array]:
-    """Clip eigenvalues at a relative floor and count how many were raised.
+    """Floor a covariance on the correlation scale and count what was raised.
 
     The silent core of :func:`project_psd_relative`, for callers that report
-    the count themselves (e.g. accumulated over a ``lax.scan``).
+    the count themselves (e.g. accumulated over a ``lax.scan``). See
+    :func:`project_psd_relative` for the projection.
 
     Parameters
     ----------
     cov : Array, shape (n, n)
         Covariance-like matrix; only its symmetric part is used.
     relative_floor, absolute_floor : float
-        See :func:`relative_psd_floor`.
+        See :func:`relative_psd_floor`; applied to the eigenvalues of the
+        correlation-scaled matrix.
 
     Returns
     -------
     projected : Array, shape (n, n)
-        Symmetric matrix whose eigenvalues are all ``>= floor``.
+        ``symmetrize(cov)`` exactly when no eigenvalue is floored, otherwise
+        the floored matrix (positive definite).
     n_floored : Array
-        Number of eigenvalues that were raised to the floor (int scalar).
+        Number of correlation-scale eigenvalues that were raised to the floor
+        (int scalar).
     """
     projected, n_floored, _ = _clip_eigenvalues_relative(
         cov, relative_floor, absolute_floor
@@ -449,17 +453,47 @@ def clip_eigenvalues_relative(
     return projected, n_floored
 
 
+def _correlation_scale(cov: Array) -> Array:
+    """Per-coordinate scale ``sqrt(d_i)`` used to form ``D^{-1/2} C D^{-1/2}``.
+
+    A nonpositive diagonal entry (a degenerate or indefinite coordinate) has
+    no scale of its own and uses the largest diagonal entry instead; an
+    all-nonpositive diagonal uses 1 (the absolute scale).
+
+    Parameters
+    ----------
+    cov : Array, shape (..., n, n)
+        Symmetric matrix.
+
+    Returns
+    -------
+    scale : Array, shape (..., n)
+        Positive scales.
+    """
+    diag = jnp.diagonal(cov, axis1=-2, axis2=-1)
+    max_diag = jnp.max(diag, axis=-1, keepdims=True)
+    fallback = jnp.where(max_diag > 0.0, max_diag, jnp.ones_like(max_diag))
+    return jnp.sqrt(jnp.where(diag > 0.0, diag, fallback))
+
+
 def _clip_eigenvalues_relative(
     cov: Array, relative_floor: float, absolute_floor: float
 ) -> tuple[Array, Array, Array]:
-    """:func:`clip_eigenvalues_relative` that also returns the floor used."""
+    """:func:`clip_eigenvalues_relative` that also returns the floor used.
+
+    The floor is on the correlation scale (the returned ``floor`` is in
+    correlation units).
+    """
     cov = symmetrize(jnp.asarray(cov))
-    eigvals, eigvecs = jnp.linalg.eigh(cov)
+    scale = _correlation_scale(cov)
+    outer_scale = scale[..., :, None] * scale[..., None, :]
+    eigvals, eigvecs = jnp.linalg.eigh(cov / outer_scale)
     floor = relative_psd_floor(eigvals, relative_floor, absolute_floor)
     floored = eigvals < floor
-    eigvals = jnp.where(floored, floor, eigvals)
-    projected = symmetrize((eigvecs * eigvals[None, :]) @ eigvecs.T)
-    return projected, jnp.sum(floored, dtype=jnp.int32), floor
+    raised = jnp.where(floored, floor, eigvals)
+    projected = symmetrize(((eigvecs * raised[None, :]) @ eigvecs.T) * outer_scale)
+    n_floored = jnp.sum(floored, dtype=jnp.int32)
+    return jnp.where(n_floored > 0, projected, cov), n_floored, floor
 
 
 def project_psd_relative(
@@ -469,20 +503,26 @@ def project_psd_relative(
     name: str = "covariance",
     warn: bool = True,
 ) -> Array:
-    """Symmetrize a covariance and clip its eigenvalues at a relative floor.
+    """Symmetrize a covariance and floor its eigenvalues on the correlation scale.
 
-    The scale-aware replacement for ``stabilize_covariance(cov,
-    min_eigenvalue=<absolute>)`` in the EM M-steps: eigenvalues below
-    :func:`relative_psd_floor` of the matrix are raised to it, the rest are
-    left untouched, so a well-conditioned covariance passes through exactly
-    (up to the eigen-reconstruction roundoff).
+    The scale-aware covariance projection of the EM M-steps. With ``D`` the
+    positive diagonal of ``C = symmetrize(cov)`` (see
+    :func:`_correlation_scale` for nonpositive entries), the eigenvalues of
+    the correlation-scaled matrix ``D^{-1/2} C D^{-1/2}`` below
+    :func:`relative_psd_floor` of it are raised to it and the result is
+    scaled back. The projection is therefore equivariant under any diagonal
+    change of units, ``floor(S C S) = S floor(C) S``: a small variance next
+    to a large one is floored relative to its own scale, not to the largest
+    eigenvalue. A covariance with no correlation-scale eigenvalue below the
+    floor is returned exactly (``symmetrize(cov)``).
 
     Parameters
     ----------
     cov : Array, shape (n, n)
         Covariance estimate; only its symmetric part is used.
     relative_floor, absolute_floor : float
-        See :func:`relative_psd_floor`.
+        See :func:`relative_psd_floor`; applied to the correlation-scaled
+        eigenvalues.
     name : str, default="covariance"
         Name used in the log message.
     warn : bool, default=True
@@ -492,7 +532,7 @@ def project_psd_relative(
     Returns
     -------
     projected : Array, shape (n, n)
-        Symmetric matrix whose eigenvalues are all ``>= floor``.
+        Symmetric positive-definite matrix.
     """
     projected, n_floored, floor = _clip_eigenvalues_relative(
         cov, relative_floor, absolute_floor
