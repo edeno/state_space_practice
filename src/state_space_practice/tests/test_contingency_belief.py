@@ -1300,3 +1300,37 @@ class TestContingencyMStepExactness:
         np.testing.assert_allclose(
             Z, counts / counts.sum(axis=1, keepdims=True), atol=1e-5
         )
+
+
+@pytest.mark.slow
+def test_reward_prob_recovery_improves_with_data():
+    """EM recovery as a statistic: 3 seeds at 120 and 480 trials.
+
+    States alternate every 40 trials; the agent picks the state's best option
+    75% of the time. The well-sampled cells (each state's best option, true
+    reward probability 0.8) are compared after matching the arbitrary state
+    labels; the mean error over seeds must shrink with 4x the data (observed
+    0.16 -> 0.05).
+    """
+    p_true = np.array([[0.8, 0.2, 0.2], [0.2, 0.2, 0.8]])
+
+    def error(n_trials, seed):
+        rng = np.random.default_rng(seed)
+        states = (np.arange(n_trials) // 40) % 2
+        best = np.array([0, 2])[states]
+        choices = np.where(
+            rng.random(n_trials) < 0.75, best, rng.integers(0, 3, n_trials)
+        )
+        rewards = (rng.random(n_trials) < p_true[states, choices]).astype(int)
+        model = ContingencyBeliefModel(n_states=2, n_options=3, seed=seed)
+        model.fit(choices, rewards, max_iter=40)
+        rp = np.asarray(model.reward_probs_)
+        same = max(abs(rp[0, 0] - 0.8), abs(rp[1, 2] - 0.8))
+        swapped = max(abs(rp[1, 0] - 0.8), abs(rp[0, 2] - 0.8))
+        return min(same, swapped)
+
+    small = [error(120, s) for s in range(3)]
+    large = [error(480, s) for s in range(3)]
+    msg = f"per-seed errors: 120 trials {np.round(small, 3)}, 480 trials {np.round(large, 3)}"
+    assert np.mean(large) < 0.6 * np.mean(small), msg
+    assert np.mean(large) < 0.1, msg

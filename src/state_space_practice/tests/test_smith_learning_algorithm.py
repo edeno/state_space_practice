@@ -2405,3 +2405,45 @@ class TestSmithMStepExactness:
         new_rule = self._objective(stats, s2, x0, p0)
         assert p0 > 1e-6  # interior optimum on this data
         assert new_rule > old_rule + 0.01, (old_rule, new_rule)
+
+
+@pytest.mark.slow
+def test_sigma_recovery_evidence_vs_em_as_statistics():
+    """Process-noise recovery over 3 seeds (300 Bernoulli trials, sigma^2=0.05).
+
+    Reference: the exact maximum-likelihood sigma^2 on a grid (quadrature).
+    The model's Laplace evidence (the fit_sgd objective) peaks at the same
+    grid value on every seed. EM's fixed point is biased upwards by the
+    Laplace E-step (observed EM / exact = 1.6, 1.6, 2.1): pinned, so a change
+    in either direction is noticed.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_oracle_choice import _exact_smith
+
+    grid = np.linspace(-10, 10, 401)
+    s2_grid = np.array([0.01, 0.02, 0.035, 0.05, 0.07, 0.1, 0.15, 0.2])
+    ratios, report = [], []
+    for seed in range(3):
+        rng = np.random.default_rng(seed)
+        x = np.cumsum(rng.normal(0, np.sqrt(0.05), 300))
+        y = (rng.random(300) < 1 / (1 + np.exp(-x))).astype(int)
+        exact = [_exact_smith(y, 1, v, 0.0, v, 0.0, grid=grid)[2] for v in s2_grid]
+        evidence = [
+            SmithLearningModel(
+                max_possible_correct=1,
+                sigma_epsilon=float(np.sqrt(v)),
+                init_learning_variance=float(v),
+            )._e_step(jnp.asarray(y))
+            for v in s2_grid
+        ]
+        s2_exact = s2_grid[np.argmax(exact)]
+        model = SmithLearningModel(max_possible_correct=1, sigma_epsilon=0.5)
+        model.fit(jnp.asarray(y), max_iter=60)
+        ratios.append(model.sigma_epsilon**2 / s2_exact)
+        report.append((s2_exact, s2_grid[np.argmax(evidence)], model.sigma_epsilon**2))
+        assert s2_grid[np.argmax(evidence)] == s2_exact, report
+    msg = f"(exact MLE, evidence argmax, EM) per seed: {report}"
+    assert all(1.2 < r < 2.8 for r in ratios), msg
