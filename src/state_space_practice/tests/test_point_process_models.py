@@ -1763,12 +1763,19 @@ class TestStructuredPointProcessMStepStationarity:
 
         grad = rh.central_difference_gradient(f, theta, 1e-8)
         scale = np.max(np.abs(theta[[0, 1, 4, 5]]))
-        grad_start = rh.central_difference_gradient(
-            lambda c: rh.transition_objective(A, Q_before * (1.0 + c[0]), stats),
-            np.zeros(1),
-            1e-7,
-        )
-        assert abs(grad_start[0]) > 1.0, "guard: the start is not optimal"
+        def _scale_derivative(Q):
+            return rh.central_difference_gradient(
+                lambda c: rh.transition_objective(A, Q * (1.0 + c[0]), stats),
+                np.zeros(1),
+                1e-7,
+            )[0]
+
+        grad_start = _scale_derivative(Q_before)
+        grad_end = _scale_derivative(np.asarray(model.process_cov))
+        # Guard: the start must be clearly non-stationary along the overall
+        # scale of Q, and the M-step must remove almost all of that slope.
+        assert abs(grad_start) > 0.1, "guard: the start is not optimal"
+        assert abs(grad_start) > 1e3 * abs(grad_end), (grad_start, grad_end)
         # Relative to the objective's own scale (n_trans / variance).
         assert np.max(np.abs(grad)) * scale < 1e-6 * stats["n_trans"].sum(), grad
         assert float(rh.transition_objective(A, model.process_cov, stats)) > float(
