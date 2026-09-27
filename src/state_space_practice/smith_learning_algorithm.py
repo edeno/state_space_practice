@@ -577,13 +577,38 @@ def smith_learning_smoother(
     )
 
 
-@jax.jit
+# Floor for the re-estimated initial-state variance: the M-step optimum
+# P_{1|T} - sigma^2 is often <= 0, and a strictly positive value keeps the
+# POSITIVE transform of fit_sgd finite.
+_MIN_INIT_LEARNING_VARIANCE = 1e-8
+
+
+@partial(jax.jit, static_argnames=["estimate_initial_variance"])
 def maximization_step(
     smoothed_learning_state_mode: ArrayLike,
     smoothed_learning_state_variance: ArrayLike,
     smoother_gain: ArrayLike,
+    estimate_initial_variance: bool = True,
 ) -> tuple[Array, Array, Array]:
-    """Estimate process noise from smoothed estimates.
+    r"""Exact EM M-step for the process noise and the initial state.
+
+    The filter draws ``x_1 ~ N(x_0, P_0 + \sigma^2)`` (one random-walk step
+    from the initial state ``x_0`` with variance ``P_0``) and then
+    ``x_{k+1} ~ N(x_k, \sigma^2)``. The expected complete-data
+    log-likelihood in ``(\sigma^2, x_0, P_0)`` is
+
+    .. math::
+
+        -\tfrac12 \log(P_0 + \sigma^2)
+        - \frac{(x_{1|T} - x_0)^2 + P_{1|T}}{2 (P_0 + \sigma^2)}
+        - \tfrac{T-1}{2} \log \sigma^2 - \frac{S}{2 \sigma^2},
+        \qquad S = \sum_k E[(x_{k+1} - x_k)^2 | y_{1:T}].
+
+    Its maximiser is ``\sigma^2 = S / (T - 1)``, ``x_0 = x_{1|T}`` and
+    ``P_0 = P_{1|T} - \sigma^2`` (floored at a small positive value). The
+    variance update previously returned ``P_{1|T}`` itself, which makes the
+    prior on ``x_1`` ``P_{1|T} + \sigma^2`` -- a generalised-EM step that
+    does not maximise the objective.
 
     Parameters
     ----------
@@ -593,15 +618,21 @@ def maximization_step(
         Smoothed learning state variance estimates.
     smoother_gain : ArrayLike, shape (n_trials - 1,)
         Smoother gain estimates.
+    estimate_initial_variance : bool, default True
+        Maximise jointly over ``(sigma^2, x_0, P_0)`` (the default
+        ``"reestimate_initial_from_data"`` method). False maximises the
+        transition terms only (static under ``jax.jit``).
 
     Returns
     -------
     sigma_epsilon : Array, shape ()
         Estimated process noise standard deviation (scalar).
     init_learning_state : Array, shape ()
-        Initial learning state estimate (scalar).
+        Initial learning state estimate ``x_{1|T}`` (scalar).
     init_learning_variance : Array, shape ()
-        Initial learning state variance estimate (scalar).
+        Initial learning state variance estimate
+        ``max(P_{1|T} - sigma_epsilon**2, 1e-8)`` (``P_{1|T}`` when
+        ``estimate_initial_variance`` is False).
     """
     smoothed_learning_state_mode = jnp.asarray(smoothed_learning_state_mode)
     smoothed_learning_state_variance = jnp.asarray(smoothed_learning_state_variance)
@@ -619,14 +650,29 @@ def maximization_step(
         * smoother_gain  # Cov = A_k * P_{k+1|T}
     )
 
-    sigma_epsilon_sq = jnp.sum(expected_squared_diff_terms) / (n_trials - 1)
+    expected_squared_diff = jnp.sum(expected_squared_diff_terms)
+    sigma_epsilon_sq = expected_squared_diff / (n_trials - 1)
+    first_variance = smoothed_learning_state_variance[0]
+    if estimate_initial_variance:
+        # P_0 = P_{1|T} - sigma^2 >= 0 binds: optimum at P_0 = 0, where the
+        # prior term (x_1 - x_0)^2 / sigma^2 joins the transition terms.
+        sigma_epsilon_sq = jnp.where(
+            first_variance >= sigma_epsilon_sq,
+            sigma_epsilon_sq,
+            (expected_squared_diff + first_variance) / n_trials,
+        )
     # Clamp to prevent NaN from negative values (can occur when smoother
     # gains exceed 1) and enforce a minimum floor to avoid degenerate estimates.
     sigma_epsilon_sq = jnp.maximum(sigma_epsilon_sq, 1e-12)
     sigma_epsilon = jnp.sqrt(sigma_epsilon_sq)
 
     init_learning_state = smoothed_learning_state_mode[0]
-    init_learning_variance = smoothed_learning_state_variance[0]
+    if estimate_initial_variance:
+        init_learning_variance = jnp.maximum(
+            first_variance - sigma_epsilon_sq, _MIN_INIT_LEARNING_VARIANCE
+        )
+    else:
+        init_learning_variance = first_variance
 
     return sigma_epsilon, init_learning_state, init_learning_variance
 
@@ -1602,6 +1648,9 @@ class SmithLearningModel(SGDFittableMixin):
             self.smoothed_learning_state_mode,
             self.smoothed_learning_state_variance,
             self.smoother_gain,
+            estimate_initial_variance=(
+                self.initial_state_method == "reestimate_initial_from_data"
+            ),
         )
         self.sigma_epsilon = float(sigma_epsilon_new)
 

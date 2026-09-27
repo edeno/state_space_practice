@@ -354,13 +354,30 @@ class TestMaximizationStep:
 
         np.testing.assert_allclose(init_mean, s["mode"][0], rtol=1e-10)
 
-    def test_init_var_equals_first_smoother(self, smoother_outputs) -> None:
-        """Estimated initial variance should equal first smoother variance."""
+    def test_init_var_is_first_smoother_variance_minus_process_noise(
+        self, smoother_outputs
+    ) -> None:
+        """x_1 ~ N(x_0, P_0 + sigma^2): the optimum is P_0 = P_{1|T} - sigma^2."""
         s = smoother_outputs
 
-        _, _, init_var = maximization_step(s["mode"], s["variance"], s["gain"])
+        sigma, _, init_var = maximization_step(s["mode"], s["variance"], s["gain"])
 
-        np.testing.assert_allclose(init_var, s["variance"][0], rtol=1e-10)
+        np.testing.assert_allclose(
+            init_var, max(float(s["variance"][0] - sigma**2), 1e-8), rtol=1e-10
+        )
+
+    def test_transition_only_estimate_for_fixed_initial_variance(
+        self, smoother_outputs
+    ) -> None:
+        """Heuristic initial-state methods keep sigma^2 = S / (T - 1)."""
+        s = smoother_outputs
+        m, P, G = (np.asarray(s[k]) for k in ("mode", "variance", "gain"))
+        S = np.sum((m[1:] - m[:-1]) ** 2 + P[1:] + P[:-1] - 2 * P[1:] * G)
+        sigma, _, init_var = maximization_step(
+            s["mode"], s["variance"], s["gain"], estimate_initial_variance=False
+        )
+        np.testing.assert_allclose(sigma**2, S / (len(m) - 1), rtol=1e-10)
+        np.testing.assert_allclose(init_var, P[0], rtol=1e-10)
 
 
 class TestCalculateProbabilityConfidenceLimits:
@@ -1736,7 +1753,7 @@ class TestSmithLearningModelTrialComparison:
 
 # --- Property-Based Tests using Hypothesis ---
 
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 
@@ -2268,3 +2285,123 @@ class TestSmithEMRollback:
             model.smoothed_learning_state_mode, accepted["smoothed_mode"]
         )
         assert any("rolling back" in r.message.lower() for r in caplog.records)
+
+
+class TestSmithMStepExactness:
+    """The M-step maximises the expected complete-data log-likelihood.
+
+    The objective is written out here independently of the implementation:
+    with ``x_1 ~ N(x_0, P_0 + s2)`` and ``x_{k+1} ~ N(x_k, s2)``,
+
+        Q(s2, x_0, P_0) = -1/2 log(P_0 + s2) - ((m_1 - x_0)^2 + P_1)/(2 (P_0 + s2))
+                          - (T-1)/2 log s2 - S / (2 s2),
+
+    S = sum_k E[(x_{k+1} - x_k)^2 | y]. The returned parameters must be a
+    stationary point (central finite differences) and must not decrease Q.
+    """
+
+    @staticmethod
+    def _objective(stats, s2, x0, p0):
+        m, P, G = stats
+        n = m.shape[0]
+        S = np.sum((m[1:] - m[:-1]) ** 2 + P[1:] + P[:-1] - 2 * P[1:] * G)
+        v = p0 + s2
+        return (
+            -0.5 * np.log(v)
+            - ((m[0] - x0) ** 2 + P[0]) / (2 * v)
+            - 0.5 * (n - 1) * np.log(s2)
+            - S / (2 * s2)
+        )
+
+    @pytest.mark.slow
+    @given(
+        seed=st.integers(0, 10_000),
+        sigma=st.floats(0.1, 0.8),
+        init_var=st.floats(0.05, 2.0),
+    )
+    @example(seed=0, sigma=0.75, init_var=0.25)  # P_0 >= 0 binds
+    @settings(max_examples=8, deadline=None)
+    def test_m_step_is_stationary_and_ascends(self, seed, sigma, init_var):
+        rng = np.random.default_rng(seed)
+        n_trials = 25
+        x = np.cumsum(rng.normal(0, 0.4, n_trials)) + 1.0
+        y = (rng.random(n_trials) < 1 / (1 + np.exp(-x))).astype(int)
+        model = SmithLearningModel(
+            max_possible_correct=1,
+            sigma_epsilon=sigma,
+            init_learning_variance=init_var,
+            init_learning_state=0.2,
+        )
+        model._e_step(jnp.asarray(y))
+        stats = tuple(
+            np.asarray(a, dtype=float)
+            for a in (
+                model.smoothed_learning_state_mode,
+                model.smoothed_learning_state_variance,
+                model.smoother_gain,
+            )
+        )
+        old = (sigma**2, 0.2, init_var)
+        model._m_step(jnp.asarray(y))
+        new = (
+            model.sigma_epsilon**2,
+            model.init_learning_state,
+            model.init_learning_variance,
+        )
+        q_old = self._objective(stats, *old)
+        q_new = self._objective(stats, *new)
+        assert q_new >= q_old - 1e-10, (q_old, q_new)
+
+        # Stationarity in s2 and x_0 (always interior) ...
+        eps = 1e-6
+        for i in (0, 1):
+            up = list(new)
+            dn = list(new)
+            up[i] += eps
+            dn[i] -= eps
+            grad = (self._objective(stats, *up) - self._objective(stats, *dn)) / (
+                2 * eps
+            )
+            assert abs(grad) < 1e-5 * max(1.0, abs(q_new)), (i, grad, new)
+        # ... and in P_0 unless the optimum P_{1|T} - s2 is clipped at the
+        # floor, where Q must be non-increasing in P_0 (KKT).
+        up = list(new)
+        up[2] += eps
+        dn = list(new)
+        dn[2] = max(new[2] - eps, 0.0)
+        grad_p0 = (self._objective(stats, *up) - self._objective(stats, *dn)) / (
+            up[2] - dn[2]
+        )
+        if new[2] > 1e-6:
+            assert abs(grad_p0) < 1e-4, (grad_p0, new)
+        else:
+            assert grad_p0 <= 1e-6, (grad_p0, new)
+
+    @pytest.mark.slow
+    def test_old_init_variance_update_was_not_the_maximiser(self):
+        """Guard for the regression: P_0 = P_{1|T} leaves ascent on the table."""
+        rng = np.random.default_rng(1)
+        x = np.cumsum(rng.normal(0, 0.3, 40))
+        y = (rng.random(40) < 1 / (1 + np.exp(-x))).astype(int)
+        model = SmithLearningModel(
+            max_possible_correct=1, init_learning_variance=0.5, sigma_epsilon=0.4
+        )
+        model._e_step(jnp.asarray(y))
+        stats = tuple(
+            np.asarray(a, dtype=float)
+            for a in (
+                model.smoothed_learning_state_mode,
+                model.smoothed_learning_state_variance,
+                model.smoother_gain,
+            )
+        )
+        model._m_step(jnp.asarray(y))
+        s2, x0, p0 = (
+            model.sigma_epsilon**2,
+            model.init_learning_state,
+            model.init_learning_variance,
+        )
+        old_rule = self._objective(stats, s2, x0, float(stats[1][0]))
+        new_rule = self._objective(stats, s2, x0, p0)
+        assert p0 > 1e-6  # interior optimum on this data
+        assert new_rule > old_rule + 0.01, (old_rule, new_rule)
