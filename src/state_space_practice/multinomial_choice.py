@@ -1023,22 +1023,15 @@ class MultinomialChoiceModel(SGDFittableMixin):
         # fit_sgd reuses a compiled step only while the attributes the loss
         # read at trace time are unchanged, and these are rewritten by every
         # fit.
+        def _param(key: str) -> Array:
+            return params[key] if key in params else jnp.array(getattr(self, key))
+
         k_free = self.n_options - 1
-        process_noise = (
-            params["process_noise"]
-            if "process_noise" in params
-            else jnp.array(self.process_noise)
-        )
-        inverse_temperature = (
-            params["inverse_temperature"]
-            if "inverse_temperature" in params
-            else jnp.array(self.inverse_temperature)
-        )
         result = _multinomial_choice_filter_jit(
             choices,
             self.n_options,
-            process_noise,
-            inverse_temperature,
+            _param("process_noise"),
+            _param("inverse_temperature"),
             jnp.zeros(k_free),
             jnp.eye(k_free),
         )
