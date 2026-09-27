@@ -33,7 +33,7 @@ import logging
 import operator
 import warnings
 from collections.abc import Callable
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
@@ -1243,6 +1243,39 @@ BERNOULLI_LOGIT_FAMILY = GLMFamily(
     loglik_plugin=_bernoulli_loglik,
     loglik_normalized=_bernoulli_loglik,
 )
+
+
+@overload
+def glm_laplace_update(
+    one_step_mean: Array,
+    one_step_cov: Array,
+    observations: Array,
+    eta_func: Callable[[Array], Array],
+    family: GLMFamily,
+    diagonal_boost: float = ...,
+    grad_eta_func: Callable[[Array], Array] | None = ...,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    return_line_search_failures: Literal[False] = ...,
+) -> tuple[Array, Array, Array]: ...
+
+
+@overload
+def glm_laplace_update(
+    one_step_mean: Array,
+    one_step_cov: Array,
+    observations: Array,
+    eta_func: Callable[[Array], Array],
+    family: GLMFamily,
+    diagonal_boost: float = ...,
+    grad_eta_func: Callable[[Array], Array] | None = ...,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    *,
+    return_line_search_failures: Literal[True],
+) -> tuple[Array, Array, Array, Array]: ...
 
 
 def glm_laplace_update(

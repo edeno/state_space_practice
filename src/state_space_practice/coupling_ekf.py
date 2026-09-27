@@ -89,7 +89,7 @@ def _regress_coupling_all_neurons(
         # its Jacobian is the constant design (passed to skip jacfwd).
         return smoothed_latent
 
-    def _fit_one(spikes_n: Array, baseline_n: Array) -> tuple[Array, Array]:
+    def _fit_one(spikes_n: Array, baseline_n: Array) -> tuple[Array, Array, Array]:
         def eta(beta: Array) -> Array:
             return baseline_n + smoothed_latent @ beta
 

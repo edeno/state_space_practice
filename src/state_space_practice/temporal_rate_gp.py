@@ -285,7 +285,9 @@ def _infer_log_rate_traced(
         )
         return smoother_mean
 
-    def _newton_step(states: Array, _: None) -> tuple[Array, Array]:
+    def _newton_step(
+        states: Array, _: None
+    ) -> tuple[Array, tuple[Array, Array, Array]]:
         # Full Newton step: the smoother mean of the current IRLS sites.
         #
         # A pure Newton step on this concave posterior can overshoot by tens
