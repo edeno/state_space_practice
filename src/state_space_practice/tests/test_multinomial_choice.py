@@ -10,7 +10,7 @@ from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from state_space_practice.covariate_choice import covariate_choice_filter
-from state_space_practice.exceptions import StateSpaceWarning
+from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.multinomial_choice import (
     NEWTON_GAP_TOL,
     ChoiceFilterResult,
@@ -686,7 +686,7 @@ class TestMultinomialChoiceModelPlotting:
 
     def test_plot_requires_fit(self):
         model = MultinomialChoiceModel(n_options=3)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(NotFittedError):
             model.plot_values()
 
 
