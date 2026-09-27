@@ -45,6 +45,7 @@ from state_space_practice.kalman import (
     InitialStatePrior,
     _kalman_smoother_update,
     process_cov_residual_form,
+    smooth_initial_state_with_cross_cov,
     sum_of_outer_products,
 )
 from state_space_practice.parameter_transforms import (
@@ -2521,10 +2522,10 @@ def smoothed_initial_transition_moments(
         P_{0|T}               = P_0 + J_0 (P_{1|T} - P_{1|0}) J_0^T
         Cov(x_0, x_1 | y_1:T) = J_0 P_{1|T}
 
-    (the same RTS step as
-    :func:`~state_space_practice.kalman.smooth_initial_state`, which returns
-    the first two). The cross-covariance lets the M-step count the
-    ``x_0 -> x_1`` transition in the ``A`` / ``Q`` sufficient statistics.
+    This is :func:`~state_space_practice.kalman.smooth_initial_state_with_cross_cov`
+    under the name the point-process M-steps use. The cross-covariance lets
+    the M-step count the ``x_0 -> x_1`` transition in the ``A`` / ``Q``
+    sufficient statistics.
 
     Parameters
     ----------
@@ -2544,13 +2545,8 @@ def smoothed_initial_transition_moments(
     init_cross_cov : Array, shape (n_cont_states, n_cont_states)
         ``Cov(x_0, x_1 | y_{1:T}) = J_0 P_{1|T}``.
     """
-    return _kalman_smoother_update(
-        jnp.asarray(first_smoother_mean),
-        jnp.asarray(first_smoother_cov),
-        jnp.asarray(prior.init_mean),
-        jnp.asarray(prior.init_cov),
-        jnp.asarray(prior.process_cov),
-        jnp.asarray(prior.transition_matrix),
+    return smooth_initial_state_with_cross_cov(
+        prior, first_smoother_mean, first_smoother_cov
     )
 
 

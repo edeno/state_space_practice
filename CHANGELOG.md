@@ -74,6 +74,32 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   hard-coded 0.99.
 - **`ContingencyBeliefModel(seed=None)`**; `None` keeps the historical
   initialization.
+- **Verification suite**: exact oracles and calibration tests that check the
+  inference core against independent reference computations rather than
+  against itself — `tests/oracles.py` (dense Gaussian conditioning and
+  discrete path enumeration, NumPy only), `test_oracle_kalman.py`,
+  `test_oracle_switching_kalman.py`, `test_oracle_point_process.py` (grid
+  quadrature for the Laplace filter, asymptotic rates),
+  `test_oracle_switching_point_process.py`, `test_oracle_choice.py`
+  (quadrature / enumeration for the choice, Smith and contingency models),
+  simulation-based calibration (`test_calibration_*.py`), finite-difference
+  M-step stationarity checks for every EM M-step, gradient checks for all 15
+  SGD losses (`test_gradients.py`), particle-filter references for the
+  Hamiltonian EKF, and multi-seed / two-length recovery statistics
+  (`test_recovery_statistics.py`). Where an approximation is inherent (GPB1/2
+  collapse, Kim's smoother, the Laplace-EKF, the softmax Gaussian posterior)
+  the observed gap is pinned with headroom and documented as approximation,
+  not bug.
+- **`kalman.smooth_initial_state_with_cross_cov`** (also exposed as
+  `point_process_kalman.smoothed_initial_transition_moments`): smoothed
+  ``x_0`` moments plus ``Cov(x_0, x_1 | y) = J_0 P_{1|T}``.
+- **`oscillator_utils.optimize_dim_transition_params_joint_until_stationary`**:
+  restarts the DIM joint BFGS solve until it stops moving.
+- **`smith_learning_algorithm.smith_laplace_log_likelihood`**: the per-step
+  Laplace evidence of the Smith model (what `log_likelihood_`, `bic()` and
+  `fit_sgd` now use).
+- **`switching_choice.switching_choice_smoother`**: GPB1 backward pass that
+  accounts for the covariate input ``B u_t``.
 
 ### Changed — behavior (may affect existing callers)
 
@@ -175,6 +201,47 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   shape. Log-likelihood histories can differ from before by up to ~1e-13.
 - **`SwitchingSpikeOscillatorModel`**'s default transition diagonal follows the
   default float dtype (was float32).
+- **Scale-relative linear algebra throughout.** `utils.psd_solve` /
+  `psd_cholesky` shift the diagonal by a per-entry relative amount
+  (``1e-12 |A_ii|`` in float64, machine epsilon in float32) instead of an
+  absolute ``1e-9``; `diagonal_boost` now defaults to ``0.0``. The Kalman and
+  RTS gain solves use their own relative shift. The Kalman, point-process and
+  switching filters are now invariant to the units of the state: with the
+  old absolute shift, models whose covariances were below ~1e-6 (e.g. volts
+  instead of millivolts) returned means off by more than one posterior
+  standard deviation, and at scale 1e-10 the point-process filter was wrong
+  by a factor of 40. Place-field process-noise estimates (~1e-6) were biased
+  by ~0.8%. The position decoder keeps an explicit ``1e-9 cm^2`` floor.
+- **EM is exact for the initial transition.** `kalman_maximization_step`,
+  `point_process_kalman.dynamics_only_m_step` (with `initial_state_prior`)
+  and `PlaceFieldModel` count the ``x_0 -> x_1`` transition in the ``A`` /
+  ``Q`` statistics (``T`` transitions, ``Q`` divided by ``T``); the
+  finite-difference gradient of the exact expected complete-data
+  log-likelihood is zero at the returned parameters.
+- **Laplace-mode Newton steps are line-searched** (multinomial, covariate and
+  switching choice; Smith `fit_sgd` and filter). The undamped 3-step Newton
+  oscillated when the prior mean sat on the saturated side of the softmax
+  (filter means off by up to 21 units; a 400-trial log-evidence at
+  ``beta=4`` of −1836 against the exact −118). The default is now 10
+  line-searched iterations; well-behaved updates are unchanged.
+- **`SmithLearningModel` reports the Laplace evidence** instead of the
+  plug-in ``sum_k log Binom(y_k | sigmoid(mu + m_{k|k-1}))``, which ignored
+  the predictive variance and biased `fit_sgd` towards too little process
+  noise. `log_likelihood_`, `bic()`, `compare_to_null` and the SGD loss
+  change accordingly. The ``beta`` M-step never decreases the marginal LL.
+- **Warm init of COM / CNM / DIM** seeds each discrete state's parameters
+  with one M-step on its GMM window cluster; it previously only set the
+  first-step probabilities and initial state, which has no effect at a
+  symmetric start (first E-step accuracy on the DIM fixture 0.51 → 0.84).
+- **`SwitchingChoiceModel`** smooths with the covariate input; with
+  covariates every smoothed mean was previously compared against a
+  prediction missing ``B u_{t+1}``.
+- **DIM / DIM-PP M-steps**: the joint BFGS solve restarts on a line-search
+  failure (it previously stopped at gradient norms of 67–173), and the
+  projected (standard) path keeps the previous dynamics when the Frobenius
+  projection would lower the M-step objective (generalized EM).
+- **Default `diagonal_boost` of `switching_point_process.point_process_kalman_update`**
+  is ``0.0`` (relative shift), like the other Laplace updates.
 
 ### Deprecated
 
@@ -245,6 +312,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   every call. The position decoder's inflation statistic uses a Cholesky solve.
 - `SmithLearningModel.find_first_significant_trial` is vectorized (same
   result, including NaN entries).
+- **Kalman / RTS gain solves** used an absolute ``1e-9`` Cholesky shift;
+  small-unit models were wrong (see *Scale-relative linear algebra*).
+- **`SwitchingSpikeOscillatorModel` M-step** installed the ``Q`` that is
+  optimal for the unconstrained ``A*`` and then projected ``A``; ``Q`` is now
+  re-estimated at the installed ``A``.
+- **`PlaceFieldModel._m_step`** with ``update_transition_matrix=False``
+  computed ``Q`` at a hard-coded identity while smoothing ``x_0`` with the
+  model's ``A``; it now uses the model's ``A`` for both.
+- **`SmithLearningModel.maximization_step`** returned ``P_0 = P_{1|T}`` for
+  the initial-state variance; the maximiser is ``P_0 = P_{1|T} - sigma^2``
+  (or the KKT solution at the ``P_0 >= 0`` floor).
+- Two vacuous recovery tests were removed (`test_random_walk_recovery`,
+  whose spikes did not depend on the state, and a transition-matrix recovery
+  test that passed without recovering anything).
 
 ### Changed — default behavior (may affect existing callers)
 
@@ -260,3 +341,25 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and `models.py` (the legacy free function, now aligned). The default interval
   is now **95%** (was 99%). Pass `alpha=0.01` explicitly for the previous 99%
   interval.
+
+### Known approximation limits (documented and pinned by tests)
+
+- The default single Fisher-scoring step (``max_newton_iter=1``) biases
+  `SwitchingSpikeOscillatorModel`'s low-noise process variance about 2x
+  upward even at ``T = 3200``; three Newton steps remove most of it. With a
+  broad prior, Newton-1 in `PointProcessModel` can diverge. Consider
+  ``max_newton_iter >= 3`` for these models.
+- The softmax Gaussian posterior of the choice models is over-confident at
+  high inverse temperature (90% intervals cover ~69% at ``beta = 5``; the
+  exact posterior on the same data is calibrated), and the Smith smoother at
+  ``sigma^2 = 1`` covers ~84%. Both are calibrated in the ordinary regime.
+- GPB1's discrete smoother (Kim's recursion) can be off from the exact
+  path-enumeration posterior by up to 0.25 in probability on 5-step
+  problems; GPB2 by 0.05. The Laplace-EKF's marginal log-likelihood is 3–5
+  nats too high for the Smith model at ``beta = 12``.
+- The position decoder's smoothed covariance is ~9% too small (bilinear
+  log-rate surrogate), and its filtered variance can collapse on the
+  realistic-trajectory fixture (kept finite by the ``1e-9 cm^2`` floor).
+- `utils.debug_print_if` fires on every element under `jax.vmap` (both
+  `lax.cond` branches run), so vmapped switching filters emit spurious
+  warnings; values are unaffected.

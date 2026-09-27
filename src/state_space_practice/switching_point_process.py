@@ -478,7 +478,7 @@ def point_process_kalman_update(
     dt: float,
     log_intensity_func: Callable[[Array, SpikeObsParams], Array],
     spike_params: SpikeObsParams,
-    diagonal_boost: float = 1e-9,
+    diagonal_boost: float = 0.0,
     grad_log_intensity_func: Callable[[Array, SpikeObsParams], Array] | None = None,
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 1,
@@ -514,9 +514,11 @@ def point_process_kalman_update(
     spike_params : SpikeObsParams
         Spike observation parameters (baseline, weights). Passed as data to
         log_intensity_func, allowing JIT compilation without closure issues.
-    diagonal_boost : float, default=1e-9
-        Small value added to precision matrix diagonal for numerical stability
-        when solving linear systems.
+    diagonal_boost : float, default=0.0
+        Absolute floor added to the precision-matrix diagonal before solving.
+        The default relies on :func:`~state_space_practice.utils.psd_solve`'s
+        scale-relative shift, so the update is invariant to the units of the
+        latent state.
     grad_log_intensity_func : Callable[[Array, SpikeObsParams], Array] | None, optional
         Pre-computed gradient function (Jacobian) of log_intensity_func w.r.t. state.
         If None, computed via jax.jacfwd(log_intensity_func, argnums=0).
