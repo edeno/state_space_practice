@@ -93,6 +93,58 @@ def _validate_filter_numerics(
     )
 
 
+def _validate_public_inputs(
+    dt: float,
+    init_mean_params: Array,
+    init_covariance_params: Array,
+    design_matrix: Array,
+    spike_indicator: Array,
+    transition_matrix: Array,
+    process_cov: Array,
+    *,
+    filter_name: str,
+    stacklevel: int,
+) -> None:
+    """Value checks of the public point-process filter and smoother.
+
+    Host-side value checks need concrete inputs. Concrete arrays (including
+    constants closed over by a jitted caller) are checked under
+    ``jax.ensure_compile_time_eval`` so jnp ops on them are not staged. When
+    any input is a tracer (jax.jit / jax.grad / jax.vmap argument) the checks
+    are skipped, keeping the entry point traceable with its default
+    arguments, and a non-positive-definite ``init_covariance_params`` is
+    reported at run time as a ``StateSpaceWarning``.
+
+    Raises on non-PSD ``init_covariance_params`` and warns on f32 + long T +
+    ill-conditioned configs (see :func:`_validate_filter_numerics`).
+    ``stacklevel`` is interpreted as if the caller had called
+    :func:`_validate_filter_numerics` directly.
+    """
+    if contains_tracer(
+        dt,
+        init_mean_params,
+        init_covariance_params,
+        design_matrix,
+        spike_indicator,
+        transition_matrix,
+        process_cov,
+    ):
+        warn_if_not_positive_definite_in_graph(
+            init_covariance_params,
+            name="init_covariance_params",
+            filter_name=filter_name,
+        )
+        return
+    with jax.ensure_compile_time_eval():
+        validate_scalar(dt, "dt", positive=True)
+        validate_count_array(spike_indicator, "spike_indicator")
+        _validate_filter_numerics(
+            init_covariance_params,
+            n_time=spike_indicator.shape[0],
+            stacklevel=stacklevel + 1,
+        )
+
+
 class BlockDiagonalStructure(NamedTuple):
     """Factored block-diagonal filter problem.
 
@@ -1572,43 +1624,26 @@ def stochastic_point_process_filter(
     transition_matrix = jnp.asarray(transition_matrix)
     process_cov = jnp.asarray(process_cov)
 
-    # Host-side value checks need concrete inputs. Concrete arrays (including
-    # constants closed over by a jitted caller) are checked under
-    # ensure_compile_time_eval so jnp ops on them are not staged. When any
-    # input is a tracer (jax.jit / jax.grad / jax.vmap argument) the checks
-    # are skipped, keeping the filter traceable with its default arguments,
-    # and a non-positive-definite init_cov is reported at run time as a
-    # StateSpaceWarning. Shape handling below is static and always runs.
-    if validate_inputs and contains_tracer(
-        dt,
-        init_mean_params,
-        init_covariance_params,
-        design_matrix,
-        spike_indicator,
-        transition_matrix,
-        process_cov,
-    ):
-        warn_if_not_positive_definite_in_graph(
+    # Numerical sanity check BEFORE the block dispatch below. The block path
+    # (large-state / long-T) is exactly where these checks matter, so they
+    # must run before dispatch, not only on the dense path. Gated behind
+    # ``validate_inputs`` so tight inner loops (e.g. SGD) can pass False after
+    # a single validation at the top of fit_sgd. stacklevel=4 so the warning
+    # points at the user's call site: user -> fit_sgd -> _sgd_loss_fn ->
+    # stochastic_point_process_filter -> _validate. Shape handling below is
+    # static and always runs.
+    if validate_inputs:
+        _validate_public_inputs(
+            dt,
+            init_mean_params,
             init_covariance_params,
-            name="init_covariance_params",
+            design_matrix,
+            spike_indicator,
+            transition_matrix,
+            process_cov,
             filter_name="stochastic_point_process_filter",
+            stacklevel=4,
         )
-    elif validate_inputs:
-        with jax.ensure_compile_time_eval():
-            validate_scalar(dt, "dt", positive=True)
-            validate_count_array(spike_indicator, "spike_indicator")
-            # Numerical sanity check BEFORE the block dispatch below: raises
-            # on non-PSD init_cov, warns on f32 + long T + ill-conditioned
-            # configs. The block path (large-state / long-T) is exactly where
-            # these matter, so the check must run before dispatch, not only on
-            # the dense path. Gated behind ``validate_inputs`` so tight inner
-            # loops (e.g. SGD) can pass False after a single validation at the
-            # top of fit_sgd. stacklevel=4 so the warning points at the user's
-            # call site: user -> fit_sgd -> _sgd_loss_fn ->
-            # stochastic_point_process_filter -> _validate.
-            _validate_filter_numerics(
-                init_covariance_params, n_time=spike_indicator.shape[0], stacklevel=4
-            )
 
     # Block-diagonal dispatch (opt-in via block_n_neurons / block_size).
     # The caller is responsible for verifying the block structure ONCE at
@@ -2465,33 +2500,22 @@ def stochastic_point_process_smoother(
     transition_matrix = jnp.asarray(transition_matrix)
     process_cov = jnp.asarray(process_cov)
 
-    # Same tracing contract as stochastic_point_process_filter.
-    if validate_inputs and contains_tracer(
-        dt,
-        init_mean_params,
-        init_covariance_params,
-        design_matrix,
-        spike_indicator,
-        transition_matrix,
-        process_cov,
-    ):
-        warn_if_not_positive_definite_in_graph(
+    # Validate BEFORE the block dispatch below (the dense path would otherwise
+    # inherit this check from the inner filter call, but the block path
+    # returns early and would skip it). stacklevel=3: user -> smoother ->
+    # _validate.
+    if validate_inputs:
+        _validate_public_inputs(
+            dt,
+            init_mean_params,
             init_covariance_params,
-            name="init_covariance_params",
+            design_matrix,
+            spike_indicator,
+            transition_matrix,
+            process_cov,
             filter_name="stochastic_point_process_smoother",
+            stacklevel=3,
         )
-    elif validate_inputs:
-        with jax.ensure_compile_time_eval():
-            validate_scalar(dt, "dt", positive=True)
-            validate_count_array(spike_indicator, "spike_indicator")
-            # Validate BEFORE the block dispatch below (the dense path would
-            # otherwise inherit this check from the inner filter call, but the
-            # block path returns early and would skip it). Raises on non-PSD
-            # init_cov, warns on f32 + long T. stacklevel=3: user -> smoother
-            # -> _validate.
-            _validate_filter_numerics(
-                init_covariance_params, n_time=spike_indicator.shape[0], stacklevel=3
-            )
 
     # Block-diagonal dispatch: same opt-in contract as the filter.
     # See stochastic_point_process_filter's block-dispatch comment for
