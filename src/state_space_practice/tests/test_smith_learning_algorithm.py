@@ -5,12 +5,16 @@ This module tests the Bayesian state-space model for learning dynamics,
 including the Laplace approximation filter/smoother and EM algorithm.
 """
 
+import warnings
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.smith_learning_algorithm import (
+    DEFAULT_SIGMA_EPSILON,
     SmithLearningModel,
     _find_runs_of_value,
     _log_posterior_objective,
@@ -264,6 +268,29 @@ class TestSmithLearningFilter:
         for a, b in zip(out_int, out_float):
             assert a.dtype == jnp.float64
             np.testing.assert_allclose(a, b, rtol=1e-12)
+
+    @pytest.mark.parametrize("differentiable", [False, True])
+    def test_stalled_newton_warns(self, simulated_data, differentiable) -> None:
+        """A prior deep in saturation opposite the data (N=1000, y=0, prior
+        N(30, 1e4)): every Armijo step overshoots, the step is 0 and the mode
+        never moves. The filter must say so; ordinary data stays silent."""
+        with pytest.warns(StateSpaceWarning, match="smith_learning_filter"):
+            _, mode, _, _, _ = smith_learning_filter(
+                jnp.array([0]),
+                init_learning_state=30.0,
+                init_learning_variance=1e4 - DEFAULT_SIGMA_EPSILON**2,
+                max_possible_correct=1000,
+                differentiable=differentiable,
+            )
+            jax.effects_barrier()
+        np.testing.assert_allclose(mode[0], 30.0)  # guard: really stalled
+        outcomes, _ = simulated_data
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", StateSpaceWarning)
+            smith_learning_filter(
+                outcomes, max_possible_correct=1, differentiable=differentiable
+            )
+            jax.effects_barrier()
 
     def test_float32_inputs_stay_float32(self, simulated_data) -> None:
         outcomes, _ = simulated_data
@@ -2430,7 +2457,7 @@ class TestDifferentiableNewtonDoesNotOscillate:
             bias=0.0,
         )
         mode = brentq(lambda x: y - n / (1 + np.exp(-x)) - (x - m) / v, -30, 30)
-        newton_mode, newton_var = _approximate_gaussian_newton(f, jnp.array([m]))
+        newton_mode, newton_var, _ = _approximate_gaussian_newton(f, jnp.array([m]))
         bfgs_mode, bfgs_var = approximate_gaussian(f, jnp.array([m]))
         assert abs(float(newton_mode[0]) - mode) < 1e-8
         assert abs(float(bfgs_mode[0]) - mode) < 1e-4

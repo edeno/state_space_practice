@@ -336,7 +336,7 @@ class TestMultinomialChoiceQuadratureOracle:
         )
         # 10 steps: converged up to psd_solve's 1e-9 diagonal boost.
         for n_steps, tol in ((3, 2e-3), (10, 1e-7)):
-            x, P, ll = _softmax_update_core(
+            x, P, ll, _ = _softmax_update_core(
                 jnp.array([prior_mean]),
                 jnp.array([[prior_var]]),
                 jnp.int32(choice),
@@ -397,7 +397,7 @@ class TestLaplaceNewtonDoesNotOscillate:
 
         mode = brentq(score, -20, 20, xtol=1e-14)
         for n_steps, tol in ((3, 2e-3), (10, 1e-7)):
-            x, _, _ = _softmax_update_core(
+            x, _, _, _ = _softmax_update_core(
                 jnp.array([m]),
                 jnp.array([[v]]),
                 jnp.int32(0),

@@ -67,7 +67,10 @@ from jax.typing import ArrayLike
 
 from state_space_practice.em_driver import run_em
 from state_space_practice.exceptions import StateSpaceWarning
-from state_space_practice.multinomial_choice import _armijo_slack
+from state_space_practice.multinomial_choice import (
+    _armijo_slack,
+    _warn_if_newton_unconverged,
+)
 from state_space_practice.parameter_transforms import (
     POSITIVE,
     UNCONSTRAINED,
@@ -149,7 +152,7 @@ def _approximate_gaussian_newton(
     log_posterior_func: Callable[[ArrayLike], Array],
     x0: ArrayLike,
     n_steps: int = 10,
-) -> tuple[Array, Array]:
+) -> tuple[Array, Array, Array]:
     """Differentiable Laplace approximation using fixed Newton iterations.
 
     Unlike approximate_gaussian (which uses BFGS via lax.while_loop and is
@@ -174,7 +177,12 @@ def _approximate_gaussian_newton(
     Returns
     -------
     mode : Array, shape (1,)
+        Final Newton iterate (the posterior mode when converged).
     covariance : Array, shape (1, 1)
+    newton_gap : Array, shape ()
+        Half the squared Newton decrement ``g^2 / (2 h)`` at the final
+        iterate: the estimated log-posterior gap (nats) to the mode, ~0 when
+        converged (see ``multinomial_choice.NEWTON_GAP_TOL``).
     """
     x0_arr = jnp.asarray(x0)
     # Integer initial guesses are promoted to the default float (jax.grad
@@ -224,8 +232,13 @@ def _approximate_gaussian_newton(
     h = hess_fn(mode)
     h_safe = jnp.maximum(h, 1e-6)
     variance = 1.0 / h_safe
+    newton_gap = 0.5 * grad_fn(mode) ** 2 / h_safe
 
-    return jnp.expand_dims(mode, 0), jnp.expand_dims(jnp.expand_dims(variance, 0), 0)
+    return (
+        jnp.expand_dims(mode, 0),
+        jnp.expand_dims(jnp.expand_dims(variance, 0), 0),
+        newton_gap,
+    )
 
 
 def _log_posterior_objective(
@@ -456,7 +469,7 @@ def _smith_learning_filter_impl(
 
     def _step(
         carry: tuple[Array, Array], trial_data: tuple[Array, Array]
-    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array, Array]]:
+    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array, Array, Array]]:
         """A single step of the non-linear filter."""
         mode_prev, variance_prev = carry
         n_correct_trial_k, max_possible_correct_trial_k = trial_data
@@ -479,7 +492,7 @@ def _smith_learning_filter_impl(
         # early on a line-search failure (e.g. a 0.06 mode error on a
         # binomial trial right after a run of saturated outcomes), while the
         # 1-D damped Newton reaches the mode to machine precision.
-        posterior_mode, posterior_variance = _approximate_gaussian_newton(
+        posterior_mode, posterior_variance, newton_gap = _approximate_gaussian_newton(
             log_objective_func, x0=jnp.array([one_step_mode])
         )
         posterior_mode = jnp.squeeze(posterior_mode)
@@ -490,6 +503,7 @@ def _smith_learning_filter_impl(
             posterior_variance,
             one_step_mode,
             one_step_variance,
+            newton_gap,
         )
 
     # Run the filter over all trials
@@ -500,9 +514,14 @@ def _smith_learning_filter_impl(
         init_carry,
         inputs,
     )
-    (learning_state_mode, learning_state_variance, one_step_mode, one_step_variance) = (
-        output
-    )
+    (
+        learning_state_mode,
+        learning_state_variance,
+        one_step_mode,
+        one_step_variance,
+        newton_gaps,
+    ) = output
+    _warn_if_newton_unconverged(newton_gaps, "smith_learning_filter")
 
     # Compute probability of correct response
     prob_correct_response = jax.nn.sigmoid(mu + learning_state_mode)

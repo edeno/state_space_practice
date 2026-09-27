@@ -32,7 +32,7 @@ class TestSoftmaxPredictAndUpdate:
         u = jnp.zeros(1)
         obs_offset = jnp.zeros(3)
 
-        post_mean, post_cov, ll = _softmax_predict_and_update(
+        post_mean, post_cov, ll, _ = _softmax_predict_and_update(
             mean,
             cov,
             jnp.int32(0),
@@ -58,7 +58,7 @@ class TestSoftmaxPredictAndUpdate:
         u = jnp.zeros(1)
         obs_offset = jnp.zeros(3)
 
-        _, _, ll = _softmax_predict_and_update(
+        _, _, ll, _ = _softmax_predict_and_update(
             mean,
             cov,
             jnp.int32(1),
@@ -82,7 +82,7 @@ class TestSoftmaxPredictAndUpdate:
         u = jnp.zeros(1)
         obs_offset = jnp.zeros(3)
 
-        _, post_cov, _ = _softmax_predict_and_update(
+        _, post_cov, _, _ = _softmax_predict_and_update(
             mean,
             cov,
             jnp.int32(0),
@@ -113,7 +113,7 @@ class TestSoftmaxUpdatePerStatePair:
         u = jnp.zeros(1)
         obs_offset = jnp.zeros(3)
 
-        pair_mean, pair_cov, pair_ll = _softmax_update_per_state_pair(
+        pair_mean, pair_cov, pair_ll, _ = _softmax_update_per_state_pair(
             mean,
             cov,
             jnp.int32(0),
@@ -141,7 +141,7 @@ class TestSoftmaxUpdatePerStatePair:
         u = jnp.zeros(1)
         obs_offset = jnp.zeros(3)
 
-        pair_mean, pair_cov, pair_ll = _softmax_update_per_state_pair(
+        pair_mean, pair_cov, pair_ll, _ = _softmax_update_per_state_pair(
             mean,
             cov,
             jnp.int32(1),
@@ -154,7 +154,7 @@ class TestSoftmaxUpdatePerStatePair:
             obs_offset,
         )
 
-        ref_mean, ref_cov, ref_ll = _softmax_predict_and_update(
+        ref_mean, ref_cov, ref_ll, _ = _softmax_predict_and_update(
             mean[:, 0],
             cov[:, :, 0],
             jnp.int32(1),
@@ -183,7 +183,7 @@ class TestSoftmaxUpdatePerStatePair:
         u = jnp.zeros(1)
         obs_offset = jnp.zeros(3)
 
-        pair_mean, _, _ = _softmax_update_per_state_pair(
+        pair_mean, _, _, _ = _softmax_update_per_state_pair(
             mean,
             cov,
             jnp.int32(0),
@@ -210,7 +210,7 @@ class TestSoftmaxUpdatePerStatePair:
         u = jnp.zeros(1)
         obs_offset = jnp.zeros(3)
 
-        _, _, pair_ll = _softmax_update_per_state_pair(
+        _, _, pair_ll, _ = _softmax_update_per_state_pair(
             mean,
             cov,
             jnp.int32(0),

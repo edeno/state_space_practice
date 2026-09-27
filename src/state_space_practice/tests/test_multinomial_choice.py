@@ -1,20 +1,28 @@
 """Tests for multinomial choice learning model."""
 
+import warnings
+
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
+from state_space_practice.covariate_choice import covariate_choice_filter
+from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.multinomial_choice import (
+    NEWTON_GAP_TOL,
     ChoiceFilterResult,
     ChoiceSmootherResult,
     MultinomialChoiceModel,
+    _softmax_update_core,
     multinomial_choice_filter,
     multinomial_choice_smoother,
     simulate_choice_data,
     softmax_observation_update,
 )
+from state_space_practice.switching_choice import switching_choice_filter
 
 
 class TestSoftmaxObservationUpdate:
@@ -186,6 +194,83 @@ class TestInputDtypes:
         for a, b in zip(out, ref):
             assert a.dtype == jnp.float32
             np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-6)
+
+
+class TestNewtonConvergenceWarning:
+    """A Laplace mode search that ends short of the mode warns; converged ones
+    stay silent (the suite runs with warnings as errors)."""
+
+    # Prior deep on the saturated side opposite the choice (beta=100, prior
+    # N(10, 1e4)): the likelihood curvature is ~0, every candidate step
+    # overshoots, no step passes the line search and the iterate never moves.
+    STALL = dict(mean=10.0, var=1e4, beta=100.0)
+
+    def test_update_warns_when_iterations_run_out(self):
+        args = (jnp.array([1.512]), jnp.array([[0.974]]), 0, 2, 4.0)
+        # guard: one iteration really leaves a gap above the tolerance
+        _, _, _, gap = _softmax_update_core(
+            args[0], args[1], jnp.int32(0), 2, 4.0, max_newton_steps=1
+        )
+        assert gap > NEWTON_GAP_TOL
+        with pytest.warns(StateSpaceWarning, match="softmax_observation_update"):
+            softmax_observation_update(*args, max_newton_steps=1)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", StateSpaceWarning)
+            softmax_observation_update(*args)
+
+    def _run_filter(self, name, var):
+        s = self.STALL
+        if name == "multinomial":
+            return multinomial_choice_filter(
+                [0, 1],
+                2,
+                inverse_temperature=s["beta"],
+                init_mean=[s["mean"]],
+                init_cov=[[var]],
+            )
+        if name == "covariate":
+            return covariate_choice_filter(
+                [0, 1],
+                2,
+                inverse_temperature=s["beta"],
+                init_mean=[s["mean"]],
+                init_cov=[[var]],
+            )
+        return switching_choice_filter(
+            [0, 1],
+            2,
+            inverse_temperatures=[s["beta"], 1.0],
+            init_mean=[s["mean"]],
+            init_cov=[[var]],
+        )
+
+    @pytest.mark.parametrize("name", ["multinomial", "covariate", "switching"])
+    def test_jitted_filters_warn_on_stalled_update(self, name):
+        with pytest.warns(StateSpaceWarning, match=f"{name}.*_filter"):
+            jax.block_until_ready(self._run_filter(name, self.STALL["var"]))
+            jax.effects_barrier()
+        # A moderate prior variance converges: no warning.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", StateSpaceWarning)
+            jax.block_until_ready(self._run_filter(name, 1.0))
+            jax.effects_barrier()
+
+    def test_warns_under_grad(self):
+        """The fit_sgd path (jax.grad through the filter) still reports."""
+
+        def neg_ll(beta):
+            return -multinomial_choice_filter(
+                [0, 1],
+                2,
+                inverse_temperature=beta,
+                init_mean=[self.STALL["mean"]],
+                init_cov=[[self.STALL["var"]]],
+            ).marginal_log_likelihood
+
+        with pytest.warns(StateSpaceWarning, match="multinomial_choice_filter"):
+            grad = jax.block_until_ready(jax.grad(neg_ll)(self.STALL["beta"]))
+            jax.effects_barrier()
+        assert np.isfinite(grad)
 
 
 class TestMultinomialChoiceFilter:

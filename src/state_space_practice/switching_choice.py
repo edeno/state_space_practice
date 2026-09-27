@@ -30,7 +30,10 @@ import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.multinomial_choice import _softmax_update_core
+from state_space_practice.multinomial_choice import (
+    _softmax_update_core,
+    _warn_if_newton_unconverged,
+)
 from state_space_practice.parameter_transforms import (
     POSITIVE,
     STOCHASTIC_ROW,
@@ -66,7 +69,7 @@ def _softmax_predict_and_update(
     input_gain: Array,
     covariates_t: Array,
     obs_offset: Array,
-) -> tuple[Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array]:
     """Predict + softmax update for one (prev_state_i, next_state_j) pair.
 
     Parameters
@@ -87,13 +90,16 @@ def _softmax_predict_and_update(
     post_mean : Array, shape (K-1,)
     post_cov : Array, shape (K-1, K-1)
     log_likelihood : Array, shape ()
+    newton_gap : Array, shape ()
+        Laplace mode-search convergence diagnostic (see
+        ``multinomial_choice._softmax_update_core``).
     """
     # Predict
     pred_mean = transition_matrix @ prev_mean + input_gain @ covariates_t
     pred_cov = transition_matrix @ prev_cov @ transition_matrix.T + process_cov
 
     # Update via softmax Laplace-EKF
-    post_mean, post_cov, ll = _softmax_update_core(
+    return _softmax_update_core(
         pred_mean,
         pred_cov,
         choice,
@@ -101,8 +107,6 @@ def _softmax_predict_and_update(
         inverse_temperature,
         obs_offset=obs_offset,
     )
-
-    return post_mean, post_cov, ll
 
 
 def _softmax_update_per_state_pair(
@@ -116,7 +120,7 @@ def _softmax_update_per_state_pair(
     input_gain: Array,
     covariates_t: Array,
     obs_offset: Array,
-) -> tuple[Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array]:
     """Per-state-pair softmax predict + update via double vmap.
 
     Computes pair-conditional posteriors for all (i, j) state pairs,
@@ -145,6 +149,8 @@ def _softmax_update_per_state_pair(
     pair_cond_mean : Array, shape (K-1, S_prev, S_next)
     pair_cond_cov : Array, shape (K-1, K-1, S_prev, S_next)
     pair_cond_ll : Array, shape (S_prev, S_next)
+    pair_newton_gap : Array, shape (S_prev, S_next)
+        Laplace mode-search convergence diagnostic per pair.
     """
 
     def _update_one_pair(prev_mean_i, prev_cov_i, A_j, Q_j, beta_j):
@@ -168,25 +174,20 @@ def _softmax_update_per_state_pair(
         return jax.vmap(
             lambda m, c: _update_one_pair(m, c, A_j, Q_j, beta_j),
             in_axes=(1, 2),  # mean: axis 1, cov: axis 2
-            out_axes=(
-                1,
-                2,
-                0,
-            ),  # mean: (K-1, S_prev), cov: (K-1, K-1, S_prev), ll: (S_prev,)
+            # mean: (K-1, S_prev), cov: (K-1, K-1, S_prev), ll and gap: (S_prev,)
+            out_axes=(1, 2, 0, 0),
         )(prev_state_cond_mean, prev_state_cond_cov)
 
     # vmap over next_state j (axis -1 of A/Q, element of beta)
-    pair_mean, pair_cov, pair_ll = jax.vmap(
+    pair_mean, pair_cov, pair_ll, pair_gap = jax.vmap(
         _update_all_prev_for_next_j,
         in_axes=(2, 2, 0),  # A: axis 2, Q: axis 2, beta: axis 0
-        out_axes=(
-            2,
-            3,
-            1,
-        ),  # mean: (K-1, S_prev, S_next), cov: (K-1, K-1, S_prev, S_next), ll: (S_prev, S_next)
+        # mean: (K-1, S_prev, S_next), cov: (K-1, K-1, S_prev, S_next),
+        # ll and gap: (S_prev, S_next)
+        out_axes=(2, 3, 1, 1),
     )(transition_matrices, process_covs, inverse_temperatures)
 
-    return pair_mean, pair_cov, pair_ll
+    return pair_mean, pair_cov, pair_ll, pair_gap
 
 
 class SwitchingChoiceFilterResult(NamedTuple):
@@ -374,7 +375,7 @@ def _switching_choice_filter_jit(
         pred_cov = A_j @ prior_cov @ A_j.T + Q_j
 
         obs_offset_0 = ow_arr @ obs_cov_arr[0]
-        post_mean, post_cov, ll = _softmax_update_core(
+        post_mean, post_cov, ll, newton_gap = _softmax_update_core(
             pred_mean,
             pred_cov,
             choices[0],
@@ -382,12 +383,19 @@ def _switching_choice_filter_jit(
             beta,
             obs_offset=obs_offset_0,
         )
-        return post_mean, post_cov, ll, pred_mean, pred_cov
+        return post_mean, post_cov, ll, pred_mean, pred_cov, newton_gap
 
-    first_means, first_covs, first_lls, first_pred_means, first_pred_covs = jax.vmap(
+    (
+        first_means,
+        first_covs,
+        first_lls,
+        first_pred_means,
+        first_pred_covs,
+        first_newton_gaps,
+    ) = jax.vmap(
         _first_update_for_state,
         in_axes=(1, 2, 0, 2, 2),
-        out_axes=(1, 2, 0, 1, 2),
+        out_axes=(1, 2, 0, 1, 2, 0),
     )(
         init_state_cond_mean,
         init_state_cond_cov,
@@ -430,7 +438,7 @@ def _switching_choice_filter_jit(
         )(prev_mean, prev_cov, transition_matrices, process_covs)
 
         # Per-state-pair predict + update
-        pair_mean, pair_cov, pair_ll = _softmax_update_per_state_pair(
+        pair_mean, pair_cov, pair_ll, pair_gap = _softmax_update_per_state_pair(
             prev_mean,
             prev_cov,
             choice_t,
@@ -468,6 +476,7 @@ def _switching_choice_filter_jit(
             pair_cov,
             pred_means,
             pred_covs,
+            pair_gap,
         )
 
     init_carry = (
@@ -489,8 +498,13 @@ def _switching_choice_filter_jit(
             rest_pair_covs,
             rest_pred_means,
             rest_pred_covs,
+            rest_newton_gaps,
         ),
     ) = jax.lax.scan(_step, init_carry, scan_inputs)
+    _warn_if_newton_unconverged(
+        jnp.concatenate([first_newton_gaps, rest_newton_gaps.ravel()]),
+        "switching_choice_filter",
+    )
 
     # Concatenate first timestep
     filtered_values = jnp.concatenate([first_means[None], rest_means], axis=0)

@@ -1008,7 +1008,7 @@ class TestMultinomialChoiceInvariances:
         from state_space_practice.multinomial_choice import _softmax_update_core
 
         def update(v):
-            x, P, ll = _softmax_update_core(
+            x, P, ll, _ = _softmax_update_core(
                 jnp.array([0.3 * np.sqrt(v)]),
                 jnp.array([[v]]),
                 jnp.int32(0),

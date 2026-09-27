@@ -40,6 +40,7 @@ from state_space_practice.multinomial_choice import (
     ChoiceSmootherResult,
     MultinomialChoiceModel,
     _softmax_update_core,
+    _warn_if_newton_unconverged,
 )
 from state_space_practice.parameter_transforms import (
     UNCONSTRAINED,
@@ -343,7 +344,7 @@ def _covariate_choice_filter_jit(
         obs_offset = obs_weights @ z_t
 
         # Update via Laplace-EKF with obs offset
-        post_mean, post_cov, ll = _softmax_update_core(
+        post_mean, post_cov, ll, newton_gap = _softmax_update_core(
             pred_mean,
             pred_cov,
             choice_t,
@@ -358,12 +359,14 @@ def _covariate_choice_filter_jit(
             post_cov,
             pred_mean,
             pred_cov,
+            newton_gap,
         )
 
     init_carry = (init_mean, init_cov, jnp.array(0.0))
-    (_, _, marginal_ll), (filt_vals, filt_covs, pred_vals, pred_covs) = jax.lax.scan(
-        _step, init_carry, (choices, covariates, obs_covariates)
+    (_, _, marginal_ll), (filt_vals, filt_covs, pred_vals, pred_covs, newton_gaps) = (
+        jax.lax.scan(_step, init_carry, (choices, covariates, obs_covariates))
     )
+    _warn_if_newton_unconverged(newton_gaps, "covariate_choice_filter")
 
     return ChoiceFilterResult(
         filtered_values=filt_vals,

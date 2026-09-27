@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
+import warnings
 from functools import partial
 from typing import NamedTuple
 
@@ -28,7 +29,7 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.exceptions import NotFittedError
+from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.kalman import rts_backward_scan
 from state_space_practice.parameter_transforms import POSITIVE
 from state_space_practice.sgd_fitting import SGDFittableMixin
@@ -55,6 +56,63 @@ def _armijo_slack(dtype) -> float:
     return max(1e-12, 16 * float(jnp.finfo(dtype).eps))
 
 
+# A Laplace mode search whose final iterate is more than this many nats below
+# the mode (estimated as half the squared Newton decrement) is reported as
+# unconverged.
+NEWTON_GAP_TOL = 1e-6
+
+
+def _warn_unconverged_host(
+    n_unconverged: ArrayLike, max_gap: ArrayLike, *, solver: str, stacklevel: int
+) -> None:
+    """Emit the unconverged-Newton ``StateSpaceWarning`` (host side)."""
+    n = int(np.sum(np.asarray(n_unconverged)))
+    if n > 0:
+        warnings.warn(
+            f"{solver}: {n} Laplace mode search(es) stopped before "
+            "convergence; the largest Newton estimate of the remaining "
+            f"log-posterior gap is {float(np.max(np.asarray(max_gap))):.3g} "
+            f"nats (tolerance {NEWTON_GAP_TOL:g}). The posterior mode, "
+            "covariance and Laplace log-evidence of those updates are "
+            "inaccurate.",
+            StateSpaceWarning,
+            stacklevel=stacklevel,
+        )
+
+
+def _warn_if_newton_unconverged(newton_gap: ArrayLike, solver: str) -> None:
+    """Warn if any Laplace mode search ended short of its mode.
+
+    Emits a :class:`~state_space_practice.exceptions.StateSpaceWarning` when
+    any entry of ``newton_gap`` exceeds :data:`NEWTON_GAP_TOL`. NaN gaps come
+    from NaN modes, which are visible in the output itself, and are not
+    counted. Concrete inputs warn directly; inside ``jax.jit`` /
+    ``lax.scan`` / ``jax.grad`` the reduced counts reach the host through one
+    :func:`jax.debug.callback` per call.
+
+    Parameters
+    ----------
+    newton_gap : ArrayLike, any shape
+        Estimated log-posterior gap (nats) between each search's final iterate
+        and its mode: half the squared Newton decrement
+        ``g^T H^{-1} g / 2`` at the final iterate.
+    solver : str
+        Name of the public function, used in the warning message.
+    """
+    newton_gap = jnp.asarray(newton_gap)
+    unconverged = newton_gap > NEWTON_GAP_TOL
+    counts = (
+        jnp.sum(unconverged),
+        jnp.max(jnp.where(unconverged, newton_gap, 0.0)),
+    )
+    if isinstance(newton_gap, jax.core.Tracer):
+        jax.debug.callback(
+            partial(_warn_unconverged_host, solver=solver, stacklevel=2), *counts
+        )
+    else:
+        _warn_unconverged_host(*counts, solver=solver, stacklevel=4)
+
+
 def _softmax_update_core(
     prior_mean: Array,
     prior_cov: Array,
@@ -63,7 +121,7 @@ def _softmax_update_core(
     inverse_temperature: float,
     max_newton_steps: int = 10,
     obs_offset: Array | None = None,
-) -> tuple[Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array]:
     """JIT-compatible Laplace-EKF update for softmax observation.
 
     All inputs must be JAX arrays (no Python-level validation).
@@ -99,6 +157,18 @@ def _softmax_update_core(
         observation covariates (e.g., stay bias, spatial bias).
         These shift choice probabilities without changing the
         latent value state. None means no offset.
+
+    Returns
+    -------
+    posterior_mean : Array, shape (K-1,)
+        Final Newton iterate (the posterior mode when converged).
+    posterior_cov : Array, shape (K-1, K-1)
+    log_likelihood : Array, shape ()
+        Laplace evidence ``log p(choice | past)`` at the final iterate.
+    newton_gap : Array, shape ()
+        Half the squared Newton decrement at the final iterate: the
+        estimated log-posterior gap (nats) to the mode, ~0 when converged.
+        Pass it to :func:`_warn_if_newton_unconverged`.
     """
     # One floating dtype for every carried and constant array: integer inputs
     # are promoted to the default float, float32 inputs stay float32.
@@ -186,6 +256,12 @@ def _softmax_update_core(
     posterior_precision = prior_precision + neg_hessian
     post_cho = psd_cholesky(posterior_precision)
     posterior_cov = symmetrize(jax.scipy.linalg.cho_solve(post_cho, eye_k))
+    # Convergence diagnostic: 0.5 g^T H^{-1} g at the final iterate, the
+    # log-posterior increase a full Newton step would predict.
+    final_gradient = beta * (e_k_free - p_free) + prior_precision @ (prior_mean - x)
+    newton_gap = (
+        0.5 * final_gradient @ jax.scipy.linalg.cho_solve(post_cho, final_gradient)
+    )
 
     # Laplace-approximated marginal log-likelihood log p(c_t | y_{1:t-1}):
     #   ≈ log p(c_t | x*) + log p(x* | y_{1:t-1}) + ½ log|Σ_post| + const
@@ -202,7 +278,7 @@ def _softmax_update_core(
     logdet_post = -psd_logdet(post_cho)
     log_lik = log_lik_at_mode - 0.5 * quad - 0.5 * logdet_prior + 0.5 * logdet_post
 
-    return x, posterior_cov, log_lik
+    return x, posterior_cov, log_lik, newton_gap
 
 
 def softmax_observation_update(
@@ -243,7 +319,7 @@ def softmax_observation_update(
     """
     if choice < 0 or choice >= n_options:
         raise ValueError(f"choice must be in [0, {n_options}), got {choice}")
-    return _softmax_update_core(
+    post_mean, post_cov, log_lik, newton_gap = _softmax_update_core(
         prior_mean,
         prior_cov,
         jnp.int32(choice),
@@ -251,6 +327,8 @@ def softmax_observation_update(
         inverse_temperature,
         max_newton_steps,
     )
+    _warn_if_newton_unconverged(newton_gap, "softmax_observation_update")
+    return post_mean, post_cov, log_lik
 
 
 class ChoiceFilterResult(NamedTuple):
@@ -382,7 +460,7 @@ def _multinomial_choice_filter_jit(
         pred_cov = filt_cov + Q
 
         # Update
-        post_mean, post_cov, ll = _softmax_update_core(
+        post_mean, post_cov, ll, newton_gap = _softmax_update_core(
             pred_mean,
             pred_cov,
             choice_t,
@@ -396,12 +474,14 @@ def _multinomial_choice_filter_jit(
             post_cov,
             pred_mean,
             pred_cov,
+            newton_gap,
         )
 
     init_carry = (init_mean, init_cov, jnp.zeros((), dtype=init_mean.dtype))
-    (_, _, marginal_ll), (filt_vals, filt_covs, pred_vals, pred_covs) = jax.lax.scan(
-        _step, init_carry, choices
+    (_, _, marginal_ll), (filt_vals, filt_covs, pred_vals, pred_covs, newton_gaps) = (
+        jax.lax.scan(_step, init_carry, choices)
     )
+    _warn_if_newton_unconverged(newton_gaps, "multinomial_choice_filter")
 
     return ChoiceFilterResult(
         filtered_values=filt_vals,
