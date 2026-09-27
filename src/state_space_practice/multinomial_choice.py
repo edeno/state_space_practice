@@ -70,16 +70,19 @@ def _softmax_update_core(
     Use ``softmax_observation_update`` for the public API with validation.
 
     The mode of the (concave) log posterior is found by Newton's method with
-    an Armijo backtracking line search: each iteration takes the largest step
-    in ``1, 1/2, ..., 1/128`` of the Newton direction that increases the log
-    posterior sufficiently. A full Newton step is not safe here: when the
-    prior mean sits on the saturated side of the softmax opposite the
-    observed choice, the likelihood curvature is ~0 there and the full step
-    overshoots to the other saturated side, after which Newton oscillates
-    between the two (e.g. prior N(1.5, 1), beta=4, choice 0: iterates 1.5,
-    -2.2, 1.5, ... around the true mode -0.2). With the line search every
-    iteration ascends, and near the mode the full step is accepted, so
-    well-behaved updates are unchanged.
+    a line search: each iteration evaluates the steps ``1, 1/2, ..., 1/128``
+    of the Newton direction and, among those passing the Armijo
+    sufficient-increase test, takes the one with the highest log posterior
+    (the largest one within round-off of it). A full Newton step is not safe
+    here: when the prior mean sits on the saturated side of the softmax
+    opposite the observed choice, the likelihood curvature is ~0 there and
+    the full step overshoots to the other saturated side, after which Newton
+    oscillates between the two (e.g. prior N(1.5, 1), beta=4, choice 0:
+    iterates 1.5, -2.2, 1.5, ... around the true mode -0.2). Taking merely
+    the largest Armijo-acceptable step still zigzags across the mode with
+    slowly shrinking amplitude. With the line search every iteration ascends,
+    and near the mode the full step is the best one, so well-behaved updates
+    are unchanged.
 
     Parameters
     ----------
@@ -160,9 +163,14 @@ def _softmax_update_core(
         sufficient = (
             f_candidates >= f_x + _ARMIJO_C * step_sizes * (rhs @ direction) - slack
         )
-        # Largest acceptable step; if none qualifies (direction numerically
-        # useless), keep x rather than risk a descent step.
-        first_ok = jnp.argmax(sufficient)
+        # Of the acceptable steps, the one with the highest log posterior
+        # (the largest within round-off of it, so a converged mode still takes
+        # the full step). Taking the largest acceptable step instead lets the
+        # iterates zigzag across the mode with slowly shrinking amplitude.
+        # If no step qualifies (direction numerically useless), keep x rather
+        # than risk a descent step.
+        f_best = jnp.max(jnp.where(sufficient, f_candidates, -jnp.inf))
+        first_ok = jnp.argmax(sufficient & (f_candidates >= f_best - slack))
         alpha = jnp.where(jnp.any(sufficient), step_sizes[first_ok], 0.0)
         return x + alpha * direction, None
 

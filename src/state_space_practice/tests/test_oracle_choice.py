@@ -364,6 +364,27 @@ class TestLaplaceNewtonDoesNotOscillate:
     the exact -118. The line-searched update converges to the mode.
     """
 
+    def test_update_does_not_zigzag_across_the_mode(self):
+        """Taking the largest Armijo-acceptable step (rather than the best
+        one) let the iterates zigzag across the mode with slowly shrinking
+        amplitude: for this prior (trial 41 of a simulated 200-trial run,
+        beta=3, choice 1) the first components went -0.61, 1.89, -0.33,
+        1.77, ... and ten iterations ended 0.02 from the mode (0.1 nats of
+        filter evidence). Ten iterations must converge."""
+        from state_space_practice.multinomial_choice import _softmax_update_core
+
+        def mode(n_steps):
+            return _softmax_update_core(
+                jnp.array([-0.614, 1.363]),
+                jnp.array([[0.931, 0.076], [0.076, 0.488]]),
+                jnp.int32(1),
+                3,
+                3.0,
+                max_newton_steps=n_steps,
+            )[0]
+
+        np.testing.assert_allclose(mode(10), mode(40), rtol=0, atol=1e-10)
+
     def test_single_update_reaches_the_mode(self):
         from scipy.optimize import brentq
 
