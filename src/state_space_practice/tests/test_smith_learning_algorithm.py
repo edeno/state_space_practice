@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from state_space_practice.exceptions import StateSpaceWarning
+from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.smith_learning_algorithm import (
     DEFAULT_SIGMA_EPSILON,
     SmithLearningModel,
@@ -891,7 +891,7 @@ class TestSmithLearningModelClass:
         """get_learning_curve() should raise if not fitted."""
         model = SmithLearningModel()
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(NotFittedError):
             model.get_learning_curve(jax.random.PRNGKey(0))
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -1016,7 +1016,7 @@ class TestSummaryAndScoring:
     def test_bic_requires_fit(self) -> None:
         """bic() should raise if not fitted."""
         model = SmithLearningModel()
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.bic()
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -1088,7 +1088,7 @@ class TestSummaryAndScoring:
     def test_summary_requires_fit(self) -> None:
         """summary() should raise if not fitted."""
         model = SmithLearningModel()
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.summary()
 
 
@@ -1120,7 +1120,7 @@ class TestFindCriterionTrial:
     def test_requires_fit(self) -> None:
         """Should raise if not fitted."""
         model = SmithLearningModel()
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.find_criterion_trial(jax.random.PRNGKey(0))
 
 
@@ -1171,7 +1171,7 @@ class TestPlotTrialComparisonMatrix:
     def test_requires_fit(self) -> None:
         """Should raise if not fitted."""
         model = SmithLearningModel()
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.plot_trial_comparison_matrix(jax.random.PRNGKey(0))
 
 
@@ -1193,7 +1193,7 @@ class TestPlotConvergence:
     def test_requires_fit(self) -> None:
         """Should raise if not fitted."""
         model = SmithLearningModel()
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.plot_convergence()
 
 
@@ -1221,7 +1221,7 @@ class TestPlotSummary:
     def test_requires_fit(self) -> None:
         """Should raise if not fitted."""
         model = SmithLearningModel()
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.plot_summary(jax.random.PRNGKey(0))
 
 
@@ -1769,7 +1769,7 @@ class TestSmithLearningModelTrialComparison:
         model = SmithLearningModel()
         key = jax.random.PRNGKey(0)
 
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.compare_trials(key, trial1=0, trial2=5)
 
     def test_compare_trials_validates_indices(self, fitted_model) -> None:
@@ -1795,7 +1795,7 @@ class TestSmithLearningModelTrialComparison:
         model = SmithLearningModel()
         key = jax.random.PRNGKey(0)
 
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.get_trial_comparison_matrix(key)
 
     def test_get_trial_comparison_matrix_shape(self, fitted_model) -> None:
@@ -1812,7 +1812,7 @@ class TestSmithLearningModelTrialComparison:
         model = SmithLearningModel()
         key = jax.random.PRNGKey(0)
 
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.find_first_significant_improvement(key)
 
 

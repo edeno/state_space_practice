@@ -66,7 +66,7 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.em_driver import run_em
-from state_space_practice.exceptions import StateSpaceWarning
+from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.multinomial_choice import (
     _armijo_slack,
     _warn_if_newton_unconverged,
@@ -2119,11 +2119,11 @@ class SmithLearningModel(SGDFittableMixin):
 
         Raises
         ------
-        RuntimeError
+        NotFittedError
             If the model has not been fitted yet (i.e., smoothed estimates are not available).
         """
         if not self.is_fitted:
-            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+            raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         return calculate_probability_confidence_limits(
             key=key,
@@ -2163,11 +2163,11 @@ class SmithLearningModel(SGDFittableMixin):
 
         Raises
         ------
-        RuntimeError
+        NotFittedError
             If the model has not been fitted.
         """
         if not self.is_fitted:
-            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+            raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         return calculate_latent_state_percentiles(
             key=key,
@@ -2363,7 +2363,7 @@ class SmithLearningModel(SGDFittableMixin):
 
         Raises
         ------
-        RuntimeError
+        NotFittedError
             If the model has not been fitted.
 
         Examples
@@ -2374,7 +2374,7 @@ class SmithLearningModel(SGDFittableMixin):
         ...     print(f"Learning established at trial {criterion}")
         """
         if not self.is_fitted:
-            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+            raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         # Compute P(p_k > p_chance | y_{1:T}) for each trial
         _, prob_above_chance = self.get_learning_curve(
@@ -2479,7 +2479,7 @@ class SmithLearningModel(SGDFittableMixin):
 
         Raises
         ------
-        RuntimeError
+        NotFittedError
             If the model has not been fitted yet (i.e., smoothed estimates
             are not available).
         ValueError
@@ -2487,7 +2487,7 @@ class SmithLearningModel(SGDFittableMixin):
             `observed_max_possible` have inconsistent lengths.
         """
         if not self.is_fitted:
-            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+            raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         import matplotlib.pyplot as plt
 
@@ -2673,13 +2673,13 @@ class SmithLearningModel(SGDFittableMixin):
 
         Raises
         ------
-        RuntimeError
+        NotFittedError
             If the model has not been fitted.
         ValueError
             If trial indices are out of bounds.
         """
         if not self.is_fitted:
-            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+            raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         n_trials = len(self.smoothed_learning_state_mode)
         if not (0 <= trial1 < n_trials and 0 <= trial2 < n_trials):
@@ -2732,7 +2732,7 @@ class SmithLearningModel(SGDFittableMixin):
 
         Raises
         ------
-        RuntimeError
+        NotFittedError
             If the model has not been fitted.
 
         Examples
@@ -2747,7 +2747,7 @@ class SmithLearningModel(SGDFittableMixin):
         ...     print("Trial 10 is significantly higher than trial 0")
         """
         if not self.is_fitted:
-            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+            raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         prob_chance = self.prob_correct_by_chance if compare_probability else None
 
@@ -2798,7 +2798,7 @@ class SmithLearningModel(SGDFittableMixin):
 
         Raises
         ------
-        RuntimeError
+        NotFittedError
             If the model has not been fitted.
 
         Notes
@@ -2807,7 +2807,7 @@ class SmithLearningModel(SGDFittableMixin):
         "Earliest trial signif above estimated start distribution".
         """
         if not self.is_fitted:
-            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+            raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         comparison_matrix = self.get_trial_comparison_matrix(
             key=key,
@@ -2836,11 +2836,11 @@ class SmithLearningModel(SGDFittableMixin):
 
         Raises
         ------
-        RuntimeError
+        NotFittedError
             If the model has not been fitted.
         """
         if not self.is_fitted or self.log_likelihood_ is None:
-            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+            raise NotFittedError("Model has not been fitted. Run .fit() method first.")
         n_params = 3  # sigma_epsilon, init_learning_state, init_learning_variance
         return -2.0 * self.log_likelihood_ + n_params * math.log(self._n_trials_)
 
@@ -2877,13 +2877,13 @@ class SmithLearningModel(SGDFittableMixin):
 
         Raises
         ------
-        RuntimeError
+        NotFittedError
             If the model has not been fitted.
         ValueError
             If ``n_correct_responses`` is not provided and cannot be inferred.
         """
         if not self.is_fitted or self.log_likelihood_ is None:
-            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+            raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         if n_correct_responses is None:
             raise ValueError(
@@ -2941,11 +2941,11 @@ class SmithLearningModel(SGDFittableMixin):
 
         Raises
         ------
-        RuntimeError
+        NotFittedError
             If the model has not been fitted.
         """
         if not self.is_fitted:
-            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+            raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         lines = [
             "SmithLearningModel Summary",
@@ -3025,11 +3025,11 @@ class SmithLearningModel(SGDFittableMixin):
 
         Raises
         ------
-        RuntimeError
+        NotFittedError
             If the model has not been fitted.
         """
         if not self.is_fitted:
-            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+            raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         import matplotlib.pyplot as plt
 
@@ -3148,11 +3148,11 @@ class SmithLearningModel(SGDFittableMixin):
 
         Raises
         ------
-        RuntimeError
+        NotFittedError
             If the model has not been fitted.
         """
         if self.log_likelihood_history_ is None:
-            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+            raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         import matplotlib.pyplot as plt
 
@@ -3201,11 +3201,11 @@ class SmithLearningModel(SGDFittableMixin):
 
         Raises
         ------
-        RuntimeError
+        NotFittedError
             If the model has not been fitted.
         """
         if not self.is_fitted:
-            raise RuntimeError("Model has not been fitted. Run .fit() method first.")
+            raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         import matplotlib.pyplot as plt
 
