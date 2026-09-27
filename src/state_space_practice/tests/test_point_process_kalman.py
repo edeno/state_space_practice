@@ -3285,12 +3285,13 @@ class TestBlockDiagonalFilterEquivalence:
         spikes,
         dt,
         include_laplace_normalization=True,
+        max_newton_iter=1,
     ):
         """Run the dense filter and the block filter on the same problem.
 
-        Uses a single Fisher step: the two paths agree to round-off only when
-        no line search backtracks (the dense path backtracks globally, the
-        block path per neuron), which one step guarantees.
+        Uses a single Fisher step by default: the two paths agree to round-off
+        only when no line search backtracks (the dense path backtracks
+        globally, the block path per neuron), which one step guarantees.
         """
         dense_mean, dense_cov, dense_mll = stochastic_point_process_filter(
             init_mean,
@@ -3302,7 +3303,7 @@ class TestBlockDiagonalFilterEquivalence:
             Q,
             log_conditional_intensity,
             include_laplace_normalization=include_laplace_normalization,
-            max_newton_iter=1,
+            max_newton_iter=max_newton_iter,
             validate_inputs=False,  # we know the problem is PSD
         )
         structure = _block_structure(init_mean, init_cov, A, Q, Z)
@@ -3312,7 +3313,7 @@ class TestBlockDiagonalFilterEquivalence:
                 spikes,
                 dt,
                 include_laplace_normalization=include_laplace_normalization,
-                max_newton_iter=1,
+                max_newton_iter=max_newton_iter,
             )
         )
         return (dense_mean, dense_cov, dense_mll), (block_mean, block_cov, block_mll)
@@ -3346,6 +3347,43 @@ class TestBlockDiagonalFilterEquivalence:
             atol=1e-9,
             rtol=1e-10,
         )
+
+    def test_matches_dense_at_default_newton_iterations(self, monkeypatch) -> None:
+        """At the default ``max_newton_iter=3`` the paths agree to round-off on
+        a well-conditioned problem where no line search backtracks."""
+        problem = self._make_problem(n_neurons=3, block_size=4, T=60, seed=1)
+        dense, block = self._run_both_paths(*problem, max_newton_iter=3)
+        for actual, expected in zip(block, dense):
+            np.testing.assert_allclose(
+                np.asarray(actual), np.asarray(expected), atol=1e-10, rtol=1e-10
+            )
+
+        # Guard: the extra iterations move the estimate, so the comparison
+        # exercises the iterated line search and not just one Fisher step.
+        dense_one_step, _ = self._run_both_paths(*problem, max_newton_iter=1)
+        assert not np.allclose(
+            np.asarray(dense[0]), np.asarray(dense_one_step[0]), atol=1e-8
+        )
+
+        # Guard: no step was shortened. With one trial step size per
+        # iteration (no backtracking possible) both paths reproduce their
+        # default-budget output. The budget is read at trace time, so the jit
+        # caches are cleared on both sides of the patch.
+        monkeypatch.setattr(point_process_kalman, "_LINE_SEARCH_MAX_BACKTRACKS", 1)
+        jax.clear_caches()
+        try:
+            dense_full_step, block_full_step = self._run_both_paths(
+                *problem, max_newton_iter=3
+            )
+        finally:
+            monkeypatch.undo()
+            jax.clear_caches()
+        for actual, expected in zip(
+            (*dense_full_step, *block_full_step), (*dense, *block)
+        ):
+            np.testing.assert_allclose(
+                np.asarray(actual), np.asarray(expected), atol=1e-12, rtol=1e-12
+            )
 
     def test_public_filter_uses_dense_for_custom_intensity(self) -> None:
         """Manual block args must not bypass a custom log-intensity callable."""
@@ -3656,8 +3694,9 @@ class TestBlockDiagonalSmootherEquivalence:
         dt,
         include_laplace_normalization=True,
         return_filtered=False,
+        max_newton_iter=1,
     ):
-        # Single Fisher step: see TestBlockDiagonalFilterEquivalence.
+        # Single Fisher step by default: see TestBlockDiagonalFilterEquivalence.
         dense_result = stochastic_point_process_smoother(
             init_mean,
             init_cov,
@@ -3669,7 +3708,7 @@ class TestBlockDiagonalSmootherEquivalence:
             log_conditional_intensity,
             include_laplace_normalization=include_laplace_normalization,
             return_filtered=return_filtered,
-            max_newton_iter=1,
+            max_newton_iter=max_newton_iter,
             validate_inputs=False,
         )
         structure = _block_structure(init_mean, init_cov, A, Q, Z)
@@ -3679,9 +3718,19 @@ class TestBlockDiagonalSmootherEquivalence:
             dt,
             include_laplace_normalization=include_laplace_normalization,
             return_filtered=return_filtered,
-            max_newton_iter=1,
+            max_newton_iter=max_newton_iter,
         )
         return dense_result, block_result
+
+    def test_matches_dense_at_default_newton_iterations(self) -> None:
+        """Smoother outputs agree at ``max_newton_iter=3`` on the problem that
+        ``TestBlockDiagonalFilterEquivalence`` shows never backtracks."""
+        problem = self._make_problem(n_neurons=3, block_size=4, T=60, seed=1)
+        dense, block = self._run_both_paths(*problem, max_newton_iter=3)
+        for actual, expected in zip(block, dense):
+            np.testing.assert_allclose(
+                np.asarray(actual), np.asarray(expected), atol=1e-10, rtol=1e-10
+            )
 
     def test_smoother_mean_matches_dense_2_neurons(self) -> None:
         problem = self._make_problem(n_neurons=2, block_size=4, T=30)
