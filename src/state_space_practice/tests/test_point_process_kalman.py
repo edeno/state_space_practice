@@ -1889,7 +1889,7 @@ class TestGetRateEstimateMultiNeuron:
             spike_indicator_t=spike_counts,
             dt=dt,
             log_intensity_func=nonlinear_log_intensity,
-            diagonal_boost=1e-9,  # production default
+            # production default (scale-relative Cholesky shift only)
             include_laplace_normalization=True,
         )
 
@@ -2991,9 +2991,9 @@ class TestValidateFilterNumerics:
         We construct a tiny problem with an init_cov that:
           - has a tiny (-1e-12) negative eigenvalue, so the validation
             layer would raise with "not positive definite"
-          - is close enough to PSD that ``psd_solve``'s internal
-            ``diagonal_boost=1e-9`` rescues the Cholesky, so the
-            downstream scan completes without NaN
+          - is close enough to PSD that the first prediction
+            (``A P0 A' + Q`` with ``Q = 1e-6 I``) is positive definite, so
+            the downstream scan completes without NaN
 
         With validate_inputs=True (default), this raises ValueError
         from the validator. With validate_inputs=False, the filter
@@ -3019,8 +3019,9 @@ class TestValidateFilterNumerics:
                 log_conditional_intensity,
             )
 
-        # Opt-out path: validation is skipped, psd_solve's diagonal_boost
-        # rescues the Cholesky, and the filter produces finite output.
+        # Opt-out path: validation is skipped, the process noise makes the
+        # first prediction positive definite, and the filter produces finite
+        # output.
         # (We don't assert output correctness — only that the validation
         # layer was bypassed cleanly.)
         filtered_mean, filtered_cov, mll = stochastic_point_process_filter(
@@ -4644,12 +4645,36 @@ class TestEMRollbackStateConsistency:
 class TestFrozenTransitionProcessCov:
     """The process-cov M-step must use the transition matrix actually stored.
 
-    The Roweis-Ghahramani shortcut Q = (gamma2 - A beta^T) / (T - 1) equals
-    the full quadratic form only at the freshly solved (unconstrained) A.
-    When ``update_transition_matrix=False`` the stored A is frozen, so Q must
-    be recomputed via the full quadratic form against that frozen A -- not the
-    discarded unconstrained solution.
+    The Roweis-Ghahramani shortcut Q = (gamma2 - A beta^T) / n_transitions
+    equals the full quadratic form only at the freshly solved (unconstrained)
+    A. When ``update_transition_matrix=False`` the stored A is frozen, so Q
+    must be recomputed via the full quadratic form against that frozen A --
+    not the discarded unconstrained solution.
+
+    ``PointProcessModel._m_step`` runs exact EM: the statistics include the
+    ``x_0 -> x_1`` transition, with the smoothed ``x_0`` moments and
+    ``Cov(x_0, x_1 | y) = J_0 P_{1|T}`` (``J_0 = P_0 A' (A P_0 A' + Q)^{-1}``)
+    written out here from the model's prior, so the expected values use all
+    ``T`` transitions.
     """
+
+    @staticmethod
+    def _with_initial_state(model, smoother_mean, smoother_cov, smoother_cross_cov):
+        """Prepend the smoothed x_0 (and its cross-covariance with x_1)."""
+        A = np.asarray(model.transition_matrix)
+        P0 = np.asarray(model.init_cov)
+        m0 = np.asarray(model.init_mean)
+        P_pred = A @ P0 @ A.T + np.asarray(model.process_cov)
+        J0 = P0 @ A.T @ np.linalg.inv(P_pred)
+        m1, P1 = np.asarray(smoother_mean[0]), np.asarray(smoother_cov[0])
+        m0_s = m0 + J0 @ (m1 - A @ m0)
+        P0_s = P0 + J0 @ (P1 - P_pred) @ J0.T
+        C01 = J0 @ P1
+        return (
+            jnp.concatenate([jnp.asarray(m0_s)[None], smoother_mean]),
+            jnp.concatenate([jnp.asarray(P0_s)[None], smoother_cov]),
+            jnp.concatenate([jnp.asarray(C01)[None], smoother_cross_cov]),
+        )
 
     @staticmethod
     def _smoother_stats():
@@ -4680,12 +4705,20 @@ class TestFrozenTransitionProcessCov:
         from state_space_practice.kalman import psd_solve, stabilize_covariance
 
         smoother_mean, smoother_cov, smoother_cross_cov = self._smoother_stats()
-        n_time = smoother_mean.shape[0]
-        gamma1, gamma2, beta = self._gammas(
-            smoother_mean, smoother_cov, smoother_cross_cov
-        )
-
         A_frozen = jnp.array([[0.2, 0.0], [0.0, 0.3]])
+        model = PointProcessModel(
+            n_state_dims=2,
+            dt=0.02,
+            transition_matrix=A_frozen,
+            update_transition_matrix=False,
+            update_process_cov=True,
+            update_init_state=False,
+        )
+        aug = self._with_initial_state(
+            model, smoother_mean, smoother_cov, smoother_cross_cov
+        )
+        n_time = aug[0].shape[0]  # T + 1 states, T transitions
+        gamma1, gamma2, beta = self._gammas(*aug)
         A_new = psd_solve(gamma1, beta.T).T
 
         Q_full = stabilize_covariance(
@@ -4706,14 +4739,6 @@ class TestFrozenTransitionProcessCov:
         # "process_cov == Q_full" is not vacuously the same as "== Q_shortcut".
         assert not np.allclose(np.asarray(Q_full), np.asarray(Q_shortcut))
 
-        model = PointProcessModel(
-            n_state_dims=2,
-            dt=0.02,
-            transition_matrix=A_frozen,
-            update_transition_matrix=False,
-            update_process_cov=True,
-            update_init_state=False,
-        )
         model.smoother_mean = smoother_mean
         model.smoother_cov = smoother_cov
         model.smoother_cross_cov = smoother_cross_cov
@@ -4735,15 +4760,6 @@ class TestFrozenTransitionProcessCov:
         from state_space_practice.kalman import psd_solve, stabilize_covariance
 
         smoother_mean, smoother_cov, smoother_cross_cov = self._smoother_stats()
-        n_time = smoother_mean.shape[0]
-        gamma1, gamma2, beta = self._gammas(
-            smoother_mean, smoother_cov, smoother_cross_cov
-        )
-        A_new = psd_solve(gamma1, beta.T).T
-        Q_shortcut = stabilize_covariance(
-            (gamma2 - A_new @ beta.T) / (n_time - 1), min_eigenvalue=1e-8
-        )
-
         model = PointProcessModel(
             n_state_dims=2,
             dt=0.02,
@@ -4751,6 +4767,16 @@ class TestFrozenTransitionProcessCov:
             update_process_cov=True,
             update_init_state=False,
         )
+        aug = self._with_initial_state(
+            model, smoother_mean, smoother_cov, smoother_cross_cov
+        )
+        n_time = aug[0].shape[0]  # T + 1 states, T transitions
+        gamma1, gamma2, beta = self._gammas(*aug)
+        A_new = psd_solve(gamma1, beta.T).T
+        Q_shortcut = stabilize_covariance(
+            (gamma2 - A_new @ beta.T) / (n_time - 1), min_eigenvalue=1e-8
+        )
+
         model.smoother_mean = smoother_mean
         model.smoother_cov = smoother_cov
         model.smoother_cross_cov = smoother_cross_cov
@@ -5141,3 +5167,81 @@ class TestPointProcessModelNonFiniteFirstEStep:
             assert getattr(model, attr) is None, attr
         with pytest.raises(RuntimeError, match="not been fitted"):
             model.get_rate_estimate(Z)
+
+
+class TestScaleEquivariance:
+    """Rescaling the latent state leaves the filter / smoother unchanged.
+
+    With ``x -> c x`` (all covariances times ``s = c**2``, the design times
+    ``1/c``) the log-rates are identical, so the filtered and smoothed means
+    must scale by ``c``, the covariances by ``s`` and the Laplace marginal
+    log-likelihood must not change. This holds only if every Cholesky
+    stabilisation shift is scale-relative: the former absolute
+    ``diagonal_boost=1e-9`` changed the answer by ~2% (means) / ~7%
+    (covariances) at ``s = 1e-6`` and produced garbage (errors > 100%) at
+    ``s = 1e-10``.
+    """
+
+    @staticmethod
+    def _problem():
+        rng = np.random.default_rng(0)
+        T, d, n = 50, 3, 4
+        Z = rng.normal(0, 1, (T, n, d))
+        A = 0.95 * np.eye(d)
+        A[0, 1] = 0.05
+        Q = np.diag([0.02, 0.03, 0.01])
+        P0 = 0.5 * np.eye(d)
+        P0[0, 2] = P0[2, 0] = 0.2
+        m0 = np.array([0.5, -0.2, 0.1])
+        y = rng.poisson(0.3, (T, n)).astype(float)
+        return m0, P0, Z, y, A, Q
+
+    @pytest.mark.parametrize(
+        ("max_newton_iter", "rtol"),
+        [(1, 1e-11), (3, 2e-8)],
+    )
+    @pytest.mark.parametrize("scale", [1e-6, 1e-10])
+    def test_filter_and_smoother_are_scale_equivariant(
+        self, scale, max_newton_iter, rtol
+    ) -> None:
+        """N1 is equivariant to roundoff. N3 to ~1e-8: its line search
+        accepts a step only when the loss strictly decreases, and near the
+        mode that comparison is decided by roundoff (see
+        ``test_oracle_point_process``), so the two runs can stop ~sqrt(eps)
+        apart."""
+        m0, P0, Z, y, A, Q = self._problem()
+
+        def run(s):
+            c = np.sqrt(s)
+            sm, sc, scc, ll, fm, fc = stochastic_point_process_smoother(
+                m0 * c,
+                P0 * s,
+                Z / c,
+                y,
+                0.1,
+                A,
+                Q * s,
+                log_conditional_intensity,
+                max_newton_iter=max_newton_iter,
+                return_filtered=True,
+            )
+            return (
+                np.asarray(fm) / c,
+                np.asarray(fc) / s,
+                np.asarray(sm) / c,
+                np.asarray(sc) / s,
+                np.asarray(scc) / s,
+                float(ll),
+            )
+
+        ref = run(1.0)
+        got = run(scale)
+        # Guard: at this scale the covariances are far below the former
+        # absolute 1e-9 jitter, which would have swamped them.
+        assert np.max(np.asarray(got[1]) * scale) < 1e-9 * 1e3
+        names = ("filt_mean", "filt_cov", "smooth_mean", "smooth_cov", "cross_cov")
+        for name, a, b in zip(names, got[:5], ref[:5]):
+            np.testing.assert_allclose(
+                a, b, rtol=0, atol=rtol * np.max(np.abs(b)), err_msg=name
+            )
+        np.testing.assert_allclose(got[5], ref[5], rtol=rtol)

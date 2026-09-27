@@ -45,7 +45,6 @@ from state_space_practice.kalman import (
     InitialStatePrior,
     _kalman_smoother_update,
     process_cov_residual_form,
-    smooth_initial_state,
     sum_of_outer_products,
 )
 from state_space_practice.parameter_transforms import (
@@ -831,7 +830,7 @@ def _point_process_laplace_update(
     spike_indicator_t: Array,
     dt: float,
     log_intensity_func: Callable[[Array], Array],
-    diagonal_boost: float = 1e-9,
+    diagonal_boost: float = 0.0,
     grad_log_intensity_func: Callable[[Array], Array] | None = None,
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 1,
@@ -889,8 +888,15 @@ def _point_process_laplace_update(
     log_intensity_func : Callable[[Array], Array]
         Function mapping state (n_latent,) to log-intensities (n_neurons,).
         Should return log(lambda) where lambda is firing rate in Hz.
-    diagonal_boost : float, default=1e-9
-        Small value added to precision matrix diagonal for numerical stability.
+    diagonal_boost : float, default=0.0
+        Absolute floor of the diagonal shift added before each Cholesky
+        factorization (prior covariance, posterior precision). The default
+        leaves only the scale-relative shift of
+        :func:`~state_space_practice.utils.psd_cholesky` (``1e-12 * max|diag|``
+        in float64), which keeps the update scale-equivariant: rescaling the latent state by ``c`` (all
+        covariances by ``c**2``, the design by ``1/c``) rescales the output
+        exactly. A positive value (the former default was ``1e-9``) breaks
+        that for covariances below ``~diagonal_boost / 1e-12`` in scale.
     grad_log_intensity_func : Callable[[Array], Array] | None, optional
         Pre-computed gradient function (Jacobian) of log_intensity_func.
         If None, computed via jax.jacfwd(log_intensity_func).
@@ -975,7 +981,7 @@ def _point_process_laplace_update(
     # Factor the prior covariance once: the precision (used by the Fisher
     # steps and the quadratic form) and the log-determinant of the Laplace
     # normaliser both come from this factor, so they see the same jittered
-    # matrix (psd_cholesky's absolute + relative diagonal boost).
+    # matrix (psd_cholesky's scale-relative diagonal shift).
     prior_cho = psd_cholesky(one_step_cov, diagonal_boost=diagonal_boost)
     prior_precision = jax.scipy.linalg.cho_solve(prior_cho, identity)
 
@@ -1192,7 +1198,7 @@ def glm_laplace_update(
     observations: Array,
     eta_func: Callable[[Array], Array],
     family: GLMFamily,
-    diagonal_boost: float = 1e-9,
+    diagonal_boost: float = 0.0,
     grad_eta_func: Callable[[Array], Array] | None = None,
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 1,
@@ -1240,7 +1246,7 @@ def glm_laplace_update(
     # Factor the prior covariance once: the precision (used by the Fisher
     # steps and the quadratic form) and the log-determinant of the Laplace
     # normaliser both come from this factor, so they see the same jittered
-    # matrix (psd_cholesky's absolute + relative diagonal boost).
+    # matrix (psd_cholesky's scale-relative diagonal shift).
     prior_cho = psd_cholesky(one_step_cov, diagonal_boost=diagonal_boost)
     prior_precision = jax.scipy.linalg.cho_solve(prior_cho, identity)
 
@@ -2498,6 +2504,56 @@ def _stochastic_point_process_smoother_backward(
     return smoother_mean, smoother_cov, smoother_cross_cov
 
 
+def smoothed_initial_transition_moments(
+    prior: InitialStatePrior,
+    first_smoother_mean: ArrayLike,
+    first_smoother_cov: ArrayLike,
+) -> tuple[Array, Array, Array]:
+    """Smoothed moments of ``x_0`` and of the ``x_0 -> x_1`` transition.
+
+    The point-process filters start from ``x_0 ~ N(m_0, P_0)`` and predict
+    before their first update, so the first observation is of ``x_1`` and
+    ``x_0`` itself is unobserved. Its smoothed law follows exactly from that
+    of ``x_1`` through the Gaussian backward kernel ``p(x_0 | x_1)``: with
+    ``P_{1|0} = A P_0 A^T + Q`` and ``J_0 = P_0 A^T P_{1|0}^{-1}``::
+
+        m_{0|T}               = m_0 + J_0 (m_{1|T} - A m_0)
+        P_{0|T}               = P_0 + J_0 (P_{1|T} - P_{1|0}) J_0^T
+        Cov(x_0, x_1 | y_1:T) = J_0 P_{1|T}
+
+    (the same RTS step as
+    :func:`~state_space_practice.kalman.smooth_initial_state`, which returns
+    the first two). The cross-covariance lets the M-step count the
+    ``x_0 -> x_1`` transition in the ``A`` / ``Q`` sufficient statistics.
+
+    Parameters
+    ----------
+    prior : InitialStatePrior
+        Initial-state prior and dynamics the E-step ran with.
+    first_smoother_mean : ArrayLike, shape (n_cont_states,)
+        ``m_{1|T}``.
+    first_smoother_cov : ArrayLike, shape (n_cont_states, n_cont_states)
+        ``P_{1|T}``.
+
+    Returns
+    -------
+    init_smoother_mean : Array, shape (n_cont_states,)
+        ``m_{0|T}``.
+    init_smoother_cov : Array, shape (n_cont_states, n_cont_states)
+        ``P_{0|T}``.
+    init_cross_cov : Array, shape (n_cont_states, n_cont_states)
+        ``Cov(x_0, x_1 | y_{1:T}) = J_0 P_{1|T}``.
+    """
+    return _kalman_smoother_update(
+        jnp.asarray(first_smoother_mean),
+        jnp.asarray(first_smoother_cov),
+        jnp.asarray(prior.init_mean),
+        jnp.asarray(prior.init_cov),
+        jnp.asarray(prior.process_cov),
+        jnp.asarray(prior.transition_matrix),
+    )
+
+
 @jax.jit
 def dynamics_only_m_step(
     smoother_mean: ArrayLike,
@@ -2513,6 +2569,24 @@ def dynamics_only_m_step(
     dynamics (transition matrix, process covariance) and the initial state.
     Used by point-process / spike models whose observation model is a GLM
     fit separately, not a linear-Gaussian emission.
+
+    Exact EM (``initial_state_prior`` given)
+    ----------------------------------------
+    The filters start from ``x_0 ~ N(m_0, P_0)`` and observe ``x_1 .. x_T``,
+    so the complete-data log-likelihood has ``T`` transitions
+    ``x_{t-1} -> x_t``, ``t = 1..T``. With the prior, the smoothed moments of
+    ``x_0`` and ``Cov(x_0, x_1 | y)`` are recovered one RTS step behind the
+    smoother (:func:`smoothed_initial_transition_moments`) and the ``x_0 ->
+    x_1`` transition enters the ``A`` and ``Q`` sufficient statistics, so
+    ``A``, ``Q``, ``m_0`` and ``P_0`` jointly maximise the expected
+    complete-data log-likelihood ``Q(theta)`` given the E-step moments (the
+    M-step is exact; ``tests/test_oracle_point_process.py`` checks that the
+    gradient of ``Q(theta)`` vanishes at the returned values). ``Q`` is then
+    divided by ``T``.
+
+    Without the prior (legacy), only the ``T - 1`` observed-to-observed
+    transitions are used (``Q`` divided by ``T - 1``) and the initial state is
+    set to the smoothed ``x_1``; that is not an exact EM step.
 
     Parameters
     ----------
@@ -2530,14 +2604,14 @@ def dynamics_only_m_step(
         form :func:`~state_space_practice.kalman.process_cov_residual_form`
         at that ``A`` -- the M-step optimum for the given dynamics, PSD by
         construction (at the solved ``A`` it equals the Roweis-Ghahramani
-        ``(gamma2 - A beta^T) / (T - 1)`` up to roundoff).
+        ``(gamma2 - A beta^T) / n_transitions`` up to roundoff).
     initial_state_prior : InitialStatePrior or None, optional
-        The initial-state prior and dynamics the E-step ran with. The
-        point-process filter predicts before its first update, so the exact
-        EM update of the initial state is the smoothed ``x_0``
-        (:func:`~state_space_practice.kalman.smooth_initial_state`). If None
-        (legacy), the smoothed moments of ``x_1`` are returned instead, which
-        is not an EM step and can decrease the log-likelihood.
+        The initial-state prior and dynamics the E-step ran with. If given,
+        the M-step is exact EM (see above): the ``x_0 -> x_1`` transition is
+        included in the ``A`` / ``Q`` statistics and the initial state is the
+        smoothed ``x_0``. If None (legacy), the smoothed moments of ``x_1``
+        are returned as the initial state and only ``T - 1`` transitions are
+        used, which is not an EM step and can decrease the log-likelihood.
 
     Returns
     -------
@@ -2562,50 +2636,60 @@ def dynamics_only_m_step(
     smoother_cross_cov = jnp.asarray(smoother_cross_cov)
 
     n_time = smoother_mean.shape[0]
-    if n_time < 2:
+    if initial_state_prior is None and n_time < 2:
         raise ValueError(
             "dynamics_only_m_step requires at least 2 time steps to "
-            "estimate transition dynamics."
+            "estimate transition dynamics (or an initial_state_prior, which "
+            "adds the x_0 -> x_1 transition)."
         )
+    if n_time < 1:
+        raise ValueError("dynamics_only_m_step requires at least 1 time step.")
 
-    # Compute intermediate expectation terms
     sum_cov = jnp.sum(smoother_cov, axis=0)
     sum_cross_cov = smoother_cross_cov.sum(axis=0)
 
+    if initial_state_prior is None:
+        # Legacy: the T - 1 transitions x_t -> x_{t+1}, t = 1..T-1.
+        init_mean = smoother_mean[0]
+        init_cov = smoother_cov[0]
+        means = smoother_mean
+        sum_state_cov = sum_cov
+        first_cov = smoother_cov[0]
+    else:
+        # Exact EM: prepend the smoothed x_0 so the sums run over all T
+        # transitions x_{t-1} -> x_t, t = 1..T.
+        init_mean, init_cov, init_cross_cov = smoothed_initial_transition_moments(
+            initial_state_prior, smoother_mean[0], smoother_cov[0]
+        )
+        means = jnp.concatenate((init_mean[None], smoother_mean), axis=0)
+        sum_state_cov = sum_cov + init_cov
+        sum_cross_cov = sum_cross_cov + init_cross_cov
+        first_cov = init_cov
+
+    # sum over the "previous" (x_{t-1}) and "next" (x_t) ends of the transitions.
+    sum_prev_cov = sum_state_cov - smoother_cov[-1]
+    sum_next_cov = sum_state_cov - first_cov
+
     if fixed_transition_matrix is None:
         # Unconstrained ML transition matrix A = beta gamma1^{-1}.
-        gamma1 = (
-            sum_cov
-            - smoother_cov[-1]
-            + sum_of_outer_products(smoother_mean[:-1], smoother_mean[:-1])
-        )
-        beta = (
-            sum_cross_cov + sum_of_outer_products(smoother_mean[:-1], smoother_mean[1:])
-        ).T
+        gamma1 = sum_prev_cov + sum_of_outer_products(means[:-1], means[:-1])
+        beta = (sum_cross_cov + sum_of_outer_products(means[:-1], means[1:])).T
         transition_matrix = psd_solve(gamma1, beta.T).T
     else:
         transition_matrix = jnp.asarray(fixed_transition_matrix)
 
-    # Process covariance: centred residual form at the chosen A.
+    # Process covariance: centred residual form at the chosen A (divides by
+    # the number of transitions, len(means) - 1).
     process_cov = project_psd_relative(
         process_cov_residual_form(
-            smoother_mean,
-            sum_next_cov=sum_cov - smoother_cov[0],
-            sum_prev_cov=sum_cov - smoother_cov[-1],
+            means,
+            sum_next_cov=sum_next_cov,
+            sum_prev_cov=sum_prev_cov,
             sum_cross_cov=sum_cross_cov,
             transition_matrix=transition_matrix,
         ),
         name="dynamics_only_m_step process_cov",
     )
-
-    # Initial mean and covariance
-    if initial_state_prior is None:
-        init_mean = smoother_mean[0]
-        init_cov = smoother_cov[0]
-    else:
-        init_mean, init_cov = smooth_initial_state(
-            initial_state_prior, smoother_mean[0], smoother_cov[0]
-        )
 
     return (
         transition_matrix,

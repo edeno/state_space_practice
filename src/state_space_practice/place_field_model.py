@@ -47,7 +47,6 @@ from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.kalman import (
     InitialStatePrior,
     process_cov_residual_form,
-    smooth_initial_state,
     sum_of_outer_products,
 )
 from state_space_practice.parameter_transforms import (
@@ -62,6 +61,7 @@ from state_space_practice.point_process_kalman import (
     _validate_filter_numerics,
     get_confidence_interval,
     log_conditional_intensity,
+    smoothed_initial_transition_moments,
     stochastic_point_process_filter,
     stochastic_point_process_smoother,
 )
@@ -1026,24 +1026,38 @@ class PlaceFieldModel(SGDFittableMixin):
     def _m_step(self) -> None:
         """M-step: update dynamics parameters from smoothed estimates.
 
+        The filter starts from ``x_0 ~ N(init_mean, init_cov)`` and observes
+        ``x_1 .. x_T``, so the complete-data log-likelihood has ``T``
+        transitions. The smoothed moments of ``x_0`` and the lag-one
+        cross-covariance ``Cov(x_0, x_1 | y) = J_0 P_{1|T}`` follow exactly
+        from those of ``x_1`` by one RTS step with the parameters the E-step
+        ran with
+        (:func:`~state_space_practice.point_process_kalman.smoothed_initial_transition_moments`);
+        the ``x_0 -> x_1`` transition is included in every sufficient
+        statistic below, so the update maximises the expected complete-data
+        log-likelihood under the model's constraints (exact EM; checked by
+        the Q-function tests in ``tests/test_oracle_point_process.py``).
+
         When A is fixed to identity (random walk), Q is computed directly as
         the expected variance of state increments under the posterior, rather
         than using the unconstrained ML formula from dynamics_only_m_step.
-        This avoids a small bias from the A-Q coupling in the general formula.
 
         Q is the centred residual form
-        ``E[(x_{t+1} - A x_t)(x_{t+1} - A x_t)^T]`` averaged over transitions
-        (:func:`~state_space_practice.kalman.process_cov_residual_form`), whose
-        diagonal is non-negative by construction. The diagonal/isotropic
-        constraint on Q is then applied, discarding off-diagonal covariance
-        structure to keep the model tractable, and the variances are floored
-        at a scale-relative level
+        ``E[(x_t - A x_{t-1})(x_t - A x_{t-1})^T]`` averaged over the ``T``
+        transitions (:func:`~state_space_practice.kalman.process_cov_residual_form`),
+        whose diagonal is non-negative by construction. The diagonal/isotropic
+        constraint on Q is then applied -- for a Gaussian with diagonal
+        (isotropic) covariance, the constrained maximiser is the diagonal
+        (mean diagonal) of the unconstrained one -- and the variances are
+        floored at a scale-relative level
         (:func:`~state_space_practice.utils.floor_variances_relative`).
+        With ``update_transition_matrix=True``, ``A = beta gamma1^{-1}`` is
+        the maximiser for any diagonal Q (every row is its own regression on
+        the same regressors).
 
-        The initial state is updated to the smoothed ``x_0`` -- one RTS step
-        behind the smoother's first time step, using the parameters the E-step
-        ran with (the filter predicts before its first update, so this is the
-        exact EM update of the ``x_0`` prior).
+        The initial state is updated to the smoothed ``x_0``; ``init_cov`` is
+        kept diagonal (its constrained maximiser is the diagonal of
+        ``P_{0|T}``).
         """
         assert self.smoother_mean is not None, "E-step must run before M-step"
         assert self.smoother_cov is not None, "E-step must run before M-step"
@@ -1057,32 +1071,37 @@ class PlaceFieldModel(SGDFittableMixin):
         sc = self.smoother_cov
         scc = self.smoother_cross_cov
 
-        # Smoothed x_0 under the E-step parameters (before any update below).
-        init_smoother_mean, init_smoother_cov = smooth_initial_state(
-            InitialStatePrior(
-                init_mean=self.init_mean,
-                init_cov=self.init_cov,
-                transition_matrix=self.transition_matrix,
-                process_cov=self.process_cov,
-            ),
-            sm[0],
-            sc[0],
+        # Smoothed x_0 and Cov(x_0, x_1 | y) under the E-step parameters
+        # (before any update below).
+        init_smoother_mean, init_smoother_cov, init_cross_cov = (
+            smoothed_initial_transition_moments(
+                InitialStatePrior(
+                    init_mean=self.init_mean,
+                    init_cov=self.init_cov,
+                    transition_matrix=self.transition_matrix,
+                    process_cov=self.process_cov,
+                ),
+                sm[0],
+                sc[0],
+            )
         )
 
-        # Sufficient statistics. ``sc`` / ``scc`` are dense arrays on the
-        # dense path and BlockDiagonalCovariance containers on the block
-        # path; both expose the time-sum and integer time indexing, so only
-        # (n_state, n_state) matrices are ever formed here.
+        # Sufficient statistics over the T transitions x_{t-1} -> x_t,
+        # t = 1..T. ``sc`` / ``scc`` are dense arrays on the dense path and
+        # BlockDiagonalCovariance containers on the block path; both expose
+        # the time-sum and integer time indexing, so only (n_state, n_state)
+        # matrices are ever formed here.
+        means = jnp.concatenate((init_smoother_mean[None], sm), axis=0)
         sum_cov = sc.sum(axis=0)
-        sum_cross_cov = scc.sum(axis=0)
-        sum_next_cov = sum_cov - sc[0]
-        sum_prev_cov = sum_cov - sc[-1]
+        sum_cross_cov = scc.sum(axis=0) + init_cross_cov
+        sum_next_cov = sum_cov  # x_1 .. x_T
+        sum_prev_cov = sum_cov - sc[-1] + init_smoother_cov  # x_0 .. x_{T-1}
 
         if self.update_transition_matrix:
-            # A = beta gamma1^{-1} with gamma1 = sum_{t<T} E[x_t x_t'] and
-            # beta = sum_t E[x_{t+1} x_t'].
-            gamma1 = sum_prev_cov + sum_of_outer_products(sm[:-1], sm[:-1])
-            beta = (sum_cross_cov + sum_of_outer_products(sm[:-1], sm[1:])).T
+            # A = beta gamma1^{-1} with gamma1 = sum_t E[x_{t-1} x_{t-1}'] and
+            # beta = sum_t E[x_t x_{t-1}'].
+            gamma1 = sum_prev_cov + sum_of_outer_products(means[:-1], means[:-1])
+            beta = (sum_cross_cov + sum_of_outer_products(means[:-1], means[1:])).T
             A_new = psd_solve(gamma1, beta.T).T
             self.transition_matrix = A_new
         else:
@@ -1090,7 +1109,7 @@ class PlaceFieldModel(SGDFittableMixin):
             A_new = jnp.eye(sm.shape[1], dtype=sm.dtype)
 
         Q_new = process_cov_residual_form(
-            sm,
+            means,
             sum_next_cov=sum_next_cov,
             sum_prev_cov=sum_prev_cov,
             sum_cross_cov=sum_cross_cov,
