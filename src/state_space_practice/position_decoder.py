@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 # Absolute diagonal shift (cm^2 for positions) in the decoder's Laplace
 # update. The Laplace-EKF core is scale-equivariant by default (only a
-# relative 1e-12 * max|diag| Cholesky shift), but the decoder works in fixed
+# relative 1e-12 * |A_ii| Cholesky shift), but the decoder works in fixed
 # physical units and its KDE rate surrogate can produce very large Fisher
 # information near the edge of the occupied region: on a realistic circular
 # track the filtered position variance collapses to ~1e-8 cm^2 in places.

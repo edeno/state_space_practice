@@ -66,28 +66,46 @@ def _default_relative_boost(dtype) -> float:
     return max(DEFAULT_RELATIVE_BOOST, float(jnp.finfo(dtype).eps))
 
 
+#: Diagonal entries below this fraction of the largest one are shifted as if
+#: they were this large (see :func:`_stabilizing_shift`).
+_SHIFT_DIAGONAL_FLOOR_RATIO = 1e-8
+
+
 def _stabilizing_shift(
     A_sym: jax.Array,
     diagonal_boost: float,
     relative_boost: float | None,
 ) -> jax.Array:
-    """Per-matrix diagonal shift of :func:`psd_cholesky` (shape ``A.shape[:-2]``).
+    """Per-diagonal-entry shift of :func:`psd_cholesky` (shape ``A.shape[:-1]``).
 
-    ``max(diagonal_boost, relative_boost * max|diag(A)|, sqrt(tiny))`` where
-    ``tiny`` is the smallest normal number of ``A``'s dtype. The last term
-    only matters for an (all-)zero matrix: it keeps the factor, and a solve
-    through it, finite without perturbing any matrix of physical scale.
+    ``shift_i = max(diagonal_boost, relative_boost * d_i, sqrt(tiny))`` with
+    ``d_i = max(|A_ii|, 1e-8 * max_j |A_jj|)`` and ``tiny`` the smallest
+    normal number of the dtype.
+
+    The shift is proportional to each diagonal entry, i.e. ``A + rel *
+    diag(A)``: Cholesky's roundoff is bounded componentwise by
+    ``~n eps sqrt(A_ii A_jj)``, so this is the natural (diagonal-scaling
+    invariant) stabilisation. It makes the factorization equivariant under
+    any rescaling ``D A D`` of the coordinates (a state in cm next to one in
+    cm/s is shifted by the same *relative* amount), and it is block-local: a
+    block-diagonal matrix gets the same shift factored whole or block by
+    block, so block-diagonal fast paths agree with their dense counterparts
+    to roundoff. The ``1e-8 * max`` floor on ``d_i`` caps the precision of
+    an exactly-degenerate coordinate (a zero diagonal entry) at
+    ``~1e20 / max|diag|`` instead of ``1 / sqrt(tiny)``; ``sqrt(tiny)``
+    (~1.5e-154 in float64) only keeps an all-zero matrix finite.
     """
     dtype = A_sym.dtype
     if relative_boost is None:
         relative_boost = _default_relative_boost(dtype)
     diag_abs = jnp.abs(jnp.diagonal(A_sym, axis1=-2, axis2=-1))
-    max_diag = jnp.max(diag_abs, axis=-1)
+    max_diag = jnp.max(diag_abs, axis=-1, keepdims=True)
+    scale = jnp.maximum(diag_abs, _SHIFT_DIAGONAL_FLOOR_RATIO * max_diag)
     floor = float(jnp.finfo(dtype).tiny) ** 0.5
     return jnp.maximum(
         jnp.maximum(
             jnp.asarray(diagonal_boost, dtype=dtype),
-            jnp.asarray(relative_boost, dtype=dtype) * max_diag,
+            jnp.asarray(relative_boost, dtype=dtype) * scale,
         ),
         jnp.asarray(floor, dtype=dtype),
     )
@@ -101,8 +119,8 @@ def psd_cholesky(
     """Stabilized Cholesky factor of a PSD matrix.
 
     Symmetrizes ``A`` and adds the same diagonal shift as :func:`psd_solve`
-    (``max(diagonal_boost, relative_boost * max|diag(A)|, sqrt(tiny))``)
-    before factoring, then returns the ``(factor, lower)`` pair accepted by
+    (entry ``i``: ``max(diagonal_boost, relative_boost * |A_ii|, sqrt(tiny))``,
+    see :func:`_stabilizing_shift`) before factoring, then returns the ``(factor, lower)`` pair accepted by
     :func:`jax.scipy.linalg.cho_solve`. Sharing one factorization lets a
     caller reuse it for a linear solve, a quadratic form, and a
     log-determinant (:func:`psd_logdet`) instead of factoring the same
@@ -121,9 +139,10 @@ def psd_cholesky(
         Absolute floor for the stabilization shift. Default 0.0 (the shift
         is purely scale-relative).
     relative_boost : float or None, optional
-        Coefficient of ``max|diag(A)|`` for the relative component of the
-        shift. Default None: ``1e-12`` for float64, machine epsilon for
-        lower precision. Pass ``0.0`` to disable relative scaling.
+        Coefficient of ``|A_ii|`` for the relative component of the shift of
+        diagonal entry ``i``. Default None: ``1e-12`` for float64, machine
+        epsilon for lower precision. Pass ``0.0`` to disable relative
+        scaling.
 
     Returns
     -------
@@ -133,9 +152,10 @@ def psd_cholesky(
         ``2 * sum(log(abs(diag(factor))))``.
     """
     A_sym = symmetrize(A)
+    shift = _stabilizing_shift(A_sym, diagonal_boost, relative_boost)
     n = A.shape[-1]
-    effective_boost = _stabilizing_shift(A_sym, diagonal_boost, relative_boost)
-    A_stabilized = A_sym + effective_boost[..., None, None] * jnp.eye(n, dtype=A.dtype)
+    idx = jnp.arange(n)
+    A_stabilized = A_sym.at[..., idx, idx].add(shift)
     return jax.scipy.linalg.cho_factor(A_stabilized)
 
 
@@ -177,35 +197,42 @@ def psd_solve(
 
     Stabilization shift
     -------------------
-    The shift added to each matrix diagonal is::
+    Diagonal entry ``i`` of each matrix is shifted by::
 
-        effective = max(diagonal_boost, relative_boost * max|diag(A)|, sqrt(tiny))
+        shift_i = max(diagonal_boost, relative_boost * d_i, sqrt(tiny))
+        d_i     = max(|A_ii|, 1e-8 * max_j |A_jj|)
 
-    For batched inputs the effective shift is computed independently for each
-    matrix in the batch.
+    (:func:`_stabilizing_shift`). For batched inputs the shift is computed
+    independently for each matrix in the batch.
 
     By default the shift is **scale-relative**: ``diagonal_boost=0`` and
     ``relative_boost=1e-12`` in float64 (machine epsilon in float32, where
-    ``1e-12`` would round away). Rescaling ``A -> s A`` rescales the shift by
-    the same factor, so ``psd_solve(s A, b) == psd_solve(A, b) / s`` for any
-    ``s > 0`` -- the solve is scale-equivariant, and so are the filters built
-    on it (a covariance of scale ``1e-10`` is treated exactly like one of
-    scale 1). ``sqrt(tiny)`` (``~1.5e-154`` in float64) is a last-resort
-    floor that only keeps an all-zero matrix finite.
+    ``1e-12`` would round away), i.e. ``A + 1e-12 * diag(A)``. Rescaling
+    ``A -> s A`` rescales the shift by the same factor, so
+    ``psd_solve(s A, b) == psd_solve(A, b) / s`` for any ``s > 0`` -- the
+    solve is scale-equivariant, and so are the filters built on it (a
+    covariance of scale ``1e-10`` is treated exactly like one of scale 1).
+    Because the shift is proportional to each diagonal entry it is also
+    equivariant under per-coordinate rescaling ``D A D`` and block-local
+    (a block-diagonal matrix is shifted identically whether it is factored
+    whole or block by block). ``sqrt(tiny)`` (``~1.5e-154`` in float64) is a
+    last-resort floor that only keeps an all-zero matrix finite.
 
     An absolute floor (the former default ``diagonal_boost=1e-9``) is *not*
     scale-equivariant: it dominates the shift for matrices below ~1e-3 in
     scale and swamps covariances below ~1e-7 entirely. Callers that want one
-    anyway (e.g. to regularise a matrix that is structurally rank-deficient)
-    can still pass ``diagonal_boost``; ``diagonal_boost=0.0`` is the default.
+    anyway (e.g. to regularise a matrix that is structurally rank-deficient,
+    or in fixed physical units) can still pass ``diagonal_boost``;
+    ``diagonal_boost=0.0`` is the default.
 
     The default ``relative_boost=1e-12`` is approximately 1e4 * f64
     machine epsilon -- small enough that the shift does not perturb
     near-singular f64 matrices (whose smallest eigenvalues may be at
     1e-10 to 1e-5 of the largest) but large enough to absorb the
-    ``O(n eps max|diag|)`` roundoff that makes a numerically-PSD matrix
-    fail Cholesky. Pass ``relative_boost=0.0`` to disable relative scaling
-    (with ``diagonal_boost=0.0`` too, only the ``sqrt(tiny)`` floor remains).
+    ``O(n eps sqrt(A_ii A_jj))`` roundoff that makes a numerically-PSD
+    matrix fail Cholesky. Pass ``relative_boost=0.0`` to disable relative
+    scaling (with ``diagonal_boost=0.0`` too, only the ``sqrt(tiny)`` floor
+    remains).
 
     Parameters
     ----------
@@ -217,10 +244,10 @@ def psd_solve(
     diagonal_boost : float, optional
         Absolute floor for the stabilization shift. Default 0.0.
     relative_boost : float or None, optional
-        Coefficient of ``max|diag(A)|`` used as the relative component
-        of the stabilization shift. Default None: ``1e-12`` (~1e4 * f64 eps)
-        for float64 and machine epsilon for lower-precision dtypes. Pass
-        ``0.0`` to disable relative scaling entirely.
+        Coefficient of ``|A_ii|`` used as the relative component of the
+        shift of diagonal entry ``i``. Default None: ``1e-12`` (~1e4 * f64
+        eps) for float64 and machine epsilon for lower-precision dtypes.
+        Pass ``0.0`` to disable relative scaling entirely.
 
     Returns
     -------

@@ -403,7 +403,7 @@ class TestZeroNewtonIterations:
     def _assert_prior_returned(self, post_mean, post_cov, ll, expected_ll):
         np.testing.assert_array_equal(np.asarray(post_mean), np.asarray(_MEAN))
         # The covariance is the prior precision inverted back, each inversion
-        # regularized by the scale-relative 1e-12 * max|diag| Cholesky shift,
+        # regularized by the scale-relative 1e-12 * |A_ii| Cholesky shift,
         # so it matches to ~1e-11 (the former absolute 1e-9 shift left ~1e-9).
         np.testing.assert_allclose(
             np.asarray(post_cov), np.asarray(_COV), rtol=1e-10, atol=1e-12

@@ -195,7 +195,7 @@ class TestLinearAlgebraUtilities:
         np.testing.assert_allclose(x, expected, atol=1e-6)
 
     def test_psd_solve_relative_boost_scales_with_max_diag(self) -> None:
-        """psd_solve's relative_boost must scale with max|diag(A)|.
+        """psd_solve's relative_boost must scale with the diagonal of A.
 
         For a large-scale matrix (max_diag ~ 1e6) the effective shift is
         ``relative_boost * max_diag`` (~1e-6 here), which must still
@@ -295,6 +295,32 @@ class TestLinearAlgebraUtilities:
             # equivariant once the matrix is small.
             x_abs = psd_solve(scale * A, b, diagonal_boost=1e-9)
             assert not np.allclose(np.asarray(x_abs) * scale, np.asarray(x), rtol=1e-3)
+
+    def test_shift_is_per_coordinate_and_block_local(self) -> None:
+        """The default shift is ``1e-12 * diag(A)``: equivariant under a
+        per-coordinate rescaling ``D A D`` and identical whether a
+        block-diagonal matrix is factored whole or block by block."""
+        rng = np.random.default_rng(1)
+        m = rng.normal(size=(4, 2))
+        A = m @ m.T + 1e-4 * np.eye(4)  # near-singular: the shift matters
+        D = np.diag([0.1, 1.0, 30.0, 0.03])
+        b = rng.normal(size=4)
+        x = np.asarray(psd_solve(jnp.asarray(A), jnp.asarray(b)))
+        x_scaled = np.asarray(psd_solve(jnp.asarray(D @ A @ D), jnp.asarray(D @ b)))
+        np.testing.assert_allclose(D @ x_scaled, x, rtol=1e-9)
+        # Block-local: blockdiag(A, 1e-6 B) whole == per block.
+        B = 1e-6 * (A[:2, :2] + np.eye(2))
+        whole = np.zeros((6, 6))
+        whole[:4, :4], whole[4:, 4:] = A, B
+        logdet_whole = psd_logdet(psd_cholesky(jnp.asarray(whole)))
+        logdet_blocks = psd_logdet(psd_cholesky(jnp.asarray(A))) + psd_logdet(
+            psd_cholesky(jnp.asarray(B))
+        )
+        np.testing.assert_allclose(logdet_whole, logdet_blocks, rtol=1e-14)
+        # Guard: a shift relative to max|diag| would not be block-local here.
+        shift_max = 1e-12 * np.max(np.diag(whole))
+        logdet_max_shift = np.linalg.slogdet(whole + shift_max * np.eye(6))[1]
+        assert abs(logdet_max_shift - float(logdet_blocks)) > 1e-6
 
     def test_explicit_absolute_boost_is_still_honoured(self) -> None:
         """Callers that pass ``diagonal_boost`` keep an absolute floor."""

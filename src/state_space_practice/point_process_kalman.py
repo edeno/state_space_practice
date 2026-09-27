@@ -892,10 +892,10 @@ def _point_process_laplace_update(
         Absolute floor of the diagonal shift added before each Cholesky
         factorization (prior covariance, posterior precision). The default
         leaves only the scale-relative shift of
-        :func:`~state_space_practice.utils.psd_cholesky` (``1e-12 * max|diag|``
-        in float64), which keeps the update scale-equivariant: rescaling the latent state by ``c`` (all
-        covariances by ``c**2``, the design by ``1/c``) rescales the output
-        exactly. A positive value (the former default was ``1e-9``) breaks
+        :func:`~state_space_practice.utils.psd_cholesky` (``1e-12 * |A_ii|``
+        in float64), which keeps the update scale-equivariant: rescaling the
+        latent state by ``c`` (all covariances by ``c**2``, the design by
+        ``1/c``) rescales the output exactly. A positive value (the former default was ``1e-9``) breaks
         that for covariances below ``~diagonal_boost / 1e-12`` in scale.
     grad_log_intensity_func : Callable[[Array], Array] | None, optional
         Pre-computed gradient function (Jacobian) of log_intensity_func.
