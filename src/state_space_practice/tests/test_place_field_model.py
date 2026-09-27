@@ -2311,3 +2311,83 @@ class TestPlaceFieldModelRecovery:
             f"Rate map peak {estimated_peak} is {dist:.1f} cm from "
             f"true center {true_center}"
         )
+
+
+# ------------------------------------------------------------------
+# M-step: smoothed x_0 init, residual-form Q, scale-relative floors
+# ------------------------------------------------------------------
+
+
+class TestPlaceFieldMStep:
+    """``_m_step`` on synthetic smoother outputs, checked against the
+    closed forms."""
+
+    @pytest.fixture(scope="class")
+    def initialized_model(self, sim_data: dict) -> PlaceFieldModel:
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        model.fit(sim_data["position"], sim_data["spikes"], max_iter=1, verbose=False)
+        return model
+
+    @staticmethod
+    def _install_posterior(model: PlaceFieldModel, scale: float, seed: int) -> tuple:
+        """Random-walk smoother outputs with increments and covariances of
+        size ``scale``; parameters reset to a contractive A for the E-step."""
+        rng = np.random.default_rng(seed)
+        n_time, n_basis = 60, model.n_basis
+        increments = rng.normal(size=(n_time, n_basis)) * np.sqrt(scale)
+        sm = jnp.asarray(1.0 + np.cumsum(increments, axis=0))
+        L = rng.normal(size=(n_time, n_basis, n_basis)) * np.sqrt(scale / n_basis)
+        sc = jnp.asarray(L @ np.swapaxes(L, 1, 2) + scale * np.eye(n_basis))
+        scc = jnp.asarray(0.3 * np.asarray(sc[1:]))
+        model.smoother_mean, model.smoother_cov, model.smoother_cross_cov = sm, sc, scc
+        model.transition_matrix = jnp.eye(n_basis) * 0.9
+        model.process_cov = jnp.eye(n_basis) * scale
+        model.init_mean = jnp.zeros(n_basis)
+        model.init_cov = jnp.eye(n_basis) * 10.0 * scale
+        return sm, sc, scc
+
+    def test_init_state_is_smoothed_x0(self, initialized_model) -> None:
+        from state_space_practice.kalman import InitialStatePrior, smooth_initial_state
+
+        model = initialized_model
+        sm, sc, _ = self._install_posterior(model, scale=1e-2, seed=0)
+        prior = InitialStatePrior(
+            model.init_mean, model.init_cov, model.transition_matrix, model.process_cov
+        )
+        expected_mean, expected_cov = smooth_initial_state(prior, sm[0], sc[0])
+        model._m_step()
+        np.testing.assert_allclose(model.init_mean, expected_mean, rtol=1e-10)
+        np.testing.assert_allclose(
+            jnp.diag(model.init_cov), jnp.diag(expected_cov), rtol=1e-10
+        )
+        # guard: the smoothed x_0 is not the smoothed x_1 (m_{0|T} ~ 0.99 m_{1|T}
+        # here, with m_{1|T} ~ 1).
+        assert np.max(np.abs(np.asarray(model.init_mean - sm[0]))) > 5e-3
+
+    def test_random_walk_q_is_expected_increment_variance(
+        self, initialized_model
+    ) -> None:
+        """With A fixed to I, diag(Q) = mean_t E[(x_{t+1} - x_t)^2]."""
+        model = initialized_model
+        sm, sc, scc = (np.asarray(a) for a in self._install_posterior(model, 1e-2, 1))
+        model._m_step()
+        diff = sm[1:] - sm[:-1]
+        var = (
+            diff**2
+            + np.diagonal(sc[1:], axis1=1, axis2=2)
+            + np.diagonal(sc[:-1], axis1=1, axis2=2)
+            - 2 * np.diagonal(scc, axis1=1, axis2=2)
+        )
+        np.testing.assert_allclose(
+            jnp.diag(model.process_cov), var.mean(axis=0), rtol=1e-10
+        )
+
+    def test_process_noise_floor_is_scale_relative(self, initialized_model) -> None:
+        """Increments of variance ~1e-13 give Q ~1e-13 rather than the former
+        absolute 1e-10 floor."""
+        model = initialized_model
+        self._install_posterior(model, scale=1e-13, seed=2)
+        model._m_step()
+        q = np.asarray(jnp.diag(model.process_cov))
+        assert np.all(q > 0.0)
+        assert q.max() < 1e-11

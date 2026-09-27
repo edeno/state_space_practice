@@ -43,7 +43,12 @@ from jax import Array
 from jax.typing import ArrayLike
 from patsy import dmatrix
 
-from state_space_practice.kalman import sum_of_outer_products
+from state_space_practice.kalman import (
+    InitialStatePrior,
+    process_cov_residual_form,
+    smooth_initial_state,
+    sum_of_outer_products,
+)
 from state_space_practice.em_driver import run_em
 from state_space_practice.parameter_transforms import (
     POSITIVE,
@@ -62,6 +67,7 @@ from state_space_practice.point_process_kalman import (
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import (
+    floor_variances_relative,
     psd_solve,
     symmetrize,
     validate_count_array,
@@ -1021,52 +1027,90 @@ class PlaceFieldModel(SGDFittableMixin):
         than using the unconstrained ML formula from dynamics_only_m_step.
         This avoids a small bias from the A-Q coupling in the general formula.
 
-        The diagonal/isotropic constraint on Q is then applied, discarding
-        off-diagonal covariance structure to keep the model tractable.
+        Q is the centred residual form
+        ``E[(x_{t+1} - A x_t)(x_{t+1} - A x_t)^T]`` averaged over transitions
+        (:func:`~state_space_practice.kalman.process_cov_residual_form`), whose
+        diagonal is non-negative by construction. The diagonal/isotropic
+        constraint on Q is then applied, discarding off-diagonal covariance
+        structure to keep the model tractable, and the variances are floored
+        at a scale-relative level
+        (:func:`~state_space_practice.utils.floor_variances_relative`).
+
+        The initial state is updated to the smoothed ``x_0`` -- one RTS step
+        behind the smoother's first time step, using the parameters the E-step
+        ran with (the filter predicts before its first update, so this is the
+        exact EM update of the ``x_0`` prior).
         """
         assert self.smoother_mean is not None, "E-step must run before M-step"
         assert self.smoother_cov is not None, "E-step must run before M-step"
         assert self.smoother_cross_cov is not None, "E-step must run before M-step"
         assert self.n_basis is not None, "Model not initialized"
+        assert self.init_mean is not None, "Model not initialized"
+        assert self.init_cov is not None, "Model not initialized"
+        assert self.transition_matrix is not None, "Model not initialized"
+        assert self.process_cov is not None, "Model not initialized"
         sm = self.smoother_mean
         sc = self.smoother_cov
         scc = self.smoother_cross_cov
-        n_time = sm.shape[0]
 
-        # Sufficient statistics: E[x_t x_t'], E[x_{t-1} x_t'], E[x_{t-1} x_{t-1}']
-        # ``sc`` / ``scc`` are dense arrays on the dense path and
-        # BlockDiagonalCovariance containers on the block path; both expose
-        # the time-sum and integer time indexing, so only (n_state, n_state)
-        # matrices are ever formed here.
-        gamma = sc.sum(axis=0) + sum_of_outer_products(sm, sm)
-        gamma1 = gamma - jnp.outer(sm[-1], sm[-1]) - sc[-1]
-        gamma2 = gamma - jnp.outer(sm[0], sm[0]) - sc[0]
-        beta = (scc.sum(axis=0) + sum_of_outer_products(sm[:-1], sm[1:])).T
+        # Smoothed x_0 under the E-step parameters (before any update below).
+        init_smoother_mean, init_smoother_cov = smooth_initial_state(
+            InitialStatePrior(
+                init_mean=self.init_mean,
+                init_cov=self.init_cov,
+                transition_matrix=self.transition_matrix,
+                process_cov=self.process_cov,
+            ),
+            sm[0],
+            sc[0],
+        )
+
+        # Sufficient statistics. ``sc`` / ``scc`` are dense arrays on the
+        # dense path and BlockDiagonalCovariance containers on the block
+        # path; both expose the time-sum and integer time indexing, so only
+        # (n_state, n_state) matrices are ever formed here.
+        sum_cov = sc.sum(axis=0)
+        sum_cross_cov = scc.sum(axis=0)
+        sum_next_cov = sum_cov - sc[0]
+        sum_prev_cov = sum_cov - sc[-1]
 
         if self.update_transition_matrix:
+            # A = beta gamma1^{-1} with gamma1 = sum_{t<T} E[x_t x_t'] and
+            # beta = sum_t E[x_{t+1} x_t'].
+            gamma1 = sum_prev_cov + sum_of_outer_products(sm[:-1], sm[:-1])
+            beta = (sum_cross_cov + sum_of_outer_products(sm[:-1], sm[1:])).T
             A_new = psd_solve(gamma1, beta.T).T
             self.transition_matrix = A_new
-            Q_new = (gamma2 - A_new @ beta.T) / (n_time - 1)
         else:
-            # A = I: Q = E[(x_t - x_{t-1})(x_t - x_{t-1})']
-            #       = (gamma2 - beta.T - beta + gamma1) / (T-1)
-            Q_new = (gamma2 - beta.T - beta + gamma1) / (n_time - 1)
+            # A = I: Q = E[(x_t - x_{t-1})(x_t - x_{t-1})'].
+            A_new = jnp.eye(sm.shape[1], dtype=sm.dtype)
 
-        Q_new = symmetrize(Q_new)
+        Q_new = process_cov_residual_form(
+            sm,
+            sum_next_cov=sum_next_cov,
+            sum_prev_cov=sum_prev_cov,
+            sum_cross_cov=sum_cross_cov,
+            transition_matrix=A_new,
+        )
 
         if self.update_process_cov:
+            q_diag = floor_variances_relative(
+                jnp.diag(Q_new), name="PlaceFieldModel process_cov"
+            )
             if self.process_noise_structure == "diagonal":
-                q_diag = jnp.maximum(jnp.diag(Q_new), 1e-10)
                 self.process_cov = jnp.diag(q_diag)
             else:  # isotropic
-                q_diag = jnp.maximum(jnp.diag(Q_new), 1e-10)
                 self.process_cov = jnp.eye(self.n_basis) * jnp.mean(q_diag)
 
         if self.update_init_state:
-            self.init_mean = sm[0]
+            self.init_mean = init_smoother_mean
             # Keep init_cov diagonal to match n_free_params count and
             # keep the model tractable for BIC/AIC comparisons.
-            self.init_cov = jnp.diag(jnp.maximum(jnp.diag(sc[0]), 1e-10))
+            self.init_cov = jnp.diag(
+                floor_variances_relative(
+                    jnp.diag(init_smoother_cov), name="PlaceFieldModel init_cov"
+                )
+            )
 
     @staticmethod
     def bin_spike_times(
