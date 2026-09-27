@@ -1006,10 +1006,9 @@ class TestChoiceModelIdentities:
                         )
                     )
             total += logsumexp(logs)
-        # 1e-8: the update's log-determinants carry an absolute 1e-9
-        # Cholesky shift (see test_invariances, the xfail on the multinomial
-        # evidence's scale equivariance)
-        np.testing.assert_allclose(float(f.marginal_log_likelihood), total, rtol=1e-8)
+        # Round-off only: this numpy re-derivation of the per-step Laplace
+        # terms matches the filter's evidence to 8e-13 relative (observed).
+        np.testing.assert_allclose(float(f.marginal_log_likelihood), total, rtol=1e-10)
 
 
 @pytest.mark.slow  # compile-dominated (>3 s)

@@ -313,10 +313,11 @@ def test_softmax_laplace_gap_shrinks_as_beta_falls_or_prior_tightens() -> None:
     variances = [4.0, 1.0, 0.25, 0.0625, 0.015625]
     by_var = [_softmax_errors(2.0, v, 0.1 * v) for v in variances]
     for e_v, e_b in zip(by_var, by_beta):
-        # 1e-7, not round-off: the update's log-determinants carry an
-        # absolute 1e-9 Cholesky shift (see the xfail in test_invariances,
-        # TestMultinomialChoiceInvariances::test_laplace_evidence_is_scale_equivariant)
-        np.testing.assert_allclose(e_v["laplace_ll"], e_b["laplace_ll"], rtol=1e-7)
+        # Round-off only: every shift in the update is scale-relative and the
+        # rescalings are powers of two (observed 2e-16 relative). An absolute
+        # Cholesky shift in the evidence's log-determinants would break the
+        # equivariance at ~1e-9 relative.
+        np.testing.assert_allclose(e_v["laplace_ll"], e_b["laplace_ll"], rtol=1e-12)
         for m in _SOFTMAX_METRICS:
             np.testing.assert_allclose(e_v[m], e_b[m], rtol=1e-4, atol=1e-8, err_msg=m)
     for m in ("filter_mean", "smoother_mean", "smoother_var"):
