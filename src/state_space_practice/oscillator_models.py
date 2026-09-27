@@ -781,6 +781,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         if not math.isfinite(log_likelihood):
             logger.debug("Warm-init seeding skipped: non-finite E-step.")
             self._restore_em_state(snapshot)
+            self._clear_smoother_state()
             return
         self.smoother_discrete_state_prob = jnp.asarray(probs)
         self.smoother_joint_discrete_state_prob = jnp.asarray(joint)
