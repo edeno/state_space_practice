@@ -27,11 +27,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   modules, fast tests on Python 3.10-3.12, nightly full suite),
   `.pre-commit-config.yaml` (ruff, ruff-format, nbstripout), `[tool.ruff]`
   config, and `HYPOTHESIS_PROFILE` selection in the test conftest. mypy gates
-  the 24 modules listed in `[tool.mypy] files`; `mypy src/state_space_practice`
-  still reports 142 errors in the other 21 modules (was 150 before the
-  `fit_sgd` override fix).
-- Tests that call `.fit(` / `.fit_sgd(` / `run_em(` (outside `pytest.raises`),
-  directly or through a fixture, are marked `slow` automatically at collection.
+  the 24 modules listed in `[tool.mypy] files`; the other modules are not yet
+  type-clean.
 - **`em_driver.run_em`**: the shared EM loop (E-step, convergence, rollback,
   M-step) used by the oscillator models, `PointProcessModel`, `PlaceFieldModel`,
   the switching point-process models and `SmithLearningModel`. Invalid option
@@ -74,6 +71,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   hard-coded 0.99.
 - **`ContingencyBeliefModel(seed=None)`**; `None` keeps the historical
   initialization.
+- **`kalman.smooth_initial_state_with_cross_cov`** (also exposed as
+  `point_process_kalman.smoothed_initial_transition_moments`): smoothed
+  ``x_0`` moments plus ``Cov(x_0, x_1 | y) = J_0 P_{1|T}``.
+- **`oscillator_utils.optimize_dim_transition_params_joint_until_stationary`**:
+  restarts the DIM joint BFGS solve until it stops moving.
+- **`smith_learning_algorithm.smith_laplace_log_likelihood`**: the per-step
+  Laplace evidence of the Smith model (what `log_likelihood_`, `bic()` and
+  `fit_sgd` now use).
+- **`switching_choice.switching_choice_smoother`**: GPB1 backward pass that
+  accounts for the covariate input ``B u_t``.
+
+### Testing
+
 - **Verification suite**: exact oracles and calibration tests that check the
   inference core against independent reference computations rather than
   against itself — `tests/oracles.py` (dense Gaussian conditioning and
@@ -90,16 +100,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   collapse, Kim's smoother, the Laplace-EKF, the softmax Gaussian posterior)
   the observed gap is pinned with headroom and documented as approximation,
   not bug.
-- **`kalman.smooth_initial_state_with_cross_cov`** (also exposed as
-  `point_process_kalman.smoothed_initial_transition_moments`): smoothed
-  ``x_0`` moments plus ``Cov(x_0, x_1 | y) = J_0 P_{1|T}``.
-- **`oscillator_utils.optimize_dim_transition_params_joint_until_stationary`**:
-  restarts the DIM joint BFGS solve until it stops moving.
-- **`smith_learning_algorithm.smith_laplace_log_likelihood`**: the per-step
-  Laplace evidence of the Smith model (what `log_likelihood_`, `bic()` and
-  `fit_sgd` now use).
-- **`switching_choice.switching_choice_smoother`**: GPB1 backward pass that
-  accounts for the covariate input ``B u_t``.
 - **Property-test suites**: `test_invariances.py` (exact invariances under
   latent coordinate changes, unit rescaling, channel / neuron / option /
   state relabelling, phase shifts, time reversal and arena translation for
@@ -129,6 +129,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   comparator fails each). Hypothesis property tests for preprocessing
   (binning round trips, count conservation), circular statistics vs
   `scipy.stats`, and the behavioural-uncertainty closed forms.
+- Tests that call `.fit(` / `.fit_sgd(` / `run_em(` (outside `pytest.raises`),
+  directly or through a fixture, are marked `slow` automatically at collection.
+- The test suite treats `DeprecationWarning`s as errors like every other
+  warning.
 
 ### Changed — behavior (may affect existing callers)
 
@@ -150,8 +154,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`SGDFittableMixin.fit_sgd` is declared `(*args, **kwargs)`**; the optimizer
   settings (`optimizer`, `num_steps`, `verbose`, `convergence_tol`) are still
   keyword-only with the same defaults.
-- **pytest no longer ignores all `DeprecationWarning`s**; they are errors like
-  every other warning.
 - **`PlaceFieldModel.smoother_cov` / `smoother_cross_cov` / `filtered_cov`**
   hold a `BlockDiagonalCovariance` when a multi-neuron model runs on the
   block-diagonal path (dense arrays otherwise). Integer/slice indexing,
@@ -222,8 +224,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `adaptive_inflation`. The decoder's `dt`, `sigma_track` and grid spacing are
   traced rather than static, so parameter sweeps no longer recompile.
 - **`PointProcessModel.fit`** clears the posteriors on a non-finite first
-  E-step (aligned with the other EM models); its `run_em` call no longer
-  passes the no-op `require_increase_to_converge`.
+  E-step (aligned with the other EM models).
 - **`fit_sgd` reuses its compiled step** across calls on the same model with
   same-shaped data (the default optimizer is a shared module-level instance),
   and the contingency / covariate-choice M-step optimizers compile once per
@@ -253,11 +254,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (filter means off by up to 21 units; a 400-trial log-evidence at
   ``beta=4`` of −1836 against the exact −118). The default is now 10
   line-searched iterations; well-behaved updates are unchanged.
+  `MultinomialChoiceModel`'s inverse-temperature M-step keeps the best of the
+  refined, best-grid and current values, so it never decreases the marginal LL.
 - **`SmithLearningModel` reports the Laplace evidence** instead of the
   plug-in ``sum_k log Binom(y_k | sigmoid(mu + m_{k|k-1}))``, which ignored
   the predictive variance and biased `fit_sgd` towards too little process
   noise. `log_likelihood_`, `bic()`, `compare_to_null` and the SGD loss
-  change accordingly. The ``beta`` M-step never decreases the marginal LL.
+  change accordingly.
 - **Warm init of COM / CNM / DIM** seeds each discrete state's parameters
   with one M-step on its GMM window cluster; it previously only set the
   first-step probabilities and initial state, which has no effect at a
@@ -284,6 +287,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (documented per function). `rayleigh_test` applies its small-sample
   correction at every ``n`` (it stopped at 50, so p jumped 14% at ``z = 6``);
   `circular_correlation` is documented as Jammalamadaka–SenGupta.
+- **`QRegularizationConfig.min_eigenvalue` default `0.01` → `None`**
+  (`switching_point_process.py`). The process-noise (Q) eigenvalue floor is now
+  **off by default**, so EM can learn genuinely small process noise instead of
+  being pinned at `0.01`. PSD safety is still guaranteed by the `1e-8` floor in
+  `_project_parameters`. Callers that relied on the old floor should pass
+  `min_eigenvalue=0.01` explicitly to reproduce prior fits.
+- **`get_confidence_interval` default `alpha` `0.01` → `0.05`** in both
+  `point_process_kalman.py` (the free function and the `PlaceFieldModel` method)
+  and `models.py` (the legacy free function, now aligned). The default interval
+  is now **95%** (was 99%). Pass `alpha=0.01` explicitly for the previous 99%
+  interval.
 
 ### Deprecated
 
@@ -296,7 +310,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `environment.yml` / `environment_gpu.yml` (superseded by `pyproject.toml` +
   `uv.lock`) and `black` from the `test` extra.
 - `scripts/_test_gaussian_boundary.py` (assertion-free scipy exploration).
-
 - **`switching_kalman_smoother(last_filter_conditional_cont_mean=...)`**: the
   argument was never read. Drop it from calls.
 - **`fit` on the Hamiltonian models** (`HamiltonianLFPModel`,
@@ -314,10 +327,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   declares version 0.8.0 (neurospatial 0.8.0 is not on PyPI yet, so pip users
   of the `spatial` extra must install it from GitHub first; see README).
 - `import state_space_practice.kalman` no longer imports `scipy.optimize`,
-  `patsy` or `sklearn` (deferred to the functions that use them); its import
-  time roughly halves.
+  `patsy` or `sklearn` (deferred to the functions that use them).
 - `warnings.warn` calls in the library pass `stacklevel=2`.
-
 - **`PlaceFieldModel` block-diagonal path uses each neuron's own A and Q
   blocks.** Previously it required identical blocks, so `fit_sgd` trained only
   neuron 0's process noise (other neurons kept their initial value), and EM
@@ -365,16 +376,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`SmithLearningModel.maximization_step`** returned ``P_0 = P_{1|T}`` for
   the initial-state variance; the maximiser is ``P_0 = P_{1|T} - sigma^2``
   (or the KKT solution at the ``P_0 >= 0`` floor).
-- Two vacuous recovery tests were removed (`test_random_walk_recovery`,
-  whose spikes did not depend on the state, and a transition-matrix recovery
-  test that passed without recovering anything).
 - **`simulate_coupling` LFP noise** used a PRNG key that collides with the
   process-noise key under JAX's partitionable threefry
   (``fold_in(k, 1) == split(k, 3)[1]``), so the simulated LFP noise was a
   scaled copy of the process noise. Latent and spikes per seed are unchanged;
   the LFP differs. Experiment write-ups produced with the old simulator
-  (`experiments/coupling_ekf_vs_pg/conclusion.md`,
-  `docs/plans/2026-06-21-spike-field-coupling-findings.md`) need re-running.
+  (`experiments/coupling_ekf_vs_pg/conclusion.md`) need re-running.
 - **Softmax Laplace evidence** (multinomial, covariate and switching choice)
   took its log-determinants through an absolute ``1e-9`` shift while the
   update used scale-relative shifts, so the evidence was not invariant to the
@@ -393,28 +400,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `bernoulli_mixture_mean_variance` returns ``mean (1 - mean)`` and can no
   longer be slightly negative.
 
-### Changed — default behavior (may affect existing callers)
-
-- **`QRegularizationConfig.min_eigenvalue` default `0.01` → `None`**
-  (`switching_point_process.py`). The process-noise (Q) eigenvalue floor is now
-  **off by default**, so EM can learn genuinely small process noise instead of
-  being pinned at `0.01`. PSD safety is still guaranteed by the `1e-8` floor in
-  `_project_parameters`. Callers that relied on the old floor should pass
-  `min_eigenvalue=0.01` explicitly to reproduce prior fits.
-
-- **`get_confidence_interval` default `alpha` `0.01` → `0.05`** in both
-  `point_process_kalman.py` (the free function and the `PlaceFieldModel` method)
-  and `models.py` (the legacy free function, now aligned). The default interval
-  is now **95%** (was 99%). Pass `alpha=0.01` explicitly for the previous 99%
-  interval.
-
 ### Known approximation limits (documented and pinned by tests)
 
-- The default single Fisher-scoring step (``max_newton_iter=1``) biases
+- A single Fisher-scoring step (``max_newton_iter=1``) biases
   `SwitchingSpikeOscillatorModel`'s low-noise process variance about 2x
-  upward even at ``T = 3200``; three Newton steps remove most of it. With a
-  broad prior, Newton-1 in `PointProcessModel` can diverge. The default is
-  now 3; pass ``max_newton_iter=1`` to reproduce old fits.
+  upward even at ``T = 3200`` and can diverge from a broad prior in
+  `PointProcessModel`; the default of 3 steps removes most of the bias.
 - The softmax Gaussian posterior of the choice models is over-confident at
   high inverse temperature (90% intervals cover ~69% at ``beta = 5``; the
   exact posterior on the same data is calibrated), and the Smith smoother at
