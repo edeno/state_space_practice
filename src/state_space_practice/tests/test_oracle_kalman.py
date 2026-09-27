@@ -440,7 +440,8 @@ class TestKalmanMStepMaximisesExactQ:
 
         dyn = ("transition_matrix", "process_cov")
         new = _e_step_and_m_step(model, use_prior=True)
-        legacy = _e_step_and_m_step(model, use_prior=False)
+        with pytest.warns(DeprecationWarning, match=r"initial_state_prior=None"):
+            legacy = _e_step_and_m_step(model, use_prior=False)
         for name, g in _fd_gradient(q_full, new, names=dyn).items():
             np.testing.assert_allclose(g, 0.0, atol=1e-6, err_msg=name)
         for name, g in _fd_gradient(q_x1, legacy).items():

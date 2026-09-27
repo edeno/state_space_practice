@@ -16,6 +16,7 @@ References
 
 """
 
+import warnings
 from typing import NamedTuple
 
 import jax
@@ -1430,7 +1431,6 @@ def process_cov_residual_form(
     ) / (n_time - 1)
 
 
-@jax.jit
 def kalman_maximization_step(
     obs: jax.Array,
     smoother_mean: jax.Array,
@@ -1460,11 +1460,16 @@ def kalman_maximization_step(
         the smoothed ``x_0`` (:func:`smooth_initial_state_with_cross_cov`)
         and is the exact maximiser of the expected complete-data
         log-likelihood of the filter's model (see Notes). Pass them for a
-        monotone EM. If None (legacy), the returned initial moments are the
-        smoothed moments of ``x_1`` and ``A`` / ``Sigma`` use only the
-        ``T - 1`` transitions within ``x_{1:T}``: the exact M-step of a model
-        whose prior sits on ``x_1``, which is not the filter's model and can
-        decrease the log-likelihood (e.g. with a contractive ``A``).
+        monotone EM.
+
+        .. deprecated:: 0.1.0
+            Passing None is deprecated and will be removed in version 0.2.0
+            (``initial_state_prior`` will become required). With None the
+            returned initial moments are the smoothed moments of ``x_1`` and
+            ``A`` / ``Sigma`` use only the ``T - 1`` transitions within
+            ``x_{1:T}``: the exact M-step of a model whose prior sits on
+            ``x_1``, which is not the filter's model and can decrease the
+            log-likelihood (e.g. with a contractive ``A``).
 
     Returns
     -------
@@ -1516,6 +1521,31 @@ def kalman_maximization_step(
     ... [1] Roweis, S. T., Ghahramani, Z., & Hinton, G. E. (1999). A unifying review of
     linear Gaussian models. Neural computation, 11(2), 305-345.
     """
+    if initial_state_prior is None:
+        warnings.warn(
+            "kalman_maximization_step(initial_state_prior=None) uses the x_1 "
+            "prior, which is not the filter's model and can decrease the "
+            "log-likelihood. Pass initial_state_prior=InitialStatePrior("
+            "init_mean, init_cov, transition_matrix, process_cov) with the "
+            "E-step's parameters. initial_state_prior=None will be removed in "
+            "version 0.2.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    return _kalman_maximization_step(
+        obs, smoother_mean, smoother_cov, smoother_cross_cov, initial_state_prior
+    )
+
+
+@jax.jit
+def _kalman_maximization_step(
+    obs: jax.Array,
+    smoother_mean: jax.Array,
+    smoother_cov: jax.Array,
+    smoother_cross_cov: jax.Array,
+    initial_state_prior: InitialStatePrior | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Jitted implementation of :func:`kalman_maximization_step`."""
 
     n_time: int = obs.shape[0]
     if n_time < 2:

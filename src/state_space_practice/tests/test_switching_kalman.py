@@ -55,6 +55,14 @@ from state_space_practice.utils import divide_safe as _divide_safe
 from state_space_practice.utils import safe_log as _safe_log
 from state_space_practice.utils import spectral_radius as _spectral_radius
 
+
+def kalman_maximization_step_x1_prior(*args):
+    """The (deprecated) x_1-prior Kalman M-step: the single-state reference
+    the switching M-step reduces to (its initial moments are those of x_1)."""
+    with pytest.warns(DeprecationWarning, match=r"initial_state_prior=None"):
+        return kalman_maximization_step(*args)
+
+
 # ---------------------------------------------------------------------------
 # Pure-Python reference implementations of the ELBO terms. These triple-nested
 # loops are the oracle the vectorized ``compute_expected_complete_log_likelihood``
@@ -1233,7 +1241,7 @@ def test_m_step_one_state(
         kf_new_R,
         kf_new_init_mean,
         kf_new_init_cov,
-    ) = kalman_maximization_step(
+    ) = kalman_maximization_step_x1_prior(
         obs,
         kf_sm,
         kf_sc,
@@ -1341,7 +1349,7 @@ def test_m_step_two_identical_states(
         kf_new_R,
         kf_new_init_mean,
         kf_new_init_cov,
-    ) = kalman_maximization_step(
+    ) = kalman_maximization_step_x1_prior(
         obs,
         kf_sm,
         kf_sc,
@@ -4892,7 +4900,7 @@ class TestSwitchingMStepMathCorrectness:
 
         # Non-switching path
         kf_sm, kf_sc, kf_scc, _ = kalman_smoother(init_mean, init_cov, obs, A, Q, H, R)
-        kf_A, kf_H, kf_Q, kf_R, kf_im, kf_ic = kalman_maximization_step(
+        kf_A, kf_H, kf_Q, kf_R, kf_im, kf_ic = kalman_maximization_step_x1_prior(
             obs, kf_sm, kf_sc, kf_scc
         )
 

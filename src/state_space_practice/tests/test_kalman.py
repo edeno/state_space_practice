@@ -40,6 +40,10 @@ from state_space_practice.tests.conftest import (
     to_jax,
 )
 
+# The x_1-prior M-step (initial_state_prior=None) is deprecated; tests of its
+# formulas assert the deprecation warning.
+LEGACY_PRIOR = r"initial_state_prior=None"
+
 # --- Unit Tests ---
 
 
@@ -253,14 +257,17 @@ def test_kalman_maximization_step_recovery(kalman_m_step_test_data: tuple) -> No
         init_mean_true, init_cov_true, obs, A_true, Q_true, H_true, R_true
     )
 
-    (
-        A_est,
-        H_est,
-        Q_est,
-        R_est,
-        init_mean_est,
-        init_cov_est,
-    ) = kalman_maximization_step(obs, smoother_mean, smoother_cov, smoother_cross_cov)
+    with pytest.warns(DeprecationWarning, match=LEGACY_PRIOR):
+        (
+            A_est,
+            H_est,
+            Q_est,
+            R_est,
+            init_mean_est,
+            init_cov_est,
+        ) = kalman_maximization_step(
+            obs, smoother_mean, smoother_cov, smoother_cross_cov
+        )
 
     rtol_params = 0.2
     rtol_covs = 0.5
@@ -284,8 +291,11 @@ def test_kalman_maximization_step_rejects_one_timestep() -> None:
     smoother_cov = jnp.eye(2)[None]
     smoother_cross_cov = jnp.zeros((0, 2, 2))
 
+    prior = InitialStatePrior(jnp.zeros(2), jnp.eye(2), jnp.eye(2), jnp.eye(2))
     with pytest.raises(ValueError, match="at least 2 time steps"):
-        kalman_maximization_step(obs, smoother_mean, smoother_cov, smoother_cross_cov)
+        kalman_maximization_step(
+            obs, smoother_mean, smoother_cov, smoother_cross_cov, prior
+        )
 
 
 @pytest.fixture(scope="module")
@@ -730,7 +740,11 @@ class TestKalmanMaximizationStepProperties:
         )
 
         A_est, H_est, Q_est, R_est, _, _ = kalman_maximization_step(
-            obs, smoother_mean, smoother_cov, smoother_cross_cov
+            obs,
+            smoother_mean,
+            smoother_cov,
+            smoother_cross_cov,
+            InitialStatePrior(init_mean, init_cov, A, Q),
         )
 
         # Check Q is positive definite
@@ -767,7 +781,11 @@ class TestKalmanMaximizationStepProperties:
         )
 
         _, _, Q_est, R_est, _, init_cov_est = kalman_maximization_step(
-            obs, smoother_mean, smoother_cov, smoother_cross_cov
+            obs,
+            smoother_mean,
+            smoother_cov,
+            smoother_cross_cov,
+            InitialStatePrior(init_mean, init_cov, A, Q),
         )
 
         np.testing.assert_allclose(Q_est, Q_est.T, rtol=1e-10, atol=1e-14)
@@ -783,9 +801,10 @@ class TestKalmanMaximizationStepProperties:
         smoother_cov = jnp.array([[[-0.9]], [[-0.9]], [[-0.9]]])
         smoother_cross_cov = jnp.array([[[0.1]], [[0.1]]])
 
-        _, _, Q_est, R_est, _, _ = kalman_maximization_step(
-            obs, smoother_mean, smoother_cov, smoother_cross_cov
-        )
+        with pytest.warns(DeprecationWarning, match=LEGACY_PRIOR):
+            _, _, Q_est, R_est, _, _ = kalman_maximization_step(
+                obs, smoother_mean, smoother_cov, smoother_cross_cov
+            )
 
         eigvals_q = jnp.linalg.eigvalsh(Q_est)
         eigvals_r = jnp.linalg.eigvalsh(R_est)
@@ -1403,7 +1422,10 @@ class TestKalmanEMMonotonicity:
             log_likelihoods.append(float(mll))
 
             sm, sc, scc, _ = kalman_smoother(init_mean, init_cov, obs, A, Q, H, R)
-            A, H, Q, R, init_mean, init_cov = kalman_maximization_step(obs, sm, sc, scc)
+            prior = InitialStatePrior(init_mean, init_cov, A, Q)
+            A, H, Q, R, init_mean, init_cov = kalman_maximization_step(
+                obs, sm, sc, scc, prior
+            )
 
         for i in range(1, len(log_likelihoods)):
             assert log_likelihoods[i] >= log_likelihoods[i - 1] - 1e-6, (
@@ -1431,7 +1453,8 @@ class TestKalmanMStepMathCorrectness:
         obs, _ = _simulate_from_model(A, Q, H, R, init_mean, init_cov, 200, seed=42)
         sm, sc, scc, _ = kalman_smoother(init_mean, init_cov, obs, A, Q, H, R)
 
-        A_est, _, _, _, _, _ = kalman_maximization_step(obs, sm, sc, scc)
+        with pytest.warns(DeprecationWarning, match=LEGACY_PRIOR):
+            A_est, _, _, _, _, _ = kalman_maximization_step(obs, sm, sc, scc)
 
         # Recompute gamma1 and beta from smoother outputs (plain numpy)
         sm_np, sc_np, scc_np = np.array(sm), np.array(sc), np.array(scc)
@@ -2231,7 +2254,8 @@ class TestInitialStateMStep:
         assert np.all(np.diff(lls) >= -1e-10), lls
         # guard: the problem is one where the legacy x_1 update is not an EM
         # step -- its LL decreases after the first iteration.
-        legacy = _init_only_em(contractive_1d_problem, n_iter=6, use_prior=False)
+        with pytest.warns(DeprecationWarning, match=LEGACY_PRIOR):
+            legacy = _init_only_em(contractive_1d_problem, n_iter=6, use_prior=False)
         assert np.any(np.diff(legacy) < -1e-3), legacy
 
     def test_init_update_matches_grid_maximiser(self, contractive_1d_problem) -> None:
@@ -2356,11 +2380,13 @@ class TestInitialTransitionInMStep:
         np.testing.assert_allclose(A, A_ref, rtol=1e-9)
         np.testing.assert_allclose(Q, (gamma2 - A_ref @ beta.T) / T, rtol=1e-8)
         # H and R still use the T observations of x_{1:T} only.
-        H_legacy, R_legacy = kalman_maximization_step(obs, sm, sc, scc)[1::2][:2]
+        with pytest.warns(DeprecationWarning, match=LEGACY_PRIOR):
+            A_legacy, H_legacy, _, R_legacy, _, _ = kalman_maximization_step(
+                obs, sm, sc, scc
+            )
         np.testing.assert_allclose(H, H_legacy, rtol=1e-12)
         np.testing.assert_allclose(R, R_legacy, rtol=1e-12)
         # guard: including x_0 -> x_1 changes A here
-        A_legacy = kalman_maximization_step(obs, sm, sc, scc)[0]
         assert np.max(np.abs(np.asarray(A) - np.asarray(A_legacy))) > 1e-3
 
 
@@ -2409,7 +2435,8 @@ class TestResidualFormMStep:
         its own (jittered-solve) H and A to ~1e-10 relative on well-scaled
         data."""
         obs, sm, sc, scc = smoothed_3d
-        A, H, Q, R, _, _ = kalman_maximization_step(obs, sm, sc, scc)
+        with pytest.warns(DeprecationWarning, match=LEGACY_PRIOR):
+            A, H, Q, R, _, _ = kalman_maximization_step(obs, sm, sc, scc)
         obs, sm, sc, scc = (np.asarray(a) for a in (obs, sm, sc, scc))
         T = obs.shape[0]
         gamma = sc.sum(0) + sm.T @ sm
@@ -2458,7 +2485,8 @@ class TestRelativeEigenvalueFloor:
         sm = jnp.asarray(x[:, None])
         sc = jnp.zeros((T, 1, 1))
         scc = jnp.zeros((T - 1, 1, 1))
-        A, H, Q, R, _, _ = kalman_maximization_step(obs, sm, sc, scc)
+        with pytest.warns(DeprecationWarning, match=LEGACY_PRIOR):
+            A, H, Q, R, _, _ = kalman_maximization_step(obs, sm, sc, scc)
         np.testing.assert_allclose(float(R[0, 0]), var, rtol=0.1)
         np.testing.assert_allclose(float(Q[0, 0]), var, rtol=0.1)
 
@@ -2472,7 +2500,8 @@ class TestRelativeEigenvalueFloor:
         sc = jnp.full((T, 1, 1), 1e-2)
         scc = jnp.zeros((T - 1, 1, 1))
         with caplog.at_level("WARNING", logger="state_space_practice.utils"):
-            _, _, _, R, _, _ = kalman_maximization_step(obs, sm, sc, scc)
+            with pytest.warns(DeprecationWarning, match=LEGACY_PRIOR):
+                _, _, _, R, _, _ = kalman_maximization_step(obs, sm, sc, scc)
             jax.block_until_ready(R)
             jax.effects_barrier()
         eigs = np.linalg.eigvalsh(np.asarray(R))
