@@ -1,5 +1,7 @@
 # ruff: noqa: E402
 
+import warnings
+
 import jax
 
 jax.config.update("jax_enable_x64", True)
@@ -12,6 +14,7 @@ from hypothesis import strategies as st
 from jax import Array, random
 from scipy.linalg import solve_discrete_are
 
+from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.kalman import (
     InitialStatePrior,
     _kalman_smoother_update,
@@ -2535,3 +2538,41 @@ class TestKalmanTraceability:
             m0.astype(jnp.float32), P0.astype(jnp.float32), obs, A, Q, H, R
         )[0]
         np.testing.assert_allclose(sm, kalman_smoother(m0, P0, obs, A, Q, H, R)[0])
+
+    @pytest.mark.parametrize("as_numpy", [False, True])
+    def test_closed_over_constants_are_validated_under_jit(
+        self, problem, as_numpy
+    ) -> None:
+        """Concrete inputs closed over by a jitted function are still concrete:
+        the value checks run (no TracerBoolConversionError) and still raise."""
+        args = [np.asarray(a) if as_numpy else a for a in problem]
+        eager = kalman_filter(*problem)[2]
+        jitted = jax.jit(lambda: kalman_filter(*args)[2])()
+        np.testing.assert_allclose(jitted, eager, rtol=1e-12)
+
+        bad = list(args)
+        bad[1] = -np.eye(2) if as_numpy else -jnp.eye(2)
+        with pytest.raises(ValueError, match="not positive definite"):
+            jax.jit(lambda: kalman_filter(*bad)[2])()
+
+    @pytest.mark.parametrize("filter_fn", [kalman_filter, kalman_smoother])
+    def test_traced_non_positive_definite_init_cov_warns(
+        self, problem, filter_fn
+    ) -> None:
+        """A traced init_cov cannot be checked host-side; a negative-definite
+        one must still be reported (it yields a finite but wrong result)."""
+        m0, _, obs, A, Q, H, R = problem
+        with pytest.warns(StateSpaceWarning, match=r"minimum eigenvalue -0\.5"):
+            out = jax.jit(lambda P: filter_fn(m0, P, obs, A, Q, H, R)[-1])(
+                -0.5 * jnp.eye(2)
+            )
+            jax.block_until_ready(out)
+            jax.effects_barrier()
+
+    def test_traced_positive_definite_init_cov_does_not_warn(self, problem) -> None:
+        m0, P0, obs, A, Q, H, R = problem
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            out = jax.jit(lambda P: kalman_filter(m0, P, obs, A, Q, H, R)[2])(P0)
+            jax.block_until_ready(out)
+            jax.effects_barrier()

@@ -31,6 +31,7 @@ from state_space_practice.utils import (  # noqa: F401 — re-exported for backw
     psd_solve,
     stabilize_covariance,
     symmetrize,
+    warn_if_not_positive_definite_in_graph,
 )
 
 # Gain solves (Kalman gain ``S^{-1} H P``, RTS gain ``P_pred^{-1} A P``) and the
@@ -245,14 +246,25 @@ def _validate_kalman_public_inputs(
     *,
     filter_name: str,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Host-side validation for public linear-Gaussian APIs."""
-    init_mean = jnp.asarray(init_mean)
-    init_cov = jnp.asarray(init_cov)
-    obs = jnp.asarray(obs)
-    transition_matrix = jnp.asarray(transition_matrix)
-    process_cov = jnp.asarray(process_cov)
-    measurement_matrix = jnp.asarray(measurement_matrix)
-    measurement_cov = jnp.asarray(measurement_cov)
+    """Validation for public linear-Gaussian APIs.
+
+    Shape checks always run. Value checks (finiteness, symmetry, positive
+    definiteness, the float32 risk warning) run host-side on concrete inputs,
+    including concrete constants closed over by a jitted caller. When any
+    input is a JAX tracer they are skipped, and a non-positive-definite
+    ``init_cov`` is reported at run time as a ``StateSpaceWarning`` (see
+    :func:`~state_space_practice.utils.warn_if_not_positive_definite_in_graph`).
+    """
+    # Under an active trace, jnp.asarray on a concrete (numpy) constant would
+    # stage it; converting under ensure_compile_time_eval keeps it concrete.
+    with jax.ensure_compile_time_eval():
+        init_mean = jnp.asarray(init_mean)
+        init_cov = jnp.asarray(init_cov)
+        obs = jnp.asarray(obs)
+        transition_matrix = jnp.asarray(transition_matrix)
+        process_cov = jnp.asarray(process_cov)
+        measurement_matrix = jnp.asarray(measurement_matrix)
+        measurement_cov = jnp.asarray(measurement_cov)
 
     if init_mean.ndim != 1:
         raise ValueError(f"init_mean must be 1D, got shape {init_mean.shape}.")
@@ -300,10 +312,10 @@ def _validate_kalman_public_inputs(
             f"{n_obs}); got {measurement_cov.shape}."
         )
 
-    # Value checks need concrete arrays. Under jax.jit / jax.grad any jnp
-    # operation is staged (even on closed-over constants), so bool()/float()
-    # on its result would raise; skip every value check when any input is
-    # traced. The shape checks above are static and always run.
+    # Value checks need concrete arrays: skip them when any input is traced
+    # (bool()/float() on a tracer raises), but still report a
+    # non-positive-definite init_cov from inside the computation. The shape
+    # checks above are static and always run.
     if contains_tracer(
         init_mean,
         init_cov,
@@ -313,6 +325,9 @@ def _validate_kalman_public_inputs(
         measurement_matrix,
         measurement_cov,
     ):
+        warn_if_not_positive_definite_in_graph(
+            init_cov, name="init_cov", filter_name=filter_name
+        )
         return (
             init_mean,
             init_cov,
@@ -323,64 +338,67 @@ def _validate_kalman_public_inputs(
             measurement_cov,
         )
 
-    for name, arr in (
-        ("init_mean", init_mean),
-        ("obs", obs),
-        ("transition_matrix", transition_matrix),
-        ("measurement_matrix", measurement_matrix),
-        ("measurement_cov", measurement_cov),
-    ):
-        if not bool(jnp.all(jnp.isfinite(arr))):
-            raise ValueError(f"{name} must contain only finite values.")
-
-    if measurement_cov_is_time_varying:
-        if not bool(
-            jnp.allclose(
-                measurement_cov,
-                jnp.swapaxes(measurement_cov, -1, -2),
-                rtol=1e-6,
-                atol=1e-8,
-            )
+    # Inside an active trace (concrete constants closed over by a jitted
+    # caller) evaluate eagerly so the results stay concrete.
+    with jax.ensure_compile_time_eval():
+        for name, arr in (
+            ("init_mean", init_mean),
+            ("obs", obs),
+            ("transition_matrix", transition_matrix),
+            ("measurement_matrix", measurement_matrix),
+            ("measurement_cov", measurement_cov),
         ):
-            asym = float(
-                jnp.max(
-                    jnp.abs(measurement_cov - jnp.swapaxes(measurement_cov, -1, -2))
+            if not bool(jnp.all(jnp.isfinite(arr))):
+                raise ValueError(f"{name} must contain only finite values.")
+
+        if measurement_cov_is_time_varying:
+            if not bool(
+                jnp.allclose(
+                    measurement_cov,
+                    jnp.swapaxes(measurement_cov, -1, -2),
+                    rtol=1e-6,
+                    atol=1e-8,
                 )
+            ):
+                asym = float(
+                    jnp.max(
+                        jnp.abs(measurement_cov - jnp.swapaxes(measurement_cov, -1, -2))
+                    )
+                )
+                raise ValueError(
+                    "measurement_cov must be symmetric at every time step "
+                    f"(max|R - R.T| = {asym:g})."
+                )
+            # Per-bin R: require every slice positive definite. eigvalsh is
+            # batched over the leading time axis (O(n_time * n_obs^3)) but runs
+            # once per public call, since inner loops pass validate_inputs=False.
+            per_slice_min_eig = jnp.linalg.eigvalsh(symmetrize(measurement_cov)).min(
+                axis=-1
             )
-            raise ValueError(
-                "measurement_cov must be symmetric at every time step "
-                f"(max|R - R.T| = {asym:g})."
+            worst_time = int(jnp.argmin(per_slice_min_eig))
+            min_slice_eig = float(per_slice_min_eig[worst_time])
+            if not min_slice_eig > 0.0:
+                raise ValueError(
+                    "measurement_cov must be positive definite at every time "
+                    f"step; the minimum eigenvalue is {min_slice_eig} at "
+                    f"time step {worst_time}."
+                )
+            _validate_filter_numerics(
+                init_cov,
+                n_time=int(n_time),
+                stacklevel=4,
+                filter_name=filter_name,
+                process_cov=process_cov,
             )
-        # Per-bin R: require every slice positive definite. eigvalsh is
-        # batched over the leading time axis (O(n_time * n_obs^3)) but runs
-        # once per public call, since inner loops pass validate_inputs=False.
-        per_slice_min_eig = jnp.linalg.eigvalsh(symmetrize(measurement_cov)).min(
-            axis=-1
-        )
-        worst_time = int(jnp.argmin(per_slice_min_eig))
-        min_slice_eig = float(per_slice_min_eig[worst_time])
-        if not min_slice_eig > 0.0:
-            raise ValueError(
-                "measurement_cov must be positive definite at every time "
-                f"step; the minimum eigenvalue is {min_slice_eig} at "
-                f"time step {worst_time}."
+        else:
+            _validate_filter_numerics(
+                init_cov,
+                n_time=int(n_time),
+                stacklevel=4,
+                filter_name=filter_name,
+                measurement_cov=measurement_cov,
+                process_cov=process_cov,
             )
-        _validate_filter_numerics(
-            init_cov,
-            n_time=int(n_time),
-            stacklevel=4,
-            filter_name=filter_name,
-            process_cov=process_cov,
-        )
-    else:
-        _validate_filter_numerics(
-            init_cov,
-            n_time=int(n_time),
-            stacklevel=4,
-            filter_name=filter_name,
-            measurement_cov=measurement_cov,
-            process_cov=process_cov,
-        )
     return (
         init_mean,
         init_cov,
@@ -620,6 +638,14 @@ def kalman_filter(
         that have already validated should pass ``False`` to skip the
         O(d^3) eigenvalue recomputation.
 
+        The value checks need concrete inputs. Concrete arrays are checked
+        even inside ``jax.jit`` (e.g. constants closed over by a jitted
+        function). When any input is a JAX tracer (an argument of ``jax.jit``
+        / ``jax.grad`` / ``jax.vmap``) only the shape checks run, and a
+        non-positive-definite ``init_cov`` is reported at run time as a
+        ``StateSpaceWarning`` naming its minimum eigenvalue instead of
+        raising.
+
     Returns
     -------
     filtered_mean : jax.Array, shape (n_time, n_cont_states)
@@ -633,7 +659,13 @@ def kalman_filter(
     ------
     ValueError
         If ``validate_inputs=True`` and any public input is malformed, non-finite,
-        or has an invalid covariance.
+        or has an invalid covariance. Under tracing only malformed shapes raise.
+
+    Warns
+    -----
+    StateSpaceWarning
+        If ``validate_inputs=True``, ``init_cov`` is traced, and it is not
+        positive definite (emitted when the computation runs).
     """
     if validate_inputs:
         (
@@ -937,6 +969,14 @@ def kalman_smoother(
         have already validated should pass ``False`` to skip the O(d^3)
         eigenvalue recomputation.
 
+        The value checks need concrete inputs. Concrete arrays are checked
+        even inside ``jax.jit`` (e.g. constants closed over by a jitted
+        function). When any input is a JAX tracer (an argument of ``jax.jit``
+        / ``jax.grad`` / ``jax.vmap``) only the shape checks run, and a
+        non-positive-definite ``init_cov`` is reported at run time as a
+        ``StateSpaceWarning`` naming its minimum eigenvalue instead of
+        raising.
+
     Returns
     -------
     smoother_mean : jax.Array, shape (n_time, n_cont_states)
@@ -952,7 +992,13 @@ def kalman_smoother(
     ------
     ValueError
         If ``validate_inputs=True`` and any public input is malformed, non-finite,
-        or has an invalid covariance.
+        or has an invalid covariance. Under tracing only malformed shapes raise.
+
+    Warns
+    -----
+    StateSpaceWarning
+        If ``validate_inputs=True``, ``init_cov`` is traced, and it is not
+        positive definite (emitted when the computation runs).
     """
     if validate_inputs:
         (

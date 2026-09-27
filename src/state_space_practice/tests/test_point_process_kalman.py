@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from state_space_practice import point_process_kalman
+from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.point_process_kalman import (
     BlockDiagonalCovariance,
     BlockDiagonalStructure,
@@ -4892,6 +4893,40 @@ class TestPointProcessTraceability:
             stochastic_point_process_filter(
                 jnp.zeros(3), -jnp.eye(3), Z, y, 0.1, A, Q, log_conditional_intensity
             )
+
+    @pytest.mark.parametrize(
+        "entry", [stochastic_point_process_filter, stochastic_point_process_smoother]
+    )
+    def test_closed_over_constants_are_validated_under_jit(
+        self, problem, entry
+    ) -> None:
+        """Concrete arguments closed over by a jitted function keep the host
+        checks: a valid call traces, and a non-PD init_cov still raises."""
+        Z, y, A, Q = problem
+        m0 = jnp.zeros(3)  # created outside the trace, so it stays concrete
+
+        def run(P0):
+            return entry(m0, P0, Z, y, 0.1, A, Q, log_conditional_intensity)[0]
+
+        P_good, P_bad = jnp.eye(3), -jnp.eye(3)
+        np.testing.assert_allclose(jax.jit(lambda: run(P_good))(), run(P_good))
+        with pytest.raises(ValueError, match="not positive definite"):
+            jax.jit(lambda: run(P_bad))()
+
+    @pytest.mark.parametrize(
+        "entry", [stochastic_point_process_filter, stochastic_point_process_smoother]
+    )
+    def test_traced_non_positive_definite_init_cov_warns(self, problem, entry) -> None:
+        Z, y, A, Q = problem
+
+        def run(P0):
+            return entry(jnp.zeros(3), P0, Z, y, 0.1, A, Q, log_conditional_intensity)[
+                0
+            ]
+
+        with pytest.warns(StateSpaceWarning, match=r"minimum eigenvalue -0\.5"):
+            jax.block_until_ready(jax.jit(run)(-0.5 * jnp.eye(3)))
+            jax.effects_barrier()
 
     @pytest.mark.parametrize("max_newton_iter", [1, 3])
     def test_float32_init_with_float64_params(self, problem, max_newton_iter) -> None:

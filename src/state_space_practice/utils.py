@@ -824,6 +824,56 @@ def contains_tracer(*values: object) -> bool:
     )
 
 
+def _warn_not_positive_definite_host(
+    min_eigenvalue: np.ndarray, *, name: str, filter_name: str
+) -> None:
+    """Host side of :func:`warn_if_not_positive_definite_in_graph`."""
+    min_eig = float(np.min(np.asarray(min_eigenvalue)))
+    if not min_eig > 0.0:
+        warnings.warn(
+            f"{filter_name}: {name} is not positive definite (minimum "
+            f"eigenvalue {min_eig:g}). The input was traced (jax.jit / "
+            f"jax.grad / jax.vmap), so this could not be raised as an error; "
+            f"the returned estimates and log-likelihood are invalid.",
+            StateSpaceWarning,
+            stacklevel=2,
+        )
+
+
+def warn_if_not_positive_definite_in_graph(
+    cov: ArrayLike, *, name: str, filter_name: str
+) -> None:
+    """Report a non-positive-definite (possibly traced) covariance at run time.
+
+    The in-graph counterpart of the host-side positive-definiteness check for
+    inputs that are JAX tracers: the minimum eigenvalue of ``symmetrize(cov)``
+    is computed inside the traced computation and handed to
+    :func:`jax.debug.callback`, which emits a
+    :class:`~state_space_practice.exceptions.StateSpaceWarning` naming it when
+    it is not strictly positive (or not finite). Works under ``jax.jit``,
+    ``jax.grad`` and ``jax.vmap``; the callback is asynchronous, so the warning
+    is emitted when the computation runs (``jax.effects_barrier()`` waits for
+    it).
+
+    Parameters
+    ----------
+    cov : ArrayLike, shape (..., n, n)
+        Covariance (or batch of covariances) to check.
+    name : str
+        Name of the covariance, used in the warning.
+    filter_name : str
+        Name of the public entry point, used in the warning.
+    """
+    cov = jnp.asarray(cov)
+    min_eig = jnp.min(jnp.linalg.eigvalsh(symmetrize(cov)))
+    jax.debug.callback(
+        functools.partial(
+            _warn_not_positive_definite_host, name=name, filter_name=filter_name
+        ),
+        min_eig,
+    )
+
+
 def debug_print_if(condition: jax.Array, fmt: str, **fmt_kwargs) -> None:
     """Fire ``jax.debug.print(fmt, **fmt_kwargs)`` only when ``condition`` is True.
 
@@ -1081,81 +1131,86 @@ def _validate_filter_numerics(
     ``fit_sgd``, or the public filter/smoother wrappers) once per call,
     then inner call sites pass ``validate_inputs=False`` to skip
     re-validation. The ``eigvalsh → float(...)`` conversion used here needs
-    concrete values, so the whole check is skipped when any covariance is a
-    JAX tracer (the public filter called under ``jax.jit`` / ``jax.grad`` /
-    ``jax.vmap``): a traced value cannot be inspected host-side, and raising
-    would make the public filters untraceable with their default arguments.
-    Callers that trace other inputs must skip the call themselves, since any
-    ``jnp`` operation inside an active trace is staged (see
-    ``contains_tracer`` checks in the public filters).
+    concrete values. Concrete arrays are checked even inside an active trace
+    (e.g. constants closed over by a jitted function): the checks run under
+    :func:`jax.ensure_compile_time_eval`. The whole check is skipped when any
+    covariance is a JAX tracer (a traced argument of ``jax.jit`` /
+    ``jax.grad`` / ``jax.vmap``), since a traced value cannot be inspected
+    host-side; the public filters then report a non-positive-definite
+    ``init_cov`` at run time through
+    :func:`warn_if_not_positive_definite_in_graph` instead.
     """
     if contains_tracer(init_covariance, measurement_cov, process_cov):
         return
-    validate_covariance(
-        init_covariance,
-        name="init_covariance",
-        require_positive_definite=True,
-    )
-    if measurement_cov is not None:
+    # Closed-over constants of a jitted caller are concrete, but any jnp op
+    # on them inside the trace is staged; evaluate the checks eagerly so
+    # they stay concrete.
+    with jax.ensure_compile_time_eval():
         validate_covariance(
-            measurement_cov,
-            name="measurement_cov",
+            init_covariance,
+            name="init_covariance",
             require_positive_definite=True,
         )
-    if process_cov is not None:
-        validate_covariance(
-            process_cov,
-            name="process_cov",
-            require_positive_definite=False,
-        )
-
-    # Eigenvalue check. eigvalsh is O(d^3) but only runs once per filter
-    # invocation, vs d^3 per scan step — negligible.
-    init_cov_sym = symmetrize(init_covariance)
-    eigs = jnp.linalg.eigvalsh(init_cov_sym)
-    min_eig = float(eigs.min())
-    max_eig = float(eigs.max())
-
-    # Condition number. Cap the denominator to avoid divide-by-zero on
-    # an (already-filtered) perfectly-rank-deficient matrix.
-    cond = max_eig / max(min_eig, 1e-300)
-    n_state = int(init_covariance.shape[0])
-
-    # Check precision: the filter's scan body inherits its dtype from
-    # init_covariance (via jnp.asarray internally). If the caller passed
-    # an f32 array — either because jax_enable_x64 is off, or because
-    # they explicitly cast — the inner Cholesky solves and matrix
-    # products accumulate f32 roundoff. f64 arrays do not have this
-    # issue in practice.
-    is_f32 = init_covariance.dtype == jnp.float32
-
-    if is_f32:
-        # Rough upper bound on per-bin absolute covariance roundoff from
-        # the predict-step congruence (A @ P @ A^T + Q) and the Cholesky
-        # update. Error-analysis constants: conservative ~sqrt(n_state)
-        # factor, f32 machine epsilon ~1.2e-7. Under a random-walk
-        # accumulation model over n_time bins, total roundoff ~
-        # sqrt(n_time * n_state) * eps * max_eig.
-        f32_eps = 1.2e-7
-        worst_roundoff = float((n_time * n_state) ** 0.5) * f32_eps * max_eig
-        if worst_roundoff > 0.5 * min_eig:
-            warnings.warn(
-                f"{filter_name} running in float32 with "
-                f"a long / ill-conditioned problem: "
-                f"T={n_time}, n_state={n_state}, "
-                f"init_cov condition number {cond:.1e}, "
-                f"min_eig {min_eig:.2e}, max_eig {max_eig:.2e}. "
-                f"Estimated accumulated covariance roundoff "
-                f"({worst_roundoff:.2e}) exceeds half of min_eig, which "
-                f"means the predict step's covariance is likely to lose "
-                f"PSD during the scan and produce NaN. Enable float64 "
-                f"BEFORE importing state_space_practice:\n"
-                f"    import jax\n"
-                f"    jax.config.update('jax_enable_x64', True)\n"
-                f"    # now import state_space_practice models",
-                StateSpaceWarning,
-                stacklevel=stacklevel,
+        if measurement_cov is not None:
+            validate_covariance(
+                measurement_cov,
+                name="measurement_cov",
+                require_positive_definite=True,
             )
+        if process_cov is not None:
+            validate_covariance(
+                process_cov,
+                name="process_cov",
+                require_positive_definite=False,
+            )
+
+        # Eigenvalue check. eigvalsh is O(d^3) but only runs once per filter
+        # invocation, vs d^3 per scan step — negligible.
+        init_cov_sym = symmetrize(init_covariance)
+        eigs = jnp.linalg.eigvalsh(init_cov_sym)
+        min_eig = float(eigs.min())
+        max_eig = float(eigs.max())
+
+        # Condition number. Cap the denominator to avoid divide-by-zero on
+        # an (already-filtered) perfectly-rank-deficient matrix.
+        cond = max_eig / max(min_eig, 1e-300)
+        n_state = int(init_covariance.shape[0])
+
+        # Check precision: the filter's scan body inherits its dtype from
+        # init_covariance (via jnp.asarray internally). If the caller passed
+        # an f32 array — either because jax_enable_x64 is off, or because
+        # they explicitly cast — the inner Cholesky solves and matrix
+        # products accumulate f32 roundoff. f64 arrays do not have this
+        # issue in practice.
+        is_f32 = init_covariance.dtype == jnp.float32
+
+        if is_f32:
+            # Rough upper bound on per-bin absolute covariance roundoff from
+            # the predict-step congruence (A @ P @ A^T + Q) and the Cholesky
+            # update. Error-analysis constants: conservative ~sqrt(n_state)
+            # factor, f32 machine epsilon ~1.2e-7. Under a random-walk
+            # accumulation model over n_time bins, total roundoff ~
+            # sqrt(n_time * n_state) * eps * max_eig.
+            f32_eps = 1.2e-7
+            worst_roundoff = float((n_time * n_state) ** 0.5) * f32_eps * max_eig
+            if worst_roundoff > 0.5 * min_eig:
+                warnings.warn(
+                    f"{filter_name} running in float32 with "
+                    f"a long / ill-conditioned problem: "
+                    f"T={n_time}, n_state={n_state}, "
+                    f"init_cov condition number {cond:.1e}, "
+                    f"min_eig {min_eig:.2e}, max_eig {max_eig:.2e}. "
+                    f"Estimated accumulated covariance roundoff "
+                    f"({worst_roundoff:.2e}) exceeds half of min_eig, which "
+                    f"means the predict step's covariance is likely to lose "
+                    f"PSD during the scan and produce NaN. Enable float64 "
+                    f"BEFORE importing state_space_practice:\n"
+                    f"    import jax\n"
+                    f"    jax.config.update('jax_enable_x64', True)\n"
+                    f"    # now import state_space_practice models",
+                    StateSpaceWarning,
+                    stacklevel=stacklevel,
+                )
 
 
 def validate_covariance(

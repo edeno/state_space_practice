@@ -65,6 +65,7 @@ from state_space_practice.utils import (
     symmetrize,
     validate_count_array,
     validate_scalar,
+    warn_if_not_positive_definite_in_graph,
 )
 
 logger = logging.getLogger(__name__)
@@ -1483,11 +1484,14 @@ def stochastic_point_process_filter(
     transition_matrix = jnp.asarray(transition_matrix)
     process_cov = jnp.asarray(process_cov)
 
-    # Host-side value checks need concrete inputs: under jax.jit / jax.grad
-    # they are skipped (any jnp op in an active trace is staged, so bool() /
-    # float() on it would raise), keeping the filter traceable with its
-    # default arguments. Shape handling below is static and always runs.
-    if validate_inputs and not contains_tracer(
+    # Host-side value checks need concrete inputs. Concrete arrays (including
+    # constants closed over by a jitted caller) are checked under
+    # ensure_compile_time_eval so jnp ops on them are not staged. When any
+    # input is a tracer (jax.jit / jax.grad / jax.vmap argument) the checks
+    # are skipped, keeping the filter traceable with its default arguments,
+    # and a non-positive-definite init_cov is reported at run time as a
+    # StateSpaceWarning. Shape handling below is static and always runs.
+    if validate_inputs and contains_tracer(
         dt,
         init_mean_params,
         init_covariance_params,
@@ -1496,20 +1500,27 @@ def stochastic_point_process_filter(
         transition_matrix,
         process_cov,
     ):
-        validate_scalar(dt, "dt", positive=True)
-        validate_count_array(spike_indicator, "spike_indicator")
-        # Numerical sanity check BEFORE the block dispatch below: raises on
-        # non-PSD init_cov, warns on f32 + long T + ill-conditioned configs.
-        # The block path (large-state / long-T) is exactly where these matter,
-        # so the check must run before dispatch, not only on the dense path.
-        # Gated behind ``validate_inputs`` so tight inner loops (e.g. SGD) can
-        # pass False after a single validation at the top of fit_sgd.
-        # stacklevel=4 so the warning points at the user's call site:
-        # user -> fit_sgd -> _sgd_loss_fn -> stochastic_point_process_filter
-        # -> _validate.
-        _validate_filter_numerics(
-            init_covariance_params, n_time=spike_indicator.shape[0], stacklevel=4
+        warn_if_not_positive_definite_in_graph(
+            init_covariance_params,
+            name="init_covariance_params",
+            filter_name="stochastic_point_process_filter",
         )
+    elif validate_inputs:
+        with jax.ensure_compile_time_eval():
+            validate_scalar(dt, "dt", positive=True)
+            validate_count_array(spike_indicator, "spike_indicator")
+            # Numerical sanity check BEFORE the block dispatch below: raises
+            # on non-PSD init_cov, warns on f32 + long T + ill-conditioned
+            # configs. The block path (large-state / long-T) is exactly where
+            # these matter, so the check must run before dispatch, not only on
+            # the dense path. Gated behind ``validate_inputs`` so tight inner
+            # loops (e.g. SGD) can pass False after a single validation at the
+            # top of fit_sgd. stacklevel=4 so the warning points at the user's
+            # call site: user -> fit_sgd -> _sgd_loss_fn ->
+            # stochastic_point_process_filter -> _validate.
+            _validate_filter_numerics(
+                init_covariance_params, n_time=spike_indicator.shape[0], stacklevel=4
+            )
 
     # Block-diagonal dispatch (opt-in via block_n_neurons / block_size).
     # The caller is responsible for verifying the block structure ONCE at
@@ -2366,8 +2377,8 @@ def stochastic_point_process_smoother(
     transition_matrix = jnp.asarray(transition_matrix)
     process_cov = jnp.asarray(process_cov)
 
-    # Skipped under tracing, as in stochastic_point_process_filter.
-    if validate_inputs and not contains_tracer(
+    # Same tracing contract as stochastic_point_process_filter.
+    if validate_inputs and contains_tracer(
         dt,
         init_mean_params,
         init_covariance_params,
@@ -2376,16 +2387,23 @@ def stochastic_point_process_smoother(
         transition_matrix,
         process_cov,
     ):
-        validate_scalar(dt, "dt", positive=True)
-        validate_count_array(spike_indicator, "spike_indicator")
-        # Validate BEFORE the block dispatch below (the dense path would
-        # otherwise inherit this check from the inner filter call, but the
-        # block path returns early and would skip it). Raises on non-PSD
-        # init_cov, warns on f32 + long T. stacklevel=3: user -> smoother ->
-        # _validate.
-        _validate_filter_numerics(
-            init_covariance_params, n_time=spike_indicator.shape[0], stacklevel=3
+        warn_if_not_positive_definite_in_graph(
+            init_covariance_params,
+            name="init_covariance_params",
+            filter_name="stochastic_point_process_smoother",
         )
+    elif validate_inputs:
+        with jax.ensure_compile_time_eval():
+            validate_scalar(dt, "dt", positive=True)
+            validate_count_array(spike_indicator, "spike_indicator")
+            # Validate BEFORE the block dispatch below (the dense path would
+            # otherwise inherit this check from the inner filter call, but the
+            # block path returns early and would skip it). Raises on non-PSD
+            # init_cov, warns on f32 + long T. stacklevel=3: user -> smoother
+            # -> _validate.
+            _validate_filter_numerics(
+                init_covariance_params, n_time=spike_indicator.shape[0], stacklevel=3
+            )
 
     # Block-diagonal dispatch: same opt-in contract as the filter.
     # See stochastic_point_process_filter's block-dispatch comment for
