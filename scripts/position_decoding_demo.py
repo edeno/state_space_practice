@@ -36,9 +36,7 @@ from state_space_practice.preprocessing import (
 def main():
     # ── 1. Load data ──────────────────────────────────────────────────────
     print("Loading data...")
-    data = load_neural_recording_from_files(
-        PROJECT_ROOT / "data", "j1620210710_02_r1"
-    )
+    data = load_neural_recording_from_files(PROJECT_ROOT / "data", "j1620210710_02_r1")
     position_info = data["position_info"]
     spike_times = data["spike_times"]
     track_graph = data["track_graph"]
@@ -52,7 +50,9 @@ def main():
 
     # ── 3. Select active neurons ──────────────────────────────────────────
     print("Selecting active neurons...")
-    selected = select_units(spike_times, min_rate=0.5, start_time=t_start, end_time=t_end)
+    selected = select_units(
+        spike_times, min_rate=0.5, start_time=t_start, end_time=t_end
+    )
     spike_times_sel = [spike_times[i] for i in selected]
     n_neurons = len(spike_times_sel)
     print(f"  Selected {n_neurons} neurons with rate > 0.5 Hz")
@@ -61,14 +61,16 @@ def main():
     print("Binning spikes...")
     spikes = bin_spike_times(spike_times_sel, time_bins)
 
-    position_xy = np.column_stack([
-        interpolate_to_new_times(
-            position_info["head_position_x"].values, pos_times, time_bins
-        ),
-        interpolate_to_new_times(
-            position_info["head_position_y"].values, pos_times, time_bins
-        ),
-    ])
+    position_xy = np.column_stack(
+        [
+            interpolate_to_new_times(
+                position_info["head_position_x"].values, pos_times, time_bins
+            ),
+            interpolate_to_new_times(
+                position_info["head_position_y"].values, pos_times, time_bins
+            ),
+        ]
+    )
     speed = interpolate_to_new_times(
         position_info["head_speed"].values, pos_times, time_bins
     )
@@ -171,8 +173,13 @@ def main():
 
     # Background: all visited positions
     ax.scatter(
-        all_pos_sub[:, 0], all_pos_sub[:, 1],
-        s=0.3, c="#DDDDDD", alpha=0.5, zorder=0, rasterized=True,
+        all_pos_sub[:, 0],
+        all_pos_sub[:, 1],
+        s=0.3,
+        c="#DDDDDD",
+        alpha=0.5,
+        zorder=0,
+        rasterized=True,
     )
 
     # Set axis limits with padding
@@ -188,24 +195,44 @@ def main():
 
     # Initialize artists
     (true_trail,) = ax.plot([], [], color="#2ca02c", linewidth=2, alpha=0.5, zorder=3)
-    (true_dot,) = ax.plot([], [], "o", color="#2ca02c", markersize=10, zorder=4, label="True position")
-    (decoded_trail,) = ax.plot([], [], color="#d62728", linewidth=2, alpha=0.5, zorder=3)
-    (decoded_dot,) = ax.plot([], [], "o", color="#d62728", markersize=10, zorder=4, label="Decoded position")
+    (true_dot,) = ax.plot(
+        [], [], "o", color="#2ca02c", markersize=10, zorder=4, label="True position"
+    )
+    (decoded_trail,) = ax.plot(
+        [], [], color="#d62728", linewidth=2, alpha=0.5, zorder=3
+    )
+    (decoded_dot,) = ax.plot(
+        [], [], "o", color="#d62728", markersize=10, zorder=4, label="Decoded position"
+    )
     conf_ellipse = Ellipse(
-        (0, 0), 0, 0, angle=0,
-        facecolor="#d62728", alpha=0.15, edgecolor="#d62728", linewidth=1.5,
+        (0, 0),
+        0,
+        0,
+        angle=0,
+        facecolor="#d62728",
+        alpha=0.15,
+        edgecolor="#d62728",
+        linewidth=1.5,
         zorder=2,
     )
     ax.add_patch(conf_ellipse)
     time_text = ax.text(
-        0.02, 0.98, "", transform=ax.transAxes,
-        fontsize=11, verticalalignment="top",
+        0.02,
+        0.98,
+        "",
+        transform=ax.transAxes,
+        fontsize=11,
+        verticalalignment="top",
         fontfamily="monospace",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
     )
     error_text = ax.text(
-        0.02, 0.92, "", transform=ax.transAxes,
-        fontsize=11, verticalalignment="top",
+        0.02,
+        0.92,
+        "",
+        transform=ax.transAxes,
+        fontsize=11,
+        verticalalignment="top",
         fontfamily="monospace",
         bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
     )
@@ -249,10 +276,22 @@ def main():
         time_text.set_text(f"t = {t:.2f} s")
         error_text.set_text(f"error = {err:.1f} cm")
 
-        return true_trail, true_dot, decoded_trail, decoded_dot, conf_ellipse, time_text, error_text
+        return (
+            true_trail,
+            true_dot,
+            decoded_trail,
+            decoded_dot,
+            conf_ellipse,
+            time_text,
+            error_text,
+        )
 
     anim = animation.FuncAnimation(
-        fig, update, frames=n_frames, interval=1000 / fps, blit=True,
+        fig,
+        update,
+        frames=n_frames,
+        interval=1000 / fps,
+        blit=True,
     )
 
     out_path = PROJECT_ROOT / "output" / "position_decoding_demo.mp4"

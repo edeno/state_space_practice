@@ -5,6 +5,7 @@ These tests simulate data with known ground-truth parameters, fit via SGD,
 and check that the recovered parameters are close to ground truth. They also
 compare SGD results against EM where applicable.
 """
+
 import jax
 
 jax.config.update("jax_enable_x64", True)
@@ -31,8 +32,11 @@ class TestMultinomialChoiceSGDIntegration:
         true_q = 0.02
         true_beta = 3.0
         sim = simulate_choice_data(
-            n_trials=300, n_options=3,
-            process_noise=true_q, inverse_temperature=true_beta, seed=42,
+            n_trials=300,
+            n_options=3,
+            process_noise=true_q,
+            inverse_temperature=true_beta,
+            seed=42,
         )
         choices = sim.choices
 
@@ -56,12 +60,13 @@ class TestMultinomialChoiceSGDIntegration:
         assert model.is_fitted
         assert model.smoothed_values.shape == (300, 2)
         # Smoothed values should track true values
-        corr = float(jnp.corrcoef(
-            model.smoothed_values[:, 0], sim.true_values[:, 0],
-        )[0, 1])
-        assert corr > 0.5, (
-            f"Smoothed-vs-true values correlation {corr:.3f} < 0.5"
+        corr = float(
+            jnp.corrcoef(
+                model.smoothed_values[:, 0],
+                sim.true_values[:, 0],
+            )[0, 1]
         )
+        assert corr > 0.5, f"Smoothed-vs-true values correlation {corr:.3f} < 0.5"
 
     def test_sgd_vs_em_agreement(self):
         from state_space_practice.multinomial_choice import (
@@ -70,8 +75,11 @@ class TestMultinomialChoiceSGDIntegration:
         )
 
         sim = simulate_choice_data(
-            n_trials=200, n_options=4, process_noise=0.01,
-            inverse_temperature=2.0, seed=123,
+            n_trials=200,
+            n_options=4,
+            process_noise=0.01,
+            inverse_temperature=2.0,
+            seed=123,
         )
         choices = sim.choices
 
@@ -106,16 +114,22 @@ class TestCovariateChoiceSGDIntegration:
         )
 
         sim = simulate_rl_choice_data(
-            n_trials=300, n_options=3,
-            inverse_temperature=2.0, seed=42,
+            n_trials=300,
+            n_options=3,
+            inverse_temperature=2.0,
+            seed=42,
         )
 
         model = CovariateChoiceModel(
-            n_options=3, n_covariates=sim.covariates.shape[1],
-            init_inverse_temperature=1.0, init_process_noise=0.01,
+            n_options=3,
+            n_covariates=sim.covariates.shape[1],
+            init_inverse_temperature=1.0,
+            init_process_noise=0.01,
         )
         lls = model.fit_sgd(
-            sim.choices, covariates=sim.covariates, num_steps=200,
+            sim.choices,
+            covariates=sim.covariates,
+            num_steps=200,
         )
 
         assert lls[-1] > lls[0]
@@ -123,12 +137,13 @@ class TestCovariateChoiceSGDIntegration:
         # Input gain should be learned (nonzero)
         assert jnp.any(jnp.abs(model.input_gain_) > 0.01)
         # Smoothed values should track true values
-        corr = float(jnp.corrcoef(
-            model.smoothed_values[:, 0], sim.true_values[:, 0],
-        )[0, 1])
-        assert corr > 0.5, (
-            f"Smoothed-vs-true values correlation {corr:.3f} < 0.5"
+        corr = float(
+            jnp.corrcoef(
+                model.smoothed_values[:, 0],
+                sim.true_values[:, 0],
+            )[0, 1]
         )
+        assert corr > 0.5, f"Smoothed-vs-true values correlation {corr:.3f} < 0.5"
         # Input gain diagonal should be non-negative (reward increases value).
         # Some entries may be near zero if that option was rarely chosen.
         diag = jnp.diag(model.input_gain_)
@@ -144,20 +159,26 @@ class TestCovariateChoiceSGDIntegration:
         )
 
         sim = simulate_rl_choice_data(
-            n_trials=200, n_options=3,
-            inverse_temperature=2.0, seed=99,
+            n_trials=200,
+            n_options=3,
+            inverse_temperature=2.0,
+            seed=99,
         )
 
         model_em = CovariateChoiceModel(
-            n_options=3, n_covariates=sim.covariates.shape[1],
+            n_options=3,
+            n_covariates=sim.covariates.shape[1],
         )
         model_em.fit(sim.choices, covariates=sim.covariates, max_iter=30)
 
         model_sgd = CovariateChoiceModel(
-            n_options=3, n_covariates=sim.covariates.shape[1],
+            n_options=3,
+            n_covariates=sim.covariates.shape[1],
         )
         model_sgd.fit_sgd(
-            sim.choices, covariates=sim.covariates, num_steps=300,
+            sim.choices,
+            covariates=sim.covariates,
+            num_steps=300,
         )
 
         # Both should have similar final LL
@@ -217,10 +238,12 @@ class TestSmithSGDIntegration:
         # Both should find similar sigma
         assert abs(model_sgd.sigma_epsilon - model_em.sigma_epsilon) < 0.15
         # Smoothed states should be correlated
-        corr = float(jnp.corrcoef(
-            model_sgd.smoothed_learning_state_mode,
-            model_em.smoothed_learning_state_mode,
-        )[0, 1])
+        corr = float(
+            jnp.corrcoef(
+                model_sgd.smoothed_learning_state_mode,
+                model_em.smoothed_learning_state_mode,
+            )[0, 1]
+        )
         assert corr > 0.9, f"Smoothed state correlation too low: {corr}"
 
 
@@ -250,7 +273,9 @@ class TestPointProcessSGDIntegration:
 
         # Simulate latent states
         def _step(x, k):
-            x_new = true_A @ x + jax.random.multivariate_normal(k, jnp.zeros(n_state), true_Q)
+            x_new = true_A @ x + jax.random.multivariate_normal(
+                k, jnp.zeros(n_state), true_Q
+            )
             return x_new, x_new
 
         keys = jax.random.split(k1, n_time)
@@ -267,7 +292,8 @@ class TestPointProcessSGDIntegration:
 
         # Fit with SGD
         model = PointProcessModel(
-            n_state, dt,
+            n_state,
+            dt,
             transition_matrix=jnp.eye(n_state),
             process_cov=0.01 * jnp.eye(n_state),
         )
@@ -323,10 +349,12 @@ class TestPointProcessSGDIntegration:
         assert model_em.smoother_mean is not None
         assert model_sgd.smoother_mean is not None
         # Smoothed states should be correlated
-        corr = float(jnp.corrcoef(
-            model_sgd.smoother_mean[:, 0],
-            model_em.smoother_mean[:, 0],
-        )[0, 1])
+        corr = float(
+            jnp.corrcoef(
+                model_sgd.smoother_mean[:, 0],
+                model_em.smoother_mean[:, 0],
+            )[0, 1]
+        )
         assert corr > 0.7, f"Smoothed state correlation too low: {corr}"
 
     def test_em_works_at_high_state_dim(self):
@@ -345,9 +373,7 @@ class TestPointProcessSGDIntegration:
         Q = 0.01 * jnp.eye(n_state)
 
         def _step(x, k):
-            x_new = A @ x + jax.random.multivariate_normal(
-                k, jnp.zeros(n_state), Q
-            )
+            x_new = A @ x + jax.random.multivariate_normal(k, jnp.zeros(n_state), Q)
             return x_new, x_new
 
         keys = jax.random.split(k1, n_time)
@@ -381,17 +407,26 @@ class TestPlaceFieldSGDIntegration:
         from state_space_practice.simulate_data import simulate_2d_moving_place_field
 
         sim = simulate_2d_moving_place_field(
-            total_time=20.0, dt=0.020, arena_size=80.0,
-            peak_rate=25.0, background_rate=1.0,
-            n_interior_knots=3, rng=np.random.default_rng(42),
+            total_time=20.0,
+            dt=0.020,
+            arena_size=80.0,
+            peak_rate=25.0,
+            background_rate=1.0,
+            n_interior_knots=3,
+            rng=np.random.default_rng(42),
         )
 
         # EM fit
         model_em = PlaceFieldModel(
-            dt=sim["dt"], n_interior_knots=3, init_process_noise=1e-3,
+            dt=sim["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-3,
         )
         em_lls = model_em.fit(
-            sim["position"], sim["spikes"], max_iter=5, verbose=False,
+            sim["position"],
+            sim["spikes"],
+            max_iter=5,
+            verbose=False,
         )
         assert len(em_lls) > 0
         assert model_em.smoother_mean is not None
@@ -400,14 +435,19 @@ class TestPlaceFieldSGDIntegration:
         import optax
 
         model_sgd = PlaceFieldModel(
-            dt=sim["dt"], n_interior_knots=3, init_process_noise=1e-3,
+            dt=sim["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-3,
         )
         optimizer = optax.chain(
-            optax.clip_by_global_norm(10.0), optax.adam(1e-3),
+            optax.clip_by_global_norm(10.0),
+            optax.adam(1e-3),
         )
         sgd_lls = model_sgd.fit_sgd(
-            sim["position"], sim["spikes"],
-            optimizer=optimizer, num_steps=30,
+            sim["position"],
+            sim["spikes"],
+            optimizer=optimizer,
+            num_steps=30,
         )
         assert len(sgd_lls) > 1
         assert all(np.isfinite(ll) for ll in sgd_lls)
@@ -422,20 +462,29 @@ class TestPlaceFieldSGDIntegration:
         import optax
 
         sim = simulate_2d_moving_place_field(
-            total_time=30.0, dt=0.020, arena_size=80.0,
-            peak_rate=25.0, background_rate=1.0,
-            n_interior_knots=3, rng=np.random.default_rng(99),
+            total_time=30.0,
+            dt=0.020,
+            arena_size=80.0,
+            peak_rate=25.0,
+            background_rate=1.0,
+            n_interior_knots=3,
+            rng=np.random.default_rng(99),
         )
 
         model = PlaceFieldModel(
-            dt=sim["dt"], n_interior_knots=3, init_process_noise=1e-3,
+            dt=sim["dt"],
+            n_interior_knots=3,
+            init_process_noise=1e-3,
         )
         optimizer = optax.chain(
-            optax.clip_by_global_norm(10.0), optax.adam(1e-3),
+            optax.clip_by_global_norm(10.0),
+            optax.adam(1e-3),
         )
         lls = model.fit_sgd(
-            sim["position"], sim["spikes"],
-            optimizer=optimizer, num_steps=50,
+            sim["position"],
+            sim["spikes"],
+            optimizer=optimizer,
+            num_steps=50,
         )
 
         # LL should improve (or at least not go to NaN)

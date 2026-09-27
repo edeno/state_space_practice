@@ -5,6 +5,7 @@ Warm init uses windowed cross-covariance features + GMM clustering to
 break symmetry before the first E-step. These tests verify that warm
 init produces better first-iteration accuracy than cold (random) init.
 """
+
 import jax
 
 jax.config.update("jax_enable_x64", True)
@@ -66,9 +67,7 @@ def dim_simulation():
             [construct_directed_influence_measurement_matrix(n_osc)] * n_disc, axis=-1
         )
     )
-    R = np.array(
-        jnp.stack([jnp.eye(n_osc) * measurement_var] * n_disc, axis=-1)
-    )
+    R = np.array(jnp.stack([jnp.eye(n_osc) * measurement_var] * n_disc, axis=-1))
 
     p_stay = 1.0 - 2.0 / sampling_freq
     Z = np.array([[p_stay, 1 - p_stay], [1 - p_stay, p_stay]])
@@ -106,12 +105,8 @@ def _build_model(data):
         damping_coef=data["damping"],
         process_variance=data["process_var"],
         measurement_variance=data["measurement_var"],
-        phase_difference=jnp.zeros(
-            (data["n_osc"], data["n_osc"], data["n_disc"])
-        ),
-        coupling_strength=jnp.zeros(
-            (data["n_osc"], data["n_osc"], data["n_disc"])
-        ),
+        phase_difference=jnp.zeros((data["n_osc"], data["n_osc"], data["n_disc"])),
+        coupling_strength=jnp.zeros((data["n_osc"], data["n_osc"], data["n_disc"])),
         discrete_transition_diag=jnp.full((data["n_disc"],), true_p_stay),
     )
 

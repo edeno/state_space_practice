@@ -146,8 +146,7 @@ def fit_coupling_ekf(
         or int(max_iter_arr) <= 0
     ):
         raise ValueError(
-            "max_newton_iter must be a positive integer, "
-            f"got {max_newton_iter}."
+            f"max_newton_iter must be a positive integer, got {max_newton_iter}."
         )
     spikes = jnp.asarray(spikes_np)
     lfp = jnp.asarray(lfp_np)
@@ -177,7 +176,8 @@ def fit_coupling_ekf(
     # (e.g. ill-conditioned init, separable spikes). Fail loudly rather than
     # return silent NaNs that propagate into detection downstream.
     if not (
-        jnp.all(jnp.isfinite(beta_mean_rows)) and jnp.all(jnp.isfinite(beta_var_rows))
+        jnp.all(jnp.isfinite(beta_mean_rows))
+        and jnp.all(jnp.isfinite(beta_var_rows))
         and jnp.all(jnp.isfinite(beta_real_imag_cov))
     ):
         raise FloatingPointError(

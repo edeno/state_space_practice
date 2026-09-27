@@ -450,7 +450,9 @@ def binned_to_spike_times(
     """
     time_bins = np.asarray(time_bins)
 
-    def extract_spike_times_single(spike_counts: NDArray[np.int_]) -> NDArray[np.floating]:
+    def extract_spike_times_single(
+        spike_counts: NDArray[np.int_],
+    ) -> NDArray[np.floating]:
         """Extract spike times for a single neuron (one entry per spike)."""
         return np.repeat(time_bins, spike_counts)
 
@@ -458,4 +460,6 @@ def binned_to_spike_times(
         return extract_spike_times_single(binned_spikes[:, neuron_idx])
     else:
         n_neurons = binned_spikes.shape[1]
-        return [extract_spike_times_single(binned_spikes[:, n]) for n in range(n_neurons)]
+        return [
+            extract_spike_times_single(binned_spikes[:, n]) for n in range(n_neurons)
+        ]

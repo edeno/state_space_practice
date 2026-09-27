@@ -41,13 +41,11 @@ def _as_coupling(coupling: Array) -> Array:
     arr = jnp.asarray(coupling)
     if arr.ndim != 3:
         raise ValueError(
-            "coupling must have shape (n_states, n_osc, n_osc), "
-            f"got {arr.shape}."
+            f"coupling must have shape (n_states, n_osc, n_osc), got {arr.shape}."
         )
     if arr.shape[-2] != arr.shape[-1]:
         raise ValueError(
-            "coupling must have square oscillator axes, "
-            f"got {arr.shape[-2:]}."
+            f"coupling must have square oscillator axes, got {arr.shape[-2:]}."
         )
     if not contains_tracer(arr) and not bool(jnp.all(jnp.isfinite(arr))):
         raise ValueError("coupling must contain only finite values.")
@@ -59,8 +57,7 @@ def _validate_area_labels(area_labels: Array, n_osc: int | None = None) -> Array
     labels_np = np.asarray(area_labels)
     if labels_np.ndim != 1:
         raise ValueError(
-            "area_labels must be a 1D integer array, "
-            f"got shape {labels_np.shape}."
+            f"area_labels must be a 1D integer array, got shape {labels_np.shape}."
         )
     if labels_np.size == 0:
         raise ValueError("area_labels must contain at least one label.")
@@ -91,8 +88,7 @@ def _area_labels_for_penalty(area_labels: Array, n_osc: int) -> Array:
     labels = jnp.asarray(area_labels)
     if labels.ndim != 1:
         raise ValueError(
-            "area_labels must be a 1D integer array, "
-            f"got shape {labels.shape}."
+            f"area_labels must be a 1D integer array, got shape {labels.shape}."
         )
     if labels.shape[0] != n_osc:
         raise ValueError(
@@ -205,7 +201,7 @@ def _build_area_pair_masks(area_labels: Array, n_areas: int) -> Array:
         masks[a, b, i, j] is True iff area_labels[i]==a and area_labels[j]==b.
     """
     areas = jnp.arange(n_areas)
-    mask_rows = (area_labels[None, :] == areas[:, None])  # (n_areas, n_osc)
+    mask_rows = area_labels[None, :] == areas[:, None]  # (n_areas, n_osc)
     # (n_areas, 1, n_osc, 1) * (1, n_areas, 1, n_osc) -> (n_areas, n_areas, n_osc, n_osc)
     return mask_rows[:, None, :, None] * mask_rows[None, :, None, :]
 
@@ -242,7 +238,7 @@ def area_group_penalty(
     masks = _build_area_pair_masks(labels, n_areas)
     eps_arr = _validate_eps(eps).astype(c.dtype)
     # (n_states, n_areas, n_areas): sum c^2 within each area block per state
-    block_sq = jnp.einsum("sij,abij->sab", c ** 2, masks.astype(c.dtype))
+    block_sq = jnp.einsum("sij,abij->sab", c**2, masks.astype(c.dtype))
     return jnp.sum(jnp.sqrt(block_sq + eps_arr) - jnp.sqrt(eps_arr))
 
 
@@ -275,11 +271,9 @@ def state_shared_area_penalty(
     masks = _build_area_pair_masks(labels, n_areas)
     eps_arr = _validate_eps(eps).astype(c.dtype)
     # Sum c^2 within each area block per state: (n_states, n_areas, n_areas)
-    block_sq = jnp.einsum("sij,abij->sab", c ** 2, masks.astype(c.dtype))
+    block_sq = jnp.einsum("sij,abij->sab", c**2, masks.astype(c.dtype))
     # Sum across states, then sqrt for group penalty
-    return jnp.sum(
-        jnp.sqrt(jnp.sum(block_sq, axis=0) + eps_arr) - jnp.sqrt(eps_arr)
-    )
+    return jnp.sum(jnp.sqrt(jnp.sum(block_sq, axis=0) + eps_arr) - jnp.sqrt(eps_arr))
 
 
 def get_area_coupling_summary(
@@ -314,7 +308,7 @@ def get_area_coupling_summary(
 
     masks = _build_area_pair_masks(labels, n_areas)
     # (n_states, n_areas, n_areas)
-    block_sq = jnp.einsum("sij,abij->sab", c ** 2, masks.astype(c.dtype))
+    block_sq = jnp.einsum("sij,abij->sab", c**2, masks.astype(c.dtype))
     block_norms = jnp.sqrt(block_sq)
 
     within_mask = jnp.eye(n_areas, dtype=bool)
@@ -365,21 +359,19 @@ def total_connectivity_penalty(
 
     if config.area_group_l2 > 0:
         if config.area_labels is None:
-            raise ValueError(
-                "area_labels required when area_group_l2 > 0"
-            )
+            raise ValueError("area_labels required when area_group_l2 > 0")
         penalty = penalty + config.area_group_l2 * area_group_penalty(
-            coupling, config.area_labels,
+            coupling,
+            config.area_labels,
             exclude_diagonal=config.exclude_diagonal,
         )
 
     if config.state_shared_group_l2 > 0:
         if config.area_labels is None:
-            raise ValueError(
-                "area_labels required when state_shared_group_l2 > 0"
-            )
+            raise ValueError("area_labels required when state_shared_group_l2 > 0")
         penalty = penalty + config.state_shared_group_l2 * state_shared_area_penalty(
-            coupling, config.area_labels,
+            coupling,
+            config.area_labels,
             exclude_diagonal=config.exclude_diagonal,
         )
 

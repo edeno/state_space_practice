@@ -18,14 +18,16 @@ def simulate_block_bandit(n_trials=200, n_options=3, seed=42):
     key = jax.random.PRNGKey(seed)
     k1, k2 = jax.random.split(key)
 
-    reward_probs = jnp.array([
-        [0.8, 0.1, 0.1],
-        [0.1, 0.1, 0.8],
-    ])
+    reward_probs = jnp.array(
+        [
+            [0.8, 0.1, 0.1],
+            [0.1, 0.1, 0.8],
+        ]
+    )
     half = n_trials // 2
-    true_states = jnp.concatenate([
-        jnp.zeros(half), jnp.ones(n_trials - half)
-    ]).astype(jnp.int32)
+    true_states = jnp.concatenate([jnp.zeros(half), jnp.ones(n_trials - half)]).astype(
+        jnp.int32
+    )
 
     best_options = jnp.array([0, 2])
     choices = best_options[true_states]
@@ -34,9 +36,9 @@ def simulate_block_bandit(n_trials=200, n_options=3, seed=42):
     choices = jnp.where(noise_mask, random_choices, choices)
 
     reward_p = reward_probs[true_states, choices]
-    rewards = jax.random.bernoulli(
-        jax.random.PRNGKey(seed + 1), reward_p
-    ).astype(jnp.int32)
+    rewards = jax.random.bernoulli(jax.random.PRNGKey(seed + 1), reward_p).astype(
+        jnp.int32
+    )
 
     return choices, rewards, true_states, reward_probs
 
@@ -47,7 +49,8 @@ def main():
     print("=" * 60)
 
     choices, rewards, true_states, true_rp = simulate_block_bandit(
-        n_trials=200, n_options=3,
+        n_trials=200,
+        n_options=3,
     )
     print(f"\nData: {len(choices)} trials, 3 options")
     print(f"True states: 0 for first half, 1 for second half")
@@ -63,6 +66,7 @@ def main():
     print(f"Learned reward probs:\n  State 0: {model_em.reward_probs_[0]}")
     print(f"  State 1: {model_em.reward_probs_[1]}")
     from state_space_practice.contingency_belief import centered_softmax
+
     trans = centered_softmax(model_em._get_transition_logits())
     print(f"Transition matrix:\n{trans}")
 
@@ -99,7 +103,8 @@ def main():
 
     model_cov = ContingencyBeliefModel(n_states=2, n_options=3)
     cov_lls = model_cov.fit_sgd(
-        choices, rewards,
+        choices,
+        rewards,
         transition_covariates=covariates,
         num_steps=200,
     )

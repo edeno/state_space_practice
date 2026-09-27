@@ -732,9 +732,9 @@ class TestCompiledStepCache:
                 with jax.log_compiles():
                     model.fit_sgd(target, num_steps=3)
             return [
-                r for r in caplog.records
-                if "Compiling" in r.getMessage()
-                and "_sgd_train_step" in r.getMessage()
+                r
+                for r in caplog.records
+                if "Compiling" in r.getMessage() and "_sgd_train_step" in r.getMessage()
             ]
 
         assert compiles(jnp.array([1.0, 2.0]))  # guard: the log is observed

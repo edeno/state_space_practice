@@ -164,7 +164,9 @@ discrete_transition_matrix = jnp.array(
 expected_dwell = 1.0 / transition_prob
 print(f"Discrete transition matrix:")
 print(discrete_transition_matrix)
-print(f"Expected dwell time: {expected_dwell:.0f} steps ({expected_dwell * dt:.1f} seconds)")
+print(
+    f"Expected dwell time: {expected_dwell:.0f} steps ({expected_dwell * dt:.1f} seconds)"
+)
 
 # %%
 # Spike observation model parameters
@@ -225,7 +227,9 @@ time = np.arange(n_time) * dt
 ax = axes[0]
 for n in range(n_neurons):
     spike_times = time[np.array(spikes[:, n]) > 0]
-    ax.eventplot([spike_times], lineoffsets=n, linelengths=0.8, colors="black", linewidths=0.5)
+    ax.eventplot(
+        [spike_times], lineoffsets=n, linelengths=0.8, colors="black", linewidths=0.5
+    )
 ax.set_ylabel("Neuron")
 ax.set_ylim(-0.5, n_neurons - 0.5)
 ax.set_title("Simulated Data: Switching Spike-Based Oscillator Network")
@@ -336,7 +340,9 @@ fig, axes = plt.subplots(3, 1, figsize=(14, 6), sharex=True)
 
 # Panel 1: True discrete state
 ax = axes[0]
-ax.fill_between(time, true_discrete_states, alpha=0.7, step="mid", color="C0", label="True")
+ax.fill_between(
+    time, true_discrete_states, alpha=0.7, step="mid", color="C0", label="True"
+)
 ax.set_ylabel("True State")
 ax.set_ylim(-0.1, 1.1)
 ax.set_yticks([0, 1])
@@ -406,7 +412,9 @@ smoother_mean_signed = smoother_mean.copy()
 for dim in range(n_latent):
     corr_raw = jnp.corrcoef(true_states[:, dim], smoother_mean[:, dim])[0, 1]
     if corr_raw < 0:
-        smoother_mean_signed = smoother_mean_signed.at[:, dim].set(-smoother_mean[:, dim])
+        smoother_mean_signed = smoother_mean_signed.at[:, dim].set(
+            -smoother_mean[:, dim]
+        )
 
 fig, axes = plt.subplots(n_oscillators, 1, figsize=(14, 3 * n_oscillators), sharex=True)
 
@@ -416,12 +424,40 @@ for osc in range(n_oscillators):
     dim1, dim2 = 2 * osc, 2 * osc + 1
 
     # True states
-    ax.plot(time, true_states[:, dim1], f"{colors[osc]}-", alpha=0.4, linewidth=1, label="True (dim 1)")
-    ax.plot(time, true_states[:, dim2], f"{colors[osc]}--", alpha=0.3, linewidth=1, label="True (dim 2)")
+    ax.plot(
+        time,
+        true_states[:, dim1],
+        f"{colors[osc]}-",
+        alpha=0.4,
+        linewidth=1,
+        label="True (dim 1)",
+    )
+    ax.plot(
+        time,
+        true_states[:, dim2],
+        f"{colors[osc]}--",
+        alpha=0.3,
+        linewidth=1,
+        label="True (dim 2)",
+    )
 
     # Inferred states (sign-corrected for visualization)
-    ax.plot(time, smoother_mean_signed[:, dim1], "k-", alpha=0.8, linewidth=1.5, label="Inferred (dim 1)")
-    ax.plot(time, smoother_mean_signed[:, dim2], "k--", alpha=0.6, linewidth=1.5, label="Inferred (dim 2)")
+    ax.plot(
+        time,
+        smoother_mean_signed[:, dim1],
+        "k-",
+        alpha=0.8,
+        linewidth=1.5,
+        label="Inferred (dim 1)",
+    )
+    ax.plot(
+        time,
+        smoother_mean_signed[:, dim2],
+        "k--",
+        alpha=0.6,
+        linewidth=1.5,
+        label="Inferred (dim 2)",
+    )
 
     ax.set_ylabel(f"Oscillator {osc + 1}")
     ax.axhline(0, color="gray", linestyle=":", alpha=0.3)
@@ -527,7 +563,7 @@ ax.set_title("True Spike Weights (C)")
 ax.set_xlabel("Latent Dimension")
 ax.set_ylabel("Neuron")
 ax.set_xticks(range(n_latent))
-ax.set_xticklabels([f"Osc{i//2+1}.d{i%2+1}" for i in range(n_latent)])
+ax.set_xticklabels([f"Osc{i // 2 + 1}.d{i % 2 + 1}" for i in range(n_latent)])
 plt.colorbar(im, ax=ax)
 
 # Learned weights
@@ -537,7 +573,7 @@ ax.set_title("Learned Spike Weights (C)")
 ax.set_xlabel("Latent Dimension")
 ax.set_ylabel("Neuron")
 ax.set_xticks(range(n_latent))
-ax.set_xticklabels([f"Osc{i//2+1}.d{i%2+1}" for i in range(n_latent)])
+ax.set_xticklabels([f"Osc{i // 2 + 1}.d{i % 2 + 1}" for i in range(n_latent)])
 plt.colorbar(im, ax=ax)
 
 plt.suptitle("Neuron Loadings on Oscillators", fontsize=12, y=1.02)
@@ -556,8 +592,12 @@ print(f"  Learned baseline std (Hz): {float(jnp.std(jnp.exp(learned_baseline))):
 # Note: Due to latent space non-identifiability, direct comparison may not be meaningful
 # Instead, look at whether weight structure is preserved (relative loadings)
 print("\nWeight statistics:")
-print(f"  True weight range: [{float(spike_weights.min()):.3f}, {float(spike_weights.max()):.3f}]")
-print(f"  Learned weight range: [{float(learned_weights.min()):.3f}, {float(learned_weights.max()):.3f}]")
+print(
+    f"  True weight range: [{float(spike_weights.min()):.3f}, {float(spike_weights.max()):.3f}]"
+)
+print(
+    f"  Learned weight range: [{float(learned_weights.min()):.3f}, {float(learned_weights.max()):.3f}]"
+)
 
 # %% [markdown]
 # ## 8. Summary

@@ -75,15 +75,15 @@ def assert_ll_improves(lls: Sequence[float], label: str = "") -> None:
     )
 
 
-def assert_ll_monotonic(lls: Sequence[float], tol: float = 1e-3,
-                         label: str = "") -> None:
+def assert_ll_monotonic(
+    lls: Sequence[float], tol: float = 1e-3, label: str = ""
+) -> None:
     """Assert that LL is non-decreasing (within tolerance) at every step."""
     assert len(lls) >= 2, f"Need at least 2 LL values, got {len(lls)}"
     prefix = f"[{label}] " if label else ""
     for i in range(1, len(lls)):
         assert lls[i] >= lls[i - 1] - tol, (
-            f"{prefix}LL decreased at step {i}: "
-            f"{lls[i - 1]:.6f} -> {lls[i]:.6f}"
+            f"{prefix}LL decreased at step {i}: {lls[i - 1]:.6f} -> {lls[i]:.6f}"
         )
 
 
@@ -152,7 +152,10 @@ def simulate_harmonic_oscillator(
     from state_space_practice.hamiltonian_lfp import HamiltonianLFPModel
 
     _tmp = HamiltonianLFPModel(
-        n_sources=2, n_oscillators=1, hidden_dims=hidden_dims, seed=0,
+        n_sources=2,
+        n_oscillators=1,
+        hidden_dims=hidden_dims,
+        seed=0,
         sampling_freq=1.0 / dt,
     )
     mlp_params = jax.tree_util.tree_map(jnp.zeros_like, dict(_tmp.mlp_params))

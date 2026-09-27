@@ -116,10 +116,14 @@ def _validate_cred_mass(cred_mass: float) -> float:
         or not np.issubdtype(cred_arr.dtype, np.number)
         or np.issubdtype(cred_arr.dtype, np.complexfloating)
     ):
-        raise ValueError(f"cred_mass must be a finite scalar in (0, 1), got {cred_mass}.")
+        raise ValueError(
+            f"cred_mass must be a finite scalar in (0, 1), got {cred_mass}."
+        )
     cred = float(cred_arr)
     if not np.isfinite(cred) or not (0.0 < cred < 1.0):
-        raise ValueError(f"cred_mass must be a finite scalar in (0, 1), got {cred_mass}.")
+        raise ValueError(
+            f"cred_mass must be a finite scalar in (0, 1), got {cred_mass}."
+        )
     return cred
 
 

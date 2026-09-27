@@ -1281,15 +1281,13 @@ def glm_laplace_update(
         post_cho = psd_cholesky(posterior_precision, diagonal_boost=diagonal_boost)
         posterior_mean = one_step_mean + jax.scipy.linalg.cho_solve(post_cho, gradient)
     else:
-        posterior_mean, posterior_precision, _ = (
-            _fisher_scoring_line_search(
-                one_step_mean,
-                prior_precision,
-                _fisher_step_at,
-                _neg_log_posterior,
-                max_newton_iter,
-                line_search_beta,
-            )
+        posterior_mean, posterior_precision, _ = _fisher_scoring_line_search(
+            one_step_mean,
+            prior_precision,
+            _fisher_step_at,
+            _neg_log_posterior,
+            max_newton_iter,
+            line_search_beta,
         )
         post_cho = psd_cholesky(posterior_precision, diagonal_boost=diagonal_boost)
 
@@ -1657,9 +1655,7 @@ def _stochastic_point_process_filter_impl(
         args: tuple[Array, Array],
     ) -> tuple[tuple[Array, Array, Array, Array], tuple[Array, Array]]:
         """Point Process Adaptive Filter update step."""
-        mean_prev, variance_prev, marginal_log_likelihood, n_failed_bins = (
-            params_prev
-        )
+        mean_prev, variance_prev, marginal_log_likelihood, n_failed_bins = params_prev
         design_matrix_t, spike_indicator_t = args
 
         one_step_mean = transition_matrix @ mean_prev
@@ -2584,8 +2580,7 @@ def dynamics_only_m_step(
             + sum_of_outer_products(smoother_mean[:-1], smoother_mean[:-1])
         )
         beta = (
-            sum_cross_cov
-            + sum_of_outer_products(smoother_mean[:-1], smoother_mean[1:])
+            sum_cross_cov + sum_of_outer_products(smoother_mean[:-1], smoother_mean[1:])
         ).T
         transition_matrix = psd_solve(gamma1, beta.T).T
     else:

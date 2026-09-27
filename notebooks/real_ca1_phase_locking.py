@@ -130,6 +130,7 @@ print(f"  Theta-on AND running: {100 * np.mean(theta_on_running):.1f}%")
 # Convert binned spikes to spike times for each neuron
 t_rel = time_subset - time_subset[0]
 
+
 def get_spike_times_from_binned(binned_spikes, time_bins, neuron_idx):
     """Extract spike times from binned spike counts."""
     spike_counts = binned_spikes[:, neuron_idx]
@@ -139,6 +140,7 @@ def get_spike_times_from_binned(binned_spikes, time_bins, neuron_idx):
         for _ in range(spike_counts[t_idx]):
             spike_times.append(time_bins[t_idx])
     return np.array(spike_times)
+
 
 # %%
 # Compute phase-locking statistics for each neuron
@@ -150,12 +152,14 @@ for n in range(n_neurons):
 
     if len(spike_times_n) < 10:
         # Skip neurons with too few spikes
-        phase_locking_results.append({
-            "preferred_phase": np.nan,
-            "mrl": np.nan,
-            "p_value": np.nan,
-            "n_spikes": len(spike_times_n),
-        })
+        phase_locking_results.append(
+            {
+                "preferred_phase": np.nan,
+                "mrl": np.nan,
+                "p_value": np.nan,
+                "n_spikes": len(spike_times_n),
+            }
+        )
         continue
 
     # Compute preferred phase during theta-on periods
@@ -166,15 +170,19 @@ for n in range(n_neurons):
         mask=theta_on_mask,
     )
 
-    phase_locking_results.append({
-        "preferred_phase": pref_phase,
-        "mrl": mrl,
-        "p_value": p_val,
-        "n_spikes": len(spike_times_n),
-    })
+    phase_locking_results.append(
+        {
+            "preferred_phase": pref_phase,
+            "mrl": mrl,
+            "p_value": p_val,
+            "n_spikes": len(spike_times_n),
+        }
+    )
 
 # Convert to arrays
-empirical_preferred_phases = np.array([r["preferred_phase"] for r in phase_locking_results])
+empirical_preferred_phases = np.array(
+    [r["preferred_phase"] for r in phase_locking_results]
+)
 empirical_mrl = np.array([r["mrl"] for r in phase_locking_results])
 empirical_p_values = np.array([r["p_value"] for r in phase_locking_results])
 n_spikes_per_neuron = np.array([r["n_spikes"] for r in phase_locking_results])
@@ -189,7 +197,9 @@ n_significant = np.sum(empirical_p_values[valid_mask] < 0.05)
 
 print("\nPhase-locking summary:")
 print(f"  Valid neurons (>10 spikes): {n_valid}/{n_neurons}")
-print(f"  Significantly phase-locked (p < 0.05): {n_significant} ({100*n_significant/n_valid:.1f}%)")
+print(
+    f"  Significantly phase-locked (p < 0.05): {n_significant} ({100 * n_significant / n_valid:.1f}%)"
+)
 print(f"  Mean MRL: {np.nanmean(empirical_mrl):.3f}")
 print(f"  Max MRL: {np.nanmax(empirical_mrl):.3f}")
 
@@ -203,7 +213,12 @@ fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 # MRL distribution
 ax = axes[0, 0]
 ax.hist(empirical_mrl[valid_mask], bins=30, alpha=0.7, edgecolor="black")
-ax.axvline(np.nanmean(empirical_mrl), color="red", linestyle="--", label=f"Mean = {np.nanmean(empirical_mrl):.3f}")
+ax.axvline(
+    np.nanmean(empirical_mrl),
+    color="red",
+    linestyle="--",
+    label=f"Mean = {np.nanmean(empirical_mrl):.3f}",
+)
 ax.set_xlabel("Mean Resultant Length (MRL)")
 ax.set_ylabel("Count")
 ax.set_title("Phase-Locking Strength Distribution")
@@ -276,8 +291,7 @@ plt.colorbar(ax.collections[0], ax=ax, label="MRL")
 # Circular correlation
 if np.sum(mask) > 5:
     circ_corr = circular_correlation(
-        model_preferred_phases[mask],
-        empirical_preferred_phases[mask]
+        model_preferred_phases[mask], empirical_preferred_phases[mask]
     )
     print(f"Circular correlation (model vs empirical phases): {circ_corr:.3f}")
 else:
@@ -285,7 +299,9 @@ else:
 
 # Phase difference distribution
 ax = axes[1]
-phase_diff = np.angle(np.exp(1j * (empirical_preferred_phases[mask] - model_preferred_phases[mask])))
+phase_diff = np.angle(
+    np.exp(1j * (empirical_preferred_phases[mask] - model_preferred_phases[mask]))
+)
 ax.hist(phase_diff, bins=36, alpha=0.7, edgecolor="black")
 ax.axvline(0, color="red", linestyle="--", alpha=0.5)
 ax.set_xlabel("Phase Difference (empirical - model)")
@@ -311,11 +327,16 @@ ax.grid(True, alpha=0.3)
 
 # Correlation
 mod_mrl_corr = pearsonr(
-    model_modulation_strength[valid_mask],
-    empirical_mrl[valid_mask]
+    model_modulation_strength[valid_mask], empirical_mrl[valid_mask]
 )[0]
-ax.text(0.05, 0.95, f"r = {mod_mrl_corr:.3f}", transform=ax.transAxes, fontsize=10,
-        verticalalignment='top')
+ax.text(
+    0.05,
+    0.95,
+    f"r = {mod_mrl_corr:.3f}",
+    transform=ax.transAxes,
+    fontsize=10,
+    verticalalignment="top",
+)
 
 plt.tight_layout()
 plt.savefig("ca1_phase_model_comparison.png", dpi=150, bbox_inches="tight")
@@ -419,8 +440,18 @@ fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 # Histograms
 ax = axes[0]
 valid = ~np.isnan(mrl_theta_on) & ~np.isnan(mrl_theta_off)
-ax.hist(mrl_theta_on[valid], bins=30, alpha=0.5, label=f"Theta-on (mean={np.nanmean(mrl_theta_on):.3f})")
-ax.hist(mrl_theta_off[valid], bins=30, alpha=0.5, label=f"Theta-off (mean={np.nanmean(mrl_theta_off):.3f})")
+ax.hist(
+    mrl_theta_on[valid],
+    bins=30,
+    alpha=0.5,
+    label=f"Theta-on (mean={np.nanmean(mrl_theta_on):.3f})",
+)
+ax.hist(
+    mrl_theta_off[valid],
+    bins=30,
+    alpha=0.5,
+    label=f"Theta-off (mean={np.nanmean(mrl_theta_off):.3f})",
+)
 ax.set_xlabel("Mean Resultant Length")
 ax.set_ylabel("Count")
 ax.set_title("Phase-Locking: Theta-On vs Theta-Off")
@@ -450,6 +481,7 @@ print(f"  Ratio: {np.nanmean(mrl_theta_on) / np.nanmean(mrl_theta_off):.2f}x")
 
 # Paired test
 from scipy.stats import wilcoxon
+
 valid_paired = valid & (mrl_theta_on > 0) & (mrl_theta_off > 0)
 if np.sum(valid_paired) > 10:
     stat, p_wilcoxon = wilcoxon(mrl_theta_on[valid_paired], mrl_theta_off[valid_paired])
@@ -470,8 +502,19 @@ sig_mask = valid_mask & (empirical_p_values < 0.05)
 for n in np.where(sig_mask)[0]:
     phase = empirical_preferred_phases[n]
     mrl = empirical_mrl[n]
-    ax.arrow(phase, 0, 0, mrl, alpha=0.5, width=0.05, length_includes_head=True,
-             head_width=0.1, head_length=0.02, fc="C0", ec="C0")
+    ax.arrow(
+        phase,
+        0,
+        0,
+        mrl,
+        alpha=0.5,
+        width=0.05,
+        length_includes_head=True,
+        head_width=0.1,
+        head_length=0.02,
+        fc="C0",
+        ec="C0",
+    )
 
 ax.set_title(f"Preferred Phases (n={np.sum(sig_mask)} significant neurons)")
 ax.set_rticks([0.1, 0.2, 0.3])
@@ -514,12 +557,14 @@ time_in_phase = np.zeros(n_phase_bins)
 
 for i in range(n_phase_bins):
     phase_mask = (
-        (inferred_phase >= phase_bin_edges[i]) &
-        (inferred_phase < phase_bin_edges[i + 1]) &
-        theta_on_mask
+        (inferred_phase >= phase_bin_edges[i])
+        & (inferred_phase < phase_bin_edges[i + 1])
+        & theta_on_mask
     )
     if np.sum(phase_mask) > 0:
-        pop_rate_by_phase[i] = np.sum(spikes_subset[phase_mask, :]) / (np.sum(phase_mask) * dt)
+        pop_rate_by_phase[i] = np.sum(spikes_subset[phase_mask, :]) / (
+            np.sum(phase_mask) * dt
+        )
         time_in_phase[i] = np.sum(phase_mask) * dt
 
 # Normalize by time in each phase bin
@@ -531,7 +576,12 @@ fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
 # Bar plot
 ax = axes[0]
-ax.bar(phase_bin_centers, pop_rate_by_phase_normalized, width=2*np.pi/n_phase_bins, alpha=0.7)
+ax.bar(
+    phase_bin_centers,
+    pop_rate_by_phase_normalized,
+    width=2 * np.pi / n_phase_bins,
+    alpha=0.7,
+)
 ax.set_xlabel("Theta Phase (rad)")
 ax.set_ylabel("Population Firing Rate (Hz/neuron)")
 ax.set_title("Population Firing Rate by Theta Phase")
@@ -542,7 +592,9 @@ ax.grid(True, alpha=0.3)
 ax = plt.subplot(1, 2, 2, projection="polar")
 # Extend data for wrapping
 phases_extended = np.concatenate([phase_bin_centers, [phase_bin_centers[0]]])
-rates_extended = np.concatenate([pop_rate_by_phase_normalized, [pop_rate_by_phase_normalized[0]]])
+rates_extended = np.concatenate(
+    [pop_rate_by_phase_normalized, [pop_rate_by_phase_normalized[0]]]
+)
 ax.fill(phases_extended, rates_extended, alpha=0.5)
 ax.plot(phases_extended, rates_extended, "b-", linewidth=2)
 ax.set_title("Population Firing Rate\nby Theta Phase")
@@ -552,7 +604,9 @@ plt.savefig("ca1_population_rate_by_phase.png", dpi=150, bbox_inches="tight")
 plt.show()
 
 # Modulation depth
-mod_depth = (np.max(pop_rate_by_phase_normalized) - np.min(pop_rate_by_phase_normalized)) / np.mean(pop_rate_by_phase_normalized)
+mod_depth = (
+    np.max(pop_rate_by_phase_normalized) - np.min(pop_rate_by_phase_normalized)
+) / np.mean(pop_rate_by_phase_normalized)
 print(f"Population firing rate modulation depth: {mod_depth:.2f}")
 
 # %% [markdown]
@@ -565,7 +619,9 @@ print("=" * 60)
 
 print(f"\nNeurons analyzed: {n_neurons}")
 print(f"  Valid (>10 spikes): {n_valid}")
-print(f"  Significantly phase-locked (p<0.05): {n_significant} ({100*n_significant/n_valid:.1f}%)")
+print(
+    f"  Significantly phase-locked (p<0.05): {n_significant} ({100 * n_significant / n_valid:.1f}%)"
+)
 
 print(f"\nPhase-locking strength:")
 print(f"  Mean MRL: {np.nanmean(empirical_mrl):.3f}")

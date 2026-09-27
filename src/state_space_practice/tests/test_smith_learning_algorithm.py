@@ -967,9 +967,9 @@ class TestSummaryAndScoring:
         model = SmithLearningModel()
         model.fit(outcomes, max_iter=30)
         result = model.compare_to_null(outcomes)
-        assert (
-            result["model_ll"] > result["null_ll"]
-        ), "Learning model should have higher LL than null"
+        assert result["model_ll"] > result["null_ll"], (
+            "Learning model should have higher LL than null"
+        )
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_summary_returns_string(self) -> None:
@@ -1629,7 +1629,6 @@ class TestFindFirstSignificantTrial:
         assert result_lenient is not None
         assert result_strict is None
 
-
     @staticmethod
     def _reference_loop(matrix, reference_trial, significance_level):
         """The original per-trial loop, kept as the behavioural reference."""
@@ -2126,16 +2125,14 @@ class TestSmithLearningModelRecovery:
         model, _, _ = fitted
         early_prob = float(model.smoothed_prob_correct_response[0])
         assert early_prob < 0.3, (
-            f"Early smoothed probability {early_prob:.3f} >= 0.3 "
-            f"(true is ~0.125)"
+            f"Early smoothed probability {early_prob:.3f} >= 0.3 (true is ~0.125)"
         )
 
     def test_late_probability_above_chance(self, fitted):
         model, _, _ = fitted
         late_prob = float(model.smoothed_prob_correct_response[-1])
         assert late_prob > 0.4, (
-            f"Late smoothed probability {late_prob:.3f} <= 0.4 "
-            f"(true is ~0.6)"
+            f"Late smoothed probability {late_prob:.3f} <= 0.4 (true is ~0.6)"
         )
 
     def test_smoother_reduces_variance(self, fitted):
@@ -2164,7 +2161,9 @@ class TestSmithEMRollback:
             prob_correct_by_chance=0.5,
         )
         assert_em_rolls_back_on_ll_decrease(
-            model, (n_correct,), caplog,
+            model,
+            (n_correct,),
+            caplog,
         )
 
     def test_smith_em_rollback_restores_parameters(self, caplog) -> None:

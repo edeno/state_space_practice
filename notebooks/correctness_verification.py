@@ -41,8 +41,8 @@ from state_space_practice.switching_point_process import (
 n_time, n_neurons, n_latent, dt = 500, 4, 2, 0.01
 
 # Two very distinct emission rates
-baseline_0 = jnp.zeros(n_neurons)        # exp(0) = 1 Hz
-baseline_1 = jnp.ones(n_neurons) * 3.4   # exp(3.4) ≈ 30 Hz
+baseline_0 = jnp.zeros(n_neurons)  # exp(0) = 1 Hz
+baseline_1 = jnp.ones(n_neurons) * 3.4  # exp(3.4) ≈ 30 Hz
 weights = jnp.zeros((n_neurons, n_latent))
 
 spike_params = SpikeObsParams(
@@ -51,10 +51,14 @@ spike_params = SpikeObsParams(
 )
 
 # Known discrete state sequence: 125-step blocks
-true_disc = np.concatenate([
-    np.zeros(125, dtype=int), np.ones(125, dtype=int),
-    np.zeros(125, dtype=int), np.ones(125, dtype=int),
-])
+true_disc = np.concatenate(
+    [
+        np.zeros(125, dtype=int),
+        np.ones(125, dtype=int),
+        np.zeros(125, dtype=int),
+        np.ones(125, dtype=int),
+    ]
+)
 
 rates_0 = jnp.exp(baseline_0) * dt
 rates_1 = jnp.exp(baseline_1) * dt
@@ -76,9 +80,7 @@ for t in range(1, n_time):
     for j in range(2):
         r = rates_0 if j == 0 else rates_1
         obs_ll = float(jnp.sum(jax.scipy.stats.poisson.logpmf(spikes[t], r)))
-        log_trans = [
-            log_alpha[t - 1, i] + np.log(float(Z[i, j])) for i in range(2)
-        ]
+        log_trans = [log_alpha[t - 1, i] + np.log(float(Z[i, j])) for i in range(2)]
         log_alpha[t, j] = obs_ll + np.logaddexp(log_trans[0], log_trans[1])
 
 true_marginal_ll = float(np.logaddexp(log_alpha[-1, 0], log_alpha[-1, 1]))
@@ -95,9 +97,11 @@ for t in range(n_time):
     hmm_filter_prob[t, 0] = np.exp(log_alpha[t, 0] - log_norm)
     hmm_filter_prob[t, 1] = np.exp(log_alpha[t, 1] - log_norm)
 
+
 # Run switching point-process filter
 def log_intensity_func(state, params):
     return params.baseline + params.weights @ state
+
 
 init_mean = jnp.zeros((n_latent, 2))
 init_cov = jnp.stack([jnp.eye(n_latent) * 1e-10] * 2, axis=-1)
@@ -105,15 +109,27 @@ A = jnp.stack([jnp.eye(n_latent)] * 2, axis=-1)
 Q = jnp.stack([jnp.eye(n_latent) * 1e-10] * 2, axis=-1)
 
 fm, fc, fp, _, _, _, filter_ll = switching_point_process_filter(
-    init_mean, init_cov, jnp.array([0.5, 0.5]), spikes,
-    Z, A, Q, dt, log_intensity_func, spike_params,
+    init_mean,
+    init_cov,
+    jnp.array([0.5, 0.5]),
+    spikes,
+    Z,
+    A,
+    Q,
+    dt,
+    log_intensity_func,
+    spike_params,
     include_laplace_normalization=False,
 )
 
 # Smoother
 (_, _, sdsp, _, _, scsm, _, _, _) = switching_kalman_smoother(
-    filter_mean=fm, filter_cov=fc, filter_discrete_state_prob=fp, process_cov=Q,
-    continuous_transition_matrix=A, discrete_state_transition_matrix=Z,
+    filter_mean=fm,
+    filter_cov=fc,
+    filter_discrete_state_prob=fp,
+    process_cov=Q,
+    continuous_transition_matrix=A,
+    discrete_state_transition_matrix=Z,
 )
 
 filter_prob = np.array(fp)
@@ -185,9 +201,14 @@ print(f"Difference:      {abs(float(filter_ll) - true_marginal_ll):.6f}")
 true_state = jnp.array([0.5, -0.3])
 
 baseline_single = jnp.array([1.0, 2.0, 1.5, 2.5])
-weights_single = jnp.array([
-    [0.5, 0.3], [-0.2, 0.4], [0.1, -0.5], [0.3, 0.2],
-])
+weights_single = jnp.array(
+    [
+        [0.5, 0.3],
+        [-0.2, 0.4],
+        [0.1, -0.5],
+        [0.3, 0.2],
+    ]
+)
 spike_params_single = SpikeObsParams(baseline=baseline_single, weights=weights_single)
 
 true_log_rates = baseline_single + weights_single @ true_state
@@ -195,14 +216,15 @@ true_rates_single = jnp.exp(true_log_rates) * dt
 
 n_time_single = 1000
 spikes_single = jax.random.poisson(
-    jax.random.PRNGKey(42), true_rates_single[None, :],
+    jax.random.PRNGKey(42),
+    true_rates_single[None, :],
     shape=(n_time_single, n_neurons),
 ).astype(float)
 
 # True LL
-true_ll_single = float(jnp.sum(
-    jax.scipy.stats.poisson.logpmf(spikes_single, true_rates_single[None, :])
-))
+true_ll_single = float(
+    jnp.sum(jax.scipy.stats.poisson.logpmf(spikes_single, true_rates_single[None, :]))
+)
 
 # Run filter at true state
 init_mean_s = true_state[:, None]
@@ -211,16 +233,26 @@ A_s = jnp.eye(n_latent)[..., None]
 Q_s = jnp.eye(n_latent)[..., None] * 1e-10
 
 fm_s, fc_s, _, _, _, _, filter_ll_s = switching_point_process_filter(
-    init_mean_s, init_cov_s, jnp.array([1.0]), spikes_single,
-    jnp.array([[1.0]]), A_s, Q_s, dt, log_intensity_func, spike_params_single,
+    init_mean_s,
+    init_cov_s,
+    jnp.array([1.0]),
+    spikes_single,
+    jnp.array([[1.0]]),
+    A_s,
+    Q_s,
+    dt,
+    log_intensity_func,
+    spike_params_single,
     include_laplace_normalization=False,
 )
 
 # Per-timestep LL comparison
-per_step_true_ll = np.array(jnp.sum(
-    jax.scipy.stats.poisson.logpmf(spikes_single, true_rates_single[None, :]),
-    axis=1,
-))
+per_step_true_ll = np.array(
+    jnp.sum(
+        jax.scipy.stats.poisson.logpmf(spikes_single, true_rates_single[None, :]),
+        axis=1,
+    )
+)
 cumulative_true_ll = np.cumsum(per_step_true_ll)
 
 fig, axes = plt.subplots(3, 1, figsize=(12, 8))
@@ -239,11 +271,13 @@ ax.legend()
 # Panel 2: Spike rates
 ax = axes[1]
 for n in range(n_neurons):
-    empirical_rate = np.convolve(
-        np.array(spikes_single[:, n]), np.ones(50) / 50, mode="same"
-    ) / dt
+    empirical_rate = (
+        np.convolve(np.array(spikes_single[:, n]), np.ones(50) / 50, mode="same") / dt
+    )
     ax.plot(empirical_rate, alpha=0.4, label=f"Neuron {n}" if n < 2 else None)
-    ax.axhline(float(jnp.exp(true_log_rates[n])), color=f"C{n}", linestyle="--", alpha=0.5)
+    ax.axhline(
+        float(jnp.exp(true_log_rates[n])), color=f"C{n}", linestyle="--", alpha=0.5
+    )
 ax.set_ylabel("Rate (Hz)")
 ax.set_title("Observed spike rates vs true rates (dashed)")
 ax.legend()
@@ -251,12 +285,15 @@ ax.legend()
 # Panel 3: LL comparison
 ax = axes[2]
 ax.text(
-    0.5, 0.5,
+    0.5,
+    0.5,
     f"Filter LL = {float(filter_ll_s):.4f}\n"
     f"True LL   = {true_ll_single:.4f}\n"
     f"Difference = {abs(float(filter_ll_s) - true_ll_single):.6f}\n\n"
     f"Filter mean error = {float(jnp.max(jnp.abs(fm_s[:, :, 0] - true_state))):.2e}",
-    transform=ax.transAxes, fontsize=14, verticalalignment="center",
+    transform=ax.transAxes,
+    fontsize=14,
+    verticalalignment="center",
     horizontalalignment="center",
     bbox=dict(boxstyle="round", facecolor="lightgreen", alpha=0.8),
 )
@@ -293,20 +330,30 @@ W_true = jax.random.normal(k_w, (n_neurons_r, n_latent_r)) * 0.8
 b_true = jnp.ones(n_neurons_r) * 3.0
 
 spikes_r, true_states_r, true_disc_r = simulate_switching_spike_oscillator(
-    n_time=n_time_r, transition_matrices=A_true, process_covs=Q_true,
-    discrete_transition_matrix=Z_true, spike_weights=W_true,
-    spike_baseline=b_true, dt=dt_r, key=k_s,
+    n_time=n_time_r,
+    transition_matrices=A_true,
+    process_covs=Q_true,
+    discrete_transition_matrix=Z_true,
+    spike_weights=W_true,
+    spike_baseline=b_true,
+    dt=dt_r,
+    key=k_s,
 )
 
 # Fit with warm start
 model_r = SwitchingSpikeOscillatorModel(
-    n_oscillators=1, n_neurons=n_neurons_r, n_discrete_states=2,
-    sampling_freq=100.0, dt=dt_r,
+    n_oscillators=1,
+    n_neurons=n_neurons_r,
+    n_discrete_states=2,
+    sampling_freq=100.0,
+    dt=dt_r,
     q_regularization=QRegularizationConfig(enabled=False),
     separate_spike_params=False,
 )
 model_r._initialize_parameters(jax.random.PRNGKey(0))
-model_r.continuous_transition_matrix = A_true + jax.random.normal(k_fit, A_true.shape) * 0.05
+model_r.continuous_transition_matrix = (
+    A_true + jax.random.normal(k_fit, A_true.shape) * 0.05
+)
 model_r.process_cov = Q_true + jnp.abs(jax.random.normal(k_fit, Q_true.shape)) * 0.01
 model_r.discrete_transition_matrix = Z_true
 model_r.spike_params = SpikeObsParams(
@@ -317,14 +364,18 @@ model_r.spike_params = SpikeObsParams(
 lls_r = model_r.fit(spikes_r, max_iter=30, skip_init=True)
 
 prob_r = np.array(model_r.smoother_discrete_state_prob)
-corr_r = [np.corrcoef(np.array(true_disc_r, float), prob_r[:, j])[0, 1] for j in range(2)]
+corr_r = [
+    np.corrcoef(np.array(true_disc_r, float), prob_r[:, j])[0, 1] for j in range(2)
+]
 best_j = np.argmax(np.abs(corr_r))
 state1_label = best_j if corr_r[best_j] > 0 else 1 - best_j
 
 sr_fitted = [
-    float(jnp.max(jnp.abs(jnp.linalg.eigvals(
-        model_r.continuous_transition_matrix[:, :, j]
-    ))))
+    float(
+        jnp.max(
+            jnp.abs(jnp.linalg.eigvals(model_r.continuous_transition_matrix[:, :, j]))
+        )
+    )
     for j in range(2)
 ]
 
@@ -340,8 +391,14 @@ ax.set_title(f"EM convergence (improvement = {lls_r[-1] - lls_r[0]:.1f})")
 
 # Panel 2: True vs inferred discrete states
 ax = axes[1]
-ax.fill_between(range(n_time_r), 0, np.array(true_disc_r), alpha=0.2, color="C1",
-                label="True state 1")
+ax.fill_between(
+    range(n_time_r),
+    0,
+    np.array(true_disc_r),
+    alpha=0.2,
+    color="C1",
+    label="True state 1",
+)
 ax.plot(prob_r[:, state1_label], alpha=0.7, label=f"P(S={state1_label} | y)")
 ax.set_ylabel("P(high-persistence state)")
 ax.set_title(f"Discrete state recovery (|corr| = {max(np.abs(corr_r)):.3f})")
@@ -350,11 +407,13 @@ ax.set_ylim(-0.05, 1.05)
 
 # Panel 3: True vs smoothed latent state (first dimension)
 ax = axes[2]
-smoother_mean_r = np.array(jnp.einsum(
-    "tls,ts->tl",
-    model_r.smoother_state_cond_mean,
-    model_r.smoother_discrete_state_prob,
-))
+smoother_mean_r = np.array(
+    jnp.einsum(
+        "tls,ts->tl",
+        model_r.smoother_state_cond_mean,
+        model_r.smoother_discrete_state_prob,
+    )
+)
 ax.plot(np.array(true_states_r[:, 0]), alpha=0.4, label="True x[0]")
 ax.plot(smoother_mean_r[:, 0], alpha=0.7, label="Smoothed x[0]")
 ax.set_ylabel("Latent state")
@@ -366,19 +425,28 @@ ax = axes[3]
 Z_fit = model_r.discrete_transition_matrix
 text = (
     f"Spectral radii:  true = [0.50, 0.98],  fitted = [{min(sr_fitted):.3f}, {max(sr_fitted):.3f}]\n"
-    f"Z diagonal:      true = [0.98, 0.98],  fitted = [{float(Z_fit[0,0]):.3f}, {float(Z_fit[1,1]):.3f}]\n"
+    f"Z diagonal:      true = [0.98, 0.98],  fitted = [{float(Z_fit[0, 0]):.3f}, {float(Z_fit[1, 1]):.3f}]\n"
     f"Baseline error:  {float(jnp.max(jnp.abs(model_r.spike_params.baseline - b_true))):.3f} "
     f"(true baseline = {float(b_true[0]):.1f})\n"
     f"Weights MAE:     {float(jnp.mean(jnp.abs(model_r.spike_params.weights - W_true))):.3f}"
 )
-ax.text(0.05, 0.5, text, transform=ax.transAxes, fontsize=12,
-        verticalalignment="center", fontfamily="monospace",
-        bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
+ax.text(
+    0.05,
+    0.5,
+    text,
+    transform=ax.transAxes,
+    fontsize=12,
+    verticalalignment="center",
+    fontfamily="monospace",
+    bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8),
+)
 ax.set_axis_off()
 ax.set_title("Parameter recovery (warm-started near truth)")
 
 plt.tight_layout()
-plt.savefig(output_dir / "correctness_3_parameter_recovery.png", dpi=150, bbox_inches="tight")
+plt.savefig(
+    output_dir / "correctness_3_parameter_recovery.png", dpi=150, bbox_inches="tight"
+)
 plt.show()
 
 # %% [markdown]
@@ -391,12 +459,16 @@ plt.show()
 n_time_d = 500
 n_neurons_d = 5
 
-true_disc_d = np.concatenate([
-    np.zeros(125, dtype=int), np.ones(125, dtype=int),
-    np.zeros(125, dtype=int), np.ones(125, dtype=int),
-])
+true_disc_d = np.concatenate(
+    [
+        np.zeros(125, dtype=int),
+        np.ones(125, dtype=int),
+        np.zeros(125, dtype=int),
+        np.ones(125, dtype=int),
+    ]
+)
 
-low_rate = 1.0 * 0.01   # 1 Hz
+low_rate = 1.0 * 0.01  # 1 Hz
 high_rate = 30.0 * 0.01  # 30 Hz
 rates_d = np.where(
     true_disc_d[:, None] == 0,
@@ -404,13 +476,14 @@ rates_d = np.where(
     high_rate * np.ones((n_time_d, n_neurons_d)),
 )
 
-spikes_d = jax.random.poisson(
-    jax.random.PRNGKey(7), jnp.array(rates_d)
-).astype(float)
+spikes_d = jax.random.poisson(jax.random.PRNGKey(7), jnp.array(rates_d)).astype(float)
 
 model_d = SwitchingSpikeOscillatorModel(
-    n_oscillators=1, n_neurons=n_neurons_d, n_discrete_states=2,
-    sampling_freq=100.0, dt=0.01,
+    n_oscillators=1,
+    n_neurons=n_neurons_d,
+    n_discrete_states=2,
+    sampling_freq=100.0,
+    dt=0.01,
     q_regularization=QRegularizationConfig(),
     separate_spike_params=True,
     update_continuous_transition_matrix=False,
@@ -446,10 +519,10 @@ ax.set_title("Total spikes per bin (orange = high-rate state)")
 
 # Panel 2: Inferred states
 ax = axes[1]
-ax.fill_between(range(n_time_d), 0, true_disc_d, alpha=0.2, color="C1",
-                label="True high-rate state")
-ax.plot(prob_d[:, high_state], color="C0", alpha=0.8,
-        label=f"P(high-rate | y)")
+ax.fill_between(
+    range(n_time_d), 0, true_disc_d, alpha=0.2, color="C1", label="True high-rate state"
+)
+ax.plot(prob_d[:, high_state], color="C0", alpha=0.8, label=f"P(high-rate | y)")
 ax.set_ylabel("Probability")
 ax.set_title(f"State recovery (|corr| = {max(np.abs(corr_d)):.3f})")
 ax.legend()
@@ -463,12 +536,16 @@ ax.set_xlabel("Time step")
 ax.set_title(f"EM convergence ({len(lls_d)} iterations)")
 
 plt.tight_layout()
-plt.savefig(output_dir / "correctness_4_state_segmentation.png", dpi=150, bbox_inches="tight")
+plt.savefig(
+    output_dir / "correctness_4_state_segmentation.png", dpi=150, bbox_inches="tight"
+)
 plt.show()
 
 print(f"State recovery |corr|: {max(np.abs(corr_d)):.3f}")
 b_fitted = np.array(model_d.spike_params.baseline)
-print(f"Fitted baselines: state 0 mean = {b_fitted[:, 1-high_state].mean():.2f} "
-      f"(true ≈ {np.log(1.0):.2f}), "
-      f"state 1 mean = {b_fitted[:, high_state].mean():.2f} "
-      f"(true ≈ {np.log(30.0):.2f})")
+print(
+    f"Fitted baselines: state 0 mean = {b_fitted[:, 1 - high_state].mean():.2f} "
+    f"(true ≈ {np.log(1.0):.2f}), "
+    f"state 1 mean = {b_fitted[:, high_state].mean():.2f} "
+    f"(true ≈ {np.log(30.0):.2f})"
+)

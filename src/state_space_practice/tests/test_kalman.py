@@ -562,9 +562,9 @@ class TestKalmanFilterProperties:
         # Check each covariance matrix is positive definite
         for t in range(n_time):
             eigenvalues = jnp.linalg.eigvalsh(filter_cov[t])
-            assert jnp.all(
-                eigenvalues > -1e-8
-            ), f"Non-PD covariance at t={t}: {eigenvalues}"
+            assert jnp.all(eigenvalues > -1e-8), (
+                f"Non-PD covariance at t={t}: {eigenvalues}"
+            )
 
     @given(kalman_model_params(n_cont_states=2, n_obs_dim=2))
     @settings(max_examples=20, deadline=None)
@@ -639,9 +639,9 @@ class TestKalmanSmootherProperties:
         for t in range(n_time):
             eigenvalues = jnp.linalg.eigvalsh(smoother_cov[t])
             # Allow small negative eigenvalues due to numerical precision
-            assert jnp.all(
-                eigenvalues > -1e-6
-            ), f"Non-PD smoother covariance at t={t}: {eigenvalues}"
+            assert jnp.all(eigenvalues > -1e-6), (
+                f"Non-PD smoother covariance at t={t}: {eigenvalues}"
+            )
 
     @given(kalman_model_params(n_cont_states=2, n_obs_dim=2))
     @settings(max_examples=20, deadline=None)
@@ -732,15 +732,15 @@ class TestKalmanMaximizationStepProperties:
 
         # Check Q is positive definite
         Q_eigenvalues = jnp.linalg.eigvalsh(Q_est)
-        assert jnp.all(
-            Q_eigenvalues > -1e-6
-        ), f"Q not PD: eigenvalues = {Q_eigenvalues}"
+        assert jnp.all(Q_eigenvalues > -1e-6), (
+            f"Q not PD: eigenvalues = {Q_eigenvalues}"
+        )
 
         # Check R is positive definite
         R_eigenvalues = jnp.linalg.eigvalsh(R_est)
-        assert jnp.all(
-            R_eigenvalues > -1e-6
-        ), f"R not PD: eigenvalues = {R_eigenvalues}"
+        assert jnp.all(R_eigenvalues > -1e-6), (
+            f"R not PD: eigenvalues = {R_eigenvalues}"
+        )
 
     @given(kalman_model_params(n_cont_states=2, n_obs_dim=2))
     @settings(max_examples=20, deadline=None)
@@ -1405,7 +1405,7 @@ class TestKalmanEMMonotonicity:
         for i in range(1, len(log_likelihoods)):
             assert log_likelihoods[i] >= log_likelihoods[i - 1] - 1e-6, (
                 f"EM monotonicity violated: LL[{i}]={log_likelihoods[i]:.6f} "
-                f"< LL[{i-1}]={log_likelihoods[i-1]:.6f}"
+                f"< LL[{i - 1}]={log_likelihoods[i - 1]:.6f}"
             )
 
 
@@ -1477,9 +1477,9 @@ class TestKalmanNumericalStability:
             eigvals = jnp.linalg.eigvalsh(filtered_cov[t])
             assert jnp.all(eigvals > -1e-8), f"Cov not PSD at t={t}"
 
-        assert (
-            filtered_cov[-1, 2, 2] > filtered_cov[-1, 0, 0]
-        ), "Unobserved state should have larger uncertainty"
+        assert filtered_cov[-1, 2, 2] > filtered_cov[-1, 0, 0], (
+            "Unobserved state should have larger uncertainty"
+        )
 
     def test_filter_nearly_unstable_dynamics(self) -> None:
         """Spectral radius near 1: filter should stay finite for 500 steps."""
@@ -1531,9 +1531,7 @@ class TestParallelKalmanSmoother:
         )
 
         # Parallel: first run filter, then parallel smoother
-        filt_mean, filt_cov, _ = kalman_filter(
-            init_mean, init_cov, obs, A, Q, H, R
-        )
+        filt_mean, filt_cov, _ = kalman_filter(init_mean, init_cov, obs, A, Q, H, R)
         par_mean, par_cov, par_cross = parallel_kalman_smoother(
             filt_mean, filt_cov, A, Q
         )
@@ -1595,9 +1593,7 @@ class TestParallelKalmanSmoother:
         )
 
         # Get parallel answer
-        filt_mean, filt_cov, _ = kalman_filter(
-            init_mean, init_cov, obs, A, Q, H, R
-        )
+        filt_mean, filt_cov, _ = kalman_filter(init_mean, init_cov, obs, A, Q, H, R)
         par_mean, par_cov, par_cross = parallel_kalman_smoother(
             filt_mean, filt_cov, A, Q
         )
@@ -1727,9 +1723,7 @@ class TestParallelKalmanSmoother:
         init_cov = jnp.eye(D)
 
         obs = random.normal(key, (T, D))
-        filt_mean, filt_cov, _ = kalman_filter(
-            init_mean, init_cov, obs, A, Q, H, R
-        )
+        filt_mean, filt_cov, _ = kalman_filter(init_mean, init_cov, obs, A, Q, H, R)
         _, sc, _ = parallel_kalman_smoother(filt_mean, filt_cov, A, Q)
 
         for t in range(T):
@@ -2013,7 +2007,13 @@ class TestKalmanInputValidation:
         init_mean, _, obs, A, Q, H, R = self._well_posed_args()
         bad_init_cov = jnp.zeros((2, 2))
         filtered_mean, filtered_cov, mll = kalman_filter(
-            init_mean, bad_init_cov, obs, A, Q, H, R,
+            init_mean,
+            bad_init_cov,
+            obs,
+            A,
+            Q,
+            H,
+            R,
             validate_inputs=False,
         )
         # We don't require NaN specifically (dtype / environment dependent),
@@ -2026,9 +2026,7 @@ class TestKalmanInputValidation:
         init_mean, init_cov, obs, A, Q, H, R = self._well_posed_args()
         filtered_mean, _, _ = kalman_filter(init_mean, init_cov, obs, A, Q, H, R)
         assert filtered_mean.shape == obs.shape
-        smoother_mean, _, _, _ = kalman_smoother(
-            init_mean, init_cov, obs, A, Q, H, R
-        )
+        smoother_mean, _, _, _ = kalman_smoother(init_mean, init_cov, obs, A, Q, H, R)
         assert smoother_mean.shape == obs.shape
 
 
@@ -2075,7 +2073,9 @@ def test_smoother_time_varying_R_matches_constant_when_all_equal():
 
     np.testing.assert_allclose(np.asarray(sm1), np.asarray(sm0), rtol=1e-10, atol=1e-12)
     np.testing.assert_allclose(np.asarray(sc1), np.asarray(sc0), rtol=1e-10, atol=1e-12)
-    np.testing.assert_allclose(np.asarray(scc1), np.asarray(scc0), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(
+        np.asarray(scc1), np.asarray(scc0), rtol=1e-10, atol=1e-12
+    )
     np.testing.assert_allclose(float(ll1), float(ll0), rtol=1e-10)
 
 
@@ -2250,8 +2250,14 @@ class TestInitialStateMStep:
         A_true = _make_asymmetric_stable_A(2, seed=15)
         H_true = jnp.array([[1.0, 0.3], [-0.2, 0.9]])
         obs, _ = _simulate_from_model(
-            A_true, jnp.eye(2) * 0.2, H_true, jnp.eye(2) * 0.5,
-            jnp.zeros(2), jnp.eye(2), 200, seed=42,
+            A_true,
+            jnp.eye(2) * 0.2,
+            H_true,
+            jnp.eye(2) * 0.5,
+            jnp.zeros(2),
+            jnp.eye(2),
+            200,
+            seed=42,
         )
         A, Q, H, R = jnp.eye(2) * 0.5, jnp.eye(2), jnp.eye(2), jnp.eye(2) * 2.0
         m0, P0 = jnp.ones(2) * 3.0, jnp.eye(2) * 2.0
@@ -2274,9 +2280,7 @@ class TestResidualFormMStep:
         Q = jnp.eye(3) * 0.2
         H = jnp.array([[1.0, 0.5, 0.0], [0.0, 1.0, 0.3]])
         R = jnp.eye(2) * 0.5
-        obs, _ = _simulate_from_model(
-            A, Q, H, R, jnp.zeros(3), jnp.eye(3), 400, seed=3
-        )
+        obs, _ = _simulate_from_model(A, Q, H, R, jnp.zeros(3), jnp.eye(3), 400, seed=3)
         sm, sc, scc, _ = kalman_smoother(jnp.zeros(3), jnp.eye(3), obs, A, Q, H, R)
         return obs, sm, sc, scc
 

@@ -64,7 +64,9 @@ bin_indices = np.searchsorted(time_bins, st) - 1
 bin_indices = bin_indices[(bin_indices >= 0) & (bin_indices < n_time)]
 np.add.at(spike_counts, bin_indices, 1)
 print(f"Total spikes: {int(spike_counts.sum())}")
-print(f"Bins with spikes: {(spike_counts > 0).sum()} ({100*(spike_counts > 0).mean():.1f}%)")
+print(
+    f"Bins with spikes: {(spike_counts > 0).sum()} ({100 * (spike_counts > 0).mean():.1f}%)"
+)
 
 # %%
 # --- Only use running epochs (speed > 5 cm/s) ---
@@ -97,12 +99,18 @@ spline_formula = (
     "   bs(y, knots=y_knots, lower_bound=y_lo, upper_bound=y_hi)) - 1"
 )
 spline_env = {
-    "x_knots": x_knots, "y_knots": y_knots,
-    "x_lo": x_lo, "x_hi": x_hi, "y_lo": y_lo, "y_hi": y_hi,
+    "x_knots": x_knots,
+    "y_knots": y_knots,
+    "x_lo": x_lo,
+    "x_hi": x_hi,
+    "y_lo": y_lo,
+    "y_hi": y_hi,
 }
 
 design_matrix = np.asarray(
-    dmatrix(spline_formula, {"x": pos_running[:, 0], "y": pos_running[:, 1], **spline_env})
+    dmatrix(
+        spline_formula, {"x": pos_running[:, 0], "y": pos_running[:, 1], **spline_env}
+    )
 )
 n_basis = design_matrix.shape[1]
 print(f"Design matrix: ({n_running}, {n_basis})")
@@ -154,7 +162,10 @@ xx, yy = np.meshgrid(x_grid, y_grid)
 grid_positions = np.column_stack([xx.ravel(), yy.ravel()])
 
 Z_grid = np.asarray(
-    dmatrix(spline_formula, {"x": grid_positions[:, 0], "y": grid_positions[:, 1], **spline_env})
+    dmatrix(
+        spline_formula,
+        {"x": grid_positions[:, 0], "y": grid_positions[:, 1], **spline_env},
+    )
 )
 
 # %%
@@ -198,7 +209,9 @@ for i, (label, sl) in enumerate(thirds):
 ci_vmax = max(c.max() for c in ci_grids)
 for i, (label, sl) in enumerate(thirds):
     ax = axes[1, i]
-    im = ax.pcolormesh(x_grid, y_grid, ci_grids[i], cmap="viridis", vmin=0, vmax=ci_vmax)
+    im = ax.pcolormesh(
+        x_grid, y_grid, ci_grids[i], cmap="viridis", vmin=0, vmax=ci_vmax
+    )
     ax.set_title(f"95% CI Width (log-rate) — {label}")
     ax.set_xlabel("x (cm)")
     if i == 0:

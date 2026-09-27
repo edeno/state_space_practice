@@ -459,7 +459,6 @@ def construct_correlated_noise_measurement_matrix(
     return measurement_matrix.at[row_indices, col_indices].set(1.0)
 
 
-
 def construct_directed_influence_transition_matrix(
     freqs: jax.Array,
     damping_coeffs: jax.Array,
@@ -541,10 +540,7 @@ def construct_directed_influence_transition_matrix(
 
     # 5. Reshape and transpose to final matrix form
     # (n1, n2, 2, 2) -> (n1, 2, n2, 2) -> (2 * n1, 2 * n2)
-    return all_blocks.swapaxes(1, 2).reshape(
-        2 * n_oscillators, 2 * n_oscillators
-    )
-
+    return all_blocks.swapaxes(1, 2).reshape(2 * n_oscillators, 2 * n_oscillators)
 
 
 def compute_directed_influence_stability_scale(
@@ -658,10 +654,7 @@ def construct_directed_influence_measurement_matrix(
     measurement_matrix = measurement_matrix.at[row_indices, col_indices_x].set(
         block_coefficient
     )
-    return measurement_matrix.at[row_indices, col_indices_y].set(
-        block_coefficient
-    )
-
+    return measurement_matrix.at[row_indices, col_indices_y].set(block_coefficient)
 
 
 def _get_scaling_factor(s: jax.Array, eps: float = 1e-12) -> jax.Array:

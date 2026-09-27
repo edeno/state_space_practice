@@ -727,6 +727,8 @@ class TemporalRateGP(SGDFittableMixin):
                 n_iter=self.n_iter,
                 min_weight=self.min_weight,
             )
-            self.log_marginal_likelihood_ = float(jnp.sum(result.log_marginal_likelihood))
+            self.log_marginal_likelihood_ = float(
+                jnp.sum(result.log_marginal_likelihood)
+            )
         self.log_rate_mean_ = result.log_rate_mean
         self.log_rate_var_ = result.log_rate_var

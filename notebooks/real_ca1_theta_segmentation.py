@@ -114,7 +114,9 @@ start_idx = best_idx * (window_size // 4)
 
 print(f"Selected window for fitting:")
 print(f"  Start index: {start_idx}")
-print(f"  Window size: {subset_samples} samples ({subset_samples / sampling_freq:.1f} s)")
+print(
+    f"  Window size: {subset_samples} samples ({subset_samples / sampling_freq:.1f} s)"
+)
 print(f"  Running fraction in window: {running_frac[best_idx]:.1%}")
 
 # Extract subset
@@ -187,9 +189,9 @@ theta_freq = jnp.array([8.0])  # Hz
 # State 0: theta-off (immobility-like) - more damped = oscillations decay faster
 # State 1: theta-on (running-like) - less damped = sustained oscillations
 damping_off = jnp.array([0.95])  # More damped (amplitude decays)
-damping_on = jnp.array([0.99])   # Less damped (sustained oscillations)
+damping_on = jnp.array([0.99])  # Less damped (sustained oscillations)
 var_off = jnp.array([0.01])  # Smaller Q
-var_on = jnp.array([0.02])   # Larger Q (keep ratio <= 2 for numerical stability)
+var_on = jnp.array([0.02])  # Larger Q (keep ratio <= 2 for numerical stability)
 
 # Build DIFFERENT transition matrices for each state
 A_off = construct_common_oscillator_transition_matrix(
@@ -240,24 +242,40 @@ p_immobile_to_running = (n_immobile_to_running + 1) / (n_immobile + 2)
 p_running_stay = (n_running_to_running + 1) / (n_running + 2)
 p_running_to_immobile = (n_running_to_immobile + 1) / (n_running + 2)
 
-model.discrete_transition_matrix = jnp.array([
-    [p_immobile_stay, p_immobile_to_running],  # From immobility (state 0)
-    [p_running_to_immobile, p_running_stay],   # From running (state 1)
-])
+model.discrete_transition_matrix = jnp.array(
+    [
+        [p_immobile_stay, p_immobile_to_running],  # From immobility (state 0)
+        [p_running_to_immobile, p_running_stay],  # From running (state 1)
+    ]
+)
 
 # Compute expected dwell times from empirical transitions
-dwell_immobile = 1 / (1 - p_immobile_stay) / sampling_freq if p_immobile_stay < 1 else float('inf')
-dwell_running = 1 / (1 - p_running_stay) / sampling_freq if p_running_stay < 1 else float('inf')
+dwell_immobile = (
+    1 / (1 - p_immobile_stay) / sampling_freq if p_immobile_stay < 1 else float("inf")
+)
+dwell_running = (
+    1 / (1 - p_running_stay) / sampling_freq if p_running_stay < 1 else float("inf")
+)
 
 print(f"\nTheta-specific initialization:")
 print(f"  Theta frequency: {float(theta_freq[0]):.1f} Hz")
-print(f"  State 0 (theta-off): damping={float(damping_off[0]):.2f}, var={float(var_off[0])}")
-print(f"  State 1 (theta-on):  damping={float(damping_on[0]):.2f}, var={float(var_on[0])}")
+print(
+    f"  State 0 (theta-off): damping={float(damping_off[0]):.2f}, var={float(var_off[0])}"
+)
+print(
+    f"  State 1 (theta-on):  damping={float(damping_on[0]):.2f}, var={float(var_on[0])}"
+)
 print(f"  Initial P(theta-on): {running_frac_init:.2f}")
 print(f"\nEmpirical discrete transition matrix:")
-print(f"  P(immobile->immobile): {p_immobile_stay:.4f}, P(immobile->running): {p_immobile_to_running:.4f}")
-print(f"  P(running->immobile):  {p_running_to_immobile:.4f}, P(running->running):  {p_running_stay:.4f}")
-print(f"  Expected dwell: immobility={dwell_immobile:.2f}s, running={dwell_running:.2f}s")
+print(
+    f"  P(immobile->immobile): {p_immobile_stay:.4f}, P(immobile->running): {p_immobile_to_running:.4f}"
+)
+print(
+    f"  P(running->immobile):  {p_running_to_immobile:.4f}, P(running->running):  {p_running_stay:.4f}"
+)
+print(
+    f"  Expected dwell: immobility={dwell_immobile:.2f}s, running={dwell_running:.2f}s"
+)
 
 # Verify spectral properties
 print("\nSpectral radius (stability):")
@@ -342,8 +360,12 @@ n_state_0 = int(jnp.sum(state_0_mask))
 n_state_1 = int(jnp.sum(state_1_mask))
 
 print(f"State occupancy:")
-print(f"  State 0: {n_state_0:,} samples ({100*n_state_0/len(inferred_states):.1f}%)")
-print(f"  State 1: {n_state_1:,} samples ({100*n_state_1/len(inferred_states):.1f}%)")
+print(
+    f"  State 0: {n_state_0:,} samples ({100 * n_state_0 / len(inferred_states):.1f}%)"
+)
+print(
+    f"  State 1: {n_state_1:,} samples ({100 * n_state_1 / len(inferred_states):.1f}%)"
+)
 
 amp_state_0 = float(jnp.mean(inferred_amplitude[state_0_mask])) if n_state_0 > 0 else 0
 amp_state_1 = float(jnp.mean(inferred_amplitude[state_1_mask])) if n_state_1 > 0 else 0
@@ -355,8 +377,12 @@ print(f"  State 1: {amp_state_1:.3f}")
 # Check correlation with running (only if both states have samples)
 running_mask = labels_subset == 1
 if n_state_0 > 0 and n_state_1 > 0:
-    corr_state_0 = float(jnp.corrcoef(state_0_mask.astype(float), running_mask.astype(float))[0, 1])
-    corr_state_1 = float(jnp.corrcoef(state_1_mask.astype(float), running_mask.astype(float))[0, 1])
+    corr_state_0 = float(
+        jnp.corrcoef(state_0_mask.astype(float), running_mask.astype(float))[0, 1]
+    )
+    corr_state_1 = float(
+        jnp.corrcoef(state_1_mask.astype(float), running_mask.astype(float))[0, 1]
+    )
     print(f"\nCorrelation with running:")
     print(f"  State 0: {corr_state_0:.3f}")
     print(f"  State 1: {corr_state_1:.3f}")
@@ -463,15 +489,19 @@ plt.show()
 
 # %%
 # Time axis relative to start
-t_rel = (time_subset - time_subset[0])
+t_rel = time_subset - time_subset[0]
 
 # Overview plot
 fig, axes = plt.subplots(5, 1, figsize=(14, 12), sharex=True)
 
 # Panel 1: Behavioral labels
 ax = axes[0]
-ax.fill_between(t_rel, 0, 1, where=labels_subset == 1, alpha=0.6, color="green", label="Running")
-ax.fill_between(t_rel, 0, 1, where=labels_subset == 0, alpha=0.6, color="blue", label="Immobility")
+ax.fill_between(
+    t_rel, 0, 1, where=labels_subset == 1, alpha=0.6, color="green", label="Running"
+)
+ax.fill_between(
+    t_rel, 0, 1, where=labels_subset == 0, alpha=0.6, color="blue", label="Immobility"
+)
 ax.set_ylabel("Behavior")
 ax.set_ylim(0, 1)
 ax.set_yticks([])
@@ -539,9 +569,9 @@ for trans_idx in transitions:
         continue
 
     # Check behavior before transition (look for sustained period)
-    before_labels = labels_subset[trans_idx - min_sustained_samples:trans_idx]
+    before_labels = labels_subset[trans_idx - min_sustained_samples : trans_idx]
     # Check behavior after transition
-    after_labels = labels_subset[trans_idx + 1:trans_idx + 1 + min_sustained_samples]
+    after_labels = labels_subset[trans_idx + 1 : trans_idx + 1 + min_sustained_samples]
 
     # We want: mostly one state before, mostly the other state after
     before_running_frac = np.mean(before_labels == 1)
@@ -554,7 +584,7 @@ for trans_idx in transitions:
     # Bonus for being very sustained (close to 0% or 100%)
     before_sustained = max(before_running_frac, 1 - before_running_frac)
     after_sustained = max(after_running_frac, 1 - after_running_frac)
-    score *= (before_sustained * after_sustained)
+    score *= before_sustained * after_sustained
 
     if score > best_score:
         best_score = score
@@ -564,7 +594,9 @@ if best_trans_idx is not None:
     trans_idx = best_trans_idx
 
     # Determine transition type
-    before_running = np.mean(labels_subset[trans_idx - min_sustained_samples:trans_idx] == 1)
+    before_running = np.mean(
+        labels_subset[trans_idx - min_sustained_samples : trans_idx] == 1
+    )
     if before_running > 0.5:
         trans_type = "Running → Immobility"
     else:
@@ -582,10 +614,24 @@ if best_trans_idx is not None:
 
     # Behavior
     ax = axes[0]
-    ax.fill_between(t_zoom, 0, 1, where=labels_subset[zoom_start:zoom_end] == 1,
-                    alpha=0.6, color="green", label="Running")
-    ax.fill_between(t_zoom, 0, 1, where=labels_subset[zoom_start:zoom_end] == 0,
-                    alpha=0.6, color="blue", label="Immobility")
+    ax.fill_between(
+        t_zoom,
+        0,
+        1,
+        where=labels_subset[zoom_start:zoom_end] == 1,
+        alpha=0.6,
+        color="green",
+        label="Running",
+    )
+    ax.fill_between(
+        t_zoom,
+        0,
+        1,
+        where=labels_subset[zoom_start:zoom_end] == 0,
+        alpha=0.6,
+        color="blue",
+        label="Immobility",
+    )
     ax.axvline(t_rel[trans_idx], color="red", linestyle="-", alpha=0.5)
     ax.set_ylabel("Behavior")
     ax.set_ylim(0, 1)
@@ -713,8 +759,12 @@ modulation_strength = np.linalg.norm(weights, axis=1)
 
 print("Spike Weight Analysis")
 print("=" * 60)
-print(f"Baseline firing rates: {np.exp(baselines).mean():.2f} ± {np.exp(baselines).std():.2f} Hz")
-print(f"Modulation strength: {modulation_strength.mean():.3f} ± {modulation_strength.std():.3f}")
+print(
+    f"Baseline firing rates: {np.exp(baselines).mean():.2f} ± {np.exp(baselines).std():.2f} Hz"
+)
+print(
+    f"Modulation strength: {modulation_strength.mean():.3f} ± {modulation_strength.std():.3f}"
+)
 
 # %%
 # Plot spike weight analysis
@@ -723,7 +773,13 @@ fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 # Preferred phases (polar)
 ax = axes[0, 0]
 ax = plt.subplot(2, 2, 1, projection="polar")
-ax.scatter(preferred_phases, modulation_strength, c=modulation_strength, cmap="viridis", alpha=0.7)
+ax.scatter(
+    preferred_phases,
+    modulation_strength,
+    c=modulation_strength,
+    cmap="viridis",
+    alpha=0.7,
+)
 ax.set_title("Preferred Phases & Modulation Strength")
 
 # Modulation strength distribution
@@ -811,7 +867,9 @@ plt.show()
 
 # Correlation
 valid_idx = ~np.isnan(speed_subset) & ~np.isnan(np.array(inferred_amplitude))
-corr = np.corrcoef(speed_subset[valid_idx], np.array(inferred_amplitude)[valid_idx])[0, 1]
+corr = np.corrcoef(speed_subset[valid_idx], np.array(inferred_amplitude)[valid_idx])[
+    0, 1
+]
 print(f"\nCorrelation (amplitude vs speed): {corr:.3f}")
 
 # %% [markdown]

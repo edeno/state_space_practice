@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 """Tests for behavioral uncertainty helpers."""
+
 import jax
 
 jax.config.update("jax_enable_x64", True)
@@ -35,10 +36,12 @@ class TestAppendReferenceOption:
 
 class TestOptionVariances:
     def test_adds_reference_zero(self):
-        cov = jnp.array([
-            [[0.2, 0.0], [0.0, 0.5]],
-            [[0.1, 0.0], [0.0, 0.3]],
-        ])
+        cov = jnp.array(
+            [
+                [[0.2, 0.0], [0.0, 0.5]],
+                [[0.1, 0.0], [0.0, 0.3]],
+            ]
+        )
         out = option_variances_from_covariances(cov)
         assert out.shape == (2, 3)
         np.testing.assert_allclose(out[:, 0], 0.0)

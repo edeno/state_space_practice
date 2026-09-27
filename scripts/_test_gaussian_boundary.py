@@ -1,4 +1,5 @@
 """Test gaussian_filter boundary mode effect on rate estimation."""
+
 import numpy as np
 from scipy.ndimage import gaussian_filter
 
@@ -38,11 +39,14 @@ for mode_name, mode_kw in [
 # Now test on actual data
 print("=== Actual data ===")
 import sys
+
 sys.path.insert(0, "src")
 sys.path.insert(0, "data")
 from load_bandit_data import load_neural_recording_from_files
 from state_space_practice.preprocessing import (
-    bin_spike_times, select_units, interpolate_to_new_times,
+    bin_spike_times,
+    select_units,
+    interpolate_to_new_times,
 )
 
 data = load_neural_recording_from_files("data", "j1620210710_02_r1")
@@ -52,10 +56,16 @@ dt = 0.004
 pos_times = pos_info.index.values
 t_start, t_end = pos_times[0], pos_times[-1]
 time_bins = np.arange(t_start, t_end, dt)
-position_xy = np.column_stack([
-    interpolate_to_new_times(pos_info["head_position_x"].values, pos_times, time_bins),
-    interpolate_to_new_times(pos_info["head_position_y"].values, pos_times, time_bins),
-])
+position_xy = np.column_stack(
+    [
+        interpolate_to_new_times(
+            pos_info["head_position_x"].values, pos_times, time_bins
+        ),
+        interpolate_to_new_times(
+            pos_info["head_position_y"].values, pos_times, time_bins
+        ),
+    ]
+)
 selected = select_units(spike_times, min_rate=0.1, start_time=t_start, end_time=t_end)
 spikes = bin_spike_times([spike_times[i] for i in selected], time_bins)
 
@@ -76,7 +86,8 @@ occ_time = occ * dt
 # Pick one neuron for illustration
 n_idx = 10
 spike_map, _, _ = np.histogram2d(
-    position_xy[:, 0], position_xy[:, 1],
+    position_xy[:, 0],
+    position_xy[:, 1],
     bins=[x_bin_edges, y_bin_edges],
     weights=spikes[:, n_idx],
 )
@@ -93,8 +104,8 @@ for mode_name, mode_kw in [
     # These are the array boundaries where reflect vs constant matters
     print(f"\nmode={mode_name}, neuron {n_idx}:")
     print(f"  Rate at array corners and edges:")
-    print(f"    [0,0]={rate[0,0]:.4f}  [0,-1]={rate[0,-1]:.4f}")
-    print(f"    [-1,0]={rate[-1,0]:.4f}  [-1,-1]={rate[-1,-1]:.4f}")
+    print(f"    [0,0]={rate[0, 0]:.4f}  [0,-1]={rate[0, -1]:.4f}")
+    print(f"    [-1,0]={rate[-1, 0]:.4f}  [-1,-1]={rate[-1, -1]:.4f}")
 
     # Compare rates at the grid boundary vs 2 bins inward
     # Top edge (low y)

@@ -161,13 +161,9 @@ def validate_coupling_params(params: CouplingModelParams) -> None:
     freq_shape = tuple(np.shape(params.osc_frequencies))
     beta_real_shape = tuple(np.shape(params.beta_real))
     if len(freq_shape) != 1 or freq_shape[0] == 0:
-        raise ValueError(
-            f"osc_frequencies must have shape (J,), got {freq_shape}."
-        )
+        raise ValueError(f"osc_frequencies must have shape (J,), got {freq_shape}.")
     if len(beta_real_shape) != 2 or 0 in beta_real_shape:
-        raise ValueError(
-            f"beta_real must have shape (S, J), got {beta_real_shape}."
-        )
+        raise ValueError(f"beta_real must have shape (S, J), got {beta_real_shape}.")
     n_bands = int(freq_shape[0])
     n_neurons = int(beta_real_shape[0])
     expected_shapes = {
@@ -185,9 +181,8 @@ def validate_coupling_params(params: CouplingModelParams) -> None:
                 f"(S={n_neurons}, J={n_bands})"
             )
         arr_np = np.asarray(arr)
-        if (
-            not np.issubdtype(arr_np.dtype, np.number)
-            or np.issubdtype(arr_np.dtype, np.complexfloating)
+        if not np.issubdtype(arr_np.dtype, np.number) or np.issubdtype(
+            arr_np.dtype, np.complexfloating
         ):
             raise ValueError(f"{name} must be real-valued numeric data.")
         if not np.all(np.isfinite(arr_np)):
@@ -211,7 +206,9 @@ def validate_coupling_params(params: CouplingModelParams) -> None:
             or not np.issubdtype(value_arr.dtype, np.number)
             or np.issubdtype(value_arr.dtype, np.complexfloating)
         ):
-            raise ValueError(f"{name} must be a real-valued numeric scalar, got {value}.")
+            raise ValueError(
+                f"{name} must be a real-valued numeric scalar, got {value}."
+            )
         value_float = float(value_arr)
         if not np.isfinite(value_float) or value_float <= 0.0:
             raise ValueError(f"{name} must be finite and positive, got {value}.")

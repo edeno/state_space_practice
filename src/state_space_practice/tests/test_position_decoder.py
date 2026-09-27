@@ -50,9 +50,7 @@ class TestBuildPositionDynamics:
 
     def test_position_only_mode(self):
         """2D position-only state (no velocity)."""
-        A, Q = build_position_dynamics(
-            dt=0.004, q_pos=1.0, include_velocity=False
-        )
+        A, Q = build_position_dynamics(dt=0.004, q_pos=1.0, include_velocity=False)
         assert A.shape == (2, 2)
         assert Q.shape == (2, 2)
         np.testing.assert_allclose(A, jnp.eye(2))
@@ -82,9 +80,9 @@ class TestPlaceFieldRateMaps:
         xx, yy = np.meshgrid(x_edges, y_edges)
 
         # Neuron 0: field at (30, 40)
-        rate0 = 20 * np.exp(-((xx - 30)**2 + (yy - 40)**2) / (2 * 15**2)) + 0.5
+        rate0 = 20 * np.exp(-((xx - 30) ** 2 + (yy - 40) ** 2) / (2 * 15**2)) + 0.5
         # Neuron 1: field at (70, 60)
-        rate1 = 30 * np.exp(-((xx - 70)**2 + (yy - 60)**2) / (2 * 12**2)) + 0.5
+        rate1 = 30 * np.exp(-((xx - 70) ** 2 + (yy - 60) ** 2) / (2 * 12**2)) + 0.5
 
         rate_maps = np.stack([rate0, rate1])  # (2, n_grid, n_grid)
         return PlaceFieldRateMaps(
@@ -169,7 +167,9 @@ class TestPlaceFieldRateMaps:
         for dim in range(2):
             pos_p = pos.at[dim].set(pos[dim] + eps)
             pos_m = pos.at[dim].set(pos[dim] - eps)
-            numerical = (simple_fields.log_rate(pos_p) - simple_fields.log_rate(pos_m)) / (2 * eps)
+            numerical = (
+                simple_fields.log_rate(pos_p) - simple_fields.log_rate(pos_m)
+            ) / (2 * eps)
             np.testing.assert_allclose(jac[:, dim], numerical, atol=0.1)
 
     def test_bilinear_log_rate_reproduces_affine_plane(self):
@@ -225,8 +225,7 @@ class TestPlaceFieldRateMaps:
         kernel = np.exp(-0.5 * dist_sq / sigma**2)
         kernel = kernel / kernel.sum()
         manual_rate = (
-            spike_histograms.reshape(1, -1) @ kernel
-            + occupancy_tau * baseline_rates
+            spike_histograms.reshape(1, -1) @ kernel + occupancy_tau * baseline_rates
         ) / (occ_histogram.ravel() @ kernel + occupancy_tau)
 
         np.testing.assert_allclose(
@@ -243,13 +242,17 @@ class TestPlaceFieldRateMaps:
         )
 
         data = simulate_2d_moving_place_field(
-            total_time=30.0, dt=0.004, peak_rate=80.0, n_interior_knots=3,
+            total_time=30.0,
+            dt=0.004,
+            peak_rate=80.0,
+            n_interior_knots=3,
         )
         model = PlaceFieldModel(dt=0.004, n_interior_knots=3)
         model.fit(data["position"], data["spikes"], max_iter=2, verbose=False)
 
         rate_maps = PlaceFieldRateMaps.from_place_field_model(
-            model, n_grid=30,
+            model,
+            n_grid=30,
         )
         assert rate_maps.n_neurons == 1
         assert rate_maps.rate_maps.shape == (1, 30, 30)
@@ -259,10 +262,12 @@ class TestPlaceFieldRateMaps:
         rng = np.random.default_rng(42)
         n_time = 1000
         dt = 0.004
-        position = np.column_stack([
-            50 + 20 * np.cos(np.linspace(0, 4 * np.pi, n_time)),
-            50 + 20 * np.sin(np.linspace(0, 4 * np.pi, n_time)),
-        ])
+        position = np.column_stack(
+            [
+                50 + 20 * np.cos(np.linspace(0, 4 * np.pi, n_time)),
+                50 + 20 * np.sin(np.linspace(0, 4 * np.pi, n_time)),
+            ]
+        )
         # Two neurons
         spikes = rng.poisson(0.1, (n_time, 2))
 
@@ -346,9 +351,7 @@ class TestPlaceFieldRateMaps:
         ("bad_value", "match"),
         [(-1.0, "non-negative"), (0.5, "integer-valued"), (np.nan, "finite")],
     )
-    def test_from_spike_position_data_rejects_invalid_counts(
-        self, bad_value, match
-    ):
+    def test_from_spike_position_data_rejects_invalid_counts(self, bad_value, match):
         rng = np.random.default_rng(0)
         position = rng.standard_normal((100, 2))
         spikes = rng.poisson(0.1, (100, 2)).astype(float)
@@ -425,10 +428,12 @@ class TestPlaceFieldRateMaps:
             np.argmax(rate_maps.rate_maps[0]),
             rate_maps.rate_maps[0].shape,
         )
-        fitted_peak = np.array([
-            rate_maps.x_edges[peak_ix],
-            rate_maps.y_edges[peak_iy],
-        ])
+        fitted_peak = np.array(
+            [
+                rate_maps.x_edges[peak_ix],
+                rate_maps.y_edges[peak_iy],
+            ]
+        )
 
         assert np.linalg.norm(fitted_peak - true_center) < 5.0
 
@@ -471,10 +476,12 @@ class TestPlaceFieldRateMaps:
         n_time = 1000
         dt = 0.004
         t = np.arange(n_time) * dt
-        position = np.column_stack([
-            50 + 20 * np.cos(2 * np.pi * t / 2.0),
-            50 + 20 * np.sin(2 * np.pi * t / 2.0),
-        ])
+        position = np.column_stack(
+            [
+                50 + 20 * np.cos(2 * np.pi * t / 2.0),
+                50 + 20 * np.sin(2 * np.pi * t / 2.0),
+            ]
+        )
 
         centers = rng.uniform(20, 80, (5, 2))
         spikes = np.zeros((n_time, 5))
@@ -539,12 +546,14 @@ class TestPositionDecoderFilter:
         y_edges = np.linspace(0, 100, n_grid)
         xx, yy = np.meshgrid(x_edges, y_edges)
 
-        rate0 = 30 * np.exp(-((xx - 30)**2 + (yy - 50)**2) / (2 * 15**2)) + 0.5
-        rate1 = 30 * np.exp(-((xx - 70)**2 + (yy - 50)**2) / (2 * 15**2)) + 0.5
+        rate0 = 30 * np.exp(-((xx - 30) ** 2 + (yy - 50) ** 2) / (2 * 15**2)) + 0.5
+        rate1 = 30 * np.exp(-((xx - 70) ** 2 + (yy - 50) ** 2) / (2 * 15**2)) + 0.5
         rate_maps_arr = np.stack([rate0, rate1])
 
         rate_maps = PlaceFieldRateMaps(
-            rate_maps=rate_maps_arr, x_edges=x_edges, y_edges=y_edges,
+            rate_maps=rate_maps_arr,
+            x_edges=x_edges,
+            y_edges=y_edges,
         )
 
         # Generate spikes from true position
@@ -743,14 +752,18 @@ class TestPositionDecoderFilter:
         )
 
         true_pos = decoding_data["true_position"]
-        filter_error = np.mean(np.linalg.norm(
-            np.array(filter_result.position_mean[50:, :2]) - true_pos[50:],
-            axis=1,
-        ))
-        smoother_error = np.mean(np.linalg.norm(
-            np.array(smoother_result.position_mean[50:, :2]) - true_pos[50:],
-            axis=1,
-        ))
+        filter_error = np.mean(
+            np.linalg.norm(
+                np.array(filter_result.position_mean[50:, :2]) - true_pos[50:],
+                axis=1,
+            )
+        )
+        smoother_error = np.mean(
+            np.linalg.norm(
+                np.array(smoother_result.position_mean[50:, :2]) - true_pos[50:],
+                axis=1,
+            )
+        )
 
         # RTS smoother has lower MSE than the forward filter at every
         # time step; the small slack absorbs numerical noise from the
@@ -792,7 +805,9 @@ class TestPositionDecoderFilter:
             dt=decoding_data["dt"],
         )
         filt_var = np.mean([np.trace(c) for c in np.array(filter_result.position_cov)])
-        smooth_var = np.mean([np.trace(c) for c in np.array(smoother_result.position_cov)])
+        smooth_var = np.mean(
+            [np.trace(c) for c in np.array(smoother_result.position_cov)]
+        )
         assert smooth_var <= filt_var * 1.01
 
 
@@ -819,18 +834,23 @@ class TestPositionDecoderIntegration:
         xx, yy = np.meshgrid(x_edges, y_edges)
 
         field_centers = [
-            (30, 30), (70, 30),  # bottom left/right
-            (30, 70), (70, 70),  # top left/right
-            (50, 25), (50, 75),  # bottom/top center
+            (30, 30),
+            (70, 30),  # bottom left/right
+            (30, 70),
+            (70, 70),  # top left/right
+            (50, 25),
+            (50, 75),  # bottom/top center
         ]
         rate_maps_list = []
         for cx, cy in field_centers:
-            rate = 40 * np.exp(-((xx - cx)**2 + (yy - cy)**2) / (2 * 12**2)) + 0.5
+            rate = 40 * np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * 12**2)) + 0.5
             rate_maps_list.append(rate)
 
         rate_maps_arr = np.stack(rate_maps_list)
         rate_maps = PlaceFieldRateMaps(
-            rate_maps=rate_maps_arr, x_edges=x_edges, y_edges=y_edges,
+            rate_maps=rate_maps_arr,
+            x_edges=x_edges,
+            y_edges=y_edges,
         )
 
         # Generate spikes from true position
@@ -853,7 +873,9 @@ class TestPositionDecoderIntegration:
         """Filter should track both x and y on a circular trajectory."""
         data = circular_trajectory_2d
         result = position_decoder_filter(
-            spikes=data["spikes"], rate_maps=data["rate_maps"], dt=data["dt"],
+            spikes=data["spikes"],
+            rate_maps=data["rate_maps"],
+            dt=data["dt"],
         )
         warmup = 100
         decoded = np.array(result.position_mean[warmup:, :2])
@@ -869,10 +891,14 @@ class TestPositionDecoderIntegration:
         """Smoother should have higher correlation than filter in both dims."""
         data = circular_trajectory_2d
         filt = position_decoder_filter(
-            spikes=data["spikes"], rate_maps=data["rate_maps"], dt=data["dt"],
+            spikes=data["spikes"],
+            rate_maps=data["rate_maps"],
+            dt=data["dt"],
         )
         smooth = position_decoder_smoother(
-            spikes=data["spikes"], rate_maps=data["rate_maps"], dt=data["dt"],
+            spikes=data["spikes"],
+            rate_maps=data["rate_maps"],
+            dt=data["dt"],
         )
         warmup = 100
         true_pos = data["true_position"][warmup:]
@@ -905,7 +931,9 @@ class TestPositionDecoderIntegration:
             spikes[t_idx] = rng.poisson(rates * dt)
 
         result = position_decoder_filter(
-            spikes=jnp.array(spikes), rate_maps=rate_maps, dt=dt,
+            spikes=jnp.array(spikes),
+            rate_maps=rate_maps,
+            dt=dt,
         )
 
         # After warmup, decoded position should be near (50, 50)
@@ -924,10 +952,14 @@ class TestPositionDecoderIntegration:
         """All outputs should be finite."""
         data = circular_trajectory_2d
         filt = position_decoder_filter(
-            spikes=data["spikes"], rate_maps=data["rate_maps"], dt=data["dt"],
+            spikes=data["spikes"],
+            rate_maps=data["rate_maps"],
+            dt=data["dt"],
         )
         smooth = position_decoder_smoother(
-            spikes=data["spikes"], rate_maps=data["rate_maps"], dt=data["dt"],
+            spikes=data["spikes"],
+            rate_maps=data["rate_maps"],
+            dt=data["dt"],
         )
         assert np.all(np.isfinite(np.array(filt.position_mean)))
         assert np.all(np.isfinite(np.array(filt.position_cov)))
@@ -1130,6 +1162,7 @@ class TestPositionDecoder:
 
     def test_plot_decoding(self, trajectory_data):
         import matplotlib
+
         matplotlib.use("Agg")
 
         decoder = PositionDecoder(dt=trajectory_data["dt"])
@@ -1139,12 +1172,14 @@ class TestPositionDecoder:
         )
         result = decoder.decode(spikes=trajectory_data["spikes"])
         fig = decoder.plot_decoding(
-            result, true_position=trajectory_data["position"],
+            result,
+            true_position=trajectory_data["position"],
         )
         assert fig is not None
 
     def test_plot_without_true_position(self, trajectory_data):
         import matplotlib
+
         matplotlib.use("Agg")
 
         decoder = PositionDecoder(dt=trajectory_data["dt"])
@@ -1190,10 +1225,12 @@ class TestRawOccupancyMask:
         t = np.arange(n_time) * dt
         true_x = 50 + 20 * np.cos(2 * np.pi * t / 2.0)
         true_y = 50 + 20 * np.sin(2 * np.pi * t / 2.0)
-        position = np.column_stack([
-            true_x + rng.normal(0.0, 1.0, size=n_time),
-            true_y + rng.normal(0.0, 1.0, size=n_time),
-        ])
+        position = np.column_stack(
+            [
+                true_x + rng.normal(0.0, 1.0, size=n_time),
+                true_y + rng.normal(0.0, 1.0, size=n_time),
+            ]
+        )
 
         grid_xs = np.linspace(28, 72, 4)
         grid_ys = np.linspace(28, 72, 4)
@@ -1247,7 +1284,9 @@ class TestRawOccupancyMask:
 
         # Raw-mask default.
         rm_raw = PlaceFieldRateMaps.from_spike_position_data(
-            position=position, spike_counts=spikes, dt=dt,
+            position=position,
+            spike_counts=spikes,
+            dt=dt,
         )
         decoded_warm, true_warm = _decode(rm_raw)
 
@@ -1263,7 +1302,9 @@ class TestRawOccupancyMask:
         # force anywhere).  The raw mask should produce meaningfully
         # better decoding.
         rm_all_true = PlaceFieldRateMaps.from_spike_position_data(
-            position=position, spike_counts=spikes, dt=dt,
+            position=position,
+            spike_counts=spikes,
+            dt=dt,
             occupancy_mask=np.ones_like(rm_raw.occupancy_mask),
         )
         decoded_all, true_all = _decode(rm_all_true)
@@ -1293,10 +1334,12 @@ class TestRawOccupancyMask:
         t = np.arange(n_time) * dt
         arm_x = 20 + 60 * (0.5 + 0.5 * np.sin(2 * np.pi * t / 3.0))
         arm_y = np.where(t % 6.0 < 3.0, 20.0, 80.0)
-        position = np.column_stack([
-            arm_x + rng.normal(0.0, 0.5, size=n_time),
-            arm_y + rng.normal(0.0, 0.5, size=n_time),
-        ])
+        position = np.column_stack(
+            [
+                arm_x + rng.normal(0.0, 0.5, size=n_time),
+                arm_y + rng.normal(0.0, 0.5, size=n_time),
+            ]
+        )
 
         n_neurons = 4
         centers = np.array([[30, 20], [70, 20], [30, 80], [70, 80]])
@@ -1337,10 +1380,7 @@ class TestRawOccupancyMask:
 
         # Sanity: the arms themselves should be substantially
         # on-track.  Arm rows are |y - 20| < 5 or |y - 80| < 5.
-        arm_rows = (
-            (np.abs(y_centers - 20.0) < 5.0)
-            | (np.abs(y_centers - 80.0) < 5.0)
-        )
+        arm_rows = (np.abs(y_centers - 20.0) < 5.0) | (np.abs(y_centers - 80.0) < 5.0)
         arm_mask = mask[arm_rows, :]
         # Arms span x in [20, 80], which is 60/80 = 75% of the x extent
         # (using the min/max of ``arm_x``).  Require at least 40% of
@@ -1357,10 +1397,12 @@ class TestRawOccupancyMask:
         rng = np.random.default_rng(0)
         n_time = 1000
         dt = 0.004
-        position = np.column_stack([
-            50 + 10 * np.cos(np.linspace(0, 4 * np.pi, n_time)),
-            50 + 10 * np.sin(np.linspace(0, 4 * np.pi, n_time)),
-        ])
+        position = np.column_stack(
+            [
+                50 + 10 * np.cos(np.linspace(0, 4 * np.pi, n_time)),
+                50 + 10 * np.sin(np.linspace(0, 4 * np.pi, n_time)),
+            ]
+        )
         spikes = rng.poisson(0.1, (n_time, 2))
 
         # All-True override — everything on-track.
@@ -1400,7 +1442,11 @@ class TestAdaptiveInflation:
             spikes[:, n] = rng.poisson(rate * dt)
 
         rm = PlaceFieldRateMaps.from_spike_position_data(
-            position, spikes, dt=dt, n_grid=50, sigma=5.0,
+            position,
+            spikes,
+            dt=dt,
+            n_grid=50,
+            sigma=5.0,
         )
         return rm, spikes, position, dt
 
@@ -1410,18 +1456,26 @@ class TestAdaptiveInflation:
         init_pos = jnp.array(position[0])
 
         result_none = position_decoder_filter(
-            spikes=spikes, rate_maps=rm, dt=dt,
-            q_pos=50.0, include_velocity=False,
+            spikes=spikes,
+            rate_maps=rm,
+            dt=dt,
+            q_pos=50.0,
+            include_velocity=False,
             init_position=init_pos,
         )
         result_off = position_decoder_filter(
-            spikes=spikes, rate_maps=rm, dt=dt,
-            q_pos=50.0, include_velocity=False,
+            spikes=spikes,
+            rate_maps=rm,
+            dt=dt,
+            q_pos=50.0,
+            include_velocity=False,
             init_position=init_pos,
             adaptive_inflation=AdaptiveInflationConfig(enabled=False),
         )
         np.testing.assert_allclose(
-            result_none.position_mean, result_off.position_mean, atol=1e-10,
+            result_none.position_mean,
+            result_off.position_mean,
+            atol=1e-10,
         )
 
     def test_inflation_increases_covariance(self, rate_maps_and_data):
@@ -1430,19 +1484,29 @@ class TestAdaptiveInflation:
         init_pos = jnp.array(position[0])
 
         result_base = position_decoder_filter(
-            spikes=spikes, rate_maps=rm, dt=dt,
-            q_pos=50.0, include_velocity=False,
+            spikes=spikes,
+            rate_maps=rm,
+            dt=dt,
+            q_pos=50.0,
+            include_velocity=False,
             init_position=init_pos,
         )
         result_infl = position_decoder_filter(
-            spikes=spikes, rate_maps=rm, dt=dt,
-            q_pos=50.0, include_velocity=False,
+            spikes=spikes,
+            rate_maps=rm,
+            dt=dt,
+            q_pos=50.0,
+            include_velocity=False,
             init_position=init_pos,
             adaptive_inflation=AdaptiveInflationConfig(gain=1.0, max_alpha=5.0),
         )
         # Mean trace of covariance should be >= baseline
-        base_trace = np.mean(np.trace(np.array(result_base.position_cov), axis1=1, axis2=2))
-        infl_trace = np.mean(np.trace(np.array(result_infl.position_cov), axis1=1, axis2=2))
+        base_trace = np.mean(
+            np.trace(np.array(result_base.position_cov), axis1=1, axis2=2)
+        )
+        infl_trace = np.mean(
+            np.trace(np.array(result_infl.position_cov), axis1=1, axis2=2)
+        )
         assert infl_trace >= base_trace
 
     def test_capped_inflation_bounds_covariance_growth(self, rate_maps_and_data):
@@ -1466,15 +1530,21 @@ class TestAdaptiveInflation:
         init_pos = jnp.array(position[0])
 
         result_base = position_decoder_filter(
-            spikes=spikes, rate_maps=rm, dt=dt,
-            q_pos=50.0, include_velocity=False,
+            spikes=spikes,
+            rate_maps=rm,
+            dt=dt,
+            q_pos=50.0,
+            include_velocity=False,
             init_position=init_pos,
         )
         # A large gain cannot grow the covariance because the per-step
         # multiplier is clipped to max_alpha == 1.0.
         result_capped = position_decoder_filter(
-            spikes=spikes, rate_maps=rm, dt=dt,
-            q_pos=50.0, include_velocity=False,
+            spikes=spikes,
+            rate_maps=rm,
+            dt=dt,
+            q_pos=50.0,
+            include_velocity=False,
             init_position=init_pos,
             adaptive_inflation=AdaptiveInflationConfig(gain=100.0, max_alpha=1.0),
         )
@@ -1485,8 +1555,11 @@ class TestAdaptiveInflation:
         # Guard: a looser cap must actually let inflation act, or the assertion
         # above would hold vacuously (a no-op inflation trivially matches base).
         result_infl = position_decoder_filter(
-            spikes=spikes, rate_maps=rm, dt=dt,
-            q_pos=50.0, include_velocity=False,
+            spikes=spikes,
+            rate_maps=rm,
+            dt=dt,
+            q_pos=50.0,
+            include_velocity=False,
             init_position=init_pos,
             adaptive_inflation=AdaptiveInflationConfig(gain=100.0, max_alpha=1.5),
         )
@@ -1499,8 +1572,12 @@ class TestAdaptiveInflation:
         indefinite = jnp.array([[1.0, 2.0], [2.0, 1.0]])  # eigenvalues 3, -1
         with pytest.raises(ValueError, match="init_cov"):
             position_decoder_filter(
-                spikes=spikes, rate_maps=rm, dt=dt, q_pos=50.0,
-                include_velocity=False, init_position=jnp.array(position[0]),
+                spikes=spikes,
+                rate_maps=rm,
+                dt=dt,
+                q_pos=50.0,
+                include_velocity=False,
+                init_position=jnp.array(position[0]),
                 init_cov=indefinite,
             )
 
@@ -1511,13 +1588,19 @@ class TestAdaptiveInflation:
 
         zero_spikes = np.zeros_like(spikes)
         result_base = position_decoder_filter(
-            spikes=zero_spikes, rate_maps=rm, dt=dt,
-            q_pos=50.0, include_velocity=False,
+            spikes=zero_spikes,
+            rate_maps=rm,
+            dt=dt,
+            q_pos=50.0,
+            include_velocity=False,
             init_position=init_pos,
         )
         result_infl = position_decoder_filter(
-            spikes=zero_spikes, rate_maps=rm, dt=dt,
-            q_pos=50.0, include_velocity=False,
+            spikes=zero_spikes,
+            rate_maps=rm,
+            dt=dt,
+            q_pos=50.0,
+            include_velocity=False,
             init_position=init_pos,
             adaptive_inflation=AdaptiveInflationConfig(gain=2.0, max_alpha=10.0),
         )
@@ -1538,14 +1621,20 @@ class TestAdaptiveInflation:
         cfg = AdaptiveInflationConfig(gain=0.5, max_alpha=5.0)
 
         result_f = position_decoder_filter(
-            spikes=spikes, rate_maps=rm, dt=dt,
-            q_pos=50.0, include_velocity=False,
+            spikes=spikes,
+            rate_maps=rm,
+            dt=dt,
+            q_pos=50.0,
+            include_velocity=False,
             init_position=init_pos,
             adaptive_inflation=cfg,
         )
         result_s = position_decoder_smoother(
-            spikes=spikes, rate_maps=rm, dt=dt,
-            q_pos=50.0, include_velocity=False,
+            spikes=spikes,
+            rate_maps=rm,
+            dt=dt,
+            q_pos=50.0,
+            include_velocity=False,
             init_position=init_pos,
             adaptive_inflation=cfg,
         )
@@ -1619,15 +1708,16 @@ class TestPositionDecoderRateMapRecovery:
         trajectory_radius = 20.0
         well_sampled_mask = []
         for c in centers:
-            dist_to_path = abs(np.linalg.norm(c - trajectory_center) - trajectory_radius)
+            dist_to_path = abs(
+                np.linalg.norm(c - trajectory_center) - trajectory_radius
+            )
             well_sampled_mask.append(dist_to_path < 8.0)  # within sigma_rf of path
 
         errors = []
         for n in range(len(centers)):
-            log_rates = np.array([
-                float(decoder.rate_maps.log_rate(jnp.array(g))[n])
-                for g in grid
-            ])
+            log_rates = np.array(
+                [float(decoder.rate_maps.log_rate(jnp.array(g))[n]) for g in grid]
+            )
             peak_idx = np.argmax(log_rates)
             estimated_peak = grid[peak_idx]
             dist = float(np.linalg.norm(estimated_peak - centers[n]))
@@ -1802,9 +1892,7 @@ class TestPredictionAwareSmoother:
         (inflated) predictions, not the recomputed A P A' + Q."""
         p = inflation_problem
         smoothed = position_decoder_smoother(**p["kwargs"])
-        A, Q = build_position_dynamics(
-            p["kwargs"]["dt"], 50.0, include_velocity=False
-        )
+        A, Q = build_position_dynamics(p["kwargs"]["dt"], 50.0, include_velocity=False)
         A = np.asarray(A)
         f_mean = np.asarray(p["result"].position_mean)
         f_cov = np.asarray(p["result"].position_cov)
@@ -1823,7 +1911,6 @@ class TestPredictionAwareSmoother:
             p["result"].position_mean, p["result"].position_cov, A, Q
         )
         assert np.max(np.abs(np.asarray(naive_mean) - smoothed.position_mean)) > 1e-3
-
 
     def test_track_penalty_is_not_folded_into_the_smoother_prediction(
         self, inflation_problem
@@ -1880,9 +1967,7 @@ class TestTracedDecoderHyperparameters:
         # guard: the first call after clearing the cache really traced.
         assert traces
         traces.clear()
-        others = [
-            position_decoder_filter(**kwargs, sigma_track=s) for s in (2.0, 9.0)
-        ]
+        others = [position_decoder_filter(**kwargs, sigma_track=s) for s in (2.0, 9.0)]
         position_decoder_filter(**{**kwargs, "dt": 0.005}, sigma_track=5.0)
         assert traces == []
         # guard: the reused compilation saw the new sigma_track values.

@@ -71,15 +71,17 @@ class TestScore:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             score = _score(post, sim)
-            out = aggregate([
-                {
-                    "coupling_mag": 0.0,
-                    "replicate": 0,
-                    "ekf": score,
-                    "pg": score,
-                    "ekf_pg_mean_maxdiff": 0.0,
-                }
-            ])
+            out = aggregate(
+                [
+                    {
+                        "coupling_mag": 0.0,
+                        "replicate": 0,
+                        "ekf": score,
+                        "pg": score,
+                        "ekf_pg_mean_maxdiff": 0.0,
+                    }
+                ]
+            )
         assert np.isnan(score["abs_bias"])
         assert np.isnan(out[0.0]["ekf"]["abs_bias"])
 

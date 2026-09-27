@@ -146,18 +146,24 @@ def build_position_dynamics(
     q_vel = validate_scalar(q_vel, "q_vel", nonnegative=True)
 
     if include_velocity:
-        A = jnp.array([
-            [1, 0, dt, 0],
-            [0, 1, 0, dt],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1],
-        ])
-        Q = jnp.diag(jnp.array([
-            q_pos * dt,
-            q_pos * dt,
-            q_vel * dt,
-            q_vel * dt,
-        ]))
+        A = jnp.array(
+            [
+                [1, 0, dt, 0],
+                [0, 1, 0, dt],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ]
+        )
+        Q = jnp.diag(
+            jnp.array(
+                [
+                    q_pos * dt,
+                    q_pos * dt,
+                    q_vel * dt,
+                    q_vel * dt,
+                ]
+            )
+        )
     else:
         A = jnp.eye(2)
         Q = jnp.eye(2) * q_pos * dt
@@ -297,17 +303,23 @@ class PlaceFieldRateMaps:
         # gradient information of the Gaussian kernel.
         self._kde_sigma = kde_sigma
         self._occupancy_tau = float(occupancy_tau)
-        if spike_histograms is not None and occ_histogram is not None and kde_sigma is not None:
+        if (
+            spike_histograms is not None
+            and occ_histogram is not None
+            and kde_sigma is not None
+        ):
             # spike_histograms: (n_neurons, n_grid_y, n_grid_x) — raw spike counts per bin
             # occ_histogram: (n_grid_y, n_grid_x) — occupancy time per bin
             # Grid center coordinates as 2D meshgrid
             xx, yy = np.meshgrid(self.x_edges, self.y_edges)  # (ny, nx)
-            self._jax_grid_xy = jnp.stack([xx.ravel(), yy.ravel()], axis=1)  # (ny*nx, 2)
+            self._jax_grid_xy = jnp.stack(
+                [xx.ravel(), yy.ravel()], axis=1
+            )  # (ny*nx, 2)
             self._jax_spike_hists = jnp.array(
                 spike_histograms.reshape(self.n_neurons, -1)  # (n_neurons, ny*nx)
             )
             self._jax_occ_hist = jnp.array(occ_histogram.ravel())  # (ny*nx,)
-            self._jax_kde_sigma2 = jnp.array(kde_sigma ** 2)
+            self._jax_kde_sigma2 = jnp.array(kde_sigma**2)
             # Baseline rates for the kernel-weighted Bayesian shrinkage
             # (see _kde_log_rate). If not supplied, default to zero
             # baseline with zero tau, which recovers the unshrunk
@@ -315,7 +327,9 @@ class PlaceFieldRateMaps:
             if baseline_rates is None:
                 baseline_rates = np.zeros(self.n_neurons, dtype=np.float64)
             self._jax_baseline_rates = jnp.asarray(baseline_rates, dtype=jnp.float64)
-            self._jax_occupancy_tau = jnp.asarray(self._occupancy_tau, dtype=jnp.float64)
+            self._jax_occupancy_tau = jnp.asarray(
+                self._occupancy_tau, dtype=jnp.float64
+            )
             self._use_analytical = True
         else:
             self._use_analytical = False
@@ -456,7 +470,8 @@ class PlaceFieldRateMaps:
 
         # Compute occupancy
         occ, _, _ = np.histogram2d(
-            position[:, 0], position[:, 1],
+            position[:, 0],
+            position[:, 1],
             bins=[x_bin_edges, y_bin_edges],
         )
         occ_time = occ * dt
@@ -470,9 +485,7 @@ class PlaceFieldRateMaps:
             sigma / (y_bin_edges[1] - y_bin_edges[0]),
             sigma / (x_bin_edges[1] - x_bin_edges[0]),
         )
-        occ_smooth = gaussian_filter(
-            occ_time.T, sigma_bins, mode="constant", cval=0
-        )
+        occ_smooth = gaussian_filter(occ_time.T, sigma_bins, mode="constant", cval=0)
 
         # Session-wide mean firing rate per neuron (baseline for shrinkage)
         total_time = position.shape[0] * dt
@@ -498,7 +511,8 @@ class PlaceFieldRateMaps:
         rate_maps = np.zeros((n_neurons, n_grid, n_grid))
         for n in range(n_neurons):
             spike_map, _, _ = np.histogram2d(
-                position[:, 0], position[:, 1],
+                position[:, 0],
+                position[:, 1],
                 bins=[x_bin_edges, y_bin_edges],
                 weights=spike_counts[:, n],
             )
@@ -549,7 +563,8 @@ class PlaceFieldRateMaps:
         spike_histograms = np.zeros((n_neurons, n_grid, n_grid))
         for n in range(n_neurons):
             spike_map, _, _ = np.histogram2d(
-                position[:, 0], position[:, 1],
+                position[:, 0],
+                position[:, 1],
                 bins=[x_bin_edges, y_bin_edges],
                 weights=spike_counts[:, n],
             )
@@ -613,9 +628,12 @@ class PlaceFieldRateMaps:
                 self._jax_occupancy_tau,
             )
         return _bilinear_log_rate(
-            position, self._jax_log_rate_maps,
-            self._jax_x_edges, self._jax_y_edges,
-            self._dx, self._dy,
+            position,
+            self._jax_log_rate_maps,
+            self._jax_x_edges,
+            self._jax_y_edges,
+            self._dx,
+            self._dy,
         )
 
     def log_rate_jacobian(self, position: Array) -> Array:
@@ -644,9 +662,12 @@ class PlaceFieldRateMaps:
                 self._jax_occupancy_tau,
             )
         return _bilinear_log_rate_jacobian(
-            position, self._jax_log_rate_maps,
-            self._jax_x_edges, self._jax_y_edges,
-            self._dx, self._dy,
+            position,
+            self._jax_log_rate_maps,
+            self._jax_x_edges,
+            self._jax_y_edges,
+            self._dx,
+            self._dy,
         )
 
 
@@ -701,7 +722,7 @@ def _kde_log_rate(
     """
     xy = position[:2]
     diff = encoding_positions - xy[None, :]  # (n_bins, 2)
-    dist_sq = jnp.sum(diff ** 2, axis=1)  # (n_bins,)
+    dist_sq = jnp.sum(diff**2, axis=1)  # (n_bins,)
     kernel_unnorm = jnp.exp(-0.5 * dist_sq / sigma2)  # (n_bins,)
 
     # Normalize the kernel so weights sum to 1. This makes the
@@ -714,7 +735,9 @@ def _kde_log_rate(
     kernel = kernel_unnorm / kernel_sum
 
     occ_kernel = jnp.sum(occ_weights * kernel)  # "seconds" (weighted-avg occ per bin)
-    spike_kernels = encoding_spikes @ kernel    # (n_neurons,), weighted-avg counts per bin
+    spike_kernels = (
+        encoding_spikes @ kernel
+    )  # (n_neurons,), weighted-avg counts per bin
 
     # Bayesian shrinkage toward the per-neuron baseline rate.
     # When the kernel-weighted occupancy is large (>> tau), the
@@ -974,7 +997,13 @@ def _run_filter_scan(
     def log_intensity_func(state):
         if use_kde:
             return _kde_log_rate(
-                state, _grid_xy, _spike_hists, _occ_hist, _sigma2, _baseline, _tau,
+                state,
+                _grid_xy,
+                _spike_hists,
+                _occ_hist,
+                _sigma2,
+                _baseline,
+                _tau,
             )
         return _bilinear_log_rate(
             state, jax_log_rate_maps, jax_x_edges, jax_y_edges, grid_dx, grid_dy
@@ -983,7 +1012,13 @@ def _run_filter_scan(
     def grad_log_intensity_func(state):
         if use_kde:
             jac_pos = _kde_log_rate_jacobian(
-                state, _grid_xy, _spike_hists, _occ_hist, _sigma2, _baseline, _tau,
+                state,
+                _grid_xy,
+                _spike_hists,
+                _occ_hist,
+                _sigma2,
+                _baseline,
+                _tau,
             )
         else:
             jac_pos = _bilinear_log_rate_jacobian(
@@ -997,21 +1032,19 @@ def _run_filter_scan(
     _x_max = jax_x_edges[-1]
     _y_min = jax_y_edges[0]
     _y_max = jax_y_edges[-1]
-    _penalty_inv_sigma2 = 1.0 / (sigma_track ** 2)
+    _penalty_inv_sigma2 = 1.0 / (sigma_track**2)
 
     def _penalty_at(pos_xy):
         interior = _bilinear_log_rate(
             pos_xy, jax_penalty_map, jax_x_edges, jax_y_edges, grid_dx, grid_dy
         )[0]
-        dx_out = (
-            jnp.maximum(pos_xy[0] - _x_max, 0.0)
-            - jnp.maximum(_x_min - pos_xy[0], 0.0)
+        dx_out = jnp.maximum(pos_xy[0] - _x_max, 0.0) - jnp.maximum(
+            _x_min - pos_xy[0], 0.0
         )
-        dy_out = (
-            jnp.maximum(pos_xy[1] - _y_max, 0.0)
-            - jnp.maximum(_y_min - pos_xy[1], 0.0)
+        dy_out = jnp.maximum(pos_xy[1] - _y_max, 0.0) - jnp.maximum(
+            _y_min - pos_xy[1], 0.0
         )
-        exterior = 0.5 * _penalty_inv_sigma2 * (dx_out ** 2 + dy_out ** 2)
+        exterior = 0.5 * _penalty_inv_sigma2 * (dx_out**2 + dy_out**2)
         return interior + exterior
 
     _penalty_grad_fn = jax.grad(_penalty_at)
@@ -1054,9 +1087,7 @@ def _run_filter_scan(
             # fisher_reg is symmetric positive definite: Cholesky, not LU. It
             # already carries the epsilon ridge, so no absolute jitter on top
             # (a 1e-9 shift would be 0.1% of the default epsilon=1e-6).
-            s_t = (
-                score @ psd_solve(fisher_reg, score, diagonal_boost=0.0)
-            ) / _infl_d
+            s_t = (score @ psd_solve(fisher_reg, score, diagonal_boost=0.0)) / _infl_d
             alpha_t = jnp.where(
                 fisher_trace > _infl_min_ft,
                 jnp.clip(1.0 + _infl_gain * (s_t - 1.0), 1.0, _infl_max),
@@ -1086,11 +1117,14 @@ def _run_filter_scan(
             dynamics_cov,
         )
 
-    (_, _, marginal_ll), (
-        filtered_mean,
-        filtered_cov,
-        predicted_mean,
-        predicted_cov,
+    (
+        (_, _, marginal_ll),
+        (
+            filtered_mean,
+            filtered_cov,
+            predicted_mean,
+            predicted_cov,
+        ),
     ) = jax.lax.scan(_step, init_carry, spikes_arr)
     return filtered_mean, filtered_cov, marginal_ll, predicted_mean, predicted_cov
 
@@ -1240,17 +1274,18 @@ def _position_decoder_filter_with_predictions(
         init_position = jnp.asarray(init_position)
         if init_position.ndim != 1:
             raise ValueError(
-                f"init_position must be a 1D vector, got shape "
-                f"{init_position.shape}"
+                f"init_position must be a 1D vector, got shape {init_position.shape}"
             )
         if not bool(jnp.all(jnp.isfinite(init_position))):
             raise ValueError("init_position must contain only finite values.")
         if include_velocity:
             if init_position.shape[0] == 2:
-                init_position = jnp.concatenate([
-                    init_position,
-                    jnp.zeros(2, dtype=init_position.dtype),
-                ])
+                init_position = jnp.concatenate(
+                    [
+                        init_position,
+                        jnp.zeros(2, dtype=init_position.dtype),
+                    ]
+                )
             elif init_position.shape[0] != 4:
                 raise ValueError(
                     "init_position must have shape (2,) or (4,) when "
@@ -1266,7 +1301,7 @@ def _position_decoder_filter_with_predictions(
         if _init_position_supplied:
             # Tight prior: ±3σ ≈ sigma_track.  Users who provide
             # init_position usually know the starting location well.
-            pos_var = sigma_track ** 2
+            pos_var = sigma_track**2
             if include_velocity:
                 vel_var = 100.0  # ±3σ = 30 cm/s
                 init_cov = jnp.diag(jnp.array([pos_var, pos_var, vel_var, vel_var]))
@@ -1281,9 +1316,7 @@ def _position_decoder_filter_with_predictions(
             pos_var_y = (y_extent / 6.0) ** 2
             if include_velocity:
                 vel_var = 100.0
-                init_cov = jnp.diag(
-                    jnp.array([pos_var_x, pos_var_y, vel_var, vel_var])
-                )
+                init_cov = jnp.diag(jnp.array([pos_var_x, pos_var_y, vel_var, vel_var]))
             else:
                 init_cov = jnp.diag(jnp.array([pos_var_x, pos_var_y]))
 
@@ -1300,13 +1333,12 @@ def _position_decoder_filter_with_predictions(
         if rate_maps.occupancy_mask is not None:
             track_penalty = _build_track_penalty(
                 rate_maps.occupancy_mask,
-                rate_maps._dx, rate_maps._dy,
+                rate_maps._dx,
+                rate_maps._dy,
                 sigma_track=sigma_track,
             )
         else:
-            track_penalty = jnp.zeros(
-                (len(rate_maps.y_edges), len(rate_maps.x_edges))
-            )
+            track_penalty = jnp.zeros((len(rate_maps.y_edges), len(rate_maps.x_edges)))
     track_penalty = jnp.asarray(track_penalty)
 
     # Use analytical KDE evaluation when sufficient statistics are
@@ -1367,8 +1399,11 @@ def _position_decoder_filter_with_predictions(
     ) = _run_filter_scan(
         spikes_arr,
         init_carry,
-        A, Q,
-        jax_log_rate_maps, jax_x_edges, jax_y_edges,
+        A,
+        Q,
+        jax_log_rate_maps,
+        jax_x_edges,
+        jax_y_edges,
         track_penalty,
         kde_args,
         infl_args,
@@ -1400,20 +1435,18 @@ def _position_decoder_filter_with_predictions(
     tol = float(sigma_track)
     xy_means = np.asarray(filtered_mean[:, :2])
     out_mask = (
-        (xy_means[:, 0] < _x_min - tol) | (xy_means[:, 0] > _x_max + tol)
-        | (xy_means[:, 1] < _y_min - tol) | (xy_means[:, 1] > _y_max + tol)
+        (xy_means[:, 0] < _x_min - tol)
+        | (xy_means[:, 0] > _x_max + tol)
+        | (xy_means[:, 1] < _y_min - tol)
+        | (xy_means[:, 1] > _y_max + tol)
     )
     n_out = int(out_mask.sum())
     frac_out = n_out / max(xy_means.shape[0], 1)
     max_escape_x = float(
-        np.max(
-            np.maximum(xy_means[:, 0] - _x_max, _x_min - xy_means[:, 0])
-        )
+        np.max(np.maximum(xy_means[:, 0] - _x_max, _x_min - xy_means[:, 0]))
     )
     max_escape_y = float(
-        np.max(
-            np.maximum(xy_means[:, 1] - _y_max, _y_min - xy_means[:, 1])
-        )
+        np.max(np.maximum(xy_means[:, 1] - _y_max, _y_min - xy_means[:, 1]))
     )
     max_escape = max(max_escape_x, max_escape_y)
     severe = max_escape > 3.0 * sigma_track
@@ -1480,9 +1513,16 @@ def position_decoder_smoother(
 
     filter_result, predicted_mean, predicted_cov = (
         _position_decoder_filter_with_predictions(
-            spikes, rate_maps, dt, q_pos, q_vel,
-            include_velocity, init_position, init_cov,
-            track_penalty=track_penalty, sigma_track=sigma_track,
+            spikes,
+            rate_maps,
+            dt,
+            q_pos,
+            q_vel,
+            include_velocity,
+            init_position,
+            init_cov,
+            track_penalty=track_penalty,
+            sigma_track=sigma_track,
             max_newton_iter=max_newton_iter,
             adaptive_inflation=adaptive_inflation,
         )
@@ -1584,13 +1624,11 @@ class PositionDecoder:
             occupancy_tau, "occupancy_tau", nonnegative=True
         )
         max_newton_iter_arr = np.asarray(max_newton_iter)
-        if (
-            max_newton_iter_arr.shape != ()
-            or not np.issubdtype(max_newton_iter_arr.dtype, np.integer)
+        if max_newton_iter_arr.shape != () or not np.issubdtype(
+            max_newton_iter_arr.dtype, np.integer
         ):
             raise ValueError(
-                "max_newton_iter must be an integer scalar, "
-                f"got {max_newton_iter}."
+                f"max_newton_iter must be an integer scalar, got {max_newton_iter}."
             )
         if max_newton_iter < 0:
             raise ValueError(
@@ -1608,10 +1646,7 @@ class PositionDecoder:
     def __repr__(self) -> str:
         fitted = self.rate_maps is not None
         n_neurons = self.rate_maps.n_neurons if self.rate_maps is not None else "?"
-        return (
-            f"PositionDecoder(dt={self.dt}, n_neurons={n_neurons}, "
-            f"fitted={fitted})"
-        )
+        return f"PositionDecoder(dt={self.dt}, n_neurons={n_neurons}, fitted={fitted})"
 
     def fit(
         self,
@@ -1637,7 +1672,9 @@ class PositionDecoder:
         )
         logger.info(
             "Fitted rate maps for %d neurons on %dx%d grid",
-            self.rate_maps.n_neurons, self.n_grid, self.n_grid,
+            self.rate_maps.n_neurons,
+            self.n_grid,
+            self.n_grid,
         )
 
     def fit_from_model(
@@ -1658,7 +1695,9 @@ class PositionDecoder:
             Time bin indices to average over. None = full session.
         """
         self.rate_maps = PlaceFieldRateMaps.from_place_field_model(
-            model, n_grid=n_grid or self.n_grid, time_slice=time_slice,
+            model,
+            n_grid=n_grid or self.n_grid,
+            time_slice=time_slice,
         )
         logger.info(
             "Loaded rate maps for %d neurons on %dx%d grid from PlaceFieldModel",
@@ -1775,12 +1814,18 @@ class PositionDecoder:
         # Left: 2D trajectory
         if true_position is not None:
             axes[0].plot(
-                true_position[:, 0], true_position[:, 1],
-                "k-", alpha=0.3, label="True",
+                true_position[:, 0],
+                true_position[:, 1],
+                "k-",
+                alpha=0.3,
+                label="True",
             )
         axes[0].plot(
-            decoded[:, 0], decoded[:, 1],
-            "r-", alpha=0.7, label="Decoded",
+            decoded[:, 0],
+            decoded[:, 1],
+            "r-",
+            alpha=0.7,
+            label="Decoded",
         )
         axes[0].set_xlabel("x (cm)")
         axes[0].set_ylabel("y (cm)")
@@ -1800,7 +1845,11 @@ class PositionDecoder:
             # 1-sigma position uncertainty radius
             sigma_radius = np.sqrt(pos_var[:, 0, 0] + pos_var[:, 1, 1])
             axes[1].fill_between(
-                t, 0, sigma_radius, alpha=0.2, color="blue",
+                t,
+                0,
+                sigma_radius,
+                alpha=0.2,
+                color="blue",
                 label=r"1$\sigma$ radius",
             )
             axes[1].legend()

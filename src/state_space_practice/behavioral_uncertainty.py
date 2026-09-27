@@ -89,9 +89,7 @@ def compute_surprise(predicted_probs: Array, choices: Array) -> Array:
         -log P(actual choice | predicted). Higher = more surprising.
     """
     eps = 1e-10
-    p = jnp.clip(
-        predicted_probs[jnp.arange(len(choices)), choices], eps, 1.0
-    )
+    p = jnp.clip(predicted_probs[jnp.arange(len(choices)), choices], eps, 1.0)
     return -jnp.log(p)
 
 
@@ -156,8 +154,8 @@ def bernoulli_mixture_mean_variance(
     # Var[r | option k] = E_s[rho(1-rho)] + Var_s[rho]
     # = sum_s P(s) * rho_sk * (1 - rho_sk) + sum_s P(s) * (rho_sk - mean_k)^2
     bernoulli_var = state_probs @ (reward_probs * (1 - reward_probs))  # (T, K)
-    mean_sq = state_probs @ (reward_probs ** 2)  # (T, K)
-    mixture_var = mean_sq - mean ** 2  # Var_s[rho]
+    mean_sq = state_probs @ (reward_probs**2)  # (T, K)
+    mixture_var = mean_sq - mean**2  # Var_s[rho]
     variance = bernoulli_var + mixture_var  # Total variance
 
     return mean, variance

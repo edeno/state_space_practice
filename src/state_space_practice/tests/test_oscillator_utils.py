@@ -7,7 +7,6 @@ from state_space_practice.oscillator_utils import (
     IDENTITY_2x2,
     ZEROS_2x2,
     DirectedInfluenceDynamicsMixin,
-
     _cnm_psd_shrink_factor,
     _cnm_structured_projection,
     _compute_coupled_oscillator_block,
@@ -83,7 +82,7 @@ def test_scatter_block_diagonal_matches_block_diag(n_blocks):
     for i in range(n_blocks):
         for j in range(n_blocks):
             if i != j:
-                block = result[2 * i:2 * (i + 1), 2 * j:2 * (j + 1)]
+                block = result[2 * i : 2 * (i + 1), 2 * j : 2 * (j + 1)]
                 assert jnp.allclose(block, 0.0), f"Off-diag block ({i},{j}) non-zero"
 
 
@@ -189,17 +188,18 @@ def test_construct_correlated_noise_process_covariance_nonzero_coupling():
 
     # Diagonal blocks are variance * I.
     for i in range(n_osc):
-        block = mat[2 * i:2 * (i + 1), 2 * i:2 * (i + 1)]
+        block = mat[2 * i : 2 * (i + 1), 2 * i : 2 * (i + 1)]
         np.testing.assert_allclose(block, var[i] * jnp.eye(2), atol=1e-13)
 
     # Off-diagonal blocks: the strict upper triangle is coupling * R(phase); the
     # lower triangle is the transpose of its upper partner (tie-blocks symmetry).
     from state_space_practice.oscillator_utils import _compute_coupling_transition_block
+
     for i in range(n_osc):
         for j in range(n_osc):
             if i == j:
                 continue
-            block = mat[2 * i:2 * (i + 1), 2 * j:2 * (j + 1)]
+            block = mat[2 * i : 2 * (i + 1), 2 * j : 2 * (j + 1)]
             u, v = min(i, j), max(i, j)
             upper = _compute_coupling_transition_block(phase[u, v], coupling[u, v])
             expected = upper if i < j else upper.T
@@ -400,7 +400,7 @@ def test_project_coupled_transition_matrix_uses_scaled_rotation_blocks():
 
     for row in range(2):
         for col in range(2):
-            block = projected[2 * row:2 * row + 2, 2 * col:2 * col + 2]
+            block = projected[2 * row : 2 * row + 2, 2 * col : 2 * col + 2]
             np.testing.assert_allclose(block[0, 0], block[1, 1], atol=1e-8)
             np.testing.assert_allclose(block[0, 1], -block[1, 0], atol=1e-8)
 
@@ -448,7 +448,7 @@ def test_project_correlated_noise_process_covariance_preserves_structure_and_psd
     assert np.linalg.eigvalsh(projected).min() >= -1e-8
 
     for osc in range(2):
-        block = projected[2 * osc:2 * osc + 2, 2 * osc:2 * osc + 2]
+        block = projected[2 * osc : 2 * osc + 2, 2 * osc : 2 * osc + 2]
         np.testing.assert_allclose(block[0, 0], block[1, 1], atol=1e-10)
         np.testing.assert_allclose(block[0, 1], 0.0, atol=1e-10)
         np.testing.assert_allclose(block[1, 0], 0.0, atol=1e-10)
@@ -592,7 +592,9 @@ def test_extract_dim_params_roundtrip_simple():
 
     # Check roundtrip
     assert jnp.allclose(params["damping"], damping, atol=1e-4)
-    assert jnp.allclose(params["freq"], freqs, atol=0.5)  # freq recovery is less precise
+    assert jnp.allclose(
+        params["freq"], freqs, atol=0.5
+    )  # freq recovery is less precise
     assert jnp.allclose(params["coupling_strength"], coupling, atol=1e-4)
 
 
@@ -765,23 +767,27 @@ class TestProjectCoupledTransitionMatrixPathological:
     def test_unstable_matrix_produces_finite_output(self) -> None:
         """An unstable transition matrix should still project to finite result."""
         # Large diagonal = spectral radius > 1
-        A = jnp.array([
-            [2.0, -0.5, 0.1, 0.0],
-            [0.5, 2.0, 0.0, 0.1],
-            [0.1, 0.0, 1.5, -0.3],
-            [0.0, 0.1, 0.3, 1.5],
-        ])
+        A = jnp.array(
+            [
+                [2.0, -0.5, 0.1, 0.0],
+                [0.5, 2.0, 0.0, 0.1],
+                [0.1, 0.0, 1.5, -0.3],
+                [0.0, 0.1, 0.3, 1.5],
+            ]
+        )
         result = project_coupled_transition_matrix(A)
         assert jnp.all(jnp.isfinite(result))
 
     def test_near_singular_matrix_produces_finite_output(self) -> None:
         """A nearly singular matrix should project without NaN."""
-        A = jnp.array([
-            [1e-15, -1e-15, 0.0, 0.0],
-            [1e-15, 1e-15, 0.0, 0.0],
-            [0.0, 0.0, 1e-15, -1e-15],
-            [0.0, 0.0, 1e-15, 1e-15],
-        ])
+        A = jnp.array(
+            [
+                [1e-15, -1e-15, 0.0, 0.0],
+                [1e-15, 1e-15, 0.0, 0.0],
+                [0.0, 0.0, 1e-15, -1e-15],
+                [0.0, 0.0, 1e-15, 1e-15],
+            ]
+        )
         result = project_coupled_transition_matrix(A)
         assert jnp.all(jnp.isfinite(result))
 
@@ -795,12 +801,14 @@ class TestProjectCoupledTransitionMatrixPathological:
         perfectly finite input. Capture at the fd level (``capfd``) because
         ``jax.debug.print`` writes past ``sys.stdout``.
         """
-        A = jnp.array([
-            [0.9, -0.3, 0.05, 0.0],
-            [0.3, 0.9, 0.0, 0.05],
-            [0.05, 0.0, 0.8, -0.2],
-            [0.0, 0.05, 0.2, 0.8],
-        ])
+        A = jnp.array(
+            [
+                [0.9, -0.3, 0.05, 0.0],
+                [0.3, 0.9, 0.0, 0.05],
+                [0.05, 0.0, 0.8, -0.2],
+                [0.0, 0.05, 0.2, 0.8],
+            ]
+        )
         assert jnp.all(jnp.isfinite(A))  # guard: input is finite
         capfd.readouterr()  # drop anything buffered before the call
         result = project_coupled_transition_matrix(A)
@@ -903,11 +911,14 @@ def test_construct_stable_directed_influence_transition_stack_applies_one_scale(
     # Weak coupling under the default bound (0.99 > max damping 0.95) needs no
     # scaling: the stack is the plain construction.
     weak = 0.01 * strong
-    assert float(
-        compute_directed_influence_stability_scale(
-            freqs, damping, weak, fs, phase_difference=phase
+    assert (
+        float(
+            compute_directed_influence_stability_scale(
+                freqs, damping, weak, fs, phase_difference=phase
+            )
         )
-    ) == 1.0
+        == 1.0
+    )
     stack_weak = construct_stable_directed_influence_transition_stack(
         freqs, damping, weak, phase, fs
     )
@@ -1030,6 +1041,7 @@ def test_directed_influence_mixin_rebuild_refreshes_optimizer_cache_only_once_se
     host._current_osc_params["freq"] = jnp.array([5.0, 9.0])
     host._update_public_oscillator_params()
     np.testing.assert_allclose(host.freqs, [5.0, 9.0])
+
 
 # CNM covariance projection: closed-form PSD shrink factor vs. bisection
 # ---------------------------------------------------------------------------
@@ -1287,9 +1299,10 @@ def test_stability_scale_clamps_actual_radius_exactly_and_is_differentiable() ->
     direction = jnp.zeros_like(coupling).at[1, 0, 0].set(1.0)
     grad = jax.jit(jax.grad(scale_of))(coupling)
     h = 1e-6
-    fd = (float(scale_of(coupling + h * direction)) - float(
-        scale_of(coupling - h * direction)
-    )) / (2 * h)
+    fd = (
+        float(scale_of(coupling + h * direction))
+        - float(scale_of(coupling - h * direction))
+    ) / (2 * h)
     np.testing.assert_allclose(float(jnp.sum(grad * direction)), fd, rtol=1e-5)
 
     weak = _dim_pair(0.05, damping=0.85)[2]

@@ -242,9 +242,7 @@ def _real_to_stochastic(logits: Array) -> Array:
     logits = _as_float_array(logits)
     if logits.shape[-1] == 0:
         return jnp.ones(logits.shape[:-1] + (1,), dtype=logits.dtype)
-    full_logits = jnp.concatenate(
-        [logits, jnp.zeros_like(logits[..., :1])], axis=-1
-    )
+    full_logits = jnp.concatenate([logits, jnp.zeros_like(logits[..., :1])], axis=-1)
     return jax.nn.softmax(full_logits, axis=-1)
 
 

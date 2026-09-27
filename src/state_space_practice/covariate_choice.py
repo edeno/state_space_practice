@@ -298,9 +298,17 @@ def covariate_choice_filter(
         obs_weights_arr = jnp.zeros((n_options, 1))
 
     return _covariate_choice_filter_jit(
-        choices_arr, n_options, covariates_arr, input_gain_arr,
-        obs_cov_arr, obs_weights_arr,
-        process_noise, inverse_temperature, decay, init_mean, init_cov,
+        choices_arr,
+        n_options,
+        covariates_arr,
+        input_gain_arr,
+        obs_cov_arr,
+        obs_weights_arr,
+        process_noise,
+        inverse_temperature,
+        decay,
+        init_mean,
+        init_cov,
     )
 
 
@@ -336,19 +344,25 @@ def _covariate_choice_filter_jit(
 
         # Update via Laplace-EKF with obs offset
         post_mean, post_cov, ll = _softmax_update_core(
-            pred_mean, pred_cov, choice_t,
-            n_options, inverse_temperature,
+            pred_mean,
+            pred_cov,
+            choice_t,
+            n_options,
+            inverse_temperature,
             obs_offset=obs_offset,
         )
 
         total_ll = total_ll + ll
         return (post_mean, post_cov, total_ll), (
-            post_mean, post_cov, pred_mean, pred_cov,
+            post_mean,
+            post_cov,
+            pred_mean,
+            pred_cov,
         )
 
     init_carry = (init_mean, init_cov, jnp.array(0.0))
-    (_, _, marginal_ll), (filt_vals, filt_covs, pred_vals, pred_covs) = (
-        jax.lax.scan(_step, init_carry, (choices, covariates, obs_covariates))
+    (_, _, marginal_ll), (filt_vals, filt_covs, pred_vals, pred_covs) = jax.lax.scan(
+        _step, init_carry, (choices, covariates, obs_covariates)
     )
 
     return ChoiceFilterResult(
@@ -424,9 +438,17 @@ def covariate_choice_smoother(
     ChoiceSmootherResult
     """
     filt = covariate_choice_filter(
-        choices, n_options, covariates, input_gain,
-        obs_covariates, obs_weights,
-        process_noise, inverse_temperature, decay, init_mean, init_cov,
+        choices,
+        n_options,
+        covariates,
+        input_gain,
+        obs_covariates,
+        obs_weights,
+        process_noise,
+        inverse_temperature,
+        decay,
+        init_mean,
+        init_cov,
     )
 
     k_free = n_options - 1
@@ -477,8 +499,7 @@ def _coerce_covariates(
     arr = jnp.asarray(values)
     if arr.ndim != 2:
         raise ValueError(
-            f"{name} must be a 2-D (n_trials, {size_name}) array, got shape "
-            f"{arr.shape}"
+            f"{name} must be a 2-D (n_trials, {size_name}) array, got shape {arr.shape}"
         )
     if arr.shape[1] != n_expected:
         raise ValueError(
@@ -630,18 +651,24 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         # M-step for B (input gain)
         if self.n_covariates > 0 and self._covariates is not None:
             self.input_gain_ = m_step_input_gain(
-                smooth.smoothed_values, self._covariates,
+                smooth.smoothed_values,
+                self._covariates,
                 decay=self.decay,
             )
 
         # M-step for Theta (observation weights)
-        if (self.learn_obs_weights
-                and self.n_obs_covariates > 0
-                and self._obs_covariates is not None):
+        if (
+            self.learn_obs_weights
+            and self.n_obs_covariates > 0
+            and self._obs_covariates is not None
+        ):
             self.obs_weights_ = m_step_obs_weights(
-                smooth.smoothed_values, choices,
-                self._obs_covariates, self.n_options,
-                self.inverse_temperature, self.obs_weights_,
+                smooth.smoothed_values,
+                choices,
+                self._obs_covariates,
+                self.n_options,
+                self.inverse_temperature,
+                self.obs_weights_,
             )
 
         # M-step for decay
@@ -675,9 +702,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
                 log_likelihoods.append(final_ll)
         elif last_accepted is not None:
             self._restore_parameters(last_accepted)
-            final_ll = super()._final_e_step(
-                choices, log_likelihoods, last_accepted
-            )
+            final_ll = super()._final_e_step(choices, log_likelihoods, last_accepted)
             logger.warning(
                 "Final M-step decreased the log-likelihood; rolled back to the "
                 "previous parameters."
@@ -702,12 +727,13 @@ class CovariateChoiceModel(MultinomialChoiceModel):
             covariates, self.n_covariates, "covariates", "n_covariates", method
         )
         obs_covariates_arr = _coerce_covariates(
-            obs_covariates, self.n_obs_covariates, "obs_covariates",
-            "n_obs_covariates", method,
+            obs_covariates,
+            self.n_obs_covariates,
+            "obs_covariates",
+            "n_obs_covariates",
+            method,
         )
-        choices_arr = self._prepare_choices(
-            choices, "EM" if method == "fit" else "SGD"
-        )
+        choices_arr = self._prepare_choices(choices, "EM" if method == "fit" else "SGD")
         self._covariates = covariates_arr
         self._obs_covariates = obs_covariates_arr
         return choices_arr
@@ -750,9 +776,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         -------
         log_likelihoods : list of float
         """
-        choices_arr = self._bind_covariates(
-            choices, covariates, obs_covariates, "fit"
-        )
+        choices_arr = self._bind_covariates(choices, covariates, obs_covariates, "fit")
         return self._fit_em(choices_arr, max_iter, tolerance, verbose, beta_grid)
 
     def fit_sgd(
@@ -833,9 +857,12 @@ class CovariateChoiceModel(MultinomialChoiceModel):
             ow_arr = jnp.zeros((self.n_options, 1))
 
         result = _covariate_choice_filter_jit(
-            choices, self.n_options,
-            cov_arr, ig_arr,
-            obs_cov_arr, ow_arr,
+            choices,
+            self.n_options,
+            cov_arr,
+            ig_arr,
+            obs_cov_arr,
+            ow_arr,
             _param("process_noise", "process_noise"),
             _param("inverse_temperature", "inverse_temperature"),
             _param("decay", "decay"),
@@ -880,13 +907,9 @@ class CovariateChoiceModel(MultinomialChoiceModel):
             target = target - control_input
 
         # Numerator: sum_t E[(x_t - B u_t)' x_{t-1}]
-        numer = jnp.sum(target * m[:-1]) + jnp.sum(
-            jnp.trace(C, axis1=1, axis2=2)
-        )
+        numer = jnp.sum(target * m[:-1]) + jnp.sum(jnp.trace(C, axis1=1, axis2=2))
         # Denominator: sum_t E[x_{t-1}' x_{t-1}]
-        denom = jnp.sum(m[:-1] ** 2) + jnp.sum(
-            jnp.trace(P[:-1], axis1=1, axis2=2)
-        )
+        denom = jnp.sum(m[:-1] ** 2) + jnp.sum(jnp.trace(P[:-1], axis1=1, axis2=2))
         return float(jnp.clip(numer / jnp.maximum(denom, 1e-10), 0.01, 1.0))
 
     @property
@@ -986,8 +1009,14 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         if self.n_covariates > 0:
             self.plot_input_gains(ax=ax1)
         else:
-            ax1.text(0.5, 0.5, "No covariates", ha="center", va="center",
-                     transform=ax1.transAxes)
+            ax1.text(
+                0.5,
+                0.5,
+                "No covariates",
+                ha="center",
+                va="center",
+                transform=ax1.transAxes,
+            )
             ax1.set_title("Input Gains")
 
         # Panel 3: convergence
@@ -1008,6 +1037,7 @@ class SimulatedRLChoiceData(NamedTuple):
     true_probs : Array, shape (n_trials, K)
     covariates : Array, shape (n_trials, d)
     """
+
     choices: Array
     true_values: Array
     true_probs: Array
@@ -1088,9 +1118,7 @@ def simulate_rl_choice_data(
         # Generate reward covariate for *next* trial
         # Reward earned on trial t becomes covariates[t+1]
         if choices[t] > 0 and t < n_trials - 1:
-            covariates[t + 1, choices[t] - 1] = float(
-                rng.random() < reward_prob
-            )
+            covariates[t + 1, choices[t] - 1] = float(rng.random() < reward_prob)
 
     return SimulatedRLChoiceData(
         choices=jnp.array(choices),

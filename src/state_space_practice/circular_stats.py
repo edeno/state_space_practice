@@ -130,8 +130,14 @@ def rayleigh_test(phases: NDArray[np.floating]) -> tuple[float, float]:
 
     # More accurate approximation for small samples (Mardia & Jupp, 2000)
     if n < 50:
-        p_value = float(np.exp(-z) * (1 + (2 * z - z**2) / (4 * n) -
-                        (24 * z - 132 * z**2 + 76 * z**3 - 9 * z**4) / (288 * n**2)))
+        p_value = float(
+            np.exp(-z)
+            * (
+                1
+                + (2 * z - z**2) / (4 * n)
+                - (24 * z - 132 * z**2 + 76 * z**3 - 9 * z**4) / (288 * n**2)
+            )
+        )
         p_value = max(0, min(1, p_value))  # Clip to [0, 1]
 
     return R, p_value

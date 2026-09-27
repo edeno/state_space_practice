@@ -370,9 +370,7 @@ class TestSummarizePosterior:
         assert s["beta_imag_ci_upper"][0, 0] == pytest.approx(2.0 + z * 0.3)
 
     @pytest.mark.parametrize("cred_mass", [-0.1, 0.0, 1.0, 1.5, np.nan])
-    def test_rejects_invalid_cred_mass(
-        self, make_coupling_posterior, cred_mass
-    ):
+    def test_rejects_invalid_cred_mass(self, make_coupling_posterior, cred_mass):
         post = make_coupling_posterior(
             beta_real_mean=[[1.0]],
             beta_imag_mean=[[2.0]],

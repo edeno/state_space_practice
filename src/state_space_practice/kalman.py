@@ -124,17 +124,14 @@ def woodbury_kalman_gain(
     # S^{-1} = R^{-1} - R^{-1} H P (I + H' R^{-1} H P)^{-1} H' R^{-1}.
     # This remains finite for positive-semidefinite/rank-deficient P.
     small_inv_term = jnp.linalg.solve(I_D + Ht_R_inv_H @ prior_cov, R_inv_H.T)
-    S_inv = symmetrize(
-        jnp.diag(r_inv) - R_inv_H @ prior_cov @ small_inv_term
-    )
+    S_inv = symmetrize(jnp.diag(r_inv) - R_inv_H @ prior_cov @ small_inv_term)
 
     # Equivalent small-system expression for K = P H' S^{-1}; avoids a dense
     # (D_obs, D_obs) multiply when callers only consume K.
     K_rhs = jnp.linalg.solve(I_D + prior_cov @ Ht_R_inv_H, prior_cov)
     K = (R_inv_H @ K_rhs).T
     S = symmetrize(
-        jnp.diag(emission_cov_diag)
-        + emission_matrix @ prior_cov @ emission_matrix.T
+        jnp.diag(emission_cov_diag) + emission_matrix @ prior_cov @ emission_matrix.T
     )
     return K, S, S_inv
 
@@ -322,9 +319,9 @@ def _validate_kalman_public_inputs(
         # Per-bin R: require every slice positive definite. eigvalsh is
         # batched over the leading time axis (O(n_time * n_obs^3)) but runs
         # once per public call, since inner loops pass validate_inputs=False.
-        per_slice_min_eig = jnp.linalg.eigvalsh(
-            symmetrize(measurement_cov)
-        ).min(axis=-1)
+        per_slice_min_eig = jnp.linalg.eigvalsh(symmetrize(measurement_cov)).min(
+            axis=-1
+        )
         worst_time = int(jnp.argmin(per_slice_min_eig))
         min_slice_eig = float(per_slice_min_eig[worst_time])
         if not min_slice_eig > 0.0:
@@ -1025,8 +1022,7 @@ def parallel_kalman_smoother(
 
     if filtered_means.ndim != 2:
         raise ValueError(
-            "filtered_means must have shape (T, D), "
-            f"got {filtered_means.shape}."
+            f"filtered_means must have shape (T, D), got {filtered_means.shape}."
         )
     T, D = filtered_means.shape
     if T == 0:
@@ -1258,10 +1254,13 @@ def measurement_cov_residual_form(
     """
     n_time = obs.shape[0]
     residual = obs - smoother_mean @ measurement_matrix.T
-    return symmetrize(
-        residual.T @ residual
-        + measurement_matrix @ sum_smoother_cov @ measurement_matrix.T
-    ) / n_time
+    return (
+        symmetrize(
+            residual.T @ residual
+            + measurement_matrix @ sum_smoother_cov @ measurement_matrix.T
+        )
+        / n_time
+    )
 
 
 def process_cov_residual_form(
@@ -1400,9 +1399,7 @@ def kalman_maximization_step(
     # Measurement matrix and covariance
     measurement_matrix = psd_solve(gamma, delta.T).T
     measurement_cov = project_psd_relative(
-        measurement_cov_residual_form(
-            obs, smoother_mean, sum_cov, measurement_matrix
-        ),
+        measurement_cov_residual_form(obs, smoother_mean, sum_cov, measurement_matrix),
         name="kalman_maximization_step measurement_cov",
     )
 

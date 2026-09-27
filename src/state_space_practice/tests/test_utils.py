@@ -682,7 +682,6 @@ class TestStabilizeTransitionMatrix:
         np.testing.assert_array_equal(np.asarray(stabilized), np.asarray(A))
 
 
-
 class TestRelativePsdFloor:
     """Scale-relative eigenvalue floors for M-step covariance projections."""
 

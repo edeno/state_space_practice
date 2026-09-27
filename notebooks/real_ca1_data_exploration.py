@@ -93,10 +93,10 @@ print(position_info.columns.tolist())
 
 print("\nPosition info time range:")
 times = position_info.index.values
-duration = (times[-1] - times[0])
+duration = times[-1] - times[0]
 print(f"  Start: {times[0]:.2f}")
 print(f"  End: {times[-1]:.2f}")
-print(f"  Duration: {duration:.1f} s ({duration/60:.1f} min)")
+print(f"  Duration: {duration:.1f} s ({duration / 60:.1f} min)")
 
 # Sampling rate
 dt_pos = np.median(np.diff(times))
@@ -215,7 +215,13 @@ ax.grid(True, alpha=0.3)
 
 # Log scale (to see low-rate place cells)
 ax = axes[1]
-ax.hist(firing_rates, bins=np.logspace(-2, 2, 50), alpha=0.7, edgecolor="black", linewidth=0.5)
+ax.hist(
+    firing_rates,
+    bins=np.logspace(-2, 2, 50),
+    alpha=0.7,
+    edgecolor="black",
+    linewidth=0.5,
+)
 ax.axvline(0.1, color="orange", linestyle="--", label="Min rate (0.1 Hz)")
 ax.axvline(50, color="red", linestyle="--", label="Max rate (50 Hz)")
 ax.set_xscale("log")
@@ -381,11 +387,15 @@ print(f"  Immobility bouts: {len(immobility_bouts)}")
 
 if len(running_bouts) > 0:
     running_durations = [(e - s) / sampling_freq for s, e in running_bouts]
-    print(f"  Running bout durations: {np.mean(running_durations):.1f} ± {np.std(running_durations):.1f} s")
+    print(
+        f"  Running bout durations: {np.mean(running_durations):.1f} ± {np.std(running_durations):.1f} s"
+    )
 
 if len(immobility_bouts) > 0:
     immobility_durations = [(e - s) / sampling_freq for s, e in immobility_bouts]
-    print(f"  Immobility bout durations: {np.mean(immobility_durations):.1f} ± {np.std(immobility_durations):.1f} s")
+    print(
+        f"  Immobility bout durations: {np.mean(immobility_durations):.1f} ± {np.std(immobility_durations):.1f} s"
+    )
 
 # %% [markdown]
 # ## 8. Visualize Preprocessed Data
@@ -497,7 +507,7 @@ print("=" * 60)
 print("Data Exploration Summary")
 print("=" * 60)
 print(f"\nOriginal data:")
-print(f"  Recording duration: {duration:.1f} s ({duration/60:.1f} min)")
+print(f"  Recording duration: {duration:.1f} s ({duration / 60:.1f} min)")
 print(f"  Total units: {len(spike_times)}")
 print(f"  Total spikes: {total_spikes:,}")
 

@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 """Tests for the contingency_belief module."""
+
 import jax
 
 jax.config.update("jax_enable_x64", True)
@@ -188,9 +189,7 @@ class TestContingencyBeliefFilter:
             # transition_logits omitted — uses default
         )
         assert result.state_posterior.shape == (4, 3)
-        np.testing.assert_allclose(
-            result.state_posterior.sum(axis=1), 1.0, atol=1e-7
-        )
+        np.testing.assert_allclose(result.state_posterior.sum(axis=1), 1.0, atol=1e-7)
 
     def test_obs_weights_row_count_mismatch(self):
         """Filter should raise a clear error for bad obs_weights rows."""
@@ -258,15 +257,14 @@ class TestContingencyBeliefSmoother:
         np.testing.assert_allclose(pairwise.sum(axis=1), smoothed[1:], atol=1e-6)
         # guard: the data actually induces a switch, so the joint is non-trivial
         # (off-diagonal mass is present) -- otherwise marginalization is vacuous.
-        off_diag = pairwise.sum(axis=(1, 2)) - np.trace(
-            pairwise, axis1=1, axis2=2
-        )
+        off_diag = pairwise.sum(axis=(1, 2)) - np.trace(pairwise, axis1=1, axis2=2)
         assert off_diag.max() > 0.05
 
     def test_smoother_sharper_than_filter(self, block_data):
         """Smoother should be at least as confident as filter."""
         filter_result = contingency_belief_filter(**block_data)
         smoother_result = contingency_belief_smoother(**block_data)
+
         # Entropy of smoother should be <= filter (sharper)
         def entropy(p):
             p = jnp.clip(p, 1e-10, 1.0)
@@ -333,9 +331,7 @@ class TestPerStateObsWeights:
             obs_weights=jnp.zeros((2, 2, 1)),  # (S, K, d)
         )
         assert result.state_posterior.shape == (4, 2)
-        np.testing.assert_allclose(
-            result.state_posterior.sum(axis=1), 1.0, atol=1e-7
-        )
+        np.testing.assert_allclose(result.state_posterior.sum(axis=1), 1.0, atol=1e-7)
 
     def test_per_state_bias_differs_from_shared_bias(self):
         """A bias that only operates in state 1 should yield different
@@ -365,10 +361,12 @@ class TestPerStateObsWeights:
         # Per-state bias: option 0 +2 only in state 0
         per_state = contingency_belief_filter(
             **common,
-            obs_weights=jnp.array([
-                [[2.0], [0.0]],  # state 0: bias option 0
-                [[0.0], [0.0]],  # state 1: no bias
-            ]),  # (S=2, K=2, d=1)
+            obs_weights=jnp.array(
+                [
+                    [[2.0], [0.0]],  # state 0: bias option 0
+                    [[0.0], [0.0]],  # state 1: no bias
+                ]
+            ),  # (S=2, K=2, d=1)
         )
         assert not np.allclose(
             shared.state_posterior, per_state.state_posterior, atol=1e-3
@@ -398,7 +396,8 @@ class TestPerStateObsWeights:
 
         per_state_w = jnp.stack([shared_w, shared_w], axis=0)  # (S, K, d)
         per_state = contingency_belief_filter(
-            **common, obs_weights=per_state_w,
+            **common,
+            obs_weights=per_state_w,
         )
         np.testing.assert_allclose(
             shared.state_posterior, per_state.state_posterior, atol=1e-6
@@ -445,7 +444,10 @@ class TestPerStateObsWeights:
         )
         assert model.obs_weights_.shape == (2, 2, 1)
         model.fit_sgd(
-            choices, rewards, obs_design_matrix=obs_cov, num_steps=5,
+            choices,
+            rewards,
+            obs_design_matrix=obs_cov,
+            num_steps=5,
         )
         # Should still have per-state shape after fitting
         assert model.obs_weights_.shape == (2, 2, 1)
@@ -477,18 +479,23 @@ class TestPerStateObsWeights:
 # Synthetic data helper
 # ---------------------------------------------------------------------------
 
+
 def _simulate_block_bandit(n_trials=100, n_options=3, seed=42):
     """Simulate block-structured bandit: state switches halfway."""
     key = jax.random.PRNGKey(seed)
     k1, k2 = jax.random.split(key)
 
     # State 0: option 0 is best; State 1: option 2 is best
-    reward_probs = jnp.array([
-        [0.8, 0.1, 0.1],
-        [0.1, 0.1, 0.8],
-    ])
+    reward_probs = jnp.array(
+        [
+            [0.8, 0.1, 0.1],
+            [0.1, 0.1, 0.8],
+        ]
+    )
     half = n_trials // 2
-    true_states = jnp.concatenate([jnp.zeros(half), jnp.ones(n_trials - half)]).astype(jnp.int32)
+    true_states = jnp.concatenate([jnp.zeros(half), jnp.ones(n_trials - half)]).astype(
+        jnp.int32
+    )
 
     # Generate choices: animals mostly pick the best option for current state
     best_options = jnp.array([0, 2])  # best for state 0, state 1
@@ -500,7 +507,9 @@ def _simulate_block_bandit(n_trials=100, n_options=3, seed=42):
 
     # Generate rewards from true state
     reward_p = reward_probs[true_states, choices]
-    rewards = jax.random.bernoulli(jax.random.PRNGKey(seed + 1), reward_p).astype(jnp.int32)
+    rewards = jax.random.bernoulli(jax.random.PRNGKey(seed + 1), reward_p).astype(
+        jnp.int32
+    )
 
     return choices, rewards, true_states, reward_probs
 
@@ -508,6 +517,7 @@ def _simulate_block_bandit(n_trials=100, n_options=3, seed=42):
 # ---------------------------------------------------------------------------
 # ContingencyBeliefModel tests
 # ---------------------------------------------------------------------------
+
 
 class TestContingencyBeliefModel:
     def test_fit_improves_ll(self):
@@ -605,7 +615,9 @@ class TestContingencyBeliefIntegration:
         recommended for full parameter learning.
         """
         choices, rewards, _, _ = _simulate_block_bandit(
-            n_trials=200, n_options=3, seed=42,
+            n_trials=200,
+            n_options=3,
+            seed=42,
         )
         model = ContingencyBeliefModel(n_states=2, n_options=3)
         model.fit(choices, rewards, max_iter=30)
@@ -618,7 +630,9 @@ class TestContingencyBeliefIntegration:
     def test_sgd_recovers_block_structure(self):
         """SGD should also recover the block structure."""
         choices, rewards, true_states, _ = _simulate_block_bandit(
-            n_trials=200, n_options=3, seed=42,
+            n_trials=200,
+            n_options=3,
+            seed=42,
         )
         model = ContingencyBeliefModel(n_states=2, n_options=3)
         model.fit_sgd(choices, rewards, num_steps=200)
@@ -648,7 +662,9 @@ class TestContingencyBeliefIntegration:
     def test_sgd_with_transition_covariates(self):
         """SGD should learn nonzero transition coefficients from covariates."""
         choices, rewards, true_states, _ = _simulate_block_bandit(
-            n_trials=100, n_options=3, seed=42,
+            n_trials=100,
+            n_options=3,
+            seed=42,
         )
         # Create a "reset" covariate that fires at the block boundary
         n_trials = len(choices)
@@ -657,7 +673,8 @@ class TestContingencyBeliefIntegration:
 
         model = ContingencyBeliefModel(n_states=2, n_options=3)
         lls = model.fit_sgd(
-            choices, rewards,
+            choices,
+            rewards,
             transition_covariates=covariates,
             num_steps=100,
         )
@@ -681,9 +698,7 @@ class TestContingencyBeliefIntegration:
         # Causal (filtered)
         assert model.state_posterior_ is not None
         assert model.state_posterior_.shape == (60, 2)
-        np.testing.assert_allclose(
-            model.state_posterior_.sum(axis=1), 1.0, atol=1e-6
-        )
+        np.testing.assert_allclose(model.state_posterior_.sum(axis=1), 1.0, atol=1e-6)
 
     def test_em_populates_both_posteriors(self):
         """EM should also populate both causal and smoothed posteriors."""
@@ -729,7 +744,8 @@ class TestContingencyBeliefIntegration:
 
         model = ContingencyBeliefModel(n_states=2, n_options=3)
         lls = model.fit(
-            choices, rewards,
+            choices,
+            rewards,
             transition_covariates=covariates,
             max_iter=15,
         )
@@ -747,7 +763,10 @@ class TestObservationDesignMatrix:
         choices, rewards, _, _ = _simulate_block_bandit(n_trials=50)
         # Without obs covariates
         result_base = contingency_belief_filter(
-            choices=choices, rewards=rewards, n_states=2, n_options=3,
+            choices=choices,
+            rewards=rewards,
+            n_states=2,
+            n_options=3,
             reward_probs=jnp.array([[0.8, 0.1, 0.1], [0.1, 0.1, 0.8]]),
             state_values=jnp.array([[1.0, 0.0, -1.0], [-1.0, 0.0, 1.0]]),
             inverse_temperature=1.0,
@@ -755,7 +774,10 @@ class TestObservationDesignMatrix:
         )
         # With zero obs covariates (should be identical)
         result_zero = contingency_belief_filter(
-            choices=choices, rewards=rewards, n_states=2, n_options=3,
+            choices=choices,
+            rewards=rewards,
+            n_states=2,
+            n_options=3,
             reward_probs=jnp.array([[0.8, 0.1, 0.1], [0.1, 0.1, 0.8]]),
             state_values=jnp.array([[1.0, 0.0, -1.0], [-1.0, 0.0, 1.0]]),
             inverse_temperature=1.0,
@@ -792,10 +814,15 @@ class TestObservationDesignMatrix:
             obs_dm = obs_dm.at[t, choices[t - 1]].set(1.0)
 
         model = ContingencyBeliefModel(
-            n_states=2, n_options=3, n_obs_covariates=3,
+            n_states=2,
+            n_options=3,
+            n_obs_covariates=3,
         )
         lls = model.fit_sgd(
-            choices, rewards, obs_design_matrix=obs_dm, num_steps=30,
+            choices,
+            rewards,
+            obs_design_matrix=obs_dm,
+            num_steps=30,
         )
         assert lls[-1] > lls[0]
         assert model.obs_weights_ is not None
@@ -808,15 +835,22 @@ class TestObservationDesignMatrix:
         obs_dm = obs_dm.at[30:, 0].set(1.0)
 
         model = ContingencyBeliefModel(
-            n_states=2, n_options=3, n_obs_covariates=1,
+            n_states=2,
+            n_options=3,
+            n_obs_covariates=1,
         )
         model.fit_sgd(
-            choices, rewards, obs_design_matrix=obs_dm, num_steps=20,
+            choices,
+            rewards,
+            obs_design_matrix=obs_dm,
+            num_steps=20,
         )
         # Predict on different data with obs covariates
         new_obs_dm = jnp.ones((60, 1))
         posterior = model.predict_state_posterior(
-            choices, rewards, obs_design_matrix=new_obs_dm,
+            choices,
+            rewards,
+            obs_design_matrix=new_obs_dm,
         )
         assert posterior.shape == (60, 2)
         np.testing.assert_allclose(posterior.sum(axis=1), 1.0, atol=1e-6)
@@ -828,10 +862,15 @@ class TestObservationDesignMatrix:
         obs_dm = obs_dm.at[40:, 0].set(1.0)
 
         model = ContingencyBeliefModel(
-            n_states=2, n_options=3, n_obs_covariates=1,
+            n_states=2,
+            n_options=3,
+            n_obs_covariates=1,
         )
         model.fit_sgd(
-            choices, rewards, obs_design_matrix=obs_dm, num_steps=15,
+            choices,
+            rewards,
+            obs_design_matrix=obs_dm,
+            num_steps=15,
         )
         # Predict on shorter sequence WITHOUT obs (stationary action model)
         posterior = model.predict_state_posterior(choices[:30], rewards[:30])
@@ -844,6 +883,7 @@ class TestObservationDesignMatrix:
         model = ContingencyBeliefModel(n_states=2, n_options=3)
         # fit() should not have obs_design_matrix parameter
         import inspect
+
         sig = inspect.signature(model.fit)
         assert "obs_design_matrix" not in sig.parameters
 
@@ -905,14 +945,16 @@ class TestContingencyBeliefRecovery:
 
         # State switches every 75 trials: 0, 1, 0, 1
         block_len = 75
-        true_states = jnp.concatenate([
-            jnp.full(block_len, i % 2) for i in range(n_trials // block_len)
-        ]).astype(jnp.int32)
+        true_states = jnp.concatenate(
+            [jnp.full(block_len, i % 2) for i in range(n_trials // block_len)]
+        ).astype(jnp.int32)
 
-        reward_probs = jnp.array([
-            [0.8, 0.1, 0.1],  # state 0: option 0 is best
-            [0.1, 0.1, 0.8],  # state 1: option 2 is best
-        ])
+        reward_probs = jnp.array(
+            [
+                [0.8, 0.1, 0.1],  # state 0: option 0 is best
+                [0.1, 0.1, 0.8],  # state 1: option 2 is best
+            ]
+        )
 
         # Generate choices: animals mostly pick best option (80% accuracy)
         best_options = jnp.array([0, 2])
@@ -925,7 +967,8 @@ class TestContingencyBeliefRecovery:
         # Generate rewards
         reward_p = reward_probs[true_states, choices]
         rewards = jax.random.bernoulli(
-            jax.random.PRNGKey(43), reward_p,
+            jax.random.PRNGKey(43),
+            reward_p,
         ).astype(jnp.int32)
 
         model = ContingencyBeliefModel(n_states=2, n_options=n_options)
@@ -940,11 +983,10 @@ class TestContingencyBeliefRecovery:
         model, choices, rewards, true_states, _, _ = fitted
         posterior = model.predict_state_posterior(choices, rewards)
         acc = state_segmentation_accuracy(
-            np.array(true_states), np.array(posterior),
+            np.array(true_states),
+            np.array(posterior),
         )
-        assert acc >= 0.70, (
-            f"State segmentation accuracy {acc:.3f} < 0.70"
-        )
+        assert acc >= 0.70, f"State segmentation accuracy {acc:.3f} < 0.70"
 
     def test_reward_prob_best_option_high(self, fitted):
         model, _, _, _, _, _ = fitted
@@ -953,8 +995,7 @@ class TestContingencyBeliefRecovery:
         for s in range(2):
             best_prob = float(np.max(learned[s]))
             assert best_prob > 0.65, (
-                f"State {s}: best reward prob {best_prob:.3f} < 0.65 "
-                f"(true is 0.8)"
+                f"State {s}: best reward prob {best_prob:.3f} < 0.65 (true is 0.8)"
             )
 
     def test_reward_prob_worst_options_low(self, fitted):
@@ -965,8 +1006,7 @@ class TestContingencyBeliefRecovery:
             sorted_probs = np.sort(learned[s])
             worst_prob = float(sorted_probs[0])
             assert worst_prob < 0.4, (
-                f"State {s}: worst reward prob {worst_prob:.3f} >= 0.4 "
-                f"(true is ~0.1)"
+                f"State {s}: worst reward prob {worst_prob:.3f} >= 0.4 (true is ~0.1)"
             )
 
 
@@ -1078,9 +1118,7 @@ class TestTransitionMStep:
         row ``t`` regresses each transition on the *previous* trial's
         covariate, which is independent of it, and returns weights near 0.
         """
-        choices, rewards, cov, states, reward_probs = (
-            _simulate_switch_covariate_iohmm()
-        )
+        choices, rewards, cov, states, reward_probs = _simulate_switch_covariate_iohmm()
         model = _true_switch_model(cov, reward_probs)
         posterior = contingency_belief_smoother(
             **model._smoother_kwargs(jnp.asarray(choices), jnp.asarray(rewards))
@@ -1115,9 +1153,7 @@ class TestTransitionMStep:
         assert np.all(np.sign(weight) == -np.sign(intercept)), (weight, intercept)
         assert np.all(np.abs(weight) > 2.0), weight
 
-    def test_m_step_optimizer_compiles_once_across_em_iterations(
-        self, monkeypatch
-    ):
+    def test_m_step_optimizer_compiles_once_across_em_iterations(self, monkeypatch):
         """The per-row BFGS runs in one module-level jitted program, so EM
         iterations with identical shapes reuse a single compilation."""
         from state_space_practice import contingency_belief as cb
@@ -1150,7 +1186,10 @@ class TestTransitionMStep:
         traces.clear()
         em_model = ContingencyBeliefModel(n_states=2, n_options=2)
         lls = em_model.fit(
-            choices, rewards, transition_covariates=cov, max_iter=4,
+            choices,
+            rewards,
+            transition_covariates=cov,
+            max_iter=4,
             tolerance=0.0,
         )
         assert len(lls) >= 4  # guard: several M-steps ran
@@ -1163,7 +1202,8 @@ class TestContingencyBeliefSeed:
         expected_values = jax.random.normal(jax.random.PRNGKey(0), (3, 2)) * 0.1
         expected_rewards = jnp.clip(
             0.5 + 0.05 * jax.random.normal(jax.random.PRNGKey(1), (3, 2)),
-            0.01, 0.99,
+            0.01,
+            0.99,
         )
         np.testing.assert_array_equal(model.state_values_, expected_values)
         np.testing.assert_array_equal(model.reward_probs_, expected_rewards)
@@ -1177,6 +1217,4 @@ class TestContingencyBeliefSeed:
         np.testing.assert_array_equal(a.state_values_, same.state_values_)
         np.testing.assert_array_equal(a.reward_probs_, same.reward_probs_)
         # the two parameters use independent keys
-        assert not np.allclose(
-            a.state_values_ / 0.1, (a.reward_probs_ - 0.5) / 0.05
-        )
+        assert not np.allclose(a.state_values_ / 0.1, (a.reward_probs_ - 0.5) / 0.05)

@@ -122,7 +122,9 @@ def approximate_gaussian(
     # so we cannot use Python conditionals on it. The optimization is assumed
     # to succeed for well-posed problems.
     x0_arr: Array = jnp.asarray(x0)
-    result = jax.scipy.optimize.minimize(fun=neg_log_posterior, x0=x0_arr, method="BFGS")
+    result = jax.scipy.optimize.minimize(
+        fun=neg_log_posterior, x0=x0_arr, method="BFGS"
+    )
 
     mode = result.x
     hessian = jax.hessian(neg_log_posterior)(mode)
@@ -224,9 +226,7 @@ def _log_posterior_objective(
     log_posterior : Array, shape ()
         Scalar log posterior of the state estimate
     """
-    prob_success = jax.nn.sigmoid(
-        bias + learning_state
-    )
+    prob_success = jax.nn.sigmoid(bias + learning_state)
     log_likelihood = jax.scipy.stats.binom.logpmf(
         k=n_correct_in_trial, n=max_possible_correct, p=prob_success
     )
@@ -339,9 +339,12 @@ def smith_learning_filter(
             )
 
     return _smith_learning_filter_impl(
-        n_correct_responses, max_correct_arr,
-        jnp.asarray(init_learning_state), init_var,
-        sigma_squared_epsilon, mu,
+        n_correct_responses,
+        max_correct_arr,
+        jnp.asarray(init_learning_state),
+        init_var,
+        sigma_squared_epsilon,
+        mu,
         differentiable=differentiable,
     )
 
@@ -380,7 +383,9 @@ def _smith_learning_filter_impl(
             bias=mu,
         )
         # Find mode and covariance (variance)
-        approx_fn = _approximate_gaussian_newton if differentiable else approximate_gaussian
+        approx_fn = (
+            _approximate_gaussian_newton if differentiable else approximate_gaussian
+        )
         posterior_mode, posterior_variance = approx_fn(
             log_objective_func, x0=jnp.array([one_step_mode])
         )
@@ -554,7 +559,9 @@ def maximization_step(
         (smoothed_learning_state_mode[1:] - smoothed_learning_state_mode[:-1]) ** 2
         + smoothed_learning_state_variance[1:]
         + smoothed_learning_state_variance[:-1]
-        - 2.0 * smoothed_learning_state_variance[1:] * smoother_gain  # Cov = A_k * P_{k+1|T}
+        - 2.0
+        * smoothed_learning_state_variance[1:]
+        * smoother_gain  # Cov = A_k * P_{k+1|T}
     )
 
     sigma_epsilon_sq = jnp.sum(expected_squared_diff_terms) / (n_trials - 1)
@@ -723,8 +730,8 @@ def find_min_consecutive_successes(
 
             if sequence_length <= 2 * current_run_length:
                 if n_possible_ending_positions > 1:
-                    prob_first_run_ends_at_idx[1:] = (
-                        prob_run_occurs * (1 - prob_correct_by_chance)
+                    prob_first_run_ends_at_idx[1:] = prob_run_occurs * (
+                        1 - prob_correct_by_chance
                     )
             else:
                 idx_simple_end = min(
@@ -915,20 +922,23 @@ def compute_cross_covariance_matrix(
     # = exp(cumsum_log[j] - cumsum_log[i]) * P_j
 
     # Create index grids
-    i_idx, j_idx = jnp.meshgrid(jnp.arange(n_trials), jnp.arange(n_trials), indexing="ij")
+    i_idx, j_idx = jnp.meshgrid(
+        jnp.arange(n_trials), jnp.arange(n_trials), indexing="ij"
+    )
 
     # Compute log of gain products: log(A_i * ... * A_{j-1}) = cumsum_log[j] - cumsum_log[i]
     log_gain_products = cumsum_log_gains[j_idx] - cumsum_log_gains[i_idx]
 
     # Cross-covariance = exp(log_gain_products) * P_j (for i <= j)
-    cross_cov_matrix = jnp.exp(log_gain_products) * smoothed_learning_state_variance[j_idx]
+    cross_cov_matrix = (
+        jnp.exp(log_gain_products) * smoothed_learning_state_variance[j_idx]
+    )
 
     # For i > j, use symmetry: Cov(x_i, x_j) = Cov(x_j, x_i)
     # But our formula computes Cov(x_i, x_j) = product(A_i:A_{j-1}) * P_j
     # which is only valid for i <= j. For i > j, we need to use the transpose.
     upper_tri = jnp.triu(cross_cov_matrix)
     return upper_tri + upper_tri.T - jnp.diag(jnp.diag(upper_tri))
-
 
 
 def compute_trial_comparison_matrix(
@@ -973,7 +983,9 @@ def compute_trial_comparison_matrix(
     n_trials = len(smoothed_learning_state_mode)
 
     # Compute full cross-covariance matrix
-    cross_cov_matrix = compute_cross_covariance_matrix(smoothed_learning_state_variance, smoother_gain)
+    cross_cov_matrix = compute_cross_covariance_matrix(
+        smoothed_learning_state_variance, smoother_gain
+    )
 
     # Generate samples for all trials at once: shape (n_samples, n_trials)
     # Sample from multivariate normal N(smoothed_learning_state_mode, cross_cov_matrix)
@@ -984,11 +996,15 @@ def compute_trial_comparison_matrix(
 
     # Generate standard normal samples and transform
     z = jax.random.normal(key, shape=(n_samples, n_trials))
-    samples = smoothed_learning_state_mode + z @ sqrt_cov.T  # shape: (n_samples, n_trials)
+    samples = (
+        smoothed_learning_state_mode + z @ sqrt_cov.T
+    )  # shape: (n_samples, n_trials)
 
     if compare_probability:
         if prob_correct_by_chance is None:
-            raise ValueError("prob_correct_by_chance is required when compare_probability=True")
+            raise ValueError(
+                "prob_correct_by_chance is required when compare_probability=True"
+            )
         mu_bias = math.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
         samples = jax.nn.sigmoid(mu_bias + samples)
 
@@ -1012,7 +1028,6 @@ def compute_trial_comparison_matrix(
         jnp.nan,
         comparison_matrix,
     )
-
 
 
 def compare_two_trials(
@@ -1070,7 +1085,9 @@ def compare_two_trials(
         return 0.5  # Same trial, no difference
 
     # Sample from 2x2 marginal; avoids O(n² × n_samples) full comparison matrix
-    cross_cov_matrix = compute_cross_covariance_matrix(smoothed_learning_state_variance, smoother_gain)
+    cross_cov_matrix = compute_cross_covariance_matrix(
+        smoothed_learning_state_variance, smoother_gain
+    )
     indices = jnp.array([trial1, trial2])
     mean_2 = smoothed_learning_state_mode[indices]
     cov_2 = cross_cov_matrix[jnp.ix_(indices, indices)]
@@ -1085,7 +1102,9 @@ def compare_two_trials(
 
     if compare_probability:
         if prob_correct_by_chance is None:
-            raise ValueError("prob_correct_by_chance is required when compare_probability=True")
+            raise ValueError(
+                "prob_correct_by_chance is required when compare_probability=True"
+            )
         mu_bias = math.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
         samples = jax.nn.sigmoid(mu_bias + samples)
 
@@ -1169,7 +1188,9 @@ def calculate_latent_state_percentiles(
     smoothed_learning_state_variance_arr = jnp.asarray(smoothed_learning_state_variance)
     n_trials = smoothed_learning_state_mode_arr.shape[0]
     epsilon = 1e-9  # For numerical stability if variance is tiny
-    smoothed_std_dev = jnp.sqrt(jnp.maximum(smoothed_learning_state_variance_arr, epsilon))
+    smoothed_std_dev = jnp.sqrt(
+        jnp.maximum(smoothed_learning_state_variance_arr, epsilon)
+    )
 
     def process_trial_state(key_trial: Array, mode_k: Array, std_dev_k: Array) -> Array:
         latent_state_samples = mode_k + std_dev_k * jax.random.normal(
@@ -1187,13 +1208,15 @@ def calculate_latent_state_percentiles(
     return mapped_results.T
 
 
-VALID_INIT_METHODS = frozenset({
-    "reestimate_initial_from_data",
-    "set_initial_to_zero",
-    "set_initial_conservative_from_second_trial",
-    "set_initial_direct_from_second_trial",
-    "user_provided",
-})
+VALID_INIT_METHODS = frozenset(
+    {
+        "reestimate_initial_from_data",
+        "set_initial_to_zero",
+        "set_initial_conservative_from_second_trial",
+        "set_initial_direct_from_second_trial",
+        "user_provided",
+    }
+)
 
 
 class SmithLearningModel(SGDFittableMixin):
@@ -1417,9 +1440,7 @@ class SmithLearningModel(SGDFittableMixin):
                 )
             validate_count_array(mpc, "max_possible_correct", allow_empty=False)
             if bool(jnp.any(mpc_arr <= 0)):
-                raise ValueError(
-                    "max_possible_correct must contain positive integers."
-                )
+                raise ValueError("max_possible_correct must contain positive integers.")
             return mpc_arr
 
         # Infer from data
@@ -1429,9 +1450,7 @@ class SmithLearningModel(SGDFittableMixin):
                 "All n_correct_responses are 0 or less; max_possible_correct inferred as 1."
             )
             val = 1
-        logger.info(
-            f"max_possible_correct not provided; inferred as {val} from data."
-        )
+        logger.info(f"max_possible_correct not provided; inferred as {val} from data.")
         return jnp.full(n_trials, val, dtype=jnp.int32)
 
     def _e_step(self, n_correct_responses: jax.Array) -> float:
@@ -1747,14 +1766,10 @@ class SmithLearningModel(SGDFittableMixin):
                 f"n_correct_responses must be 1D, got shape {n_correct_arr.shape}."
             )
         if len(n_correct_arr) < 2:
-            raise ValueError(
-                f"Need at least 2 trials, got {len(n_correct_arr)}."
-            )
+            raise ValueError(f"Need at least 2 trials, got {len(n_correct_arr)}.")
         validate_count_array(n_correct_arr, "n_correct_responses", allow_empty=False)
         self._n_trials_ = int(n_correct_arr.shape[0])
-        self._resolved_max_correct = self._resolve_max_possible_correct(
-            n_correct_arr
-        )
+        self._resolved_max_correct = self._resolve_max_possible_correct(n_correct_arr)
         if bool(jnp.any(n_correct_arr > self._resolved_max_correct)):
             raise ValueError(
                 "n_correct_responses contains values exceeding max_possible_correct."
@@ -1787,17 +1802,13 @@ class SmithLearningModel(SGDFittableMixin):
         ):
             params["init_learning_state"] = jnp.array(self.init_learning_state)
             spec["init_learning_state"] = UNCONSTRAINED
-            params["init_learning_variance"] = jnp.array(
-                self.init_learning_variance
-            )
+            params["init_learning_variance"] = jnp.array(self.init_learning_variance)
             spec["init_learning_variance"] = POSITIVE
         # For other methods, init state is data-driven or fixed — freeze it.
 
         return params, spec
 
-    def _sgd_loss_fn(
-        self, params: dict, n_correct_responses: Array
-    ) -> Array:
+    def _sgd_loss_fn(self, params: dict, n_correct_responses: Array) -> Array:
         # Read a model attribute only when the parameter is not optimized:
         # ``params.get(key, self.attr)`` reads it regardless, and fit_sgd only
         # reuses a compiled step while the attributes the loss read at trace
@@ -1873,9 +1884,7 @@ class SmithLearningModel(SGDFittableMixin):
             prob_correct_by_chance=self.prob_correct_by_chance,
         )
 
-        prob_pred_success = jax.nn.sigmoid(
-            self.mu_bias + self.filtered_one_step_mode
-        )
+        prob_pred_success = jax.nn.sigmoid(self.mu_bias + self.filtered_one_step_mode)
         epsilon = 1e-9
         prob_pred_success = jnp.clip(prob_pred_success, epsilon, 1.0 - epsilon)
         log_likelihood_terms = jax.scipy.stats.binom.logpmf(
@@ -2027,8 +2036,7 @@ class SmithLearningModel(SGDFittableMixin):
         if prob_correct_by_chance is None:
             prob_correct_by_chance_to_use = self.prob_correct_by_chance
             logger.info(
-                f"Using prob_correct_by_chance "
-                f"({prob_correct_by_chance_to_use:.3f})."
+                f"Using prob_correct_by_chance ({prob_correct_by_chance_to_use:.3f})."
             )
         else:
             prob_correct_by_chance_to_use = prob_correct_by_chance
@@ -2698,11 +2706,13 @@ class SmithLearningModel(SGDFittableMixin):
         # Null model: constant probability = prob_correct_by_chance
         epsilon = 1e-9
         p_null = max(epsilon, min(self.prob_correct_by_chance, 1.0 - epsilon))
-        null_ll = float(jnp.sum(
-            jax.scipy.stats.binom.logpmf(
-                k=n_correct_responses, n=resolved_max, p=p_null
+        null_ll = float(
+            jnp.sum(
+                jax.scipy.stats.binom.logpmf(
+                    k=n_correct_responses, n=resolved_max, p=p_null
+                )
             )
-        ))
+        )
 
         # BIC: null model has 0 free parameters (chance is fixed)
         model_bic = self.bic()
@@ -2771,14 +2781,16 @@ class SmithLearningModel(SGDFittableMixin):
 
         if key is not None and n_correct_responses is not None:
             comparison = self.compare_to_null(n_correct_responses)
-            lines.extend([
-                "",
-                "  Null model comparison:",
-                f"    Null LL:              {comparison['null_ll']:.4f}",
-                f"    Null BIC:             {comparison['null_bic']:.4f}",
-                f"    Delta BIC:            {comparison['delta_bic']:.4f}",
-                f"    Learning detected:    {comparison['learning_detected']}",
-            ])
+            lines.extend(
+                [
+                    "",
+                    "  Null model comparison:",
+                    f"    Null LL:              {comparison['null_ll']:.4f}",
+                    f"    Null BIC:             {comparison['null_bic']:.4f}",
+                    f"    Delta BIC:            {comparison['delta_bic']:.4f}",
+                    f"    Learning detected:    {comparison['learning_detected']}",
+                ]
+            )
 
         return "\n".join(lines)
 
@@ -2852,35 +2864,63 @@ class SmithLearningModel(SGDFittableMixin):
 
         # Colorblind-safe palette (Wong 2011)
         color_higher = "#E69F00"  # orange
-        color_lower = "#0072B2"   # blue
+        color_lower = "#0072B2"  # blue
 
         # Significant: trial j higher than trial i
         sig_higher = upper_mask & (mat_np < alpha_half)
         rows, cols = np.where(sig_higher)
         if len(rows) > 0:
-            ax.scatter(cols, rows, c=color_higher, marker="o", s=40,
-                       label="Sig. higher", zorder=3)
+            ax.scatter(
+                cols,
+                rows,
+                c=color_higher,
+                marker="o",
+                s=40,
+                label="Sig. higher",
+                zorder=3,
+            )
 
         # Marginal: trial j higher
         marg_higher = upper_mask & (mat_np >= alpha_half) & (mat_np < alpha)
         rows, cols = np.where(marg_higher)
         if len(rows) > 0:
-            ax.scatter(cols, rows, c=color_higher, marker="*", s=30,
-                       label="Marg. higher", zorder=3)
+            ax.scatter(
+                cols,
+                rows,
+                c=color_higher,
+                marker="*",
+                s=30,
+                label="Marg. higher",
+                zorder=3,
+            )
 
         # Significant: trial i higher than trial j (unusual)
         sig_lower = upper_mask & (mat_np > 1 - alpha_half)
         rows, cols = np.where(sig_lower)
         if len(rows) > 0:
-            ax.scatter(cols, rows, c=color_lower, marker="^", s=40,
-                       label="Sig. lower", zorder=3)
+            ax.scatter(
+                cols,
+                rows,
+                c=color_lower,
+                marker="^",
+                s=40,
+                label="Sig. lower",
+                zorder=3,
+            )
 
         # Marginal: trial i higher
         marg_lower = upper_mask & (mat_np <= 1 - alpha_half) & (mat_np > 1 - alpha)
         rows, cols = np.where(marg_lower)
         if len(rows) > 0:
-            ax.scatter(cols, rows, c=color_lower, marker="*", s=30,
-                       label="Marg. lower", zorder=3)
+            ax.scatter(
+                cols,
+                rows,
+                c=color_lower,
+                marker="*",
+                s=30,
+                label="Marg. lower",
+                zorder=3,
+            )
 
         # Add diagonal line
         ax.plot([0, n_trials - 1], [0, n_trials - 1], "k-", linewidth=0.5)
@@ -2989,26 +3029,56 @@ class SmithLearningModel(SGDFittableMixin):
         ax = axes[0]
         key1, key2 = jax.random.split(key)
         prob_percentiles, _ = self.get_learning_curve(
-            key=key1, n_samples=n_samples, percentiles=plot_percentiles,
+            key=key1,
+            n_samples=n_samples,
+            percentiles=plot_percentiles,
         )
-        ax.plot(trials_axis, prob_percentiles[1], color="blue", linewidth=2,
-                label="Smoothed median")
-        ax.fill_between(trials_axis, prob_percentiles[0], prob_percentiles[2],
-                        color="blue", alpha=0.2, label="90% CI")
-        ax.axhline(self.prob_correct_by_chance, color="gray", linestyle="--",
-                    linewidth=1, label=f"Chance ({self.prob_correct_by_chance:.2g})")
+        ax.plot(
+            trials_axis,
+            prob_percentiles[1],
+            color="blue",
+            linewidth=2,
+            label="Smoothed median",
+        )
+        ax.fill_between(
+            trials_axis,
+            prob_percentiles[0],
+            prob_percentiles[2],
+            color="blue",
+            alpha=0.2,
+            label="90% CI",
+        )
+        ax.axhline(
+            self.prob_correct_by_chance,
+            color="gray",
+            linestyle="--",
+            linewidth=1,
+            label=f"Chance ({self.prob_correct_by_chance:.2g})",
+        )
 
         if observed_n_correct is not None:
             observed_n_correct = jnp.asarray(observed_n_correct)
             if jnp.all((observed_n_correct == 0) | (observed_n_correct == 1)):
-                ax.scatter(trials_axis, observed_n_correct, color="lightgray",
-                           alpha=0.7, s=15, marker="|", label="Observed (0/1)")
+                ax.scatter(
+                    trials_axis,
+                    observed_n_correct,
+                    color="lightgray",
+                    alpha=0.7,
+                    s=15,
+                    marker="|",
+                    label="Observed (0/1)",
+                )
 
         # Mark criterion trial
         criterion = self.find_criterion_trial(key1, n_samples=n_samples)
         if criterion is not None and criterion > 0:
-            ax.axvline(criterion, color="green", linestyle=":", linewidth=1.5,
-                       label=f"Criterion trial ({criterion})")
+            ax.axvline(
+                criterion,
+                color="green",
+                linestyle=":",
+                linewidth=1.5,
+                label=f"Criterion trial ({criterion})",
+            )
 
         ax.set_xlabel("Trial", fontsize=11)
         ax.set_ylabel("P(Correct)", fontsize=11)
@@ -3020,12 +3090,25 @@ class SmithLearningModel(SGDFittableMixin):
         # --- Panel 2: Latent state ---
         ax = axes[1]
         state_percentiles = self.get_latent_state_percentiles(
-            key=key2, n_samples=n_samples, percentiles=plot_percentiles,
+            key=key2,
+            n_samples=n_samples,
+            percentiles=plot_percentiles,
         )
-        ax.plot(trials_axis, state_percentiles[1], color="blue", linewidth=2,
-                label="Smoothed median")
-        ax.fill_between(trials_axis, state_percentiles[0], state_percentiles[2],
-                        color="blue", alpha=0.2, label="90% CI")
+        ax.plot(
+            trials_axis,
+            state_percentiles[1],
+            color="blue",
+            linewidth=2,
+            label="Smoothed median",
+        )
+        ax.fill_between(
+            trials_axis,
+            state_percentiles[0],
+            state_percentiles[2],
+            color="blue",
+            alpha=0.2,
+            label="90% CI",
+        )
         ax.axhline(0, color="gray", linestyle="--", linewidth=0.8)
         ax.set_xlabel("Trial", fontsize=11)
         ax.set_ylabel("Latent State", fontsize=11)
@@ -3037,8 +3120,13 @@ class SmithLearningModel(SGDFittableMixin):
         ax = axes[2]
         if self.log_likelihood_history_:
             iterations = range(1, len(self.log_likelihood_history_) + 1)
-            ax.plot(iterations, self.log_likelihood_history_, "o-", markersize=3,
-                    color="blue")
+            ax.plot(
+                iterations,
+                self.log_likelihood_history_,
+                "o-",
+                markersize=3,
+                color="blue",
+            )
         ax.set_xlabel("EM Iteration", fontsize=11)
         ax.set_ylabel("Log-Likelihood", fontsize=11)
         ax.set_title("EM Convergence", fontsize=13, fontweight="bold")
@@ -3048,7 +3136,8 @@ class SmithLearningModel(SGDFittableMixin):
             f"SmithLearningModel Summary "
             f"(\u03c3\u03b5={self.sigma_epsilon:.3g}, "
             f"BIC={self.bic():.1f})",
-            fontsize=14, fontweight="bold",
+            fontsize=14,
+            fontweight="bold",
         )
 
         return fig, axes

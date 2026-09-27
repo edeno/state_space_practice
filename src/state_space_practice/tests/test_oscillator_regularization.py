@@ -1,5 +1,6 @@
 # ruff: noqa: E402
 """Tests for oscillator connectivity regularization penalties."""
+
 import jax
 
 jax.config.update("jax_enable_x64", True)
@@ -48,10 +49,12 @@ class TestEdgeL1Penalty:
 
 class TestAreaGroupPenalty:
     def test_groups_by_area_labels(self):
-        coupling = jnp.array([
-            [[0.0, 1.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.0]],
-            [[0.0, 2.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.0]],
-        ])
+        coupling = jnp.array(
+            [
+                [[0.0, 1.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.0]],
+                [[0.0, 2.0, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            ]
+        )
         area_labels = jnp.array([0, 0, 1])
         value = area_group_penalty(coupling, area_labels)
         assert value > 0.0
@@ -91,14 +94,18 @@ class TestAreaGroupPenalty:
 
 class TestStateSharedAreaPenalty:
     def test_invariant_to_state_permutation(self):
-        coupling = jnp.array([
-            [[0.0, 1.0], [0.5, 0.0]],
-            [[0.0, 2.0], [0.5, 0.0]],
-            [[0.0, 0.5], [1.0, 0.0]],
-        ])
+        coupling = jnp.array(
+            [
+                [[0.0, 1.0], [0.5, 0.0]],
+                [[0.0, 2.0], [0.5, 0.0]],
+                [[0.0, 0.5], [1.0, 0.0]],
+            ]
+        )
         area_labels = jnp.array([0, 1])
         original = state_shared_area_penalty(coupling, area_labels)
-        permuted = state_shared_area_penalty(coupling[jnp.array([2, 0, 1])], area_labels)
+        permuted = state_shared_area_penalty(
+            coupling[jnp.array([2, 0, 1])], area_labels
+        )
         np.testing.assert_allclose(float(original), float(permuted), atol=1e-10)
 
     def test_reduces_to_area_penalty_for_single_state(self):
@@ -180,9 +187,7 @@ class TestOscillatorPenaltyConfig:
         p_100 = total_connectivity_penalty(coupling, config, n_timesteps=100)
         p_1000 = total_connectivity_penalty(coupling, config, n_timesteps=1000)
         # After dividing by T: p_100/100 ≈ p_1000/1000
-        np.testing.assert_allclose(
-            float(p_100) / 100, float(p_1000) / 1000, rtol=1e-10
-        )
+        np.testing.assert_allclose(float(p_100) / 100, float(p_1000) / 1000, rtol=1e-10)
 
     def test_scale_with_length_true(self):
         """scale_with_length=True: raw penalty, no T scaling."""
@@ -261,7 +266,9 @@ class TestRegularizedSGDIntegration:
         )
         config = OscillatorPenaltyConfig(edge_l1=0.5)
         model_reg.fit_sgd(
-            scenario["obs"], key=key, num_steps=40,
+            scenario["obs"],
+            key=key,
+            num_steps=40,
             connectivity_penalty=config,
         )
 
@@ -291,11 +298,14 @@ class TestRegularizedSGDIntegration:
         )
         area_labels = jnp.array([0, 1])  # 2 oscillators, 2 areas
         config = OscillatorPenaltyConfig(
-            area_group_l2=1.0, area_labels=area_labels,
+            area_group_l2=1.0,
+            area_labels=area_labels,
         )
         key = jax.random.PRNGKey(0)
         lls = model.fit_sgd(
-            scenario["obs"], key=key, num_steps=30,
+            scenario["obs"],
+            key=key,
+            num_steps=30,
             connectivity_penalty=config,
         )
 
@@ -346,10 +356,13 @@ class TestRegularizedSGDIntegration:
             coupling_strength=p["coupling_strength"],
         )
         config = OscillatorPenaltyConfig(
-            area_group_l2=2.0, area_labels=area_labels,
+            area_group_l2=2.0,
+            area_labels=area_labels,
         )
         model_reg.fit_sgd(
-            scenario["obs"], key=key, num_steps=40,
+            scenario["obs"],
+            key=key,
+            num_steps=40,
             connectivity_penalty=config,
         )
         c_reg = jnp.moveaxis(model_reg.coupling_strength, -1, 0)

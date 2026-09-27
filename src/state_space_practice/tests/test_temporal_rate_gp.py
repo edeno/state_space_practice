@@ -455,9 +455,7 @@ def test_batch_inference_rejects_empty_counts():
 
 
 @pytest.mark.parametrize("bad_min_weight", [0.0, -1.0, np.nan, np.inf])
-def test_batch_inference_rejects_invalid_min_weight(
-    multineuron_counts, bad_min_weight
-):
+def test_batch_inference_rejects_invalid_min_weight(multineuron_counts, bad_min_weight):
     with pytest.raises(ValueError, match="min_weight"):
         infer_log_rate_batch(
             multineuron_counts,

@@ -506,17 +506,26 @@ class TestDeprecatedFilterJitAndFloors:
 
         monkeypatch.setattr(models, "_safe_expected_count", counting)
         args = (
-            m["init_mode"], m["init_cov"], m["position"], m["spike_indicator"],
+            m["init_mode"],
+            m["init_cov"],
+            m["position"],
+            m["spike_indicator"],
         )
         models._stochastic_point_process_filter_impl.clear_cache()
         first, _ = stochastic_point_process_filter(
-            *args, m["dt"], m["transition_matrix"], m["latent_state_cov"],
+            *args,
+            m["dt"],
+            m["transition_matrix"],
+            m["latent_state_cov"],
             log_receptive_field_model,
         )
         # guard: the first call after clearing the cache traced the scan once.
         assert len(traces) == 1
         second, _ = stochastic_point_process_filter(
-            *args, 0.5 * m["dt"], m["transition_matrix"], 2 * m["latent_state_cov"],
+            *args,
+            0.5 * m["dt"],
+            m["transition_matrix"],
+            2 * m["latent_state_cov"],
             log_receptive_field_model,
         )
         assert len(traces) == 1

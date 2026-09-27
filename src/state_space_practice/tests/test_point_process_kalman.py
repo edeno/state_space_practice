@@ -3996,9 +3996,7 @@ class TestBlockDiagonalSmootherEquivalence:
         with pytest.raises(ValueError, match="axis=0"):
             block[1].sum(axis=1)
 
-    def test_block_cores_compile_once_across_repeated_calls(
-        self, monkeypatch
-    ) -> None:
+    def test_block_cores_compile_once_across_repeated_calls(self, monkeypatch) -> None:
         """The block cores are jitted with the option flags static, so calls
         with identical shapes (every EM iteration) reuse one compilation even
         when the parameter values, ``dt`` and ``max_log_count`` change.
@@ -4795,7 +4793,6 @@ class TestBlockDispatchValidatesInputs:
         assert bool(jnp.isfinite(ll))
 
 
-
 # ---------------------------------------------------------------------------
 # Initial-state M-step, traceability, carry dtype, Laplace normaliser, Armijo
 # ---------------------------------------------------------------------------
@@ -4823,8 +4820,14 @@ class TestPointProcessInitialStateMStep:
         A, Q = jnp.eye(1) * 0.5, jnp.eye(1) * 0.1
         m0, P0 = jnp.zeros(1), jnp.eye(1)
         sm, sc, scc, _ = stochastic_point_process_smoother(
-            m0, P0, constant_rate_problem["design_matrix"],
-            constant_rate_problem["spikes"], 0.1, A, Q, log_conditional_intensity,
+            m0,
+            P0,
+            constant_rate_problem["design_matrix"],
+            constant_rate_problem["spikes"],
+            0.1,
+            A,
+            Q,
+            log_conditional_intensity,
         )
         prior = InitialStatePrior(m0, P0, A, Q)
         _, _, init_mean, init_cov = dynamics_only_m_step(
@@ -4920,12 +4923,26 @@ class TestPointProcessTraceability:
         Z, y, A, Q = problem
         kwargs = dict(max_newton_iter=max_newton_iter)
         mean, cov, ll = stochastic_point_process_filter(
-            jnp.zeros(3, jnp.float32), jnp.eye(3, dtype=jnp.float32),
-            Z, y, 0.1, A, Q, log_conditional_intensity, **kwargs,
+            jnp.zeros(3, jnp.float32),
+            jnp.eye(3, dtype=jnp.float32),
+            Z,
+            y,
+            0.1,
+            A,
+            Q,
+            log_conditional_intensity,
+            **kwargs,
         )
         assert mean.dtype == jnp.float64 and cov.dtype == jnp.float64
         ref = stochastic_point_process_filter(
-            jnp.zeros(3), jnp.eye(3), Z, y, 0.1, A, Q, log_conditional_intensity,
+            jnp.zeros(3),
+            jnp.eye(3),
+            Z,
+            y,
+            0.1,
+            A,
+            Q,
+            log_conditional_intensity,
             **kwargs,
         )
         np.testing.assert_allclose(mean, ref[0], rtol=1e-12)
@@ -5027,7 +5044,11 @@ class TestArmijoLineSearch:
     def test_converged_point_is_not_a_failure(self) -> None:
         step, f = self._quadratic(1.0)
         _, _, n_failed = _fisher_scoring_line_search(
-            jnp.zeros(2), jnp.eye(2), step, f, max_newton_iter=3,
+            jnp.zeros(2),
+            jnp.eye(2),
+            step,
+            f,
+            max_newton_iter=3,
             line_search_beta=0.5,
         )
         assert int(n_failed) == 0
@@ -5051,12 +5072,16 @@ class TestArmijoLineSearch:
         Z = jnp.asarray(rng.normal(size=(n_time, 2, 2)))
         y = jnp.asarray(rng.poisson(3.0, size=(n_time, 2)))
         args = (jnp.zeros(2), jnp.eye(2), Z, y, 0.1, jnp.eye(2), jnp.eye(2) * 0.1)
-        with caplog.at_level("WARNING", logger="state_space_practice.point_process_kalman"):
+        with caplog.at_level(
+            "WARNING", logger="state_space_practice.point_process_kalman"
+        ):
             stochastic_point_process_filter(*args, bad_log_rate, max_newton_iter=3)
         assert any("line search" in r.getMessage() for r in caplog.records)
         # guard: a correct intensity with the same data does not warn.
         caplog.clear()
-        with caplog.at_level("WARNING", logger="state_space_practice.point_process_kalman"):
+        with caplog.at_level(
+            "WARNING", logger="state_space_practice.point_process_kalman"
+        ):
             stochastic_point_process_filter(
                 *args, log_conditional_intensity, max_newton_iter=3
             )

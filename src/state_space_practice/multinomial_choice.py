@@ -150,12 +150,14 @@ def softmax_observation_update(
         prior mean (for EM monitoring).
     """
     if choice < 0 or choice >= n_options:
-        raise ValueError(
-            f"choice must be in [0, {n_options}), got {choice}"
-        )
+        raise ValueError(f"choice must be in [0, {n_options}), got {choice}")
     return _softmax_update_core(
-        prior_mean, prior_cov, jnp.int32(choice),
-        n_options, inverse_temperature, max_newton_steps,
+        prior_mean,
+        prior_cov,
+        jnp.int32(choice),
+        n_options,
+        inverse_temperature,
+        max_newton_steps,
     )
 
 
@@ -175,6 +177,7 @@ class ChoiceFilterResult(NamedTuple):
     marginal_log_likelihood : Array
         Sum of per-trial log-likelihoods.
     """
+
     filtered_values: Array
     filtered_covariances: Array
     predicted_values: Array
@@ -193,6 +196,7 @@ class ChoiceSmootherResult(NamedTuple):
         Cross-covariance Cov(x_t, x_{t+1} | y_{1:T}).
     marginal_log_likelihood : Array
     """
+
     smoothed_values: Array
     smoothed_covariances: Array
     smoother_cross_cov: Array
@@ -248,8 +252,12 @@ def multinomial_choice_filter(
         init_cov = jnp.asarray(init_cov)
 
     return _multinomial_choice_filter_jit(
-        choices_arr, n_options, process_noise, inverse_temperature,
-        init_mean, init_cov,
+        choices_arr,
+        n_options,
+        process_noise,
+        inverse_temperature,
+        init_mean,
+        init_cov,
     )
 
 
@@ -275,18 +283,24 @@ def _multinomial_choice_filter_jit(
 
         # Update
         post_mean, post_cov, ll = _softmax_update_core(
-            pred_mean, pred_cov, choice_t,
-            n_options, inverse_temperature,
+            pred_mean,
+            pred_cov,
+            choice_t,
+            n_options,
+            inverse_temperature,
         )
 
         total_ll = total_ll + ll
         return (post_mean, post_cov, total_ll), (
-            post_mean, post_cov, pred_mean, pred_cov
+            post_mean,
+            post_cov,
+            pred_mean,
+            pred_cov,
         )
 
     init_carry = (init_mean, init_cov, jnp.array(0.0))
-    (_, _, marginal_ll), (filt_vals, filt_covs, pred_vals, pred_covs) = (
-        jax.lax.scan(_step, init_carry, choices)
+    (_, _, marginal_ll), (filt_vals, filt_covs, pred_vals, pred_covs) = jax.lax.scan(
+        _step, init_carry, choices
     )
 
     return ChoiceFilterResult(
@@ -315,8 +329,12 @@ def multinomial_choice_smoother(
     ChoiceSmootherResult
     """
     filt = multinomial_choice_filter(
-        choices, n_options, process_noise, inverse_temperature,
-        init_mean, init_cov,
+        choices,
+        n_options,
+        process_noise,
+        inverse_temperature,
+        init_mean,
+        init_cov,
     )
 
     k_free = n_options - 1
@@ -815,7 +833,8 @@ class MultinomialChoiceModel(SGDFittableMixin):
             else jnp.array(self.inverse_temperature)
         )
         result = _multinomial_choice_filter_jit(
-            choices, self.n_options,
+            choices,
+            self.n_options,
             process_noise,
             inverse_temperature,
             jnp.zeros(k_free),
@@ -849,9 +868,9 @@ class MultinomialChoiceModel(SGDFittableMixin):
         Convention: smoother_cross_cov[t] = Cov(x_t, x_{t+1} | y_{1:T}),
         which pairs with diff[t] = m[t+1] - a * m[t].
         """
-        m = smooth.smoothed_values       # (T, K-1)
+        m = smooth.smoothed_values  # (T, K-1)
         P = smooth.smoothed_covariances  # (T, K-1, K-1)
-        C = smooth.smoother_cross_cov    # (T-1, K-1, K-1)
+        C = smooth.smoother_cross_cov  # (T-1, K-1, K-1)
         a = self._transition_decay()
 
         T_minus_1 = m.shape[0] - 1
@@ -877,6 +896,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         beta_grid: Array,
     ) -> float:
         """M-step: grid search + golden-section refinement for beta."""
+
         def _eval_beta(beta):
             result = self._run_filter(choices, inverse_temperature=beta)
             return result.marginal_log_likelihood
@@ -951,9 +971,8 @@ class MultinomialChoiceModel(SGDFittableMixin):
         Only counts parameters that are actually learned via EM.
         """
         self._check_fitted("bic")
-        return (
-            -2.0 * self.log_likelihood_
-            + self.n_free_params * math.log(self._n_trials)
+        return -2.0 * self.log_likelihood_ + self.n_free_params * math.log(
+            self._n_trials
         )
 
     def compare_to_null(self) -> dict:
@@ -1020,11 +1039,18 @@ class MultinomialChoiceModel(SGDFittableMixin):
             std = np.sqrt(covs[:, k, k])
             ax.plot(trials, vals[:, k], label=option_labels[k + 1])
             ax.fill_between(
-                trials, vals[:, k] - 1.96 * std, vals[:, k] + 1.96 * std,
+                trials,
+                vals[:, k] - 1.96 * std,
+                vals[:, k] + 1.96 * std,
                 alpha=0.2,
             )
-        ax.axhline(0, color="gray", linestyle="--", alpha=0.5,
-                   label=f"{option_labels[0]} (ref)")
+        ax.axhline(
+            0,
+            color="gray",
+            linestyle="--",
+            alpha=0.5,
+            label=f"{option_labels[0]} (ref)",
+        )
         ax.set_ylabel("Relative value")
         ax.set_title(title)
         ax.legend(fontsize=legend_fontsize)
@@ -1060,9 +1086,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
             fig = axes[0].figure
 
         # Top: latent values with CI
-        self._plot_smoothed_values(
-            axes[0], option_labels, "Smoothed Option Values", 8
-        )
+        self._plot_smoothed_values(axes[0], option_labels, "Smoothed Option Values", 8)
 
         # Bottom: choice probabilities (stacked area)
         axes[1].stackplot(trials, probs.T, labels=option_labels, alpha=0.7)
@@ -1073,8 +1097,11 @@ class MultinomialChoiceModel(SGDFittableMixin):
                 chosen_trials = trials[choices_np == k]
                 if len(chosen_trials) > 0:
                     axes[1].eventplot(
-                        chosen_trials, lineoffsets=1.02 - k * 0.03,
-                        linelengths=0.02, colors="k", alpha=0.4,
+                        chosen_trials,
+                        lineoffsets=1.02 - k * 0.03,
+                        linelengths=0.02,
+                        colors="k",
+                        alpha=0.4,
                     )
         axes[1].set_ylabel("Choice probability")
         axes[1].set_xlabel("Trial")
@@ -1100,8 +1127,11 @@ class MultinomialChoiceModel(SGDFittableMixin):
         else:
             fig = ax.figure
 
-        ax.plot(range(1, len(self.log_likelihood_history_) + 1),
-                self.log_likelihood_history_, "o-")
+        ax.plot(
+            range(1, len(self.log_likelihood_history_) + 1),
+            self.log_likelihood_history_,
+            "o-",
+        )
         ax.set_xlabel("EM Iteration")
         ax.set_ylabel("Log-Likelihood")
         ax.set_title("EM Convergence")
@@ -1157,6 +1187,7 @@ class SimulatedChoiceData(NamedTuple):
     true_values : Array, shape (n_trials, K-1)
     true_probs : Array, shape (n_trials, K)
     """
+
     choices: Array
     true_values: Array
     true_probs: Array
@@ -1198,9 +1229,7 @@ def simulate_choice_data(
     probs = np.exp(logits_shifted)
     probs = probs / probs.sum(axis=1, keepdims=True)
 
-    choices = np.array([
-        rng.choice(n_options, p=probs[t]) for t in range(n_trials)
-    ])
+    choices = np.array([rng.choice(n_options, p=probs[t]) for t in range(n_trials)])
 
     return SimulatedChoiceData(
         choices=jnp.array(choices),
