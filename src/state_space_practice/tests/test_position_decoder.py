@@ -1667,7 +1667,8 @@ class TestPositionDecoderRateMapRecovery:
     match the true place field centers."""
 
     @pytest.fixture(scope="class")
-    def fitted_decoder(self):
+    @classmethod
+    def fitted_decoder(cls):
         rng = np.random.default_rng(42)
         n_time = 7500  # 30 s at dt=0.004
         dt = 0.004

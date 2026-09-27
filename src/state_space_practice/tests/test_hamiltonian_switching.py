@@ -595,7 +595,8 @@ class TestSwitchingHamiltonianSGDRecovery:
     """Verify fit_sgd learns distinguishable omegas and recovers state structure."""
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         from state_space_practice.hamiltonian_switching import (
             SwitchingHamiltonianJointModel,
         )

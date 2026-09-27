@@ -254,7 +254,8 @@ class TestHamiltonianLFPSGDRecovery:
     """Verify fit_sgd learns omega and observation matrix from LFP data."""
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         omega_true = 2 * jnp.pi
         dt = 0.01
         n_time = 300

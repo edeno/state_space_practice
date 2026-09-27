@@ -4248,7 +4248,8 @@ class TestPointProcessModelRecovery:
     transition matrix recovery and latent trajectory tracking."""
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         # 1D latent state, single neuron — simplest recovery scenario
         n_basis = 3
         n_time = 500
@@ -4810,7 +4811,8 @@ class TestPointProcessInitialStateMStep:
     to the smoothed x_0 (the filter predicts before its first update)."""
 
     @pytest.fixture(scope="class")
-    def constant_rate_problem(self) -> dict:
+    @classmethod
+    def constant_rate_problem(cls) -> dict:
         rng = np.random.default_rng(0)
         n_time = 40
         return {
@@ -4876,7 +4878,8 @@ class TestPointProcessTraceability:
     and mixed-precision inputs promote the scan carry."""
 
     @pytest.fixture(scope="class")
-    def problem(self) -> tuple:
+    @classmethod
+    def problem(cls) -> tuple:
         rng = np.random.default_rng(3)
         n_time, n_state = 30, 3
         Z = jnp.asarray(rng.normal(size=(n_time, 2, n_state)) * 0.3)

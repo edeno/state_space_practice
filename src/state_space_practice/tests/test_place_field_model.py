@@ -2261,7 +2261,8 @@ class TestPlaceFieldModelRecovery:
     the recovered rate map correlates with ground truth."""
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         data = simulate_2d_moving_place_field(
             total_time=30.0,
             dt=0.020,
@@ -2320,7 +2321,8 @@ class TestPlaceFieldMStep:
     closed forms."""
 
     @pytest.fixture(scope="class")
-    def initialized_model(self, sim_data: dict) -> PlaceFieldModel:
+    @classmethod
+    def initialized_model(cls, sim_data: dict) -> PlaceFieldModel:
         model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
         model.fit(sim_data["position"], sim_data["spikes"], max_iter=1, verbose=False)
         return model

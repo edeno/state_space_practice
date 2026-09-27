@@ -392,7 +392,8 @@ class TestJointHamiltonianSGDRecovery:
     """Verify fit_sgd learns omega from joint LFP + spike observations."""
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         omega_true = 2 * jnp.pi
         dt = 0.01
         n_time = 300

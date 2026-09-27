@@ -937,7 +937,8 @@ class TestContingencyBeliefRecovery:
     state segmentation accuracy and reward probability recovery."""
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         # Use multiple block switches for richer signal
         key = jax.random.PRNGKey(42)
         n_trials = 300

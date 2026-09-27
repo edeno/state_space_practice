@@ -2103,7 +2103,8 @@ class TestSmithLearningModelRecovery:
     the recovered learning curve tracks the true probability trajectory."""
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         outcomes, true_prob = simulate_learning_data(
             n_trials=200,
             prob_success_init=0.125,
