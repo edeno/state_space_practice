@@ -68,6 +68,8 @@ from jax.typing import ArrayLike
 from state_space_practice.em_driver import run_em
 from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.multinomial_choice import (
+    _ARMIJO_C,
+    _NEWTON_STEP_SIZES,
     _armijo_slack,
     _warn_if_newton_unconverged,
 )
@@ -140,12 +142,6 @@ def approximate_gaussian(
     covariance = jnp.linalg.pinv(hessian + jnp.eye(hessian.shape[0]) * reg)
 
     return mode, covariance
-
-
-# Backtracking step sizes (largest first) and Armijo constant for the
-# Newton mode search.
-_NEWTON_STEP_SIZES = tuple(0.5**i for i in range(8))
-_ARMIJO_C = 1e-4
 
 
 def _approximate_gaussian_newton(
