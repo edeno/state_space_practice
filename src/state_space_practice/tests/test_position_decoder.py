@@ -1,19 +1,28 @@
 """Tests for position decoding from spike trains via Laplace-EKF."""
 
+import copy
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice import position_decoder
+from state_space_practice.kalman import rts_backward_scan
 from state_space_practice.position_decoder import (
     AdaptiveInflationConfig,
     DecoderResult,
     PlaceFieldRateMaps,
     PositionDecoder,
+    _position_decoder_filter_with_predictions,
+    _run_filter_scan,
     build_position_dynamics,
     position_decoder_filter,
     position_decoder_smoother,
 )
-from state_space_practice.point_process_kalman import _point_process_laplace_update
+from state_space_practice.point_process_kalman import (
+    _point_process_laplace_update,
+    _safe_expected_count,
+)
 
 
 class TestBuildPositionDynamics:
@@ -1668,3 +1677,216 @@ class TestAdaptiveInflationConfigBounds:
     def test_accepts_reasonable_values(self):
         cfg = AdaptiveInflationConfig(gain=100.0, max_alpha=5.0)
         assert cfg.max_alpha == 5.0 and cfg.gain == 100.0
+
+
+# ============================================================================
+# Anisotropic arenas, prediction-aware smoothing, traced hyperparameters
+# ============================================================================
+
+
+def _second_moments_cm(rate_map: np.ndarray, rm: PlaceFieldRateMaps) -> tuple:
+    """Spatial variances (cm^2) of a non-negative (n_y, n_x) map."""
+    w = rate_map / rate_map.sum()
+    xx, yy = np.meshgrid(rm.x_edges, rm.y_edges)
+    mx, my = np.sum(w * xx), np.sum(w * yy)
+    return np.sum(w * (xx - mx) ** 2), np.sum(w * (yy - my) ** 2)
+
+
+class TestAnisotropicArenaSmoothing:
+    """The Gaussian rate-map smoothing is isotropic in cm on a non-square
+    arena, where the x and y bin widths differ."""
+
+    def test_rate_map_kernel_is_isotropic_in_cm(self):
+        # 200 x 50 cm arena, uniformly covered; one spike at the centre.
+        xs, ys = np.meshgrid(np.linspace(0, 200, 201), np.linspace(0, 50, 51))
+        position = np.column_stack([xs.ravel(), ys.ravel()])
+        spikes = np.zeros(position.shape[0])
+        spikes[np.flatnonzero((position[:, 0] == 100) & (position[:, 1] == 25))] = 1
+        sigma = 5.0
+        rm = PlaceFieldRateMaps.from_spike_position_data(
+            position, spikes, dt=0.01, n_grid=50, sigma=sigma
+        )
+        # guard: the bins really are anisotropic (4 cm x 1 cm).
+        assert rm._dx > 3.5 * rm._dy
+        var_x, var_y = _second_moments_cm(rm.rate_maps[0], rm)
+        np.testing.assert_allclose(var_x, sigma**2, rtol=0.15)
+        np.testing.assert_allclose(var_y, sigma**2, rtol=0.15)
+
+
+@pytest.fixture(scope="module")
+def inflation_problem():
+    """Decoding problem (0.4 of a lap) with adaptive inflation on and a zero
+    track-penalty map, so wherever the predicted mean is inside the grid
+    each stored prediction is exactly alpha_t * (A P A^T + Q)."""
+    rng = np.random.default_rng(7)
+    n_time, dt = 200, 0.004
+    t = np.arange(n_time) * dt
+    position = np.column_stack(
+        [50 + 20 * np.cos(2 * np.pi * t / 2.0), 50 + 20 * np.sin(2 * np.pi * t / 2.0)]
+    )
+    centers = rng.uniform(20, 80, (8, 2))
+    spikes = np.zeros((n_time, 8))
+    for n in range(8):
+        dist_sq = np.sum((position - centers[n]) ** 2, axis=1)
+        spikes[:, n] = rng.poisson((25 * np.exp(-dist_sq / (2 * 15**2)) + 0.5) * dt)
+    rm = PlaceFieldRateMaps.from_spike_position_data(
+        position, spikes, dt=dt, n_grid=50, sigma=5.0
+    )
+    cfg = AdaptiveInflationConfig(gain=1.0, max_alpha=5.0)
+    kwargs = dict(
+        spikes=spikes,
+        rate_maps=rm,
+        dt=dt,
+        q_pos=50.0,
+        include_velocity=False,
+        init_position=jnp.asarray(position[0]),
+        track_penalty=jnp.zeros((len(rm.y_edges), len(rm.x_edges))),
+        adaptive_inflation=cfg,
+    )
+    result, pred_mean, pred_cov = _position_decoder_filter_with_predictions(**kwargs)
+    return {
+        "kwargs": kwargs,
+        "cfg": cfg,
+        "result": result,
+        "pred_mean": np.asarray(pred_mean),
+        "pred_cov": np.asarray(pred_cov),
+    }
+
+
+class TestPredictionAwareSmoother:
+    """The decoder's smoother uses the filter's modified predictions."""
+
+    def test_stored_prediction_is_inflated_by_hand_computed_alpha(
+        self, inflation_problem
+    ):
+        """At every bin whose predicted mean is inside the grid (no exterior
+        penalty, so alpha is evaluated at A m_{t-1}) the stored predicted
+        covariance is the hand-computed inflation factor
+        (score' (F + eps I)^{-1} score / 2) times A P A' + Q."""
+        p = inflation_problem
+        rm, dt = p["kwargs"]["rate_maps"], p["kwargs"]["dt"]
+        cfg = p["cfg"]
+        A, Q = build_position_dynamics(dt, 50.0, include_velocity=False)
+        A, Q = np.asarray(A), np.asarray(Q)
+        f_cov = np.asarray(p["result"].position_cov)
+        spikes = p["kwargs"]["spikes"]
+        alphas = []
+        for t in range(1, 200):
+            x, y = p["pred_mean"][t]
+            if not (
+                rm.x_edges[0] < x < rm.x_edges[-1]
+                and rm.y_edges[0] < y < rm.y_edges[-1]
+            ):
+                continue
+            m = jnp.asarray(p["pred_mean"][t])
+            cond = np.asarray(_safe_expected_count(rm.log_rate(m), dt))
+            jac = np.asarray(rm.log_rate_jacobian(m))
+            score = jac.T @ (spikes[t] - cond)
+            fisher = jac.T @ (cond[:, None] * jac)
+            s_t = score @ np.linalg.solve(fisher + cfg.epsilon * np.eye(2), score) / 2
+            alpha = (
+                np.clip(1 + cfg.gain * (s_t - 1), 1, cfg.max_alpha)
+                if np.trace(fisher) > cfg.min_fisher_trace
+                else 1.0
+            )
+            alphas.append(alpha)
+            np.testing.assert_allclose(
+                p["pred_cov"][t], alpha * (A @ f_cov[t - 1] @ A.T + Q), rtol=1e-6
+            )
+        # guard: most bins were checked and inflation was active in some.
+        assert len(alphas) > 50
+        assert max(alphas) > 1.05
+
+    def test_smoother_gain_uses_inflated_prediction(self, inflation_problem):
+        """The smoothed moments equal a hand-built RTS pass on the stored
+        (inflated) predictions, not the recomputed A P A' + Q."""
+        p = inflation_problem
+        smoothed = position_decoder_smoother(**p["kwargs"])
+        A, Q = build_position_dynamics(
+            p["kwargs"]["dt"], 50.0, include_velocity=False
+        )
+        A = np.asarray(A)
+        f_mean = np.asarray(p["result"].position_mean)
+        f_cov = np.asarray(p["result"].position_cov)
+        n_time = f_mean.shape[0]
+        m_s, P_s = f_mean[-1], f_cov[-1]
+        for t in range(n_time - 2, n_time - 40, -1):
+            J = f_cov[t] @ A.T @ np.linalg.inv(p["pred_cov"][t + 1])
+            m_s = f_mean[t] + J @ (m_s - p["pred_mean"][t + 1])
+            P_s = f_cov[t] + J @ (P_s - p["pred_cov"][t + 1]) @ J.T
+            np.testing.assert_allclose(smoothed.position_mean[t], m_s, rtol=1e-7)
+            np.testing.assert_allclose(
+                smoothed.position_cov[t], P_s, rtol=1e-6, atol=1e-10
+            )
+        # guard: the naive backward pass (recomputed prediction) differs.
+        naive_mean, _, _ = rts_backward_scan(
+            p["result"].position_mean, p["result"].position_cov, A, Q
+        )
+        assert np.max(np.abs(np.asarray(naive_mean) - smoothed.position_mean)) > 1e-3
+
+
+    def test_track_penalty_is_not_folded_into_the_smoother_prediction(
+        self, inflation_problem
+    ):
+        """Without inflation the stored predictions are the plain dynamics
+        prediction, so the smoother equals the standard RTS pass even with an
+        active track penalty (a pseudo-observation, carried by the filtered
+        moments rather than the dynamics)."""
+        kwargs = dict(inflation_problem["kwargs"])
+        kwargs.pop("track_penalty")
+        kwargs.pop("adaptive_inflation")
+        rm = copy.copy(kwargs["rate_maps"])
+        rm.occupancy_mask = np.ones_like(rm.occupancy_mask)
+        rm.occupancy_mask[:, :20] = False  # off-track strip the lap crosses
+        kwargs["rate_maps"] = rm
+        filtered, pred_mean, _ = _position_decoder_filter_with_predictions(**kwargs)
+        smoothed = position_decoder_smoother(**kwargs)
+        A, Q = build_position_dynamics(kwargs["dt"], 50.0, include_velocity=False)
+        naive_mean, naive_cov, _ = rts_backward_scan(
+            filtered.position_mean, filtered.position_cov, A, Q
+        )
+        np.testing.assert_allclose(smoothed.position_mean, naive_mean, rtol=1e-10)
+        np.testing.assert_allclose(smoothed.position_cov, naive_cov, rtol=1e-8)
+        # guard: the penalty was active (its downdate would have moved the
+        # prediction off A m_{t-1}).
+        np.testing.assert_allclose(
+            pred_mean[1:], np.asarray(filtered.position_mean[:-1]) @ np.asarray(A).T
+        )
+        assert np.any(np.asarray(filtered.position_mean[:, 0]) < rm.x_edges[20])
+
+
+class TestTracedDecoderHyperparameters:
+    """``dt``, ``sigma_track`` and the grid spacing are traced scalars."""
+
+    def test_sigma_track_sweep_compiles_once(self, monkeypatch, inflation_problem):
+        traces: list = []
+        original = position_decoder._point_process_laplace_update
+
+        def counting(*args, **kwargs):
+            traces.append(None)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(position_decoder, "_point_process_laplace_update", counting)
+        kwargs = dict(inflation_problem["kwargs"])
+        kwargs.pop("track_penalty")
+        kwargs.pop("adaptive_inflation")
+        # An off-track strip the lap crosses, so sigma_track matters.
+        rm = copy.copy(kwargs["rate_maps"])
+        rm.occupancy_mask = np.ones_like(rm.occupancy_mask)
+        rm.occupancy_mask[:, :20] = False
+        kwargs["rate_maps"] = rm
+        _run_filter_scan.clear_cache()
+        first = position_decoder_filter(**kwargs, sigma_track=5.0)
+        # guard: the first call after clearing the cache really traced.
+        assert traces
+        traces.clear()
+        others = [
+            position_decoder_filter(**kwargs, sigma_track=s) for s in (2.0, 9.0)
+        ]
+        position_decoder_filter(**{**kwargs, "dt": 0.005}, sigma_track=5.0)
+        assert traces == []
+        # guard: the reused compilation saw the new sigma_track values.
+        assert not np.allclose(first.position_mean, others[0].position_mean)
+        # guard: a structural (static) change does retrace.
+        position_decoder_filter(**kwargs, sigma_track=5.0, max_newton_iter=2)
+        assert traces

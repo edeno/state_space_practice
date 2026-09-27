@@ -29,12 +29,13 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.kalman import rts_backward_scan
+from state_space_practice.kalman import rts_backward_scan_with_predictions
 from state_space_practice.point_process_kalman import (
     _point_process_laplace_update,
     _safe_expected_count,
 )
 from state_space_practice.utils import (
+    psd_solve,
     symmetrize,
     validate_count_array,
     validate_covariance,
@@ -460,8 +461,15 @@ class PlaceFieldRateMaps:
         )
         occ_time = occ * dt
         # Smooth occupancy (zero-pad at array boundaries to avoid
-        # reflecting occupied-region data into the padding bins)
-        sigma_bins = sigma / (x_bin_edges[1] - x_bin_edges[0])
+        # reflecting occupied-region data into the padding bins). The maps
+        # are (n_grid_y, n_grid_x) after the transpose, and the bin widths
+        # differ per axis on a non-square arena, so the kernel width in bins
+        # is per axis: an isotropic ``sigma`` cm kernel, matching the
+        # analytical KDE path (_kde_log_rate).
+        sigma_bins = (
+            sigma / (y_bin_edges[1] - y_bin_edges[0]),
+            sigma / (x_bin_edges[1] - x_bin_edges[0]),
+        )
         occ_smooth = gaussian_filter(
             occ_time.T, sigma_bins, mode="constant", cval=0
         )
@@ -903,10 +911,6 @@ def _build_track_penalty(
 @partial(
     jax.jit,
     static_argnames=(
-        "dt",
-        "sigma_track",
-        "grid_dx",
-        "grid_dy",
         "n_neurons",
         "n_state",
         "include_velocity",
@@ -937,19 +941,29 @@ def _run_filter_scan(
     max_newton_iter: int,
     use_kde: bool,
     inflate: bool,
-) -> tuple[Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array, Array]:
     """JIT-compiled core: build closures, run forward filter scan.
 
-    All scalar config (``dt``, ``sigma_track``, ``grid_dx``, ``grid_dy``)
-    is passed as static args. JAX recompiles per-unique-value, but in
-    typical decode workflows these floats are fixed across calls
-    (dt is set once per session, grid spacing is rate-map-bound) so
-    the cache hits. We tested passing them as tracers to allow
-    parameter sweeps without recompile, but XLA's runtime-value codegen
-    produced slightly different floating-point order, breaking a tight
-    test threshold (4% drift on a 10000-bin decode error). Static gives
-    deterministic codegen and the recompile cost (~200 ms once per
-    unique value) is acceptable.
+    The float hyperparameters (``dt``, ``sigma_track``, ``grid_dx``,
+    ``grid_dy``) are ordinary traced scalars, so sweeping them (e.g. a
+    ``sigma_track`` or ``dt`` grid search) reuses one compilation; only the
+    shapes and the static structural flags trigger a retrace.
+
+    Returns
+    -------
+    filtered_mean : Array, shape (n_time, n_state)
+    filtered_cov : Array, shape (n_time, n_state, n_state)
+    marginal_ll : Array
+        Scalar marginal log-likelihood.
+    predicted_mean : Array, shape (n_time, n_state)
+        One-step dynamics predictions ``A m_{t-1|t-1}``.
+    predicted_cov : Array, shape (n_time, n_state, n_state)
+        One-step dynamics predicted covariances *including* the adaptive
+        inflation factor, ``alpha_t (A P_{t-1|t-1} A' + Q)`` -- the prediction
+        the RTS smoother must use. The track-penalty (Woodbury) downdate is
+        not included: it is a pseudo-observation of ``x_t``, already
+        reflected in the filtered moments, and folding it into the
+        prediction would make the smoother treat it as dynamics.
     """
     _grid_xy, _spike_hists, _occ_hist, _sigma2, _baseline, _tau = kde_args
     _infl_gain, _infl_max, _infl_eps, _infl_min_ft = infl_args
@@ -1010,6 +1024,10 @@ def _run_filter_scan(
         one_step_mean = A @ mean_prev
         one_step_cov = A @ cov_prev @ A.T + Q
         one_step_cov = symmetrize(one_step_cov)
+        # The dynamics prediction, kept for the RTS smoother: the track
+        # penalty below is a pseudo-observation of x_t (it belongs to the
+        # update, like the spikes), so the smoother must not see it.
+        dynamics_mean, dynamics_cov = one_step_mean, one_step_cov
 
         # Distance-to-track prior as a rank-1 precision update (Woodbury);
         # see position_decoder_filter docstring for the derivation.
@@ -1033,13 +1051,21 @@ def _run_filter_scan(
             fisher = jacobian.T @ (cond_int[:, None] * jacobian)
             fisher_trace = jnp.trace(fisher)
             fisher_reg = fisher + _infl_eps * jnp.eye(n_state)
-            s_t = (score @ jnp.linalg.solve(fisher_reg, score)) / _infl_d
+            # fisher_reg is symmetric positive definite: Cholesky, not LU. It
+            # already carries the epsilon ridge, so no absolute jitter on top
+            # (a 1e-9 shift would be 0.1% of the default epsilon=1e-6).
+            s_t = (
+                score @ psd_solve(fisher_reg, score, diagonal_boost=0.0)
+            ) / _infl_d
             alpha_t = jnp.where(
                 fisher_trace > _infl_min_ft,
                 jnp.clip(1.0 + _infl_gain * (s_t - 1.0), 1.0, _infl_max),
                 1.0,
             )
             one_step_cov = one_step_cov * alpha_t
+            # Inflation modifies the dynamics (an effective process noise
+            # (alpha - 1) A P A' + alpha Q), so the smoother must see it.
+            dynamics_cov = dynamics_cov * alpha_t
 
         post_mean, post_cov, ll = _point_process_laplace_update(
             one_step_mean,
@@ -1053,12 +1079,20 @@ def _run_filter_scan(
         )
 
         total_ll = total_ll + ll
-        return (post_mean, post_cov, total_ll), (post_mean, post_cov)
+        return (post_mean, post_cov, total_ll), (
+            post_mean,
+            post_cov,
+            dynamics_mean,
+            dynamics_cov,
+        )
 
-    (_, _, marginal_ll), (filtered_mean, filtered_cov) = jax.lax.scan(
-        _step, init_carry, spikes_arr,
-    )
-    return filtered_mean, filtered_cov, marginal_ll
+    (_, _, marginal_ll), (
+        filtered_mean,
+        filtered_cov,
+        predicted_mean,
+        predicted_cov,
+    ) = jax.lax.scan(_step, init_carry, spikes_arr)
+    return filtered_mean, filtered_cov, marginal_ll, predicted_mean, predicted_cov
 
 
 def position_decoder_filter(
@@ -1122,6 +1156,44 @@ def position_decoder_filter(
     Returns
     -------
     DecoderResult
+    """
+    result, _, _ = _position_decoder_filter_with_predictions(
+        spikes,
+        rate_maps,
+        dt,
+        q_pos=q_pos,
+        q_vel=q_vel,
+        include_velocity=include_velocity,
+        init_position=init_position,
+        init_cov=init_cov,
+        track_penalty=track_penalty,
+        sigma_track=sigma_track,
+        max_newton_iter=max_newton_iter,
+        adaptive_inflation=adaptive_inflation,
+    )
+    return result
+
+
+def _position_decoder_filter_with_predictions(
+    spikes: ArrayLike,
+    rate_maps: PlaceFieldRateMaps,
+    dt: float,
+    q_pos: float | None = None,
+    q_vel: float = 10.0,
+    include_velocity: bool = True,
+    init_position: ArrayLike | None = None,
+    init_cov: ArrayLike | None = None,
+    track_penalty: Array | None = None,
+    sigma_track: float = 5.0,
+    max_newton_iter: int = 3,
+    adaptive_inflation: AdaptiveInflationConfig | None = None,
+) -> tuple[DecoderResult, Array, Array]:
+    """:func:`position_decoder_filter` plus the filter's one-step predictions.
+
+    Returns ``(result, predicted_mean, predicted_cov)``, where the predictions
+    are the filter's one-step dynamics predictions including the adaptive
+    inflation (see :func:`_run_filter_scan`). :func:`position_decoder_smoother`
+    needs them for a smoother consistent with the filter.
     """
     spikes_arr = jnp.asarray(spikes)
     if spikes_arr.ndim == 1:
@@ -1286,7 +1358,13 @@ def position_decoder_filter(
     validate_covariance(init_cov, "init_cov")
 
     init_carry = (init_position, init_cov, jnp.array(0.0))
-    filtered_mean, filtered_cov, marginal_ll = _run_filter_scan(
+    (
+        filtered_mean,
+        filtered_cov,
+        marginal_ll,
+        predicted_mean,
+        predicted_cov,
+    ) = _run_filter_scan(
         spikes_arr,
         init_carry,
         A, Q,
@@ -1349,14 +1427,15 @@ def position_decoder_filter(
             f"{max_escape:.1f} cm).  This usually indicates a divergent "
             f"filter — check q_pos, adaptive_inflation, and init_cov.",
             UserWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
 
-    return DecoderResult(
+    result = DecoderResult(
         position_mean=filtered_mean,
         position_cov=filtered_cov,
         marginal_log_likelihood=float(marginal_ll),
     )
+    return result, predicted_mean, predicted_cov
 
 
 def position_decoder_smoother(
@@ -1378,7 +1457,11 @@ def position_decoder_smoother(
     Runs the forward filter, then applies the Rauch-Tung-Striebel
     backward smoother to produce non-causal position estimates that
     use the entire spike train. Smoothed estimates have lower variance
-    than filtered estimates.
+    than filtered estimates. The backward pass uses the filter's stored
+    one-step dynamics predictions, including the adaptive-inflation factor,
+    so the smoother gain sees the inflated prior covariance the filter used.
+    (The track penalty acts as a pseudo-observation and is carried by the
+    filtered moments.)
 
     Parameters are the same as :func:`position_decoder_filter`.
 
@@ -1395,17 +1478,26 @@ def position_decoder_smoother(
             else 100.0
         )
 
-    filter_result = position_decoder_filter(
-        spikes, rate_maps, dt, q_pos, q_vel,
-        include_velocity, init_position, init_cov,
-        track_penalty=track_penalty, sigma_track=sigma_track,
-        max_newton_iter=max_newton_iter,
-        adaptive_inflation=adaptive_inflation,
+    filter_result, predicted_mean, predicted_cov = (
+        _position_decoder_filter_with_predictions(
+            spikes, rate_maps, dt, q_pos, q_vel,
+            include_velocity, init_position, init_cov,
+            track_penalty=track_penalty, sigma_track=sigma_track,
+            max_newton_iter=max_newton_iter,
+            adaptive_inflation=adaptive_inflation,
+        )
     )
 
-    A, Q = build_position_dynamics(dt, q_pos, q_vel, include_velocity)
-    smoother_mean, smoother_cov, _ = rts_backward_scan(
-        filter_result.position_mean, filter_result.position_cov, A, Q,
+    # Adaptive inflation modifies each forward prediction, so the backward
+    # pass must use the stored (inflated) predictions rather than recompute
+    # A P A^T + Q. Without inflation the two coincide.
+    A, _ = build_position_dynamics(dt, q_pos, q_vel, include_velocity)
+    smoother_mean, smoother_cov, _ = rts_backward_scan_with_predictions(
+        filter_result.position_mean,
+        filter_result.position_cov,
+        predicted_mean,
+        predicted_cov,
+        A,
     )
 
     return DecoderResult(
