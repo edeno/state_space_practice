@@ -586,8 +586,11 @@ def test_model_e_step_identical_states_posterior_equals_prior(smoother_type):
     np.testing.assert_allclose(
         model.smoother_joint_discrete_state_prob, prior_joint, atol=1e-8
     )
-    # ... and the LL is the single-regime Laplace LL of the (common) path.
-    paths, log_w = laplace_path_oracle(_model_params(model), spikes)
+    # ... and the LL is the single-regime Laplace LL of the (common) path,
+    # computed with the same number of Fisher steps the model uses.
+    paths, log_w = laplace_path_oracle(
+        _model_params(model), spikes, max_newton_iter=model.max_newton_iter
+    )
     np.testing.assert_allclose(
         float(log_lik), path_posterior(paths, log_w)["log_lik"], atol=1e-10
     )
@@ -602,7 +605,9 @@ def test_model_e_step_two_steps_matches_per_path_laplace():
     params = _model_params(model)
     spikes = _simulate_spikes(params, n_time=2, seed=7)
     log_lik = model._e_step(spikes)
-    oracle = path_posterior(*laplace_path_oracle(params, spikes))
+    oracle = path_posterior(
+        *laplace_path_oracle(params, spikes, max_newton_iter=model.max_newton_iter)
+    )
     np.testing.assert_allclose(float(log_lik), oracle["log_lik"], atol=1e-10)
     np.testing.assert_allclose(
         model.smoother_discrete_state_prob, oracle["smoothed"], atol=1e-10
