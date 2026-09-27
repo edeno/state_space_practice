@@ -1030,8 +1030,13 @@ def _descent_step(
         callers into one warning).
     """
     # NaN in delta (e.g. a failed Cholesky) also triggers the fallback. A zero
-    # gradient is a stationary point, not a failure, so it is not counted.
-    fell_back = ~(jnp.dot(gradient, delta) > 0.0) & (jnp.dot(gradient, gradient) > 0.0)
+    # gradient is a stationary point, not a failure, and a non-finite gradient
+    # (overflowing objective) offers no usable direction either; neither is
+    # redirected or counted, so the latter still fails loud downstream.
+    grad_sq = jnp.dot(gradient, gradient)
+    fell_back = (
+        ~(jnp.dot(gradient, delta) > 0.0) & (grad_sq > 0.0) & jnp.isfinite(grad_sq)
+    )
     direction = jnp.where(fell_back, gradient, delta)
     alpha = _armijo_line_search(
         params,

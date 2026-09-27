@@ -10028,6 +10028,16 @@ def test_descent_step_falls_back_to_gradient_for_non_descent_direction() -> None
         jnp.ones(2), jnp.zeros(2), jnp.zeros(2), loss_fn, jnp.array(0.0)
     )
     assert not bool(fell_back_zero)
+    # Overflowing objective: a non-finite gradient is no usable direction, so
+    # it is neither redirected nor counted (the NaN still fails loud).
+    _, fell_back_inf = _descent_step(
+        params,
+        jnp.array([jnp.nan, 0.0]),
+        jnp.array([jnp.inf, 1.0]),
+        loss_fn,
+        loss_fn(params),
+    )
+    assert not bool(fell_back_inf)
 
 
 def test_spike_glm_update_warns_on_newton_fallback(monkeypatch) -> None:
