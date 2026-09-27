@@ -119,6 +119,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   recovery. `coupling_pg.pg_gibbs_sweep` (the Gibbs kernel, bit-identical
   output) and `coupling_validation.batch_means_mcse` are public; crosscheck
   records carry `pg_mean_mcse_max` and `ekf_pg_mean_max_z`.
+- **GP and dynamics oracles** (`test_oracle_gp.py`, `test_oracle_dynamics.py`):
+  the state-space Matérn-3/2 GP matches dense kernel regression (filtered and
+  smoothed moments, full posterior covariance, marginal likelihood) to 1e-14;
+  the GP-Laplace mode and evidence match a dense reference and its gap to
+  quadrature is pinned and shrinks as O(1/count); the leapfrog integrator has
+  order 2 against `solve_ivp`, is time-reversible to 1e-13, conserves energy
+  in a bounded band and preserves phase-space volume to 1e-14 (an RK4
+  comparator fails each). Hypothesis property tests for preprocessing
+  (binning round trips, count conservation), circular statistics vs
+  `scipy.stats`, and the behavioural-uncertainty closed forms.
 
 ### Changed — behavior (may affect existing callers)
 
@@ -268,6 +278,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   agree to round-off only when no line search backtracks.
 - **Default `diagonal_boost` of `switching_point_process.point_process_kalman_update`**
   is ``0.0`` (relative shift), like the other Laplace updates.
+- **`circular_stats.circular_std` delegates to `scipy.stats.circstd`** (with
+  the existing ``R >= 1e-10`` floor). The other circular functions stay
+  hand-written where SciPy has no equivalent or different conventions
+  (documented per function). `rayleigh_test` applies its small-sample
+  correction at every ``n`` (it stopped at 50, so p jumped 14% at ``z = 6``);
+  `circular_correlation` is documented as Jammalamadaka–SenGupta.
 
 ### Deprecated
 
@@ -367,6 +383,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Point-process Fisher line search** froze at a converged mode (strict
   decrease test), so reverse-mode gradients through the scan carried a 2%
   error; a round-off slack accepts the negligible full step.
+- **`temporal_rate_gp.infer_log_rate`** Newton steps had no step control: with
+  a baseline far below the data (the default ``mean=0`` on a 50 Hz train) the
+  default 25 iterations returned an unconverged mode and an evidence off by
+  tens of nats up to ~1e5. Steps are now damped by an Armijo line search on
+  the exact log-posterior; converged problems are unchanged to 1e-13.
+- **`behavioral_uncertainty.categorical_entropy`** added 2.3e-9 nats per zero
+  entry (clipping); it is exact now with finite gradients.
+  `bernoulli_mixture_mean_variance` returns ``mean (1 - mean)`` and can no
+  longer be slightly negative.
 
 ### Changed — default behavior (may affect existing callers)
 
