@@ -2128,6 +2128,7 @@ class TestPointProcessMathCorrectness:
                 dt,
                 log_intensity,
                 include_laplace_normalization=False,
+                max_newton_iter=1,  # the hand-derived solution is one step
             )
 
             np.testing.assert_allclose(
@@ -3251,7 +3252,12 @@ class TestBlockDiagonalFilterEquivalence:
         dt,
         include_laplace_normalization=True,
     ):
-        """Run the dense filter and the block filter on the same problem."""
+        """Run the dense filter and the block filter on the same problem.
+
+        Uses a single Fisher step: the two paths agree to round-off only when
+        no line search backtracks (the dense path backtracks globally, the
+        block path per neuron), which one step guarantees.
+        """
         dense_mean, dense_cov, dense_mll = stochastic_point_process_filter(
             init_mean,
             init_cov,
@@ -3262,6 +3268,7 @@ class TestBlockDiagonalFilterEquivalence:
             Q,
             log_conditional_intensity,
             include_laplace_normalization=include_laplace_normalization,
+            max_newton_iter=1,
             validate_inputs=False,  # we know the problem is PSD
         )
         structure = _block_structure(init_mean, init_cov, A, Q, Z)
@@ -3271,6 +3278,7 @@ class TestBlockDiagonalFilterEquivalence:
                 spikes,
                 dt,
                 include_laplace_normalization=include_laplace_normalization,
+                max_newton_iter=1,
             )
         )
         return (dense_mean, dense_cov, dense_mll), (block_mean, block_cov, block_mll)
@@ -3614,6 +3622,7 @@ class TestBlockDiagonalSmootherEquivalence:
         include_laplace_normalization=True,
         return_filtered=False,
     ):
+        # Single Fisher step: see TestBlockDiagonalFilterEquivalence.
         dense_result = stochastic_point_process_smoother(
             init_mean,
             init_cov,
@@ -3625,6 +3634,7 @@ class TestBlockDiagonalSmootherEquivalence:
             log_conditional_intensity,
             include_laplace_normalization=include_laplace_normalization,
             return_filtered=return_filtered,
+            max_newton_iter=1,
             validate_inputs=False,
         )
         structure = _block_structure(init_mean, init_cov, A, Q, Z)
@@ -3634,6 +3644,7 @@ class TestBlockDiagonalSmootherEquivalence:
             dt,
             include_laplace_normalization=include_laplace_normalization,
             return_filtered=return_filtered,
+            max_newton_iter=1,
         )
         return dense_result, block_result
 

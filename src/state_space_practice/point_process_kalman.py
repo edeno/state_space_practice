@@ -696,10 +696,11 @@ def _fisher_scoring_line_search(
     ``neg_log_posterior(x)`` the objective ``f`` the line search decreases.
 
     A step size ``alpha`` (``1, beta, beta^2, ...``, at most
-    ``_LINE_SEARCH_MAX_BACKTRACKS`` halvings) is accepted when it strictly
-    decreases ``f`` and satisfies the Armijo condition
-    ``f(x + alpha delta) <= f(x) - c alpha gradient' delta`` with
-    ``c = _ARMIJO_C``. Because ``post_prec`` is positive definite,
+    ``_LINE_SEARCH_MAX_BACKTRACKS`` halvings) is accepted when it satisfies
+    the Armijo condition ``f(x + alpha delta) <= f(x) - c alpha gradient'
+    delta`` with ``c = _ARMIJO_C``, up to a round-off slack of
+    ``1e-12 (1 + |f(x)|)`` so a converged point still takes its (negligible)
+    full step instead of freezing. Because ``post_prec`` is positive definite,
     ``gradient' delta >= 0`` and ``delta`` is a descent direction. When the
     full step is accepted the result is the same as without the Armijo
     condition. If no step size qualifies, ``x`` is kept (an uphill or
@@ -738,8 +739,13 @@ def _fisher_scoring_line_search(
             alpha, _, _ = alpha_carry
             new_x = x + alpha * delta
             new_loss = neg_log_posterior(new_x)
-            sufficient = new_loss <= current_loss - _ARMIJO_C * alpha * slope
-            improved = (new_loss < current_loss) & sufficient
+            # The slack admits steps that change f only at round-off level,
+            # so at a converged mode the (tiny) full step is still taken:
+            # rejecting it would freeze x, and reverse-mode gradients
+            # through the scan would then miss the Fisher map's contraction
+            # and carry the error of an earlier, unconverged iterate.
+            slack = 1e-12 * (1.0 + jnp.abs(current_loss))
+            improved = new_loss <= current_loss - _ARMIJO_C * alpha * slope + slack
             new_alpha = jnp.where(improved, alpha, alpha * line_search_beta)
             return (new_alpha, improved, new_loss), None
 

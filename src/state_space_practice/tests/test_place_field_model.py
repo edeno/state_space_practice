@@ -1664,10 +1664,11 @@ class TestMaxFiringRateHz:
             f"ceiling should keep LL > -1e5 (analytical bound ~-21k for the "
             f"outlier bin); got {float(mll_capped):.2e}"
         )
-        # And it must be dramatically better than the default-ceiling LL on
-        # this pathological input (default path produces ~-1e8).
-        assert mll_capped - mll_default > 1e5, (
-            f"ceiling should improve LL by >1e5; got capped={float(mll_capped):.2e} "
+        # And it must be much better than the default-ceiling LL on this
+        # pathological input (one Fisher step gave ~-1e8 there; the default
+        # three line-searched steps ~-7e4, still twice as bad as capped).
+        assert mll_capped - mll_default > 1e4, (
+            f"ceiling should improve LL by >1e4; got capped={float(mll_capped):.2e} "
             f"default={float(mll_default):.2e}"
         )
 
