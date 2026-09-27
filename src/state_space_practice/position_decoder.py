@@ -45,6 +45,18 @@ from state_space_practice.utils import (
 
 logger = logging.getLogger(__name__)
 
+# Absolute diagonal shift (cm^2 for positions) in the decoder's Laplace
+# update. The Laplace-EKF core is scale-equivariant by default (only a
+# relative 1e-12 * max|diag| Cholesky shift), but the decoder works in fixed
+# physical units and its KDE rate surrogate can produce very large Fisher
+# information near the edge of the occupied region: on a realistic circular
+# track the filtered position variance collapses to ~1e-8 cm^2 in places.
+# A 1e-9 cm^2 floor (the library's former absolute default) caps the
+# posterior precision there; without it the decoded trajectory on such data
+# changes by several cm. Positions are always in cm, so a fixed-unit floor is
+# appropriate here.
+_DECODER_DIAGONAL_BOOST = 1e-9
+
 # Upper bounds for AdaptiveInflationConfig. The per-step multiplier compounds
 # across time bins, so an unbounded max_alpha (or a gain large enough to pin
 # the multiplier at max_alpha every bin) drives runaway covariance growth --
@@ -1106,6 +1118,7 @@ def _run_filter_scan(
             dt,
             log_intensity_func,
             grad_log_intensity_func=grad_log_intensity_func,
+            diagonal_boost=_DECODER_DIAGONAL_BOOST,
             include_laplace_normalization=True,
             max_newton_iter=max_newton_iter,
         )
