@@ -47,6 +47,33 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`SwitchingSpikeOscillatorModel(max_spectral_radius=0.999)`** replaces a
   hard-coded bound (same default). It is enforced when the transition matrix is
   projected (`update_continuous_transition_matrix=True`).
+- **Exact initial-state EM update**: `kalman.InitialStatePrior`,
+  `kalman.smooth_initial_state` and `initial_state_prior=` on
+  `kalman_maximization_step` / `point_process_kalman.dynamics_only_m_step`
+  return the smoothed `x_0` (one RTS step behind the smoother output) instead
+  of the `x_1` moments.
+- **`kalman.measurement_cov_residual_form` / `process_cov_residual_form`**
+  (centred M-step covariance estimates, PSD by construction) and
+  **`kalman.rts_backward_scan_with_predictions`** (RTS pass for filters whose
+  one-step prediction was modified, e.g. by covariance inflation).
+- **Scale-relative PSD floors in `utils`**: `relative_psd_floor`,
+  `clip_eigenvalues_relative`, `project_psd_relative`,
+  `floor_variances_relative` and `warn_if_floored` (a jit-safe logged warning).
+- **`utils.differentiable_spectral_radius`** (exact largest eigenvalue
+  magnitude, usable under `jit` / `grad` / `vmap`), and
+  `stabilize_transition_matrix(block_size=, warn=)` which clamps each
+  strongly connected oscillator block separately and logs the radius and scale.
+  The docstring explains how to pick `max_spectral_radius`
+  (`>= 1 - pi * min_freq_gap / fs`).
+- **`switching_kalman_maximization_step(fixed_measurement_matrix=,
+  fixed_continuous_transition_matrix=, previous_params=,
+  estimate_measurement_params=)`**: R and Q are estimated at the H / A that
+  are actually installed (residual forms), and a discrete state with fewer
+  than `n_cont + 1` expected bins keeps its previous per-state parameters
+  (logged). `optimize_dim_transition_params(max_spectral_radius=)` replaces a
+  hard-coded 0.99.
+- **`ContingencyBeliefModel(seed=None)`**; `None` keeps the historical
+  initialization.
 
 ### Changed — behavior (may affect existing callers)
 
@@ -104,6 +131,50 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`preprocessing.binned_to_spike_times`** raises on negative counts or a
   `time_bins` length that does not match the number of bins (previously
   accepted silently).
+- **EM initial-state updates use the smoothed `x_0`** (`PointProcessModel`,
+  `PlaceFieldModel`, and the Kalman M-step when `initial_state_prior` is
+  passed). Init-only EM is now monotone; fitted `init_mean` / `init_cov` and
+  later log-likelihoods change.
+- **Covariance floors are relative to the matrix scale** (`1e-8 * lambda_max`,
+  `1e-10 * trace / n` in the switching M-step) instead of absolute constants,
+  so M-steps at scale `1e-3` or below are no longer pinned. A warning is logged
+  when a floor binds. The point-process `init_cov` clip bounds are multiples of
+  the fit's initial latent scale.
+- **Laplace-EKF marginal log-likelihood** takes both log-determinants from the
+  Cholesky factors the update used (one jitter policy). Values move for small
+  or ill-conditioned posterior covariances; the switching point-process models
+  share this path.
+- **Fisher-scoring line search** (`max_newton_iter > 1`) requires an Armijo
+  decrease and logs a warning when more than 10% of bins exhaust the
+  backtracking. The spike-GLM Newton steps use one relative ridge and a
+  Cholesky solve; a non-descent direction falls back to the gradient with one
+  warning instead of a silent zero step.
+- **Directed-influence stability scale** is the exact spectral radius (was a
+  block-row-norm bound that over-damped coupled models by up to ~20%). Stable
+  parameters are a fixed point of construct / rebuild and EM started at the
+  truth no longer rolls back. `compute_directed_influence_stability_scale` now
+  requires `phase_difference=`.
+- **`CorrelatedNoiseModel` / `CorrelatedNoisePointProcessModel` default to
+  `use_reparameterized_mstep=True`**; the DIM reparameterized M-step updates Q
+  at the current A (ECM style).
+- **Switching-model ELBO and posterior entropies** use Cholesky
+  log-determinants (NaN on an indefinite covariance instead of a finite value).
+- **`PlaceFieldRateMaps.from_spike_position_data`** smooths isotropically in
+  cm (`sigma` is divided by each axis's bin width), so rate maps on non-square
+  arenas change.
+- **`position_decoder_smoother`** uses the filter's inflation-aware
+  predictions in the backward pass; smoothed output changes only with
+  `adaptive_inflation`. The decoder's `dt`, `sigma_track` and grid spacing are
+  traced rather than static, so parameter sweeps no longer recompile.
+- **`PointProcessModel.fit`** clears the posteriors on a non-finite first
+  E-step (aligned with the other EM models); its `run_em` call no longer
+  passes the no-op `require_increase_to_converge`.
+- **`fit_sgd` reuses its compiled step** across calls on the same model with
+  same-shaped data (the default optimizer is a shared module-level instance),
+  and the contingency / covariate-choice M-step optimizers compile once per
+  shape. Log-likelihood histories can differ from before by up to ~1e-13.
+- **`SwitchingSpikeOscillatorModel`**'s default transition diagonal follows the
+  default float dtype (was float32).
 
 ### Deprecated
 
@@ -152,6 +223,28 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   parameters when x64 is enabled (the scan carry dtype no longer changes).
 - LaTeX docstrings in `smith_learning_algorithm` are raw strings (`\frac` and
   `\text` were being rendered as control characters).
+- **`kalman_filter`, `kalman_smoother`, `stochastic_point_process_filter`
+  and `stochastic_point_process_smoother` work under `jax.jit` / `jax.grad`
+  with the default `validate_inputs=True`** (host-side checks are skipped when
+  an input is a tracer). A float32 `init_mean` / `init_cov` with float64
+  parameters no longer fails with "scan carry types differ".
+- **`ContingencyBeliefModel` EM** regressed each transition posterior on the
+  previous trial's covariate row, so transition-covariate effects were not
+  learned.
+- **`CovariateChoiceModel` decay M-step** omitted the lag-one smoother
+  cross-covariance, biasing the learned decay toward 0.
+- **`SwitchingChoiceModel`** between-state variance is computed in centred
+  form (no catastrophic cancellation for large option values).
+- **`SwitchingHamiltonianJointModel`** per-state MLPs reused the parent
+  model's PRNG keys; `JointHamiltonianModel` now advances its key after its
+  own draws (which are unchanged).
+- 0-d or 2-D `choices` (and non-2-D covariates) passed to the choice models'
+  `fit` / `fit_sgd` raise `ValueError` (was `IndexError`); the choices are
+  validated once.
+- `models.stochastic_point_process_filter` is jitted and no longer retraces on
+  every call. The position decoder's inflation statistic uses a Cholesky solve.
+- `SmithLearningModel.find_first_significant_trial` is vectorized (same
+  result, including NaN entries).
 
 ### Changed — default behavior (may affect existing callers)
 

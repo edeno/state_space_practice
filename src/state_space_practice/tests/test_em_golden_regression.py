@@ -5,15 +5,40 @@ Every model below is fitted by EM on small, fixed-seed synthetic data, and the
 full log-likelihood history (hence also the iteration count) plus a few
 fitted-parameter summaries are compared against values recorded from the
 reference implementation at commit
-``f9e1d8f18691b0a2998807465eefc9707cac9445``.  The point is to catch
-refactors of the EM loops and their E/M-step internals that *silently* shift
-the numerics: a correct refactor reproduces these numbers to near round-off.
+``06cc7de01cf7b6435e9fb744e102688fff481269``.
+The point is to catch refactors of the EM loops and their E/M-step internals
+that *silently* shift the numerics: a correct refactor reproduces these numbers
+to near round-off.
 
 Configurations are chosen so that EM runs its ordinary path (no rollback, no
 non-finite log-likelihood); the rollback branches are covered by behavioural
-tests elsewhere.  The values were recorded with float64 on macOS arm64 with
-jax/jaxlib 0.10.2; the tightest tolerances below assume a comparable
-platform, since a different CPU or XLA version may reorder reductions.
+tests elsewhere.  The values were recorded with float64 on Linux x86-64 with
+jax/jaxlib 0.10.2.  Log-likelihood histories reproduce across platforms to
+~1e-13 relative, so they get tight tolerances; the fitted-parameter summaries
+include tiny quantities (process noise ~1e-6, spike weights ~1e-4) in which EM
+amplifies platform round-off to ~1e-8 relative, so they get a looser floor.
+
+History
+-------
+The first pins were recorded from ``master`` at ``f9e1d8f`` (macOS arm64).
+They were re-recorded at the commit above after the numerical-review fixes
+that intentionally change EM numerics; the cases that moved, and why:
+
+* ``point_process_glm``, ``place_field_*``: the EM update of the initial
+  state uses the smoothed ``x_0`` (one RTS step behind the smoother output)
+  instead of the ``x_1`` moments; the Laplace-EKF log-likelihood takes both
+  log-determinants from the factors the update used (one jitter policy); Q
+  comes from the centred residual form.  LL histories moved by 1e-7 to 2e-6
+  relative, the last smoothed mean by up to 2e-2 relative.
+* ``directed_influence``: the switching M-step estimates R at the fixed H the
+  model installs instead of at the unconstrained H*, so the iteration-1
+  log-likelihood moved by 9% and the fitted transition entries changed.
+* ``common_oscillator_pp``, ``directed_influence_pp``,
+  ``switching_spike_oscillator``: the shared Laplace update's jitter policy
+  (spike weights up to 2e-5 relative, LL up to 6e-10 relative).
+* ``common_oscillator``, ``covariate_choice``: round-off only (< 1e-10
+  relative) from the residual-form covariance updates and jitted M-steps.
+* ``smith_learning``, ``multinomial_choice``: unchanged.
 
 Regenerating the expected values
 --------------------------------
@@ -25,7 +50,8 @@ so point ``PYTHONPATH`` at the source tree you want to record from::
     PYTHONPATH=/tmp/ssp_ref/src uv run --no-sync python \
         src/state_space_practice/tests/test_em_golden_regression.py
 
-and paste the output over ``EXPECTED`` (and update the commit hash above).
+and paste the output over ``EXPECTED`` (and update the commit hash and the
+history above).
 """
 
 import logging
@@ -345,31 +371,35 @@ CASES: dict[str, Callable[[], FitResult]] = {
     "covariate_choice": _fit_covariate_choice,
 }
 
-# (rtol, atol) per case; atol is a floor for entries at or near zero.
-# Cases whose E/M steps perform the same floating-point operations as the
-# reference reproduce it bit-for-bit; they get rtol=1e-10, which still admits
-# round-off-level reordering but nothing an algorithmic change could hide in.
-# The block place-field and point-process oscillator cases differ from the
-# reference at round-off level, which EM amplifies over iterations (most in
-# the smallest fitted parameters).  Their tolerances are >= ~10x the largest
-# deviation observed against the reference, noted inline.
+# Per-case tolerances for the log-likelihood histories.  Cases that pass
+# through no Laplace update or block-covariance machinery reproduce the
+# reference to ~1e-13 relative on another platform; they get rtol=1e-10, which
+# still admits round-off-level reordering but nothing an algorithmic change
+# could hide in.  The point-process and block place-field cases accumulate
+# round-off through Newton iterations; their tolerances are >= ~10x the largest
+# cross-platform deviation observed, noted inline.
 _EXACT = (1e-10, 1e-14)
-TOLERANCES: dict[str, tuple[float, float]] = {
+LL_TOLERANCES: dict[str, tuple[float, float]] = {
     "smith_learning": _EXACT,
     "point_process_glm": _EXACT,
-    "place_field_1_neuron_dense": _EXACT,
+    "place_field_1_neuron_dense": (1e-9, 1e-14),
     "place_field_2_neuron_block_update_A": (2e-8, 1e-14),  # observed 1.4e-9 rel
     "place_field_2_neuron_block_newton3": (2e-8, 1e-14),  # observed 1.1e-9 rel
     "common_oscillator": _EXACT,
     "directed_influence": _EXACT,
-    # Observed: LL 1.6e-10 rel; spike weights (|w| >= 2e-4) up to 2.6e-8 abs,
-    # i.e. 1.4e-6 relative on the smallest weight, hence an absolute floor.
-    "common_oscillator_pp": (1e-8, 3e-7),
+    "common_oscillator_pp": (1e-8, 1e-14),  # observed 1.6e-10 rel
     "directed_influence_pp": (5e-8, 1e-14),  # observed 3.9e-9 rel
     "switching_spike_oscillator": (1e-9, 1e-14),  # observed 1.9e-11 rel
     "multinomial_choice": _EXACT,
     "covariate_choice": _EXACT,
 }
+# Fitted-parameter summaries: EM amplifies platform round-off most in the
+# smallest parameters (process noise ~1e-6 moved 1.4e-8 relative between macOS
+# arm64 and Linux x86-64 on *unchanged* code; spike weights ~1e-4 up to 7e-9).
+# An algorithmic change moves them by >= 1e-5 relative, so 1e-6 keeps the
+# signal while tolerating a different CPU / XLA reduction order.  The absolute
+# floor covers summaries that are exactly zero.
+PARAMETER_TOLERANCE = (1e-6, 1e-14)
 
 EXPECTED: dict[str, FitResult] = {
     "smith_learning": {
@@ -401,269 +431,264 @@ EXPECTED: dict[str, FitResult] = {
     },
     "point_process_glm": {
         "log_likelihoods": [
-            -56.64088098125764,
-            -54.8057648297898,
-            -54.44459305349927,
-            -54.27476619254216,
-            -54.17169517584386,
-            -54.10014329128558,
+            -56.64088192154854,
+            -54.805898572605784,
+            -54.444689388489785,
+            -54.27481133323117,
+            -54.17167947574161,
+            -54.10005514855322,
         ],
-        "transition_diag": [0.9994653248040615, 0.9994819400860228, 0.9997512528533303],
+        "transition_diag": [0.9994653194644283, 0.9994819325301134, 0.9997512474032848],
         "process_cov_diag": [
-            9.997783174530033e-05,
-            9.996293578175032e-05,
-            9.995051059825807e-05,
+            9.997781482057636e-05,
+            9.996291950978701e-05,
+            9.995049230577501e-05,
         ],
         "last_smoother_mean": [
-            -0.010173495850860657,
-            -0.4629744956852703,
-            -1.2666545382419248,
+            -0.009998089022387465,
+            -0.4629534292203509,
+            -1.2668993739887677,
         ],
     },
     "place_field_1_neuron_dense": {
         "log_likelihoods": [
-            -117.74174845375951,
-            -115.24255533611213,
-            -114.24279500742355,
-            -113.6552360037551,
-            -113.20530092265507,
+            -117.7417577466171,
+            -115.24256698230296,
+            -114.24280563943415,
+            -113.6552474010005,
+            -113.2053132730756,
         ],
         "process_cov_diag": [
-            1.007999991370092e-06,
-            1.0079999925098095e-06,
-            1.0079999822523507e-06,
-            1.007999905178943e-06,
-            1.0079998159960354e-06,
-            1.0079999142966843e-06,
-            1.007999991370092e-06,
-            1.007999991370092e-06,
+            1.0079999917974862e-06,
+            1.0079999920824156e-06,
+            1.007999981540027e-06,
+            1.007999896132434e-06,
+            1.0079998165658941e-06,
+            1.007999914225452e-06,
+            1.0079999917974862e-06,
+            1.0079999917974862e-06,
         ],
         "transition_diag": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         "last_smoother_mean": [
             0.0,
-            -0.009840604605700562,
-            0.47726785623895873,
-            3.9012865551360614,
-            0.5465316847150868,
-            1.545454374706094,
+            -0.009840578049769195,
+            0.47726905281482296,
+            3.901285150686082,
+            0.5465328349384494,
+            1.5454521733535929,
             0.0,
             0.0,
         ],
     },
     "place_field_2_neuron_block_update_A": {
         "log_likelihoods": [
-            -165.77701776679186,
-            -159.79656401559905,
-            -156.8638824712707,
-            -155.1586313095854,
-            -153.9736164328118,
+            -165.77703492169934,
+            -159.79658765650126,
+            -156.86390759826725,
+            -155.15865926718595,
+            -153.97364717963447,
         ],
         "process_cov_diag": [
-            1.0080798126369258e-06,
-            1.0080798087903787e-06,
-            1.0080798126369258e-06,
-            1.0080798085054493e-06,
-            1.0080798126369258e-06,
-            1.0080798093602375e-06,
-            1.0080798126369258e-06,
-            1.0080798974034276e-06,
+            1.0079999917974862e-06,
+            1.0079999872386153e-06,
+            1.0079999917974862e-06,
+            1.0079999852441094e-06,
+            1.0079999917974862e-06,
+            1.0079999896605154e-06,
+            1.0079999917974862e-06,
+            1.0080000757091996e-06,
         ],
         "transition_diag": [
-            0.9999999959210049,
-            0.9999999904188883,
-            0.9999999959210049,
-            0.9999999699581358,
-            0.9999999959210049,
-            0.999999992783058,
-            0.9999999959210049,
-            0.9999999644345146,
+            0.9999999959209992,
+            0.9999999904190654,
+            0.9999999959209992,
+            0.9999999699588251,
+            0.9999999959209992,
+            0.9999999927831443,
+            0.9999999959209992,
+            0.9999999644355377,
         ],
         "last_smoother_mean": [
             0.0,
-            0.46765294338225766,
+            0.4676535444902131,
             0.0,
-            -0.9418921728087534,
+            -0.9418900569850257,
             0.0,
-            0.13158460848876016,
+            0.13158539281013507,
             0.0,
-            2.0927314038448124,
+            2.0927273008614247,
         ],
     },
     "place_field_2_neuron_block_newton3": {
         "log_likelihoods": [
-            -165.8070583932336,
-            -159.8474705858473,
-            -156.9314517282477,
-            -155.23717657612875,
-            -154.05010589987342,
+            -165.80707556042552,
+            -159.84749421692482,
+            -156.93147561226226,
+            -155.2372018255782,
+            -154.0501325501947,
         ],
-        # Recorded after the per-neuron block fix, not on the reference commit:
-        # there the block path smoothed every neuron with neuron 0's Q once the
-        # per-neuron Q differed by less than the equal-blocks tolerance, which
-        # put Q ~1e-13 off the dense path. These values agree with
-        # ``fit(..., force_dense=True)`` to ~1e-15.
         "process_cov_diag": [
-            1.007999991370092e-06,
-            1.0079999888057273e-06,
-            1.007999991370092e-06,
-            1.0079999906577684e-06,
-            1.007999991370092e-06,
+            1.0079999917974862e-06,
+            1.0079999876660095e-06,
+            1.0079999917974862e-06,
+            1.0079999905153036e-06,
+            1.0079999917974862e-06,
             1.0079999912276272e-06,
-            1.007999991370092e-06,
-            1.0080001194458653e-06,
+            1.0079999917974862e-06,
+            1.0080001187335417e-06,
         ],
         "transition_diag": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         "last_smoother_mean": [
             0.0,
-            0.4677666700856715,
+            0.4677672078330044,
             0.0,
-            -0.9421205734848691,
+            -0.94211862478966,
             0.0,
-            0.1328221837317423,
+            0.13282291088896941,
             0.0,
-            2.0908842973533863,
+            2.0908807407549372,
         ],
     },
     "common_oscillator": {
         "log_likelihoods": [
-            -5264.806444212982,
-            -864.2181355874648,
-            -853.1167260334222,
-            -852.571285693658,
-            -852.3750063247974,
-            -852.2950663588105,
+            -5264.806444212983,
+            -864.2181355875056,
+            -853.1167260334241,
+            -852.5712856936526,
+            -852.3750063247894,
+            -852.2950663588033,
         ],
         "discrete_transition": [
-            0.8959358823790271,
-            0.10406411762097277,
-            0.22651637096681385,
-            0.7734836290331861,
+            0.8959358823789606,
+            0.10406411762103951,
+            0.22651637096668603,
+            0.773483629033314,
         ],
         "measurement_matrix": [
-            0.15446390370214075,
-            0.13551357747820197,
-            0.076323794001411,
-            -0.02375522804510817,
-            0.10518977536741621,
-            -0.052701795747433534,
-            -0.053239997431782364,
-            -0.03235813513988948,
+            0.15446390370366214,
+            0.13551357748177464,
+            0.07632379400232135,
+            -0.02375522804590668,
+            0.10518977536810814,
+            -0.05270179574890487,
+            -0.053239997432183904,
+            -0.032358135139554496,
         ],
     },
     "directed_influence": {
         "log_likelihoods": [
-            -1633.3124019174234,
-            -835.8268231277262,
-            -628.6617696500973,
-            -585.038772844064,
-            -580.0969178462706,
-            -579.3717476885153,
+            -1633.3124019174236,
+            -763.1296588944158,
+            -601.875381559935,
+            -581.8818724600944,
+            -579.903965013694,
+            -579.4172564989066,
         ],
         "discrete_transition": [
-            0.985620521873509,
-            0.014379478126490928,
-            0.008554729785406856,
-            0.9914452702145933,
+            0.980991830510689,
+            0.01900816948931121,
+            0.0062569774947468975,
+            0.993743022505253,
         ],
         "continuous_transition": [
-            0.38303967568227926,
-            -0.13101985504730881,
-            0.4428077751066417,
-            -0.09147403864527288,
-            0.011021095508626119,
-            0.4753400570645071,
-            -0.0010238554411398288,
-            0.6031348776285204,
+            0.40567262522152325,
+            -0.11736659817797383,
+            0.42922370146958544,
+            -0.08917959002344307,
+            0.005448984338919801,
+            0.4750437777706677,
+            -0.009904623306323489,
+            0.5954558229702361,
         ],
     },
     "common_oscillator_pp": {
         "log_likelihoods": [
-            -273.72126438291116,
-            -271.97071205761534,
-            -271.289163462526,
-            -269.9022127510272,
+            -273.7212644609051,
+            -271.9707121294263,
+            -271.28916352747956,
+            -269.90221283996783,
         ],
         "discrete_transition": [
-            0.9941928026628999,
-            0.0058071973371001005,
-            0.1259188166557504,
-            0.8740811833442496,
+            0.9941928027320925,
+            0.0058071972679073465,
+            0.12591881692853113,
+            0.8740811830714689,
         ],
         "spike_weights": [
-            -0.0002340020967738842,
-            -0.0035023250459563678,
-            -0.027166344093586203,
-            -0.0062400241960830554,
-            0.010691105219450008,
-            -0.007447268368016869,
-            0.005971861899730394,
-            0.01790920234504152,
+            -0.00023399832686438134,
+            -0.0035023236999313805,
+            -0.027166341268409683,
+            -0.006240028548839944,
+            0.010691106607746383,
+            -0.00744726618753062,
+            0.0059718589063385156,
+            0.017909177700624414,
         ],
         "spike_baseline": [
-            3.5028519961378266,
-            1.8115525959233865,
-            3.816466549744381,
-            3.435367214947459,
-            3.804326536385313,
-            3.203649745664705,
-            4.0499983730774325,
-            4.06230009972351,
+            3.5028519962908318,
+            1.8115525776260524,
+            3.8164665504067097,
+            3.435367207017822,
+            3.8043265364310423,
+            3.2036497426726593,
+            4.049998349334377,
+            4.062300098331773,
         ],
     },
     "directed_influence_pp": {
         "log_likelihoods": [
-            -273.9050068017913,
-            -271.9368574435317,
-            -271.4769538980737,
-            -270.6151897202182,
+            -273.9050069538668,
+            -271.93685759718795,
+            -271.4769540534215,
+            -270.61518987520145,
         ],
         "continuous_transition": [
-            0.8350089264805329,
-            0.00033829897289660795,
-            0.45849419303725486,
-            -0.0002160976134380212,
-            -6.487181007478574e-05,
-            0.6946559760097927,
-            0.0005726813568868674,
-            0.6520250993319063,
+            0.8350089265299702,
+            0.00033829897314898653,
+            0.4584941930657065,
+            -0.0002160976130016461,
+            -6.487180937817834e-05,
+            0.6946559760392366,
+            0.000572681357630095,
+            0.6520250993600448,
         ],
         "spike_weights": [
-            0.051868656923750325,
-            0.05287618141034226,
-            0.03887179234543186,
-            -0.0459248456080469,
-            0.030104089707579527,
-            -0.043785134857723625,
-            -0.0600036664643555,
-            0.031111820133567707,
+            0.0518686568528939,
+            0.05287618140270316,
+            0.0388717920873224,
+            -0.0459248454666966,
+            0.030104089678413767,
+            -0.043785134861137436,
+            -0.06000366638040976,
+            0.031111820135246795,
         ],
     },
     "switching_spike_oscillator": {
         "log_likelihoods": [
-            -662.1638572716206,
-            -270.7479686808796,
-            -269.58110250333215,
-            -267.7544884944406,
+            -662.1638576943454,
+            -270.74796874727446,
+            -269.5811025980952,
+            -267.7544885508181,
         ],
         "continuous_transition": [
-            0.8558958216501339,
-            0.8558619903743119,
-            -0.27633383181032545,
-            -0.27423481678345407,
-            0.27633383181032545,
-            0.27423481678345407,
-            0.8558958216501339,
-            0.8558619903743119,
+            0.8558958377181372,
+            0.8558619788087026,
+            -0.2763338371046401,
+            -0.2742348125651018,
+            0.2763338371046401,
+            0.2742348125651018,
+            0.8558958377181372,
+            0.8558619788087026,
         ],
         "spike_weights": [
-            -0.058842508175110914,
-            -0.039596459088451996,
-            -0.032893774865250434,
-            -0.0330278939203562,
-            -0.07357521803228662,
-            0.006485704444619204,
-            0.01558225506749641,
-            -0.01386813086944359,
+            -0.05884250803288802,
+            -0.0395964560838335,
+            -0.03289377589460647,
+            -0.0330278938213854,
+            -0.07357521989857148,
+            0.0064857064621266095,
+            0.015582256237362934,
+            -0.013868133807748872,
         ],
     },
     "multinomial_choice": {
@@ -675,14 +700,14 @@ EXPECTED: dict[str, FitResult] = {
         "log_likelihoods": [
             -168.09077828766885,
             -164.95657530249645,
-            -164.95569697894862,
+            -164.9556969789486,
         ],
-        "inverse_temperature_and_noise": [0.10081306187557834, 0.009935007000345747],
+        "inverse_temperature_and_noise": [0.10081306187557834, 0.009935007000345365],
         "input_gain": [
-            0.0005960370207988313,
-            -0.0012995005608915603,
-            -0.000265305458935273,
-            0.0007794742331517101,
+            0.0005960370207988287,
+            -0.001299500560891564,
+            -0.00026530545893527663,
+            0.0007794742331517103,
         ],
     },
 }
@@ -692,7 +717,6 @@ EXPECTED: dict[str, FitResult] = {
 @pytest.mark.parametrize("case", list(CASES))
 def test_em_matches_recorded_values(case: str) -> None:
     expected = EXPECTED[case]
-    rtol, atol = TOLERANCES[case]
     actual = CASES[case]()
 
     assert set(actual) == set(expected)
@@ -700,6 +724,9 @@ def test_em_matches_recorded_values(case: str) -> None:
         "number of EM iterations changed"
     )
     for name, expected_value in expected.items():
+        rtol, atol = (
+            LL_TOLERANCES[case] if name == "log_likelihoods" else PARAMETER_TOLERANCE
+        )
         np.testing.assert_allclose(
             actual[name], expected_value, rtol=rtol, atol=atol, err_msg=name
         )

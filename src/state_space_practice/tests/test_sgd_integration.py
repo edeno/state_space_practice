@@ -107,19 +107,18 @@ class TestMultinomialChoiceSGDIntegration:
 class TestCovariateChoiceSGDIntegration:
     """End-to-end: simulate RL choice data → fit_sgd → recover parameters."""
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "TODO(covariate-choice): fit_sgd does not recover the latent "
-            "values. Over seeds 0-9 and 42 the smoothed-vs-true correlation "
-            "for option 0 exceeds 0.5 on only 4/11 seeds (seed 42: -0.11), "
-            "one diagonal input_gain_ entry stays exactly 0 on every seed, "
-            "and seed 0 learns a -0.53 diagonal gain. Remove once recovery "
-            "holds on most seeds (then make this a multi-seed test)."
-        ),
-    )
-    def test_recover_with_covariates(self):
+    @pytest.mark.parametrize("seed", [0, 42])
+    def test_recover_with_covariates(self, seed):
+        """fit_sgd recovers the latent value of the option the learner uses.
+
+        With ``inverse_temperature=2`` the simulated bandit runs away (one
+        option is chosen on ~299/300 trials), so the other options' values are
+        pure unobservable process noise and cannot be recovered by any model.
+        ``inverse_temperature=0.5`` keeps every option in play, and the model
+        is given the simulation's decay (``init_decay=0.95``) instead of a
+        random walk. The assertions target the most-chosen non-reference
+        option, whose latent value is identifiable from the data.
+        """
         from state_space_practice.covariate_choice import (
             CovariateChoiceModel,
             simulate_rl_choice_data,
@@ -128,15 +127,22 @@ class TestCovariateChoiceSGDIntegration:
         sim = simulate_rl_choice_data(
             n_trials=300,
             n_options=3,
-            inverse_temperature=2.0,
-            seed=42,
+            inverse_temperature=0.5,
+            seed=seed,
         )
+        counts = np.bincount(np.asarray(sim.choices), minlength=3)
+        # Guard: the simulation must not be degenerate for this to mean much.
+        assert counts.min() >= 10, f"degenerate simulation, counts={counts}"
+        # Non-reference option (1 or 2) chosen most often; its value column is
+        # ``true_values[:, option - 1]``.
+        option = int(np.argmax(counts[1:])) + 1
 
         model = CovariateChoiceModel(
             n_options=3,
             n_covariates=sim.covariates.shape[1],
             init_inverse_temperature=1.0,
             init_process_noise=0.01,
+            init_decay=0.95,
         )
         lls = model.fit_sgd(
             sim.choices,
@@ -146,23 +152,17 @@ class TestCovariateChoiceSGDIntegration:
 
         assert lls[-1] > lls[0]
         assert model.is_fitted
-        # Input gain should be learned (nonzero)
-        assert jnp.any(jnp.abs(model.input_gain_) > 0.01)
-        # Smoothed values should track true values
         corr = float(
-            jnp.corrcoef(
-                model.smoothed_values[:, 0],
-                sim.true_values[:, 0],
+            np.corrcoef(
+                np.asarray(model.smoothed_values[:, option - 1]),
+                np.asarray(sim.true_values[:, option - 1]),
             )[0, 1]
         )
-        assert corr > 0.5, f"Smoothed-vs-true values correlation {corr:.3f} < 0.5"
-        # Input gain diagonal should be non-negative (reward increases value).
-        # Some entries may be near zero if that option was rarely chosen.
-        diag = jnp.diag(model.input_gain_)
-        assert jnp.all(diag >= -0.05), (
-            f"Input gain diagonal should be non-negative (learning from reward), "
-            f"got {diag}"
-        )
+        assert corr > 0.8, f"option {option}: smoothed-vs-true corr {corr:.3f}"
+        # Reward on that option raises its value: a clearly positive learning
+        # rate (true value 0.5; softmax scale trades off against it).
+        gain = float(model.input_gain_[option - 1, option - 1])
+        assert gain > 0.1, f"option {option}: learned input gain {gain:.3f}"
 
     def test_sgd_vs_em_agreement(self):
         from state_space_practice.covariate_choice import (
