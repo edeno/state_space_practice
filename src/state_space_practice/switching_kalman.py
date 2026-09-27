@@ -2405,14 +2405,30 @@ def switching_kalman_maximization_step(
     measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim, n_discrete_states)
         Measurement covariance.
     init_mean : jax.Array, shape (n_cont_states, n_discrete_states)
-        Initial mean of the continuous latent state.
+        Initial mean of the continuous latent state, ``E[x_1 | S_1=j, y]``.
     init_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-        Initial covariance of the continuous latent state.
+        Initial covariance of the continuous latent state,
+        ``Cov[x_1 | S_1=j, y]``.
     discrete_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
         Transition matrix for the discrete states.
     init_discrete_state_prob : jax.Array, shape (n_discrete_states,)
         Initial discrete state probabilities.
 
+    Notes
+    -----
+    :func:`switching_kalman_filter` places its prior directly on ``x_1``
+    (measurement-only update at ``t = 1``; there is no ``x_0 -> x_1``
+    transition), so installing the state-conditional smoothed moments of
+    ``x_1`` is the exact EM update of the initial prior -- unlike
+    :func:`~state_space_practice.kalman.kalman_filter`, which predicts before
+    its first update and needs the smoothed ``x_0``
+    (:class:`~state_space_practice.kalman.InitialStatePrior`). Given the
+    *exact* posterior statistics (state- and pair-conditional moments), every
+    returned parameter -- including the fixed-``H`` / fixed-``A`` constrained
+    ``R`` / ``Q`` -- is the exact maximiser of the expected complete-data
+    log-likelihood (checked against discrete-path enumeration in
+    ``tests/test_oracle_switching_kalman.py``); with GPB smoother statistics
+    it inherits the GPB approximation of the posterior.
 
     References
     ----------
