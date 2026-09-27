@@ -203,8 +203,13 @@ def _approximate_gaussian_newton(
         # largest step in 1, 1/2, ..., 1/128 that decreases the objective
         # sufficiently; near the mode the full step is accepted.
         f_candidates = batched_objective(x + step_sizes * direction)
-        sufficient = f_candidates <= neg_log_posterior(x) + _ARMIJO_C * step_sizes * (
-            g * direction
+        f_x = neg_log_posterior(x)
+        # Round-off slack: at a converged mode the tiny full step must still
+        # be taken, or gradients through the scan miss the Newton map's
+        # contraction (see multinomial_choice._softmax_update_core).
+        slack = 1e-12 * (1.0 + jnp.abs(f_x))
+        sufficient = (
+            f_candidates <= f_x + _ARMIJO_C * step_sizes * (g * direction) + slack
         )
         alpha = jnp.where(jnp.any(sufficient), step_sizes[jnp.argmax(sufficient)], 0.0)
         return x + alpha * direction, None

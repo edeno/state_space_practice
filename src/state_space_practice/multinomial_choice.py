@@ -123,7 +123,15 @@ def _softmax_update_core(
         candidates = x + step_sizes[:, None] * direction
         f_x = log_posterior(x)
         f_candidates = log_posterior(candidates)
-        sufficient = f_candidates >= f_x + _ARMIJO_C * step_sizes * (rhs @ direction)
+        # The slack admits steps that change f only at round-off level, so
+        # at a converged mode the (tiny) full Newton step is still taken:
+        # rejecting it would freeze x, and reverse-mode gradients through
+        # the scan would then miss the Newton map's contraction and carry
+        # the error of an earlier, unconverged iterate.
+        slack = 1e-12 * (1.0 + jnp.abs(f_x))
+        sufficient = (
+            f_candidates >= f_x + _ARMIJO_C * step_sizes * (rhs @ direction) - slack
+        )
         # Largest acceptable step; if none qualifies (direction numerically
         # useless), keep x rather than risk a descent step.
         first_ok = jnp.argmax(sufficient)
