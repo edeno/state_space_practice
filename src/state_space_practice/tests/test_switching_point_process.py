@@ -2392,7 +2392,7 @@ class TestSingleNeuronGLMStep:
         baseline = 0.0
         weights = jnp.zeros(n_latent)
 
-        new_baseline, new_weights = _single_neuron_glm_step(
+        new_baseline, new_weights, _ = _single_neuron_glm_step(
             baseline, weights, y_n, smoother_mean, dt
         )
 
@@ -2419,7 +2419,7 @@ class TestSingleNeuronGLMStep:
         baseline = 0.0
         weights = jnp.ones(n_latent) * 0.1
 
-        new_baseline, new_weights = _single_neuron_glm_step(
+        new_baseline, new_weights, _ = _single_neuron_glm_step(
             baseline, weights, y_n, smoother_mean, dt
         )
 
@@ -2455,7 +2455,7 @@ class TestSingleNeuronGLMStep:
         loss_before = _single_neuron_glm_loss(baseline, weights, y_n, smoother_mean, dt)
 
         # Take Newton step
-        new_baseline, new_weights = _single_neuron_glm_step(
+        new_baseline, new_weights, _ = _single_neuron_glm_step(
             baseline, weights, y_n, smoother_mean, dt
         )
 
@@ -2494,7 +2494,7 @@ class TestSingleNeuronGLMStep:
 
         # Run multiple Newton iterations
         for _ in range(10):
-            baseline, weights = _single_neuron_glm_step(
+            baseline, weights, _ = _single_neuron_glm_step(
                 baseline, weights, y_n, smoother_mean, dt
             )
 
@@ -2526,7 +2526,7 @@ class TestSingleNeuronGLMStep:
         baseline = 0.0
         weights = jnp.ones(n_latent) * 0.1
 
-        new_baseline, new_weights = _single_neuron_glm_step(
+        new_baseline, new_weights, _ = _single_neuron_glm_step(
             baseline, weights, y_n, smoother_mean, dt
         )
 
@@ -2554,7 +2554,7 @@ class TestSingleNeuronGLMStep:
         baseline = 3.0
         weights = jnp.ones(n_latent) * 0.1
 
-        new_baseline, new_weights = _single_neuron_glm_step(
+        new_baseline, new_weights, _ = _single_neuron_glm_step(
             baseline, weights, y_n, smoother_mean, dt
         )
 
@@ -3245,7 +3245,7 @@ class TestSecondOrderNewtonScan:
         for n in range(pb["spikes"].shape[1]):
             b, w = pb["current"].baseline[n], pb["current"].weights[n]
             for _ in range(max_iter):
-                b, w = _single_neuron_glm_step_second_order(
+                b, w, _ = _single_neuron_glm_step_second_order(
                     b,
                     w,
                     pb["spikes"][:, n],
@@ -3337,7 +3337,7 @@ class TestSecondOrderNewtonScan:
         for n in range(pb["spikes"].shape[1]):
             b, w = pb["current"].baseline[n], pb["current"].weights[n]
             for _ in range(max_iter):
-                b, w = _single_neuron_glm_step_second_order_mixture(
+                b, w, _ = _single_neuron_glm_step_second_order_mixture(
                     b,
                     w,
                     pb["spikes"][:, n],
@@ -3497,7 +3497,7 @@ class TestSecondOrderClippedWarmStart:
         baseline = jnp.asarray(25.0)
         weights = jnp.zeros((1,))
         for _ in range(60):
-            baseline, weights = _single_neuron_glm_step_second_order(
+            baseline, weights, _ = _single_neuron_glm_step_second_order(
                 baseline, weights, y_n, smoother_mean, smoother_cov, dt
             )
 
@@ -3520,7 +3520,7 @@ class TestSecondOrderClippedWarmStart:
         baseline = jnp.asarray(25.0)
         weights = jnp.zeros((1,))
         for _ in range(60):
-            baseline, weights = _single_neuron_glm_step_second_order_mixture(
+            baseline, weights, _ = _single_neuron_glm_step_second_order_mixture(
                 baseline,
                 weights,
                 y_n,

@@ -1200,22 +1200,6 @@ def _single_neuron_glm_step(
     dt: float,
     time_weights: Array | None = None,
     weight_l2: float = 0.0,
-) -> tuple[Array, Array]:
-    """Single plug-in Newton step; see :func:`_single_neuron_glm_step_with_flag`."""
-    new_baseline, new_weights, _ = _single_neuron_glm_step_with_flag(
-        baseline, weights, y_n, smoother_mean, dt, time_weights, weight_l2
-    )
-    return new_baseline, new_weights
-
-
-def _single_neuron_glm_step_with_flag(
-    baseline: ArrayLike,
-    weights: Array,
-    y_n: Array,
-    smoother_mean: Array,
-    dt: float,
-    time_weights: Array | None = None,
-    weight_l2: float = 0.0,
 ) -> tuple[Array, Array, Array]:
     """Single Newton-Raphson step for Poisson GLM parameter optimization.
 
@@ -1448,34 +1432,6 @@ def _single_neuron_glm_step_second_order(
     weight_l2: float = 0.0,
     baseline_prior: Array | None = None,
     baseline_prior_l2: float = 0.0,
-) -> tuple[Array, Array]:
-    """Second-order Newton step; see the ``_with_flag`` variant."""
-    new_baseline, new_weights, _ = _single_neuron_glm_step_second_order_with_flag(
-        baseline,
-        weights,
-        y_n,
-        smoother_mean,
-        smoother_cov,
-        dt,
-        time_weights,
-        weight_l2,
-        baseline_prior,
-        baseline_prior_l2,
-    )
-    return new_baseline, new_weights
-
-
-def _single_neuron_glm_step_second_order_with_flag(
-    baseline: Array,
-    weights: Array,
-    y_n: Array,
-    smoother_mean: Array,
-    smoother_cov: Array,
-    dt: float,
-    time_weights: Array | None = None,
-    weight_l2: float = 0.0,
-    baseline_prior: Array | None = None,
-    baseline_prior_l2: float = 0.0,
 ) -> tuple[Array, Array, Array]:
     """Single Newton step for Poisson GLM with second-order expectation.
 
@@ -1624,34 +1580,6 @@ def _single_neuron_glm_step_second_order_mixture(
     weight_l2: float = 0.0,
     baseline_prior: Array | None = None,
     baseline_prior_l2: float = 0.0,
-) -> tuple[Array, Array]:
-    """Shared-parameter mixture Newton step; see the ``_with_flag`` variant."""
-    new_b, new_w, _ = _single_neuron_glm_step_second_order_mixture_with_flag(
-        baseline,
-        weights,
-        y_n,
-        state_cond_smoother_mean,
-        state_cond_smoother_cov,
-        state_weights,
-        dt,
-        weight_l2,
-        baseline_prior,
-        baseline_prior_l2,
-    )
-    return new_b, new_w
-
-
-def _single_neuron_glm_step_second_order_mixture_with_flag(
-    baseline: Array,
-    weights: Array,
-    y_n: Array,
-    state_cond_smoother_mean: Array,
-    state_cond_smoother_cov: Array,
-    state_weights: Array,
-    dt: float,
-    weight_l2: float = 0.0,
-    baseline_prior: Array | None = None,
-    baseline_prior_l2: float = 0.0,
 ) -> tuple[Array, Array, Array]:
     """Single Newton step for a shared Poisson GLM under a Gaussian mixture.
 
@@ -1769,7 +1697,7 @@ def _second_order_newton_iterations(
         baselines, weights = carry
 
         def update_neuron(b, w, y_n, bp):
-            return _single_neuron_glm_step_second_order_with_flag(
+            return _single_neuron_glm_step_second_order(
                 b,
                 w,
                 y_n,
@@ -1847,7 +1775,7 @@ def _mixture_newton_iterations(
         baselines, weights = carry
 
         def update_neuron(b, w, y_n, bp):
-            return _single_neuron_glm_step_second_order_mixture_with_flag(
+            return _single_neuron_glm_step_second_order_mixture(
                 b,
                 w,
                 y_n,
@@ -2011,7 +1939,7 @@ def update_spike_glm_params(
             baselines, weights = carry
 
             def update_neuron(b, w, y_n):
-                return _single_neuron_glm_step_with_flag(
+                return _single_neuron_glm_step(
                     b, w, y_n, smoother_mean, dt, time_weights, weight_l2
                 )
 
