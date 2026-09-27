@@ -1763,6 +1763,7 @@ class TestStructuredPointProcessMStepStationarity:
 
         grad = rh.central_difference_gradient(f, theta, 1e-8)
         scale = np.max(np.abs(theta[[0, 1, 4, 5]]))
+
         def _scale_derivative(Q):
             return rh.central_difference_gradient(
                 lambda c: rh.transition_objective(A, Q * (1.0 + c[0]), stats),
