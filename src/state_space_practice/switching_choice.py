@@ -219,7 +219,17 @@ def switching_choice_filter(
     init_cov: ArrayLike | None = None,
     init_discrete_prob: ArrayLike | None = None,
 ) -> SwitchingChoiceFilterResult:
-    """Validate choices and run the JIT-compiled switching choice filter."""
+    """Validate choices and run the JIT-compiled switching choice filter.
+
+    See :func:`_switching_choice_filter_jit` for parameters and returns.
+
+    Warns
+    -----
+    StateSpaceWarning
+        If a Laplace mode search (for any state pair) ends more than
+        ``multinomial_choice.NEWTON_GAP_TOL`` nats (Newton estimate) below
+        its mode.
+    """
     validate_choice_indices(choices, n_options)
     return _switching_choice_filter_jit(
         choices,

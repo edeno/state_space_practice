@@ -309,6 +309,25 @@ def smith_laplace_log_likelihood(
     predictive uncertainty ``P_{k|k-1}``; the plug-in is over-confident and
     biases a likelihood-based ``sigma_epsilon`` estimate downwards.
 
+    Parameters
+    ----------
+    n_correct_responses : ArrayLike, shape (n_trials,)
+        Number of correct responses ``y_k`` in each trial.
+    max_possible_correct : ArrayLike, shape (n_trials,) or scalar
+        Number of Bernoulli attempts ``N_k`` in each trial.
+    filtered_mode : ArrayLike, shape (n_trials,)
+        Posterior mode ``x_k^*`` of the learning state (the filter's
+        ``learning_state_mode``).
+    filtered_variance : ArrayLike, shape (n_trials,)
+        Posterior variance ``P_{k|k}`` at the mode.
+    one_step_mode : ArrayLike, shape (n_trials,)
+        One-step prediction mean ``m_{k|k-1}``.
+    one_step_variance : ArrayLike, shape (n_trials,)
+        One-step prediction variance ``P_{k|k-1}``.
+    mu : ArrayLike, scalar
+        Logit bias of the observation model, ``p_k = sigmoid(mu + x_k)``
+        (``log(p_chance / (1 - p_chance))``).
+
     Returns
     -------
     log_likelihood_terms : Array, shape (n_trials,)
@@ -378,9 +397,9 @@ def smith_learning_filter(
         If True, skip the host-side input validation so the filter can be
         traced by ``jax.grad`` (SGD fitting). Both settings find each
         Laplace mode with the same line-searched Newton iterations
-        (reverse-mode differentiable); the BFGS solver of
-        :func:`approximate_gaussian` is no longer used here because it can
-        terminate early on a line-search failure. Default False.
+        (reverse-mode differentiable), not the BFGS solver of
+        :func:`approximate_gaussian`, which can terminate early on a
+        line-search failure. Default False.
 
     Returns
     -------
@@ -394,6 +413,13 @@ def smith_learning_filter(
         One-step prediction mode ($x_{k|k-1}$).
     one_step_variance : Array, shape (n_trials,)
         One-step prediction variance ($P_{k|k-1}$).
+
+    Warns
+    -----
+    StateSpaceWarning
+        If a Laplace mode search ends more than
+        ``multinomial_choice.NEWTON_GAP_TOL`` nats (Newton estimate) below
+        its mode, e.g. for a prior deep in saturation opposite the data.
     """
     # Resolve concrete values before JIT boundary
     if not differentiable:
@@ -662,10 +688,10 @@ def maximization_step(
         \qquad S = \sum_k E[(x_{k+1} - x_k)^2 | y_{1:T}].
 
     Its maximiser is ``\sigma^2 = S / (T - 1)``, ``x_0 = x_{1|T}`` and
-    ``P_0 = P_{1|T} - \sigma^2`` (floored at a small positive value). The
-    variance update previously returned ``P_{1|T}`` itself, which makes the
-    prior on ``x_1`` ``P_{1|T} + \sigma^2`` -- a generalised-EM step that
-    does not maximise the objective.
+    ``P_0 = P_{1|T} - \sigma^2`` (floored at a small positive value), not
+    ``P_0 = P_{1|T}``: the latter makes the prior on ``x_1``
+    ``P_{1|T} + \sigma^2``, a generalised-EM step that does not maximise the
+    objective.
 
     Parameters
     ----------

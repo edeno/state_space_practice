@@ -145,13 +145,15 @@ def _softmax_update_core(
     Parameters
     ----------
     max_newton_steps : int, default 10
-        Number of line-searched Newton iterations for Laplace mode-finding
-        (a ``lax.scan``, so the compile cost does not depend on it). Three
-        iterations, the previous default, leave the mode unconverged for
-        moderately large inverse temperatures (a 2.7-nat evidence error at
-        beta=3 on 100 simulated trials); ten converge it in every tested
-        case, and at an already converged mode extra iterations take a
-        zero-length step.
+        Number of line-searched Newton iterations for Laplace mode-finding:
+        a fixed-length ``lax.scan`` with no early exit, so the update stays
+        reverse-mode differentiable and the compile cost does not depend on
+        it. Ten converge the mode in ordinary use (none of 42,000 simulated
+        updates at beta in [0.5, 12] was left unconverged); three leave it
+        unconverged at moderately large inverse temperatures (a 2.7-nat
+        evidence error at beta=3 on 100 simulated trials). At a converged
+        mode extra iterations take a zero-length step; ``newton_gap`` reports
+        a mode that was not reached.
     obs_offset : Array or None, shape (K,)
         Additive offset to the logits before softmax. Used for
         observation covariates (e.g., stay bias, spatial bias).
@@ -306,16 +308,30 @@ def softmax_observation_update(
         Total number of options K.
     inverse_temperature : float
         Softmax inverse temperature beta.
-    max_newton_steps : int
-        Maximum Newton iterations for Laplace mode-finding.
+    max_newton_steps : int, default 10
+        Number of line-searched Newton iterations for the Laplace mode. This
+        is a fixed-length ``lax.scan`` with no early exit: every call runs
+        all of them (at a converged mode the extra iterations take a
+        zero-length step). A ``StateSpaceWarning`` is emitted if the final
+        iterate is still more than ``NEWTON_GAP_TOL`` nats (Newton estimate)
+        below the mode.
 
     Returns
     -------
     posterior_mean : Array, shape (K-1,)
+        Posterior mode.
     posterior_cov : Array, shape (K-1, K-1)
+        Inverse negative Hessian of the log posterior at the mode.
     log_likelihood : Array, scalar
-        Log-likelihood log P(choice | prior_mean) evaluated at the
-        prior mean (for EM monitoring).
+        Laplace approximation, at the posterior mode, of the evidence
+        ``log p(choice | prior) = log E_{N(prior_mean, prior_cov)}[p(choice
+        | x)]`` (for EM monitoring).
+
+    Warns
+    -----
+    StateSpaceWarning
+        If the Newton search stops short of the mode (see
+        ``max_newton_steps``).
     """
     if choice < 0 or choice >= n_options:
         raise ValueError(f"choice must be in [0, {n_options}), got {choice}")
@@ -406,6 +422,12 @@ def multinomial_choice_filter(
     ------
     ValueError
         If any entry of ``choices`` is outside ``[0, n_options)``.
+
+    Warns
+    -----
+    StateSpaceWarning
+        If a Laplace mode search ends more than ``NEWTON_GAP_TOL`` nats
+        (Newton estimate) below its mode.
     """
     _validate_choices(choices, n_options)
     choices_arr = jnp.asarray(choices, dtype=jnp.int32)

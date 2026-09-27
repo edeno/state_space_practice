@@ -254,6 +254,13 @@ def covariate_choice_filter(
     Returns
     -------
     ChoiceFilterResult
+
+    Warns
+    -----
+    StateSpaceWarning
+        If a Laplace mode search ends more than
+        ``multinomial_choice.NEWTON_GAP_TOL`` nats (Newton estimate) below
+        its mode.
     """
     validate_choice_indices(choices, n_options)
     choices_arr = jnp.asarray(choices, dtype=jnp.int32)

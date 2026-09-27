@@ -92,9 +92,8 @@ def circular_std(phases: NDArray[np.floating]) -> float:
     Notes
     -----
     Delegates to ``scipy.stats.circstd(phases)`` (default ``low=0``,
-    ``high=2 pi``, ``normalize=False``: result in radians). The one
-    difference from SciPy is kept from the previous hand-written version:
-    ``R`` is floored at ``1e-10``, so the result is capped at
+    ``high=2 pi``, ``normalize=False``: result in radians), except that
+    ``R`` is floored at ``1e-10``: the result is capped at
     ``sqrt(-2 log 1e-10) ~ 6.79`` rather than growing to ``inf`` for
     (numerically) uniform phases.
     """
@@ -151,9 +150,9 @@ def rayleigh_test(phases: NDArray[np.floating]) -> tuple[float, float]:
                          - (24z - 132z^2 + 76z^3 - 9z^4) / (288 n^2))
 
     clipped to ``[0, 1]``. It tends to the leading-order ``exp(-z)`` as
-    ``n -> inf`` and is applied at every ``n``; the correction was previously
-    dropped for ``n >= 50``, which made the p-value jump (by 14% at ``z = 6``)
-    between ``n = 49`` and ``n = 50``. SciPy has no Rayleigh test
+    ``n -> inf`` and is applied at every ``n``: switching to ``exp(-z)``
+    above a cutoff would make the p-value jump there (by 14% at ``z = 6``
+    for a cutoff at ``n = 50``). SciPy has no Rayleigh test
     (``scipy.stats.rayleigh`` is the Rayleigh distribution).
 
     References
