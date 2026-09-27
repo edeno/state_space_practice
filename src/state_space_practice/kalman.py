@@ -33,6 +33,30 @@ from state_space_practice.utils import (  # noqa: F401 — re-exported for backw
     symmetrize,
 )
 
+# Gain solves (Kalman gain ``S^{-1} H P``, RTS gain ``P_pred^{-1} A P``) and the
+# M-step regression solves use a purely scale-relative Cholesky shift: the
+# linear-Gaussian recursions are equivariant under a change of units
+# (x -> c x, covariances -> c^2 cov), and an absolute shift breaks that. With
+# psd_solve's default absolute 1e-9 floor, a model whose covariances are
+# ~1e-8 (e.g. voltages) got posterior means off by >1 posterior standard
+# deviation, and n_obs > n_latent with R ~ 1e-6 by ~2 standard deviations
+# (tests/test_oracle_kalman.py). The matrices solved here are positive
+# definite whenever the inputs are valid (R > 0 makes S > 0), so the shift only
+# guards against round-off; the tiny absolute part only keeps an all-zero
+# matrix factorizable.
+_GAIN_SOLVE_RELATIVE_BOOST = 1e-14
+_GAIN_SOLVE_ABSOLUTE_BOOST = 1e-300
+
+
+def _gain_solve(cov: jax.Array, rhs: jax.Array) -> jax.Array:
+    """Solve ``cov @ x = rhs`` for a PD ``cov`` with a scale-relative shift."""
+    return psd_solve(
+        cov,
+        rhs,
+        diagonal_boost=_GAIN_SOLVE_ABSOLUTE_BOOST,
+        relative_boost=_GAIN_SOLVE_RELATIVE_BOOST,
+    )
+
 
 def woodbury_kalman_gain(
     prior_cov: ArrayLike,
@@ -393,7 +417,7 @@ def kalman_measurement_update(
     )
 
     residual_error = obs - obs_mean
-    kalman_gain = psd_solve(obs_cov, measurement_matrix @ prior_cov).T
+    kalman_gain = _gain_solve(obs_cov, measurement_matrix @ prior_cov).T
 
     posterior_mean = prior_mean + kalman_gain @ residual_error
     posterior_cov = joseph_form_update(
@@ -676,7 +700,7 @@ def _kalman_smoother_update(
     )
 
     # Smoother gain J_t
-    smoother_kalman_gain = psd_solve(one_step_cov, transition_matrix @ filter_cov).T
+    smoother_kalman_gain = _gain_solve(one_step_cov, transition_matrix @ filter_cov).T
 
     # Smoothed mean m_{t|T}
     smoother_mean = filter_mean + smoother_kalman_gain @ (
@@ -810,7 +834,7 @@ def rts_backward_scan_with_predictions(
     def _step(carry, args):
         next_mean, next_cov = carry
         f_mean, f_cov, p_mean_next, p_cov_next = args
-        gain = psd_solve(p_cov_next, A @ f_cov).T
+        gain = _gain_solve(p_cov_next, A @ f_cov).T
         mean = f_mean + gain @ (next_mean - p_mean_next)
         cov = symmetrize(f_cov + gain @ (next_cov - p_cov_next) @ gain.T)
         return (mean, cov), (mean, cov, gain @ next_cov)
@@ -1075,7 +1099,7 @@ def parallel_kalman_smoother(
     def _build_element(filt_mean, filt_cov, A_t, Q_t):
         pred_cov = symmetrize(A_t @ filt_cov @ A_t.T + Q_t)
         pred_mean = A_t @ filt_mean
-        J = psd_solve(pred_cov, A_t @ filt_cov).T  # smoother gain
+        J = _gain_solve(pred_cov, A_t @ filt_cov).T  # smoother gain
         g = filt_mean - J @ pred_mean
         L = symmetrize(filt_cov - J @ pred_cov @ J.T)
         return _SmootherElement(E=J, g=g, L=L)
@@ -1398,14 +1422,14 @@ def kalman_maximization_step(
     ).T
 
     # Measurement matrix and covariance
-    measurement_matrix = psd_solve(gamma, delta.T).T
+    measurement_matrix = _gain_solve(gamma, delta.T).T
     measurement_cov = project_psd_relative(
         measurement_cov_residual_form(obs, smoother_mean, sum_cov, measurement_matrix),
         name="kalman_maximization_step measurement_cov",
     )
 
     # Transition matrix
-    transition_matrix = psd_solve(gamma1, beta.T).T
+    transition_matrix = _gain_solve(gamma1, beta.T).T
 
     # Process covariance
     process_cov = project_psd_relative(
