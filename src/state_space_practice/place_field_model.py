@@ -1383,9 +1383,6 @@ class PlaceFieldModel(SGDFittableMixin):
                 # E-step the design form that path consumes.
                 design_holder["design_matrix"] = self._filter_design_matrix(Z_base)
 
-        def _warn(msg: str) -> None:
-            logger.warning(msg)
-
         def _on_iteration(iteration: int, ll: float, change: float) -> None:
             _print(
                 f"  EM iter {iteration + 1:>{len(str(max_iter))}}/{max_iter}: "
@@ -1403,7 +1400,6 @@ class PlaceFieldModel(SGDFittableMixin):
             clear_state=_clear_posteriors,
             logger=logger,
             on_iteration=_on_iteration,
-            warn=_warn,
         )
         self.log_likelihoods = result.log_likelihoods
         if result.converged:
