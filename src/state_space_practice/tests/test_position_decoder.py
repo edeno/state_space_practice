@@ -1983,3 +1983,59 @@ class TestTracedDecoderHyperparameters:
         # guard: a structural (static) change does retrace.
         position_decoder_filter(**kwargs, sigma_track=5.0, max_newton_iter=2)
         assert traces
+
+
+def _noisy_circle_session(rng, n_time, dt, phase=0.0):
+    """Circular run (r=20 cm, 2 s period) with ~1 cm tracking noise and
+    spikes from a 4x4 grid of Gaussian place fields (sigma 8 cm, 30 Hz)."""
+    t = np.arange(n_time) * dt
+    position = np.column_stack(
+        [
+            50 + 20 * np.cos(2 * np.pi * t / 2.0 + phase),
+            50 + 20 * np.sin(2 * np.pi * t / 2.0 + phase),
+        ]
+    ) + rng.normal(0.0, 1.0, (n_time, 2))
+    grid = np.linspace(28, 72, 4)
+    centers = np.array([(cx, cy) for cx in grid for cy in grid])
+    dist_sq = np.sum((position[:, None, :] - centers[None]) ** 2, axis=-1)
+    rate = 30.0 * np.exp(-dist_sq / (2 * 8.0**2)) + 0.5
+    return position, rng.poisson(rate * dt).astype(float)
+
+
+@pytest.mark.slow
+class TestDecoderRecoverySweep:
+    """Decoding error as a statistic over seeds and training lengths.
+
+    For each seed, KDE rate maps are fit on a short (6 s) and a long (48 s)
+    training session and the same held-out 10 s test session is decoded
+    with each. More training data gives better rate maps, so the held-out
+    median error must shrink; per-seed values are reported on failure.
+    Observed median errors: 7.6-9.2 cm (6 s) vs 4.4-5.9 cm (48 s).
+    """
+
+    def test_heldout_error_decreases_with_training_length(self) -> None:
+        dt = 0.004
+        errors = {1500: [], 12000: []}
+        for seed in (0, 1, 2):
+            rng = np.random.default_rng(seed)
+            train_pos, train_spikes = _noisy_circle_session(rng, 12000, dt)
+            test_pos, test_spikes = _noisy_circle_session(rng, 2500, dt, phase=1.0)
+            for n_train in errors:
+                decoder = PositionDecoder(dt=dt, q_pos=500.0, include_velocity=False)
+                decoder.fit(train_pos[:n_train], train_spikes[:n_train])
+                result = decoder.decode(
+                    test_spikes,
+                    method="smoother",
+                    init_position=jnp.asarray(test_pos[0]),
+                )
+                decoded = np.asarray(result.position_mean[:, :2])
+                err = np.linalg.norm(decoded[250:] - test_pos[250:], axis=1)
+                errors[n_train].append(float(np.median(err)))
+        short, long = np.array(errors[1500]), np.array(errors[12000])
+        msg = (
+            f"per-seed held-out median error (cm): 6 s training "
+            f"{np.round(short, 2)}, 48 s training {np.round(long, 2)}"
+        )
+        assert np.all(long < 8.0), msg
+        assert np.mean(long) < 0.8 * np.mean(short), msg
+        assert np.all(long < short), msg

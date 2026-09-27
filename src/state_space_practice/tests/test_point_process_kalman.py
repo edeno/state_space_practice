@@ -1171,29 +1171,6 @@ class TestPointProcessModel:
         # Last time point should be the same
         np.testing.assert_allclose(ci_smoothed[-1], ci_filtered[-1], rtol=1e-5)
 
-    def test_random_walk_recovery(self) -> None:
-        """Model should recover A ≈ I for random walk data."""
-        np.random.seed(123)
-        n_time = 500
-        n_basis = 3
-        dt = 0.02
-
-        design_matrix = np.eye(n_basis)[np.arange(n_time) % n_basis]
-        spike_indicator = np.random.poisson(0.2, size=n_time).astype(float)
-
-        model = PointProcessModel(
-            n_state_dims=n_basis,
-            dt=dt,
-            transition_matrix=jnp.eye(n_basis) * 0.8,  # Start away from I
-            process_cov=jnp.eye(n_basis) * 1e-3,
-        )
-
-        model.fit(design_matrix, spike_indicator, max_iter=20)
-
-        # A should be close to identity for random walk (allow 0.25 tolerance)
-        # Note: with limited data, exact recovery is difficult
-        np.testing.assert_allclose(model.transition_matrix, jnp.eye(n_basis), atol=0.25)
-
 
 class TestKalmanMaximizationStepMStepRegression:
     """Regression tests for the dynamics_only_m_step M-step bug fix.
@@ -2531,55 +2508,6 @@ class TestPointProcessEMCorrectness:
         # All finite
         for i, ll in enumerate(log_likelihoods):
             assert np.isfinite(ll), f"LL should be finite at iteration {i}"
-
-    def test_em_recovers_stationary_params(self) -> None:
-        """With A=I and small Q, EM should recover the true GLM parameters.
-
-        The state is the parameter vector. With identity dynamics and small
-        process noise, the smoother mean at steady state should approximate
-        the true parameters.
-        """
-        n_time = 2000
-        n_params = 3  # intercept + 2 features
-        dt = 0.01
-
-        true_params = jnp.array([1.5, 0.8, -0.5])
-
-        key = jax.random.PRNGKey(99)
-        k1, k2 = jax.random.split(key)
-        features = jax.random.normal(k1, (n_time, 2)) * 0.3
-        design_matrix = jnp.concatenate([jnp.ones((n_time, 1)), features], axis=1)
-
-        log_rate = log_conditional_intensity(design_matrix, true_params)
-        rate = jnp.exp(log_rate) * dt
-        spikes = jax.random.poisson(k2, rate).astype(float)
-
-        model = PointProcessModel(
-            n_state_dims=n_params,
-            dt=dt,
-            transition_matrix=jnp.eye(n_params),
-            process_cov=jnp.eye(n_params) * 0.0001,
-            init_mean=jnp.zeros(n_params),
-            init_cov=jnp.eye(n_params) * 1.0,
-            update_process_cov=True,
-            update_transition_matrix=False,
-        )
-
-        model.fit(design_matrix, spikes, max_iter=30, tolerance=1e-6)
-
-        # Smoother mean averaged over the middle portion should approximate
-        # true params. The smoother state drifts slightly due to process noise,
-        # so we average over the central 50% of time to reduce variance.
-        mid_start = n_time // 4
-        mid_end = 3 * n_time // 4
-        recovered_params = jnp.mean(model.smoother_mean[mid_start:mid_end], axis=0)
-
-        np.testing.assert_allclose(
-            recovered_params,
-            true_params,
-            atol=0.5,
-            err_msg="Smoother should recover approximately true parameters",
-        )
 
     def test_em_monotonic_per_iteration(self) -> None:
         """With well-conditioned data, EM should be nearly monotonic.
@@ -4310,16 +4238,6 @@ class TestPointProcessModelRecovery:
         _, _, _, _, lls = fitted
         assert_ll_improves(lls, label="PointProcessModel")
 
-    def test_transition_matrix_recovery(self, fitted):
-        model, _, true_A, _, _ = fitted
-        # Point-process EM with Laplace approximation: atol=0.25
-        # (consistent with existing test_random_walk_recovery)
-        np.testing.assert_allclose(
-            model.transition_matrix,
-            true_A,
-            atol=0.25,
-        )
-
     def test_process_cov_psd(self, fitted):
         model, _, _, _, _ = fitted
         eigvals = jnp.linalg.eigvalsh(model.process_cov)
@@ -5245,3 +5163,113 @@ class TestScaleEquivariance:
                 a, b, rtol=0, atol=rtol * np.max(np.abs(b)), err_msg=name
             )
         np.testing.assert_allclose(got[5], ref[5], rtol=rtol)
+
+
+def _affine_log_rate(design_t, x):
+    """log lambda_n = b_n + w_n . x with ``design_t[n] = [b_n, w_n]``."""
+    return design_t[:, 0] + design_t[:, 1:] @ x
+
+
+@pytest.mark.slow
+class TestPointProcessRecoverySweep:
+    """Parameter recovery as a statistic over seeds and sequence lengths.
+
+    Replaces single-seed thresholds: ``test_em_recovers_stationary_params``
+    (atol=0.5 on one seed), ``test_random_walk_recovery`` (whose spikes were
+    independent of the latent state, so A ~ I came from the prior) and
+    ``TestPointProcessModelRecovery.test_transition_matrix_recovery`` (which
+    started A at 0.8 I and allowed atol=0.25, so it passed without
+    recovering anything). Both sweeps use ``max_newton_iter=3``: with the
+    one-step update and a broad prior (init_cov = 4 I, intercept 3 away
+    from the prior mean) one of these GLM seeds diverges to
+    ``|error| ~ 25`` -- the EKF overshoot quantified in
+    ``test_oracle_point_process`` -- which is an approximation failure,
+    not a regression target.
+    """
+
+    _SEEDS = (0, 1, 2, 3, 4)
+
+    def test_glm_weight_error_decreases_with_data(self) -> None:
+        """Static GLM weights (A = I, Q = 1e-6 I held fixed) from 400 vs 3200
+        bins at ~20 Hz: the error should shrink roughly like 1/sqrt(T)
+        (expected ratio ~0.35).
+
+        Observed per-seed errors 0.08-0.37 (T=400) vs 0.02-0.05 (T=3200).
+        """
+        true = np.array([3.0, 0.8, -0.5])
+        dt = 0.01
+        errors = {}
+        for n_time in (400, 3200):
+            errors[n_time] = []
+            for seed in self._SEEDS:
+                rng = np.random.default_rng(seed)
+                X = np.concatenate(
+                    [np.ones((n_time, 1)), rng.normal(0.0, 1.0, (n_time, 2))], 1
+                )
+                y = rng.poisson(np.exp(X @ true) * dt).astype(float)
+                model = PointProcessModel(
+                    3,
+                    dt,
+                    transition_matrix=jnp.eye(3),
+                    process_cov=jnp.eye(3) * 1e-6,
+                    init_mean=jnp.zeros(3),
+                    init_cov=jnp.eye(3) * 4.0,
+                    update_transition_matrix=False,
+                    update_process_cov=False,
+                    max_newton_iter=3,
+                )
+                model.fit(X, y, max_iter=5)
+                estimate = np.asarray(model.smoother_mean[-1])
+                errors[n_time].append(float(np.linalg.norm(estimate - true)))
+        short, long = np.array(errors[400]), np.array(errors[3200])
+        msg = f"per-seed |w_hat - w|: T=400 {np.round(short, 4)}, T=3200 {np.round(long, 4)}"
+        assert np.all(short < 0.8) and np.all(long < 0.15), msg
+        assert np.mean(long) < 0.5 * np.mean(short), msg
+        assert np.median(long) < np.median(short), msg
+
+    def test_transition_error_decreases_with_data(self) -> None:
+        """EM for A (started at 0.5 I; truth diag(0.95, 0.8)) on 2-latent,
+        4-neuron AR(1) data, 500 vs 2000 bins.
+
+        EM for A is slow and the Laplace log-likelihood is not a strict EM
+        objective, so recovery is partial after 60 iterations; the test
+        asserts that every seed moves A substantially toward the truth and
+        that the error shrinks with more data. Observed max|A_hat - A|:
+        T=500 ~0.06-0.27, T=2000 ~0.08-0.27 (median 0.18 -> 0.11).
+        """
+        A_true = np.diag([0.95, 0.8])
+        q_true = np.array([0.02, 0.05])
+        dt, n_neurons = 0.02, 4
+        initial_error = float(np.max(np.abs(0.5 * np.eye(2) - A_true)))
+        errors = {}
+        for n_time in (500, 2000):
+            errors[n_time] = []
+            for seed in self._SEEDS[:4]:
+                rng = np.random.default_rng(seed)
+                W = rng.normal(0.0, 1.0, (n_neurons, 2))
+                b = np.full(n_neurons, np.log(20.0))
+                x, spikes = np.zeros(2), []
+                for _ in range(n_time):
+                    x = A_true @ x + rng.normal(0.0, np.sqrt(q_true))
+                    spikes.append(rng.poisson(np.exp(b + W @ x) * dt))
+                design = np.tile(np.concatenate([b[:, None], W], 1), (n_time, 1, 1))
+                model = PointProcessModel(
+                    2,
+                    dt,
+                    transition_matrix=0.5 * jnp.eye(2),
+                    process_cov=0.1 * jnp.eye(2),
+                    log_intensity_func=_affine_log_rate,
+                    max_newton_iter=3,
+                )
+                model.fit(
+                    design, np.asarray(spikes, float), max_iter=60, tolerance=1e-7
+                )
+                A_hat = np.asarray(model.transition_matrix)
+                errors[n_time].append(float(np.max(np.abs(A_hat - A_true))))
+        short, long = np.array(errors[500]), np.array(errors[2000])
+        msg = (
+            f"per-seed max|A_hat - A| (initial {initial_error:.2f}): "
+            f"T=500 {np.round(short, 3)}, T=2000 {np.round(long, 3)}"
+        )
+        assert np.all(long < 0.7 * initial_error), msg
+        assert np.median(long) < np.median(short), msg

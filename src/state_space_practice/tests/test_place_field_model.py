@@ -2366,27 +2366,91 @@ class TestPlaceFieldMStep:
     def test_random_walk_q_is_expected_increment_variance(
         self, initialized_model
     ) -> None:
-        """With A fixed to I, diag(Q) = mean_t E[(x_{t+1} - x_t)^2]."""
+        """With A held fixed, diag(Q) = mean_t E[(x_t - A x_{t-1})^2] over all
+        T transitions -- including x_0 -> x_1, whose smoothed moments follow
+        from the prior by one RTS step (J_0 = P_0 A' (A P_0 A' + Q)^{-1})."""
         model = initialized_model
         sm, sc, scc = (np.asarray(a) for a in self._install_posterior(model, 1e-2, 1))
+        A = np.asarray(model.transition_matrix)
+        P0, m0 = np.asarray(model.init_cov), np.asarray(model.init_mean)
+        P_pred = A @ P0 @ A.T + np.asarray(model.process_cov)
+        J0 = P0 @ A.T @ np.linalg.inv(P_pred)
+        m0_s = m0 + J0 @ (sm[0] - A @ m0)
+        P0_s = P0 + J0 @ (sc[0] - P_pred) @ J0.T
+        means = np.concatenate([m0_s[None], sm])
+        covs = np.concatenate([P0_s[None], sc])
+        cross = np.concatenate([(J0 @ sc[0])[None], scc])  # Cov(x_{t-1}, x_t)
         model._m_step()
-        diff = sm[1:] - sm[:-1]
+        a = np.diag(A)
         var = (
-            diff**2
-            + np.diagonal(sc[1:], axis1=1, axis2=2)
-            + np.diagonal(sc[:-1], axis1=1, axis2=2)
-            - 2 * np.diagonal(scc, axis1=1, axis2=2)
+            (means[1:] - a * means[:-1]) ** 2
+            + np.diagonal(covs[1:], axis1=1, axis2=2)
+            + a**2 * np.diagonal(covs[:-1], axis1=1, axis2=2)
+            - 2 * a * np.diagonal(cross, axis1=1, axis2=2)
         )
         np.testing.assert_allclose(
             jnp.diag(model.process_cov), var.mean(axis=0), rtol=1e-10
         )
+        # guard: dropping the x_0 transition would change the answer.
+        legacy = var[1:].mean(axis=0)
+        assert not np.allclose(jnp.diag(model.process_cov), legacy, rtol=1e-3)
 
     def test_process_noise_floor_is_scale_relative(self, initialized_model) -> None:
         """Increments of variance ~1e-13 give Q ~1e-13 rather than the former
         absolute 1e-10 floor."""
         model = initialized_model
-        self._install_posterior(model, scale=1e-13, seed=2)
+        sm, _, _ = self._install_posterior(model, scale=1e-13, seed=2)
+        # A random-walk model whose x_0 prior agrees with the posterior, so
+        # every transition residual (x_0 -> x_1 included) is ~1e-13 in size.
+        model.transition_matrix = jnp.eye(model.n_basis)
+        model.init_mean = sm[0]
         model._m_step()
         q = np.asarray(jnp.diag(model.process_cov))
         assert np.all(q > 0.0)
         assert q.max() < 1e-11
+
+
+@pytest.mark.slow
+class TestPlaceFieldRecoverySweep:
+    """Rate-map recovery as a statistic over seeds and session lengths.
+
+    Complements ``TestPlaceFieldModelRecovery`` (one seed, correlation >
+    0.6) with 3 seeds x {10 s, 40 s} of a stationary place field and a tiny
+    16-weight spline basis (kept small for runtime). The error is the RMSE
+    of the log-rate predicted at the long session's positions against the
+    true log-rate; more data (and coverage) must reduce it. Observed RMSE:
+    0.83-0.97 (10 s) vs 0.23-0.33 (40 s).
+    """
+
+    def test_log_rate_error_decreases_with_session_length(self) -> None:
+        errors = {10.0: [], 40.0: []}
+        for seed in (0, 1, 2):
+            sessions = {
+                total: simulate_2d_moving_place_field(
+                    total_time=total,
+                    dt=0.02,
+                    arena_size=60.0,
+                    peak_rate=25.0,
+                    background_rate=1.0,
+                    drift_speed=0.0,
+                    n_interior_knots=1,
+                    rng=np.random.default_rng(seed),
+                )
+                for total in errors
+            }
+            eval_position = sessions[40.0]["position"]
+            eval_log_rate = np.log(sessions[40.0]["true_rate"])
+            for total, data in sessions.items():
+                model = PlaceFieldModel(dt=data["dt"], n_interior_knots=1)
+                model.fit(data["position"], data["spikes"], max_iter=2, verbose=False)
+                pred, _ = model.predict_rate_map(eval_position)
+                rmse = np.sqrt(np.mean((np.log(pred) - eval_log_rate) ** 2))
+                errors[total].append(float(rmse))
+        short, long = np.array(errors[10.0]), np.array(errors[40.0])
+        msg = (
+            f"per-seed log-rate RMSE: 10 s {np.round(short, 3)}, "
+            f"40 s {np.round(long, 3)}"
+        )
+        assert np.all(long < 0.6), msg
+        assert np.mean(long) < 0.6 * np.mean(short), msg
+        assert np.all(long < short), msg

@@ -1038,9 +1038,9 @@ class PlaceFieldModel(SGDFittableMixin):
         log-likelihood under the model's constraints (exact EM; checked by
         the Q-function tests in ``tests/test_oracle_point_process.py``).
 
-        When A is fixed to identity (random walk), Q is computed directly as
-        the expected variance of state increments under the posterior, rather
-        than using the unconstrained ML formula from dynamics_only_m_step.
+        When A is not updated it is held at its current value -- the
+        identity of the random-walk model -- and Q is the expected variance
+        of the state increments ``x_t - A x_{t-1}`` under the posterior.
 
         Q is the centred residual form
         ``E[(x_t - A x_{t-1})(x_t - A x_{t-1})^T]`` averaged over the ``T``
@@ -1105,8 +1105,9 @@ class PlaceFieldModel(SGDFittableMixin):
             A_new = psd_solve(gamma1, beta.T).T
             self.transition_matrix = A_new
         else:
-            # A = I: Q = E[(x_t - x_{t-1})(x_t - x_{t-1})'].
-            A_new = jnp.eye(sm.shape[1], dtype=sm.dtype)
+            # A held at its current value (the identity of the random-walk
+            # model unless a caller changed it): Q = E[(x_t - A x_{t-1})(.)'].
+            A_new = self.transition_matrix
 
         Q_new = process_cov_residual_form(
             means,
