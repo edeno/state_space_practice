@@ -1347,12 +1347,15 @@ def optimize_dim_transition_params_joint_until_stationary(
     """
     if optimizer is None:
         from state_space_practice.switching_kalman import (
-            optimize_dim_transition_params_joint as optimizer,
+            optimize_dim_transition_params_joint,
         )
+
+        optimizer = optimize_dim_transition_params_joint
+    solve: Callable[..., dict] = optimizer
 
     params = dict(init_params)
     for _ in range(max_restarts + 1):
-        updated = optimizer(
+        updated = solve(
             gamma1=gamma1,
             beta=beta,
             init_params=params,
@@ -1407,6 +1410,7 @@ class DirectedInfluenceDynamicsMixin:
     use_reparameterized_mstep: bool
     update_continuous_transition_matrix: bool
     _current_osc_params: dict | None
+    _pre_m_step_dynamics: dict | None
     process_cov: jax.Array
 
     _PUBLIC_DYNAMICS_ATTRS = (
