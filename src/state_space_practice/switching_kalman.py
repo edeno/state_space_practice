@@ -3527,9 +3527,12 @@ def optimize_dim_transition_params(
         solution.
     max_spectral_radius : float, default=0.99
         Bound on the spectral radius of the reconstructed ``A``, enforced after
-        optimization. For uncoupled oscillators only the offending
-        oscillator's damping is reduced; with coupling, damping and coupling
-        are scaled uniformly. A logged warning reports any clamp. See
+        optimization. When ``init_params["coupling_strength"]`` is all zero
+        (uncoupled oscillators) only the offending oscillator's damping is
+        reduced, followed by a uniform scale only if the optimizer's residual
+        coupling still leaves the radius above the bound; with coupling,
+        damping and coupling are scaled uniformly. A logged warning reports
+        any clamp. See
         :func:`~state_space_practice.utils.stabilize_transition_matrix` for
         choosing it from the sampling rate and the narrowest bandwidth.
 
@@ -3599,25 +3602,43 @@ def optimize_dim_transition_params(
     )
     radius = _spectral_radius(A_opt) if solution_finite else float("nan")
     if radius > max_spectral_radius:
-        uncoupled = not bool(jnp.any(opt_params["coupling_strength"] != 0.0))
+        # The optimizer's coupling is a scaled sigmoid and is never exactly
+        # zero, so "uncoupled" is decided from the caller's coupling.
+        uncoupled = not bool(
+            jnp.any(jnp.asarray(init_params["coupling_strength"]) != 0.0)
+        )
+        details = []
+        remaining_radius = radius
         if uncoupled:
             # Uncoupled blocks are damping * R(theta): each oscillator's
             # eigenvalue modulus is its own damping, so clamp only those.
             damping = opt_params["damping"]
             clamped = jnp.minimum(damping, max_spectral_radius)
-            detail = (
+            details.append(
                 "oscillator damping clamped per block "
                 f"{jax.device_get(damping).tolist()} -> "
                 f"{jax.device_get(clamped).tolist()}"
             )
             opt_params["damping"] = clamped
-        else:
-            safe_scale = max_spectral_radius / radius
-            detail = f"damping and coupling scaled by {safe_scale:.6g}"
+            # The residual coupling the optimizer returns can still leave the
+            # radius above the bound; the uniform scale below covers that.
+            remaining_radius = _spectral_radius(
+                construct_directed_influence_transition_matrix(
+                    freqs=opt_params["freq"],
+                    damping_coeffs=opt_params["damping"],
+                    coupling_strengths=opt_params["coupling_strength"],
+                    phase_diffs=opt_params["phase_diff"],
+                    sampling_freq=sampling_freq,
+                )
+            )
+        if remaining_radius > max_spectral_radius:
+            safe_scale = max_spectral_radius / remaining_radius
+            details.append(f"damping and coupling scaled by {safe_scale:.6g}")
             opt_params["damping"] = opt_params["damping"] * safe_scale
             opt_params["coupling_strength"] = (
                 opt_params["coupling_strength"] * safe_scale
             )
+        detail = "; ".join(details)
         logger.warning(
             "optimize_dim_transition_params: spectral radius %.6g exceeded "
             "max_spectral_radius=%g; %s.",

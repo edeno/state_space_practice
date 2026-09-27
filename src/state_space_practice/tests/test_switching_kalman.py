@@ -53,6 +53,7 @@ from state_space_practice.switching_kalman import (
 )
 from state_space_practice.utils import divide_safe as _divide_safe
 from state_space_practice.utils import safe_log as _safe_log
+from state_space_practice.utils import spectral_radius as _spectral_radius
 
 # ---------------------------------------------------------------------------
 # Pure-Python reference implementations of the ELBO terms. These triple-nested
@@ -6650,6 +6651,56 @@ def test_optimize_dim_transition_params_bounds_freq_and_uses_max_iter(
     assert jnp.all(opt["coupling_strength"] >= 0.0)
     np.testing.assert_allclose(jnp.diag(opt["coupling_strength"]), 0.0, atol=0.0)
     np.testing.assert_allclose(jnp.diag(opt["phase_diff"]), 0.0, atol=0.0)
+
+
+def test_optimize_dim_transition_params_clamps_only_the_offending_uncoupled_oscillator(
+    caplog,
+) -> None:
+    """With uncoupled input the spectral clamp reduces only the oscillator
+    whose damping exceeds the bound; the other rhythm keeps its damping."""
+    from state_space_practice.oscillator_utils import (
+        construct_directed_influence_transition_matrix,
+    )
+
+    A_true = construct_directed_influence_transition_matrix(
+        jnp.array([8.0, 20.0]),
+        jnp.array([0.999, 0.6]),
+        jnp.zeros((2, 2)),
+        jnp.zeros((2, 2)),
+        100.0,
+    )
+    init_params = {
+        "damping": jnp.array([0.9, 0.6]),
+        "freq": jnp.array([8.0, 20.0]),
+        "coupling_strength": jnp.zeros((2, 2)),
+        "phase_diff": jnp.zeros((2, 2)),
+    }
+    kwargs = dict(
+        gamma1=jnp.eye(4),
+        beta=A_true,
+        init_params=init_params,
+        sampling_freq=100.0,
+    )
+    unclamped = optimize_dim_transition_params(**kwargs, max_spectral_radius=0.999)
+    # guard: the optimum is unstable for the 0.99 bound, via oscillator 0 only.
+    assert float(unclamped["damping"][0]) > 0.99
+    assert float(unclamped["damping"][1]) < 0.9
+
+    with caplog.at_level("WARNING", logger="state_space_practice.switching_kalman"):
+        clamped = optimize_dim_transition_params(**kwargs, max_spectral_radius=0.99)
+    assert "clamped per block" in caplog.text
+    np.testing.assert_allclose(float(clamped["damping"][0]), 0.99, rtol=1e-12)
+    np.testing.assert_allclose(
+        clamped["damping"][1], unclamped["damping"][1], rtol=1e-12
+    )
+    A = construct_directed_influence_transition_matrix(
+        clamped["freq"],
+        clamped["damping"],
+        clamped["coupling_strength"],
+        clamped["phase_diff"],
+        100.0,
+    )
+    assert _spectral_radius(A) <= 0.99 + 1e-12
 
 
 def test_optimize_dim_transition_params_raises_on_nonfinite_solution(
