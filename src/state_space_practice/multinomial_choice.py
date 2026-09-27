@@ -36,6 +36,11 @@ from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import psd_cholesky, psd_solve, symmetrize
 from state_space_practice.utils import validate_choice_indices as _validate_choices
 
+# Backtracking step sizes tried by every Newton iteration (largest first).
+_NEWTON_STEP_SIZES = tuple(0.5**i for i in range(8))
+# Armijo sufficient-increase constant for the backtracking line search.
+_ARMIJO_C = 1e-4
+
 
 def _softmax_update_core(
     prior_mean: Array,
@@ -43,7 +48,7 @@ def _softmax_update_core(
     choice: Array,
     n_options: int,
     inverse_temperature: float,
-    max_newton_steps: int = 3,
+    max_newton_steps: int = 10,
     obs_offset: Array | None = None,
 ) -> tuple[Array, Array, Array]:
     """JIT-compatible Laplace-EKF update for softmax observation.
@@ -51,13 +56,28 @@ def _softmax_update_core(
     All inputs must be JAX arrays (no Python-level validation).
     Use ``softmax_observation_update`` for the public API with validation.
 
+    The mode of the (concave) log posterior is found by Newton's method with
+    an Armijo backtracking line search: each iteration takes the largest step
+    in ``1, 1/2, ..., 1/128`` of the Newton direction that increases the log
+    posterior sufficiently. A full Newton step is not safe here: when the
+    prior mean sits on the saturated side of the softmax opposite the
+    observed choice, the likelihood curvature is ~0 there and the full step
+    overshoots to the other saturated side, after which Newton oscillates
+    between the two (e.g. prior N(1.5, 1), beta=4, choice 0: iterates 1.5,
+    -2.2, 1.5, ... around the true mode -0.2). With the line search every
+    iteration ascends, and near the mode the full step is accepted, so
+    well-behaved updates are unchanged.
+
     Parameters
     ----------
-    max_newton_steps : int, default 3
-        Number of Newton-Raphson iterations for Laplace mode-finding.
-        These are unrolled at JIT compile time, so large values (> ~10)
-        significantly increase compilation time and XLA graph size
-        without proportional accuracy gains for well-conditioned problems.
+    max_newton_steps : int, default 10
+        Number of line-searched Newton iterations for Laplace mode-finding
+        (a ``lax.scan``, so the compile cost does not depend on it). Three
+        iterations, the previous default, leave the mode unconverged for
+        moderately large inverse temperatures (a 2.7-nat evidence error at
+        beta=3 on 100 simulated trials); ten converge it in every tested
+        case, and at an already converged mode extra iterations take a
+        zero-length step.
     obs_offset : Array or None, shape (K,)
         Additive offset to the logits before softmax. Used for
         observation covariates (e.g., stay bias, spatial bias).
@@ -74,13 +94,21 @@ def _softmax_update_core(
     zero_ref = jnp.zeros(1)
     beta_sq = beta**2
     _obs_offset = obs_offset if obs_offset is not None else jnp.zeros(n_options)
+    step_sizes = jnp.asarray(_NEWTON_STEP_SIZES)
 
     # Prior precision
     prior_precision = psd_solve(prior_cov, eye_k)
 
-    # Fixed Newton iterations (unrolled for JIT compatibility)
-    x = prior_mean
-    for _ in range(max_newton_steps):
+    def log_posterior(x):
+        """Unnormalised log posterior at x, shape (..., K-1) -> (...)."""
+        zeros = jnp.zeros(x.shape[:-1] + (1,))
+        logits = beta * jnp.concatenate([zeros, x], axis=-1) + _obs_offset
+        delta = x - prior_mean
+        return jax.nn.log_softmax(logits, axis=-1)[..., choice] - 0.5 * jnp.einsum(
+            "...i,ij,...j->...", delta, prior_precision, delta
+        )
+
+    def newton_iteration(x, _):
         v = jnp.concatenate([zero_ref, x])
         p_free = jax.nn.softmax(beta * v + _obs_offset)[1:]
 
@@ -88,8 +116,24 @@ def _softmax_update_core(
         neg_hessian = beta_sq * (jnp.diag(p_free) - jnp.outer(p_free, p_free))
 
         posterior_precision = prior_precision + neg_hessian
-        rhs = gradient + prior_precision @ (prior_mean - x)
-        x = x + psd_solve(posterior_precision, rhs)
+        rhs = gradient + prior_precision @ (prior_mean - x)  # d log post / dx
+        direction = psd_solve(posterior_precision, rhs)
+
+        # Armijo backtracking, evaluated for all candidate steps at once.
+        candidates = x + step_sizes[:, None] * direction
+        f_x = log_posterior(x)
+        f_candidates = log_posterior(candidates)
+        sufficient = f_candidates >= f_x + _ARMIJO_C * step_sizes * (rhs @ direction)
+        # Largest acceptable step; if none qualifies (direction numerically
+        # useless), keep x rather than risk a descent step.
+        first_ok = jnp.argmax(sufficient)
+        alpha = jnp.where(jnp.any(sufficient), step_sizes[first_ok], 0.0)
+        return x + alpha * direction, None
+
+    # Fixed number of Newton iterations: a scan (not a while loop) keeps the
+    # update reverse-mode differentiable for fit_sgd, and (unlike an unrolled
+    # Python loop) its compile cost does not grow with max_newton_steps.
+    x, _ = jax.lax.scan(newton_iteration, prior_mean, None, length=max_newton_steps)
 
     # Final posterior covariance at the mode
     v = jnp.concatenate([zero_ref, x])
@@ -120,7 +164,7 @@ def softmax_observation_update(
     choice: int,
     n_options: int,
     inverse_temperature: float = 1.0,
-    max_newton_steps: int = 3,
+    max_newton_steps: int = 10,
 ) -> tuple[Array, Array, Array]:
     """Laplace-EKF update for a categorical observation with softmax link.
 
@@ -896,7 +940,13 @@ class MultinomialChoiceModel(SGDFittableMixin):
         choices: Array,
         beta_grid: Array,
     ) -> float:
-        """M-step: grid search + golden-section refinement for beta."""
+        """M-step: grid search + golden-section refinement for beta.
+
+        Maximises the filter's marginal log-likelihood over beta (at the
+        current process noise). Returns the best of the refined value, the
+        best grid point and the current beta, so the marginal LL never
+        decreases.
+        """
 
         def _eval_beta(beta):
             result = self._run_filter(choices, inverse_temperature=beta)
@@ -932,7 +982,19 @@ class MultinomialChoiceModel(SGDFittableMixin):
             else:
                 lo = c
 
-        return (lo + hi) / 2
+        # The bracket midpoint can be worse than the best grid point (e.g. a
+        # maximum at the edge of the grid, which golden section cannot
+        # return) or than the current beta: keep whichever of the three has
+        # the highest marginal LL, so the M-step never decreases it.
+        refined = (lo + hi) / 2
+        current = float(self.inverse_temperature)
+        ll_refined, ll_current = np.asarray(_eval_betas(jnp.array([refined, current])))
+        candidates = [
+            (float(lls[best_idx]), best_beta),
+            (float(ll_refined), refined),
+            (float(ll_current), current),
+        ]
+        return max(candidates, key=lambda pair: pair[0])[1]
 
     def choice_probabilities(self) -> Array:
         """Softmax choice probabilities from smoothed values.

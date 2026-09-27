@@ -352,6 +352,103 @@ class TestMultinomialChoiceQuadratureOracle:
         assert 1e-3 < abs(laplace_log_z - log_z) < 0.1, (laplace_log_z, log_z)
 
 
+class TestLaplaceNewtonDoesNotOscillate:
+    """Regression: the softmax Laplace update used undamped Newton steps.
+
+    When the prior mean sits on the saturated side of the softmax opposite the
+    observed choice, the likelihood curvature there is ~0 and a full Newton
+    step overshoots to the other saturated side; Newton then oscillates
+    between the two (prior N(1.512, 0.974), beta=4, choice 0: 1.51, -2.23,
+    1.50, ... around the mode -0.09). The 3-step filter landed on -2.23 and on
+    a 400-trial sequence at beta=4 reported a log-evidence of -1836 against
+    the exact -118. The line-searched update converges to the mode.
+    """
+
+    def test_single_update_reaches_the_mode(self):
+        from scipy.optimize import brentq
+
+        from state_space_practice.multinomial_choice import _softmax_update_core
+
+        m, v, beta = 1.512, 0.974, 4.0
+
+        def score(x):
+            return beta * (0.0 - 1.0 / (1.0 + np.exp(-beta * x))) - (x - m) / v
+
+        mode = brentq(score, -20, 20, xtol=1e-14)
+        for n_steps, tol in ((3, 2e-3), (10, 1e-7)):
+            x, _, _ = _softmax_update_core(
+                jnp.array([m]),
+                jnp.array([[v]]),
+                jnp.int32(0),
+                2,
+                beta,
+                max_newton_steps=n_steps,
+            )
+            assert abs(float(x[0]) - mode) < tol, (n_steps, float(x[0]), mode)
+        assert abs(mode - m) > 1.0  # guard: the prior is far from the mode
+
+    @pytest.mark.parametrize(
+        "choices, q",
+        [
+            ([1] * 12 + [0, 1, 0, 0, 1], 0.3),
+            ([1] * 8 + [0] * 2 + [1] * 8 + [0], 0.5),
+            ([0] * 10 + [1] + [0] * 5 + [1], 0.4),
+        ],
+    )
+    def test_filter_evidence_stays_near_exact_after_saturated_runs(self, choices, q):
+        """Old code: log-evidence -70.7 / -93.7 / -67.0, filter-mean errors
+        5.6 / 21.2 / 13.2. Now within the Laplace error (observed log-evidence
+        errors 0.7 / 1.6 / 0.8, mean errors ~1.2) of the exact -8.9 / -10.5 /
+        -8.8."""
+        beta = 4.0
+        fm, _, _, _, lm = _exact_multinomial_1d(choices, beta, q, _GRID_1D)
+        filt = multinomial_choice_filter(
+            jnp.array(choices), 2, process_noise=q, inverse_temperature=beta
+        )
+        err_ll = abs(float(filt.marginal_log_likelihood) - lm)
+        err_m = np.max(np.abs(np.asarray(filt.filtered_values[:, 0]) - fm))
+        assert err_ll < 2.5, (err_ll, float(filt.marginal_log_likelihood), lm)
+        assert err_m < 2.0, err_m
+
+
+@pytest.mark.slow
+def test_laplace_evidence_is_biased_upwards_at_large_inverse_temperature():
+    """Documented limitation of the Laplace evidence (not a code bug).
+
+    At a saturating softmax the Laplace step evaluates p(c | x*) at the mode,
+    where it is ~1 whenever the prior mean already favours the choice, and so
+    ignores the prior mass on the wrong side of the decision boundary. On
+    100 simulated trials (beta=2) the exact evidence falls by 4-12 nats from
+    beta=2 to beta=12; the Laplace evidence falls much less (or rises), i.e.
+    the beta M-step / SGD objective favours too-large inverse temperatures.
+    Observed Laplace - exact at beta=12: 3.0, 5.2, 5.5, 3.6; at beta=2:
+    -0.19, 0.00, 0.13, -0.46.
+    """
+    from state_space_practice.multinomial_choice import simulate_choice_data
+
+    grid = np.linspace(-15, 15, 751)
+    for seed in range(4):
+        sim = simulate_choice_data(
+            n_trials=100,
+            n_options=2,
+            process_noise=0.05,
+            inverse_temperature=2.0,
+            seed=seed,
+        )
+        c = np.asarray(sim.choices)
+        gaps = {}
+        for beta in (2.0, 12.0):
+            exact = _exact_multinomial_1d(c, beta, 0.05, grid)[4]
+            laplace = float(
+                multinomial_choice_filter(
+                    c, 2, process_noise=0.05, inverse_temperature=beta
+                ).marginal_log_likelihood
+            )
+            gaps[beta] = laplace - exact
+        assert abs(gaps[2.0]) < 0.8, (seed, gaps)
+        assert 2.0 < gaps[12.0] < 9.0, (seed, gaps)
+
+
 # ---------------------------------------------------------------------------
 # Smith learning model (1-D Laplace filter + RTS)
 # ---------------------------------------------------------------------------

@@ -2447,3 +2447,74 @@ def test_sigma_recovery_evidence_vs_em_as_statistics():
         assert s2_grid[np.argmax(evidence)] == s2_exact, report
     msg = f"(exact MLE, evidence argmax, EM) per seed: {report}"
     assert all(1.2 < r < 2.8 for r in ratios), msg
+
+
+class TestDifferentiableNewtonDoesNotOscillate:
+    """Regression: the Laplace mode solvers were not reliable.
+
+    The differentiable (fit_sgd) Newton path took full steps: for N=10, y=0
+    and a prior N(3, 4) the logistic is saturated at the prior mean, the full
+    step jumps to -10.5 (saturated the other way) and the iteration
+    oscillated between 3.0 and -10.5, ending at 2.98 instead of the mode
+    -1.956. The default path used jax.scipy BFGS, which stopped early on a
+    line-search failure (mode 2.708 vs the exact 2.647 on trial 3 of the
+    sequence below). Both filter paths now use the line-searched Newton.
+    """
+
+    def test_newton_matches_bfgs_and_exact_mode(self):
+        from functools import partial
+
+        from scipy.optimize import brentq
+
+        from state_space_practice.smith_learning_algorithm import (
+            _approximate_gaussian_newton,
+            _log_posterior_objective,
+            approximate_gaussian,
+        )
+
+        m, v, y, n = 3.0, 4.0, 0, 10
+        f = partial(
+            _log_posterior_objective,
+            learning_state_prev=m,
+            variance_prev=v,
+            n_correct_in_trial=y,
+            max_possible_correct=n,
+            bias=0.0,
+        )
+        mode = brentq(lambda x: y - n / (1 + np.exp(-x)) - (x - m) / v, -30, 30)
+        newton_mode, newton_var = _approximate_gaussian_newton(f, jnp.array([m]))
+        bfgs_mode, bfgs_var = approximate_gaussian(f, jnp.array([m]))
+        assert abs(float(newton_mode[0]) - mode) < 1e-8
+        assert abs(float(bfgs_mode[0]) - mode) < 1e-4
+        np.testing.assert_allclose(newton_var, bfgs_var, rtol=1e-3)
+
+    def test_filter_modes_are_exact_one_step_modes(self):
+        from scipy.optimize import brentq
+
+        rng = np.random.default_rng(0)
+        y = np.concatenate([np.full(8, 10), np.zeros(4), np.full(4, 10)]).astype(int)
+        y = np.clip(y + rng.integers(-1, 1, y.size), 0, 10)
+        kwargs = dict(
+            init_learning_variance=4.0,
+            sigma_epsilon=1.5,
+            max_possible_correct=10,
+        )
+        for differentiable in (False, True):
+            _, mode, _, pred_mode, pred_var = (
+                np.asarray(a)
+                for a in smith_learning_filter(
+                    jnp.asarray(y), differentiable=differentiable, **kwargs
+                )
+            )
+            # Each filtered mode solves y - N sigmoid(x) = (x - m_pred) / P_pred.
+            exact = [
+                brentq(
+                    lambda x, yt=y[t], m=pred_mode[t], v=pred_var[t]: (
+                        yt - 10 / (1 + np.exp(-x)) - (x - m) / v
+                    ),
+                    -40,
+                    40,
+                )
+                for t in range(y.size)
+            ]
+            np.testing.assert_allclose(mode, exact, atol=1e-8)

@@ -3,7 +3,7 @@
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from state_space_practice.multinomial_choice import (
@@ -830,6 +830,7 @@ class TestMultinomialMStepExactness:
 
     @pytest.mark.slow
     @given(seed=st.integers(0, 10_000), beta_init=st.floats(0.3, 6.0))
+    @example(seed=4, beta_init=1.0)  # maximum at the top edge of the grid
     @settings(max_examples=5, deadline=None)
     def test_beta_reaches_marginal_ll_maximum_within_bracket(self, seed, beta_init):
         from scipy.optimize import minimize_scalar
@@ -867,3 +868,39 @@ class TestMultinomialMStepExactness:
         assert abs(beta_new - ref.x) <= 0.005 * (hi - lo) + 1e-6, (beta_new, ref.x)
         assert ll(beta_new) >= grid_lls.max() - 1e-9
         assert ll(beta_new) >= ll(beta_init) - 1e-9
+
+
+@pytest.mark.slow
+def test_beta_recovery_improves_with_data():
+    """Recovery as a statistic: the beta M-step (q at its true value).
+
+    5 seeds at 100 and 800 trials, beta_true=1. The mean |log(beta_hat /
+    beta)| must shrink with 8x the data (observed 0.75 -> 0.18). (At
+    beta_true=2 the Laplace evidence's upward bias at large beta -- see
+    test_oracle_choice -- sends some seeds to the top of the grid.)
+    """
+    from state_space_practice.multinomial_choice import _DEFAULT_BETA_GRID
+
+    def errors(n_trials):
+        out = []
+        for seed in range(5):
+            sim = simulate_choice_data(
+                n_trials=n_trials,
+                n_options=3,
+                process_noise=0.05,
+                inverse_temperature=1.0,
+                seed=seed,
+            )
+            model = MultinomialChoiceModel(n_options=3, init_process_noise=0.05)
+            beta = model._m_step_beta(
+                jnp.asarray(sim.choices), jnp.asarray(_DEFAULT_BETA_GRID)
+            )
+            out.append(abs(np.log(beta)))
+        return np.array(out)
+
+    small, large = errors(100), errors(800)
+    msg = (
+        f"|log beta error| per seed: 100 trials {small.round(3)}, 800 {large.round(3)}"
+    )
+    assert large.mean() < 0.5 * small.mean(), msg
+    assert large.mean() < 0.35, msg

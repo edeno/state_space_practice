@@ -93,10 +93,10 @@ def approximate_gaussian(
 
     This function uses ``jax.scipy.optimize.minimize(method="BFGS")``
     internally. It is **not** reverse-mode differentiable: ``jax.grad``
-    cannot propagate through the BFGS solver. For SGD-based fitting
-    (where gradients must flow through the filter), use the Newton path
-    via ``differentiable=True`` in ``smith_learning_filter`` or
-    ``SmithLearningModel.fit_sgd``.
+    cannot propagate through the BFGS solver, and jax.scipy's BFGS can stop
+    early on a line-search failure. ``smith_learning_filter`` therefore
+    uses the line-searched Newton solver ``_approximate_gaussian_newton``
+    instead; this function is kept for general (multi-dimensional) use.
 
     Parameters
     ----------
@@ -138,6 +138,12 @@ def approximate_gaussian(
     return mode, covariance
 
 
+# Backtracking step sizes (largest first) and Armijo constant for the
+# Newton mode search.
+_NEWTON_STEP_SIZES = tuple(0.5**i for i in range(8))
+_ARMIJO_C = 1e-4
+
+
 def _approximate_gaussian_newton(
     log_posterior_func: Callable[[ArrayLike], Array],
     x0: ArrayLike,
@@ -149,8 +155,11 @@ def _approximate_gaussian_newton(
     not reverse-mode differentiable), this version uses a fixed number of
     Newton-Raphson steps. This makes it compatible with jax.grad for SGD.
 
-    Only supports 1D (scalar) state variables. For the 1D Smith learning
-    model, 10 Newton steps are typically more than sufficient.
+    Only supports 1D (scalar) state variables. Each step is a Newton step
+    with Armijo backtracking, so the iteration ascends monotonically and
+    cannot oscillate; for the 1D Smith learning model, 10 steps reach the
+    mode to machine precision. ``smith_learning_filter`` uses this solver
+    for both its default and its ``differentiable`` path.
 
     Parameters
     ----------
@@ -178,14 +187,27 @@ def _approximate_gaussian_newton(
 
     grad_fn = jax.grad(neg_log_posterior)
     hess_fn = jax.grad(grad_fn)
+    step_sizes = jnp.asarray(_NEWTON_STEP_SIZES)
+    batched_objective = jax.vmap(neg_log_posterior)
 
     def newton_step(x, _):
         g = grad_fn(x)
         h = hess_fn(x)
         # Regularize Hessian for stability
         h_safe = jnp.maximum(h, 1e-6)
-        x_new = x - g / h_safe
-        return x_new, None
+        direction = -g / h_safe
+        # Armijo backtracking: a full Newton step overshoots when the prior
+        # mean sits on the saturated side of the logistic opposite the data
+        # (curvature ~ 0 there) and then oscillates between the two saturated
+        # sides, e.g. N=10, y=0, prior N(3, 4): 3.0, -10.5, 3.0, ... Take the
+        # largest step in 1, 1/2, ..., 1/128 that decreases the objective
+        # sufficiently; near the mode the full step is accepted.
+        f_candidates = batched_objective(x + step_sizes * direction)
+        sufficient = f_candidates <= neg_log_posterior(x) + _ARMIJO_C * step_sizes * (
+            g * direction
+        )
+        alpha = jnp.where(jnp.any(sufficient), step_sizes[jnp.argmax(sufficient)], 0.0)
+        return x + alpha * direction, None
 
     mode, _ = jax.lax.scan(newton_step, jnp.squeeze(x0_arr), None, length=n_steps)
 
@@ -331,10 +353,12 @@ def smith_learning_filter(
         Can be a scalar int (applied to all trials) or an array of
         per-trial values. Defaults to max(n_correct_responses).
     differentiable : bool, optional
-        If True, use fixed-iteration Newton steps instead of BFGS for
-        the Laplace approximation. This makes the filter compatible with
-        ``jax.grad`` for SGD fitting, at the cost of slightly less
-        precise mode-finding. Default False (BFGS).
+        If True, skip the host-side input validation so the filter can be
+        traced by ``jax.grad`` (SGD fitting). Both settings find each
+        Laplace mode with the same line-searched Newton iterations
+        (reverse-mode differentiable); the BFGS solver of
+        :func:`approximate_gaussian` is no longer used here because it can
+        terminate early on a line-search failure. Default False.
 
     Returns
     -------
@@ -437,11 +461,12 @@ def _smith_learning_filter_impl(
             max_possible_correct=max_possible_correct_trial_k,
             bias=mu,
         )
-        # Find mode and covariance (variance)
-        approx_fn = (
-            _approximate_gaussian_newton if differentiable else approximate_gaussian
-        )
-        posterior_mode, posterior_variance = approx_fn(
+        # Find mode and covariance (variance). Both paths use the line-searched
+        # Newton solver: jax.scipy's BFGS (``approximate_gaussian``) can stop
+        # early on a line-search failure (e.g. a 0.06 mode error on a
+        # binomial trial right after a run of saturated outcomes), while the
+        # 1-D damped Newton reaches the mode to machine precision.
+        posterior_mode, posterior_variance = _approximate_gaussian_newton(
             log_objective_func, x0=jnp.array([one_step_mode])
         )
         posterior_mode = jnp.squeeze(posterior_mode)
