@@ -3,25 +3,22 @@
 
 Every model below is fitted by EM on small, fixed-seed synthetic data, and the
 full log-likelihood history (hence also the iteration count) plus a few
-fitted-parameter summaries are compared against values recorded from the
-reference implementation at commit
-``6fc3ef269f96543fbbcd1f0b65d5ad17fee4acb3``.
-The point is to catch refactors of the EM loops and their E/M-step internals
-that *silently* shift the numerics: a correct refactor reproduces these numbers
-to near round-off.
+fitted-parameter summaries are compared against recorded values.  The point is
+to catch refactors of the EM loops and their E/M-step internals that
+*silently* shift the numerics: a correct refactor reproduces these numbers to
+near round-off.
 
 Configurations are chosen so that EM runs its ordinary path (no rollback, no
 non-finite log-likelihood); the rollback branches are covered by behavioural
 tests elsewhere.  The values were recorded with float64 on Linux x86-64 with
-jax/jaxlib 0.10.2.  Log-likelihood histories reproduce across platforms to
-~1e-13 relative, so they get tight tolerances; the fitted-parameter summaries
-include tiny quantities (process noise ~1e-6, spike weights ~1e-4) in which EM
-amplifies platform round-off to ~1e-8 relative, so they get a looser floor.
+jax/jaxlib 0.10.2.  The tolerances (``LL_TOLERANCES`` and
+``parameter_tolerance``) are set from the deviations observed when the same
+code runs on macOS arm64.
 
 History
 -------
 The first pins were recorded from ``master`` at ``f9e1d8f`` (macOS arm64).
-They were re-recorded at the commit above after the numerical-review fixes
+They were re-recorded after the numerical-review fixes
 that intentionally change EM numerics; the cases that moved, and why:
 
 * ``point_process_glm``, ``place_field_*``: the EM update of the initial
@@ -40,7 +37,7 @@ that intentionally change EM numerics; the cases that moved, and why:
   relative) from the residual-form covariance updates and jitted M-steps.
 * ``smith_learning``, ``multinomial_choice``: unchanged.
 
-They were re-recorded a second time at the commit above after the
+They were re-recorded a second time after the
 verification round (exact oracles, calibration and M-step stationarity tests)
 found and fixed further bugs; every case moved:
 
@@ -76,15 +73,15 @@ and choice cases moved by at most 3e-10 relative in log-likelihood).
 Regenerating the expected values
 --------------------------------
 Only do this for an *intended* change in numerics.  Running this module as a
-script prints ``EXPECTED`` for whichever ``state_space_practice`` it imports,
-so point ``PYTHONPATH`` at the source tree you want to record from::
+script prints ``EXPECTED`` for whichever ``state_space_practice`` it imports.
+From the checkout that contains the intended change, run::
 
-    git worktree add /tmp/ssp_ref <commit>
-    PYTHONPATH=/tmp/ssp_ref/src uv run --no-sync python \
-        src/state_space_practice/tests/test_em_golden_regression.py
+    uv run --no-sync python src/state_space_practice/tests/test_em_golden_regression.py
 
-and paste the output over ``EXPECTED`` (and update the commit hash and the
-history above).
+(prefix ``PYTHONPATH=<tree>/src`` to record from a different source tree).
+Paste the output over ``EXPECTED`` and add an entry to the history above that
+names the change and which cases moved, by how much.  Record on Linux x86-64,
+the platform the tolerances were measured against, or re-measure them.
 """
 
 import logging
@@ -404,35 +401,76 @@ CASES: dict[str, Callable[[], FitResult]] = {
     "covariate_choice": _fit_covariate_choice,
 }
 
-# Per-case tolerances for the log-likelihood histories.  Cases that pass
-# through no Laplace update or block-covariance machinery reproduce the
-# reference to ~1e-13 relative on another platform; they get rtol=1e-10, which
-# still admits round-off-level reordering but nothing an algorithmic change
-# could hide in.  The point-process and block place-field cases accumulate
-# round-off through Newton iterations; their tolerances are >= ~10x the largest
-# cross-platform deviation observed, noted inline.
+# Per-case (rtol, atol) for the log-likelihood histories.  Each rtol is
+# >= ~100x the largest relative deviation observed between the Linux x86-64
+# pins and the same code on macOS arm64 (noted inline), so a different CPU or
+# XLA reduction order passes.  Most cases, including those whose E-step takes
+# Newton / Laplace steps, reproduce to ~1e-14 and get rtol=1e-10.  The
+# switching point-process oscillator cases amplify round-off through their
+# Laplace updates and numerically optimised M-steps and get looser rtols.
+# Changes whose effect is itself near round-off can pass: the point-process
+# Fisher line-search slack moved ``point_process_glm`` by 8.9e-11 relative, and
+# on ``common_oscillator_pp`` (sparse spikes, Newton converges in one step)
+# ``max_newton_iter=1`` instead of 3 moves the history by only 2.4e-9.
 _EXACT = (1e-10, 1e-14)
 LL_TOLERANCES: dict[str, tuple[float, float]] = {
-    "smith_learning": _EXACT,
-    "point_process_glm": _EXACT,
-    "place_field_1_neuron_dense": (1e-9, 1e-14),
-    "place_field_2_neuron_block_update_A": (2e-8, 1e-14),  # observed 1.4e-9 rel
-    "place_field_2_neuron_block_newton3": (2e-8, 1e-14),  # observed 1.1e-9 rel
-    "common_oscillator": _EXACT,
-    "directed_influence": _EXACT,
-    "common_oscillator_pp": (1e-8, 1e-14),  # observed 1.6e-10 rel
-    "directed_influence_pp": (5e-8, 1e-14),  # observed 3.9e-9 rel
-    "switching_spike_oscillator": (1e-9, 1e-14),  # observed 1.9e-11 rel
-    "multinomial_choice": _EXACT,
-    "covariate_choice": _EXACT,
+    "smith_learning": _EXACT,  # observed 1.8e-16 rel
+    "point_process_glm": _EXACT,  # observed 1.0e-14 rel
+    "place_field_1_neuron_dense": _EXACT,  # observed 1.5e-15 rel
+    "place_field_2_neuron_block_update_A": _EXACT,  # observed 5.4e-15 rel
+    "place_field_2_neuron_block_newton3": _EXACT,  # observed 9.2e-16 rel
+    "common_oscillator": _EXACT,  # observed 1.3e-16 rel
+    "directed_influence": _EXACT,  # observed 4.5e-16 rel
+    "common_oscillator_pp": (1e-8, 1e-14),  # observed 9.5e-11 rel
+    "directed_influence_pp": (5e-8, 1e-14),  # observed 1.2e-10 rel
+    "switching_spike_oscillator": (1e-9, 1e-14),  # observed 1.2e-12 rel
+    "multinomial_choice": _EXACT,  # observed 1.7e-16 rel
+    "covariate_choice": _EXACT,  # observed 3.5e-16 rel
 }
-# Fitted-parameter summaries: EM amplifies platform round-off most in the
-# smallest parameters (process noise ~1e-6 moved 1.4e-8 relative between macOS
-# arm64 and Linux x86-64 on *unchanged* code; spike weights ~1e-4 up to 7e-9).
-# An algorithmic change moves them by >= 1e-5 relative, so 1e-6 keeps the
-# signal while tolerating a different CPU / XLA reduction order.  The absolute
-# floor covers summaries that are exactly zero.
-PARAMETER_TOLERANCE = (1e-6, 1e-14)
+
+# Fitted-parameter summaries.  Each element must satisfy
+#
+#     |actual - expected| <= PARAMETER_RTOL * |expected| + k * max|expected|
+#
+# with the maximum taken over that summary and k = PARAMETER_SCALE_ATOL[case].
+# The relative term covers entries of the summary's own magnitude.  The scale
+# term covers entries near zero, whose round-off is set by the magnitude of
+# the quantities they are computed with rather than by their own value: in
+# ``common_oscillator_pp`` every spike weight comes out of the same Newton
+# solves and moves by 0.7e-9 to 6e-9 across platforms (<= 2.3e-7 of the
+# largest weight), which is 3.1e-6 relative on the smallest weight (2.3e-4).
+# Its k = 5e-6 leaves ~20x headroom over that and still fails a 1% change in
+# ``spike_weight_l2`` (which moves the weights by 1.2e-5 of their scale).
+# Every other summary element reproduces to <= 5.3e-8 relative (>= ~20x
+# headroom under PARAMETER_RTOL), so the default k only admits entries at or
+# very near zero.
+PARAMETER_RTOL = 1e-6
+PARAMETER_SCALE_ATOL: dict[str, float] = {case: 1e-8 for case in CASES} | {
+    "common_oscillator_pp": 5e-6,  # observed 2.3e-7 of the largest weight
+}
+
+
+def parameter_tolerance(case: str, expected: list[float]) -> tuple[float, float]:
+    """(rtol, atol) for one recorded fitted-parameter summary of ``case``.
+
+    Parameters
+    ----------
+    case : str
+        Key of ``CASES``.
+    expected : list of float
+        The recorded summary.
+
+    Returns
+    -------
+    rtol : float
+        ``PARAMETER_RTOL``.
+    atol : float
+        ``PARAMETER_SCALE_ATOL[case]`` times the summary's largest magnitude,
+        at least 1e-14 so that all-zero summaries admit round-off.
+    """
+    scale = float(np.max(np.abs(expected)))
+    return PARAMETER_RTOL, max(PARAMETER_SCALE_ATOL[case] * scale, 1e-14)
+
 
 EXPECTED: dict[str, FitResult] = {
     "smith_learning": {
@@ -762,7 +800,9 @@ def test_em_matches_recorded_values(case: str) -> None:
     )
     for name, expected_value in expected.items():
         rtol, atol = (
-            LL_TOLERANCES[case] if name == "log_likelihoods" else PARAMETER_TOLERANCE
+            LL_TOLERANCES[case]
+            if name == "log_likelihoods"
+            else parameter_tolerance(case, expected_value)
         )
         np.testing.assert_allclose(
             actual[name], expected_value, rtol=rtol, atol=atol, err_msg=name
