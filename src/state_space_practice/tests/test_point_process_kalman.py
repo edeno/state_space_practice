@@ -543,6 +543,12 @@ class TestStochasticPointProcessSmoother:
         )
 
 
+def _legacy_dynamics_only_m_step(*args, **kwargs):
+    """The deprecated ``initial_state_prior=None`` path, which must warn."""
+    with pytest.warns(DeprecationWarning, match="initial_state_prior=None"):
+        return dynamics_only_m_step(*args, **kwargs)
+
+
 class TestKalmanMaximizationStep:
     """Tests for the dynamics_only_m_step function."""
 
@@ -575,10 +581,12 @@ class TestKalmanMaximizationStep:
         """M-step outputs should have correct shapes."""
         s = smoother_outputs
 
-        transition_matrix, process_cov, init_mean, init_cov = dynamics_only_m_step(
-            s["smoother_mean"],
-            s["smoother_cov"],
-            s["smoother_cross_cov"],
+        transition_matrix, process_cov, init_mean, init_cov = (
+            _legacy_dynamics_only_m_step(
+                s["smoother_mean"],
+                s["smoother_cov"],
+                s["smoother_cross_cov"],
+            )
         )
 
         n_params = s["n_params"]
@@ -591,10 +599,12 @@ class TestKalmanMaximizationStep:
         """M-step should not produce NaN values."""
         s = smoother_outputs
 
-        transition_matrix, process_cov, init_mean, init_cov = dynamics_only_m_step(
-            s["smoother_mean"],
-            s["smoother_cov"],
-            s["smoother_cross_cov"],
+        transition_matrix, process_cov, init_mean, init_cov = (
+            _legacy_dynamics_only_m_step(
+                s["smoother_mean"],
+                s["smoother_cov"],
+                s["smoother_cross_cov"],
+            )
         )
 
         assert not jnp.any(jnp.isnan(transition_matrix))
@@ -609,7 +619,7 @@ class TestKalmanMaximizationStep:
         smoother_cross_cov = jnp.zeros((0, 2, 2))
 
         with pytest.raises(ValueError, match="at least 2 time steps"):
-            dynamics_only_m_step(
+            _legacy_dynamics_only_m_step(
                 smoother_mean,
                 smoother_cov,
                 smoother_cross_cov,
@@ -619,7 +629,7 @@ class TestKalmanMaximizationStep:
         """Process covariance should be symmetric."""
         s = smoother_outputs
 
-        _, process_cov, _, _ = dynamics_only_m_step(
+        _, process_cov, _, _ = _legacy_dynamics_only_m_step(
             s["smoother_mean"],
             s["smoother_cov"],
             s["smoother_cross_cov"],
@@ -631,7 +641,7 @@ class TestKalmanMaximizationStep:
         """Initial covariance should be symmetric."""
         s = smoother_outputs
 
-        _, _, _, init_cov = dynamics_only_m_step(
+        _, _, _, init_cov = _legacy_dynamics_only_m_step(
             s["smoother_mean"],
             s["smoother_cov"],
             s["smoother_cross_cov"],
@@ -643,7 +653,7 @@ class TestKalmanMaximizationStep:
         """Initial mean should equal first smoother mean."""
         s = smoother_outputs
 
-        _, _, init_mean, _ = dynamics_only_m_step(
+        _, _, init_mean, _ = _legacy_dynamics_only_m_step(
             s["smoother_mean"],
             s["smoother_cov"],
             s["smoother_cross_cov"],
@@ -655,13 +665,31 @@ class TestKalmanMaximizationStep:
         """Initial covariance should equal first smoother covariance."""
         s = smoother_outputs
 
-        _, _, _, init_cov = dynamics_only_m_step(
+        _, _, _, init_cov = _legacy_dynamics_only_m_step(
             s["smoother_mean"],
             s["smoother_cov"],
             s["smoother_cross_cov"],
         )
 
         np.testing.assert_allclose(init_cov, s["smoother_cov"][0], rtol=1e-10)
+
+    def test_prior_path_does_not_warn(self, smoother_outputs) -> None:
+        """Only the legacy ``initial_state_prior=None`` path is deprecated."""
+        from state_space_practice.kalman import InitialStatePrior
+
+        s = smoother_outputs
+        n = s["n_params"]
+        prior = InitialStatePrior(
+            jnp.zeros(n), jnp.eye(n), 0.9 * jnp.eye(n), 0.1 * jnp.eye(n)
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            dynamics_only_m_step(
+                s["smoother_mean"],
+                s["smoother_cov"],
+                s["smoother_cross_cov"],
+                initial_state_prior=prior,
+            )
 
     def test_recovers_nonsymmetric_transition_from_exact_sufficient_stats(self) -> None:
         """M-step should recover A orientation for a noiseless 2D trajectory."""
@@ -677,10 +705,12 @@ class TestKalmanMaximizationStep:
         smoother_cov = jnp.zeros((n_time, n_state, n_state))
         smoother_cross_cov = jnp.zeros((n_time - 1, n_state, n_state))
 
-        estimated_transition_matrix, estimated_process_cov, _, _ = dynamics_only_m_step(
-            smoother_mean,
-            smoother_cov,
-            smoother_cross_cov,
+        estimated_transition_matrix, estimated_process_cov, _, _ = (
+            _legacy_dynamics_only_m_step(
+                smoother_mean,
+                smoother_cov,
+                smoother_cross_cov,
+            )
         )
 
         np.testing.assert_allclose(
@@ -1212,7 +1242,7 @@ class TestKalmanMaximizationStepMStepRegression:
         smoother_cross_cov = jnp.stack([jnp.eye(n_params) * 0.0005] * (n_time - 1))
 
         # Run M-step
-        A_est, Q_est, _, _ = dynamics_only_m_step(
+        A_est, Q_est, _, _ = _legacy_dynamics_only_m_step(
             smoother_mean, smoother_cov, smoother_cross_cov
         )
 
@@ -1245,14 +1275,14 @@ class TestKalmanMaximizationStepMStepRegression:
         smoother_cov = jnp.stack([jnp.eye(n_params) * 0.01] * n_time)
         smoother_cross_cov = jnp.stack([jnp.eye(n_params) * 0.005] * (n_time - 1))
 
-        A_increasing, _, _, _ = dynamics_only_m_step(
+        A_increasing, _, _, _ = _legacy_dynamics_only_m_step(
             smoother_mean_increasing, smoother_cov, smoother_cross_cov
         )
 
         # Case 2: States that are constant (all zeros)
         smoother_mean_constant = jnp.zeros((n_time, n_params))
 
-        A_constant, _, _, _ = dynamics_only_m_step(
+        A_constant, _, _, _ = _legacy_dynamics_only_m_step(
             smoother_mean_constant, smoother_cov, smoother_cross_cov
         )
 

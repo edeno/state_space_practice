@@ -47,6 +47,7 @@ from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.kalman import (
     InitialStatePrior,
     process_cov_residual_form,
+    smooth_initial_state_with_cross_cov,
     sum_of_outer_products,
 )
 from state_space_practice.parameter_transforms import (
@@ -61,7 +62,6 @@ from state_space_practice.point_process_kalman import (
     _validate_filter_numerics,
     get_confidence_interval,
     log_conditional_intensity,
-    smoothed_initial_transition_moments,
     stochastic_point_process_filter,
     stochastic_point_process_smoother,
 )
@@ -1032,7 +1032,7 @@ class PlaceFieldModel(SGDFittableMixin):
         cross-covariance ``Cov(x_0, x_1 | y) = J_0 P_{1|T}`` follow exactly
         from those of ``x_1`` by one RTS step with the parameters the E-step
         ran with
-        (:func:`~state_space_practice.point_process_kalman.smoothed_initial_transition_moments`);
+        (:func:`~state_space_practice.kalman.smooth_initial_state_with_cross_cov`);
         the ``x_0 -> x_1`` transition is included in every sufficient
         statistic below, so the update maximises the expected complete-data
         log-likelihood under the model's constraints (exact EM; checked by
@@ -1074,7 +1074,7 @@ class PlaceFieldModel(SGDFittableMixin):
         # Smoothed x_0 and Cov(x_0, x_1 | y) under the E-step parameters
         # (before any update below).
         init_smoother_mean, init_smoother_cov, init_cross_cov = (
-            smoothed_initial_transition_moments(
+            smooth_initial_state_with_cross_cov(
                 InitialStatePrior(
                     init_mean=self.init_mean,
                     init_cov=self.init_cov,

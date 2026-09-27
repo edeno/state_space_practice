@@ -783,9 +783,10 @@ class TestDynamicsMStepMaximisesQ:
             "m0": np.zeros(2),
             "P0": np.eye(2),
         }
-        A_new, Q_new, _, _ = dynamics_only_m_step(
-            jnp.asarray(means), jnp.asarray(covs), jnp.asarray(cross)
-        )
+        with pytest.warns(DeprecationWarning, match="initial_state_prior=None"):
+            A_new, Q_new, _, _ = dynamics_only_m_step(
+                jnp.asarray(means), jnp.asarray(covs), jnp.asarray(cross)
+            )
         aug = _augment_with_x0(prior, means, covs, cross)
         params = dict(prior, A=np.asarray(A_new), Q=np.asarray(Q_new))
         directions = [("A", e) for e in _unit_directions((2, 2))]

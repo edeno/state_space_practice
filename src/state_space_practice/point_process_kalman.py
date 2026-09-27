@@ -31,6 +31,7 @@ References
 import functools
 import logging
 import operator
+import warnings
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -2577,52 +2578,6 @@ def _stochastic_point_process_smoother_backward(
     return smoother_mean, smoother_cov, smoother_cross_cov
 
 
-def smoothed_initial_transition_moments(
-    prior: InitialStatePrior,
-    first_smoother_mean: ArrayLike,
-    first_smoother_cov: ArrayLike,
-) -> tuple[Array, Array, Array]:
-    """Smoothed moments of ``x_0`` and of the ``x_0 -> x_1`` transition.
-
-    The point-process filters start from ``x_0 ~ N(m_0, P_0)`` and predict
-    before their first update, so the first observation is of ``x_1`` and
-    ``x_0`` itself is unobserved. Its smoothed law follows exactly from that
-    of ``x_1`` through the Gaussian backward kernel ``p(x_0 | x_1)``: with
-    ``P_{1|0} = A P_0 A^T + Q`` and ``J_0 = P_0 A^T P_{1|0}^{-1}``::
-
-        m_{0|T}               = m_0 + J_0 (m_{1|T} - A m_0)
-        P_{0|T}               = P_0 + J_0 (P_{1|T} - P_{1|0}) J_0^T
-        Cov(x_0, x_1 | y_1:T) = J_0 P_{1|T}
-
-    This is :func:`~state_space_practice.kalman.smooth_initial_state_with_cross_cov`
-    under the name the point-process M-steps use. The cross-covariance lets
-    the M-step count the ``x_0 -> x_1`` transition in the ``A`` / ``Q``
-    sufficient statistics.
-
-    Parameters
-    ----------
-    prior : InitialStatePrior
-        Initial-state prior and dynamics the E-step ran with.
-    first_smoother_mean : ArrayLike, shape (n_cont_states,)
-        ``m_{1|T}``.
-    first_smoother_cov : ArrayLike, shape (n_cont_states, n_cont_states)
-        ``P_{1|T}``.
-
-    Returns
-    -------
-    init_smoother_mean : Array, shape (n_cont_states,)
-        ``m_{0|T}``.
-    init_smoother_cov : Array, shape (n_cont_states, n_cont_states)
-        ``P_{0|T}``.
-    init_cross_cov : Array, shape (n_cont_states, n_cont_states)
-        ``Cov(x_0, x_1 | y_{1:T}) = J_0 P_{1|T}``.
-    """
-    return smooth_initial_state_with_cross_cov(
-        prior, first_smoother_mean, first_smoother_cov
-    )
-
-
-@jax.jit
 def dynamics_only_m_step(
     smoother_mean: ArrayLike,
     smoother_cov: ArrayLike,
@@ -2644,7 +2599,8 @@ def dynamics_only_m_step(
     so the complete-data log-likelihood has ``T`` transitions
     ``x_{t-1} -> x_t``, ``t = 1..T``. With the prior, the smoothed moments of
     ``x_0`` and ``Cov(x_0, x_1 | y)`` are recovered one RTS step behind the
-    smoother (:func:`smoothed_initial_transition_moments`) and the ``x_0 ->
+    smoother (:func:`~state_space_practice.kalman.smooth_initial_state_with_cross_cov`)
+    and the ``x_0 ->
     x_1`` transition enters the ``A`` and ``Q`` sufficient statistics, so
     ``A``, ``Q``, ``m_0`` and ``P_0`` jointly maximise the expected
     complete-data log-likelihood ``Q(theta)`` given the E-step moments (the
@@ -2652,7 +2608,7 @@ def dynamics_only_m_step(
     gradient of ``Q(theta)`` vanishes at the returned values). ``Q`` is then
     divided by ``T``.
 
-    Without the prior (legacy), only the ``T - 1`` observed-to-observed
+    Without the prior (deprecated), only the ``T - 1`` observed-to-observed
     transitions are used (``Q`` divided by ``T - 1``) and the initial state is
     set to the smoothed ``x_1``; that is not an exact EM step.
 
@@ -2677,9 +2633,13 @@ def dynamics_only_m_step(
         The initial-state prior and dynamics the E-step ran with. If given,
         the M-step is exact EM (see above): the ``x_0 -> x_1`` transition is
         included in the ``A`` / ``Q`` statistics and the initial state is the
-        smoothed ``x_0``. If None (legacy), the smoothed moments of ``x_1``
-        are returned as the initial state and only ``T - 1`` transitions are
+        smoothed ``x_0``. If None, the smoothed moments of ``x_1`` are
+        returned as the initial state and only ``T - 1`` transitions are
         used, which is not an EM step and can decrease the log-likelihood.
+
+        .. deprecated::
+            Passing ``None`` emits a ``DeprecationWarning`` and will be
+            removed in version 0.2.0; pass the prior the E-step ran with.
 
     Returns
     -------
@@ -2699,6 +2659,33 @@ def dynamics_only_m_step(
     ... [1] Roweis, S. T., Ghahramani, Z., & Hinton, G. E. (1999). A unifying review of
     linear Gaussian models. Neural computation, 11(2), 305-345.
     """
+    if initial_state_prior is None:
+        warnings.warn(
+            "dynamics_only_m_step with initial_state_prior=None uses only the "
+            "T - 1 observed transitions, which is not an exact EM step. Pass the "
+            "InitialStatePrior the E-step ran with instead. "
+            "It will be removed in version 0.2.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    return _dynamics_only_m_step(
+        smoother_mean,
+        smoother_cov,
+        smoother_cross_cov,
+        fixed_transition_matrix,
+        initial_state_prior,
+    )
+
+
+@jax.jit
+def _dynamics_only_m_step(
+    smoother_mean: ArrayLike,
+    smoother_cov: ArrayLike,
+    smoother_cross_cov: ArrayLike,
+    fixed_transition_matrix: ArrayLike | None,
+    initial_state_prior: InitialStatePrior | None,
+) -> tuple[Array, Array, Array, Array]:
+    """Jitted core of :func:`dynamics_only_m_step` (no deprecation check)."""
     smoother_mean = jnp.asarray(smoother_mean)
     smoother_cov = jnp.asarray(smoother_cov)
     smoother_cross_cov = jnp.asarray(smoother_cross_cov)
@@ -2717,7 +2704,7 @@ def dynamics_only_m_step(
     sum_cross_cov = smoother_cross_cov.sum(axis=0)
 
     if initial_state_prior is None:
-        # Legacy: the T - 1 transitions x_t -> x_{t+1}, t = 1..T-1.
+        # Deprecated: the T - 1 transitions x_t -> x_{t+1}, t = 1..T-1.
         init_mean = smoother_mean[0]
         init_cov = smoother_cov[0]
         means = smoother_mean
@@ -2726,7 +2713,7 @@ def dynamics_only_m_step(
     else:
         # Exact EM: prepend the smoothed x_0 so the sums run over all T
         # transitions x_{t-1} -> x_t, t = 1..T.
-        init_mean, init_cov, init_cross_cov = smoothed_initial_transition_moments(
+        init_mean, init_cov, init_cross_cov = smooth_initial_state_with_cross_cov(
             initial_state_prior, smoother_mean[0], smoother_cov[0]
         )
         means = jnp.concatenate((init_mean[None], smoother_mean), axis=0)
