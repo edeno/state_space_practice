@@ -1505,6 +1505,34 @@ class TestKalmanNumericalStability:
             eigvals = jnp.linalg.eigvalsh(filtered_cov[t])
             assert jnp.all(eigvals > -1e-8), f"Cov not PSD at t={t}"
 
+    def test_float32_smoother_rank_deficient_dynamics_zero_process_noise(
+        self,
+    ) -> None:
+        """A rank-1 A with Q = 0 makes every predicted covariance singular, so
+        the RTS gain solve relies entirely on its stabilising shift. In float32
+        the shift must survive rounding: the smoother must stay finite and
+        agree with the float64 smoother to float32 accuracy."""
+        A = np.array([[0.6, 0.8], [0.3, 0.4]])
+        obs = np.array([[1.0, 2.0], [0.5, -1.0], [0.3, 0.2]])
+        args = (
+            np.zeros(2),
+            np.eye(2),
+            obs,
+            A,
+            np.zeros((2, 2)),
+            np.eye(2),
+            0.1 * np.eye(2),
+        )
+        ref_mean, ref_cov, _, _ = kalman_smoother(*(jnp.asarray(a) for a in args))
+        mean32, cov32, _, _ = kalman_smoother(
+            *(jnp.asarray(a, dtype=jnp.float32) for a in args)
+        )
+
+        assert mean32.dtype == jnp.float32
+        assert jnp.all(jnp.isfinite(mean32)) and jnp.all(jnp.isfinite(cov32))
+        np.testing.assert_allclose(mean32, ref_mean, rtol=1e-3, atol=1e-3)
+        np.testing.assert_allclose(cov32, ref_cov, rtol=1e-3, atol=1e-3)
+
 
 # --- Parallel Kalman Smoother Tests ---
 

@@ -43,18 +43,28 @@ from state_space_practice.utils import (  # noqa: F401 — re-exported for backw
 # (tests/test_oracle_kalman.py). The matrices solved here are positive
 # definite whenever the inputs are valid (R > 0 makes S > 0), so the shift only
 # guards against round-off; the tiny absolute part only keeps an all-zero
-# matrix factorizable.
+# matrix factorizable. The relative shift is never below the dtype's machine
+# epsilon: in float32 a 1e-14 relative shift rounds away entirely, and a
+# singular predicted covariance (rank-deficient dynamics, zero process noise)
+# then fails Cholesky.
 _GAIN_SOLVE_RELATIVE_BOOST = 1e-14
 _GAIN_SOLVE_ABSOLUTE_BOOST = 1e-300
 
 
 def _gain_solve(cov: jax.Array, rhs: jax.Array) -> jax.Array:
-    """Solve ``cov @ x = rhs`` for a PD ``cov`` with a scale-relative shift."""
+    """Solve ``cov @ x = rhs`` for a PD ``cov`` with a scale-relative shift.
+
+    The relative shift is ``max(1e-14, eps(dtype))`` times each diagonal
+    entry of ``cov`` (see :func:`state_space_practice.utils.psd_solve`).
+    """
+    relative_boost = max(
+        _GAIN_SOLVE_RELATIVE_BOOST, float(jnp.finfo(jnp.result_type(cov)).eps)
+    )
     return psd_solve(
         cov,
         rhs,
         diagonal_boost=_GAIN_SOLVE_ABSOLUTE_BOOST,
-        relative_boost=_GAIN_SOLVE_RELATIVE_BOOST,
+        relative_boost=relative_boost,
     )
 
 
