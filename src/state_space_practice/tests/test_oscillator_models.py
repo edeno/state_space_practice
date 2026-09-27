@@ -3630,8 +3630,9 @@ class TestMStepIsConstrainedStationaryPoint:
         """The standard DIM M-step (A* -> Frobenius projection) is not the
         constrained optimum.  From a perturbed start it still improves the
         objective, but it is not stationary; started *at* the constrained
-        optimum the projection would lower the objective (by 0.46 here), so the
-        model keeps the previous dynamics and the objective never decreases."""
+        optimum the projection would lower the objective (0.2-0.8 nats on these
+        problems), so the model keeps the previous dynamics and the objective
+        never decreases."""
         from state_space_practice.oscillator_utils import (
             optimize_dim_transition_params_joint_until_stationary,
         )
@@ -3665,40 +3666,12 @@ class TestMStepIsConstrainedStationaryPoint:
             max_spectral_radius=model.max_spectral_radius,
             max_damping=model.max_damping,
         )
-        model.freqs, model.damping_coef = optimum["freq"], optimum["damping"]
-        model.coupling_strength = optimum["coupling_strength"]
-        model.phase_difference = optimum["phase_diff"]
-        model._rebuild_stable_transition_matrix()
+        rh.set_dim_public_params(model, optimum)
         A_opt = model.continuous_transition_matrix
         obj_opt = float(rh.transition_objective(A_opt, Q, stats))
 
         # What the bare projection would install (the old behaviour).
-        from state_space_practice.oscillator_utils import (
-            extract_dim_params_from_matrix_stack,
-            project_transition_matrix_stack,
-        )
-
-        A_star = jnp.stack(
-            [
-                jnp.linalg.solve(stats["gamma1"][..., j].T, stats["beta"][..., j].T).T
-                for j in range(2)
-            ],
-            axis=-1,
-        )
-        projected = project_transition_matrix_stack(A_star, model.max_spectral_radius)
-        p = extract_dim_params_from_matrix_stack(projected, model.sampling_freq, 2)
-        from state_space_practice.oscillator_utils import (
-            construct_stable_directed_influence_transition_stack,
-        )
-
-        A_proj = construct_stable_directed_influence_transition_stack(
-            p["freq"],
-            p["damping"],
-            p["coupling_strength"],
-            p["phase_diff"],
-            model.sampling_freq,
-            max_spectral_radius=model.max_spectral_radius,
-        )
+        A_proj = rh.dim_projected_mstep_parameters(stats, model)["transition_matrix"]
         decrease = obj_opt - float(rh.transition_objective(A_proj, Q, stats))
         assert decrease > 1e-2, f"guard: the projection must lose here ({decrease})"
 
