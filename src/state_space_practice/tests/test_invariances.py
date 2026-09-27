@@ -1000,18 +1000,6 @@ class TestMultinomialChoiceInvariances:
         assert abs(ll_a - ll_b) > 1e-3
 
     @pytest.mark.slow  # eager Newton scan (~5 s)
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "multinomial_choice._softmax_update_core forms the Laplace "
-            "evidence's log-determinants with point_process_kalman._logdet_psd "
-            "(absolute 1e-9 Cholesky shift) while its prior precision and "
-            "posterior use scale-relative shifts; the evidence is therefore not "
-            "scale-equivariant for covariances below ~1e-6 (0.04 nats per trial "
-            "at prior variance 1e-8, 0.29 at 1e-10). Fixing it moves the choice "
-            "golden-EM pins, so it is left to the coordinator."
-        ),
-    )
     def test_laplace_evidence_is_scale_equivariant(self) -> None:
         """x -> x / sqrt(v) maps prior N(m, v), inverse temperature beta to
         prior N(m / sqrt(v), 1), inverse temperature beta sqrt(v): the mode,

@@ -31,9 +31,13 @@ from jax.typing import ArrayLike
 from state_space_practice.exceptions import NotFittedError
 from state_space_practice.kalman import rts_backward_scan
 from state_space_practice.parameter_transforms import POSITIVE
-from state_space_practice.point_process_kalman import _logdet_psd
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import psd_cholesky, psd_solve, symmetrize
+from state_space_practice.utils import (
+    psd_cholesky,
+    psd_logdet,
+    psd_solve,
+    symmetrize,
+)
 from state_space_practice.utils import validate_choice_indices as _validate_choices
 
 # Backtracking step sizes tried by every Newton iteration (largest first).
@@ -96,8 +100,11 @@ def _softmax_update_core(
     _obs_offset = obs_offset if obs_offset is not None else jnp.zeros(n_options)
     step_sizes = jnp.asarray(_NEWTON_STEP_SIZES)
 
-    # Prior precision
-    prior_precision = psd_solve(prior_cov, eye_k)
+    # Prior precision from one Cholesky factor of the prior covariance; the
+    # same factor supplies log|P_prior| below, so the evidence sees exactly
+    # the (scale-relatively shifted) matrix the update used.
+    prior_cho = psd_cholesky(prior_cov)
+    prior_precision = symmetrize(jax.scipy.linalg.cho_solve(prior_cho, eye_k))
 
     def log_posterior(x):
         """Unnormalised log posterior at x, shape (..., K-1) -> (...)."""
@@ -159,8 +166,11 @@ def _softmax_update_core(
     log_lik_at_mode = jax.nn.log_softmax(beta * v + _obs_offset)[choice]
     delta = x - prior_mean
     quad = delta @ (prior_precision @ delta)
-    logdet_prior = _logdet_psd(prior_cov)
-    logdet_post = _logdet_psd(posterior_cov)
+    # Both log-determinants come from the factors already computed (no extra
+    # absolute jitter), which keeps the evidence invariant to the units of x:
+    # log|Sigma_post| = -log|Lambda_post|.
+    logdet_prior = psd_logdet(prior_cho)
+    logdet_post = -psd_logdet(post_cho)
     log_lik = log_lik_at_mode - 0.5 * quad - 0.5 * logdet_prior + 0.5 * logdet_post
 
     return x, posterior_cov, log_lik
