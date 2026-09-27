@@ -441,19 +441,15 @@ class SGDFittableMixin:
         n_timesteps: float,
         data_structure: _LeafStructure,
         frozen_structure: _LeafStructure,
-    ) -> tuple[
-        Callable[..., Any],
-        _CompiledSGDStep,
-        dict[Hashable, _CompiledSGDStep] | None,
-        Hashable,
-    ]:
+    ) -> tuple[_CompiledSGDStep, dict[Hashable, _CompiledSGDStep] | None, Hashable]:
         """Return a jitted SGD step, reusing this model's cached one if valid.
 
         The step fuses loss + grad + ``optimizer.update`` + ``apply_updates``
         into one compiled graph; without jit the optimizer update and the
         softplus/adam primitives dispatch one at a time through Python (~65x
-        slower on CPU; worse on GPU due to per-primitive sync). It takes
-        ``(unc_params, opt_state, frozen_leaves, data_leaves)``.
+        slower on CPU; worse on GPU due to per-primitive sync). Its
+        ``train_step`` takes ``(unc_params, opt_state, frozen_leaves,
+        data_leaves)``.
 
         Steps are cached per model instance under ``(id(optimizer),
         param_spec, n_timesteps, static data / frozen structure)``; jit's own
@@ -466,7 +462,6 @@ class SGDFittableMixin:
 
         Returns
         -------
-        train_step : callable
         entry : _CompiledSGDStep
         cache : dict or None
             The model's step cache (None when the model cannot be cached).
@@ -489,7 +484,7 @@ class SGDFittableMixin:
                 cache, key, cached = None, None, None
             if cache is not None and cached is not None and cached.matches(self):
                 cache[key] = cached  # re-insert as most recently used
-                return cached.train_step, cached, cache, key
+                return cached, cache, key
 
         entry = _build_sgd_step(
             weakref.ref(self) if cache is not None else (lambda: self),
@@ -503,7 +498,7 @@ class SGDFittableMixin:
             cache[key] = entry
             while len(cache) > _MAX_CACHED_STEPS_PER_MODEL:
                 cache.pop(next(iter(cache)))
-        return entry.train_step, entry, cache, key
+        return entry, cache, key
 
     # Declared as ``(*args, **kwargs)`` so subclasses can replace the data
     # arguments with their own signature without an [override] violation.
@@ -596,7 +591,7 @@ class SGDFittableMixin:
         # the compiled step instead of re-tracing and re-compiling it.
         data_dynamic, data_structure = _split_leaves((args, kwargs))
         frozen_dynamic, frozen_structure = _split_leaves(frozen_params)
-        train_step, step_entry, step_cache, cache_key = self._compiled_sgd_step(
+        step_entry, step_cache, cache_key = self._compiled_sgd_step(
             optimizer, param_spec, n_timesteps, data_structure, frozen_structure
         )
 
@@ -609,19 +604,19 @@ class SGDFittableMixin:
         # not the post-update params that then produced NaN.
         last_valid_unc_params = unc_params
         stall_count = 0
-        data_baked = False
 
         # Python loop (not lax.scan) to support NaN checks and verbose
         # logging without JIT closure issues with self.
         for step in range(num_steps):
             try:
-                loss, new_unc_params, new_opt_state, step_finite = train_step(
-                    unc_params, opt_state, frozen_dynamic, data_dynamic
+                loss, new_unc_params, new_opt_state, step_finite = (
+                    step_entry.train_step(
+                        unc_params, opt_state, frozen_dynamic, data_dynamic
+                    )
                 )
             except _DATA_TRACING_ERRORS:
-                if step > 0 or data_baked:
+                if step > 0:
                     raise
-                data_baked = True
                 # The loss needs concrete data while tracing (e.g. it validates
                 # its inputs on the host): bake the data in as constants for
                 # this call instead, uncached (the pre-cache behaviour).
@@ -642,10 +637,10 @@ class SGDFittableMixin:
                     frozen_structure,
                     baked_leaves=(frozen_dynamic, data_dynamic),
                 )
-                step_entry.cacheable = False
-                train_step = step_entry.train_step
-                loss, new_unc_params, new_opt_state, step_finite = train_step(
-                    unc_params, opt_state, frozen_dynamic, data_dynamic
+                loss, new_unc_params, new_opt_state, step_finite = (
+                    step_entry.train_step(
+                        unc_params, opt_state, frozen_dynamic, data_dynamic
+                    )
                 )
 
             # One device->host round trip per step; ``float`` / ``bool`` on
