@@ -238,6 +238,60 @@ def _log_posterior_objective(
     return jnp.squeeze(log_likelihood + log_prior)
 
 
+def smith_laplace_log_likelihood(
+    n_correct_responses: ArrayLike,
+    max_possible_correct: ArrayLike,
+    filtered_mode: ArrayLike,
+    filtered_variance: ArrayLike,
+    one_step_mode: ArrayLike,
+    one_step_variance: ArrayLike,
+    mu: ArrayLike,
+) -> Array:
+    r"""Per-trial Laplace approximation of ``log p(y_k | y_{1:k-1})``.
+
+    Each filter update approximates the one-step posterior
+    ``p(x_k | y_{1:k}) \propto p(y_k | x_k) N(x_k; m_{k|k-1}, P_{k|k-1})`` by a
+    Gaussian at its mode ``x_k^*`` with variance ``P_{k|k}``. The same
+    approximation of the normaliser gives
+
+    .. math::
+
+        \log p(y_k | y_{1:k-1}) \approx \log p(y_k | x_k^*)
+            - \frac{(x_k^* - m_{k|k-1})^2}{2 P_{k|k-1}}
+            - \tfrac12 \log P_{k|k-1} + \tfrac12 \log P_{k|k},
+
+    the evidence used by the multinomial-choice and point-process filters.
+    Unlike the plug-in ``log p(y_k | x = m_{k|k-1})`` it accounts for the
+    predictive uncertainty ``P_{k|k-1}``; the plug-in is over-confident and
+    biases a likelihood-based ``sigma_epsilon`` estimate downwards.
+
+    Returns
+    -------
+    log_likelihood_terms : Array, shape (n_trials,)
+    """
+    y = jnp.asarray(n_correct_responses)
+    n = jnp.asarray(max_possible_correct)
+    mode = jnp.asarray(filtered_mode)
+    eta = mu + mode
+    log_binom_coef = (
+        jax.scipy.special.gammaln(n + 1.0)
+        - jax.scipy.special.gammaln(y + 1.0)
+        - jax.scipy.special.gammaln(n - y + 1.0)
+    )
+    log_lik_at_mode = (
+        log_binom_coef
+        + y * jax.nn.log_sigmoid(eta)
+        + (n - y) * jax.nn.log_sigmoid(-eta)
+    )
+    pred_var = jnp.asarray(one_step_variance)
+    return (
+        log_lik_at_mode
+        - 0.5 * (mode - jnp.asarray(one_step_mode)) ** 2 / pred_var
+        - 0.5 * jnp.log(pred_var)
+        + 0.5 * jnp.log(jnp.asarray(filtered_variance))
+    )
+
+
 def smith_learning_filter(
     n_correct_responses: ArrayLike,
     init_learning_state: float = 0.0,
@@ -1468,11 +1522,10 @@ class SmithLearningModel(SGDFittableMixin):
         Returns
         -------
         log_likelihood : float
-            Approximate marginal log-likelihood, computed by evaluating
-            the binomial PMF at the one-step predicted modes. This is not
-            the true marginal likelihood (which would require integrating
-            over the predictive uncertainty) but is standard practice for
-            Laplace-EKF models and sufficient for EM convergence monitoring.
+            Laplace-approximated marginal log-likelihood
+            ``sum_k log p(y_k | y_{1:k-1})`` (see
+            :func:`smith_laplace_log_likelihood`), which accounts for the
+            predictive uncertainty of each one-step prediction.
         """
         validate_count_array(
             n_correct_responses, "n_correct_responses", allow_empty=False
@@ -1500,15 +1553,14 @@ class SmithLearningModel(SGDFittableMixin):
             max_possible_correct=resolved_trial_max_correct,
         )
 
-        prob_pred_success = jax.nn.sigmoid(self.mu_bias + self.filtered_one_step_mode)
-        # Clip probabilities to avoid logpmf errors with values exactly 0 or 1
-        epsilon = 1e-9
-        prob_pred_success = jnp.clip(prob_pred_success, epsilon, 1.0 - epsilon)
-
-        log_likelihood_terms = jax.scipy.stats.binom.logpmf(
-            k=n_correct_responses,
-            n=resolved_trial_max_correct,
-            p=prob_pred_success,
+        log_likelihood_terms = smith_laplace_log_likelihood(
+            n_correct_responses,
+            resolved_trial_max_correct,
+            self.filtered_learning_state_mode,
+            self.filtered_learning_state_variance,
+            self.filtered_one_step_mode,
+            self.filtered_one_step_variance,
+            self.mu_bias,
         )
         log_likelihood = jnp.sum(log_likelihood_terms)
 
@@ -1824,10 +1876,10 @@ class SmithLearningModel(SGDFittableMixin):
 
         (
             _prob_correct,
-            _learning_state_mode,
-            _learning_state_var,
+            learning_state_mode,
+            learning_state_var,
             one_step_mode,
-            _one_step_var,
+            one_step_var,
         ) = smith_learning_filter(
             n_correct_responses,
             init_learning_state=init_state,
@@ -1838,14 +1890,14 @@ class SmithLearningModel(SGDFittableMixin):
             differentiable=True,
         )
 
-        prob_pred_success = jax.nn.sigmoid(self.mu_bias + one_step_mode)
-        epsilon = 1e-9
-        prob_pred_success = jnp.clip(prob_pred_success, epsilon, 1.0 - epsilon)
-
-        log_likelihood_terms = jax.scipy.stats.binom.logpmf(
-            k=n_correct_responses,
-            n=self._resolved_max_correct,
-            p=prob_pred_success,
+        log_likelihood_terms = smith_laplace_log_likelihood(
+            n_correct_responses,
+            self._resolved_max_correct,
+            learning_state_mode,
+            learning_state_var,
+            one_step_mode,
+            one_step_var,
+            self.mu_bias,
         )
         return -jnp.sum(log_likelihood_terms)
 
@@ -1886,13 +1938,14 @@ class SmithLearningModel(SGDFittableMixin):
             prob_correct_by_chance=self.prob_correct_by_chance,
         )
 
-        prob_pred_success = jax.nn.sigmoid(self.mu_bias + self.filtered_one_step_mode)
-        epsilon = 1e-9
-        prob_pred_success = jnp.clip(prob_pred_success, epsilon, 1.0 - epsilon)
-        log_likelihood_terms = jax.scipy.stats.binom.logpmf(
-            k=n_correct_responses,
-            n=resolved_max,
-            p=prob_pred_success,
+        log_likelihood_terms = smith_laplace_log_likelihood(
+            n_correct_responses,
+            resolved_max,
+            self.filtered_learning_state_mode,
+            self.filtered_learning_state_variance,
+            self.filtered_one_step_mode,
+            self.filtered_one_step_variance,
+            self.mu_bias,
         )
         self.log_likelihood_ = float(jnp.sum(log_likelihood_terms))
 
