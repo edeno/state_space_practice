@@ -429,12 +429,14 @@ class TestSwitchingChoiceSmootherControlInput:
             inverse_temperature=1.5,
             decay=0.9,
         )
-        np.testing.assert_allclose(smooth[0], ref.smoothed_values, atol=1e-10)
-        np.testing.assert_allclose(smooth[1], ref.smoothed_covariances, atol=1e-10)
-        np.testing.assert_allclose(smooth[4], ref.smoother_cross_cov, atol=1e-10)
+        # 1e-8: the batched (vmapped) and unbatched Newton iterates differ at
+        # round-off level.
+        np.testing.assert_allclose(smooth[0], ref.smoothed_values, atol=1e-8)
+        np.testing.assert_allclose(smooth[1], ref.smoothed_covariances, atol=1e-8)
+        np.testing.assert_allclose(smooth[4], ref.smoother_cross_cov, atol=1e-8)
         for s in range(2):
             np.testing.assert_allclose(
-                smooth[5][..., s], ref.smoothed_values, atol=1e-10
+                smooth[5][..., s], ref.smoothed_values, atol=1e-8
             )
         # Guard: the control input is large enough that ignoring it (the old
         # behaviour, reproduced by a zero control input) is far off.
