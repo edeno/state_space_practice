@@ -76,8 +76,8 @@ uvx pre-commit install            # ruff, ruff-format and nbstripout on commit
 ```
 
 Tests that run EM, SGD or full fits are marked `slow`, either explicitly or
-automatically by `tests/conftest.py` (any test whose body calls `.fit(`,
-`.fit_sgd(` or `run_em(` outside `pytest.raises`). CI runs lint, mypy and the
+automatically by `tests/conftest.py` (any test whose body, or a fixture it
+uses, calls `.fit(`, `.fit_sgd(` or `run_em(` outside `pytest.raises`). CI runs lint, mypy and the
 fast suite on Python 3.10-3.12 for every push and pull request, and the full
 suite nightly. Set `HYPOTHESIS_PROFILE=ci` for the thorough Hypothesis profile.
 

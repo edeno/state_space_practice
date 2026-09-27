@@ -30,8 +30,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the 24 modules listed in `[tool.mypy] files`; `mypy src/state_space_practice`
   still reports 142 errors in the other 21 modules (was 150 before the
   `fit_sgd` override fix).
-- Tests that call `.fit(` / `.fit_sgd(` / `run_em(` (outside `pytest.raises`)
-  are marked `slow` automatically at collection.
+- Tests that call `.fit(` / `.fit_sgd(` / `run_em(` (outside `pytest.raises`),
+  directly or through a fixture, are marked `slow` automatically at collection.
 - **`em_driver.run_em`**: the shared EM loop (E-step, convergence, rollback,
   M-step) used by the oscillator models, `PointProcessModel`, `PlaceFieldModel`,
   the switching point-process models and `SmithLearningModel`. Invalid option

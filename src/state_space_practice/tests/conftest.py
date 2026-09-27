@@ -47,8 +47,24 @@ settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))
 _FIT_METHODS = frozenset({"fit", "fit_sgd"})
 _FIT_FUNCTIONS = frozenset({"run_em"})
 
-# Node-id substrings (``file.py::Class`` or ``file.py::Class::test``).
-_SLOW_TEST_REGISTRY: tuple[str, ...] = ()
+# Node-id substrings (``file.py::Class`` or ``file.py::Class::test``) for tests
+# that run EM / optimizers through helpers the source scan can't see. Chosen
+# from ``--durations`` of the fast suite.
+_SLOW_TEST_REGISTRY: tuple[str, ...] = (
+    # EM driven through conftest.assert_em_rolls_back_on_ll_decrease
+    "test_smith_learning_algorithm.py::TestSmithEMRollback::",
+    "test_oscillator_models.py::TestOscillatorEMRollback::",
+    # hand-rolled EM loops / optimizers
+    "test_oscillator_models.py::TestOscillatorPaperStructure::"
+    "test_em_pools_observation_covariance_across_states",
+    "test_switching_kalman.py::TestSwitchingEMMonotonicity::",
+    "test_switching_kalman.py::test_joint_dim_optimizer_improves_total_q_and_",
+    "test_switching_point_process.py::TestMilestone8EndToEnd::",
+    "test_switching_point_process.py::TestSecondOrderClippedWarmStart::"
+    "test_single_neuron_converges_from_clipped_warm_start",
+    "test_switching_point_process.py::TestSecondOrderClippedWarmStart::"
+    "test_mixture_converges_from_clipped_warm_start",
+)
 
 
 def _is_fit_call(node: ast.AST) -> bool:
