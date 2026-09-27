@@ -2042,44 +2042,9 @@ class SmithLearningModel(SGDFittableMixin):
             self.init_learning_variance = float(params["init_learning_variance"])
 
     def _finalize_sgd(self, n_correct_responses: Array) -> None:
-        resolved_max = self._resolve_max_possible_correct(n_correct_responses)
-        (
-            self.filtered_prob_correct_response,
-            self.filtered_learning_state_mode,
-            self.filtered_learning_state_variance,
-            self.filtered_one_step_mode,
-            self.filtered_one_step_variance,
-        ) = smith_learning_filter(
-            n_correct_responses,
-            init_learning_state=self.init_learning_state,
-            init_learning_variance=self.init_learning_variance,
-            sigma_epsilon=self.sigma_epsilon,
-            prob_correct_by_chance=self.prob_correct_by_chance,
-            max_possible_correct=resolved_max,
-        )
-        (
-            self.smoothed_learning_state_mode,
-            self.smoothed_learning_state_variance,
-            self.smoothed_prob_correct_response,
-            self.smoother_gain,
-        ) = smith_learning_smoother(
-            self.filtered_learning_state_mode,
-            self.filtered_learning_state_variance,
-            self.filtered_one_step_mode,
-            self.filtered_one_step_variance,
-            prob_correct_by_chance=self.prob_correct_by_chance,
-        )
-
-        log_likelihood_terms = smith_laplace_log_likelihood(
-            n_correct_responses,
-            resolved_max,
-            self.filtered_learning_state_mode,
-            self.filtered_learning_state_variance,
-            self.filtered_one_step_mode,
-            self.filtered_one_step_variance,
-            self.mu_bias,
-        )
-        self.log_likelihood_ = float(jnp.sum(log_likelihood_terms))
+        # One E-step at the fitted parameters stores the filtered / smoothed
+        # estimates and the Laplace log-likelihood, exactly as after EM.
+        self.log_likelihood_ = self._e_step(n_correct_responses)
 
     def get_learning_curve(
         self,
