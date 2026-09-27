@@ -481,7 +481,7 @@ def point_process_kalman_update(
     diagonal_boost: float = 0.0,
     grad_log_intensity_func: Callable[[Array, SpikeObsParams], Array] | None = None,
     include_laplace_normalization: bool = True,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
 ) -> tuple[Array, Array, Array]:
     """Single point-process Laplace-EKF update for multiple neurons.
@@ -597,7 +597,7 @@ def _point_process_predict_and_update(
     log_intensity_func: Callable[[Array, SpikeObsParams], Array],
     spike_params: SpikeObsParams,
     include_laplace_normalization: bool = True,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
     grad_log_intensity_func: Callable[[Array, SpikeObsParams], Array] | None = None,
 ) -> tuple[Array, Array, Array]:
@@ -678,7 +678,7 @@ def _point_process_update_per_discrete_state_pair(
     log_intensity_func: Callable[[Array, SpikeObsParams], Array],
     spike_params: SpikeObsParams,
     include_laplace_normalization: bool = True,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
 ) -> tuple[Array, Array, Array]:
     """Compute pair-conditional posteriors for all (i, j) state pairs.
@@ -779,7 +779,7 @@ def _first_timestep_point_process_update(
     log_intensity_func: Callable[[Array, SpikeObsParams], Array],
     spike_params: SpikeObsParams,
     include_laplace_normalization: bool = True,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
 ) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
     """Handle first timestep with x₁ convention (update only, no prediction).
@@ -2085,7 +2085,7 @@ def _switching_point_process_filter_jit(
     log_intensity_func: Callable[[Array, SpikeObsParams], Array],
     spike_params: SpikeObsParams,
     include_laplace_normalization: bool = True,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
 ) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
     """Switching point-process Kalman filter for spike observations.
@@ -2432,7 +2432,7 @@ def switching_point_process_filter(
     log_intensity_func: Callable[[Array, SpikeObsParams], Array],
     spike_params: SpikeObsParams,
     include_laplace_normalization: bool = True,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
 ) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
     """Switching point-process Kalman filter for spike observations.
@@ -3651,7 +3651,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         q_regularization: QRegularizationConfig | None = None,
         spike_weight_l2: float = 100.0,
         spike_baseline_prior_l2: float = 0.0,
-        max_newton_iter: int = 1,
+        max_newton_iter: int = 3,
         line_search_beta: float = 0.5,
         smoother_type: str = "gpb1",
         max_spectral_radius: float = 0.999,

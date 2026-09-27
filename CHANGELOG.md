@@ -240,6 +240,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   failure (it previously stopped at gradient norms of 67–173), and the
   projected (standard) path keeps the previous dynamics when the Frobenius
   projection would lower the M-step objective (generalized EM).
+- **`max_newton_iter` defaults to 3** (was 1) in `stochastic_point_process_filter`
+  / `_smoother`, `PointProcessModel`, `PlaceFieldModel`, the point-process
+  oscillator models and `SwitchingSpikeOscillatorModel`. One Fisher-scoring
+  step biased the switching spike-oscillator's low-noise process variance
+  about 2x upward even at ``T = 3200`` and could diverge from a broad prior;
+  three steps remove most of the bias. Block and dense place-field paths now
+  agree to round-off only when no line search backtracks.
 - **Default `diagonal_boost` of `switching_point_process.point_process_kalman_update`**
   is ``0.0`` (relative shift), like the other Laplace updates.
 
@@ -347,8 +354,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The default single Fisher-scoring step (``max_newton_iter=1``) biases
   `SwitchingSpikeOscillatorModel`'s low-noise process variance about 2x
   upward even at ``T = 3200``; three Newton steps remove most of it. With a
-  broad prior, Newton-1 in `PointProcessModel` can diverge. Consider
-  ``max_newton_iter >= 3`` for these models.
+  broad prior, Newton-1 in `PointProcessModel` can diverge. The default is
+  now 3; pass ``max_newton_iter=1`` to reproduce old fits.
 - The softmax Gaussian posterior of the choice models is over-confident at
   high inverse temperature (90% intervals cover ~69% at ``beta = 5``; the
   exact posterior on the same data is calibrated), and the Smith smoother at

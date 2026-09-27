@@ -153,7 +153,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         L2 regularization on spike GLM weights.
     spike_baseline_prior_l2 : float, default=0.0
         L2 regularization shrinking baselines toward empirical log-rate.
-    max_newton_iter : int, default=1
+    max_newton_iter : int, default=3
         Newton iterations per Laplace-EKF update.
     line_search_beta : float, default=0.5
         Armijo line search parameter.
@@ -189,7 +189,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         q_regularization: QRegularizationConfig | None = None,
         spike_weight_l2: float = 0.01,
         spike_baseline_prior_l2: float = 0.0,
-        max_newton_iter: int = 1,
+        max_newton_iter: int = 3,
         line_search_beta: float = 0.5,
         smoother_type: str = "gpb1",
     ) -> None:

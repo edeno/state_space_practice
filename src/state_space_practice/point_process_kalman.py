@@ -834,7 +834,7 @@ def _point_process_laplace_update(
     diagonal_boost: float = 0.0,
     grad_log_intensity_func: Callable[[Array], Array] | None = None,
     include_laplace_normalization: bool = True,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
     max_log_count: float = 20.0,
     return_line_search_failures: bool = False,
@@ -907,7 +907,7 @@ def _point_process_laplace_update(
         If True, include the Laplace normalization and prior terms to approximate
         log p(y_t | y_{1:t-1}). If False, return the plug-in log-likelihood
         at the posterior mode without normalization.
-    max_newton_iter : int, default=1
+    max_newton_iter : int, default=3
         Maximum number of Fisher scoring iterations. Use > 1 with line search
         for numerical stability with large spike counts (e.g., many neurons).
         (Named ``max_newton_iter`` for backwards compatibility; the inner
@@ -1202,7 +1202,7 @@ def glm_laplace_update(
     diagonal_boost: float = 0.0,
     grad_eta_func: Callable[[Array], Array] | None = None,
     include_laplace_normalization: bool = True,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
 ) -> tuple[Array, Array, Array]:
     """Family-generic Laplace measurement update via Fisher scoring.
@@ -1332,7 +1332,7 @@ def stochastic_point_process_filter(
     block_n_neurons: int | None = None,
     block_size: int | None = None,
     force_dense: bool = False,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     return_block_covariances: bool = False,
 ) -> tuple[Array, Array | BlockDiagonalCovariance, Array]:
     """Applies a Stochastic State Point Process Filter (SSPPF).
@@ -1614,7 +1614,7 @@ def _stochastic_point_process_filter_impl(
     log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
     include_laplace_normalization: bool = True,
     max_log_count: float = 20.0,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
 ) -> tuple[Array, Array, Array, Array]:
     """JIT-compiled inner implementation of the point process filter.
 
@@ -1845,7 +1845,7 @@ def _run_forward_block_diagonal(
     dt: float,
     include_laplace_normalization: bool = True,
     max_log_count: float = 20.0,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
 ) -> tuple[Array, Array, Array, Array]:
     """Run the per-neuron forward Laplace-EKF filter in block form.
 
@@ -1860,7 +1860,7 @@ def _run_forward_block_diagonal(
     dt : float
     include_laplace_normalization : bool, default=True
     max_log_count : float, default=20.0
-    max_newton_iter : int, default=1
+    max_newton_iter : int, default=3
 
     Returns
     -------
@@ -2015,7 +2015,7 @@ def _stochastic_point_process_filter_block_diagonal(
     dt: float,
     include_laplace_normalization: bool = True,
     max_log_count: float = 20.0,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     return_block_covariances: bool = False,
 ) -> tuple[Array, Array | BlockDiagonalCovariance, Array]:
     """Block-diagonal Laplace-EKF filter via vmapped per-neuron scans.
@@ -2048,9 +2048,9 @@ def _stochastic_point_process_filter_block_diagonal(
     Therefore: per-neuron ``log p(y_t^j | y_{1:t-1})`` contributions
     sum to the full-problem marginal log-likelihood.
 
-    This equivalence is exact for the default single Fisher step
-    (``max_newton_iter == 1``). For ``max_newton_iter > 1`` the two paths
-    differ: the dense update runs one *global* backtracking line search
+    This equivalence is exact for a single Fisher step
+    (``max_newton_iter == 1``). For ``max_newton_iter > 1`` (the default is
+    3) the two paths differ only when a line search backtracks: the dense update runs one *global* backtracking line search
     (a single step size gating all neurons on the summed neg-log-posterior),
     whereas this block path backtracks *per neuron* independently. The
     per-neuron search is arguably better conditioned, but the resulting
@@ -2081,7 +2081,7 @@ def _stochastic_point_process_filter_block_diagonal(
         Time bin width.
     include_laplace_normalization : bool, default=True
     max_log_count : float, default=20.0
-    max_newton_iter : int, default=1
+    max_newton_iter : int, default=3
     return_block_covariances : bool, default=False
         Return ``filtered_cov`` as a :class:`BlockDiagonalCovariance`
         instead of the dense array.
@@ -2133,7 +2133,7 @@ def _stochastic_point_process_smoother_block_diagonal(
     include_laplace_normalization: bool = True,
     max_log_count: float = 20.0,
     return_filtered: bool = False,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     return_block_covariances: bool = False,
 ) -> tuple[Array | BlockDiagonalCovariance, ...]:
     """Block-diagonal RTS smoother via vmapped per-neuron backward pass.
@@ -2188,7 +2188,7 @@ def _stochastic_point_process_smoother_block_diagonal(
     max_log_count : float, default=20.0
     return_filtered : bool, default=False
         If True, also return the filtered mean and covariance.
-    max_newton_iter : int, default=1
+    max_newton_iter : int, default=3
     return_block_covariances : bool, default=False
 
     Returns
@@ -2265,7 +2265,7 @@ def stochastic_point_process_smoother(
     block_n_neurons: int | None = None,
     block_size: int | None = None,
     force_dense: bool = False,
-    max_newton_iter: int = 1,
+    max_newton_iter: int = 3,
     return_block_covariances: bool = False,
 ) -> tuple[Array | BlockDiagonalCovariance, ...]:
     """Applies a Stochastic State Point Process Smoother (SSPPS).
@@ -2880,7 +2880,7 @@ class PointProcessModel(SGDFittableMixin):
         update_transition_matrix: bool = True,
         update_process_cov: bool = True,
         update_init_state: bool = True,
-        max_newton_iter: int = 1,
+        max_newton_iter: int = 3,
     ):
         validate_scalar(dt, "dt", positive=True)
         self.n_state_dims = n_state_dims

@@ -370,7 +370,7 @@ class PlaceFieldModel(SGDFittableMixin):
         update_process_cov: bool = True,
         update_init_state: bool = True,
         max_firing_rate_hz: float = 500.0,
-        max_newton_iter: int = 1,
+        max_newton_iter: int = 3,
     ):
         if dt <= 0:
             raise ValueError(f"dt must be positive, got {dt}")
