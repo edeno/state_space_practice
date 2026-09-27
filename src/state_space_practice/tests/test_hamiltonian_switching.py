@@ -266,6 +266,7 @@ class TestSwitchingHamiltonianSmooth:
             "transition matrices — Jacobian weighting may be ignoring probabilities"
         )
 
+    @pytest.mark.slow  # full switching filter + smoother vs a reference (~7 s)
     def test_smoother_matches_pairwise_rts_reference(self):
         """The continuous smoother must update all (S_t, S_{t+1}) pairs."""
         from state_space_practice.hamiltonian_core import (

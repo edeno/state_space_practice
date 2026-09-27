@@ -1512,6 +1512,7 @@ class TestKalmanNumericalStability:
 class TestParallelKalmanSmoother:
     """Tests for the parallel RTS smoother via associative scan."""
 
+    @pytest.mark.slow  # full sequential + parallel smoother, T=500 (~5 s)
     def test_matches_sequential_smoother(self) -> None:
         """Parallel smoother should match sequential smoother to high precision."""
         key = random.PRNGKey(42)
@@ -1602,6 +1603,7 @@ class TestParallelKalmanSmoother:
         np.testing.assert_allclose(par_cov, seq_cov, atol=1e-6)
         np.testing.assert_allclose(par_cross, seq_cross, atol=1e-6)
 
+    @pytest.mark.slow  # Kalman filter + parallel smoother pipeline (~4 s)
     def test_time_varying_transition(self) -> None:
         """Should handle per-timestep transition matrices."""
         T, D = 50, 2

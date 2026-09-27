@@ -3387,6 +3387,7 @@ class TestBlockDiagonalFilterEquivalence:
             float(block[2]), float(dense[2]), atol=1e-9, rtol=1e-10
         )
 
+    @pytest.mark.slow  # jax.grad through the dense and the block filter (~5 s)
     def test_gradient_matches_dense_for_fit_sgd(self) -> None:
         """jax.grad through both filters must agree.
 
