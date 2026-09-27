@@ -10095,7 +10095,9 @@ def test_spike_glm_update_warns_on_newton_fallback(monkeypatch) -> None:
     )
     # Corrupt the Newton direction so it points uphill.
     monkeypatch.setattr(spp, "_ridged_newton_direction", lambda hess, grad: -grad)
-    with pytest.warns(UserWarning, match="fell back to the gradient direction"):
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    with pytest.warns(StateSpaceWarning, match="fell back to the gradient direction"):
         updated = spp.update_spike_glm_params(
             spikes, smoother_mean, params0, dt=0.01, max_iter=3
         )

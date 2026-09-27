@@ -95,6 +95,7 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.em_driver import run_em
+from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.oscillator_utils import (
     _matrix_to_oscillator_blocks,
     _oscillator_blocks_to_matrix,
@@ -1062,7 +1063,7 @@ def _warn_newton_fallbacks(n_fallbacks: Array, context: str) -> None:
             f"{context}: the Newton direction was not a descent direction in "
             f"{count} neuron-iteration(s) (ill-conditioned Hessian); fell back "
             "to the gradient direction for those steps.",
-            UserWarning,
+            StateSpaceWarning,
             stacklevel=3,
         )
 
