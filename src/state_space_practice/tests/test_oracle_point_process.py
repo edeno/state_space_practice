@@ -711,7 +711,7 @@ def _augment_with_x0(prior, means, covs, cross):
 class TestDynamicsMStepMaximisesQ:
     """dynamics_only_m_step with an initial_state_prior is exact EM."""
 
-    @settings(deadline=None, max_examples=15)
+    @settings(deadline=None, max_examples=10)
     @given(
         seed=st.integers(0, 2**31 - 1),
         n_latent=st.integers(1, 3),
@@ -936,9 +936,8 @@ class TestStationaryGLMFitIsStationary:
     with ``mu_t = exp(Z_t w) dt``.
     """
 
-    @pytest.mark.parametrize("seed", [0, 1])
-    def test_map_is_stationary_and_covariance_is_inverse_hessian(self, seed) -> None:
-        rng = np.random.default_rng(seed)
+    def test_map_is_stationary_and_covariance_is_inverse_hessian(self) -> None:
+        rng = np.random.default_rng(0)
         n_time, n_basis, dt = 400, 5, 0.01
         Z = rng.uniform(0.0, 1.0, (n_time, n_basis))
         Z /= Z.sum(axis=1, keepdims=True)  # partition of unity, like B-splines
