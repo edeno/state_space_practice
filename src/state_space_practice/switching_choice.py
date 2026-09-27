@@ -42,8 +42,11 @@ from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.switching_kalman import (
     _first_timestep_discrete_update,
     _normalize_initial_discrete_prob,
+    _stabilize_probability_vector_preserving_zeros,
     _update_discrete_state_probabilities,
+    collapse_gaussian_mixture,
     collapse_gaussian_mixture_per_discrete_state,
+    switching_kalman_smoother,
 )
 from state_space_practice.utils import (
     validate_choice_indices,
@@ -514,6 +517,124 @@ def _switching_choice_filter_jit(
     )
 
 
+@jax.jit
+def switching_choice_smoother(
+    filtered_values: Array,
+    filtered_covs: Array,
+    discrete_state_probs: Array,
+    process_covs: Array,
+    transition_matrices: Array,
+    discrete_transition_matrix: Array,
+    control_input: Array,
+) -> tuple[Array, ...]:
+    """GPB1 switching RTS smoother for dynamics with a known control input.
+
+    The latent dynamics of the switching choice model are
+    ``x_t = A_{s_t} x_{t-1} + b_t + w_t`` with the known input
+    ``b_t = B @ u_t``. :func:`switching_kalman.switching_kalman_smoother`
+    assumes ``b_t = 0``: its backward step predicts ``A_k m_{t|t}`` and so,
+    with covariates, compares the smoothed ``x_{t+1}`` against a prediction
+    that is missing ``b_{t+1}``, which biases every smoothed mean.
+
+    For each state pair the correct RTS mean update is
+    ``m_t + J (m^s_{t+1} - A_k m_t - b_{t+1})``, which is the control-free
+    update applied to the shifted next-step smoothed mean
+    ``m^s_{t+1} - b_{t+1}``. The discrete-state recursion and every
+    covariance (including the mixture-collapse spread terms, which are
+    invariant to a common shift of the ``t+1`` means) do not depend on
+    ``b``. This function therefore runs the library backward step one time
+    step at a time, feeding it the shifted next-step means, and returns the
+    same 9-tuple as ``switching_kalman_smoother``. With ``control_input == 0``
+    it reproduces ``switching_kalman_smoother`` exactly.
+
+    Parameters
+    ----------
+    filtered_values : Array, shape (T, K-1, S)
+    filtered_covs : Array, shape (T, K-1, K-1, S)
+    discrete_state_probs : Array, shape (T, S)
+    process_covs : Array, shape (K-1, K-1, S)
+    transition_matrices : Array, shape (K-1, K-1, S)
+    discrete_transition_matrix : Array, shape (S, S)
+    control_input : Array, shape (T, K-1)
+        ``control_input[t]`` is the known input ``b_t`` of the transition
+        ``x_{t-1} -> x_t`` (row 0 is never read).
+
+    Returns
+    -------
+    tuple
+        ``(overall_mean, overall_cov, discrete_probs, joint_discrete_probs,
+        overall_cross_cov, state_cond_means, state_cond_covs,
+        pair_cond_cross_covs, pair_cond_means)`` with the shapes documented
+        in :func:`switching_kalman.switching_kalman_smoother`.
+    """
+
+    def _backward_step(carry, inputs):
+        next_means, next_covs, next_probs = carry
+        filt_mean_t, filt_cov_t, filt_prob_t, b_next = inputs
+        # A two-step call whose "last filter" slot is the smoothed t+1 state:
+        # the library initialises its backward carry from that slot, so its
+        # single backward step is exactly the GPB1 step at t.
+        out = switching_kalman_smoother(
+            filter_mean=jnp.stack([filt_mean_t, next_means - b_next[:, None]]),
+            filter_cov=jnp.stack([filt_cov_t, next_covs]),
+            filter_discrete_state_prob=jnp.stack([filt_prob_t, next_probs]),
+            process_cov=process_covs,
+            continuous_transition_matrix=transition_matrices,
+            discrete_state_transition_matrix=discrete_transition_matrix,
+        )
+        step = tuple(o[0] for o in out)
+        state_means_t, state_covs_t, probs_t = step[5], step[6], step[2]
+        new_carry = (
+            state_means_t,
+            state_covs_t,
+            _stabilize_probability_vector_preserving_zeros(probs_t),
+        )
+        return new_carry, step
+
+    init_carry = (
+        filtered_values[-1],
+        filtered_covs[-1],
+        discrete_state_probs[-1],
+    )
+    _, steps = jax.lax.scan(
+        _backward_step,
+        init_carry,
+        (
+            filtered_values[:-1],
+            filtered_covs[:-1],
+            discrete_state_probs[:-1],
+            control_input[1:],
+        ),
+        reverse=True,
+    )
+    (
+        overall_mean,
+        overall_cov,
+        disc_probs,
+        joint_probs,
+        overall_cross_cov,
+        state_means,
+        state_covs,
+        pair_cross_covs,
+        pair_means,
+    ) = steps
+
+    last_mean, last_cov = collapse_gaussian_mixture(
+        filtered_values[-1], filtered_covs[-1], discrete_state_probs[-1]
+    )
+    return (
+        jnp.concatenate([overall_mean, last_mean[None]], axis=0),
+        jnp.concatenate([overall_cov, last_cov[None]], axis=0),
+        jnp.concatenate([disc_probs, discrete_state_probs[-1:]], axis=0),
+        joint_probs,
+        overall_cross_cov,
+        jnp.concatenate([state_means, filtered_values[-1:]], axis=0),
+        jnp.concatenate([state_covs, filtered_covs[-1:]], axis=0),
+        pair_cross_covs,
+        pair_means,
+    )
+
+
 def _between_state_variance(means: Array, probs: Array) -> Array:
     """Between-state term ``Var_s(E[x | s])`` of the law of total variance.
 
@@ -627,6 +748,10 @@ class SwitchingChoiceModel(SGDFittableMixin):
             self.obs_weights_ = jnp.zeros((n_options, n_obs_covariates))
         else:
             self.obs_weights_ = None
+
+        # Covariates bound by fit() / fit_sgd()
+        self._covariates: Array | None = None
+        self._obs_covariates: Array | None = None
 
         # Fitted state
         self.converged_: bool | None = None
@@ -862,23 +987,26 @@ class SwitchingChoiceModel(SGDFittableMixin):
         return log_likelihoods
 
     def _run_smoother(self, filter_result):
-        """Run the switching Kalman smoother on filter output."""
-        from state_space_practice.switching_kalman import switching_kalman_smoother
+        """Run the control-aware GPB1 switching smoother on filter output.
 
+        The known dynamics input ``B @ u_t`` enters the smoother's one-step
+        predictions (see :func:`switching_choice_smoother`), so the smoothed
+        means stay consistent with the filter when covariates are present.
+        """
         k_free = self.n_options - 1
-        return switching_kalman_smoother(
-            filter_mean=filter_result.filtered_values,
-            filter_cov=filter_result.filtered_covs,
-            filter_discrete_state_prob=filter_result.discrete_state_probs,
-            process_cov=jnp.stack(
-                [q * jnp.eye(k_free) for q in self.process_noises_],
-                axis=-1,
-            ),
-            continuous_transition_matrix=jnp.stack(
-                [d * jnp.eye(k_free) for d in self.decays_],
-                axis=-1,
-            ),
-            discrete_state_transition_matrix=self.discrete_transition_matrix_,
+        n_trials = filter_result.filtered_values.shape[0]
+        if self.input_gain_ is not None and self._covariates is not None:
+            control_input = self._covariates @ self.input_gain_.T  # (T, K-1)
+        else:
+            control_input = jnp.zeros((n_trials, k_free))
+        return switching_choice_smoother(
+            filter_result.filtered_values,
+            filter_result.filtered_covs,
+            filter_result.discrete_state_probs,
+            self.process_noises_[None, None, :] * jnp.eye(k_free)[:, :, None],
+            self.decays_[None, None, :] * jnp.eye(k_free)[:, :, None],
+            self.discrete_transition_matrix_,
+            control_input,
         )
 
     def _m_step(self, choices, filter_result, smoother_result):

@@ -15,6 +15,7 @@ from state_space_practice.switching_choice import (
     _softmax_update_per_state_pair,
     simulate_switching_choice_data,
     switching_choice_filter,
+    switching_choice_smoother,
 )
 
 
@@ -379,6 +380,104 @@ class TestSwitchingChoiceFilter:
         first_half = result.discrete_state_probs[:25].mean(axis=0)
         second_half = result.discrete_state_probs[75:].mean(axis=0)
         assert not jnp.allclose(first_half, second_half, atol=0.05)
+
+
+class TestSwitchingChoiceSmootherControlInput:
+    """The smoother must see the dynamics input ``B @ u_t`` the filter used.
+
+    Regression: ``SwitchingChoiceModel._run_smoother`` called
+    ``switching_kalman_smoother``, whose backward step predicts ``A_k m_t``
+    without the control input, so with covariates every smoothed mean was
+    compared against a prediction missing ``B u_{t+1}`` (a 3.2-unit error on
+    the data below). With identical per-state parameters the switching
+    smoother must reduce exactly to the control-aware covariate smoother.
+    """
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def data(cls):
+        from state_space_practice.covariate_choice import simulate_rl_choice_data
+
+        return simulate_rl_choice_data(
+            n_trials=40, n_options=3, seed=3, inverse_temperature=1.0
+        )
+
+    def _model(self, n_covariates=2):
+        return SwitchingChoiceModel(
+            n_options=3,
+            n_discrete_states=2,
+            n_covariates=n_covariates,
+            init_inverse_temperatures=[1.5, 1.5],
+            init_process_noises=[0.05, 0.05],
+            init_decays=[0.9, 0.9],
+        )
+
+    def test_identical_states_match_covariate_smoother(self, data):
+        from state_space_practice.covariate_choice import covariate_choice_smoother
+
+        B = 0.5 * jnp.eye(2)
+        model = self._model()
+        model.input_gain_ = B
+        model._covariates = data.covariates
+        smooth = model._run_smoother(model._run_filter(data.choices, data.covariates))
+        ref = covariate_choice_smoother(
+            data.choices,
+            3,
+            covariates=data.covariates,
+            input_gain=B,
+            process_noise=0.05,
+            inverse_temperature=1.5,
+            decay=0.9,
+        )
+        np.testing.assert_allclose(smooth[0], ref.smoothed_values, atol=1e-10)
+        np.testing.assert_allclose(smooth[1], ref.smoothed_covariances, atol=1e-10)
+        np.testing.assert_allclose(smooth[4], ref.smoother_cross_cov, atol=1e-10)
+        for s in range(2):
+            np.testing.assert_allclose(
+                smooth[5][..., s], ref.smoothed_values, atol=1e-10
+            )
+        # Guard: the control input is large enough that ignoring it (the old
+        # behaviour, reproduced by a zero control input) is far off.
+        filt = model._run_filter(data.choices, data.covariates)
+        k = 2
+        stale = switching_choice_smoother(
+            filt.filtered_values,
+            filt.filtered_covs,
+            filt.discrete_state_probs,
+            0.05 * jnp.stack([jnp.eye(k)] * 2, axis=-1),
+            0.9 * jnp.stack([jnp.eye(k)] * 2, axis=-1),
+            model.discrete_transition_matrix_,
+            jnp.zeros((40, k)),
+        )
+        assert float(jnp.max(jnp.abs(stale[0] - ref.smoothed_values))) > 1.0
+
+    def test_zero_control_matches_library_smoother(self, data):
+        from state_space_practice.switching_kalman import switching_kalman_smoother
+
+        model = SwitchingChoiceModel(
+            n_options=3,
+            n_discrete_states=2,
+            init_inverse_temperatures=[0.5, 3.0],
+            init_process_noises=[0.01, 0.2],
+            init_decays=[1.0, 0.8],
+        )
+        filt = model._run_filter(data.choices)
+        ours = model._run_smoother(filt)
+        eye = jnp.eye(2)
+        lib = switching_kalman_smoother(
+            filt.filtered_values,
+            filt.filtered_covs,
+            filt.discrete_state_probs,
+            jnp.stack([q * eye for q in model.process_noises_], axis=-1),
+            jnp.stack([a * eye for a in model.decays_], axis=-1),
+            model.discrete_transition_matrix_,
+        )
+        assert len(ours) == len(lib)
+        for a, b in zip(ours, lib):
+            np.testing.assert_allclose(a, b, atol=1e-12)
+        # Guard: the per-state parameters differ, so the discrete smoother
+        # actually moved away from uniform.
+        assert float(jnp.max(jnp.abs(ours[2] - 0.5))) > 0.05
 
 
 class TestSwitchingChoiceInitialDiscretePrior:
