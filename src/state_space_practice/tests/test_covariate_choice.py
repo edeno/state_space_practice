@@ -1482,3 +1482,86 @@ class TestCovariateUncertaintySummaries:
             m_obs.surprise_,
             atol=1e-3,
         ), "obs_covariates should change surprise_"
+
+
+class TestInputGainNeverRewardedOption:
+    """Why one ``input_gain_`` column stays exactly 0 after ``fit_sgd``.
+
+    With ``simulate_rl_choice_data`` at its defaults (``inverse_temperature=2``,
+    ``B = 0.5 I``, ``decay=0.95``) the simulated agent locks onto one option
+    within a few trials; the other non-reference option is chosen at most once
+    and never rewarded (seed 42: choice counts [1, 0, 199]). Its reward
+    covariate column is therefore identically zero, ``B[:, k]`` multiplies
+    only zeros, and the marginal log-likelihood does not depend on it: the
+    gradient is exactly zero and Adam never moves it from its zero start. The
+    same zero column makes the EM Gram matrix singular in that direction, and
+    ``m_step_input_gain`` returns exactly 0 there. This is the correct answer
+    for an unidentified parameter, not a parametrisation / transform bug: as
+    soon as the column carries any signal the gradient is nonzero and the gain
+    moves.
+    """
+
+    @staticmethod
+    def _loss_grad(choices, covariates):
+        model = CovariateChoiceModel(n_options=3, n_covariates=2)
+        choices_arr = model._bind_covariates(choices, covariates, None, "fit_sgd")
+        params, _ = model._build_param_spec()
+        return jax.grad(model._sgd_loss_fn)(params, choices_arr)["input_gain"]
+
+    @pytest.mark.parametrize("seed", [42, 1, 7])
+    def test_zero_covariate_column_has_exactly_zero_gradient(self, seed):
+        data = simulate_rl_choice_data(n_trials=200, n_options=3, seed=seed)
+        cov = np.asarray(data.covariates)
+        col_sums = cov.sum(axis=0)
+        assert (col_sums == 0).sum() == 1, (
+            f"seed {seed}: expected exactly one never-rewarded option, "
+            f"column sums {col_sums}"
+        )
+        dead = int(np.flatnonzero(col_sums == 0)[0])
+        live = 1 - dead
+        grad = np.asarray(self._loss_grad(data.choices, data.covariates))
+        np.testing.assert_array_equal(grad[:, dead], 0.0)
+        assert np.all(np.abs(grad[:, live]) > 1e-3), grad
+
+    def test_injected_signal_gives_nonzero_gradient(self):
+        data = simulate_rl_choice_data(n_trials=200, n_options=3, seed=42)
+        cov = np.asarray(data.covariates).copy()
+        assert cov[:, 0].sum() == 0
+        rng = np.random.default_rng(0)
+        cov[1:, 0] = (rng.random(199) < 0.3).astype(float)
+        grad = np.asarray(self._loss_grad(data.choices, cov))
+        assert np.all(np.abs(grad[:, 0]) > 1e-3), grad
+
+    def test_em_m_step_zero_column_is_exactly_zero(self):
+        data = simulate_rl_choice_data(n_trials=200, n_options=3, seed=42)
+        rng = np.random.default_rng(1)
+        values = rng.normal(size=(200, 2)).cumsum(axis=0)
+        B_hat = np.asarray(m_step_input_gain(jnp.asarray(values), data.covariates))
+        assert np.all(np.isfinite(B_hat))
+        np.testing.assert_array_equal(B_hat[:, 0], 0.0)
+        assert np.all(np.abs(B_hat[:, 1]) > 0)
+
+    def test_fit_sgd_moves_gain_once_column_carries_signal(self):
+        # Simulate at beta=0.5 (no lock-in) so both options are chosen and
+        # rewarded, i.e. both covariate columns carry signal.
+        B_true = 0.5 * jnp.eye(2)
+        data = simulate_rl_choice_data(
+            n_trials=200,
+            n_options=3,
+            input_gain=B_true,
+            seed=42,
+            inverse_temperature=0.5,
+        )
+        cov = np.asarray(data.covariates)
+        assert np.all(cov.sum(axis=0) > 5), cov.sum(axis=0)
+        model = CovariateChoiceModel(n_options=3, n_covariates=2)
+        model.fit_sgd(data.choices, covariates=cov, num_steps=60)
+        B = np.asarray(model.input_gain_)
+        assert np.max(np.abs(B[:, 0])) > 0.05, B
+
+        # Same data with column 0 zeroed: that column must stay exactly 0.
+        cov_dead = cov.copy()
+        cov_dead[:, 0] = 0.0
+        model_dead = CovariateChoiceModel(n_options=3, n_covariates=2)
+        model_dead.fit_sgd(data.choices, covariates=cov_dead, num_steps=60)
+        np.testing.assert_array_equal(np.asarray(model_dead.input_gain_)[:, 0], 0.0)
