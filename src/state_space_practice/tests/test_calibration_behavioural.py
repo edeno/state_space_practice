@@ -161,7 +161,6 @@ def _smith_smooth(y, sigma2, init_var):
         init_var,
         sigma2,
         jnp.asarray(0.0),
-        differentiable=False,
     )
     sm, sv, _, _ = smith_learning_smoother(out[1], out[2], out[3], out[4])
     return sm, sv

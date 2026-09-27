@@ -479,11 +479,10 @@ def smith_learning_filter(
         init_var.astype(dtype),
         sigma_squared_epsilon.astype(dtype),
         mu.astype(dtype),
-        differentiable=differentiable,
     )
 
 
-@partial(jax.jit, static_argnames=["differentiable"])
+@jax.jit
 def _smith_learning_filter_impl(
     n_correct_responses: Array,
     max_correct_arr: Array,
@@ -491,8 +490,6 @@ def _smith_learning_filter_impl(
     init_var: Array,
     sigma_squared_epsilon: Array,
     mu: Array,
-    *,
-    differentiable: bool = False,
 ) -> tuple[Array, Array, Array, Array, Array]:
     """JIT-compiled inner implementation of the Smith learning filter."""
 
