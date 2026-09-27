@@ -1638,6 +1638,49 @@ class TestRelativeInitCovClip:
         np.testing.assert_allclose(clipped, 2e-4 * eye, rtol=1e-10)
         assert "init_cov eigenvalues clipped" in caplog.text
 
+    def test_warm_restarts_keep_the_initial_bounds(
+        self, com_pp_params, monkeypatch
+    ) -> None:
+        """``fit(skip_init=True)`` keeps the latent scale recorded by the
+        initialising fit, so a clipped init_cov cannot raise its own ceiling."""
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        n, k = model.n_latent, model.n_discrete_states
+        spikes = jnp.zeros((20, model.n_neurons))
+
+        # A numerically diffuse smoother at t=0: every M-step proposes an
+        # init_cov 10x the current one, which the clip must cap.
+        def diffuse_m_step_dynamics() -> None:
+            model.init_cov = model._regularize_init_cov_update(10.0 * model.init_cov)
+
+        monkeypatch.setattr(model, "_e_step", lambda _spikes: jnp.asarray(0.0))
+        monkeypatch.setattr(model, "_m_step_dynamics", diffuse_m_step_dynamics)
+        monkeypatch.setattr(model, "_m_step_spikes", lambda _spikes: None)
+        monkeypatch.setattr(model, "_warm_initialize_states", lambda _spikes: None)
+
+        model.fit(spikes, max_iter=1)
+        reference_scale = model._init_cov_latent_scale()
+        cap = 2.0 * reference_scale
+        # Guard: the first fit already hit the ceiling.
+        np.testing.assert_allclose(
+            model.init_cov, cap * jnp.stack([jnp.eye(n)] * k, -1)
+        )
+
+        for _ in range(3):
+            model.fit(spikes, max_iter=1, skip_init=True)
+            assert model._init_cov_latent_scale() == reference_scale
+            max_eig = float(jnp.max(jnp.linalg.eigvalsh(model.init_cov[..., 0])))
+            np.testing.assert_allclose(max_eig, cap, rtol=1e-12)
+
+    def test_non_finite_trace_warns_on_fallback_scale(
+        self, com_pp_params, caplog
+    ) -> None:
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        model.init_cov = model.init_cov.at[0, 0, 0].set(jnp.nan)
+        with caplog.at_level("WARNING"):
+            assert model._record_init_cov_latent_scale() == 1.0
+        assert "latent scale" in caplog.text
+
     def test_default_identity_init_cov_keeps_the_absolute_bounds(
         self, com_pp_params
     ) -> None:

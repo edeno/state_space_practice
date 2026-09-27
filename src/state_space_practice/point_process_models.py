@@ -387,8 +387,10 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         """Latent scale the init_cov clip bounds are relative to.
 
         The mean per-dimension variance ``trace(init_cov) / n_latent`` of the
-        init_cov the current fit started from (recorded by ``_fit_single``);
-        falls back to the current init_cov when no fit has recorded it.
+        init_cov recorded when parameters were last initialised (a
+        ``fit`` without ``skip_init``). Warm restarts (``skip_init=True``)
+        keep that scale, so a clipped init_cov cannot raise its own ceiling.
+        When nothing has been recorded yet, the current init_cov is recorded.
         """
         scale = getattr(self, "_init_cov_reference_scale", None)
         if scale is None:
@@ -400,6 +402,11 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         traces = jnp.trace(jnp.asarray(self.init_cov), axis1=0, axis2=1)
         scale = float(jnp.mean(traces)) / self.n_latent
         if not (scale > 0.0 and jnp.isfinite(scale)):
+            logger.warning(
+                "init_cov has a non-finite or non-positive mean trace (%s); "
+                "using latent scale 1.0 for the M-step init_cov clip bounds.",
+                scale,
+            )
             scale = 1.0
         self._init_cov_reference_scale = scale
         return scale
@@ -595,7 +602,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
             self.smoother_next_pair_cond_means = None
             self._m_step_spikes(spikes)
         else:
-            self._record_init_cov_latent_scale()
+            self._init_cov_latent_scale()
 
         def _m_step() -> None:
             self._m_step_dynamics()
