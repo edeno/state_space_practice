@@ -114,18 +114,21 @@ def _assert_matches_oracle(model: dict, rtol: float):
     """Filter, smoother, x_0 smoothing and the log-likelihood vs the oracle."""
     oracle = _oracle(model)
     mean_atol = rtol * _mean_scale(oracle)
-    cov_atol = rtol * _cov_scale(model)
+
+    def cov_close(actual, desired) -> None:
+        # relative to the compared array's own scale (posterior covariances
+        # are ~1e-7 when R ~ 1e-6), floored at the oracle's round-off level.
+        atol = max(rtol * float(np.max(np.abs(desired))), 1e-13 * _cov_scale(model))
+        np.testing.assert_allclose(actual, desired, rtol=rtol, atol=atol)
 
     f_mean, f_cov, f_ll = kalman_filter(*_args(model))
     s_mean, s_cov, s_cross, s_ll = kalman_smoother(*_args(model))
 
     np.testing.assert_allclose(f_mean, oracle.filtered_mean, rtol=rtol, atol=mean_atol)
-    np.testing.assert_allclose(f_cov, oracle.filtered_cov, rtol=rtol, atol=cov_atol)
+    cov_close(f_cov, oracle.filtered_cov)
     np.testing.assert_allclose(s_mean, oracle.smoothed_mean, rtol=rtol, atol=mean_atol)
-    np.testing.assert_allclose(s_cov, oracle.smoothed_cov, rtol=rtol, atol=cov_atol)
-    np.testing.assert_allclose(
-        s_cross, oracle.smoothed_cross_cov, rtol=rtol, atol=cov_atol
-    )
+    cov_close(s_cov, oracle.smoothed_cov)
+    cov_close(s_cross, oracle.smoothed_cross_cov)
     # log-likelihood: an O(T) sum of O(1) terms; compare absolutely too.
     np.testing.assert_allclose(f_ll, oracle.log_likelihood, rtol=rtol, atol=rtol)
     np.testing.assert_allclose(s_ll, oracle.log_likelihood, rtol=rtol, atol=rtol)
@@ -140,8 +143,8 @@ def _assert_matches_oracle(model: dict, rtol: float):
     np.testing.assert_allclose(
         m00, oracle.init_smoothed_mean, rtol=rtol, atol=mean_atol
     )
-    np.testing.assert_allclose(P00, oracle.init_smoothed_cov, rtol=rtol, atol=cov_atol)
-    np.testing.assert_allclose(C01, oracle.init_cross_cov, rtol=rtol, atol=cov_atol)
+    cov_close(P00, oracle.init_smoothed_cov)
+    cov_close(C01, oracle.init_cross_cov)
     m00_b, P00_b = smooth_initial_state(prior, s_mean[0], s_cov[0])
     np.testing.assert_array_equal(m00_b, m00)
     np.testing.assert_array_equal(P00_b, P00)
