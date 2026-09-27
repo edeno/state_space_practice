@@ -1614,6 +1614,13 @@ class TestAdaptiveInflation:
         # Covariance should not shrink (alpha clipped at 1)
         assert np.all(infl_trace >= base_trace - 1e-6)
 
+    # The escape heuristic (filtered mean beyond the rate-map extent) fires on
+    # a single transient bin of this synthetic data on some CPUs and not on
+    # others (round-off in the inflated filter), so it is not part of what this
+    # test checks; finiteness and the filter/smoother trace ratio are.
+    @pytest.mark.filterwarnings(
+        "ignore:position_decoder. filtered mean left the rate-map extent"
+    )
     def test_smoother_with_inflation_produces_valid_output(self, rate_maps_and_data):
         """Smoother with inflation produces finite, correctly-shaped output."""
         rm, spikes, position, dt = rate_maps_and_data
