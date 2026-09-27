@@ -1757,239 +1757,149 @@ from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 
+def _binary_outcomes(lengths: tuple[int, ...]) -> st.SearchStrategy[jax.Array]:
+    """Arbitrary 0/1 outcome sequences whose length is one of ``lengths``.
+
+    The filter and smoother are jitted, so every distinct length compiles
+    them again; a couple of fixed lengths keeps each example cheap while the
+    drawn outcomes (including all-0 / all-1 runs) explore the input space.
+    """
+    return st.sampled_from(lengths).flatmap(
+        lambda n: st.lists(st.integers(0, 1), min_size=n, max_size=n).map(jnp.asarray)
+    )
+
+
+def _filter_and_smooth(outcomes: jax.Array):
+    """Run the filter then the smoother on ``outcomes``.
+
+    Returns
+    -------
+    filtered : tuple
+        ``smith_learning_filter`` outputs (prob, mode, variance,
+        one_step_mode, one_step_variance), each of shape (n_trials,).
+    smoothed : tuple
+        ``smith_learning_smoother`` outputs (mode, variance, prob, gain).
+    """
+    filtered = smith_learning_filter(outcomes, max_possible_correct=1)
+    _, filter_mode, filter_var, one_step_mode, one_step_var = filtered
+    smoothed = smith_learning_smoother(
+        filter_mode, filter_var, one_step_mode, one_step_var
+    )
+    return filtered, smoothed
+
+
 class TestSmithLearningFilterProperties:
     """Property-based tests for smith_learning_filter."""
 
-    @given(st.integers(min_value=5, max_value=30))
-    @settings(max_examples=20, deadline=None)
-    def test_probability_always_in_bounds(self, n_trials: int) -> None:
+    @given(_binary_outcomes((8, 25)))
+    def test_probability_always_in_bounds(self, outcomes: jax.Array) -> None:
         """Probability of correct response should always be in [0, 1]."""
-        # Generate random binary outcomes
-        key = jax.random.PRNGKey(42)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
+        prob, _, _, _, _ = smith_learning_filter(outcomes, max_possible_correct=1)
+        assert jnp.all(prob >= 0.0)
+        assert jnp.all(prob <= 1.0)
 
-        try:
-            prob, _, _, _, _ = smith_learning_filter(
-                jnp.array(outcomes), max_possible_correct=1
-            )
-            assert jnp.all(prob >= 0.0)
-            assert jnp.all(prob <= 1.0)
-        except Exception:
-            pass  # Skip if optimization fails
-
-    @given(st.integers(min_value=5, max_value=30))
-    @settings(max_examples=20, deadline=None)
-    def test_variance_always_positive(self, n_trials: int) -> None:
+    @given(_binary_outcomes((8, 25)))
+    def test_variance_always_positive(self, outcomes: jax.Array) -> None:
         """Variance should always be positive."""
-        key = jax.random.PRNGKey(123)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
-
-        try:
-            _, _, variance, _, one_step_var = smith_learning_filter(
-                jnp.array(outcomes), max_possible_correct=1
-            )
-            assert jnp.all(variance > 0)
-            assert jnp.all(one_step_var > 0)
-        except Exception:
-            pass  # Skip if optimization fails
+        _, _, variance, _, one_step_var = smith_learning_filter(
+            outcomes, max_possible_correct=1
+        )
+        assert jnp.all(variance > 0)
+        assert jnp.all(one_step_var > 0)
 
     @given(
         st.floats(min_value=0.01, max_value=0.99, allow_nan=False),
         st.floats(min_value=0.05, max_value=0.5, allow_nan=False),
     )
-    @settings(max_examples=20, deadline=None)
     def test_outputs_finite_for_valid_params(
         self, prob_chance: float, sigma: float
     ) -> None:
         """Outputs should be finite for valid parameter combinations."""
         outcomes = jnp.array([0, 1, 1, 0, 1, 1, 1, 0, 1, 1])
-
-        try:
-            prob, mode, variance, _, _ = smith_learning_filter(
-                outcomes,
-                prob_correct_by_chance=prob_chance,
-                sigma_epsilon=sigma,
-                max_possible_correct=1,
-            )
-            assert jnp.all(jnp.isfinite(prob))
-            assert jnp.all(jnp.isfinite(mode))
-            assert jnp.all(jnp.isfinite(variance))
-        except Exception:
-            pass  # Skip if optimization fails
+        prob, mode, variance, _, _ = smith_learning_filter(
+            outcomes,
+            prob_correct_by_chance=prob_chance,
+            sigma_epsilon=sigma,
+            max_possible_correct=1,
+        )
+        assert jnp.all(jnp.isfinite(prob))
+        assert jnp.all(jnp.isfinite(mode))
+        assert jnp.all(jnp.isfinite(variance))
 
 
 class TestSmithLearningSmootherProperties:
     """Property-based tests for smith_learning_smoother."""
 
-    @given(st.integers(min_value=5, max_value=30))
-    @settings(max_examples=20, deadline=None)
-    def test_smoother_probability_in_bounds(self, n_trials: int) -> None:
+    @given(_binary_outcomes((8, 25)))
+    def test_smoother_probability_in_bounds(self, outcomes: jax.Array) -> None:
         """Smoothed probability should be in [0, 1]."""
-        key = jax.random.PRNGKey(456)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
+        _, (_, _, smooth_prob, _) = _filter_and_smooth(outcomes)
+        assert jnp.all(smooth_prob >= 0.0)
+        assert jnp.all(smooth_prob <= 1.0)
 
-        try:
-            _, filter_mode, filter_var, one_step_mode, one_step_var = (
-                smith_learning_filter(jnp.array(outcomes), max_possible_correct=1)
-            )
-
-            _, _, smooth_prob, _ = smith_learning_smoother(
-                filter_mode, filter_var, one_step_mode, one_step_var
-            )
-
-            assert jnp.all(smooth_prob >= 0.0)
-            assert jnp.all(smooth_prob <= 1.0)
-        except Exception:
-            pass  # Skip if optimization fails
-
-    @given(st.integers(min_value=5, max_value=30))
-    @settings(max_examples=20, deadline=None)
-    def test_smoother_variance_non_negative(self, n_trials: int) -> None:
+    @given(_binary_outcomes((8, 25)))
+    def test_smoother_variance_non_negative(self, outcomes: jax.Array) -> None:
         """Smoothed variance should be non-negative."""
-        key = jax.random.PRNGKey(789)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
+        _, (_, smooth_var, _, _) = _filter_and_smooth(outcomes)
+        assert jnp.all(smooth_var >= 0.0)
 
-        try:
-            _, filter_mode, filter_var, one_step_mode, one_step_var = (
-                smith_learning_filter(jnp.array(outcomes), max_possible_correct=1)
-            )
-
-            _, smooth_var, _, _ = smith_learning_smoother(
-                filter_mode, filter_var, one_step_mode, one_step_var
-            )
-
-            assert jnp.all(smooth_var >= 0.0)
-        except Exception:
-            pass  # Skip if optimization fails
-
-    @given(st.integers(min_value=5, max_value=30))
-    @settings(max_examples=20, deadline=None)
-    def test_smoother_last_equals_filter_last(self, n_trials: int) -> None:
+    @given(_binary_outcomes((8, 25)))
+    def test_smoother_last_equals_filter_last(self, outcomes: jax.Array) -> None:
         """Last smoothed state should equal last filtered state."""
-        key = jax.random.PRNGKey(321)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
-
-        try:
-            _, filter_mode, filter_var, one_step_mode, one_step_var = (
-                smith_learning_filter(jnp.array(outcomes), max_possible_correct=1)
-            )
-
-            smooth_mode, smooth_var, _, _ = smith_learning_smoother(
-                filter_mode, filter_var, one_step_mode, one_step_var
-            )
-
-            np.testing.assert_allclose(smooth_mode[-1], filter_mode[-1], rtol=1e-5)
-            np.testing.assert_allclose(smooth_var[-1], filter_var[-1], rtol=1e-5)
-        except Exception:
-            pass  # Skip if optimization fails
+        filtered, (smooth_mode, smooth_var, _, _) = _filter_and_smooth(outcomes)
+        _, filter_mode, filter_var, _, _ = filtered
+        np.testing.assert_allclose(smooth_mode[-1], filter_mode[-1], rtol=1e-5)
+        np.testing.assert_allclose(smooth_var[-1], filter_var[-1], rtol=1e-5)
 
 
 class TestMaximizationStepProperties:
     """Property-based tests for the maximization step."""
 
-    @given(st.integers(min_value=10, max_value=50))
-    @settings(max_examples=15, deadline=None)
-    def test_estimated_sigma_positive(self, n_trials: int) -> None:
+    @given(_binary_outcomes((12, 40)))
+    def test_estimated_sigma_positive(self, outcomes: jax.Array) -> None:
         """Estimated sigma_epsilon should be positive."""
-        key = jax.random.PRNGKey(654)
-        outcomes = jax.random.bernoulli(key, 0.6, (n_trials,)).astype(int)
-
-        try:
-            _, filter_mode, filter_var, one_step_mode, one_step_var = (
-                smith_learning_filter(jnp.array(outcomes), max_possible_correct=1)
-            )
-
-            smooth_mode, smooth_var, _, smoother_gain = smith_learning_smoother(
-                filter_mode, filter_var, one_step_mode, one_step_var
-            )
-
-            sigma_est, _, _ = maximization_step(smooth_mode, smooth_var, smoother_gain)
-
-            assert sigma_est > 0
-        except Exception:
-            pass  # Skip if optimization fails
+        _, (smooth_mode, smooth_var, _, smoother_gain) = _filter_and_smooth(outcomes)
+        sigma_est, _, _ = maximization_step(smooth_mode, smooth_var, smoother_gain)
+        assert sigma_est > 0
 
 
 class TestTrialComparisonProperties:
     """Property-based tests for trial comparison functions."""
 
-    @given(st.integers(min_value=5, max_value=20))
-    @settings(max_examples=15, deadline=None)
-    def test_cross_covariance_symmetry(self, n_trials: int) -> None:
+    @given(_binary_outcomes((6, 15)))
+    def test_cross_covariance_symmetry(self, outcomes: jax.Array) -> None:
         """Cross-covariance matrix should be symmetric."""
-        key = jax.random.PRNGKey(111)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
+        _, (_, smooth_var, _, smoother_gain) = _filter_and_smooth(outcomes)
+        cross_cov = compute_cross_covariance_matrix(smooth_var, smoother_gain)
+        np.testing.assert_allclose(cross_cov, cross_cov.T, rtol=1e-5, atol=1e-10)
 
-        try:
-            _, filter_mode, filter_var, one_step_mode, one_step_var = (
-                smith_learning_filter(jnp.array(outcomes), max_possible_correct=1)
-            )
-
-            _, smooth_var, _, smoother_gain = smith_learning_smoother(
-                filter_mode, filter_var, one_step_mode, one_step_var
-            )
-
-            cross_cov = compute_cross_covariance_matrix(smooth_var, smoother_gain)
-
-            np.testing.assert_allclose(cross_cov, cross_cov.T, rtol=1e-5, atol=1e-10)
-        except Exception:
-            pass  # Skip if optimization fails
-
-    @given(st.integers(min_value=5, max_value=15))
-    @settings(max_examples=10, deadline=None)
-    def test_comparison_matrix_diagonal_is_half(self, n_trials: int) -> None:
+    @given(_binary_outcomes((6, 15)))
+    def test_comparison_matrix_diagonal_is_half(self, outcomes: jax.Array) -> None:
         """Diagonal of comparison matrix should be 0.5 (comparing trial to itself)."""
-        key = jax.random.PRNGKey(222)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
+        _, (smooth_mode, smooth_var, _, smoother_gain) = _filter_and_smooth(outcomes)
+        comp_matrix = compute_trial_comparison_matrix(
+            key=jax.random.PRNGKey(42),
+            smoothed_learning_state_mode=smooth_mode,
+            smoothed_learning_state_variance=smooth_var,
+            smoother_gain=smoother_gain,
+        )
+        np.testing.assert_allclose(jnp.diag(comp_matrix), 0.5, rtol=1e-3)
 
-        try:
-            _, filter_mode, filter_var, one_step_mode, one_step_var = (
-                smith_learning_filter(jnp.array(outcomes), max_possible_correct=1)
-            )
-
-            smooth_mode, smooth_var, _, smoother_gain = smith_learning_smoother(
-                filter_mode, filter_var, one_step_mode, one_step_var
-            )
-
-            comp_matrix = compute_trial_comparison_matrix(
-                key=jax.random.PRNGKey(42),
-                smoothed_learning_state_mode=smooth_mode,
-                smoothed_learning_state_variance=smooth_var,
-                smoother_gain=smoother_gain,
-            )
-
-            diagonal = jnp.diag(comp_matrix)
-            np.testing.assert_allclose(diagonal, 0.5, rtol=1e-3)
-        except Exception:
-            pass  # Skip if optimization fails
-
-    @given(st.integers(min_value=5, max_value=15))
-    @settings(max_examples=10, deadline=None)
-    def test_comparison_probabilities_in_bounds(self, n_trials: int) -> None:
-        """All comparison probabilities should be in [0, 1]."""
-        key = jax.random.PRNGKey(333)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
-
-        try:
-            _, filter_mode, filter_var, one_step_mode, one_step_var = (
-                smith_learning_filter(jnp.array(outcomes), max_possible_correct=1)
-            )
-
-            smooth_mode, smooth_var, _, smoother_gain = smith_learning_smoother(
-                filter_mode, filter_var, one_step_mode, one_step_var
-            )
-
-            comp_matrix = compute_trial_comparison_matrix(
-                key=jax.random.PRNGKey(42),
-                smoothed_learning_state_mode=smooth_mode,
-                smoothed_learning_state_variance=smooth_var,
-                smoother_gain=smoother_gain,
-            )
-
-            assert jnp.all(comp_matrix >= 0.0)
-            assert jnp.all(comp_matrix <= 1.0)
-        except Exception:
-            pass  # Skip if optimization fails
+    @given(_binary_outcomes((6, 15)))
+    def test_comparison_probabilities_in_bounds(self, outcomes: jax.Array) -> None:
+        """Comparison probabilities (upper triangle) are in [0, 1]; the
+        lower triangle is NaN as documented."""
+        _, (smooth_mode, smooth_var, _, smoother_gain) = _filter_and_smooth(outcomes)
+        comp_matrix = compute_trial_comparison_matrix(
+            key=jax.random.PRNGKey(42),
+            smoothed_learning_state_mode=smooth_mode,
+            smoothed_learning_state_variance=smooth_var,
+            smoother_gain=smoother_gain,
+        )
+        upper = comp_matrix[jnp.triu_indices(len(outcomes))]
+        assert jnp.all(upper >= 0.0)
+        assert jnp.all(upper <= 1.0)
+        assert jnp.all(jnp.isnan(comp_matrix[jnp.tril_indices(len(outcomes), k=-1)]))
 
 
 class TestSimulateLearningDataProperties:
