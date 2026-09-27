@@ -16,6 +16,8 @@ from state_space_practice.utils import (
     make_discrete_transition_matrix,
     project_psd,
     project_psd_relative,
+    psd_cholesky,
+    psd_logdet,
     psd_solve,
     relative_psd_floor,
     safe_log,
@@ -195,10 +197,9 @@ class TestLinearAlgebraUtilities:
     def test_psd_solve_relative_boost_scales_with_max_diag(self) -> None:
         """psd_solve's relative_boost must scale with max|diag(A)|.
 
-        For a large-scale matrix (max_diag ~ 1e6), the absolute
-        diagonal_boost=1e-9 is vastly smaller than max|diag|, so the
-        relative component dominates and the effective shift should be
-        on the order of ``relative_boost * max_diag``.
+        For a large-scale matrix (max_diag ~ 1e6) the effective shift is
+        ``relative_boost * max_diag`` (~1e-6 here), which must still
+        preserve the relative signal.
         """
         # max_diag ~ 1e6, well-conditioned otherwise
         A = jnp.array([[1.0e6, 100.0], [100.0, 5.0e5]])
@@ -220,10 +221,8 @@ class TestLinearAlgebraUtilities:
         )
 
     def test_psd_solve_small_scale_unchanged(self) -> None:
-        """On a small-scale well-conditioned matrix, the adaptive boost
-        should behave almost identically to the old absolute-only boost
-        (max_diag is O(1), so relative * max_diag ~ relative_boost,
-        which is still much smaller than the matrix eigenvalues)."""
+        """On an O(1) well-conditioned matrix the relative shift
+        (``1e-12 * max_diag``) is negligible against the eigenvalues."""
         A = jnp.array([[4.0, 1.0], [1.0, 3.0]])
         b = jnp.array([1.0, 2.0])
         x = psd_solve(A, b)
@@ -249,30 +248,71 @@ class TestLinearAlgebraUtilities:
     def test_psd_solve_relative_boost_zero_matches_old_behavior(self) -> None:
         """``relative_boost=0.0`` disables relative scaling entirely.
 
-        Documents the back-compat escape hatch: setting relative_boost to
-        zero reproduces the pre-adaptive (absolute-only) behavior. Used by
-        callers that need bit-for-bit reproducibility with older code.
+        With the default ``diagonal_boost=0.0`` only the ``sqrt(tiny)``
+        floor remains, so the solve is the plain Cholesky solve.
         """
         A = jnp.array([[4.0, 1.0], [1.0, 3.0]])
         b = jnp.array([1.0, 2.0])
         x_default = psd_solve(A, b)
         x_no_relative = psd_solve(A, b, relative_boost=0.0)
-        # On this small-scale well-conditioned matrix the two should agree
-        # to machine precision because the relative contribution is
-        # negligible vs the absolute floor (1e-12*4 << 1e-9).
+        # The default relative shift (1e-12 * 4) is negligible here.
         np.testing.assert_allclose(
-            np.asarray(x_default), np.asarray(x_no_relative), atol=1e-12
+            np.asarray(x_default), np.asarray(x_no_relative), atol=1e-11
+        )
+        np.testing.assert_allclose(
+            np.asarray(x_no_relative),
+            np.linalg.solve(np.asarray(A), np.asarray(b)),
+            rtol=1e-14,
         )
 
-    def test_psd_solve_zero_matrix_falls_back_to_absolute_boost(self) -> None:
-        """All-zero matrix: ``max_diag=0``, so effective boost equals the
-        absolute diagonal_boost. The solver should produce a finite
-        output (the diagonal boost is the only thing regularizing the
-        otherwise-singular system)."""
+    def test_psd_solve_zero_matrix_falls_back_to_tiny_floor(self) -> None:
+        """All-zero matrix: ``max_diag=0``, so the relative shift vanishes
+        and only the ``sqrt(tiny)`` floor regularizes the otherwise-singular
+        system. The solver must still produce a finite output."""
         A = jnp.zeros((3, 3))
         b = jnp.array([1.0, 2.0, 3.0])
         x = psd_solve(A, b)
         assert jnp.all(jnp.isfinite(x))
+
+    @pytest.mark.parametrize("scale", [1e-10, 1e-6, 1e6])
+    def test_default_shift_is_scale_equivariant(self, scale) -> None:
+        """psd_solve(s A, b) = psd_solve(A, b) / s and logdet(s A) =
+        logdet(A) + n log s: the default shift is relative to the scale."""
+        rng = np.random.default_rng(0)
+        m = rng.normal(size=(5, 3))
+        A = jnp.asarray(m @ m.T + 1e-3 * np.eye(5))  # eigenvalues ~1e-3 .. 10
+        b = jnp.asarray(rng.normal(size=5))
+        x = psd_solve(A, b)
+        np.testing.assert_allclose(psd_solve(scale * A, b), x / scale, rtol=1e-11)
+        logdet = psd_logdet(psd_cholesky(A))
+        np.testing.assert_allclose(
+            psd_logdet(psd_cholesky(scale * A)),
+            logdet + 5 * np.log(scale),
+            rtol=1e-12,
+        )
+        if scale < 1.0:
+            # Guard: an absolute shift (the former 1e-9 default) is not
+            # equivariant once the matrix is small.
+            x_abs = psd_solve(scale * A, b, diagonal_boost=1e-9)
+            assert not np.allclose(np.asarray(x_abs) * scale, np.asarray(x), rtol=1e-3)
+
+    def test_explicit_absolute_boost_is_still_honoured(self) -> None:
+        """Callers that pass ``diagonal_boost`` keep an absolute floor."""
+        A = jnp.eye(2) * 1e-6
+        b = jnp.ones(2)
+        np.testing.assert_allclose(psd_solve(A, b), 1e6 * np.ones(2), rtol=1e-10)
+        np.testing.assert_allclose(
+            psd_solve(A, b, diagonal_boost=1e-6), 0.5e6 * np.ones(2), rtol=1e-10
+        )
+
+    def test_float32_default_shift_is_machine_epsilon(self) -> None:
+        """In float32 a 1e-12 relative shift rounds away; the default uses
+        float32 epsilon, which keeps a singular PSD matrix factorable."""
+        singular = jnp.ones((2, 2), dtype=jnp.float32)
+        assert np.isfinite(float(psd_logdet(psd_cholesky(singular))))
+        assert not np.isfinite(
+            float(psd_logdet(psd_cholesky(singular, relative_boost=1e-12)))
+        )
 
     def test_psd_solve_batched_boost_matches_vmap(self) -> None:
         """Direct batches should get the same per-matrix boost as vmapped calls."""

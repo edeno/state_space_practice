@@ -235,7 +235,7 @@ class TestCarriedLineSearch:
         family,
         max_newton_iter,
         line_search_beta=0.5,
-        diagonal_boost=1e-9,
+        diagonal_boost=0.0,
     ):
         """Recomputing Fisher scoring with the same 10-step Armijo backtracking."""
         identity = jnp.eye(one_step_mean.shape[0])
@@ -403,12 +403,15 @@ class TestZeroNewtonIterations:
     def _assert_prior_returned(self, post_mean, post_cov, ll, expected_ll):
         np.testing.assert_array_equal(np.asarray(post_mean), np.asarray(_MEAN))
         # The covariance is the prior precision inverted back, each inversion
-        # regularized by diagonal_boost=1e-9, so it matches to ~1e-9.
+        # regularized by the scale-relative 1e-12 * max|diag| Cholesky shift,
+        # so it matches to ~1e-11 (the former absolute 1e-9 shift left ~1e-9).
         np.testing.assert_allclose(
-            np.asarray(post_cov), np.asarray(_COV), rtol=1e-8, atol=1e-10
+            np.asarray(post_cov), np.asarray(_COV), rtol=1e-10, atol=1e-12
         )
         # Same regularization residue in 0.5 * (log|P_post| - log|P_prior|).
-        np.testing.assert_allclose(float(ll), float(expected_ll), rtol=1e-8, atol=1e-8)
+        np.testing.assert_allclose(
+            float(ll), float(expected_ll), rtol=1e-10, atol=1e-10
+        )
 
     def test_point_process_update_returns_prior(self):
         post_mean, post_cov, ll = _point_process_laplace_update(
