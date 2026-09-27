@@ -65,6 +65,15 @@ _DECODER_DIAGONAL_BOOST = 1e-9
 _MAX_INFLATION_MAX_ALPHA = 100.0
 _MAX_INFLATION_GAIN = 1.0e4
 
+# Fraction of time bins whose inflation factor may be clipped at max_alpha
+# before the filter warns (the same fraction as the line-search warning).
+# Occasional clipping is the cap doing its job on a surprising bin (a spike
+# far from the predicted field); the multiplier at its cap on more than one
+# bin in ten means inflation is saturated, and each capped bin multiplies the
+# predicted covariance by max_alpha, compounding faster than the spike
+# updates shrink it.
+_INFLATION_CAP_WARN_FRAC = 0.1
+
 
 @dataclass
 class AdaptiveInflationConfig:
@@ -82,7 +91,9 @@ class AdaptiveInflationConfig:
         Scaling factor *c* in alpha = clip(1 + c*(s - 1), 1, max_alpha).
         Larger values inflate more aggressively per unit excess score.
     max_alpha : float
-        Maximum multiplicative inflation factor.
+        Maximum multiplicative inflation factor. The filter warns when the
+        factor is clipped at ``max_alpha`` in more than 10% of the time bins
+        (a saturated multiplier compounds the covariance bin after bin).
     epsilon : float
         Regularisation added to Fisher diagonal for inversion stability.
     min_fisher_trace : float
@@ -978,7 +989,7 @@ def _run_filter_scan(
     max_newton_iter: int,
     use_kde: bool,
     inflate: bool,
-) -> tuple[Array, Array, Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array, Array, Array]:
     """JIT-compiled core: build closures, run forward filter scan.
 
     The float hyperparameters (``dt``, ``sigma_track``, ``grid_dx``,
@@ -1004,6 +1015,10 @@ def _run_filter_scan(
         not included: it is a pseudo-observation of ``x_t``, already
         reflected in the filtered moments, and folding it into the
         prediction would make the smoother treat it as dynamics.
+    n_capped_bins : Array
+        Number of time bins (int32 scalar) whose inflation factor was
+        clipped at ``max_alpha`` (always 0 without inflation or with
+        ``max_alpha == 1``).
     """
     _grid_xy, _spike_hists, _occ_hist, _sigma2, _baseline, _tau = kde_args
     _infl_gain, _infl_max, _infl_eps, _infl_min_ft = infl_args
@@ -1068,7 +1083,7 @@ def _run_filter_scan(
     _penalty_value_fn = _penalty_at
 
     def _step(carry, spike_t):
-        mean_prev, cov_prev, total_ll, n_failed_bins = carry
+        mean_prev, cov_prev, total_ll, n_failed_bins, n_capped_bins = carry
 
         # Prediction
         one_step_mean = A @ mean_prev
@@ -1105,11 +1120,12 @@ def _run_filter_scan(
             # already carries the epsilon ridge, so no absolute jitter on top
             # (a 1e-9 shift would be 0.1% of the default epsilon=1e-6).
             s_t = (score @ psd_solve(fisher_reg, score, diagonal_boost=0.0)) / _infl_d
-            alpha_t = jnp.where(
-                fisher_trace > _infl_min_ft,
-                jnp.clip(1.0 + _infl_gain * (s_t - 1.0), 1.0, _infl_max),
-                1.0,
-            )
+            raw_alpha = 1.0 + _infl_gain * (s_t - 1.0)
+            informative = fisher_trace > _infl_min_ft
+            alpha_t = jnp.where(informative, jnp.clip(raw_alpha, 1.0, _infl_max), 1.0)
+            # A cap of 1 disables inflation, so nothing saturates.
+            capped = informative & (raw_alpha > _infl_max) & (_infl_max > 1.0)
+            n_capped_bins = n_capped_bins + capped.astype(jnp.int32)
             one_step_cov = one_step_cov * alpha_t
             # Inflation modifies the dynamics (an effective process noise
             # (alpha - 1) A P A' + alpha Q), so the smoother must see it.
@@ -1130,29 +1146,37 @@ def _run_filter_scan(
 
         total_ll = total_ll + ll
         n_failed_bins = n_failed_bins + (n_failed > 0).astype(jnp.int32)
-        return (post_mean, post_cov, total_ll, n_failed_bins), (
+        return (post_mean, post_cov, total_ll, n_failed_bins, n_capped_bins), (
             post_mean,
             post_cov,
             dynamics_mean,
             dynamics_cov,
         )
 
+    zero_count = jnp.zeros((), dtype=jnp.int32)
     (
-        (_, _, marginal_ll, n_failed_bins),
+        (_, _, marginal_ll, n_failed_bins, n_capped_bins),
         (
             filtered_mean,
             filtered_cov,
             predicted_mean,
             predicted_cov,
         ),
-    ) = jax.lax.scan(_step, (*init_carry, jnp.zeros((), dtype=jnp.int32)), spikes_arr)
+    ) = jax.lax.scan(_step, (*init_carry, zero_count, zero_count), spikes_arr)
     _warn_line_search_failures(
         n_failed_bins,
         spikes_arr.shape[0],
         max_newton_iter,
         "position_decoder_filter",
     )
-    return filtered_mean, filtered_cov, marginal_ll, predicted_mean, predicted_cov
+    return (
+        filtered_mean,
+        filtered_cov,
+        marginal_ll,
+        predicted_mean,
+        predicted_cov,
+        n_capped_bins,
+    )
 
 
 def position_decoder_filter(
@@ -1422,6 +1446,7 @@ def _position_decoder_filter_with_predictions(
         marginal_ll,
         predicted_mean,
         predicted_cov,
+        n_capped_bins,
     ) = _run_filter_scan(
         spikes_arr,
         init_carry,
@@ -1444,6 +1469,20 @@ def _position_decoder_filter_with_predictions(
         use_kde=use_kde,
         inflate=inflate,
     )
+
+    n_bins = int(spikes_arr.shape[0])
+    capped_frac = int(n_capped_bins) / max(n_bins, 1)
+    if capped_frac > _INFLATION_CAP_WARN_FRAC:
+        warnings.warn(
+            f"position_decoder: the adaptive inflation factor was clipped at "
+            f"max_alpha at {int(n_capped_bins)}/{n_bins} time bins "
+            f"({100.0 * capped_frac:.0f}%). A multiplier pinned at its cap "
+            f"compounds the predicted covariance bin after bin; lower "
+            f"adaptive_inflation.gain or check q_pos and the rate maps.",
+            StateSpaceWarning,
+            # Two frames below the public filter/smoother entry point.
+            stacklevel=3,
+        )
 
     # Divergence sanity check: flag runaway escapes from the rate-map
     # extent.  Minor boundary overshoot during normal tracking (within

@@ -1,12 +1,14 @@
 """Tests for position decoding from spike trains via Laplace-EKF."""
 
 import copy
+import warnings
 
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from state_space_practice import position_decoder
+from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.kalman import rts_backward_scan
 from state_space_practice.point_process_kalman import (
     _point_process_laplace_update,
@@ -1590,17 +1592,47 @@ class TestAdaptiveInflation:
 
         # Guard: a looser cap must actually let inflation act, or the assertion
         # above would hold vacuously (a no-op inflation trivially matches base).
-        result_infl = position_decoder_filter(
+        # This gain saturates the multiplier, which the filter reports.
+        with pytest.warns(StateSpaceWarning, match="clipped at max_alpha"):
+            result_infl = position_decoder_filter(
+                spikes=spikes,
+                rate_maps=rm,
+                dt=dt,
+                q_pos=50.0,
+                include_velocity=False,
+                init_position=init_pos,
+                adaptive_inflation=AdaptiveInflationConfig(gain=100.0, max_alpha=1.5),
+            )
+        infl_trace = np.trace(np.array(result_infl.position_cov), axis1=1, axis2=2)
+        assert np.any(infl_trace > base_trace + 1e-9)
+
+    def test_warns_when_inflation_is_pinned_at_the_cap(self, rate_maps_and_data):
+        """A gain large enough to clip the multiplier at max_alpha on most
+        spiking bins (79/500 bins here) is reported; the default configuration
+        on the same data (21/500 bins at the cap) is not."""
+        rm, spikes, position, dt = rate_maps_and_data
+        kwargs = dict(
             spikes=spikes,
             rate_maps=rm,
             dt=dt,
             q_pos=50.0,
             include_velocity=False,
-            init_position=init_pos,
-            adaptive_inflation=AdaptiveInflationConfig(gain=100.0, max_alpha=1.5),
+            init_position=jnp.array(position[0]),
         )
-        infl_trace = np.trace(np.array(result_infl.position_cov), axis1=1, axis2=2)
-        assert np.any(infl_trace > base_trace + 1e-9)
+        # The saturated filter may also escape the rate-map extent; only the
+        # cap warning is asserted.
+        with pytest.warns(StateSpaceWarning) as record:
+            position_decoder_filter(
+                **kwargs,
+                adaptive_inflation=AdaptiveInflationConfig(gain=1e4, max_alpha=1.5),
+            )
+        assert any("clipped at max_alpha" in str(w.message) for w in record)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", StateSpaceWarning)
+            position_decoder_filter(
+                **kwargs, adaptive_inflation=AdaptiveInflationConfig()
+            )
 
     def test_rejects_non_psd_init_cov(self, rate_maps_and_data):
         """A symmetric-indefinite init_cov is rejected loudly, not run to NaN."""
