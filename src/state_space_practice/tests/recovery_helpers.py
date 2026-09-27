@@ -227,3 +227,185 @@ def simulate_poisson_spikes(
     log_rates = x_true @ C.T + d
     rates = jnp.exp(jnp.clip(log_rates, -5, 3)) * dt
     return jax.random.poisson(key, rates)
+
+
+# ---------------------------------------------------------------------------
+# Switching oscillator models (COM / CNM / DIM) at known parameters
+# ---------------------------------------------------------------------------
+
+OSCILLATOR_KINDS = ("COM", "CNM", "DIM")
+_OSC_FS = 100.0
+_OSC_FREQS = (6.0, 11.0)
+_OSC_DAMPING = (0.95, 0.9)
+_OSC_MEASUREMENT_VARIANCE = 0.2
+_OSC_SWITCHING_Z = ((0.97, 0.03), (0.05, 0.95))
+
+
+def oscillator_model_at_truth(
+    kind: str, n_discrete_states: int = 1, switching: bool = False, **kwargs
+):
+    """A two-oscillator COM / CNM / DIM model whose parameters *are* the truth.
+
+    The model's own ``A, H, Q, R`` stacks (after ``_initialize_parameters``)
+    define the generative process, so :func:`simulate_from_oscillator_model`
+    samples exactly the model the E-step assumes.
+
+    Parameters
+    ----------
+    kind : {"COM", "CNM", "DIM"}
+    n_discrete_states : int
+        1 or 2.
+    switching : bool
+        With two states, give them *distinct* state-dependent parameters (H for
+        COM, Q for CNM, A for DIM).  Otherwise both states share the
+        state-dependent parameter, so the model is a single regime written with
+        two labels.
+    **kwargs
+        Forwarded to the model constructor (e.g. ``use_reparameterized_mstep``).
+    """
+    from state_space_practice.oscillator_models import (
+        CommonOscillatorModel,
+        CorrelatedNoiseModel,
+        DirectedInfluenceModel,
+    )
+
+    S = n_discrete_states
+    common = {
+        "n_oscillators": 2,
+        "n_discrete_states": S,
+        "sampling_freq": _OSC_FS,
+        "freqs": jnp.array(_OSC_FREQS),
+        "damping_coef": jnp.array(_OSC_DAMPING),
+        "measurement_variance": _OSC_MEASUREMENT_VARIANCE,
+    }
+    coupling = np.zeros((2, 2, S))
+    phase = np.zeros((2, 2, S))
+    if kind == "COM":
+        model = CommonOscillatorModel(
+            n_sources=3, process_variance=jnp.array([0.5, 0.3]), **common, **kwargs
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        rng = np.random.default_rng(1)
+        H_first = rng.normal(size=(3, 4))
+        H_second = rng.normal(size=(3, 4)) if switching else H_first
+        model.measurement_matrix = jnp.stack([H_first, H_second][:S], axis=-1)
+    elif kind == "CNM":
+        coupling[0, 1, 0], phase[0, 1, 0] = 0.4, 0.5
+        if S > 1 and not switching:
+            coupling[0, 1, 1], phase[0, 1, 1] = 0.4, 0.5
+        model = CorrelatedNoiseModel(
+            process_variance=jnp.full((2, S), 0.5),
+            phase_difference=jnp.asarray(phase),
+            coupling_strength=jnp.asarray(coupling),
+            **common,
+            **kwargs,
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+    elif kind == "DIM":
+        coupling[1, 0, 0], phase[1, 0, 0] = 0.3, 0.4
+        if S > 1:
+            if switching:
+                coupling[0, 1, 1], phase[0, 1, 1] = 0.3, -0.4
+            else:
+                coupling[1, 0, 1], phase[1, 0, 1] = 0.3, 0.4
+        model = DirectedInfluenceModel(
+            process_variance=jnp.array([0.5, 0.3]),
+            phase_difference=jnp.asarray(phase),
+            coupling_strength=jnp.asarray(coupling),
+            **common,
+            **kwargs,
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+    else:
+        raise ValueError(f"unknown oscillator model kind {kind!r}")
+
+    n_latent = model.n_cont_states
+    model.init_mean = jnp.zeros((n_latent, S))
+    model.init_cov = jnp.stack([2.0 * jnp.eye(n_latent)] * S, axis=-1)
+    if S == 2:
+        model.discrete_transition_matrix = jnp.array(_OSC_SWITCHING_Z)
+        model.init_discrete_state_prob = jnp.array([0.5, 0.5])
+    return model
+
+
+def simulate_from_oscillator_model(
+    model, n_time: int, rng: np.random.Generator
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sample ``(x, y, s)`` from a switching LGSSM model (x_1 convention).
+
+    ``s_1 ~ init_discrete_state_prob``, ``x_1 ~ N(init_mean_s1, init_cov_s1)``
+    and ``y_t = H_{s_t} x_t + v_t`` for every ``t`` -- the convention of
+    ``switching_kalman_filter``.  The number of random draws does not depend
+    on the number of discrete states, so a one-state model and its two-label
+    copy see identical ``(x, y)`` for the same generator state.
+
+    Returns
+    -------
+    x : (n_time, n_latent), y : (n_time, n_obs), s : (n_time,)
+    """
+    A = np.asarray(model.continuous_transition_matrix)
+    Q = np.asarray(model.process_cov)
+    H = np.asarray(model.measurement_matrix)
+    R = np.asarray(model.measurement_cov)
+    Z = np.asarray(model.discrete_transition_matrix)
+    pi0 = np.asarray(model.init_discrete_state_prob)
+    m0 = np.asarray(model.init_mean)
+    P0 = np.asarray(model.init_cov)
+    n_states = A.shape[-1]
+    n_latent, n_obs = A.shape[0], H.shape[0]
+
+    s = rng.choice(n_states, p=pi0)
+    x = rng.multivariate_normal(m0[:, s], P0[:, :, s])
+    xs, ys, ss = [], [], []
+    for t in range(n_time):
+        if t > 0:
+            s = rng.choice(n_states, p=Z[s])
+            x = A[:, :, s] @ x + rng.multivariate_normal(np.zeros(n_latent), Q[:, :, s])
+        y = H[:, :, s] @ x + rng.multivariate_normal(np.zeros(n_obs), R[:, :, s])
+        xs.append(x)
+        ys.append(y)
+        ss.append(s)
+    return np.array(xs), np.array(ys), np.array(ss)
+
+
+def collapse_switching_posterior(
+    discrete_prob: ArrayLike, state_cond_mean: ArrayLike, state_cond_cov: ArrayLike
+) -> tuple[np.ndarray, np.ndarray]:
+    """Moment-match the state-conditional posteriors into one Gaussian per t.
+
+    Parameters
+    ----------
+    discrete_prob : (n_time, n_states)
+    state_cond_mean : (n_time, n_latent, n_states)
+    state_cond_cov : (n_time, n_latent, n_latent, n_states)
+
+    Returns
+    -------
+    mean : (n_time, n_latent), cov : (n_time, n_latent, n_latent)
+    """
+    p = np.asarray(discrete_prob)
+    mu = np.asarray(state_cond_mean)
+    P = np.asarray(state_cond_cov)
+    mean = np.einsum("tj,tkj->tk", p, mu)
+    dev = mu - mean[:, :, None]
+    cov = np.einsum("tj,tklj->tkl", p, P) + np.einsum("tj,tkj,tlj->tkl", p, dev, dev)
+    return mean, cov
+
+
+def standardized_errors(
+    truth: ArrayLike, mean: ArrayLike, cov: ArrayLike
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-coordinate z-scores and per-time Mahalanobis distances.
+
+    Returns
+    -------
+    z : (n_time, n_latent)
+        ``(x - m) / sqrt(diag P)``; ~N(0, 1) under a calibrated posterior.
+    mahalanobis : (n_time,)
+        ``(x - m)^T P^{-1} (x - m)``; ~chi^2(n_latent) under calibration.
+    """
+    err = np.asarray(truth) - np.asarray(mean)
+    cov = np.asarray(cov)
+    z = err / np.sqrt(np.einsum("tkk->tk", cov))
+    mahalanobis = np.einsum("tk,tkl,tl->t", err, np.linalg.inv(cov), err)
+    return z, mahalanobis

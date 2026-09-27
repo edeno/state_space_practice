@@ -3071,3 +3071,117 @@ def test_dim_em_started_at_truth_does_not_roll_back(use_reparameterized_mstep) -
     assert (
         np.max(np.abs(np.asarray(model.continuous_transition_matrix) - A_true)) < 0.05
     )
+
+
+# ============================================================================
+# Calibration of the switching smoother at the true parameters
+# ============================================================================
+
+_CALIBRATION_REPLICATES = 16
+_CALIBRATION_N_TIME = 150
+
+
+def _calibration_run(kind: str, n_discrete_states: int, switching: bool) -> dict:
+    """Pooled smoothed-error statistics over small replicates at the truth."""
+    from state_space_practice.tests.recovery_helpers import (
+        collapse_switching_posterior,
+        oscillator_model_at_truth,
+        simulate_from_oscillator_model,
+        standardized_errors,
+    )
+
+    model = oscillator_model_at_truth(kind, n_discrete_states, switching)
+    rng = np.random.default_rng(0)
+    zs, mahal, means, covs = [], [], [], []
+    for _ in range(_CALIBRATION_REPLICATES):
+        x, y, _ = simulate_from_oscillator_model(model, _CALIBRATION_N_TIME, rng)
+        model._e_step(jnp.asarray(y))
+        mean, cov = collapse_switching_posterior(
+            model.smoother_discrete_state_prob,
+            model.smoother_state_cond_mean,
+            model.smoother_state_cond_cov,
+        )
+        z, m2 = standardized_errors(x, mean, cov)
+        zs.append(z)
+        mahal.append(m2)
+        means.append(mean)
+        covs.append(cov)
+    z = np.concatenate(zs).ravel()
+    n_latent = model.n_cont_states
+    return {
+        "z_mean": float(z.mean()),
+        "z_var": float(z.var()),
+        "coverage90": float(np.mean(np.abs(z) < 1.6448536)),
+        "mahalanobis_per_dim": float(np.concatenate(mahal).mean() / n_latent),
+        "means": np.stack(means),
+        "covs": np.stack(covs),
+    }
+
+
+@pytest.mark.slow
+class TestCalibrationAtTrueParameters:
+    """The switching Kalman smoother is exact for a single linear-Gaussian
+    regime, so at the true parameters the smoothed errors must be N(0, P).
+
+    16 replicates x 150 bins x 4 latent dims = 9600 z-scores.  Replicate-level
+    spread puts the standard error of the pooled variance near 0.02 and of the
+    90% coverage near 0.005; the tolerances below are ~3-4 standard errors,
+    while a smoother that reported its *filtered* covariance, or a covariance
+    off by 15%, fails them.
+    """
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def runs(cls) -> dict:
+        return {
+            (kind, n_states, switching): _calibration_run(kind, n_states, switching)
+            for kind in ("COM", "CNM", "DIM")
+            for n_states, switching in ((1, False), (2, False), (2, True))
+        }
+
+    @staticmethod
+    def _assert_calibrated(stats: dict, label: str) -> None:
+        summary = {k: round(v, 4) for k, v in stats.items() if not hasattr(v, "shape")}
+        assert abs(stats["z_mean"]) < 0.05, f"{label}: {summary}"
+        assert abs(stats["z_var"] - 1.0) < 0.08, f"{label}: {summary}"
+        assert abs(stats["coverage90"] - 0.90) < 0.02, f"{label}: {summary}"
+        assert abs(stats["mahalanobis_per_dim"] - 1.0) < 0.06, f"{label}: {summary}"
+
+    @pytest.mark.parametrize("kind", ["COM", "CNM", "DIM"])
+    def test_single_regime_is_calibrated(self, runs, kind):
+        # Observed z-variance / coverage: COM 1.023 / 0.897, CNM 0.993 / 0.902,
+        # DIM 1.019 / 0.899.
+        self._assert_calibrated(runs[kind, 1, False], f"{kind} single regime")
+
+    @pytest.mark.parametrize("kind", ["COM", "CNM", "DIM"])
+    def test_identical_regimes_reproduce_single_regime(self, runs, kind):
+        """Two labels for one regime: the GPB collapse is exact, so the smoothed
+        moments equal the single-regime smoother's on the same data."""
+        single, double = runs[kind, 1, False], runs[kind, 2, False]
+        np.testing.assert_allclose(double["means"], single["means"], atol=1e-8)
+        np.testing.assert_allclose(double["covs"], single["covs"], atol=1e-8)
+        self._assert_calibrated(double, f"{kind} identical regimes")
+
+    @pytest.mark.parametrize(
+        ("kind", "z_var_range", "coverage_range"),
+        [
+            # Observed: z-variance 1.052, coverage 0.893.
+            ("COM", (0.95, 1.15), (0.86, 0.92)),
+            # Observed: z-variance 1.000, coverage 0.900.
+            ("CNM", (0.92, 1.10), (0.87, 0.93)),
+            # Observed: z-variance 1.023, coverage 0.896.
+            ("DIM", (0.93, 1.12), (0.87, 0.93)),
+        ],
+    )
+    def test_switching_regimes_coverage_is_pinned(
+        self, runs, kind, z_var_range, coverage_range
+    ):
+        """Genuinely switching: GPB1 moment matching is approximate; pin the
+        observed calibration (it stays close to nominal on these data)."""
+        stats = runs[kind, 2, True]
+        # Guard: the switching data differ from the identical-regime data.
+        assert np.max(np.abs(stats["means"] - runs[kind, 2, False]["means"])) > 1e-2
+        assert z_var_range[0] < stats["z_var"] < z_var_range[1], stats["z_var"]
+        assert coverage_range[0] < stats["coverage90"] < coverage_range[1], stats[
+            "coverage90"
+        ]
