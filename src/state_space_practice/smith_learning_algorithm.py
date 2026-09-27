@@ -160,9 +160,10 @@ def _approximate_gaussian_newton(
     Newton-Raphson steps. This makes it compatible with jax.grad for SGD.
 
     Only supports 1D (scalar) state variables. Each step is a Newton step
-    with Armijo backtracking, so the iteration ascends monotonically and
-    cannot oscillate; for the 1D Smith learning model, 10 steps reach the
-    mode to machine precision. ``smith_learning_filter`` uses this solver
+    whose length is the Armijo-acceptable one (of 1, 1/2, ..., 1/128) with
+    the highest log posterior, so the iteration ascends monotonically and
+    neither oscillates nor zigzags across the mode; for the 1D Smith learning
+    model, 10 steps reach the mode to machine precision. ``smith_learning_filter`` uses this solver
     for both its default and its ``differentiable`` path.
 
     Parameters
@@ -211,9 +212,13 @@ def _approximate_gaussian_newton(
         # Armijo backtracking: a full Newton step overshoots when the prior
         # mean sits on the saturated side of the logistic opposite the data
         # (curvature ~ 0 there) and then oscillates between the two saturated
-        # sides, e.g. N=10, y=0, prior N(3, 4): 3.0, -10.5, 3.0, ... Take the
-        # largest step in 1, 1/2, ..., 1/128 that decreases the objective
-        # sufficiently; near the mode the full step is accepted.
+        # sides, e.g. N=10, y=0, prior N(3, 4): 3.0, -10.5, 3.0, ... Of the
+        # steps in 1, 1/2, ..., 1/128 that decrease the objective
+        # sufficiently, take the one with the lowest objective (the largest
+        # within round-off of it); near the mode that is the full step. The
+        # largest acceptable step instead zigzags across the mode with slowly
+        # shrinking amplitude (N=1, y=0, prior N(5.16, 11.5): 5.16, -5.58,
+        # 4.68, -5.21, ... still 4 nats short after ten iterations).
         f_candidates = batched_objective(x + step_sizes * direction)
         f_x = neg_log_posterior(x)
         # Round-off slack: at a converged mode the tiny full step must still
@@ -223,7 +228,9 @@ def _approximate_gaussian_newton(
         sufficient = (
             f_candidates <= f_x + _ARMIJO_C * step_sizes * (g * direction) + slack
         )
-        alpha = jnp.where(jnp.any(sufficient), step_sizes[jnp.argmax(sufficient)], 0.0)
+        f_best = jnp.min(jnp.where(sufficient, f_candidates, jnp.inf))
+        best_ok = jnp.argmax(sufficient & (f_candidates <= f_best + slack))
+        alpha = jnp.where(jnp.any(sufficient), step_sizes[best_ok], 0.0)
         return x + alpha * direction, None
 
     mode, _ = jax.lax.scan(newton_step, jnp.squeeze(x0_arr), None, length=n_steps)

@@ -167,7 +167,7 @@ def _smith_smooth(y, sigma2, init_var):
     return sm, sv
 
 
-@pytest.mark.slow  # vmapped BFGS filter: ~9 s to compile
+@pytest.mark.slow  # jitted filter + smoother vmapped over 300 replicates
 @pytest.mark.parametrize(
     "sigma2, bands",
     [

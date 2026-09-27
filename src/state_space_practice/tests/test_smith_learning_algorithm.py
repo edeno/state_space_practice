@@ -2463,6 +2463,37 @@ class TestDifferentiableNewtonDoesNotOscillate:
         assert abs(float(bfgs_mode[0]) - mode) < 1e-4
         np.testing.assert_allclose(newton_var, bfgs_var, rtol=1e-3)
 
+    def test_newton_does_not_zigzag_across_the_mode(self):
+        """A broad prior on the wrong saturated side: y=0, prior N(5.163, 11.51).
+
+        Taking the largest Armijo-acceptable step zigzags across the mode
+        (5.16, -5.58, 4.68, -5.21, ...) and ten iterations end 4 nats short
+        of it; the best acceptable step converges.
+        """
+        from functools import partial
+
+        from scipy.optimize import brentq
+
+        from state_space_practice.multinomial_choice import NEWTON_GAP_TOL
+        from state_space_practice.smith_learning_algorithm import (
+            _approximate_gaussian_newton,
+            _log_posterior_objective,
+        )
+
+        m, v, y, n = 5.163, 11.51, 0, 1
+        f = partial(
+            _log_posterior_objective,
+            learning_state_prev=m,
+            variance_prev=v,
+            n_correct_in_trial=y,
+            max_possible_correct=n,
+            bias=0.0,
+        )
+        mode = brentq(lambda x: y - n / (1 + np.exp(-x)) - (x - m) / v, -30, 30)
+        newton_mode, _, gap = _approximate_gaussian_newton(f, jnp.array([m]))
+        assert abs(float(newton_mode[0]) - mode) < 1e-8
+        assert float(gap) < NEWTON_GAP_TOL
+
     def test_filter_modes_are_exact_one_step_modes(self):
         from scipy.optimize import brentq
 
