@@ -155,8 +155,8 @@ def _split_leaves(tree: object) -> tuple[list[Any], _LeafStructure]:
     """
     leaves, treedef = jax.tree_util.tree_flatten(tree)
     is_array = tuple(isinstance(leaf, (jax.Array, np.ndarray)) for leaf in leaves)
-    dynamic = [leaf for leaf, dyn in zip(leaves, is_array) if dyn]
-    static = tuple(leaf for leaf, dyn in zip(leaves, is_array) if not dyn)
+    dynamic = [leaf for leaf, dyn in zip(leaves, is_array, strict=True) if dyn]
+    static = tuple(leaf for leaf, dyn in zip(leaves, is_array, strict=True) if not dyn)
     return dynamic, (treedef, is_array, static)
 
 
