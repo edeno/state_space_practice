@@ -779,7 +779,11 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         cls = type(self)
         log_likelihood = float(cls._e_step(self, observations))
         if not math.isfinite(log_likelihood):
-            logger.debug("Warm-init seeding skipped: non-finite E-step.")
+            logger.warning(
+                "Warm-init seeding skipped: non-finite E-step log-likelihood "
+                "at the initial parameters; per-state parameters were not "
+                "seeded from the window clusters."
+            )
             self._restore_em_state(snapshot)
             self._clear_smoother_state()
             return

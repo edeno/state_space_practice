@@ -976,6 +976,24 @@ class _DIMHost(DirectedInfluenceDynamicsMixin):
         self._current_osc_params = None
 
 
+def test_rejected_projected_dynamics_are_restored_and_logged_at_warning(caplog):
+    """When the projected A lowers the M-step objective the previous dynamics
+    are kept; if that happens every iteration A never moves, so it must be
+    visible at the default log level."""
+    host = _DIMHost(jnp.zeros((2, 2, 1)))
+    old_A = jnp.eye(4)[..., None] * 0.5
+    host.continuous_transition_matrix = jnp.eye(4)[..., None] * 0.8
+    # Objective prefers the previous matrix.
+    host._transition_objective = lambda A: -float(jnp.sum((A - old_A) ** 2))
+    with caplog.at_level("WARNING", logger="state_space_practice.oscillator_utils"):
+        host._keep_previous_dynamics_if_objective_decreased(
+            {"continuous_transition_matrix": old_A}
+        )
+    np.testing.assert_array_equal(host.continuous_transition_matrix, old_A)
+    records = [r for r in caplog.records if "keeping the previous" in r.getMessage()]
+    assert records and records[0].levelname == "WARNING"
+
+
 def test_directed_influence_mixin_projection_syncs_public_params_and_rebuilds():
     """Standard-EM projection leaves A reconstructable from the synced public
     params; the reparameterized path leaves A untouched."""

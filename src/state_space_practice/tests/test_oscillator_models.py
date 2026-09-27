@@ -2746,6 +2746,38 @@ class TestComWarmInitStateDependentH:
         model._warm_initialize_states(obs)
         assert not np.allclose(np.array(model.init_mean), np.array(cold_mean))
 
+    def test_skipped_seeding_is_logged_at_warning(self, caplog, monkeypatch):
+        """A non-finite E-step skips per-state seeding (parameters restored);
+        that must be visible at the default log level."""
+        model = DirectedInfluenceModel(
+            n_oscillators=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            freqs=jnp.array([8.0, 12.0]),
+            damping_coef=jnp.array([0.95, 0.95]),
+            process_variance=jnp.array([0.1, 0.1]),
+            measurement_variance=0.05,
+            phase_difference=jnp.zeros((2, 2, 2)),
+            coupling_strength=jnp.zeros((2, 2, 2)),
+        )
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        A_before = np.array(model.continuous_transition_matrix)
+        monkeypatch.setattr(
+            DirectedInfluenceModel, "_e_step", lambda self, obs: float("nan")
+        )
+        obs = np.asarray(jax.random.normal(jax.random.PRNGKey(1), (40, 2)))
+        with caplog.at_level(
+            "WARNING", logger="state_space_practice.oscillator_models"
+        ):
+            model._seed_state_parameters_from_windows(
+                np.full((4, 2), 0.5), obs, window=10
+            )
+        records = [r for r in caplog.records if "seeding skipped" in r.getMessage()]
+        assert records and records[0].levelname == "WARNING"
+        np.testing.assert_array_equal(
+            np.array(model.continuous_transition_matrix), A_before
+        )
+
 
 class TestReparameterizedPublicParamsReconstructA:
     """After a reparameterized DIM fit, public params must reconstruct A."""

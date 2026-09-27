@@ -1590,9 +1590,11 @@ class DirectedInfluenceDynamicsMixin:
         slack = 1e-10 * max(1.0, abs(old_objective))
         if new_objective >= old_objective - slack:
             return
-        logger.info(
+        logger.warning(
             "DIM standard M-step: the projected transition matrix lowers the "
-            "M-step objective (%.6g -> %.6g); keeping the previous dynamics.",
+            "M-step objective (%.6g -> %.6g); keeping the previous dynamics. "
+            "If this repeats every iteration the dynamics never move; consider "
+            "use_reparameterized_mstep=True.",
             old_objective,
             new_objective,
         )
