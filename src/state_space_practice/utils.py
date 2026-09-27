@@ -383,27 +383,68 @@ def relative_psd_floor(
     return jnp.maximum(jnp.asarray(absolute_floor, dtype=dtype), rel * scale)
 
 
-def _log_floored_eigenvalues(n_floored: Array, floor: Array, *, name: str) -> None:
+def _log_floored_eigenvalues(
+    n_floored: Array,
+    floor: Array,
+    min_eigenvalue: Array | None = None,
+    max_abs_eigenvalue: Array | None = None,
+    *,
+    name: str,
+) -> None:
     """Host-side logger for :func:`project_psd_relative` (via debug callback)."""
     n = int(np.sum(np.asarray(n_floored)))
-    if n > 0:
-        logger.warning(
-            "%s: raised %d eigenvalue(s) to the scale-relative PSD floor "
-            "%.3g. The estimate is (numerically) rank deficient; check for "
-            "a degenerate latent dimension or an over-parameterised model.",
-            name,
-            n,
-            float(np.min(np.asarray(floor))),
-        )
+    if n == 0:
+        return
+    floor_value = float(np.min(np.asarray(floor)))
+    if min_eigenvalue is not None and max_abs_eigenvalue is not None:
+        min_eig = np.asarray(min_eigenvalue)
+        max_abs = np.asarray(max_abs_eigenvalue)
+        tolerance = np.sqrt(np.finfo(min_eig.dtype).eps) * max_abs
+        if bool(np.any(min_eig < -tolerance)):
+            logger.warning(
+                "%s: the estimate is indefinite (minimum eigenvalue %.3g "
+                "relative to a largest |eigenvalue| of %.3g, on the "
+                "correlation scale); raised %d eigenvalue(s) to the PSD floor "
+                "%.3g. A materially negative eigenvalue indicates inconsistent "
+                "sufficient statistics (e.g. E-step moments that do not come "
+                "from one posterior), not a degenerate latent dimension.",
+                name,
+                float(np.min(min_eig)),
+                float(np.max(max_abs)),
+                n,
+                floor_value,
+            )
+            return
+    logger.warning(
+        "%s: raised %d eigenvalue(s) to the scale-relative PSD floor "
+        "%.3g. The estimate is (numerically) rank deficient; check for "
+        "a degenerate latent dimension or an over-parameterised model.",
+        name,
+        n,
+        floor_value,
+    )
 
 
-def warn_if_floored(n_floored: Array, floor: Array, name: str) -> None:
+def warn_if_floored(
+    n_floored: Array,
+    floor: Array,
+    name: str,
+    min_eigenvalue: Array | None = None,
+    max_abs_eigenvalue: Array | None = None,
+) -> None:
     """Log (host side, jit-safe) that ``n_floored`` eigenvalues were floored.
 
     Emits a ``logger.warning`` from :mod:`state_space_practice.utils` when
     ``n_floored > 0``. Works eagerly and inside ``jax.jit`` / ``lax.scan``
     (through :func:`jax.debug.callback`), so jitted M-steps can report a
     projection without a host sync of their own.
+
+    A round-off-level negative (or zero) eigenvalue is reported as numerical
+    rank deficiency. When the eigenvalue range is supplied and the minimum
+    eigenvalue is materially negative (below ``-sqrt(eps) *
+    max_abs_eigenvalue``), the matrix is reported as indefinite instead, which
+    points at inconsistent sufficient statistics rather than a degenerate
+    dimension.
 
     Parameters
     ----------
@@ -413,10 +454,22 @@ def warn_if_floored(n_floored: Array, floor: Array, name: str) -> None:
         The floor that was applied.
     name : str
         Name of the quantity, used in the log message.
+    min_eigenvalue, max_abs_eigenvalue : Array or None, optional
+        Minimum eigenvalue and largest eigenvalue magnitude of the matrix
+        before flooring (on the scale the floor was applied on).
     """
-    jax.debug.callback(
-        functools.partial(_log_floored_eigenvalues, name=name), n_floored, floor
-    )
+    if min_eigenvalue is None or max_abs_eigenvalue is None:
+        jax.debug.callback(
+            functools.partial(_log_floored_eigenvalues, name=name), n_floored, floor
+        )
+    else:
+        jax.debug.callback(
+            functools.partial(_log_floored_eigenvalues, name=name),
+            n_floored,
+            floor,
+            min_eigenvalue,
+            max_abs_eigenvalue,
+        )
 
 
 def clip_eigenvalues_relative(
@@ -447,7 +500,7 @@ def clip_eigenvalues_relative(
         Number of correlation-scale eigenvalues that were raised to the floor
         (int scalar).
     """
-    projected, n_floored, _ = _clip_eigenvalues_relative(
+    projected, n_floored, _, _ = _clip_eigenvalues_relative(
         cov, relative_floor, absolute_floor
     )
     return projected, n_floored
@@ -479,11 +532,8 @@ def _correlation_scale(cov: Array) -> Array:
 def _clip_eigenvalues_relative(
     cov: Array, relative_floor: float, absolute_floor: float
 ) -> tuple[Array, Array, Array]:
-    """:func:`clip_eigenvalues_relative` that also returns the floor used.
-
-    The floor is on the correlation scale (the returned ``floor`` is in
-    correlation units).
-    """
+    """:func:`clip_eigenvalues_relative` that also returns the floor used and
+    the eigenvalues before flooring (both on the correlation scale)."""
     cov = symmetrize(jnp.asarray(cov))
     scale = _correlation_scale(cov)
     outer_scale = scale[..., :, None] * scale[..., None, :]
@@ -493,7 +543,7 @@ def _clip_eigenvalues_relative(
     raised = jnp.where(floored, floor, eigvals)
     projected = symmetrize(((eigvecs * raised[None, :]) @ eigvecs.T) * outer_scale)
     n_floored = jnp.sum(floored, dtype=jnp.int32)
-    return jnp.where(n_floored > 0, projected, cov), n_floored, floor
+    return jnp.where(n_floored > 0, projected, cov), n_floored, floor, eigvals
 
 
 def project_psd_relative(
@@ -534,11 +584,17 @@ def project_psd_relative(
     projected : Array, shape (n, n)
         Symmetric positive-definite matrix.
     """
-    projected, n_floored, floor = _clip_eigenvalues_relative(
+    projected, n_floored, floor, eigvals = _clip_eigenvalues_relative(
         cov, relative_floor, absolute_floor
     )
     if warn:
-        warn_if_floored(n_floored, floor, name)
+        warn_if_floored(
+            n_floored,
+            floor,
+            name,
+            min_eigenvalue=jnp.min(eigvals),
+            max_abs_eigenvalue=jnp.max(jnp.abs(eigvals)),
+        )
     return projected
 
 

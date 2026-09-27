@@ -821,6 +821,33 @@ class TestRelativePsdFloor:
         np.testing.assert_allclose(eigs, [1e-8, 1.0], rtol=1e-6)
         assert any("test_cov" in r.getMessage() for r in caplog.records)
 
+    def test_materially_negative_eigenvalue_is_reported_as_indefinite(
+        self, caplog
+    ) -> None:
+        """Flooring eigenvalue -5 is not rank deficiency: the log names the
+        minimum eigenvalue and points at inconsistent sufficient statistics."""
+        cov = jnp.array([[1.0, 0.0], [0.0, -5.0]])
+        with caplog.at_level("WARNING", logger="state_space_practice.utils"):
+            project_psd_relative(cov, name="test_cov")
+            jax.effects_barrier()
+        messages = [r.getMessage() for r in caplog.records]
+        assert len(messages) == 1
+        assert "indefinite" in messages[0] and "-5" in messages[0]
+        assert "inconsistent sufficient statistics" in messages[0]
+        assert "rank deficient" not in messages[0]
+
+    def test_roundoff_negative_eigenvalue_is_reported_as_rank_deficient(
+        self, caplog
+    ) -> None:
+        cov = jnp.array([[1.0, 1.0], [1.0, 1.0 - 1e-15]])  # rank one + round-off
+        with caplog.at_level("WARNING", logger="state_space_practice.utils"):
+            project_psd_relative(cov, name="test_cov")
+            jax.effects_barrier()
+        messages = [r.getMessage() for r in caplog.records]
+        assert len(messages) == 1
+        assert "rank deficient" in messages[0]
+        assert "indefinite" not in messages[0]
+
     def test_no_log_when_nothing_changes(self, caplog) -> None:
         with caplog.at_level("WARNING", logger="state_space_practice.utils"):
             project_psd_relative(jnp.eye(2), name="test_cov")
