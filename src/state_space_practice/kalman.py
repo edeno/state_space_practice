@@ -26,6 +26,7 @@ import jax.scipy.stats.multivariate_normal
 from jax.typing import ArrayLike
 
 from state_space_practice.utils import (  # noqa: F401 — re-exported for backward compat
+    _stabilizing_shift,
     _validate_filter_numerics,
     contains_tracer,
     project_psd_relative,
@@ -48,8 +49,10 @@ from state_space_practice.utils import (  # noqa: F401 — re-exported for backw
 # singular predicted covariance (rank-deficient dynamics, zero process noise)
 # then fails Cholesky. Even an eps-relative shift can be below the round-off of
 # a singular float32 covariance whose diagonal entries differ in scale, so a
-# solve whose result is non-finite is repeated once with a ``sqrt(eps)``
-# relative shift. A solve that succeeds is unchanged.
+# failed Cholesky factorization is retried with a ``sqrt(eps)`` relative shift.
+# The successful factor is reused for the solve and its implicit derivatives;
+# differentiation follows the stabilized matrix, keeping failed factors out
+# of reverse mode without an extra factorization on the successful path.
 _GAIN_SOLVE_RELATIVE_BOOST = 1e-14
 _GAIN_SOLVE_ABSOLUTE_BOOST = 1e-300
 
@@ -58,28 +61,40 @@ def _gain_solve(cov: jax.Array, rhs: jax.Array) -> jax.Array:
     """Solve ``cov @ x = rhs`` for a PD ``cov`` with a scale-relative shift.
 
     The relative shift is ``max(1e-14, eps(dtype))`` times each diagonal
-    entry of ``cov`` (see :func:`state_space_practice.utils.psd_solve`). If
-    that solution is not finite (Cholesky failed on a numerically singular
-    ``cov``), the solve is repeated with a ``sqrt(eps(dtype))`` relative
-    shift.
+    entry of ``cov`` (see :func:`state_space_practice.utils.psd_solve`), or
+    ``sqrt(eps(dtype))`` when the smaller shift gives a non-finite Cholesky
+    factor. The successful factor is reused by
+    :func:`jax.lax.custom_linear_solve`, which differentiates the stabilized
+    linear system implicitly. This preserves derivatives of the diagonal
+    shift while keeping the factorization outside autodiff.
     """
     eps = float(jnp.finfo(jnp.result_type(cov)).eps)
-    solution = psd_solve(
-        cov,
-        rhs,
-        diagonal_boost=_GAIN_SOLVE_ABSOLUTE_BOOST,
-        relative_boost=max(_GAIN_SOLVE_RELATIVE_BOOST, eps),
+    cov = symmetrize(cov)
+    idx = jnp.arange(cov.shape[-1])
+
+    def factorize(relative_boost):
+        shift = _stabilizing_shift(cov, _GAIN_SOLVE_ABSOLUTE_BOOST, relative_boost)
+        matrix = cov.at[..., idx, idx].add(shift)
+        factor = jnp.linalg.cholesky(jax.lax.stop_gradient(matrix))
+        return matrix, factor
+
+    matrix, factor = factorize(max(_GAIN_SOLVE_RELATIVE_BOOST, eps))
+    matrix, factor = jax.lax.cond(
+        jnp.all(jnp.isfinite(factor)),
+        lambda: (matrix, factor),
+        lambda: factorize(eps**0.5),
     )
-    return jax.lax.cond(
-        jnp.all(jnp.isfinite(solution)),
-        lambda: solution,
-        lambda: psd_solve(
-            cov,
-            rhs,
-            diagonal_boost=_GAIN_SOLVE_ABSOLUTE_BOOST,
-            relative_boost=eps**0.5,
-        ),
+
+    rhs = jnp.asarray(rhs)
+    rhs_is_vector = rhs.ndim == cov.ndim - 1
+    rhs_matrix = rhs[..., None] if rhs_is_vector else rhs
+    solution = jax.lax.custom_linear_solve(
+        lambda x: matrix @ x,
+        rhs_matrix,
+        solve=lambda _, b: jax.scipy.linalg.cho_solve((factor, True), b),
+        symmetric=True,
     )
+    return solution[..., 0] if rhs_is_vector else solution
 
 
 def woodbury_kalman_gain(

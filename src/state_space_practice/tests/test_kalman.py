@@ -17,6 +17,7 @@ from scipy.linalg import solve_discrete_are
 from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.kalman import (
     InitialStatePrior,
+    _gain_solve,
     _kalman_smoother_update,
     joseph_form_update,
     kalman_filter,
@@ -1571,6 +1572,89 @@ class TestKalmanNumericalStability:
         scale = float(np.max(np.abs(ref_cov)))
         np.testing.assert_allclose(mean32, ref_mean, rtol=1e-3, atol=1e-3)
         np.testing.assert_allclose(cov32, ref_cov, rtol=1e-3, atol=1e-3 * scale)
+
+    def test_float32_smoother_gradient_through_stabilised_gain_solve(self) -> None:
+        """The RTS gain solve needs its larger shift here; reverse mode must not
+        pass through the factorization that failed. With a zero initial mean
+        and zero observations the smoothed means are identically 0, so their
+        gradient with respect to A is 0."""
+        f32 = jnp.float32
+        A = jnp.asarray([[0.56, 0.56], [0.08, 0.08]], dtype=f32)
+        small = (2.0**-10) * jnp.eye(2, dtype=f32)
+
+        def summed_means(A):
+            means, _, _, _ = kalman_smoother(
+                jnp.zeros(2, dtype=f32),
+                small,
+                jnp.zeros((3, 2), dtype=f32),
+                A,
+                jnp.zeros((2, 2), dtype=f32),
+                jnp.eye(2, dtype=f32),
+                small,
+            )
+            return jnp.sum(means)
+
+        grad = jax.grad(summed_means)(A)
+        assert jnp.all(jnp.isfinite(grad))
+        np.testing.assert_allclose(grad, 0.0, atol=1e-6)
+
+    @pytest.mark.parametrize("needs_retry", [False, True])
+    @pytest.mark.parametrize("vector_rhs", [False, True])
+    def test_gain_solve_nonzero_derivatives(self, needs_retry, vector_rhs) -> None:
+        """Scaling cov by exp(t) and rhs by exp(2t) scales the solution by exp(t).
+
+        Both covariance and rhs derivatives must contribute, including the
+        covariance-dependent diagonal shift and the retry under float32.
+        """
+        dtype = jnp.float32 if needs_retry else jnp.float64
+        eps = float(jnp.finfo(dtype).eps)
+        cov = jnp.asarray(
+            [[1.0, 1.0], [1.0, 1.0 - 4 * eps]]
+            if needs_retry
+            else [[3.0, 0.2], [0.2, 1.0]],
+            dtype=dtype,
+        )
+        rhs = jnp.asarray(
+            [1.0, 2.0] if vector_rhs else [[1.0, 2.0], [2.0, -1.0]], dtype=dtype
+        )
+        weights = jnp.arange(1, rhs.size + 1, dtype=dtype).reshape(rhs.shape)
+        if needs_retry:
+            # Guard: this case actually requires the larger shift.
+            assert not jnp.all(jnp.isfinite(psd_solve(cov, rhs, relative_boost=eps)))
+
+        def scaled_solution(t):
+            return _gain_solve(jnp.exp(t) * cov, jnp.exp(2 * t) * rhs)
+
+        zero, one = jnp.asarray(0.0, dtype=dtype), jnp.asarray(1.0, dtype=dtype)
+        solution, tangent = jax.jvp(scaled_solution, (zero,), (one,))
+        np.testing.assert_allclose(tangent, solution, rtol=2e-3, atol=1e-6)
+
+        def loss(t):
+            return jnp.sum(weights * scaled_solution(t))
+
+        value, gradient = jax.value_and_grad(loss)(zero)
+        np.testing.assert_allclose(gradient, value, rtol=2e-3, atol=1e-6)
+        np.testing.assert_allclose(
+            jax.grad(jax.grad(loss))(zero), value, rtol=2e-3, atol=1e-6
+        )
+
+    def test_gain_solve_retry_gradients_under_vmap(self) -> None:
+        """A failed factor in one batch entry cannot contaminate its gradients."""
+        eps = float(jnp.finfo(jnp.float32).eps)
+        covs = jnp.asarray(
+            [[[1.0, 1.0], [1.0, 1.0 - 4 * eps]], [[3.0, 0.2], [0.2, 1.0]]],
+            dtype=jnp.float32,
+        )
+        rhs = jnp.asarray([1.0, 2.0], dtype=jnp.float32)
+        weights = jnp.asarray([2.0, -1.0], dtype=jnp.float32)
+
+        def loss(t, cov):
+            return weights @ _gain_solve(jnp.exp(t) * cov, rhs)
+
+        values, gradients = jax.jit(jax.vmap(jax.value_and_grad(loss), in_axes=(0, 0)))(
+            jnp.zeros(2, dtype=jnp.float32), covs
+        )
+        np.testing.assert_allclose(gradients, -values, rtol=2e-3, atol=1e-6)
 
 
 # --- Parallel Kalman Smoother Tests ---
