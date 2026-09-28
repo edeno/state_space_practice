@@ -21,6 +21,7 @@ import numpy as np
 from jax.scipy.special import logsumexp
 
 from state_space_practice.kalman import (
+    _gain_solve,
     _kalman_filter_update,
     _kalman_smoother_update,
     kalman_measurement_update,
@@ -2109,13 +2110,13 @@ def warn_low_occupancy_states(
     return low
 
 
-# The per-state regression solves (H*, A*) use a purely relative Cholesky shift
-# (1e-12 times each diagonal entry; the absolute part only keeps an all-zero Gram
-# matrix of an empty state factorizable) so the solution does not depend on the
-# units of the latent state: an absolute shift would dominate a Gram matrix
-# whose scale is comparable to or below it.
+# The per-state regression solves (H*, A*) use the Kalman M-step's stabilised
+# solve (kalman._gain_solve): a purely scale-relative Cholesky shift, so the
+# solution does not depend on the units of the latent state, floored at the
+# Gram matrix's machine epsilon with a sqrt(eps) retry for a numerically
+# singular (e.g. float32) Gram matrix.
 psd_solve_per_discrete_state = jax.vmap(
-    lambda x, y: psd_solve(x, y.T, diagonal_boost=1e-300, relative_boost=1e-12).T,
+    lambda x, y: _gain_solve(x, y.T).T,
     in_axes=(-1, -1),
     out_axes=-1,
 )

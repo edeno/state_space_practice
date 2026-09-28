@@ -4881,6 +4881,43 @@ class TestSwitchingMStepMathCorrectness:
     Uses asymmetric A and independent verification approaches.
     """
 
+    @pytest.mark.parametrize("rhs_dtype", [jnp.float32, jnp.float64])
+    def test_per_state_regression_solve_nearly_singular_float32(
+        self, rhs_dtype
+    ) -> None:
+        """The per-state H* / A* solve uses the Kalman M-step's stabilised solve.
+
+        State 0's float32 Gram matrix is singular to within 4 eps, so Cholesky
+        fails at an eps-relative shift; state 1 is well conditioned. Both must
+        give finite coefficients, state 1 must match the float64 solve, and
+        state 0 must still fit its identified direction (the Gram matrix's
+        leading eigenvector).
+        """
+        from state_space_practice.switching_kalman import (
+            psd_solve_per_discrete_state,
+        )
+
+        eps = float(np.finfo(np.float32).eps)
+        gamma = np.stack(
+            [[[1.0, 1.0], [1.0, 1.0 - 4 * eps]], [[3.0, 0.2], [0.2, 1.0]]], axis=-1
+        )  # (n_state, n_state, n_discrete_states)
+        delta = np.stack([[[1.0, 1.0]], [[1.0, 2.0]]], axis=-1)  # (n_obs, n_state, S)
+
+        coef = psd_solve_per_discrete_state(
+            jnp.asarray(gamma, dtype=jnp.float32), jnp.asarray(delta, dtype=rhs_dtype)
+        )
+
+        assert jnp.all(jnp.isfinite(coef))
+        np.testing.assert_allclose(
+            coef[..., 1],
+            np.linalg.solve(gamma[..., 1], delta[..., 1].T).T,
+            rtol=1e-5,
+        )
+        # State 0: delta lies along the leading eigenvector (1, 1) of gamma.
+        np.testing.assert_allclose(
+            coef[..., 0] @ gamma[..., 0], delta[..., 0], rtol=1e-3
+        )
+
     def test_switching_mstep_matches_nonswitching_asymmetric_A(self) -> None:
         """S=1 switching M-step should match non-switching M-step.
 
