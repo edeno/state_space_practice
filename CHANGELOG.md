@@ -426,7 +426,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Both log-determinants now come from the update's own Cholesky factors.
 - **float32 Kalman / RTS gain solves** could return NaN (e.g. rank-deficient
   dynamics with zero process noise): the ``1e-14`` relative shift rounded
-  away; it is now at least machine epsilon of the dtype.
+  away. It is now at least machine epsilon of the dtype, and a solve whose
+  result is still non-finite is repeated with a ``sqrt(eps)`` relative shift
+  (a successful solve is unchanged).
 - **`stabilize_transition_matrix`** truncated integer inputs (``[[2, 1],
   [0, 2]]`` became zeros); integers are promoted first. A `block_size` that
   does not divide the dimension is logged before the uniform-scale fallback.
