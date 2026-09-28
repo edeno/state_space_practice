@@ -87,7 +87,13 @@ Roadmaps were reconciled on 2026-07-08 against the checked-in code. The old
 P1/P2/P2.5/P3/P6 queue has shipped; active next work should start from the
 missing modules in:
 
-- [Execution roadmap](docs/plans/2026-04-04-execution-roadmap.md)
+- [Execution roadmap](docs/plans/2026-04-04-execution-roadmap.md) — including the
+  [2026-09-28 extension queue](docs/plans/2026-04-04-execution-roadmap.md#extension-queue-2026-09-28):
+  eleven phased plans under `docs/plans/<slug>/` (identifiability diagnostics,
+  robust updates, new GLM families, masks and multi-sequence fitting, the
+  iterated/parallel Laplace smoother, recurrent switching transitions,
+  multi-map place fields, a successor-representation basis, a volatile Kalman
+  choice model, theta-sweep amplitude tracking, streaming filters)
 - [Spatial bandit latent roadmap](docs/plans/2026-04-05-bandit-latent-roadmap.md)
 
 Spike-only latent oscillator coupling plans are treated as exploratory or
