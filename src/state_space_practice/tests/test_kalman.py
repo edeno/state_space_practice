@@ -1656,6 +1656,54 @@ class TestKalmanNumericalStability:
         )
         np.testing.assert_allclose(gradients, -values, rtol=2e-3, atol=1e-6)
 
+    @pytest.mark.parametrize("wide", ["cov", "rhs"])
+    def test_gain_solve_mixed_dtypes(self, wide) -> None:
+        """A float32 / float64 mix solves in the promoted dtype, eagerly, under
+        jit and under grad, and matches the all-float64 solve."""
+        cov64 = jnp.asarray([[3.0, 0.2], [0.2, 1.0]])
+        rhs64 = jnp.asarray([[1.0, 2.0], [2.0, -1.0]])
+        cov = cov64 if wide == "cov" else cov64.astype(jnp.float32)
+        rhs = rhs64 if wide == "rhs" else rhs64.astype(jnp.float32)
+        # Reference: the same (rounded) values, all in float64.
+        expected = _gain_solve(cov.astype(jnp.float64), rhs.astype(jnp.float64))
+
+        for solve in (_gain_solve, jax.jit(_gain_solve)):
+            solution = solve(cov, rhs)
+            assert solution.dtype == jnp.float64
+            np.testing.assert_allclose(solution, expected, rtol=1e-12)
+
+        def loss(scale):
+            return jnp.sum(_gain_solve(scale * cov, rhs))
+
+        # d/ds sum((s cov)^{-1} rhs) at s = 1 is -sum(cov^{-1} rhs).
+        gradient = jax.grad(loss)(jnp.asarray(1.0, dtype=cov.dtype))
+        np.testing.assert_allclose(gradient, -jnp.sum(expected), rtol=1e-6)
+
+    def test_measurement_update_float32_inputs_float64_measurement_cov(self) -> None:
+        """float32 state / observation with a float64 R: eager, jit and grad."""
+        f32 = jnp.float32
+        args64 = (
+            jnp.zeros(2),
+            jnp.asarray([[2.0, 0.5], [0.5, 1.0]]),
+            jnp.asarray([1.0, -0.5]),
+            jnp.eye(2),
+            0.5 * jnp.eye(2),
+        )
+        mixed = tuple(a.astype(f32) for a in args64[:4]) + (args64[4],)
+        expected = kalman_measurement_update(*args64)
+
+        for update in (kalman_measurement_update, jax.jit(kalman_measurement_update)):
+            for got, want in zip(update(*mixed), expected, strict=True):
+                np.testing.assert_allclose(got, want, rtol=1e-6)
+
+        def posterior_mean_sum(prior_cov, *rest):
+            return jnp.sum(kalman_measurement_update(rest[0], prior_cov, *rest[1:])[0])
+
+        grad_mixed = jax.grad(posterior_mean_sum)(mixed[1], mixed[0], *mixed[2:])
+        grad64 = jax.grad(posterior_mean_sum)(args64[1], args64[0], *args64[2:])
+        assert jnp.all(jnp.isfinite(grad_mixed))
+        np.testing.assert_allclose(grad_mixed, grad64, rtol=1e-5)
+
 
 # --- Parallel Kalman Smoother Tests ---
 
