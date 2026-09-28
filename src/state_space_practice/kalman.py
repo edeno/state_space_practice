@@ -68,12 +68,14 @@ def _gain_solve(cov: jax.Array, rhs: jax.Array) -> jax.Array:
     linear system implicitly. This preserves derivatives of the diagonal
     shift while keeping the factorization outside autodiff.
     """
+    # The shift follows cov's own precision: a float32 cov carries float32
+    # rounding even when it is solved in float64.
+    eps = float(jnp.finfo(jnp.result_type(cov)).eps)
     # custom_linear_solve needs the matrix, right-hand side and solution in
     # one dtype, so a float32 / float64 mix is solved in the promoted dtype.
     dtype = jnp.result_type(cov, rhs)
     cov = jnp.asarray(cov, dtype=dtype)
     rhs = jnp.asarray(rhs, dtype=dtype)
-    eps = float(jnp.finfo(dtype).eps)
     cov = symmetrize(cov)
     idx = jnp.arange(cov.shape[-1])
 

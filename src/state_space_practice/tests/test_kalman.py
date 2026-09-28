@@ -1667,10 +1667,13 @@ class TestKalmanNumericalStability:
         # Reference: the same (rounded) values, all in float64.
         expected = _gain_solve(cov.astype(jnp.float64), rhs.astype(jnp.float64))
 
+        # A float32 cov is stabilised at float32 precision (an eps32-relative
+        # shift), so it matches the float64 solve to ~1e-7, not round-off.
+        rtol = 1e-12 if cov.dtype == jnp.float64 else 1e-6
         for solve in (_gain_solve, jax.jit(_gain_solve)):
             solution = solve(cov, rhs)
             assert solution.dtype == jnp.float64
-            np.testing.assert_allclose(solution, expected, rtol=1e-12)
+            np.testing.assert_allclose(solution, expected, rtol=rtol)
 
         def loss(scale):
             return jnp.sum(_gain_solve(scale * cov, rhs))
@@ -1678,6 +1681,29 @@ class TestKalmanNumericalStability:
         # d/ds sum((s cov)^{-1} rhs) at s = 1 is -sum(cov^{-1} rhs).
         gradient = jax.grad(loss)(jnp.asarray(1.0, dtype=cov.dtype))
         np.testing.assert_allclose(gradient, -jnp.sum(expected), rtol=1e-6)
+
+    def test_m_step_nearly_singular_float32_moments_float64_obs(self) -> None:
+        """Identical float32 smoothed means (second moment rank-1 up to 1e-10)
+        with float64 observations. The regression is solved in float64, but
+        the second moment carries float32 rounding, so its stabilising shift
+        must follow float32: H and R stay finite and H m reproduces the mean
+        observation (the only identified direction)."""
+        f32 = jnp.float32
+        mean = jnp.asarray([0.86, 0.245], dtype=f32)
+        _, H, _, R, _, _ = kalman_maximization_step(
+            jnp.asarray([[0.0], [1.0], [2.0]]),
+            jnp.tile(mean, (3, 1)),
+            1e-10 * jnp.tile(jnp.eye(2, dtype=f32), (3, 1, 1)),
+            jnp.zeros((2, 2, 2), dtype=f32),
+            initial_state_prior=InitialStatePrior(
+                jnp.zeros(2, dtype=f32),
+                jnp.eye(2, dtype=f32),
+                jnp.eye(2, dtype=f32),
+                jnp.eye(2, dtype=f32),
+            ),
+        )
+        assert jnp.all(jnp.isfinite(H)) and jnp.all(jnp.isfinite(R))
+        np.testing.assert_allclose(H @ mean, [1.0], rtol=1e-3)
 
     def test_measurement_update_float32_inputs_float64_measurement_cov(self) -> None:
         """float32 state / observation with a float64 R: eager, jit and grad."""
