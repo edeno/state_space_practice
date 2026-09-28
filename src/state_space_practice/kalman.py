@@ -45,14 +45,9 @@ from state_space_practice.utils import (  # noqa: F401 — re-exported for backw
 # inputs are valid (R > 0 makes S > 0), so the shift only guards against
 # round-off; the tiny absolute part only keeps an all-zero matrix
 # factorizable. The relative shift is never below the dtype's machine
-# epsilon: in float32 a 1e-14 relative shift rounds away entirely, and a
-# singular predicted covariance (rank-deficient dynamics, zero process noise)
-# then fails Cholesky. Even an eps-relative shift can be below the round-off of
-# a singular float32 covariance whose diagonal entries differ in scale, so a
-# failed Cholesky factorization is retried with a ``sqrt(eps)`` relative shift.
-# The successful factor is reused for the solve and its implicit derivatives;
-# differentiation follows the stabilized matrix, keeping failed factors out
-# of reverse mode without an extra factorization on the successful path.
+# epsilon (a 1e-14 shift rounds away in float32), and when even that is below
+# the round-off of a singular float32 covariance whose diagonal entries differ
+# in scale, the solve retries with a ``sqrt(eps)`` shift (see _gain_solve).
 _GAIN_SOLVE_RELATIVE_BOOST = 1e-14
 _GAIN_SOLVE_ABSOLUTE_BOOST = 1e-300
 
@@ -60,48 +55,46 @@ _GAIN_SOLVE_ABSOLUTE_BOOST = 1e-300
 def _gain_solve(cov: jax.Array, rhs: jax.Array) -> jax.Array:
     """Solve ``cov @ x = rhs`` for a PD ``cov`` with a scale-relative shift.
 
-    The relative shift is ``max(1e-14, eps(dtype))`` times each diagonal
-    entry of ``cov`` (see :func:`state_space_practice.utils.psd_solve`), or
-    ``sqrt(eps(dtype))`` when the smaller shift gives a non-finite Cholesky
-    factor. The successful factor is reused by
-    :func:`jax.lax.custom_linear_solve`, which differentiates the stabilized
-    linear system implicitly. This preserves derivatives of the diagonal
-    shift while keeping the factorization outside autodiff.
+    The relative shift is ``max(1e-14, eps)`` times each diagonal entry of
+    ``cov`` (see :func:`state_space_practice.utils.psd_solve`), or
+    ``sqrt(eps)`` when the smaller shift gives a non-finite Cholesky factor;
+    ``eps`` is that of ``cov``'s own dtype, whose rounding it carries even
+    when a float32 / float64 mix is solved in the promoted dtype. The shift
+    is chosen and the matrix factored on a gradient-free copy; the factor is
+    reused by :func:`jax.lax.custom_linear_solve`, which differentiates the
+    stabilized system (including the shift) implicitly, so a failed
+    factorization never reaches autodiff.
     """
-    # The shift follows cov's own precision: a float32 cov carries float32
-    # rounding even when it is solved in float64.
     eps = float(jnp.finfo(jnp.result_type(cov)).eps)
     # custom_linear_solve needs the matrix, right-hand side and solution in
-    # one dtype, so a float32 / float64 mix is solved in the promoted dtype.
+    # one dtype.
     dtype = jnp.result_type(cov, rhs)
-    cov = jnp.asarray(cov, dtype=dtype)
+    cov = symmetrize(jnp.asarray(cov, dtype=dtype))
     rhs = jnp.asarray(rhs, dtype=dtype)
-    cov = symmetrize(cov)
     idx = jnp.arange(cov.shape[-1])
 
-    def factorize(relative_boost):
+    def stabilized(cov, relative_boost):
         shift = _stabilizing_shift(cov, _GAIN_SOLVE_ABSOLUTE_BOOST, relative_boost)
-        matrix = cov.at[..., idx, idx].add(shift)
-        factor = jnp.linalg.cholesky(jax.lax.stop_gradient(matrix))
-        return matrix, factor
+        return cov.at[..., idx, idx].add(shift)
 
-    matrix, factor = factorize(max(_GAIN_SOLVE_RELATIVE_BOOST, eps))
-    matrix, factor = jax.lax.cond(
+    def factor_with(relative_boost):
+        factor = jnp.linalg.cholesky(stabilized(cov_const, relative_boost))
+        return jnp.asarray(relative_boost, dtype=dtype), factor
+
+    cov_const = jax.lax.stop_gradient(cov)
+    relative_boost, factor = factor_with(max(_GAIN_SOLVE_RELATIVE_BOOST, eps))
+    relative_boost, factor = jax.lax.cond(
         jnp.all(jnp.isfinite(factor)),
-        lambda: (matrix, factor),
-        lambda: factorize(eps**0.5),
+        lambda: (relative_boost, factor),
+        lambda: factor_with(eps**0.5),
     )
-
-    rhs = jnp.asarray(rhs)
-    rhs_is_vector = rhs.ndim == cov.ndim - 1
-    rhs_matrix = rhs[..., None] if rhs_is_vector else rhs
-    solution = jax.lax.custom_linear_solve(
+    matrix = stabilized(cov, relative_boost)
+    return jax.lax.custom_linear_solve(
         lambda x: matrix @ x,
-        rhs_matrix,
+        rhs,
         solve=lambda _, b: jax.scipy.linalg.cho_solve((factor, True), b),
         symmetric=True,
     )
-    return solution[..., 0] if rhs_is_vector else solution
 
 
 def woodbury_kalman_gain(
