@@ -46,7 +46,10 @@ from state_space_practice.utils import (  # noqa: F401 — re-exported for backw
 # factorizable. The relative shift is never below the dtype's machine
 # epsilon: in float32 a 1e-14 relative shift rounds away entirely, and a
 # singular predicted covariance (rank-deficient dynamics, zero process noise)
-# then fails Cholesky.
+# then fails Cholesky. Even an eps-relative shift can be below the round-off of
+# a singular float32 covariance whose diagonal entries differ in scale, so a
+# solve whose result is non-finite is repeated once with a ``sqrt(eps)``
+# relative shift. A solve that succeeds is unchanged.
 _GAIN_SOLVE_RELATIVE_BOOST = 1e-14
 _GAIN_SOLVE_ABSOLUTE_BOOST = 1e-300
 
@@ -55,16 +58,27 @@ def _gain_solve(cov: jax.Array, rhs: jax.Array) -> jax.Array:
     """Solve ``cov @ x = rhs`` for a PD ``cov`` with a scale-relative shift.
 
     The relative shift is ``max(1e-14, eps(dtype))`` times each diagonal
-    entry of ``cov`` (see :func:`state_space_practice.utils.psd_solve`).
+    entry of ``cov`` (see :func:`state_space_practice.utils.psd_solve`). If
+    that solution is not finite (Cholesky failed on a numerically singular
+    ``cov``), the solve is repeated with a ``sqrt(eps(dtype))`` relative
+    shift.
     """
-    relative_boost = max(
-        _GAIN_SOLVE_RELATIVE_BOOST, float(jnp.finfo(jnp.result_type(cov)).eps)
-    )
-    return psd_solve(
+    eps = float(jnp.finfo(jnp.result_type(cov)).eps)
+    solution = psd_solve(
         cov,
         rhs,
         diagonal_boost=_GAIN_SOLVE_ABSOLUTE_BOOST,
-        relative_boost=relative_boost,
+        relative_boost=max(_GAIN_SOLVE_RELATIVE_BOOST, eps),
+    )
+    return jax.lax.cond(
+        jnp.all(jnp.isfinite(solution)),
+        lambda: solution,
+        lambda: psd_solve(
+            cov,
+            rhs,
+            diagonal_boost=_GAIN_SOLVE_ABSOLUTE_BOOST,
+            relative_boost=eps**0.5,
+        ),
     )
 
 
