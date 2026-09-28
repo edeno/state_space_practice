@@ -285,6 +285,16 @@ class TestMultinomialChoiceFilter:
         assert result.predicted_values.shape == (100, 3)
         assert result.predicted_covariances.shape == (100, 3, 3)
 
+    @pytest.mark.parametrize(
+        "choice_filter",
+        [multinomial_choice_filter, covariate_choice_filter],
+    )
+    def test_empty_choice_sequence(self, choice_filter):
+        """No trials: empty estimates and a zero log-likelihood, no warning."""
+        result = choice_filter(jnp.zeros((0,), dtype=int), n_options=3)
+        assert result.filtered_values.shape[0] == 0
+        assert float(result.marginal_log_likelihood) == 0.0
+
     def test_preferred_option_has_highest_value(self):
         """Option 1 chosen 80% -> its value should be highest."""
         rng = np.random.default_rng(42)

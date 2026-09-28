@@ -103,7 +103,7 @@ def _warn_if_newton_unconverged(newton_gap: ArrayLike, solver: str) -> None:
     unconverged = newton_gap > NEWTON_GAP_TOL
     counts = (
         jnp.sum(unconverged),
-        jnp.max(jnp.where(unconverged, newton_gap, 0.0)),
+        jnp.max(jnp.where(unconverged, newton_gap, 0.0), initial=0.0),
     )
     if isinstance(newton_gap, jax.core.Tracer):
         jax.debug.callback(
