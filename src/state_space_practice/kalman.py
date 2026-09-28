@@ -65,10 +65,14 @@ def _gain_solve(cov: jax.Array, rhs: jax.Array) -> jax.Array:
     stabilized system (including the shift) implicitly, so a failed
     factorization never reaches autodiff.
     """
-    eps = float(jnp.finfo(jnp.result_type(cov)).eps)
     # custom_linear_solve needs the matrix, right-hand side and solution in
-    # one dtype.
-    dtype = jnp.result_type(cov, rhs)
+    # one floating dtype (integer inputs are promoted).
+    dtype = jnp.result_type(cov, rhs, 1.0)
+    # A float cov keeps its own precision's shift; an integer cov is exact, so
+    # its shift follows the dtype the solve runs in.
+    cov_dtype = jnp.result_type(cov)
+    eps_dtype = cov_dtype if jnp.issubdtype(cov_dtype, jnp.inexact) else dtype
+    eps = float(jnp.finfo(eps_dtype).eps)
     cov = symmetrize(jnp.asarray(cov, dtype=dtype))
     rhs = jnp.asarray(rhs, dtype=dtype)
     idx = jnp.arange(cov.shape[-1])

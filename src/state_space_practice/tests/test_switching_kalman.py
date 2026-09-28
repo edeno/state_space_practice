@@ -4918,6 +4918,39 @@ class TestSwitchingMStepMathCorrectness:
             coef[..., 0] @ gamma[..., 0], delta[..., 0], rtol=1e-3
         )
 
+    @pytest.mark.parametrize(
+        "stat_dtype, obs_dtype",
+        [
+            (np.int64, np.int64),
+            # The solve runs in float32, so its stabilising shift must be
+            # float32-sized even though the Gram matrix is integer.
+            (np.int32, np.float32),
+        ],
+    )
+    def test_mstep_integer_statistics_singular_gram(self, stat_dtype, obs_dtype):
+        """Integer statistics with exactly singular Gram matrices.
+
+        Constant latent means m with zero covariance make the H* and A* Gram
+        matrices exactly rank-1, so the solves rely on their stabilising
+        shift. The estimates must be finite and fit the identified direction:
+        H m is the mean observation and A m = m.
+        """
+        n_time, n_state, n_disc = 6, 2, 1
+        mean = np.array([2, 1])
+        obs = np.arange(n_time * n_state).reshape(n_time, n_state) % 3
+        A, H, *rest = switching_kalman_maximization_step(
+            jnp.asarray(obs, dtype=obs_dtype),
+            jnp.asarray(np.tile(mean[:, None], (n_time, 1, 1)), dtype=stat_dtype),
+            jnp.zeros((n_time, n_state, n_state, n_disc), dtype=stat_dtype),
+            jnp.ones((n_time, n_disc), dtype=stat_dtype),
+            jnp.ones((n_time - 1, n_disc, n_disc), dtype=stat_dtype),
+            jnp.zeros((n_time - 1, n_state, n_state, n_disc, n_disc), dtype=stat_dtype),
+        )
+        for estimate in (A, H, *rest):
+            assert jnp.all(jnp.isfinite(estimate))
+        np.testing.assert_allclose(H[..., 0] @ mean, obs.mean(axis=0), rtol=1e-4)
+        np.testing.assert_allclose(A[..., 0] @ mean, mean, rtol=1e-4)
+
     def test_switching_mstep_matches_nonswitching_asymmetric_A(self) -> None:
         """S=1 switching M-step should match non-switching M-step.
 

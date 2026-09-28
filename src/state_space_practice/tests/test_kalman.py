@@ -1686,6 +1686,21 @@ class TestKalmanNumericalStability:
         gradient = jax.grad(loss)(jnp.asarray(1.0, dtype=cov.dtype))
         np.testing.assert_allclose(gradient, -jnp.sum(expected), rtol=1e-6)
 
+    @pytest.mark.parametrize("int_dtype", [jnp.int32, jnp.int64])
+    def test_gain_solve_integer_singular_cov_float32_rhs(self, int_dtype) -> None:
+        """An integer cov is stabilised at the precision of the float32 solve.
+
+        The exactly singular Gram matrix [[4, 2], [2, 1]] needs its shift; a
+        float64-sized shift rounds away in the float32 solve. The solution is
+        finite, float32, and solves the system along the identified direction.
+        """
+        cov = jnp.asarray([[4, 2], [2, 1]], dtype=int_dtype)
+        rhs = jnp.asarray([[1.0], [0.5]], dtype=jnp.float32)  # in cov's range
+        solution = _gain_solve(cov, rhs)
+        assert solution.dtype == jnp.float32
+        assert jnp.all(jnp.isfinite(solution))
+        np.testing.assert_allclose(cov @ solution, rhs, rtol=1e-3)
+
     def test_m_step_nearly_singular_float32_moments_float64_obs(self) -> None:
         """Identical float32 smoothed means (second moment rank-1 up to 1e-10)
         with float64 observations. The regression is solved in float64, but
