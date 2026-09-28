@@ -1478,6 +1478,13 @@ class TestKalmanMStepMathCorrectness:
         )
 
 
+# Gain-solve test matrices: well conditioned, and a float32 matrix singular
+# to within 4 eps, whose Cholesky fails at an eps-relative shift.
+_WELL_CONDITIONED_COV = [[3.0, 0.2], [0.2, 1.0]]
+_F32_EPS = float(np.finfo(np.float32).eps)
+_NEARLY_SINGULAR_F32_COV = [[1.0, 1.0], [1.0, 1.0 - 4 * _F32_EPS]]
+
+
 class TestKalmanNumericalStability:
     """Tests for numerical stability under adversarial conditions."""
 
@@ -1607,11 +1614,8 @@ class TestKalmanNumericalStability:
         covariance-dependent diagonal shift and the retry under float32.
         """
         dtype = jnp.float32 if needs_retry else jnp.float64
-        eps = float(jnp.finfo(dtype).eps)
         cov = jnp.asarray(
-            [[1.0, 1.0], [1.0, 1.0 - 4 * eps]]
-            if needs_retry
-            else [[3.0, 0.2], [0.2, 1.0]],
+            _NEARLY_SINGULAR_F32_COV if needs_retry else _WELL_CONDITIONED_COV,
             dtype=dtype,
         )
         rhs = jnp.asarray(
@@ -1620,7 +1624,9 @@ class TestKalmanNumericalStability:
         weights = jnp.arange(1, rhs.size + 1, dtype=dtype).reshape(rhs.shape)
         if needs_retry:
             # Guard: this case actually requires the larger shift.
-            assert not jnp.all(jnp.isfinite(psd_solve(cov, rhs, relative_boost=eps)))
+            assert not jnp.all(
+                jnp.isfinite(psd_solve(cov, rhs, relative_boost=_F32_EPS))
+            )
 
         def scaled_solution(t):
             return _gain_solve(jnp.exp(t) * cov, jnp.exp(2 * t) * rhs)
@@ -1640,10 +1646,8 @@ class TestKalmanNumericalStability:
 
     def test_gain_solve_retry_gradients_under_vmap(self) -> None:
         """A failed factor in one batch entry cannot contaminate its gradients."""
-        eps = float(jnp.finfo(jnp.float32).eps)
         covs = jnp.asarray(
-            [[[1.0, 1.0], [1.0, 1.0 - 4 * eps]], [[3.0, 0.2], [0.2, 1.0]]],
-            dtype=jnp.float32,
+            [_NEARLY_SINGULAR_F32_COV, _WELL_CONDITIONED_COV], dtype=jnp.float32
         )
         rhs = jnp.asarray([1.0, 2.0], dtype=jnp.float32)
         weights = jnp.asarray([2.0, -1.0], dtype=jnp.float32)
@@ -1660,7 +1664,7 @@ class TestKalmanNumericalStability:
     def test_gain_solve_mixed_dtypes(self, wide) -> None:
         """A float32 / float64 mix solves in the promoted dtype, eagerly, under
         jit and under grad, and matches the all-float64 solve."""
-        cov64 = jnp.asarray([[3.0, 0.2], [0.2, 1.0]])
+        cov64 = jnp.asarray(_WELL_CONDITIONED_COV)
         rhs64 = jnp.asarray([[1.0, 2.0], [2.0, -1.0]])
         cov = cov64 if wide == "cov" else cov64.astype(jnp.float32)
         rhs = rhs64 if wide == "rhs" else rhs64.astype(jnp.float32)
@@ -1722,11 +1726,12 @@ class TestKalmanNumericalStability:
             for got, want in zip(update(*mixed), expected, strict=True):
                 np.testing.assert_allclose(got, want, rtol=1e-6)
 
-        def posterior_mean_sum(prior_cov, *rest):
-            return jnp.sum(kalman_measurement_update(rest[0], prior_cov, *rest[1:])[0])
+        def posterior_mean_sum(*args):
+            return jnp.sum(kalman_measurement_update(*args)[0])
 
-        grad_mixed = jax.grad(posterior_mean_sum)(mixed[1], mixed[0], *mixed[2:])
-        grad64 = jax.grad(posterior_mean_sum)(args64[1], args64[0], *args64[2:])
+        # Gradient with respect to the prior covariance.
+        grad_mixed = jax.grad(posterior_mean_sum, argnums=1)(*mixed)
+        grad64 = jax.grad(posterior_mean_sum, argnums=1)(*args64)
         assert jnp.all(jnp.isfinite(grad_mixed))
         np.testing.assert_allclose(grad_mixed, grad64, rtol=1e-5)
 
