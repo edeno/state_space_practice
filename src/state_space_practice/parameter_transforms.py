@@ -17,12 +17,14 @@ Usage::
 """
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 import jax
 import jax.numpy as jnp
 from jax import Array
+
+from state_space_practice.utils import contains_tracer
 
 
 @dataclass(frozen=True)
@@ -50,14 +52,9 @@ def _dtype_tiny(x: Array) -> Array:
 
 def _check_array(condition: Array, message: str) -> None:
     """Validate concrete arrays while leaving traced JAX values jittable."""
-    try:
-        ok = bool(jnp.all(condition))
-    except (
-        jax.errors.ConcretizationTypeError,
-        jax.errors.TracerBoolConversionError,
-    ):
+    if contains_tracer(condition):
         return
-    if not ok:
+    if not bool(jnp.all(condition)):
         raise ValueError(message)
 
 
@@ -245,9 +242,7 @@ def _real_to_stochastic(logits: Array) -> Array:
     logits = _as_float_array(logits)
     if logits.shape[-1] == 0:
         return jnp.ones(logits.shape[:-1] + (1,), dtype=logits.dtype)
-    full_logits = jnp.concatenate(
-        [logits, jnp.zeros_like(logits[..., :1])], axis=-1
-    )
+    full_logits = jnp.concatenate([logits, jnp.zeros_like(logits[..., :1])], axis=-1)
     return jax.nn.softmax(full_logits, axis=-1)
 
 
@@ -272,7 +267,7 @@ def _validate_matching_keys(
     *,
     values_name: str,
     allow_missing_non_trainable: bool = False,
-    static_params: Optional[dict] = None,
+    static_params: dict | None = None,
 ) -> None:
     value_keys = set(values)
     spec_keys = set(spec)
@@ -315,7 +310,7 @@ def transform_to_constrained(
     unc_params: dict,
     spec: dict,
     *,
-    static_params: Optional[dict] = None,
+    static_params: dict | None = None,
 ) -> dict:
     """Transform a dict of unconstrained parameters back to constrained space.
 

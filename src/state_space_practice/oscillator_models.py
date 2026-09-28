@@ -36,71 +36,62 @@ Models
 import logging
 import math
 from abc import ABC, abstractmethod
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.em_driver import run_em
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.oscillator_utils import (
+    DirectedInfluenceDynamicsMixin,
     canonicalize_correlated_noise_pair_parameters,
+    compute_directed_influence_stability_scale,
     constrain_correlated_noise_process_covariance,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix,
     construct_correlated_noise_measurement_matrix,
     construct_correlated_noise_process_covariance,
-    compute_directed_influence_stability_scale,
     construct_directed_influence_measurement_matrix,
     construct_directed_influence_transition_matrix,
     extract_correlated_noise_params_from_covariance,
-    extract_dim_params_from_matrix,
     get_block_slice,
+    optimize_dim_transition_params_joint_until_stationary,
     project_correlated_noise_process_covariance,
-    project_coupled_transition_matrix,
+)
+from state_space_practice.parameter_transforms import (
+    POSITIVE,
+    PSD_MATRIX,
+    STOCHASTIC_ROW,
+    UNCONSTRAINED,
+)
+from state_space_practice.sgd_fitting import (
+    SGDFittableMixin,
+    reconstruct_per_state_array,
 )
 from state_space_practice.switching_kalman import (
     compute_process_covariance_sufficient_stats,
     compute_transition_sufficient_stats,
+    minimum_state_occupancy,
     optimize_dim_transition_params_joint,
     switching_kalman_filter,
     switching_kalman_maximization_step,
     switching_kalman_smoother,
     switching_kalman_smoother_gpb2,
+    warn_low_occupancy_states,
 )
-from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import (
-    check_converged,
     make_discrete_transition_matrix,
     shift_to_psd,
-    stabilize_transition_matrix,
+    symmetrize,
     validate_covariance,
+    validate_finite_array,
+    validate_nonnegative_array,
+    validate_unit_interval_array,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _validate_finite_array(name: str, value: ArrayLike) -> None:
-    """Validate finite model parameters at public boundaries."""
-    arr = jnp.asarray(value)
-    if bool(jnp.any(~jnp.isfinite(arr))):
-        raise ValueError(f"{name} must contain only finite values.")
-
-
-def _validate_nonnegative_array(name: str, value: ArrayLike) -> None:
-    """Validate finite, non-negative model parameters at public boundaries."""
-    arr = jnp.asarray(value)
-    _validate_finite_array(name, arr)
-    if bool(jnp.any(arr < 0)):
-        raise ValueError(f"{name} must be non-negative.")
-
-
-def _validate_unit_interval_array(name: str, value: ArrayLike) -> None:
-    """Validate finite parameters constrained to the closed unit interval."""
-    arr = jnp.asarray(value)
-    _validate_finite_array(name, arr)
-    if bool(jnp.any((arr < 0) | (arr > 1))):
-        raise ValueError(f"{name} entries must lie in [0, 1].")
 
 
 def _validate_positive_scalar(name: str, value: ArrayLike) -> None:
@@ -118,23 +109,6 @@ def _validate_positive_scalar(name: str, value: ArrayLike) -> None:
         raise ValueError(f"{name} must be a real scalar. Got {value!r}.") from None
     if not math.isfinite(numeric) or numeric <= 0:
         raise ValueError(f"{name} must be positive and finite. Got {value}.")
-
-
-def _dim_stability_scale(
-    freqs: ArrayLike,
-    damping_coef: ArrayLike,
-    coupling_strength: ArrayLike,
-    sampling_freq: float,
-    max_spectral_radius: float = 0.99,
-) -> Array:
-    """Compatibility wrapper for the shared differentiable DIM stability bound."""
-    return compute_directed_influence_stability_scale(
-        freqs,
-        damping_coef,
-        coupling_strength,
-        sampling_freq,
-        max_spectral_radius,
-    )
 
 
 # Update flags each oscillator subclass fixes by model definition (which of the
@@ -164,25 +138,229 @@ def _reject_forced_update_flags(model_name: str, kwargs: dict) -> None:
         )
 
 
-def _stabilize_transition_matrix(
-    A: ArrayLike, max_spectral_radius: float = 0.99
-) -> Array:
-    """Scale a transition matrix so its spectral radius is <= the bound.
+class OscillatorParameterBase:
+    """Parameter containers and dimensions shared by the oscillator model families.
 
-    Thin wrapper over :func:`state_space_practice.utils.stabilize_transition_matrix`;
-    kept for the eager per-state stability clamp in oscillator model M-steps.
+    Holds the switching state-space parameter set of an oscillator model
+    (initial continuous state, discrete-state prior and transition matrix,
+    continuous transition matrix, process and measurement matrices and
+    covariances -- one slice per discrete state on the trailing axis), the
+    model dimensions, the shape validation of that set, the smoother
+    posteriors read by ``decode`` / ``predict_proba``, and the storage side
+    of the ``SGDFittableMixin`` protocol (``_n_timesteps`` and the shared
+    measurement-covariance helpers). It carries no fitting algorithm:
+    :class:`BaseModel` layers EM on top for the linear-Gaussian oscillator
+    models, while the SGD-only Hamiltonian family combines this base with
+    ``SGDFittableMixin`` directly.
+
+    Parameters
+    ----------
+    n_oscillators : int
+        Number of latent oscillators.
+    n_discrete_states : int
+        Number of discrete latent states (network configurations).
+    n_sources : int
+        Number of observed sources or channels.
+    sampling_freq : float
+        Sampling frequency of the observations.
+
+    Attributes
+    ----------
+    init_mean : jax.Array
+        Initial mean (n_cont_states, n_discrete_states).
+    init_cov : jax.Array
+        Initial covariances (n_cont_states, n_cont_states, n_discrete_states).
+    init_discrete_state_prob : jax.Array
+        Initial discrete probabilities (n_discrete_states,).
+    discrete_transition_matrix : jax.Array
+        Discrete transition matrix (n_discrete_states, n_discrete_states).
+    continuous_transition_matrix : jax.Array
+        Continuous transition matrix (n_cont_states, n_cont_states, n_discrete_states).
+    process_cov : jax.Array
+        Process noise (n_cont_states, n_cont_states, n_discrete_states).
+    measurement_matrix : jax.Array
+        Observation matrix (n_obs_dim, n_cont_states, n_discrete_states).
+    measurement_cov : jax.Array
+        Observation noise (n_obs_dim, n_obs_dim, n_discrete_states).
+
     """
-    return stabilize_transition_matrix(A, max_spectral_radius=max_spectral_radius)
+
+    def __init__(
+        self,
+        n_oscillators: int,
+        n_discrete_states: int,
+        n_sources: int,
+        sampling_freq: float,
+    ):
+        _validate_positive_scalar("sampling_freq", sampling_freq)
+        self.n_oscillators = n_oscillators
+        self.n_discrete_states = n_discrete_states
+        self.n_sources = n_sources
+        self.sampling_freq = sampling_freq
+        self.n_cont_states = 2 * n_oscillators
+        # Length of the sequence most recently handed to fit_sgd; reported
+        # through ``_n_timesteps`` to normalize the SGD loss.
+        self._sgd_n_time = 0
+
+        # Placeholder for parameters - to be initialized by subclasses
+        self.init_mean: jax.Array
+        self.init_cov: jax.Array
+        self.init_discrete_state_prob: jax.Array
+        self.discrete_transition_matrix: jax.Array
+        self.continuous_transition_matrix: jax.Array
+        self.process_cov: jax.Array
+        self.measurement_matrix: jax.Array
+        self.measurement_cov: jax.Array
+
+        # Smoother posteriors read by decode()/predict_proba(). Optional
+        # because a failed E-step reset (see BaseModel._clear_smoother_state)
+        # sets them to None so those guards fire.
+        self.smoother_state_cond_mean: jax.Array | None
+        self.smoother_state_cond_cov: jax.Array | None
+        self.smoother_discrete_state_prob: jax.Array | None
+
+    def _repr_core_params(self) -> list[str]:
+        """``key=value`` strings for the dimensions shown by ``__repr__``."""
+        return [
+            f"n_oscillators={self.n_oscillators}",
+            f"n_discrete_states={self.n_discrete_states}",
+            f"n_sources={self.n_sources}",
+            f"sampling_freq={self.sampling_freq}",
+        ]
+
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__name__}: {', '.join(self._repr_core_params())}>"
+
+    def decode(self) -> jax.Array:
+        """Return the most likely discrete state at each time step.
+
+        Returns
+        -------
+        states : jax.Array, shape (n_time,)
+            Argmax of smoother discrete state probabilities.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted successfully.
+        """
+        return jnp.argmax(self._discrete_state_posterior("decode"), axis=1)
+
+    def predict_proba(self) -> jax.Array:
+        """Return smoothed discrete state probabilities.
+
+        Returns
+        -------
+        probs : jax.Array, shape (n_time, n_discrete_states)
+            Posterior probability of each discrete state at each time step.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted successfully.
+        """
+        return self._discrete_state_posterior("predict_proba")
+
+    def _discrete_state_posterior(self, caller: str) -> jax.Array:
+        """Return ``smoother_discrete_state_prob`` or raise if it is unset.
+
+        Parameters
+        ----------
+        caller : str
+            Public method name quoted in the error message.
+
+        Returns
+        -------
+        jax.Array, shape (n_time, n_discrete_states)
+        """
+        if (
+            not hasattr(self, "smoother_discrete_state_prob")
+            or self.smoother_discrete_state_prob is None
+        ):
+            # Worded without naming a fitting method: the EM models fit with
+            # ``fit`` / ``fit_sgd``, the Hamiltonian family with ``fit_sgd`` only.
+            raise NotFittedError(
+                "No smoother posteriors available. Fit the model first and "
+                f"ensure the fit produced a finite log-likelihood before {caller}()."
+            )
+        return self.smoother_discrete_state_prob
+
+    def _validate_parameter_shapes(self) -> None:
+        """Raise ``ValueError`` if a parameter container has the wrong shape."""
+        n, k, s = self.n_cont_states, self.n_discrete_states, self.n_sources
+        expected = {
+            "init_mean": (n, k),
+            "init_cov": (n, n, k),
+            "init_discrete_state_prob": (k,),
+            "discrete_transition_matrix": (k, k),
+            "continuous_transition_matrix": (n, n, k),
+            "process_cov": (n, n, k),
+            "measurement_matrix": (s, n, k),
+            "measurement_cov": (s, s, k),
+        }
+        for name, shape in expected.items():
+            actual = getattr(self, name).shape
+            if actual != shape:
+                raise ValueError(
+                    f"{name} shape mismatch: expected {shape}, got {actual}."
+                )
+
+    # --- SGDFittableMixin protocol: storage side shared by every subclass ---
+
+    @property
+    def _n_timesteps(self) -> int:
+        return self._sgd_n_time
+
+    def _reconstruct_per_state_array(
+        self, params: dict, prefix: str, fallback: Array
+    ) -> Array:
+        """See :func:`state_space_practice.sgd_fitting.reconstruct_per_state_array`."""
+        return reconstruct_per_state_array(
+            params, prefix, fallback, self.n_discrete_states
+        )
+
+    def _stack_shared_measurement_covariance(self, measurement_cov: Array) -> Array:
+        """Return a per-state stack from one shared observation covariance."""
+        cov_arr = jnp.asarray(measurement_cov)
+        if cov_arr.ndim == 3:
+            if cov_arr.shape[-1] != self.n_discrete_states:
+                raise ValueError(
+                    "measurement_cov state axis mismatch: expected "
+                    f"{self.n_discrete_states}, got {cov_arr.shape[-1]}."
+                )
+            return cov_arr
+        if cov_arr.shape != (self.n_sources, self.n_sources):
+            raise ValueError(
+                "shared measurement_cov must have shape "
+                f"({self.n_sources}, {self.n_sources}), got {cov_arr.shape}."
+            )
+        return jnp.stack([cov_arr] * self.n_discrete_states, axis=-1)
+
+    def _measurement_covariance_from_params(self, params: dict) -> Array:
+        """Get the shared observation covariance stack for SGD losses."""
+        if "measurement_cov" in params:
+            return self._stack_shared_measurement_covariance(params["measurement_cov"])
+        return self.measurement_cov
+
+    def _store_shared_measurement_covariance(self, params: dict) -> None:
+        """Store a shared observation covariance optimized by SGD."""
+        if "measurement_cov" in params:
+            self.measurement_cov = self._stack_shared_measurement_covariance(
+                params["measurement_cov"]
+            )
 
 
-class BaseModel(ABC, SGDFittableMixin):
-    """Abstract base class for switching oscillator models.
+class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
+    """EM-fitting layer for the switching oscillator models.
 
-    This class provides the core structure for Expectation-Maximization (EM)
-    based fitting of switching linear Gaussian state-space models,
-    specifically tailored for oscillator dynamics. Subclasses must implement
-    methods to initialize model-specific parameters and project them onto
-    valid spaces after M-steps.
+    Adds to :class:`OscillatorParameterBase` everything the
+    Expectation-Maximization fit of a switching linear-Gaussian oscillator
+    model needs: the abstract initialization hooks and
+    ``_project_parameters``, the E-/M-step machinery with rollback
+    snapshots, warm initialization, ``fit``, and a ``fit_sgd`` that runs the
+    same initialization before handing off to ``SGDFittableMixin``.
+    Subclasses must implement methods to initialize model-specific
+    parameters and project them onto valid spaces after M-steps.
 
     Parameters
     ----------
@@ -220,26 +398,19 @@ class BaseModel(ABC, SGDFittableMixin):
         Approximate switching smoother. GPB2 retains pair-conditioned
         continuous-state statistics and is more accurate but more expensive.
 
-    Attributes
-    ----------
-    init_mean : jax.Array
-        Initial mean (n_cont_states, n_discrete_states).
-    init_cov : jax.Array
-        Initial covariances (n_cont_states, n_cont_states, n_discrete_states).
-    init_discrete_state_prob : jax.Array
-        Initial discrete probabilities (n_discrete_states,).
-    discrete_transition_matrix : jax.Array
-        Discrete transition matrix (n_discrete_states, n_discrete_states).
-    continuous_transition_matrix : jax.Array
-        Continuous transition matrix (n_cont_states, n_cont_states, n_discrete_states).
-    process_cov : jax.Array
-        Process noise (n_cont_states, n_cont_states, n_discrete_states).
-    measurement_matrix : jax.Array
-        Observation matrix (n_obs_dim, n_cont_states, n_discrete_states).
-    measurement_cov : jax.Array
-        Observation noise (n_obs_dim, n_obs_dim, n_discrete_states).
-
+    See :class:`OscillatorParameterBase` for the parameter attributes.
     """
+
+    # Plain SGD parameters stored by the mapping-driven default; the shared
+    # ``measurement_cov`` and per-state ``init_cov_{j}`` keys are restacked by
+    # ``BaseModel._store_sgd_params``, and subclasses store their additional
+    # params (coupling, etc.) in overrides.
+    _sgd_param_attrs = {
+        "measurement_matrix": "measurement_matrix",
+        "discrete_transition_matrix": "discrete_transition_matrix",
+        "init_mean": "init_mean",
+        "init_discrete_state_prob": "init_discrete_state_prob",
+    }
 
     _EM_SNAPSHOT_KEYS = (
         "smoother_state_cond_mean",
@@ -272,7 +443,7 @@ class BaseModel(ABC, SGDFittableMixin):
         n_discrete_states: int,
         n_sources: int,
         sampling_freq: float,
-        discrete_transition_diag: Optional[jax.Array] = None,
+        discrete_transition_diag: jax.Array | None = None,
         stickiness: float = 0.0,
         update_discrete_transition_matrix: bool = True,
         update_continuous_transition_matrix: bool = True,
@@ -283,17 +454,17 @@ class BaseModel(ABC, SGDFittableMixin):
         update_init_cov: bool = True,
         smoother_type: str = "gpb1",
     ):
-        _validate_positive_scalar("sampling_freq", sampling_freq)
+        super().__init__(
+            n_oscillators=n_oscillators,
+            n_discrete_states=n_discrete_states,
+            n_sources=n_sources,
+            sampling_freq=sampling_freq,
+        )
         if smoother_type not in ("gpb1", "gpb2"):
             raise ValueError(
                 f"smoother_type must be 'gpb1' or 'gpb2', got {smoother_type!r}."
             )
-        self.n_oscillators = n_oscillators
-        self.n_discrete_states = n_discrete_states
-        self.n_sources = n_sources
-        self.sampling_freq = sampling_freq
         self.smoother_type = smoother_type
-        self.n_cont_states = 2 * n_oscillators
 
         # Set default diagonal if not provided.
         # Default: ~1s expected dwell time, computed from sampling_freq.
@@ -351,27 +522,15 @@ class BaseModel(ABC, SGDFittableMixin):
         self.update_init_mean = update_init_mean
         self.update_init_cov = update_init_cov
 
-        # Placeholder for parameters - to be initialized by subclasses
-        self.init_mean: jax.Array
-        self.init_cov: jax.Array
-        self.init_discrete_state_prob: jax.Array
-        self.discrete_transition_matrix: jax.Array
-        self.continuous_transition_matrix: jax.Array
-        self.process_cov: jax.Array
-        self.measurement_matrix: jax.Array
-        self.measurement_cov: jax.Array
-
-        # Placeholders for smoother results (Expected Sufficient Statistics - ESS).
-        # Optional because a failed E-step reset (see _clear_smoother_state)
-        # sets them to None so decode()/predict_proba() guards fire.
-        self.smoother_state_cond_mean: Optional[jax.Array]
-        self.smoother_state_cond_cov: Optional[jax.Array]
-        self.smoother_discrete_state_prob: Optional[jax.Array]
-        self.smoother_joint_discrete_state_prob: Optional[jax.Array]
-        self.smoother_pair_cond_cross_cov: Optional[jax.Array]
-        self.smoother_pair_cond_means: Optional[jax.Array]  # E[x|S_t=i,S_{t+1}=j]
-        self.smoother_pair_cond_covs: Optional[jax.Array]
-        self.smoother_next_pair_cond_means: Optional[jax.Array]
+        # Placeholders for the pairwise smoother results (Expected Sufficient
+        # Statistics - ESS) only the EM M-step consumes; the marginal ones are
+        # declared on OscillatorParameterBase. Optional because a failed
+        # E-step reset (see _clear_smoother_state) sets them to None.
+        self.smoother_joint_discrete_state_prob: jax.Array | None
+        self.smoother_pair_cond_cross_cov: jax.Array | None
+        self.smoother_pair_cond_means: jax.Array | None  # E[x|S_t=i,S_{t+1}=j]
+        self.smoother_pair_cond_covs: jax.Array | None
+        self.smoother_next_pair_cond_means: jax.Array | None
 
     def _snapshot_em_state(self) -> dict:
         """Capture parameters and smoother outputs for EM rollback.
@@ -425,11 +584,7 @@ class BaseModel(ABC, SGDFittableMixin):
             A string showing the model class name and its core parameters.
         """
         # Collect the core parameters
-        params = [
-            f"n_oscillators={self.n_oscillators}",
-            f"n_discrete_states={self.n_discrete_states}",
-            f"n_sources={self.n_sources}",
-            f"sampling_freq={self.sampling_freq}",
+        params = self._repr_core_params() + [
             f"smoother_type={self.smoother_type!r}",
         ]
 
@@ -448,58 +603,14 @@ class BaseModel(ABC, SGDFittableMixin):
 
         return f"<{self.__class__.__name__}: {', '.join(params)}, [{flags_str}]>"
 
-    def decode(self) -> jax.Array:
-        """Return the most likely discrete state at each time step.
-
-        Returns
-        -------
-        states : jax.Array, shape (n_time,)
-            Argmax of smoother discrete state probabilities.
-
-        Raises
-        ------
-        RuntimeError
-            If called before fit() or fit_sgd().
-        """
-        if (
-            not hasattr(self, "smoother_discrete_state_prob")
-            or self.smoother_discrete_state_prob is None
-        ):
-            raise RuntimeError(
-                "No smoother posteriors available. Call fit() or fit_sgd() and "
-                "ensure it produced a finite log-likelihood before decode()."
-            )
-        return jnp.argmax(self.smoother_discrete_state_prob, axis=1)
-
-    def predict_proba(self) -> jax.Array:
-        """Return smoothed discrete state probabilities.
-
-        Returns
-        -------
-        probs : jax.Array, shape (n_time, n_discrete_states)
-            Posterior probability of each discrete state at each time step.
-
-        Raises
-        ------
-        RuntimeError
-            If called before fit() or fit_sgd().
-        """
-        if (
-            not hasattr(self, "smoother_discrete_state_prob")
-            or self.smoother_discrete_state_prob is None
-        ):
-            raise RuntimeError(
-                "No smoother posteriors available. Call fit() or fit_sgd() and "
-                "ensure it produced a finite log-likelihood before "
-                "predict_proba()."
-            )
-        return self.smoother_discrete_state_prob
-
     def _warm_initialize_states(self, observations: ArrayLike) -> None:
-        """Warm-initialize discrete state priors and per-state init_mean.
+        """Warm-initialize the per-state parameters and discrete state priors.
 
         Uses windowed cross-covariance features clustered with a Gaussian
-        mixture model to break symmetry before the first E-step.  Sets
+        mixture model to break symmetry before the first E-step.  The window
+        responsibilities seed one M-step, so every state's learned parameters
+        start from its own windows (see
+        ``_seed_state_parameters_from_windows``).  Sets
         ``init_discrete_state_prob`` from GMM mixing weights and scales
         ``init_cov`` to match data variance.  For models with a single shared
         measurement matrix it also sets per-state ``init_mean`` via the H
@@ -583,6 +694,9 @@ class BaseModel(ABC, SGDFittableMixin):
         )
         gmm.fit(features)
         labels = gmm.predict(features)
+        self._seed_state_parameters_from_windows(
+            gmm.predict_proba(features), obs_np, windowed.shape[1]
+        )
 
         # Per-state init_mean via H pseudo-inverse -- only meaningful when H is
         # shared across discrete states. For state-dependent H (COM), skip it.
@@ -614,6 +728,79 @@ class BaseModel(ABC, SGDFittableMixin):
         smoothed = weights * (1.0 - eps) + eps / n_states
         smoothed = smoothed / smoothed.sum()
         self.init_discrete_state_prob = jnp.array(smoothed)
+
+    def _seed_state_parameters_from_windows(
+        self, window_state_prob, obs_np, window: int
+    ) -> None:
+        """Seed the per-state parameters with one M-step on the window clusters.
+
+        Without this, warm initialization only touched the prior of the first
+        discrete state, ``init_mean`` and ``init_cov``: at a symmetric start
+        (e.g. DIM with zero initial coupling, so every ``A_j`` is identical)
+        the first E-step posterior is then the Markov-chain prior whatever the
+        clustering found, and warm and cold starts segment at chance.  Here
+        the window responsibilities (expanded to every time step, softened to
+        a 0.05 floor) replace the discrete posterior of an E-step run at the
+        current parameters, and one M-step fits each state's parameters (A, H,
+        Q, R as the model learns them) to its own windows.  The discrete
+        transition matrix, the initial discrete distribution and the initial
+        continuous state are left as they were: a joint posterior built from
+        independent window labels carries no dwell-time information, and the
+        initial-state quantities are set by the rest of warm initialization.
+        The seeding is skipped (parameters restored) if the E-step fails.
+
+        Parameters
+        ----------
+        window_state_prob : array, shape (n_windows, n_discrete_states)
+            GMM responsibilities of each window.
+        obs_np : array, shape (n_time, n_sources)
+        window : int
+            Window length in time steps.
+        """
+        import numpy as np_cpu
+
+        n_time = obs_np.shape[0]
+        n_states = self.n_discrete_states
+        probs = np_cpu.repeat(np_cpu.asarray(window_state_prob), window, axis=0)
+        if probs.shape[0] < n_time:
+            probs = np_cpu.concatenate(
+                [probs, np_cpu.tile(probs[-1], (n_time - probs.shape[0], 1))]
+            )
+        probs = probs[:n_time] * 0.9 + 0.05 / n_states
+        probs = probs / probs.sum(axis=1, keepdims=True)
+        joint = probs[:-1, :, None] * probs[1:, None, :]
+        joint = joint / joint.sum(axis=(1, 2), keepdims=True)
+
+        snapshot = self._snapshot_em_state()
+        observations = jnp.asarray(obs_np)
+        # Seeding is initialization, not an EM iteration: call the class's
+        # E-/M-step implementations so instance-level instrumentation of the
+        # EM loop (e.g. a wrapped ``model._e_step``) sees only EM iterations.
+        cls = type(self)
+        log_likelihood = float(cls._e_step(self, observations))
+        if not math.isfinite(log_likelihood):
+            logger.warning(
+                "Warm-init seeding skipped: non-finite E-step log-likelihood "
+                "at the initial parameters; per-state parameters were not "
+                "seeded from the window clusters."
+            )
+            self._restore_em_state(snapshot)
+            self._clear_smoother_state()
+            return
+        self.smoother_discrete_state_prob = jnp.asarray(probs)
+        self.smoother_joint_discrete_state_prob = jnp.asarray(joint)
+        cls._m_step(self, observations)
+        cls._project_parameters(self)
+        for name in (
+            "discrete_transition_matrix",
+            "init_discrete_state_prob",
+            "init_mean",
+            "init_cov",
+        ):
+            setattr(self, name, snapshot[name])
+        # The smoother outputs belong to an E-step with overridden weights;
+        # drop them so nothing downstream mistakes them for a posterior.
+        self._clear_smoother_state()
 
     def _initialize_discrete_state_prob(self) -> None:
         """Initializes the starting probability for each discrete state."""
@@ -694,70 +881,7 @@ class BaseModel(ABC, SGDFittableMixin):
         self._initialize_measurement_covariance()
         self._initialize_continuous_transition_matrix()
         self._initialize_process_covariance()
-
-        if self.init_mean.shape != (self.n_cont_states, self.n_discrete_states):
-            raise ValueError(
-                f"init_mean shape mismatch: expected ({self.n_cont_states}, {self.n_discrete_states}), "
-                f"got {self.init_mean.shape}."
-            )
-        if self.init_cov.shape != (
-            self.n_cont_states,
-            self.n_cont_states,
-            self.n_discrete_states,
-        ):
-            raise ValueError(
-                f"init_cov shape mismatch: expected ({self.n_cont_states}, {self.n_cont_states}, {self.n_discrete_states}), "
-                f"got {self.init_cov.shape}."
-            )
-        if self.init_discrete_state_prob.shape != (self.n_discrete_states,):
-            raise ValueError(
-                f"init_discrete_state_prob shape mismatch: expected ({self.n_discrete_states},), "
-                f"got {self.init_discrete_state_prob.shape}."
-            )
-        if self.discrete_transition_matrix.shape != (
-            self.n_discrete_states,
-            self.n_discrete_states,
-        ):
-            raise ValueError(
-                f"discrete_transition_matrix shape mismatch: expected ({self.n_discrete_states}, {self.n_discrete_states}), "
-                f"got {self.discrete_transition_matrix.shape}."
-            )
-        if self.continuous_transition_matrix.shape != (
-            self.n_cont_states,
-            self.n_cont_states,
-            self.n_discrete_states,
-        ):
-            raise ValueError(
-                f"continuous_transition_matrix shape mismatch: expected ({self.n_cont_states}, {self.n_cont_states}, {self.n_discrete_states}), "
-                f"got {self.continuous_transition_matrix.shape}."
-            )
-        if self.process_cov.shape != (
-            self.n_cont_states,
-            self.n_cont_states,
-            self.n_discrete_states,
-        ):
-            raise ValueError(
-                f"process_cov shape mismatch: expected ({self.n_cont_states}, {self.n_cont_states}, {self.n_discrete_states}), "
-                f"got {self.process_cov.shape}."
-            )
-        if self.measurement_matrix.shape != (
-            self.n_sources,
-            self.n_cont_states,
-            self.n_discrete_states,
-        ):
-            raise ValueError(
-                f"measurement_matrix shape mismatch: expected ({self.n_sources}, {self.n_cont_states}, {self.n_discrete_states}), "
-                f"got {self.measurement_matrix.shape}."
-            )
-        if self.measurement_cov.shape != (
-            self.n_sources,
-            self.n_sources,
-            self.n_discrete_states,
-        ):
-            raise ValueError(
-                f"measurement_cov shape mismatch: expected ({self.n_sources}, {self.n_sources}, {self.n_discrete_states}), "
-                f"got {self.measurement_cov.shape}."
-            )
+        self._validate_parameter_shapes()
 
     def _e_step(self, observations: ArrayLike) -> jax.Array:
         """Performs the Expectation (E) step of the approximate EM algorithm.
@@ -798,13 +922,13 @@ class BaseModel(ABC, SGDFittableMixin):
             measurement_cov=self.measurement_cov,
         )
 
-        smoother_args = dict(
-            filter_mean=filter_mean,
-            filter_cov=filter_cov,
-            filter_discrete_state_prob=filter_discrete_state_prob,
-            process_cov=self.process_cov,
-            continuous_transition_matrix=self.continuous_transition_matrix,
-        )
+        smoother_args = {
+            "filter_mean": filter_mean,
+            "filter_cov": filter_cov,
+            "filter_discrete_state_prob": filter_discrete_state_prob,
+            "process_cov": self.process_cov,
+            "continuous_transition_matrix": self.continuous_transition_matrix,
+        }
 
         if self.smoother_type == "gpb2":
             (
@@ -838,7 +962,6 @@ class BaseModel(ABC, SGDFittableMixin):
                 self.smoother_pair_cond_means,
             ) = switching_kalman_smoother(
                 **smoother_args,
-                last_filter_conditional_cont_mean=pair_cond_filter_mean[-1],
                 discrete_state_transition_matrix=self.discrete_transition_matrix,
             )
             self.smoother_pair_cond_covs = None
@@ -885,6 +1008,7 @@ class BaseModel(ABC, SGDFittableMixin):
             pair_cond_smoother_covs=self.smoother_pair_cond_covs,
             next_pair_cond_smoother_means=self.smoother_next_pair_cond_means,
             transition_prior=self.transition_prior,
+            **self._m_step_fixed_and_previous_params(),
         )
 
         # Update parameters based on flags
@@ -905,35 +1029,39 @@ class BaseModel(ABC, SGDFittableMixin):
         # Always update init_prob based on the first smoother probability
         self.init_discrete_state_prob = pi0
 
-    def _stack_shared_measurement_covariance(self, measurement_cov: Array) -> Array:
-        """Return a per-state stack from one shared observation covariance."""
-        cov_arr = jnp.asarray(measurement_cov)
-        if cov_arr.ndim == 3:
-            if cov_arr.shape[-1] != self.n_discrete_states:
-                raise ValueError(
-                    "measurement_cov state axis mismatch: expected "
-                    f"{self.n_discrete_states}, got {cov_arr.shape[-1]}."
-                )
-            return cov_arr
-        if cov_arr.shape != (self.n_sources, self.n_sources):
-            raise ValueError(
-                "shared measurement_cov must have shape "
-                f"({self.n_sources}, {self.n_sources}), got {cov_arr.shape}."
-            )
-        return jnp.stack([cov_arr] * self.n_discrete_states, axis=-1)
+    def _m_step_fixed_and_previous_params(
+        self, transition_matrix_fixed: bool | None = None
+    ) -> dict:
+        """Keyword arguments tying the generic M-step to this model's structure.
 
-    def _measurement_covariance_from_params(self, params: dict) -> Array:
-        """Get the shared observation covariance stack for SGD losses."""
-        if "measurement_cov" in params:
-            return self._stack_shared_measurement_covariance(params["measurement_cov"])
-        return self.measurement_cov
+        A matrix the model does not learn (``update_*`` False) is passed as
+        fixed, so the covariance installed alongside it is the optimum *for that
+        matrix* (not the shortcut that assumes the unconstrained solution). The
+        current parameters are forwarded so an under-occupied discrete state
+        keeps them instead of receiving an unidentified estimate.
 
-    def _store_shared_measurement_covariance(self, params: dict) -> None:
-        """Store a shared observation covariance optimized by SGD."""
-        if "measurement_cov" in params:
-            self.measurement_cov = self._stack_shared_measurement_covariance(
-                params["measurement_cov"]
-            )
+        Parameters
+        ----------
+        transition_matrix_fixed : bool or None
+            Override for whether ``A`` is held fixed during the covariance
+            update (defaults to ``not update_continuous_transition_matrix``).
+        """
+        if transition_matrix_fixed is None:
+            transition_matrix_fixed = not self.update_continuous_transition_matrix
+        return {
+            "fixed_measurement_matrix": (
+                None if self.update_measurement_matrix else self.measurement_matrix
+            ),
+            "fixed_continuous_transition_matrix": (
+                self.continuous_transition_matrix if transition_matrix_fixed else None
+            ),
+            "previous_params": {
+                "continuous_transition_matrix": self.continuous_transition_matrix,
+                "measurement_matrix": self.measurement_matrix,
+                "process_cov": self.process_cov,
+                "measurement_cov": self.measurement_cov,
+            },
+        }
 
     def _pool_measurement_covariance(self, per_state_cov: Array) -> Array:
         """Pool per-state Kalman M-step covariances into one shared R.
@@ -948,7 +1076,7 @@ class BaseModel(ABC, SGDFittableMixin):
         state_weights = jnp.sum(self.smoother_discrete_state_prob, axis=0)
         total_weight = jnp.maximum(jnp.sum(state_weights), 1e-12)
         pooled = jnp.einsum("j,abj->ab", state_weights, per_state_cov) / total_weight
-        pooled = 0.5 * (pooled + pooled.T)
+        pooled = symmetrize(pooled)
         return self._stack_shared_measurement_covariance(pooled)
 
     def fit(
@@ -990,126 +1118,39 @@ class BaseModel(ABC, SGDFittableMixin):
         if not skip_init:
             self._initialize_parameters(key)
             self._warm_initialize_states(observations)
-        log_likelihoods: list[float] = []
-        last_accepted_state: Optional[dict] = None
-        needs_final_e_step = False
 
-        for iteration in range(max_iter):
-            current_log_likelihood = float(self._e_step(observations))
-            log_likelihoods.append(current_log_likelihood)
-            needs_final_e_step = False
-
-            if not jnp.isfinite(current_log_likelihood):
-                bad_ll = log_likelihoods.pop()
-                if last_accepted_state is not None:
-                    self._restore_em_state(last_accepted_state)
-                    logger.warning(
-                        f"Non-finite log-likelihood at iteration {iteration + 1} "
-                        f"({bad_ll}); rolling back to previous E-step and "
-                        f"stopping EM."
-                    )
-                else:
-                    # No earlier accepted state to roll back to: the failed
-                    # E-step already installed NaN posteriors, so drop them
-                    # rather than let decode()/predict_proba() return garbage.
-                    self._clear_smoother_state()
-                    logger.warning(
-                        f"Non-finite log-likelihood at iteration {iteration + 1} "
-                        f"with no usable previous state; clearing posteriors and "
-                        f"stopping EM."
-                    )
-                self.converged_ = False
-                break
-
-            if iteration > 0:
-                # The GPB1 E-step is approximate, so exact monotonicity is not
-                # guaranteed. We deliberately stop on the first LL decrease:
-                # within-tol decreases fall through to the is_converged check
-                # below (treated as a plateau), while larger decreases roll
-                # back to the last accepted state. Continuing past a real
-                # decrease would risk drifting away from a good iterate.
-                is_converged, is_increasing = check_converged(
-                    current_log_likelihood, log_likelihoods[-2], tol
-                )
-
-                if not is_increasing:
-                    bad_ll = log_likelihoods.pop()
-                    if last_accepted_state is not None:
-                        self._restore_em_state(last_accepted_state)
-                    logger.warning(
-                        f"LL decreased: {log_likelihoods[-1]:.4f} -> "
-                        f"{bad_ll:.4f}; rolling back to previous E-step "
-                        f"and stopping EM."
-                    )
-                    self.converged_ = False
-                    break
-
-                if is_converged:
-                    logger.info(f"Converged after {iteration + 1} iterations.")
-                    self.converged_ = True
-                    break
-
-            last_accepted_state = self._snapshot_em_state()
+        def _m_step_and_project() -> None:
             self._m_step(observations)
             self._project_parameters()
-            needs_final_e_step = True
 
-            change = (
-                current_log_likelihood - log_likelihoods[-2]
-                if iteration > 0
-                else float("nan")
-            )
-            logger.info(
-                f"Iteration {iteration + 1}/{max_iter}\t"
-                f"Log-Likelihood: {current_log_likelihood:.4f}\t"
-                f"Change: {change:.4f}"
-            )
-        else:
-            self.converged_ = False
-            logger.warning("Reached maximum iterations without converging.")
-
-        # Final E-step to sync smoother results with current parameters.
-        # Without this, the stored posteriors correspond to the previous
-        # iteration's parameters after the last M-step. If the final refresh
-        # reveals that the last M-step was bad, roll back to the last accepted
-        # E-step state instead of returning inconsistent parameters.
-        if needs_final_e_step:
-            final_ll = float(self._e_step(observations))
-            if not jnp.isfinite(final_ll):
-                if last_accepted_state is not None:
-                    self._restore_em_state(last_accepted_state)
-                logger.warning(
-                    "Final E-step produced non-finite log-likelihood; "
-                    "rolling back to previous E-step."
-                )
-                self.converged_ = False
-            elif log_likelihoods:
-                _, is_increasing = check_converged(final_ll, log_likelihoods[-1], tol)
-                if is_increasing:
-                    log_likelihoods.append(final_ll)
-                else:
-                    if last_accepted_state is not None:
-                        self._restore_em_state(last_accepted_state)
-                    logger.warning(
-                        f"Final E-step decreased LL: {log_likelihoods[-1]:.4f} -> "
-                        f"{final_ll:.4f}; rolling back to previous E-step."
-                    )
-                    self.converged_ = False
-            else:
-                log_likelihoods.append(final_ll)
-
-        return log_likelihoods
+        # The GPB1 E-step is approximate, so the driver stops on the first
+        # rejected step (non-finite or decreasing LL) and rolls back to the
+        # last accepted (parameters, posteriors) pair; with no accepted state
+        # yet, the NaN posteriors the failed E-step installed are cleared.
+        result = run_em(
+            lambda: float(self._e_step(observations)),
+            _m_step_and_project,
+            self._snapshot_em_state,
+            self._restore_em_state,
+            max_iter=max_iter,
+            tol=tol,
+            on_first_nonfinite="clear",
+            clear_state=self._clear_smoother_state,
+            logger=logger,
+        )
+        self.converged_ = result.converged
+        return result.log_likelihoods
 
     # --- SGDFittableMixin protocol (shared by all oscillator subclasses) ---
 
-    def fit_sgd(  # type: ignore[override]  # concrete signature vs mixin *args/**kwargs
+    def fit_sgd(
         self,
         observations: ArrayLike,
         key: Array | None = None,
-        optimizer: Optional[object] = None,
+        optimizer: object | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
         skip_init: bool = False,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
@@ -1152,10 +1193,6 @@ class BaseModel(ABC, SGDFittableMixin):
             convergence_tol=convergence_tol,
         )
 
-    @property
-    def _n_timesteps(self) -> int:
-        return self._sgd_n_time
-
     def _check_sgd_initialized(self) -> None:
         if (
             not hasattr(self, "continuous_transition_matrix")
@@ -1166,41 +1203,21 @@ class BaseModel(ABC, SGDFittableMixin):
             )
 
     def _store_sgd_params(self, params: dict) -> None:
-        if "measurement_matrix" in params:
-            self.measurement_matrix = params["measurement_matrix"]
-        if "measurement_cov" in params:
-            self.measurement_cov = params["measurement_cov"]
-        if "discrete_transition_matrix" in params:
-            self.discrete_transition_matrix = params["discrete_transition_matrix"]
-        if "init_mean" in params:
-            self.init_mean = params["init_mean"]
-        if "init_cov" in params:
-            self.init_cov = params["init_cov"]
-        if "init_discrete_state_prob" in params:
-            self.init_discrete_state_prob = params["init_discrete_state_prob"]
-        # Subclasses may store additional params (coupling, etc.)
+        """Store the plain keys, then rebuild the per-state covariance stacks.
+
+        The param specs optimize one shared ``(n_sources, n_sources)``
+        ``measurement_cov`` and one ``init_cov_{j}`` per discrete state; both
+        are restacked here into their ``(..., n_discrete_states)`` containers.
+        Subclasses store their model-specific params on top.
+        """
+        super()._store_sgd_params(params)
+        self._store_shared_measurement_covariance(params)
+        self.init_cov = self._reconstruct_per_state_array(
+            params, "init_cov", self.init_cov
+        )
 
     def _finalize_sgd(self, observations: ArrayLike) -> None:
         self._e_step(observations)
-
-    def _reconstruct_per_state_array(
-        self, params: dict, prefix: str, fallback: Array
-    ) -> Array:
-        """Reconstruct a (…, n_discrete_states) array from per-state PSD params.
-
-        Used by subclass _sgd_loss_fn and _store_sgd_params to reassemble
-        arrays like measurement_cov and init_cov from per-state keys
-        (e.g. "measurement_cov_0", "measurement_cov_1", ...).
-        """
-        if not any(k.startswith(f"{prefix}_") for k in params):
-            return fallback
-        return jnp.stack(
-            [
-                params.get(f"{prefix}_{j}", fallback[..., j])
-                for j in range(self.n_discrete_states)
-            ],
-            axis=-1,
-        )
 
     # Subclasses must implement _build_param_spec and _sgd_loss_fn
 
@@ -1245,21 +1262,21 @@ class CommonOscillatorModel(BaseModel):
             raise ValueError(
                 f"Shape mismatch: freqs {freqs.shape} vs n_oscillators {n_oscillators}"
             )
-        _validate_finite_array("freqs", freqs)
+        validate_finite_array("freqs", freqs)
         self.freqs = freqs
 
         if damping_coef.shape != (n_oscillators,):
             raise ValueError(
                 f"Shape mismatch: damping_coef {damping_coef.shape} vs n_oscillators {n_oscillators}"
             )
-        _validate_unit_interval_array("damping_coef", damping_coef)
+        validate_unit_interval_array("damping_coef", damping_coef)
         self.damping_coef = damping_coef
 
         if process_variance.shape != (n_oscillators,):
             raise ValueError(
                 f"Shape mismatch: process_variance {process_variance.shape} vs n_oscillators {n_oscillators}"
             )
-        _validate_nonnegative_array("process_variance", process_variance)
+        validate_nonnegative_array("process_variance", process_variance)
         self.process_variance = process_variance
 
         _validate_positive_scalar("measurement_variance", measurement_variance)
@@ -1401,12 +1418,6 @@ class CommonOscillatorModel(BaseModel):
     # --- SGDFittableMixin: COM-specific param spec and loss ---
 
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            PSD_MATRIX,
-            STOCHASTIC_ROW,
-            UNCONSTRAINED,
-        )
-
         params: dict = {}
         spec: dict = {}
 
@@ -1450,13 +1461,6 @@ class CommonOscillatorModel(BaseModel):
         )
         return -jnp.asarray(result[6])  # scalar marginal_ll
 
-    def _store_sgd_params(self, params: dict) -> None:
-        super()._store_sgd_params(params)
-        self._store_shared_measurement_covariance(params)
-        self.init_cov = self._reconstruct_per_state_array(
-            params, "init_cov", self.init_cov
-        )
-
 
 class CorrelatedNoiseModel(BaseModel):
     """Correlated Noise Model (CNM).
@@ -1486,12 +1490,13 @@ class CorrelatedNoiseModel(BaseModel):
         may be supplied in the strict upper triangle, strict lower triangle, or
         both triangles if the two entries agree; values are stored canonically in
         the strict upper triangle.
-    use_reparameterized_mstep : bool, default=False
-        If True, use the exact joint constrained CNM covariance M-step. It
-        updates variance, coupling, and phase together from the fixed-transition
-        residual covariance while guaranteeing CNM block structure and positive
-        semidefiniteness. If False, retain the generic covariance M-step followed
-        by structural projection.
+    use_reparameterized_mstep : bool, default=True
+        If True (default), use the exact joint constrained CNM covariance
+        M-step. It updates variance, coupling, and phase together from the
+        fixed-transition residual covariance while guaranteeing CNM block
+        structure and positive semidefiniteness. If False, use the generic
+        covariance M-step (evaluated at the fixed ``A`` and ``H``) followed by
+        structural projection.
     """
 
     def __init__(
@@ -1505,7 +1510,7 @@ class CorrelatedNoiseModel(BaseModel):
         measurement_variance: float,
         phase_difference: jax.Array,
         coupling_strength: jax.Array,
-        use_reparameterized_mstep: bool = False,
+        use_reparameterized_mstep: bool = True,
         **kwargs,
     ):
         # n_sources is fixed to n_oscillators for CNM (passed to super below).
@@ -1530,9 +1535,9 @@ class CorrelatedNoiseModel(BaseModel):
                 "process_variance must have shape (n_oscillators, n_discrete_states)."
                 f" Got {process_variance.shape}."
             )
-        _validate_finite_array("freqs", freqs)
-        _validate_unit_interval_array("damping_coef", damping_coef)
-        _validate_nonnegative_array("process_variance", process_variance)
+        validate_finite_array("freqs", freqs)
+        validate_unit_interval_array("damping_coef", damping_coef)
+        validate_nonnegative_array("process_variance", process_variance)
         if phase_difference.shape != (n_oscillators, n_oscillators, n_discrete_states):
             raise ValueError(
                 "phase_difference must have shape (n_oscillators, n_oscillators, n_discrete_states)."
@@ -1663,12 +1668,21 @@ class CorrelatedNoiseModel(BaseModel):
             ],
             axis=-1,
         )
+        # A state with fewer than n_cont_states + 1 expected transitions has an
+        # unidentified residual covariance: keep its previous Q (and warn).
+        min_count = minimum_state_occupancy(residual_scatter.shape[0])
+        warn_low_occupancy_states(
+            state_counts,
+            min_count,
+            "CorrelatedNoiseModel constrained Q M-step",
+            "their process covariance kept its previous value",
+        )
         updated = []
         for j in range(self.n_discrete_states):
             count = state_counts[j]
             target = residual_scatter[..., j] / jnp.maximum(count, 1e-12)
             constrained = constrain_correlated_noise_process_covariance(target)
-            updated.append(jnp.where(count > 1e-8, constrained, previous[..., j]))
+            updated.append(jnp.where(count >= min_count, constrained, previous[..., j]))
         self.process_cov = jnp.stack(updated, axis=-1)
         self._sync_process_covariance_params()
 
@@ -1729,13 +1743,6 @@ class CorrelatedNoiseModel(BaseModel):
     # --- SGDFittableMixin: CNM-specific param spec and loss ---
 
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            PSD_MATRIX,
-            POSITIVE,
-            STOCHASTIC_ROW,
-            UNCONSTRAINED,
-        )
-
         params: dict = {}
         spec: dict = {}
 
@@ -1832,13 +1839,9 @@ class CorrelatedNoiseModel(BaseModel):
             )(self.process_variance, self.phase_difference, self.coupling_strength)
             self.process_cov = jax.vmap(shift_to_psd, in_axes=-1, out_axes=-1)(Q_raw)
             self._sync_process_covariance_params()
-        self._store_shared_measurement_covariance(params)
-        self.init_cov = self._reconstruct_per_state_array(
-            params, "init_cov", self.init_cov
-        )
 
 
-class DirectedInfluenceModel(BaseModel):
+class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
     """Directed Influence Model (DIM).
 
     In this model, the **continuous transition matrix (A)** depends on the
@@ -1868,7 +1871,8 @@ class DirectedInfluenceModel(BaseModel):
     max_spectral_radius : float, default=0.99
         Target upper bound on the spectral radius of each state's transition
         matrix. The differentiable stability scale shrinks damping and coupling
-        so the block-row operator-norm bound stays at or below this value. A
+        so the spectral radius of every state's transition matrix stays at or
+        below this value. A
         larger radius (closer to one) permits longer memory and a narrower
         spectral peak: the resolvable half-power bandwidth is
         ``delta_f ~= (1 - radius) * fs / pi``, so at ``fs = 1 kHz`` the default
@@ -1911,19 +1915,19 @@ class DirectedInfluenceModel(BaseModel):
             raise ValueError(
                 f"Shape mismatch: freqs {freqs.shape} vs n_oscillators {n_oscillators}"
             )
-        _validate_finite_array("freqs", freqs)
+        validate_finite_array("freqs", freqs)
         self.freqs = freqs
         if damping_coef.shape != (n_oscillators,):
             raise ValueError(
                 f"Shape mismatch: damping_coef {damping_coef.shape} vs n_oscillators {n_oscillators}"
             )
-        _validate_unit_interval_array("damping_coef", damping_coef)
+        validate_unit_interval_array("damping_coef", damping_coef)
         self.damping_coef = damping_coef
         if process_variance.shape != (n_oscillators,):
             raise ValueError(
                 f"Shape mismatch: process_variance {process_variance.shape} vs n_oscillators {n_oscillators}"
             )
-        _validate_nonnegative_array("process_variance", process_variance)
+        validate_nonnegative_array("process_variance", process_variance)
         self.process_variance = process_variance
 
         _validate_positive_scalar("measurement_variance", measurement_variance)
@@ -1942,8 +1946,8 @@ class DirectedInfluenceModel(BaseModel):
             )
         phase_difference = jnp.asarray(phase_difference)
         coupling_strength = jnp.asarray(coupling_strength)
-        _validate_finite_array("phase_difference", phase_difference)
-        _validate_finite_array("coupling_strength", coupling_strength)
+        validate_finite_array("phase_difference", phase_difference)
+        validate_finite_array("coupling_strength", coupling_strength)
         diag_idx = jnp.arange(n_oscillators)
         diag_phase = phase_difference[diag_idx, diag_idx, :]
         diag_coupling = coupling_strength[diag_idx, diag_idx, :]
@@ -1968,7 +1972,7 @@ class DirectedInfluenceModel(BaseModel):
         # Reparameterized M-step option
         self.use_reparameterized_mstep = use_reparameterized_mstep
         # Store current oscillator params for warm-starting optimizer
-        self._current_osc_params: Optional[dict] = None
+        self._current_osc_params: dict | None = None
 
         # Stability bounds applied when rebuilding transition matrices.
         if not 0.0 < max_spectral_radius < 1.0:
@@ -1994,61 +1998,6 @@ class DirectedInfluenceModel(BaseModel):
             [measurement_cov] * self.n_discrete_states, axis=2
         )
 
-    def _initialize_continuous_transition_matrix(self):
-        """Initializes A based on initial params, varying across discrete states."""
-        self._rebuild_stable_transition_matrix()
-
-    def _effective_dim_scale(self) -> Array:
-        """Global stability scale for the current (intrinsic) DIM parameters.
-
-        ``continuous_transition_matrix`` is built from ``damping_coef * scale``
-        and ``coupling_strength * scale``; reconstructing it from the public
-        parameters requires re-applying this same scale.
-        """
-        return _dim_stability_scale(
-            self.freqs,
-            self.damping_coef,
-            self.coupling_strength,
-            self.sampling_freq,
-            max_spectral_radius=self.max_spectral_radius,
-        )
-
-    def _rebuild_stable_transition_matrix(self) -> None:
-        """Rebuild stable DIM matrices from the intrinsic scientific params.
-
-        The stability scale is applied only to the *effective* damping and
-        coupling used to build ``A``; it is deliberately NOT written back onto
-        ``self.damping_coef`` / ``self.coupling_strength``. Keeping the public
-        parameters as the intrinsic source makes the rebuild idempotent --
-        re-stabilizing already-stable params is a no-op -- so damping does not
-        drift toward zero across successive fits with strong coupling (the scale
-        would otherwise compound into the accumulating public damping). ``A`` is
-        reconstructable from the public params by re-applying the same
-        :func:`_dim_stability_scale` (see ``_effective_dim_scale``).
-        """
-        scale = self._effective_dim_scale()
-        effective_damping = jnp.asarray(self.damping_coef) * scale
-        effective_coupling = jnp.asarray(self.coupling_strength) * scale
-        self.continuous_transition_matrix = jax.vmap(
-            lambda phase, coupling: construct_directed_influence_transition_matrix(
-                freqs=self.freqs,
-                damping_coeffs=effective_damping,
-                coupling_strengths=coupling,
-                phase_diffs=phase,
-                sampling_freq=self.sampling_freq,
-            ),
-            in_axes=(-1, -1),
-            out_axes=-1,
-        )(self.phase_difference, effective_coupling)
-
-        if self._current_osc_params is not None:
-            self._current_osc_params = {
-                "freq": self.freqs,
-                "damping": self.damping_coef,
-                "coupling_strength": self.coupling_strength,
-                "phase_diff": self.phase_difference,
-            }
-
     def _initialize_process_covariance(self):
         """Initializes Q based on variance, constant across discrete states."""
         process_cov = construct_common_oscillator_process_covariance(
@@ -2067,6 +2016,8 @@ class DirectedInfluenceModel(BaseModel):
         if self.use_reparameterized_mstep:
             self._m_step_reparameterized(observations)
         else:
+            if self.update_continuous_transition_matrix:
+                self._remember_pre_m_step_dynamics()
             super()._m_step(observations)
 
     def _m_step_reparameterized(self, observations: ArrayLike) -> None:
@@ -2111,6 +2062,10 @@ class DirectedInfluenceModel(BaseModel):
             pair_cond_smoother_covs=self.smoother_pair_cond_covs,
             next_pair_cond_smoother_means=self.smoother_next_pair_cond_means,
             transition_prior=self.transition_prior,
+            # ECM: Q is updated for the current A (held fixed here); A is then
+            # optimized for that Q below. Using the unconstrained A* for Q would
+            # install a covariance that is optimal for a matrix never used.
+            **self._m_step_fixed_and_previous_params(transition_matrix_fixed=True),
         )
 
         # Update non-A parameters based on flags (same as standard M-step)
@@ -2152,14 +2107,17 @@ class DirectedInfluenceModel(BaseModel):
                     "phase_diff": self.phase_difference,
                 }
 
-            self._current_osc_params = optimize_dim_transition_params_joint(
-                gamma1=gamma1,
-                beta=beta,
-                init_params=self._current_osc_params,
-                sampling_freq=self.sampling_freq,
-                process_cov=self.process_cov,
-                max_spectral_radius=self.max_spectral_radius,
-                max_damping=self.max_damping,
+            self._current_osc_params = (
+                optimize_dim_transition_params_joint_until_stationary(
+                    gamma1=gamma1,
+                    beta=beta,
+                    init_params=self._current_osc_params,
+                    sampling_freq=self.sampling_freq,
+                    process_cov=self.process_cov,
+                    max_spectral_radius=self.max_spectral_radius,
+                    max_damping=self.max_damping,
+                    optimizer=optimize_dim_transition_params_joint,
+                )
             )
 
             # Sync the one joint solution directly; no post-hoc averaging of
@@ -2169,79 +2127,6 @@ class DirectedInfluenceModel(BaseModel):
             # Rebuild from the shared intrinsic parameters and enforce one
             # global stability scale, preserving exact reconstructability.
             self._rebuild_stable_transition_matrix()
-
-    def _update_public_oscillator_params(self) -> None:
-        """Update public oscillator attributes from optimized parameters.
-
-        After the joint reparameterized M-step, syncs the private optimizer
-        result to the public attributes. Frequency/damping are already shared;
-        coupling/phase retain their discrete-state axis.
-        """
-        if self._current_osc_params is None:
-            return
-
-        self.freqs = self._current_osc_params["freq"]
-        self.damping_coef = self._current_osc_params["damping"]
-        self.coupling_strength = self._current_osc_params["coupling_strength"]
-        self.phase_difference = self._current_osc_params["phase_diff"]
-
-    def _project_parameters(self):
-        """Project transition matrices to the DIM oscillator family.
-
-        With reparameterized M-step, A is already valid by construction.
-        With standard M-step, the generic Kalman update is unconstrained; the
-        paper's M-step therefore projects each 2x2 block back to scaled-rotation
-        structure and then enforces stability.
-        """
-        if self.use_reparameterized_mstep:
-            return
-
-        projected = []
-        for j in range(self.n_discrete_states):
-            A_unc_j = self.continuous_transition_matrix[..., j]
-            A_j = project_coupled_transition_matrix(A_unc_j)
-
-            # Enforce spectral radius < 1 for stability (unconditional).
-            # Stability is a hard physical constraint: an unstable A causes
-            # state divergence and invalidates the E-step posteriors. Unlike
-            # the block structure projection above, this is not optional.
-            A_j = _stabilize_transition_matrix(
-                A_j, max_spectral_radius=self.max_spectral_radius
-            )
-
-            projected.append(A_j)
-        self.continuous_transition_matrix = jnp.stack(projected, axis=-1)
-
-        # Sync all scientific parameters, then rebuild A so the public shared
-        # frequency/damping plus per-state coupling/phase exactly represent it.
-        self._sync_coupling_from_transition_matrix()
-
-    def _sync_coupling_from_transition_matrix(self) -> None:
-        """Synchronize scientific parameters from the current transition matrix.
-
-        Called after standard EM projection so shared frequency/damping and
-        per-state coupling/phase all reflect the fitted A rather than the
-        initial values.
-        """
-        frequency_list = []
-        damping_list = []
-        coupling_list = []
-        phase_list = []
-        for j in range(self.n_discrete_states):
-            params = extract_dim_params_from_matrix(
-                self.continuous_transition_matrix[..., j],
-                self.sampling_freq,
-                self.n_oscillators,
-            )
-            frequency_list.append(params["freq"])
-            damping_list.append(params["damping"])
-            coupling_list.append(params["coupling_strength"])
-            phase_list.append(params["phase_diff"])
-        self.freqs = jnp.mean(jnp.stack(frequency_list, axis=-1), axis=-1)
-        self.damping_coef = jnp.mean(jnp.stack(damping_list, axis=-1), axis=-1)
-        self.coupling_strength = jnp.stack(coupling_list, axis=-1)
-        self.phase_difference = jnp.stack(phase_list, axis=-1)
-        self._rebuild_stable_transition_matrix()
 
     def fit(
         self,
@@ -2282,12 +2167,6 @@ class DirectedInfluenceModel(BaseModel):
     # --- SGDFittableMixin: DIM-specific param spec and loss ---
 
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            PSD_MATRIX,
-            STOCHASTIC_ROW,
-            UNCONSTRAINED,
-        )
-
         params: dict = {}
         spec: dict = {}
 
@@ -2317,15 +2196,15 @@ class DirectedInfluenceModel(BaseModel):
 
         return params, spec
 
-    def fit_sgd(  # type: ignore[override]  # concrete signature vs mixin *args/**kwargs
+    def fit_sgd(  # type: ignore[override]  # connectivity_penalty inserted before skip_init
         self,
         observations: ArrayLike,
         key: Array | None = None,
-        optimizer: Optional[object] = None,
+        optimizer: object | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
-        connectivity_penalty: Optional[object] = None,
+        convergence_tol: float | None = None,
+        connectivity_penalty: object | None = None,
         skip_init: bool = False,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
@@ -2374,12 +2253,13 @@ class DirectedInfluenceModel(BaseModel):
     def _sgd_loss_fn(self, params: dict, observations) -> jax.Array:
         phase_diff = params.get("phase_difference", self.phase_difference)
         coupling = params.get("coupling_strength", self.coupling_strength)
-        stability_scale = _dim_stability_scale(
+        stability_scale = compute_directed_influence_stability_scale(
             self.freqs,
             self.damping_coef,
             coupling,
             self.sampling_freq,
             max_spectral_radius=self.max_spectral_radius,
+            phase_difference=phase_diff,
         )
         effective_damping = self.damping_coef * stability_scale
         effective_coupling = coupling * stability_scale
@@ -2447,7 +2327,3 @@ class DirectedInfluenceModel(BaseModel):
         # stability scale evaluated by the SGD loss.
         if "phase_difference" in params or "coupling_strength" in params:
             self._rebuild_stable_transition_matrix()
-        self._store_shared_measurement_covariance(params)
-        self.init_cov = self._reconstruct_per_state_array(
-            params, "init_cov", self.init_cov
-        )

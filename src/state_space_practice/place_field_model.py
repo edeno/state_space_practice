@@ -34,18 +34,30 @@ References
 
 import logging
 import warnings
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
-from patsy import dmatrix
 
-from state_space_practice.kalman import psd_solve, sum_of_outer_products, symmetrize
+from state_space_practice.em_driver import run_em
+from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
+from state_space_practice.kalman import (
+    InitialStatePrior,
+    process_cov_residual_form,
+    smooth_initial_state_with_cross_cov,
+    sum_of_outer_products,
+)
+from state_space_practice.parameter_transforms import (
+    POSITIVE,
+    PSD_MATRIX,
+    UNCONSTRAINED,
+)
 from state_space_practice.point_process_kalman import (
-    _detect_block_diagonal_problem,
+    BlockDiagonalCovariance,
+    _block_diagonal_parameters_ok,
     _safe_expected_count,
     _validate_filter_numerics,
     get_confidence_interval,
@@ -54,7 +66,12 @@ from state_space_practice.point_process_kalman import (
     stochastic_point_process_smoother,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import check_converged, validate_count_array
+from state_space_practice.utils import (
+    floor_variances_relative,
+    psd_solve,
+    symmetrize,
+    validate_count_array,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +79,8 @@ logger = logging.getLogger(__name__)
 def build_2d_spline_basis(
     position: np.ndarray,
     n_interior_knots: int = 5,
-    knots_x: Optional[np.ndarray] = None,
-    knots_y: Optional[np.ndarray] = None,
+    knots_x: np.ndarray | None = None,
+    knots_y: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Build a 2D tensor-product B-spline design matrix from position data.
 
@@ -101,9 +118,7 @@ def build_2d_spline_basis(
     """
     position = np.asarray(position)
     if position.ndim != 2 or position.shape[1] != 2:
-        raise ValueError(
-            f"position must be (n_time, 2), got shape {position.shape}"
-        )
+        raise ValueError(f"position must be (n_time, 2), got shape {position.shape}")
 
     x, y = position[:, 0], position[:, 1]
 
@@ -127,6 +142,8 @@ def build_2d_spline_basis(
         "y_lo": y_lo,
         "y_hi": y_hi,
     }
+
+    from patsy import dmatrix  # deferred: slow import
 
     design_matrix = np.asarray(dmatrix(formula, {"x": x, "y": y, **env}))
 
@@ -162,15 +179,14 @@ def evaluate_basis(
     """
     position = np.asarray(position)
     if position.ndim != 2 or position.shape[1] != 2:
-        raise ValueError(
-            f"position must be (n_points, 2), got shape {position.shape}"
-        )
+        raise ValueError(f"position must be (n_points, 2), got shape {position.shape}")
     x = np.clip(position[:, 0], basis_info["x_lo"], basis_info["x_hi"])
     y = np.clip(position[:, 1], basis_info["y_lo"], basis_info["y_hi"])
     env = {
-        k: basis_info[k]
-        for k in ("knots_x", "knots_y", "x_lo", "x_hi", "y_lo", "y_hi")
+        k: basis_info[k] for k in ("knots_x", "knots_y", "x_lo", "x_hi", "y_lo", "y_hi")
     }
+    from patsy import dmatrix  # deferred: slow import
+
     return np.asarray(dmatrix(basis_info["formula"], {"x": x, "y": y, **env}))
 
 
@@ -223,21 +239,35 @@ class PlaceFieldModel(SGDFittableMixin):
     auto-detected block path when applicable. Single-neuron fits never
     dispatch (no structural advantage).
 
-    Numerical note: forward-pass equivalence between the dense and
-    block paths is bit-identical (``atol=1e-9`` in the regression
-    tests). Gradient equivalence is bit-identical for ``init_mean``,
-    ``process_cov``, and ``transition_matrix``, but NOT for
-    ``init_cov`` — the dense path's autodiff produces spurious
-    non-zero gradients on off-block entries of ``init_cov`` that the
-    block path never computes (because the block filter only reads
-    diagonal blocks). As a result, multi-step ``fit_sgd`` trajectories
-    can drift subtly between paths; the block path is the correct
-    gradient for the block-diagonal parameterization, while the dense
-    path has extra off-block noise that EM's M-step projects away.
-    For ``fit`` (EM), the two paths agree to ``atol=1e-5``; for
-    ``fit_sgd``, step-0 LL is bit-identical and subsequent steps may
-    diverge by ~``1e-3`` in LL over tens of iterations without
-    meaningful algorithmic difference.
+    On the block path the model hands the filter the shared spline basis
+    ``Z_base`` of shape ``(n_time, n_basis_per_neuron)`` directly -- the
+    block-expanded ``(n_time, n_neurons, n_neurons * n_basis_per_neuron)`` design
+    matrix (>99% structural zeros) is only ever built for the dense
+    fallback -- and stores the posterior covariances as
+    :class:`~state_space_practice.point_process_kalman.BlockDiagonalCovariance`
+    containers of per-neuron blocks rather than dense zero-padded arrays
+    (see the attribute notes below).
+
+    Each neuron runs with its own diagonal blocks of ``transition_matrix``,
+    ``process_cov`` and ``init_cov``, so per-neuron parameters -- e.g. the
+    per-neuron process noise EM and ``fit_sgd`` learn -- stay on the block
+    path. Only off-block entries break it: when the EM M-step writes back a
+    dense ``transition_matrix`` (``update_transition_matrix=True``) the next
+    E-step falls back to the dense filter.
+
+    Numerical note: the dense and block forward passes agree to roundoff
+    (``atol=1e-9`` in the regression tests), and so do gradients with
+    respect to ``init_mean``, ``process_cov`` (per neuron) and the diagonal
+    blocks of ``transition_matrix`` and ``init_cov``. The block filter reads
+    only diagonal blocks, so the *off-block* entries of a matrix trained as
+    a full matrix get a gradient only on the dense path (the Laplace
+    quadratic terms couple neurons through them). Hence ``fit_sgd``
+    dispatches dense when ``update_transition_matrix=True``. ``init_cov``
+    is trained as a full PSD matrix too: with ``update_init_state=True``
+    its off-block entries are learned only on the dense path, so multi-step
+    ``fit_sgd`` trajectories drift slightly between paths (step-0 LL agrees
+    to roundoff). For ``fit`` (EM), whose M-step keeps ``init_cov``
+    diagonal, the two paths agree to roundoff.
 
     Parameters
     ----------
@@ -301,13 +331,19 @@ class PlaceFieldModel(SGDFittableMixin):
     Attributes (set after fit)
     --------------------------
     smoother_mean : Array, shape (n_time, n_state)
-        Smoothed weight estimates. For multi-neuron, n_state = n_neurons * n_basis.
-    smoother_cov : Array, shape (n_time, n_state, n_state)
-        Smoothed weight covariances.
+        Smoothed weight estimates. For multi-neuron, n_state = n_neurons * n_basis_per_neuron.
+    smoother_cov : Array or BlockDiagonalCovariance, shape (n_time, n_state, n_state)
+        Smoothed weight covariances. On the block-diagonal path this is a
+        ``BlockDiagonalCovariance`` holding the per-neuron
+        ``(n_neurons, n_time, n_basis_per_neuron, n_basis_per_neuron)`` blocks: it reports the
+        dense ``shape``, supports integer time indexing, ``.sum(axis=0)``,
+        ``.diagonal()`` and ``.neuron_blocks(j)`` without building the dense
+        array, and ``np.asarray`` / ``.to_dense()`` materialise it on demand.
+        Same for ``smoother_cross_cov`` and ``filtered_cov``.
     filtered_mean : Array, shape (n_time, n_state)
         Filtered (causal) weight estimates.
-    filtered_cov : Array, shape (n_time, n_state, n_state)
-        Filtered weight covariances.
+    filtered_cov : Array or BlockDiagonalCovariance, shape (n_time, n_state, n_state)
+        Filtered weight covariances (see ``smoother_cov``).
     basis_info : dict
         Spline basis specification (knots, bounds, formula).
     log_likelihoods : list[float]
@@ -329,19 +365,17 @@ class PlaceFieldModel(SGDFittableMixin):
         process_noise_structure: str = "diagonal",
         init_process_noise: float = 1e-6,
         init_cov_scale: float = 0.01,
-        log_intensity_func: Optional[Callable[[ArrayLike, ArrayLike], Array]] = None,
+        log_intensity_func: Callable[[ArrayLike, ArrayLike], Array] | None = None,
         update_transition_matrix: bool = False,
         update_process_cov: bool = True,
         update_init_state: bool = True,
         max_firing_rate_hz: float = 500.0,
-        max_newton_iter: int = 1,
+        max_newton_iter: int = 3,
     ):
         if dt <= 0:
             raise ValueError(f"dt must be positive, got {dt}")
         if n_interior_knots < 1:
-            raise ValueError(
-                f"n_interior_knots must be >= 1, got {n_interior_knots}"
-            )
+            raise ValueError(f"n_interior_knots must be >= 1, got {n_interior_knots}")
         if process_noise_structure not in ("diagonal", "isotropic"):
             raise ValueError(
                 f"process_noise_structure must be 'diagonal' or 'isotropic', "
@@ -360,7 +394,8 @@ class PlaceFieldModel(SGDFittableMixin):
         self.max_firing_rate_hz = max_firing_rate_hz
         self.max_newton_iter = max_newton_iter
         self._log_intensity_func = (
-            log_intensity_func if log_intensity_func is not None
+            log_intensity_func
+            if log_intensity_func is not None
             else log_conditional_intensity
         )
         self.update_transition_matrix = update_transition_matrix
@@ -368,24 +403,24 @@ class PlaceFieldModel(SGDFittableMixin):
         self.update_init_state = update_init_state
 
         # Populated during fit
-        self.basis_info: Optional[dict] = None
-        self.n_basis_per_neuron: Optional[int] = None
-        self.n_basis: Optional[int] = None  # total state dim
+        self.basis_info: dict | None = None
+        self.n_basis_per_neuron: int | None = None
+        self.n_basis: int | None = None  # total state dim
         self.n_neurons: int = 1
-        self.transition_matrix: Optional[Array] = None
-        self.process_cov: Optional[Array] = None
-        self.init_mean: Optional[Array] = None
-        self.init_cov: Optional[Array] = None
-        self.smoother_mean: Optional[Array] = None
-        self.smoother_cov: Optional[Array] = None
-        self.smoother_cross_cov: Optional[Array] = None
+        self.transition_matrix: Array | None = None
+        self.process_cov: Array | None = None
+        self.init_mean: Array | None = None
+        self.init_cov: Array | None = None
+        self.smoother_mean: Array | None = None
+        self.smoother_cov: Array | BlockDiagonalCovariance | None = None
+        self.smoother_cross_cov: Array | BlockDiagonalCovariance | None = None
         # Block-diagonal dispatch: populated at fit/fit_sgd entry via
         # _detect_block_structure. If both are ints, the filter/smoother
         # dispatch to the block-diagonal fast path. None means dense.
-        self._block_n_neurons: Optional[int] = None
-        self._block_size: Optional[int] = None
-        self.filtered_mean: Optional[Array] = None
-        self.filtered_cov: Optional[Array] = None
+        self._block_n_neurons: int | None = None
+        self._block_size: int | None = None
+        self.filtered_mean: Array | None = None
+        self.filtered_cov: Array | BlockDiagonalCovariance | None = None
         self.log_likelihoods: list[float] = []
         self._total_spikes: int = 0
         self._n_time: int = 0
@@ -474,14 +509,11 @@ class PlaceFieldModel(SGDFittableMixin):
 
         return cls(dt=dt, n_interior_knots=n_interior_knots, **kwargs)
 
-    def _neuron_weights(
-        self, neuron_idx: int = 0
-    ) -> tuple[slice, int]:
+    def _neuron_weights(self, neuron_idx: int = 0) -> tuple[slice, int]:
         """Return the slice into the state vector for a given neuron."""
         if neuron_idx < 0 or neuron_idx >= self.n_neurons:
             raise ValueError(
-                f"neuron_idx={neuron_idx} out of range for "
-                f"n_neurons={self.n_neurons}"
+                f"neuron_idx={neuron_idx} out of range for n_neurons={self.n_neurons}"
             )
         assert self.n_basis_per_neuron is not None, "Model not initialized"
         nb = self.n_basis_per_neuron
@@ -490,6 +522,10 @@ class PlaceFieldModel(SGDFittableMixin):
 
     def _build_block_diagonal(self, Z_base: np.ndarray) -> Array:
         """Build block-diagonal design matrix for multi-neuron models.
+
+        Only the dense multi-neuron fallback consumes this expansion (see
+        ``_filter_design_matrix``); the block-diagonal path works from
+        ``Z_base`` itself.
 
         Parameters
         ----------
@@ -507,15 +543,14 @@ class PlaceFieldModel(SGDFittableMixin):
         # Z_full[t, j, :] = kron(e_j, Z_base[t]) — non-zero only at j*nb:(j+1)*nb
         eye_n = jnp.eye(self.n_neurons)  # (n_neurons, n_neurons)
         # (1, n_neurons, n_neurons, 1) * (n_time, 1, 1, nb) -> (n_time, n_neurons, n_neurons, nb)
-        Z_full = (eye_n[None, :, :, None] * Z_base_jnp[:, None, None, :]).reshape(
+        return (eye_n[None, :, :, None] * Z_base_jnp[:, None, None, :]).reshape(
             n_time, self.n_neurons, self.n_neurons * nb
         )
-        return Z_full
 
     def _check_fitted(self, method_name: str) -> None:
         """Raise if the model has not been fitted."""
         if self.smoother_mean is None:
-            raise RuntimeError(
+            raise NotFittedError(
                 f"Model has not been fitted. "
                 f"Call model.fit(position, spikes) before {method_name}()."
             )
@@ -532,8 +567,8 @@ class PlaceFieldModel(SGDFittableMixin):
     def _build_spline_basis_matrix(
         self,
         position: np.ndarray,
-        knots_x: Optional[np.ndarray] = None,
-        knots_y: Optional[np.ndarray] = None,
+        knots_x: np.ndarray | None = None,
+        knots_y: np.ndarray | None = None,
     ) -> Array:
         """Build the base 2D spline basis matrix and cache basis metadata.
 
@@ -560,8 +595,8 @@ class PlaceFieldModel(SGDFittableMixin):
         """Expand a per-neuron spline basis into the full design matrix.
 
         For single-neuron, returns ``Z_base`` unchanged (shape
-        ``(n_time, n_basis)``). For multi-neuron, block-diagonalizes into
-        ``(n_time, n_neurons, n_neurons * n_basis)`` so each neuron's
+        ``(n_time, n_basis_per_neuron)``). For multi-neuron, block-diagonalizes into
+        ``(n_time, n_neurons, n_neurons * n_basis_per_neuron)`` so each neuron's
         log-intensity row selects its own weight slice.
 
         Also sets ``self.n_basis``.
@@ -574,16 +609,32 @@ class PlaceFieldModel(SGDFittableMixin):
         self.n_basis = self.n_neurons * self.n_basis_per_neuron
         return self._build_block_diagonal(np.asarray(Z_base))
 
+    def _filter_design_matrix(self, Z_base: Array) -> Array:
+        """Design matrix in the form the current filter dispatch consumes.
+
+        Single-neuron models and the block-diagonal path hand the filter the
+        shared basis ``Z_base`` ``(n_time, n_basis_per_neuron)`` directly: the
+        block-diagonal filter works per neuron from ``Z_base`` and the block
+        ints, so the ``(n_time, n_neurons, n_neurons * n_basis_per_neuron)`` expansion --
+        more than 99% structural zeros -- is never built on that path. Only
+        the dense multi-neuron fallback (``force_dense=True``, a custom
+        ``log_intensity_func``, or an M-step that broke the block structure)
+        materialises it, via ``_expand_to_block_diagonal``.
+        """
+        if self.n_neurons == 1 or self._block_n_neurons is not None:
+            return jnp.asarray(Z_base)
+        return self._expand_to_block_diagonal(Z_base)
+
     def _build_design_matrix(
         self,
         position: np.ndarray,
-        knots_x: Optional[np.ndarray] = None,
-        knots_y: Optional[np.ndarray] = None,
+        knots_x: np.ndarray | None = None,
+        knots_y: np.ndarray | None = None,
     ) -> Array:
         """Build the spline design matrix from position data.
 
-        For single-neuron: returns shape (n_time, n_basis).
-        For multi-neuron: returns shape (n_time, n_neurons, n_neurons * n_basis)
+        For single-neuron: returns shape (n_time, n_basis_per_neuron).
+        For multi-neuron: returns shape (n_time, n_neurons, n_neurons * n_basis_per_neuron)
         as a block-diagonal matrix where each neuron selects its own weight slice.
         """
         Z_base = self._build_spline_basis_matrix(position, knots_x, knots_y)
@@ -591,7 +642,7 @@ class PlaceFieldModel(SGDFittableMixin):
 
     def _initialize_parameters(self) -> None:
         """Initialize model parameters with scalar defaults (no warm-start)."""
-        assert self.n_basis is not None, "Must call _build_design_matrix first"
+        assert self.n_basis is not None, "Must build the spline basis first"
         n = self.n_basis
         self.transition_matrix = jnp.eye(n)
         self.process_cov = jnp.eye(n) * self.init_process_noise
@@ -602,7 +653,7 @@ class PlaceFieldModel(SGDFittableMixin):
         self,
         Z_base: Array,
         spikes: Array,
-        window: Optional[slice] = None,
+        window: slice | None = None,
         max_iter: int = 15,
         prior_precision: float = 1.0,
     ) -> tuple[Array, Array]:
@@ -773,7 +824,7 @@ class PlaceFieldModel(SGDFittableMixin):
         self,
         Z_base: Array,
         spikes: Array,
-        window: Optional[slice],
+        window: slice | None,
     ) -> None:
         """Warm-start ``init_mean`` and ``init_cov`` from a stationary GLM.
 
@@ -794,9 +845,7 @@ class PlaceFieldModel(SGDFittableMixin):
         self.transition_matrix = jnp.eye(n)
         self.process_cov = jnp.eye(n) * self.init_process_noise
 
-        init_mean, init_cov = self._fit_stationary_glm(
-            Z_base, spikes, window=window
-        )
+        init_mean, init_cov = self._fit_stationary_glm(Z_base, spikes, window=window)
         self.init_mean = init_mean
         self.init_cov = init_cov
 
@@ -821,56 +870,52 @@ class PlaceFieldModel(SGDFittableMixin):
     _SATURATION_WARN_FRAC = 1e-3
 
     def _detect_block_structure(
-        self, design_matrix: Array, force_dense: bool = False
-    ) -> tuple[Optional[int], Optional[int]]:
-        """Detect block-diagonal structure of the current filter problem.
+        self, force_dense: bool = False
+    ) -> tuple[int | None, int | None]:
+        """Decide whether the current parameters allow block-diagonal dispatch.
 
-        Returns ``(n_neurons, block_size)`` integers if the problem
-        satisfies the block-diagonal contract (multi-neuron, block-
-        diagonal A/Q/init_cov, shared Z_base across neurons, identical
-        per-neuron A and Q blocks), or ``(None, None)`` otherwise.
+        The design half of the block-diagonal contract holds by construction
+        -- every neuron reads its own weight slice against the same shared
+        ``Z_base`` -- so only the parameter half is checked: ``init_cov``,
+        ``transition_matrix`` and ``process_cov`` block-diagonal (their
+        diagonal blocks may differ per neuron). The check is one fused
+        device computation (``_block_diagonal_parameters_ok``) with a single
+        host sync, cheap enough to run after every EM M-step: the M-step
+        can write back a non-block-diagonal ``A`` when
+        ``update_transition_matrix=True``, in which case the next E-step
+        falls back to the dense path.
 
-        These integers are Python constants (not traced values), safe
-        to pass into ``stochastic_point_process_filter`` inside a
-        jit-compiled loss function. Inside the jit boundary the filter
-        uses static slicing to extract per-neuron factors from the
-        traced init_mean/init_cov/A/Q/design_matrix arrays.
-
-        Called at fit / fit_sgd entry time with concrete arrays.
-        Re-detection is required after each EM M-step because the
-        M-step can change transition_matrix or process_cov — if
-        ``update_transition_matrix=True`` the new A may not be
-        block-diagonal, in which case the next E-step falls back to
-        the dense path.
-
-        Parameters
-        ----------
-        design_matrix : Array
-            Block-expanded design matrix as built by
-            ``_expand_to_block_diagonal``.
-        force_dense : bool, default=False
-            If True, skip detection entirely and return ``(None, None)``.
-            Used by the ``force_dense=True`` escape hatch on ``fit``
-            and ``fit_sgd``.
-
-        Returns
-        -------
-        (n_neurons, block_size) : tuple of int or tuple of None
+        Returns ``(n_neurons, block_size)`` -- Python ints, safe to bake into
+        a jit-compiled loss function as static slicing constants -- or
+        ``(None, None)`` for the dense path (``force_dense``, single neuron,
+        a custom ``log_intensity_func``, or parameters that broke the
+        structure).
         """
-        if force_dense:
+        if force_dense or self.n_neurons < 2:
             return None, None
         if self._log_intensity_func is not log_conditional_intensity:
             return None, None
-        structure = _detect_block_diagonal_problem(
-            self.init_mean,
+        assert self.n_basis_per_neuron is not None, "Model not initialized"
+        assert self.init_cov is not None, "Model not initialized"
+        assert self.transition_matrix is not None, "Model not initialized"
+        assert self.process_cov is not None, "Model not initialized"
+        n_state = self.n_neurons * self.n_basis_per_neuron
+        if (
+            self.init_cov.shape != (n_state, n_state)
+            or self.transition_matrix.shape != (n_state, n_state)
+            or self.process_cov.shape != (n_state, n_state)
+        ):
+            return None, None
+        ok = _block_diagonal_parameters_ok(
             self.init_cov,
             self.transition_matrix,
             self.process_cov,
-            design_matrix,
+            n_neurons=self.n_neurons,
+            block_size=self.n_basis_per_neuron,
         )
-        if structure is None:
+        if not bool(ok):
             return None, None
-        return structure.n_neurons, structure.block_size
+        return self.n_neurons, self.n_basis_per_neuron
 
     def _warn_if_rate_saturated(
         self,
@@ -889,19 +934,29 @@ class PlaceFieldModel(SGDFittableMixin):
 
         Parameters
         ----------
-        design_matrix : Array, shape (n_time, n_basis) or (n_time, n_neurons, n_basis)
-            Same design matrix passed to the filter/smoother.
+        design_matrix : Array, shape (n_time, n_basis_per_neuron) or (n_time, n_neurons, n_basis)
+            Same design matrix passed to the filter/smoother: the shared
+            basis ``Z_base`` on the single-neuron and block-diagonal paths,
+            the block-expanded matrix on the dense multi-neuron path.
         posterior_mean : Array, shape (n_time, n_state)
             Filtered (or smoothed) posterior means ``x_{k|k}``.
         context : str
             Method name for the warning message (``"fit"`` or ``"fit_sgd"``).
         """
-        # log_intensity_func(Z_t, x_t) returns a scalar (single-neuron) or
-        # (n_neurons,) (multi-neuron). vmap over time to get log-rates for
-        # every bin, then flatten so the count logic is shape-agnostic.
-        log_rates = jax.vmap(self._log_intensity_func)(
-            design_matrix, posterior_mean
-        )
+        n_time = posterior_mean.shape[0]
+        if self.n_neurons > 1 and design_matrix.ndim == 2:
+            # Shared-basis (block-diagonal) form: neuron j's log-rate is its
+            # own weight slice against the same Z_base row.
+            weights = posterior_mean.reshape(n_time, self.n_neurons, -1)
+            log_rates = jnp.einsum("tb,tnb->tn", design_matrix, weights)
+        else:
+            # log_intensity_func(Z_t, x_t) returns a scalar (single-neuron)
+            # or (n_neurons,) (multi-neuron). vmap over time to get log-rates
+            # for every bin, then flatten so the count logic is
+            # shape-agnostic.
+            log_rates = jax.vmap(self._log_intensity_func)(
+                design_matrix, posterior_mean
+            )
         log_counts = log_rates + float(np.log(self.dt))
         log_counts_flat = jnp.ravel(log_counts)
 
@@ -923,12 +978,16 @@ class PlaceFieldModel(SGDFittableMixin):
                 f"ceiling is genuinely too tight for your neuron population."
             )
             logger.warning(msg)
-            warnings.warn(msg, UserWarning, stacklevel=2)
+            warnings.warn(msg, StateSpaceWarning, stacklevel=2)
 
-    def _e_step(
-        self, design_matrix: Array, spikes: Array
-    ) -> float:
-        """E-step: run filter and smoother."""
+    def _e_step(self, design_matrix: Array, spikes: Array) -> float:
+        """E-step: run filter and smoother.
+
+        ``design_matrix`` is whatever ``_filter_design_matrix`` produced for
+        the current dispatch. On the block-diagonal path the covariances
+        come back as ``BlockDiagonalCovariance`` containers -- the dense
+        ``(n_time, n_state, n_state)`` arrays are never materialised.
+        """
         assert self.init_mean is not None, "Model not initialized"
         assert self.init_cov is not None, "Model not initialized"
         assert self.transition_matrix is not None, "Model not initialized"
@@ -960,61 +1019,122 @@ class PlaceFieldModel(SGDFittableMixin):
             block_n_neurons=self._block_n_neurons,
             block_size=self._block_size,
             max_newton_iter=self.max_newton_iter,
+            return_block_covariances=True,
         )
         return float(marginal_ll)
 
     def _m_step(self) -> None:
         """M-step: update dynamics parameters from smoothed estimates.
 
-        When A is fixed to identity (random walk), Q is computed directly as
-        the expected variance of state increments under the posterior, rather
-        than using the unconstrained ML formula from dynamics_only_m_step.
-        This avoids a small bias from the A-Q coupling in the general formula.
+        The filter starts from ``x_0 ~ N(init_mean, init_cov)`` and observes
+        ``x_1 .. x_T``, so the complete-data log-likelihood has ``T``
+        transitions. The smoothed moments of ``x_0`` and the lag-one
+        cross-covariance ``Cov(x_0, x_1 | y) = J_0 P_{1|T}`` follow exactly
+        from those of ``x_1`` by one RTS step with the parameters the E-step
+        ran with
+        (:func:`~state_space_practice.kalman.smooth_initial_state_with_cross_cov`);
+        the ``x_0 -> x_1`` transition is included in every sufficient
+        statistic below, so the update maximises the expected complete-data
+        log-likelihood under the model's constraints (exact EM; checked by
+        the Q-function tests in ``tests/test_oracle_point_process.py``).
 
-        The diagonal/isotropic constraint on Q is then applied, discarding
-        off-diagonal covariance structure to keep the model tractable.
+        When A is not updated it is held at its current value -- the
+        identity of the random-walk model -- and Q is the expected variance
+        of the state increments ``x_t - A x_{t-1}`` under the posterior.
+
+        Q is the centred residual form
+        ``E[(x_t - A x_{t-1})(x_t - A x_{t-1})^T]`` averaged over the ``T``
+        transitions (:func:`~state_space_practice.kalman.process_cov_residual_form`),
+        whose diagonal is non-negative by construction. The diagonal/isotropic
+        constraint on Q is then applied -- for a Gaussian with diagonal
+        (isotropic) covariance, the constrained maximiser is the diagonal
+        (mean diagonal) of the unconstrained one -- and the variances are
+        floored at a scale-relative level
+        (:func:`~state_space_practice.utils.floor_variances_relative`).
+        With ``update_transition_matrix=True``, ``A = beta gamma1^{-1}`` is
+        the maximiser for any diagonal Q (every row is its own regression on
+        the same regressors).
+
+        The initial state is updated to the smoothed ``x_0``; ``init_cov`` is
+        kept diagonal (its constrained maximiser is the diagonal of
+        ``P_{0|T}``).
         """
         assert self.smoother_mean is not None, "E-step must run before M-step"
         assert self.smoother_cov is not None, "E-step must run before M-step"
         assert self.smoother_cross_cov is not None, "E-step must run before M-step"
         assert self.n_basis is not None, "Model not initialized"
+        assert self.init_mean is not None, "Model not initialized"
+        assert self.init_cov is not None, "Model not initialized"
+        assert self.transition_matrix is not None, "Model not initialized"
+        assert self.process_cov is not None, "Model not initialized"
         sm = self.smoother_mean
         sc = self.smoother_cov
         scc = self.smoother_cross_cov
-        n_time = sm.shape[0]
 
-        # Sufficient statistics: E[x_t x_t'], E[x_{t-1} x_t'], E[x_{t-1} x_{t-1}']
-        gamma = jnp.sum(sc, axis=0) + sum_of_outer_products(sm, sm)
-        gamma1 = gamma - jnp.outer(sm[-1], sm[-1]) - sc[-1]
-        gamma2 = gamma - jnp.outer(sm[0], sm[0]) - sc[0]
-        beta = (
-            scc.sum(axis=0) + sum_of_outer_products(sm[:-1], sm[1:])
-        ).T
+        # Smoothed x_0 and Cov(x_0, x_1 | y) under the E-step parameters
+        # (before any update below).
+        init_smoother_mean, init_smoother_cov, init_cross_cov = (
+            smooth_initial_state_with_cross_cov(
+                InitialStatePrior(
+                    init_mean=self.init_mean,
+                    init_cov=self.init_cov,
+                    transition_matrix=self.transition_matrix,
+                    process_cov=self.process_cov,
+                ),
+                sm[0],
+                sc[0],
+            )
+        )
+
+        # Sufficient statistics over the T transitions x_{t-1} -> x_t,
+        # t = 1..T. ``sc`` / ``scc`` are dense arrays on the dense path and
+        # BlockDiagonalCovariance containers on the block path; both expose
+        # the time-sum and integer time indexing, so only (n_state, n_state)
+        # matrices are ever formed here.
+        means = jnp.concatenate((init_smoother_mean[None], sm), axis=0)
+        sum_cov = sc.sum(axis=0)
+        sum_cross_cov = scc.sum(axis=0) + init_cross_cov
+        sum_next_cov = sum_cov  # x_1 .. x_T
+        sum_prev_cov = sum_cov - sc[-1] + init_smoother_cov  # x_0 .. x_{T-1}
 
         if self.update_transition_matrix:
+            # A = beta gamma1^{-1} with gamma1 = sum_t E[x_{t-1} x_{t-1}'] and
+            # beta = sum_t E[x_t x_{t-1}'].
+            gamma1 = sum_prev_cov + sum_of_outer_products(means[:-1], means[:-1])
+            beta = (sum_cross_cov + sum_of_outer_products(means[:-1], means[1:])).T
             A_new = psd_solve(gamma1, beta.T).T
             self.transition_matrix = A_new
-            Q_new = (gamma2 - A_new @ beta.T) / (n_time - 1)
         else:
-            # A = I: Q = E[(x_t - x_{t-1})(x_t - x_{t-1})']
-            #       = (gamma2 - beta.T - beta + gamma1) / (T-1)
-            Q_new = (gamma2 - beta.T - beta + gamma1) / (n_time - 1)
+            # A held at its current value (the identity of the random-walk
+            # model unless a caller changed it): Q = E[(x_t - A x_{t-1})(.)'].
+            A_new = self.transition_matrix
 
-        Q_new = symmetrize(Q_new)
+        Q_new = process_cov_residual_form(
+            means,
+            sum_next_cov=sum_next_cov,
+            sum_prev_cov=sum_prev_cov,
+            sum_cross_cov=sum_cross_cov,
+            transition_matrix=A_new,
+        )
 
         if self.update_process_cov:
+            q_diag = floor_variances_relative(
+                jnp.diag(Q_new), name="PlaceFieldModel process_cov"
+            )
             if self.process_noise_structure == "diagonal":
-                q_diag = jnp.maximum(jnp.diag(Q_new), 1e-10)
                 self.process_cov = jnp.diag(q_diag)
             else:  # isotropic
-                q_diag = jnp.maximum(jnp.diag(Q_new), 1e-10)
                 self.process_cov = jnp.eye(self.n_basis) * jnp.mean(q_diag)
 
         if self.update_init_state:
-            self.init_mean = sm[0]
+            self.init_mean = init_smoother_mean
             # Keep init_cov diagonal to match n_free_params count and
             # keep the model tractable for BIC/AIC comparisons.
-            self.init_cov = jnp.diag(jnp.maximum(jnp.diag(sc[0]), 1e-10))
+            self.init_cov = jnp.diag(
+                floor_variances_relative(
+                    jnp.diag(init_smoother_cov), name="PlaceFieldModel init_cov"
+                )
+            )
 
     @staticmethod
     def bin_spike_times(
@@ -1042,9 +1162,9 @@ class PlaceFieldModel(SGDFittableMixin):
         time_bins : np.ndarray, shape (n_time,)
             Left edges of time bins (e.g., from ``np.arange(t_start, t_end, dt)``).
         warn_on_drops : bool, default=True
-            Emit a warning if spikes fall outside the bin window. Prevents
-            the silent-funnel-to-last-bin failure mode that used to occur
-            when callers passed a sub-window of the spike time range.
+            Emit a warning if spikes fall outside the bin window, so a
+            sub-window of the spike time range does not silently drop
+            spikes.
 
         Returns
         -------
@@ -1079,11 +1199,11 @@ class PlaceFieldModel(SGDFittableMixin):
         spikes: ArrayLike,
         max_iter: int = 100,
         tolerance: float = 1e-4,
-        knots_x: Optional[np.ndarray] = None,
-        knots_y: Optional[np.ndarray] = None,
+        knots_x: np.ndarray | None = None,
+        knots_y: np.ndarray | None = None,
         verbose: bool = True,
         warm_start: bool = True,
-        warm_start_window: Optional[slice] = None,
+        warm_start_window: slice | None = None,
         force_dense: bool = False,
     ) -> list[float]:
         """Fit the model to spike data and position using EM.
@@ -1105,7 +1225,9 @@ class PlaceFieldModel(SGDFittableMixin):
         knots_y : np.ndarray or None, optional
             Explicit interior knot locations for y dimension.
         verbose : bool, default=True
-            Print progress to stdout during fitting.
+            Log progress at INFO level on the
+            ``state_space_practice.place_field_model`` logger during fitting
+            (enable with e.g. ``logging.basicConfig(level=logging.INFO)``).
         warm_start : bool, default=True
             If True (default), initialize ``init_mean`` and ``init_cov``
             from the Laplace approximation of a stationary Poisson GLM
@@ -1163,11 +1285,13 @@ class PlaceFieldModel(SGDFittableMixin):
         if self.n_neurons == 1:
             spikes = spikes.squeeze(axis=1)
 
-        # Build basis, expand to block-diagonal for the filter, then
-        # (optionally) warm-start. The warm-start only needs Z_base, so we
-        # build the full design matrix once and reuse it.
+        # Build the shared spline basis, then (optionally) warm-start. The
+        # filter works from Z_base directly on the single-neuron and
+        # block-diagonal paths; only the dense multi-neuron fallback expands
+        # it to the (n_time, n_neurons, n_neurons * n_basis_per_neuron) design matrix
+        # (see _filter_design_matrix).
         Z_base = self._build_spline_basis_matrix(position, knots_x, knots_y)
-        design_matrix = self._expand_to_block_diagonal(Z_base)
+        self.n_basis = self.n_neurons * self.n_basis_per_neuron
         if warm_start:
             self._warm_start_parameters(Z_base, spikes, warm_start_window)
         else:
@@ -1176,21 +1300,21 @@ class PlaceFieldModel(SGDFittableMixin):
         # Numerical sanity check: validate init_cov is PSD and warn if
         # the configuration is at risk of f32 NaN during the scan. Runs
         # once here so the EM loop's _e_step calls can skip re-validation.
-        _validate_filter_numerics(
-            self.init_cov, n_time=design_matrix.shape[0]
-        )
+        _validate_filter_numerics(self.init_cov, n_time=Z_base.shape[0])
 
-        # Block-diagonal dispatch: detect once before the EM loop.
-        # Re-detected after each M-step in case the M-step writes back
-        # a non-block-diagonal A (only possible when
-        # update_transition_matrix=True).
+        # Block-diagonal dispatch: the design structure (shared Z_base,
+        # block-diagonal by construction) is fixed for the whole fit, so
+        # only the parameter matrices are checked -- once here and again
+        # after each M-step, which can write back a non-block-diagonal A
+        # (only possible when update_transition_matrix=True).
         self._block_n_neurons, self._block_size = self._detect_block_structure(
-            design_matrix, force_dense=force_dense
+            force_dense=force_dense
         )
+        design_matrix = self._filter_design_matrix(Z_base)
 
         def _print(msg: str) -> None:
             if verbose:
-                print(msg)
+                logger.info("%s", msg)
 
         neurons_str = f", n_neurons={self.n_neurons}" if self.n_neurons > 1 else ""
         block_str = (
@@ -1204,8 +1328,9 @@ class PlaceFieldModel(SGDFittableMixin):
             f"total_spikes={self._total_spikes}{block_str}"
         )
 
-        self.log_likelihoods = []
-        last_accepted_state: dict[str, object] | None = None
+        # The block/dense dispatch can flip after an M-step, so the E-step
+        # reads the design form through a holder the M-step may update.
+        design_holder = {"design_matrix": design_matrix}
 
         def _capture_state() -> dict[str, object]:
             return {
@@ -1222,88 +1347,63 @@ class PlaceFieldModel(SGDFittableMixin):
                 "_block_size": self._block_size,
             }
 
-        def _restore_state(state: dict[str, object] | None) -> None:
-            if state is None:
-                return
+        def _restore_state(state: dict[str, object]) -> None:
             for key, value in state.items():
                 setattr(self, key, value)
 
-        for iteration in range(max_iter):
-            ll = self._e_step(design_matrix, spikes)
-            self.log_likelihoods.append(ll)
+        def _clear_posteriors() -> None:
+            # A non-finite first E-step has no accepted state to roll back
+            # to: drop the posteriors it installed so the model reads as
+            # unfitted (``_check_fitted``) instead of holding NaN output.
+            self.smoother_mean = None
+            self.smoother_cov = None
+            self.smoother_cross_cov = None
+            self.filtered_mean = None
+            self.filtered_cov = None
 
-            _print(f"  EM iter {iteration + 1:>{len(str(max_iter))}}/{max_iter}: LL = {ll:.1f}")
+        def _e_step() -> float:
+            return float(self._e_step(design_holder["design_matrix"], spikes))
 
-            if not jnp.isfinite(ll):
-                _print(f"  WARNING: Non-finite LL at iteration {iteration + 1}")
-                break
-
-            if iteration > 0:
-                is_converged, is_increasing = check_converged(
-                    ll, self.log_likelihoods[-2], tolerance
-                )
-                if not is_increasing:
-                    # Roll back to the previous (better) state
-                    _restore_state(last_accepted_state)
-                    # Remove the bad LL so log_likelihoods[-1] matches
-                    # the stored model state (used by bic/aic/summary).
-                    bad_ll = self.log_likelihoods.pop()
-                    msg = (
-                        f"LL decreased: "
-                        f"{self.log_likelihoods[-1]:.1f} -> {bad_ll:.1f}; "
-                        f"stopping EM and rolling back to previous E-step."
-                    )
-                    _print(f"  WARNING: {msg}")
-                    logger.warning(msg)
-                    break
-                if is_converged:
-                    _print(f"  Converged after {iteration + 1} iterations.")
-                    break
-
-            # The E-step is accepted. Snapshot both posterior state and
-            # parameters before mutating parameters in the M-step, so a
-            # later rejected E-step can restore the fitted pair coherently.
-            last_accepted_state = _capture_state()
+        def _m_step() -> None:
             self._m_step()
             # Re-detect block structure after the M-step, unconditionally.
             # The primary case where the M-step can break block-
-            # diagonality is update_transition_matrix=True (where
-            # dynamics_only_m_step returns both a dense A_new and a
-            # dense Q_new that are not diagonalized before being
-            # written to self.process_cov). But unconditional re-
-            # detection is cheap relative to the E-step (one host-side
-            # _detect_block_diagonal_problem call per iteration) and
-            # guards against any future M-step extension that breaks
-            # structure without touching update_transition_matrix.
-            self._block_n_neurons, self._block_size = (
-                self._detect_block_structure(
-                    design_matrix, force_dense=force_dense
-                )
+            # diagonality is update_transition_matrix=True (where the
+            # M-step writes back a dense A_new). Unconditional re-detection
+            # is cheap relative to the E-step (one fused parameter check
+            # and one host sync per iteration) and guards against any
+            # future M-step extension that breaks structure without
+            # touching update_transition_matrix.
+            dispatch_before = self._block_n_neurons
+            self._block_n_neurons, self._block_size = self._detect_block_structure(
+                force_dense=force_dense
             )
-        else:
-            msg = (
-                f"EM reached maximum iterations ({max_iter}) without "
-                f"converging. Consider increasing max_iter or loosening "
-                f"tolerance."
+            if self._block_n_neurons != dispatch_before:
+                # The path changed (block -> dense fallback): hand the next
+                # E-step the design form that path consumes.
+                design_holder["design_matrix"] = self._filter_design_matrix(Z_base)
+
+        def _on_iteration(iteration: int, ll: float, change: float) -> None:
+            _print(
+                f"  EM iter {iteration + 1:>{len(str(max_iter))}}/{max_iter}: "
+                f"LL = {ll:.1f}"
             )
-            _print(f"  WARNING: {msg}")
-            logger.warning(msg)
-            if self.log_likelihoods:
-                final_ll = self._e_step(design_matrix, spikes)
-                is_converged, is_increasing = check_converged(
-                    final_ll, self.log_likelihoods[-1], tolerance
-                )
-                if is_increasing and np.isfinite(final_ll):
-                    self.log_likelihoods.append(final_ll)
-                else:
-                    _restore_state(last_accepted_state)
-                    rollback_msg = (
-                        f"Final E-step after max_iter decreased LL: "
-                        f"{self.log_likelihoods[-1]:.1f} -> {final_ll:.1f}; "
-                        "rolling back the last M-step."
-                    )
-                    _print(f"  WARNING: {rollback_msg}")
-                    logger.warning(rollback_msg)
+
+        result = run_em(
+            _e_step,
+            _m_step,
+            _capture_state,
+            _restore_state,
+            max_iter=max_iter,
+            tol=tolerance,
+            on_first_nonfinite="clear",
+            clear_state=_clear_posteriors,
+            logger=logger,
+            on_iteration=_on_iteration,
+        )
+        self.log_likelihoods = result.log_likelihoods
+        if result.converged:
+            _print(f"  Converged after {len(self.log_likelihoods)} iterations.")
 
         # Saturation diagnostic: post-hoc check on the final filtered posterior.
         # Runs after fit completes so a substantial fraction of clipped bins
@@ -1317,16 +1417,16 @@ class PlaceFieldModel(SGDFittableMixin):
 
     # --- SGDFittableMixin protocol ---
 
-    def fit_sgd(  # type: ignore[override]
+    def fit_sgd(
         self,
         position: ArrayLike,
         spikes: ArrayLike,
-        optimizer: Optional[object] = None,
+        optimizer: object | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol: Optional[float] = None,
+        convergence_tol: float | None = None,
         warm_start: bool = True,
-        warm_start_window: Optional[slice] = None,
+        warm_start_window: slice | None = None,
         force_dense: bool = False,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
@@ -1359,6 +1459,9 @@ class PlaceFieldModel(SGDFittableMixin):
         force_dense : bool, default=False
             Skip the block-diagonal filter dispatch even when the problem
             structure would allow it. See ``fit`` docstring for details.
+            With ``update_transition_matrix=True`` the dense path is always
+            used (the full transition matrix is trained, and only the dense
+            filter gives its off-block entries a gradient).
 
         Returns
         -------
@@ -1388,18 +1491,15 @@ class PlaceFieldModel(SGDFittableMixin):
         if self.n_neurons == 1:
             spikes = spikes.squeeze(axis=1)
 
-        # Build basis, expand to block-diagonal once, then (optionally)
-        # warm-start. Warm-start only needs Z_base; the expanded
-        # design_matrix feeds the filter.
+        # Build the shared spline basis, then (optionally) warm-start.
         #
-        # The ``elif self.init_mean is None`` guard on the cold-start path
-        # is preserved from the pre-refactor behavior. Unlike ``fit`` (EM),
-        # which always resets init state, repeated ``fit_sgd(..., warm_start=
+        # The ``elif self.init_mean is None`` guard on the cold-start path:
+        # unlike ``fit`` (EM), which always resets init state, repeated ``fit_sgd(..., warm_start=
         # False)`` calls on the same model reuse the existing init state —
         # this is intentional for users who want to resume optimization
         # from a previous fit_sgd result without a warm-start reset.
         Z_base = self._build_spline_basis_matrix(position)
-        design_matrix = self._expand_to_block_diagonal(Z_base)
+        self.n_basis = self.n_neurons * self.n_basis_per_neuron
         if warm_start:
             self._warm_start_parameters(Z_base, spikes, warm_start_window)
         elif self.init_mean is None:
@@ -1409,20 +1509,24 @@ class PlaceFieldModel(SGDFittableMixin):
         # the configuration is at risk of f32 NaN during the scan. Runs
         # once here so the SGD loop's _sgd_loss_fn can skip re-validation
         # (the eigvalsh call is not jit-traceable anyway).
-        _validate_filter_numerics(
-            self.init_cov, n_time=design_matrix.shape[0]
-        )
+        _validate_filter_numerics(self.init_cov, n_time=Z_base.shape[0])
 
         # Block-diagonal dispatch: detect once before entering the SGD
         # loop. The detection result is stored on self and read by the
         # (jit'd) _sgd_loss_fn. Since n_neurons/block_size are Python
-        # ints (not traced), passing them into the filter is safe.
+        # ints (not traced), passing them into the filter is safe. The
+        # block path consumes Z_base itself; only the dense fallback
+        # expands it (see _filter_design_matrix). A trained transition
+        # matrix is a full matrix whose off-block entries only the dense
+        # filter gives a gradient, so it always takes the dense path.
         self._block_n_neurons, self._block_size = self._detect_block_structure(
-            design_matrix, force_dense=force_dense
+            force_dense=force_dense or self.update_transition_matrix
         )
+        design_matrix = self._filter_design_matrix(Z_base)
 
         return super().fit_sgd(
-            design_matrix, spikes,
+            design_matrix,
+            spikes,
             optimizer=optimizer,
             num_steps=num_steps,
             verbose=verbose,
@@ -1441,12 +1545,6 @@ class PlaceFieldModel(SGDFittableMixin):
             )
 
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            POSITIVE,
-            PSD_MATRIX,
-            UNCONSTRAINED,
-        )
-
         params: dict = {}
         spec: dict = {}
 
@@ -1473,9 +1571,7 @@ class PlaceFieldModel(SGDFittableMixin):
 
         return params, spec
 
-    def _sgd_loss_fn(
-        self, params: dict, design_matrix: Array, spikes: Array
-    ) -> Array:
+    def _sgd_loss_fn(self, params: dict, design_matrix: Array, spikes: Array) -> Array:
         A = params.get("transition_matrix", self.transition_matrix)
         m0 = params.get("init_mean", self.init_mean)
         P0 = params.get("init_cov", self.init_cov)
@@ -1503,10 +1599,12 @@ class PlaceFieldModel(SGDFittableMixin):
             validate_inputs=False,
             # Block-diagonal dispatch: n_neurons and block_size are
             # Python ints captured from self (not traced). None falls
-            # through to the dense path.
+            # through to the dense path. Only the marginal LL is used, so
+            # the block path never assembles dense covariances here.
             block_n_neurons=self._block_n_neurons,
             block_size=self._block_size,
             max_newton_iter=self.max_newton_iter,
+            return_block_covariances=True,
         )
         return -marginal_ll
 
@@ -1522,9 +1620,7 @@ class PlaceFieldModel(SGDFittableMixin):
         if "init_cov" in params:
             self.init_cov = params["init_cov"]
 
-    def _finalize_sgd(
-        self, design_matrix: Array, spikes: Array
-    ) -> None:
+    def _finalize_sgd(self, design_matrix: Array, spikes: Array) -> None:
         (
             self.smoother_mean,
             self.smoother_cov,
@@ -1545,10 +1641,12 @@ class PlaceFieldModel(SGDFittableMixin):
             max_log_count=self._max_log_count,
             # fit_sgd validated at the top; skip per-call re-validation.
             validate_inputs=False,
-            # Block-diagonal dispatch (None/None falls through to dense).
+            # Block-diagonal dispatch (None/None falls through to dense);
+            # block covariances are kept as per-neuron blocks.
             block_n_neurons=self._block_n_neurons,
             block_size=self._block_size,
             max_newton_iter=self.max_newton_iter,
+            return_block_covariances=True,
         )
         self.log_likelihoods = [float(marginal_ll)]
         # Saturation diagnostic: post-hoc check on the filtered posterior.
@@ -1558,6 +1656,20 @@ class PlaceFieldModel(SGDFittableMixin):
         self._warn_if_rate_saturated(
             design_matrix, self.filtered_mean, context="fit_sgd"
         )
+
+    def _neuron_smoother_cov(self, neuron_idx: int, time_slice: slice) -> Array:
+        """One neuron's ``(n_t, nb, nb)`` smoothed covariance blocks.
+
+        Reads the per-neuron blocks directly on the block-diagonal path;
+        on the dense path slices the neuron's diagonal block out of the
+        dense covariance in one indexing expression (no ``[time_slice]``
+        intermediate of the full ``(n_t, n_state, n_state)`` array).
+        """
+        assert self.smoother_cov is not None
+        if isinstance(self.smoother_cov, BlockDiagonalCovariance):
+            return self.smoother_cov.neuron_blocks(neuron_idx, time_slice)
+        s, _ = self._neuron_weights(neuron_idx)
+        return self.smoother_cov[time_slice, s, s]
 
     def _posterior_rate_map_for_basis(
         self,
@@ -1578,11 +1690,10 @@ class PlaceFieldModel(SGDFittableMixin):
         time-averaged map, not an exact quantile of the log-normal mixture.
         """
         assert self.smoother_mean is not None
-        assert self.smoother_cov is not None
 
         s, _ = self._neuron_weights(neuron_idx)
         means = np.asarray(self.smoother_mean[time_slice, s])
-        covs = np.asarray(self.smoother_cov[time_slice][:, s, s])
+        covs = np.asarray(self._neuron_smoother_cov(neuron_idx, time_slice))
         if means.ndim == 1:
             means = means[None, :]
             covs = covs[None, :, :]
@@ -1602,9 +1713,7 @@ class PlaceFieldModel(SGDFittableMixin):
             means_chunk = means[start:stop]
             covs_chunk = covs[start:stop]
             log_rate_mean = means_chunk @ Z_grid.T
-            var_log_rate = np.einsum(
-                "gb,tbc,gc->tg", Z_grid, covs_chunk, Z_grid
-            )
+            var_log_rate = np.einsum("gb,tbc,gc->tg", Z_grid, covs_chunk, Z_grid)
             var_log_rate = np.maximum(var_log_rate, 0.0)
             std_log_rate = np.sqrt(var_log_rate)
 
@@ -1621,7 +1730,7 @@ class PlaceFieldModel(SGDFittableMixin):
     def predict_rate_map(
         self,
         grid_positions: np.ndarray,
-        time_slice: Optional[slice] = None,
+        time_slice: slice | None = None,
         alpha: float = 0.05,
         neuron_idx: int = 0,
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -1674,6 +1783,7 @@ class PlaceFieldModel(SGDFittableMixin):
                 "predict_rate_map uses the linear approximation exp(Z @ x). "
                 "For the nonlinear log_intensity_func set on this model, "
                 "use smoother_mean directly with your intensity function.",
+                StateSpaceWarning,
                 stacklevel=2,
             )
 
@@ -1842,12 +1952,11 @@ class PlaceFieldModel(SGDFittableMixin):
                 f"got position ({position.shape[0]},) vs spikes ({spikes.shape[0]},)"
             )
 
-        # Build design matrix matching the fitted n_neurons
-        Z_base = evaluate_basis(position, self.basis_info)
-        if self.n_neurons == 1:
-            design_matrix = jnp.asarray(Z_base)
-        else:
-            design_matrix = self._build_block_diagonal(Z_base)
+        # Design matrix in the form the fit-time dispatch consumes (Z_base
+        # itself unless the model fell back to the dense multi-neuron path).
+        design_matrix = self._filter_design_matrix(
+            jnp.asarray(evaluate_basis(position, self.basis_info))
+        )
 
         _, _, marginal_ll = stochastic_point_process_filter(
             init_mean_params=self.init_mean,
@@ -1869,9 +1978,7 @@ class PlaceFieldModel(SGDFittableMixin):
         )
         return float(marginal_ll)
 
-    def get_state_confidence_interval(
-        self, alpha: float = 0.05
-    ) -> Array:
+    def get_state_confidence_interval(self, alpha: float = 0.05) -> Array:
         """Get confidence intervals for the latent weight estimates.
 
         Parameters
@@ -1902,13 +2009,14 @@ class PlaceFieldModel(SGDFittableMixin):
         Counts diagonal entries of Q (or 1 for isotropic), A entries if
         learned, and initial mean + diagonal covariance if learned.
         """
-        assert self.n_basis is not None, "Model not initialized"
+        self._check_fitted("n_free_params")
+        assert self.n_basis is not None  # narrowed by _check_fitted
         nb = self.n_basis
         n = 0
         if self.update_process_cov:
             n += nb if self.process_noise_structure == "diagonal" else 1
         if self.update_transition_matrix:
-            n += nb ** 2
+            n += nb**2
         if self.update_init_state:
             n += nb  # mean
             n += nb  # diagonal of covariance (effective)
@@ -1969,7 +2077,9 @@ class PlaceFieldModel(SGDFittableMixin):
 
         n_time = self.smoother_mean.shape[0]
         session_duration = n_time * self.dt
-        mean_rate = self._total_spikes / session_duration if session_duration > 0 else 0.0
+        mean_rate = (
+            self._total_spikes / session_duration if session_duration > 0 else 0.0
+        )
 
         q_diag = jnp.diag(self.process_cov)
 
@@ -2006,13 +2116,15 @@ class PlaceFieldModel(SGDFittableMixin):
 
         try:
             drift = self.drift_summary(n_blocks=10)
-            lines.extend([
-                "",
-                "Drift",
-                "-" * 50,
-                f"  total (start-to-end):     {drift['total_drift']:.2f} cm",
-                f"  cumulative (path):        {drift['cumulative_drift']:.2f} cm",
-            ])
+            lines.extend(
+                [
+                    "",
+                    "Drift",
+                    "-" * 50,
+                    f"  total (start-to-end):     {drift['total_drift']:.2f} cm",
+                    f"  cumulative (path):        {drift['cumulative_drift']:.2f} cm",
+                ]
+            )
         except (ValueError, RuntimeError) as e:
             logger.debug("drift_summary unavailable in summary: %s", e)
 
@@ -2095,7 +2207,7 @@ class PlaceFieldModel(SGDFittableMixin):
         n_time_bins: int = 3,
         n_grid: int = 50,
         neuron_idx: int = 0,
-        ax: Optional[np.ndarray] = None,
+        ax: np.ndarray | None = None,
     ):
         """Plot estimated rate maps in temporal bins.
 
@@ -2127,13 +2239,15 @@ class PlaceFieldModel(SGDFittableMixin):
             1: ["Full session"],
             2: ["First half", "Second half"],
             3: ["Early", "Middle", "Late"],
-        }.get(n_time_bins, [f"Block {i+1}" for i in range(n_time_bins)])
+        }.get(n_time_bins, [f"Block {i + 1}" for i in range(n_time_bins)])
 
         # Compute all rate maps first to get shared color scale
         rate_maps = []
         for idx in block_indices:
             rate, _ = self.predict_rate_map(
-                grid, time_slice=slice(idx[0], idx[-1] + 1), neuron_idx=neuron_idx,
+                grid,
+                time_slice=slice(idx[0], idx[-1] + 1),
+                neuron_idx=neuron_idx,
             )
             rate_maps.append(rate.reshape(n_grid, n_grid))
 

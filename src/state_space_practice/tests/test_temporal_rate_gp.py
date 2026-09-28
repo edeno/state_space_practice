@@ -19,6 +19,7 @@ import pytest
 from jax import random
 from scipy.special import gammaln
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.temporal_rate_gp import (
     TemporalRateGP,
     infer_log_rate,
@@ -57,7 +58,7 @@ def _dense_laplace_lgcp(
     lengthscale: float,
     mean: float = 0.0,
     n_newton: int = 300,
-    jitter: float = 1e-9,
+    jitter: float = 0.0,
     min_weight: float = 1e-9,
 ) -> tuple[np.ndarray, float]:
     """Return (posterior mode of the zero-mean latent g, Laplace log-evidence).
@@ -147,8 +148,9 @@ def test_posterior_mode_matches_dense_gp_laplace(small_counts):
     )
     result = infer_log_rate(small_counts, dt, variance, lengthscale, n_iter=40)
     # mean=0, so the returned log-rate mean IS the zero-mean latent g.
+    # Observed agreement ~1e-14 (the SSM prior reproduces the Gram exactly).
     np.testing.assert_allclose(
-        np.asarray(result.log_rate_mean), dense_g, atol=1e-4, rtol=1e-4
+        np.asarray(result.log_rate_mean), dense_g, atol=1e-10, rtol=1e-8
     )
 
 
@@ -159,9 +161,10 @@ def test_log_evidence_matches_dense_gp_laplace(small_counts):
         np.asarray(small_counts), dt, variance, lengthscale
     )
     result = infer_log_rate(small_counts, dt, variance, lengthscale, n_iter=40)
-    # An O(1)-or-worse error (the failure mode of an approximate energy) would
-    # blow past this; require agreement to a few 1e-2 on an O(10) quantity.
-    assert abs(float(result.log_marginal_likelihood) - dense_evidence) < 2e-2
+    # Observed agreement ~1e-14; an approximate energy would be off by O(1).
+    np.testing.assert_allclose(
+        float(result.log_marginal_likelihood), dense_evidence, rtol=1e-8
+    )
 
 
 def test_evidence_prefers_true_lengthscale_over_dense(small_counts):
@@ -181,6 +184,107 @@ def test_evidence_prefers_true_lengthscale_over_dense(small_counts):
         for ell in lengthscales
     ]
     assert int(np.argmax(ssm)) == int(np.argmax(dense))
+
+
+def test_default_iterations_converge_when_baseline_is_far_below_data():
+    """Regression: Newton is line-searched, so a low baseline cannot derail it.
+
+    With ``mean=0`` (the ``TemporalRateGP`` default) and a 50 Hz train in 4 ms
+    bins, the undamped first step overshot far above the mode and the default
+    25 iterations stopped with ``max_abs_update ~ 1``, a mean log-rate of 5.57
+    (converged: 4.15) and an evidence of -192.1 (converged: -144.2).
+    """
+    rng = np.random.default_rng(0)
+    counts = rng.poisson(50.0 * 0.004, size=200).astype(float)
+    default = infer_log_rate(counts, 0.004, 1.0, 1.0, mean=0.0)
+    reference = infer_log_rate(counts, 0.004, 1.0, 1.0, mean=0.0, n_iter=200)
+    assert float(default.max_abs_update) < 1e-10
+    np.testing.assert_allclose(
+        np.asarray(default.log_rate_mean),
+        np.asarray(reference.log_rate_mean),
+        atol=1e-10,
+    )
+    np.testing.assert_allclose(
+        float(default.log_marginal_likelihood),
+        float(reference.log_marginal_likelihood),
+        rtol=1e-10,
+    )
+    # the fitted log-rate sits near log(50 Hz), far from the baseline 0
+    assert abs(float(jnp.mean(default.log_rate_mean)) - np.log(50.0)) < 0.5
+
+
+def _far_baseline_counts() -> np.ndarray:
+    """A 50 Hz train in 4 ms bins: far above the default baseline 0, so a
+    single Newton step does not reach the mode."""
+    rng = np.random.default_rng(0)
+    return rng.poisson(50.0 * 0.004, size=200).astype(float)
+
+
+def test_unconverged_iteration_warns():
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    counts = _far_baseline_counts()
+    with pytest.warns(StateSpaceWarning, match="did not reach the posterior mode"):
+        result = infer_log_rate(counts, 0.004, 1.0, 1.0, mean=0.0, n_iter=1)
+    assert float(result.max_abs_update) > 1e-3  # guard: genuinely unconverged
+
+
+def test_unconverged_batch_counts_trains():
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    counts = np.stack([_far_baseline_counts(), _far_baseline_counts()])
+    with pytest.warns(StateSpaceWarning, match="for 2/2 spike train"):
+        infer_log_rate_batch(counts, 0.004, 1.0, 1.0, mean=0.0, n_iter=1)
+
+
+def test_fitted_model_warns_when_final_inference_is_unconverged():
+    """``fit_sgd`` reads the convergence diagnostic of its final inference."""
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    model = TemporalRateGP(dt=0.004, variance=1.0, lengthscale=1.0, n_iter=1)
+    with pytest.warns(StateSpaceWarning, match="did not reach the posterior mode"):
+        model.fit_sgd(_far_baseline_counts(), num_steps=1)
+
+
+def test_nonfinite_merit_fallback_is_counted_and_warns(small_counts, monkeypatch):
+    """A non-finite prior quadratic form (a lost Cholesky factor) makes the
+    merit non-finite: the full step is taken, counted and reported."""
+    import state_space_practice.temporal_rate_gp as trg
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    monkeypatch.setattr(
+        trg,
+        "_prior_whitened_residuals",
+        lambda states, *_: jnp.full(states.size, jnp.nan),
+    )
+    # The fallback steps need not reach the mode, so a non-convergence
+    # warning may accompany the fallback warning.
+    with pytest.warns(StateSpaceWarning) as record:
+        result = infer_log_rate(small_counts, 0.1, 1.5, 0.4, n_iter=3)
+    assert any("fell back in 3 iteration" in str(w.message) for w in record)
+    assert int(result.n_nonfinite_merit) == 3
+    assert int(result.n_unaccepted_steps) == 0
+
+
+def test_unaccepted_step_fallback_is_counted_and_warns(small_counts, monkeypatch):
+    """When no trial step passes the Armijo test the smallest one is taken;
+    that fallback is counted and reported."""
+    import state_space_practice.temporal_rate_gp as trg
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    # A negative slack larger than any achievable increase rejects every step.
+    monkeypatch.setattr(trg, "_MERIT_RTOL", -1.0)
+    with pytest.warns(StateSpaceWarning) as record:
+        result = infer_log_rate(small_counts, 0.1, 1.5, 0.4, n_iter=3)
+    assert any("in 3 iteration(s) where no step" in str(w.message) for w in record)
+    assert int(result.n_unaccepted_steps) == 3
+    assert int(result.n_nonfinite_merit) == 0
+
+
+def test_converged_inference_reports_no_fallbacks(small_counts):
+    result = infer_log_rate(small_counts, 0.1, 1.5, 0.4, n_iter=40)
+    assert int(result.n_nonfinite_merit) == 0
+    assert int(result.n_unaccepted_steps) == 0
 
 
 def test_laplace_iteration_converges(small_counts):
@@ -219,7 +323,7 @@ def test_nonzero_mean_offsets_log_rate(small_counts):
     )
     # Returned log-rate mean is f = mean + g.
     np.testing.assert_allclose(
-        np.asarray(result.log_rate_mean), mean + dense_g, atol=1e-4, rtol=1e-4
+        np.asarray(result.log_rate_mean), mean + dense_g, atol=1e-10, rtol=1e-8
     )
 
 
@@ -296,7 +400,7 @@ def test_evidence_gradient_matches_finite_difference(small_counts):
 
 def test_predict_before_fit_raises():
     model = TemporalRateGP(dt=0.1)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(NotFittedError, match="fit_sgd"):
         model.predict_rate()
 
 
@@ -455,9 +559,7 @@ def test_batch_inference_rejects_empty_counts():
 
 
 @pytest.mark.parametrize("bad_min_weight", [0.0, -1.0, np.nan, np.inf])
-def test_batch_inference_rejects_invalid_min_weight(
-    multineuron_counts, bad_min_weight
-):
+def test_batch_inference_rejects_invalid_min_weight(multineuron_counts, bad_min_weight):
     with pytest.raises(ValueError, match="min_weight"):
         infer_log_rate_batch(
             multineuron_counts,

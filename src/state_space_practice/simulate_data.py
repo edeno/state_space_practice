@@ -8,7 +8,9 @@ def receptive_field_model(position: ArrayLike, params: np.ndarray) -> np.ndarray
     if params.ndim == 1:
         params = params[None]
     log_max_rate, place_field_center, scale = params.T
-    result: np.ndarray = np.exp(log_max_rate - (position - place_field_center) ** 2 / (2 * scale**2))
+    result: np.ndarray = np.exp(
+        log_max_rate - (position - place_field_center) ** 2 / (2 * scale**2)
+    )
     return result
 
 
@@ -57,7 +59,9 @@ def simulate_eden_brown_2004_linear(
     if rng is None:
         rng = np.random.default_rng()
     dt = 0.020
-    time, position, n_total_steps, true_params1, true_params2 = _eden_brown_2004_base(dt=dt)
+    time, position, n_total_steps, true_params1, true_params2 = _eden_brown_2004_base(
+        dt=dt
+    )
 
     # Interpolate between true_params1 and true_params2
     true_params = np.linspace(true_params1, true_params2, n_total_steps)
@@ -176,9 +180,8 @@ def simulate_2d_moving_place_field(
 
     # --- True firing rate from 2D Gaussian place field + background ---
     dist_sq = np.sum((position - true_center) ** 2, axis=1)
-    true_rate = (
-        background_rate
-        + (peak_rate - background_rate) * np.exp(-dist_sq / (2 * place_field_sigma**2))
+    true_rate = background_rate + (peak_rate - background_rate) * np.exp(
+        -dist_sq / (2 * place_field_sigma**2)
     )
 
     # --- Build design matrix from 2D spline basis ---

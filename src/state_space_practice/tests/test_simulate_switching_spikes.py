@@ -31,9 +31,7 @@ def switching_spike_params():
     transition_matrices = jnp.stack(
         [jnp.eye(n_latent) * 0.99] * n_discrete_states, axis=-1
     )
-    process_covs = jnp.stack(
-        [jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1
-    )
+    process_covs = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
     discrete_transition_matrix = jnp.array([[0.9, 0.1], [0.1, 0.9]])
     spike_weights = jax.random.normal(key, (n_neurons, n_latent)) * 0.1
     spike_baseline = jnp.zeros(n_neurons)
@@ -98,20 +96,18 @@ class TestSimulateSwitchingSpikeOscillator:
         spike_weights = jnp.zeros((1, 1))
         spike_baseline = jnp.array([-20.0])
 
-        _spikes, _states, true_discrete_states = (
-            simulate_switching_spike_oscillator(
-                n_time=n_time,
-                transition_matrices=transition_matrices,
-                process_covs=process_covs,
-                discrete_transition_matrix=discrete_transition_matrix,
-                spike_weights=spike_weights,
-                spike_baseline=spike_baseline,
-                dt=0.01,
-                key=jax.random.PRNGKey(0),
-                init_mean=jnp.zeros(1),
-                init_cov=jnp.eye(1) * 1e-12,
-                init_discrete_prob=jnp.array([1.0, 0.0]),
-            )
+        _spikes, _states, true_discrete_states = simulate_switching_spike_oscillator(
+            n_time=n_time,
+            transition_matrices=transition_matrices,
+            process_covs=process_covs,
+            discrete_transition_matrix=discrete_transition_matrix,
+            spike_weights=spike_weights,
+            spike_baseline=spike_baseline,
+            dt=0.01,
+            key=jax.random.PRNGKey(0),
+            init_mean=jnp.zeros(1),
+            init_cov=jnp.eye(1) * 1e-12,
+            init_discrete_prob=jnp.array([1.0, 0.0]),
         )
 
         np.testing.assert_array_equal(
@@ -241,9 +237,7 @@ class TestSimulateSwitchingSpikeOscillator:
         final_magnitude = jnp.sqrt(jnp.sum(true_states[-1] ** 2))
         assert final_magnitude < initial_magnitude * 0.1
 
-    def test_works_with_default_init_conditions(
-        self, switching_spike_params
-    ) -> None:
+    def test_works_with_default_init_conditions(self, switching_spike_params) -> None:
         """Should work with just required parameters (no init conditions)."""
         p = switching_spike_params
         n_time = 50

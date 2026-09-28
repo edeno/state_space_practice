@@ -23,22 +23,30 @@ from state_space_practice.hamiltonian_switching import SwitchingHamiltonianJoint
 
 # --- Ground Truths ---
 
+
 def h_pendulum(state):
-    return 0.5 * state[1]**2 + (1.0 - jnp.cos(state[0]))
+    return 0.5 * state[1] ** 2 + (1.0 - jnp.cos(state[0]))
+
 
 def h_stiff(state):
     # Faster, more quadratic
-    return 0.5 * state[1]**2 + 2.0 * state[0]**2
+    return 0.5 * state[1] ** 2 + 2.0 * state[0] ** 2
+
 
 def simulate_trajectory(h_func, n_time, dt, x0=jnp.array([1.5, 0.0])):
     def step_fn(carry, _):
-        def h_apply(p, x): return h_func(x)
+        def h_apply(p, x):
+            return h_func(x)
+
         x_next = leapfrog_step(carry, {}, h_apply, dt)
         return x_next, x_next
+
     _, x_traj = jax.lax.scan(step_fn, x0, jnp.arange(n_time))
     return x_traj
 
+
 # --- Evaluation Core ---
+
 
 def compute_metrics(model, x_true, learned_h_params, grid_size=30):
     # 1. Hamiltonian Grid Correlation
@@ -46,21 +54,26 @@ def compute_metrics(model, x_true, learned_h_params, grid_size=30):
     p_grid = jnp.linspace(-3, 3, grid_size)
     Q, P = jnp.meshgrid(q_grid, p_grid)
     states = jnp.stack([Q.flatten(), P.flatten()], axis=1)
-    
+
     # We assume state 0 if switching
     if "Z" in learned_h_params:
         # Extract first state params
-        h_p = {**jax.tree_util.tree_map(lambda x: x[0], learned_h_params["mlp"]), "omega": learned_h_params["omega"][0]}
+        h_p = {
+            **jax.tree_util.tree_map(lambda x: x[0], learned_h_params["mlp"]),
+            "omega": learned_h_params["omega"][0],
+        }
     else:
         h_p = {**learned_h_params["mlp"], "omega": learned_h_params["omega"]}
-        
+
     h_gt = jax.vmap(h_pendulum)(states)
     h_learned = jax.vmap(lambda s: apply_mlp(h_p, s))(states)
     h_corr, _ = pearsonr(np.array(h_gt), np.array(h_learned))
-    
+
     return {"H-Corr": h_corr}
 
+
 # --- Standardized Test Loop ---
+
 
 def run_verification():
     n_time = 1500
@@ -70,10 +83,10 @@ def run_verification():
 
     print("Generating synthetic data (Anharmonic Pendulum)...")
     x_true = simulate_trajectory(h_pendulum, n_time, dt)
-    
+
     # Generate Observations
     lfp = x_true[:, :1] + jax.random.normal(jax.random.PRNGKey(0), (n_time, 1)) * 0.1
-    angles = jnp.linspace(0, 2*jnp.pi, 10, endpoint=False)
+    angles = jnp.linspace(0, 2 * jnp.pi, 10, endpoint=False)
     C_s = jnp.stack([jnp.cos(angles), jnp.sin(angles)], axis=1) * 1.5
     rates = jnp.exp(jnp.dot(x_true, C_s.T) - 1.0) * dt
     spikes = jax.random.poisson(jax.random.PRNGKey(1), rates)
@@ -116,11 +129,12 @@ def run_verification():
 
     # Summary
     df = pd.DataFrame(results)
-    print("\n" + "="*30)
+    print("\n" + "=" * 30)
     print("   CONSOLIDATED RESULTS")
-    print("="*30)
+    print("=" * 30)
     print(df.to_string(index=False))
-    print("="*30)
+    print("=" * 30)
+
 
 if __name__ == "__main__":
     run_verification()

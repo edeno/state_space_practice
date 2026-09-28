@@ -494,12 +494,14 @@ def main():
     # Compute center uncertainty via sampling (subsampled for speed)
     print("Computing center uncertainty (sampling)...")
     subsample = 100  # Subsample time for faster computation
-    center_mean, center_std, center_lower, center_upper = estimate_center_with_uncertainty(
-        smoothed_mean[::subsample],
-        smoothed_cov[::subsample],
-        design_matrix,
-        position,
-        n_samples=200,
+    center_mean, center_std, center_lower, center_upper = (
+        estimate_center_with_uncertainty(
+            smoothed_mean[::subsample],
+            smoothed_cov[::subsample],
+            design_matrix,
+            position,
+            n_samples=200,
+        )
     )
     time_subsampled = time[::subsample]
 
@@ -574,7 +576,9 @@ def main():
     # Save figures
     fig1.savefig("notebooks/spline_raster.png", dpi=150, bbox_inches="tight")
     fig2.savefig("notebooks/spline_rate_heatmap.png", dpi=150, bbox_inches="tight")
-    fig3.savefig("notebooks/spline_place_field_uncertainty.png", dpi=150, bbox_inches="tight")
+    fig3.savefig(
+        "notebooks/spline_place_field_uncertainty.png", dpi=150, bbox_inches="tight"
+    )
     fig4.savefig("notebooks/spline_center_tracking.png", dpi=150, bbox_inches="tight")
     print("\nFigures saved to notebooks/")
 

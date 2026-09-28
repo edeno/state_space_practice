@@ -324,3 +324,223 @@ class TestBinnedToSpikeTimes:
         recovered = binned_to_spike_times(binned, time_bins)
 
         assert len(recovered[0]) == len(original_spike_times[0])
+
+
+# ---------------------------------------------------------------------------
+# Property tests (Hypothesis)
+# ---------------------------------------------------------------------------
+
+import warnings  # noqa: E402
+
+import pytest  # noqa: E402
+from hypothesis import given, settings  # noqa: E402
+from hypothesis import strategies as st  # noqa: E402
+from hypothesis.extra.numpy import arrays  # noqa: E402
+
+from state_space_practice.exceptions import StateSpaceWarning  # noqa: E402
+
+
+@st.composite
+def _binning_problem(draw, max_spikes: int = 80):
+    """Uniform bins plus spike times that include exact edges and out-of-window."""
+    n_bins = draw(st.integers(2, 40))
+    t0 = draw(st.floats(-5.0, 5.0))
+    dt = draw(st.floats(1e-3, 1.0))
+    time_bins = t0 + dt * np.arange(n_bins)
+    t_end = float(time_bins[-1]) + float(time_bins[1] - time_bins[0])
+    edges = np.append(time_bins, t_end)
+    n_spikes = draw(st.integers(0, max_spikes))
+    inside = (
+        draw(arrays(np.float64, n_spikes, elements=st.floats(0.0, 1.0))) * (t_end - t0)
+        + t0
+    )
+    n_edge = draw(st.integers(0, 5))
+    on_edges = edges[draw(arrays(np.int64, n_edge, elements=st.integers(0, n_bins)))]
+    n_out = draw(st.integers(0, 3))
+    outside = np.concatenate(
+        [
+            t0 - dt * draw(arrays(np.float64, n_out, elements=st.floats(1e-3, 3.0))),
+            t_end + dt * draw(arrays(np.float64, n_out, elements=st.floats(1e-3, 3.0))),
+        ]
+    )
+    spikes = np.concatenate([inside, on_edges, outside])
+    return time_bins, edges, spikes
+
+
+def _brute_force_counts(spikes: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    """[e_k, e_{k+1}) for every bin, the last one closed on the right."""
+    counts = np.zeros(edges.size - 1, dtype=int)
+    for t in spikes:
+        for k in range(edges.size - 1):
+            last = k == edges.size - 2
+            if edges[k] <= t and (t < edges[k + 1] or (last and t == edges[k + 1])):
+                counts[k] += 1
+                break
+    return counts
+
+
+class TestBinningProperties:
+    @settings(deadline=None, max_examples=60)
+    @given(problem=_binning_problem())
+    def test_counts_match_brute_force_and_are_conserved(self, problem):
+        time_bins, edges, spikes = problem
+        counts = bin_spike_times(spikes, time_bins, warn_on_drops=False)[:, 0]
+        np.testing.assert_array_equal(counts, _brute_force_counts(spikes, edges))
+        in_window = np.sum((spikes >= edges[0]) & (spikes <= edges[-1]))
+        assert counts.sum() == in_window
+
+    @settings(deadline=None, max_examples=40)
+    @given(problem=_binning_problem(), seed=st.integers(0, 2**31 - 1))
+    def test_invariant_to_permuting_spikes_and_equivariant_in_units(
+        self, problem, seed
+    ):
+        time_bins, _edges, spikes = problem
+        rng = np.random.default_rng(seed)
+        units = [spikes, spikes[: spikes.size // 2], rng.permutation(spikes)]
+        counts = bin_spike_times(units, time_bins, warn_on_drops=False)
+        np.testing.assert_array_equal(counts[:, 0], counts[:, 2])
+        order = rng.permutation(3)
+        permuted = bin_spike_times(
+            [units[i] for i in order], time_bins, warn_on_drops=False
+        )
+        np.testing.assert_array_equal(permuted, counts[:, order])
+
+    @settings(deadline=None, max_examples=40)
+    @given(problem=_binning_problem())
+    def test_warns_exactly_when_spikes_are_dropped(self, problem):
+        time_bins, edges, spikes = problem
+        n_out = int(np.sum((spikes < edges[0]) | (spikes > edges[-1])))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            bin_spike_times(spikes, time_bins)
+        relevant = [w for w in caught if issubclass(w.category, StateSpaceWarning)]
+        assert len(relevant) == (1 if n_out else 0)
+        if n_out:
+            assert f"{n_out} spike(s)" in str(relevant[0].message)
+
+    @settings(deadline=None, max_examples=40)
+    @given(problem=_binning_problem())
+    def test_clip_then_bin_equals_bin_without_warning(self, problem):
+        time_bins, edges, spikes = problem
+        clipped = clip_spike_times_to_window([spikes], edges[0], edges[-1])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            from_clipped = bin_spike_times(clipped, time_bins)
+        np.testing.assert_array_equal(
+            from_clipped, bin_spike_times([spikes], time_bins, warn_on_drops=False)
+        )
+
+    @settings(deadline=None, max_examples=40)
+    @given(
+        n_bins=st.integers(2, 40),
+        t0=st.floats(-5.0, 5.0),
+        dt=st.floats(1e-3, 1.0),
+        data=st.data(),
+    )
+    def test_counts_to_times_to_counts_round_trip(self, n_bins, t0, dt, data):
+        time_bins = t0 + dt * np.arange(n_bins)
+        counts = data.draw(arrays(np.int64, (n_bins, 3), elements=st.integers(0, 6)))
+        times = binned_to_spike_times(counts, time_bins)
+        assert [t.size for t in times] == list(counts.sum(axis=0))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # left edges are never out of window
+            np.testing.assert_array_equal(bin_spike_times(times, time_bins), counts)
+
+    @settings(deadline=None, max_examples=40)
+    @given(problem=_binning_problem())
+    def test_times_to_counts_to_times_floors_to_left_edges(self, problem):
+        time_bins, edges, spikes = problem
+        counts = bin_spike_times(spikes, time_bins, warn_on_drops=False)
+        recovered = binned_to_spike_times(counts, time_bins, neuron_idx=0)
+        kept = np.sort(spikes[(spikes >= edges[0]) & (spikes <= edges[-1])])
+        assert recovered.size == kept.size
+        index = np.searchsorted(time_bins, kept, side="right") - 1
+        np.testing.assert_array_equal(np.sort(recovered), time_bins[index])
+        assert np.all(recovered <= kept)
+
+    def test_boundary_bins(self):
+        """First edge -> bin 0; interior edge -> the bin it opens; right end of
+        the window -> last bin; one ulp outside either end -> dropped + warned."""
+        time_bins = np.array([0.0, 0.25, 0.5, 0.75])
+        t_end = 1.0
+        counts = bin_spike_times(np.array([0.0, 0.25, 0.75, t_end]), time_bins)
+        np.testing.assert_array_equal(counts[:, 0], [1, 1, 0, 2])
+        for outside in (np.nextafter(0.0, -1.0), np.nextafter(t_end, 2.0)):
+            with pytest.warns(StateSpaceWarning, match="1 spike"):
+                counts = bin_spike_times(np.array([outside, 0.5]), time_bins)
+            np.testing.assert_array_equal(counts[:, 0], [0, 0, 1, 0])
+
+
+class TestRateAndInterpolationProperties:
+    @settings(deadline=None, max_examples=40)
+    @given(problem=_binning_problem())
+    def test_firing_rate_times_duration_is_the_binned_count(self, problem):
+        time_bins, edges, spikes = problem
+        rates = compute_firing_rates([spikes], edges[0], edges[-1])
+        counts = bin_spike_times(spikes, time_bins, warn_on_drops=False)
+        np.testing.assert_allclose(
+            rates[0] * (edges[-1] - edges[0]), counts.sum(), rtol=1e-12
+        )
+
+    @settings(deadline=None, max_examples=30)
+    @given(
+        n=st.integers(5, 30),
+        a=st.floats(-3.0, 3.0),
+        b=st.floats(-3.0, 3.0),
+        kind=st.sampled_from(["linear", "nearest", "cubic"]),
+        seed=st.integers(0, 2**31 - 1),
+    )
+    def test_interpolation_is_linear_and_exact_at_knots(self, n, a, b, kind, seed):
+        rng = np.random.default_rng(seed)
+        t = np.sort(rng.uniform(0.0, 10.0, n)) + 1e-3 * np.arange(n)
+        v1 = rng.normal(size=(n, 2))
+        v2 = rng.normal(size=(n, 2))
+        new_t = rng.uniform(t[0], t[-1], 25)
+        combo = interpolate_to_new_times(a * v1 + b * v2, t, new_t, kind=kind)
+        separate = a * interpolate_to_new_times(
+            v1, t, new_t, kind=kind
+        ) + b * interpolate_to_new_times(v2, t, new_t, kind=kind)
+        np.testing.assert_allclose(combo, separate, atol=1e-9)
+        np.testing.assert_allclose(
+            interpolate_to_new_times(v1, t, t, kind=kind), v1, atol=1e-9
+        )
+
+    @settings(deadline=None, max_examples=30)
+    @given(slope=st.floats(-5.0, 5.0), intercept=st.floats(-5.0, 5.0))
+    def test_linear_interpolation_reproduces_affine_functions(self, slope, intercept):
+        t = np.array([0.0, 0.3, 1.1, 2.0, 3.7])
+        new_t = np.linspace(-1.0, 5.0, 13)  # includes linear extrapolation
+        values = slope * t + intercept
+        np.testing.assert_allclose(
+            interpolate_to_new_times(values, t, new_t),
+            slope * new_t + intercept,
+            atol=1e-12,
+        )
+
+
+class TestBoutProperties:
+    @settings(deadline=None, max_examples=60)
+    @given(
+        speed=arrays(np.float64, st.integers(0, 60), elements=st.floats(0.0, 10.0)),
+        threshold=st.floats(0.0, 10.0),
+        min_duration=st.integers(1, 5),
+        above=st.booleans(),
+    )
+    def test_bouts_are_exactly_the_long_runs(
+        self, speed, threshold, min_duration, above
+    ):
+        mask = speed > threshold if above else speed < threshold
+        bouts = identify_behavioral_bouts(speed, threshold, min_duration, above)
+        covered = np.zeros(speed.size, dtype=bool)
+        for start, end in bouts:
+            assert end - start >= min_duration
+            assert np.all(mask[start:end])
+            assert start == 0 or not mask[start - 1]  # maximal on the left
+            assert end == speed.size or not mask[end]  # maximal on the right
+            covered[start:end] = True
+        # every masked sample outside a bout lies in a run shorter than min
+        runs = np.diff(np.concatenate([[0], mask.astype(int), [0]]))
+        starts, ends = np.flatnonzero(runs == 1), np.flatnonzero(runs == -1)
+        long_runs = [(s, e) for s, e in zip(starts, ends) if e - s >= min_duration]
+        assert bouts == [(int(s), int(e)) for s, e in long_runs]
+        assert covered.sum() == sum(e - s for s, e in long_runs)

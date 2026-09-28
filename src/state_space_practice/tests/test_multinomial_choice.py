@@ -1,18 +1,28 @@
 """Tests for multinomial choice learning model."""
 
+import warnings
+
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
 
+from state_space_practice.covariate_choice import covariate_choice_filter
+from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.multinomial_choice import (
+    NEWTON_GAP_TOL,
     ChoiceFilterResult,
     ChoiceSmootherResult,
     MultinomialChoiceModel,
+    _softmax_update_core,
     multinomial_choice_filter,
     multinomial_choice_smoother,
     simulate_choice_data,
     softmax_observation_update,
 )
+from state_space_practice.switching_choice import switching_choice_filter
 
 
 class TestSoftmaxObservationUpdate:
@@ -21,7 +31,10 @@ class TestSoftmaxObservationUpdate:
         prior_mean = jnp.zeros(3)
         prior_cov = jnp.eye(3)
         post_mean, post_cov, ll = softmax_observation_update(
-            prior_mean, prior_cov, choice=2, n_options=4,
+            prior_mean,
+            prior_cov,
+            choice=2,
+            n_options=4,
         )
         assert post_mean.shape == (3,)
         assert post_cov.shape == (3, 3)
@@ -32,7 +45,10 @@ class TestSoftmaxObservationUpdate:
         prior_mean = jnp.zeros(2)
         prior_cov = jnp.eye(2)
         post_mean, _, _ = softmax_observation_update(
-            prior_mean, prior_cov, choice=1, n_options=3,
+            prior_mean,
+            prior_cov,
+            choice=1,
+            n_options=3,
         )
         assert post_mean[0] > prior_mean[0]
 
@@ -41,16 +57,24 @@ class TestSoftmaxObservationUpdate:
         prior_mean = jnp.zeros(2)
         prior_cov = jnp.eye(2)
         post_mean, _, _ = softmax_observation_update(
-            prior_mean, prior_cov, choice=1, n_options=3,
+            prior_mean,
+            prior_cov,
+            choice=1,
+            n_options=3,
         )
-        assert post_mean[1] < prior_mean[1] or np.isclose(post_mean[1], prior_mean[1], atol=1e-6)
+        assert post_mean[1] < prior_mean[1] or np.isclose(
+            post_mean[1], prior_mean[1], atol=1e-6
+        )
 
     def test_reference_option_choice_decreases_all(self):
         """Choose option 0 (reference) -> all free values should decrease."""
         prior_mean = jnp.ones(2) * 0.5  # Start slightly positive
         prior_cov = jnp.eye(2)
         post_mean, _, _ = softmax_observation_update(
-            prior_mean, prior_cov, choice=0, n_options=3,
+            prior_mean,
+            prior_cov,
+            choice=0,
+            n_options=3,
         )
         assert jnp.all(post_mean < prior_mean)
 
@@ -59,11 +83,17 @@ class TestSoftmaxObservationUpdate:
         prior_mean = jnp.zeros(2)
         prior_cov = jnp.eye(2)
         post_low, _, _ = softmax_observation_update(
-            prior_mean, prior_cov, choice=1, n_options=3,
+            prior_mean,
+            prior_cov,
+            choice=1,
+            n_options=3,
             inverse_temperature=0.1,
         )
         post_high, _, _ = softmax_observation_update(
-            prior_mean, prior_cov, choice=1, n_options=3,
+            prior_mean,
+            prior_cov,
+            choice=1,
+            n_options=3,
             inverse_temperature=5.0,
         )
         update_low = jnp.linalg.norm(post_low - prior_mean)
@@ -75,7 +105,10 @@ class TestSoftmaxObservationUpdate:
         prior_mean = jnp.zeros(3)
         prior_cov = jnp.eye(3)
         _, post_cov, _ = softmax_observation_update(
-            prior_mean, prior_cov, choice=1, n_options=4,
+            prior_mean,
+            prior_cov,
+            choice=1,
+            n_options=4,
         )
         assert jnp.trace(post_cov) < jnp.trace(prior_cov)
 
@@ -84,7 +117,10 @@ class TestSoftmaxObservationUpdate:
         prior_mean = jnp.zeros(2)
         prior_cov = jnp.eye(2)
         _, _, ll = softmax_observation_update(
-            prior_mean, prior_cov, choice=1, n_options=3,
+            prior_mean,
+            prior_cov,
+            choice=1,
+            n_options=3,
         )
         assert jnp.isfinite(ll)
         assert ll < 0
@@ -94,7 +130,10 @@ class TestSoftmaxObservationUpdate:
         prior_mean = jnp.zeros(3)
         prior_cov = jnp.eye(3)
         _, post_cov, _ = softmax_observation_update(
-            prior_mean, prior_cov, choice=2, n_options=4,
+            prior_mean,
+            prior_cov,
+            choice=2,
+            n_options=4,
         )
         eigvals = jnp.linalg.eigvalsh(post_cov)
         assert jnp.all(eigvals >= -1e-8)
@@ -109,6 +148,131 @@ class TestSoftmaxObservationUpdate:
             softmax_observation_update(prior_mean, prior_cov, choice=-1, n_options=3)
 
 
+class TestInputDtypes:
+    """Integer inputs are promoted to the default float; float32 stays float32."""
+
+    def test_integer_prior_mean_matches_float(self):
+        post_int = softmax_observation_update(jnp.array([0, 0]), jnp.eye(2), 1, 3)
+        post_float = softmax_observation_update(jnp.zeros(2), jnp.eye(2), 1, 3)
+        for a, b in zip(post_int, post_float):
+            assert a.dtype == jnp.float64
+            np.testing.assert_allclose(a, b, rtol=1e-12)
+        np.testing.assert_allclose(post_int[2], -1.0762705, rtol=1e-6)
+
+    def test_float32_update_stays_float32(self):
+        prior_mean = jnp.array([0.3, -0.2])
+        prior_cov = jnp.array([[1.0, 0.2], [0.2, 0.5]])
+        ref = softmax_observation_update(prior_mean, prior_cov, 2, 3, 2.0)
+        out = softmax_observation_update(
+            prior_mean.astype(jnp.float32), prior_cov.astype(jnp.float32), 2, 3, 2.0
+        )
+        for a, b in zip(out, ref):
+            assert a.dtype == jnp.float32
+            np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-6)
+
+    @pytest.mark.parametrize("init_mean", [np.array([0, 1]), [0, 1]])
+    def test_filter_integer_init_mean_matches_float(self, init_mean):
+        choices = np.array([0, 1, 2, 1, 1, 0])
+        out_int = multinomial_choice_filter(choices, 3, init_mean=init_mean)
+        out_float = multinomial_choice_filter(
+            choices, 3, init_mean=np.array([0.0, 1.0])
+        )
+        for a, b in zip(out_int, out_float):
+            assert a.dtype == jnp.float64
+            np.testing.assert_allclose(a, b, rtol=1e-12)
+
+    def test_filter_float32_stays_float32(self):
+        choices = np.array([0, 1, 2, 1, 1, 0])
+        ref = multinomial_choice_filter(choices, 3, inverse_temperature=2.0)
+        out = multinomial_choice_filter(
+            choices,
+            3,
+            inverse_temperature=2.0,
+            init_mean=np.zeros(2, np.float32),
+            init_cov=np.eye(2, dtype=np.float32),
+        )
+        for a, b in zip(out, ref):
+            assert a.dtype == jnp.float32
+            np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-6)
+
+
+class TestNewtonConvergenceWarning:
+    """A Laplace mode search that ends short of the mode warns; converged ones
+    stay silent (the suite runs with warnings as errors)."""
+
+    # Prior deep on the saturated side opposite the choice (beta=100, prior
+    # N(10, 1e4)): the likelihood curvature is ~0, every candidate step
+    # overshoots, no step passes the line search and the iterate never moves.
+    STALL = dict(mean=10.0, var=1e4, beta=100.0)
+
+    def test_update_warns_when_iterations_run_out(self):
+        args = (jnp.array([1.512]), jnp.array([[0.974]]), 0, 2, 4.0)
+        # guard: one iteration really leaves a gap above the tolerance
+        _, _, _, gap = _softmax_update_core(
+            args[0], args[1], jnp.int32(0), 2, 4.0, max_newton_steps=1
+        )
+        assert gap > NEWTON_GAP_TOL
+        with pytest.warns(StateSpaceWarning, match="softmax_observation_update"):
+            softmax_observation_update(*args, max_newton_steps=1)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", StateSpaceWarning)
+            softmax_observation_update(*args)
+
+    def _run_filter(self, name, var):
+        s = self.STALL
+        if name == "multinomial":
+            return multinomial_choice_filter(
+                [0, 1],
+                2,
+                inverse_temperature=s["beta"],
+                init_mean=[s["mean"]],
+                init_cov=[[var]],
+            )
+        if name == "covariate":
+            return covariate_choice_filter(
+                [0, 1],
+                2,
+                inverse_temperature=s["beta"],
+                init_mean=[s["mean"]],
+                init_cov=[[var]],
+            )
+        return switching_choice_filter(
+            [0, 1],
+            2,
+            inverse_temperatures=[s["beta"], 1.0],
+            init_mean=[s["mean"]],
+            init_cov=[[var]],
+        )
+
+    @pytest.mark.parametrize("name", ["multinomial", "covariate", "switching"])
+    def test_jitted_filters_warn_on_stalled_update(self, name):
+        with pytest.warns(StateSpaceWarning, match=f"{name}.*_filter"):
+            jax.block_until_ready(self._run_filter(name, self.STALL["var"]))
+            jax.effects_barrier()
+        # A moderate prior variance converges: no warning.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", StateSpaceWarning)
+            jax.block_until_ready(self._run_filter(name, 1.0))
+            jax.effects_barrier()
+
+    def test_warns_under_grad(self):
+        """The fit_sgd path (jax.grad through the filter) still reports."""
+
+        def neg_ll(beta):
+            return -multinomial_choice_filter(
+                [0, 1],
+                2,
+                inverse_temperature=beta,
+                init_mean=[self.STALL["mean"]],
+                init_cov=[[self.STALL["var"]]],
+            ).marginal_log_likelihood
+
+        with pytest.warns(StateSpaceWarning, match="multinomial_choice_filter"):
+            grad = jax.block_until_ready(jax.grad(neg_ll)(self.STALL["beta"]))
+            jax.effects_barrier()
+        assert np.isfinite(grad)
+
+
 class TestMultinomialChoiceFilter:
     def test_output_shapes(self):
         """100 trials, 4 options -> filtered_values shape (100, 3)."""
@@ -121,13 +285,25 @@ class TestMultinomialChoiceFilter:
         assert result.predicted_values.shape == (100, 3)
         assert result.predicted_covariances.shape == (100, 3, 3)
 
+    @pytest.mark.parametrize(
+        "choice_filter",
+        [multinomial_choice_filter, covariate_choice_filter],
+    )
+    def test_empty_choice_sequence(self, choice_filter):
+        """No trials: empty estimates and a zero log-likelihood, no warning."""
+        result = choice_filter(jnp.zeros((0,), dtype=int), n_options=3)
+        assert result.filtered_values.shape[0] == 0
+        assert float(result.marginal_log_likelihood) == 0.0
+
     def test_preferred_option_has_highest_value(self):
         """Option 1 chosen 80% -> its value should be highest."""
         rng = np.random.default_rng(42)
         n_trials = 200
         choices = np.where(rng.random(n_trials) < 0.8, 1, 2)
         result = multinomial_choice_filter(
-            choices, n_options=3, inverse_temperature=1.0,
+            choices,
+            n_options=3,
+            inverse_temperature=1.0,
         )
         final_values = result.filtered_values[-1]
         # Option 1 = free param index 0, option 2 = free param index 1
@@ -135,12 +311,16 @@ class TestMultinomialChoiceFilter:
 
     def test_switching_preference_tracked(self):
         """First 100 trials: option 1, next 100: option 2."""
-        choices = np.concatenate([
-            np.ones(100, dtype=int),   # option 1
-            np.full(100, 2, dtype=int),  # option 2
-        ])
+        choices = np.concatenate(
+            [
+                np.ones(100, dtype=int),  # option 1
+                np.full(100, 2, dtype=int),  # option 2
+            ]
+        )
         result = multinomial_choice_filter(
-            choices, n_options=3, process_noise=0.05,
+            choices,
+            n_options=3,
+            process_noise=0.05,
         )
         # At trial 50: value[0] > value[1]
         assert result.filtered_values[49, 0] > result.filtered_values[49, 1]
@@ -200,7 +380,9 @@ class TestMultinomialChoiceSmoother:
         filt = multinomial_choice_filter(choices, n_options=3)
         smooth = multinomial_choice_smoother(choices, n_options=3)
         filt_var = np.mean([np.trace(c) for c in np.array(filt.filtered_covariances)])
-        smooth_var = np.mean([np.trace(c) for c in np.array(smooth.smoothed_covariances)])
+        smooth_var = np.mean(
+            [np.trace(c) for c in np.array(smooth.smoothed_covariances)]
+        )
         assert smooth_var <= filt_var * 1.01
 
     def test_last_trial_matches_filter(self):
@@ -254,7 +436,9 @@ class TestMultinomialChoiceModel:
     def test_fit_learns_process_noise(self):
         """Switching preferences should yield higher Q than stable."""
         stable = np.ones(200, dtype=int)
-        switching = np.concatenate([np.ones(100, dtype=int), np.full(100, 2, dtype=int)])
+        switching = np.concatenate(
+            [np.ones(100, dtype=int), np.full(100, 2, dtype=int)]
+        )
 
         model_stable = MultinomialChoiceModel(n_options=3)
         model_stable.fit(stable, max_iter=10)
@@ -266,9 +450,12 @@ class TestMultinomialChoiceModel:
 
     def test_fit_verbose(self, caplog):
         import logging
+
         rng = np.random.default_rng(42)
         model = MultinomialChoiceModel(n_options=3)
-        with caplog.at_level(logging.INFO, logger="state_space_practice.multinomial_choice"):
+        with caplog.at_level(
+            logging.INFO, logger="state_space_practice.multinomial_choice"
+        ):
             model.fit(rng.integers(0, 3, size=50), max_iter=2, verbose=True)
         assert "EM iter" in caplog.text
 
@@ -314,7 +501,7 @@ class TestMultinomialChoiceModel:
         # history is non-decreasing (up to the guard's 1e-6 tolerance).
         for i in range(1, len(lls)):
             assert lls[i] >= lls[i - 1] - 1e-5, (
-                f"LL decreased by {lls[i-1] - lls[i]:.6f} at iter {i}"
+                f"LL decreased by {lls[i - 1] - lls[i]:.6f} at iter {i}"
             )
 
     def test_em_monotonicity_guard_rolls_back_overshoot(self):
@@ -330,7 +517,7 @@ class TestMultinomialChoiceModel:
         lls = model.fit(sim.choices, max_iter=40)
         for i in range(1, len(lls)):
             assert lls[i] >= lls[i - 1] - 1e-6, (
-                f"LL decreased by {lls[i-1] - lls[i]:.6f} at iter {i}"
+                f"LL decreased by {lls[i - 1] - lls[i]:.6f} at iter {i}"
             )
         # guard: the reported final LL is the best iterate, not a degraded one.
         assert model.log_likelihood_ >= max(lls) - 1e-6
@@ -395,8 +582,11 @@ class TestSimulateChoiceData:
         """With high beta, the most-chosen option in last trials should
         correspond to the highest-valued option."""
         data = simulate_choice_data(
-            n_trials=500, n_options=3,
-            process_noise=0.1, inverse_temperature=5.0, seed=42,
+            n_trials=500,
+            n_options=3,
+            process_noise=0.1,
+            inverse_temperature=5.0,
+            seed=42,
         )
         # Find the option with highest final value (including reference at 0)
         final_free_values = np.array(data.true_values[-1])
@@ -420,8 +610,11 @@ class TestMultinomialChoiceIntegration:
     def test_recovers_simulated_values(self):
         """Smoothed values should track true values on simulated data."""
         data = simulate_choice_data(
-            n_trials=300, n_options=4,
-            process_noise=0.05, inverse_temperature=2.0, seed=42,
+            n_trials=300,
+            n_options=4,
+            process_noise=0.05,
+            inverse_temperature=2.0,
+            seed=42,
         )
         model = MultinomialChoiceModel(n_options=4)
         model.fit(np.array(data.choices), max_iter=15)
@@ -433,15 +626,16 @@ class TestMultinomialChoiceIntegration:
         warmup = 50
         for k in range(3):
             corr = np.corrcoef(smoothed[warmup:, k], true_vals[warmup:, k])[0, 1]
-            assert corr > 0.5, (
-                f"Option {k+1} correlation {corr:.2f} < 0.5"
-            )
+            assert corr > 0.5, f"Option {k + 1} correlation {corr:.2f} < 0.5"
 
     def test_compare_to_null_detects_learning(self):
         """Model should beat null on simulated biased data."""
         data = simulate_choice_data(
-            n_trials=200, n_options=3,
-            process_noise=0.05, inverse_temperature=3.0, seed=42,
+            n_trials=200,
+            n_options=3,
+            process_noise=0.05,
+            inverse_temperature=3.0,
+            seed=42,
         )
         model = MultinomialChoiceModel(n_options=3)
         model.fit(np.array(data.choices), max_iter=10)
@@ -474,6 +668,7 @@ class TestMultinomialChoiceModelPlotting:
     @pytest.fixture
     def fitted_model(self):
         import matplotlib
+
         matplotlib.use("Agg")
 
         rng = np.random.default_rng(42)
@@ -501,7 +696,7 @@ class TestMultinomialChoiceModelPlotting:
 
     def test_plot_requires_fit(self):
         model = MultinomialChoiceModel(n_options=3)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(NotFittedError):
             model.plot_values()
 
 
@@ -541,7 +736,11 @@ class TestMultinomialSGDFitting:
         m_sgd.fit_sgd(choices, num_steps=200)
 
         # LLs should be within 10% of each other
-        assert abs(m_em.log_likelihood_ - m_sgd.log_likelihood_) / abs(m_em.log_likelihood_) < 0.1
+        assert (
+            abs(m_em.log_likelihood_ - m_sgd.log_likelihood_)
+            / abs(m_em.log_likelihood_)
+            < 0.1
+        )
 
 
 class TestMultinomialUncertaintySummaries:
@@ -638,9 +837,7 @@ class TestMultinomialRecovery:
         # Predictive accuracy: argmax choice probs should agree with
         # argmax of true choice probs at least 60% of the time
         true_probs = np.asarray(sim.true_probs)
-        full_smoothed = np.column_stack([
-            np.zeros(len(smoothed)), smoothed
-        ])
+        full_smoothed = np.column_stack([np.zeros(len(smoothed)), smoothed])
         pred_probs = np.exp(2.0 * full_smoothed)
         pred_probs /= pred_probs.sum(axis=1, keepdims=True)
         agree = (pred_probs.argmax(axis=1) == true_probs.argmax(axis=1)).mean()
@@ -691,3 +888,187 @@ class TestMultinomialChoiceValidation:
         m2 = MultinomialChoiceModel(n_options=3)
         m2.fit(choices, max_iter=100)
         assert m2.converged_ is True
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize(
+        "bad_choices",
+        [np.array([0, 1, 7, 2]), np.array([1])],
+        ids=["out_of_range", "too_few_trials"],
+    )
+    def test_rejected_refit_preserves_fitted_state(self, bad_choices):
+        rng = np.random.default_rng(1)
+        model = MultinomialChoiceModel(n_options=3)
+        model.fit(rng.integers(0, 3, size=60), max_iter=3)
+        bic_before = model.bic()
+        with pytest.raises(ValueError):
+            model.fit(bad_choices, max_iter=3)
+        # Guard: the rejected call would change n_trials if it leaked through.
+        assert len(bad_choices) != 60
+        assert model.bic() == bic_before
+
+
+class TestMultinomialMStepExactness:
+    """Each EM M-step returns the optimum of the objective it claims.
+
+    - Process noise: the expected complete-data log-likelihood of the random
+      walk ``x_t = x_{t-1} + w_t, w_t ~ N(0, q I)`` in the scalar ``q``,
+
+          Q(q) = -(T-1) k / 2 log q - S / (2 q),
+          S = sum_t E||x_t - x_{t-1}||^2 = sum_t ||m_t - m_{t-1}||^2
+              + tr P_t + tr P_{t-1} - 2 tr C_{t-1,t},
+
+      written out here from the smoother moments.
+    - Inverse temperature: no closed form; the M-step maximises the filter's
+      marginal log-likelihood by grid search + 10 golden-section steps, so the
+      returned beta must lie within the final bracket of the true maximiser.
+    """
+
+    @staticmethod
+    def _q_objective(smooth, q):
+        m = np.asarray(smooth.smoothed_values)
+        P = np.asarray(smooth.smoothed_covariances)
+        C = np.asarray(smooth.smoother_cross_cov)
+        n, k = m.shape[0] - 1, m.shape[1]
+        S = (
+            np.sum((m[1:] - m[:-1]) ** 2)
+            + np.trace(P[1:], axis1=1, axis2=2).sum()
+            + np.trace(P[:-1], axis1=1, axis2=2).sum()
+            - 2 * np.trace(C, axis1=1, axis2=2).sum()
+        )
+        return -0.5 * n * k * np.log(q) - S / (2 * q)
+
+    @pytest.mark.slow
+    @given(
+        seed=st.integers(0, 10_000),
+        q_init=st.floats(0.005, 0.5),
+        beta=st.floats(0.5, 3.0),
+    )
+    @settings(max_examples=6, deadline=None)
+    def test_process_noise_is_stationary_and_ascends(self, seed, q_init, beta):
+        sim = simulate_choice_data(
+            n_trials=40,
+            n_options=3,
+            process_noise=0.05,
+            inverse_temperature=beta,
+            seed=seed,
+        )
+        model = MultinomialChoiceModel(
+            n_options=3, init_process_noise=q_init, init_inverse_temperature=beta
+        )
+        smooth = model._run_smoother(jnp.asarray(sim.choices))
+        q_new = model._m_step_process_noise(smooth)
+        eps = 1e-6 * q_new
+        grad = (
+            self._q_objective(smooth, q_new + eps)
+            - self._q_objective(smooth, q_new - eps)
+        ) / (2 * eps)
+        scale = abs(self._q_objective(smooth, q_new)) / q_new
+        assert abs(grad) < 1e-6 * scale, (grad, q_new)
+        assert self._q_objective(smooth, q_new) >= self._q_objective(smooth, q_init)
+        # Strictly a maximum: moving 10% either way lowers Q.
+        for f in (0.9, 1.1):
+            assert self._q_objective(smooth, f * q_new) < self._q_objective(
+                smooth, q_new
+            )
+
+    def test_one_point_grid_keeps_better_current_beta(self):
+        """A one-point grid has no bracket to refine; the M-step must still
+        compare the grid point with the current beta."""
+        sim = simulate_choice_data(
+            n_trials=40,
+            n_options=3,
+            process_noise=0.05,
+            inverse_temperature=1.0,
+            seed=0,
+        )
+        choices = jnp.asarray(sim.choices)
+        model = MultinomialChoiceModel(
+            n_options=3, init_process_noise=0.05, init_inverse_temperature=1.0
+        )
+
+        def ll(beta):
+            return float(
+                multinomial_choice_filter(
+                    choices, 3, process_noise=0.05, inverse_temperature=beta
+                ).marginal_log_likelihood
+            )
+
+        assert ll(1.0) > ll(12.0) + 1.0  # guard: the grid point is worse
+        assert model._m_step_beta(choices, jnp.array([12.0])) == 1.0
+
+    @pytest.mark.slow
+    @given(seed=st.integers(0, 10_000), beta_init=st.floats(0.3, 6.0))
+    @example(seed=4, beta_init=1.0)  # maximum at the top edge of the grid
+    @settings(max_examples=5, deadline=None)
+    def test_beta_reaches_marginal_ll_maximum_within_bracket(self, seed, beta_init):
+        from scipy.optimize import minimize_scalar
+
+        from state_space_practice.multinomial_choice import _DEFAULT_BETA_GRID
+
+        sim = simulate_choice_data(
+            n_trials=40,
+            n_options=3,
+            process_noise=0.05,
+            inverse_temperature=2.0,
+            seed=seed,
+        )
+        choices = jnp.asarray(sim.choices)
+        model = MultinomialChoiceModel(
+            n_options=3, init_process_noise=0.05, init_inverse_temperature=beta_init
+        )
+        grid = np.array(_DEFAULT_BETA_GRID)
+        beta_new = model._m_step_beta(choices, jnp.asarray(grid))
+
+        def ll(beta):
+            return float(
+                multinomial_choice_filter(
+                    choices, 3, process_noise=0.05, inverse_temperature=beta
+                ).marginal_log_likelihood
+            )
+
+        grid_lls = np.array([ll(b) for b in grid])
+        i = int(np.argmax(grid_lls))
+        lo, hi = grid[max(i - 1, 0)], grid[min(i + 1, grid.size - 1)]
+        ref = minimize_scalar(
+            lambda b: -ll(b), bounds=(lo, hi), method="bounded", options={"xatol": 1e-8}
+        )
+        # 10 golden-section steps shrink the bracket to 0.618^10 = 0.8%.
+        assert abs(beta_new - ref.x) <= 0.005 * (hi - lo) + 1e-6, (beta_new, ref.x)
+        assert ll(beta_new) >= grid_lls.max() - 1e-9
+        assert ll(beta_new) >= ll(beta_init) - 1e-9
+
+
+@pytest.mark.slow
+def test_beta_recovery_improves_with_data():
+    """Recovery as a statistic: the beta M-step (q at its true value).
+
+    5 seeds at 100 and 800 trials, beta_true=1. The mean |log(beta_hat /
+    beta)| must shrink with 8x the data (observed 0.75 -> 0.18). (At
+    beta_true=2 the Laplace evidence's upward bias at large beta -- see
+    test_oracle_choice -- sends some seeds to the top of the grid.)
+    """
+    from state_space_practice.multinomial_choice import _DEFAULT_BETA_GRID
+
+    def errors(n_trials):
+        out = []
+        for seed in range(5):
+            sim = simulate_choice_data(
+                n_trials=n_trials,
+                n_options=3,
+                process_noise=0.05,
+                inverse_temperature=1.0,
+                seed=seed,
+            )
+            model = MultinomialChoiceModel(n_options=3, init_process_noise=0.05)
+            beta = model._m_step_beta(
+                jnp.asarray(sim.choices), jnp.asarray(_DEFAULT_BETA_GRID)
+            )
+            out.append(abs(np.log(beta)))
+        return np.array(out)
+
+    small, large = errors(100), errors(800)
+    msg = (
+        f"|log beta error| per seed: 100 trials {small.round(3)}, 800 {large.round(3)}"
+    )
+    assert large.mean() < 0.5 * small.mean(), msg
+    assert large.mean() < 0.35, msg

@@ -26,8 +26,12 @@ from state_space_practice.simulate_data import simulate_2d_moving_place_field
 # %%
 # --- Simulate data ---
 data = simulate_2d_moving_place_field(
-    total_time=600.0, dt=0.004, drift_speed=0.05,
-    peak_rate=80.0, background_rate=2.0, n_basis_per_dim=5,
+    total_time=600.0,
+    dt=0.004,
+    drift_speed=0.05,
+    peak_rate=80.0,
+    background_rate=2.0,
+    n_basis_per_dim=5,
 )
 
 print(f"n_time: {len(data['time'])}")
@@ -109,8 +113,20 @@ fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 t_plot = 10.0  # seconds to plot
 n_plot = int(t_plot / dt)
 ax = axes[0, 0]
-ax.plot(data["time"][:n_plot], data["true_rate"][:n_plot], "k-", alpha=0.5, label="True rate")
-ax.plot(data["time"][:n_plot], np.array(rate_estimated[:n_plot]), "r-", alpha=0.7, label="Estimated rate")
+ax.plot(
+    data["time"][:n_plot],
+    data["true_rate"][:n_plot],
+    "k-",
+    alpha=0.5,
+    label="True rate",
+)
+ax.plot(
+    data["time"][:n_plot],
+    np.array(rate_estimated[:n_plot]),
+    "r-",
+    alpha=0.7,
+    label="Estimated rate",
+)
 ax.set_xlabel("Time (s)")
 ax.set_ylabel("Firing rate (Hz)")
 ax.set_title("True vs Estimated Rate (first 10s)")
@@ -130,7 +146,9 @@ background_rate = 2.0
 pf_sigma = 12.0
 center_start = data["true_center"][0]
 dist_sq = (xx - center_start[0]) ** 2 + (yy - center_start[1]) ** 2
-true_field_start = background_rate + (peak_rate - background_rate) * np.exp(-dist_sq / (2 * pf_sigma**2))
+true_field_start = background_rate + (peak_rate - background_rate) * np.exp(
+    -dist_sq / (2 * pf_sigma**2)
+)
 im = ax.pcolormesh(x_grid, y_grid, true_field_start, cmap="hot")
 ax.set_title("True Place Field (t=0)")
 ax.set_xlabel("x (cm)")
@@ -141,7 +159,9 @@ plt.colorbar(im, ax=ax, label="Rate (Hz)")
 ax = axes[0, 2]
 center_end = data["true_center"][-1]
 dist_sq = (xx - center_end[0]) ** 2 + (yy - center_end[1]) ** 2
-true_field_end = background_rate + (peak_rate - background_rate) * np.exp(-dist_sq / (2 * pf_sigma**2))
+true_field_end = background_rate + (peak_rate - background_rate) * np.exp(
+    -dist_sq / (2 * pf_sigma**2)
+)
 im = ax.pcolormesh(x_grid, y_grid, true_field_end, cmap="hot")
 ax.set_title("True Place Field (t=end)")
 ax.set_xlabel("x (cm)")
@@ -198,18 +218,35 @@ n_blocks = 20
 block_size = n_time // n_blocks
 estimated_centers = []
 for i in range(n_blocks):
-    w_block = np.array(smoother_mean[i * block_size : (i + 1) * block_size].mean(axis=0))
+    w_block = np.array(
+        smoother_mean[i * block_size : (i + 1) * block_size].mean(axis=0)
+    )
     log_r = Z_grid_fine @ w_block
     peak_idx = np.argmax(log_r)
     estimated_centers.append(grid_fine[peak_idx])
 estimated_centers = np.array(estimated_centers)
 
 true_center_blocks = np.array(
-    [data["true_center"][i * block_size : (i + 1) * block_size].mean(axis=0) for i in range(n_blocks)]
+    [
+        data["true_center"][i * block_size : (i + 1) * block_size].mean(axis=0)
+        for i in range(n_blocks)
+    ]
 )
 
-ax.plot(true_center_blocks[:, 0], true_center_blocks[:, 1], "k-o", label="True center", markersize=4)
-ax.plot(estimated_centers[:, 0], estimated_centers[:, 1], "r-s", label="Estimated center", markersize=4)
+ax.plot(
+    true_center_blocks[:, 0],
+    true_center_blocks[:, 1],
+    "k-o",
+    label="True center",
+    markersize=4,
+)
+ax.plot(
+    estimated_centers[:, 0],
+    estimated_centers[:, 1],
+    "r-s",
+    label="Estimated center",
+    markersize=4,
+)
 ax.set_xlabel("x (cm)")
 ax.set_ylabel("y (cm)")
 ax.set_title("Place Field Center Drift")

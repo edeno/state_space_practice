@@ -15,36 +15,13 @@ shifting the objective when all penalized couplings are zero. Post-hoc
 thresholding can be applied after optimization for exact sparsity.
 """
 
-import operator
 from dataclasses import dataclass
-from typing import Optional
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-
-def _contains_tracer(*values: object) -> bool:
-    """Return True if any pytree leaf is being traced by JAX."""
-    return any(
-        isinstance(leaf, jax.core.Tracer)
-        for value in values
-        for leaf in jax.tree_util.tree_leaves(value)
-    )
-
-
-def _validate_nonnegative_weight(value: object, name: str) -> float:
-    """Validate and coerce a finite non-negative scalar penalty weight."""
-    value_arr = np.asarray(value)
-    if value_arr.shape != ():
-        raise ValueError(f"{name} must be a scalar, got shape {value_arr.shape}.")
-    value_float = float(value_arr)
-    if not np.isfinite(value_float):
-        raise ValueError(f"{name} must be finite, got {value}.")
-    if value_float < 0.0:
-        raise ValueError(f"{name} must be non-negative, got {value_float}.")
-    return value_float
+from state_space_practice.utils import contains_tracer, validate_int, validate_scalar
 
 
 def _validate_eps(eps: float) -> Array:
@@ -52,7 +29,7 @@ def _validate_eps(eps: float) -> Array:
     eps_arr = jnp.asarray(eps)
     if eps_arr.shape != ():
         raise ValueError(f"eps must be a scalar, got shape {eps_arr.shape}.")
-    if not _contains_tracer(eps_arr):
+    if not contains_tracer(eps_arr):
         eps_float = float(eps_arr)
         if not np.isfinite(eps_float) or eps_float <= 0.0:
             raise ValueError(f"eps must be positive and finite, got {eps}.")
@@ -64,15 +41,13 @@ def _as_coupling(coupling: Array) -> Array:
     arr = jnp.asarray(coupling)
     if arr.ndim != 3:
         raise ValueError(
-            "coupling must have shape (n_states, n_osc, n_osc), "
-            f"got {arr.shape}."
+            f"coupling must have shape (n_states, n_osc, n_osc), got {arr.shape}."
         )
     if arr.shape[-2] != arr.shape[-1]:
         raise ValueError(
-            "coupling must have square oscillator axes, "
-            f"got {arr.shape[-2:]}."
+            f"coupling must have square oscillator axes, got {arr.shape[-2:]}."
         )
-    if not _contains_tracer(arr) and not bool(jnp.all(jnp.isfinite(arr))):
+    if not contains_tracer(arr) and not bool(jnp.all(jnp.isfinite(arr))):
         raise ValueError("coupling must contain only finite values.")
     return arr
 
@@ -82,8 +57,7 @@ def _validate_area_labels(area_labels: Array, n_osc: int | None = None) -> Array
     labels_np = np.asarray(area_labels)
     if labels_np.ndim != 1:
         raise ValueError(
-            "area_labels must be a 1D integer array, "
-            f"got shape {labels_np.shape}."
+            f"area_labels must be a 1D integer array, got shape {labels_np.shape}."
         )
     if labels_np.size == 0:
         raise ValueError("area_labels must contain at least one label.")
@@ -114,15 +88,14 @@ def _area_labels_for_penalty(area_labels: Array, n_osc: int) -> Array:
     labels = jnp.asarray(area_labels)
     if labels.ndim != 1:
         raise ValueError(
-            "area_labels must be a 1D integer array, "
-            f"got shape {labels.shape}."
+            f"area_labels must be a 1D integer array, got shape {labels.shape}."
         )
     if labels.shape[0] != n_osc:
         raise ValueError(
             "area_labels length must match the number of oscillators; "
             f"got {labels.shape[0]} labels for n_osc={n_osc}."
         )
-    if _contains_tracer(labels):
+    if contains_tracer(labels):
         return labels
     return _validate_area_labels(labels, n_osc=n_osc)
 
@@ -159,7 +132,7 @@ class OscillatorPenaltyConfig:
     edge_l1: float = 0.0
     area_group_l2: float = 0.0
     state_shared_group_l2: float = 0.0
-    area_labels: Optional[Array] = None
+    area_labels: Array | None = None
     exclude_diagonal: bool = True
     scale_with_length: bool = False
 
@@ -168,7 +141,7 @@ class OscillatorPenaltyConfig:
             object.__setattr__(
                 self,
                 name,
-                _validate_nonnegative_weight(getattr(self, name), name),
+                validate_scalar(getattr(self, name), name, nonnegative=True),
             )
 
         if self.area_labels is not None:
@@ -228,7 +201,7 @@ def _build_area_pair_masks(area_labels: Array, n_areas: int) -> Array:
         masks[a, b, i, j] is True iff area_labels[i]==a and area_labels[j]==b.
     """
     areas = jnp.arange(n_areas)
-    mask_rows = (area_labels[None, :] == areas[:, None])  # (n_areas, n_osc)
+    mask_rows = area_labels[None, :] == areas[:, None]  # (n_areas, n_osc)
     # (n_areas, 1, n_osc, 1) * (1, n_areas, 1, n_osc) -> (n_areas, n_areas, n_osc, n_osc)
     return mask_rows[:, None, :, None] * mask_rows[None, :, None, :]
 
@@ -265,7 +238,7 @@ def area_group_penalty(
     masks = _build_area_pair_masks(labels, n_areas)
     eps_arr = _validate_eps(eps).astype(c.dtype)
     # (n_states, n_areas, n_areas): sum c^2 within each area block per state
-    block_sq = jnp.einsum("sij,abij->sab", c ** 2, masks.astype(c.dtype))
+    block_sq = jnp.einsum("sij,abij->sab", c**2, masks.astype(c.dtype))
     return jnp.sum(jnp.sqrt(block_sq + eps_arr) - jnp.sqrt(eps_arr))
 
 
@@ -298,11 +271,9 @@ def state_shared_area_penalty(
     masks = _build_area_pair_masks(labels, n_areas)
     eps_arr = _validate_eps(eps).astype(c.dtype)
     # Sum c^2 within each area block per state: (n_states, n_areas, n_areas)
-    block_sq = jnp.einsum("sij,abij->sab", c ** 2, masks.astype(c.dtype))
+    block_sq = jnp.einsum("sij,abij->sab", c**2, masks.astype(c.dtype))
     # Sum across states, then sqrt for group penalty
-    return jnp.sum(
-        jnp.sqrt(jnp.sum(block_sq, axis=0) + eps_arr) - jnp.sqrt(eps_arr)
-    )
+    return jnp.sum(jnp.sqrt(jnp.sum(block_sq, axis=0) + eps_arr) - jnp.sqrt(eps_arr))
 
 
 def get_area_coupling_summary(
@@ -337,7 +308,7 @@ def get_area_coupling_summary(
 
     masks = _build_area_pair_masks(labels, n_areas)
     # (n_states, n_areas, n_areas)
-    block_sq = jnp.einsum("sij,abij->sab", c ** 2, masks.astype(c.dtype))
+    block_sq = jnp.einsum("sij,abij->sab", c**2, masks.astype(c.dtype))
     block_norms = jnp.sqrt(block_sq)
 
     within_mask = jnp.eye(n_areas, dtype=bool)
@@ -377,12 +348,7 @@ def total_connectivity_penalty(
         the total loss by T, the effective penalty is exactly lambda.
     """
     coupling = _as_coupling(coupling)
-    try:
-        n_timesteps = operator.index(n_timesteps)
-    except TypeError as exc:
-        raise ValueError("n_timesteps must be a positive integer.") from exc
-    if n_timesteps <= 0:
-        raise ValueError("n_timesteps must be a positive integer.")
+    n_timesteps = validate_int(n_timesteps, "n_timesteps", positive=True)
 
     penalty = jnp.array(0.0, dtype=coupling.dtype)
 
@@ -393,21 +359,19 @@ def total_connectivity_penalty(
 
     if config.area_group_l2 > 0:
         if config.area_labels is None:
-            raise ValueError(
-                "area_labels required when area_group_l2 > 0"
-            )
+            raise ValueError("area_labels required when area_group_l2 > 0")
         penalty = penalty + config.area_group_l2 * area_group_penalty(
-            coupling, config.area_labels,
+            coupling,
+            config.area_labels,
             exclude_diagonal=config.exclude_diagonal,
         )
 
     if config.state_shared_group_l2 > 0:
         if config.area_labels is None:
-            raise ValueError(
-                "area_labels required when state_shared_group_l2 > 0"
-            )
+            raise ValueError("area_labels required when state_shared_group_l2 > 0")
         penalty = penalty + config.state_shared_group_l2 * state_shared_area_penalty(
-            coupling, config.area_labels,
+            coupling,
+            config.area_labels,
             exclude_diagonal=config.exclude_diagonal,
         )
 

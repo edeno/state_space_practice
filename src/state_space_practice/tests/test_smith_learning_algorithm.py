@@ -5,12 +5,16 @@ This module tests the Bayesian state-space model for learning dynamics,
 including the Laplace approximation filter/smoother and EM algorithm.
 """
 
+import warnings
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.smith_learning_algorithm import (
+    DEFAULT_SIGMA_EPSILON,
     SmithLearningModel,
     _find_runs_of_value,
     _log_posterior_objective,
@@ -243,6 +247,67 @@ class TestSmithLearningFilter:
         # Average variance should be higher with higher sigma_epsilon
         assert jnp.mean(var_high) > jnp.mean(var_low)
 
+    @pytest.mark.parametrize("differentiable", [False, True])
+    def test_integer_initial_state_matches_float(
+        self, simulated_data, differentiable
+    ) -> None:
+        """An integer initial state is promoted to float, not a TypeError."""
+        outcomes, _ = simulated_data
+        out_int = smith_learning_filter(
+            outcomes,
+            init_learning_state=1,
+            max_possible_correct=1,
+            differentiable=differentiable,
+        )
+        out_float = smith_learning_filter(
+            outcomes,
+            init_learning_state=1.0,
+            max_possible_correct=1,
+            differentiable=differentiable,
+        )
+        for a, b in zip(out_int, out_float):
+            assert a.dtype == jnp.float64
+            np.testing.assert_allclose(a, b, rtol=1e-12)
+
+    @pytest.mark.parametrize("differentiable", [False, True])
+    def test_stalled_newton_warns(self, simulated_data, differentiable) -> None:
+        """A prior deep in saturation opposite the data (N=1000, y=0, prior
+        N(30, 1e4)): every Armijo step overshoots, the step is 0 and the mode
+        never moves. The filter must say so; ordinary data stays silent."""
+        with pytest.warns(StateSpaceWarning, match="smith_learning_filter"):
+            _, mode, _, _, _ = smith_learning_filter(
+                jnp.array([0]),
+                init_learning_state=30.0,
+                init_learning_variance=1e4 - DEFAULT_SIGMA_EPSILON**2,
+                max_possible_correct=1000,
+                differentiable=differentiable,
+            )
+            jax.effects_barrier()
+        np.testing.assert_allclose(mode[0], 30.0)  # guard: really stalled
+        outcomes, _ = simulated_data
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", StateSpaceWarning)
+            smith_learning_filter(
+                outcomes, max_possible_correct=1, differentiable=differentiable
+            )
+            jax.effects_barrier()
+
+    def test_float32_inputs_stay_float32(self, simulated_data) -> None:
+        outcomes, _ = simulated_data
+        kwargs = dict(init_learning_variance=0.3, max_possible_correct=1)
+        ref = smith_learning_filter(
+            outcomes, init_learning_state=0.5, sigma_epsilon=0.2, **kwargs
+        )
+        out = smith_learning_filter(
+            outcomes,
+            init_learning_state=np.float32(0.5),
+            sigma_epsilon=np.float32(0.2),
+            **kwargs,
+        )
+        for a, b in zip(out, ref):
+            assert a.dtype == jnp.float32
+            np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-6)
+
 
 class TestSmithLearningSmoother:
     """Tests for the smith_learning_smoother function."""
@@ -354,13 +419,30 @@ class TestMaximizationStep:
 
         np.testing.assert_allclose(init_mean, s["mode"][0], rtol=1e-10)
 
-    def test_init_var_equals_first_smoother(self, smoother_outputs) -> None:
-        """Estimated initial variance should equal first smoother variance."""
+    def test_init_var_is_first_smoother_variance_minus_process_noise(
+        self, smoother_outputs
+    ) -> None:
+        """x_1 ~ N(x_0, P_0 + sigma^2): the optimum is P_0 = P_{1|T} - sigma^2."""
         s = smoother_outputs
 
-        _, _, init_var = maximization_step(s["mode"], s["variance"], s["gain"])
+        sigma, _, init_var = maximization_step(s["mode"], s["variance"], s["gain"])
 
-        np.testing.assert_allclose(init_var, s["variance"][0], rtol=1e-10)
+        np.testing.assert_allclose(
+            init_var, max(float(s["variance"][0] - sigma**2), 1e-8), rtol=1e-10
+        )
+
+    def test_transition_only_estimate_for_fixed_initial_variance(
+        self, smoother_outputs
+    ) -> None:
+        """Heuristic initial-state methods keep sigma^2 = S / (T - 1)."""
+        s = smoother_outputs
+        m, P, G = (np.asarray(s[k]) for k in ("mode", "variance", "gain"))
+        S = np.sum((m[1:] - m[:-1]) ** 2 + P[1:] + P[:-1] - 2 * P[1:] * G)
+        sigma, _, init_var = maximization_step(
+            s["mode"], s["variance"], s["gain"], estimate_initial_variance=False
+        )
+        np.testing.assert_allclose(sigma**2, S / (len(m) - 1), rtol=1e-10)
+        np.testing.assert_allclose(init_var, P[0], rtol=1e-10)
 
 
 class TestCalculateProbabilityConfidenceLimits:
@@ -754,14 +836,19 @@ class TestSmithLearningModelClass:
         plt.close(fig)
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
-    def test_fit_verbose_prints_output(self, capsys: pytest.CaptureFixture) -> None:
-        """fit(verbose=True) should print convergence info to stdout."""
+    def test_fit_verbose_logs_progress(self, caplog: pytest.LogCaptureFixture) -> None:
+        """fit(verbose=True) logs per-iteration progress at INFO; quiet does not."""
+        import logging
+
         outcomes_np, _ = simulate_learning_data(n_trials=20, seed=42)
         outcomes = jnp.array(outcomes_np)
-        model = SmithLearningModel()
-        model.fit(outcomes, max_iter=5, verbose=True)
-        captured = capsys.readouterr()
-        assert "LL=" in captured.out or "Converged" in captured.out
+        smith_logger = "state_space_practice.smith_learning_algorithm"
+        with caplog.at_level(logging.INFO, logger=smith_logger):
+            SmithLearningModel().fit(outcomes, max_iter=5, verbose=False)
+        assert "Log-Likelihood" not in caplog.text
+        with caplog.at_level(logging.INFO, logger=smith_logger):
+            SmithLearningModel().fit(outcomes, max_iter=5, verbose=True)
+        assert "Iteration 1/5" in caplog.text
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_fit_final_estep_after_convergence(self) -> None:
@@ -804,7 +891,7 @@ class TestSmithLearningModelClass:
         """get_learning_curve() should raise if not fitted."""
         model = SmithLearningModel()
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(NotFittedError):
             model.get_learning_curve(jax.random.PRNGKey(0))
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -929,7 +1016,7 @@ class TestSummaryAndScoring:
     def test_bic_requires_fit(self) -> None:
         """bic() should raise if not fitted."""
         model = SmithLearningModel()
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.bic()
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -967,9 +1054,9 @@ class TestSummaryAndScoring:
         model = SmithLearningModel()
         model.fit(outcomes, max_iter=30)
         result = model.compare_to_null(outcomes)
-        assert (
-            result["model_ll"] > result["null_ll"]
-        ), "Learning model should have higher LL than null"
+        assert result["model_ll"] > result["null_ll"], (
+            "Learning model should have higher LL than null"
+        )
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_summary_returns_string(self) -> None:
@@ -1001,7 +1088,7 @@ class TestSummaryAndScoring:
     def test_summary_requires_fit(self) -> None:
         """summary() should raise if not fitted."""
         model = SmithLearningModel()
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.summary()
 
 
@@ -1033,7 +1120,7 @@ class TestFindCriterionTrial:
     def test_requires_fit(self) -> None:
         """Should raise if not fitted."""
         model = SmithLearningModel()
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.find_criterion_trial(jax.random.PRNGKey(0))
 
 
@@ -1084,7 +1171,7 @@ class TestPlotTrialComparisonMatrix:
     def test_requires_fit(self) -> None:
         """Should raise if not fitted."""
         model = SmithLearningModel()
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.plot_trial_comparison_matrix(jax.random.PRNGKey(0))
 
 
@@ -1106,7 +1193,7 @@ class TestPlotConvergence:
     def test_requires_fit(self) -> None:
         """Should raise if not fitted."""
         model = SmithLearningModel()
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.plot_convergence()
 
 
@@ -1134,7 +1221,7 @@ class TestPlotSummary:
     def test_requires_fit(self) -> None:
         """Should raise if not fitted."""
         model = SmithLearningModel()
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.plot_summary(jax.random.PRNGKey(0))
 
 
@@ -1629,6 +1716,34 @@ class TestFindFirstSignificantTrial:
         assert result_lenient is not None
         assert result_strict is None
 
+    @staticmethod
+    def _reference_loop(matrix, reference_trial, significance_level):
+        """The original per-trial loop, kept as the behavioural reference."""
+        for j in range(reference_trial + 1, matrix.shape[0]):
+            if matrix[reference_trial, j] < significance_level / 2:
+                return j
+        return None
+
+    @pytest.mark.parametrize("seed", range(5))
+    def test_matches_per_trial_loop(self, seed) -> None:
+        """The vectorized search returns exactly what the per-trial loop did,
+        including NaN entries (never significant) and every reference trial."""
+        rng = np.random.default_rng(seed)
+        n_trials = 30
+        matrix = rng.uniform(0.0, 0.2, size=(n_trials, n_trials))
+        matrix[rng.random((n_trials, n_trials)) < 0.2] = np.nan
+        found_some = False
+        for reference_trial in [-1, 0, 1, 7, n_trials - 2, n_trials - 1, n_trials]:
+            for level in (0.01, 0.05, 0.2):
+                expected = self._reference_loop(matrix, reference_trial, level)
+                found_some |= expected is not None
+                result = find_first_significant_trial(
+                    jnp.asarray(matrix), reference_trial, level
+                )
+                assert result == expected
+                assert result is None or type(result) is int
+        assert found_some  # guard: the comparison covered positive cases
+
 
 class TestSmithLearningModelTrialComparison:
     """Tests for trial comparison methods on SmithLearningModel class."""
@@ -1654,7 +1769,7 @@ class TestSmithLearningModelTrialComparison:
         model = SmithLearningModel()
         key = jax.random.PRNGKey(0)
 
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.compare_trials(key, trial1=0, trial2=5)
 
     def test_compare_trials_validates_indices(self, fitted_model) -> None:
@@ -1680,7 +1795,7 @@ class TestSmithLearningModelTrialComparison:
         model = SmithLearningModel()
         key = jax.random.PRNGKey(0)
 
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.get_trial_comparison_matrix(key)
 
     def test_get_trial_comparison_matrix_shape(self, fitted_model) -> None:
@@ -1697,249 +1812,159 @@ class TestSmithLearningModelTrialComparison:
         model = SmithLearningModel()
         key = jax.random.PRNGKey(0)
 
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.find_first_significant_improvement(key)
 
 
 # --- Property-Based Tests using Hypothesis ---
 
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
+
+
+def _binary_outcomes(lengths: tuple[int, ...]) -> st.SearchStrategy[jax.Array]:
+    """Arbitrary 0/1 outcome sequences whose length is one of ``lengths``.
+
+    The filter and smoother are jitted, so every distinct length compiles
+    them again; a couple of fixed lengths keeps each example cheap while the
+    drawn outcomes (including all-0 / all-1 runs) explore the input space.
+    """
+    return st.sampled_from(lengths).flatmap(
+        lambda n: st.lists(st.integers(0, 1), min_size=n, max_size=n).map(jnp.asarray)
+    )
+
+
+def _filter_and_smooth(outcomes: jax.Array):
+    """Run the filter then the smoother on ``outcomes``.
+
+    Returns
+    -------
+    filtered : tuple
+        ``smith_learning_filter`` outputs (prob, mode, variance,
+        one_step_mode, one_step_variance), each of shape (n_trials,).
+    smoothed : tuple
+        ``smith_learning_smoother`` outputs (mode, variance, prob, gain).
+    """
+    filtered = smith_learning_filter(outcomes, max_possible_correct=1)
+    _, filter_mode, filter_var, one_step_mode, one_step_var = filtered
+    smoothed = smith_learning_smoother(
+        filter_mode, filter_var, one_step_mode, one_step_var
+    )
+    return filtered, smoothed
 
 
 class TestSmithLearningFilterProperties:
     """Property-based tests for smith_learning_filter."""
 
-    @given(st.integers(min_value=5, max_value=30))
-    @settings(max_examples=20, deadline=None)
-    def test_probability_always_in_bounds(self, n_trials: int) -> None:
+    @given(_binary_outcomes((8, 25)))
+    def test_probability_always_in_bounds(self, outcomes: jax.Array) -> None:
         """Probability of correct response should always be in [0, 1]."""
-        # Generate random binary outcomes
-        key = jax.random.PRNGKey(42)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
+        prob, _, _, _, _ = smith_learning_filter(outcomes, max_possible_correct=1)
+        assert jnp.all(prob >= 0.0)
+        assert jnp.all(prob <= 1.0)
 
-        try:
-            prob, _, _, _, _ = smith_learning_filter(
-                jnp.array(outcomes), max_possible_correct=1
-            )
-            assert jnp.all(prob >= 0.0)
-            assert jnp.all(prob <= 1.0)
-        except Exception:
-            pass  # Skip if optimization fails
-
-    @given(st.integers(min_value=5, max_value=30))
-    @settings(max_examples=20, deadline=None)
-    def test_variance_always_positive(self, n_trials: int) -> None:
+    @given(_binary_outcomes((8, 25)))
+    def test_variance_always_positive(self, outcomes: jax.Array) -> None:
         """Variance should always be positive."""
-        key = jax.random.PRNGKey(123)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
-
-        try:
-            _, _, variance, _, one_step_var = smith_learning_filter(
-                jnp.array(outcomes), max_possible_correct=1
-            )
-            assert jnp.all(variance > 0)
-            assert jnp.all(one_step_var > 0)
-        except Exception:
-            pass  # Skip if optimization fails
+        _, _, variance, _, one_step_var = smith_learning_filter(
+            outcomes, max_possible_correct=1
+        )
+        assert jnp.all(variance > 0)
+        assert jnp.all(one_step_var > 0)
 
     @given(
         st.floats(min_value=0.01, max_value=0.99, allow_nan=False),
         st.floats(min_value=0.05, max_value=0.5, allow_nan=False),
     )
-    @settings(max_examples=20, deadline=None)
     def test_outputs_finite_for_valid_params(
         self, prob_chance: float, sigma: float
     ) -> None:
         """Outputs should be finite for valid parameter combinations."""
         outcomes = jnp.array([0, 1, 1, 0, 1, 1, 1, 0, 1, 1])
-
-        try:
-            prob, mode, variance, _, _ = smith_learning_filter(
-                outcomes,
-                prob_correct_by_chance=prob_chance,
-                sigma_epsilon=sigma,
-                max_possible_correct=1,
-            )
-            assert jnp.all(jnp.isfinite(prob))
-            assert jnp.all(jnp.isfinite(mode))
-            assert jnp.all(jnp.isfinite(variance))
-        except Exception:
-            pass  # Skip if optimization fails
+        prob, mode, variance, _, _ = smith_learning_filter(
+            outcomes,
+            prob_correct_by_chance=prob_chance,
+            sigma_epsilon=sigma,
+            max_possible_correct=1,
+        )
+        assert jnp.all(jnp.isfinite(prob))
+        assert jnp.all(jnp.isfinite(mode))
+        assert jnp.all(jnp.isfinite(variance))
 
 
 class TestSmithLearningSmootherProperties:
     """Property-based tests for smith_learning_smoother."""
 
-    @given(st.integers(min_value=5, max_value=30))
-    @settings(max_examples=20, deadline=None)
-    def test_smoother_probability_in_bounds(self, n_trials: int) -> None:
+    @given(_binary_outcomes((8, 25)))
+    def test_smoother_probability_in_bounds(self, outcomes: jax.Array) -> None:
         """Smoothed probability should be in [0, 1]."""
-        key = jax.random.PRNGKey(456)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
+        _, (_, _, smooth_prob, _) = _filter_and_smooth(outcomes)
+        assert jnp.all(smooth_prob >= 0.0)
+        assert jnp.all(smooth_prob <= 1.0)
 
-        try:
-            _, filter_mode, filter_var, one_step_mode, one_step_var = (
-                smith_learning_filter(jnp.array(outcomes), max_possible_correct=1)
-            )
-
-            _, _, smooth_prob, _ = smith_learning_smoother(
-                filter_mode, filter_var, one_step_mode, one_step_var
-            )
-
-            assert jnp.all(smooth_prob >= 0.0)
-            assert jnp.all(smooth_prob <= 1.0)
-        except Exception:
-            pass  # Skip if optimization fails
-
-    @given(st.integers(min_value=5, max_value=30))
-    @settings(max_examples=20, deadline=None)
-    def test_smoother_variance_non_negative(self, n_trials: int) -> None:
+    @given(_binary_outcomes((8, 25)))
+    def test_smoother_variance_non_negative(self, outcomes: jax.Array) -> None:
         """Smoothed variance should be non-negative."""
-        key = jax.random.PRNGKey(789)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
+        _, (_, smooth_var, _, _) = _filter_and_smooth(outcomes)
+        assert jnp.all(smooth_var >= 0.0)
 
-        try:
-            _, filter_mode, filter_var, one_step_mode, one_step_var = (
-                smith_learning_filter(jnp.array(outcomes), max_possible_correct=1)
-            )
-
-            _, smooth_var, _, _ = smith_learning_smoother(
-                filter_mode, filter_var, one_step_mode, one_step_var
-            )
-
-            assert jnp.all(smooth_var >= 0.0)
-        except Exception:
-            pass  # Skip if optimization fails
-
-    @given(st.integers(min_value=5, max_value=30))
-    @settings(max_examples=20, deadline=None)
-    def test_smoother_last_equals_filter_last(self, n_trials: int) -> None:
+    @given(_binary_outcomes((8, 25)))
+    def test_smoother_last_equals_filter_last(self, outcomes: jax.Array) -> None:
         """Last smoothed state should equal last filtered state."""
-        key = jax.random.PRNGKey(321)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
-
-        try:
-            _, filter_mode, filter_var, one_step_mode, one_step_var = (
-                smith_learning_filter(jnp.array(outcomes), max_possible_correct=1)
-            )
-
-            smooth_mode, smooth_var, _, _ = smith_learning_smoother(
-                filter_mode, filter_var, one_step_mode, one_step_var
-            )
-
-            np.testing.assert_allclose(smooth_mode[-1], filter_mode[-1], rtol=1e-5)
-            np.testing.assert_allclose(smooth_var[-1], filter_var[-1], rtol=1e-5)
-        except Exception:
-            pass  # Skip if optimization fails
+        filtered, (smooth_mode, smooth_var, _, _) = _filter_and_smooth(outcomes)
+        _, filter_mode, filter_var, _, _ = filtered
+        np.testing.assert_allclose(smooth_mode[-1], filter_mode[-1], rtol=1e-5)
+        np.testing.assert_allclose(smooth_var[-1], filter_var[-1], rtol=1e-5)
 
 
 class TestMaximizationStepProperties:
     """Property-based tests for the maximization step."""
 
-    @given(st.integers(min_value=10, max_value=50))
-    @settings(max_examples=15, deadline=None)
-    def test_estimated_sigma_positive(self, n_trials: int) -> None:
+    @given(_binary_outcomes((12, 40)))
+    def test_estimated_sigma_positive(self, outcomes: jax.Array) -> None:
         """Estimated sigma_epsilon should be positive."""
-        key = jax.random.PRNGKey(654)
-        outcomes = jax.random.bernoulli(key, 0.6, (n_trials,)).astype(int)
-
-        try:
-            _, filter_mode, filter_var, one_step_mode, one_step_var = (
-                smith_learning_filter(jnp.array(outcomes), max_possible_correct=1)
-            )
-
-            smooth_mode, smooth_var, _, smoother_gain = smith_learning_smoother(
-                filter_mode, filter_var, one_step_mode, one_step_var
-            )
-
-            sigma_est, _, _ = maximization_step(smooth_mode, smooth_var, smoother_gain)
-
-            assert sigma_est > 0
-        except Exception:
-            pass  # Skip if optimization fails
+        _, (smooth_mode, smooth_var, _, smoother_gain) = _filter_and_smooth(outcomes)
+        sigma_est, _, _ = maximization_step(smooth_mode, smooth_var, smoother_gain)
+        assert sigma_est > 0
 
 
 class TestTrialComparisonProperties:
     """Property-based tests for trial comparison functions."""
 
-    @given(st.integers(min_value=5, max_value=20))
-    @settings(max_examples=15, deadline=None)
-    def test_cross_covariance_symmetry(self, n_trials: int) -> None:
+    @given(_binary_outcomes((6, 15)))
+    def test_cross_covariance_symmetry(self, outcomes: jax.Array) -> None:
         """Cross-covariance matrix should be symmetric."""
-        key = jax.random.PRNGKey(111)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
+        _, (_, smooth_var, _, smoother_gain) = _filter_and_smooth(outcomes)
+        cross_cov = compute_cross_covariance_matrix(smooth_var, smoother_gain)
+        np.testing.assert_allclose(cross_cov, cross_cov.T, rtol=1e-5, atol=1e-10)
 
-        try:
-            _, filter_mode, filter_var, one_step_mode, one_step_var = (
-                smith_learning_filter(jnp.array(outcomes), max_possible_correct=1)
-            )
-
-            _, smooth_var, _, smoother_gain = smith_learning_smoother(
-                filter_mode, filter_var, one_step_mode, one_step_var
-            )
-
-            cross_cov = compute_cross_covariance_matrix(smooth_var, smoother_gain)
-
-            np.testing.assert_allclose(cross_cov, cross_cov.T, rtol=1e-5, atol=1e-10)
-        except Exception:
-            pass  # Skip if optimization fails
-
-    @given(st.integers(min_value=5, max_value=15))
-    @settings(max_examples=10, deadline=None)
-    def test_comparison_matrix_diagonal_is_half(self, n_trials: int) -> None:
+    @given(_binary_outcomes((6, 15)))
+    def test_comparison_matrix_diagonal_is_half(self, outcomes: jax.Array) -> None:
         """Diagonal of comparison matrix should be 0.5 (comparing trial to itself)."""
-        key = jax.random.PRNGKey(222)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
+        _, (smooth_mode, smooth_var, _, smoother_gain) = _filter_and_smooth(outcomes)
+        comp_matrix = compute_trial_comparison_matrix(
+            key=jax.random.PRNGKey(42),
+            smoothed_learning_state_mode=smooth_mode,
+            smoothed_learning_state_variance=smooth_var,
+            smoother_gain=smoother_gain,
+        )
+        np.testing.assert_allclose(jnp.diag(comp_matrix), 0.5, rtol=1e-3)
 
-        try:
-            _, filter_mode, filter_var, one_step_mode, one_step_var = (
-                smith_learning_filter(jnp.array(outcomes), max_possible_correct=1)
-            )
-
-            smooth_mode, smooth_var, _, smoother_gain = smith_learning_smoother(
-                filter_mode, filter_var, one_step_mode, one_step_var
-            )
-
-            comp_matrix = compute_trial_comparison_matrix(
-                key=jax.random.PRNGKey(42),
-                smoothed_learning_state_mode=smooth_mode,
-                smoothed_learning_state_variance=smooth_var,
-                smoother_gain=smoother_gain,
-            )
-
-            diagonal = jnp.diag(comp_matrix)
-            np.testing.assert_allclose(diagonal, 0.5, rtol=1e-3)
-        except Exception:
-            pass  # Skip if optimization fails
-
-    @given(st.integers(min_value=5, max_value=15))
-    @settings(max_examples=10, deadline=None)
-    def test_comparison_probabilities_in_bounds(self, n_trials: int) -> None:
-        """All comparison probabilities should be in [0, 1]."""
-        key = jax.random.PRNGKey(333)
-        outcomes = jax.random.bernoulli(key, 0.5, (n_trials,)).astype(int)
-
-        try:
-            _, filter_mode, filter_var, one_step_mode, one_step_var = (
-                smith_learning_filter(jnp.array(outcomes), max_possible_correct=1)
-            )
-
-            smooth_mode, smooth_var, _, smoother_gain = smith_learning_smoother(
-                filter_mode, filter_var, one_step_mode, one_step_var
-            )
-
-            comp_matrix = compute_trial_comparison_matrix(
-                key=jax.random.PRNGKey(42),
-                smoothed_learning_state_mode=smooth_mode,
-                smoothed_learning_state_variance=smooth_var,
-                smoother_gain=smoother_gain,
-            )
-
-            assert jnp.all(comp_matrix >= 0.0)
-            assert jnp.all(comp_matrix <= 1.0)
-        except Exception:
-            pass  # Skip if optimization fails
+    @given(_binary_outcomes((6, 15)))
+    def test_comparison_probabilities_in_bounds(self, outcomes: jax.Array) -> None:
+        """Comparison probabilities (upper triangle) are in [0, 1]; the
+        lower triangle is NaN as documented."""
+        _, (smooth_mode, smooth_var, _, smoother_gain) = _filter_and_smooth(outcomes)
+        comp_matrix = compute_trial_comparison_matrix(
+            key=jax.random.PRNGKey(42),
+            smoothed_learning_state_mode=smooth_mode,
+            smoothed_learning_state_variance=smooth_var,
+            smoother_gain=smoother_gain,
+        )
+        upper = comp_matrix[jnp.triu_indices(len(outcomes))]
+        assert jnp.all(upper >= 0.0)
+        assert jnp.all(upper <= 1.0)
+        assert jnp.all(jnp.isnan(comp_matrix[jnp.tril_indices(len(outcomes), k=-1)]))
 
 
 class TestSimulateLearningDataProperties:
@@ -2070,7 +2095,8 @@ class TestSmithLearningModelRecovery:
     the recovered learning curve tracks the true probability trajectory."""
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         outcomes, true_prob = simulate_learning_data(
             n_trials=200,
             prob_success_init=0.125,
@@ -2097,16 +2123,14 @@ class TestSmithLearningModelRecovery:
         model, _, _ = fitted
         early_prob = float(model.smoothed_prob_correct_response[0])
         assert early_prob < 0.3, (
-            f"Early smoothed probability {early_prob:.3f} >= 0.3 "
-            f"(true is ~0.125)"
+            f"Early smoothed probability {early_prob:.3f} >= 0.3 (true is ~0.125)"
         )
 
     def test_late_probability_above_chance(self, fitted):
         model, _, _ = fitted
         late_prob = float(model.smoothed_prob_correct_response[-1])
         assert late_prob > 0.4, (
-            f"Late smoothed probability {late_prob:.3f} <= 0.4 "
-            f"(true is ~0.6)"
+            f"Late smoothed probability {late_prob:.3f} <= 0.4 (true is ~0.6)"
         )
 
     def test_smoother_reduces_variance(self, fitted):
@@ -2135,7 +2159,9 @@ class TestSmithEMRollback:
             prob_correct_by_chance=0.5,
         )
         assert_em_rolls_back_on_ll_decrease(
-            model, (n_correct,), caplog,
+            model,
+            (n_correct,),
+            caplog,
         )
 
     def test_smith_em_rollback_restores_parameters(self, caplog) -> None:
@@ -2169,3 +2195,332 @@ class TestSmithEMRollback:
             initial_params,
             atol=1e-10,
         )
+
+    @pytest.mark.slow
+    def test_nonfinite_first_e_step_leaves_model_unfitted(self, caplog) -> None:
+        rng = np.random.default_rng(2)
+        n_correct = jnp.asarray(rng.integers(0, 2, size=30).astype(float))
+        model = SmithLearningModel(max_possible_correct=1)
+        # A NaN parameter makes the very first E-step non-finite.
+        model.sigma_epsilon = float("nan")
+
+        with caplog.at_level("WARNING"):
+            lls = model.fit(n_correct, max_iter=5)
+
+        assert any("non-finite" in r.message.lower() for r in caplog.records)
+        assert lls == []
+        assert model.log_likelihood_ is None and model.n_iter_ == 0
+        # The NaN posteriors are cleared rather than left looking fitted.
+        assert not model.is_fitted
+        assert model.smoothed_prob_correct_response is None
+        assert model.filtered_prob_correct_response is None
+
+    @pytest.mark.slow
+    def test_nonfinite_later_e_step_rolls_back_to_last_accepted(self, caplog) -> None:
+        rng = np.random.default_rng(3)
+        n_correct = jnp.asarray(rng.integers(0, 2, size=30).astype(float))
+        model = SmithLearningModel(max_possible_correct=1)
+        real_e_step = model._e_step
+        calls = []
+
+        def e_step_nan_on_third_call(*args, **kwargs):
+            ll = real_e_step(*args, **kwargs)
+            calls.append(
+                {
+                    "ll": ll,
+                    "sigma_epsilon": model.sigma_epsilon,
+                    "init_learning_variance": model.init_learning_variance,
+                    "smoothed_mode": np.asarray(model.smoothed_learning_state_mode),
+                }
+            )
+            if len(calls) == 3:
+                model.smoothed_learning_state_mode = jnp.full_like(
+                    model.smoothed_learning_state_mode, jnp.nan
+                )
+                return float("nan")
+            return ll
+
+        model._e_step = e_step_nan_on_third_call
+        with caplog.at_level("WARNING"):
+            lls = model.fit(n_correct, max_iter=10, tolerance=1e-12)
+
+        assert len(calls) == 3  # the NaN E-step was reached
+        accepted = calls[1]
+        # The M-step between E-steps 2 and 3 changed the parameters, so
+        # restoring them is observable.
+        param_keys = ("sigma_epsilon", "init_learning_variance")
+        assert [accepted[k] for k in param_keys] != [calls[2][k] for k in param_keys]
+        assert lls == [calls[0]["ll"], accepted["ll"]]
+        assert np.all(np.isfinite(lls))
+        assert model.log_likelihood_ == accepted["ll"]
+        assert model.n_iter_ == 2
+        assert model.sigma_epsilon == accepted["sigma_epsilon"]
+        assert model.init_learning_variance == accepted["init_learning_variance"]
+        np.testing.assert_array_equal(
+            model.smoothed_learning_state_mode, accepted["smoothed_mode"]
+        )
+        assert any("rolling back" in r.message.lower() for r in caplog.records)
+
+
+class TestSmithMStepExactness:
+    """The M-step maximises the expected complete-data log-likelihood.
+
+    The objective is written out here independently of the implementation:
+    with ``x_1 ~ N(x_0, P_0 + s2)`` and ``x_{k+1} ~ N(x_k, s2)``,
+
+        Q(s2, x_0, P_0) = -1/2 log(P_0 + s2) - ((m_1 - x_0)^2 + P_1)/(2 (P_0 + s2))
+                          - (T-1)/2 log s2 - S / (2 s2),
+
+    S = sum_k E[(x_{k+1} - x_k)^2 | y]. The returned parameters must be a
+    stationary point (central finite differences) and must not decrease Q.
+    """
+
+    @staticmethod
+    def _objective(stats, s2, x0, p0):
+        m, P, G = stats
+        n = m.shape[0]
+        S = np.sum((m[1:] - m[:-1]) ** 2 + P[1:] + P[:-1] - 2 * P[1:] * G)
+        v = p0 + s2
+        return (
+            -0.5 * np.log(v)
+            - ((m[0] - x0) ** 2 + P[0]) / (2 * v)
+            - 0.5 * (n - 1) * np.log(s2)
+            - S / (2 * s2)
+        )
+
+    @pytest.mark.slow
+    @given(
+        seed=st.integers(0, 10_000),
+        sigma=st.floats(0.1, 0.8),
+        init_var=st.floats(0.05, 2.0),
+    )
+    @example(seed=0, sigma=0.75, init_var=0.25)  # P_0 >= 0 binds
+    @settings(max_examples=8, deadline=None)
+    def test_m_step_is_stationary_and_ascends(self, seed, sigma, init_var):
+        rng = np.random.default_rng(seed)
+        n_trials = 25
+        x = np.cumsum(rng.normal(0, 0.4, n_trials)) + 1.0
+        y = (rng.random(n_trials) < 1 / (1 + np.exp(-x))).astype(int)
+        model = SmithLearningModel(
+            max_possible_correct=1,
+            sigma_epsilon=sigma,
+            init_learning_variance=init_var,
+            init_learning_state=0.2,
+        )
+        model._e_step(jnp.asarray(y))
+        stats = tuple(
+            np.asarray(a, dtype=float)
+            for a in (
+                model.smoothed_learning_state_mode,
+                model.smoothed_learning_state_variance,
+                model.smoother_gain,
+            )
+        )
+        old = (sigma**2, 0.2, init_var)
+        model._m_step(jnp.asarray(y))
+        new = (
+            model.sigma_epsilon**2,
+            model.init_learning_state,
+            model.init_learning_variance,
+        )
+        q_old = self._objective(stats, *old)
+        q_new = self._objective(stats, *new)
+        assert q_new >= q_old - 1e-10, (q_old, q_new)
+
+        # Stationarity in s2 and x_0 (always interior) ...
+        eps = 1e-6
+        for i in (0, 1):
+            up = list(new)
+            dn = list(new)
+            up[i] += eps
+            dn[i] -= eps
+            grad = (self._objective(stats, *up) - self._objective(stats, *dn)) / (
+                2 * eps
+            )
+            assert abs(grad) < 1e-5 * max(1.0, abs(q_new)), (i, grad, new)
+        # ... and in P_0 unless the optimum P_{1|T} - s2 is clipped at the
+        # floor, where Q must be non-increasing in P_0 (KKT).
+        up = list(new)
+        up[2] += eps
+        dn = list(new)
+        dn[2] = max(new[2] - eps, 0.0)
+        grad_p0 = (self._objective(stats, *up) - self._objective(stats, *dn)) / (
+            up[2] - dn[2]
+        )
+        if new[2] > 1e-6:
+            assert abs(grad_p0) < 1e-4, (grad_p0, new)
+        else:
+            assert grad_p0 <= 1e-6, (grad_p0, new)
+
+    @pytest.mark.slow
+    def test_old_init_variance_update_was_not_the_maximiser(self):
+        """Guard for the regression: P_0 = P_{1|T} leaves ascent on the table."""
+        rng = np.random.default_rng(1)
+        x = np.cumsum(rng.normal(0, 0.3, 40))
+        y = (rng.random(40) < 1 / (1 + np.exp(-x))).astype(int)
+        model = SmithLearningModel(
+            max_possible_correct=1, init_learning_variance=0.5, sigma_epsilon=0.4
+        )
+        model._e_step(jnp.asarray(y))
+        stats = tuple(
+            np.asarray(a, dtype=float)
+            for a in (
+                model.smoothed_learning_state_mode,
+                model.smoothed_learning_state_variance,
+                model.smoother_gain,
+            )
+        )
+        model._m_step(jnp.asarray(y))
+        s2, x0, p0 = (
+            model.sigma_epsilon**2,
+            model.init_learning_state,
+            model.init_learning_variance,
+        )
+        old_rule = self._objective(stats, s2, x0, float(stats[1][0]))
+        new_rule = self._objective(stats, s2, x0, p0)
+        assert p0 > 1e-6  # interior optimum on this data
+        assert new_rule > old_rule + 0.01, (old_rule, new_rule)
+
+
+@pytest.mark.slow
+def test_sigma_recovery_evidence_vs_em_as_statistics():
+    """Process-noise recovery over 3 seeds (300 Bernoulli trials, sigma^2=0.05).
+
+    Reference: the exact maximum-likelihood sigma^2 on a grid (quadrature).
+    The model's Laplace evidence (the fit_sgd objective) peaks at the same
+    grid value on every seed. EM's fixed point is biased upwards by the
+    Laplace E-step (observed EM / exact = 1.6, 1.6, 2.1): pinned, so a change
+    in either direction is noticed.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_oracle_choice import _exact_smith
+
+    grid = np.linspace(-10, 10, 401)
+    s2_grid = np.array([0.01, 0.02, 0.035, 0.05, 0.07, 0.1, 0.15, 0.2])
+    ratios, report = [], []
+    for seed in range(3):
+        rng = np.random.default_rng(seed)
+        x = np.cumsum(rng.normal(0, np.sqrt(0.05), 300))
+        y = (rng.random(300) < 1 / (1 + np.exp(-x))).astype(int)
+        exact = [_exact_smith(y, 1, v, 0.0, v, 0.0, grid=grid)[2] for v in s2_grid]
+        evidence = [
+            SmithLearningModel(
+                max_possible_correct=1,
+                sigma_epsilon=float(np.sqrt(v)),
+                init_learning_variance=float(v),
+            )._e_step(jnp.asarray(y))
+            for v in s2_grid
+        ]
+        s2_exact = s2_grid[np.argmax(exact)]
+        model = SmithLearningModel(max_possible_correct=1, sigma_epsilon=0.5)
+        model.fit(jnp.asarray(y), max_iter=60)
+        ratios.append(model.sigma_epsilon**2 / s2_exact)
+        report.append((s2_exact, s2_grid[np.argmax(evidence)], model.sigma_epsilon**2))
+        assert s2_grid[np.argmax(evidence)] == s2_exact, report
+    msg = f"(exact MLE, evidence argmax, EM) per seed: {report}"
+    assert all(1.2 < r < 2.8 for r in ratios), msg
+
+
+class TestDifferentiableNewtonDoesNotOscillate:
+    """Regression: the Laplace mode solvers were not reliable.
+
+    The differentiable (fit_sgd) Newton path took full steps: for N=10, y=0
+    and a prior N(3, 4) the logistic is saturated at the prior mean, the full
+    step jumps to -10.5 (saturated the other way) and the iteration
+    oscillated between 3.0 and -10.5, ending at 2.98 instead of the mode
+    -1.956. The default path used jax.scipy BFGS, which stopped early on a
+    line-search failure (mode 2.708 vs the exact 2.647 on trial 3 of the
+    sequence below). Both filter paths now use the line-searched Newton.
+    """
+
+    def test_newton_matches_bfgs_and_exact_mode(self):
+        from functools import partial
+
+        from scipy.optimize import brentq
+
+        from state_space_practice.smith_learning_algorithm import (
+            _approximate_gaussian_newton,
+            _log_posterior_objective,
+            approximate_gaussian,
+        )
+
+        m, v, y, n = 3.0, 4.0, 0, 10
+        f = partial(
+            _log_posterior_objective,
+            learning_state_prev=m,
+            variance_prev=v,
+            n_correct_in_trial=y,
+            max_possible_correct=n,
+            bias=0.0,
+        )
+        mode = brentq(lambda x: y - n / (1 + np.exp(-x)) - (x - m) / v, -30, 30)
+        newton_mode, newton_var, _ = _approximate_gaussian_newton(f, jnp.array([m]))
+        bfgs_mode, bfgs_var = approximate_gaussian(f, jnp.array([m]))
+        assert abs(float(newton_mode[0]) - mode) < 1e-8
+        assert abs(float(bfgs_mode[0]) - mode) < 1e-4
+        np.testing.assert_allclose(newton_var, bfgs_var, rtol=1e-3)
+
+    def test_newton_does_not_zigzag_across_the_mode(self):
+        """A broad prior on the wrong saturated side: y=0, prior N(5.163, 11.51).
+
+        Taking the largest Armijo-acceptable step zigzags across the mode
+        (5.16, -5.58, 4.68, -5.21, ...) and ten iterations end 4 nats short
+        of it; the best acceptable step converges.
+        """
+        from functools import partial
+
+        from scipy.optimize import brentq
+
+        from state_space_practice.multinomial_choice import NEWTON_GAP_TOL
+        from state_space_practice.smith_learning_algorithm import (
+            _approximate_gaussian_newton,
+            _log_posterior_objective,
+        )
+
+        m, v, y, n = 5.163, 11.51, 0, 1
+        f = partial(
+            _log_posterior_objective,
+            learning_state_prev=m,
+            variance_prev=v,
+            n_correct_in_trial=y,
+            max_possible_correct=n,
+            bias=0.0,
+        )
+        mode = brentq(lambda x: y - n / (1 + np.exp(-x)) - (x - m) / v, -30, 30)
+        newton_mode, _, gap = _approximate_gaussian_newton(f, jnp.array([m]))
+        assert abs(float(newton_mode[0]) - mode) < 1e-8
+        assert float(gap) < NEWTON_GAP_TOL
+
+    def test_filter_modes_are_exact_one_step_modes(self):
+        from scipy.optimize import brentq
+
+        rng = np.random.default_rng(0)
+        y = np.concatenate([np.full(8, 10), np.zeros(4), np.full(4, 10)]).astype(int)
+        y = np.clip(y + rng.integers(-1, 1, y.size), 0, 10)
+        kwargs = dict(
+            init_learning_variance=4.0,
+            sigma_epsilon=1.5,
+            max_possible_correct=10,
+        )
+        for differentiable in (False, True):
+            _, mode, _, pred_mode, pred_var = (
+                np.asarray(a)
+                for a in smith_learning_filter(
+                    jnp.asarray(y), differentiable=differentiable, **kwargs
+                )
+            )
+            # Each filtered mode solves y - N sigmoid(x) = (x - m_pred) / P_pred.
+            exact = [
+                brentq(
+                    lambda x, yt=y[t], m=pred_mode[t], v=pred_var[t]: (
+                        yt - 10 / (1 + np.exp(-x)) - (x - m) / v
+                    ),
+                    -40,
+                    40,
+                )
+                for t in range(y.size)
+            ]
+            np.testing.assert_allclose(mode, exact, atol=1e-8)

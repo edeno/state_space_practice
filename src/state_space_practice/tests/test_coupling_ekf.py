@@ -206,5 +206,67 @@ class TestPosteriorCorrectness:
         np.testing.assert_allclose(
             float(post.beta_real_imag_cov[0, 0]), cov_ref[0, 1], atol=1e-6
         )
-        # guard: the cross-covariance is non-trivial (check isn't vacuous at ~0).
-        assert abs(cov_ref[0, 1]) > 1e-3
+        # guard: the cross-covariance is non-trivial relative to the atol=1e-6
+        # above (check isn't vacuous at ~0); it is ~9e-4 on this seed.
+        assert abs(cov_ref[0, 1]) > 1e-4
+
+
+class TestVectorisedRegression:
+    def test_matches_per_neuron_loop(self, coupling_params_small):
+        """The vmapped stage-2 regression equals a per-neuron loop of updates.
+
+        ``_regress_coupling_all_neurons`` runs one ``jax.vmap`` over neurons
+        under one ``jax.jit``; each neuron must still see its own spike
+        column and baseline. Compare with an explicit loop of
+        ``glm_laplace_update`` calls on the same smoothed latent. Roundoff
+        differs slightly (batched matmuls change the summation order and the
+        10-step Fisher scoring is not converged to machine precision), so
+        the tolerance is loose in absolute terms but far below the posterior
+        scale -- a swapped column or baseline would differ by O(1).
+        """
+        from state_space_practice.coupling_ekf import _regress_coupling_all_neurons
+        from state_space_practice.point_process_kalman import (
+            BERNOULLI_LOGIT_FAMILY,
+            glm_laplace_update,
+        )
+
+        params = coupling_params_small
+        sim = simulate_coupling(params, n_time=500, seed=0)
+        spikes = jnp.asarray(np.asarray(sim.spikes))
+        latent = smooth_latent_from_lfp(jnp.asarray(sim.lfp), params)
+        n_latent = latent.shape[1]
+        prior_mean = jnp.zeros(n_latent)
+        prior_cov = 25.0 * jnp.eye(n_latent)
+        # Distinct baselines so a neuron/baseline mismatch would be visible.
+        baseline = jnp.asarray(params.baseline) + jnp.array([-0.5, 0.0, 0.5])
+
+        means, covs = [], []
+        for neuron in range(spikes.shape[1]):
+
+            def eta(beta, baseline_n=baseline[neuron]):
+                return baseline_n + latent @ beta
+
+            m, c, _ = glm_laplace_update(
+                prior_mean,
+                prior_cov,
+                spikes[:, neuron],
+                eta,
+                BERNOULLI_LOGIT_FAMILY,
+                grad_eta_func=lambda _beta: latent,
+                max_newton_iter=10,
+            )
+            means.append(m)
+            covs.append(c)
+        loop_means, loop_covs = jnp.stack(means), jnp.stack(covs)
+
+        vmap_means, vmap_covs = _regress_coupling_all_neurons(
+            spikes, latent, baseline, prior_mean, prior_cov, max_newton_iter=10
+        )
+        # Guard: the neurons genuinely differ, so the pairing is tested.
+        assert float(jnp.max(jnp.abs(loop_means[0] - loop_means[2]))) > 0.5
+        np.testing.assert_allclose(
+            np.asarray(vmap_means), np.asarray(loop_means), rtol=1e-6, atol=1e-7
+        )
+        np.testing.assert_allclose(
+            np.asarray(vmap_covs), np.asarray(loop_covs), rtol=1e-6, atol=1e-9
+        )

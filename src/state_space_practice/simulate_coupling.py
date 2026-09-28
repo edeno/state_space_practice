@@ -54,10 +54,9 @@ def simulate_coupling(
     n_latent = transition_matrix.shape[0]
 
     base_key = jax.random.PRNGKey(seed)
-    init_key, noise_key, spike_key = jax.random.split(base_key, 3)
-    # Derive the LFP key independently so adding the field does not perturb the
-    # latent/spike RNG stream (existing seeds reproduce their prior values).
-    lfp_key = jax.random.fold_in(base_key, 1)
+    # All keys come from one split: fold_in(k, 1) would collide with
+    # split(k, 3)[1] under partitionable threefry.
+    init_key, noise_key, spike_key, lfp_key = jax.random.split(base_key, 4)
 
     # Start from the oscillator stationary distribution so early bins are not a
     # warm-up transient: each component has variance var / (1 - decay**2).

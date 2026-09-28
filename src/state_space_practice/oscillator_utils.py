@@ -1,12 +1,26 @@
+import logging
 import warnings
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 
-from state_space_practice.utils import debug_print_if
+from state_space_practice.exceptions import StateSpaceWarning
+from state_space_practice.utils import (
+    contains_tracer,
+    debug_print_if,
+    differentiable_spectral_radius,
+    stabilize_transition_matrix,
+    symmetrize,
+)
+
+logger = logging.getLogger(__name__)
 
 IDENTITY_2x2 = jnp.identity(2)
+# Relative tolerance above ``max_spectral_radius`` tolerated by the DIM stability
+# scale before it engages (absorbs round-off of an already clamped matrix).
+_STABILITY_SCALE_RTOL = 1e-10
 ZEROS_2x2 = jnp.zeros((2, 2))
 
 
@@ -219,11 +233,11 @@ def construct_common_oscillator_transition_matrix(
     if not damping_coef.shape == (n_oscillators,):
         raise ValueError("damping_coef must be a 1D array of shape (n_oscillators,)")
     # Warn and clamp out-of-range values (JIT-compatible via pre-trace check)
-    if not isinstance(damping_coef, jax.core.Tracer):
+    if not contains_tracer(damping_coef):
         if jnp.any(jnp.logical_or(damping_coef > 1, damping_coef < 0)):
             warnings.warn(
                 "damping_coef values outside [0, 1] will be clipped",
-                UserWarning,
+                StateSpaceWarning,
                 stacklevel=2,
             )
     damping_coef = jnp.clip(damping_coef, 0.0, 1.0)
@@ -444,9 +458,7 @@ def construct_correlated_noise_measurement_matrix(
     col_indices = jnp.arange(0, 2 * n_oscillators, 2)
 
     # Set the [1, 0] blocks
-    measurement_matrix = measurement_matrix.at[row_indices, col_indices].set(1.0)
-
-    return measurement_matrix
+    return measurement_matrix.at[row_indices, col_indices].set(1.0)
 
 
 def construct_directed_influence_transition_matrix(
@@ -530,11 +542,7 @@ def construct_directed_influence_transition_matrix(
 
     # 5. Reshape and transpose to final matrix form
     # (n1, n2, 2, 2) -> (n1, 2, n2, 2) -> (2 * n1, 2 * n2)
-    transition_matrix = all_blocks.swapaxes(1, 2).reshape(
-        2 * n_oscillators, 2 * n_oscillators
-    )
-
-    return transition_matrix
+    return all_blocks.swapaxes(1, 2).reshape(2 * n_oscillators, 2 * n_oscillators)
 
 
 def compute_directed_influence_stability_scale(
@@ -543,43 +551,68 @@ def compute_directed_influence_stability_scale(
     coupling_strength: ArrayLike,
     sampling_freq: float,
     max_spectral_radius: float = 0.99,
+    *,
+    phase_difference: ArrayLike,
 ) -> jax.Array:
     """Return a differentiable global scale guaranteeing stable DIM dynamics.
 
-    The maximum block-row operator norm bounds the spectral radius. Scaling
-    damping and coupling by the same scalar scales the complete directed-
-    influence transition matrix by that scalar, while leaving frequency and
-    phase unchanged. ``coupling_strength`` may be one matrix or a stack with a
-    final discrete-state axis; one shared scale is returned for the full stack.
+    Scaling damping and coupling by the same scalar ``s`` scales the complete
+    directed-influence transition matrix by ``s`` (frequency and phase are
+    unchanged), so its spectral radius scales by ``s`` too. The returned scale
+    is ``min(1, max_spectral_radius / max_j rho(A_j))`` with ``rho`` the
+    *actual* spectral radius of each state's unscaled matrix
+    (:func:`~state_space_practice.utils.differentiable_spectral_radius`): it is
+    exactly ``1`` -- and has zero gradient -- whenever every ``A_j`` already
+    honors the bound, so stable parameters are a fixed point of the
+    construction. (A norm-based upper bound would engage for stable matrices
+    and over-damp them.) ``coupling_strength`` / ``phase_difference`` may be
+    one matrix or a stack with a final discrete-state axis; one shared scale is
+    returned for the full stack.
+
+    Parameters
+    ----------
+    freqs : ArrayLike, shape (n_oscillators,)
+    damping_coef : ArrayLike, shape (n_oscillators,)
+    coupling_strength : ArrayLike, shape (n_osc, n_osc[, n_discrete_states])
+    sampling_freq : float
+    max_spectral_radius : float, default=0.99
+    phase_difference : ArrayLike, same shape as ``coupling_strength``
+        Required: the spectral radius depends on the coupling phases.
+
+    Returns
+    -------
+    jax.Array, scalar
+        Scale in ``(0, 1]``.
     """
     freqs_arr = jnp.asarray(freqs)
     damping_arr = jnp.asarray(damping_coef)
     coupling_arr = jnp.asarray(coupling_strength)
+    phase_arr = jnp.asarray(phase_difference)
     if coupling_arr.ndim == 2:
         coupling_arr = coupling_arr[..., None]
+    if phase_arr.ndim == 2:
+        phase_arr = phase_arr[..., None]
+    phase_arr = jnp.broadcast_to(phase_arr, coupling_arr.shape)
 
-    n_oscillators = damping_arr.shape[0]
-    off_diagonal = ~jnp.eye(n_oscillators, dtype=bool)
-    coupling_off = jnp.where(off_diagonal[..., None], coupling_arr, 0.0)
-    incoming_sum = jnp.sum(coupling_off, axis=1)
-    incoming_abs_sum = jnp.sum(jnp.abs(coupling_off), axis=1)
-
-    angles = 2.0 * jnp.pi * freqs_arr / sampling_freq
-    damping_by_state = damping_arr[:, None]
-    diagonal_norm_sq = (
-        damping_by_state**2
-        + incoming_sum**2
-        - 2.0 * damping_by_state * incoming_sum * jnp.cos(angles)[:, None]
-    )
-    # Avoid sqrt'(0) at a degenerate block while conservatively preserving the
-    # upper bound to floating-point precision.
-    eps = jnp.finfo(jnp.result_type(diagonal_norm_sq, 1.0)).eps
-    diagonal_norm = jnp.sqrt(jnp.maximum(diagonal_norm_sq, eps))
-    max_block_row_norm = jnp.max(diagonal_norm + incoming_abs_sum)
-    tiny = jnp.finfo(jnp.result_type(max_block_row_norm, 1.0)).tiny
-    return jnp.minimum(
-        1.0,
-        max_spectral_radius / jnp.maximum(max_block_row_norm, tiny),
+    transition_stack = jax.vmap(
+        lambda coupling, phase: construct_directed_influence_transition_matrix(
+            freqs=freqs_arr,
+            damping_coeffs=damping_arr,
+            coupling_strengths=coupling,
+            phase_diffs=phase,
+            sampling_freq=sampling_freq,
+        ),
+        in_axes=(-1, -1),
+    )(coupling_arr, phase_arr)
+    radius = jnp.max(differentiable_spectral_radius(transition_stack))
+    tiny = jnp.finfo(jnp.result_type(radius, 1.0)).tiny
+    # Relative slack so an extract -> construct round-trip of a matrix already
+    # clamped to exactly the bound is not re-scaled by floating-point noise.
+    threshold = max_spectral_radius * (1.0 + _STABILITY_SCALE_RTOL)
+    return jnp.where(
+        radius > threshold,
+        max_spectral_radius / jnp.maximum(radius, tiny),
+        jnp.ones_like(radius),
     )
 
 
@@ -623,11 +656,7 @@ def construct_directed_influence_measurement_matrix(
     measurement_matrix = measurement_matrix.at[row_indices, col_indices_x].set(
         block_coefficient
     )
-    measurement_matrix = measurement_matrix.at[row_indices, col_indices_y].set(
-        block_coefficient
-    )
-
-    return measurement_matrix
+    return measurement_matrix.at[row_indices, col_indices_y].set(block_coefficient)
 
 
 def _get_scaling_factor(s: jax.Array, eps: float = 1e-12) -> jax.Array:
@@ -757,25 +786,6 @@ def _warn_if_rotation_projection_degenerate(transition_matrix: jax.Array) -> Non
     )
 
 
-def _get_scaling_factor_from_block(block: jax.Array, eps: float = 1e-12) -> jax.Array:
-    """Compute scaling factor from a 2x2 block via SVD.
-
-    Parameters
-    ----------
-    block : jax.Array, shape (2, 2)
-        The block to compute the scaling factor for
-    eps : float, optional
-        Minimum singular value, by default 1e-12
-
-    Returns
-    -------
-    jax.Array
-        The geometric mean of the singular values
-    """
-    _, s, _ = jnp.linalg.svd(block)
-    return _get_scaling_factor(s, eps)
-
-
 def _extract_scale_and_angle(block: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Extract scaling factor and rotation angle from a 2x2 oscillator block.
 
@@ -854,10 +864,102 @@ def _oscillator_blocks_to_matrix(blocks: jax.Array) -> jax.Array:
     return blocks.transpose(0, 2, 1, 3).reshape(2 * n_oscillators, 2 * n_oscillators)
 
 
+def _cnm_structured_projection(
+    process_covariance: jax.Array, min_eigenvalue: float
+) -> tuple[jax.Array, jax.Array]:
+    """Project a covariance onto the CNM block family, block by block.
+
+    Returns ``(structured, diag_only)``: ``structured`` has ``variance_k * I``
+    diagonal blocks (variance floored at ``min_eigenvalue``) and symmetric
+    scaled-rotation off-diagonal blocks; ``diag_only`` keeps only the
+    diagonal blocks. Every block is projected in one vectorised pass (no
+    per-block ``.at[].set`` chain), so the function is a handful of fused
+    ops whether run eagerly or under ``jit``.
+    """
+    cov = symmetrize(process_covariance)
+    blocks = _matrix_to_oscillator_blocks(cov)  # (n, n, 2, 2)
+    n_oscillators = blocks.shape[0]
+    eye = jnp.eye(n_oscillators, dtype=cov.dtype)
+
+    # Diagonal blocks: variance_k * I, variance floored at min_eigenvalue.
+    variance = jnp.maximum(
+        0.5 * jnp.trace(blocks, axis1=-2, axis2=-1).diagonal(), min_eigenvalue
+    )
+    diag_blocks = (eye * variance[:, None])[:, :, None, None] * IDENTITY_2x2.astype(
+        cov.dtype
+    )
+
+    # Off-diagonal blocks: scaled-rotation projection of every upper block,
+    # mirrored (transposed) into the lower triangle.
+    projected = jax.vmap(jax.vmap(_project_to_scaled_rotation_matrix))(blocks)
+    upper = jnp.triu(jnp.ones((n_oscillators, n_oscillators), dtype=cov.dtype), k=1)
+    upper_blocks = upper[:, :, None, None] * projected
+    structured_blocks = (
+        diag_blocks + upper_blocks + jnp.transpose(upper_blocks, (1, 0, 3, 2))
+    )
+
+    return (
+        _oscillator_blocks_to_matrix(structured_blocks),
+        _oscillator_blocks_to_matrix(diag_blocks),
+    )
+
+
+def _cnm_psd_shrink_factor(
+    structured: jax.Array,
+    diag_only: jax.Array,
+    min_eigenvalue: float,
+    safety_margin: float | None = None,
+) -> jax.Array:
+    """Largest ``t`` in ``[0, 1]`` with ``diag_only + t * O >= min_eigenvalue * I``.
+
+    ``O = structured - diag_only`` holds the linkage blocks. Write
+    ``S = diag_only - min_eigenvalue * I``: diagonal, with entries ``>= 0``
+    because the block variances are floored at ``min_eigenvalue``. For
+    ``S > 0`` the constraint is a congruence away from an eigenvalue bound::
+
+        S + t O >= 0   <=>   I + t M >= 0,   M = S^{-1/2} O S^{-1/2}
+
+    which holds iff ``t * lambda_max(-M) <= 1``. So ``t* = 1 /
+    lambda_max(-M)`` when that eigenvalue is positive and ``t* = 1`` (no
+    shrink needed) otherwise -- one symmetric eigendecomposition, traceable
+    under ``jit``.
+
+    A coordinate whose variance sits exactly at the floor has ``S_ii = 0``.
+    It drops out of ``M`` (its scale factor is set to 0) when its linkage
+    row is zero -- it is decoupled -- and otherwise forces ``t = 0``, since
+    any ``t > 0`` would make ``S + t O`` indefinite in that coordinate.
+
+    ``safety_margin`` shrinks ``t*`` by that relative amount so that the
+    floating-point minimum eigenvalue of the result stays at or above
+    ``min_eigenvalue``: the exact ``t*`` puts it there only up to the
+    eigen-solver's roundoff. (The minimum eigenvalue is concave in ``t``, so
+    the margin lifts it by at least ``safety_margin * min(S_ii)``.) It also
+    applies when the computed ``t*`` lands just above 1, where roundoff can
+    hide a structured covariance sitting just past the floor. The default,
+    ``max(1e-9, 64 * eps)`` for the input dtype, is ``1e-9`` in float64 and
+    about ``7.6e-6`` in float32, where ``1 - 1e-9`` rounds to 1.
+    """
+    dtype = structured.dtype
+    off_diag = structured - diag_only
+    shift = jnp.diagonal(diag_only) - jnp.asarray(min_eigenvalue, dtype=dtype)
+    positive = shift > 0
+    inv_sqrt = jnp.where(positive, 1.0 / jnp.sqrt(jnp.where(positive, shift, 1.0)), 0.0)
+    scaled = -(inv_sqrt[:, None] * off_diag * inv_sqrt[None, :])
+    lam_max = jnp.max(jnp.linalg.eigvalsh(symmetrize(scaled)))
+    needs_shrink = lam_max > 0
+    if safety_margin is None:
+        safety_margin = max(1e-9, 64.0 * float(jnp.finfo(dtype).eps))
+    t_exact = 1.0 / jnp.where(needs_shrink, lam_max, 1.0)
+    t = jnp.where(needs_shrink, t_exact * (1.0 - safety_margin), 1.0)
+    pinned = jnp.any((~positive) & (jnp.max(jnp.abs(off_diag), axis=1) > 0))
+    t = jnp.where(pinned, 0.0, t)
+    return jnp.clip(t, 0.0, 1.0)
+
+
+@jax.jit
 def project_correlated_noise_process_covariance(
     process_covariance: jax.Array,
     min_eigenvalue: float = 1e-8,
-    max_shrink_iter: int = 60,
 ) -> jax.Array:
     """Project a covariance to the CNM block structure while preserving PSD.
 
@@ -865,45 +967,19 @@ def project_correlated_noise_process_covariance(
     ``sigma_k * I`` and symmetric off-diagonal scaled-rotation blocks.  A
     generic Kalman M-step produces an arbitrary covariance, so this projects the
     blocks back to the model family and, if needed, shrinks only the off-diagonal
-    linkage blocks toward zero until the covariance is positive semidefinite.
+    linkage blocks toward zero -- by the closed-form factor of
+    :func:`_cnm_psd_shrink_factor` -- until the covariance is positive
+    semidefinite with minimum eigenvalue ``min_eigenvalue``.  Fully traceable
+    (one eigendecomposition, no host syncs) and jit-compiled, so per-EM-iteration
+    callers pay one compile per covariance shape.
     """
-    cov = 0.5 * (process_covariance + process_covariance.T)
-    blocks = _matrix_to_oscillator_blocks(cov)
-    n_oscillators = blocks.shape[0]
-
-    structured_blocks = jnp.zeros_like(blocks)
-    diag_blocks = jnp.zeros_like(blocks)
-    for i in range(n_oscillators):
-        variance = jnp.maximum(0.5 * jnp.trace(blocks[i, i]), min_eigenvalue)
-        block = variance * IDENTITY_2x2.astype(cov.dtype)
-        structured_blocks = structured_blocks.at[i, i].set(block)
-        diag_blocks = diag_blocks.at[i, i].set(block)
-
-    for i in range(n_oscillators):
-        for j in range(i + 1, n_oscillators):
-            upper = _project_to_scaled_rotation_matrix(blocks[i, j])
-            structured_blocks = structured_blocks.at[i, j].set(upper)
-            structured_blocks = structured_blocks.at[j, i].set(upper.T)
-
-    structured = _oscillator_blocks_to_matrix(structured_blocks)
-    diag_only = _oscillator_blocks_to_matrix(diag_blocks)
-    min_eig = float(jnp.linalg.eigvalsh(structured).min())
-    if min_eig >= min_eigenvalue:
-        return structured
-
-    off_diag = structured - diag_only
-    lo = 0.0
-    hi = 1.0
-    for _ in range(max_shrink_iter):
-        mid = 0.5 * (lo + hi)
-        candidate = diag_only + mid * off_diag
-        candidate_min_eig = float(jnp.linalg.eigvalsh(candidate).min())
-        if candidate_min_eig >= min_eigenvalue:
-            lo = mid
-        else:
-            hi = mid
-
-    return diag_only + lo * off_diag
+    structured, diag_only = _cnm_structured_projection(
+        process_covariance, min_eigenvalue
+    )
+    shrink = _cnm_psd_shrink_factor(structured, diag_only, min_eigenvalue)
+    return jnp.where(
+        shrink >= 1.0, structured, diag_only + shrink * (structured - diag_only)
+    )
 
 
 def constrain_correlated_noise_process_covariance(
@@ -936,12 +1012,12 @@ def constrain_correlated_noise_process_covariance(
     if min_eigenvalue < 0.0:
         raise ValueError("min_eigenvalue must be non-negative.")
 
-    cov = 0.5 * (cov + cov.T)
+    cov = symmetrize(cov)
     n_oscillators = cov.shape[0] // 2
     quarter_turn = jnp.array([[0.0, -1.0], [1.0, 0.0]], dtype=cov.dtype)
     complex_structure = jnp.kron(jnp.eye(n_oscillators, dtype=cov.dtype), quarter_turn)
     constrained = 0.5 * (cov + complex_structure @ cov @ complex_structure.T)
-    constrained = 0.5 * (constrained + constrained.T)
+    constrained = symmetrize(constrained)
 
     min_eig = jnp.min(jnp.linalg.eigvalsh(constrained))
     lift = jnp.maximum(
@@ -1084,3 +1160,475 @@ def project_matrix_blockwise(transition_matrix: jax.Array) -> jax.Array:
             for from_oscillator in range(n_oscillators)
         ]
     )
+
+
+def construct_stable_directed_influence_transition_stack(
+    freqs: ArrayLike,
+    damping_coef: ArrayLike,
+    coupling_strength: ArrayLike,
+    phase_difference: ArrayLike,
+    sampling_freq: float,
+    max_spectral_radius: float = 0.99,
+) -> jax.Array:
+    """Build every discrete state's DIM transition matrix under one stability scale.
+
+    The global scale from :func:`compute_directed_influence_stability_scale` is
+    applied to the *effective* damping and coupling used to build each
+    ``A_j``; the intrinsic inputs are left untouched, so the construction is
+    idempotent and ``A_j`` is reconstructable from the intrinsic parameters by
+    re-applying the same scale.
+
+    Parameters
+    ----------
+    freqs : ArrayLike, shape (n_oscillators,)
+    damping_coef : ArrayLike, shape (n_oscillators,)
+    coupling_strength : ArrayLike, shape (n_osc, n_osc, n_discrete_states)
+    phase_difference : ArrayLike, shape (n_osc, n_osc, n_discrete_states)
+    sampling_freq : float
+    max_spectral_radius : float, default=0.99
+        Target upper bound on each ``A_j``'s spectral radius.
+
+    Returns
+    -------
+    jax.Array, shape (2 * n_oscillators, 2 * n_oscillators, n_discrete_states)
+    """
+    freqs_arr = jnp.asarray(freqs)
+    scale = compute_directed_influence_stability_scale(
+        freqs_arr,
+        damping_coef,
+        coupling_strength,
+        sampling_freq,
+        max_spectral_radius=max_spectral_radius,
+        phase_difference=phase_difference,
+    )
+    effective_damping = jnp.asarray(damping_coef) * scale
+    effective_coupling = jnp.asarray(coupling_strength) * scale
+    return jax.vmap(
+        lambda phase, coupling: construct_directed_influence_transition_matrix(
+            freqs=freqs_arr,
+            damping_coeffs=effective_damping,
+            coupling_strengths=coupling,
+            phase_diffs=phase,
+            sampling_freq=sampling_freq,
+        ),
+        in_axes=(-1, -1),
+        out_axes=-1,
+    )(jnp.asarray(phase_difference), effective_coupling)
+
+
+def project_transition_matrix_stack(
+    transition_matrices: jax.Array, max_spectral_radius: float = 0.99
+) -> jax.Array:
+    """Project each state's transition matrix onto the coupled-oscillator family.
+
+    Every ``A_j`` is projected block-wise to scaled-rotation structure
+    (:func:`project_coupled_transition_matrix`) and then its spectral radius is
+    clamped to at most ``max_spectral_radius``
+    (:func:`~state_space_practice.utils.stabilize_transition_matrix` with
+    ``block_size=2``). The clamp is local to the strongly connected components
+    of the oscillator coupling graph: for uncoupled (or one-directionally
+    coupled) oscillators only the offending oscillator block is rescaled, so a
+    single unstable rhythm does not damp every other rhythm; for fully coupled
+    oscillators it is the uniform scale. The clamp logs a warning (``logging``)
+    reporting the radius and scale whenever it engages. It is computed on host
+    (``eigvals`` has no accelerator lowering), so this runs eagerly.
+
+    Parameters
+    ----------
+    transition_matrices : jax.Array, shape (n_latent, n_latent, n_discrete_states)
+        Per-state transition matrices, ``n_latent = 2 * n_oscillators``.
+    max_spectral_radius : float, default=0.99
+        See :func:`~state_space_practice.utils.stabilize_transition_matrix` for
+        how to choose it from the sampling rate and the narrowest bandwidth
+        that must remain representable.
+
+    Returns
+    -------
+    jax.Array, shape (2 * n_oscillators, 2 * n_oscillators, n_discrete_states)
+    """
+    return jnp.stack(
+        [
+            stabilize_transition_matrix(
+                project_coupled_transition_matrix(transition_matrices[..., j]),
+                max_spectral_radius=max_spectral_radius,
+                block_size=2,
+            )
+            for j in range(transition_matrices.shape[-1])
+        ],
+        axis=-1,
+    )
+
+
+def extract_dim_params_from_matrix_stack(
+    transition_matrices: jax.Array, sampling_freq: float, n_oscillators: int
+) -> dict:
+    """Extract shared DIM oscillator parameters from a per-state matrix stack.
+
+    Frequency and damping are shared across discrete states in the directed
+    influence model, so their per-state extractions are averaged; coupling
+    strength and phase difference keep their trailing discrete-state axis.
+
+    Parameters
+    ----------
+    transition_matrices : jax.Array, shape (n_latent, n_latent, n_discrete_states)
+        Per-state transition matrices, ``n_latent = 2 * n_oscillators``.
+    sampling_freq : float
+    n_oscillators : int
+
+    Returns
+    -------
+    dict
+        ``freq`` and ``damping`` of shape ``(n_oscillators,)``;
+        ``coupling_strength`` and ``phase_diff`` of shape
+        ``(n_oscillators, n_oscillators, n_discrete_states)``.
+    """
+    per_state = [
+        extract_dim_params_from_matrix(
+            transition_matrices[..., j], sampling_freq, n_oscillators
+        )
+        for j in range(transition_matrices.shape[-1])
+    ]
+    stacked = {
+        key: jnp.stack([p[key] for p in per_state], axis=-1)
+        for key in ("freq", "damping", "coupling_strength", "phase_diff")
+    }
+    return {
+        "freq": jnp.mean(stacked["freq"], axis=-1),
+        "damping": jnp.mean(stacked["damping"], axis=-1),
+        "coupling_strength": stacked["coupling_strength"],
+        "phase_diff": stacked["phase_diff"],
+    }
+
+
+def optimize_dim_transition_params_joint_until_stationary(
+    gamma1: jax.Array,
+    beta: jax.Array,
+    init_params: dict,
+    sampling_freq: float,
+    process_cov: jax.Array | None,
+    max_spectral_radius: float,
+    max_damping: float,
+    max_restarts: int = 5,
+    param_tol: float = 1e-8,
+    optimizer: Callable[..., dict] | None = None,
+) -> dict:
+    """Run the joint DIM optimizer, restarting BFGS until it stops moving.
+
+    :func:`~state_space_practice.switching_kalman.optimize_dim_transition_params_joint`
+    runs one ``jax.scipy`` BFGS solve, which terminates as soon as a line
+    search fails (``status=3``) -- this happens well before the gradient
+    tolerance on ordinary DIM problems (e.g. after 13 iterations with an
+    objective gradient of 67 in the damping coordinate), leaving the M-step
+    at a non-stationary point.  Restarting from the returned point resets
+    the inverse-Hessian approximation and the line-search bracket; each call
+    never accepts a worse objective than its start (the optimizer backtracks),
+    so the restarts can only improve the M-step objective.  Iteration stops
+    once a restart moves no parameter by more than ``param_tol``.
+
+    Parameters
+    ----------
+    gamma1, beta, init_params, sampling_freq, process_cov, max_spectral_radius,
+    max_damping
+        As for ``optimize_dim_transition_params_joint``.
+    max_restarts : int, default=5
+        Additional BFGS solves after the first.
+    param_tol : float, default=1e-8
+        Largest parameter change of a solve that counts as converged (a first
+        solve that does not move needs no restart).
+    optimizer : callable, optional
+        The single-solve optimizer, called with the keyword arguments of
+        ``optimize_dim_transition_params_joint`` (the default).
+
+    Returns
+    -------
+    dict
+        Shared ``damping``/``freq`` and state-specific
+        ``coupling_strength``/``phase_diff``.
+    """
+    if optimizer is None:
+        from state_space_practice.switching_kalman import (
+            optimize_dim_transition_params_joint,
+        )
+
+        optimizer = optimize_dim_transition_params_joint
+    solve: Callable[..., dict] = optimizer
+
+    params = dict(init_params)
+    for _ in range(max_restarts + 1):
+        updated = solve(
+            gamma1=gamma1,
+            beta=beta,
+            init_params=params,
+            sampling_freq=sampling_freq,
+            process_cov=process_cov,
+            max_spectral_radius=max_spectral_radius,
+            max_damping=max_damping,
+        )
+        change = max(
+            float(
+                jnp.max(jnp.abs(jnp.asarray(updated[key]) - jnp.asarray(params[key])))
+            )
+            for key in ("freq", "damping", "coupling_strength", "phase_diff")
+        )
+        params = updated
+        if change <= param_tol:
+            break
+    return params
+
+
+class DirectedInfluenceDynamicsMixin:
+    """Transition-matrix machinery shared by the directed influence models.
+
+    ``DirectedInfluenceModel`` (Gaussian observations) and
+    ``DirectedInfluencePointProcessModel`` (spike observations) keep the same
+    per-state coupled-oscillator transition matrices ``A_j`` in sync with the
+    same public scientific parameters. The host class owns those parameters
+    (``freqs``, ``damping_coef``, ``coupling_strength``, ``phase_difference``),
+    the stability bound ``max_spectral_radius``, the
+    ``use_reparameterized_mstep`` / ``update_continuous_transition_matrix``
+    flags and the joint-optimizer warm-start cache ``_current_osc_params``;
+    this mixin provides the shared rebuild, projection and synchronization
+    steps that keep ``continuous_transition_matrix`` consistent with them.
+
+    The public ``damping_coef`` / ``coupling_strength`` are *intrinsic*: the
+    stability scale is applied only to the effective values used to build
+    ``A``, never written back, so rebuilding is idempotent and damping does not
+    drift toward zero across successive fits with strong coupling. (The
+    standard-EM sync is the exception: there the public values are estimates
+    extracted from ``A`` itself, see :meth:`_sync_coupling_from_transition_matrix`.)
+    """
+
+    freqs: jax.Array
+    damping_coef: jax.Array
+    coupling_strength: jax.Array
+    phase_difference: jax.Array
+    continuous_transition_matrix: jax.Array
+    sampling_freq: float
+    max_spectral_radius: float
+    n_oscillators: int
+    n_discrete_states: int
+    use_reparameterized_mstep: bool
+    update_continuous_transition_matrix: bool
+    _current_osc_params: dict | None
+    _pre_m_step_dynamics: dict | None
+    process_cov: jax.Array
+
+    _PUBLIC_DYNAMICS_ATTRS = (
+        "continuous_transition_matrix",
+        "freqs",
+        "damping_coef",
+        "coupling_strength",
+        "phase_difference",
+    )
+
+    def _initialize_continuous_transition_matrix(self) -> None:
+        """Build the per-state A from the intrinsic params via the stability scale.
+
+        The initial matrices therefore already honor ``max_spectral_radius``
+        before the first E-step runs.
+        """
+        self._rebuild_stable_transition_matrix()
+
+    def _effective_dim_scale(self) -> jax.Array:
+        """Global stability scale for the current (intrinsic) DIM parameters.
+
+        ``continuous_transition_matrix`` is built from ``damping_coef * scale``
+        and ``coupling_strength * scale``; reconstructing it from the public
+        parameters requires re-applying this same scale.
+        """
+        return compute_directed_influence_stability_scale(
+            self.freqs,
+            self.damping_coef,
+            self.coupling_strength,
+            self.sampling_freq,
+            max_spectral_radius=self.max_spectral_radius,
+            phase_difference=self.phase_difference,
+        )
+
+    def _intrinsic_osc_params(self) -> dict:
+        """The public scientific parameters in the joint optimizer's layout."""
+        return {
+            "freq": self.freqs,
+            "damping": self.damping_coef,
+            "coupling_strength": self.coupling_strength,
+            "phase_diff": self.phase_difference,
+        }
+
+    def _rebuild_stable_transition_matrix(self) -> None:
+        """Rebuild A from the intrinsic public params via the shared scale.
+
+        See :func:`construct_stable_directed_influence_transition_stack`. Also
+        refreshes the joint-optimizer warm-start cache so a later
+        reparameterized M-step does not warm-start (or, on BFGS fallback,
+        restore) stale pre-rebuild dynamics after the public params changed
+        via SGD or standard EM. The cache is left untouched (``None``) before
+        the first joint solve.
+        """
+        self.continuous_transition_matrix = (
+            construct_stable_directed_influence_transition_stack(
+                self.freqs,
+                self.damping_coef,
+                self.coupling_strength,
+                self.phase_difference,
+                self.sampling_freq,
+                max_spectral_radius=self.max_spectral_radius,
+            )
+        )
+        scale = float(self._effective_dim_scale())
+        if scale < 1.0:
+            # Logged (not warnings.warn): EM and SGD rebuild A every step.
+            logger.warning(
+                "DIM transition matrix exceeded max_spectral_radius=%g "
+                "(radius=%.6g); effective damping and coupling were scaled by "
+                "%.6g. The public parameters stay intrinsic; raise "
+                "max_spectral_radius toward 1 - pi * bandwidth / sampling_freq "
+                "for narrow-band rhythms.",
+                self.max_spectral_radius,
+                self.max_spectral_radius / scale,
+                scale,
+            )
+        if self._current_osc_params is not None:
+            self._current_osc_params = self._intrinsic_osc_params()
+
+    def _update_public_oscillator_params(self) -> None:
+        """Sync the joint optimizer solution to the public attributes.
+
+        Frequency/damping are already shared (one joint solution); coupling and
+        phase retain their discrete-state axis. No post-hoc averaging.
+        """
+        if self._current_osc_params is None:
+            return
+
+        self.freqs = self._current_osc_params["freq"]
+        self.damping_coef = self._current_osc_params["damping"]
+        self.coupling_strength = self._current_osc_params["coupling_strength"]
+        self.phase_difference = self._current_osc_params["phase_diff"]
+
+    def _project_parameters(self) -> None:
+        """Project A onto the coupled-oscillator family and enforce stability.
+
+        The unconstrained switching Kalman M-step can leave the directed
+        influence model family, so this projection is a hard structural
+        constraint (see :func:`project_transition_matrix_stack`). Returns
+        without changes when ``A`` is not being learned
+        (``update_continuous_transition_matrix`` is False) or when the
+        reparameterized M-step already produced a valid ``A`` by construction.
+        """
+        previous = getattr(self, "_pre_m_step_dynamics", None)
+        self._pre_m_step_dynamics = None
+
+        if self.use_reparameterized_mstep:
+            return
+
+        if not self.update_continuous_transition_matrix:
+            return
+
+        self.continuous_transition_matrix = project_transition_matrix_stack(
+            self.continuous_transition_matrix, self.max_spectral_radius
+        )
+        self._sync_coupling_from_transition_matrix()
+        if previous is not None:
+            self._keep_previous_dynamics_if_objective_decreased(previous)
+
+    # --- Generalized-EM safeguard for the standard (projected) M-step -------
+
+    def _remember_pre_m_step_dynamics(self) -> None:
+        """Record ``A`` and its public parameters before a standard M-step.
+
+        The next :meth:`_project_parameters` compares the projected ``A``
+        against this previous iterate on the M-step objective (see
+        :meth:`_keep_previous_dynamics_if_objective_decreased`).
+        """
+        self._pre_m_step_dynamics = {
+            name: getattr(self, name) for name in self._PUBLIC_DYNAMICS_ATTRS
+        }
+
+    def _transition_objective(self, transition_matrix: jax.Array) -> float:
+        """A-dependent part of the expected complete-data log-likelihood.
+
+        ``-1/2 sum_j tr(Q_j^{-1} (A_j Gamma1_j A_j^T - A_j Beta_j^T - Beta_j A_j^T))``
+        with the current E-step's transition statistics (the ``A``-free
+        ``Gamma2`` and ``log|Q|`` terms are omitted; ``Q`` is fixed in DIM).
+        """
+        from state_space_practice.switching_kalman import (
+            compute_transition_q_function,
+            compute_transition_sufficient_stats,
+        )
+
+        gamma1, beta = compute_transition_sufficient_stats(
+            state_cond_smoother_means=self.smoother_state_cond_mean,  # type: ignore[attr-defined]
+            state_cond_smoother_covs=self.smoother_state_cond_cov,  # type: ignore[attr-defined]
+            smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,  # type: ignore[attr-defined]
+            pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,  # type: ignore[attr-defined]
+            pair_cond_smoother_means=self.smoother_pair_cond_means,  # type: ignore[attr-defined]
+            pair_cond_smoother_covs=getattr(self, "smoother_pair_cond_covs", None),
+            next_pair_cond_smoother_means=getattr(
+                self, "smoother_next_pair_cond_means", None
+            ),
+        )
+        negative = jax.vmap(compute_transition_q_function, in_axes=-1)(
+            transition_matrix, gamma1, beta, self.process_cov
+        )
+        return -float(jnp.sum(negative))
+
+    def _keep_previous_dynamics_if_objective_decreased(self, previous: dict) -> None:
+        """Make the standard DIM M-step a generalized EM step.
+
+        The standard M-step solves the unconstrained ``A*`` and then projects
+        it (Frobenius-closest scaled rotations, spectral clamp, shared
+        frequency/damping averaged across states). That projection ignores
+        the ``Q^{-1} (x) Gamma1`` metric of the objective, so the projected
+        ``A`` can score *below* the previous iterate -- e.g. by 0.2-0.8 nats
+        when EM starts from the constrained optimum. When it does, the
+        previous (already valid) dynamics are kept, so the M-step never
+        decreases the expected complete-data log-likelihood.
+        """
+        new_objective = self._transition_objective(self.continuous_transition_matrix)
+        old_objective = self._transition_objective(
+            previous["continuous_transition_matrix"]
+        )
+        slack = 1e-10 * max(1.0, abs(old_objective))
+        if new_objective >= old_objective - slack:
+            return
+        logger.warning(
+            "DIM standard M-step: the projected transition matrix lowers the "
+            "M-step objective (%.6g -> %.6g); keeping the previous dynamics. "
+            "If this repeats every iteration the dynamics never move; consider "
+            "use_reparameterized_mstep=True.",
+            old_objective,
+            new_objective,
+        )
+        for name, value in previous.items():
+            setattr(self, name, value)
+        if self._current_osc_params is not None:
+            self._current_osc_params = self._intrinsic_osc_params()
+
+    def _sync_coupling_from_transition_matrix(self) -> None:
+        """Sync all four scientific params from the current transition matrix.
+
+        Called after the standard EM projection so the public
+        frequency/damping/coupling/phase reflect the fitted A -- not just the
+        initial values. ``A`` is then rebuilt from the public params so it
+        stays reconstructable from them. Extracting only coupling/phase would
+        leave frequency/damping stale, so ``A`` could not be reconstructed.
+
+        The projection has already clamped each state's *actual* spectral
+        radius and the extract -> construct round-trip of a single state is
+        exact, so ``A`` is not re-scaled here. Only when averaging the shared
+        frequency/damping across disagreeing states pushes a rebuilt ``A_j``
+        past the bound are the extracted damping and coupling scaled by the
+        exact factor -- written into the public parameters, which here are
+        estimates of ``A`` rather than user-supplied intrinsic values -- so the
+        public parameters reconstruct ``A`` with a stability scale of 1.
+        """
+        params = extract_dim_params_from_matrix_stack(
+            self.continuous_transition_matrix, self.sampling_freq, self.n_oscillators
+        )
+        self.freqs = params["freq"]
+        self.damping_coef = params["damping"]
+        self.coupling_strength = params["coupling_strength"]
+        self.phase_difference = params["phase_diff"]
+        scale = self._effective_dim_scale()
+        self.damping_coef = self.damping_coef * scale
+        self.coupling_strength = self.coupling_strength * scale
+        self._rebuild_stable_transition_matrix()

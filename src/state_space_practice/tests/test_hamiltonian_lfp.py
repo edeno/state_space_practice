@@ -1,8 +1,11 @@
 """Smoke and recovery tests for HamiltonianLFPModel."""
 
+import copy
+
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 
 from state_space_practice.hamiltonian_lfp import HamiltonianLFPModel
@@ -60,9 +63,11 @@ class TestHamiltonianLFPSmoke:
         assert jnp.all(jnp.isfinite(m_s))
         assert m_s.shape[0] == lfp.shape[0]
 
-    def test_fit_raises_not_implemented(self, model_and_data):
+    def test_em_fit_is_not_available(self, model_and_data):
+        """SGD-only: the EM ``fit`` is not inherited; ``fit_sgd`` is the entry."""
         model, lfp = model_and_data
-        with pytest.raises(NotImplementedError, match="fit_sgd"):
+        assert callable(model.fit_sgd)
+        with pytest.raises(AttributeError, match="fit"):
             model.fit(lfp, max_iter=1, skip_init=True)
 
     def test_store_sgd_params_resyncs_measurement_matrix(self, model_and_data):
@@ -117,6 +122,24 @@ class TestHamiltonianLFPSmoke:
         model, lfp = model_and_data
         with pytest.raises(TypeError, match="unexpected keyword argument 'key'"):
             model.fit_sgd(lfp, key=jax.random.PRNGKey(1), num_steps=0)
+
+    @pytest.mark.slow
+    def test_fit_sgd_accepts_named_data_and_positional_optimizer(self, model_and_data):
+        """The public signature is ``fit_sgd(observations, optimizer, num_steps,
+        ...)``: naming the data and passing the optimizer positionally must fit
+        exactly like the positional-data / keyword-optimizer call."""
+        model, lfp = model_and_data
+        optimizer = optax.adam(1e-2)
+        ref, named, positional = (copy.deepcopy(model) for _ in range(3))
+
+        lls_ref = ref.fit_sgd(lfp, optimizer=optimizer, num_steps=2)
+        assert len(lls_ref) == 2
+
+        lls_named = named.fit_sgd(observations=lfp, optimizer=optimizer, num_steps=2)
+        assert lls_named == lls_ref
+        assert positional.fit_sgd(lfp, optimizer, 2) == lls_ref
+        assert jnp.array_equal(named.C, ref.C)
+        assert jnp.array_equal(positional.C, ref.C)
 
 
 class TestHamiltonianLFPMultiOscillator:
@@ -231,7 +254,8 @@ class TestHamiltonianLFPSGDRecovery:
     """Verify fit_sgd learns omega and observation matrix from LFP data."""
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         omega_true = 2 * jnp.pi
         dt = 0.01
         n_time = 300

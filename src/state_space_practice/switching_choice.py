@@ -21,23 +21,37 @@ References
     experiments. J Neuroscience 24(2), 447-461.
 """
 
-import logging
 import functools
-from typing import NamedTuple, Optional
+import logging
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.multinomial_choice import _softmax_update_core
+from state_space_practice.multinomial_choice import (
+    _softmax_update_core,
+    _warn_if_newton_unconverged,
+)
+from state_space_practice.parameter_transforms import (
+    POSITIVE,
+    STOCHASTIC_ROW,
+    UNCONSTRAINED,
+    UNIT_INTERVAL,
+    positive_capped,
+)
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.switching_kalman import (
+    _first_timestep_discrete_update,
+    _normalize_initial_discrete_prob,
+    _stabilize_probability_vector_preserving_zeros,
     _update_discrete_state_probabilities,
+    collapse_gaussian_mixture,
     collapse_gaussian_mixture_per_discrete_state,
+    switching_kalman_smoother,
 )
 from state_space_practice.utils import (
-    stabilize_probability_vector as _stabilize_probability_vector,
     validate_choice_indices,
 )
 
@@ -55,7 +69,7 @@ def _softmax_predict_and_update(
     input_gain: Array,
     covariates_t: Array,
     obs_offset: Array,
-) -> tuple[Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array]:
     """Predict + softmax update for one (prev_state_i, next_state_j) pair.
 
     Parameters
@@ -76,13 +90,16 @@ def _softmax_predict_and_update(
     post_mean : Array, shape (K-1,)
     post_cov : Array, shape (K-1, K-1)
     log_likelihood : Array, shape ()
+    newton_gap : Array, shape ()
+        Laplace mode-search convergence diagnostic (see
+        ``multinomial_choice._softmax_update_core``).
     """
     # Predict
     pred_mean = transition_matrix @ prev_mean + input_gain @ covariates_t
     pred_cov = transition_matrix @ prev_cov @ transition_matrix.T + process_cov
 
     # Update via softmax Laplace-EKF
-    post_mean, post_cov, ll = _softmax_update_core(
+    return _softmax_update_core(
         pred_mean,
         pred_cov,
         choice,
@@ -90,8 +107,6 @@ def _softmax_predict_and_update(
         inverse_temperature,
         obs_offset=obs_offset,
     )
-
-    return post_mean, post_cov, ll
 
 
 def _softmax_update_per_state_pair(
@@ -105,7 +120,7 @@ def _softmax_update_per_state_pair(
     input_gain: Array,
     covariates_t: Array,
     obs_offset: Array,
-) -> tuple[Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array]:
     """Per-state-pair softmax predict + update via double vmap.
 
     Computes pair-conditional posteriors for all (i, j) state pairs,
@@ -134,6 +149,8 @@ def _softmax_update_per_state_pair(
     pair_cond_mean : Array, shape (K-1, S_prev, S_next)
     pair_cond_cov : Array, shape (K-1, K-1, S_prev, S_next)
     pair_cond_ll : Array, shape (S_prev, S_next)
+    pair_newton_gap : Array, shape (S_prev, S_next)
+        Laplace mode-search convergence diagnostic per pair.
     """
 
     def _update_one_pair(prev_mean_i, prev_cov_i, A_j, Q_j, beta_j):
@@ -157,25 +174,20 @@ def _softmax_update_per_state_pair(
         return jax.vmap(
             lambda m, c: _update_one_pair(m, c, A_j, Q_j, beta_j),
             in_axes=(1, 2),  # mean: axis 1, cov: axis 2
-            out_axes=(
-                1,
-                2,
-                0,
-            ),  # mean: (K-1, S_prev), cov: (K-1, K-1, S_prev), ll: (S_prev,)
+            # mean: (K-1, S_prev), cov: (K-1, K-1, S_prev), ll and gap: (S_prev,)
+            out_axes=(1, 2, 0, 0),
         )(prev_state_cond_mean, prev_state_cond_cov)
 
     # vmap over next_state j (axis -1 of A/Q, element of beta)
-    pair_mean, pair_cov, pair_ll = jax.vmap(
+    pair_mean, pair_cov, pair_ll, pair_gap = jax.vmap(
         _update_all_prev_for_next_j,
         in_axes=(2, 2, 0),  # A: axis 2, Q: axis 2, beta: axis 0
-        out_axes=(
-            2,
-            3,
-            1,
-        ),  # mean: (K-1, S_prev, S_next), cov: (K-1, K-1, S_prev, S_next), ll: (S_prev, S_next)
+        # mean: (K-1, S_prev, S_next), cov: (K-1, K-1, S_prev, S_next),
+        # ll and gap: (S_prev, S_next)
+        out_axes=(2, 3, 1, 1),
     )(transition_matrices, process_covs, inverse_temperatures)
 
-    return pair_mean, pair_cov, pair_ll
+    return pair_mean, pair_cov, pair_ll, pair_gap
 
 
 class SwitchingChoiceFilterResult(NamedTuple):
@@ -195,19 +207,29 @@ def switching_choice_filter(
     choices: ArrayLike,
     n_options: int,
     n_discrete_states: int = 2,
-    covariates: Optional[ArrayLike] = None,
-    input_gain: Optional[ArrayLike] = None,
-    obs_covariates: Optional[ArrayLike] = None,
-    obs_weights: Optional[ArrayLike] = None,
-    process_noises: Optional[ArrayLike] = None,
-    inverse_temperatures: Optional[ArrayLike] = None,
-    decays: Optional[ArrayLike] = None,
-    discrete_transition_matrix: Optional[ArrayLike] = None,
-    init_mean: Optional[ArrayLike] = None,
-    init_cov: Optional[ArrayLike] = None,
-    init_discrete_prob: Optional[ArrayLike] = None,
+    covariates: ArrayLike | None = None,
+    input_gain: ArrayLike | None = None,
+    obs_covariates: ArrayLike | None = None,
+    obs_weights: ArrayLike | None = None,
+    process_noises: ArrayLike | None = None,
+    inverse_temperatures: ArrayLike | None = None,
+    decays: ArrayLike | None = None,
+    discrete_transition_matrix: ArrayLike | None = None,
+    init_mean: ArrayLike | None = None,
+    init_cov: ArrayLike | None = None,
+    init_discrete_prob: ArrayLike | None = None,
 ) -> SwitchingChoiceFilterResult:
-    """Validate choices and run the JIT-compiled switching choice filter."""
+    """Validate choices and run the JIT-compiled switching choice filter.
+
+    See :func:`_switching_choice_filter_jit` for parameters and returns.
+
+    Warns
+    -----
+    StateSpaceWarning
+        If a Laplace mode search (for any state pair) ends more than
+        ``multinomial_choice.NEWTON_GAP_TOL`` nats (Newton estimate) below
+        its mode.
+    """
     validate_choice_indices(choices, n_options)
     return _switching_choice_filter_jit(
         choices,
@@ -235,17 +257,17 @@ def _switching_choice_filter_jit(
     choices: ArrayLike,
     n_options: int,
     n_discrete_states: int = 2,
-    covariates: Optional[ArrayLike] = None,
-    input_gain: Optional[ArrayLike] = None,
-    obs_covariates: Optional[ArrayLike] = None,
-    obs_weights: Optional[ArrayLike] = None,
-    process_noises: Optional[ArrayLike] = None,
-    inverse_temperatures: Optional[ArrayLike] = None,
-    decays: Optional[ArrayLike] = None,
-    discrete_transition_matrix: Optional[ArrayLike] = None,
-    init_mean: Optional[ArrayLike] = None,
-    init_cov: Optional[ArrayLike] = None,
-    init_discrete_prob: Optional[ArrayLike] = None,
+    covariates: ArrayLike | None = None,
+    input_gain: ArrayLike | None = None,
+    obs_covariates: ArrayLike | None = None,
+    obs_weights: ArrayLike | None = None,
+    process_noises: ArrayLike | None = None,
+    inverse_temperatures: ArrayLike | None = None,
+    decays: ArrayLike | None = None,
+    discrete_transition_matrix: ArrayLike | None = None,
+    init_mean: ArrayLike | None = None,
+    init_cov: ArrayLike | None = None,
+    init_discrete_prob: ArrayLike | None = None,
 ) -> SwitchingChoiceFilterResult:
     """Switching choice filter with GPB1/IMM approximation.
 
@@ -344,11 +366,12 @@ def _switching_choice_filter_jit(
     init_state_cond_mean = jnp.stack([init_mean] * S, axis=-1)  # (K-1, S)
     init_state_cond_cov = jnp.stack([init_cov] * S, axis=-1)  # (K-1, K-1, S)
 
-    # Structural support S_1 from the RAW prior (before stabilization floors its
-    # exact zeros to 1e-10), so a caller-declared impossible state (prior 0) stays
-    # impossible: the support mask, not the floored value, decides.
-    first_support = jnp.asarray(init_discrete_prob) > 0.0
-    init_discrete_prob = _stabilize_probability_vector(init_discrete_prob)
+    # Sanitize the caller-supplied prior exactly as the switching-Kalman and
+    # switching point-process filters do: exact zeros are structural (an
+    # impossible state stays impossible), NaN / negative entries are clamped to
+    # 0, and the structural support S_1 is read from the sanitized prior.
+    init_discrete_prob = _normalize_initial_discrete_prob(init_discrete_prob)
+    first_support = init_discrete_prob > 0.0
 
     # --- First timestep: predict + update (x₀ convention) ---
     # This uses the x₀ convention (predict+update at t=0) to match the
@@ -362,7 +385,7 @@ def _switching_choice_filter_jit(
         pred_cov = A_j @ prior_cov @ A_j.T + Q_j
 
         obs_offset_0 = ow_arr @ obs_cov_arr[0]
-        post_mean, post_cov, ll = _softmax_update_core(
+        post_mean, post_cov, ll, newton_gap = _softmax_update_core(
             pred_mean,
             pred_cov,
             choices[0],
@@ -370,12 +393,19 @@ def _switching_choice_filter_jit(
             beta,
             obs_offset=obs_offset_0,
         )
-        return post_mean, post_cov, ll, pred_mean, pred_cov
+        return post_mean, post_cov, ll, pred_mean, pred_cov, newton_gap
 
-    first_means, first_covs, first_lls, first_pred_means, first_pred_covs = jax.vmap(
+    (
+        first_means,
+        first_covs,
+        first_lls,
+        first_pred_means,
+        first_pred_covs,
+        first_newton_gaps,
+    ) = jax.vmap(
         _first_update_for_state,
         in_axes=(1, 2, 0, 2, 2),
-        out_axes=(1, 2, 0, 1, 2),
+        out_axes=(1, 2, 0, 1, 2, 0),
     )(
         init_state_cond_mean,
         init_state_cond_cov,
@@ -385,18 +415,14 @@ def _switching_choice_filter_jit(
     )
     # first_means: (K-1, S), first_pred_means: (K-1, S), etc.
 
-    # Log-space, support-masked discrete update for the first timestep. `first_support`
-    # (from the RAW prior, computed above) is threaded through the scan so an
-    # impossible state cannot set the log-sum-exp reference nor be resurrected.
-    first_pair_ll = first_lls[None, :] * jnp.ones((S, 1))  # (S, S) broadcast
-    (
-        first_discrete_prob,
-        _,
-        first_marginal_ll,
-        first_next_support,
-    ) = _update_discrete_state_probabilities(
-        first_pair_ll, jnp.eye(S), init_discrete_prob, first_support
+    # Log-space, support-masked discrete update for the first timestep, shared
+    # with the other switching filters: a structural zero stays exactly 0, a
+    # tiny prior is represented faithfully, and an all-zero prior fails loud.
+    # There is no transition at t=0, so the support carried into the scan is S_1.
+    first_discrete_prob, first_marginal_ll = _first_timestep_discrete_update(
+        first_lls, init_discrete_prob
     )
+    first_next_support = first_support
 
     # Pair-conditional for smoother: diagonal (no pair structure at t=0)
     first_pair_mean = jnp.stack([first_means] * S, axis=-1)  # (K-1, S, S)
@@ -422,7 +448,7 @@ def _switching_choice_filter_jit(
         )(prev_mean, prev_cov, transition_matrices, process_covs)
 
         # Per-state-pair predict + update
-        pair_mean, pair_cov, pair_ll = _softmax_update_per_state_pair(
+        pair_mean, pair_cov, pair_ll, pair_gap = _softmax_update_per_state_pair(
             prev_mean,
             prev_cov,
             choice_t,
@@ -460,6 +486,7 @@ def _switching_choice_filter_jit(
             pair_cov,
             pred_means,
             pred_covs,
+            pair_gap,
         )
 
     init_carry = (
@@ -481,8 +508,13 @@ def _switching_choice_filter_jit(
             rest_pair_covs,
             rest_pred_means,
             rest_pred_covs,
+            rest_newton_gaps,
         ),
     ) = jax.lax.scan(_step, init_carry, scan_inputs)
+    _warn_if_newton_unconverged(
+        jnp.concatenate([first_newton_gaps, rest_newton_gaps.ravel()]),
+        "switching_choice_filter",
+    )
 
     # Concatenate first timestep
     filtered_values = jnp.concatenate([first_means[None], rest_means], axis=0)
@@ -507,6 +539,149 @@ def _switching_choice_filter_jit(
         pair_cond_means=pair_cond_means,
         pair_cond_covs=pair_cond_covs,
     )
+
+
+@jax.jit
+def switching_choice_smoother(
+    filtered_values: Array,
+    filtered_covs: Array,
+    discrete_state_probs: Array,
+    process_covs: Array,
+    transition_matrices: Array,
+    discrete_transition_matrix: Array,
+    control_input: Array,
+) -> tuple[Array, ...]:
+    """GPB1 switching RTS smoother for dynamics with a known control input.
+
+    The latent dynamics of the switching choice model are
+    ``x_t = A_{s_t} x_{t-1} + b_t + w_t`` with the known input
+    ``b_t = B @ u_t``. :func:`switching_kalman.switching_kalman_smoother`
+    assumes ``b_t = 0``: its backward step predicts ``A_k m_{t|t}`` and so,
+    with covariates, compares the smoothed ``x_{t+1}`` against a prediction
+    that is missing ``b_{t+1}``, which biases every smoothed mean.
+
+    For each state pair the correct RTS mean update is
+    ``m_t + J (m^s_{t+1} - A_k m_t - b_{t+1})``, which is the control-free
+    update applied to the shifted next-step smoothed mean
+    ``m^s_{t+1} - b_{t+1}``. The discrete-state recursion and every
+    covariance (including the mixture-collapse spread terms, which are
+    invariant to a common shift of the ``t+1`` means) do not depend on
+    ``b``. This function therefore runs the library backward step one time
+    step at a time, feeding it the shifted next-step means, and returns the
+    same 9-tuple as ``switching_kalman_smoother``. With ``control_input == 0``
+    it reproduces ``switching_kalman_smoother`` exactly.
+
+    Parameters
+    ----------
+    filtered_values : Array, shape (T, K-1, S)
+    filtered_covs : Array, shape (T, K-1, K-1, S)
+    discrete_state_probs : Array, shape (T, S)
+    process_covs : Array, shape (K-1, K-1, S)
+    transition_matrices : Array, shape (K-1, K-1, S)
+    discrete_transition_matrix : Array, shape (S, S)
+    control_input : Array, shape (T, K-1)
+        ``control_input[t]`` is the known input ``b_t`` of the transition
+        ``x_{t-1} -> x_t`` (row 0 is never read).
+
+    Returns
+    -------
+    tuple
+        ``(overall_mean, overall_cov, discrete_probs, joint_discrete_probs,
+        overall_cross_cov, state_cond_means, state_cond_covs,
+        pair_cond_cross_covs, pair_cond_means)`` with the shapes documented
+        in :func:`switching_kalman.switching_kalman_smoother`.
+    """
+
+    def _backward_step(carry, inputs):
+        next_means, next_covs, next_probs = carry
+        filt_mean_t, filt_cov_t, filt_prob_t, b_next = inputs
+        # A two-step call whose "last filter" slot is the smoothed t+1 state:
+        # the library initialises its backward carry from that slot, so its
+        # single backward step is exactly the GPB1 step at t.
+        out = switching_kalman_smoother(
+            filter_mean=jnp.stack([filt_mean_t, next_means - b_next[:, None]]),
+            filter_cov=jnp.stack([filt_cov_t, next_covs]),
+            filter_discrete_state_prob=jnp.stack([filt_prob_t, next_probs]),
+            process_cov=process_covs,
+            continuous_transition_matrix=transition_matrices,
+            discrete_state_transition_matrix=discrete_transition_matrix,
+        )
+        step = tuple(o[0] for o in out)
+        state_means_t, state_covs_t, probs_t = step[5], step[6], step[2]
+        new_carry = (
+            state_means_t,
+            state_covs_t,
+            _stabilize_probability_vector_preserving_zeros(probs_t),
+        )
+        return new_carry, step
+
+    init_carry = (
+        filtered_values[-1],
+        filtered_covs[-1],
+        discrete_state_probs[-1],
+    )
+    _, steps = jax.lax.scan(
+        _backward_step,
+        init_carry,
+        (
+            filtered_values[:-1],
+            filtered_covs[:-1],
+            discrete_state_probs[:-1],
+            control_input[1:],
+        ),
+        reverse=True,
+    )
+    (
+        overall_mean,
+        overall_cov,
+        disc_probs,
+        joint_probs,
+        overall_cross_cov,
+        state_means,
+        state_covs,
+        pair_cross_covs,
+        pair_means,
+    ) = steps
+
+    last_mean, last_cov = collapse_gaussian_mixture(
+        filtered_values[-1], filtered_covs[-1], discrete_state_probs[-1]
+    )
+    return (
+        jnp.concatenate([overall_mean, last_mean[None]], axis=0),
+        jnp.concatenate([overall_cov, last_cov[None]], axis=0),
+        jnp.concatenate([disc_probs, discrete_state_probs[-1:]], axis=0),
+        joint_probs,
+        overall_cross_cov,
+        jnp.concatenate([state_means, filtered_values[-1:]], axis=0),
+        jnp.concatenate([state_covs, filtered_covs[-1:]], axis=0),
+        pair_cross_covs,
+        pair_means,
+    )
+
+
+def _between_state_variance(means: Array, probs: Array) -> Array:
+    """Between-state term ``Var_s(E[x | s])`` of the law of total variance.
+
+    Uses the centred form ``sum_s p_s (m_s - m_bar)^2`` rather than
+    ``E[m^2] - E[m]^2``, which cancels catastrophically when the per-state
+    means are large relative to their spread (the same reason
+    ``collapse_gaussian_mixture`` centres its spread-of-means term).
+
+    Parameters
+    ----------
+    means : Array, shape (n_time, n_options, n_discrete_states)
+        Per-state conditional means.
+    probs : Array, shape (n_time, n_discrete_states)
+        Discrete-state mixing weights (each row sums to 1).
+
+    Returns
+    -------
+    Array, shape (n_time, n_options)
+        Non-negative variance of the per-state means under ``probs``.
+    """
+    mixture_mean = jnp.einsum("tks,ts->tk", means, probs)
+    centred = means - mixture_mean[..., None]
+    return jnp.einsum("tks,ts->tk", centred**2, probs)
 
 
 class SwitchingChoiceModel(SGDFittableMixin):
@@ -539,9 +714,9 @@ class SwitchingChoiceModel(SGDFittableMixin):
         n_discrete_states: int = 2,
         n_covariates: int = 0,
         n_obs_covariates: int = 0,
-        init_inverse_temperatures: Optional[ArrayLike] = None,
-        init_process_noises: Optional[ArrayLike] = None,
-        init_decays: Optional[ArrayLike] = None,
+        init_inverse_temperatures: ArrayLike | None = None,
+        init_process_noises: ArrayLike | None = None,
+        init_decays: ArrayLike | None = None,
     ):
         self.n_options = n_options
         self.n_discrete_states = n_discrete_states
@@ -598,20 +773,24 @@ class SwitchingChoiceModel(SGDFittableMixin):
         else:
             self.obs_weights_ = None
 
+        # Covariates bound by fit() / fit_sgd()
+        self._covariates: Array | None = None
+        self._obs_covariates: Array | None = None
+
         # Fitted state
-        self.converged_: Optional[bool] = None
-        self._filter_result: Optional[SwitchingChoiceFilterResult] = None
-        self.smoothed_discrete_probs_: Optional[Array] = None
-        self.log_likelihood_: Optional[float] = None
-        self.log_likelihood_history_: Optional[list[float]] = None
-        self._n_trials: Optional[int] = None
+        self.converged_: bool | None = None
+        self._filter_result: SwitchingChoiceFilterResult | None = None
+        self.smoothed_discrete_probs_: Array | None = None
+        self.log_likelihood_: float | None = None
+        self.log_likelihood_history_: list[float] | None = None
+        self._n_trials: int | None = None
 
         # Uncertainty summaries
-        self.predicted_option_variances_: Optional[Array] = None
-        self.smoothed_option_variances_: Optional[Array] = None
-        self.predicted_choice_entropy_: Optional[Array] = None
-        self.surprise_: Optional[Array] = None
-        self.per_state_predicted_variances_: Optional[Array] = None
+        self.predicted_option_variances_: Array | None = None
+        self.smoothed_option_variances_: Array | None = None
+        self.predicted_choice_entropy_: Array | None = None
+        self.surprise_: Array | None = None
+        self.per_state_predicted_variances_: Array | None = None
 
     @property
     def is_fitted(self) -> bool:
@@ -667,9 +846,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
         # Law of total variance: Var(x) = E[Var(x|s)] + Var(E[x|s])
         # Use PREDICTED (prior) state probs for weighting.
         e_var = jnp.einsum("tks,ts->tk", full_vars, predicted_disc)  # E[Var(x|s)]
-        e_mean = jnp.einsum("tks,ts->tk", full_means, predicted_disc)  # E[E[x|s]]
-        e_mean_sq = jnp.einsum("tks,ts->tk", full_means**2, predicted_disc)
-        var_mean = e_mean_sq - e_mean**2  # Var(E[x|s])
+        var_mean = _between_state_variance(full_means, predicted_disc)
         self.predicted_option_variances_ = e_var + var_mean
 
         # Smoothed variances: law of total variance with smoother quantities
@@ -698,9 +875,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
                 )  # (T, K, S)
                 sm_disc = self.smoothed_discrete_probs_
                 sm_e_var = jnp.einsum("tks,ts->tk", full_sm_vars, sm_disc)
-                sm_e_mean = jnp.einsum("tks,ts->tk", full_sm_means, sm_disc)
-                sm_e_mean_sq = jnp.einsum("tks,ts->tk", full_sm_means**2, sm_disc)
-                sm_var_mean = sm_e_mean_sq - sm_e_mean**2
+                sm_var_mean = _between_state_variance(full_sm_means, sm_disc)
                 self.smoothed_option_variances_ = sm_e_var + sm_var_mean
             else:
                 # Fallback: no between-state term
@@ -736,17 +911,17 @@ class SwitchingChoiceModel(SGDFittableMixin):
 
     def _run_filter(self, choices, covariates=None, obs_covariates=None):
         """Run the switching choice filter with current parameters."""
-        kwargs = dict(
-            choices=choices,
-            n_options=self.n_options,
-            n_discrete_states=self.n_discrete_states,
-            process_noises=self.process_noises_,
-            inverse_temperatures=self.inverse_temperatures_,
-            decays=self.decays_,
-            discrete_transition_matrix=self.discrete_transition_matrix_,
-            init_mean=self.init_mean_,
-            init_cov=self.init_cov_,
-        )
+        kwargs = {
+            "choices": choices,
+            "n_options": self.n_options,
+            "n_discrete_states": self.n_discrete_states,
+            "process_noises": self.process_noises_,
+            "inverse_temperatures": self.inverse_temperatures_,
+            "decays": self.decays_,
+            "discrete_transition_matrix": self.discrete_transition_matrix_,
+            "init_mean": self.init_mean_,
+            "init_cov": self.init_cov_,
+        }
         if covariates is not None and self.input_gain_ is not None:
             kwargs["covariates"] = covariates
             kwargs["input_gain"] = self.input_gain_
@@ -758,8 +933,8 @@ class SwitchingChoiceModel(SGDFittableMixin):
     def fit(
         self,
         choices: ArrayLike,
-        covariates: Optional[ArrayLike] = None,
-        obs_covariates: Optional[ArrayLike] = None,
+        covariates: ArrayLike | None = None,
+        obs_covariates: ArrayLike | None = None,
         max_iter: int = 50,
         tolerance: float = 1e-4,
     ) -> list[float]:
@@ -775,7 +950,13 @@ class SwitchingChoiceModel(SGDFittableMixin):
         covariates : ArrayLike or None, shape (n_trials, d_dyn)
         obs_covariates : ArrayLike or None, shape (n_trials, d_obs)
         max_iter : int
+            Maximum EM iterations.
         tolerance : float
+            Convergence threshold on the *absolute* log-likelihood change
+            between successive E-steps, ``|LL_k - LL_{k-1}| < tolerance``
+            (nats; not the relative criterion of
+            :func:`state_space_practice.utils.check_converged`), so it should
+            be scaled with the number of trials.
 
         Returns
         -------
@@ -830,24 +1011,26 @@ class SwitchingChoiceModel(SGDFittableMixin):
         return log_likelihoods
 
     def _run_smoother(self, filter_result):
-        """Run the switching Kalman smoother on filter output."""
-        from state_space_practice.switching_kalman import switching_kalman_smoother
+        """Run the control-aware GPB1 switching smoother on filter output.
 
+        The known dynamics input ``B @ u_t`` enters the smoother's one-step
+        predictions (see :func:`switching_choice_smoother`), so the smoothed
+        means stay consistent with the filter when covariates are present.
+        """
         k_free = self.n_options - 1
-        return switching_kalman_smoother(
-            filter_mean=filter_result.filtered_values,
-            filter_cov=filter_result.filtered_covs,
-            filter_discrete_state_prob=filter_result.discrete_state_probs,
-            last_filter_conditional_cont_mean=filter_result.pair_cond_means[-1],
-            process_cov=jnp.stack(
-                [q * jnp.eye(k_free) for q in self.process_noises_],
-                axis=-1,
-            ),
-            continuous_transition_matrix=jnp.stack(
-                [d * jnp.eye(k_free) for d in self.decays_],
-                axis=-1,
-            ),
-            discrete_state_transition_matrix=self.discrete_transition_matrix_,
+        n_trials = filter_result.filtered_values.shape[0]
+        if self.input_gain_ is not None and self._covariates is not None:
+            control_input = self._covariates @ self.input_gain_.T  # (T, K-1)
+        else:
+            control_input = jnp.zeros((n_trials, k_free))
+        return switching_choice_smoother(
+            filter_result.filtered_values,
+            filter_result.filtered_covs,
+            filter_result.discrete_state_probs,
+            self.process_noises_[None, None, :] * jnp.eye(k_free)[:, :, None],
+            self.decays_[None, None, :] * jnp.eye(k_free)[:, :, None],
+            self.discrete_transition_matrix_,
+            control_input,
         )
 
     def _m_step(self, choices, filter_result, smoother_result):
@@ -939,14 +1122,40 @@ class SwitchingChoiceModel(SGDFittableMixin):
     def fit_sgd(
         self,
         choices: ArrayLike,
-        covariates: Optional[ArrayLike] = None,
-        obs_covariates: Optional[ArrayLike] = None,
+        covariates: ArrayLike | None = None,
+        obs_covariates: ArrayLike | None = None,
         optimizer=None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol=None,
     ) -> list[float]:
-        """Fit by minimizing negative marginal LL via gradient descent."""
+        """Fit by minimizing negative marginal LL via gradient descent.
+
+        Parameters
+        ----------
+        choices : ArrayLike, shape (n_trials,)
+            Observed choices, integers in ``[0, n_options)``.
+        covariates : ArrayLike or None, shape (n_trials, n_covariates)
+            Dynamics covariates driving the per-state value updates. None =
+            no covariate drive.
+        obs_covariates : ArrayLike or None, shape (n_trials, n_obs_covariates)
+            Observation covariates biasing choice probabilities. None = no
+            bias.
+        optimizer : optax optimizer or None
+            Default: adam(1e-2) with gradient clipping.
+        num_steps : int
+            Number of optimization steps.
+        verbose : bool
+            Log progress every 10 steps (INFO level).
+        convergence_tol : float or None
+            Stop early when the relative LL change stays below this for 5
+            consecutive steps.
+
+        Returns
+        -------
+        log_likelihoods : list of float
+            Marginal log-likelihood per optimization step.
+        """
         validate_choice_indices(choices, self.n_options)
         choices = jnp.asarray(choices, dtype=jnp.int32)
         self._n_trials = int(choices.shape[0])
@@ -967,18 +1176,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
     def _n_timesteps(self) -> int:
         return self._n_trials
 
-    def _check_sgd_initialized(self) -> None:
-        pass
-
     def _build_param_spec(self) -> tuple[dict, dict]:
-        from state_space_practice.parameter_transforms import (
-            POSITIVE,
-            STOCHASTIC_ROW,
-            UNCONSTRAINED,
-            UNIT_INTERVAL,
-            positive_capped,
-        )
-
         params = {
             "process_noises": self.process_noises_,
             "inverse_temperatures": self.inverse_temperatures_,
@@ -1005,17 +1203,17 @@ class SwitchingChoiceModel(SGDFittableMixin):
         return params, spec
 
     def _sgd_loss_fn(self, params: dict, choices: Array) -> Array:
-        kwargs = dict(
-            choices=choices,
-            n_options=self.n_options,
-            n_discrete_states=self.n_discrete_states,
-            process_noises=params["process_noises"],
-            inverse_temperatures=params["inverse_temperatures"],
-            decays=params["decays"],
-            discrete_transition_matrix=params["discrete_transition_matrix"],
-            init_mean=params["init_mean"],
-            init_cov=self.init_cov_,
-        )
+        kwargs = {
+            "choices": choices,
+            "n_options": self.n_options,
+            "n_discrete_states": self.n_discrete_states,
+            "process_noises": params["process_noises"],
+            "inverse_temperatures": params["inverse_temperatures"],
+            "decays": params["decays"],
+            "discrete_transition_matrix": params["discrete_transition_matrix"],
+            "init_mean": params["init_mean"],
+            "init_cov": self.init_cov_,
+        }
         if self._covariates is not None and "input_gain" in params:
             kwargs["covariates"] = self._covariates
             kwargs["input_gain"] = params["input_gain"]
@@ -1023,7 +1221,9 @@ class SwitchingChoiceModel(SGDFittableMixin):
             kwargs["obs_covariates"] = self._obs_covariates
             kwargs["obs_weights"] = params["obs_weights"]
 
-        result = switching_choice_filter(**kwargs)
+        # The jitted core, not the validating public wrapper: fit_sgd already
+        # validated the choices, which are a traced jit argument here.
+        result = _switching_choice_filter_jit(**kwargs)
         return -result.marginal_log_likelihood
 
     def _store_sgd_params(self, params: dict) -> None:
@@ -1061,10 +1261,10 @@ def simulate_switching_choice_data(
     n_trials: int = 200,
     n_options: int = 3,
     n_discrete_states: int = 2,
-    process_noises: Optional[ArrayLike] = None,
-    inverse_temperatures: Optional[ArrayLike] = None,
-    decays: Optional[ArrayLike] = None,
-    transition_matrix: Optional[ArrayLike] = None,
+    process_noises: ArrayLike | None = None,
+    inverse_temperatures: ArrayLike | None = None,
+    decays: ArrayLike | None = None,
+    transition_matrix: ArrayLike | None = None,
     seed: int = 42,
 ) -> SimulatedSwitchingChoiceData:
     """Simulate switching multi-armed bandit choice data.

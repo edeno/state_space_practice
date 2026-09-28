@@ -28,7 +28,8 @@ _detector`` MRF) feed *our* basis to both sides, so they are robust to this choi
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple, Optional
+import contextlib
+from typing import TYPE_CHECKING, NamedTuple
 
 import networkx as nx
 import numpy as np
@@ -91,7 +92,7 @@ class GraphBasis(NamedTuple):
     env_key: tuple[int, int, float]
 
 
-def _distance_weighted_laplacian(env: "Environment") -> sp.csr_matrix:
+def _distance_weighted_laplacian(env: Environment) -> sp.csr_matrix:
     """Return ``L = D @ D.T`` (distance-weighted graph Laplacian) as CSR."""
     D = env.get_differential_operator()
     return (D @ D.T).tocsr()
@@ -110,12 +111,12 @@ def _laplacian_key(laplacian: sp.spmatrix) -> tuple[int, int, float]:
     )
 
 
-def _env_key(env: "Environment") -> tuple[int, int, float]:
+def _env_key(env: Environment) -> tuple[int, int, float]:
     """Fingerprint of ``env``'s current distance-weighted Laplacian."""
     return _laplacian_key(_distance_weighted_laplacian(env))
 
 
-def _check_basis_matches_env(env: "Environment", basis: GraphBasis) -> None:
+def _check_basis_matches_env(env: Environment, basis: GraphBasis) -> None:
     """Refuse a basis built for a different (or since-refit) environment.
 
     The basis rows and the ``bin_sequence`` ids the consumers index by must belong to
@@ -141,8 +142,8 @@ def _check_basis_matches_env(env: "Environment", basis: GraphBasis) -> None:
 def _resolve_rank(
     eigvals: NDArray[np.float64],
     n_components: int,
-    rank: Optional[int],
-    sigma: Optional[float],
+    rank: int | None,
+    sigma: float | None,
     tol: float,
 ) -> int:
     """Resolve the number of modes to keep.
@@ -202,10 +203,10 @@ def _full_eigensystem(
 
 
 def build_graph_basis(
-    env: "Environment",
-    rank: Optional[int] = None,
+    env: Environment,
+    rank: int | None = None,
     *,
-    sigma: Optional[float] = None,
+    sigma: float | None = None,
     tol: float = 1e-6,
 ) -> GraphBasis:
     """Build (and cache) the truncated graph-Laplacian eigenbasis for ``env``.
@@ -245,10 +246,9 @@ def build_graph_basis(
     if cache is None or cache.get("key") != key:
         eigvals, eigvecs = _full_eigensystem(laplacian, labels, int(n_components))
         cache = {"key": key, "eigvals": eigvals, "eigvecs": eigvecs, "labels": labels}
-        try:
+        # An environment that forbids attribute assignment simply skips caching.
+        with contextlib.suppress(AttributeError):
             setattr(env, _CACHE_ATTR, cache)
-        except AttributeError:  # environment forbids attribute assignment; skip caching
-            pass
 
     eigvals_full = cache["eigvals"]
     keep = _resolve_rank(eigvals_full, int(n_components), rank, sigma, tol)
@@ -303,7 +303,7 @@ def spectral_shape(
 
 
 def _bin_ids(
-    env: "Environment",
+    env: Environment,
     times: NDArray[np.float64],
     trajectory: NDArray[np.float64],
 ) -> NDArray[np.int_]:
@@ -326,7 +326,7 @@ def _bin_ids(
 
 
 def graph_design_matrix(
-    env: "Environment",
+    env: Environment,
     basis: GraphBasis,
     times: NDArray[np.float64],
     trajectory: NDArray[np.float64],
@@ -377,7 +377,7 @@ def graph_design_matrix(
 
 
 def bin_occupancy(
-    env: "Environment",
+    env: Environment,
     times: NDArray[np.float64],
     trajectory: NDArray[np.float64],
     dt: float,
@@ -413,7 +413,7 @@ def bin_occupancy(
 
 
 def bin_spike_counts(
-    env: "Environment",
+    env: Environment,
     spikes: NDArray[np.float64],
     times: NDArray[np.float64],
     trajectory: NDArray[np.float64],
@@ -460,7 +460,7 @@ def bin_spike_counts(
     return out
 
 
-def laplacian_matches_distance_weight(env: "Environment") -> bool:
+def laplacian_matches_distance_weight(env: Environment) -> bool:
     """True if ``get_differential_operator`` gives the distance-weighted Laplacian.
 
     A cheap invariant check (used by the contract test): ``D @ D.T`` must equal

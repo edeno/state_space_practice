@@ -5,6 +5,28 @@ phase relationships in oscillatory neural data.
 
 Note: These utilities use NumPy/SciPy for data analysis and are not
 JIT-compatible. For JAX-compatible operations, see the core model modules.
+
+Relation to :mod:`scipy.stats`
+------------------------------
+Where SciPy computes the same quantity with the same conventions the function
+delegates to it; the remaining functions are hand-written because SciPy has no
+equivalent or its conventions differ (each docstring says which):
+
+========================  ====================================================
+``circular_std``          ``scipy.stats.circstd(phases)`` (radians), plus the
+                          documented floor ``R >= 1e-10``.
+``circular_mean``         hand-written: ``scipy.stats.circmean(..., low=-pi,
+                          high=pi)`` returns ``[-pi, pi)`` (not ``(-pi, pi]``)
+                          and loses relative precision near 0.
+``mean_resultant_length`` hand-written: SciPy exposes ``R`` only as
+                          ``1 - circvar`` (cancellation) or via
+                          ``directional_stats`` on Cartesian vectors.
+``rayleigh_test``         hand-written: no SciPy Rayleigh test
+                          (``scipy.stats.rayleigh`` is the distribution).
+``circular_correlation``  hand-written: no SciPy circular correlation.
+``angular_distance``,     hand-written NumPy one-liners (no SciPy equivalent).
+``wrap_to_pi``
+========================  ====================================================
 """
 
 from __future__ import annotations
@@ -12,6 +34,12 @@ from __future__ import annotations
 import numpy as np
 import numpy.typing as npt
 from numpy.typing import NDArray
+from scipy import stats
+
+#: Floor on the mean resultant length in :func:`circular_std`, so (numerically)
+#: uniform phases give a large finite spread instead of ``inf``.
+_MIN_RESULTANT_LENGTH = 1e-10
+_MAX_CIRCULAR_STD = float(np.sqrt(-2.0 * np.log(_MIN_RESULTANT_LENGTH)))
 
 
 def circular_mean(phases: NDArray[np.floating]) -> float:
@@ -31,6 +59,15 @@ def circular_mean(phases: NDArray[np.floating]) -> float:
     --------
     >>> phases = np.array([0, np.pi/4, -np.pi/4])
     >>> circular_mean(phases)  # Should be close to 0
+
+    Notes
+    -----
+    Not delegated to ``scipy.stats.circmean(phases, high=pi, low=-pi)``: that
+    agrees on the circle to round-off, but wraps with
+    ``(x + pi) % (2 pi) - pi`` and so returns ``[-pi, pi)`` (a mean at ``+pi``
+    becomes ``-pi``) and carries ``ulp(pi)``-sized absolute error (a mean of
+    ``1e-20`` becomes ``0.0``). ``np.angle`` keeps ``(-pi, pi]`` and full
+    relative precision.
     """
     return float(np.angle(np.mean(np.exp(1j * phases))))
 
@@ -38,8 +75,9 @@ def circular_mean(phases: NDArray[np.floating]) -> float:
 def circular_std(phases: NDArray[np.floating]) -> float:
     """Compute the circular standard deviation of angles.
 
-    Uses the formula: std = sqrt(-2 * log(R)) where R is the mean resultant
-    length.
+    ``std = sqrt(-2 log R)`` with ``R`` the mean resultant length (Mardia &
+    Jupp, 2000), computed by ``scipy.stats.circstd`` (which also
+    clips ``R <= 1`` against round-off).
 
     Parameters
     ----------
@@ -50,12 +88,18 @@ def circular_std(phases: NDArray[np.floating]) -> float:
     -------
     std : float
         Circular standard deviation in radians.
+
+    Notes
+    -----
+    Delegates to ``scipy.stats.circstd(phases)`` (default ``low=0``,
+    ``high=2 pi``, ``normalize=False``: result in radians), except that
+    ``R`` is floored at ``1e-10``: the result is capped at
+    ``sqrt(-2 log 1e-10) ~ 6.79`` rather than growing to ``inf`` for
+    (numerically) uniform phases.
     """
-    R = mean_resultant_length(phases)
-    # Clamp R to valid range [0, 1] to avoid numerical issues
-    # (floating-point errors could cause R slightly > 1)
-    R = np.clip(R, 1e-10, 1.0)
-    return float(np.sqrt(-2 * np.log(R)))
+    with np.errstate(divide="ignore"):  # R == 0 -> inf, then capped below
+        std = stats.circstd(phases)
+    return float(np.minimum(std, _MAX_CIRCULAR_STD))
 
 
 def mean_resultant_length(phases: NDArray[np.floating]) -> float:
@@ -99,15 +143,24 @@ def rayleigh_test(phases: NDArray[np.floating]) -> tuple[float, float]:
     Notes
     -----
     The Rayleigh test is appropriate for unimodal alternatives to uniformity.
-    For the approximation used here, the p-value is:
-        p = exp(-n * R^2)
-    which is accurate for large n.
+    With ``z = n R^2`` the p-value is the second-order expansion (Greenwood &
+    Durand, 1955; Zar, 1999)::
 
-    For small samples (n < 50), uses the corrected p-value from Mardia & Jupp (2000).
+        p = exp(-z) * (1 + (2z - z^2) / (4n)
+                         - (24z - 132z^2 + 76z^3 - 9z^4) / (288 n^2))
+
+    clipped to ``[0, 1]``. It tends to the leading-order ``exp(-z)`` as
+    ``n -> inf`` and is applied at every ``n``: switching to ``exp(-z)``
+    above a cutoff would make the p-value jump there (by 14% at ``z = 6``
+    for a cutoff at ``n = 50``). SciPy has no Rayleigh test
+    (``scipy.stats.rayleigh`` is the Rayleigh distribution).
 
     References
     ----------
     Mardia, K. V., & Jupp, P. E. (2000). Directional Statistics. Wiley.
+    Greenwood, J. A. & Durand, D. (1955). The distribution of length and
+    components of the sum of n random unit vectors. Ann. Math. Statist. 26.
+    Zar, J. H. (1999). Biostatistical Analysis, 4th ed. Prentice Hall.
 
     Examples
     --------
@@ -125,14 +178,15 @@ def rayleigh_test(phases: NDArray[np.floating]) -> tuple[float, float]:
     R = mean_resultant_length(phases)
     z = n * R**2
 
-    # Rayleigh test p-value (asymptotic approximation)
-    p_value = float(np.exp(-z))
-
-    # More accurate approximation for small samples (Mardia & Jupp, 2000)
-    if n < 50:
-        p_value = float(np.exp(-z) * (1 + (2 * z - z**2) / (4 * n) -
-                        (24 * z - 132 * z**2 + 76 * z**3 - 9 * z**4) / (288 * n**2)))
-        p_value = max(0, min(1, p_value))  # Clip to [0, 1]
+    p_value = float(
+        np.exp(-z)
+        * (
+            1
+            + (2 * z - z**2) / (4 * n)
+            - (24 * z - 132 * z**2 + 76 * z**3 - 9 * z**4) / (288 * n**2)
+        )
+    )
+    p_value = max(0.0, min(1.0, p_value))  # Clip to [0, 1]
 
     return R, p_value
 
@@ -143,7 +197,7 @@ def circular_correlation(
 ) -> float:
     """Compute circular-circular correlation coefficient.
 
-    Uses the Fisher-Lee correlation coefficient for two circular variables.
+    Uses the Jammalamadaka-SenGupta circular correlation coefficient.
 
     Parameters
     ----------
@@ -159,14 +213,23 @@ def circular_correlation(
 
     Notes
     -----
-    The Fisher-Lee correlation is defined as:
+    The coefficient is defined as::
+
         r = sum(sin(a_i - a_bar) * sin(b_i - b_bar)) /
             sqrt(sum(sin(a_i - a_bar)^2) * sum(sin(b_i - b_bar)^2))
 
+    with ``a_bar``, ``b_bar`` the circular means (Jammalamadaka & Sarma, 1988;
+    Jammalamadaka & SenGupta, 2001; the ``circcorrcoef`` of
+    astropy / pycircstat). It is *not* the Fisher-Lee (1983) coefficient, which
+    is built from pairwise differences ``sin(a_i - a_j) sin(b_i - b_j)``.
+    SciPy has no circular correlation.
+
     References
     ----------
-    Fisher, N.I. and Lee, A.J. (1983). A correlation coefficient for circular data.
-    Biometrika, 70(2), 327-332.
+    Jammalamadaka, S. R. & Sarma, Y. R. (1988). A correlation coefficient for
+    angular variables. Statistical Theory and Data Analysis II, 349-364.
+    Jammalamadaka, S. R. & SenGupta, A. (2001). Topics in Circular Statistics.
+    World Scientific.
     """
     if len(phases1) != len(phases2):
         raise ValueError("phases1 and phases2 must have the same length")
@@ -179,7 +242,7 @@ def circular_correlation(
     sin_centered1 = np.sin(phases1 - mean1)
     sin_centered2 = np.sin(phases2 - mean2)
 
-    # Fisher-Lee correlation
+    # Jammalamadaka-SenGupta correlation
     numerator = np.sum(sin_centered1 * sin_centered2)
     denominator = np.sqrt(np.sum(sin_centered1**2) * np.sum(sin_centered2**2))
 

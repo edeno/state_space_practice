@@ -50,7 +50,8 @@ class TestCOMRecovery:
     """
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         data = simulate_com_scenario()
         p = data["params"]
 
@@ -97,7 +98,8 @@ class TestCNMRecovery:
     """
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         data = simulate_cnm_scenario()
         p = data["params"]
 
@@ -145,7 +147,8 @@ class TestDIMRecovery:
     """
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         data = simulate_dim_scenario()
         p = data["params"]
         n_osc = p["n_oscillators"]
@@ -195,7 +198,8 @@ class TestCOMPPRecovery:
     """
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         data = simulate_com_pp_scenario()
         p = data["params"]
 
@@ -247,7 +251,8 @@ class TestCNMPPRecovery:
     """
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         data = simulate_cnm_pp_scenario()
         p = data["params"]
 
@@ -316,7 +321,8 @@ class TestDIMPPRecovery:
     """
 
     @pytest.fixture(scope="class")
-    def fitted(self):
+    @classmethod
+    def fitted(cls):
         data = simulate_dim_pp_scenario()
         p = data["params"]
 

@@ -4,7 +4,7 @@ This module tests the switching point-process Kalman filter and smoother
 for spike-based observations with discrete state switching.
 """
 
-from typing import Callable
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -1859,7 +1859,6 @@ class TestSmootherIntegration:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_discrete_prob,
-            last_filter_conditional_cont_mean=last_pair_cond_mean[-1],
             process_cov=process_cov,
             continuous_transition_matrix=continuous_transition_matrix,
             discrete_state_transition_matrix=discrete_transition_matrix,
@@ -1940,7 +1939,6 @@ class TestSmootherIntegration:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_discrete_prob,
-            last_filter_conditional_cont_mean=last_pair_cond_mean[-1],
             process_cov=process_cov,
             continuous_transition_matrix=continuous_transition_matrix,
             discrete_state_transition_matrix=discrete_transition_matrix,
@@ -2029,7 +2027,6 @@ class TestSmootherIntegration:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_discrete_prob,
-            last_filter_conditional_cont_mean=last_pair_cond_mean[-1],
             process_cov=process_cov,
             continuous_transition_matrix=continuous_transition_matrix,
             discrete_state_transition_matrix=discrete_transition_matrix,
@@ -2137,7 +2134,6 @@ class TestSmootherIntegration:
             filter_mean=filter_mean,
             filter_cov=filter_cov,
             filter_discrete_state_prob=filter_discrete_prob,
-            last_filter_conditional_cont_mean=last_pair_cond_mean[-1],
             process_cov=process_cov,
             continuous_transition_matrix=continuous_transition_matrix,
             discrete_state_transition_matrix=discrete_transition_matrix,
@@ -2396,7 +2392,7 @@ class TestSingleNeuronGLMStep:
         baseline = 0.0
         weights = jnp.zeros(n_latent)
 
-        new_baseline, new_weights = _single_neuron_glm_step(
+        new_baseline, new_weights, _ = _single_neuron_glm_step(
             baseline, weights, y_n, smoother_mean, dt
         )
 
@@ -2423,7 +2419,7 @@ class TestSingleNeuronGLMStep:
         baseline = 0.0
         weights = jnp.ones(n_latent) * 0.1
 
-        new_baseline, new_weights = _single_neuron_glm_step(
+        new_baseline, new_weights, _ = _single_neuron_glm_step(
             baseline, weights, y_n, smoother_mean, dt
         )
 
@@ -2459,7 +2455,7 @@ class TestSingleNeuronGLMStep:
         loss_before = _single_neuron_glm_loss(baseline, weights, y_n, smoother_mean, dt)
 
         # Take Newton step
-        new_baseline, new_weights = _single_neuron_glm_step(
+        new_baseline, new_weights, _ = _single_neuron_glm_step(
             baseline, weights, y_n, smoother_mean, dt
         )
 
@@ -2498,7 +2494,7 @@ class TestSingleNeuronGLMStep:
 
         # Run multiple Newton iterations
         for _ in range(10):
-            baseline, weights = _single_neuron_glm_step(
+            baseline, weights, _ = _single_neuron_glm_step(
                 baseline, weights, y_n, smoother_mean, dt
             )
 
@@ -2530,7 +2526,7 @@ class TestSingleNeuronGLMStep:
         baseline = 0.0
         weights = jnp.ones(n_latent) * 0.1
 
-        new_baseline, new_weights = _single_neuron_glm_step(
+        new_baseline, new_weights, _ = _single_neuron_glm_step(
             baseline, weights, y_n, smoother_mean, dt
         )
 
@@ -2558,7 +2554,7 @@ class TestSingleNeuronGLMStep:
         baseline = 3.0
         weights = jnp.ones(n_latent) * 0.1
 
-        new_baseline, new_weights = _single_neuron_glm_step(
+        new_baseline, new_weights, _ = _single_neuron_glm_step(
             baseline, weights, y_n, smoother_mean, dt
         )
 
@@ -3178,6 +3174,300 @@ class TestUpdateSpikeGLMParamsSecondOrder:
             )
 
 
+class TestSecondOrderNewtonScan:
+    """The second-order updates run exactly ``max_iter`` per-neuron Newton steps.
+
+    Both public updates iterate a jitted ``lax.scan`` over vmapped per-neuron
+    steps; the reference here applies the per-neuron step ``max_iter`` times in
+    plain Python, so a wrong scan length, a dropped ``time_weights`` or a
+    mishandled ``baseline_prior`` default all show up as a mismatch.
+    """
+
+    @staticmethod
+    def _problem():
+        n_time, n_neurons, n_latent, n_states = 40, 3, 2, 2
+        keys = jax.random.split(jax.random.PRNGKey(7), 7)
+        smoother_mean = jax.random.normal(keys[0], (n_time, n_latent))
+        L = 0.3 * jax.random.normal(keys[1], (n_time, n_latent, n_latent))
+        smoother_cov = jnp.einsum("tij,tkj->tik", L, L) + 1e-3 * jnp.eye(n_latent)
+        spikes = jax.random.poisson(keys[2], 1.0, (n_time, n_neurons)).astype(float)
+        current = SpikeObsParams(
+            baseline=0.2 * jax.random.normal(keys[3], (n_neurons,)),
+            weights=0.3 * jax.random.normal(keys[4], (n_neurons, n_latent)),
+        )
+        time_weights = jax.random.uniform(keys[5], (n_time,))
+        state_weights = jax.random.dirichlet(keys[6], jnp.ones(n_states), (n_time,))
+        state_mean = jnp.stack([smoother_mean, 0.5 * smoother_mean], axis=-1)
+        state_cov = jnp.stack([smoother_cov, 2.0 * smoother_cov], axis=-1)
+        dt = 0.05
+        baseline_prior = jnp.log(jnp.mean(spikes, axis=0) / dt + 1e-10)
+        return dict(
+            spikes=spikes,
+            smoother_mean=smoother_mean,
+            smoother_cov=smoother_cov,
+            state_mean=state_mean,
+            state_cov=state_cov,
+            state_weights=state_weights,
+            current=current,
+            time_weights=time_weights,
+            dt=dt,
+            baseline_prior=baseline_prior,
+        )
+
+    @pytest.mark.parametrize("max_iter", [1, 3])
+    def test_second_order_update_equals_sequential_newton_steps(
+        self, max_iter: int
+    ) -> None:
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_step_second_order,
+            update_spike_glm_params,
+        )
+
+        pb = self._problem()
+        weight_l2, prior_l2 = 0.1, 0.5
+        updated = update_spike_glm_params(
+            spikes=pb["spikes"],
+            smoother_mean=pb["smoother_mean"],
+            current_params=pb["current"],
+            dt=pb["dt"],
+            max_iter=max_iter,
+            smoother_cov=pb["smoother_cov"],
+            use_second_order=True,
+            weight_l2=weight_l2,
+            time_weights=pb["time_weights"],
+            baseline_prior=pb["baseline_prior"],
+            baseline_prior_l2=prior_l2,
+        )
+
+        # Guard: the solve moved the parameters, so the equality is non-vacuous.
+        assert not jnp.allclose(updated.weights, pb["current"].weights)
+
+        for n in range(pb["spikes"].shape[1]):
+            b, w = pb["current"].baseline[n], pb["current"].weights[n]
+            for _ in range(max_iter):
+                b, w, _ = _single_neuron_glm_step_second_order(
+                    b,
+                    w,
+                    pb["spikes"][:, n],
+                    pb["smoother_mean"],
+                    pb["smoother_cov"],
+                    pb["dt"],
+                    pb["time_weights"],
+                    weight_l2,
+                    pb["baseline_prior"][n],
+                    prior_l2,
+                )
+            np.testing.assert_allclose(updated.baseline[n], b, rtol=1e-10, atol=1e-12)
+            np.testing.assert_allclose(updated.weights[n], w, rtol=1e-10, atol=1e-12)
+
+    def test_second_order_iteration_count_is_honored(self) -> None:
+        from state_space_practice.switching_point_process import (
+            update_spike_glm_params,
+        )
+
+        pb = self._problem()
+        results = [
+            update_spike_glm_params(
+                spikes=pb["spikes"],
+                smoother_mean=pb["smoother_mean"],
+                current_params=pb["current"],
+                dt=pb["dt"],
+                max_iter=max_iter,
+                smoother_cov=pb["smoother_cov"],
+                use_second_order=True,
+                weight_l2=0.1,
+            ).weights
+            for max_iter in (1, 3)
+        ]
+        assert not jnp.allclose(results[0], results[1], rtol=1e-8, atol=1e-8)
+
+    def test_second_order_none_prior_is_a_zero_centered_prior(self) -> None:
+        from state_space_practice.switching_point_process import (
+            update_spike_glm_params,
+        )
+
+        pb = self._problem()
+        n_neurons = pb["spikes"].shape[1]
+        common = dict(
+            spikes=pb["spikes"],
+            smoother_mean=pb["smoother_mean"],
+            current_params=pb["current"],
+            dt=pb["dt"],
+            max_iter=3,
+            smoother_cov=pb["smoother_cov"],
+            use_second_order=True,
+            weight_l2=0.1,
+            baseline_prior_l2=0.5,
+        )
+        no_prior = update_spike_glm_params(**common, baseline_prior=None)
+        zero_prior = update_spike_glm_params(
+            **common, baseline_prior=jnp.zeros(n_neurons)
+        )
+        empirical = update_spike_glm_params(
+            **common, baseline_prior=pb["baseline_prior"]
+        )
+        np.testing.assert_allclose(no_prior.baseline, zero_prior.baseline, rtol=1e-12)
+        np.testing.assert_allclose(no_prior.weights, zero_prior.weights, rtol=1e-12)
+        # Guard: the prior center matters, so the equality above is non-vacuous.
+        assert not jnp.allclose(no_prior.baseline, empirical.baseline)
+
+    @pytest.mark.parametrize("max_iter", [1, 4])
+    def test_mixture_update_equals_sequential_newton_steps(self, max_iter: int) -> None:
+        from state_space_practice.switching_point_process import (
+            _single_neuron_glm_step_second_order_mixture,
+            update_spike_glm_params_mixture,
+        )
+
+        pb = self._problem()
+        weight_l2, prior_l2 = 0.1, 0.5
+        updated = update_spike_glm_params_mixture(
+            spikes=pb["spikes"],
+            state_cond_smoother_mean=pb["state_mean"],
+            state_cond_smoother_cov=pb["state_cov"],
+            state_weights=pb["state_weights"],
+            current_params=pb["current"],
+            dt=pb["dt"],
+            max_iter=max_iter,
+            weight_l2=weight_l2,
+            baseline_prior=pb["baseline_prior"],
+            baseline_prior_l2=prior_l2,
+        )
+        assert not jnp.allclose(updated.weights, pb["current"].weights)
+
+        for n in range(pb["spikes"].shape[1]):
+            b, w = pb["current"].baseline[n], pb["current"].weights[n]
+            for _ in range(max_iter):
+                b, w, _ = _single_neuron_glm_step_second_order_mixture(
+                    b,
+                    w,
+                    pb["spikes"][:, n],
+                    pb["state_mean"],
+                    pb["state_cov"],
+                    pb["state_weights"],
+                    pb["dt"],
+                    weight_l2,
+                    pb["baseline_prior"][n],
+                    prior_l2,
+                )
+            np.testing.assert_allclose(updated.baseline[n], b, rtol=1e-10, atol=1e-12)
+            np.testing.assert_allclose(updated.weights[n], w, rtol=1e-10, atol=1e-12)
+
+    @staticmethod
+    def _run_update(pb: dict, method: str, current: SpikeObsParams, cast):
+        """Run one public GLM update, casting the data arrays."""
+        from state_space_practice.switching_point_process import (
+            update_spike_glm_params,
+            update_spike_glm_params_mixture,
+        )
+
+        if method == "plug_in":
+            return update_spike_glm_params(
+                spikes=cast(pb["spikes"]),
+                smoother_mean=cast(pb["smoother_mean"]),
+                current_params=current,
+                dt=pb["dt"],
+                max_iter=3,
+                weight_l2=0.1,
+                time_weights=cast(pb["time_weights"]),
+            )
+        if method == "second_order":
+            return update_spike_glm_params(
+                spikes=cast(pb["spikes"]),
+                smoother_mean=cast(pb["smoother_mean"]),
+                current_params=current,
+                dt=pb["dt"],
+                max_iter=3,
+                smoother_cov=cast(pb["smoother_cov"]),
+                use_second_order=True,
+                weight_l2=0.1,
+                time_weights=cast(pb["time_weights"]),
+                baseline_prior=cast(pb["baseline_prior"]),
+                baseline_prior_l2=0.5,
+            )
+        return update_spike_glm_params_mixture(
+            spikes=cast(pb["spikes"]),
+            state_cond_smoother_mean=cast(pb["state_mean"]),
+            state_cond_smoother_cov=cast(pb["state_cov"]),
+            state_weights=cast(pb["state_weights"]),
+            current_params=current,
+            dt=pb["dt"],
+            max_iter=3,
+            weight_l2=0.1,
+            baseline_prior=cast(pb["baseline_prior"]),
+            baseline_prior_l2=0.5,
+        )
+
+    @pytest.mark.parametrize("method", ["plug_in", "second_order", "mixture"])
+    @pytest.mark.parametrize("all_float32", [False, True])
+    def test_float32_params_keep_their_dtype(
+        self, method: str, all_float32: bool
+    ) -> None:
+        """float32 parameters under x64 run and come back as float32.
+
+        The Newton solver promotes to float64 internally; the scan carry must
+        still keep the parameters' dtype. The result matches the float64
+        update started from the same (float32-representable) values up to
+        float32 rounding of the per-iteration carry.
+        """
+        pb = self._problem()
+        to_f32 = lambda x: jnp.asarray(x, dtype=jnp.float32)  # noqa: E731
+        to_f64 = lambda x: jnp.asarray(x, dtype=jnp.float64)  # noqa: E731
+        # Round the data through float32 so both runs see identical values.
+        pb = {
+            k: (to_f64(to_f32(v)) if isinstance(v, jax.Array) else v)
+            for k, v in pb.items()
+        }
+        current_f32 = SpikeObsParams(
+            baseline=to_f32(pb["current"].baseline),
+            weights=to_f32(pb["current"].weights),
+        )
+        current_f64 = SpikeObsParams(
+            baseline=to_f64(current_f32.baseline),
+            weights=to_f64(current_f32.weights),
+        )
+
+        updated = self._run_update(
+            pb, method, current_f32, to_f32 if all_float32 else to_f64
+        )
+        reference = self._run_update(pb, method, current_f64, to_f64)
+
+        assert updated.baseline.dtype == jnp.float32
+        assert updated.weights.dtype == jnp.float32
+        # Guard: the solve moved the parameters, so the match is non-vacuous.
+        assert not jnp.allclose(reference.weights, current_f64.weights)
+        np.testing.assert_allclose(
+            updated.baseline, reference.baseline, rtol=1e-4, atol=1e-5
+        )
+        np.testing.assert_allclose(
+            updated.weights, reference.weights, rtol=1e-4, atol=1e-5
+        )
+
+    @pytest.mark.parametrize("method", ["second_order", "mixture"])
+    def test_integer_params_are_promoted_not_truncated(self, method: str) -> None:
+        """Integer initial parameters give the float64 update, not a
+        truncated one: the carry dtype is fixed only after promoting ints."""
+        pb = self._problem()
+        to_f64 = lambda x: jnp.asarray(x, dtype=jnp.float64)  # noqa: E731
+        current_int = SpikeObsParams(
+            baseline=jnp.zeros_like(pb["current"].baseline, dtype=jnp.int32),
+            weights=jnp.zeros_like(pb["current"].weights, dtype=jnp.int32),
+        )
+        current_f64 = SpikeObsParams(
+            baseline=to_f64(current_int.baseline),
+            weights=to_f64(current_int.weights),
+        )
+
+        updated = self._run_update(pb, method, current_int, to_f64)
+        reference = self._run_update(pb, method, current_f64, to_f64)
+
+        assert jnp.issubdtype(updated.baseline.dtype, jnp.floating)
+        # Guard: the float update moves off the integer lattice, so a
+        # truncating carry could not reproduce it.
+        assert not np.allclose(reference.baseline, np.round(reference.baseline))
+        np.testing.assert_allclose(updated.baseline, reference.baseline, rtol=1e-12)
+        np.testing.assert_allclose(updated.weights, reference.weights, rtol=1e-12)
+
+
 class TestSecondOrderClippedWarmStart:
     """Newton M-step must converge from warm starts with a large log-rate.
 
@@ -3207,7 +3497,7 @@ class TestSecondOrderClippedWarmStart:
         baseline = jnp.asarray(25.0)
         weights = jnp.zeros((1,))
         for _ in range(60):
-            baseline, weights = _single_neuron_glm_step_second_order(
+            baseline, weights, _ = _single_neuron_glm_step_second_order(
                 baseline, weights, y_n, smoother_mean, smoother_cov, dt
             )
 
@@ -3230,7 +3520,7 @@ class TestSecondOrderClippedWarmStart:
         baseline = jnp.asarray(25.0)
         weights = jnp.zeros((1,))
         for _ in range(60):
-            baseline, weights = _single_neuron_glm_step_second_order_mixture(
+            baseline, weights, _ = _single_neuron_glm_step_second_order_mixture(
                 baseline,
                 weights,
                 y_n,
@@ -3430,7 +3720,6 @@ class TestDynamicsMStepReuse:
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            last_pair_cond_filter_mean[-1],
             process_cov,
             continuous_transition_matrix,
             discrete_transition_matrix,
@@ -3458,7 +3747,14 @@ class TestDynamicsMStepReuse:
             pair_cond_smoother_means=pair_cond_smoother_means,
         )
 
-        # This should run without error - that's the main test
+        # The dynamics estimates must be valid parameters: a row-stochastic
+        # discrete transition matrix and a PSD process covariance per state.
+        np.testing.assert_allclose(
+            new_discrete_transition_matrix.sum(axis=1), 1.0, atol=1e-10
+        )
+        assert jnp.all(new_discrete_transition_matrix >= 0.0)
+        for j in range(n_discrete_states):
+            assert jnp.linalg.eigvalsh(new_process_cov[..., j]).min() > -1e-10
 
     def test_dynamics_mstep_returns_correct_shapes(self) -> None:
         """Dynamics M-step returns should have correct shapes for dynamics parameters.
@@ -3553,7 +3849,6 @@ class TestDynamicsMStepReuse:
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            last_pair_cond_filter_mean[-1],
             process_cov,
             continuous_transition_matrix,
             discrete_transition_matrix,
@@ -3671,7 +3966,6 @@ class TestDynamicsMStepReuse:
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            last_pair_cond_filter_mean[-1],
             process_cov,
             continuous_transition_matrix,
             discrete_transition_matrix,
@@ -3778,7 +4072,6 @@ class TestDynamicsMStepReuse:
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            last_pair_cond_filter_mean[-1],
             process_cov,
             continuous_transition_matrix,
             discrete_transition_matrix,
@@ -3899,7 +4192,6 @@ class TestDynamicsMStepReuse:
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_state_prob,
-            last_pair_cond_filter_mean[-1],
             process_cov,
             continuous_transition_matrix,
             discrete_transition_matrix,
@@ -4268,7 +4560,16 @@ class TestSwitchingSpikeOscillatorModelInitializeParameters:
         )
 
         key = jax.random.PRNGKey(42)
-        model._initialize_parameters(key)  # Should not raise
+        model._initialize_parameters(key)
+
+        # The initial parameters must already be valid: row-stochastic Z,
+        # a normalized initial discrete distribution and PSD per-state Q.
+        np.testing.assert_allclose(
+            model.discrete_transition_matrix.sum(axis=1), 1.0, atol=1e-10
+        )
+        np.testing.assert_allclose(model.init_discrete_state_prob.sum(), 1.0)
+        for j in range(model.n_discrete_states):
+            assert jnp.linalg.eigvalsh(model.process_cov[..., j]).min() > 0.0
 
     def test_initialize_parameters_sets_init_mean(self) -> None:
         """_initialize_parameters should set init_mean with correct shape."""
@@ -5062,8 +5363,14 @@ class TestSwitchingSpikeOscillatorModelMStepDynamics:
         # Run E-step first (required before M-step)
         model._e_step(spikes)
 
-        # M-step dynamics should not raise
         model._m_step_dynamics()
+
+        # Post-condition: the updated dynamics are still valid parameters.
+        np.testing.assert_allclose(
+            model.discrete_transition_matrix.sum(axis=1), 1.0, atol=1e-10
+        )
+        for j in range(model.n_discrete_states):
+            assert jnp.linalg.eigvalsh(model.process_cov[..., j]).min() > 0.0
 
     def test_m_step_dynamics_updates_continuous_transition_matrix(self) -> None:
         """_m_step_dynamics should update continuous_transition_matrix when flag is True."""
@@ -5602,9 +5909,16 @@ class TestSwitchingSpikeOscillatorModelMStepSpikes:
 
         # Run E-step first (required before M-step)
         model._e_step(spikes)
+        weights_before = model.spike_params.weights
 
-        # M-step spikes should not raise
         model._m_step_spikes(spikes)
+
+        # update_spike_params defaults to True: the GLM weights must move and
+        # stay finite.
+        assert model.update_spike_params
+        assert jnp.all(jnp.isfinite(model.spike_params.weights))
+        assert jnp.all(jnp.isfinite(model.spike_params.baseline))
+        assert not jnp.allclose(model.spike_params.weights, weights_before)
 
     def test_m_step_spikes_updates_spike_params_when_enabled(self) -> None:
         """_m_step_spikes should update spike_params when flag is True."""
@@ -5977,6 +6291,44 @@ class TestSwitchingSpikeOscillatorModelFit:
 
         assert len(log_likelihoods) == 2
         assert log_likelihoods[-1] == pytest.approx(fresh_ll)
+
+    @pytest.mark.slow
+    def test_fit_converging_on_last_iteration_has_no_duplicate_final_ll(
+        self,
+    ) -> None:
+        """Converging on iteration ``max_iter`` is convergence, not exhaustion.
+
+        No M-step follows a converged E-step, so re-running the E-step would
+        only re-evaluate the same parameters. The history must hold one LL per
+        E-step (``max_iter`` entries), not a duplicated final LL. A huge
+        ``tol`` / ``decrease_tol`` forces convergence exactly on the second
+        (= last) iteration.
+        """
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        spikes = jax.random.poisson(jax.random.PRNGKey(0), 0.05, shape=(20, 2)).astype(
+            float
+        )
+        model = SwitchingSpikeOscillatorModel(
+            n_oscillators=1,
+            n_neurons=2,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            separate_spike_params=False,
+        )
+
+        log_likelihoods = model.fit(
+            spikes, max_iter=2, tol=10.0, decrease_tol=10.0, key=jax.random.PRNGKey(42)
+        )
+
+        assert len(log_likelihoods) == 2
+        # Guard: the one M-step changed the parameters, so the two entries are
+        # distinct E-steps rather than a re-evaluation of the same point.
+        assert log_likelihoods[0] != log_likelihoods[1]
+        assert log_likelihoods[-1] == pytest.approx(float(model._e_step(spikes)))
 
     def test_fit_rolls_back_bad_final_m_step(self, monkeypatch) -> None:
         """A final E-step LL decrease should restore the pre-M-step parameters."""
@@ -6621,8 +6973,17 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
 
         model._initialize_parameters(jax.random.PRNGKey(0))
 
-        # Should not raise any exceptions
         model._project_parameters()
+        A_once = model.continuous_transition_matrix
+        Q_once = model.process_cov
+
+        # A projection is idempotent: projecting already-valid parameters
+        # again must leave them unchanged.
+        model._project_parameters()
+        np.testing.assert_allclose(
+            model.continuous_transition_matrix, A_once, rtol=1e-10, atol=1e-12
+        )
+        np.testing.assert_allclose(model.process_cov, Q_once, rtol=1e-10, atol=1e-12)
 
     def test_project_parameters_ensures_psd_process_cov(self) -> None:
         """_project_parameters() should ensure process covariance is PSD."""
@@ -7000,6 +7361,58 @@ class TestSwitchingSpikeOscillatorModelProjectParameters:
                     ]
                     np.testing.assert_allclose(block[0, 0], block[1, 1], atol=1e-6)
                     np.testing.assert_allclose(block[0, 1], -block[1, 0], atol=1e-6)
+
+    @pytest.mark.parametrize("max_spectral_radius", [None, 0.7])
+    def test_project_parameters_clamps_to_max_spectral_radius(
+        self, max_spectral_radius
+    ) -> None:
+        """The spectral clamp uses the configured bound (0.999 by default)."""
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        kwargs = dict(
+            n_oscillators=2,
+            n_neurons=3,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+        )
+        if max_spectral_radius is not None:
+            kwargs["max_spectral_radius"] = max_spectral_radius
+        model = SwitchingSpikeOscillatorModel(**kwargs)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+
+        # 1.5 * I is already in the scaled-rotation family, so only the clamp
+        # acts: every state lands exactly on the bound.
+        n_latent = 2 * model.n_oscillators
+        model.continuous_transition_matrix = jnp.stack(
+            [jnp.eye(n_latent) * 1.5] * model.n_discrete_states, axis=-1
+        )
+        model._project_parameters()
+
+        expected = 0.999 if max_spectral_radius is None else max_spectral_radius
+        assert model.max_spectral_radius == expected
+        for j in range(model.n_discrete_states):
+            A_j = model.continuous_transition_matrix[:, :, j]
+            radius = float(jnp.max(jnp.abs(jnp.linalg.eigvals(A_j))))
+            np.testing.assert_allclose(radius, expected, rtol=1e-6)
+
+    @pytest.mark.parametrize("bad_radius", [0.0, 1.0, 1.5])
+    def test_rejects_invalid_max_spectral_radius(self, bad_radius) -> None:
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        with pytest.raises(ValueError, match="max_spectral_radius must lie in"):
+            SwitchingSpikeOscillatorModel(
+                n_oscillators=2,
+                n_neurons=3,
+                n_discrete_states=2,
+                sampling_freq=100.0,
+                dt=0.01,
+                max_spectral_radius=bad_radius,
+            )
 
 
 class TestSwitchingSpikeOscillatorModelEndToEnd:
@@ -7398,8 +7811,8 @@ class TestSwitchingSpikeOscillatorModelEndToEnd:
             assert log_likelihoods[-1] >= log_likelihoods[0]
 
 
-class TestMilestone8EndToEnd:
-    """Milestone 8: End-to-End Tests for full pipeline validation.
+class TestSwitchingSpikeOscillatorFitValidation:
+    """End-to-end validation of the switching spike oscillator fit.
 
     These tests comprehensively validate the switching spike oscillator model:
     - EM per-iteration monotonicity (with Laplace approximation tolerance)
@@ -7407,12 +7820,13 @@ class TestMilestone8EndToEnd:
     - Comparison to non-switching baseline
     - Gaussian mixture collapse correctness
 
-    Note: These tests build on Task 7.8 tests but with stricter validation.
+    They extend ``TestSwitchingSpikeOscillatorModelEndToEnd`` with stricter
+    validation.
     """
 
     @pytest.mark.slow
     def test_switching_spike_oscillator_em_monotonic(self) -> None:
-        """Task 8.1: EM convergence properties with Laplace approximation.
+        """EM convergence properties with Laplace approximation.
 
         Tests the EM algorithm's convergence behavior for the switching spike
         oscillator model. Due to the Laplace approximation used for point-process
@@ -7539,7 +7953,7 @@ class TestMilestone8EndToEnd:
 
     @pytest.mark.slow
     def test_switching_spike_oscillator_recovers_parameters(self) -> None:
-        """Task 8.2: Model should recover parameters from simulated data.
+        """Model should recover parameters from simulated data.
 
         Tests comprehensive parameter recovery including:
         1. Discrete transition matrix structure (high self-transition)
@@ -7716,7 +8130,7 @@ class TestMilestone8EndToEnd:
         #    the smoother has very little information to infer latent states
         # 2. The fitted model's latent space may be rotated/sign-flipped relative to
         #    the generative model (latent space is not identifiable)
-        # 3. Task 8.2 focuses on PARAMETER recovery, not STATE recovery
+        # 3. this test targets on PARAMETER recovery, not STATE recovery
         #
         # Instead, we verify the smoother outputs are well-formed:
         smoother_mean = jnp.einsum(
@@ -7830,7 +8244,7 @@ class TestMilestone8EndToEnd:
         assert jnp.all(Z_fitted >= 0), "Transition probs should be non-negative"
 
     def test_switching_spike_oscillator_vs_non_switching(self) -> None:
-        """Task 8.3: Switching model with S=1 should behave like non-switching model.
+        """Switching model with S=1 should behave like non-switching model.
 
         Tests that when n_discrete_states=1, the SwitchingSpikeOscillatorModel
         produces similar smoothed means as the non-switching PointProcessModel.
@@ -8014,7 +8428,7 @@ class TestMilestone8EndToEnd:
         )
 
     def test_collapse_to_state_conditional(self) -> None:
-        """Task 8.4: Verify Gaussian mixture collapse math is correct.
+        """Verify Gaussian mixture collapse math is correct.
 
         Tests that `collapse_gaussian_mixture_per_discrete_state` correctly
         computes state-conditional moments from pair-conditional moments.
@@ -8848,11 +9262,11 @@ class TestEMVerification:
         3. The filter doesn't corrupt the state when initialized at truth
         4. The smoother preserves the filter output when state is fixed
         """
+        from state_space_practice.switching_kalman import switching_kalman_smoother
         from state_space_practice.switching_point_process import (
             SpikeObsParams,
             switching_point_process_filter,
         )
-        from state_space_practice.switching_kalman import switching_kalman_smoother
 
         n_time, n_neurons, n_latent, dt = 1000, 4, 2, 0.01
 
@@ -8925,7 +9339,6 @@ class TestEMVerification:
             filter_mean=fm,
             filter_cov=fc,
             filter_discrete_state_prob=fp,
-            last_filter_conditional_cont_mean=lpm[-1],
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=jnp.array([[1.0]]),
@@ -8946,11 +9359,11 @@ class TestEMVerification:
         discrete state probability updates, likelihood scaling, and
         log-likelihood accumulation.
         """
+        from state_space_practice.switching_kalman import switching_kalman_smoother
         from state_space_practice.switching_point_process import (
             SpikeObsParams,
             switching_point_process_filter,
         )
-        from state_space_practice.switching_kalman import switching_kalman_smoother
 
         n_time, n_neurons, n_latent, dt = 500, 4, 2, 0.01
 
@@ -9044,7 +9457,6 @@ class TestEMVerification:
             filter_mean=fm,
             filter_cov=fc,
             filter_discrete_state_prob=fp,
-            last_filter_conditional_cont_mean=lpm[-1],
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
@@ -9098,7 +9510,6 @@ class TestGPB2Smoother:
             filter_mean=fm,
             filter_cov=fc,
             filter_discrete_state_prob=fp,
-            last_filter_conditional_cont_mean=pcm[-1],
             process_cov=Q,
             continuous_transition_matrix=A,
             discrete_state_transition_matrix=Z,
@@ -9398,6 +9809,64 @@ class TestSwitchingSpikeOscillatorSGD:
         assert expected_penalty > 1.0
         assert delta == pytest.approx(expected_penalty, rel=1e-5)
 
+    @staticmethod
+    def _bounded_model(max_spectral_radius: float):
+        from state_space_practice.switching_point_process import (
+            SwitchingSpikeOscillatorModel,
+        )
+
+        return SwitchingSpikeOscillatorModel(
+            n_oscillators=2,
+            n_neurons=4,
+            n_discrete_states=2,
+            sampling_freq=100.0,
+            dt=0.01,
+            max_spectral_radius=max_spectral_radius,
+        )
+
+    @staticmethod
+    def _state_radii(transition_matrix) -> np.ndarray:
+        from state_space_practice.utils import spectral_radius
+
+        return np.array(
+            [
+                float(spectral_radius(transition_matrix[..., j]))
+                for j in range(transition_matrix.shape[-1])
+            ]
+        )
+
+    def test_sgd_store_respects_non_default_spectral_radius(self):
+        """_store_sgd_params projects A onto a non-default max_spectral_radius."""
+        bound = 0.93
+        model = self._bounded_model(bound)
+        model._initialize_parameters(jax.random.PRNGKey(0))
+        params, _ = model._build_param_spec()
+
+        # Guard: the unprojected SGD transition matrix violates the bound
+        # (the initial damping runs 0.90 -> 0.98 across states), so the
+        # assertion below is non-vacuous.
+        raw_radii = self._state_radii(model._reconstruct_A_from_blocks(params))
+        assert raw_radii.max() > bound + 1e-3
+
+        model._store_sgd_params(params)
+
+        radii = self._state_radii(model.continuous_transition_matrix)
+        assert np.all(radii <= bound + 1e-9)
+        # The violating state is clamped onto the bound; the stable one is kept.
+        np.testing.assert_allclose(radii, np.minimum(raw_radii, bound), atol=1e-9)
+
+    @pytest.mark.slow
+    def test_fit_sgd_respects_non_default_spectral_radius(self):
+        bound = 0.93
+        model = self._bounded_model(bound)
+        key = jax.random.PRNGKey(42)
+        spikes = jax.random.poisson(key, jnp.ones((100, 4)) * 0.01)
+        model.fit_sgd(spikes, key=key, num_steps=3)
+
+        radii = self._state_radii(model.continuous_transition_matrix)
+        assert np.all(np.isfinite(radii))
+        assert np.all(radii <= bound + 1e-9)
+
 
 class TestSwitchingSpikeOscillatorEMConsistency:
     """Regression guards for the EM cache-identity and rollback-resync fixes."""
@@ -9489,7 +9958,7 @@ class TestSwitchingSpikeOscillatorEMConsistency:
             model.fit(spikes, max_iter=5, key=jax.random.PRNGKey(42))
 
         # Guard: the rollback path must have executed (else the test is vacuous).
-        assert "rolled back" in caplog.text
+        assert "rolling back" in caplog.text
 
         # The stored smoother must equal a fresh E-step under the returned params.
         # (The two rolled-back iterations use distinct params, so a stale smoother
@@ -9498,3 +9967,418 @@ class TestSwitchingSpikeOscillatorEMConsistency:
         real_e_step(spikes)  # recompute under the returned (restored) params
         resynced_mean = np.asarray(model.smoother_state_cond_mean)
         np.testing.assert_allclose(post_fit_mean, resynced_mean, rtol=1e-10, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Newton ridge / fallback, occupancy gate, default dtype
+# ---------------------------------------------------------------------------
+
+
+def test_separate_spike_glm_keeps_params_of_near_empty_state(caplog) -> None:
+    """A state with expected occupancy 1e-7 keeps its spike GLM parameters and
+    warns; the occupied state is still refit."""
+    from state_space_practice.switching_point_process import (
+        SwitchingSpikeOscillatorModel,
+    )
+
+    model = SwitchingSpikeOscillatorModel(
+        n_oscillators=1,
+        n_neurons=3,
+        n_discrete_states=2,
+        sampling_freq=100.0,
+        dt=0.01,
+        separate_spike_params=True,
+    )
+    model._initialize_parameters(jax.random.PRNGKey(0))
+    rng = np.random.default_rng(2)
+    n_time = 300
+    means = rng.normal(size=(n_time, 2))
+    model.smoother_state_cond_mean = jnp.asarray(np.stack([means, means], axis=-1))
+    model.smoother_state_cond_cov = jnp.broadcast_to(
+        0.1 * jnp.eye(2)[None, :, :, None], (n_time, 2, 2, 2)
+    )
+    prob = jnp.stack(
+        [jnp.ones(n_time) - 1e-7 / n_time, jnp.full(n_time, 1e-7 / n_time)], axis=-1
+    )
+    model.smoother_discrete_state_prob = prob
+    spikes = jnp.asarray(rng.poisson(np.exp(2.0 + means[:, :1]) * 0.01, (n_time, 3)))
+    before = model.spike_params
+
+    with caplog.at_level("WARNING"):
+        model._m_step_spikes(spikes)
+    assert "discrete state(s) [1] have expected occupancy" in caplog.text
+
+    np.testing.assert_array_equal(
+        np.asarray(model.spike_params.baseline[:, 1]),
+        np.asarray(before.baseline[:, 1]),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(model.spike_params.weights[..., 1]),
+        np.asarray(before.weights[..., 1]),
+    )
+    assert not np.allclose(
+        np.asarray(model.spike_params.baseline[:, 0]),
+        np.asarray(before.baseline[:, 0]),
+    )
+
+
+def test_ridged_newton_direction_uses_one_relative_ridge_policy() -> None:
+    """Every GLM Newton solve adds 1e-4 * max(max|diag H|, 1) (relative for a
+    large Hessian) and solves by Cholesky."""
+    from state_space_practice.switching_point_process import (
+        _ridged_newton_direction,
+    )
+
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(50, 3))
+    for scale in (1e-3, 1e6):
+        hess = scale * X.T @ X
+        grad = rng.normal(size=3)
+        ridge = 1e-4 * max(np.max(np.abs(np.diag(hess))), 1.0)
+        expected = np.linalg.solve(hess + ridge * np.eye(3), grad)
+        np.testing.assert_allclose(
+            _ridged_newton_direction(jnp.asarray(hess), jnp.asarray(grad)),
+            expected,
+            rtol=1e-10,
+        )
+
+
+def test_descent_step_falls_back_to_gradient_for_non_descent_direction() -> None:
+    """g^T delta <= 0 (or a NaN direction) no longer yields a silent alpha = 0:
+    the step moves along -g and decreases the loss."""
+    from state_space_practice.switching_point_process import _descent_step
+
+    def loss_fn(p):
+        return jnp.sum((p - 1.0) ** 2)
+
+    params = jnp.array([0.0, 0.0])
+    grad = jax.grad(loss_fn)(params)
+    for bad_delta in (-grad, jnp.array([jnp.nan, 0.0])):
+        new_params, fell_back = _descent_step(
+            params, bad_delta, grad, loss_fn, loss_fn(params)
+        )
+        assert bool(fell_back)
+        assert float(loss_fn(new_params)) < float(loss_fn(params))
+
+    new_params, fell_back = _descent_step(params, grad, grad, loss_fn, loss_fn(params))
+    assert not bool(fell_back)
+    # Stationary point: nothing to do, and not counted as a fallback.
+    _, fell_back_zero = _descent_step(
+        jnp.ones(2), jnp.zeros(2), jnp.zeros(2), loss_fn, jnp.array(0.0)
+    )
+    assert not bool(fell_back_zero)
+    # Overflowing objective: a non-finite gradient is no usable direction, so
+    # it is neither redirected nor counted (the NaN still fails loud).
+    _, fell_back_inf = _descent_step(
+        params,
+        jnp.array([jnp.nan, 0.0]),
+        jnp.array([jnp.inf, 1.0]),
+        loss_fn,
+        loss_fn(params),
+    )
+    assert not bool(fell_back_inf)
+
+
+def test_spike_glm_update_warns_on_newton_fallback(monkeypatch) -> None:
+    """The per-neuron fallbacks are aggregated into one host-side warning, and
+    the update still improves the objective instead of freezing."""
+    import state_space_practice.switching_point_process as spp
+
+    rng = np.random.default_rng(1)
+    n_time, n_latent, n_neurons = 200, 2, 3
+    smoother_mean = jnp.asarray(rng.normal(size=(n_time, n_latent)))
+    true_w = rng.normal(size=(n_neurons, n_latent))
+    rates = np.exp(1.0 + smoother_mean @ true_w.T) * 0.01
+    spikes = jnp.asarray(rng.poisson(rates))
+    params0 = SpikeObsParams(
+        baseline=jnp.zeros(n_neurons), weights=jnp.zeros((n_neurons, n_latent))
+    )
+    # Corrupt the Newton direction so it points uphill.
+    monkeypatch.setattr(spp, "_ridged_newton_direction", lambda hess, grad: -grad)
+    from state_space_practice.exceptions import StateSpaceWarning
+
+    with pytest.warns(StateSpaceWarning, match="fell back to the gradient direction"):
+        updated = spp.update_spike_glm_params(
+            spikes, smoother_mean, params0, dt=0.01, max_iter=3
+        )
+    assert float(jnp.max(jnp.abs(updated.baseline - params0.baseline))) > 0.0
+
+
+@jax.custom_jvp
+def _sign_flipped_switching_log_rate(state: Array, params: SpikeObsParams) -> Array:
+    """Linear log-rate whose state derivative has the wrong sign, so every
+    Fisher step points uphill and each line search is exhausted."""
+    return params.baseline + params.weights @ state
+
+
+@_sign_flipped_switching_log_rate.defjvp
+def _sign_flipped_switching_log_rate_jvp(primals, tangents):
+    state, params = primals
+    d_state, _ = tangents
+    return (
+        params.baseline + params.weights @ state,
+        -(params.weights @ d_state),
+    )
+
+
+def test_switching_filter_reports_line_search_failures(caplog) -> None:
+    """The (jitted) switching filter logs when most bins exhaust the line
+    search, and stays silent for a well-posed intensity on the same data."""
+    from state_space_practice.switching_point_process import (
+        _linear_log_intensity,
+        switching_point_process_filter,
+    )
+
+    rng = np.random.default_rng(0)
+    n_time, n_latent, n_neurons, n_disc = 30, 2, 3, 2
+    params = SpikeObsParams(
+        baseline=jnp.full(n_neurons, 3.0),
+        weights=jnp.asarray(rng.normal(size=(n_neurons, n_latent))),
+    )
+    spikes = jnp.asarray(rng.poisson(2.0, size=(n_time, n_neurons))).astype(float)
+
+    def run(log_rate):
+        return switching_point_process_filter(
+            jnp.zeros((n_latent, n_disc)),
+            jnp.stack([jnp.eye(n_latent)] * n_disc, axis=-1),
+            jnp.full(n_disc, 1.0 / n_disc),
+            spikes,
+            jnp.array([[0.9, 0.1], [0.1, 0.9]]),
+            jnp.stack([0.9 * jnp.eye(n_latent)] * n_disc, axis=-1),
+            jnp.stack([0.1 * jnp.eye(n_latent)] * n_disc, axis=-1),
+            0.1,
+            log_rate,
+            params,
+            max_newton_iter=3,
+        )
+
+    logger_name = "state_space_practice.point_process_kalman"
+    with caplog.at_level("WARNING", logger=logger_name):
+        run(_sign_flipped_switching_log_rate)
+    assert "switching_point_process_filter: the Fisher-scoring line search" in (
+        caplog.text
+    )
+    caplog.clear()
+    with caplog.at_level("WARNING", logger=logger_name):
+        run(_linear_log_intensity)
+    assert "line search" not in caplog.text
+
+
+def test_spike_oscillator_default_transition_diag_uses_default_float() -> None:
+    from state_space_practice.switching_point_process import (
+        SwitchingSpikeOscillatorModel,
+    )
+
+    model = SwitchingSpikeOscillatorModel(
+        n_oscillators=1, n_neurons=2, n_discrete_states=2, sampling_freq=100.0, dt=0.01
+    )
+    diag = model._default_discrete_transition_diag()
+    assert diag.dtype == jnp.result_type(float)  # float64 under x64, not float32
+    np.testing.assert_array_equal(np.asarray(diag), 0.95)
+
+
+# ============================================================================
+# M-step exactness for the spike-oscillator model
+# ============================================================================
+
+
+def _expected_poisson_objective(
+    b, w, spikes_n, means, covs, weights, dt, weight_l2, b_prior=0.0, b_prior_l2=0.0
+):
+    """Expected Poisson log-likelihood of one neuron under Gaussian posteriors.
+
+    ``sum_{t,j} weights_tj [y_t (b + w.m_tj) - dt exp(b + w.m_tj + w'P_tj w / 2)]``
+    minus the ridge penalties.  ``means`` (T, n, S), ``covs`` (T, n, n, S) and
+    ``weights`` (T, S); a single-state GLM passes S = 1.  Written from the
+    definition (Gaussian moment generating function), independently of the
+    library's Newton step.
+    """
+    lin = b + jnp.einsum("tkj,k->tj", means, w)
+    quad = 0.5 * jnp.einsum("tklj,k,l->tj", covs, w, w)
+    ll = jnp.sum(weights * (spikes_n[:, None] * lin - dt * jnp.exp(lin + quad)))
+    return ll - 0.5 * weight_l2 * jnp.sum(w**2) - 0.5 * b_prior_l2 * (b - b_prior) ** 2
+
+
+def _spike_oscillator_em_problem(separate_spike_params: bool = True, **kwargs):
+    """One E-step of SwitchingSpikeOscillatorModel on simulated switching data."""
+    from state_space_practice.oscillator_utils import (
+        construct_common_oscillator_transition_matrix,
+    )
+    from state_space_practice.simulate.simulate_switching_spikes import (
+        simulate_switching_spike_oscillator,
+    )
+    from state_space_practice.switching_point_process import (
+        QRegularizationConfig,
+        SwitchingSpikeOscillatorModel,
+    )
+
+    A = jnp.stack(
+        [
+            construct_common_oscillator_transition_matrix(
+                freqs=jnp.array([8.0]),
+                damping_coef=jnp.array([d]),
+                sampling_freq=100.0,
+            )
+            for d in (0.97, 0.85)
+        ],
+        axis=-1,
+    )
+    Q = jnp.stack([0.05 * jnp.eye(2), 0.02 * jnp.eye(2)], axis=-1)
+    weights = jax.random.normal(jax.random.PRNGKey(3), (6, 2)) * 0.8
+    spikes, _, _ = simulate_switching_spike_oscillator(
+        n_time=400,
+        transition_matrices=A,
+        process_covs=Q,
+        discrete_transition_matrix=jnp.array([[0.98, 0.02], [0.02, 0.98]]),
+        spike_weights=weights,
+        spike_baseline=jnp.full(6, 3.0),
+        dt=0.01,
+        key=jax.random.PRNGKey(11),
+    )
+    model = SwitchingSpikeOscillatorModel(
+        n_oscillators=1,
+        n_neurons=6,
+        n_discrete_states=2,
+        sampling_freq=100.0,
+        dt=0.01,
+        separate_spike_params=separate_spike_params,
+        smoother_type="gpb2",
+        q_regularization=QRegularizationConfig(enabled=False),
+        spike_weight_l2=1.0,
+        **kwargs,
+    )
+    model._initialize_parameters(jax.random.PRNGKey(0))
+    model.spike_params = SpikeObsParams(
+        baseline=model.spike_params.baseline + 2.5,
+        weights=model.spike_params.weights,
+    )
+    model._e_step(spikes)
+    return model, spikes
+
+
+@pytest.mark.slow
+class TestSpikeOscillatorMStepStationarity:
+    """The spike-GLM and dynamics M-steps land on stationary points of the
+    expected complete-data objective (written out in the test)."""
+
+    @pytest.mark.parametrize("separate_spike_params", [True, False])
+    def test_spike_glm_update_is_stationary(self, separate_spike_params):
+        from state_space_practice.tests import recovery_helpers as rh
+
+        model, spikes = _spike_oscillator_em_problem(separate_spike_params)
+        before = model.spike_params
+        model._m_step_spikes(spikes)
+        after = model.spike_params
+        means = model.smoother_state_cond_mean
+        covs = model.smoother_state_cond_cov
+        probs = model.smoother_discrete_state_prob
+
+        def objective(params, n, j):
+            b, w = params[0], jnp.asarray(params[1:])
+            if separate_spike_params:
+                return _expected_poisson_objective(
+                    b,
+                    w,
+                    spikes[:, n],
+                    means[..., j : j + 1],
+                    covs[..., j : j + 1],
+                    probs[:, j : j + 1],
+                    model.dt,
+                    model.spike_weight_l2,
+                )
+            return _expected_poisson_objective(
+                b, w, spikes[:, n], means, covs, probs, model.dt, model.spike_weight_l2
+            )
+
+        def flat(params, n, j):
+            if separate_spike_params:
+                return np.r_[params.baseline[n, j], np.asarray(params.weights[n, :, j])]
+            return np.r_[params.baseline[n], np.asarray(params.weights[n])]
+
+        states = range(2) if separate_spike_params else [None]
+        for j in states:
+            for n in range(spikes.shape[1]):
+                grad_after = rh.central_difference_gradient(
+                    lambda p, n=n, j=j: objective(p, n, j), flat(after, n, j), 1e-6
+                )
+                grad_before = rh.central_difference_gradient(
+                    lambda p, n=n, j=j: objective(p, n, j), flat(before, n, j), 1e-6
+                )
+                assert np.max(np.abs(grad_before)) > 1.0, (n, j, grad_before)
+                assert np.max(np.abs(grad_after)) < 1e-5 * np.max(
+                    np.abs(grad_before)
+                ), (n, j, grad_after, grad_before)
+
+    def test_dynamics_update_installs_q_for_the_projected_a(self):
+        """A is projected onto the oscillator family inside the M-step and Q is
+        re-estimated there, so Q is the exact optimum *given the installed A*
+        (it used to be the optimum for the never-installed A*)."""
+        from state_space_practice.oscillator_utils import (
+            project_transition_matrix_stack,
+        )
+        from state_space_practice.tests import recovery_helpers as rh
+
+        model, _ = _spike_oscillator_em_problem()
+        stats = rh.switching_posterior_stats(model)
+        A_old, Q_old = model.continuous_transition_matrix, model.process_cov
+        model._m_step_dynamics()
+        A_new, Q_new = model.continuous_transition_matrix, model.process_cov
+
+        A_star = jnp.stack(
+            [
+                jnp.linalg.solve(stats["gamma1"][..., j].T, stats["beta"][..., j].T).T
+                for j in range(2)
+            ],
+            axis=-1,
+        )
+        np.testing.assert_allclose(
+            A_new,
+            project_transition_matrix_stack(A_star, model.max_spectral_radius),
+            atol=1e-10,
+        )
+        # Guard: the projection genuinely moved A.
+        assert float(jnp.max(jnp.abs(A_new - A_star))) > 1e-3
+
+        def residual_q(A):
+            scatter = [
+                stats["gamma2"][..., j]
+                - A[..., j] @ stats["beta"][..., j].T
+                - stats["beta"][..., j] @ A[..., j].T
+                + A[..., j] @ stats["gamma1"][..., j] @ A[..., j].T
+                for j in range(2)
+            ]
+            return jnp.stack(scatter, axis=-1) / stats["n_trans"]
+
+        np.testing.assert_allclose(Q_new, residual_q(A_new), rtol=1e-8, atol=1e-12)
+        basis = np.array(rh.symmetric_basis(2))
+        for j in range(2):
+
+            def f(Qj, j=j):
+                return rh.transition_objective(A_new, Q_new.at[..., j].set(Qj), stats)
+
+            grad = rh.central_difference_gradient(
+                lambda c, j=j: f(
+                    np.asarray(Q_new[..., j]) + np.einsum("k,kab->ab", c, basis)
+                ),
+                np.zeros(len(basis)),
+                1e-8,
+            )
+            grad_old = rh.central_difference_gradient(
+                lambda c, j=j: f(
+                    np.asarray(Q_old[..., j]) + np.einsum("k,kab->ab", c, basis)
+                ),
+                np.zeros(len(basis)),
+                1e-8,
+            )
+            assert np.max(np.abs(grad)) < 1e-6 * np.max(np.abs(grad_old)), (
+                grad,
+                grad_old,
+            )
+
+        obj_new = float(rh.transition_objective(A_new, Q_new, stats))
+        obj_mismatched = float(
+            rh.transition_objective(A_new, residual_q(A_star), stats)
+        )
+        obj_old = float(rh.transition_objective(A_old, Q_old, stats))
+        assert obj_new > obj_mismatched, (obj_new, obj_mismatched)
+        assert obj_new > obj_old, (obj_new, obj_old)

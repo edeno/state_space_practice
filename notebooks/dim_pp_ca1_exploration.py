@@ -165,8 +165,12 @@ axes[1].plot(t, smoother_prob[:, 1], label="State 1", alpha=0.7)
 axes[1].set_ylabel("P(state)")
 axes[1].legend()
 
-axes[2].fill_between(t, 0, 1, where=labels_sub == 1, alpha=0.3, color="green", label="Running")
-axes[2].fill_between(t, 0, 1, where=labels_sub == 0, alpha=0.3, color="red", label="Immobile")
+axes[2].fill_between(
+    t, 0, 1, where=labels_sub == 1, alpha=0.3, color="green", label="Running"
+)
+axes[2].fill_between(
+    t, 0, 1, where=labels_sub == 0, alpha=0.3, color="red", label="Immobile"
+)
 axes[2].set_ylabel("Behavior")
 axes[2].set_xlabel("Time (s)")
 axes[2].legend()
@@ -247,8 +251,12 @@ axes[1].plot(t, smoother_prob_2[:, 1], label="State 1", alpha=0.7)
 axes[1].set_ylabel("P(state)")
 axes[1].legend()
 
-axes[2].fill_between(t, 0, 1, where=labels_sub == 1, alpha=0.3, color="green", label="Running")
-axes[2].fill_between(t, 0, 1, where=labels_sub == 0, alpha=0.3, color="red", label="Immobile")
+axes[2].fill_between(
+    t, 0, 1, where=labels_sub == 1, alpha=0.3, color="green", label="Running"
+)
+axes[2].fill_between(
+    t, 0, 1, where=labels_sub == 0, alpha=0.3, color="red", label="Immobile"
+)
 axes[2].set_ylabel("Behavior")
 axes[2].set_xlabel("Time (s)")
 axes[2].legend()

@@ -112,9 +112,7 @@ def simulate_switching_spike_oscillator(
         init_discrete_prob = jnp.ones(n_discrete_states) / n_discrete_states
 
     # Split keys for different random operations
-    key, key_init_state, key_init_discrete, key_init_spikes = jax.random.split(
-        key, 4
-    )
+    key, key_init_state, key_init_discrete, key_init_spikes = jax.random.split(key, 4)
 
     # Sample initial continuous state
     x_0 = jax.random.multivariate_normal(key_init_state, init_mean, init_cov)

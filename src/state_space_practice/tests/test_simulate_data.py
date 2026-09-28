@@ -78,7 +78,9 @@ class TestReceptiveFieldModel:
         params_narrow = np.array([np.log(10.0), center, 5.0])
         params_wide = np.array([np.log(10.0), center, 20.0])
 
-        rate_narrow = receptive_field_model(np.array([center + distance]), params_narrow)
+        rate_narrow = receptive_field_model(
+            np.array([center + distance]), params_narrow
+        )
         rate_wide = receptive_field_model(np.array([center + distance]), params_wide)
 
         assert rate_wide > rate_narrow
@@ -130,7 +132,9 @@ class TestSimulateEdenBrown2004Jump:
 
         # Observed mean should be within an order of magnitude of expected
         np.testing.assert_allclose(
-            observed_mean_count, expected_mean_count, rtol=1.0,
+            observed_mean_count,
+            expected_mean_count,
+            rtol=1.0,
             err_msg="Observed spike rate differs from model prediction by >2x",
         )
 
