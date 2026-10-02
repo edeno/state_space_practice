@@ -15,6 +15,7 @@ from state_space_practice.utils import (
     differentiable_spectral_radius,
     stabilize_transition_matrix,
     symmetrize,
+    typed_jit,
 )
 
 logger = logging.getLogger(__name__)
@@ -960,7 +961,7 @@ def _cnm_psd_shrink_factor(
     return jnp.clip(t, 0.0, 1.0)
 
 
-@jax.jit
+@typed_jit
 def project_correlated_noise_process_covariance(
     process_covariance: jax.Array,
     min_eigenvalue: float = 1e-8,

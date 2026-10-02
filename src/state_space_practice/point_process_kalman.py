@@ -35,7 +35,7 @@ import logging
 import operator
 import warnings
 from collections.abc import Callable
-from typing import Any, Literal, NamedTuple, cast, overload
+from typing import Any, Literal, NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
@@ -66,6 +66,7 @@ from state_space_practice.utils import (
     psd_logdet,
     psd_solve,
     symmetrize,
+    typed_jit,
     validate_count_array,
     validate_scalar,
     warn_if_not_positive_definite_in_graph,
@@ -386,7 +387,7 @@ def _scaled_atol(mat: Array, atol: float) -> Array:
     return atol * jnp.maximum(1.0, jnp.max(jnp.abs(mat)))
 
 
-@functools.partial(jax.jit, static_argnames=("n_neurons", "block_size", "atol"))
+@functools.partial(typed_jit, static_argnames=("n_neurons", "block_size", "atol"))
 def _block_diagonal_parameters_ok(
     init_cov: Array,
     transition_matrix: Array,
@@ -1762,9 +1763,7 @@ def stochastic_point_process_filter(
     if single_neuron:
         spike_indicator = spike_indicator[:, None]
 
-    # jax.jit erases the wrapped function's return type to Any; the typed
-    # binding restores it so the declared return type is honored.
-    result: tuple[Array, Array, Array, Array] = _stochastic_point_process_filter_impl(
+    result = _stochastic_point_process_filter_impl(
         init_mean_params,
         init_covariance_params,
         design_matrix,
@@ -1788,7 +1787,7 @@ def stochastic_point_process_filter(
 
 
 @functools.partial(
-    jax.jit,
+    typed_jit,
     static_argnames=[
         "log_conditional_intensity",
         "include_laplace_normalization",
@@ -1920,7 +1919,7 @@ def _stochastic_point_process_filter_impl(
 
 
 @functools.partial(
-    jax.jit,
+    typed_jit,
     static_argnames=("include_laplace_normalization", "max_newton_iter"),
 )
 def _block_diagonal_forward_core(
@@ -2013,7 +2012,7 @@ def _block_diagonal_forward_core(
         init_mean_j: Array,
         init_cov_j: Array,
         spikes_j: Array,
-    ):
+    ) -> tuple[Array, Array, Array, Array]:
         init_carry = (
             init_mean_j,
             init_cov_j,
@@ -2027,15 +2026,8 @@ def _block_diagonal_forward_core(
         )
         return means_j, covs_j, ll_j, n_failed_j
 
-    return cast(
-        tuple[Array, Array, Array, Array],
-        jax.vmap(_run_one_neuron, in_axes=(0, 0, 0, 0, 1))(
-            A_blocks,
-            Q_blocks,
-            init_means_per_neuron,
-            init_covs_per_neuron,
-            spike_indicator,
-        ),
+    return jax.vmap(_run_one_neuron, in_axes=(0, 0, 0, 0, 1))(
+        A_blocks, Q_blocks, init_means_per_neuron, init_covs_per_neuron, spike_indicator
     )
 
 
@@ -2074,8 +2066,7 @@ def _run_forward_block_diagonal(
         Per-neuron number of time bins whose Fisher-scoring line search was
         exhausted (0 for ``max_newton_iter <= 1``).
     """
-    # jax.jit erases the return type to Any; the typed binding restores it.
-    fwd: tuple[Array, Array, Array, Array] = _block_diagonal_forward_core(
+    fwd = _block_diagonal_forward_core(
         structure.A_blocks,
         structure.Q_blocks,
         structure.init_means_per_neuron,
@@ -2091,7 +2082,7 @@ def _run_forward_block_diagonal(
 
 
 @functools.partial(
-    jax.jit,
+    typed_jit,
     static_argnames=("include_laplace_normalization", "max_newton_iter"),
 )
 def _block_diagonal_smoother_core(
@@ -2768,6 +2759,9 @@ def stochastic_point_process_smoother(
             max_newton_iter=max_newton_iter,
         )
     )
+    # return_block_covariances defaults to False, so the filter returns dense
+    # covariances.
+    assert not isinstance(filtered_cov, BlockDiagonalCovariance)
 
     smoother_mean, smoother_cov, smoother_cross_cov = (
         _stochastic_point_process_smoother_backward(
@@ -2784,7 +2778,7 @@ def stochastic_point_process_smoother(
     return result
 
 
-@jax.jit
+@typed_jit
 def _stochastic_point_process_smoother_backward(
     filtered_mean: Array,
     filtered_cov: Array,
@@ -2913,19 +2907,16 @@ def dynamics_only_m_step(
             DeprecationWarning,
             stacklevel=2,
         )
-    return cast(
-        tuple[Array, Array, Array, Array],
-        _dynamics_only_m_step(
-            smoother_mean,
-            smoother_cov,
-            smoother_cross_cov,
-            fixed_transition_matrix,
-            initial_state_prior,
-        ),
+    return _dynamics_only_m_step(
+        smoother_mean,
+        smoother_cov,
+        smoother_cross_cov,
+        fixed_transition_matrix,
+        initial_state_prior,
     )
 
 
-@jax.jit
+@typed_jit
 def _dynamics_only_m_step(
     smoother_mean: ArrayLike,
     smoother_cov: ArrayLike,

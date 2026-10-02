@@ -16,7 +16,6 @@ import logging
 import math
 import warnings
 from functools import partial
-from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -38,6 +37,7 @@ from state_space_practice.utils import (
     psd_solve,
     stabilize_covariance,
     symmetrize,
+    typed_jit,
     zero_preserving_log,
 )
 from state_space_practice.utils import divide_safe as _divide_safe
@@ -60,7 +60,7 @@ _kalman_filter_update_per_discrete_state_pair = jax.vmap(
 )  # shape (n_discrete_states, n_discrete_states, n_obs_dim)
 
 
-@jax.jit
+@typed_jit
 def collapse_gaussian_mixture(
     conditional_means_x: jax.Array,
     conditional_cov: jax.Array,
@@ -793,7 +793,7 @@ def _first_timestep_kalman_update(
     )
 
 
-@jax.jit
+@typed_jit
 def switching_kalman_filter(
     init_state_cond_mean: jax.Array,
     init_state_cond_cov: jax.Array,
@@ -1314,10 +1314,7 @@ def _collapse_triple_to_pair(
         in_axes=(-2, -2, 0),  # vmap over j (second-to-last of 4D), weights axis 0
         out_axes=(-1, -1),
     )
-    return cast(
-        tuple[jax.Array, jax.Array],
-        _collapse_over_k(triple_mean, triple_cov, weights),
-    )
+    return _collapse_over_k(triple_mean, triple_cov, weights)
 
 
 def _update_smoother_discrete_probabilities(
@@ -1389,7 +1386,7 @@ def _update_smoother_discrete_probabilities(
     )
 
 
-@jax.jit
+@typed_jit
 def switching_kalman_smoother(
     filter_mean: jax.Array,
     filter_cov: jax.Array,
@@ -1689,7 +1686,7 @@ def switching_kalman_smoother(
     )
 
 
-@jax.jit
+@typed_jit
 def switching_kalman_smoother_gpb2(
     filter_mean: jax.Array,
     filter_cov: jax.Array,
@@ -2154,7 +2151,7 @@ _floor_covariance_relative_per_discrete_state = jax.vmap(
 
 
 @functools.partial(
-    jax.jit,
+    typed_jit,
     static_argnames=("use_fixed_measurement_matrix", "use_fixed_transition_matrix"),
 )
 def _switching_kalman_m_step_inner(
@@ -2623,7 +2620,7 @@ def _weighted_gaussian_log_prob(
     return -0.5 * (n_cont_states * jnp.log(2 * jnp.pi) + log_det + trace_term)
 
 
-@jax.jit
+@typed_jit
 def compute_expected_complete_log_likelihood(
     obs: jax.Array,
     state_cond_smoother_means: jax.Array,
@@ -2864,7 +2861,7 @@ def compute_expected_complete_log_likelihood(
     )
 
 
-@jax.jit
+@typed_jit
 def compute_posterior_entropy(
     smoother_discrete_state_prob: jax.Array,
     smoother_joint_discrete_state_prob: jax.Array,
@@ -2917,7 +2914,7 @@ def compute_posterior_entropy(
     return discrete_entropy + cont_entropy
 
 
-@jax.jit
+@typed_jit
 def compute_markov_posterior_entropy(
     smoother_discrete_state_prob: jax.Array,
     smoother_joint_discrete_state_prob: jax.Array,
@@ -3000,7 +2997,7 @@ def compute_markov_posterior_entropy(
     return discrete_entropy + terminal_entropy + conditional_entropy
 
 
-@jax.jit
+@typed_jit
 def compute_elbo(
     obs: jax.Array,
     state_cond_smoother_means: jax.Array,
@@ -3087,7 +3084,7 @@ def compute_elbo(
         pair_cond_smoother_covs=pair_cond_smoother_covs,
     )
 
-    return cast(jax.Array, expected_ll + entropy)
+    return expected_ll + entropy
 
 
 def compute_transition_sufficient_stats(
@@ -3436,7 +3433,7 @@ def _unpack_dim_params(
     }
 
 
-@functools.partial(jax.jit, static_argnames=("tol", "max_iter", "has_process_cov"))
+@functools.partial(typed_jit, static_argnames=("tol", "max_iter", "has_process_cov"))
 def _optimize_dim_single_core(
     damping0: jax.Array,
     freq0: jax.Array,
@@ -3653,7 +3650,7 @@ def optimize_dim_transition_params(
 
 
 @functools.partial(
-    jax.jit,
+    typed_jit,
     static_argnames=("tol", "max_iter", "max_backtracking_steps", "has_process_cov"),
 )
 def _optimize_dim_joint_core(

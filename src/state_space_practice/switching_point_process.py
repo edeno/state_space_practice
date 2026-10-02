@@ -90,7 +90,7 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, cast, overload
+from typing import Literal, overload
 
 import jax
 import jax.numpy as jnp
@@ -137,6 +137,7 @@ from state_space_practice.utils import (
     psd_solve,
     stabilize_covariance,
     symmetrize,
+    typed_jit,
     validate_count_array,
     validate_covariance,
     validate_probability_vector,
@@ -796,7 +797,13 @@ def _point_process_update_per_discrete_state_pair(
 
     # Create a version of predict_and_update that only takes array arguments
     # (log_intensity_func, spike_params, dt are captured in the closure for vmap)
-    def _update(prev_mean, prev_cov, A, Q, params_j):
+    def _update(
+        prev_mean: Array,
+        prev_cov: Array,
+        A: Array,
+        Q: Array,
+        params_j: SpikeObsParams,
+    ) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]:
         return _point_process_predict_and_update(
             prev_mean,
             prev_cov,
@@ -815,17 +822,14 @@ def _point_process_update_per_discrete_state_pair(
 
     def _update_for_state_j(
         state_index: Array, A: Array, Q: Array
-    ) -> tuple[Array, ...]:
+    ) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]:
         """Update for a single next-state j, vmapped over previous states i."""
         params_j = _select_spike_params(spike_params, state_index)
-        return cast(
-            tuple[Array, ...],
-            jax.vmap(
-                _update,
-                in_axes=(-1, -1, None, None, None),  # vmap over prev state i
-                out_axes=-1,
-            )(prev_state_cond_mean, prev_state_cond_cov, A, Q, params_j),
-        )
+        return jax.vmap(
+            _update,
+            in_axes=(-1, -1, None, None, None),  # vmap over prev state i
+            out_axes=-1,
+        )(prev_state_cond_mean, prev_state_cond_cov, A, Q, params_j)
 
     # Outer vmap: over next state j (axis -1 of A/Q)
     vmapped_update = jax.vmap(
@@ -834,11 +838,7 @@ def _point_process_update_per_discrete_state_pair(
         out_axes=-1,
     )
 
-    result: tuple[Array, Array, Array] | tuple[Array, Array, Array, Array] = cast(
-        tuple[Array, Array, Array] | tuple[Array, Array, Array, Array],
-        vmapped_update(state_indices, continuous_transition_matrix, process_cov),
-    )
-    return result
+    return vmapped_update(state_indices, continuous_transition_matrix, process_cov)
 
 
 def _first_timestep_point_process_update(
@@ -1716,7 +1716,7 @@ def _single_neuron_glm_step_second_order_mixture(
     return new_params[0], new_params[1:], fell_back
 
 
-@functools.partial(jax.jit, static_argnames=("max_iter",))
+@functools.partial(typed_jit, static_argnames=("max_iter",))
 def _second_order_newton_iterations(
     baselines: Array,
     weights: Array,
@@ -1800,7 +1800,7 @@ def _as_float(x: ArrayLike) -> Array:
     return x.astype(jnp.result_type(float))
 
 
-@functools.partial(jax.jit, static_argnames=("max_iter",))
+@functools.partial(typed_jit, static_argnames=("max_iter",))
 def _mixture_newton_iterations(
     baselines: Array,
     weights: Array,
@@ -1968,6 +1968,7 @@ def update_spike_glm_params(
         # zero-centered prior is the neutral default for baseline_prior.
         if baseline_prior is None:
             baseline_prior = jnp.zeros_like(baselines)
+        assert smoother_cov is not None  # validated above for use_second_order
         final_baselines, final_weights, n_fallbacks = _second_order_newton_iterations(
             baselines,
             weights,
@@ -2073,7 +2074,7 @@ def update_spike_glm_params_mixture(
 
 
 @functools.partial(
-    jax.jit,
+    typed_jit,
     static_argnames=[
         "log_intensity_func",
         "include_laplace_normalization",
@@ -2494,23 +2495,20 @@ def switching_point_process_filter(
     _validate_discrete_state_transitions(
         discrete_transition_matrix, init_discrete_state_prob, dt
     )
-    return cast(
-        tuple[Array, Array, Array, Array, Array, Array, Array],
-        _switching_point_process_filter_jit(
-            init_state_cond_mean,
-            init_state_cond_cov,
-            init_discrete_state_prob,
-            spikes,
-            discrete_transition_matrix,
-            continuous_transition_matrix,
-            process_cov,
-            dt,
-            log_intensity_func,
-            spike_params,
-            include_laplace_normalization=include_laplace_normalization,
-            max_newton_iter=max_newton_iter,
-            line_search_beta=line_search_beta,
-        ),
+    return _switching_point_process_filter_jit(
+        init_state_cond_mean,
+        init_state_cond_cov,
+        init_discrete_state_prob,
+        spikes,
+        discrete_transition_matrix,
+        continuous_transition_matrix,
+        process_cov,
+        dt,
+        log_intensity_func,
+        spike_params,
+        include_laplace_normalization=include_laplace_normalization,
+        max_newton_iter=max_newton_iter,
+        line_search_beta=line_search_beta,
     )
 
 

@@ -58,7 +58,12 @@ from state_space_practice.point_process_kalman import (
     poisson_family,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import psd_cholesky, psd_logdet, stabilize_covariance
+from state_space_practice.utils import (
+    psd_cholesky,
+    psd_logdet,
+    stabilize_covariance,
+    typed_jit,
+)
 
 
 def gaussian_measurement_update(
@@ -445,7 +450,7 @@ def _observation_updates(
     return filter_update, smoother_update
 
 
-@partial(jax.jit, static_argnames=("dt", "observation_model"))
+@partial(typed_jit, static_argnames=("dt", "observation_model"))
 def hamiltonian_ekf_filter(
     observations: Any,
     params: dict[str, Any],
@@ -480,7 +485,7 @@ def hamiltonian_ekf_filter(
     )
 
 
-@partial(jax.jit, static_argnames=("dt", "observation_model"))
+@partial(typed_jit, static_argnames=("dt", "observation_model"))
 def hamiltonian_ekf_smoother(
     observations: Any,
     params: dict[str, Any],
@@ -637,28 +642,22 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
         self, observations: Any, params: dict[str, Any]
     ) -> tuple[Array, Array, Array]:
         """Run the jitted filter core on validated data and completed params."""
-        return cast(
-            tuple[Array, Array, Array],
-            hamiltonian_ekf_filter(
-                observations,
-                params,
-                dt=self.dt,
-                observation_model=self._observation_model,
-            ),
+        return hamiltonian_ekf_filter(
+            observations,
+            params,
+            dt=self.dt,
+            observation_model=self._observation_model,
         )
 
     def _smooth_jit(
         self, observations: Any, params: dict[str, Any]
     ) -> tuple[Array, Array]:
         """Run the jitted smoother core on validated data and completed params."""
-        return cast(
-            tuple[Array, Array],
-            hamiltonian_ekf_smoother(
-                observations,
-                params,
-                dt=self.dt,
-                observation_model=self._observation_model,
-            ),
+        return hamiltonian_ekf_smoother(
+            observations,
+            params,
+            dt=self.dt,
+            observation_model=self._observation_model,
         )
 
     def filter(self, *args: Any, **kwargs: Any) -> tuple[Array, Array, Array]:

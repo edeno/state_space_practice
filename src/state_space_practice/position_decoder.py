@@ -40,6 +40,7 @@ from state_space_practice.point_process_kalman import (
 from state_space_practice.utils import (
     psd_solve,
     symmetrize,
+    typed_jit,
     validate_count_array,
     validate_covariance,
     validate_scalar,
@@ -957,7 +958,7 @@ def _build_track_penalty(
 
 
 @partial(
-    jax.jit,
+    typed_jit,
     static_argnames=(
         "n_neurons",
         "n_state",

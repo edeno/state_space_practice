@@ -19,6 +19,7 @@ from state_space_practice.utils import (
     clip_eigenvalues_relative,
     contains_tracer,
     psd_solve,
+    typed_jit,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,7 +132,7 @@ def stochastic_point_process_filter(
     return posterior_mode, posterior_covariance
 
 
-@functools.partial(jax.jit, static_argnames=("log_receptive_field_model",))
+@functools.partial(typed_jit, static_argnames=("log_receptive_field_model",))
 def _stochastic_point_process_filter_impl(
     init_mode_params: Array,
     init_covariance_params: Array,

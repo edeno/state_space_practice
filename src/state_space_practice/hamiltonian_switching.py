@@ -8,7 +8,7 @@ linear-Gaussian EM integration and is fit by SGD only.
 """
 
 from functools import partial
-from typing import Any, cast
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -37,6 +37,7 @@ from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.switching_kalman import collapse_gaussian_mixture
 from state_space_practice.utils import divide_safe as _divide_safe
 from state_space_practice.utils import scale_likelihood as _scale_likelihood
+from state_space_practice.utils import typed_jit
 
 
 def switching_predict_collapse(
@@ -102,7 +103,7 @@ def switching_predict_collapse(
     return m_p_k, P_p_k, F_jk, joint_pi_pred, pi_pred_k, m_p_jk, P_p_jk
 
 
-@partial(jax.jit, static_argnames=("dt",))
+@partial(typed_jit, static_argnames=("dt",))
 def switching_hamiltonian_filter(
     observations: tuple[Array, Array],
     params: dict[str, Any],
@@ -197,7 +198,7 @@ def switching_hamiltonian_filter(
     return means, covs, probs, marginal_lls
 
 
-@partial(jax.jit, static_argnames=("dt",))
+@partial(typed_jit, static_argnames=("dt",))
 def switching_hamiltonian_smoother(
     observations: tuple[Array, Array],
     params: dict[str, Any],
@@ -502,10 +503,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         self, observations: Any, params: dict[str, Any]
     ) -> tuple[Array, Array, Array, Array]:
         """Switching filter core: ``(means, covs, discrete_probs, marginal_lls)``."""
-        return cast(
-            tuple[Array, Array, Array, Array],
-            switching_hamiltonian_filter(observations, params, dt=self.dt),
-        )
+        return switching_hamiltonian_filter(observations, params, dt=self.dt)
 
     def smooth(  # type: ignore[override]
         self,
@@ -530,10 +528,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         self, observations: Any, params: dict[str, Any]
     ) -> tuple[Array, Array, Array]:
         """Switching smoother core: ``(means, covs, discrete_probs)``."""
-        return cast(
-            tuple[Array, Array, Array],
-            switching_hamiltonian_smoother(observations, params, dt=self.dt),
-        )
+        return switching_hamiltonian_smoother(observations, params, dt=self.dt)
 
     def _complete_filter_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Fill per-state covariance defaults before entering the jitted cores.

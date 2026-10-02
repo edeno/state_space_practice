@@ -28,7 +28,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `.pre-commit-config.yaml` (ruff, ruff-format, nbstripout), `[tool.ruff]`
   config, and `HYPOTHESIS_PROFILE` selection in the test conftest. mypy checks
   all package modules except tests, including untyped function bodies via
-  `check_untyped_defs = true`.
+  `check_untyped_defs = true`. Jitted functions are declared with
+  `utils.typed_jit`, a `jax.jit` that keeps the wrapped signature visible to
+  mypy, so arguments and results at jitted calls are type-checked.
 - **`em_driver.run_em`**: the shared EM loop (E-step, convergence, rollback,
   M-step) used by the oscillator models, `PointProcessModel`, `PlaceFieldModel`,
   the switching point-process models and `SmithLearningModel`. Invalid option

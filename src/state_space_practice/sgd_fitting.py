@@ -37,7 +37,7 @@ from state_space_practice.parameter_transforms import (
     transform_to_constrained,
     transform_to_unconstrained,
 )
-from state_space_practice.utils import validate_int
+from state_space_practice.utils import typed_jit, validate_int
 
 logger = logging.getLogger(__name__)
 
@@ -350,7 +350,7 @@ def _build_sgd_step(
         )
         return loss, new_unc_p, new_opt_st, step_finite
 
-    entry.train_step = jax.jit(_sgd_train_step)
+    entry.train_step = typed_jit(_sgd_train_step)
     return entry
 
 

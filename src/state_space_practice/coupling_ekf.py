@@ -48,9 +48,10 @@ from state_space_practice.point_process_kalman import (
     _warn_line_search_failures,
     glm_laplace_update,
 )
+from state_space_practice.utils import typed_jit
 
 
-@functools.partial(jax.jit, static_argnames=("max_newton_iter",))
+@functools.partial(typed_jit, static_argnames=("max_newton_iter",))
 def _regress_coupling_all_neurons(
     spikes: Array,
     smoothed_latent: Array,

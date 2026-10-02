@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import NamedTuple, cast
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -45,6 +45,7 @@ from state_space_practice.parameter_transforms import (
 from state_space_practice.sgd_fitting import SGDFittableMixin
 from state_space_practice.utils import (
     check_converged,
+    typed_jit,
     validate_choice_indices,
     validate_count_array,
 )
@@ -225,13 +226,13 @@ def get_transition_prior(
     return jnp.maximum(alpha, 1.0)
 
 
-@jax.jit
+@typed_jit
 def dirichlet_neg_log_likelihood(
     coefficients_flat: Array,
     design_matrix: Array,
     response: Array,
     alpha: Array,
-    l2_penalty: float = 1e-5,
+    l2_penalty: float | Array = 1e-5,
 ) -> Array:
     """Negative expected complete log-likelihood for transition M-step.
 
@@ -257,7 +258,7 @@ def dirichlet_neg_log_likelihood(
         Pseudo-count smoothing (acts like Dirichlet alpha for the
         intercept-only case, but is only an approximation when
         covariates are present).
-    l2_penalty : float
+    l2_penalty : float or Array
         L2 on non-intercept coefficients.
 
     Returns
@@ -478,27 +479,24 @@ def contingency_belief_filter(
     _validate_choices_rewards(choices, rewards, n_options)
     choices = jnp.asarray(choices, dtype=jnp.int32)
     rewards = jnp.asarray(rewards, dtype=jnp.int32)
-    return cast(
-        ContingencyBeliefResult,
-        _contingency_belief_filter_jit(
-            choices=choices,
-            rewards=rewards,
-            n_states=n_states,
-            n_options=n_options,
-            reward_probs=reward_probs,
-            state_values=state_values,
-            inverse_temperature=inverse_temperature,
-            transition_logits=transition_logits,
-            transition_covariates=transition_covariates,
-            transition_weights=transition_weights,
-            init_state_prob=init_state_prob,
-            obs_design_matrix=obs_design_matrix,
-            obs_weights=obs_weights,
-        ),
+    return _contingency_belief_filter_jit(
+        choices=choices,
+        rewards=rewards,
+        n_states=n_states,
+        n_options=n_options,
+        reward_probs=reward_probs,
+        state_values=state_values,
+        inverse_temperature=inverse_temperature,
+        transition_logits=transition_logits,
+        transition_covariates=transition_covariates,
+        transition_weights=transition_weights,
+        init_state_prob=init_state_prob,
+        obs_design_matrix=obs_design_matrix,
+        obs_weights=obs_weights,
     )
 
 
-@functools.partial(jax.jit, static_argnames=["n_states", "n_options"])
+@functools.partial(typed_jit, static_argnames=["n_states", "n_options"])
 def _contingency_belief_filter_jit(
     choices: Array,
     rewards: Array,
@@ -633,27 +631,24 @@ def contingency_belief_smoother(
     _validate_choices_rewards(choices, rewards, n_options)
     choices = jnp.asarray(choices, dtype=jnp.int32)
     rewards = jnp.asarray(rewards, dtype=jnp.int32)
-    return cast(
-        SmootherResult,
-        _contingency_belief_smoother_jit(
-            choices=choices,
-            rewards=rewards,
-            n_states=n_states,
-            n_options=n_options,
-            reward_probs=reward_probs,
-            state_values=state_values,
-            inverse_temperature=inverse_temperature,
-            transition_logits=transition_logits,
-            transition_covariates=transition_covariates,
-            transition_weights=transition_weights,
-            init_state_prob=init_state_prob,
-            obs_design_matrix=obs_design_matrix,
-            obs_weights=obs_weights,
-        ),
+    return _contingency_belief_smoother_jit(
+        choices=choices,
+        rewards=rewards,
+        n_states=n_states,
+        n_options=n_options,
+        reward_probs=reward_probs,
+        state_values=state_values,
+        inverse_temperature=inverse_temperature,
+        transition_logits=transition_logits,
+        transition_covariates=transition_covariates,
+        transition_weights=transition_weights,
+        init_state_prob=init_state_prob,
+        obs_design_matrix=obs_design_matrix,
+        obs_weights=obs_weights,
     )
 
 
-@functools.partial(jax.jit, static_argnames=["n_states", "n_options"])
+@functools.partial(typed_jit, static_argnames=["n_states", "n_options"])
 def _contingency_belief_smoother_jit(
     choices: Array,
     rewards: Array,
@@ -801,7 +796,7 @@ def _contingency_belief_smoother_jit(
     )
 
 
-@jax.jit
+@typed_jit
 def _optimize_transition_rows(
     x0_all: Array,
     response_all: Array,
@@ -833,7 +828,9 @@ def _optimize_transition_rows(
         Optimized flattened coefficients per from-state.
     """
 
-    def _optimize_one_row(x0_flat, response_row, alpha_row):
+    def _optimize_one_row(
+        x0_flat: Array, response_row: Array, alpha_row: Array
+    ) -> Array:
         def loss(c):
             return dirichlet_neg_log_likelihood(
                 c, design, response_row, alpha_row, l2_penalty
@@ -844,7 +841,7 @@ def _optimize_transition_rows(
         )
         return result_opt.x
 
-    return cast(Array, jax.vmap(_optimize_one_row)(x0_all, response_all, alpha_all))
+    return jax.vmap(_optimize_one_row)(x0_all, response_all, alpha_all)
 
 
 class ContingencyBeliefModel(SGDFittableMixin):
@@ -1520,7 +1517,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
             kwargs["obs_weights"] = params["obs_weights"]
 
         result = _contingency_belief_filter_jit(**kwargs)
-        return cast(Array, -result.log_likelihood)
+        return -result.log_likelihood
 
     def _store_sgd_params(self, params: dict) -> None:
         self.reward_probs_ = params["reward_probs"]

@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import NamedTuple, cast
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -46,7 +46,12 @@ from state_space_practice.parameter_transforms import (
     UNCONSTRAINED,
     UNIT_INTERVAL,
 )
-from state_space_practice.utils import psd_solve, symmetrize, validate_choice_indices
+from state_space_practice.utils import (
+    psd_solve,
+    symmetrize,
+    typed_jit,
+    validate_choice_indices,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +92,7 @@ def covariate_predict(
     return pred_mean, pred_cov
 
 
-@jax.jit
+@typed_jit
 def m_step_input_gain(
     smoothed_values: Array,
     covariates: Array,
@@ -132,7 +137,7 @@ def m_step_input_gain(
     return psd_solve(gram.T, cross.T).T
 
 
-@partial(jax.jit, static_argnames=("n_options", "max_newton_steps"))
+@partial(typed_jit, static_argnames=("n_options", "max_newton_steps"))
 def m_step_obs_weights(
     smoothed_values: Array,
     choices: Array,
@@ -305,25 +310,22 @@ def covariate_choice_filter(
         obs_cov_arr = jnp.zeros((choices_arr.shape[0], 1))
         obs_weights_arr = jnp.zeros((n_options, 1))
 
-    return cast(
-        ChoiceFilterResult,
-        _covariate_choice_filter_jit(
-            choices_arr,
-            n_options,
-            covariates_arr,
-            input_gain_arr,
-            obs_cov_arr,
-            obs_weights_arr,
-            process_noise,
-            inverse_temperature,
-            decay,
-            init_mean,
-            init_cov,
-        ),
+    return _covariate_choice_filter_jit(
+        choices_arr,
+        n_options,
+        covariates_arr,
+        input_gain_arr,
+        obs_cov_arr,
+        obs_weights_arr,
+        process_noise,
+        inverse_temperature,
+        decay,
+        init_mean,
+        init_cov,
     )
 
 
-@partial(jax.jit, static_argnames=("n_options",))
+@partial(typed_jit, static_argnames=("n_options",))
 def _covariate_choice_filter_jit(
     choices: Array,
     n_options: int,
@@ -331,9 +333,9 @@ def _covariate_choice_filter_jit(
     input_gain: Array,
     obs_covariates: Array,
     obs_weights: Array,
-    process_noise: float,
-    inverse_temperature: float,
-    decay: float,
+    process_noise: float | Array,
+    inverse_temperature: float | Array,
+    decay: float | Array,
     init_mean: Array,
     init_cov: Array,
 ) -> ChoiceFilterResult:
@@ -895,7 +897,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
             jnp.zeros(k_free),
             jnp.eye(k_free),
         )
-        return cast(Array, -result.marginal_log_likelihood)
+        return -result.marginal_log_likelihood
 
     def _store_sgd_params(self, params: dict) -> None:
         super()._store_sgd_params(params)

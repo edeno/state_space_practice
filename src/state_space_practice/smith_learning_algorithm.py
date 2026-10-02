@@ -52,7 +52,7 @@ import math
 import warnings
 from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import matplotlib.pyplot as plt
@@ -78,7 +78,7 @@ from state_space_practice.parameter_transforms import (
     UNCONSTRAINED,
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import validate_count_array
+from state_space_practice.utils import typed_jit, validate_count_array
 
 logger = logging.getLogger(__name__)
 
@@ -472,20 +472,17 @@ def smith_learning_filter(
     # promoted to the default float, float32 inputs stay float32.
     init_state = jnp.asarray(init_learning_state)
     dtype = jnp.result_type(init_state, init_var, sigma_squared_epsilon, 1.0)
-    return cast(
-        tuple[Array, Array, Array, Array, Array],
-        _smith_learning_filter_impl(
-            n_correct_responses,
-            max_correct_arr,
-            init_state.astype(dtype),
-            init_var.astype(dtype),
-            sigma_squared_epsilon.astype(dtype),
-            mu.astype(dtype),
-        ),
+    return _smith_learning_filter_impl(
+        n_correct_responses,
+        max_correct_arr,
+        init_state.astype(dtype),
+        init_var.astype(dtype),
+        sigma_squared_epsilon.astype(dtype),
+        mu.astype(dtype),
     )
 
 
-@jax.jit
+@typed_jit
 def _smith_learning_filter_impl(
     n_correct_responses: Array,
     max_correct_arr: Array,
@@ -564,7 +561,7 @@ def _smith_learning_filter_impl(
     )
 
 
-@jax.jit
+@typed_jit
 def smith_learning_smoother(
     filtered_learning_state_mode: ArrayLike,
     filtered_learning_state_variance: ArrayLike,
@@ -669,7 +666,7 @@ def smith_learning_smoother(
 _MIN_INIT_LEARNING_VARIANCE = 1e-8
 
 
-@partial(jax.jit, static_argnames=["estimate_initial_variance"])
+@partial(typed_jit, static_argnames=["estimate_initial_variance"])
 def maximization_step(
     smoothed_learning_state_mode: ArrayLike,
     smoothed_learning_state_variance: ArrayLike,
@@ -1725,6 +1722,9 @@ class SmithLearningModel(SGDFittableMixin):
         """
         if not self.is_fitted:
             raise RuntimeError("Must run E-step before M-step")
+        assert self.smoothed_learning_state_mode is not None
+        assert self.smoothed_learning_state_variance is not None
+        assert self.smoother_gain is not None
 
         (
             sigma_epsilon_new,

@@ -35,6 +35,7 @@ from state_space_practice.utils import (  # noqa: F401 — re-exported for backw
     psd_solve,
     stabilize_covariance,
     symmetrize,
+    typed_jit,
     warn_if_not_positive_definite_in_graph,
 )
 
@@ -428,7 +429,7 @@ def _validate_kalman_public_inputs(
     return arrays
 
 
-@jax.jit
+@typed_jit
 def kalman_measurement_update(
     prior_mean: jax.Array,
     prior_cov: jax.Array,
@@ -480,7 +481,7 @@ def kalman_measurement_update(
     return posterior_mean, posterior_cov, marginal_log_likelihood
 
 
-@jax.jit
+@typed_jit
 def _kalman_filter_update(
     mean_prev: jax.Array,
     cov_prev: jax.Array,
@@ -526,15 +527,12 @@ def _kalman_filter_update(
     )
 
     # Measurement update
-    return cast(
-        tuple[jax.Array, jax.Array, jax.Array],
-        kalman_measurement_update(
-            one_step_mean, one_step_cov, obs, measurement_matrix, measurement_cov
-        ),
+    return kalman_measurement_update(
+        one_step_mean, one_step_cov, obs, measurement_matrix, measurement_cov
     )
 
 
-@jax.jit
+@typed_jit
 def _kalman_filter_impl(
     init_mean: jax.Array,
     init_cov: jax.Array,
@@ -708,21 +706,18 @@ def kalman_filter(
             filter_name="kalman_filter",
         )
 
-    return cast(
-        tuple[jax.Array, jax.Array, jax.Array],
-        _kalman_filter_impl(
-            init_mean,
-            init_cov,
-            obs,
-            transition_matrix,
-            process_cov,
-            measurement_matrix,
-            measurement_cov,
-        ),
+    return _kalman_filter_impl(
+        init_mean,
+        init_cov,
+        obs,
+        transition_matrix,
+        process_cov,
+        measurement_matrix,
+        measurement_cov,
     )
 
 
-@jax.jit
+@typed_jit
 def _kalman_smoother_update(
     next_smoother_mean: jax.Array,
     next_smoother_cov: jax.Array,
@@ -786,7 +781,7 @@ def _kalman_smoother_update(
     return smoother_mean, smoother_cov, smoother_cross_cov
 
 
-@jax.jit
+@typed_jit
 def rts_backward_scan(
     filtered_mean: jax.Array,
     filtered_cov: jax.Array,
@@ -853,7 +848,7 @@ def rts_backward_scan(
     )
 
 
-@jax.jit
+@typed_jit
 def rts_backward_scan_with_predictions(
     filtered_mean: jax.Array,
     filtered_cov: jax.Array,
@@ -923,7 +918,7 @@ def rts_backward_scan_with_predictions(
     )
 
 
-@jax.jit
+@typed_jit
 def _kalman_smoother_impl(
     init_mean: jax.Array,
     init_cov: jax.Array,
@@ -1044,17 +1039,14 @@ def kalman_smoother(
             filter_name="kalman_smoother",
         )
 
-    return cast(
-        tuple[jax.Array, jax.Array, jax.Array, jax.Array],
-        _kalman_smoother_impl(
-            init_mean,
-            init_cov,
-            obs,
-            transition_matrix,
-            process_cov,
-            measurement_matrix,
-            measurement_cov,
-        ),
+    return _kalman_smoother_impl(
+        init_mean,
+        init_cov,
+        obs,
+        transition_matrix,
+        process_cov,
+        measurement_matrix,
+        measurement_cov,
     )
 
 
@@ -1365,16 +1357,13 @@ def smooth_initial_state_with_cross_cov(
     init_cross_cov : jax.Array, shape (n_cont_states, n_cont_states)
         $$ C_{0,1} = Cov(x_0, x_1 | y_{1:T}) $$.
     """
-    return cast(
-        tuple[jax.Array, jax.Array, jax.Array],
-        _kalman_smoother_update(
-            jnp.asarray(first_smoother_mean),
-            jnp.asarray(first_smoother_cov),
-            jnp.asarray(prior.init_mean),
-            jnp.asarray(prior.init_cov),
-            jnp.asarray(prior.process_cov),
-            jnp.asarray(prior.transition_matrix),
-        ),
+    return _kalman_smoother_update(
+        jnp.asarray(first_smoother_mean),
+        jnp.asarray(first_smoother_cov),
+        jnp.asarray(prior.init_mean),
+        jnp.asarray(prior.init_cov),
+        jnp.asarray(prior.process_cov),
+        jnp.asarray(prior.transition_matrix),
     )
 
 
@@ -1563,22 +1552,12 @@ def kalman_maximization_step(
             DeprecationWarning,
             stacklevel=2,
         )
-    return cast(
-        tuple[
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-        ],
-        _kalman_maximization_step(
-            obs, smoother_mean, smoother_cov, smoother_cross_cov, initial_state_prior
-        ),
+    return _kalman_maximization_step(
+        obs, smoother_mean, smoother_cov, smoother_cross_cov, initial_state_prior
     )
 
 
-@jax.jit
+@typed_jit
 def _kalman_maximization_step(
     obs: jax.Array,
     smoother_mean: jax.Array,

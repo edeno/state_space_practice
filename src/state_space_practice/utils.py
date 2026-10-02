@@ -4,7 +4,8 @@ import functools
 import logging
 import operator
 import warnings
-from typing import cast
+from collections.abc import Callable
+from typing import Any, ParamSpec, TypeVar, cast
 
 import jax
 import jax.numpy as jnp
@@ -19,6 +20,23 @@ logger = logging.getLogger(__name__)
 
 # Type alias for numeric values (scalars, numpy arrays, JAX arrays)
 Numeric = float | int | np.ndarray | jax.Array
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def typed_jit(fun: Callable[_P, _R], /, **jit_kwargs: Any) -> Callable[_P, _R]:
+    """``jax.jit`` that keeps ``fun``'s signature visible to type checkers.
+
+    ``jax.jit`` returns a wrapper whose ``__call__`` is typed ``(*Any) -> Any``,
+    so mypy checks neither the arguments nor the result at a jitted call. This
+    returns the identical ``jax.jit(fun, **jit_kwargs)`` object, typed as
+    ``fun``. Use it like ``jax.jit``: ``@typed_jit`` or
+    ``@functools.partial(typed_jit, static_argnames=...)``. The jit-only
+    attributes (``.lower``, ``.trace``) still exist at runtime but are not
+    visible to the type checker.
+    """
+    return cast(Callable[_P, _R], jax.jit(fun, **jit_kwargs))
 
 
 # ---------------------------------------------------------------------------
@@ -594,7 +612,7 @@ def project_psd_relative(
             min_eigenvalue=jnp.min(eigvals),
             max_abs_eigenvalue=jnp.max(jnp.abs(eigvals)),
         )
-    return cast(Array, projected)
+    return projected
 
 
 def floor_variances_relative(
@@ -1772,7 +1790,7 @@ def make_discrete_transition_matrix(diag: Array, n_discrete_states: int) -> Arra
 # ---------------------------------------------------------------------------
 
 
-@jax.jit
+@typed_jit
 def hmm_viterbi(
     initial_probs: Array,
     transition_matrix: Array,

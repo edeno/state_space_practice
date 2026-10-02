@@ -21,7 +21,7 @@ import logging
 import math
 import warnings
 from functools import partial
-from typing import NamedTuple, cast
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -38,6 +38,7 @@ from state_space_practice.utils import (
     psd_logdet,
     psd_solve,
     symmetrize,
+    typed_jit,
 )
 from state_space_practice.utils import validate_choice_indices as _validate_choices
 
@@ -118,7 +119,7 @@ def _softmax_update_core(
     prior_cov: Array,
     choice: Array,
     n_options: int,
-    inverse_temperature: float,
+    inverse_temperature: float | Array,
     max_newton_steps: int = 10,
     obs_offset: Array | None = None,
 ) -> tuple[Array, Array, Array, Array]:
@@ -451,25 +452,22 @@ def multinomial_choice_filter(
     else:
         init_cov = jnp.asarray(init_cov, dtype=dtype)
 
-    return cast(
-        ChoiceFilterResult,
-        _multinomial_choice_filter_jit(
-            choices_arr,
-            n_options,
-            process_noise,
-            inverse_temperature,
-            init_mean,
-            init_cov,
-        ),
+    return _multinomial_choice_filter_jit(
+        choices_arr,
+        n_options,
+        process_noise,
+        inverse_temperature,
+        init_mean,
+        init_cov,
     )
 
 
-@partial(jax.jit, static_argnames=("n_options",))
+@partial(typed_jit, static_argnames=("n_options",))
 def _multinomial_choice_filter_jit(
     choices: Array,
     n_options: int,
-    process_noise: float,
-    inverse_temperature: float,
+    process_noise: float | Array,
+    inverse_temperature: float | Array,
     init_mean: Array,
     init_cov: Array,
 ) -> ChoiceFilterResult:
@@ -1040,7 +1038,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
             jnp.zeros(k_free),
             jnp.eye(k_free),
         )
-        return cast(Array, -result.marginal_log_likelihood)
+        return -result.marginal_log_likelihood
 
     def _store_sgd_params(self, params: dict) -> None:
         if "process_noise" in params:

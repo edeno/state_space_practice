@@ -30,12 +30,48 @@ from state_space_practice.utils import (
     stabilize_probability_vector,
     stabilize_transition_matrix,
     symmetrize,
+    typed_jit,
     validate_covariance,
     validate_int,
     validate_probability_vector,
     validate_transition_matrix,
     zero_preserving_log,
 )
+
+
+class TestTypedJit:
+    """typed_jit must behave exactly like jax.jit at runtime."""
+
+    def test_compiles_once_and_matches_eager(self) -> None:
+        n_traces = 0
+
+        def f(x: jax.Array) -> jax.Array:
+            nonlocal n_traces
+            n_traces += 1
+            return jnp.sin(x) * 2.0
+
+        jitted = typed_jit(f)
+        x = jnp.linspace(0.0, 1.0, 5)
+        first = jitted(x)
+        second = jitted(x + 1.0)
+
+        assert n_traces == 1  # second call hit the compilation cache
+        np.testing.assert_allclose(first, jnp.sin(x) * 2.0)
+        np.testing.assert_allclose(second, jnp.sin(x + 1.0) * 2.0)
+
+    def test_forwards_static_argnames(self) -> None:
+        def f(x: jax.Array, power: int) -> jax.Array:
+            # Python control flow on `power` needs it to be static.
+            return x**power if power > 0 else jnp.ones_like(x)
+
+        x = jnp.array([2.0, 3.0])
+        static = typed_jit(f, static_argnames=("power",))
+        np.testing.assert_allclose(static(x, power=2), [4.0, 9.0])
+        np.testing.assert_allclose(static(x, power=0), [1.0, 1.0])
+
+        # Guard: without static_argnames the same function cannot trace.
+        with pytest.raises(jax.errors.TracerBoolConversionError):
+            typed_jit(f)(x, 2)
 
 
 class TestCheckConverged:

@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import NamedTuple, cast
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -55,6 +55,7 @@ from state_space_practice.switching_kalman import (
     switching_kalman_smoother,
 )
 from state_space_practice.utils import (
+    typed_jit,
     validate_choice_indices,
 )
 
@@ -234,29 +235,26 @@ def switching_choice_filter(
         its mode.
     """
     validate_choice_indices(choices, n_options)
-    return cast(
-        SwitchingChoiceFilterResult,
-        _switching_choice_filter_jit(
-            choices,
-            n_options,
-            n_discrete_states,
-            covariates,
-            input_gain,
-            obs_covariates,
-            obs_weights,
-            process_noises,
-            inverse_temperatures,
-            decays,
-            discrete_transition_matrix,
-            init_mean,
-            init_cov,
-            init_discrete_prob,
-        ),
+    return _switching_choice_filter_jit(
+        choices,
+        n_options,
+        n_discrete_states,
+        covariates,
+        input_gain,
+        obs_covariates,
+        obs_weights,
+        process_noises,
+        inverse_temperatures,
+        decays,
+        discrete_transition_matrix,
+        init_mean,
+        init_cov,
+        init_discrete_prob,
     )
 
 
 @functools.partial(
-    jax.jit,
+    typed_jit,
     static_argnames=["n_options", "n_discrete_states"],
 )
 def _switching_choice_filter_jit(
@@ -547,7 +545,7 @@ def _switching_choice_filter_jit(
     )
 
 
-@jax.jit
+@typed_jit
 def switching_choice_smoother(
     filtered_values: Array,
     filtered_covs: Array,
@@ -1235,7 +1233,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
         # The jitted core, not the validating public wrapper: fit_sgd already
         # validated the choices, which are a traced jit argument here.
         result = _switching_choice_filter_jit(**kwargs)
-        return cast(Array, -result.marginal_log_likelihood)
+        return -result.marginal_log_likelihood
 
     def _store_sgd_params(self, params: dict) -> None:
         self.process_noises_ = params["process_noises"]
