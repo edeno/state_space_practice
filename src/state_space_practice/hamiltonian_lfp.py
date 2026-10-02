@@ -15,6 +15,7 @@ from jax.typing import ArrayLike
 
 from state_space_practice.hamiltonian_core import (
     HamiltonianModelBase,
+    _SingleRegimeHamiltonianModel,
     default_init_mean,
     mlp_l2_penalty,
 )
@@ -32,7 +33,7 @@ if TYPE_CHECKING:
     import optax
 
 
-class HamiltonianLFPModel(HamiltonianModelBase):
+class HamiltonianLFPModel(_SingleRegimeHamiltonianModel):
     """LFP Model with Hamiltonian dynamics and Gaussian noise."""
 
     _observation_model = "gaussian"

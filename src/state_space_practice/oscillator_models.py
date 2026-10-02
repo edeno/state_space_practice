@@ -2230,7 +2230,7 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
 
         return params, spec
 
-    def fit_sgd(  # type: ignore[override]  # connectivity_penalty inserted before skip_init
+    def fit_sgd(
         self,
         observations: ArrayLike,
         key: Array | None = None,
@@ -2238,8 +2238,8 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
-        connectivity_penalty: "OscillatorPenaltyConfig | None" = None,
         skip_init: bool = False,
+        connectivity_penalty: "OscillatorPenaltyConfig | None" = None,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
 
@@ -2263,11 +2263,11 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         num_steps : int
         verbose : bool
         convergence_tol : float or None
+        skip_init : bool, default=False
+            If True, skip initialization and warm start.
         connectivity_penalty : OscillatorPenaltyConfig or None
             If provided, adds structured sparsity penalties on
             coupling_strength during SGD optimization.
-        skip_init : bool, default=False
-            If True, skip initialization and warm start.
 
         Returns
         -------

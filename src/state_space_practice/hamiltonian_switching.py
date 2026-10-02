@@ -21,7 +21,7 @@ from state_space_practice.hamiltonian_core import (
     mlp_l2_penalty,
     point_process_laplace_update,
 )
-from state_space_practice.hamiltonian_joint import JointHamiltonianModel
+from state_space_practice.hamiltonian_joint import _JointHamiltonianBase
 from state_space_practice.nonlinear_dynamics import (
     apply_mlp,
     ekf_predict_step,
@@ -426,12 +426,12 @@ def switching_hamiltonian_smoother(
     return m_s, P_s, pi_s
 
 
-class SwitchingHamiltonianJointModel(JointHamiltonianModel):
+class SwitchingHamiltonianJointModel(_JointHamiltonianBase):
     """Switching Model with multiple Hamiltonian energy landscapes."""
 
     _has_discrete_states = True
     _sgd_param_attrs = {
-        **JointHamiltonianModel._sgd_param_attrs,
+        **_JointHamiltonianBase._sgd_param_attrs,
         "init_mean": "init_mean",
         "Z": "discrete_transition_matrix",
         "init_pi": "init_discrete_state_prob",
@@ -514,7 +514,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
             [jnp.eye(self.n_cont_states)] * self.n_discrete_states, axis=2
         )
 
-    def filter(  # type: ignore[override]
+    def filter(
         self,
         lfp_data: ArrayLike,
         spike_data: ArrayLike,
@@ -526,13 +526,13 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
             (lfp_data, spike_data), self._complete_filter_params(params)
         )
 
-    def _filter_jit(  # type: ignore[override]
+    def _filter_jit(
         self, observations: Any, params: dict[str, Any]
     ) -> tuple[Array, Array, Array, Array]:
         """Switching filter core: ``(means, covs, discrete_probs, marginal_lls)``."""
         return switching_hamiltonian_filter(observations, params, dt=self.dt)
 
-    def smooth(  # type: ignore[override]
+    def smooth(
         self,
         lfp_data: ArrayLike,
         spike_data: ArrayLike,
@@ -551,7 +551,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
             (lfp_data, spike_data), self._complete_filter_params(params)
         )
 
-    def _smooth_jit(  # type: ignore[override]
+    def _smooth_jit(
         self, observations: Any, params: dict[str, Any]
     ) -> tuple[Array, Array, Array]:
         """Switching smoother core: ``(means, covs, discrete_probs)``."""

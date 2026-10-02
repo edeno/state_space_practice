@@ -587,7 +587,7 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
     and nothing else: no EM layer, no abstract initialization hooks and no
     ``fit`` -- ``fit_sgd`` is the only fitting entry point. Concrete models
     add their observation head(s), the validating ``filter`` / ``smooth``
-    wrappers, ``_build_param_spec``, ``_sgd_loss_fn`` and
+    wrappers (single-regime contract: :class:`_SingleRegimeHamiltonianModel`), ``_build_param_spec``, ``_sgd_loss_fn`` and
     ``_validate_fit_data``, and name their readout in ``_observation_model``.
 
     Each concrete model also declares a thin public ``fit_sgd`` with its own
@@ -666,36 +666,6 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
             )
         return super()._discrete_state_posterior(caller)
 
-    def _filter_jit(
-        self, observations: Any, params: dict[str, Any]
-    ) -> tuple[Array, Array, Array]:
-        """Run the jitted filter core on validated data and completed params."""
-        return hamiltonian_ekf_filter(
-            observations,
-            params,
-            dt=self.dt,
-            observation_model=self._observation_model,
-        )
-
-    def _smooth_jit(
-        self, observations: Any, params: dict[str, Any]
-    ) -> tuple[Array, Array]:
-        """Run the jitted smoother core on validated data and completed params."""
-        return hamiltonian_ekf_smoother(
-            observations,
-            params,
-            dt=self.dt,
-            observation_model=self._observation_model,
-        )
-
-    def filter(self, *args: Any, **kwargs: Any) -> tuple[Array, Array, Array]:
-        """Filter with the concrete model's observation-specific arguments."""
-        raise NotImplementedError(f"{type(self).__name__} must implement filter.")
-
-    def smooth(self, *args: Any, **kwargs: Any) -> tuple[Array, Array]:
-        """Smooth with the concrete model's observation-specific arguments."""
-        raise NotImplementedError(f"{type(self).__name__} must implement smooth.")
-
     def _validate_fit_data(self, *data: Any, **kwargs: Any) -> tuple[Array, ...]:
         """Validate the observation arrays given to ``fit_sgd`` (non-empty).
 
@@ -736,6 +706,47 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
             self.init_mean = self.init_mean.at[:, 0].set(params["init_mean"])
         if "Q" in params:
             self.process_cov = jnp.stack([stabilize_covariance(params["Q"])], axis=2)
+
+
+class _SingleRegimeHamiltonianModel(HamiltonianModelBase):
+    """Hamiltonian model with one dynamical regime.
+
+    Owns the single-regime filter contract -- ``filter`` returns ``(means,
+    covs, marginal_lls)`` and ``smooth`` ``(means, covs)`` -- and the
+    ``_finalize_sgd`` that relies on it. The LFP, spike and joint models
+    derive from it; ``SwitchingHamiltonianJointModel``, whose filter also
+    returns discrete-state probabilities, does not.
+    """
+
+    def _filter_jit(
+        self, observations: Any, params: dict[str, Any]
+    ) -> tuple[Array, Array, Array]:
+        """Run the jitted filter core on validated data and completed params."""
+        return hamiltonian_ekf_filter(
+            observations,
+            params,
+            dt=self.dt,
+            observation_model=self._observation_model,
+        )
+
+    def _smooth_jit(
+        self, observations: Any, params: dict[str, Any]
+    ) -> tuple[Array, Array]:
+        """Run the jitted smoother core on validated data and completed params."""
+        return hamiltonian_ekf_smoother(
+            observations,
+            params,
+            dt=self.dt,
+            observation_model=self._observation_model,
+        )
+
+    def filter(self, *args: Any, **kwargs: Any) -> tuple[Array, Array, Array]:
+        """Filter with the concrete model's observation-specific arguments."""
+        raise NotImplementedError(f"{type(self).__name__} must implement filter.")
+
+    def smooth(self, *args: Any, **kwargs: Any) -> tuple[Array, Array]:
+        """Smooth with the concrete model's observation-specific arguments."""
+        raise NotImplementedError(f"{type(self).__name__} must implement smooth.")
 
     def _finalize_sgd(self, *data: Any, **kwargs: Any) -> None:
         """Run filter + smoother to populate fitted states after SGD.

@@ -18,6 +18,7 @@ from jax.typing import ArrayLike
 from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.hamiltonian_core import (
     HamiltonianModelBase,
+    _SingleRegimeHamiltonianModel,
     default_init_mean,
     mlp_l2_penalty,
     poisson_rollout_nll,
@@ -42,8 +43,9 @@ if TYPE_CHECKING:
     import optax
 
 
-class JointHamiltonianModel(HamiltonianModelBase):
-    """Joint Model combining Gaussian LFP and Poisson Spikes."""
+class _JointHamiltonianBase(HamiltonianModelBase):
+    """LFP + spike machinery shared by the single- and switching-regime joint
+    models (data validation, observation heads, parameter spec, ``fit_sgd``)."""
 
     _observation_model = "joint"
     _sgd_param_attrs = {
@@ -199,30 +201,6 @@ class JointHamiltonianModel(HamiltonianModelBase):
     def _r_lfp(self) -> Array:
         return self.R_lfp
 
-    def filter(
-        self,
-        lfp_data: ArrayLike,
-        spike_data: ArrayLike,
-        params: dict[str, Any],
-    ) -> tuple[Array, Array, Array]:
-        """Hybrid EKF: sequentially update from LFP then Spikes."""
-        lfp_data, spike_data = self._validate_joint_data(lfp_data, spike_data)
-        return self._filter_jit(
-            (lfp_data, spike_data), self._complete_filter_params(params)
-        )
-
-    def smooth(
-        self,
-        lfp_data: ArrayLike,
-        spike_data: ArrayLike,
-        params: dict[str, Any],
-    ) -> tuple[Array, Array]:
-        """Apply EKF-RTS Smoother to joint data."""
-        lfp_data, spike_data = self._validate_joint_data(lfp_data, spike_data)
-        return self._smooth_jit(
-            (lfp_data, spike_data), self._complete_filter_params(params)
-        )
-
     def _validate_joint_data(
         self,
         lfp_data: ArrayLike,
@@ -353,6 +331,44 @@ class JointHamiltonianModel(HamiltonianModelBase):
         }
         return params, spec
 
+    def _store_sgd_params(self, params: dict[str, Any]) -> None:
+        super()._store_sgd_params(params)
+        if "R_lfp" in params:
+            self.R_lfp = stabilize_covariance(params["R_lfp"])
+            self._obs_noise_std = float(jnp.sqrt(jnp.mean(jnp.diag(self.R_lfp))))
+
+        # Resync the combined observation containers with the two heads.
+        self.measurement_matrix = self._measurement_matrix_all_states()
+        self.measurement_cov = self._measurement_cov_all_states()
+
+
+class JointHamiltonianModel(_JointHamiltonianBase, _SingleRegimeHamiltonianModel):
+    """Joint Model combining Gaussian LFP and Poisson Spikes."""
+
+    def filter(
+        self,
+        lfp_data: ArrayLike,
+        spike_data: ArrayLike,
+        params: dict[str, Any],
+    ) -> tuple[Array, Array, Array]:
+        """Hybrid EKF: sequentially update from LFP then Spikes."""
+        lfp_data, spike_data = self._validate_joint_data(lfp_data, spike_data)
+        return self._filter_jit(
+            (lfp_data, spike_data), self._complete_filter_params(params)
+        )
+
+    def smooth(
+        self,
+        lfp_data: ArrayLike,
+        spike_data: ArrayLike,
+        params: dict[str, Any],
+    ) -> tuple[Array, Array]:
+        """Apply EKF-RTS Smoother to joint data."""
+        lfp_data, spike_data = self._validate_joint_data(lfp_data, spike_data)
+        return self._smooth_jit(
+            (lfp_data, spike_data), self._complete_filter_params(params)
+        )
+
     def _sgd_loss_fn(
         self,
         params: dict[str, Any],
@@ -386,13 +402,3 @@ class JointHamiltonianModel(HamiltonianModelBase):
             lik_loss = nll_l + nll_s
 
         return lik_loss + l2_reg * mlp_l2_penalty(params["mlp"])
-
-    def _store_sgd_params(self, params: dict[str, Any]) -> None:
-        super()._store_sgd_params(params)
-        if "R_lfp" in params:
-            self.R_lfp = stabilize_covariance(params["R_lfp"])
-            self._obs_noise_std = float(jnp.sqrt(jnp.mean(jnp.diag(self.R_lfp))))
-
-        # Resync the combined observation containers with the two heads.
-        self.measurement_matrix = self._measurement_matrix_all_states()
-        self.measurement_cov = self._measurement_cov_all_states()

@@ -144,6 +144,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **Subclasses that could not stand in for their parent no longer inherit
+  from it**: `CovariateChoiceModel` takes covariates positionally after
+  `choices` in `fit` / `fit_sgd`, so it now derives from the shared
+  `_MultinomialChoiceBase` instead of `MultinomialChoiceModel`; and
+  `SwitchingHamiltonianJointModel`, whose `filter` / `smooth` also return
+  discrete-state probabilities, derives from the shared `_JointHamiltonianBase`
+  instead of `JointHamiltonianModel`. Behavior and signatures are unchanged;
+  only `isinstance` / `issubclass` against the former parent change.
+- **`DirectedInfluenceModel.fit_sgd`**: `connectivity_penalty` now follows
+  `skip_init` (it was inserted before it, so a positional `skip_init` bound to
+  the penalty).
 - **Long result tuples are NamedTuples**: `switching_kalman_filter` and
   `switching_point_process_filter` return `SwitchingFilterResult`,
   `switching_kalman_smoother` / `switching_kalman_smoother_gpb2` return

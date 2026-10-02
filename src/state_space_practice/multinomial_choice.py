@@ -576,42 +576,16 @@ _DEFAULT_BETA_GRID = (0.1, 0.3, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0)
 _EM_MONOTONICITY_TOL = 1e-6
 
 
-class MultinomialChoiceModel(SGDFittableMixin):
-    """Multi-armed bandit choice model with evolving option values.
+class _MultinomialChoiceBase(SGDFittableMixin):
+    """Shared machinery of the softmax choice models.
 
-    Tracks latent option values from a sequence of choices using a
-    state-space model with softmax observation model. Uses EM to learn
-    the drift rate (process noise) and exploration-exploitation tradeoff
-    (inverse temperature).
-
-    The latent state x_t in R^{K-1} represents the relative value of
-    options 1 through K-1, with option 0 as the reference (value = 0).
-
-    Typical workflow::
-
-        model = MultinomialChoiceModel(n_options=4)
-        model.fit(choices, verbose=True)
-        print(model.summary())
-
-    Parameters
-    ----------
-    n_options : int
-        Number of choice options K.
-    init_inverse_temperature : float
-        Starting inverse temperature for EM.
-    init_process_noise : float
-        Starting process noise for EM.
-    learn_inverse_temperature : bool
-        Whether to learn beta via EM.
-    learn_process_noise : bool
-        Whether to learn Q via EM.
-
-    Notes
-    -----
-    ``CovariateChoiceModel`` (``covariate_choice.py``) subclasses this model.
-    The EM driver, the beta / process-noise M-steps, the SGD protocol, the
-    uncertainty summaries, BIC and the plots live here; a subclass changes
-    only what genuinely differs, through these hooks:
+    ``MultinomialChoiceModel`` and ``CovariateChoiceModel`` (``covariate_choice.py``)
+    derive from this base and differ only in their public ``fit`` / ``fit_sgd``
+    signatures (the covariate model takes covariates after ``choices``), so
+    neither overrides the other's. The EM driver, the beta / process-noise
+    M-steps, the SGD protocol, the uncertainty summaries, BIC and the plots
+    live here; a subclass changes only what genuinely differs, through these
+    hooks:
 
     - ``_run_filter()`` / ``_run_smoother()`` (which filter and smoother to
       run) and ``_filter_kwargs()`` (the keyword arguments selecting the
@@ -853,42 +827,6 @@ class MultinomialChoiceModel(SGDFittableMixin):
         self._n_trials = n_trials
         return jnp.asarray(choices_np, dtype=jnp.int32)
 
-    def fit(
-        self,
-        choices: ArrayLike,
-        max_iter: int = 50,
-        tolerance: float = 1e-4,
-        verbose: bool = False,
-        beta_grid: ArrayLike | None = None,
-    ) -> list[float]:
-        """Fit the model via EM algorithm.
-
-        Parameters
-        ----------
-        choices : ArrayLike, shape (n_trials,)
-            Observed choices (0-indexed integers in [0, K)).
-        max_iter : int
-            Maximum EM iterations.
-        tolerance : float
-            Convergence tolerance on the relative log-likelihood change
-            ``|LL_k - LL_{k-1}| / |LL_{k-1}| < tolerance`` (the absolute change
-            ``|LL_k - LL_{k-1}|`` when ``LL_{k-1} == 0``). This normalizes by the
-            previous LL only, not by the average of the two as
-            :func:`state_space_practice.utils.check_converged` does.
-        verbose : bool
-            Print progress each iteration.
-        beta_grid : ArrayLike or None
-            Candidate inverse temperatures for grid search.
-            Default: [0.1, 0.3, 0.5, 1, 2, 3, 5, 8, 12].
-
-        Returns
-        -------
-        log_likelihoods : list of float
-            Log-likelihood at each EM iteration.
-        """
-        choices_arr = self._prepare_choices(choices, "EM")
-        return self._fit_em(choices_arr, max_iter, tolerance, verbose, beta_grid)
-
     def _fit_em(
         self,
         choices_arr: Array,
@@ -962,38 +900,6 @@ class MultinomialChoiceModel(SGDFittableMixin):
         self._finalize_convergence(converged, max_iter)
 
         return log_likelihoods
-
-    def fit_sgd(
-        self,
-        choices: ArrayLike,
-        optimizer: optax.GradientTransformation | None = None,
-        num_steps: int = 200,
-        verbose: bool = False,
-        convergence_tol: float | None = None,
-    ) -> list[float]:
-        """Fit by minimizing negative marginal LL via gradient descent.
-
-        Parameters
-        ----------
-        choices : ArrayLike, shape (n_trials,)
-            Observed choices (0-indexed integers in [0, K)).
-        optimizer : optax optimizer or None
-            Gradient optimizer. Default: adam(1e-2) with gradient clipping.
-        num_steps : int
-            Number of optimization steps.
-        verbose : bool
-            Log progress every 10 steps.
-        convergence_tol : float or None
-            If set, stop early when loss change < tol for 5 consecutive steps.
-
-        Returns
-        -------
-        log_likelihoods : list of float
-        """
-        choices_arr = self._prepare_choices(choices, "SGD")
-        return self._fit_sgd_validated(
-            choices_arr, optimizer, num_steps, verbose, convergence_tol
-        )
 
     def _fit_sgd_validated(
         self,
@@ -1422,6 +1328,106 @@ class MultinomialChoiceModel(SGDFittableMixin):
 
         fig.tight_layout()
         return fig, np.array([ax0, ax1, ax2])
+
+
+class MultinomialChoiceModel(_MultinomialChoiceBase):
+    """Multi-armed bandit choice model with evolving option values.
+
+    Tracks latent option values from a sequence of choices using a
+    state-space model with softmax observation model. Uses EM to learn
+    the drift rate (process noise) and exploration-exploitation tradeoff
+    (inverse temperature).
+
+    The latent state x_t in R^{K-1} represents the relative value of
+    options 1 through K-1, with option 0 as the reference (value = 0).
+
+    Typical workflow::
+
+        model = MultinomialChoiceModel(n_options=4)
+        model.fit(choices, verbose=True)
+        print(model.summary())
+
+    Parameters
+    ----------
+    n_options : int
+        Number of choice options K.
+    init_inverse_temperature : float
+        Starting inverse temperature for EM.
+    init_process_noise : float
+        Starting process noise for EM.
+    learn_inverse_temperature : bool
+        Whether to learn beta via EM.
+    learn_process_noise : bool
+        Whether to learn Q via EM.
+    """
+
+    def fit(
+        self,
+        choices: ArrayLike,
+        max_iter: int = 50,
+        tolerance: float = 1e-4,
+        verbose: bool = False,
+        beta_grid: ArrayLike | None = None,
+    ) -> list[float]:
+        """Fit the model via EM algorithm.
+
+        Parameters
+        ----------
+        choices : ArrayLike, shape (n_trials,)
+            Observed choices (0-indexed integers in [0, K)).
+        max_iter : int
+            Maximum EM iterations.
+        tolerance : float
+            Convergence tolerance on the relative log-likelihood change
+            ``|LL_k - LL_{k-1}| / |LL_{k-1}| < tolerance`` (the absolute change
+            ``|LL_k - LL_{k-1}|`` when ``LL_{k-1} == 0``). This normalizes by the
+            previous LL only, not by the average of the two as
+            :func:`state_space_practice.utils.check_converged` does.
+        verbose : bool
+            Print progress each iteration.
+        beta_grid : ArrayLike or None
+            Candidate inverse temperatures for grid search.
+            Default: [0.1, 0.3, 0.5, 1, 2, 3, 5, 8, 12].
+
+        Returns
+        -------
+        log_likelihoods : list of float
+            Log-likelihood at each EM iteration.
+        """
+        choices_arr = self._prepare_choices(choices, "EM")
+        return self._fit_em(choices_arr, max_iter, tolerance, verbose, beta_grid)
+
+    def fit_sgd(
+        self,
+        choices: ArrayLike,
+        optimizer: optax.GradientTransformation | None = None,
+        num_steps: int = 200,
+        verbose: bool = False,
+        convergence_tol: float | None = None,
+    ) -> list[float]:
+        """Fit by minimizing negative marginal LL via gradient descent.
+
+        Parameters
+        ----------
+        choices : ArrayLike, shape (n_trials,)
+            Observed choices (0-indexed integers in [0, K)).
+        optimizer : optax optimizer or None
+            Gradient optimizer. Default: adam(1e-2) with gradient clipping.
+        num_steps : int
+            Number of optimization steps.
+        verbose : bool
+            Log progress every 10 steps.
+        convergence_tol : float or None
+            If set, stop early when loss change < tol for 5 consecutive steps.
+
+        Returns
+        -------
+        log_likelihoods : list of float
+        """
+        choices_arr = self._prepare_choices(choices, "SGD")
+        return self._fit_sgd_validated(
+            choices_arr, optimizer, num_steps, verbose, convergence_tol
+        )
 
 
 class SimulatedChoiceData(NamedTuple):

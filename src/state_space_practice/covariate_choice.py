@@ -39,7 +39,7 @@ from numpy.typing import NDArray
 from state_space_practice.multinomial_choice import (
     ChoiceFilterResult,
     ChoiceSmootherResult,
-    MultinomialChoiceModel,
+    _MultinomialChoiceBase,
     _softmax_update_core,
     _warn_if_newton_unconverged,
 )
@@ -543,7 +543,7 @@ def _coerce_covariates(
     return arr
 
 
-class CovariateChoiceModel(MultinomialChoiceModel):
+class CovariateChoiceModel(_MultinomialChoiceBase):
     """Multi-armed bandit with covariate-driven value dynamics and
     observation-level choice biases.
 
@@ -559,7 +559,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
     MultinomialChoiceModel (pure random walk).
 
     The EM driver, uncertainty summaries, BIC and plots are inherited; this
-    class overrides the hooks listed in :class:`MultinomialChoiceModel`
+    class overrides the hooks listed in :class:`~state_space_practice.multinomial_choice._MultinomialChoiceBase`
     (filter selection, dynamics, logit offsets, M-steps, final E-step).
 
     Parameters
@@ -649,7 +649,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
             f"decay={self.decay:.4f}, fitted={fitted})"
         )
 
-    # --- Hooks (see MultinomialChoiceModel) ---
+    # --- Hooks (see _MultinomialChoiceBase) ---
 
     def _filter_kwargs(self) -> dict[str, Any]:
         kwargs = super()._filter_kwargs()
@@ -785,7 +785,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         self._obs_covariates = obs_covariates_arr
         return choices_arr
 
-    def fit(  # type: ignore[override]  # covariates inserted positionally after choices
+    def fit(
         self,
         choices: ArrayLike,
         covariates: ArrayLike | None = None,
@@ -826,7 +826,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         choices_arr = self._bind_covariates(choices, covariates, obs_covariates, "fit")
         return self._fit_em(choices_arr, max_iter, tolerance, verbose, beta_grid)
 
-    def fit_sgd(  # type: ignore[override]  # covariates inserted positionally after choices
+    def fit_sgd(
         self,
         choices: ArrayLike,
         covariates: ArrayLike | None = None,
@@ -883,7 +883,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
 
     def _sgd_loss_fn(self, params: SGDParams, choices: Array) -> Array:
         # Model attributes are read only for parameters that are not being
-        # optimized (see MultinomialChoiceModel._sgd_loss_fn).
+        # optimized (see _MultinomialChoiceBase._sgd_loss_fn).
         def _param(key: str, attr: str) -> Array:
             return params[key] if key in params else jnp.asarray(getattr(self, attr))
 

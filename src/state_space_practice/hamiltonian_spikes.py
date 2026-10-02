@@ -15,6 +15,7 @@ from jax.typing import ArrayLike
 
 from state_space_practice.hamiltonian_core import (
     HamiltonianModelBase,
+    _SingleRegimeHamiltonianModel,
     default_init_mean,
     mlp_l2_penalty,
     poisson_rollout_nll,
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
     import optax
 
 
-class HamiltonianSpikeModel(HamiltonianModelBase):
+class HamiltonianSpikeModel(_SingleRegimeHamiltonianModel):
     """Spike Model with Hamiltonian dynamics and Point-Process observations.
 
     ``fit_sgd(spikes, use_filter=True)`` optimizes the marginal Laplace-EKF
