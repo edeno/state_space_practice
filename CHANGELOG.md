@@ -178,6 +178,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   M-step projection from ~33 ms to ~15 ms per EM iteration independent of T.
   XLA fusion moves outputs at round-off (~1e-15 relative per call; ~1e-9
   relative in DIM-PP parameters after 12 EM iterations).
+- **The CNM / CNM-PP parameter sync is vectorized and jitted**:
+  `oscillator_utils.extract_correlated_noise_params_from_covariance(_stack)`
+  reduces all oscillator blocks in one pass instead of an O(n_osc²) Python
+  loop of `.at[].set` updates (3 / 22 / 91 ms -> 0.01 / 0.02 / 0.06 ms per
+  call at n_osc = 2 / 6 / 12; CNM standard-EM iterations at n_osc = 12 go from
+  ~180-250 ms to ~40-50 ms). Variance and phase are bit-identical; coupling
+  strength moves by at most 1 ulp, which the CNM-PP Laplace-EKF carries to
+  ~1e-9 relative in fitted parameters after 8 EM iterations.
 - **Reading a fitted attribute before fitting raises `NotFittedError`**
   instead of returning `None` (or a bare `AttributeError`). Fitted outputs of
   every model (smoothed/filtered states, posteriors, log likelihoods,

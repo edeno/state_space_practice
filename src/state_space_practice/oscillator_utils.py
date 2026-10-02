@@ -1098,11 +1098,29 @@ def constrain_correlated_noise_process_covariance(
     return constrained + lift * jnp.eye(constrained.shape[0], dtype=cov.dtype)
 
 
+@functools.partial(typed_jit, static_argnames=("n_oscillators",))
 def extract_correlated_noise_params_from_covariance(
     process_covariance: ArrayLike,
     n_oscillators: int,
 ) -> dict[str, jax.Array]:
-    """Extract CNM scientific parameters from a structured process covariance."""
+    """Extract CNM scientific parameters from a structured process covariance.
+
+    Parameters
+    ----------
+    process_covariance : ArrayLike, shape (2 * n_oscillators, 2 * n_oscillators)
+    n_oscillators : int
+        Static under the jit; must match ``process_covariance``.
+
+    Returns
+    -------
+    dict
+        ``variance`` of shape ``(n_oscillators,)`` (half the trace of each
+        diagonal block); ``coupling_strength`` and ``phase_difference`` of shape
+        ``(n_oscillators, n_oscillators)``, the scale and angle of the closest
+        scaled rotation to each strict-upper (``i < j``) cross-block and zero
+        on the diagonal and lower triangle. All blocks are reduced in one
+        vectorized pass.
+    """
     process_covariance = jnp.asarray(process_covariance)
     blocks = _matrix_to_oscillator_blocks(process_covariance)
     if blocks.shape[0] != n_oscillators:
@@ -1111,31 +1129,26 @@ def extract_correlated_noise_params_from_covariance(
             f"{n_oscillators} vs {blocks.shape[0]}."
         )
 
-    variance = jnp.zeros((n_oscillators,), dtype=process_covariance.dtype)
-    phase_difference = jnp.zeros(
-        (n_oscillators, n_oscillators), dtype=process_covariance.dtype
-    )
-    coupling_strength = jnp.zeros_like(phase_difference)
-
-    for i in range(n_oscillators):
-        variance = variance.at[i].set(0.5 * jnp.trace(blocks[i, i]))
-        for j in range(i + 1, n_oscillators):
-            scale, angle = _extract_scale_and_angle(blocks[i, j])
-            coupling_strength = coupling_strength.at[i, j].set(scale)
-            phase_difference = phase_difference.at[i, j].set(angle)
+    variance = 0.5 * jnp.trace(blocks, axis1=-2, axis2=-1).diagonal()
+    scale, angle = jax.vmap(jax.vmap(_extract_scale_and_angle))(blocks)
+    strict_upper = jnp.triu(jnp.ones((n_oscillators, n_oscillators), dtype=bool), k=1)
+    zero = jnp.zeros((), dtype=process_covariance.dtype)
 
     return {
         "variance": variance,
-        "phase_difference": phase_difference,
-        "coupling_strength": coupling_strength,
+        "phase_difference": jnp.where(strict_upper, angle, zero),
+        "coupling_strength": jnp.where(strict_upper, scale, zero),
     }
 
 
+@functools.partial(typed_jit, static_argnames=("n_oscillators",))
 def extract_correlated_noise_params_from_covariance_stack(
     process_covariances: ArrayLike,
     n_oscillators: int,
 ) -> dict[str, jax.Array]:
     """Extract CNM scientific parameters from a per-state covariance stack.
+
+    Jit-compiled with ``n_oscillators`` static, vectorized over states.
 
     Parameters
     ----------
@@ -1151,17 +1164,11 @@ def extract_correlated_noise_params_from_covariance_stack(
         ``(n_oscillators, n_oscillators, n_discrete_states)``, each slice from
         :func:`extract_correlated_noise_params_from_covariance`.
     """
-    process_covariances = jnp.asarray(process_covariances)
-    per_state = [
-        extract_correlated_noise_params_from_covariance(
-            process_covariances[..., j], n_oscillators
-        )
-        for j in range(process_covariances.shape[-1])
-    ]
-    return {
-        key: jnp.stack([p[key] for p in per_state], axis=-1)
-        for key in ("variance", "phase_difference", "coupling_strength")
-    }
+    return jax.vmap(
+        lambda cov: extract_correlated_noise_params_from_covariance(cov, n_oscillators),
+        in_axes=-1,
+        out_axes=-1,
+    )(jnp.asarray(process_covariances))
 
 
 @functools.partial(typed_jit, static_argnames=("n_oscillators",))

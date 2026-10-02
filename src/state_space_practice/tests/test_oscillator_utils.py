@@ -16,6 +16,7 @@ from state_space_practice.oscillator_utils import (
     _compute_coupled_oscillator_block,
     _compute_coupling_transition_block,
     _compute_intrinsic_oscillation_block,
+    _extract_scale_and_angle,
     _get_rotation_matrix,
     _get_scaling_factor,
     _project_to_closest_rotation,
@@ -27,9 +28,12 @@ from state_space_practice.oscillator_utils import (
     construct_common_oscillator_transition_matrix,
     construct_correlated_noise_measurement_matrix,
     construct_correlated_noise_process_covariance,
+    construct_correlated_noise_process_covariance_stack,
     construct_directed_influence_measurement_matrix,
     construct_directed_influence_transition_matrix,
     construct_stable_directed_influence_transition_stack,
+    extract_correlated_noise_params_from_covariance,
+    extract_correlated_noise_params_from_covariance_stack,
     extract_dim_params_from_matrix,
     extract_dim_params_from_matrix_stack,
     get_block_slice,
@@ -1241,6 +1245,79 @@ def _random_cnm_covariance(rng, n_oscillators, linkage_scale):
     for i in range(n_oscillators):
         scale[2 * i : 2 * i + 2, 2 * i : 2 * i + 2] = 1.0
     return jnp.asarray(cov * scale)
+
+
+def test_extract_cnm_params_recovers_constructed_covariance_parameters():
+    """Every state's variance and strict-upper coupling/phase come back from a
+    constructed CNM covariance stack; the diagonal and lower triangle are 0."""
+    rng = np.random.default_rng(3)
+    n_osc, n_states = 4, 2
+    upper = np.triu(np.ones((n_osc, n_osc)), k=1)[:, :, None]
+    variance = jnp.asarray(rng.uniform(0.5, 2.0, (n_osc, n_states)))
+    coupling = jnp.asarray(rng.uniform(0.05, 0.3, (n_osc, n_osc, n_states)) * upper)
+    phase = jnp.asarray(rng.uniform(-3.0, 3.0, (n_osc, n_osc, n_states)) * upper)
+    stack = construct_correlated_noise_process_covariance_stack(
+        variance, phase, coupling
+    )
+
+    params = extract_correlated_noise_params_from_covariance_stack(stack, n_osc)
+
+    np.testing.assert_allclose(params["variance"], variance, rtol=1e-12)
+    np.testing.assert_allclose(params["coupling_strength"], coupling, rtol=1e-12)
+    np.testing.assert_allclose(params["phase_difference"], phase, atol=1e-12)
+    single = extract_correlated_noise_params_from_covariance(stack[..., 1], n_osc)
+    for key, value in single.items():
+        np.testing.assert_allclose(value, params[key][..., 1], rtol=1e-14)
+
+
+def test_extract_cnm_params_matches_per_block_extraction_on_raw_covariance():
+    """On an unstructured covariance each upper block is reduced to its closest
+    scaled rotation as a block-by-block extraction does (to round-off: XLA may
+    fuse ``sqrt(a**2 + b**2)`` differently under jit)."""
+    n_osc = 5
+    cov = _random_cnm_covariance(np.random.default_rng(4), n_osc, 2.0)
+    blocks = cov.reshape(n_osc, 2, n_osc, 2).transpose(0, 2, 1, 3)
+    expected_variance = np.zeros(n_osc)
+    expected_scale = np.zeros((n_osc, n_osc))
+    expected_angle = np.zeros((n_osc, n_osc))
+    for i in range(n_osc):
+        expected_variance[i] = 0.5 * float(jnp.trace(blocks[i, i]))
+        for j in range(i + 1, n_osc):
+            scale, angle = _extract_scale_and_angle(blocks[i, j])
+            expected_scale[i, j] = float(scale)
+            expected_angle[i, j] = float(angle)
+
+    params = extract_correlated_noise_params_from_covariance(cov, n_osc)
+
+    assert np.min(expected_scale[np.triu_indices(n_osc, k=1)]) > 0.0  # guard
+    np.testing.assert_allclose(params["variance"], expected_variance, rtol=1e-14)
+    np.testing.assert_allclose(params["coupling_strength"], expected_scale, rtol=1e-14)
+    np.testing.assert_allclose(params["phase_difference"], expected_angle, rtol=1e-14)
+
+
+def test_extract_cnm_params_stack_compiles_once_per_shape() -> None:
+    """The CNM sync runs every EM iteration; new values must not recompile."""
+    n_osc, n_states = 7, 2
+    rng = np.random.default_rng(5)
+    stacks = [
+        jnp.stack(
+            [_random_cnm_covariance(rng, n_osc, 0.5) for _ in range(n_states)],
+            axis=-1,
+        )
+        for _ in range(4)
+    ]
+    with _count_backend_compiles() as first:
+        jax.block_until_ready(
+            extract_correlated_noise_params_from_covariance_stack(stacks[0], n_osc)
+        )
+    with _count_backend_compiles() as later:
+        for stack in stacks[1:]:
+            jax.block_until_ready(
+                extract_correlated_noise_params_from_covariance_stack(stack, n_osc)
+            )
+
+    assert len(first) <= 1
+    assert later == []
 
 
 def test_cnm_shrink_factor_matches_bisection_on_random_covariances():
