@@ -1590,6 +1590,94 @@ class TestComputeTrialComparisonMatrix:
             result1[upper_tri_mask], result2[upper_tri_mask], rtol=1e-5
         )
 
+    @pytest.fixture
+    def smoothed_posterior(self):
+        """A small smoothed posterior from the filter/smoother on real-ish data."""
+        outcomes = jnp.array([0, 0, 1, 0, 1, 1, 0, 1, 1, 1])
+        filt = smith_learning_filter(outcomes, max_possible_correct=1)
+        mode, var, _, gain = smith_learning_smoother(
+            filt.learning_state_mode,
+            filt.learning_state_variance,
+            filt.one_step_mode,
+            filt.one_step_variance,
+        )
+        return np.asarray(mode), np.asarray(var), np.asarray(gain)
+
+    def test_matches_joint_gaussian_closed_form(self, smoothed_posterior) -> None:
+        """Entry [i, j] is P(x_i > x_j) = Phi((m_i - m_j) / sd(x_i - x_j)) under
+        the joint smoothed posterior, Cov(x_i, x_j) = A_i...A_{j-1} P_{j|T}."""
+        from scipy.stats import norm
+
+        mode, var, gain = smoothed_posterior
+        n = len(mode)
+        cov = np.empty((n, n))
+        for i in range(n):
+            for j in range(i, n):
+                cov[i, j] = cov[j, i] = np.prod(gain[i:j]) * var[j]
+        expected = np.full((n, n), np.nan)
+        for i in range(n):
+            expected[i, i] = 0.5
+            for j in range(i + 1, n):
+                sd = np.sqrt(cov[i, i] + cov[j, j] - 2 * cov[i, j])
+                expected[i, j] = norm.cdf((mode[i] - mode[j]) / sd)
+
+        result = compute_trial_comparison_matrix(jax.random.PRNGKey(0), mode, var, gain)
+        np.testing.assert_allclose(result, expected, rtol=1e-10, atol=1e-14)
+
+    def test_matches_high_sample_monte_carlo(self, smoothed_posterior) -> None:
+        """The exact matrix agrees with 400k joint posterior draws to within
+        5 Monte Carlo standard errors."""
+        mode, var, gain = smoothed_posterior
+        cov = np.asarray(compute_cross_covariance_matrix(var, gain))
+        n_draws = 400_000
+        draws = np.random.default_rng(0).multivariate_normal(mode, cov, n_draws)
+        i_idx, j_idx = np.triu_indices(len(mode), k=1)
+        mc = np.mean(draws[:, i_idx] > draws[:, j_idx], axis=0)
+
+        result = np.asarray(
+            compute_trial_comparison_matrix(jax.random.PRNGKey(0), mode, var, gain)
+        )[i_idx, j_idx]
+        # guard: the comparisons span non-trivial probabilities
+        assert np.any((result > 0.05) & (result < 0.95))
+        mc_se = np.sqrt(np.maximum(result * (1 - result), 1e-6) / n_draws)
+        assert np.all(np.abs(result - mc) <= 5 * mc_se)
+
+    def test_independent_of_key_and_n_samples(self, smoothed_posterior) -> None:
+        """The probabilities are exact, so neither the key nor n_samples
+        changes them."""
+        mode, var, gain = smoothed_posterior
+        a = compute_trial_comparison_matrix(
+            jax.random.PRNGKey(0), mode, var, gain, n_samples=10
+        )
+        b = compute_trial_comparison_matrix(
+            jax.random.PRNGKey(99), mode, var, gain, n_samples=10_000
+        )
+        np.testing.assert_array_equal(a, b)
+
+    def test_probability_space_equals_latent_space(self, smoothed_posterior) -> None:
+        """sigmoid is strictly increasing, so P(p_i > p_j) = P(x_i > x_j)."""
+        mode, var, gain = smoothed_posterior
+        latent = compute_trial_comparison_matrix(jax.random.PRNGKey(0), mode, var, gain)
+        prob = compute_trial_comparison_matrix(
+            jax.random.PRNGKey(0),
+            mode,
+            var,
+            gain,
+            compare_probability=True,
+            prob_correct_by_chance=0.25,
+        )
+        np.testing.assert_array_equal(latent, prob)
+
+    def test_zero_variance_difference_is_indicator(self) -> None:
+        """With a deterministic difference (zero variance) the entry is the
+        indicator m_i > m_j, never NaN."""
+        mode = jnp.array([0.0, 1.0, 1.0])
+        var = jnp.zeros(3)
+        gain = jnp.full(2, 0.5)
+        result = compute_trial_comparison_matrix(jax.random.PRNGKey(0), mode, var, gain)
+        np.testing.assert_array_equal(result[0, 1:], [0.0, 0.0])
+        assert result[1, 2] == 0.0
+
 
 class TestCompareTwoTrials:
     """Tests for the compare_two_trials function."""
@@ -1673,7 +1761,18 @@ class TestCompareTwoTrials:
             trial2=3,
         )
 
-        np.testing.assert_allclose(p_12 + p_21, 1.0, rtol=0.05)
+        np.testing.assert_allclose(p_12 + p_21, 1.0, rtol=1e-12)
+
+    def test_matches_comparison_matrix_entry(self, model_data) -> None:
+        """The two-trial comparison is the matrix entry, whatever the key."""
+        mode, var, gain = model_data
+        matrix = compute_trial_comparison_matrix(jax.random.PRNGKey(0), mode, var, gain)
+        result = compare_two_trials(
+            jax.random.PRNGKey(7), mode, var, gain, trial1=3, trial2=12
+        )
+        # guard: a non-trivial probability
+        assert 0.01 < result < 0.99
+        np.testing.assert_allclose(result, matrix[3, 12], rtol=1e-12)
 
 
 class TestFindFirstSignificantTrial:

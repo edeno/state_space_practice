@@ -1159,62 +1159,28 @@ def compute_cross_covariance_matrix(
     return upper_tri + upper_tri.T - jnp.diag(jnp.diag(upper_tri))
 
 
-def _sample_trial_states(
-    key: Array,
-    mean: Array,
-    cov: Array,
-    n_samples: int,
-    compare_probability: bool,
-    prob_correct_by_chance: float | None,
-) -> Array:
-    """Draw joint Gaussian samples of learning states for trial comparisons.
+def _prob_difference_positive(mean_diff: Array, diff_variance: Array) -> Array:
+    """``P(D > 0)`` for ``D ~ N(mean_diff, diff_variance)``, elementwise.
 
-    Samples ``N(mean, cov)`` through an eigendecomposition of ``cov`` (negative
-    eigenvalues clipped to zero) and, if ``compare_probability``, maps them to
-    probability space with ``sigmoid(mu + x)``.
+    A non-positive variance (a deterministic difference, up to round-off)
+    gives the indicator ``mean_diff > 0``.
 
     Parameters
     ----------
-    key : Array
-        JAX PRNG key.
-    mean : Array, shape (n_compared,)
-        Smoothed learning-state modes of the compared trials.
-    cov : Array, shape (n_compared, n_compared)
-        Joint posterior covariance of the compared trials.
-    n_samples : int
-        Number of Monte Carlo samples.
-    compare_probability : bool
-        If True, return sigmoid-transformed samples.
-    prob_correct_by_chance : float or None
-        Chance-level probability setting the bias ``mu``; required when
-        ``compare_probability`` is True.
+    mean_diff : Array, shape (...)
+    diff_variance : Array, shape (...)
 
     Returns
     -------
-    samples : Array, shape (n_samples, n_compared)
-
-    Raises
-    ------
-    ValueError
-        If ``compare_probability`` is True and ``prob_correct_by_chance`` is
-        None.
+    prob : Array, shape (...)
     """
-    # Eigendecomposition for numerical stability
-    eigenvalues, eigenvectors = jnp.linalg.eigh(cov)
-    eigenvalues = jnp.maximum(eigenvalues, 0.0)  # Ensure non-negative
-    sqrt_cov = eigenvectors @ jnp.diag(jnp.sqrt(eigenvalues))
-
-    z = jax.random.normal(key, shape=(n_samples, mean.shape[0]))
-    samples: Array = mean + z @ sqrt_cov.T
-
-    if compare_probability:
-        if prob_correct_by_chance is None:
-            raise ValueError(
-                "prob_correct_by_chance is required when compare_probability=True"
-            )
-        mu_bias = math.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
-        samples = jax.nn.sigmoid(mu_bias + samples)
-    return samples
+    degenerate = diff_variance <= 0.0
+    sd = jnp.sqrt(jnp.where(degenerate, 1.0, diff_variance))
+    return jnp.where(
+        degenerate,
+        (mean_diff > 0.0).astype(sd.dtype),
+        jax.scipy.special.ndtr(mean_diff / sd),
+    )
 
 
 def compute_trial_comparison_matrix(
@@ -1226,16 +1192,28 @@ def compute_trial_comparison_matrix(
     compare_probability: bool = False,
     prob_correct_by_chance: float | None = None,
 ) -> Array:
-    """Compute pairwise comparison matrix for all trials (vectorized).
+    r"""Compute pairwise comparison matrix for all trials (vectorized).
 
     Computes P(x_i > x_j | y_{1:T}) for all pairs of trials i < j.
     This implements the full trialtotrial.m functionality using vectorized
     JAX operations for efficiency.
 
+    Under the Gaussian smoothed posterior, ``x_i - x_j`` is Gaussian with mean
+    ``m_i - m_j`` and variance ``P_i + P_j - 2 C_ij`` (``C`` from
+    :func:`compute_cross_covariance_matrix`), so
+
+    .. math::
+
+        P(x_i > x_j | y_{1:T}) = \Phi\left(
+            \frac{m_i - m_j}{\sqrt{P_i + P_j - 2 C_{ij}}}\right),
+
+    computed exactly (no sampling) in ``O(n_trials^2)`` memory.
+
     Parameters
     ----------
     key : Array
-        JAX PRNG key for Monte Carlo sampling.
+        Unused: the probabilities are exact. Kept for backward compatibility
+        (they were formerly Monte Carlo estimates).
     smoothed_learning_state_mode : jnp.ndarray, shape (n_trials,)
         Smoothed learning state modes (x_{k|T}).
     smoothed_learning_state_variance : jnp.ndarray, shape (n_trials,)
@@ -1243,12 +1221,15 @@ def compute_trial_comparison_matrix(
     smoother_gain : jnp.ndarray, shape (n_trials - 1,)
         Smoother gain values (A_k).
     n_samples : int, optional
-        Number of Monte Carlo samples per comparison. Default is 10000.
+        Unused (formerly the number of Monte Carlo samples). Kept for
+        backward compatibility.
     compare_probability : bool, optional
-        If True, compare in probability space. Default is False.
+        Compare in probability space, ``P(p_i > p_j)``. The sigmoid link is
+        strictly increasing, so this equals ``P(x_i > x_j)``; the result does
+        not depend on this flag. Default is False.
     prob_correct_by_chance : Optional[float], optional
-        Probability of correct response by chance. Required if compare_probability=True.
-        Used to compute the bias term for sigmoid transformation.
+        Probability of correct response by chance (the sigmoid bias for
+        ``compare_probability``). Does not affect the result.
 
     Returns
     -------
@@ -1256,32 +1237,30 @@ def compute_trial_comparison_matrix(
         Upper triangular matrix where entry [i, j] (i < j) contains
         P(x_i > x_j | y_{1:T}). Diagonal is 0.5, lower triangle is NaN.
     """
-    mode = jnp.asarray(smoothed_learning_state_mode)
+    return _exact_comparison_matrix(
+        jnp.asarray(smoothed_learning_state_mode),
+        jnp.asarray(smoothed_learning_state_variance),
+        jnp.asarray(smoother_gain),
+    )
+
+
+@typed_jit
+def _exact_comparison_matrix(
+    mode: Array, smoothed_variance: Array, smoother_gain: Array
+) -> Array:
+    """Exact ``P(x_i > x_j | y_{1:T})`` matrix; see
+    :func:`compute_trial_comparison_matrix` (same arguments and layout)."""
     n_trials = mode.shape[0]
 
-    # Compute full cross-covariance matrix
-    cross_cov_matrix = compute_cross_covariance_matrix(
-        smoothed_learning_state_variance, smoother_gain
+    # Full posterior covariance across trials, shape (n_trials, n_trials)
+    cross_cov_matrix = compute_cross_covariance_matrix(smoothed_variance, smoother_gain)
+    marginal_var = jnp.diag(cross_cov_matrix)
+    diff_variance = (
+        marginal_var[:, None] + marginal_var[None, :] - 2.0 * cross_cov_matrix
     )
-
-    # Joint samples for all trials at once: shape (n_samples, n_trials)
-    samples = _sample_trial_states(
-        key,
-        mode,
-        cross_cov_matrix,
-        n_samples,
-        compare_probability,
-        prob_correct_by_chance,
+    comparison_matrix = _prob_difference_positive(
+        mode[:, None] - mode[None, :], diff_variance
     )
-
-    # Compute P(x_i > x_j) for all pairs using broadcasting
-    # samples[:, :, None] has shape (n_samples, n_trials, 1)
-    # samples[:, None, :] has shape (n_samples, 1, n_trials)
-    # comparison has shape (n_samples, n_trials, n_trials)
-    comparison = samples[:, :, None] > samples[:, None, :]
-
-    # Mean over samples gives P(x_i > x_j)
-    comparison_matrix = jnp.mean(comparison, axis=0)
 
     # Set diagonal to 0.5 and lower triangle to NaN
     comparison_matrix = jnp.where(
@@ -1311,7 +1290,11 @@ def compare_two_trials(
 
     This implements the trial-to-trial comparison from trialtotrial.m,
     computing P(x_{trial1} > x_{trial2} | y_{1:T}) or optionally
-    P(p_{trial1} > p_{trial2} | y_{1:T}) for probability space.
+    P(p_{trial1} > p_{trial2} | y_{1:T}) for probability space. Both equal
+    ``Phi((m_1 - m_2) / sd(x_1 - x_2))`` under the joint Gaussian smoothed
+    posterior (the sigmoid link is strictly increasing) and are computed
+    exactly; this is entry ``[trial1, trial2]`` of
+    :func:`compute_trial_comparison_matrix`.
 
     For comparing many pairs, use compute_trial_comparison_matrix() instead
     which is more efficient due to vectorization.
@@ -1319,7 +1302,7 @@ def compare_two_trials(
     Parameters
     ----------
     key : Array
-        JAX PRNG key for Monte Carlo sampling.
+        Unused: the probability is exact. Kept for backward compatibility.
     smoothed_learning_state_mode : jnp.ndarray, shape (n_trials,)
         Smoothed learning state modes (x_{k|T}).
     smoothed_learning_state_variance : jnp.ndarray, shape (n_trials,)
@@ -1331,13 +1314,14 @@ def compare_two_trials(
     trial2 : int
         Second trial index (0-based). Must be different from trial1.
     n_samples : int, optional
-        Number of Monte Carlo samples. Default is 10000.
+        Unused (formerly the number of Monte Carlo samples). Kept for
+        backward compatibility.
     compare_probability : bool, optional
-        If True, compare in probability space (sigmoid-transformed).
-        If False, compare raw latent states. Default is False.
+        Compare in probability space (sigmoid-transformed) instead of raw
+        latent states; the result is the same. Default is False.
     prob_correct_by_chance : Optional[float], optional
-        Probability of correct response by chance. Required if compare_probability=True.
-        Used to compute the bias term for sigmoid transformation.
+        Probability of correct response by chance (the sigmoid bias for
+        ``compare_probability``). Does not affect the result.
 
     Returns
     -------
@@ -1350,21 +1334,16 @@ def compare_two_trials(
     if trial1 == trial2:
         return 0.5  # Same trial, no difference
 
-    # Sample from 2x2 marginal; avoids O(n² × n_samples) full comparison matrix
     cross_cov_matrix = compute_cross_covariance_matrix(
         smoothed_learning_state_variance, smoother_gain
     )
-    indices = jnp.array([trial1, trial2])
     mode = jnp.asarray(smoothed_learning_state_mode)
-    mean_2 = mode[indices]
-    cov_2 = cross_cov_matrix[jnp.ix_(indices, indices)]
-
-    # Sample from bivariate normal: shape (n_samples, 2)
-    samples = _sample_trial_states(
-        key, mean_2, cov_2, n_samples, compare_probability, prob_correct_by_chance
+    diff_variance = (
+        cross_cov_matrix[trial1, trial1]
+        + cross_cov_matrix[trial2, trial2]
+        - 2.0 * cross_cov_matrix[trial1, trial2]
     )
-
-    return float(jnp.mean(samples[:, 0] > samples[:, 1]))
+    return float(_prob_difference_positive(mode[trial1] - mode[trial2], diff_variance))
 
 
 def find_first_significant_trial(
@@ -2680,16 +2659,18 @@ class SmithLearningModel(SGDFittableMixin):
         Parameters
         ----------
         key : Array
-            JAX PRNG key for Monte Carlo sampling.
+            Unused (the comparison probabilities are exact); kept for
+            backward compatibility.
         trial1 : int
             First trial index (0-based).
         trial2 : int
             Second trial index (0-based).
         n_samples : int, optional
-            Number of Monte Carlo samples. Default is 10000.
+            Unused; kept for backward compatibility.
         compare_probability : bool, optional
-            If True, compare in probability space (sigmoid-transformed).
-            If False, compare raw latent states. Default is False.
+            If True, compare in probability space (sigmoid-transformed);
+            the sigmoid link is strictly increasing, so the result is the
+            same as for raw latent states. Default is False.
 
         Returns
         -------
@@ -2747,11 +2728,13 @@ class SmithLearningModel(SGDFittableMixin):
         Parameters
         ----------
         key : Array
-            JAX PRNG key for Monte Carlo sampling.
+            Unused (the comparison probabilities are exact); kept for
+            backward compatibility.
         n_samples : int, optional
-            Number of Monte Carlo samples per comparison. Default is 10000.
+            Unused; kept for backward compatibility.
         compare_probability : bool, optional
-            If True, compare in probability space. Default is False.
+            If True, compare in probability space; the sigmoid link is
+            strictly increasing, so the result is the same. Default is False.
 
         Returns
         -------
@@ -2809,15 +2792,17 @@ class SmithLearningModel(SGDFittableMixin):
         Parameters
         ----------
         key : Array
-            JAX PRNG key for Monte Carlo sampling.
+            Unused (the comparison probabilities are exact); kept for
+            backward compatibility.
         reference_trial : int, optional
             The reference trial to compare against. Default is 0 (first trial).
         significance_level : float, optional
             Two-tailed significance threshold. Default is 0.05.
         n_samples : int, optional
-            Number of Monte Carlo samples per comparison. Default is 10000.
+            Unused; kept for backward compatibility.
         compare_probability : bool, optional
-            If True, compare in probability space. Default is False.
+            If True, compare in probability space; the sigmoid link is
+            strictly increasing, so the result is the same. Default is False.
 
         Returns
         -------
@@ -3037,11 +3022,13 @@ class SmithLearningModel(SGDFittableMixin):
         Parameters
         ----------
         key : Array
-            JAX PRNG key for Monte Carlo sampling.
+            Unused (the comparison probabilities are exact); kept for
+            backward compatibility.
         n_samples : int, optional
-            Number of Monte Carlo samples per comparison. Default is 10000.
+            Unused; kept for backward compatibility.
         compare_probability : bool, optional
-            If True, compare in probability space. Default is False.
+            If True, compare in probability space; the sigmoid link is
+            strictly increasing, so the result is the same. Default is False.
         significance_level : float, optional
             Two-tailed significance threshold. Default is 0.05.
         title : Optional[str], optional

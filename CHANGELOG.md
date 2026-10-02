@@ -157,6 +157,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **Smith trial-to-trial comparisons are exact**
+  (`compute_trial_comparison_matrix`, `compare_two_trials` and the
+  `SmithLearningModel` methods `get_trial_comparison_matrix`,
+  `compare_trials`, `find_first_significant_improvement`,
+  `plot_trial_comparison_matrix`): ``P(x_i > x_j | y_{1:T}) =
+  Phi((m_i - m_j) / sd(x_i - x_j))`` under the joint smoothed posterior,
+  replacing the 10k-sample Monte Carlo estimate. The matrix built an
+  ``(n_samples, T, T)`` comparison array: peak RSS 1.0 GB at T = 100 and
+  14 GB at T = 400, now ~10 MB above baseline at both (and 0.1 s instead of
+  0.9-4.9 s for the first call). Values move by Monte Carlo noise only (at
+  most 0.017 vs the old estimate at T = 30-50, |z| <= 3.6 over ~2000
+  entries) and no longer depend on `key`. `key` and `n_samples` are still
+  accepted but unused; `compare_probability` gives the same result as the
+  latent comparison (the sigmoid link is strictly increasing).
 - **`covariate_choice_smoother` uses `kalman.rts_backward_scan_with_predictions`**
   (jitted; about 10x faster per call -- the previous un-jitted RTS pass
   re-traced on every EM iteration). Its gain solve is the shared, retrying one, so smoothed values
