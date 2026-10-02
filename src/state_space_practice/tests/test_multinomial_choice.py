@@ -719,6 +719,19 @@ class TestMultinomialSGDFitting:
         lls = model.fit_sgd(choices, num_steps=50)
         assert lls[-1] > lls[0]
 
+    def test_sgd_after_em_replaces_em_results(self):
+        """fit_sgd after fit records its own history and clears the EM-only
+        n_iter_, so nothing from the EM fit is left behind."""
+        rng = np.random.default_rng(42)
+        choices = rng.integers(0, 3, size=100)
+        model = MultinomialChoiceModel(n_options=3)
+        em_lls = model.fit(choices, max_iter=3)
+        assert model.n_iter_ == len(em_lls)  # guard: EM recorded an int
+
+        sgd_lls = model.fit_sgd(choices, num_steps=5)
+        assert model.n_iter_ is None
+        assert model.log_likelihood_history_ == sgd_lls
+
     def test_sgd_respects_constraints(self):
         rng = np.random.default_rng(42)
         model = MultinomialChoiceModel(n_options=3)

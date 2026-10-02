@@ -421,6 +421,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Fit results no longer go stale when switching between `fit` and
+  `fit_sgd`**: every EM `fit` and `fit_sgd` now records `log_likelihood_`,
+  `log_likelihood_history_`, `converged_` and `n_iter_` together (through
+  `SGDFittableMixin._record_fit_result`). Before, e.g. `PointProcessModel.fit`
+  after `fit_sgd` kept the SGD log-likelihood, history and convergence flag;
+  `PointProcessModel.fit`, `SwitchingSpikeOscillatorModel.fit`,
+  `PlaceFieldModel.fit` and the oscillator models' `fit` did not set
+  `log_likelihood_` at all; and `n_iter_` survived a later `fit_sgd`.
+  `n_iter_` is now available on every model (`None` until an EM fit, and after
+  `fit_sgd`). Multi-restart switching point-process fits report the best
+  restart's convergence flag.
 - **Switching point-process `fit_sgd` validates spike shape like `fit`**: a
   1-D array or a wrong neuron count raised a misleading
   "spike_params.baseline neuron dimension must match ..." error, after

@@ -2748,6 +2748,28 @@ class TestPointProcessSGDFitting:
         spike_indicator = jax.random.poisson(key, jnp.ones((n_time, n_neurons)) * 0.01)
         return n_state, dt, design_matrix, spike_indicator
 
+    def test_fit_results_are_replaced_when_switching_fitters(self, small_pp_problem):
+        """fit and fit_sgd each record log_likelihood_, its history, converged_
+        and n_iter_; switching fitters never leaves the other's values behind."""
+        n_state, dt, design_matrix, spike_indicator = small_pp_problem
+        model = PointProcessModel(n_state, dt)
+
+        em_lls = model.fit(design_matrix, spike_indicator, max_iter=3)
+        assert model.log_likelihood_ == em_lls[-1]
+        assert model.log_likelihood_history_ == em_lls
+        assert model.n_iter_ == len(em_lls)
+        assert isinstance(model.converged_, bool)
+
+        sgd_lls = model.fit_sgd(design_matrix, spike_indicator, num_steps=5)
+        assert model.log_likelihood_history_ == sgd_lls
+        assert model.n_iter_ is None  # n_iter_ counts EM iterations only
+
+        em_lls = model.fit(design_matrix, spike_indicator, max_iter=3)
+        assert model.log_likelihood_ == em_lls[-1]
+        assert model.log_likelihood_ != sgd_lls[-1]  # guard: the values differ
+        assert model.log_likelihood_history_ == em_lls
+        assert model.n_iter_ == len(em_lls)
+
     def test_sgd_improves_ll(self, small_pp_problem):
         n_state, dt, design_matrix, spike_indicator = small_pp_problem
         model = PointProcessModel(n_state, dt)

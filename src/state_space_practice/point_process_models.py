@@ -628,12 +628,12 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
             track_best=True,
             logger=logger,
         )
-        self.converged_ = result.converged
-        log_likelihoods = result.log_likelihoods
-        if log_likelihoods:
-            self.log_likelihood_ = float(log_likelihoods[-1])
-
-        return log_likelihoods
+        self._record_fit_result(
+            result.log_likelihoods,
+            result.converged,
+            n_iter=len(result.log_likelihoods),
+        )
+        return result.log_likelihoods
 
     def _fit_multi_restart(
         self,
@@ -652,19 +652,19 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         best_lls: list[float] | None = None
         best_final_ll = -float("inf")
         best_state: dict[str, object] | None = None
+        best_converged = False
 
         keys = jax.random.split(key, n_restarts)
 
         for restart in range(n_restarts):
             try:
                 lls = self._fit_single(spikes, max_iter, tol, keys[restart])
-                final_ll = float(
-                    getattr(self, "log_likelihood_", lls[-1] if lls else -float("inf"))
-                )
+                final_ll = lls[-1] if lls else -float("inf")
 
                 if final_ll > best_final_ll:
                     best_final_ll = final_ll
                     best_lls = lls
+                    best_converged = self.converged_
                     best_state = self._snapshot_em_state()
 
                 logger.info(
@@ -685,7 +685,12 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         self._restore_em_state(best_state)
 
         # Re-run E-step to populate all smoother outputs for the best params
-        self.log_likelihood_ = float(self._e_step(spikes))
+        self._record_fit_result(
+            best_lls,
+            best_converged,
+            n_iter=len(best_lls),
+            log_likelihood=float(self._e_step(spikes)),
+        )
 
         return best_lls
 

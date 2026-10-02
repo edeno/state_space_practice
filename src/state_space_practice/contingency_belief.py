@@ -1409,8 +1409,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
                     "the previous parameters."
                 )
 
-        self.log_likelihood_ = log_likelihoods[-1]
-        self.log_likelihood_history_ = log_likelihoods
+        self._record_fit_result(log_likelihoods, converged, n_iter=len(log_likelihoods))
         # Causal posterior: the forward pass of the final parameters' smoother
         self.state_posterior_ = self._smoother_result.filtered_state_prob
         self._populate_uncertainty(choices)

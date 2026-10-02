@@ -647,7 +647,6 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         self.learn_process_noise = learn_process_noise
 
         # EM iteration count; stays None after an SGD-only fit.
-        self.n_iter_: int | None = None
 
     def __repr__(self) -> str:
         fitted = self.is_fitted
@@ -908,8 +907,12 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         self._final_e_step(
             choices_arr, log_likelihoods, last_accepted, smooth if converged else None
         )
-        self.n_iter_ = len(log_likelihoods)
-        self.log_likelihood_history_ = log_likelihoods
+        self._record_fit_result(
+            log_likelihoods,
+            converged,
+            n_iter=len(log_likelihoods),
+            log_likelihood=self.log_likelihood_,
+        )
         self._populate_uncertainty(choices_arr)
         self._finalize_convergence(converged, max_iter)
 

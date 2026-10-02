@@ -1372,6 +1372,11 @@ class PlaceFieldModel(SGDFittableMixin):
             on_iteration=_on_iteration,
         )
         self.log_likelihoods = result.log_likelihoods
+        self._record_fit_result(
+            result.log_likelihoods,
+            result.converged,
+            n_iter=len(result.log_likelihoods),
+        )
         if result.converged:
             _print(f"  Converged after {len(self.log_likelihoods)} iterations.")
 

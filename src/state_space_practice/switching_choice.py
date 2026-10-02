@@ -1035,12 +1035,16 @@ class SwitchingChoiceModel(SGDFittableMixin):
         self.smoothed_discrete_probs_ = smoother_result.smoother_discrete_state_prob
         self._smoother_state_cond_means = smoother_result.state_cond_smoother_means
         self._smoother_state_cond_covs = smoother_result.state_cond_smoother_covs
-        self.log_likelihood_ = float(result.marginal_log_likelihood)
         # History is the per-iteration E-step LL trajectory; without
         # convergence its last entry predates the final M-step, so it
-        # intentionally differs from log_likelihood_ above (re-evaluated at the
+        # intentionally differs from log_likelihood_ (re-evaluated at the
         # final parameters).
-        self.log_likelihood_history_ = log_likelihoods
+        self._record_fit_result(
+            log_likelihoods,
+            converged,
+            n_iter=len(log_likelihoods),
+            log_likelihood=float(result.marginal_log_likelihood),
+        )
         self._populate_uncertainty(choices)
         self._finalize_convergence(converged, max_iter)
 

@@ -4092,6 +4092,11 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
             refresh_after_restore=True,
             logger=logger,
         )
+        self._record_fit_result(
+            result.log_likelihoods,
+            result.converged,
+            n_iter=len(result.log_likelihoods),
+        )
         return result.log_likelihoods
 
     # --- SGDFittableMixin protocol: model-specific dynamics parameters ---

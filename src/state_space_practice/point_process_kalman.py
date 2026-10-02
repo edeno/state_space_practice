@@ -3278,7 +3278,14 @@ class PointProcessModel(SGDFittableMixin):
     filtered_mean, filtered_cov : Array
         Filtered state estimates and covariances after fitting.
     log_likelihood_ : float
-        Marginal log-likelihood at the parameters fitted by :meth:`fit_sgd`.
+        Marginal log-likelihood at the fitted parameters (from the last
+        :meth:`fit` or :meth:`fit_sgd`).
+    log_likelihood_history_ : list[float]
+        Per-iteration (EM) or per-step (SGD) log-likelihoods of the last fit.
+    converged_ : bool
+        Whether the last fit met its convergence criterion.
+    n_iter_ : int or None
+        EM iterations of the last fit; ``None`` after :meth:`fit_sgd`.
 
     Reading a fitted attribute before fitting raises ``NotFittedError``.
 
@@ -3516,6 +3523,11 @@ class PointProcessModel(SGDFittableMixin):
             logger=logger,
             on_first_nonfinite="clear",
             clear_state=lambda: clear_attributes(self, posterior_keys),
+        )
+        self._record_fit_result(
+            result.log_likelihoods,
+            result.converged,
+            n_iter=len(result.log_likelihoods),
         )
         return result.log_likelihoods
 

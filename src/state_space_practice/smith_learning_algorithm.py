@@ -1648,7 +1648,6 @@ class SmithLearningModel(SGDFittableMixin):
 
         self.initial_state_method = initial_state_method
         # Set by EM (``fit``) only; stays None for an SGD fit.
-        self.n_iter_: int | None = None
 
     def __repr__(self) -> str:
         fitted = "fitted" if self.is_fitted else "not fitted"
@@ -1968,13 +1967,9 @@ class SmithLearningModel(SGDFittableMixin):
         if result.converged and verbose:
             logger.info("Converged. sigma_epsilon=%.4g", self.sigma_epsilon)
 
-        # Store fit diagnostics
-        if log_likelihoods:
-            self.log_likelihood_ = log_likelihoods[-1]
-        else:
-            del self.log_likelihood_
-        self.n_iter_ = len(log_likelihoods)
-        self.log_likelihood_history_ = log_likelihoods
+        self._record_fit_result(
+            log_likelihoods, result.converged, n_iter=len(log_likelihoods)
+        )
         self._n_trials_ = len(n_correct_responses)
 
         return log_likelihoods

@@ -1168,7 +1168,11 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
             clear_state=self._clear_smoother_state,
             logger=logger,
         )
-        self.converged_ = result.converged
+        self._record_fit_result(
+            result.log_likelihoods,
+            result.converged,
+            n_iter=len(result.log_likelihoods),
+        )
         return result.log_likelihoods
 
     # --- SGDFittableMixin protocol (shared by all oscillator subclasses) ---

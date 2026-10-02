@@ -405,9 +405,13 @@ class SGDFittableMixin:
     #: ``{**Parent._sgd_param_attrs, "key": "attr"}``.
     _sgd_param_attrs: ClassVar[Mapping[str, str]] = {}
 
-    # Set by fitting; reading one before then raises NotFittedError.
+    # Set by fitting (see ``_record_fit_result``); reading one before then
+    # raises NotFittedError.
     converged_: FittedAttribute[bool] = FittedAttribute()
+    log_likelihood_: FittedAttribute[float] = FittedAttribute()
     log_likelihood_history_: FittedAttribute[list[float]] = FittedAttribute()
+    #: EM iterations of the last fit; ``None`` before fitting or after fit_sgd.
+    n_iter_: int | None = None
 
     def _build_param_spec(
         self,
@@ -458,15 +462,50 @@ class SGDFittableMixin:
             if key in params:
                 setattr(self, attr, params[key])
 
-    def _finalize_convergence(self, converged: bool, max_iter: int) -> None:
-        """Record the EM convergence flag and warn if the fit did not converge.
+    def _record_fit_result(
+        self,
+        log_likelihoods: list[float],
+        converged: bool,
+        *,
+        n_iter: int | None,
+        log_likelihood: float | None = None,
+    ) -> None:
+        """Record a finished fit, replacing whatever an earlier fit recorded.
 
-        Shared terminal-convergence policy for the EM fitters that subclass this
-        mixin: sets ``self.converged_`` and, on max-iter exhaustion, logs a
-        warning under the model's own module logger. The per-loop convergence
-        criterion (which differs across fitters) stays in each ``fit`` method.
+        Every ``fit`` (EM) and ``fit_sgd`` calls this, so switching fitters
+        never leaves the previous fitter's results behind.
+
+        Parameters
+        ----------
+        log_likelihoods : list[float]
+            The fit's log-likelihood history (``log_likelihood_history_``).
+        converged : bool
+            Whether the fit met its convergence criterion (``converged_``).
+        n_iter : int or None
+            EM iterations (``n_iter_``); ``None`` for SGD.
+        log_likelihood : float or None
+            Log-likelihood at the stored parameters (``log_likelihood_``).
+            Defaults to the last history entry; with an empty history and no
+            value, ``log_likelihood_`` is unset.
         """
+        self.log_likelihood_history_ = log_likelihoods
         self.converged_ = converged
+        self.n_iter_ = n_iter
+        if log_likelihood is None and log_likelihoods:
+            log_likelihood = log_likelihoods[-1]
+        if log_likelihood is None:
+            del self.log_likelihood_
+        else:
+            self.log_likelihood_ = float(log_likelihood)
+
+    def _finalize_convergence(self, converged: bool, max_iter: int) -> None:
+        """Warn if a hand-rolled EM loop ran out of iterations.
+
+        Shared terminal-convergence policy for the EM fitters that run their own
+        loop (``run_em`` reports this itself): logs a warning under the model's
+        own module logger. The per-loop convergence criterion (which differs
+        across fitters) stays in each ``fit`` method.
+        """
         if not converged and max_iter > 1:
             logging.getLogger(type(self).__module__).warning(
                 "%s.fit did not converge in %d EM iterations; the returned "
@@ -760,8 +799,7 @@ class SGDFittableMixin:
             static_params=frozen_params,
         )
         self._store_sgd_params(final_params)
-        self.log_likelihood_history_ = log_likelihoods
-        self.converged_ = converged
+        self._record_fit_result(log_likelihoods, converged, n_iter=None)
         self._finalize_sgd(*args, **kwargs)
 
         return log_likelihoods
