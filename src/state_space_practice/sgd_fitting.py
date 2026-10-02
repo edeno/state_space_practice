@@ -13,8 +13,8 @@ Models must implement:
 
 and either declare ``_sgd_param_attrs`` (param key -> attribute name, used by
 the default ``_store_sgd_params``) or override ``_store_sgd_params``.
-Optional hooks: ``_check_sgd_initialized`` (default no-op) and
-``_prepare_sgd_data`` (default: pass the data through unchanged).
+Optional hook: ``_prepare_sgd_data`` (model-specific setup; default: pass the
+data through unchanged).
 """
 
 from __future__ import annotations
@@ -516,9 +516,6 @@ class SGDFittableMixin:
         fallback = getattr(self, prefix if attr is None else attr)
         return reconstruct_per_state_array(params, prefix, fallback, n_discrete_states)
 
-    def _check_sgd_initialized(self) -> None:
-        return
-
     def _prepare_sgd_data(
         self, *args: Any, **kwargs: Any
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
@@ -771,7 +768,6 @@ class SGDFittableMixin:
             )
         args, kwargs = self._prepare_sgd_data(*args, **kwargs)
 
-        self._check_sgd_initialized()
         params, param_spec = self._build_param_spec()
 
         if not param_spec or not any(spec.trainable for spec in param_spec.values()):

@@ -483,7 +483,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `TypeError`/`IndexError`). Removed the private `TemporalRateGP._counts` and
   the `RuntimeError` guards against calling `SGDFittableMixin.fit_sgd`
   directly on `PlaceFieldModel` / `TemporalRateGP`, which the hook makes
-  unnecessary.
+  unnecessary, and the `SGDFittableMixin._check_sgd_initialized` hook, which
+  no model overrides any more (initialization belongs in `_prepare_sgd_data`).
 - **Fit results no longer go stale when switching between `fit` and
   `fit_sgd`**: every EM `fit` and `fit_sgd` now records `log_likelihood_`,
   `log_likelihood_history_`, `converged_` and `n_iter_` together (through

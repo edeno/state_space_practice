@@ -107,15 +107,10 @@ class _ToyModel(SGDFittableMixin):
 
     def __init__(self, scale: float = 1.0):
         self.scale = scale
-        self._initialized = True
 
     @property
     def _n_timesteps(self):
         return 100
-
-    def _check_sgd_initialized(self):
-        if not self._initialized:
-            raise RuntimeError("Not initialized")
 
     def _build_param_spec(self):
         params = {"scale": jnp.array(self.scale)}
@@ -236,9 +231,6 @@ class TestSGDFittableMixin:
         class _EmptyModel(SGDFittableMixin):
             _n_timesteps = 10
 
-            def _check_sgd_initialized(self):
-                pass
-
             def _build_param_spec(self):
                 return {}, {}
 
@@ -253,12 +245,6 @@ class TestSGDFittableMixin:
 
         with pytest.raises(ValueError, match="No learnable parameters"):
             _EmptyModel().fit_sgd(num_steps=10)
-
-    def test_not_initialized_raises(self) -> None:
-        model = _ToyModel(scale=1.0)
-        model._initialized = False
-        with pytest.raises(RuntimeError, match="Not initialized"):
-            model.fit_sgd(jnp.array(5.0))
 
     def test_log_likelihood_comes_from_final_inference(self) -> None:
         """log_likelihood_ is _finalize_sgd's log-likelihood at the stored
@@ -373,15 +359,11 @@ class TestSGDFittableMixin:
         class _BadGradientAtInit(SGDFittableMixin):
             def __init__(self):
                 self.scale = 0.0
-                self._initialized = True
                 self.is_fitted = False
 
             @property
             def _n_timesteps(self):
                 return 1
-
-            def _check_sgd_initialized(self):
-                pass
 
             def _build_param_spec(self):
                 return {"scale": jnp.array(self.scale)}, {"scale": UNCONSTRAINED}
@@ -437,14 +419,10 @@ class TestSGDFittableMixin:
 
             def __init__(self):
                 self.scale = 0.0
-                self._initialized = True
 
             @property
             def _n_timesteps(self):
                 return 100
-
-            def _check_sgd_initialized(self):
-                pass
 
             def _build_param_spec(self):
                 return {"scale": jnp.array(self.scale)}, {"scale": UNCONSTRAINED}
@@ -504,14 +482,10 @@ class TestSGDFittableMixin:
         class _NanAboveThreshold(SGDFittableMixin):
             def __init__(self):
                 self.scale = 0.0
-                self._initialized = True
 
             @property
             def _n_timesteps(self):
                 return 100
-
-            def _check_sgd_initialized(self):
-                pass
 
             def _build_param_spec(self):
                 return {"scale": jnp.array(self.scale)}, {"scale": UNCONSTRAINED}
@@ -551,14 +525,10 @@ class TestSGDFittableMixin:
         class _AlwaysNan(SGDFittableMixin):
             def __init__(self):
                 self.scale = 2.0  # already above the NaN threshold
-                self._initialized = True
 
             @property
             def _n_timesteps(self):
                 return 100
-
-            def _check_sgd_initialized(self):
-                pass
 
             def _build_param_spec(self):
                 return {"scale": jnp.array(self.scale)}, {"scale": UNCONSTRAINED}
