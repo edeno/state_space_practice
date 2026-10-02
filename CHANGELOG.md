@@ -162,6 +162,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **`DirectedInfluencePointProcessModel.fit_sgd(connectivity_penalty=...)`
+  penalizes the effective coupling**: the stability-scaled coupling that
+  enters the transition matrix, as `DirectedInfluenceModel` already did; it
+  penalized the raw `coupling_strength` before. Penalized DIM-PP SGD fits
+  change whenever the stability scale is active (< 1).
 - **Smith trial-to-trial comparisons are exact**
   (`compute_trial_comparison_matrix`, `compare_two_trials` and the
   `SmithLearningModel` methods `get_trial_comparison_matrix`,

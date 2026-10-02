@@ -475,3 +475,91 @@ class TestRegularizedSGDIntegration:
             f"Regularized cross-area ({cross_reg:.4f}) should be < "
             f"baseline ({cross_base:.4f})"
         )
+
+
+def _directed_influence_model(kind: str, max_spectral_radius: float):
+    """A DIM or DIM-PP model and its data, from the shared scenarios."""
+    from state_space_practice.oscillator_models import DirectedInfluenceModel
+    from state_space_practice.point_process_models import (
+        DirectedInfluencePointProcessModel,
+    )
+    from state_space_practice.simulate.scenarios import (
+        simulate_dim_pp_scenario,
+        simulate_dim_scenario,
+    )
+
+    if kind == "gaussian":
+        scenario = simulate_dim_scenario(n_time=100, seed=0)
+        p = scenario["params"]
+        model = DirectedInfluenceModel(
+            n_oscillators=p["n_oscillators"],
+            n_discrete_states=p["n_discrete_states"],
+            sampling_freq=p["sampling_freq"],
+            freqs=p["freqs"],
+            damping_coef=p["damping"],
+            process_variance=p["process_variance"],
+            measurement_variance=p["measurement_variance"],
+            phase_difference=p["phase_difference"],
+            coupling_strength=p["coupling_strength"],
+            max_spectral_radius=max_spectral_radius,
+        )
+        return model, jnp.asarray(scenario["obs"])
+    scenario = simulate_dim_pp_scenario(n_time=100, seed=0)
+    p = scenario["params"]
+    model = DirectedInfluencePointProcessModel(
+        n_oscillators=p["n_oscillators"],
+        n_neurons=p["n_neurons"],
+        n_discrete_states=p["n_discrete_states"],
+        sampling_freq=p["sampling_freq"],
+        dt=p["dt"],
+        freqs=p["freqs"],
+        damping_coef=p["damping"],
+        process_variance=p["process_variance"],
+        phase_difference=p["phase_difference"],
+        coupling_strength=p["coupling_strength"],
+        max_spectral_radius=max_spectral_radius,
+    )
+    return model, jnp.asarray(scenario["spikes"])
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("kind", ["gaussian", "point_process"])
+def test_connectivity_penalty_applies_to_effective_coupling(kind):
+    """Both directed-influence models penalize the coupling that enters A --
+    the stability-scaled (effective) coupling -- not the raw parameter."""
+    from state_space_practice.oscillator_utils import (
+        compute_directed_influence_stability_scale,
+    )
+
+    # A tight spectral-radius bound makes the stability scale bite.
+    model, data = _directed_influence_model(kind, max_spectral_radius=0.5)
+    model.fit_sgd(data, key=jax.random.PRNGKey(0), num_steps=0)
+    params, _ = model._build_param_spec()
+    config = OscillatorPenaltyConfig(edge_l1=1.0)
+
+    model._connectivity_penalty = None
+    loss_without = float(model._sgd_loss_fn(params, data))
+    model._connectivity_penalty = config
+    loss_with = float(model._sgd_loss_fn(params, data))
+
+    coupling = params["coupling_strength"]
+    scale = compute_directed_influence_stability_scale(
+        params["freqs"],
+        params["damping_coef"],
+        coupling,
+        model.sampling_freq,
+        max_spectral_radius=model.max_spectral_radius,
+        phase_difference=params["phase_difference"],
+    )
+    assert float(scale) < 0.99  # guard: effective and raw coupling differ
+
+    def penalty(c):
+        return float(
+            total_connectivity_penalty(
+                jnp.moveaxis(c, -1, 0), config, n_timesteps=model._n_timesteps
+            )
+        )
+
+    expected = penalty(coupling * scale)
+    assert not np.isclose(expected, penalty(coupling))  # guard
+    np.testing.assert_allclose(loss_with - loss_without, expected, rtol=1e-9)

@@ -42,13 +42,13 @@ from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedE
 from state_space_practice.fitted_state import is_set
 from state_space_practice.oscillator_utils import (
     DirectedInfluenceDynamicsMixin,
+    _construct_stable_dim_stack_and_scale,
     canonicalize_correlated_noise_pair_parameters,
     constrain_correlated_noise_process_covariance,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix_stack,
     construct_correlated_noise_process_covariance,
     construct_correlated_noise_process_covariance_stack,
-    construct_stable_directed_influence_transition_stack,
     extract_correlated_noise_params_from_covariance_stack,
     optimize_dim_transition_params_joint_until_stationary,
     project_correlated_noise_process_covariance,
@@ -1518,7 +1518,7 @@ class DirectedInfluencePointProcessModel(
         # (only coupling/phase are free), so the scale depends on the free
         # coupling and the fixed damping.
         params_with_A = dict(params)
-        params_with_A["_A"] = construct_stable_directed_influence_transition_stack(
+        params_with_A["_A"], stability_scale = _construct_stable_dim_stack_and_scale(
             # Frozen (non-trained) entries of the SGD param spec.
             self._sgd_param(params, "freqs"),
             self._sgd_param(params, "damping_coef"),
@@ -1536,7 +1536,9 @@ class DirectedInfluencePointProcessModel(
                 total_connectivity_penalty,
             )
 
-            coupling_transposed = jnp.moveaxis(coupling, -1, 0)
+            # Penalize the coupling that enters A (the stability-scaled one), as
+            # the Gaussian DirectedInfluenceModel does.
+            coupling_transposed = jnp.moveaxis(coupling * stability_scale, -1, 0)
             base_loss = base_loss + total_connectivity_penalty(
                 coupling_transposed,
                 penalty_config,
