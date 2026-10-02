@@ -83,7 +83,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Laplace evidence of the Smith model (what `log_likelihood_`, `bic()` and
   `fit_sgd` now use).
 - **`switching_choice.switching_choice_smoother`**: GPB1 backward pass that
-  accounts for the covariate input ``B u_t``.
+  accounts for the covariate input ``B u_t``. It returns a
+  `switching_kalman.SwitchingSmootherResult` (a NamedTuple, so positional
+  access still works).
+- **`em_driver.snapshot_attributes` / `restore_attributes` /
+  `clear_attributes`** (and the `AttributeSnapshot` they pass): build
+  `run_em`'s snapshot, restore and clear hooks from a tuple of attribute
+  names; a snapshot carries its own keys, and `deepcopy_keys` outside them
+  raise. Every `run_em` caller builds its snapshot / restore hooks from them.
+- **`utils.as_2d_count_matrix`**: coerce `(n_time,)` or `(n_time, n_neurons)`
+  counts to 2-D and validate them.
+- **Stacked oscillator constructors in `oscillator_utils`**:
+  `construct_common_oscillator_transition_matrix_stack`,
+  `construct_correlated_noise_process_covariance_stack` and
+  `extract_correlated_noise_params_from_covariance_stack`.
 
 ### Testing
 
@@ -144,6 +157,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **`covariate_choice_smoother` uses `kalman.rts_backward_scan_with_predictions`**
+  (jitted; about 10x faster per call -- the previous un-jitted RTS pass
+  re-traced on every EM iteration). Its gain solve is the shared, retrying one, so smoothed values
+  and fitted parameters can move at round-off level (~1e-9 relative after 200
+  EM iterations).
+- **The choice models skip the duplicate final E-step after convergence**
+  (`MultinomialChoiceModel`, `CovariateChoiceModel`, `SwitchingChoiceModel`).
+- **`PlaceFieldModel.predict_rate_map` uses an optimized einsum** (large
+  speedups at moderate grid sizes).
+- **Eager `utils.debug_print_if` calls no longer compile a `jit(cond)` each
+  time.**
 - **Reading a fitted attribute before fitting raises `NotFittedError`**
   instead of returning `None` (or a bare `AttributeError`). Fitted outputs of
   every model (smoothed/filtered states, posteriors, log likelihoods,
@@ -397,6 +421,98 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A failed fit no longer leaves stale or non-finite results that look
+  fitted**: when a fit raises `NonFiniteLikelihoodError` (its starting
+  parameters give a non-finite log-likelihood), it first clears every fit
+  output -- posteriors, cached inference results, uncertainty summaries and
+  `log_likelihood_` / `log_likelihood_history_` / `converged_` / `n_iter_`
+  (declared per model as `_fit_output_attrs`, cleared by
+  `SGDFittableMixin._clear_fit_state`). Previously the choice and belief
+  models kept the earlier fit's results next to the newly bound data, and the
+  switching point-process models kept non-finite posteriors. `run_em`'s
+  `"raise"` policy now accepts a `clear_state` hook. `fit_sgd` raises
+  `NonFiniteLikelihoodError` (after clearing) when the log-likelihood at the
+  fitted parameters is non-finite, instead of returning with
+  `log_likelihood_ = NaN`; a multi-restart switching point-process fit whose
+  restarts all fail raises it too (was a plain `ValueError`). The choice and
+  belief models' `fit` rejects `max_iter < 1` before binding data, `fit_sgd`
+  validates `convergence_tol` (finite, >= 0) before touching the model, and
+  the oscillator models reject non-2-D observations with `ValueError` (was
+  `IndexError`).
+- **The choice and belief models' EM no longer runs on after a non-finite
+  log-likelihood**: `MultinomialChoiceModel`, `CovariateChoiceModel`,
+  `SwitchingChoiceModel` and `ContingencyBeliefModel` run their own EM loops,
+  which recorded a NaN log-likelihood and kept iterating, so an M-step that
+  produced a NaN parameter left the model with NaN parameters, posteriors and
+  `log_likelihood_`, flagged only by "did not converge". Like
+  `em_driver.run_em`, a non-finite first E-step now raises
+  `NonFiniteLikelihoodError`, and a later one (including the final E-step
+  after `max_iter`) restores the last accepted parameters and their
+  posteriors, warns and stops. Their convergence criteria (relative or
+  absolute `tolerance`) are unchanged, and finite fits are bit-identical.
+  After a rollback stop the models no longer also log the misleading "did not
+  converge in max_iter EM iterations" warning; `MultinomialChoiceModel` /
+  `CovariateChoiceModel` now warn when their monotonicity guard rolls back a
+  decreasing step.
+- **Repeat `fit_sgd` calls reuse the compiled SGD step**: losses read trained
+  parameters as `params.get(key, self.<attr>)`, so the compiled-step cache
+  (which fingerprints model attributes read while tracing) missed after every
+  fit rewrote them, and each repeat `fit_sgd` re-traced and recompiled --
+  about 0.4-2 s per call at test sizes for `PointProcessModel`,
+  `PlaceFieldModel.fit_sgd(warm_start=False)`, the Gaussian and point-process
+  oscillator models and `SwitchingSpikeOscillatorModel` (now ~0.04-0.35 s).
+  Losses read parameters through the new `SGDFittableMixin._sgd_param` /
+  `_sgd_per_state_param`, which touch the attribute only when the parameter is
+  not optimized. `DirectedInfluenceModel` / `DirectedInfluencePointProcessModel`
+  pass `freqs` and `damping_coef` as frozen SGD parameters (warm-start seeding
+  and EM re-derive them from the transition matrix), which moves their SGD
+  results at round-off level (~1e-15 relative). `SwitchingChoiceModel` also
+  recompiled on every call, because `parameter_transforms.positive_capped`
+  built a new transform each time, so equal parameter specs compared unequal;
+  it now returns one transform per cap. Results of every other model are
+  bit-identical.
+- **A rejected `fit_sgd` call no longer changes the model**: model-specific
+  setup (data binding, initialization, warm start, recorded lengths) ran in
+  each model's `fit_sgd` override before the shared settings checks, so e.g.
+  `fit_sgd(data, num_steps=-1)` raised only after re-initializing the model --
+  on a fitted oscillator model or `PlaceFieldModel` that discarded the fit.
+  That setup now runs in the `_prepare_sgd_data` hook, after `num_steps` and
+  the optimizer are validated, and data is validated before anything is
+  stored. The oscillator models' `fit_sgd` also rejects a wrong observation
+  column count with `ValueError` (it re-initialized, then failed with
+  `TypeError`/`IndexError`). Removed the private `TemporalRateGP._counts` and
+  the `RuntimeError` guards against calling `SGDFittableMixin.fit_sgd`
+  directly on `PlaceFieldModel` / `TemporalRateGP`, which the hook makes
+  unnecessary, and the `SGDFittableMixin._check_sgd_initialized` hook, which
+  no model overrides any more (initialization belongs in `_prepare_sgd_data`).
+- **Fit results no longer go stale when switching between `fit` and
+  `fit_sgd`**: every EM `fit` and `fit_sgd` now records `log_likelihood_`,
+  `log_likelihood_history_`, `converged_` and `n_iter_` together (through
+  `SGDFittableMixin._record_fit_result`). Before, e.g. `PointProcessModel.fit`
+  after `fit_sgd` kept the SGD log-likelihood, history and convergence flag;
+  `PointProcessModel.fit`, `SwitchingSpikeOscillatorModel.fit`,
+  `PlaceFieldModel.fit` and the oscillator models' `fit` did not set
+  `log_likelihood_` at all; and `n_iter_` survived a later `fit_sgd`.
+  `n_iter_` is now available on every `SGDFittableMixin` model: the number of
+  log-likelihoods an EM fit recorded (EM's final synchronising E-step can
+  make it `max_iter + 1`), `None` until an EM fit and after `fit_sgd`. Multi-restart switching point-process fits report the best
+  restart's convergence flag. After `fit_sgd`, `log_likelihood_` is the
+  marginal log-likelihood from the final inference at the fitted parameters
+  (each model's `_finalize_sgd` now returns it), not the training objective:
+  with a connectivity penalty the two differ, and `log_likelihood_history_`
+  records the objective. A zero-step `fit_sgd` also sets `log_likelihood_`.
+- **Switching point-process `fit_sgd` validates spike shape like `fit`**: a
+  1-D array or a wrong neuron count raised a misleading
+  "spike_params.baseline neuron dimension must match ..." error, after
+  initializing the model; it now raises the same "must be 2D" / "must match
+  n_neurons" errors as `fit`, before touching the model.
+- **Multi-restart switching point-process fits no longer hide real errors**:
+  `fit(n_restarts>1)` treated every `ValueError` (e.g. from initialization or
+  the M-step) as a non-finite-likelihood restart and finally reported "All N
+  restarts failed with non-finite log-likelihood". It now skips only restarts
+  whose first E-step is non-finite; `run_em` raises the new
+  `NonFiniteLikelihoodError` (a `ValueError` subclass, exported at package
+  level) for that case, and other errors propagate.
 - **Plotting into axes inside a matplotlib SubFigure**: the plot methods of
   `MultinomialChoiceModel`, `CovariateChoiceModel`, `PlaceFieldModel` and
   `PositionDecoder` that accept `ax` called `tight_layout` on `ax.figure`, which

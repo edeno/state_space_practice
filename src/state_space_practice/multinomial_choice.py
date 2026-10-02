@@ -30,7 +30,11 @@ from jax import Array
 from jax.typing import ArrayLike, DTypeLike
 from numpy.typing import NDArray
 
-from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
+from state_space_practice.exceptions import (
+    NonFiniteLikelihoodError,
+    NotFittedError,
+    StateSpaceWarning,
+)
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.kalman import rts_backward_scan
 from state_space_practice.parameter_transforms import POSITIVE
@@ -42,6 +46,7 @@ from state_space_practice.utils import (
     psd_solve,
     symmetrize,
     typed_jit,
+    validate_int,
 )
 from state_space_practice.utils import validate_choice_indices as _validate_choices
 
@@ -606,7 +611,6 @@ class _MultinomialChoiceBase(SGDFittableMixin):
     # Fitted state, set by fit() / fit_sgd(); reading one before raises
     # NotFittedError.
     _smoother_result: FittedAttribute[ChoiceSmootherResult] = FittedAttribute()
-    log_likelihood_: FittedAttribute[float] = FittedAttribute()
     _n_trials: FittedAttribute[int] = FittedAttribute()
 
     # Uncertainty summaries, each (n_trials, n_options)
@@ -619,6 +623,19 @@ class _MultinomialChoiceBase(SGDFittableMixin):
     # Per trial, shape (n_trials,)
     predicted_choice_entropy_: FittedAttribute[Array] = FittedAttribute()
     surprise_: FittedAttribute[Array] = FittedAttribute()
+
+    # Everything above a fit writes, cleared when a fit fails.
+    _fit_output_attrs = (
+        "_smoother_result",
+        "predicted_option_values_",
+        "filtered_option_values_",
+        "smoothed_option_values_",
+        "predicted_option_variances_",
+        "filtered_option_variances_",
+        "smoothed_option_variances_",
+        "predicted_choice_entropy_",
+        "surprise_",
+    )
 
     def __init__(
         self,
@@ -645,9 +662,6 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         self.process_noise = init_process_noise
         self.learn_inverse_temperature = learn_inverse_temperature
         self.learn_process_noise = learn_process_noise
-
-        # EM iteration count; stays None after an SGD-only fit.
-        self.n_iter_: int | None = None
 
     def __repr__(self) -> str:
         fitted = self.is_fitted
@@ -750,18 +764,33 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         choices: Array,
         log_likelihoods: list[float],
         last_accepted: dict[str, Any] | None,
+        current: ChoiceSmootherResult | None = None,
     ) -> float:
-        """Sync ``_smoother_result`` / ``log_likelihood_`` to the final parameters.
+        """Sync ``_smoother_result`` to the final parameters; return their LL.
 
-        Runs once after the EM loop and returns the final log-likelihood.
+        Runs once after the EM loop; the caller records the returned
+        log-likelihood as ``log_likelihood_``.
         ``log_likelihoods`` is the per-iteration history and ``last_accepted``
         the parameter snapshot taken before the last M-step (None if no M-step
-        ran); subclasses may use them to amend the history or roll a degrading
-        final M-step back.
+        ran). A non-finite final log-likelihood rolls the parameters back to
+        ``last_accepted`` and re-runs the smoother there; subclasses may also
+        use these to amend the history or roll a degrading final M-step back.
+        ``current`` is an E-step result already computed at the current
+        parameters, reused instead of re-running the smoother.
         """
-        self._smoother_result = self._run_smoother(choices)
-        self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
-        return self.log_likelihood_
+        self._smoother_result = (
+            current if current is not None else self._run_smoother(choices)
+        )
+        log_likelihood = float(self._smoother_result.marginal_log_likelihood)
+        if not np.isfinite(log_likelihood) and last_accepted is not None:
+            self._restore_parameters(last_accepted)
+            self._smoother_result = self._run_smoother(choices)
+            log_likelihood = float(self._smoother_result.marginal_log_likelihood)
+            logging.getLogger(type(self).__module__).warning(
+                "Final E-step produced a non-finite log-likelihood; rolled back "
+                "to the previous parameters."
+            )
+        return log_likelihood
 
     def _populate_uncertainty(self, choices: Array) -> None:
         """Compute uncertainty summaries from filter + smoother results.
@@ -852,12 +881,34 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         log = logging.getLogger(type(self).__module__)
         log_likelihoods: list[float] = []
         converged = False
+        rolled_back = False
         last_accepted: dict[str, Any] | None = None
 
         for iteration in range(max_iter):
             # E-step: run smoother with current parameters
             smooth = self._run_smoother(choices_arr)
             ll = float(smooth.marginal_log_likelihood)
+
+            # A non-finite E-step is never recorded (as em_driver.run_em): with
+            # no accepted iterate the starting parameters are unusable;
+            # otherwise restore the last accepted parameters and stop (the
+            # final E-step below re-syncs the posteriors to them).
+            if not np.isfinite(ll):
+                if last_accepted is None:
+                    self._clear_fit_state()
+                    raise NonFiniteLikelihoodError(
+                        f"Non-finite log-likelihood at iteration {iteration + 1}: "
+                        f"{ll}. This may indicate numerical instability."
+                    )
+                self._restore_parameters(last_accepted)
+                rolled_back = True
+                log.warning(
+                    "Non-finite log-likelihood (%s) at iteration %d; rolling back "
+                    "to the previous E-step and stopping EM.",
+                    ll,
+                    iteration + 1,
+                )
+                break
 
             # GEM monotonicity guard: the approximate (Laplace-EKF) M-step can
             # decrease the marginal LL. On a decrease beyond tolerance, restore the
@@ -869,6 +920,14 @@ class _MultinomialChoiceBase(SGDFittableMixin):
                 and ll < log_likelihoods[-1] - _EM_MONOTONICITY_TOL
             ):
                 self._restore_parameters(last_accepted)
+                rolled_back = True
+                log.warning(
+                    "Log-likelihood decreased at iteration %d (%.6g -> %.6g); "
+                    "rolling back to the previous E-step and stopping EM.",
+                    iteration + 1,
+                    log_likelihoods[-1],
+                    ll,
+                )
                 break
 
             log_likelihoods.append(ll)
@@ -899,33 +958,35 @@ class _MultinomialChoiceBase(SGDFittableMixin):
 
             self._m_step(smooth, choices_arr, beta_grid)
 
-        # Final E-step with learned parameters
-        self._final_e_step(choices_arr, log_likelihoods, last_accepted)
-        self.n_iter_ = len(log_likelihoods)
-        self.log_likelihood_history_ = log_likelihoods
+        # Final E-step with learned parameters. On convergence no M-step followed
+        # the last E-step, so its smoother result is already at those parameters.
+        final_log_likelihood = self._final_e_step(
+            choices_arr, log_likelihoods, last_accepted, smooth if converged else None
+        )
+        self._record_fit_result(
+            log_likelihoods,
+            converged,
+            n_iter=len(log_likelihoods),
+            log_likelihood=final_log_likelihood,
+        )
         self._populate_uncertainty(choices_arr)
-        self._finalize_convergence(converged, max_iter)
+        if not rolled_back:  # a rollback already warned why EM stopped
+            self._finalize_convergence(converged, max_iter)
 
         return log_likelihoods
 
-    def _fit_sgd_validated(
-        self,
-        choices_arr: Array,
-        optimizer: optax.GradientTransformation | None,
-        num_steps: int,
-        verbose: bool,
-        convergence_tol: float | None,
-    ) -> list[float]:
-        """SGD fit on choices already validated by ``_prepare_choices``."""
-        return super().fit_sgd(
-            choices_arr,
-            optimizer=optimizer,
-            num_steps=num_steps,
-            verbose=verbose,
-            convergence_tol=convergence_tol,
-        )
-
     # --- SGDFittableMixin protocol ---
+
+    def _prepare_sgd_data(
+        self, choices: ArrayLike
+    ) -> tuple[tuple[Array, ...], dict[str, Any]]:
+        """Validate the ``fit_sgd`` choices and record ``_n_trials``.
+
+        ``SGDFittableMixin.fit_sgd`` calls this after validating its optimizer
+        settings, so a call rejected for its settings leaves the model
+        untouched. Returns the int32 choices as the loss's only data argument.
+        """
+        return (self._prepare_choices(choices, "SGD"),), {}
 
     @property
     def _n_timesteps(self) -> int:
@@ -945,20 +1006,12 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         return params, spec
 
     def _sgd_loss_fn(self, params: SGDParams, choices: Array) -> Array:
-        # Read the model attribute only when the parameter is not optimized
-        # (not ``params.get(key, self.attr)``, which reads it regardless):
-        # fit_sgd reuses a compiled step only while the attributes the loss
-        # read at trace time are unchanged, and these are rewritten by every
-        # fit.
-        def _param(key: str) -> Array:
-            return params[key] if key in params else jnp.array(getattr(self, key))
-
         k_free = self.n_options - 1
         result = _multinomial_choice_filter_jit(
             choices,
             self.n_options,
-            _param("process_noise"),
-            _param("inverse_temperature"),
+            self._sgd_param(params, "process_noise"),
+            self._sgd_param(params, "inverse_temperature"),
             jnp.zeros(k_free),
             jnp.eye(k_free),
         )
@@ -970,10 +1023,10 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         if "inverse_temperature" in params:
             self.inverse_temperature = float(params["inverse_temperature"])
 
-    def _finalize_sgd(self, choices: Array) -> None:
+    def _finalize_sgd(self, choices: Array) -> float:
         self._smoother_result = self._run_smoother(choices)
-        self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
         self._populate_uncertainty(choices)
+        return float(self._smoother_result.marginal_log_likelihood)
 
     # --- M-steps ---
 
@@ -1396,7 +1449,15 @@ class MultinomialChoiceModel(_MultinomialChoiceBase):
         -------
         log_likelihoods : list of float
             Log-likelihood at each EM iteration.
+
+        Raises
+        ------
+        NonFiniteLikelihoodError
+            If the first E-step's log-likelihood is non-finite. A later
+            non-finite E-step is never recorded: the parameters roll back to
+            the last accepted iterate and EM stops with a warning.
         """
+        max_iter = validate_int(max_iter, "max_iter", positive=True)
         choices_arr = self._prepare_choices(choices, "EM")
         return self._fit_em(choices_arr, max_iter, tolerance, verbose, beta_grid)
 
@@ -1427,9 +1488,12 @@ class MultinomialChoiceModel(_MultinomialChoiceBase):
         -------
         log_likelihoods : list of float
         """
-        choices_arr = self._prepare_choices(choices, "SGD")
-        return self._fit_sgd_validated(
-            choices_arr, optimizer, num_steps, verbose, convergence_tol
+        return super().fit_sgd(
+            choices,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
         )
 
 

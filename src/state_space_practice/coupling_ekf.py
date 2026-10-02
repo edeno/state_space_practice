@@ -38,6 +38,7 @@ from jax.typing import ArrayLike
 
 from state_space_practice.coupling_model import (
     CouplingModelParams,
+    _validate_positive_real_scalar,
     deinterleave_coupling,
     smooth_latent_from_lfp,
     validate_coupling_observations,
@@ -154,16 +155,9 @@ def fit_coupling_ekf(
     spikes_np, lfp_np = validate_coupling_observations(
         spikes, lfp, n_neurons=n_neurons, n_latent=n_latent
     )
-    sigma_beta_arr = np.asarray(sigma_beta)
-    if (
-        sigma_beta_arr.shape != ()
-        or not np.issubdtype(sigma_beta_arr.dtype, np.number)
-        or np.issubdtype(sigma_beta_arr.dtype, np.complexfloating)
-    ):
-        raise ValueError(f"sigma_beta must be finite and positive, got {sigma_beta}.")
-    sigma_beta_float = float(sigma_beta_arr)
-    if not np.isfinite(sigma_beta_float) or sigma_beta_float <= 0.0:
-        raise ValueError(f"sigma_beta must be finite and positive, got {sigma_beta}.")
+    sigma_beta_float = _validate_positive_real_scalar(
+        "sigma_beta", sigma_beta, type_requirement="finite and positive"
+    )
     max_iter_arr = np.asarray(max_newton_iter)
     if (
         max_iter_arr.shape != ()

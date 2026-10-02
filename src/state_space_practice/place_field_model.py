@@ -43,7 +43,12 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.em_driver import run_em
+from state_space_practice.em_driver import (
+    clear_attributes,
+    restore_attributes,
+    run_em,
+    snapshot_attributes,
+)
 from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.kalman import (
@@ -70,6 +75,7 @@ from state_space_practice.point_process_kalman import (
 from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.utils import (
     _root_figure,
+    as_2d_count_matrix,
     floor_variances_relative,
     psd_solve,
     symmetrize,
@@ -356,7 +362,17 @@ class PlaceFieldModel(SGDFittableMixin):
     basis_info : dict
         Spline basis specification (knots, bounds, formula).
     log_likelihoods : list[float]
-        Log-likelihood history from fitting.
+        EM log-likelihood history after ``fit`` (same as
+        ``log_likelihood_history_``); after ``fit_sgd``, the single marginal
+        log-likelihood at the fitted parameters (``[log_likelihood_]``).
+    log_likelihood_ : float
+        Marginal log-likelihood at the fitted parameters.
+    log_likelihood_history_ : list[float]
+        Per-iteration EM log-likelihoods, or per-step SGD training objective.
+    converged_ : bool
+        Whether the last fit met its convergence criterion.
+    n_iter_ : int or None
+        Number of EM log-likelihoods recorded; ``None`` after ``fit_sgd``.
     n_neurons : int
         Number of neurons (detected from spikes during fit).
 
@@ -386,6 +402,14 @@ class PlaceFieldModel(SGDFittableMixin):
     filtered_mean: FittedAttribute[Array] = FittedAttribute()
     filtered_cov: FittedAttribute[Array | BlockDiagonalCovariance] = FittedAttribute()
     _sgd_n_time: FittedAttribute[int] = FittedAttribute()
+    # The posteriors above, cleared when a fit fails.
+    _fit_output_attrs = (
+        "smoother_mean",
+        "smoother_cov",
+        "smoother_cross_cov",
+        "filtered_mean",
+        "filtered_cov",
+    )
 
     def __init__(
         self,
@@ -1003,8 +1027,8 @@ class PlaceFieldModel(SGDFittableMixin):
             log_conditional_intensity=self._log_intensity_func,
             return_filtered=True,
             max_log_count=self._max_log_count,
-            # fit() validates once at the top before EM starts; skip
-            # per-iteration re-validation (eigvalsh is O(d^3)).
+            # fit() / fit_sgd() validate once at the top; skip per-call
+            # re-validation (eigvalsh is O(d^3)).
             validate_inputs=False,
             # Block-diagonal dispatch: None/None falls through to dense.
             # fit() re-detects after every M-step in case
@@ -1247,15 +1271,7 @@ class PlaceFieldModel(SGDFittableMixin):
         """
         # Validate inputs
         position = np.asarray(position)
-        spikes = jnp.asarray(spikes)
-        if spikes.ndim == 1:
-            spikes = spikes[:, None]  # (n_time,) -> (n_time, 1)
-        if spikes.ndim != 2:
-            raise ValueError(
-                f"spikes must be 1D (n_time,) or 2D (n_time, n_neurons), "
-                f"got shape {spikes.shape}."
-            )
-        validate_count_array(spikes, "spikes", allow_empty=False)
+        spikes = as_2d_count_matrix(spikes, "spikes")
         if position.shape[0] != spikes.shape[0]:
             raise ValueError(
                 f"position and spikes must have the same number of time bins: "
@@ -1317,14 +1333,7 @@ class PlaceFieldModel(SGDFittableMixin):
         # reads the design form through a holder the M-step may update.
         design_holder = {"design_matrix": design_matrix}
 
-        posterior_keys = (
-            "smoother_mean",
-            "smoother_cov",
-            "smoother_cross_cov",
-            "filtered_mean",
-            "filtered_cov",
-        )
-        snapshot_keys = posterior_keys + (
+        snapshot_keys = self._fit_output_attrs + (
             "transition_matrix",
             "process_cov",
             "init_mean",
@@ -1332,24 +1341,6 @@ class PlaceFieldModel(SGDFittableMixin):
             "_block_n_neurons",
             "_block_size",
         )
-
-        def _capture_state() -> dict[str, object]:
-            # Unset fitted attributes are left out and unset again on restore.
-            return {k: getattr(self, k) for k in snapshot_keys if hasattr(self, k)}
-
-        def _restore_state(state: dict[str, object]) -> None:
-            for key in snapshot_keys:
-                if key in state:
-                    setattr(self, key, state[key])
-                else:
-                    delattr(self, key)
-
-        def _clear_posteriors() -> None:
-            # A non-finite first E-step has no accepted state to roll back
-            # to: drop the posteriors it installed so the model reads as
-            # unfitted (``_check_fitted``) instead of holding NaN output.
-            for key in posterior_keys:
-                delattr(self, key)
 
         def _e_step() -> float:
             return float(self._e_step(design_holder["design_matrix"], spikes))
@@ -1382,16 +1373,21 @@ class PlaceFieldModel(SGDFittableMixin):
         result = run_em(
             _e_step,
             _m_step,
-            _capture_state,
-            _restore_state,
+            lambda: snapshot_attributes(self, snapshot_keys),
+            lambda state: restore_attributes(self, state),
             max_iter=max_iter,
             tol=tolerance,
             on_first_nonfinite="clear",
-            clear_state=_clear_posteriors,
+            clear_state=lambda: clear_attributes(self, self._fit_output_attrs),
             logger=logger,
             on_iteration=_on_iteration,
         )
         self.log_likelihoods = result.log_likelihoods
+        self._record_fit_result(
+            result.log_likelihoods,
+            result.converged,
+            n_iter=len(result.log_likelihoods),
+        )
         if result.converged:
             _print(f"  Converged after {len(self.log_likelihoods)} iterations.")
 
@@ -1458,21 +1454,43 @@ class PlaceFieldModel(SGDFittableMixin):
         log_likelihoods : list of float
 
         """
+        return super().fit_sgd(
+            position,
+            spikes,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+            warm_start=warm_start,
+            warm_start_window=warm_start_window,
+            force_dense=force_dense,
+        )
+
+    def _prepare_sgd_data(
+        self,
+        position: ArrayLike,
+        spikes: ArrayLike,
+        warm_start: bool = True,
+        warm_start_window: slice | None = None,
+        force_dense: bool = False,
+    ) -> tuple[tuple[Array, Array], dict[str, Any]]:
+        """Validate the ``fit_sgd`` data, initialize the model, build the design.
+
+        Runs after ``fit_sgd`` has validated its settings and validates the
+        data before building the basis, so a call rejected for its settings or
+        data leaves the model (including fitted parameters a warm start would
+        overwrite) untouched. Returns the filter design matrix and spikes.
+        """
         position = np.asarray(position)
-        spikes = jnp.asarray(spikes)
-        if spikes.ndim == 1:
-            spikes = spikes[:, None]
-        if spikes.ndim != 2:
-            raise ValueError(
-                f"spikes must be 1D (n_time,) or 2D (n_time, n_neurons), "
-                f"got shape {spikes.shape}."
-            )
-        validate_count_array(spikes, "spikes", allow_empty=False)
+        spikes = as_2d_count_matrix(spikes, "spikes")
         if position.shape[0] != spikes.shape[0]:
             raise ValueError(
                 f"position and spikes must have the same number of time bins: "
                 f"got position ({position.shape[0]},) vs spikes ({spikes.shape[0]},)"
             )
+        # Build the shared spline basis first: it validates ``position``
+        # before setting anything else on the model.
+        Z_base = self._build_spline_basis_matrix(position)
 
         self._sgd_n_time = spikes.shape[0]
         self.n_neurons = spikes.shape[1]
@@ -1481,14 +1499,13 @@ class PlaceFieldModel(SGDFittableMixin):
         if self.n_neurons == 1:
             spikes = spikes.squeeze(axis=1)
 
-        # Build the shared spline basis, then (optionally) warm-start.
+        # (Optionally) warm-start.
         #
         # The ``elif not is_set(self, "init_mean")`` guard on the cold-start path:
         # unlike ``fit`` (EM), which always resets init state, repeated ``fit_sgd(..., warm_start=
         # False)`` calls on the same model reuse the existing init state —
         # this is intentional for users who want to resume optimization
         # from a previous fit_sgd result without a warm-start reset.
-        Z_base = self._build_spline_basis_matrix(position)
         self.n_basis = self.n_neurons * self.n_basis_per_neuron
         if warm_start:
             self._warm_start_parameters(Z_base, spikes, warm_start_window)
@@ -1498,8 +1515,9 @@ class PlaceFieldModel(SGDFittableMixin):
         # Numerical sanity check: validate init_cov is PSD and warn if
         # the configuration is at risk of f32 NaN during the scan. Runs
         # once here so the SGD loop's _sgd_loss_fn can skip re-validation
-        # (the eigvalsh call is not jit-traceable anyway).
-        _validate_filter_numerics(self.init_cov, n_time=Z_base.shape[0])
+        # (the eigvalsh call is not jit-traceable anyway). stacklevel=5:
+        # user -> fit_sgd -> SGDFittableMixin.fit_sgd -> this hook -> wrapper.
+        _validate_filter_numerics(self.init_cov, n_time=Z_base.shape[0], stacklevel=5)
 
         # Block-diagonal dispatch: detect once before entering the SGD
         # loop. The detection result is stored on self and read by the
@@ -1513,26 +1531,11 @@ class PlaceFieldModel(SGDFittableMixin):
             force_dense=force_dense or self.update_transition_matrix
         )
         design_matrix = self._filter_design_matrix(Z_base)
-
-        return super().fit_sgd(
-            design_matrix,
-            spikes,
-            optimizer=optimizer,
-            num_steps=num_steps,
-            verbose=verbose,
-            convergence_tol=convergence_tol,
-        )
+        return (design_matrix, spikes), {}
 
     @property
     def _n_timesteps(self) -> int:
         return self._sgd_n_time
-
-    def _check_sgd_initialized(self) -> None:
-        if not is_set(self, "init_mean"):
-            raise RuntimeError(
-                "Model parameters not initialized. "
-                "Call fit_sgd(position, spikes) not super().fit_sgd() directly."
-            )
 
     def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         params: SGDParams = {}
@@ -1564,9 +1567,9 @@ class PlaceFieldModel(SGDFittableMixin):
     def _sgd_loss_fn(
         self, params: SGDParams, design_matrix: Array, spikes: Array
     ) -> Array:
-        A = params.get("transition_matrix", self.transition_matrix)
-        m0 = params.get("init_mean", self.init_mean)
-        P0 = params.get("init_cov", self.init_cov)
+        A = self._sgd_param(params, "transition_matrix")
+        m0 = self._sgd_param(params, "init_mean")
+        P0 = self._sgd_param(params, "init_cov")
 
         if "process_diag" in params:
             Q = jnp.diag(params["process_diag"])
@@ -1612,41 +1615,20 @@ class PlaceFieldModel(SGDFittableMixin):
         if "init_cov" in params:
             self.init_cov = params["init_cov"]
 
-    def _finalize_sgd(self, design_matrix: Array, spikes: Array) -> None:
-        (
-            self.smoother_mean,
-            self.smoother_cov,
-            self.smoother_cross_cov,
-            marginal_ll,
-            self.filtered_mean,
-            self.filtered_cov,
-        ) = stochastic_point_process_smoother(
-            init_mean_params=self.init_mean,
-            init_covariance_params=self.init_cov,
-            design_matrix=design_matrix,
-            spike_indicator=spikes,
-            dt=self.dt,
-            transition_matrix=self.transition_matrix,
-            process_cov=self.process_cov,
-            log_conditional_intensity=self._log_intensity_func,
-            return_filtered=True,
-            max_log_count=self._max_log_count,
-            # fit_sgd validated at the top; skip per-call re-validation.
-            validate_inputs=False,
-            # Block-diagonal dispatch (None/None falls through to dense);
-            # block covariances are kept as per-neuron blocks.
-            block_n_neurons=self._block_n_neurons,
-            block_size=self._block_size,
-            max_newton_iter=self.max_newton_iter,
-            return_block_covariances=True,
-        )
-        self.log_likelihoods = [float(marginal_ll)]
+    def _finalize_sgd(self, design_matrix: Array, spikes: Array) -> float:
+        log_likelihood = self._e_step(design_matrix, spikes)
+        self.log_likelihoods = [log_likelihood]
         # Saturation diagnostic: post-hoc check on the filtered posterior.
         # If a substantial fraction of bins saturate the physiological
         # ceiling, the filter output is unreliable.
         self._warn_if_rate_saturated(
             design_matrix, self.filtered_mean, context="fit_sgd"
         )
+        return log_likelihood
+
+    def _clear_fit_state(self) -> None:
+        super()._clear_fit_state()
+        self.log_likelihoods = []
 
     def _neuron_smoother_cov(self, neuron_idx: int, time_slice: slice) -> Array:
         """One neuron's ``(n_t, nb, nb)`` smoothed covariance blocks.
@@ -1702,7 +1684,9 @@ class PlaceFieldModel(SGDFittableMixin):
             means_chunk = means[start:stop]
             covs_chunk = covs[start:stop]
             log_rate_mean = means_chunk @ Z_grid.T
-            var_log_rate = np.einsum("gb,tbc,gc->tg", Z_grid, covs_chunk, Z_grid)
+            var_log_rate = np.einsum(
+                "gb,tbc,gc->tg", Z_grid, covs_chunk, Z_grid, optimize=True
+            )
             var_log_rate = np.maximum(var_log_rate, 0.0)
             std_log_rate = np.sqrt(var_log_rate)
 

@@ -365,16 +365,12 @@ def project_psd(Q: ArrayLike, min_eigenvalue: float = 1e-8) -> jax.Array:
     jax.Array
         The projected PSD matrix with all eigenvalues >= min_eigenvalue.
     """
-    Q = symmetrize(Q)
-    eigvals, eigvecs = jnp.linalg.eigh(Q)
-    eigvals_clipped = jnp.maximum(eigvals, min_eigenvalue)
-    projected = eigvecs @ jnp.diag(eigvals_clipped) @ eigvecs.T
-    return symmetrize(projected)
+    return symmetrize(clip_eigenvalues(Q, min_eigenvalue=min_eigenvalue))
 
 
 def stabilize_covariance(cov: ArrayLike, min_eigenvalue: float = 1e-8) -> jax.Array:
     """Symmetrize a covariance-like matrix and project it to the PSD cone."""
-    return project_psd(symmetrize(cov), min_eigenvalue=min_eigenvalue)
+    return project_psd(cov, min_eigenvalue=min_eigenvalue)
 
 
 #: Default relative eigenvalue floor for M-step covariance projections: an
@@ -1017,12 +1013,18 @@ def warn_if_not_positive_definite_in_graph(
 def debug_print_if(condition: ArrayLike, fmt: str, **fmt_kwargs: Any) -> None:
     """Fire ``jax.debug.print(fmt, **fmt_kwargs)`` only when ``condition`` is True.
 
-    Wraps ``jax.lax.cond`` so callers don't have to spell out the
-    ``(lambda: jax.debug.print(...), lambda: None)`` pattern at every
-    silent-fallback site. The print branch fires when the predicate is
+    Under tracing it wraps ``jax.lax.cond``, so callers don't have to spell
+    out the ``(lambda: jax.debug.print(...), lambda: None)`` pattern at every
+    silent-fallback site; with concrete inputs it branches on the host. The print branch fires when the predicate is
     True (i.e. when the *bad* condition holds), matching how the call
     site reads at the user's eye: "if `~is_valid`, print the warning."
     """
+    if not contains_tracer(condition, fmt_kwargs):
+        # Concrete inputs: branch on the host instead of building (and
+        # compiling) a fresh ``lax.cond`` on every eager call.
+        if bool(condition):
+            jax.debug.print(fmt, **fmt_kwargs)
+        return
     jax.lax.cond(
         condition,
         lambda: jax.debug.print(fmt, **fmt_kwargs),
@@ -1087,6 +1089,38 @@ def validate_count_array(
         raise ValueError(f"{name} must contain non-negative counts.")
     if not np.all(np.isclose(counts_float, np.round(counts_float))):
         raise ValueError(f"{name} must contain integer-valued counts.")
+
+
+def as_2d_count_matrix(counts: ArrayLike, name: str) -> Array:
+    """Coerce counts to ``(n_time, n_neurons)`` and validate them as counts.
+
+    Parameters
+    ----------
+    counts : ArrayLike, shape (n_time,) or (n_time, n_neurons)
+        Observed counts; a 1-D array is treated as a single neuron.
+    name : str
+        Argument name used in error messages.
+
+    Returns
+    -------
+    Array, shape (n_time, n_neurons)
+
+    Raises
+    ------
+    ValueError
+        If ``counts`` is not 1-D or 2-D, is empty, or fails
+        :func:`validate_count_array`.
+    """
+    counts_arr = jnp.asarray(counts)
+    if counts_arr.ndim == 1:
+        counts_arr = counts_arr[:, None]
+    if counts_arr.ndim != 2:
+        raise ValueError(
+            f"{name} must be 1D (n_time,) or 2D (n_time, n_neurons), "
+            f"got shape {counts_arr.shape}."
+        )
+    validate_count_array(counts_arr, name, allow_empty=False)
+    return counts_arr
 
 
 def validate_finite_array(name: str, value: ArrayLike) -> None:

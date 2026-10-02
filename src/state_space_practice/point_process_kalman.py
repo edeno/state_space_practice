@@ -44,7 +44,12 @@ from jax import Array
 from jax.typing import ArrayLike
 from numpy.typing import DTypeLike
 
-from state_space_practice.em_driver import run_em
+from state_space_practice.em_driver import (
+    clear_attributes,
+    restore_attributes,
+    run_em,
+    snapshot_attributes,
+)
 from state_space_practice.exceptions import NotFittedError
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.kalman import (
@@ -517,6 +522,62 @@ def _build_block_structure_from_traced(
         Z_base=Z_base,
         n_neurons=n_neurons,
         block_size=nb,
+    )
+
+
+def _validated_dispatch_block_structure(
+    init_mean: Array,
+    init_cov: Array,
+    transition_matrix: Array,
+    process_cov: Array,
+    design_matrix: Array,
+    spike_indicator: Array,
+    block_n_neurons: int | None,
+    block_size: int | None,
+) -> BlockDiagonalStructure:
+    """Check the block-dispatch request and extract its per-neuron factors.
+
+    Shared entry of the block-diagonal dispatch in
+    :func:`stochastic_point_process_filter` and
+    :func:`stochastic_point_process_smoother`, called only when both
+    ``block_n_neurons`` and ``block_size`` are set.
+
+    Raises
+    ------
+    ValueError
+        If ``spike_indicator`` is 1-D (single neuron), or if
+        ``block_n_neurons * block_size`` does not match the state dimension
+        of ``init_cov``.
+    """
+    # The callers only dispatch when both are set; assert so mypy narrows
+    # block_n_neurons / block_size from int | None to int.
+    assert block_n_neurons is not None and block_size is not None
+    if spike_indicator.ndim == 1:
+        raise ValueError(
+            "block_n_neurons / block_size can only be passed for "
+            "multi-neuron (2D spike_indicator) inputs."
+        )
+    # Shape guard: block_n_neurons * block_size must match the total state
+    # dimension. A mismatch means the caller passed wrong detection integers
+    # or the model state shape changed between detection and dispatch.
+    expected_state_dim = block_n_neurons * block_size
+    if init_cov.shape[-1] != expected_state_dim:
+        raise ValueError(
+            f"block dispatch shape mismatch: block_n_neurons="
+            f"{block_n_neurons} * block_size={block_size} = "
+            f"{expected_state_dim}, but init_cov has shape "
+            f"{init_cov.shape}. Pass the block "
+            f"structure of the current problem (PlaceFieldModel "
+            f"re-derives it with _detect_block_structure)."
+        )
+    return _build_block_structure_from_traced(
+        init_mean,
+        init_cov,
+        transition_matrix,
+        process_cov,
+        design_matrix,
+        block_n_neurons,
+        block_size,
     )
 
 
@@ -1794,34 +1855,13 @@ def stochastic_point_process_filter(
         and _uses_default_linear_log_intensity(log_conditional_intensity)
     )
     if use_block_dispatch:
-        # use_block_dispatch is only True when both are set (see its definition);
-        # assert so mypy narrows block_n_neurons / block_size from int | None to int.
-        assert block_n_neurons is not None and block_size is not None
-        if spike_indicator.ndim == 1:
-            raise ValueError(
-                "block_n_neurons / block_size can only be passed for "
-                "multi-neuron (2D spike_indicator) inputs."
-            )
-        # Shape guard: block_n_neurons * block_size must match the total
-        # state dimension. A mismatch means the caller passed wrong
-        # detection integers or the model state shape changed between
-        # detection and dispatch.
-        expected_state_dim = block_n_neurons * block_size
-        if init_covariance_params.shape[-1] != expected_state_dim:
-            raise ValueError(
-                f"block dispatch shape mismatch: block_n_neurons="
-                f"{block_n_neurons} * block_size={block_size} = "
-                f"{expected_state_dim}, but init_cov has shape "
-                f"{init_covariance_params.shape}. Pass the block "
-                f"structure of the current problem (PlaceFieldModel "
-                f"re-derives it with _detect_block_structure)."
-            )
-        structure = _build_block_structure_from_traced(
+        structure = _validated_dispatch_block_structure(
             init_mean_params,
             init_covariance_params,
             transition_matrix,
             process_cov,
             design_matrix,
+            spike_indicator,
             block_n_neurons,
             block_size,
         )
@@ -2796,30 +2836,13 @@ def stochastic_point_process_smoother(
         and _uses_default_linear_log_intensity(log_conditional_intensity)
     )
     if use_block_dispatch:
-        # use_block_dispatch is only True when both are set (see its definition);
-        # assert so mypy narrows block_n_neurons / block_size from int | None to int.
-        assert block_n_neurons is not None and block_size is not None
-        if spike_indicator.ndim == 1:
-            raise ValueError(
-                "block_n_neurons / block_size can only be passed for "
-                "multi-neuron (2D spike_indicator) inputs."
-            )
-        expected_state_dim = block_n_neurons * block_size
-        if init_covariance_params.shape[-1] != expected_state_dim:
-            raise ValueError(
-                f"block dispatch shape mismatch: block_n_neurons="
-                f"{block_n_neurons} * block_size={block_size} = "
-                f"{expected_state_dim}, but init_cov has shape "
-                f"{init_covariance_params.shape}. Pass the block "
-                f"structure of the current problem (PlaceFieldModel "
-                f"re-derives it with _detect_block_structure)."
-            )
-        structure = _build_block_structure_from_traced(
+        structure = _validated_dispatch_block_structure(
             init_mean_params,
             init_covariance_params,
             transition_matrix,
             process_cov,
             design_matrix,
+            spike_indicator,
             block_n_neurons,
             block_size,
         )
@@ -3255,7 +3278,15 @@ class PointProcessModel(SGDFittableMixin):
     filtered_mean, filtered_cov : Array
         Filtered state estimates and covariances after fitting.
     log_likelihood_ : float
-        Marginal log-likelihood at the parameters fitted by :meth:`fit_sgd`.
+        Marginal log-likelihood at the fitted parameters (from the last
+        :meth:`fit` or :meth:`fit_sgd`).
+    log_likelihood_history_ : list[float]
+        Per-iteration EM log-likelihoods, or per-step SGD training objective,
+        of the last fit.
+    converged_ : bool
+        Whether the last fit met its convergence criterion.
+    n_iter_ : int or None
+        EM iterations of the last fit; ``None`` after :meth:`fit_sgd`.
 
     Reading a fitted attribute before fitting raises ``NotFittedError``.
 
@@ -3272,8 +3303,16 @@ class PointProcessModel(SGDFittableMixin):
     smoother_cross_cov: FittedAttribute[Array] = FittedAttribute()
     filtered_mean: FittedAttribute[Array] = FittedAttribute()
     filtered_cov: FittedAttribute[Array] = FittedAttribute()
-    log_likelihood_: FittedAttribute[float] = FittedAttribute()
     _sgd_n_time: FittedAttribute[int] = FittedAttribute()
+
+    # The posteriors above, cleared when a fit fails.
+    _fit_output_attrs = (
+        "smoother_mean",
+        "smoother_cov",
+        "smoother_cross_cov",
+        "filtered_mean",
+        "filtered_cov",
+    )
 
     def __init__(
         self,
@@ -3375,8 +3414,8 @@ class PointProcessModel(SGDFittableMixin):
             transition_matrix=self.transition_matrix,
             process_cov=self.process_cov,
             log_conditional_intensity=self.log_intensity_func,
-            # fit() validates once at entry; skip re-validation on each
-            # EM iteration's E-step.
+            # fit() / fit_sgd() validate once at entry; skip re-validation on
+            # each EM iteration's E-step and the post-SGD smoothing pass.
             validate_inputs=False,
             return_filtered=True,
             max_newton_iter=self.max_newton_iter,
@@ -3465,37 +3504,12 @@ class PointProcessModel(SGDFittableMixin):
             jnp.asarray(self.init_cov), n_time=spike_indicator.shape[0]
         )
 
-        posterior_keys = (
-            "smoother_mean",
-            "smoother_cov",
-            "smoother_cross_cov",
-            "filtered_mean",
-            "filtered_cov",
-        )
-        snapshot_keys = posterior_keys + (
+        snapshot_keys = self._fit_output_attrs + (
             "transition_matrix",
             "process_cov",
             "init_mean",
             "init_cov",
         )
-
-        def _snapshot_state() -> dict[str, Any]:
-            # Unset fitted attributes are left out and unset again on restore.
-            return {k: getattr(self, k) for k in snapshot_keys if hasattr(self, k)}
-
-        def _restore_state(state: dict[str, Any]) -> None:
-            for key in snapshot_keys:
-                if key in state:
-                    setattr(self, key, state[key])
-                else:
-                    delattr(self, key)
-
-        def _clear_posteriors() -> None:
-            # A non-finite first E-step has no accepted state to roll back
-            # to: drop the posteriors it installed so the model reads as
-            # unfitted instead of serving NaN output.
-            for key in posterior_keys:
-                delattr(self, key)
 
         # A rejected E-step (non-finite or decreasing LL) restores the last
         # accepted (parameters, smoother) pair so get_rate_estimate /
@@ -3504,13 +3518,18 @@ class PointProcessModel(SGDFittableMixin):
         result = run_em(
             lambda: float(self._e_step(design_matrix, spike_indicator)),
             self._m_step,
-            _snapshot_state,
-            _restore_state,
+            lambda: snapshot_attributes(self, snapshot_keys),
+            lambda state: restore_attributes(self, state),
             max_iter=max_iter,
             tol=tolerance,
             logger=logger,
             on_first_nonfinite="clear",
-            clear_state=_clear_posteriors,
+            clear_state=lambda: clear_attributes(self, self._fit_output_attrs),
+        )
+        self._record_fit_result(
+            result.log_likelihoods,
+            result.converged,
+            n_iter=len(result.log_likelihoods),
         )
         return result.log_likelihoods
 
@@ -3546,23 +3565,6 @@ class PointProcessModel(SGDFittableMixin):
         -------
         log_likelihoods : list of float
         """
-        design_matrix = jnp.asarray(design_matrix)
-        spike_indicator = jnp.asarray(spike_indicator)
-        validate_count_array(spike_indicator, "spike_indicator")
-        if spike_indicator.ndim == 1:
-            spike_indicator = spike_indicator[:, None]
-        self._sgd_n_time = spike_indicator.shape[0]
-        self._sgd_design_matrix = design_matrix
-        self._sgd_spike_indicator = spike_indicator
-
-        # Numerical sanity check once at the top: validate PSD and warn
-        # on f32 risk. The SGD loss_fn runs inside jax.jit, which cannot
-        # call eigvalsh's host-side float() conversion, so per-step
-        # re-validation is both wasteful and forbidden.
-        _validate_filter_numerics(
-            jnp.asarray(self.init_cov), n_time=spike_indicator.shape[0]
-        )
-
         return super().fit_sgd(
             design_matrix,
             spike_indicator,
@@ -3571,6 +3573,32 @@ class PointProcessModel(SGDFittableMixin):
             verbose=verbose,
             convergence_tol=convergence_tol,
         )
+
+    def _prepare_sgd_data(
+        self, design_matrix: ArrayLike, spike_indicator: ArrayLike
+    ) -> tuple[tuple[Array, Array], dict[str, Any]]:
+        """Validate the ``fit_sgd`` data and record its length.
+
+        Runs after ``fit_sgd`` has validated its settings, so a call rejected
+        for its settings or data leaves the model untouched.
+        """
+        design_matrix = jnp.asarray(design_matrix)
+        spike_indicator = jnp.asarray(spike_indicator)
+        validate_count_array(spike_indicator, "spike_indicator")
+        if spike_indicator.ndim == 1:
+            spike_indicator = spike_indicator[:, None]
+
+        # Numerical sanity check once at the top: validate PSD and warn
+        # on f32 risk. The SGD loss_fn runs inside jax.jit, which cannot
+        # call eigvalsh's host-side float() conversion, so per-step
+        # re-validation is both wasteful and forbidden. stacklevel=5: user
+        # -> fit_sgd -> SGDFittableMixin.fit_sgd -> this hook -> wrapper.
+        _validate_filter_numerics(
+            jnp.asarray(self.init_cov), n_time=spike_indicator.shape[0], stacklevel=5
+        )
+
+        self._sgd_n_time = spike_indicator.shape[0]
+        return (design_matrix, spike_indicator), {}
 
     @property
     def _n_timesteps(self) -> int:
@@ -3599,10 +3627,10 @@ class PointProcessModel(SGDFittableMixin):
     def _sgd_loss_fn(
         self, params: SGDParams, design_matrix: Array, spike_indicator: Array
     ) -> Array:
-        A = params.get("transition_matrix", self.transition_matrix)
-        Q = params.get("process_cov", self.process_cov)
-        m0 = params.get("init_mean", self.init_mean)
-        P0 = params.get("init_cov", self.init_cov)
+        A = self._sgd_param(params, "transition_matrix")
+        Q = self._sgd_param(params, "process_cov")
+        m0 = self._sgd_param(params, "init_mean")
+        P0 = self._sgd_param(params, "init_cov")
 
         _, _, marginal_ll = stochastic_point_process_filter(
             init_mean_params=m0,
@@ -3630,30 +3658,8 @@ class PointProcessModel(SGDFittableMixin):
         if "init_cov" in params:
             self.init_cov = params["init_cov"]
 
-    def _finalize_sgd(self, design_matrix: Array, spike_indicator: Array) -> None:
-        # Take the filtered moments from the smoother's single forward pass
-        # (return_filtered=True) rather than running a second forward filter.
-        (
-            self.smoother_mean,
-            self.smoother_cov,
-            self.smoother_cross_cov,
-            marginal_ll,
-            self.filtered_mean,
-            self.filtered_cov,
-        ) = stochastic_point_process_smoother(
-            init_mean_params=self.init_mean,
-            init_covariance_params=self.init_cov,
-            design_matrix=design_matrix,
-            spike_indicator=spike_indicator,
-            dt=self.dt,
-            transition_matrix=self.transition_matrix,
-            process_cov=self.process_cov,
-            log_conditional_intensity=self.log_intensity_func,
-            validate_inputs=False,  # validated at fit_sgd entry
-            return_filtered=True,
-            max_newton_iter=self.max_newton_iter,
-        )
-        self.log_likelihood_ = float(marginal_ll)
+    def _finalize_sgd(self, design_matrix: Array, spike_indicator: Array) -> float:
+        return self._e_step(design_matrix, spike_indicator)
 
     def get_rate_estimate(
         self,

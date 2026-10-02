@@ -1967,6 +1967,23 @@ class TestCommonOscillatorSGDFitting:
         # LL should improve from first to last
         assert lls[-1] > lls[0]
 
+    @pytest.mark.parametrize("method", ["fit", "fit_sgd"])
+    def test_one_dimensional_observations_raise_value_error(self, com_setup, method):
+        model, obs = com_setup
+        with pytest.raises(ValueError, match="2D"):
+            getattr(model, method)(obs[:, 0], key=jax.random.PRNGKey(0))
+
+    def test_zero_step_fit_sgd_records_log_likelihood(self, com_setup):
+        """num_steps=0 records no optimization history, but final inference
+        still runs, so log_likelihood_ is the marginal LL at the stored
+        parameters."""
+        model, obs = com_setup
+        lls = model.fit_sgd(obs, key=jax.random.PRNGKey(0), num_steps=0)
+        assert lls == []
+        assert model.log_likelihood_ == pytest.approx(
+            float(model._e_step(obs)), rel=1e-12
+        )
+
     def test_sgd_discrete_transitions_stochastic(self, com_setup):
         model, obs = com_setup
         key = jax.random.PRNGKey(0)
@@ -3807,10 +3824,10 @@ def test_em_restore_unsets_outputs_missing_from_snapshot(make_model):
     model = make_model()
     model._initialize_parameters(jax.random.PRNGKey(0))
     snapshot = model._snapshot_em_state()
-    assert "smoother_discrete_state_prob" not in snapshot
+    assert "smoother_discrete_state_prob" not in snapshot.values
     model.smoother_discrete_state_prob = jnp.ones((5, 2)) / 2
 
     model._restore_em_state(snapshot)
 
     assert not hasattr(model, "smoother_discrete_state_prob")
-    np.testing.assert_array_equal(model.init_mean, snapshot["init_mean"])
+    np.testing.assert_array_equal(model.init_mean, snapshot.values["init_mean"])

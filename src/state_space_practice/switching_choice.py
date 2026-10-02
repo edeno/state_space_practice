@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
@@ -32,7 +33,13 @@ import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.exceptions import NotFittedError
+from state_space_practice.covariate_choice import covariate_predict
+from state_space_practice.em_driver import (
+    AttributeSnapshot,
+    restore_attributes,
+    snapshot_attributes,
+)
+from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.multinomial_choice import (
     _softmax_update_core,
@@ -47,6 +54,7 @@ from state_space_practice.parameter_transforms import (
 )
 from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.switching_kalman import (
+    SwitchingSmootherResult,
     _first_timestep_discrete_update,
     _normalize_initial_discrete_prob,
     _stabilize_probability_vector_preserving_zeros,
@@ -58,12 +66,17 @@ from state_space_practice.switching_kalman import (
 from state_space_practice.utils import (
     typed_jit,
     validate_choice_indices,
+    validate_int,
 )
 
 if TYPE_CHECKING:
     import optax
 
 logger = logging.getLogger(__name__)
+
+# Everything SwitchingChoiceModel._m_step writes: the parameters an EM
+# rollback restores.
+_EM_PARAM_ATTRS = ("process_noises_", "discrete_transition_matrix_")
 
 
 def _softmax_predict_and_update(
@@ -103,8 +116,9 @@ def _softmax_predict_and_update(
         ``multinomial_choice._softmax_update_core``).
     """
     # Predict
-    pred_mean = transition_matrix @ prev_mean + input_gain @ covariates_t
-    pred_cov = transition_matrix @ prev_cov @ transition_matrix.T + process_cov
+    pred_mean, pred_cov = covariate_predict(
+        prev_mean, prev_cov, covariates_t, input_gain, transition_matrix, process_cov
+    )
 
     # Update via softmax Laplace-EKF
     return _softmax_update_core(
@@ -395,8 +409,9 @@ def _switching_choice_filter_jit(
     def _first_update_for_state(
         prior_mean: Array, prior_cov: Array, beta: Array, A_j: Array, Q_j: Array
     ) -> tuple[Array, Array, Array, Array, Array, Array]:
-        pred_mean = A_j @ prior_mean + ig_arr @ cov_arr[0]
-        pred_cov = A_j @ prior_cov @ A_j.T + Q_j
+        pred_mean, pred_cov = covariate_predict(
+            prior_mean, prior_cov, cov_arr[0], ig_arr, A_j, Q_j
+        )
 
         obs_offset_0 = ow_arr @ obs_cov_arr[0]
         post_mean, post_cov, ll, newton_gap = _softmax_update_core(
@@ -459,9 +474,7 @@ def _switching_choice_filter_jit(
         def _predict_for_state_j(
             prev_m: Array, prev_c: Array, A_j: Array, Q_j: Array
         ) -> tuple[Array, Array]:
-            pred_m = A_j @ prev_m + ig_arr @ u_t
-            pred_c = A_j @ prev_c @ A_j.T + Q_j
-            return pred_m, pred_c
+            return covariate_predict(prev_m, prev_c, u_t, ig_arr, A_j, Q_j)
 
         pred_means, pred_covs = jax.vmap(
             _predict_for_state_j,
@@ -572,7 +585,7 @@ def switching_choice_smoother(
     transition_matrices: ArrayLike,
     discrete_transition_matrix: ArrayLike,
     control_input: ArrayLike,
-) -> tuple[Array, ...]:
+) -> SwitchingSmootherResult:
     """GPB1 switching RTS smoother for dynamics with a known control input.
 
     The latent dynamics of the switching choice model are
@@ -590,7 +603,7 @@ def switching_choice_smoother(
     invariant to a common shift of the ``t+1`` means) do not depend on
     ``b``. This function therefore runs the library backward step one time
     step at a time, feeding it the shifted next-step means, and returns the
-    same 9-tuple as ``switching_kalman_smoother``. With ``control_input == 0``
+    same result as ``switching_kalman_smoother``. With ``control_input == 0``
     it reproduces ``switching_kalman_smoother`` exactly.
 
     Parameters
@@ -607,11 +620,9 @@ def switching_choice_smoother(
 
     Returns
     -------
-    tuple
-        ``(overall_mean, overall_cov, discrete_probs, joint_discrete_probs,
-        overall_cross_cov, state_cond_means, state_cond_covs,
-        pair_cond_cross_covs, pair_cond_means)`` with the shapes documented
-        in :func:`switching_kalman.switching_kalman_smoother`.
+    SwitchingSmootherResult
+        With the shapes documented in
+        :func:`switching_kalman.switching_kalman_smoother`.
     """
     filtered_values = jnp.asarray(filtered_values)
     filtered_covs = jnp.asarray(filtered_covs)
@@ -621,7 +632,7 @@ def switching_choice_smoother(
     def _backward_step(
         carry: tuple[Array, Array, Array],
         inputs: tuple[Array, Array, Array, Array],
-    ) -> tuple[tuple[Array, Array, Array], tuple[Array, ...]]:
+    ) -> tuple[tuple[Array, Array, Array], SwitchingSmootherResult]:
         next_means, next_covs, next_probs = carry
         filt_mean_t, filt_cov_t, filt_prob_t, b_next = inputs
         # A two-step call whose "last filter" slot is the smoothed t+1 state:
@@ -635,12 +646,13 @@ def switching_choice_smoother(
             continuous_transition_matrix=transition_matrices,
             discrete_state_transition_matrix=discrete_transition_matrix,
         )
-        step = tuple(o[0] for o in out)
-        state_means_t, state_covs_t, probs_t = step[5], step[6], step[2]
+        step = SwitchingSmootherResult(*(o[0] for o in out))
         new_carry = (
-            state_means_t,
-            state_covs_t,
-            _stabilize_probability_vector_preserving_zeros(probs_t),
+            step.state_cond_smoother_means,
+            step.state_cond_smoother_covs,
+            _stabilize_probability_vector_preserving_zeros(
+                step.smoother_discrete_state_prob
+            ),
         )
         return new_carry, step
 
@@ -660,31 +672,25 @@ def switching_choice_smoother(
         ),
         reverse=True,
     )
-    (
-        overall_mean,
-        overall_cov,
-        disc_probs,
-        joint_probs,
-        overall_cross_cov,
-        state_means,
-        state_covs,
-        pair_cross_covs,
-        pair_means,
-    ) = steps
-
     last_mean, last_cov = collapse_gaussian_mixture(
         filtered_values[-1], filtered_covs[-1], discrete_state_probs[-1]
     )
-    return (
-        jnp.concatenate([overall_mean, last_mean[None]], axis=0),
-        jnp.concatenate([overall_cov, last_cov[None]], axis=0),
-        jnp.concatenate([disc_probs, discrete_state_probs[-1:]], axis=0),
-        joint_probs,
-        overall_cross_cov,
-        jnp.concatenate([state_means, filtered_values[-1:]], axis=0),
-        jnp.concatenate([state_covs, filtered_covs[-1:]], axis=0),
-        pair_cross_covs,
-        pair_means,
+    return steps._replace(
+        overall_smoother_mean=jnp.concatenate(
+            [steps.overall_smoother_mean, last_mean[None]], axis=0
+        ),
+        overall_smoother_cov=jnp.concatenate(
+            [steps.overall_smoother_cov, last_cov[None]], axis=0
+        ),
+        smoother_discrete_state_prob=jnp.concatenate(
+            [steps.smoother_discrete_state_prob, discrete_state_probs[-1:]], axis=0
+        ),
+        state_cond_smoother_means=jnp.concatenate(
+            [steps.state_cond_smoother_means, filtered_values[-1:]], axis=0
+        ),
+        state_cond_smoother_covs=jnp.concatenate(
+            [steps.state_cond_smoother_covs, filtered_covs[-1:]], axis=0
+        ),
     )
 
 
@@ -711,6 +717,14 @@ def _between_state_variance(means: Array, probs: Array) -> Array:
     mixture_mean = jnp.einsum("tks,ts->tk", means, probs)
     centred = means - mixture_mean[..., None]
     return jnp.einsum("tks,ts->tk", centred**2, probs)
+
+
+class _AcceptedEStep(NamedTuple):
+    """An EM E-step with a finite log-likelihood and the parameters it used."""
+
+    params: AttributeSnapshot  # of _EM_PARAM_ATTRS
+    filter_result: SwitchingChoiceFilterResult
+    smoother_result: SwitchingSmootherResult
 
 
 class SwitchingChoiceModel(SGDFittableMixin):
@@ -745,7 +759,6 @@ class SwitchingChoiceModel(SGDFittableMixin):
     smoothed_discrete_probs_: FittedAttribute[Array] = FittedAttribute()
     _smoother_state_cond_means: FittedAttribute[Array] = FittedAttribute()
     _smoother_state_cond_covs: FittedAttribute[Array] = FittedAttribute()
-    log_likelihood_: FittedAttribute[float] = FittedAttribute()
     _n_trials: FittedAttribute[int] = FittedAttribute()
 
     # Uncertainty summaries: (T, K) variances, (T,) entropy and surprise,
@@ -755,6 +768,19 @@ class SwitchingChoiceModel(SGDFittableMixin):
     predicted_choice_entropy_: FittedAttribute[Array] = FittedAttribute()
     surprise_: FittedAttribute[Array] = FittedAttribute()
     per_state_predicted_variances_: FittedAttribute[Array] = FittedAttribute()
+
+    # Everything above a fit writes, cleared when a fit fails.
+    _fit_output_attrs = (
+        "_filter_result",
+        "smoothed_discrete_probs_",
+        "_smoother_state_cond_means",
+        "_smoother_state_cond_covs",
+        "predicted_option_variances_",
+        "smoothed_option_variances_",
+        "predicted_choice_entropy_",
+        "surprise_",
+        "per_state_predicted_variances_",
+    )
 
     def __init__(
         self,
@@ -941,6 +967,37 @@ class SwitchingChoiceModel(SGDFittableMixin):
             f"n_discrete_states={self.n_discrete_states}, {fitted})"
         )
 
+    def _bind_data(
+        self,
+        choices: ArrayLike,
+        covariates: ArrayLike | None,
+        obs_covariates: ArrayLike | None,
+    ) -> Array:
+        """Validate the fitting data and bind it to the model.
+
+        Records the trial count and the covariates that the filter, smoother,
+        M-step and SGD loss read from the model.
+
+        Parameters
+        ----------
+        choices : ArrayLike, shape (n_trials,)
+        covariates : ArrayLike or None, shape (n_trials, n_covariates)
+        obs_covariates : ArrayLike or None, shape (n_trials, n_obs_covariates)
+
+        Returns
+        -------
+        choices : Array, shape (n_trials,)
+            The choices as int32.
+        """
+        validate_choice_indices(choices, self.n_options)
+        choices = jnp.asarray(choices, dtype=jnp.int32)
+        self._n_trials = int(choices.shape[0])
+        self._covariates = jnp.asarray(covariates) if covariates is not None else None
+        self._obs_covariates = (
+            jnp.asarray(obs_covariates) if obs_covariates is not None else None
+        )
+        return choices
+
     def _run_filter(
         self,
         choices: Array,
@@ -998,25 +1055,41 @@ class SwitchingChoiceModel(SGDFittableMixin):
         Returns
         -------
         log_likelihoods : list of float
+            Log-likelihood of every E-step with a finite value. If an E-step
+            (including the final one after ``max_iter``) is non-finite, EM
+            restores the parameters and posteriors of the last finite E-step,
+            logs a warning and stops unconverged; the non-finite value is not
+            recorded.
+
+        Raises
+        ------
+        NonFiniteLikelihoodError
+            If the first E-step's log-likelihood is non-finite (the starting
+            parameters are unusable).
         """
-        validate_choice_indices(choices, self.n_options)
-        choices = jnp.asarray(choices, dtype=jnp.int32)
-        self._n_trials = int(choices.shape[0])
-        self._covariates = jnp.asarray(covariates) if covariates is not None else None
-        self._obs_covariates = (
-            jnp.asarray(obs_covariates) if obs_covariates is not None else None
-        )
+        max_iter = validate_int(max_iter, "max_iter", positive=True)
+        choices = self._bind_data(choices, covariates, obs_covariates)
 
         log_likelihoods: list[float] = []
         prev_ll = float("-inf")
         converged = False
+        # Parameters and posteriors of the last E-step with a finite
+        # log-likelihood; a non-finite E-step rolls back to them.
+        accepted: _AcceptedEStep | None = None
+        rolled_back = False
 
         for iteration in range(max_iter):
             # E-step: filter + smoother
             result = self._run_filter(choices, self._covariates, self._obs_covariates)
+            ll = float(result.marginal_log_likelihood)
+            if not math.isfinite(ll):
+                result, smoother_result = self._roll_back_em(
+                    accepted, ll, f"EM iteration {iteration + 1}"
+                )
+                rolled_back = True
+                break
             self._filter_result = result
             smoother_result = self._run_smoother(result)
-            ll = float(result.marginal_log_likelihood)
             log_likelihoods.append(ll)
 
             if abs(ll - prev_ll) < tolerance and iteration > 0:
@@ -1024,32 +1097,96 @@ class SwitchingChoiceModel(SGDFittableMixin):
                 converged = True
                 break
             prev_ll = ll
+            accepted = _AcceptedEStep(
+                snapshot_attributes(self, _EM_PARAM_ATTRS), result, smoother_result
+            )
 
             # M-step
-            self._m_step(choices, result, smoother_result)
+            self._m_step(smoother_result)
 
-        # Final E-step with learned parameters so fitted summaries and
-        # log_likelihood_ correspond to the model state after the last M-step.
-        result = self._run_filter(choices, self._covariates, self._obs_covariates)
-        self._filter_result = result
-        smoother_result = self._run_smoother(result)
+        if not converged and not rolled_back:
+            # Final E-step with learned parameters so fitted summaries and
+            # log_likelihood_ correspond to the model state after the last
+            # M-step. On convergence no M-step followed the last E-step, so its
+            # results are already at the final parameters.
+            result = self._run_filter(choices, self._covariates, self._obs_covariates)
+            final_ll = float(result.marginal_log_likelihood)
+            if math.isfinite(final_ll):
+                self._filter_result = result
+                smoother_result = self._run_smoother(result)
+            else:
+                result, smoother_result = self._roll_back_em(
+                    accepted, final_ll, "the final E-step"
+                )
+                rolled_back = True
 
-        self.smoothed_discrete_probs_ = smoother_result[2]
-        self._smoother_state_cond_means = smoother_result[5]  # (T, K-1, S)
-        self._smoother_state_cond_covs = smoother_result[6]  # (T, K-1, K-1, S)
-        self.log_likelihood_ = float(result.marginal_log_likelihood)
-        # History is the per-iteration E-step LL trajectory; its last entry
-        # predates the final M-step, so it intentionally differs from
-        # log_likelihood_ above (re-evaluated at the final parameters).
-        self.log_likelihood_history_ = log_likelihoods
+        self.smoothed_discrete_probs_ = smoother_result.smoother_discrete_state_prob
+        self._smoother_state_cond_means = smoother_result.state_cond_smoother_means
+        self._smoother_state_cond_covs = smoother_result.state_cond_smoother_covs
+        # History is the per-iteration E-step LL trajectory; without
+        # convergence (and without a rollback) its last entry predates the
+        # final M-step, so it intentionally differs from log_likelihood_
+        # (re-evaluated at the final parameters).
+        self._record_fit_result(
+            log_likelihoods,
+            converged,
+            n_iter=len(log_likelihoods),
+            log_likelihood=float(result.marginal_log_likelihood),
+        )
         self._populate_uncertainty(choices)
-        self._finalize_convergence(converged, max_iter)
+        if not rolled_back:
+            self._finalize_convergence(converged, max_iter)
 
         return log_likelihoods
 
+    def _roll_back_em(
+        self, accepted: _AcceptedEStep | None, bad_ll: float, where: str
+    ) -> tuple[SwitchingChoiceFilterResult, SwitchingSmootherResult]:
+        """Restore the last finite E-step after a non-finite one.
+
+        Parameters
+        ----------
+        accepted : _AcceptedEStep or None
+            The last E-step with a finite log-likelihood, or None if there was
+            none.
+        bad_ll : float
+            The non-finite log-likelihood.
+        where : str
+            Which E-step failed, for the messages.
+
+        Returns
+        -------
+        filter_result : SwitchingChoiceFilterResult
+        smoother_result : SwitchingSmootherResult
+            The restored E-step's posteriors (computed under the restored
+            parameters, so they need no re-run).
+
+        Raises
+        ------
+        NonFiniteLikelihoodError
+            If no E-step was finite: the starting parameters are unusable.
+        """
+        if accepted is None:
+            self._clear_fit_state()
+            raise NonFiniteLikelihoodError(
+                f"Non-finite log-likelihood ({bad_ll}) at {where} with the "
+                "starting parameters; check init_process_noises, "
+                "init_inverse_temperatures, init_decays and the covariates."
+            )
+        restore_attributes(self, accepted.params)
+        self._filter_result = accepted.filter_result
+        logger.warning(
+            "SwitchingChoiceModel.fit: non-finite log-likelihood (%s) at %s; "
+            "rolled back to the parameters of the last finite E-step and "
+            "stopped EM (not converged).",
+            bad_ll,
+            where,
+        )
+        return accepted.filter_result, accepted.smoother_result
+
     def _run_smoother(
         self, filter_result: SwitchingChoiceFilterResult
-    ) -> tuple[Array, ...]:
+    ) -> SwitchingSmootherResult:
         """Run the control-aware GPB1 switching smoother on filter output.
 
         The known dynamics input ``B @ u_t`` enters the smoother's one-step
@@ -1072,12 +1209,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
             control_input,
         )
 
-    def _m_step(
-        self,
-        choices: Array,
-        filter_result: SwitchingChoiceFilterResult,
-        smoother_result: tuple[Array, ...],
-    ) -> None:
+    def _m_step(self, smoother_result: SwitchingSmootherResult) -> None:
         """M-step: update per-state Q and transition matrix.
 
         Uses smoother quantities throughout (approximate EM via GPB1/IMM):
@@ -1090,16 +1222,11 @@ class SwitchingChoiceModel(SGDFittableMixin):
         expects matrix A/Q and returns matrices. Per-state beta and decay
         have no closed-form M-step and are learned via SGD only.
         """
-        joint = smoother_result[3]  # smoother joint (T-1, S, S)
-        smoother_means = smoother_result[
-            5
-        ]  # state-conditional smoother means (T, K-1, S)
-        smoother_covs = smoother_result[
-            6
-        ]  # state-conditional smoother covs (T, K-1, K-1, S)
-        pair_cross_covs = smoother_result[
-            7
-        ]  # pair-cond cross-covs (T-1, K-1, K-1, S, S)
+        joint = smoother_result.smoother_joint_discrete_state_prob  # (T-1, S, S)
+        smoother_means = smoother_result.state_cond_smoother_means  # (T, K-1, S)
+        smoother_covs = smoother_result.state_cond_smoother_covs  # (T, K-1, K-1, S)
+        # (T-1, K-1, K-1, S, S)
+        pair_cross_covs = smoother_result.pair_cond_smoother_cross_covs
         S = self.n_discrete_states
         k_free = self.n_options - 1
         eps = 1e-10
@@ -1200,21 +1327,28 @@ class SwitchingChoiceModel(SGDFittableMixin):
         log_likelihoods : list of float
             Marginal log-likelihood per optimization step.
         """
-        validate_choice_indices(choices, self.n_options)
-        choices = jnp.asarray(choices, dtype=jnp.int32)
-        self._n_trials = int(choices.shape[0])
-        self._covariates = jnp.asarray(covariates) if covariates is not None else None
-        self._obs_covariates = (
-            jnp.asarray(obs_covariates) if obs_covariates is not None else None
-        )
-
         return super().fit_sgd(
             choices,
+            covariates,
+            obs_covariates,
             optimizer=optimizer,
             num_steps=num_steps,
             verbose=verbose,
             convergence_tol=convergence_tol,
         )
+
+    def _prepare_sgd_data(
+        self,
+        choices: ArrayLike,
+        covariates: ArrayLike | None = None,
+        obs_covariates: ArrayLike | None = None,
+    ) -> tuple[tuple[Array], dict[str, Any]]:
+        """Bind the data after ``fit_sgd`` has validated its settings.
+
+        The covariates stay on the model (the loss and ``_finalize_sgd`` read
+        them there); only the choices are forwarded.
+        """
+        return (self._bind_data(choices, covariates, obs_covariates),), {}
 
     @property
     def _n_timesteps(self) -> int:
@@ -1284,15 +1418,15 @@ class SwitchingChoiceModel(SGDFittableMixin):
         if "obs_weights" in params:
             self.obs_weights_ = params["obs_weights"]
 
-    def _finalize_sgd(self, choices: Array) -> None:
+    def _finalize_sgd(self, choices: Array) -> float:
         result = self._run_filter(choices, self._covariates, self._obs_covariates)
         self._filter_result = result
         smoother_result = self._run_smoother(result)
-        self.smoothed_discrete_probs_ = smoother_result[2]
-        self._smoother_state_cond_means = smoother_result[5]  # (T, K-1, S)
-        self._smoother_state_cond_covs = smoother_result[6]  # (T, K-1, K-1, S)
-        self.log_likelihood_ = float(result.marginal_log_likelihood)
+        self.smoothed_discrete_probs_ = smoother_result.smoother_discrete_state_prob
+        self._smoother_state_cond_means = smoother_result.state_cond_smoother_means
+        self._smoother_state_cond_covs = smoother_result.state_cond_smoother_covs
         self._populate_uncertainty(choices)
+        return float(result.marginal_log_likelihood)
 
 
 class SimulatedSwitchingChoiceData(NamedTuple):

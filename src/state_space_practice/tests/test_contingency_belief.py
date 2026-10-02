@@ -1,6 +1,8 @@
 # ruff: noqa: E402
 """Tests for the contingency_belief module."""
 
+import logging
+
 import jax
 
 jax.config.update("jax_enable_x64", True)
@@ -12,6 +14,7 @@ import pytest
 from state_space_practice.contingency_belief import (
     ContingencyBeliefModel,
     ContingencyBeliefResult,
+    SmootherResult,
     centered_softmax,
     compute_input_output_transition_matrix,
     compute_reward_log_likelihood,
@@ -19,7 +22,7 @@ from state_space_practice.contingency_belief import (
     contingency_belief_smoother,
     transition_logits_to_matrix,
 )
-from state_space_practice.exceptions import NotFittedError
+from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
 from state_space_practice.tests.recovery_helpers import (
     assert_ll_improves,
     state_segmentation_accuracy,
@@ -257,6 +260,16 @@ class TestContingencyBeliefSmoother:
             transition_logits=jnp.array([[3.0], [-3.0]]),
         )
         return kwargs
+
+    def test_result_unpacks_into_three_values(self, block_data):
+        """The public result keeps its (smoothed, pairwise, log_likelihood)
+        layout, so existing three-way unpacking keeps working."""
+        result = contingency_belief_smoother(**block_data)
+        assert type(result) is SmootherResult and len(result) == 3
+        smoothed, pairwise, ll = result
+        assert smoothed is result.smoothed_state_prob
+        assert pairwise is result.pairwise_state_prob
+        assert ll is result.log_likelihood
 
     def test_smoother_shapes(self, block_data):
         result = contingency_belief_smoother(**block_data)
@@ -599,7 +612,14 @@ class TestContingencyBeliefModel:
         choices, rewards, _, _ = _simulate_block_bandit(n_trials=50)
         model = ContingencyBeliefModel(n_states=2, n_options=3)
         lls = model.fit(choices, rewards, max_iter=1)
-        fresh = contingency_belief_smoother(**model._smoother_kwargs(choices, rewards))
+        fresh = contingency_belief_smoother(
+            **model._smoother_kwargs(
+                choices,
+                rewards,
+                model._transition_design_matrix,
+                model._obs_design_matrix,
+            )
+        )
         np.testing.assert_allclose(model.log_likelihood_, float(fresh.log_likelihood))
         np.testing.assert_allclose(lls[-1], model.log_likelihood_)
 
@@ -644,6 +664,66 @@ class TestContingencyBeliefSGD:
 
         assert np.isfinite(model_em.log_likelihood_)
         assert np.isfinite(model_sgd.log_likelihood_)
+
+
+class TestEMNonFiniteLikelihood:
+    def test_mid_fit_nonfinite_restores_last_accepted(self, monkeypatch, caplog):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=80)
+        original = ContingencyBeliefModel._m_step
+        calls: list = []
+        accepted: dict = {}
+
+        def poisoned_m_step(self, choices, rewards, result):
+            calls.append(None)
+            if len(calls) == 2:
+                accepted["reward_probs"] = np.asarray(self.reward_probs_)
+                accepted["transition_coefficients"] = np.asarray(
+                    self.transition_coefficients_
+                )
+            original(self, choices, rewards, result)
+            if len(calls) == 2:
+                self.reward_probs_ = jnp.full_like(self.reward_probs_, jnp.nan)
+
+        monkeypatch.setattr(ContingencyBeliefModel, "_m_step", poisoned_m_step)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        with caplog.at_level(
+            logging.WARNING, logger="state_space_practice.contingency_belief"
+        ):
+            lls = model.fit(choices, rewards, max_iter=10, tolerance=0.0)
+
+        # Guard: the poisoned M-step ran and EM stopped at the next E-step.
+        assert len(calls) == 2
+        assert len(lls) == 2
+        assert np.all(np.isfinite(lls))
+        np.testing.assert_array_equal(model.reward_probs_, accepted["reward_probs"])
+        np.testing.assert_array_equal(
+            model.transition_coefficients_, accepted["transition_coefficients"]
+        )
+        assert model.converged_ is False
+        assert model.log_likelihood_ == lls[-1]
+        # Posteriors are those of the restored parameters.
+        kwargs = model._smoother_kwargs(
+            jnp.asarray(choices),
+            jnp.asarray(rewards),
+            model._transition_design_matrix,
+            None,
+        )
+        fresh = contingency_belief_smoother(**kwargs)
+        assert float(fresh.log_likelihood) == lls[-1]
+        np.testing.assert_array_equal(
+            model.smoothed_state_posterior_, fresh.smoothed_state_prob
+        )
+        np.testing.assert_array_equal(
+            model.state_posterior_, contingency_belief_filter(**kwargs).state_posterior
+        )
+        assert any("non-finite" in r.getMessage().lower() for r in caplog.records)
+
+    def test_first_estep_nonfinite_raises(self):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=40)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.reward_probs_ = jnp.full_like(model.reward_probs_, jnp.nan)
+        with pytest.raises(NonFiniteLikelihoodError):
+            model.fit(choices, rewards, max_iter=5)
 
 
 class TestContingencyBeliefIntegration:
@@ -1164,7 +1244,12 @@ class TestTransitionMStep:
         choices, rewards, cov, states, reward_probs = _simulate_switch_covariate_iohmm()
         model = _true_switch_model(cov, reward_probs)
         posterior = contingency_belief_smoother(
-            **model._smoother_kwargs(jnp.asarray(choices), jnp.asarray(rewards))
+            **model._smoother_kwargs(
+                jnp.asarray(choices),
+                jnp.asarray(rewards),
+                model._transition_design_matrix,
+                model._obs_design_matrix,
+            )
         )
         # guard: the true-parameter posterior is informative about the states
         accuracy = np.mean(
@@ -1219,7 +1304,12 @@ class TestTransitionMStep:
         cb._optimize_transition_rows.clear_cache()
         model = _true_switch_model(cov, reward_probs)
         posterior = contingency_belief_smoother(
-            **model._smoother_kwargs(choices, rewards)
+            **model._smoother_kwargs(
+                choices,
+                rewards,
+                model._transition_design_matrix,
+                model._obs_design_matrix,
+            )
         )
         model._m_step(choices, rewards, posterior)
         per_trace = len(traces)
@@ -1290,7 +1380,14 @@ class TestContingencyMStepExactness:
         model = ContingencyBeliefModel(n_states=2, n_options=K, seed=0)
         model._transition_design_matrix = model._build_design_matrix(n_trials)
         choices, rewards = jnp.asarray(choices), jnp.asarray(rewards)
-        post = contingency_belief_smoother(**model._smoother_kwargs(choices, rewards))
+        post = contingency_belief_smoother(
+            **model._smoother_kwargs(
+                choices,
+                rewards,
+                model._transition_design_matrix,
+                model._obs_design_matrix,
+            )
+        )
         return model, choices, rewards, post
 
     def test_reward_probs_are_stationary(self, e_step):

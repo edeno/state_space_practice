@@ -59,7 +59,7 @@ src/state_space_practice/
 ├── oscillator_models.py       # Coupled oscillator model classes
 ├── models.py                  # General state-space model classes
 ├── utils.py                   # Shared utilities (PSD floors, validation)
-├── exceptions.py              # StateSpaceWarning, NotFittedError
+├── exceptions.py              # StateSpaceWarning, NotFittedError, NonFiniteLikelihoodError
 ├── fitted_state.py            # FittedAttribute: typed post-fit model state
 ├── simulate_data.py           # Data simulation utilities
 ├── simulate/                  # Additional simulation modules

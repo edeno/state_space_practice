@@ -196,22 +196,49 @@ def validate_coupling_params(params: CouplingModelParams) -> None:
         )
     if np.any(np.asarray(params.process_noise_var) < 0.0):
         raise ValueError("process_noise_var must be nonnegative")
-    for name, value in (
-        ("dt", params.dt),
-        ("lfp_noise_var", params.lfp_noise_var),
+    _validate_positive_real_scalar("dt", params.dt)
+    _validate_positive_real_scalar("lfp_noise_var", params.lfp_noise_var)
+
+
+def _validate_positive_real_scalar(
+    name: str,
+    value: ArrayLike,
+    *,
+    type_requirement: str = "a real-valued numeric scalar",
+) -> float:
+    """Validate a finite, positive, real numeric scalar and return it as a float.
+
+    Parameters
+    ----------
+    name : str
+        Argument name used in error messages.
+    value : ArrayLike, shape ()
+        Value to check.
+    type_requirement : str, default "a real-valued numeric scalar"
+        Completes ``"{name} must be ..."`` in the error raised when ``value``
+        is not a real numeric scalar.
+
+    Returns
+    -------
+    float
+
+    Raises
+    ------
+    ValueError
+        If ``value`` is not a real numeric scalar, or is non-finite or
+        non-positive.
+    """
+    value_arr = np.asarray(value)
+    if (
+        value_arr.shape != ()
+        or not np.issubdtype(value_arr.dtype, np.number)
+        or np.issubdtype(value_arr.dtype, np.complexfloating)
     ):
-        value_arr = np.asarray(value)
-        if (
-            value_arr.shape != ()
-            or not np.issubdtype(value_arr.dtype, np.number)
-            or np.issubdtype(value_arr.dtype, np.complexfloating)
-        ):
-            raise ValueError(
-                f"{name} must be a real-valued numeric scalar, got {value}."
-            )
-        value_float = float(value_arr)
-        if not np.isfinite(value_float) or value_float <= 0.0:
-            raise ValueError(f"{name} must be finite and positive, got {value}.")
+        raise ValueError(f"{name} must be {type_requirement}, got {value}.")
+    value_float = float(value_arr)
+    if not np.isfinite(value_float) or value_float <= 0.0:
+        raise ValueError(f"{name} must be finite and positive, got {value}.")
+    return value_float
 
 
 def validate_coupling_observations(

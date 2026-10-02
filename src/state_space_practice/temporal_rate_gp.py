@@ -46,7 +46,7 @@ Nickisch, H., Solin, A. & Grigorevskiy, A. (2018). State Space Gaussian Processe
 """
 
 import warnings
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -70,6 +70,7 @@ from state_space_practice.utils import (
     _validate_filter_numerics,
     contains_tracer,
     validate_count_array,
+    validate_finite_array,
     validate_int,
     validate_scalar,
 )
@@ -526,8 +527,7 @@ def _broadcast_hyperparameter(
                     f"{name} must be a scalar or have length n_neurons="
                     f"{n_neurons}; got shape {array.shape}."
                 )
-            if not bool(jnp.all(jnp.isfinite(array))):
-                raise ValueError(f"{name} must contain only finite values.")
+            validate_finite_array(name, array)
             if positive and not bool(jnp.all(array > 0.0)):
                 raise ValueError(f"{name} must be strictly positive.")
         else:
@@ -649,11 +649,13 @@ class TemporalRateGP(SGDFittableMixin):
     them.
     """
 
-    # Data and posterior, set by fit_sgd.
-    _counts: FittedAttribute[Array] = FittedAttribute()
+    # Posterior, set by fit_sgd.
     log_rate_mean_: FittedAttribute[Array] = FittedAttribute()
     log_rate_var_: FittedAttribute[Array] = FittedAttribute()
     log_marginal_likelihood_: FittedAttribute[float] = FittedAttribute()
+
+    # The posterior above, cleared when a fit fails.
+    _fit_output_attrs = ("log_rate_mean_", "log_rate_var_", "log_marginal_likelihood_")
 
     def __init__(
         self,
@@ -741,39 +743,6 @@ class TemporalRateGP(SGDFittableMixin):
         list of float
             Log-evidence (summed over neurons) at each optimization step.
         """
-        counts = jnp.asarray(counts)
-        if counts.ndim == 1:
-            n_neurons, n_time = 1, int(counts.shape[0])
-        elif counts.ndim == 2:
-            n_neurons, n_time = int(counts.shape[0]), int(counts.shape[1])
-        else:
-            raise ValueError(
-                "counts must be 1D (n_time,) or 2D (n_neurons, n_time), got "
-                f"shape {counts.shape}."
-            )
-        validate_count_array(counts, "counts", allow_empty=False)
-        self._counts = counts
-        self._n_neurons = n_neurons
-        # Total observation count normalizes the mixin's loss so the learning
-        # rate scale is comparable across single- and multi-neuron fits.
-        self._sgd_n_time = n_time * n_neurons
-
-        # Numerical-precision guard: the Laplace-EKF smoother needs float64 for
-        # long sequences. Validate the stationary prior once (also warns on
-        # f32 + long T), matching the other filter entry points. A representative
-        # scalar hyperparameter suffices for the per-neuron case.
-        representative_variance = float(jnp.mean(jnp.asarray(self.variance)))
-        representative_lengthscale = float(jnp.mean(jnp.asarray(self.lengthscale)))
-        _, _, _, _, stationary_cov = matern32_continuous(
-            representative_variance, representative_lengthscale
-        )
-        _validate_filter_numerics(
-            stationary_cov,
-            n_time=n_time,
-            stacklevel=3,
-            filter_name="TemporalRateGP.fit_sgd",
-        )
-
         return super().fit_sgd(
             counts,
             num_steps=num_steps,
@@ -829,12 +798,48 @@ class TemporalRateGP(SGDFittableMixin):
     def _n_timesteps(self) -> int:
         return self._sgd_n_time
 
-    def _check_sgd_initialized(self) -> None:
-        if not is_set(self, "_counts"):
-            raise RuntimeError(
-                "No data. Call fit_sgd(counts), not SGDFittableMixin.fit_sgd() "
-                "directly."
+    def _prepare_sgd_data(
+        self, counts: ArrayLike
+    ) -> tuple[tuple[Array], dict[str, Any]]:
+        """Validate the ``fit_sgd`` counts and record their shape.
+
+        Runs after ``fit_sgd`` has validated its settings, so a call rejected
+        for its settings or data leaves the model untouched.
+        """
+        counts = jnp.asarray(counts)
+        if counts.ndim == 1:
+            n_neurons, n_time = 1, int(counts.shape[0])
+        elif counts.ndim == 2:
+            n_neurons, n_time = int(counts.shape[0]), int(counts.shape[1])
+        else:
+            raise ValueError(
+                "counts must be 1D (n_time,) or 2D (n_neurons, n_time), got "
+                f"shape {counts.shape}."
             )
+        validate_count_array(counts, "counts", allow_empty=False)
+
+        # Numerical-precision guard: the Laplace-EKF smoother needs float64 for
+        # long sequences. Validate the stationary prior once (also warns on
+        # f32 + long T), matching the other filter entry points. A representative
+        # scalar hyperparameter suffices for the per-neuron case. stacklevel=5:
+        # user -> fit_sgd -> SGDFittableMixin.fit_sgd -> this hook.
+        representative_variance = float(jnp.mean(jnp.asarray(self.variance)))
+        representative_lengthscale = float(jnp.mean(jnp.asarray(self.lengthscale)))
+        _, _, _, _, stationary_cov = matern32_continuous(
+            representative_variance, representative_lengthscale
+        )
+        _validate_filter_numerics(
+            stationary_cov,
+            n_time=n_time,
+            stacklevel=5,
+            filter_name="TemporalRateGP.fit_sgd",
+        )
+
+        self._n_neurons = n_neurons
+        # Total observation count normalizes the mixin's loss so the learning
+        # rate scale is comparable across single- and multi-neuron fits.
+        self._sgd_n_time = n_time * n_neurons
+        return (counts,), {}
 
     def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         n_neurons = self._n_neurons
@@ -902,7 +907,7 @@ class TemporalRateGP(SGDFittableMixin):
             self.lengthscale = params["lengthscale"]
             self.mean = params["mean"]
 
-    def _finalize_sgd(self, counts: Array) -> None:
+    def _finalize_sgd(self, counts: Array) -> float:
         if self._n_neurons == 1:
             result = infer_log_rate(
                 counts,
@@ -929,3 +934,4 @@ class TemporalRateGP(SGDFittableMixin):
             )
         self.log_rate_mean_ = result.log_rate_mean
         self.log_rate_var_ = result.log_rate_var
+        return self.log_marginal_likelihood_

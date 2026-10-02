@@ -36,6 +36,7 @@ from jax import Array
 from jax.typing import ArrayLike
 from numpy.typing import NDArray
 
+from state_space_practice.kalman import rts_backward_scan_with_predictions
 from state_space_practice.multinomial_choice import (
     ChoiceFilterResult,
     ChoiceSmootherResult,
@@ -51,9 +52,9 @@ from state_space_practice.sgd_fitting import SGDParams, SGDParamSpec
 from state_space_practice.utils import (
     _root_figure,
     psd_solve,
-    symmetrize,
     typed_jit,
     validate_choice_indices,
+    validate_int,
 )
 
 if TYPE_CHECKING:
@@ -366,8 +367,9 @@ def _covariate_choice_filter_jit(
         choice_t, u_t, z_t = inputs
 
         # Predict with transition and control input
-        pred_mean = A @ filt_mean + input_gain @ u_t
-        pred_cov = A @ filt_cov @ A.T + Q
+        pred_mean, pred_cov = covariate_predict(
+            filt_mean, filt_cov, u_t, input_gain, A, Q
+        )
 
         # Observation offset from obs covariates
         obs_offset = obs_weights @ z_t
@@ -406,50 +408,6 @@ def _covariate_choice_filter_jit(
     )
 
 
-def _rts_smoother_pass_with_predictions(
-    filtered_values: Array,
-    filtered_covariances: Array,
-    predicted_values: Array,
-    predicted_covariances: Array,
-    A: Array,
-) -> tuple[Array, Array, Array]:
-    """RTS backward smoother that consumes the filter's stored one-step predictions.
-
-    Unlike :func:`kalman.rts_backward_scan`, which recomputes the
-    one-step prediction as ``A @ m_filt`` (valid only for control-free dynamics),
-    this uses ``predicted_values`` / ``predicted_covariances`` from the forward
-    filter. Those already include the control input ``input_gain @ u_t``, so the
-    smoothed means stay consistent with the filter when dynamics covariates are
-    present. The gain/covariance recursion is the standard RTS update (the control
-    input does not affect covariances), so with no control input this reduces
-    exactly to ``rts_backward_scan``.
-    """
-
-    def _smooth_step(
-        carry: tuple[Array, Array], inputs: tuple[Array, Array, Array, Array]
-    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
-        next_sm_mean, next_sm_cov = carry
-        f_mean, f_cov, p_mean_next, p_cov_next = inputs
-        gain = psd_solve(p_cov_next, A @ f_cov).T
-        sm_mean = f_mean + gain @ (next_sm_mean - p_mean_next)
-        sm_cov = symmetrize(f_cov + gain @ (next_sm_cov - p_cov_next) @ gain.T)
-        cross_cov = gain @ next_sm_cov
-        return (sm_mean, sm_cov), (sm_mean, sm_cov, cross_cov)
-
-    _, (sm_means, sm_covs, cross_covs) = jax.lax.scan(
-        _smooth_step,
-        (filtered_values[-1], filtered_covariances[-1]),
-        (
-            filtered_values[:-1],
-            filtered_covariances[:-1],
-            predicted_values[1:],
-            predicted_covariances[1:],
-        ),
-        reverse=True,
-    )
-    return sm_means, sm_covs, cross_covs
-
-
 def covariate_choice_smoother(
     choices: ArrayLike,
     n_options: int,
@@ -485,23 +443,17 @@ def covariate_choice_smoother(
         init_cov,
     )
 
-    k_free = n_options - 1
-    A = jnp.eye(k_free) * decay
-
     # Control-aware RTS: consume the filter's stored one-step predictions (which
     # include the control input input_gain @ u_t) instead of recomputing
     # A @ m_filt, so the smoothed means are consistent with the filter when
     # dynamics covariates are present.
-    sm_means, sm_covs, cross_covs = _rts_smoother_pass_with_predictions(
+    smoothed_values, smoothed_covs, cross_covs = rts_backward_scan_with_predictions(
         filt.filtered_values,
         filt.filtered_covariances,
         filt.predicted_values,
         filt.predicted_covariances,
-        A,
+        jnp.eye(n_options - 1) * decay,
     )
-
-    smoothed_values = jnp.concatenate([sm_means, filt.filtered_values[-1:]])
-    smoothed_covs = jnp.concatenate([sm_covs, filt.filtered_covariances[-1:]])
 
     return ChoiceSmootherResult(
         smoothed_values=smoothed_values,
@@ -730,6 +682,7 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
         choices: Array,
         log_likelihoods: list[float],
         last_accepted: dict[str, Any] | None,
+        current: ChoiceSmootherResult | None = None,
     ) -> float:
         """Final E-step, kept only if it did not decrease the log-likelihood.
 
@@ -737,9 +690,11 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
         is accepted (its LL replacing or extending the history) when that LL is
         finite and not worse than the last accepted iterate; otherwise the last
         M-step is rolled back so the stored (params, smoother, LL) stay
-        consistent.
+        consistent. Arguments and return value as in the base class.
         """
-        final_ll = super()._final_e_step(choices, log_likelihoods, last_accepted)
+        final_ll = super()._final_e_step(
+            choices, log_likelihoods, last_accepted, current
+        )
         close = bool(log_likelihoods) and np.isclose(final_ll, log_likelihoods[-1])
         not_worse = (not log_likelihoods) or close or final_ll >= log_likelihoods[-1]
         if np.isfinite(final_ll) and not_worse:
@@ -751,8 +706,8 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
             self._restore_parameters(last_accepted)
             final_ll = super()._final_e_step(choices, log_likelihoods, last_accepted)
             logger.warning(
-                "Final M-step decreased the log-likelihood; rolled back to the "
-                "previous parameters."
+                "Final M-step decreased the log-likelihood (or left it "
+                "non-finite); rolled back to the previous parameters."
             )
         return final_ll
 
@@ -822,7 +777,15 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
         Returns
         -------
         log_likelihoods : list of float
+
+        Raises
+        ------
+        NonFiniteLikelihoodError
+            If the first E-step's log-likelihood is non-finite. A later
+            non-finite E-step is never recorded: the parameters roll back to
+            the last accepted iterate and EM stops with a warning.
         """
+        max_iter = validate_int(max_iter, "max_iter", positive=True)
         choices_arr = self._bind_covariates(choices, covariates, obs_covariates, "fit")
         return self._fit_em(choices_arr, max_iter, tolerance, verbose, beta_grid)
 
@@ -859,14 +822,34 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
         -------
         log_likelihoods : list of float
         """
-        choices_arr = self._bind_covariates(
-            choices, covariates, obs_covariates, "fit_sgd"
-        )
-        return self._fit_sgd_validated(
-            choices_arr, optimizer, num_steps, verbose, convergence_tol
+        return super().fit_sgd(
+            choices,
+            covariates=covariates,
+            obs_covariates=obs_covariates,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
         )
 
     # --- SGDFittableMixin protocol ---
+
+    def _prepare_sgd_data(
+        self,
+        choices: ArrayLike,
+        covariates: ArrayLike | None = None,
+        obs_covariates: ArrayLike | None = None,
+    ) -> tuple[tuple[Array, ...], dict[str, Any]]:
+        """Validate and bind the ``fit_sgd`` inputs (see ``_bind_covariates``).
+
+        Runs after ``fit_sgd`` validates its optimizer settings. The loss reads
+        the bound covariates from the model, so only the int32 choices are
+        forwarded to it.
+        """
+        choices_arr = self._bind_covariates(
+            choices, covariates, obs_covariates, "fit_sgd"
+        )
+        return (choices_arr,), {}
 
     def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         params, spec = super()._build_param_spec()
@@ -882,23 +865,18 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
         return params, spec
 
     def _sgd_loss_fn(self, params: SGDParams, choices: Array) -> Array:
-        # Model attributes are read only for parameters that are not being
-        # optimized (see _MultinomialChoiceBase._sgd_loss_fn).
-        def _param(key: str, attr: str) -> Array:
-            return params[key] if key in params else jnp.asarray(getattr(self, attr))
-
         k_free = self.n_options - 1
 
         if self._covariates is not None:
             cov_arr = self._covariates
-            ig_arr = _param("input_gain", "input_gain_")
+            ig_arr = self._sgd_param(params, "input_gain", "input_gain_")
         else:
             cov_arr = jnp.zeros((self._n_trials, 1))
             ig_arr = jnp.zeros((k_free, 1))
 
         if self._obs_covariates is not None:
             obs_cov_arr = self._obs_covariates
-            ow_arr = _param("obs_weights", "obs_weights_")
+            ow_arr = self._sgd_param(params, "obs_weights", "obs_weights_")
         else:
             obs_cov_arr = jnp.zeros((self._n_trials, 1))
             ow_arr = jnp.zeros((self.n_options, 1))
@@ -910,9 +888,9 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
             ig_arr,
             obs_cov_arr,
             ow_arr,
-            _param("process_noise", "process_noise"),
-            _param("inverse_temperature", "inverse_temperature"),
-            _param("decay", "decay"),
+            self._sgd_param(params, "process_noise"),
+            self._sgd_param(params, "inverse_temperature"),
+            self._sgd_param(params, "decay"),
             jnp.zeros(k_free),
             jnp.eye(k_free),
         )

@@ -40,11 +40,14 @@ from state_space_practice.point_process_kalman import (
 )
 from state_space_practice.utils import (
     _root_figure,
+    as_2d_count_matrix,
     psd_solve,
+    safe_log,
     symmetrize,
     typed_jit,
     validate_count_array,
     validate_covariance,
+    validate_finite_array,
     validate_scalar,
 )
 
@@ -319,15 +322,13 @@ class PlaceFieldRateMaps:
                 "bilinear interpolation"
             )
 
-        # Precompute log rate maps (clamp rates below 1e-10 to avoid log(0))
-        self._log_rate_maps = np.log(np.maximum(self.rate_maps, 1e-10))
-
         # Grid spacing
         self._dx = float(x_diffs[0])
         self._dy = float(y_diffs[0])
 
-        # JAX arrays for JIT-compatible interpolation
-        self._jax_log_rate_maps = jnp.array(self._log_rate_maps)
+        # JAX arrays for JIT-compatible interpolation. Log rate maps clamp
+        # rates below 1e-10 to avoid log(0).
+        self._jax_log_rate_maps = jnp.array(np.log(np.maximum(self.rate_maps, 1e-10)))
         self._jax_x_edges = jnp.array(self.x_edges)
         self._jax_y_edges = jnp.array(self.y_edges)
 
@@ -336,8 +337,7 @@ class PlaceFieldRateMaps:
         # sums over the gridded histograms rather than interpolating
         # the pre-smoothed rate map.  This preserves the full spatial
         # gradient information of the Gaussian kernel.
-        self._kde_sigma = kde_sigma
-        self._occupancy_tau = float(occupancy_tau)
+        occupancy_tau = float(occupancy_tau)
         if (
             spike_histograms is not None
             and occ_histogram is not None
@@ -347,23 +347,22 @@ class PlaceFieldRateMaps:
             # occ_histogram: (n_grid_y, n_grid_x) — occupancy time per bin
             # Grid center coordinates as 2D meshgrid
             xx, yy = np.meshgrid(self.x_edges, self.y_edges)  # (ny, nx)
-            self._jax_grid_xy = jnp.stack(
-                [xx.ravel(), yy.ravel()], axis=1
-            )  # (ny*nx, 2)
-            self._jax_spike_hists = jnp.array(
-                spike_histograms.reshape(self.n_neurons, -1)  # (n_neurons, ny*nx)
-            )
-            self._jax_occ_hist = jnp.array(occ_histogram.ravel())  # (ny*nx,)
-            self._jax_kde_sigma2 = jnp.array(kde_sigma**2)
             # Baseline rates for the kernel-weighted Bayesian shrinkage
             # (see _kde_log_rate). If not supplied, default to zero
             # baseline with zero tau, which recovers the unshrunk
             # Nadaraya-Watson estimator.
             if baseline_rates is None:
                 baseline_rates = np.zeros(self.n_neurons, dtype=np.float64)
-            self._jax_baseline_rates = jnp.asarray(baseline_rates, dtype=jnp.float64)
-            self._jax_occupancy_tau = jnp.asarray(
-                self._occupancy_tau, dtype=jnp.float64
+            # Positional arguments of _kde_log_rate after ``position``.
+            self._kde_args: tuple[Array, Array, Array, Array, Array, Array] = (
+                jnp.stack([xx.ravel(), yy.ravel()], axis=1),  # (ny*nx, 2)
+                jnp.array(
+                    spike_histograms.reshape(self.n_neurons, -1)
+                ),  # (n_neurons, ny*nx)
+                jnp.array(occ_histogram.ravel()),  # (ny*nx,)
+                jnp.array(kde_sigma**2),
+                jnp.asarray(baseline_rates, dtype=jnp.float64),
+                jnp.asarray(occupancy_tau, dtype=jnp.float64),
             )
             self._use_analytical = True
         else:
@@ -543,7 +542,12 @@ class PlaceFieldRateMaps:
         #   rate_shrunk = w * rate_local + (1 - w) * baseline
         #              = (spike_smooth + eff_tau * baseline)
         #              / (occ_smooth + eff_tau)
+        #
+        # The raw per-bin spike histograms are also kept as KDE sufficient
+        # statistics so the analytical rate evaluation can compute exact
+        # kernel-sum rates and gradients at arbitrary positions.
         rate_maps = np.zeros((n_neurons, n_grid, n_grid))
+        spike_histograms = np.zeros((n_neurons, n_grid, n_grid))
         for n in range(n_neurons):
             spike_map, _, _ = np.histogram2d(
                 position[:, 0],
@@ -551,6 +555,7 @@ class PlaceFieldRateMaps:
                 bins=[x_bin_edges, y_bin_edges],
                 weights=spike_counts[:, n],
             )
+            spike_histograms[n] = spike_map.T
             spike_smooth = gaussian_filter(
                 spike_map.T, sigma_bins, mode="constant", cval=0
             )
@@ -591,19 +596,6 @@ class PlaceFieldRateMaps:
             # rest of the class uses (n_y, n_x) convention (matches
             # ``rate_maps``), so transpose.
             occupancy_mask = occ.T > 0
-
-        # Store raw histograms as KDE sufficient statistics so the
-        # analytical rate evaluation can compute exact kernel-sum
-        # rates and gradients at arbitrary positions.
-        spike_histograms = np.zeros((n_neurons, n_grid, n_grid))
-        for n in range(n_neurons):
-            spike_map, _, _ = np.histogram2d(
-                position[:, 0],
-                position[:, 1],
-                bins=[x_bin_edges, y_bin_edges],
-                weights=spike_counts[:, n],
-            )
-            spike_histograms[n] = spike_map.T
 
         # Estimate q_pos (cm^2/s) from observed position increments.
         # ``var(Δpos)`` equals ``2 * q_pos * dt`` for an independent-step
@@ -654,15 +646,7 @@ class PlaceFieldRateMaps:
         """
         position = jnp.asarray(position)
         if self._use_analytical:
-            return _kde_log_rate(
-                position,
-                self._jax_grid_xy,
-                self._jax_spike_hists,
-                self._jax_occ_hist,
-                self._jax_kde_sigma2,
-                self._jax_baseline_rates,
-                self._jax_occupancy_tau,
-            )
+            return _kde_log_rate(position, *self._kde_args)
         return _bilinear_log_rate(
             position,
             self._jax_log_rate_maps,
@@ -689,15 +673,7 @@ class PlaceFieldRateMaps:
         """
         position = jnp.asarray(position)
         if self._use_analytical:
-            return _kde_log_rate_jacobian(
-                position,
-                self._jax_grid_xy,
-                self._jax_spike_hists,
-                self._jax_occ_hist,
-                self._jax_kde_sigma2,
-                self._jax_baseline_rates,
-                self._jax_occupancy_tau,
-            )
+            return _kde_log_rate_jacobian(position, *self._kde_args)
         return _bilinear_log_rate_jacobian(
             position,
             self._jax_log_rate_maps,
@@ -783,7 +759,7 @@ def _kde_log_rate(
     numerator = spike_kernels + occupancy_tau * baseline_rates
     denominator = occ_kernel + occupancy_tau + 1e-30
     rates = numerator / denominator
-    return jnp.log(jnp.maximum(rates, 1e-10))
+    return safe_log(rates)
 
 
 def _kde_log_rate_jacobian(
@@ -1297,15 +1273,7 @@ def _position_decoder_filter_with_predictions(
     inflation (see :func:`_run_filter_scan`). :func:`position_decoder_smoother`
     needs them for a smoother consistent with the filter.
     """
-    spikes_arr = jnp.asarray(spikes)
-    if spikes_arr.ndim == 1:
-        spikes_arr = spikes_arr[:, None]
-    if spikes_arr.ndim != 2:
-        raise ValueError(
-            f"spikes must be 1D (n_time,) or 2D (n_time, n_neurons), "
-            f"got shape {spikes_arr.shape}"
-        )
-    validate_count_array(spikes_arr, "spikes", allow_empty=False)
+    spikes_arr = as_2d_count_matrix(spikes, "spikes")
 
     if spikes_arr.shape[1] != rate_maps.n_neurons:
         raise ValueError(
@@ -1344,8 +1312,7 @@ def _position_decoder_filter_with_predictions(
             raise ValueError(
                 f"init_position must be a 1D vector, got shape {init_position.shape}"
             )
-        if not bool(jnp.all(jnp.isfinite(init_position))):
-            raise ValueError("init_position must contain only finite values.")
+        validate_finite_array("init_position", init_position)
         if include_velocity:
             if init_position.shape[0] == 2:
                 init_position = jnp.concatenate(
@@ -1413,14 +1380,7 @@ def _position_decoder_filter_with_predictions(
     # available; fall back to bilinear grid interpolation otherwise.
     use_kde = rate_maps._use_analytical
     if use_kde:
-        kde_args = (
-            rate_maps._jax_grid_xy,
-            rate_maps._jax_spike_hists,
-            rate_maps._jax_occ_hist,
-            rate_maps._jax_kde_sigma2,
-            rate_maps._jax_baseline_rates,
-            rate_maps._jax_occupancy_tau,
-        )
+        kde_args = rate_maps._kde_args
     else:
         # Pass zero-shaped sentinels; static `use_kde=False` skips this
         # branch in the impl. Keeping the arg position stable lets JIT
@@ -1823,15 +1783,7 @@ class PositionDecoder:
                 "decoder.fit_from_model(model) first."
             )
 
-        spikes_arr = jnp.asarray(spikes)
-        if spikes_arr.ndim == 1:
-            spikes_arr = spikes_arr[:, None]
-        if spikes_arr.ndim != 2:
-            raise ValueError(
-                f"spikes must be 1D (n_time,) or 2D (n_time, n_neurons), "
-                f"got shape {spikes_arr.shape}"
-            )
-        validate_count_array(spikes_arr, "spikes", allow_empty=False)
+        spikes_arr = as_2d_count_matrix(spikes, "spikes")
 
         if spikes_arr.shape[1] != self.rate_maps.n_neurons:
             raise ValueError(

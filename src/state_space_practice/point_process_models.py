@@ -23,7 +23,6 @@ References
 
 from __future__ import annotations
 
-import copy
 import functools
 import logging
 from typing import TYPE_CHECKING, Any
@@ -33,23 +32,29 @@ import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.em_driver import run_em
-from state_space_practice.exceptions import NotFittedError
-from state_space_practice.fitted_state import FittedAttribute, is_set
+from state_space_practice.em_driver import (
+    AttributeSnapshot,
+    restore_attributes,
+    run_em,
+    snapshot_attributes,
+)
+from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
+from state_space_practice.fitted_state import is_set
 from state_space_practice.oscillator_utils import (
     DirectedInfluenceDynamicsMixin,
     canonicalize_correlated_noise_pair_parameters,
     constrain_correlated_noise_process_covariance,
     construct_common_oscillator_process_covariance,
-    construct_common_oscillator_transition_matrix,
+    construct_common_oscillator_transition_matrix_stack,
     construct_correlated_noise_process_covariance,
+    construct_correlated_noise_process_covariance_stack,
     construct_stable_directed_influence_transition_stack,
-    extract_correlated_noise_params_from_covariance,
+    extract_correlated_noise_params_from_covariance_stack,
     optimize_dim_transition_params_joint_until_stationary,
     project_correlated_noise_process_covariance,
 )
-from state_space_practice.parameter_transforms import POSITIVE, UNCONSTRAINED
-from state_space_practice.sgd_fitting import SGDParams, SGDParamSpec
+from state_space_practice.parameter_transforms import POSITIVE, UNCONSTRAINED, frozen
+from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.switching_kalman import (
     compute_process_covariance_sufficient_stats,
     compute_transition_sufficient_stats,
@@ -66,7 +71,6 @@ from state_space_practice.utils import (
     clip_eigenvalues,
     shift_to_psd,
     symmetrize,
-    validate_count_array,
     validate_finite_array,
     validate_nonnegative_array,
     validate_unit_interval_array,
@@ -209,11 +213,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         "phase_difference",
         "coupling_strength",
         "_current_osc_params",
-        "_transition_suff_stats",
     )
-
-    #: Marginal log-likelihood of the final EM iterate; set by ``fit``.
-    log_likelihood_: FittedAttribute[float] = FittedAttribute()
 
     def __init__(
         self,
@@ -500,7 +500,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
     # EM state snapshots
     # ------------------------------------------------------------------
 
-    def _snapshot_em_state(self) -> dict[str, object]:
+    def _snapshot_em_state(self) -> AttributeSnapshot:
         """Snapshot parameters and posteriors for EM rollback.
 
         Restoring a reference snapshot is unaffected by later reassignment
@@ -509,26 +509,13 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         deep-copied, so an in-place edit of the live dict cannot leak into the
         snapshot.
         """
-        deepcopy_attrs = {"_current_osc_params"}
-        snapshot: dict[str, object] = {}
-        for attr in self._EM_SNAPSHOT_KEYS:
-            if not hasattr(self, attr):
-                continue
-            value = getattr(self, attr)
-            snapshot[attr] = copy.deepcopy(value) if attr in deepcopy_attrs else value
-        return snapshot
+        return snapshot_attributes(
+            self, self._EM_SNAPSHOT_KEYS, deepcopy_keys=("_current_osc_params",)
+        )
 
-    def _restore_em_state(self, state: dict[str, object]) -> None:
-        """Restore a snapshot produced by ``_snapshot_em_state``.
-
-        A key absent from the snapshot was unset when it was taken (e.g. the
-        smoother outputs before the first E-step), so it is unset again.
-        """
-        for attr in self._EM_SNAPSHOT_KEYS:
-            if attr in state:
-                setattr(self, attr, state[attr])
-            elif is_set(self, attr):
-                delattr(self, attr)
+    def _restore_em_state(self, state: AttributeSnapshot) -> None:
+        """Restore a snapshot produced by ``_snapshot_em_state``."""
+        restore_attributes(self, state)
 
     # ------------------------------------------------------------------
     # EM loop
@@ -565,20 +552,17 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         -------
         log_likelihoods : list[float]
             Marginal log-likelihood at each iteration (from the best restart).
-        """
-        spikes = jnp.asarray(spikes)
 
-        if spikes.ndim != 2:
-            raise ValueError(
-                f"spikes must be 2D with shape (n_time, n_neurons), "
-                f"got {spikes.ndim}D with shape {spikes.shape}"
-            )
-        if spikes.shape[1] != self.n_neurons:
-            raise ValueError(
-                f"spikes shape[1] must match n_neurons={self.n_neurons}, "
-                f"got shape {spikes.shape}"
-            )
-        validate_count_array(spikes, "spikes")
+        Raises
+        ------
+        ValueError
+            If ``spikes`` is not ``(n_time, n_neurons)`` count data.
+        NonFiniteLikelihoodError
+            If the first E-step's log-likelihood is non-finite (with
+            ``n_restarts > 1``: in every restart); the fit outputs are
+            cleared first.
+        """
+        spikes = self._validate_spikes(spikes)
 
         if key is None:
             key = jax.random.PRNGKey(0)
@@ -646,16 +630,17 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
             max_iter=max_iter,
             tol=tol,
             on_first_nonfinite="raise",
+            clear_state=self._clear_fit_state,
             stop_on_decrease=False,
             track_best=True,
             logger=logger,
         )
-        self.converged_ = result.converged
-        log_likelihoods = result.log_likelihoods
-        if log_likelihoods:
-            self.log_likelihood_ = float(log_likelihoods[-1])
-
-        return log_likelihoods
+        self._record_fit_result(
+            result.log_likelihoods,
+            result.converged,
+            n_iter=len(result.log_likelihoods),
+        )
+        return result.log_likelihoods
 
     def _fit_multi_restart(
         self,
@@ -673,33 +658,34 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         """
         best_lls: list[float] | None = None
         best_final_ll = -float("inf")
-        best_state: dict[str, object] | None = None
+        best_state: AttributeSnapshot | None = None
+        best_converged = False
 
         keys = jax.random.split(key, n_restarts)
 
         for restart in range(n_restarts):
             try:
                 lls = self._fit_single(spikes, max_iter, tol, keys[restart])
-                final_ll = float(
-                    getattr(self, "log_likelihood_", lls[-1] if lls else -float("inf"))
-                )
+                final_ll = lls[-1] if lls else -float("inf")
 
                 if final_ll > best_final_ll:
                     best_final_ll = final_ll
                     best_lls = lls
+                    best_converged = self.converged_
                     best_state = self._snapshot_em_state()
 
                 logger.info(
                     f"Restart {restart + 1}/{n_restarts}: final LL={final_ll:.4f}"
                 )
-            except ValueError:
+            except NonFiniteLikelihoodError:
                 logger.warning(
                     f"Restart {restart + 1}/{n_restarts}: failed (non-finite LL)"
                 )
                 continue
 
         if best_state is None or best_lls is None:
-            raise ValueError(
+            # Each failed restart already cleared its fit outputs.
+            raise NonFiniteLikelihoodError(
                 f"All {n_restarts} restarts failed with non-finite log-likelihood."
             )
 
@@ -707,7 +693,12 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         self._restore_em_state(best_state)
 
         # Re-run E-step to populate all smoother outputs for the best params
-        self.log_likelihood_ = float(self._e_step(spikes))
+        self._record_fit_result(
+            best_lls,
+            best_converged,
+            n_iter=len(best_lls),
+            log_likelihood=float(self._e_step(spikes)),
+        )
 
         return best_lls
 
@@ -789,13 +780,13 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
 
     def _initialize_continuous_transition_matrix(self) -> None:
         """A is constant across states: uncoupled oscillators."""
-        transition_matrix = construct_common_oscillator_transition_matrix(
-            freqs=self.freqs,
-            damping_coef=self.damping_coef,
-            sampling_freq=self.sampling_freq,
-        )
-        self.continuous_transition_matrix = jnp.stack(
-            [transition_matrix] * self.n_discrete_states, axis=2
+        self.continuous_transition_matrix = (
+            construct_common_oscillator_transition_matrix_stack(
+                self.freqs,
+                self.damping_coef,
+                self.sampling_freq,
+                self.n_discrete_states,
+            )
         )
 
     def _initialize_process_covariance(self) -> None:
@@ -987,27 +978,19 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
 
     def _initialize_continuous_transition_matrix(self) -> None:
         """A is constant across states: uncoupled oscillators."""
-        transition_matrix = construct_common_oscillator_transition_matrix(
-            freqs=self.freqs,
-            damping_coef=self.damping_coef,
-            sampling_freq=self.sampling_freq,
-        )
-        self.continuous_transition_matrix = jnp.stack(
-            [transition_matrix] * self.n_discrete_states, axis=2
+        self.continuous_transition_matrix = (
+            construct_common_oscillator_transition_matrix_stack(
+                self.freqs,
+                self.damping_coef,
+                self.sampling_freq,
+                self.n_discrete_states,
+            )
         )
 
     def _initialize_process_covariance(self) -> None:
         """Q varies across states: correlated noise structure."""
-        self.process_cov = jnp.stack(
-            [
-                construct_correlated_noise_process_covariance(
-                    variance=self.process_variance[:, state_ind],
-                    phase_difference=self.phase_difference[:, :, state_ind],
-                    coupling_strength=self.coupling_strength[:, :, state_ind],
-                )
-                for state_ind in range(self.n_discrete_states)
-            ],
-            axis=2,
+        self.process_cov = construct_correlated_noise_process_covariance_stack(
+            self.process_variance, self.phase_difference, self.coupling_strength
         )
 
     def _project_parameters(self) -> None:
@@ -1049,16 +1032,8 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
             ),
         )
 
-        previous = jnp.stack(
-            [
-                construct_correlated_noise_process_covariance(
-                    variance=self.process_variance[..., j],
-                    phase_difference=self.phase_difference[..., j],
-                    coupling_strength=self.coupling_strength[..., j],
-                )
-                for j in range(self.n_discrete_states)
-            ],
-            axis=-1,
+        previous = construct_correlated_noise_process_covariance_stack(
+            self.process_variance, self.phase_difference, self.coupling_strength
         )
         # A state with fewer than n_cont_states + 1 expected transitions has an
         # unidentified residual covariance: keep its previous Q (and warn).
@@ -1095,19 +1070,12 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
 
     def _sync_process_covariance_params(self) -> None:
         """Synchronize public CNM parameters from the structured Q stack."""
-        params = [
-            extract_correlated_noise_params_from_covariance(
-                self.process_cov[..., j], self.n_oscillators
-            )
-            for j in range(self.n_discrete_states)
-        ]
-        self.process_variance = jnp.stack([p["variance"] for p in params], axis=-1)
-        self.phase_difference = jnp.stack(
-            [p["phase_difference"] for p in params], axis=-1
+        params = extract_correlated_noise_params_from_covariance_stack(
+            self.process_cov, self.n_oscillators
         )
-        self.coupling_strength = jnp.stack(
-            [p["coupling_strength"] for p in params], axis=-1
-        )
+        self.process_variance = params["variance"]
+        self.phase_difference = params["phase_difference"]
+        self.coupling_strength = params["coupling_strength"]
 
     # --- SGDFittableMixin: CNM-PP specific ---
 
@@ -1126,9 +1094,9 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
 
     def _sgd_loss_fn(self, params: SGDParams, spikes: jax.Array) -> jax.Array:
         # Reconstruct per-state Q from scientific params
-        proc_var = params.get("process_variance", self.process_variance)
-        phase_diff = params.get("phase_difference", self.phase_difference)
-        coupling = params.get("coupling_strength", self.coupling_strength)
+        proc_var = self._sgd_param(params, "process_variance")
+        phase_diff = self._sgd_param(params, "phase_difference")
+        coupling = self._sgd_param(params, "coupling_strength")
 
         # Vectorize Q construction over discrete states (last axis)
         Q = jax.vmap(
@@ -1456,6 +1424,15 @@ class DirectedInfluencePointProcessModel(
             params["coupling_strength"] = self.coupling_strength
             spec["coupling_strength"] = UNCONSTRAINED
 
+        # Not trained, but read by the loss, and re-derived from the transition
+        # matrix by EM: as frozen params they are arguments of the compiled SGD
+        # step rather than baked-in constants, so a change to them alone does
+        # not force a recompile (kept in sync with DirectedInfluenceModel).
+        params["freqs"] = self.freqs
+        spec["freqs"] = frozen(UNCONSTRAINED)
+        params["damping_coef"] = self.damping_coef
+        spec["damping_coef"] = frozen(UNCONSTRAINED)
+
         return params, spec
 
     def fit_sgd(
@@ -1468,12 +1445,12 @@ class DirectedInfluencePointProcessModel(
         convergence_tol: float | None = None,
         connectivity_penalty: OscillatorPenaltyConfig | None = None,
     ) -> list[float]:
-        """Fit by minimizing negative marginal LL via gradient descent.
+        """Fit by gradient descent on the marginal LL (minus any penalty).
 
         SGD optimizes ``coupling_strength`` and ``phase_difference``
         (and optionally spike params, discrete transition, init params).
-        Frequencies (``freqs``) and damping (``damping_coef``) are frozen
-        during SGD and used as constants.
+        Frequencies (``freqs``) and damping (``damping_coef``) are held fixed
+        (not trained).
 
         Parameters
         ----------
@@ -1490,20 +1467,50 @@ class DirectedInfluencePointProcessModel(
         Returns
         -------
         log_likelihoods : list of float
+            Per-step training objective: the log-likelihood minus the
+            connectivity penalty when one is given (see
+            ``SGDFittableMixin.fit_sgd``). ``log_likelihood_`` is the marginal
+            log-likelihood at the fitted parameters, without the penalty.
+
+        Raises
+        ------
+        ValueError
+            Invalid settings or data (see ``SGDFittableMixin.fit_sgd``).
+        NonFiniteLikelihoodError
+            If the log-likelihood at the fitted parameters is non-finite.
         """
-        self._connectivity_penalty = connectivity_penalty
-        return super().fit_sgd(
+        # The mixin's fit_sgd, not SwitchingPointProcessBase's: that typed
+        # wrapper does not forward ``connectivity_penalty`` to
+        # ``_prepare_sgd_data``.
+        return SGDFittableMixin.fit_sgd(
+            self,
             spikes,
             key=key,
+            connectivity_penalty=connectivity_penalty,
             optimizer=optimizer,
             num_steps=num_steps,
             verbose=verbose,
             convergence_tol=convergence_tol,
         )
 
+    def _prepare_sgd_data(
+        self,
+        spikes: ArrayLike,
+        key: Array | None = None,
+        connectivity_penalty: OscillatorPenaltyConfig | None = None,
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Prepare as the base model does, then record the connectivity penalty.
+
+        The penalty is stored only once the base preparation has accepted the
+        call, so a rejected call leaves it unchanged too.
+        """
+        prepared = super()._prepare_sgd_data(spikes, key=key)
+        self._connectivity_penalty = connectivity_penalty
+        return prepared
+
     def _sgd_loss_fn(self, params: SGDParams, spikes: jax.Array) -> jax.Array:
-        phase_diff = params.get("phase_difference", self.phase_difference)
-        coupling = params.get("coupling_strength", self.coupling_strength)
+        phase_diff = self._sgd_param(params, "phase_difference")
+        coupling = self._sgd_param(params, "coupling_strength")
 
         # Apply the shared differentiable stability scale so SGD optimizes only
         # over transition matrices that honor max_spectral_radius, matching the
@@ -1512,8 +1519,9 @@ class DirectedInfluencePointProcessModel(
         # coupling and the fixed damping.
         params_with_A = dict(params)
         params_with_A["_A"] = construct_stable_directed_influence_transition_stack(
-            self.freqs,
-            self.damping_coef,
+            # Frozen (non-trained) entries of the SGD param spec.
+            self._sgd_param(params, "freqs"),
+            self._sgd_param(params, "damping_coef"),
             coupling,
             phase_diff,
             self.sampling_freq,

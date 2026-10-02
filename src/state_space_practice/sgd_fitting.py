@@ -7,13 +7,14 @@ finalization.
 Models must implement:
 - _build_param_spec() -> tuple[dict, dict]
 - _sgd_loss_fn(params, *args, **kwargs) -> Array
-- _finalize_sgd(*args, **kwargs) -> None
+- _finalize_sgd(*args, **kwargs) -> float  (final inference; returns the
+  marginal log-likelihood at the stored parameters)
 - _n_timesteps: int (property or attribute)
 
 and either declare ``_sgd_param_attrs`` (param key -> attribute name, used by
 the default ``_store_sgd_params``) or override ``_store_sgd_params``.
-Optional hooks: ``_check_sgd_initialized`` (default no-op) and
-``_prepare_sgd_data`` (default: pass the data through unchanged).
+Optional hook: ``_prepare_sgd_data`` (model-specific setup; default: pass the
+data through unchanged).
 """
 
 from __future__ import annotations
@@ -33,13 +34,15 @@ import optax
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.em_driver import clear_attributes
+from state_space_practice.exceptions import NonFiniteLikelihoodError
 from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.parameter_transforms import (
     ParameterTransform,
     transform_to_constrained,
     transform_to_unconstrained,
 )
-from state_space_practice.utils import typed_jit, validate_int
+from state_space_practice.utils import typed_jit, validate_int, validate_scalar
 
 logger = logging.getLogger(__name__)
 
@@ -384,19 +387,25 @@ class SGDFittableMixin:
     Models must implement:
     - _build_param_spec() -> tuple[dict, dict]
     - _sgd_loss_fn(params, *args, **kwargs) -> Array
-    - _finalize_sgd(*args, **kwargs) -> None
+    - _finalize_sgd(*args, **kwargs) -> float  (final inference; returns the
+      marginal log-likelihood at the stored parameters)
     - _n_timesteps: int (property or attribute)
 
     and store the optimized parameters either by declaring
     ``_sgd_param_attrs`` (consumed by the default ``_store_sgd_params``) or
     by overriding ``_store_sgd_params``.
 
-    Models whose parameters are allocated lazily (e.g. on the first ``fit``)
-    may override ``_check_sgd_initialized`` to raise before optimization
-    starts; the default is a no-op for models that allocate in ``__init__``.
-    Models that need to validate or canonicalize the data ``fit_sgd``
-    receives (or record its length for ``_n_timesteps``) override
-    ``_prepare_sgd_data`` instead of re-declaring ``fit_sgd``.
+    All model-specific setup for a fit -- validating and binding the data,
+    recording its length for ``_n_timesteps``, initializing or warm-starting
+    parameters -- belongs in ``_prepare_sgd_data``, which ``fit_sgd`` calls
+    only after validating its own settings; it must validate before it
+    mutates the model. A model may re-declare ``fit_sgd`` only as a typed
+    wrapper that forwards its arguments to this one.
+
+    Every fit (``fit_sgd`` and a model's EM ``fit``) records its results with
+    ``_record_fit_result``; a fit that cannot produce a result clears the
+    model's fit outputs (``_fit_output_attrs``) with ``_clear_fit_state``
+    before raising.
     """
 
     #: Optimized-parameter key -> model attribute name, consumed by the
@@ -405,9 +414,26 @@ class SGDFittableMixin:
     #: ``{**Parent._sgd_param_attrs, "key": "attr"}``.
     _sgd_param_attrs: ClassVar[Mapping[str, str]] = {}
 
-    # Set by fitting; reading one before then raises NotFittedError.
+    #: Attributes a fit writes besides the shared results below (posteriors,
+    #: cached inference results, uncertainty summaries). ``_clear_fit_state``
+    #: unsets them, so a failed fit cannot leave an earlier fit's (or its own
+    #: non-finite) outputs looking fitted.
+    _fit_output_attrs: ClassVar[tuple[str, ...]] = ()
+
+    # Set by fitting (see ``_record_fit_result``); reading one before then
+    # raises NotFittedError.
     converged_: FittedAttribute[bool] = FittedAttribute()
+    #: Marginal log-likelihood at the fitted parameters (never a penalized
+    #: training objective).
+    log_likelihood_: FittedAttribute[float] = FittedAttribute()
+    #: The last fit's trajectory: one log-likelihood per accepted EM E-step,
+    #: or the per-step SGD training objective (log-likelihood plus any
+    #: penalty term).
     log_likelihood_history_: FittedAttribute[list[float]] = FittedAttribute()
+    #: Length of ``log_likelihood_history_`` after an EM fit (EM's final
+    #: synchronising E-step can make it ``max_iter + 1``); ``None`` before
+    #: fitting and after ``fit_sgd``.
+    n_iter_: int | None = None
 
     def _build_param_spec(
         self,
@@ -417,24 +443,96 @@ class SGDFittableMixin:
     def _sgd_loss_fn(self, params: SGDParams, *args: Any, **kwargs: Any) -> Array:
         raise NotImplementedError
 
-    def _finalize_sgd(self, *args: Any, **kwargs: Any) -> None:
+    def _finalize_sgd(self, *args: Any, **kwargs: Any) -> float:
+        """Run inference at the stored parameters; return its marginal LL.
+
+        The returned value becomes ``log_likelihood_``. It must be the model's
+        log-likelihood, not the training objective: with a penalty (or any
+        other loss term) the two differ, and ``log_likelihood_history_``
+        already records the objective.
+        """
         raise NotImplementedError
 
-    def _check_sgd_initialized(self) -> None:
-        return
+    def _sgd_param(self, params: SGDParams, key: str, attr: str | None = None) -> Array:
+        """Value of ``key`` for ``_sgd_loss_fn``: optimized if present, else stored.
+
+        Use this instead of ``params.get(key, self.<attr>)``. The compiled-step
+        cache fingerprints every model attribute the loss reads while tracing,
+        and fitting rewrites trained attributes, so reading them unconditionally
+        makes every repeat ``fit_sgd`` miss the cache and recompile. This reads
+        the attribute only when ``key`` is not being optimized.
+
+        Parameters
+        ----------
+        params : SGDParams
+            The constrained parameters passed to the loss.
+        key : str
+            Parameter name in ``params``.
+        attr : str or None
+            Model attribute to fall back to; defaults to ``key``.
+
+        Returns
+        -------
+        Array
+        """
+        if key in params:
+            return params[key]
+        return jnp.asarray(getattr(self, key if attr is None else attr))
+
+    def _sgd_per_state_param(
+        self,
+        params: SGDParams,
+        prefix: str,
+        n_discrete_states: int,
+        attr: str | None = None,
+    ) -> Array:
+        """Per-state stack of the ``f"{prefix}_{j}"`` SGD params.
+
+        States absent from ``params`` keep their slice of the model attribute
+        ``attr`` (default ``prefix``; see :func:`reconstruct_per_state_array`).
+        Like :meth:`_sgd_param`, the attribute is read only when some state is
+        not optimized, so the compiled SGD step stays reusable after a fit
+        rewrites it.
+
+        Parameters
+        ----------
+        params : SGDParams
+            The constrained parameters passed to the loss.
+        prefix : str
+            Key prefix of the per-state entries (``f"{prefix}_{j}"``).
+        n_discrete_states : int
+            Number of discrete states (length of the trailing axis).
+        attr : str or None
+            Model attribute supplying states absent from ``params``; defaults
+            to ``prefix``.
+
+        Returns
+        -------
+        Array, shape (..., n_discrete_states)
+        """
+        keys = [f"{prefix}_{j}" for j in range(n_discrete_states)]
+        if all(k in params for k in keys):
+            return jnp.stack([params[k] for k in keys], axis=-1)
+        fallback = getattr(self, prefix if attr is None else attr)
+        return reconstruct_per_state_array(params, prefix, fallback, n_discrete_states)
 
     def _prepare_sgd_data(
         self, *args: Any, **kwargs: Any
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        """Validate / canonicalize the data passed to ``fit_sgd``.
+        """Model-specific setup for ``fit_sgd``: validate data, then prepare.
 
-        Called first thing in ``fit_sgd`` with the positional data and any
-        model-specific keyword arguments (everything except the optimizer
-        settings). The returned ``(args, kwargs)`` replace the originals and
-        are forwarded to ``_sgd_loss_fn`` and ``_finalize_sgd``, so a model
-        can coerce inputs to arrays, reject malformed data before any JAX
-        work, or record the sequence length that ``_n_timesteps`` reports,
-        without overriding ``fit_sgd`` itself. The default is the identity.
+        Called by ``fit_sgd`` after it validates ``num_steps``, the optimizer
+        and ``convergence_tol``, with the positional data and any
+        model-specific keyword arguments (everything except those settings).
+        The returned ``(args, kwargs)`` replace the originals and are
+        forwarded to ``_sgd_loss_fn`` and ``_finalize_sgd``. A model may
+        coerce and validate the data, bind it, record the length
+        ``_n_timesteps`` reports, and initialize or warm-start parameters
+        here; it must validate before mutating anything, so a call rejected
+        for its settings or its data leaves the model unchanged. (Checks
+        ``fit_sgd`` runs after this hook -- learnable parameters exist, are
+        finite, ``_n_timesteps`` is positive -- see the prepared model.)
+        The default is the identity.
         """
         return args, kwargs
 
@@ -458,15 +556,70 @@ class SGDFittableMixin:
             if key in params:
                 setattr(self, attr, params[key])
 
-    def _finalize_convergence(self, converged: bool, max_iter: int) -> None:
-        """Record the EM convergence flag and warn if the fit did not converge.
+    def _record_fit_result(
+        self,
+        log_likelihoods: list[float],
+        converged: bool,
+        *,
+        n_iter: int | None,
+        log_likelihood: float | None = None,
+    ) -> None:
+        """Record a finished fit, replacing whatever an earlier fit recorded.
 
-        Shared terminal-convergence policy for the EM fitters that subclass this
-        mixin: sets ``self.converged_`` and, on max-iter exhaustion, logs a
-        warning under the model's own module logger. The per-loop convergence
-        criterion (which differs across fitters) stays in each ``fit`` method.
+        Every ``fit`` (EM) and ``fit_sgd`` calls this, so switching fitters
+        never leaves the previous fitter's results behind.
+
+        Parameters
+        ----------
+        log_likelihoods : list[float]
+            The fit's history (``log_likelihood_history_``): per-iteration EM
+            log-likelihoods, or per-step SGD training objective (the
+            log-likelihood plus any penalty term).
+        converged : bool
+            Whether the fit met its convergence criterion (``converged_``).
+        n_iter : int or None
+            EM iterations (``n_iter_``); ``None`` for SGD.
+        log_likelihood : float or None
+            Log-likelihood at the stored parameters (``log_likelihood_``).
+            Defaults to the last history entry; with an empty history and no
+            value, ``log_likelihood_`` is unset.
         """
+        self.log_likelihood_history_ = log_likelihoods
         self.converged_ = converged
+        self.n_iter_ = n_iter
+        if log_likelihood is None and log_likelihoods:
+            log_likelihood = log_likelihoods[-1]
+        if log_likelihood is None:
+            del self.log_likelihood_
+        else:
+            self.log_likelihood_ = float(log_likelihood)
+
+    def _clear_fit_state(self) -> None:
+        """Unset every fit output (``_fit_output_attrs`` and the shared results).
+
+        Called before a fit raises because it could not produce a usable
+        result, so the model reads as unfitted instead of serving an earlier
+        fit's outputs alongside newly bound data, or non-finite ones.
+        """
+        clear_attributes(
+            self,
+            (
+                "converged_",
+                "log_likelihood_",
+                "log_likelihood_history_",
+                *self._fit_output_attrs,
+            ),
+        )
+        self.n_iter_ = None
+
+    def _finalize_convergence(self, converged: bool, max_iter: int) -> None:
+        """Warn if a hand-rolled EM loop ran out of iterations.
+
+        Shared terminal-convergence policy for the EM fitters that run their own
+        loop (``run_em`` reports this itself): logs a warning under the model's
+        own module logger. The per-loop convergence criterion (which differs
+        across fitters) stays in each ``fit`` method.
+        """
         if not converged and max_iter > 1:
             logging.getLogger(type(self).__module__).warning(
                 "%s.fit did not converge in %d EM iterations; the returned "
@@ -546,7 +699,12 @@ class SGDFittableMixin:
     # arguments with their own signature without an [override] violation.
     # The optimizer settings are keyword-only, exactly as before.
     def fit_sgd(self, *args: Any, **kwargs: Any) -> list[float]:
-        """Fit by minimizing negative marginal LL via gradient descent.
+        """Fit by gradient descent on the model's SGD loss.
+
+        The loss is the negative marginal log-likelihood plus any penalty term
+        the model adds (e.g. a connectivity penalty). Settings are validated
+        before ``_prepare_sgd_data`` binds data or initializes the model, so a
+        call rejected for its settings leaves the model unchanged.
 
         Parameters
         ----------
@@ -563,17 +721,31 @@ class SGDFittableMixin:
             ``state_space_practice.sgd_fitting`` logger (enable with e.g.
             ``logging.basicConfig(level=logging.INFO)``).
         convergence_tol : float or None
-            If set, stop early when the direction-agnostic relative change
-            ``|ΔLL| / avg(|LL|) < tol`` for 5 consecutive steps.
-            This is a dimensionless fraction (e.g., ``1e-4`` means 0.01%
-            relative change), consistent with the EM convergence check.
+            If set (finite, >= 0), stop early when the direction-agnostic
+            relative change ``|ΔLL| / avg(|LL|) < tol`` for 5 consecutive
+            steps. This is a dimensionless fraction (e.g., ``1e-4`` means
+            0.01% relative change), consistent with the EM convergence check.
 
         Returns
         -------
         log_likelihoods : list of float
-            One entry per evaluated optimization step that produced a finite
-            loss. When the final candidate is finite, the final entry is
-            rewritten to the log likelihood of the stored final parameters.
+            The training objective (log-likelihood plus any penalty), one
+            entry per evaluated step that produced a finite loss; when the
+            final candidate is finite, the last entry is re-evaluated at the
+            stored parameters. Also stored as ``log_likelihood_history_``.
+            ``log_likelihood_`` is instead the marginal log-likelihood from
+            the final inference (``_finalize_sgd``); ``n_iter_`` is ``None``.
+
+        Raises
+        ------
+        ValueError
+            If ``num_steps``, the optimizer or ``convergence_tol`` is invalid
+            (before the model is touched); if the model has no learnable
+            parameters, non-finite initial parameters or a non-positive
+            ``_n_timesteps``.
+        NonFiniteLikelihoodError
+            If the log-likelihood at the stored parameters is non-finite (e.g.
+            unusable starting parameters); the fit outputs are cleared first.
         """
         optimizer: optax.GradientTransformation | None = kwargs.pop("optimizer", None)
         num_steps: int = kwargs.pop("num_steps", 200)
@@ -583,9 +755,19 @@ class SGDFittableMixin:
         # Validate the plain settings before the hook: ``_prepare_sgd_data`` may
         # mutate the model (e.g. record the sequence length).
         num_steps = validate_int(num_steps, "num_steps", nonnegative=True)
+        if convergence_tol is not None:
+            convergence_tol = validate_scalar(
+                convergence_tol, "convergence_tol", nonnegative=True
+            )
+        if optimizer is None:
+            optimizer = _DEFAULT_OPTIMIZER
+        if not hasattr(optimizer, "init") or not hasattr(optimizer, "update"):
+            raise ValueError(
+                "optimizer must be an optax GradientTransformation with "
+                "init and update methods."
+            )
         args, kwargs = self._prepare_sgd_data(*args, **kwargs)
 
-        self._check_sgd_initialized()
         params, param_spec = self._build_param_spec()
 
         if not param_spec or not any(spec.trainable for spec in param_spec.values()):
@@ -612,13 +794,6 @@ class SGDFittableMixin:
                 "Check the model's initial parameter values."
             )
 
-        if optimizer is None:
-            optimizer = _DEFAULT_OPTIMIZER
-        if not hasattr(optimizer, "init") or not hasattr(optimizer, "update"):
-            raise ValueError(
-                "optimizer must be an optax GradientTransformation with "
-                "init and update methods."
-            )
         opt_state = optimizer.init(unc_params)
 
         def _loss_inner(unc_p: SGDParams) -> Array:
@@ -760,8 +935,19 @@ class SGDFittableMixin:
             static_params=frozen_params,
         )
         self._store_sgd_params(final_params)
-        self.log_likelihood_history_ = log_likelihoods
-        self.converged_ = converged
-        self._finalize_sgd(*args, **kwargs)
+        final_log_likelihood = float(self._finalize_sgd(*args, **kwargs))
+        if not math.isfinite(final_log_likelihood):
+            self._clear_fit_state()
+            raise NonFiniteLikelihoodError(
+                f"Log-likelihood at the fitted parameters is non-finite "
+                f"({final_log_likelihood}); the starting parameters are likely "
+                "unusable."
+            )
+        self._record_fit_result(
+            log_likelihoods,
+            converged,
+            n_iter=None,
+            log_likelihood=final_log_likelihood,
+        )
 
         return log_likelihoods

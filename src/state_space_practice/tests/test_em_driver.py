@@ -5,7 +5,14 @@ import logging
 import numpy as np
 import pytest
 
-from state_space_practice.em_driver import run_em
+from state_space_practice.em_driver import (
+    clear_attributes,
+    restore_attributes,
+    run_em,
+    snapshot_attributes,
+)
+from state_space_practice.exceptions import NonFiniteLikelihoodError
+from state_space_practice.fitted_state import FittedAttribute, is_set
 
 
 class ScriptedModel:
@@ -181,8 +188,21 @@ def test_first_nonfinite_policies(policy):
 
 def test_first_nonfinite_raise_policy():
     model = ScriptedModel([np.inf])
-    with pytest.raises(ValueError, match="Non-finite"):
+    # A ValueError subclass, so existing ``except ValueError`` callers still match.
+    with pytest.raises(NonFiniteLikelihoodError, match="Non-finite"):
         model.run(max_iter=3, tol=1e-4, on_first_nonfinite="raise")
+    assert model.cleared is False  # no clear_state given: nothing cleared
+
+
+def test_first_nonfinite_raise_policy_clears_before_raising():
+    """With a clear_state hook the raise policy removes the failed E-step's
+    outputs first, so a caller that catches the error sees no stale state."""
+    model = ScriptedModel([np.inf])
+    with pytest.raises(NonFiniteLikelihoodError):
+        model.run(
+            max_iter=3, tol=1e-4, on_first_nonfinite="raise", clear_state=model.clear
+        )
+    assert model.cleared is True
 
 
 @pytest.mark.parametrize(
@@ -190,7 +210,6 @@ def test_first_nonfinite_raise_policy():
     [
         ({"on_first_nonfinite": "clear"}, "clear_state"),
         ({"on_first_nonfinite": "break", "clear_state": lambda: None}, "clear_state"),
-        ({"on_first_nonfinite": "raise", "clear_state": lambda: None}, "clear_state"),
         ({"on_first_nonfinite": "ignore"}, "on_first_nonfinite"),
         ({"max_iter": 0}, "max_iter"),
     ],
@@ -318,3 +337,80 @@ def test_iteration_and_warning_hooks_receive_messages():
     assert [s[:2] for s in seen] == [(0, -100.0), (1, -50.0), (2, -80.0)]
     assert np.isnan(seen[0][2]) and seen[1][2] == 50.0
     assert len(warnings) == 1 and "rolling back" in warnings[0]
+
+
+class AttributeModel:
+    """A model holding a plain parameter, a mutable cache and a fitted posterior."""
+
+    posterior: FittedAttribute[float] = FittedAttribute()
+
+    def __init__(self):
+        self.param = 1.0
+        self.cache = {"warm": [1.0]}
+
+
+ATTRIBUTE_KEYS = ("param", "cache", "posterior")
+
+
+def test_attribute_snapshot_restore_round_trip_unsets_unset_keys():
+    model = AttributeModel()
+    state = snapshot_attributes(model, ATTRIBUTE_KEYS)
+    assert "posterior" not in state.values  # unset when captured
+
+    model.param = 2.0
+    model.posterior = -3.0
+    restore_attributes(model, state)
+
+    assert model.param == 1.0
+    assert not is_set(model, "posterior")
+
+
+def test_attribute_snapshot_deepcopies_only_listed_keys():
+    model = AttributeModel()
+    referenced = snapshot_attributes(model, ATTRIBUTE_KEYS)
+    copied = snapshot_attributes(model, ATTRIBUTE_KEYS, deepcopy_keys=("cache",))
+
+    model.cache["warm"].append(2.0)  # in-place M-step style mutation
+
+    assert referenced.values["cache"]["warm"] == [1.0, 2.0]
+    assert copied.values["cache"]["warm"] == [1.0]
+
+
+def test_attribute_snapshot_rejects_deepcopy_key_outside_keys():
+    """A typo in deepcopy_keys would silently shallow-copy a mutable container."""
+    with pytest.raises(ValueError, match="deepcopy_keys"):
+        snapshot_attributes(AttributeModel(), ATTRIBUTE_KEYS, deepcopy_keys=("cach",))
+
+
+def test_clear_attributes_unsets_set_and_tolerates_unset():
+    model = AttributeModel()
+    model.posterior = 0.5
+    clear_attributes(model, ("posterior",))
+    assert not is_set(model, "posterior")
+    clear_attributes(model, ("posterior",))  # already unset: no error
+    assert not is_set(model, "posterior")
+
+
+def test_run_em_with_attribute_hooks_rolls_back_parameters_and_posterior():
+    model = AttributeModel()
+    lls = iter([-10.0, -20.0])
+
+    def e_step():
+        model.posterior = model.param
+        return next(lls)
+
+    def m_step():
+        model.param += 1.0
+
+    result = run_em(
+        e_step,
+        m_step,
+        lambda: snapshot_attributes(model, ATTRIBUTE_KEYS),
+        lambda state: restore_attributes(model, state),
+        max_iter=5,
+        tol=1e-12,
+    )
+
+    assert result.log_likelihoods == [-10.0]
+    assert model.param == 1.0  # the decreasing step's M-step was undone
+    assert model.posterior == 1.0

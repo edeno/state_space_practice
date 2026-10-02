@@ -12,18 +12,24 @@ learning models fit through it.  The choice and belief models
 The driver never touches model attributes directly.  It talks to the model
 through four callables (``e_step``, ``m_step``, ``snapshot``, ``restore``) so
 it can be used by models that store their posteriors under different names.
+Models that keep their parameters and posteriors as attributes build those
+hooks from :func:`snapshot_attributes`, :func:`restore_attributes` and
+:func:`clear_attributes`.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import numpy as np
 
+from state_space_practice.exceptions import NonFiniteLikelihoodError
+from state_space_practice.fitted_state import is_set
 from state_space_practice.utils import check_converged
 
 _logger = logging.getLogger(__name__)
@@ -53,6 +59,101 @@ class EMResult:
     log_likelihoods: list[float] = field(default_factory=list)
     converged: bool = False
     reached_max_iter: bool = False
+
+
+@dataclass(frozen=True)
+class AttributeSnapshot:
+    """Attributes captured by :func:`snapshot_attributes`, with their names.
+
+    Attributes
+    ----------
+    keys : tuple of str
+        Every attribute name the snapshot covers, set or not.
+    values : dict[str, Any]
+        Value of each covered attribute that was set when captured.
+    """
+
+    keys: tuple[str, ...]
+    values: dict[str, Any]
+
+
+def snapshot_attributes(
+    obj: object, keys: Iterable[str], deepcopy_keys: Collection[str] = ()
+) -> AttributeSnapshot:
+    """Capture ``obj``'s attributes ``keys`` as a ``run_em`` snapshot.
+
+    Unset attributes (e.g. posteriors before the first E-step) are left out of
+    ``values``, so :func:`restore_attributes` unsets them again.  Values are
+    referenced, which is enough for immutable JAX arrays; a container that the
+    M-step mutates in place must be listed in ``deepcopy_keys``.
+
+    Parameters
+    ----------
+    obj : object
+        The model.
+    keys : iterable of str
+        Attribute names to capture.
+    deepcopy_keys : collection of str
+        Names among ``keys`` whose values are deep-copied.
+
+    Returns
+    -------
+    AttributeSnapshot
+
+    Raises
+    ------
+    ValueError
+        If ``deepcopy_keys`` names an attribute not in ``keys`` (a typo there
+        would silently restore a mutated container).
+    """
+    keys = tuple(keys)
+    unknown = set(deepcopy_keys) - set(keys)
+    if unknown:
+        raise ValueError(f"deepcopy_keys not in keys: {sorted(unknown)}.")
+    values: dict[str, Any] = {}
+    for key in keys:
+        if hasattr(obj, key):
+            value = getattr(obj, key)
+            values[key] = copy.deepcopy(value) if key in deepcopy_keys else value
+    return AttributeSnapshot(keys, values)
+
+
+def restore_attributes(obj: object, snapshot: AttributeSnapshot) -> None:
+    """Restore a :func:`snapshot_attributes` snapshot onto ``obj``.
+
+    Each covered attribute gets its captured value; one that was unset when
+    captured is unset again.
+
+    Parameters
+    ----------
+    obj : object
+        The model.
+    snapshot : AttributeSnapshot
+        A snapshot of ``obj`` (or an object with the same attributes).
+    """
+    for key in snapshot.keys:
+        if key in snapshot.values:
+            setattr(obj, key, snapshot.values[key])
+        elif is_set(obj, key):
+            delattr(obj, key)
+
+
+def clear_attributes(obj: object, keys: Iterable[str]) -> None:
+    """Unset ``obj``'s attributes ``keys`` (the ``run_em`` ``clear_state`` hook).
+
+    Used to drop the non-finite posteriors a failed first E-step installed, so
+    the model reads as unfitted instead of serving NaN output.
+
+    Parameters
+    ----------
+    obj : object
+        The model.
+    keys : iterable of str
+        Attribute names to unset; already-unset ones are skipped.
+    """
+    for key in keys:
+        if is_set(obj, key):
+            delattr(obj, key)
 
 
 def run_em(
@@ -92,8 +193,9 @@ def run_em(
       together (with ``refresh_after_restore`` the posteriors are recomputed,
       and a non-finite recomputation is warned about).
     - If the *first* E-step is non-finite there is nothing to roll back to:
-      ``"break"`` and ``"raise"`` leave that E-step's non-finite posteriors
-      installed; ``"clear"`` calls ``clear_state`` to remove them.
+      ``"break"`` leaves that E-step's non-finite posteriors installed;
+      ``"clear"`` calls ``clear_state`` to remove them; ``"raise"`` calls
+      ``clear_state`` when given, then raises.
     - With ``stop_on_decrease=False`` a decreasing E-step is kept, so the
       model holds the latest iterate, not the best one, unless
       ``track_best`` restores the best accepted state at the end.
@@ -120,12 +222,14 @@ def run_em(
         instead of divergence.
     on_first_nonfinite : {"break", "raise", "clear"}
         What to do when an E-step is non-finite before any step was accepted:
-        warn and stop, raise ``ValueError``, or call ``clear_state``, warn and
-        stop.  Once a step has been accepted, a non-finite E-step always rolls
-        back to it, warns, and stops, whatever this policy.
+        warn and stop, raise ``NonFiniteLikelihoodError``, or call
+        ``clear_state``, warn and stop.  Once a step has been accepted, a
+        non-finite E-step always rolls back to it, warns, and stops, whatever
+        this policy.
     clear_state : callable or None
-        Removes the non-finite posteriors under the ``"clear"`` policy.
-        Required with ``"clear"`` and not allowed with the other policies.
+        Removes the fit outputs a failed first E-step left behind.  Required
+        with ``"clear"``, optional with ``"raise"`` (called before raising),
+        not allowed with ``"break"``.
     stop_on_decrease : bool
         Roll back and stop on a decrease (default) or warn and continue.
     require_increase_to_converge : bool
@@ -169,9 +273,11 @@ def run_em(
     ------
     ValueError
         If ``max_iter < 1``, ``on_first_nonfinite`` is not one of the three
-        policies, or ``clear_state`` is given without (or missing with) the
-        ``"clear"`` policy -- all checked before any E-step.  Also raised by
-        the ``"raise"`` policy when the first E-step is non-finite.
+        policies, ``clear_state`` is missing with ``"clear"`` or given with
+        ``"break"`` -- all checked before any E-step.
+    NonFiniteLikelihoodError
+        Under the ``"raise"`` policy, when the first E-step is non-finite (a
+        ``ValueError`` subclass).
     """
     if max_iter < 1:
         raise ValueError(f"max_iter must be at least 1, got {max_iter}.")
@@ -180,11 +286,12 @@ def run_em(
             "on_first_nonfinite must be 'break', 'raise' or 'clear', got "
             f"{on_first_nonfinite!r}."
         )
-    if (on_first_nonfinite == "clear") != (clear_state is not None):
+    if on_first_nonfinite == "clear" and clear_state is None:
+        raise ValueError("on_first_nonfinite='clear' requires clear_state.")
+    if on_first_nonfinite == "break" and clear_state is not None:
         raise ValueError(
-            "clear_state must be given exactly when on_first_nonfinite='clear' "
-            f"(got on_first_nonfinite={on_first_nonfinite!r}, clear_state="
-            f"{'None' if clear_state is None else 'a callable'})."
+            "clear_state is not used with on_first_nonfinite='break'; pass "
+            "'clear' (or 'raise') to clear a failed first E-step."
         )
 
     log = logger if logger is not None else _logger
@@ -227,13 +334,13 @@ def run_em(
         if not np.isfinite(current_ll):
             bad_ll = log_likelihoods.pop()
             if last_accepted is None:
+                if clear_state is not None:
+                    clear_state()
                 if on_first_nonfinite == "raise":
-                    raise ValueError(
+                    raise NonFiniteLikelihoodError(
                         f"Non-finite log-likelihood at iteration {iteration + 1}: "
                         f"{bad_ll}. This may indicate numerical instability."
                     )
-                if clear_state is not None:
-                    clear_state()
                 emit_warning(
                     f"Non-finite log-likelihood ({bad_ll}) at iteration "
                     f"{iteration + 1} with no usable previous state; stopping EM."

@@ -19,7 +19,11 @@ import importlib
 import warnings
 from typing import TYPE_CHECKING, Any
 
-from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
+from state_space_practice.exceptions import (
+    NonFiniteLikelihoodError,
+    NotFittedError,
+    StateSpaceWarning,
+)
 
 try:
     from state_space_practice._version import __version__
@@ -54,6 +58,7 @@ _LAZY_API: dict[str, str] = {
 
 __all__ = [
     "__version__",
+    "NonFiniteLikelihoodError",
     "NotFittedError",
     "StateSpaceWarning",
     "kalman_filter",

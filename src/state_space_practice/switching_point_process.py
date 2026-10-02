@@ -97,7 +97,11 @@ import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.em_driver import run_em
+from state_space_practice.em_driver import (
+    restore_attributes,
+    run_em,
+    snapshot_attributes,
+)
 from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.oscillator_utils import (
@@ -120,7 +124,6 @@ from state_space_practice.sgd_fitting import (
     SGDFittableMixin,
     SGDParams,
     SGDParamSpec,
-    reconstruct_per_state_array,
 )
 from state_space_practice.switching_kalman import (
     SwitchingFilterResult,
@@ -2604,6 +2607,18 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
     smoother_pair_cond_covs: FittedAttribute[Array | None] = FittedAttribute()
     smoother_next_pair_cond_means: FittedAttribute[Array | None] = FittedAttribute()
 
+    # The smoother results above, cleared when a fit fails.
+    _fit_output_attrs = (
+        "smoother_state_cond_mean",
+        "smoother_state_cond_cov",
+        "smoother_discrete_state_prob",
+        "smoother_joint_discrete_state_prob",
+        "smoother_pair_cond_cross_cov",
+        "smoother_pair_cond_means",
+        "smoother_pair_cond_covs",
+        "smoother_next_pair_cond_means",
+    )
+
     def __init__(
         self,
         n_oscillators: int,
@@ -3423,24 +3438,66 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         Returns
         -------
         log_likelihoods : list of float
+
+        Raises
+        ------
+        ValueError
+            If ``spikes`` is not a ``(n_time, n_neurons)`` count array, ``key``
+            is missing on the first call, or a setting is invalid. Nothing on
+            the model changes in that case.
         """
-        spikes = jnp.asarray(spikes)
-        validate_count_array(spikes, "spikes")
-        self._sgd_n_time = spikes.shape[0]
-
-        if not self._is_initialized():
-            if key is None:
-                raise ValueError("key required for initialization on first call")
-            self._initialize_parameters(key)
-            self._warm_initialize_states(spikes)
-
         return super().fit_sgd(
             spikes,
+            key=key,
             optimizer=optimizer,
             num_steps=num_steps,
             verbose=verbose,
             convergence_tol=convergence_tol,
         )
+
+    def _prepare_sgd_data(
+        self, spikes: ArrayLike, key: Array | None = None
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Validate, then initialize / warm-start the model for ``fit_sgd``.
+
+        Runs after ``fit_sgd`` validated its settings and validates the spikes
+        first, so a call rejected for its settings or data leaves the model
+        untouched. Parameters are initialized only
+        on the first call; later calls continue from the current parameters.
+        Only the spikes are forwarded to ``_sgd_loss_fn`` and ``_finalize_sgd``.
+        """
+        spikes = self._validate_spikes(spikes)
+        if not self._is_initialized():
+            if key is None:
+                raise ValueError("key required for initialization on first call")
+            self._initialize_parameters(key)
+            self._warm_initialize_states(spikes)
+        self._sgd_n_time = spikes.shape[0]
+        return (spikes,), {}
+
+    def _validate_spikes(self, spikes: ArrayLike) -> Array:
+        """Check ``spikes`` is a ``(n_time, n_neurons)`` count array.
+
+        Shared by ``fit`` and ``fit_sgd`` so both reject bad input alike, before
+        the model is touched.
+
+        Returns
+        -------
+        Array, shape (n_time, n_neurons)
+        """
+        spikes = jnp.asarray(spikes)
+        if spikes.ndim != 2:
+            raise ValueError(
+                f"spikes must be 2D array with shape (n_time, n_neurons), "
+                f"got {spikes.ndim}D array with shape {spikes.shape}"
+            )
+        if spikes.shape[1] != self.n_neurons:
+            raise ValueError(
+                f"spikes shape[1] must match n_neurons={self.n_neurons}, "
+                f"got shape {spikes.shape}"
+            )
+        validate_count_array(spikes, "spikes")
+        return spikes
 
     def _is_initialized(self) -> bool:
         return (
@@ -3453,12 +3510,6 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
     @property
     def _n_timesteps(self) -> int:
         return self._sgd_n_time
-
-    def _check_sgd_initialized(self) -> None:
-        if not self._is_initialized():
-            raise RuntimeError(
-                "Call fit_sgd(spikes, key=...) to initialize parameters."
-            )
 
     def _shared_sgd_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         """SGD parameters every switching point-process model optimizes.
@@ -3501,18 +3552,26 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         before delegating here; absent those keys the model's current
         matrices are used.
         """
-        Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
-        m0 = params.get("init_mean", self.init_mean)
-        A = params.get("_A", self.continuous_transition_matrix)
-        Q = params.get("_Q", self.process_cov)
+        Z = self._sgd_param(params, "discrete_transition_matrix")
+        m0 = self._sgd_param(params, "init_mean")
+        A = self._sgd_param(params, "_A", "continuous_transition_matrix")
+        Q = self._sgd_param(params, "_Q", "process_cov")
 
-        baseline = params.get("spike_baseline", self.spike_params.baseline)
-        weights = params.get("spike_weights", self.spike_params.weights)
+        # Read ``spike_params`` only for a key that is not optimized (see
+        # ``_sgd_param``): fits replace it, which would force a recompile.
+        baseline = (
+            params["spike_baseline"]
+            if "spike_baseline" in params
+            else self.spike_params.baseline
+        )
+        weights = (
+            params["spike_weights"]
+            if "spike_weights" in params
+            else self.spike_params.weights
+        )
         sp = SpikeObsParams(baseline=baseline, weights=weights)
 
-        P0 = reconstruct_per_state_array(
-            params, "init_cov", self.init_cov, self.n_discrete_states
-        )
+        P0 = self._sgd_per_state_param(params, "init_cov", self.n_discrete_states)
 
         # Optimize the *same* filter approximation the E-step/finalize evaluate:
         # pass max_newton_iter and line_search_beta so a model configured with
@@ -3564,12 +3623,12 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
                 baseline=params.get("spike_baseline", self.spike_params.baseline),
                 weights=params.get("spike_weights", self.spike_params.weights),
             )
-        self.init_cov = reconstruct_per_state_array(
-            params, "init_cov", self.init_cov, self.n_discrete_states
+        self.init_cov = self._sgd_per_state_param(
+            params, "init_cov", self.n_discrete_states
         )
 
-    def _finalize_sgd(self, spikes: Array) -> None:
-        self._e_step(spikes)
+    def _finalize_sgd(self, spikes: Array) -> float:
+        return float(self._e_step(spikes))
 
 
 class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
@@ -3969,10 +4028,11 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         ------
         ValueError
             If spikes has wrong shape (must be 2D with n_neurons columns).
+        NonFiniteLikelihoodError
             If the first E-step's log-likelihood is non-finite (the initial
-            parameters are unusable). A later non-finite E-step does not
-            raise: EM rolls back to the previous accepted iterate, logs a
-            warning and stops.
+            parameters are unusable); the fit outputs are cleared first. A
+            later non-finite E-step does not raise: EM rolls back to the
+            previous accepted iterate, logs a warning and stops.
 
         Notes
         -----
@@ -4020,21 +4080,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         >>> 0 < len(log_likelihoods) <= 21  # <= max_iter, plus at most one final-E-step LL
         True
         """
-        # Convert to JAX array
-        spikes = jnp.asarray(spikes)
-
-        # Validate input shape
-        if spikes.ndim != 2:
-            raise ValueError(
-                f"spikes must be 2D array with shape (n_time, n_neurons), "
-                f"got {spikes.ndim}D array with shape {spikes.shape}"
-            )
-        if spikes.shape[1] != self.n_neurons:
-            raise ValueError(
-                f"spikes shape[1] must match n_neurons={self.n_neurons}, "
-                f"got shape {spikes.shape}"
-            )
-        validate_count_array(spikes, "spikes")
+        spikes = self._validate_spikes(spikes)
 
         # Set default random key if not provided
         if key is None:
@@ -4044,28 +4090,17 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         if not skip_init:
             self._initialize_parameters(key)
 
-        # Snapshot parameters for rollback on a rejected step
-        import copy
-
-        def _snapshot_params() -> dict[str, Any]:
-            return {
-                "continuous_transition_matrix": self.continuous_transition_matrix.copy(),
-                "process_cov": self.process_cov.copy(),
-                "discrete_transition_matrix": self.discrete_transition_matrix.copy(),
-                "init_mean": self.init_mean.copy(),
-                "init_cov": self.init_cov.copy(),
-                "init_discrete_state_prob": self.init_discrete_state_prob.copy(),
-                "spike_params": copy.deepcopy(self.spike_params),
-            }
-
-        def _restore_params(params: dict[str, Any]) -> None:
-            self.continuous_transition_matrix = params["continuous_transition_matrix"]
-            self.process_cov = params["process_cov"]
-            self.discrete_transition_matrix = params["discrete_transition_matrix"]
-            self.init_mean = params["init_mean"]
-            self.init_cov = params["init_cov"]
-            self.init_discrete_state_prob = params["init_discrete_state_prob"]
-            self.spike_params = params["spike_params"]
+        # Snapshot parameters for rollback on a rejected step. The arrays are
+        # immutable JAX arrays; ``spike_params`` is a container, so deep-copy it.
+        param_keys = (
+            "continuous_transition_matrix",
+            "process_cov",
+            "discrete_transition_matrix",
+            "init_mean",
+            "init_cov",
+            "init_discrete_state_prob",
+            "spike_params",
+        )
 
         def _m_step() -> None:
             self._m_step_dynamics()
@@ -4079,14 +4114,22 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         result = run_em(
             lambda: float(self._e_step(spikes)),
             _m_step,
-            _snapshot_params,
-            _restore_params,
+            lambda: snapshot_attributes(
+                self, param_keys, deepcopy_keys=("spike_params",)
+            ),
+            lambda state: restore_attributes(self, state),
             max_iter=max_iter,
             tol=tol,
             decrease_tol=decrease_tol,
             on_first_nonfinite="raise",
+            clear_state=self._clear_fit_state,
             refresh_after_restore=True,
             logger=logger,
+        )
+        self._record_fit_result(
+            result.log_likelihoods,
+            result.converged,
+            n_iter=len(result.log_likelihoods),
         )
         return result.log_likelihoods
 
@@ -4117,8 +4160,8 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         params_with_dynamics = dict(params)
         if any(k.startswith("A_blocks_") for k in params):
             params_with_dynamics["_A"] = self._reconstruct_A_from_blocks(params)
-        params_with_dynamics["_Q"] = reconstruct_per_state_array(
-            params, "Q", self.process_cov, self.n_discrete_states
+        params_with_dynamics["_Q"] = self._sgd_per_state_param(
+            params, "Q", self.n_discrete_states, "process_cov"
         )
         return super()._sgd_loss_fn(params_with_dynamics, spikes)
 
@@ -4129,14 +4172,16 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         transition matrix's own scaled-rotation coefficients, so states that
         were not optimized are left unchanged.
         """
+        # The fallback is evaluated only for a missing block: reading the
+        # transition matrix when every block is optimized would bake it into
+        # the compiled SGD step, which a fit then invalidates (see _sgd_param).
         return jnp.stack(
             [
                 _scaled_rotation_params_to_transition_matrix(
-                    params.get(
-                        f"A_blocks_{j}",
-                        _transition_matrix_to_scaled_rotation_params(
-                            self.continuous_transition_matrix[..., j]
-                        ),
+                    params[f"A_blocks_{j}"]
+                    if f"A_blocks_{j}" in params
+                    else _transition_matrix_to_scaled_rotation_params(
+                        self.continuous_transition_matrix[..., j]
                     )
                 )
                 for j in range(self.n_discrete_states)
@@ -4150,7 +4195,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         if any(k.startswith("A_blocks_") for k in params):
             self.continuous_transition_matrix = self._reconstruct_A_from_blocks(params)
 
-        self.process_cov = reconstruct_per_state_array(
-            params, "Q", self.process_cov, self.n_discrete_states
+        self.process_cov = self._sgd_per_state_param(
+            params, "Q", self.n_discrete_states, "process_cov"
         )
         self._project_parameters()

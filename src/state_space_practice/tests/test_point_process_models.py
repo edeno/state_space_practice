@@ -15,6 +15,10 @@ from state_space_practice.point_process_models import (
     CorrelatedNoisePointProcessModel,
     DirectedInfluencePointProcessModel,
 )
+from state_space_practice.tests.model_state import (
+    assert_model_state_unchanged,
+    snapshot_model_state,
+)
 
 # Enable 64-bit precision for numerical stability
 jax.config.update("jax_enable_x64", True)
@@ -397,6 +401,54 @@ class TestCommonOscillatorPointProcessModel:
 
         with pytest.raises(ValueError, match=match):
             model.fit(bad_spikes, max_iter=1, key=jax.random.PRNGKey(0))
+
+    @pytest.mark.parametrize("method", ["fit", "fit_sgd"])
+    @pytest.mark.parametrize(
+        ("shape", "match"),
+        [((200,), "must be 2D"), ((200, 7), "must match n_neurons=5")],
+    )
+    def test_fit_and_fit_sgd_validate_spike_shape_alike(
+        self, com_pp_params, method, shape, match
+    ) -> None:
+        """fit and fit_sgd reject a wrong spike shape with the same message,
+        before touching the model."""
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        before = snapshot_model_state(model)
+        with pytest.raises(ValueError, match=match):
+            getattr(model, method)(jnp.zeros(shape), key=jax.random.PRNGKey(0))
+        assert_model_state_unchanged(model, before)
+
+    def test_restarts_propagate_errors_other_than_nonfinite_ll(
+        self, com_pp_params, synthetic_spikes, monkeypatch
+    ) -> None:
+        """Only a non-finite log-likelihood counts as a failed restart; any other
+        ValueError (e.g. from initialization) surfaces with its own message."""
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+
+        def _broken_init(key: jax.Array) -> None:
+            raise ValueError("broken initialization")
+
+        monkeypatch.setattr(model, "_initialize_parameters", _broken_init)
+        with pytest.raises(ValueError, match="broken initialization"):
+            model.fit(synthetic_spikes, max_iter=1, n_restarts=2)
+
+    def test_restarts_skip_nonfinite_ll_restart(
+        self, com_pp_params, synthetic_spikes, monkeypatch
+    ) -> None:
+        """A restart whose first E-step is non-finite is skipped, not fatal."""
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        e_step = model._e_step
+        calls = {"n": 0}
+
+        def _first_restart_nonfinite(spikes: jax.Array) -> float:
+            calls["n"] += 1
+            ll = e_step(spikes)
+            return float("nan") if calls["n"] == 1 else ll
+
+        monkeypatch.setattr(model, "_e_step", _first_restart_nonfinite)
+        lls = model.fit(synthetic_spikes, max_iter=1, n_restarts=2)
+        assert calls["n"] > 1  # the second restart ran
+        assert np.isfinite(lls[-1])
 
 
 # ============================================================================

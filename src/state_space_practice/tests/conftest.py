@@ -734,6 +734,26 @@ def assert_em_rolls_back_on_ll_decrease(
 
 
 @pytest.fixture
+def sgd_step_builds(monkeypatch: pytest.MonkeyPatch) -> list[None]:
+    """One entry per compiled SGD step ``fit_sgd`` builds (a step-cache miss).
+
+    Refitting a model on same-shaped data should reuse its compiled step, so a
+    repeat ``fit_sgd`` call adds no entry.
+    """
+    from state_space_practice import sgd_fitting
+
+    builds: list[None] = []
+    build = sgd_fitting._build_sgd_step
+
+    def counting_build(*args: object, **kwargs: object) -> object:
+        builds.append(None)
+        return build(*args, **kwargs)
+
+    monkeypatch.setattr(sgd_fitting, "_build_sgd_step", counting_build)
+    return builds
+
+
+@pytest.fixture
 def make_coupling_posterior():
     """Factory building a ``CouplingPosterior`` from explicit mean/var arrays.
 

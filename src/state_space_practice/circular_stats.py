@@ -252,6 +252,55 @@ def circular_correlation(
     return float(numerator / denominator)
 
 
+def _phases_at_spike_times(
+    spike_times: NDArray[np.floating],
+    inferred_phase: NDArray[np.floating],
+    time_axis: NDArray[np.floating],
+    mask: NDArray[np.bool_] | None,
+) -> NDArray[np.floating]:
+    """Phase at each spike time, restricted to masked, in-range spikes.
+
+    Parameters
+    ----------
+    spike_times : array, shape (n_spikes,)
+        Spike times in seconds.
+    inferred_phase : array, shape (n_time,)
+        Phase values at each time bin in radians.
+    time_axis : array, shape (n_time,)
+        Time axis corresponding to ``inferred_phase``.
+    mask : array, shape (n_time,), or None
+        Boolean mask of time points to include; None includes all.
+
+    Returns
+    -------
+    spike_phases : array, shape (n_kept_spikes,)
+        Phases of the spikes inside the mask and inside ``time_axis``.
+    """
+    from scipy.interpolate import interp1d
+
+    # Nearest-neighbor interpolation avoids phase-wrapping artifacts.
+    phase_interp = interp1d(
+        time_axis, inferred_phase, kind="nearest", bounds_error=False, fill_value=np.nan
+    )
+    spike_phases: NDArray[np.floating] = phase_interp(spike_times)
+
+    if mask is not None:
+        # Determine which spikes fall in masked regions
+        mask_interp = interp1d(
+            time_axis,
+            mask.astype(float),
+            kind="nearest",
+            bounds_error=False,
+            fill_value=0,
+        )
+        spike_in_mask = mask_interp(spike_times) > 0.5
+        spike_phases = spike_phases[spike_in_mask]
+
+    # Remove NaN phases (spikes outside time range)
+    in_range: NDArray[np.floating] = spike_phases[~np.isnan(spike_phases)]
+    return in_range
+
+
 def compute_phase_histogram(
     spike_times: NDArray[np.floating],
     inferred_phase: NDArray[np.floating],
@@ -289,30 +338,7 @@ def compute_phase_histogram(
     >>> phase = np.sin(2 * np.pi * 8 * time_axis)  # Dummy phase
     >>> hist, bins = compute_phase_histogram(spike_times, phase, time_axis)
     """
-    from scipy.interpolate import interp1d
-
-    # Interpolate phase to spike times
-    # Use nearest interpolation to avoid phase wrapping issues
-    phase_interp = interp1d(
-        time_axis, inferred_phase, kind="nearest", bounds_error=False, fill_value=np.nan
-    )
-    spike_phases = phase_interp(spike_times)
-
-    # Apply mask if provided
-    if mask is not None:
-        # Determine which spikes fall in masked regions
-        mask_interp = interp1d(
-            time_axis,
-            mask.astype(float),
-            kind="nearest",
-            bounds_error=False,
-            fill_value=0,
-        )
-        spike_in_mask = mask_interp(spike_times) > 0.5
-        spike_phases = spike_phases[spike_in_mask]
-
-    # Remove NaN phases (spikes outside time range)
-    spike_phases = spike_phases[~np.isnan(spike_phases)]
+    spike_phases = _phases_at_spike_times(spike_times, inferred_phase, time_axis, mask)
 
     # Create phase bins
     bin_edges = np.linspace(-np.pi, np.pi, n_bins + 1)
@@ -353,28 +379,7 @@ def compute_preferred_phase(
     p_value : float
         P-value from Rayleigh test for non-uniformity.
     """
-    from scipy.interpolate import interp1d
-
-    # Interpolate phase to spike times
-    phase_interp = interp1d(
-        time_axis, inferred_phase, kind="nearest", bounds_error=False, fill_value=np.nan
-    )
-    spike_phases = phase_interp(spike_times)
-
-    # Apply mask if provided
-    if mask is not None:
-        mask_interp = interp1d(
-            time_axis,
-            mask.astype(float),
-            kind="nearest",
-            bounds_error=False,
-            fill_value=0,
-        )
-        spike_in_mask = mask_interp(spike_times) > 0.5
-        spike_phases = spike_phases[spike_in_mask]
-
-    # Remove NaN phases
-    spike_phases = spike_phases[~np.isnan(spike_phases)]
+    spike_phases = _phases_at_spike_times(spike_times, inferred_phase, time_axis, mask)
 
     if len(spike_phases) < 3:
         return np.nan, np.nan, np.nan
@@ -403,8 +408,8 @@ def angular_distance(
     distance : float or array
         Angular distance in radians, range [0, pi].
     """
-    diff = np.angle(np.exp(1j * (phase1 - phase2)))
-    return np.abs(diff)
+    distance: NDArray[np.floating] = np.abs(wrap_to_pi(np.asarray(phase1 - phase2)))
+    return distance
 
 
 def wrap_to_pi(phases: NDArray[np.floating]) -> NDArray[np.floating]:

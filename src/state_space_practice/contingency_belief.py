@@ -36,7 +36,7 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.exceptions import NotFittedError
+from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.parameter_transforms import (
     POSITIVE,
@@ -49,6 +49,7 @@ from state_space_practice.utils import (
     typed_jit,
     validate_choice_indices,
     validate_count_array,
+    validate_int,
 )
 
 if TYPE_CHECKING:
@@ -425,6 +426,48 @@ def _bayes_update(
     return jnp.exp(log_joint - log_norm), log_norm
 
 
+def _prepare_inputs(
+    choices: ArrayLike,
+    rewards: ArrayLike,
+    n_states: int,
+    n_options: int,
+    reward_probs: ArrayLike,
+    state_values: ArrayLike,
+    inverse_temperature: float = 1.0,
+    transition_logits: ArrayLike | None = None,
+    transition_covariates: ArrayLike | None = None,
+    transition_weights: ArrayLike | None = None,
+    init_state_prob: ArrayLike | None = None,
+    obs_design_matrix: ArrayLike | None = None,
+    obs_weights: ArrayLike | None = None,
+) -> dict[str, Any]:
+    """Validate choices/rewards and convert the inputs of the jitted cores.
+
+    Shared by :func:`contingency_belief_filter` and
+    :func:`contingency_belief_smoother`; optional inputs stay ``None``.
+    """
+    _validate_choices_rewards(choices, rewards, n_options)
+
+    def _optional(x: ArrayLike | None) -> Array | None:
+        return None if x is None else jnp.asarray(x)
+
+    return {
+        "choices": jnp.asarray(choices, dtype=jnp.int32),
+        "rewards": jnp.asarray(rewards, dtype=jnp.int32),
+        "n_states": n_states,
+        "n_options": n_options,
+        "reward_probs": jnp.asarray(reward_probs),
+        "state_values": jnp.asarray(state_values),
+        "inverse_temperature": inverse_temperature,
+        "transition_logits": _optional(transition_logits),
+        "transition_covariates": _optional(transition_covariates),
+        "transition_weights": _optional(transition_weights),
+        "init_state_prob": _optional(init_state_prob),
+        "obs_design_matrix": _optional(obs_design_matrix),
+        "obs_weights": _optional(obs_weights),
+    }
+
+
 def contingency_belief_filter(
     choices: ArrayLike,
     rewards: ArrayLike,
@@ -485,58 +528,58 @@ def contingency_belief_filter(
         state_posterior: shape (n_trials, n_states)
         log_likelihood: scalar
     """
-    _validate_choices_rewards(choices, rewards, n_options)
-    choices = jnp.asarray(choices, dtype=jnp.int32)
-    rewards = jnp.asarray(rewards, dtype=jnp.int32)
-    reward_probs = jnp.asarray(reward_probs)
-    state_values = jnp.asarray(state_values)
-    transition_logits = (
-        None if transition_logits is None else jnp.asarray(transition_logits)
-    )
-    transition_covariates = (
-        None if transition_covariates is None else jnp.asarray(transition_covariates)
-    )
-    transition_weights = (
-        None if transition_weights is None else jnp.asarray(transition_weights)
-    )
-    init_state_prob = None if init_state_prob is None else jnp.asarray(init_state_prob)
-    obs_design_matrix = (
-        None if obs_design_matrix is None else jnp.asarray(obs_design_matrix)
-    )
-    obs_weights = None if obs_weights is None else jnp.asarray(obs_weights)
     return _contingency_belief_filter_jit(
-        choices=choices,
-        rewards=rewards,
-        n_states=n_states,
-        n_options=n_options,
-        reward_probs=reward_probs,
-        state_values=state_values,
-        inverse_temperature=inverse_temperature,
-        transition_logits=transition_logits,
-        transition_covariates=transition_covariates,
-        transition_weights=transition_weights,
-        init_state_prob=init_state_prob,
-        obs_design_matrix=obs_design_matrix,
-        obs_weights=obs_weights,
+        **_prepare_inputs(
+            choices,
+            rewards,
+            n_states,
+            n_options,
+            reward_probs,
+            state_values,
+            inverse_temperature,
+            transition_logits,
+            transition_covariates,
+            transition_weights,
+            init_state_prob,
+            obs_design_matrix,
+            obs_weights,
+        )
     )
 
 
-@functools.partial(typed_jit, static_argnames=["n_states", "n_options"])
-def _contingency_belief_filter_jit(
+def _forward_pass(
     choices: Array,
     rewards: Array,
     n_states: int,
     n_options: int,
     reward_probs: Array,
     state_values: Array,
-    inverse_temperature: float | Array = 1.0,
-    transition_logits: Array | None = None,
-    transition_covariates: Array | None = None,
-    transition_weights: Array | None = None,
-    init_state_prob: Array | None = None,
-    obs_design_matrix: Array | None = None,
-    obs_weights: Array | None = None,
-) -> ContingencyBeliefResult:
+    inverse_temperature: float | Array,
+    transition_logits: Array | None,
+    transition_covariates: Array | None,
+    transition_weights: Array | None,
+    init_state_prob: Array | None,
+    obs_design_matrix: Array | None,
+    obs_weights: Array | None,
+) -> tuple[Array, Array, Array, Array]:
+    """Fill defaults, validate the observation inputs, and run the forward pass.
+
+    Shared by the jitted filter and smoother cores; the parameters are those
+    of :func:`contingency_belief_filter`.
+
+    Returns
+    -------
+    filter_beliefs : Array, shape (n_trials, n_states)
+        Filtered posterior ``P(s_t | a_{1:t}, r_{1:t})``.
+    predicted_beliefs : Array, shape (n_trials, n_states)
+        One-step prediction ``P(s_t | a_{1:t-1}, r_{1:t-1})``; row 0 is
+        ``init_state_prob`` (no transition is applied before trial 0).
+    trans_matrices : Array, shape (n_trials, n_states, n_states)
+        Transition matrix into trial ``t``; row 0 is the baseline matrix and
+        is not used by the backward pass.
+    log_likelihood : Array, shape ()
+        Marginal log-likelihood of all trials.
+    """
     choices = jnp.asarray(choices, dtype=jnp.int32)
     rewards = jnp.asarray(rewards, dtype=jnp.int32)
     n_trials = choices.shape[0]
@@ -580,7 +623,7 @@ def _contingency_belief_filter_jit(
 
     def _step(
         carry: tuple[Array, Array], trial_data: tuple[Array, Array, Array, Array]
-    ) -> tuple[tuple[Array, Array], Array]:
+    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
         prev_belief, accum_ll = carry
         choice_t, reward_t, h_t, obs_dm_t = trial_data
 
@@ -591,13 +634,15 @@ def _contingency_belief_filter_jit(
         obs_offset_t = _compute_obs_offset(obs_dm_t)
 
         posterior, log_norm = _update(predicted, choice_t, reward_t, obs_offset_t)
-        return (posterior, accum_ll + log_norm), posterior
+        return (posterior, accum_ll + log_norm), (posterior, predicted, trans)
 
     # t=0: use init_state_prob directly as prior (no transition applied)
     obs_offset_0 = _compute_obs_offset(obs_design_matrix[0])
     posterior_0, log_norm_0 = _update(
         init_state_prob, choices[0], rewards[0], obs_offset_0
     )
+    # Dummy transition for t=0 (not used by backward pass)
+    dummy_trans = centered_softmax(transition_logits)
 
     # t=1:T: scan with transitions
     init_carry = (posterior_0, log_norm_0)
@@ -607,10 +652,48 @@ def _contingency_belief_filter_jit(
         transition_covariates[1:],
         obs_design_matrix[1:],
     )
-    (_, total_ll), posteriors_rest = jax.lax.scan(_step, init_carry, remaining_inputs)
+    (_, total_ll), (filt_rest, pred_rest, trans_rest) = jax.lax.scan(
+        _step, init_carry, remaining_inputs
+    )
 
-    posteriors = jnp.concatenate([posterior_0[None], posteriors_rest], axis=0)
+    # Concatenate t=0 with t=1:T
+    filter_beliefs = jnp.concatenate([posterior_0[None], filt_rest], axis=0)
+    predicted_beliefs = jnp.concatenate([init_state_prob[None], pred_rest], axis=0)
+    trans_matrices = jnp.concatenate([dummy_trans[None], trans_rest], axis=0)
+    return filter_beliefs, predicted_beliefs, trans_matrices, total_ll
 
+
+@functools.partial(typed_jit, static_argnames=["n_states", "n_options"])
+def _contingency_belief_filter_jit(
+    choices: Array,
+    rewards: Array,
+    n_states: int,
+    n_options: int,
+    reward_probs: Array,
+    state_values: Array,
+    inverse_temperature: float | Array = 1.0,
+    transition_logits: Array | None = None,
+    transition_covariates: Array | None = None,
+    transition_weights: Array | None = None,
+    init_state_prob: Array | None = None,
+    obs_design_matrix: Array | None = None,
+    obs_weights: Array | None = None,
+) -> ContingencyBeliefResult:
+    posteriors, _, _, total_ll = _forward_pass(
+        choices,
+        rewards,
+        n_states,
+        n_options,
+        reward_probs,
+        state_values,
+        inverse_temperature,
+        transition_logits,
+        transition_covariates,
+        transition_weights,
+        init_state_prob,
+        obs_design_matrix,
+        obs_weights,
+    )
     return ContingencyBeliefResult(
         state_posterior=posteriors,
         log_likelihood=total_ll,
@@ -623,6 +706,19 @@ class SmootherResult(NamedTuple):
     smoothed_state_prob: Array  # (n_trials, n_states)
     pairwise_state_prob: Array  # (n_trials-1, n_states, n_states)
     log_likelihood: Array  # scalar
+
+
+class _SmootherOutputs(NamedTuple):
+    """``SmootherResult`` plus the forward pass's filtered posterior.
+
+    Internal: the model stores the causal posterior without re-running the
+    filter, while the public smoother keeps its three-field result.
+    """
+
+    smoothed_state_prob: Array  # (n_trials, n_states)
+    pairwise_state_prob: Array  # (n_trials-1, n_states, n_states)
+    log_likelihood: Array  # scalar
+    filtered_state_prob: Array  # (n_trials, n_states)
 
 
 def contingency_belief_smoother(
@@ -655,40 +751,30 @@ def contingency_belief_smoother(
         pairwise_state_prob: shape (n_trials-1, n_states, n_states)
         log_likelihood: scalar
     """
-    _validate_choices_rewards(choices, rewards, n_options)
-    choices = jnp.asarray(choices, dtype=jnp.int32)
-    rewards = jnp.asarray(rewards, dtype=jnp.int32)
-    reward_probs = jnp.asarray(reward_probs)
-    state_values = jnp.asarray(state_values)
-    transition_logits = (
-        None if transition_logits is None else jnp.asarray(transition_logits)
+    smoothed, pairwise, log_likelihood, _ = _contingency_belief_smoother_jit(
+        **_prepare_inputs(
+            choices,
+            rewards,
+            n_states,
+            n_options,
+            reward_probs,
+            state_values,
+            inverse_temperature,
+            transition_logits,
+            transition_covariates,
+            transition_weights,
+            init_state_prob,
+            obs_design_matrix,
+            obs_weights,
+        )
     )
-    transition_covariates = (
-        None if transition_covariates is None else jnp.asarray(transition_covariates)
-    )
-    transition_weights = (
-        None if transition_weights is None else jnp.asarray(transition_weights)
-    )
-    init_state_prob = None if init_state_prob is None else jnp.asarray(init_state_prob)
-    obs_design_matrix = (
-        None if obs_design_matrix is None else jnp.asarray(obs_design_matrix)
-    )
-    obs_weights = None if obs_weights is None else jnp.asarray(obs_weights)
-    return _contingency_belief_smoother_jit(
-        choices=choices,
-        rewards=rewards,
-        n_states=n_states,
-        n_options=n_options,
-        reward_probs=reward_probs,
-        state_values=state_values,
-        inverse_temperature=inverse_temperature,
-        transition_logits=transition_logits,
-        transition_covariates=transition_covariates,
-        transition_weights=transition_weights,
-        init_state_prob=init_state_prob,
-        obs_design_matrix=obs_design_matrix,
-        obs_weights=obs_weights,
-    )
+    return SmootherResult(smoothed, pairwise, log_likelihood)
+
+
+def _smooth_with_filter(**kwargs: Any) -> _SmootherOutputs:
+    """Smoother outputs plus the filtered posterior; takes the keyword
+    arguments of :func:`contingency_belief_smoother`."""
+    return _contingency_belief_smoother_jit(**_prepare_inputs(**kwargs))
 
 
 @functools.partial(typed_jit, static_argnames=["n_states", "n_options"])
@@ -706,83 +792,23 @@ def _contingency_belief_smoother_jit(
     init_state_prob: Array | None = None,
     obs_design_matrix: Array | None = None,
     obs_weights: Array | None = None,
-) -> SmootherResult:
-    choices = jnp.asarray(choices, dtype=jnp.int32)
-    rewards = jnp.asarray(rewards, dtype=jnp.int32)
-    n_trials = choices.shape[0]
-
-    if transition_logits is None:
-        transition_logits = jnp.zeros((n_states, n_states - 1))
-    if init_state_prob is None:
-        init_state_prob = jnp.ones(n_states) / n_states
-
-    if transition_covariates is None or transition_weights is None:
-        transition_covariates = jnp.zeros((n_trials, 1))
-        transition_weights = jnp.zeros((n_states, n_states - 1, 1))
-
-    if obs_design_matrix is None or obs_weights is None:
-        obs_design_matrix = jnp.zeros((n_trials, 1))
-        obs_weights = jnp.zeros((n_options, 1))
-    else:
-        if obs_design_matrix.shape[0] != n_trials:
-            raise ValueError(
-                f"obs_design_matrix has {obs_design_matrix.shape[0]} rows "
-                f"but choices has {n_trials} trials"
-            )
-        _validate_obs_weights_shape(obs_weights, n_states, n_options)
-        if obs_weights.shape[-1] != obs_design_matrix.shape[1]:
-            raise ValueError(
-                f"obs_weights last-axis size {obs_weights.shape[-1]} != "
-                f"obs_design_matrix width {obs_design_matrix.shape[1]}"
-            )
-
-    # --- Forward pass: store filter beliefs and per-step info ---
-    _fwd_update = functools.partial(
-        _bayes_update,
-        reward_probs=reward_probs,
-        state_values=state_values,
-        inverse_temperature=inverse_temperature,
+) -> _SmootherOutputs:
+    # Forward pass
+    filter_beliefs, predicted_beliefs, trans_matrices, total_ll = _forward_pass(
+        choices,
+        rewards,
+        n_states,
+        n_options,
+        reward_probs,
+        state_values,
+        inverse_temperature,
+        transition_logits,
+        transition_covariates,
+        transition_weights,
+        init_state_prob,
+        obs_design_matrix,
+        obs_weights,
     )
-
-    def _forward_step(
-        carry: tuple[Array, Array], trial_data: tuple[Array, Array, Array, Array]
-    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
-        prev_belief, accum_ll = carry
-        choice_t, reward_t, h_t, obs_dm_t = trial_data
-
-        trans = compute_input_output_transition_matrix(
-            transition_logits, transition_weights, h_t
-        )
-        predicted = trans.T @ prev_belief
-        obs_offset_t = obs_weights @ obs_dm_t  # (K,) or (S, K)
-        posterior, log_norm = _fwd_update(predicted, choice_t, reward_t, obs_offset_t)
-
-        return (posterior, accum_ll + log_norm), (posterior, predicted, trans)
-
-    # t=0: use init_state_prob directly
-    obs_offset_0 = obs_weights @ obs_design_matrix[0]
-    posterior_0, log_norm_0 = _fwd_update(
-        init_state_prob, choices[0], rewards[0], obs_offset_0
-    )
-    # Dummy transition for t=0 (not used by backward pass)
-    dummy_trans = centered_softmax(transition_logits)
-
-    # t=1:T
-    init_carry = (posterior_0, log_norm_0)
-    remaining_inputs = (
-        choices[1:],
-        rewards[1:],
-        transition_covariates[1:],
-        obs_design_matrix[1:],
-    )
-    (_, total_ll), (filt_rest, pred_rest, trans_rest) = jax.lax.scan(
-        _forward_step, init_carry, remaining_inputs
-    )
-
-    # Concatenate t=0 with t=1:T
-    filter_beliefs = jnp.concatenate([posterior_0[None], filt_rest], axis=0)
-    predicted_beliefs = jnp.concatenate([init_state_prob[None], pred_rest], axis=0)
-    trans_matrices = jnp.concatenate([dummy_trans[None], trans_rest], axis=0)
 
     # --- Backward pass ---
     def _backward_step(
@@ -836,10 +862,11 @@ def _contingency_belief_smoother_jit(
     )
     pairwise = jax.vmap(_pairwise)(pairwise_inputs)
 
-    return SmootherResult(
+    return _SmootherOutputs(
         smoothed_state_prob=smoothed,
         pairwise_state_prob=pairwise,
         log_likelihood=total_ll,
+        filtered_state_prob=filter_beliefs,
     )
 
 
@@ -889,6 +916,38 @@ def _optimize_transition_rows(
         return result_opt.x
 
     return jax.vmap(_optimize_one_row)(x0_all, response_all, alpha_all)
+
+
+def _split_transition_coefficients(
+    coefficients: Array, transition_design_matrix: Array | None
+) -> tuple[Array, Array | None, Array | None]:
+    """Split design-matrix transition coefficients into filter inputs.
+
+    Parameters
+    ----------
+    coefficients : Array, shape (n_coefficients, n_states, n_states - 1)
+        Transition coefficients; row 0 is the intercept.
+    transition_design_matrix : Array or None, shape (n_trials, n_coefficients)
+        Intercept column followed by the transition covariates.
+
+    Returns
+    -------
+    transition_logits : Array, shape (n_states, n_states - 1)
+        Intercept coefficients.
+    transition_weights : Array or None, shape (n_states, n_states - 1, n_coefficients - 1)
+        ``weights[i, j, k] = coefficients[k + 1, i, j]``. None when the model
+        is stationary (one coefficient) or no design matrix is given.
+    transition_covariates : Array or None, shape (n_trials, n_coefficients - 1)
+        Design matrix without its intercept column; None together with
+        ``transition_weights``.
+    """
+    if coefficients.shape[0] > 1 and transition_design_matrix is not None:
+        return (
+            coefficients[0],
+            jnp.moveaxis(coefficients[1:], 0, -1),
+            transition_design_matrix[:, 1:],
+        )
+    return coefficients[0], None, None
 
 
 class ContingencyBeliefModel(SGDFittableMixin):
@@ -947,8 +1006,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
     # NotFittedError. Posteriors are (n_trials, n_states).
     state_posterior_: FittedAttribute[Array] = FittedAttribute()
     smoothed_state_posterior_: FittedAttribute[Array] = FittedAttribute()
-    _smoother_result: FittedAttribute[SmootherResult] = FittedAttribute()
-    log_likelihood_: FittedAttribute[float] = FittedAttribute()
+    _smoother_result: FittedAttribute[_SmootherOutputs] = FittedAttribute()
     _n_trials: FittedAttribute[int] = FittedAttribute()
 
     # Uncertainty summaries, each (n_trials,).
@@ -957,6 +1015,18 @@ class ContingencyBeliefModel(SGDFittableMixin):
     predicted_reward_variance_: FittedAttribute[Array] = FittedAttribute()
     surprise_: FittedAttribute[Array] = FittedAttribute()
     change_point_probability_: FittedAttribute[Array] = FittedAttribute()
+
+    # Everything above a fit writes, cleared when a fit fails.
+    _fit_output_attrs = (
+        "state_posterior_",
+        "smoothed_state_posterior_",
+        "_smoother_result",
+        "belief_entropy_",
+        "predicted_reward_mean_",
+        "predicted_reward_variance_",
+        "surprise_",
+        "change_point_probability_",
+    )
 
     def __init__(
         self,
@@ -1094,15 +1164,14 @@ class ContingencyBeliefModel(SGDFittableMixin):
             init_prob = jnp.ones(self.n_states) / self.n_states
 
             # Build per-trial transition matrices
-            coefs = self.transition_coefficients_
-            if coefs.shape[0] > 1 and self._transition_design_matrix is not None:
+            logits, trans_weights, dm_covs = _split_transition_coefficients(
+                self.transition_coefficients_, self._transition_design_matrix
+            )
+            if trans_weights is not None and dm_covs is not None:
                 # Non-stationary: compute per-trial transition matrix
-                trans_weights = jnp.moveaxis(coefs[1:], 0, -1)
-                dm_covs = self._transition_design_matrix[:, 1:]
-
                 def _get_trans_t(h_t: Array) -> Array:
                     return compute_input_output_transition_matrix(
-                        coefs[0], trans_weights, h_t
+                        logits, trans_weights, h_t
                     )
 
                 # predicted[t] = posterior[t-1] @ T_t for t > 0
@@ -1119,7 +1188,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
                 )
             else:
                 # Stationary
-                trans = centered_softmax(coefs[0])
+                trans = centered_softmax(logits)
                 predicted_state = jnp.concatenate(
                     [
                         init_prob[None, :],
@@ -1174,9 +1243,21 @@ class ContingencyBeliefModel(SGDFittableMixin):
             return jnp.concatenate([intercept, transition_covariates], axis=1)
         return intercept
 
-    def _smoother_kwargs(self, choices: Array, rewards: Array) -> dict[str, Any]:
-        """Build kwargs for filter/smoother calls, including covariates."""
-        coefs = self.transition_coefficients_
+    def _smoother_kwargs(
+        self,
+        choices: Array,
+        rewards: Array,
+        transition_design_matrix: Array | None,
+        obs_design_matrix: Array | None,
+    ) -> dict[str, Any]:
+        """Build kwargs for filter/smoother calls, including covariates.
+
+        The design matrices are arguments (not read from the model) so that
+        prediction on new data does not rebind the training ones.
+        """
+        logits, weights, covariates = _split_transition_coefficients(
+            self.transition_coefficients_, transition_design_matrix
+        )
         kwargs: dict[str, Any] = {
             "choices": choices,
             "rewards": rewards,
@@ -1185,17 +1266,78 @@ class ContingencyBeliefModel(SGDFittableMixin):
             "reward_probs": self.reward_probs_,
             "state_values": self.state_values_,
             "inverse_temperature": self.inverse_temperature_,
-            "transition_logits": coefs[0],  # intercept: (S, S-1)
+            "transition_logits": logits,  # intercept: (S, S-1)
         }
         # Pass covariate-driven transitions if non-stationary
-        if coefs.shape[0] > 1 and self._transition_design_matrix is not None:
-            kwargs["transition_weights"] = jnp.moveaxis(coefs[1:], 0, -1)
-            kwargs["transition_covariates"] = self._transition_design_matrix[:, 1:]
+        if weights is not None:
+            kwargs["transition_weights"] = weights
+            kwargs["transition_covariates"] = covariates
         # Pass observation covariates if present
-        if self.obs_weights_ is not None and self._obs_design_matrix is not None:
-            kwargs["obs_design_matrix"] = self._obs_design_matrix
+        if self.obs_weights_ is not None and obs_design_matrix is not None:
+            kwargs["obs_design_matrix"] = obs_design_matrix
             kwargs["obs_weights"] = self.obs_weights_
         return kwargs
+
+    def _bind_data(
+        self,
+        choices: ArrayLike,
+        rewards: ArrayLike,
+        transition_covariates: ArrayLike | None,
+        obs_design_matrix: ArrayLike | None,
+        require_obs_design_matrix: bool,
+    ) -> tuple[Array, Array]:
+        """Validate and bind training data for ``fit`` / ``fit_sgd``.
+
+        Sets ``_n_trials`` and the transition / observation design matrices
+        (``_obs_design_matrix`` is cleared when ``obs_design_matrix`` is None,
+        so a previous fit's covariates never leak into this one), and pads
+        ``transition_coefficients_`` with zero rows when covariates are added.
+
+        Returns
+        -------
+        choices, rewards : Array, shape (n_trials,)
+            The inputs as int32 arrays.
+
+        Raises
+        ------
+        ValueError
+            If the choices/rewards are invalid, or ``require_obs_design_matrix``
+            is set and ``obs_design_matrix`` is missing while
+            ``n_obs_covariates > 0``.
+        """
+        _validate_choices_rewards(choices, rewards, self.n_options)
+        if (
+            obs_design_matrix is None
+            and require_obs_design_matrix
+            and self.n_obs_covariates > 0
+        ):
+            raise ValueError(
+                f"Model has n_obs_covariates={self.n_obs_covariates}"
+                " but no obs_design_matrix was passed"
+            )
+        choices = jnp.asarray(choices, dtype=jnp.int32)
+        rewards = jnp.asarray(rewards, dtype=jnp.int32)
+        self._n_trials = int(choices.shape[0])
+
+        if transition_covariates is not None:
+            cov = jnp.asarray(transition_covariates)
+        else:
+            cov = None
+        self._transition_design_matrix = self._build_design_matrix(self._n_trials, cov)
+
+        if obs_design_matrix is not None:
+            self._obs_design_matrix = jnp.asarray(obs_design_matrix)
+        else:
+            self._obs_design_matrix = None
+
+        # Expand coefficients if covariates added
+        n_coefficients = self._transition_design_matrix.shape[1]
+        if self.transition_coefficients_.shape[0] < n_coefficients:
+            old = self.transition_coefficients_
+            new = jnp.zeros((n_coefficients, self.n_states, self.n_states - 1))
+            new = new.at[: old.shape[0]].set(old)
+            self.transition_coefficients_ = new
+        return choices, rewards
 
     def fit(
         self,
@@ -1228,44 +1370,69 @@ class ContingencyBeliefModel(SGDFittableMixin):
         Returns
         -------
         log_likelihoods : list of float
+            Finite log-likelihood of each accepted E-step. If an E-step after
+            the first is non-finite, EM restores the previous parameters,
+            logs a warning and stops (``converged_`` is False).
+
+        Raises
+        ------
+        NonFiniteLikelihoodError
+            If the first E-step's log-likelihood is non-finite.
         """
-        _validate_choices_rewards(choices, rewards, self.n_options)
-        choices = jnp.asarray(choices, dtype=jnp.int32)
-        rewards = jnp.asarray(rewards, dtype=jnp.int32)
-        self._n_trials = int(choices.shape[0])
+        # EM does not support observation covariates, so binding clears any
+        # obs design matrix left by a previous fit_sgd().
+        max_iter = validate_int(max_iter, "max_iter", positive=True)
+        choices, rewards = self._bind_data(
+            choices,
+            rewards,
+            transition_covariates,
+            obs_design_matrix=None,
+            require_obs_design_matrix=False,
+        )
 
-        # Clear stale observation covariates from a previous fit_sgd() or
-        # predict() call.  EM does not support obs covariates, and leaving
-        # _obs_design_matrix set would silently leak them into _smoother_kwargs.
-        self._obs_design_matrix = None
-
-        if transition_covariates is not None:
-            cov = jnp.asarray(transition_covariates)
-        else:
-            cov = None
-        self._transition_design_matrix = self._build_design_matrix(self._n_trials, cov)
-
-        # Expand coefficients if covariates added
-        n_coefficients = self._transition_design_matrix.shape[1]
-        if self.transition_coefficients_.shape[0] < n_coefficients:
-            old = self.transition_coefficients_
-            new = jnp.zeros((n_coefficients, self.n_states, self.n_states - 1))
-            new = new.at[: old.shape[0]].set(old)
-            self.transition_coefficients_ = new
+        def _e_step() -> _SmootherOutputs:
+            return _smooth_with_filter(
+                **self._smoother_kwargs(
+                    choices, rewards, self._transition_design_matrix, None
+                )
+            )
 
         log_likelihoods: list[float] = []
         prev_ll = float("-inf")
         converged = False
+        stopped_nonfinite = False
         params_dirty = False
         last_accepted: dict[str, Array] | None = None
 
         for iteration in range(max_iter):
             # E-step
-            kwargs = self._smoother_kwargs(choices, rewards)
-            result = contingency_belief_smoother(**kwargs)
+            result = _e_step()
+            ll = float(result.log_likelihood)
+            if not np.isfinite(ll):
+                if last_accepted is None:
+                    self._clear_fit_state()
+                    raise NonFiniteLikelihoodError(
+                        f"Non-finite log-likelihood ({ll}) at the first EM "
+                        "E-step; the starting parameters are unusable."
+                    )
+                # Roll back the M-step that produced the bad parameters and
+                # resync the smoother with the restored ones.
+                for attr, value in last_accepted.items():
+                    setattr(self, attr, value)
+                result = _e_step()
+                self._smoother_result = result
+                self.smoothed_state_posterior_ = result.smoothed_state_prob
+                params_dirty = False
+                stopped_nonfinite = True
+                logger.warning(
+                    "Non-finite log-likelihood (%s) at EM iteration %d; rolled "
+                    "back to the previous parameters and stopped EM.",
+                    ll,
+                    iteration + 1,
+                )
+                break
             self._smoother_result = result
             self.smoothed_state_posterior_ = result.smoothed_state_prob
-            ll = float(result.log_likelihood)
             log_likelihoods.append(ll)
             params_dirty = False
 
@@ -1289,8 +1456,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
             # Final E-step syncs the smoother to the last M-step's parameters.
             # Accept it only if it did not decrease the LL; otherwise roll the
             # M-step back so the stored (params, smoother, LL) stay consistent.
-            kwargs = self._smoother_kwargs(choices, rewards)
-            result = contingency_belief_smoother(**kwargs)
+            result = _e_step()
             final_ll = float(result.log_likelihood)
             _, is_increasing = check_converged(final_ll, log_likelihoods[-1], tolerance)
             if is_increasing and np.isfinite(final_ll):
@@ -1300,27 +1466,24 @@ class ContingencyBeliefModel(SGDFittableMixin):
             elif last_accepted is not None:
                 for attr, value in last_accepted.items():
                     setattr(self, attr, value)
-                kwargs = self._smoother_kwargs(choices, rewards)
-                result = contingency_belief_smoother(**kwargs)
+                result = _e_step()
                 self._smoother_result = result
                 self.smoothed_state_posterior_ = result.smoothed_state_prob
                 logger.warning(
-                    "Final M-step decreased the log-likelihood; rolled back to "
-                    "the previous parameters."
+                    "Final M-step decreased the log-likelihood (or left it "
+                    "non-finite); rolled back to the previous parameters."
                 )
 
-        self.log_likelihood_ = log_likelihoods[-1]
-        self.log_likelihood_history_ = log_likelihoods
-        # Populate causal posterior from final parameters
-        filter_kwargs = self._smoother_kwargs(choices, rewards)
-        filter_result = contingency_belief_filter(**filter_kwargs)
-        self.state_posterior_ = filter_result.state_posterior
+        self._record_fit_result(log_likelihoods, converged, n_iter=len(log_likelihoods))
+        # Causal posterior: the forward pass of the final parameters' smoother
+        self.state_posterior_ = self._smoother_result.filtered_state_prob
         self._populate_uncertainty(choices)
-        self._finalize_convergence(converged, max_iter)
+        if not stopped_nonfinite:
+            self._finalize_convergence(converged, max_iter)
 
         return log_likelihoods
 
-    def _m_step(self, choices: Array, rewards: Array, result: SmootherResult) -> None:
+    def _m_step(self, choices: Array, rewards: Array, result: _SmootherOutputs) -> None:
         """M-step: update reward_probs and transition coefficients."""
         assert self._transition_design_matrix is not None
         gamma = result.smoothed_state_prob  # (T, S)
@@ -1376,8 +1539,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
         Always builds a fresh design matrix from the input length — does
         not reuse the training design matrix. The fitted parameters are
-        used as-is; the model's stored design matrices are restored
-        afterwards.
+        used as-is; the model's stored design matrices are not changed.
 
         Parameters
         ----------
@@ -1401,25 +1563,18 @@ class ContingencyBeliefModel(SGDFittableMixin):
         choices = jnp.asarray(choices, dtype=jnp.int32)
         rewards = jnp.asarray(rewards, dtype=jnp.int32)
         n_trials = int(choices.shape[0])
-        # Build fresh design matrices for this prediction
-        old_tdm = self._transition_design_matrix
-        old_odm = self._obs_design_matrix
-        if transition_covariates is not None:
-            self._transition_design_matrix = self._build_design_matrix(
-                n_trials, jnp.asarray(transition_covariates)
-            )
-        else:
-            self._transition_design_matrix = self._build_design_matrix(n_trials)
-        if obs_design_matrix is not None:
-            self._obs_design_matrix = jnp.asarray(obs_design_matrix)
-        else:
-            # Always clear obs state for prediction to prevent stale-length bugs
-            self._obs_design_matrix = None
-        kwargs = self._smoother_kwargs(choices, rewards)
-        result = contingency_belief_smoother(**kwargs)
-        self._transition_design_matrix = old_tdm
-        self._obs_design_matrix = old_odm
-        return result.smoothed_state_prob
+        # Fresh design matrices for this prediction; no obs covariates unless
+        # passed (the training ones would have the wrong length).
+        cov = (
+            None
+            if transition_covariates is None
+            else jnp.asarray(transition_covariates)
+        )
+        obs = None if obs_design_matrix is None else jnp.asarray(obs_design_matrix)
+        kwargs = self._smoother_kwargs(
+            choices, rewards, self._build_design_matrix(n_trials, cov), obs
+        )
+        return contingency_belief_smoother(**kwargs).smoothed_state_prob
 
     # --- SGDFittableMixin protocol ---
 
@@ -1472,43 +1627,40 @@ class ContingencyBeliefModel(SGDFittableMixin):
             If the choices/rewards are invalid or ``obs_design_matrix`` is
             missing while ``n_obs_covariates > 0``.
         """
-        _validate_choices_rewards(choices, rewards, self.n_options)
-        choices = jnp.asarray(choices, dtype=jnp.int32)
-        rewards = jnp.asarray(rewards, dtype=jnp.int32)
-        self._n_trials = int(choices.shape[0])
-
-        if transition_covariates is not None:
-            cov = jnp.asarray(transition_covariates)
-        else:
-            cov = None
-        self._transition_design_matrix = self._build_design_matrix(self._n_trials, cov)
-
-        if obs_design_matrix is not None:
-            self._obs_design_matrix = jnp.asarray(obs_design_matrix)
-        elif self.n_obs_covariates > 0:
-            raise ValueError(
-                f"Model has n_obs_covariates={self.n_obs_covariates}"
-                " but no obs_design_matrix was passed"
-            )
-        else:
-            self._obs_design_matrix = None
-
-        # Expand coefficients if covariates added
-        n_coefficients = self._transition_design_matrix.shape[1]
-        if self.transition_coefficients_.shape[0] < n_coefficients:
-            old = self.transition_coefficients_
-            new = jnp.zeros((n_coefficients, self.n_states, self.n_states - 1))
-            new = new.at[: old.shape[0]].set(old)
-            self.transition_coefficients_ = new
-
         return super().fit_sgd(
             choices,
             rewards,
+            transition_covariates=transition_covariates,
+            obs_design_matrix=obs_design_matrix,
             optimizer=optimizer,
             num_steps=num_steps,
             verbose=verbose,
             convergence_tol=convergence_tol,
         )
+
+    def _prepare_sgd_data(
+        self,
+        choices: ArrayLike,
+        rewards: ArrayLike,
+        transition_covariates: ArrayLike | None = None,
+        obs_design_matrix: ArrayLike | None = None,
+    ) -> tuple[tuple[Array, Array], dict[str, Any]]:
+        """Bind the training data once the optimizer settings are validated.
+
+        Binding sets ``_n_trials`` and the design matrices and may pad
+        ``transition_coefficients_``, so it runs here rather than before
+        ``super().fit_sgd``: invalid settings then fail with the model
+        untouched. Only ``(choices, rewards)`` reach ``_sgd_loss_fn`` and
+        ``_finalize_sgd``; the design matrices are read from the model.
+        """
+        choices, rewards = self._bind_data(
+            choices,
+            rewards,
+            transition_covariates,
+            obs_design_matrix,
+            require_obs_design_matrix=True,
+        )
+        return (choices, rewards), {}
 
     @property
     def _n_timesteps(self) -> int:
@@ -1535,17 +1687,11 @@ class ContingencyBeliefModel(SGDFittableMixin):
         return params, spec
 
     def _sgd_loss_fn(self, params: SGDParams, choices: Array, rewards: Array) -> Array:
-        coefs = params["transition_coefficients"]
-        transition_logits = coefs[0]  # intercept: (n_states, n_states-1)
-
-        # If non-stationary (>1 coefficient), extract covariate weights
-        transition_weights = None
-        transition_covariates = None
-        if coefs.shape[0] > 1 and self._transition_design_matrix is not None:
-            # weights[i, j, k] = coefficients[k+1, i, j] for covariates
-            transition_weights = jnp.moveaxis(coefs[1:], 0, -1)
-            # Covariates from design matrix (exclude intercept column)
-            transition_covariates = self._transition_design_matrix[:, 1:]
+        transition_logits, transition_weights, transition_covariates = (
+            _split_transition_coefficients(
+                params["transition_coefficients"], self._transition_design_matrix
+            )
+        )
 
         # Observation covariates
         use_obs_covariates = (
@@ -1576,13 +1722,14 @@ class ContingencyBeliefModel(SGDFittableMixin):
         if "obs_weights" in params:
             self.obs_weights_ = params["obs_weights"]
 
-    def _finalize_sgd(self, choices: Array, rewards: Array) -> None:
-        kwargs = self._smoother_kwargs(choices, rewards)
-        result = contingency_belief_smoother(**kwargs)
+    def _finalize_sgd(self, choices: Array, rewards: Array) -> float:
+        kwargs = self._smoother_kwargs(
+            choices, rewards, self._transition_design_matrix, self._obs_design_matrix
+        )
+        result = _smooth_with_filter(**kwargs)
         self._smoother_result = result
         self.smoothed_state_posterior_ = result.smoothed_state_prob
-        self.log_likelihood_ = float(result.log_likelihood)
-        # Also populate causal posterior
-        filter_result = contingency_belief_filter(**kwargs)
-        self.state_posterior_ = filter_result.state_posterior
+        # Also populate causal posterior (the smoother's forward pass)
+        self.state_posterior_ = result.filtered_state_prob
         self._populate_uncertainty(choices)
+        return float(result.log_likelihood)

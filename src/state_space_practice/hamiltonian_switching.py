@@ -443,6 +443,14 @@ class SwitchingHamiltonianJointModel(_JointHamiltonianBase):
     filtered_discrete_probs_: FittedAttribute[Array] = FittedAttribute()
     smoothed_discrete_probs_: FittedAttribute[Array] = FittedAttribute()
 
+    _fit_output_attrs = _JointHamiltonianBase._fit_output_attrs + (
+        "filtered_discrete_probs_",
+        "smoothed_discrete_probs_",
+        "smoother_state_cond_mean",
+        "smoother_state_cond_cov",
+        "smoother_discrete_state_prob",
+    )
+
     def __init__(
         self,
         n_oscillators: int,
@@ -646,19 +654,19 @@ class SwitchingHamiltonianJointModel(_JointHamiltonianBase):
         SGDFittableMixin._store_sgd_params(self, params)
         self.measurement_matrix = self._measurement_matrix_all_states()
 
-    def _finalize_sgd(self, lfp_data: Array, spike_data: Array, **kwargs: Any) -> None:
+    def _finalize_sgd(self, lfp_data: Array, spike_data: Array, **kwargs: Any) -> float:
         """Run filter + smoother to populate fitted states after SGD.
 
         Overrides the single-regime parent: the switching filter returns
         four arrays (means, covs, discrete_probs, marginal_lls) and the
-        smoother returns three (means, covs, discrete_probs).
+        smoother returns three (means, covs, discrete_probs). Returns the
+        summed marginal log-likelihood, which becomes ``log_likelihood_``.
         """
         params = self._build_param_spec()[0]
         means, covs, probs, lls = self.filter(lfp_data, spike_data, params)
         self.filtered_means_ = means
         self.filtered_covs_ = covs
         self.filtered_discrete_probs_ = probs
-        self.log_likelihood_ = float(jnp.sum(lls))
         sm_means, sm_covs, sm_probs = self.smooth(lfp_data, spike_data, params)
         self.smoothed_means_ = sm_means
         self.smoothed_covs_ = sm_covs
@@ -666,3 +674,4 @@ class SwitchingHamiltonianJointModel(_JointHamiltonianBase):
         self.smoother_state_cond_mean = sm_means
         self.smoother_state_cond_cov = sm_covs
         self.smoother_discrete_state_prob = sm_probs
+        return float(jnp.sum(lls))
