@@ -97,6 +97,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `construct_common_oscillator_transition_matrix_stack`,
   `construct_correlated_noise_process_covariance_stack` and
   `extract_correlated_noise_params_from_covariance_stack`.
+- **`seed=` on `simulate_eden_brown_2004_jump` /
+  `simulate_eden_brown_2004_linear`** for a reproducible spike realization
+  without building a generator. The default (`rng=None, seed=None`) is
+  unchanged and nondeterministic; passing both `rng` and `seed` raises
+  `ValueError`.
 
 ### Testing
 

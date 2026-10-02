@@ -60,11 +60,41 @@ def _eden_brown_2004_base(
     return time, position, n_total_steps, true_params1, true_params2
 
 
+def _resolve_rng(
+    rng: np.random.Generator | None, seed: int | None
+) -> np.random.Generator:
+    """The generator to draw from: ``rng`` if given, else one seeded by ``seed``."""
+    if rng is not None:
+        if seed is not None:
+            raise ValueError("Pass either rng or seed, not both.")
+        return rng
+    return np.random.default_rng(seed)
+
+
 def simulate_eden_brown_2004_jump(
     rng: np.random.Generator | None = None,
+    seed: int | None = None,
 ) -> EdenBrownJumpSimulation:
-    if rng is None:
-        rng = np.random.default_rng()
+    """Simulate a 1D place cell whose field jumps halfway through the session.
+
+    Eden et al. (2004) setup: 8000 s of back-and-forth runs on a 300 cm track
+    at 125 cm/s, 20 ms bins; the Gaussian receptive field switches from
+    ``true_params1`` to ``true_params2`` at the midpoint.
+
+    Parameters
+    ----------
+    rng : numpy.random.Generator or None, optional
+        Generator for the Poisson spike draws.
+    seed : int or None, optional
+        Seed for a fresh generator when ``rng`` is None. With both None
+        (the default) the spikes are nondeterministic (fresh OS entropy);
+        pass ``seed`` (or a seeded ``rng``) for a reproducible realization.
+
+    Returns
+    -------
+    EdenBrownJumpSimulation
+    """
+    rng = _resolve_rng(rng, seed)
     dt = 0.020
     time, position, _, true_params1, true_params2 = _eden_brown_2004_base(dt=dt)
 
@@ -80,9 +110,28 @@ def simulate_eden_brown_2004_jump(
 
 def simulate_eden_brown_2004_linear(
     rng: np.random.Generator | None = None,
+    seed: int | None = None,
 ) -> EdenBrownLinearSimulation:
-    if rng is None:
-        rng = np.random.default_rng()
+    """Simulate a 1D place cell whose field drifts linearly over the session.
+
+    Same track and timing as :func:`simulate_eden_brown_2004_jump`, with the
+    receptive-field parameters interpolated linearly from ``true_params1`` to
+    ``true_params2``.
+
+    Parameters
+    ----------
+    rng : numpy.random.Generator or None, optional
+        Generator for the Poisson spike draws.
+    seed : int or None, optional
+        Seed for a fresh generator when ``rng`` is None. With both None
+        (the default) the spikes are nondeterministic (fresh OS entropy);
+        pass ``seed`` (or a seeded ``rng``) for a reproducible realization.
+
+    Returns
+    -------
+    EdenBrownLinearSimulation
+    """
+    rng = _resolve_rng(rng, seed)
     dt = 0.020
     time, position, n_total_steps, true_params1, true_params2 = _eden_brown_2004_base(
         dt=dt
