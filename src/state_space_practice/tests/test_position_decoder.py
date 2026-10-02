@@ -200,41 +200,76 @@ class TestPlaceFieldRateMaps:
             atol=1e-10,
         )
 
-    def test_kde_log_rate_matches_manual_kernel_ratio(self):
-        """Analytical KDE path should use count/occupancy units correctly."""
-        x_edges = np.array([0.0, 2.0, 4.0])
-        y_edges = np.array([10.0, 13.0])
-        spike_histograms = np.array([[[1.0, 3.0, 2.0], [4.0, 0.0, 5.0]]])
-        occ_histogram = np.array([[0.2, 0.5, 0.4], [0.8, 0.1, 0.6]])
-        baseline_rates = np.array([2.5])
-        occupancy_tau = 0.3
-        sigma = 2.0
-        rate_maps = PlaceFieldRateMaps(
-            rate_maps=np.ones((1, 2, 3)),
-            x_edges=x_edges,
-            y_edges=y_edges,
-            spike_histograms=spike_histograms,
-            occ_histogram=occ_histogram,
-            kde_sigma=sigma,
-            baseline_rates=baseline_rates,
-            occupancy_tau=occupancy_tau,
-        )
-        query = jnp.array([1.5, 11.0])
+    # Small analytical-KDE problem shared by the kernel-ratio tests.
+    _KDE_X_EDGES = np.array([0.0, 2.0, 4.0])
+    _KDE_Y_EDGES = np.array([10.0, 13.0])
+    _KDE_SPIKES = np.array([[[1.0, 3.0, 2.0], [4.0, 0.0, 5.0]]])
+    _KDE_OCC = np.array([[0.2, 0.5, 0.4], [0.8, 0.1, 0.6]])
+    _KDE_BASELINE = np.array([2.5])
+    _KDE_TAU = 0.3
+    _KDE_SIGMA = 2.0
 
-        xx, yy = np.meshgrid(x_edges, y_edges)
+    @classmethod
+    def _kde_rate_maps(cls) -> PlaceFieldRateMaps:
+        return PlaceFieldRateMaps(
+            rate_maps=np.ones((1, 2, 3)),
+            x_edges=cls._KDE_X_EDGES,
+            y_edges=cls._KDE_Y_EDGES,
+            spike_histograms=cls._KDE_SPIKES,
+            occ_histogram=cls._KDE_OCC,
+            kde_sigma=cls._KDE_SIGMA,
+            baseline_rates=cls._KDE_BASELINE,
+            occupancy_tau=cls._KDE_TAU,
+        )
+
+    @classmethod
+    def _manual_kde_log_rate(cls, query: np.ndarray) -> np.ndarray:
+        """NumPy reference; the kernel is normalized after subtracting its
+        largest exponent, so it is exact far from every grid bin."""
+        xx, yy = np.meshgrid(cls._KDE_X_EDGES, cls._KDE_Y_EDGES)
         grid_xy = np.column_stack([xx.ravel(), yy.ravel()])
         dist_sq = np.sum((grid_xy - np.asarray(query)[None, :]) ** 2, axis=1)
-        kernel = np.exp(-0.5 * dist_sq / sigma**2)
+        log_kernel = -0.5 * dist_sq / cls._KDE_SIGMA**2
+        kernel = np.exp(log_kernel - log_kernel.max())
         kernel = kernel / kernel.sum()
         manual_rate = (
-            spike_histograms.reshape(1, -1) @ kernel + occupancy_tau * baseline_rates
-        ) / (occ_histogram.ravel() @ kernel + occupancy_tau)
+            cls._KDE_SPIKES.reshape(1, -1) @ kernel + cls._KDE_TAU * cls._KDE_BASELINE
+        ) / (cls._KDE_OCC.ravel() @ kernel + cls._KDE_TAU)
+        return np.log(manual_rate)
 
+    def test_kde_log_rate_matches_manual_kernel_ratio(self):
+        """Analytical KDE path should use count/occupancy units correctly."""
+        query = jnp.array([1.5, 11.0])
         np.testing.assert_allclose(
-            np.asarray(rate_maps.log_rate(query)),
-            np.log(manual_rate),
+            np.asarray(self._kde_rate_maps().log_rate(query)),
+            self._manual_kde_log_rate(np.asarray(query)),
             atol=1e-10,
         )
+
+    def test_kde_log_rate_far_from_grid_keeps_value_and_gradient(self):
+        """~80 bandwidths from every bin each kernel weight underflows to 0,
+        but the normalized weights (and so the rate and its gradient) are
+        well defined: the rate is dominated by the nearest row of bins and
+        still varies with x along that row."""
+        rate_maps = self._kde_rate_maps()
+        query = np.array([1.5, 13.0 + 80 * self._KDE_SIGMA])
+        # guard: the unnormalized kernel underflows at this distance
+        assert np.exp(-0.5 * (80.0**2)) == 0.0
+
+        np.testing.assert_allclose(
+            np.asarray(rate_maps.log_rate(jnp.asarray(query))),
+            self._manual_kde_log_rate(query),
+            rtol=1e-10,
+        )
+        jac = np.asarray(rate_maps.log_rate_jacobian(jnp.asarray(query)))
+        h = 1e-5
+        fd_x = (
+            self._manual_kde_log_rate(query + [h, 0.0])
+            - self._manual_kde_log_rate(query - [h, 0.0])
+        ) / (2 * h)
+        assert np.all(np.isfinite(jac))
+        assert abs(fd_x[0]) > 1e-3  # guard: a real, nonzero gradient
+        np.testing.assert_allclose(jac[0, 0], fd_x[0], rtol=1e-6)
 
     def test_from_place_field_model(self):
         """Construct rate maps from a fitted PlaceFieldModel."""

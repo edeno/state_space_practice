@@ -534,6 +534,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   1.5e-11 relative (the old form's rounding of `1 - sigmoid` near
   `|mu + x| = 16`; the new form is within 4e-16 of an exact reference);
   filter outputs and EM fits move by <= 1.4e-14.
+- **`PositionDecoder` KDE log-rates stay correct far from the encoding
+  grid**: the KDE kernel is normalized in log space (softmax). Beyond ~12
+  bandwidths from every grid bin the linear normalization (`+ 1e-30`) collapsed
+  the weights to 0, so the rate fell back to the baseline and the gradient
+  with respect to position vanished. Values in the normal range are unchanged
+  (to ~1e-15).
 - **Importing `simulate.simulate_switching_kalman` no longer reseeds the
   global NumPy RNG** (it ran `np.random.seed(0)` at import), and
   `simdata_settings` / `simulate_model` no longer draw the initial state from
