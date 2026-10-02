@@ -18,6 +18,7 @@ Usage::
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -118,7 +119,13 @@ def positive_capped(max_val: float = 50.0) -> ParameterTransform:
     """
     if not math.isfinite(max_val) or max_val <= 0.0:
         raise ValueError("max_val must be positive and finite.")
+    # One transform per cap: the SGD compiled-step cache keys on the parameter
+    # spec, and fresh closures would make equal specs compare unequal.
+    return _positive_capped(float(max_val))
 
+
+@functools.cache
+def _positive_capped(max_val: float) -> ParameterTransform:
     def _to_constrained(x: Array) -> Array:
         return max_val * jax.nn.sigmoid(x)
 
