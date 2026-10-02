@@ -529,6 +529,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   1.5e-11 relative (the old form's rounding of `1 - sigmoid` near
   `|mu + x| = 16`; the new form is within 4e-16 of an exact reference);
   filter outputs and EM fits move by <= 1.4e-14.
+- **Importing `simulate.simulate_switching_kalman` no longer reseeds the
+  global NumPy RNG** (it ran `np.random.seed(0)` at import), and
+  `simdata_settings` / `simulate_model` no longer draw the initial state from
+  the global RNG, so consecutive `simulate_model()` calls return the same
+  data. New `init_seed` (initial state, default 0 -- the value the old
+  import-time seeding gave on a first call) and `simulate_model(noise_seed=14)`
+  (the existing noise seed) arguments; `None` makes either part
+  nondeterministic.
 - **A failed fit no longer leaves stale or non-finite results that look
   fitted**: when a fit raises `NonFiniteLikelihoodError` (its starting
   parameters give a non-finite log-likelihood), it first clears every fit

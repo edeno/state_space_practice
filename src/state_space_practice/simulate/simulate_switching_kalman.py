@@ -4,10 +4,10 @@ import numpy as np
 import scipy
 from numpy.typing import ArrayLike, NDArray
 
-np.random.seed(0)
 
-
-def simdata_settings() -> tuple[
+def simdata_settings(
+    init_seed: int | None = 0,
+) -> tuple[
     int,
     int,
     int,
@@ -24,6 +24,21 @@ def simdata_settings() -> tuple[
     NDArray[np.float64],
     int,
 ]:
+    """Parameters of the three-state switching oscillator simulation.
+
+    Parameters
+    ----------
+    init_seed : int or None, default=0
+        Seed for the random initial oscillatory state ``X0``. ``None`` draws
+        fresh OS entropy (a different ``X0`` on every call). The global
+        NumPy random state is neither read nor modified.
+
+    Returns
+    -------
+    tuple
+        ``(fs, k, n, M, osc_freqs, rhos, var_state_nois, var_obs_noi, A, Q,
+        R, B, Z, X0, S0)``; see :func:`simulate_model`.
+    """
     # Define the dimensions of the input data
     k = 2  # # of oscillators
     n = 4  # # of electrodes
@@ -62,9 +77,14 @@ def simdata_settings() -> tuple[
         [[0.998, 0.001, 0.001], [0.001, 0.998, 0.001], [0.001, 0.001, 0.998]]
     )  # Discrete state transition matrix
 
-    X0 = np.random.multivariate_normal(
-        np.zeros(x_dim), np.eye(x_dim)
-    ).T  # Initial oscillatory state
+    # Initial oscillatory state. A seeded RandomState (rather than a
+    # Generator) keeps the default X0 equal to the value the module used to
+    # draw after reseeding the global RNG with 0 at import time.
+    X0 = (
+        np.random.RandomState(init_seed)
+        .multivariate_normal(np.zeros(x_dim), np.eye(x_dim))
+        .T
+    )
     S0 = 0  # Initial discrete state
 
     return (
@@ -136,7 +156,7 @@ def simulate(
     S_0: int,
     T: int,
     s: ArrayLike | None = None,
-    seed: int = 14,
+    seed: int | None = 14,
 ) -> tuple[NDArray[np.float64], NDArray[np.int_], NDArray[np.float64]]:
     if T <= 0:
         raise ValueError(f"T must be positive, got {T}.")
@@ -172,7 +192,10 @@ def simulate(
 
 
 def simulate_model(
-    T: int = 30000, blnSimS: bool = False
+    T: int = 30000,
+    blnSimS: bool = False,
+    init_seed: int | None = 0,
+    noise_seed: int | None = 14,
 ) -> tuple[
     int,
     int,
@@ -200,8 +223,20 @@ def simulate_model(
     Parameters
     ----------
     T : int, optional
-        _description_, by default 30000
+        Number of time steps, by default 30000
     blnSimS : bool, optional
+        If True, simulate the discrete state sequence from ``Z``; otherwise
+        use the fixed schedule (state 1 after 80 s, state 2 after 200 s).
+    init_seed : int or None, optional
+        Seed for the initial continuous state ``X0`` (see
+        :func:`simdata_settings`), by default 0.
+    noise_seed : int or None, optional
+        Seed for the state/observation noise and simulated discrete states
+        (passed to :func:`simulate`), by default 14.
+
+    With integer seeds the output is a deterministic function of the
+    arguments; ``None`` for either seed makes that part nondeterministic.
+    The global NumPy random state is neither read nor modified.
 
     Returns
     -------
@@ -247,7 +282,7 @@ def simulate_model(
         Time sequence
     """
     fs, k, n, M, osc_freqs, rhos, var_state_nois, var_obs_noi, A, Q, R, B, Z, X0, S0 = (
-        simdata_settings()
+        simdata_settings(init_seed)
     )
 
     x_dim = k * 2
@@ -263,7 +298,7 @@ def simulate_model(
         s[ta > 80] = 1
         s[ta > 200] = 2
 
-    y, s, x = simulate(A, B, Q, R, Z, X0, S0, T, s=s)
+    y, s, x = simulate(A, B, Q, R, Z, X0, S0, T, s=s, seed=noise_seed)
     time = np.arange(T) / fs
 
     return (
