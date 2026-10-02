@@ -424,6 +424,34 @@ class SGDFittableMixin:
     def _finalize_sgd(self, *args: Any, **kwargs: Any) -> None:
         raise NotImplementedError
 
+    def _sgd_param(self, params: SGDParams, key: str, attr: str | None = None) -> Any:
+        """Value of ``key`` for ``_sgd_loss_fn``: optimized if present, else stored.
+
+        Use this instead of ``params.get(key, self.<attr>)``. The compiled-step
+        cache fingerprints every model attribute the loss reads while tracing,
+        and fitting rewrites trained attributes, so reading them unconditionally
+        makes every repeat ``fit_sgd`` miss the cache and recompile. This reads
+        the attribute only when ``key`` is not being optimized.
+
+        Parameters
+        ----------
+        params : SGDParams
+            The constrained parameters passed to the loss.
+        key : str
+            Parameter name in ``params``.
+        attr : str or None
+            Model attribute to fall back to; defaults to ``key``.
+
+        Returns
+        -------
+        Array or pytree of Arrays
+        """
+        if key in params:
+            return params[key]
+        return jax.tree_util.tree_map(
+            jnp.asarray, getattr(self, key if attr is None else attr)
+        )
+
     def _check_sgd_initialized(self) -> None:
         return
 
