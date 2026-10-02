@@ -831,7 +831,11 @@ def _fisher_scoring_line_search(
     ``gradient' delta >= 0`` and ``delta`` is a descent direction. When the
     full step is accepted the result is the same as without the Armijo
     condition. If no step size qualifies, ``x`` is kept (an uphill or
-    insufficient step is never taken).
+    insufficient step is never taken). The backtracking stops at the first
+    accepted step size, so an accepted full step costs one objective
+    evaluation; it is differentiable in reverse mode because only the
+    accepted point ``x + alpha delta`` carries derivatives (``alpha`` is a
+    constant power of ``beta``).
 
     With ``max_newton_iter == 0`` no measurement update is made: the prior
     ``(x0, prior_precision)`` is returned unchanged.
@@ -861,35 +865,61 @@ def _fisher_scoring_line_search(
     ) -> tuple[tuple[Array, Array, Array, Array, Array, Array], None]:
         x, delta, _, current_loss, slope, n_failed = carry
 
-        # Backtracking line search. The loss at the evaluated step size rides
-        # along in the carry, so the winning loss is known without a second
-        # evaluation at the accepted point.
-        def _backtrack(
-            alpha_carry: tuple[Array, Array, Array], _: Array | None
-        ) -> tuple[tuple[Array, Array, Array], None]:
-            alpha, _, _ = alpha_carry
-            new_x = x + alpha * delta
-            new_loss = neg_log_posterior(new_x)
-            # The slack admits steps that change f only at round-off level,
-            # so at a converged mode the (tiny) full step is still taken:
-            # rejecting it would freeze x, and reverse-mode gradients
-            # through the scan would then miss the Fisher map's contraction
-            # and carry the error of an earlier, unconverged iterate.
-            slack = 1e-12 * (1.0 + jnp.abs(current_loss))
-            improved = new_loss <= current_loss - _ARMIJO_C * alpha * slope + slack
-            new_alpha = jnp.where(improved, alpha, alpha * line_search_beta)
-            return (new_alpha, improved, new_loss), None
+        # Backtracking line search, stopped at the first accepted step size
+        # (usually the full step) instead of always evaluating all
+        # ``_LINE_SEARCH_MAX_BACKTRACKS`` trials. The loss at the evaluated
+        # step size rides along in the carry, so the winning loss is known
+        # without a second evaluation at the accepted point.
+        #
+        # The search only *selects* a step size: alpha is a power of beta and
+        # the accept flag is boolean, so the result has zero derivative with
+        # respect to every input, and the loss is used only in comparisons.
+        # Everything entering or produced by the loop is therefore cut from
+        # differentiation with ``stop_gradient``; that makes the
+        # ``while_loop`` a primal-only computation, so reverse-mode AD
+        # (fit_sgd differentiates through the filters) works through it, and
+        # the gradient -- which flows through ``x + alpha * delta`` below --
+        # is the same as through a fixed-length search.
+        x_sg = jax.lax.stop_gradient(x)
+        delta_sg = jax.lax.stop_gradient(delta)
+        loss_sg = jax.lax.stop_gradient(current_loss)
+        slope_sg = jax.lax.stop_gradient(slope)
+        # The slack admits steps that change f only at round-off level, so at
+        # a converged mode the (tiny) full step is still taken: rejecting it
+        # would freeze x, and reverse-mode gradients through the iterations
+        # would then miss the Fisher map's contraction and carry the error of
+        # an earlier, unconverged iterate.
+        slack = 1e-12 * (1.0 + jnp.abs(loss_sg))
 
-        (final_alpha, line_search_improved, final_loss), _ = jax.lax.scan(
+        def _not_accepted(
+            alpha_carry: tuple[Array, Array, Array, Array],
+        ) -> Array:
+            n_tried, _, improved, _ = alpha_carry
+            return ~improved & (n_tried < _LINE_SEARCH_MAX_BACKTRACKS)
+
+        def _backtrack(
+            alpha_carry: tuple[Array, Array, Array, Array],
+        ) -> tuple[Array, Array, Array, Array]:
+            n_tried, alpha, _, _ = alpha_carry
+            new_loss = jax.lax.stop_gradient(neg_log_posterior(x_sg + alpha * delta_sg))
+            improved = new_loss <= loss_sg - _ARMIJO_C * alpha * slope_sg + slack
+            new_alpha = jnp.where(improved, alpha, alpha * line_search_beta)
+            return n_tried + 1, new_alpha, improved, new_loss
+
+        _, final_alpha, line_search_improved, final_loss = jax.lax.while_loop(
+            _not_accepted,
             _backtrack,
-            (jnp.ones((), dtype=x.dtype), jnp.array(False), current_loss),
-            None,
-            length=_LINE_SEARCH_MAX_BACKTRACKS,
+            (
+                jnp.zeros((), dtype=jnp.int32),
+                jnp.ones((), dtype=x.dtype),
+                jnp.array(False),
+                loss_sg,
+            ),
         )
         candidate_x = x + final_alpha * delta
 
         # Reject uphill / insufficient steps: reuse the improved flag from
-        # the backtracking scan rather than re-evaluating neg_log_posterior.
+        # the backtracking loop rather than re-evaluating neg_log_posterior.
         # If improved is False, no step size qualified -- keep current x and
         # count the failure unless the step was already negligible (a
         # converged point legitimately exhausts the backtracking).
@@ -1697,8 +1727,8 @@ def stochastic_point_process_filter(
     negative semidefinite, so no damping or trust-region safeguarding is
     needed for PSD of the covariance update.
 
-    With ``max_newton_iter > 1`` each iteration is gated by a fixed-length
-    Armijo backtracking scan (:func:`_fisher_scoring_line_search`); when more
+    With ``max_newton_iter > 1`` each iteration is gated by an Armijo
+    backtracking line search (:func:`_fisher_scoring_line_search`); when more
     than 10% of the bins exhaust it, one warning is logged per call.
     ``max_newton_iter == 1`` is a single Fisher step without line search. For a true Newton
     step with observed Hessian + Armijo line search, see

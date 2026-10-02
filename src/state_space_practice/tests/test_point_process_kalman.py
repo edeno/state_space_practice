@@ -5178,6 +5178,76 @@ class TestArmijoLineSearch:
         )
         assert int(n_failed) == 0
 
+    @staticmethod
+    def _count_objective_evaluations(precision_scale: float) -> int:
+        """Run three jitted line-searched iterations and count (host side)
+        how many times the objective is evaluated."""
+        step, f = TestArmijoLineSearch._quadratic(precision_scale)
+        n_calls = []
+
+        def counted_f(x):
+            jax.debug.callback(lambda: n_calls.append(1))
+            return f(x)
+
+        run = jax.jit(
+            lambda x0: _fisher_scoring_line_search(
+                x0, jnp.eye(2), step, counted_f, max_newton_iter=3, line_search_beta=0.5
+            )
+        )
+        jax.block_until_ready(run(jnp.array([1.0, -2.0])))
+        jax.effects_barrier()
+        return len(n_calls)
+
+    def test_search_stops_at_the_first_accepted_step(self) -> None:
+        """An accepted full step costs one objective evaluation, not the
+        whole backtracking budget: 1 (initial point) + 1 per iteration."""
+        assert self._count_objective_evaluations(1.0) == 1 + 3
+
+    def test_backtracking_evaluates_only_until_acceptance(self) -> None:
+        """With a 2x curvature underestimate the full step fails Armijo and
+        the halved step is accepted (2 evaluations); the later iterations
+        start ~1e-4 from the minimum, where the round-off slack admits the
+        full step (1 evaluation each). A fixed-length search would evaluate
+        all 10 trial step sizes in every iteration."""
+        assert self._count_objective_evaluations(0.50005) == 1 + 2 + 1 + 1
+
+    def test_reverse_mode_gradient_through_backtracking(self) -> None:
+        """Reverse-mode AD runs through the early-exit search (fit_sgd
+        differentiates the filters) and matches central finite differences
+        on a problem whose full Fisher steps are backtracked, under jit and
+        vmap alike."""
+        cov = 100.0 * jnp.eye(2)
+        spikes = jnp.array([40.0, 0.0, 55.0])
+        design = jnp.array([[1.0, 0.5], [-0.3, 1.0], [0.8, -0.6]])
+
+        def posterior_summary(scale):
+            def log_rate(x):
+                return scale * (design @ x)
+
+            mean, post_cov, ll = _point_process_laplace_update(
+                jnp.zeros(2), cov, spikes, 0.1, log_rate, max_newton_iter=4
+            )
+            return jnp.sum(mean) + jnp.trace(post_cov) + 1e-3 * ll
+
+        # guard: this problem actually backtracks (a single trial step size
+        # changes the result)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(point_process_kalman, "_LINE_SEARCH_MAX_BACKTRACKS", 1)
+            one_trial = posterior_summary(1.0)
+        assert not np.isclose(float(one_trial), float(posterior_summary(1.0)))
+
+        grad = jax.jit(jax.grad(posterior_summary))
+        scales = jnp.array([0.9, 1.0, 1.1])
+        h = 1e-6
+        for scale in scales:
+            fd = (posterior_summary(scale + h) - posterior_summary(scale - h)) / (2 * h)
+            np.testing.assert_allclose(float(grad(scale)), float(fd), rtol=1e-5)
+        np.testing.assert_allclose(
+            np.asarray(jax.vmap(grad)(scales)),
+            np.asarray([grad(s) for s in scales]),
+            rtol=1e-12,
+        )
+
     def test_filter_logs_when_many_bins_fail(self, caplog) -> None:
         """A log-intensity whose derivative has the wrong sign makes every
         bin's line search fail; the public filter logs one warning."""

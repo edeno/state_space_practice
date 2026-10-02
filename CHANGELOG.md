@@ -195,6 +195,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`MultinomialChoiceModel`, `CovariateChoiceModel`, `SwitchingChoiceModel`).
 - **`PlaceFieldModel.predict_rate_map` uses an optimized einsum** (large
   speedups at moderate grid sizes).
+- **The point-process Fisher-scoring line search stops at the first accepted
+  step size** (a `lax.while_loop`) instead of always evaluating all 10 trial
+  step sizes, so an accepted full step costs one objective evaluation instead
+  of ten. Results and reverse-mode gradients are bit-identical; on typical
+  data the dense `stochastic_point_process_filter` and the switching
+  point-process filter run about 40% faster and the block-diagonal path
+  about 20% faster.
 - **Eager `utils.debug_print_if` calls no longer compile a `jit(cond)` each
   time.**
 - **The DIM / DIM-PP standard-EM projection helpers are jitted**:
