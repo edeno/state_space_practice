@@ -211,7 +211,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   of ten. Results and reverse-mode gradients are bit-identical; on typical
   data the dense `stochastic_point_process_filter` and the switching
   point-process filter run about 40% faster and the block-diagonal path
-  about 20% faster.
+  10-25% faster.
+- **The Laplace updates reuse the last Fisher step's posterior-precision
+  Cholesky factor** (`_point_process_laplace_update`, `glm_laplace_update`)
+  instead of factoring the same matrix again after the line search.
+  Bit-identical results; roughly another 10-20% off the dense and
+  block-diagonal filters and their gradients.
 - **Eager `utils.debug_print_if` calls no longer compile a `jit(cond)` each
   time.**
 - **The DIM / DIM-PP standard-EM projection helpers are jitted**:

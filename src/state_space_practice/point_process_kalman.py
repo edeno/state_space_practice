@@ -807,7 +807,7 @@ _LINE_SEARCH_FAIL_WARN_FRAC = 0.1
 
 def _fisher_scoring_line_search(
     x0: Array,
-    prior_precision: Array,
+    prior_factor: Array,
     fisher_step_at: Callable[[Array], tuple[Array, Array, Array]],
     neg_log_posterior: Callable[[Array], Array],
     max_newton_iter: int,
@@ -817,10 +817,13 @@ def _fisher_scoring_line_search(
 
     Shared by :func:`_point_process_laplace_update` and
     :func:`glm_laplace_update`. ``fisher_step_at(x)`` returns
-    ``(delta, post_prec, gradient)`` -- the Fisher direction
-    ``delta = post_prec^{-1} gradient`` and posterior precision at ``x``, with
-    ``gradient`` the gradient of the log-posterior -- and
-    ``neg_log_posterior(x)`` the objective ``f`` the line search decreases.
+    ``(delta, post_factor, gradient)`` -- the Fisher direction
+    ``delta = post_prec^{-1} gradient`` and the Cholesky factor (as returned
+    by :func:`~state_space_practice.utils.psd_cholesky`) of the posterior
+    precision ``post_prec`` at ``x``, with ``gradient`` the gradient of the
+    log-posterior -- and ``neg_log_posterior(x)`` the objective ``f`` the
+    line search decreases. The factor is only carried and returned, so the
+    callers reuse the factorization the last Fisher step already did.
 
     The trial step sizes are ``alpha = 1, beta, ..., beta^(N-1)`` with
     ``N = _LINE_SEARCH_MAX_BACKTRACKS``; the largest is accepted that
@@ -838,20 +841,20 @@ def _fisher_scoring_line_search(
     constant power of ``beta``).
 
     With ``max_newton_iter == 0`` no measurement update is made: the prior
-    ``(x0, prior_precision)`` is returned unchanged.
+    ``(x0, prior_factor)`` is returned unchanged.
 
-    The scan carries ``(x, delta, post_prec, loss, slope, n_failed)``, i.e.
+    The scan carries ``(x, delta, post_factor, loss, slope, n_failed)``, i.e.
     the Fisher step, the objective and the directional derivative *at the
     current point*. They are computed exactly once, when a point is accepted,
     and reused as the next iteration's search direction and references; the
-    precision at the last accepted point is the returned posterior precision.
+    factor at the last accepted point is the returned posterior factor.
 
     Returns
     -------
     x : Array
         The accepted point after ``max_newton_iter`` iterations.
-    post_prec : Array
-        The Fisher posterior precision evaluated at ``x``.
+    post_factor : Array
+        Cholesky factor of the Fisher posterior precision evaluated at ``x``.
     n_failed : Array
         Number of iterations (int32 scalar) whose backtracking was exhausted
         although the Fisher step predicted a decrease above roundoff
@@ -929,29 +932,29 @@ def _fisher_scoring_line_search(
             0.5 * slope > eps_sqrt * (1.0 + jnp.abs(current_loss))
         )
 
-        # Fisher step at the accepted point: its precision is the posterior
-        # precision if this was the last iteration, and its direction is the
-        # next iteration's step.
-        new_delta, new_post_prec, new_gradient = fisher_step_at(new_x)
+        # Fisher step at the accepted point: its precision factor is the
+        # posterior factor if this was the last iteration, and its direction
+        # is the next iteration's step.
+        new_delta, new_post_factor, new_gradient = fisher_step_at(new_x)
         new_slope = new_gradient @ new_delta
         return (
             new_x,
             new_delta,
-            new_post_prec,
+            new_post_factor,
             new_loss,
             new_slope,
             n_failed + exhausted.astype(jnp.int32),
         ), None
 
     if max_newton_iter == 0:
-        return x0, prior_precision, jnp.zeros((), dtype=jnp.int32)
-    delta0, post_prec0, gradient0 = fisher_step_at(x0)
-    (x, _, post_prec, _, _, n_failed), _ = jax.lax.scan(
+        return x0, prior_factor, jnp.zeros((), dtype=jnp.int32)
+    delta0, post_factor0, gradient0 = fisher_step_at(x0)
+    (x, _, post_factor, _, _, n_failed), _ = jax.lax.scan(
         _line_search_step,
         (
             x0,
             delta0,
-            post_prec0,
+            post_factor0,
             neg_log_posterior(x0),
             gradient0 @ delta0,
             jnp.zeros((), dtype=jnp.int32),
@@ -959,7 +962,7 @@ def _fisher_scoring_line_search(
         None,
         length=max_newton_iter,
     )
-    return x, post_prec, n_failed
+    return x, post_factor, n_failed
 
 
 def _log_line_search_failures(
@@ -1295,9 +1298,11 @@ def _point_process_laplace_update(
         fisher_info = jacobian.T @ (conditional_intensity[:, None] * jacobian)
         post_prec = symmetrize(prior_precision + fisher_info)
 
-        # Fisher-scoring direction
-        delta = psd_solve(post_prec, gradient, diagonal_boost=diagonal_boost)
-        return delta, post_prec, gradient
+        # Fisher-scoring direction. The factor is returned too: at the last
+        # iterate it is the posterior factor, so it is not refactored below.
+        post_cho = psd_cholesky(post_prec, diagonal_boost=diagonal_boost)
+        delta = jax.scipy.linalg.cho_solve(post_cho, gradient[:, None])[:, 0]
+        return delta, post_cho[0], gradient
 
     if max_newton_iter == 1:
         # Single-step Fisher scoring (no line search overhead).
@@ -1319,18 +1324,20 @@ def _point_process_laplace_update(
         n_line_search_failures = jnp.zeros((), dtype=jnp.int32)
     else:
         # Iterative Fisher scoring with line search, started at the prior mean
-        # (zero iterations return the prior unchanged).
-        posterior_mean, posterior_precision, n_line_search_failures = (
+        # (zero iterations return the prior unchanged). It returns the
+        # posterior-precision factor of the last Fisher step; the factor and
+        # lower flag follow psd_cholesky's convention, as prior_cho does.
+        posterior_mean, posterior_factor, n_line_search_failures = (
             _fisher_scoring_line_search(
                 one_step_mean,
-                prior_precision,
+                psd_cholesky(prior_precision, diagonal_boost=diagonal_boost)[0],
                 _fisher_step_at,
                 _neg_log_posterior,
                 max_newton_iter,
                 line_search_beta,
             )
         )
-        post_cho = psd_cholesky(posterior_precision, diagonal_boost=diagonal_boost)
+        post_cho = (posterior_factor, prior_cho[1])
 
     # Posterior covariance from the same factor. No post-hoc stabilization
     # needed because posterior_precision is PSD by construction (sum of two
@@ -1572,8 +1579,10 @@ def glm_laplace_update(
         weight = family.fisher_weight(eta, mu)
         fisher_info = jacobian.T @ (weight[:, None] * jacobian)
         post_prec = symmetrize(prior_precision + fisher_info)
-        delta = psd_solve(post_prec, gradient, diagonal_boost=diagonal_boost)
-        return delta, post_prec, gradient
+        # Return the factor too (see _point_process_laplace_update).
+        post_cho = psd_cholesky(post_prec, diagonal_boost=diagonal_boost)
+        delta = jax.scipy.linalg.cho_solve(post_cho, gradient[:, None])[:, 0]
+        return delta, post_cho[0], gradient
 
     if max_newton_iter == 1:
         # Single Fisher step from the prior mean (prior gradient is zero there).
@@ -1591,17 +1600,17 @@ def glm_laplace_update(
         posterior_mean = one_step_mean + jax.scipy.linalg.cho_solve(post_cho, gradient)
         n_line_search_failures = jnp.zeros((), dtype=jnp.int32)
     else:
-        posterior_mean, posterior_precision, n_line_search_failures = (
+        posterior_mean, posterior_factor, n_line_search_failures = (
             _fisher_scoring_line_search(
                 one_step_mean,
-                prior_precision,
+                psd_cholesky(prior_precision, diagonal_boost=diagonal_boost)[0],
                 _fisher_step_at,
                 _neg_log_posterior,
                 max_newton_iter,
                 line_search_beta,
             )
         )
-        post_cho = psd_cholesky(posterior_precision, diagonal_boost=diagonal_boost)
+        post_cho = (posterior_factor, prior_cho[1])
 
     posterior_cov = symmetrize(jax.scipy.linalg.cho_solve(post_cho, identity))
 
