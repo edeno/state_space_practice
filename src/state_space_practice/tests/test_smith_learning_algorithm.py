@@ -142,6 +142,59 @@ class TestLogPosteriorObjective:
 
         assert lp_close > lp_far
 
+    @pytest.mark.parametrize(
+        "state, n_correct, max_correct",
+        [(40.0, 2, 3), (60.0, 0, 1), (-800.0, 1, 1), (-800.0, 4, 5)],
+    )
+    def test_finite_when_link_saturates(self, state, n_correct, max_correct) -> None:
+        """Far on the saturated side of the logistic opposite an observation
+        (sigmoid(mu + x) rounds to 1 with an error, or to 0 with a success),
+        the log posterior and its gradient and Hessian stay finite and exact."""
+        from scipy.special import gammaln
+
+        def objective(x):
+            return _log_posterior_objective(
+                x, 0.0, 1.0, n_correct, max_correct, bias=0.4
+            )
+
+        x = jnp.array([state])
+        eta = 0.4 + state
+        # log_sigmoid(t) = -log1p(exp(-t)), exact for these magnitudes
+        expected_loglik = (
+            gammaln(max_correct + 1)
+            - gammaln(n_correct + 1)
+            - gammaln(max_correct - n_correct + 1)
+            - n_correct * np.logaddexp(0.0, -eta)
+            - (max_correct - n_correct) * np.logaddexp(0.0, eta)
+        )
+        expected = expected_loglik - 0.5 * state**2 - 0.5 * np.log(2 * np.pi)
+        np.testing.assert_allclose(objective(x), expected, rtol=1e-12)
+        grad = jax.grad(objective)(x)
+        hess = jax.hessian(objective)(x)
+        assert np.all(np.isfinite(grad)) and np.all(np.isfinite(hess))
+        # d/dx: y - n sigmoid(eta) - x, saturated: y - n [state > 0] - x
+        np.testing.assert_allclose(
+            grad[0], n_correct - max_correct * (state > 0) - state, rtol=1e-10
+        )
+
+    def test_matches_binomial_logpmf(self) -> None:
+        """Equals log Binomial(y; n, sigmoid(mu + x)) + log N(x; x_prev, v)
+        across the non-saturated range."""
+        from scipy.special import expit
+        from scipy.stats import binom, norm
+
+        xs = np.linspace(-8.0, 8.0, 33)
+        for n_correct, max_correct, bias in [(0, 1, 0.0), (1, 1, -1.1), (3, 7, 0.7)]:
+            values = jax.vmap(
+                lambda x, y=n_correct, n=max_correct, b=bias: _log_posterior_objective(
+                    x[None], 0.3, 0.8, y, n, b
+                )
+            )(jnp.asarray(xs))
+            expected = binom.logpmf(
+                n_correct, max_correct, expit(bias + xs)
+            ) + norm.logpdf(xs, 0.3, np.sqrt(0.8))
+            np.testing.assert_allclose(values, expected, rtol=1e-12)
+
 
 class TestSmithLearningFilter:
     """Tests for the smith_learning_filter function.

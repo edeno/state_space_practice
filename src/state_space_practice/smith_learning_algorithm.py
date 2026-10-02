@@ -306,15 +306,46 @@ def _log_posterior_objective(
     log_posterior : Array, shape ()
         Scalar log posterior of the state estimate
     """
-    prob_success = jax.nn.sigmoid(bias + learning_state)
-    log_likelihood = jax.scipy.stats.binom.logpmf(
-        k=n_correct_in_trial, n=max_possible_correct, p=prob_success
+    log_likelihood = _binomial_logit_logpmf(
+        n_correct_in_trial, max_possible_correct, jnp.asarray(bias) + learning_state
     )
     log_prior = jax.scipy.stats.norm.logpdf(
         x=learning_state, loc=learning_state_prev, scale=jnp.sqrt(variance_prev)
     )
 
     return jnp.squeeze(log_likelihood + log_prior)
+
+
+def _binomial_logit_logpmf(
+    n_correct: ArrayLike, n_attempts: ArrayLike, logit: ArrayLike
+) -> Array:
+    """``log Binomial(n_correct; n_attempts, sigmoid(logit))``, elementwise.
+
+    Written with ``log_sigmoid`` rather than ``log(sigmoid(.))``: it stays
+    finite (with finite derivatives) where ``sigmoid(logit)`` rounds to 0 or
+    1, e.g. an error trial at ``logit >~ 37``.
+
+    Parameters
+    ----------
+    n_correct, n_attempts, logit : ArrayLike, broadcastable shapes
+
+    Returns
+    -------
+    Array, the broadcast shape
+    """
+    y = jnp.asarray(n_correct)
+    n = jnp.asarray(n_attempts)
+    eta = jnp.asarray(logit)
+    log_binom_coef = (
+        jax.scipy.special.gammaln(n + 1.0)
+        - jax.scipy.special.gammaln(y + 1.0)
+        - jax.scipy.special.gammaln(n - y + 1.0)
+    )
+    return (
+        log_binom_coef
+        + y * jax.nn.log_sigmoid(eta)
+        + (n - y) * jax.nn.log_sigmoid(-eta)
+    )
 
 
 def smith_laplace_log_likelihood(
@@ -367,19 +398,9 @@ def smith_laplace_log_likelihood(
     -------
     log_likelihood_terms : Array, shape (n_trials,)
     """
-    y = jnp.asarray(n_correct_responses)
-    n = jnp.asarray(max_possible_correct)
     mode = jnp.asarray(filtered_mode)
-    eta = mu + mode
-    log_binom_coef = (
-        jax.scipy.special.gammaln(n + 1.0)
-        - jax.scipy.special.gammaln(y + 1.0)
-        - jax.scipy.special.gammaln(n - y + 1.0)
-    )
-    log_lik_at_mode = (
-        log_binom_coef
-        + y * jax.nn.log_sigmoid(eta)
-        + (n - y) * jax.nn.log_sigmoid(-eta)
+    log_lik_at_mode = _binomial_logit_logpmf(
+        n_correct_responses, max_possible_correct, mu + mode
     )
     pred_var = jnp.asarray(one_step_variance)
     return (

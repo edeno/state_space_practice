@@ -492,6 +492,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   forcing a retrace. The parameters are now built with an explicit dtype,
   so the step is traced once (first `fit_sgd` on 100 trials 2.4-2.5 s ->
   1.5-1.6 s); fitted values are bit-identical.
+- **Smith filter log posterior no longer saturates to `-inf`**: the
+  per-trial objective used `binom.logpmf(p=sigmoid(mu + x))`, which is
+  `-inf` with NaN gradient and Hessian once `sigmoid` rounds to 1 on a trial
+  with an error (`mu + x >~ 37`) or to 0 on a trial with a success. It now
+  uses the `log_sigmoid` form shared with `smith_laplace_log_likelihood`
+  (mathematically identical). In the normal range values change by at most
+  1.5e-11 relative (the old form's rounding of `1 - sigmoid` near
+  `|mu + x| = 16`; the new form is within 4e-16 of an exact reference);
+  filter outputs and EM fits move by <= 1.4e-14.
 - **A failed fit no longer leaves stale or non-finite results that look
   fitted**: when a fit raises `NonFiniteLikelihoodError` (its starting
   parameters give a non-finite log-likelihood), it first clears every fit
