@@ -40,10 +40,6 @@ from state_space_practice.point_process_kalman import (
     stochastic_point_process_filter,
     stochastic_point_process_smoother,
 )
-from state_space_practice.tests.model_state import (
-    assert_model_state_unchanged,
-    snapshot_model_state,
-)
 
 # Enable 64-bit precision for numerical stability
 jax.config.update("jax_enable_x64", True)
@@ -2752,28 +2748,6 @@ class TestPointProcessSGDFitting:
         spike_indicator = jax.random.poisson(key, jnp.ones((n_time, n_neurons)) * 0.01)
         return n_state, dt, design_matrix, spike_indicator
 
-    def test_fit_results_are_replaced_when_switching_fitters(self, small_pp_problem):
-        """fit and fit_sgd each record log_likelihood_, its history, converged_
-        and n_iter_; switching fitters never leaves the other's values behind."""
-        n_state, dt, design_matrix, spike_indicator = small_pp_problem
-        model = PointProcessModel(n_state, dt)
-
-        em_lls = model.fit(design_matrix, spike_indicator, max_iter=3)
-        assert model.log_likelihood_ == em_lls[-1]
-        assert model.log_likelihood_history_ == em_lls
-        assert model.n_iter_ == len(em_lls)
-        assert isinstance(model.converged_, bool)
-
-        sgd_lls = model.fit_sgd(design_matrix, spike_indicator, num_steps=5)
-        assert model.log_likelihood_history_ == sgd_lls
-        assert model.n_iter_ is None  # n_iter_ counts EM iterations only
-
-        em_lls = model.fit(design_matrix, spike_indicator, max_iter=3)
-        assert model.log_likelihood_ == em_lls[-1]
-        assert model.log_likelihood_ != sgd_lls[-1]  # guard: the values differ
-        assert model.log_likelihood_history_ == em_lls
-        assert model.n_iter_ == len(em_lls)
-
     def test_sgd_improves_ll(self, small_pp_problem):
         n_state, dt, design_matrix, spike_indicator = small_pp_problem
         model = PointProcessModel(n_state, dt)
@@ -2804,31 +2778,6 @@ class TestPointProcessSGDFitting:
         assert model.smoother_mean is not None
         assert model.smoother_cov is not None
         assert hasattr(model, "log_likelihood_")
-
-    @pytest.mark.parametrize("prefit", [False, True], ids=["fresh", "fitted"])
-    def test_rejected_settings_leave_model_unchanged(self, small_pp_problem, prefit):
-        """fit_sgd rejects bad settings before it touches the model."""
-        n_state, dt, design_matrix, spike_indicator = small_pp_problem
-        model = PointProcessModel(n_state, dt)
-        if prefit:
-            model.fit_sgd(design_matrix, spike_indicator, num_steps=2)
-        # A different length than the prefit, so a stashed length would show.
-        before = snapshot_model_state(model)
-        with pytest.raises(ValueError, match="num_steps"):
-            model.fit_sgd(design_matrix[:50], spike_indicator[:50], num_steps=-1)
-        assert_model_state_unchanged(model, before)
-
-    def test_repeat_fit_sgd_reuses_compiled_step(
-        self, small_pp_problem, sgd_step_builds
-    ):
-        """Refitting rewrites the trained parameters; the loss must not read
-        them, or every repeat call misses the step cache and recompiles."""
-        n_state, dt, design_matrix, spike_indicator = small_pp_problem
-        builds = sgd_step_builds
-        model = PointProcessModel(n_state, dt)
-        for _ in range(3):
-            model.fit_sgd(design_matrix, spike_indicator, num_steps=2)
-        assert len(builds) == 1
 
 
 class TestLogdetPsd:

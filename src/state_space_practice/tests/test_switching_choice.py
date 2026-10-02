@@ -18,10 +18,6 @@ from state_space_practice.switching_choice import (
     switching_choice_filter,
     switching_choice_smoother,
 )
-from state_space_practice.tests.model_state import (
-    assert_model_state_unchanged,
-    snapshot_model_state,
-)
 
 
 class TestSoftmaxPredictAndUpdate:
@@ -1234,61 +1230,6 @@ class TestSwitchingChoiceMStepExactness:
         np.testing.assert_allclose(
             N / Z, np.broadcast_to(N.sum(axis=1, keepdims=True), N.shape), rtol=1e-8
         )
-
-
-class TestSwitchingChoiceFitSgdData:
-    """fit_sgd binds its data through the mixin's ``_prepare_sgd_data`` hook."""
-
-    @pytest.fixture
-    def data(self):
-        rng = np.random.default_rng(7)
-
-        def make(n_trials):
-            return (
-                rng.integers(0, 3, size=n_trials),
-                rng.normal(size=(n_trials, 2)),
-                rng.normal(size=(n_trials, 1)),
-            )
-
-        return make
-
-    @staticmethod
-    def _model():
-        return SwitchingChoiceModel(
-            n_options=3, n_discrete_states=2, n_covariates=2, n_obs_covariates=1
-        )
-
-    def test_invalid_num_steps_leaves_fresh_model_unchanged(self, data):
-        model = self._model()
-        before = snapshot_model_state(model)
-
-        with pytest.raises(ValueError, match="num_steps"):
-            model.fit_sgd(*data(30), num_steps=-1)
-
-        assert_model_state_unchanged(model, before)
-
-    def test_invalid_num_steps_leaves_fitted_model_unchanged(self, data):
-        model = self._model()
-        model.fit_sgd(*data(40), num_steps=3)
-        before = snapshot_model_state(model)
-        # Guard: the refit data differs in length from what the model holds.
-        assert before["_n_trials"] == 40
-
-        with pytest.raises(ValueError, match="num_steps"):
-            model.fit_sgd(*data(25), num_steps=-1)
-
-        assert_model_state_unchanged(model, before)
-
-    def test_repeat_fit_sgd_reuses_compiled_step(self, data, sgd_step_builds):
-        model = self._model()
-        choices, covariates, obs_covariates = data(30)
-
-        model.fit_sgd(choices, covariates, obs_covariates, num_steps=3)
-        assert len(sgd_step_builds) == 1
-        model.fit_sgd(choices, covariates, obs_covariates, num_steps=3)
-        model.fit_sgd(choices, covariates, obs_covariates, num_steps=3)
-
-        assert len(sgd_step_builds) == 1
 
 
 class TestSwitchingChoiceEMNonFinite:

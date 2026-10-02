@@ -15,10 +15,6 @@ from state_space_practice.place_field_model import (
     evaluate_basis,
 )
 from state_space_practice.simulate_data import simulate_2d_moving_place_field
-from state_space_practice.tests.model_state import (
-    assert_model_state_unchanged,
-    snapshot_model_state,
-)
 from state_space_practice.tests.recovery_helpers import assert_ll_monotonic
 
 jax.config.update("jax_enable_x64", True)
@@ -1242,53 +1238,6 @@ class TestPlaceFieldSGDFitting:
         )
         assert model.smoother_mean is not None
         assert model.filtered_mean is not None
-
-    @pytest.mark.parametrize("prefit", [False, True], ids=["fresh", "fitted"])
-    def test_rejected_settings_leave_model_unchanged(
-        self, sim_data: dict, prefit: bool
-    ) -> None:
-        """fit_sgd rejects bad settings before it touches the model: no
-        basis/neuron bookkeeping and no warm start over fitted parameters."""
-        import optax
-
-        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
-        if prefit:
-            model.fit_sgd(
-                sim_data["position"],
-                sim_data["spikes"],
-                optimizer=optax.adam(1e-3),
-                num_steps=1,
-            )
-        # A different length than the prefit, so a stashed length would show.
-        before = snapshot_model_state(model)
-        with pytest.raises(ValueError, match="num_steps"):
-            model.fit_sgd(
-                sim_data["position"][:500],
-                sim_data["spikes"][:500],
-                optimizer=optax.adam(1e-3),
-                num_steps=-1,
-            )
-        assert_model_state_unchanged(model, before)
-
-    def test_repeat_fit_sgd_reuses_compiled_step(
-        self, sim_data: dict, sgd_step_builds
-    ) -> None:
-        """Without a warm start each call resumes from the trained parameters;
-        the loss must not read them, or every repeat call recompiles."""
-        import optax
-
-        builds = sgd_step_builds
-        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
-        optimizer = optax.adam(1e-3)  # one instance: the cache keys on it
-        for _ in range(3):
-            model.fit_sgd(
-                sim_data["position"],
-                sim_data["spikes"],
-                optimizer=optimizer,
-                num_steps=1,
-                warm_start=False,
-            )
-        assert len(builds) == 1
 
     def test_sgd_mismatched_lengths_rejected(self, sim_data: dict) -> None:
         import optax

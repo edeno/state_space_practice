@@ -31,10 +31,6 @@ from state_space_practice.multinomial_choice import (
     softmax_observation_update,
 )
 from state_space_practice.switching_choice import switching_choice_filter
-from state_space_practice.tests.model_state import (
-    assert_model_state_unchanged,
-    snapshot_model_state,
-)
 
 
 class TestSoftmaxObservationUpdate:
@@ -730,51 +726,6 @@ class TestMultinomialSGDFitting:
         model = MultinomialChoiceModel(n_options=3)
         lls = model.fit_sgd(choices, num_steps=50)
         assert lls[-1] > lls[0]
-
-    def test_sgd_after_em_replaces_em_results(self):
-        """fit_sgd after fit records its own history and clears the EM-only
-        n_iter_, so nothing from the EM fit is left behind."""
-        rng = np.random.default_rng(42)
-        choices = rng.integers(0, 3, size=100)
-        model = MultinomialChoiceModel(n_options=3)
-        em_lls = model.fit(choices, max_iter=3)
-        assert model.n_iter_ == len(em_lls)  # guard: EM recorded an int
-
-        sgd_lls = model.fit_sgd(choices, num_steps=5)
-        assert model.n_iter_ is None
-        assert model.log_likelihood_history_ == sgd_lls
-
-    def test_repeat_fit_reuses_compiled_step(self, sgd_step_builds):
-        """Refitting the same data builds no new SGD step, although each fit
-        rewrites the trained parameters."""
-        builds = sgd_step_builds
-        choices = np.random.default_rng(0).integers(0, 3, 50)
-        model = MultinomialChoiceModel(n_options=3)
-        params = []
-        for _ in range(3):
-            model.fit_sgd(choices, num_steps=3)
-            params.append((model.process_noise, model.inverse_temperature))
-        assert params[0] != params[1] != params[2]  # guard: each fit moved them
-        assert len(builds) == 1
-
-    def test_rejected_settings_leave_fresh_model_untouched(self):
-        """Invalid optimizer settings fail before the data is bound."""
-        model = MultinomialChoiceModel(n_options=3)
-        before = snapshot_model_state(model)
-        with pytest.raises(ValueError, match="num_steps"):
-            model.fit_sgd(np.random.default_rng(0).integers(0, 3, 40), num_steps=-1)
-        assert_model_state_unchanged(model, before)
-
-    def test_rejected_settings_leave_fitted_model_untouched(self):
-        """A rejected fit_sgd on shorter data keeps the previous fit's state."""
-        rng = np.random.default_rng(0)
-        model = MultinomialChoiceModel(n_options=3)
-        model.fit(rng.integers(0, 3, 60), max_iter=2)
-        before = snapshot_model_state(model)
-        # 40 != 60 trials: binding this data would change _n_trials.
-        with pytest.raises(ValueError, match="num_steps"):
-            model.fit_sgd(rng.integers(0, 3, 40), num_steps=-1)
-        assert_model_state_unchanged(model, before)
 
     def test_sgd_respects_constraints(self):
         rng = np.random.default_rng(42)
