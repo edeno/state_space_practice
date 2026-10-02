@@ -36,6 +36,7 @@ from state_space_practice.utils import (  # noqa: F401 — re-exported for backw
     stabilize_covariance,
     symmetrize,
     typed_jit,
+    validate_finite_array,
     warn_if_not_positive_definite_in_graph,
 )
 
@@ -179,8 +180,7 @@ def woodbury_kalman_gain(
             ("emission_matrix", emission_matrix),
             ("emission_cov_diag", emission_cov_diag),
         ):
-            if not bool(jnp.all(jnp.isfinite(arr))):
-                raise ValueError(f"{name} must contain only finite values.")
+            validate_finite_array(name, arr)
         if not bool(jnp.all(emission_cov_diag > 0.0)):
             raise ValueError("emission_cov_diag entries must be positive.")
 
@@ -276,7 +276,7 @@ def joseph_form_update(
     )
 
 
-def _validate_kalman_public_inputs(
+def _prepare_kalman_inputs(
     init_mean: ArrayLike,
     init_cov: ArrayLike,
     obs: ArrayLike,
@@ -285,17 +285,33 @@ def _validate_kalman_public_inputs(
     measurement_matrix: ArrayLike,
     measurement_cov: ArrayLike,
     *,
+    validate: bool,
     filter_name: str,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Validation for public linear-Gaussian APIs.
+    """Convert public linear-Gaussian inputs to arrays, optionally validating.
 
-    Shape checks always run. Value checks (finiteness, symmetry, positive
-    definiteness, the float32 risk warning) run host-side on concrete inputs,
-    including concrete constants closed over by a jitted caller. When any
-    input is a JAX tracer they are skipped, and a non-positive-definite
+    With ``validate=False`` the inputs are only converted with ``jnp.asarray``.
+    Otherwise shape checks always run. Value checks (finiteness, symmetry,
+    positive definiteness, the float32 risk warning) run host-side on concrete
+    inputs, including concrete constants closed over by a jitted caller. When
+    any input is a JAX tracer they are skipped, and a non-positive-definite
     ``init_cov`` is reported at run time as a ``StateSpaceWarning`` (see
     :func:`~state_space_practice.utils.warn_if_not_positive_definite_in_graph`).
+
+    Must be called directly from the public entry point: the float32 risk
+    warning uses a fixed ``stacklevel`` that points at that function's caller.
     """
+    if not validate:
+        return (
+            jnp.asarray(init_mean),
+            jnp.asarray(init_cov),
+            jnp.asarray(obs),
+            jnp.asarray(transition_matrix),
+            jnp.asarray(process_cov),
+            jnp.asarray(measurement_matrix),
+            jnp.asarray(measurement_cov),
+        )
+
     # Under an active trace, jnp.asarray on a concrete (numpy) constant would
     # stage it; converting under ensure_compile_time_eval keeps it concrete.
     with jax.ensure_compile_time_eval():
@@ -383,8 +399,7 @@ def _validate_kalman_public_inputs(
             ("measurement_matrix", measurement_matrix),
             ("measurement_cov", measurement_cov),
         ):
-            if not bool(jnp.all(jnp.isfinite(arr))):
-                raise ValueError(f"{name} must contain only finite values.")
+            validate_finite_array(name, arr)
 
         if measurement_cov_is_time_varying:
             if not bool(
@@ -696,34 +711,25 @@ def kalman_filter(
         If ``validate_inputs=True``, ``init_cov`` is traced, and it is not
         positive definite (emitted when the computation runs).
     """
-    if validate_inputs:
-        (
-            init_mean,
-            init_cov,
-            obs,
-            transition_matrix,
-            process_cov,
-            measurement_matrix,
-            measurement_cov,
-        ) = _validate_kalman_public_inputs(
-            init_mean,
-            init_cov,
-            obs,
-            transition_matrix,
-            process_cov,
-            measurement_matrix,
-            measurement_cov,
-            filter_name="kalman_filter",
-        )
-    else:
-        init_mean = jnp.asarray(init_mean)
-        init_cov = jnp.asarray(init_cov)
-        obs = jnp.asarray(obs)
-        transition_matrix = jnp.asarray(transition_matrix)
-        process_cov = jnp.asarray(process_cov)
-        measurement_matrix = jnp.asarray(measurement_matrix)
-        measurement_cov = jnp.asarray(measurement_cov)
-
+    (
+        init_mean,
+        init_cov,
+        obs,
+        transition_matrix,
+        process_cov,
+        measurement_matrix,
+        measurement_cov,
+    ) = _prepare_kalman_inputs(
+        init_mean,
+        init_cov,
+        obs,
+        transition_matrix,
+        process_cov,
+        measurement_matrix,
+        measurement_cov,
+        validate=validate_inputs,
+        filter_name="kalman_filter",
+    )
     return _kalman_filter_impl(
         init_mean,
         init_cov,
@@ -1048,34 +1054,25 @@ def kalman_smoother(
         If ``validate_inputs=True``, ``init_cov`` is traced, and it is not
         positive definite (emitted when the computation runs).
     """
-    if validate_inputs:
-        (
-            init_mean,
-            init_cov,
-            obs,
-            transition_matrix,
-            process_cov,
-            measurement_matrix,
-            measurement_cov,
-        ) = _validate_kalman_public_inputs(
-            init_mean,
-            init_cov,
-            obs,
-            transition_matrix,
-            process_cov,
-            measurement_matrix,
-            measurement_cov,
-            filter_name="kalman_smoother",
-        )
-    else:
-        init_mean = jnp.asarray(init_mean)
-        init_cov = jnp.asarray(init_cov)
-        obs = jnp.asarray(obs)
-        transition_matrix = jnp.asarray(transition_matrix)
-        process_cov = jnp.asarray(process_cov)
-        measurement_matrix = jnp.asarray(measurement_matrix)
-        measurement_cov = jnp.asarray(measurement_cov)
-
+    (
+        init_mean,
+        init_cov,
+        obs,
+        transition_matrix,
+        process_cov,
+        measurement_matrix,
+        measurement_cov,
+    ) = _prepare_kalman_inputs(
+        init_mean,
+        init_cov,
+        obs,
+        transition_matrix,
+        process_cov,
+        measurement_matrix,
+        measurement_cov,
+        validate=validate_inputs,
+        filter_name="kalman_smoother",
+    )
     return _kalman_smoother_impl(
         init_mean,
         init_cov,
@@ -1200,8 +1197,7 @@ def parallel_kalman_smoother(
             ("transition_matrix", transition_matrix),
             ("process_cov", process_cov),
         ):
-            if not bool(jnp.all(jnp.isfinite(arr))):
-                raise ValueError(f"{name} must contain only finite values.")
+            validate_finite_array(name, arr)
 
     # Broadcast time-invariant parameters to (T-1, D, D)
     A = _as_transition_stack("transition_matrix", transition_matrix)

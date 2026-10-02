@@ -22,7 +22,12 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.utils import contains_tracer, validate_int, validate_scalar
+from state_space_practice.utils import (
+    contains_tracer,
+    validate_finite_array,
+    validate_int,
+    validate_scalar,
+)
 
 
 def _validate_eps(eps: float) -> Array:
@@ -48,8 +53,8 @@ def _as_coupling(coupling: ArrayLike) -> Array:
         raise ValueError(
             f"coupling must have square oscillator axes, got {arr.shape[-2:]}."
         )
-    if not contains_tracer(arr) and not bool(jnp.all(jnp.isfinite(arr))):
-        raise ValueError("coupling must contain only finite values.")
+    if not contains_tracer(arr):
+        validate_finite_array("coupling", arr)
     return arr
 
 

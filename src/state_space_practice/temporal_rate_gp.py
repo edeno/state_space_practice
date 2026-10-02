@@ -70,6 +70,7 @@ from state_space_practice.utils import (
     _validate_filter_numerics,
     contains_tracer,
     validate_count_array,
+    validate_finite_array,
     validate_int,
     validate_scalar,
 )
@@ -526,8 +527,7 @@ def _broadcast_hyperparameter(
                     f"{name} must be a scalar or have length n_neurons="
                     f"{n_neurons}; got shape {array.shape}."
                 )
-            if not bool(jnp.all(jnp.isfinite(array))):
-                raise ValueError(f"{name} must contain only finite values.")
+            validate_finite_array(name, array)
             if positive and not bool(jnp.all(array > 0.0)):
                 raise ValueError(f"{name} must be strictly positive.")
         else:

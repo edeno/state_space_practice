@@ -41,6 +41,7 @@ from state_space_practice.utils import (
     stabilize_covariance,
     symmetrize,
     typed_jit,
+    validate_finite_array,
     zero_preserving_log,
 )
 from state_space_practice.utils import divide_safe as _divide_safe
@@ -2557,8 +2558,7 @@ def switching_kalman_maximization_step(
                 f"got {transition_prior.shape}."
             )
         if not contains_tracer(transition_prior):
-            if not bool(jnp.all(jnp.isfinite(transition_prior))):
-                raise ValueError("transition_prior must contain only finite values.")
+            validate_finite_array("transition_prior", transition_prior)
             if not bool(jnp.all(transition_prior >= 1.0)):
                 raise ValueError(
                     "transition_prior entries must be >= 1.0 for this MAP "

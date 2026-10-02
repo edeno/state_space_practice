@@ -35,13 +35,17 @@ the posterior at each step with a Gaussian distribution by finding its mode
 and calculating the curvature (Hessian) at the mode.
 
 The module provides:
-- `approximate_gaussian`: Computes the Laplace approximation.
+- `_approximate_gaussian_newton`: The Laplace approximation used by the
+  filter (fixed line-searched Newton steps; reverse-mode differentiable).
+- `approximate_gaussian`: A general (multi-dimensional) BFGS-based Laplace
+  approximation; not used by the filter and not reverse-mode differentiable.
 - `_log_posterior_objective`: Defines the log-posterior for a single step.
 - `smith_learning_filter`: Implements the forward-pass filter.
 - `smith_learning_smoother`: Implements a backward-pass RTS smoother.
 
-This implementation leverages JAX for automatic differentiation (Hessian),
-optimization (BFGS), and efficient vectorized/scanned operations.
+This implementation leverages JAX for automatic differentiation (gradient and
+Hessian of the log posterior for the Newton mode search) and efficient
+vectorized/scanned operations.
 
 """
 
@@ -263,6 +267,15 @@ def _approximate_gaussian_newton(
     )
 
 
+def _chance_logit(prob_correct_by_chance: float) -> Array:
+    """Observation-model bias ``mu = log(p / (1 - p))`` for chance level ``p``.
+
+    Unlike ``SmithLearningModel._calculate_mu_bias`` this does not clamp
+    ``p`` away from 0 and 1.
+    """
+    return jnp.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
+
+
 def _log_posterior_objective(
     learning_state: ArrayLike,
     learning_state_prev: ArrayLike,
@@ -453,7 +466,7 @@ def smith_learning_filter(
                 max_possible_correct, "max_possible_correct", allow_empty=False
             )
     n_correct_responses = jnp.asarray(n_correct_responses)
-    mu = jnp.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
+    mu = _chance_logit(prob_correct_by_chance)
     sigma_squared_epsilon = jnp.asarray(sigma_epsilon) ** 2
 
     init_var: Array
@@ -668,7 +681,7 @@ def smith_learning_smoother(
         [learning_state_variance, filtered_learning_state_variance[-1:]]
     )
 
-    mu_bias = jnp.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
+    mu_bias = _chance_logit(prob_correct_by_chance)
     prob_correct_response = jax.nn.sigmoid(mu_bias + learning_state_mode)
 
     return (
@@ -1146,6 +1159,64 @@ def compute_cross_covariance_matrix(
     return upper_tri + upper_tri.T - jnp.diag(jnp.diag(upper_tri))
 
 
+def _sample_trial_states(
+    key: Array,
+    mean: Array,
+    cov: Array,
+    n_samples: int,
+    compare_probability: bool,
+    prob_correct_by_chance: float | None,
+) -> Array:
+    """Draw joint Gaussian samples of learning states for trial comparisons.
+
+    Samples ``N(mean, cov)`` through an eigendecomposition of ``cov`` (negative
+    eigenvalues clipped to zero) and, if ``compare_probability``, maps them to
+    probability space with ``sigmoid(mu + x)``.
+
+    Parameters
+    ----------
+    key : Array
+        JAX PRNG key.
+    mean : Array, shape (n_compared,)
+        Smoothed learning-state modes of the compared trials.
+    cov : Array, shape (n_compared, n_compared)
+        Joint posterior covariance of the compared trials.
+    n_samples : int
+        Number of Monte Carlo samples.
+    compare_probability : bool
+        If True, return sigmoid-transformed samples.
+    prob_correct_by_chance : float or None
+        Chance-level probability setting the bias ``mu``; required when
+        ``compare_probability`` is True.
+
+    Returns
+    -------
+    samples : Array, shape (n_samples, n_compared)
+
+    Raises
+    ------
+    ValueError
+        If ``compare_probability`` is True and ``prob_correct_by_chance`` is
+        None.
+    """
+    # Eigendecomposition for numerical stability
+    eigenvalues, eigenvectors = jnp.linalg.eigh(cov)
+    eigenvalues = jnp.maximum(eigenvalues, 0.0)  # Ensure non-negative
+    sqrt_cov = eigenvectors @ jnp.diag(jnp.sqrt(eigenvalues))
+
+    z = jax.random.normal(key, shape=(n_samples, mean.shape[0]))
+    samples: Array = mean + z @ sqrt_cov.T
+
+    if compare_probability:
+        if prob_correct_by_chance is None:
+            raise ValueError(
+                "prob_correct_by_chance is required when compare_probability=True"
+            )
+        mu_bias = math.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
+        samples = jax.nn.sigmoid(mu_bias + samples)
+    return samples
+
+
 def compute_trial_comparison_matrix(
     key: Array,
     smoothed_learning_state_mode: ArrayLike,
@@ -1193,24 +1264,15 @@ def compute_trial_comparison_matrix(
         smoothed_learning_state_variance, smoother_gain
     )
 
-    # Generate samples for all trials at once: shape (n_samples, n_trials)
-    # Sample from multivariate normal N(smoothed_learning_state_mode, cross_cov_matrix)
-    # Use eigendecomposition for numerical stability
-    eigenvalues, eigenvectors = jnp.linalg.eigh(cross_cov_matrix)
-    eigenvalues = jnp.maximum(eigenvalues, 0.0)  # Ensure non-negative
-    sqrt_cov = eigenvectors @ jnp.diag(jnp.sqrt(eigenvalues))
-
-    # Generate standard normal samples and transform
-    z = jax.random.normal(key, shape=(n_samples, n_trials))
-    samples = mode + z @ sqrt_cov.T  # shape: (n_samples, n_trials)
-
-    if compare_probability:
-        if prob_correct_by_chance is None:
-            raise ValueError(
-                "prob_correct_by_chance is required when compare_probability=True"
-            )
-        mu_bias = math.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
-        samples = jax.nn.sigmoid(mu_bias + samples)
+    # Joint samples for all trials at once: shape (n_samples, n_trials)
+    samples = _sample_trial_states(
+        key,
+        mode,
+        cross_cov_matrix,
+        n_samples,
+        compare_probability,
+        prob_correct_by_chance,
+    )
 
     # Compute P(x_i > x_j) for all pairs using broadcasting
     # samples[:, :, None] has shape (n_samples, n_trials, 1)
@@ -1297,21 +1359,10 @@ def compare_two_trials(
     mean_2 = mode[indices]
     cov_2 = cross_cov_matrix[jnp.ix_(indices, indices)]
 
-    # Sample from bivariate normal
-    eigenvalues, eigenvectors = jnp.linalg.eigh(cov_2)
-    eigenvalues = jnp.maximum(eigenvalues, 0.0)
-    sqrt_cov = eigenvectors @ jnp.diag(jnp.sqrt(eigenvalues))
-
-    z = jax.random.normal(key, shape=(n_samples, 2))
-    samples = mean_2 + z @ sqrt_cov.T  # shape: (n_samples, 2)
-
-    if compare_probability:
-        if prob_correct_by_chance is None:
-            raise ValueError(
-                "prob_correct_by_chance is required when compare_probability=True"
-            )
-        mu_bias = math.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
-        samples = jax.nn.sigmoid(mu_bias + samples)
+    # Sample from bivariate normal: shape (n_samples, 2)
+    samples = _sample_trial_states(
+        key, mean_2, cov_2, n_samples, compare_probability, prob_correct_by_chance
+    )
 
     return float(jnp.mean(samples[:, 0] > samples[:, 1]))
 

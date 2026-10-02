@@ -27,7 +27,11 @@ from state_space_practice.parameter_transforms import (
     ParameterTransform,
     frozen,
 )
-from state_space_practice.utils import stabilize_covariance, validate_scalar
+from state_space_practice.utils import (
+    stabilize_covariance,
+    validate_finite_array,
+    validate_scalar,
+)
 
 if TYPE_CHECKING:
     import optax
@@ -152,8 +156,7 @@ class HamiltonianLFPModel(_SingleRegimeHamiltonianModel):
             )
         if not allow_empty and lfp_data.shape[0] == 0:
             raise ValueError("lfp_data must contain at least one observation.")
-        if not bool(jnp.all(jnp.isfinite(lfp_data))):
-            raise ValueError("lfp_data must contain only finite values.")
+        validate_finite_array("lfp_data", lfp_data)
         return lfp_data
 
     def fit_sgd(

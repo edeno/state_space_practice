@@ -36,6 +36,7 @@ from state_space_practice.utils import (
     psd_logdet,
     stabilize_covariance,
     validate_count_array,
+    validate_finite_array,
     validate_scalar,
 )
 
@@ -228,8 +229,7 @@ class _JointHamiltonianBase(HamiltonianModelBase):
             )
         if not allow_empty and lfp_data.shape[0] == 0:
             raise ValueError("joint observations must contain at least one time row.")
-        if not bool(jnp.all(jnp.isfinite(lfp_data))):
-            raise ValueError("lfp_data must contain only finite values.")
+        validate_finite_array("lfp_data", lfp_data)
         validate_count_array(spike_data, "spike_data", allow_empty=allow_empty)
         return lfp_data, spike_data
 
