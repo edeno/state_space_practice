@@ -123,18 +123,22 @@ class HamiltonianLFPModel(HamiltonianModelBase):
         return float(jnp.sqrt(jnp.mean(jnp.diag(R))))
 
     def filter(
-        self, lfp_data: Array, params: dict[str, Any]
+        self, lfp_data: ArrayLike, params: dict[str, Any]
     ) -> tuple[Array, Array, Array]:
         """Apply EKF filter to LFP data."""
         lfp_data = self._validate_lfp_data(lfp_data)
         return self._filter_jit(lfp_data, self._complete_filter_params(params))
 
-    def smooth(self, lfp_data: Array, params: dict[str, Any]) -> tuple[Array, Array]:
+    def smooth(
+        self, lfp_data: ArrayLike, params: dict[str, Any]
+    ) -> tuple[Array, Array]:
         """Apply EKF-RTS Smoother to LFP data."""
         lfp_data = self._validate_lfp_data(lfp_data)
         return self._smooth_jit(lfp_data, self._complete_filter_params(params))
 
-    def _validate_lfp_data(self, lfp_data: Array, *, allow_empty: bool = True) -> Array:
+    def _validate_lfp_data(
+        self, lfp_data: ArrayLike, *, allow_empty: bool = True
+    ) -> Array:
         """Validate public LFP input and return it as a JAX array."""
         lfp_data = jnp.asarray(lfp_data)
         if lfp_data.ndim != 2:

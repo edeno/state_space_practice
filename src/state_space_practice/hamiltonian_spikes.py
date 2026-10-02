@@ -104,18 +104,18 @@ class HamiltonianSpikeModel(HamiltonianModelBase):
         )
 
     def filter(
-        self, spikes: Array, params: dict[str, Any]
+        self, spikes: ArrayLike, params: dict[str, Any]
     ) -> tuple[Array, Array, Array]:
         """Apply Point-Process EKF (Laplace-EKF) to spikes."""
         spikes = self._validate_spikes(spikes)
         return self._filter_jit(spikes, self._complete_filter_params(params))
 
-    def smooth(self, spikes: Array, params: dict[str, Any]) -> tuple[Array, Array]:
+    def smooth(self, spikes: ArrayLike, params: dict[str, Any]) -> tuple[Array, Array]:
         """Apply Point-Process RTS Smoother to spikes."""
         spikes = self._validate_spikes(spikes)
         return self._smooth_jit(spikes, self._complete_filter_params(params))
 
-    def _validate_spikes(self, spikes: Array, *, allow_empty: bool = True) -> Array:
+    def _validate_spikes(self, spikes: ArrayLike, *, allow_empty: bool = True) -> Array:
         """Validate public spike input and return it as a JAX array."""
         spikes = jnp.asarray(spikes)
         if spikes.ndim != 2:

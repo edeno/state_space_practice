@@ -633,7 +633,7 @@ class PlaceFieldRateMaps:
         instance.suggested_q_pos = suggested_q_pos
         return instance
 
-    def log_rate(self, position: Array) -> Array:
+    def log_rate(self, position: ArrayLike) -> Array:
         """Evaluate log firing rate for all neurons at a position.
 
         Uses the analytical KDE kernel-sum evaluation when sufficient
@@ -644,13 +644,14 @@ class PlaceFieldRateMaps:
 
         Parameters
         ----------
-        position : Array, shape (2,) or (4,)
+        position : ArrayLike, shape (2,) or (4,)
             Position [x, y] or state [x, y, vx, vy].
 
         Returns
         -------
         log_rate : Array, shape (n_neurons,)
         """
+        position = jnp.asarray(position)
         if self._use_analytical:
             return _kde_log_rate(
                 position,
@@ -670,7 +671,7 @@ class PlaceFieldRateMaps:
             self._dy,
         )
 
-    def log_rate_jacobian(self, position: Array) -> Array:
+    def log_rate_jacobian(self, position: ArrayLike) -> Array:
         """Jacobian of log firing rate w.r.t. position via jax.jacfwd.
 
         Uses the analytical KDE path when sufficient statistics are
@@ -678,13 +679,14 @@ class PlaceFieldRateMaps:
 
         Parameters
         ----------
-        position : Array, shape (2,) or (4,)
+        position : ArrayLike, shape (2,) or (4,)
 
         Returns
         -------
         jacobian : Array, shape (n_neurons, 2)
             d(log_rate_n) / d(x, y) for each neuron.
         """
+        position = jnp.asarray(position)
         if self._use_analytical:
             return _kde_log_rate_jacobian(
                 position,
@@ -898,12 +900,12 @@ class DecoderResult:
 
     def __init__(
         self,
-        position_mean: Array,
-        position_cov: Array,
+        position_mean: ArrayLike,
+        position_cov: ArrayLike,
         marginal_log_likelihood: float,
     ):
-        self.position_mean = position_mean
-        self.position_cov = position_cov
+        self.position_mean = jnp.asarray(position_mean)
+        self.position_cov = jnp.asarray(position_cov)
         self.marginal_log_likelihood = marginal_log_likelihood
 
     @property
@@ -1202,7 +1204,7 @@ def position_decoder_filter(
     include_velocity: bool = True,
     init_position: ArrayLike | None = None,
     init_cov: ArrayLike | None = None,
-    track_penalty: Array | None = None,
+    track_penalty: ArrayLike | None = None,
     sigma_track: float = 5.0,
     max_newton_iter: int = 3,
     adaptive_inflation: AdaptiveInflationConfig | None = None,
@@ -1244,7 +1246,7 @@ def position_decoder_filter(
         Initial covariance. If None, auto-scales from the rate-map
         extent so ±3σ spans the arena per dimension (see ``init_cov``
         construction in ``position_decoder_filter``).
-    track_penalty : Array or None
+    track_penalty : ArrayLike or None
         Pre-built penalty map from :func:`_build_track_penalty`.
         If None, built automatically from rate_maps.
     sigma_track : float
@@ -1255,6 +1257,7 @@ def position_decoder_filter(
     -------
     DecoderResult
     """
+    track_penalty = None if track_penalty is None else jnp.asarray(track_penalty)
     result, _, _ = _position_decoder_filter_with_predictions(
         spikes,
         rate_maps,
@@ -1560,7 +1563,7 @@ def position_decoder_smoother(
     include_velocity: bool = True,
     init_position: ArrayLike | None = None,
     init_cov: ArrayLike | None = None,
-    track_penalty: Array | None = None,
+    track_penalty: ArrayLike | None = None,
     sigma_track: float = 5.0,
     max_newton_iter: int = 3,
     adaptive_inflation: AdaptiveInflationConfig | None = None,
@@ -1584,6 +1587,7 @@ def position_decoder_smoother(
         Smoothed position estimates with the same marginal_log_likelihood
         as the forward filter (the smoother does not change it).
     """
+    track_penalty = None if track_penalty is None else jnp.asarray(track_penalty)
     if q_pos is None:
         q_pos = (
             rate_maps.suggested_q_pos

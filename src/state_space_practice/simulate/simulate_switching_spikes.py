@@ -10,20 +10,21 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 from jax import Array
+from jax.typing import ArrayLike
 
 
 def simulate_switching_spike_oscillator(
     n_time: int,
-    transition_matrices: Array,
-    process_covs: Array,
-    discrete_transition_matrix: Array,
-    spike_weights: Array,
-    spike_baseline: Array,
+    transition_matrices: ArrayLike,
+    process_covs: ArrayLike,
+    discrete_transition_matrix: ArrayLike,
+    spike_weights: ArrayLike,
+    spike_baseline: ArrayLike,
     dt: float,
     key: Array,
-    init_mean: Array | None = None,
-    init_cov: Array | None = None,
-    init_discrete_prob: Array | None = None,
+    init_mean: ArrayLike | None = None,
+    init_cov: ArrayLike | None = None,
+    init_discrete_prob: ArrayLike | None = None,
 ) -> tuple[Array, Array, Array]:
     """Simulate spikes from a switching oscillator network model.
 
@@ -46,28 +47,28 @@ def simulate_switching_spike_oscillator(
     ----------
     n_time : int
         Number of time steps to simulate.
-    transition_matrices : Array, shape (n_latent, n_latent, n_discrete_states)
+    transition_matrices : ArrayLike, shape (n_latent, n_latent, n_discrete_states)
         State transition matrices A_s for each discrete state s.
-    process_covs : Array, shape (n_latent, n_latent, n_discrete_states)
+    process_covs : ArrayLike, shape (n_latent, n_latent, n_discrete_states)
         Process noise covariances Q_s for each discrete state s.
-    discrete_transition_matrix : Array, shape (n_discrete_states, n_discrete_states)
+    discrete_transition_matrix : ArrayLike, shape (n_discrete_states, n_discrete_states)
         Discrete state transition probabilities Z[i,j] = P(s_t=j | s_{t-1}=i).
         Rows should sum to 1.
-    spike_weights : Array, shape (n_neurons, n_latent) or (n_neurons, n_latent, n_discrete_states)
+    spike_weights : ArrayLike, shape (n_neurons, n_latent) or (n_neurons, n_latent, n_discrete_states)
         Linear weights C mapping latent state to log firing rates.
         If 3D, per-state weights are indexed by the current discrete state.
-    spike_baseline : Array, shape (n_neurons,) or (n_neurons, n_discrete_states)
+    spike_baseline : ArrayLike, shape (n_neurons,) or (n_neurons, n_discrete_states)
         Baseline log firing rates b for each neuron.
         If 2D, per-state baselines are indexed by the current discrete state.
     dt : float
         Time bin width in seconds.
     key : Array
         JAX random key for reproducibility.
-    init_mean : Array, shape (n_latent,), optional
+    init_mean : ArrayLike, shape (n_latent,), optional
         Initial continuous state mean. Defaults to zeros.
-    init_cov : Array, shape (n_latent, n_latent), optional
+    init_cov : ArrayLike, shape (n_latent, n_latent), optional
         Initial continuous state covariance. Defaults to identity.
-    init_discrete_prob : Array, shape (n_discrete_states,), optional
+    init_discrete_prob : ArrayLike, shape (n_discrete_states,), optional
         Initial discrete state probabilities. Defaults to uniform.
 
     Returns
@@ -96,6 +97,12 @@ def simulate_switching_spike_oscillator(
     """
     if n_time <= 0:
         raise ValueError(f"n_time must be positive, got {n_time}.")
+
+    transition_matrices = jnp.asarray(transition_matrices)
+    process_covs = jnp.asarray(process_covs)
+    discrete_transition_matrix = jnp.asarray(discrete_transition_matrix)
+    spike_weights = jnp.asarray(spike_weights)
+    spike_baseline = jnp.asarray(spike_baseline)
 
     n_latent = transition_matrices.shape[0]
     n_discrete_states = transition_matrices.shape[-1]

@@ -2060,7 +2060,7 @@ class SmithLearningModel(SGDFittableMixin):
         self,
         key: Array,
         n_samples: int = 10000,
-        percentiles: jax.Array | None = None,
+        percentiles: ArrayLike | None = None,
         return_prob_above_chance: bool = False,
     ) -> tuple[jax.Array, jax.Array | None]:
         """
@@ -2076,7 +2076,7 @@ class SmithLearningModel(SGDFittableMixin):
         n_samples : int, optional
             Number of Monte Carlo samples to draw per trial for confidence limits.
             Default is 10000.
-        percentiles : jax.Array, optional
+        percentiles : ArrayLike, optional
             Array of percentiles to compute for the probability (e.g., jnp.array([5, 50, 95])).
             If None, defaults to jnp.array([5.0, 50.0, 95.0]).
         return_prob_above_chance : bool, optional
@@ -2116,7 +2116,7 @@ class SmithLearningModel(SGDFittableMixin):
         self,
         key: Array,
         n_samples: int = 10000,
-        percentiles: jax.Array | None = None,
+        percentiles: ArrayLike | None = None,
     ) -> jax.Array:
         """
         Calculates confidence percentiles for the smoothed latent learning state x_k|T.
@@ -2129,7 +2129,7 @@ class SmithLearningModel(SGDFittableMixin):
             JAX PRNG key for random number generation.
         n_samples : int, optional
             Number of Monte Carlo samples per trial. Default is 10000.
-        percentiles : jax.Array, optional
+        percentiles : ArrayLike, optional
             Percentiles to compute (e.g., jnp.array([5, 50, 95])).
             Defaults to [5.0, 50.0, 95.0].
 
@@ -2401,8 +2401,8 @@ class SmithLearningModel(SGDFittableMixin):
         self,
         key: Array,
         plot_type: str = "probability",
-        observed_n_correct: jax.Array | None = None,
-        observed_max_possible: jax.Array | None = None,
+        observed_n_correct: ArrayLike | None = None,
+        observed_max_possible: ArrayLike | None = None,
         confidence_bounds: tuple[float, float] = (5.0, 95.0),
         n_samples: int = 10000,
         title: str | None = None,
@@ -2425,10 +2425,10 @@ class SmithLearningModel(SGDFittableMixin):
             Type of plot to generate. Options are:
             - "probability": Plots the probability of a correct response (default).
             - "latent_state": Plots the latent learning state.
-        observed_n_correct : Optional[jax.Array], shape (n_trials,), optional
+        observed_n_correct : Optional[ArrayLike], shape (n_trials,), optional
             Observed number of correct responses per trial to overlay on the plot.
             Default is None.
-        observed_max_possible : Optional[jax.Array], shape (n_trials,), optional
+        observed_max_possible : Optional[ArrayLike], shape (n_trials,), optional
             Maximum possible correct responses for each trial corresponding to
             `observed_n_correct`. Required if `observed_n_correct` is provided
             and represents counts from multiple sub-trials. If `observed_n_correct`

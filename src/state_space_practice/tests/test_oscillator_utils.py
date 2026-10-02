@@ -270,6 +270,30 @@ def test_construct_directed_influence_transition_matrix_shape_error():
         )
 
 
+def test_construct_directed_influence_transition_matrix_accepts_numpy_inputs():
+    freqs = np.array([5.0, 9.0])
+    damping = np.array([0.95, 0.9])
+    coupling = np.array([[0.0, 0.1], [0.05, 0.0]])
+    phase = np.array([[0.0, 0.4], [-0.7, 0.0]])
+
+    from_numpy = construct_directed_influence_transition_matrix(
+        freqs, damping, coupling, phase, sampling_freq=100.0
+    )
+    from_jax = construct_directed_influence_transition_matrix(
+        jnp.asarray(freqs),
+        jnp.asarray(damping),
+        jnp.asarray(coupling),
+        jnp.asarray(phase),
+        sampling_freq=100.0,
+    )
+
+    assert isinstance(from_numpy, jax.Array)
+    # Guard: the coupled off-diagonal blocks are populated, so the comparison
+    # covers the coupling and phase inputs, not just the intrinsic blocks.
+    assert float(jnp.max(jnp.abs(from_jax[:2, 2:]))) > 0.0
+    np.testing.assert_array_equal(np.asarray(from_numpy), np.asarray(from_jax))
+
+
 def test_construct_directed_influence_measurement_matrix():
     mat = construct_directed_influence_measurement_matrix(2)
     coeff = 1 / jnp.sqrt(2)

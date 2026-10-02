@@ -1016,6 +1016,19 @@ def test_switching_kalman_filter_shapes(simple_skf_model: tuple) -> None:
     np.testing.assert_allclose(jnp.sum(filt_p, axis=1), 1.0, rtol=1e-5)
 
 
+def test_switching_kalman_filter_accepts_numpy_inputs(simple_skf_model: tuple) -> None:
+    """NumPy inputs (accepted by the ArrayLike signature) match JAX inputs."""
+    jax_outputs = switching_kalman_filter(*simple_skf_model)
+    numpy_inputs = [np.asarray(x) for x in simple_skf_model]
+    assert all(type(x) is np.ndarray for x in numpy_inputs)
+
+    numpy_outputs = switching_kalman_filter(*numpy_inputs)
+
+    assert len(numpy_outputs) == len(jax_outputs)
+    for from_numpy, from_jax in zip(numpy_outputs, jax_outputs, strict=True):
+        np.testing.assert_array_equal(from_numpy, from_jax)
+
+
 def test_skf_reduces_to_kf_single_state(simple_1d_model: tuple) -> None:
     """Tests that a single-state SKF matches the standard KF."""
     (

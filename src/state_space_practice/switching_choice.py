@@ -564,13 +564,13 @@ def _switching_choice_filter_jit(
 
 @typed_jit
 def switching_choice_smoother(
-    filtered_values: Array,
-    filtered_covs: Array,
-    discrete_state_probs: Array,
-    process_covs: Array,
-    transition_matrices: Array,
-    discrete_transition_matrix: Array,
-    control_input: Array,
+    filtered_values: ArrayLike,
+    filtered_covs: ArrayLike,
+    discrete_state_probs: ArrayLike,
+    process_covs: ArrayLike,
+    transition_matrices: ArrayLike,
+    discrete_transition_matrix: ArrayLike,
+    control_input: ArrayLike,
 ) -> tuple[Array, ...]:
     """GPB1 switching RTS smoother for dynamics with a known control input.
 
@@ -594,13 +594,13 @@ def switching_choice_smoother(
 
     Parameters
     ----------
-    filtered_values : Array, shape (T, K-1, S)
-    filtered_covs : Array, shape (T, K-1, K-1, S)
-    discrete_state_probs : Array, shape (T, S)
-    process_covs : Array, shape (K-1, K-1, S)
-    transition_matrices : Array, shape (K-1, K-1, S)
-    discrete_transition_matrix : Array, shape (S, S)
-    control_input : Array, shape (T, K-1)
+    filtered_values : ArrayLike, shape (T, K-1, S)
+    filtered_covs : ArrayLike, shape (T, K-1, K-1, S)
+    discrete_state_probs : ArrayLike, shape (T, S)
+    process_covs : ArrayLike, shape (K-1, K-1, S)
+    transition_matrices : ArrayLike, shape (K-1, K-1, S)
+    discrete_transition_matrix : ArrayLike, shape (S, S)
+    control_input : ArrayLike, shape (T, K-1)
         ``control_input[t]`` is the known input ``b_t`` of the transition
         ``x_{t-1} -> x_t`` (row 0 is never read).
 
@@ -612,6 +612,10 @@ def switching_choice_smoother(
         pair_cond_cross_covs, pair_cond_means)`` with the shapes documented
         in :func:`switching_kalman.switching_kalman_smoother`.
     """
+    filtered_values = jnp.asarray(filtered_values)
+    filtered_covs = jnp.asarray(filtered_covs)
+    discrete_state_probs = jnp.asarray(discrete_state_probs)
+    control_input = jnp.asarray(control_input)
 
     def _backward_step(
         carry: tuple[Array, Array, Array],

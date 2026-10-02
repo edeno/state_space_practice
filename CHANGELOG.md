@@ -144,6 +144,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **Public array inputs are typed `ArrayLike`**: every public function and
+  method that takes a JAX array (except PRNG `key` arguments) is annotated
+  `jax.typing.ArrayLike` and converts with `jnp.asarray`, so numpy inputs
+  type-check in user code as they already ran. Return types stay `Array`.
 - **Runtime dependencies trimmed** to what the package imports: numpy, scipy,
   jax, optax, patsy, networkx, scikit-learn (with minimum versions).
   matplotlib moved to the `plot` extra; pandas to `notebooks`; jaxlib (pulled

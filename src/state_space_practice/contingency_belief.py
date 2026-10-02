@@ -88,12 +88,12 @@ class ContingencyBeliefResult(NamedTuple):
     log_likelihood: Array  # scalar
 
 
-def centered_log_softmax(logits: Array) -> Array:
+def centered_log_softmax(logits: ArrayLike) -> Array:
     """Centered log-softmax: last state is the reference category.
 
     Parameters
     ----------
-    logits : Array, shape (..., n_states - 1)
+    logits : ArrayLike, shape (..., n_states - 1)
         Unconstrained logits for states 0..S-2.
 
     Returns
@@ -101,16 +101,17 @@ def centered_log_softmax(logits: Array) -> Array:
     Array, shape (..., n_states)
         Log-probabilities for all S states.
     """
+    logits = jnp.asarray(logits)
     full_logits = jnp.concatenate([logits, jnp.zeros_like(logits[..., :1])], axis=-1)
     return jax.nn.log_softmax(full_logits, axis=-1)
 
 
-def centered_softmax(logits: Array) -> Array:
+def centered_softmax(logits: ArrayLike) -> Array:
     """Centered softmax: last state is the reference category.
 
     Parameters
     ----------
-    logits : Array, shape (..., n_states - 1)
+    logits : ArrayLike, shape (..., n_states - 1)
 
     Returns
     -------
@@ -119,12 +120,12 @@ def centered_softmax(logits: Array) -> Array:
     return jnp.exp(centered_log_softmax(logits))
 
 
-def centered_softmax_inverse(probs: Array) -> Array:
+def centered_softmax_inverse(probs: ArrayLike) -> Array:
     """Inverse of centered softmax: extract logits relative to last state.
 
     Parameters
     ----------
-    probs : Array, shape (..., n_states)
+    probs : ArrayLike, shape (..., n_states)
         Probability vectors summing to 1.
 
     Returns
@@ -137,12 +138,12 @@ def centered_softmax_inverse(probs: Array) -> Array:
     return jnp.log(safe[..., :-1]) - jnp.log(safe[..., -1:])
 
 
-def transition_logits_to_matrix(logits: Array) -> Array:
+def transition_logits_to_matrix(logits: ArrayLike) -> Array:
     """Convert centered logits to a row-stochastic transition matrix.
 
     Parameters
     ----------
-    logits : Array, shape (n_states, n_states - 1)
+    logits : ArrayLike, shape (n_states, n_states - 1)
         Centered transition logits (last state is reference).
 
     Returns
@@ -154,16 +155,16 @@ def transition_logits_to_matrix(logits: Array) -> Array:
 
 
 def compute_transition_matrix_from_design(
-    design_row: Array,
-    coefficients: Array,
+    design_row: ArrayLike,
+    coefficients: ArrayLike,
 ) -> Array:
     """Compute one transition matrix from a design matrix row.
 
     Parameters
     ----------
-    design_row : Array, shape (n_coefficients,)
+    design_row : ArrayLike, shape (n_coefficients,)
         One row of the design matrix.
-    coefficients : Array, shape (n_coefficients, n_states, n_states - 1)
+    coefficients : ArrayLike, shape (n_coefficients, n_states, n_states - 1)
         Regression coefficients for each from-state.
 
     Returns
@@ -178,9 +179,9 @@ def compute_transition_matrix_from_design(
 
 
 def compute_input_output_transition_matrix(
-    baseline_logits: Array,
-    transition_weights: Array,
-    covariates_t: Array,
+    baseline_logits: ArrayLike,
+    transition_weights: ArrayLike,
+    covariates_t: ArrayLike,
 ) -> Array:
     """Compute time-varying transition matrix from covariates.
 
@@ -188,11 +189,11 @@ def compute_input_output_transition_matrix(
 
     Parameters
     ----------
-    baseline_logits : Array, shape (n_states, n_states - 1)
+    baseline_logits : ArrayLike, shape (n_states, n_states - 1)
         Baseline transition logits (centered softmax).
-    transition_weights : Array, shape (n_states, n_states - 1, d_h)
+    transition_weights : ArrayLike, shape (n_states, n_states - 1, d_h)
         Covariate weights for transitions.
-    covariates_t : Array, shape (d_h,)
+    covariates_t : ArrayLike, shape (d_h,)
         Transition covariates at time t.
 
     Returns
@@ -231,10 +232,10 @@ def get_transition_prior(
 
 @typed_jit
 def dirichlet_neg_log_likelihood(
-    coefficients_flat: Array,
-    design_matrix: Array,
-    response: Array,
-    alpha: Array,
+    coefficients_flat: ArrayLike,
+    design_matrix: ArrayLike,
+    response: ArrayLike,
+    alpha: ArrayLike,
     l2_penalty: float | Array = 1e-5,
 ) -> Array:
     """Negative expected complete log-likelihood for transition M-step.
@@ -252,12 +253,12 @@ def dirichlet_neg_log_likelihood(
 
     Parameters
     ----------
-    coefficients_flat : Array, shape (n_coefficients * (n_states - 1),)
+    coefficients_flat : ArrayLike, shape (n_coefficients * (n_states - 1),)
         Flattened regression coefficients for one from-state row.
-    design_matrix : Array, shape (n_samples, n_coefficients)
-    response : Array, shape (n_samples, n_states)
+    design_matrix : ArrayLike, shape (n_samples, n_coefficients)
+    response : ArrayLike, shape (n_samples, n_states)
         Expected counts (from joint distribution) for this from-state.
-    alpha : Array, shape (n_states,)
+    alpha : ArrayLike, shape (n_states,)
         Pseudo-count smoothing (acts like Dirichlet alpha for the
         intercept-only case, but is only an approximation when
         covariates are present).
@@ -268,6 +269,9 @@ def dirichlet_neg_log_likelihood(
     -------
     Array, shape ()
     """
+    coefficients_flat = jnp.asarray(coefficients_flat)
+    design_matrix = jnp.asarray(design_matrix)
+    response = jnp.asarray(response)
     n_coefficients = design_matrix.shape[1]
     coefficients = coefficients_flat.reshape((n_coefficients, -1))
     log_probs = centered_log_softmax(design_matrix @ coefficients)
@@ -292,7 +296,7 @@ _dirichlet_hessian = jax.hessian(dirichlet_neg_log_likelihood)
 def compute_reward_log_likelihood(
     reward_t: ArrayLike,
     choice_t: ArrayLike,
-    reward_probs: Array,
+    reward_probs: ArrayLike,
 ) -> Array:
     """Compute log P(reward | state, choice) for each state.
 
@@ -302,7 +306,7 @@ def compute_reward_log_likelihood(
         Reward outcome (0 or 1).
     choice_t : int or Array
         Chosen option index.
-    reward_probs : Array, shape (n_states, n_options)
+    reward_probs : ArrayLike, shape (n_states, n_options)
         P(reward=1 | state, choice) for each state-option pair.
 
     Returns
@@ -310,6 +314,7 @@ def compute_reward_log_likelihood(
     Array, shape (n_states,)
         Log-likelihood of the reward under each state.
     """
+    reward_probs = jnp.asarray(reward_probs)
     p = reward_probs[:, choice_t]  # (n_states,)
     eps = 1e-10
     p = jnp.clip(p, eps, 1.0 - eps)
@@ -356,9 +361,9 @@ def _validate_obs_weights_shape(
 
 def compute_choice_log_likelihood(
     choice_t: ArrayLike,
-    state_values: Array,
+    state_values: ArrayLike,
     inverse_temperature: float | Array,
-    obs_offset: Array | None = None,
+    obs_offset: ArrayLike | None = None,
 ) -> Array:
     """Compute log P(choice | state) for each state.
 
@@ -366,11 +371,11 @@ def compute_choice_log_likelihood(
     ----------
     choice_t : int or Array
         Chosen option index.
-    state_values : Array, shape (n_states, n_options)
+    state_values : ArrayLike, shape (n_states, n_options)
         Value preferences per state-option pair.
     inverse_temperature : float
         Softmax temperature.
-    obs_offset : Array or None
+    obs_offset : ArrayLike or None
         Additive offset to action logits from observation design matrix.
         Two supported shapes:
 
@@ -424,15 +429,15 @@ def contingency_belief_filter(
     rewards: ArrayLike,
     n_states: int,
     n_options: int,
-    reward_probs: Array,
-    state_values: Array,
+    reward_probs: ArrayLike,
+    state_values: ArrayLike,
     inverse_temperature: float = 1.0,
-    transition_logits: Array | None = None,
-    transition_covariates: Array | None = None,
-    transition_weights: Array | None = None,
-    init_state_prob: Array | None = None,
-    obs_design_matrix: Array | None = None,
-    obs_weights: Array | None = None,
+    transition_logits: ArrayLike | None = None,
+    transition_covariates: ArrayLike | None = None,
+    transition_weights: ArrayLike | None = None,
+    init_state_prob: ArrayLike | None = None,
+    obs_design_matrix: ArrayLike | None = None,
+    obs_weights: ArrayLike | None = None,
 ) -> ContingencyBeliefResult:
     """Forward filter for the contingency-belief HMM.
 
@@ -448,23 +453,23 @@ def contingency_belief_filter(
         Number of latent contingency states.
     n_options : int
         Number of choice options.
-    reward_probs : Array, shape (n_states, n_options)
+    reward_probs : ArrayLike, shape (n_states, n_options)
         P(reward=1 | state, choice).
-    state_values : Array, shape (n_states, n_options)
+    state_values : ArrayLike, shape (n_states, n_options)
         Choice value preferences per state.
     inverse_temperature : float
         Softmax temperature for choice policy.
-    transition_logits : Array or None, shape (n_states, n_states - 1)
+    transition_logits : ArrayLike or None, shape (n_states, n_states - 1)
         Baseline transition logits (centered softmax).
-    transition_covariates : Array or None, shape (n_trials, d_h)
+    transition_covariates : ArrayLike or None, shape (n_trials, d_h)
         Time-varying transition covariates.
-    transition_weights : Array or None, shape (n_states, n_states - 1, d_h)
+    transition_weights : ArrayLike or None, shape (n_states, n_states - 1, d_h)
         Weights for covariate-driven transitions.
-    init_state_prob : Array or None, shape (n_states,)
+    init_state_prob : ArrayLike or None, shape (n_states,)
         Initial state distribution. Default: uniform.
-    obs_design_matrix : Array or None, shape (n_trials, d_obs)
+    obs_design_matrix : ArrayLike or None, shape (n_trials, d_obs)
         Observation-side design matrix for action biases.
-    obs_weights : Array or None
+    obs_weights : ArrayLike or None
         Weights mapping observation covariates to action logit offsets.
         Two supported shapes:
 
@@ -482,6 +487,22 @@ def contingency_belief_filter(
     _validate_choices_rewards(choices, rewards, n_options)
     choices = jnp.asarray(choices, dtype=jnp.int32)
     rewards = jnp.asarray(rewards, dtype=jnp.int32)
+    reward_probs = jnp.asarray(reward_probs)
+    state_values = jnp.asarray(state_values)
+    transition_logits = (
+        None if transition_logits is None else jnp.asarray(transition_logits)
+    )
+    transition_covariates = (
+        None if transition_covariates is None else jnp.asarray(transition_covariates)
+    )
+    transition_weights = (
+        None if transition_weights is None else jnp.asarray(transition_weights)
+    )
+    init_state_prob = None if init_state_prob is None else jnp.asarray(init_state_prob)
+    obs_design_matrix = (
+        None if obs_design_matrix is None else jnp.asarray(obs_design_matrix)
+    )
+    obs_weights = None if obs_weights is None else jnp.asarray(obs_weights)
     return _contingency_belief_filter_jit(
         choices=choices,
         rewards=rewards,
@@ -608,15 +629,15 @@ def contingency_belief_smoother(
     rewards: ArrayLike,
     n_states: int,
     n_options: int,
-    reward_probs: Array,
-    state_values: Array,
+    reward_probs: ArrayLike,
+    state_values: ArrayLike,
     inverse_temperature: float = 1.0,
-    transition_logits: Array | None = None,
-    transition_covariates: Array | None = None,
-    transition_weights: Array | None = None,
-    init_state_prob: Array | None = None,
-    obs_design_matrix: Array | None = None,
-    obs_weights: Array | None = None,
+    transition_logits: ArrayLike | None = None,
+    transition_covariates: ArrayLike | None = None,
+    transition_weights: ArrayLike | None = None,
+    init_state_prob: ArrayLike | None = None,
+    obs_design_matrix: ArrayLike | None = None,
+    obs_weights: ArrayLike | None = None,
 ) -> SmootherResult:
     """Forward-backward smoother for the contingency-belief HMM.
 
@@ -636,6 +657,22 @@ def contingency_belief_smoother(
     _validate_choices_rewards(choices, rewards, n_options)
     choices = jnp.asarray(choices, dtype=jnp.int32)
     rewards = jnp.asarray(rewards, dtype=jnp.int32)
+    reward_probs = jnp.asarray(reward_probs)
+    state_values = jnp.asarray(state_values)
+    transition_logits = (
+        None if transition_logits is None else jnp.asarray(transition_logits)
+    )
+    transition_covariates = (
+        None if transition_covariates is None else jnp.asarray(transition_covariates)
+    )
+    transition_weights = (
+        None if transition_weights is None else jnp.asarray(transition_weights)
+    )
+    init_state_prob = None if init_state_prob is None else jnp.asarray(init_state_prob)
+    obs_design_matrix = (
+        None if obs_design_matrix is None else jnp.asarray(obs_design_matrix)
+    )
+    obs_weights = None if obs_weights is None else jnp.asarray(obs_weights)
     return _contingency_belief_smoother_jit(
         choices=choices,
         rewards=rewards,

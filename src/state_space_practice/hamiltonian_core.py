@@ -67,12 +67,12 @@ from state_space_practice.utils import (
 
 
 def gaussian_measurement_update(
-    m_pred: Array,
-    P_pred: Array,
-    y: Array,
-    C: Array,
-    d: Array,
-    R: Array,
+    m_pred: ArrayLike,
+    P_pred: ArrayLike,
+    y: ArrayLike,
+    C: ArrayLike,
+    d: ArrayLike,
+    R: ArrayLike,
     *,
     include_normalization_const: bool = True,
 ) -> tuple[Array, Array, Array]:
@@ -80,18 +80,18 @@ def gaussian_measurement_update(
 
     Parameters
     ----------
-    m_pred : Array, shape (n,)
+    m_pred : ArrayLike, shape (n,)
         Predicted (prior) state mean.
-    P_pred : Array, shape (n, n)
+    P_pred : ArrayLike, shape (n, n)
         Predicted (prior) state covariance.
-    y : Array, shape (n_obs,)
+    y : ArrayLike, shape (n_obs,)
         Observation at this step. ``n_obs = 0`` is allowed and returns the
         prior unchanged with zero log-likelihood.
-    C : Array, shape (n_obs, n)
+    C : ArrayLike, shape (n_obs, n)
         Observation matrix.
-    d : Array, shape (n_obs,)
+    d : ArrayLike, shape (n_obs,)
         Observation offset.
-    R : Array, shape (n_obs, n_obs)
+    R : ArrayLike, shape (n_obs, n_obs)
         Observation noise covariance (positive definite).
     include_normalization_const : bool, default True
         Whether to include the ``-0.5 * n_obs * log(2π)`` term in the
@@ -109,6 +109,12 @@ def gaussian_measurement_update(
         (e.g. discrete-state softmax in switching models) where the
         constant cancels in normalization.
     """
+    m_pred = jnp.asarray(m_pred)
+    P_pred = jnp.asarray(P_pred)
+    y = jnp.asarray(y)
+    C = jnp.asarray(C)
+    d = jnp.asarray(d)
+    R = jnp.asarray(R)
     # The Gaussian density over an empty observation vector is the empty
     # product: it contributes zero log-likelihood and leaves the prior
     # unchanged. Besides being mathematically natural, this avoids asking
@@ -137,11 +143,11 @@ def gaussian_measurement_update(
 
 
 def point_process_laplace_update(
-    m_pred: Array,
-    P_pred: Array,
-    y: Array,
-    C: Array,
-    d: Array,
+    m_pred: ArrayLike,
+    P_pred: ArrayLike,
+    y: ArrayLike,
+    C: ArrayLike,
+    d: ArrayLike,
     dt: float,
     *,
     compute_log_likelihood: bool = True,
@@ -171,6 +177,8 @@ def point_process_laplace_update(
         normalization (two Cholesky log-determinants per step) inside the
         GLM update — the intended saving for the smoother forward pass.
     """
+    C = jnp.asarray(C)
+    d = jnp.asarray(d)
 
     def eta_func(x: Array) -> Array:
         return C @ x + d
@@ -200,11 +208,11 @@ def point_process_laplace_update(
 
 
 def ekf_rts_backward_pass(
-    m_filt: Array,
-    P_filt: Array,
-    m_pred: Array,
-    P_pred: Array,
-    F: Array,
+    m_filt: ArrayLike,
+    P_filt: ArrayLike,
+    m_pred: ArrayLike,
+    P_pred: ArrayLike,
+    F: ArrayLike,
 ) -> tuple[Array, Array]:
     """EKF-RTS backward smoother given a forward pass's filtered + predicted state.
 
@@ -236,6 +244,11 @@ def ekf_rts_backward_pass(
     m_smooth, P_smooth : (T, n) and (T, n, n)
         The final time step is not re-smoothed (``m_smooth[-1] == m_filt[-1]``).
     """
+    m_filt = jnp.asarray(m_filt)
+    P_filt = jnp.asarray(P_filt)
+    m_pred = jnp.asarray(m_pred)
+    P_pred = jnp.asarray(P_pred)
+    F = jnp.asarray(F)
     # A zero-length filtered trajectory has no terminal state from which to
     # initialize the reverse scan. Its smoother is therefore the same empty
     # trajectory. The time dimension is static, so this branch is JIT-safe.
@@ -285,10 +298,10 @@ def mlp_l2_penalty(mlp_params: dict[str, Any]) -> Array:
 
 def run_ekf_filter(
     observations: Any,
-    init_mean: Array,
-    init_cov: Array,
+    init_mean: ArrayLike,
+    init_cov: ArrayLike,
     trans_params: dict[str, Any],
-    process_cov: Array,
+    process_cov: ArrayLike,
     dt: float,
     update_fn: Callable[[Array, Array, Any], tuple[Array, Array, Array]],
 ) -> tuple[Array, Array, Array]:
@@ -300,13 +313,13 @@ def run_ekf_filter(
         Leaves share a leading time axis of length ``n_time``: one
         ``(n_time, n_obs)`` array, or a tuple of such arrays for the
         multi-modality models (e.g. ``(lfp, spikes)``).
-    init_mean : Array, shape (n_latent,)
+    init_mean : ArrayLike, shape (n_latent,)
         Prior mean of the state before the first prediction.
-    init_cov : Array, shape (n_latent, n_latent)
+    init_cov : ArrayLike, shape (n_latent, n_latent)
         Prior covariance of the state before the first prediction.
     trans_params : dict
         MLP parameters plus ``"omega"`` for the leapfrog transition.
-    process_cov : Array, shape (n_latent, n_latent)
+    process_cov : ArrayLike, shape (n_latent, n_latent)
         Additive process-noise covariance ``Q``.
     dt : float
         Leapfrog step (static when jitted).
@@ -323,6 +336,9 @@ def run_ekf_filter(
         Per-step contributions ``log p(y_t | y_{1:t-1})`` as returned by
         ``update_fn``.
     """
+    init_mean = jnp.asarray(init_mean)
+    init_cov = jnp.asarray(init_cov)
+    process_cov = jnp.asarray(process_cov)
 
     def step(
         carry: tuple[Array, Array], y_t: Any
@@ -340,10 +356,10 @@ def run_ekf_filter(
 
 def run_ekf_smoother(
     observations: Any,
-    init_mean: Array,
-    init_cov: Array,
+    init_mean: ArrayLike,
+    init_cov: ArrayLike,
     trans_params: dict[str, Any],
-    process_cov: Array,
+    process_cov: ArrayLike,
     dt: float,
     update_fn: Callable[[Array, Array, Any], tuple[Array, Array]],
 ) -> tuple[Array, Array]:
@@ -362,6 +378,9 @@ def run_ekf_smoother(
     smoothed_means : Array, shape (n_time, n_latent)
     smoothed_covs : Array, shape (n_time, n_latent, n_latent)
     """
+    init_mean = jnp.asarray(init_mean)
+    init_cov = jnp.asarray(init_cov)
+    process_cov = jnp.asarray(process_cov)
 
     def forward_step(
         carry: tuple[Array, Array], y_t: Any
@@ -518,7 +537,7 @@ def hamiltonian_ekf_smoother(
     )
 
 
-def poisson_rollout_nll(log_lambda: Array, spikes: Array, dt: float) -> Array:
+def poisson_rollout_nll(log_lambda: ArrayLike, spikes: ArrayLike, dt: float) -> Array:
     """Overflow-safe, gradient-preserving Poisson negative log-likelihood.
 
     Computes ``sum(mu - y * log(mu) + log(y!))`` with expected counts
@@ -537,9 +556,9 @@ def poisson_rollout_nll(log_lambda: Array, spikes: Array, dt: float) -> Array:
 
     Parameters
     ----------
-    log_lambda : Array, shape (n_time, n_neurons)
+    log_lambda : ArrayLike, shape (n_time, n_neurons)
         Log firing rate in Hz.
-    spikes : Array, shape (n_time, n_neurons)
+    spikes : ArrayLike, shape (n_time, n_neurons)
         Spike counts per bin.
     dt : float
         Bin width in seconds.
@@ -549,6 +568,7 @@ def poisson_rollout_nll(log_lambda: Array, spikes: Array, dt: float) -> Array:
     nll : Array, shape ()
         Negative log-likelihood summed over time and neurons.
     """
+    log_lambda = jnp.asarray(log_lambda)
     rates, log_rates = _soft_expected_count_and_log(log_lambda, dt)
     return jnp.sum(rates - spikes * log_rates + jax.scipy.special.gammaln(spikes + 1.0))
 
@@ -609,8 +629,9 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
         self.hidden_dims = hidden_dims or [32, 32]
         self.key = jax.random.PRNGKey(seed)
 
-    def transition_func(self, x: Array, params: dict[str, Array]) -> Array:
+    def transition_func(self, x: ArrayLike, params: dict[str, Array]) -> Array:
         """Deterministic Hamiltonian transition."""
+        x = jnp.asarray(x)
         return leapfrog_step(x, params, apply_mlp, self.dt)
 
     def _rollout_trajectory(self, params: dict[str, Any], n_time: int) -> Array:

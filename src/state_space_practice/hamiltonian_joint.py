@@ -201,8 +201,8 @@ class JointHamiltonianModel(HamiltonianModelBase):
 
     def filter(
         self,
-        lfp_data: Array,
-        spike_data: Array,
+        lfp_data: ArrayLike,
+        spike_data: ArrayLike,
         params: dict[str, Any],
     ) -> tuple[Array, Array, Array]:
         """Hybrid EKF: sequentially update from LFP then Spikes."""
@@ -213,8 +213,8 @@ class JointHamiltonianModel(HamiltonianModelBase):
 
     def smooth(
         self,
-        lfp_data: Array,
-        spike_data: Array,
+        lfp_data: ArrayLike,
+        spike_data: ArrayLike,
         params: dict[str, Any],
     ) -> tuple[Array, Array]:
         """Apply EKF-RTS Smoother to joint data."""
@@ -225,8 +225,8 @@ class JointHamiltonianModel(HamiltonianModelBase):
 
     def _validate_joint_data(
         self,
-        lfp_data: Array,
-        spike_data: Array,
+        lfp_data: ArrayLike,
+        spike_data: ArrayLike,
         *,
         allow_empty: bool = True,
     ) -> tuple[Array, Array]:

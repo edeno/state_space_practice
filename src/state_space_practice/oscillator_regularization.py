@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
+from jax.typing import ArrayLike
 
 from state_space_practice.utils import contains_tracer, validate_int, validate_scalar
 
@@ -36,7 +37,7 @@ def _validate_eps(eps: float) -> Array:
     return eps_arr
 
 
-def _as_coupling(coupling: Array) -> Array:
+def _as_coupling(coupling: ArrayLike) -> Array:
     """Convert and validate a coupling array with convention (state, osc, osc)."""
     arr = jnp.asarray(coupling)
     if arr.ndim != 3:
@@ -52,7 +53,7 @@ def _as_coupling(coupling: Array) -> Array:
     return arr
 
 
-def _validate_area_labels(area_labels: Array, n_osc: int | None = None) -> Array:
+def _validate_area_labels(area_labels: ArrayLike, n_osc: int | None = None) -> Array:
     """Validate contiguous integer area labels and return a JAX array."""
     labels_np = np.asarray(area_labels)
     if labels_np.ndim != 1:
@@ -83,7 +84,7 @@ def _validate_area_labels(area_labels: Array, n_osc: int | None = None) -> Array
     return jnp.asarray(labels_np, dtype=jnp.int32)
 
 
-def _area_labels_for_penalty(area_labels: Array, n_osc: int) -> Array:
+def _area_labels_for_penalty(area_labels: ArrayLike, n_osc: int) -> Array:
     """Validate labels when possible; keep penalty helpers jit-compatible."""
     labels = jnp.asarray(area_labels)
     if labels.ndim != 1:
@@ -167,7 +168,7 @@ def _mask_diagonal(coupling: Array, exclude: bool) -> Array:
 
 
 def edge_l1_penalty(
-    coupling: Array,
+    coupling: ArrayLike,
     eps: float = 1e-8,
     exclude_diagonal: bool = True,
 ) -> Array:
@@ -175,7 +176,7 @@ def edge_l1_penalty(
 
     Parameters
     ----------
-    coupling : Array, shape (n_states, n_osc, n_osc)
+    coupling : ArrayLike, shape (n_states, n_osc, n_osc)
         Coupling strength array.
     eps : float
         Smoothing constant to avoid gradient singularity at zero.
@@ -207,8 +208,8 @@ def _build_area_pair_masks(area_labels: Array, n_areas: int) -> Array:
 
 
 def area_group_penalty(
-    coupling: Array,
-    area_labels: Array,
+    coupling: ArrayLike,
+    area_labels: ArrayLike,
     eps: float = 1e-8,
     exclude_diagonal: bool = True,
 ) -> Array:
@@ -219,8 +220,8 @@ def area_group_penalty(
 
     Parameters
     ----------
-    coupling : Array, shape (n_states, n_osc, n_osc)
-    area_labels : Array, shape (n_osc,)
+    coupling : ArrayLike, shape (n_states, n_osc, n_osc)
+    area_labels : ArrayLike, shape (n_osc,)
     eps : float
     exclude_diagonal : bool
 
@@ -243,8 +244,8 @@ def area_group_penalty(
 
 
 def state_shared_area_penalty(
-    coupling: Array,
-    area_labels: Array,
+    coupling: ArrayLike,
+    area_labels: ArrayLike,
     eps: float = 1e-8,
     exclude_diagonal: bool = True,
 ) -> Array:
@@ -256,8 +257,8 @@ def state_shared_area_penalty(
 
     Parameters
     ----------
-    coupling : Array, shape (n_states, n_osc, n_osc)
-    area_labels : Array, shape (n_osc,)
+    coupling : ArrayLike, shape (n_states, n_osc, n_osc)
+    area_labels : ArrayLike, shape (n_osc,)
     eps : float
     exclude_diagonal : bool
 
@@ -277,17 +278,17 @@ def state_shared_area_penalty(
 
 
 def get_area_coupling_summary(
-    coupling: Array,
-    area_labels: Array,
+    coupling: ArrayLike,
+    area_labels: ArrayLike,
     exclude_diagonal: bool = True,
 ) -> dict[str, Array]:
     """Compute area-level coupling summary from oscillator coupling strengths.
 
     Parameters
     ----------
-    coupling : Array, shape (n_states, n_osc, n_osc)
+    coupling : ArrayLike, shape (n_states, n_osc, n_osc)
         Coupling strength array (states as first axis).
-    area_labels : Array, shape (n_osc,)
+    area_labels : ArrayLike, shape (n_osc,)
         Integer area label per oscillator.
     exclude_diagonal : bool
         Exclude self-coupling from block norms.
@@ -323,7 +324,7 @@ def get_area_coupling_summary(
 
 
 def total_connectivity_penalty(
-    coupling: Array,
+    coupling: ArrayLike,
     config: OscillatorPenaltyConfig,
     n_timesteps: int = 1,
 ) -> Array:
@@ -331,7 +332,7 @@ def total_connectivity_penalty(
 
     Parameters
     ----------
-    coupling : Array, shape (n_states, n_osc, n_osc)
+    coupling : ArrayLike, shape (n_states, n_osc, n_osc)
         Coupling strength array. For DirectedInfluenceModel, this is
         ``model.coupling_strength`` transposed to (n_states, n_osc, n_osc).
     config : OscillatorPenaltyConfig

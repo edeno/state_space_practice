@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 import jax
 import jax.numpy as jnp
 from jax import Array
+from jax.typing import ArrayLike
 
 from state_space_practice.em_driver import run_em
 from state_space_practice.exceptions import NotFittedError
@@ -139,7 +140,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         Sampling frequency in Hz.
     dt : float
         Time bin width in seconds.
-    discrete_transition_diag : Array | None, optional
+    discrete_transition_diag : ArrayLike | None, optional
         Diagonal of discrete transition matrix. Defaults to a ~1 s expected
         dwell time at ``sampling_freq``.
     stickiness : float, default=0.0
@@ -189,7 +190,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         n_discrete_states: int,
         sampling_freq: float,
         dt: float,
-        discrete_transition_diag: Array | None = None,
+        discrete_transition_diag: ArrayLike | None = None,
         stickiness: float = 0.0,
         update_continuous_transition_matrix: bool = True,
         update_process_cov: bool = True,
@@ -527,7 +528,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
 
     def fit(
         self,
-        spikes: Array,
+        spikes: ArrayLike,
         max_iter: int = 50,
         tol: float = 1e-4,
         key: Array | None = None,
@@ -730,11 +731,11 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
         Sampling frequency in Hz.
     dt : float
         Time bin width in seconds.
-    freqs : Array, shape (n_oscillators,)
+    freqs : ArrayLike, shape (n_oscillators,)
         Intrinsic oscillation frequencies in Hz.
-    damping_coef : Array, shape (n_oscillators,)
+    damping_coef : ArrayLike, shape (n_oscillators,)
         Damping coefficients for each oscillator (0 to 1).
-    process_variance : Array, shape (n_oscillators,)
+    process_variance : ArrayLike, shape (n_oscillators,)
         Process noise variance for each oscillator.
     """
 
@@ -745,9 +746,9 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
         n_discrete_states: int,
         sampling_freq: float,
         dt: float,
-        freqs: jax.Array,
-        damping_coef: jax.Array,
-        process_variance: jax.Array,
+        freqs: ArrayLike,
+        damping_coef: ArrayLike,
+        process_variance: ArrayLike,
         **kwargs: Any,
     ) -> None:
         # Force COM-specific update flags
@@ -758,6 +759,9 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
             n_oscillators, n_neurons, n_discrete_states, sampling_freq, dt, **kwargs
         )
 
+        freqs = jnp.asarray(freqs)
+        damping_coef = jnp.asarray(damping_coef)
+        process_variance = jnp.asarray(process_variance)
         if freqs.shape != (n_oscillators,):
             raise ValueError(f"freqs shape {freqs.shape} != ({n_oscillators},)")
         if damping_coef.shape != (n_oscillators,):
@@ -876,18 +880,18 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         Sampling frequency in Hz.
     dt : float
         Time bin width in seconds.
-    freqs : Array, shape (n_oscillators,)
+    freqs : ArrayLike, shape (n_oscillators,)
         Intrinsic oscillation frequencies in Hz.
-    damping_coef : Array, shape (n_oscillators,)
+    damping_coef : ArrayLike, shape (n_oscillators,)
         Damping coefficients for each oscillator.
-    process_variance : Array, shape (n_oscillators, n_discrete_states)
+    process_variance : ArrayLike, shape (n_oscillators, n_discrete_states)
         Process noise variance per oscillator per state.
-    phase_difference : Array, shape (n_oscillators, n_oscillators, n_discrete_states)
+    phase_difference : ArrayLike, shape (n_oscillators, n_oscillators, n_discrete_states)
         Phase differences for noise correlation. Each oscillator pair may be
         supplied in the strict upper triangle, strict lower triangle, or both
         triangles if the two entries are opposite phases; values are stored
         canonically in the strict upper triangle.
-    coupling_strength : Array, shape (n_oscillators, n_oscillators, n_discrete_states)
+    coupling_strength : ArrayLike, shape (n_oscillators, n_oscillators, n_discrete_states)
         Coupling strengths for noise correlation. Each oscillator pair may be
         supplied in the strict upper triangle, strict lower triangle, or both
         triangles if the two entries agree; values are stored canonically in the
@@ -908,11 +912,11 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         n_discrete_states: int,
         sampling_freq: float,
         dt: float,
-        freqs: jax.Array,
-        damping_coef: jax.Array,
-        process_variance: jax.Array,
-        phase_difference: jax.Array,
-        coupling_strength: jax.Array,
+        freqs: ArrayLike,
+        damping_coef: ArrayLike,
+        process_variance: ArrayLike,
+        phase_difference: ArrayLike,
+        coupling_strength: ArrayLike,
         use_reparameterized_mstep: bool = True,
         **kwargs: Any,
     ) -> None:
@@ -923,6 +927,11 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
             n_oscillators, n_neurons, n_discrete_states, sampling_freq, dt, **kwargs
         )
 
+        freqs = jnp.asarray(freqs)
+        damping_coef = jnp.asarray(damping_coef)
+        process_variance = jnp.asarray(process_variance)
+        phase_difference = jnp.asarray(phase_difference)
+        coupling_strength = jnp.asarray(coupling_strength)
         if freqs.shape != (n_oscillators,):
             raise ValueError(f"freqs shape {freqs.shape} != ({n_oscillators},)")
         if damping_coef.shape != (n_oscillators,):
@@ -1199,15 +1208,15 @@ class DirectedInfluencePointProcessModel(
         Sampling frequency in Hz.
     dt : float
         Time bin width in seconds.
-    freqs : Array, shape (n_oscillators,)
+    freqs : ArrayLike, shape (n_oscillators,)
         Intrinsic oscillation frequencies in Hz.
-    damping_coef : Array, shape (n_oscillators,)
+    damping_coef : ArrayLike, shape (n_oscillators,)
         Damping coefficients for each oscillator.
-    process_variance : Array, shape (n_oscillators,)
+    process_variance : ArrayLike, shape (n_oscillators,)
         Process noise variance (constant across states).
-    phase_difference : Array, shape (n_oscillators, n_oscillators, n_discrete_states)
+    phase_difference : ArrayLike, shape (n_oscillators, n_oscillators, n_discrete_states)
         Initial coupling phase differences.
-    coupling_strength : Array, shape (n_oscillators, n_oscillators, n_discrete_states)
+    coupling_strength : ArrayLike, shape (n_oscillators, n_oscillators, n_discrete_states)
         Initial coupling strengths.
     use_reparameterized_mstep : bool, default=False
         If True, optimize oscillator parameters directly (guarantees valid
@@ -1236,11 +1245,11 @@ class DirectedInfluencePointProcessModel(
         n_discrete_states: int,
         sampling_freq: float,
         dt: float,
-        freqs: jax.Array,
-        damping_coef: jax.Array,
-        process_variance: jax.Array,
-        phase_difference: jax.Array,
-        coupling_strength: jax.Array,
+        freqs: ArrayLike,
+        damping_coef: ArrayLike,
+        process_variance: ArrayLike,
+        phase_difference: ArrayLike,
+        coupling_strength: ArrayLike,
         use_reparameterized_mstep: bool = False,
         max_spectral_radius: float = 0.99,
         max_damping: float = 0.995,
@@ -1253,6 +1262,11 @@ class DirectedInfluencePointProcessModel(
             n_oscillators, n_neurons, n_discrete_states, sampling_freq, dt, **kwargs
         )
 
+        freqs = jnp.asarray(freqs)
+        damping_coef = jnp.asarray(damping_coef)
+        process_variance = jnp.asarray(process_variance)
+        phase_difference = jnp.asarray(phase_difference)
+        coupling_strength = jnp.asarray(coupling_strength)
         if freqs.shape != (n_oscillators,):
             raise ValueError(f"freqs shape {freqs.shape} != ({n_oscillators},)")
         if damping_coef.shape != (n_oscillators,):
@@ -1285,8 +1299,6 @@ class DirectedInfluencePointProcessModel(
                 f"!= ({n_oscillators}, {n_oscillators}, {n_discrete_states})"
             )
 
-        phase_difference = jnp.asarray(phase_difference)
-        coupling_strength = jnp.asarray(coupling_strength)
         if not bool(jnp.all(jnp.isfinite(phase_difference))) or not bool(
             jnp.all(jnp.isfinite(coupling_strength))
         ):
@@ -1445,7 +1457,7 @@ class DirectedInfluencePointProcessModel(
 
     def fit_sgd(
         self,
-        spikes: Array,
+        spikes: ArrayLike,
         key: Array | None = None,
         optimizer: optax.GradientTransformation | None = None,
         num_steps: int = 200,
@@ -1462,7 +1474,7 @@ class DirectedInfluencePointProcessModel(
 
         Parameters
         ----------
-        spikes : Array, shape (n_time, n_neurons)
+        spikes : ArrayLike, shape (n_time, n_neurons)
         key : Array or None
         optimizer : optax optimizer or None
         num_steps : int

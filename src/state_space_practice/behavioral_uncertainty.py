@@ -7,31 +7,33 @@ ContingencyBeliefModel, and SwitchingChoiceModel.
 
 import jax.numpy as jnp
 from jax import Array
+from jax.typing import ArrayLike
 
 
-def append_reference_option(values: Array) -> Array:
+def append_reference_option(values: ArrayLike) -> Array:
     """Prepend the reference option (value=0) to K-1 free values.
 
     Parameters
     ----------
-    values : Array, shape (..., K-1)
+    values : ArrayLike, shape (..., K-1)
 
     Returns
     -------
     Array, shape (..., K)
     """
+    values = jnp.asarray(values)
     zeros = jnp.zeros(values.shape[:-1] + (1,))
     return jnp.concatenate([zeros, values], axis=-1)
 
 
-def option_variances_from_covariances(covariances: Array) -> Array:
+def option_variances_from_covariances(covariances: ArrayLike) -> Array:
     """Extract per-option variances from covariance matrices.
 
     Adds zero variance for the reference option.
 
     Parameters
     ----------
-    covariances : Array, shape (..., K-1, K-1)
+    covariances : ArrayLike, shape (..., K-1, K-1)
 
     Returns
     -------
@@ -43,7 +45,7 @@ def option_variances_from_covariances(covariances: Array) -> Array:
     return jnp.concatenate([zeros, diag], axis=-1)
 
 
-def categorical_entropy(probs: Array) -> Array:
+def categorical_entropy(probs: ArrayLike) -> Array:
     """Entropy of a categorical distribution, in nats.
 
     ``H(p) = -sum_k p_k log p_k`` with the convention ``0 log 0 = 0``, i.e.
@@ -54,7 +56,7 @@ def categorical_entropy(probs: Array) -> Array:
 
     Parameters
     ----------
-    probs : Array, shape (..., K)
+    probs : ArrayLike, shape (..., K)
         Probabilities summing to one over the last axis.
 
     Returns
@@ -68,12 +70,12 @@ def categorical_entropy(probs: Array) -> Array:
     return -jnp.sum(jnp.where(positive, probs * jnp.log(safe_probs), 0.0), axis=-1)
 
 
-def belief_entropy(state_probs: Array) -> Array:
+def belief_entropy(state_probs: ArrayLike) -> Array:
     """Entropy of the discrete state belief.
 
     Parameters
     ----------
-    state_probs : Array, shape (T, S)
+    state_probs : ArrayLike, shape (T, S)
 
     Returns
     -------
@@ -82,14 +84,14 @@ def belief_entropy(state_probs: Array) -> Array:
     return categorical_entropy(state_probs)
 
 
-def compute_surprise(predicted_probs: Array, choices: Array) -> Array:
+def compute_surprise(predicted_probs: ArrayLike, choices: ArrayLike) -> Array:
     """Surprise: negative log predictive probability of actual choice.
 
     Parameters
     ----------
-    predicted_probs : Array, shape (T, K)
+    predicted_probs : ArrayLike, shape (T, K)
         Predicted choice probabilities before observing the choice.
-    choices : Array, shape (T,)
+    choices : ArrayLike, shape (T,)
         Actual choices (0-indexed).
 
     Returns
@@ -100,12 +102,14 @@ def compute_surprise(predicted_probs: Array, choices: Array) -> Array:
         model deemed impossible is capped at ``-log(1e-10) ~ 23.03`` nats
         instead of ``inf``.
     """
+    predicted_probs = jnp.asarray(predicted_probs)
+    choices = jnp.asarray(choices)
     eps = 1e-10
     p = jnp.clip(predicted_probs[jnp.arange(len(choices)), choices], eps, 1.0)
     return -jnp.log(p)
 
 
-def pairwise_change_point_probability(pairwise_state_prob: Array) -> Array:
+def pairwise_change_point_probability(pairwise_state_prob: ArrayLike) -> Array:
     """True per-trial switch probability P(s_t != s_{t-1} | data).
 
     Marginalizes off-diagonal mass from the pairwise smoothed joint:
@@ -119,7 +123,7 @@ def pairwise_change_point_probability(pairwise_state_prob: Array) -> Array:
 
     Parameters
     ----------
-    pairwise_state_prob : Array, shape (T-1, S, S)
+    pairwise_state_prob : ArrayLike, shape (T-1, S, S)
         Smoothed pairwise joint `P(s_{t-1}, s_t | data)` from an HMM
         smoother (e.g., ``contingency_belief_smoother``).
         ``pairwise_state_prob[t, i, j] = P(s_t=i, s_{t+1}=j | data)``.
@@ -131,6 +135,7 @@ def pairwise_change_point_probability(pairwise_state_prob: Array) -> Array:
         previous trial exists, and subsequent entries are
         ``1 - sum_i P(s_{t-1}=i, s_t=i | data)`` (off-diagonal mass).
     """
+    pairwise_state_prob = jnp.asarray(pairwise_state_prob)
     # Diagonal gives P(s_{t-1} = s_t) for each pair index
     n_states = pairwise_state_prob.shape[-1]
     diag = pairwise_state_prob[..., jnp.arange(n_states), jnp.arange(n_states)]
@@ -141,14 +146,14 @@ def pairwise_change_point_probability(pairwise_state_prob: Array) -> Array:
 
 
 def bernoulli_mixture_mean_variance(
-    state_probs: Array, reward_probs: Array
+    state_probs: ArrayLike, reward_probs: ArrayLike
 ) -> tuple[Array, Array]:
     """Expected reward mean and variance under a discrete state mixture.
 
     Parameters
     ----------
-    state_probs : Array, shape (T, S)
-    reward_probs : Array, shape (S, K)
+    state_probs : ArrayLike, shape (T, S)
+    reward_probs : ArrayLike, shape (S, K)
         P(reward=1 | state, option).
 
     Returns
@@ -168,6 +173,8 @@ def bernoulli_mixture_mean_variance(
     ``[0, 1]`` against round-off, so unlike the two-term sum (whose
     ``E_s[rho^2] - mean^2`` cancels) it is never negative.
     """
+    state_probs = jnp.asarray(state_probs)
+    reward_probs = jnp.asarray(reward_probs)
     # E[r | option k] = sum_s P(s) * rho[s, k]
     mean = state_probs @ reward_probs  # (T, K)
     bounded_mean = jnp.clip(mean, 0.0, 1.0)  # mean can exceed 1 by an ulp

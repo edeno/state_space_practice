@@ -382,7 +382,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         Number of observed sources or channels.
     sampling_freq : float
         Sampling frequency of the observations.
-    discrete_transition_diag : Optional[jax.Array], default=None
+    discrete_transition_diag : ArrayLike | None, default=None
         Diagonal elements of the discrete transition matrix (Z).
         If None, initializes Z with a default based on `n_discrete_states`.
     stickiness : float, default=0.0
@@ -453,7 +453,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         n_discrete_states: int,
         n_sources: int,
         sampling_freq: float,
-        discrete_transition_diag: jax.Array | None = None,
+        discrete_transition_diag: ArrayLike | None = None,
         stickiness: float = 0.0,
         update_discrete_transition_matrix: bool = True,
         update_continuous_transition_matrix: bool = True,
@@ -1255,11 +1255,11 @@ class CommonOscillatorModel(BaseModel):
 
     Parameters
     ----------
-    freqs : jax.Array, shape (n_oscillators,)
+    freqs : ArrayLike, shape (n_oscillators,)
         Intrinsic frequencies of the oscillators.
-    damping_coef : jax.Array, shape (n_oscillators,)
+    damping_coef : ArrayLike, shape (n_oscillators,)
         Damping coefficients for each oscillator.
-    process_variance : jax.Array, shape (n_oscillators,)
+    process_variance : ArrayLike, shape (n_oscillators,)
         Process noise variance for each oscillator.
     measurement_variance : float
         Variance of the measurement noise (assumed isotropic and constant).
@@ -1271,9 +1271,9 @@ class CommonOscillatorModel(BaseModel):
         n_discrete_states: int,
         n_sources: int,
         sampling_freq: float,
-        freqs: jax.Array,
-        damping_coef: jax.Array,
-        process_variance: jax.Array,
+        freqs: ArrayLike,
+        damping_coef: ArrayLike,
+        process_variance: ArrayLike,
         measurement_variance: float,
         **kwargs: Any,
     ):
@@ -1281,6 +1281,9 @@ class CommonOscillatorModel(BaseModel):
         super().__init__(
             n_oscillators, n_discrete_states, n_sources, sampling_freq, **kwargs
         )
+        freqs = jnp.asarray(freqs)
+        damping_coef = jnp.asarray(damping_coef)
+        process_variance = jnp.asarray(process_variance)
         if freqs.shape != (n_oscillators,):
             raise ValueError(
                 f"Shape mismatch: freqs {freqs.shape} vs n_oscillators {n_oscillators}"
@@ -1495,20 +1498,20 @@ class CorrelatedNoiseModel(BaseModel):
 
     Parameters
     ----------
-    freqs : jax.Array, shape (n_oscillators,)
+    freqs : ArrayLike, shape (n_oscillators,)
         Intrinsic frequencies of the oscillators.
-    damping_coef : jax.Array, shape (n_oscillators,)
+    damping_coef : ArrayLike, shape (n_oscillators,)
         Damping coefficients for each oscillator.
-    process_variance : jax.Array, shape (n_oscillators, n_discrete_states)
+    process_variance : ArrayLike, shape (n_oscillators, n_discrete_states)
         Process noise variance for each oscillator and state.
     measurement_variance : float
         Variance of the measurement noise.
-    phase_difference : jax.Array, shape (n_oscillators, n_oscillators, n_discrete_states)
+    phase_difference : ArrayLike, shape (n_oscillators, n_oscillators, n_discrete_states)
         Initial phase differences for noise correlation. Each oscillator pair may
         be supplied in the strict upper triangle, strict lower triangle, or both
         triangles if the two entries are opposite phases; values are stored
         canonically in the strict upper triangle.
-    coupling_strength : jax.Array, shape (n_oscillators, n_oscillators, n_discrete_states)
+    coupling_strength : ArrayLike, shape (n_oscillators, n_oscillators, n_discrete_states)
         Initial coupling strengths for noise correlation. Each oscillator pair
         may be supplied in the strict upper triangle, strict lower triangle, or
         both triangles if the two entries agree; values are stored canonically in
@@ -1527,12 +1530,12 @@ class CorrelatedNoiseModel(BaseModel):
         n_oscillators: int,
         n_discrete_states: int,
         sampling_freq: float,
-        freqs: jax.Array,
-        damping_coef: jax.Array,
-        process_variance: jax.Array,
+        freqs: ArrayLike,
+        damping_coef: ArrayLike,
+        process_variance: ArrayLike,
         measurement_variance: float,
-        phase_difference: jax.Array,
-        coupling_strength: jax.Array,
+        phase_difference: ArrayLike,
+        coupling_strength: ArrayLike,
         use_reparameterized_mstep: bool = True,
         **kwargs: Any,
     ):
@@ -1545,6 +1548,11 @@ class CorrelatedNoiseModel(BaseModel):
             sampling_freq,
             **kwargs,
         )
+        freqs = jnp.asarray(freqs)
+        damping_coef = jnp.asarray(damping_coef)
+        process_variance = jnp.asarray(process_variance)
+        phase_difference = jnp.asarray(phase_difference)
+        coupling_strength = jnp.asarray(coupling_strength)
         if freqs.shape != (n_oscillators,):
             raise ValueError(
                 f"Shape mismatch: freqs {freqs.shape} vs n_oscillators {n_oscillators}"
@@ -1874,17 +1882,17 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
 
     Parameters
     ----------
-    freqs : jax.Array, shape (n_oscillators,)
+    freqs : ArrayLike, shape (n_oscillators,)
         Intrinsic frequencies of the oscillators.
-    damping_coef : jax.Array, shape (n_oscillators,)
+    damping_coef : ArrayLike, shape (n_oscillators,)
         Damping coefficients for each oscillator.
-    process_variance : jax.Array, shape (n_oscillators,)
+    process_variance : ArrayLike, shape (n_oscillators,)
         Process noise variance (constant across states).
     measurement_variance : float
         Variance of the measurement noise.
-    phase_difference : jax.Array, shape (n_oscillators, n_oscillators, n_discrete_states)
+    phase_difference : ArrayLike, shape (n_oscillators, n_oscillators, n_discrete_states)
         Initial phase differences for coupling.
-    coupling_strength : jax.Array, shape (n_oscillators, n_oscillators, n_discrete_states)
+    coupling_strength : ArrayLike, shape (n_oscillators, n_oscillators, n_discrete_states)
         Initial coupling strengths.
     use_reparameterized_mstep : bool, default=False
         If True, use reparameterized M-step that directly optimizes oscillator
@@ -1913,12 +1921,12 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         n_oscillators: int,
         n_discrete_states: int,
         sampling_freq: float,
-        freqs: jax.Array,
-        damping_coef: jax.Array,
-        process_variance: jax.Array,
+        freqs: ArrayLike,
+        damping_coef: ArrayLike,
+        process_variance: ArrayLike,
         measurement_variance: float,
-        phase_difference: jax.Array,
-        coupling_strength: jax.Array,
+        phase_difference: ArrayLike,
+        coupling_strength: ArrayLike,
         use_reparameterized_mstep: bool = False,
         max_spectral_radius: float = 0.99,
         max_damping: float = 0.995,
@@ -1933,6 +1941,11 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
             sampling_freq,
             **kwargs,
         )
+        freqs = jnp.asarray(freqs)
+        damping_coef = jnp.asarray(damping_coef)
+        process_variance = jnp.asarray(process_variance)
+        phase_difference = jnp.asarray(phase_difference)
+        coupling_strength = jnp.asarray(coupling_strength)
 
         if freqs.shape != (n_oscillators,):
             raise ValueError(
@@ -1967,8 +1980,6 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
                 "coupling_strength must have shape (n_oscillators, n_oscillators, n_discrete_states)."
                 f" Got {coupling_strength.shape}."
             )
-        phase_difference = jnp.asarray(phase_difference)
-        coupling_strength = jnp.asarray(coupling_strength)
         validate_finite_array("phase_difference", phase_difference)
         validate_finite_array("coupling_strength", coupling_strength)
         diag_idx = jnp.arange(n_oscillators)

@@ -292,8 +292,8 @@ def _softmax_update_core(
 
 
 def softmax_observation_update(
-    prior_mean: Array,
-    prior_cov: Array,
+    prior_mean: ArrayLike,
+    prior_cov: ArrayLike,
     choice: int,
     n_options: int,
     inverse_temperature: float = 1.0,
@@ -306,9 +306,9 @@ def softmax_observation_update(
 
     Parameters
     ----------
-    prior_mean : Array, shape (K-1,)
+    prior_mean : ArrayLike, shape (K-1,)
         Prior state mean from prediction step.
-    prior_cov : Array, shape (K-1, K-1)
+    prior_cov : ArrayLike, shape (K-1, K-1)
         Prior state covariance from prediction step.
     choice : int
         Observed choice (0-indexed, 0 = reference option).
@@ -343,6 +343,8 @@ def softmax_observation_update(
     """
     if choice < 0 or choice >= n_options:
         raise ValueError(f"choice must be in [0, {n_options}), got {choice}")
+    prior_mean = jnp.asarray(prior_mean)
+    prior_cov = jnp.asarray(prior_cov)
     post_mean, post_cov, log_lik, newton_gap = _softmax_update_core(
         prior_mean,
         prior_cov,

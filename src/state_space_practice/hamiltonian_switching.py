@@ -13,6 +13,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from jax import Array
+from jax.typing import ArrayLike
 
 from state_space_practice.hamiltonian_core import (
     default_init_mean,
@@ -41,13 +42,13 @@ from state_space_practice.utils import typed_jit
 
 
 def switching_predict_collapse(
-    m_prev: Array,
-    P_prev: Array,
-    pi_prev: Array,
-    Z: Array,
+    m_prev: ArrayLike,
+    P_prev: ArrayLike,
+    pi_prev: ArrayLike,
+    Z: ArrayLike,
     mlp_params: dict[str, Any],
-    omega: Array,
-    Q_all: Array,
+    omega: ArrayLike,
+    Q_all: ArrayLike,
     dt: float,
     *,
     with_jacobian: bool,
@@ -63,6 +64,12 @@ def switching_predict_collapse(
     predicted prior P(s_t), and the uncollapsed pair predictions needed by
     the switching RTS smoother.
     """
+    m_prev = jnp.asarray(m_prev)
+    P_prev = jnp.asarray(P_prev)
+    pi_prev = jnp.asarray(pi_prev)
+    Z = jnp.asarray(Z)
+    omega = jnp.asarray(omega)
+    Q_all = jnp.asarray(Q_all)
     K_states = Z.shape[0]
 
     def predict_j_k(mj: Array, Pj: Array, k: Array) -> tuple[Array, ...]:
@@ -509,8 +516,8 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
 
     def filter(  # type: ignore[override]
         self,
-        lfp_data: Array,
-        spike_data: Array,
+        lfp_data: ArrayLike,
+        spike_data: ArrayLike,
         params: dict[str, Any],
     ) -> tuple[Array, Array, Array, Array]:
         """Switching EKF with Gaussian Collapse (Kim Filter)."""
@@ -527,8 +534,8 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
 
     def smooth(  # type: ignore[override]
         self,
-        lfp_data: Array,
-        spike_data: Array,
+        lfp_data: ArrayLike,
+        spike_data: ArrayLike,
         params: dict[str, Any],
     ) -> tuple[Array, Array, Array]:
         """Switching EKF-RTS smoother with Kim-style discrete-state smoothing.

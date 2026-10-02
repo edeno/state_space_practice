@@ -202,8 +202,8 @@ def _compute_coupling_transition_block(
 
 
 def construct_common_oscillator_transition_matrix(
-    freqs: jax.Array,
-    damping_coef: jax.Array,
+    freqs: ArrayLike,
+    damping_coef: ArrayLike,
     sampling_freq: float = 1.0,
 ) -> jax.Array:
     """Constructs the transition matrix for a common oscillator model.
@@ -218,9 +218,9 @@ def construct_common_oscillator_transition_matrix(
 
     Parameters
     ----------
-    freqs : jax.Array, shape (n_oscillators,)
+    freqs : ArrayLike, shape (n_oscillators,)
         Array of oscillation frequencies (fk) for each oscillator.
-    damping_coef : jax.Array, shape (n_oscillators,)
+    damping_coef : ArrayLike, shape (n_oscillators,)
         Array of auto-regressive coefficients (alpha_j^k) for each oscillator k.
     sampling_freq : float, optional
         Sampling frequency (Fs) in Hz, by default 1.0.
@@ -234,6 +234,8 @@ def construct_common_oscillator_transition_matrix(
     ValueError
         If input array dimensions do not match the inferred number of oscillators.
     """
+    freqs = jnp.asarray(freqs)
+    damping_coef = jnp.asarray(damping_coef)
     n_oscillators = freqs.shape[0]
     if not damping_coef.shape == (n_oscillators,):
         raise ValueError("damping_coef must be a 1D array of shape (n_oscillators,)")
@@ -256,7 +258,7 @@ def construct_common_oscillator_transition_matrix(
 
 
 def construct_common_oscillator_process_covariance(
-    variance: jax.Array,
+    variance: ArrayLike,
 ) -> jax.Array:
     """Constructs the process covariance matrix for a common oscillator model.
 
@@ -265,7 +267,7 @@ def construct_common_oscillator_process_covariance(
 
     Parameters
     ----------
-    variance : jax.Array, shape (n_oscillators,)
+    variance : ArrayLike, shape (n_oscillators,)
         Array of process noise variances (sigma_j) for each oscillator.
 
     Returns
@@ -280,8 +282,8 @@ def construct_common_oscillator_process_covariance(
 
 
 def canonicalize_correlated_noise_pair_parameters(
-    phase_difference: jax.Array,
-    coupling_strength: jax.Array,
+    phase_difference: ArrayLike,
+    coupling_strength: ArrayLike,
     *,
     atol: float = 1e-8,
 ) -> tuple[jax.Array, jax.Array]:
@@ -367,9 +369,9 @@ def canonicalize_correlated_noise_pair_parameters(
 
 
 def construct_correlated_noise_process_covariance(
-    variance: jax.Array,
-    phase_difference: jax.Array,
-    coupling_strength: jax.Array,
+    variance: ArrayLike,
+    phase_difference: ArrayLike,
+    coupling_strength: ArrayLike,
 ) -> jax.Array:
     """Symmetric process covariance for correlated oscillator noise.
 
@@ -388,14 +390,14 @@ def construct_correlated_noise_process_covariance(
 
     Parameters
     ----------
-    variance : jax.Array, shape (n_oscillators,)
+    variance : ArrayLike, shape (n_oscillators,)
         Process-noise variance for each oscillator; sets the diagonal 2x2 blocks
         to ``variance[j] * I``.
-    phase_difference : jax.Array, shape (n_oscillators, n_oscillators)
+    phase_difference : ArrayLike, shape (n_oscillators, n_oscillators)
         Per-pair phase of the noise correlation in canonical strict-upper form;
         ``phase_difference[i, j]`` sets the phase of the (i, j) cross-block, and
         the (j, i) block is its transpose.
-    coupling_strength : jax.Array, shape (n_oscillators, n_oscillators)
+    coupling_strength : ArrayLike, shape (n_oscillators, n_oscillators)
         Per-pair noise-correlation magnitude in canonical strict-upper form.
 
     Returns
@@ -405,6 +407,7 @@ def construct_correlated_noise_process_covariance(
         guaranteed positive semidefinite for large coupling -- the model's
         ``_project_parameters`` / entry-point validation enforce PSD.
     """
+    variance = jnp.asarray(variance)
     n_oscillators = variance.shape[0]
 
     # Compute all (n, n) coupling blocks at once via nested vmap
@@ -467,10 +470,10 @@ def construct_correlated_noise_measurement_matrix(
 
 
 def construct_directed_influence_transition_matrix(
-    freqs: jax.Array,
-    damping_coeffs: jax.Array,
-    coupling_strengths: jax.Array,
-    phase_diffs: jax.Array,
+    freqs: ArrayLike,
+    damping_coeffs: ArrayLike,
+    coupling_strengths: ArrayLike,
+    phase_diffs: ArrayLike,
     sampling_freq: float | jax.Array = 1.0,
 ) -> jax.Array:
     """Constructs the full state transition matrix Aj.
@@ -483,15 +486,15 @@ def construct_directed_influence_transition_matrix(
 
     Parameters
     ----------
-    freqs : jax.Array, shape (n_oscillators,)
+    freqs : ArrayLike, shape (n_oscillators,)
         Array of oscillation frequencies (fk) for each oscillator.
-    damping_coeffs : jax.Array, shape (n_oscillators,)
+    damping_coeffs : ArrayLike, shape (n_oscillators,)
         Array of damping coefficients (alpha_j^k) for each oscillator k.
-    coupling_strengths : jax.Array, shape (n_oscillators, n_oscillators)
+    coupling_strengths : ArrayLike, shape (n_oscillators, n_oscillators)
         Matrix where coupling_strengths[n1, n2] is the coupling strength
         from oscillator n2 to oscillator n1 (alpha_j^{n1,n2}).
         Diagonal elements are ignored. A value of 0 indicates no direct coupling.
-    phase_diffs : jax.Array, shape (n_oscillators, n_oscillators)
+    phase_diffs : ArrayLike, shape (n_oscillators, n_oscillators)
         Matrix where phase_diffs[n1, n2] is the phase difference for
         coupling from oscillator n2 to oscillator n1 (phi_j^{n1,n2}).
         Diagonal elements are ignored.
@@ -507,6 +510,10 @@ def construct_directed_influence_transition_matrix(
     ValueError
         If input array dimensions do not match the inferred number of oscillators.
     """
+    freqs = jnp.asarray(freqs)
+    damping_coeffs = jnp.asarray(damping_coeffs)
+    coupling_strengths = jnp.asarray(coupling_strengths)
+    phase_diffs = jnp.asarray(phase_diffs)
     n_oscillators = freqs.shape[0]
     if not (
         damping_coeffs.shape == (n_oscillators,)
@@ -817,12 +824,12 @@ def _extract_scale_and_angle(block: jax.Array) -> tuple[jax.Array, jax.Array]:
     return scale, angle
 
 
-def project_coupled_transition_matrix(transition_matrix: jax.Array) -> jax.Array:
+def project_coupled_transition_matrix(transition_matrix: ArrayLike) -> jax.Array:
     """Project each 2x2 block to the closest scaled-rotation oscillator block.
 
     Parameters
     ----------
-    transition_matrix : jax.Array, shape (2 * n_oscillators, 2 * n_oscillators)
+    transition_matrix : ArrayLike, shape (2 * n_oscillators, 2 * n_oscillators)
 
     Returns
     -------
@@ -833,6 +840,7 @@ def project_coupled_transition_matrix(transition_matrix: jax.Array) -> jax.Array
     ValueError
         If the input matrix dimensions are not even or not square.
     """
+    transition_matrix = jnp.asarray(transition_matrix)
     dim = transition_matrix.shape[0]
     if dim % 2 != 0 or transition_matrix.shape != (dim, dim):
         raise ValueError("Input transition_matrix must be square with even dimensions.")
@@ -963,7 +971,7 @@ def _cnm_psd_shrink_factor(
 
 @typed_jit
 def project_correlated_noise_process_covariance(
-    process_covariance: jax.Array,
+    process_covariance: ArrayLike,
     min_eigenvalue: float = 1e-8,
 ) -> jax.Array:
     """Project a covariance to the CNM block structure while preserving PSD.
@@ -978,6 +986,7 @@ def project_correlated_noise_process_covariance(
     (one eigendecomposition, no host syncs) and jit-compiled, so per-EM-iteration
     callers pay one compile per covariance shape.
     """
+    process_covariance = jnp.asarray(process_covariance)
     structured, diag_only = _cnm_structured_projection(
         process_covariance, min_eigenvalue
     )
@@ -988,7 +997,7 @@ def project_correlated_noise_process_covariance(
 
 
 def constrain_correlated_noise_process_covariance(
-    process_covariance: jax.Array,
+    process_covariance: ArrayLike,
     min_eigenvalue: float = 1e-8,
 ) -> jax.Array:
     """Return the exact PSD CNM projection of a residual covariance.
@@ -1033,10 +1042,11 @@ def constrain_correlated_noise_process_covariance(
 
 
 def extract_correlated_noise_params_from_covariance(
-    process_covariance: jax.Array,
+    process_covariance: ArrayLike,
     n_oscillators: int,
 ) -> dict[str, jax.Array]:
     """Extract CNM scientific parameters from a structured process covariance."""
+    process_covariance = jnp.asarray(process_covariance)
     blocks = _matrix_to_oscillator_blocks(process_covariance)
     if blocks.shape[0] != n_oscillators:
         raise ValueError(
@@ -1065,7 +1075,7 @@ def extract_correlated_noise_params_from_covariance(
 
 
 def extract_dim_params_from_matrix(
-    A: jax.Array,
+    A: ArrayLike,
     sampling_freq: float,
     n_oscillators: int,
 ) -> dict[str, jax.Array]:
@@ -1081,7 +1091,7 @@ def extract_dim_params_from_matrix(
 
     Parameters
     ----------
-    A : jax.Array, shape (2*n_osc, 2*n_osc)
+    A : ArrayLike, shape (2*n_osc, 2*n_osc)
         Transition matrix (assumed to have rotation block structure).
     sampling_freq : float
         Sampling frequency in Hz.
@@ -1096,6 +1106,7 @@ def extract_dim_params_from_matrix(
         - coupling_strength: (n_osc, n_osc) - coupling strengths (0 on diagonal)
         - phase_diff: (n_osc, n_osc) - phase differences (0 on diagonal)
     """
+    A = jnp.asarray(A)
     # Reshape A into (n, n, 2, 2) blocks
     blocks = A.reshape(n_oscillators, 2, n_oscillators, 2).transpose(0, 2, 1, 3)
 
@@ -1130,13 +1141,13 @@ def extract_dim_params_from_matrix(
     }
 
 
-def project_matrix_blockwise(transition_matrix: jax.Array) -> jax.Array:
+def project_matrix_blockwise(transition_matrix: ArrayLike) -> jax.Array:
     """Projects each 2x2 oscillator block of the transition matrix to the closest
     rotation matrix.
 
     Parameters
     ----------
-    transition_matrix : jax.Array, shape (2 * n_oscillators, 2 * n_oscillators)
+    transition_matrix : ArrayLike, shape (2 * n_oscillators, 2 * n_oscillators)
 
     Returns
     -------
@@ -1147,6 +1158,7 @@ def project_matrix_blockwise(transition_matrix: jax.Array) -> jax.Array:
     ValueError
         If the input matrix dimensions are not even or not square.
     """
+    transition_matrix = jnp.asarray(transition_matrix)
     dim = transition_matrix.shape[0]
     if dim % 2 != 0 or transition_matrix.shape != (dim, dim):
         raise ValueError("Input transition_matrix must be square with even dimensions.")
@@ -1222,7 +1234,7 @@ def construct_stable_directed_influence_transition_stack(
 
 
 def project_transition_matrix_stack(
-    transition_matrices: jax.Array, max_spectral_radius: float = 0.99
+    transition_matrices: ArrayLike, max_spectral_radius: float = 0.99
 ) -> jax.Array:
     """Project each state's transition matrix onto the coupled-oscillator family.
 
@@ -1240,7 +1252,7 @@ def project_transition_matrix_stack(
 
     Parameters
     ----------
-    transition_matrices : jax.Array, shape (n_latent, n_latent, n_discrete_states)
+    transition_matrices : ArrayLike, shape (n_latent, n_latent, n_discrete_states)
         Per-state transition matrices, ``n_latent = 2 * n_oscillators``.
     max_spectral_radius : float, default=0.99
         See :func:`~state_space_practice.utils.stabilize_transition_matrix` for
@@ -1251,6 +1263,7 @@ def project_transition_matrix_stack(
     -------
     jax.Array, shape (2 * n_oscillators, 2 * n_oscillators, n_discrete_states)
     """
+    transition_matrices = jnp.asarray(transition_matrices)
     return jnp.stack(
         [
             stabilize_transition_matrix(
@@ -1265,7 +1278,7 @@ def project_transition_matrix_stack(
 
 
 def extract_dim_params_from_matrix_stack(
-    transition_matrices: jax.Array, sampling_freq: float, n_oscillators: int
+    transition_matrices: ArrayLike, sampling_freq: float, n_oscillators: int
 ) -> dict[str, jax.Array]:
     """Extract shared DIM oscillator parameters from a per-state matrix stack.
 
@@ -1275,7 +1288,7 @@ def extract_dim_params_from_matrix_stack(
 
     Parameters
     ----------
-    transition_matrices : jax.Array, shape (n_latent, n_latent, n_discrete_states)
+    transition_matrices : ArrayLike, shape (n_latent, n_latent, n_discrete_states)
         Per-state transition matrices, ``n_latent = 2 * n_oscillators``.
     sampling_freq : float
     n_oscillators : int
@@ -1287,6 +1300,7 @@ def extract_dim_params_from_matrix_stack(
         ``coupling_strength`` and ``phase_diff`` of shape
         ``(n_oscillators, n_oscillators, n_discrete_states)``.
     """
+    transition_matrices = jnp.asarray(transition_matrices)
     per_state = [
         extract_dim_params_from_matrix(
             transition_matrices[..., j], sampling_freq, n_oscillators
@@ -1306,11 +1320,11 @@ def extract_dim_params_from_matrix_stack(
 
 
 def optimize_dim_transition_params_joint_until_stationary(
-    gamma1: jax.Array,
-    beta: jax.Array,
+    gamma1: ArrayLike,
+    beta: ArrayLike,
     init_params: dict[str, jax.Array],
     sampling_freq: float,
-    process_cov: jax.Array | None,
+    process_cov: ArrayLike | None,
     max_spectral_radius: float,
     max_damping: float,
     max_restarts: int = 5,

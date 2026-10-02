@@ -1363,9 +1363,9 @@ BERNOULLI_LOGIT_FAMILY = GLMFamily(
 
 @overload
 def glm_laplace_update(
-    one_step_mean: Array,
-    one_step_cov: Array,
-    observations: Array,
+    one_step_mean: ArrayLike,
+    one_step_cov: ArrayLike,
+    observations: ArrayLike,
     eta_func: Callable[[Array], Array],
     family: GLMFamily,
     diagonal_boost: float = ...,
@@ -1379,9 +1379,9 @@ def glm_laplace_update(
 
 @overload
 def glm_laplace_update(
-    one_step_mean: Array,
-    one_step_cov: Array,
-    observations: Array,
+    one_step_mean: ArrayLike,
+    one_step_cov: ArrayLike,
+    observations: ArrayLike,
     eta_func: Callable[[Array], Array],
     family: GLMFamily,
     diagonal_boost: float = ...,
@@ -1395,9 +1395,9 @@ def glm_laplace_update(
 
 
 def glm_laplace_update(
-    one_step_mean: Array,
-    one_step_cov: Array,
-    observations: Array,
+    one_step_mean: ArrayLike,
+    one_step_cov: ArrayLike,
+    observations: ArrayLike,
     eta_func: Callable[[Array], Array],
     family: GLMFamily,
     diagonal_boost: float = 0.0,
@@ -1417,11 +1417,11 @@ def glm_laplace_update(
 
     Parameters
     ----------
-    one_step_mean : Array, shape (n_latent,)
+    one_step_mean : ArrayLike, shape (n_latent,)
         Predicted mean ``A @ m_{t-1}``.
-    one_step_cov : Array, shape (n_latent, n_latent)
+    one_step_cov : ArrayLike, shape (n_latent, n_latent)
         Predicted covariance ``A @ P_{t-1} @ A.T + Q``.
-    observations : Array, shape (n_obs,)
+    observations : ArrayLike, shape (n_obs,)
         Observed counts (Poisson) or 0/1 indicators (Bernoulli) at this bin.
     eta_func : callable ``x -> eta``
         Maps state (n_latent,) to the linear predictor (n_obs,). May be nonlinear;
@@ -1444,6 +1444,9 @@ def glm_laplace_update(
         Fisher iterations whose backtracking was exhausted (see
         :func:`_fisher_scoring_line_search`).
     """
+    one_step_mean = jnp.asarray(one_step_mean)
+    one_step_cov = jnp.asarray(one_step_cov)
+    observations = jnp.asarray(observations)
     if grad_eta_func is None:
         grad_eta_func = jax.jacfwd(eta_func)
     grad_eta = grad_eta_func

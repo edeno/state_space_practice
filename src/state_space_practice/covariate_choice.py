@@ -65,29 +65,29 @@ logger = logging.getLogger(__name__)
 
 
 def covariate_predict(
-    filt_mean: Array,
-    filt_cov: Array,
-    covariates_t: Array,
-    input_gain: Array,
-    transition_matrix: Array,
-    process_noise_cov: Array,
+    filt_mean: ArrayLike,
+    filt_cov: ArrayLike,
+    covariates_t: ArrayLike,
+    input_gain: ArrayLike,
+    transition_matrix: ArrayLike,
+    process_noise_cov: ArrayLike,
 ) -> tuple[Array, Array]:
     """Prediction step with transition matrix and control input.
 
     Parameters
     ----------
-    filt_mean : Array, shape (K-1,)
+    filt_mean : ArrayLike, shape (K-1,)
         Filtered state mean from previous trial.
-    filt_cov : Array, shape (K-1, K-1)
+    filt_cov : ArrayLike, shape (K-1, K-1)
         Filtered state covariance from previous trial.
-    covariates_t : Array, shape (d,)
+    covariates_t : ArrayLike, shape (d,)
         Covariate vector for current trial.
-    input_gain : Array, shape (K-1, d)
+    input_gain : ArrayLike, shape (K-1, d)
         Input-gain matrix B.
-    transition_matrix : Array, shape (K-1, K-1)
+    transition_matrix : ArrayLike, shape (K-1, K-1)
         State transition matrix A. Identity = random walk.
         decay * I = mean-reverting (Ornstein-Uhlenbeck).
-    process_noise_cov : Array, shape (K-1, K-1)
+    process_noise_cov : ArrayLike, shape (K-1, K-1)
         Process noise covariance Q.
 
     Returns
@@ -95,6 +95,8 @@ def covariate_predict(
     pred_mean : Array, shape (K-1,)
     pred_cov : Array, shape (K-1, K-1)
     """
+    input_gain = jnp.asarray(input_gain)
+    transition_matrix = jnp.asarray(transition_matrix)
     pred_mean = transition_matrix @ filt_mean + input_gain @ covariates_t
     pred_cov = transition_matrix @ filt_cov @ transition_matrix.T + process_noise_cov
     return pred_mean, pred_cov
@@ -102,8 +104,8 @@ def covariate_predict(
 
 @typed_jit
 def m_step_input_gain(
-    smoothed_values: Array,
-    covariates: Array,
+    smoothed_values: ArrayLike,
+    covariates: ArrayLike,
     decay: float = 1.0,
 ) -> Array:
     """Closed-form M-step for input-gain matrix B.
@@ -113,9 +115,9 @@ def m_step_input_gain(
 
     Parameters
     ----------
-    smoothed_values : Array, shape (T, K-1)
+    smoothed_values : ArrayLike, shape (T, K-1)
         Smoothed state means from RTS smoother.
-    covariates : Array, shape (T, d)
+    covariates : ArrayLike, shape (T, d)
         Covariate matrix. Row t drives the prediction at trial t
         (transition x_{t-1} -> x_t). Uses covariates[1:] paired with
         the residual at each transition.
@@ -134,6 +136,8 @@ def m_step_input_gain(
     terms from the smoother drop out and this simple regression is
     the exact EM M-step for B.
     """
+    smoothed_values = jnp.asarray(smoothed_values)
+    covariates = jnp.asarray(covariates)
     diff = smoothed_values[1:] - decay * smoothed_values[:-1]  # (T-1, K-1)
     u = covariates[1:]  # (T-1, d) — covariates[i+1] drives diff[i]
 
@@ -147,12 +151,12 @@ def m_step_input_gain(
 
 @partial(typed_jit, static_argnames=("n_options", "max_newton_steps"))
 def m_step_obs_weights(
-    smoothed_values: Array,
-    choices: Array,
-    obs_covariates: Array,
+    smoothed_values: ArrayLike,
+    choices: ArrayLike,
+    obs_covariates: ArrayLike,
     n_options: int,
     inverse_temperature: float,
-    current_obs_weights: Array,
+    current_obs_weights: ArrayLike,
     max_newton_steps: int = 5,
 ) -> Array:
     """Newton M-step for observation weights Theta.
@@ -163,13 +167,13 @@ def m_step_obs_weights(
 
     Parameters
     ----------
-    smoothed_values : Array, shape (T, K-1)
-    choices : Array, shape (T,) int
-    obs_covariates : Array, shape (T, d_obs)
+    smoothed_values : ArrayLike, shape (T, K-1)
+    choices : ArrayLike, shape (T,) int
+    obs_covariates : ArrayLike, shape (T, d_obs)
     n_options : int
         Number of options K (static under ``jax.jit``).
     inverse_temperature : float
-    current_obs_weights : Array, shape (K, d_obs)
+    current_obs_weights : ArrayLike, shape (K, d_obs)
         Current Theta estimate (warm start).
     max_newton_steps : int
         Number of damped Newton steps (static under ``jax.jit``; the loop
@@ -179,6 +183,9 @@ def m_step_obs_weights(
     -------
     Theta_hat : Array, shape (K, d_obs)
     """
+    smoothed_values = jnp.asarray(smoothed_values)
+    obs_covariates = jnp.asarray(obs_covariates)
+    current_obs_weights = jnp.asarray(current_obs_weights)
     T = smoothed_values.shape[0]
     d_obs = obs_covariates.shape[1]
     K = n_options

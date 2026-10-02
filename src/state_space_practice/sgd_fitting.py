@@ -31,6 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from jax import Array
+from jax.typing import ArrayLike
 
 from state_space_practice.parameter_transforms import (
     ParameterTransform,
@@ -259,7 +260,7 @@ def _tree_all_finite_array(tree: object) -> jax.Array:
 
 
 def reconstruct_per_state_array(
-    params: SGDParams, prefix: str, fallback: Array, n_discrete_states: int
+    params: SGDParams, prefix: str, fallback: ArrayLike, n_discrete_states: int
 ) -> Array:
     """Reassemble a ``(..., n_discrete_states)`` array from per-state SGD params.
 
@@ -276,7 +277,7 @@ def reconstruct_per_state_array(
         ``(n_latent, n_latent)`` for ``init_cov``.
     prefix : str
         Key prefix of the per-state entries, e.g. ``"init_cov"``.
-    fallback : Array, shape (..., n_discrete_states)
+    fallback : ArrayLike, shape (..., n_discrete_states)
         Current stacked array, discrete-state axis last, e.g.
         ``(n_latent, n_latent, n_discrete_states)``. Supplies every state
         slice absent from ``params``.
@@ -286,9 +287,11 @@ def reconstruct_per_state_array(
     Returns
     -------
     Array, shape (..., n_discrete_states)
-        ``fallback`` itself (same object) when ``params`` has no
-        ``f"{prefix}_*"`` key, else the restacked array.
+        ``fallback`` as a JAX array (the same object when it already is
+        one) when ``params`` has no ``f"{prefix}_*"`` key, else the
+        restacked array.
     """
+    fallback = jnp.asarray(fallback)
     if not any(k.startswith(f"{prefix}_") for k in params):
         return fallback
     return jnp.stack(

@@ -487,9 +487,9 @@ class QRegularizationConfig:
 
 
 def point_process_kalman_update(
-    one_step_mean: Array,
-    one_step_cov: Array,
-    y_t: Array,
+    one_step_mean: ArrayLike,
+    one_step_cov: ArrayLike,
+    y_t: ArrayLike,
     dt: float,
     log_intensity_func: Callable[[Array, SpikeObsParams], Array],
     spike_params: SpikeObsParams,
@@ -517,11 +517,11 @@ def point_process_kalman_update(
 
     Parameters
     ----------
-    one_step_mean : Array, shape (n_latent,)
+    one_step_mean : ArrayLike, shape (n_latent,)
         Predicted mean from dynamics: A @ m_{t-1}
-    one_step_cov : Array, shape (n_latent, n_latent)
+    one_step_cov : ArrayLike, shape (n_latent, n_latent)
         Predicted covariance: A @ P_{t-1} @ A.T + Q
-    y_t : Array, shape (n_neurons,)
+    y_t : ArrayLike, shape (n_neurons,)
         Spike counts at time t for all neurons
     dt : float
         Time bin width in seconds
@@ -589,6 +589,9 @@ def point_process_kalman_update(
             "point_process_kalman_update expects single-state spike_params with "
             "baseline shape (n_neurons,) and weights shape (n_neurons, n_latent)."
         )
+    one_step_mean = jnp.asarray(one_step_mean)
+    one_step_cov = jnp.asarray(one_step_cov)
+    y_t = jnp.asarray(y_t)
 
     # Create a closure-free wrapper for the shared helper
     # This binds spike_params so _point_process_laplace_update sees Callable[[Array], Array]
@@ -1869,16 +1872,16 @@ def _mixture_newton_iterations(
 
 
 def update_spike_glm_params(
-    spikes: Array,
-    smoother_mean: Array,
+    spikes: ArrayLike,
+    smoother_mean: ArrayLike,
     current_params: SpikeObsParams,
     dt: float,
     max_iter: int = 10,
-    smoother_cov: Array | None = None,
+    smoother_cov: ArrayLike | None = None,
     use_second_order: bool = False,
     weight_l2: float = 0.0,
-    time_weights: Array | None = None,
-    baseline_prior: Array | None = None,
+    time_weights: ArrayLike | None = None,
+    baseline_prior: ArrayLike | None = None,
     baseline_prior_l2: float = 0.0,
 ) -> SpikeObsParams:
     """M-step for spike observation parameters.
@@ -1896,9 +1899,9 @@ def update_spike_glm_params(
 
     Parameters
     ----------
-    spikes : Array, shape (n_time, n_neurons)
+    spikes : ArrayLike, shape (n_time, n_neurons)
         Observed spike counts for all neurons at each timestep.
-    smoother_mean : Array, shape (n_time, n_latent)
+    smoother_mean : ArrayLike, shape (n_time, n_latent)
         Smoothed latent state estimates from the E-step.
     current_params : SpikeObsParams
         Current parameter estimates (for warm-starting).
@@ -1909,7 +1912,7 @@ def update_spike_glm_params(
         second-order method use Newton steps with analytical gradient and
         Hessian plus Armijo backtracking line search — there is no BFGS
         path. This sets the per-neuron Newton step budget.
-    smoother_cov : Array | None, shape (n_time, n_latent, n_latent), optional
+    smoother_cov : ArrayLike | None, shape (n_time, n_latent, n_latent), optional
         Smoothed latent state covariances. Required if use_second_order=True.
     use_second_order : bool, default=False
         If True, use second-order expectation method that accounts for
@@ -1917,9 +1920,9 @@ def update_spike_glm_params(
     weight_l2 : float, default=0.0
         L2 regularization strength on the weights (not baseline).
         Adds 0.5 * weight_l2 * ||weights||^2 to the objective for each neuron.
-    time_weights : Array | None, shape (n_time,), optional
+    time_weights : ArrayLike | None, shape (n_time,), optional
         Per-timestep weights (e.g., state responsibilities). If None, uses ones.
-    baseline_prior : Array | None, optional
+    baseline_prior : ArrayLike | None, optional
         Prior center for baseline shrinkage. If None, uses a zero-centered
         prior when baseline_prior_l2 > 0.
     baseline_prior_l2 : float, default=0.0
@@ -1947,6 +1950,9 @@ def update_spike_glm_params(
     which helps prevent overfitting when the number of neurons is small
     relative to the latent dimensionality.
     """
+    spikes = jnp.asarray(spikes)
+    smoother_mean = jnp.asarray(smoother_mean)
+    smoother_cov = None if smoother_cov is None else jnp.asarray(smoother_cov)
     n_time = smoother_mean.shape[0]
     n_latent = smoother_mean.shape[1]
 
@@ -2032,15 +2038,15 @@ def update_spike_glm_params(
 
 
 def update_spike_glm_params_mixture(
-    spikes: Array,
-    state_cond_smoother_mean: Array,
-    state_cond_smoother_cov: Array,
-    state_weights: Array,
+    spikes: ArrayLike,
+    state_cond_smoother_mean: ArrayLike,
+    state_cond_smoother_cov: ArrayLike,
+    state_weights: ArrayLike,
     current_params: SpikeObsParams,
     dt: float,
     max_iter: int = 10,
     weight_l2: float = 0.0,
-    baseline_prior: Array | None = None,
+    baseline_prior: ArrayLike | None = None,
     baseline_prior_l2: float = 0.0,
 ) -> SpikeObsParams:
     """M-step for shared spike GLM parameters under a switching posterior.
@@ -2055,6 +2061,8 @@ def update_spike_glm_params_mixture(
     Newton solve runs in the promoted precision).
     """
     spikes = jnp.asarray(spikes)
+    state_cond_smoother_mean = jnp.asarray(state_cond_smoother_mean)
+    state_cond_smoother_cov = jnp.asarray(state_cond_smoother_cov)
     state_weights = jnp.asarray(state_weights)
     n_time, n_latent, n_states = state_cond_smoother_mean.shape
 
@@ -2476,13 +2484,13 @@ def _switching_point_process_filter_jit(
 
 
 def switching_point_process_filter(
-    init_state_cond_mean: Array,
-    init_state_cond_cov: Array,
-    init_discrete_state_prob: Array,
-    spikes: Array,
-    discrete_transition_matrix: Array,
-    continuous_transition_matrix: Array,
-    process_cov: Array,
+    init_state_cond_mean: ArrayLike,
+    init_state_cond_cov: ArrayLike,
+    init_discrete_state_prob: ArrayLike,
+    spikes: ArrayLike,
+    discrete_transition_matrix: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
     dt: float,
     log_intensity_func: Callable[[Array, SpikeObsParams], Array],
     spike_params: SpikeObsParams,
@@ -2513,6 +2521,13 @@ def switching_point_process_filter(
     tuple of Array
         Same 7-tuple as ``_switching_point_process_filter_jit``.
     """
+    init_state_cond_mean = jnp.asarray(init_state_cond_mean)
+    init_state_cond_cov = jnp.asarray(init_state_cond_cov)
+    init_discrete_state_prob = jnp.asarray(init_discrete_state_prob)
+    spikes = jnp.asarray(spikes)
+    discrete_transition_matrix = jnp.asarray(discrete_transition_matrix)
+    continuous_transition_matrix = jnp.asarray(continuous_transition_matrix)
+    process_cov = jnp.asarray(process_cov)
     _validate_discrete_state_transitions(
         discrete_transition_matrix, init_discrete_state_prob, dt
     )
@@ -2582,7 +2597,7 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         sampling_freq: float,
         dt: float,
         *,
-        discrete_transition_diag: Array | None,
+        discrete_transition_diag: ArrayLike | None,
         update_continuous_transition_matrix: bool,
         update_process_cov: bool,
         update_discrete_transition_matrix: bool,
@@ -3377,7 +3392,7 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
 
     def fit_sgd(
         self,
-        spikes: Array,
+        spikes: ArrayLike,
         key: Array | None = None,
         optimizer: optax.GradientTransformation | None = None,
         num_steps: int = 200,
@@ -3388,7 +3403,7 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
 
         Parameters
         ----------
-        spikes : Array, shape (n_time, n_neurons)
+        spikes : ArrayLike, shape (n_time, n_neurons)
             Observed spike counts.
         key : Array or None
             JAX random key for initialization. Required on first call.
@@ -3583,7 +3598,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
     dt : float
         Time bin width in seconds. Must be positive. Typically dt <= 1/sampling_freq
         for numerical stability.
-    discrete_transition_diag : Array | None, optional
+    discrete_transition_diag : ArrayLike | None, optional
         Diagonal elements of the discrete transition matrix (self-transition
         probabilities). Values should be in [0, 1]. Shape must be (n_discrete_states,)
         if provided. If None, defaults to 0.95 for all states.
@@ -3679,7 +3694,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         n_discrete_states: int,
         sampling_freq: float,
         dt: float,
-        discrete_transition_diag: Array | None = None,
+        discrete_transition_diag: ArrayLike | None = None,
         update_continuous_transition_matrix: bool = True,
         update_process_cov: bool = True,
         update_discrete_transition_matrix: bool = True,
@@ -3709,7 +3724,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
             Sampling frequency in Hz.
         dt : float
             Time bin width in seconds.
-        discrete_transition_diag : Array | None, optional
+        discrete_transition_diag : ArrayLike | None, optional
             Diagonal of discrete transition matrix. Defaults to 0.95.
         update_continuous_transition_matrix : bool, default=True
             Update A during M-step.

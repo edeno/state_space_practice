@@ -60,12 +60,12 @@ def _root_figure(ax: Axes) -> Figure:
 # ---------------------------------------------------------------------------
 
 
-def symmetrize(A: jax.Array) -> jax.Array:
+def symmetrize(A: ArrayLike) -> jax.Array:
     """Symmetrize one or more matrices by averaging each matrix with its transpose.
 
     Parameters
     ----------
-    A : jax.Array
+    A : ArrayLike
         A matrix or a batch of matrices to be symmetrized. The last two
         dimensions should be square matrices.
 
@@ -84,6 +84,7 @@ def symmetrize(A: jax.Array) -> jax.Array:
            [2.5, 4. ]], dtype=float32)
 
     """
+    A = jnp.asarray(A)
     return 0.5 * (A + jnp.swapaxes(A, -1, -2))
 
 
@@ -149,7 +150,7 @@ def _stabilizing_shift(
 
 
 def psd_cholesky(
-    A: jax.Array,
+    A: ArrayLike,
     diagonal_boost: float = 0.0,
     relative_boost: float | None = None,
 ) -> tuple[jax.Array, bool]:
@@ -169,7 +170,7 @@ def psd_cholesky(
 
     Parameters
     ----------
-    A : jax.Array
+    A : ArrayLike
         Coefficient matrix or batch of matrices, expected positive
         semi-definite. Only the last two axes are treated as the matrix.
     diagonal_boost : float, optional
@@ -188,6 +189,7 @@ def psd_cholesky(
         The stabilized matrix's log-determinant is
         ``2 * sum(log(abs(diag(factor))))``.
     """
+    A = jnp.asarray(A)
     A_sym = symmetrize(A)
     shift = _stabilizing_shift(A_sym, diagonal_boost, relative_boost)
     n = A.shape[-1]
@@ -220,8 +222,8 @@ def psd_logdet(cho: tuple[jax.Array, bool]) -> jax.Array:
 
 
 def psd_solve(
-    A: jax.Array,
-    b: jax.Array,
+    A: ArrayLike,
+    b: ArrayLike,
     diagonal_boost: float = 0.0,
     relative_boost: float | None = None,
 ) -> jax.Array:
@@ -273,10 +275,10 @@ def psd_solve(
 
     Parameters
     ----------
-    A : jax.Array
+    A : ArrayLike
         The coefficient matrix or batch of coefficient matrices, expected to
         be positive semi-definite.
-    b : jax.Array
+    b : ArrayLike
         The right-hand side vector or matrix.
     diagonal_boost : float, optional
         Absolute floor for the stabilization shift. Default 0.0.
@@ -301,6 +303,7 @@ def psd_solve(
     # the deprecation recommends -- and drop it again. The non-batched vector
     # path is numerically unchanged, and 2D matrix right-hand sides (all
     # internal callers) are untouched.
+    A = jnp.asarray(A)
     cho = psd_cholesky(A, diagonal_boost=diagonal_boost, relative_boost=relative_boost)
     b = jnp.asarray(b)
     rhs_is_vector = b.ndim == A.ndim - 1
@@ -310,7 +313,7 @@ def psd_solve(
 
 
 def clip_eigenvalues(
-    mat: jax.Array,
+    mat: ArrayLike,
     min_eigenvalue: float | None = None,
     max_eigenvalue: float | None = None,
 ) -> jax.Array:
@@ -323,7 +326,7 @@ def clip_eigenvalues(
 
     Parameters
     ----------
-    mat : jax.Array, shape (n, n)
+    mat : ArrayLike, shape (n, n)
         Matrix to clip; only its symmetric part is used.
     min_eigenvalue, max_eigenvalue : float or None
         Lower / upper bound on the eigenvalues; ``None`` leaves that side open.
@@ -342,7 +345,7 @@ def clip_eigenvalues(
     return cast(jax.Array, eigvecs @ jnp.diag(eigvals) @ eigvecs.T)
 
 
-def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
+def project_psd(Q: ArrayLike, min_eigenvalue: float = 1e-8) -> jax.Array:
     """Project a matrix onto the positive semi-definite cone.
 
     This function ensures the input matrix is positive semi-definite by:
@@ -352,7 +355,7 @@ def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
 
     Parameters
     ----------
-    Q : jax.Array
+    Q : ArrayLike
         A symmetric matrix to project onto the PSD cone. Shape (n, n).
     min_eigenvalue : float, optional
         Minimum eigenvalue to enforce. Default is 1e-8.
@@ -369,7 +372,7 @@ def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
     return symmetrize(projected)
 
 
-def stabilize_covariance(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
+def stabilize_covariance(cov: ArrayLike, min_eigenvalue: float = 1e-8) -> jax.Array:
     """Symmetrize a covariance-like matrix and project it to the PSD cone."""
     return project_psd(symmetrize(cov), min_eigenvalue=min_eigenvalue)
 
@@ -382,7 +385,7 @@ PSD_ABSOLUTE_FLOOR = 1e-30
 
 
 def relative_psd_floor(
-    eigenvalues: Array,
+    eigenvalues: ArrayLike,
     relative_floor: float = PSD_RELATIVE_FLOOR,
     absolute_floor: float = PSD_ABSOLUTE_FLOOR,
 ) -> Array:
@@ -397,7 +400,7 @@ def relative_psd_floor(
 
     Parameters
     ----------
-    eigenvalues : Array, shape (..., n)
+    eigenvalues : ArrayLike, shape (..., n)
         Eigenvalues (or the diagonal of a diagonal covariance).
     relative_floor : float, default=PSD_RELATIVE_FLOOR
         Floor as a fraction of the largest eigenvalue magnitude.
@@ -463,11 +466,11 @@ def _log_floored_eigenvalues(
 
 
 def warn_if_floored(
-    n_floored: Array,
-    floor: Array,
+    n_floored: ArrayLike,
+    floor: ArrayLike,
     name: str,
-    min_eigenvalue: Array | None = None,
-    max_abs_eigenvalue: Array | None = None,
+    min_eigenvalue: ArrayLike | None = None,
+    max_abs_eigenvalue: ArrayLike | None = None,
 ) -> None:
     """Log (host side, jit-safe) that ``n_floored`` eigenvalues were floored.
 
@@ -485,13 +488,13 @@ def warn_if_floored(
 
     Parameters
     ----------
-    n_floored : Array
+    n_floored : ArrayLike
         Number of eigenvalues (or variances) that were raised to the floor.
-    floor : Array
+    floor : ArrayLike
         The floor that was applied.
     name : str
         Name of the quantity, used in the log message.
-    min_eigenvalue, max_abs_eigenvalue : Array or None, optional
+    min_eigenvalue, max_abs_eigenvalue : ArrayLike or None, optional
         Minimum eigenvalue and largest eigenvalue magnitude of the matrix
         before flooring (on the scale the floor was applied on).
     """
@@ -506,7 +509,7 @@ def warn_if_floored(
 
 
 def clip_eigenvalues_relative(
-    cov: Array,
+    cov: ArrayLike,
     relative_floor: float = PSD_RELATIVE_FLOOR,
     absolute_floor: float = PSD_ABSOLUTE_FLOOR,
 ) -> tuple[Array, Array]:
@@ -518,7 +521,7 @@ def clip_eigenvalues_relative(
 
     Parameters
     ----------
-    cov : Array, shape (n, n)
+    cov : ArrayLike, shape (n, n)
         Covariance-like matrix; only its symmetric part is used.
     relative_floor, absolute_floor : float
         See :func:`relative_psd_floor`; applied to the eigenvalues of the
@@ -533,6 +536,7 @@ def clip_eigenvalues_relative(
         Number of correlation-scale eigenvalues that were raised to the floor
         (int scalar).
     """
+    cov = jnp.asarray(cov)
     projected, n_floored, _, _ = _clip_eigenvalues_relative(
         cov, relative_floor, absolute_floor
     )
@@ -580,7 +584,7 @@ def _clip_eigenvalues_relative(
 
 
 def project_psd_relative(
-    cov: Array,
+    cov: ArrayLike,
     relative_floor: float = PSD_RELATIVE_FLOOR,
     absolute_floor: float = PSD_ABSOLUTE_FLOOR,
     name: str = "covariance",
@@ -601,7 +605,7 @@ def project_psd_relative(
 
     Parameters
     ----------
-    cov : Array, shape (n, n)
+    cov : ArrayLike, shape (n, n)
         Covariance estimate; only its symmetric part is used.
     relative_floor, absolute_floor : float
         See :func:`relative_psd_floor`; applied to the correlation-scaled
@@ -617,6 +621,7 @@ def project_psd_relative(
     projected : Array, shape (n, n)
         Symmetric positive-definite matrix.
     """
+    cov = jnp.asarray(cov)
     projected, n_floored, floor, eigvals = _clip_eigenvalues_relative(
         cov, relative_floor, absolute_floor
     )
@@ -632,7 +637,7 @@ def project_psd_relative(
 
 
 def floor_variances_relative(
-    variances: Array,
+    variances: ArrayLike,
     relative_floor: float = PSD_RELATIVE_FLOOR,
     absolute_floor: float = PSD_ABSOLUTE_FLOOR,
     name: str = "variances",
@@ -642,7 +647,7 @@ def floor_variances_relative(
 
     Parameters
     ----------
-    variances : Array, shape (n,)
+    variances : ArrayLike, shape (n,)
         Diagonal of a diagonal covariance.
     relative_floor, absolute_floor : float
         See :func:`relative_psd_floor`.
@@ -664,7 +669,7 @@ def floor_variances_relative(
     return jnp.where(floored, floor, variances)
 
 
-def shift_to_psd(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
+def shift_to_psd(cov: ArrayLike, min_eigenvalue: float = 1e-8) -> jax.Array:
     r"""Lift a symmetric matrix to the PSD cone by a uniform eigenvalue shift.
 
     Returns ``cov + max(min_eigenvalue - lambda_min(cov), 0) * I`` -- the
@@ -690,7 +695,7 @@ def shift_to_psd(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
 
     Parameters
     ----------
-    cov : jax.Array
+    cov : ArrayLike
         A symmetric matrix. Shape (n, n).
     min_eigenvalue : float, optional
         Target lower bound on the minimum eigenvalue. Default is 1e-8.
@@ -701,6 +706,7 @@ def shift_to_psd(cov: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
         ``cov`` shifted so its minimum eigenvalue is at least
         ``min_eigenvalue``. Shape (n, n).
     """
+    cov = jnp.asarray(cov)
     lambda_min = jnp.linalg.eigvalsh(cov).min()
     shift = jnp.maximum(min_eigenvalue - lambda_min, 0.0)
     return cov + shift * jnp.eye(cov.shape[-1], dtype=cov.dtype)
@@ -1008,7 +1014,7 @@ def warn_if_not_positive_definite_in_graph(
     )
 
 
-def debug_print_if(condition: jax.Array, fmt: str, **fmt_kwargs: Any) -> None:
+def debug_print_if(condition: ArrayLike, fmt: str, **fmt_kwargs: Any) -> None:
     """Fire ``jax.debug.print(fmt, **fmt_kwargs)`` only when ``condition`` is True.
 
     Wraps ``jax.lax.cond`` so callers don't have to spell out the
@@ -1348,7 +1354,7 @@ def _validate_filter_numerics(
 
 
 def validate_covariance(
-    covariance: Array,
+    covariance: ArrayLike,
     name: str = "covariance",
     *,
     require_positive_definite: bool = True,
@@ -1365,7 +1371,7 @@ def validate_covariance(
 
     Parameters
     ----------
-    covariance : Array
+    covariance : ArrayLike
         Either a single square matrix ``(d, d)`` or a stack of per-discrete-
         state matrices ``(d, d, n_states)`` (discrete-state axis last, per the
         project convention).
@@ -1448,7 +1454,7 @@ def validate_covariance(
 
 
 def validate_transition_matrix(
-    transition_matrix: Array,
+    transition_matrix: ArrayLike,
     name: str = "transition_matrix",
     *,
     atol: float = 1e-6,
@@ -1457,7 +1463,7 @@ def validate_transition_matrix(
 
     Parameters
     ----------
-    transition_matrix : Array, shape (n_states, n_states)
+    transition_matrix : ArrayLike, shape (n_states, n_states)
         Discrete-state transition matrix, row-stochastic by convention
         (``T[i, j] = P(next = j | current = i)``).
     name : str
@@ -1500,7 +1506,7 @@ def validate_transition_matrix(
 
 
 def validate_probability_vector(
-    probabilities: Array,
+    probabilities: ArrayLike,
     name: str = "probabilities",
     *,
     atol: float = 1e-6,
@@ -1509,7 +1515,7 @@ def validate_probability_vector(
 
     Parameters
     ----------
-    probabilities : Array, shape (n_states,)
+    probabilities : ArrayLike, shape (n_states,)
         Discrete probability vector.
     name : str
         Field name used in error messages.
@@ -1551,7 +1557,7 @@ _LOG_FLOOR_VALUE = float(np.log(_LOG_PROB_FLOOR))
 _DISCRETE_PROB_STABILITY_FLOOR = 1e-10
 
 
-def divide_safe(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
+def divide_safe(numerator: ArrayLike, denominator: ArrayLike) -> jax.Array:
     """Divide two arrays, returning 0.0 where denominator is exactly 0.0.
 
     Guards against division-by-zero for exact floating-point zeros only
@@ -1560,8 +1566,8 @@ def divide_safe(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
 
     Parameters
     ----------
-    numerator : jax.Array
-    denominator : jax.Array
+    numerator : ArrayLike
+    denominator : ArrayLike
 
     Returns
     -------
@@ -1572,7 +1578,7 @@ def divide_safe(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
     return jnp.where(denominator == 0.0, 0.0, numerator / safe_denominator)
 
 
-def safe_log(x: jax.Array) -> jax.Array:
+def safe_log(x: ArrayLike) -> jax.Array:
     """Compute log(x) with numerical stability for small probabilities.
 
     Uses jnp.where to explicitly handle near-zero values rather than
@@ -1580,7 +1586,7 @@ def safe_log(x: jax.Array) -> jax.Array:
 
     Parameters
     ----------
-    x : jax.Array
+    x : ArrayLike
         Input array (typically probabilities).
 
     Returns
@@ -1601,7 +1607,7 @@ def safe_log(x: jax.Array) -> jax.Array:
     return jnp.where(jnp.isnan(x), jnp.nan, result)
 
 
-def stabilize_probability_vector(probabilities: jax.Array) -> jax.Array:
+def stabilize_probability_vector(probabilities: ArrayLike) -> jax.Array:
     """Prevent exact-zero probability lockout from numerical underflow.
 
     Applies a small floor to each element, then re-normalizes so the vector
@@ -1610,7 +1616,7 @@ def stabilize_probability_vector(probabilities: jax.Array) -> jax.Array:
 
     Parameters
     ----------
-    probabilities : jax.Array, shape (n_states,)
+    probabilities : ArrayLike, shape (n_states,)
         Probability vector (non-negative, ideally sums to 1).
 
     Returns
@@ -1665,12 +1671,12 @@ def stabilize_probability_vector(probabilities: jax.Array) -> jax.Array:
     return stabilized / jnp.sum(stabilized)
 
 
-def scale_likelihood(log_likelihood: jax.Array) -> tuple[jax.Array, jax.Array]:
+def scale_likelihood(log_likelihood: ArrayLike) -> tuple[jax.Array, jax.Array]:
     """Scale the log likelihood to avoid numerical underflow.
 
     Parameters
     ----------
-    log_likelihood : jax.Array
+    log_likelihood : ArrayLike
         Log likelihood values.
 
     Returns
@@ -1761,7 +1767,7 @@ def check_converged(
     return bool(is_converged), bool(is_increasing)
 
 
-def make_discrete_transition_matrix(diag: Array, n_discrete_states: int) -> Array:
+def make_discrete_transition_matrix(diag: ArrayLike, n_discrete_states: int) -> Array:
     """Build a row-stochastic transition matrix from diagonal values.
 
     Off-diagonal elements distribute the remaining probability mass
@@ -1769,7 +1775,7 @@ def make_discrete_transition_matrix(diag: Array, n_discrete_states: int) -> Arra
 
     Parameters
     ----------
-    diag : Array, shape (n_discrete_states,)
+    diag : ArrayLike, shape (n_discrete_states,)
         Diagonal (self-transition) probabilities for each state.
     n_discrete_states : int
         Number of discrete states.
@@ -1810,9 +1816,9 @@ def make_discrete_transition_matrix(diag: Array, n_discrete_states: int) -> Arra
 
 @typed_jit
 def hmm_viterbi(
-    initial_probs: Array,
-    transition_matrix: Array,
-    log_likelihoods: Array,
+    initial_probs: ArrayLike,
+    transition_matrix: ArrayLike,
+    log_likelihoods: ArrayLike,
 ) -> Array:
     """Find the most likely discrete state sequence (Viterbi algorithm).
 
@@ -1821,12 +1827,12 @@ def hmm_viterbi(
 
     Parameters
     ----------
-    initial_probs : Array, shape (K,)
+    initial_probs : ArrayLike, shape (K,)
         Prior probability of each discrete state at time 0.
-    transition_matrix : Array, shape (K, K)
+    transition_matrix : ArrayLike, shape (K, K)
         Row-stochastic transition matrix where entry ``(i, j)`` is
         ``P(S_t = j | S_{t-1} = i)``.
-    log_likelihoods : Array, shape (T, K)
+    log_likelihoods : ArrayLike, shape (T, K)
         Per-state log observation likelihoods ``log p(y_t | S_t = k)``
         at each time step.
 
@@ -1835,6 +1841,7 @@ def hmm_viterbi(
     states : Array, shape (T,)
         Most likely state sequence (integer-valued).
     """
+    log_likelihoods = jnp.asarray(log_likelihoods)
     num_timesteps, num_states = log_likelihoods.shape
     log_initial_probs = zero_preserving_log(initial_probs)
     log_transition_matrix = zero_preserving_log(transition_matrix)
@@ -1866,7 +1873,7 @@ def hmm_viterbi(
     return jnp.concatenate([jnp.array([first_state]), states])
 
 
-def zero_preserving_log(probabilities: Array) -> Array:
+def zero_preserving_log(probabilities: ArrayLike) -> Array:
     """Elementwise log of probabilities that keeps exact zeros at ``-inf``.
 
     There is no floor: an exact zero maps to ``-inf`` (an impossible state or
@@ -1877,7 +1884,7 @@ def zero_preserving_log(probabilities: Array) -> Array:
 
     Parameters
     ----------
-    probabilities : Array, shape (...)
+    probabilities : ArrayLike, shape (...)
         Probabilities (any shape).
 
     Returns
@@ -1897,8 +1904,8 @@ def zero_preserving_log(probabilities: Array) -> Array:
 
 
 def compute_state_overlap(
-    z1: Array,
-    z2: Array,
+    z1: ArrayLike,
+    z2: ArrayLike,
 ) -> Array:
     """Compute a matrix of state-wise overlap counts between two state sequences.
 
@@ -1907,9 +1914,9 @@ def compute_state_overlap(
 
     Parameters
     ----------
-    z1 : Int[Array, " num_timesteps"]
+    z1 : Int[ArrayLike, " num_timesteps"]
         First state sequence (integer-valued, non-negative).
-    z2 : Int[Array, " num_timesteps"]
+    z2 : Int[ArrayLike, " num_timesteps"]
         Second state sequence (integer-valued, non-negative, same length).
 
     Returns
@@ -1935,8 +1942,8 @@ def compute_state_overlap(
 
 
 def find_permutation(
-    z1: Array,
-    z2: Array,
+    z1: ArrayLike,
+    z2: ArrayLike,
 ) -> np.ndarray:
     """Find the permutation of labels in ``z1`` that best aligns with ``z2``.
 
@@ -1945,9 +1952,9 @@ def find_permutation(
 
     Parameters
     ----------
-    z1 : Int[Array, " num_timesteps"]
+    z1 : Int[ArrayLike, " num_timesteps"]
         First state sequence (integer-valued, non-negative).
-    z2 : Int[Array, " num_timesteps"]
+    z2 : Int[ArrayLike, " num_timesteps"]
         Second state sequence (integer-valued, non-negative, same length).
 
     Returns
