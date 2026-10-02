@@ -541,7 +541,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         tol : float, default=1e-4
             Convergence tolerance for relative log-likelihood change.
         key : Array | None, optional
-            JAX random key for initialization. Defaults to PRNGKey(0).
+            JAX random key for initialization. Defaults to ``jax.random.key(0)``.
         skip_init : bool, default=False
             If True, skip initialization (use existing parameters).
         n_restarts : int, default=1
@@ -565,7 +565,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         spikes = self._validate_spikes(spikes)
 
         if key is None:
-            key = jax.random.PRNGKey(0)
+            key = jax.random.key(0)
 
         if n_restarts > 1 and not skip_init:
             return self._fit_multi_restart(spikes, max_iter, tol, key, n_restarts)

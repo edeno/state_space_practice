@@ -1104,7 +1104,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
         key : Array or None, optional
-            JAX random key for initialization. Defaults to PRNGKey(0).
+            JAX random key for initialization. Defaults to ``jax.random.key(0)``.
         max_iter : int, optional
             Maximum number of EM iterations, by default 100.
         tol : float, optional
@@ -1126,7 +1126,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         """
         observations = self._validate_observations(observations)
         if key is None:
-            key = jax.random.PRNGKey(0)
+            key = jax.random.key(0)
         if not skip_init:
             self._initialize_parameters(key)
             self._warm_initialize_states(observations)
@@ -1177,7 +1177,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
             The sequence of observations.
         key : Array or None
             JAX random key for parameter initialization.
-            If None, defaults to ``jax.random.PRNGKey(0)``.
+            If None, defaults to ``jax.random.key(0)``.
         optimizer : optax optimizer or None
             Default: adam(1e-2) with gradient clipping.
         num_steps : int
@@ -1260,7 +1260,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
                     "fit_sgd(observations, key=...) without skip_init first."
                 )
         else:
-            self._initialize_parameters(jax.random.PRNGKey(0) if key is None else key)
+            self._initialize_parameters(jax.random.key(0) if key is None else key)
             self._warm_initialize_states(observations)
         self._sgd_n_time = observations.shape[0]
         return (observations,), {}
@@ -1356,7 +1356,9 @@ class CommonOscillatorModel(BaseModel):
     def _initialize_measurement_matrix(self, key: Array | None = None) -> None:
         """Initializes H with small random values, varying across discrete states."""
         if key is None:
-            raise ValueError("A JAX PRNGKey must be provided for COM initialization.")
+            raise ValueError(
+                "A JAX random key must be provided for COM initialization."
+            )
         self.measurement_matrix = jax.random.uniform(
             key,
             (self.n_sources, self.n_cont_states, self.n_discrete_states),
@@ -2140,7 +2142,7 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         observations : ArrayLike, shape (n_time, n_sources)
         key : Array or None
             JAX random key for parameter initialization.
-            If None, defaults to ``jax.random.PRNGKey(0)``.
+            If None, defaults to ``jax.random.key(0)``.
         optimizer : optax optimizer or None
         num_steps : int
         verbose : bool

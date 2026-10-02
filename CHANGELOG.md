@@ -162,6 +162,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **Typed PRNG keys internally**: default and seed-derived keys use
+  `jax.random.key` (JAX's recommended typed keys) instead of the legacy
+  `jax.random.PRNGKey`, which JAX plans to deprecate. Both encode the same
+  stream, so results are unchanged, and every `key=` argument still accepts
+  either kind. `HamiltonianModelBase.key` is now a typed key.
 - **`DirectedInfluencePointProcessModel.fit_sgd(connectivity_penalty=...)`
   penalizes the effective coupling**: the stability-scaled coupling that
   enters the transition matrix, as `DirectedInfluenceModel` already did; it

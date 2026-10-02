@@ -1465,7 +1465,7 @@ class SmithLearningModel(SGDFittableMixin):
 
         model = SmithLearningModel(sigma_epsilon=0.22)
         log_likelihoods = model.fit(outcomes)
-        key = jax.random.PRNGKey(0)
+        key = jax.random.key(0)
         prob_percentiles, _ = model.get_learning_curve(key)
         fig, ax = model.plot_learning_curve(key, observed_n_correct=outcomes)
 
@@ -2387,7 +2387,7 @@ class SmithLearningModel(SGDFittableMixin):
         Examples
         --------
         >>> model.fit(outcomes)
-        >>> criterion = model.find_criterion_trial(jax.random.PRNGKey(0))
+        >>> criterion = model.find_criterion_trial(jax.random.key(0))
         >>> if criterion is not None:
         ...     print(f"Learning established at trial {criterion}")
         """
@@ -2760,7 +2760,7 @@ class SmithLearningModel(SGDFittableMixin):
         --------
         >>> model = SmithLearningModel()
         >>> model.fit(responses)
-        >>> key = jax.random.PRNGKey(0)
+        >>> key = jax.random.key(0)
         >>> matrix = model.get_trial_comparison_matrix(key)
         >>> # Check if trial 10 is significantly higher than trial 0
         >>> p_val = matrix[0, 10]

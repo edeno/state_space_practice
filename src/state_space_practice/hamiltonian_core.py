@@ -660,7 +660,7 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
         # cores, so every instance with the same rate shares their cache.
         self.dt = 1.0 / float(sampling_freq)
         self.hidden_dims = hidden_dims or [32, 32]
-        self.key = jax.random.PRNGKey(seed)
+        self.key = jax.random.key(seed)
 
     def transition_func(self, x: ArrayLike, params: dict[str, Array]) -> Array:
         """Deterministic Hamiltonian transition."""

@@ -85,7 +85,7 @@ def simulate_switching_spike_oscillator(
     >>> import jax.numpy as jnp
     >>> import jax
     >>> n_time, n_neurons, n_latent, n_discrete_states = 100, 5, 4, 2
-    >>> key = jax.random.PRNGKey(0)
+    >>> key = jax.random.key(0)
     >>> A = jnp.stack([jnp.eye(n_latent) * 0.99] * n_discrete_states, axis=-1)
     >>> Q = jnp.stack([jnp.eye(n_latent) * 0.01] * n_discrete_states, axis=-1)
     >>> Z = jnp.array([[0.95, 0.05], [0.05, 0.95]])

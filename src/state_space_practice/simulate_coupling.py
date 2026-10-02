@@ -54,7 +54,7 @@ def simulate_coupling(
     transition_matrix, process_covariance = build_transition(params)
     n_latent = transition_matrix.shape[0]
 
-    base_key = jax.random.PRNGKey(seed)
+    base_key = jax.random.key(seed)
     # All keys come from one split: fold_in(k, 1) would collide with
     # split(k, 3)[1] under partitionable threefry.
     init_key, noise_key, spike_key, lfp_key = jax.random.split(base_key, 4)

@@ -335,7 +335,7 @@ def simulate_com_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict[st
         weights = weights.at[i, i % 2, 0].set(0.5)  # theta dims
         weights = weights.at[i, 2 + i % 2, 1].set(0.5)  # beta dims
 
-    key = jax.random.PRNGKey(seed)
+    key = jax.random.key(seed)
     spikes, true_continuous, true_discrete = simulate_switching_spike_oscillator(
         n_time=n_time,
         transition_matrices=A,
@@ -406,7 +406,7 @@ def simulate_cnm_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict[st
     for i in range(n_neurons):
         weights = weights.at[i, i % N_LATENT].set(0.3)
 
-    key = jax.random.PRNGKey(seed)
+    key = jax.random.key(seed)
     _, k2 = jax.random.split(key)
     spikes, true_continuous, true_discrete = simulate_switching_spike_oscillator(
         n_time=n_time,
@@ -493,7 +493,7 @@ def simulate_dim_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict[st
     for i in range(n_neurons):
         weights = weights.at[i, i % N_LATENT].set(0.3)
 
-    key = jax.random.PRNGKey(seed)
+    key = jax.random.key(seed)
     _, k2 = jax.random.split(key)
     spikes, true_continuous, true_discrete = simulate_switching_spike_oscillator(
         n_time=n_time,

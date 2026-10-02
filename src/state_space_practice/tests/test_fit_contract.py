@@ -65,6 +65,7 @@ from state_space_practice.switching_point_process import SwitchingSpikeOscillato
 from state_space_practice.temporal_rate_gp import TemporalRateGP
 from state_space_practice.tests.model_state import (
     assert_model_state_unchanged,
+    assert_snapshots_equal,
     snapshot_model_state,
 )
 
@@ -1022,3 +1023,22 @@ def test_repeat_fit_sgd_resuming_from_fitted_parameters(
     assert builds == [1, 0, 0]
     assert _parameters_changed(trained[0], trained[1])  # guard
     assert _parameters_changed(trained[1], trained[2])
+
+
+# --- PRNG keys: typed (jax.random.key) and legacy (PRNGKey) both accepted ----
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("method", ["fit", "fit_sgd"])
+def test_typed_and_legacy_keys_give_identical_fits(method):
+    """The library uses typed keys internally but accepts legacy uint32 keys;
+    both encode the same stream, so a fit is identical either way."""
+    fitted = []
+    for key in (jax.random.key(3), jax.random.PRNGKey(3)):
+        model = _com_pp()
+        if method == "fit":
+            model.fit(_SPIKES, max_iter=2, key=key)
+        else:
+            model.fit_sgd(_SPIKES, key=key, num_steps=2)
+        fitted.append(snapshot_model_state(model))
+    assert_snapshots_equal(*fitted)

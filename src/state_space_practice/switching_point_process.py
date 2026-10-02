@@ -3848,9 +3848,10 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         # Optimize the *same* filter approximation the E-step/finalize evaluate:
         # pass max_newton_iter and line_search_beta so a model configured with
         # multi-step Laplace does not train against the 1-step LL and then report
-        # a different multi-step LL. Note: with max_newton_iter > 1 the SGD loss
-        # differentiates through the backtracking scan's jnp.where selections, so
-        # the gradient is valid but piecewise-constant in the step size.
+        # a different multi-step LL. Note: with max_newton_iter > 1 the accepted
+        # line-search step size is gradient-stopped (the backtracking loop only
+        # selects it), so the gradient is valid but piecewise-constant in the
+        # step size.
         result = switching_point_process_filter(
             init_state_cond_mean=m0,
             init_state_cond_cov=P0,
@@ -4285,7 +4286,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
             approximate, so small LL decreases are expected. Only roll back
             and stop when the relative decrease exceeds this threshold.
         key : Array | None, optional
-            JAX random key for parameter initialization. If None, uses PRNGKey(0).
+            JAX random key for parameter initialization. If None, uses ``jax.random.key(0)``.
         skip_init : bool, default=False
             If True, skip parameter initialization and use existing parameters.
             This allows custom initialization before calling fit().
@@ -4347,8 +4348,8 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         ...     sampling_freq=100.0,
         ...     dt=0.01,
         ... )
-        >>> spikes = jax.random.poisson(jax.random.PRNGKey(0), 0.5, (100, 10))
-        >>> log_likelihoods = model.fit(spikes, max_iter=20, key=jax.random.PRNGKey(42))
+        >>> spikes = jax.random.poisson(jax.random.key(0), 0.5, (100, 10))
+        >>> log_likelihoods = model.fit(spikes, max_iter=20, key=jax.random.key(42))
         >>> 0 < len(log_likelihoods) <= 21  # <= max_iter, plus at most one final-E-step LL
         True
         """
@@ -4356,7 +4357,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
 
         # Set default random key if not provided
         if key is None:
-            key = jax.random.PRNGKey(0)
+            key = jax.random.key(0)
 
         # Initialize parameters (unless skip_init is True for custom initialization)
         if not skip_init:
