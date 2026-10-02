@@ -1531,6 +1531,70 @@ def glm_laplace_update(
     return posterior_mean, posterior_cov, log_likelihood
 
 
+@overload
+def stochastic_point_process_filter(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: Literal[False] = ...,
+) -> tuple[Array, Array, Array]: ...
+
+
+@overload
+def stochastic_point_process_filter(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    *,
+    return_block_covariances: Literal[True],
+) -> tuple[Array, Array | BlockDiagonalCovariance, Array]: ...
+
+
+@overload
+def stochastic_point_process_filter(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: bool = ...,
+) -> tuple[Array, Array | BlockDiagonalCovariance, Array]: ...
+
+
 def stochastic_point_process_filter(
     init_mean_params: ArrayLike,
     init_covariance_params: ArrayLike,
@@ -2786,9 +2850,6 @@ def stochastic_point_process_smoother(
             max_newton_iter=max_newton_iter,
         )
     )
-    # return_block_covariances defaults to False, so the filter returns dense
-    # covariances.
-    assert not isinstance(filtered_cov, BlockDiagonalCovariance)
 
     smoother_mean, smoother_cov, smoother_cross_cov = (
         _stochastic_point_process_smoother_backward(
