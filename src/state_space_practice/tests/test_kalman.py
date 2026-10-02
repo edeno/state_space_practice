@@ -21,6 +21,7 @@ from state_space_practice.kalman import (
     InitialStatePrior,
     _gain_solve,
     _kalman_smoother_update,
+    _scan_with_boundary,
     joseph_form_update,
     kalman_filter,
     kalman_maximization_step,
@@ -1795,6 +1796,68 @@ class TestKalmanNumericalStability:
 
 
 # --- Parallel Kalman Smoother Tests ---
+
+
+class TestScanWithBoundary:
+    """The boundary-entry scan equals scan + concatenate, without the copies."""
+
+    @staticmethod
+    def _step(
+        carry: Array, x: tuple[Array, Array]
+    ) -> tuple[Array, tuple[tuple[Array, Array], Array]]:
+        a, b = x
+        new = 0.5 * carry + a * b
+        return new, ((new, jnp.outer(new, a)), carry @ b)
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @pytest.mark.parametrize("n_time", [1, 2, 7])
+    def test_matches_scan_and_concatenate(self, reverse: bool, n_time: int) -> None:
+        k_a, k_b = random.split(random.PRNGKey(0))
+        a = random.normal(k_a, (n_time, 3))
+        b = random.normal(k_b, (n_time, 3))
+        init = jnp.ones(3)
+        # float32 boundary: concatenate promotes to the step's float64.
+        boundary = (jnp.full(3, 7.0, jnp.float32), jnp.full((3, 3), -1.0))
+        # Forward: step i reads a[i + 1], b[i]; reverse: a[i], b[i + 1].
+        starts = (0, 1) if reverse else (1, 0)
+        length = n_time - 1
+
+        carry, ys, zs = _scan_with_boundary(
+            self._step, init, (a, b), starts, length, boundary, reverse=reverse
+        )
+
+        ref_carry, ((y0, y1), ref_zs) = jax.lax.scan(
+            self._step,
+            init,
+            (a[starts[0] : starts[0] + length], b[starts[1] : starts[1] + length]),
+            reverse=reverse,
+        )
+        parts = [(y0, y1), tuple(v[None] for v in boundary)]
+        if not reverse:
+            parts = parts[::-1]
+        ref_ys = tuple(jnp.concatenate([parts[0][i], parts[1][i]]) for i in range(2))
+        np.testing.assert_array_equal(carry, ref_carry)
+        np.testing.assert_array_equal(zs, ref_zs)
+        for out, ref in zip(ys, ref_ys, strict=True):
+            assert out.dtype == ref.dtype == jnp.float64
+            assert out.shape == ref.shape == (n_time, *out.shape[1:])
+            np.testing.assert_array_equal(out, ref)
+
+    def test_rts_backward_scan_needs_no_full_size_temporaries(self) -> None:
+        """The RTS pass writes its outputs in place (no concatenate/slice copies)."""
+        T, D = 2000, 4
+        spec = jax.ShapeDtypeStruct
+        compiled = rts_backward_scan.lower(
+            spec((T, D), jnp.float64),
+            spec((T, D, D), jnp.float64),
+            spec((D, D), jnp.float64),
+            spec((D, D), jnp.float64),
+        ).compile()
+        memory = compiled.memory_analysis()
+        if memory is None:
+            pytest.skip("backend reports no memory analysis")
+        # Copying the stacked covariances alone would need T*D*D*8 = 256 kB.
+        assert memory.temp_size_in_bytes < 0.1 * T * D * D * 8
 
 
 class TestParallelKalmanSmoother:

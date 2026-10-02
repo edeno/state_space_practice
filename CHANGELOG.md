@@ -219,6 +219,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   E-step outputs are bit-identical; the public `switching_kalman_filter`,
   `switching_kalman_smoother` and `switching_point_process_filter` are
   unchanged.
+- **Filters and smoothers no longer copy their stacked outputs or inputs**:
+  `kalman.rts_backward_scan`, `rts_backward_scan_with_predictions`, the
+  switching Kalman filter, both switching smoothers (GPB1/GPB2) and the
+  switching point-process filter handled one time step outside their scan
+  and joined it with `jnp.concatenate` (a full copy of every stacked output),
+  and scanned over sliced inputs (`x[1:]`, `x[:-1]`, another copy). They now
+  write into loop-carried output buffers and index the inputs in the loop
+  (`kalman._scan_with_boundary`). Compiled temporaries drop to ~0: e.g.
+  `rts_backward_scan` 110 MB -> 0 at T=200k, d=8;
+  `rts_backward_scan_with_predictions` 220 MB -> 0; at T=20k, 8 latent dims,
+  3 states the switching filter 103 MB -> 0, GPB2 smoother 131 MB -> 0.
+  Outputs are bit-identical; runtime and gradient memory are unchanged.
 - **The choice models skip the duplicate final E-step after convergence**
   (`MultinomialChoiceModel`, `CovariateChoiceModel`, `SwitchingChoiceModel`).
 - **`PlaceFieldModel` posterior rate maps are computed by a jitted JAX

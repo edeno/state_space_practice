@@ -104,6 +104,7 @@ from state_space_practice.em_driver import (
 )
 from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.fitted_state import FittedAttribute
+from state_space_practice.kalman import _scan_with_boundary
 from state_space_practice.oscillator_utils import (
     _matrix_to_oscillator_blocks,
     _oscillator_blocks_to_matrix,
@@ -2401,7 +2402,7 @@ def _switching_point_process_filter_core(
         y_t: Array,
     ) -> tuple[
         tuple[Array, Array, Array, Array, Array, Array],
-        tuple[Array, ...],
+        tuple[tuple[Array, ...], tuple[()]],
     ]:
         """One step of the switching point-process filter.
 
@@ -2528,7 +2529,7 @@ def _switching_point_process_filter_core(
             marginal_log_likelihood,
             next_support,
             n_failed_bins,
-        ), outputs
+        ), (outputs, ())
 
     # Handle first timestep with x₁ convention: update-only (no dynamics prediction)
     # init_state_cond_mean represents p(x₁ | S₁), the prior for the first observation
@@ -2560,31 +2561,6 @@ def _switching_point_process_filter_core(
     # (e.g. +inf) that the sanitizer clamps to 0 would be marked reachable and
     # resurrected to ~1e-10 at the next step. Threaded through the scan.
     first_support = _normalize_initial_discrete_prob(init_discrete_state_prob) > 0.0
-    # Run predict-then-update for t=2,...,T
-    # jax.lax.scan handles empty inputs (spikes[1:] when n_time=1) gracefully
-    (
-        (_, _, _, marginal_log_likelihood, _, n_failed_bins),
-        rest_outputs,
-    ) = jax.lax.scan(
-        _step,
-        (
-            first_state_cond_mean,
-            first_state_cond_cov,
-            first_discrete_prob,
-            first_log_lik,
-            first_support,
-            jnp.any(first_n_failed > 0).astype(jnp.int32),
-        ),
-        spikes[1:],
-    )
-    _warn_line_search_failures(
-        n_failed_bins,
-        spikes.shape[0],
-        max_newton_iter,
-        "switching_point_process_filter",
-    )
-
-    # Prepend first timestep results
     first_outputs: tuple[Array, ...] = (
         first_state_cond_mean,
         first_state_cond_cov,
@@ -2596,10 +2572,34 @@ def _switching_point_process_filter_core(
             first_pair_cond_cov,
             first_pair_cond_prob,
         )
-    outputs = [
-        jnp.concatenate([first[None, ...], rest], axis=0)
-        for first, rest in zip(first_outputs, rest_outputs, strict=True)
-    ]
+    # Run predict-then-update for t=2,...,T (an empty scan when n_time=1); the
+    # first timestep's outputs fill index 0 of the stacked outputs.
+    (
+        (_, _, _, marginal_log_likelihood, _, n_failed_bins),
+        outputs,
+        _,
+    ) = _scan_with_boundary(
+        _step,
+        (
+            first_state_cond_mean,
+            first_state_cond_cov,
+            first_discrete_prob,
+            first_log_lik,
+            first_support,
+            jnp.any(first_n_failed > 0).astype(jnp.int32),
+        ),
+        spikes,
+        1,
+        spikes.shape[0] - 1,
+        first_outputs,
+    )
+    _warn_line_search_failures(
+        n_failed_bins,
+        spikes.shape[0],
+        max_newton_iter,
+        "switching_point_process_filter",
+    )
+
     filtered = SwitchingFilterGPB1Result(
         state_cond_filter_mean=outputs[0],
         state_cond_filter_cov=outputs[1],
