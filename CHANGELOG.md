@@ -486,6 +486,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   from ~1.7 GB to ~0.7 GB (5.6 GB to 0.8 GB at 100,000 steps), with no
   slowdown. Filter and smoother outputs are bit-identical; gradients agree
   to round-off.
+- **`SmithLearningModel.fit_sgd` compiled its SGD step twice per call**: the
+  `init_learning_state` parameter was a weakly typed scalar
+  (`jnp.array(python_float)`) that the first optimizer update made strong,
+  forcing a retrace. The parameters are now built with an explicit dtype,
+  so the step is traced once (first `fit_sgd` on 100 trials 2.4-2.5 s ->
+  1.5-1.6 s); fitted values are bit-identical.
 - **A failed fit no longer leaves stale or non-finite results that look
   fitted**: when a fit raises `NonFiniteLikelihoodError` (its starting
   parameters give a non-finite log-likelihood), it first clears every fit

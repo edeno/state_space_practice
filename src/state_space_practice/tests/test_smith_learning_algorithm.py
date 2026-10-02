@@ -2339,6 +2339,32 @@ class TestSmithSGDFitting:
         assert model.init_learning_state == 0.0
         assert model.is_fitted
 
+    @pytest.mark.parametrize(
+        "initial_state_method", ["reestimate_initial_from_data", "set_initial_to_zero"]
+    )
+    def test_sgd_step_traced_once(
+        self, monkeypatch, simple_outcomes, initial_state_method
+    ):
+        """One fit_sgd traces its SGD step once: the initial parameters are
+        not weakly typed, so the optimizer's (strongly typed) updates do not
+        change the step's input types after the first step."""
+        from state_space_practice import sgd_fitting
+
+        entries = []
+        build = sgd_fitting._build_sgd_step
+
+        def capturing_build(*args, **kwargs):
+            entries.append(build(*args, **kwargs))
+            return entries[-1]
+
+        monkeypatch.setattr(sgd_fitting, "_build_sgd_step", capturing_build)
+        model = SmithLearningModel(
+            sigma_epsilon=0.1, initial_state_method=initial_state_method
+        )
+        model.fit_sgd(simple_outcomes, num_steps=3)
+        assert len(entries) == 1
+        assert entries[0].train_step._cache_size() == 1
+
 
 # ============================================================================
 # Integration: learning curve recovery on simulated data

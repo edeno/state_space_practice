@@ -2004,8 +2004,11 @@ class SmithLearningModel(SGDFittableMixin):
         params: SGDParams = {}
         spec: SGDParamSpec = {}
 
+        # An explicit dtype makes the leaves strongly typed. A weakly typed
+        # leaf (jnp.array of a Python float) turns strong after the first
+        # optimizer update, which retraces and recompiles the SGD step.
         # Process noise is always learnable
-        params["sigma_epsilon"] = jnp.array(self.sigma_epsilon)
+        params["sigma_epsilon"] = jnp.asarray(self.sigma_epsilon, dtype=float)
         spec["sigma_epsilon"] = POSITIVE
 
         # Initial state params depend on initial_state_method
@@ -2013,9 +2016,13 @@ class SmithLearningModel(SGDFittableMixin):
             "reestimate_initial_from_data",
             "user_provided",
         ):
-            params["init_learning_state"] = jnp.array(self.init_learning_state)
+            params["init_learning_state"] = jnp.asarray(
+                self.init_learning_state, dtype=float
+            )
             spec["init_learning_state"] = UNCONSTRAINED
-            params["init_learning_variance"] = jnp.array(self.init_learning_variance)
+            params["init_learning_variance"] = jnp.asarray(
+                self.init_learning_variance, dtype=float
+            )
             spec["init_learning_variance"] = POSITIVE
         # For other methods, init state is data-driven or fixed — freeze it.
 
