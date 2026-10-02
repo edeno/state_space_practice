@@ -84,6 +84,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `fit_sgd` now use).
 - **`switching_choice.switching_choice_smoother`**: GPB1 backward pass that
   accounts for the covariate input ``B u_t``.
+- **`em_driver.snapshot_attributes` / `restore_attributes` /
+  `clear_attributes`**: build `run_em`'s snapshot, restore and clear hooks
+  from a tuple of attribute names; every `run_em` caller now uses them.
 
 ### Testing
 

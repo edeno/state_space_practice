@@ -44,7 +44,12 @@ from jax import Array
 from jax.typing import ArrayLike
 from numpy.typing import DTypeLike
 
-from state_space_practice.em_driver import run_em
+from state_space_practice.em_driver import (
+    clear_attributes,
+    restore_attributes,
+    run_em,
+    snapshot_attributes,
+)
 from state_space_practice.exceptions import NotFittedError
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.kalman import (
@@ -3479,24 +3484,6 @@ class PointProcessModel(SGDFittableMixin):
             "init_cov",
         )
 
-        def _snapshot_state() -> dict[str, Any]:
-            # Unset fitted attributes are left out and unset again on restore.
-            return {k: getattr(self, k) for k in snapshot_keys if hasattr(self, k)}
-
-        def _restore_state(state: dict[str, Any]) -> None:
-            for key in snapshot_keys:
-                if key in state:
-                    setattr(self, key, state[key])
-                else:
-                    delattr(self, key)
-
-        def _clear_posteriors() -> None:
-            # A non-finite first E-step has no accepted state to roll back
-            # to: drop the posteriors it installed so the model reads as
-            # unfitted instead of serving NaN output.
-            for key in posterior_keys:
-                delattr(self, key)
-
         # A rejected E-step (non-finite or decreasing LL) restores the last
         # accepted (parameters, smoother) pair so get_rate_estimate /
         # get_confidence_interval never serve a diverged posterior; a
@@ -3504,13 +3491,13 @@ class PointProcessModel(SGDFittableMixin):
         result = run_em(
             lambda: float(self._e_step(design_matrix, spike_indicator)),
             self._m_step,
-            _snapshot_state,
-            _restore_state,
+            lambda: snapshot_attributes(self, snapshot_keys),
+            lambda state: restore_attributes(self, snapshot_keys, state),
             max_iter=max_iter,
             tol=tolerance,
             logger=logger,
             on_first_nonfinite="clear",
-            clear_state=_clear_posteriors,
+            clear_state=lambda: clear_attributes(self, posterior_keys),
         )
         return result.log_likelihoods
 

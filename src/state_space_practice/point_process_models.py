@@ -23,7 +23,6 @@ References
 
 from __future__ import annotations
 
-import copy
 import functools
 import logging
 from typing import TYPE_CHECKING, Any
@@ -33,7 +32,11 @@ import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.em_driver import run_em
+from state_space_practice.em_driver import (
+    restore_attributes,
+    run_em,
+    snapshot_attributes,
+)
 from state_space_practice.exceptions import NotFittedError
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.oscillator_utils import (
@@ -509,26 +512,13 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         deep-copied, so an in-place edit of the live dict cannot leak into the
         snapshot.
         """
-        deepcopy_attrs = {"_current_osc_params"}
-        snapshot: dict[str, object] = {}
-        for attr in self._EM_SNAPSHOT_KEYS:
-            if not hasattr(self, attr):
-                continue
-            value = getattr(self, attr)
-            snapshot[attr] = copy.deepcopy(value) if attr in deepcopy_attrs else value
-        return snapshot
+        return snapshot_attributes(
+            self, self._EM_SNAPSHOT_KEYS, deepcopy_keys=("_current_osc_params",)
+        )
 
     def _restore_em_state(self, state: dict[str, object]) -> None:
-        """Restore a snapshot produced by ``_snapshot_em_state``.
-
-        A key absent from the snapshot was unset when it was taken (e.g. the
-        smoother outputs before the first E-step), so it is unset again.
-        """
-        for attr in self._EM_SNAPSHOT_KEYS:
-            if attr in state:
-                setattr(self, attr, state[attr])
-            elif is_set(self, attr):
-                delattr(self, attr)
+        """Restore a snapshot produced by ``_snapshot_em_state``."""
+        restore_attributes(self, self._EM_SNAPSHOT_KEYS, state)
 
     # ------------------------------------------------------------------
     # EM loop

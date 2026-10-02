@@ -43,7 +43,12 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.em_driver import run_em
+from state_space_practice.em_driver import (
+    clear_attributes,
+    restore_attributes,
+    run_em,
+    snapshot_attributes,
+)
 from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.kalman import (
@@ -1333,24 +1338,6 @@ class PlaceFieldModel(SGDFittableMixin):
             "_block_size",
         )
 
-        def _capture_state() -> dict[str, object]:
-            # Unset fitted attributes are left out and unset again on restore.
-            return {k: getattr(self, k) for k in snapshot_keys if hasattr(self, k)}
-
-        def _restore_state(state: dict[str, object]) -> None:
-            for key in snapshot_keys:
-                if key in state:
-                    setattr(self, key, state[key])
-                else:
-                    delattr(self, key)
-
-        def _clear_posteriors() -> None:
-            # A non-finite first E-step has no accepted state to roll back
-            # to: drop the posteriors it installed so the model reads as
-            # unfitted (``_check_fitted``) instead of holding NaN output.
-            for key in posterior_keys:
-                delattr(self, key)
-
         def _e_step() -> float:
             return float(self._e_step(design_holder["design_matrix"], spikes))
 
@@ -1382,12 +1369,12 @@ class PlaceFieldModel(SGDFittableMixin):
         result = run_em(
             _e_step,
             _m_step,
-            _capture_state,
-            _restore_state,
+            lambda: snapshot_attributes(self, snapshot_keys),
+            lambda state: restore_attributes(self, snapshot_keys, state),
             max_iter=max_iter,
             tol=tolerance,
             on_first_nonfinite="clear",
-            clear_state=_clear_posteriors,
+            clear_state=lambda: clear_attributes(self, posterior_keys),
             logger=logger,
             on_iteration=_on_iteration,
         )

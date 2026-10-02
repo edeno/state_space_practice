@@ -5,7 +5,13 @@ import logging
 import numpy as np
 import pytest
 
-from state_space_practice.em_driver import run_em
+from state_space_practice.em_driver import (
+    clear_attributes,
+    restore_attributes,
+    run_em,
+    snapshot_attributes,
+)
+from state_space_practice.fitted_state import FittedAttribute, is_set
 
 
 class ScriptedModel:
@@ -318,3 +324,74 @@ def test_iteration_and_warning_hooks_receive_messages():
     assert [s[:2] for s in seen] == [(0, -100.0), (1, -50.0), (2, -80.0)]
     assert np.isnan(seen[0][2]) and seen[1][2] == 50.0
     assert len(warnings) == 1 and "rolling back" in warnings[0]
+
+
+class AttributeModel:
+    """A model holding a plain parameter, a mutable cache and a fitted posterior."""
+
+    posterior: FittedAttribute[float] = FittedAttribute()
+
+    def __init__(self):
+        self.param = 1.0
+        self.cache = {"warm": [1.0]}
+
+
+ATTRIBUTE_KEYS = ("param", "cache", "posterior")
+
+
+def test_attribute_snapshot_restore_round_trip_unsets_unset_keys():
+    model = AttributeModel()
+    state = snapshot_attributes(model, ATTRIBUTE_KEYS)
+    assert "posterior" not in state  # unset when captured
+
+    model.param = 2.0
+    model.posterior = -3.0
+    restore_attributes(model, ATTRIBUTE_KEYS, state)
+
+    assert model.param == 1.0
+    assert not is_set(model, "posterior")
+
+
+def test_attribute_snapshot_deepcopies_only_listed_keys():
+    model = AttributeModel()
+    referenced = snapshot_attributes(model, ATTRIBUTE_KEYS)
+    copied = snapshot_attributes(model, ATTRIBUTE_KEYS, deepcopy_keys=("cache",))
+
+    model.cache["warm"].append(2.0)  # in-place M-step style mutation
+
+    assert referenced["cache"]["warm"] == [1.0, 2.0]
+    assert copied["cache"]["warm"] == [1.0]
+
+
+def test_clear_attributes_unsets_set_and_tolerates_unset():
+    model = AttributeModel()
+    model.posterior = 0.5
+    clear_attributes(model, ("posterior",))
+    assert not is_set(model, "posterior")
+    clear_attributes(model, ("posterior",))  # already unset: no error
+    assert not is_set(model, "posterior")
+
+
+def test_run_em_with_attribute_hooks_rolls_back_parameters_and_posterior():
+    model = AttributeModel()
+    lls = iter([-10.0, -20.0])
+
+    def e_step():
+        model.posterior = model.param
+        return next(lls)
+
+    def m_step():
+        model.param += 1.0
+
+    result = run_em(
+        e_step,
+        m_step,
+        lambda: snapshot_attributes(model, ATTRIBUTE_KEYS),
+        lambda state: restore_attributes(model, ATTRIBUTE_KEYS, state),
+        max_iter=5,
+        tol=1e-12,
+    )
+
+    assert result.log_likelihoods == [-10.0]
+    assert model.param == 1.0  # the decreasing step's M-step was undone
+    assert model.posterior == 1.0

@@ -67,7 +67,12 @@ import scipy.special
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.em_driver import run_em
+from state_space_practice.em_driver import (
+    clear_attributes,
+    restore_attributes,
+    run_em,
+    snapshot_attributes,
+)
 from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.multinomial_choice import (
@@ -1882,23 +1887,6 @@ class SmithLearningModel(SGDFittableMixin):
             "init_learning_variance",
         )
 
-        def _capture_state() -> dict[str, object]:
-            # Unset fitted attributes are left out and unset again on restore.
-            return {k: getattr(self, k) for k in snapshot_keys if hasattr(self, k)}
-
-        def _restore_state(state: dict[str, object]) -> None:
-            for k in snapshot_keys:
-                if k in state:
-                    setattr(self, k, state[k])
-                else:
-                    delattr(self, k)
-
-        def _clear_posteriors() -> None:
-            # A non-finite first E-step leaves nothing to roll back to: drop
-            # its NaN filter/smoother outputs so the model reads as unfitted.
-            for k in posterior_keys:
-                delattr(self, k)
-
         def _on_iteration(iteration: int, ll: float, change: float) -> None:
             # verbose=True surfaces per-iteration progress at INFO; otherwise DEBUG.
             logger.log(
@@ -1915,12 +1903,12 @@ class SmithLearningModel(SGDFittableMixin):
         result = run_em(
             lambda: float(self._e_step(n_correct_responses)),
             lambda: self._m_step(n_correct_responses),
-            _capture_state,
-            _restore_state,
+            lambda: snapshot_attributes(self, snapshot_keys),
+            lambda state: restore_attributes(self, snapshot_keys, state),
             max_iter=max_iter,
             tol=tolerance,
             on_first_nonfinite="clear",
-            clear_state=_clear_posteriors,
+            clear_state=lambda: clear_attributes(self, posterior_keys),
             m_step_on_convergence=True,
             logger=logger,
             on_iteration=_on_iteration,

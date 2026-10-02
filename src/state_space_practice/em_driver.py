@@ -12,18 +12,23 @@ learning models fit through it.  The choice and belief models
 The driver never touches model attributes directly.  It talks to the model
 through four callables (``e_step``, ``m_step``, ``snapshot``, ``restore``) so
 it can be used by models that store their posteriors under different names.
+Models that keep their parameters and posteriors as attributes build those
+hooks from :func:`snapshot_attributes`, :func:`restore_attributes` and
+:func:`clear_attributes`.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import numpy as np
 
+from state_space_practice.fitted_state import is_set
 from state_space_practice.utils import check_converged
 
 _logger = logging.getLogger(__name__)
@@ -53,6 +58,62 @@ class EMResult:
     log_likelihoods: list[float] = field(default_factory=list)
     converged: bool = False
     reached_max_iter: bool = False
+
+
+def snapshot_attributes(
+    obj: object, keys: Iterable[str], deepcopy_keys: Collection[str] = ()
+) -> dict[str, Any]:
+    """Capture ``obj``'s attributes ``keys`` as a ``run_em`` snapshot.
+
+    Unset attributes (e.g. posteriors before the first E-step) are left out,
+    so :func:`restore_attributes` unsets them again.  Values are referenced,
+    which is enough for immutable JAX arrays; a container that the M-step
+    mutates in place must be listed in ``deepcopy_keys``.
+
+    Parameters
+    ----------
+    obj : object
+        The model.
+    keys : iterable of str
+        Attribute names to capture.
+    deepcopy_keys : collection of str
+        Names among ``keys`` whose values are deep-copied.
+
+    Returns
+    -------
+    dict[str, Any]
+        Attribute name to value, for the attributes that are set.
+    """
+    snapshot: dict[str, Any] = {}
+    for key in keys:
+        if hasattr(obj, key):
+            value = getattr(obj, key)
+            snapshot[key] = copy.deepcopy(value) if key in deepcopy_keys else value
+    return snapshot
+
+
+def restore_attributes(obj: object, keys: Iterable[str], state: dict[str, Any]) -> None:
+    """Restore a :func:`snapshot_attributes` snapshot taken with the same ``keys``.
+
+    A key absent from ``state`` was unset when the snapshot was taken, so it
+    is unset again.
+    """
+    for key in keys:
+        if key in state:
+            setattr(obj, key, state[key])
+        elif is_set(obj, key):
+            delattr(obj, key)
+
+
+def clear_attributes(obj: object, keys: Iterable[str]) -> None:
+    """Unset ``obj``'s attributes ``keys`` (the ``run_em`` ``clear_state`` hook).
+
+    Used to drop the non-finite posteriors a failed first E-step installed, so
+    the model reads as unfitted instead of serving NaN output.
+    """
+    for key in keys:
+        if is_set(obj, key):
+            delattr(obj, key)
 
 
 def run_em(

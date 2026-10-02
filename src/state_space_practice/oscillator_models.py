@@ -45,7 +45,11 @@ from jax import Array
 from jax.typing import ArrayLike
 from numpy.typing import NDArray
 
-from state_space_practice.em_driver import run_em
+from state_space_practice.em_driver import (
+    restore_attributes,
+    run_em,
+    snapshot_attributes,
+)
 from state_space_practice.exceptions import NotFittedError
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.oscillator_utils import (
@@ -558,29 +562,13 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         sufficient -- except ``_current_osc_params``, a dict that the
         reparameterized M-step mutates in place, which needs a deep copy.
         """
-        import copy
-
-        snapshot: dict[str, object] = {}
-        for key in self._EM_SNAPSHOT_KEYS:
-            if not hasattr(self, key):
-                continue
-            value = getattr(self, key)
-            snapshot[key] = (
-                copy.deepcopy(value) if key == "_current_osc_params" else value
-            )
-        return snapshot
+        return snapshot_attributes(
+            self, self._EM_SNAPSHOT_KEYS, deepcopy_keys=("_current_osc_params",)
+        )
 
     def _restore_em_state(self, state: dict[str, object]) -> None:
-        """Restore a state captured by _snapshot_em_state.
-
-        A key absent from the snapshot was unset when it was taken (e.g. the
-        smoother outputs before the first E-step), so it is unset again.
-        """
-        for key in self._EM_SNAPSHOT_KEYS:
-            if key in state:
-                setattr(self, key, state[key])
-            elif is_set(self, key):
-                delattr(self, key)
+        """Restore a state captured by _snapshot_em_state."""
+        restore_attributes(self, self._EM_SNAPSHOT_KEYS, state)
 
     def _clear_smoother_state(self) -> None:
         """Drop smoother posteriors so decode()/predict_proba() fail loudly.

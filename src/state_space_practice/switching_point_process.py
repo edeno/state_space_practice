@@ -90,14 +90,18 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 import jax
 import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.em_driver import run_em
+from state_space_practice.em_driver import (
+    restore_attributes,
+    run_em,
+    snapshot_attributes,
+)
 from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.oscillator_utils import (
@@ -4044,28 +4048,17 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         if not skip_init:
             self._initialize_parameters(key)
 
-        # Snapshot parameters for rollback on a rejected step
-        import copy
-
-        def _snapshot_params() -> dict[str, Any]:
-            return {
-                "continuous_transition_matrix": self.continuous_transition_matrix.copy(),
-                "process_cov": self.process_cov.copy(),
-                "discrete_transition_matrix": self.discrete_transition_matrix.copy(),
-                "init_mean": self.init_mean.copy(),
-                "init_cov": self.init_cov.copy(),
-                "init_discrete_state_prob": self.init_discrete_state_prob.copy(),
-                "spike_params": copy.deepcopy(self.spike_params),
-            }
-
-        def _restore_params(params: dict[str, Any]) -> None:
-            self.continuous_transition_matrix = params["continuous_transition_matrix"]
-            self.process_cov = params["process_cov"]
-            self.discrete_transition_matrix = params["discrete_transition_matrix"]
-            self.init_mean = params["init_mean"]
-            self.init_cov = params["init_cov"]
-            self.init_discrete_state_prob = params["init_discrete_state_prob"]
-            self.spike_params = params["spike_params"]
+        # Snapshot parameters for rollback on a rejected step. The arrays are
+        # immutable JAX arrays; ``spike_params`` is a container, so deep-copy it.
+        param_keys = (
+            "continuous_transition_matrix",
+            "process_cov",
+            "discrete_transition_matrix",
+            "init_mean",
+            "init_cov",
+            "init_discrete_state_prob",
+            "spike_params",
+        )
 
         def _m_step() -> None:
             self._m_step_dynamics()
@@ -4079,8 +4072,10 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         result = run_em(
             lambda: float(self._e_step(spikes)),
             _m_step,
-            _snapshot_params,
-            _restore_params,
+            lambda: snapshot_attributes(
+                self, param_keys, deepcopy_keys=("spike_params",)
+            ),
+            lambda state: restore_attributes(self, param_keys, state),
             max_iter=max_iter,
             tol=tol,
             decrease_tol=decrease_tol,
