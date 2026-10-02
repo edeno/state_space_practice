@@ -1430,6 +1430,35 @@ class TestSGDFitting:
         assert np.isfinite(model.log_likelihood_)
         assert len(lls) == 50
 
+    def test_repeat_fit_reuses_compiled_step(self, sgd_step_builds):
+        """Refitting the same data builds no new SGD step, although each fit
+        rewrites the trained parameters and rebinds the covariates."""
+        builds = sgd_step_builds
+        rng = np.random.default_rng(0)
+        choices = rng.integers(0, 3, 50)
+        covariates = rng.standard_normal((50, 2))
+        obs_covariates = rng.standard_normal((50, 2))
+        model = CovariateChoiceModel(
+            n_options=3,
+            n_covariates=2,
+            n_obs_covariates=2,
+            init_decay=0.9,
+            learn_decay=True,
+        )
+        gains = []
+        for _ in range(3):
+            model.fit_sgd(
+                choices,
+                covariates=covariates,
+                obs_covariates=obs_covariates,
+                num_steps=3,
+            )
+            gains.append(np.asarray(model.input_gain_))
+        # guard: each fit moved the trained parameters
+        assert not np.array_equal(gains[0], gains[1])
+        assert not np.array_equal(gains[1], gains[2])
+        assert len(builds) == 1
+
     def test_sgd_model_is_fitted(self):
         """Model should report as fitted after SGD."""
         rng = np.random.default_rng(42)

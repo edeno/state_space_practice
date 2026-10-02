@@ -2121,6 +2121,17 @@ class TestSmithSGDFitting:
             model.fit_sgd(simple_outcomes[:50], num_steps=-1)
         assert_model_state_unchanged(model, before)
 
+    def test_repeat_fit_sgd_reuses_compiled_step(
+        self, simple_outcomes, sgd_step_builds
+    ):
+        """Refitting rewrites the trained parameters; the loss must not read
+        them, or every repeat call misses the step cache and recompiles."""
+        builds = sgd_step_builds
+        model = SmithLearningModel(sigma_epsilon=0.1)
+        for _ in range(3):
+            model.fit_sgd(simple_outcomes, num_steps=2)
+        assert len(builds) == 1
+
 
 # ============================================================================
 # Integration: learning curve recovery on simulated data

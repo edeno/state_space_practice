@@ -856,23 +856,18 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
         return params, spec
 
     def _sgd_loss_fn(self, params: SGDParams, choices: Array) -> Array:
-        # Model attributes are read only for parameters that are not being
-        # optimized (see _MultinomialChoiceBase._sgd_loss_fn).
-        def _param(key: str, attr: str) -> Array:
-            return params[key] if key in params else jnp.asarray(getattr(self, attr))
-
         k_free = self.n_options - 1
 
         if self._covariates is not None:
             cov_arr = self._covariates
-            ig_arr = _param("input_gain", "input_gain_")
+            ig_arr = self._sgd_param(params, "input_gain", "input_gain_")
         else:
             cov_arr = jnp.zeros((self._n_trials, 1))
             ig_arr = jnp.zeros((k_free, 1))
 
         if self._obs_covariates is not None:
             obs_cov_arr = self._obs_covariates
-            ow_arr = _param("obs_weights", "obs_weights_")
+            ow_arr = self._sgd_param(params, "obs_weights", "obs_weights_")
         else:
             obs_cov_arr = jnp.zeros((self._n_trials, 1))
             ow_arr = jnp.zeros((self.n_options, 1))
@@ -884,9 +879,9 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
             ig_arr,
             obs_cov_arr,
             ow_arr,
-            _param("process_noise", "process_noise"),
-            _param("inverse_temperature", "inverse_temperature"),
-            _param("decay", "decay"),
+            self._sgd_param(params, "process_noise"),
+            self._sgd_param(params, "inverse_temperature"),
+            self._sgd_param(params, "decay"),
             jnp.zeros(k_free),
             jnp.eye(k_free),
         )

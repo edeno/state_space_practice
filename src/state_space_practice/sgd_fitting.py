@@ -452,6 +452,31 @@ class SGDFittableMixin:
             jnp.asarray, getattr(self, key if attr is None else attr)
         )
 
+    def _sgd_per_state_param(
+        self,
+        params: SGDParams,
+        prefix: str,
+        n_discrete_states: int,
+        attr: str | None = None,
+    ) -> Array:
+        """Per-state stack of the ``f"{prefix}_{j}"`` SGD params.
+
+        States absent from ``params`` keep their slice of the model attribute
+        ``attr`` (default ``prefix``; see :func:`reconstruct_per_state_array`).
+        Like :meth:`_sgd_param`, the attribute is read only when some state is
+        not optimized, so the compiled SGD step stays reusable after a fit
+        rewrites it.
+
+        Returns
+        -------
+        Array, shape (..., n_discrete_states)
+        """
+        keys = [f"{prefix}_{j}" for j in range(n_discrete_states)]
+        if all(k in params for k in keys):
+            return jnp.stack([params[k] for k in keys], axis=-1)
+        fallback = getattr(self, prefix if attr is None else attr)
+        return reconstruct_per_state_array(params, prefix, fallback, n_discrete_states)
+
     def _check_sgd_initialized(self) -> None:
         return
 

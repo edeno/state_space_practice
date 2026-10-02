@@ -1270,6 +1270,26 @@ class TestPlaceFieldSGDFitting:
             )
         assert_model_state_unchanged(model, before)
 
+    def test_repeat_fit_sgd_reuses_compiled_step(
+        self, sim_data: dict, sgd_step_builds
+    ) -> None:
+        """Without a warm start each call resumes from the trained parameters;
+        the loss must not read them, or every repeat call recompiles."""
+        import optax
+
+        builds = sgd_step_builds
+        model = PlaceFieldModel(dt=sim_data["dt"], n_interior_knots=3)
+        optimizer = optax.adam(1e-3)  # one instance: the cache keys on it
+        for _ in range(3):
+            model.fit_sgd(
+                sim_data["position"],
+                sim_data["spikes"],
+                optimizer=optimizer,
+                num_steps=1,
+                warm_start=False,
+            )
+        assert len(builds) == 1
+
     def test_sgd_mismatched_lengths_rejected(self, sim_data: dict) -> None:
         import optax
 

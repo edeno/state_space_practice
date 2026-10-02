@@ -3625,10 +3625,10 @@ class PointProcessModel(SGDFittableMixin):
     def _sgd_loss_fn(
         self, params: SGDParams, design_matrix: Array, spike_indicator: Array
     ) -> Array:
-        A = params.get("transition_matrix", self.transition_matrix)
-        Q = params.get("process_cov", self.process_cov)
-        m0 = params.get("init_mean", self.init_mean)
-        P0 = params.get("init_cov", self.init_cov)
+        A = self._sgd_param(params, "transition_matrix")
+        Q = self._sgd_param(params, "process_cov")
+        m0 = self._sgd_param(params, "init_mean")
+        P0 = self._sgd_param(params, "init_cov")
 
         _, _, marginal_ll = stochastic_point_process_filter(
             init_mean_params=m0,

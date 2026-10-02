@@ -1555,9 +1555,9 @@ class PlaceFieldModel(SGDFittableMixin):
     def _sgd_loss_fn(
         self, params: SGDParams, design_matrix: Array, spikes: Array
     ) -> Array:
-        A = params.get("transition_matrix", self.transition_matrix)
-        m0 = params.get("init_mean", self.init_mean)
-        P0 = params.get("init_cov", self.init_cov)
+        A = self._sgd_param(params, "transition_matrix")
+        m0 = self._sgd_param(params, "init_mean")
+        P0 = self._sgd_param(params, "init_cov")
 
         if "process_diag" in params:
             Q = jnp.diag(params["process_diag"])

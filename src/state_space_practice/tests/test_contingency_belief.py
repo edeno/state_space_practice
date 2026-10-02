@@ -716,19 +716,10 @@ class TestFitSGDFailureLeavesModelUnchanged:
 
 
 @pytest.mark.parametrize("with_covariates", [False, True])
-def test_repeat_fit_sgd_reuses_compiled_step(monkeypatch, with_covariates):
+def test_repeat_fit_sgd_reuses_compiled_step(sgd_step_builds, with_covariates):
     """Refitting the same model on the same data reuses the compiled SGD step:
     the loss reads only bound data, never the parameters fitting rewrites."""
-    from state_space_practice import sgd_fitting
-
-    builds: list = []
-    original = sgd_fitting._build_sgd_step
-
-    def counting(*args, **kwargs):
-        builds.append(None)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(sgd_fitting, "_build_sgd_step", counting)
+    builds = sgd_step_builds
     n_trials = 60
     choices, rewards, _, _ = _simulate_block_bandit(n_trials=n_trials)
     kwargs = {}

@@ -2112,3 +2112,57 @@ class TestFailedFitSgdLeavesModelUnchanged:
                 model.fit_sgd(data[:, :-1], key=key, num_steps=2)
 
         assert_model_state_unchanged(model, before)
+
+
+def _fit_sgd_step_builds(
+    builds: list[None],
+    model: Any,
+    data: jax.Array,
+    calls: list[dict[str, Any]],
+) -> list[int]:
+    """Run one ``fit_sgd`` per entry of ``calls``; count the SGD steps each compiled.
+
+    ``builds`` is the ``sgd_step_builds`` fixture; each entry of ``calls``
+    holds the extra keyword arguments of that call.
+    """
+    key = jax.random.PRNGKey(0)
+    per_call = []
+    for call_kwargs in calls:
+        n_before = len(builds)
+        model.fit_sgd(data, key=key, num_steps=2, **call_kwargs)
+        per_call.append(len(builds) - n_before)
+    return per_call
+
+
+@pytest.mark.slow
+class TestRepeatFitSgdReusesCompiledStep:
+    """Refitting a model on same-shaped data reuses its compiled SGD step.
+
+    Every fit rewrites the trained attributes, so a loss that read them while
+    tracing (instead of taking them from the optimized parameters) would miss
+    the model's step cache and recompile on every later ``fit_sgd`` call. The
+    first call must compile, which also shows the counter sees the builds.
+    """
+
+    def test_repeat_fit(
+        self, sgd_model_case: tuple[Any, jax.Array], sgd_step_builds: list[None]
+    ) -> None:
+        model, data = sgd_model_case
+        builds = _fit_sgd_step_builds(sgd_step_builds, model, data, [{}, {}, {}])
+        assert builds == [1, 0, 0]
+
+    @pytest.mark.parametrize(
+        "case",
+        ["CommonOscillatorModel", "CorrelatedNoiseModel", "DirectedInfluenceModel"],
+    )
+    def test_repeat_fit_resuming_from_fitted_parameters(
+        self, case: str, sgd_step_builds: list[None]
+    ) -> None:
+        # skip_init=True continues from the previous fit's parameters instead
+        # of re-initializing them, so every trained attribute has changed.
+        model, data = _SGD_MODEL_CASES[case]()
+        resume = {"skip_init": True}
+        builds = _fit_sgd_step_builds(
+            sgd_step_builds, model, data, [{}, resume, resume]
+        )
+        assert builds == [1, 0, 0]

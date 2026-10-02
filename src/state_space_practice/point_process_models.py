@@ -52,7 +52,7 @@ from state_space_practice.oscillator_utils import (
     optimize_dim_transition_params_joint_until_stationary,
     project_correlated_noise_process_covariance,
 )
-from state_space_practice.parameter_transforms import POSITIVE, UNCONSTRAINED
+from state_space_practice.parameter_transforms import POSITIVE, UNCONSTRAINED, frozen
 from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.switching_kalman import (
     compute_process_covariance_sufficient_stats,
@@ -1086,9 +1086,9 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
 
     def _sgd_loss_fn(self, params: SGDParams, spikes: jax.Array) -> jax.Array:
         # Reconstruct per-state Q from scientific params
-        proc_var = params.get("process_variance", self.process_variance)
-        phase_diff = params.get("phase_difference", self.phase_difference)
-        coupling = params.get("coupling_strength", self.coupling_strength)
+        proc_var = self._sgd_param(params, "process_variance")
+        phase_diff = self._sgd_param(params, "phase_difference")
+        coupling = self._sgd_param(params, "coupling_strength")
 
         # Vectorize Q construction over discrete states (last axis)
         Q = jax.vmap(
@@ -1416,6 +1416,15 @@ class DirectedInfluencePointProcessModel(
             params["coupling_strength"] = self.coupling_strength
             spec["coupling_strength"] = UNCONSTRAINED
 
+        # Not optimized, but read by the loss: passing them as frozen params
+        # makes them arguments of the compiled SGD step rather than constants
+        # baked into it, so changing them (e.g. by an EM fit) does not force a
+        # recompile.
+        params["freqs"] = self.freqs
+        spec["freqs"] = frozen(UNCONSTRAINED)
+        params["damping_coef"] = self.damping_coef
+        spec["damping_coef"] = frozen(UNCONSTRAINED)
+
         return params, spec
 
     def fit_sgd(
@@ -1481,8 +1490,8 @@ class DirectedInfluencePointProcessModel(
         return prepared
 
     def _sgd_loss_fn(self, params: SGDParams, spikes: jax.Array) -> jax.Array:
-        phase_diff = params.get("phase_difference", self.phase_difference)
-        coupling = params.get("coupling_strength", self.coupling_strength)
+        phase_diff = self._sgd_param(params, "phase_difference")
+        coupling = self._sgd_param(params, "coupling_strength")
 
         # Apply the shared differentiable stability scale so SGD optimizes only
         # over transition matrices that honor max_spectral_radius, matching the
@@ -1491,8 +1500,9 @@ class DirectedInfluencePointProcessModel(
         # coupling and the fixed damping.
         params_with_A = dict(params)
         params_with_A["_A"] = construct_stable_directed_influence_transition_stack(
-            self.freqs,
-            self.damping_coef,
+            # Frozen (non-trained) entries of the SGD param spec.
+            self._sgd_param(params, "freqs"),
+            self._sgd_param(params, "damping_coef"),
             coupling,
             phase_diff,
             self.sampling_freq,

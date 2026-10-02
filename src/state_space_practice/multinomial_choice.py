@@ -949,20 +949,12 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         return params, spec
 
     def _sgd_loss_fn(self, params: SGDParams, choices: Array) -> Array:
-        # Read the model attribute only when the parameter is not optimized
-        # (not ``params.get(key, self.attr)``, which reads it regardless):
-        # fit_sgd reuses a compiled step only while the attributes the loss
-        # read at trace time are unchanged, and these are rewritten by every
-        # fit.
-        def _param(key: str) -> Array:
-            return params[key] if key in params else jnp.array(getattr(self, key))
-
         k_free = self.n_options - 1
         result = _multinomial_choice_filter_jit(
             choices,
             self.n_options,
-            _param("process_noise"),
-            _param("inverse_temperature"),
+            self._sgd_param(params, "process_noise"),
+            self._sgd_param(params, "inverse_temperature"),
             jnp.zeros(k_free),
             jnp.eye(k_free),
         )

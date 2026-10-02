@@ -1278,3 +1278,14 @@ class TestSwitchingChoiceFitSgdData:
             model.fit_sgd(*data(25), num_steps=-1)
 
         assert_model_state_unchanged(model, before)
+
+    def test_repeat_fit_sgd_reuses_compiled_step(self, data, sgd_step_builds):
+        model = self._model()
+        choices, covariates, obs_covariates = data(30)
+
+        model.fit_sgd(choices, covariates, obs_covariates, num_steps=3)
+        assert len(sgd_step_builds) == 1
+        model.fit_sgd(choices, covariates, obs_covariates, num_steps=3)
+        model.fit_sgd(choices, covariates, obs_covariates, num_steps=3)
+
+        assert len(sgd_step_builds) == 1

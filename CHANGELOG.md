@@ -421,6 +421,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Repeat `fit_sgd` calls reuse the compiled SGD step**: losses read trained
+  parameters as `params.get(key, self.<attr>)`, so the compiled-step cache
+  (which fingerprints model attributes read while tracing) missed after every
+  fit rewrote them, and each repeat `fit_sgd` re-traced and recompiled --
+  about 0.4-2 s per call at test sizes for `PointProcessModel`,
+  `PlaceFieldModel(warm_start=False)`, the Gaussian and point-process
+  oscillator models and `SwitchingSpikeOscillatorModel` (now ~0.04-0.35 s).
+  Losses read parameters through the new `SGDFittableMixin._sgd_param` /
+  `_sgd_per_state_param`, which touch the attribute only when the parameter is
+  not optimized. `DirectedInfluenceModel` / `DirectedInfluencePointProcessModel`
+  pass `freqs` and `damping_coef` as frozen SGD parameters (they change on
+  re-initialization), which moves their SGD results at round-off level
+  (~1e-15 relative). Results of every other model are bit-identical.
 - **A rejected `fit_sgd` call no longer changes the model**: model-specific
   setup (data binding, initialization, warm start, recorded lengths) ran in
   each model's `fit_sgd` override before the shared settings checks, so e.g.

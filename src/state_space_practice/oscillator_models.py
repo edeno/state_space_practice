@@ -74,12 +74,12 @@ from state_space_practice.parameter_transforms import (
     PSD_MATRIX,
     STOCHASTIC_ROW,
     UNCONSTRAINED,
+    frozen,
 )
 from state_space_practice.sgd_fitting import (
     SGDFittableMixin,
     SGDParams,
     SGDParamSpec,
-    reconstruct_per_state_array,
 )
 from state_space_practice.switching_kalman import (
     compute_process_covariance_sufficient_stats,
@@ -332,14 +332,6 @@ class OscillatorParameterBase:
     @property
     def _n_timesteps(self) -> int:
         return self._sgd_n_time
-
-    def _reconstruct_per_state_array(
-        self, params: SGDParams, prefix: str, fallback: Array
-    ) -> Array:
-        """See :func:`state_space_practice.sgd_fitting.reconstruct_per_state_array`."""
-        return reconstruct_per_state_array(
-            params, prefix, fallback, self.n_discrete_states
-        )
 
     def _stack_shared_measurement_covariance(self, measurement_cov: Array) -> Array:
         """Return a per-state stack from one shared observation covariance."""
@@ -1277,8 +1269,8 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         """
         super()._store_sgd_params(params)
         self._store_shared_measurement_covariance(params)
-        self.init_cov = self._reconstruct_per_state_array(
-            params, "init_cov", self.init_cov
+        self.init_cov = self._sgd_per_state_param(
+            params, "init_cov", self.n_discrete_states
         )
 
     def _finalize_sgd(self, observations: ArrayLike) -> None:
@@ -1467,11 +1459,11 @@ class CommonOscillatorModel(BaseModel):
         return params, spec
 
     def _sgd_loss_fn(self, params: SGDParams, observations: Array) -> Array:
-        H = params.get("measurement_matrix", self.measurement_matrix)
-        Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
-        m0 = params.get("init_mean", self.init_mean)
+        H = self._sgd_param(params, "measurement_matrix")
+        Z = self._sgd_param(params, "discrete_transition_matrix")
+        m0 = self._sgd_param(params, "init_mean")
         R = self._measurement_covariance_from_params(params)
-        P0 = self._reconstruct_per_state_array(params, "init_cov", self.init_cov)
+        P0 = self._sgd_per_state_param(params, "init_cov", self.n_discrete_states)
 
         result = switching_kalman_filter(
             init_state_cond_mean=m0,
@@ -1731,15 +1723,15 @@ class CorrelatedNoiseModel(BaseModel):
         return params, spec
 
     def _sgd_loss_fn(self, params: SGDParams, observations: Array) -> Array:
-        Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
-        m0 = params.get("init_mean", self.init_mean)
+        Z = self._sgd_param(params, "discrete_transition_matrix")
+        m0 = self._sgd_param(params, "init_mean")
         R = self._measurement_covariance_from_params(params)
-        P0 = self._reconstruct_per_state_array(params, "init_cov", self.init_cov)
+        P0 = self._sgd_per_state_param(params, "init_cov", self.n_discrete_states)
 
         # Reconstruct per-state Q from scientific params
-        proc_var = params.get("process_variance", self.process_variance)
-        phase_diff = params.get("phase_difference", self.phase_difference)
-        coupling = params.get("coupling_strength", self.coupling_strength)
+        proc_var = self._sgd_param(params, "process_variance")
+        phase_diff = self._sgd_param(params, "phase_difference")
+        coupling = self._sgd_param(params, "coupling_strength")
 
         # Vectorize Q construction over discrete states (last axis)
         Q = jax.vmap(
@@ -2103,6 +2095,14 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
                 params[k] = self.init_cov[..., j]
                 spec[k] = PSD_MATRIX
 
+        # Not optimized, but read by the loss: passing them as frozen params
+        # makes them arguments of the compiled SGD step rather than constants
+        # baked into it, so re-initialization does not force a recompile.
+        params["freqs"] = self.freqs
+        spec["freqs"] = frozen(UNCONSTRAINED)
+        params["damping_coef"] = self.damping_coef
+        spec["damping_coef"] = frozen(UNCONSTRAINED)
+
         return params, spec
 
     def fit_sgd(
@@ -2179,23 +2179,26 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         return prepared
 
     def _sgd_loss_fn(self, params: SGDParams, observations: Array) -> jax.Array:
-        phase_diff = params.get("phase_difference", self.phase_difference)
-        coupling = params.get("coupling_strength", self.coupling_strength)
+        phase_diff = self._sgd_param(params, "phase_difference")
+        coupling = self._sgd_param(params, "coupling_strength")
+        # Frozen (non-trained) entries of the SGD param spec.
+        freqs = self._sgd_param(params, "freqs")
+        damping_coef = self._sgd_param(params, "damping_coef")
         stability_scale = compute_directed_influence_stability_scale(
-            self.freqs,
-            self.damping_coef,
+            freqs,
+            damping_coef,
             coupling,
             self.sampling_freq,
             max_spectral_radius=self.max_spectral_radius,
             phase_difference=phase_diff,
         )
-        effective_damping = self.damping_coef * stability_scale
+        effective_damping = damping_coef * stability_scale
         effective_coupling = coupling * stability_scale
 
         # Vectorize A construction over discrete states (last axis)
         A = jax.vmap(
             lambda pd, cs: construct_directed_influence_transition_matrix(
-                freqs=self.freqs,
+                freqs=freqs,
                 damping_coeffs=effective_damping,
                 phase_diffs=pd,
                 coupling_strengths=cs,
@@ -2205,10 +2208,10 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
             out_axes=-1,
         )(phase_diff, effective_coupling)
 
-        Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
-        m0 = params.get("init_mean", self.init_mean)
+        Z = self._sgd_param(params, "discrete_transition_matrix")
+        m0 = self._sgd_param(params, "init_mean")
         R = self._measurement_covariance_from_params(params)
-        P0 = self._reconstruct_per_state_array(params, "init_cov", self.init_cov)
+        P0 = self._sgd_per_state_param(params, "init_cov", self.n_discrete_states)
 
         result = switching_kalman_filter(
             init_state_cond_mean=m0,

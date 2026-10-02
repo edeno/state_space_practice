@@ -2818,6 +2818,18 @@ class TestPointProcessSGDFitting:
             model.fit_sgd(design_matrix[:50], spike_indicator[:50], num_steps=-1)
         assert_model_state_unchanged(model, before)
 
+    def test_repeat_fit_sgd_reuses_compiled_step(
+        self, small_pp_problem, sgd_step_builds
+    ):
+        """Refitting rewrites the trained parameters; the loss must not read
+        them, or every repeat call misses the step cache and recompiles."""
+        n_state, dt, design_matrix, spike_indicator = small_pp_problem
+        builds = sgd_step_builds
+        model = PointProcessModel(n_state, dt)
+        for _ in range(3):
+            model.fit_sgd(design_matrix, spike_indicator, num_steps=2)
+        assert len(builds) == 1
+
 
 class TestLogdetPsd:
     """Tests for the Cholesky-based ``_logdet_psd`` helper.

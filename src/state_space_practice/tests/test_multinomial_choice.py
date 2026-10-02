@@ -736,6 +736,19 @@ class TestMultinomialSGDFitting:
         assert model.n_iter_ is None
         assert model.log_likelihood_history_ == sgd_lls
 
+    def test_repeat_fit_reuses_compiled_step(self, sgd_step_builds):
+        """Refitting the same data builds no new SGD step, although each fit
+        rewrites the trained parameters."""
+        builds = sgd_step_builds
+        choices = np.random.default_rng(0).integers(0, 3, 50)
+        model = MultinomialChoiceModel(n_options=3)
+        params = []
+        for _ in range(3):
+            model.fit_sgd(choices, num_steps=3)
+            params.append((model.process_noise, model.inverse_temperature))
+        assert params[0] != params[1] != params[2]  # guard: each fit moved them
+        assert len(builds) == 1
+
     def test_rejected_settings_leave_fresh_model_untouched(self):
         """Invalid optimizer settings fail before the data is bound."""
         model = MultinomialChoiceModel(n_options=3)

@@ -124,7 +124,6 @@ from state_space_practice.sgd_fitting import (
     SGDFittableMixin,
     SGDParams,
     SGDParamSpec,
-    reconstruct_per_state_array,
 )
 from state_space_practice.switching_kalman import (
     SwitchingFilterResult,
@@ -3540,18 +3539,26 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         before delegating here; absent those keys the model's current
         matrices are used.
         """
-        Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
-        m0 = params.get("init_mean", self.init_mean)
-        A = params.get("_A", self.continuous_transition_matrix)
-        Q = params.get("_Q", self.process_cov)
+        Z = self._sgd_param(params, "discrete_transition_matrix")
+        m0 = self._sgd_param(params, "init_mean")
+        A = self._sgd_param(params, "_A", "continuous_transition_matrix")
+        Q = self._sgd_param(params, "_Q", "process_cov")
 
-        baseline = params.get("spike_baseline", self.spike_params.baseline)
-        weights = params.get("spike_weights", self.spike_params.weights)
+        # Read ``spike_params`` only for a key that is not optimized (see
+        # ``_sgd_param``): fits replace it, which would force a recompile.
+        baseline = (
+            params["spike_baseline"]
+            if "spike_baseline" in params
+            else self.spike_params.baseline
+        )
+        weights = (
+            params["spike_weights"]
+            if "spike_weights" in params
+            else self.spike_params.weights
+        )
         sp = SpikeObsParams(baseline=baseline, weights=weights)
 
-        P0 = reconstruct_per_state_array(
-            params, "init_cov", self.init_cov, self.n_discrete_states
-        )
+        P0 = self._sgd_per_state_param(params, "init_cov", self.n_discrete_states)
 
         # Optimize the *same* filter approximation the E-step/finalize evaluate:
         # pass max_newton_iter and line_search_beta so a model configured with
@@ -3603,8 +3610,8 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
                 baseline=params.get("spike_baseline", self.spike_params.baseline),
                 weights=params.get("spike_weights", self.spike_params.weights),
             )
-        self.init_cov = reconstruct_per_state_array(
-            params, "init_cov", self.init_cov, self.n_discrete_states
+        self.init_cov = self._sgd_per_state_param(
+            params, "init_cov", self.n_discrete_states
         )
 
     def _finalize_sgd(self, spikes: Array) -> None:
@@ -4138,8 +4145,8 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         params_with_dynamics = dict(params)
         if any(k.startswith("A_blocks_") for k in params):
             params_with_dynamics["_A"] = self._reconstruct_A_from_blocks(params)
-        params_with_dynamics["_Q"] = reconstruct_per_state_array(
-            params, "Q", self.process_cov, self.n_discrete_states
+        params_with_dynamics["_Q"] = self._sgd_per_state_param(
+            params, "Q", self.n_discrete_states, "process_cov"
         )
         return super()._sgd_loss_fn(params_with_dynamics, spikes)
 
@@ -4150,14 +4157,16 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         transition matrix's own scaled-rotation coefficients, so states that
         were not optimized are left unchanged.
         """
+        # The fallback is evaluated only for a missing block: reading the
+        # transition matrix when every block is optimized would bake it into
+        # the compiled SGD step, which a fit then invalidates (see _sgd_param).
         return jnp.stack(
             [
                 _scaled_rotation_params_to_transition_matrix(
-                    params.get(
-                        f"A_blocks_{j}",
-                        _transition_matrix_to_scaled_rotation_params(
-                            self.continuous_transition_matrix[..., j]
-                        ),
+                    params[f"A_blocks_{j}"]
+                    if f"A_blocks_{j}" in params
+                    else _transition_matrix_to_scaled_rotation_params(
+                        self.continuous_transition_matrix[..., j]
                     )
                 )
                 for j in range(self.n_discrete_states)
@@ -4171,7 +4180,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         if any(k.startswith("A_blocks_") for k in params):
             self.continuous_transition_matrix = self._reconstruct_A_from_blocks(params)
 
-        self.process_cov = reconstruct_per_state_array(
-            params, "Q", self.process_cov, self.n_discrete_states
+        self.process_cov = self._sgd_per_state_param(
+            params, "Q", self.n_discrete_states, "process_cov"
         )
         self._project_parameters()
