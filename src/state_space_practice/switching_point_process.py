@@ -3614,8 +3614,8 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
             params, "init_cov", self.n_discrete_states
         )
 
-    def _finalize_sgd(self, spikes: Array) -> None:
-        self._e_step(spikes)
+    def _finalize_sgd(self, spikes: Array) -> float:
+        return float(self._e_step(spikes))
 
 
 class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):

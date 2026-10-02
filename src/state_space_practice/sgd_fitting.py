@@ -7,7 +7,8 @@ finalization.
 Models must implement:
 - _build_param_spec() -> tuple[dict, dict]
 - _sgd_loss_fn(params, *args, **kwargs) -> Array
-- _finalize_sgd(*args, **kwargs) -> None
+- _finalize_sgd(*args, **kwargs) -> float  (final inference; returns the
+  marginal log-likelihood at the stored parameters)
 - _n_timesteps: int (property or attribute)
 
 and either declare ``_sgd_param_attrs`` (param key -> attribute name, used by
@@ -384,7 +385,8 @@ class SGDFittableMixin:
     Models must implement:
     - _build_param_spec() -> tuple[dict, dict]
     - _sgd_loss_fn(params, *args, **kwargs) -> Array
-    - _finalize_sgd(*args, **kwargs) -> None
+    - _finalize_sgd(*args, **kwargs) -> float  (final inference; returns the
+      marginal log-likelihood at the stored parameters)
     - _n_timesteps: int (property or attribute)
 
     and store the optimized parameters either by declaring
@@ -421,7 +423,14 @@ class SGDFittableMixin:
     def _sgd_loss_fn(self, params: SGDParams, *args: Any, **kwargs: Any) -> Array:
         raise NotImplementedError
 
-    def _finalize_sgd(self, *args: Any, **kwargs: Any) -> None:
+    def _finalize_sgd(self, *args: Any, **kwargs: Any) -> float:
+        """Run inference at the stored parameters; return its marginal LL.
+
+        The returned value becomes ``log_likelihood_``. It must be the model's
+        log-likelihood, not the training objective: with a penalty (or any
+        other loss term) the two differ, and ``log_likelihood_history_``
+        already records the objective.
+        """
         raise NotImplementedError
 
     def _sgd_param(self, params: SGDParams, key: str, attr: str | None = None) -> Any:
@@ -531,7 +540,9 @@ class SGDFittableMixin:
         Parameters
         ----------
         log_likelihoods : list[float]
-            The fit's log-likelihood history (``log_likelihood_history_``).
+            The fit's history (``log_likelihood_history_``): per-iteration EM
+            log-likelihoods, or per-step SGD training objective (the
+            log-likelihood plus any penalty term).
         converged : bool
             Whether the fit met its convergence criterion (``converged_``).
         n_iter : int or None
@@ -852,7 +863,12 @@ class SGDFittableMixin:
             static_params=frozen_params,
         )
         self._store_sgd_params(final_params)
-        self._record_fit_result(log_likelihoods, converged, n_iter=None)
-        self._finalize_sgd(*args, **kwargs)
+        final_log_likelihood = self._finalize_sgd(*args, **kwargs)
+        self._record_fit_result(
+            log_likelihoods,
+            converged,
+            n_iter=None,
+            log_likelihood=float(final_log_likelihood),
+        )
 
         return log_likelihoods

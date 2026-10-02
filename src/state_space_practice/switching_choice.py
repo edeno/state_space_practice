@@ -1399,15 +1399,15 @@ class SwitchingChoiceModel(SGDFittableMixin):
         if "obs_weights" in params:
             self.obs_weights_ = params["obs_weights"]
 
-    def _finalize_sgd(self, choices: Array) -> None:
+    def _finalize_sgd(self, choices: Array) -> float:
         result = self._run_filter(choices, self._covariates, self._obs_covariates)
         self._filter_result = result
         smoother_result = self._run_smoother(result)
         self.smoothed_discrete_probs_ = smoother_result.smoother_discrete_state_prob
         self._smoother_state_cond_means = smoother_result.state_cond_smoother_means
         self._smoother_state_cond_covs = smoother_result.state_cond_smoother_covs
-        self.log_likelihood_ = float(result.marginal_log_likelihood)
         self._populate_uncertainty(choices)
+        return float(result.marginal_log_likelihood)
 
 
 class SimulatedSwitchingChoiceData(NamedTuple):

@@ -3281,7 +3281,8 @@ class PointProcessModel(SGDFittableMixin):
         Marginal log-likelihood at the fitted parameters (from the last
         :meth:`fit` or :meth:`fit_sgd`).
     log_likelihood_history_ : list[float]
-        Per-iteration (EM) or per-step (SGD) log-likelihoods of the last fit.
+        Per-iteration EM log-likelihoods, or per-step SGD training objective,
+        of the last fit.
     converged_ : bool
         Whether the last fit met its convergence criterion.
     n_iter_ : int or None
@@ -3656,8 +3657,8 @@ class PointProcessModel(SGDFittableMixin):
         if "init_cov" in params:
             self.init_cov = params["init_cov"]
 
-    def _finalize_sgd(self, design_matrix: Array, spike_indicator: Array) -> None:
-        self.log_likelihood_ = self._e_step(design_matrix, spike_indicator)
+    def _finalize_sgd(self, design_matrix: Array, spike_indicator: Array) -> float:
+        return self._e_step(design_matrix, spike_indicator)
 
     def get_rate_estimate(
         self,

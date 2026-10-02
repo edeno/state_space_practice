@@ -904,7 +904,7 @@ class TemporalRateGP(SGDFittableMixin):
             self.lengthscale = params["lengthscale"]
             self.mean = params["mean"]
 
-    def _finalize_sgd(self, counts: Array) -> None:
+    def _finalize_sgd(self, counts: Array) -> float:
         if self._n_neurons == 1:
             result = infer_log_rate(
                 counts,
@@ -931,3 +931,4 @@ class TemporalRateGP(SGDFittableMixin):
             )
         self.log_rate_mean_ = result.log_rate_mean
         self.log_rate_var_ = result.log_rate_var
+        return self.log_marginal_likelihood_

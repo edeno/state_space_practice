@@ -760,7 +760,7 @@ class _SingleRegimeHamiltonianModel(HamiltonianModelBase):
         """Smooth with the concrete model's observation-specific arguments."""
         raise NotImplementedError(f"{type(self).__name__} must implement smooth.")
 
-    def _finalize_sgd(self, *data: Any, **kwargs: Any) -> None:
+    def _finalize_sgd(self, *data: Any, **kwargs: Any) -> float:
         """Run filter + smoother to populate fitted states after SGD.
 
         ``data`` is whatever ``fit_sgd`` passed positionally (one observation
@@ -771,7 +771,7 @@ class _SingleRegimeHamiltonianModel(HamiltonianModelBase):
         means, covs, lls = self.filter(*data, params)
         self.filtered_means_ = means
         self.filtered_covs_ = covs
-        self.log_likelihood_ = float(jnp.sum(lls))
         sm_means, sm_covs = self.smooth(*data, params)
         self.smoothed_means_ = sm_means
         self.smoothed_covs_ = sm_covs
+        return float(jnp.sum(lls))

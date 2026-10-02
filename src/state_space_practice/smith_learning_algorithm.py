@@ -2104,10 +2104,10 @@ class SmithLearningModel(SGDFittableMixin):
         if "init_learning_variance" in params:
             self.init_learning_variance = float(params["init_learning_variance"])
 
-    def _finalize_sgd(self, n_correct_responses: Array) -> None:
+    def _finalize_sgd(self, n_correct_responses: Array) -> float:
         # One E-step at the fitted parameters stores the filtered / smoothed
         # estimates and the Laplace log-likelihood, exactly as after EM.
-        self.log_likelihood_ = self._e_step(n_correct_responses)
+        return self._e_step(n_correct_responses)
 
     def get_learning_curve(
         self,

@@ -1708,14 +1708,14 @@ class ContingencyBeliefModel(SGDFittableMixin):
         if "obs_weights" in params:
             self.obs_weights_ = params["obs_weights"]
 
-    def _finalize_sgd(self, choices: Array, rewards: Array) -> None:
+    def _finalize_sgd(self, choices: Array, rewards: Array) -> float:
         kwargs = self._smoother_kwargs(
             choices, rewards, self._transition_design_matrix, self._obs_design_matrix
         )
         result = _smooth_with_filter(**kwargs)
         self._smoother_result = result
         self.smoothed_state_posterior_ = result.smoothed_state_prob
-        self.log_likelihood_ = float(result.log_likelihood)
         # Also populate causal posterior (the smoother's forward pass)
         self.state_posterior_ = result.filtered_state_prob
         self._populate_uncertainty(choices)
+        return float(result.log_likelihood)

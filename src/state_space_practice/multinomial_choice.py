@@ -1010,10 +1010,10 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         if "inverse_temperature" in params:
             self.inverse_temperature = float(params["inverse_temperature"])
 
-    def _finalize_sgd(self, choices: Array) -> None:
+    def _finalize_sgd(self, choices: Array) -> float:
         self._smoother_result = self._run_smoother(choices)
-        self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
         self._populate_uncertainty(choices)
+        return float(self._smoother_result.marginal_log_likelihood)
 
     # --- M-steps ---
 

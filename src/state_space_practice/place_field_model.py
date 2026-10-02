@@ -1603,14 +1603,16 @@ class PlaceFieldModel(SGDFittableMixin):
         if "init_cov" in params:
             self.init_cov = params["init_cov"]
 
-    def _finalize_sgd(self, design_matrix: Array, spikes: Array) -> None:
-        self.log_likelihoods = [self._e_step(design_matrix, spikes)]
+    def _finalize_sgd(self, design_matrix: Array, spikes: Array) -> float:
+        log_likelihood = self._e_step(design_matrix, spikes)
+        self.log_likelihoods = [log_likelihood]
         # Saturation diagnostic: post-hoc check on the filtered posterior.
         # If a substantial fraction of bins saturate the physiological
         # ceiling, the filter output is unreliable.
         self._warn_if_rate_saturated(
             design_matrix, self.filtered_mean, context="fit_sgd"
         )
+        return log_likelihood
 
     def _neuron_smoother_cov(self, neuron_idx: int, time_slice: slice) -> Array:
         """One neuron's ``(n_t, nb, nb)`` smoothed covariance blocks.

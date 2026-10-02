@@ -470,7 +470,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `log_likelihood_` at all; and `n_iter_` survived a later `fit_sgd`.
   `n_iter_` is now available on every model (`None` until an EM fit, and after
   `fit_sgd`). Multi-restart switching point-process fits report the best
-  restart's convergence flag.
+  restart's convergence flag. After `fit_sgd`, `log_likelihood_` is the
+  marginal log-likelihood from the final inference at the fitted parameters
+  (each model's `_finalize_sgd` now returns it), not the training objective:
+  with a connectivity penalty the two differ, and `log_likelihood_history_`
+  records the objective. A zero-step `fit_sgd` also sets `log_likelihood_`.
 - **Switching point-process `fit_sgd` validates spike shape like `fit`**: a
   1-D array or a wrong neuron count raised a misleading
   "spike_params.baseline neuron dimension must match ..." error, after

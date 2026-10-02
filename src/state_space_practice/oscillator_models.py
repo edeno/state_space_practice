@@ -1273,8 +1273,8 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
             params, "init_cov", self.n_discrete_states
         )
 
-    def _finalize_sgd(self, observations: ArrayLike) -> None:
-        self._e_step(observations)
+    def _finalize_sgd(self, observations: ArrayLike) -> float:
+        return float(self._e_step(observations))
 
     # Subclasses must implement _build_param_spec and _sgd_loss_fn
 
