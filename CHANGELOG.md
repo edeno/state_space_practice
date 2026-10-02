@@ -222,6 +222,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `M`. At n_osc = 100 the jitted value-and-gradient scratch memory drops from
   1.6 GB to 0.24 MB (81 ms -> ~2 ms); values and gradients match the previous
   implementation to <= 7e-16 relative.
+- **`TemporalRateGP.fit_sgd` / `infer_log_rate` gradients differentiate only
+  the final Newton step** (the implicit derivative at the converged mode)
+  instead of all `n_iter` iterations, so gradient memory no longer grows with
+  `n_iter`: at the default 25 iterations the compiled `value_and_grad`
+  temporaries drop from 184 MB to 13 MB at 10^4 bins and from 1.8 GB to
+  129 MB at 10^5 bins, and a gradient evaluation is ~3x faster. Forward
+  results are bit-identical; gradients match the unrolled ones to ~1e-14
+  relative once the iteration has converged, so SGD trajectories move at
+  round-off level.
 - **Reading a fitted attribute before fitting raises `NotFittedError`**
   instead of returning `None` (or a bare `AttributeError`). Fitted outputs of
   every model (smoothed/filtered states, posteriors, log likelihoods,

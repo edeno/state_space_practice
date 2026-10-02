@@ -46,6 +46,7 @@ Nickisch, H., Solin, A. & Grigorevskiy, A. (2018). State Space Gaussian Processe
 """
 
 import warnings
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
@@ -238,31 +239,35 @@ def poisson_log_rate_site(
     return working_response, site_variance, expected_count
 
 
-def _infer_log_rate_traced(
+def _make_newton_step(
     counts: Array,
-    dt: ArrayLike,
-    variance: ArrayLike,
-    lengthscale: ArrayLike,
-    mean: ArrayLike,
-    n_iter: int,
+    offset: ArrayLike,
+    transition: Array,
+    process_cov: Array,
+    stationary_cov: Array,
+    measurement_matrix: Array,
     min_weight: float,
-) -> LaplaceRateResult:
-    """Traced core of :func:`infer_log_rate` (safe under ``jit`` / ``grad``).
+) -> Callable[[Array, None], tuple[Array, tuple[Array, Array, Array]]]:
+    """One line-searched Newton step on the Laplace log-posterior, as a scan body.
 
-    Does no host-side validation, so hyperparameters may be tracers. The public
-    :func:`infer_log_rate` validates concrete inputs before delegating here.
+    Parameters
+    ----------
+    counts : Array, shape (n_time,)
+    offset : ArrayLike, shape ()
+        ``mean + log(dt)``.
+    transition, process_cov, stationary_cov : Array, shape (2, 2)
+        Matern-3/2 state-space prior.
+    measurement_matrix : Array, shape (1, 2)
+    min_weight : float
+        Fisher-weight floor; see :func:`poisson_log_rate_site`.
+
+    Returns
+    -------
+    Callable
+        ``step(states, None) -> (new_states, (max_abs_update, merit_nonfinite,
+        unaccepted))`` with ``states`` of shape ``(n_time, 2)``.
     """
-    offset = mean + jnp.log(dt)
-    _F, _L, _Qc, measurement_vector, stationary_cov = matern32_continuous(
-        variance, lengthscale, validate=False
-    )
-    transition, process_cov = matern32_discretize(
-        variance, lengthscale, dt, validate=False
-    )
-    measurement_matrix = measurement_vector[None, :]  # (1, 2)
     init_mean = jnp.zeros(2)
-    n_time = counts.shape[0]
-
     backtrack_steps = 0.5 ** jnp.arange(float(_N_BACKTRACK))  # largest first
     # Whitening factors of the Markov prior, for the log-posterior merit
     # function of the line search (see _prior_whitened_residuals).
@@ -343,8 +348,8 @@ def _infer_log_rate_traced(
             0,
         )
         # The step length is a discrete choice: keep it out of the gradient
-        # (at the mode the full step is always taken, so the unrolled
-        # derivative of the evidence is the fixed-point derivative).
+        # (at the mode the full step is always taken, so the derivative of
+        # the final step is the fixed-point derivative of the mode).
         step = jax.lax.stop_gradient(backtrack_steps[index])
         new_states = states + step * direction
         return new_states, (
@@ -353,11 +358,68 @@ def _infer_log_rate_traced(
             merit_finite & ~any_accepted,
         )
 
-    states_mode, (updates, nonfinite_merit, unaccepted) = jax.lax.scan(
-        _newton_step, jnp.zeros((n_time, 2)), None, length=n_iter
+    return _newton_step
+
+
+def _infer_log_rate_traced(
+    counts: Array,
+    dt: ArrayLike,
+    variance: ArrayLike,
+    lengthscale: ArrayLike,
+    mean: ArrayLike,
+    n_iter: int,
+    min_weight: float,
+) -> LaplaceRateResult:
+    """Traced core of :func:`infer_log_rate` (safe under ``jit`` / ``grad``).
+
+    Does no host-side validation, so hyperparameters may be tracers. The public
+    :func:`infer_log_rate` validates concrete inputs before delegating here.
+
+    Gradients are implicit (fixed-point) derivatives: the first ``n_iter - 1``
+    Newton steps run on gradient-stopped hyperparameters and only the last
+    step is differentiated. Newton's update map has zero Jacobian in ``g`` at
+    the mode, so the last step's derivative in the hyperparameters is the
+    mode's derivative ``dg*/dtheta`` (implicit function theorem) and the
+    evidence gradient matches the fully unrolled one once the iteration has
+    converged, without keeping every iteration's smoother residuals.
+    """
+    offset = mean + jnp.log(dt)
+    _F, _L, _Qc, measurement_vector, stationary_cov = matern32_continuous(
+        variance, lengthscale, validate=False
+    )
+    transition, process_cov = matern32_discretize(
+        variance, lengthscale, dt, validate=False
+    )
+    measurement_matrix = measurement_vector[None, :]  # (1, 2)
+    init_mean = jnp.zeros(2)
+    n_time = counts.shape[0]
+
+    # Run every Newton step but the last on gradient-stopped hyperparameters.
+    warm_step = _make_newton_step(
+        counts,
+        *jax.lax.stop_gradient(
+            (offset, transition, process_cov, stationary_cov, measurement_matrix)
+        ),
+        min_weight,
+    )
+    warm_states, (_warm_updates, warm_nonfinite, warm_unaccepted) = jax.lax.scan(
+        warm_step, jnp.zeros((n_time, 2)), None, length=n_iter - 1
+    )
+    last_step = _make_newton_step(
+        counts,
+        offset,
+        transition,
+        process_cov,
+        stationary_cov,
+        measurement_matrix,
+        min_weight,
+    )
+    states_mode, (max_abs_update, last_nonfinite, last_unaccepted) = last_step(
+        warm_states, None
     )
     g_mode = states_mode[:, 0]
-    max_abs_update = updates[-1]
+    nonfinite_merit = jnp.append(warm_nonfinite, last_nonfinite)
+    unaccepted = jnp.append(warm_unaccepted, last_unaccepted)
 
     # Evaluate the Laplace evidence at the converged mode. The Kalman filter's
     # marginal likelihood of the mode's Gaussian sites, corrected by (true
@@ -429,8 +491,7 @@ def infer_log_rate(
     mean : ArrayLike, default 0.0
         Baseline log-rate ``mu``; the prior mean of ``f = mu + g``.
     n_iter : int, default 25
-        Number of Newton iterations. The iteration is a fixed-length scan so the
-        evidence stays differentiable for hyperparameter learning. Steps are
+        Number of Newton iterations, run as a fixed-length scan. Steps are
         damped by a backtracking line search, so the iteration converges from
         any start (typically in < 10 steps, quadratically near the mode) and
         extra steps are stable no-ops. ``max_abs_update`` reports convergence.
@@ -456,7 +517,10 @@ def infer_log_rate(
     validation of those is skipped when they are tracers), so
     ``jax.grad(lambda th: infer_log_rate(..., *th).log_marginal_likelihood)``
     gives the marginal-likelihood gradient used by
-    :class:`TemporalRateGP.fit_sgd`.
+    :class:`TemporalRateGP.fit_sgd`. The gradient is the implicit derivative
+    at the mode: only the final Newton step is differentiated, so its memory
+    does not grow with ``n_iter``. It is exact once the iteration has
+    converged (see ``max_abs_update``).
     """
     counts = jnp.asarray(counts)
     if counts.ndim != 1:

@@ -395,6 +395,77 @@ def test_evidence_gradient_matches_finite_difference(small_counts):
     np.testing.assert_allclose(np.asarray(grad), fd, rtol=1e-3, atol=1e-3)
 
 
+@pytest.fixture
+def sinusoid_counts() -> np.ndarray:
+    """60 bins of a ~3 Hz sinusoidally modulated train (dt = 0.1 s)."""
+    rng = np.random.default_rng(0)
+    rate = np.exp(1.0 + np.sin(np.arange(60) / 5.0))
+    return rng.poisson(rate * 0.1).astype(float)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "variance, lengthscale, mean",
+    [(1.0, 0.5, 0.5), (2.0, 0.2, -0.5), (0.3, 1.5, 1.5)],
+)
+def test_evidence_gradient_in_all_hyperparameters_matches_finite_difference(
+    sinusoid_counts, variance, lengthscale, mean
+):
+    """The evidence gradient in (log variance, log lengthscale, mean) is the
+    exact derivative: it matches central differences of the converged evidence
+    to near round-off, from mean values on both sides of the data's rate."""
+
+    def log_evidence(theta):
+        return infer_log_rate(
+            sinusoid_counts, 0.1, jnp.exp(theta[0]), jnp.exp(theta[1]), theta[2]
+        ).log_marginal_likelihood
+
+    theta = jnp.array([np.log(variance), np.log(lengthscale), mean])
+    grad = np.asarray(jax.grad(log_evidence)(theta))
+    eps = 1e-5
+    fd = np.array(
+        [
+            (
+                float(log_evidence(theta.at[i].add(eps)))
+                - float(log_evidence(theta.at[i].add(-eps)))
+            )
+            / (2 * eps)
+            for i in range(3)
+        ]
+    )
+    assert np.all(np.abs(fd) > 1e-2)  # guard: a non-trivial gradient
+    np.testing.assert_allclose(grad, fd, rtol=1e-6)
+
+
+@pytest.mark.slow
+def test_evidence_gradient_memory_does_not_grow_with_newton_iterations():
+    """Only the converged Newton step is differentiated, so the gradient keeps
+    no per-iteration residuals: its compiled temporary memory is (nearly) the
+    same for 5 and 40 Newton iterations rather than ~8x larger."""
+    from state_space_practice.temporal_rate_gp import _infer_log_rate_traced
+
+    rng = np.random.default_rng(0)
+    counts = jnp.asarray(rng.poisson(2.0 * 0.05, size=200).astype(float))
+    theta = jnp.array([0.0, np.log(0.5), 0.5])
+
+    def gradient_temp_bytes(n_iter: int) -> int:
+        def log_evidence(theta):
+            return _infer_log_rate_traced(
+                counts,
+                0.05,
+                jnp.exp(theta[0]),
+                jnp.exp(theta[1]),
+                theta[2],
+                n_iter,
+                1e-9,
+            ).log_marginal_likelihood
+
+        compiled = jax.jit(jax.grad(log_evidence)).lower(theta).compile()
+        return compiled.memory_analysis().temp_size_in_bytes
+
+    assert gradient_temp_bytes(40) < 1.5 * gradient_temp_bytes(5)
+
+
 # --- TemporalRateGP model class -----------------------------------------------
 
 
