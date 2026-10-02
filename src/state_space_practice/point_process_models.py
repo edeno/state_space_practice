@@ -33,12 +33,13 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.em_driver import (
+    AttributeSnapshot,
     restore_attributes,
     run_em,
     snapshot_attributes,
 )
 from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
-from state_space_practice.fitted_state import FittedAttribute, is_set
+from state_space_practice.fitted_state import is_set
 from state_space_practice.oscillator_utils import (
     DirectedInfluenceDynamicsMixin,
     canonicalize_correlated_noise_pair_parameters,
@@ -212,11 +213,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         "phase_difference",
         "coupling_strength",
         "_current_osc_params",
-        "_transition_suff_stats",
     )
-
-    #: Marginal log-likelihood of the final EM iterate; set by ``fit``.
-    log_likelihood_: FittedAttribute[float] = FittedAttribute()
 
     def __init__(
         self,
@@ -503,7 +500,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
     # EM state snapshots
     # ------------------------------------------------------------------
 
-    def _snapshot_em_state(self) -> dict[str, object]:
+    def _snapshot_em_state(self) -> AttributeSnapshot:
         """Snapshot parameters and posteriors for EM rollback.
 
         Restoring a reference snapshot is unaffected by later reassignment
@@ -516,9 +513,9 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
             self, self._EM_SNAPSHOT_KEYS, deepcopy_keys=("_current_osc_params",)
         )
 
-    def _restore_em_state(self, state: dict[str, object]) -> None:
+    def _restore_em_state(self, state: AttributeSnapshot) -> None:
         """Restore a snapshot produced by ``_snapshot_em_state``."""
-        restore_attributes(self, self._EM_SNAPSHOT_KEYS, state)
+        restore_attributes(self, state)
 
     # ------------------------------------------------------------------
     # EM loop
@@ -651,7 +648,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         """
         best_lls: list[float] | None = None
         best_final_ll = -float("inf")
-        best_state: dict[str, object] | None = None
+        best_state: AttributeSnapshot | None = None
         best_converged = False
 
         keys = jax.random.split(key, n_restarts)

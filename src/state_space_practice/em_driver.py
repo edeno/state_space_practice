@@ -61,15 +61,31 @@ class EMResult:
     reached_max_iter: bool = False
 
 
+@dataclass(frozen=True)
+class AttributeSnapshot:
+    """Attributes captured by :func:`snapshot_attributes`, with their names.
+
+    Attributes
+    ----------
+    keys : tuple of str
+        Every attribute name the snapshot covers, set or not.
+    values : dict[str, Any]
+        Value of each covered attribute that was set when captured.
+    """
+
+    keys: tuple[str, ...]
+    values: dict[str, Any]
+
+
 def snapshot_attributes(
     obj: object, keys: Iterable[str], deepcopy_keys: Collection[str] = ()
-) -> dict[str, Any]:
+) -> AttributeSnapshot:
     """Capture ``obj``'s attributes ``keys`` as a ``run_em`` snapshot.
 
-    Unset attributes (e.g. posteriors before the first E-step) are left out,
-    so :func:`restore_attributes` unsets them again.  Values are referenced,
-    which is enough for immutable JAX arrays; a container that the M-step
-    mutates in place must be listed in ``deepcopy_keys``.
+    Unset attributes (e.g. posteriors before the first E-step) are left out of
+    ``values``, so :func:`restore_attributes` unsets them again.  Values are
+    referenced, which is enough for immutable JAX arrays; a container that the
+    M-step mutates in place must be listed in ``deepcopy_keys``.
 
     Parameters
     ----------
@@ -82,26 +98,42 @@ def snapshot_attributes(
 
     Returns
     -------
-    dict[str, Any]
-        Attribute name to value, for the attributes that are set.
+    AttributeSnapshot
+
+    Raises
+    ------
+    ValueError
+        If ``deepcopy_keys`` names an attribute not in ``keys`` (a typo there
+        would silently restore a mutated container).
     """
-    snapshot: dict[str, Any] = {}
+    keys = tuple(keys)
+    unknown = set(deepcopy_keys) - set(keys)
+    if unknown:
+        raise ValueError(f"deepcopy_keys not in keys: {sorted(unknown)}.")
+    values: dict[str, Any] = {}
     for key in keys:
         if hasattr(obj, key):
             value = getattr(obj, key)
-            snapshot[key] = copy.deepcopy(value) if key in deepcopy_keys else value
-    return snapshot
+            values[key] = copy.deepcopy(value) if key in deepcopy_keys else value
+    return AttributeSnapshot(keys, values)
 
 
-def restore_attributes(obj: object, keys: Iterable[str], state: dict[str, Any]) -> None:
-    """Restore a :func:`snapshot_attributes` snapshot taken with the same ``keys``.
+def restore_attributes(obj: object, snapshot: AttributeSnapshot) -> None:
+    """Restore a :func:`snapshot_attributes` snapshot onto ``obj``.
 
-    A key absent from ``state`` was unset when the snapshot was taken, so it
-    is unset again.
+    Each covered attribute gets its captured value; one that was unset when
+    captured is unset again.
+
+    Parameters
+    ----------
+    obj : object
+        The model.
+    snapshot : AttributeSnapshot
+        A snapshot of ``obj`` (or an object with the same attributes).
     """
-    for key in keys:
-        if key in state:
-            setattr(obj, key, state[key])
+    for key in snapshot.keys:
+        if key in snapshot.values:
+            setattr(obj, key, snapshot.values[key])
         elif is_set(obj, key):
             delattr(obj, key)
 
@@ -111,6 +143,13 @@ def clear_attributes(obj: object, keys: Iterable[str]) -> None:
 
     Used to drop the non-finite posteriors a failed first E-step installed, so
     the model reads as unfitted instead of serving NaN output.
+
+    Parameters
+    ----------
+    obj : object
+        The model.
+    keys : iterable of str
+        Attribute names to unset; already-unset ones are skipped.
     """
     for key in keys:
         if is_set(obj, key):

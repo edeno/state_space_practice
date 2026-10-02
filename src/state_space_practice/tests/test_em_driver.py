@@ -344,11 +344,11 @@ ATTRIBUTE_KEYS = ("param", "cache", "posterior")
 def test_attribute_snapshot_restore_round_trip_unsets_unset_keys():
     model = AttributeModel()
     state = snapshot_attributes(model, ATTRIBUTE_KEYS)
-    assert "posterior" not in state  # unset when captured
+    assert "posterior" not in state.values  # unset when captured
 
     model.param = 2.0
     model.posterior = -3.0
-    restore_attributes(model, ATTRIBUTE_KEYS, state)
+    restore_attributes(model, state)
 
     assert model.param == 1.0
     assert not is_set(model, "posterior")
@@ -361,8 +361,14 @@ def test_attribute_snapshot_deepcopies_only_listed_keys():
 
     model.cache["warm"].append(2.0)  # in-place M-step style mutation
 
-    assert referenced["cache"]["warm"] == [1.0, 2.0]
-    assert copied["cache"]["warm"] == [1.0]
+    assert referenced.values["cache"]["warm"] == [1.0, 2.0]
+    assert copied.values["cache"]["warm"] == [1.0]
+
+
+def test_attribute_snapshot_rejects_deepcopy_key_outside_keys():
+    """A typo in deepcopy_keys would silently shallow-copy a mutable container."""
+    with pytest.raises(ValueError, match="deepcopy_keys"):
+        snapshot_attributes(AttributeModel(), ATTRIBUTE_KEYS, deepcopy_keys=("cach",))
 
 
 def test_clear_attributes_unsets_set_and_tolerates_unset():
@@ -389,7 +395,7 @@ def test_run_em_with_attribute_hooks_rolls_back_parameters_and_posterior():
         e_step,
         m_step,
         lambda: snapshot_attributes(model, ATTRIBUTE_KEYS),
-        lambda state: restore_attributes(model, ATTRIBUTE_KEYS, state),
+        lambda state: restore_attributes(model, state),
         max_iter=5,
         tol=1e-12,
     )

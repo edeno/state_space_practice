@@ -3303,7 +3303,6 @@ class PointProcessModel(SGDFittableMixin):
     smoother_cross_cov: FittedAttribute[Array] = FittedAttribute()
     filtered_mean: FittedAttribute[Array] = FittedAttribute()
     filtered_cov: FittedAttribute[Array] = FittedAttribute()
-    log_likelihood_: FittedAttribute[float] = FittedAttribute()
     _sgd_n_time: FittedAttribute[int] = FittedAttribute()
 
     def __init__(
@@ -3518,7 +3517,7 @@ class PointProcessModel(SGDFittableMixin):
             lambda: float(self._e_step(design_matrix, spike_indicator)),
             self._m_step,
             lambda: snapshot_attributes(self, snapshot_keys),
-            lambda state: restore_attributes(self, snapshot_keys, state),
+            lambda state: restore_attributes(self, state),
             max_iter=max_iter,
             tol=tolerance,
             logger=logger,

@@ -4103,7 +4103,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
             lambda: snapshot_attributes(
                 self, param_keys, deepcopy_keys=("spike_params",)
             ),
-            lambda state: restore_attributes(self, param_keys, state),
+            lambda state: restore_attributes(self, state),
             max_iter=max_iter,
             tol=tol,
             decrease_tol=decrease_tol,

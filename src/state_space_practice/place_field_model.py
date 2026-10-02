@@ -1363,7 +1363,7 @@ class PlaceFieldModel(SGDFittableMixin):
             _e_step,
             _m_step,
             lambda: snapshot_attributes(self, snapshot_keys),
-            lambda state: restore_attributes(self, snapshot_keys, state),
+            lambda state: restore_attributes(self, state),
             max_iter=max_iter,
             tol=tolerance,
             on_first_nonfinite="clear",

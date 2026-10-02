@@ -1552,8 +1552,7 @@ class SmithLearningModel(SGDFittableMixin):
     smoothed_prob_correct_response: FittedAttribute[Array] = FittedAttribute()
     smoother_gain: FittedAttribute[Array] = FittedAttribute()  # (n_trials - 1,)
 
-    # Fit diagnostics.
-    log_likelihood_: FittedAttribute[float] = FittedAttribute()
+    # Bound by the last fit.
     _n_trials_: FittedAttribute[int] = FittedAttribute()
     # ``max_possible_correct`` resolved against the data passed to fit_sgd.
     _resolved_max_correct: FittedAttribute[Array] = FittedAttribute()
@@ -1647,7 +1646,6 @@ class SmithLearningModel(SGDFittableMixin):
         self.mu_bias = self._calculate_mu_bias(self.prob_correct_by_chance)
 
         self.initial_state_method = initial_state_method
-        # Set by EM (``fit``) only; stays None for an SGD fit.
 
     def __repr__(self) -> str:
         fitted = "fitted" if self.is_fitted else "not fitted"
@@ -1954,7 +1952,7 @@ class SmithLearningModel(SGDFittableMixin):
             lambda: float(self._e_step(n_correct_responses)),
             lambda: self._m_step(n_correct_responses),
             lambda: snapshot_attributes(self, snapshot_keys),
-            lambda state: restore_attributes(self, snapshot_keys, state),
+            lambda state: restore_attributes(self, state),
             max_iter=max_iter,
             tol=tolerance,
             on_first_nonfinite="clear",

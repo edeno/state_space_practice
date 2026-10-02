@@ -46,6 +46,7 @@ from jax.typing import ArrayLike
 from numpy.typing import NDArray
 
 from state_space_practice.em_driver import (
+    AttributeSnapshot,
     restore_attributes,
     run_em,
     snapshot_attributes,
@@ -547,7 +548,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         self.update_init_mean = update_init_mean
         self.update_init_cov = update_init_cov
 
-    def _snapshot_em_state(self) -> dict[str, object]:
+    def _snapshot_em_state(self) -> AttributeSnapshot:
         """Capture parameters and smoother outputs for EM rollback.
 
         Snapshotted values are JAX arrays (immutable), so a reference copy is
@@ -558,9 +559,9 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
             self, self._EM_SNAPSHOT_KEYS, deepcopy_keys=("_current_osc_params",)
         )
 
-    def _restore_em_state(self, state: dict[str, object]) -> None:
+    def _restore_em_state(self, state: AttributeSnapshot) -> None:
         """Restore a state captured by _snapshot_em_state."""
-        restore_attributes(self, self._EM_SNAPSHOT_KEYS, state)
+        restore_attributes(self, state)
 
     def _clear_smoother_state(self) -> None:
         """Drop smoother posteriors so decode()/predict_proba() fail loudly.
@@ -816,7 +817,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
             "init_mean",
             "init_cov",
         ):
-            setattr(self, name, snapshot[name])
+            setattr(self, name, snapshot.values[name])
         # The smoother outputs belong to an E-step with overridden weights;
         # drop them so nothing downstream mistakes them for a posterior.
         self._clear_smoother_state()

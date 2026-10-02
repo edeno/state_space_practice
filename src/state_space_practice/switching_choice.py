@@ -34,7 +34,11 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.covariate_choice import covariate_predict
-from state_space_practice.em_driver import restore_attributes, snapshot_attributes
+from state_space_practice.em_driver import (
+    AttributeSnapshot,
+    restore_attributes,
+    snapshot_attributes,
+)
 from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.multinomial_choice import (
@@ -717,7 +721,7 @@ def _between_state_variance(means: Array, probs: Array) -> Array:
 class _AcceptedEStep(NamedTuple):
     """An EM E-step with a finite log-likelihood and the parameters it used."""
 
-    params: dict[str, Any]  # snapshot_attributes of _EM_PARAM_ATTRS
+    params: AttributeSnapshot  # of _EM_PARAM_ATTRS
     filter_result: SwitchingChoiceFilterResult
     smoother_result: SwitchingSmootherResult
 
@@ -754,7 +758,6 @@ class SwitchingChoiceModel(SGDFittableMixin):
     smoothed_discrete_probs_: FittedAttribute[Array] = FittedAttribute()
     _smoother_state_cond_means: FittedAttribute[Array] = FittedAttribute()
     _smoother_state_cond_covs: FittedAttribute[Array] = FittedAttribute()
-    log_likelihood_: FittedAttribute[float] = FittedAttribute()
     _n_trials: FittedAttribute[int] = FittedAttribute()
 
     # Uncertainty summaries: (T, K) variances, (T,) entropy and surprise,
@@ -1154,7 +1157,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
                 "starting parameters; check init_process_noises, "
                 "init_inverse_temperatures, init_decays and the covariates."
             )
-        restore_attributes(self, _EM_PARAM_ATTRS, accepted.params)
+        restore_attributes(self, accepted.params)
         self._filter_result = accepted.filter_result
         logger.warning(
             "SwitchingChoiceModel.fit: non-finite log-likelihood (%s) at %s; "

@@ -610,7 +610,6 @@ class _MultinomialChoiceBase(SGDFittableMixin):
     # Fitted state, set by fit() / fit_sgd(); reading one before raises
     # NotFittedError.
     _smoother_result: FittedAttribute[ChoiceSmootherResult] = FittedAttribute()
-    log_likelihood_: FittedAttribute[float] = FittedAttribute()
     _n_trials: FittedAttribute[int] = FittedAttribute()
 
     # Uncertainty summaries, each (n_trials, n_options)
@@ -649,8 +648,6 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         self.process_noise = init_process_noise
         self.learn_inverse_temperature = learn_inverse_temperature
         self.learn_process_noise = learn_process_noise
-
-        # EM iteration count; stays None after an SGD-only fit.
 
     def __repr__(self) -> str:
         fitted = self.is_fitted
@@ -755,9 +752,10 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         last_accepted: dict[str, Any] | None,
         current: ChoiceSmootherResult | None = None,
     ) -> float:
-        """Sync ``_smoother_result`` / ``log_likelihood_`` to the final parameters.
+        """Sync ``_smoother_result`` to the final parameters; return their LL.
 
-        Runs once after the EM loop and returns the final log-likelihood.
+        Runs once after the EM loop; the caller records the returned
+        log-likelihood as ``log_likelihood_``.
         ``log_likelihoods`` is the per-iteration history and ``last_accepted``
         the parameter snapshot taken before the last M-step (None if no M-step
         ran). A non-finite final log-likelihood rolls the parameters back to
@@ -769,16 +767,16 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         self._smoother_result = (
             current if current is not None else self._run_smoother(choices)
         )
-        self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
-        if not np.isfinite(self.log_likelihood_) and last_accepted is not None:
+        log_likelihood = float(self._smoother_result.marginal_log_likelihood)
+        if not np.isfinite(log_likelihood) and last_accepted is not None:
             self._restore_parameters(last_accepted)
             self._smoother_result = self._run_smoother(choices)
-            self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
+            log_likelihood = float(self._smoother_result.marginal_log_likelihood)
             logging.getLogger(type(self).__module__).warning(
                 "Final E-step produced a non-finite log-likelihood; rolled back "
                 "to the previous parameters."
             )
-        return self.log_likelihood_
+        return log_likelihood
 
     def _populate_uncertainty(self, choices: Array) -> None:
         """Compute uncertainty summaries from filter + smoother results.
@@ -947,14 +945,14 @@ class _MultinomialChoiceBase(SGDFittableMixin):
 
         # Final E-step with learned parameters. On convergence no M-step followed
         # the last E-step, so its smoother result is already at those parameters.
-        self._final_e_step(
+        final_log_likelihood = self._final_e_step(
             choices_arr, log_likelihoods, last_accepted, smooth if converged else None
         )
         self._record_fit_result(
             log_likelihoods,
             converged,
             n_iter=len(log_likelihoods),
-            log_likelihood=self.log_likelihood_,
+            log_likelihood=final_log_likelihood,
         )
         self._populate_uncertainty(choices_arr)
         if not rolled_back:  # a rollback already warned why EM stopped

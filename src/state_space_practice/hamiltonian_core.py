@@ -617,8 +617,14 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
     filtered_covs_: FittedAttribute[Array] = FittedAttribute()
     smoothed_means_: FittedAttribute[Array] = FittedAttribute()
     smoothed_covs_: FittedAttribute[Array] = FittedAttribute()
-    #: Summed marginal log-likelihood of the filter at the fitted parameters.
-    log_likelihood_: FittedAttribute[float] = FittedAttribute()
+
+    # The outputs above, cleared when a fit fails.
+    _fit_output_attrs: ClassVar[tuple[str, ...]] = (
+        "filtered_means_",
+        "filtered_covs_",
+        "smoothed_means_",
+        "smoothed_covs_",
+    )
 
     def __init__(
         self,

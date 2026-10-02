@@ -3818,10 +3818,10 @@ def test_em_restore_unsets_outputs_missing_from_snapshot(make_model):
     model = make_model()
     model._initialize_parameters(jax.random.PRNGKey(0))
     snapshot = model._snapshot_em_state()
-    assert "smoother_discrete_state_prob" not in snapshot
+    assert "smoother_discrete_state_prob" not in snapshot.values
     model.smoother_discrete_state_prob = jnp.ones((5, 2)) / 2
 
     model._restore_em_state(snapshot)
 
     assert not hasattr(model, "smoother_discrete_state_prob")
-    np.testing.assert_array_equal(model.init_mean, snapshot["init_mean"])
+    np.testing.assert_array_equal(model.init_mean, snapshot.values["init_mean"])

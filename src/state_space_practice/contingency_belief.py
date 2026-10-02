@@ -1006,7 +1006,6 @@ class ContingencyBeliefModel(SGDFittableMixin):
     state_posterior_: FittedAttribute[Array] = FittedAttribute()
     smoothed_state_posterior_: FittedAttribute[Array] = FittedAttribute()
     _smoother_result: FittedAttribute[_SmootherOutputs] = FittedAttribute()
-    log_likelihood_: FittedAttribute[float] = FittedAttribute()
     _n_trials: FittedAttribute[int] = FittedAttribute()
 
     # Uncertainty summaries, each (n_trials,).

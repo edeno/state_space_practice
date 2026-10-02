@@ -433,7 +433,7 @@ class SGDFittableMixin:
         """
         raise NotImplementedError
 
-    def _sgd_param(self, params: SGDParams, key: str, attr: str | None = None) -> Any:
+    def _sgd_param(self, params: SGDParams, key: str, attr: str | None = None) -> Array:
         """Value of ``key`` for ``_sgd_loss_fn``: optimized if present, else stored.
 
         Use this instead of ``params.get(key, self.<attr>)``. The compiled-step
@@ -453,13 +453,11 @@ class SGDFittableMixin:
 
         Returns
         -------
-        Array or pytree of Arrays
+        Array
         """
         if key in params:
             return params[key]
-        return jax.tree_util.tree_map(
-            jnp.asarray, getattr(self, key if attr is None else attr)
-        )
+        return jnp.asarray(getattr(self, key if attr is None else attr))
 
     def _sgd_per_state_param(
         self,

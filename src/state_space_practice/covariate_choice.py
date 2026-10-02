@@ -689,7 +689,7 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
         is accepted (its LL replacing or extending the history) when that LL is
         finite and not worse than the last accepted iterate; otherwise the last
         M-step is rolled back so the stored (params, smoother, LL) stay
-        consistent.
+        consistent. Arguments and return value as in the base class.
         """
         final_ll = super()._final_e_step(
             choices, log_likelihoods, last_accepted, current
@@ -705,8 +705,8 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
             self._restore_parameters(last_accepted)
             final_ll = super()._final_e_step(choices, log_likelihoods, last_accepted)
             logger.warning(
-                "Final M-step decreased the log-likelihood; rolled back to the "
-                "previous parameters."
+                "Final M-step decreased the log-likelihood (or left it "
+                "non-finite); rolled back to the previous parameters."
             )
         return final_ll
 
