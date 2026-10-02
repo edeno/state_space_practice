@@ -44,10 +44,11 @@ from state_space_practice.oscillator_utils import (
     canonicalize_correlated_noise_pair_parameters,
     constrain_correlated_noise_process_covariance,
     construct_common_oscillator_process_covariance,
-    construct_common_oscillator_transition_matrix,
+    construct_common_oscillator_transition_matrix_stack,
     construct_correlated_noise_process_covariance,
+    construct_correlated_noise_process_covariance_stack,
     construct_stable_directed_influence_transition_stack,
-    extract_correlated_noise_params_from_covariance,
+    extract_correlated_noise_params_from_covariance_stack,
     optimize_dim_transition_params_joint_until_stationary,
     project_correlated_noise_process_covariance,
 )
@@ -779,13 +780,13 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
 
     def _initialize_continuous_transition_matrix(self) -> None:
         """A is constant across states: uncoupled oscillators."""
-        transition_matrix = construct_common_oscillator_transition_matrix(
-            freqs=self.freqs,
-            damping_coef=self.damping_coef,
-            sampling_freq=self.sampling_freq,
-        )
-        self.continuous_transition_matrix = jnp.stack(
-            [transition_matrix] * self.n_discrete_states, axis=2
+        self.continuous_transition_matrix = (
+            construct_common_oscillator_transition_matrix_stack(
+                self.freqs,
+                self.damping_coef,
+                self.sampling_freq,
+                self.n_discrete_states,
+            )
         )
 
     def _initialize_process_covariance(self) -> None:
@@ -977,27 +978,19 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
 
     def _initialize_continuous_transition_matrix(self) -> None:
         """A is constant across states: uncoupled oscillators."""
-        transition_matrix = construct_common_oscillator_transition_matrix(
-            freqs=self.freqs,
-            damping_coef=self.damping_coef,
-            sampling_freq=self.sampling_freq,
-        )
-        self.continuous_transition_matrix = jnp.stack(
-            [transition_matrix] * self.n_discrete_states, axis=2
+        self.continuous_transition_matrix = (
+            construct_common_oscillator_transition_matrix_stack(
+                self.freqs,
+                self.damping_coef,
+                self.sampling_freq,
+                self.n_discrete_states,
+            )
         )
 
     def _initialize_process_covariance(self) -> None:
         """Q varies across states: correlated noise structure."""
-        self.process_cov = jnp.stack(
-            [
-                construct_correlated_noise_process_covariance(
-                    variance=self.process_variance[:, state_ind],
-                    phase_difference=self.phase_difference[:, :, state_ind],
-                    coupling_strength=self.coupling_strength[:, :, state_ind],
-                )
-                for state_ind in range(self.n_discrete_states)
-            ],
-            axis=2,
+        self.process_cov = construct_correlated_noise_process_covariance_stack(
+            self.process_variance, self.phase_difference, self.coupling_strength
         )
 
     def _project_parameters(self) -> None:
@@ -1039,16 +1032,8 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
             ),
         )
 
-        previous = jnp.stack(
-            [
-                construct_correlated_noise_process_covariance(
-                    variance=self.process_variance[..., j],
-                    phase_difference=self.phase_difference[..., j],
-                    coupling_strength=self.coupling_strength[..., j],
-                )
-                for j in range(self.n_discrete_states)
-            ],
-            axis=-1,
+        previous = construct_correlated_noise_process_covariance_stack(
+            self.process_variance, self.phase_difference, self.coupling_strength
         )
         # A state with fewer than n_cont_states + 1 expected transitions has an
         # unidentified residual covariance: keep its previous Q (and warn).
@@ -1085,19 +1070,12 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
 
     def _sync_process_covariance_params(self) -> None:
         """Synchronize public CNM parameters from the structured Q stack."""
-        params = [
-            extract_correlated_noise_params_from_covariance(
-                self.process_cov[..., j], self.n_oscillators
-            )
-            for j in range(self.n_discrete_states)
-        ]
-        self.process_variance = jnp.stack([p["variance"] for p in params], axis=-1)
-        self.phase_difference = jnp.stack(
-            [p["phase_difference"] for p in params], axis=-1
+        params = extract_correlated_noise_params_from_covariance_stack(
+            self.process_cov, self.n_oscillators
         )
-        self.coupling_strength = jnp.stack(
-            [p["coupling_strength"] for p in params], axis=-1
-        )
+        self.process_variance = params["variance"]
+        self.phase_difference = params["phase_difference"]
+        self.coupling_strength = params["coupling_strength"]
 
     # --- SGDFittableMixin: CNM-PP specific ---
 

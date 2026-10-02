@@ -258,6 +258,35 @@ def construct_common_oscillator_transition_matrix(
     return _scatter_block_diagonal(blocks)
 
 
+def construct_common_oscillator_transition_matrix_stack(
+    freqs: ArrayLike,
+    damping_coef: ArrayLike,
+    sampling_freq: float,
+    n_discrete_states: int,
+) -> jax.Array:
+    """Repeat the uncoupled-oscillator transition matrix for every discrete state.
+
+    Parameters
+    ----------
+    freqs : ArrayLike, shape (n_oscillators,)
+    damping_coef : ArrayLike, shape (n_oscillators,)
+    sampling_freq : float
+    n_discrete_states : int
+
+    Returns
+    -------
+    transition_matrices : jax.Array, shape (n_latent, n_latent, n_discrete_states)
+        ``n_latent = 2 * n_oscillators``; every slice is
+        :func:`construct_common_oscillator_transition_matrix`.
+    """
+    transition_matrix = construct_common_oscillator_transition_matrix(
+        freqs=freqs,
+        damping_coef=damping_coef,
+        sampling_freq=sampling_freq,
+    )
+    return jnp.stack([transition_matrix] * n_discrete_states, axis=2)
+
+
 def construct_common_oscillator_process_covariance(
     variance: ArrayLike,
 ) -> jax.Array:
@@ -436,8 +465,43 @@ def construct_correlated_noise_process_covariance(
     diag_idx = jnp.arange(n_oscillators)
     all_blocks = all_blocks.at[diag_idx, diag_idx].set(diag_blocks)
 
-    # Reshape (n, n, 2, 2) -> (2n, 2n)
-    return all_blocks.swapaxes(1, 2).reshape(2 * n_oscillators, 2 * n_oscillators)
+    return _oscillator_blocks_to_matrix(all_blocks)
+
+
+def construct_correlated_noise_process_covariance_stack(
+    variance: ArrayLike,
+    phase_difference: ArrayLike,
+    coupling_strength: ArrayLike,
+) -> jax.Array:
+    """Build one correlated-noise process covariance per discrete state.
+
+    Parameters
+    ----------
+    variance : ArrayLike, shape (n_oscillators, n_discrete_states)
+    phase_difference : ArrayLike, shape (n_oscillators, n_oscillators, n_discrete_states)
+    coupling_strength : ArrayLike, shape (n_oscillators, n_oscillators, n_discrete_states)
+
+    Returns
+    -------
+    process_covariances : jax.Array, shape (n_latent, n_latent, n_discrete_states)
+        ``n_latent = 2 * n_oscillators``; slice ``j`` is
+        :func:`construct_correlated_noise_process_covariance` of the state-``j``
+        parameters.
+    """
+    variance = jnp.asarray(variance)
+    phase_difference = jnp.asarray(phase_difference)
+    coupling_strength = jnp.asarray(coupling_strength)
+    return jnp.stack(
+        [
+            construct_correlated_noise_process_covariance(
+                variance=variance[..., j],
+                phase_difference=phase_difference[..., j],
+                coupling_strength=coupling_strength[..., j],
+            )
+            for j in range(variance.shape[-1])
+        ],
+        axis=-1,
+    )
 
 
 def construct_correlated_noise_measurement_matrix(
@@ -553,9 +617,8 @@ def construct_directed_influence_transition_matrix(
     all_blocks = all_coupling_blocks.at[diag_indices, diag_indices].set(all_diag_blocks)
     # Shape: (n_oscillators, n_oscillators, 2, 2)
 
-    # 5. Reshape and transpose to final matrix form
-    # (n1, n2, 2, 2) -> (n1, 2, n2, 2) -> (2 * n1, 2 * n2)
-    return all_blocks.swapaxes(1, 2).reshape(2 * n_oscillators, 2 * n_oscillators)
+    # 5. Assemble the (n, n, 2, 2) blocks into the (2n, 2n) matrix
+    return _oscillator_blocks_to_matrix(all_blocks)
 
 
 def compute_directed_influence_stability_scale(
@@ -842,25 +905,14 @@ def project_coupled_transition_matrix(transition_matrix: ArrayLike) -> jax.Array
         If the input matrix dimensions are not even or not square.
     """
     transition_matrix = jnp.asarray(transition_matrix)
-    dim = transition_matrix.shape[0]
-    if dim % 2 != 0 or transition_matrix.shape != (dim, dim):
-        raise ValueError("Input transition_matrix must be square with even dimensions.")
-    n_oscillators = dim // 2
+    # (n_oscillators, n_oscillators, 2, 2) blocks; validates the shape.
+    blocks = _matrix_to_oscillator_blocks(transition_matrix)
 
     # Non-vmapped: emit one reduced fallback signal for the whole matrix.
     _warn_if_rotation_projection_degenerate(transition_matrix)
 
-    # Reshape to (n_oscillators, 2, n_oscillators, 2) for block access
-    blocks = transition_matrix.reshape(n_oscillators, 2, n_oscillators, 2)
-    # Transpose to (n_oscillators, n_oscillators, 2, 2) - (from, to, row, col)
-    blocks = blocks.transpose(0, 2, 1, 3)
-
     project_all = jax.vmap(jax.vmap(_project_to_scaled_rotation_matrix, in_axes=0))
-    projected_blocks = project_all(blocks)
-
-    # Reshape back to (2*n_oscillators, 2*n_oscillators)
-    # (from, to, row, col) -> (from, row, to, col) -> (2*n_osc, 2*n_osc)
-    return projected_blocks.transpose(0, 2, 1, 3).reshape(dim, dim)
+    return _oscillator_blocks_to_matrix(project_all(blocks))
 
 
 def _matrix_to_oscillator_blocks(matrix: jax.Array) -> jax.Array:
@@ -1072,6 +1124,39 @@ def extract_correlated_noise_params_from_covariance(
         "variance": variance,
         "phase_difference": phase_difference,
         "coupling_strength": coupling_strength,
+    }
+
+
+def extract_correlated_noise_params_from_covariance_stack(
+    process_covariances: ArrayLike,
+    n_oscillators: int,
+) -> dict[str, jax.Array]:
+    """Extract CNM scientific parameters from a per-state covariance stack.
+
+    Parameters
+    ----------
+    process_covariances : ArrayLike, shape (n_latent, n_latent, n_discrete_states)
+        Structured per-state process covariances, ``n_latent = 2 * n_oscillators``.
+    n_oscillators : int
+
+    Returns
+    -------
+    dict
+        ``variance`` of shape ``(n_oscillators, n_discrete_states)``;
+        ``phase_difference`` and ``coupling_strength`` of shape
+        ``(n_oscillators, n_oscillators, n_discrete_states)``, each slice from
+        :func:`extract_correlated_noise_params_from_covariance`.
+    """
+    process_covariances = jnp.asarray(process_covariances)
+    per_state = [
+        extract_correlated_noise_params_from_covariance(
+            process_covariances[..., j], n_oscillators
+        )
+        for j in range(process_covariances.shape[-1])
+    ]
+    return {
+        key: jnp.stack([p[key] for p in per_state], axis=-1)
+        for key in ("variance", "phase_difference", "coupling_strength")
     }
 
 

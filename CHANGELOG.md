@@ -87,6 +87,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`em_driver.snapshot_attributes` / `restore_attributes` /
   `clear_attributes`**: build `run_em`'s snapshot, restore and clear hooks
   from a tuple of attribute names; every `run_em` caller now uses them.
+- **Stacked oscillator constructors in `oscillator_utils`**:
+  `construct_common_oscillator_transition_matrix_stack`,
+  `construct_correlated_noise_process_covariance_stack` and
+  `extract_correlated_noise_params_from_covariance_stack`.
 
 ### Testing
 
