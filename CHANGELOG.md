@@ -162,6 +162,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **Point-process smoothers write their backward-pass outputs in place**:
+  the dense smoother now reuses `kalman.rts_backward_scan` (its private copy
+  is removed) and the block-diagonal backward pass carries its output
+  buffers, so no full-size temporary copies are made (T=5000, d=50: backward
+  temp 102 MB -> 0.2 MB; block-diagonal smoother core 504 MB -> 160 MB).
+  Outputs and gradients are bit-identical.
 - **Typed PRNG keys internally**: default and seed-derived keys use
   `jax.random.key` (JAX's recommended typed keys) instead of the legacy
   `jax.random.PRNGKey`, which JAX plans to deprecate. Both encode the same

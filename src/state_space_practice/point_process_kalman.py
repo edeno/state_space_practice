@@ -55,7 +55,9 @@ from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.kalman import (
     InitialStatePrior,
     _kalman_smoother_update,
+    _scan_with_boundary,
     process_cov_residual_form,
+    rts_backward_scan,
     smooth_initial_state_with_cross_cov,
     sum_of_outer_products,
 )
@@ -2298,13 +2300,23 @@ def _block_diagonal_smoother_core(
     # decomposes into independent per-neuron smoothers (neuron j with its
     # own A_j, Q_j), exactly matching the dense filter's backward pass on
     # the block-diagonal problem.
+    #
+    # The outputs are written in place: _scan_with_boundary carries the
+    # smoothed mean/cov buffers (the terminal slot holds the filtered
+    # moments, which the smoother leaves unchanged) and reads the filtered
+    # moments by index, and the cross-covariances go into a buffer carried
+    # here. A scan-stacked output under vmap is laid out time-major and
+    # transposed to the per-neuron layout afterwards (a full-size copy), so
+    # none of the three outputs is stacked by the scan.
     def _backward_step(
         A_j: Array,
         Q_j: Array,
-        carry: tuple[Array, Array],
+        carry: tuple[tuple[Array, Array], Array, Array],
         args: tuple[Array, Array],
-    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
-        next_smoother_mean, next_smoother_cov = carry
+    ) -> tuple[
+        tuple[tuple[Array, Array], Array, Array], tuple[tuple[Array, Array], None]
+    ]:
+        (next_smoother_mean, next_smoother_cov), cross_cov_buffer, t = carry
         filter_mean, filter_cov = args
         sm, sc, scc = _kalman_smoother_update(
             next_smoother_mean,
@@ -2314,22 +2326,34 @@ def _block_diagonal_smoother_core(
             Q_j,
             A_j,
         )
-        return (sm, sc), (sm, sc, scc)
+        # The step is still traced when n_time == 1 (a zero-length scan),
+        # where the buffer is empty and there is nothing to write.
+        if cross_cov_buffer.shape[0] > 0:
+            cross_cov_buffer = jax.lax.dynamic_update_index_in_dim(
+                cross_cov_buffer, scc, t, axis=0
+            )
+        return ((sm, sc), cross_cov_buffer, t - 1), ((sm, sc), None)
 
     def _run_backward_one_neuron(
         A_j: Array, Q_j: Array, means_j: Array, covs_j: Array
     ) -> tuple[Array, Array, Array]:
-        # Initial carry: the last-time-step filtered posterior.
-        (_, _), (sm_rev, sc_rev, scc_rev) = jax.lax.scan(
+        n_time = means_j.shape[0]
+        terminal = (means_j[-1], covs_j[-1])
+        init_carry = (
+            terminal,
+            jnp.zeros((n_time - 1, *covs_j.shape[1:]), covs_j.dtype),
+            jnp.asarray(n_time - 2),
+        )
+        (_, cross_covs, _), (means, covs), _ = _scan_with_boundary(
             functools.partial(_backward_step, A_j, Q_j),
-            (means_j[-1], covs_j[-1]),
-            (means_j[:-1], covs_j[:-1]),
+            init_carry,
+            (means_j, covs_j),
+            (0, 0),
+            n_time - 1,
+            terminal,
             reverse=True,
         )
-        # Append the last time step's filter posterior (no backward update)
-        sm_full = jnp.concatenate((sm_rev, means_j[-1][None]))
-        sc_full = jnp.concatenate((sc_rev, covs_j[-1][None]))
-        return sm_full, sc_full, scc_rev
+        return means, covs, cross_covs
 
     smoother_means, smoother_covs, smoother_cross_covs = jax.vmap(
         _run_backward_one_neuron
@@ -2915,60 +2939,14 @@ def stochastic_point_process_smoother(
         )
     )
 
-    smoother_mean, smoother_cov, smoother_cross_cov = (
-        _stochastic_point_process_smoother_backward(
-            filtered_mean,
-            filtered_cov,
-            process_cov,
-            transition_matrix,
-        )
+    smoother_mean, smoother_cov, smoother_cross_cov = rts_backward_scan(
+        filtered_mean, filtered_cov, transition_matrix, process_cov
     )
 
     result = (smoother_mean, smoother_cov, smoother_cross_cov, marginal_log_likelihood)
     if return_filtered:
         return result + (filtered_mean, filtered_cov)
     return result
-
-
-@typed_jit
-def _stochastic_point_process_smoother_backward(
-    filtered_mean: Array,
-    filtered_cov: Array,
-    process_cov: Array,
-    transition_matrix: Array,
-) -> tuple[Array, Array, Array]:
-    """JIT-compiled backward pass of the point process smoother."""
-
-    def _step(
-        carry: tuple[Array, Array], args: tuple[Array, Array]
-    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
-        next_smoother_mean, next_smoother_cov = carry
-        filter_mean, filter_cov = args
-        smoother_mean, smoother_cov, smoother_cross_cov = _kalman_smoother_update(
-            next_smoother_mean,
-            next_smoother_cov,
-            filter_mean,
-            filter_cov,
-            process_cov,
-            transition_matrix,
-        )
-        return (smoother_mean, smoother_cov), (
-            smoother_mean,
-            smoother_cov,
-            smoother_cross_cov,
-        )
-
-    (_, _), (smoother_mean, smoother_cov, smoother_cross_cov) = jax.lax.scan(
-        _step,
-        (filtered_mean[-1], filtered_cov[-1]),
-        (filtered_mean[:-1], filtered_cov[:-1]),
-        reverse=True,
-    )
-
-    smoother_mean = jnp.concatenate((smoother_mean, filtered_mean[-1][None]))
-    smoother_cov = jnp.concatenate((smoother_cov, filtered_cov[-1][None]))
-
-    return smoother_mean, smoother_cov, smoother_cross_cov
 
 
 def dynamics_only_m_step(

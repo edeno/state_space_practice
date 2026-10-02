@@ -4273,6 +4273,86 @@ class TestBlockDiagonalCovarianceContainer:
                 jax.jit(lambda x: x)(cov)
 
 
+class TestSmootherBackwardPassMemory:
+    """The smoothers' backward passes write their outputs in place.
+
+    A backward scan whose stacked outputs are concatenated with the terminal
+    step, or that scans over sliced inputs, holds a second full-size copy of
+    a covariance stack at peak memory; so does a scan-stacked output under
+    ``vmap`` (transposed to the per-neuron layout afterwards). Only the
+    compiled programs are inspected, nothing is run.
+    """
+
+    n_time = 2000
+
+    @staticmethod
+    def _temp_bytes(fn, *arg_specs) -> int:
+        memory = jax.jit(fn).lower(*arg_specs).compile().memory_analysis()
+        if memory is None:
+            pytest.skip("backend reports no memory analysis")
+        return memory.temp_size_in_bytes
+
+    def test_dense_smoother_needs_no_full_size_temporaries(self) -> None:
+        T, d, n_obs = self.n_time, 4, 3
+        spec = jax.ShapeDtypeStruct
+
+        def smoother(init_mean, init_cov, design, spikes, A, Q):
+            # return_filtered: the filtered stacks are outputs, not temps.
+            return stochastic_point_process_smoother(
+                init_mean,
+                init_cov,
+                design,
+                spikes,
+                0.02,
+                A,
+                Q,
+                log_conditional_intensity,
+                validate_inputs=False,
+                return_filtered=True,
+            )
+
+        temp = self._temp_bytes(
+            smoother,
+            spec((d,), jnp.float64),
+            spec((d, d), jnp.float64),
+            spec((T, n_obs, d), jnp.float64),
+            spec((T, n_obs), jnp.float64),
+            spec((d, d), jnp.float64),
+            spec((d, d), jnp.float64),
+        )
+        # One copy of the smoothed covariances is T*d*d*8 = 256 kB.
+        assert temp < 0.1 * T * d * d * 8
+
+    def test_block_smoother_backward_adds_no_full_size_temporaries(self) -> None:
+        T, n_neurons, nb = self.n_time, 3, 4
+        spec = jax.ShapeDtypeStruct
+        arg_specs = (
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((n_neurons, nb), jnp.float64),
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((T, nb), jnp.float64),
+            spec((T, n_neurons), jnp.float64),
+        )
+        options = {
+            "include_laplace_normalization": True,
+            "max_log_count": 20.0,
+            "max_newton_iter": 3,
+        }
+        forward_temp = self._temp_bytes(
+            lambda *args: _block_diagonal_forward_core(*args, 0.02, **options),
+            *arg_specs,
+        )
+        smoother_temp = self._temp_bytes(
+            lambda *args: _block_diagonal_smoother_core(*args, 0.02, **options),
+            *arg_specs,
+        )
+        # The smoother core runs the forward core, so its temporaries are
+        # the forward pass's plus the backward pass's. One copy of the
+        # per-neuron smoothed covariances is n_neurons*T*nb*nb*8 = 768 kB.
+        assert smoother_temp - forward_temp < 0.1 * n_neurons * T * nb * nb * 8
+
+
 # ============================================================================
 # Integration: PointProcessModel parameter + trajectory recovery
 # ============================================================================
