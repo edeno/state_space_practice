@@ -23,6 +23,10 @@ from state_space_practice.multinomial_choice import (
     softmax_observation_update,
 )
 from state_space_practice.switching_choice import switching_choice_filter
+from state_space_practice.tests.model_state import (
+    assert_model_state_unchanged,
+    snapshot_model_state,
+)
 
 
 class TestSoftmaxObservationUpdate:
@@ -731,6 +735,25 @@ class TestMultinomialSGDFitting:
         sgd_lls = model.fit_sgd(choices, num_steps=5)
         assert model.n_iter_ is None
         assert model.log_likelihood_history_ == sgd_lls
+
+    def test_rejected_settings_leave_fresh_model_untouched(self):
+        """Invalid optimizer settings fail before the data is bound."""
+        model = MultinomialChoiceModel(n_options=3)
+        before = snapshot_model_state(model)
+        with pytest.raises(ValueError, match="num_steps"):
+            model.fit_sgd(np.random.default_rng(0).integers(0, 3, 40), num_steps=-1)
+        assert_model_state_unchanged(model, before)
+
+    def test_rejected_settings_leave_fitted_model_untouched(self):
+        """A rejected fit_sgd on shorter data keeps the previous fit's state."""
+        rng = np.random.default_rng(0)
+        model = MultinomialChoiceModel(n_options=3)
+        model.fit(rng.integers(0, 3, 60), max_iter=2)
+        before = snapshot_model_state(model)
+        # 40 != 60 trials: binding this data would change _n_trials.
+        with pytest.raises(ValueError, match="num_steps"):
+            model.fit_sgd(rng.integers(0, 3, 40), num_steps=-1)
+        assert_model_state_unchanged(model, before)
 
     def test_sgd_respects_constraints(self):
         rng = np.random.default_rng(42)

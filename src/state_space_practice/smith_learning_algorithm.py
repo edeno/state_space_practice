@@ -56,7 +56,7 @@ import math
 import warnings
 from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     import optax
@@ -2003,6 +2003,22 @@ class SmithLearningModel(SGDFittableMixin):
         -------
         log_likelihoods : list of float
         """
+        return super().fit_sgd(
+            n_correct_responses,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+        )
+
+    def _prepare_sgd_data(
+        self, n_correct_responses: ArrayLike
+    ) -> tuple[tuple[Array], dict[str, Any]]:
+        """Validate the ``fit_sgd`` responses and record the trial count.
+
+        Runs after ``fit_sgd`` has validated its settings, so a rejected call
+        leaves the model untouched.
+        """
         n_correct_arr = jnp.asarray(n_correct_responses)
         if n_correct_arr.ndim != 1:
             raise ValueError(
@@ -2011,20 +2027,15 @@ class SmithLearningModel(SGDFittableMixin):
         if len(n_correct_arr) < 2:
             raise ValueError(f"Need at least 2 trials, got {len(n_correct_arr)}.")
         validate_count_array(n_correct_arr, "n_correct_responses", allow_empty=False)
-        self._n_trials_ = int(n_correct_arr.shape[0])
-        self._resolved_max_correct = self._resolve_max_possible_correct(n_correct_arr)
-        if bool(jnp.any(n_correct_arr > self._resolved_max_correct)):
+        resolved_max_correct = self._resolve_max_possible_correct(n_correct_arr)
+        if bool(jnp.any(n_correct_arr > resolved_max_correct)):
             raise ValueError(
                 "n_correct_responses contains values exceeding max_possible_correct."
             )
 
-        return super().fit_sgd(
-            n_correct_arr,
-            optimizer=optimizer,
-            num_steps=num_steps,
-            verbose=verbose,
-            convergence_tol=convergence_tol,
-        )
+        self._n_trials_ = int(n_correct_arr.shape[0])
+        self._resolved_max_correct = resolved_max_correct
+        return (n_correct_arr,), {}
 
     @property
     def _n_timesteps(self) -> int:

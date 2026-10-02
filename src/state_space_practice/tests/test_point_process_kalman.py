@@ -40,6 +40,10 @@ from state_space_practice.point_process_kalman import (
     stochastic_point_process_filter,
     stochastic_point_process_smoother,
 )
+from state_space_practice.tests.model_state import (
+    assert_model_state_unchanged,
+    snapshot_model_state,
+)
 
 # Enable 64-bit precision for numerical stability
 jax.config.update("jax_enable_x64", True)
@@ -2800,6 +2804,19 @@ class TestPointProcessSGDFitting:
         assert model.smoother_mean is not None
         assert model.smoother_cov is not None
         assert hasattr(model, "log_likelihood_")
+
+    @pytest.mark.parametrize("prefit", [False, True], ids=["fresh", "fitted"])
+    def test_rejected_settings_leave_model_unchanged(self, small_pp_problem, prefit):
+        """fit_sgd rejects bad settings before it touches the model."""
+        n_state, dt, design_matrix, spike_indicator = small_pp_problem
+        model = PointProcessModel(n_state, dt)
+        if prefit:
+            model.fit_sgd(design_matrix, spike_indicator, num_steps=2)
+        # A different length than the prefit, so a stashed length would show.
+        before = snapshot_model_state(model)
+        with pytest.raises(ValueError, match="num_steps"):
+            model.fit_sgd(design_matrix[:50], spike_indicator[:50], num_steps=-1)
+        assert_model_state_unchanged(model, before)
 
 
 class TestLogdetPsd:

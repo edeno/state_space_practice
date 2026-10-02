@@ -21,6 +21,10 @@ from state_space_practice.multinomial_choice import (
     MultinomialChoiceModel,
     multinomial_choice_filter,
 )
+from state_space_practice.tests.model_state import (
+    assert_model_state_unchanged,
+    snapshot_model_state,
+)
 
 
 class TestCovariatePrediction:
@@ -1190,6 +1194,44 @@ class TestRejectedFitPreservesState:
             np.asarray(model._control_input()), control_before
         )
         assert model.bic() == bic_before
+
+    @staticmethod
+    def _data(n_trials):
+        rng = np.random.default_rng(n_trials)
+        return (
+            rng.integers(0, 3, size=n_trials),
+            rng.standard_normal((n_trials, 2)),
+            rng.standard_normal((n_trials, 2)),
+        )
+
+    def test_rejected_sgd_settings_leave_fresh_model_untouched(self):
+        """Invalid optimizer settings fail before the covariates are bound."""
+        model = CovariateChoiceModel(n_options=3, n_covariates=2, n_obs_covariates=2)
+        before = snapshot_model_state(model)
+        choices, covariates, obs_covariates = self._data(40)
+        with pytest.raises(ValueError, match="num_steps"):
+            model.fit_sgd(
+                choices,
+                covariates=covariates,
+                obs_covariates=obs_covariates,
+                num_steps=-1,
+            )
+        assert_model_state_unchanged(model, before)
+
+    def test_rejected_sgd_settings_leave_fitted_model_untouched(self, fitted):
+        """Valid but shorter data with invalid settings keeps the previous fit."""
+        model = fitted[0]
+        before = snapshot_model_state(model)
+        # 40 != N_TRIALS: binding this data would change every bound input.
+        choices, covariates, obs_covariates = self._data(40)
+        with pytest.raises(ValueError, match="num_steps"):
+            model.fit_sgd(
+                choices,
+                covariates=covariates,
+                obs_covariates=obs_covariates,
+                num_steps=-1,
+            )
+        assert_model_state_unchanged(model, before)
 
 
 class TestDecayDynamics:

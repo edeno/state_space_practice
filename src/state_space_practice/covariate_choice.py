@@ -813,14 +813,34 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
         -------
         log_likelihoods : list of float
         """
-        choices_arr = self._bind_covariates(
-            choices, covariates, obs_covariates, "fit_sgd"
-        )
-        return self._fit_sgd_validated(
-            choices_arr, optimizer, num_steps, verbose, convergence_tol
+        return super().fit_sgd(
+            choices,
+            covariates=covariates,
+            obs_covariates=obs_covariates,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
         )
 
     # --- SGDFittableMixin protocol ---
+
+    def _prepare_sgd_data(
+        self,
+        choices: ArrayLike,
+        covariates: ArrayLike | None = None,
+        obs_covariates: ArrayLike | None = None,
+    ) -> tuple[tuple[Array, ...], dict[str, Any]]:
+        """Validate and bind the ``fit_sgd`` inputs (see ``_bind_covariates``).
+
+        Runs after ``fit_sgd`` validates its optimizer settings. The loss reads
+        the bound covariates from the model, so only the int32 choices are
+        forwarded to it.
+        """
+        choices_arr = self._bind_covariates(
+            choices, covariates, obs_covariates, "fit_sgd"
+        )
+        return (choices_arr,), {}
 
     def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         params, spec = super()._build_param_spec()

@@ -20,6 +20,10 @@ from state_space_practice.contingency_belief import (
     transition_logits_to_matrix,
 )
 from state_space_practice.exceptions import NotFittedError
+from state_space_practice.tests.model_state import (
+    assert_model_state_unchanged,
+    snapshot_model_state,
+)
 from state_space_practice.tests.recovery_helpers import (
     assert_ll_improves,
     state_segmentation_accuracy,
@@ -651,6 +655,102 @@ class TestContingencyBeliefSGD:
 
         assert np.isfinite(model_em.log_likelihood_)
         assert np.isfinite(model_sgd.log_likelihood_)
+
+
+def _stay_obs_design(choices, n_options=3):
+    """Previous-choice indicator, shape (n_trials, n_options)."""
+    choices = np.asarray(choices)
+    obs = np.zeros((len(choices), n_options))
+    obs[np.arange(1, len(choices)), choices[:-1]] = 1.0
+    return obs
+
+
+class TestFitSGDFailureLeavesModelUnchanged:
+    """A fit_sgd call that raises must not have rebound data or parameters."""
+
+    def test_fresh_model(self):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=60)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        before = snapshot_model_state(model)
+        with pytest.raises(ValueError, match="num_steps"):
+            model.fit_sgd(choices, rewards, num_steps=-1)
+        assert_model_state_unchanged(model, before)
+
+    def test_fitted_model_with_different_length_data(self):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=80)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.fit_sgd(choices, rewards, num_steps=5)
+        before = snapshot_model_state(model)
+        with pytest.raises(ValueError, match="num_steps"):
+            model.fit_sgd(choices[:50], rewards[:50], num_steps=-1)
+        assert_model_state_unchanged(model, before)
+        assert model._n_trials == 80
+
+    def test_covariates_and_obs_design_matrix(self):
+        n_trials = 60
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=n_trials)
+        covariates = np.zeros((n_trials, 1))
+        covariates[n_trials // 2, 0] = 1.0
+        model = ContingencyBeliefModel(n_states=2, n_options=3, n_obs_covariates=3)
+        # Guard: these covariates add a coefficient row, so binding them pads
+        # transition_coefficients_.
+        assert model.transition_coefficients_.shape[0] == 1
+        before = snapshot_model_state(model)
+        with pytest.raises(ValueError, match="num_steps"):
+            model.fit_sgd(
+                choices,
+                rewards,
+                transition_covariates=covariates,
+                obs_design_matrix=_stay_obs_design(choices),
+                num_steps=-1,
+            )
+        assert_model_state_unchanged(model, before)
+
+    def test_missing_obs_design_matrix(self):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=60)
+        model = ContingencyBeliefModel(n_states=2, n_options=3, n_obs_covariates=3)
+        before = snapshot_model_state(model)
+        with pytest.raises(ValueError, match="obs_design_matrix"):
+            model.fit_sgd(choices, rewards, num_steps=5)
+        assert_model_state_unchanged(model, before)
+
+
+@pytest.mark.parametrize("with_covariates", [False, True])
+def test_repeat_fit_sgd_reuses_compiled_step(monkeypatch, with_covariates):
+    """Refitting the same model on the same data reuses the compiled SGD step:
+    the loss reads only bound data, never the parameters fitting rewrites."""
+    from state_space_practice import sgd_fitting
+
+    builds: list = []
+    original = sgd_fitting._build_sgd_step
+
+    def counting(*args, **kwargs):
+        builds.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(sgd_fitting, "_build_sgd_step", counting)
+    n_trials = 60
+    choices, rewards, _, _ = _simulate_block_bandit(n_trials=n_trials)
+    kwargs = {}
+    if with_covariates:
+        covariates = np.zeros((n_trials, 1))
+        covariates[n_trials // 2, 0] = 1.0
+        kwargs = {
+            "transition_covariates": covariates,
+            "obs_design_matrix": _stay_obs_design(choices),
+        }
+    model = ContingencyBeliefModel(
+        n_states=2, n_options=3, n_obs_covariates=3 if with_covariates else 0
+    )
+    lls = []
+    for _ in range(3):
+        before = np.asarray(model.reward_probs_)
+        lls.append(model.fit_sgd(choices, rewards, num_steps=5, **kwargs))
+        # Guard: each fit changed the trained parameters the cache must ignore.
+        assert not np.array_equal(before, model.reward_probs_)
+    assert len(builds) == 1
+    # The reused step continues optimizing from the stored parameters.
+    assert lls[2][-1] > lls[0][0]
 
 
 class TestContingencyBeliefIntegration:

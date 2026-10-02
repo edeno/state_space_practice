@@ -1137,12 +1137,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         ValueError
             If ``observations.shape[1]`` differs from ``n_sources``.
         """
-        observations = jnp.asarray(observations)
-        if observations.shape[1] != self.n_sources:
-            raise ValueError(
-                f"observations must have {self.n_sources} sources, "
-                f"got {observations.shape[1]}."
-            )
+        observations = self._validate_observations(observations)
         if key is None:
             key = jax.random.PRNGKey(0)
         if not skip_init:
@@ -1210,31 +1205,67 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         Returns
         -------
         log_likelihoods : list of float
-        """
-        if key is None:
-            key = jax.random.PRNGKey(0)
-        observations = jnp.asarray(observations)
-        if not skip_init:
-            self._initialize_parameters(key)
-            self._warm_initialize_states(observations)
-        self._sgd_n_time = observations.shape[0]
 
+        Raises
+        ------
+        ValueError
+            If ``observations.shape[1]`` differs from ``n_sources`` or a
+            setting is invalid. Nothing on the model changes in that case.
+        RuntimeError
+            If ``skip_init=True`` but the parameters were never initialized.
+        """
         return super().fit_sgd(
             observations,
+            key=key,
+            skip_init=skip_init,
             optimizer=optimizer,
             num_steps=num_steps,
             verbose=verbose,
             convergence_tol=convergence_tol,
         )
 
-    def _check_sgd_initialized(self) -> None:
-        if (
-            not hasattr(self, "continuous_transition_matrix")
-            or self.continuous_transition_matrix is None
-        ):
-            raise RuntimeError(
-                "Call fit_sgd(observations, key=...) to initialize parameters."
+    def _validate_observations(self, observations: ArrayLike) -> Array:
+        """Check ``observations`` has one column per source.
+
+        Shared by ``fit`` and ``fit_sgd`` so both reject bad input alike, before
+        the model is touched.
+
+        Returns
+        -------
+        Array, shape (n_time, n_sources)
+        """
+        observations = jnp.asarray(observations)
+        if observations.shape[1] != self.n_sources:
+            raise ValueError(
+                f"observations must have {self.n_sources} sources, "
+                f"got {observations.shape[1]}."
             )
+        return observations
+
+    def _prepare_sgd_data(
+        self,
+        observations: ArrayLike,
+        key: Array | None = None,
+        skip_init: bool = False,
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Validate, then initialize / warm-start the model for ``fit_sgd``.
+
+        Runs after ``fit_sgd`` validated its settings, so a call that is
+        rejected leaves the model untouched. Only the observations are
+        forwarded to ``_sgd_loss_fn`` and ``_finalize_sgd``.
+        """
+        observations = self._validate_observations(observations)
+        if skip_init:
+            if getattr(self, "continuous_transition_matrix", None) is None:
+                raise RuntimeError(
+                    "fit_sgd(skip_init=True) needs initialized parameters; call "
+                    "fit_sgd(observations, key=...) without skip_init first."
+                )
+        else:
+            self._initialize_parameters(jax.random.PRNGKey(0) if key is None else key)
+            self._warm_initialize_states(observations)
+        self._sgd_n_time = observations.shape[0]
+        return (observations,), {}
 
     def _store_sgd_params(self, params: SGDParams) -> None:
         """Store the plain keys, then rebuild the per-state covariance stacks.
@@ -2117,16 +2148,35 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         -------
         log_likelihoods : list of float
         """
-        self._connectivity_penalty = connectivity_penalty
-        return super().fit_sgd(
+        # The mixin's fit_sgd, not BaseModel's: that typed wrapper does not
+        # forward ``connectivity_penalty`` to ``_prepare_sgd_data``.
+        return SGDFittableMixin.fit_sgd(
+            self,
             observations,
             key=key,
+            skip_init=skip_init,
+            connectivity_penalty=connectivity_penalty,
             optimizer=optimizer,
             num_steps=num_steps,
             verbose=verbose,
             convergence_tol=convergence_tol,
-            skip_init=skip_init,
         )
+
+    def _prepare_sgd_data(
+        self,
+        observations: ArrayLike,
+        key: Array | None = None,
+        skip_init: bool = False,
+        connectivity_penalty: "OscillatorPenaltyConfig | None" = None,
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Prepare as the base model does, then record the connectivity penalty.
+
+        The penalty is stored only once the base preparation has accepted the
+        call, so a rejected call leaves it unchanged too.
+        """
+        prepared = super()._prepare_sgd_data(observations, key=key, skip_init=skip_init)
+        self._connectivity_penalty = connectivity_penalty
+        return prepared
 
     def _sgd_loss_fn(self, params: SGDParams, observations: Array) -> jax.Array:
         phase_diff = params.get("phase_difference", self.phase_difference)

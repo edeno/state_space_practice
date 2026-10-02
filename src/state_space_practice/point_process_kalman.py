@@ -3563,21 +3563,6 @@ class PointProcessModel(SGDFittableMixin):
         -------
         log_likelihoods : list of float
         """
-        design_matrix = jnp.asarray(design_matrix)
-        spike_indicator = jnp.asarray(spike_indicator)
-        validate_count_array(spike_indicator, "spike_indicator")
-        if spike_indicator.ndim == 1:
-            spike_indicator = spike_indicator[:, None]
-        self._sgd_n_time = spike_indicator.shape[0]
-
-        # Numerical sanity check once at the top: validate PSD and warn
-        # on f32 risk. The SGD loss_fn runs inside jax.jit, which cannot
-        # call eigvalsh's host-side float() conversion, so per-step
-        # re-validation is both wasteful and forbidden.
-        _validate_filter_numerics(
-            jnp.asarray(self.init_cov), n_time=spike_indicator.shape[0]
-        )
-
         return super().fit_sgd(
             design_matrix,
             spike_indicator,
@@ -3586,6 +3571,32 @@ class PointProcessModel(SGDFittableMixin):
             verbose=verbose,
             convergence_tol=convergence_tol,
         )
+
+    def _prepare_sgd_data(
+        self, design_matrix: ArrayLike, spike_indicator: ArrayLike
+    ) -> tuple[tuple[Array, Array], dict[str, Any]]:
+        """Validate the ``fit_sgd`` data and record its length.
+
+        Runs after ``fit_sgd`` has validated its settings, so a rejected call
+        leaves the model untouched.
+        """
+        design_matrix = jnp.asarray(design_matrix)
+        spike_indicator = jnp.asarray(spike_indicator)
+        validate_count_array(spike_indicator, "spike_indicator")
+        if spike_indicator.ndim == 1:
+            spike_indicator = spike_indicator[:, None]
+
+        # Numerical sanity check once at the top: validate PSD and warn
+        # on f32 risk. The SGD loss_fn runs inside jax.jit, which cannot
+        # call eigvalsh's host-side float() conversion, so per-step
+        # re-validation is both wasteful and forbidden. stacklevel=5: user
+        # -> fit_sgd -> SGDFittableMixin.fit_sgd -> this hook -> wrapper.
+        _validate_filter_numerics(
+            jnp.asarray(self.init_cov), n_time=spike_indicator.shape[0], stacklevel=5
+        )
+
+        self._sgd_n_time = spike_indicator.shape[0]
+        return (design_matrix, spike_indicator), {}
 
     @property
     def _n_timesteps(self) -> int:

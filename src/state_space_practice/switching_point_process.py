@@ -90,7 +90,7 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import jax
 import jax.numpy as jnp
@@ -3427,23 +3427,41 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         Returns
         -------
         log_likelihoods : list of float
+
+        Raises
+        ------
+        ValueError
+            If ``spikes`` is not a ``(n_time, n_neurons)`` count array, ``key``
+            is missing on the first call, or a setting is invalid. Nothing on
+            the model changes in that case.
         """
-        spikes = self._validate_spikes(spikes)
-        self._sgd_n_time = spikes.shape[0]
-
-        if not self._is_initialized():
-            if key is None:
-                raise ValueError("key required for initialization on first call")
-            self._initialize_parameters(key)
-            self._warm_initialize_states(spikes)
-
         return super().fit_sgd(
             spikes,
+            key=key,
             optimizer=optimizer,
             num_steps=num_steps,
             verbose=verbose,
             convergence_tol=convergence_tol,
         )
+
+    def _prepare_sgd_data(
+        self, spikes: ArrayLike, key: Array | None = None
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Validate, then initialize / warm-start the model for ``fit_sgd``.
+
+        Runs after ``fit_sgd`` validated its settings, so a call that is
+        rejected leaves the model untouched. Parameters are initialized only
+        on the first call; later calls continue from the current parameters.
+        Only the spikes are forwarded to ``_sgd_loss_fn`` and ``_finalize_sgd``.
+        """
+        spikes = self._validate_spikes(spikes)
+        if not self._is_initialized():
+            if key is None:
+                raise ValueError("key required for initialization on first call")
+            self._initialize_parameters(key)
+            self._warm_initialize_states(spikes)
+        self._sgd_n_time = spikes.shape[0]
+        return (spikes,), {}
 
     def _validate_spikes(self, spikes: ArrayLike) -> Array:
         """Check ``spikes`` is a ``(n_time, n_neurons)`` count array.
@@ -3480,12 +3498,6 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
     @property
     def _n_timesteps(self) -> int:
         return self._sgd_n_time
-
-    def _check_sgd_initialized(self) -> None:
-        if not self._is_initialized():
-            raise RuntimeError(
-                "Call fit_sgd(spikes, key=...) to initialize parameters."
-            )
 
     def _shared_sgd_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         """SGD parameters every switching point-process model optimizes.

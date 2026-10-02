@@ -46,7 +46,7 @@ Nickisch, H., Solin, A. & Grigorevskiy, A. (2018). State Space Gaussian Processe
 """
 
 import warnings
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -649,8 +649,7 @@ class TemporalRateGP(SGDFittableMixin):
     them.
     """
 
-    # Data and posterior, set by fit_sgd.
-    _counts: FittedAttribute[Array] = FittedAttribute()
+    # Posterior, set by fit_sgd.
     log_rate_mean_: FittedAttribute[Array] = FittedAttribute()
     log_rate_var_: FittedAttribute[Array] = FittedAttribute()
     log_marginal_likelihood_: FittedAttribute[float] = FittedAttribute()
@@ -741,39 +740,6 @@ class TemporalRateGP(SGDFittableMixin):
         list of float
             Log-evidence (summed over neurons) at each optimization step.
         """
-        counts = jnp.asarray(counts)
-        if counts.ndim == 1:
-            n_neurons, n_time = 1, int(counts.shape[0])
-        elif counts.ndim == 2:
-            n_neurons, n_time = int(counts.shape[0]), int(counts.shape[1])
-        else:
-            raise ValueError(
-                "counts must be 1D (n_time,) or 2D (n_neurons, n_time), got "
-                f"shape {counts.shape}."
-            )
-        validate_count_array(counts, "counts", allow_empty=False)
-        self._counts = counts
-        self._n_neurons = n_neurons
-        # Total observation count normalizes the mixin's loss so the learning
-        # rate scale is comparable across single- and multi-neuron fits.
-        self._sgd_n_time = n_time * n_neurons
-
-        # Numerical-precision guard: the Laplace-EKF smoother needs float64 for
-        # long sequences. Validate the stationary prior once (also warns on
-        # f32 + long T), matching the other filter entry points. A representative
-        # scalar hyperparameter suffices for the per-neuron case.
-        representative_variance = float(jnp.mean(jnp.asarray(self.variance)))
-        representative_lengthscale = float(jnp.mean(jnp.asarray(self.lengthscale)))
-        _, _, _, _, stationary_cov = matern32_continuous(
-            representative_variance, representative_lengthscale
-        )
-        _validate_filter_numerics(
-            stationary_cov,
-            n_time=n_time,
-            stacklevel=3,
-            filter_name="TemporalRateGP.fit_sgd",
-        )
-
         return super().fit_sgd(
             counts,
             num_steps=num_steps,
@@ -829,12 +795,48 @@ class TemporalRateGP(SGDFittableMixin):
     def _n_timesteps(self) -> int:
         return self._sgd_n_time
 
-    def _check_sgd_initialized(self) -> None:
-        if not is_set(self, "_counts"):
-            raise RuntimeError(
-                "No data. Call fit_sgd(counts), not SGDFittableMixin.fit_sgd() "
-                "directly."
+    def _prepare_sgd_data(
+        self, counts: ArrayLike
+    ) -> tuple[tuple[Array], dict[str, Any]]:
+        """Validate the ``fit_sgd`` counts and record their shape.
+
+        Runs after ``fit_sgd`` has validated its settings, so a rejected call
+        leaves the model untouched.
+        """
+        counts = jnp.asarray(counts)
+        if counts.ndim == 1:
+            n_neurons, n_time = 1, int(counts.shape[0])
+        elif counts.ndim == 2:
+            n_neurons, n_time = int(counts.shape[0]), int(counts.shape[1])
+        else:
+            raise ValueError(
+                "counts must be 1D (n_time,) or 2D (n_neurons, n_time), got "
+                f"shape {counts.shape}."
             )
+        validate_count_array(counts, "counts", allow_empty=False)
+
+        # Numerical-precision guard: the Laplace-EKF smoother needs float64 for
+        # long sequences. Validate the stationary prior once (also warns on
+        # f32 + long T), matching the other filter entry points. A representative
+        # scalar hyperparameter suffices for the per-neuron case. stacklevel=5:
+        # user -> fit_sgd -> SGDFittableMixin.fit_sgd -> this hook.
+        representative_variance = float(jnp.mean(jnp.asarray(self.variance)))
+        representative_lengthscale = float(jnp.mean(jnp.asarray(self.lengthscale)))
+        _, _, _, _, stationary_cov = matern32_continuous(
+            representative_variance, representative_lengthscale
+        )
+        _validate_filter_numerics(
+            stationary_cov,
+            n_time=n_time,
+            stacklevel=5,
+            filter_name="TemporalRateGP.fit_sgd",
+        )
+
+        self._n_neurons = n_neurons
+        # Total observation count normalizes the mixin's loss so the learning
+        # rate scale is comparable across single- and multi-neuron fits.
+        self._sgd_n_time = n_time * n_neurons
+        return (counts,), {}
 
     def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         n_neurons = self._n_neurons

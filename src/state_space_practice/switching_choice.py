@@ -936,6 +936,37 @@ class SwitchingChoiceModel(SGDFittableMixin):
             f"n_discrete_states={self.n_discrete_states}, {fitted})"
         )
 
+    def _bind_data(
+        self,
+        choices: ArrayLike,
+        covariates: ArrayLike | None,
+        obs_covariates: ArrayLike | None,
+    ) -> Array:
+        """Validate the fitting data and bind it to the model.
+
+        Records the trial count and the covariates that the filter, smoother,
+        M-step and SGD loss read from the model.
+
+        Parameters
+        ----------
+        choices : ArrayLike, shape (n_trials,)
+        covariates : ArrayLike or None, shape (n_trials, n_covariates)
+        obs_covariates : ArrayLike or None, shape (n_trials, n_obs_covariates)
+
+        Returns
+        -------
+        choices : Array, shape (n_trials,)
+            The choices as int32.
+        """
+        validate_choice_indices(choices, self.n_options)
+        choices = jnp.asarray(choices, dtype=jnp.int32)
+        self._n_trials = int(choices.shape[0])
+        self._covariates = jnp.asarray(covariates) if covariates is not None else None
+        self._obs_covariates = (
+            jnp.asarray(obs_covariates) if obs_covariates is not None else None
+        )
+        return choices
+
     def _run_filter(
         self,
         choices: Array,
@@ -994,13 +1025,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
         -------
         log_likelihoods : list of float
         """
-        validate_choice_indices(choices, self.n_options)
-        choices = jnp.asarray(choices, dtype=jnp.int32)
-        self._n_trials = int(choices.shape[0])
-        self._covariates = jnp.asarray(covariates) if covariates is not None else None
-        self._obs_covariates = (
-            jnp.asarray(obs_covariates) if obs_covariates is not None else None
-        )
+        choices = self._bind_data(choices, covariates, obs_covariates)
 
         log_likelihoods: list[float] = []
         prev_ll = float("-inf")
@@ -1193,21 +1218,28 @@ class SwitchingChoiceModel(SGDFittableMixin):
         log_likelihoods : list of float
             Marginal log-likelihood per optimization step.
         """
-        validate_choice_indices(choices, self.n_options)
-        choices = jnp.asarray(choices, dtype=jnp.int32)
-        self._n_trials = int(choices.shape[0])
-        self._covariates = jnp.asarray(covariates) if covariates is not None else None
-        self._obs_covariates = (
-            jnp.asarray(obs_covariates) if obs_covariates is not None else None
-        )
-
         return super().fit_sgd(
             choices,
+            covariates,
+            obs_covariates,
             optimizer=optimizer,
             num_steps=num_steps,
             verbose=verbose,
             convergence_tol=convergence_tol,
         )
+
+    def _prepare_sgd_data(
+        self,
+        choices: ArrayLike,
+        covariates: ArrayLike | None = None,
+        obs_covariates: ArrayLike | None = None,
+    ) -> tuple[tuple[Array], dict[str, Any]]:
+        """Bind the data after ``fit_sgd`` has validated its settings.
+
+        The covariates stay on the model (the loss and ``_finalize_sgd`` read
+        them there); only the choices are forwarded.
+        """
+        return (self._bind_data(choices, covariates, obs_covariates),), {}
 
     @property
     def _n_timesteps(self) -> int:

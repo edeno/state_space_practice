@@ -32,6 +32,10 @@ from state_space_practice.smith_learning_algorithm import (
     smith_learning_filter,
     smith_learning_smoother,
 )
+from state_space_practice.tests.model_state import (
+    assert_model_state_unchanged,
+    snapshot_model_state,
+)
 from state_space_practice.tests.recovery_helpers import assert_ll_monotonic
 
 # Enable 64-bit precision for numerical stability
@@ -2104,6 +2108,18 @@ class TestSmithSGDFitting:
         # Init state should still be 0
         assert model.init_learning_state == 0.0
         assert model.is_fitted
+
+    @pytest.mark.parametrize("prefit", [False, True], ids=["fresh", "fitted"])
+    def test_rejected_settings_leave_model_unchanged(self, simple_outcomes, prefit):
+        """fit_sgd rejects bad settings before it touches the model."""
+        model = SmithLearningModel(sigma_epsilon=0.1)
+        if prefit:
+            model.fit_sgd(simple_outcomes, num_steps=2)
+        # A different length than the prefit, so a stashed length would show.
+        before = snapshot_model_state(model)
+        with pytest.raises(ValueError, match="num_steps"):
+            model.fit_sgd(simple_outcomes[:50], num_steps=-1)
+        assert_model_state_unchanged(model, before)
 
 
 # ============================================================================

@@ -918,24 +918,18 @@ class _MultinomialChoiceBase(SGDFittableMixin):
 
         return log_likelihoods
 
-    def _fit_sgd_validated(
-        self,
-        choices_arr: Array,
-        optimizer: optax.GradientTransformation | None,
-        num_steps: int,
-        verbose: bool,
-        convergence_tol: float | None,
-    ) -> list[float]:
-        """SGD fit on choices already validated by ``_prepare_choices``."""
-        return super().fit_sgd(
-            choices_arr,
-            optimizer=optimizer,
-            num_steps=num_steps,
-            verbose=verbose,
-            convergence_tol=convergence_tol,
-        )
-
     # --- SGDFittableMixin protocol ---
+
+    def _prepare_sgd_data(
+        self, choices: ArrayLike
+    ) -> tuple[tuple[Array, ...], dict[str, Any]]:
+        """Validate the ``fit_sgd`` choices and record ``_n_trials``.
+
+        ``SGDFittableMixin.fit_sgd`` calls this after validating its optimizer
+        settings, so a call rejected for its settings leaves the model
+        untouched. Returns the int32 choices as the loss's only data argument.
+        """
+        return (self._prepare_choices(choices, "SGD"),), {}
 
     @property
     def _n_timesteps(self) -> int:
@@ -1437,9 +1431,12 @@ class MultinomialChoiceModel(_MultinomialChoiceBase):
         -------
         log_likelihoods : list of float
         """
-        choices_arr = self._prepare_choices(choices, "SGD")
-        return self._fit_sgd_validated(
-            choices_arr, optimizer, num_steps, verbose, convergence_tol
+        return super().fit_sgd(
+            choices,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
         )
 
 

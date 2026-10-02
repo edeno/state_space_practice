@@ -1278,6 +1278,15 @@ class ContingencyBeliefModel(SGDFittableMixin):
             ``n_obs_covariates > 0``.
         """
         _validate_choices_rewards(choices, rewards, self.n_options)
+        if (
+            obs_design_matrix is None
+            and require_obs_design_matrix
+            and self.n_obs_covariates > 0
+        ):
+            raise ValueError(
+                f"Model has n_obs_covariates={self.n_obs_covariates}"
+                " but no obs_design_matrix was passed"
+            )
         choices = jnp.asarray(choices, dtype=jnp.int32)
         rewards = jnp.asarray(rewards, dtype=jnp.int32)
         self._n_trials = int(choices.shape[0])
@@ -1290,11 +1299,6 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
         if obs_design_matrix is not None:
             self._obs_design_matrix = jnp.asarray(obs_design_matrix)
-        elif require_obs_design_matrix and self.n_obs_covariates > 0:
-            raise ValueError(
-                f"Model has n_obs_covariates={self.n_obs_covariates}"
-                " but no obs_design_matrix was passed"
-            )
         else:
             self._obs_design_matrix = None
 
@@ -1561,6 +1565,32 @@ class ContingencyBeliefModel(SGDFittableMixin):
             If the choices/rewards are invalid or ``obs_design_matrix`` is
             missing while ``n_obs_covariates > 0``.
         """
+        return super().fit_sgd(
+            choices,
+            rewards,
+            transition_covariates=transition_covariates,
+            obs_design_matrix=obs_design_matrix,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+        )
+
+    def _prepare_sgd_data(
+        self,
+        choices: ArrayLike,
+        rewards: ArrayLike,
+        transition_covariates: ArrayLike | None = None,
+        obs_design_matrix: ArrayLike | None = None,
+    ) -> tuple[tuple[Array, Array], dict[str, Any]]:
+        """Bind the training data once the optimizer settings are validated.
+
+        Binding sets ``_n_trials`` and the design matrices and may pad
+        ``transition_coefficients_``, so it runs here rather than before
+        ``super().fit_sgd``: invalid settings then fail with the model
+        untouched. Only ``(choices, rewards)`` reach ``_sgd_loss_fn`` and
+        ``_finalize_sgd``; the design matrices are read from the model.
+        """
         choices, rewards = self._bind_data(
             choices,
             rewards,
@@ -1568,14 +1598,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
             obs_design_matrix,
             require_obs_design_matrix=True,
         )
-        return super().fit_sgd(
-            choices,
-            rewards,
-            optimizer=optimizer,
-            num_steps=num_steps,
-            verbose=verbose,
-            convergence_tol=convergence_tol,
-        )
+        return (choices, rewards), {}
 
     @property
     def _n_timesteps(self) -> int:

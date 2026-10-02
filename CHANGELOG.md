@@ -421,6 +421,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A rejected `fit_sgd` call no longer changes the model**: model-specific
+  setup (data binding, initialization, warm start, recorded lengths) ran in
+  each model's `fit_sgd` override before the shared settings checks, so e.g.
+  `fit_sgd(data, num_steps=-1)` raised only after re-initializing the model --
+  on a fitted oscillator model or `PlaceFieldModel` that discarded the fit.
+  That setup now runs in the `_prepare_sgd_data` hook, after `num_steps` and
+  the optimizer are validated, and data is validated before anything is
+  stored. The oscillator models' `fit_sgd` also rejects a wrong observation
+  column count with `ValueError` (it re-initialized, then failed with
+  `TypeError`/`IndexError`). Removed the private `TemporalRateGP._counts` and
+  the `RuntimeError` guards against calling `SGDFittableMixin.fit_sgd`
+  directly on `PlaceFieldModel` / `TemporalRateGP`, which the hook makes
+  unnecessary.
 - **Fit results no longer go stale when switching between `fit` and
   `fit_sgd`**: every EM `fit` and `fit_sgd` now records `log_likelihood_`,
   `log_likelihood_history_`, `converged_` and `n_iter_` together (through

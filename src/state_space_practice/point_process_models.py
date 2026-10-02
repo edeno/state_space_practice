@@ -53,7 +53,7 @@ from state_space_practice.oscillator_utils import (
     project_correlated_noise_process_covariance,
 )
 from state_space_practice.parameter_transforms import POSITIVE, UNCONSTRAINED
-from state_space_practice.sgd_fitting import SGDParams, SGDParamSpec
+from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.switching_kalman import (
     compute_process_covariance_sufficient_stats,
     compute_transition_sufficient_stats,
@@ -1451,15 +1451,34 @@ class DirectedInfluencePointProcessModel(
         -------
         log_likelihoods : list of float
         """
-        self._connectivity_penalty = connectivity_penalty
-        return super().fit_sgd(
+        # The mixin's fit_sgd, not SwitchingPointProcessBase's: that typed
+        # wrapper does not forward ``connectivity_penalty`` to
+        # ``_prepare_sgd_data``.
+        return SGDFittableMixin.fit_sgd(
+            self,
             spikes,
             key=key,
+            connectivity_penalty=connectivity_penalty,
             optimizer=optimizer,
             num_steps=num_steps,
             verbose=verbose,
             convergence_tol=convergence_tol,
         )
+
+    def _prepare_sgd_data(
+        self,
+        spikes: ArrayLike,
+        key: Array | None = None,
+        connectivity_penalty: OscillatorPenaltyConfig | None = None,
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Prepare as the base model does, then record the connectivity penalty.
+
+        The penalty is stored only once the base preparation has accepted the
+        call, so a rejected call leaves it unchanged too.
+        """
+        prepared = super()._prepare_sgd_data(spikes, key=key)
+        self._connectivity_penalty = connectivity_penalty
+        return prepared
 
     def _sgd_loss_fn(self, params: SGDParams, spikes: jax.Array) -> jax.Array:
         phase_diff = params.get("phase_difference", self.phase_difference)

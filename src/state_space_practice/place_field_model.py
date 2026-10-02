@@ -1443,6 +1443,32 @@ class PlaceFieldModel(SGDFittableMixin):
         log_likelihoods : list of float
 
         """
+        return super().fit_sgd(
+            position,
+            spikes,
+            optimizer=optimizer,
+            num_steps=num_steps,
+            verbose=verbose,
+            convergence_tol=convergence_tol,
+            warm_start=warm_start,
+            warm_start_window=warm_start_window,
+            force_dense=force_dense,
+        )
+
+    def _prepare_sgd_data(
+        self,
+        position: ArrayLike,
+        spikes: ArrayLike,
+        warm_start: bool = True,
+        warm_start_window: slice | None = None,
+        force_dense: bool = False,
+    ) -> tuple[tuple[Array, Array], dict[str, Any]]:
+        """Validate the ``fit_sgd`` data, initialize the model, build the design.
+
+        Runs after ``fit_sgd`` has validated its settings, so a rejected call
+        leaves the model (including fitted parameters a warm start would
+        overwrite) untouched. Returns the filter design matrix and spikes.
+        """
         position = np.asarray(position)
         spikes = as_2d_count_matrix(spikes, "spikes")
         if position.shape[0] != spikes.shape[0]:
@@ -1450,6 +1476,9 @@ class PlaceFieldModel(SGDFittableMixin):
                 f"position and spikes must have the same number of time bins: "
                 f"got position ({position.shape[0]},) vs spikes ({spikes.shape[0]},)"
             )
+        # Build the shared spline basis first: it validates ``position``
+        # before setting anything else on the model.
+        Z_base = self._build_spline_basis_matrix(position)
 
         self._sgd_n_time = spikes.shape[0]
         self.n_neurons = spikes.shape[1]
@@ -1458,14 +1487,13 @@ class PlaceFieldModel(SGDFittableMixin):
         if self.n_neurons == 1:
             spikes = spikes.squeeze(axis=1)
 
-        # Build the shared spline basis, then (optionally) warm-start.
+        # (Optionally) warm-start.
         #
         # The ``elif not is_set(self, "init_mean")`` guard on the cold-start path:
         # unlike ``fit`` (EM), which always resets init state, repeated ``fit_sgd(..., warm_start=
         # False)`` calls on the same model reuse the existing init state —
         # this is intentional for users who want to resume optimization
         # from a previous fit_sgd result without a warm-start reset.
-        Z_base = self._build_spline_basis_matrix(position)
         self.n_basis = self.n_neurons * self.n_basis_per_neuron
         if warm_start:
             self._warm_start_parameters(Z_base, spikes, warm_start_window)
@@ -1475,8 +1503,9 @@ class PlaceFieldModel(SGDFittableMixin):
         # Numerical sanity check: validate init_cov is PSD and warn if
         # the configuration is at risk of f32 NaN during the scan. Runs
         # once here so the SGD loop's _sgd_loss_fn can skip re-validation
-        # (the eigvalsh call is not jit-traceable anyway).
-        _validate_filter_numerics(self.init_cov, n_time=Z_base.shape[0])
+        # (the eigvalsh call is not jit-traceable anyway). stacklevel=5:
+        # user -> fit_sgd -> SGDFittableMixin.fit_sgd -> this hook -> wrapper.
+        _validate_filter_numerics(self.init_cov, n_time=Z_base.shape[0], stacklevel=5)
 
         # Block-diagonal dispatch: detect once before entering the SGD
         # loop. The detection result is stored on self and read by the
@@ -1490,26 +1519,11 @@ class PlaceFieldModel(SGDFittableMixin):
             force_dense=force_dense or self.update_transition_matrix
         )
         design_matrix = self._filter_design_matrix(Z_base)
-
-        return super().fit_sgd(
-            design_matrix,
-            spikes,
-            optimizer=optimizer,
-            num_steps=num_steps,
-            verbose=verbose,
-            convergence_tol=convergence_tol,
-        )
+        return (design_matrix, spikes), {}
 
     @property
     def _n_timesteps(self) -> int:
         return self._sgd_n_time
-
-    def _check_sgd_initialized(self) -> None:
-        if not is_set(self, "init_mean"):
-            raise RuntimeError(
-                "Model parameters not initialized. "
-                "Call fit_sgd(position, spikes) not super().fit_sgd() directly."
-            )
 
     def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         params: SGDParams = {}

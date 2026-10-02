@@ -26,6 +26,10 @@ from state_space_practice.temporal_rate_gp import (
     infer_log_rate_batch,
     poisson_log_rate_site,
 )
+from state_space_practice.tests.model_state import (
+    assert_model_state_unchanged,
+    snapshot_model_state,
+)
 
 
 def _sample_matern32_latent(
@@ -582,6 +586,19 @@ def test_fit_sgd_rejects_empty_counts():
     model = TemporalRateGP(dt=0.1)
     with pytest.raises(ValueError, match="at least one"):
         model.fit_sgd(jnp.array([]), num_steps=0)
+
+
+@pytest.mark.parametrize("prefit", [False, True], ids=["fresh", "fitted"])
+def test_fit_sgd_rejected_settings_leave_model_unchanged(small_counts, prefit):
+    """fit_sgd rejects bad settings before it touches the model."""
+    model = TemporalRateGP(dt=0.1)
+    if prefit:
+        model.fit_sgd(small_counts, num_steps=2)
+    # A different length than the prefit, so a stashed length would show.
+    before = snapshot_model_state(model)
+    with pytest.raises(ValueError, match="num_steps"):
+        model.fit_sgd(small_counts[:12], num_steps=-1)
+    assert_model_state_unchanged(model, before)
 
 
 def test_fit_sgd_multineuron_shared_shapes(multineuron_counts):

@@ -4,16 +4,23 @@ This module tests the switching point-process oscillator model classes
 (COM-PP, CNM-PP, DIM-PP) for spike-based dynamic functional connectivity.
 """
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from state_space_practice.exceptions import NotFittedError
+from state_space_practice.fitted_state import is_set
 from state_space_practice.point_process_models import (
     CommonOscillatorPointProcessModel,
     CorrelatedNoisePointProcessModel,
     DirectedInfluencePointProcessModel,
+)
+from state_space_practice.tests.model_state import (
+    assert_model_state_unchanged,
+    snapshot_model_state,
 )
 
 # Enable 64-bit precision for numerical stability
@@ -1939,3 +1946,169 @@ class TestStructuredPointProcessMStepStationarity:
             rh.transition_objective(model.continuous_transition_matrix, Q, stats)
         )
         assert obj_after >= obj_start - 1e-8 * abs(obj_start), (obj_after, obj_start)
+
+
+# ============================================================================
+# fit_sgd contract shared by the oscillator and point-process model families
+# ============================================================================
+
+
+def _com_case() -> tuple[Any, jax.Array]:
+    from state_space_practice.oscillator_models import CommonOscillatorModel
+    from state_space_practice.simulate.scenarios import simulate_com_scenario
+
+    scenario = simulate_com_scenario(n_time=50, seed=42)
+    p = scenario["params"]
+    model = CommonOscillatorModel(
+        n_oscillators=p["n_oscillators"],
+        n_discrete_states=p["n_discrete_states"],
+        n_sources=p["n_sources"],
+        sampling_freq=p["sampling_freq"],
+        freqs=p["freqs"],
+        damping_coef=p["damping"],
+        process_variance=p["process_variance"],
+        measurement_variance=p["measurement_variance"],
+    )
+    return model, jnp.asarray(scenario["obs"])
+
+
+def _coupled_gaussian_case(name: str) -> tuple[Any, jax.Array]:
+    from state_space_practice.oscillator_models import (
+        CorrelatedNoiseModel,
+        DirectedInfluenceModel,
+    )
+    from state_space_practice.simulate.scenarios import (
+        simulate_cnm_scenario,
+        simulate_dim_scenario,
+    )
+
+    cls, simulate = {
+        "CNM": (CorrelatedNoiseModel, simulate_cnm_scenario),
+        "DIM": (DirectedInfluenceModel, simulate_dim_scenario),
+    }[name]
+    scenario = simulate(n_time=50, seed=42)
+    p = scenario["params"]
+    model = cls(
+        n_oscillators=p["n_oscillators"],
+        n_discrete_states=p["n_discrete_states"],
+        sampling_freq=p["sampling_freq"],
+        freqs=p["freqs"],
+        damping_coef=p["damping"],
+        process_variance=p["process_variance"],
+        measurement_variance=p["measurement_variance"],
+        phase_difference=p["phase_difference"],
+        coupling_strength=p["coupling_strength"],
+    )
+    return model, jnp.asarray(scenario["obs"])
+
+
+def _point_process_case(name: str) -> tuple[Any, jax.Array]:
+    from state_space_practice.simulate.scenarios import (
+        simulate_cnm_pp_scenario,
+        simulate_com_pp_scenario,
+        simulate_dim_pp_scenario,
+    )
+
+    simulate = {
+        "COM-PP": simulate_com_pp_scenario,
+        "CNM-PP": simulate_cnm_pp_scenario,
+        "DIM-PP": simulate_dim_pp_scenario,
+    }[name]
+    scenario = simulate(n_time=50, seed=42)
+    p = scenario["params"]
+    kwargs = {
+        "n_oscillators": p["n_oscillators"],
+        "n_neurons": p["n_neurons"],
+        "n_discrete_states": p["n_discrete_states"],
+        "sampling_freq": p["sampling_freq"],
+        "dt": p["dt"],
+        "freqs": p["freqs"],
+        "damping_coef": p["damping"],
+        "process_variance": p["process_variance"],
+    }
+    if name == "COM-PP":
+        return CommonOscillatorPointProcessModel(**kwargs), scenario["spikes"]
+    cls = (
+        CorrelatedNoisePointProcessModel
+        if name == "CNM-PP"
+        else DirectedInfluencePointProcessModel
+    )
+    model = cls(
+        **kwargs,
+        phase_difference=p["phase_difference"],
+        coupling_strength=p["coupling_strength"],
+    )
+    return model, scenario["spikes"]
+
+
+def _switching_spike_oscillator_case() -> tuple[Any, jax.Array]:
+    from state_space_practice.switching_point_process import (
+        SwitchingSpikeOscillatorModel,
+    )
+
+    model = SwitchingSpikeOscillatorModel(
+        n_oscillators=2,
+        n_neurons=4,
+        n_discrete_states=2,
+        sampling_freq=100.0,
+        dt=0.01,
+    )
+    spikes = jax.random.poisson(jax.random.PRNGKey(42), jnp.full((50, 4), 0.5))
+    return model, spikes
+
+
+#: Every concrete oscillator / switching point-process model with ``fit_sgd``.
+_SGD_MODEL_CASES = {
+    "CommonOscillatorModel": _com_case,
+    "CorrelatedNoiseModel": lambda: _coupled_gaussian_case("CNM"),
+    "DirectedInfluenceModel": lambda: _coupled_gaussian_case("DIM"),
+    "CommonOscillatorPointProcessModel": lambda: _point_process_case("COM-PP"),
+    "CorrelatedNoisePointProcessModel": lambda: _point_process_case("CNM-PP"),
+    "DirectedInfluencePointProcessModel": lambda: _point_process_case("DIM-PP"),
+    "SwitchingSpikeOscillatorModel": _switching_spike_oscillator_case,
+}
+
+
+@pytest.fixture(params=list(_SGD_MODEL_CASES))
+def sgd_model_case(request: pytest.FixtureRequest) -> tuple[Any, jax.Array]:
+    """A fresh model and a small dataset it can be fit to."""
+    return _SGD_MODEL_CASES[request.param]()
+
+
+@pytest.mark.slow
+class TestFailedFitSgdLeavesModelUnchanged:
+    """A ``fit_sgd`` call that raises must not touch the model.
+
+    Initialization, warm start and the data / settings validation all have to
+    happen in an order where every rejection comes before the first mutation.
+    """
+
+    def test_fresh_model(self, sgd_model_case: tuple[Any, jax.Array]) -> None:
+        model, data = sgd_model_case
+        before = snapshot_model_state(model)
+
+        with pytest.raises(ValueError, match="num_steps"):
+            model.fit_sgd(data, key=jax.random.PRNGKey(0), num_steps=-1)
+
+        assert_model_state_unchanged(model, before)
+
+    @pytest.mark.parametrize("bad_call", ["num_steps", "data_shape"])
+    def test_fitted_model(
+        self, sgd_model_case: tuple[Any, jax.Array], bad_call: str
+    ) -> None:
+        model, data = sgd_model_case
+        key = jax.random.PRNGKey(0)
+        model.fit_sgd(data, key=key, num_steps=2)
+        # Guard: the fit left posteriors that a re-initialization would drop.
+        assert is_set(model, "smoother_discrete_state_prob")
+        before = snapshot_model_state(model)
+
+        with pytest.raises(ValueError):
+            if bad_call == "num_steps":
+                # A shorter (otherwise valid) sequence, so recording its
+                # length on the model would also show up as a change.
+                model.fit_sgd(data[:-1], key=key, num_steps=-1)
+            else:
+                model.fit_sgd(data[:, :-1], key=key, num_steps=2)
+
+        assert_model_state_unchanged(model, before)
