@@ -1218,11 +1218,13 @@ def parallel_kalman_smoother(
         filtered_means[:-1], filtered_covariances[:-1], A, Q
     )
 
-    # Terminal element for t = T-1: no dependence on future state
+    # Terminal element for t = T-1: no dependence on future state. It takes
+    # the element dtypes so the scan's concatenations agree (a bare
+    # jnp.zeros would be float64 under x64 even for float32 inputs).
     terminal = _SmootherElement(
-        E=jnp.zeros((D, D)),
-        g=filtered_means[-1],
-        L=filtered_covariances[-1],
+        E=jnp.zeros((D, D), dtype=elements.E.dtype),
+        g=filtered_means[-1].astype(elements.g.dtype),
+        L=filtered_covariances[-1].astype(elements.L.dtype),
     )
 
     # Concatenate elements with terminal at end

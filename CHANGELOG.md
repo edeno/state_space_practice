@@ -553,6 +553,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   import-time seeding gave on a first call) and `simulate_model(noise_seed=14)`
   (the existing noise seed) arguments; `None` makes either part
   nondeterministic.
+- **`kalman.parallel_kalman_smoother` accepts float32 inputs under x64**: the
+  terminal scan element was built with a default-dtype `jnp.zeros` (float64
+  when `jax_enable_x64` is on), so float32 inputs raised `TypeError` from
+  `lax.concatenate`. It now takes the dtype of the other elements.
 - **A failed fit no longer leaves stale or non-finite results that look
   fitted**: when a fit raises `NonFiniteLikelihoodError` (its starting
   parameters give a non-finite log-likelihood), it first clears every fit

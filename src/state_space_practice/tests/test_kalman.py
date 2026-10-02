@@ -28,6 +28,7 @@ from state_space_practice.kalman import (
     parallel_kalman_smoother,
     process_cov_residual_form,
     psd_solve,
+    rts_backward_scan,
     smooth_initial_state,
     smooth_initial_state_with_cross_cov,
     standard_kalman_gain,
@@ -1943,6 +1944,28 @@ class TestParallelKalmanSmoother:
         np.testing.assert_allclose(par_mean, seq_mean, atol=1e-8)
         np.testing.assert_allclose(par_cov, seq_cov, atol=1e-8)
         np.testing.assert_allclose(par_cross, seq_cross, atol=1e-8)
+
+    def test_float32_inputs_match_sequential_smoother(self) -> None:
+        """float32 inputs run under x64 and match the sequential RTS pass."""
+        T, D = 50, 3
+        k_mean, k_cov = random.split(random.PRNGKey(0))
+        filt_mean = random.normal(k_mean, (T, D)).astype(jnp.float32)
+        factors = random.normal(k_cov, (T, D, D))
+        filt_cov = (
+            jnp.einsum("tij,tkj->tik", factors, factors) + 0.5 * jnp.eye(D)
+        ).astype(jnp.float32)
+        A = (0.9 * jnp.eye(D)).astype(jnp.float32)
+        Q = (0.1 * jnp.eye(D)).astype(jnp.float32)
+        assert jax.config.jax_enable_x64  # the mixed-default-dtype setting
+
+        par = parallel_kalman_smoother(filt_mean, filt_cov, A, Q)
+        seq = rts_backward_scan(filt_mean, filt_cov, A, Q)
+
+        for par_out, seq_out in zip(par, seq):
+            assert par_out.dtype == jnp.float32
+            # float32 round-off of a log-depth vs a sequential recursion on
+            # O(1) values; a dtype or algebra bug gives O(1) differences.
+            np.testing.assert_allclose(par_out, seq_out, rtol=1e-4, atol=1e-4)
 
     def test_rejects_bad_time_varying_parameter_shapes(self) -> None:
         T, D = 5, 2
