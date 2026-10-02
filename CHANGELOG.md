@@ -186,6 +186,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   ~180-250 ms to ~40-50 ms). Variance and phase are bit-identical; coupling
   strength moves by at most 1 ulp, which the CNM-PP Laplace-EKF carries to
   ~1e-9 relative in fitted parameters after 8 EM iterations.
+- **Area connectivity penalties no longer build `(n_osc)⁴` masks**:
+  `oscillator_regularization.area_group_penalty`,
+  `state_shared_area_penalty` and `get_area_coupling_summary` sum squared
+  coupling per area pair as `M @ c**2 @ M.T` with a one-hot area assignment
+  `M`. At n_osc = 100 the jitted value-and-gradient scratch memory drops from
+  1.6 GB to 0.24 MB (81 ms -> ~2 ms); values and gradients match the previous
+  implementation to <= 7e-16 relative.
 - **Reading a fitted attribute before fitting raises `NotFittedError`**
   instead of returning `None` (or a bare `AttributeError`). Fitted outputs of
   every model (smoothed/filtered states, posteriors, log likelihoods,
