@@ -240,6 +240,46 @@ def poisson_log_rate_site(
     return working_response, site_variance, expected_count
 
 
+def _make_newton_target(
+    counts: Array,
+    offset: ArrayLike,
+    transition: Array,
+    process_cov: Array,
+    stationary_cov: Array,
+    measurement_matrix: Array,
+    min_weight: float,
+) -> Callable[[Array], Array]:
+    """Full (undamped) IRLS Newton target: the smoother mean of the sites at ``g``.
+
+    Parameters are as in :func:`_make_newton_step`.
+
+    Returns
+    -------
+    Callable
+        ``target(g) -> states`` with ``g`` of shape ``(n_time,)`` and states
+        of shape ``(n_time, 2)``.
+    """
+    init_mean = jnp.zeros(2)
+
+    def _newton_target(g: Array) -> Array:
+        working_response, site_variance, _ = poisson_log_rate_site(
+            g, counts, offset, min_weight
+        )
+        smoother_mean, _cov, _cross, _ll = kalman_smoother(
+            init_mean,
+            stationary_cov,
+            working_response[:, None],
+            transition,
+            process_cov,
+            measurement_matrix,
+            site_variance[:, None, None],
+            validate_inputs=False,
+        )
+        return smoother_mean
+
+    return _newton_target
+
+
 def _make_newton_step(
     counts: Array,
     offset: ArrayLike,
@@ -268,7 +308,15 @@ def _make_newton_step(
         ``step(states, None) -> (new_states, (max_abs_update, merit_nonfinite,
         unaccepted))`` with ``states`` of shape ``(n_time, 2)``.
     """
-    init_mean = jnp.zeros(2)
+    _newton_target = _make_newton_target(
+        counts,
+        offset,
+        transition,
+        process_cov,
+        stationary_cov,
+        measurement_matrix,
+        min_weight,
+    )
     backtrack_steps = 0.5 ** jnp.arange(float(_N_BACKTRACK))  # largest first
     # Whitening factors of the Markov prior, for the log-posterior merit
     # function of the line search (see _prior_whitened_residuals).
@@ -279,22 +327,6 @@ def _make_newton_step(
         return _prior_whitened_residuals(
             states, transition, stationary_chol, process_chol
         )
-
-    def _newton_target(g: Array) -> Array:
-        working_response, site_variance, _ = poisson_log_rate_site(
-            g, counts, offset, min_weight
-        )
-        smoother_mean, _cov, _cross, _ll = kalman_smoother(
-            init_mean,
-            stationary_cov,
-            working_response[:, None],
-            transition,
-            process_cov,
-            measurement_matrix,
-            site_variance[:, None, None],
-            validate_inputs=False,
-        )
-        return smoother_mean
 
     def _newton_step(
         states: Array, _: None
@@ -376,13 +408,17 @@ def _infer_log_rate_traced(
     Does no host-side validation, so hyperparameters may be tracers. The public
     :func:`infer_log_rate` validates concrete inputs before delegating here.
 
-    Gradients are implicit (fixed-point) derivatives: the first ``n_iter - 1``
-    Newton steps run on gradient-stopped hyperparameters and only the last
-    step is differentiated. Newton's update map has zero Jacobian in ``g`` at
-    the mode, so the last step's derivative in the hyperparameters is the
-    mode's derivative ``dg*/dtheta`` (implicit function theorem) and the
-    evidence gradient matches the fully unrolled one once the iteration has
-    converged, without keeping every iteration's smoother residuals.
+    Gradients are implicit (fixed-point) derivatives: all ``n_iter`` Newton
+    steps run on gradient-stopped hyperparameters, and the mode's derivative
+    comes from one *exact* Newton step taken at the converged mode. The
+    iteration floors the Fisher weights at ``min_weight``, which makes it
+    quasi-Newton where the floor binds; it still converges to the true mode,
+    but its update map then has a nonzero Jacobian in ``g`` there, so its own
+    derivative would be wrong. The exact (unfloored) Newton map has zero
+    Jacobian in ``g`` at the mode, so its hyperparameter derivative is
+    ``dg*/dtheta`` (implicit function theorem). Its value enters only as a
+    zero-valued straight-through term, so forward outputs are those of the
+    floored iteration, and no per-iteration residuals are kept.
     """
     offset = mean + jnp.log(dt)
     _F, _L, _Qc, measurement_vector, stationary_cov = matern32_continuous(
@@ -395,29 +431,30 @@ def _infer_log_rate_traced(
     init_mean = jnp.zeros(2)
     n_time = counts.shape[0]
 
-    # Run every Newton step but the last on gradient-stopped hyperparameters.
-    warm_step = _make_newton_step(
-        counts,
-        *jax.lax.stop_gradient(
-            (offset, transition, process_cov, stationary_cov, measurement_matrix)
-        ),
-        min_weight,
+    # Run the Newton iteration on gradient-stopped hyperparameters.
+    stopped_prior = jax.lax.stop_gradient(
+        (offset, transition, process_cov, stationary_cov, measurement_matrix)
     )
+    newton_step = _make_newton_step(counts, *stopped_prior, min_weight)
     warm_states, (_warm_updates, warm_nonfinite, warm_unaccepted) = jax.lax.scan(
-        warm_step, jnp.zeros((n_time, 2)), None, length=n_iter - 1
+        newton_step, jnp.zeros((n_time, 2)), None, length=n_iter - 1
     )
-    last_step = _make_newton_step(
+    states_last, (max_abs_update, last_nonfinite, last_unaccepted) = newton_step(
+        warm_states, None
+    )
+    # Derivative of the mode: one exact Newton step at it. Its weights are
+    # floored only at eps**2, far below any prior precision, so the step is
+    # exact to round-off yet its sites stay finite when a rate underflows.
+    exact_target = _make_newton_target(
         counts,
         offset,
         transition,
         process_cov,
         stationary_cov,
         measurement_matrix,
-        min_weight,
-    )
-    states_mode, (max_abs_update, last_nonfinite, last_unaccepted) = last_step(
-        warm_states, None
-    )
+        float(jnp.finfo(jnp.result_type(offset)).eps) ** 2,
+    )(states_last[:, 0])
+    states_mode = states_last + (exact_target - jax.lax.stop_gradient(exact_target))
     g_mode = states_mode[:, 0]
     nonfinite_merit = jnp.append(warm_nonfinite, last_nonfinite)
     unaccepted = jnp.append(warm_unaccepted, last_unaccepted)

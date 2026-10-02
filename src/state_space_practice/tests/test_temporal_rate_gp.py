@@ -502,6 +502,50 @@ def test_evidence_gradient_in_all_hyperparameters_matches_finite_difference(
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("output", ["log_rate_sum", "log_evidence"])
+def test_gradient_is_exact_when_the_fisher_weight_floor_binds(output):
+    """With min_weight above the mode's expected counts the Newton iteration is
+    quasi-Newton (floored weights), so its last step's derivative is not the
+    mode's derivative; the gradient must still match central differences."""
+    counts = jnp.asarray([0.0] * 10 + [1.0] * 10)
+    dt, min_weight, n_iter = 0.1, 0.2, 200
+
+    def f(theta):
+        result = infer_log_rate(
+            counts,
+            dt,
+            jnp.exp(theta[0]),
+            jnp.exp(theta[1]),
+            theta[2],
+            n_iter=n_iter,
+            min_weight=min_weight,
+        )
+        if output == "log_rate_sum":
+            return jnp.sum(result.log_rate_mean)
+        return result.log_marginal_likelihood
+
+    theta = jnp.array([np.log(2.0), np.log(0.3), 0.0])
+    converged = infer_log_rate(
+        counts, dt, 2.0, 0.3, 0.0, n_iter=n_iter, min_weight=min_weight
+    )
+    # Guards: converged, and the floor binds at the mode.
+    assert float(converged.max_abs_update) < 1e-10
+    assert np.any(np.exp(np.asarray(converged.log_rate_mean)) * dt < min_weight)
+
+    grad = np.asarray(jax.grad(f)(theta))
+    eps = 1e-5
+    fd = np.array(
+        [
+            (float(f(theta.at[i].add(eps))) - float(f(theta.at[i].add(-eps))))
+            / (2 * eps)
+            for i in range(3)
+        ]
+    )
+    assert np.all(np.abs(fd) > 1e-2)  # guard: a non-trivial gradient
+    np.testing.assert_allclose(grad, fd, rtol=1e-5)
+
+
+@pytest.mark.slow
 def test_evidence_gradient_memory_does_not_grow_with_newton_iterations():
     """Only the converged Newton step is differentiated, so the gradient keeps
     no per-iteration residuals: its compiled temporary memory is (nearly) the
