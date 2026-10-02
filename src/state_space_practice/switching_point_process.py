@@ -1794,6 +1794,50 @@ def _second_order_newton_iterations(
     return final_baselines, final_weights, jnp.sum(n_fallbacks)
 
 
+@functools.partial(typed_jit, static_argnames=("max_iter",))
+def _plug_in_newton_iterations(
+    baselines: Array,
+    weights: Array,
+    spikes: Array,
+    smoother_mean: Array,
+    dt: float,
+    time_weights: Array,
+    weight_l2: float,
+    max_iter: int,
+) -> tuple[Array, Array, Array]:
+    """``max_iter`` plug-in Newton steps for every neuron in one jitted scan.
+
+    The plug-in branch of :func:`update_spike_glm_params` (the per-neuron
+    step uses ``smoother_mean`` as a fixed design matrix). Jitting it keeps
+    repeated M-steps with the same shapes from re-tracing the scan. The third
+    output counts the neuron-iterations whose Newton direction fell back to
+    the gradient.
+    """
+
+    def iterate_all_neurons(
+        carry: tuple[Array, Array], _: None
+    ) -> tuple[tuple[Array, Array], Array]:
+        baselines, weights = carry
+
+        def update_neuron(b: Array, w: Array, y_n: Array) -> tuple[Array, Array, Array]:
+            return _single_neuron_glm_step(
+                b, w, y_n, smoother_mean, dt, time_weights, weight_l2
+            )
+
+        new_baselines, new_weights, fell_back = jax.vmap(
+            update_neuron, in_axes=(0, 0, 1)
+        )(baselines, weights, spikes)
+        return (
+            _cast_like_carry(new_baselines, new_weights, baselines, weights),
+            jnp.sum(fell_back),
+        )
+
+    (final_baselines, final_weights), n_fallbacks = jax.lax.scan(
+        iterate_all_neurons, (baselines, weights), None, length=max_iter
+    )
+    return final_baselines, final_weights, jnp.sum(n_fallbacks)
+
+
 def _cast_like_carry(
     new_baselines: Array, new_weights: Array, baselines: Array, weights: Array
 ) -> tuple[Array, Array]:
@@ -2011,34 +2055,19 @@ def update_spike_glm_params(
             max_iter=max_iter,
         )
     else:
-        # Run Newton iterations for all neurons (plug-in)
-        # vmap directly over neuron-axis data.
-        def iterate_all_neurons(
-            carry: tuple[Array, Array], _: None
-        ) -> tuple[tuple[Array, Array], Array]:
-            baselines, weights = carry
-
-            def update_neuron(
-                b: Array, w: Array, y_n: Array
-            ) -> tuple[Array, Array, Array]:
-                return _single_neuron_glm_step(
-                    b, w, y_n, smoother_mean, dt, time_weights, weight_l2
-                )
-
-            new_baselines, new_weights, fell_back = jax.vmap(
-                update_neuron, in_axes=(0, 0, 1)
-            )(baselines, weights, spikes)
-
-            return (
-                _cast_like_carry(new_baselines, new_weights, baselines, weights),
-                jnp.sum(fell_back),
-            )
-
-        (final_baselines, final_weights), n_fallbacks = jax.lax.scan(
-            iterate_all_neurons, (baselines, weights), None, length=max_iter
+        # Plug-in Newton iterations for all neurons: one jitted scan.
+        final_baselines, final_weights, n_fallbacks = _plug_in_newton_iterations(
+            baselines,
+            weights,
+            spikes,
+            smoother_mean,
+            dt,
+            time_weights,
+            weight_l2,
+            max_iter=max_iter,
         )
 
-    _warn_newton_fallbacks(jnp.sum(n_fallbacks), "update_spike_glm_params")
+    _warn_newton_fallbacks(n_fallbacks, "update_spike_glm_params")
     return SpikeObsParams(baseline=final_baselines, weights=final_weights)
 
 

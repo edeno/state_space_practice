@@ -1167,26 +1167,28 @@ def parallel_kalman_smoother(
             f"(T={T}, D={D}, D={D}), got {filtered_covariances.shape}."
         )
 
-    def _as_transition_stack(name: str, value: jax.Array) -> jax.Array:
+    for name, value in (
+        ("transition_matrix", transition_matrix),
+        ("process_cov", process_cov),
+    ):
         if value.ndim == 2:
             if value.shape != (D, D):
                 raise ValueError(
                     f"{name} must have shape ({D}, {D}) or "
                     f"({T - 1}, {D}, {D}), got {value.shape}."
                 )
-            return jnp.broadcast_to(value, (T - 1, D, D))
-        if value.ndim == 3:
+        elif value.ndim == 3:
             if value.shape != (T - 1, D, D):
                 raise ValueError(
                     f"{name} with a leading time axis must have shape "
                     f"({T - 1}, {D}, {D}) because entry t maps time t to "
                     f"t+1; got {value.shape}."
                 )
-            return value
-        raise ValueError(
-            f"{name} must have shape ({D}, {D}) or ({T - 1}, {D}, {D}), "
-            f"got {value.shape}."
-        )
+        else:
+            raise ValueError(
+                f"{name} must have shape ({D}, {D}) or ({T - 1}, {D}, {D}), "
+                f"got {value.shape}."
+            )
 
     if not contains_tracer(
         filtered_means, filtered_covariances, transition_matrix, process_cov
@@ -1199,9 +1201,28 @@ def parallel_kalman_smoother(
         ):
             validate_finite_array(name, arr)
 
+    return _parallel_kalman_smoother_impl(
+        filtered_means, filtered_covariances, transition_matrix, process_cov
+    )
+
+
+@typed_jit
+def _parallel_kalman_smoother_impl(
+    filtered_means: jax.Array,
+    filtered_covariances: jax.Array,
+    transition_matrix: jax.Array,
+    process_cov: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Jitted parallel RTS smoother on validated inputs.
+
+    See :func:`parallel_kalman_smoother`. ``transition_matrix`` and
+    ``process_cov`` are ``(D, D)`` or ``(T-1, D, D)``.
+    """
+    T, D = filtered_means.shape
+
     # Broadcast time-invariant parameters to (T-1, D, D)
-    A = _as_transition_stack("transition_matrix", transition_matrix)
-    Q = _as_transition_stack("process_cov", process_cov)
+    A = jnp.broadcast_to(transition_matrix, (T - 1, D, D))
+    Q = jnp.broadcast_to(process_cov, (T - 1, D, D))
 
     # Build per-timestep smoother elements for t = 0, ..., T-2
     def _build_element(

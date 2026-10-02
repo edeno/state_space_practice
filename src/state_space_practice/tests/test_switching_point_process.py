@@ -4,7 +4,8 @@ This module tests the switching point-process Kalman filter and smoother
 for spike-based observations with discrete state switching.
 """
 
-from collections.abc import Callable
+import contextlib
+from collections.abc import Callable, Iterator
 
 import jax
 import jax.numpy as jnp
@@ -17,6 +18,31 @@ from state_space_practice.switching_point_process import SpikeObsParams
 
 # Enable 64-bit precision for numerical stability
 jax.config.update("jax_enable_x64", True)
+
+
+# JAX lowers every newly traced computation to MLIR (even when a persistent
+# compilation cache then skips the backend compile), so counting lowerings
+# and backend compiles detects re-tracing.
+_COMPILE_EVENTS = (
+    "/jax/core/compile/jaxpr_to_mlir_module_duration",
+    "/jax/core/compile/backend_compile_duration",
+)
+
+
+@contextlib.contextmanager
+def _count_compiles() -> Iterator[Callable[[], int]]:
+    """Count JAX lowerings/compiles inside the block; yields a getter."""
+    count = 0
+
+    def listener(event: str, duration: float, **kwargs: object) -> None:
+        nonlocal count
+        count += event in _COMPILE_EVENTS
+
+    jax.monitoring.register_event_duration_secs_listener(listener)
+    try:
+        yield lambda: count
+    finally:
+        jax.monitoring.unregister_event_duration_listener(listener)
 
 
 def linear_log_intensity(state: Array, params: SpikeObsParams) -> Array:
@@ -2599,6 +2625,39 @@ class TestUpdateSpikeGLMParams:
 
         assert new_params.baseline.shape == (n_neurons,)
         assert new_params.weights.shape == (n_neurons, n_latent)
+
+    def test_plug_in_repeat_call_does_not_recompile(self) -> None:
+        """A second plug-in M-step with the same shapes reuses the compiled scan."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            update_spike_glm_params,
+        )
+
+        n_time, n_latent, n_neurons = 60, 2, 3
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 1.0, shape=(n_time, n_neurons)
+        ).astype(float)
+        smoother_mean = 0.5 * jax.random.normal(
+            jax.random.PRNGKey(1), (n_time, n_latent)
+        )
+        params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons), weights=jnp.zeros((n_neurons, n_latent))
+        )
+        doubled_spikes = 2.0 * spikes
+
+        first = update_spike_glm_params(spikes, smoother_mean, params, 0.02)
+        with _count_compiles() as n_compiles:
+            second = update_spike_glm_params(
+                doubled_spikes, smoother_mean, params, 0.02
+            )
+            again = update_spike_glm_params(spikes, smoother_mean, params, 0.02)
+        assert n_compiles() == 0
+        np.testing.assert_array_equal(again.baseline, first.baseline)
+        np.testing.assert_array_equal(again.weights, first.weights)
+        # Doubling every count raises each fitted baseline by ~log 2.
+        np.testing.assert_allclose(
+            second.baseline - first.baseline, np.log(2.0), atol=1e-2
+        )
 
     def test_output_finite(self) -> None:
         """Updated params should be finite."""

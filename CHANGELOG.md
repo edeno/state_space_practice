@@ -196,6 +196,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   re-traced on every EM iteration). Its gain solve is the shared, retrying one, so smoothed values
   and fitted parameters can move at round-off level (~1e-9 relative after 200
   EM iterations).
+- **`kalman.parallel_kalman_smoother`, `switching_kalman.switching_kalman_viterbi`
+  and the plug-in branch of `switching_point_process.update_spike_glm_params`
+  run a jitted core** (input validation stays eager). Previously they ran op
+  by op: the parallel smoother compiled ~490 programs on its first call at a
+  new shape (5-7 s at T=20k; now ~1 s) and ran 52 ms vs 36 ms per call after;
+  Viterbi re-traced its scans on every call (3 compiles, ~240 ms vs 8 ms at
+  T=2000, K=2); the plug-in GLM M-step re-traced its scan on every call
+  (~190 ms vs 52 ms at T=5000, 10 neurons). Outputs are bit-identical.
 - **The choice models skip the duplicate final E-step after convergence**
   (`MultinomialChoiceModel`, `CovariateChoiceModel`, `SwitchingChoiceModel`).
 - **`PlaceFieldModel` posterior rate maps are computed by a jitted JAX

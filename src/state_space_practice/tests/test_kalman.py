@@ -1,6 +1,8 @@
 # ruff: noqa: E402
 
+import contextlib
 import warnings
+from collections.abc import Callable, Iterator
 
 import jax
 
@@ -45,6 +47,31 @@ from state_space_practice.tests.conftest import (
 # The x_1-prior M-step (initial_state_prior=None) is deprecated; tests of its
 # formulas assert the deprecation warning.
 LEGACY_PRIOR = r"initial_state_prior=None"
+
+# JAX lowers every newly traced computation to MLIR (even when a persistent
+# compilation cache then skips the backend compile), so counting lowerings
+# and backend compiles detects re-tracing.
+_COMPILE_EVENTS = (
+    "/jax/core/compile/jaxpr_to_mlir_module_duration",
+    "/jax/core/compile/backend_compile_duration",
+)
+
+
+@contextlib.contextmanager
+def _count_compiles() -> Iterator[Callable[[], int]]:
+    """Count JAX lowerings/compiles inside the block; yields a getter."""
+    count = 0
+
+    def listener(event: str, duration: float, **kwargs: object) -> None:
+        nonlocal count
+        count += event in _COMPILE_EVENTS
+
+    jax.monitoring.register_event_duration_secs_listener(listener)
+    try:
+        yield lambda: count
+    finally:
+        jax.monitoring.unregister_event_duration_listener(listener)
+
 
 # --- Unit Tests ---
 
@@ -1966,6 +1993,30 @@ class TestParallelKalmanSmoother:
             # float32 round-off of a log-depth vs a sequential recursion on
             # O(1) values; a dtype or algebra bug gives O(1) differences.
             np.testing.assert_allclose(par_out, seq_out, rtol=1e-4, atol=1e-4)
+
+    def test_compiles_once_per_shape(self) -> None:
+        """New shapes compile one jitted core; a repeat call compiles nothing.
+
+        Run op by op, the associative scan compiled one program per primitive
+        and tree level (100+ even at T=37); jitted, a new shape costs the core
+        plus the few eager finite checks.
+        """
+        T, D = 41, 3
+        filt_mean = random.normal(random.PRNGKey(0), (T, D))
+        filt_cov = jnp.broadcast_to(0.5 * jnp.eye(D), (T, D, D))
+        A, Q = 0.9 * jnp.eye(D), 0.1 * jnp.eye(D)
+
+        shifted_mean = filt_mean + 1.0
+        with _count_compiles() as n_compiles:
+            first = parallel_kalman_smoother(filt_mean, filt_cov, A, Q)
+        assert n_compiles() <= 20
+        with _count_compiles() as n_compiles:
+            second = parallel_kalman_smoother(shifted_mean, filt_cov, A, Q)
+        assert n_compiles() == 0
+        # Same compiled function on new values: the mean shifts, covariances
+        # (independent of the means) are unchanged.
+        assert not np.allclose(first[0], second[0])
+        np.testing.assert_array_equal(first[1], second[1])
 
     def test_rejects_bad_time_varying_parameter_shapes(self) -> None:
         T, D = 5, 2

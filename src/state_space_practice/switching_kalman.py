@@ -1177,18 +1177,7 @@ def switching_kalman_viterbi(
     states : jax.Array, shape (n_time,)
         Most likely discrete state sequence (integer-valued).
     """
-    init_state_cond_mean = jnp.asarray(init_state_cond_mean)
-    init_state_cond_cov = jnp.asarray(init_state_cond_cov)
-    init_discrete_state_prob = jnp.asarray(init_discrete_state_prob)
-    obs = jnp.asarray(obs)
-    discrete_transition_matrix = jnp.asarray(discrete_transition_matrix)
-    continuous_transition_matrix = jnp.asarray(continuous_transition_matrix)
-    process_cov = jnp.asarray(process_cov)
-    measurement_matrix = jnp.asarray(measurement_matrix)
-    measurement_cov = jnp.asarray(measurement_cov)
-    n_discrete_states = init_state_cond_mean.shape[-1]
-
-    # Viterbi is not JIT-decorated, so reject a malformed prior loudly here
+    # Reject a malformed prior loudly here (eagerly, before the jitted core)
     # rather than returning an arbitrary path from a NaN/degenerate posterior.
     _init_prob = jnp.asarray(init_discrete_state_prob)
     if not (
@@ -1200,6 +1189,33 @@ def switching_kalman_viterbi(
             "and sum to a positive value (it defines the initial support); got "
             f"{jnp.asarray(_init_prob)}."
         )
+    return _switching_kalman_viterbi_impl(
+        jnp.asarray(init_state_cond_mean),
+        jnp.asarray(init_state_cond_cov),
+        _init_prob,
+        jnp.asarray(obs),
+        jnp.asarray(discrete_transition_matrix),
+        jnp.asarray(continuous_transition_matrix),
+        jnp.asarray(process_cov),
+        jnp.asarray(measurement_matrix),
+        jnp.asarray(measurement_cov),
+    )
+
+
+@typed_jit
+def _switching_kalman_viterbi_impl(
+    init_state_cond_mean: jax.Array,
+    init_state_cond_cov: jax.Array,
+    init_discrete_state_prob: jax.Array,
+    obs: jax.Array,
+    discrete_transition_matrix: jax.Array,
+    continuous_transition_matrix: jax.Array,
+    process_cov: jax.Array,
+    measurement_matrix: jax.Array,
+    measurement_cov: jax.Array,
+) -> jax.Array:
+    """Jitted core of :func:`switching_kalman_viterbi` on a validated prior."""
+    n_discrete_states = init_state_cond_mean.shape[-1]
 
     # --- First timestep: measurement update only (x₁ convention) -----------
     (
