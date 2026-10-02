@@ -599,7 +599,14 @@ class TestContingencyBeliefModel:
         choices, rewards, _, _ = _simulate_block_bandit(n_trials=50)
         model = ContingencyBeliefModel(n_states=2, n_options=3)
         lls = model.fit(choices, rewards, max_iter=1)
-        fresh = contingency_belief_smoother(**model._smoother_kwargs(choices, rewards))
+        fresh = contingency_belief_smoother(
+            **model._smoother_kwargs(
+                choices,
+                rewards,
+                model._transition_design_matrix,
+                model._obs_design_matrix,
+            )
+        )
         np.testing.assert_allclose(model.log_likelihood_, float(fresh.log_likelihood))
         np.testing.assert_allclose(lls[-1], model.log_likelihood_)
 
@@ -1164,7 +1171,12 @@ class TestTransitionMStep:
         choices, rewards, cov, states, reward_probs = _simulate_switch_covariate_iohmm()
         model = _true_switch_model(cov, reward_probs)
         posterior = contingency_belief_smoother(
-            **model._smoother_kwargs(jnp.asarray(choices), jnp.asarray(rewards))
+            **model._smoother_kwargs(
+                jnp.asarray(choices),
+                jnp.asarray(rewards),
+                model._transition_design_matrix,
+                model._obs_design_matrix,
+            )
         )
         # guard: the true-parameter posterior is informative about the states
         accuracy = np.mean(
@@ -1219,7 +1231,12 @@ class TestTransitionMStep:
         cb._optimize_transition_rows.clear_cache()
         model = _true_switch_model(cov, reward_probs)
         posterior = contingency_belief_smoother(
-            **model._smoother_kwargs(choices, rewards)
+            **model._smoother_kwargs(
+                choices,
+                rewards,
+                model._transition_design_matrix,
+                model._obs_design_matrix,
+            )
         )
         model._m_step(choices, rewards, posterior)
         per_trace = len(traces)
@@ -1290,7 +1307,14 @@ class TestContingencyMStepExactness:
         model = ContingencyBeliefModel(n_states=2, n_options=K, seed=0)
         model._transition_design_matrix = model._build_design_matrix(n_trials)
         choices, rewards = jnp.asarray(choices), jnp.asarray(rewards)
-        post = contingency_belief_smoother(**model._smoother_kwargs(choices, rewards))
+        post = contingency_belief_smoother(
+            **model._smoother_kwargs(
+                choices,
+                rewards,
+                model._transition_design_matrix,
+                model._obs_design_matrix,
+            )
+        )
         return model, choices, rewards, post
 
     def test_reward_probs_are_stationary(self, e_step):

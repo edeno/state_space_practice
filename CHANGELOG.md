@@ -91,6 +91,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   from a tuple of attribute names; every `run_em` caller now uses them.
 - **`utils.as_2d_count_matrix`**: coerce `(n_time,)` or `(n_time, n_units)`
   counts to 2-D and validate them.
+- **`contingency_belief.SmootherResult.filtered_state_prob`**: the forward
+  filter's state posterior, so callers no longer re-run the filter for it.
 - **Stacked oscillator constructors in `oscillator_utils`**:
   `construct_common_oscillator_transition_matrix_stack`,
   `construct_correlated_noise_process_covariance_stack` and
