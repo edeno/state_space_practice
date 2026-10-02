@@ -151,6 +151,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **Eager `utils.debug_print_if` calls no longer compile a `jit(cond)` each
+  time.**
 - **Reading a fitted attribute before fitting raises `NotFittedError`**
   instead of returning `None` (or a bare `AttributeError`). Fitted outputs of
   every model (smoothed/filtered states, posteriors, log likelihoods,

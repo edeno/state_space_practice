@@ -365,16 +365,12 @@ def project_psd(Q: ArrayLike, min_eigenvalue: float = 1e-8) -> jax.Array:
     jax.Array
         The projected PSD matrix with all eigenvalues >= min_eigenvalue.
     """
-    Q = symmetrize(Q)
-    eigvals, eigvecs = jnp.linalg.eigh(Q)
-    eigvals_clipped = jnp.maximum(eigvals, min_eigenvalue)
-    projected = eigvecs @ jnp.diag(eigvals_clipped) @ eigvecs.T
-    return symmetrize(projected)
+    return symmetrize(clip_eigenvalues(Q, min_eigenvalue=min_eigenvalue))
 
 
 def stabilize_covariance(cov: ArrayLike, min_eigenvalue: float = 1e-8) -> jax.Array:
     """Symmetrize a covariance-like matrix and project it to the PSD cone."""
-    return project_psd(symmetrize(cov), min_eigenvalue=min_eigenvalue)
+    return project_psd(cov, min_eigenvalue=min_eigenvalue)
 
 
 #: Default relative eigenvalue floor for M-step covariance projections: an
@@ -1023,6 +1019,12 @@ def debug_print_if(condition: ArrayLike, fmt: str, **fmt_kwargs: Any) -> None:
     True (i.e. when the *bad* condition holds), matching how the call
     site reads at the user's eye: "if `~is_valid`, print the warning."
     """
+    if not contains_tracer(condition, fmt_kwargs):
+        # Concrete inputs: branch on the host instead of building (and
+        # compiling) a fresh ``lax.cond`` on every eager call.
+        if bool(condition):
+            jax.debug.print(fmt, **fmt_kwargs)
+        return
     jax.lax.cond(
         condition,
         lambda: jax.debug.print(fmt, **fmt_kwargs),
