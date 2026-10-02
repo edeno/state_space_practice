@@ -1,6 +1,8 @@
 # ruff: noqa: E402
 """Tests for the contingency_belief module."""
 
+import logging
+
 import jax
 
 jax.config.update("jax_enable_x64", True)
@@ -19,7 +21,7 @@ from state_space_practice.contingency_belief import (
     contingency_belief_smoother,
     transition_logits_to_matrix,
 )
-from state_space_practice.exceptions import NotFittedError
+from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
 from state_space_practice.tests.model_state import (
     assert_model_state_unchanged,
     snapshot_model_state,
@@ -742,6 +744,65 @@ def test_repeat_fit_sgd_reuses_compiled_step(sgd_step_builds, with_covariates):
     assert len(builds) == 1
     # The reused step continues optimizing from the stored parameters.
     assert lls[2][-1] > lls[0][0]
+
+
+class TestEMNonFiniteLikelihood:
+    def test_mid_fit_nonfinite_restores_last_accepted(self, monkeypatch, caplog):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=80)
+        original = ContingencyBeliefModel._m_step
+        calls: list = []
+        accepted: dict = {}
+
+        def poisoned_m_step(self, choices, rewards, result):
+            calls.append(None)
+            if len(calls) == 2:
+                accepted["reward_probs"] = np.asarray(self.reward_probs_)
+                accepted["transition_coefficients"] = np.asarray(
+                    self.transition_coefficients_
+                )
+            original(self, choices, rewards, result)
+            if len(calls) == 2:
+                self.reward_probs_ = jnp.full_like(self.reward_probs_, jnp.nan)
+
+        monkeypatch.setattr(ContingencyBeliefModel, "_m_step", poisoned_m_step)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        with caplog.at_level(
+            logging.WARNING, logger="state_space_practice.contingency_belief"
+        ):
+            lls = model.fit(choices, rewards, max_iter=10, tolerance=0.0)
+
+        # Guard: the poisoned M-step ran and EM stopped at the next E-step.
+        assert len(calls) == 2
+        assert len(lls) == 2
+        assert np.all(np.isfinite(lls))
+        np.testing.assert_array_equal(model.reward_probs_, accepted["reward_probs"])
+        np.testing.assert_array_equal(
+            model.transition_coefficients_, accepted["transition_coefficients"]
+        )
+        assert model.converged_ is False
+        assert model.log_likelihood_ == lls[-1]
+        # Posteriors are those of the restored parameters.
+        fresh = contingency_belief_smoother(
+            **model._smoother_kwargs(
+                jnp.asarray(choices),
+                jnp.asarray(rewards),
+                model._transition_design_matrix,
+                None,
+            )
+        )
+        assert float(fresh.log_likelihood) == lls[-1]
+        np.testing.assert_array_equal(
+            model.smoothed_state_posterior_, fresh.smoothed_state_prob
+        )
+        np.testing.assert_array_equal(model.state_posterior_, fresh.filtered_state_prob)
+        assert any("non-finite" in r.getMessage().lower() for r in caplog.records)
+
+    def test_first_estep_nonfinite_raises(self):
+        choices, rewards, _, _ = _simulate_block_bandit(n_trials=40)
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        model.reward_probs_ = jnp.full_like(model.reward_probs_, jnp.nan)
+        with pytest.raises(NonFiniteLikelihoodError):
+            model.fit(choices, rewards, max_iter=5)
 
 
 class TestContingencyBeliefIntegration:

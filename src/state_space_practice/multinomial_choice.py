@@ -30,7 +30,11 @@ from jax import Array
 from jax.typing import ArrayLike, DTypeLike
 from numpy.typing import NDArray
 
-from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
+from state_space_practice.exceptions import (
+    NonFiniteLikelihoodError,
+    NotFittedError,
+    StateSpaceWarning,
+)
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.kalman import rts_backward_scan
 from state_space_practice.parameter_transforms import POSITIVE
@@ -756,14 +760,24 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         Runs once after the EM loop and returns the final log-likelihood.
         ``log_likelihoods`` is the per-iteration history and ``last_accepted``
         the parameter snapshot taken before the last M-step (None if no M-step
-        ran); subclasses may use them to amend the history or roll a degrading
-        final M-step back. ``current`` is an E-step result already computed at
-        the current parameters, reused instead of re-running the smoother.
+        ran). A non-finite final log-likelihood rolls the parameters back to
+        ``last_accepted`` and re-runs the smoother there; subclasses may also
+        use these to amend the history or roll a degrading final M-step back.
+        ``current`` is an E-step result already computed at the current
+        parameters, reused instead of re-running the smoother.
         """
         self._smoother_result = (
             current if current is not None else self._run_smoother(choices)
         )
         self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
+        if not np.isfinite(self.log_likelihood_) and last_accepted is not None:
+            self._restore_parameters(last_accepted)
+            self._smoother_result = self._run_smoother(choices)
+            self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
+            logging.getLogger(type(self).__module__).warning(
+                "Final E-step produced a non-finite log-likelihood; rolled back "
+                "to the previous parameters."
+            )
         return self.log_likelihood_
 
     def _populate_uncertainty(self, choices: Array) -> None:
@@ -855,12 +869,33 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         log = logging.getLogger(type(self).__module__)
         log_likelihoods: list[float] = []
         converged = False
+        rolled_back = False
         last_accepted: dict[str, Any] | None = None
 
         for iteration in range(max_iter):
             # E-step: run smoother with current parameters
             smooth = self._run_smoother(choices_arr)
             ll = float(smooth.marginal_log_likelihood)
+
+            # A non-finite E-step is never recorded (as em_driver.run_em): with
+            # no accepted iterate the starting parameters are unusable;
+            # otherwise restore the last accepted parameters and stop (the
+            # final E-step below re-syncs the posteriors to them).
+            if not np.isfinite(ll):
+                if last_accepted is None:
+                    raise NonFiniteLikelihoodError(
+                        f"Non-finite log-likelihood at iteration {iteration + 1}: "
+                        f"{ll}. This may indicate numerical instability."
+                    )
+                self._restore_parameters(last_accepted)
+                rolled_back = True
+                log.warning(
+                    "Non-finite log-likelihood (%s) at iteration %d; rolling back "
+                    "to the previous E-step and stopping EM.",
+                    ll,
+                    iteration + 1,
+                )
+                break
 
             # GEM monotonicity guard: the approximate (Laplace-EKF) M-step can
             # decrease the marginal LL. On a decrease beyond tolerance, restore the
@@ -872,6 +907,14 @@ class _MultinomialChoiceBase(SGDFittableMixin):
                 and ll < log_likelihoods[-1] - _EM_MONOTONICITY_TOL
             ):
                 self._restore_parameters(last_accepted)
+                rolled_back = True
+                log.warning(
+                    "Log-likelihood decreased at iteration %d (%.6g -> %.6g); "
+                    "rolling back to the previous E-step and stopping EM.",
+                    iteration + 1,
+                    log_likelihoods[-1],
+                    ll,
+                )
                 break
 
             log_likelihoods.append(ll)
@@ -914,7 +957,8 @@ class _MultinomialChoiceBase(SGDFittableMixin):
             log_likelihood=self.log_likelihood_,
         )
         self._populate_uncertainty(choices_arr)
-        self._finalize_convergence(converged, max_iter)
+        if not rolled_back:  # a rollback already warned why EM stopped
+            self._finalize_convergence(converged, max_iter)
 
         return log_likelihoods
 
@@ -1392,6 +1436,13 @@ class MultinomialChoiceModel(_MultinomialChoiceBase):
         -------
         log_likelihoods : list of float
             Log-likelihood at each EM iteration.
+
+        Raises
+        ------
+        NonFiniteLikelihoodError
+            If the first E-step's log-likelihood is non-finite. A later
+            non-finite E-step is never recorded: the parameters roll back to
+            the last accepted iterate and EM stops with a warning.
         """
         choices_arr = self._prepare_choices(choices, "EM")
         return self._fit_em(choices_arr, max_iter, tolerance, verbose, beta_grid)

@@ -36,7 +36,7 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.exceptions import NotFittedError
+from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.parameter_transforms import (
     POSITIVE,
@@ -1342,6 +1342,14 @@ class ContingencyBeliefModel(SGDFittableMixin):
         Returns
         -------
         log_likelihoods : list of float
+            Finite log-likelihood of each accepted E-step. If an E-step after
+            the first is non-finite, EM restores the previous parameters,
+            logs a warning and stops (``converged_`` is False).
+
+        Raises
+        ------
+        NonFiniteLikelihoodError
+            If the first E-step's log-likelihood is non-finite.
         """
         # EM does not support observation covariates, so binding clears any
         # obs design matrix left by a previous fit_sgd().
@@ -1363,15 +1371,38 @@ class ContingencyBeliefModel(SGDFittableMixin):
         log_likelihoods: list[float] = []
         prev_ll = float("-inf")
         converged = False
+        stopped_nonfinite = False
         params_dirty = False
         last_accepted: dict[str, Array] | None = None
 
         for iteration in range(max_iter):
             # E-step
             result = _e_step()
+            ll = float(result.log_likelihood)
+            if not np.isfinite(ll):
+                if last_accepted is None:
+                    raise NonFiniteLikelihoodError(
+                        f"Non-finite log-likelihood ({ll}) at the first EM "
+                        "E-step; the starting parameters are unusable."
+                    )
+                # Roll back the M-step that produced the bad parameters and
+                # resync the smoother with the restored ones.
+                for attr, value in last_accepted.items():
+                    setattr(self, attr, value)
+                result = _e_step()
+                self._smoother_result = result
+                self.smoothed_state_posterior_ = result.smoothed_state_prob
+                params_dirty = False
+                stopped_nonfinite = True
+                logger.warning(
+                    "Non-finite log-likelihood (%s) at EM iteration %d; rolled "
+                    "back to the previous parameters and stopped EM.",
+                    ll,
+                    iteration + 1,
+                )
+                break
             self._smoother_result = result
             self.smoothed_state_posterior_ = result.smoothed_state_prob
-            ll = float(result.log_likelihood)
             log_likelihoods.append(ll)
             params_dirty = False
 
@@ -1417,7 +1448,8 @@ class ContingencyBeliefModel(SGDFittableMixin):
         # Causal posterior: the forward pass of the final parameters' smoother
         self.state_posterior_ = self._smoother_result.filtered_state_prob
         self._populate_uncertainty(choices)
-        self._finalize_convergence(converged, max_iter)
+        if not stopped_nonfinite:
+            self._finalize_convergence(converged, max_iter)
 
         return log_likelihoods
 

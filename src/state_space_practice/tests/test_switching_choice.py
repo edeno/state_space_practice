@@ -1289,3 +1289,84 @@ class TestSwitchingChoiceFitSgdData:
         model.fit_sgd(choices, covariates, obs_covariates, num_steps=3)
 
         assert len(sgd_step_builds) == 1
+
+
+class TestSwitchingChoiceEMNonFinite:
+    """EM never keeps a non-finite E-step: it rolls back or raises."""
+
+    @pytest.fixture
+    def choices(self):
+        return np.random.default_rng(3).integers(0, 3, size=80)
+
+    def test_nan_m_step_rolls_back_to_last_finite_e_step(
+        self, choices, monkeypatch, caplog
+    ):
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        m_step = SwitchingChoiceModel._m_step
+        params_at_call: list[tuple[np.ndarray, np.ndarray]] = []
+
+        def nan_on_second_call(self, smoother_result):
+            params_at_call.append(
+                (
+                    np.asarray(self.process_noises_),
+                    np.asarray(self.discrete_transition_matrix_),
+                )
+            )
+            m_step(self, smoother_result)
+            if len(params_at_call) == 2:
+                self.process_noises_ = self.process_noises_.at[0].set(jnp.nan)
+
+        monkeypatch.setattr(SwitchingChoiceModel, "_m_step", nan_on_second_call)
+        with caplog.at_level("WARNING", logger="state_space_practice.switching_choice"):
+            lls = model.fit(choices, max_iter=10, tolerance=0.0)
+
+        # Guard: the poisoned M-step ran, so the third E-step was non-finite.
+        assert len(params_at_call) == 2
+        assert len(lls) == 2
+        assert np.all(np.isfinite(lls))
+        assert model.converged_ is False
+        # The parameters are those the last accepted (second) E-step ran under.
+        accepted_q, accepted_z = params_at_call[1]
+        np.testing.assert_array_equal(model.process_noises_, accepted_q)
+        np.testing.assert_array_equal(model.discrete_transition_matrix_, accepted_z)
+        # Stored posteriors and log_likelihood_ belong to those parameters.
+        assert model.log_likelihood_ == lls[-1]
+        fresh = model._run_filter(jnp.asarray(choices, dtype=jnp.int32))
+        assert float(fresh.marginal_log_likelihood) == model.log_likelihood_
+        np.testing.assert_array_equal(
+            model._filter_result.discrete_state_probs, fresh.discrete_state_probs
+        )
+        assert np.all(np.isfinite(model.smoothed_discrete_probs_))
+        assert np.all(np.isfinite(model.surprise_))
+        assert any("non-finite" in r.getMessage() for r in caplog.records)
+
+    def test_nan_final_e_step_rolls_back(self, choices, monkeypatch):
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        m_step = SwitchingChoiceModel._m_step
+        params_at_call: list[np.ndarray] = []
+
+        def nan_on_last_call(self, smoother_result):
+            params_at_call.append(np.asarray(self.process_noises_))
+            m_step(self, smoother_result)
+            if len(params_at_call) == 3:
+                self.process_noises_ = self.process_noises_.at[1].set(jnp.nan)
+
+        monkeypatch.setattr(SwitchingChoiceModel, "_m_step", nan_on_last_call)
+        lls = model.fit(choices, max_iter=3, tolerance=0.0)
+
+        # Guard: the poisoned M-step was the last one, before the final E-step.
+        assert len(params_at_call) == 3
+        assert len(lls) == 3
+        np.testing.assert_array_equal(model.process_noises_, params_at_call[2])
+        assert model.log_likelihood_ == lls[-1]
+        assert np.all(np.isfinite(model.smoothed_discrete_probs_))
+
+    def test_non_finite_first_e_step_raises(self, choices):
+        from state_space_practice.exceptions import NonFiniteLikelihoodError
+
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        model.process_noises_ = jnp.array([jnp.nan, 0.01])
+
+        with pytest.raises(NonFiniteLikelihoodError):
+            model.fit(choices, max_iter=5)
+        assert not model.is_fitted

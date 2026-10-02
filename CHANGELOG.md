@@ -421,6 +421,21 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The choice and belief models' EM no longer runs on after a non-finite
+  log-likelihood**: `MultinomialChoiceModel`, `CovariateChoiceModel`,
+  `SwitchingChoiceModel` and `ContingencyBeliefModel` run their own EM loops,
+  which recorded a NaN log-likelihood and kept iterating, so an M-step that
+  produced a NaN parameter left the model with NaN parameters, posteriors and
+  `log_likelihood_`, flagged only by "did not converge". Like
+  `em_driver.run_em`, a non-finite first E-step now raises
+  `NonFiniteLikelihoodError`, and a later one (including the final E-step
+  after `max_iter`) restores the last accepted parameters and their
+  posteriors, warns and stops. Their convergence criteria (relative or
+  absolute `tolerance`) are unchanged, and finite fits are bit-identical.
+  After a rollback stop the models no longer also log the misleading "did not
+  converge in max_iter EM iterations" warning; `MultinomialChoiceModel` /
+  `CovariateChoiceModel` now warn when their monotonicity guard rolls back a
+  decreasing step.
 - **Repeat `fit_sgd` calls reuse the compiled SGD step**: losses read trained
   parameters as `params.get(key, self.<attr>)`, so the compiled-step cache
   (which fingerprints model attributes read while tracing) missed after every

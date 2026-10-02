@@ -776,6 +776,13 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
         Returns
         -------
         log_likelihoods : list of float
+
+        Raises
+        ------
+        NonFiniteLikelihoodError
+            If the first E-step's log-likelihood is non-finite. A later
+            non-finite E-step is never recorded: the parameters roll back to
+            the last accepted iterate and EM stops with a warning.
         """
         choices_arr = self._bind_covariates(choices, covariates, obs_covariates, "fit")
         return self._fit_em(choices_arr, max_iter, tolerance, verbose, beta_grid)

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
@@ -33,7 +34,8 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.covariate_choice import covariate_predict
-from state_space_practice.exceptions import NotFittedError
+from state_space_practice.em_driver import restore_attributes, snapshot_attributes
+from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.multinomial_choice import (
     _softmax_update_core,
@@ -66,6 +68,10 @@ if TYPE_CHECKING:
     import optax
 
 logger = logging.getLogger(__name__)
+
+# Everything SwitchingChoiceModel._m_step writes: the parameters an EM
+# rollback restores.
+_EM_PARAM_ATTRS = ("process_noises_", "discrete_transition_matrix_")
 
 
 def _softmax_predict_and_update(
@@ -708,6 +714,14 @@ def _between_state_variance(means: Array, probs: Array) -> Array:
     return jnp.einsum("tks,ts->tk", centred**2, probs)
 
 
+class _AcceptedEStep(NamedTuple):
+    """An EM E-step with a finite log-likelihood and the parameters it used."""
+
+    params: dict[str, Any]  # snapshot_attributes of _EM_PARAM_ATTRS
+    filter_result: SwitchingChoiceFilterResult
+    smoother_result: SwitchingSmootherResult
+
+
 class SwitchingChoiceModel(SGDFittableMixin):
     """Switching multi-armed bandit with per-state learning dynamics.
 
@@ -1024,19 +1038,40 @@ class SwitchingChoiceModel(SGDFittableMixin):
         Returns
         -------
         log_likelihoods : list of float
+            Log-likelihood of every E-step with a finite value. If an E-step
+            (including the final one after ``max_iter``) is non-finite, EM
+            restores the parameters and posteriors of the last finite E-step,
+            logs a warning and stops unconverged; the non-finite value is not
+            recorded.
+
+        Raises
+        ------
+        NonFiniteLikelihoodError
+            If the first E-step's log-likelihood is non-finite (the starting
+            parameters are unusable).
         """
         choices = self._bind_data(choices, covariates, obs_covariates)
 
         log_likelihoods: list[float] = []
         prev_ll = float("-inf")
         converged = False
+        # Parameters and posteriors of the last E-step with a finite
+        # log-likelihood; a non-finite E-step rolls back to them.
+        accepted: _AcceptedEStep | None = None
+        rolled_back = False
 
         for iteration in range(max_iter):
             # E-step: filter + smoother
             result = self._run_filter(choices, self._covariates, self._obs_covariates)
+            ll = float(result.marginal_log_likelihood)
+            if not math.isfinite(ll):
+                result, smoother_result = self._roll_back_em(
+                    accepted, ll, f"EM iteration {iteration + 1}"
+                )
+                rolled_back = True
+                break
             self._filter_result = result
             smoother_result = self._run_smoother(result)
-            ll = float(result.marginal_log_likelihood)
             log_likelihoods.append(ll)
 
             if abs(ll - prev_ll) < tolerance and iteration > 0:
@@ -1044,26 +1079,36 @@ class SwitchingChoiceModel(SGDFittableMixin):
                 converged = True
                 break
             prev_ll = ll
+            accepted = _AcceptedEStep(
+                snapshot_attributes(self, _EM_PARAM_ATTRS), result, smoother_result
+            )
 
             # M-step
             self._m_step(smoother_result)
 
-        if not converged:
+        if not converged and not rolled_back:
             # Final E-step with learned parameters so fitted summaries and
             # log_likelihood_ correspond to the model state after the last
             # M-step. On convergence no M-step followed the last E-step, so its
             # results are already at the final parameters.
             result = self._run_filter(choices, self._covariates, self._obs_covariates)
-            self._filter_result = result
-            smoother_result = self._run_smoother(result)
+            final_ll = float(result.marginal_log_likelihood)
+            if math.isfinite(final_ll):
+                self._filter_result = result
+                smoother_result = self._run_smoother(result)
+            else:
+                result, smoother_result = self._roll_back_em(
+                    accepted, final_ll, "the final E-step"
+                )
+                rolled_back = True
 
         self.smoothed_discrete_probs_ = smoother_result.smoother_discrete_state_prob
         self._smoother_state_cond_means = smoother_result.state_cond_smoother_means
         self._smoother_state_cond_covs = smoother_result.state_cond_smoother_covs
         # History is the per-iteration E-step LL trajectory; without
-        # convergence its last entry predates the final M-step, so it
-        # intentionally differs from log_likelihood_ (re-evaluated at the
-        # final parameters).
+        # convergence (and without a rollback) its last entry predates the
+        # final M-step, so it intentionally differs from log_likelihood_
+        # (re-evaluated at the final parameters).
         self._record_fit_result(
             log_likelihoods,
             converged,
@@ -1071,9 +1116,54 @@ class SwitchingChoiceModel(SGDFittableMixin):
             log_likelihood=float(result.marginal_log_likelihood),
         )
         self._populate_uncertainty(choices)
-        self._finalize_convergence(converged, max_iter)
+        if not rolled_back:
+            self._finalize_convergence(converged, max_iter)
 
         return log_likelihoods
+
+    def _roll_back_em(
+        self, accepted: _AcceptedEStep | None, bad_ll: float, where: str
+    ) -> tuple[SwitchingChoiceFilterResult, SwitchingSmootherResult]:
+        """Restore the last finite E-step after a non-finite one.
+
+        Parameters
+        ----------
+        accepted : _AcceptedEStep or None
+            The last E-step with a finite log-likelihood, or None if there was
+            none.
+        bad_ll : float
+            The non-finite log-likelihood.
+        where : str
+            Which E-step failed, for the messages.
+
+        Returns
+        -------
+        filter_result : SwitchingChoiceFilterResult
+        smoother_result : SwitchingSmootherResult
+            The restored E-step's posteriors (computed under the restored
+            parameters, so they need no re-run).
+
+        Raises
+        ------
+        NonFiniteLikelihoodError
+            If no E-step was finite: the starting parameters are unusable.
+        """
+        if accepted is None:
+            raise NonFiniteLikelihoodError(
+                f"Non-finite log-likelihood ({bad_ll}) at {where} with the "
+                "starting parameters; check init_process_noises, "
+                "init_inverse_temperatures, init_decays and the covariates."
+            )
+        restore_attributes(self, _EM_PARAM_ATTRS, accepted.params)
+        self._filter_result = accepted.filter_result
+        logger.warning(
+            "SwitchingChoiceModel.fit: non-finite log-likelihood (%s) at %s; "
+            "rolled back to the parameters of the last finite E-step and "
+            "stopped EM (not converged).",
+            bad_ll,
+            where,
+        )
+        return accepted.filter_result, accepted.smoother_result
 
     def _run_smoother(
         self, filter_result: SwitchingChoiceFilterResult

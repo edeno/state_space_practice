@@ -9,8 +9,16 @@ import pytest
 from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
-from state_space_practice.covariate_choice import covariate_choice_filter
-from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
+from state_space_practice.covariate_choice import (
+    CovariateChoiceModel,
+    covariate_choice_filter,
+    simulate_rl_choice_data,
+)
+from state_space_practice.exceptions import (
+    NonFiniteLikelihoodError,
+    NotFittedError,
+    StateSpaceWarning,
+)
 from state_space_practice.multinomial_choice import (
     NEWTON_GAP_TOL,
     ChoiceFilterResult,
@@ -922,6 +930,100 @@ class TestMultinomialRecovery:
         for k in range(true_vals.shape[1]):
             r = np.corrcoef(true_vals[:, k], smoothed[:, k])[0, 1]
             assert r > 0.6, f"option {k + 1}: corr={r:.3f} too low"
+
+
+def _multinomial_em_case():
+    sim = simulate_choice_data(n_trials=100, n_options=3, seed=1)
+    return MultinomialChoiceModel(n_options=3), (sim.choices,), {}
+
+
+def _covariate_em_case():
+    sim = simulate_rl_choice_data(n_trials=100, n_options=3, seed=3)
+    obs_covariates = np.random.default_rng(0).standard_normal((100, 2))
+    model = CovariateChoiceModel(
+        n_options=3,
+        n_covariates=2,
+        n_obs_covariates=2,
+        init_decay=0.9,
+        learn_decay=True,
+    )
+    data = {"covariates": sim.covariates, "obs_covariates": obs_covariates}
+    return model, (sim.choices,), data
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "make_case",
+    [_multinomial_em_case, _covariate_em_case],
+    ids=["multinomial", "covariate"],
+)
+class TestEMNonFiniteLikelihood:
+    """A non-finite E-step never enters the history or the stored fit: EM
+    rolls back to the last accepted parameters (or raises when there are
+    none), matching ``em_driver.run_em``."""
+
+    @staticmethod
+    def _poison_m_step(model, monkeypatch, poisoned_call):
+        """Make M-step number ``poisoned_call`` set ``process_noise`` to NaN.
+
+        Returns the ``(process_noise, inverse_temperature)`` after each
+        M-step, in order (filled in as EM runs).
+        """
+        original = model._m_step
+        produced = []
+
+        def poisoned(*args):
+            original(*args)
+            if len(produced) + 1 == poisoned_call:
+                model.process_noise = float("nan")
+            produced.append((model.process_noise, model.inverse_temperature))
+
+        monkeypatch.setattr(model, "_m_step", poisoned)
+        return produced
+
+    @staticmethod
+    def _assert_finite_fit(model, lls):
+        assert np.all(np.isfinite(lls))
+        assert model.log_likelihood_history_ == lls
+        assert np.isfinite(model.process_noise)
+        assert np.isfinite(model.log_likelihood_)
+        assert model.log_likelihood_ == lls[-1]
+        assert np.all(np.isfinite(np.asarray(model.smoothed_values)))
+        assert model.converged_ is False
+
+    def test_nonfinite_e_step_rolls_back(self, make_case, monkeypatch, caplog):
+        model, args, kwargs = make_case()
+        produced = self._poison_m_step(model, monkeypatch, poisoned_call=2)
+        with caplog.at_level("WARNING", logger=type(model).__module__):
+            lls = model.fit(*args, **kwargs, max_iter=10, tolerance=1e-12)
+
+        # Guard: the poisoned M-step ran, and EM stopped at the E-step after it.
+        assert len(produced) == 2 and np.isnan(produced[1][0])
+        assert len(lls) == 2
+        # Restored to the parameters of the last accepted E-step (after M-step 1).
+        assert (model.process_noise, model.inverse_temperature) == produced[0]
+        self._assert_finite_fit(model, lls)
+        assert "Non-finite log-likelihood" in caplog.text
+
+    def test_nonfinite_final_e_step_rolls_back(self, make_case, monkeypatch, caplog):
+        model, args, kwargs = make_case()
+        produced = self._poison_m_step(model, monkeypatch, poisoned_call=2)
+        with caplog.at_level("WARNING", logger=type(model).__module__):
+            lls = model.fit(*args, **kwargs, max_iter=2, tolerance=1e-12)
+
+        # Guard: the last M-step was poisoned and only the final E-step saw it.
+        assert len(produced) == 2 and np.isnan(produced[1][0])
+        assert (model.process_noise, model.inverse_temperature) == produced[0]
+        self._assert_finite_fit(model, lls)
+        assert "non-finite log-likelihood" in caplog.text
+
+    def test_nonfinite_first_e_step_raises(self, make_case):
+        model, args, kwargs = make_case()
+        model.process_noise = float("nan")
+        with pytest.raises(
+            NonFiniteLikelihoodError, match="Non-finite log-likelihood at iteration 1"
+        ):
+            model.fit(*args, **kwargs, max_iter=10)
 
 
 class TestMultinomialChoiceValidation:
