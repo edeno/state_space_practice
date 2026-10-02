@@ -87,6 +87,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`em_driver.snapshot_attributes` / `restore_attributes` /
   `clear_attributes`**: build `run_em`'s snapshot, restore and clear hooks
   from a tuple of attribute names; every `run_em` caller now uses them.
+- **`utils.as_2d_count_matrix`**: coerce `(n_time,)` or `(n_time, n_units)`
+  counts to 2-D and validate them.
 - **Stacked oscillator constructors in `oscillator_utils`**:
   `construct_common_oscillator_transition_matrix_stack`,
   `construct_correlated_noise_process_covariance_stack` and
@@ -151,6 +153,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **`PlaceFieldModel.predict_rate_map` uses an optimized einsum** (large
+  speedups at moderate grid sizes).
 - **Eager `utils.debug_print_if` calls no longer compile a `jit(cond)` each
   time.**
 - **Reading a fitted attribute before fitting raises `NotFittedError`**

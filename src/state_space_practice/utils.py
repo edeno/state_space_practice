@@ -1091,6 +1091,38 @@ def validate_count_array(
         raise ValueError(f"{name} must contain integer-valued counts.")
 
 
+def as_2d_count_matrix(counts: ArrayLike, name: str) -> Array:
+    """Coerce counts to ``(n_time, n_units)`` and validate them as counts.
+
+    Parameters
+    ----------
+    counts : ArrayLike, shape (n_time,) or (n_time, n_units)
+        Observed counts; a 1-D array is treated as a single unit.
+    name : str
+        Argument name used in error messages.
+
+    Returns
+    -------
+    Array, shape (n_time, n_units)
+
+    Raises
+    ------
+    ValueError
+        If ``counts`` is not 1-D or 2-D, is empty, or fails
+        :func:`validate_count_array`.
+    """
+    counts_arr = jnp.asarray(counts)
+    if counts_arr.ndim == 1:
+        counts_arr = counts_arr[:, None]
+    if counts_arr.ndim != 2:
+        raise ValueError(
+            f"{name} must be 1D (n_time,) or 2D (n_time, n_neurons), "
+            f"got shape {counts_arr.shape}."
+        )
+    validate_count_array(counts_arr, name, allow_empty=False)
+    return counts_arr
+
+
 def validate_finite_array(name: str, value: ArrayLike) -> None:
     """Validate finite model parameters at public boundaries.
 

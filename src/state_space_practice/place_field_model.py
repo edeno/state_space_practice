@@ -75,6 +75,7 @@ from state_space_practice.point_process_kalman import (
 from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.utils import (
     _root_figure,
+    as_2d_count_matrix,
     floor_variances_relative,
     psd_solve,
     symmetrize,
@@ -1008,8 +1009,8 @@ class PlaceFieldModel(SGDFittableMixin):
             log_conditional_intensity=self._log_intensity_func,
             return_filtered=True,
             max_log_count=self._max_log_count,
-            # fit() validates once at the top before EM starts; skip
-            # per-iteration re-validation (eigvalsh is O(d^3)).
+            # fit() / fit_sgd() validate once at the top; skip per-call
+            # re-validation (eigvalsh is O(d^3)).
             validate_inputs=False,
             # Block-diagonal dispatch: None/None falls through to dense.
             # fit() re-detects after every M-step in case
@@ -1252,15 +1253,7 @@ class PlaceFieldModel(SGDFittableMixin):
         """
         # Validate inputs
         position = np.asarray(position)
-        spikes = jnp.asarray(spikes)
-        if spikes.ndim == 1:
-            spikes = spikes[:, None]  # (n_time,) -> (n_time, 1)
-        if spikes.ndim != 2:
-            raise ValueError(
-                f"spikes must be 1D (n_time,) or 2D (n_time, n_neurons), "
-                f"got shape {spikes.shape}."
-            )
-        validate_count_array(spikes, "spikes", allow_empty=False)
+        spikes = as_2d_count_matrix(spikes, "spikes")
         if position.shape[0] != spikes.shape[0]:
             raise ValueError(
                 f"position and spikes must have the same number of time bins: "
@@ -1446,15 +1439,7 @@ class PlaceFieldModel(SGDFittableMixin):
 
         """
         position = np.asarray(position)
-        spikes = jnp.asarray(spikes)
-        if spikes.ndim == 1:
-            spikes = spikes[:, None]
-        if spikes.ndim != 2:
-            raise ValueError(
-                f"spikes must be 1D (n_time,) or 2D (n_time, n_neurons), "
-                f"got shape {spikes.shape}."
-            )
-        validate_count_array(spikes, "spikes", allow_empty=False)
+        spikes = as_2d_count_matrix(spikes, "spikes")
         if position.shape[0] != spikes.shape[0]:
             raise ValueError(
                 f"position and spikes must have the same number of time bins: "
@@ -1600,34 +1585,7 @@ class PlaceFieldModel(SGDFittableMixin):
             self.init_cov = params["init_cov"]
 
     def _finalize_sgd(self, design_matrix: Array, spikes: Array) -> None:
-        (
-            self.smoother_mean,
-            self.smoother_cov,
-            self.smoother_cross_cov,
-            marginal_ll,
-            self.filtered_mean,
-            self.filtered_cov,
-        ) = stochastic_point_process_smoother(
-            init_mean_params=self.init_mean,
-            init_covariance_params=self.init_cov,
-            design_matrix=design_matrix,
-            spike_indicator=spikes,
-            dt=self.dt,
-            transition_matrix=self.transition_matrix,
-            process_cov=self.process_cov,
-            log_conditional_intensity=self._log_intensity_func,
-            return_filtered=True,
-            max_log_count=self._max_log_count,
-            # fit_sgd validated at the top; skip per-call re-validation.
-            validate_inputs=False,
-            # Block-diagonal dispatch (None/None falls through to dense);
-            # block covariances are kept as per-neuron blocks.
-            block_n_neurons=self._block_n_neurons,
-            block_size=self._block_size,
-            max_newton_iter=self.max_newton_iter,
-            return_block_covariances=True,
-        )
-        self.log_likelihoods = [float(marginal_ll)]
+        self.log_likelihoods = [self._e_step(design_matrix, spikes)]
         # Saturation diagnostic: post-hoc check on the filtered posterior.
         # If a substantial fraction of bins saturate the physiological
         # ceiling, the filter output is unreliable.
@@ -1689,7 +1647,9 @@ class PlaceFieldModel(SGDFittableMixin):
             means_chunk = means[start:stop]
             covs_chunk = covs[start:stop]
             log_rate_mean = means_chunk @ Z_grid.T
-            var_log_rate = np.einsum("gb,tbc,gc->tg", Z_grid, covs_chunk, Z_grid)
+            var_log_rate = np.einsum(
+                "gb,tbc,gc->tg", Z_grid, covs_chunk, Z_grid, optimize=True
+            )
             var_log_rate = np.maximum(var_log_rate, 0.0)
             std_log_rate = np.sqrt(var_log_rate)
 
