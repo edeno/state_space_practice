@@ -398,6 +398,22 @@ class TestCommonOscillatorPointProcessModel:
         with pytest.raises(ValueError, match=match):
             model.fit(bad_spikes, max_iter=1, key=jax.random.PRNGKey(0))
 
+    @pytest.mark.parametrize("method", ["fit", "fit_sgd"])
+    @pytest.mark.parametrize(
+        ("shape", "match"),
+        [((200,), "must be 2D"), ((200, 7), "must match n_neurons=5")],
+    )
+    def test_fit_and_fit_sgd_validate_spike_shape_alike(
+        self, com_pp_params, method, shape, match
+    ) -> None:
+        """fit and fit_sgd reject a wrong spike shape with the same message,
+        before touching the model."""
+        model = CommonOscillatorPointProcessModel(**com_pp_params)
+        before = set(vars(model))
+        with pytest.raises(ValueError, match=match):
+            getattr(model, method)(jnp.zeros(shape), key=jax.random.PRNGKey(0))
+        assert set(vars(model)) == before
+
     def test_restarts_propagate_errors_other_than_nonfinite_ll(
         self, com_pp_params, synthetic_spikes, monkeypatch
     ) -> None:

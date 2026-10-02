@@ -70,7 +70,6 @@ from state_space_practice.utils import (
     clip_eigenvalues,
     shift_to_psd,
     symmetrize,
-    validate_count_array,
     validate_finite_array,
     validate_nonnegative_array,
     validate_unit_interval_array,
@@ -557,19 +556,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         log_likelihoods : list[float]
             Marginal log-likelihood at each iteration (from the best restart).
         """
-        spikes = jnp.asarray(spikes)
-
-        if spikes.ndim != 2:
-            raise ValueError(
-                f"spikes must be 2D with shape (n_time, n_neurons), "
-                f"got {spikes.ndim}D with shape {spikes.shape}"
-            )
-        if spikes.shape[1] != self.n_neurons:
-            raise ValueError(
-                f"spikes shape[1] must match n_neurons={self.n_neurons}, "
-                f"got shape {spikes.shape}"
-            )
-        validate_count_array(spikes, "spikes")
+        spikes = self._validate_spikes(spikes)
 
         if key is None:
             key = jax.random.PRNGKey(0)

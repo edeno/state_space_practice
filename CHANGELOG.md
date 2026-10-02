@@ -421,6 +421,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Switching point-process `fit_sgd` validates spike shape like `fit`**: a
+  1-D array or a wrong neuron count raised a misleading
+  "spike_params.baseline neuron dimension must match ..." error, after
+  initializing the model; it now raises the same "must be 2D" / "must match
+  n_neurons" errors as `fit`, before touching the model.
 - **Multi-restart switching point-process fits no longer hide real errors**:
   `fit(n_restarts>1)` treated every `ValueError` (e.g. from initialization or
   the M-step) as a non-finite-likelihood restart and finally reported "All N

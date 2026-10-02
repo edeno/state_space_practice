@@ -3428,8 +3428,7 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         -------
         log_likelihoods : list of float
         """
-        spikes = jnp.asarray(spikes)
-        validate_count_array(spikes, "spikes")
+        spikes = self._validate_spikes(spikes)
         self._sgd_n_time = spikes.shape[0]
 
         if not self._is_initialized():
@@ -3445,6 +3444,30 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
             verbose=verbose,
             convergence_tol=convergence_tol,
         )
+
+    def _validate_spikes(self, spikes: ArrayLike) -> Array:
+        """Check ``spikes`` is a ``(n_time, n_neurons)`` count array.
+
+        Shared by ``fit`` and ``fit_sgd`` so both reject bad input alike, before
+        the model is touched.
+
+        Returns
+        -------
+        Array, shape (n_time, n_neurons)
+        """
+        spikes = jnp.asarray(spikes)
+        if spikes.ndim != 2:
+            raise ValueError(
+                f"spikes must be 2D array with shape (n_time, n_neurons), "
+                f"got {spikes.ndim}D array with shape {spikes.shape}"
+            )
+        if spikes.shape[1] != self.n_neurons:
+            raise ValueError(
+                f"spikes shape[1] must match n_neurons={self.n_neurons}, "
+                f"got shape {spikes.shape}"
+            )
+        validate_count_array(spikes, "spikes")
+        return spikes
 
     def _is_initialized(self) -> bool:
         return (
@@ -4024,21 +4047,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         >>> 0 < len(log_likelihoods) <= 21  # <= max_iter, plus at most one final-E-step LL
         True
         """
-        # Convert to JAX array
-        spikes = jnp.asarray(spikes)
-
-        # Validate input shape
-        if spikes.ndim != 2:
-            raise ValueError(
-                f"spikes must be 2D array with shape (n_time, n_neurons), "
-                f"got {spikes.ndim}D array with shape {spikes.shape}"
-            )
-        if spikes.shape[1] != self.n_neurons:
-            raise ValueError(
-                f"spikes shape[1] must match n_neurons={self.n_neurons}, "
-                f"got shape {spikes.shape}"
-            )
-        validate_count_array(spikes, "spikes")
+        spikes = self._validate_spikes(spikes)
 
         # Set default random key if not provided
         if key is None:
