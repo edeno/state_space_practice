@@ -52,7 +52,7 @@ import math
 import warnings
 from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
     import optax
@@ -83,6 +83,17 @@ from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDPar
 from state_space_practice.utils import typed_jit, validate_count_array
 
 logger = logging.getLogger(__name__)
+
+
+class SmithFilterResult(NamedTuple):
+    """Output of :func:`smith_learning_filter` (each shape ``(n_trials,)``)."""
+
+    prob_correct_response: Array
+    learning_state_mode: Array
+    learning_state_variance: Array
+    one_step_mode: Array
+    one_step_variance: Array
+
 
 # Default process noise standard deviation
 # Smith et al. (2004) used variance of 0.05, so sigma = sqrt(0.05)
@@ -368,7 +379,7 @@ def smith_learning_filter(
     prob_correct_by_chance: float = 0.5,
     max_possible_correct: ArrayLike | None = None,
     differentiable: bool = False,
-) -> tuple[Array, Array, Array, Array, Array]:
+) -> SmithFilterResult:
     r"""Applies a non-linear Bayesian filter (Laplace approximation) for learning.
 
     Assumes a random walk model for the latent learning state ($x_k$) and
@@ -492,7 +503,7 @@ def _smith_learning_filter_impl(
     init_var: Array,
     sigma_squared_epsilon: Array,
     mu: Array,
-) -> tuple[Array, Array, Array, Array, Array]:
+) -> SmithFilterResult:
     """JIT-compiled inner implementation of the Smith learning filter."""
 
     def _step(
@@ -554,12 +565,12 @@ def _smith_learning_filter_impl(
     # Compute probability of correct response
     prob_correct_response = jax.nn.sigmoid(mu + learning_state_mode)
 
-    return (
-        prob_correct_response,
-        learning_state_mode,
-        learning_state_variance,
-        one_step_mode,
-        one_step_variance,
+    return SmithFilterResult(
+        prob_correct_response=prob_correct_response,
+        learning_state_mode=learning_state_mode,
+        learning_state_variance=learning_state_variance,
+        one_step_mode=one_step_mode,
+        one_step_variance=one_step_variance,
     )
 
 

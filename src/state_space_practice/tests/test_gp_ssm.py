@@ -63,10 +63,11 @@ def test_process_noise_tiny_dt_keeps_value_variance_positive():
 
 
 def test_stationary_covariance_solves_lyapunov():
-    """Pinf solves F Pinf + Pinf F.T + L Qc L.T = 0."""
-    F, L, Qc, _H, Pinf = matern32_continuous(VARIANCE, LENGTHSCALE)
-    L_col = jnp.reshape(L, (-1, 1))
-    residual = F @ Pinf + Pinf @ F.T + L_col @ (Qc * L_col.T)
+    """Pinf solves F Pinf + Pinf F.T + L Qc L.T = 0 (by field name, so the
+    NamedTuple fields are checked against the math, not just their order)."""
+    sde = matern32_continuous(VARIANCE, LENGTHSCALE)
+    L_col = jnp.reshape(sde.L, (-1, 1))
+    residual = sde.F @ sde.Pinf + sde.Pinf @ sde.F.T + L_col @ (sde.Qc * L_col.T)
     assert_allclose(np.asarray(residual), np.zeros((2, 2)), atol=1e-10)
 
 

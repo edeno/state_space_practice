@@ -122,6 +122,7 @@ from state_space_practice.sgd_fitting import (
     reconstruct_per_state_array,
 )
 from state_space_practice.switching_kalman import (
+    SwitchingFilterResult,
     _first_timestep_discrete_update,
     _normalize_initial_discrete_prob,
     _update_discrete_state_probabilities,
@@ -2124,7 +2125,7 @@ def _switching_point_process_filter_jit(
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
-) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
+) -> SwitchingFilterResult:
     """Switching point-process Kalman filter for spike observations.
 
     This filter implements a Switching Linear Dynamical System (SLDS) with
@@ -2472,14 +2473,14 @@ def _switching_point_process_filter_jit(
         [first_pair_cond_prob[None, ...], rest_pair_cond_filter_prob], axis=0
     )
 
-    return (
-        state_cond_filter_mean,
-        state_cond_filter_cov,
-        filter_discrete_state_prob,
-        pair_cond_filter_mean,  # full pair-conditional trajectory (GPB2 smoother)
-        pair_cond_filter_cov,  # full pair-conditional cov trajectory
-        pair_cond_filter_prob,  # full pair-filter discrete trajectory
-        marginal_log_likelihood,
+    return SwitchingFilterResult(
+        state_cond_filter_mean=state_cond_filter_mean,
+        state_cond_filter_cov=state_cond_filter_cov,
+        filter_discrete_state_prob=filter_discrete_state_prob,
+        pair_cond_filter_mean=pair_cond_filter_mean,
+        pair_cond_filter_cov=pair_cond_filter_cov,
+        pair_cond_filter_prob=pair_cond_filter_prob,
+        marginal_log_likelihood=marginal_log_likelihood,
     )
 
 
@@ -2497,7 +2498,7 @@ def switching_point_process_filter(
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
-) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
+) -> SwitchingFilterResult:
     """Switching point-process Kalman filter for spike observations.
 
     Thin, eagerly-evaluated wrapper around the jitted core
@@ -2518,8 +2519,9 @@ def switching_point_process_filter(
 
     Returns
     -------
-    tuple of Array
-        Same 7-tuple as ``_switching_point_process_filter_jit``.
+    SwitchingFilterResult
+        NamedTuple of the seven filter outputs (see
+        ``_switching_point_process_filter_jit`` for shapes).
     """
     init_state_cond_mean = jnp.asarray(init_state_cond_mean)
     init_state_cond_cov = jnp.asarray(init_state_cond_cov)

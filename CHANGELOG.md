@@ -144,6 +144,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **Long result tuples are NamedTuples**: `switching_kalman_filter` and
+  `switching_point_process_filter` return `SwitchingFilterResult`,
+  `switching_kalman_smoother` / `switching_kalman_smoother_gpb2` return
+  `SwitchingSmootherResult` / `SwitchingSmootherGPB2Result`,
+  `switching_kalman_maximization_step` returns `SwitchingMStepResult`,
+  `smith_learning_filter` returns `SmithFilterResult`, `matern32_continuous`
+  returns `Matern32SDE`, and the Eden & Brown 2004 simulators return
+  `EdenBrownJumpSimulation` / `EdenBrownLinearSimulation`. Positional
+  unpacking and indexing are unchanged; fields can now be read by name. The
+  types are JAX pytree nodes distinct from `tuple`, so code that mixes them
+  with plain tuples in one `lax.cond` / `tree_map` must use the same type.
 - **Public array inputs are typed `ArrayLike`**: every public function and
   method that takes a JAX array (except PRNG `key` arguments) is annotated
   `jax.typing.ArrayLike` and converts with `jnp.asarray`, so numpy inputs

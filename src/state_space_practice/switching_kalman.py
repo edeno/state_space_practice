@@ -17,7 +17,7 @@ import math
 import warnings
 from collections.abc import Callable
 from functools import partial
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -51,6 +51,67 @@ from state_space_practice.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Result types. NamedTuples, so positional unpacking keeps working; field
+# shapes are documented in the Returns section of the producing function.
+
+
+class SwitchingFilterResult(NamedTuple):
+    """Output of :func:`switching_kalman_filter` and the switching point-process filter."""
+
+    state_cond_filter_mean: jax.Array
+    state_cond_filter_cov: jax.Array
+    filter_discrete_state_prob: jax.Array
+    pair_cond_filter_mean: jax.Array
+    pair_cond_filter_cov: jax.Array
+    pair_cond_filter_prob: jax.Array
+    marginal_log_likelihood: jax.Array
+
+
+class SwitchingSmootherResult(NamedTuple):
+    """Output of :func:`switching_kalman_smoother` (GPB1)."""
+
+    overall_smoother_mean: jax.Array
+    overall_smoother_cov: jax.Array
+    smoother_discrete_state_prob: jax.Array
+    smoother_joint_discrete_state_prob: jax.Array
+    overall_smoother_cross_cov: jax.Array
+    state_cond_smoother_means: jax.Array
+    state_cond_smoother_covs: jax.Array
+    pair_cond_smoother_cross_covs: jax.Array
+    pair_cond_smoother_means: jax.Array
+
+
+class SwitchingSmootherGPB2Result(NamedTuple):
+    """Output of :func:`switching_kalman_smoother_gpb2`: the GPB1 fields plus the
+    pair-conditional covariances and next-step means its M-step uses."""
+
+    overall_smoother_mean: jax.Array
+    overall_smoother_cov: jax.Array
+    smoother_discrete_state_prob: jax.Array
+    smoother_joint_discrete_state_prob: jax.Array
+    overall_smoother_cross_cov: jax.Array
+    state_cond_smoother_means: jax.Array
+    state_cond_smoother_covs: jax.Array
+    pair_cond_smoother_cross_covs: jax.Array
+    pair_cond_smoother_means: jax.Array
+    pair_cond_smoother_covs: jax.Array
+    next_pair_cond_smoother_means: jax.Array
+
+
+class SwitchingMStepResult(NamedTuple):
+    """Parameters returned by :func:`switching_kalman_maximization_step`."""
+
+    continuous_transition_matrix: jax.Array
+    measurement_matrix: jax.Array
+    process_cov: jax.Array
+    measurement_cov: jax.Array
+    init_mean: jax.Array
+    init_cov: jax.Array
+    discrete_transition_matrix: jax.Array
+    init_discrete_state_prob: jax.Array
+
 
 _kalman_filter_update_per_discrete_state_pair = jax.vmap(
     jax.vmap(
@@ -814,15 +875,7 @@ def switching_kalman_filter(
     process_cov: ArrayLike,
     measurement_matrix: ArrayLike,
     measurement_cov: ArrayLike,
-) -> tuple[
-    jax.Array,  # Filtered mean of the continuous latent state
-    jax.Array,  # Filtered covariance of the continuous latent state
-    jax.Array,  # Filtered probability of the discrete states
-    jax.Array,  # Pair-conditional filter mean trajectory
-    jax.Array,  # Pair-conditional filter covariance trajectory
-    jax.Array,  # Pair-conditional discrete probability trajectory
-    jax.Array,  # Marginal log likelihood of the observations (scalar array)
-]:
+) -> SwitchingFilterResult:
     """Switching Kalman filter for a linear Gaussian state space model with discrete states.
 
     This filter uses the x₁ convention where init parameters represent the state
@@ -1087,14 +1140,14 @@ def switching_kalman_filter(
         [first_pair_cond_prob[None, ...], rest_pair_cond_filter_prob], axis=0
     )
 
-    return (
-        state_cond_filter_mean,
-        state_cond_filter_cov,
-        filter_discrete_state_prob,
-        pair_cond_filter_mean,
-        pair_cond_filter_cov,
-        pair_cond_filter_prob,
-        marginal_log_likelihood,
+    return SwitchingFilterResult(
+        state_cond_filter_mean=state_cond_filter_mean,
+        state_cond_filter_cov=state_cond_filter_cov,
+        filter_discrete_state_prob=filter_discrete_state_prob,
+        pair_cond_filter_mean=pair_cond_filter_mean,
+        pair_cond_filter_cov=pair_cond_filter_cov,
+        pair_cond_filter_prob=pair_cond_filter_prob,
+        marginal_log_likelihood=marginal_log_likelihood,
     )
 
 
@@ -1428,17 +1481,7 @@ def switching_kalman_smoother(
     process_cov: ArrayLike,
     continuous_transition_matrix: ArrayLike,
     discrete_state_transition_matrix: ArrayLike,
-) -> tuple[
-    jax.Array,  # Overall smoother mean
-    jax.Array,  # Overall smoother covariance
-    jax.Array,  # Smoother discrete state probabilities
-    jax.Array,  # Smoother joint discrete state probabilities
-    jax.Array,  # Overall smoother cross covariance
-    jax.Array,  # State conditional smoother means
-    jax.Array,  # State conditional smoother covariances
-    jax.Array,  # Pair conditional smoother cross covariances
-    jax.Array,  # Pair conditional smoother means
-]:
+) -> SwitchingSmootherResult:
     """GPB1/IMM approximate switching Kalman smoother.
 
     This is an approximate smoother: the forward pass collapses K^2 mixture
@@ -1713,16 +1756,16 @@ def switching_kalman_smoother(
         [state_cond_smoother_covs, filter_cov[-1][None]], axis=0
     )
 
-    return (
-        overall_smoother_mean,
-        overall_smoother_covs,
-        smoother_discrete_state_prob,
-        smoother_joint_discrete_state_prob,
-        overall_smoother_cross_cov,
-        state_cond_smoother_means,
-        state_cond_smoother_covs,
-        pair_cond_smoother_cross_covs,
-        pair_cond_smoother_means,
+    return SwitchingSmootherResult(
+        overall_smoother_mean=overall_smoother_mean,
+        overall_smoother_cov=overall_smoother_covs,
+        smoother_discrete_state_prob=smoother_discrete_state_prob,
+        smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
+        overall_smoother_cross_cov=overall_smoother_cross_cov,
+        state_cond_smoother_means=state_cond_smoother_means,
+        state_cond_smoother_covs=state_cond_smoother_covs,
+        pair_cond_smoother_cross_covs=pair_cond_smoother_cross_covs,
+        pair_cond_smoother_means=pair_cond_smoother_means,
     )
 
 
@@ -1736,19 +1779,7 @@ def switching_kalman_smoother_gpb2(
     pair_cond_filter_prob: ArrayLike,
     process_cov: ArrayLike,
     continuous_transition_matrix: ArrayLike,
-) -> tuple[
-    jax.Array,  # overall_smoother_mean
-    jax.Array,  # overall_smoother_covs
-    jax.Array,  # smoother_discrete_state_prob
-    jax.Array,  # smoother_joint_discrete_state_prob
-    jax.Array,  # overall_smoother_cross_cov
-    jax.Array,  # state_cond_smoother_means
-    jax.Array,  # state_cond_smoother_covs
-    jax.Array,  # pair_cond_smoother_cross_covs
-    jax.Array,  # pair_cond_smoother_means
-    jax.Array,  # pair_cond_smoother_covs_mstep
-    jax.Array,  # next_pair_cond_smoother_means
-]:
+) -> SwitchingSmootherGPB2Result:
     """GPB2 (Kim second-order) switching Kalman smoother.
 
     Carries pair-conditional (S_t, S_{t+1}) Gaussians and pair discrete
@@ -2093,18 +2124,18 @@ def switching_kalman_smoother_gpb2(
         [state_cond_smoother_covs, filter_cov[-1][None]], axis=0
     )
 
-    return (
-        overall_smoother_mean,
-        overall_smoother_covs,
-        smoother_discrete_state_prob,
-        smoother_joint_discrete_state_prob,
-        overall_smoother_cross_cov,
-        state_cond_smoother_means,
-        state_cond_smoother_covs,
-        pair_cond_smoother_cross_covs,
-        pair_cond_smoother_means,
-        pair_cond_smoother_covs_mstep,
-        next_pair_cond_smoother_means,
+    return SwitchingSmootherGPB2Result(
+        overall_smoother_mean=overall_smoother_mean,
+        overall_smoother_cov=overall_smoother_covs,
+        smoother_discrete_state_prob=smoother_discrete_state_prob,
+        smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
+        overall_smoother_cross_cov=overall_smoother_cross_cov,
+        state_cond_smoother_means=state_cond_smoother_means,
+        state_cond_smoother_covs=state_cond_smoother_covs,
+        pair_cond_smoother_cross_covs=pair_cond_smoother_cross_covs,
+        pair_cond_smoother_means=pair_cond_smoother_means,
+        pair_cond_smoother_covs=pair_cond_smoother_covs_mstep,
+        next_pair_cond_smoother_means=next_pair_cond_smoother_means,
     )
 
 
@@ -2386,16 +2417,7 @@ def switching_kalman_maximization_step(
     fixed_continuous_transition_matrix: ArrayLike | None = None,
     previous_params: dict[str, jax.Array] | None = None,
     estimate_measurement_params: bool = True,
-) -> tuple[
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-]:
+) -> SwitchingMStepResult:
     """Maximization step for the switching Kalman filter.
 
     Parameters
@@ -2662,15 +2684,15 @@ def switching_kalman_maximization_step(
                 floored_states,
             )
 
-    return (
-        continuous_transition_matrix,
-        measurement_matrix,
-        process_cov,
-        measurement_cov,
-        init_state_cond_mean,
-        init_state_cond_cov,
-        discrete_state_transition,
-        init_discrete_state_prob,
+    return SwitchingMStepResult(
+        continuous_transition_matrix=continuous_transition_matrix,
+        measurement_matrix=measurement_matrix,
+        process_cov=process_cov,
+        measurement_cov=measurement_cov,
+        init_mean=init_state_cond_mean,
+        init_cov=init_state_cond_cov,
+        discrete_transition_matrix=discrete_state_transition,
+        init_discrete_state_prob=init_discrete_state_prob,
     )
 
 
