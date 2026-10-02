@@ -12,7 +12,8 @@ import numpy as np
 import pytest
 
 from state_space_practice import point_process_kalman
-from state_space_practice.exceptions import StateSpaceWarning
+from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
+from state_space_practice.fitted_state import is_set
 from state_space_practice.point_process_kalman import (
     BlockDiagonalCovariance,
     BlockDiagonalStructure,
@@ -1014,9 +1015,11 @@ class TestPointProcessModel:
         d = simple_model_data
         model = PointProcessModel(n_state_dims=d["n_basis"], dt=d["dt"])
 
-        # Before fit, results are None
-        assert model.smoother_mean is None
-        assert model.smoother_cov is None
+        # Before fit, results are unset: reading one raises NotFittedError.
+        for attr in ("smoother_mean", "smoother_cov"):
+            with pytest.raises(NotFittedError, match=attr):
+                getattr(model, attr)
+            assert not hasattr(model, attr)
 
         model.fit(d["design_matrix"], d["spike_indicator"], max_iter=3)
 
@@ -1146,7 +1149,7 @@ class TestPointProcessModel:
         d = simple_model_data
         model = PointProcessModel(n_state_dims=d["n_basis"], dt=d["dt"])
 
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.get_rate_estimate(d["design_matrix"])
 
     def test_get_rate_estimate_after_fit(self, simple_model_data) -> None:
@@ -1169,7 +1172,7 @@ class TestPointProcessModel:
         d = simple_model_data
         model = PointProcessModel(n_state_dims=d["n_basis"], dt=d["dt"])
 
-        with pytest.raises(RuntimeError, match="not been fitted"):
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.get_confidence_interval()
 
     def test_get_confidence_interval_after_fit(self, simple_model_data) -> None:
@@ -5296,8 +5299,8 @@ class TestPointProcessModelNonFiniteFirstEStep:
             "filtered_mean",
             "filtered_cov",
         ):
-            assert getattr(model, attr) is None, attr
-        with pytest.raises(RuntimeError, match="not been fitted"):
+            assert not is_set(model, attr), attr
+        with pytest.raises(NotFittedError, match="not been fitted"):
             model.get_rate_estimate(Z)
 
 

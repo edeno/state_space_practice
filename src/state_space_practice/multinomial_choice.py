@@ -31,6 +31,7 @@ from jax.typing import ArrayLike, DTypeLike
 from numpy.typing import NDArray
 
 from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
+from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.kalman import rts_backward_scan
 from state_space_practice.parameter_transforms import POSITIVE
 from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
@@ -602,6 +603,23 @@ class _MultinomialChoiceBase(SGDFittableMixin):
       counting for BIC and the leading rows of ``summary()``.
     """
 
+    # Fitted state, set by fit() / fit_sgd(); reading one before raises
+    # NotFittedError.
+    _smoother_result: FittedAttribute[ChoiceSmootherResult] = FittedAttribute()
+    log_likelihood_: FittedAttribute[float] = FittedAttribute()
+    _n_trials: FittedAttribute[int] = FittedAttribute()
+
+    # Uncertainty summaries, each (n_trials, n_options)
+    predicted_option_values_: FittedAttribute[Array] = FittedAttribute()
+    filtered_option_values_: FittedAttribute[Array] = FittedAttribute()
+    smoothed_option_values_: FittedAttribute[Array] = FittedAttribute()
+    predicted_option_variances_: FittedAttribute[Array] = FittedAttribute()
+    filtered_option_variances_: FittedAttribute[Array] = FittedAttribute()
+    smoothed_option_variances_: FittedAttribute[Array] = FittedAttribute()
+    # Per trial, shape (n_trials,)
+    predicted_choice_entropy_: FittedAttribute[Array] = FittedAttribute()
+    surprise_: FittedAttribute[Array] = FittedAttribute()
+
     def __init__(
         self,
         n_options: int,
@@ -628,19 +646,8 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         self.learn_inverse_temperature = learn_inverse_temperature
         self.learn_process_noise = learn_process_noise
 
-        # Fitted state (populated by fit())
-        self._smoother_result: ChoiceSmootherResult | None = None
-        self.log_likelihood_: float | None = None
+        # EM iteration count; stays None after an SGD-only fit.
         self.n_iter_: int | None = None
-        self.converged_: bool | None = None
-        self.log_likelihood_history_: list[float] | None = None
-        self._n_trials: int | None = None
-
-        # Uncertainty summaries (populated after fitting)
-        self.predicted_option_variances_: Array | None = None
-        self.smoothed_option_variances_: Array | None = None
-        self.predicted_choice_entropy_: Array | None = None
-        self.surprise_: Array | None = None
 
     def __repr__(self) -> str:
         fitted = self.is_fitted
@@ -652,10 +659,10 @@ class _MultinomialChoiceBase(SGDFittableMixin):
 
     @property
     def is_fitted(self) -> bool:
-        return self._smoother_result is not None
+        return is_set(self, "_smoother_result")
 
     def _check_fitted(self, method: str) -> ChoiceSmootherResult:
-        if self._smoother_result is None:
+        if not is_set(self, "_smoother_result"):
             raise NotFittedError(
                 f"{type(self).__name__}.{method}() called before fitting. "
                 f"Call model.fit(choices) first."
@@ -922,7 +929,7 @@ class _MultinomialChoiceBase(SGDFittableMixin):
 
     @property
     def _n_timesteps(self) -> int:
-        if self._n_trials is None:
+        if not is_set(self, "_n_trials"):
             raise NotFittedError("Model must be fitted before accessing _n_timesteps.")
         return self._n_trials
 
@@ -1103,8 +1110,6 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         Only counts parameters that are actually learned via EM.
         """
         self._check_fitted("bic")
-        assert self.log_likelihood_ is not None
-        assert self._n_trials is not None
         return -2.0 * self.log_likelihood_ + self.n_free_params * math.log(
             self._n_trials
         )
@@ -1118,7 +1123,6 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         delta_bic, learning_detected.
         """
         self._check_fitted("compare_to_null")
-        assert self._n_trials is not None
         null_ll_per_trial = math.log(1.0 / self.n_options)
         null_ll = null_ll_per_trial * self._n_trials
         null_bic = -2.0 * null_ll  # 0 free params
@@ -1268,7 +1272,6 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         import matplotlib.pyplot as plt
 
         self._check_fitted("plot_convergence")
-        assert self.log_likelihood_history_ is not None
 
         if ax is None:
             fig, ax = plt.subplots(figsize=(6, 4))

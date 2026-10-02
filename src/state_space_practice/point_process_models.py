@@ -35,6 +35,7 @@ from jax.typing import ArrayLike
 
 from state_space_practice.em_driver import run_em
 from state_space_practice.exceptions import NotFittedError
+from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.oscillator_utils import (
     DirectedInfluenceDynamicsMixin,
     canonicalize_correlated_noise_pair_parameters,
@@ -183,6 +184,37 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         "update_init_cov": "init_cov",
     }
 
+    # Parameters and posteriors captured for EM rollback. Every JAX-array and
+    # immutable-container attribute is *reassigned* (never mutated in place)
+    # by the E/M steps, so a plain reference is a valid snapshot.
+    _EM_SNAPSHOT_KEYS = (
+        "init_mean",
+        "init_cov",
+        "init_discrete_state_prob",
+        "discrete_transition_matrix",
+        "continuous_transition_matrix",
+        "process_cov",
+        "spike_params",
+        "smoother_state_cond_mean",
+        "smoother_state_cond_cov",
+        "smoother_discrete_state_prob",
+        "smoother_joint_discrete_state_prob",
+        "smoother_pair_cond_cross_cov",
+        "smoother_pair_cond_means",
+        "smoother_pair_cond_covs",
+        "smoother_next_pair_cond_means",
+        "freqs",
+        "damping_coef",
+        "process_variance",
+        "phase_difference",
+        "coupling_strength",
+        "_current_osc_params",
+        "_transition_suff_stats",
+    )
+
+    #: Marginal log-likelihood of the final EM iterate; set by ``fit``.
+    log_likelihood_: FittedAttribute[float] = FittedAttribute()
+
     def __init__(
         self,
         n_oscillators: int,
@@ -269,10 +301,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         RuntimeError
             If called before fit() or fit_sgd().
         """
-        if (
-            not hasattr(self, "smoother_discrete_state_prob")
-            or self.smoother_discrete_state_prob is None
-        ):
+        if not is_set(self, "smoother_discrete_state_prob"):
             raise NotFittedError("Call fit() or fit_sgd() before decode().")
         return jnp.argmax(self.smoother_discrete_state_prob, axis=1)
 
@@ -289,10 +318,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         RuntimeError
             If called before fit() or fit_sgd().
         """
-        if (
-            not hasattr(self, "smoother_discrete_state_prob")
-            or self.smoother_discrete_state_prob is None
-        ):
+        if not is_set(self, "smoother_discrete_state_prob"):
             raise NotFittedError("Call fit() or fit_sgd() before predict_proba().")
         return self.smoother_discrete_state_prob
 
@@ -477,40 +503,15 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
     def _snapshot_em_state(self) -> dict[str, object]:
         """Snapshot parameters and posteriors for EM rollback.
 
-        Every JAX-array and immutable-container attribute below is *reassigned*
-        (never mutated in place) by the E/M steps, so a plain reference is a
-        valid snapshot -- restoring it later is unaffected by the reassignment.
-        Only ``_current_osc_params`` (a mutable ``dict | None`` warm-start
-        cache for the reparameterized M-step) is deep-copied, so an in-place
-        edit of the live dict cannot leak into the snapshot.
+        Restoring a reference snapshot is unaffected by later reassignment
+        (see ``_EM_SNAPSHOT_KEYS``). Only ``_current_osc_params`` (a mutable
+        ``dict | None`` warm-start cache for the reparameterized M-step) is
+        deep-copied, so an in-place edit of the live dict cannot leak into the
+        snapshot.
         """
-        attrs = [
-            "init_mean",
-            "init_cov",
-            "init_discrete_state_prob",
-            "discrete_transition_matrix",
-            "continuous_transition_matrix",
-            "process_cov",
-            "spike_params",
-            "smoother_state_cond_mean",
-            "smoother_state_cond_cov",
-            "smoother_discrete_state_prob",
-            "smoother_joint_discrete_state_prob",
-            "smoother_pair_cond_cross_cov",
-            "smoother_pair_cond_means",
-            "smoother_pair_cond_covs",
-            "smoother_next_pair_cond_means",
-            "freqs",
-            "damping_coef",
-            "process_variance",
-            "phase_difference",
-            "coupling_strength",
-            "_current_osc_params",
-            "_transition_suff_stats",
-        ]
         deepcopy_attrs = {"_current_osc_params"}
         snapshot: dict[str, object] = {}
-        for attr in attrs:
+        for attr in self._EM_SNAPSHOT_KEYS:
             if not hasattr(self, attr):
                 continue
             value = getattr(self, attr)
@@ -518,9 +519,16 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         return snapshot
 
     def _restore_em_state(self, state: dict[str, object]) -> None:
-        """Restore a snapshot produced by ``_snapshot_em_state``."""
-        for attr, value in state.items():
-            setattr(self, attr, value)
+        """Restore a snapshot produced by ``_snapshot_em_state``.
+
+        A key absent from the snapshot was unset when it was taken (e.g. the
+        smoother outputs before the first E-step), so it is unset again.
+        """
+        for attr in self._EM_SNAPSHOT_KEYS:
+            if attr in state:
+                setattr(self, attr, state[attr])
+            elif is_set(self, attr):
+                delattr(self, attr)
 
     # ------------------------------------------------------------------
     # EM loop
@@ -610,9 +618,10 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
                     self.n_discrete_states,
                 )
             )
-            self.smoother_pair_cond_means = None
-            self.smoother_pair_cond_covs = None
-            self.smoother_next_pair_cond_means = None
+            # Not computed until the first E-step; drop any from a prior fit.
+            del self.smoother_pair_cond_means
+            del self.smoother_pair_cond_covs
+            del self.smoother_next_pair_cond_means
             self._m_step_spikes(spikes)
         else:
             self._init_cov_latent_scale()
@@ -1026,12 +1035,6 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
 
     def _m_step_constrained_process_covariance(self) -> None:
         """Install the exact fixed-A, PSD, jointly constrained CNM Q update."""
-        assert self.smoother_state_cond_mean is not None
-        assert self.smoother_state_cond_cov is not None
-        assert self.smoother_discrete_state_prob is not None
-        assert self.smoother_joint_discrete_state_prob is not None
-        assert self.smoother_pair_cond_cross_cov is not None
-
         residual_scatter, state_counts = compute_process_covariance_sufficient_stats(
             continuous_transition_matrix=self.continuous_transition_matrix,
             state_cond_smoother_means=self.smoother_state_cond_mean,

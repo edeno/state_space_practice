@@ -16,6 +16,7 @@ from state_space_practice.covariate_choice import (
     m_step_input_gain,
     simulate_rl_choice_data,
 )
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.multinomial_choice import (
     MultinomialChoiceModel,
     multinomial_choice_filter,
@@ -548,6 +549,13 @@ class TestCovariateChoiceModel:
         choices, covariates, _, _ = _generate_reward_covariate_data(n_trials=80)
         model.fit(choices, covariates=covariates, max_iter=3)
         assert model.is_fitted
+
+    @pytest.mark.parametrize("attr", ["log_likelihood_", "predicted_choice_entropy_"])
+    def test_fitted_attribute_unavailable_before_fit(self, attr):
+        model = CovariateChoiceModel(n_options=3, n_covariates=2)
+        with pytest.raises(NotFittedError, match=attr):
+            getattr(model, attr)
+        assert not hasattr(model, attr)
 
     def test_fit_learns_reward_sensitivity(self):
         """Rewarding option 1 -> B[0, 0] should be positive."""

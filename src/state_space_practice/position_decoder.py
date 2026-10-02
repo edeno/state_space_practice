@@ -30,7 +30,8 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
-from state_space_practice.exceptions import StateSpaceWarning
+from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
+from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.kalman import rts_backward_scan_with_predictions
 from state_space_practice.point_process_kalman import (
     _point_process_laplace_update,
@@ -1681,6 +1682,9 @@ class PositionDecoder:
     >>> decoded_xy = result.position_mean[:, :2]
     """
 
+    # Set by fit / fit_from_model; reading it before then raises NotFittedError.
+    rate_maps: FittedAttribute[PlaceFieldRateMaps] = FittedAttribute()
+
     def __init__(
         self,
         dt: float,
@@ -1725,11 +1729,9 @@ class PositionDecoder:
         self.max_newton_iter = int(max_newton_iter)
         self.adaptive_inflation = adaptive_inflation
 
-        self.rate_maps: PlaceFieldRateMaps | None = None
-
     def __repr__(self) -> str:
-        fitted = self.rate_maps is not None
-        n_neurons = self.rate_maps.n_neurons if self.rate_maps is not None else "?"
+        fitted = is_set(self, "rate_maps")
+        n_neurons = self.rate_maps.n_neurons if fitted else "?"
         return f"PositionDecoder(dt={self.dt}, n_neurons={n_neurons}, fitted={fitted})"
 
     def fit(
@@ -1814,8 +1816,8 @@ class PositionDecoder:
         -------
         DecoderResult
         """
-        if self.rate_maps is None:
-            raise RuntimeError(
+        if not is_set(self, "rate_maps"):
+            raise NotFittedError(
                 "PositionDecoder.decode() called before fitting. "
                 "Call decoder.fit(position, spikes) or "
                 "decoder.fit_from_model(model) first."

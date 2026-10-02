@@ -37,6 +37,7 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.exceptions import NotFittedError
+from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.parameter_transforms import (
     POSITIVE,
     UNCONSTRAINED,
@@ -942,6 +943,21 @@ class ContingencyBeliefModel(SGDFittableMixin):
         different EM starting points.
     """
 
+    # Fitted state, set by fit() / fit_sgd(); reading one before raises
+    # NotFittedError. Posteriors are (n_trials, n_states).
+    state_posterior_: FittedAttribute[Array] = FittedAttribute()
+    smoothed_state_posterior_: FittedAttribute[Array] = FittedAttribute()
+    _smoother_result: FittedAttribute[SmootherResult] = FittedAttribute()
+    log_likelihood_: FittedAttribute[float] = FittedAttribute()
+    _n_trials: FittedAttribute[int] = FittedAttribute()
+
+    # Uncertainty summaries, each (n_trials,).
+    belief_entropy_: FittedAttribute[Array] = FittedAttribute()
+    predicted_reward_mean_: FittedAttribute[Array] = FittedAttribute()
+    predicted_reward_variance_: FittedAttribute[Array] = FittedAttribute()
+    surprise_: FittedAttribute[Array] = FittedAttribute()
+    change_point_probability_: FittedAttribute[Array] = FittedAttribute()
+
     def __init__(
         self,
         n_states: int,
@@ -1029,7 +1045,6 @@ class ContingencyBeliefModel(SGDFittableMixin):
             init_logits[None, :, :]  # (1, n_states, n_states - 1)
         )
         self._transition_design_matrix: Array | None = None
-        self.converged_: bool | None = None
 
         # Observation-side covariates for action biases
         self.obs_weights_: Array | None
@@ -1042,24 +1057,9 @@ class ContingencyBeliefModel(SGDFittableMixin):
             self.obs_weights_ = None
         self._obs_design_matrix: Array | None = None
 
-        # Fitted state (public attributes per plan)
-        self.state_posterior_: Array | None = None
-        self.smoothed_state_posterior_: Array | None = None
-        self._smoother_result: SmootherResult | None = None
-        self.log_likelihood_: float | None = None
-        self.log_likelihood_history_: list[float] | None = None
-        self._n_trials: int | None = None
-
-        # Uncertainty summaries
-        self.belief_entropy_: Array | None = None
-        self.predicted_reward_mean_: Array | None = None
-        self.predicted_reward_variance_: Array | None = None
-        self.surprise_: Array | None = None
-        self.change_point_probability_: Array | None = None
-
     @property
     def is_fitted(self) -> bool:
-        return self._smoother_result is not None
+        return is_set(self, "_smoother_result")
 
     def _populate_uncertainty(self, choices: Array) -> None:
         """Compute uncertainty summaries from fitted posteriors."""
@@ -1070,7 +1070,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
             pairwise_change_point_probability,
         )
 
-        if self.smoothed_state_posterior_ is not None:
+        if is_set(self, "smoothed_state_posterior_"):
             self.belief_entropy_ = belief_entropy(self.smoothed_state_posterior_)
             mean, var = bernoulli_mixture_mean_variance(
                 self.smoothed_state_posterior_, self.reward_probs_
@@ -1080,7 +1080,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
         # True per-trial switch probability from the smoother's pairwise joint
         if (
-            self._smoother_result is not None
+            is_set(self, "_smoother_result")
             and self._smoother_result.pairwise_state_prob is not None
         ):
             self.change_point_probability_ = pairwise_change_point_probability(
@@ -1090,7 +1090,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
         # Surprise from PREDICTED (prior) choice probabilities.
         # Uses time-varying transition matrices (from covariates if present)
         # and observation offsets (from obs_design_matrix if present).
-        if self.state_posterior_ is not None:
+        if is_set(self, "state_posterior_"):
             init_prob = jnp.ones(self.n_states) / self.n_states
 
             # Build per-trial transition matrices
@@ -1512,7 +1512,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
     @property
     def _n_timesteps(self) -> int:
-        if self._n_trials is None:
+        if not is_set(self, "_n_trials"):
             raise NotFittedError("Model must be fitted before accessing _n_timesteps.")
         return self._n_trials
 

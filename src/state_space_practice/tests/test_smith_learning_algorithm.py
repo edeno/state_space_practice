@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
+from state_space_practice.fitted_state import is_set
 from state_space_practice.smith_learning_algorithm import (
     DEFAULT_SIGMA_EPSILON,
     SmithLearningModel,
@@ -790,6 +791,16 @@ class TestSmithLearningModelClass:
         """is_fitted should be False before calling fit()."""
         model = SmithLearningModel()
         assert not model.is_fitted
+
+    @pytest.mark.parametrize(
+        "attr", ["smoothed_learning_state_mode", "log_likelihood_", "n_iter_"]
+    )
+    def test_fitted_attribute_unset_before_fit(self, attr: str) -> None:
+        """Fitted outputs raise NotFittedError (and look absent) before fit()."""
+        model = SmithLearningModel()
+        with pytest.raises(NotFittedError, match=attr):
+            getattr(model, attr)
+        assert not hasattr(model, attr)
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_is_fitted_true_after_fit(self) -> None:
@@ -2209,11 +2220,11 @@ class TestSmithEMRollback:
 
         assert any("non-finite" in r.message.lower() for r in caplog.records)
         assert lls == []
-        assert model.log_likelihood_ is None and model.n_iter_ == 0
+        assert not is_set(model, "log_likelihood_") and model.n_iter_ == 0
         # The NaN posteriors are cleared rather than left looking fitted.
         assert not model.is_fitted
-        assert model.smoothed_prob_correct_response is None
-        assert model.filtered_prob_correct_response is None
+        assert not is_set(model, "smoothed_prob_correct_response")
+        assert not is_set(model, "filtered_prob_correct_response")
 
     @pytest.mark.slow
     def test_nonfinite_later_e_step_rolls_back_to_last_accepted(self, caplog) -> None:

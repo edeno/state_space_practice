@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from jax.typing import ArrayLike
 
 from state_space_practice.exceptions import StateSpaceWarning
+from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.utils import (
     contains_tracer,
     debug_print_if,
@@ -1432,6 +1433,14 @@ class DirectedInfluenceDynamicsMixin:
     _pre_m_step_dynamics: dict[str, jax.Array] | None
     process_cov: jax.Array
 
+    # E-step outputs read by the M-step objective, declared exactly as the
+    # hosts declare them (set by fitting; NotFittedError before then).
+    smoother_state_cond_mean: FittedAttribute[jax.Array] = FittedAttribute()
+    smoother_state_cond_cov: FittedAttribute[jax.Array] = FittedAttribute()
+    smoother_joint_discrete_state_prob: FittedAttribute[jax.Array] = FittedAttribute()
+    smoother_pair_cond_cross_cov: FittedAttribute[jax.Array] = FittedAttribute()
+    smoother_pair_cond_means: FittedAttribute[jax.Array] = FittedAttribute()
+
     _PUBLIC_DYNAMICS_ATTRS = (
         "continuous_transition_matrix",
         "freqs",
@@ -1575,11 +1584,11 @@ class DirectedInfluenceDynamicsMixin:
         )
 
         gamma1, beta = compute_transition_sufficient_stats(
-            state_cond_smoother_means=self.smoother_state_cond_mean,  # type: ignore[attr-defined]
-            state_cond_smoother_covs=self.smoother_state_cond_cov,  # type: ignore[attr-defined]
-            smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,  # type: ignore[attr-defined]
-            pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,  # type: ignore[attr-defined]
-            pair_cond_smoother_means=self.smoother_pair_cond_means,  # type: ignore[attr-defined]
+            state_cond_smoother_means=self.smoother_state_cond_mean,
+            state_cond_smoother_covs=self.smoother_state_cond_cov,
+            smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
+            pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
+            pair_cond_smoother_means=self.smoother_pair_cond_means,
             pair_cond_smoother_covs=getattr(self, "smoother_pair_cond_covs", None),
             next_pair_cond_smoother_means=getattr(
                 self, "smoother_next_pair_cond_means", None

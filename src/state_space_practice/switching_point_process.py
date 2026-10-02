@@ -99,6 +99,7 @@ from jax.typing import ArrayLike
 
 from state_space_practice.em_driver import run_em
 from state_space_practice.exceptions import StateSpaceWarning
+from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.oscillator_utils import (
     _matrix_to_oscillator_blocks,
     _oscillator_blocks_to_matrix,
@@ -2591,6 +2592,18 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         "update_init_cov": "P0",
     }
 
+    # Smoother results, set by the E-step (and the warm-start placeholders in
+    # ``BaseSwitchingPointProcessModel``); NotFittedError before then.
+    smoother_state_cond_mean: FittedAttribute[Array] = FittedAttribute()
+    smoother_state_cond_cov: FittedAttribute[Array] = FittedAttribute()
+    smoother_discrete_state_prob: FittedAttribute[Array] = FittedAttribute()
+    smoother_joint_discrete_state_prob: FittedAttribute[Array] = FittedAttribute()
+    smoother_pair_cond_cross_cov: FittedAttribute[Array] = FittedAttribute()
+    smoother_pair_cond_means: FittedAttribute[Array] = FittedAttribute()
+    # Populated only by the GPB2 smoother; None under GPB1.
+    smoother_pair_cond_covs: FittedAttribute[Array | None] = FittedAttribute()
+    smoother_next_pair_cond_means: FittedAttribute[Array | None] = FittedAttribute()
+
     def __init__(
         self,
         n_oscillators: int,
@@ -2703,17 +2716,6 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         self.continuous_transition_matrix: Array
         self.process_cov: Array
         self.spike_params: SpikeObsParams
-
-        # Placeholders for smoother results (computed in E-step)
-        self.smoother_state_cond_mean: Array
-        self.smoother_state_cond_cov: Array
-        self.smoother_discrete_state_prob: Array
-        self.smoother_joint_discrete_state_prob: Array
-        self.smoother_pair_cond_cross_cov: Array
-        self.smoother_pair_cond_means: Array | None
-        # Populated only by the GPB2 smoother; None under GPB1.
-        self.smoother_pair_cond_covs: Array | None
-        self.smoother_next_pair_cond_means: Array | None
 
     def __repr__(self) -> str:
         """Return string representation of the model."""

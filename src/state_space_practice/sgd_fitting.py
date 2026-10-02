@@ -33,6 +33,7 @@ import optax
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.parameter_transforms import (
     ParameterTransform,
     transform_to_constrained,
@@ -404,9 +405,9 @@ class SGDFittableMixin:
     #: ``{**Parent._sgd_param_attrs, "key": "attr"}``.
     _sgd_param_attrs: ClassVar[Mapping[str, str]] = {}
 
-    converged_: bool | None = None
-    loss_history_: list[float] | None = None
-    log_likelihood_history_: list[float] | None = None
+    # Set by fitting; reading one before then raises NotFittedError.
+    converged_: FittedAttribute[bool] = FittedAttribute()
+    log_likelihood_history_: FittedAttribute[list[float]] = FittedAttribute()
 
     def _build_param_spec(
         self,

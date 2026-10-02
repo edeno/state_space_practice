@@ -15,6 +15,7 @@ import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.hamiltonian_core import (
     default_init_mean,
     gaussian_measurement_update,
@@ -436,6 +437,11 @@ class SwitchingHamiltonianJointModel(_JointHamiltonianBase):
         "Z": "discrete_transition_matrix",
         "init_pi": "init_discrete_state_prob",
     }
+
+    # Discrete-state probabilities (n_time, n_discrete_states) set by
+    # ``_finalize_sgd``; NotFittedError before then.
+    filtered_discrete_probs_: FittedAttribute[Array] = FittedAttribute()
+    smoothed_discrete_probs_: FittedAttribute[Array] = FittedAttribute()
 
     def __init__(
         self,

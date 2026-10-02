@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.switching_choice import (
     SwitchingChoiceModel,
     _softmax_predict_and_update,
@@ -579,6 +580,20 @@ class TestSwitchingChoiceModel:
         assert not model.is_fitted
         model.fit(choices, max_iter=3)
         assert model.is_fitted
+
+    @pytest.mark.parametrize(
+        "attr",
+        [
+            "log_likelihood_",
+            "smoothed_discrete_probs_",
+            "per_state_predicted_variances_",
+        ],
+    )
+    def test_fitted_attribute_unavailable_before_fit(self, attr):
+        model = SwitchingChoiceModel(n_options=3, n_discrete_states=2)
+        with pytest.raises(NotFittedError, match=attr):
+            getattr(model, attr)
+        assert not hasattr(model, attr)
 
     def test_discrete_state_posterior_shape(self):
         from state_space_practice.switching_choice import SwitchingChoiceModel

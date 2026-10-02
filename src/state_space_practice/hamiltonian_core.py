@@ -43,6 +43,7 @@ import jax.scipy.linalg
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.kalman import joseph_form_update
 from state_space_practice.nonlinear_dynamics import (
     apply_mlp,
@@ -607,6 +608,17 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
     _has_discrete_states: ClassVar[bool] = False
 
     _sgd_param_attrs = {"mlp": "mlp_params", "omega": "omega"}
+
+    # Filter / smoother outputs set by ``_finalize_sgd`` after ``fit_sgd``;
+    # reading one before then raises NotFittedError. The single-regime models
+    # store ``(n_time, n_latent)`` means and ``(n_time, n_latent, n_latent)``
+    # covariances; the switching model adds a trailing discrete-state axis.
+    filtered_means_: FittedAttribute[Array] = FittedAttribute()
+    filtered_covs_: FittedAttribute[Array] = FittedAttribute()
+    smoothed_means_: FittedAttribute[Array] = FittedAttribute()
+    smoothed_covs_: FittedAttribute[Array] = FittedAttribute()
+    #: Summed marginal log-likelihood of the filter at the fitted parameters.
+    log_likelihood_: FittedAttribute[float] = FittedAttribute()
 
     def __init__(
         self,

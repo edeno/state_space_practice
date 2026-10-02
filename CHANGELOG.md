@@ -144,6 +144,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **Reading a fitted attribute before fitting raises `NotFittedError`**
+  instead of returning `None` (or a bare `AttributeError`). Fitted outputs of
+  every model (smoothed/filtered states, posteriors, log likelihoods,
+  histories, ...) are declared with the new `fitted_state.FittedAttribute`,
+  so type checkers see `Array` rather than `Array | None`. The error is also an
+  `AttributeError`, so `hasattr(model, "smoother_mean")` is `False` before
+  fitting; `fitted_state.is_set(model, name)` tests without raising. Values
+  that can legitimately be `None` after fitting (e.g. covariate weights of a
+  model without covariates, GPB2-only smoother outputs under GPB1, `n_iter_`
+  after an SGD-only fit) keep `None`. `PointProcessModel` and `PositionDecoder`
+  raise `NotFittedError` (a `RuntimeError`) where they raised `RuntimeError`.
 - **Subclasses that could not stand in for their parent no longer inherit
   from it**: `CovariateChoiceModel` takes covariates positionally after
   `choices` in `fit` / `fit_sgd`, so it now derives from the shared

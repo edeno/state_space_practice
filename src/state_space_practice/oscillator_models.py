@@ -47,6 +47,7 @@ from numpy.typing import NDArray
 
 from state_space_practice.em_driver import run_em
 from state_space_practice.exceptions import NotFittedError
+from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.oscillator_utils import (
     DirectedInfluenceDynamicsMixin,
     canonicalize_correlated_noise_pair_parameters,
@@ -192,8 +193,24 @@ class OscillatorParameterBase:
         Observation matrix (n_obs_dim, n_cont_states, n_discrete_states).
     measurement_cov : jax.Array
         Observation noise (n_obs_dim, n_obs_dim, n_discrete_states).
+    smoother_state_cond_mean : jax.Array
+        Smoothed state-conditional means (n_time, n_cont_states, n_discrete_states).
+    smoother_state_cond_cov : jax.Array
+        Smoothed state-conditional covariances
+        (n_time, n_cont_states, n_cont_states, n_discrete_states).
+    smoother_discrete_state_prob : jax.Array
+        Smoothed discrete-state probabilities (n_time, n_discrete_states).
+
+    The smoother attributes are set by fitting; reading one before then, or
+    after a failed E-step cleared it, raises ``NotFittedError``.
 
     """
+
+    # Smoother posteriors read by decode()/predict_proba(). A failed E-step
+    # reset (see BaseModel._clear_smoother_state) unsets them again.
+    smoother_state_cond_mean: FittedAttribute[jax.Array] = FittedAttribute()
+    smoother_state_cond_cov: FittedAttribute[jax.Array] = FittedAttribute()
+    smoother_discrete_state_prob: FittedAttribute[jax.Array] = FittedAttribute()
 
     def __init__(
         self,
@@ -221,13 +238,6 @@ class OscillatorParameterBase:
         self.process_cov: jax.Array
         self.measurement_matrix: jax.Array
         self.measurement_cov: jax.Array
-
-        # Smoother posteriors read by decode()/predict_proba(). Optional
-        # because a failed E-step reset (see BaseModel._clear_smoother_state)
-        # sets them to None so those guards fire.
-        self.smoother_state_cond_mean: jax.Array | None
-        self.smoother_state_cond_cov: jax.Array | None
-        self.smoother_discrete_state_prob: jax.Array | None
 
     def _repr_core_params(self) -> list[str]:
         """``key=value`` strings for the dimensions shown by ``__repr__``."""
@@ -283,10 +293,7 @@ class OscillatorParameterBase:
         -------
         jax.Array, shape (n_time, n_discrete_states)
         """
-        if (
-            not hasattr(self, "smoother_discrete_state_prob")
-            or self.smoother_discrete_state_prob is None
-        ):
+        if not is_set(self, "smoother_discrete_state_prob"):
             # Worded without naming a fitting method: the EM models fit with
             # ``fit`` / ``fit_sgd``, the Hamiltonian family with ``fit_sgd`` only.
             raise NotFittedError(
@@ -447,6 +454,18 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         "_current_osc_params",
     )
 
+    # Pairwise smoother results (Expected Sufficient Statistics - ESS) only
+    # the EM M-step consumes; the marginal ones are declared on
+    # OscillatorParameterBase. Set by the E-step and unset again by a failed
+    # E-step reset (see _clear_smoother_state).
+    smoother_joint_discrete_state_prob: FittedAttribute[jax.Array] = FittedAttribute()
+    smoother_pair_cond_cross_cov: FittedAttribute[jax.Array] = FittedAttribute()
+    # E[x | S_t=i, S_{t+1}=j]
+    smoother_pair_cond_means: FittedAttribute[jax.Array] = FittedAttribute()
+    # Populated only by the GPB2 smoother; None under GPB1.
+    smoother_pair_cond_covs: FittedAttribute[jax.Array | None] = FittedAttribute()
+    smoother_next_pair_cond_means: FittedAttribute[jax.Array | None] = FittedAttribute()
+
     def __init__(
         self,
         n_oscillators: int,
@@ -532,16 +551,6 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         self.update_init_mean = update_init_mean
         self.update_init_cov = update_init_cov
 
-        # Placeholders for the pairwise smoother results (Expected Sufficient
-        # Statistics - ESS) only the EM M-step consumes; the marginal ones are
-        # declared on OscillatorParameterBase. Optional because a failed
-        # E-step reset (see _clear_smoother_state) sets them to None.
-        self.smoother_joint_discrete_state_prob: jax.Array | None
-        self.smoother_pair_cond_cross_cov: jax.Array | None
-        self.smoother_pair_cond_means: jax.Array | None  # E[x|S_t=i,S_{t+1}=j]
-        self.smoother_pair_cond_covs: jax.Array | None
-        self.smoother_next_pair_cond_means: jax.Array | None
-
     def _snapshot_em_state(self) -> dict[str, object]:
         """Capture parameters and smoother outputs for EM rollback.
 
@@ -562,9 +571,16 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         return snapshot
 
     def _restore_em_state(self, state: dict[str, object]) -> None:
-        """Restore a state captured by _snapshot_em_state."""
-        for key, value in state.items():
-            setattr(self, key, value)
+        """Restore a state captured by _snapshot_em_state.
+
+        A key absent from the snapshot was unset when it was taken (e.g. the
+        smoother outputs before the first E-step), so it is unset again.
+        """
+        for key in self._EM_SNAPSHOT_KEYS:
+            if key in state:
+                setattr(self, key, state[key])
+            elif is_set(self, key):
+                delattr(self, key)
 
     def _clear_smoother_state(self) -> None:
         """Drop smoother posteriors so decode()/predict_proba() fail loudly.
@@ -572,18 +588,18 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         Used when EM cannot produce a usable posterior (e.g. a non-finite
         first E-step with no earlier accepted state to roll back to). Without
         this the NaN posteriors installed by the failed E-step would remain,
-        and decode()/predict_proba() -- whose guards catch a missing/None
-        attribute but not a NaN-filled array -- would silently return garbage
-        (argmax of NaN). Setting the attributes to None makes those guards fire.
+        and decode()/predict_proba() -- whose guards catch an unset attribute
+        but not a NaN-filled array -- would silently return garbage (argmax of
+        NaN). Unsetting the attributes makes those guards fire.
         """
-        self.smoother_discrete_state_prob = None
-        self.smoother_joint_discrete_state_prob = None
-        self.smoother_state_cond_mean = None
-        self.smoother_state_cond_cov = None
-        self.smoother_pair_cond_cross_cov = None
-        self.smoother_pair_cond_means = None
-        self.smoother_pair_cond_covs = None
-        self.smoother_next_pair_cond_means = None
+        del self.smoother_discrete_state_prob
+        del self.smoother_joint_discrete_state_prob
+        del self.smoother_state_cond_mean
+        del self.smoother_state_cond_cov
+        del self.smoother_pair_cond_cross_cov
+        del self.smoother_pair_cond_means
+        del self.smoother_pair_cond_covs
+        del self.smoother_next_pair_cond_means
 
     def __repr__(self) -> str:
         """Returns an unambiguous string representation of the model.
@@ -1004,13 +1020,6 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
             The sequence of observations.
         """
         obs_arr: jax.Array = jnp.asarray(observations)
-        # The M-step always follows a populated E-step, so the smoother ESS are
-        # non-None here (the failed-EM reset only runs before any M-step).
-        assert self.smoother_state_cond_mean is not None
-        assert self.smoother_state_cond_cov is not None
-        assert self.smoother_discrete_state_prob is not None
-        assert self.smoother_joint_discrete_state_prob is not None
-        assert self.smoother_pair_cond_cross_cov is not None
         (
             A,
             H,
@@ -1094,8 +1103,6 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         switching Kalman M-step returns state-specific ``R_j`` values; weighting
         them by state responsibilities recovers the pooled update.
         """
-        # Called from the M-step, after a populated E-step.
-        assert self.smoother_discrete_state_prob is not None
         state_weights = jnp.sum(self.smoother_discrete_state_prob, axis=0)
         total_weight = jnp.maximum(jnp.sum(state_weights), 1e-12)
         pooled = jnp.einsum("j,abj->ab", state_weights, per_state_cov) / total_weight
@@ -1670,12 +1677,6 @@ class CorrelatedNoiseModel(BaseModel):
 
     def _m_step_constrained_process_covariance(self) -> None:
         """Install the exact fixed-A, PSD, jointly constrained CNM Q update."""
-        assert self.smoother_state_cond_mean is not None
-        assert self.smoother_state_cond_cov is not None
-        assert self.smoother_discrete_state_prob is not None
-        assert self.smoother_joint_discrete_state_prob is not None
-        assert self.smoother_pair_cond_cross_cov is not None
-
         residual_scatter, state_counts = compute_process_covariance_sufficient_stats(
             continuous_transition_matrix=self.continuous_transition_matrix,
             state_cond_smoother_means=self.smoother_state_cond_mean,
@@ -2068,13 +2069,6 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
             The sequence of observations.
         """
         obs_arr: jax.Array = jnp.asarray(observations)
-        # The M-step always follows a populated E-step, so the smoother ESS are
-        # non-None here (the failed-EM reset only runs before any M-step).
-        assert self.smoother_state_cond_mean is not None
-        assert self.smoother_state_cond_cov is not None
-        assert self.smoother_discrete_state_prob is not None
-        assert self.smoother_joint_discrete_state_prob is not None
-        assert self.smoother_pair_cond_cross_cov is not None
         # First, run the standard M-step for all parameters except A
         (
             _,  # A - we'll compute this ourselves

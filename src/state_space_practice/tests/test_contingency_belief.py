@@ -19,6 +19,7 @@ from state_space_practice.contingency_belief import (
     contingency_belief_smoother,
     transition_logits_to_matrix,
 )
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.tests.recovery_helpers import (
     assert_ll_improves,
     state_segmentation_accuracy,
@@ -551,6 +552,16 @@ def _simulate_block_bandit(n_trials=100, n_options=3, seed=42):
 
 
 class TestContingencyBeliefModel:
+    @pytest.mark.parametrize(
+        "attr", ["log_likelihood_", "smoothed_state_posterior_", "surprise_"]
+    )
+    def test_fitted_attribute_unavailable_before_fit(self, attr):
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        assert not model.is_fitted
+        with pytest.raises(NotFittedError, match=attr):
+            getattr(model, attr)
+        assert not hasattr(model, attr)
+
     def test_fit_improves_ll(self):
         choices, rewards, _, _ = _simulate_block_bandit(n_trials=80)
         model = ContingencyBeliefModel(n_states=2, n_options=3)

@@ -69,6 +69,7 @@ from jax.typing import ArrayLike
 
 from state_space_practice.em_driver import run_em
 from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
+from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.multinomial_choice import (
     _ARMIJO_C,
     _NEWTON_STEP_SIZES,
@@ -1449,28 +1450,31 @@ class SmithLearningModel(SGDFittableMixin):
         Initial learning state estimate (updated during EM).
     init_learning_variance : float
         Initial learning state variance (updated during EM).
-    filtered_prob_correct_response : Optional[jax.Array]
+    filtered_prob_correct_response : jax.Array
         Filtered probability of correct response, shape ``(n_trials,)``.
-    filtered_learning_state_mode : Optional[jax.Array]
+    filtered_learning_state_mode : jax.Array
         Filtered learning state mode, shape ``(n_trials,)``.
-    filtered_learning_state_variance : Optional[jax.Array]
+    filtered_learning_state_variance : jax.Array
         Filtered learning state variance, shape ``(n_trials,)``.
-    filtered_one_step_mode : Optional[jax.Array]
+    filtered_one_step_mode : jax.Array
         One-step-ahead predicted mode, shape ``(n_trials,)``.
-    filtered_one_step_variance : Optional[jax.Array]
+    filtered_one_step_variance : jax.Array
         One-step-ahead predicted variance, shape ``(n_trials,)``.
-    smoothed_learning_state_mode : Optional[jax.Array]
+    smoothed_learning_state_mode : jax.Array
         Smoothed learning state mode, shape ``(n_trials,)``.
-    smoothed_learning_state_variance : Optional[jax.Array]
+    smoothed_learning_state_variance : jax.Array
         Smoothed learning state variance, shape ``(n_trials,)``.
-    smoothed_prob_correct_response : Optional[jax.Array]
+    smoothed_prob_correct_response : jax.Array
         Smoothed probability of correct response, shape ``(n_trials,)``.
-    smoother_gain : Optional[jax.Array]
+    smoother_gain : jax.Array
         Smoother gain, shape ``(n_trials - 1,)``.
-    log_likelihood_ : Optional[float]
+    log_likelihood_ : float
         Final log-likelihood after fitting.
-    n_iter_ : Optional[int]
+    n_iter_ : int
         Number of EM iterations performed.
+
+    The filtered/smoothed estimates and fit diagnostics are set by ``fit`` /
+    ``fit_sgd``; reading one before then raises ``NotFittedError``.
 
     References
     ----------
@@ -1479,6 +1483,24 @@ class SmithLearningModel(SGDFittableMixin):
     Dynamic analysis of learning in behavioral experiments.
     Journal of Neuroscience, 24(2), 447-461.
     """
+
+    # Filter/smoother outputs, set by each E-step.
+    filtered_prob_correct_response: FittedAttribute[Array] = FittedAttribute()
+    filtered_learning_state_mode: FittedAttribute[Array] = FittedAttribute()
+    filtered_learning_state_variance: FittedAttribute[Array] = FittedAttribute()
+    filtered_one_step_mode: FittedAttribute[Array] = FittedAttribute()
+    filtered_one_step_variance: FittedAttribute[Array] = FittedAttribute()
+    smoothed_learning_state_mode: FittedAttribute[Array] = FittedAttribute()
+    smoothed_learning_state_variance: FittedAttribute[Array] = FittedAttribute()
+    smoothed_prob_correct_response: FittedAttribute[Array] = FittedAttribute()
+    smoother_gain: FittedAttribute[Array] = FittedAttribute()  # (n_trials - 1,)
+
+    # Fit diagnostics. ``n_iter_`` is set by EM only.
+    log_likelihood_: FittedAttribute[float] = FittedAttribute()
+    n_iter_: FittedAttribute[int] = FittedAttribute()
+    _n_trials_: FittedAttribute[int] = FittedAttribute()
+    # ``max_possible_correct`` resolved against the data passed to fit_sgd.
+    _resolved_max_correct: FittedAttribute[Array] = FittedAttribute()
 
     def __init__(
         self,
@@ -1570,24 +1592,6 @@ class SmithLearningModel(SGDFittableMixin):
 
         self.initial_state_method = initial_state_method
 
-        # Attributes to store filter/smoother outputs
-        self.filtered_prob_correct_response: jax.Array | None = None
-        self.filtered_learning_state_mode: jax.Array | None = None
-        self.filtered_learning_state_variance: jax.Array | None = None
-        self.filtered_one_step_mode: jax.Array | None = None
-        self.filtered_one_step_variance: jax.Array | None = None
-
-        self.smoothed_learning_state_mode: jax.Array | None = None
-        self.smoothed_learning_state_variance: jax.Array | None = None
-        self.smoothed_prob_correct_response: jax.Array | None = None
-        self.smoother_gain: jax.Array | None = None  # Has shape (n_trials-1,)
-
-        # Fit diagnostics
-        self.log_likelihood_: float | None = None
-        self.n_iter_: int | None = None
-        self.log_likelihood_history_: list[float] | None = None
-        self._n_trials_: int | None = None
-
     def __repr__(self) -> str:
         fitted = "fitted" if self.is_fitted else "not fitted"
         return (
@@ -1603,9 +1607,9 @@ class SmithLearningModel(SGDFittableMixin):
     def is_fitted(self) -> bool:
         """Whether the model has been fitted."""
         return (
-            self.smoothed_learning_state_mode is not None
-            and self.smoothed_learning_state_variance is not None
-            and self.smoother_gain is not None
+            is_set(self, "smoothed_learning_state_mode")
+            and is_set(self, "smoothed_learning_state_variance")
+            and is_set(self, "smoother_gain")
         )
 
     def _calculate_mu_bias(self, prob_correct_by_chance: float) -> float:
@@ -1737,9 +1741,6 @@ class SmithLearningModel(SGDFittableMixin):
         """
         if not self.is_fitted:
             raise RuntimeError("Must run E-step before M-step")
-        assert self.smoothed_learning_state_mode is not None
-        assert self.smoothed_learning_state_variance is not None
-        assert self.smoother_gain is not None
 
         (
             sigma_epsilon_new,
@@ -1763,10 +1764,7 @@ class SmithLearningModel(SGDFittableMixin):
             self.init_learning_state = 0.0
             self.init_learning_variance = float(self.sigma_epsilon**2)
         elif self.initial_state_method == "set_initial_conservative_from_second_trial":
-            if (
-                self.smoothed_learning_state_mode is not None
-                and len(self.smoothed_learning_state_mode) > 1
-            ):
+            if len(self.smoothed_learning_state_mode) > 1:
                 self.init_learning_state = float(
                     0.5 * self.smoothed_learning_state_mode[1]
                 )  # x_{1|T}
@@ -1784,9 +1782,7 @@ class SmithLearningModel(SGDFittableMixin):
             # Not from Smith et al. (2004); may not converge to same fixed point
             # as "reestimate_initial_from_data".
             if (
-                self.smoothed_learning_state_mode is not None
-                and len(self.smoothed_learning_state_mode) > 1
-                and self.smoothed_learning_state_variance is not None
+                len(self.smoothed_learning_state_mode) > 1
                 and len(self.smoothed_learning_state_variance) > 1
             ):
                 self.init_learning_state = float(
@@ -1885,18 +1881,21 @@ class SmithLearningModel(SGDFittableMixin):
         )
 
         def _capture_state() -> dict[str, object]:
-            return {k: getattr(self, k, None) for k in snapshot_keys}
+            # Unset fitted attributes are left out and unset again on restore.
+            return {k: getattr(self, k) for k in snapshot_keys if hasattr(self, k)}
 
         def _restore_state(state: dict[str, object]) -> None:
-            for k, v in state.items():
-                if v is not None:
-                    setattr(self, k, v)
+            for k in snapshot_keys:
+                if k in state:
+                    setattr(self, k, state[k])
+                else:
+                    delattr(self, k)
 
         def _clear_posteriors() -> None:
             # A non-finite first E-step leaves nothing to roll back to: drop
             # its NaN filter/smoother outputs so the model reads as unfitted.
             for k in posterior_keys:
-                setattr(self, k, None)
+                delattr(self, k)
 
         def _on_iteration(iteration: int, ll: float, change: float) -> None:
             # verbose=True surfaces per-iteration progress at INFO; otherwise DEBUG.
@@ -1929,7 +1928,10 @@ class SmithLearningModel(SGDFittableMixin):
             logger.info("Converged. sigma_epsilon=%.4g", self.sigma_epsilon)
 
         # Store fit diagnostics
-        self.log_likelihood_ = log_likelihoods[-1] if log_likelihoods else None
+        if log_likelihoods:
+            self.log_likelihood_ = log_likelihoods[-1]
+        else:
+            del self.log_likelihood_
         self.n_iter_ = len(log_likelihoods)
         self.log_likelihood_history_ = log_likelihoods
         self._n_trials_ = len(n_correct_responses)
@@ -1990,7 +1992,7 @@ class SmithLearningModel(SGDFittableMixin):
 
     @property
     def _n_timesteps(self) -> int:
-        if self._n_trials_ is None:
+        if not is_set(self, "_n_trials_"):
             raise NotFittedError("Model must be fitted before accessing _n_timesteps.")
         return self._n_trials_
 
@@ -2110,8 +2112,6 @@ class SmithLearningModel(SGDFittableMixin):
         """
         if not self.is_fitted:
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
-        assert self.smoothed_learning_state_mode is not None
-        assert self.smoothed_learning_state_variance is not None
 
         return calculate_probability_confidence_limits(
             key=key,
@@ -2156,8 +2156,6 @@ class SmithLearningModel(SGDFittableMixin):
         """
         if not self.is_fitted:
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
-        assert self.smoothed_learning_state_mode is not None
-        assert self.smoothed_learning_state_variance is not None
 
         return calculate_latent_state_percentiles(
             key=key,
@@ -2482,7 +2480,6 @@ class SmithLearningModel(SGDFittableMixin):
 
         import matplotlib.pyplot as plt
 
-        assert self.smoothed_learning_state_mode is not None
         n_trials = len(self.smoothed_learning_state_mode)
         trials_axis = jnp.arange(n_trials)
 
@@ -2672,9 +2669,6 @@ class SmithLearningModel(SGDFittableMixin):
         """
         if not self.is_fitted:
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
-        assert self.smoothed_learning_state_mode is not None
-        assert self.smoothed_learning_state_variance is not None
-        assert self.smoother_gain is not None
 
         n_trials = len(self.smoothed_learning_state_mode)
         if not (0 <= trial1 < n_trials and 0 <= trial2 < n_trials):
@@ -2743,9 +2737,6 @@ class SmithLearningModel(SGDFittableMixin):
         """
         if not self.is_fitted:
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
-        assert self.smoothed_learning_state_mode is not None
-        assert self.smoothed_learning_state_variance is not None
-        assert self.smoother_gain is not None
 
         prob_chance = self.prob_correct_by_chance if compare_probability else None
 
@@ -2839,8 +2830,8 @@ class SmithLearningModel(SGDFittableMixin):
         """
         if (
             not self.is_fitted
-            or self.log_likelihood_ is None
-            or self._n_trials_ is None
+            or not is_set(self, "log_likelihood_")
+            or not is_set(self, "_n_trials_")
         ):
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
         n_params = 3  # sigma_epsilon, init_learning_state, init_learning_variance
@@ -2884,7 +2875,7 @@ class SmithLearningModel(SGDFittableMixin):
         ValueError
             If ``n_correct_responses`` is not provided and cannot be inferred.
         """
-        if not self.is_fitted or self.log_likelihood_ is None:
+        if not self.is_fitted or not is_set(self, "log_likelihood_"):
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         if n_correct_responses is None:
@@ -2958,7 +2949,7 @@ class SmithLearningModel(SGDFittableMixin):
             f"  init_learning_variance: {self.init_learning_variance:.4g}",
             f"  initial_state_method:   {self.initial_state_method}",
             "",
-            f"  EM iterations:          {self.n_iter_}",
+            f"  EM iterations:          {self.n_iter_ if is_set(self, 'n_iter_') else None}",
             f"  Log-likelihood:         {self.log_likelihood_:.4f}",
             f"  BIC:                    {self.bic():.4f}",
             f"  N trials:               {self._n_trials_}",
@@ -3153,7 +3144,7 @@ class SmithLearningModel(SGDFittableMixin):
         NotFittedError
             If the model has not been fitted.
         """
-        if self.log_likelihood_history_ is None:
+        if not is_set(self, "log_likelihood_history_"):
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         import matplotlib.pyplot as plt
@@ -3213,7 +3204,6 @@ class SmithLearningModel(SGDFittableMixin):
 
         fig, axes = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
 
-        assert self.smoothed_learning_state_mode is not None
         n_trials = len(self.smoothed_learning_state_mode)
         trials_axis = jnp.arange(n_trials)
         plot_percentiles = jnp.array([5.0, 50.0, 95.0])
@@ -3311,7 +3301,7 @@ class SmithLearningModel(SGDFittableMixin):
 
         # --- Panel 3: EM convergence ---
         ax = axes[2]
-        if self.log_likelihood_history_:
+        if is_set(self, "log_likelihood_history_") and self.log_likelihood_history_:
             iterations = range(1, len(self.log_likelihood_history_) + 1)
             ax.plot(
                 iterations,

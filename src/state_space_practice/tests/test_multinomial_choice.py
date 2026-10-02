@@ -426,6 +426,15 @@ class TestMultinomialChoiceModel:
         model.fit(rng.integers(0, 3, size=50), max_iter=2)
         assert model.is_fitted
 
+    @pytest.mark.parametrize(
+        "attr", ["log_likelihood_", "surprise_", "smoothed_option_variances_"]
+    )
+    def test_fitted_attribute_unavailable_before_fit(self, attr):
+        model = MultinomialChoiceModel(n_options=3)
+        with pytest.raises(NotFittedError, match=attr):
+            getattr(model, attr)
+        assert not hasattr(model, attr)
+
     def test_fit_learns_from_deterministic_choices(self):
         """Always choose option 1 -> high inverse_temperature."""
         choices = np.ones(200, dtype=int)

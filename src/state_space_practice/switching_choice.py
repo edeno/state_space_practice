@@ -33,6 +33,7 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.exceptions import NotFittedError
+from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.multinomial_choice import (
     _softmax_update_core,
     _warn_if_newton_unconverged,
@@ -736,6 +737,25 @@ class SwitchingChoiceModel(SGDFittableMixin):
         Per-state starting decays.
     """
 
+    # Fitted state, set by fit() / fit_sgd(); reading one before raises
+    # NotFittedError.
+    _filter_result: FittedAttribute[SwitchingChoiceFilterResult] = FittedAttribute()
+    # Smoothed discrete-state probabilities (T, S) and state-conditional
+    # smoother means (T, K-1, S) and covariances (T, K-1, K-1, S).
+    smoothed_discrete_probs_: FittedAttribute[Array] = FittedAttribute()
+    _smoother_state_cond_means: FittedAttribute[Array] = FittedAttribute()
+    _smoother_state_cond_covs: FittedAttribute[Array] = FittedAttribute()
+    log_likelihood_: FittedAttribute[float] = FittedAttribute()
+    _n_trials: FittedAttribute[int] = FittedAttribute()
+
+    # Uncertainty summaries: (T, K) variances, (T,) entropy and surprise,
+    # (T, K, S) per-state predicted variances.
+    predicted_option_variances_: FittedAttribute[Array] = FittedAttribute()
+    smoothed_option_variances_: FittedAttribute[Array] = FittedAttribute()
+    predicted_choice_entropy_: FittedAttribute[Array] = FittedAttribute()
+    surprise_: FittedAttribute[Array] = FittedAttribute()
+    per_state_predicted_variances_: FittedAttribute[Array] = FittedAttribute()
+
     def __init__(
         self,
         n_options: int,
@@ -807,24 +827,9 @@ class SwitchingChoiceModel(SGDFittableMixin):
         self._covariates: Array | None = None
         self._obs_covariates: Array | None = None
 
-        # Fitted state
-        self.converged_: bool | None = None
-        self._filter_result: SwitchingChoiceFilterResult | None = None
-        self.smoothed_discrete_probs_: Array | None = None
-        self.log_likelihood_: float | None = None
-        self.log_likelihood_history_: list[float] | None = None
-        self._n_trials: int | None = None
-
-        # Uncertainty summaries
-        self.predicted_option_variances_: Array | None = None
-        self.smoothed_option_variances_: Array | None = None
-        self.predicted_choice_entropy_: Array | None = None
-        self.surprise_: Array | None = None
-        self.per_state_predicted_variances_: Array | None = None
-
     @property
     def is_fitted(self) -> bool:
-        return self._filter_result is not None
+        return is_set(self, "_filter_result")
 
     def _populate_uncertainty(self, choices: Array) -> None:
         """Compute uncertainty summaries from filter result."""
@@ -834,7 +839,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
             compute_surprise,
         )
 
-        if self._filter_result is None:
+        if not is_set(self, "_filter_result"):
             return
 
         result = self._filter_result
@@ -880,10 +885,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
         self.predicted_option_variances_ = e_var + var_mean
 
         # Smoothed variances: law of total variance with smoother quantities
-        if (
-            hasattr(self, "_smoother_state_cond_covs")
-            and self._smoother_state_cond_covs is not None
-        ):
+        if is_set(self, "_smoother_state_cond_covs"):
             # See note above on diagonal axis ordering; use einsum to get (T, K-1, S).
             smoother_diag = jnp.einsum(
                 "tiis->tis", self._smoother_state_cond_covs
@@ -892,8 +894,8 @@ class SwitchingChoiceModel(SGDFittableMixin):
             full_sm_vars = jnp.concatenate([zero_ref_sm, smoother_diag], axis=1)
 
             # Smoother state-conditional means
-            smoother_means = getattr(self, "_smoother_state_cond_means", None)
-            if smoother_means is not None:
+            if is_set(self, "_smoother_state_cond_means"):
+                smoother_means = self._smoother_state_cond_means
                 full_sm_means = jnp.concatenate(
                     [
                         jnp.zeros(
@@ -904,7 +906,6 @@ class SwitchingChoiceModel(SGDFittableMixin):
                     axis=1,
                 )  # (T, K, S)
                 sm_disc = self.smoothed_discrete_probs_
-                assert sm_disc is not None
                 sm_e_var = jnp.einsum("tks,ts->tk", full_sm_vars, sm_disc)
                 sm_var_mean = _between_state_variance(full_sm_means, sm_disc)
                 self.smoothed_option_variances_ = sm_e_var + sm_var_mean
@@ -1217,7 +1218,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
 
     @property
     def _n_timesteps(self) -> int:
-        if self._n_trials is None:
+        if not is_set(self, "_n_trials"):
             raise NotFittedError("Model must be fitted before accessing _n_timesteps.")
         return self._n_trials
 

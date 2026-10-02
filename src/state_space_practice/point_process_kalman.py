@@ -45,6 +45,8 @@ from jax.typing import ArrayLike
 from numpy.typing import DTypeLike
 
 from state_space_practice.em_driver import run_em
+from state_space_practice.exceptions import NotFittedError
+from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.kalman import (
     InitialStatePrior,
     _kalman_smoother_update,
@@ -3250,6 +3252,12 @@ class PointProcessModel(SGDFittableMixin):
         Smoothed state covariances after fitting.
     smoother_cross_cov : Array
         Smoothed cross-covariances after fitting.
+    filtered_mean, filtered_cov : Array
+        Filtered state estimates and covariances after fitting.
+    log_likelihood_ : float
+        Marginal log-likelihood at the parameters fitted by :meth:`fit_sgd`.
+
+    Reading a fitted attribute before fitting raises ``NotFittedError``.
 
     References
     ----------
@@ -3257,6 +3265,15 @@ class PointProcessModel(SGDFittableMixin):
         Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
         Neural Computation 16, 971-998.
     """
+
+    # Results, set by fit / fit_sgd.
+    smoother_mean: FittedAttribute[Array] = FittedAttribute()
+    smoother_cov: FittedAttribute[Array] = FittedAttribute()
+    smoother_cross_cov: FittedAttribute[Array] = FittedAttribute()
+    filtered_mean: FittedAttribute[Array] = FittedAttribute()
+    filtered_cov: FittedAttribute[Array] = FittedAttribute()
+    log_likelihood_: FittedAttribute[float] = FittedAttribute()
+    _sgd_n_time: FittedAttribute[int] = FittedAttribute()
 
     def __init__(
         self,
@@ -3325,13 +3342,6 @@ class PointProcessModel(SGDFittableMixin):
         self.update_process_cov = update_process_cov
         self.update_init_state = update_init_state
 
-        # Results (populated after fit)
-        self.smoother_mean: Array | None = None
-        self.smoother_cov: Array | None = None
-        self.smoother_cross_cov: Array | None = None
-        self.filtered_mean: Array | None = None
-        self.filtered_cov: Array | None = None
-
     def _e_step(self, design_matrix: ArrayLike, spike_indicator: ArrayLike) -> float:
         """E-step: Run filter and smoother to estimate latent states.
 
@@ -3376,10 +3386,10 @@ class PointProcessModel(SGDFittableMixin):
 
     def _m_step(self) -> None:
         """M-step: Update model parameters based on smoothed estimates."""
-        if (
-            self.smoother_mean is None
-            or self.smoother_cov is None
-            or self.smoother_cross_cov is None
+        if not (
+            is_set(self, "smoother_mean")
+            and is_set(self, "smoother_cov")
+            and is_set(self, "smoother_cross_cov")
         ):
             raise RuntimeError("Must run E-step before M-step")
 
@@ -3455,32 +3465,37 @@ class PointProcessModel(SGDFittableMixin):
             jnp.asarray(self.init_cov), n_time=spike_indicator.shape[0]
         )
 
+        posterior_keys = (
+            "smoother_mean",
+            "smoother_cov",
+            "smoother_cross_cov",
+            "filtered_mean",
+            "filtered_cov",
+        )
+        snapshot_keys = posterior_keys + (
+            "transition_matrix",
+            "process_cov",
+            "init_mean",
+            "init_cov",
+        )
+
         def _snapshot_state() -> dict[str, Any]:
-            return {
-                "smoother_mean": self.smoother_mean,
-                "smoother_cov": self.smoother_cov,
-                "smoother_cross_cov": self.smoother_cross_cov,
-                "filtered_mean": self.filtered_mean,
-                "filtered_cov": self.filtered_cov,
-                "transition_matrix": self.transition_matrix,
-                "process_cov": self.process_cov,
-                "init_mean": self.init_mean,
-                "init_cov": self.init_cov,
-            }
+            # Unset fitted attributes are left out and unset again on restore.
+            return {k: getattr(self, k) for k in snapshot_keys if hasattr(self, k)}
 
         def _restore_state(state: dict[str, Any]) -> None:
-            for key, value in state.items():
-                setattr(self, key, value)
+            for key in snapshot_keys:
+                if key in state:
+                    setattr(self, key, state[key])
+                else:
+                    delattr(self, key)
 
         def _clear_posteriors() -> None:
             # A non-finite first E-step has no accepted state to roll back
             # to: drop the posteriors it installed so the model reads as
             # unfitted instead of serving NaN output.
-            self.smoother_mean = None
-            self.smoother_cov = None
-            self.smoother_cross_cov = None
-            self.filtered_mean = None
-            self.filtered_cov = None
+            for key in posterior_keys:
+                delattr(self, key)
 
         # A rejected E-step (non-finite or decreasing LL) restores the last
         # accepted (parameters, smoother) pair so get_rate_estimate /
@@ -3686,12 +3701,12 @@ class PointProcessModel(SGDFittableMixin):
         linear Z @ x.
         """
         if use_smoothed:
-            if self.smoother_mean is None:
-                raise RuntimeError("Model has not been fitted yet.")
+            if not is_set(self, "smoother_mean"):
+                raise NotFittedError("Model has not been fitted yet.")
             state_estimate = self.smoother_mean
         else:
-            if self.filtered_mean is None:
-                raise RuntimeError("Model has not been fitted yet.")
+            if not is_set(self, "filtered_mean"):
+                raise NotFittedError("Model has not been fitted yet.")
             state_estimate = self.filtered_mean
 
         design_matrix = jnp.asarray(design_matrix)
@@ -3731,13 +3746,13 @@ class PointProcessModel(SGDFittableMixin):
             Lower and upper bounds of the confidence interval.
         """
         if use_smoothed:
-            if self.smoother_mean is None or self.smoother_cov is None:
-                raise RuntimeError("Model has not been fitted yet.")
+            if not (is_set(self, "smoother_mean") and is_set(self, "smoother_cov")):
+                raise NotFittedError("Model has not been fitted yet.")
             mean = self.smoother_mean
             cov = self.smoother_cov
         else:
-            if self.filtered_mean is None or self.filtered_cov is None:
-                raise RuntimeError("Model has not been fitted yet.")
+            if not (is_set(self, "filtered_mean") and is_set(self, "filtered_cov")):
+                raise NotFittedError("Model has not been fitted yet.")
             mean = self.filtered_mean
             cov = self.filtered_cov
 
