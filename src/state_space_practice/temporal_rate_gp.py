@@ -654,6 +654,9 @@ class TemporalRateGP(SGDFittableMixin):
     log_rate_var_: FittedAttribute[Array] = FittedAttribute()
     log_marginal_likelihood_: FittedAttribute[float] = FittedAttribute()
 
+    # The posterior above, cleared when a fit fails.
+    _fit_output_attrs = ("log_rate_mean_", "log_rate_var_", "log_marginal_likelihood_")
+
     def __init__(
         self,
         dt: float,

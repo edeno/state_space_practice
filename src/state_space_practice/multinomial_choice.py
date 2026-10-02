@@ -46,6 +46,7 @@ from state_space_practice.utils import (
     psd_solve,
     symmetrize,
     typed_jit,
+    validate_int,
 )
 from state_space_practice.utils import validate_choice_indices as _validate_choices
 
@@ -623,6 +624,19 @@ class _MultinomialChoiceBase(SGDFittableMixin):
     predicted_choice_entropy_: FittedAttribute[Array] = FittedAttribute()
     surprise_: FittedAttribute[Array] = FittedAttribute()
 
+    # Everything above a fit writes, cleared when a fit fails.
+    _fit_output_attrs = (
+        "_smoother_result",
+        "predicted_option_values_",
+        "filtered_option_values_",
+        "smoothed_option_values_",
+        "predicted_option_variances_",
+        "filtered_option_variances_",
+        "smoothed_option_variances_",
+        "predicted_choice_entropy_",
+        "surprise_",
+    )
+
     def __init__(
         self,
         n_options: int,
@@ -881,6 +895,7 @@ class _MultinomialChoiceBase(SGDFittableMixin):
             # final E-step below re-syncs the posteriors to them).
             if not np.isfinite(ll):
                 if last_accepted is None:
+                    self._clear_fit_state()
                     raise NonFiniteLikelihoodError(
                         f"Non-finite log-likelihood at iteration {iteration + 1}: "
                         f"{ll}. This may indicate numerical instability."
@@ -1442,6 +1457,7 @@ class MultinomialChoiceModel(_MultinomialChoiceBase):
             non-finite E-step is never recorded: the parameters roll back to
             the last accepted iterate and EM stops with a warning.
         """
+        max_iter = validate_int(max_iter, "max_iter", positive=True)
         choices_arr = self._prepare_choices(choices, "EM")
         return self._fit_em(choices_arr, max_iter, tolerance, verbose, beta_grid)
 

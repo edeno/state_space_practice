@@ -54,6 +54,7 @@ from state_space_practice.utils import (
     psd_solve,
     typed_jit,
     validate_choice_indices,
+    validate_int,
 )
 
 if TYPE_CHECKING:
@@ -784,6 +785,7 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
             non-finite E-step is never recorded: the parameters roll back to
             the last accepted iterate and EM stops with a warning.
         """
+        max_iter = validate_int(max_iter, "max_iter", positive=True)
         choices_arr = self._bind_covariates(choices, covariates, obs_covariates, "fit")
         return self._fit_em(choices_arr, max_iter, tolerance, verbose, beta_grid)
 

@@ -1551,6 +1551,18 @@ class SmithLearningModel(SGDFittableMixin):
     smoothed_learning_state_variance: FittedAttribute[Array] = FittedAttribute()
     smoothed_prob_correct_response: FittedAttribute[Array] = FittedAttribute()
     smoother_gain: FittedAttribute[Array] = FittedAttribute()  # (n_trials - 1,)
+    # The filter/smoother outputs above, cleared when a fit fails.
+    _fit_output_attrs = (
+        "filtered_prob_correct_response",
+        "filtered_learning_state_mode",
+        "filtered_learning_state_variance",
+        "filtered_one_step_mode",
+        "filtered_one_step_variance",
+        "smoothed_learning_state_mode",
+        "smoothed_learning_state_variance",
+        "smoothed_prob_correct_response",
+        "smoother_gain",
+    )
 
     # Bound by the last fit.
     _n_trials_: FittedAttribute[int] = FittedAttribute()
@@ -1918,18 +1930,7 @@ class SmithLearningModel(SGDFittableMixin):
         # the M-step parameters (sigma_epsilon and the initial-variance
         # derivative). On a rejected step both are restored so the stored
         # (params, smoother) pair stays consistent with the prior iteration.
-        posterior_keys = (
-            "filtered_prob_correct_response",
-            "filtered_learning_state_mode",
-            "filtered_learning_state_variance",
-            "filtered_one_step_mode",
-            "filtered_one_step_variance",
-            "smoothed_learning_state_mode",
-            "smoothed_learning_state_variance",
-            "smoothed_prob_correct_response",
-            "smoother_gain",
-        )
-        snapshot_keys = posterior_keys + (
+        snapshot_keys = self._fit_output_attrs + (
             "sigma_epsilon",
             "init_learning_state",
             "init_learning_variance",
@@ -1956,7 +1957,7 @@ class SmithLearningModel(SGDFittableMixin):
             max_iter=max_iter,
             tol=tolerance,
             on_first_nonfinite="clear",
-            clear_state=lambda: clear_attributes(self, posterior_keys),
+            clear_state=lambda: clear_attributes(self, self._fit_output_attrs),
             m_step_on_convergence=True,
             logger=logger,
             on_iteration=_on_iteration,

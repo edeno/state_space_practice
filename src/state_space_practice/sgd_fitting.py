@@ -34,13 +34,15 @@ import optax
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.em_driver import clear_attributes
+from state_space_practice.exceptions import NonFiniteLikelihoodError
 from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.parameter_transforms import (
     ParameterTransform,
     transform_to_constrained,
     transform_to_unconstrained,
 )
-from state_space_practice.utils import typed_jit, validate_int
+from state_space_practice.utils import typed_jit, validate_int, validate_scalar
 
 logger = logging.getLogger(__name__)
 
@@ -407,12 +409,25 @@ class SGDFittableMixin:
     #: ``{**Parent._sgd_param_attrs, "key": "attr"}``.
     _sgd_param_attrs: ClassVar[Mapping[str, str]] = {}
 
+    #: Attributes a fit writes besides the shared results below (posteriors,
+    #: cached inference results, uncertainty summaries). ``_clear_fit_state``
+    #: unsets them, so a failed fit cannot leave an earlier fit's (or its own
+    #: non-finite) outputs looking fitted.
+    _fit_output_attrs: ClassVar[tuple[str, ...]] = ()
+
     # Set by fitting (see ``_record_fit_result``); reading one before then
     # raises NotFittedError.
     converged_: FittedAttribute[bool] = FittedAttribute()
+    #: Marginal log-likelihood at the fitted parameters (never a penalized
+    #: training objective).
     log_likelihood_: FittedAttribute[float] = FittedAttribute()
+    #: The last fit's trajectory: one log-likelihood per accepted EM E-step,
+    #: or the per-step SGD training objective (log-likelihood plus any
+    #: penalty term).
     log_likelihood_history_: FittedAttribute[list[float]] = FittedAttribute()
-    #: EM iterations of the last fit; ``None`` before fitting or after fit_sgd.
+    #: Length of ``log_likelihood_history_`` after an EM fit (EM's final
+    #: synchronising E-step can make it ``max_iter + 1``); ``None`` before
+    #: fitting and after ``fit_sgd``.
     n_iter_: int | None = None
 
     def _build_param_spec(
@@ -560,6 +575,24 @@ class SGDFittableMixin:
         else:
             self.log_likelihood_ = float(log_likelihood)
 
+    def _clear_fit_state(self) -> None:
+        """Unset every fit output (``_fit_output_attrs`` and the shared results).
+
+        Called before a fit raises because it could not produce a usable
+        result, so the model reads as unfitted instead of serving an earlier
+        fit's outputs alongside newly bound data, or non-finite ones.
+        """
+        clear_attributes(
+            self,
+            (
+                "converged_",
+                "log_likelihood_",
+                "log_likelihood_history_",
+                *self._fit_output_attrs,
+            ),
+        )
+        self.n_iter_ = None
+
     def _finalize_convergence(self, converged: bool, max_iter: int) -> None:
         """Warn if a hand-rolled EM loop ran out of iterations.
 
@@ -647,7 +680,12 @@ class SGDFittableMixin:
     # arguments with their own signature without an [override] violation.
     # The optimizer settings are keyword-only, exactly as before.
     def fit_sgd(self, *args: Any, **kwargs: Any) -> list[float]:
-        """Fit by minimizing negative marginal LL via gradient descent.
+        """Fit by gradient descent on the model's SGD loss.
+
+        The loss is the negative marginal log-likelihood plus any penalty term
+        the model adds (e.g. a connectivity penalty). Settings are validated
+        before ``_prepare_sgd_data`` binds data or initializes the model, so a
+        call rejected for its settings leaves the model unchanged.
 
         Parameters
         ----------
@@ -664,17 +702,31 @@ class SGDFittableMixin:
             ``state_space_practice.sgd_fitting`` logger (enable with e.g.
             ``logging.basicConfig(level=logging.INFO)``).
         convergence_tol : float or None
-            If set, stop early when the direction-agnostic relative change
-            ``|ΔLL| / avg(|LL|) < tol`` for 5 consecutive steps.
-            This is a dimensionless fraction (e.g., ``1e-4`` means 0.01%
-            relative change), consistent with the EM convergence check.
+            If set (finite, >= 0), stop early when the direction-agnostic
+            relative change ``|ΔLL| / avg(|LL|) < tol`` for 5 consecutive
+            steps. This is a dimensionless fraction (e.g., ``1e-4`` means
+            0.01% relative change), consistent with the EM convergence check.
 
         Returns
         -------
         log_likelihoods : list of float
-            One entry per evaluated optimization step that produced a finite
-            loss. When the final candidate is finite, the final entry is
-            rewritten to the log likelihood of the stored final parameters.
+            The training objective (log-likelihood plus any penalty), one
+            entry per evaluated step that produced a finite loss; when the
+            final candidate is finite, the last entry is re-evaluated at the
+            stored parameters. Also stored as ``log_likelihood_history_``.
+            ``log_likelihood_`` is instead the marginal log-likelihood from
+            the final inference (``_finalize_sgd``); ``n_iter_`` is ``None``.
+
+        Raises
+        ------
+        ValueError
+            If ``num_steps``, the optimizer or ``convergence_tol`` is invalid
+            (before the model is touched); if the model has no learnable
+            parameters, non-finite initial parameters or a non-positive
+            ``_n_timesteps``.
+        NonFiniteLikelihoodError
+            If the log-likelihood at the stored parameters is non-finite (e.g.
+            unusable starting parameters); the fit outputs are cleared first.
         """
         optimizer: optax.GradientTransformation | None = kwargs.pop("optimizer", None)
         num_steps: int = kwargs.pop("num_steps", 200)
@@ -684,6 +736,10 @@ class SGDFittableMixin:
         # Validate the plain settings before the hook: ``_prepare_sgd_data`` may
         # mutate the model (e.g. record the sequence length).
         num_steps = validate_int(num_steps, "num_steps", nonnegative=True)
+        if convergence_tol is not None:
+            convergence_tol = validate_scalar(
+                convergence_tol, "convergence_tol", nonnegative=True
+            )
         if optimizer is None:
             optimizer = _DEFAULT_OPTIMIZER
         if not hasattr(optimizer, "init") or not hasattr(optimizer, "update"):
@@ -861,12 +917,19 @@ class SGDFittableMixin:
             static_params=frozen_params,
         )
         self._store_sgd_params(final_params)
-        final_log_likelihood = self._finalize_sgd(*args, **kwargs)
+        final_log_likelihood = float(self._finalize_sgd(*args, **kwargs))
+        if not math.isfinite(final_log_likelihood):
+            self._clear_fit_state()
+            raise NonFiniteLikelihoodError(
+                f"Log-likelihood at the fitted parameters is non-finite "
+                f"({final_log_likelihood}); the starting parameters are likely "
+                "unusable."
+            )
         self._record_fit_result(
             log_likelihoods,
             converged,
             n_iter=None,
-            log_likelihood=float(final_log_likelihood),
+            log_likelihood=final_log_likelihood,
         )
 
         return log_likelihoods

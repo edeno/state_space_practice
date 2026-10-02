@@ -392,6 +392,14 @@ class PlaceFieldModel(SGDFittableMixin):
     filtered_mean: FittedAttribute[Array] = FittedAttribute()
     filtered_cov: FittedAttribute[Array | BlockDiagonalCovariance] = FittedAttribute()
     _sgd_n_time: FittedAttribute[int] = FittedAttribute()
+    # The posteriors above, cleared when a fit fails.
+    _fit_output_attrs = (
+        "smoother_mean",
+        "smoother_cov",
+        "smoother_cross_cov",
+        "filtered_mean",
+        "filtered_cov",
+    )
 
     def __init__(
         self,
@@ -1315,14 +1323,7 @@ class PlaceFieldModel(SGDFittableMixin):
         # reads the design form through a holder the M-step may update.
         design_holder = {"design_matrix": design_matrix}
 
-        posterior_keys = (
-            "smoother_mean",
-            "smoother_cov",
-            "smoother_cross_cov",
-            "filtered_mean",
-            "filtered_cov",
-        )
-        snapshot_keys = posterior_keys + (
+        snapshot_keys = self._fit_output_attrs + (
             "transition_matrix",
             "process_cov",
             "init_mean",
@@ -1367,7 +1368,7 @@ class PlaceFieldModel(SGDFittableMixin):
             max_iter=max_iter,
             tol=tolerance,
             on_first_nonfinite="clear",
-            clear_state=lambda: clear_attributes(self, posterior_keys),
+            clear_state=lambda: clear_attributes(self, self._fit_output_attrs),
             logger=logger,
             on_iteration=_on_iteration,
         )
@@ -1613,6 +1614,10 @@ class PlaceFieldModel(SGDFittableMixin):
             design_matrix, self.filtered_mean, context="fit_sgd"
         )
         return log_likelihood
+
+    def _clear_fit_state(self) -> None:
+        super()._clear_fit_state()
+        self.log_likelihoods = []
 
     def _neuron_smoother_cov(self, neuron_idx: int, time_slice: slice) -> Array:
         """One neuron's ``(n_t, nb, nb)`` smoothed covariance blocks.

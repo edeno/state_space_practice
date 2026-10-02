@@ -2607,6 +2607,18 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
     smoother_pair_cond_covs: FittedAttribute[Array | None] = FittedAttribute()
     smoother_next_pair_cond_means: FittedAttribute[Array | None] = FittedAttribute()
 
+    # The smoother results above, cleared when a fit fails.
+    _fit_output_attrs = (
+        "smoother_state_cond_mean",
+        "smoother_state_cond_cov",
+        "smoother_discrete_state_prob",
+        "smoother_joint_discrete_state_prob",
+        "smoother_pair_cond_cross_cov",
+        "smoother_pair_cond_means",
+        "smoother_pair_cond_covs",
+        "smoother_next_pair_cond_means",
+    )
+
     def __init__(
         self,
         n_oscillators: int,
@@ -4108,6 +4120,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
             tol=tol,
             decrease_tol=decrease_tol,
             on_first_nonfinite="raise",
+            clear_state=self._clear_fit_state,
             refresh_after_restore=True,
             logger=logger,
         )

@@ -47,6 +47,7 @@ from numpy.typing import NDArray
 
 from state_space_practice.em_driver import (
     AttributeSnapshot,
+    clear_attributes,
     restore_attributes,
     run_em,
     snapshot_attributes,
@@ -427,7 +428,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         "init_discrete_state_prob": "init_discrete_state_prob",
     }
 
-    _EM_SNAPSHOT_KEYS = (
+    _fit_output_attrs = (
         "smoother_state_cond_mean",
         "smoother_state_cond_cov",
         "smoother_discrete_state_prob",
@@ -436,6 +437,9 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         "smoother_pair_cond_means",
         "smoother_pair_cond_covs",
         "smoother_next_pair_cond_means",
+    )
+
+    _EM_SNAPSHOT_KEYS = _fit_output_attrs + (
         "continuous_transition_matrix",
         "process_cov",
         "measurement_matrix",
@@ -573,14 +577,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         but not a NaN-filled array -- would silently return garbage (argmax of
         NaN). Unsetting the attributes makes those guards fire.
         """
-        del self.smoother_discrete_state_prob
-        del self.smoother_joint_discrete_state_prob
-        del self.smoother_state_cond_mean
-        del self.smoother_state_cond_cov
-        del self.smoother_pair_cond_cross_cov
-        del self.smoother_pair_cond_means
-        del self.smoother_pair_cond_covs
-        del self.smoother_next_pair_cond_means
+        clear_attributes(self, self._fit_output_attrs)
 
     def __repr__(self) -> str:
         """Returns an unambiguous string representation of the model.
@@ -1218,7 +1215,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         )
 
     def _validate_observations(self, observations: ArrayLike) -> Array:
-        """Check ``observations`` has one column per source.
+        """Check ``observations`` is ``(n_time, n_sources)``.
 
         Shared by ``fit`` and ``fit_sgd`` so both reject bad input alike, before
         the model is touched.
@@ -1226,8 +1223,18 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         Returns
         -------
         Array, shape (n_time, n_sources)
+
+        Raises
+        ------
+        ValueError
+            If ``observations`` is not 2-D or has the wrong number of columns.
         """
         observations = jnp.asarray(observations)
+        if observations.ndim != 2:
+            raise ValueError(
+                "observations must be 2D with shape (n_time, n_sources), got "
+                f"shape {observations.shape}."
+            )
         if observations.shape[1] != self.n_sources:
             raise ValueError(
                 f"observations must have {self.n_sources} sources, "

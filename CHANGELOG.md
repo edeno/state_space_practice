@@ -419,6 +419,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A failed fit no longer leaves stale or non-finite results that look
+  fitted**: when a fit raises `NonFiniteLikelihoodError` (its starting
+  parameters give a non-finite log-likelihood), it first clears every fit
+  output -- posteriors, cached inference results, uncertainty summaries and
+  `log_likelihood_` / `log_likelihood_history_` / `converged_` / `n_iter_`
+  (declared per model as `_fit_output_attrs`, cleared by
+  `SGDFittableMixin._clear_fit_state`). Previously the choice and belief
+  models kept the earlier fit's results next to the newly bound data, and the
+  switching point-process models kept non-finite posteriors. `run_em`'s
+  `"raise"` policy now accepts a `clear_state` hook. `fit_sgd` raises
+  `NonFiniteLikelihoodError` (after clearing) when the log-likelihood at the
+  fitted parameters is non-finite, instead of returning with
+  `log_likelihood_ = NaN`; a multi-restart switching point-process fit whose
+  restarts all fail raises it too (was a plain `ValueError`). The choice and
+  belief models' `fit` rejects `max_iter < 1` before binding data, `fit_sgd`
+  validates `convergence_tol` (finite, >= 0) before touching the model, and
+  the oscillator models reject non-2-D observations with `ValueError` (was
+  `IndexError`).
 - **The choice and belief models' EM no longer runs on after a non-finite
   log-likelihood**: `MultinomialChoiceModel`, `CovariateChoiceModel`,
   `SwitchingChoiceModel` and `ContingencyBeliefModel` run their own EM loops,

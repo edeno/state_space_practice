@@ -724,6 +724,13 @@ class TestPrepareSGDDataHook:
             _Recording().fit_sgd(jnp.array(1.0), optimizer=object(), num_steps=1)
         assert calls == []
 
+        for bad_tol in (-1e-4, float("nan"), "tight"):
+            with pytest.raises(ValueError):
+                _Recording().fit_sgd(
+                    jnp.array(1.0), num_steps=1, convergence_tol=bad_tol
+                )
+        assert calls == []
+
 
 class _CallCounter:
     """Mutable counter; the model holds one object, so reading the attribute

@@ -3305,6 +3305,15 @@ class PointProcessModel(SGDFittableMixin):
     filtered_cov: FittedAttribute[Array] = FittedAttribute()
     _sgd_n_time: FittedAttribute[int] = FittedAttribute()
 
+    # The posteriors above, cleared when a fit fails.
+    _fit_output_attrs = (
+        "smoother_mean",
+        "smoother_cov",
+        "smoother_cross_cov",
+        "filtered_mean",
+        "filtered_cov",
+    )
+
     def __init__(
         self,
         n_state_dims: int,
@@ -3495,14 +3504,7 @@ class PointProcessModel(SGDFittableMixin):
             jnp.asarray(self.init_cov), n_time=spike_indicator.shape[0]
         )
 
-        posterior_keys = (
-            "smoother_mean",
-            "smoother_cov",
-            "smoother_cross_cov",
-            "filtered_mean",
-            "filtered_cov",
-        )
-        snapshot_keys = posterior_keys + (
+        snapshot_keys = self._fit_output_attrs + (
             "transition_matrix",
             "process_cov",
             "init_mean",
@@ -3522,7 +3524,7 @@ class PointProcessModel(SGDFittableMixin):
             tol=tolerance,
             logger=logger,
             on_first_nonfinite="clear",
-            clear_state=lambda: clear_attributes(self, posterior_keys),
+            clear_state=lambda: clear_attributes(self, self._fit_output_attrs),
         )
         self._record_fit_result(
             result.log_likelihoods,

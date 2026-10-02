@@ -443,6 +443,14 @@ class SwitchingHamiltonianJointModel(_JointHamiltonianBase):
     filtered_discrete_probs_: FittedAttribute[Array] = FittedAttribute()
     smoothed_discrete_probs_: FittedAttribute[Array] = FittedAttribute()
 
+    _fit_output_attrs = _JointHamiltonianBase._fit_output_attrs + (
+        "filtered_discrete_probs_",
+        "smoothed_discrete_probs_",
+        "smoother_state_cond_mean",
+        "smoother_state_cond_cov",
+        "smoother_discrete_state_prob",
+    )
+
     def __init__(
         self,
         n_oscillators: int,

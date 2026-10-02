@@ -193,8 +193,9 @@ def run_em(
       together (with ``refresh_after_restore`` the posteriors are recomputed,
       and a non-finite recomputation is warned about).
     - If the *first* E-step is non-finite there is nothing to roll back to:
-      ``"break"`` and ``"raise"`` leave that E-step's non-finite posteriors
-      installed; ``"clear"`` calls ``clear_state`` to remove them.
+      ``"break"`` leaves that E-step's non-finite posteriors installed;
+      ``"clear"`` calls ``clear_state`` to remove them; ``"raise"`` calls
+      ``clear_state`` when given, then raises.
     - With ``stop_on_decrease=False`` a decreasing E-step is kept, so the
       model holds the latest iterate, not the best one, unless
       ``track_best`` restores the best accepted state at the end.
@@ -221,12 +222,14 @@ def run_em(
         instead of divergence.
     on_first_nonfinite : {"break", "raise", "clear"}
         What to do when an E-step is non-finite before any step was accepted:
-        warn and stop, raise ``NonFiniteLikelihoodError``, or call ``clear_state``, warn and
-        stop.  Once a step has been accepted, a non-finite E-step always rolls
-        back to it, warns, and stops, whatever this policy.
+        warn and stop, raise ``NonFiniteLikelihoodError``, or call
+        ``clear_state``, warn and stop.  Once a step has been accepted, a
+        non-finite E-step always rolls back to it, warns, and stops, whatever
+        this policy.
     clear_state : callable or None
-        Removes the non-finite posteriors under the ``"clear"`` policy.
-        Required with ``"clear"`` and not allowed with the other policies.
+        Removes the fit outputs a failed first E-step left behind.  Required
+        with ``"clear"``, optional with ``"raise"`` (called before raising),
+        not allowed with ``"break"``.
     stop_on_decrease : bool
         Roll back and stop on a decrease (default) or warn and continue.
     require_increase_to_converge : bool
@@ -270,8 +273,8 @@ def run_em(
     ------
     ValueError
         If ``max_iter < 1``, ``on_first_nonfinite`` is not one of the three
-        policies, or ``clear_state`` is given without (or missing with) the
-        ``"clear"`` policy -- all checked before any E-step.
+        policies, ``clear_state`` is missing with ``"clear"`` or given with
+        ``"break"`` -- all checked before any E-step.
     NonFiniteLikelihoodError
         Under the ``"raise"`` policy, when the first E-step is non-finite (a
         ``ValueError`` subclass).
@@ -283,11 +286,12 @@ def run_em(
             "on_first_nonfinite must be 'break', 'raise' or 'clear', got "
             f"{on_first_nonfinite!r}."
         )
-    if (on_first_nonfinite == "clear") != (clear_state is not None):
+    if on_first_nonfinite == "clear" and clear_state is None:
+        raise ValueError("on_first_nonfinite='clear' requires clear_state.")
+    if on_first_nonfinite == "break" and clear_state is not None:
         raise ValueError(
-            "clear_state must be given exactly when on_first_nonfinite='clear' "
-            f"(got on_first_nonfinite={on_first_nonfinite!r}, clear_state="
-            f"{'None' if clear_state is None else 'a callable'})."
+            "clear_state is not used with on_first_nonfinite='break'; pass "
+            "'clear' (or 'raise') to clear a failed first E-step."
         )
 
     log = logger if logger is not None else _logger
@@ -330,13 +334,13 @@ def run_em(
         if not np.isfinite(current_ll):
             bad_ll = log_likelihoods.pop()
             if last_accepted is None:
+                if clear_state is not None:
+                    clear_state()
                 if on_first_nonfinite == "raise":
                     raise NonFiniteLikelihoodError(
                         f"Non-finite log-likelihood at iteration {iteration + 1}: "
                         f"{bad_ll}. This may indicate numerical instability."
                     )
-                if clear_state is not None:
-                    clear_state()
                 emit_warning(
                     f"Non-finite log-likelihood ({bad_ll}) at iteration "
                     f"{iteration + 1} with no usable previous state; stopping EM."

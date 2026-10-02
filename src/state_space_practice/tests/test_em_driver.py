@@ -191,6 +191,18 @@ def test_first_nonfinite_raise_policy():
     # A ValueError subclass, so existing ``except ValueError`` callers still match.
     with pytest.raises(NonFiniteLikelihoodError, match="Non-finite"):
         model.run(max_iter=3, tol=1e-4, on_first_nonfinite="raise")
+    assert model.cleared is False  # no clear_state given: nothing cleared
+
+
+def test_first_nonfinite_raise_policy_clears_before_raising():
+    """With a clear_state hook the raise policy removes the failed E-step's
+    outputs first, so a caller that catches the error sees no stale state."""
+    model = ScriptedModel([np.inf])
+    with pytest.raises(NonFiniteLikelihoodError):
+        model.run(
+            max_iter=3, tol=1e-4, on_first_nonfinite="raise", clear_state=model.clear
+        )
+    assert model.cleared is True
 
 
 @pytest.mark.parametrize(
@@ -198,7 +210,6 @@ def test_first_nonfinite_raise_policy():
     [
         ({"on_first_nonfinite": "clear"}, "clear_state"),
         ({"on_first_nonfinite": "break", "clear_state": lambda: None}, "clear_state"),
-        ({"on_first_nonfinite": "raise", "clear_state": lambda: None}, "clear_state"),
         ({"on_first_nonfinite": "ignore"}, "on_first_nonfinite"),
         ({"max_iter": 0}, "max_iter"),
     ],

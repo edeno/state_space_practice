@@ -621,6 +621,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
             max_iter=max_iter,
             tol=tol,
             on_first_nonfinite="raise",
+            clear_state=self._clear_fit_state,
             stop_on_decrease=False,
             track_best=True,
             logger=logger,
@@ -674,7 +675,8 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
                 continue
 
         if best_state is None or best_lls is None:
-            raise ValueError(
+            # Each failed restart already cleared its fit outputs.
+            raise NonFiniteLikelihoodError(
                 f"All {n_restarts} restarts failed with non-finite log-likelihood."
             )
 

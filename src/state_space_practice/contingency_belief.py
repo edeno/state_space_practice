@@ -49,6 +49,7 @@ from state_space_practice.utils import (
     typed_jit,
     validate_choice_indices,
     validate_count_array,
+    validate_int,
 )
 
 if TYPE_CHECKING:
@@ -1015,6 +1016,18 @@ class ContingencyBeliefModel(SGDFittableMixin):
     surprise_: FittedAttribute[Array] = FittedAttribute()
     change_point_probability_: FittedAttribute[Array] = FittedAttribute()
 
+    # Everything above a fit writes, cleared when a fit fails.
+    _fit_output_attrs = (
+        "state_posterior_",
+        "smoothed_state_posterior_",
+        "_smoother_result",
+        "belief_entropy_",
+        "predicted_reward_mean_",
+        "predicted_reward_variance_",
+        "surprise_",
+        "change_point_probability_",
+    )
+
     def __init__(
         self,
         n_states: int,
@@ -1368,6 +1381,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
         """
         # EM does not support observation covariates, so binding clears any
         # obs design matrix left by a previous fit_sgd().
+        max_iter = validate_int(max_iter, "max_iter", positive=True)
         choices, rewards = self._bind_data(
             choices,
             rewards,
@@ -1396,6 +1410,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
             ll = float(result.log_likelihood)
             if not np.isfinite(ll):
                 if last_accepted is None:
+                    self._clear_fit_state()
                     raise NonFiniteLikelihoodError(
                         f"Non-finite log-likelihood ({ll}) at the first EM "
                         "E-step; the starting parameters are unusable."

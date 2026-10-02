@@ -66,6 +66,7 @@ from state_space_practice.switching_kalman import (
 from state_space_practice.utils import (
     typed_jit,
     validate_choice_indices,
+    validate_int,
 )
 
 if TYPE_CHECKING:
@@ -768,6 +769,19 @@ class SwitchingChoiceModel(SGDFittableMixin):
     surprise_: FittedAttribute[Array] = FittedAttribute()
     per_state_predicted_variances_: FittedAttribute[Array] = FittedAttribute()
 
+    # Everything above a fit writes, cleared when a fit fails.
+    _fit_output_attrs = (
+        "_filter_result",
+        "smoothed_discrete_probs_",
+        "_smoother_state_cond_means",
+        "_smoother_state_cond_covs",
+        "predicted_option_variances_",
+        "smoothed_option_variances_",
+        "predicted_choice_entropy_",
+        "surprise_",
+        "per_state_predicted_variances_",
+    )
+
     def __init__(
         self,
         n_options: int,
@@ -1053,6 +1067,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
             If the first E-step's log-likelihood is non-finite (the starting
             parameters are unusable).
         """
+        max_iter = validate_int(max_iter, "max_iter", positive=True)
         choices = self._bind_data(choices, covariates, obs_covariates)
 
         log_likelihoods: list[float] = []
@@ -1152,6 +1167,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
             If no E-step was finite: the starting parameters are unusable.
         """
         if accepted is None:
+            self._clear_fit_state()
             raise NonFiniteLikelihoodError(
                 f"Non-finite log-likelihood ({bad_ll}) at {where} with the "
                 "starting parameters; check init_process_noises, "

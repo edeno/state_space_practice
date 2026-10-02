@@ -1967,6 +1967,12 @@ class TestCommonOscillatorSGDFitting:
         # LL should improve from first to last
         assert lls[-1] > lls[0]
 
+    @pytest.mark.parametrize("method", ["fit", "fit_sgd"])
+    def test_one_dimensional_observations_raise_value_error(self, com_setup, method):
+        model, obs = com_setup
+        with pytest.raises(ValueError, match="2D"):
+            getattr(model, method)(obs[:, 0], key=jax.random.PRNGKey(0))
+
     def test_zero_step_fit_sgd_records_log_likelihood(self, com_setup):
         """num_steps=0 records no optimization history, but final inference
         still runs, so log_likelihood_ is the marginal LL at the stored
