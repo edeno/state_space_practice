@@ -297,6 +297,21 @@ def mlp_l2_penalty(mlp_params: dict[str, Any]) -> Array:
     )
 
 
+# The EKF predict steps the scan drivers below call, rematerialized under
+# reverse-mode AD. The leapfrog Jacobian differentiates the MLP twice, so the
+# residuals reverse mode would otherwise store per time step (MLP activations
+# and their tangents) scale with the hidden width and dwarf the scan carry
+# (~55 kB per step for ``hidden_dims=[32, 32]``, ~1 GB for a 20,000-step
+# ``fit_sgd`` gradient of the LFP model). Under
+# ``jax.checkpoint`` only the step inputs are kept and the predict is recomputed
+# in the backward pass (one extra predict per step). Forward evaluation is
+# unchanged. ``h_apply_fn`` and ``dt`` (argnums 3, 5) are static.
+_ekf_predict_step_remat = jax.checkpoint(ekf_predict_step, static_argnums=(3, 5))
+_ekf_predict_step_with_jacobian_remat = jax.checkpoint(
+    ekf_predict_step_with_jacobian, static_argnums=(3, 5)
+)
+
+
 def run_ekf_filter(
     observations: Any,
     init_mean: ArrayLike,
@@ -345,7 +360,7 @@ def run_ekf_filter(
         carry: tuple[Array, Array], y_t: Any
     ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
         m_prev, P_prev = carry
-        m_pred, P_pred = ekf_predict_step(
+        m_pred, P_pred = _ekf_predict_step_remat(
             m_prev, P_prev, trans_params, apply_mlp, process_cov, dt
         )
         m_post, P_post, ll = update_fn(m_pred, P_pred, y_t)
@@ -387,7 +402,7 @@ def run_ekf_smoother(
         carry: tuple[Array, Array], y_t: Any
     ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array, Array, Array]]:
         m_prev, P_prev = carry
-        m_pred, P_pred, F_t = ekf_predict_step_with_jacobian(
+        m_pred, P_pred, F_t = _ekf_predict_step_with_jacobian_remat(
             m_prev, P_prev, trans_params, apply_mlp, process_cov, dt
         )
         m_post, P_post = update_fn(m_pred, P_pred, y_t)

@@ -762,3 +762,126 @@ def test_switching_discrete_posterior_is_exact_for_identical_regimes():
     sm_probs = np.asarray(smoothed[2]) if len(smoothed) > 2 else None
     assert sm_probs is not None
     np.testing.assert_allclose(sm_probs, filt, atol=1e-10)
+
+
+def _scalar_pipeline_loss(family, pass_name, hidden_dims, n_time):
+    """``(loss, params)`` for a scalar loss through one jitted Hamiltonian core.
+
+    ``family`` is ``"single"`` (the joint LFP+spike single-regime core) or
+    ``"switching"``; ``pass_name`` is ``"filter"`` (summed marginal
+    log-likelihood, the ``fit_sgd`` objective) or ``"smoother"`` (sum of the
+    smoothed moments, so every output feeds the gradient).
+    """
+    from state_space_practice.hamiltonian_switching import (
+        switching_hamiltonian_filter,
+        switching_hamiltonian_smoother,
+    )
+
+    k1, k2 = jax.random.split(jax.random.PRNGKey(7))
+    obs = (
+        jax.random.normal(k1, (n_time, 2)),
+        jax.random.poisson(k2, 0.5, (n_time, 3)).astype(jnp.float64),
+    )
+    kwargs = dict(
+        n_oscillators=1,
+        n_lfp_sources=2,
+        n_spike_sources=3,
+        sampling_freq=100.0,
+        hidden_dims=hidden_dims,
+    )
+    if family == "single":
+        model = JointHamiltonianModel(**kwargs)
+        params = model._build_param_spec()[0]
+        core = (
+            hamiltonian_ekf_filter
+            if pass_name == "filter"
+            else hamiltonian_ekf_smoother
+        )
+
+        def run(p):
+            return core(obs, p, dt=model.dt, observation_model="joint")
+
+    else:
+        model = SwitchingHamiltonianJointModel(n_discrete_states=2, **kwargs)
+        params = model._complete_filter_params(model._build_param_spec()[0])
+        core = (
+            switching_hamiltonian_filter
+            if pass_name == "filter"
+            else switching_hamiltonian_smoother
+        )
+
+        def run(p):
+            return core(obs, p, dt=model.dt)
+
+    if pass_name == "filter":
+        # The marginal log-likelihoods are the last filter output.
+        def loss(p):
+            return jnp.sum(run(p)[-1])
+
+    else:
+
+        def loss(p):
+            means, covs = run(p)[:2]
+            return jnp.sum(means) + jnp.sum(covs)
+
+    return loss, params
+
+
+_PIPELINES = pytest.mark.parametrize(
+    "family, pass_name",
+    [
+        ("single", "filter"),
+        ("single", "smoother"),
+        ("switching", "filter"),
+        ("switching", "smoother"),
+    ],
+)
+
+
+@pytest.mark.slow
+@_PIPELINES
+def test_reverse_mode_gradient_matches_forward_mode(family, pass_name):
+    """Reverse-mode gradients through the rematerialized predict steps are exact.
+
+    The predict steps run under ``jax.checkpoint``, which changes only the
+    reverse-mode program (recompute instead of store). Forward mode does not
+    go through that partial evaluation, so it is an independent reference
+    that must agree to round-off.
+    """
+    loss, params = _scalar_pipeline_loss(family, pass_name, [4], n_time=15)
+    rev = jax.jit(jax.grad(loss))(params)
+    fwd = jax.jit(jax.jacfwd(loss))(params)
+    rev_leaves = jax.tree_util.tree_leaves(rev)
+    # Guard: the gradient is non-trivial, so agreement is not vacuous.
+    assert max(float(jnp.max(jnp.abs(g))) for g in rev_leaves) > 1e-3
+    for g_rev, g_fwd in zip(rev_leaves, jax.tree_util.tree_leaves(fwd)):
+        np.testing.assert_allclose(g_rev, g_fwd, rtol=1e-9, atol=1e-11)
+
+
+@pytest.mark.slow
+@_PIPELINES
+def test_gradient_memory_per_time_step_is_independent_of_mlp_width(family, pass_name):
+    """Reverse-mode memory per time step does not scale with the MLP.
+
+    Storing the leapfrog-Jacobian residuals (the MLP's activations and their
+    tangents) for every time step made ``fit_sgd`` memory grow with
+    ``n_time * hidden_width`` (gigabytes at ``n_time`` ~ 1e4). With the
+    predict step rematerialized, only the per-step carry is kept, so the
+    per-step growth of the compiled program's temporary buffers is the same
+    for a narrow and a wide MLP. Compile-only: nothing is executed.
+    """
+
+    def temp_bytes(hidden_dims, n_time):
+        loss, params = _scalar_pipeline_loss(family, pass_name, hidden_dims, n_time)
+        analysis = jax.jit(jax.grad(loss)).lower(params).compile().memory_analysis()
+        if analysis is None:
+            pytest.skip("backend does not report compiled memory usage")
+        return analysis.temp_size_in_bytes
+
+    def per_step_bytes(hidden_dims):
+        return (temp_bytes(hidden_dims, 300) - temp_bytes(hidden_dims, 100)) / 200
+
+    narrow, wide = per_step_bytes([4]), per_step_bytes([128])
+    # Guard: the program does keep per-step state, so the comparison is real.
+    assert narrow > 0
+    assert wide < 1.25 * narrow, f"per-step bytes: narrow {narrow}, wide {wide}"
