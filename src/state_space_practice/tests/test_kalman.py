@@ -1095,6 +1095,21 @@ class TestKalmanFilterInputHandling:
         assert filtered_mean.shape == (10, n_states)
         assert jnp.isfinite(mll)
 
+    @pytest.mark.parametrize("validate_inputs", [True, False])
+    def test_numpy_inputs_match_jax_inputs(
+        self, multi_dim_model: tuple, validate_inputs: bool
+    ) -> None:
+        """NumPy arrays are accepted (ArrayLike) and give the jax-array result."""
+        jax_result = kalman_filter(*multi_dim_model, validate_inputs=validate_inputs)
+        numpy_inputs = tuple(np.asarray(x) for x in multi_dim_model)
+        assert all(type(x) is np.ndarray for x in numpy_inputs)
+
+        numpy_result = kalman_filter(*numpy_inputs, validate_inputs=validate_inputs)
+
+        for got, expected in zip(numpy_result, jax_result, strict=True):
+            assert isinstance(got, jax.Array)
+            np.testing.assert_array_equal(got, expected)
+
 
 # --- Mathematical Correctness Tests ---
 

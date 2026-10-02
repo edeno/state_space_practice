@@ -21,16 +21,21 @@ References
    Neural Computation 16, 971-998.
 """
 
+from __future__ import annotations
+
 import copy
 import functools
 import logging
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
 from jax import Array
+from jax.typing import ArrayLike
 
 from state_space_practice.em_driver import run_em
 from state_space_practice.exceptions import NotFittedError
+from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.oscillator_utils import (
     DirectedInfluenceDynamicsMixin,
     canonicalize_correlated_noise_pair_parameters,
@@ -44,6 +49,7 @@ from state_space_practice.oscillator_utils import (
     project_correlated_noise_process_covariance,
 )
 from state_space_practice.parameter_transforms import POSITIVE, UNCONSTRAINED
+from state_space_practice.sgd_fitting import SGDParams, SGDParamSpec
 from state_space_practice.switching_kalman import (
     compute_process_covariance_sufficient_stats,
     compute_transition_sufficient_stats,
@@ -65,6 +71,14 @@ from state_space_practice.utils import (
     validate_nonnegative_array,
     validate_unit_interval_array,
 )
+
+if TYPE_CHECKING:
+    import numpy as np
+    import optax
+
+    from state_space_practice.oscillator_regularization import (
+        OscillatorPenaltyConfig,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +141,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         Sampling frequency in Hz.
     dt : float
         Time bin width in seconds.
-    discrete_transition_diag : Array | None, optional
+    discrete_transition_diag : ArrayLike | None, optional
         Diagonal of discrete transition matrix. Defaults to a ~1 s expected
         dwell time at ``sampling_freq``.
     stickiness : float, default=0.0
@@ -170,6 +184,37 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         "update_init_cov": "init_cov",
     }
 
+    # Parameters and posteriors captured for EM rollback. Every JAX-array and
+    # immutable-container attribute is *reassigned* (never mutated in place)
+    # by the E/M steps, so a plain reference is a valid snapshot.
+    _EM_SNAPSHOT_KEYS = (
+        "init_mean",
+        "init_cov",
+        "init_discrete_state_prob",
+        "discrete_transition_matrix",
+        "continuous_transition_matrix",
+        "process_cov",
+        "spike_params",
+        "smoother_state_cond_mean",
+        "smoother_state_cond_cov",
+        "smoother_discrete_state_prob",
+        "smoother_joint_discrete_state_prob",
+        "smoother_pair_cond_cross_cov",
+        "smoother_pair_cond_means",
+        "smoother_pair_cond_covs",
+        "smoother_next_pair_cond_means",
+        "freqs",
+        "damping_coef",
+        "process_variance",
+        "phase_difference",
+        "coupling_strength",
+        "_current_osc_params",
+        "_transition_suff_stats",
+    )
+
+    #: Marginal log-likelihood of the final EM iterate; set by ``fit``.
+    log_likelihood_: FittedAttribute[float] = FittedAttribute()
+
     def __init__(
         self,
         n_oscillators: int,
@@ -177,7 +222,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         n_discrete_states: int,
         sampling_freq: float,
         dt: float,
-        discrete_transition_diag: Array | None = None,
+        discrete_transition_diag: ArrayLike | None = None,
         stickiness: float = 0.0,
         update_continuous_transition_matrix: bool = True,
         update_process_cov: bool = True,
@@ -256,10 +301,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         RuntimeError
             If called before fit() or fit_sgd().
         """
-        if (
-            not hasattr(self, "smoother_discrete_state_prob")
-            or self.smoother_discrete_state_prob is None
-        ):
+        if not is_set(self, "smoother_discrete_state_prob"):
             raise NotFittedError("Call fit() or fit_sgd() before decode().")
         return jnp.argmax(self.smoother_discrete_state_prob, axis=1)
 
@@ -276,10 +318,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         RuntimeError
             If called before fit() or fit_sgd().
         """
-        if (
-            not hasattr(self, "smoother_discrete_state_prob")
-            or self.smoother_discrete_state_prob is None
-        ):
+        if not is_set(self, "smoother_discrete_state_prob"):
             raise NotFittedError("Call fit() or fit_sgd() before predict_proba().")
         return self.smoother_discrete_state_prob
 
@@ -337,7 +376,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         return window, n_time // window
 
     def _set_state_probs_from_window_features(
-        self, features, window: int, n_time: int
+        self, features: np.ndarray, window: int, n_time: int
     ) -> None:
         """Cluster windowed features with a GMM and store per-timestep state probs.
 
@@ -464,40 +503,15 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
     def _snapshot_em_state(self) -> dict[str, object]:
         """Snapshot parameters and posteriors for EM rollback.
 
-        Every JAX-array and immutable-container attribute below is *reassigned*
-        (never mutated in place) by the E/M steps, so a plain reference is a
-        valid snapshot -- restoring it later is unaffected by the reassignment.
-        Only ``_current_osc_params`` (a mutable ``dict | None`` warm-start
-        cache for the reparameterized M-step) is deep-copied, so an in-place
-        edit of the live dict cannot leak into the snapshot.
+        Restoring a reference snapshot is unaffected by later reassignment
+        (see ``_EM_SNAPSHOT_KEYS``). Only ``_current_osc_params`` (a mutable
+        ``dict | None`` warm-start cache for the reparameterized M-step) is
+        deep-copied, so an in-place edit of the live dict cannot leak into the
+        snapshot.
         """
-        attrs = [
-            "init_mean",
-            "init_cov",
-            "init_discrete_state_prob",
-            "discrete_transition_matrix",
-            "continuous_transition_matrix",
-            "process_cov",
-            "spike_params",
-            "smoother_state_cond_mean",
-            "smoother_state_cond_cov",
-            "smoother_discrete_state_prob",
-            "smoother_joint_discrete_state_prob",
-            "smoother_pair_cond_cross_cov",
-            "smoother_pair_cond_means",
-            "smoother_pair_cond_covs",
-            "smoother_next_pair_cond_means",
-            "freqs",
-            "damping_coef",
-            "process_variance",
-            "phase_difference",
-            "coupling_strength",
-            "_current_osc_params",
-            "_transition_suff_stats",
-        ]
         deepcopy_attrs = {"_current_osc_params"}
         snapshot: dict[str, object] = {}
-        for attr in attrs:
+        for attr in self._EM_SNAPSHOT_KEYS:
             if not hasattr(self, attr):
                 continue
             value = getattr(self, attr)
@@ -505,9 +519,16 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         return snapshot
 
     def _restore_em_state(self, state: dict[str, object]) -> None:
-        """Restore a snapshot produced by ``_snapshot_em_state``."""
-        for attr, value in state.items():
-            setattr(self, attr, value)
+        """Restore a snapshot produced by ``_snapshot_em_state``.
+
+        A key absent from the snapshot was unset when it was taken (e.g. the
+        smoother outputs before the first E-step), so it is unset again.
+        """
+        for attr in self._EM_SNAPSHOT_KEYS:
+            if attr in state:
+                setattr(self, attr, state[attr])
+            elif is_set(self, attr):
+                delattr(self, attr)
 
     # ------------------------------------------------------------------
     # EM loop
@@ -515,7 +536,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
 
     def fit(
         self,
-        spikes: Array,
+        spikes: ArrayLike,
         max_iter: int = 50,
         tol: float = 1e-4,
         key: Array | None = None,
@@ -597,9 +618,10 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
                     self.n_discrete_states,
                 )
             )
-            self.smoother_pair_cond_means = None
-            self.smoother_pair_cond_covs = None
-            self.smoother_next_pair_cond_means = None
+            # Not computed until the first E-step; drop any from a prior fit.
+            del self.smoother_pair_cond_means
+            del self.smoother_pair_cond_covs
+            del self.smoother_next_pair_cond_means
             self._m_step_spikes(spikes)
         else:
             self._init_cov_latent_scale()
@@ -651,7 +673,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         """
         best_lls: list[float] | None = None
         best_final_ll = -float("inf")
-        best_state: dict | None = None
+        best_state: dict[str, object] | None = None
 
         keys = jax.random.split(key, n_restarts)
 
@@ -676,7 +698,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
                 )
                 continue
 
-        if best_state is None:
+        if best_state is None or best_lls is None:
             raise ValueError(
                 f"All {n_restarts} restarts failed with non-finite log-likelihood."
             )
@@ -718,11 +740,11 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
         Sampling frequency in Hz.
     dt : float
         Time bin width in seconds.
-    freqs : Array, shape (n_oscillators,)
+    freqs : ArrayLike, shape (n_oscillators,)
         Intrinsic oscillation frequencies in Hz.
-    damping_coef : Array, shape (n_oscillators,)
+    damping_coef : ArrayLike, shape (n_oscillators,)
         Damping coefficients for each oscillator (0 to 1).
-    process_variance : Array, shape (n_oscillators,)
+    process_variance : ArrayLike, shape (n_oscillators,)
         Process noise variance for each oscillator.
     """
 
@@ -733,11 +755,11 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
         n_discrete_states: int,
         sampling_freq: float,
         dt: float,
-        freqs: jax.Array,
-        damping_coef: jax.Array,
-        process_variance: jax.Array,
-        **kwargs,
-    ):
+        freqs: ArrayLike,
+        damping_coef: ArrayLike,
+        process_variance: ArrayLike,
+        **kwargs: Any,
+    ) -> None:
         # Force COM-specific update flags
         kwargs["update_continuous_transition_matrix"] = False
         kwargs["update_process_cov"] = False
@@ -746,6 +768,9 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
             n_oscillators, n_neurons, n_discrete_states, sampling_freq, dt, **kwargs
         )
 
+        freqs = jnp.asarray(freqs)
+        damping_coef = jnp.asarray(damping_coef)
+        process_variance = jnp.asarray(process_variance)
         if freqs.shape != (n_oscillators,):
             raise ValueError(f"freqs shape {freqs.shape} != ({n_oscillators},)")
         if damping_coef.shape != (n_oscillators,):
@@ -832,7 +857,7 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
         """No projection needed — A and Q are not updated."""
         pass
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         return self._shared_sgd_param_spec()
 
 
@@ -864,18 +889,18 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         Sampling frequency in Hz.
     dt : float
         Time bin width in seconds.
-    freqs : Array, shape (n_oscillators,)
+    freqs : ArrayLike, shape (n_oscillators,)
         Intrinsic oscillation frequencies in Hz.
-    damping_coef : Array, shape (n_oscillators,)
+    damping_coef : ArrayLike, shape (n_oscillators,)
         Damping coefficients for each oscillator.
-    process_variance : Array, shape (n_oscillators, n_discrete_states)
+    process_variance : ArrayLike, shape (n_oscillators, n_discrete_states)
         Process noise variance per oscillator per state.
-    phase_difference : Array, shape (n_oscillators, n_oscillators, n_discrete_states)
+    phase_difference : ArrayLike, shape (n_oscillators, n_oscillators, n_discrete_states)
         Phase differences for noise correlation. Each oscillator pair may be
         supplied in the strict upper triangle, strict lower triangle, or both
         triangles if the two entries are opposite phases; values are stored
         canonically in the strict upper triangle.
-    coupling_strength : Array, shape (n_oscillators, n_oscillators, n_discrete_states)
+    coupling_strength : ArrayLike, shape (n_oscillators, n_oscillators, n_discrete_states)
         Coupling strengths for noise correlation. Each oscillator pair may be
         supplied in the strict upper triangle, strict lower triangle, or both
         triangles if the two entries agree; values are stored canonically in the
@@ -896,14 +921,14 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         n_discrete_states: int,
         sampling_freq: float,
         dt: float,
-        freqs: jax.Array,
-        damping_coef: jax.Array,
-        process_variance: jax.Array,
-        phase_difference: jax.Array,
-        coupling_strength: jax.Array,
+        freqs: ArrayLike,
+        damping_coef: ArrayLike,
+        process_variance: ArrayLike,
+        phase_difference: ArrayLike,
+        coupling_strength: ArrayLike,
         use_reparameterized_mstep: bool = True,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         # Force CNM-specific update flags
         kwargs["update_continuous_transition_matrix"] = False
         kwargs["update_process_cov"] = True
@@ -911,6 +936,11 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
             n_oscillators, n_neurons, n_discrete_states, sampling_freq, dt, **kwargs
         )
 
+        freqs = jnp.asarray(freqs)
+        damping_coef = jnp.asarray(damping_coef)
+        process_variance = jnp.asarray(process_variance)
+        phase_difference = jnp.asarray(phase_difference)
+        coupling_strength = jnp.asarray(coupling_strength)
         if freqs.shape != (n_oscillators,):
             raise ValueError(f"freqs shape {freqs.shape} != ({n_oscillators},)")
         if damping_coef.shape != (n_oscillators,):
@@ -1005,12 +1035,6 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
 
     def _m_step_constrained_process_covariance(self) -> None:
         """Install the exact fixed-A, PSD, jointly constrained CNM Q update."""
-        assert self.smoother_state_cond_mean is not None
-        assert self.smoother_state_cond_cov is not None
-        assert self.smoother_discrete_state_prob is not None
-        assert self.smoother_joint_discrete_state_prob is not None
-        assert self.smoother_pair_cond_cross_cov is not None
-
         residual_scatter, state_counts = compute_process_covariance_sufficient_stats(
             continuous_transition_matrix=self.continuous_transition_matrix,
             state_cond_smoother_means=self.smoother_state_cond_mean,
@@ -1087,7 +1111,7 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
 
     # --- SGDFittableMixin: CNM-PP specific ---
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         params, spec = self._shared_sgd_param_spec()
 
         if self.update_process_cov:
@@ -1100,7 +1124,7 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
 
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, spikes: jax.Array) -> jax.Array:
+    def _sgd_loss_fn(self, params: SGDParams, spikes: jax.Array) -> jax.Array:
         # Reconstruct per-state Q from scientific params
         proc_var = params.get("process_variance", self.process_variance)
         phase_diff = params.get("phase_difference", self.phase_difference)
@@ -1123,7 +1147,7 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         params_with_Q["_Q"] = Q
         return super()._sgd_loss_fn(params_with_Q, spikes)
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         super()._store_sgd_params(params)
         if "process_variance" in params:
             self.process_variance = params["process_variance"]
@@ -1187,15 +1211,15 @@ class DirectedInfluencePointProcessModel(
         Sampling frequency in Hz.
     dt : float
         Time bin width in seconds.
-    freqs : Array, shape (n_oscillators,)
+    freqs : ArrayLike, shape (n_oscillators,)
         Intrinsic oscillation frequencies in Hz.
-    damping_coef : Array, shape (n_oscillators,)
+    damping_coef : ArrayLike, shape (n_oscillators,)
         Damping coefficients for each oscillator.
-    process_variance : Array, shape (n_oscillators,)
+    process_variance : ArrayLike, shape (n_oscillators,)
         Process noise variance (constant across states).
-    phase_difference : Array, shape (n_oscillators, n_oscillators, n_discrete_states)
+    phase_difference : ArrayLike, shape (n_oscillators, n_oscillators, n_discrete_states)
         Initial coupling phase differences.
-    coupling_strength : Array, shape (n_oscillators, n_oscillators, n_discrete_states)
+    coupling_strength : ArrayLike, shape (n_oscillators, n_oscillators, n_discrete_states)
         Initial coupling strengths.
     use_reparameterized_mstep : bool, default=False
         If True, optimize oscillator parameters directly (guarantees valid
@@ -1224,16 +1248,16 @@ class DirectedInfluencePointProcessModel(
         n_discrete_states: int,
         sampling_freq: float,
         dt: float,
-        freqs: jax.Array,
-        damping_coef: jax.Array,
-        process_variance: jax.Array,
-        phase_difference: jax.Array,
-        coupling_strength: jax.Array,
+        freqs: ArrayLike,
+        damping_coef: ArrayLike,
+        process_variance: ArrayLike,
+        phase_difference: ArrayLike,
+        coupling_strength: ArrayLike,
         use_reparameterized_mstep: bool = False,
         max_spectral_radius: float = 0.99,
         max_damping: float = 0.995,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         # Force DIM-specific update flags
         kwargs["update_continuous_transition_matrix"] = True
         kwargs["update_process_cov"] = False
@@ -1241,6 +1265,11 @@ class DirectedInfluencePointProcessModel(
             n_oscillators, n_neurons, n_discrete_states, sampling_freq, dt, **kwargs
         )
 
+        freqs = jnp.asarray(freqs)
+        damping_coef = jnp.asarray(damping_coef)
+        process_variance = jnp.asarray(process_variance)
+        phase_difference = jnp.asarray(phase_difference)
+        coupling_strength = jnp.asarray(coupling_strength)
         if freqs.shape != (n_oscillators,):
             raise ValueError(f"freqs shape {freqs.shape} != ({n_oscillators},)")
         if damping_coef.shape != (n_oscillators,):
@@ -1273,8 +1302,6 @@ class DirectedInfluencePointProcessModel(
                 f"!= ({n_oscillators}, {n_oscillators}, {n_discrete_states})"
             )
 
-        phase_difference = jnp.asarray(phase_difference)
-        coupling_strength = jnp.asarray(coupling_strength)
         if not bool(jnp.all(jnp.isfinite(phase_difference))) or not bool(
             jnp.all(jnp.isfinite(coupling_strength))
         ):
@@ -1302,7 +1329,7 @@ class DirectedInfluencePointProcessModel(
         self.phase_difference = phase_difference.at[diag_idx, diag_idx, :].set(0.0)
         self.coupling_strength = coupling_strength.at[diag_idx, diag_idx, :].set(0.0)
         self.use_reparameterized_mstep = use_reparameterized_mstep
-        self._current_osc_params: dict | None = None
+        self._current_osc_params: dict[str, Array] | None = None
 
         # Stability bounds applied when rebuilding transition matrices.
         if not 0.0 < max_spectral_radius < 1.0:
@@ -1420,7 +1447,7 @@ class DirectedInfluencePointProcessModel(
 
     # --- SGDFittableMixin: DIM-PP specific ---
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         params, spec = self._shared_sgd_param_spec()
 
         if self.update_continuous_transition_matrix:
@@ -1433,14 +1460,14 @@ class DirectedInfluencePointProcessModel(
 
     def fit_sgd(
         self,
-        spikes,
-        key=None,
-        optimizer=None,
-        num_steps=200,
-        verbose=False,
-        convergence_tol=None,
-        connectivity_penalty=None,
-    ):
+        spikes: ArrayLike,
+        key: Array | None = None,
+        optimizer: optax.GradientTransformation | None = None,
+        num_steps: int = 200,
+        verbose: bool = False,
+        convergence_tol: float | None = None,
+        connectivity_penalty: OscillatorPenaltyConfig | None = None,
+    ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
 
         SGD optimizes ``coupling_strength`` and ``phase_difference``
@@ -1450,7 +1477,7 @@ class DirectedInfluencePointProcessModel(
 
         Parameters
         ----------
-        spikes : Array, shape (n_time, n_neurons)
+        spikes : ArrayLike, shape (n_time, n_neurons)
         key : Array or None
         optimizer : optax optimizer or None
         num_steps : int
@@ -1474,7 +1501,7 @@ class DirectedInfluencePointProcessModel(
             convergence_tol=convergence_tol,
         )
 
-    def _sgd_loss_fn(self, params: dict, spikes: jax.Array) -> jax.Array:
+    def _sgd_loss_fn(self, params: SGDParams, spikes: jax.Array) -> jax.Array:
         phase_diff = params.get("phase_difference", self.phase_difference)
         coupling = params.get("coupling_strength", self.coupling_strength)
 
@@ -1510,7 +1537,7 @@ class DirectedInfluencePointProcessModel(
 
         return base_loss
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         super()._store_sgd_params(params)
         if "phase_difference" in params:
             self.phase_difference = params["phase_difference"]

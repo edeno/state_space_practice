@@ -46,7 +46,7 @@ Nickisch, H., Solin, A. & Grigorevskiy, A. (2018). State Space Gaussian Processe
 """
 
 import warnings
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -57,6 +57,7 @@ from jax.scipy.special import gammaln, ndtri
 from jax.typing import ArrayLike
 
 from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
+from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.gp_ssm import matern32_continuous, matern32_discretize
 from state_space_practice.kalman import kalman_smoother
 from state_space_practice.parameter_transforms import (
@@ -64,7 +65,7 @@ from state_space_practice.parameter_transforms import (
     UNCONSTRAINED,
     frozen,
 )
-from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.utils import (
     _validate_filter_numerics,
     contains_tracer,
@@ -72,6 +73,9 @@ from state_space_practice.utils import (
     validate_int,
     validate_scalar,
 )
+
+if TYPE_CHECKING:
+    import optax
 
 #: Default floor on the Fisher weight ``rate`` to keep the site variance finite
 #: at (near-)zero-rate bins. exp(-20)/dt Hz is far below any real firing rate.
@@ -640,7 +644,16 @@ class TemporalRateGP(SGDFittableMixin):
         Laplace log-evidence at the fitted hyperparameters.
     log_likelihood_history_ : list of float
         Log-evidence at each SGD step (from the mixin).
+
+    The fitted attributes raise ``NotFittedError`` until :meth:`fit_sgd` sets
+    them.
     """
+
+    # Data and posterior, set by fit_sgd.
+    _counts: FittedAttribute[Array] = FittedAttribute()
+    log_rate_mean_: FittedAttribute[Array] = FittedAttribute()
+    log_rate_var_: FittedAttribute[Array] = FittedAttribute()
+    log_marginal_likelihood_: FittedAttribute[float] = FittedAttribute()
 
     def __init__(
         self,
@@ -656,9 +669,14 @@ class TemporalRateGP(SGDFittableMixin):
         min_weight: float = _DEFAULT_MIN_WEIGHT,
     ) -> None:
         self.dt = validate_scalar(dt, "dt", positive=True)
-        self.variance = validate_scalar(variance, "variance", positive=True)
-        self.lengthscale = validate_scalar(lengthscale, "lengthscale", positive=True)
-        self.mean = validate_scalar(mean, "mean")
+        # Scalars for one neuron; per-neuron vectors after fitting several.
+        self.variance: float | Array = validate_scalar(
+            variance, "variance", positive=True
+        )
+        self.lengthscale: float | Array = validate_scalar(
+            lengthscale, "lengthscale", positive=True
+        )
+        self.mean: float | Array = validate_scalar(mean, "mean")
         self.n_iter = validate_int(n_iter, "n_iter", positive=True)
         self.update_variance = bool(update_variance)
         self.update_lengthscale = bool(update_lengthscale)
@@ -666,14 +684,10 @@ class TemporalRateGP(SGDFittableMixin):
         self.share_hyperparameters = bool(share_hyperparameters)
         self.min_weight = validate_scalar(min_weight, "min_weight", positive=True)
 
-        # Data and posterior, populated by fit_sgd. _n_neurons is 1 for a 1D
+        # Data shape, populated by fit_sgd. _n_neurons is 1 for a 1D
         # (single-train) fit and n_neurons for a 2D (n_neurons, n_time) fit.
-        self._counts: Array | None = None
         self._n_neurons: int = 1
         self._sgd_n_time: int = 0
-        self.log_rate_mean_: Array | None = None
-        self.log_rate_var_: Array | None = None
-        self.log_marginal_likelihood_: float | None = None
 
     def __repr__(self) -> str:
         return (
@@ -705,7 +719,7 @@ class TemporalRateGP(SGDFittableMixin):
         counts: ArrayLike,
         *,
         num_steps: int = 200,
-        optimizer: object | None = None,
+        optimizer: "optax.GradientTransformation | None" = None,
         verbose: bool = False,
         convergence_tol: float | None = None,
     ) -> list[float]:
@@ -769,13 +783,12 @@ class TemporalRateGP(SGDFittableMixin):
         )
 
     def _check_fitted(self) -> None:
-        if self.log_rate_mean_ is None:
+        if not is_set(self, "log_rate_mean_"):
             raise NotFittedError("Model is not fitted. Call fit_sgd(counts) first.")
 
     def predict_log_rate(self) -> tuple[Array, Array]:
         """Posterior mode and variance of the log-rate ``f`` (after fitting)."""
         self._check_fitted()
-        assert self.log_rate_mean_ is not None and self.log_rate_var_ is not None
         return self.log_rate_mean_, self.log_rate_var_
 
     def predict_rate(self) -> Array:
@@ -786,7 +799,6 @@ class TemporalRateGP(SGDFittableMixin):
         ``exp(f_mean)``.
         """
         self._check_fitted()
-        assert self.log_rate_mean_ is not None and self.log_rate_var_ is not None
         return jnp.exp(self.log_rate_mean_ + 0.5 * self.log_rate_var_)
 
     def credible_interval(self, level: float = 0.95) -> tuple[Array, Array]:
@@ -805,7 +817,6 @@ class TemporalRateGP(SGDFittableMixin):
         if not 0.0 < level < 1.0:
             raise ValueError(f"level must be in (0, 1), got {level}.")
         self._check_fitted()
-        assert self.log_rate_mean_ is not None and self.log_rate_var_ is not None
         z = ndtri(0.5 * (1.0 + level))
         sd = jnp.sqrt(self.log_rate_var_)
         lower = jnp.exp(self.log_rate_mean_ - z * sd)
@@ -819,13 +830,13 @@ class TemporalRateGP(SGDFittableMixin):
         return self._sgd_n_time
 
     def _check_sgd_initialized(self) -> None:
-        if self._counts is None:
+        if not is_set(self, "_counts"):
             raise RuntimeError(
                 "No data. Call fit_sgd(counts), not SGDFittableMixin.fit_sgd() "
                 "directly."
             )
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         n_neurons = self._n_neurons
         # Shared variance/lengthscale stay scalar; per-neuron ones become
         # (n_neurons,) vectors. The baseline mean is always per-neuron for a
@@ -855,7 +866,7 @@ class TemporalRateGP(SGDFittableMixin):
         }
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, counts: Array) -> Array:
+    def _sgd_loss_fn(self, params: SGDParams, counts: Array) -> Array:
         if self._n_neurons == 1:
             result = _infer_log_rate_traced(
                 counts,
@@ -880,7 +891,7 @@ class TemporalRateGP(SGDFittableMixin):
         )
         return -jnp.sum(result.log_marginal_likelihood)
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         if self._n_neurons == 1:
             self.variance = float(params["variance"])
             self.lengthscale = float(params["lengthscale"])

@@ -28,20 +28,25 @@ References
     Neural Computation 16, 971-998.
 """
 
+from __future__ import annotations
+
 import functools
 import logging
 import operator
 import warnings
 from collections.abc import Callable
-from typing import Any, Literal, NamedTuple, overload
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
+from numpy.typing import DTypeLike
 
 from state_space_practice.em_driver import run_em
+from state_space_practice.exceptions import NotFittedError
+from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.kalman import (
     InitialStatePrior,
     _kalman_smoother_update,
@@ -53,7 +58,7 @@ from state_space_practice.parameter_transforms import (
     PSD_MATRIX,
     UNCONSTRAINED,
 )
-from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.utils import (
     _validate_filter_numerics as _validate_filter_numerics_impl,
 )
@@ -64,10 +69,14 @@ from state_space_practice.utils import (
     psd_logdet,
     psd_solve,
     symmetrize,
+    typed_jit,
     validate_count_array,
     validate_scalar,
     warn_if_not_positive_definite_in_graph,
 )
+
+if TYPE_CHECKING:
+    import optax
 
 logger = logging.getLogger(__name__)
 
@@ -346,7 +355,7 @@ class BlockDiagonalCovariance:
         """Dense ``(n_state, n_state)`` covariance of one time bin (``dense[t]``)."""
         return _assemble_block_diagonal_matrix(self._blocks[:, self._time_index(t)])
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: Any) -> Array:
         if not isinstance(index, (bool, np.bool_)):
             try:
                 operator.index(index)
@@ -361,7 +370,9 @@ class BlockDiagonalCovariance:
         """Materialise the dense ``(n_time, n_state, n_state)`` array."""
         return jax.vmap(_assemble_block_diagonal_matrix, in_axes=1)(self._blocks)
 
-    def __array__(self, dtype=None, copy=None) -> np.ndarray:
+    def __array__(
+        self, dtype: DTypeLike | None = None, copy: bool | None = None
+    ) -> np.ndarray:
         return np.asarray(self.to_dense(), dtype=dtype)
 
     def __jax_array__(self) -> Array:
@@ -384,7 +395,7 @@ def _scaled_atol(mat: Array, atol: float) -> Array:
     return atol * jnp.maximum(1.0, jnp.max(jnp.abs(mat)))
 
 
-@functools.partial(jax.jit, static_argnames=("n_neurons", "block_size", "atol"))
+@functools.partial(typed_jit, static_argnames=("n_neurons", "block_size", "atol"))
 def _block_diagonal_parameters_ok(
     init_cov: Array,
     transition_matrix: Array,
@@ -784,13 +795,17 @@ def _fisher_scoring_line_search(
     """
     eps_sqrt = float(jnp.finfo(x0.dtype).eps) ** 0.5
 
-    def _line_search_step(carry, _):
+    def _line_search_step(
+        carry: tuple[Array, Array, Array, Array, Array, Array], _: Array | None
+    ) -> tuple[tuple[Array, Array, Array, Array, Array, Array], None]:
         x, delta, _, current_loss, slope, n_failed = carry
 
         # Backtracking line search. The loss at the evaluated step size rides
         # along in the carry, so the winning loss is known without a second
         # evaluation at the accepted point.
-        def _backtrack(alpha_carry, _):
+        def _backtrack(
+            alpha_carry: tuple[Array, Array, Array], _: Array | None
+        ) -> tuple[tuple[Array, Array, Array], None]:
             alpha, _, _ = alpha_carry
             new_x = x + alpha * delta
             new_loss = neg_log_posterior(new_x)
@@ -922,6 +937,57 @@ def _warn_line_search_failures(
         ),
         n_failed_bins,
     )
+
+
+@overload
+def _point_process_laplace_update(
+    one_step_mean: Array,
+    one_step_cov: Array,
+    spike_indicator_t: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array], Array],
+    diagonal_boost: float = ...,
+    grad_log_intensity_func: Callable[[Array], Array] | None = ...,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    max_log_count: float = ...,
+    return_line_search_failures: Literal[False] = ...,
+) -> tuple[Array, Array, Array]: ...
+
+
+@overload
+def _point_process_laplace_update(
+    one_step_mean: Array,
+    one_step_cov: Array,
+    spike_indicator_t: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array], Array],
+    diagonal_boost: float = ...,
+    grad_log_intensity_func: Callable[[Array], Array] | None = ...,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    max_log_count: float = ...,
+    return_line_search_failures: Literal[True] = ...,
+) -> tuple[Array, Array, Array, Array]: ...
+
+
+@overload
+def _point_process_laplace_update(
+    one_step_mean: Array,
+    one_step_cov: Array,
+    spike_indicator_t: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array], Array],
+    diagonal_boost: float = ...,
+    grad_log_intensity_func: Callable[[Array], Array] | None = ...,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    max_log_count: float = ...,
+    return_line_search_failures: bool = ...,
+) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]: ...
 
 
 def _point_process_laplace_update(
@@ -1299,9 +1365,9 @@ BERNOULLI_LOGIT_FAMILY = GLMFamily(
 
 @overload
 def glm_laplace_update(
-    one_step_mean: Array,
-    one_step_cov: Array,
-    observations: Array,
+    one_step_mean: ArrayLike,
+    one_step_cov: ArrayLike,
+    observations: ArrayLike,
     eta_func: Callable[[Array], Array],
     family: GLMFamily,
     diagonal_boost: float = ...,
@@ -1315,9 +1381,9 @@ def glm_laplace_update(
 
 @overload
 def glm_laplace_update(
-    one_step_mean: Array,
-    one_step_cov: Array,
-    observations: Array,
+    one_step_mean: ArrayLike,
+    one_step_cov: ArrayLike,
+    observations: ArrayLike,
     eta_func: Callable[[Array], Array],
     family: GLMFamily,
     diagonal_boost: float = ...,
@@ -1331,9 +1397,9 @@ def glm_laplace_update(
 
 
 def glm_laplace_update(
-    one_step_mean: Array,
-    one_step_cov: Array,
-    observations: Array,
+    one_step_mean: ArrayLike,
+    one_step_cov: ArrayLike,
+    observations: ArrayLike,
     eta_func: Callable[[Array], Array],
     family: GLMFamily,
     diagonal_boost: float = 0.0,
@@ -1353,11 +1419,11 @@ def glm_laplace_update(
 
     Parameters
     ----------
-    one_step_mean : Array, shape (n_latent,)
+    one_step_mean : ArrayLike, shape (n_latent,)
         Predicted mean ``A @ m_{t-1}``.
-    one_step_cov : Array, shape (n_latent, n_latent)
+    one_step_cov : ArrayLike, shape (n_latent, n_latent)
         Predicted covariance ``A @ P_{t-1} @ A.T + Q``.
-    observations : Array, shape (n_obs,)
+    observations : ArrayLike, shape (n_obs,)
         Observed counts (Poisson) or 0/1 indicators (Bernoulli) at this bin.
     eta_func : callable ``x -> eta``
         Maps state (n_latent,) to the linear predictor (n_obs,). May be nonlinear;
@@ -1380,6 +1446,9 @@ def glm_laplace_update(
         Fisher iterations whose backtracking was exhausted (see
         :func:`_fisher_scoring_line_search`).
     """
+    one_step_mean = jnp.asarray(one_step_mean)
+    one_step_cov = jnp.asarray(one_step_cov)
+    observations = jnp.asarray(observations)
     if grad_eta_func is None:
         grad_eta_func = jax.jacfwd(eta_func)
     grad_eta = grad_eta_func
@@ -1462,6 +1531,70 @@ def glm_laplace_update(
     if return_line_search_failures:
         return posterior_mean, posterior_cov, log_likelihood, n_line_search_failures
     return posterior_mean, posterior_cov, log_likelihood
+
+
+@overload
+def stochastic_point_process_filter(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: Literal[False] = ...,
+) -> tuple[Array, Array, Array]: ...
+
+
+@overload
+def stochastic_point_process_filter(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    *,
+    return_block_covariances: Literal[True],
+) -> tuple[Array, Array | BlockDiagonalCovariance, Array]: ...
+
+
+@overload
+def stochastic_point_process_filter(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: bool = ...,
+) -> tuple[Array, Array | BlockDiagonalCovariance, Array]: ...
 
 
 def stochastic_point_process_filter(
@@ -1709,9 +1842,7 @@ def stochastic_point_process_filter(
     if single_neuron:
         spike_indicator = spike_indicator[:, None]
 
-    # jax.jit erases the wrapped function's return type to Any; the typed
-    # binding restores it so the declared return type is honored.
-    result: tuple[Array, Array, Array, Array] = _stochastic_point_process_filter_impl(
+    result = _stochastic_point_process_filter_impl(
         init_mean_params,
         init_covariance_params,
         design_matrix,
@@ -1735,7 +1866,7 @@ def stochastic_point_process_filter(
 
 
 @functools.partial(
-    jax.jit,
+    typed_jit,
     static_argnames=[
         "log_conditional_intensity",
         "include_laplace_normalization",
@@ -1791,11 +1922,13 @@ def _stochastic_point_process_filter_impl(
     process_cov = process_cov.astype(dtype)
 
     # Pre-compute gradient function outside the scan.
-    def _log_intensity_with_design(design_matrix_t, x):
+    def _log_intensity_with_design(design_matrix_t: Array, x: Array) -> Array:
         log_lambda = log_conditional_intensity(design_matrix_t, x)
         return jnp.atleast_1d(log_lambda)
 
-    _grad_log_intensity = jax.jacfwd(_log_intensity_with_design, argnums=1)
+    _grad_log_intensity: Callable[[Array, Array], Array] = jax.jacfwd(
+        _log_intensity_with_design, argnums=1
+    )
 
     def _step(
         params_prev: tuple[Array, Array, Array, Array],
@@ -1811,10 +1944,10 @@ def _stochastic_point_process_filter_impl(
             transition_matrix @ variance_prev_sym @ transition_matrix.T + process_cov
         )
 
-        def log_intensity_func(x):
+        def log_intensity_func(x: Array) -> Array:
             return _log_intensity_with_design(design_matrix_t, x)
 
-        def grad_log_intensity_func(x):
+        def grad_log_intensity_func(x: Array) -> Array:
             return _grad_log_intensity(design_matrix_t, x)
 
         posterior_mean, posterior_covariance, log_lik, n_failed = (
@@ -1867,7 +2000,7 @@ def _stochastic_point_process_filter_impl(
 
 
 @functools.partial(
-    jax.jit,
+    typed_jit,
     static_argnames=("include_laplace_normalization", "max_newton_iter"),
 )
 def _block_diagonal_forward_core(
@@ -1912,7 +2045,12 @@ def _block_diagonal_forward_core(
     init_covs_per_neuron = init_covs_per_neuron.astype(dtype)
     Z_base = Z_base.astype(dtype)
 
-    def _step_one_neuron(A_j: Array, Q_j: Array, carry, args: tuple[Array, Array]):
+    def _step_one_neuron(
+        A_j: Array,
+        Q_j: Array,
+        carry: tuple[Array, Array, Array, Array],
+        args: tuple[Array, Array],
+    ) -> tuple[tuple[Array, Array, Array, Array], tuple[Array, Array]]:
         mean_prev, cov_prev, ll_acc, n_failed_bins = carry
         z_row_t, y_t = args
         one_step_mean = A_j @ mean_prev
@@ -1960,7 +2098,7 @@ def _block_diagonal_forward_core(
         init_mean_j: Array,
         init_cov_j: Array,
         spikes_j: Array,
-    ):
+    ) -> tuple[Array, Array, Array, Array]:
         init_carry = (
             init_mean_j,
             init_cov_j,
@@ -2014,8 +2152,7 @@ def _run_forward_block_diagonal(
         Per-neuron number of time bins whose Fisher-scoring line search was
         exhausted (0 for ``max_newton_iter <= 1``).
     """
-    # jax.jit erases the return type to Any; the typed binding restores it.
-    fwd: tuple[Array, Array, Array, Array] = _block_diagonal_forward_core(
+    fwd = _block_diagonal_forward_core(
         structure.A_blocks,
         structure.Q_blocks,
         structure.init_means_per_neuron,
@@ -2031,7 +2168,7 @@ def _run_forward_block_diagonal(
 
 
 @functools.partial(
-    jax.jit,
+    typed_jit,
     static_argnames=("include_laplace_normalization", "max_newton_iter"),
 )
 def _block_diagonal_smoother_core(
@@ -2082,7 +2219,12 @@ def _block_diagonal_smoother_core(
     # decomposes into independent per-neuron smoothers (neuron j with its
     # own A_j, Q_j), exactly matching the dense filter's backward pass on
     # the block-diagonal problem.
-    def _backward_step(A_j, Q_j, carry, args):
+    def _backward_step(
+        A_j: Array,
+        Q_j: Array,
+        carry: tuple[Array, Array],
+        args: tuple[Array, Array],
+    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
         next_smoother_mean, next_smoother_cov = carry
         filter_mean, filter_cov = args
         sm, sc, scc = _kalman_smoother_update(
@@ -2095,7 +2237,9 @@ def _block_diagonal_smoother_core(
         )
         return (sm, sc), (sm, sc, scc)
 
-    def _run_backward_one_neuron(A_j, Q_j, means_j, covs_j):
+    def _run_backward_one_neuron(
+        A_j: Array, Q_j: Array, means_j: Array, covs_j: Array
+    ) -> tuple[Array, Array, Array]:
         # Initial carry: the last-time-step filtered posterior.
         (_, _), (sm_rev, sc_rev, scc_rev) = jax.lax.scan(
             functools.partial(_backward_step, A_j, Q_j),
@@ -2389,6 +2533,128 @@ def _stochastic_point_process_smoother_block_diagonal(
     return smoother_mean, smoother_cov, smoother_cross_cov, marginal_ll
 
 
+@overload
+def stochastic_point_process_smoother(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    return_filtered: Literal[False] = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: Literal[False] = ...,
+) -> tuple[Array, Array, Array, Array]: ...
+
+
+@overload
+def stochastic_point_process_smoother(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    return_filtered: Literal[True] = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: Literal[False] = ...,
+) -> tuple[Array, Array, Array, Array, Array, Array]: ...
+
+
+@overload
+def stochastic_point_process_smoother(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    return_filtered: Literal[False] = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: Literal[True] = ...,
+) -> tuple[
+    Array,
+    Array | BlockDiagonalCovariance,
+    Array | BlockDiagonalCovariance,
+    Array,
+]: ...
+
+
+@overload
+def stochastic_point_process_smoother(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    return_filtered: Literal[True] = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: Literal[True] = ...,
+) -> tuple[
+    Array,
+    Array | BlockDiagonalCovariance,
+    Array | BlockDiagonalCovariance,
+    Array,
+    Array,
+    Array | BlockDiagonalCovariance,
+]: ...
+
+
+@overload
+def stochastic_point_process_smoother(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    return_filtered: bool = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: bool = ...,
+) -> tuple[Array | BlockDiagonalCovariance, ...]: ...
+
+
 def stochastic_point_process_smoother(
     init_mean_params: ArrayLike,
     init_covariance_params: ArrayLike,
@@ -2602,7 +2868,7 @@ def stochastic_point_process_smoother(
     return result
 
 
-@jax.jit
+@typed_jit
 def _stochastic_point_process_smoother_backward(
     filtered_mean: Array,
     filtered_cov: Array,
@@ -2611,7 +2877,9 @@ def _stochastic_point_process_smoother_backward(
 ) -> tuple[Array, Array, Array]:
     """JIT-compiled backward pass of the point process smoother."""
 
-    def _step(carry, args):
+    def _step(
+        carry: tuple[Array, Array], args: tuple[Array, Array]
+    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
         next_smoother_mean, next_smoother_cov = carry
         filter_mean, filter_cov = args
         smoother_mean, smoother_cov, smoother_cross_cov = _kalman_smoother_update(
@@ -2740,7 +3008,7 @@ def dynamics_only_m_step(
     )
 
 
-@jax.jit
+@typed_jit
 def _dynamics_only_m_step(
     smoother_mean: ArrayLike,
     smoother_cov: ArrayLike,
@@ -2818,7 +3086,9 @@ def _dynamics_only_m_step(
 
 
 def get_confidence_interval(
-    posterior_mean: ArrayLike, posterior_covariance: ArrayLike, alpha: float = 0.05
+    posterior_mean: ArrayLike,
+    posterior_covariance: ArrayLike | BlockDiagonalCovariance,
+    alpha: float = 0.05,
 ) -> Array:
     """Get the confidence interval from the posterior covariance
 
@@ -2982,6 +3252,12 @@ class PointProcessModel(SGDFittableMixin):
         Smoothed state covariances after fitting.
     smoother_cross_cov : Array
         Smoothed cross-covariances after fitting.
+    filtered_mean, filtered_cov : Array
+        Filtered state estimates and covariances after fitting.
+    log_likelihood_ : float
+        Marginal log-likelihood at the parameters fitted by :meth:`fit_sgd`.
+
+    Reading a fitted attribute before fitting raises ``NotFittedError``.
 
     References
     ----------
@@ -2989,6 +3265,15 @@ class PointProcessModel(SGDFittableMixin):
         Dynamic Analysis of Neural Encoding by Point Process Adaptive Filtering.
         Neural Computation 16, 971-998.
     """
+
+    # Results, set by fit / fit_sgd.
+    smoother_mean: FittedAttribute[Array] = FittedAttribute()
+    smoother_cov: FittedAttribute[Array] = FittedAttribute()
+    smoother_cross_cov: FittedAttribute[Array] = FittedAttribute()
+    filtered_mean: FittedAttribute[Array] = FittedAttribute()
+    filtered_cov: FittedAttribute[Array] = FittedAttribute()
+    log_likelihood_: FittedAttribute[float] = FittedAttribute()
+    _sgd_n_time: FittedAttribute[int] = FittedAttribute()
 
     def __init__(
         self,
@@ -2998,7 +3283,7 @@ class PointProcessModel(SGDFittableMixin):
         process_cov: ArrayLike | None = None,
         init_mean: ArrayLike | None = None,
         init_cov: ArrayLike | None = None,
-        log_intensity_func: Callable | None = None,
+        log_intensity_func: Callable[[ArrayLike, ArrayLike], Array] | None = None,
         update_transition_matrix: bool = True,
         update_process_cov: bool = True,
         update_init_state: bool = True,
@@ -3046,7 +3331,9 @@ class PointProcessModel(SGDFittableMixin):
                 )
 
         if log_intensity_func is None:
-            self.log_intensity_func = log_conditional_intensity
+            self.log_intensity_func: Callable[[ArrayLike, ArrayLike], Array] = (
+                log_conditional_intensity
+            )
         else:
             self.log_intensity_func = log_intensity_func
 
@@ -3054,13 +3341,6 @@ class PointProcessModel(SGDFittableMixin):
         self.update_transition_matrix = update_transition_matrix
         self.update_process_cov = update_process_cov
         self.update_init_state = update_init_state
-
-        # Results (populated after fit)
-        self.smoother_mean: Array | None = None
-        self.smoother_cov: Array | None = None
-        self.smoother_cross_cov: Array | None = None
-        self.filtered_mean: Array | None = None
-        self.filtered_cov: Array | None = None
 
     def _e_step(self, design_matrix: ArrayLike, spike_indicator: ArrayLike) -> float:
         """E-step: Run filter and smoother to estimate latent states.
@@ -3106,10 +3386,10 @@ class PointProcessModel(SGDFittableMixin):
 
     def _m_step(self) -> None:
         """M-step: Update model parameters based on smoothed estimates."""
-        if (
-            self.smoother_mean is None
-            or self.smoother_cov is None
-            or self.smoother_cross_cov is None
+        if not (
+            is_set(self, "smoother_mean")
+            and is_set(self, "smoother_cov")
+            and is_set(self, "smoother_cross_cov")
         ):
             raise RuntimeError("Must run E-step before M-step")
 
@@ -3185,32 +3465,37 @@ class PointProcessModel(SGDFittableMixin):
             jnp.asarray(self.init_cov), n_time=spike_indicator.shape[0]
         )
 
+        posterior_keys = (
+            "smoother_mean",
+            "smoother_cov",
+            "smoother_cross_cov",
+            "filtered_mean",
+            "filtered_cov",
+        )
+        snapshot_keys = posterior_keys + (
+            "transition_matrix",
+            "process_cov",
+            "init_mean",
+            "init_cov",
+        )
+
         def _snapshot_state() -> dict[str, Any]:
-            return {
-                "smoother_mean": self.smoother_mean,
-                "smoother_cov": self.smoother_cov,
-                "smoother_cross_cov": self.smoother_cross_cov,
-                "filtered_mean": self.filtered_mean,
-                "filtered_cov": self.filtered_cov,
-                "transition_matrix": self.transition_matrix,
-                "process_cov": self.process_cov,
-                "init_mean": self.init_mean,
-                "init_cov": self.init_cov,
-            }
+            # Unset fitted attributes are left out and unset again on restore.
+            return {k: getattr(self, k) for k in snapshot_keys if hasattr(self, k)}
 
         def _restore_state(state: dict[str, Any]) -> None:
-            for key, value in state.items():
-                setattr(self, key, value)
+            for key in snapshot_keys:
+                if key in state:
+                    setattr(self, key, state[key])
+                else:
+                    delattr(self, key)
 
         def _clear_posteriors() -> None:
             # A non-finite first E-step has no accepted state to roll back
             # to: drop the posteriors it installed so the model reads as
             # unfitted instead of serving NaN output.
-            self.smoother_mean = None
-            self.smoother_cov = None
-            self.smoother_cross_cov = None
-            self.filtered_mean = None
-            self.filtered_cov = None
+            for key in posterior_keys:
+                delattr(self, key)
 
         # A rejected E-step (non-finite or decreasing LL) restores the last
         # accepted (parameters, smoother) pair so get_rate_estimate /
@@ -3235,7 +3520,7 @@ class PointProcessModel(SGDFittableMixin):
         self,
         design_matrix: ArrayLike,
         spike_indicator: ArrayLike,
-        optimizer: object | None = None,
+        optimizer: optax.GradientTransformation | None = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
@@ -3291,9 +3576,9 @@ class PointProcessModel(SGDFittableMixin):
     def _n_timesteps(self) -> int:
         return self._sgd_n_time
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
-        params: dict = {}
-        spec: dict = {}
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
+        params: SGDParams = {}
+        spec: SGDParamSpec = {}
 
         if self.update_transition_matrix:
             params["transition_matrix"] = self.transition_matrix
@@ -3312,7 +3597,7 @@ class PointProcessModel(SGDFittableMixin):
         return params, spec
 
     def _sgd_loss_fn(
-        self, params: dict, design_matrix: Array, spike_indicator: Array
+        self, params: SGDParams, design_matrix: Array, spike_indicator: Array
     ) -> Array:
         A = params.get("transition_matrix", self.transition_matrix)
         Q = params.get("process_cov", self.process_cov)
@@ -3335,7 +3620,7 @@ class PointProcessModel(SGDFittableMixin):
         )
         return -marginal_ll
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         if "transition_matrix" in params:
             self.transition_matrix = params["transition_matrix"]
         if "process_cov" in params:
@@ -3416,12 +3701,12 @@ class PointProcessModel(SGDFittableMixin):
         linear Z @ x.
         """
         if use_smoothed:
-            if self.smoother_mean is None:
-                raise RuntimeError("Model has not been fitted yet.")
+            if not is_set(self, "smoother_mean"):
+                raise NotFittedError("Model has not been fitted yet.")
             state_estimate = self.smoother_mean
         else:
-            if self.filtered_mean is None:
-                raise RuntimeError("Model has not been fitted yet.")
+            if not is_set(self, "filtered_mean"):
+                raise NotFittedError("Model has not been fitted yet.")
             state_estimate = self.filtered_mean
 
         design_matrix = jnp.asarray(design_matrix)
@@ -3430,7 +3715,7 @@ class PointProcessModel(SGDFittableMixin):
             # Evaluate rate at all positions for each time point
             # For each (time, position) pair, compute log_intensity_func(design[pos], state[time])
             # vmap over positions (inner), then over times (outer)
-            def rate_at_time(state_t):
+            def rate_at_time(state_t: Array) -> Array:
                 # For this time's state, evaluate at all positions
                 return jax.vmap(lambda dm: self.log_intensity_func(dm, state_t))(
                     design_matrix
@@ -3461,13 +3746,13 @@ class PointProcessModel(SGDFittableMixin):
             Lower and upper bounds of the confidence interval.
         """
         if use_smoothed:
-            if self.smoother_mean is None or self.smoother_cov is None:
-                raise RuntimeError("Model has not been fitted yet.")
+            if not (is_set(self, "smoother_mean") and is_set(self, "smoother_cov")):
+                raise NotFittedError("Model has not been fitted yet.")
             mean = self.smoother_mean
             cov = self.smoother_cov
         else:
-            if self.filtered_mean is None or self.filtered_cov is None:
-                raise RuntimeError("Model has not been fitted yet.")
+            if not (is_set(self, "filtered_mean") and is_set(self, "filtered_cov")):
+                raise NotFittedError("Model has not been fitted yet.")
             mean = self.filtered_mean
             cov = self.filtered_cov
 

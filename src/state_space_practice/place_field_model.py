@@ -35,6 +35,7 @@ References
 import logging
 import warnings
 from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -44,6 +45,7 @@ from jax.typing import ArrayLike
 
 from state_space_practice.em_driver import run_em
 from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
+from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.kalman import (
     InitialStatePrior,
     process_cov_residual_form,
@@ -65,13 +67,20 @@ from state_space_practice.point_process_kalman import (
     stochastic_point_process_filter,
     stochastic_point_process_smoother,
 )
-from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.utils import (
+    _root_figure,
     floor_variances_relative,
     psd_solve,
     symmetrize,
     validate_count_array,
 )
+
+if TYPE_CHECKING:
+    import optax
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+    from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +90,7 @@ def build_2d_spline_basis(
     n_interior_knots: int = 5,
     knots_x: np.ndarray | None = None,
     knots_y: np.ndarray | None = None,
-) -> tuple[np.ndarray, dict]:
+) -> tuple[np.ndarray, dict[str, Any]]:
     """Build a 2D tensor-product B-spline design matrix from position data.
 
     Constructs the design matrix by taking the tensor product of 1D B-spline
@@ -159,7 +168,7 @@ def build_2d_spline_basis(
 
 def evaluate_basis(
     position: np.ndarray,
-    basis_info: dict,
+    basis_info: dict[str, Any],
 ) -> np.ndarray:
     """Evaluate a previously constructed 2D spline basis at new positions.
 
@@ -358,6 +367,26 @@ class PlaceFieldModel(SGDFittableMixin):
     >>> rate_map = model.predict_rate_map(grid_positions, time_slice=slice(0, 1000))
     """
 
+    # Set by fit / fit_sgd; reading one before then raises NotFittedError.
+    # Spline basis and state dimension.
+    basis_info: FittedAttribute[dict[str, Any]] = FittedAttribute()
+    n_basis_per_neuron: FittedAttribute[int] = FittedAttribute()
+    n_basis: FittedAttribute[int] = FittedAttribute()  # total state dim
+    # Dynamics parameters (initialized from the data at fit entry).
+    transition_matrix: FittedAttribute[Array] = FittedAttribute()
+    process_cov: FittedAttribute[Array] = FittedAttribute()
+    init_mean: FittedAttribute[Array] = FittedAttribute()
+    init_cov: FittedAttribute[Array] = FittedAttribute()
+    # Posteriors.
+    smoother_mean: FittedAttribute[Array] = FittedAttribute()
+    smoother_cov: FittedAttribute[Array | BlockDiagonalCovariance] = FittedAttribute()
+    smoother_cross_cov: FittedAttribute[Array | BlockDiagonalCovariance] = (
+        FittedAttribute()
+    )
+    filtered_mean: FittedAttribute[Array] = FittedAttribute()
+    filtered_cov: FittedAttribute[Array | BlockDiagonalCovariance] = FittedAttribute()
+    _sgd_n_time: FittedAttribute[int] = FittedAttribute()
+
     def __init__(
         self,
         dt: float,
@@ -403,40 +432,28 @@ class PlaceFieldModel(SGDFittableMixin):
         self.update_init_state = update_init_state
 
         # Populated during fit
-        self.basis_info: dict | None = None
-        self.n_basis_per_neuron: int | None = None
-        self.n_basis: int | None = None  # total state dim
         self.n_neurons: int = 1
-        self.transition_matrix: Array | None = None
-        self.process_cov: Array | None = None
-        self.init_mean: Array | None = None
-        self.init_cov: Array | None = None
-        self.smoother_mean: Array | None = None
-        self.smoother_cov: Array | BlockDiagonalCovariance | None = None
-        self.smoother_cross_cov: Array | BlockDiagonalCovariance | None = None
         # Block-diagonal dispatch: populated at fit/fit_sgd entry via
         # _detect_block_structure. If both are ints, the filter/smoother
         # dispatch to the block-diagonal fast path. None means dense.
         self._block_n_neurons: int | None = None
         self._block_size: int | None = None
-        self.filtered_mean: Array | None = None
-        self.filtered_cov: Array | BlockDiagonalCovariance | None = None
         self.log_likelihoods: list[float] = []
         self._total_spikes: int = 0
         self._n_time: int = 0
 
     def __repr__(self) -> str:
-        fitted = self.smoother_mean is not None
+        fitted = is_set(self, "smoother_mean")
         parts = [
             f"dt={self.dt}",
             f"n_interior_knots={self.n_interior_knots}",
             f"process_noise_structure={self.process_noise_structure}",
             f"fitted={fitted}",
         ]
-        if fitted and self.process_cov is not None:
+        if fitted and is_set(self, "process_cov"):
             q_mean = float(jnp.diag(self.process_cov).mean())
             parts.append(f"Q_diag_mean={q_mean:.2e}")
-        if fitted and self.n_basis_per_neuron is not None:
+        if fitted and is_set(self, "n_basis_per_neuron"):
             parts.append(f"n_basis={self.n_basis_per_neuron}")
         if fitted and self.n_neurons > 1:
             parts.append(f"n_neurons={self.n_neurons}")
@@ -449,7 +466,7 @@ class PlaceFieldModel(SGDFittableMixin):
         place_field_width: float,
         arena_range_x: tuple[float, float],
         arena_range_y: tuple[float, float],
-        **kwargs,
+        **kwargs: Any,
     ) -> "PlaceFieldModel":
         """Create a model with knot spacing matched to place field size.
 
@@ -515,7 +532,6 @@ class PlaceFieldModel(SGDFittableMixin):
             raise ValueError(
                 f"neuron_idx={neuron_idx} out of range for n_neurons={self.n_neurons}"
             )
-        assert self.n_basis_per_neuron is not None, "Model not initialized"
         nb = self.n_basis_per_neuron
         start = neuron_idx * nb
         return slice(start, start + nb), nb
@@ -535,8 +551,6 @@ class PlaceFieldModel(SGDFittableMixin):
         -------
         Array, shape (n_time, n_neurons, n_basis)
         """
-        assert self.n_basis_per_neuron is not None, "Model not initialized"
-        assert self.n_basis is not None, "Model not initialized"
         nb = self.n_basis_per_neuron
         n_time = Z_base.shape[0]
         Z_base_jnp = jnp.asarray(Z_base)
@@ -549,20 +563,11 @@ class PlaceFieldModel(SGDFittableMixin):
 
     def _check_fitted(self, method_name: str) -> None:
         """Raise if the model has not been fitted."""
-        if self.smoother_mean is None:
+        if not is_set(self, "smoother_mean"):
             raise NotFittedError(
                 f"Model has not been fitted. "
                 f"Call model.fit(position, spikes) before {method_name}()."
             )
-        # These are always set before smoother_mean; assert for type narrowing
-        assert self.basis_info is not None
-        assert self.n_basis is not None
-        assert self.n_basis_per_neuron is not None
-        assert self.transition_matrix is not None
-        assert self.process_cov is not None
-        assert self.init_mean is not None
-        assert self.init_cov is not None
-        assert self.smoother_cov is not None
 
     def _build_spline_basis_matrix(
         self,
@@ -601,7 +606,6 @@ class PlaceFieldModel(SGDFittableMixin):
 
         Also sets ``self.n_basis``.
         """
-        assert self.n_basis_per_neuron is not None
         if self.n_neurons == 1:
             self.n_basis = self.n_basis_per_neuron
             return Z_base
@@ -642,7 +646,6 @@ class PlaceFieldModel(SGDFittableMixin):
 
     def _initialize_parameters(self) -> None:
         """Initialize model parameters with scalar defaults (no warm-start)."""
-        assert self.n_basis is not None, "Must build the spline basis first"
         n = self.n_basis
         self.transition_matrix = jnp.eye(n)
         self.process_cov = jnp.eye(n) * self.init_process_noise
@@ -721,7 +724,6 @@ class PlaceFieldModel(SGDFittableMixin):
         init_cov : Array, shape (n_basis, n_basis)
             Laplace posterior covariance. Block-diagonal for multi-neuron.
         """
-        assert self.n_basis_per_neuron is not None
         nb = self.n_basis_per_neuron
         Z_base = jnp.asarray(Z_base)
         spikes = jnp.asarray(spikes)
@@ -835,7 +837,6 @@ class PlaceFieldModel(SGDFittableMixin):
         warm-started — the scalar defaults are fine because EM / SGD
         updates them during fitting).
         """
-        assert self.n_basis_per_neuron is not None
         if self.n_neurons == 1:
             self.n_basis = self.n_basis_per_neuron
         else:
@@ -895,10 +896,6 @@ class PlaceFieldModel(SGDFittableMixin):
             return None, None
         if self._log_intensity_func is not log_conditional_intensity:
             return None, None
-        assert self.n_basis_per_neuron is not None, "Model not initialized"
-        assert self.init_cov is not None, "Model not initialized"
-        assert self.transition_matrix is not None, "Model not initialized"
-        assert self.process_cov is not None, "Model not initialized"
         n_state = self.n_neurons * self.n_basis_per_neuron
         if (
             self.init_cov.shape != (n_state, n_state)
@@ -988,10 +985,6 @@ class PlaceFieldModel(SGDFittableMixin):
         come back as ``BlockDiagonalCovariance`` containers -- the dense
         ``(n_time, n_state, n_state)`` arrays are never materialised.
         """
-        assert self.init_mean is not None, "Model not initialized"
-        assert self.init_cov is not None, "Model not initialized"
-        assert self.transition_matrix is not None, "Model not initialized"
-        assert self.process_cov is not None, "Model not initialized"
         (
             self.smoother_mean,
             self.smoother_cov,
@@ -1059,14 +1052,6 @@ class PlaceFieldModel(SGDFittableMixin):
         kept diagonal (its constrained maximiser is the diagonal of
         ``P_{0|T}``).
         """
-        assert self.smoother_mean is not None, "E-step must run before M-step"
-        assert self.smoother_cov is not None, "E-step must run before M-step"
-        assert self.smoother_cross_cov is not None, "E-step must run before M-step"
-        assert self.n_basis is not None, "Model not initialized"
-        assert self.init_mean is not None, "Model not initialized"
-        assert self.init_cov is not None, "Model not initialized"
-        assert self.transition_matrix is not None, "Model not initialized"
-        assert self.process_cov is not None, "Model not initialized"
         sm = self.smoother_mean
         sc = self.smoother_cov
         scc = self.smoother_cross_cov
@@ -1332,34 +1317,39 @@ class PlaceFieldModel(SGDFittableMixin):
         # reads the design form through a holder the M-step may update.
         design_holder = {"design_matrix": design_matrix}
 
+        posterior_keys = (
+            "smoother_mean",
+            "smoother_cov",
+            "smoother_cross_cov",
+            "filtered_mean",
+            "filtered_cov",
+        )
+        snapshot_keys = posterior_keys + (
+            "transition_matrix",
+            "process_cov",
+            "init_mean",
+            "init_cov",
+            "_block_n_neurons",
+            "_block_size",
+        )
+
         def _capture_state() -> dict[str, object]:
-            return {
-                "smoother_mean": self.smoother_mean,
-                "smoother_cov": self.smoother_cov,
-                "smoother_cross_cov": self.smoother_cross_cov,
-                "filtered_mean": self.filtered_mean,
-                "filtered_cov": self.filtered_cov,
-                "transition_matrix": self.transition_matrix,
-                "process_cov": self.process_cov,
-                "init_mean": self.init_mean,
-                "init_cov": self.init_cov,
-                "_block_n_neurons": self._block_n_neurons,
-                "_block_size": self._block_size,
-            }
+            # Unset fitted attributes are left out and unset again on restore.
+            return {k: getattr(self, k) for k in snapshot_keys if hasattr(self, k)}
 
         def _restore_state(state: dict[str, object]) -> None:
-            for key, value in state.items():
-                setattr(self, key, value)
+            for key in snapshot_keys:
+                if key in state:
+                    setattr(self, key, state[key])
+                else:
+                    delattr(self, key)
 
         def _clear_posteriors() -> None:
             # A non-finite first E-step has no accepted state to roll back
             # to: drop the posteriors it installed so the model reads as
             # unfitted (``_check_fitted``) instead of holding NaN output.
-            self.smoother_mean = None
-            self.smoother_cov = None
-            self.smoother_cross_cov = None
-            self.filtered_mean = None
-            self.filtered_cov = None
+            for key in posterior_keys:
+                delattr(self, key)
 
         def _e_step() -> float:
             return float(self._e_step(design_holder["design_matrix"], spikes))
@@ -1408,7 +1398,7 @@ class PlaceFieldModel(SGDFittableMixin):
         # Saturation diagnostic: post-hoc check on the final filtered posterior.
         # Runs after fit completes so a substantial fraction of clipped bins
         # surfaces as a warning rather than a silently degraded fit.
-        if self.filtered_mean is not None:
+        if is_set(self, "filtered_mean"):
             self._warn_if_rate_saturated(
                 design_matrix, self.filtered_mean, context="fit"
             )
@@ -1421,7 +1411,7 @@ class PlaceFieldModel(SGDFittableMixin):
         self,
         position: ArrayLike,
         spikes: ArrayLike,
-        optimizer: object | None = None,
+        optimizer: "optax.GradientTransformation | None" = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
@@ -1493,7 +1483,7 @@ class PlaceFieldModel(SGDFittableMixin):
 
         # Build the shared spline basis, then (optionally) warm-start.
         #
-        # The ``elif self.init_mean is None`` guard on the cold-start path:
+        # The ``elif not is_set(self, "init_mean")`` guard on the cold-start path:
         # unlike ``fit`` (EM), which always resets init state, repeated ``fit_sgd(..., warm_start=
         # False)`` calls on the same model reuse the existing init state —
         # this is intentional for users who want to resume optimization
@@ -1502,7 +1492,7 @@ class PlaceFieldModel(SGDFittableMixin):
         self.n_basis = self.n_neurons * self.n_basis_per_neuron
         if warm_start:
             self._warm_start_parameters(Z_base, spikes, warm_start_window)
-        elif self.init_mean is None:
+        elif not is_set(self, "init_mean"):
             self._initialize_parameters()
 
         # Numerical sanity check: validate init_cov is PSD and warn if
@@ -1538,15 +1528,15 @@ class PlaceFieldModel(SGDFittableMixin):
         return self._sgd_n_time
 
     def _check_sgd_initialized(self) -> None:
-        if self.init_mean is None:
+        if not is_set(self, "init_mean"):
             raise RuntimeError(
                 "Model parameters not initialized. "
                 "Call fit_sgd(position, spikes) not super().fit_sgd() directly."
             )
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
-        params: dict = {}
-        spec: dict = {}
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
+        params: SGDParams = {}
+        spec: SGDParamSpec = {}
 
         if self.update_process_cov:
             if self.process_noise_structure == "diagonal":
@@ -1571,7 +1561,9 @@ class PlaceFieldModel(SGDFittableMixin):
 
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, design_matrix: Array, spikes: Array) -> Array:
+    def _sgd_loss_fn(
+        self, params: SGDParams, design_matrix: Array, spikes: Array
+    ) -> Array:
         A = params.get("transition_matrix", self.transition_matrix)
         m0 = params.get("init_mean", self.init_mean)
         P0 = params.get("init_cov", self.init_cov)
@@ -1608,7 +1600,7 @@ class PlaceFieldModel(SGDFittableMixin):
         )
         return -marginal_ll
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         if "process_diag" in params:
             self.process_cov = jnp.diag(params["process_diag"])
         elif "process_scalar" in params:
@@ -1652,7 +1644,6 @@ class PlaceFieldModel(SGDFittableMixin):
         # Saturation diagnostic: post-hoc check on the filtered posterior.
         # If a substantial fraction of bins saturate the physiological
         # ceiling, the filter output is unreliable.
-        assert self.filtered_mean is not None
         self._warn_if_rate_saturated(
             design_matrix, self.filtered_mean, context="fit_sgd"
         )
@@ -1665,7 +1656,6 @@ class PlaceFieldModel(SGDFittableMixin):
         dense covariance in one indexing expression (no ``[time_slice]``
         intermediate of the full ``(n_t, n_state, n_state)`` array).
         """
-        assert self.smoother_cov is not None
         if isinstance(self.smoother_cov, BlockDiagonalCovariance):
             return self.smoother_cov.neuron_blocks(neuron_idx, time_slice)
         s, _ = self._neuron_weights(neuron_idx)
@@ -1689,7 +1679,6 @@ class PlaceFieldModel(SGDFittableMixin):
         bounds over the slice. This is a representative interval for the
         time-averaged map, not an exact quantile of the log-normal mixture.
         """
-        assert self.smoother_mean is not None
 
         s, _ = self._neuron_weights(neuron_idx)
         means = np.asarray(self.smoother_mean[time_slice, s])
@@ -1774,9 +1763,6 @@ class PlaceFieldModel(SGDFittableMixin):
         your intensity function for exact predictions.
         """
         self._check_fitted("predict_rate_map")
-        assert self.basis_info is not None
-        assert self.smoother_mean is not None
-        assert self.smoother_cov is not None
 
         if self._log_intensity_func is not log_conditional_intensity:
             warnings.warn(
@@ -1822,8 +1808,6 @@ class PlaceFieldModel(SGDFittableMixin):
             Estimated place field center (x, y) in each block.
         """
         self._check_fitted("predict_center")
-        assert self.basis_info is not None
-        assert self.smoother_mean is not None
 
         Z_grid = evaluate_basis(grid_positions, self.basis_info)
         n_time = self.smoother_mean.shape[0]
@@ -1877,7 +1861,6 @@ class PlaceFieldModel(SGDFittableMixin):
         >>> plt.pcolormesh(x_edges, y_edges, rate.reshape(len(y_edges), len(x_edges)))
         """
         self._check_fitted("make_grid")
-        assert self.basis_info is not None
         x = np.linspace(self.basis_info["x_lo"], self.basis_info["x_hi"], n_grid)
         y = np.linspace(self.basis_info["y_lo"], self.basis_info["y_hi"], n_grid)
         xx, yy = np.meshgrid(x, y)
@@ -1907,11 +1890,6 @@ class PlaceFieldModel(SGDFittableMixin):
             Marginal log-likelihood of the held-out data.
         """
         self._check_fitted("score")
-        assert self.basis_info is not None
-        assert self.init_mean is not None
-        assert self.init_cov is not None
-        assert self.transition_matrix is not None
-        assert self.process_cov is not None
 
         position = np.asarray(position)
         spikes = jnp.asarray(spikes)
@@ -1992,8 +1970,6 @@ class PlaceFieldModel(SGDFittableMixin):
             Lower and upper bounds for each weight at each time step.
         """
         self._check_fitted("get_state_confidence_interval")
-        assert self.smoother_mean is not None
-        assert self.smoother_cov is not None
         return get_confidence_interval(
             self.smoother_mean, self.smoother_cov, alpha=alpha
         )
@@ -2010,7 +1986,6 @@ class PlaceFieldModel(SGDFittableMixin):
         learned, and initial mean + diagonal covariance if learned.
         """
         self._check_fitted("n_free_params")
-        assert self.n_basis is not None  # narrowed by _check_fitted
         nb = self.n_basis
         n = 0
         if self.update_process_cov:
@@ -2044,7 +2019,6 @@ class PlaceFieldModel(SGDFittableMixin):
         float
         """
         self._check_fitted("bic")
-        assert self.smoother_mean is not None
         n = self.smoother_mean.shape[0]
         return float(-2.0 * self.log_likelihoods[-1] + self.n_free_params * np.log(n))
 
@@ -2072,8 +2046,6 @@ class PlaceFieldModel(SGDFittableMixin):
             process noise, and drift metrics.
         """
         self._check_fitted("summary")
-        assert self.smoother_mean is not None
-        assert self.process_cov is not None
 
         n_time = self.smoother_mean.shape[0]
         session_duration = n_time * self.dt
@@ -2139,7 +2111,7 @@ class PlaceFieldModel(SGDFittableMixin):
         n_grid: int = 80,
         n_blocks: int = 20,
         neuron_idx: int = 0,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Summarize place field drift over the session.
 
         Parameters
@@ -2161,8 +2133,6 @@ class PlaceFieldModel(SGDFittableMixin):
             block_times : (n_blocks,) — center time of each block (seconds)
         """
         self._check_fitted("drift_summary")
-        assert self.basis_info is not None
-        assert self.smoother_mean is not None
 
         grid, _, _ = self.make_grid(n_grid)
         Z_grid = evaluate_basis(grid, self.basis_info)
@@ -2207,8 +2177,8 @@ class PlaceFieldModel(SGDFittableMixin):
         n_time_bins: int = 3,
         n_grid: int = 50,
         neuron_idx: int = 0,
-        ax: np.ndarray | None = None,
-    ):
+        ax: "NDArray[np.object_] | None" = None,
+    ) -> "Figure":
         """Plot estimated rate maps in temporal bins.
 
         Parameters
@@ -2230,7 +2200,6 @@ class PlaceFieldModel(SGDFittableMixin):
         import matplotlib.pyplot as plt
 
         self._check_fitted("plot_rate_maps")
-        assert self.smoother_mean is not None
 
         grid, x_edges, y_edges = self.make_grid(n_grid)
         n_time = self.smoother_mean.shape[0]
@@ -2259,7 +2228,7 @@ class PlaceFieldModel(SGDFittableMixin):
                 axes = [axes]
         else:
             axes = np.atleast_1d(ax)
-            fig = axes[0].figure
+            fig = _root_figure(axes[0])
 
         for i, (rate_map, label) in enumerate(zip(rate_maps, labels)):
             im = axes[i].pcolormesh(
@@ -2279,8 +2248,8 @@ class PlaceFieldModel(SGDFittableMixin):
         self,
         n_blocks: int = 20,
         n_grid: int = 80,
-        ax=None,
-    ):
+        ax: "Axes | None" = None,
+    ) -> "Figure":
         """Plot the place field center trajectory over time.
 
         Colors the trajectory from dark (start) to bright (end).
@@ -2307,7 +2276,7 @@ class PlaceFieldModel(SGDFittableMixin):
         if ax is None:
             fig, ax = plt.subplots(figsize=(6, 6))
         else:
-            fig = ax.figure
+            fig = _root_figure(ax)
 
         cmap = plt.get_cmap("viridis")
         colors = cmap(np.linspace(0, 1, n_blocks))

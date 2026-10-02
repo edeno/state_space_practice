@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.oscillator_models import DirectedInfluenceModel
 from state_space_practice.oscillator_utils import (
     construct_common_oscillator_process_covariance,
@@ -175,7 +176,8 @@ class TestWarmInitConvergence:
         np.testing.assert_array_equal(
             np.array(model.discrete_transition_matrix), Z_cold
         )
-        assert model.smoother_discrete_state_prob is None
+        with pytest.raises(NotFittedError):
+            _ = model.smoother_discrete_state_prob
 
     def test_warm_init_converges_to_higher_accuracy(self, dim_simulation):
         """Warm init should converge to a strictly higher, stable accuracy.

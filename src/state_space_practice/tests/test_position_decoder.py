@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from state_space_practice import position_decoder
-from state_space_practice.exceptions import StateSpaceWarning
+from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.kalman import rts_backward_scan
 from state_space_practice.point_process_kalman import (
     _point_process_laplace_update,
@@ -1145,8 +1145,15 @@ class TestPositionDecoder:
 
     def test_decode_requires_fit(self):
         decoder = PositionDecoder(dt=0.004)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(NotFittedError, match="before fitting"):
             decoder.decode(spikes=np.zeros((10, 2)))
+
+    def test_rate_maps_unset_before_fit(self):
+        decoder = PositionDecoder(dt=0.004)
+        with pytest.raises(NotFittedError, match="rate_maps"):
+            _ = decoder.rate_maps
+        assert not hasattr(decoder, "rate_maps")
+        assert "fitted=False" in repr(decoder)
 
     def test_filter_vs_smoother_methods(self, trajectory_data):
         decoder = PositionDecoder(dt=trajectory_data["dt"])

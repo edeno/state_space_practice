@@ -23,12 +23,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`kalman.kalman_filter_update` / `kalman.kalman_smoother_update`**: public
   names for the single-step Kalman updates.
 - **Optional extras** `plot` (matplotlib) and `notebooks` (matplotlib, pandas).
-- **Tooling**: GitHub Actions CI (ruff, ruff format, mypy on the type-clean
-  modules, fast tests on Python 3.10-3.12, nightly full suite),
+- **Tooling**: GitHub Actions CI (ruff, ruff format, mypy on the entire
+  package, fast tests on Python 3.10-3.12, nightly full suite),
   `.pre-commit-config.yaml` (ruff, ruff-format, nbstripout), `[tool.ruff]`
-  config, and `HYPOTHESIS_PROFILE` selection in the test conftest. mypy gates
-  the 24 modules listed in `[tool.mypy] files`; the other modules are not yet
-  type-clean.
+  config, and `HYPOTHESIS_PROFILE` selection in the test conftest. mypy checks
+  all package modules except tests with the `--strict` checks enabled
+  (every function annotated, generic types parameterized, no implicit
+  re-exports); calls into untyped JAX APIs are exempt. SGD parameter dicts are
+  typed `sgd_fitting.SGDParams` / `SGDParamSpec`. Jitted functions are declared with
+  `utils.typed_jit`, a `jax.jit` that keeps the wrapped signature visible to
+  mypy, so arguments and results at jitted calls are type-checked.
 - **`em_driver.run_em`**: the shared EM loop (E-step, convergence, rollback,
   M-step) used by the oscillator models, `PointProcessModel`, `PlaceFieldModel`,
   the switching point-process models and `SmithLearningModel`. Invalid option
@@ -140,6 +144,43 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **Reading a fitted attribute before fitting raises `NotFittedError`**
+  instead of returning `None` (or a bare `AttributeError`). Fitted outputs of
+  every model (smoothed/filtered states, posteriors, log likelihoods,
+  histories, ...) are declared with the new `fitted_state.FittedAttribute`,
+  so type checkers see `Array` rather than `Array | None`. The error is also an
+  `AttributeError`, so `hasattr(model, "smoother_mean")` is `False` before
+  fitting; `fitted_state.is_set(model, name)` tests without raising. Values
+  that can legitimately be `None` after fitting (e.g. covariate weights of a
+  model without covariates, GPB2-only smoother outputs under GPB1, `n_iter_`
+  after an SGD-only fit) keep `None`. `PointProcessModel` and `PositionDecoder`
+  raise `NotFittedError` (a `RuntimeError`) where they raised `RuntimeError`.
+- **Subclasses that could not stand in for their parent no longer inherit
+  from it**: `CovariateChoiceModel` takes covariates positionally after
+  `choices` in `fit` / `fit_sgd`, so it now derives from the shared
+  `_MultinomialChoiceBase` instead of `MultinomialChoiceModel`; and
+  `SwitchingHamiltonianJointModel`, whose `filter` / `smooth` also return
+  discrete-state probabilities, derives from the shared `_JointHamiltonianBase`
+  instead of `JointHamiltonianModel`. Behavior and signatures are unchanged;
+  only `isinstance` / `issubclass` against the former parent change.
+- **`DirectedInfluenceModel.fit_sgd`**: `connectivity_penalty` now follows
+  `skip_init` (it was inserted before it, so a positional `skip_init` bound to
+  the penalty).
+- **Long result tuples are NamedTuples**: `switching_kalman_filter` and
+  `switching_point_process_filter` return `SwitchingFilterResult`,
+  `switching_kalman_smoother` / `switching_kalman_smoother_gpb2` return
+  `SwitchingSmootherResult` / `SwitchingSmootherGPB2Result`,
+  `switching_kalman_maximization_step` returns `SwitchingMStepResult`,
+  `smith_learning_filter` returns `SmithFilterResult`, `matern32_continuous`
+  returns `Matern32SDE`, and the Eden & Brown 2004 simulators return
+  `EdenBrownJumpSimulation` / `EdenBrownLinearSimulation`. Positional
+  unpacking and indexing are unchanged; fields can now be read by name. The
+  types are JAX pytree nodes distinct from `tuple`, so code that mixes them
+  with plain tuples in one `lax.cond` / `tree_map` must use the same type.
+- **Public array inputs are typed `ArrayLike`**: every public function and
+  method that takes a JAX array (except PRNG `key` arguments) is annotated
+  `jax.typing.ArrayLike` and converts with `jnp.asarray`, so numpy inputs
+  type-check in user code as they already ran. Return types stay `Array`.
 - **Runtime dependencies trimmed** to what the package imports: numpy, scipy,
   jax, optax, patsy, networkx, scikit-learn (with minimum versions).
   matplotlib moved to the `plot` extra; pandas to `notebooks`; jaxlib (pulled
@@ -356,6 +397,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Plotting into axes inside a matplotlib SubFigure**: the plot methods of
+  `MultinomialChoiceModel`, `CovariateChoiceModel`, `PlaceFieldModel` and
+  `PositionDecoder` that accept `ax` called `tight_layout` on `ax.figure`, which
+  is the SubFigure (no `tight_layout`) and raised `AttributeError`; they now
+  use the root Figure.
 - **Fresh clones install**: the `neurospatial` source no longer points at a
   sibling `../neurospatial` checkout; uv resolves it from a git commit that
   declares version 0.8.0 (neurospatial 0.8.0 is not on PyPI yet, so pip users

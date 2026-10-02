@@ -9,16 +9,21 @@ References
 5. https://github.com/Stephen-Lab-BU/Switching_Oscillator_Networks
 """
 
+from __future__ import annotations
+
 import functools
 import logging
 import math
 import warnings
+from collections.abc import Callable
 from functools import partial
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.scipy.special import logsumexp
+from jax.typing import ArrayLike
 
 from state_space_practice.kalman import (
     _gain_solve,
@@ -35,6 +40,7 @@ from state_space_practice.utils import (
     psd_solve,
     stabilize_covariance,
     symmetrize,
+    typed_jit,
     zero_preserving_log,
 )
 from state_space_practice.utils import divide_safe as _divide_safe
@@ -45,6 +51,67 @@ from state_space_practice.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Result types. NamedTuples, so positional unpacking keeps working; field
+# shapes are documented in the Returns section of the producing function.
+
+
+class SwitchingFilterResult(NamedTuple):
+    """Output of :func:`switching_kalman_filter` and the switching point-process filter."""
+
+    state_cond_filter_mean: jax.Array
+    state_cond_filter_cov: jax.Array
+    filter_discrete_state_prob: jax.Array
+    pair_cond_filter_mean: jax.Array
+    pair_cond_filter_cov: jax.Array
+    pair_cond_filter_prob: jax.Array
+    marginal_log_likelihood: jax.Array
+
+
+class SwitchingSmootherResult(NamedTuple):
+    """Output of :func:`switching_kalman_smoother` (GPB1)."""
+
+    overall_smoother_mean: jax.Array
+    overall_smoother_cov: jax.Array
+    smoother_discrete_state_prob: jax.Array
+    smoother_joint_discrete_state_prob: jax.Array
+    overall_smoother_cross_cov: jax.Array
+    state_cond_smoother_means: jax.Array
+    state_cond_smoother_covs: jax.Array
+    pair_cond_smoother_cross_covs: jax.Array
+    pair_cond_smoother_means: jax.Array
+
+
+class SwitchingSmootherGPB2Result(NamedTuple):
+    """Output of :func:`switching_kalman_smoother_gpb2`: the GPB1 fields plus the
+    pair-conditional covariances and next-step means its M-step uses."""
+
+    overall_smoother_mean: jax.Array
+    overall_smoother_cov: jax.Array
+    smoother_discrete_state_prob: jax.Array
+    smoother_joint_discrete_state_prob: jax.Array
+    overall_smoother_cross_cov: jax.Array
+    state_cond_smoother_means: jax.Array
+    state_cond_smoother_covs: jax.Array
+    pair_cond_smoother_cross_covs: jax.Array
+    pair_cond_smoother_means: jax.Array
+    pair_cond_smoother_covs: jax.Array
+    next_pair_cond_smoother_means: jax.Array
+
+
+class SwitchingMStepResult(NamedTuple):
+    """Parameters returned by :func:`switching_kalman_maximization_step`."""
+
+    continuous_transition_matrix: jax.Array
+    measurement_matrix: jax.Array
+    process_cov: jax.Array
+    measurement_cov: jax.Array
+    init_mean: jax.Array
+    init_cov: jax.Array
+    discrete_transition_matrix: jax.Array
+    init_discrete_state_prob: jax.Array
+
 
 _kalman_filter_update_per_discrete_state_pair = jax.vmap(
     jax.vmap(
@@ -57,21 +124,21 @@ _kalman_filter_update_per_discrete_state_pair = jax.vmap(
 )  # shape (n_discrete_states, n_discrete_states, n_obs_dim)
 
 
-@jax.jit
+@typed_jit
 def collapse_gaussian_mixture(
-    conditional_means_x: jax.Array,
-    conditional_cov: jax.Array,
-    mixing_weights: jax.Array,
+    conditional_means_x: ArrayLike,
+    conditional_cov: ArrayLike,
+    mixing_weights: ArrayLike,
 ) -> tuple[jax.Array, jax.Array]:
     """Collapse a mixture of Gaussians.
 
     Parameters
     ----------
-    conditional_means_x : jax.Array, shape (n_dims, n_discrete_states)
+    conditional_means_x : ArrayLike, shape (n_dims, n_discrete_states)
         E[X | S = j]
-    conditional_cov : jax.Array, shape (n_dims, n_dims, n_discrete_states)
+    conditional_cov : ArrayLike, shape (n_dims, n_dims, n_discrete_states)
         Cov[X | S = j]
-    mixing_weights : jax.Array, shape (n_discrete_states,)
+    mixing_weights : ArrayLike, shape (n_discrete_states,)
         P[S = j]
 
     Returns
@@ -81,6 +148,9 @@ def collapse_gaussian_mixture(
     unconditional_cov_x : jax.Array, shape (n_dims, n_dims)
         Cov[X]
     """
+    conditional_means_x = jnp.asarray(conditional_means_x)
+    conditional_cov = jnp.asarray(conditional_cov)
+    mixing_weights = jnp.asarray(mixing_weights)
     unconditional_mean_x = conditional_means_x @ mixing_weights  # E[X]
     diff_x = conditional_means_x - unconditional_mean_x[:, None]
 
@@ -94,22 +164,22 @@ def collapse_gaussian_mixture(
 
 
 def collapse_gaussian_mixture_cross_covariance(
-    conditional_means_x: jax.Array,
-    conditional_means_y: jax.Array,
-    conditional_cross_cov: jax.Array,
-    mixing_weights: jax.Array,
+    conditional_means_x: ArrayLike,
+    conditional_means_y: ArrayLike,
+    conditional_cross_cov: ArrayLike,
+    mixing_weights: ArrayLike,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Compute cross-covariance when collapsing a Gaussian mixture.
 
     Parameters
     ----------
-    conditional_means_x : jax.Array, shape (n_dims, n_discrete_states)
+    conditional_means_x : ArrayLike, shape (n_dims, n_discrete_states)
         E[X | S = j]
-    conditional_means_y : jax.Array, shape (n_dims, n_discrete_states)
+    conditional_means_y : ArrayLike, shape (n_dims, n_discrete_states)
         E[Y | S = j]
-    conditional_cross_cov : jax.Array, shape (n_dims, n_dims, n_discrete_states)
+    conditional_cross_cov : ArrayLike, shape (n_dims, n_dims, n_discrete_states)
         Cov[X, Y | S = j], conditional cross-covariance per discrete state.
-    mixing_weights : jax.Array, shape (n_discrete_states,)
+    mixing_weights : ArrayLike, shape (n_discrete_states,)
         P[S = j]
 
     Returns
@@ -121,6 +191,10 @@ def collapse_gaussian_mixture_cross_covariance(
     unconditional_cov_xy : jax.Array, shape (n_dims, n_dims)
         Cov[X, Y]
     """
+    conditional_means_x = jnp.asarray(conditional_means_x)
+    conditional_means_y = jnp.asarray(conditional_means_y)
+    conditional_cross_cov = jnp.asarray(conditional_cross_cov)
+    mixing_weights = jnp.asarray(mixing_weights)
 
     unconditional_mean_x = conditional_means_x @ mixing_weights  # E[X]
     unconditional_mean_y = conditional_means_y @ mixing_weights  # E[Y]
@@ -790,26 +864,18 @@ def _first_timestep_kalman_update(
     )
 
 
-@jax.jit
+@typed_jit
 def switching_kalman_filter(
-    init_state_cond_mean: jax.Array,
-    init_state_cond_cov: jax.Array,
-    init_discrete_state_prob: jax.Array,
-    obs: jax.Array,
-    discrete_transition_matrix: jax.Array,
-    continuous_transition_matrix: jax.Array,
-    process_cov: jax.Array,
-    measurement_matrix: jax.Array,
-    measurement_cov: jax.Array,
-) -> tuple[
-    jax.Array,  # Filtered mean of the continuous latent state
-    jax.Array,  # Filtered covariance of the continuous latent state
-    jax.Array,  # Filtered probability of the discrete states
-    jax.Array,  # Pair-conditional filter mean trajectory
-    jax.Array,  # Pair-conditional filter covariance trajectory
-    jax.Array,  # Pair-conditional discrete probability trajectory
-    jax.Array,  # Marginal log likelihood of the observations (scalar array)
-]:
+    init_state_cond_mean: ArrayLike,
+    init_state_cond_cov: ArrayLike,
+    init_discrete_state_prob: ArrayLike,
+    obs: ArrayLike,
+    discrete_transition_matrix: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    measurement_matrix: ArrayLike,
+    measurement_cov: ArrayLike,
+) -> SwitchingFilterResult:
     """Switching Kalman filter for a linear Gaussian state space model with discrete states.
 
     This filter uses the x₁ convention where init parameters represent the state
@@ -822,25 +888,25 @@ def switching_kalman_filter(
 
     Parameters
     ----------
-    init_state_cond_mean : jax.Array, shape (n_cont_states, n_discrete_states)
+    init_state_cond_mean : ArrayLike, shape (n_cont_states, n_discrete_states)
         Prior belief about x₁ given S₁, p(x₁ | S₁ = j) for each discrete state.
         This is the prior on the latent state *at* the first observation, before
         incorporating y₁.
-    init_state_cond_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
+    init_state_cond_cov : ArrayLike, shape (n_cont_states, n_cont_states, n_discrete_states)
         Prior covariance of x₁ given S₁ for each discrete state.
-    init_discrete_state_prob : jax.Array, shape (n_discrete_states,)
+    init_discrete_state_prob : ArrayLike, shape (n_discrete_states,)
         Prior discrete state probabilities p(S₁ = j).
-    obs : jax.Array, shape (n_time, n_obs_dim)
+    obs : ArrayLike, shape (n_time, n_obs_dim)
         Observations $y_{1:T}$
-    discrete_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
+    discrete_transition_matrix : ArrayLike, shape (n_discrete_states, n_discrete_states)
         Transition matrix for the discrete states $B$
-    continuous_transition_matrix : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
+    continuous_transition_matrix : ArrayLike, shape (n_cont_states, n_cont_states, n_discrete_states)
         Transition matrix for the continuous states $A$
-    process_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
+    process_cov : ArrayLike, shape (n_cont_states, n_cont_states, n_discrete_states)
         Process noise covariance matrix. $\\Sigma$
-    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states, n_discrete_states)
+    measurement_matrix : ArrayLike, shape (n_obs_dim, n_cont_states, n_discrete_states)
         Map observations to the continuous states $H$
-    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim, n_discrete_states)
+    measurement_cov : ArrayLike, shape (n_obs_dim, n_obs_dim, n_discrete_states)
         Measurement variance. $R$
 
     Returns
@@ -867,6 +933,15 @@ def switching_kalman_filter(
         Marginal log likelihood of the observations (scalar array)
 
     """
+    init_state_cond_mean = jnp.asarray(init_state_cond_mean)
+    init_state_cond_cov = jnp.asarray(init_state_cond_cov)
+    init_discrete_state_prob = jnp.asarray(init_discrete_state_prob)
+    obs = jnp.asarray(obs)
+    discrete_transition_matrix = jnp.asarray(discrete_transition_matrix)
+    continuous_transition_matrix = jnp.asarray(continuous_transition_matrix)
+    process_cov = jnp.asarray(process_cov)
+    measurement_matrix = jnp.asarray(measurement_matrix)
+    measurement_cov = jnp.asarray(measurement_cov)
 
     def _step(
         carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
@@ -1065,27 +1140,27 @@ def switching_kalman_filter(
         [first_pair_cond_prob[None, ...], rest_pair_cond_filter_prob], axis=0
     )
 
-    return (
-        state_cond_filter_mean,
-        state_cond_filter_cov,
-        filter_discrete_state_prob,
-        pair_cond_filter_mean,
-        pair_cond_filter_cov,
-        pair_cond_filter_prob,
-        marginal_log_likelihood,
+    return SwitchingFilterResult(
+        state_cond_filter_mean=state_cond_filter_mean,
+        state_cond_filter_cov=state_cond_filter_cov,
+        filter_discrete_state_prob=filter_discrete_state_prob,
+        pair_cond_filter_mean=pair_cond_filter_mean,
+        pair_cond_filter_cov=pair_cond_filter_cov,
+        pair_cond_filter_prob=pair_cond_filter_prob,
+        marginal_log_likelihood=marginal_log_likelihood,
     )
 
 
 def switching_kalman_viterbi(
-    init_state_cond_mean: jax.Array,
-    init_state_cond_cov: jax.Array,
-    init_discrete_state_prob: jax.Array,
-    obs: jax.Array,
-    discrete_transition_matrix: jax.Array,
-    continuous_transition_matrix: jax.Array,
-    process_cov: jax.Array,
-    measurement_matrix: jax.Array,
-    measurement_cov: jax.Array,
+    init_state_cond_mean: ArrayLike,
+    init_state_cond_cov: ArrayLike,
+    init_discrete_state_prob: ArrayLike,
+    obs: ArrayLike,
+    discrete_transition_matrix: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    measurement_matrix: ArrayLike,
+    measurement_cov: ArrayLike,
 ) -> jax.Array:
     """Find the most likely discrete state sequence for a switching Kalman model.
 
@@ -1101,6 +1176,15 @@ def switching_kalman_viterbi(
     states : jax.Array, shape (n_time,)
         Most likely discrete state sequence (integer-valued).
     """
+    init_state_cond_mean = jnp.asarray(init_state_cond_mean)
+    init_state_cond_cov = jnp.asarray(init_state_cond_cov)
+    init_discrete_state_prob = jnp.asarray(init_discrete_state_prob)
+    obs = jnp.asarray(obs)
+    discrete_transition_matrix = jnp.asarray(discrete_transition_matrix)
+    continuous_transition_matrix = jnp.asarray(continuous_transition_matrix)
+    process_cov = jnp.asarray(process_cov)
+    measurement_matrix = jnp.asarray(measurement_matrix)
+    measurement_cov = jnp.asarray(measurement_cov)
     n_discrete_states = init_state_cond_mean.shape[-1]
 
     # Viterbi is not JIT-decorated, so reject a malformed prior loudly here
@@ -1137,7 +1221,9 @@ def switching_kalman_viterbi(
         return jnp.array([jnp.argmax(first_discrete_prob)], dtype=jnp.int32)
 
     # --- Forward pass: collect pair log-likelihoods -----------------------
-    def _step(carry, obs_t):
+    def _step(
+        carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array], obs_t: jax.Array
+    ) -> tuple[tuple[jax.Array, jax.Array, jax.Array, jax.Array], jax.Array]:
         prev_mean, prev_cov, prev_prob, prev_support = carry
 
         # Pair-conditional Kalman update (same as in the filter)
@@ -1199,7 +1285,9 @@ def switching_kalman_viterbi(
     # Backward pass: accumulate best future scores with pair log-likelihoods
     log_trans = zero_preserving_log(discrete_transition_matrix)
 
-    def _viterbi_backward(best_next_score, t):
+    def _viterbi_backward(
+        best_next_score: jax.Array, t: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
         # scores[i, j] = log A(i,j) + pair_log_lik(t, i, j) + best_future(j)
         scores = log_trans + pair_log_liks[t] + best_next_score[None, :]
         best_next_state = jnp.argmax(scores, axis=1)
@@ -1221,7 +1309,9 @@ def switching_kalman_viterbi(
     )
 
     # Forward trace
-    def _viterbi_forward(state, best_next_state):
+    def _viterbi_forward(
+        state: jax.Array, best_next_state: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
         next_state = best_next_state[state]
         return next_state, next_state
 
@@ -1383,25 +1473,15 @@ def _update_smoother_discrete_probabilities(
     )
 
 
-@jax.jit
+@typed_jit
 def switching_kalman_smoother(
-    filter_mean: jax.Array,
-    filter_cov: jax.Array,
-    filter_discrete_state_prob: jax.Array,
-    process_cov: jax.Array,
-    continuous_transition_matrix: jax.Array,
-    discrete_state_transition_matrix: jax.Array,
-) -> tuple[
-    jax.Array,  # Overall smoother mean
-    jax.Array,  # Overall smoother covariance
-    jax.Array,  # Smoother discrete state probabilities
-    jax.Array,  # Smoother joint discrete state probabilities
-    jax.Array,  # Overall smoother cross covariance
-    jax.Array,  # State conditional smoother means
-    jax.Array,  # State conditional smoother covariances
-    jax.Array,  # Pair conditional smoother cross covariances
-    jax.Array,  # Pair conditional smoother means
-]:
+    filter_mean: ArrayLike,
+    filter_cov: ArrayLike,
+    filter_discrete_state_prob: ArrayLike,
+    process_cov: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+    discrete_state_transition_matrix: ArrayLike,
+) -> SwitchingSmootherResult:
     """GPB1/IMM approximate switching Kalman smoother.
 
     This is an approximate smoother: the forward pass collapses K^2 mixture
@@ -1412,12 +1492,12 @@ def switching_kalman_smoother(
 
     Parameters
     ----------
-    filter_mean : jax.Array, shape (n_time, n_cont_states, n_discrete_states)
-    filter_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
-    filter_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
-    process_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-    continuous_transition_matrix : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-    discrete_state_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
+    filter_mean : ArrayLike, shape (n_time, n_cont_states, n_discrete_states)
+    filter_cov : ArrayLike, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
+    filter_discrete_state_prob : ArrayLike, shape (n_time, n_discrete_states)
+    process_cov : ArrayLike, shape (n_cont_states, n_cont_states, n_discrete_states)
+    continuous_transition_matrix : ArrayLike, shape (n_cont_states, n_cont_states, n_discrete_states)
+    discrete_state_transition_matrix : ArrayLike, shape (n_discrete_states, n_discrete_states)
 
     Returns
     -------
@@ -1432,12 +1512,18 @@ def switching_kalman_smoother(
     pair_cond_smoother_means : jax.Array, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
         E[X_t | y_{1:T}, S_t=j, S_{t+1}=k] - needed for correct M-step beta computation.
     """
+    filter_mean = jnp.asarray(filter_mean)
+    filter_cov = jnp.asarray(filter_cov)
+    filter_discrete_state_prob = jnp.asarray(filter_discrete_state_prob)
+    process_cov = jnp.asarray(process_cov)
+    continuous_transition_matrix = jnp.asarray(continuous_transition_matrix)
+    discrete_state_transition_matrix = jnp.asarray(discrete_state_transition_matrix)
 
     def _step(
-        carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        carry: tuple[jax.Array, jax.Array, jax.Array],
         args: tuple[jax.Array, jax.Array, jax.Array],
     ) -> tuple[
-        tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        tuple[jax.Array, jax.Array, jax.Array],
         tuple[
             jax.Array,
             jax.Array,
@@ -1670,42 +1756,30 @@ def switching_kalman_smoother(
         [state_cond_smoother_covs, filter_cov[-1][None]], axis=0
     )
 
-    return (
-        overall_smoother_mean,
-        overall_smoother_covs,
-        smoother_discrete_state_prob,
-        smoother_joint_discrete_state_prob,
-        overall_smoother_cross_cov,
-        state_cond_smoother_means,
-        state_cond_smoother_covs,
-        pair_cond_smoother_cross_covs,
-        pair_cond_smoother_means,
+    return SwitchingSmootherResult(
+        overall_smoother_mean=overall_smoother_mean,
+        overall_smoother_cov=overall_smoother_covs,
+        smoother_discrete_state_prob=smoother_discrete_state_prob,
+        smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
+        overall_smoother_cross_cov=overall_smoother_cross_cov,
+        state_cond_smoother_means=state_cond_smoother_means,
+        state_cond_smoother_covs=state_cond_smoother_covs,
+        pair_cond_smoother_cross_covs=pair_cond_smoother_cross_covs,
+        pair_cond_smoother_means=pair_cond_smoother_means,
     )
 
 
-@jax.jit
+@typed_jit
 def switching_kalman_smoother_gpb2(
-    filter_mean: jax.Array,
-    filter_cov: jax.Array,
-    filter_discrete_state_prob: jax.Array,
-    pair_cond_filter_mean: jax.Array,
-    pair_cond_filter_cov: jax.Array,
-    pair_cond_filter_prob: jax.Array,
-    process_cov: jax.Array,
-    continuous_transition_matrix: jax.Array,
-) -> tuple[
-    jax.Array,  # overall_smoother_mean
-    jax.Array,  # overall_smoother_covs
-    jax.Array,  # smoother_discrete_state_prob
-    jax.Array,  # smoother_joint_discrete_state_prob
-    jax.Array,  # overall_smoother_cross_cov
-    jax.Array,  # state_cond_smoother_means
-    jax.Array,  # state_cond_smoother_covs
-    jax.Array,  # pair_cond_smoother_cross_covs
-    jax.Array,  # pair_cond_smoother_means
-    jax.Array,  # pair_cond_smoother_covs_mstep
-    jax.Array,  # next_pair_cond_smoother_means
-]:
+    filter_mean: ArrayLike,
+    filter_cov: ArrayLike,
+    filter_discrete_state_prob: ArrayLike,
+    pair_cond_filter_mean: ArrayLike,
+    pair_cond_filter_cov: ArrayLike,
+    pair_cond_filter_prob: ArrayLike,
+    process_cov: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+) -> SwitchingSmootherGPB2Result:
     """GPB2 (Kim second-order) switching Kalman smoother.
 
     Carries pair-conditional (S_t, S_{t+1}) Gaussians and pair discrete
@@ -1733,23 +1807,23 @@ def switching_kalman_smoother_gpb2(
 
     Parameters
     ----------
-    filter_mean : jax.Array, shape (n_time, n_cont_states, n_discrete_states)
+    filter_mean : ArrayLike, shape (n_time, n_cont_states, n_discrete_states)
         State-conditional filter mean E[x_t | S_t=j, y_{1:t}].
-    filter_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
+    filter_cov : ArrayLike, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
         State-conditional filter covariance.
-    filter_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
+    filter_discrete_state_prob : ArrayLike, shape (n_time, n_discrete_states)
         M_{t|t}(j) = P(S_t=j | y_{1:t}).
-    pair_cond_filter_mean : jax.Array, shape (n_time, n_cont_states, n_discrete_states, n_discrete_states)
+    pair_cond_filter_mean : ArrayLike, shape (n_time, n_cont_states, n_discrete_states, n_discrete_states)
         Pair-conditional filter mean E[x_t | S_{t-1}=i, S_t=j, y_{1:t}], as
         returned (whole trajectory) by :func:`switching_kalman_filter`.
-    pair_cond_filter_cov : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+    pair_cond_filter_cov : ArrayLike, shape (n_time, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         Pair-conditional filter covariance Cov[x_t | S_{t-1}=i, S_t=j, y_{1:t}].
-    pair_cond_filter_prob : jax.Array, shape (n_time, n_discrete_states, n_discrete_states)
+    pair_cond_filter_prob : ArrayLike, shape (n_time, n_discrete_states, n_discrete_states)
         Pair-filter discrete probabilities
         ``P(S_{t-1}=i, S_t=j | y_{1:t})``. These provide the past-state
         conditioning weights used when marginalizing the GPB2 triple smoother.
-    process_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-    continuous_transition_matrix : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
+    process_cov : ArrayLike, shape (n_cont_states, n_cont_states, n_discrete_states)
+    continuous_transition_matrix : ArrayLike, shape (n_cont_states, n_cont_states, n_discrete_states)
 
     Returns
     -------
@@ -1761,8 +1835,34 @@ def switching_kalman_smoother_gpb2(
 
     Computational cost is ~2x GPB1 for S=2 (8 vs 4 RTS updates per step).
     """
+    filter_mean = jnp.asarray(filter_mean)
+    filter_cov = jnp.asarray(filter_cov)
+    filter_discrete_state_prob = jnp.asarray(filter_discrete_state_prob)
+    pair_cond_filter_mean = jnp.asarray(pair_cond_filter_mean)
+    pair_cond_filter_cov = jnp.asarray(pair_cond_filter_cov)
+    pair_cond_filter_prob = jnp.asarray(pair_cond_filter_prob)
+    process_cov = jnp.asarray(process_cov)
+    continuous_transition_matrix = jnp.asarray(continuous_transition_matrix)
 
-    def _step(carry, args):
+    def _step(
+        carry: tuple[jax.Array, jax.Array, jax.Array],
+        args: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    ) -> tuple[
+        tuple[jax.Array, jax.Array, jax.Array],
+        tuple[
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+        ],
+    ]:
         (
             next_pair_cond_smoother_mean,  # E[x_{t+1} | S_t=j, S_{t+1}=k], (L, Sj, Sk)
             next_pair_cond_smoother_cov,  # (L, L, Sj, Sk)
@@ -2024,32 +2124,32 @@ def switching_kalman_smoother_gpb2(
         [state_cond_smoother_covs, filter_cov[-1][None]], axis=0
     )
 
-    return (
-        overall_smoother_mean,
-        overall_smoother_covs,
-        smoother_discrete_state_prob,
-        smoother_joint_discrete_state_prob,
-        overall_smoother_cross_cov,
-        state_cond_smoother_means,
-        state_cond_smoother_covs,
-        pair_cond_smoother_cross_covs,
-        pair_cond_smoother_means,
-        pair_cond_smoother_covs_mstep,
-        next_pair_cond_smoother_means,
+    return SwitchingSmootherGPB2Result(
+        overall_smoother_mean=overall_smoother_mean,
+        overall_smoother_cov=overall_smoother_covs,
+        smoother_discrete_state_prob=smoother_discrete_state_prob,
+        smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
+        overall_smoother_cross_cov=overall_smoother_cross_cov,
+        state_cond_smoother_means=state_cond_smoother_means,
+        state_cond_smoother_covs=state_cond_smoother_covs,
+        pair_cond_smoother_cross_covs=pair_cond_smoother_cross_covs,
+        pair_cond_smoother_means=pair_cond_smoother_means,
+        pair_cond_smoother_covs=pair_cond_smoother_covs_mstep,
+        next_pair_cond_smoother_means=next_pair_cond_smoother_means,
     )
 
 
 def weighted_sum_of_outer_products(
-    x: jax.Array, y: jax.Array, weights: jax.Array
+    x: ArrayLike, y: ArrayLike, weights: ArrayLike
 ) -> jax.Array:
     """Compute the weighted outer sum of two arrays.
     Parameters
     ----------
-    x : jax.Array, shape (n_time, x_dims, n_discrete_states)
+    x : ArrayLike, shape (n_time, x_dims, n_discrete_states)
         First array.
-    y : jax.Array, shape (n_time, y_dims, n_discrete_states)
+    y : ArrayLike, shape (n_time, y_dims, n_discrete_states)
         Second array.
-    weights : jax.Array, shape (n_time, n_discrete_states)
+    weights : ArrayLike, shape (n_time, n_discrete_states)
         Weights for the outer sum.
 
     Returns
@@ -2072,7 +2172,7 @@ def minimum_state_occupancy(n_cont_states: int) -> float:
 
 
 def warn_low_occupancy_states(
-    occupancy: jax.Array, min_occupancy: float, context: str, action: str
+    occupancy: ArrayLike, min_occupancy: float, context: str, action: str
 ) -> list[int]:
     """Log a warning (host-side) about discrete states below the occupancy gate.
 
@@ -2081,7 +2181,7 @@ def warn_low_occupancy_states(
 
     Parameters
     ----------
-    occupancy : jax.Array, shape (n_discrete_states,)
+    occupancy : ArrayLike, shape (n_discrete_states,)
         Expected number of bins in each discrete state.
     min_occupancy : float
         Gate, e.g. :func:`minimum_state_occupancy`.
@@ -2115,7 +2215,7 @@ def warn_low_occupancy_states(
 # solution does not depend on the units of the latent state, floored at the
 # Gram matrix's machine epsilon with a sqrt(eps) retry for a numerically
 # singular (e.g. float32) Gram matrix.
-psd_solve_per_discrete_state = jax.vmap(
+psd_solve_per_discrete_state: Callable[[jax.Array, jax.Array], jax.Array] = jax.vmap(
     lambda x, y: _gain_solve(x, y.T).T,
     in_axes=(-1, -1),
     out_axes=-1,
@@ -2148,7 +2248,7 @@ _floor_covariance_relative_per_discrete_state = jax.vmap(
 
 
 @functools.partial(
-    jax.jit,
+    typed_jit,
     static_argnames=("use_fixed_measurement_matrix", "use_fixed_transition_matrix"),
 )
 def _switching_kalman_m_step_inner(
@@ -2257,7 +2357,9 @@ def _switching_kalman_m_step_inner(
         continuous_transition_matrix = psd_solve_per_discrete_state(gamma1, beta)
 
     # Process covariance, residual form at the installed A.
-    def _process_scatter(A, gamma1_j, beta_j, gamma2_j):
+    def _process_scatter(
+        A: jax.Array, gamma1_j: jax.Array, beta_j: jax.Array, gamma2_j: jax.Array
+    ) -> jax.Array:
         cross = A @ beta_j.T
         return gamma2_j - cross - cross.T + A @ gamma1_j @ A.T
 
@@ -2301,73 +2403,64 @@ def _switching_kalman_m_step_inner(
 
 
 def switching_kalman_maximization_step(
-    obs: jax.Array,
-    state_cond_smoother_means: jax.Array,
-    state_cond_smoother_covs: jax.Array,
-    smoother_discrete_state_prob: jax.Array,
-    smoother_joint_discrete_state_prob: jax.Array,
-    pair_cond_smoother_cross_cov: jax.Array,
-    pair_cond_smoother_means: jax.Array | None = None,
-    pair_cond_smoother_covs: jax.Array | None = None,
-    next_pair_cond_smoother_means: jax.Array | None = None,
-    transition_prior: jax.Array | None = None,
-    fixed_measurement_matrix: jax.Array | None = None,
-    fixed_continuous_transition_matrix: jax.Array | None = None,
-    previous_params: dict | None = None,
+    obs: ArrayLike,
+    state_cond_smoother_means: ArrayLike,
+    state_cond_smoother_covs: ArrayLike,
+    smoother_discrete_state_prob: ArrayLike,
+    smoother_joint_discrete_state_prob: ArrayLike,
+    pair_cond_smoother_cross_cov: ArrayLike,
+    pair_cond_smoother_means: ArrayLike | None = None,
+    pair_cond_smoother_covs: ArrayLike | None = None,
+    next_pair_cond_smoother_means: ArrayLike | None = None,
+    transition_prior: ArrayLike | None = None,
+    fixed_measurement_matrix: ArrayLike | None = None,
+    fixed_continuous_transition_matrix: ArrayLike | None = None,
+    previous_params: dict[str, jax.Array] | None = None,
     estimate_measurement_params: bool = True,
-) -> tuple[
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-    jax.Array,
-]:
+) -> SwitchingMStepResult:
     """Maximization step for the switching Kalman filter.
 
     Parameters
     ----------
-    obs : jax.Array, shape (n_time, n_obs_dim)
+    obs : ArrayLike, shape (n_time, n_obs_dim)
         Observations.
-    state_cond_smoother_means : jax.Array, shape (n_time, n_cont_states, n_discrete_states)
+    state_cond_smoother_means : ArrayLike, shape (n_time, n_cont_states, n_discrete_states)
         smoother mean.
-    state_cond_smoother_covs : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
+    state_cond_smoother_covs : ArrayLike, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
         smoother covariance.
-    smoother_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
+    smoother_discrete_state_prob : ArrayLike, shape (n_time, n_discrete_states)
         smoother discrete state probabilities.
-    smoother_joint_discrete_state_prob : jax.Array, shape (n_time - 1, n_discrete_states, n_discrete_states)
+    smoother_joint_discrete_state_prob : ArrayLike, shape (n_time - 1, n_discrete_states, n_discrete_states)
         smoother joint discrete state probabilities.
-    pair_cond_smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+    pair_cond_smoother_cross_cov : ArrayLike, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         smoother cross-covariance.
-    pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+    pair_cond_smoother_means : ArrayLike | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
         E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional
         means for transition sufficient statistics. If None, uses the approximate factored form.
-    pair_cond_smoother_covs : jax.Array | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+    pair_cond_smoother_covs : ArrayLike | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         Cov[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional
         covariances for gamma1. If None, falls back to state-conditional covariances.
-    next_pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+    next_pair_cond_smoother_means : ArrayLike | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
         E[X_{t+1} | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional
         next-step means for beta. If None, falls back to state-conditional means.
-    transition_prior : jax.Array | None, shape (n_discrete_states, n_discrete_states)
+    transition_prior : ArrayLike | None, shape (n_discrete_states, n_discrete_states)
         Dirichlet prior alpha parameters for the discrete transition matrix.
         If provided, adds (alpha - 1) pseudo-counts to the expected transition
         counts (MAP estimate). Use ``get_transition_prior(concentration, stickiness,
         n_states)`` from ``contingency_belief`` to construct. If None, uses the
         standard ML estimate.
-    fixed_measurement_matrix : jax.Array | None
+    fixed_measurement_matrix : ArrayLike | None
         Shape ``(n_obs_dim, n_cont_states, n_discrete_states)``. The
         measurement matrix the caller keeps fixed (e.g. a structured model
         with ``update_measurement_matrix=False``). When given, it is returned
         as ``measurement_matrix`` and ``measurement_cov`` is the optimum *for
         this H* (full residual quadratic form) rather than the shortcut that
         assumes the solved ``H*``.
-    fixed_continuous_transition_matrix : jax.Array | None
+    fixed_continuous_transition_matrix : ArrayLike | None
         Shape ``(n_cont_states, n_cont_states, n_discrete_states)``. The
         transition matrix the caller keeps fixed; ``process_cov`` is then the
         fixed-``A`` residual optimum.
-    previous_params : dict | None
+    previous_params : dict[str, jax.Array] | None
         Current parameter values, keyed by any of
         ``"continuous_transition_matrix"``, ``"measurement_matrix"``,
         ``"process_cov"``, ``"measurement_cov"``. A discrete state whose
@@ -2422,6 +2515,12 @@ def switching_kalman_maximization_step(
     ... [1] Roweis, S. T., Ghahramani, Z., & Hinton, G. E. (1999). A unifying review of
     linear Gaussian models. Neural computation, 11(2), 305-345.
     """
+    obs = jnp.asarray(obs)
+    state_cond_smoother_means = jnp.asarray(state_cond_smoother_means)
+    state_cond_smoother_covs = jnp.asarray(state_cond_smoother_covs)
+    smoother_discrete_state_prob = jnp.asarray(smoother_discrete_state_prob)
+    smoother_joint_discrete_state_prob = jnp.asarray(smoother_joint_discrete_state_prob)
+    pair_cond_smoother_cross_cov = jnp.asarray(pair_cond_smoother_cross_cov)
 
     if obs.shape[0] < 2:
         raise ValueError(
@@ -2585,15 +2684,15 @@ def switching_kalman_maximization_step(
                 floored_states,
             )
 
-    return (
-        continuous_transition_matrix,
-        measurement_matrix,
-        process_cov,
-        measurement_cov,
-        init_state_cond_mean,
-        init_state_cond_cov,
-        discrete_state_transition,
-        init_discrete_state_prob,
+    return SwitchingMStepResult(
+        continuous_transition_matrix=continuous_transition_matrix,
+        measurement_matrix=measurement_matrix,
+        process_cov=process_cov,
+        measurement_cov=measurement_cov,
+        init_mean=init_state_cond_mean,
+        init_cov=init_state_cond_cov,
+        discrete_transition_matrix=discrete_state_transition,
+        init_discrete_state_prob=init_discrete_state_prob,
     )
 
 
@@ -2617,25 +2716,25 @@ def _weighted_gaussian_log_prob(
     return -0.5 * (n_cont_states * jnp.log(2 * jnp.pi) + log_det + trace_term)
 
 
-@jax.jit
+@typed_jit
 def compute_expected_complete_log_likelihood(
-    obs: jax.Array,
-    state_cond_smoother_means: jax.Array,
-    state_cond_smoother_covs: jax.Array,
-    smoother_discrete_state_prob: jax.Array,
-    smoother_joint_discrete_state_prob: jax.Array,
-    pair_cond_smoother_cross_cov: jax.Array,
-    init_state_cond_mean: jax.Array,
-    init_state_cond_cov: jax.Array,
-    init_discrete_state_prob: jax.Array,
-    continuous_transition_matrix: jax.Array,
-    process_cov: jax.Array,
-    measurement_matrix: jax.Array,
-    measurement_cov: jax.Array,
-    discrete_transition_matrix: jax.Array,
-    pair_cond_smoother_means: jax.Array | None = None,
-    pair_cond_smoother_covs: jax.Array | None = None,
-    next_pair_cond_smoother_means: jax.Array | None = None,
+    obs: ArrayLike,
+    state_cond_smoother_means: ArrayLike,
+    state_cond_smoother_covs: ArrayLike,
+    smoother_discrete_state_prob: ArrayLike,
+    smoother_joint_discrete_state_prob: ArrayLike,
+    pair_cond_smoother_cross_cov: ArrayLike,
+    init_state_cond_mean: ArrayLike,
+    init_state_cond_cov: ArrayLike,
+    init_discrete_state_prob: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    measurement_matrix: ArrayLike,
+    measurement_cov: ArrayLike,
+    discrete_transition_matrix: ArrayLike,
+    pair_cond_smoother_means: ArrayLike | None = None,
+    pair_cond_smoother_covs: ArrayLike | None = None,
+    next_pair_cond_smoother_means: ArrayLike | None = None,
 ) -> jax.Array:
     """Vectorized expected complete-data log-likelihood E_q[log p(y, x, s | θ)].
 
@@ -2647,27 +2746,27 @@ def compute_expected_complete_log_likelihood(
 
     Parameters
     ----------
-    obs : jax.Array, shape (n_time, n_obs_dim)
-    state_cond_smoother_means : jax.Array, shape (n_time, n_cont_states, n_discrete_states)
-    state_cond_smoother_covs : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
-    smoother_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
-    smoother_joint_discrete_state_prob : jax.Array, shape (n_time - 1, n_discrete_states, n_discrete_states)
-    pair_cond_smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+    obs : ArrayLike, shape (n_time, n_obs_dim)
+    state_cond_smoother_means : ArrayLike, shape (n_time, n_cont_states, n_discrete_states)
+    state_cond_smoother_covs : ArrayLike, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
+    smoother_discrete_state_prob : ArrayLike, shape (n_time, n_discrete_states)
+    smoother_joint_discrete_state_prob : ArrayLike, shape (n_time - 1, n_discrete_states, n_discrete_states)
+    pair_cond_smoother_cross_cov : ArrayLike, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         Cov[x_t, x_{t+1} | y_{1:T}, S_t=i, S_{t+1}=j].
-    init_state_cond_mean : jax.Array, shape (n_cont_states, n_discrete_states)
-    init_state_cond_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-    init_discrete_state_prob : jax.Array, shape (n_discrete_states,)
-    continuous_transition_matrix : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-    process_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states, n_discrete_states)
-    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim, n_discrete_states)
-    discrete_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
-    pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+    init_state_cond_mean : ArrayLike, shape (n_cont_states, n_discrete_states)
+    init_state_cond_cov : ArrayLike, shape (n_cont_states, n_cont_states, n_discrete_states)
+    init_discrete_state_prob : ArrayLike, shape (n_discrete_states,)
+    continuous_transition_matrix : ArrayLike, shape (n_cont_states, n_cont_states, n_discrete_states)
+    process_cov : ArrayLike, shape (n_cont_states, n_cont_states, n_discrete_states)
+    measurement_matrix : ArrayLike, shape (n_obs_dim, n_cont_states, n_discrete_states)
+    measurement_cov : ArrayLike, shape (n_obs_dim, n_obs_dim, n_discrete_states)
+    discrete_transition_matrix : ArrayLike, shape (n_discrete_states, n_discrete_states)
+    pair_cond_smoother_means : ArrayLike | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
         E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional
         quantities for the transition Q-function term.
-    pair_cond_smoother_covs : jax.Array | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+    pair_cond_smoother_covs : ArrayLike | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         Cov[X_t | y_{1:T}, S_t=i, S_{t+1}=j].
-    next_pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+    next_pair_cond_smoother_means : ArrayLike | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
         E[X_{t+1} | y_{1:T}, S_t=i, S_{t+1}=j].
 
     Returns
@@ -2684,6 +2783,35 @@ def compute_expected_complete_log_likelihood(
     not produce that quantity directly. This affects only diagnostics, not
     the closed-form parameter updates.
     """
+    obs = jnp.asarray(obs)
+    state_cond_smoother_means = jnp.asarray(state_cond_smoother_means)
+    state_cond_smoother_covs = jnp.asarray(state_cond_smoother_covs)
+    smoother_discrete_state_prob = jnp.asarray(smoother_discrete_state_prob)
+    smoother_joint_discrete_state_prob = jnp.asarray(smoother_joint_discrete_state_prob)
+    pair_cond_smoother_cross_cov = jnp.asarray(pair_cond_smoother_cross_cov)
+    init_state_cond_mean = jnp.asarray(init_state_cond_mean)
+    init_state_cond_cov = jnp.asarray(init_state_cond_cov)
+    init_discrete_state_prob = jnp.asarray(init_discrete_state_prob)
+    continuous_transition_matrix = jnp.asarray(continuous_transition_matrix)
+    process_cov = jnp.asarray(process_cov)
+    measurement_matrix = jnp.asarray(measurement_matrix)
+    measurement_cov = jnp.asarray(measurement_cov)
+    discrete_transition_matrix = jnp.asarray(discrete_transition_matrix)
+    pair_cond_smoother_means = (
+        None
+        if pair_cond_smoother_means is None
+        else jnp.asarray(pair_cond_smoother_means)
+    )
+    pair_cond_smoother_covs = (
+        None
+        if pair_cond_smoother_covs is None
+        else jnp.asarray(pair_cond_smoother_covs)
+    )
+    next_pair_cond_smoother_means = (
+        None
+        if next_pair_cond_smoother_means is None
+        else jnp.asarray(next_pair_cond_smoother_means)
+    )
     n_cont_states = state_cond_smoother_means.shape[1]
     n_obs = obs.shape[1]
 
@@ -2754,8 +2882,16 @@ def compute_expected_complete_log_likelihood(
     )
 
     def _cont_trans_log_prob_single(
-        weight, m_t_ij, m_t1_ij, V_t_ij, V_t1_ij, cross_cov_ij, A_j, Q_j, log_det_Q
-    ):
+        weight: jax.Array,
+        m_t_ij: jax.Array,
+        m_t1_ij: jax.Array,
+        V_t_ij: jax.Array,
+        V_t1_ij: jax.Array,
+        cross_cov_ij: jax.Array,
+        A_j: jax.Array,
+        Q_j: jax.Array,
+        log_det_Q: jax.Array,
+    ) -> jax.Array:
         """Log-prob for a single (t, i, j) triple."""
         E_xt1_xt1 = V_t1_ij + jnp.outer(m_t1_ij, m_t1_ij)
         E_xt_xt = V_t_ij + jnp.outer(m_t_ij, m_t_ij)
@@ -2781,7 +2917,16 @@ def compute_expected_complete_log_likelihood(
     )
 
     # For each j: compute over all (t, i) and sum
-    def _sum_for_j(A_j, Q_j, weights_j, m_t_j, m_t1_j, V_t_j, V_t1_j, cross_cov_j):
+    def _sum_for_j(
+        A_j: jax.Array,
+        Q_j: jax.Array,
+        weights_j: jax.Array,
+        m_t_j: jax.Array,
+        m_t1_j: jax.Array,
+        V_t_j: jax.Array,
+        V_t1_j: jax.Array,
+        cross_cov_j: jax.Array,
+    ) -> jax.Array:
         """Sum log-probs over (t, i) for a single destination state j.
 
         weights_j: (T-1, K_i)
@@ -2822,11 +2967,19 @@ def compute_expected_complete_log_likelihood(
     )
 
     # 5. Observations — vmap over j, vectorize over t
-    def _obs_log_prob_for_j(H_j, R_j, weights_j, means_j, covs_j):
+    def _obs_log_prob_for_j(
+        H_j: jax.Array,
+        R_j: jax.Array,
+        weights_j: jax.Array,
+        means_j: jax.Array,
+        covs_j: jax.Array,
+    ) -> jax.Array:
         """Sum observation log-probs over t for a single state j."""
         log_det_R = psd_logdet(psd_cholesky(R_j))
 
-        def _single_t(weight, m_t_j, V_t_j, y_t):
+        def _single_t(
+            weight: jax.Array, m_t_j: jax.Array, V_t_j: jax.Array, y_t: jax.Array
+        ) -> jax.Array:
             pred_mean = H_j @ m_t_j
             diff = y_t - pred_mean
             expected_residual = jnp.outer(diff, diff) + H_j @ V_t_j @ H_j.T
@@ -2858,11 +3011,11 @@ def compute_expected_complete_log_likelihood(
     )
 
 
-@jax.jit
+@typed_jit
 def compute_posterior_entropy(
-    smoother_discrete_state_prob: jax.Array,
-    smoother_joint_discrete_state_prob: jax.Array,
-    state_cond_smoother_covs: jax.Array,
+    smoother_discrete_state_prob: ArrayLike,
+    smoother_joint_discrete_state_prob: ArrayLike,
+    state_cond_smoother_covs: ArrayLike,
 ) -> jax.Array:
     """Vectorized posterior entropy H(q).
 
@@ -2872,15 +3025,18 @@ def compute_posterior_entropy(
 
     Parameters
     ----------
-    smoother_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
-    smoother_joint_discrete_state_prob : jax.Array, shape (n_time - 1, n_discrete_states, n_discrete_states)
-    state_cond_smoother_covs : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
+    smoother_discrete_state_prob : ArrayLike, shape (n_time, n_discrete_states)
+    smoother_joint_discrete_state_prob : ArrayLike, shape (n_time - 1, n_discrete_states, n_discrete_states)
+    state_cond_smoother_covs : ArrayLike, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
 
     Returns
     -------
     entropy : jax.Array
         H(q(x, s)) (scalar array)
     """
+    smoother_discrete_state_prob = jnp.asarray(smoother_discrete_state_prob)
+    smoother_joint_discrete_state_prob = jnp.asarray(smoother_joint_discrete_state_prob)
+    state_cond_smoother_covs = jnp.asarray(state_cond_smoother_covs)
     n_cont_states = state_cond_smoother_covs.shape[1]
 
     # 1. Discrete entropy: t=0
@@ -2911,13 +3067,13 @@ def compute_posterior_entropy(
     return discrete_entropy + cont_entropy
 
 
-@jax.jit
+@typed_jit
 def compute_markov_posterior_entropy(
-    smoother_discrete_state_prob: jax.Array,
-    smoother_joint_discrete_state_prob: jax.Array,
-    state_cond_smoother_covs: jax.Array,
-    pair_cond_smoother_cross_cov: jax.Array,
-    pair_cond_smoother_covs: jax.Array | None = None,
+    smoother_discrete_state_prob: ArrayLike,
+    smoother_joint_discrete_state_prob: ArrayLike,
+    state_cond_smoother_covs: ArrayLike,
+    pair_cond_smoother_cross_cov: ArrayLike,
+    pair_cond_smoother_covs: ArrayLike | None = None,
 ) -> jax.Array:
     """Approximate trajectory entropy for the switching smoother posterior.
 
@@ -2931,6 +3087,10 @@ def compute_markov_posterior_entropy(
     with the available GPB pair lag covariances. For a single-state linear
     Gaussian model this reduces to the exact RTS trajectory entropy.
     """
+    smoother_discrete_state_prob = jnp.asarray(smoother_discrete_state_prob)
+    smoother_joint_discrete_state_prob = jnp.asarray(smoother_joint_discrete_state_prob)
+    state_cond_smoother_covs = jnp.asarray(state_cond_smoother_covs)
+    pair_cond_smoother_cross_cov = jnp.asarray(pair_cond_smoother_cross_cov)
     n_cont_states = state_cond_smoother_covs.shape[1]
 
     # Discrete Markov-chain entropy H(s_1:T).
@@ -2994,25 +3154,25 @@ def compute_markov_posterior_entropy(
     return discrete_entropy + terminal_entropy + conditional_entropy
 
 
-@jax.jit
+@typed_jit
 def compute_elbo(
-    obs: jax.Array,
-    state_cond_smoother_means: jax.Array,
-    state_cond_smoother_covs: jax.Array,
-    smoother_discrete_state_prob: jax.Array,
-    smoother_joint_discrete_state_prob: jax.Array,
-    pair_cond_smoother_cross_cov: jax.Array,
-    init_state_cond_mean: jax.Array,
-    init_state_cond_cov: jax.Array,
-    init_discrete_state_prob: jax.Array,
-    continuous_transition_matrix: jax.Array,
-    process_cov: jax.Array,
-    measurement_matrix: jax.Array,
-    measurement_cov: jax.Array,
-    discrete_transition_matrix: jax.Array,
-    pair_cond_smoother_means: jax.Array | None = None,
-    pair_cond_smoother_covs: jax.Array | None = None,
-    next_pair_cond_smoother_means: jax.Array | None = None,
+    obs: ArrayLike,
+    state_cond_smoother_means: ArrayLike,
+    state_cond_smoother_covs: ArrayLike,
+    smoother_discrete_state_prob: ArrayLike,
+    smoother_joint_discrete_state_prob: ArrayLike,
+    pair_cond_smoother_cross_cov: ArrayLike,
+    init_state_cond_mean: ArrayLike,
+    init_state_cond_cov: ArrayLike,
+    init_discrete_state_prob: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    measurement_matrix: ArrayLike,
+    measurement_cov: ArrayLike,
+    discrete_transition_matrix: ArrayLike,
+    pair_cond_smoother_means: ArrayLike | None = None,
+    pair_cond_smoother_covs: ArrayLike | None = None,
+    next_pair_cond_smoother_means: ArrayLike | None = None,
 ) -> jax.Array:
     """Compute the GPB approximate lower-bound diagnostic.
 
@@ -3027,25 +3187,25 @@ def compute_elbo(
 
     Parameters
     ----------
-    obs : jax.Array, shape (n_time, n_obs_dim)
-    state_cond_smoother_means : jax.Array, shape (n_time, n_cont_states, n_discrete_states)
-    state_cond_smoother_covs : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
-    smoother_discrete_state_prob : jax.Array, shape (n_time, n_discrete_states)
-    smoother_joint_discrete_state_prob : jax.Array, shape (n_time - 1, n_discrete_states, n_discrete_states)
-    pair_cond_smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
-    init_state_cond_mean : jax.Array, shape (n_cont_states, n_discrete_states)
-    init_state_cond_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-    init_discrete_state_prob : jax.Array, shape (n_discrete_states,)
-    continuous_transition_matrix : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-    process_cov : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
-    measurement_matrix : jax.Array, shape (n_obs_dim, n_cont_states, n_discrete_states)
-    measurement_cov : jax.Array, shape (n_obs_dim, n_obs_dim, n_discrete_states)
-    discrete_transition_matrix : jax.Array, shape (n_discrete_states, n_discrete_states)
-    pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+    obs : ArrayLike, shape (n_time, n_obs_dim)
+    state_cond_smoother_means : ArrayLike, shape (n_time, n_cont_states, n_discrete_states)
+    state_cond_smoother_covs : ArrayLike, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
+    smoother_discrete_state_prob : ArrayLike, shape (n_time, n_discrete_states)
+    smoother_joint_discrete_state_prob : ArrayLike, shape (n_time - 1, n_discrete_states, n_discrete_states)
+    pair_cond_smoother_cross_cov : ArrayLike, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+    init_state_cond_mean : ArrayLike, shape (n_cont_states, n_discrete_states)
+    init_state_cond_cov : ArrayLike, shape (n_cont_states, n_cont_states, n_discrete_states)
+    init_discrete_state_prob : ArrayLike, shape (n_discrete_states,)
+    continuous_transition_matrix : ArrayLike, shape (n_cont_states, n_cont_states, n_discrete_states)
+    process_cov : ArrayLike, shape (n_cont_states, n_cont_states, n_discrete_states)
+    measurement_matrix : ArrayLike, shape (n_obs_dim, n_cont_states, n_discrete_states)
+    measurement_cov : ArrayLike, shape (n_obs_dim, n_obs_dim, n_discrete_states)
+    discrete_transition_matrix : ArrayLike, shape (n_discrete_states, n_discrete_states)
+    pair_cond_smoother_means : ArrayLike | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
         E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. Optional GPB2 Q-function input.
-    pair_cond_smoother_covs : jax.Array | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+    pair_cond_smoother_covs : ArrayLike | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         Cov[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. Optional GPB2 Q-function input.
-    next_pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+    next_pair_cond_smoother_means : ArrayLike | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
         E[X_{t+1} | y_{1:T}, S_t=i, S_{t+1}=j]. Optional GPB2 Q-function input.
 
     Returns
@@ -3085,27 +3245,27 @@ def compute_elbo(
 
 
 def compute_transition_sufficient_stats(
-    state_cond_smoother_means: jax.Array,
-    state_cond_smoother_covs: jax.Array,
-    smoother_joint_discrete_state_prob: jax.Array,
-    pair_cond_smoother_cross_cov: jax.Array,
-    pair_cond_smoother_means: jax.Array | None = None,
-    pair_cond_smoother_covs: jax.Array | None = None,
-    next_pair_cond_smoother_means: jax.Array | None = None,
+    state_cond_smoother_means: ArrayLike,
+    state_cond_smoother_covs: ArrayLike,
+    smoother_joint_discrete_state_prob: ArrayLike,
+    pair_cond_smoother_cross_cov: ArrayLike,
+    pair_cond_smoother_means: ArrayLike | None = None,
+    pair_cond_smoother_covs: ArrayLike | None = None,
+    next_pair_cond_smoother_means: ArrayLike | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Compute sufficient statistics for transition matrix estimation.
 
     Parameters
     ----------
-    state_cond_smoother_means : jax.Array, shape (n_time, n_cont_states, n_discrete_states)
-    state_cond_smoother_covs : jax.Array, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
-    smoother_joint_discrete_state_prob : jax.Array, shape (n_time - 1, n_discrete_states, n_discrete_states)
-    pair_cond_smoother_cross_cov : jax.Array, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
-    pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+    state_cond_smoother_means : ArrayLike, shape (n_time, n_cont_states, n_discrete_states)
+    state_cond_smoother_covs : ArrayLike, shape (n_time, n_cont_states, n_cont_states, n_discrete_states)
+    smoother_joint_discrete_state_prob : ArrayLike, shape (n_time - 1, n_discrete_states, n_discrete_states)
+    pair_cond_smoother_cross_cov : ArrayLike, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+    pair_cond_smoother_means : ArrayLike | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
         E[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional means.
-    pair_cond_smoother_covs : jax.Array | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
+    pair_cond_smoother_covs : ArrayLike | None, shape (n_time - 1, n_cont_states, n_cont_states, n_discrete_states, n_discrete_states)
         Cov[X_t | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional covariances.
-    next_pair_cond_smoother_means : jax.Array | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
+    next_pair_cond_smoother_means : ArrayLike | None, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
         E[X_{t+1} | y_{1:T}, S_t=i, S_{t+1}=j]. If provided, uses pair-conditional next means.
 
     Returns
@@ -3115,6 +3275,10 @@ def compute_transition_sufficient_stats(
     beta : jax.Array, shape (n_cont_states, n_cont_states, n_discrete_states)
         E[x_{t+1} x_t^T] weighted by joint probability.
     """
+    state_cond_smoother_means = jnp.asarray(state_cond_smoother_means)
+    state_cond_smoother_covs = jnp.asarray(state_cond_smoother_covs)
+    smoother_joint_discrete_state_prob = jnp.asarray(smoother_joint_discrete_state_prob)
+    pair_cond_smoother_cross_cov = jnp.asarray(pair_cond_smoother_cross_cov)
     if pair_cond_smoother_means is not None:
         # gamma1[a,b,j] = sum_{t,i} w_t^{ij} * (Cov[x_t | i,j] + m_t^{ij} (m_t^{ij})^T)
         if pair_cond_smoother_covs is not None:
@@ -3185,15 +3349,15 @@ def compute_transition_sufficient_stats(
 
 
 def compute_process_covariance_sufficient_stats(
-    continuous_transition_matrix: jax.Array,
-    state_cond_smoother_means: jax.Array,
-    state_cond_smoother_covs: jax.Array,
-    smoother_discrete_state_prob: jax.Array,
-    smoother_joint_discrete_state_prob: jax.Array,
-    pair_cond_smoother_cross_cov: jax.Array,
-    pair_cond_smoother_means: jax.Array | None = None,
-    pair_cond_smoother_covs: jax.Array | None = None,
-    next_pair_cond_smoother_means: jax.Array | None = None,
+    continuous_transition_matrix: ArrayLike,
+    state_cond_smoother_means: ArrayLike,
+    state_cond_smoother_covs: ArrayLike,
+    smoother_discrete_state_prob: ArrayLike,
+    smoother_joint_discrete_state_prob: ArrayLike,
+    pair_cond_smoother_cross_cov: ArrayLike,
+    pair_cond_smoother_means: ArrayLike | None = None,
+    pair_cond_smoother_covs: ArrayLike | None = None,
+    next_pair_cond_smoother_means: ArrayLike | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Compute fixed-transition residual scatter for a constrained Q M-step.
 
@@ -3208,6 +3372,10 @@ def compute_process_covariance_sufficient_stats(
     destination-state counts.  Optional GPB2 pair-conditioned statistics are
     forwarded to the shared transition-statistics implementation.
     """
+    continuous_transition_matrix = jnp.asarray(continuous_transition_matrix)
+    state_cond_smoother_means = jnp.asarray(state_cond_smoother_means)
+    state_cond_smoother_covs = jnp.asarray(state_cond_smoother_covs)
+    smoother_discrete_state_prob = jnp.asarray(smoother_discrete_state_prob)
     gamma1, beta = compute_transition_sufficient_stats(
         state_cond_smoother_means=state_cond_smoother_means,
         state_cond_smoother_covs=state_cond_smoother_covs,
@@ -3242,10 +3410,10 @@ def compute_process_covariance_sufficient_stats(
 
 
 def compute_transition_q_function(
-    A: jax.Array,
-    gamma1: jax.Array,
-    beta: jax.Array,
-    process_cov: jax.Array | None = None,
+    A: ArrayLike,
+    gamma1: ArrayLike,
+    beta: ArrayLike,
+    process_cov: ArrayLike | None = None,
 ) -> jax.Array:
     """Compute the Q-function contribution from transition matrix.
 
@@ -3258,13 +3426,13 @@ def compute_transition_q_function(
 
     Parameters
     ----------
-    A : jax.Array, shape (n_cont, n_cont)
+    A : ArrayLike, shape (n_cont, n_cont)
         Transition matrix.
-    gamma1 : jax.Array, shape (n_cont, n_cont)
+    gamma1 : ArrayLike, shape (n_cont, n_cont)
         E[x_t x_t^T] summed over time, weighted by joint discrete state probs.
-    beta : jax.Array, shape (n_cont, n_cont)
+    beta : ArrayLike, shape (n_cont, n_cont)
         E[x_{t+1} x_t^T] summed over time, weighted by joint discrete state probs.
-    process_cov : jax.Array | None, shape (n_cont, n_cont), optional
+    process_cov : ArrayLike | None, shape (n_cont, n_cont), optional
         Process covariance Q for Mahalanobis weighting. If None, uses identity
         weighting for backwards compatibility.
 
@@ -3273,6 +3441,9 @@ def compute_transition_q_function(
     jax.Array
         Negative Q-function value (to be minimized, scalar array).
     """
+    A = jnp.asarray(A)
+    gamma1 = jnp.asarray(gamma1)
+    beta = jnp.asarray(beta)
     if process_cov is None:
         return 0.5 * jnp.trace(A.T @ A @ gamma1) - jnp.trace(A.T @ beta)
 
@@ -3282,14 +3453,14 @@ def compute_transition_q_function(
 
 
 def compute_transition_q_from_params(
-    damping: jax.Array,
-    freq: jax.Array,
-    coupling_strength: jax.Array,
-    phase_diff: jax.Array,
-    sampling_freq: float,
-    gamma1: jax.Array,
-    beta: jax.Array,
-    process_cov: jax.Array | None = None,
+    damping: ArrayLike,
+    freq: ArrayLike,
+    coupling_strength: ArrayLike,
+    phase_diff: ArrayLike,
+    sampling_freq: float | jax.Array,
+    gamma1: ArrayLike,
+    beta: ArrayLike,
+    process_cov: ArrayLike | None = None,
 ) -> jax.Array:
     """Compute Q-function from oscillator parameters.
 
@@ -3297,21 +3468,21 @@ def compute_transition_q_from_params(
 
     Parameters
     ----------
-    damping : jax.Array, shape (n_oscillators,)
+    damping : ArrayLike, shape (n_oscillators,)
         Damping coefficients.
-    freq : jax.Array, shape (n_oscillators,)
+    freq : ArrayLike, shape (n_oscillators,)
         Frequencies in Hz.
-    coupling_strength : jax.Array, shape (n_oscillators, n_oscillators)
+    coupling_strength : ArrayLike, shape (n_oscillators, n_oscillators)
         Coupling strengths (0 on diagonal).
-    phase_diff : jax.Array, shape (n_oscillators, n_oscillators)
+    phase_diff : ArrayLike, shape (n_oscillators, n_oscillators)
         Phase differences (0 on diagonal).
     sampling_freq : float
         Sampling frequency.
-    gamma1 : jax.Array, shape (n_cont, n_cont)
+    gamma1 : ArrayLike, shape (n_cont, n_cont)
         Sufficient statistic.
-    beta : jax.Array, shape (n_cont, n_cont)
+    beta : ArrayLike, shape (n_cont, n_cont)
         Sufficient statistic.
-    process_cov : jax.Array | None, shape (n_cont, n_cont), optional
+    process_cov : ArrayLike | None, shape (n_cont, n_cont), optional
         Process covariance for Mahalanobis weighting.
 
     Returns
@@ -3340,20 +3511,20 @@ def compute_transition_q_from_params(
 _OPEN_INTERVAL_EPS = 1e-6
 
 
-def _scaled_sigmoid(x: jax.Array, scale: float) -> jax.Array:
+def _scaled_sigmoid(x: jax.Array, scale: float | jax.Array) -> jax.Array:
     return scale * jax.nn.sigmoid(x)
 
 
-def _inv_scaled_sigmoid(y: jax.Array, scale: float) -> jax.Array:
+def _inv_scaled_sigmoid(y: jax.Array, scale: float | jax.Array) -> jax.Array:
     ratio = jnp.clip(y / scale, _OPEN_INTERVAL_EPS, 1.0 - _OPEN_INTERVAL_EPS)
     return jnp.log(ratio) - jnp.log1p(-ratio)
 
 
-def _scaled_tanh(x: jax.Array, scale: float) -> jax.Array:
+def _scaled_tanh(x: jax.Array, scale: float | jax.Array) -> jax.Array:
     return scale * jnp.tanh(x)
 
 
-def _inv_scaled_tanh(y: jax.Array, scale: float) -> jax.Array:
+def _inv_scaled_tanh(y: jax.Array, scale: float | jax.Array) -> jax.Array:
     ratio = jnp.clip(y / scale, -1.0 + _OPEN_INTERVAL_EPS, 1.0 - _OPEN_INTERVAL_EPS)
     return jnp.arctanh(ratio)
 
@@ -3401,7 +3572,7 @@ def _unpack_dim_params(
     n_states: int | None,
     max_damping: jax.Array,
     max_freq: jax.Array,
-) -> dict:
+) -> dict[str, jax.Array]:
     """Inverse of :func:`_pack_dim_params` (``n_states=None``: one state)."""
     offdiag_i, offdiag_j = np.where(~np.eye(n_osc, dtype=bool))
     n_offdiag = n_osc * (n_osc - 1)
@@ -3430,7 +3601,7 @@ def _unpack_dim_params(
     }
 
 
-@functools.partial(jax.jit, static_argnames=("tol", "max_iter", "has_process_cov"))
+@functools.partial(typed_jit, static_argnames=("tol", "max_iter", "has_process_cov"))
 def _optimize_dim_single_core(
     damping0: jax.Array,
     freq0: jax.Array,
@@ -3443,7 +3614,7 @@ def _optimize_dim_single_core(
     tol: float,
     max_iter: int,
     has_process_cov: bool,
-) -> dict:
+) -> dict[str, Any]:
     """Jitted numeric core of :func:`optimize_dim_transition_params`.
 
     Shapes and the static controls (``tol``, ``max_iter``) form the
@@ -3485,16 +3656,16 @@ def _optimize_dim_single_core(
 
 
 def optimize_dim_transition_params(
-    gamma1: jax.Array,
-    beta: jax.Array,
-    init_params: dict,
+    gamma1: ArrayLike,
+    beta: ArrayLike,
+    init_params: dict[str, jax.Array],
     sampling_freq: float,
-    process_cov: jax.Array | None = None,
+    process_cov: ArrayLike | None = None,
     max_iter: int = 100,
     tol: float = 1e-6,
     raise_on_failure: bool = False,
     max_spectral_radius: float = 0.99,
-) -> dict:
+) -> dict[str, jax.Array]:
     """Optimize oscillator parameters to maximize Q-function.
 
     Uses JAX autodiff + BFGS optimizer. The numeric core (reparameterization
@@ -3503,15 +3674,15 @@ def optimize_dim_transition_params(
 
     Parameters
     ----------
-    gamma1 : jax.Array, shape (n_cont, n_cont)
+    gamma1 : ArrayLike, shape (n_cont, n_cont)
         Sufficient statistic E[x_t x_t^T].
-    beta : jax.Array, shape (n_cont, n_cont)
+    beta : ArrayLike, shape (n_cont, n_cont)
         Sufficient statistic E[x_{t+1} x_t^T].
     init_params : dict
         Initial parameter values (damping, freq, coupling_strength, phase_diff).
     sampling_freq : float
         Sampling frequency.
-    process_cov : jax.Array | None, optional
+    process_cov : ArrayLike | None, optional
         Process covariance for Mahalanobis weighting of the transition
         residual. If None, uses identity weighting.
     max_iter : int
@@ -3593,7 +3764,7 @@ def optimize_dim_transition_params(
     # Post-check: verify the spectral radius of the resulting A. Spectral
     # radius is computed on host (eigvals has no GPU/TPU lowering); the
     # optimizer has already returned, so this runs eagerly.
-    def _radius(params: dict) -> float:
+    def _radius(params: dict[str, jax.Array]) -> float:
         return _spectral_radius(
             construct_directed_influence_transition_matrix(
                 freqs=params["freq"],
@@ -3647,7 +3818,7 @@ def optimize_dim_transition_params(
 
 
 @functools.partial(
-    jax.jit,
+    typed_jit,
     static_argnames=("tol", "max_iter", "max_backtracking_steps", "has_process_cov"),
 )
 def _optimize_dim_joint_core(
@@ -3665,7 +3836,7 @@ def _optimize_dim_joint_core(
     max_iter: int,
     max_backtracking_steps: int,
     has_process_cov: bool,
-) -> dict:
+) -> dict[str, Any]:
     """Jitted numeric core of :func:`optimize_dim_transition_params_joint`.
 
     Packs the initial point, runs BFGS, evaluates the candidate objective and
@@ -3687,7 +3858,7 @@ def _optimize_dim_joint_core(
     n_states = gamma1.shape[-1]
     max_freq = 0.5 * sampling_freq
 
-    def unpack(flat: jax.Array) -> dict:
+    def unpack(flat: jax.Array) -> dict[str, jax.Array]:
         return _unpack_dim_params(flat, n_osc, n_states, max_damping, max_freq)
 
     def loss(flat_params: jax.Array) -> jax.Array:
@@ -3703,7 +3874,13 @@ def _optimize_dim_joint_core(
         effective_damping = params["damping"] * scale
         effective_coupling = params["coupling_strength"] * scale
 
-        def per_state(coupling, phase, gamma, cross, cov):
+        def per_state(
+            coupling: jax.Array,
+            phase: jax.Array,
+            gamma: jax.Array,
+            cross: jax.Array,
+            cov: jax.Array,
+        ) -> jax.Array:
             return compute_transition_q_from_params(
                 damping=effective_damping,
                 freq=params["freq"],
@@ -3737,11 +3914,13 @@ def _optimize_dim_joint_core(
     objective_slack = tol * jnp.maximum(1.0, jnp.abs(init_loss))
     threshold = init_loss + objective_slack
 
-    def backtrack(_: None) -> jax.Array:
+    def backtrack(_unused: None) -> jax.Array:
         direction = result.x - init_flat
         steps = 0.5 ** jnp.arange(1, max_backtracking_steps + 1, dtype=init_flat.dtype)
 
-        def body(carry, step):
+        def body(
+            carry: tuple[jax.Array, jax.Array], step: jax.Array
+        ) -> tuple[tuple[jax.Array, jax.Array], None]:
             accepted, found = carry
             trial_flat = init_flat + step * direction
             trial_loss = loss(trial_flat)
@@ -3752,7 +3931,7 @@ def _optimize_dim_joint_core(
         return accepted
 
     accepted_flat = jax.lax.cond(
-        candidate_loss > threshold, backtrack, lambda _: result.x, None
+        candidate_loss > threshold, backtrack, lambda _unused: result.x, None
     )
     return {
         "params": unpack(accepted_flat),
@@ -3767,18 +3946,18 @@ def _optimize_dim_joint_core(
 
 
 def optimize_dim_transition_params_joint(
-    gamma1: jax.Array,
-    beta: jax.Array,
-    init_params: dict,
+    gamma1: ArrayLike,
+    beta: ArrayLike,
+    init_params: dict[str, jax.Array],
     sampling_freq: float,
-    process_cov: jax.Array | None = None,
+    process_cov: ArrayLike | None = None,
     max_spectral_radius: float = 0.99,
     max_damping: float = 0.995,
     max_iter: int = 100,
     tol: float = 1e-6,
     max_backtracking_steps: int = 20,
     raise_on_failure: bool = False,
-) -> dict:
+) -> dict[str, jax.Array]:
     """Jointly optimize shared and state-specific DIM transition parameters.
 
     Unlike :func:`optimize_dim_transition_params`, this solves one objective
@@ -3800,7 +3979,7 @@ def optimize_dim_transition_params_joint(
         ``(n_oscillators, n_oscillators, n_discrete_states)``.
     sampling_freq : float
         Sampling frequency in Hz.
-    process_cov : jax.Array | None
+    process_cov : ArrayLike | None
         Per-state process covariance stack. Identity weighting is used when
         omitted.
     max_spectral_radius : float
@@ -3893,7 +4072,7 @@ def optimize_dim_transition_params_joint(
         beta.astype(dtype),
         (
             process_cov_arr.astype(dtype)
-            if has_process_cov
+            if process_cov_arr is not None
             else jnp.zeros(expected_stats_shape, dtype=dtype)
         ),
         jnp.asarray(sampling_freq, dtype=dtype),

@@ -32,6 +32,7 @@ the defaults are too short there. Requires float64 (tests enable
 import operator
 
 import numpy as np
+from jax.typing import ArrayLike
 from polyagamma import random_polyagamma
 from scipy.linalg import cho_factor, cho_solve, solve_triangular
 
@@ -100,8 +101,8 @@ def pg_gibbs_sweep(
 
 
 def fit_coupling_pg(
-    spikes,
-    lfp,
+    spikes: ArrayLike,
+    lfp: ArrayLike,
     params: CouplingModelParams,
     n_iter: int = 400,
     burn_in: int = 200,

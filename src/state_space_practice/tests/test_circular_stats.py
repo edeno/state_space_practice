@@ -292,7 +292,7 @@ class TestWrapToPi:
 # Oracles: scipy.stats and closed forms
 # ---------------------------------------------------------------------------
 
-from hypothesis import assume, given, settings  # noqa: E402
+from hypothesis import assume, example, given, settings  # noqa: E402
 from hypothesis import strategies as st  # noqa: E402
 from hypothesis.extra.numpy import arrays  # noqa: E402
 from scipy import stats  # noqa: E402
@@ -311,14 +311,18 @@ def _legacy_circular_std(phases: np.ndarray) -> float:
     return float(np.sqrt(-2 * np.log(resultant)))
 
 
-def _std_roundoff(std: float) -> float:
-    """Round-off scale of sqrt(-2 ln R) given R known to a few ulp.
+def _std_roundoff(std: float, n: int) -> float:
+    """Round-off scale of sqrt(-2 ln R) for R computed from ``n`` phases.
 
-    d std / d R = -1 / (R std), so a few-ulp error in R becomes ~1e-15 / std,
-    saturating at the sqrt(2 eps) ~ 2e-8 floor for (numerically) identical
-    phases.
+    R is the length of a mean of n unit vectors, so it carries an absolute
+    round-off of up to ~(n + 2) u (u = 2**-53: the n-term sum plus the
+    cos/sin and hypot roundings). d std / d R = -1 / (R std), so away from
+    R = 1 that is ~1e-15 / std; at R = 1 the error saturates at
+    sqrt(2 (n + 2) u) -- 1.5e-8 for one phase, 3.3e-8 seen for 45 identical
+    phases (R 5 ulp below 1).
     """
-    return min(3e-8, 1e-14 / max(std, 1e-300)) + 1e-12 * std
+    floor = float(np.sqrt(2.0 * (n + 2) * 2.0**-53))
+    return min(floor, 1e-14 / max(std, 1e-300)) + 1e-12 * std
 
 
 class TestCircularMeanOracle:
@@ -348,12 +352,15 @@ class TestCircularMeanOracle:
 class TestCircularStdOracle:
     @settings(deadline=None, max_examples=50)
     @given(phases=_angles())
+    # 45 identical phases: R lands 5 ulp below 1 (std 3.3e-8) in scipy's
+    # hypot(mean cos, mean sin) but exactly at 1 in the legacy |mean exp|.
+    @example(phases=np.full(45, 5.60693762e-05))
     def test_matches_scipy_circstd_and_legacy(self, phases):
         ours = circular_std(phases)
         legacy = _legacy_circular_std(phases)
         with np.errstate(divide="ignore"):
             theirs = float(stats.circstd(phases))
-        tol = _std_roundoff(legacy)
+        tol = _std_roundoff(legacy, len(phases))
         assert abs(ours - legacy) <= tol, (ours, legacy)
         if mean_resultant_length(phases) > 1e-9:  # away from the legacy floor
             assert abs(ours - theirs) <= tol, (ours, theirs)
@@ -364,7 +371,9 @@ class TestCircularStdOracle:
         """For phases {+a, -a}: R = cos a and std = sqrt(-2 ln cos a)."""
         phases = np.array([half_angle, -half_angle])
         expected = np.sqrt(-2.0 * np.log(np.cos(half_angle)))
-        assert abs(circular_std(phases) - expected) <= _std_roundoff(expected)
+        assert abs(circular_std(phases) - expected) <= _std_roundoff(
+            expected, len(phases)
+        )
 
     def test_uniform_phases_hit_the_documented_floor(self):
         """R ~ 1e-17 is floored at 1e-10 (scipy alone would return 8.6)."""

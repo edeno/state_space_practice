@@ -2860,7 +2860,8 @@ class TestFirstIterationFailureClearsPosteriors:
 
         # Nothing usable was produced.
         assert lls == []
-        assert model.smoother_discrete_state_prob is None
+        with pytest.raises(NotFittedError):
+            _ = model.smoother_discrete_state_prob
         with pytest.raises(RuntimeError, match="No smoother posteriors"):
             model.decode()
         with pytest.raises(RuntimeError, match="No smoother posteriors"):
@@ -3713,3 +3714,103 @@ class TestMStepIsConstrainedStationaryPoint:
             rh.transition_objective(model.continuous_transition_matrix, Q, stats)
         )
         assert obj_guarded >= obj_opt - 1e-9 * abs(obj_opt), (obj_guarded, obj_opt)
+
+
+# ============================================================================
+# Fitted outputs before fitting
+# ============================================================================
+
+
+def _dim_dynamics_kwargs():
+    return {
+        "n_oscillators": 2,
+        "n_discrete_states": 2,
+        "sampling_freq": 100.0,
+        "freqs": jnp.array([8.0, 12.0]),
+        "damping_coef": jnp.array([0.95, 0.95]),
+        "process_variance": jnp.array([0.1, 0.1]),
+        "phase_difference": jnp.zeros((2, 2, 2)),
+        "coupling_strength": jnp.zeros((2, 2, 2)),
+    }
+
+
+def _make_dim():
+    return DirectedInfluenceModel(**_dim_dynamics_kwargs(), measurement_variance=0.05)
+
+
+def _make_dim_pp():
+    from state_space_practice.point_process_models import (
+        DirectedInfluencePointProcessModel,
+    )
+
+    return DirectedInfluencePointProcessModel(
+        **_dim_dynamics_kwargs(), n_neurons=3, dt=0.01
+    )
+
+
+def _make_switching_spike():
+    from state_space_practice.switching_point_process import (
+        SwitchingSpikeOscillatorModel,
+    )
+
+    return SwitchingSpikeOscillatorModel(
+        n_oscillators=2, n_neurons=3, n_discrete_states=2, sampling_freq=100.0, dt=0.01
+    )
+
+
+def _make_hamiltonian_lfp():
+    from state_space_practice.hamiltonian_lfp import HamiltonianLFPModel
+
+    return HamiltonianLFPModel(n_oscillators=1, n_sources=2, sampling_freq=100.0)
+
+
+def _make_switching_hamiltonian():
+    from state_space_practice.hamiltonian_switching import (
+        SwitchingHamiltonianJointModel,
+    )
+
+    return SwitchingHamiltonianJointModel(
+        n_oscillators=1,
+        n_discrete_states=2,
+        n_lfp_sources=2,
+        n_spike_sources=2,
+        sampling_freq=100.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("make_model", "attribute"),
+    [
+        (_make_dim, "smoother_discrete_state_prob"),
+        (_make_dim, "smoother_pair_cond_means"),
+        (_make_dim, "smoother_pair_cond_covs"),
+        (_make_dim_pp, "smoother_state_cond_mean"),
+        (_make_dim_pp, "log_likelihood_"),
+        (_make_switching_spike, "smoother_joint_discrete_state_prob"),
+        (_make_switching_spike, "smoother_next_pair_cond_means"),
+        (_make_hamiltonian_lfp, "filtered_means_"),
+        (_make_switching_hamiltonian, "smoothed_discrete_probs_"),
+        (_make_switching_hamiltonian, "smoother_state_cond_cov"),
+    ],
+)
+def test_fitted_attribute_before_fit_raises_not_fitted(make_model, attribute):
+    """A fitted output read before fitting raises NotFittedError, not None."""
+    model = make_model()
+    assert not hasattr(model, attribute)
+    with pytest.raises(NotFittedError, match=attribute):
+        getattr(model, attribute)
+
+
+@pytest.mark.parametrize("make_model", [_make_dim, _make_dim_pp])
+def test_em_restore_unsets_outputs_missing_from_snapshot(make_model):
+    """Rolling back to a pre-E-step snapshot unsets later smoother outputs."""
+    model = make_model()
+    model._initialize_parameters(jax.random.PRNGKey(0))
+    snapshot = model._snapshot_em_state()
+    assert "smoother_discrete_state_prob" not in snapshot
+    model.smoother_discrete_state_prob = jnp.ones((5, 2)) / 2
+
+    model._restore_em_state(snapshot)
+
+    assert not hasattr(model, "smoother_discrete_state_prob")
+    np.testing.assert_array_equal(model.init_mean, snapshot["init_mean"])

@@ -19,6 +19,7 @@ from state_space_practice.contingency_belief import (
     contingency_belief_smoother,
     transition_logits_to_matrix,
 )
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.tests.recovery_helpers import (
     assert_ll_improves,
     state_segmentation_accuracy,
@@ -206,6 +207,37 @@ class TestContingencyBeliefFilter:
                 obs_design_matrix=jnp.ones((3, 1)),
                 obs_weights=jnp.zeros((3, 1)),  # wrong: 3 rows, n_options=2
             )
+
+    def test_numpy_inputs_match_jax_inputs(self):
+        """Plain numpy parameter arrays give the same result as JAX arrays."""
+        n_trials = 6
+        params = {
+            "reward_probs": np.array([[0.8, 0.2], [0.3, 0.7]]),
+            "state_values": np.array([[1.5, 0.0], [0.0, 1.0]]),
+            "transition_logits": np.array([[2.0], [-1.0]]),
+            "transition_covariates": np.linspace(-1.0, 1.0, n_trials)[:, None],
+            "transition_weights": np.array([[[0.5]], [[-0.3]]]),
+            "init_state_prob": np.array([0.7, 0.3]),
+            "obs_design_matrix": np.ones((n_trials, 1)),
+            "obs_weights": np.array([[0.4], [-0.2]]),
+        }
+        data = {
+            "choices": np.array([0, 1, 0, 0, 1, 1]),
+            "rewards": np.array([1, 0, 1, 1, 0, 1]),
+            "n_states": 2,
+            "n_options": 2,
+            "inverse_temperature": 1.5,
+        }
+        from_numpy = contingency_belief_filter(**data, **params)
+        from_jax = contingency_belief_filter(
+            **data, **{name: jnp.asarray(value) for name, value in params.items()}
+        )
+        np.testing.assert_allclose(
+            from_numpy.state_posterior, from_jax.state_posterior, rtol=1e-12
+        )
+        np.testing.assert_allclose(
+            from_numpy.log_likelihood, from_jax.log_likelihood, rtol=1e-12
+        )
 
 
 class TestContingencyBeliefSmoother:
@@ -520,6 +552,16 @@ def _simulate_block_bandit(n_trials=100, n_options=3, seed=42):
 
 
 class TestContingencyBeliefModel:
+    @pytest.mark.parametrize(
+        "attr", ["log_likelihood_", "smoothed_state_posterior_", "surprise_"]
+    )
+    def test_fitted_attribute_unavailable_before_fit(self, attr):
+        model = ContingencyBeliefModel(n_states=2, n_options=3)
+        assert not model.is_fitted
+        with pytest.raises(NotFittedError, match=attr):
+            getattr(model, attr)
+        assert not hasattr(model, attr)
+
     def test_fit_improves_ll(self):
         choices, rewards, _, _ = _simulate_block_bandit(n_trials=80)
         model = ContingencyBeliefModel(n_states=2, n_options=3)

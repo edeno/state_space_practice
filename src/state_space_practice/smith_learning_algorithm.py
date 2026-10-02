@@ -52,10 +52,12 @@ import math
 import warnings
 from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
-    import matplotlib.pyplot as plt
+    import optax
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 import jax
 import jax.numpy as jnp
@@ -67,6 +69,7 @@ from jax.typing import ArrayLike
 
 from state_space_practice.em_driver import run_em
 from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
+from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.multinomial_choice import (
     _ARMIJO_C,
     _NEWTON_STEP_SIZES,
@@ -77,10 +80,21 @@ from state_space_practice.parameter_transforms import (
     POSITIVE,
     UNCONSTRAINED,
 )
-from state_space_practice.sgd_fitting import SGDFittableMixin
-from state_space_practice.utils import validate_count_array
+from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
+from state_space_practice.utils import typed_jit, validate_count_array
 
 logger = logging.getLogger(__name__)
+
+
+class SmithFilterResult(NamedTuple):
+    """Output of :func:`smith_learning_filter` (each shape ``(n_trials,)``)."""
+
+    prob_correct_response: Array
+    learning_state_mode: Array
+    learning_state_variance: Array
+    one_step_mode: Array
+    one_step_variance: Array
+
 
 # Default process noise standard deviation
 # Smith et al. (2004) used variance of 0.05, so sigma = sqrt(0.05)
@@ -191,7 +205,7 @@ def _approximate_gaussian_newton(
             f"got x0 with shape {x0_arr.shape}"
         )
 
-    def neg_log_posterior(x):
+    def neg_log_posterior(x: Array) -> Array:
         return -log_posterior_func(x)
 
     grad_fn = jax.grad(neg_log_posterior)
@@ -199,7 +213,7 @@ def _approximate_gaussian_newton(
     step_sizes = jnp.asarray(_NEWTON_STEP_SIZES, dtype=x0_arr.dtype)
     batched_objective = jax.vmap(neg_log_posterior)
 
-    def newton_step(x, _):
+    def newton_step(x: Array, _: None) -> tuple[Array, None]:
         g = grad_fn(x)
         h = hess_fn(x)
         # Regularize Hessian for stability
@@ -360,13 +374,13 @@ def smith_laplace_log_likelihood(
 
 def smith_learning_filter(
     n_correct_responses: ArrayLike,
-    init_learning_state: float = 0.0,
-    init_learning_variance: float | None = None,
-    sigma_epsilon: float = DEFAULT_SIGMA_EPSILON,
+    init_learning_state: float | ArrayLike = 0.0,
+    init_learning_variance: float | ArrayLike | None = None,
+    sigma_epsilon: float | ArrayLike = DEFAULT_SIGMA_EPSILON,
     prob_correct_by_chance: float = 0.5,
     max_possible_correct: ArrayLike | None = None,
     differentiable: bool = False,
-) -> tuple[Array, Array, Array, Array, Array]:
+) -> SmithFilterResult:
     r"""Applies a non-linear Bayesian filter (Laplace approximation) for learning.
 
     Assumes a random walk model for the latent learning state ($x_k$) and
@@ -482,7 +496,7 @@ def smith_learning_filter(
     )
 
 
-@jax.jit
+@typed_jit
 def _smith_learning_filter_impl(
     n_correct_responses: Array,
     max_correct_arr: Array,
@@ -490,7 +504,7 @@ def _smith_learning_filter_impl(
     init_var: Array,
     sigma_squared_epsilon: Array,
     mu: Array,
-) -> tuple[Array, Array, Array, Array, Array]:
+) -> SmithFilterResult:
     """JIT-compiled inner implementation of the Smith learning filter."""
 
     def _step(
@@ -552,16 +566,16 @@ def _smith_learning_filter_impl(
     # Compute probability of correct response
     prob_correct_response = jax.nn.sigmoid(mu + learning_state_mode)
 
-    return (
-        prob_correct_response,
-        learning_state_mode,
-        learning_state_variance,
-        one_step_mode,
-        one_step_variance,
+    return SmithFilterResult(
+        prob_correct_response=prob_correct_response,
+        learning_state_mode=learning_state_mode,
+        learning_state_variance=learning_state_variance,
+        one_step_mode=one_step_mode,
+        one_step_variance=one_step_variance,
     )
 
 
-@jax.jit
+@typed_jit
 def smith_learning_smoother(
     filtered_learning_state_mode: ArrayLike,
     filtered_learning_state_variance: ArrayLike,
@@ -604,7 +618,7 @@ def smith_learning_smoother(
     n_trials: int = len(filtered_learning_state_mode)
 
     def _step(
-        carry: tuple[Array, Array], k: int
+        carry: tuple[Array, Array], k: Array
     ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
         """A single step of the RTS smoother."""
         mode_smoothed_next, variance_smoothed_next = carry
@@ -666,7 +680,7 @@ def smith_learning_smoother(
 _MIN_INIT_LEARNING_VARIANCE = 1e-8
 
 
-@partial(jax.jit, static_argnames=["estimate_initial_variance"])
+@partial(typed_jit, static_argnames=["estimate_initial_variance"])
 def maximization_step(
     smoothed_learning_state_mode: ArrayLike,
     smoothed_learning_state_variance: ArrayLike,
@@ -818,7 +832,9 @@ def calculate_probability_confidence_limits(
     smoothed_std_dev = jnp.sqrt(jnp.maximum(smoothed_learning_state_variance, epsilon))
 
     # Function to process a single trial
-    def process_trial(key_trial, mode_k, std_dev_k):
+    def process_trial(
+        key_trial: Array, mode_k: Array, std_dev_k: Array
+    ) -> tuple[Array, Array | None]:
         # Generate samples from the Gaussian posterior of the learning state x_k
         # latent_state_samples will have shape (n_samples,)
         latent_state_samples = mode_k + std_dev_k * jax.random.normal(
@@ -1093,11 +1109,13 @@ def compute_cross_covariance_matrix(
         Cov(x_i, x_j | y_{1:T}). Diagonal contains variances P_{k|T}.
         Lower triangle is symmetric (Cov(x_i, x_j) = Cov(x_j, x_i)).
     """
-    n_trials = len(smoothed_learning_state_variance)
+    smoothed_var = jnp.asarray(smoothed_learning_state_variance)
+    gain = jnp.asarray(smoother_gain)
+    n_trials = smoothed_var.shape[0]
 
     # Compute cumulative product of smoother gains
     # cumgain[k] = A_0 * A_1 * ... * A_{k-1} for k >= 1, cumgain[0] = 1
-    log_gains = jnp.log(jnp.clip(smoother_gain, 1e-10, None))
+    log_gains = jnp.log(jnp.clip(gain, 1e-10, None))
     cumsum_log_gains = jnp.concatenate([jnp.array([0.0]), jnp.cumsum(log_gains)])
 
     # For Cov(x_i, x_j) where i < j:
@@ -1114,9 +1132,7 @@ def compute_cross_covariance_matrix(
     log_gain_products = cumsum_log_gains[j_idx] - cumsum_log_gains[i_idx]
 
     # Cross-covariance = exp(log_gain_products) * P_j (for i <= j)
-    cross_cov_matrix = (
-        jnp.exp(log_gain_products) * smoothed_learning_state_variance[j_idx]
-    )
+    cross_cov_matrix = jnp.exp(log_gain_products) * smoothed_var[j_idx]
 
     # For i > j, use symmetry: Cov(x_i, x_j) = Cov(x_j, x_i)
     # But our formula computes Cov(x_i, x_j) = product(A_i:A_{j-1}) * P_j
@@ -1164,7 +1180,8 @@ def compute_trial_comparison_matrix(
         Upper triangular matrix where entry [i, j] (i < j) contains
         P(x_i > x_j | y_{1:T}). Diagonal is 0.5, lower triangle is NaN.
     """
-    n_trials = len(smoothed_learning_state_mode)
+    mode = jnp.asarray(smoothed_learning_state_mode)
+    n_trials = mode.shape[0]
 
     # Compute full cross-covariance matrix
     cross_cov_matrix = compute_cross_covariance_matrix(
@@ -1180,9 +1197,7 @@ def compute_trial_comparison_matrix(
 
     # Generate standard normal samples and transform
     z = jax.random.normal(key, shape=(n_samples, n_trials))
-    samples = (
-        smoothed_learning_state_mode + z @ sqrt_cov.T
-    )  # shape: (n_samples, n_trials)
+    samples = mode + z @ sqrt_cov.T  # shape: (n_samples, n_trials)
 
     if compare_probability:
         if prob_correct_by_chance is None:
@@ -1273,7 +1288,8 @@ def compare_two_trials(
         smoothed_learning_state_variance, smoother_gain
     )
     indices = jnp.array([trial1, trial2])
-    mean_2 = smoothed_learning_state_mode[indices]
+    mode = jnp.asarray(smoothed_learning_state_mode)
+    mean_2 = mode[indices]
     cov_2 = cross_cov_matrix[jnp.ix_(indices, indices)]
 
     # Sample from bivariate normal
@@ -1434,28 +1450,32 @@ class SmithLearningModel(SGDFittableMixin):
         Initial learning state estimate (updated during EM).
     init_learning_variance : float
         Initial learning state variance (updated during EM).
-    filtered_prob_correct_response : Optional[jax.Array]
+    filtered_prob_correct_response : jax.Array
         Filtered probability of correct response, shape ``(n_trials,)``.
-    filtered_learning_state_mode : Optional[jax.Array]
+    filtered_learning_state_mode : jax.Array
         Filtered learning state mode, shape ``(n_trials,)``.
-    filtered_learning_state_variance : Optional[jax.Array]
+    filtered_learning_state_variance : jax.Array
         Filtered learning state variance, shape ``(n_trials,)``.
-    filtered_one_step_mode : Optional[jax.Array]
+    filtered_one_step_mode : jax.Array
         One-step-ahead predicted mode, shape ``(n_trials,)``.
-    filtered_one_step_variance : Optional[jax.Array]
+    filtered_one_step_variance : jax.Array
         One-step-ahead predicted variance, shape ``(n_trials,)``.
-    smoothed_learning_state_mode : Optional[jax.Array]
+    smoothed_learning_state_mode : jax.Array
         Smoothed learning state mode, shape ``(n_trials,)``.
-    smoothed_learning_state_variance : Optional[jax.Array]
+    smoothed_learning_state_variance : jax.Array
         Smoothed learning state variance, shape ``(n_trials,)``.
-    smoothed_prob_correct_response : Optional[jax.Array]
+    smoothed_prob_correct_response : jax.Array
         Smoothed probability of correct response, shape ``(n_trials,)``.
-    smoother_gain : Optional[jax.Array]
+    smoother_gain : jax.Array
         Smoother gain, shape ``(n_trials - 1,)``.
-    log_likelihood_ : Optional[float]
+    log_likelihood_ : float
         Final log-likelihood after fitting.
-    n_iter_ : Optional[int]
-        Number of EM iterations performed.
+    n_iter_ : int or None
+        Number of EM iterations performed; None before ``fit`` and after
+        ``fit_sgd``.
+
+    The filtered/smoothed estimates and fit diagnostics are set by ``fit`` /
+    ``fit_sgd``; reading one before then raises ``NotFittedError``.
 
     References
     ----------
@@ -1464,6 +1484,23 @@ class SmithLearningModel(SGDFittableMixin):
     Dynamic analysis of learning in behavioral experiments.
     Journal of Neuroscience, 24(2), 447-461.
     """
+
+    # Filter/smoother outputs, set by each E-step.
+    filtered_prob_correct_response: FittedAttribute[Array] = FittedAttribute()
+    filtered_learning_state_mode: FittedAttribute[Array] = FittedAttribute()
+    filtered_learning_state_variance: FittedAttribute[Array] = FittedAttribute()
+    filtered_one_step_mode: FittedAttribute[Array] = FittedAttribute()
+    filtered_one_step_variance: FittedAttribute[Array] = FittedAttribute()
+    smoothed_learning_state_mode: FittedAttribute[Array] = FittedAttribute()
+    smoothed_learning_state_variance: FittedAttribute[Array] = FittedAttribute()
+    smoothed_prob_correct_response: FittedAttribute[Array] = FittedAttribute()
+    smoother_gain: FittedAttribute[Array] = FittedAttribute()  # (n_trials - 1,)
+
+    # Fit diagnostics.
+    log_likelihood_: FittedAttribute[float] = FittedAttribute()
+    _n_trials_: FittedAttribute[int] = FittedAttribute()
+    # ``max_possible_correct`` resolved against the data passed to fit_sgd.
+    _resolved_max_correct: FittedAttribute[Array] = FittedAttribute()
 
     def __init__(
         self,
@@ -1554,24 +1591,8 @@ class SmithLearningModel(SGDFittableMixin):
         self.mu_bias = self._calculate_mu_bias(self.prob_correct_by_chance)
 
         self.initial_state_method = initial_state_method
-
-        # Attributes to store filter/smoother outputs
-        self.filtered_prob_correct_response: jax.Array | None = None
-        self.filtered_learning_state_mode: jax.Array | None = None
-        self.filtered_learning_state_variance: jax.Array | None = None
-        self.filtered_one_step_mode: jax.Array | None = None
-        self.filtered_one_step_variance: jax.Array | None = None
-
-        self.smoothed_learning_state_mode: jax.Array | None = None
-        self.smoothed_learning_state_variance: jax.Array | None = None
-        self.smoothed_prob_correct_response: jax.Array | None = None
-        self.smoother_gain: jax.Array | None = None  # Has shape (n_trials-1,)
-
-        # Fit diagnostics
-        self.log_likelihood_: float | None = None
+        # Set by EM (``fit``) only; stays None for an SGD fit.
         self.n_iter_: int | None = None
-        self.log_likelihood_history_: list[float] | None = None
-        self._n_trials_: int | None = None
 
     def __repr__(self) -> str:
         fitted = "fitted" if self.is_fitted else "not fitted"
@@ -1588,9 +1609,9 @@ class SmithLearningModel(SGDFittableMixin):
     def is_fitted(self) -> bool:
         """Whether the model has been fitted."""
         return (
-            self.smoothed_learning_state_mode is not None
-            and self.smoothed_learning_state_variance is not None
-            and self.smoother_gain is not None
+            is_set(self, "smoothed_learning_state_mode")
+            and is_set(self, "smoothed_learning_state_variance")
+            and is_set(self, "smoother_gain")
         )
 
     def _calculate_mu_bias(self, prob_correct_by_chance: float) -> float:
@@ -1862,18 +1883,21 @@ class SmithLearningModel(SGDFittableMixin):
         )
 
         def _capture_state() -> dict[str, object]:
-            return {k: getattr(self, k, None) for k in snapshot_keys}
+            # Unset fitted attributes are left out and unset again on restore.
+            return {k: getattr(self, k) for k in snapshot_keys if hasattr(self, k)}
 
         def _restore_state(state: dict[str, object]) -> None:
-            for k, v in state.items():
-                if v is not None:
-                    setattr(self, k, v)
+            for k in snapshot_keys:
+                if k in state:
+                    setattr(self, k, state[k])
+                else:
+                    delattr(self, k)
 
         def _clear_posteriors() -> None:
             # A non-finite first E-step leaves nothing to roll back to: drop
             # its NaN filter/smoother outputs so the model reads as unfitted.
             for k in posterior_keys:
-                setattr(self, k, None)
+                delattr(self, k)
 
         def _on_iteration(iteration: int, ll: float, change: float) -> None:
             # verbose=True surfaces per-iteration progress at INFO; otherwise DEBUG.
@@ -1906,7 +1930,10 @@ class SmithLearningModel(SGDFittableMixin):
             logger.info("Converged. sigma_epsilon=%.4g", self.sigma_epsilon)
 
         # Store fit diagnostics
-        self.log_likelihood_ = log_likelihoods[-1] if log_likelihoods else None
+        if log_likelihoods:
+            self.log_likelihood_ = log_likelihoods[-1]
+        else:
+            del self.log_likelihood_
         self.n_iter_ = len(log_likelihoods)
         self.log_likelihood_history_ = log_likelihoods
         self._n_trials_ = len(n_correct_responses)
@@ -1918,7 +1945,7 @@ class SmithLearningModel(SGDFittableMixin):
     def fit_sgd(
         self,
         n_correct_responses: ArrayLike,
-        optimizer: object | None = None,
+        optimizer: optax.GradientTransformation | None = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
@@ -1967,11 +1994,13 @@ class SmithLearningModel(SGDFittableMixin):
 
     @property
     def _n_timesteps(self) -> int:
+        if not is_set(self, "_n_trials_"):
+            raise NotFittedError("Model must be fitted before accessing _n_timesteps.")
         return self._n_trials_
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
-        params: dict = {}
-        spec: dict = {}
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
+        params: SGDParams = {}
+        spec: SGDParamSpec = {}
 
         # Process noise is always learnable
         params["sigma_epsilon"] = jnp.array(self.sigma_epsilon)
@@ -1990,7 +2019,7 @@ class SmithLearningModel(SGDFittableMixin):
 
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, n_correct_responses: Array) -> Array:
+    def _sgd_loss_fn(self, params: SGDParams, n_correct_responses: Array) -> Array:
         # Read a model attribute only when the parameter is not optimized:
         # ``params.get(key, self.attr)`` reads it regardless, and fit_sgd only
         # reuses a compiled step while the attributes the loss read at trace
@@ -2029,7 +2058,7 @@ class SmithLearningModel(SGDFittableMixin):
         )
         return -jnp.sum(log_likelihood_terms)
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         if "sigma_epsilon" in params:
             self.sigma_epsilon = float(params["sigma_epsilon"])
         if "init_learning_state" in params:
@@ -2046,7 +2075,7 @@ class SmithLearningModel(SGDFittableMixin):
         self,
         key: Array,
         n_samples: int = 10000,
-        percentiles: jax.Array | None = None,
+        percentiles: ArrayLike | None = None,
         return_prob_above_chance: bool = False,
     ) -> tuple[jax.Array, jax.Array | None]:
         """
@@ -2062,7 +2091,7 @@ class SmithLearningModel(SGDFittableMixin):
         n_samples : int, optional
             Number of Monte Carlo samples to draw per trial for confidence limits.
             Default is 10000.
-        percentiles : jax.Array, optional
+        percentiles : ArrayLike, optional
             Array of percentiles to compute for the probability (e.g., jnp.array([5, 50, 95])).
             If None, defaults to jnp.array([5.0, 50.0, 95.0]).
         return_prob_above_chance : bool, optional
@@ -2100,7 +2129,7 @@ class SmithLearningModel(SGDFittableMixin):
         self,
         key: Array,
         n_samples: int = 10000,
-        percentiles: jax.Array | None = None,
+        percentiles: ArrayLike | None = None,
     ) -> jax.Array:
         """
         Calculates confidence percentiles for the smoothed latent learning state x_k|T.
@@ -2113,7 +2142,7 @@ class SmithLearningModel(SGDFittableMixin):
             JAX PRNG key for random number generation.
         n_samples : int, optional
             Number of Monte Carlo samples per trial. Default is 10000.
-        percentiles : jax.Array, optional
+        percentiles : ArrayLike, optional
             Percentiles to compute (e.g., jnp.array([5, 50, 95])).
             Defaults to [5.0, 50.0, 95.0].
 
@@ -2343,6 +2372,7 @@ class SmithLearningModel(SGDFittableMixin):
             n_samples=n_samples,
             return_prob_above_chance=True,
         )
+        assert prob_above_chance is not None
 
         threshold = 1.0 - alpha
         meets_criterion = jnp.asarray(prob_above_chance >= threshold)
@@ -2382,14 +2412,14 @@ class SmithLearningModel(SGDFittableMixin):
         self,
         key: Array,
         plot_type: str = "probability",
-        observed_n_correct: jax.Array | None = None,
-        observed_max_possible: jax.Array | None = None,
+        observed_n_correct: ArrayLike | None = None,
+        observed_max_possible: ArrayLike | None = None,
         confidence_bounds: tuple[float, float] = (5.0, 95.0),
         n_samples: int = 10000,
         title: str | None = None,
         xlabel: str = "Trial",
         ylabel_override: str | None = None,
-    ) -> tuple[plt.Figure, plt.Axes]:
+    ) -> tuple[Figure, Axes]:
         """Plots the smoothed learning process with confidence intervals.
 
         This method visualizes either the probability of a correct response or
@@ -2406,10 +2436,10 @@ class SmithLearningModel(SGDFittableMixin):
             Type of plot to generate. Options are:
             - "probability": Plots the probability of a correct response (default).
             - "latent_state": Plots the latent learning state.
-        observed_n_correct : Optional[jax.Array], shape (n_trials,), optional
+        observed_n_correct : Optional[ArrayLike], shape (n_trials,), optional
             Observed number of correct responses per trial to overlay on the plot.
             Default is None.
-        observed_max_possible : Optional[jax.Array], shape (n_trials,), optional
+        observed_max_possible : Optional[ArrayLike], shape (n_trials,), optional
             Maximum possible correct responses for each trial corresponding to
             `observed_n_correct`. Required if `observed_n_correct` is provided
             and represents counts from multiple sub-trials. If `observed_n_correct`
@@ -2800,7 +2830,11 @@ class SmithLearningModel(SGDFittableMixin):
         NotFittedError
             If the model has not been fitted.
         """
-        if not self.is_fitted or self.log_likelihood_ is None:
+        if (
+            not self.is_fitted
+            or not is_set(self, "log_likelihood_")
+            or not is_set(self, "_n_trials_")
+        ):
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
         n_params = 3  # sigma_epsilon, init_learning_state, init_learning_variance
         return -2.0 * self.log_likelihood_ + n_params * math.log(self._n_trials_)
@@ -2808,7 +2842,7 @@ class SmithLearningModel(SGDFittableMixin):
     def compare_to_null(
         self,
         n_correct_responses: ArrayLike | None = None,
-    ) -> dict:
+    ) -> dict[str, float | bool]:
         """Compare the fitted model to a null (no-learning) model.
 
         The null model assumes a constant probability of correct response
@@ -2843,7 +2877,7 @@ class SmithLearningModel(SGDFittableMixin):
         ValueError
             If ``n_correct_responses`` is not provided and cannot be inferred.
         """
-        if not self.is_fitted or self.log_likelihood_ is None:
+        if not self.is_fitted or not is_set(self, "log_likelihood_"):
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         if n_correct_responses is None:
@@ -2953,7 +2987,7 @@ class SmithLearningModel(SGDFittableMixin):
         significance_level: float = 0.05,
         title: str | None = None,
         cmap: str = "bone",
-    ) -> tuple[plt.Figure, plt.Axes]:
+    ) -> tuple[Figure, Axes]:
         """Plot the trial-to-trial comparison matrix with significant points.
 
         Creates a heatmap visualization of pairwise trial comparisons,
@@ -3095,7 +3129,7 @@ class SmithLearningModel(SGDFittableMixin):
 
         return fig, ax
 
-    def plot_convergence(self) -> tuple[plt.Figure, plt.Axes]:
+    def plot_convergence(self) -> tuple[Figure, Axes]:
         """Plot the EM log-likelihood convergence trace.
 
         Must be called after ``fit()``.
@@ -3112,7 +3146,7 @@ class SmithLearningModel(SGDFittableMixin):
         NotFittedError
             If the model has not been fitted.
         """
-        if self.log_likelihood_history_ is None:
+        if not is_set(self, "log_likelihood_history_"):
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         import matplotlib.pyplot as plt
@@ -3132,7 +3166,7 @@ class SmithLearningModel(SGDFittableMixin):
         key: Array,
         observed_n_correct: ArrayLike | None = None,
         n_samples: int = 10000,
-    ) -> tuple[plt.Figure, np.ndarray]:
+    ) -> tuple[Figure, np.ndarray]:
         """Multi-panel diagnostic figure summarizing the fitted model.
 
         Creates a 3-panel figure:
@@ -3269,7 +3303,7 @@ class SmithLearningModel(SGDFittableMixin):
 
         # --- Panel 3: EM convergence ---
         ax = axes[2]
-        if self.log_likelihood_history_:
+        if is_set(self, "log_likelihood_history_") and self.log_likelihood_history_:
             iterations = range(1, len(self.log_likelihood_history_) + 1)
             ax.plot(
                 iterations,

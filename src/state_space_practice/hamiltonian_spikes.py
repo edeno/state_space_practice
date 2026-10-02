@@ -6,7 +6,7 @@ See docs/hamiltonian_architecture.md for why this family has no
 linear-Gaussian EM integration and is fit by SGD only.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -15,6 +15,7 @@ from jax.typing import ArrayLike
 
 from state_space_practice.hamiltonian_core import (
     HamiltonianModelBase,
+    _SingleRegimeHamiltonianModel,
     default_init_mean,
     mlp_l2_penalty,
     poisson_rollout_nll,
@@ -29,8 +30,11 @@ from state_space_practice.parameter_transforms import (
 )
 from state_space_practice.utils import validate_count_array
 
+if TYPE_CHECKING:
+    import optax
 
-class HamiltonianSpikeModel(HamiltonianModelBase):
+
+class HamiltonianSpikeModel(_SingleRegimeHamiltonianModel):
     """Spike Model with Hamiltonian dynamics and Point-Process observations.
 
     ``fit_sgd(spikes, use_filter=True)`` optimizes the marginal Laplace-EKF
@@ -101,18 +105,18 @@ class HamiltonianSpikeModel(HamiltonianModelBase):
         )
 
     def filter(
-        self, spikes: Array, params: dict[str, Any]
+        self, spikes: ArrayLike, params: dict[str, Any]
     ) -> tuple[Array, Array, Array]:
         """Apply Point-Process EKF (Laplace-EKF) to spikes."""
         spikes = self._validate_spikes(spikes)
         return self._filter_jit(spikes, self._complete_filter_params(params))
 
-    def smooth(self, spikes: Array, params: dict[str, Any]) -> tuple[Array, Array]:
+    def smooth(self, spikes: ArrayLike, params: dict[str, Any]) -> tuple[Array, Array]:
         """Apply Point-Process RTS Smoother to spikes."""
         spikes = self._validate_spikes(spikes)
         return self._smooth_jit(spikes, self._complete_filter_params(params))
 
-    def _validate_spikes(self, spikes: Array, *, allow_empty: bool = True) -> Array:
+    def _validate_spikes(self, spikes: ArrayLike, *, allow_empty: bool = True) -> Array:
         """Validate public spike input and return it as a JAX array."""
         spikes = jnp.asarray(spikes)
         if spikes.ndim != 2:
@@ -129,7 +133,7 @@ class HamiltonianSpikeModel(HamiltonianModelBase):
     def fit_sgd(
         self,
         observations: ArrayLike,
-        optimizer: object | None = None,
+        optimizer: "optax.GradientTransformation | None" = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
@@ -220,7 +224,7 @@ class HamiltonianSpikeModel(HamiltonianModelBase):
         spikes: Array,
         use_filter: bool = True,
         l2_reg: float = 1e-4,
-        **kwargs,
+        **kwargs: Any,
     ) -> Array:
         if use_filter:
             _, _, lls = self._filter_jit(spikes, params)

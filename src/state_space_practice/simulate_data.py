@@ -1,7 +1,30 @@
+from typing import Any, NamedTuple
+
 import numpy as np
 from numpy.typing import ArrayLike
 
 from state_space_practice.place_field_model import build_2d_spline_basis
+
+
+class EdenBrownJumpSimulation(NamedTuple):
+    """Output of :func:`simulate_eden_brown_2004_jump`."""
+
+    time: np.ndarray
+    position: np.ndarray
+    spike_indicator: np.ndarray
+    dt: float
+    true_params1: np.ndarray
+    true_params2: np.ndarray
+
+
+class EdenBrownLinearSimulation(NamedTuple):
+    """Output of :func:`simulate_eden_brown_2004_linear`."""
+
+    time: np.ndarray
+    position: np.ndarray
+    spike_indicator: np.ndarray
+    dt: float
+    true_params: np.ndarray
 
 
 def receptive_field_model(position: ArrayLike, params: np.ndarray) -> np.ndarray:
@@ -39,7 +62,7 @@ def _eden_brown_2004_base(
 
 def simulate_eden_brown_2004_jump(
     rng: np.random.Generator | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray, np.ndarray]:
+) -> EdenBrownJumpSimulation:
     if rng is None:
         rng = np.random.default_rng()
     dt = 0.020
@@ -50,12 +73,14 @@ def simulate_eden_brown_2004_jump(
     true_rate = np.concatenate((true_rate1, true_rate2))
     spike_indicator = rng.poisson(true_rate * dt)
 
-    return time, position, spike_indicator, dt, true_params1, true_params2
+    return EdenBrownJumpSimulation(
+        time, position, spike_indicator, dt, true_params1, true_params2
+    )
 
 
 def simulate_eden_brown_2004_linear(
     rng: np.random.Generator | None = None,
-):
+) -> EdenBrownLinearSimulation:
     if rng is None:
         rng = np.random.default_rng()
     dt = 0.020
@@ -71,7 +96,7 @@ def simulate_eden_brown_2004_linear(
     )
     spike_indicator = rng.poisson(true_rate * dt)
 
-    return time, position, spike_indicator, dt, true_params
+    return EdenBrownLinearSimulation(time, position, spike_indicator, dt, true_params)
 
 
 def simulate_2d_moving_place_field(
@@ -85,7 +110,7 @@ def simulate_2d_moving_place_field(
     drift_speed: float = 0.02,
     n_interior_knots: int = 5,
     rng: np.random.Generator | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Simulate a neuron with a 2D place field that drifts over time.
 
     The animal runs a lawnmower trajectory in a square arena. The neuron's

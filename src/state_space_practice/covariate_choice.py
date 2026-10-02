@@ -27,18 +27,19 @@ from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
+from numpy.typing import NDArray
 
 from state_space_practice.multinomial_choice import (
     ChoiceFilterResult,
     ChoiceSmootherResult,
-    MultinomialChoiceModel,
+    _MultinomialChoiceBase,
     _softmax_update_core,
     _warn_if_newton_unconverged,
 )
@@ -46,35 +47,47 @@ from state_space_practice.parameter_transforms import (
     UNCONSTRAINED,
     UNIT_INTERVAL,
 )
-from state_space_practice.utils import psd_solve, symmetrize, validate_choice_indices
+from state_space_practice.sgd_fitting import SGDParams, SGDParamSpec
+from state_space_practice.utils import (
+    _root_figure,
+    psd_solve,
+    symmetrize,
+    typed_jit,
+    validate_choice_indices,
+)
+
+if TYPE_CHECKING:
+    import optax
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 logger = logging.getLogger(__name__)
 
 
 def covariate_predict(
-    filt_mean: Array,
-    filt_cov: Array,
-    covariates_t: Array,
-    input_gain: Array,
-    transition_matrix: Array,
-    process_noise_cov: Array,
+    filt_mean: ArrayLike,
+    filt_cov: ArrayLike,
+    covariates_t: ArrayLike,
+    input_gain: ArrayLike,
+    transition_matrix: ArrayLike,
+    process_noise_cov: ArrayLike,
 ) -> tuple[Array, Array]:
     """Prediction step with transition matrix and control input.
 
     Parameters
     ----------
-    filt_mean : Array, shape (K-1,)
+    filt_mean : ArrayLike, shape (K-1,)
         Filtered state mean from previous trial.
-    filt_cov : Array, shape (K-1, K-1)
+    filt_cov : ArrayLike, shape (K-1, K-1)
         Filtered state covariance from previous trial.
-    covariates_t : Array, shape (d,)
+    covariates_t : ArrayLike, shape (d,)
         Covariate vector for current trial.
-    input_gain : Array, shape (K-1, d)
+    input_gain : ArrayLike, shape (K-1, d)
         Input-gain matrix B.
-    transition_matrix : Array, shape (K-1, K-1)
+    transition_matrix : ArrayLike, shape (K-1, K-1)
         State transition matrix A. Identity = random walk.
         decay * I = mean-reverting (Ornstein-Uhlenbeck).
-    process_noise_cov : Array, shape (K-1, K-1)
+    process_noise_cov : ArrayLike, shape (K-1, K-1)
         Process noise covariance Q.
 
     Returns
@@ -82,15 +95,17 @@ def covariate_predict(
     pred_mean : Array, shape (K-1,)
     pred_cov : Array, shape (K-1, K-1)
     """
+    input_gain = jnp.asarray(input_gain)
+    transition_matrix = jnp.asarray(transition_matrix)
     pred_mean = transition_matrix @ filt_mean + input_gain @ covariates_t
     pred_cov = transition_matrix @ filt_cov @ transition_matrix.T + process_noise_cov
     return pred_mean, pred_cov
 
 
-@jax.jit
+@typed_jit
 def m_step_input_gain(
-    smoothed_values: Array,
-    covariates: Array,
+    smoothed_values: ArrayLike,
+    covariates: ArrayLike,
     decay: float = 1.0,
 ) -> Array:
     """Closed-form M-step for input-gain matrix B.
@@ -100,9 +115,9 @@ def m_step_input_gain(
 
     Parameters
     ----------
-    smoothed_values : Array, shape (T, K-1)
+    smoothed_values : ArrayLike, shape (T, K-1)
         Smoothed state means from RTS smoother.
-    covariates : Array, shape (T, d)
+    covariates : ArrayLike, shape (T, d)
         Covariate matrix. Row t drives the prediction at trial t
         (transition x_{t-1} -> x_t). Uses covariates[1:] paired with
         the residual at each transition.
@@ -121,6 +136,8 @@ def m_step_input_gain(
     terms from the smoother drop out and this simple regression is
     the exact EM M-step for B.
     """
+    smoothed_values = jnp.asarray(smoothed_values)
+    covariates = jnp.asarray(covariates)
     diff = smoothed_values[1:] - decay * smoothed_values[:-1]  # (T-1, K-1)
     u = covariates[1:]  # (T-1, d) — covariates[i+1] drives diff[i]
 
@@ -132,14 +149,14 @@ def m_step_input_gain(
     return psd_solve(gram.T, cross.T).T
 
 
-@partial(jax.jit, static_argnames=("n_options", "max_newton_steps"))
+@partial(typed_jit, static_argnames=("n_options", "max_newton_steps"))
 def m_step_obs_weights(
-    smoothed_values: Array,
-    choices: Array,
-    obs_covariates: Array,
+    smoothed_values: ArrayLike,
+    choices: ArrayLike,
+    obs_covariates: ArrayLike,
     n_options: int,
     inverse_temperature: float,
-    current_obs_weights: Array,
+    current_obs_weights: ArrayLike,
     max_newton_steps: int = 5,
 ) -> Array:
     """Newton M-step for observation weights Theta.
@@ -150,13 +167,13 @@ def m_step_obs_weights(
 
     Parameters
     ----------
-    smoothed_values : Array, shape (T, K-1)
-    choices : Array, shape (T,) int
-    obs_covariates : Array, shape (T, d_obs)
+    smoothed_values : ArrayLike, shape (T, K-1)
+    choices : ArrayLike, shape (T,) int
+    obs_covariates : ArrayLike, shape (T, d_obs)
     n_options : int
         Number of options K (static under ``jax.jit``).
     inverse_temperature : float
-    current_obs_weights : Array, shape (K, d_obs)
+    current_obs_weights : ArrayLike, shape (K, d_obs)
         Current Theta estimate (warm start).
     max_newton_steps : int
         Number of damped Newton steps (static under ``jax.jit``; the loop
@@ -166,6 +183,9 @@ def m_step_obs_weights(
     -------
     Theta_hat : Array, shape (K, d_obs)
     """
+    smoothed_values = jnp.asarray(smoothed_values)
+    obs_covariates = jnp.asarray(obs_covariates)
+    current_obs_weights = jnp.asarray(current_obs_weights)
     T = smoothed_values.shape[0]
     d_obs = obs_covariates.shape[1]
     K = n_options
@@ -320,7 +340,7 @@ def covariate_choice_filter(
     )
 
 
-@partial(jax.jit, static_argnames=("n_options",))
+@partial(typed_jit, static_argnames=("n_options",))
 def _covariate_choice_filter_jit(
     choices: Array,
     n_options: int,
@@ -328,9 +348,9 @@ def _covariate_choice_filter_jit(
     input_gain: Array,
     obs_covariates: Array,
     obs_weights: Array,
-    process_noise: float,
-    inverse_temperature: float,
-    decay: float,
+    process_noise: float | Array,
+    inverse_temperature: float | Array,
+    decay: float | Array,
     init_mean: Array,
     init_cov: Array,
 ) -> ChoiceFilterResult:
@@ -339,7 +359,9 @@ def _covariate_choice_filter_jit(
     Q = jnp.eye(k_free) * process_noise
     A = jnp.eye(k_free) * decay
 
-    def _step(carry, inputs):
+    def _step(
+        carry: tuple[Array, Array, Array], inputs: tuple[Array, Array, Array]
+    ) -> tuple[tuple[Array, Array, Array], tuple[Array, Array, Array, Array, Array]]:
         filt_mean, filt_cov, total_ll = carry
         choice_t, u_t, z_t = inputs
 
@@ -403,7 +425,9 @@ def _rts_smoother_pass_with_predictions(
     exactly to ``rts_backward_scan``.
     """
 
-    def _smooth_step(carry, inputs):
+    def _smooth_step(
+        carry: tuple[Array, Array], inputs: tuple[Array, Array, Array, Array]
+    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
         next_sm_mean, next_sm_cov = carry
         f_mean, f_cov, p_mean_next, p_cov_next = inputs
         gain = psd_solve(p_cov_next, A @ f_cov).T
@@ -519,7 +543,7 @@ def _coerce_covariates(
     return arr
 
 
-class CovariateChoiceModel(MultinomialChoiceModel):
+class CovariateChoiceModel(_MultinomialChoiceBase):
     """Multi-armed bandit with covariate-driven value dynamics and
     observation-level choice biases.
 
@@ -535,7 +559,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
     MultinomialChoiceModel (pure random walk).
 
     The EM driver, uncertainty summaries, BIC and plots are inherited; this
-    class overrides the hooks listed in :class:`MultinomialChoiceModel`
+    class overrides the hooks listed in :class:`~state_space_practice.multinomial_choice._MultinomialChoiceBase`
     (filter selection, dynamics, logit offsets, M-steps, final E-step).
 
     Parameters
@@ -625,9 +649,9 @@ class CovariateChoiceModel(MultinomialChoiceModel):
             f"decay={self.decay:.4f}, fitted={fitted})"
         )
 
-    # --- Hooks (see MultinomialChoiceModel) ---
+    # --- Hooks (see _MultinomialChoiceBase) ---
 
-    def _filter_kwargs(self) -> dict:
+    def _filter_kwargs(self) -> dict[str, Any]:
         kwargs = super()._filter_kwargs()
         kwargs.update(
             covariates=self._covariates,
@@ -638,7 +662,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         )
         return kwargs
 
-    def _run_filter(self, choices: Array, **overrides) -> ChoiceFilterResult:
+    def _run_filter(self, choices: Array, **overrides: Any) -> ChoiceFilterResult:
         kwargs = {**self._filter_kwargs(), **overrides}
         return covariate_choice_filter(choices, self.n_options, **kwargs)
 
@@ -705,7 +729,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         self,
         choices: Array,
         log_likelihoods: list[float],
-        last_accepted: dict | None,
+        last_accepted: dict[str, Any] | None,
     ) -> float:
         """Final E-step, kept only if it did not decrease the log-likelihood.
 
@@ -761,7 +785,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         self._obs_covariates = obs_covariates_arr
         return choices_arr
 
-    def fit(  # type: ignore[override]  # covariates inserted positionally after choices
+    def fit(
         self,
         choices: ArrayLike,
         covariates: ArrayLike | None = None,
@@ -802,12 +826,12 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         choices_arr = self._bind_covariates(choices, covariates, obs_covariates, "fit")
         return self._fit_em(choices_arr, max_iter, tolerance, verbose, beta_grid)
 
-    def fit_sgd(  # type: ignore[override]  # covariates inserted positionally after choices
+    def fit_sgd(
         self,
         choices: ArrayLike,
         covariates: ArrayLike | None = None,
         obs_covariates: ArrayLike | None = None,
-        optimizer: object | None = None,
+        optimizer: optax.GradientTransformation | None = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
@@ -844,7 +868,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
 
     # --- SGDFittableMixin protocol ---
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         params, spec = super()._build_param_spec()
         if self.learn_decay:
             params["decay"] = jnp.array(self.decay)
@@ -857,9 +881,9 @@ class CovariateChoiceModel(MultinomialChoiceModel):
             spec["obs_weights"] = UNCONSTRAINED
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, choices: Array) -> Array:
+    def _sgd_loss_fn(self, params: SGDParams, choices: Array) -> Array:
         # Model attributes are read only for parameters that are not being
-        # optimized (see MultinomialChoiceModel._sgd_loss_fn).
+        # optimized (see _MultinomialChoiceBase._sgd_loss_fn).
         def _param(key: str, attr: str) -> Array:
             return params[key] if key in params else jnp.asarray(getattr(self, attr))
 
@@ -894,7 +918,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         )
         return -result.marginal_log_likelihood
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         super()._store_sgd_params(params)
         if "decay" in params:
             self.decay = float(params["decay"])
@@ -967,7 +991,12 @@ class CovariateChoiceModel(MultinomialChoiceModel):
                 )
         return "\n".join(lines)
 
-    def plot_input_gains(self, option_labels=None, covariate_labels=None, ax=None):
+    def plot_input_gains(
+        self,
+        option_labels: list[str] | None = None,
+        covariate_labels: list[str] | None = None,
+        ax: Axes | None = None,
+    ) -> tuple[Figure, Axes]:
         """Bar plot of the learned input-gain matrix B.
 
         Requires the ``plot`` extra (matplotlib).
@@ -1007,7 +1036,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         if ax is None:
             fig, ax = plt.subplots(figsize=(6, 4))
         else:
-            fig = ax.figure
+            fig = _root_figure(ax)
 
         x = np.arange(d)
         width = 0.8 / k_free
@@ -1024,7 +1053,11 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         fig.tight_layout()
         return fig, ax
 
-    def plot_summary(self, observed_choices=None, option_labels=None):
+    def plot_summary(
+        self,
+        observed_choices: ArrayLike | None = None,
+        option_labels: list[str] | None = None,
+    ) -> tuple[Figure, NDArray[np.object_]]:
         """3-panel diagnostic: values, input gains, convergence.
 
         Requires the ``plot`` extra (matplotlib).

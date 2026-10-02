@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from state_space_practice.exceptions import NotFittedError
+from state_space_practice.fitted_state import is_set
 from state_space_practice.place_field_model import (
     PlaceFieldModel,
     build_2d_spline_basis,
@@ -136,6 +137,14 @@ class TestPlaceFieldModelInit:
         r = repr(m)
         assert "fitted=False" in r
         assert "process_noise_structure=" in r
+
+    @pytest.mark.parametrize("attr", ["smoother_mean", "process_cov", "n_basis"])
+    def test_fitted_attribute_unset_before_fit(self, attr: str) -> None:
+        """Fit-initialized state raises NotFittedError (and looks absent)."""
+        m = PlaceFieldModel(dt=0.004)
+        with pytest.raises(NotFittedError, match=attr):
+            getattr(m, attr)
+        assert not hasattr(m, attr)
 
     def test_init_cov_scale(self) -> None:
         m = PlaceFieldModel(dt=0.004, init_cov_scale=5.0)
@@ -299,7 +308,7 @@ class TestPlaceFieldModelFit:
         assert model.log_likelihoods == []
         assert "non-finite" in caplog.text.lower()
         for attr in self._POSTERIOR_ATTRS:
-            assert getattr(model, attr) is None, attr
+            assert not is_set(model, attr), attr
         assert "fitted=False" in repr(model)
         with pytest.raises(NotFittedError, match="Call model.fit"):
             model.bic()

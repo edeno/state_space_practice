@@ -82,12 +82,15 @@ References
 3. Murphy, K.P. (1998). Switching Kalman Filters.
 """
 
+from __future__ import annotations
+
 import functools
 import logging
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import jax
 import jax.numpy as jnp
@@ -96,6 +99,7 @@ from jax.typing import ArrayLike
 
 from state_space_practice.em_driver import run_em
 from state_space_practice.exceptions import StateSpaceWarning
+from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.oscillator_utils import (
     _matrix_to_oscillator_blocks,
     _oscillator_blocks_to_matrix,
@@ -114,9 +118,12 @@ from state_space_practice.point_process_kalman import (
 )
 from state_space_practice.sgd_fitting import (
     SGDFittableMixin,
+    SGDParams,
+    SGDParamSpec,
     reconstruct_per_state_array,
 )
 from state_space_practice.switching_kalman import (
+    SwitchingFilterResult,
     _first_timestep_discrete_update,
     _normalize_initial_discrete_prob,
     _update_discrete_state_probabilities,
@@ -134,11 +141,15 @@ from state_space_practice.utils import (
     psd_solve,
     stabilize_covariance,
     symmetrize,
+    typed_jit,
     validate_count_array,
     validate_covariance,
     validate_probability_vector,
     validate_transition_matrix,
 )
+
+if TYPE_CHECKING:
+    import optax
 
 logger = logging.getLogger(__name__)
 
@@ -170,12 +181,14 @@ class SpikeObsParams:
     baseline: Array
     weights: Array
 
-    def tree_flatten(self):
+    def tree_flatten(self) -> tuple[tuple[Array, Array], None]:
         """Flatten for JAX pytree registration."""
         return (self.baseline, self.weights), None
 
     @classmethod
-    def tree_unflatten(cls, aux_data, children):
+    def tree_unflatten(
+        cls, aux_data: None, children: tuple[Array, Array]
+    ) -> SpikeObsParams:
         """Unflatten for JAX pytree registration."""
         baseline, weights = children
         return cls(baseline=baseline, weights=weights)
@@ -476,9 +489,9 @@ class QRegularizationConfig:
 
 
 def point_process_kalman_update(
-    one_step_mean: Array,
-    one_step_cov: Array,
-    y_t: Array,
+    one_step_mean: ArrayLike,
+    one_step_cov: ArrayLike,
+    y_t: ArrayLike,
     dt: float,
     log_intensity_func: Callable[[Array, SpikeObsParams], Array],
     spike_params: SpikeObsParams,
@@ -506,11 +519,11 @@ def point_process_kalman_update(
 
     Parameters
     ----------
-    one_step_mean : Array, shape (n_latent,)
+    one_step_mean : ArrayLike, shape (n_latent,)
         Predicted mean from dynamics: A @ m_{t-1}
-    one_step_cov : Array, shape (n_latent, n_latent)
+    one_step_cov : ArrayLike, shape (n_latent, n_latent)
         Predicted covariance: A @ P_{t-1} @ A.T + Q
-    y_t : Array, shape (n_neurons,)
+    y_t : ArrayLike, shape (n_neurons,)
         Spike counts at time t for all neurons
     dt : float
         Time bin width in seconds
@@ -578,6 +591,9 @@ def point_process_kalman_update(
             "point_process_kalman_update expects single-state spike_params with "
             "baseline shape (n_neurons,) and weights shape (n_neurons, n_latent)."
         )
+    one_step_mean = jnp.asarray(one_step_mean)
+    one_step_cov = jnp.asarray(one_step_cov)
+    y_t = jnp.asarray(y_t)
 
     # Create a closure-free wrapper for the shared helper
     # This binds spike_params so _point_process_laplace_update sees Callable[[Array], Array]
@@ -692,6 +708,40 @@ def _point_process_predict_and_update(
     )
 
 
+@overload
+def _point_process_update_per_discrete_state_pair(
+    prev_state_cond_mean: Array,
+    prev_state_cond_cov: Array,
+    y_t: Array,
+    continuous_transition_matrix: Array,
+    process_cov: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    return_line_search_failures: Literal[False] = ...,
+) -> tuple[Array, Array, Array]: ...
+
+
+@overload
+def _point_process_update_per_discrete_state_pair(
+    prev_state_cond_mean: Array,
+    prev_state_cond_cov: Array,
+    y_t: Array,
+    continuous_transition_matrix: Array,
+    process_cov: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    return_line_search_failures: Literal[True] = ...,
+) -> tuple[Array, Array, Array, Array]: ...
+
+
 def _point_process_update_per_discrete_state_pair(
     prev_state_cond_mean: Array,
     prev_state_cond_cov: Array,
@@ -759,7 +809,13 @@ def _point_process_update_per_discrete_state_pair(
 
     # Create a version of predict_and_update that only takes array arguments
     # (log_intensity_func, spike_params, dt are captured in the closure for vmap)
-    def _update(prev_mean, prev_cov, A, Q, params_j):
+    def _update(
+        prev_mean: Array,
+        prev_cov: Array,
+        A: Array,
+        Q: Array,
+        params_j: SpikeObsParams,
+    ) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]:
         return _point_process_predict_and_update(
             prev_mean,
             prev_cov,
@@ -778,7 +834,7 @@ def _point_process_update_per_discrete_state_pair(
 
     def _update_for_state_j(
         state_index: Array, A: Array, Q: Array
-    ) -> tuple[Array, ...]:
+    ) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]:
         """Update for a single next-state j, vmapped over previous states i."""
         params_j = _select_spike_params(spike_params, state_index)
         return jax.vmap(
@@ -794,10 +850,7 @@ def _point_process_update_per_discrete_state_pair(
         out_axes=-1,
     )
 
-    result: tuple[Array, Array, Array] | tuple[Array, Array, Array, Array] = (
-        vmapped_update(state_indices, continuous_transition_matrix, process_cov)
-    )
-    return result
+    return vmapped_update(state_indices, continuous_transition_matrix, process_cov)
 
 
 def _first_timestep_point_process_update(
@@ -1000,7 +1053,9 @@ def _armijo_line_search(
     directional_derivative = jnp.dot(gradient, delta)
     is_descent_direction = directional_derivative > 0.0
 
-    def line_search_step(carry, _):
+    def line_search_step(
+        carry: tuple[Array, Array], _: None
+    ) -> tuple[tuple[Array, Array], None]:
         alpha, found = carry
         # Under tracing loss_fn is evaluated every iteration; once a step is
         # found, `where` selects the cached current_loss (it does not skip the
@@ -1311,7 +1366,7 @@ def _single_neuron_glm_step(
     )
 
     # Define loss function for line search
-    def loss_fn(p):
+    def loss_fn(p: Array) -> Array:
         eta_trial = design_matrix @ p
         mu_trial = jnp.exp(_exp_safe_clip(eta_trial)) * dt
         weights_trial = p[1:]
@@ -1675,7 +1730,7 @@ def _single_neuron_glm_step_second_order_mixture(
     return new_params[0], new_params[1:], fell_back
 
 
-@functools.partial(jax.jit, static_argnames=("max_iter",))
+@functools.partial(typed_jit, static_argnames=("max_iter",))
 def _second_order_newton_iterations(
     baselines: Array,
     weights: Array,
@@ -1701,10 +1756,14 @@ def _second_order_newton_iterations(
     neuron-iterations whose Newton direction fell back to the gradient.
     """
 
-    def iterate_all_neurons(carry, _):
+    def iterate_all_neurons(
+        carry: tuple[Array, Array], _: None
+    ) -> tuple[tuple[Array, Array], Array]:
         baselines, weights = carry
 
-        def update_neuron(b, w, y_n, bp):
+        def update_neuron(
+            b: Array, w: Array, y_n: Array, bp: Array
+        ) -> tuple[Array, Array, Array]:
             return _single_neuron_glm_step_second_order(
                 b,
                 w,
@@ -1759,7 +1818,7 @@ def _as_float(x: ArrayLike) -> Array:
     return x.astype(jnp.result_type(float))
 
 
-@functools.partial(jax.jit, static_argnames=("max_iter",))
+@functools.partial(typed_jit, static_argnames=("max_iter",))
 def _mixture_newton_iterations(
     baselines: Array,
     weights: Array,
@@ -1779,10 +1838,14 @@ def _mixture_newton_iterations(
     for :func:`update_spike_glm_params_mixture`.
     """
 
-    def iterate_all_neurons(carry, _):
+    def iterate_all_neurons(
+        carry: tuple[Array, Array], _: None
+    ) -> tuple[tuple[Array, Array], Array]:
         baselines, weights = carry
 
-        def update_neuron(b, w, y_n, bp):
+        def update_neuron(
+            b: Array, w: Array, y_n: Array, bp: Array
+        ) -> tuple[Array, Array, Array]:
             return _single_neuron_glm_step_second_order_mixture(
                 b,
                 w,
@@ -1811,16 +1874,16 @@ def _mixture_newton_iterations(
 
 
 def update_spike_glm_params(
-    spikes: Array,
-    smoother_mean: Array,
+    spikes: ArrayLike,
+    smoother_mean: ArrayLike,
     current_params: SpikeObsParams,
     dt: float,
     max_iter: int = 10,
-    smoother_cov: Array | None = None,
+    smoother_cov: ArrayLike | None = None,
     use_second_order: bool = False,
     weight_l2: float = 0.0,
-    time_weights: Array | None = None,
-    baseline_prior: Array | None = None,
+    time_weights: ArrayLike | None = None,
+    baseline_prior: ArrayLike | None = None,
     baseline_prior_l2: float = 0.0,
 ) -> SpikeObsParams:
     """M-step for spike observation parameters.
@@ -1838,9 +1901,9 @@ def update_spike_glm_params(
 
     Parameters
     ----------
-    spikes : Array, shape (n_time, n_neurons)
+    spikes : ArrayLike, shape (n_time, n_neurons)
         Observed spike counts for all neurons at each timestep.
-    smoother_mean : Array, shape (n_time, n_latent)
+    smoother_mean : ArrayLike, shape (n_time, n_latent)
         Smoothed latent state estimates from the E-step.
     current_params : SpikeObsParams
         Current parameter estimates (for warm-starting).
@@ -1851,7 +1914,7 @@ def update_spike_glm_params(
         second-order method use Newton steps with analytical gradient and
         Hessian plus Armijo backtracking line search — there is no BFGS
         path. This sets the per-neuron Newton step budget.
-    smoother_cov : Array | None, shape (n_time, n_latent, n_latent), optional
+    smoother_cov : ArrayLike | None, shape (n_time, n_latent, n_latent), optional
         Smoothed latent state covariances. Required if use_second_order=True.
     use_second_order : bool, default=False
         If True, use second-order expectation method that accounts for
@@ -1859,9 +1922,9 @@ def update_spike_glm_params(
     weight_l2 : float, default=0.0
         L2 regularization strength on the weights (not baseline).
         Adds 0.5 * weight_l2 * ||weights||^2 to the objective for each neuron.
-    time_weights : Array | None, shape (n_time,), optional
+    time_weights : ArrayLike | None, shape (n_time,), optional
         Per-timestep weights (e.g., state responsibilities). If None, uses ones.
-    baseline_prior : Array | None, optional
+    baseline_prior : ArrayLike | None, optional
         Prior center for baseline shrinkage. If None, uses a zero-centered
         prior when baseline_prior_l2 > 0.
     baseline_prior_l2 : float, default=0.0
@@ -1889,6 +1952,9 @@ def update_spike_glm_params(
     which helps prevent overfitting when the number of neurons is small
     relative to the latent dimensionality.
     """
+    spikes = jnp.asarray(spikes)
+    smoother_mean = jnp.asarray(smoother_mean)
+    smoother_cov = None if smoother_cov is None else jnp.asarray(smoother_cov)
     n_time = smoother_mean.shape[0]
     n_latent = smoother_mean.shape[1]
 
@@ -1927,6 +1993,7 @@ def update_spike_glm_params(
         # zero-centered prior is the neutral default for baseline_prior.
         if baseline_prior is None:
             baseline_prior = jnp.zeros_like(baselines)
+        assert smoother_cov is not None  # validated above for use_second_order
         final_baselines, final_weights, n_fallbacks = _second_order_newton_iterations(
             baselines,
             weights,
@@ -1943,10 +2010,14 @@ def update_spike_glm_params(
     else:
         # Run Newton iterations for all neurons (plug-in)
         # vmap directly over neuron-axis data.
-        def iterate_all_neurons(carry, _):
+        def iterate_all_neurons(
+            carry: tuple[Array, Array], _: None
+        ) -> tuple[tuple[Array, Array], Array]:
             baselines, weights = carry
 
-            def update_neuron(b, w, y_n):
+            def update_neuron(
+                b: Array, w: Array, y_n: Array
+            ) -> tuple[Array, Array, Array]:
                 return _single_neuron_glm_step(
                     b, w, y_n, smoother_mean, dt, time_weights, weight_l2
                 )
@@ -1969,15 +2040,15 @@ def update_spike_glm_params(
 
 
 def update_spike_glm_params_mixture(
-    spikes: Array,
-    state_cond_smoother_mean: Array,
-    state_cond_smoother_cov: Array,
-    state_weights: Array,
+    spikes: ArrayLike,
+    state_cond_smoother_mean: ArrayLike,
+    state_cond_smoother_cov: ArrayLike,
+    state_weights: ArrayLike,
     current_params: SpikeObsParams,
     dt: float,
     max_iter: int = 10,
     weight_l2: float = 0.0,
-    baseline_prior: Array | None = None,
+    baseline_prior: ArrayLike | None = None,
     baseline_prior_l2: float = 0.0,
 ) -> SpikeObsParams:
     """M-step for shared spike GLM parameters under a switching posterior.
@@ -1992,6 +2063,8 @@ def update_spike_glm_params_mixture(
     Newton solve runs in the promoted precision).
     """
     spikes = jnp.asarray(spikes)
+    state_cond_smoother_mean = jnp.asarray(state_cond_smoother_mean)
+    state_cond_smoother_cov = jnp.asarray(state_cond_smoother_cov)
     state_weights = jnp.asarray(state_weights)
     n_time, n_latent, n_states = state_cond_smoother_mean.shape
 
@@ -2032,7 +2105,7 @@ def update_spike_glm_params_mixture(
 
 
 @functools.partial(
-    jax.jit,
+    typed_jit,
     static_argnames=[
         "log_intensity_func",
         "include_laplace_normalization",
@@ -2053,7 +2126,7 @@ def _switching_point_process_filter_jit(
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
-) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
+) -> SwitchingFilterResult:
     """Switching point-process Kalman filter for spike observations.
 
     This filter implements a Switching Linear Dynamical System (SLDS) with
@@ -2401,32 +2474,32 @@ def _switching_point_process_filter_jit(
         [first_pair_cond_prob[None, ...], rest_pair_cond_filter_prob], axis=0
     )
 
-    return (
-        state_cond_filter_mean,
-        state_cond_filter_cov,
-        filter_discrete_state_prob,
-        pair_cond_filter_mean,  # full pair-conditional trajectory (GPB2 smoother)
-        pair_cond_filter_cov,  # full pair-conditional cov trajectory
-        pair_cond_filter_prob,  # full pair-filter discrete trajectory
-        marginal_log_likelihood,
+    return SwitchingFilterResult(
+        state_cond_filter_mean=state_cond_filter_mean,
+        state_cond_filter_cov=state_cond_filter_cov,
+        filter_discrete_state_prob=filter_discrete_state_prob,
+        pair_cond_filter_mean=pair_cond_filter_mean,
+        pair_cond_filter_cov=pair_cond_filter_cov,
+        pair_cond_filter_prob=pair_cond_filter_prob,
+        marginal_log_likelihood=marginal_log_likelihood,
     )
 
 
 def switching_point_process_filter(
-    init_state_cond_mean: Array,
-    init_state_cond_cov: Array,
-    init_discrete_state_prob: Array,
-    spikes: Array,
-    discrete_transition_matrix: Array,
-    continuous_transition_matrix: Array,
-    process_cov: Array,
+    init_state_cond_mean: ArrayLike,
+    init_state_cond_cov: ArrayLike,
+    init_discrete_state_prob: ArrayLike,
+    spikes: ArrayLike,
+    discrete_transition_matrix: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
     dt: float,
     log_intensity_func: Callable[[Array, SpikeObsParams], Array],
     spike_params: SpikeObsParams,
     include_laplace_normalization: bool = True,
     max_newton_iter: int = 3,
     line_search_beta: float = 0.5,
-) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
+) -> SwitchingFilterResult:
     """Switching point-process Kalman filter for spike observations.
 
     Thin, eagerly-evaluated wrapper around the jitted core
@@ -2447,9 +2520,17 @@ def switching_point_process_filter(
 
     Returns
     -------
-    tuple of Array
-        Same 7-tuple as ``_switching_point_process_filter_jit``.
+    SwitchingFilterResult
+        NamedTuple of the seven filter outputs (see
+        ``_switching_point_process_filter_jit`` for shapes).
     """
+    init_state_cond_mean = jnp.asarray(init_state_cond_mean)
+    init_state_cond_cov = jnp.asarray(init_state_cond_cov)
+    init_discrete_state_prob = jnp.asarray(init_discrete_state_prob)
+    spikes = jnp.asarray(spikes)
+    discrete_transition_matrix = jnp.asarray(discrete_transition_matrix)
+    continuous_transition_matrix = jnp.asarray(continuous_transition_matrix)
+    process_cov = jnp.asarray(process_cov)
     _validate_discrete_state_transitions(
         discrete_transition_matrix, init_discrete_state_prob, dt
     )
@@ -2511,6 +2592,18 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         "update_init_cov": "P0",
     }
 
+    # Smoother results, set by the E-step (and the warm-start placeholders in
+    # ``BaseSwitchingPointProcessModel``); NotFittedError before then.
+    smoother_state_cond_mean: FittedAttribute[Array] = FittedAttribute()
+    smoother_state_cond_cov: FittedAttribute[Array] = FittedAttribute()
+    smoother_discrete_state_prob: FittedAttribute[Array] = FittedAttribute()
+    smoother_joint_discrete_state_prob: FittedAttribute[Array] = FittedAttribute()
+    smoother_pair_cond_cross_cov: FittedAttribute[Array] = FittedAttribute()
+    smoother_pair_cond_means: FittedAttribute[Array] = FittedAttribute()
+    # Populated only by the GPB2 smoother; None under GPB1.
+    smoother_pair_cond_covs: FittedAttribute[Array | None] = FittedAttribute()
+    smoother_next_pair_cond_means: FittedAttribute[Array | None] = FittedAttribute()
+
     def __init__(
         self,
         n_oscillators: int,
@@ -2519,7 +2612,7 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         sampling_freq: float,
         dt: float,
         *,
-        discrete_transition_diag: Array | None,
+        discrete_transition_diag: ArrayLike | None,
         update_continuous_transition_matrix: bool,
         update_process_cov: bool,
         update_discrete_transition_matrix: bool,
@@ -2623,17 +2716,6 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         self.continuous_transition_matrix: Array
         self.process_cov: Array
         self.spike_params: SpikeObsParams
-
-        # Placeholders for smoother results (computed in E-step)
-        self.smoother_state_cond_mean: Array
-        self.smoother_state_cond_cov: Array
-        self.smoother_discrete_state_prob: Array
-        self.smoother_joint_discrete_state_prob: Array
-        self.smoother_pair_cond_cross_cov: Array
-        self.smoother_pair_cond_means: Array
-        # Populated only by the GPB2 smoother; None under GPB1.
-        self.smoother_pair_cond_covs: Array | None
-        self.smoother_next_pair_cond_means: Array | None
 
     def __repr__(self) -> str:
         """Return string representation of the model."""
@@ -2860,6 +2942,8 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         validate_covariance(
             self.process_cov, "process_cov", require_positive_definite=False
         )
+        expected_baseline: tuple[int, ...]
+        expected_weights: tuple[int, ...]
         if self.separate_spike_params:
             expected_baseline = (self.n_neurons, self.n_discrete_states)
             expected_weights = (
@@ -3312,9 +3396,9 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
 
     def fit_sgd(
         self,
-        spikes: Array,
+        spikes: ArrayLike,
         key: Array | None = None,
-        optimizer: object | None = None,
+        optimizer: optax.GradientTransformation | None = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
@@ -3323,7 +3407,7 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
 
         Parameters
         ----------
-        spikes : Array, shape (n_time, n_neurons)
+        spikes : ArrayLike, shape (n_time, n_neurons)
             Observed spike counts.
         key : Array or None
             JAX random key for initialization. Required on first call.
@@ -3376,15 +3460,15 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
                 "Call fit_sgd(spikes, key=...) to initialize parameters."
             )
 
-    def _shared_sgd_param_spec(self) -> tuple[dict, dict]:
+    def _shared_sgd_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         """SGD parameters every switching point-process model optimizes.
 
         Spike GLM parameters, the discrete transition matrix, the initial mean
         and the per-state initial covariances, each gated by its update flag.
         Subclasses add their model-specific dynamics parameters.
         """
-        params: dict = {}
-        spec: dict = {}
+        params: SGDParams = {}
+        spec: SGDParamSpec = {}
 
         if self.update_spike_params:
             params["spike_baseline"] = self.spike_params.baseline
@@ -3408,7 +3492,7 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
 
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, spikes: Array) -> Array:
+    def _sgd_loss_fn(self, params: SGDParams, spikes: Array) -> Array:
         """Negative marginal LL (plus the EM M-step's penalties) for SGD.
 
         Subclasses that optimize structured dynamics reconstruct the per-state
@@ -3469,7 +3553,7 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
 
         return loss
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         """Store the shared SGD parameters; subclasses add their own after."""
         if "discrete_transition_matrix" in params:
             self.discrete_transition_matrix = params["discrete_transition_matrix"]
@@ -3518,7 +3602,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
     dt : float
         Time bin width in seconds. Must be positive. Typically dt <= 1/sampling_freq
         for numerical stability.
-    discrete_transition_diag : Array | None, optional
+    discrete_transition_diag : ArrayLike | None, optional
         Diagonal elements of the discrete transition matrix (self-transition
         probabilities). Values should be in [0, 1]. Shape must be (n_discrete_states,)
         if provided. If None, defaults to 0.95 for all states.
@@ -3614,7 +3698,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         n_discrete_states: int,
         sampling_freq: float,
         dt: float,
-        discrete_transition_diag: Array | None = None,
+        discrete_transition_diag: ArrayLike | None = None,
         update_continuous_transition_matrix: bool = True,
         update_process_cov: bool = True,
         update_discrete_transition_matrix: bool = True,
@@ -3644,7 +3728,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
             Sampling frequency in Hz.
         dt : float
             Time bin width in seconds.
-        discrete_transition_diag : Array | None, optional
+        discrete_transition_diag : ArrayLike | None, optional
             Diagonal of discrete transition matrix. Defaults to 0.95.
         update_continuous_transition_matrix : bool, default=True
             Update A during M-step.
@@ -3963,7 +4047,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         # Snapshot parameters for rollback on a rejected step
         import copy
 
-        def _snapshot_params() -> dict:
+        def _snapshot_params() -> dict[str, Any]:
             return {
                 "continuous_transition_matrix": self.continuous_transition_matrix.copy(),
                 "process_cov": self.process_cov.copy(),
@@ -3974,7 +4058,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
                 "spike_params": copy.deepcopy(self.spike_params),
             }
 
-        def _restore_params(params: dict) -> None:
+        def _restore_params(params: dict[str, Any]) -> None:
             self.continuous_transition_matrix = params["continuous_transition_matrix"]
             self.process_cov = params["process_cov"]
             self.discrete_transition_matrix = params["discrete_transition_matrix"]
@@ -4008,7 +4092,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
 
     # --- SGDFittableMixin protocol: model-specific dynamics parameters ---
 
-    def _build_param_spec(self):
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         params, spec = self._shared_sgd_param_spec()
 
         if self.update_continuous_transition_matrix:
@@ -4027,7 +4111,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
 
         return params, spec
 
-    def _sgd_loss_fn(self, params, spikes):
+    def _sgd_loss_fn(self, params: SGDParams, spikes: Array) -> Array:
         # Reconstruct the per-state dynamics from the scaled-rotation blocks and
         # per-state Q parameters, then evaluate the shared filter loss.
         params_with_dynamics = dict(params)
@@ -4038,7 +4122,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         )
         return super()._sgd_loss_fn(params_with_dynamics, spikes)
 
-    def _reconstruct_A_from_blocks(self, params: dict) -> Array:
+    def _reconstruct_A_from_blocks(self, params: SGDParams) -> Array:
         """Rebuild the per-state transition matrix from scaled-rotation SGD blocks.
 
         A per-state block missing from ``params`` falls back to the current
@@ -4060,7 +4144,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
             axis=-1,
         )
 
-    def _store_sgd_params(self, params):
+    def _store_sgd_params(self, params: SGDParams) -> None:
         super()._store_sgd_params(params)
 
         if any(k.startswith("A_blocks_") for k in params):

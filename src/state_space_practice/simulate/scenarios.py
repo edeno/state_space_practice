@@ -20,6 +20,8 @@ Design principles:
 - E-step with true parameters achieves >=0.70 accuracy for all scenarios
 """
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -54,7 +56,9 @@ Z = np.array([[0.98, 0.02], [0.02, 0.98]])
 # ============================================================================
 
 
-def simulate_com_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict:
+def simulate_com_scenario(
+    n_time: int = N_TIME_GAUSSIAN, seed: int = 42
+) -> dict[str, Any]:
     """COM scenario: measurement matrix H switches between states.
 
     State 0: sources observe theta oscillations (8 Hz).
@@ -118,7 +122,9 @@ def simulate_com_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
     }
 
 
-def simulate_cnm_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict:
+def simulate_cnm_scenario(
+    n_time: int = N_TIME_GAUSSIAN, seed: int = 42
+) -> dict[str, Any]:
     """CNM scenario: process noise covariance Q switches between states.
 
     State 0: independent noise (diagonal Q).
@@ -210,7 +216,9 @@ def simulate_cnm_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
     }
 
 
-def simulate_dim_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict:
+def simulate_dim_scenario(
+    n_time: int = N_TIME_GAUSSIAN, seed: int = 42
+) -> dict[str, Any]:
     """DIM scenario: transition matrix A switches between states.
 
     State 0: oscillator 1 drives oscillator 2 (osc1 -> osc2).
@@ -295,7 +303,7 @@ def simulate_dim_scenario(n_time: int = N_TIME_GAUSSIAN, seed: int = 42) -> dict
 # ============================================================================
 
 
-def simulate_com_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
+def simulate_com_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict[str, Any]:
     """COM-PP scenario: spike observation params switch between states.
 
     All neurons are active in both states with similar overall firing rates.
@@ -361,7 +369,7 @@ def simulate_com_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
     }
 
 
-def simulate_cnm_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
+def simulate_cnm_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict[str, Any]:
     """CNM-PP scenario: process noise Q switches, observed through spikes.
 
     State 0: low process noise (Q variance = 0.05).
@@ -441,7 +449,7 @@ def simulate_cnm_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
     }
 
 
-def simulate_dim_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict:
+def simulate_dim_pp_scenario(n_time: int = N_TIME_PP, seed: int = 42) -> dict[str, Any]:
     """DIM-PP scenario: transition matrix A switches, observed through spikes.
 
     State 0: oscillator 1 drives oscillator 2 (osc1 -> osc2).

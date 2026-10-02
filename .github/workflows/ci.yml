@@ -42,7 +42,7 @@ jobs:
         run: uv run --no-sync ruff check src/ notebooks/ scripts/
       - name: ruff format
         run: uv run --no-sync ruff format --check src/ notebooks/ scripts/
-      - name: mypy (modules listed in [tool.mypy] files)
+      - name: mypy (whole package)
         run: uv run --no-sync mypy
 
   test:

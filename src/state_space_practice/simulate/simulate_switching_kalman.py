@@ -1,10 +1,29 @@
+from typing import Any
+
 import numpy as np
 import scipy
+from numpy.typing import ArrayLike, NDArray
 
 np.random.seed(0)
 
 
-def simdata_settings():
+def simdata_settings() -> tuple[
+    int,
+    int,
+    int,
+    int,
+    NDArray[np.int_],
+    NDArray[np.float64],
+    NDArray[np.int_],
+    int,
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    int,
+]:
     # Define the dimensions of the input data
     k = 2  # # of oscillators
     n = 4  # # of electrodes
@@ -29,9 +48,15 @@ def simdata_settings():
     R = build_R(n, M, var_obs_noi)  # Observation noise covariance
 
     B = np.zeros((n, x_dim, M))  # Observation matrix
-    B[:, :, 0] = [[0.4, 0, 0, 0], [0, 0, 0.4, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
-    B[:, :, 1] = [[0.3, 0, 0, 0], [0, 0.3, 0, 0], [0, 0, 0.25, 0], [0, 0, 0, -0.25]]
-    B[:, :, 2] = [[0.5, 0, 0, 0], [-0.5, 0, 0, 0], [0.5, 0, 0, 0], [0, 0, 0.4, 0]]
+    B[:, :, 0] = np.asarray(
+        [[0.4, 0, 0, 0], [0, 0, 0.4, 0], [0, 0, 0, 0], [0, 0, 0, 0]], dtype=float
+    )
+    B[:, :, 1] = np.asarray(
+        [[0.3, 0, 0, 0], [0, 0.3, 0, 0], [0, 0, 0.25, 0], [0, 0, 0, -0.25]], dtype=float
+    )
+    B[:, :, 2] = np.asarray(
+        [[0.5, 0, 0, 0], [-0.5, 0, 0, 0], [0.5, 0, 0, 0], [0, 0, 0.4, 0]], dtype=float
+    )
 
     Z = np.asarray(
         [[0.998, 0.001, 0.001], [0.001, 0.998, 0.001], [0.001, 0.001, 0.998]]
@@ -61,7 +86,13 @@ def simdata_settings():
     )
 
 
-def build_AQ(M, fs, osc_freqs, rhos, var_state_nois):
+def build_AQ(
+    M: int,
+    fs: float,
+    osc_freqs: NDArray[np.number],
+    rhos: NDArray[np.number],
+    var_state_nois: NDArray[np.number],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
 
     k = len(osc_freqs)
     assert len(rhos) == k
@@ -88,14 +119,25 @@ def build_AQ(M, fs, osc_freqs, rhos, var_state_nois):
     return A, Q
 
 
-def build_R(n, M, var_obs_noi):
+def build_R(n: int, M: int, var_obs_noi: float) -> NDArray[np.float64]:
     R = np.zeros((n, n, M))
     for i in range(M):
         R[:, :, i] = var_obs_noi * np.eye(n)
     return R
 
 
-def simulate(A, B0, Q, R, Z, X_0, S_0, T, s=None, seed: int = 14):
+def simulate(
+    A: NDArray[np.floating],
+    B0: NDArray[np.floating],
+    Q: NDArray[np.floating],
+    R: NDArray[np.floating],
+    Z: NDArray[np.floating],
+    X_0: NDArray[np.floating],
+    S_0: int,
+    T: int,
+    s: ArrayLike | None = None,
+    seed: int = 14,
+) -> tuple[NDArray[np.float64], NDArray[np.int_], NDArray[np.float64]]:
     if T <= 0:
         raise ValueError(f"T must be positive, got {T}.")
     rng = np.random.default_rng(seed)
@@ -129,7 +171,30 @@ def simulate(A, B0, Q, R, Z, X_0, S_0, T, s=None, seed: int = 14):
     return y, s, x
 
 
-def simulate_model(T: int = 30000, blnSimS: bool = False):
+def simulate_model(
+    T: int = 30000, blnSimS: bool = False
+) -> tuple[
+    int,
+    int,
+    int,
+    int,
+    NDArray[np.int_],
+    NDArray[np.float64],
+    NDArray[np.int_],
+    int,
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    int,
+    int,
+    NDArray[np.int_],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
     """
 
     Parameters
@@ -228,7 +293,7 @@ def simulate_model(T: int = 30000, blnSimS: bool = False):
 def simulate_distinguishable_states(
     n_time: int = 1000,
     seed: int = 42,
-) -> dict:
+) -> dict[str, Any]:
     """
     Generate data where discrete states are easy to distinguish.
 

@@ -48,6 +48,7 @@ from state_space_practice.switching_kalman import (
     switching_kalman_filter,
     switching_kalman_maximization_step,
     switching_kalman_smoother,
+    switching_kalman_smoother_gpb2,
     switching_kalman_viterbi,
     weighted_sum_of_outer_products,
 )
@@ -1014,6 +1015,96 @@ def test_switching_kalman_filter_shapes(simple_skf_model: tuple) -> None:
     )
     assert not jnp.isnan(mll)
     np.testing.assert_allclose(jnp.sum(filt_p, axis=1), 1.0, rtol=1e-5)
+
+
+def test_switching_kalman_filter_accepts_numpy_inputs(simple_skf_model: tuple) -> None:
+    """NumPy inputs (accepted by the ArrayLike signature) match JAX inputs."""
+    jax_outputs = switching_kalman_filter(*simple_skf_model)
+    numpy_inputs = [np.asarray(x) for x in simple_skf_model]
+    assert all(type(x) is np.ndarray for x in numpy_inputs)
+
+    numpy_outputs = switching_kalman_filter(*numpy_inputs)
+
+    assert len(numpy_outputs) == len(jax_outputs)
+    for from_numpy, from_jax in zip(numpy_outputs, jax_outputs, strict=True):
+        np.testing.assert_array_equal(from_numpy, from_jax)
+
+
+def test_switching_result_fields_name_the_right_outputs(
+    simple_skf_model: tuple,
+) -> None:
+    """Each NamedTuple field holds the quantity its name says (shape and
+    probability invariants), so field access cannot silently misbind."""
+    init_mean, init_cov, init_prob, obs, Z, A, Q, H, R = simple_skf_model
+    n_time = obs.shape[0]
+    n, n_s = init_mean.shape
+
+    filt = switching_kalman_filter(init_mean, init_cov, init_prob, obs, Z, A, Q, H, R)
+    assert filt.state_cond_filter_mean.shape == (n_time, n, n_s)
+    assert filt.state_cond_filter_cov.shape == (n_time, n, n, n_s)
+    np.testing.assert_allclose(filt.filter_discrete_state_prob.sum(axis=1), 1.0)
+    assert filt.pair_cond_filter_mean.shape == (n_time, n, n_s, n_s)
+    assert filt.pair_cond_filter_cov.shape == (n_time, n, n, n_s, n_s)
+    np.testing.assert_allclose(filt.pair_cond_filter_prob.sum(axis=(1, 2)), 1.0)
+    assert filt.marginal_log_likelihood.shape == ()
+
+    smooth = switching_kalman_smoother(
+        filt.state_cond_filter_mean,
+        filt.state_cond_filter_cov,
+        filt.filter_discrete_state_prob,
+        Q,
+        A,
+        Z,
+    )
+    gpb2 = switching_kalman_smoother_gpb2(
+        filt.state_cond_filter_mean,
+        filt.state_cond_filter_cov,
+        filt.filter_discrete_state_prob,
+        filt.pair_cond_filter_mean,
+        filt.pair_cond_filter_cov,
+        filt.pair_cond_filter_prob,
+        Q,
+        A,
+    )
+    for result in (smooth, gpb2):
+        assert result.overall_smoother_mean.shape == (n_time, n)
+        assert result.overall_smoother_cov.shape == (n_time, n, n)
+        np.testing.assert_allclose(
+            result.smoother_discrete_state_prob.sum(axis=1), 1.0, rtol=1e-6
+        )
+        np.testing.assert_allclose(
+            result.smoother_joint_discrete_state_prob.sum(axis=(1, 2)),
+            1.0,
+            rtol=1e-6,
+        )
+        assert result.overall_smoother_cross_cov.shape == (n_time - 1, n, n)
+        assert result.state_cond_smoother_means.shape == (n_time, n, n_s)
+        assert result.state_cond_smoother_covs.shape == (n_time, n, n, n_s)
+        assert result.pair_cond_smoother_cross_covs.shape == (
+            n_time - 1,
+            n,
+            n,
+            n_s,
+            n_s,
+        )
+        assert result.pair_cond_smoother_means.shape == (n_time - 1, n, n_s, n_s)
+    assert gpb2.pair_cond_smoother_covs.ndim == 5
+    assert gpb2.next_pair_cond_smoother_means.ndim == 4
+
+    params = switching_kalman_maximization_step(
+        obs,
+        smooth.state_cond_smoother_means,
+        smooth.state_cond_smoother_covs,
+        smooth.smoother_discrete_state_prob,
+        smooth.smoother_joint_discrete_state_prob,
+        smooth.pair_cond_smoother_cross_covs,
+        smooth.pair_cond_smoother_means,
+    )
+    assert params.init_mean.shape == (n, n_s)
+    assert params.init_cov.shape == (n, n, n_s)
+    np.testing.assert_allclose(params.discrete_transition_matrix.sum(axis=1), 1.0)
+    assert params.init_discrete_state_prob.shape == (n_s,)
+    np.testing.assert_allclose(params.init_discrete_state_prob.sum(), 1.0)
 
 
 def test_skf_reduces_to_kf_single_state(simple_1d_model: tuple) -> None:

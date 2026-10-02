@@ -38,7 +38,7 @@ uv run pytest --cov=src/state_space_practice --cov-report=term-missing
 uv run ruff check src/
 uv run ruff format src/
 
-# Run type checker (checks the modules listed in [tool.mypy] files, as CI does)
+# Run type checker (whole package except tests, as CI does)
 uv run mypy
 ```
 
@@ -60,6 +60,7 @@ src/state_space_practice/
 ├── models.py                  # General state-space model classes
 ├── utils.py                   # Shared utilities (PSD floors, validation)
 ├── exceptions.py              # StateSpaceWarning, NotFittedError
+├── fitted_state.py            # FittedAttribute: typed post-fit model state
 ├── simulate_data.py           # Data simulation utilities
 ├── simulate/                  # Additional simulation modules
 └── tests/                     # pytest test suite
@@ -80,6 +81,15 @@ src/state_space_practice/
 - Use `ArrayLike` for function inputs (accepts numpy/jax arrays)
 - Use `Array` (jax.Array) for return types
 - Document shapes in docstrings: `mean: Array of shape (n_latent,)`
+- mypy runs with the `--strict` checks: annotate every function (including
+  `lax.scan` bodies) and parameterize generics (SGD dicts are `SGDParams` /
+  `SGDParamSpec` from `sgd_fitting`)
+- Jit with `utils.typed_jit` (same as `jax.jit`, but mypy sees the wrapped
+  signature), not `jax.jit`
+- Return 5+ results as a `NamedTuple`, not a bare tuple
+- Fitted model outputs are class-level `FittedAttribute[T]` (`fitted_state.py`):
+  test with `is_set`, reset with `del`; keep `T | None` only for values that
+  can be `None` after fitting
 
 ### Testing
 

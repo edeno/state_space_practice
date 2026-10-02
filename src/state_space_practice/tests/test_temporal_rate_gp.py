@@ -404,6 +404,14 @@ def test_predict_before_fit_raises():
         model.predict_rate()
 
 
+@pytest.mark.parametrize("attr", ["log_rate_mean_", "log_marginal_likelihood_"])
+def test_fitted_attribute_unset_before_fit(attr):
+    model = TemporalRateGP(dt=0.1)
+    with pytest.raises(NotFittedError, match=attr):
+        getattr(model, attr)
+    assert not hasattr(model, attr)
+
+
 @pytest.mark.parametrize("bad_min_weight", [0.0, -1.0, np.nan, np.inf])
 def test_temporal_rate_gp_rejects_invalid_min_weight(bad_min_weight):
     with pytest.raises(ValueError, match="min_weight"):
