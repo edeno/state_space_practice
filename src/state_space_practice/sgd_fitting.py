@@ -650,6 +650,13 @@ class SGDFittableMixin:
         # Validate the plain settings before the hook: ``_prepare_sgd_data`` may
         # mutate the model (e.g. record the sequence length).
         num_steps = validate_int(num_steps, "num_steps", nonnegative=True)
+        if optimizer is None:
+            optimizer = _DEFAULT_OPTIMIZER
+        if not hasattr(optimizer, "init") or not hasattr(optimizer, "update"):
+            raise ValueError(
+                "optimizer must be an optax GradientTransformation with "
+                "init and update methods."
+            )
         args, kwargs = self._prepare_sgd_data(*args, **kwargs)
 
         self._check_sgd_initialized()
@@ -679,13 +686,6 @@ class SGDFittableMixin:
                 "Check the model's initial parameter values."
             )
 
-        if optimizer is None:
-            optimizer = _DEFAULT_OPTIMIZER
-        if not hasattr(optimizer, "init") or not hasattr(optimizer, "update"):
-            raise ValueError(
-                "optimizer must be an optax GradientTransformation with "
-                "init and update methods."
-            )
         opt_state = optimizer.init(unc_params)
 
         def _loss_inner(unc_p: SGDParams) -> Array:

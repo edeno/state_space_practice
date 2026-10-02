@@ -674,9 +674,10 @@ class TestPrepareSGDDataHook:
         with pytest.raises(TypeError, match="unexpected keyword argument 'key'"):
             _Strict().fit_sgd(jnp.array(1.0), key=1, num_steps=0)
 
-    def test_invalid_num_steps_is_rejected_before_the_hook_runs(self) -> None:
+    def test_invalid_settings_are_rejected_before_the_hook_runs(self) -> None:
         """``_prepare_sgd_data`` may have side effects (e.g. recording the
-        sequence length); an invalid ``num_steps`` must fail before it runs."""
+        sequence length); an invalid ``num_steps`` or optimizer must fail
+        before it runs."""
         calls: list[str] = []
 
         class _Recording(_ToyModel):
@@ -690,6 +691,10 @@ class TestPrepareSGDDataHook:
         calls.clear()
         with pytest.raises(ValueError, match="num_steps"):
             _Recording().fit_sgd(jnp.array(1.0), num_steps=-1)
+        assert calls == []
+
+        with pytest.raises(ValueError, match="optimizer"):
+            _Recording().fit_sgd(jnp.array(1.0), optimizer=object(), num_steps=1)
         assert calls == []
 
 
