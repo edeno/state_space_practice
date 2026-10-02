@@ -10179,6 +10179,79 @@ def test_descent_step_falls_back_to_gradient_for_non_descent_direction() -> None
     assert not bool(fell_back_inf)
 
 
+@pytest.mark.parametrize(
+    "variant", ["second_order", "second_order_no_prior", "mixture"]
+)
+def test_second_order_line_search_trial_loss_matches_direct_loss(
+    monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    """The O(T) polynomial-in-alpha trial loss equals loss_fn at each trial.
+
+    The second-order and mixture Newton steps evaluate the Armijo trials from
+    per-time terms expanded in the step size; a spy on the line search
+    compares them with the full loss at the trial parameters (off-diagonal
+    covariances and a nonzero baseline step exercise every term).
+    """
+    import state_space_practice.switching_point_process as spp
+
+    n_time, n_latent, n_states = 60, 3, 2
+    keys = jax.random.split(jax.random.PRNGKey(3), 5)
+    factors = 0.4 * jax.random.normal(keys[0], (n_time, n_latent, n_latent, n_states))
+    covs = (
+        jnp.einsum("tiks,tjks->tijs", factors, factors)
+        + 0.05 * jnp.eye(n_latent)[None, :, :, None]
+    )
+    means = jax.random.normal(keys[1], (n_time, n_latent, n_states))
+    spikes = jax.random.poisson(keys[2], 2.0, (n_time,)).astype(float)
+    weights = 0.3 * jax.random.normal(keys[3], (n_latent,))
+    state_weights = jax.nn.softmax(jax.random.normal(keys[4], (n_time, n_states)))
+
+    real_line_search = spp._armijo_line_search
+    n_checked = []
+
+    def spy(params, delta, gradient, loss_fn, current_loss, **kwargs):
+        loss_along = kwargs["loss_along"]
+        assert loss_along is not None
+        for alpha in (1.0, 0.5, 0.0625, 1e-3):
+            np.testing.assert_allclose(
+                loss_along(jnp.asarray(alpha)),
+                loss_fn(params - alpha * delta),
+                rtol=1e-12,
+            )
+        n_checked.append(1)
+        return real_line_search(
+            params, delta, gradient, loss_fn, current_loss, **kwargs
+        )
+
+    monkeypatch.setattr(spp, "_armijo_line_search", spy)
+    common = dict(weight_l2=0.3, baseline_prior_l2=0.7)
+    if variant == "mixture":
+        spp._single_neuron_glm_step_second_order_mixture(
+            jnp.array(0.5),
+            weights,
+            spikes,
+            means,
+            covs,
+            state_weights,
+            0.05,
+            baseline_prior=jnp.array(1.0),
+            **common,
+        )
+    else:
+        spp._single_neuron_glm_step_second_order(
+            jnp.array(0.5),
+            weights,
+            spikes,
+            means[..., 0],
+            covs[..., 0],
+            0.05,
+            time_weights=state_weights[:, 0],
+            baseline_prior=None if variant.endswith("no_prior") else jnp.array(1.0),
+            **common,
+        )
+    assert n_checked == [1]
+
+
 def test_spike_glm_update_warns_on_newton_fallback(monkeypatch) -> None:
     """The per-neuron fallbacks are aggregated into one host-side warning, and
     the update still improves the objective instead of freezing."""

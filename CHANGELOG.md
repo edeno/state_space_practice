@@ -231,6 +231,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `rts_backward_scan_with_predictions` 220 MB -> 0; at T=20k, 8 latent dims,
   3 states the switching filter 103 MB -> 0, GPB2 smoother 131 MB -> 0.
   Outputs are bit-identical; runtime and gradient memory are unchanged.
+- **Faster second-order and mixture spike-GLM M-steps**: each Armijo trial
+  of the Newton line search recomputed the `O(T L^2)` (mixture:
+  `O(T L^2 S)`) quadratic forms `w' P_t w`; the trial loss is now evaluated
+  from per-time terms expanded as polynomials in the step size, computed once
+  per direction, so each trial costs `O(T)` (`O(T S)`). At T=20k, 8 latent
+  dims, 30 neurons: second-order M-step 437 -> 382 ms, mixture 1746 ->
+  1163 ms. Trial losses change only by floating-point reassociation (they
+  match the direct loss to 1e-12 relative), so an Armijo decision can flip
+  only at round-off level: fitted EM log-likelihoods of DIM-PP, COM-PP and
+  `SwitchingSpikeOscillatorModel` move by at most 6e-9 relative over 8-10
+  iterations.
 - **The choice models skip the duplicate final E-step after convergence**
   (`MultinomialChoiceModel`, `CovariateChoiceModel`, `SwitchingChoiceModel`).
 - **`PlaceFieldModel` posterior rate maps are computed by a jitted JAX

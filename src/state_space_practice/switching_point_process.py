@@ -1019,6 +1019,7 @@ def _armijo_line_search(
     beta: float = 0.5,
     c: float = 1e-4,
     max_iter: int = 20,
+    loss_along: Callable[[Array], Array] | None = None,
 ) -> Array:
     """Backtracking line search with Armijo condition.
 
@@ -1044,6 +1045,11 @@ def _armijo_line_search(
         Armijo constant for sufficient decrease condition.
     max_iter : int, default=20
         Maximum number of backtracking iterations.
+    loss_along : Callable[[Array], Array] | None, optional
+        ``alpha -> loss_fn(params - alpha * delta)``, when the caller can
+        evaluate it more cheaply than ``loss_fn`` (e.g. from per-time terms
+        precomputed once for this ``delta``). Used for the trial losses in
+        place of ``loss_fn``.
 
     Returns
     -------
@@ -1065,8 +1071,11 @@ def _armijo_line_search(
         # Under tracing loss_fn is evaluated every iteration; once a step is
         # found, `where` selects the cached current_loss (it does not skip the
         # call), which makes subsequent iterations inert.
-        new_params_trial = params - alpha * delta
-        new_loss = jnp.where(found, current_loss, loss_fn(new_params_trial))
+        if loss_along is None:
+            trial_loss = loss_fn(params - alpha * delta)
+        else:
+            trial_loss = loss_along(alpha)
+        new_loss = jnp.where(found, current_loss, trial_loss)
 
         # Armijo condition: new_loss <= current_loss - c * alpha * directional_derivative
         sufficient_decrease = found | (
@@ -1113,6 +1122,7 @@ def _descent_step(
     current_loss: Array,
     beta: float = 0.5,
     max_iter: int = 20,
+    line_loss: Callable[[Array], Callable[[Array], Array]] | None = None,
 ) -> tuple[Array, Array]:
     """Armijo step along ``delta``, falling back to the gradient direction.
 
@@ -1120,6 +1130,10 @@ def _descent_step(
     direction corrupted by an ill-conditioned Hessian), the Armijo search
     along it can only return ``alpha = 0`` -- a silent no-op update. The
     steepest-descent direction ``g`` is used instead.
+
+    ``line_loss``, if given, maps the search direction ``d`` to
+    ``alpha -> loss_fn(params - alpha * d)`` (see
+    :func:`_armijo_line_search`'s ``loss_along``).
 
     Returns
     -------
@@ -1146,6 +1160,7 @@ def _descent_step(
         current_loss,
         beta=beta,
         max_iter=max_iter,
+        loss_along=None if line_loss is None else line_loss(direction),
     )
     return params - alpha * direction, fell_back
 
@@ -1627,9 +1642,49 @@ def _single_neuron_glm_step_second_order(
             loss += 0.5 * baseline_prior_l2 * b_trial**2
         return loss
 
+    def line_loss(direction: Array) -> Callable[[Array], Array]:
+        # loss_fn(params - alpha * direction) with its O(T L^2) per-time terms
+        # expanded as polynomials in alpha (computed once per direction), so
+        # each line-search trial costs O(T):
+        #   m_t.w(alpha) = m_t.w - alpha m_t.d
+        #   w(alpha)' P_t w(alpha) = w'P_t w - alpha (d'P_t w + w'P_t d)
+        #                            + alpha^2 d'P_t d
+        d_b, d_w = direction[0], direction[1:]
+        mean_d = smoother_mean @ d_w  # (T,)
+        quad_lin = 0.5 * (
+            Pw @ d_w + jnp.einsum("tij,i,j->t", smoother_cov, w, d_w)
+        )  # (T,)
+        quad_sq = 0.5 * jnp.einsum("tij,i,j->t", smoother_cov, d_w, d_w)  # (T,)
+
+        def loss_along(alpha: Array) -> Array:
+            b_trial = b - alpha * d_b
+            w_trial = w - alpha * d_w
+            eta_lin_trial = eta_lin - alpha * mean_d
+            quad_trial = quad - alpha * quad_lin + alpha**2 * quad_sq
+            eta_trial = b_trial + eta_lin_trial + quad_trial
+            mu_trial = jnp.exp(_exp_safe_clip(eta_trial)) * dt
+            loss = jnp.sum(
+                time_weights_val * (mu_trial - y_n * (b_trial + eta_lin_trial))
+            )
+            loss += 0.5 * weight_l2 * jnp.dot(w_trial, w_trial)
+            if baseline_prior is not None:
+                loss += 0.5 * baseline_prior_l2 * (b_trial - bp) ** 2
+            else:
+                loss += 0.5 * baseline_prior_l2 * b_trial**2
+            return loss
+
+        return loss_along
+
     current_loss = loss_fn(params)
     new_params, fell_back = _descent_step(
-        params, delta, grad, loss_fn, current_loss, beta=0.5, max_iter=10
+        params,
+        delta,
+        grad,
+        loss_fn,
+        current_loss,
+        beta=0.5,
+        max_iter=10,
+        line_loss=line_loss,
     )
     new_baseline = new_params[0]
     new_weights = new_params[1:]
@@ -1728,9 +1783,44 @@ def _single_neuron_glm_step_second_order_mixture(
         loss += 0.5 * baseline_prior_l2 * (b_trial - bp) ** 2
         return loss
 
+    def line_loss(direction: Array) -> Callable[[Array], Array]:
+        # loss_fn(params - alpha * direction) with its O(T L^2 S) per-(time,
+        # state) terms expanded as polynomials in alpha (see the second-order
+        # step), so each line-search trial costs O(T S).
+        d_b, d_w = direction[0], direction[1:]
+        mean_d = jnp.einsum("tls,l->ts", state_cond_smoother_mean, d_w)
+        quad_lin = 0.5 * (
+            jnp.einsum("tls,l->ts", cov_w, d_w)
+            + jnp.einsum("tlks,l,k->ts", state_cond_smoother_cov, w, d_w)
+        )
+        quad_sq = 0.5 * jnp.einsum("tlks,l,k->ts", state_cond_smoother_cov, d_w, d_w)
+
+        def loss_along(alpha: Array) -> Array:
+            b_trial = b - alpha * d_b
+            w_trial = w - alpha * d_w
+            eta_lin_trial = eta_lin - alpha * mean_d
+            quad_trial = quad - alpha * quad_lin + alpha**2 * quad_sq
+            eta_trial = b_trial + eta_lin_trial + quad_trial
+            mu_trial = jnp.exp(_exp_safe_clip(eta_trial)) * dt
+            loss = jnp.sum(
+                state_weights * (mu_trial - y_n[:, None] * (b_trial + eta_lin_trial))
+            )
+            loss += 0.5 * weight_l2 * jnp.dot(w_trial, w_trial)
+            loss += 0.5 * baseline_prior_l2 * (b_trial - bp) ** 2
+            return loss
+
+        return loss_along
+
     current_loss = loss_fn(params)
     new_params, fell_back = _descent_step(
-        params, delta, grad, loss_fn, current_loss, beta=0.5, max_iter=10
+        params,
+        delta,
+        grad,
+        loss_fn,
+        current_loss,
+        beta=0.5,
+        max_iter=10,
+        line_loss=line_loss,
     )
     return new_params[0], new_params[1:], fell_back
 
