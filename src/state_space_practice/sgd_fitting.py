@@ -61,6 +61,12 @@ _SGD_STEP_CACHE: dict[int, dict[Hashable, _CompiledSGDStep]] = {}
 
 _MISSING = object()
 
+#: Trainable parameters by name: what ``_build_param_spec`` returns and
+#: ``_sgd_loss_fn`` / ``_store_sgd_params`` receive.
+SGDParams = dict[str, Array]
+#: The constraint transform for each trainable parameter.
+SGDParamSpec = dict[str, ParameterTransform]
+
 
 class _Uncacheable(Exception):
     """A value whose identity cannot be captured by a fingerprint."""
@@ -253,7 +259,7 @@ def _tree_all_finite_array(tree: object) -> jax.Array:
 
 
 def reconstruct_per_state_array(
-    params: dict, prefix: str, fallback: Array, n_discrete_states: int
+    params: SGDParams, prefix: str, fallback: Array, n_discrete_states: int
 ) -> Array:
     """Reassemble a ``(..., n_discrete_states)`` array from per-state SGD params.
 
@@ -264,7 +270,7 @@ def reconstruct_per_state_array(
 
     Parameters
     ----------
-    params : dict
+    params : SGDParams
         Optimized parameters; the per-state entries are keyed
         ``f"{prefix}_{j}"`` and each has shape ``fallback.shape[:-1]``, e.g.
         ``(n_latent, n_latent)`` for ``init_cov``.
@@ -307,7 +313,7 @@ _DATA_TRACING_ERRORS = (
 def _build_sgd_step(
     model_ref: Callable[[], Any],
     optimizer: Any,
-    param_spec: dict,
+    param_spec: SGDParamSpec,
     n_timesteps: float,
     data_structure: _LeafStructure,
     frozen_structure: _LeafStructure,
@@ -322,14 +328,21 @@ def _build_sgd_step(
     # Keep the optimizer (and hence its id) alive as long as the entry.
     entry = _CompiledSGDStep(keepalive=[optimizer])
 
-    def _loss_inner(unc_p, frozen_leaves, data_leaves):
-        model = model_ref()
+    def _loss_inner(
+        unc_p: SGDParams, frozen_leaves: list[Any], data_leaves: list[Any]
+    ) -> Array:
+        model: SGDFittableMixin = model_ref()
         frozen = _merge_leaves(frozen_leaves, frozen_structure)
         args, kwargs = _merge_leaves(data_leaves, data_structure)
         p = transform_to_constrained(unc_p, param_spec, static_params=frozen)
         return model._sgd_loss_fn(p, *args, **kwargs) / n_timesteps
 
-    def _sgd_train_step(unc_p, opt_st, frozen_leaves, data_leaves):
+    def _sgd_train_step(
+        unc_p: SGDParams,
+        opt_st: optax.OptState,
+        frozen_leaves: list[Any],
+        data_leaves: list[Any],
+    ) -> tuple[Array, SGDParams, optax.OptState, Array]:
         if baked_leaves is not None:
             frozen_leaves, data_leaves = baked_leaves
         # Runs only while tracing: record which model attributes the loss
@@ -394,12 +407,10 @@ class SGDFittableMixin:
 
     def _build_param_spec(
         self,
-    ) -> tuple[dict[str, Array], dict[str, ParameterTransform]]:
+    ) -> tuple[SGDParams, SGDParamSpec]:
         raise NotImplementedError
 
-    def _sgd_loss_fn(
-        self, params: dict[str, Array], *args: Any, **kwargs: Any
-    ) -> Array:
+    def _sgd_loss_fn(self, params: SGDParams, *args: Any, **kwargs: Any) -> Array:
         raise NotImplementedError
 
     def _finalize_sgd(self, *args: Any, **kwargs: Any) -> None:
@@ -423,7 +434,7 @@ class SGDFittableMixin:
         """
         return args, kwargs
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         """Copy the optimized parameters onto the model.
 
         Default implementation driven by ``_sgd_param_attrs``: every mapped
@@ -464,7 +475,7 @@ class SGDFittableMixin:
     def _compiled_sgd_step(
         self,
         optimizer: Any,
-        param_spec: dict,
+        param_spec: SGDParamSpec,
         n_timesteps: float,
         data_structure: _LeafStructure,
         frozen_structure: _LeafStructure,
@@ -606,7 +617,7 @@ class SGDFittableMixin:
             )
         opt_state = optimizer.init(unc_params)
 
-        def _loss_inner(unc_p):
+        def _loss_inner(unc_p: SGDParams) -> Array:
             p = transform_to_constrained(
                 unc_p,
                 param_spec,

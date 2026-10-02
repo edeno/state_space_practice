@@ -55,7 +55,9 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    import matplotlib.pyplot as plt
+    import optax
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 import jax
 import jax.numpy as jnp
@@ -77,7 +79,7 @@ from state_space_practice.parameter_transforms import (
     POSITIVE,
     UNCONSTRAINED,
 )
-from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.utils import typed_jit, validate_count_array
 
 logger = logging.getLogger(__name__)
@@ -191,7 +193,7 @@ def _approximate_gaussian_newton(
             f"got x0 with shape {x0_arr.shape}"
         )
 
-    def neg_log_posterior(x):
+    def neg_log_posterior(x: Array) -> Array:
         return -log_posterior_func(x)
 
     grad_fn = jax.grad(neg_log_posterior)
@@ -199,7 +201,7 @@ def _approximate_gaussian_newton(
     step_sizes = jnp.asarray(_NEWTON_STEP_SIZES, dtype=x0_arr.dtype)
     batched_objective = jax.vmap(neg_log_posterior)
 
-    def newton_step(x, _):
+    def newton_step(x: Array, _: None) -> tuple[Array, None]:
         g = grad_fn(x)
         h = hess_fn(x)
         # Regularize Hessian for stability
@@ -818,7 +820,9 @@ def calculate_probability_confidence_limits(
     smoothed_std_dev = jnp.sqrt(jnp.maximum(smoothed_learning_state_variance, epsilon))
 
     # Function to process a single trial
-    def process_trial(key_trial, mode_k, std_dev_k):
+    def process_trial(
+        key_trial: Array, mode_k: Array, std_dev_k: Array
+    ) -> tuple[Array, Array | None]:
         # Generate samples from the Gaussian posterior of the learning state x_k
         # latent_state_samples will have shape (n_samples,)
         latent_state_samples = mode_k + std_dev_k * jax.random.normal(
@@ -1926,7 +1930,7 @@ class SmithLearningModel(SGDFittableMixin):
     def fit_sgd(
         self,
         n_correct_responses: ArrayLike,
-        optimizer: object | None = None,
+        optimizer: optax.GradientTransformation | None = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
@@ -1979,9 +1983,9 @@ class SmithLearningModel(SGDFittableMixin):
             raise NotFittedError("Model must be fitted before accessing _n_timesteps.")
         return self._n_trials_
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
-        params: dict = {}
-        spec: dict = {}
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
+        params: SGDParams = {}
+        spec: SGDParamSpec = {}
 
         # Process noise is always learnable
         params["sigma_epsilon"] = jnp.array(self.sigma_epsilon)
@@ -2000,7 +2004,7 @@ class SmithLearningModel(SGDFittableMixin):
 
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, n_correct_responses: Array) -> Array:
+    def _sgd_loss_fn(self, params: SGDParams, n_correct_responses: Array) -> Array:
         # Read a model attribute only when the parameter is not optimized:
         # ``params.get(key, self.attr)`` reads it regardless, and fit_sgd only
         # reuses a compiled step while the attributes the loss read at trace
@@ -2039,7 +2043,7 @@ class SmithLearningModel(SGDFittableMixin):
         )
         return -jnp.sum(log_likelihood_terms)
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         if "sigma_epsilon" in params:
             self.sigma_epsilon = float(params["sigma_epsilon"])
         if "init_learning_state" in params:
@@ -2404,7 +2408,7 @@ class SmithLearningModel(SGDFittableMixin):
         title: str | None = None,
         xlabel: str = "Trial",
         ylabel_override: str | None = None,
-    ) -> tuple[plt.Figure, plt.Axes]:
+    ) -> tuple[Figure, Axes]:
         """Plots the smoothed learning process with confidence intervals.
 
         This method visualizes either the probability of a correct response or
@@ -2834,7 +2838,7 @@ class SmithLearningModel(SGDFittableMixin):
     def compare_to_null(
         self,
         n_correct_responses: ArrayLike | None = None,
-    ) -> dict:
+    ) -> dict[str, float | bool]:
         """Compare the fitted model to a null (no-learning) model.
 
         The null model assumes a constant probability of correct response
@@ -2979,7 +2983,7 @@ class SmithLearningModel(SGDFittableMixin):
         significance_level: float = 0.05,
         title: str | None = None,
         cmap: str = "bone",
-    ) -> tuple[plt.Figure, plt.Axes]:
+    ) -> tuple[Figure, Axes]:
         """Plot the trial-to-trial comparison matrix with significant points.
 
         Creates a heatmap visualization of pairwise trial comparisons,
@@ -3121,7 +3125,7 @@ class SmithLearningModel(SGDFittableMixin):
 
         return fig, ax
 
-    def plot_convergence(self) -> tuple[plt.Figure, plt.Axes]:
+    def plot_convergence(self) -> tuple[Figure, Axes]:
         """Plot the EM log-likelihood convergence trace.
 
         Must be called after ``fit()``.
@@ -3158,7 +3162,7 @@ class SmithLearningModel(SGDFittableMixin):
         key: Array,
         observed_n_correct: ArrayLike | None = None,
         n_samples: int = 10000,
-    ) -> tuple[plt.Figure, np.ndarray]:
+    ) -> tuple[Figure, np.ndarray]:
         """Multi-panel diagnostic figure summarizing the fitted model.
 
         Creates a 3-panel figure:

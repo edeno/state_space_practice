@@ -202,7 +202,9 @@ def wald_test(
     return W, pval
 
 
-def summarize_posterior(posterior: CouplingPosterior, cred_mass: float = 0.95) -> dict:
+def summarize_posterior(
+    posterior: CouplingPosterior, cred_mass: float = 0.95
+) -> dict[str, np.ndarray]:
     """Posterior magnitude, phase, and per-component credible intervals.
 
     When ``posterior.samples`` is present the intervals are sample percentiles;
@@ -262,7 +264,7 @@ def detection_metrics(
     pval: npt.NDArray[np.floating],
     coupling_mask: npt.NDArray[np.bool_],
     alpha: float = 0.05,
-) -> dict:
+) -> dict[str, int | float]:
     """Detection confusion counts and rates vs a ground-truth coupling mask.
 
     A (neuron, band) entry is "detected" when ``pval < alpha``. Element-wise
@@ -298,7 +300,9 @@ def detection_metrics(
     return out
 
 
-def _confusion(predicted: npt.NDArray[np.bool_], truth: npt.NDArray[np.bool_]) -> dict:
+def _confusion(
+    predicted: npt.NDArray[np.bool_], truth: npt.NDArray[np.bool_]
+) -> dict[str, int | float]:
     """Confusion counts and rates from boolean prediction/truth arrays."""
     predicted = np.asarray(predicted, dtype=bool)
     truth = np.asarray(truth, dtype=bool)
@@ -396,7 +400,7 @@ def magnitude_recovery(
     beta_real_true: npt.NDArray[np.floating],
     beta_imag_true: npt.NDArray[np.floating],
     coupling_mask: npt.NDArray[np.bool_],
-) -> dict:
+) -> dict[str, int | float]:
     """Correlation between recovered and true coupling magnitude over coupled entries.
 
     Parameters

@@ -265,12 +265,12 @@ def frozen(transform: ParameterTransform) -> ParameterTransform:
 
 
 def _validate_matching_keys(
-    values: dict,
-    spec: dict,
+    values: dict[str, Array],
+    spec: dict[str, ParameterTransform],
     *,
     values_name: str,
     allow_missing_non_trainable: bool = False,
-    static_params: dict | None = None,
+    static_params: dict[str, Array] | None = None,
 ) -> None:
     value_keys = set(values)
     spec_keys = set(spec)
@@ -289,11 +289,11 @@ def _validate_matching_keys(
 
 
 def transform_to_unconstrained(
-    params: dict,
-    spec: dict,
+    params: dict[str, Array],
+    spec: dict[str, ParameterTransform],
     *,
     include_non_trainable: bool = True,
-) -> dict:
+) -> dict[str, Array]:
     """Transform constrained parameters to unconstrained optimizer coordinates.
 
     Parameters marked ``trainable=False`` are included by default for backwards
@@ -310,11 +310,11 @@ def transform_to_unconstrained(
 
 
 def transform_to_constrained(
-    unc_params: dict,
-    spec: dict,
+    unc_params: dict[str, Array],
+    spec: dict[str, ParameterTransform],
     *,
-    static_params: dict | None = None,
-) -> dict:
+    static_params: dict[str, Array] | None = None,
+) -> dict[str, Array]:
     """Transform a dict of unconstrained parameters back to constrained space.
 
     ``static_params`` supplies already-constrained parameters omitted from

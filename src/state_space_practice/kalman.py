@@ -19,7 +19,7 @@ References
 from __future__ import annotations
 
 import warnings
-from typing import NamedTuple, cast
+from typing import Any, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -80,11 +80,11 @@ def _gain_solve(cov: jax.Array, rhs: jax.Array) -> jax.Array:
     rhs = jnp.asarray(rhs, dtype=dtype)
     idx = jnp.arange(cov.shape[-1])
 
-    def stabilized(cov, relative_boost):
+    def stabilized(cov: jax.Array, relative_boost: float | jax.Array) -> jax.Array:
         shift = _stabilizing_shift(cov, _GAIN_SOLVE_ABSOLUTE_BOOST, relative_boost)
         return cov.at[..., idx, idx].add(shift)
 
-    def factor_with(relative_boost):
+    def factor_with(relative_boost: float) -> tuple[jax.Array, jax.Array]:
         factor = jnp.linalg.cholesky(stabilized(cov_const, relative_boost))
         return jnp.asarray(relative_boost, dtype=dtype), factor
 
@@ -573,7 +573,12 @@ def _kalman_filter_impl(
     measurement_cov = jnp.asarray(measurement_cov, dtype=dtype)
     time_varying_measurement_cov = measurement_cov.ndim == 3
 
-    def _step(carry, step_inputs):
+    def _step(
+        carry: tuple[jax.Array, jax.Array, jax.Array],
+        # ``obs_t`` or ``(obs_t, measurement_cov_t)``; ``Any`` because mypy
+        # joins the union ``scan`` receives as ``xs`` to ``object``.
+        step_inputs: Any,
+    ) -> tuple[tuple[jax.Array, jax.Array, jax.Array], tuple[jax.Array, jax.Array]]:
         mean_prev, cov_prev, marginal_log_likelihood = carry
         if time_varying_measurement_cov:
             obs_t, measurement_cov_t = step_inputs
@@ -892,7 +897,10 @@ def rts_backward_scan_with_predictions(
     """
     A = transition_matrix
 
-    def _step(carry, args):
+    def _step(
+        carry: tuple[jax.Array, jax.Array],
+        args: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    ) -> tuple[tuple[jax.Array, jax.Array], tuple[jax.Array, jax.Array, jax.Array]]:
         next_mean, next_cov = carry
         f_mean, f_cov, p_mean_next, p_cov_next = args
         gain = _gain_solve(p_cov_next, A @ f_cov).T
@@ -1171,7 +1179,9 @@ def parallel_kalman_smoother(
     Q = _as_transition_stack("process_cov", process_cov)
 
     # Build per-timestep smoother elements for t = 0, ..., T-2
-    def _build_element(filt_mean, filt_cov, A_t, Q_t):
+    def _build_element(
+        filt_mean: jax.Array, filt_cov: jax.Array, A_t: jax.Array, Q_t: jax.Array
+    ) -> _SmootherElement:
         pred_cov = symmetrize(A_t @ filt_cov @ A_t.T + Q_t)
         pred_mean = A_t @ filt_mean
         J = _gain_solve(pred_cov, A_t @ filt_cov).T  # smoother gain
@@ -1200,7 +1210,7 @@ def parallel_kalman_smoother(
     # Associative operator vmapped over the batch dimension that
     # associative_scan introduces when combining sub-sequences.
     @jax.vmap
-    def _operator(elem1, elem2):
+    def _operator(elem1: _SmootherElement, elem2: _SmootherElement) -> _SmootherElement:
         E1, g1, L1 = elem1
         E2, g2, L2 = elem2
         E = E2 @ E1

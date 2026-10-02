@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from functools import partial
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -57,7 +57,7 @@ from state_space_practice.point_process_kalman import (
     glm_laplace_update,
     poisson_family,
 )
-from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams
 from state_space_practice.utils import (
     psd_cholesky,
     psd_logdet,
@@ -242,7 +242,10 @@ def ekf_rts_backward_pass(
     if m_filt.shape[0] == 0:
         return m_filt, P_filt
 
-    def backward_step(carry, inputs):
+    def backward_step(
+        carry: tuple[Array, Array],
+        inputs: tuple[Array, Array, Array, Array, Array],
+    ) -> tuple[tuple[Array, Array], tuple[Array, Array]]:
         m_s_next, P_s_next = carry
         m_f_t, P_f_t, m_p_next, P_p_next, F_next = inputs
         m_s, P_s = ekf_smooth_step(
@@ -321,7 +324,9 @@ def run_ekf_filter(
         ``update_fn``.
     """
 
-    def step(carry, y_t):
+    def step(
+        carry: tuple[Array, Array], y_t: Any
+    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
         m_prev, P_prev = carry
         m_pred, P_pred = ekf_predict_step(
             m_prev, P_prev, trans_params, apply_mlp, process_cov, dt
@@ -358,7 +363,9 @@ def run_ekf_smoother(
     smoothed_covs : Array, shape (n_time, n_latent, n_latent)
     """
 
-    def forward_step(carry, y_t):
+    def forward_step(
+        carry: tuple[Array, Array], y_t: Any
+    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array, Array, Array]]:
         m_prev, P_prev = carry
         m_pred, P_pred, F_t = ekf_predict_step_with_jacobian(
             m_prev, P_prev, trans_params, apply_mlp, process_cov, dt
@@ -396,10 +403,10 @@ def _observation_updates(
     if observation_model == "gaussian":
         C, d, R = params["C"], params["d"], params["R"]
 
-        def filter_update(m, P, y):
+        def filter_update(m: Array, P: Array, y: Any) -> tuple[Array, Array, Array]:
             return gaussian_measurement_update(m, P, y, C, d, R)
 
-        def smoother_update(m, P, y):
+        def smoother_update(m: Array, P: Array, y: Any) -> tuple[Array, Array]:
             return gaussian_measurement_update(
                 m, P, y, C, d, R, include_normalization_const=False
             )[:2]
@@ -407,10 +414,10 @@ def _observation_updates(
     elif observation_model == "poisson":
         C, d = params["C"], params["d"]
 
-        def filter_update(m, P, y):
+        def filter_update(m: Array, P: Array, y: Any) -> tuple[Array, Array, Array]:
             return point_process_laplace_update(m, P, y, C, d, dt)
 
-        def smoother_update(m, P, y):
+        def smoother_update(m: Array, P: Array, y: Any) -> tuple[Array, Array]:
             return point_process_laplace_update(
                 m, P, y, C, d, dt, compute_log_likelihood=False
             )[:2]
@@ -419,7 +426,7 @@ def _observation_updates(
         C_l, d_l, R_l = params["C_lfp"], params["d_lfp"], params["R_lfp"]
         C_s, d_s = params["C_spikes"], params["d_spikes"]
 
-        def filter_update(m, P, y):
+        def filter_update(m: Array, P: Array, y: Any) -> tuple[Array, Array, Array]:
             # Sequential: LFP update first, then point-process update on the
             # LFP posterior. The two log-likelihoods sum to the joint marginal
             # because the observations are conditionally independent given x_t.
@@ -432,7 +439,7 @@ def _observation_updates(
             )
             return m_post, P_post, ll_lfp + ll_spike
 
-        def smoother_update(m, P, y):
+        def smoother_update(m: Array, P: Array, y: Any) -> tuple[Array, Array]:
             y_lfp, y_spike = y
             m_mid, P_mid, _ = gaussian_measurement_update(
                 m, P, y_lfp, C_l, d_l, R_l, include_normalization_const=False
@@ -615,12 +622,12 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
         """
         trans_params = {**params["mlp"], "omega": params["omega"]}
 
-        def scan_fn(x_prev, _):
+        def scan_fn(x_prev: Array, _: None) -> tuple[Array, Array]:
             x_next = self.transition_func(x_prev, trans_params)
             return x_next, x_next
 
         _, x_traj = jax.lax.scan(scan_fn, params["init_mean"], None, length=n_time)
-        return cast(Array, x_traj)
+        return x_traj
 
     def _discrete_state_posterior(self, caller: str) -> Array:
         """Reject discrete-state decoding on a single-regime model.
@@ -695,7 +702,7 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
         self._sgd_n_time = validated[0].shape[0]
         return validated, {"use_filter": use_filter, "l2_reg": l2_reg}
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         """Store the plain keys, then the single-regime derived ones.
 
         ``init_mean`` is optimized as the ``(n_cont_states,)`` slice of the

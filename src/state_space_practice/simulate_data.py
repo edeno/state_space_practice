@@ -1,3 +1,5 @@
+from typing import Any
+
 import numpy as np
 from numpy.typing import ArrayLike
 
@@ -55,7 +57,7 @@ def simulate_eden_brown_2004_jump(
 
 def simulate_eden_brown_2004_linear(
     rng: np.random.Generator | None = None,
-):
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]:
     if rng is None:
         rng = np.random.default_rng()
     dt = 0.020
@@ -85,7 +87,7 @@ def simulate_2d_moving_place_field(
     drift_speed: float = 0.02,
     n_interior_knots: int = 5,
     rng: np.random.Generator | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Simulate a neuron with a 2D place field that drifts over time.
 
     The animal runs a lawnmower trajectory in a square arena. The neuron's

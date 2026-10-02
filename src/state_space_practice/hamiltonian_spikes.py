@@ -6,7 +6,7 @@ See docs/hamiltonian_architecture.md for why this family has no
 linear-Gaussian EM integration and is fit by SGD only.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +28,9 @@ from state_space_practice.parameter_transforms import (
     frozen,
 )
 from state_space_practice.utils import validate_count_array
+
+if TYPE_CHECKING:
+    import optax
 
 
 class HamiltonianSpikeModel(HamiltonianModelBase):
@@ -129,7 +132,7 @@ class HamiltonianSpikeModel(HamiltonianModelBase):
     def fit_sgd(
         self,
         observations: ArrayLike,
-        optimizer: object | None = None,
+        optimizer: "optax.GradientTransformation | None" = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
@@ -220,7 +223,7 @@ class HamiltonianSpikeModel(HamiltonianModelBase):
         spikes: Array,
         use_filter: bool = True,
         l2_reg: float = 1e-4,
-        **kwargs,
+        **kwargs: Any,
     ) -> Array:
         if use_filter:
             _, _, lls = self._filter_jit(spikes, params)

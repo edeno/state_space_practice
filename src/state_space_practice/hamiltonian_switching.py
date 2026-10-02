@@ -51,7 +51,7 @@ def switching_predict_collapse(
     dt: float,
     *,
     with_jacobian: bool,
-):
+) -> tuple[Array, Array, Array | None, Array, Array, Array, Array]:
     """Predict step + Gaussian-mixture collapse for the switching filter.
 
     Every previous-state Gaussian ``j`` is propagated through every
@@ -65,7 +65,7 @@ def switching_predict_collapse(
     """
     K_states = Z.shape[0]
 
-    def predict_j_k(mj, Pj, k):
+    def predict_j_k(mj: Array, Pj: Array, k: Array) -> tuple[Array, ...]:
         trans_k = {
             **jax.tree_util.tree_map(lambda x: x[k], mlp_params),
             "omega": omega[k],
@@ -89,7 +89,7 @@ def switching_predict_collapse(
     joint_pi_pred = pi_prev[:, None] * Z
     pi_pred_k = jnp.sum(joint_pi_pred, axis=0)
 
-    def collapse_k(k):
+    def collapse_k(k: Array) -> tuple[Array, Array]:
         w_jk = _divide_safe(joint_pi_pred[:, k], pi_pred_k[k])
         return collapse_gaussian_mixture(
             m_p_jk[:, k, :].T,
@@ -132,7 +132,9 @@ def switching_hamiltonian_filter(
     Q = params["Q"]
     K_states = Z.shape[0]
 
-    def step(carry, obs_t):
+    def step(
+        carry: tuple[Array, Array, Array], obs_t: tuple[Array, Array]
+    ) -> tuple[tuple[Array, Array, Array], tuple[Array, Array, Array, Array]]:
         y_lfp_t, y_spike_t = obs_t
         m_prev, P_prev, pi_prev = carry
 
@@ -156,7 +158,7 @@ def switching_hamiltonian_filter(
             with_jacobian=False,
         )
 
-        def update_k(k):
+        def update_k(k: Array) -> tuple[Array, Array, Array]:
             m_mid, P_mid, ll_l = gaussian_measurement_update(
                 m_p_k[:, k],
                 P_p_k[:, :, k],
@@ -224,7 +226,12 @@ def switching_hamiltonian_smoother(
     Q = params["Q"]
     K_states = Z.shape[0]
 
-    def forward_step(carry, obs_t):
+    def forward_step(
+        carry: tuple[Array, Array, Array], obs_t: tuple[Array, Array]
+    ) -> tuple[
+        tuple[Array, Array, Array],
+        tuple[Array, Array, Array, Array, Array, Array, Array, Array],
+    ]:
         y_lfp_t, y_spike_t = obs_t
         m_prev, P_prev, pi_prev = carry
 
@@ -247,8 +254,10 @@ def switching_hamiltonian_smoother(
             dt,
             with_jacobian=True,
         )
+        # with_jacobian=True always returns the transition Jacobians.
+        assert F_jk is not None
 
-        def update_k(k):
+        def update_k(k: Array) -> tuple[Array, Array, Array]:
             # Per-state gaussian + Laplace update. Log-likelihoods
             # here go into _scale_likelihood for relative discrete-
             # state weighting only, so the Gaussian normalization
@@ -322,7 +331,10 @@ def switching_hamiltonian_smoother(
     # Backward pass: Kim-style discrete-state smoothing plus pairwise
     # EKF-RTS updates over (S_t=i, S_{t+1}=k), collapsed back to one
     # Gaussian per current state.
-    def backward_step(carry, inputs):
+    def backward_step(
+        carry: tuple[Array, Array, Array],
+        inputs: tuple[Array, Array, Array, Array, Array, Array, Array, Array],
+    ) -> tuple[tuple[Array, Array, Array], tuple[Array, Array, Array]]:
         m_s_next, P_s_next, pi_s_next = carry
         (
             m_f_t,
@@ -346,7 +358,13 @@ def switching_hamiltonian_smoother(
         m_f_i = m_f_t.T
         P_f_i = P_f_t.transpose(2, 0, 1)
 
-        def smooth_i(m_f_curr, P_f_curr, m_pred_i, P_pred_i, F_i):
+        def smooth_i(
+            m_f_curr: Array,
+            P_f_curr: Array,
+            m_pred_i: Array,
+            P_pred_i: Array,
+            F_i: Array,
+        ) -> tuple[Array, Array]:
             return jax.vmap(
                 lambda m_pred, P_pred, F, m_next, P_next: ekf_smooth_step(
                     m_f_curr,
@@ -363,7 +381,9 @@ def switching_hamiltonian_smoother(
             m_f_i, P_f_i, m_p_next_jk, P_p_next_jk, F_next_jk
         )
 
-        def collapse_i(means_i, covs_i, weights_i):
+        def collapse_i(
+            means_i: Array, covs_i: Array, weights_i: Array
+        ) -> tuple[Array, Array]:
             return collapse_gaussian_mixture(
                 means_i.T,
                 covs_i.transpose(1, 2, 0),
@@ -578,7 +598,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         spike_data: Array,
         use_filter: bool = True,
         l2_reg: float = 1e-4,
-        **kwargs,
+        **kwargs: Any,
     ) -> Array:
         # The parent's deterministic-rollout surrogate (use_filter=False) is a
         # single-trajectory warm-start with no analogue under discrete-state
@@ -613,7 +633,7 @@ class SwitchingHamiltonianJointModel(JointHamiltonianModel):
         SGDFittableMixin._store_sgd_params(self, params)
         self.measurement_matrix = self._measurement_matrix_all_states()
 
-    def _finalize_sgd(self, lfp_data, spike_data, **kwargs):
+    def _finalize_sgd(self, lfp_data: Array, spike_data: Array, **kwargs: Any) -> None:
         """Run filter + smoother to populate fitted states after SGD.
 
         Overrides the single-regime parent: the switching filter returns

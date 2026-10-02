@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -42,13 +42,16 @@ from state_space_practice.parameter_transforms import (
     UNCONSTRAINED,
     UNIT_INTERVAL,
 )
-from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.utils import (
     check_converged,
     typed_jit,
     validate_choice_indices,
     validate_count_array,
 )
+
+if TYPE_CHECKING:
+    import optax
 
 logger = logging.getLogger(__name__)
 
@@ -354,7 +357,7 @@ def _validate_obs_weights_shape(
 def compute_choice_log_likelihood(
     choice_t: ArrayLike,
     state_values: Array,
-    inverse_temperature: float,
+    inverse_temperature: float | Array,
     obs_offset: Array | None = None,
 ) -> Array:
     """Compute log P(choice | state) for each state.
@@ -399,7 +402,7 @@ def _bayes_update(
     *,
     reward_probs: Array,
     state_values: Array,
-    inverse_temperature: float,
+    inverse_temperature: float | Array,
 ) -> tuple[Array, Array]:
     """Bayes update: predicted belief -> posterior given one trial's observations.
 
@@ -504,7 +507,7 @@ def _contingency_belief_filter_jit(
     n_options: int,
     reward_probs: Array,
     state_values: Array,
-    inverse_temperature: float = 1.0,
+    inverse_temperature: float | Array = 1.0,
     transition_logits: Array | None = None,
     transition_covariates: Array | None = None,
     transition_weights: Array | None = None,
@@ -548,12 +551,14 @@ def _contingency_belief_filter_jit(
         inverse_temperature=inverse_temperature,
     )
 
-    def _compute_obs_offset(obs_dm_t):
+    def _compute_obs_offset(obs_dm_t: Array) -> Array:
         # Shape is (n_states, n_options) when obs_weights is per-state (ndim 3),
         # else (n_options,); the matmul handles both without branching.
         return obs_weights @ obs_dm_t
 
-    def _step(carry, trial_data):
+    def _step(
+        carry: tuple[Array, Array], trial_data: tuple[Array, Array, Array, Array]
+    ) -> tuple[tuple[Array, Array], Array]:
         prev_belief, accum_ll = carry
         choice_t, reward_t, h_t, obs_dm_t = trial_data
 
@@ -656,7 +661,7 @@ def _contingency_belief_smoother_jit(
     n_options: int,
     reward_probs: Array,
     state_values: Array,
-    inverse_temperature: float = 1.0,
+    inverse_temperature: float | Array = 1.0,
     transition_logits: Array | None = None,
     transition_covariates: Array | None = None,
     transition_weights: Array | None = None,
@@ -701,7 +706,9 @@ def _contingency_belief_smoother_jit(
         inverse_temperature=inverse_temperature,
     )
 
-    def _forward_step(carry, trial_data):
+    def _forward_step(
+        carry: tuple[Array, Array], trial_data: tuple[Array, Array, Array, Array]
+    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
         prev_belief, accum_ll = carry
         choice_t, reward_t, h_t, obs_dm_t = trial_data
 
@@ -740,7 +747,9 @@ def _contingency_belief_smoother_jit(
     trans_matrices = jnp.concatenate([dummy_trans[None], trans_rest], axis=0)
 
     # --- Backward pass ---
-    def _backward_step(beta_next, step_data):
+    def _backward_step(
+        beta_next: Array, step_data: tuple[Array, Array, Array]
+    ) -> tuple[Array, Array]:
         filter_t, predicted_tp1, trans_tp1 = step_data
         # beta_next = P(s_{t+1} | data) / P(s_{t+1} | data_{1:t})
         # smoothed_t = filter_t * sum_j T(i→j) * beta_next[j] / predicted[j]
@@ -767,7 +776,7 @@ def _contingency_belief_smoother_jit(
     smoothed = jnp.concatenate([smoothed_interior, filter_beliefs[-1:]], axis=0)
 
     # --- Pairwise state probabilities P(s_t=i, s_{t+1}=j | data) ---
-    def _pairwise(step_data):
+    def _pairwise(step_data: tuple[Array, Array, Array, Array]) -> Array:
         filter_t, predicted_tp1, trans_tp1, smooth_tp1 = step_data
         # Two-slice HMM identity:
         #   P(s_t=i, s_{t+1}=j | data)
@@ -831,7 +840,7 @@ def _optimize_transition_rows(
     def _optimize_one_row(
         x0_flat: Array, response_row: Array, alpha_row: Array
     ) -> Array:
-        def loss(c):
+        def loss(c: Array) -> Array:
             return dirichlet_neg_log_likelihood(
                 c, design, response_row, alpha_row, l2_penalty
             )
@@ -1054,14 +1063,14 @@ class ContingencyBeliefModel(SGDFittableMixin):
                 trans_weights = jnp.moveaxis(coefs[1:], 0, -1)
                 dm_covs = self._transition_design_matrix[:, 1:]
 
-                def _get_trans_t(h_t):
+                def _get_trans_t(h_t: Array) -> Array:
                     return compute_input_output_transition_matrix(
                         coefs[0], trans_weights, h_t
                     )
 
                 # predicted[t] = posterior[t-1] @ T_t for t > 0
                 # No sequential dependency: vmap over trials
-                def _predict_one(posterior_prev, h_t):
+                def _predict_one(posterior_prev: Array, h_t: Array) -> Array:
                     T_t = _get_trans_t(h_t)
                     return posterior_prev @ T_t
 
@@ -1128,10 +1137,10 @@ class ContingencyBeliefModel(SGDFittableMixin):
             return jnp.concatenate([intercept, transition_covariates], axis=1)
         return intercept
 
-    def _smoother_kwargs(self, choices, rewards):
+    def _smoother_kwargs(self, choices: Array, rewards: Array) -> dict[str, Any]:
         """Build kwargs for filter/smoother calls, including covariates."""
         coefs = self.transition_coefficients_
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "choices": choices,
             "rewards": rewards,
             "n_states": self.n_states,
@@ -1211,7 +1220,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
         prev_ll = float("-inf")
         converged = False
         params_dirty = False
-        last_accepted: dict | None = None
+        last_accepted: dict[str, Array] | None = None
 
         for iteration in range(max_iter):
             # E-step
@@ -1383,10 +1392,10 @@ class ContingencyBeliefModel(SGDFittableMixin):
         rewards: ArrayLike,
         transition_covariates: ArrayLike | None = None,
         obs_design_matrix: ArrayLike | None = None,
-        optimizer=None,
+        optimizer: optax.GradientTransformation | None = None,
         num_steps: int = 200,
         verbose: bool = False,
-        convergence_tol=None,
+        convergence_tol: float | None = None,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
 
@@ -1470,7 +1479,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
             raise NotFittedError("Model must be fitted before accessing _n_timesteps.")
         return self._n_trials
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         params = {
             "reward_probs": self.reward_probs_,
             "state_values": self.state_values_,
@@ -1488,38 +1497,41 @@ class ContingencyBeliefModel(SGDFittableMixin):
             spec["obs_weights"] = UNCONSTRAINED
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, choices: Array, rewards: Array) -> Array:
+    def _sgd_loss_fn(self, params: SGDParams, choices: Array, rewards: Array) -> Array:
         coefs = params["transition_coefficients"]
         transition_logits = coefs[0]  # intercept: (n_states, n_states-1)
 
-        kwargs = {
-            "choices": choices,
-            "rewards": rewards,
-            "n_states": self.n_states,
-            "n_options": self.n_options,
-            "reward_probs": params["reward_probs"],
-            "state_values": params["state_values"],
-            "inverse_temperature": params["inverse_temperature"],
-            "transition_logits": transition_logits,
-        }
-
         # If non-stationary (>1 coefficient), extract covariate weights
+        transition_weights = None
+        transition_covariates = None
         if coefs.shape[0] > 1 and self._transition_design_matrix is not None:
             # weights[i, j, k] = coefficients[k+1, i, j] for covariates
             transition_weights = jnp.moveaxis(coefs[1:], 0, -1)
             # Covariates from design matrix (exclude intercept column)
-            kwargs["transition_weights"] = transition_weights
-            kwargs["transition_covariates"] = self._transition_design_matrix[:, 1:]
+            transition_covariates = self._transition_design_matrix[:, 1:]
 
         # Observation covariates
-        if "obs_weights" in params and self._obs_design_matrix is not None:
-            kwargs["obs_design_matrix"] = self._obs_design_matrix
-            kwargs["obs_weights"] = params["obs_weights"]
+        use_obs_covariates = (
+            "obs_weights" in params and self._obs_design_matrix is not None
+        )
 
-        result = _contingency_belief_filter_jit(**kwargs)
+        result = _contingency_belief_filter_jit(
+            choices=choices,
+            rewards=rewards,
+            n_states=self.n_states,
+            n_options=self.n_options,
+            reward_probs=params["reward_probs"],
+            state_values=params["state_values"],
+            inverse_temperature=params["inverse_temperature"],
+            transition_logits=transition_logits,
+            transition_covariates=transition_covariates,
+            transition_weights=transition_weights,
+            obs_design_matrix=self._obs_design_matrix if use_obs_covariates else None,
+            obs_weights=params["obs_weights"] if use_obs_covariates else None,
+        )
         return -result.log_likelihood
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         self.reward_probs_ = params["reward_probs"]
         self.state_values_ = params["state_values"]
         self.inverse_temperature_ = float(params["inverse_temperature"])

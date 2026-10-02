@@ -280,7 +280,7 @@ def get_area_coupling_summary(
     coupling: Array,
     area_labels: Array,
     exclude_diagonal: bool = True,
-) -> dict:
+) -> dict[str, Array]:
     """Compute area-level coupling summary from oscillator coupling strengths.
 
     Parameters

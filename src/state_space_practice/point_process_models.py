@@ -26,6 +26,7 @@ from __future__ import annotations
 import copy
 import functools
 import logging
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -46,6 +47,7 @@ from state_space_practice.oscillator_utils import (
     project_correlated_noise_process_covariance,
 )
 from state_space_practice.parameter_transforms import POSITIVE, UNCONSTRAINED
+from state_space_practice.sgd_fitting import SGDParams, SGDParamSpec
 from state_space_practice.switching_kalman import (
     compute_process_covariance_sufficient_stats,
     compute_transition_sufficient_stats,
@@ -67,6 +69,14 @@ from state_space_practice.utils import (
     validate_nonnegative_array,
     validate_unit_interval_array,
 )
+
+if TYPE_CHECKING:
+    import numpy as np
+    import optax
+
+    from state_space_practice.oscillator_regularization import (
+        OscillatorPenaltyConfig,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -339,7 +349,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         return window, n_time // window
 
     def _set_state_probs_from_window_features(
-        self, features, window: int, n_time: int
+        self, features: np.ndarray, window: int, n_time: int
     ) -> None:
         """Cluster windowed features with a GMM and store per-timestep state probs.
 
@@ -653,7 +663,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         """
         best_lls: list[float] | None = None
         best_final_ll = -float("inf")
-        best_state: dict | None = None
+        best_state: dict[str, object] | None = None
 
         keys = jax.random.split(key, n_restarts)
 
@@ -738,8 +748,8 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
         freqs: jax.Array,
         damping_coef: jax.Array,
         process_variance: jax.Array,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         # Force COM-specific update flags
         kwargs["update_continuous_transition_matrix"] = False
         kwargs["update_process_cov"] = False
@@ -834,7 +844,7 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
         """No projection needed — A and Q are not updated."""
         pass
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         return self._shared_sgd_param_spec()
 
 
@@ -904,8 +914,8 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         phase_difference: jax.Array,
         coupling_strength: jax.Array,
         use_reparameterized_mstep: bool = True,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         # Force CNM-specific update flags
         kwargs["update_continuous_transition_matrix"] = False
         kwargs["update_process_cov"] = True
@@ -1089,7 +1099,7 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
 
     # --- SGDFittableMixin: CNM-PP specific ---
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         params, spec = self._shared_sgd_param_spec()
 
         if self.update_process_cov:
@@ -1102,7 +1112,7 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
 
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, spikes: jax.Array) -> jax.Array:
+    def _sgd_loss_fn(self, params: SGDParams, spikes: jax.Array) -> jax.Array:
         # Reconstruct per-state Q from scientific params
         proc_var = params.get("process_variance", self.process_variance)
         phase_diff = params.get("phase_difference", self.phase_difference)
@@ -1125,7 +1135,7 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         params_with_Q["_Q"] = Q
         return super()._sgd_loss_fn(params_with_Q, spikes)
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         super()._store_sgd_params(params)
         if "process_variance" in params:
             self.process_variance = params["process_variance"]
@@ -1234,8 +1244,8 @@ class DirectedInfluencePointProcessModel(
         use_reparameterized_mstep: bool = False,
         max_spectral_radius: float = 0.99,
         max_damping: float = 0.995,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         # Force DIM-specific update flags
         kwargs["update_continuous_transition_matrix"] = True
         kwargs["update_process_cov"] = False
@@ -1304,7 +1314,7 @@ class DirectedInfluencePointProcessModel(
         self.phase_difference = phase_difference.at[diag_idx, diag_idx, :].set(0.0)
         self.coupling_strength = coupling_strength.at[diag_idx, diag_idx, :].set(0.0)
         self.use_reparameterized_mstep = use_reparameterized_mstep
-        self._current_osc_params: dict | None = None
+        self._current_osc_params: dict[str, Array] | None = None
 
         # Stability bounds applied when rebuilding transition matrices.
         if not 0.0 < max_spectral_radius < 1.0:
@@ -1422,7 +1432,7 @@ class DirectedInfluencePointProcessModel(
 
     # --- SGDFittableMixin: DIM-PP specific ---
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         params, spec = self._shared_sgd_param_spec()
 
         if self.update_continuous_transition_matrix:
@@ -1435,14 +1445,14 @@ class DirectedInfluencePointProcessModel(
 
     def fit_sgd(
         self,
-        spikes,
-        key=None,
-        optimizer=None,
-        num_steps=200,
-        verbose=False,
-        convergence_tol=None,
-        connectivity_penalty=None,
-    ):
+        spikes: Array,
+        key: Array | None = None,
+        optimizer: optax.GradientTransformation | None = None,
+        num_steps: int = 200,
+        verbose: bool = False,
+        convergence_tol: float | None = None,
+        connectivity_penalty: OscillatorPenaltyConfig | None = None,
+    ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
 
         SGD optimizes ``coupling_strength`` and ``phase_difference``
@@ -1476,7 +1486,7 @@ class DirectedInfluencePointProcessModel(
             convergence_tol=convergence_tol,
         )
 
-    def _sgd_loss_fn(self, params: dict, spikes: jax.Array) -> jax.Array:
+    def _sgd_loss_fn(self, params: SGDParams, spikes: jax.Array) -> jax.Array:
         phase_diff = params.get("phase_difference", self.phase_difference)
         coupling = params.get("coupling_strength", self.coupling_strength)
 
@@ -1512,7 +1522,7 @@ class DirectedInfluencePointProcessModel(
 
         return base_loss
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         super()._store_sgd_params(params)
         if "phase_difference" in params:
             self.phase_difference = params["phase_difference"]

@@ -137,6 +137,13 @@ check_untyped_defs = true
 warn_return_any = true
 warn_unused_ignores = true
 warn_redundant_casts = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_any_generics = true
+disallow_untyped_calls = true
+# jnp.finfo (ml_dtypes), ShapeDtypeStruct and jax.config.read are untyped upstream.
+untyped_calls_exclude = ["jax", "ml_dtypes"]
+no_implicit_reexport = true
 
 [tool.uv.sources]
 # neurospatial 0.8.0 (required by the `spatial` extra) is not yet on PyPI and the

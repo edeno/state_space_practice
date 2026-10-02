@@ -22,7 +22,7 @@ import logging
 import warnings
 from dataclasses import dataclass
 from functools import partial
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import jax
 import jax.numpy as jnp
@@ -38,6 +38,7 @@ from state_space_practice.point_process_kalman import (
     _warn_line_search_failures,
 )
 from state_space_practice.utils import (
+    _root_figure,
     psd_solve,
     symmetrize,
     typed_jit,
@@ -45,6 +46,13 @@ from state_space_practice.utils import (
     validate_covariance,
     validate_scalar,
 )
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+    from numpy.typing import NDArray
+
+    from state_space_practice.place_field_model import PlaceFieldModel
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +116,7 @@ class AdaptiveInflationConfig:
     epsilon: float = 1e-6
     min_fisher_trace: float = 1e-8
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.gain < 0:
             raise ValueError(f"gain must be >= 0, got {self.gain}")
         if self.gain > _MAX_INFLATION_GAIN:
@@ -363,7 +371,7 @@ class PlaceFieldRateMaps:
     @classmethod
     def from_place_field_model(
         cls,
-        model,
+        model: PlaceFieldModel,
         n_grid: int = 50,
         time_slice: slice | None = None,
     ) -> PlaceFieldRateMaps:
@@ -970,15 +978,15 @@ def _build_track_penalty(
 )
 def _run_filter_scan(
     spikes_arr: Array,
-    init_carry: tuple,
+    init_carry: tuple[Array, Array, Array],
     A: Array,
     Q: Array,
     jax_log_rate_maps: Array,
     jax_x_edges: Array,
     jax_y_edges: Array,
     track_penalty: Array,
-    kde_args: tuple,
-    infl_args: tuple,
+    kde_args: tuple[Array, Array, Array, Array, Array, Array],
+    infl_args: tuple[Array, Array, Array, Array],
     *,
     dt: float,
     sigma_track: float,
@@ -1027,7 +1035,7 @@ def _run_filter_scan(
     _vel_pad = jnp.zeros((n_neurons, 2)) if include_velocity else None
     jax_penalty_map = track_penalty[None, :, :]
 
-    def log_intensity_func(state):
+    def log_intensity_func(state: Array) -> Array:
         if use_kde:
             return _kde_log_rate(
                 state,
@@ -1042,7 +1050,7 @@ def _run_filter_scan(
             state, jax_log_rate_maps, jax_x_edges, jax_y_edges, grid_dx, grid_dy
         )
 
-    def grad_log_intensity_func(state):
+    def grad_log_intensity_func(state: Array) -> Array:
         if use_kde:
             jac_pos = _kde_log_rate_jacobian(
                 state,
@@ -1068,7 +1076,7 @@ def _run_filter_scan(
     _y_max = jax_y_edges[-1]
     _penalty_inv_sigma2 = 1.0 / (sigma_track**2)
 
-    def _penalty_at(pos_xy):
+    def _penalty_at(pos_xy: Array) -> Array:
         interior = _bilinear_log_rate(
             pos_xy, jax_penalty_map, jax_x_edges, jax_y_edges, grid_dx, grid_dy
         )[0]
@@ -1084,7 +1092,11 @@ def _run_filter_scan(
     _penalty_grad_fn = jax.grad(_penalty_at)
     _penalty_value_fn = _penalty_at
 
-    def _step(carry, spike_t):
+    def _step(
+        carry: tuple[Array, Array, Array, Array, Array], spike_t: Array
+    ) -> tuple[
+        tuple[Array, Array, Array, Array, Array], tuple[Array, Array, Array, Array]
+    ]:
         mean_prev, cov_prev, total_ll, n_failed_bins, n_capped_bins = carry
 
         # Prediction
@@ -1747,7 +1759,7 @@ class PositionDecoder:
 
     def fit_from_model(
         self,
-        model,
+        model: PlaceFieldModel,
         n_grid: int | None = None,
         time_slice: slice | None = None,
     ) -> None:
@@ -1847,8 +1859,8 @@ class PositionDecoder:
         self,
         result: DecoderResult,
         true_position: np.ndarray | None = None,
-        ax=None,
-    ):
+        ax: Axes | NDArray[np.object_] | None = None,
+    ) -> Figure:
         """Plot decoded vs true position trajectory.
 
         When called without ``ax``, creates a two-panel figure:
@@ -1876,8 +1888,8 @@ class PositionDecoder:
             fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5))
             axes = np.atleast_1d(axes)
         else:
-            axes = np.atleast_1d(ax)
-            fig = axes[0].figure
+            axes = np.atleast_1d(np.asarray(ax, dtype=object))
+            fig = _root_figure(axes[0])
 
         # Left: 2D trajectory
         if true_position is not None:

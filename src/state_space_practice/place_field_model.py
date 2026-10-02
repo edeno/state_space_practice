@@ -35,6 +35,7 @@ References
 import logging
 import warnings
 from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -65,13 +66,20 @@ from state_space_practice.point_process_kalman import (
     stochastic_point_process_filter,
     stochastic_point_process_smoother,
 )
-from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.utils import (
+    _root_figure,
     floor_variances_relative,
     psd_solve,
     symmetrize,
     validate_count_array,
 )
+
+if TYPE_CHECKING:
+    import optax
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+    from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +89,7 @@ def build_2d_spline_basis(
     n_interior_knots: int = 5,
     knots_x: np.ndarray | None = None,
     knots_y: np.ndarray | None = None,
-) -> tuple[np.ndarray, dict]:
+) -> tuple[np.ndarray, dict[str, Any]]:
     """Build a 2D tensor-product B-spline design matrix from position data.
 
     Constructs the design matrix by taking the tensor product of 1D B-spline
@@ -159,7 +167,7 @@ def build_2d_spline_basis(
 
 def evaluate_basis(
     position: np.ndarray,
-    basis_info: dict,
+    basis_info: dict[str, Any],
 ) -> np.ndarray:
     """Evaluate a previously constructed 2D spline basis at new positions.
 
@@ -403,7 +411,7 @@ class PlaceFieldModel(SGDFittableMixin):
         self.update_init_state = update_init_state
 
         # Populated during fit
-        self.basis_info: dict | None = None
+        self.basis_info: dict[str, Any] | None = None
         self.n_basis_per_neuron: int | None = None
         self.n_basis: int | None = None  # total state dim
         self.n_neurons: int = 1
@@ -449,7 +457,7 @@ class PlaceFieldModel(SGDFittableMixin):
         place_field_width: float,
         arena_range_x: tuple[float, float],
         arena_range_y: tuple[float, float],
-        **kwargs,
+        **kwargs: Any,
     ) -> "PlaceFieldModel":
         """Create a model with knot spacing matched to place field size.
 
@@ -1423,7 +1431,7 @@ class PlaceFieldModel(SGDFittableMixin):
         self,
         position: ArrayLike,
         spikes: ArrayLike,
-        optimizer: object | None = None,
+        optimizer: "optax.GradientTransformation | None" = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
@@ -1548,9 +1556,9 @@ class PlaceFieldModel(SGDFittableMixin):
                 "Call fit_sgd(position, spikes) not super().fit_sgd() directly."
             )
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
-        params: dict = {}
-        spec: dict = {}
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
+        params: SGDParams = {}
+        spec: SGDParamSpec = {}
 
         if self.update_process_cov:
             assert self.process_cov is not None
@@ -1579,7 +1587,9 @@ class PlaceFieldModel(SGDFittableMixin):
 
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, design_matrix: Array, spikes: Array) -> Array:
+    def _sgd_loss_fn(
+        self, params: SGDParams, design_matrix: Array, spikes: Array
+    ) -> Array:
         assert self.transition_matrix is not None
         assert self.init_mean is not None
         assert self.init_cov is not None
@@ -1621,7 +1631,7 @@ class PlaceFieldModel(SGDFittableMixin):
         )
         return -marginal_ll
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         if "process_diag" in params:
             self.process_cov = jnp.diag(params["process_diag"])
         elif "process_scalar" in params:
@@ -2157,7 +2167,7 @@ class PlaceFieldModel(SGDFittableMixin):
         n_grid: int = 80,
         n_blocks: int = 20,
         neuron_idx: int = 0,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Summarize place field drift over the session.
 
         Parameters
@@ -2225,8 +2235,8 @@ class PlaceFieldModel(SGDFittableMixin):
         n_time_bins: int = 3,
         n_grid: int = 50,
         neuron_idx: int = 0,
-        ax: np.ndarray | None = None,
-    ):
+        ax: "NDArray[np.object_] | None" = None,
+    ) -> "Figure":
         """Plot estimated rate maps in temporal bins.
 
         Parameters
@@ -2277,7 +2287,7 @@ class PlaceFieldModel(SGDFittableMixin):
                 axes = [axes]
         else:
             axes = np.atleast_1d(ax)
-            fig = axes[0].figure
+            fig = _root_figure(axes[0])
 
         for i, (rate_map, label) in enumerate(zip(rate_maps, labels)):
             im = axes[i].pcolormesh(
@@ -2297,8 +2307,8 @@ class PlaceFieldModel(SGDFittableMixin):
         self,
         n_blocks: int = 20,
         n_grid: int = 80,
-        ax=None,
-    ):
+        ax: "Axes | None" = None,
+    ) -> "Figure":
         """Plot the place field center trajectory over time.
 
         Colors the trajectory from dark (start) to bright (end).
@@ -2325,7 +2335,7 @@ class PlaceFieldModel(SGDFittableMixin):
         if ax is None:
             fig, ax = plt.subplots(figsize=(6, 6))
         else:
-            fig = ax.figure
+            fig = _root_figure(ax)
 
         cmap = plt.get_cmap("viridis")
         colors = cmap(np.linspace(0, 1, n_blocks))

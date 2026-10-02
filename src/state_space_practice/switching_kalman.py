@@ -15,7 +15,9 @@ import functools
 import logging
 import math
 import warnings
+from collections.abc import Callable
 from functools import partial
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -1140,7 +1142,9 @@ def switching_kalman_viterbi(
         return jnp.array([jnp.argmax(first_discrete_prob)], dtype=jnp.int32)
 
     # --- Forward pass: collect pair log-likelihoods -----------------------
-    def _step(carry, obs_t):
+    def _step(
+        carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array], obs_t: jax.Array
+    ) -> tuple[tuple[jax.Array, jax.Array, jax.Array, jax.Array], jax.Array]:
         prev_mean, prev_cov, prev_prob, prev_support = carry
 
         # Pair-conditional Kalman update (same as in the filter)
@@ -1202,7 +1206,9 @@ def switching_kalman_viterbi(
     # Backward pass: accumulate best future scores with pair log-likelihoods
     log_trans = zero_preserving_log(discrete_transition_matrix)
 
-    def _viterbi_backward(best_next_score, t):
+    def _viterbi_backward(
+        best_next_score: jax.Array, t: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
         # scores[i, j] = log A(i,j) + pair_log_lik(t, i, j) + best_future(j)
         scores = log_trans + pair_log_liks[t] + best_next_score[None, :]
         best_next_state = jnp.argmax(scores, axis=1)
@@ -1224,7 +1230,9 @@ def switching_kalman_viterbi(
     )
 
     # Forward trace
-    def _viterbi_forward(state, best_next_state):
+    def _viterbi_forward(
+        state: jax.Array, best_next_state: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
         next_state = best_next_state[state]
         return next_state, next_state
 
@@ -1765,7 +1773,25 @@ def switching_kalman_smoother_gpb2(
     Computational cost is ~2x GPB1 for S=2 (8 vs 4 RTS updates per step).
     """
 
-    def _step(carry, args):
+    def _step(
+        carry: tuple[jax.Array, jax.Array, jax.Array],
+        args: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    ) -> tuple[
+        tuple[jax.Array, jax.Array, jax.Array],
+        tuple[
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+        ],
+    ]:
         (
             next_pair_cond_smoother_mean,  # E[x_{t+1} | S_t=j, S_{t+1}=k], (L, Sj, Sk)
             next_pair_cond_smoother_cov,  # (L, L, Sj, Sk)
@@ -2118,7 +2144,7 @@ def warn_low_occupancy_states(
 # solution does not depend on the units of the latent state, floored at the
 # Gram matrix's machine epsilon with a sqrt(eps) retry for a numerically
 # singular (e.g. float32) Gram matrix.
-psd_solve_per_discrete_state = jax.vmap(
+psd_solve_per_discrete_state: Callable[[jax.Array, jax.Array], jax.Array] = jax.vmap(
     lambda x, y: _gain_solve(x, y.T).T,
     in_axes=(-1, -1),
     out_axes=-1,
@@ -2260,7 +2286,9 @@ def _switching_kalman_m_step_inner(
         continuous_transition_matrix = psd_solve_per_discrete_state(gamma1, beta)
 
     # Process covariance, residual form at the installed A.
-    def _process_scatter(A, gamma1_j, beta_j, gamma2_j):
+    def _process_scatter(
+        A: jax.Array, gamma1_j: jax.Array, beta_j: jax.Array, gamma2_j: jax.Array
+    ) -> jax.Array:
         cross = A @ beta_j.T
         return gamma2_j - cross - cross.T + A @ gamma1_j @ A.T
 
@@ -2316,7 +2344,7 @@ def switching_kalman_maximization_step(
     transition_prior: jax.Array | None = None,
     fixed_measurement_matrix: jax.Array | None = None,
     fixed_continuous_transition_matrix: jax.Array | None = None,
-    previous_params: dict | None = None,
+    previous_params: dict[str, jax.Array] | None = None,
     estimate_measurement_params: bool = True,
 ) -> tuple[
     jax.Array,
@@ -2370,7 +2398,7 @@ def switching_kalman_maximization_step(
         Shape ``(n_cont_states, n_cont_states, n_discrete_states)``. The
         transition matrix the caller keeps fixed; ``process_cov`` is then the
         fixed-``A`` residual optimum.
-    previous_params : dict | None
+    previous_params : dict[str, jax.Array] | None
         Current parameter values, keyed by any of
         ``"continuous_transition_matrix"``, ``"measurement_matrix"``,
         ``"process_cov"``, ``"measurement_cov"``. A discrete state whose
@@ -2757,8 +2785,16 @@ def compute_expected_complete_log_likelihood(
     )
 
     def _cont_trans_log_prob_single(
-        weight, m_t_ij, m_t1_ij, V_t_ij, V_t1_ij, cross_cov_ij, A_j, Q_j, log_det_Q
-    ):
+        weight: jax.Array,
+        m_t_ij: jax.Array,
+        m_t1_ij: jax.Array,
+        V_t_ij: jax.Array,
+        V_t1_ij: jax.Array,
+        cross_cov_ij: jax.Array,
+        A_j: jax.Array,
+        Q_j: jax.Array,
+        log_det_Q: jax.Array,
+    ) -> jax.Array:
         """Log-prob for a single (t, i, j) triple."""
         E_xt1_xt1 = V_t1_ij + jnp.outer(m_t1_ij, m_t1_ij)
         E_xt_xt = V_t_ij + jnp.outer(m_t_ij, m_t_ij)
@@ -2784,7 +2820,16 @@ def compute_expected_complete_log_likelihood(
     )
 
     # For each j: compute over all (t, i) and sum
-    def _sum_for_j(A_j, Q_j, weights_j, m_t_j, m_t1_j, V_t_j, V_t1_j, cross_cov_j):
+    def _sum_for_j(
+        A_j: jax.Array,
+        Q_j: jax.Array,
+        weights_j: jax.Array,
+        m_t_j: jax.Array,
+        m_t1_j: jax.Array,
+        V_t_j: jax.Array,
+        V_t1_j: jax.Array,
+        cross_cov_j: jax.Array,
+    ) -> jax.Array:
         """Sum log-probs over (t, i) for a single destination state j.
 
         weights_j: (T-1, K_i)
@@ -2825,11 +2870,19 @@ def compute_expected_complete_log_likelihood(
     )
 
     # 5. Observations — vmap over j, vectorize over t
-    def _obs_log_prob_for_j(H_j, R_j, weights_j, means_j, covs_j):
+    def _obs_log_prob_for_j(
+        H_j: jax.Array,
+        R_j: jax.Array,
+        weights_j: jax.Array,
+        means_j: jax.Array,
+        covs_j: jax.Array,
+    ) -> jax.Array:
         """Sum observation log-probs over t for a single state j."""
         log_det_R = psd_logdet(psd_cholesky(R_j))
 
-        def _single_t(weight, m_t_j, V_t_j, y_t):
+        def _single_t(
+            weight: jax.Array, m_t_j: jax.Array, V_t_j: jax.Array, y_t: jax.Array
+        ) -> jax.Array:
             pred_mean = H_j @ m_t_j
             diff = y_t - pred_mean
             expected_residual = jnp.outer(diff, diff) + H_j @ V_t_j @ H_j.T
@@ -3404,7 +3457,7 @@ def _unpack_dim_params(
     n_states: int | None,
     max_damping: jax.Array,
     max_freq: jax.Array,
-) -> dict:
+) -> dict[str, jax.Array]:
     """Inverse of :func:`_pack_dim_params` (``n_states=None``: one state)."""
     offdiag_i, offdiag_j = np.where(~np.eye(n_osc, dtype=bool))
     n_offdiag = n_osc * (n_osc - 1)
@@ -3446,7 +3499,7 @@ def _optimize_dim_single_core(
     tol: float,
     max_iter: int,
     has_process_cov: bool,
-) -> dict:
+) -> dict[str, Any]:
     """Jitted numeric core of :func:`optimize_dim_transition_params`.
 
     Shapes and the static controls (``tol``, ``max_iter``) form the
@@ -3490,14 +3543,14 @@ def _optimize_dim_single_core(
 def optimize_dim_transition_params(
     gamma1: jax.Array,
     beta: jax.Array,
-    init_params: dict,
+    init_params: dict[str, jax.Array],
     sampling_freq: float,
     process_cov: jax.Array | None = None,
     max_iter: int = 100,
     tol: float = 1e-6,
     raise_on_failure: bool = False,
     max_spectral_radius: float = 0.99,
-) -> dict:
+) -> dict[str, jax.Array]:
     """Optimize oscillator parameters to maximize Q-function.
 
     Uses JAX autodiff + BFGS optimizer. The numeric core (reparameterization
@@ -3596,7 +3649,7 @@ def optimize_dim_transition_params(
     # Post-check: verify the spectral radius of the resulting A. Spectral
     # radius is computed on host (eigvals has no GPU/TPU lowering); the
     # optimizer has already returned, so this runs eagerly.
-    def _radius(params: dict) -> float:
+    def _radius(params: dict[str, jax.Array]) -> float:
         return _spectral_radius(
             construct_directed_influence_transition_matrix(
                 freqs=params["freq"],
@@ -3668,7 +3721,7 @@ def _optimize_dim_joint_core(
     max_iter: int,
     max_backtracking_steps: int,
     has_process_cov: bool,
-) -> dict:
+) -> dict[str, Any]:
     """Jitted numeric core of :func:`optimize_dim_transition_params_joint`.
 
     Packs the initial point, runs BFGS, evaluates the candidate objective and
@@ -3690,7 +3743,7 @@ def _optimize_dim_joint_core(
     n_states = gamma1.shape[-1]
     max_freq = 0.5 * sampling_freq
 
-    def unpack(flat: jax.Array) -> dict:
+    def unpack(flat: jax.Array) -> dict[str, jax.Array]:
         return _unpack_dim_params(flat, n_osc, n_states, max_damping, max_freq)
 
     def loss(flat_params: jax.Array) -> jax.Array:
@@ -3706,7 +3759,13 @@ def _optimize_dim_joint_core(
         effective_damping = params["damping"] * scale
         effective_coupling = params["coupling_strength"] * scale
 
-        def per_state(coupling, phase, gamma, cross, cov):
+        def per_state(
+            coupling: jax.Array,
+            phase: jax.Array,
+            gamma: jax.Array,
+            cross: jax.Array,
+            cov: jax.Array,
+        ) -> jax.Array:
             return compute_transition_q_from_params(
                 damping=effective_damping,
                 freq=params["freq"],
@@ -3744,7 +3803,9 @@ def _optimize_dim_joint_core(
         direction = result.x - init_flat
         steps = 0.5 ** jnp.arange(1, max_backtracking_steps + 1, dtype=init_flat.dtype)
 
-        def body(carry, step):
+        def body(
+            carry: tuple[jax.Array, jax.Array], step: jax.Array
+        ) -> tuple[tuple[jax.Array, jax.Array], None]:
             accepted, found = carry
             trial_flat = init_flat + step * direction
             trial_loss = loss(trial_flat)
@@ -3772,7 +3833,7 @@ def _optimize_dim_joint_core(
 def optimize_dim_transition_params_joint(
     gamma1: jax.Array,
     beta: jax.Array,
-    init_params: dict,
+    init_params: dict[str, jax.Array],
     sampling_freq: float,
     process_cov: jax.Array | None = None,
     max_spectral_radius: float = 0.99,
@@ -3781,7 +3842,7 @@ def optimize_dim_transition_params_joint(
     tol: float = 1e-6,
     max_backtracking_steps: int = 20,
     raise_on_failure: bool = False,
-) -> dict:
+) -> dict[str, jax.Array]:
     """Jointly optimize shared and state-specific DIM transition parameters.
 
     Unlike :func:`optimize_dim_transition_params`, this solves one objective

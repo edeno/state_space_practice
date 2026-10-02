@@ -36,11 +36,14 @@ Models
 import logging
 import math
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
+from numpy.typing import NDArray
 
 from state_space_practice.em_driver import run_em
 from state_space_practice.exceptions import NotFittedError
@@ -68,6 +71,8 @@ from state_space_practice.parameter_transforms import (
 )
 from state_space_practice.sgd_fitting import (
     SGDFittableMixin,
+    SGDParams,
+    SGDParamSpec,
     reconstruct_per_state_array,
 )
 from state_space_practice.switching_kalman import (
@@ -90,6 +95,11 @@ from state_space_practice.utils import (
     validate_nonnegative_array,
     validate_unit_interval_array,
 )
+
+if TYPE_CHECKING:
+    import optax
+
+    from state_space_practice.oscillator_regularization import OscillatorPenaltyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +132,7 @@ _FORCED_UPDATE_FLAGS = (
 )
 
 
-def _reject_forced_update_flags(model_name: str, kwargs: dict) -> None:
+def _reject_forced_update_flags(model_name: str, kwargs: dict[str, Any]) -> None:
     """Reject update flags a subclass fixes by model definition.
 
     Each subclass hard-sets which of A, H, and Q are learned. Silently
@@ -312,7 +322,7 @@ class OscillatorParameterBase:
         return self._sgd_n_time
 
     def _reconstruct_per_state_array(
-        self, params: dict, prefix: str, fallback: Array
+        self, params: SGDParams, prefix: str, fallback: Array
     ) -> Array:
         """See :func:`state_space_practice.sgd_fitting.reconstruct_per_state_array`."""
         return reconstruct_per_state_array(
@@ -336,13 +346,13 @@ class OscillatorParameterBase:
             )
         return jnp.stack([cov_arr] * self.n_discrete_states, axis=-1)
 
-    def _measurement_covariance_from_params(self, params: dict) -> Array:
+    def _measurement_covariance_from_params(self, params: SGDParams) -> Array:
         """Get the shared observation covariance stack for SGD losses."""
         if "measurement_cov" in params:
             return self._stack_shared_measurement_covariance(params["measurement_cov"])
         return self.measurement_cov
 
-    def _store_shared_measurement_covariance(self, params: dict) -> None:
+    def _store_shared_measurement_covariance(self, params: SGDParams) -> None:
         """Store a shared observation covariance optimized by SGD."""
         if "measurement_cov" in params:
             self.measurement_cov = self._stack_shared_measurement_covariance(
@@ -532,7 +542,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         self.smoother_pair_cond_covs: jax.Array | None
         self.smoother_next_pair_cond_means: jax.Array | None
 
-    def _snapshot_em_state(self) -> dict:
+    def _snapshot_em_state(self) -> dict[str, object]:
         """Capture parameters and smoother outputs for EM rollback.
 
         Snapshotted values are JAX arrays (immutable), so a reference copy is
@@ -541,7 +551,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         """
         import copy
 
-        snapshot: dict = {}
+        snapshot: dict[str, object] = {}
         for key in self._EM_SNAPSHOT_KEYS:
             if not hasattr(self, key):
                 continue
@@ -551,7 +561,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
             )
         return snapshot
 
-    def _restore_em_state(self, state: dict) -> None:
+    def _restore_em_state(self, state: dict[str, object]) -> None:
         """Restore a state captured by _snapshot_em_state."""
         for key, value in state.items():
             setattr(self, key, value)
@@ -636,6 +646,8 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         window, n_windows, windowed = self._prepare_windows(obs_np, n_states)
         if windowed is None:
             return
+        # _prepare_windows returns all three values or none of them.
+        assert n_windows is not None
 
         # Windowed cross-covariance features (upper triangle)
         triu_idx = np_cpu.triu_indices(n_sources)
@@ -646,7 +658,9 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         self._apply_warm_init(features, obs_np, windowed, n_states)
 
     @staticmethod
-    def _prepare_windows(obs_np, n_states):
+    def _prepare_windows(
+        obs_np: NDArray[np.floating], n_states: int
+    ) -> tuple[int, int, NDArray[np.floating]] | tuple[None, None, None]:
         """Compute windowed observations for warm init.
 
         Returns (window, n_windows, windowed) or (None, None, None)
@@ -670,7 +684,13 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         windowed = trimmed.reshape(n_windows, window, -1)
         return window, n_windows, windowed
 
-    def _apply_warm_init(self, features, obs_np, windowed, n_states) -> None:
+    def _apply_warm_init(
+        self,
+        features: NDArray[np.floating],
+        obs_np: NDArray[np.floating],
+        windowed: NDArray[np.floating],
+        n_states: int,
+    ) -> None:
         """Shared GMM clustering and parameter setting for warm init.
 
         Called by ``_warm_initialize_states`` (and subclass overrides)
@@ -730,7 +750,10 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         self.init_discrete_state_prob = jnp.array(smoothed)
 
     def _seed_state_parameters_from_windows(
-        self, window_state_prob, obs_np, window: int
+        self,
+        window_state_prob: NDArray[np.floating],
+        obs_np: NDArray[np.floating],
+        window: int,
     ) -> None:
         """Seed the per-state parameters with one M-step on the window clusters.
 
@@ -841,27 +864,27 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         )
 
     @abstractmethod
-    def _initialize_measurement_matrix(self, key: Array | None = None):
+    def _initialize_measurement_matrix(self, key: Array | None = None) -> None:
         """Abstract method to initialize the measurement matrix (H)."""
         pass
 
     @abstractmethod
-    def _initialize_measurement_covariance(self):
+    def _initialize_measurement_covariance(self) -> None:
         """Abstract method to initialize the measurement covariance (R)."""
         pass
 
     @abstractmethod
-    def _initialize_continuous_transition_matrix(self):
+    def _initialize_continuous_transition_matrix(self) -> None:
         """Abstract method to initialize the continuous transition matrix (A)."""
         pass
 
     @abstractmethod
-    def _initialize_process_covariance(self):
+    def _initialize_process_covariance(self) -> None:
         """Abstract method to initialize the process covariance (Q)."""
         pass
 
     @abstractmethod
-    def _project_parameters(self):
+    def _project_parameters(self) -> None:
         """Abstract method to project estimated parameters onto valid spaces."""
         pass
 
@@ -1031,7 +1054,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
 
     def _m_step_fixed_and_previous_params(
         self, transition_matrix_fixed: bool | None = None
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Keyword arguments tying the generic M-step to this model's structure.
 
         A matrix the model does not learn (``update_*`` False) is passed as
@@ -1147,7 +1170,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         self,
         observations: ArrayLike,
         key: Array | None = None,
-        optimizer: object | None = None,
+        optimizer: "optax.GradientTransformation | None" = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
@@ -1202,7 +1225,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
                 "Call fit_sgd(observations, key=...) to initialize parameters."
             )
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         """Store the plain keys, then rebuild the per-state covariance stacks.
 
         The param specs optimize one shared ``(n_sources, n_sources)``
@@ -1252,7 +1275,7 @@ class CommonOscillatorModel(BaseModel):
         damping_coef: jax.Array,
         process_variance: jax.Array,
         measurement_variance: float,
-        **kwargs,
+        **kwargs: Any,
     ):
         _reject_forced_update_flags("CommonOscillatorModel", kwargs)
         super().__init__(
@@ -1287,7 +1310,7 @@ class CommonOscillatorModel(BaseModel):
         self.update_process_cov = False
         self.update_measurement_matrix = True
 
-    def _initialize_measurement_matrix(self, key: Array | None = None):
+    def _initialize_measurement_matrix(self, key: Array | None = None) -> None:
         """Initializes H with small random values, varying across discrete states."""
         if key is None:
             raise ValueError("A JAX PRNGKey must be provided for COM initialization.")
@@ -1298,14 +1321,14 @@ class CommonOscillatorModel(BaseModel):
             maxval=0.1,
         )
 
-    def _initialize_measurement_covariance(self):
+    def _initialize_measurement_covariance(self) -> None:
         """Initializes R as isotropic, constant across discrete states."""
         measurement_cov = jnp.identity(self.n_sources) * self.measurement_variance
         self.measurement_cov = jnp.stack(
             [measurement_cov] * self.n_discrete_states, axis=2
         )
 
-    def _initialize_continuous_transition_matrix(self):
+    def _initialize_continuous_transition_matrix(self) -> None:
         """Initializes A based on freqs/damping, constant across discrete states."""
         transition_matrix = construct_common_oscillator_transition_matrix(
             freqs=self.freqs,
@@ -1316,14 +1339,14 @@ class CommonOscillatorModel(BaseModel):
             [transition_matrix] * self.n_discrete_states, axis=2
         )
 
-    def _initialize_process_covariance(self):
+    def _initialize_process_covariance(self) -> None:
         """Initializes Q based on variance, constant across discrete states."""
         process_cov = construct_common_oscillator_process_covariance(
             variance=self.process_variance,
         )
         self.process_cov = jnp.stack([process_cov] * self.n_discrete_states, axis=2)
 
-    def _project_parameters(self):
+    def _project_parameters(self) -> None:
         """No specific projection needed for COM beyond M-step updates."""
         pass  # H is typically unconstrained in COM
 
@@ -1417,9 +1440,9 @@ class CommonOscillatorModel(BaseModel):
 
     # --- SGDFittableMixin: COM-specific param spec and loss ---
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
-        params: dict = {}
-        spec: dict = {}
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
+        params: SGDParams = {}
+        spec: SGDParamSpec = {}
 
         if self.update_measurement_matrix:
             params["measurement_matrix"] = self.measurement_matrix
@@ -1441,7 +1464,7 @@ class CommonOscillatorModel(BaseModel):
 
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, observations: Array) -> Array:
+    def _sgd_loss_fn(self, params: SGDParams, observations: Array) -> Array:
         H = params.get("measurement_matrix", self.measurement_matrix)
         Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
         m0 = params.get("init_mean", self.init_mean)
@@ -1511,7 +1534,7 @@ class CorrelatedNoiseModel(BaseModel):
         phase_difference: jax.Array,
         coupling_strength: jax.Array,
         use_reparameterized_mstep: bool = True,
-        **kwargs,
+        **kwargs: Any,
     ):
         # n_sources is fixed to n_oscillators for CNM (passed to super below).
         _reject_forced_update_flags("CorrelatedNoiseModel", kwargs)
@@ -1568,7 +1591,7 @@ class CorrelatedNoiseModel(BaseModel):
         self.update_measurement_matrix = False  # H is fixed in CNM
         self.update_process_cov = True
 
-    def _initialize_measurement_matrix(self, key: Array | None = None):
+    def _initialize_measurement_matrix(self, key: Array | None = None) -> None:
         """Initializes H as block-diagonal [1, 0], constant across states."""
         measurement_matrix = construct_correlated_noise_measurement_matrix(
             self.n_sources,
@@ -1577,14 +1600,14 @@ class CorrelatedNoiseModel(BaseModel):
             [measurement_matrix] * self.n_discrete_states, axis=2
         )
 
-    def _initialize_measurement_covariance(self):
+    def _initialize_measurement_covariance(self) -> None:
         """Initializes R as isotropic, constant across discrete states."""
         measurement_cov = jnp.identity(self.n_sources) * self.measurement_variance
         self.measurement_cov = jnp.stack(
             [measurement_cov] * self.n_discrete_states, axis=2
         )
 
-    def _initialize_continuous_transition_matrix(self):
+    def _initialize_continuous_transition_matrix(self) -> None:
         """Initializes A based on freqs/damping, constant across discrete states."""
         transition_matrix = construct_common_oscillator_transition_matrix(
             freqs=self.freqs,
@@ -1595,7 +1618,7 @@ class CorrelatedNoiseModel(BaseModel):
             [transition_matrix] * self.n_discrete_states, axis=2
         )
 
-    def _initialize_process_covariance(self):
+    def _initialize_process_covariance(self) -> None:
         """Initializes Q based on initial params, varying across discrete states."""
         self.process_cov = jnp.stack(
             [
@@ -1616,7 +1639,7 @@ class CorrelatedNoiseModel(BaseModel):
             self.process_cov, "process_cov", require_positive_definite=False
         )
 
-    def _project_parameters(self):
+    def _project_parameters(self) -> None:
         """Project each per-state Q to the CNM covariance family.
 
         The generic switching Kalman M-step estimates an unconstrained
@@ -1742,9 +1765,9 @@ class CorrelatedNoiseModel(BaseModel):
 
     # --- SGDFittableMixin: CNM-specific param spec and loss ---
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
-        params: dict = {}
-        spec: dict = {}
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
+        params: SGDParams = {}
+        spec: SGDParamSpec = {}
 
         if self.update_process_cov:
             params["process_variance"] = self.process_variance
@@ -1774,7 +1797,7 @@ class CorrelatedNoiseModel(BaseModel):
 
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, observations: Array) -> Array:
+    def _sgd_loss_fn(self, params: SGDParams, observations: Array) -> Array:
         Z = params.get("discrete_transition_matrix", self.discrete_transition_matrix)
         m0 = params.get("init_mean", self.init_mean)
         R = self._measurement_covariance_from_params(params)
@@ -1810,7 +1833,7 @@ class CorrelatedNoiseModel(BaseModel):
         )
         return -jnp.asarray(result[6])
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         super()._store_sgd_params(params)
         if "process_variance" in params:
             self.process_variance = params["process_variance"]
@@ -1899,7 +1922,7 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         use_reparameterized_mstep: bool = False,
         max_spectral_radius: float = 0.99,
         max_damping: float = 0.995,
-        **kwargs,
+        **kwargs: Any,
     ):
         # n_sources is fixed to n_oscillators for DIM (passed to super below).
         _reject_forced_update_flags("DirectedInfluenceModel", kwargs)
@@ -1972,7 +1995,7 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         # Reparameterized M-step option
         self.use_reparameterized_mstep = use_reparameterized_mstep
         # Store current oscillator params for warm-starting optimizer
-        self._current_osc_params: dict | None = None
+        self._current_osc_params: dict[str, Array] | None = None
 
         # Stability bounds applied when rebuilding transition matrices.
         if not 0.0 < max_spectral_radius < 1.0:
@@ -1982,7 +2005,7 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         self.max_spectral_radius = max_spectral_radius
         self.max_damping = max_damping
 
-    def _initialize_measurement_matrix(self, key: Array | None = None):
+    def _initialize_measurement_matrix(self, key: Array | None = None) -> None:
         """Initializes H with [1/sqrt(2), 1/sqrt(2)] blocks, constant across states."""
         measurement_matrix = construct_directed_influence_measurement_matrix(
             self.n_sources,
@@ -1991,14 +2014,14 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
             [measurement_matrix] * self.n_discrete_states, axis=2
         )
 
-    def _initialize_measurement_covariance(self):
+    def _initialize_measurement_covariance(self) -> None:
         """Initializes R as isotropic, constant across discrete states."""
         measurement_cov = jnp.identity(self.n_sources) * self.measurement_variance
         self.measurement_cov = jnp.stack(
             [measurement_cov] * self.n_discrete_states, axis=2
         )
 
-    def _initialize_process_covariance(self):
+    def _initialize_process_covariance(self) -> None:
         """Initializes Q based on variance, constant across discrete states."""
         process_cov = construct_common_oscillator_process_covariance(
             variance=self.process_variance,
@@ -2166,9 +2189,9 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
 
     # --- SGDFittableMixin: DIM-specific param spec and loss ---
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
-        params: dict = {}
-        spec: dict = {}
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
+        params: SGDParams = {}
+        spec: SGDParamSpec = {}
 
         if self.update_continuous_transition_matrix:
             params["phase_difference"] = self.phase_difference
@@ -2200,11 +2223,11 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         self,
         observations: ArrayLike,
         key: Array | None = None,
-        optimizer: object | None = None,
+        optimizer: "optax.GradientTransformation | None" = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
-        connectivity_penalty: object | None = None,
+        connectivity_penalty: "OscillatorPenaltyConfig | None" = None,
         skip_init: bool = False,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
@@ -2250,7 +2273,7 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
             skip_init=skip_init,
         )
 
-    def _sgd_loss_fn(self, params: dict, observations) -> jax.Array:
+    def _sgd_loss_fn(self, params: SGDParams, observations: Array) -> jax.Array:
         phase_diff = params.get("phase_difference", self.phase_difference)
         coupling = params.get("coupling_strength", self.coupling_strength)
         stability_scale = compute_directed_influence_stability_scale(
@@ -2312,7 +2335,7 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
 
         return jnp.asarray(base_loss)
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         super()._store_sgd_params(params)
         if "phase_difference" in params:
             self.phase_difference = params["phase_difference"]

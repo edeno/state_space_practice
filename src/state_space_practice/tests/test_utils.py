@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from state_space_practice.utils import (
+    _root_figure,
     _validate_filter_numerics,
     check_converged,
     clip_eigenvalues_relative,
@@ -72,6 +73,26 @@ class TestTypedJit:
         # Guard: without static_argnames the same function cannot trace.
         with pytest.raises(jax.errors.TracerBoolConversionError):
             typed_jit(f)(x, 2)
+
+
+class TestRootFigure:
+    """Plot helpers call tight_layout on the root Figure, never a SubFigure."""
+
+    def test_axes_in_subfigure_resolve_to_root_figure(self) -> None:
+        plt = pytest.importorskip("matplotlib.pyplot")
+        fig = plt.figure()
+        try:
+            sub = fig.subfigures(1, 2)[0]
+            ax = sub.subplots()
+            # Guard: ax.figure is the SubFigure, which has no tight_layout.
+            assert ax.figure is sub
+            assert not hasattr(ax.figure, "tight_layout")
+
+            root = _root_figure(ax)
+            assert root is fig
+            root.tight_layout()
+        finally:
+            plt.close(fig)
 
 
 class TestCheckConverged:

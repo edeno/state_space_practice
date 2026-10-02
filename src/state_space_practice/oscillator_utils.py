@@ -55,7 +55,7 @@ def _scatter_block_diagonal(blocks: jax.Array) -> jax.Array:
     )
 
 
-def get_block_slice(from_oscillator: int, to_oscillator: int) -> tuple:
+def get_block_slice(from_oscillator: int, to_oscillator: int) -> tuple[slice, slice]:
     """Get the indices for a 2x2 block in a 2n_oscillator matrix
 
     Parameters
@@ -1035,7 +1035,7 @@ def constrain_correlated_noise_process_covariance(
 def extract_correlated_noise_params_from_covariance(
     process_covariance: jax.Array,
     n_oscillators: int,
-) -> dict:
+) -> dict[str, jax.Array]:
     """Extract CNM scientific parameters from a structured process covariance."""
     blocks = _matrix_to_oscillator_blocks(process_covariance)
     if blocks.shape[0] != n_oscillators:
@@ -1068,7 +1068,7 @@ def extract_dim_params_from_matrix(
     A: jax.Array,
     sampling_freq: float,
     n_oscillators: int,
-) -> dict:
+) -> dict[str, jax.Array]:
     """Extract oscillator parameters from a DIM transition matrix.
 
     This function extracts the underlying oscillator parameters (damping, frequency,
@@ -1266,7 +1266,7 @@ def project_transition_matrix_stack(
 
 def extract_dim_params_from_matrix_stack(
     transition_matrices: jax.Array, sampling_freq: float, n_oscillators: int
-) -> dict:
+) -> dict[str, jax.Array]:
     """Extract shared DIM oscillator parameters from a per-state matrix stack.
 
     Frequency and damping are shared across discrete states in the directed
@@ -1308,15 +1308,15 @@ def extract_dim_params_from_matrix_stack(
 def optimize_dim_transition_params_joint_until_stationary(
     gamma1: jax.Array,
     beta: jax.Array,
-    init_params: dict,
+    init_params: dict[str, jax.Array],
     sampling_freq: float,
     process_cov: jax.Array | None,
     max_spectral_radius: float,
     max_damping: float,
     max_restarts: int = 5,
     param_tol: float = 1e-8,
-    optimizer: Callable[..., dict] | None = None,
-) -> dict:
+    optimizer: Callable[..., dict[str, jax.Array]] | None = None,
+) -> dict[str, jax.Array]:
     """Run the joint DIM optimizer, restarting BFGS until it stops moving.
 
     :func:`~state_space_practice.switching_kalman.optimize_dim_transition_params_joint`
@@ -1356,7 +1356,7 @@ def optimize_dim_transition_params_joint_until_stationary(
         )
 
         optimizer = optimize_dim_transition_params_joint
-    solve: Callable[..., dict] = optimizer
+    solve: Callable[..., dict[str, jax.Array]] = optimizer
 
     params = dict(init_params)
     for _ in range(max_restarts + 1):
@@ -1414,8 +1414,8 @@ class DirectedInfluenceDynamicsMixin:
     n_discrete_states: int
     use_reparameterized_mstep: bool
     update_continuous_transition_matrix: bool
-    _current_osc_params: dict | None
-    _pre_m_step_dynamics: dict | None
+    _current_osc_params: dict[str, jax.Array] | None
+    _pre_m_step_dynamics: dict[str, jax.Array] | None
     process_cov: jax.Array
 
     _PUBLIC_DYNAMICS_ATTRS = (
@@ -1450,7 +1450,7 @@ class DirectedInfluenceDynamicsMixin:
             phase_difference=self.phase_difference,
         )
 
-    def _intrinsic_osc_params(self) -> dict:
+    def _intrinsic_osc_params(self) -> dict[str, jax.Array]:
         """The public scientific parameters in the joint optimizer's layout."""
         return {
             "freq": self.freqs,
@@ -1576,7 +1576,9 @@ class DirectedInfluenceDynamicsMixin:
         )
         return -float(jnp.sum(negative))
 
-    def _keep_previous_dynamics_if_objective_decreased(self, previous: dict) -> None:
+    def _keep_previous_dynamics_if_objective_decreased(
+        self, previous: dict[str, jax.Array]
+    ) -> None:
         """Make the standard DIM M-step a generalized EM step.
 
         The standard M-step solves the unconstrained ``A*`` and then projects

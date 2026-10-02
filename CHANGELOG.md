@@ -27,8 +27,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   package, fast tests on Python 3.10-3.12, nightly full suite),
   `.pre-commit-config.yaml` (ruff, ruff-format, nbstripout), `[tool.ruff]`
   config, and `HYPOTHESIS_PROFILE` selection in the test conftest. mypy checks
-  all package modules except tests, including untyped function bodies via
-  `check_untyped_defs = true`. Jitted functions are declared with
+  all package modules except tests with the `--strict` checks enabled
+  (every function annotated, generic types parameterized, no implicit
+  re-exports); calls into untyped JAX APIs are exempt. SGD parameter dicts are
+  typed `sgd_fitting.SGDParams` / `SGDParamSpec`. Jitted functions are declared with
   `utils.typed_jit`, a `jax.jit` that keeps the wrapped signature visible to
   mypy, so arguments and results at jitted calls are type-checked.
 - **`em_driver.run_em`**: the shared EM loop (E-step, convergence, rollback,
@@ -358,6 +360,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Plotting into axes inside a matplotlib SubFigure**: the plot methods of
+  `MultinomialChoiceModel`, `CovariateChoiceModel`, `PlaceFieldModel` and
+  `PositionDecoder` that accept `ax` called `tight_layout` on `ax.figure`, which
+  is the SubFigure (no `tight_layout`) and raised `AttributeError`; they now
+  use the root Figure.
 - **Fresh clones install**: the `neurospatial` source no longer points at a
   sibling `../neurospatial` checkout; uv resolves it from a git commit that
   declares version 0.8.0 (neurospatial 0.8.0 is not on PyPI yet, so pip users

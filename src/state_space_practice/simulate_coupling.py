@@ -8,6 +8,7 @@ enables ``jax_enable_x64``).
 
 import jax
 import jax.numpy as jnp
+from jax import Array
 from jax.nn import sigmoid
 
 from state_space_practice.coupling_model import (
@@ -72,7 +73,7 @@ def simulate_coupling(
         jnp.diag(process_covariance)
     )
 
-    def step(x, w):
+    def step(x: Array, w: Array) -> tuple[Array, Array]:
         x_next = transition_matrix @ x + w
         return x_next, x_next
 

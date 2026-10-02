@@ -27,13 +27,14 @@ from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
+from numpy.typing import NDArray
 
 from state_space_practice.multinomial_choice import (
     ChoiceFilterResult,
@@ -46,12 +47,19 @@ from state_space_practice.parameter_transforms import (
     UNCONSTRAINED,
     UNIT_INTERVAL,
 )
+from state_space_practice.sgd_fitting import SGDParams, SGDParamSpec
 from state_space_practice.utils import (
+    _root_figure,
     psd_solve,
     symmetrize,
     typed_jit,
     validate_choice_indices,
 )
+
+if TYPE_CHECKING:
+    import optax
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 logger = logging.getLogger(__name__)
 
@@ -344,7 +352,9 @@ def _covariate_choice_filter_jit(
     Q = jnp.eye(k_free) * process_noise
     A = jnp.eye(k_free) * decay
 
-    def _step(carry, inputs):
+    def _step(
+        carry: tuple[Array, Array, Array], inputs: tuple[Array, Array, Array]
+    ) -> tuple[tuple[Array, Array, Array], tuple[Array, Array, Array, Array, Array]]:
         filt_mean, filt_cov, total_ll = carry
         choice_t, u_t, z_t = inputs
 
@@ -408,7 +418,9 @@ def _rts_smoother_pass_with_predictions(
     exactly to ``rts_backward_scan``.
     """
 
-    def _smooth_step(carry, inputs):
+    def _smooth_step(
+        carry: tuple[Array, Array], inputs: tuple[Array, Array, Array, Array]
+    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
         next_sm_mean, next_sm_cov = carry
         f_mean, f_cov, p_mean_next, p_cov_next = inputs
         gain = psd_solve(p_cov_next, A @ f_cov).T
@@ -632,7 +644,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
 
     # --- Hooks (see MultinomialChoiceModel) ---
 
-    def _filter_kwargs(self) -> dict:
+    def _filter_kwargs(self) -> dict[str, Any]:
         kwargs = super()._filter_kwargs()
         kwargs.update(
             covariates=self._covariates,
@@ -643,7 +655,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         )
         return kwargs
 
-    def _run_filter(self, choices: Array, **overrides) -> ChoiceFilterResult:
+    def _run_filter(self, choices: Array, **overrides: Any) -> ChoiceFilterResult:
         kwargs = {**self._filter_kwargs(), **overrides}
         return covariate_choice_filter(choices, self.n_options, **kwargs)
 
@@ -710,7 +722,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         self,
         choices: Array,
         log_likelihoods: list[float],
-        last_accepted: dict | None,
+        last_accepted: dict[str, Any] | None,
     ) -> float:
         """Final E-step, kept only if it did not decrease the log-likelihood.
 
@@ -812,7 +824,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         choices: ArrayLike,
         covariates: ArrayLike | None = None,
         obs_covariates: ArrayLike | None = None,
-        optimizer: object | None = None,
+        optimizer: optax.GradientTransformation | None = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
@@ -849,7 +861,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
 
     # --- SGDFittableMixin protocol ---
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         params, spec = super()._build_param_spec()
         if self.learn_decay:
             params["decay"] = jnp.array(self.decay)
@@ -862,7 +874,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
             spec["obs_weights"] = UNCONSTRAINED
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, choices: Array) -> Array:
+    def _sgd_loss_fn(self, params: SGDParams, choices: Array) -> Array:
         # Model attributes are read only for parameters that are not being
         # optimized (see MultinomialChoiceModel._sgd_loss_fn).
         def _param(key: str, attr: str) -> Array:
@@ -899,7 +911,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         )
         return -result.marginal_log_likelihood
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         super()._store_sgd_params(params)
         if "decay" in params:
             self.decay = float(params["decay"])
@@ -972,7 +984,12 @@ class CovariateChoiceModel(MultinomialChoiceModel):
                 )
         return "\n".join(lines)
 
-    def plot_input_gains(self, option_labels=None, covariate_labels=None, ax=None):
+    def plot_input_gains(
+        self,
+        option_labels: list[str] | None = None,
+        covariate_labels: list[str] | None = None,
+        ax: Axes | None = None,
+    ) -> tuple[Figure, Axes]:
         """Bar plot of the learned input-gain matrix B.
 
         Requires the ``plot`` extra (matplotlib).
@@ -1012,7 +1029,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         if ax is None:
             fig, ax = plt.subplots(figsize=(6, 4))
         else:
-            fig = ax.figure
+            fig = _root_figure(ax)
 
         x = np.arange(d)
         width = 0.8 / k_free
@@ -1029,7 +1046,11 @@ class CovariateChoiceModel(MultinomialChoiceModel):
         fig.tight_layout()
         return fig, ax
 
-    def plot_summary(self, observed_choices=None, option_labels=None):
+    def plot_summary(
+        self,
+        observed_choices: ArrayLike | None = None,
+        option_labels: list[str] | None = None,
+    ) -> tuple[Figure, NDArray[np.object_]]:
         """3-panel diagnostic: values, input gains, convergence.
 
         Requires the ``plot`` extra (matplotlib).

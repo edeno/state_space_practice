@@ -21,19 +21,21 @@ import logging
 import math
 import warnings
 from functools import partial
-from typing import NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
-from jax.typing import ArrayLike
+from jax.typing import ArrayLike, DTypeLike
+from numpy.typing import NDArray
 
 from state_space_practice.exceptions import NotFittedError, StateSpaceWarning
 from state_space_practice.kalman import rts_backward_scan
 from state_space_practice.parameter_transforms import POSITIVE
-from state_space_practice.sgd_fitting import SGDFittableMixin
+from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.utils import (
+    _root_figure,
     psd_cholesky,
     psd_logdet,
     psd_solve,
@@ -42,13 +44,18 @@ from state_space_practice.utils import (
 )
 from state_space_practice.utils import validate_choice_indices as _validate_choices
 
+if TYPE_CHECKING:
+    import optax
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+
 # Backtracking step sizes tried by every Newton iteration (largest first).
 _NEWTON_STEP_SIZES = tuple(0.5**i for i in range(8))
 # Armijo sufficient-increase constant for the backtracking line search.
 _ARMIJO_C = 1e-4
 
 
-def _armijo_slack(dtype) -> float:
+def _armijo_slack(dtype: DTypeLike) -> float:
     """Relative round-off slack of the Armijo test in ``dtype``.
 
     ``1e-12`` in float64 and ``16 * eps`` in lower precision, where a
@@ -203,7 +210,7 @@ def _softmax_update_core(
     prior_cho = psd_cholesky(prior_cov)
     prior_precision = symmetrize(jax.scipy.linalg.cho_solve(prior_cho, eye_k))
 
-    def log_posterior(x):
+    def log_posterior(x: Array) -> Array:
         """Unnormalised log posterior at x, shape (..., K-1) -> (...)."""
         zeros = jnp.zeros(x.shape[:-1] + (1,), dtype=x.dtype)
         logits = beta * jnp.concatenate([zeros, x], axis=-1) + _obs_offset
@@ -212,7 +219,7 @@ def _softmax_update_core(
             "...i,ij,...j->...", delta, prior_precision, delta
         )
 
-    def newton_iteration(x, _):
+    def newton_iteration(x: Array, _: None) -> tuple[Array, None]:
         v = jnp.concatenate([zero_ref, x])
         p_free = jax.nn.softmax(beta * v + _obs_offset)[1:]
 
@@ -475,7 +482,9 @@ def _multinomial_choice_filter_jit(
     k_free = n_options - 1
     Q = jnp.eye(k_free, dtype=init_mean.dtype) * process_noise
 
-    def _step(carry, choice_t):
+    def _step(
+        carry: tuple[Array, Array, Array], choice_t: Array
+    ) -> tuple[tuple[Array, Array, Array], tuple[Array, Array, Array, Array, Array]]:
         filt_mean, filt_cov, total_ll = carry
 
         # Predict (random walk: A = I)
@@ -691,7 +700,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
 
     # --- Hooks: which filter to run, with which parameters ---
 
-    def _filter_kwargs(self) -> dict:
+    def _filter_kwargs(self) -> dict[str, Any]:
         """Keyword arguments selecting the current parameters for the filter.
 
         ``_run_filter`` and ``_run_smoother`` pass these on, after ``choices``
@@ -702,7 +711,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
             "inverse_temperature": self.inverse_temperature,
         }
 
-    def _run_filter(self, choices: Array, **overrides) -> ChoiceFilterResult:
+    def _run_filter(self, choices: Array, **overrides: Any) -> ChoiceFilterResult:
         """Forward filter at the current parameters; ``overrides`` replace any."""
         kwargs = {**self._filter_kwargs(), **overrides}
         return multinomial_choice_filter(choices, self.n_options, **kwargs)
@@ -737,7 +746,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         """Current-parameter summary for the verbose per-iteration log line."""
         return f"beta={self.inverse_temperature:.3f}, Q={self.process_noise:.6f}"
 
-    def _restore_parameters(self, snapshot: dict) -> None:
+    def _restore_parameters(self, snapshot: dict[str, Any]) -> None:
         for attr, value in snapshot.items():
             setattr(self, attr, value)
 
@@ -757,7 +766,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         self,
         choices: Array,
         log_likelihoods: list[float],
-        last_accepted: dict | None,
+        last_accepted: dict[str, Any] | None,
     ) -> float:
         """Sync ``_smoother_result`` / ``log_likelihood_`` to the final parameters.
 
@@ -896,7 +905,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         log = logging.getLogger(type(self).__module__)
         log_likelihoods: list[float] = []
         converged = False
-        last_accepted: dict | None = None
+        last_accepted: dict[str, Any] | None = None
 
         for iteration in range(max_iter):
             # E-step: run smoother with current parameters
@@ -955,7 +964,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
     def fit_sgd(
         self,
         choices: ArrayLike,
-        optimizer: object | None = None,
+        optimizer: optax.GradientTransformation | None = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
@@ -987,7 +996,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
     def _fit_sgd_validated(
         self,
         choices_arr: Array,
-        optimizer: object | None,
+        optimizer: optax.GradientTransformation | None,
         num_steps: int,
         verbose: bool,
         convergence_tol: float | None,
@@ -1009,9 +1018,9 @@ class MultinomialChoiceModel(SGDFittableMixin):
             raise NotFittedError("Model must be fitted before accessing _n_timesteps.")
         return self._n_trials
 
-    def _build_param_spec(self) -> tuple[dict, dict]:
-        params: dict = {}
-        spec: dict = {}
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
+        params: SGDParams = {}
+        spec: SGDParamSpec = {}
         if self.learn_process_noise:
             params["process_noise"] = jnp.array(self.process_noise)
             spec["process_noise"] = POSITIVE
@@ -1020,7 +1029,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
             spec["inverse_temperature"] = POSITIVE
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, choices: Array) -> Array:
+    def _sgd_loss_fn(self, params: SGDParams, choices: Array) -> Array:
         # Read the model attribute only when the parameter is not optimized
         # (not ``params.get(key, self.attr)``, which reads it regardless):
         # fit_sgd reuses a compiled step only while the attributes the loss
@@ -1040,7 +1049,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         )
         return -result.marginal_log_likelihood
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         if "process_noise" in params:
             self.process_noise = float(params["process_noise"])
         if "inverse_temperature" in params:
@@ -1101,7 +1110,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         decreases.
         """
 
-        def _eval_beta(beta):
+        def _eval_beta(beta: Array) -> Array:
             result = self._run_filter(choices, inverse_temperature=beta)
             return result.marginal_log_likelihood
 
@@ -1192,7 +1201,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
             self._n_trials
         )
 
-    def compare_to_null(self) -> dict:
+    def compare_to_null(self) -> dict[str, Any]:
         """Compare fitted model to a null (uniform 1/K) model.
 
         Returns
@@ -1243,12 +1252,18 @@ class MultinomialChoiceModel(SGDFittableMixin):
 
     # --- Plotting ---
 
-    def _resolve_option_labels(self, option_labels):
+    def _resolve_option_labels(self, option_labels: list[str] | None) -> list[str]:
         if option_labels is None:
             return [f"Option {i}" for i in range(self.n_options)]
         return option_labels
 
-    def _plot_smoothed_values(self, ax, option_labels, title, legend_fontsize):
+    def _plot_smoothed_values(
+        self,
+        ax: Axes,
+        option_labels: list[str],
+        title: str,
+        legend_fontsize: float,
+    ) -> None:
         """Draw smoothed relative values with 95% bands on ``ax``."""
         res = self._check_fitted("_plot_smoothed_values")
         vals = np.array(res.smoothed_values)
@@ -1274,7 +1289,12 @@ class MultinomialChoiceModel(SGDFittableMixin):
         ax.set_title(title)
         ax.legend(fontsize=legend_fontsize)
 
-    def plot_values(self, observed_choices=None, option_labels=None, ax=None):
+    def plot_values(
+        self,
+        observed_choices: ArrayLike | None = None,
+        option_labels: list[str] | None = None,
+        ax: NDArray[np.object_] | None = None,
+    ) -> tuple[Figure, NDArray[np.object_]]:
         """Plot smoothed option values and choice probabilities.
 
         Parameters
@@ -1302,7 +1322,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
             fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
         else:
             axes = np.atleast_1d(ax)
-            fig = axes[0].figure
+            fig = _root_figure(axes[0])
 
         # Top: latent values with CI
         self._plot_smoothed_values(axes[0], option_labels, "Smoothed Option Values", 8)
@@ -1330,7 +1350,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         fig.tight_layout()
         return fig, axes
 
-    def plot_convergence(self, ax=None):
+    def plot_convergence(self, ax: Axes | None = None) -> tuple[Figure, Axes]:
         """Plot EM log-likelihood convergence.
 
         Returns
@@ -1345,7 +1365,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         if ax is None:
             fig, ax = plt.subplots(figsize=(6, 4))
         else:
-            fig = ax.figure
+            fig = _root_figure(ax)
 
         ax.plot(
             range(1, len(self.log_likelihood_history_) + 1),
@@ -1359,7 +1379,11 @@ class MultinomialChoiceModel(SGDFittableMixin):
         fig.tight_layout()
         return fig, ax
 
-    def plot_summary(self, observed_choices=None, option_labels=None):
+    def plot_summary(
+        self,
+        observed_choices: ArrayLike | None = None,
+        option_labels: list[str] | None = None,
+    ) -> tuple[Figure, NDArray[np.object_]]:
         """3-panel diagnostic: values, convergence, probabilities.
 
         Returns

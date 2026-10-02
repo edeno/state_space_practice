@@ -6,7 +6,7 @@ See docs/hamiltonian_architecture.md for why this family has no
 linear-Gaussian EM integration and is fit by SGD only.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -27,6 +27,9 @@ from state_space_practice.parameter_transforms import (
     frozen,
 )
 from state_space_practice.utils import stabilize_covariance, validate_scalar
+
+if TYPE_CHECKING:
+    import optax
 
 
 class HamiltonianLFPModel(HamiltonianModelBase):
@@ -151,7 +154,7 @@ class HamiltonianLFPModel(HamiltonianModelBase):
     def fit_sgd(
         self,
         observations: ArrayLike,
-        optimizer: object | None = None,
+        optimizer: "optax.GradientTransformation | None" = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
@@ -242,7 +245,7 @@ class HamiltonianLFPModel(HamiltonianModelBase):
         lfp_data: Array,
         use_filter: bool = True,
         l2_reg: float = 1e-4,
-        **kwargs,
+        **kwargs: Any,
     ) -> Array:
         if use_filter:
             _, _, lls = self._filter_jit(lfp_data, params)

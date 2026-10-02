@@ -8,7 +8,7 @@ linear-Gaussian EM integration and is fit by SGD only.
 """
 
 import warnings
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -37,6 +37,9 @@ from state_space_practice.utils import (
     validate_count_array,
     validate_scalar,
 )
+
+if TYPE_CHECKING:
+    import optax
 
 
 class JointHamiltonianModel(HamiltonianModelBase):
@@ -256,7 +259,7 @@ class JointHamiltonianModel(HamiltonianModelBase):
         self,
         lfp_obs: ArrayLike,
         spike_obs: ArrayLike,
-        optimizer: object | None = None,
+        optimizer: "optax.GradientTransformation | None" = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
@@ -357,7 +360,7 @@ class JointHamiltonianModel(HamiltonianModelBase):
         spike_data: Array,
         use_filter: bool = True,
         l2_reg: float = 1e-4,
-        **kwargs,
+        **kwargs: Any,
     ) -> Array:
         if use_filter:
             _, _, lls = self._filter_jit((lfp_data, spike_data), params)

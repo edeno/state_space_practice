@@ -90,7 +90,7 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import jax
 import jax.numpy as jnp
@@ -117,6 +117,8 @@ from state_space_practice.point_process_kalman import (
 )
 from state_space_practice.sgd_fitting import (
     SGDFittableMixin,
+    SGDParams,
+    SGDParamSpec,
     reconstruct_per_state_array,
 )
 from state_space_practice.switching_kalman import (
@@ -143,6 +145,9 @@ from state_space_practice.utils import (
     validate_probability_vector,
     validate_transition_matrix,
 )
+
+if TYPE_CHECKING:
+    import optax
 
 logger = logging.getLogger(__name__)
 
@@ -174,12 +179,14 @@ class SpikeObsParams:
     baseline: Array
     weights: Array
 
-    def tree_flatten(self):
+    def tree_flatten(self) -> tuple[tuple[Array, Array], None]:
         """Flatten for JAX pytree registration."""
         return (self.baseline, self.weights), None
 
     @classmethod
-    def tree_unflatten(cls, aux_data, children):
+    def tree_unflatten(
+        cls, aux_data: None, children: tuple[Array, Array]
+    ) -> SpikeObsParams:
         """Unflatten for JAX pytree registration."""
         baseline, weights = children
         return cls(baseline=baseline, weights=weights)
@@ -1041,7 +1048,9 @@ def _armijo_line_search(
     directional_derivative = jnp.dot(gradient, delta)
     is_descent_direction = directional_derivative > 0.0
 
-    def line_search_step(carry, _):
+    def line_search_step(
+        carry: tuple[Array, Array], _: None
+    ) -> tuple[tuple[Array, Array], None]:
         alpha, found = carry
         # Under tracing loss_fn is evaluated every iteration; once a step is
         # found, `where` selects the cached current_loss (it does not skip the
@@ -1352,7 +1361,7 @@ def _single_neuron_glm_step(
     )
 
     # Define loss function for line search
-    def loss_fn(p):
+    def loss_fn(p: Array) -> Array:
         eta_trial = design_matrix @ p
         mu_trial = jnp.exp(_exp_safe_clip(eta_trial)) * dt
         weights_trial = p[1:]
@@ -1742,10 +1751,14 @@ def _second_order_newton_iterations(
     neuron-iterations whose Newton direction fell back to the gradient.
     """
 
-    def iterate_all_neurons(carry, _):
+    def iterate_all_neurons(
+        carry: tuple[Array, Array], _: None
+    ) -> tuple[tuple[Array, Array], Array]:
         baselines, weights = carry
 
-        def update_neuron(b, w, y_n, bp):
+        def update_neuron(
+            b: Array, w: Array, y_n: Array, bp: Array
+        ) -> tuple[Array, Array, Array]:
             return _single_neuron_glm_step_second_order(
                 b,
                 w,
@@ -1820,10 +1833,14 @@ def _mixture_newton_iterations(
     for :func:`update_spike_glm_params_mixture`.
     """
 
-    def iterate_all_neurons(carry, _):
+    def iterate_all_neurons(
+        carry: tuple[Array, Array], _: None
+    ) -> tuple[tuple[Array, Array], Array]:
         baselines, weights = carry
 
-        def update_neuron(b, w, y_n, bp):
+        def update_neuron(
+            b: Array, w: Array, y_n: Array, bp: Array
+        ) -> tuple[Array, Array, Array]:
             return _single_neuron_glm_step_second_order_mixture(
                 b,
                 w,
@@ -1985,10 +2002,14 @@ def update_spike_glm_params(
     else:
         # Run Newton iterations for all neurons (plug-in)
         # vmap directly over neuron-axis data.
-        def iterate_all_neurons(carry, _):
+        def iterate_all_neurons(
+            carry: tuple[Array, Array], _: None
+        ) -> tuple[tuple[Array, Array], Array]:
             baselines, weights = carry
 
-            def update_neuron(b, w, y_n):
+            def update_neuron(
+                b: Array, w: Array, y_n: Array
+            ) -> tuple[Array, Array, Array]:
                 return _single_neuron_glm_step(
                     b, w, y_n, smoother_mean, dt, time_weights, weight_l2
                 )
@@ -3358,7 +3379,7 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         self,
         spikes: Array,
         key: Array | None = None,
-        optimizer: object | None = None,
+        optimizer: optax.GradientTransformation | None = None,
         num_steps: int = 200,
         verbose: bool = False,
         convergence_tol: float | None = None,
@@ -3420,15 +3441,15 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
                 "Call fit_sgd(spikes, key=...) to initialize parameters."
             )
 
-    def _shared_sgd_param_spec(self) -> tuple[dict, dict]:
+    def _shared_sgd_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         """SGD parameters every switching point-process model optimizes.
 
         Spike GLM parameters, the discrete transition matrix, the initial mean
         and the per-state initial covariances, each gated by its update flag.
         Subclasses add their model-specific dynamics parameters.
         """
-        params: dict = {}
-        spec: dict = {}
+        params: SGDParams = {}
+        spec: SGDParamSpec = {}
 
         if self.update_spike_params:
             params["spike_baseline"] = self.spike_params.baseline
@@ -3452,7 +3473,7 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
 
         return params, spec
 
-    def _sgd_loss_fn(self, params: dict, spikes: Array) -> Array:
+    def _sgd_loss_fn(self, params: SGDParams, spikes: Array) -> Array:
         """Negative marginal LL (plus the EM M-step's penalties) for SGD.
 
         Subclasses that optimize structured dynamics reconstruct the per-state
@@ -3513,7 +3534,7 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
 
         return loss
 
-    def _store_sgd_params(self, params: dict) -> None:
+    def _store_sgd_params(self, params: SGDParams) -> None:
         """Store the shared SGD parameters; subclasses add their own after."""
         if "discrete_transition_matrix" in params:
             self.discrete_transition_matrix = params["discrete_transition_matrix"]
@@ -4007,7 +4028,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         # Snapshot parameters for rollback on a rejected step
         import copy
 
-        def _snapshot_params() -> dict:
+        def _snapshot_params() -> dict[str, Any]:
             return {
                 "continuous_transition_matrix": self.continuous_transition_matrix.copy(),
                 "process_cov": self.process_cov.copy(),
@@ -4018,7 +4039,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
                 "spike_params": copy.deepcopy(self.spike_params),
             }
 
-        def _restore_params(params: dict) -> None:
+        def _restore_params(params: dict[str, Any]) -> None:
             self.continuous_transition_matrix = params["continuous_transition_matrix"]
             self.process_cov = params["process_cov"]
             self.discrete_transition_matrix = params["discrete_transition_matrix"]
@@ -4052,7 +4073,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
 
     # --- SGDFittableMixin protocol: model-specific dynamics parameters ---
 
-    def _build_param_spec(self):
+    def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         params, spec = self._shared_sgd_param_spec()
 
         if self.update_continuous_transition_matrix:
@@ -4071,7 +4092,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
 
         return params, spec
 
-    def _sgd_loss_fn(self, params, spikes):
+    def _sgd_loss_fn(self, params: SGDParams, spikes: Array) -> Array:
         # Reconstruct the per-state dynamics from the scaled-rotation blocks and
         # per-state Q parameters, then evaluate the shared filter loss.
         params_with_dynamics = dict(params)
@@ -4082,7 +4103,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         )
         return super()._sgd_loss_fn(params_with_dynamics, spikes)
 
-    def _reconstruct_A_from_blocks(self, params: dict) -> Array:
+    def _reconstruct_A_from_blocks(self, params: SGDParams) -> Array:
         """Rebuild the per-state transition matrix from scaled-rotation SGD blocks.
 
         A per-state block missing from ``params`` falls back to the current
@@ -4104,7 +4125,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
             axis=-1,
         )
 
-    def _store_sgd_params(self, params):
+    def _store_sgd_params(self, params: SGDParams) -> None:
         super()._store_sgd_params(params)
 
         if any(k.startswith("A_blocks_") for k in params):

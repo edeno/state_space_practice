@@ -34,6 +34,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
+from jax.typing import ArrayLike
 
 from state_space_practice.coupling_model import (
     CouplingModelParams,
@@ -118,8 +119,8 @@ def _regress_coupling_all_neurons(
 
 
 def fit_coupling_ekf(
-    spikes,
-    lfp,
+    spikes: ArrayLike,
+    lfp: ArrayLike,
     params: CouplingModelParams,
     sigma_beta: float = 5.0,
     max_newton_iter: int = 10,

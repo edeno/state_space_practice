@@ -5,16 +5,20 @@ import logging
 import operator
 import warnings
 from collections.abc import Callable
-from typing import Any, ParamSpec, TypeVar, cast
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg
 import numpy as np
 from jax import Array
-from jax.typing import ArrayLike
+from jax.typing import ArrayLike, DTypeLike
 
 from state_space_practice.exceptions import StateSpaceWarning
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +41,18 @@ def typed_jit(fun: Callable[_P, _R], /, **jit_kwargs: Any) -> Callable[_P, _R]:
     visible to the type checker.
     """
     return cast(Callable[_P, _R], jax.jit(fun, **jit_kwargs))
+
+
+def _root_figure(ax: Axes) -> Figure:
+    """The top-level Figure holding ``ax``, even when ``ax`` is in a SubFigure.
+
+    ``ax.figure`` is the innermost (Sub)Figure, which lacks ``tight_layout`` /
+    ``savefig``; plotting helpers that call those need the root.
+    """
+    fig = ax.get_figure(root=True)
+    if fig is None:
+        raise ValueError("ax is not attached to a matplotlib Figure.")
+    return fig
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +93,7 @@ def symmetrize(A: jax.Array) -> jax.Array:
 DEFAULT_RELATIVE_BOOST = 1e-12
 
 
-def _default_relative_boost(dtype) -> float:
+def _default_relative_boost(dtype: DTypeLike) -> float:
     """Relative diagonal shift used when a caller passes ``relative_boost=None``.
 
     ``max(DEFAULT_RELATIVE_BOOST, eps(dtype))``: ``1e-12`` in float64, and the
@@ -95,7 +111,7 @@ _SHIFT_DIAGONAL_FLOOR_RATIO = 1e-8
 def _stabilizing_shift(
     A_sym: jax.Array,
     diagonal_boost: float,
-    relative_boost: float | None,
+    relative_boost: float | jax.Array | None,
 ) -> jax.Array:
     """Per-diagonal-entry shift of :func:`psd_cholesky` (shape ``A.shape[:-1]``).
 
@@ -801,7 +817,9 @@ def differentiable_spectral_radius(matrices: ArrayLike) -> Array:
 
 
 @differentiable_spectral_radius.defjvp
-def _differentiable_spectral_radius_jvp(primals, tangents):
+def _differentiable_spectral_radius_jvp(
+    primals: tuple[ArrayLike], tangents: tuple[Array]
+) -> tuple[Array, Array]:
     (matrices,) = primals
     (d_matrices,) = tangents
     matrices = jnp.asarray(matrices)
@@ -809,7 +827,7 @@ def _differentiable_spectral_radius_jvp(primals, tangents):
     return radii, jnp.sum(grads * d_matrices, axis=(-2, -1))
 
 
-def _strongly_connected_blocks(matrix: np.ndarray, block_size: int) -> list:
+def _strongly_connected_blocks(matrix: np.ndarray, block_size: int) -> list[np.ndarray]:
     """Group ``block_size`` diagonal blocks into strongly connected components.
 
     Block ``(i, j)`` is an edge when it has any nonzero entry. The spectrum of
@@ -990,7 +1008,7 @@ def warn_if_not_positive_definite_in_graph(
     )
 
 
-def debug_print_if(condition: jax.Array, fmt: str, **fmt_kwargs) -> None:
+def debug_print_if(condition: jax.Array, fmt: str, **fmt_kwargs: Any) -> None:
     """Fire ``jax.debug.print(fmt, **fmt_kwargs)`` only when ``condition`` is True.
 
     Wraps ``jax.lax.cond`` so callers don't have to spell out the
@@ -1822,7 +1840,7 @@ def hmm_viterbi(
     log_transition_matrix = zero_preserving_log(transition_matrix)
 
     # Backward pass: accumulate best future scores and store argmax pointers
-    def _backward_step(best_next_score, t):
+    def _backward_step(best_next_score: Array, t: Array) -> tuple[Array, Array]:
         scores = log_transition_matrix + best_next_score + log_likelihoods[t + 1]
         best_next_state = jnp.argmax(scores, axis=1)
         best_next_score = jnp.max(scores, axis=1)
@@ -1839,7 +1857,7 @@ def hmm_viterbi(
     first_state = jnp.argmax(log_initial_probs + log_likelihoods[0] + best_second_score)
 
     # Forward pass: trace through pointers
-    def _forward_step(state, best_next_state):
+    def _forward_step(state: Array, best_next_state: Array) -> tuple[Array, Array]:
         next_state = best_next_state[state]
         return next_state, next_state
 

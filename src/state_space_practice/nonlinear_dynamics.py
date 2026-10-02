@@ -6,7 +6,6 @@ independent of the observation model.
 
 import operator
 from collections.abc import Callable
-from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -86,7 +85,7 @@ def leapfrog_step(
 def get_transition_jacobian(
     x: Array,
     params: dict[str, Array],
-    h_apply_fn: Callable,
+    h_apply_fn: Callable[[dict[str, Array], Array], Array],
     dt: float,
 ) -> Array:
     """Compute local Jacobian F = df/dx for EKF-style covariance propagation.
@@ -128,7 +127,7 @@ def ekf_predict_step(
     m_prev: Array,
     P_prev: Array,
     params: dict[str, Array],
-    h_apply_fn: Callable,
+    h_apply_fn: Callable[[dict[str, Array], Array], Array],
     Q: Array,
     dt: float,
 ) -> tuple[Array, Array]:
@@ -143,7 +142,7 @@ def ekf_predict_step_with_jacobian(
     m_prev: Array,
     P_prev: Array,
     params: dict[str, Array],
-    h_apply_fn: Callable,
+    h_apply_fn: Callable[[dict[str, Array], Array], Array],
     Q: Array,
     dt: float,
 ) -> tuple[Array, Array, Array]:
@@ -159,12 +158,12 @@ def ekf_predict_step_with_jacobian(
 def _leapfrog_step_and_jacobian(
     x: Array,
     params: dict[str, Array],
-    h_apply_fn: Callable,
+    h_apply_fn: Callable[[dict[str, Array], Array], Array],
     dt: float,
 ) -> tuple[Array, Array]:
     """Compute leapfrog step and its Jacobian in a single pass."""
 
-    def step_fn(state):
+    def step_fn(state: Array) -> Array:
         return leapfrog_step(state, params, h_apply_fn, dt)
 
     x = _validate_state_vector(x)
@@ -254,7 +253,7 @@ def apply_mlp(params: dict[str, Array], x: Array) -> Array:
     q, p = x[:n], x[n:]
     n_layers = _mlp_layer_count(params, input_dim=n)
 
-    def mlp_forward(input_vec):
+    def mlp_forward(input_vec: Array) -> Array:
         curr = input_vec
         for i in range(n_layers - 1):
             curr = jnp.dot(curr, params[f"w{i}"]) + params[f"b{i}"]
@@ -265,4 +264,4 @@ def apply_mlp(params: dict[str, Array], x: Array) -> Array:
     h_prior = 0.5 * jnp.sum(p**2) + 0.5 * (omega**2) * jnp.sum(q**2)
     h_mlp = mlp_forward(q) - mlp_forward(jnp.zeros_like(q))
 
-    return cast(Array, h_prior + h_mlp)
+    return h_prior + h_mlp

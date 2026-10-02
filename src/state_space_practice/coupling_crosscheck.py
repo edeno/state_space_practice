@@ -30,13 +30,16 @@ Requires float64 and the ``coupling`` extra (``polyagamma``).
 """
 
 import operator
+from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
 from state_space_practice.coupling_ekf import fit_coupling_ekf
 from state_space_practice.coupling_model import (
     CouplingModelParams,
+    SimulatedCoupling,
     smooth_latent_from_lfp,
 )
 from state_space_practice.coupling_pg import fit_coupling_pg
@@ -69,7 +72,7 @@ def scale_coupling(params: CouplingModelParams, scale: float) -> CouplingModelPa
     )
 
 
-def _score(post: CouplingPosterior, sim) -> dict:
+def _score(post: CouplingPosterior, sim: SimulatedCoupling) -> dict[str, float]:
     """Score one posterior against simulated ground truth."""
     mask = np.asarray(sim.coupling_mask)
     true_real = np.asarray(sim.beta_real_true)
@@ -117,7 +120,9 @@ def _score(post: CouplingPosterior, sim) -> dict:
     }
 
 
-def _mean_disagreement(ekf: CouplingPosterior, pg: CouplingPosterior) -> dict:
+def _mean_disagreement(
+    ekf: CouplingPosterior, pg: CouplingPosterior
+) -> dict[str, float]:
     """EKF-vs-PG posterior-mean disagreement on the PG Monte Carlo error scale.
 
     Returns ``ekf_pg_mean_maxdiff`` (max abs mean difference over all real and
@@ -153,7 +158,7 @@ def _mean_disagreement(ekf: CouplingPosterior, pg: CouplingPosterior) -> dict:
     return out
 
 
-def _latent_plugin_diagnostics(sim) -> dict:
+def _latent_plugin_diagnostics(sim: SimulatedCoupling) -> dict[str, float]:
     """Compare the shared plug-in smoother mean to the simulator's true latent."""
     if not all(hasattr(sim, name) for name in ("latent_true", "lfp", "params")):
         return {}
@@ -187,13 +192,13 @@ def _latent_plugin_diagnostics(sim) -> dict:
 
 def run_crosscheck(
     base_params: CouplingModelParams,
-    scales,
+    scales: Iterable[float],
     n_time: int,
     n_replicates: int,
     seed: int = 0,
     pg_n_iter: int = 400,
     pg_burn_in: int = 200,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Sweep coupling strength and compare EKF vs PG posteriors on identical data.
 
     Parameters
@@ -278,7 +283,7 @@ def run_crosscheck(
     return records
 
 
-def aggregate(records: list[dict]) -> dict:
+def aggregate(records: list[dict[str, Any]]) -> dict[float, dict[str, Any]]:
     """Average each metric across replicates, grouped by coupling magnitude.
 
     Returns a dict keyed by rounded ``coupling_mag`` -> {method -> {metric -> mean},
@@ -288,7 +293,7 @@ def aggregate(records: list[dict]) -> dict:
     if not records:
         raise ValueError("records must contain at least one crosscheck result.")
 
-    by_mag: dict = {}
+    by_mag: dict[float, list[dict[str, Any]]] = {}
     for record in records:
         by_mag.setdefault(round(record["coupling_mag"], 4), []).append(record)
     out = {}
@@ -317,7 +322,7 @@ def aggregate(records: list[dict]) -> dict:
     return out
 
 
-def _mean_ignore_nan(values) -> float:
+def _mean_ignore_nan(values: npt.ArrayLike) -> float:
     """Mean of finite values, or NaN when every value is undefined."""
     values = np.asarray(values, dtype=float)
     finite = values[np.isfinite(values)]
