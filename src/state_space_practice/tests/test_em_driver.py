@@ -11,6 +11,7 @@ from state_space_practice.em_driver import (
     run_em,
     snapshot_attributes,
 )
+from state_space_practice.exceptions import NonFiniteLikelihoodError
 from state_space_practice.fitted_state import FittedAttribute, is_set
 
 
@@ -187,7 +188,8 @@ def test_first_nonfinite_policies(policy):
 
 def test_first_nonfinite_raise_policy():
     model = ScriptedModel([np.inf])
-    with pytest.raises(ValueError, match="Non-finite"):
+    # A ValueError subclass, so existing ``except ValueError`` callers still match.
+    with pytest.raises(NonFiniteLikelihoodError, match="Non-finite"):
         model.run(max_iter=3, tol=1e-4, on_first_nonfinite="raise")
 
 

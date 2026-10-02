@@ -37,7 +37,7 @@ from state_space_practice.em_driver import (
     run_em,
     snapshot_attributes,
 )
-from state_space_practice.exceptions import NotFittedError
+from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedError
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.oscillator_utils import (
     DirectedInfluenceDynamicsMixin,
@@ -683,7 +683,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
                 logger.info(
                     f"Restart {restart + 1}/{n_restarts}: final LL={final_ll:.4f}"
                 )
-            except ValueError:
+            except NonFiniteLikelihoodError:
                 logger.warning(
                     f"Restart {restart + 1}/{n_restarts}: failed (non-finite LL)"
                 )

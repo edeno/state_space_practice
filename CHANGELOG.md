@@ -421,6 +421,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Multi-restart switching point-process fits no longer hide real errors**:
+  `fit(n_restarts>1)` treated every `ValueError` (e.g. from initialization or
+  the M-step) as a non-finite-likelihood restart and finally reported "All N
+  restarts failed with non-finite log-likelihood". It now skips only restarts
+  whose first E-step is non-finite; `run_em` raises the new
+  `NonFiniteLikelihoodError` (a `ValueError` subclass, exported at package
+  level) for that case, and other errors propagate.
 - **Plotting into axes inside a matplotlib SubFigure**: the plot methods of
   `MultinomialChoiceModel`, `CovariateChoiceModel`, `PlaceFieldModel` and
   `PositionDecoder` that accept `ax` called `tight_layout` on `ax.figure`, which

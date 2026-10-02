@@ -8,7 +8,7 @@ Filter all library warnings at once with::
     warnings.simplefilter("ignore", StateSpaceWarning)
 """
 
-__all__ = ["NotFittedError", "StateSpaceWarning"]
+__all__ = ["NonFiniteLikelihoodError", "NotFittedError", "StateSpaceWarning"]
 
 
 class StateSpaceWarning(UserWarning):
@@ -24,4 +24,13 @@ class NotFittedError(RuntimeError):
 
     Call ``fit`` / ``fit_sgd`` (or the model's initialization method) before
     using the method that raised.
+    """
+
+
+class NonFiniteLikelihoodError(ValueError):
+    """Raised when EM's first E-step returns a non-finite log-likelihood.
+
+    The starting parameters are unusable. A ``ValueError`` subclass, so
+    ``except ValueError`` handlers keep matching; catch this class to tell a
+    numerically failed fit apart from invalid input.
     """

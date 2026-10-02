@@ -28,6 +28,7 @@ from typing import Any, Literal
 
 import numpy as np
 
+from state_space_practice.exceptions import NonFiniteLikelihoodError
 from state_space_practice.fitted_state import is_set
 from state_space_practice.utils import check_converged
 
@@ -181,7 +182,7 @@ def run_em(
         instead of divergence.
     on_first_nonfinite : {"break", "raise", "clear"}
         What to do when an E-step is non-finite before any step was accepted:
-        warn and stop, raise ``ValueError``, or call ``clear_state``, warn and
+        warn and stop, raise ``NonFiniteLikelihoodError``, or call ``clear_state``, warn and
         stop.  Once a step has been accepted, a non-finite E-step always rolls
         back to it, warns, and stops, whatever this policy.
     clear_state : callable or None
@@ -231,8 +232,10 @@ def run_em(
     ValueError
         If ``max_iter < 1``, ``on_first_nonfinite`` is not one of the three
         policies, or ``clear_state`` is given without (or missing with) the
-        ``"clear"`` policy -- all checked before any E-step.  Also raised by
-        the ``"raise"`` policy when the first E-step is non-finite.
+        ``"clear"`` policy -- all checked before any E-step.
+    NonFiniteLikelihoodError
+        Under the ``"raise"`` policy, when the first E-step is non-finite (a
+        ``ValueError`` subclass).
     """
     if max_iter < 1:
         raise ValueError(f"max_iter must be at least 1, got {max_iter}.")
@@ -289,7 +292,7 @@ def run_em(
             bad_ll = log_likelihoods.pop()
             if last_accepted is None:
                 if on_first_nonfinite == "raise":
-                    raise ValueError(
+                    raise NonFiniteLikelihoodError(
                         f"Non-finite log-likelihood at iteration {iteration + 1}: "
                         f"{bad_ll}. This may indicate numerical instability."
                     )

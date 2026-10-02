@@ -8,7 +8,11 @@ import textwrap
 import pytest
 
 import state_space_practice as ssp
-from state_space_practice import NotFittedError, StateSpaceWarning
+from state_space_practice import (
+    NonFiniteLikelihoodError,
+    NotFittedError,
+    StateSpaceWarning,
+)
 
 
 def _run_python(code: str, **env_overrides: str) -> subprocess.CompletedProcess:
@@ -34,7 +38,12 @@ def _run_python(code: str, **env_overrides: str) -> subprocess.CompletedProcess:
 class TestPublicAPI:
     def test_all_matches_lazy_registry(self):
         lazy = set(ssp._LAZY_API)
-        eager = {"__version__", "NotFittedError", "StateSpaceWarning"}
+        eager = {
+            "__version__",
+            "NonFiniteLikelihoodError",
+            "NotFittedError",
+            "StateSpaceWarning",
+        }
         assert set(ssp.__all__) == lazy | eager
         assert len(ssp.__all__) == len(set(ssp.__all__))
 
@@ -63,6 +72,7 @@ class TestPublicAPI:
     def test_exception_hierarchy(self):
         assert issubclass(StateSpaceWarning, UserWarning)
         assert issubclass(NotFittedError, RuntimeError)
+        assert issubclass(NonFiniteLikelihoodError, ValueError)
 
 
 class TestImportSideEffects:
