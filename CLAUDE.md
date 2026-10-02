@@ -38,7 +38,7 @@ uv run pytest --cov=src/state_space_practice --cov-report=term-missing
 uv run ruff check src/
 uv run ruff format src/
 
-# Run type checker (checks the modules listed in [tool.mypy] files, as CI does)
+# Run type checker (whole package except tests, as CI does)
 uv run mypy
 ```
 

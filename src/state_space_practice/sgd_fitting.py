@@ -16,13 +16,15 @@ Optional hooks: ``_check_sgd_initialized`` (default no-op) and
 ``_prepare_sgd_data`` (default: pass the data through unchanged).
 """
 
+from __future__ import annotations
+
 import contextlib
 import hashlib
 import logging
 import math
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Protocol, cast
 
 import jax
 import jax.numpy as jnp
@@ -31,6 +33,7 @@ import optax
 from jax import Array
 
 from state_space_practice.parameter_transforms import (
+    ParameterTransform,
     transform_to_constrained,
     transform_to_unconstrained,
 )
@@ -54,7 +57,7 @@ _MAX_CACHED_STEPS_PER_MODEL = 4
 #: not be hashable) and emptied by a ``weakref.finalize`` when the model is
 #: collected; the compiled steps only hold a weak reference to their model.
 #: Kept outside the instance so models stay deep-copyable and picklable.
-_SGD_STEP_CACHE: dict[int, dict[Hashable, "_CompiledSGDStep"]] = {}
+_SGD_STEP_CACHE: dict[int, dict[Hashable, _CompiledSGDStep]] = {}
 
 _MISSING = object()
 
@@ -351,6 +354,13 @@ def _build_sgd_step(
     return entry
 
 
+class _TimeSeriesModel(Protocol):
+    """Readable sequence length, implemented as a property or an attribute."""
+
+    @property
+    def _n_timesteps(self) -> int: ...
+
+
 class SGDFittableMixin:
     """Mixin providing fit_sgd() for state-space models.
 
@@ -377,6 +387,23 @@ class SGDFittableMixin:
     #: not merge with) the parent's mapping; extend it explicitly with
     #: ``{**Parent._sgd_param_attrs, "key": "attr"}``.
     _sgd_param_attrs: ClassVar[Mapping[str, str]] = {}
+
+    converged_: bool | None = None
+    loss_history_: list[float] | None = None
+    log_likelihood_history_: list[float] | None = None
+
+    def _build_param_spec(
+        self,
+    ) -> tuple[dict[str, Array], dict[str, ParameterTransform]]:
+        raise NotImplementedError
+
+    def _sgd_loss_fn(
+        self, params: dict[str, Array], *args: Any, **kwargs: Any
+    ) -> Array:
+        raise NotImplementedError
+
+    def _finalize_sgd(self, *args: Any, **kwargs: Any) -> None:
+        raise NotImplementedError
 
     def _check_sgd_initialized(self) -> None:
         return
@@ -533,7 +560,7 @@ class SGDFittableMixin:
             loss. When the final candidate is finite, the final entry is
             rewritten to the log likelihood of the stored final parameters.
         """
-        optimizer: object | None = kwargs.pop("optimizer", None)
+        optimizer: optax.GradientTransformation | None = kwargs.pop("optimizer", None)
         num_steps: int = kwargs.pop("num_steps", 200)
         verbose: bool = kwargs.pop("verbose", False)
         convergence_tol: float | None = kwargs.pop("convergence_tol", None)
@@ -557,7 +584,9 @@ class SGDFittableMixin:
             param_spec,
             include_non_trainable=False,
         )
-        n_timesteps = float(self._n_timesteps)
+        # Subclasses supply this readable member. Keep its structural contract
+        # separate from the mixin so no inherited descriptor blocks assignment.
+        n_timesteps = float(cast(_TimeSeriesModel, self)._n_timesteps)
         if not math.isfinite(n_timesteps) or n_timesteps <= 0.0:
             raise ValueError(
                 "_n_timesteps must be positive and finite for SGD fitting."

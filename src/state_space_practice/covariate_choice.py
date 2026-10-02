@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -305,18 +305,21 @@ def covariate_choice_filter(
         obs_cov_arr = jnp.zeros((choices_arr.shape[0], 1))
         obs_weights_arr = jnp.zeros((n_options, 1))
 
-    return _covariate_choice_filter_jit(
-        choices_arr,
-        n_options,
-        covariates_arr,
-        input_gain_arr,
-        obs_cov_arr,
-        obs_weights_arr,
-        process_noise,
-        inverse_temperature,
-        decay,
-        init_mean,
-        init_cov,
+    return cast(
+        ChoiceFilterResult,
+        _covariate_choice_filter_jit(
+            choices_arr,
+            n_options,
+            covariates_arr,
+            input_gain_arr,
+            obs_cov_arr,
+            obs_weights_arr,
+            process_noise,
+            inverse_temperature,
+            decay,
+            init_mean,
+            init_cov,
+        ),
     )
 
 
@@ -892,7 +895,7 @@ class CovariateChoiceModel(MultinomialChoiceModel):
             jnp.zeros(k_free),
             jnp.eye(k_free),
         )
-        return -result.marginal_log_likelihood
+        return cast(Array, -result.marginal_log_likelihood)
 
     def _store_sgd_params(self, params: dict) -> None:
         super()._store_sgd_params(params)

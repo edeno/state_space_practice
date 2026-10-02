@@ -21,6 +21,8 @@ References
    Neural Computation 16, 971-998.
 """
 
+from __future__ import annotations
+
 import copy
 import functools
 import logging
@@ -676,7 +678,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
                 )
                 continue
 
-        if best_state is None:
+        if best_state is None or best_lls is None:
             raise ValueError(
                 f"All {n_restarts} restarts failed with non-finite log-likelihood."
             )

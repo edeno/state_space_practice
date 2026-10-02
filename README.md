@@ -70,7 +70,7 @@ loaded on first access. Everything else lives in the submodules
 
 ```bash
 uv run ruff check src/ && uv run ruff format --check src/ notebooks/ scripts/
-uv run mypy                       # the type-clean modules listed in pyproject
+uv run mypy                       # all package modules, including untyped bodies
 uv run pytest -m "not slow"       # fast suite; drop -m for the full suite
 uvx pre-commit install            # ruff, ruff-format and nbstripout on commit
 ```

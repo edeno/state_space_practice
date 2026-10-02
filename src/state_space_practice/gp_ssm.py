@@ -26,6 +26,8 @@ Sarkka, S. & Solin, A. (2019). Applied Stochastic Differential Equations.
     Cambridge University Press. (Ch. 12.)
 """
 
+from __future__ import annotations
+
 import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
@@ -169,7 +171,7 @@ def matern32_discretize(
     r = lam_dt
     r2 = r * r
     q11_closed = variance * (1.0 - decay_sq * (1.0 + 2.0 * r + 2.0 * r2))
-    q11_poly = 16.0 / 405.0
+    q11_poly: Array | float = 16.0 / 405.0
     for coeff in (-2.0 / 15.0, 8.0 / 21.0, -8.0 / 9.0, 8.0 / 5.0, -2.0, 4.0 / 3.0):
         q11_poly = coeff + r * q11_poly
     q11_series = variance * r**3 * q11_poly

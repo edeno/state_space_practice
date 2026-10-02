@@ -1291,6 +1291,7 @@ class PlaceFieldModel(SGDFittableMixin):
         # it to the (n_time, n_neurons, n_neurons * n_basis_per_neuron) design matrix
         # (see _filter_design_matrix).
         Z_base = self._build_spline_basis_matrix(position, knots_x, knots_y)
+        assert self.n_basis_per_neuron is not None
         self.n_basis = self.n_neurons * self.n_basis_per_neuron
         if warm_start:
             self._warm_start_parameters(Z_base, spikes, warm_start_window)
@@ -1300,6 +1301,7 @@ class PlaceFieldModel(SGDFittableMixin):
         # Numerical sanity check: validate init_cov is PSD and warn if
         # the configuration is at risk of f32 NaN during the scan. Runs
         # once here so the EM loop's _e_step calls can skip re-validation.
+        assert self.init_cov is not None
         _validate_filter_numerics(self.init_cov, n_time=Z_base.shape[0])
 
         # Block-diagonal dispatch: the design structure (shared Z_base,
@@ -1499,6 +1501,7 @@ class PlaceFieldModel(SGDFittableMixin):
         # this is intentional for users who want to resume optimization
         # from a previous fit_sgd result without a warm-start reset.
         Z_base = self._build_spline_basis_matrix(position)
+        assert self.n_basis_per_neuron is not None
         self.n_basis = self.n_neurons * self.n_basis_per_neuron
         if warm_start:
             self._warm_start_parameters(Z_base, spikes, warm_start_window)
@@ -1509,6 +1512,7 @@ class PlaceFieldModel(SGDFittableMixin):
         # the configuration is at risk of f32 NaN during the scan. Runs
         # once here so the SGD loop's _sgd_loss_fn can skip re-validation
         # (the eigvalsh call is not jit-traceable anyway).
+        assert self.init_cov is not None
         _validate_filter_numerics(self.init_cov, n_time=Z_base.shape[0])
 
         # Block-diagonal dispatch: detect once before entering the SGD
@@ -1549,6 +1553,7 @@ class PlaceFieldModel(SGDFittableMixin):
         spec: dict = {}
 
         if self.update_process_cov:
+            assert self.process_cov is not None
             if self.process_noise_structure == "diagonal":
                 # Optimize per-basis-function variances
                 params["process_diag"] = jnp.diag(self.process_cov)
@@ -1560,10 +1565,13 @@ class PlaceFieldModel(SGDFittableMixin):
                 spec["process_scalar"] = POSITIVE
 
         if self.update_transition_matrix:
+            assert self.transition_matrix is not None
             params["transition_matrix"] = self.transition_matrix
             spec["transition_matrix"] = UNCONSTRAINED
 
         if self.update_init_state:
+            assert self.init_mean is not None
+            assert self.init_cov is not None
             params["init_mean"] = self.init_mean
             spec["init_mean"] = UNCONSTRAINED
             params["init_cov"] = self.init_cov
@@ -1572,6 +1580,11 @@ class PlaceFieldModel(SGDFittableMixin):
         return params, spec
 
     def _sgd_loss_fn(self, params: dict, design_matrix: Array, spikes: Array) -> Array:
+        assert self.transition_matrix is not None
+        assert self.init_mean is not None
+        assert self.init_cov is not None
+        assert self.process_cov is not None
+        assert self.n_basis is not None
         A = params.get("transition_matrix", self.transition_matrix)
         m0 = params.get("init_mean", self.init_mean)
         P0 = params.get("init_cov", self.init_cov)
@@ -1612,6 +1625,7 @@ class PlaceFieldModel(SGDFittableMixin):
         if "process_diag" in params:
             self.process_cov = jnp.diag(params["process_diag"])
         elif "process_scalar" in params:
+            assert self.n_basis is not None
             self.process_cov = jnp.eye(self.n_basis) * params["process_scalar"]
         if "transition_matrix" in params:
             self.transition_matrix = params["transition_matrix"]
@@ -1621,6 +1635,10 @@ class PlaceFieldModel(SGDFittableMixin):
             self.init_cov = params["init_cov"]
 
     def _finalize_sgd(self, design_matrix: Array, spikes: Array) -> None:
+        assert self.init_mean is not None
+        assert self.init_cov is not None
+        assert self.transition_matrix is not None
+        assert self.process_cov is not None
         (
             self.smoother_mean,
             self.smoother_cov,

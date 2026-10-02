@@ -128,39 +128,12 @@ exclude = ["notebooks/**", "scripts/**"]
 [tool.mypy]
 python_version = "3.10"
 mypy_path = "src"
-# Modules that type-check cleanly today; CI runs plain `mypy` over exactly these.
-# Add a module once its errors are fixed. `uv run mypy src/state_space_practice`
-# checks everything (the remaining errors are tracked in the CHANGELOG).
-files = [
-    "src/state_space_practice/__init__.py",
-    "src/state_space_practice/behavioral_uncertainty.py",
-    "src/state_space_practice/circular_stats.py",
-    "src/state_space_practice/coupling_ekf.py",
-    "src/state_space_practice/coupling_pg.py",
-    "src/state_space_practice/em_driver.py",
-    "src/state_space_practice/exceptions.py",
-    "src/state_space_practice/hamiltonian_core.py",
-    "src/state_space_practice/hamiltonian_joint.py",
-    "src/state_space_practice/hamiltonian_lfp.py",
-    "src/state_space_practice/hamiltonian_spikes.py",
-    "src/state_space_practice/hamiltonian_switching.py",
-    "src/state_space_practice/models.py",
-    "src/state_space_practice/nonlinear_dynamics.py",
-    "src/state_space_practice/oscillator_models.py",
-    "src/state_space_practice/oscillator_regularization.py",
-    "src/state_space_practice/preprocessing.py",
-    "src/state_space_practice/simulate/__init__.py",
-    "src/state_space_practice/simulate/scenarios.py",
-    "src/state_space_practice/simulate/simulate_switching_kalman.py",
-    "src/state_space_practice/simulate/simulate_switching_spikes.py",
-    "src/state_space_practice/simulate_coupling.py",
-    "src/state_space_practice/simulate_data.py",
-    "src/state_space_practice/temporal_rate_gp.py",
-]
+files = ["src/state_space_practice"]
 exclude = ["tests/"]
 # Analyse imported modules for types but only report errors in `files`.
 follow_imports = "silent"
 ignore_missing_imports = true
+check_untyped_defs = true
 warn_return_any = true
 warn_unused_ignores = true
 

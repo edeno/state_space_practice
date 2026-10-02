@@ -22,6 +22,7 @@ import logging
 import warnings
 from dataclasses import dataclass
 from functools import partial
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -796,7 +797,7 @@ def _kde_log_rate_jacobian(
             occupancy_tau,
         )
 
-    return jax.jacfwd(_log_rate_xy)(pos_xy)
+    return cast(Array, jax.jacfwd(_log_rate_xy)(pos_xy))
 
 
 def _bilinear_log_rate(
@@ -864,7 +865,7 @@ def _bilinear_log_rate_jacobian(
         return _bilinear_log_rate(xy, log_rate_maps, x_edges, y_edges, dx, dy)
 
     # jacfwd gives shape (n_neurons, 2) — Jacobian of vector output w.r.t. 2D input
-    return jax.jacfwd(_log_rate_xy)(pos_xy)
+    return cast(Array, jax.jacfwd(_log_rate_xy)(pos_xy))
 
 
 class DecoderResult:
@@ -1056,6 +1057,7 @@ def _run_filter_scan(
                 state, jax_log_rate_maps, jax_x_edges, jax_y_edges, grid_dx, grid_dy
             )
         if include_velocity:
+            assert _vel_pad is not None
             return jnp.concatenate([jac_pos, _vel_pad], axis=1)
         return jac_pos
 

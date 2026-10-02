@@ -21,7 +21,7 @@ import logging
 import math
 import warnings
 from functools import partial
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -451,13 +451,16 @@ def multinomial_choice_filter(
     else:
         init_cov = jnp.asarray(init_cov, dtype=dtype)
 
-    return _multinomial_choice_filter_jit(
-        choices_arr,
-        n_options,
-        process_noise,
-        inverse_temperature,
-        init_mean,
-        init_cov,
+    return cast(
+        ChoiceFilterResult,
+        _multinomial_choice_filter_jit(
+            choices_arr,
+            n_options,
+            process_noise,
+            inverse_temperature,
+            init_mean,
+            init_cov,
+        ),
     )
 
 
@@ -668,24 +671,25 @@ class MultinomialChoiceModel(SGDFittableMixin):
     def is_fitted(self) -> bool:
         return self._smoother_result is not None
 
-    def _check_fitted(self, method: str) -> None:
-        if not self.is_fitted:
+    def _check_fitted(self, method: str) -> ChoiceSmootherResult:
+        if self._smoother_result is None:
             raise NotFittedError(
                 f"{type(self).__name__}.{method}() called before fitting. "
                 f"Call model.fit(choices) first."
             )
+        return self._smoother_result
 
     @property
     def smoothed_values(self) -> Array:
         """Smoothed option values, shape (n_trials, K-1)."""
-        self._check_fitted("smoothed_values")
-        return self._smoother_result.smoothed_values
+        res = self._check_fitted("smoothed_values")
+        return res.smoothed_values
 
     @property
     def smoothed_covariances(self) -> Array:
         """Smoothed covariances, shape (n_trials, K-1, K-1)."""
-        self._check_fitted("smoothed_covariances")
-        return self._smoother_result.smoothed_covariances
+        res = self._check_fitted("smoothed_covariances")
+        return res.smoothed_covariances
 
     # --- Hooks: which filter to run, with which parameters ---
 
@@ -783,13 +787,12 @@ class MultinomialChoiceModel(SGDFittableMixin):
         )
 
         filt = self._run_filter(choices)
+        smoother = self._check_fitted("_populate_uncertainty")
 
         # Option values (full K with reference option appended)
         self.predicted_option_values_ = append_reference_option(filt.predicted_values)
         self.filtered_option_values_ = append_reference_option(filt.filtered_values)
-        self.smoothed_option_values_ = append_reference_option(
-            self._smoother_result.smoothed_values
-        )
+        self.smoothed_option_values_ = append_reference_option(smoother.smoothed_values)
 
         # Option variances (full K options)
         self.predicted_option_variances_ = option_variances_from_covariances(
@@ -799,7 +802,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
             filt.filtered_covariances
         )
         self.smoothed_option_variances_ = option_variances_from_covariances(
-            self._smoother_result.smoothed_covariances
+            smoother.smoothed_covariances
         )
 
         # Predicted choice entropy (including any observation-covariate offsets)
@@ -1004,6 +1007,8 @@ class MultinomialChoiceModel(SGDFittableMixin):
 
     @property
     def _n_timesteps(self) -> int:
+        if self._n_trials is None:
+            raise NotFittedError("Model must be fitted before accessing _n_timesteps.")
         return self._n_trials
 
     def _build_param_spec(self) -> tuple[dict, dict]:
@@ -1035,7 +1040,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
             jnp.zeros(k_free),
             jnp.eye(k_free),
         )
-        return -result.marginal_log_likelihood
+        return cast(Array, -result.marginal_log_likelihood)
 
     def _store_sgd_params(self, params: dict) -> None:
         if "process_noise" in params:
@@ -1157,12 +1162,10 @@ class MultinomialChoiceModel(SGDFittableMixin):
         probs : Array, shape (n_trials, K)
             Each row sums to 1.
         """
-        self._check_fitted("choice_probabilities")
+        res = self._check_fitted("choice_probabilities")
         # Build full value vectors: [0, x_t] for each trial
-        zeros = jnp.zeros((self._smoother_result.smoothed_values.shape[0], 1))
-        full_values = jnp.concatenate(
-            [zeros, self._smoother_result.smoothed_values], axis=1
-        )
+        zeros = jnp.zeros((res.smoothed_values.shape[0], 1))
+        full_values = jnp.concatenate([zeros, res.smoothed_values], axis=1)
         logits = self.inverse_temperature * full_values
         obs_offsets = self._observation_logit_offsets()
         if obs_offsets is not None:
@@ -1185,6 +1188,8 @@ class MultinomialChoiceModel(SGDFittableMixin):
         Only counts parameters that are actually learned via EM.
         """
         self._check_fitted("bic")
+        assert self.log_likelihood_ is not None
+        assert self._n_trials is not None
         return -2.0 * self.log_likelihood_ + self.n_free_params * math.log(
             self._n_trials
         )
@@ -1198,6 +1203,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         delta_bic, learning_detected.
         """
         self._check_fitted("compare_to_null")
+        assert self._n_trials is not None
         null_ll_per_trial = math.log(1.0 / self.n_options)
         null_ll = null_ll_per_trial * self._n_trials
         null_bic = -2.0 * null_ll  # 0 free params
@@ -1246,8 +1252,9 @@ class MultinomialChoiceModel(SGDFittableMixin):
 
     def _plot_smoothed_values(self, ax, option_labels, title, legend_fontsize):
         """Draw smoothed relative values with 95% bands on ``ax``."""
-        vals = np.array(self._smoother_result.smoothed_values)
-        covs = np.array(self._smoother_result.smoothed_covariances)
+        res = self._check_fitted("_plot_smoothed_values")
+        vals = np.array(res.smoothed_values)
+        covs = np.array(res.smoothed_covariances)
         trials = np.arange(vals.shape[0])
         for k in range(self.n_options - 1):
             std = np.sqrt(covs[:, k, k])
@@ -1335,6 +1342,7 @@ class MultinomialChoiceModel(SGDFittableMixin):
         import matplotlib.pyplot as plt
 
         self._check_fitted("plot_convergence")
+        assert self.log_likelihood_history_ is not None
 
         if ax is None:
             fig, ax = plt.subplots(figsize=(6, 4))

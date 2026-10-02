@@ -28,12 +28,14 @@ References
     Neural Computation 16, 971-998.
 """
 
+from __future__ import annotations
+
 import functools
 import logging
 import operator
 import warnings
 from collections.abc import Callable
-from typing import Any, Literal, NamedTuple, overload
+from typing import Any, Literal, NamedTuple, cast, overload
 
 import jax
 import jax.numpy as jnp
@@ -922,6 +924,57 @@ def _warn_line_search_failures(
         ),
         n_failed_bins,
     )
+
+
+@overload
+def _point_process_laplace_update(
+    one_step_mean: Array,
+    one_step_cov: Array,
+    spike_indicator_t: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array], Array],
+    diagonal_boost: float = ...,
+    grad_log_intensity_func: Callable[[Array], Array] | None = ...,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    max_log_count: float = ...,
+    return_line_search_failures: Literal[False] = ...,
+) -> tuple[Array, Array, Array]: ...
+
+
+@overload
+def _point_process_laplace_update(
+    one_step_mean: Array,
+    one_step_cov: Array,
+    spike_indicator_t: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array], Array],
+    diagonal_boost: float = ...,
+    grad_log_intensity_func: Callable[[Array], Array] | None = ...,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    max_log_count: float = ...,
+    return_line_search_failures: Literal[True] = ...,
+) -> tuple[Array, Array, Array, Array]: ...
+
+
+@overload
+def _point_process_laplace_update(
+    one_step_mean: Array,
+    one_step_cov: Array,
+    spike_indicator_t: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array], Array],
+    diagonal_boost: float = ...,
+    grad_log_intensity_func: Callable[[Array], Array] | None = ...,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    max_log_count: float = ...,
+    return_line_search_failures: bool = ...,
+) -> tuple[Array, Array, Array] | tuple[Array, Array, Array, Array]: ...
 
 
 def _point_process_laplace_update(
@@ -1974,8 +2027,15 @@ def _block_diagonal_forward_core(
         )
         return means_j, covs_j, ll_j, n_failed_j
 
-    return jax.vmap(_run_one_neuron, in_axes=(0, 0, 0, 0, 1))(
-        A_blocks, Q_blocks, init_means_per_neuron, init_covs_per_neuron, spike_indicator
+    return cast(
+        tuple[Array, Array, Array, Array],
+        jax.vmap(_run_one_neuron, in_axes=(0, 0, 0, 0, 1))(
+            A_blocks,
+            Q_blocks,
+            init_means_per_neuron,
+            init_covs_per_neuron,
+            spike_indicator,
+        ),
     )
 
 
@@ -2389,6 +2449,128 @@ def _stochastic_point_process_smoother_block_diagonal(
     return smoother_mean, smoother_cov, smoother_cross_cov, marginal_ll
 
 
+@overload
+def stochastic_point_process_smoother(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    return_filtered: Literal[False] = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: Literal[False] = ...,
+) -> tuple[Array, Array, Array, Array]: ...
+
+
+@overload
+def stochastic_point_process_smoother(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    return_filtered: Literal[True] = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: Literal[False] = ...,
+) -> tuple[Array, Array, Array, Array, Array, Array]: ...
+
+
+@overload
+def stochastic_point_process_smoother(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    return_filtered: Literal[False] = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: Literal[True] = ...,
+) -> tuple[
+    Array,
+    Array | BlockDiagonalCovariance,
+    Array | BlockDiagonalCovariance,
+    Array,
+]: ...
+
+
+@overload
+def stochastic_point_process_smoother(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    return_filtered: Literal[True] = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: Literal[True] = ...,
+) -> tuple[
+    Array,
+    Array | BlockDiagonalCovariance,
+    Array | BlockDiagonalCovariance,
+    Array,
+    Array,
+    Array | BlockDiagonalCovariance,
+]: ...
+
+
+@overload
+def stochastic_point_process_smoother(
+    init_mean_params: ArrayLike,
+    init_covariance_params: ArrayLike,
+    design_matrix: ArrayLike,
+    spike_indicator: ArrayLike,
+    dt: float,
+    transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    log_conditional_intensity: Callable[[ArrayLike, ArrayLike], Array],
+    include_laplace_normalization: bool = ...,
+    return_filtered: bool = ...,
+    max_log_count: float = ...,
+    validate_inputs: bool = ...,
+    block_n_neurons: int | None = ...,
+    block_size: int | None = ...,
+    force_dense: bool = ...,
+    max_newton_iter: int = ...,
+    return_block_covariances: bool = ...,
+) -> tuple[Array | BlockDiagonalCovariance, ...]: ...
+
+
 def stochastic_point_process_smoother(
     init_mean_params: ArrayLike,
     init_covariance_params: ArrayLike,
@@ -2731,12 +2913,15 @@ def dynamics_only_m_step(
             DeprecationWarning,
             stacklevel=2,
         )
-    return _dynamics_only_m_step(
-        smoother_mean,
-        smoother_cov,
-        smoother_cross_cov,
-        fixed_transition_matrix,
-        initial_state_prior,
+    return cast(
+        tuple[Array, Array, Array, Array],
+        _dynamics_only_m_step(
+            smoother_mean,
+            smoother_cov,
+            smoother_cross_cov,
+            fixed_transition_matrix,
+            initial_state_prior,
+        ),
     )
 
 
@@ -2818,7 +3003,9 @@ def _dynamics_only_m_step(
 
 
 def get_confidence_interval(
-    posterior_mean: ArrayLike, posterior_covariance: ArrayLike, alpha: float = 0.05
+    posterior_mean: ArrayLike,
+    posterior_covariance: ArrayLike | BlockDiagonalCovariance,
+    alpha: float = 0.05,
 ) -> Array:
     """Get the confidence interval from the posterior covariance
 

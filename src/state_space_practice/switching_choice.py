@@ -21,15 +21,18 @@ References
     experiments. J Neuroscience 24(2), 447-461.
 """
 
+from __future__ import annotations
+
 import functools
 import logging
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.multinomial_choice import (
     _softmax_update_core,
     _warn_if_newton_unconverged,
@@ -231,21 +234,24 @@ def switching_choice_filter(
         its mode.
     """
     validate_choice_indices(choices, n_options)
-    return _switching_choice_filter_jit(
-        choices,
-        n_options,
-        n_discrete_states,
-        covariates,
-        input_gain,
-        obs_covariates,
-        obs_weights,
-        process_noises,
-        inverse_temperatures,
-        decays,
-        discrete_transition_matrix,
-        init_mean,
-        init_cov,
-        init_discrete_prob,
+    return cast(
+        SwitchingChoiceFilterResult,
+        _switching_choice_filter_jit(
+            choices,
+            n_options,
+            n_discrete_states,
+            covariates,
+            input_gain,
+            obs_covariates,
+            obs_weights,
+            process_noises,
+            inverse_temperatures,
+            decays,
+            discrete_transition_matrix,
+            init_mean,
+            init_cov,
+            init_discrete_prob,
+        ),
     )
 
 
@@ -764,10 +770,12 @@ class SwitchingChoiceModel(SGDFittableMixin):
         self.init_mean_ = jnp.zeros(k_free)
         self.init_cov_ = jnp.eye(k_free)
         self.discrete_transition_matrix_ = 0.9 * jnp.eye(S) + 0.1 / S * jnp.ones((S, S))
+        self.input_gain_: Array | None
         if n_covariates > 0:
             self.input_gain_ = jnp.zeros((k_free, n_covariates))
         else:
             self.input_gain_ = None
+        self.obs_weights_: Array | None
         if n_obs_covariates > 0:
             self.obs_weights_ = jnp.zeros((n_options, n_obs_covariates))
         else:
@@ -874,6 +882,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
                     axis=1,
                 )  # (T, K, S)
                 sm_disc = self.smoothed_discrete_probs_
+                assert sm_disc is not None
                 sm_e_var = jnp.einsum("tks,ts->tk", full_sm_vars, sm_disc)
                 sm_var_mean = _between_state_variance(full_sm_means, sm_disc)
                 self.smoothed_option_variances_ = sm_e_var + sm_var_mean
@@ -891,12 +900,12 @@ class SwitchingChoiceModel(SGDFittableMixin):
         else:
             obs_offsets = jnp.zeros((per_state_values.shape[0], self.n_options))
 
-        per_state_probs = []
+        per_state_prob_list = []
         for s in range(self.n_discrete_states):
             v = append_reference_option(per_state_values[:, :, s])
             p = jax.nn.softmax(self.inverse_temperatures_[s] * v + obs_offsets, axis=1)
-            per_state_probs.append(p)
-        per_state_probs = jnp.stack(per_state_probs, axis=-1)  # (T, K, S)
+            per_state_prob_list.append(p)
+        per_state_probs = jnp.stack(per_state_prob_list, axis=-1)  # (T, K, S)
         predicted_probs = jnp.einsum("tks,ts->tk", per_state_probs, predicted_disc)
 
         self.predicted_choice_entropy_ = categorical_entropy(predicted_probs)
@@ -1174,6 +1183,8 @@ class SwitchingChoiceModel(SGDFittableMixin):
 
     @property
     def _n_timesteps(self) -> int:
+        if self._n_trials is None:
+            raise NotFittedError("Model must be fitted before accessing _n_timesteps.")
         return self._n_trials
 
     def _build_param_spec(self) -> tuple[dict, dict]:
@@ -1224,7 +1235,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
         # The jitted core, not the validating public wrapper: fit_sgd already
         # validated the choices, which are a traced jit argument here.
         result = _switching_choice_filter_jit(**kwargs)
-        return -result.marginal_log_likelihood
+        return cast(Array, -result.marginal_log_likelihood)
 
     def _store_sgd_params(self, params: dict) -> None:
         self.process_noises_ = params["process_noises"]

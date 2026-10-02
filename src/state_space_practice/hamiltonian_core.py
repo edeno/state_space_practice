@@ -661,6 +661,14 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
             ),
         )
 
+    def filter(self, *args: Any, **kwargs: Any) -> tuple[Array, Array, Array]:
+        """Filter with the concrete model's observation-specific arguments."""
+        raise NotImplementedError(f"{type(self).__name__} must implement filter.")
+
+    def smooth(self, *args: Any, **kwargs: Any) -> tuple[Array, Array]:
+        """Smooth with the concrete model's observation-specific arguments."""
+        raise NotImplementedError(f"{type(self).__name__} must implement smooth.")
+
     def _validate_fit_data(self, *data: Any, **kwargs: Any) -> tuple[Array, ...]:
         """Validate the observation arrays given to ``fit_sgd`` (non-empty).
 
@@ -702,7 +710,7 @@ class HamiltonianModelBase(OscillatorParameterBase, SGDFittableMixin):
         if "Q" in params:
             self.process_cov = jnp.stack([stabilize_covariance(params["Q"])], axis=2)
 
-    def _finalize_sgd(self, *data, **kwargs):
+    def _finalize_sgd(self, *data: Any, **kwargs: Any) -> None:
         """Run filter + smoother to populate fitted states after SGD.
 
         ``data`` is whatever ``fit_sgd`` passed positionally (one observation

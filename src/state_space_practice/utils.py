@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import functools
 import logging
 import operator
 import warnings
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -302,7 +305,7 @@ def clip_eigenvalues(
         eigvals = jnp.maximum(eigvals, min_eigenvalue)
     if max_eigenvalue is not None:
         eigvals = jnp.minimum(eigvals, max_eigenvalue)
-    return eigvecs @ jnp.diag(eigvals) @ eigvecs.T
+    return cast(jax.Array, eigvecs @ jnp.diag(eigvals) @ eigvecs.T)
 
 
 def project_psd(Q: jax.Array, min_eigenvalue: float = 1e-8) -> jax.Array:
@@ -527,7 +530,7 @@ def _correlation_scale(cov: Array) -> Array:
 
 def _clip_eigenvalues_relative(
     cov: Array, relative_floor: float, absolute_floor: float
-) -> tuple[Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array]:
     """:func:`clip_eigenvalues_relative` that also returns the floor used and
     the eigenvalues before flooring (both on the correlation scale)."""
     cov = symmetrize(jnp.asarray(cov))
@@ -591,7 +594,7 @@ def project_psd_relative(
             min_eigenvalue=jnp.min(eigvals),
             max_abs_eigenvalue=jnp.max(jnp.abs(eigvals)),
         )
-    return projected
+    return cast(Array, projected)
 
 
 def floor_variances_relative(
@@ -711,7 +714,7 @@ def _host_spectral_radius_and_gradient(
     batch_shape = matrices.shape[:-2]
     n = matrices.shape[-1]
     flat = matrices.reshape((-1, n, n))
-    radii = np.zeros(flat.shape[0], dtype=matrices.dtype)
+    radii = np.zeros(len(flat), dtype=matrices.dtype)
     grads = np.zeros_like(flat)
     for k, A in enumerate(flat):
         if not np.all(np.isfinite(A)):
@@ -739,11 +742,14 @@ def _spectral_radius_callback(matrices: jax.Array) -> tuple[jax.Array, jax.Array
         jax.ShapeDtypeStruct(matrices.shape[:-2], dtype),
         jax.ShapeDtypeStruct(matrices.shape, dtype),
     )
-    return jax.pure_callback(
-        _host_spectral_radius_and_gradient,
-        result_shape,
-        matrices,
-        vmap_method="sequential",
+    return cast(
+        tuple[jax.Array, jax.Array],
+        jax.pure_callback(
+            _host_spectral_radius_and_gradient,
+            result_shape,
+            matrices,
+            vmap_method="sequential",
+        ),
     )
 
 
@@ -1918,4 +1924,4 @@ def find_permutation(
 
     overlap = compute_state_overlap(z1, z2)
     _, perm = linear_sum_assignment(-np.asarray(overlap))
-    return perm
+    return cast(np.ndarray, perm)

@@ -9,11 +9,14 @@ References
 5. https://github.com/Stephen-Lab-BU/Switching_Oscillator_Networks
 """
 
+from __future__ import annotations
+
 import functools
 import logging
 import math
 import warnings
 from functools import partial
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -1311,7 +1314,10 @@ def _collapse_triple_to_pair(
         in_axes=(-2, -2, 0),  # vmap over j (second-to-last of 4D), weights axis 0
         out_axes=(-1, -1),
     )
-    return _collapse_over_k(triple_mean, triple_cov, weights)
+    return cast(
+        tuple[jax.Array, jax.Array],
+        _collapse_over_k(triple_mean, triple_cov, weights),
+    )
 
 
 def _update_smoother_discrete_probabilities(
@@ -1434,10 +1440,10 @@ def switching_kalman_smoother(
     """
 
     def _step(
-        carry: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        carry: tuple[jax.Array, jax.Array, jax.Array],
         args: tuple[jax.Array, jax.Array, jax.Array],
     ) -> tuple[
-        tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        tuple[jax.Array, jax.Array, jax.Array],
         tuple[
             jax.Array,
             jax.Array,
@@ -3081,7 +3087,7 @@ def compute_elbo(
         pair_cond_smoother_covs=pair_cond_smoother_covs,
     )
 
-    return expected_ll + entropy
+    return cast(jax.Array, expected_ll + entropy)
 
 
 def compute_transition_sufficient_stats(
@@ -3286,7 +3292,7 @@ def compute_transition_q_from_params(
     freq: jax.Array,
     coupling_strength: jax.Array,
     phase_diff: jax.Array,
-    sampling_freq: float,
+    sampling_freq: float | jax.Array,
     gamma1: jax.Array,
     beta: jax.Array,
     process_cov: jax.Array | None = None,
@@ -3340,20 +3346,20 @@ def compute_transition_q_from_params(
 _OPEN_INTERVAL_EPS = 1e-6
 
 
-def _scaled_sigmoid(x: jax.Array, scale: float) -> jax.Array:
+def _scaled_sigmoid(x: jax.Array, scale: float | jax.Array) -> jax.Array:
     return scale * jax.nn.sigmoid(x)
 
 
-def _inv_scaled_sigmoid(y: jax.Array, scale: float) -> jax.Array:
+def _inv_scaled_sigmoid(y: jax.Array, scale: float | jax.Array) -> jax.Array:
     ratio = jnp.clip(y / scale, _OPEN_INTERVAL_EPS, 1.0 - _OPEN_INTERVAL_EPS)
     return jnp.log(ratio) - jnp.log1p(-ratio)
 
 
-def _scaled_tanh(x: jax.Array, scale: float) -> jax.Array:
+def _scaled_tanh(x: jax.Array, scale: float | jax.Array) -> jax.Array:
     return scale * jnp.tanh(x)
 
 
-def _inv_scaled_tanh(y: jax.Array, scale: float) -> jax.Array:
+def _inv_scaled_tanh(y: jax.Array, scale: float | jax.Array) -> jax.Array:
     ratio = jnp.clip(y / scale, -1.0 + _OPEN_INTERVAL_EPS, 1.0 - _OPEN_INTERVAL_EPS)
     return jnp.arctanh(ratio)
 
@@ -3737,7 +3743,7 @@ def _optimize_dim_joint_core(
     objective_slack = tol * jnp.maximum(1.0, jnp.abs(init_loss))
     threshold = init_loss + objective_slack
 
-    def backtrack(_: None) -> jax.Array:
+    def backtrack(_unused: None) -> jax.Array:
         direction = result.x - init_flat
         steps = 0.5 ** jnp.arange(1, max_backtracking_steps + 1, dtype=init_flat.dtype)
 
@@ -3752,7 +3758,7 @@ def _optimize_dim_joint_core(
         return accepted
 
     accepted_flat = jax.lax.cond(
-        candidate_loss > threshold, backtrack, lambda _: result.x, None
+        candidate_loss > threshold, backtrack, lambda _unused: result.x, None
     )
     return {
         "params": unpack(accepted_flat),
@@ -3893,7 +3899,7 @@ def optimize_dim_transition_params_joint(
         beta.astype(dtype),
         (
             process_cov_arr.astype(dtype)
-            if has_process_cov
+            if process_cov_arr is not None
             else jnp.zeros(expected_stats_shape, dtype=dtype)
         ),
         jnp.asarray(sampling_freq, dtype=dtype),

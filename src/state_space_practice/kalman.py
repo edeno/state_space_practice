@@ -16,8 +16,10 @@ References
 
 """
 
+from __future__ import annotations
+
 import warnings
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -93,11 +95,14 @@ def _gain_solve(cov: jax.Array, rhs: jax.Array) -> jax.Array:
         lambda: factor_with(eps**0.5),
     )
     matrix = stabilized(cov, relative_boost)
-    return jax.lax.custom_linear_solve(
-        lambda x: matrix @ x,
-        rhs,
-        solve=lambda _, b: jax.scipy.linalg.cho_solve((factor, True), b),
-        symmetric=True,
+    return cast(
+        jax.Array,
+        jax.lax.custom_linear_solve(
+            lambda x: matrix @ x,
+            rhs,
+            solve=lambda _, b: jax.scipy.linalg.cho_solve((factor, True), b),
+            symmetric=True,
+        ),
     )
 
 
@@ -521,8 +526,11 @@ def _kalman_filter_update(
     )
 
     # Measurement update
-    return kalman_measurement_update(
-        one_step_mean, one_step_cov, obs, measurement_matrix, measurement_cov
+    return cast(
+        tuple[jax.Array, jax.Array, jax.Array],
+        kalman_measurement_update(
+            one_step_mean, one_step_cov, obs, measurement_matrix, measurement_cov
+        ),
     )
 
 
@@ -700,14 +708,17 @@ def kalman_filter(
             filter_name="kalman_filter",
         )
 
-    return _kalman_filter_impl(
-        init_mean,
-        init_cov,
-        obs,
-        transition_matrix,
-        process_cov,
-        measurement_matrix,
-        measurement_cov,
+    return cast(
+        tuple[jax.Array, jax.Array, jax.Array],
+        _kalman_filter_impl(
+            init_mean,
+            init_cov,
+            obs,
+            transition_matrix,
+            process_cov,
+            measurement_matrix,
+            measurement_cov,
+        ),
     )
 
 
@@ -1033,14 +1044,17 @@ def kalman_smoother(
             filter_name="kalman_smoother",
         )
 
-    return _kalman_smoother_impl(
-        init_mean,
-        init_cov,
-        obs,
-        transition_matrix,
-        process_cov,
-        measurement_matrix,
-        measurement_cov,
+    return cast(
+        tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+        _kalman_smoother_impl(
+            init_mean,
+            init_cov,
+            obs,
+            transition_matrix,
+            process_cov,
+            measurement_matrix,
+            measurement_cov,
+        ),
     )
 
 
@@ -1351,13 +1365,16 @@ def smooth_initial_state_with_cross_cov(
     init_cross_cov : jax.Array, shape (n_cont_states, n_cont_states)
         $$ C_{0,1} = Cov(x_0, x_1 | y_{1:T}) $$.
     """
-    return _kalman_smoother_update(
-        jnp.asarray(first_smoother_mean),
-        jnp.asarray(first_smoother_cov),
-        jnp.asarray(prior.init_mean),
-        jnp.asarray(prior.init_cov),
-        jnp.asarray(prior.process_cov),
-        jnp.asarray(prior.transition_matrix),
+    return cast(
+        tuple[jax.Array, jax.Array, jax.Array],
+        _kalman_smoother_update(
+            jnp.asarray(first_smoother_mean),
+            jnp.asarray(first_smoother_cov),
+            jnp.asarray(prior.init_mean),
+            jnp.asarray(prior.init_cov),
+            jnp.asarray(prior.process_cov),
+            jnp.asarray(prior.transition_matrix),
+        ),
     )
 
 
@@ -1546,8 +1563,18 @@ def kalman_maximization_step(
             DeprecationWarning,
             stacklevel=2,
         )
-    return _kalman_maximization_step(
-        obs, smoother_mean, smoother_cov, smoother_cross_cov, initial_state_prior
+    return cast(
+        tuple[
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+            jax.Array,
+        ],
+        _kalman_maximization_step(
+            obs, smoother_mean, smoother_cov, smoother_cross_cov, initial_state_prior
+        ),
     )
 
 

@@ -16,9 +16,12 @@ Usage::
     params = transform_to_constrained(unc_params, param_spec)
 """
 
+from __future__ import annotations
+
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -190,7 +193,7 @@ def _psd_to_real(P: Array) -> Array:
     # direction can use softplus rather than exp and avoid optimizer overflow.
     diag = jnp.maximum(jnp.diag(L) - _dtype_tiny(L), _dtype_tiny(L))
     L = L.at[jnp.diag_indices_from(L)].set(_inverse_softplus(diag))
-    return L[jnp.tril_indices_from(L)]
+    return cast(Array, L[jnp.tril_indices_from(L)])
 
 
 def _real_to_psd(flat: Array) -> Array:

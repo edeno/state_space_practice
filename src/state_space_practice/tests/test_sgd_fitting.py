@@ -145,6 +145,35 @@ class _UnconstrainedToyModel(_ToyModel):
 
 
 class TestSGDFittableMixin:
+    def test_instance_timesteps_attribute(self) -> None:
+        import optax
+
+        class _InstanceTimestepsModel(SGDFittableMixin):
+            _sgd_param_attrs = {"scale": "scale"}
+
+            def __init__(self) -> None:
+                self._n_timesteps = 10
+                self.scale = jnp.array(0.0)
+                self.is_fitted = False
+
+            def _build_param_spec(self):
+                return {"scale": self.scale}, {"scale": UNCONSTRAINED}
+
+            def _sgd_loss_fn(self, params, target):
+                return (params["scale"] - target) ** 2 * self._n_timesteps
+
+            def _finalize_sgd(self, target):
+                self.is_fitted = True
+
+        model = _InstanceTimestepsModel()
+        lls = model.fit_sgd(
+            jnp.array(1.0), optimizer=optax.sgd(learning_rate=0.1), num_steps=1
+        )
+
+        assert model.is_fitted
+        np.testing.assert_allclose(model.scale, 0.2, atol=1e-7)
+        np.testing.assert_allclose(lls, [-6.4], rtol=1e-6)
+
     def test_basic_optimization(self) -> None:
         import optax
 
@@ -177,7 +206,7 @@ class TestSGDFittableMixin:
     def test_stores_log_likelihood_history(self) -> None:
         model = _ToyModel(scale=0.1)
         lls = model.fit_sgd(jnp.array(5.0), num_steps=20)
-        assert hasattr(model, "log_likelihood_history_")
+        assert model.log_likelihood_history_ is not None
         assert model.log_likelihood_history_ == lls
 
     def test_history_final_entry_matches_stored_final_params(self) -> None:

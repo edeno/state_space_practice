@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import warnings
 from collections.abc import Callable
@@ -100,7 +102,9 @@ def _get_rotation_matrix(rotation_frequency: ArrayLike) -> jax.Array:
 
 
 def _compute_intrinsic_oscillation_block(
-    oscillation_freq: ArrayLike, damping_coef: ArrayLike, sampling_freq: float = 1.0
+    oscillation_freq: ArrayLike,
+    damping_coef: ArrayLike,
+    sampling_freq: float | jax.Array = 1.0,
 ) -> jax.Array:
     """Compute the rotation matrix for a given frequency and auto-regressive coefficient
 
@@ -132,7 +136,7 @@ def _compute_coupled_oscillator_block(
     freq: ArrayLike,
     damping_coef: ArrayLike,
     sum_incoming_coupling_strength: ArrayLike,
-    sampling_freq: float = 1.0,
+    sampling_freq: float | jax.Array = 1.0,
 ) -> jax.Array:
     """Compute the diagonal block of the transition matrix for the coupled model.
 
@@ -193,7 +197,7 @@ def _compute_coupling_transition_block(
         0.0,
         phase_difference,
     )
-    return coupling_strength * _get_rotation_matrix(safe_phase)
+    return jnp.asarray(coupling_strength) * _get_rotation_matrix(safe_phase)
 
 
 def construct_common_oscillator_transition_matrix(
@@ -466,7 +470,7 @@ def construct_directed_influence_transition_matrix(
     damping_coeffs: jax.Array,
     coupling_strengths: jax.Array,
     phase_diffs: jax.Array,
-    sampling_freq: float = 1.0,
+    sampling_freq: float | jax.Array = 1.0,
 ) -> jax.Array:
     """Constructs the full state transition matrix Aj.
 
@@ -549,8 +553,8 @@ def compute_directed_influence_stability_scale(
     freqs: ArrayLike,
     damping_coef: ArrayLike,
     coupling_strength: ArrayLike,
-    sampling_freq: float,
-    max_spectral_radius: float = 0.99,
+    sampling_freq: float | jax.Array,
+    max_spectral_radius: float | jax.Array = 0.99,
     *,
     phase_difference: ArrayLike,
 ) -> jax.Array:

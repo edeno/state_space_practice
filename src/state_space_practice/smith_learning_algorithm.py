@@ -52,7 +52,7 @@ import math
 import warnings
 from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     import matplotlib.pyplot as plt
@@ -360,9 +360,9 @@ def smith_laplace_log_likelihood(
 
 def smith_learning_filter(
     n_correct_responses: ArrayLike,
-    init_learning_state: float = 0.0,
-    init_learning_variance: float | None = None,
-    sigma_epsilon: float = DEFAULT_SIGMA_EPSILON,
+    init_learning_state: float | ArrayLike = 0.0,
+    init_learning_variance: float | ArrayLike | None = None,
+    sigma_epsilon: float | ArrayLike = DEFAULT_SIGMA_EPSILON,
     prob_correct_by_chance: float = 0.5,
     max_possible_correct: ArrayLike | None = None,
     differentiable: bool = False,
@@ -472,13 +472,16 @@ def smith_learning_filter(
     # promoted to the default float, float32 inputs stay float32.
     init_state = jnp.asarray(init_learning_state)
     dtype = jnp.result_type(init_state, init_var, sigma_squared_epsilon, 1.0)
-    return _smith_learning_filter_impl(
-        n_correct_responses,
-        max_correct_arr,
-        init_state.astype(dtype),
-        init_var.astype(dtype),
-        sigma_squared_epsilon.astype(dtype),
-        mu.astype(dtype),
+    return cast(
+        tuple[Array, Array, Array, Array, Array],
+        _smith_learning_filter_impl(
+            n_correct_responses,
+            max_correct_arr,
+            init_state.astype(dtype),
+            init_var.astype(dtype),
+            sigma_squared_epsilon.astype(dtype),
+            mu.astype(dtype),
+        ),
     )
 
 
@@ -604,7 +607,7 @@ def smith_learning_smoother(
     n_trials: int = len(filtered_learning_state_mode)
 
     def _step(
-        carry: tuple[Array, Array], k: int
+        carry: tuple[Array, Array], k: Array
     ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
         """A single step of the RTS smoother."""
         mode_smoothed_next, variance_smoothed_next = carry
@@ -1093,11 +1096,13 @@ def compute_cross_covariance_matrix(
         Cov(x_i, x_j | y_{1:T}). Diagonal contains variances P_{k|T}.
         Lower triangle is symmetric (Cov(x_i, x_j) = Cov(x_j, x_i)).
     """
-    n_trials = len(smoothed_learning_state_variance)
+    smoothed_var = jnp.asarray(smoothed_learning_state_variance)
+    gain = jnp.asarray(smoother_gain)
+    n_trials = smoothed_var.shape[0]
 
     # Compute cumulative product of smoother gains
     # cumgain[k] = A_0 * A_1 * ... * A_{k-1} for k >= 1, cumgain[0] = 1
-    log_gains = jnp.log(jnp.clip(smoother_gain, 1e-10, None))
+    log_gains = jnp.log(jnp.clip(gain, 1e-10, None))
     cumsum_log_gains = jnp.concatenate([jnp.array([0.0]), jnp.cumsum(log_gains)])
 
     # For Cov(x_i, x_j) where i < j:
@@ -1114,9 +1119,7 @@ def compute_cross_covariance_matrix(
     log_gain_products = cumsum_log_gains[j_idx] - cumsum_log_gains[i_idx]
 
     # Cross-covariance = exp(log_gain_products) * P_j (for i <= j)
-    cross_cov_matrix = (
-        jnp.exp(log_gain_products) * smoothed_learning_state_variance[j_idx]
-    )
+    cross_cov_matrix = jnp.exp(log_gain_products) * smoothed_var[j_idx]
 
     # For i > j, use symmetry: Cov(x_i, x_j) = Cov(x_j, x_i)
     # But our formula computes Cov(x_i, x_j) = product(A_i:A_{j-1}) * P_j
@@ -1164,7 +1167,8 @@ def compute_trial_comparison_matrix(
         Upper triangular matrix where entry [i, j] (i < j) contains
         P(x_i > x_j | y_{1:T}). Diagonal is 0.5, lower triangle is NaN.
     """
-    n_trials = len(smoothed_learning_state_mode)
+    mode = jnp.asarray(smoothed_learning_state_mode)
+    n_trials = mode.shape[0]
 
     # Compute full cross-covariance matrix
     cross_cov_matrix = compute_cross_covariance_matrix(
@@ -1180,9 +1184,7 @@ def compute_trial_comparison_matrix(
 
     # Generate standard normal samples and transform
     z = jax.random.normal(key, shape=(n_samples, n_trials))
-    samples = (
-        smoothed_learning_state_mode + z @ sqrt_cov.T
-    )  # shape: (n_samples, n_trials)
+    samples = mode + z @ sqrt_cov.T  # shape: (n_samples, n_trials)
 
     if compare_probability:
         if prob_correct_by_chance is None:
@@ -1273,7 +1275,8 @@ def compare_two_trials(
         smoothed_learning_state_variance, smoother_gain
     )
     indices = jnp.array([trial1, trial2])
-    mean_2 = smoothed_learning_state_mode[indices]
+    mode = jnp.asarray(smoothed_learning_state_mode)
+    mean_2 = mode[indices]
     cov_2 = cross_cov_matrix[jnp.ix_(indices, indices)]
 
     # Sample from bivariate normal
@@ -1745,7 +1748,10 @@ class SmithLearningModel(SGDFittableMixin):
             self.init_learning_state = 0.0
             self.init_learning_variance = float(self.sigma_epsilon**2)
         elif self.initial_state_method == "set_initial_conservative_from_second_trial":
-            if len(self.smoothed_learning_state_mode) > 1:
+            if (
+                self.smoothed_learning_state_mode is not None
+                and len(self.smoothed_learning_state_mode) > 1
+            ):
                 self.init_learning_state = float(
                     0.5 * self.smoothed_learning_state_mode[1]
                 )  # x_{1|T}
@@ -1763,7 +1769,9 @@ class SmithLearningModel(SGDFittableMixin):
             # Not from Smith et al. (2004); may not converge to same fixed point
             # as "reestimate_initial_from_data".
             if (
-                len(self.smoothed_learning_state_mode) > 1
+                self.smoothed_learning_state_mode is not None
+                and len(self.smoothed_learning_state_mode) > 1
+                and self.smoothed_learning_state_variance is not None
                 and len(self.smoothed_learning_state_variance) > 1
             ):
                 self.init_learning_state = float(
@@ -1967,6 +1975,8 @@ class SmithLearningModel(SGDFittableMixin):
 
     @property
     def _n_timesteps(self) -> int:
+        if self._n_trials_ is None:
+            raise NotFittedError("Model must be fitted before accessing _n_timesteps.")
         return self._n_trials_
 
     def _build_param_spec(self) -> tuple[dict, dict]:
@@ -2085,6 +2095,8 @@ class SmithLearningModel(SGDFittableMixin):
         """
         if not self.is_fitted:
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
+        assert self.smoothed_learning_state_mode is not None
+        assert self.smoothed_learning_state_variance is not None
 
         return calculate_probability_confidence_limits(
             key=key,
@@ -2129,6 +2141,8 @@ class SmithLearningModel(SGDFittableMixin):
         """
         if not self.is_fitted:
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
+        assert self.smoothed_learning_state_mode is not None
+        assert self.smoothed_learning_state_variance is not None
 
         return calculate_latent_state_percentiles(
             key=key,
@@ -2343,6 +2357,7 @@ class SmithLearningModel(SGDFittableMixin):
             n_samples=n_samples,
             return_prob_above_chance=True,
         )
+        assert prob_above_chance is not None
 
         threshold = 1.0 - alpha
         meets_criterion = jnp.asarray(prob_above_chance >= threshold)
@@ -2452,6 +2467,7 @@ class SmithLearningModel(SGDFittableMixin):
 
         import matplotlib.pyplot as plt
 
+        assert self.smoothed_learning_state_mode is not None
         n_trials = len(self.smoothed_learning_state_mode)
         trials_axis = jnp.arange(n_trials)
 
@@ -2641,6 +2657,9 @@ class SmithLearningModel(SGDFittableMixin):
         """
         if not self.is_fitted:
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
+        assert self.smoothed_learning_state_mode is not None
+        assert self.smoothed_learning_state_variance is not None
+        assert self.smoother_gain is not None
 
         n_trials = len(self.smoothed_learning_state_mode)
         if not (0 <= trial1 < n_trials and 0 <= trial2 < n_trials):
@@ -2709,6 +2728,9 @@ class SmithLearningModel(SGDFittableMixin):
         """
         if not self.is_fitted:
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
+        assert self.smoothed_learning_state_mode is not None
+        assert self.smoothed_learning_state_variance is not None
+        assert self.smoother_gain is not None
 
         prob_chance = self.prob_correct_by_chance if compare_probability else None
 
@@ -2800,7 +2822,11 @@ class SmithLearningModel(SGDFittableMixin):
         NotFittedError
             If the model has not been fitted.
         """
-        if not self.is_fitted or self.log_likelihood_ is None:
+        if (
+            not self.is_fitted
+            or self.log_likelihood_ is None
+            or self._n_trials_ is None
+        ):
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
         n_params = 3  # sigma_epsilon, init_learning_state, init_learning_variance
         return -2.0 * self.log_likelihood_ + n_params * math.log(self._n_trials_)
@@ -3172,6 +3198,7 @@ class SmithLearningModel(SGDFittableMixin):
 
         fig, axes = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
 
+        assert self.smoothed_learning_state_mode is not None
         n_trials = len(self.smoothed_learning_state_mode)
         trials_axis = jnp.arange(n_trials)
         plot_percentiles = jnp.array([5.0, 50.0, 95.0])

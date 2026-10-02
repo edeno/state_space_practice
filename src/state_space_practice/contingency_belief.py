@@ -23,9 +23,11 @@ References
     behavioral experiments. J Neuroscience 24(2), 447-461.
 """
 
+from __future__ import annotations
+
 import functools
 import logging
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -34,6 +36,7 @@ import numpy as np
 from jax import Array
 from jax.typing import ArrayLike
 
+from state_space_practice.exceptions import NotFittedError
 from state_space_practice.parameter_transforms import (
     POSITIVE,
     UNCONSTRAINED,
@@ -475,20 +478,23 @@ def contingency_belief_filter(
     _validate_choices_rewards(choices, rewards, n_options)
     choices = jnp.asarray(choices, dtype=jnp.int32)
     rewards = jnp.asarray(rewards, dtype=jnp.int32)
-    return _contingency_belief_filter_jit(
-        choices=choices,
-        rewards=rewards,
-        n_states=n_states,
-        n_options=n_options,
-        reward_probs=reward_probs,
-        state_values=state_values,
-        inverse_temperature=inverse_temperature,
-        transition_logits=transition_logits,
-        transition_covariates=transition_covariates,
-        transition_weights=transition_weights,
-        init_state_prob=init_state_prob,
-        obs_design_matrix=obs_design_matrix,
-        obs_weights=obs_weights,
+    return cast(
+        ContingencyBeliefResult,
+        _contingency_belief_filter_jit(
+            choices=choices,
+            rewards=rewards,
+            n_states=n_states,
+            n_options=n_options,
+            reward_probs=reward_probs,
+            state_values=state_values,
+            inverse_temperature=inverse_temperature,
+            transition_logits=transition_logits,
+            transition_covariates=transition_covariates,
+            transition_weights=transition_weights,
+            init_state_prob=init_state_prob,
+            obs_design_matrix=obs_design_matrix,
+            obs_weights=obs_weights,
+        ),
     )
 
 
@@ -517,15 +523,14 @@ def _contingency_belief_filter_jit(
     if init_state_prob is None:
         init_state_prob = jnp.ones(n_states) / n_states
 
-    has_trans_covariates = (
-        transition_covariates is not None and transition_weights is not None
-    )
-    if not has_trans_covariates:
+    if transition_covariates is None or transition_weights is None:
         transition_covariates = jnp.zeros((n_trials, 1))
         transition_weights = jnp.zeros((n_states, n_states - 1, 1))
 
-    has_obs_covariates = obs_design_matrix is not None and obs_weights is not None
-    if has_obs_covariates:
+    if obs_design_matrix is None or obs_weights is None:
+        obs_design_matrix = jnp.zeros((n_trials, 1))
+        obs_weights = jnp.zeros((n_options, 1))
+    else:
         if obs_design_matrix.shape[0] != n_trials:
             raise ValueError(
                 f"obs_design_matrix has {obs_design_matrix.shape[0]} rows "
@@ -537,9 +542,6 @@ def _contingency_belief_filter_jit(
                 f"obs_weights last-axis size {obs_weights.shape[-1]} != "
                 f"obs_design_matrix width {obs_design_matrix.shape[1]}"
             )
-    else:
-        obs_design_matrix = jnp.zeros((n_trials, 1))
-        obs_weights = jnp.zeros((n_options, 1))
 
     _update = functools.partial(
         _bayes_update,
@@ -631,20 +633,23 @@ def contingency_belief_smoother(
     _validate_choices_rewards(choices, rewards, n_options)
     choices = jnp.asarray(choices, dtype=jnp.int32)
     rewards = jnp.asarray(rewards, dtype=jnp.int32)
-    return _contingency_belief_smoother_jit(
-        choices=choices,
-        rewards=rewards,
-        n_states=n_states,
-        n_options=n_options,
-        reward_probs=reward_probs,
-        state_values=state_values,
-        inverse_temperature=inverse_temperature,
-        transition_logits=transition_logits,
-        transition_covariates=transition_covariates,
-        transition_weights=transition_weights,
-        init_state_prob=init_state_prob,
-        obs_design_matrix=obs_design_matrix,
-        obs_weights=obs_weights,
+    return cast(
+        SmootherResult,
+        _contingency_belief_smoother_jit(
+            choices=choices,
+            rewards=rewards,
+            n_states=n_states,
+            n_options=n_options,
+            reward_probs=reward_probs,
+            state_values=state_values,
+            inverse_temperature=inverse_temperature,
+            transition_logits=transition_logits,
+            transition_covariates=transition_covariates,
+            transition_weights=transition_weights,
+            init_state_prob=init_state_prob,
+            obs_design_matrix=obs_design_matrix,
+            obs_weights=obs_weights,
+        ),
     )
 
 
@@ -673,15 +678,14 @@ def _contingency_belief_smoother_jit(
     if init_state_prob is None:
         init_state_prob = jnp.ones(n_states) / n_states
 
-    has_trans_covariates = (
-        transition_covariates is not None and transition_weights is not None
-    )
-    if not has_trans_covariates:
+    if transition_covariates is None or transition_weights is None:
         transition_covariates = jnp.zeros((n_trials, 1))
         transition_weights = jnp.zeros((n_states, n_states - 1, 1))
 
-    has_obs_covariates = obs_design_matrix is not None and obs_weights is not None
-    if has_obs_covariates:
+    if obs_design_matrix is None or obs_weights is None:
+        obs_design_matrix = jnp.zeros((n_trials, 1))
+        obs_weights = jnp.zeros((n_options, 1))
+    else:
         if obs_design_matrix.shape[0] != n_trials:
             raise ValueError(
                 f"obs_design_matrix has {obs_design_matrix.shape[0]} rows "
@@ -693,9 +697,6 @@ def _contingency_belief_smoother_jit(
                 f"obs_weights last-axis size {obs_weights.shape[-1]} != "
                 f"obs_design_matrix width {obs_design_matrix.shape[1]}"
             )
-    else:
-        obs_design_matrix = jnp.zeros((n_trials, 1))
-        obs_weights = jnp.zeros((n_options, 1))
 
     # --- Forward pass: store filter beliefs and per-step info ---
     _fwd_update = functools.partial(
@@ -843,7 +844,7 @@ def _optimize_transition_rows(
         )
         return result_opt.x
 
-    return jax.vmap(_optimize_one_row)(x0_all, response_all, alpha_all)
+    return cast(Array, jax.vmap(_optimize_one_row)(x0_all, response_all, alpha_all))
 
 
 class ContingencyBeliefModel(SGDFittableMixin):
@@ -988,13 +989,14 @@ class ContingencyBeliefModel(SGDFittableMixin):
         self.converged_: bool | None = None
 
         # Observation-side covariates for action biases
+        self.obs_weights_: Array | None
         if n_obs_covariates > 0:
             if per_state_obs_weights:
                 self.obs_weights_ = jnp.zeros((n_states, n_options, n_obs_covariates))
             else:
                 self.obs_weights_ = jnp.zeros((n_options, n_obs_covariates))
         else:
-            self.obs_weights_: Array | None = None
+            self.obs_weights_ = None
         self._obs_design_matrix: Array | None = None
 
         # Fitted state (public attributes per plan)
@@ -1275,8 +1277,9 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
         return log_likelihoods
 
-    def _m_step(self, choices, rewards, result):
+    def _m_step(self, choices: Array, rewards: Array, result: SmootherResult) -> None:
         """M-step: update reward_probs and transition coefficients."""
+        assert self._transition_design_matrix is not None
         gamma = result.smoothed_state_prob  # (T, S)
         xi = result.pairwise_state_prob  # (T-1, S, S)
 
@@ -1466,6 +1469,8 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
     @property
     def _n_timesteps(self) -> int:
+        if self._n_trials is None:
+            raise NotFittedError("Model must be fitted before accessing _n_timesteps.")
         return self._n_trials
 
     def _build_param_spec(self) -> tuple[dict, dict]:
@@ -1515,7 +1520,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
             kwargs["obs_weights"] = params["obs_weights"]
 
         result = _contingency_belief_filter_jit(**kwargs)
-        return -result.log_likelihood
+        return cast(Array, -result.log_likelihood)
 
     def _store_sgd_params(self, params: dict) -> None:
         self.reward_probs_ = params["reward_probs"]

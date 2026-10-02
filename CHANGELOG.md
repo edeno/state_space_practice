@@ -23,12 +23,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`kalman.kalman_filter_update` / `kalman.kalman_smoother_update`**: public
   names for the single-step Kalman updates.
 - **Optional extras** `plot` (matplotlib) and `notebooks` (matplotlib, pandas).
-- **Tooling**: GitHub Actions CI (ruff, ruff format, mypy on the type-clean
-  modules, fast tests on Python 3.10-3.12, nightly full suite),
+- **Tooling**: GitHub Actions CI (ruff, ruff format, mypy on the entire
+  package, fast tests on Python 3.10-3.12, nightly full suite),
   `.pre-commit-config.yaml` (ruff, ruff-format, nbstripout), `[tool.ruff]`
-  config, and `HYPOTHESIS_PROFILE` selection in the test conftest. mypy gates
-  the 24 modules listed in `[tool.mypy] files`; the other modules are not yet
-  type-clean.
+  config, and `HYPOTHESIS_PROFILE` selection in the test conftest. mypy checks
+  all package modules except tests, including untyped function bodies via
+  `check_untyped_defs = true`.
 - **`em_driver.run_em`**: the shared EM loop (E-step, convergence, rollback,
   M-step) used by the oscillator models, `PointProcessModel`, `PlaceFieldModel`,
   the switching point-process models and `SmithLearningModel`. Invalid option

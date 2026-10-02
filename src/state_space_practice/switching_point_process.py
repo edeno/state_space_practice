@@ -82,12 +82,15 @@ References
 3. Murphy, K.P. (1998). Switching Kalman Filters.
 """
 
+from __future__ import annotations
+
 import functools
 import logging
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal, cast, overload
 
 import jax
 import jax.numpy as jnp
@@ -692,6 +695,40 @@ def _point_process_predict_and_update(
     )
 
 
+@overload
+def _point_process_update_per_discrete_state_pair(
+    prev_state_cond_mean: Array,
+    prev_state_cond_cov: Array,
+    y_t: Array,
+    continuous_transition_matrix: Array,
+    process_cov: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    return_line_search_failures: Literal[False] = ...,
+) -> tuple[Array, Array, Array]: ...
+
+
+@overload
+def _point_process_update_per_discrete_state_pair(
+    prev_state_cond_mean: Array,
+    prev_state_cond_cov: Array,
+    y_t: Array,
+    continuous_transition_matrix: Array,
+    process_cov: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
+    include_laplace_normalization: bool = ...,
+    max_newton_iter: int = ...,
+    line_search_beta: float = ...,
+    return_line_search_failures: Literal[True] = ...,
+) -> tuple[Array, Array, Array, Array]: ...
+
+
 def _point_process_update_per_discrete_state_pair(
     prev_state_cond_mean: Array,
     prev_state_cond_cov: Array,
@@ -781,11 +818,14 @@ def _point_process_update_per_discrete_state_pair(
     ) -> tuple[Array, ...]:
         """Update for a single next-state j, vmapped over previous states i."""
         params_j = _select_spike_params(spike_params, state_index)
-        return jax.vmap(
-            _update,
-            in_axes=(-1, -1, None, None, None),  # vmap over prev state i
-            out_axes=-1,
-        )(prev_state_cond_mean, prev_state_cond_cov, A, Q, params_j)
+        return cast(
+            tuple[Array, ...],
+            jax.vmap(
+                _update,
+                in_axes=(-1, -1, None, None, None),  # vmap over prev state i
+                out_axes=-1,
+            )(prev_state_cond_mean, prev_state_cond_cov, A, Q, params_j),
+        )
 
     # Outer vmap: over next state j (axis -1 of A/Q)
     vmapped_update = jax.vmap(
@@ -794,8 +834,9 @@ def _point_process_update_per_discrete_state_pair(
         out_axes=-1,
     )
 
-    result: tuple[Array, Array, Array] | tuple[Array, Array, Array, Array] = (
-        vmapped_update(state_indices, continuous_transition_matrix, process_cov)
+    result: tuple[Array, Array, Array] | tuple[Array, Array, Array, Array] = cast(
+        tuple[Array, Array, Array] | tuple[Array, Array, Array, Array],
+        vmapped_update(state_indices, continuous_transition_matrix, process_cov),
     )
     return result
 
@@ -2453,20 +2494,23 @@ def switching_point_process_filter(
     _validate_discrete_state_transitions(
         discrete_transition_matrix, init_discrete_state_prob, dt
     )
-    return _switching_point_process_filter_jit(
-        init_state_cond_mean,
-        init_state_cond_cov,
-        init_discrete_state_prob,
-        spikes,
-        discrete_transition_matrix,
-        continuous_transition_matrix,
-        process_cov,
-        dt,
-        log_intensity_func,
-        spike_params,
-        include_laplace_normalization=include_laplace_normalization,
-        max_newton_iter=max_newton_iter,
-        line_search_beta=line_search_beta,
+    return cast(
+        tuple[Array, Array, Array, Array, Array, Array, Array],
+        _switching_point_process_filter_jit(
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            spikes,
+            discrete_transition_matrix,
+            continuous_transition_matrix,
+            process_cov,
+            dt,
+            log_intensity_func,
+            spike_params,
+            include_laplace_normalization=include_laplace_normalization,
+            max_newton_iter=max_newton_iter,
+            line_search_beta=line_search_beta,
+        ),
     )
 
 
@@ -2630,7 +2674,7 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         self.smoother_discrete_state_prob: Array
         self.smoother_joint_discrete_state_prob: Array
         self.smoother_pair_cond_cross_cov: Array
-        self.smoother_pair_cond_means: Array
+        self.smoother_pair_cond_means: Array | None
         # Populated only by the GPB2 smoother; None under GPB1.
         self.smoother_pair_cond_covs: Array | None
         self.smoother_next_pair_cond_means: Array | None
@@ -2860,6 +2904,8 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         validate_covariance(
             self.process_cov, "process_cov", require_positive_definite=False
         )
+        expected_baseline: tuple[int, ...]
+        expected_weights: tuple[int, ...]
         if self.separate_spike_params:
             expected_baseline = (self.n_neurons, self.n_discrete_states)
             expected_weights = (
