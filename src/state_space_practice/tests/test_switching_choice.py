@@ -1207,7 +1207,7 @@ class TestSwitchingChoiceMStepExactness:
         )
         fresh.input_gain_ = model.input_gain_
         fresh._covariates = data.covariates
-        fresh._m_step(jnp.asarray(data.choices), filt, smooth)
+        fresh._m_step(smooth)
         q_new = np.asarray(fresh.process_noises_)
         for s in range(2):
             eps = 1e-6 * q_new[s]

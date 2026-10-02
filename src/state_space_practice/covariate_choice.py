@@ -36,6 +36,7 @@ from jax import Array
 from jax.typing import ArrayLike
 from numpy.typing import NDArray
 
+from state_space_practice.kalman import rts_backward_scan_with_predictions
 from state_space_practice.multinomial_choice import (
     ChoiceFilterResult,
     ChoiceSmootherResult,
@@ -51,7 +52,6 @@ from state_space_practice.sgd_fitting import SGDParams, SGDParamSpec
 from state_space_practice.utils import (
     _root_figure,
     psd_solve,
-    symmetrize,
     typed_jit,
     validate_choice_indices,
 )
@@ -366,8 +366,9 @@ def _covariate_choice_filter_jit(
         choice_t, u_t, z_t = inputs
 
         # Predict with transition and control input
-        pred_mean = A @ filt_mean + input_gain @ u_t
-        pred_cov = A @ filt_cov @ A.T + Q
+        pred_mean, pred_cov = covariate_predict(
+            filt_mean, filt_cov, u_t, input_gain, A, Q
+        )
 
         # Observation offset from obs covariates
         obs_offset = obs_weights @ z_t
@@ -406,50 +407,6 @@ def _covariate_choice_filter_jit(
     )
 
 
-def _rts_smoother_pass_with_predictions(
-    filtered_values: Array,
-    filtered_covariances: Array,
-    predicted_values: Array,
-    predicted_covariances: Array,
-    A: Array,
-) -> tuple[Array, Array, Array]:
-    """RTS backward smoother that consumes the filter's stored one-step predictions.
-
-    Unlike :func:`kalman.rts_backward_scan`, which recomputes the
-    one-step prediction as ``A @ m_filt`` (valid only for control-free dynamics),
-    this uses ``predicted_values`` / ``predicted_covariances`` from the forward
-    filter. Those already include the control input ``input_gain @ u_t``, so the
-    smoothed means stay consistent with the filter when dynamics covariates are
-    present. The gain/covariance recursion is the standard RTS update (the control
-    input does not affect covariances), so with no control input this reduces
-    exactly to ``rts_backward_scan``.
-    """
-
-    def _smooth_step(
-        carry: tuple[Array, Array], inputs: tuple[Array, Array, Array, Array]
-    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
-        next_sm_mean, next_sm_cov = carry
-        f_mean, f_cov, p_mean_next, p_cov_next = inputs
-        gain = psd_solve(p_cov_next, A @ f_cov).T
-        sm_mean = f_mean + gain @ (next_sm_mean - p_mean_next)
-        sm_cov = symmetrize(f_cov + gain @ (next_sm_cov - p_cov_next) @ gain.T)
-        cross_cov = gain @ next_sm_cov
-        return (sm_mean, sm_cov), (sm_mean, sm_cov, cross_cov)
-
-    _, (sm_means, sm_covs, cross_covs) = jax.lax.scan(
-        _smooth_step,
-        (filtered_values[-1], filtered_covariances[-1]),
-        (
-            filtered_values[:-1],
-            filtered_covariances[:-1],
-            predicted_values[1:],
-            predicted_covariances[1:],
-        ),
-        reverse=True,
-    )
-    return sm_means, sm_covs, cross_covs
-
-
 def covariate_choice_smoother(
     choices: ArrayLike,
     n_options: int,
@@ -485,23 +442,17 @@ def covariate_choice_smoother(
         init_cov,
     )
 
-    k_free = n_options - 1
-    A = jnp.eye(k_free) * decay
-
     # Control-aware RTS: consume the filter's stored one-step predictions (which
     # include the control input input_gain @ u_t) instead of recomputing
     # A @ m_filt, so the smoothed means are consistent with the filter when
     # dynamics covariates are present.
-    sm_means, sm_covs, cross_covs = _rts_smoother_pass_with_predictions(
+    smoothed_values, smoothed_covs, cross_covs = rts_backward_scan_with_predictions(
         filt.filtered_values,
         filt.filtered_covariances,
         filt.predicted_values,
         filt.predicted_covariances,
-        A,
+        jnp.eye(n_options - 1) * decay,
     )
-
-    smoothed_values = jnp.concatenate([sm_means, filt.filtered_values[-1:]])
-    smoothed_covs = jnp.concatenate([sm_covs, filt.filtered_covariances[-1:]])
 
     return ChoiceSmootherResult(
         smoothed_values=smoothed_values,
@@ -730,6 +681,7 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
         choices: Array,
         log_likelihoods: list[float],
         last_accepted: dict[str, Any] | None,
+        current: ChoiceSmootherResult | None = None,
     ) -> float:
         """Final E-step, kept only if it did not decrease the log-likelihood.
 
@@ -739,7 +691,9 @@ class CovariateChoiceModel(_MultinomialChoiceBase):
         M-step is rolled back so the stored (params, smoother, LL) stay
         consistent.
         """
-        final_ll = super()._final_e_step(choices, log_likelihoods, last_accepted)
+        final_ll = super()._final_e_step(
+            choices, log_likelihoods, last_accepted, current
+        )
         close = bool(log_likelihoods) and np.isclose(final_ll, log_likelihoods[-1])
         not_worse = (not log_likelihoods) or close or final_ll >= log_likelihoods[-1]
         if np.isfinite(final_ll) and not_worse:

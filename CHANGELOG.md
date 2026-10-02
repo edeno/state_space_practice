@@ -83,7 +83,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Laplace evidence of the Smith model (what `log_likelihood_`, `bic()` and
   `fit_sgd` now use).
 - **`switching_choice.switching_choice_smoother`**: GPB1 backward pass that
-  accounts for the covariate input ``B u_t``.
+  accounts for the covariate input ``B u_t``. It returns a
+  `switching_kalman.SwitchingSmootherResult` (a NamedTuple, so positional
+  access still works).
 - **`em_driver.snapshot_attributes` / `restore_attributes` /
   `clear_attributes`**: build `run_em`'s snapshot, restore and clear hooks
   from a tuple of attribute names; every `run_em` caller now uses them.
@@ -153,6 +155,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **`covariate_choice_smoother` uses `kalman.rts_backward_scan_with_predictions`**
+  (jitted; about 10x faster per call, which was recompiling every EM
+  iteration). Its gain solve is the shared, retrying one, so smoothed values
+  and fitted parameters can move at round-off level (~1e-9 relative after 200
+  EM iterations).
+- **The choice models skip the duplicate final E-step after convergence**
+  (`MultinomialChoiceModel`, `CovariateChoiceModel`, `SwitchingChoiceModel`).
 - **`PlaceFieldModel.predict_rate_map` uses an optimized einsum** (large
   speedups at moderate grid sizes).
 - **Eager `utils.debug_print_if` calls no longer compile a `jit(cond)` each

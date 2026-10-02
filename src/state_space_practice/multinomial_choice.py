@@ -750,6 +750,7 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         choices: Array,
         log_likelihoods: list[float],
         last_accepted: dict[str, Any] | None,
+        current: ChoiceSmootherResult | None = None,
     ) -> float:
         """Sync ``_smoother_result`` / ``log_likelihood_`` to the final parameters.
 
@@ -757,9 +758,12 @@ class _MultinomialChoiceBase(SGDFittableMixin):
         ``log_likelihoods`` is the per-iteration history and ``last_accepted``
         the parameter snapshot taken before the last M-step (None if no M-step
         ran); subclasses may use them to amend the history or roll a degrading
-        final M-step back.
+        final M-step back. ``current`` is an E-step result already computed at
+        the current parameters, reused instead of re-running the smoother.
         """
-        self._smoother_result = self._run_smoother(choices)
+        self._smoother_result = (
+            current if current is not None else self._run_smoother(choices)
+        )
         self.log_likelihood_ = float(self._smoother_result.marginal_log_likelihood)
         return self.log_likelihood_
 
@@ -899,8 +903,11 @@ class _MultinomialChoiceBase(SGDFittableMixin):
 
             self._m_step(smooth, choices_arr, beta_grid)
 
-        # Final E-step with learned parameters
-        self._final_e_step(choices_arr, log_likelihoods, last_accepted)
+        # Final E-step with learned parameters. On convergence no M-step followed
+        # the last E-step, so its smoother result is already at those parameters.
+        self._final_e_step(
+            choices_arr, log_likelihoods, last_accepted, smooth if converged else None
+        )
         self.n_iter_ = len(log_likelihoods)
         self.log_likelihood_history_ = log_likelihoods
         self._populate_uncertainty(choices_arr)
