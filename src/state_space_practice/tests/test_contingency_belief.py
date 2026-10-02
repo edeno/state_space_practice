@@ -264,6 +264,14 @@ class TestContingencyBeliefSmoother:
         )
         return kwargs
 
+    def test_result_unpacks_into_three_values(self, block_data):
+        """The public result keeps its (smoothed, pairwise, log_likelihood)
+        layout, so existing three-way unpacking keeps working."""
+        smoothed, pairwise, ll = contingency_belief_smoother(**block_data)
+        assert smoothed.shape == (40, 2)
+        assert pairwise.shape == (39, 2, 2)
+        assert np.isfinite(ll)
+
     def test_smoother_shapes(self, block_data):
         result = contingency_belief_smoother(**block_data)
         assert result.smoothed_state_prob.shape == (40, 2)
@@ -782,19 +790,20 @@ class TestEMNonFiniteLikelihood:
         assert model.converged_ is False
         assert model.log_likelihood_ == lls[-1]
         # Posteriors are those of the restored parameters.
-        fresh = contingency_belief_smoother(
-            **model._smoother_kwargs(
-                jnp.asarray(choices),
-                jnp.asarray(rewards),
-                model._transition_design_matrix,
-                None,
-            )
+        kwargs = model._smoother_kwargs(
+            jnp.asarray(choices),
+            jnp.asarray(rewards),
+            model._transition_design_matrix,
+            None,
         )
+        fresh = contingency_belief_smoother(**kwargs)
         assert float(fresh.log_likelihood) == lls[-1]
         np.testing.assert_array_equal(
             model.smoothed_state_posterior_, fresh.smoothed_state_prob
         )
-        np.testing.assert_array_equal(model.state_posterior_, fresh.filtered_state_prob)
+        np.testing.assert_array_equal(
+            model.state_posterior_, contingency_belief_filter(**kwargs).state_posterior
+        )
         assert any("non-finite" in r.getMessage().lower() for r in caplog.records)
 
     def test_first_estep_nonfinite_raises(self):

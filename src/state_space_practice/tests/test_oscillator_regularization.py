@@ -277,6 +277,39 @@ class TestRegularizedSGDIntegration:
         norm_reg = float(jnp.sum(jnp.abs(model_reg.coupling_strength)))
         assert norm_reg < norm_base
 
+    def test_log_likelihood_is_marginal_not_penalized_objective(self):
+        """log_likelihood_ after a regularized fit_sgd is the marginal
+        log-likelihood at the fitted parameters, not the penalized training
+        objective recorded in log_likelihood_history_."""
+        from state_space_practice.oscillator_models import DirectedInfluenceModel
+        from state_space_practice.simulate.scenarios import simulate_dim_scenario
+
+        scenario = simulate_dim_scenario(n_time=200, seed=42)
+        p = scenario["params"]
+        model = DirectedInfluenceModel(
+            n_oscillators=p["n_oscillators"],
+            n_discrete_states=p["n_discrete_states"],
+            sampling_freq=p["sampling_freq"],
+            freqs=p["freqs"],
+            damping_coef=p["damping"],
+            process_variance=p["process_variance"],
+            measurement_variance=p["measurement_variance"],
+            phase_difference=p["phase_difference"],
+            coupling_strength=p["coupling_strength"],
+        )
+        objective = model.fit_sgd(
+            scenario["obs"],
+            key=jax.random.PRNGKey(0),
+            num_steps=10,
+            connectivity_penalty=OscillatorPenaltyConfig(edge_l1=5.0),
+        )
+
+        marginal_ll = float(model._e_step(scenario["obs"]))
+        # Guard: the penalty makes the objective differ from the likelihood.
+        assert not np.isclose(objective[-1], marginal_ll)
+        assert model.log_likelihood_ == pytest.approx(marginal_ll, rel=1e-12)
+        assert model.log_likelihood_history_ == objective
+
     def test_area_penalty_with_summary(self):
         """Area group penalty + summary helper work end-to-end."""
         from state_space_practice.oscillator_models import DirectedInfluenceModel

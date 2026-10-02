@@ -432,13 +432,13 @@ def _prepare_inputs(
     n_options: int,
     reward_probs: ArrayLike,
     state_values: ArrayLike,
-    inverse_temperature: float,
-    transition_logits: ArrayLike | None,
-    transition_covariates: ArrayLike | None,
-    transition_weights: ArrayLike | None,
-    init_state_prob: ArrayLike | None,
-    obs_design_matrix: ArrayLike | None,
-    obs_weights: ArrayLike | None,
+    inverse_temperature: float = 1.0,
+    transition_logits: ArrayLike | None = None,
+    transition_covariates: ArrayLike | None = None,
+    transition_weights: ArrayLike | None = None,
+    init_state_prob: ArrayLike | None = None,
+    obs_design_matrix: ArrayLike | None = None,
+    obs_weights: ArrayLike | None = None,
 ) -> dict[str, Any]:
     """Validate choices/rewards and convert the inputs of the jitted cores.
 
@@ -705,7 +705,19 @@ class SmootherResult(NamedTuple):
     smoothed_state_prob: Array  # (n_trials, n_states)
     pairwise_state_prob: Array  # (n_trials-1, n_states, n_states)
     log_likelihood: Array  # scalar
-    filtered_state_prob: Array  # (n_trials, n_states), the forward-pass posterior
+
+
+class _SmootherOutputs(NamedTuple):
+    """``SmootherResult`` plus the forward pass's filtered posterior.
+
+    Internal: the model stores the causal posterior without re-running the
+    filter, while the public smoother keeps its three-field result.
+    """
+
+    smoothed_state_prob: Array  # (n_trials, n_states)
+    pairwise_state_prob: Array  # (n_trials-1, n_states, n_states)
+    log_likelihood: Array  # scalar
+    filtered_state_prob: Array  # (n_trials, n_states)
 
 
 def contingency_belief_smoother(
@@ -737,11 +749,8 @@ def contingency_belief_smoother(
         smoothed_state_prob: shape (n_trials, n_states)
         pairwise_state_prob: shape (n_trials-1, n_states, n_states)
         log_likelihood: scalar
-        filtered_state_prob: shape (n_trials, n_states), the filter
-        posterior P(s_t | a_{1:t}, r_{1:t}) from the forward pass (equal to
-        ``contingency_belief_filter(...).state_posterior``)
     """
-    return _contingency_belief_smoother_jit(
+    smoothed, pairwise, log_likelihood, _ = _contingency_belief_smoother_jit(
         **_prepare_inputs(
             choices,
             rewards,
@@ -758,6 +767,13 @@ def contingency_belief_smoother(
             obs_weights,
         )
     )
+    return SmootherResult(smoothed, pairwise, log_likelihood)
+
+
+def _smooth_with_filter(**kwargs: Any) -> _SmootherOutputs:
+    """Smoother outputs plus the filtered posterior; takes the keyword
+    arguments of :func:`contingency_belief_smoother`."""
+    return _contingency_belief_smoother_jit(**_prepare_inputs(**kwargs))
 
 
 @functools.partial(typed_jit, static_argnames=["n_states", "n_options"])
@@ -775,7 +791,7 @@ def _contingency_belief_smoother_jit(
     init_state_prob: Array | None = None,
     obs_design_matrix: Array | None = None,
     obs_weights: Array | None = None,
-) -> SmootherResult:
+) -> _SmootherOutputs:
     # --- Forward pass: store filter beliefs and per-step info ---
     filter_beliefs, predicted_beliefs, trans_matrices, total_ll = _forward_pass(
         choices,
@@ -845,7 +861,7 @@ def _contingency_belief_smoother_jit(
     )
     pairwise = jax.vmap(_pairwise)(pairwise_inputs)
 
-    return SmootherResult(
+    return _SmootherOutputs(
         smoothed_state_prob=smoothed,
         pairwise_state_prob=pairwise,
         log_likelihood=total_ll,
@@ -989,7 +1005,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
     # NotFittedError. Posteriors are (n_trials, n_states).
     state_posterior_: FittedAttribute[Array] = FittedAttribute()
     smoothed_state_posterior_: FittedAttribute[Array] = FittedAttribute()
-    _smoother_result: FittedAttribute[SmootherResult] = FittedAttribute()
+    _smoother_result: FittedAttribute[_SmootherOutputs] = FittedAttribute()
     log_likelihood_: FittedAttribute[float] = FittedAttribute()
     _n_trials: FittedAttribute[int] = FittedAttribute()
 
@@ -1361,8 +1377,8 @@ class ContingencyBeliefModel(SGDFittableMixin):
             require_obs_design_matrix=False,
         )
 
-        def _e_step() -> SmootherResult:
-            return contingency_belief_smoother(
+        def _e_step() -> _SmootherOutputs:
+            return _smooth_with_filter(
                 **self._smoother_kwargs(
                     choices, rewards, self._transition_design_matrix, None
                 )
@@ -1453,7 +1469,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
 
         return log_likelihoods
 
-    def _m_step(self, choices: Array, rewards: Array, result: SmootherResult) -> None:
+    def _m_step(self, choices: Array, rewards: Array, result: _SmootherOutputs) -> None:
         """M-step: update reward_probs and transition coefficients."""
         assert self._transition_design_matrix is not None
         gamma = result.smoothed_state_prob  # (T, S)
@@ -1696,7 +1712,7 @@ class ContingencyBeliefModel(SGDFittableMixin):
         kwargs = self._smoother_kwargs(
             choices, rewards, self._transition_design_matrix, self._obs_design_matrix
         )
-        result = contingency_belief_smoother(**kwargs)
+        result = _smooth_with_filter(**kwargs)
         self._smoother_result = result
         self.smoothed_state_posterior_ = result.smoothed_state_prob
         self.log_likelihood_ = float(result.log_likelihood)

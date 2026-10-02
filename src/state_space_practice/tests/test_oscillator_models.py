@@ -1967,6 +1967,17 @@ class TestCommonOscillatorSGDFitting:
         # LL should improve from first to last
         assert lls[-1] > lls[0]
 
+    def test_zero_step_fit_sgd_records_log_likelihood(self, com_setup):
+        """num_steps=0 records no optimization history, but final inference
+        still runs, so log_likelihood_ is the marginal LL at the stored
+        parameters."""
+        model, obs = com_setup
+        lls = model.fit_sgd(obs, key=jax.random.PRNGKey(0), num_steps=0)
+        assert lls == []
+        assert model.log_likelihood_ == pytest.approx(
+            float(model._e_step(obs)), rel=1e-12
+        )
+
     def test_sgd_discrete_transitions_stochastic(self, com_setup):
         model, obs = com_setup
         key = jax.random.PRNGKey(0)
