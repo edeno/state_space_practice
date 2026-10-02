@@ -2015,8 +2015,8 @@ class SmithLearningModel(SGDFittableMixin):
     ) -> tuple[tuple[Array], dict[str, Any]]:
         """Validate the ``fit_sgd`` responses and record the trial count.
 
-        Runs after ``fit_sgd`` has validated its settings, so a rejected call
-        leaves the model untouched.
+        Runs after ``fit_sgd`` has validated its settings, so a call rejected
+        for its settings or data leaves the model untouched.
         """
         n_correct_arr = jnp.asarray(n_correct_responses)
         if n_correct_arr.ndim != 1:
@@ -2105,7 +2105,8 @@ class SmithLearningModel(SGDFittableMixin):
 
     def _finalize_sgd(self, n_correct_responses: Array) -> float:
         # One E-step at the fitted parameters stores the filtered / smoothed
-        # estimates and the Laplace log-likelihood, exactly as after EM.
+        # estimates, exactly as after EM, and returns the Laplace
+        # log-likelihood (recorded as log_likelihood_).
         return self._e_step(n_correct_responses)
 
     def get_learning_curve(

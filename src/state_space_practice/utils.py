@@ -1013,9 +1013,9 @@ def warn_if_not_positive_definite_in_graph(
 def debug_print_if(condition: ArrayLike, fmt: str, **fmt_kwargs: Any) -> None:
     """Fire ``jax.debug.print(fmt, **fmt_kwargs)`` only when ``condition`` is True.
 
-    Wraps ``jax.lax.cond`` so callers don't have to spell out the
-    ``(lambda: jax.debug.print(...), lambda: None)`` pattern at every
-    silent-fallback site. The print branch fires when the predicate is
+    Under tracing it wraps ``jax.lax.cond``, so callers don't have to spell
+    out the ``(lambda: jax.debug.print(...), lambda: None)`` pattern at every
+    silent-fallback site; with concrete inputs it branches on the host. The print branch fires when the predicate is
     True (i.e. when the *bad* condition holds), matching how the call
     site reads at the user's eye: "if `~is_valid`, print the warning."
     """
@@ -1092,18 +1092,18 @@ def validate_count_array(
 
 
 def as_2d_count_matrix(counts: ArrayLike, name: str) -> Array:
-    """Coerce counts to ``(n_time, n_units)`` and validate them as counts.
+    """Coerce counts to ``(n_time, n_neurons)`` and validate them as counts.
 
     Parameters
     ----------
-    counts : ArrayLike, shape (n_time,) or (n_time, n_units)
-        Observed counts; a 1-D array is treated as a single unit.
+    counts : ArrayLike, shape (n_time,) or (n_time, n_neurons)
+        Observed counts; a 1-D array is treated as a single neuron.
     name : str
         Argument name used in error messages.
 
     Returns
     -------
-    Array, shape (n_time, n_units)
+    Array, shape (n_time, n_neurons)
 
     Raises
     ------

@@ -395,12 +395,17 @@ class SGDFittableMixin:
     ``_sgd_param_attrs`` (consumed by the default ``_store_sgd_params``) or
     by overriding ``_store_sgd_params``.
 
-    Models whose parameters are allocated lazily (e.g. on the first ``fit``)
-    may override ``_check_sgd_initialized`` to raise before optimization
-    starts; the default is a no-op for models that allocate in ``__init__``.
-    Models that need to validate or canonicalize the data ``fit_sgd``
-    receives (or record its length for ``_n_timesteps``) override
-    ``_prepare_sgd_data`` instead of re-declaring ``fit_sgd``.
+    All model-specific setup for a fit -- validating and binding the data,
+    recording its length for ``_n_timesteps``, initializing or warm-starting
+    parameters -- belongs in ``_prepare_sgd_data``, which ``fit_sgd`` calls
+    only after validating its own settings; it must validate before it
+    mutates the model. A model may re-declare ``fit_sgd`` only as a typed
+    wrapper that forwards its arguments to this one.
+
+    Every fit (``fit_sgd`` and a model's EM ``fit``) records its results with
+    ``_record_fit_result``; a fit that cannot produce a result clears the
+    model's fit outputs (``_fit_output_attrs``) with ``_clear_fit_state``
+    before raising.
     """
 
     #: Optimized-parameter key -> model attribute name, consumed by the
@@ -489,6 +494,18 @@ class SGDFittableMixin:
         not optimized, so the compiled SGD step stays reusable after a fit
         rewrites it.
 
+        Parameters
+        ----------
+        params : SGDParams
+            The constrained parameters passed to the loss.
+        prefix : str
+            Key prefix of the per-state entries (``f"{prefix}_{j}"``).
+        n_discrete_states : int
+            Number of discrete states (length of the trailing axis).
+        attr : str or None
+            Model attribute supplying states absent from ``params``; defaults
+            to ``prefix``.
+
         Returns
         -------
         Array, shape (..., n_discrete_states)
@@ -505,15 +522,20 @@ class SGDFittableMixin:
     def _prepare_sgd_data(
         self, *args: Any, **kwargs: Any
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        """Validate / canonicalize the data passed to ``fit_sgd``.
+        """Model-specific setup for ``fit_sgd``: validate data, then prepare.
 
-        Called first thing in ``fit_sgd`` with the positional data and any
-        model-specific keyword arguments (everything except the optimizer
-        settings). The returned ``(args, kwargs)`` replace the originals and
-        are forwarded to ``_sgd_loss_fn`` and ``_finalize_sgd``, so a model
-        can coerce inputs to arrays, reject malformed data before any JAX
-        work, or record the sequence length that ``_n_timesteps`` reports,
-        without overriding ``fit_sgd`` itself. The default is the identity.
+        Called by ``fit_sgd`` after it validates ``num_steps``, the optimizer
+        and ``convergence_tol``, with the positional data and any
+        model-specific keyword arguments (everything except those settings).
+        The returned ``(args, kwargs)`` replace the originals and are
+        forwarded to ``_sgd_loss_fn`` and ``_finalize_sgd``. A model may
+        coerce and validate the data, bind it, record the length
+        ``_n_timesteps`` reports, and initialize or warm-start parameters
+        here; it must validate before mutating anything, so a call rejected
+        for its settings or its data leaves the model unchanged. (Checks
+        ``fit_sgd`` runs after this hook -- learnable parameters exist, are
+        finite, ``_n_timesteps`` is positive -- see the prepared model.)
+        The default is the identity.
         """
         return args, kwargs
 

@@ -28,9 +28,16 @@ class NotFittedError(RuntimeError):
 
 
 class NonFiniteLikelihoodError(ValueError):
-    """Raised when EM's first E-step returns a non-finite log-likelihood.
+    """Raised when a fit's starting parameters give a non-finite log-likelihood.
 
-    The starting parameters are unusable. A ``ValueError`` subclass, so
-    ``except ValueError`` handlers keep matching; catch this class to tell a
-    numerically failed fit apart from invalid input.
+    Raised by ``fit_sgd`` (non-finite log-likelihood at the fitted parameters)
+    and by the EM ``fit`` of the choice / belief models and the switching
+    point-process models (non-finite first E-step). The model's fit outputs
+    are cleared first, so it reads as unfitted. The oscillator, point-process,
+    place-field and Smith learning models' EM ``fit`` instead clears its
+    outputs, logs a warning and returns an empty history.
+
+    A ``ValueError`` subclass, so ``except ValueError`` handlers keep
+    matching; catch this class to tell a numerically failed fit apart from
+    invalid input.
     """

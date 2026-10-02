@@ -87,9 +87,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `switching_kalman.SwitchingSmootherResult` (a NamedTuple, so positional
   access still works).
 - **`em_driver.snapshot_attributes` / `restore_attributes` /
-  `clear_attributes`**: build `run_em`'s snapshot, restore and clear hooks
-  from a tuple of attribute names; every `run_em` caller now uses them.
-- **`utils.as_2d_count_matrix`**: coerce `(n_time,)` or `(n_time, n_units)`
+  `clear_attributes`** (and the `AttributeSnapshot` they pass): build
+  `run_em`'s snapshot, restore and clear hooks from a tuple of attribute
+  names; a snapshot carries its own keys, and `deepcopy_keys` outside them
+  raise. Every `run_em` caller builds its snapshot / restore hooks from them.
+- **`utils.as_2d_count_matrix`**: coerce `(n_time,)` or `(n_time, n_neurons)`
   counts to 2-D and validate them.
 - **Stacked oscillator constructors in `oscillator_utils`**:
   `construct_common_oscillator_transition_matrix_stack`,
@@ -156,8 +158,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed — behavior (may affect existing callers)
 
 - **`covariate_choice_smoother` uses `kalman.rts_backward_scan_with_predictions`**
-  (jitted; about 10x faster per call, which was recompiling every EM
-  iteration). Its gain solve is the shared, retrying one, so smoothed values
+  (jitted; about 10x faster per call -- the previous un-jitted RTS pass
+  re-traced on every EM iteration). Its gain solve is the shared, retrying one, so smoothed values
   and fitted parameters can move at round-off level (~1e-9 relative after 200
   EM iterations).
 - **The choice models skip the duplicate final E-step after convergence**
@@ -457,14 +459,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (which fingerprints model attributes read while tracing) missed after every
   fit rewrote them, and each repeat `fit_sgd` re-traced and recompiled --
   about 0.4-2 s per call at test sizes for `PointProcessModel`,
-  `PlaceFieldModel(warm_start=False)`, the Gaussian and point-process
+  `PlaceFieldModel.fit_sgd(warm_start=False)`, the Gaussian and point-process
   oscillator models and `SwitchingSpikeOscillatorModel` (now ~0.04-0.35 s).
   Losses read parameters through the new `SGDFittableMixin._sgd_param` /
   `_sgd_per_state_param`, which touch the attribute only when the parameter is
   not optimized. `DirectedInfluenceModel` / `DirectedInfluencePointProcessModel`
-  pass `freqs` and `damping_coef` as frozen SGD parameters (they change on
-  re-initialization), which moves their SGD results at round-off level
-  (~1e-15 relative). Results of every other model are bit-identical.
+  pass `freqs` and `damping_coef` as frozen SGD parameters (warm-start seeding
+  and EM re-derive them from the transition matrix), which moves their SGD
+  results at round-off level (~1e-15 relative). `SwitchingChoiceModel` also
+  recompiled on every call, because `parameter_transforms.positive_capped`
+  built a new transform each time, so equal parameter specs compared unequal;
+  it now returns one transform per cap. Results of every other model are
+  bit-identical.
 - **A rejected `fit_sgd` call no longer changes the model**: model-specific
   setup (data binding, initialization, warm start, recorded lengths) ran in
   each model's `fit_sgd` override before the shared settings checks, so e.g.
@@ -486,8 +492,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `PointProcessModel.fit`, `SwitchingSpikeOscillatorModel.fit`,
   `PlaceFieldModel.fit` and the oscillator models' `fit` did not set
   `log_likelihood_` at all; and `n_iter_` survived a later `fit_sgd`.
-  `n_iter_` is now available on every model (`None` until an EM fit, and after
-  `fit_sgd`). Multi-restart switching point-process fits report the best
+  `n_iter_` is now available on every `SGDFittableMixin` model: the number of
+  log-likelihoods an EM fit recorded (EM's final synchronising E-step can
+  make it `max_iter + 1`), `None` until an EM fit and after `fit_sgd`. Multi-restart switching point-process fits report the best
   restart's convergence flag. After `fit_sgd`, `log_likelihood_` is the
   marginal log-likelihood from the final inference at the fitted parameters
   (each model's `_finalize_sgd` now returns it), not the training objective:

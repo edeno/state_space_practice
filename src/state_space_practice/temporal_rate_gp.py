@@ -803,8 +803,8 @@ class TemporalRateGP(SGDFittableMixin):
     ) -> tuple[tuple[Array], dict[str, Any]]:
         """Validate the ``fit_sgd`` counts and record their shape.
 
-        Runs after ``fit_sgd`` has validated its settings, so a rejected call
-        leaves the model untouched.
+        Runs after ``fit_sgd`` has validated its settings, so a call rejected
+        for its settings or data leaves the model untouched.
         """
         counts = jnp.asarray(counts)
         if counts.ndim == 1:

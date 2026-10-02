@@ -362,7 +362,17 @@ class PlaceFieldModel(SGDFittableMixin):
     basis_info : dict
         Spline basis specification (knots, bounds, formula).
     log_likelihoods : list[float]
-        Log-likelihood history from fitting.
+        EM log-likelihood history after ``fit`` (same as
+        ``log_likelihood_history_``); after ``fit_sgd``, the single marginal
+        log-likelihood at the fitted parameters (``[log_likelihood_]``).
+    log_likelihood_ : float
+        Marginal log-likelihood at the fitted parameters.
+    log_likelihood_history_ : list[float]
+        Per-iteration EM log-likelihoods, or per-step SGD training objective.
+    converged_ : bool
+        Whether the last fit met its convergence criterion.
+    n_iter_ : int or None
+        Number of EM log-likelihoods recorded; ``None`` after ``fit_sgd``.
     n_neurons : int
         Number of neurons (detected from spikes during fit).
 
@@ -1466,8 +1476,9 @@ class PlaceFieldModel(SGDFittableMixin):
     ) -> tuple[tuple[Array, Array], dict[str, Any]]:
         """Validate the ``fit_sgd`` data, initialize the model, build the design.
 
-        Runs after ``fit_sgd`` has validated its settings, so a rejected call
-        leaves the model (including fitted parameters a warm start would
+        Runs after ``fit_sgd`` has validated its settings and validates the
+        data before building the basis, so a call rejected for its settings or
+        data leaves the model (including fitted parameters a warm start would
         overwrite) untouched. Returns the filter design matrix and spikes.
         """
         position = np.asarray(position)

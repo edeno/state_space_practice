@@ -793,7 +793,7 @@ def _contingency_belief_smoother_jit(
     obs_design_matrix: Array | None = None,
     obs_weights: Array | None = None,
 ) -> _SmootherOutputs:
-    # --- Forward pass: store filter beliefs and per-step info ---
+    # Forward pass
     filter_beliefs, predicted_beliefs, trans_matrices, total_ll = _forward_pass(
         choices,
         rewards,
@@ -1470,8 +1470,8 @@ class ContingencyBeliefModel(SGDFittableMixin):
                 self._smoother_result = result
                 self.smoothed_state_posterior_ = result.smoothed_state_prob
                 logger.warning(
-                    "Final M-step decreased the log-likelihood; rolled back to "
-                    "the previous parameters."
+                    "Final M-step decreased the log-likelihood (or left it "
+                    "non-finite); rolled back to the previous parameters."
                 )
 
         self._record_fit_result(log_likelihoods, converged, n_iter=len(log_likelihoods))

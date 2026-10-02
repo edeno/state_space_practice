@@ -1250,8 +1250,9 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
         """Validate, then initialize / warm-start the model for ``fit_sgd``.
 
-        Runs after ``fit_sgd`` validated its settings, so a call that is
-        rejected leaves the model untouched. Only the observations are
+        Runs after ``fit_sgd`` validated its settings and validates the
+        observations first, so a call rejected for its settings or data leaves
+        the model untouched. Only the observations are
         forwarded to ``_sgd_loss_fn`` and ``_finalize_sgd``.
         """
         observations = self._validate_observations(observations)
@@ -2103,9 +2104,10 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
                 params[k] = self.init_cov[..., j]
                 spec[k] = PSD_MATRIX
 
-        # Not optimized, but read by the loss: passing them as frozen params
-        # makes them arguments of the compiled SGD step rather than constants
-        # baked into it, so re-initialization does not force a recompile.
+        # Not trained, but read by the loss, and re-derived from the transition
+        # matrix by warm-start seeding and by EM: as frozen params they are
+        # arguments of the compiled SGD step rather than baked-in constants,
+        # so a change to them alone does not force a recompile.
         params["freqs"] = self.freqs
         spec["freqs"] = frozen(UNCONSTRAINED)
         params["damping_coef"] = self.damping_coef
@@ -2124,7 +2126,7 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         skip_init: bool = False,
         connectivity_penalty: "OscillatorPenaltyConfig | None" = None,
     ) -> list[float]:
-        """Fit by minimizing negative marginal LL via gradient descent.
+        """Fit by gradient descent on the marginal LL (minus any penalty).
 
         SGD optimizes ``coupling_strength`` and ``phase_difference``
         (and optionally discrete transition, init params, measurement cov).
@@ -2155,6 +2157,17 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         Returns
         -------
         log_likelihoods : list of float
+            Per-step training objective: the log-likelihood minus the
+            connectivity penalty when one is given (see
+            ``SGDFittableMixin.fit_sgd``). ``log_likelihood_`` is the marginal
+            log-likelihood at the fitted parameters, without the penalty.
+
+        Raises
+        ------
+        ValueError
+            Invalid settings or data (see ``SGDFittableMixin.fit_sgd``).
+        NonFiniteLikelihoodError
+            If the log-likelihood at the fitted parameters is non-finite.
         """
         # The mixin's fit_sgd, not BaseModel's: that typed wrapper does not
         # forward ``connectivity_penalty`` to ``_prepare_sgd_data``.

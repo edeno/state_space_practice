@@ -3579,8 +3579,8 @@ class PointProcessModel(SGDFittableMixin):
     ) -> tuple[tuple[Array, Array], dict[str, Any]]:
         """Validate the ``fit_sgd`` data and record its length.
 
-        Runs after ``fit_sgd`` has validated its settings, so a rejected call
-        leaves the model untouched.
+        Runs after ``fit_sgd`` has validated its settings, so a call rejected
+        for its settings or data leaves the model untouched.
         """
         design_matrix = jnp.asarray(design_matrix)
         spike_indicator = jnp.asarray(spike_indicator)

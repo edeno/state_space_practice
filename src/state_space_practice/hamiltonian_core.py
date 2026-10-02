@@ -772,6 +772,8 @@ class _SingleRegimeHamiltonianModel(HamiltonianModelBase):
         ``data`` is whatever ``fit_sgd`` passed positionally (one observation
         array for the single-modality models, LFP and spikes for the joint
         model); ``filter`` and ``smooth`` take the same positional layout.
+        Returns the filter's summed marginal log-likelihood, which becomes
+        ``log_likelihood_``.
         """
         params = self._build_param_spec()[0]
         means, covs, lls = self.filter(*data, params)

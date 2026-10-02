@@ -244,7 +244,7 @@ class _JointHamiltonianBase(HamiltonianModelBase):
         use_filter: bool = True,
         l2_reg: float = 1e-4,
     ) -> list[float]:
-        """Fit by gradient descent on the negative log-likelihood.
+        """Fit by gradient descent on the negative log-likelihood + L2 penalty.
 
         Parameters
         ----------
@@ -273,7 +273,10 @@ class _JointHamiltonianBase(HamiltonianModelBase):
         Returns
         -------
         log_likelihoods : list of float
-            Log-likelihood (or surrogate) per accepted optimization step.
+            Training objective per accepted optimization step: the
+            log-likelihood (or the rollout surrogate) minus the L2 penalty.
+            ``log_likelihood_`` is instead the filter's marginal
+            log-likelihood at the fitted parameters.
         """
         return super().fit_sgd(
             lfp_obs,

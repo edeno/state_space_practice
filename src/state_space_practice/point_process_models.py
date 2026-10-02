@@ -552,6 +552,15 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         -------
         log_likelihoods : list[float]
             Marginal log-likelihood at each iteration (from the best restart).
+
+        Raises
+        ------
+        ValueError
+            If ``spikes`` is not ``(n_time, n_neurons)`` count data.
+        NonFiniteLikelihoodError
+            If the first E-step's log-likelihood is non-finite (with
+            ``n_restarts > 1``: in every restart); the fit outputs are
+            cleared first.
         """
         spikes = self._validate_spikes(spikes)
 
@@ -1415,10 +1424,10 @@ class DirectedInfluencePointProcessModel(
             params["coupling_strength"] = self.coupling_strength
             spec["coupling_strength"] = UNCONSTRAINED
 
-        # Not optimized, but read by the loss: passing them as frozen params
-        # makes them arguments of the compiled SGD step rather than constants
-        # baked into it, so changing them (e.g. by an EM fit) does not force a
-        # recompile.
+        # Not trained, but read by the loss, and re-derived from the transition
+        # matrix by EM: as frozen params they are arguments of the compiled SGD
+        # step rather than baked-in constants, so a change to them alone does
+        # not force a recompile (kept in sync with DirectedInfluenceModel).
         params["freqs"] = self.freqs
         spec["freqs"] = frozen(UNCONSTRAINED)
         params["damping_coef"] = self.damping_coef
@@ -1436,12 +1445,12 @@ class DirectedInfluencePointProcessModel(
         convergence_tol: float | None = None,
         connectivity_penalty: OscillatorPenaltyConfig | None = None,
     ) -> list[float]:
-        """Fit by minimizing negative marginal LL via gradient descent.
+        """Fit by gradient descent on the marginal LL (minus any penalty).
 
         SGD optimizes ``coupling_strength`` and ``phase_difference``
         (and optionally spike params, discrete transition, init params).
-        Frequencies (``freqs``) and damping (``damping_coef``) are frozen
-        during SGD and used as constants.
+        Frequencies (``freqs``) and damping (``damping_coef``) are held fixed
+        (not trained).
 
         Parameters
         ----------
@@ -1458,6 +1467,17 @@ class DirectedInfluencePointProcessModel(
         Returns
         -------
         log_likelihoods : list of float
+            Per-step training objective: the log-likelihood minus the
+            connectivity penalty when one is given (see
+            ``SGDFittableMixin.fit_sgd``). ``log_likelihood_`` is the marginal
+            log-likelihood at the fitted parameters, without the penalty.
+
+        Raises
+        ------
+        ValueError
+            Invalid settings or data (see ``SGDFittableMixin.fit_sgd``).
+        NonFiniteLikelihoodError
+            If the log-likelihood at the fitted parameters is non-finite.
         """
         # The mixin's fit_sgd, not SwitchingPointProcessBase's: that typed
         # wrapper does not forward ``connectivity_penalty`` to

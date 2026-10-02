@@ -3460,8 +3460,9 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
         """Validate, then initialize / warm-start the model for ``fit_sgd``.
 
-        Runs after ``fit_sgd`` validated its settings, so a call that is
-        rejected leaves the model untouched. Parameters are initialized only
+        Runs after ``fit_sgd`` validated its settings and validates the spikes
+        first, so a call rejected for its settings or data leaves the model
+        untouched. Parameters are initialized only
         on the first call; later calls continue from the current parameters.
         Only the spikes are forwarded to ``_sgd_loss_fn`` and ``_finalize_sgd``.
         """
@@ -4027,10 +4028,11 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         ------
         ValueError
             If spikes has wrong shape (must be 2D with n_neurons columns).
+        NonFiniteLikelihoodError
             If the first E-step's log-likelihood is non-finite (the initial
-            parameters are unusable). A later non-finite E-step does not
-            raise: EM rolls back to the previous accepted iterate, logs a
-            warning and stops.
+            parameters are unusable); the fit outputs are cleared first. A
+            later non-finite E-step does not raise: EM rolls back to the
+            previous accepted iterate, logs a warning and stops.
 
         Notes
         -----

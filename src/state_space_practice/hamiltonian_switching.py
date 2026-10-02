@@ -659,7 +659,8 @@ class SwitchingHamiltonianJointModel(_JointHamiltonianBase):
 
         Overrides the single-regime parent: the switching filter returns
         four arrays (means, covs, discrete_probs, marginal_lls) and the
-        smoother returns three (means, covs, discrete_probs).
+        smoother returns three (means, covs, discrete_probs). Returns the
+        summed marginal log-likelihood, which becomes ``log_likelihood_``.
         """
         params = self._build_param_spec()[0]
         means, covs, probs, lls = self.filter(lfp_data, spike_data, params)
