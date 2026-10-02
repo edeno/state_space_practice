@@ -694,6 +694,35 @@ def test_fit_sgd_multineuron_per_neuron_hyperparameters(multineuron_counts):
     assert np.asarray(model.lengthscale_).shape == (n_neurons,)
 
 
+@pytest.mark.parametrize("n_neurons", [1, 3])
+@pytest.mark.parametrize("share_hyperparameters", [True, False])
+def test_fit_sgd_traces_the_train_step_once(
+    multineuron_counts, monkeypatch, n_neurons, share_hyperparameters
+):
+    """One ``fit_sgd`` traces (and compiles) its SGD step once: the initial
+    parameters have the same (strong) dtype as the optimizer's updates, so the
+    second step does not re-trace."""
+    from state_space_practice import sgd_fitting
+
+    traces: list[None] = []
+    record_trace = sgd_fitting._CompiledSGDStep.record_trace
+
+    def counting_record_trace(self, *args, **kwargs):  # runs once per trace
+        traces.append(None)
+        return record_trace(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        sgd_fitting._CompiledSGDStep, "record_trace", counting_record_trace
+    )
+    counts = multineuron_counts[0] if n_neurons == 1 else multineuron_counts[:3]
+    model = TemporalRateGP(
+        dt=0.1, n_iter=8, share_hyperparameters=share_hyperparameters
+    )
+    history = model.fit_sgd(counts, num_steps=3)
+    assert len(history) == 3  # guard: every step ran
+    assert len(traces) == 1
+
+
 def test_single_neuron_path_unchanged_by_batch_support(small_counts):
     """A 1D fit still yields scalar hyperparameters and a 1D rate."""
     model = TemporalRateGP(dt=0.1, variance=1.0, lengthscale=0.4, n_iter=12)

@@ -907,21 +907,25 @@ class TemporalRateGP(SGDFittableMixin):
 
     def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         n_neurons = self._n_neurons
+        # An explicit dtype keeps Python-float hyperparameters from becoming
+        # weak-typed leaves: the optimizer's first update returns them strong,
+        # which would re-trace the compiled SGD step on the second step.
+        variance = jnp.asarray(self.variance, dtype=float)
+        lengthscale = jnp.asarray(self.lengthscale, dtype=float)
+        mean = jnp.asarray(self.mean, dtype=float)
         # Shared variance/lengthscale stay scalar; per-neuron ones become
         # (n_neurons,) vectors. The baseline mean is always per-neuron for a
         # multi-neuron fit so each cell keeps its own firing level.
         if n_neurons == 1 or self.share_hyperparameters:
-            variance_init = jnp.asarray(self.variance)
-            lengthscale_init = jnp.asarray(self.lengthscale)
+            variance_init = variance
+            lengthscale_init = lengthscale
         else:
-            variance_init = jnp.broadcast_to(jnp.asarray(self.variance), (n_neurons,))
-            lengthscale_init = jnp.broadcast_to(
-                jnp.asarray(self.lengthscale), (n_neurons,)
-            )
+            variance_init = jnp.broadcast_to(variance, (n_neurons,))
+            lengthscale_init = jnp.broadcast_to(lengthscale, (n_neurons,))
         if n_neurons == 1:
-            mean_init = jnp.asarray(self.mean)
+            mean_init = mean
         else:
-            mean_init = jnp.broadcast_to(jnp.asarray(self.mean), (n_neurons,))
+            mean_init = jnp.broadcast_to(mean, (n_neurons,))
 
         params = {
             "variance": variance_init,

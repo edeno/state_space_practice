@@ -560,6 +560,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   built a new transform each time, so equal parameter specs compared unequal;
   it now returns one transform per cap. Results of every other model are
   bit-identical.
+- **`TemporalRateGP.fit_sgd` compiles its SGD step once per fit**: the initial
+  hyperparameters were weak-typed (built from Python floats) and the first
+  optimizer update returned them strong-typed, so the second step re-traced
+  and re-compiled the step (~1.5 s extra per fit at 2000 bins). They are now
+  built with an explicit float dtype; results are bit-identical.
 - **A rejected `fit_sgd` call no longer changes the model**: model-specific
   setup (data binding, initialization, warm start, recorded lengths) ran in
   each model's `fit_sgd` override before the shared settings checks, so e.g.
