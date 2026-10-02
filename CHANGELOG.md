@@ -203,7 +203,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   new shape (5-7 s at T=20k; now ~1 s) and ran 52 ms vs 36 ms per call after;
   Viterbi re-traced its scans on every call (3 compiles, ~240 ms vs 8 ms at
   T=2000, K=2); the plug-in GLM M-step re-traced its scan on every call
-  (~190 ms vs 52 ms at T=5000, 10 neurons). Outputs are bit-identical.
+  (~190 ms vs 52 ms at T=5000, 10 neurons). Viterbi paths and the GLM M-step
+  are bit-identical; the parallel smoother can differ from the op-by-op
+  version at round-off level (XLA fuses the jitted graph; max 4e-16 absolute
+  at T=500).
 - **GPB1 E-steps no longer materialize outputs they discard**: the switching
   oscillator models (`oscillator_models`) and the switching point-process
   models (`SwitchingSpikeOscillatorModel` and the COM/CNM/DIM point-process
