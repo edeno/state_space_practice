@@ -246,13 +246,35 @@ def test_fitted_model_warns_when_final_inference_is_unconverged():
         model.fit_sgd(_far_baseline_counts(), num_steps=1)
 
 
-def test_nonfinite_merit_fallback_is_counted_and_warns(small_counts, monkeypatch):
+@pytest.fixture
+def patch_traced_internals(monkeypatch):
+    """``monkeypatch`` for module globals read while the inference is traced.
+
+    The compiled inference bakes such globals in, so its cache is cleared
+    before the test (to re-trace with the patch) and after it (so the patched
+    program does not leak into later tests).
+    """
+    import state_space_practice.temporal_rate_gp as trg
+
+    def clear() -> None:
+        trg._infer_log_rate_jit.clear_cache()
+        trg._infer_log_rate_batch_jit.clear_cache()
+
+    clear()
+    yield monkeypatch
+    monkeypatch.undo()
+    clear()
+
+
+def test_nonfinite_merit_fallback_is_counted_and_warns(
+    small_counts, patch_traced_internals
+):
     """A non-finite prior quadratic form (a lost Cholesky factor) makes the
     merit non-finite: the full step is taken, counted and reported."""
     import state_space_practice.temporal_rate_gp as trg
     from state_space_practice.exceptions import StateSpaceWarning
 
-    monkeypatch.setattr(
+    patch_traced_internals.setattr(
         trg,
         "_prior_whitened_residuals",
         lambda states, *_: jnp.full(states.size, jnp.nan),
@@ -266,19 +288,61 @@ def test_nonfinite_merit_fallback_is_counted_and_warns(small_counts, monkeypatch
     assert int(result.n_unaccepted_steps) == 0
 
 
-def test_unaccepted_step_fallback_is_counted_and_warns(small_counts, monkeypatch):
+def test_unaccepted_step_fallback_is_counted_and_warns(
+    small_counts, patch_traced_internals
+):
     """When no trial step passes the Armijo test the smallest one is taken;
     that fallback is counted and reported."""
     import state_space_practice.temporal_rate_gp as trg
     from state_space_practice.exceptions import StateSpaceWarning
 
     # A negative slack larger than any achievable increase rejects every step.
-    monkeypatch.setattr(trg, "_MERIT_RTOL", -1.0)
+    patch_traced_internals.setattr(trg, "_MERIT_RTOL", -1.0)
     with pytest.warns(StateSpaceWarning) as record:
         result = infer_log_rate(small_counts, 0.1, 1.5, 0.4, n_iter=3)
     assert any("in 3 iteration(s) where no step" in str(w.message) for w in record)
     assert int(result.n_unaccepted_steps) == 3
     assert int(result.n_nonfinite_merit) == 0
+
+
+@pytest.fixture
+def backend_compiles():
+    """One entry per XLA backend compilation while the test runs."""
+    compiles: list[float] = []
+    event = "/jax/core/compile/backend_compile_duration"
+
+    def listener(name: str, duration: float, **kwargs: object) -> None:
+        if name == event:
+            compiles.append(duration)
+
+    jax.monitoring.register_event_duration_secs_listener(listener)
+    yield compiles
+    jax.monitoring.unregister_event_duration_listener(listener)
+
+
+def test_repeat_inference_compiles_nothing(small_counts, backend_compiles):
+    """A repeat call with same-shaped inputs reuses the compiled inference, also
+    for new hyperparameter values."""
+    first = infer_log_rate(small_counts, 0.1, 1.5, 0.4, mean=0.2)
+    n_first = len(backend_compiles)
+    again = infer_log_rate(small_counts, 0.1, 1.5, 0.4, mean=0.2)
+    infer_log_rate(small_counts, 0.1, 0.7, 0.9, mean=-0.3)
+    assert n_first > 0  # guard: the listener sees compilations
+    assert len(backend_compiles) == n_first
+    for field, value in first._asdict().items():
+        np.testing.assert_array_equal(getattr(again, field), value)
+
+
+def test_repeat_batch_inference_compiles_nothing(multineuron_counts, backend_compiles):
+    infer_log_rate_batch(
+        multineuron_counts, 0.1, jnp.array([1.0, 0.5, 2.0, 1.5]), 0.4, mean=0.2
+    )
+    n_first = len(backend_compiles)
+    infer_log_rate_batch(
+        multineuron_counts, 0.1, jnp.array([2.0, 1.0, 0.3, 0.8]), 0.6, mean=0.1
+    )
+    assert n_first > 0  # guard: the listener sees compilations
+    assert len(backend_compiles) == n_first
 
 
 def test_converged_inference_reports_no_fallbacks(small_counts):

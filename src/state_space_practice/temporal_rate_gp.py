@@ -70,6 +70,7 @@ from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDPar
 from state_space_practice.utils import (
     _validate_filter_numerics,
     contains_tracer,
+    typed_jit,
     validate_count_array,
     validate_finite_array,
     validate_int,
@@ -462,6 +463,12 @@ def _infer_log_rate_traced(
     )
 
 
+#: Compiled :func:`_infer_log_rate_traced` (``n_iter`` static) for the eager
+#: entry points: data and hyperparameters are arguments, so a repeat call with
+#: same-shaped inputs reuses the program instead of re-tracing the scan.
+_infer_log_rate_jit = typed_jit(_infer_log_rate_traced, static_argnames="n_iter")
+
+
 def infer_log_rate(
     counts: ArrayLike,
     dt: ArrayLike,
@@ -521,6 +528,9 @@ def infer_log_rate(
     at the mode: only the final Newton step is differentiated, so its memory
     does not grow with ``n_iter``. It is exact once the iteration has
     converged (see ``max_abs_update``).
+
+    The inference is compiled once per input shape and ``n_iter``; repeat
+    calls with new data or hyperparameter values of the same shapes reuse it.
     """
     counts = jnp.asarray(counts)
     if counts.ndim != 1:
@@ -542,7 +552,7 @@ def infer_log_rate(
     if not contains_tracer(min_weight):
         min_weight = validate_scalar(min_weight, "min_weight", positive=True)
 
-    result = _infer_log_rate_traced(
+    result = _infer_log_rate_jit(
         counts, dt, variance, lengthscale, mean, n_iter, min_weight
     )
     _warn_laplace_diagnostics(result, "infer_log_rate")
@@ -568,6 +578,12 @@ def _infer_log_rate_batch_traced(
         return _infer_log_rate_traced(row, dt, var, ell, mu, n_iter, min_weight)
 
     return jax.vmap(_one)(counts, variance, lengthscale, mean)
+
+
+#: Compiled :func:`_infer_log_rate_batch_traced`; see ``_infer_log_rate_jit``.
+_infer_log_rate_batch_jit = typed_jit(
+    _infer_log_rate_batch_traced, static_argnames="n_iter"
+)
 
 
 def _broadcast_hyperparameter(
@@ -663,7 +679,7 @@ def infer_log_rate_batch(
     if not contains_tracer(min_weight):
         min_weight = validate_scalar(min_weight, "min_weight", positive=True)
 
-    result = _infer_log_rate_batch_traced(
+    result = _infer_log_rate_batch_jit(
         counts, dt, variance, lengthscale, mean, n_iter, min_weight
     )
     _warn_laplace_diagnostics(result, "infer_log_rate_batch")

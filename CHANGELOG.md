@@ -231,6 +231,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   results are bit-identical; gradients match the unrolled ones to ~1e-14
   relative once the iteration has converged, so SGD trajectories move at
   round-off level.
+- **`temporal_rate_gp.infer_log_rate` / `infer_log_rate_batch` are jitted**
+  (input validation stays eager): every call used to re-compile its Newton
+  scan, so a repeat call with same-shaped inputs, including new
+  hyperparameter values, now compiles nothing (~3.5x faster per call at 2000
+  bins: 0.42 -> 0.12 s single, 0.52 -> 0.17 s for 3 trains). The fused
+  program moves results at round-off level (log-rates ~1e-15, evidence
+  ~1e-15 relative), which also reaches `TemporalRateGP`'s fitted posterior.
 - **Reading a fitted attribute before fitting raises `NotFittedError`**
   instead of returning `None` (or a bare `AttributeError`). Fitted outputs of
   every model (smoothed/filtered states, posteriors, log likelihoods,
