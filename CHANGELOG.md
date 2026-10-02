@@ -193,8 +193,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   EM iterations).
 - **The choice models skip the duplicate final E-step after convergence**
   (`MultinomialChoiceModel`, `CovariateChoiceModel`, `SwitchingChoiceModel`).
-- **`PlaceFieldModel.predict_rate_map` uses an optimized einsum** (large
-  speedups at moderate grid sizes).
+- **`PlaceFieldModel` posterior rate maps are computed by a jitted JAX
+  kernel** in bounded-memory, fixed-size time chunks (`predict_rate_map`,
+  `predict_center`, `drift_summary`, and
+  `PlaceFieldRateMaps.from_place_field_model`). NumPy's einsum fell back to a
+  naive contraction path at realistic grid sizes: one 50x50-grid map over
+  2000 time bins with 49 basis functions took ~25 s and now takes ~0.2 s.
+  Results agree to ~2e-15 relative.
 - **The point-process Fisher-scoring line search stops at the first accepted
   step size** (a `lax.while_loop`) instead of always evaluating all 10 trial
   step sizes, so an accepted full step costs one objective evaluation instead
