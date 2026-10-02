@@ -793,7 +793,7 @@ class TestSmithLearningModelClass:
         assert not model.is_fitted
 
     @pytest.mark.parametrize(
-        "attr", ["smoothed_learning_state_mode", "log_likelihood_", "n_iter_"]
+        "attr", ["smoothed_learning_state_mode", "log_likelihood_"]
     )
     def test_fitted_attribute_unset_before_fit(self, attr: str) -> None:
         """Fitted outputs raise NotFittedError (and look absent) before fit()."""
@@ -801,6 +801,17 @@ class TestSmithLearningModelClass:
         with pytest.raises(NotFittedError, match=attr):
             getattr(model, attr)
         assert not hasattr(model, attr)
+
+    def test_n_iter_is_none_after_sgd_fit(self) -> None:
+        """n_iter_ counts EM iterations only: None (not an error) on a model
+        fitted by fit_sgd, an int after fit()."""
+        outcomes = jnp.asarray(simulate_learning_data(n_trials=20, seed=0)[0])
+        model = SmithLearningModel()
+        assert model.n_iter_ is None
+        model.fit_sgd(outcomes, num_steps=3)
+        assert model.is_fitted
+        assert model.n_iter_ is None
+        assert "EM iterations:          None" in model.summary()
 
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_is_fitted_true_after_fit(self) -> None:
