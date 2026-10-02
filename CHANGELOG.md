@@ -171,6 +171,21 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   entries) and no longer depend on `key`. `key` and `n_samples` are still
   accepted but unused; `compare_probability` gives the same result as the
   latent comparison (the sigmoid link is strictly increasing).
+- **Smith learning-curve summaries and the criterion trial are exact**
+  (`calculate_probability_confidence_limits`,
+  `calculate_latent_state_percentiles` and the `SmithLearningModel` methods
+  `get_learning_curve`, `get_latent_state_percentiles`,
+  `find_criterion_trial`, `plot_learning_curve`, `plot_summary`, `summary`):
+  percentiles are the Gaussian quantiles ``m_k + s_k z_q`` (through the
+  sigmoid for the probability curve; quantiles commute with the increasing
+  link) and ``P(p_k > p_chance) = Phi(m_k / s_k)``, replacing 10k-sample
+  Monte Carlo estimates. `find_criterion_trial` thresholded the noisy
+  estimate, so on 7 of 20 simulated 60-trial sessions the criterion trial
+  changed (by one trial) with the PRNG key; it is now deterministic. Values
+  move by Monte Carlo noise only (at most 0.017 in probability, 0.036 in
+  the latent state over 10 keys on a fitted session); percentiles 0 and 100
+  are now the exact limits. `key` and `n_samples` are still accepted but
+  unused.
 - **`covariate_choice_smoother` uses `kalman.rts_backward_scan_with_predictions`**
   (jitted; about 10x faster per call -- the previous un-jitted RTS pass
   re-traced on every EM iteration). Its gain solve is the shared, retrying one, so smoothed values

@@ -801,16 +801,21 @@ def calculate_probability_confidence_limits(
     percentiles: ArrayLike | None = None,
     return_prob_above_chance: bool = False,
 ) -> tuple[Array, Array | None]:
-    """Calculates confidence limits for the probability of a correct response.
+    r"""Calculates confidence limits for the probability of a correct response.
 
-    This is achieved by sampling from the smoothed posterior distribution of
-    the learning state for each trial and transforming these samples through
-    the sigmoid link function.
+    The smoothed posterior of the learning state is ``x_k ~ N(m_k, s_k^2)``
+    (``s_k^2`` floored at ``1e-9``) and ``p_k = sigmoid(mu + x_k)`` with
+    ``sigmoid(mu)`` the chance level. The sigmoid is strictly increasing, so
+    the ``q``-th percentile of ``p_k`` is ``sigmoid(mu + m_k + s_k z_q)``
+    (``z_q`` the standard normal quantile) and
+    ``P(p_k > p_chance) = P(x_k > 0) = Phi(m_k / s_k)``. Both are computed
+    exactly (no sampling).
 
     Parameters
     ----------
     key : Array
-        JAX PRNG key for random number generation.
+        Unused: the values are exact. Kept for backward compatibility (they
+        were formerly Monte Carlo estimates).
     smoothed_learning_state_mode : ArrayLike, shape (n_trials,)
         Smoothed learning state means (x_{k|T}).
     smoothed_learning_state_variance : ArrayLike, shape (n_trials,)
@@ -821,10 +826,12 @@ def calculate_probability_confidence_limits(
         If ``return_prob_above_chance`` is True, also used as the threshold
         for computing prob_above_chance.
     n_samples : int, optional
-        Number of Monte Carlo samples to draw per trial. Default is 10000.
+        Unused (formerly the number of Monte Carlo samples per trial). Kept
+        for backward compatibility.
     percentiles : ArrayLike, optional
         Array of percentiles to compute (e.g., jnp.array([5, 50, 95])).
-        If None, defaults to jnp.array([5.0, 50.0, 95.0]).
+        If None, defaults to jnp.array([5.0, 50.0, 95.0]). Percentiles 0 and
+        100 give the exact limits 0 and 1.
     return_prob_above_chance : bool, optional
         If True, computes the certainty (prob_above_chance) that the true probability
         of a correct response is greater than the chance level. Default is False.
@@ -839,50 +846,39 @@ def calculate_probability_confidence_limits(
         Returned if return_prob_above_chance is True.
     """
     mu_bias = math.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
-    smoothed_learning_state_mode = jnp.asarray(smoothed_learning_state_mode)
-    smoothed_learning_state_variance = jnp.asarray(smoothed_learning_state_variance)
+    mode = jnp.asarray(smoothed_learning_state_mode)
+    std_dev = _smoothed_std_dev(smoothed_learning_state_variance)
+    latent_percentiles = _gaussian_percentiles(mode, std_dev, percentiles)
+    probability_percentiles = jax.nn.sigmoid(mu_bias + latent_percentiles)
+    if not return_prob_above_chance:
+        return probability_percentiles, None
+    return probability_percentiles, jax.scipy.special.ndtr(mode / std_dev)
+
+
+def _smoothed_std_dev(smoothed_learning_state_variance: ArrayLike) -> Array:
+    """Posterior standard deviation, variance floored at ``1e-9``, shape (n_trials,)."""
+    return jnp.sqrt(jnp.maximum(jnp.asarray(smoothed_learning_state_variance), 1e-9))
+
+
+def _gaussian_percentiles(
+    mean: Array, std_dev: Array, percentiles: ArrayLike | None
+) -> Array:
+    """Percentiles of ``N(mean, std_dev^2)`` per trial.
+
+    Parameters
+    ----------
+    mean, std_dev : Array, shape (n_trials,)
+    percentiles : ArrayLike, shape (n_percentiles,) or scalar, or None
+        Percentiles in [0, 100]; None means ``[5, 50, 95]``.
+
+    Returns
+    -------
+    Array, shape (n_percentiles, n_trials), or (n_trials,) for a scalar
+    """
     if percentiles is None:
         percentiles = jnp.array([5.0, 50.0, 95.0])
-
-    n_trials = smoothed_learning_state_mode.shape[0]
-
-    epsilon = 1e-9
-    smoothed_std_dev = jnp.sqrt(jnp.maximum(smoothed_learning_state_variance, epsilon))
-
-    # Function to process a single trial
-    def process_trial(
-        key_trial: Array, mode_k: Array, std_dev_k: Array
-    ) -> tuple[Array, Array | None]:
-        # Generate samples from the Gaussian posterior of the learning state x_k
-        # latent_state_samples will have shape (n_samples,)
-        latent_state_samples = mode_k + std_dev_k * jax.random.normal(
-            key_trial, shape=(n_samples,)
-        )
-
-        # Transform samples to probability of correct response
-        # prob_samples will have shape (n_samples,)
-        prob_samples = jax.nn.sigmoid(mu_bias + latent_state_samples)
-
-        # Calculate requested percentiles for this trial
-        trial_percentiles = jnp.percentile(prob_samples, percentiles)
-
-        # Calculate prob_above_chance if requested
-        if return_prob_above_chance:
-            trial_prob_above_chance = jnp.mean(prob_samples > prob_correct_by_chance)
-            return trial_percentiles, trial_prob_above_chance
-        else:
-            return trial_percentiles, None  # Or jnp.nan if a consistent shape is needed
-
-    # Generate per-trial PRNG keys
-    trial_keys = jax.random.split(key, n_trials)
-    probability_percentiles = jax.vmap(process_trial)(
-        trial_keys, smoothed_learning_state_mode, smoothed_std_dev
-    )
-
-    if return_prob_above_chance:
-        return probability_percentiles[0].T, probability_percentiles[1]
-    else:
-        return probability_percentiles[0].T, None
+    z = jax.scipy.special.ndtri(jnp.asarray(percentiles) / 100.0)
+    return mean + std_dev * z[..., None]
 
 
 def find_min_consecutive_successes(
@@ -1394,19 +1390,22 @@ def calculate_latent_state_percentiles(
 ) -> Array:
     """Calculates confidence percentiles for the smoothed latent state.
 
-    Samples from the smoothed posterior distribution of the learning state
-    N(x_k|T, P_k|T) for each trial.
+    The exact percentiles ``m_k + s_k z_q`` of the smoothed posterior
+    ``N(x_{k|T}, P_{k|T})`` of each trial (``z_q`` the standard normal
+    quantile, ``s_k^2 = max(P_{k|T}, 1e-9)``); no sampling.
 
     Parameters
     ----------
     key : Array
-        JAX PRNG key for random number generation.
+        Unused: the percentiles are exact. Kept for backward compatibility
+        (they were formerly Monte Carlo estimates).
     smoothed_learning_state_mode : jnp.ndarray, shape (n_trials,)
         Smoothed learning state means (x_{k|T}).
     smoothed_learning_state_variance : jnp.ndarray, shape (n_trials,)
         Smoothed learning state variances (P_{k|T}).
     n_samples : int, optional
-        Number of Monte Carlo samples to draw per trial. Default is 10000.
+        Unused (formerly the number of Monte Carlo samples per trial). Kept
+        for backward compatibility.
     percentiles : jnp.ndarray, optional
         Array of percentiles to compute (e.g., jnp.array([5, 50, 95])).
         If None, defaults to jnp.array([5.0, 50.0, 95.0]).
@@ -1416,31 +1415,11 @@ def calculate_latent_state_percentiles(
     latent_state_percentiles : jnp.ndarray, shape (n_percentiles, n_trials)
         The computed percentile values for the latent state for each trial.
     """
-    if percentiles is None:
-        percentiles = jnp.array([5.0, 50.0, 95.0])
-
-    smoothed_learning_state_mode_arr = jnp.asarray(smoothed_learning_state_mode)
-    smoothed_learning_state_variance_arr = jnp.asarray(smoothed_learning_state_variance)
-    n_trials = smoothed_learning_state_mode_arr.shape[0]
-    epsilon = 1e-9  # For numerical stability if variance is tiny
-    smoothed_std_dev = jnp.sqrt(
-        jnp.maximum(smoothed_learning_state_variance_arr, epsilon)
+    return _gaussian_percentiles(
+        jnp.asarray(smoothed_learning_state_mode),
+        _smoothed_std_dev(smoothed_learning_state_variance),
+        percentiles,
     )
-
-    def process_trial_state(key_trial: Array, mode_k: Array, std_dev_k: Array) -> Array:
-        latent_state_samples = mode_k + std_dev_k * jax.random.normal(
-            key_trial, shape=(n_samples,)
-        )
-        return jnp.percentile(latent_state_samples, percentiles)
-
-    trial_keys = jax.random.split(key, n_trials)
-    # Use vmap for efficient per-trial processing
-    # mapped_results will have shape (n_trials, n_percentiles)
-    mapped_results: Array = jax.vmap(process_trial_state)(
-        trial_keys, smoothed_learning_state_mode_arr, smoothed_std_dev
-    )
-    # Transpose to get (n_percentiles, n_trials)
-    return mapped_results.T
 
 
 VALID_INIT_METHODS = frozenset(
@@ -2104,10 +2083,10 @@ class SmithLearningModel(SGDFittableMixin):
         Parameters
         ----------
         key : Array
-            JAX PRNG key for random number generation (for sampling).
+            Unused (the posterior summaries are exact); kept for backward
+            compatibility.
         n_samples : int, optional
-            Number of Monte Carlo samples to draw per trial for confidence limits.
-            Default is 10000.
+            Unused; kept for backward compatibility.
         percentiles : ArrayLike, optional
             Array of percentiles to compute for the probability (e.g., jnp.array([5, 50, 95])).
             If None, defaults to jnp.array([5.0, 50.0, 95.0]).
@@ -2156,9 +2135,10 @@ class SmithLearningModel(SGDFittableMixin):
         Parameters
         ----------
         key : Array
-            JAX PRNG key for random number generation.
+            Unused (the posterior summaries are exact); kept for backward
+            compatibility.
         n_samples : int, optional
-            Number of Monte Carlo samples per trial. Default is 10000.
+            Unused; kept for backward compatibility.
         percentiles : ArrayLike, optional
             Percentiles to compute (e.g., jnp.array([5, 50, 95])).
             Defaults to [5.0, 50.0, 95.0].
@@ -2348,17 +2328,20 @@ class SmithLearningModel(SGDFittableMixin):
         such that P(p_k > p_chance | y_{1:T}) >= 1 - alpha for all
         subsequent trials k' >= k. This is computed directly from the
         ``prob_above_chance`` posterior probability, not from percentile
-        thresholds.
+        thresholds; that probability is exact,
+        ``Phi(x_{k|T} / sqrt(P_{k|T}))``, so the result does not depend on
+        ``key``.
 
         Parameters
         ----------
         key : Array
-            JAX PRNGKey for Monte Carlo sampling.
+            Unused (the posterior summaries are exact); kept for backward
+            compatibility.
         alpha : float, optional
             Significance level. The criterion requires
             P(p_k > p_chance) >= 1 - alpha. Default is 0.05.
         n_samples : int, optional
-            Number of Monte Carlo samples. Default is 10000.
+            Unused; kept for backward compatibility.
 
         Returns
         -------
@@ -2446,9 +2429,8 @@ class SmithLearningModel(SGDFittableMixin):
         Parameters
         ----------
         key : Array
-            JAX PRNG key for random number generation, required for computing
-            confidence intervals if they haven't been implicitly computed by
-            prior calls that populate necessary attributes.
+            Unused (the posterior summaries are exact); kept for backward
+            compatibility.
         plot_type : str, optional
             Type of plot to generate. Options are:
             - "probability": Plots the probability of a correct response (default).
@@ -2467,8 +2449,7 @@ class SmithLearningModel(SGDFittableMixin):
             for the confidence interval (e.g., (5.0, 95.0) for a 90% CI).
             Default is (5.0, 95.0).
         n_samples : int, optional
-            Number of Monte Carlo samples used to compute confidence intervals.
-            Default is 10000.
+            Unused; kept for backward compatibility.
         title : Optional[str], optional
             Custom title for the plot. If None, a default title is generated.
             Default is None.
@@ -3205,12 +3186,12 @@ class SmithLearningModel(SGDFittableMixin):
         Parameters
         ----------
         key : Array
-            JAX PRNG key for Monte Carlo sampling.
+            Unused (the posterior summaries are exact); kept for backward
+            compatibility.
         observed_n_correct : ArrayLike, shape (n_trials,), optional
             Observed correct responses to overlay on the learning curve.
         n_samples : int, optional
-            Number of Monte Carlo samples for confidence intervals.
-            Default is 10000.
+            Unused; kept for backward compatibility.
 
         Returns
         -------

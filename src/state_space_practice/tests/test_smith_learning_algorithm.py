@@ -545,6 +545,97 @@ class TestCalculateProbabilityConfidenceLimits:
         assert prob_above_chance is not None
         assert jnp.all(prob_above_chance > 0.9)
 
+    @pytest.fixture
+    def posterior(self):
+        """Smoothed modes / variances spanning below, at and above chance."""
+        mode = np.array([-2.0, -0.3, 0.0, 0.1, 0.4, 1.5, 3.0])
+        var = np.array([0.5, 0.2, 0.3, 0.05, 0.1, 0.4, 1e-12])
+        return mode, var
+
+    def test_matches_closed_form(self, posterior) -> None:
+        """Percentiles are sigmoid(mu + m + sd z_q) (quantiles commute with the
+        increasing sigmoid) and P(p_k > p_chance) = P(x_k > 0) = Phi(m / sd)
+        (sigmoid(mu) is the chance level); sd is floored at sqrt(1e-9)."""
+        from scipy.special import expit
+        from scipy.stats import norm
+
+        mode, var = posterior
+        p_chance = 0.25
+        mu = np.log(p_chance / (1 - p_chance))
+        q = np.array([2.5, 5.0, 50.0, 95.0, 97.5])
+        sd = np.sqrt(np.maximum(var, 1e-9))
+
+        percentiles, prob_above_chance = calculate_probability_confidence_limits(
+            jax.random.PRNGKey(0),
+            mode,
+            var,
+            prob_correct_by_chance=p_chance,
+            percentiles=q,
+            return_prob_above_chance=True,
+        )
+        expected = expit(mu + mode[None, :] + sd[None, :] * norm.ppf(q / 100)[:, None])
+        np.testing.assert_allclose(percentiles, expected, rtol=1e-12, atol=1e-15)
+        np.testing.assert_allclose(prob_above_chance, norm.cdf(mode / sd), rtol=1e-12)
+
+    def test_matches_high_sample_monte_carlo(self, posterior) -> None:
+        """The exact values agree with 400k posterior draws per trial within
+        Monte Carlo error."""
+        mode, var = posterior
+        p_chance = 0.25
+        mu = np.log(p_chance / (1 - p_chance))
+        n_draws = 400_000
+        draws = mode + np.sqrt(np.maximum(var, 1e-9)) * np.random.default_rng(
+            0
+        ).standard_normal((n_draws, len(mode)))
+        prob_draws = 1 / (1 + np.exp(-(mu + draws)))
+        q = np.array([5.0, 50.0, 95.0])
+
+        percentiles, prob_above_chance = calculate_probability_confidence_limits(
+            jax.random.PRNGKey(0),
+            mode,
+            var,
+            prob_correct_by_chance=p_chance,
+            percentiles=q,
+            return_prob_above_chance=True,
+        )
+        np.testing.assert_allclose(
+            percentiles, np.percentile(prob_draws, q, axis=0), atol=2e-3
+        )
+        mc_above = np.mean(prob_draws > p_chance, axis=0)
+        # guard: some trials are genuinely uncertain
+        assert np.any((mc_above > 0.1) & (mc_above < 0.9))
+        np.testing.assert_allclose(prob_above_chance, mc_above, atol=4e-3)
+
+    def test_independent_of_key_and_n_samples(self, posterior) -> None:
+        mode, var = posterior
+        a = calculate_probability_confidence_limits(
+            jax.random.PRNGKey(0),
+            mode,
+            var,
+            prob_correct_by_chance=0.5,
+            n_samples=10,
+            return_prob_above_chance=True,
+        )
+        b = calculate_probability_confidence_limits(
+            jax.random.PRNGKey(5),
+            mode,
+            var,
+            prob_correct_by_chance=0.5,
+            n_samples=10_000,
+            return_prob_above_chance=True,
+        )
+        np.testing.assert_array_equal(a[0], b[0])
+        np.testing.assert_array_equal(a[1], b[1])
+
+    def test_scalar_percentile_keeps_trial_shape(self, posterior) -> None:
+        """A scalar percentile gives one value per trial, as before."""
+        mode, var = posterior
+        result, _ = calculate_probability_confidence_limits(
+            jax.random.PRNGKey(0), mode, var, 0.5, percentiles=50.0
+        )
+        assert result.shape == (len(mode),)
+        np.testing.assert_allclose(result, 1 / (1 + np.exp(-mode)), rtol=1e-12)
+
 
 class TestFindMinConsecutiveSuccesses:
     """Tests for the find_min_consecutive_successes function."""
@@ -1145,6 +1236,34 @@ class TestFindCriterionTrial:
         with pytest.raises(NotFittedError, match="not been fitted"):
             model.find_criterion_trial(jax.random.PRNGKey(0))
 
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_deterministic_and_exact(self) -> None:
+        """The criterion trial does not depend on the key and is the first
+        trial after which Phi(x_{k|T} / sd_{k|T}) >= 1 - alpha holds for good.
+        (On this dataset 10k-sample Monte Carlo gave 35 or 36 by key.)"""
+        from scipy.stats import norm
+
+        outcomes, _ = simulate_learning_data(
+            n_trials=60,
+            seed=4,
+            prob_success_init=0.3,
+            prob_success_final=0.9,
+            inflection_point=30,
+        )
+        model = SmithLearningModel()
+        model.fit(jnp.asarray(outcomes), max_iter=30)
+
+        sd = np.sqrt(
+            np.maximum(np.asarray(model.smoothed_learning_state_variance), 1e-9)
+        )
+        meets = norm.cdf(np.asarray(model.smoothed_learning_state_mode) / sd) >= 0.95
+        # guard: the criterion is met at a trial inside the session
+        assert meets[-1] and not meets.all()
+        expected = int(np.flatnonzero(~meets)[-1] + 1)
+
+        results = {model.find_criterion_trial(jax.random.PRNGKey(k)) for k in range(10)}
+        assert results == {expected}
+
 
 class TestIdentifySignificantRuns:
     """Tests for find_significant_runs and find_critical_run_length."""
@@ -1318,6 +1437,22 @@ class TestCalculateLatentStatePercentiles:
         np.testing.assert_allclose(
             result[1], smoothed_learning_state_mode, rtol=0.1, atol=0.1
         )
+
+    def test_matches_gaussian_quantiles(self) -> None:
+        """Percentiles are the exact Gaussian quantiles m + sd z_q, whatever
+        the key."""
+        from scipy.stats import norm
+
+        mode = np.array([-1.0, 0.0, 2.5])
+        var = np.array([0.4, 1e-12, 2.0])
+        q = np.array([1.0, 25.0, 50.0, 90.0])
+        sd = np.sqrt(np.maximum(var, 1e-9))
+        expected = mode[None, :] + sd[None, :] * norm.ppf(q / 100)[:, None]
+        for seed in (0, 3):
+            result = calculate_latent_state_percentiles(
+                jax.random.PRNGKey(seed), mode, var, percentiles=q
+            )
+            np.testing.assert_allclose(result, expected, rtol=1e-12, atol=1e-15)
 
 
 class TestComputeCrossCovarianceMatrix:
