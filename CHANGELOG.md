@@ -168,6 +168,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   speedups at moderate grid sizes).
 - **Eager `utils.debug_print_if` calls no longer compile a `jit(cond)` each
   time.**
+- **The DIM / DIM-PP standard-EM projection helpers are jitted**:
+  `oscillator_utils.extract_dim_params_from_matrix(_stack)`,
+  `construct_stable_directed_influence_transition_stack` and
+  `compute_directed_influence_stability_scale` compile once per shape
+  (`n_oscillators` static; `sampling_freq` / `max_spectral_radius` traced) and
+  the rebuild evaluates the host spectral-radius callback once instead of
+  twice. Per call they drop from 3-9 ms eager to 0.04-0.17 ms, cutting the
+  M-step projection from ~33 ms to ~15 ms per EM iteration independent of T.
+  XLA fusion moves outputs at round-off (~1e-15 relative per call; ~1e-9
+  relative in DIM-PP parameters after 12 EM iterations).
 - **Reading a fitted attribute before fitting raises `NotFittedError`**
   instead of returning `None` (or a bare `AttributeError`). Fitted outputs of
   every model (smoothed/filtered states, posteriors, log likelihoods,

@@ -1,3 +1,7 @@
+import contextlib
+import functools
+from collections.abc import Iterator
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -1083,6 +1087,125 @@ def test_directed_influence_mixin_rebuild_refreshes_optimizer_cache_only_once_se
     host._current_osc_params["freq"] = jnp.array([5.0, 9.0])
     host._update_public_oscillator_params()
     np.testing.assert_allclose(host.freqs, [5.0, 9.0])
+
+
+@contextlib.contextmanager
+def _count_backend_compiles() -> Iterator[list[str]]:
+    """Record every XLA backend compile that happens inside the block."""
+    compiles: list[str] = []
+
+    def listener(event: str, duration: float, **kwargs: object) -> None:
+        if event == "/jax/core/compile/backend_compile_duration":
+            compiles.append(event)
+
+    jax.monitoring.register_event_duration_secs_listener(listener)
+    try:
+        yield compiles
+    finally:
+        jax.monitoring.unregister_event_duration_listener(listener)
+
+
+def _random_dim_inputs(seed: int, n_osc: int, n_states: int):
+    rng = np.random.default_rng(seed)
+    off_diag = (1.0 - np.eye(n_osc))[:, :, None]
+    freqs = jnp.asarray(rng.uniform(2.0, 30.0, n_osc))
+    damping = jnp.asarray(rng.uniform(0.6, 0.95, n_osc))
+    coupling = jnp.asarray(rng.uniform(0.0, 0.5, (n_osc, n_osc, n_states)) * off_diag)
+    phase = jnp.asarray(rng.uniform(-np.pi, np.pi, (n_osc, n_osc, n_states)) * off_diag)
+    return freqs, damping, coupling, phase
+
+
+@pytest.mark.parametrize(
+    "helper",
+    [
+        "compute_directed_influence_stability_scale",
+        "construct_stable_directed_influence_transition_stack",
+        "extract_dim_params_from_matrix_stack",
+    ],
+)
+def test_dim_em_helpers_compile_once_and_never_retrace(helper: str) -> None:
+    """The per-EM-iteration DIM helpers are single jitted executables.
+
+    On a shape no other test uses, the first call compiles at most one
+    executable (an eager implementation compiles one per primitive), and later
+    calls with new values -- including new ``sampling_freq`` /
+    ``max_spectral_radius`` floats -- compile nothing.
+    """
+    n_osc, n_states = 5, 3
+    calls = []
+    for seed in range(4):
+        freqs, damping, coupling, phase = _random_dim_inputs(seed, n_osc, n_states)
+        fs = 100.0 + seed
+        bound = 0.9 + 0.01 * seed
+        if helper == "compute_directed_influence_stability_scale":
+            calls.append(
+                functools.partial(
+                    compute_directed_influence_stability_scale,
+                    freqs,
+                    damping,
+                    coupling,
+                    fs,
+                    max_spectral_radius=bound,
+                    phase_difference=phase,
+                )
+            )
+        elif helper == "construct_stable_directed_influence_transition_stack":
+            calls.append(
+                functools.partial(
+                    construct_stable_directed_influence_transition_stack,
+                    freqs,
+                    damping,
+                    coupling,
+                    phase,
+                    fs,
+                    max_spectral_radius=bound,
+                )
+            )
+        else:
+            stack = construct_stable_directed_influence_transition_stack(
+                freqs, damping, coupling, phase, fs, max_spectral_radius=bound
+            )
+            calls.append(
+                functools.partial(
+                    extract_dim_params_from_matrix_stack,
+                    jax.block_until_ready(stack),
+                    fs,
+                    n_osc,
+                )
+            )
+
+    with _count_backend_compiles() as first:
+        jax.block_until_ready(calls[0]())
+    with _count_backend_compiles() as later:
+        for call in calls[1:]:
+            jax.block_until_ready(call())
+
+    assert len(first) <= 1
+    assert later == []
+
+
+def test_dim_standard_em_sync_compiles_nothing_after_warm_up() -> None:
+    """The mixin's standard-EM extract -> rescale -> rebuild path reuses its
+    executables across EM iterations (new A values, same shapes)."""
+    strong = jnp.zeros((2, 2, 2)).at[0, 1, :].set(2.0).at[1, 0, :].set(2.0)
+    host = _DIMHost(strong)
+    host._initialize_continuous_transition_matrix()
+    rng = np.random.default_rng(0)
+    perturbations = [jnp.asarray(rng.normal(0.0, 1e-3, (4, 4, 2))) for _ in range(4)]
+
+    def em_sync(perturbation: jax.Array) -> None:
+        host.continuous_transition_matrix = (
+            host.continuous_transition_matrix + perturbation
+        )
+        host._sync_coupling_from_transition_matrix()
+
+    em_sync(perturbations[0])  # warm-up
+    with _count_backend_compiles() as compiles:
+        for perturbation in perturbations[1:]:
+            em_sync(perturbation)
+            jax.block_until_ready(host.continuous_transition_matrix)
+
+    assert compiles == []
 
 
 # CNM covariance projection: closed-form PSD shrink factor vs. bisection

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 import warnings
 from collections.abc import Callable
@@ -621,6 +622,7 @@ def construct_directed_influence_transition_matrix(
     return _oscillator_blocks_to_matrix(all_blocks)
 
 
+@typed_jit
 def compute_directed_influence_stability_scale(
     freqs: ArrayLike,
     damping_coef: ArrayLike,
@@ -643,7 +645,9 @@ def compute_directed_influence_stability_scale(
     construction. (A norm-based upper bound would engage for stable matrices
     and over-damp them.) ``coupling_strength`` / ``phase_difference`` may be
     one matrix or a stack with a final discrete-state axis; one shared scale is
-    returned for the full stack.
+    returned for the full stack. Jit-compiled (one executable per input shape;
+    ``sampling_freq`` and ``max_spectral_radius`` are traced, so new values do
+    not recompile); the spectral radius itself runs on host through a callback.
 
     Parameters
     ----------
@@ -1160,6 +1164,7 @@ def extract_correlated_noise_params_from_covariance_stack(
     }
 
 
+@functools.partial(typed_jit, static_argnames=("n_oscillators",))
 def extract_dim_params_from_matrix(
     A: ArrayLike,
     sampling_freq: float,
@@ -1170,6 +1175,7 @@ def extract_dim_params_from_matrix(
     This function extracts the underlying oscillator parameters (damping, frequency,
     coupling strength, phase difference) from a transition matrix that has been
     constructed using construct_directed_influence_transition_matrix().
+    Jit-compiled with ``n_oscillators`` static (``sampling_freq`` is traced).
 
     The transition matrix has structure:
     - Diagonal blocks: damping * R(2π*freq/fs) - sum_incoming_coupling * I
@@ -1265,6 +1271,46 @@ def project_matrix_blockwise(transition_matrix: ArrayLike) -> jax.Array:
     )
 
 
+@typed_jit
+def _construct_stable_dim_stack_and_scale(
+    freqs: ArrayLike,
+    damping_coef: ArrayLike,
+    coupling_strength: ArrayLike,
+    phase_difference: ArrayLike,
+    sampling_freq: float,
+    max_spectral_radius: float = 0.99,
+) -> tuple[jax.Array, jax.Array]:
+    """:func:`construct_stable_directed_influence_transition_stack` plus its scale.
+
+    Returns ``(transition_stack, scale)`` so a caller that also reports the
+    stability scale does not evaluate the host spectral-radius callback twice.
+    """
+    freqs_arr = jnp.asarray(freqs)
+    scale = compute_directed_influence_stability_scale(
+        freqs_arr,
+        damping_coef,
+        coupling_strength,
+        sampling_freq,
+        max_spectral_radius=max_spectral_radius,
+        phase_difference=phase_difference,
+    )
+    effective_damping = jnp.asarray(damping_coef) * scale
+    effective_coupling = jnp.asarray(coupling_strength) * scale
+    transition_stack = jax.vmap(
+        lambda phase, coupling: construct_directed_influence_transition_matrix(
+            freqs=freqs_arr,
+            damping_coeffs=effective_damping,
+            coupling_strengths=coupling,
+            phase_diffs=phase,
+            sampling_freq=sampling_freq,
+        ),
+        in_axes=(-1, -1),
+        out_axes=-1,
+    )(jnp.asarray(phase_difference), effective_coupling)
+    return transition_stack, scale
+
+
+@typed_jit
 def construct_stable_directed_influence_transition_stack(
     freqs: ArrayLike,
     damping_coef: ArrayLike,
@@ -1279,7 +1325,8 @@ def construct_stable_directed_influence_transition_stack(
     applied to the *effective* damping and coupling used to build each
     ``A_j``; the intrinsic inputs are left untouched, so the construction is
     idempotent and ``A_j`` is reconstructable from the intrinsic parameters by
-    re-applying the same scale.
+    re-applying the same scale. Jit-compiled (one executable per input shape;
+    the float arguments are traced).
 
     Parameters
     ----------
@@ -1295,28 +1342,15 @@ def construct_stable_directed_influence_transition_stack(
     -------
     jax.Array, shape (2 * n_oscillators, 2 * n_oscillators, n_discrete_states)
     """
-    freqs_arr = jnp.asarray(freqs)
-    scale = compute_directed_influence_stability_scale(
-        freqs_arr,
+    transition_stack, _ = _construct_stable_dim_stack_and_scale(
+        freqs,
         damping_coef,
         coupling_strength,
+        phase_difference,
         sampling_freq,
-        max_spectral_radius=max_spectral_radius,
-        phase_difference=phase_difference,
+        max_spectral_radius,
     )
-    effective_damping = jnp.asarray(damping_coef) * scale
-    effective_coupling = jnp.asarray(coupling_strength) * scale
-    return jax.vmap(
-        lambda phase, coupling: construct_directed_influence_transition_matrix(
-            freqs=freqs_arr,
-            damping_coeffs=effective_damping,
-            coupling_strengths=coupling,
-            phase_diffs=phase,
-            sampling_freq=sampling_freq,
-        ),
-        in_axes=(-1, -1),
-        out_axes=-1,
-    )(jnp.asarray(phase_difference), effective_coupling)
+    return transition_stack
 
 
 def project_transition_matrix_stack(
@@ -1363,6 +1397,7 @@ def project_transition_matrix_stack(
     )
 
 
+@functools.partial(typed_jit, static_argnames=("n_oscillators",))
 def extract_dim_params_from_matrix_stack(
     transition_matrices: ArrayLike, sampling_freq: float, n_oscillators: int
 ) -> dict[str, jax.Array]:
@@ -1371,6 +1406,7 @@ def extract_dim_params_from_matrix_stack(
     Frequency and damping are shared across discrete states in the directed
     influence model, so their per-state extractions are averaged; coupling
     strength and phase difference keep their trailing discrete-state axis.
+    Jit-compiled with ``n_oscillators`` static (``sampling_freq`` is traced).
 
     Parameters
     ----------
@@ -1386,17 +1422,11 @@ def extract_dim_params_from_matrix_stack(
         ``coupling_strength`` and ``phase_diff`` of shape
         ``(n_oscillators, n_oscillators, n_discrete_states)``.
     """
-    transition_matrices = jnp.asarray(transition_matrices)
-    per_state = [
-        extract_dim_params_from_matrix(
-            transition_matrices[..., j], sampling_freq, n_oscillators
-        )
-        for j in range(transition_matrices.shape[-1])
-    ]
-    stacked = {
-        key: jnp.stack([p[key] for p in per_state], axis=-1)
-        for key in ("freq", "damping", "coupling_strength", "phase_diff")
-    }
+    stacked = jax.vmap(
+        lambda A: extract_dim_params_from_matrix(A, sampling_freq, n_oscillators),
+        in_axes=-1,
+        out_axes=-1,
+    )(jnp.asarray(transition_matrices))
     return {
         "freq": jnp.mean(stacked["freq"], axis=-1),
         "damping": jnp.mean(stacked["damping"], axis=-1),
@@ -1577,17 +1607,16 @@ class DirectedInfluenceDynamicsMixin:
         via SGD or standard EM. The cache is left untouched (``None``) before
         the first joint solve.
         """
-        self.continuous_transition_matrix = (
-            construct_stable_directed_influence_transition_stack(
-                self.freqs,
-                self.damping_coef,
-                self.coupling_strength,
-                self.phase_difference,
-                self.sampling_freq,
-                max_spectral_radius=self.max_spectral_radius,
-            )
+        transition_stack, effective_scale = _construct_stable_dim_stack_and_scale(
+            self.freqs,
+            self.damping_coef,
+            self.coupling_strength,
+            self.phase_difference,
+            self.sampling_freq,
+            max_spectral_radius=self.max_spectral_radius,
         )
-        scale = float(self._effective_dim_scale())
+        self.continuous_transition_matrix = transition_stack
+        scale = float(effective_scale)
         if scale < 1.0:
             # Logged (not warnings.warn): EM and SGD rebuild A every step.
             logger.warning(
