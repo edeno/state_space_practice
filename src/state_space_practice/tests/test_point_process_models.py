@@ -1653,13 +1653,21 @@ class TestSharedSwitchingPointProcessBase:
         )
 
         captured = []
-        real_filter = spp.switching_point_process_filter
 
-        def spy(*args, **kwargs):
-            captured.append(kwargs["log_intensity_func"])
-            return real_filter(*args, **kwargs)
+        # The GPB1 E-step calls the filter variant without pair-conditional
+        # outputs, GPB2 the public filter; spy on both.
+        def make_spy(real_filter):
+            def spy(*args, **kwargs):
+                captured.append(kwargs["log_intensity_func"])
+                return real_filter(*args, **kwargs)
 
-        monkeypatch.setattr(spp, "switching_point_process_filter", spy)
+            return spy
+
+        for name in (
+            "switching_point_process_filter",
+            "_switching_point_process_filter_gpb1",
+        ):
+            monkeypatch.setattr(spp, name, make_spy(getattr(spp, name)))
         model.fit(spikes, max_iter=2, key=jax.random.PRNGKey(42))
 
         assert len(captured) >= 2

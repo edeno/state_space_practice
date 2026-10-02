@@ -662,6 +662,39 @@ class TestPointProcessUpdatePerStatePair:
 class TestSwitchingPointProcessFilter:
     """Tests for the switching_point_process_filter function (Task 2.5)."""
 
+    def test_gpb1_variant_matches_public_filter(self) -> None:
+        """The GPB1 E-step filter skips pair outputs but changes none it returns."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            _switching_point_process_filter_gpb1,
+            switching_point_process_filter,
+        )
+
+        n_time, n_latent, n_neurons, n_states = 40, 2, 4, 2
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+        args = (
+            jnp.zeros((n_latent, n_states)),
+            jnp.stack([jnp.eye(n_latent)] * n_states, axis=-1),
+            jnp.array([0.6, 0.4]),
+            spikes,
+            jnp.array([[0.9, 0.1], [0.2, 0.8]]),
+            jnp.stack([0.99 * jnp.eye(n_latent), 0.9 * jnp.eye(n_latent)], axis=-1),
+            jnp.stack([0.01 * jnp.eye(n_latent), 0.05 * jnp.eye(n_latent)], axis=-1),
+            0.02,
+            linear_log_intensity,
+            SpikeObsParams(
+                baseline=jnp.zeros(n_neurons),
+                weights=0.3
+                * jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)),
+            ),
+        )
+        full = switching_point_process_filter(*args)
+        gpb1 = _switching_point_process_filter_gpb1(*args)
+        for name in gpb1._fields:
+            np.testing.assert_array_equal(getattr(gpb1, name), getattr(full, name))
+
     def test_output_shapes(self) -> None:
         """All outputs should have correct shapes (Task 2.5)."""
         from state_space_practice.switching_point_process import (
@@ -9966,13 +9999,21 @@ class TestSwitchingSpikeOscillatorEMConsistency:
         model = self._small_model()
 
         captured = []
-        real_filter = spp.switching_point_process_filter
 
-        def spy(*args, **kwargs):
-            captured.append(kwargs["log_intensity_func"])
-            return real_filter(*args, **kwargs)
+        # The GPB1 E-step calls the filter variant without pair-conditional
+        # outputs, GPB2 the public filter; spy on both.
+        def make_spy(real_filter):
+            def spy(*args, **kwargs):
+                captured.append(kwargs["log_intensity_func"])
+                return real_filter(*args, **kwargs)
 
-        monkeypatch.setattr(spp, "switching_point_process_filter", spy)
+            return spy
+
+        for name in (
+            "switching_point_process_filter",
+            "_switching_point_process_filter_gpb1",
+        ):
+            monkeypatch.setattr(spp, name, make_spy(getattr(spp, name)))
         model.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
 
         assert len(captured) >= 2, "expected filter calls across multiple E-steps"

@@ -35,6 +35,8 @@ from state_space_practice.switching_kalman import (
     _kalman_smoother_update_per_discrete_state_pair,
     _optimize_dim_joint_core,
     _optimize_dim_single_core,
+    _switching_kalman_filter_gpb1,
+    _switching_kalman_smoother_em_stats,
     _update_discrete_state_probabilities,
     _update_smoother_discrete_probabilities,
     collapse_gaussian_mixture,
@@ -1055,6 +1057,30 @@ def test_switching_kalman_filter_accepts_numpy_inputs(simple_skf_model: tuple) -
     assert len(numpy_outputs) == len(jax_outputs)
     for from_numpy, from_jax in zip(numpy_outputs, jax_outputs, strict=True):
         np.testing.assert_array_equal(from_numpy, from_jax)
+
+
+def test_gpb1_variants_match_public_filter_and_smoother(
+    simple_skf_model: tuple,
+) -> None:
+    """The GPB1 E-step variants skip outputs but change none they return."""
+    init_mean, init_cov, init_prob, obs, Z, A, Q, H, R = simple_skf_model
+    full = switching_kalman_filter(*simple_skf_model)
+    gpb1 = _switching_kalman_filter_gpb1(*simple_skf_model)
+    for name in gpb1._fields:
+        np.testing.assert_array_equal(getattr(gpb1, name), getattr(full, name))
+
+    smoother_args = (
+        full.state_cond_filter_mean,
+        full.state_cond_filter_cov,
+        full.filter_discrete_state_prob,
+        Q,
+        A,
+        Z,
+    )
+    full_smooth = switching_kalman_smoother(*smoother_args)
+    stats = _switching_kalman_smoother_em_stats(*smoother_args)
+    for name in stats._fields:
+        np.testing.assert_array_equal(getattr(stats, name), getattr(full_smooth, name))
 
 
 def test_switching_result_fields_name_the_right_outputs(

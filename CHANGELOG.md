@@ -204,6 +204,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Viterbi re-traced its scans on every call (3 compiles, ~240 ms vs 8 ms at
   T=2000, K=2); the plug-in GLM M-step re-traced its scan on every call
   (~190 ms vs 52 ms at T=5000, 10 neurons). Outputs are bit-identical.
+- **GPB1 E-steps no longer materialize outputs they discard**: the switching
+  oscillator models (`oscillator_models`) and the switching point-process
+  models (`SwitchingSpikeOscillatorModel` and the COM/CNM/DIM point-process
+  models) with `smoother_type="gpb1"` (the default) now run filter/smoother
+  variants that skip the pair-conditional filter trajectories (only GPB2 reads
+  them) and the overall collapsed smoother moments. At T=20k, 8 latent dims,
+  3 states the Gaussian filter's compiled output drops from 134 to 33 MB
+  (temporaries 103 to 30 MB), the E-step's peak RSS growth from 448 to 302 MB
+  (Gaussian) and 393 to 178 MB (point process), and E-step time by 25-30%.
+  E-step outputs are bit-identical; the public `switching_kalman_filter`,
+  `switching_kalman_smoother` and `switching_point_process_filter` are
+  unchanged.
 - **The choice models skip the duplicate final E-step after convergence**
   (`MultinomialChoiceModel`, `CovariateChoiceModel`, `SwitchingChoiceModel`).
 - **`PlaceFieldModel` posterior rate maps are computed by a jitted JAX

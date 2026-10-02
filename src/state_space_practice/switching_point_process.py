@@ -126,14 +126,15 @@ from state_space_practice.sgd_fitting import (
     SGDParamSpec,
 )
 from state_space_practice.switching_kalman import (
+    SwitchingFilterGPB1Result,
     SwitchingFilterResult,
     _first_timestep_discrete_update,
     _normalize_initial_discrete_prob,
+    _switching_kalman_smoother_em_stats,
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture_per_discrete_state,
     minimum_state_occupancy,
     switching_kalman_maximization_step,
-    switching_kalman_smoother,
     switching_kalman_smoother_gpb2,
     warn_low_occupancy_states,
 )
@@ -2278,6 +2279,105 @@ def _switching_point_process_filter_jit(
     [2] Murphy, K.P. (1998). Switching Kalman Filters.
     [3] Shumway, R.H., and Stoffer, D.S. (1991). Dynamic Linear Models With Switching.
     """
+    filtered, pair_cond = _switching_point_process_filter_core(
+        init_state_cond_mean,
+        init_state_cond_cov,
+        init_discrete_state_prob,
+        spikes,
+        discrete_transition_matrix,
+        continuous_transition_matrix,
+        process_cov,
+        dt,
+        log_intensity_func,
+        spike_params,
+        include_laplace_normalization,
+        max_newton_iter,
+        line_search_beta,
+        return_pair_cond=True,
+    )
+    assert pair_cond is not None  # requested above
+    return SwitchingFilterResult(
+        state_cond_filter_mean=filtered.state_cond_filter_mean,
+        state_cond_filter_cov=filtered.state_cond_filter_cov,
+        filter_discrete_state_prob=filtered.filter_discrete_state_prob,
+        pair_cond_filter_mean=pair_cond[0],
+        pair_cond_filter_cov=pair_cond[1],
+        pair_cond_filter_prob=pair_cond[2],
+        marginal_log_likelihood=filtered.marginal_log_likelihood,
+    )
+
+
+@functools.partial(
+    typed_jit,
+    static_argnames=[
+        "log_intensity_func",
+        "include_laplace_normalization",
+        "max_newton_iter",
+    ],
+)
+def _switching_point_process_filter_gpb1_jit(
+    init_state_cond_mean: Array,
+    init_state_cond_cov: Array,
+    init_discrete_state_prob: Array,
+    spikes: Array,
+    discrete_transition_matrix: Array,
+    continuous_transition_matrix: Array,
+    process_cov: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
+    include_laplace_normalization: bool = True,
+    max_newton_iter: int = 3,
+    line_search_beta: float = 0.5,
+) -> SwitchingFilterGPB1Result:
+    """:func:`_switching_point_process_filter_jit` without pair-conditional outputs.
+
+    For GPB1 E-steps, which never read the ``(n_time, ..., K, K)``
+    pair-conditional trajectories; the returned fields are identical to the
+    matching fields of the full filter.
+    """
+    filtered, _ = _switching_point_process_filter_core(
+        init_state_cond_mean,
+        init_state_cond_cov,
+        init_discrete_state_prob,
+        spikes,
+        discrete_transition_matrix,
+        continuous_transition_matrix,
+        process_cov,
+        dt,
+        log_intensity_func,
+        spike_params,
+        include_laplace_normalization,
+        max_newton_iter,
+        line_search_beta,
+        return_pair_cond=False,
+    )
+    return filtered
+
+
+def _switching_point_process_filter_core(
+    init_state_cond_mean: Array,
+    init_state_cond_cov: Array,
+    init_discrete_state_prob: Array,
+    spikes: Array,
+    discrete_transition_matrix: Array,
+    continuous_transition_matrix: Array,
+    process_cov: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
+    include_laplace_normalization: bool,
+    max_newton_iter: int,
+    line_search_beta: float,
+    return_pair_cond: bool,
+) -> tuple[SwitchingFilterGPB1Result, tuple[Array, Array, Array] | None]:
+    """Traced switching point-process filter shared by the jitted entry points.
+
+    Returns the state-conditional outputs and, when ``return_pair_cond``
+    (a Python bool, fixed at trace time) is True, the pair-conditional
+    ``(mean, cov, prob)`` trajectories; otherwise None, and the scan never
+    emits them. See :func:`_switching_point_process_filter_jit`.
+    """
     # Input validation: ensure spikes is 2D (n_time, n_neurons)
     spikes = jnp.asarray(spikes)
     if spikes.ndim == 1:
@@ -2301,7 +2401,7 @@ def _switching_point_process_filter_jit(
         y_t: Array,
     ) -> tuple[
         tuple[Array, Array, Array, Array, Array, Array],
-        tuple[Array, Array, Array, Array, Array, Array],
+        tuple[Array, ...],
     ]:
         """One step of the switching point-process filter.
 
@@ -2344,8 +2444,9 @@ def _switching_point_process_filter_jit(
                 Posterior state-conditional covariances.
             filter_discrete_prob : Array, shape (n_discrete_states,)
                 Posterior discrete state probabilities.
-            pair_cond_filter_mean : Array, shape (n_latent, n_discrete_states, n_discrete_states)
-                Pair-conditional filter means for smoother.
+            pair_cond_filter_mean, pair_cond_filter_cov, pair_cond_filter_prob
+                Pair-conditional mean, covariance and probability (only
+                when ``return_pair_cond``).
         """
         (
             prev_state_cond_filter_mean,
@@ -2409,6 +2510,17 @@ def _switching_point_process_filter_jit(
             )
         )
 
+        outputs: tuple[Array, ...] = (
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_prob,
+        )
+        if return_pair_cond:
+            outputs += (
+                pair_cond_filter_mean,
+                pair_cond_filter_cov,
+                pair_cond_filter_prob,
+            )
         return (
             state_cond_filter_mean,
             state_cond_filter_cov,
@@ -2416,14 +2528,7 @@ def _switching_point_process_filter_jit(
             marginal_log_likelihood,
             next_support,
             n_failed_bins,
-        ), (
-            state_cond_filter_mean,
-            state_cond_filter_cov,
-            filter_discrete_prob,
-            pair_cond_filter_mean,
-            pair_cond_filter_cov,
-            pair_cond_filter_prob,
-        )
+        ), outputs
 
     # Handle first timestep with x₁ convention: update-only (no dynamics prediction)
     # init_state_cond_mean represents p(x₁ | S₁), the prior for the first observation
@@ -2459,14 +2564,7 @@ def _switching_point_process_filter_jit(
     # jax.lax.scan handles empty inputs (spikes[1:] when n_time=1) gracefully
     (
         (_, _, _, marginal_log_likelihood, _, n_failed_bins),
-        (
-            rest_state_cond_filter_mean,
-            rest_state_cond_filter_cov,
-            rest_filter_discrete_state_prob,
-            rest_pair_cond_filter_mean,
-            rest_pair_cond_filter_cov,
-            rest_pair_cond_filter_prob,
-        ),
+        rest_outputs,
     ) = jax.lax.scan(
         _step,
         (
@@ -2487,34 +2585,30 @@ def _switching_point_process_filter_jit(
     )
 
     # Prepend first timestep results
-    state_cond_filter_mean = jnp.concatenate(
-        [first_state_cond_mean[None, ...], rest_state_cond_filter_mean], axis=0
+    first_outputs: tuple[Array, ...] = (
+        first_state_cond_mean,
+        first_state_cond_cov,
+        first_discrete_prob,
     )
-    state_cond_filter_cov = jnp.concatenate(
-        [first_state_cond_cov[None, ...], rest_state_cond_filter_cov], axis=0
-    )
-    filter_discrete_state_prob = jnp.concatenate(
-        [first_discrete_prob[None, ...], rest_filter_discrete_state_prob], axis=0
-    )
-    pair_cond_filter_mean = jnp.concatenate(
-        [first_pair_cond_mean[None, ...], rest_pair_cond_filter_mean], axis=0
-    )
-    pair_cond_filter_cov = jnp.concatenate(
-        [first_pair_cond_cov[None, ...], rest_pair_cond_filter_cov], axis=0
-    )
-    pair_cond_filter_prob = jnp.concatenate(
-        [first_pair_cond_prob[None, ...], rest_pair_cond_filter_prob], axis=0
-    )
-
-    return SwitchingFilterResult(
-        state_cond_filter_mean=state_cond_filter_mean,
-        state_cond_filter_cov=state_cond_filter_cov,
-        filter_discrete_state_prob=filter_discrete_state_prob,
-        pair_cond_filter_mean=pair_cond_filter_mean,
-        pair_cond_filter_cov=pair_cond_filter_cov,
-        pair_cond_filter_prob=pair_cond_filter_prob,
+    if return_pair_cond:
+        first_outputs += (
+            first_pair_cond_mean,
+            first_pair_cond_cov,
+            first_pair_cond_prob,
+        )
+    outputs = [
+        jnp.concatenate([first[None, ...], rest], axis=0)
+        for first, rest in zip(first_outputs, rest_outputs, strict=True)
+    ]
+    filtered = SwitchingFilterGPB1Result(
+        state_cond_filter_mean=outputs[0],
+        state_cond_filter_cov=outputs[1],
+        filter_discrete_state_prob=outputs[2],
         marginal_log_likelihood=marginal_log_likelihood,
     )
+    if not return_pair_cond:
+        return filtered, None
+    return filtered, (outputs[3], outputs[4], outputs[5])
 
 
 def switching_point_process_filter(
@@ -2556,30 +2650,93 @@ def switching_point_process_filter(
         NamedTuple of the seven filter outputs (see
         ``_switching_point_process_filter_jit`` for shapes).
     """
-    init_state_cond_mean = jnp.asarray(init_state_cond_mean)
-    init_state_cond_cov = jnp.asarray(init_state_cond_cov)
-    init_discrete_state_prob = jnp.asarray(init_discrete_state_prob)
-    spikes = jnp.asarray(spikes)
-    discrete_transition_matrix = jnp.asarray(discrete_transition_matrix)
-    continuous_transition_matrix = jnp.asarray(continuous_transition_matrix)
-    process_cov = jnp.asarray(process_cov)
-    _validate_discrete_state_transitions(
-        discrete_transition_matrix, init_discrete_state_prob, dt
-    )
     return _switching_point_process_filter_jit(
-        init_state_cond_mean,
-        init_state_cond_cov,
-        init_discrete_state_prob,
-        spikes,
-        discrete_transition_matrix,
-        continuous_transition_matrix,
-        process_cov,
+        *_validated_filter_arrays(
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            spikes,
+            discrete_transition_matrix,
+            continuous_transition_matrix,
+            process_cov,
+            dt,
+        ),
         dt,
         log_intensity_func,
         spike_params,
         include_laplace_normalization=include_laplace_normalization,
         max_newton_iter=max_newton_iter,
         line_search_beta=line_search_beta,
+    )
+
+
+def _switching_point_process_filter_gpb1(
+    init_state_cond_mean: ArrayLike,
+    init_state_cond_cov: ArrayLike,
+    init_discrete_state_prob: ArrayLike,
+    spikes: ArrayLike,
+    discrete_transition_matrix: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    dt: float,
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
+    max_newton_iter: int = 3,
+    line_search_beta: float = 0.5,
+) -> SwitchingFilterGPB1Result:
+    """:func:`switching_point_process_filter` without pair-conditional outputs.
+
+    Same eager validation, then the jitted filter variant that does not
+    materialize the pair-conditional trajectories (GPB1 E-steps never read
+    them).
+    """
+    return _switching_point_process_filter_gpb1_jit(
+        *_validated_filter_arrays(
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            spikes,
+            discrete_transition_matrix,
+            continuous_transition_matrix,
+            process_cov,
+            dt,
+        ),
+        dt,
+        log_intensity_func,
+        spike_params,
+        max_newton_iter=max_newton_iter,
+        line_search_beta=line_search_beta,
+    )
+
+
+def _validated_filter_arrays(
+    init_state_cond_mean: ArrayLike,
+    init_state_cond_cov: ArrayLike,
+    init_discrete_state_prob: ArrayLike,
+    spikes: ArrayLike,
+    discrete_transition_matrix: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    dt: float,
+) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
+    """Convert the filter's array inputs and validate the discrete-state ones.
+
+    Runs ``_validate_discrete_state_transitions`` eagerly (it is skipped for
+    traced inputs); see :func:`switching_point_process_filter`.
+    """
+    init_discrete_state_prob = jnp.asarray(init_discrete_state_prob)
+    discrete_transition_matrix = jnp.asarray(discrete_transition_matrix)
+    _validate_discrete_state_transitions(
+        discrete_transition_matrix, init_discrete_state_prob, dt
+    )
+    return (
+        jnp.asarray(init_state_cond_mean),
+        jnp.asarray(init_state_cond_cov),
+        init_discrete_state_prob,
+        jnp.asarray(spikes),
+        discrete_transition_matrix,
+        jnp.asarray(continuous_transition_matrix),
+        jnp.asarray(process_cov),
     )
 
 
@@ -3051,40 +3208,26 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         # single module-level object (not a per-call closure): the jitted filter
         # core takes it as a static jit argument cached by identity, so reusing
         # the same object avoids recompiling the filter on every EM iteration.
-        (
-            state_cond_filter_mean,
-            state_cond_filter_cov,
-            filter_discrete_state_prob,
-            pair_cond_filter_mean,
-            pair_cond_filter_cov,
-            pair_cond_filter_prob,
-            marginal_log_likelihood,
-        ) = switching_point_process_filter(
-            init_state_cond_mean=self.init_mean,
-            init_state_cond_cov=self.init_cov,
-            init_discrete_state_prob=self.init_discrete_state_prob,
-            spikes=spikes,
-            discrete_transition_matrix=self.discrete_transition_matrix,
-            continuous_transition_matrix=self.continuous_transition_matrix,
-            process_cov=self.process_cov,
-            dt=self.dt,
-            log_intensity_func=_linear_log_intensity,
-            spike_params=self.spike_params,
-            max_newton_iter=self.max_newton_iter,
-            line_search_beta=self.line_search_beta,
-        )
+        filter_args: dict[str, Any] = {
+            "init_state_cond_mean": self.init_mean,
+            "init_state_cond_cov": self.init_cov,
+            "init_discrete_state_prob": self.init_discrete_state_prob,
+            "spikes": spikes,
+            "discrete_transition_matrix": self.discrete_transition_matrix,
+            "continuous_transition_matrix": self.continuous_transition_matrix,
+            "process_cov": self.process_cov,
+            "dt": self.dt,
+            "log_intensity_func": _linear_log_intensity,
+            "spike_params": self.spike_params,
+            "max_newton_iter": self.max_newton_iter,
+            "line_search_beta": self.line_search_beta,
+        }
 
         # Run the switching Kalman smoother (observation-model agnostic)
         # The smoother operates on Gaussian posteriors regardless of observation model
-        smoother_args = {
-            "filter_mean": state_cond_filter_mean,
-            "filter_cov": state_cond_filter_cov,
-            "filter_discrete_state_prob": filter_discrete_state_prob,
-            "process_cov": self.process_cov,
-            "continuous_transition_matrix": self.continuous_transition_matrix,
-        }
-
         if self.smoother_type == "gpb2":
+            filtered = switching_point_process_filter(**filter_args)
+            marginal_log_likelihood = filtered.marginal_log_likelihood
             (
                 _,
                 _,
@@ -3098,24 +3241,34 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
                 pair_cond_smoother_covs,
                 next_pair_cond_smoother_means,
             ) = switching_kalman_smoother_gpb2(
-                **smoother_args,
-                pair_cond_filter_mean=pair_cond_filter_mean,
-                pair_cond_filter_cov=pair_cond_filter_cov,
-                pair_cond_filter_prob=pair_cond_filter_prob,
+                filter_mean=filtered.state_cond_filter_mean,
+                filter_cov=filtered.state_cond_filter_cov,
+                filter_discrete_state_prob=filtered.filter_discrete_state_prob,
+                pair_cond_filter_mean=filtered.pair_cond_filter_mean,
+                pair_cond_filter_cov=filtered.pair_cond_filter_cov,
+                pair_cond_filter_prob=filtered.pair_cond_filter_prob,
+                process_cov=self.process_cov,
+                continuous_transition_matrix=self.continuous_transition_matrix,
             )
         else:
+            # GPB1 reads neither the pair-conditional filter trajectories nor
+            # the overall (collapsed) smoother moments, so the filter/smoother
+            # variants that do not materialize them are used.
+            gpb1_filtered = _switching_point_process_filter_gpb1(**filter_args)
+            marginal_log_likelihood = gpb1_filtered.marginal_log_likelihood
             (
-                _,
-                _,
                 smoother_discrete_state_prob,
                 smoother_joint_discrete_state_prob,
-                _,
                 state_cond_smoother_means,
                 state_cond_smoother_covs,
                 pair_cond_smoother_cross_covs,
                 pair_cond_smoother_means,
-            ) = switching_kalman_smoother(
-                **smoother_args,
+            ) = _switching_kalman_smoother_em_stats(
+                filter_mean=gpb1_filtered.state_cond_filter_mean,
+                filter_cov=gpb1_filtered.state_cond_filter_cov,
+                filter_discrete_state_prob=gpb1_filtered.filter_discrete_state_prob,
+                process_cov=self.process_cov,
+                continuous_transition_matrix=self.continuous_transition_matrix,
                 discrete_state_transition_matrix=self.discrete_transition_matrix,
             )
             pair_cond_smoother_covs = None

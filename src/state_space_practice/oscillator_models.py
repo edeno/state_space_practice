@@ -84,13 +84,14 @@ from state_space_practice.sgd_fitting import (
     SGDParamSpec,
 )
 from state_space_practice.switching_kalman import (
+    _switching_kalman_filter_gpb1,
+    _switching_kalman_smoother_em_stats,
     compute_process_covariance_sufficient_stats,
     compute_transition_sufficient_stats,
     minimum_state_occupancy,
     optimize_dim_transition_params_joint,
     switching_kalman_filter,
     switching_kalman_maximization_step,
-    switching_kalman_smoother,
     switching_kalman_smoother_gpb2,
     warn_low_occupancy_states,
 )
@@ -921,35 +922,21 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
             The log-likelihood of the observations given the current parameters (scalar array).
         """
         obs_arr: jax.Array = jnp.asarray(observations)
-        (
-            filter_mean,
-            filter_cov,
-            filter_discrete_state_prob,
-            pair_cond_filter_mean,
-            pair_cond_filter_cov,
-            pair_cond_filter_prob,
-            marginal_log_likelihood,
-        ) = switching_kalman_filter(
-            init_state_cond_mean=self.init_mean,
-            init_state_cond_cov=self.init_cov,
-            init_discrete_state_prob=self.init_discrete_state_prob,
-            obs=obs_arr,
-            discrete_transition_matrix=self.discrete_transition_matrix,
-            continuous_transition_matrix=self.continuous_transition_matrix,
-            process_cov=self.process_cov,
-            measurement_matrix=self.measurement_matrix,
-            measurement_cov=self.measurement_cov,
-        )
-
-        smoother_args = {
-            "filter_mean": filter_mean,
-            "filter_cov": filter_cov,
-            "filter_discrete_state_prob": filter_discrete_state_prob,
-            "process_cov": self.process_cov,
+        filter_args = {
+            "init_state_cond_mean": self.init_mean,
+            "init_state_cond_cov": self.init_cov,
+            "init_discrete_state_prob": self.init_discrete_state_prob,
+            "obs": obs_arr,
+            "discrete_transition_matrix": self.discrete_transition_matrix,
             "continuous_transition_matrix": self.continuous_transition_matrix,
+            "process_cov": self.process_cov,
+            "measurement_matrix": self.measurement_matrix,
+            "measurement_cov": self.measurement_cov,
         }
 
         if self.smoother_type == "gpb2":
+            filtered = switching_kalman_filter(**filter_args)
+            marginal_log_likelihood = filtered.marginal_log_likelihood
             (
                 _,  # smoother_mean (marginal)
                 _,  # smoother_cov (marginal)
@@ -963,24 +950,34 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
                 self.smoother_pair_cond_covs,
                 self.smoother_next_pair_cond_means,
             ) = switching_kalman_smoother_gpb2(
-                **smoother_args,
-                pair_cond_filter_mean=pair_cond_filter_mean,
-                pair_cond_filter_cov=pair_cond_filter_cov,
-                pair_cond_filter_prob=pair_cond_filter_prob,
+                filter_mean=filtered.state_cond_filter_mean,
+                filter_cov=filtered.state_cond_filter_cov,
+                filter_discrete_state_prob=filtered.filter_discrete_state_prob,
+                pair_cond_filter_mean=filtered.pair_cond_filter_mean,
+                pair_cond_filter_cov=filtered.pair_cond_filter_cov,
+                pair_cond_filter_prob=filtered.pair_cond_filter_prob,
+                process_cov=self.process_cov,
+                continuous_transition_matrix=self.continuous_transition_matrix,
             )
         else:
+            # GPB1 reads neither the pair-conditional filter trajectories nor
+            # the overall (collapsed) smoother moments, so the filter/smoother
+            # variants that do not materialize them are used.
+            gpb1_filtered = _switching_kalman_filter_gpb1(**filter_args)
+            marginal_log_likelihood = gpb1_filtered.marginal_log_likelihood
             (
-                _,  # smoother_mean (marginal)
-                _,  # smoother_cov (marginal)
                 self.smoother_discrete_state_prob,
                 self.smoother_joint_discrete_state_prob,
-                _,  # smoother_cross_cov (marginal)
                 self.smoother_state_cond_mean,
                 self.smoother_state_cond_cov,
                 self.smoother_pair_cond_cross_cov,
                 self.smoother_pair_cond_means,
-            ) = switching_kalman_smoother(
-                **smoother_args,
+            ) = _switching_kalman_smoother_em_stats(
+                filter_mean=gpb1_filtered.state_cond_filter_mean,
+                filter_cov=gpb1_filtered.state_cond_filter_cov,
+                filter_discrete_state_prob=gpb1_filtered.filter_discrete_state_prob,
+                process_cov=self.process_cov,
+                continuous_transition_matrix=self.continuous_transition_matrix,
                 discrete_state_transition_matrix=self.discrete_transition_matrix,
             )
             self.smoother_pair_cond_covs = None
