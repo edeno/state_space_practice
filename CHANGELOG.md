@@ -196,9 +196,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   14 GB at T = 400, now ~10 MB above baseline at both (and 0.1 s instead of
   0.9-4.9 s for the first call). Values move by Monte Carlo noise only (at
   most 0.017 vs the old estimate at T = 30-50, |z| <= 3.6 over ~2000
-  entries) and no longer depend on `key`. `key` and `n_samples` are still
-  accepted but unused; `compare_probability` gives the same result as the
-  latent comparison (the sigmoid link is strictly increasing).
+  entries) and no longer depend on a PRNG key (the now-dead `key`,
+  `n_samples`, `compare_probability` and `prob_correct_by_chance` arguments
+  are removed; see Removed).
 - **Smith learning-curve summaries and the criterion trial are exact**
   (`calculate_probability_confidence_limits`,
   `calculate_latent_state_percentiles` and the `SmithLearningModel` methods
@@ -212,8 +212,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   changed (by one trial) with the PRNG key; it is now deterministic. Values
   move by Monte Carlo noise only (at most 0.017 in probability, 0.036 in
   the latent state over 10 keys on a fitted session); percentiles 0 and 100
-  are now the exact limits. `key` and `n_samples` are still accepted but
-  unused.
+  are now the exact limits. The now-dead `key` and `n_samples` arguments are
+  removed (see Removed).
 - **`covariate_choice_smoother` uses `kalman.rts_backward_scan_with_predictions`**
   (jitted; about 10x faster per call -- the previous un-jitted RTS pass
   re-traced on every EM iteration). Its gain solve is the shared, retrying one, so smoothed values
@@ -580,6 +580,32 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`simulate.simulate_switching_kalman.simulate_challenging_states`**: unused.
 - **`point_process_kalman.smoothed_initial_transition_moments`**: an alias of
   `kalman.smooth_initial_state_with_cross_cov`; call that instead.
+- **Smith learning model Monte Carlo arguments** (the posterior summaries are
+  exact, so these no longer had any effect): `key` and `n_samples` from
+  `calculate_probability_confidence_limits`,
+  `calculate_latent_state_percentiles`, `compute_trial_comparison_matrix`,
+  `compare_two_trials` and the `SmithLearningModel` methods
+  `get_learning_curve`, `get_latent_state_percentiles`,
+  `find_criterion_trial`, `plot_learning_curve`, `plot_summary`,
+  `compare_trials`, `get_trial_comparison_matrix`,
+  `find_first_significant_improvement`, `plot_trial_comparison_matrix`; and
+  `compare_probability` (from all six trial-comparison functions/methods:
+  `compute_trial_comparison_matrix`, `compare_two_trials`, `compare_trials`,
+  `get_trial_comparison_matrix`, `find_first_significant_improvement`,
+  `plot_trial_comparison_matrix`) and `prob_correct_by_chance` (from
+  `compute_trial_comparison_matrix`, `compare_two_trials`), which could not
+  change a comparison because the sigmoid link is strictly increasing. Drop them from calls; `key` was the
+  leading positional argument, so positional calls shift by one (e.g.
+  `model.find_criterion_trial(key)` -> `model.find_criterion_trial()`,
+  `compare_two_trials(key, mode, var, gain, i, j)` ->
+  `compare_two_trials(mode, var, gain, i, j)`). Results are unchanged
+  (bit-identical).
+- **`SmithLearningModel.summary(key=...)`**: replaced by
+  `include_criterion: bool = True`. The criterion trial is now reported by
+  default (it used to need a PRNG key), and the null-model comparison appears
+  whenever `n_correct_responses` is given (it used to also need `key`).
+  `summary(key=k)` -> `summary()`; `summary()` (no criterion) ->
+  `summary(include_criterion=False)`.
 
 ### Fixed
 
