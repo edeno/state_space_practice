@@ -4377,6 +4377,139 @@ class TestScanOutputMemory:
 
 
 # ============================================================================
+# Reverse-mode gradients of the marginal log-likelihood (fit_sgd's loss)
+# ============================================================================
+
+
+def _symmetric_like(a: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    v = rng.normal(size=a.shape)
+    return 0.5 * (v + np.swapaxes(v, -1, -2))
+
+
+def _assert_reverse_mode_gradient_is_correct(loss, params, directions) -> None:
+    """``<grad loss, v>`` from reverse mode matches forward mode and FD.
+
+    Forward mode differentiates the filter step by step as it runs, so it is
+    an independent reference for the reverse-mode gradient ``fit_sgd`` uses
+    (to round-off); central finite differences additionally check that the
+    derivative is that of the loss (to truncation error).
+    """
+    loss_jit = jax.jit(loss)
+    grad = jax.jit(jax.grad(loss))(params)
+    jvp = jax.jit(lambda p, v: jax.jvp(loss, (p,), (v,))[1])
+    h = 1e-6
+    for v in directions:
+        forward = float(jvp(params, v))
+        reverse = float(
+            sum(
+                jnp.vdot(g, d)
+                for g, d in zip(jax.tree.leaves(grad), jax.tree.leaves(v))
+            )
+        )
+        shifted = [
+            float(loss_jit(jax.tree.map(lambda p, d, s=s: p + s * h * d, params, v)))
+            for s in (1.0, -1.0)
+        ]
+        finite_difference = (shifted[0] - shifted[1]) / (2 * h)
+        # Guard: the direction has a real slope, so agreement is informative.
+        assert abs(forward) > 1e-1
+        np.testing.assert_allclose(reverse, forward, rtol=1e-9)
+        np.testing.assert_allclose(reverse, finite_difference, rtol=1e-5)
+
+
+@pytest.mark.slow
+class TestMarginalLogLikelihoodGradient:
+    """Reverse-mode gradients through the forward filters match forward mode.
+
+    ``fit_sgd`` minimizes the negative marginal log-likelihood with
+    ``jax.grad`` through the block-diagonal forward core (PlaceFieldModel)
+    and the dense filter (PointProcessModel), including the Fisher-scoring
+    iterations and their line search.
+    """
+
+    @pytest.mark.parametrize("max_newton_iter", [1, 3])
+    def test_block_forward_core(self, max_newton_iter: int) -> None:
+        rng = np.random.default_rng(0)
+        T, n_neurons, nb, dt = 60, 3, 4, 0.1
+        Z = np.abs(rng.normal(size=(T, nb)))
+        init_means = rng.normal(0.5, 0.3, (n_neurons, nb))
+        spikes = rng.poisson(np.exp(Z @ init_means.T) * dt).astype(float)
+        params = (
+            np.tile(0.95 * np.eye(nb), (n_neurons, 1, 1)),
+            np.tile(1e-2 * np.eye(nb), (n_neurons, 1, 1)),
+            init_means,
+            np.tile(0.3 * np.eye(nb), (n_neurons, 1, 1)),
+        )
+
+        def loss(p):
+            A, Q, m0, P0 = p
+            _, _, lls, _ = _block_diagonal_forward_core(
+                A,
+                Q,
+                m0,
+                P0,
+                jnp.asarray(Z),
+                jnp.asarray(spikes),
+                dt,
+                include_laplace_normalization=True,
+                max_log_count=20.0,
+                max_newton_iter=max_newton_iter,
+            )
+            return jnp.sum(lls)
+
+        directions = [
+            (
+                rng.normal(size=params[0].shape),
+                _symmetric_like(params[1], rng),
+                rng.normal(size=params[2].shape),
+                _symmetric_like(params[3], rng),
+            )
+            for _ in range(3)
+        ]
+        _assert_reverse_mode_gradient_is_correct(
+            loss, jax.tree.map(jnp.asarray, params), directions
+        )
+
+    @pytest.mark.parametrize("max_newton_iter", [1, 3])
+    def test_dense_filter(self, max_newton_iter: int) -> None:
+        rng = np.random.default_rng(1)
+        T, d, n_obs, dt = 60, 4, 3, 0.1
+        design = rng.normal(0, 0.5, (T, n_obs, d))
+        init_mean = rng.normal(0.5, 0.3, d)
+        spikes = rng.poisson(np.exp(design @ init_mean) * dt).astype(float)
+        params = (0.95 * np.eye(d), 1e-2 * np.eye(d), init_mean, 0.3 * np.eye(d))
+
+        def loss(p):
+            A, Q, m0, P0 = p
+            _, _, marginal_ll = stochastic_point_process_filter(
+                m0,
+                P0,
+                jnp.asarray(design),
+                jnp.asarray(spikes),
+                dt,
+                A,
+                Q,
+                log_conditional_intensity,
+                validate_inputs=False,
+                max_newton_iter=max_newton_iter,
+            )
+            return marginal_ll
+
+        directions = [
+            (
+                rng.normal(size=params[0].shape),
+                _symmetric_like(params[1], rng),
+                rng.normal(size=params[2].shape),
+                _symmetric_like(params[3], rng),
+            )
+            for _ in range(3)
+        ]
+        _assert_reverse_mode_gradient_is_correct(
+            loss, jax.tree.map(jnp.asarray, params), directions
+        )
+
+
+# ============================================================================
 # Integration: PointProcessModel parameter + trajectory recovery
 # ============================================================================
 
