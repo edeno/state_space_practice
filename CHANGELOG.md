@@ -162,6 +162,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **DIM / DIM-PP standard-EM projection is compiled**:
+  `project_transition_matrix_stack` projects every state's oscillator blocks
+  in one jit-compiled call (only the `eigvals` spectral clamp stays on the
+  host), and the generalized-EM check of the projected transition matrix
+  computes the transition sufficient statistics once and scores the new and
+  previous matrices in one compiled call (it ran eagerly, twice). The
+  projection step of `DirectedInfluenceModel` and
+  `DirectedInfluencePointProcessModel` drops from 17-27 ms to 1.5-3 ms per EM
+  iteration (30-66% of an iteration at T=200, 16-29% at T=2000). Outputs and
+  log-likelihood sequences are bit-identical.
 - **Point-process smoothers write their backward-pass outputs in place**:
   the dense smoother now reuses `kalman.rts_backward_scan` (its private copy
   is removed) and the block-diagonal backward pass carries its output

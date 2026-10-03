@@ -1551,6 +1551,72 @@ def optimize_dim_transition_params_joint_until_stationary(
     return params
 
 
+@typed_jit
+def _dim_transition_objectives(
+    new_transition_matrix: ArrayLike,
+    old_transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    state_cond_smoother_means: ArrayLike,
+    state_cond_smoother_covs: ArrayLike,
+    smoother_joint_discrete_state_prob: ArrayLike,
+    pair_cond_smoother_cross_cov: ArrayLike,
+    pair_cond_smoother_means: ArrayLike,
+    pair_cond_smoother_covs: ArrayLike | None,
+    next_pair_cond_smoother_means: ArrayLike | None,
+) -> jax.Array:
+    """A-dependent M-step objective of two candidate DIM transition stacks.
+
+    ``-1/2 sum_j tr(Q_j^{-1} (A_j Gamma1_j A_j^T - A_j Beta_j^T - Beta_j A_j^T))``
+    with the E-step's transition statistics (the ``A``-free ``Gamma2`` and
+    ``log|Q|`` terms are omitted; ``Q`` is fixed in DIM). The statistics are
+    computed once and both candidates are scored in the same executable. The
+    smoother arguments are those of
+    :func:`~state_space_practice.switching_kalman.compute_transition_sufficient_stats`;
+    the optional pair-conditional ones (``None`` unless the GPB2 smoother
+    produced them) change the input structure, so there is at most one
+    compilation per smoother type and shape.
+
+    Parameters
+    ----------
+    new_transition_matrix, old_transition_matrix : ArrayLike, shape (n_latent, n_latent, n_discrete_states)
+    process_cov : ArrayLike, shape (n_latent, n_latent, n_discrete_states)
+    state_cond_smoother_means, state_cond_smoother_covs,
+    smoother_joint_discrete_state_prob, pair_cond_smoother_cross_cov,
+    pair_cond_smoother_means, pair_cond_smoother_covs,
+    next_pair_cond_smoother_means
+        E-step outputs, as for ``compute_transition_sufficient_stats``.
+
+    Returns
+    -------
+    jax.Array, shape (2,)
+        The objective (to be maximized) of the new and the old matrices.
+    """
+    from state_space_practice.switching_kalman import (
+        compute_transition_q_function,
+        compute_transition_sufficient_stats,
+    )
+
+    gamma1, beta = compute_transition_sufficient_stats(
+        state_cond_smoother_means=state_cond_smoother_means,
+        state_cond_smoother_covs=state_cond_smoother_covs,
+        smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
+        pair_cond_smoother_cross_cov=pair_cond_smoother_cross_cov,
+        pair_cond_smoother_means=pair_cond_smoother_means,
+        pair_cond_smoother_covs=pair_cond_smoother_covs,
+        next_pair_cond_smoother_means=next_pair_cond_smoother_means,
+    )
+
+    def objective(transition_matrix: jax.Array) -> jax.Array:
+        negative = jax.vmap(compute_transition_q_function, in_axes=-1)(
+            transition_matrix, gamma1, beta, process_cov
+        )
+        return -jnp.sum(negative)
+
+    return jax.vmap(objective)(
+        jnp.stack([new_transition_matrix, old_transition_matrix])
+    )
+
+
 class DirectedInfluenceDynamicsMixin:
     """Transition-matrix machinery shared by the directed influence models.
 
@@ -1725,33 +1791,27 @@ class DirectedInfluenceDynamicsMixin:
             name: getattr(self, name) for name in self._PUBLIC_DYNAMICS_ATTRS
         }
 
-    def _transition_objective(self, transition_matrix: jax.Array) -> float:
-        """A-dependent part of the expected complete-data log-likelihood.
+    def _transition_objectives(
+        self, new_transition_matrix: jax.Array, old_transition_matrix: jax.Array
+    ) -> tuple[float, float]:
+        """M-step objectives of the new and the old ``A`` under the current E-step.
 
-        ``-1/2 sum_j tr(Q_j^{-1} (A_j Gamma1_j A_j^T - A_j Beta_j^T - Beta_j A_j^T))``
-        with the current E-step's transition statistics (the ``A``-free
-        ``Gamma2`` and ``log|Q|`` terms are omitted; ``Q`` is fixed in DIM).
+        See :func:`_dim_transition_objectives`; one compiled call.
         """
-        from state_space_practice.switching_kalman import (
-            compute_transition_q_function,
-            compute_transition_sufficient_stats,
+        objectives = _dim_transition_objectives(
+            new_transition_matrix,
+            old_transition_matrix,
+            self.process_cov,
+            self.smoother_state_cond_mean,
+            self.smoother_state_cond_cov,
+            self.smoother_joint_discrete_state_prob,
+            self.smoother_pair_cond_cross_cov,
+            self.smoother_pair_cond_means,
+            getattr(self, "smoother_pair_cond_covs", None),
+            getattr(self, "smoother_next_pair_cond_means", None),
         )
-
-        gamma1, beta = compute_transition_sufficient_stats(
-            state_cond_smoother_means=self.smoother_state_cond_mean,
-            state_cond_smoother_covs=self.smoother_state_cond_cov,
-            smoother_joint_discrete_state_prob=self.smoother_joint_discrete_state_prob,
-            pair_cond_smoother_cross_cov=self.smoother_pair_cond_cross_cov,
-            pair_cond_smoother_means=self.smoother_pair_cond_means,
-            pair_cond_smoother_covs=getattr(self, "smoother_pair_cond_covs", None),
-            next_pair_cond_smoother_means=getattr(
-                self, "smoother_next_pair_cond_means", None
-            ),
-        )
-        negative = jax.vmap(compute_transition_q_function, in_axes=-1)(
-            transition_matrix, gamma1, beta, self.process_cov
-        )
-        return -float(jnp.sum(negative))
+        new_objective, old_objective = np.asarray(objectives).tolist()
+        return new_objective, old_objective
 
     def _keep_previous_dynamics_if_objective_decreased(
         self, previous: dict[str, jax.Array]
@@ -1767,9 +1827,8 @@ class DirectedInfluenceDynamicsMixin:
         previous (already valid) dynamics are kept, so the M-step never
         decreases the expected complete-data log-likelihood.
         """
-        new_objective = self._transition_objective(self.continuous_transition_matrix)
-        old_objective = self._transition_objective(
-            previous["continuous_transition_matrix"]
+        new_objective, old_objective = self._transition_objectives(
+            self.continuous_transition_matrix, previous["continuous_transition_matrix"]
         )
         slack = 1e-10 * max(1.0, abs(old_objective))
         if new_objective >= old_objective - slack:

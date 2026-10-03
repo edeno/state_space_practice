@@ -16,6 +16,7 @@ from state_space_practice.oscillator_utils import (
     _compute_coupled_oscillator_block,
     _compute_coupling_transition_block,
     _compute_intrinsic_oscillation_block,
+    _dim_transition_objectives,
     _extract_scale_and_angle,
     _get_rotation_matrix,
     _get_scaling_factor,
@@ -42,6 +43,10 @@ from state_space_practice.oscillator_utils import (
     project_coupled_transition_matrix,
     project_matrix_blockwise,
     project_transition_matrix_stack,
+)
+from state_space_practice.switching_kalman import (
+    compute_transition_q_function,
+    compute_transition_sufficient_stats,
 )
 from state_space_practice.utils import stabilize_transition_matrix
 
@@ -1017,7 +1022,10 @@ def test_rejected_projected_dynamics_are_restored_and_logged_at_warning(caplog):
     old_A = jnp.eye(4)[..., None] * 0.5
     host.continuous_transition_matrix = jnp.eye(4)[..., None] * 0.8
     # Objective prefers the previous matrix.
-    host._transition_objective = lambda A: -float(jnp.sum((A - old_A) ** 2))
+    host._transition_objectives = lambda new_A, prev_A: (
+        -float(jnp.sum((new_A - old_A) ** 2)),
+        -float(jnp.sum((prev_A - old_A) ** 2)),
+    )
     with caplog.at_level("WARNING", logger="state_space_practice.oscillator_utils"):
         host._keep_previous_dynamics_if_objective_decreased(
             {"continuous_transition_matrix": old_A}
@@ -1213,6 +1221,64 @@ def test_dim_standard_em_sync_compiles_nothing_after_warm_up() -> None:
     assert compiles == []
 
 
+def _random_psd_stack(
+    rng: np.random.Generator, shape: tuple[int, ...], n: int
+) -> np.ndarray:
+    """PSD ``(n, n)`` matrices with the matrix axes after the leading ``shape``."""
+    factor = rng.normal(size=(*shape, n, n))
+    return factor @ np.swapaxes(factor, -1, -2) + 0.1 * np.eye(n)
+
+
+def _random_dim_smoother_outputs(
+    seed: int, n_latent: int, n_states: int, n_time: int, pair_conditional: bool
+) -> dict[str, jax.Array | None]:
+    """E-step outputs in the layout ``compute_transition_sufficient_stats`` reads.
+
+    ``pair_conditional`` adds the GPB2-only pair-conditional covariances and
+    next-step means (``None`` otherwise, as for GPB1).
+    """
+    rng = np.random.default_rng(seed)
+    n_pairs = n_time - 1
+    joint = rng.uniform(0.1, 1.0, (n_pairs, n_states, n_states))
+    joint /= joint.sum(axis=(1, 2), keepdims=True)
+
+    def states_last(x: np.ndarray) -> jax.Array:
+        # (time, K[, K], n, n) -> (time, n, n, K[, K])
+        return jnp.asarray(np.moveaxis(x, (-2, -1), (1, 2)))
+
+    return {
+        "state_cond_smoother_means": jnp.asarray(
+            rng.normal(size=(n_time, n_latent, n_states))
+        ),
+        "state_cond_smoother_covs": states_last(
+            _random_psd_stack(rng, (n_time, n_states), n_latent)
+        ),
+        "smoother_joint_discrete_state_prob": jnp.asarray(joint),
+        "pair_cond_smoother_cross_cov": jnp.asarray(
+            rng.normal(size=(n_pairs, n_latent, n_latent, n_states, n_states))
+        ),
+        "pair_cond_smoother_means": jnp.asarray(
+            rng.normal(size=(n_pairs, n_latent, n_states, n_states))
+        ),
+        "pair_cond_smoother_covs": (
+            states_last(_random_psd_stack(rng, (n_pairs, n_states, n_states), n_latent))
+            if pair_conditional
+            else None
+        ),
+        "next_pair_cond_smoother_means": (
+            jnp.asarray(rng.normal(size=(n_pairs, n_latent, n_states, n_states)))
+            if pair_conditional
+            else None
+        ),
+    }
+
+
+def _random_process_cov(rng: np.random.Generator, n_latent: int, n_states: int):
+    return jnp.asarray(
+        np.moveaxis(_random_psd_stack(rng, (n_states,), n_latent), 0, -1)
+    )
+
+
 @pytest.mark.parametrize("case", ["within_bound", "clamp_engaged", "non_finite"])
 def test_project_transition_matrix_stack_is_bit_identical_to_eager_per_state(
     case: str,
@@ -1261,18 +1327,66 @@ def test_project_transition_matrix_stack_is_bit_identical_to_eager_per_state(
     )
 
 
-@pytest.mark.parametrize("helper", ["_project_coupled_transition_matrix_stack"])
+@pytest.mark.parametrize("pair_conditional", [False, True], ids=["gpb1", "gpb2"])
+def test_dim_transition_objectives_are_bit_identical_to_eager_q_function(
+    pair_conditional: bool,
+) -> None:
+    """Scoring the (new, old) pair in one compiled call reproduces the eager
+    sufficient-statistics + Q-function evaluation of each matrix exactly."""
+    n_latent, n_states = 4, 2
+    smoother = _random_dim_smoother_outputs(0, n_latent, n_states, 30, pair_conditional)
+    rng = np.random.default_rng(1)
+    new_A, old_A = (
+        jnp.asarray(rng.normal(scale=0.4, size=(n_latent, n_latent, n_states)))
+        for _ in range(2)
+    )
+    process_cov = _random_process_cov(rng, n_latent, n_states)
+    gamma1, beta = compute_transition_sufficient_stats(**smoother)
+
+    def eager_objective(A: jax.Array) -> float:
+        negative = jax.vmap(compute_transition_q_function, in_axes=-1)(
+            A, gamma1, beta, process_cov
+        )
+        return -float(jnp.sum(negative))
+
+    objectives = _dim_transition_objectives(
+        new_A, old_A, process_cov, *smoother.values()
+    )
+
+    expected = [eager_objective(new_A), eager_objective(old_A)]
+    assert expected[0] != expected[1]  # guard: the two candidates are told apart
+    assert np.asarray(objectives).tolist() == expected
+
+
+@pytest.mark.parametrize(
+    "helper",
+    ["_project_coupled_transition_matrix_stack", "_dim_transition_objectives"],
+)
 def test_dim_projection_helpers_compile_once_and_never_retrace(helper: str) -> None:
-    """The standard-EM block projection is one jitted executable: the first
-    call on a fresh shape compiles at most one, and new values (later EM
-    iterations) compile nothing."""
+    """The standard-EM block projection and its objective check are each one
+    jitted executable: the first call on a fresh shape compiles at most one,
+    and new values (later EM iterations) compile nothing."""
     n_osc, n_states = 5, 3
     n_latent = 2 * n_osc
     calls = []
     for seed in range(4):
         rng = np.random.default_rng(seed)
         A = jnp.asarray(rng.normal(size=(n_latent, n_latent, n_states)))
-        calls.append(functools.partial(_project_coupled_transition_matrix_stack, A))
+        if helper == "_project_coupled_transition_matrix_stack":
+            calls.append(functools.partial(_project_coupled_transition_matrix_stack, A))
+        else:
+            smoother = _random_dim_smoother_outputs(
+                seed, n_latent, n_states, 7, pair_conditional=False
+            )
+            calls.append(
+                functools.partial(
+                    _dim_transition_objectives,
+                    A,
+                    0.5 * A,
+                    _random_process_cov(rng, n_latent, n_states),
+                    *smoother.values(),
+                )
+            )
 
     with _count_backend_compiles() as first:
         jax.block_until_ready(calls[0]())
@@ -1282,6 +1396,51 @@ def test_dim_projection_helpers_compile_once_and_never_retrace(helper: str) -> N
 
     assert len(first) <= 1
     assert later == []
+
+
+_MIXIN_SMOOTHER_ATTRS = {
+    "state_cond_smoother_means": "smoother_state_cond_mean",
+    "state_cond_smoother_covs": "smoother_state_cond_cov",
+    "smoother_joint_discrete_state_prob": "smoother_joint_discrete_state_prob",
+    "pair_cond_smoother_cross_cov": "smoother_pair_cond_cross_cov",
+    "pair_cond_smoother_means": "smoother_pair_cond_means",
+}
+
+
+def test_dim_standard_em_projection_compiles_nothing_after_warm_up(caplog) -> None:
+    """The whole standard-EM projection (block projection, host clamp, sync and
+    generalized-EM objective check) reuses its executables across EM
+    iterations, whether or not the clamp engages or the previous dynamics are
+    kept."""
+    n_states = 2
+    host = _DIMHost(jnp.zeros((2, 2, n_states)).at[0, 1, :].set(0.3))
+    host._initialize_continuous_transition_matrix()
+    host.process_cov = jnp.stack([0.1 * jnp.eye(4)] * n_states, axis=-1)
+    smoother = _random_dim_smoother_outputs(0, 4, n_states, 25, pair_conditional=False)
+    for name, attr in _MIXIN_SMOOTHER_ATTRS.items():
+        setattr(host, attr, smoother[name])
+    rng = np.random.default_rng(0)
+
+    def em_projection(scale: float) -> None:
+        host._remember_pre_m_step_dynamics()
+        host.continuous_transition_matrix = scale * (
+            host.continuous_transition_matrix
+            + jnp.asarray(rng.normal(0.0, 0.05, (4, 4, n_states)))
+        )
+        host._project_parameters()
+
+    em_projection(1.0)  # warm-up
+    with caplog.at_level("WARNING", logger="state_space_practice"):
+        with _count_backend_compiles() as compiles:
+            for scale in (1.0, 1.5, 1.0, 1.5):
+                em_projection(scale)
+                jax.block_until_ready(host.continuous_transition_matrix)
+
+    assert compiles == []
+    # Guard: the clamp and the keep-previous branch both ran without compiling.
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("spectral radius exceeded" in m for m in messages)
+    assert any("keeping the previous dynamics" in m for m in messages)
 
 
 # CNM covariance projection: closed-form PSD shrink factor vs. bisection
