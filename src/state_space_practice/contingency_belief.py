@@ -50,6 +50,7 @@ from state_space_practice.utils import (
     validate_choice_indices,
     validate_count_array,
     validate_int,
+    zero_preserving_log,
 )
 
 if TYPE_CHECKING:
@@ -402,7 +403,7 @@ def compute_choice_log_likelihood(
 
 
 def _bayes_update(
-    predicted: Array,
+    log_prior: Array,
     choice_t: Array,
     reward_t: Array,
     obs_offset_t: Array,
@@ -411,7 +412,7 @@ def _bayes_update(
     state_values: Array,
     inverse_temperature: float | Array,
 ) -> tuple[Array, Array]:
-    """Bayes update: predicted belief -> posterior given one trial's observations.
+    """Bayes update: log prior belief -> posterior given one trial's observations.
 
     Returns the normalized posterior and the log-normalizer (the trial's
     marginal log-likelihood contribution). Shared by the filter and the
@@ -421,7 +422,7 @@ def _bayes_update(
     choice_ll = compute_choice_log_likelihood(
         choice_t, state_values, inverse_temperature, obs_offset=obs_offset_t
     )
-    log_joint = jnp.log(jnp.maximum(predicted, 1e-30)) + reward_ll + choice_ll
+    log_joint = log_prior + reward_ll + choice_ll
     log_norm = jax.nn.logsumexp(log_joint)
     return jnp.exp(log_joint - log_norm), log_norm
 
@@ -633,13 +634,20 @@ def _forward_pass(
         predicted = trans.T @ prev_belief
         obs_offset_t = _compute_obs_offset(obs_dm_t)
 
-        posterior, log_norm = _update(predicted, choice_t, reward_t, obs_offset_t)
+        # Every state is reachable after a (softmax) transition, so a zero here
+        # is underflow, not a structural zero: floor it.
+        posterior, log_norm = _update(
+            jnp.log(jnp.maximum(predicted, 1e-30)), choice_t, reward_t, obs_offset_t
+        )
         return (posterior, accum_ll + log_norm), (posterior, predicted, trans)
 
     # t=0: use init_state_prob directly as prior (no transition applied)
     obs_offset_0 = _compute_obs_offset(obs_design_matrix[0])
+    # A zero in init_state_prob is structural: the state is impossible at t=0
+    # and keeps zero posterior mass (a floor would let a strong enough
+    # likelihood revive it).
     posterior_0, log_norm_0 = _update(
-        init_state_prob, choices[0], rewards[0], obs_offset_0
+        zero_preserving_log(init_state_prob), choices[0], rewards[0], obs_offset_0
     )
     # Dummy transition for t=0 (not used by backward pass)
     dummy_trans = centered_softmax(transition_logits)

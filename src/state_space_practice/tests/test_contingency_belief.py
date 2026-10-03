@@ -243,6 +243,53 @@ class TestContingencyBeliefFilter:
         )
 
 
+class TestStructuralZeroPrior:
+    """A zero prior probability is a structural zero: no likelihood revives it.
+
+    Choosing option 1 at inverse temperature 50 favours state 1 by a factor
+    of ``exp(100)``, far more than a small floor on the prior could hold back.
+    """
+
+    @pytest.fixture
+    def inputs(self):
+        return {
+            "rewards": jnp.array([0, 0]),
+            "n_states": 2,
+            "n_options": 2,
+            "reward_probs": jnp.full((2, 2), 0.5),
+            "state_values": jnp.array([[1.0, -1.0], [-1.0, 1.0]]),
+            "init_state_prob": jnp.array([1.0, 0.0]),
+        }
+
+    def test_filter_keeps_zero_posterior(self, inputs):
+        result = contingency_belief_filter(
+            choices=jnp.array([1]),
+            **{**inputs, "rewards": jnp.array([0])},
+            inverse_temperature=50.0,
+        )
+        np.testing.assert_array_equal(result.state_posterior, [[1.0, 0.0]])
+        # Only state 0 is possible: log P(r=0) + log softmax([50, -50])[1].
+        expected_ll = np.log(0.5) - 100.0 - np.log1p(np.exp(-100.0))
+        np.testing.assert_allclose(result.log_likelihood, expected_ll, rtol=1e-12)
+
+    def test_smoother_keeps_zero_posterior(self, inputs):
+        result = contingency_belief_smoother(
+            choices=jnp.array([1, 1]), **inputs, inverse_temperature=50.0
+        )
+        assert result.smoothed_state_prob[0, 1] == 0.0
+        np.testing.assert_array_equal(result.pairwise_state_prob[0, 1], [0.0, 0.0])
+        # Guard: the transition makes state 1 possible again at trial 1.
+        assert result.smoothed_state_prob[1, 1] > 0.5
+
+    def test_gradient_finite_with_zero_prior(self, inputs):
+        def log_likelihood(beta):
+            return contingency_belief_filter(
+                choices=jnp.array([1, 1]), **inputs, inverse_temperature=beta
+            ).log_likelihood
+
+        assert jnp.isfinite(jax.grad(log_likelihood)(5.0))
+
+
 class TestContingencyBeliefSmoother:
     @pytest.fixture
     def block_data(self):
