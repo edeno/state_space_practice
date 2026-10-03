@@ -35,7 +35,7 @@ import logging
 import operator
 import warnings
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, overload
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast, overload
 
 import jax
 import jax.numpy as jnp
@@ -1946,6 +1946,32 @@ def stochastic_point_process_filter(
     return filtered_mean, filtered_cov, marginal_log_likelihood
 
 
+_StepFn = TypeVar("_StepFn", bound=Callable[..., Any])
+
+
+def _remat_filter_step(step: _StepFn) -> _StepFn:
+    """Rematerialize a filter's per-time-step function under reverse-mode AD.
+
+    ``fit_sgd`` differentiates the marginal log-likelihood through the
+    forward filters. Without rematerialization reverse mode keeps, for every
+    time step, the residuals of the whole Laplace update -- each Fisher
+    iteration's Cholesky factors, triangular solves and iterates -- about 20
+    state-covariance-sized arrays per step (3 GB for the block-diagonal
+    filter at 5000 bins, 10 neurons and 20 basis functions per neuron).
+    Under :func:`jax.checkpoint` only the step's inputs (the scan carry,
+    about one covariance per step) are kept, and the step is recomputed in
+    the backward pass, which costs one extra forward step per time step.
+
+    Forward evaluation runs the same operations, so the filter's outputs
+    are bit-identical. The Fisher-scoring line search's ``while_loop`` is
+    primal-only (see :func:`_fisher_scoring_line_search`), so it is simply
+    re-run in the recomputation. ``prevent_cse=False`` is safe because the
+    step runs inside ``lax.scan``: the recomputation sits in the backward
+    loop, where XLA cannot merge it with the forward loop's copy.
+    """
+    return cast(_StepFn, jax.checkpoint(step, prevent_cse=False))
+
+
 @functools.partial(
     typed_jit,
     static_argnames=[
@@ -2060,6 +2086,8 @@ def _stochastic_point_process_filter_impl(
         )
 
     marginal_log_likelihood = jnp.zeros((), dtype=dtype)
+    # Each time step is rematerialized under reverse-mode AD (see
+    # _remat_filter_step).
     (
         (_, _, marginal_log_likelihood, n_failed_bins),
         (
@@ -2067,7 +2095,7 @@ def _stochastic_point_process_filter_impl(
             filtered_cov,
         ),
     ) = jax.lax.scan(
-        _step,
+        _remat_filter_step(_step),
         (
             init_mean_params,
             init_covariance_params,
@@ -2181,7 +2209,12 @@ def _block_diagonal_forward_core(
     # copy.
     n_neurons = init_means_per_neuron.shape[0]
     n_time = Z_base.shape[0]
-    step_all = jax.vmap(_step_one_neuron, in_axes=(0, 0, 0, (None, 0)))
+    # Each time step is rematerialized under reverse-mode AD (see
+    # _remat_filter_step). The buffer writes below stay outside the
+    # checkpoint: they need no residuals.
+    step_all = _remat_filter_step(
+        jax.vmap(_step_one_neuron, in_axes=(0, 0, 0, (None, 0)))
+    )
 
     def _step_all_neurons(
         carry: tuple[tuple[Array, Array, Array, Array], Array, Array, Array],

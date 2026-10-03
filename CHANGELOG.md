@@ -182,6 +182,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fit starts. A first fit on a fresh model is bit-identical to before. The
   point-process models' `fit_sgd` is unchanged: it initializes only a model
   that has no parameters yet and otherwise continues from the current ones.
+- **Point-process filter gradients keep one carry per time step**: the
+  per-time-step function of the dense filter (`PointProcessModel.fit_sgd`)
+  and of the block-diagonal forward core (`PlaceFieldModel.fit_sgd`) is
+  rematerialized under reverse-mode AD (`jax.checkpoint`), so the gradient
+  of the marginal log-likelihood keeps only each step's input mean and
+  covariance instead of every Fisher iteration's Cholesky factors and solves
+  (~20 covariance-sized arrays per step). Compiled temp of the gradient at
+  T=5000: block-diagonal, 10 neurons x 20 basis functions, 3.07 GB -> 169 MB;
+  dense, d=20, 10 neurons, 393 MB -> 17 MB. Step time: dense -19%
+  (0.377 -> 0.304 s), block-diagonal +13% (1.61-1.66 -> 1.84-1.88 s; the
+  backward pass recomputes each step once). End to end, 20 `fit_sgd` steps
+  at T=5000: `PlaceFieldModel` (10 neurons x 25 basis functions) peak RSS
+  5.4 GB -> 1.5 GB, wall time unchanged within noise (~115 s);
+  `PointProcessModel` (d=20) 950 MB -> 560 MB, 12-16 s -> 9-12 s. Forward
+  outputs are bit-identical; gradients agree to round-off (relative
+  difference <= 3e-11), and the fitted parameters after 20 Adam steps to
+  1e-9 relative.
 - **DIM / DIM-PP standard-EM projection is compiled**:
   `project_transition_matrix_stack` projects every state's oscillator blocks
   in one jit-compiled call (only the `eigvals` spectral clamp stays on the

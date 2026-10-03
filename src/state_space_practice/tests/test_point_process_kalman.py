@@ -4376,6 +4376,120 @@ class TestScanOutputMemory:
         assert smoother_temp - forward_temp < 0.1 * n_neurons * T * nb * nb * 8
 
 
+class TestGradientMemory:
+    """Reverse mode through the filters keeps about one carry per time step.
+
+    ``fit_sgd`` differentiates the marginal log-likelihood through the
+    forward filters. Keeping every time step's Laplace-update residuals
+    (each Fisher iteration's Cholesky factors and solves) costs ~20
+    state-covariance-sized arrays per step -- gigabytes at a few thousand
+    bins. With each step rematerialized only the step's input carry (mean
+    and covariance) is kept. The per-step growth of the compiled gradient's
+    temporaries is measured between two sequence lengths, so fixed costs
+    cancel. Compile-only: nothing is executed.
+    """
+
+    n_times = (100, 300)
+
+    @staticmethod
+    def _per_step_bytes(make_loss, make_specs) -> float:
+        temps = []
+        for T in TestGradientMemory.n_times:
+            memory = (
+                jax.jit(jax.value_and_grad(make_loss()))
+                .lower(*make_specs(T))
+                .compile()
+                .memory_analysis()
+            )
+            if memory is None:
+                pytest.skip("backend reports no memory analysis")
+            temps.append(memory.temp_size_in_bytes)
+        n0, n1 = TestGradientMemory.n_times
+        return (temps[1] - temps[0]) / (n1 - n0)
+
+    def test_block_forward_core(self) -> None:
+        n_neurons, nb = 3, 8
+        spec = jax.ShapeDtypeStruct
+
+        def make_loss():
+            def loss(params, Z, spikes):
+                A, Q, m0, P0 = params
+                _, _, lls, _ = _block_diagonal_forward_core(
+                    A,
+                    Q,
+                    m0,
+                    P0,
+                    Z,
+                    spikes,
+                    0.02,
+                    include_laplace_normalization=True,
+                    max_log_count=20.0,
+                    max_newton_iter=3,
+                )
+                return jnp.sum(lls)
+
+            return loss
+
+        def make_specs(T):
+            return (
+                (
+                    spec((n_neurons, nb, nb), jnp.float64),
+                    spec((n_neurons, nb, nb), jnp.float64),
+                    spec((n_neurons, nb), jnp.float64),
+                    spec((n_neurons, nb, nb), jnp.float64),
+                ),
+                spec((T, nb), jnp.float64),
+                spec((T, n_neurons), jnp.float64),
+            )
+
+        per_step = self._per_step_bytes(make_loss, make_specs)
+        carry_bytes = n_neurons * (nb * nb + nb) * 8
+        # Guard: reverse mode must keep the carry, so the bound is not vacuous.
+        assert per_step >= 0.5 * carry_bytes
+        assert per_step < 3 * carry_bytes, (per_step, carry_bytes)
+
+    def test_dense_filter(self) -> None:
+        d, n_obs = 8, 3
+        spec = jax.ShapeDtypeStruct
+
+        def make_loss():
+            def loss(params, design, spikes):
+                A, Q, m0, P0 = params
+                _, _, marginal_ll = stochastic_point_process_filter(
+                    m0,
+                    P0,
+                    design,
+                    spikes,
+                    0.02,
+                    A,
+                    Q,
+                    log_conditional_intensity,
+                    validate_inputs=False,
+                    max_newton_iter=3,
+                )
+                return marginal_ll
+
+            return loss
+
+        def make_specs(T):
+            return (
+                (
+                    spec((d, d), jnp.float64),
+                    spec((d, d), jnp.float64),
+                    spec((d,), jnp.float64),
+                    spec((d, d), jnp.float64),
+                ),
+                spec((T, n_obs, d), jnp.float64),
+                spec((T, n_obs), jnp.float64),
+            )
+
+        per_step = self._per_step_bytes(make_loss, make_specs)
+        carry_bytes = (d * d + d) * 8
+        # Guard: reverse mode must keep the carry, so the bound is not vacuous.
+        assert per_step >= 0.5 * carry_bytes
+        assert per_step < 3 * carry_bytes, (per_step, carry_bytes)
+
+
 # ============================================================================
 # Reverse-mode gradients of the marginal log-likelihood (fit_sgd's loss)
 # ============================================================================
