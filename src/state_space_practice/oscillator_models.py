@@ -55,6 +55,7 @@ from state_space_practice.em_driver import (
 from state_space_practice.exceptions import NotFittedError
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.oscillator_utils import (
+    ConstructorParametersMixin,
     DirectedInfluenceDynamicsMixin,
     canonicalize_correlated_noise_pair_parameters,
     compute_directed_influence_stability_scale,
@@ -84,13 +85,14 @@ from state_space_practice.sgd_fitting import (
     SGDParamSpec,
 )
 from state_space_practice.switching_kalman import (
+    _switching_kalman_filter_gpb1,
+    _switching_kalman_smoother_em_stats,
     compute_process_covariance_sufficient_stats,
     compute_transition_sufficient_stats,
     minimum_state_occupancy,
     optimize_dim_transition_params_joint,
     switching_kalman_filter,
     switching_kalman_maximization_step,
-    switching_kalman_smoother,
     switching_kalman_smoother_gpb2,
     warn_low_occupancy_states,
 )
@@ -366,7 +368,9 @@ class OscillatorParameterBase:
             )
 
 
-class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
+class BaseModel(
+    ConstructorParametersMixin, OscillatorParameterBase, ABC, SGDFittableMixin
+):
     """EM-fitting layer for the switching oscillator models.
 
     Adds to :class:`OscillatorParameterBase` everything the
@@ -887,11 +891,16 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
     def _initialize_parameters(self, key: Array) -> None:
         """Initializes all model parameters by calling specific methods.
 
+        Starts from the constructor's values of the intrinsic parameters, not
+        the ones an earlier fit left behind (see
+        ``ConstructorParametersMixin``).
+
         Parameters
         ----------
         key : Array
             JAX random number generator key.
         """
+        self._restore_constructor_parameters()
         k1, k2 = jax.random.split(key)
         self._initialize_discrete_state_prob()
         self._initialize_discrete_transition_matrix()
@@ -921,35 +930,21 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
             The log-likelihood of the observations given the current parameters (scalar array).
         """
         obs_arr: jax.Array = jnp.asarray(observations)
-        (
-            filter_mean,
-            filter_cov,
-            filter_discrete_state_prob,
-            pair_cond_filter_mean,
-            pair_cond_filter_cov,
-            pair_cond_filter_prob,
-            marginal_log_likelihood,
-        ) = switching_kalman_filter(
-            init_state_cond_mean=self.init_mean,
-            init_state_cond_cov=self.init_cov,
-            init_discrete_state_prob=self.init_discrete_state_prob,
-            obs=obs_arr,
-            discrete_transition_matrix=self.discrete_transition_matrix,
-            continuous_transition_matrix=self.continuous_transition_matrix,
-            process_cov=self.process_cov,
-            measurement_matrix=self.measurement_matrix,
-            measurement_cov=self.measurement_cov,
-        )
-
-        smoother_args = {
-            "filter_mean": filter_mean,
-            "filter_cov": filter_cov,
-            "filter_discrete_state_prob": filter_discrete_state_prob,
-            "process_cov": self.process_cov,
+        filter_args = {
+            "init_state_cond_mean": self.init_mean,
+            "init_state_cond_cov": self.init_cov,
+            "init_discrete_state_prob": self.init_discrete_state_prob,
+            "obs": obs_arr,
+            "discrete_transition_matrix": self.discrete_transition_matrix,
             "continuous_transition_matrix": self.continuous_transition_matrix,
+            "process_cov": self.process_cov,
+            "measurement_matrix": self.measurement_matrix,
+            "measurement_cov": self.measurement_cov,
         }
 
         if self.smoother_type == "gpb2":
+            filtered = switching_kalman_filter(**filter_args)
+            marginal_log_likelihood = filtered.marginal_log_likelihood
             (
                 _,  # smoother_mean (marginal)
                 _,  # smoother_cov (marginal)
@@ -963,24 +958,34 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
                 self.smoother_pair_cond_covs,
                 self.smoother_next_pair_cond_means,
             ) = switching_kalman_smoother_gpb2(
-                **smoother_args,
-                pair_cond_filter_mean=pair_cond_filter_mean,
-                pair_cond_filter_cov=pair_cond_filter_cov,
-                pair_cond_filter_prob=pair_cond_filter_prob,
+                filter_mean=filtered.state_cond_filter_mean,
+                filter_cov=filtered.state_cond_filter_cov,
+                filter_discrete_state_prob=filtered.filter_discrete_state_prob,
+                pair_cond_filter_mean=filtered.pair_cond_filter_mean,
+                pair_cond_filter_cov=filtered.pair_cond_filter_cov,
+                pair_cond_filter_prob=filtered.pair_cond_filter_prob,
+                process_cov=self.process_cov,
+                continuous_transition_matrix=self.continuous_transition_matrix,
             )
         else:
+            # GPB1 reads neither the pair-conditional filter trajectories nor
+            # the overall (collapsed) smoother moments, so the filter/smoother
+            # variants that do not materialize them are used.
+            gpb1_filtered = _switching_kalman_filter_gpb1(**filter_args)
+            marginal_log_likelihood = gpb1_filtered.marginal_log_likelihood
             (
-                _,  # smoother_mean (marginal)
-                _,  # smoother_cov (marginal)
                 self.smoother_discrete_state_prob,
                 self.smoother_joint_discrete_state_prob,
-                _,  # smoother_cross_cov (marginal)
                 self.smoother_state_cond_mean,
                 self.smoother_state_cond_cov,
                 self.smoother_pair_cond_cross_cov,
                 self.smoother_pair_cond_means,
-            ) = switching_kalman_smoother(
-                **smoother_args,
+            ) = _switching_kalman_smoother_em_stats(
+                filter_mean=gpb1_filtered.state_cond_filter_mean,
+                filter_cov=gpb1_filtered.state_cond_filter_cov,
+                filter_discrete_state_prob=gpb1_filtered.filter_discrete_state_prob,
+                process_cov=self.process_cov,
+                continuous_transition_matrix=self.continuous_transition_matrix,
                 discrete_state_transition_matrix=self.discrete_transition_matrix,
             )
             self.smoother_pair_cond_covs = None
@@ -1102,20 +1107,26 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         Iteratively performs E-steps and M-steps until convergence or
         the maximum number of iterations is reached.
 
+        Every call starts from the initial parameters given to the
+        constructor, not from an earlier fit's estimates (which can overwrite
+        public parameters such as ``coupling_strength``): a repeat fit with
+        the same data and ``key`` reproduces a fresh model's fit. Pass
+        ``skip_init=True`` to continue from the current parameters instead.
+
         Parameters
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
         key : Array or None, optional
-            JAX random key for initialization. Defaults to PRNGKey(0).
+            JAX random key for initialization. Defaults to ``jax.random.key(0)``.
         max_iter : int, optional
             Maximum number of EM iterations, by default 100.
         tol : float, optional
             Convergence tolerance for log-likelihood, by default 1e-4.
         skip_init : bool, default=False
-            If True, skip initialization and warm start (use existing
-            parameters). Useful for resuming fitting or providing
-            custom initial parameters.
+            If True, skip initialization and warm start and continue from the
+            current parameters (e.g. resume an earlier fit, or start from
+            custom parameters set on the model).
 
         Returns
         -------
@@ -1129,7 +1140,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         """
         observations = self._validate_observations(observations)
         if key is None:
-            key = jax.random.PRNGKey(0)
+            key = jax.random.key(0)
         if not skip_init:
             self._initialize_parameters(key)
             self._warm_initialize_states(observations)
@@ -1174,13 +1185,18 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
 
+        Like ``fit``, every call starts from the initial parameters given to
+        the constructor, so a repeat call with the same data and ``key``
+        reproduces a fresh model's fit. Pass ``skip_init=True`` to continue
+        from the current parameters instead.
+
         Parameters
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
             The sequence of observations.
         key : Array or None
             JAX random key for parameter initialization.
-            If None, defaults to ``jax.random.PRNGKey(0)``.
+            If None, defaults to ``jax.random.key(0)``.
         optimizer : optax optimizer or None
             Default: adam(1e-2) with gradient clipping.
         num_steps : int
@@ -1190,7 +1206,8 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         convergence_tol : float or None
             If set, stop early when |ΔLL| < tol for 5 consecutive steps.
         skip_init : bool, default=False
-            If True, skip initialization and warm start.
+            If True, skip initialization and warm start and continue from the
+            current parameters.
 
         Returns
         -------
@@ -1263,7 +1280,7 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
                     "fit_sgd(observations, key=...) without skip_init first."
                 )
         else:
-            self._initialize_parameters(jax.random.PRNGKey(0) if key is None else key)
+            self._initialize_parameters(jax.random.key(0) if key is None else key)
             self._warm_initialize_states(observations)
         self._sgd_n_time = observations.shape[0]
         return (observations,), {}
@@ -1356,10 +1373,14 @@ class CommonOscillatorModel(BaseModel):
         self.update_process_cov = False
         self.update_measurement_matrix = True
 
+        self._record_constructor_parameters("freqs", "damping_coef", "process_variance")
+
     def _initialize_measurement_matrix(self, key: Array | None = None) -> None:
         """Initializes H with small random values, varying across discrete states."""
         if key is None:
-            raise ValueError("A JAX PRNGKey must be provided for COM initialization.")
+            raise ValueError(
+                "A JAX random key must be provided for COM initialization."
+            )
         self.measurement_matrix = jax.random.uniform(
             key,
             (self.n_sources, self.n_cont_states, self.n_discrete_states),
@@ -1598,6 +1619,14 @@ class CorrelatedNoiseModel(BaseModel):
         self.update_continuous_transition_matrix = False
         self.update_measurement_matrix = False  # H is fixed in CNM
         self.update_process_cov = True
+
+        self._record_constructor_parameters(
+            "freqs",
+            "damping_coef",
+            "process_variance",
+            "phase_difference",
+            "coupling_strength",
+        )
 
     def _initialize_measurement_matrix(self, key: Array | None = None) -> None:
         """Initializes H as block-diagonal [1, 0], constant across states."""
@@ -1942,6 +1971,14 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         self.max_spectral_radius = max_spectral_radius
         self.max_damping = max_damping
 
+        self._record_constructor_parameters(
+            "freqs",
+            "damping_coef",
+            "process_variance",
+            "phase_difference",
+            "coupling_strength",
+        )
+
     def _initialize_measurement_matrix(self, key: Array | None = None) -> None:
         """Initializes H with [1/sqrt(2), 1/sqrt(2)] blocks, constant across states."""
         measurement_matrix = construct_directed_influence_measurement_matrix(
@@ -2138,18 +2175,24 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         ``coupling_strength`` are left at their intrinsic values -- reconstruct
         ``A`` by re-applying :meth:`_effective_dim_scale`.
 
+        Every call starts from the initial parameters given to the
+        constructor, not from an earlier fit's estimates, so a repeat call
+        with the same data and ``key`` reproduces a fresh model's fit. Pass
+        ``skip_init=True`` to continue from the current parameters instead.
+
         Parameters
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
         key : Array or None
             JAX random key for parameter initialization.
-            If None, defaults to ``jax.random.PRNGKey(0)``.
+            If None, defaults to ``jax.random.key(0)``.
         optimizer : optax optimizer or None
         num_steps : int
         verbose : bool
         convergence_tol : float or None
         skip_init : bool, default=False
-            If True, skip initialization and warm start.
+            If True, skip initialization and warm start and continue from the
+            current parameters.
         connectivity_penalty : OscillatorPenaltyConfig or None
             If provided, adds structured sparsity penalties on
             coupling_strength during SGD optimization.

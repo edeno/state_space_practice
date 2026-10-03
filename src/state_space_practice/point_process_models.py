@@ -42,13 +42,13 @@ from state_space_practice.exceptions import NonFiniteLikelihoodError, NotFittedE
 from state_space_practice.fitted_state import is_set
 from state_space_practice.oscillator_utils import (
     DirectedInfluenceDynamicsMixin,
+    _construct_stable_dim_stack_and_scale,
     canonicalize_correlated_noise_pair_parameters,
     constrain_correlated_noise_process_covariance,
     construct_common_oscillator_process_covariance,
     construct_common_oscillator_transition_matrix_stack,
     construct_correlated_noise_process_covariance,
     construct_correlated_noise_process_covariance_stack,
-    construct_stable_directed_influence_transition_stack,
     extract_correlated_noise_params_from_covariance_stack,
     optimize_dim_transition_params_joint_until_stationary,
     project_correlated_noise_process_covariance,
@@ -532,6 +532,12 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
     ) -> list[float]:
         """Fit the model to spike data using EM.
 
+        Every call starts from the initial parameters given to the
+        constructor, not from an earlier fit's estimates (which can overwrite
+        public parameters such as ``coupling_strength``): a repeat fit with
+        the same data and ``key`` reproduces a fresh model's fit. Pass
+        ``skip_init=True`` to continue from the current parameters instead.
+
         Parameters
         ----------
         spikes : ArrayLike, shape (n_time, n_neurons)
@@ -541,9 +547,11 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         tol : float, default=1e-4
             Convergence tolerance for relative log-likelihood change.
         key : Array | None, optional
-            JAX random key for initialization. Defaults to PRNGKey(0).
+            JAX random key for initialization. Defaults to ``jax.random.key(0)``.
         skip_init : bool, default=False
-            If True, skip initialization (use existing parameters).
+            If True, skip initialization and warm start and continue from the
+            current parameters (e.g. resume an earlier ``fit`` or
+            ``fit_sgd``).
         n_restarts : int, default=1
             Number of random restarts. Each restart uses a different random
             key. The run with the best final log-likelihood is kept.
@@ -565,7 +573,7 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         spikes = self._validate_spikes(spikes)
 
         if key is None:
-            key = jax.random.PRNGKey(0)
+            key = jax.random.key(0)
 
         if n_restarts > 1 and not skip_init:
             return self._fit_multi_restart(spikes, max_iter, tol, key, n_restarts)
@@ -777,6 +785,7 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
         self.freqs = freqs
         self.damping_coef = damping_coef
         self.process_variance = process_variance
+        self._record_constructor_parameters("freqs", "damping_coef", "process_variance")
 
     def _initialize_continuous_transition_matrix(self) -> None:
         """A is constant across states: uncoupled oscillators."""
@@ -975,6 +984,13 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         self.phase_difference = phase_difference
         self.coupling_strength = coupling_strength
         self.use_reparameterized_mstep = use_reparameterized_mstep
+        self._record_constructor_parameters(
+            "freqs",
+            "damping_coef",
+            "process_variance",
+            "phase_difference",
+            "coupling_strength",
+        )
 
     def _initialize_continuous_transition_matrix(self) -> None:
         """A is constant across states: uncoupled oscillators."""
@@ -1307,6 +1323,14 @@ class DirectedInfluencePointProcessModel(
         self.max_spectral_radius = max_spectral_radius
         self.max_damping = max_damping
 
+        self._record_constructor_parameters(
+            "freqs",
+            "damping_coef",
+            "process_variance",
+            "phase_difference",
+            "coupling_strength",
+        )
+
     def _initialize_process_covariance(self) -> None:
         """Q is constant across states: block-diagonal from process_variance."""
         process_cov = construct_common_oscillator_process_covariance(
@@ -1452,6 +1476,11 @@ class DirectedInfluencePointProcessModel(
         Frequencies (``freqs``) and damping (``damping_coef``) are held fixed
         (not trained).
 
+        Parameters are initialized (from the constructor's initial
+        parameters, as ``fit`` does) only when the model has none yet; a later
+        call continues from the current parameters, including those of an
+        earlier ``fit``.
+
         Parameters
         ----------
         spikes : ArrayLike, shape (n_time, n_neurons)
@@ -1518,7 +1547,7 @@ class DirectedInfluencePointProcessModel(
         # (only coupling/phase are free), so the scale depends on the free
         # coupling and the fixed damping.
         params_with_A = dict(params)
-        params_with_A["_A"] = construct_stable_directed_influence_transition_stack(
+        params_with_A["_A"], stability_scale = _construct_stable_dim_stack_and_scale(
             # Frozen (non-trained) entries of the SGD param spec.
             self._sgd_param(params, "freqs"),
             self._sgd_param(params, "damping_coef"),
@@ -1536,7 +1565,9 @@ class DirectedInfluencePointProcessModel(
                 total_connectivity_penalty,
             )
 
-            coupling_transposed = jnp.moveaxis(coupling, -1, 0)
+            # Penalize the coupling that enters A (the stability-scaled one), as
+            # the Gaussian DirectedInfluenceModel does.
+            coupling_transposed = jnp.moveaxis(coupling * stability_scale, -1, 0)
             base_loss = base_loss + total_connectivity_penalty(
                 coupling_transposed,
                 penalty_config,

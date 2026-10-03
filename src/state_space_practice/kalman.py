@@ -19,6 +19,7 @@ References
 from __future__ import annotations
 
 import warnings
+from collections.abc import Callable
 from typing import Any, NamedTuple, cast
 
 import jax
@@ -805,6 +806,105 @@ def _kalman_smoother_update(
     return smoother_mean, smoother_cov, smoother_cross_cov
 
 
+def _scan_with_boundary(
+    step: Callable[[Any, Any], tuple[Any, tuple[Any, Any]]],
+    init_carry: Any,
+    sequences: Any,
+    starts: Any,
+    length: int,
+    boundary: Any,
+    *,
+    reverse: bool = False,
+) -> tuple[Any, Any, Any]:
+    """``lax.scan`` whose stacked outputs gain one boundary entry without copies.
+
+    Filters and smoothers handle one time step outside their scan (the first
+    observation, or the terminal smoother step). Prepending/appending it with
+    ``jnp.concatenate`` copies every stacked output, and scanning over sliced
+    inputs (``x[1:]``, ``x[:-1]``) copies those inputs: each is a second
+    full-size buffer at peak memory. Here ``step(carry, x) -> (carry, (y, z))``
+    runs for ``i = 0, ..., length - 1`` (in reverse when ``reverse``) with
+    ``x`` read in the loop as ``sequence[i + start]`` for each leaf of
+    ``sequences`` (so no sliced copy is made), and each ``y`` is written into
+    a ``(length + 1, ...)`` buffer carried through the loop (which XLA updates
+    in place) whose remaining slot -- index 0, or index ``length`` when
+    ``reverse`` -- holds ``boundary``. ``z`` is stacked as usual.
+
+    Parameters
+    ----------
+    step : callable
+        Scan body returning ``(carry, (y, z))``; ``y`` and ``z`` are pytrees.
+    init_carry : pytree
+    sequences : pytree of arrays
+        Full-length per-time inputs.
+    starts : pytree of int with the structure of ``sequences``
+        Step ``i`` reads entry ``i + start`` of the matching sequence, i.e.
+        the scan runs over ``sequence[start:start + length]``.
+    length : int
+        Number of scan steps.
+    boundary : pytree matching ``y``
+        The entry placed at index 0 (forward) or ``length`` (reverse).
+    reverse : bool, default=False
+
+    Returns
+    -------
+    carry : pytree
+        Final carry.
+    ys : pytree of arrays, each of shape ``(length + 1, ...)``
+        Equal to ``concatenate([boundary[None], y_stack])`` (forward) or
+        ``concatenate([y_stack, boundary[None]])`` (reverse), with the same
+        dtype promotion.
+    zs : pytree of arrays, each of shape ``(length, ...)``
+    """
+    x_spec = jax.tree.map(
+        lambda a: jax.ShapeDtypeStruct(a.shape[1:], a.dtype), sequences
+    )
+    _, (y_spec, _) = jax.eval_shape(step, init_carry, x_spec)
+
+    boundary_index = length if reverse else 0
+    offset = 0 if reverse else 1
+
+    def make_buffer(value: jax.Array, spec: jax.ShapeDtypeStruct) -> jax.Array:
+        value = jnp.asarray(value)
+        dtype = jnp.promote_types(value.dtype, spec.dtype)
+        buffer = jnp.zeros((length + 1, *spec.shape), dtype)
+        return buffer.at[boundary_index].set(value.astype(dtype))
+
+    buffers = jax.tree.map(make_buffer, boundary, y_spec)
+
+    # The step index is carried (not scanned over an arange) so that no
+    # length-T index array is materialized either.
+    def body(carry: tuple[Any, Any, jax.Array], _: None) -> tuple[Any, Any]:
+        inner_carry, bufs, index = carry
+        x = jax.tree.map(
+            lambda start, a: jax.lax.dynamic_index_in_dim(
+                a, index + start, keepdims=False
+            ),
+            starts,
+            sequences,
+        )
+        inner_carry, (y, z) = step(inner_carry, x)
+        bufs = jax.tree.map(
+            lambda buf, value: jax.lax.dynamic_update_index_in_dim(
+                buf, value.astype(buf.dtype), index + offset, axis=0
+            ),
+            bufs,
+            y,
+        )
+        next_index = index - 1 if reverse else index + 1
+        return (inner_carry, bufs, next_index), z
+
+    first_index = jnp.asarray(length - 1 if reverse else 0)
+    (carry, ys, _), zs = jax.lax.scan(
+        body,
+        (init_carry, buffers, first_index),
+        None,
+        length=length,
+        reverse=reverse,
+    )
+    return carry, ys, zs
+
+
 @typed_jit
 def rts_backward_scan(
     filtered_mean: ArrayLike,
@@ -845,7 +945,10 @@ def rts_backward_scan(
     def _step(
         carry: tuple[jax.Array, jax.Array],
         args: tuple[jax.Array, jax.Array],
-    ) -> tuple[tuple[jax.Array, jax.Array], tuple[jax.Array, jax.Array, jax.Array]]:
+    ) -> tuple[
+        tuple[jax.Array, jax.Array],
+        tuple[tuple[jax.Array, jax.Array], jax.Array],
+    ]:
         next_smoother_mean, next_smoother_cov = carry
         filter_mean, filter_cov = args
         smoother_mean, smoother_cov, smoother_cross_cov = _kalman_smoother_update(
@@ -857,23 +960,22 @@ def rts_backward_scan(
             transition_matrix,
         )
         return (smoother_mean, smoother_cov), (
-            smoother_mean,
-            smoother_cov,
+            (smoother_mean, smoother_cov),
             smoother_cross_cov,
         )
 
-    init_carry = (filtered_mean[-1], filtered_cov[-1])
-    (_, _), (smoother_mean, smoother_cov, smoother_cross_cov) = jax.lax.scan(
+    # The terminal smoothed moments equal the filtered ones.
+    terminal = (filtered_mean[-1], filtered_cov[-1])
+    _, (smoother_mean, smoother_cov), smoother_cross_cov = _scan_with_boundary(
         _step,
-        init_carry,
-        (filtered_mean[:-1], filtered_cov[:-1]),
+        terminal,
+        (filtered_mean, filtered_cov),
+        (0, 0),
+        filtered_mean.shape[0] - 1,
+        terminal,
         reverse=True,
     )
-    return (
-        jnp.concatenate((smoother_mean, filtered_mean[-1][None])),
-        jnp.concatenate((smoother_cov, filtered_cov[-1][None])),
-        smoother_cross_cov,
-    )
+    return smoother_mean, smoother_cov, smoother_cross_cov
 
 
 @typed_jit
@@ -927,30 +1029,28 @@ def rts_backward_scan_with_predictions(
     def _step(
         carry: tuple[jax.Array, jax.Array],
         args: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
-    ) -> tuple[tuple[jax.Array, jax.Array], tuple[jax.Array, jax.Array, jax.Array]]:
+    ) -> tuple[
+        tuple[jax.Array, jax.Array],
+        tuple[tuple[jax.Array, jax.Array], jax.Array],
+    ]:
         next_mean, next_cov = carry
         f_mean, f_cov, p_mean_next, p_cov_next = args
         gain = _gain_solve(p_cov_next, A @ f_cov).T
         mean = f_mean + gain @ (next_mean - p_mean_next)
         cov = symmetrize(f_cov + gain @ (next_cov - p_cov_next) @ gain.T)
-        return (mean, cov), (mean, cov, gain @ next_cov)
+        return (mean, cov), ((mean, cov), gain @ next_cov)
 
-    _, (smoother_mean, smoother_cov, smoother_cross_cov) = jax.lax.scan(
+    terminal = (filtered_mean[-1], filtered_cov[-1])
+    _, (smoother_mean, smoother_cov), smoother_cross_cov = _scan_with_boundary(
         _step,
-        (filtered_mean[-1], filtered_cov[-1]),
-        (
-            filtered_mean[:-1],
-            filtered_cov[:-1],
-            predicted_mean[1:],
-            predicted_cov[1:],
-        ),
+        terminal,
+        (filtered_mean, filtered_cov, predicted_mean, predicted_cov),
+        (0, 0, 1, 1),
+        filtered_mean.shape[0] - 1,
+        terminal,
         reverse=True,
     )
-    return (
-        jnp.concatenate((smoother_mean, filtered_mean[-1][None])),
-        jnp.concatenate((smoother_cov, filtered_cov[-1][None])),
-        smoother_cross_cov,
-    )
+    return smoother_mean, smoother_cov, smoother_cross_cov
 
 
 @typed_jit
@@ -1167,26 +1267,28 @@ def parallel_kalman_smoother(
             f"(T={T}, D={D}, D={D}), got {filtered_covariances.shape}."
         )
 
-    def _as_transition_stack(name: str, value: jax.Array) -> jax.Array:
+    for name, value in (
+        ("transition_matrix", transition_matrix),
+        ("process_cov", process_cov),
+    ):
         if value.ndim == 2:
             if value.shape != (D, D):
                 raise ValueError(
                     f"{name} must have shape ({D}, {D}) or "
                     f"({T - 1}, {D}, {D}), got {value.shape}."
                 )
-            return jnp.broadcast_to(value, (T - 1, D, D))
-        if value.ndim == 3:
+        elif value.ndim == 3:
             if value.shape != (T - 1, D, D):
                 raise ValueError(
                     f"{name} with a leading time axis must have shape "
                     f"({T - 1}, {D}, {D}) because entry t maps time t to "
                     f"t+1; got {value.shape}."
                 )
-            return value
-        raise ValueError(
-            f"{name} must have shape ({D}, {D}) or ({T - 1}, {D}, {D}), "
-            f"got {value.shape}."
-        )
+        else:
+            raise ValueError(
+                f"{name} must have shape ({D}, {D}) or ({T - 1}, {D}, {D}), "
+                f"got {value.shape}."
+            )
 
     if not contains_tracer(
         filtered_means, filtered_covariances, transition_matrix, process_cov
@@ -1199,9 +1301,28 @@ def parallel_kalman_smoother(
         ):
             validate_finite_array(name, arr)
 
+    return _parallel_kalman_smoother_impl(
+        filtered_means, filtered_covariances, transition_matrix, process_cov
+    )
+
+
+@typed_jit
+def _parallel_kalman_smoother_impl(
+    filtered_means: jax.Array,
+    filtered_covariances: jax.Array,
+    transition_matrix: jax.Array,
+    process_cov: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Jitted parallel RTS smoother on validated inputs.
+
+    See :func:`parallel_kalman_smoother`. ``transition_matrix`` and
+    ``process_cov`` are ``(D, D)`` or ``(T-1, D, D)``.
+    """
+    T, D = filtered_means.shape
+
     # Broadcast time-invariant parameters to (T-1, D, D)
-    A = _as_transition_stack("transition_matrix", transition_matrix)
-    Q = _as_transition_stack("process_cov", process_cov)
+    A = jnp.broadcast_to(transition_matrix, (T - 1, D, D))
+    Q = jnp.broadcast_to(process_cov, (T - 1, D, D))
 
     # Build per-timestep smoother elements for t = 0, ..., T-2
     def _build_element(
@@ -1218,11 +1339,13 @@ def parallel_kalman_smoother(
         filtered_means[:-1], filtered_covariances[:-1], A, Q
     )
 
-    # Terminal element for t = T-1: no dependence on future state
+    # Terminal element for t = T-1: no dependence on future state. It takes
+    # the element dtypes so the scan's concatenations agree (a bare
+    # jnp.zeros would be float64 under x64 even for float32 inputs).
     terminal = _SmootherElement(
-        E=jnp.zeros((D, D)),
-        g=filtered_means[-1],
-        L=filtered_covariances[-1],
+        E=jnp.zeros((D, D), dtype=elements.E.dtype),
+        g=filtered_means[-1].astype(elements.g.dtype),
+        L=filtered_covariances[-1].astype(elements.L.dtype),
     )
 
     # Concatenate elements with terminal at end

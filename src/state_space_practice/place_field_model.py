@@ -79,6 +79,7 @@ from state_space_practice.utils import (
     floor_variances_relative,
     psd_solve,
     symmetrize,
+    typed_jit,
     validate_count_array,
 )
 
@@ -203,6 +204,54 @@ def evaluate_basis(
     from patsy import dmatrix  # deferred: slow import
 
     return np.asarray(dmatrix(basis_info["formula"], {"x": x, "y": y, **env}))
+
+
+#: Element budget for the ``(n_chunk, n_basis, n_grid)`` intermediate of
+#: :func:`_posterior_rate_sums_chunk` (``2**24`` float64 values = 128 MiB).
+_RATE_MAP_CHUNK_ELEMENTS = 2**24
+
+
+@typed_jit
+def _posterior_rate_sums_chunk(
+    Z_grid: Array, means: Array, covs: Array, valid: Array, z: Array
+) -> tuple[Array, Array, Array]:
+    """Sum the posterior expected rate and its log-normal bounds over time.
+
+    Parameters
+    ----------
+    Z_grid : Array, shape (n_grid, n_basis)
+        Basis evaluated at the grid positions.
+    means : Array, shape (n_chunk, n_basis)
+        Posterior weight means ``m_t``.
+    covs : Array, shape (n_chunk, n_basis, n_basis)
+        Posterior weight covariances ``P_t``.
+    valid : Array, shape (n_chunk,)
+        Boolean mask; padded rows (False) contribute nothing.
+    z : Array
+        Standard-normal quantile of the credible bound (scalar).
+
+    Returns
+    -------
+    rate_sum, rate_lo_sum, rate_hi_sum : Array, shape (n_grid,)
+        Sums over the valid rows of ``exp(Z m_t + 0.5 Z P_t Z')`` and of the
+        lower/upper bounds ``exp(Z m_t -/+ z sqrt(Z P_t Z'))``.
+    """
+    log_rate_mean = means @ Z_grid.T
+    # diag(Z P_t Z') for every t without the (n_grid, n_grid) product: one
+    # batched GEMM P_t Z' -> (n_chunk, n_basis, n_grid), then a fused
+    # multiply-reduce over the basis axis.
+    var_log_rate = jnp.sum((covs @ Z_grid.T) * Z_grid.T, axis=1)
+    var_log_rate = jnp.maximum(var_log_rate, 0.0)
+    std_log_rate = jnp.sqrt(var_log_rate)
+
+    def _sum_valid(log_rate: Array) -> Array:
+        return jnp.sum(jnp.where(valid[:, None], jnp.exp(log_rate), 0.0), axis=0)
+
+    return (
+        _sum_valid(log_rate_mean + 0.5 * var_log_rate),
+        _sum_valid(log_rate_mean - z * std_log_rate),
+        _sum_valid(log_rate_mean + z * std_log_rate),
+    )
 
 
 class PlaceFieldModel(SGDFittableMixin):
@@ -1663,40 +1712,45 @@ class PlaceFieldModel(SGDFittableMixin):
         """
 
         s, _ = self._neuron_weights(neuron_idx)
-        means = np.asarray(self.smoother_mean[time_slice, s])
-        covs = np.asarray(self._neuron_smoother_cov(neuron_idx, time_slice))
+        means = jnp.asarray(self.smoother_mean[time_slice, s])
+        covs = jnp.asarray(self._neuron_smoother_cov(neuron_idx, time_slice))
         if means.ndim == 1:
             means = means[None, :]
             covs = covs[None, :, :]
-        if means.shape[0] == 0:
+        n_time = means.shape[0]
+        if n_time == 0:
             raise ValueError("time_slice selects no time bins")
 
-        z = float(jax.scipy.stats.norm.ppf(1 - alpha / 2))
-        n_time = means.shape[0]
-        n_grid = Z_grid.shape[0]
-        rate_sum = np.zeros(n_grid)
-        rate_lo_sum = np.zeros(n_grid)
-        rate_hi_sum = np.zeros(n_grid)
-        chunk_size = max(1, min(n_time, 2_000_000 // max(n_grid, 1)))
+        z = jnp.asarray(jax.scipy.stats.norm.ppf(1 - alpha / 2), dtype=means.dtype)
+        Z = jnp.asarray(Z_grid, dtype=means.dtype)
+        n_grid, n_basis = Z.shape
+        # Fixed-size chunks bound the (n_chunk, n_basis, n_grid) intermediate.
+        # The chunk length is the budget, or the next power of two >= n_time
+        # when that is smaller, so the time slices of different lengths used
+        # by predict_center / drift_summary share a few compiled shapes; the
+        # padded rows are masked out of the sums.
+        max_chunk = max(1, _RATE_MAP_CHUNK_ELEMENTS // max(n_grid * n_basis, 1))
+        chunk_size = min(max_chunk, 1 << (n_time - 1).bit_length())
+        n_pad = -n_time % chunk_size
+        means = jnp.pad(means, ((0, n_pad), (0, 0)))
+        covs = jnp.pad(covs, ((0, n_pad), (0, 0), (0, 0)))
+        valid = jnp.arange(n_time + n_pad) < n_time
 
-        for start in range(0, n_time, chunk_size):
-            stop = min(start + chunk_size, n_time)
-            means_chunk = means[start:stop]
-            covs_chunk = covs[start:stop]
-            log_rate_mean = means_chunk @ Z_grid.T
-            var_log_rate = np.einsum(
-                "gb,tbc,gc->tg", Z_grid, covs_chunk, Z_grid, optimize=True
+        rate_sum = jnp.zeros(n_grid, dtype=means.dtype)
+        rate_lo_sum = jnp.zeros(n_grid, dtype=means.dtype)
+        rate_hi_sum = jnp.zeros(n_grid, dtype=means.dtype)
+        for start in range(0, n_time + n_pad, chunk_size):
+            stop = start + chunk_size
+            chunk_sums = _posterior_rate_sums_chunk(
+                Z, means[start:stop], covs[start:stop], valid[start:stop], z
             )
-            var_log_rate = np.maximum(var_log_rate, 0.0)
-            std_log_rate = np.sqrt(var_log_rate)
+            rate_sum += chunk_sums[0]
+            rate_lo_sum += chunk_sums[1]
+            rate_hi_sum += chunk_sums[2]
 
-            rate_sum += np.exp(log_rate_mean + 0.5 * var_log_rate).sum(axis=0)
-            rate_lo_sum += np.exp(log_rate_mean - z * std_log_rate).sum(axis=0)
-            rate_hi_sum += np.exp(log_rate_mean + z * std_log_rate).sum(axis=0)
-
-        rate = rate_sum / n_time
-        rate_lo = rate_lo_sum / n_time
-        rate_hi = rate_hi_sum / n_time
+        rate = np.asarray(rate_sum / n_time)
+        rate_lo = np.asarray(rate_lo_sum / n_time)
+        rate_hi = np.asarray(rate_hi_sum / n_time)
 
         return rate, np.column_stack([rate_lo, rate_hi])
 

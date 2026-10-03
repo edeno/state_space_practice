@@ -996,9 +996,10 @@ class ContingencyBeliefModel(SGDFittableMixin):
     seed : int or None
         Seed for the random initialization of ``reward_probs_`` and
         ``state_values_``. ``None`` (default) keeps the historical fixed keys
-        (``PRNGKey(1)`` for ``reward_probs_``, ``PRNGKey(0)`` for
-        ``state_values_``), so existing fits are unchanged; an integer splits
-        ``PRNGKey(seed)`` into one key per parameter, so different seeds give
+        (``jax.random.key(1)`` for ``reward_probs_``, ``jax.random.key(0)``
+        for ``state_values_``), so existing fits are unchanged; an integer
+        splits ``jax.random.key(seed)`` into one key per parameter, so
+        different seeds give
         different EM starting points.
     """
 
@@ -1092,9 +1093,9 @@ class ContingencyBeliefModel(SGDFittableMixin):
         # where the reward channel provides no state-discriminating signal --
         # the failure mode when states differ mainly in reward contingency.
         if seed is None:
-            reward_key, values_key = jax.random.PRNGKey(1), jax.random.PRNGKey(0)
+            reward_key, values_key = jax.random.key(1), jax.random.key(0)
         else:
-            reward_key, values_key = jax.random.split(jax.random.PRNGKey(seed))
+            reward_key, values_key = jax.random.split(jax.random.key(seed))
         self.seed = seed
         self.reward_probs_ = jnp.clip(
             0.5 + 0.05 * jax.random.normal(reward_key, (n_states, n_options)),

@@ -535,6 +535,51 @@ class TestPlaceFieldModelPredict:
         np.testing.assert_allclose(rate, [expected_rate], rtol=1e-12, atol=1e-12)
         np.testing.assert_allclose(ci[0], expected_ci, rtol=1e-12, atol=1e-12)
 
+    @pytest.mark.parametrize("time_slice", [slice(None), slice(3, 40)])
+    def test_chunked_rate_map_matches_direct_formula(
+        self, monkeypatch: pytest.MonkeyPatch, time_slice: slice
+    ) -> None:
+        """The chunked, padded rate-map kernel equals the direct per-time
+        log-normal formula, also when the slice spans several chunks and the
+        last chunk is padded."""
+        import state_space_practice.place_field_model as pfm
+
+        rng = np.random.default_rng(3)
+        n_time, n_basis, n_grid = 45, 6, 7
+        means = rng.normal(size=(n_time, n_basis)) * 0.5
+        factors = rng.normal(size=(n_time, n_basis, n_basis)) * 0.3
+        covs = factors @ np.swapaxes(factors, 1, 2)
+        Z_grid = np.abs(rng.normal(size=(n_grid, n_basis)))
+
+        model = PlaceFieldModel(dt=0.02, n_interior_knots=1)
+        model.n_neurons = 1
+        model.n_basis_per_neuron = n_basis
+        model.n_basis = n_basis
+        model.smoother_mean = jnp.asarray(means)
+        model.smoother_cov = jnp.asarray(covs)
+
+        # 8-row chunks: the slices span several chunks, the last one padded.
+        monkeypatch.setattr(pfm, "_RATE_MAP_CHUNK_ELEMENTS", 8 * n_grid * n_basis)
+        alpha = 0.1
+        rate, ci = model._posterior_rate_map_for_basis(
+            Z_grid, time_slice, alpha=alpha, neuron_idx=0
+        )
+
+        m, P = means[time_slice], covs[time_slice]
+        assert m.shape[0] % 8 != 0  # guard: the last chunk is padded
+        z = float(jax.scipy.stats.norm.ppf(1 - alpha / 2))
+        log_mean = m @ Z_grid.T
+        var = np.einsum("gb,tbc,gc->tg", Z_grid, P, Z_grid)
+        np.testing.assert_allclose(
+            rate, np.exp(log_mean + 0.5 * var).mean(axis=0), rtol=1e-12
+        )
+        np.testing.assert_allclose(
+            ci[:, 0], np.exp(log_mean - z * np.sqrt(var)).mean(axis=0), rtol=1e-12
+        )
+        np.testing.assert_allclose(
+            ci[:, 1], np.exp(log_mean + z * np.sqrt(var)).mean(axis=0), rtol=1e-12
+        )
+
     def test_predict_center_shapes(self, fitted_model: PlaceFieldModel) -> None:
         grid, _, _ = fitted_model.make_grid(n_grid=10)
         centers = fitted_model.predict_center(grid, n_blocks=5)

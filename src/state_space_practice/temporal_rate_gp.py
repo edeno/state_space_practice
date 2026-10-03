@@ -46,6 +46,7 @@ Nickisch, H., Solin, A. & Grigorevskiy, A. (2018). State Space Gaussian Processe
 """
 
 import warnings
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
@@ -69,6 +70,7 @@ from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDPar
 from state_space_practice.utils import (
     _validate_filter_numerics,
     contains_tracer,
+    typed_jit,
     validate_count_array,
     validate_finite_array,
     validate_int,
@@ -238,41 +240,26 @@ def poisson_log_rate_site(
     return working_response, site_variance, expected_count
 
 
-def _infer_log_rate_traced(
+def _make_newton_target(
     counts: Array,
-    dt: ArrayLike,
-    variance: ArrayLike,
-    lengthscale: ArrayLike,
-    mean: ArrayLike,
-    n_iter: int,
+    offset: ArrayLike,
+    transition: Array,
+    process_cov: Array,
+    stationary_cov: Array,
+    measurement_matrix: Array,
     min_weight: float,
-) -> LaplaceRateResult:
-    """Traced core of :func:`infer_log_rate` (safe under ``jit`` / ``grad``).
+) -> Callable[[Array], Array]:
+    """Full (undamped) IRLS Newton target: the smoother mean of the sites at ``g``.
 
-    Does no host-side validation, so hyperparameters may be tracers. The public
-    :func:`infer_log_rate` validates concrete inputs before delegating here.
+    Parameters are as in :func:`_make_newton_step`.
+
+    Returns
+    -------
+    Callable
+        ``target(g) -> states`` with ``g`` of shape ``(n_time,)`` and states
+        of shape ``(n_time, 2)``.
     """
-    offset = mean + jnp.log(dt)
-    _F, _L, _Qc, measurement_vector, stationary_cov = matern32_continuous(
-        variance, lengthscale, validate=False
-    )
-    transition, process_cov = matern32_discretize(
-        variance, lengthscale, dt, validate=False
-    )
-    measurement_matrix = measurement_vector[None, :]  # (1, 2)
     init_mean = jnp.zeros(2)
-    n_time = counts.shape[0]
-
-    backtrack_steps = 0.5 ** jnp.arange(float(_N_BACKTRACK))  # largest first
-    # Whitening factors of the Markov prior, for the log-posterior merit
-    # function of the line search (see _prior_whitened_residuals).
-    stationary_chol = jnp.linalg.cholesky(stationary_cov)
-    process_chol = jnp.linalg.cholesky(process_cov)
-
-    def _whiten(states: Array) -> Array:
-        return _prior_whitened_residuals(
-            states, transition, stationary_chol, process_chol
-        )
 
     def _newton_target(g: Array) -> Array:
         working_response, site_variance, _ = poisson_log_rate_site(
@@ -289,6 +276,57 @@ def _infer_log_rate_traced(
             validate_inputs=False,
         )
         return smoother_mean
+
+    return _newton_target
+
+
+def _make_newton_step(
+    counts: Array,
+    offset: ArrayLike,
+    transition: Array,
+    process_cov: Array,
+    stationary_cov: Array,
+    measurement_matrix: Array,
+    min_weight: float,
+) -> Callable[[Array, None], tuple[Array, tuple[Array, Array, Array]]]:
+    """One line-searched Newton step on the Laplace log-posterior, as a scan body.
+
+    Parameters
+    ----------
+    counts : Array, shape (n_time,)
+    offset : ArrayLike, shape ()
+        ``mean + log(dt)``.
+    transition, process_cov, stationary_cov : Array, shape (2, 2)
+        Matern-3/2 state-space prior.
+    measurement_matrix : Array, shape (1, 2)
+    min_weight : float
+        Fisher-weight floor; see :func:`poisson_log_rate_site`.
+
+    Returns
+    -------
+    Callable
+        ``step(states, None) -> (new_states, (max_abs_update, merit_nonfinite,
+        unaccepted))`` with ``states`` of shape ``(n_time, 2)``.
+    """
+    _newton_target = _make_newton_target(
+        counts,
+        offset,
+        transition,
+        process_cov,
+        stationary_cov,
+        measurement_matrix,
+        min_weight,
+    )
+    backtrack_steps = 0.5 ** jnp.arange(float(_N_BACKTRACK))  # largest first
+    # Whitening factors of the Markov prior, for the log-posterior merit
+    # function of the line search (see _prior_whitened_residuals).
+    stationary_chol = jnp.linalg.cholesky(stationary_cov)
+    process_chol = jnp.linalg.cholesky(process_cov)
+
+    def _whiten(states: Array) -> Array:
+        return _prior_whitened_residuals(
+            states, transition, stationary_chol, process_chol
+        )
 
     def _newton_step(
         states: Array, _: None
@@ -343,8 +381,8 @@ def _infer_log_rate_traced(
             0,
         )
         # The step length is a discrete choice: keep it out of the gradient
-        # (at the mode the full step is always taken, so the unrolled
-        # derivative of the evidence is the fixed-point derivative).
+        # (at the mode the full step is always taken, so the derivative of
+        # the final step is the fixed-point derivative of the mode).
         step = jax.lax.stop_gradient(backtrack_steps[index])
         new_states = states + step * direction
         return new_states, (
@@ -353,11 +391,73 @@ def _infer_log_rate_traced(
             merit_finite & ~any_accepted,
         )
 
-    states_mode, (updates, nonfinite_merit, unaccepted) = jax.lax.scan(
-        _newton_step, jnp.zeros((n_time, 2)), None, length=n_iter
+    return _newton_step
+
+
+def _infer_log_rate_traced(
+    counts: Array,
+    dt: ArrayLike,
+    variance: ArrayLike,
+    lengthscale: ArrayLike,
+    mean: ArrayLike,
+    n_iter: int,
+    min_weight: float,
+) -> LaplaceRateResult:
+    """Traced core of :func:`infer_log_rate` (safe under ``jit`` / ``grad``).
+
+    Does no host-side validation, so hyperparameters may be tracers. The public
+    :func:`infer_log_rate` validates concrete inputs before delegating here.
+
+    Gradients are implicit (fixed-point) derivatives: all ``n_iter`` Newton
+    steps run on gradient-stopped hyperparameters, and the mode's derivative
+    comes from one *exact* Newton step taken at the converged mode. The
+    iteration floors the Fisher weights at ``min_weight``, which makes it
+    quasi-Newton where the floor binds; it still converges to the true mode,
+    but its update map then has a nonzero Jacobian in ``g`` there, so its own
+    derivative would be wrong. The exact (unfloored) Newton map has zero
+    Jacobian in ``g`` at the mode, so its hyperparameter derivative is
+    ``dg*/dtheta`` (implicit function theorem). Its value enters only as a
+    zero-valued straight-through term, so forward outputs are those of the
+    floored iteration, and no per-iteration residuals are kept.
+    """
+    offset = mean + jnp.log(dt)
+    _F, _L, _Qc, measurement_vector, stationary_cov = matern32_continuous(
+        variance, lengthscale, validate=False
     )
+    transition, process_cov = matern32_discretize(
+        variance, lengthscale, dt, validate=False
+    )
+    measurement_matrix = measurement_vector[None, :]  # (1, 2)
+    init_mean = jnp.zeros(2)
+    n_time = counts.shape[0]
+
+    # Run the Newton iteration on gradient-stopped hyperparameters.
+    stopped_prior = jax.lax.stop_gradient(
+        (offset, transition, process_cov, stationary_cov, measurement_matrix)
+    )
+    newton_step = _make_newton_step(counts, *stopped_prior, min_weight)
+    warm_states, (_warm_updates, warm_nonfinite, warm_unaccepted) = jax.lax.scan(
+        newton_step, jnp.zeros((n_time, 2)), None, length=n_iter - 1
+    )
+    states_last, (max_abs_update, last_nonfinite, last_unaccepted) = newton_step(
+        warm_states, None
+    )
+    # Derivative of the mode: one exact Newton step at it. Its weights are
+    # floored only at eps**2, far below any prior precision, so the step is
+    # exact to round-off yet its sites stay finite when a rate underflows.
+    exact_target = _make_newton_target(
+        counts,
+        offset,
+        transition,
+        process_cov,
+        stationary_cov,
+        measurement_matrix,
+        float(jnp.finfo(jnp.result_type(offset)).eps) ** 2,
+    )(states_last[:, 0])
+    states_mode = states_last + (exact_target - jax.lax.stop_gradient(exact_target))
     g_mode = states_mode[:, 0]
-    max_abs_update = updates[-1]
+    nonfinite_merit = jnp.append(warm_nonfinite, last_nonfinite)
+    unaccepted = jnp.append(warm_unaccepted, last_unaccepted)
 
     # Evaluate the Laplace evidence at the converged mode. The Kalman filter's
     # marginal likelihood of the mode's Gaussian sites, corrected by (true
@@ -400,6 +500,12 @@ def _infer_log_rate_traced(
     )
 
 
+#: Compiled :func:`_infer_log_rate_traced` (``n_iter`` static) for the eager
+#: entry points: data and hyperparameters are arguments, so a repeat call with
+#: same-shaped inputs reuses the program instead of re-tracing the scan.
+_infer_log_rate_jit = typed_jit(_infer_log_rate_traced, static_argnames="n_iter")
+
+
 def infer_log_rate(
     counts: ArrayLike,
     dt: ArrayLike,
@@ -429,8 +535,7 @@ def infer_log_rate(
     mean : ArrayLike, default 0.0
         Baseline log-rate ``mu``; the prior mean of ``f = mu + g``.
     n_iter : int, default 25
-        Number of Newton iterations. The iteration is a fixed-length scan so the
-        evidence stays differentiable for hyperparameter learning. Steps are
+        Number of Newton iterations, run as a fixed-length scan. Steps are
         damped by a backtracking line search, so the iteration converges from
         any start (typically in < 10 steps, quadratically near the mode) and
         extra steps are stable no-ops. ``max_abs_update`` reports convergence.
@@ -456,7 +561,13 @@ def infer_log_rate(
     validation of those is skipped when they are tracers), so
     ``jax.grad(lambda th: infer_log_rate(..., *th).log_marginal_likelihood)``
     gives the marginal-likelihood gradient used by
-    :class:`TemporalRateGP.fit_sgd`.
+    :class:`TemporalRateGP.fit_sgd`. The gradient is the implicit derivative
+    at the mode: only the final Newton step is differentiated, so its memory
+    does not grow with ``n_iter``. It is exact once the iteration has
+    converged (see ``max_abs_update``).
+
+    The inference is compiled once per input shape and ``n_iter``; repeat
+    calls with new data or hyperparameter values of the same shapes reuse it.
     """
     counts = jnp.asarray(counts)
     if counts.ndim != 1:
@@ -478,7 +589,7 @@ def infer_log_rate(
     if not contains_tracer(min_weight):
         min_weight = validate_scalar(min_weight, "min_weight", positive=True)
 
-    result = _infer_log_rate_traced(
+    result = _infer_log_rate_jit(
         counts, dt, variance, lengthscale, mean, n_iter, min_weight
     )
     _warn_laplace_diagnostics(result, "infer_log_rate")
@@ -504,6 +615,12 @@ def _infer_log_rate_batch_traced(
         return _infer_log_rate_traced(row, dt, var, ell, mu, n_iter, min_weight)
 
     return jax.vmap(_one)(counts, variance, lengthscale, mean)
+
+
+#: Compiled :func:`_infer_log_rate_batch_traced`; see ``_infer_log_rate_jit``.
+_infer_log_rate_batch_jit = typed_jit(
+    _infer_log_rate_batch_traced, static_argnames="n_iter"
+)
 
 
 def _broadcast_hyperparameter(
@@ -599,7 +716,7 @@ def infer_log_rate_batch(
     if not contains_tracer(min_weight):
         min_weight = validate_scalar(min_weight, "min_weight", positive=True)
 
-    result = _infer_log_rate_batch_traced(
+    result = _infer_log_rate_batch_jit(
         counts, dt, variance, lengthscale, mean, n_iter, min_weight
     )
     _warn_laplace_diagnostics(result, "infer_log_rate_batch")
@@ -843,21 +960,25 @@ class TemporalRateGP(SGDFittableMixin):
 
     def _build_param_spec(self) -> tuple[SGDParams, SGDParamSpec]:
         n_neurons = self._n_neurons
+        # An explicit dtype keeps Python-float hyperparameters from becoming
+        # weak-typed leaves: the optimizer's first update returns them strong,
+        # which would re-trace the compiled SGD step on the second step.
+        variance = jnp.asarray(self.variance, dtype=float)
+        lengthscale = jnp.asarray(self.lengthscale, dtype=float)
+        mean = jnp.asarray(self.mean, dtype=float)
         # Shared variance/lengthscale stay scalar; per-neuron ones become
         # (n_neurons,) vectors. The baseline mean is always per-neuron for a
         # multi-neuron fit so each cell keeps its own firing level.
         if n_neurons == 1 or self.share_hyperparameters:
-            variance_init = jnp.asarray(self.variance)
-            lengthscale_init = jnp.asarray(self.lengthscale)
+            variance_init = variance
+            lengthscale_init = lengthscale
         else:
-            variance_init = jnp.broadcast_to(jnp.asarray(self.variance), (n_neurons,))
-            lengthscale_init = jnp.broadcast_to(
-                jnp.asarray(self.lengthscale), (n_neurons,)
-            )
+            variance_init = jnp.broadcast_to(variance, (n_neurons,))
+            lengthscale_init = jnp.broadcast_to(lengthscale, (n_neurons,))
         if n_neurons == 1:
-            mean_init = jnp.asarray(self.mean)
+            mean_init = mean
         else:
-            mean_init = jnp.broadcast_to(jnp.asarray(self.mean), (n_neurons,))
+            mean_init = jnp.broadcast_to(mean, (n_neurons,))
 
         params = {
             "variance": variance_init,

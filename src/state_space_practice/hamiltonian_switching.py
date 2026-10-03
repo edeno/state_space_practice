@@ -111,6 +111,37 @@ def switching_predict_collapse(
     return m_p_k, P_p_k, F_jk, joint_pi_pred, pi_pred_k, m_p_jk, P_p_jk
 
 
+def _switching_predict_collapse_remat(
+    m_prev: Array,
+    P_prev: Array,
+    pi_prev: Array,
+    Z: Array,
+    mlp_params: dict[str, Any],
+    omega: Array,
+    Q_all: Array,
+    dt: float,
+    *,
+    with_jacobian: bool,
+) -> tuple[Array, Array, Array | None, Array, Array, Array, Array]:
+    """:func:`switching_predict_collapse`, rematerialized under reverse-mode AD.
+
+    Each step's ``K x K`` leapfrog Jacobians differentiate the per-state MLPs
+    twice, so the residuals reverse mode would otherwise store per time step
+    scale with the hidden width and dwarf the scan carry (~0.5 MB per step
+    for three states and ``hidden_dims=[32, 32]``, i.e. ~10 GB for a
+    20,000-step ``fit_sgd`` gradient). Under ``jax.checkpoint`` only the step
+    inputs are kept and the predict is recomputed in the backward pass.
+    Forward evaluation is unchanged. ``dt`` (argnum 7) is static.
+    """
+    predict_collapse = jax.checkpoint(
+        partial(switching_predict_collapse, with_jacobian=with_jacobian),
+        static_argnums=(7,),
+    )
+    return predict_collapse(  # type: ignore[no-any-return]
+        m_prev, P_prev, pi_prev, Z, mlp_params, omega, Q_all, dt
+    )
+
+
 @partial(typed_jit, static_argnames=("dt",))
 def switching_hamiltonian_filter(
     observations: tuple[Array, Array],
@@ -154,7 +185,7 @@ def switching_hamiltonian_filter(
             pi_pred_k,
             _,
             _,
-        ) = switching_predict_collapse(
+        ) = _switching_predict_collapse_remat(
             m_prev,
             P_prev,
             pi_prev,
@@ -251,7 +282,7 @@ def switching_hamiltonian_smoother(
             pi_pred_k,
             m_p_jk,
             P_p_jk,
-        ) = switching_predict_collapse(
+        ) = _switching_predict_collapse_remat(
             m_prev,
             P_prev,
             pi_prev,

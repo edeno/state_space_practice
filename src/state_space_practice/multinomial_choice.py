@@ -41,6 +41,7 @@ from state_space_practice.parameter_transforms import POSITIVE
 from state_space_practice.sgd_fitting import SGDFittableMixin, SGDParams, SGDParamSpec
 from state_space_practice.utils import (
     _root_figure,
+    contains_tracer,
     psd_cholesky,
     psd_logdet,
     psd_solve,
@@ -119,7 +120,7 @@ def _warn_if_newton_unconverged(newton_gap: ArrayLike, solver: str) -> None:
         jnp.sum(unconverged),
         jnp.max(newton_gap, where=unconverged, initial=0.0),
     )
-    if isinstance(newton_gap, jax.core.Tracer):
+    if contains_tracer(newton_gap):
         jax.debug.callback(
             partial(_warn_unconverged_host, solver=solver, stacklevel=2), *counts
         )

@@ -16,6 +16,10 @@ import numpy as np
 
 def _snapshot(value: Any) -> Any:
     """Deep copy of ``value`` with arrays, dataclasses and containers unpacked."""
+    if isinstance(value, jax.Array) and jax.dtypes.issubdtype(
+        value.dtype, jax.dtypes.prng_key
+    ):  # typed PRNG keys cannot become NumPy arrays; compare their key data
+        return ("prng_key", np.array(jax.random.key_data(value)))
     if isinstance(value, (jax.Array, np.ndarray)):
         return np.array(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
@@ -63,3 +67,8 @@ def snapshot_model_state(model: object) -> Any:
 def assert_model_state_unchanged(model: object, before: Any) -> None:
     """Every instance attribute of ``model`` still equals its snapshot."""
     _assert_same_snapshot(before, _snapshot(vars(model)), type(model).__name__)
+
+
+def assert_snapshots_equal(first: Any, second: Any) -> None:
+    """Two :func:`snapshot_model_state` results are identical."""
+    _assert_same_snapshot(first, second, "model")

@@ -35,7 +35,7 @@ import logging
 import operator
 import warnings
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, overload
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast, overload
 
 import jax
 import jax.numpy as jnp
@@ -55,7 +55,9 @@ from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.kalman import (
     InitialStatePrior,
     _kalman_smoother_update,
+    _scan_with_boundary,
     process_cov_residual_form,
+    rts_backward_scan,
     smooth_initial_state_with_cross_cov,
     sum_of_outer_products,
 )
@@ -807,7 +809,7 @@ _LINE_SEARCH_FAIL_WARN_FRAC = 0.1
 
 def _fisher_scoring_line_search(
     x0: Array,
-    prior_precision: Array,
+    prior_factor: Array,
     fisher_step_at: Callable[[Array], tuple[Array, Array, Array]],
     neg_log_posterior: Callable[[Array], Array],
     max_newton_iter: int,
@@ -817,10 +819,13 @@ def _fisher_scoring_line_search(
 
     Shared by :func:`_point_process_laplace_update` and
     :func:`glm_laplace_update`. ``fisher_step_at(x)`` returns
-    ``(delta, post_prec, gradient)`` -- the Fisher direction
-    ``delta = post_prec^{-1} gradient`` and posterior precision at ``x``, with
-    ``gradient`` the gradient of the log-posterior -- and
-    ``neg_log_posterior(x)`` the objective ``f`` the line search decreases.
+    ``(delta, post_factor, gradient)`` -- the Fisher direction
+    ``delta = post_prec^{-1} gradient`` and the Cholesky factor (as returned
+    by :func:`~state_space_practice.utils.psd_cholesky`) of the posterior
+    precision ``post_prec`` at ``x``, with ``gradient`` the gradient of the
+    log-posterior -- and ``neg_log_posterior(x)`` the objective ``f`` the
+    line search decreases. The factor is only carried and returned, so the
+    callers reuse the factorization the last Fisher step already did.
 
     The trial step sizes are ``alpha = 1, beta, ..., beta^(N-1)`` with
     ``N = _LINE_SEARCH_MAX_BACKTRACKS``; the largest is accepted that
@@ -831,23 +836,27 @@ def _fisher_scoring_line_search(
     ``gradient' delta >= 0`` and ``delta`` is a descent direction. When the
     full step is accepted the result is the same as without the Armijo
     condition. If no step size qualifies, ``x`` is kept (an uphill or
-    insufficient step is never taken).
+    insufficient step is never taken). The backtracking stops at the first
+    accepted step size, so an accepted full step costs one objective
+    evaluation; it is differentiable in reverse mode because only the
+    accepted point ``x + alpha delta`` carries derivatives (``alpha`` is a
+    constant power of ``beta``).
 
     With ``max_newton_iter == 0`` no measurement update is made: the prior
-    ``(x0, prior_precision)`` is returned unchanged.
+    ``(x0, prior_factor)`` is returned unchanged.
 
-    The scan carries ``(x, delta, post_prec, loss, slope, n_failed)``, i.e.
+    The scan carries ``(x, delta, post_factor, loss, slope, n_failed)``, i.e.
     the Fisher step, the objective and the directional derivative *at the
     current point*. They are computed exactly once, when a point is accepted,
     and reused as the next iteration's search direction and references; the
-    precision at the last accepted point is the returned posterior precision.
+    factor at the last accepted point is the returned posterior factor.
 
     Returns
     -------
     x : Array
         The accepted point after ``max_newton_iter`` iterations.
-    post_prec : Array
-        The Fisher posterior precision evaluated at ``x``.
+    post_factor : Array
+        Cholesky factor of the Fisher posterior precision evaluated at ``x``.
     n_failed : Array
         Number of iterations (int32 scalar) whose backtracking was exhausted
         although the Fisher step predicted a decrease above roundoff
@@ -861,35 +870,61 @@ def _fisher_scoring_line_search(
     ) -> tuple[tuple[Array, Array, Array, Array, Array, Array], None]:
         x, delta, _, current_loss, slope, n_failed = carry
 
-        # Backtracking line search. The loss at the evaluated step size rides
-        # along in the carry, so the winning loss is known without a second
-        # evaluation at the accepted point.
-        def _backtrack(
-            alpha_carry: tuple[Array, Array, Array], _: Array | None
-        ) -> tuple[tuple[Array, Array, Array], None]:
-            alpha, _, _ = alpha_carry
-            new_x = x + alpha * delta
-            new_loss = neg_log_posterior(new_x)
-            # The slack admits steps that change f only at round-off level,
-            # so at a converged mode the (tiny) full step is still taken:
-            # rejecting it would freeze x, and reverse-mode gradients
-            # through the scan would then miss the Fisher map's contraction
-            # and carry the error of an earlier, unconverged iterate.
-            slack = 1e-12 * (1.0 + jnp.abs(current_loss))
-            improved = new_loss <= current_loss - _ARMIJO_C * alpha * slope + slack
-            new_alpha = jnp.where(improved, alpha, alpha * line_search_beta)
-            return (new_alpha, improved, new_loss), None
+        # Backtracking line search, stopped at the first accepted step size
+        # (usually the full step) instead of always evaluating all
+        # ``_LINE_SEARCH_MAX_BACKTRACKS`` trials. The loss at the evaluated
+        # step size rides along in the carry, so the winning loss is known
+        # without a second evaluation at the accepted point.
+        #
+        # The search only *selects* a step size: alpha is a power of beta and
+        # the accept flag is boolean, so the result has zero derivative with
+        # respect to every input, and the loss is used only in comparisons.
+        # Everything entering or produced by the loop is therefore cut from
+        # differentiation with ``stop_gradient``; that makes the
+        # ``while_loop`` a primal-only computation, so reverse-mode AD
+        # (fit_sgd differentiates through the filters) works through it, and
+        # the gradient -- which flows through ``x + alpha * delta`` below --
+        # is the same as through a fixed-length search.
+        x_sg = jax.lax.stop_gradient(x)
+        delta_sg = jax.lax.stop_gradient(delta)
+        loss_sg = jax.lax.stop_gradient(current_loss)
+        slope_sg = jax.lax.stop_gradient(slope)
+        # The slack admits steps that change f only at round-off level, so at
+        # a converged mode the (tiny) full step is still taken: rejecting it
+        # would freeze x, and reverse-mode gradients through the iterations
+        # would then miss the Fisher map's contraction and carry the error of
+        # an earlier, unconverged iterate.
+        slack = 1e-12 * (1.0 + jnp.abs(loss_sg))
 
-        (final_alpha, line_search_improved, final_loss), _ = jax.lax.scan(
+        def _not_accepted(
+            alpha_carry: tuple[Array, Array, Array, Array],
+        ) -> Array:
+            n_tried, _, improved, _ = alpha_carry
+            return ~improved & (n_tried < _LINE_SEARCH_MAX_BACKTRACKS)
+
+        def _backtrack(
+            alpha_carry: tuple[Array, Array, Array, Array],
+        ) -> tuple[Array, Array, Array, Array]:
+            n_tried, alpha, _, _ = alpha_carry
+            new_loss = jax.lax.stop_gradient(neg_log_posterior(x_sg + alpha * delta_sg))
+            improved = new_loss <= loss_sg - _ARMIJO_C * alpha * slope_sg + slack
+            new_alpha = jnp.where(improved, alpha, alpha * line_search_beta)
+            return n_tried + 1, new_alpha, improved, new_loss
+
+        _, final_alpha, line_search_improved, final_loss = jax.lax.while_loop(
+            _not_accepted,
             _backtrack,
-            (jnp.ones((), dtype=x.dtype), jnp.array(False), current_loss),
-            None,
-            length=_LINE_SEARCH_MAX_BACKTRACKS,
+            (
+                jnp.zeros((), dtype=jnp.int32),
+                jnp.ones((), dtype=x.dtype),
+                jnp.array(False),
+                loss_sg,
+            ),
         )
         candidate_x = x + final_alpha * delta
 
         # Reject uphill / insufficient steps: reuse the improved flag from
-        # the backtracking scan rather than re-evaluating neg_log_posterior.
+        # the backtracking loop rather than re-evaluating neg_log_posterior.
         # If improved is False, no step size qualified -- keep current x and
         # count the failure unless the step was already negligible (a
         # converged point legitimately exhausts the backtracking).
@@ -899,29 +934,29 @@ def _fisher_scoring_line_search(
             0.5 * slope > eps_sqrt * (1.0 + jnp.abs(current_loss))
         )
 
-        # Fisher step at the accepted point: its precision is the posterior
-        # precision if this was the last iteration, and its direction is the
-        # next iteration's step.
-        new_delta, new_post_prec, new_gradient = fisher_step_at(new_x)
+        # Fisher step at the accepted point: its precision factor is the
+        # posterior factor if this was the last iteration, and its direction
+        # is the next iteration's step.
+        new_delta, new_post_factor, new_gradient = fisher_step_at(new_x)
         new_slope = new_gradient @ new_delta
         return (
             new_x,
             new_delta,
-            new_post_prec,
+            new_post_factor,
             new_loss,
             new_slope,
             n_failed + exhausted.astype(jnp.int32),
         ), None
 
     if max_newton_iter == 0:
-        return x0, prior_precision, jnp.zeros((), dtype=jnp.int32)
-    delta0, post_prec0, gradient0 = fisher_step_at(x0)
-    (x, _, post_prec, _, _, n_failed), _ = jax.lax.scan(
+        return x0, prior_factor, jnp.zeros((), dtype=jnp.int32)
+    delta0, post_factor0, gradient0 = fisher_step_at(x0)
+    (x, _, post_factor, _, _, n_failed), _ = jax.lax.scan(
         _line_search_step,
         (
             x0,
             delta0,
-            post_prec0,
+            post_factor0,
             neg_log_posterior(x0),
             gradient0 @ delta0,
             jnp.zeros((), dtype=jnp.int32),
@@ -929,7 +964,7 @@ def _fisher_scoring_line_search(
         None,
         length=max_newton_iter,
     )
-    return x, post_prec, n_failed
+    return x, post_factor, n_failed
 
 
 def _log_line_search_failures(
@@ -1265,9 +1300,11 @@ def _point_process_laplace_update(
         fisher_info = jacobian.T @ (conditional_intensity[:, None] * jacobian)
         post_prec = symmetrize(prior_precision + fisher_info)
 
-        # Fisher-scoring direction
-        delta = psd_solve(post_prec, gradient, diagonal_boost=diagonal_boost)
-        return delta, post_prec, gradient
+        # Fisher-scoring direction. The factor is returned too: at the last
+        # iterate it is the posterior factor, so it is not refactored below.
+        post_cho = psd_cholesky(post_prec, diagonal_boost=diagonal_boost)
+        delta = jax.scipy.linalg.cho_solve(post_cho, gradient[:, None])[:, 0]
+        return delta, post_cho[0], gradient
 
     if max_newton_iter == 1:
         # Single-step Fisher scoring (no line search overhead).
@@ -1289,18 +1326,20 @@ def _point_process_laplace_update(
         n_line_search_failures = jnp.zeros((), dtype=jnp.int32)
     else:
         # Iterative Fisher scoring with line search, started at the prior mean
-        # (zero iterations return the prior unchanged).
-        posterior_mean, posterior_precision, n_line_search_failures = (
+        # (zero iterations return the prior unchanged). It returns the
+        # posterior-precision factor of the last Fisher step; the factor and
+        # lower flag follow psd_cholesky's convention, as prior_cho does.
+        posterior_mean, posterior_factor, n_line_search_failures = (
             _fisher_scoring_line_search(
                 one_step_mean,
-                prior_precision,
+                psd_cholesky(prior_precision, diagonal_boost=diagonal_boost)[0],
                 _fisher_step_at,
                 _neg_log_posterior,
                 max_newton_iter,
                 line_search_beta,
             )
         )
-        post_cho = psd_cholesky(posterior_precision, diagonal_boost=diagonal_boost)
+        post_cho = (posterior_factor, prior_cho[1])
 
     # Posterior covariance from the same factor. No post-hoc stabilization
     # needed because posterior_precision is PSD by construction (sum of two
@@ -1542,8 +1581,10 @@ def glm_laplace_update(
         weight = family.fisher_weight(eta, mu)
         fisher_info = jacobian.T @ (weight[:, None] * jacobian)
         post_prec = symmetrize(prior_precision + fisher_info)
-        delta = psd_solve(post_prec, gradient, diagonal_boost=diagonal_boost)
-        return delta, post_prec, gradient
+        # Return the factor too (see _point_process_laplace_update).
+        post_cho = psd_cholesky(post_prec, diagonal_boost=diagonal_boost)
+        delta = jax.scipy.linalg.cho_solve(post_cho, gradient[:, None])[:, 0]
+        return delta, post_cho[0], gradient
 
     if max_newton_iter == 1:
         # Single Fisher step from the prior mean (prior gradient is zero there).
@@ -1561,17 +1602,17 @@ def glm_laplace_update(
         posterior_mean = one_step_mean + jax.scipy.linalg.cho_solve(post_cho, gradient)
         n_line_search_failures = jnp.zeros((), dtype=jnp.int32)
     else:
-        posterior_mean, posterior_precision, n_line_search_failures = (
+        posterior_mean, posterior_factor, n_line_search_failures = (
             _fisher_scoring_line_search(
                 one_step_mean,
-                prior_precision,
+                psd_cholesky(prior_precision, diagonal_boost=diagonal_boost)[0],
                 _fisher_step_at,
                 _neg_log_posterior,
                 max_newton_iter,
                 line_search_beta,
             )
         )
-        post_cho = psd_cholesky(posterior_precision, diagonal_boost=diagonal_boost)
+        post_cho = (posterior_factor, prior_cho[1])
 
     posterior_cov = symmetrize(jax.scipy.linalg.cho_solve(post_cho, identity))
 
@@ -1697,8 +1738,8 @@ def stochastic_point_process_filter(
     negative semidefinite, so no damping or trust-region safeguarding is
     needed for PSD of the covariance update.
 
-    With ``max_newton_iter > 1`` each iteration is gated by a fixed-length
-    Armijo backtracking scan (:func:`_fisher_scoring_line_search`); when more
+    With ``max_newton_iter > 1`` each iteration is gated by an Armijo
+    backtracking line search (:func:`_fisher_scoring_line_search`); when more
     than 10% of the bins exhaust it, one warning is logged per call.
     ``max_newton_iter == 1`` is a single Fisher step without line search. For a true Newton
     step with observed Hessian + Armijo line search, see
@@ -1905,6 +1946,32 @@ def stochastic_point_process_filter(
     return filtered_mean, filtered_cov, marginal_log_likelihood
 
 
+_StepFn = TypeVar("_StepFn", bound=Callable[..., Any])
+
+
+def _remat_filter_step(step: _StepFn) -> _StepFn:
+    """Rematerialize a filter's per-time-step function under reverse-mode AD.
+
+    ``fit_sgd`` differentiates the marginal log-likelihood through the
+    forward filters. Without rematerialization reverse mode keeps, for every
+    time step, the residuals of the whole Laplace update -- each Fisher
+    iteration's Cholesky factors, triangular solves and iterates -- about 20
+    state-covariance-sized arrays per step (3 GB for the block-diagonal
+    filter at 5000 bins, 10 neurons and 20 basis functions per neuron).
+    Under :func:`jax.checkpoint` only the step's inputs (the scan carry,
+    about one covariance per step) are kept, and the step is recomputed in
+    the backward pass, which costs one extra forward step per time step.
+
+    Forward evaluation runs the same operations, so the filter's outputs
+    are bit-identical. The Fisher-scoring line search's ``while_loop`` is
+    primal-only (see :func:`_fisher_scoring_line_search`), so it is simply
+    re-run in the recomputation. ``prevent_cse=False`` is safe because the
+    step runs inside ``lax.scan``: the recomputation sits in the backward
+    loop, where XLA cannot merge it with the forward loop's copy.
+    """
+    return cast(_StepFn, jax.checkpoint(step, prevent_cse=False))
+
+
 @functools.partial(
     typed_jit,
     static_argnames=[
@@ -2019,6 +2086,8 @@ def _stochastic_point_process_filter_impl(
         )
 
     marginal_log_likelihood = jnp.zeros((), dtype=dtype)
+    # Each time step is rematerialized under reverse-mode AD (see
+    # _remat_filter_step).
     (
         (_, _, marginal_log_likelihood, n_failed_bins),
         (
@@ -2026,7 +2095,7 @@ def _stochastic_point_process_filter_impl(
             filtered_cov,
         ),
     ) = jax.lax.scan(
-        _step,
+        _remat_filter_step(_step),
         (
             init_mean_params,
             init_covariance_params,
@@ -2060,9 +2129,10 @@ def _block_diagonal_forward_core(
 
     Takes the array fields of a :class:`BlockDiagonalStructure` explicitly,
     so its Python-int fields never become traced, and the option flags as
-    static arguments. Each neuron's scan uses its own ``A_blocks[j]`` and
-    ``Q_blocks[j]`` (vmapped alongside its initial state and spikes). The vmapped ``lax.scan`` is therefore traced and
-    compiled once per (shapes, dtypes, options) and reused across calls --
+    static arguments. One ``lax.scan`` over time runs every neuron's step
+    (vmapped over neurons), each with its own ``A_blocks[j]`` and
+    ``Q_blocks[j]``, initial state and spikes. The scan is therefore traced
+    and compiled once per (shapes, dtypes, options) and reused across calls --
     every EM iteration of ``PlaceFieldModel.fit`` -- instead of being
     re-traced on each call. ``dt`` and ``max_log_count`` are ordinary
     (traced) scalars, so changing their values does not recompile.
@@ -2132,29 +2202,54 @@ def _block_diagonal_forward_core(
             (post_mean, post_cov),
         )
 
-    def _run_one_neuron(
-        A_j: Array,
-        Q_j: Array,
-        init_mean_j: Array,
-        init_cov_j: Array,
-        spikes_j: Array,
-    ) -> tuple[Array, Array, Array, Array]:
-        init_carry = (
-            init_mean_j,
-            init_cov_j,
-            jnp.array(0.0, dtype=init_mean_j.dtype),
-            jnp.zeros((), dtype=jnp.int32),
-        )
-        (_, _, ll_j, n_failed_j), (means_j, covs_j) = jax.lax.scan(
-            functools.partial(_step_one_neuron, A_j, Q_j),
-            init_carry,
-            (Z_base, spikes_j),
-        )
-        return means_j, covs_j, ll_j, n_failed_j
-
-    return jax.vmap(_run_one_neuron, in_axes=(0, 0, 0, 0, 1))(
-        A_blocks, Q_blocks, init_means_per_neuron, init_covs_per_neuron, spike_indicator
+    # Scan over time with the per-neuron step vmapped inside it, writing the
+    # filtered moments into neuron-major buffers carried through the scan
+    # (updated in place). Stacking them as scan outputs would lay them out
+    # time-major, and the transpose to the per-neuron layout is a full-size
+    # copy.
+    n_neurons = init_means_per_neuron.shape[0]
+    n_time = Z_base.shape[0]
+    # Each time step is rematerialized under reverse-mode AD (see
+    # _remat_filter_step). The buffer writes below stay outside the
+    # checkpoint: they need no residuals.
+    step_all = _remat_filter_step(
+        jax.vmap(_step_one_neuron, in_axes=(0, 0, 0, (None, 0)))
     )
+
+    def _step_all_neurons(
+        carry: tuple[tuple[Array, Array, Array, Array], Array, Array, Array],
+        args: tuple[Array, Array],
+    ) -> tuple[tuple[tuple[Array, Array, Array, Array], Array, Array, Array], None]:
+        neuron_carry, means_buffer, covs_buffer, t = carry
+        neuron_carry, (post_means, post_covs) = step_all(
+            A_blocks, Q_blocks, neuron_carry, args
+        )
+        # The step is still traced when n_time == 0 (a zero-length scan),
+        # where the buffers are empty and there is nothing to write.
+        if n_time > 0:
+            means_buffer = jax.lax.dynamic_update_index_in_dim(
+                means_buffer, post_means, t, axis=1
+            )
+            covs_buffer = jax.lax.dynamic_update_index_in_dim(
+                covs_buffer, post_covs, t, axis=1
+            )
+        return (neuron_carry, means_buffer, covs_buffer, t + 1), None
+
+    init_carry = (
+        (
+            init_means_per_neuron,
+            init_covs_per_neuron,
+            jnp.zeros((n_neurons,), dtype),
+            jnp.zeros((n_neurons,), dtype=jnp.int32),
+        ),
+        jnp.zeros((n_neurons, n_time, *init_means_per_neuron.shape[1:]), dtype),
+        jnp.zeros((n_neurons, n_time, *init_covs_per_neuron.shape[1:]), dtype),
+        jnp.asarray(0),
+    )
+    ((_, _, lls_per_neuron, n_failed_per_neuron), means, covs, _), _ = jax.lax.scan(
+        _step_all_neurons, init_carry, (Z_base, spike_indicator)
+    )
+    return means, covs, lls_per_neuron, n_failed_per_neuron
 
 
 def _run_forward_block_diagonal(
@@ -2259,13 +2354,23 @@ def _block_diagonal_smoother_core(
     # decomposes into independent per-neuron smoothers (neuron j with its
     # own A_j, Q_j), exactly matching the dense filter's backward pass on
     # the block-diagonal problem.
+    #
+    # The outputs are written in place: _scan_with_boundary carries the
+    # smoothed mean/cov buffers (the terminal slot holds the filtered
+    # moments, which the smoother leaves unchanged) and reads the filtered
+    # moments by index, and the cross-covariances go into a buffer carried
+    # here. A scan-stacked output under vmap is laid out time-major and
+    # transposed to the per-neuron layout afterwards (a full-size copy), so
+    # none of the three outputs is stacked by the scan.
     def _backward_step(
         A_j: Array,
         Q_j: Array,
-        carry: tuple[Array, Array],
+        carry: tuple[tuple[Array, Array], Array, Array],
         args: tuple[Array, Array],
-    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
-        next_smoother_mean, next_smoother_cov = carry
+    ) -> tuple[
+        tuple[tuple[Array, Array], Array, Array], tuple[tuple[Array, Array], None]
+    ]:
+        (next_smoother_mean, next_smoother_cov), cross_cov_buffer, t = carry
         filter_mean, filter_cov = args
         sm, sc, scc = _kalman_smoother_update(
             next_smoother_mean,
@@ -2275,22 +2380,34 @@ def _block_diagonal_smoother_core(
             Q_j,
             A_j,
         )
-        return (sm, sc), (sm, sc, scc)
+        # The step is still traced when n_time == 1 (a zero-length scan),
+        # where the buffer is empty and there is nothing to write.
+        if cross_cov_buffer.shape[0] > 0:
+            cross_cov_buffer = jax.lax.dynamic_update_index_in_dim(
+                cross_cov_buffer, scc, t, axis=0
+            )
+        return ((sm, sc), cross_cov_buffer, t - 1), ((sm, sc), None)
 
     def _run_backward_one_neuron(
         A_j: Array, Q_j: Array, means_j: Array, covs_j: Array
     ) -> tuple[Array, Array, Array]:
-        # Initial carry: the last-time-step filtered posterior.
-        (_, _), (sm_rev, sc_rev, scc_rev) = jax.lax.scan(
+        n_time = means_j.shape[0]
+        terminal = (means_j[-1], covs_j[-1])
+        init_carry = (
+            terminal,
+            jnp.zeros((n_time - 1, *covs_j.shape[1:]), covs_j.dtype),
+            jnp.asarray(n_time - 2),
+        )
+        (_, cross_covs, _), (means, covs), _ = _scan_with_boundary(
             functools.partial(_backward_step, A_j, Q_j),
-            (means_j[-1], covs_j[-1]),
-            (means_j[:-1], covs_j[:-1]),
+            init_carry,
+            (means_j, covs_j),
+            (0, 0),
+            n_time - 1,
+            terminal,
             reverse=True,
         )
-        # Append the last time step's filter posterior (no backward update)
-        sm_full = jnp.concatenate((sm_rev, means_j[-1][None]))
-        sc_full = jnp.concatenate((sc_rev, covs_j[-1][None]))
-        return sm_full, sc_full, scc_rev
+        return means, covs, cross_covs
 
     smoother_means, smoother_covs, smoother_cross_covs = jax.vmap(
         _run_backward_one_neuron
@@ -2876,60 +2993,14 @@ def stochastic_point_process_smoother(
         )
     )
 
-    smoother_mean, smoother_cov, smoother_cross_cov = (
-        _stochastic_point_process_smoother_backward(
-            filtered_mean,
-            filtered_cov,
-            process_cov,
-            transition_matrix,
-        )
+    smoother_mean, smoother_cov, smoother_cross_cov = rts_backward_scan(
+        filtered_mean, filtered_cov, transition_matrix, process_cov
     )
 
     result = (smoother_mean, smoother_cov, smoother_cross_cov, marginal_log_likelihood)
     if return_filtered:
         return result + (filtered_mean, filtered_cov)
     return result
-
-
-@typed_jit
-def _stochastic_point_process_smoother_backward(
-    filtered_mean: Array,
-    filtered_cov: Array,
-    process_cov: Array,
-    transition_matrix: Array,
-) -> tuple[Array, Array, Array]:
-    """JIT-compiled backward pass of the point process smoother."""
-
-    def _step(
-        carry: tuple[Array, Array], args: tuple[Array, Array]
-    ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
-        next_smoother_mean, next_smoother_cov = carry
-        filter_mean, filter_cov = args
-        smoother_mean, smoother_cov, smoother_cross_cov = _kalman_smoother_update(
-            next_smoother_mean,
-            next_smoother_cov,
-            filter_mean,
-            filter_cov,
-            process_cov,
-            transition_matrix,
-        )
-        return (smoother_mean, smoother_cov), (
-            smoother_mean,
-            smoother_cov,
-            smoother_cross_cov,
-        )
-
-    (_, _), (smoother_mean, smoother_cov, smoother_cross_cov) = jax.lax.scan(
-        _step,
-        (filtered_mean[-1], filtered_cov[-1]),
-        (filtered_mean[:-1], filtered_cov[:-1]),
-        reverse=True,
-    )
-
-    smoother_mean = jnp.concatenate((smoother_mean, filtered_mean[-1][None]))
-    smoother_cov = jnp.concatenate((smoother_cov, filtered_cov[-1][None]))
-
-    return smoother_mean, smoother_cov, smoother_cross_cov
 
 
 def dynamics_only_m_step(

@@ -4273,6 +4273,356 @@ class TestBlockDiagonalCovarianceContainer:
                 jax.jit(lambda x: x)(cov)
 
 
+class TestScanOutputMemory:
+    """The block forward pass and the smoothers' backward passes write their
+    outputs in place.
+
+    A backward scan whose stacked outputs are concatenated with the terminal
+    step, or that scans over sliced inputs, holds a second full-size copy of
+    a covariance stack at peak memory; so does a scan-stacked output under
+    ``vmap`` (transposed to the per-neuron layout afterwards). Only the
+    compiled programs are inspected, nothing is run.
+    """
+
+    n_time = 2000
+
+    @staticmethod
+    def _temp_bytes(fn, *arg_specs) -> int:
+        memory = jax.jit(fn).lower(*arg_specs).compile().memory_analysis()
+        if memory is None:
+            pytest.skip("backend reports no memory analysis")
+        return memory.temp_size_in_bytes
+
+    def test_dense_smoother_needs_no_full_size_temporaries(self) -> None:
+        T, d, n_obs = self.n_time, 4, 3
+        spec = jax.ShapeDtypeStruct
+
+        def smoother(init_mean, init_cov, design, spikes, A, Q):
+            # return_filtered: the filtered stacks are outputs, not temps.
+            return stochastic_point_process_smoother(
+                init_mean,
+                init_cov,
+                design,
+                spikes,
+                0.02,
+                A,
+                Q,
+                log_conditional_intensity,
+                validate_inputs=False,
+                return_filtered=True,
+            )
+
+        temp = self._temp_bytes(
+            smoother,
+            spec((d,), jnp.float64),
+            spec((d, d), jnp.float64),
+            spec((T, n_obs, d), jnp.float64),
+            spec((T, n_obs), jnp.float64),
+            spec((d, d), jnp.float64),
+            spec((d, d), jnp.float64),
+        )
+        # One copy of the smoothed covariances is T*d*d*8 = 256 kB.
+        assert temp < 0.1 * T * d * d * 8
+
+    def test_block_forward_needs_no_full_size_temporaries(self) -> None:
+        T, n_neurons, nb = self.n_time, 3, 4
+        spec = jax.ShapeDtypeStruct
+        temp = self._temp_bytes(
+            lambda *args: _block_diagonal_forward_core(
+                *args,
+                0.02,
+                include_laplace_normalization=True,
+                max_log_count=20.0,
+                max_newton_iter=3,
+            ),
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((n_neurons, nb), jnp.float64),
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((T, nb), jnp.float64),
+            spec((T, n_neurons), jnp.float64),
+        )
+        # The filtered moments are outputs, not temps. One copy of the
+        # per-neuron filtered covariances is n_neurons*T*nb*nb*8 = 768 kB.
+        assert temp < 0.1 * n_neurons * T * nb * nb * 8
+
+    def test_block_smoother_backward_adds_no_full_size_temporaries(self) -> None:
+        T, n_neurons, nb = self.n_time, 3, 4
+        spec = jax.ShapeDtypeStruct
+        arg_specs = (
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((n_neurons, nb), jnp.float64),
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((T, nb), jnp.float64),
+            spec((T, n_neurons), jnp.float64),
+        )
+        options = {
+            "include_laplace_normalization": True,
+            "max_log_count": 20.0,
+            "max_newton_iter": 3,
+        }
+        forward_temp = self._temp_bytes(
+            lambda *args: _block_diagonal_forward_core(*args, 0.02, **options),
+            *arg_specs,
+        )
+        smoother_temp = self._temp_bytes(
+            lambda *args: _block_diagonal_smoother_core(*args, 0.02, **options),
+            *arg_specs,
+        )
+        # The smoother core runs the forward core, so its temporaries are
+        # the forward pass's plus the backward pass's. One copy of the
+        # per-neuron smoothed covariances is n_neurons*T*nb*nb*8 = 768 kB.
+        assert smoother_temp - forward_temp < 0.1 * n_neurons * T * nb * nb * 8
+
+
+class TestGradientMemory:
+    """Reverse mode through the filters keeps about one carry per time step.
+
+    ``fit_sgd`` differentiates the marginal log-likelihood through the
+    forward filters. Keeping every time step's Laplace-update residuals
+    (each Fisher iteration's Cholesky factors and solves) costs ~20
+    state-covariance-sized arrays per step -- gigabytes at a few thousand
+    bins. With each step rematerialized only the step's input carry (mean
+    and covariance) is kept. The per-step growth of the compiled gradient's
+    temporaries is measured between two sequence lengths, so fixed costs
+    cancel. Compile-only: nothing is executed.
+    """
+
+    n_times = (100, 300)
+
+    @staticmethod
+    def _per_step_bytes(make_loss, make_specs) -> float:
+        temps = []
+        for T in TestGradientMemory.n_times:
+            memory = (
+                jax.jit(jax.value_and_grad(make_loss()))
+                .lower(*make_specs(T))
+                .compile()
+                .memory_analysis()
+            )
+            if memory is None:
+                pytest.skip("backend reports no memory analysis")
+            temps.append(memory.temp_size_in_bytes)
+        n0, n1 = TestGradientMemory.n_times
+        return (temps[1] - temps[0]) / (n1 - n0)
+
+    def test_block_forward_core(self) -> None:
+        n_neurons, nb = 3, 8
+        spec = jax.ShapeDtypeStruct
+
+        def make_loss():
+            def loss(params, Z, spikes):
+                A, Q, m0, P0 = params
+                _, _, lls, _ = _block_diagonal_forward_core(
+                    A,
+                    Q,
+                    m0,
+                    P0,
+                    Z,
+                    spikes,
+                    0.02,
+                    include_laplace_normalization=True,
+                    max_log_count=20.0,
+                    max_newton_iter=3,
+                )
+                return jnp.sum(lls)
+
+            return loss
+
+        def make_specs(T):
+            return (
+                (
+                    spec((n_neurons, nb, nb), jnp.float64),
+                    spec((n_neurons, nb, nb), jnp.float64),
+                    spec((n_neurons, nb), jnp.float64),
+                    spec((n_neurons, nb, nb), jnp.float64),
+                ),
+                spec((T, nb), jnp.float64),
+                spec((T, n_neurons), jnp.float64),
+            )
+
+        per_step = self._per_step_bytes(make_loss, make_specs)
+        carry_bytes = n_neurons * (nb * nb + nb) * 8
+        # Guard: reverse mode must keep the carry, so the bound is not vacuous.
+        assert per_step >= 0.5 * carry_bytes
+        assert per_step < 3 * carry_bytes, (per_step, carry_bytes)
+
+    def test_dense_filter(self) -> None:
+        d, n_obs = 8, 3
+        spec = jax.ShapeDtypeStruct
+
+        def make_loss():
+            def loss(params, design, spikes):
+                A, Q, m0, P0 = params
+                _, _, marginal_ll = stochastic_point_process_filter(
+                    m0,
+                    P0,
+                    design,
+                    spikes,
+                    0.02,
+                    A,
+                    Q,
+                    log_conditional_intensity,
+                    validate_inputs=False,
+                    max_newton_iter=3,
+                )
+                return marginal_ll
+
+            return loss
+
+        def make_specs(T):
+            return (
+                (
+                    spec((d, d), jnp.float64),
+                    spec((d, d), jnp.float64),
+                    spec((d,), jnp.float64),
+                    spec((d, d), jnp.float64),
+                ),
+                spec((T, n_obs, d), jnp.float64),
+                spec((T, n_obs), jnp.float64),
+            )
+
+        per_step = self._per_step_bytes(make_loss, make_specs)
+        carry_bytes = (d * d + d) * 8
+        # Guard: reverse mode must keep the carry, so the bound is not vacuous.
+        assert per_step >= 0.5 * carry_bytes
+        assert per_step < 3 * carry_bytes, (per_step, carry_bytes)
+
+
+# ============================================================================
+# Reverse-mode gradients of the marginal log-likelihood (fit_sgd's loss)
+# ============================================================================
+
+
+def _symmetric_like(a: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    v = rng.normal(size=a.shape)
+    return 0.5 * (v + np.swapaxes(v, -1, -2))
+
+
+def _assert_reverse_mode_gradient_is_correct(loss, params, directions) -> None:
+    """``<grad loss, v>`` from reverse mode matches forward mode and FD.
+
+    Forward mode differentiates the filter step by step as it runs, so it is
+    an independent reference for the reverse-mode gradient ``fit_sgd`` uses
+    (to round-off); central finite differences additionally check that the
+    derivative is that of the loss (to truncation error).
+    """
+    loss_jit = jax.jit(loss)
+    grad = jax.jit(jax.grad(loss))(params)
+    jvp = jax.jit(lambda p, v: jax.jvp(loss, (p,), (v,))[1])
+    h = 1e-6
+    for v in directions:
+        forward = float(jvp(params, v))
+        reverse = float(
+            sum(
+                jnp.vdot(g, d)
+                for g, d in zip(jax.tree.leaves(grad), jax.tree.leaves(v))
+            )
+        )
+        shifted = [
+            float(loss_jit(jax.tree.map(lambda p, d, s=s: p + s * h * d, params, v)))
+            for s in (1.0, -1.0)
+        ]
+        finite_difference = (shifted[0] - shifted[1]) / (2 * h)
+        # Guard: the direction has a real slope, so agreement is informative.
+        assert abs(forward) > 1e-1
+        np.testing.assert_allclose(reverse, forward, rtol=1e-9)
+        np.testing.assert_allclose(reverse, finite_difference, rtol=1e-5)
+
+
+@pytest.mark.slow
+class TestMarginalLogLikelihoodGradient:
+    """Reverse-mode gradients through the forward filters match forward mode.
+
+    ``fit_sgd`` minimizes the negative marginal log-likelihood with
+    ``jax.grad`` through the block-diagonal forward core (PlaceFieldModel)
+    and the dense filter (PointProcessModel), including the Fisher-scoring
+    iterations and their line search.
+    """
+
+    @pytest.mark.parametrize("max_newton_iter", [1, 3])
+    def test_block_forward_core(self, max_newton_iter: int) -> None:
+        rng = np.random.default_rng(0)
+        T, n_neurons, nb, dt = 60, 3, 4, 0.1
+        Z = np.abs(rng.normal(size=(T, nb)))
+        init_means = rng.normal(0.5, 0.3, (n_neurons, nb))
+        spikes = rng.poisson(np.exp(Z @ init_means.T) * dt).astype(float)
+        params = (
+            np.tile(0.95 * np.eye(nb), (n_neurons, 1, 1)),
+            np.tile(1e-2 * np.eye(nb), (n_neurons, 1, 1)),
+            init_means,
+            np.tile(0.3 * np.eye(nb), (n_neurons, 1, 1)),
+        )
+
+        def loss(p):
+            A, Q, m0, P0 = p
+            _, _, lls, _ = _block_diagonal_forward_core(
+                A,
+                Q,
+                m0,
+                P0,
+                jnp.asarray(Z),
+                jnp.asarray(spikes),
+                dt,
+                include_laplace_normalization=True,
+                max_log_count=20.0,
+                max_newton_iter=max_newton_iter,
+            )
+            return jnp.sum(lls)
+
+        directions = [
+            (
+                rng.normal(size=params[0].shape),
+                _symmetric_like(params[1], rng),
+                rng.normal(size=params[2].shape),
+                _symmetric_like(params[3], rng),
+            )
+            for _ in range(3)
+        ]
+        _assert_reverse_mode_gradient_is_correct(
+            loss, jax.tree.map(jnp.asarray, params), directions
+        )
+
+    @pytest.mark.parametrize("max_newton_iter", [1, 3])
+    def test_dense_filter(self, max_newton_iter: int) -> None:
+        rng = np.random.default_rng(1)
+        T, d, n_obs, dt = 60, 4, 3, 0.1
+        design = rng.normal(0, 0.5, (T, n_obs, d))
+        init_mean = rng.normal(0.5, 0.3, d)
+        spikes = rng.poisson(np.exp(design @ init_mean) * dt).astype(float)
+        params = (0.95 * np.eye(d), 1e-2 * np.eye(d), init_mean, 0.3 * np.eye(d))
+
+        def loss(p):
+            A, Q, m0, P0 = p
+            _, _, marginal_ll = stochastic_point_process_filter(
+                m0,
+                P0,
+                jnp.asarray(design),
+                jnp.asarray(spikes),
+                dt,
+                A,
+                Q,
+                log_conditional_intensity,
+                validate_inputs=False,
+                max_newton_iter=max_newton_iter,
+            )
+            return marginal_ll
+
+        directions = [
+            (
+                rng.normal(size=params[0].shape),
+                _symmetric_like(params[1], rng),
+                rng.normal(size=params[2].shape),
+                _symmetric_like(params[3], rng),
+            )
+            for _ in range(3)
+        ]
+        _assert_reverse_mode_gradient_is_correct(
+            loss, jax.tree.map(jnp.asarray, params), directions
+        )
+
+
 # ============================================================================
 # Integration: PointProcessModel parameter + trajectory recovery
 # ============================================================================
@@ -5177,6 +5527,76 @@ class TestArmijoLineSearch:
             line_search_beta=0.5,
         )
         assert int(n_failed) == 0
+
+    @staticmethod
+    def _count_objective_evaluations(precision_scale: float) -> int:
+        """Run three jitted line-searched iterations and count (host side)
+        how many times the objective is evaluated."""
+        step, f = TestArmijoLineSearch._quadratic(precision_scale)
+        n_calls = []
+
+        def counted_f(x):
+            jax.debug.callback(lambda: n_calls.append(1))
+            return f(x)
+
+        run = jax.jit(
+            lambda x0: _fisher_scoring_line_search(
+                x0, jnp.eye(2), step, counted_f, max_newton_iter=3, line_search_beta=0.5
+            )
+        )
+        jax.block_until_ready(run(jnp.array([1.0, -2.0])))
+        jax.effects_barrier()
+        return len(n_calls)
+
+    def test_search_stops_at_the_first_accepted_step(self) -> None:
+        """An accepted full step costs one objective evaluation, not the
+        whole backtracking budget: 1 (initial point) + 1 per iteration."""
+        assert self._count_objective_evaluations(1.0) == 1 + 3
+
+    def test_backtracking_evaluates_only_until_acceptance(self) -> None:
+        """With a 2x curvature underestimate the full step fails Armijo and
+        the halved step is accepted (2 evaluations); the later iterations
+        start ~1e-4 from the minimum, where the round-off slack admits the
+        full step (1 evaluation each). A fixed-length search would evaluate
+        all 10 trial step sizes in every iteration."""
+        assert self._count_objective_evaluations(0.50005) == 1 + 2 + 1 + 1
+
+    def test_reverse_mode_gradient_through_backtracking(self) -> None:
+        """Reverse-mode AD runs through the early-exit search (fit_sgd
+        differentiates the filters) and matches central finite differences
+        on a problem whose full Fisher steps are backtracked, under jit and
+        vmap alike."""
+        cov = 100.0 * jnp.eye(2)
+        spikes = jnp.array([40.0, 0.0, 55.0])
+        design = jnp.array([[1.0, 0.5], [-0.3, 1.0], [0.8, -0.6]])
+
+        def posterior_summary(scale):
+            def log_rate(x):
+                return scale * (design @ x)
+
+            mean, post_cov, ll = _point_process_laplace_update(
+                jnp.zeros(2), cov, spikes, 0.1, log_rate, max_newton_iter=4
+            )
+            return jnp.sum(mean) + jnp.trace(post_cov) + 1e-3 * ll
+
+        # guard: this problem actually backtracks (a single trial step size
+        # changes the result)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(point_process_kalman, "_LINE_SEARCH_MAX_BACKTRACKS", 1)
+            one_trial = posterior_summary(1.0)
+        assert not np.isclose(float(one_trial), float(posterior_summary(1.0)))
+
+        grad = jax.jit(jax.grad(posterior_summary))
+        scales = jnp.array([0.9, 1.0, 1.1])
+        h = 1e-6
+        for scale in scales:
+            fd = (posterior_summary(scale + h) - posterior_summary(scale - h)) / (2 * h)
+            np.testing.assert_allclose(float(grad(scale)), float(fd), rtol=1e-5)
+        np.testing.assert_allclose(
+            np.asarray(jax.vmap(grad)(scales)),
+            np.asarray([grad(s) for s in scales]),
+            rtol=1e-12,
+        )
 
     def test_filter_logs_when_many_bins_fail(self, caplog) -> None:
         """A log-intensity whose derivative has the wrong sign makes every

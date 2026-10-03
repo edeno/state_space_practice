@@ -4,7 +4,8 @@ This module tests the switching point-process Kalman filter and smoother
 for spike-based observations with discrete state switching.
 """
 
-from collections.abc import Callable
+import contextlib
+from collections.abc import Callable, Iterator
 
 import jax
 import jax.numpy as jnp
@@ -17,6 +18,31 @@ from state_space_practice.switching_point_process import SpikeObsParams
 
 # Enable 64-bit precision for numerical stability
 jax.config.update("jax_enable_x64", True)
+
+
+# JAX lowers every newly traced computation to MLIR (even when a persistent
+# compilation cache then skips the backend compile), so counting lowerings
+# and backend compiles detects re-tracing.
+_COMPILE_EVENTS = (
+    "/jax/core/compile/jaxpr_to_mlir_module_duration",
+    "/jax/core/compile/backend_compile_duration",
+)
+
+
+@contextlib.contextmanager
+def _count_compiles() -> Iterator[Callable[[], int]]:
+    """Count JAX lowerings/compiles inside the block; yields a getter."""
+    count = 0
+
+    def listener(event: str, duration: float, **kwargs: object) -> None:
+        nonlocal count
+        count += event in _COMPILE_EVENTS
+
+    jax.monitoring.register_event_duration_secs_listener(listener)
+    try:
+        yield lambda: count
+    finally:
+        jax.monitoring.unregister_event_duration_listener(listener)
 
 
 def linear_log_intensity(state: Array, params: SpikeObsParams) -> Array:
@@ -635,6 +661,39 @@ class TestPointProcessUpdatePerStatePair:
 
 class TestSwitchingPointProcessFilter:
     """Tests for the switching_point_process_filter function (Task 2.5)."""
+
+    def test_gpb1_variant_matches_public_filter(self) -> None:
+        """The GPB1 E-step filter skips pair outputs but changes none it returns."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            _switching_point_process_filter_gpb1,
+            switching_point_process_filter,
+        )
+
+        n_time, n_latent, n_neurons, n_states = 40, 2, 4, 2
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 0.5, shape=(n_time, n_neurons)
+        ).astype(float)
+        args = (
+            jnp.zeros((n_latent, n_states)),
+            jnp.stack([jnp.eye(n_latent)] * n_states, axis=-1),
+            jnp.array([0.6, 0.4]),
+            spikes,
+            jnp.array([[0.9, 0.1], [0.2, 0.8]]),
+            jnp.stack([0.99 * jnp.eye(n_latent), 0.9 * jnp.eye(n_latent)], axis=-1),
+            jnp.stack([0.01 * jnp.eye(n_latent), 0.05 * jnp.eye(n_latent)], axis=-1),
+            0.02,
+            linear_log_intensity,
+            SpikeObsParams(
+                baseline=jnp.zeros(n_neurons),
+                weights=0.3
+                * jax.random.normal(jax.random.PRNGKey(1), (n_neurons, n_latent)),
+            ),
+        )
+        full = switching_point_process_filter(*args)
+        gpb1 = _switching_point_process_filter_gpb1(*args)
+        for name in gpb1._fields:
+            np.testing.assert_array_equal(getattr(gpb1, name), getattr(full, name))
 
     def test_output_shapes(self) -> None:
         """All outputs should have correct shapes (Task 2.5)."""
@@ -2599,6 +2658,39 @@ class TestUpdateSpikeGLMParams:
 
         assert new_params.baseline.shape == (n_neurons,)
         assert new_params.weights.shape == (n_neurons, n_latent)
+
+    def test_plug_in_repeat_call_does_not_recompile(self) -> None:
+        """A second plug-in M-step with the same shapes reuses the compiled scan."""
+        from state_space_practice.switching_point_process import (
+            SpikeObsParams,
+            update_spike_glm_params,
+        )
+
+        n_time, n_latent, n_neurons = 60, 2, 3
+        spikes = jax.random.poisson(
+            jax.random.PRNGKey(0), 1.0, shape=(n_time, n_neurons)
+        ).astype(float)
+        smoother_mean = 0.5 * jax.random.normal(
+            jax.random.PRNGKey(1), (n_time, n_latent)
+        )
+        params = SpikeObsParams(
+            baseline=jnp.zeros(n_neurons), weights=jnp.zeros((n_neurons, n_latent))
+        )
+        doubled_spikes = 2.0 * spikes
+
+        first = update_spike_glm_params(spikes, smoother_mean, params, 0.02)
+        with _count_compiles() as n_compiles:
+            second = update_spike_glm_params(
+                doubled_spikes, smoother_mean, params, 0.02
+            )
+            again = update_spike_glm_params(spikes, smoother_mean, params, 0.02)
+        assert n_compiles() == 0
+        np.testing.assert_array_equal(again.baseline, first.baseline)
+        np.testing.assert_array_equal(again.weights, first.weights)
+        # Doubling every count raises each fitted baseline by ~log 2.
+        np.testing.assert_allclose(
+            second.baseline - first.baseline, np.log(2.0), atol=1e-2
+        )
 
     def test_output_finite(self) -> None:
         """Updated params should be finite."""
@@ -9907,13 +9999,21 @@ class TestSwitchingSpikeOscillatorEMConsistency:
         model = self._small_model()
 
         captured = []
-        real_filter = spp.switching_point_process_filter
 
-        def spy(*args, **kwargs):
-            captured.append(kwargs["log_intensity_func"])
-            return real_filter(*args, **kwargs)
+        # The GPB1 E-step calls the filter variant without pair-conditional
+        # outputs, GPB2 the public filter; spy on both.
+        def make_spy(real_filter):
+            def spy(*args, **kwargs):
+                captured.append(kwargs["log_intensity_func"])
+                return real_filter(*args, **kwargs)
 
-        monkeypatch.setattr(spp, "switching_point_process_filter", spy)
+            return spy
+
+        for name in (
+            "switching_point_process_filter",
+            "_switching_point_process_filter_gpb1",
+        ):
+            monkeypatch.setattr(spp, name, make_spy(getattr(spp, name)))
         model.fit(spikes, max_iter=3, key=jax.random.PRNGKey(42))
 
         assert len(captured) >= 2, "expected filter calls across multiple E-steps"
@@ -10077,6 +10177,79 @@ def test_descent_step_falls_back_to_gradient_for_non_descent_direction() -> None
         loss_fn(params),
     )
     assert not bool(fell_back_inf)
+
+
+@pytest.mark.parametrize(
+    "variant", ["second_order", "second_order_no_prior", "mixture"]
+)
+def test_second_order_line_search_trial_loss_matches_direct_loss(
+    monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    """The O(T) polynomial-in-alpha trial loss equals loss_fn at each trial.
+
+    The second-order and mixture Newton steps evaluate the Armijo trials from
+    per-time terms expanded in the step size; a spy on the line search
+    compares them with the full loss at the trial parameters (off-diagonal
+    covariances and a nonzero baseline step exercise every term).
+    """
+    import state_space_practice.switching_point_process as spp
+
+    n_time, n_latent, n_states = 60, 3, 2
+    keys = jax.random.split(jax.random.PRNGKey(3), 5)
+    factors = 0.4 * jax.random.normal(keys[0], (n_time, n_latent, n_latent, n_states))
+    covs = (
+        jnp.einsum("tiks,tjks->tijs", factors, factors)
+        + 0.05 * jnp.eye(n_latent)[None, :, :, None]
+    )
+    means = jax.random.normal(keys[1], (n_time, n_latent, n_states))
+    spikes = jax.random.poisson(keys[2], 2.0, (n_time,)).astype(float)
+    weights = 0.3 * jax.random.normal(keys[3], (n_latent,))
+    state_weights = jax.nn.softmax(jax.random.normal(keys[4], (n_time, n_states)))
+
+    real_line_search = spp._armijo_line_search
+    n_checked = []
+
+    def spy(params, delta, gradient, loss_fn, current_loss, **kwargs):
+        loss_along = kwargs["loss_along"]
+        assert loss_along is not None
+        for alpha in (1.0, 0.5, 0.0625, 1e-3):
+            np.testing.assert_allclose(
+                loss_along(jnp.asarray(alpha)),
+                loss_fn(params - alpha * delta),
+                rtol=1e-12,
+            )
+        n_checked.append(1)
+        return real_line_search(
+            params, delta, gradient, loss_fn, current_loss, **kwargs
+        )
+
+    monkeypatch.setattr(spp, "_armijo_line_search", spy)
+    common = dict(weight_l2=0.3, baseline_prior_l2=0.7)
+    if variant == "mixture":
+        spp._single_neuron_glm_step_second_order_mixture(
+            jnp.array(0.5),
+            weights,
+            spikes,
+            means,
+            covs,
+            state_weights,
+            0.05,
+            baseline_prior=jnp.array(1.0),
+            **common,
+        )
+    else:
+        spp._single_neuron_glm_step_second_order(
+            jnp.array(0.5),
+            weights,
+            spikes,
+            means[..., 0],
+            covs[..., 0],
+            0.05,
+            time_weights=state_weights[:, 0],
+            baseline_prior=None if variant.endswith("no_prior") else jnp.array(1.0),
+            **common,
+        )
+    assert n_checked == [1]
 
 
 def test_spike_glm_update_warns_on_newton_fallback(monkeypatch) -> None:

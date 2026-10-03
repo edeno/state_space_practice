@@ -29,6 +29,7 @@ from state_space_practice.kalman import (
     _gain_solve,
     _kalman_filter_update,
     _kalman_smoother_update,
+    _scan_with_boundary,
     kalman_measurement_update,
 )
 from state_space_practice.utils import (
@@ -70,6 +71,21 @@ class SwitchingFilterResult(NamedTuple):
     marginal_log_likelihood: jax.Array
 
 
+class SwitchingFilterGPB1Result(NamedTuple):
+    """The switching filter outputs the GPB1 smoother uses.
+
+    :class:`SwitchingFilterResult` without the pair-conditional trajectories,
+    which only the GPB2 smoother consumes. Returned by the internal filter
+    variants that GPB1 E-steps call so those ``(n_time, ..., K, K)`` arrays
+    are never materialized.
+    """
+
+    state_cond_filter_mean: jax.Array
+    state_cond_filter_cov: jax.Array
+    filter_discrete_state_prob: jax.Array
+    marginal_log_likelihood: jax.Array
+
+
 class SwitchingSmootherResult(NamedTuple):
     """Output of :func:`switching_kalman_smoother` (GPB1)."""
 
@@ -78,6 +94,22 @@ class SwitchingSmootherResult(NamedTuple):
     smoother_discrete_state_prob: jax.Array
     smoother_joint_discrete_state_prob: jax.Array
     overall_smoother_cross_cov: jax.Array
+    state_cond_smoother_means: jax.Array
+    state_cond_smoother_covs: jax.Array
+    pair_cond_smoother_cross_covs: jax.Array
+    pair_cond_smoother_means: jax.Array
+
+
+class SwitchingSmootherEMStats(NamedTuple):
+    """The GPB1 smoother outputs the EM M-step uses.
+
+    :class:`SwitchingSmootherResult` without the overall (collapsed over the
+    discrete state) mean, covariance and cross-covariance, which the switching
+    E-steps discard.
+    """
+
+    smoother_discrete_state_prob: jax.Array
+    smoother_joint_discrete_state_prob: jax.Array
     state_cond_smoother_means: jax.Array
     state_cond_smoother_covs: jax.Array
     pair_cond_smoother_cross_covs: jax.Array
@@ -934,6 +966,83 @@ def switching_kalman_filter(
         Marginal log likelihood of the observations (scalar array)
 
     """
+    filtered, pair_cond = _switching_kalman_filter_core(
+        init_state_cond_mean,
+        init_state_cond_cov,
+        init_discrete_state_prob,
+        obs,
+        discrete_transition_matrix,
+        continuous_transition_matrix,
+        process_cov,
+        measurement_matrix,
+        measurement_cov,
+        return_pair_cond=True,
+    )
+    assert pair_cond is not None  # requested above
+    return SwitchingFilterResult(
+        state_cond_filter_mean=filtered.state_cond_filter_mean,
+        state_cond_filter_cov=filtered.state_cond_filter_cov,
+        filter_discrete_state_prob=filtered.filter_discrete_state_prob,
+        pair_cond_filter_mean=pair_cond[0],
+        pair_cond_filter_cov=pair_cond[1],
+        pair_cond_filter_prob=pair_cond[2],
+        marginal_log_likelihood=filtered.marginal_log_likelihood,
+    )
+
+
+@typed_jit
+def _switching_kalman_filter_gpb1(
+    init_state_cond_mean: ArrayLike,
+    init_state_cond_cov: ArrayLike,
+    init_discrete_state_prob: ArrayLike,
+    obs: ArrayLike,
+    discrete_transition_matrix: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    measurement_matrix: ArrayLike,
+    measurement_cov: ArrayLike,
+) -> SwitchingFilterGPB1Result:
+    """:func:`switching_kalman_filter` without the pair-conditional outputs.
+
+    For GPB1 E-steps, which never read the ``(n_time, ..., K, K)``
+    pair-conditional trajectories; skipping them saves most of the filter's
+    output memory. The returned fields are identical to the matching fields
+    of :func:`switching_kalman_filter`.
+    """
+    filtered, _ = _switching_kalman_filter_core(
+        init_state_cond_mean,
+        init_state_cond_cov,
+        init_discrete_state_prob,
+        obs,
+        discrete_transition_matrix,
+        continuous_transition_matrix,
+        process_cov,
+        measurement_matrix,
+        measurement_cov,
+        return_pair_cond=False,
+    )
+    return filtered
+
+
+def _switching_kalman_filter_core(
+    init_state_cond_mean: ArrayLike,
+    init_state_cond_cov: ArrayLike,
+    init_discrete_state_prob: ArrayLike,
+    obs: ArrayLike,
+    discrete_transition_matrix: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    measurement_matrix: ArrayLike,
+    measurement_cov: ArrayLike,
+    return_pair_cond: bool,
+) -> tuple[SwitchingFilterGPB1Result, tuple[jax.Array, jax.Array, jax.Array] | None]:
+    """Traced switching Kalman filter shared by the jitted entry points.
+
+    Returns the state-conditional outputs and, when ``return_pair_cond``
+    (a Python bool, fixed at trace time) is True, the pair-conditional
+    ``(mean, cov, prob)`` trajectories; otherwise None, and the scan never
+    emits them. See :func:`switching_kalman_filter` for shapes.
+    """
     init_state_cond_mean = jnp.asarray(init_state_cond_mean)
     init_state_cond_cov = jnp.asarray(init_state_cond_cov)
     init_discrete_state_prob = jnp.asarray(init_discrete_state_prob)
@@ -949,14 +1058,7 @@ def switching_kalman_filter(
         obs_t: jax.Array,
     ) -> tuple[
         tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],  # Next carry
-        tuple[
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-        ],  # Stacked output
+        tuple[tuple[jax.Array, ...], tuple[()]],  # Stacked output
     ]:
         """One step of the switching Kalman filter.
 
@@ -992,8 +1094,9 @@ def switching_kalman_filter(
                 Posterior state covariance.
             filter_discrete_prob : jax.Array, shape (n_discrete_states,)
                 Posterior discrete state probabilities
-            pair_cond_filter_mean : jax.Array, shape (n_cont_states, n_discrete_states, n_discrete_states)
-                Conditional means of the continuous latent state
+            pair_cond_filter_mean, pair_cond_filter_cov, pair_cond_filter_prob
+                Pair-conditional mean, covariance and probability (only
+                when ``return_pair_cond``).
         """
         (
             prev_state_cond_filter_mean,
@@ -1048,20 +1151,24 @@ def switching_kalman_filter(
             )
         )
 
+        outputs: tuple[jax.Array, ...] = (
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_prob,
+        )
+        if return_pair_cond:
+            outputs += (
+                pair_cond_filter_mean,
+                pair_cond_filter_cov,
+                pair_cond_filter_prob,
+            )
         return (
             state_cond_filter_mean,
             state_cond_filter_cov,
             filter_discrete_prob,
             marginal_log_likelihood,
             next_support,
-        ), (
-            state_cond_filter_mean,
-            state_cond_filter_cov,
-            filter_discrete_prob,
-            pair_cond_filter_mean,
-            pair_cond_filter_cov,
-            pair_cond_filter_prob,
-        )
+        ), (outputs, ())
 
     # Handle first timestep with x₁ convention: measurement update only (no dynamics)
     # init_state_cond_mean represents p(x₁ | S₁), the prior for the first observation
@@ -1084,8 +1191,8 @@ def switching_kalman_filter(
 
     # Run predict-then-update for t=2,...,T
     # jax.lax.scan handles empty inputs (obs[1:] when n_time=1) gracefully.
-    # The scan now emits the full pair-conditional filter trajectory as stacked
-    # outputs (the GPB2 smoother needs every timestep, not just the last).
+    # With return_pair_cond the scan also emits the full pair-conditional filter
+    # trajectory (the GPB2 smoother needs every timestep, not just the last).
     # Structural support S_1 from the *sanitized* prior (the same normalization
     # _first_timestep_discrete_update applies before forming the posterior), not
     # the raw prior. Otherwise a non-finite prior entry (e.g. +inf) that the
@@ -1095,17 +1202,23 @@ def switching_kalman_filter(
     # transition per step, so an underflowed reachable state is not mistaken for
     # a structurally impossible one.
     first_support = _normalize_initial_discrete_prob(init_discrete_state_prob) > 0.0
-    (
-        (_, _, _, marginal_log_likelihood, _),
-        (
-            rest_state_cond_filter_mean,
-            rest_state_cond_filter_cov,
-            rest_filter_discrete_state_prob,
-            rest_pair_cond_filter_mean,
-            rest_pair_cond_filter_cov,
-            rest_pair_cond_filter_prob,
-        ),
-    ) = jax.lax.scan(
+    first_outputs: tuple[jax.Array, ...] = (
+        first_state_cond_mean,
+        first_state_cond_cov,
+        first_discrete_prob,
+    )
+    if return_pair_cond:
+        # Full pair-conditional filter trajectories, E[x_t | S_{t-1}=i, S_t=j,
+        # y_{1:t}], its covariance and the pair probability. The first
+        # timestep uses the x_1 convention (broadcast over the nonexistent
+        # S_0). Only the GPB2 smoother consumes these (the whole trajectory).
+        first_outputs += (
+            first_pair_cond_mean,
+            first_pair_cond_cov,
+            first_pair_cond_prob,
+        )
+    # The first timestep's outputs fill index 0 of the stacked outputs.
+    (_, _, _, marginal_log_likelihood, _), outputs, _ = _scan_with_boundary(
         _step,
         (
             first_state_cond_mean,
@@ -1114,42 +1227,20 @@ def switching_kalman_filter(
             first_log_lik,
             first_support,
         ),
-        obs[1:],
+        obs,
+        1,
+        obs.shape[0] - 1,
+        first_outputs,
     )
-
-    # Prepend first timestep results
-    state_cond_filter_mean = jnp.concatenate(
-        [first_state_cond_mean[None, ...], rest_state_cond_filter_mean], axis=0
-    )
-    state_cond_filter_cov = jnp.concatenate(
-        [first_state_cond_cov[None, ...], rest_state_cond_filter_cov], axis=0
-    )
-    filter_discrete_state_prob = jnp.concatenate(
-        [first_discrete_prob[None, ...], rest_filter_discrete_state_prob], axis=0
-    )
-    # Full pair-conditional filter trajectories, E[x_t | S_{t-1}=i, S_t=j, y_{1:t}]
-    # and its covariance. The first timestep uses the x_1 convention (broadcast
-    # over the nonexistent S_0). Only the GPB2 smoother consumes these (the
-    # whole trajectory); the GPB1 smoother does not use them.
-    pair_cond_filter_mean = jnp.concatenate(
-        [first_pair_cond_mean[None, ...], rest_pair_cond_filter_mean], axis=0
-    )
-    pair_cond_filter_cov = jnp.concatenate(
-        [first_pair_cond_cov[None, ...], rest_pair_cond_filter_cov], axis=0
-    )
-    pair_cond_filter_prob = jnp.concatenate(
-        [first_pair_cond_prob[None, ...], rest_pair_cond_filter_prob], axis=0
-    )
-
-    return SwitchingFilterResult(
-        state_cond_filter_mean=state_cond_filter_mean,
-        state_cond_filter_cov=state_cond_filter_cov,
-        filter_discrete_state_prob=filter_discrete_state_prob,
-        pair_cond_filter_mean=pair_cond_filter_mean,
-        pair_cond_filter_cov=pair_cond_filter_cov,
-        pair_cond_filter_prob=pair_cond_filter_prob,
+    filtered = SwitchingFilterGPB1Result(
+        state_cond_filter_mean=outputs[0],
+        state_cond_filter_cov=outputs[1],
+        filter_discrete_state_prob=outputs[2],
         marginal_log_likelihood=marginal_log_likelihood,
     )
+    if not return_pair_cond:
+        return filtered, None
+    return filtered, (outputs[3], outputs[4], outputs[5])
 
 
 def switching_kalman_viterbi(
@@ -1177,18 +1268,7 @@ def switching_kalman_viterbi(
     states : jax.Array, shape (n_time,)
         Most likely discrete state sequence (integer-valued).
     """
-    init_state_cond_mean = jnp.asarray(init_state_cond_mean)
-    init_state_cond_cov = jnp.asarray(init_state_cond_cov)
-    init_discrete_state_prob = jnp.asarray(init_discrete_state_prob)
-    obs = jnp.asarray(obs)
-    discrete_transition_matrix = jnp.asarray(discrete_transition_matrix)
-    continuous_transition_matrix = jnp.asarray(continuous_transition_matrix)
-    process_cov = jnp.asarray(process_cov)
-    measurement_matrix = jnp.asarray(measurement_matrix)
-    measurement_cov = jnp.asarray(measurement_cov)
-    n_discrete_states = init_state_cond_mean.shape[-1]
-
-    # Viterbi is not JIT-decorated, so reject a malformed prior loudly here
+    # Reject a malformed prior loudly here (eagerly, before the jitted core)
     # rather than returning an arbitrary path from a NaN/degenerate posterior.
     _init_prob = jnp.asarray(init_discrete_state_prob)
     if not (
@@ -1200,6 +1280,33 @@ def switching_kalman_viterbi(
             "and sum to a positive value (it defines the initial support); got "
             f"{jnp.asarray(_init_prob)}."
         )
+    return _switching_kalman_viterbi_impl(
+        jnp.asarray(init_state_cond_mean),
+        jnp.asarray(init_state_cond_cov),
+        _init_prob,
+        jnp.asarray(obs),
+        jnp.asarray(discrete_transition_matrix),
+        jnp.asarray(continuous_transition_matrix),
+        jnp.asarray(process_cov),
+        jnp.asarray(measurement_matrix),
+        jnp.asarray(measurement_cov),
+    )
+
+
+@typed_jit
+def _switching_kalman_viterbi_impl(
+    init_state_cond_mean: jax.Array,
+    init_state_cond_cov: jax.Array,
+    init_discrete_state_prob: jax.Array,
+    obs: jax.Array,
+    discrete_transition_matrix: jax.Array,
+    continuous_transition_matrix: jax.Array,
+    process_cov: jax.Array,
+    measurement_matrix: jax.Array,
+    measurement_cov: jax.Array,
+) -> jax.Array:
+    """Jitted core of :func:`switching_kalman_viterbi` on a validated prior."""
+    n_discrete_states = init_state_cond_mean.shape[-1]
 
     # --- First timestep: measurement update only (x₁ convention) -----------
     (
@@ -1513,6 +1620,72 @@ def switching_kalman_smoother(
     pair_cond_smoother_means : jax.Array, shape (n_time - 1, n_cont_states, n_discrete_states, n_discrete_states)
         E[X_t | y_{1:T}, S_t=j, S_{t+1}=k] - needed for correct M-step beta computation.
     """
+    stats, overall = _switching_kalman_smoother_core(
+        filter_mean,
+        filter_cov,
+        filter_discrete_state_prob,
+        process_cov,
+        continuous_transition_matrix,
+        discrete_state_transition_matrix,
+        return_overall=True,
+    )
+    assert overall is not None  # requested above
+    return SwitchingSmootherResult(
+        overall_smoother_mean=overall[0],
+        overall_smoother_cov=overall[1],
+        smoother_discrete_state_prob=stats.smoother_discrete_state_prob,
+        smoother_joint_discrete_state_prob=stats.smoother_joint_discrete_state_prob,
+        overall_smoother_cross_cov=overall[2],
+        state_cond_smoother_means=stats.state_cond_smoother_means,
+        state_cond_smoother_covs=stats.state_cond_smoother_covs,
+        pair_cond_smoother_cross_covs=stats.pair_cond_smoother_cross_covs,
+        pair_cond_smoother_means=stats.pair_cond_smoother_means,
+    )
+
+
+@typed_jit
+def _switching_kalman_smoother_em_stats(
+    filter_mean: ArrayLike,
+    filter_cov: ArrayLike,
+    filter_discrete_state_prob: ArrayLike,
+    process_cov: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+    discrete_state_transition_matrix: ArrayLike,
+) -> SwitchingSmootherEMStats:
+    """:func:`switching_kalman_smoother` without the overall (collapsed) outputs.
+
+    For GPB1 E-steps, which keep only the state- and pair-conditional
+    statistics the M-step uses. The returned fields are identical to the
+    matching fields of :func:`switching_kalman_smoother`.
+    """
+    stats, _ = _switching_kalman_smoother_core(
+        filter_mean,
+        filter_cov,
+        filter_discrete_state_prob,
+        process_cov,
+        continuous_transition_matrix,
+        discrete_state_transition_matrix,
+        return_overall=False,
+    )
+    return stats
+
+
+def _switching_kalman_smoother_core(
+    filter_mean: ArrayLike,
+    filter_cov: ArrayLike,
+    filter_discrete_state_prob: ArrayLike,
+    process_cov: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+    discrete_state_transition_matrix: ArrayLike,
+    return_overall: bool,
+) -> tuple[SwitchingSmootherEMStats, tuple[jax.Array, jax.Array, jax.Array] | None]:
+    """Traced GPB1 smoother shared by the jitted entry points.
+
+    Returns the EM statistics and, when ``return_overall`` (a Python bool,
+    fixed at trace time) is True, the overall ``(mean, cov, cross_cov)``
+    collapsed over the discrete state; otherwise None, and the backward scan
+    never computes them. See :func:`switching_kalman_smoother` for shapes.
+    """
     filter_mean = jnp.asarray(filter_mean)
     filter_cov = jnp.asarray(filter_cov)
     filter_discrete_state_prob = jnp.asarray(filter_discrete_state_prob)
@@ -1525,17 +1698,7 @@ def switching_kalman_smoother(
         args: tuple[jax.Array, jax.Array, jax.Array],
     ) -> tuple[
         tuple[jax.Array, jax.Array, jax.Array],
-        tuple[
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-        ],
+        tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]],
     ]:
         """
 
@@ -1638,45 +1801,49 @@ def switching_kalman_smoother(
             smoother_forward_cond_prob,  # Pr(S_{t+1} = k | S{t} = j, y_{1:T}), shape (n_discrete_states, n_discrete_states), W^{k | j}_t
         )
 
-        # 4. Collapse to single mean and covariance (n_states -> 1)
-        (
-            overall_smoother_mean,  # E[X_t | y_{1:T}], shape (n_cont_states,), x_{t|T}
-            overall_smoother_covs,  # Cov[X_t | y_{1:T}], shape (n_cont_states, n_cont_states)
-        ) = collapse_gaussian_mixture(
-            state_cond_smoother_means,  # E[X_t | y_{1:T}, S_{t}=j], shape (n_cont_states, n_discrete_states)
-            state_cond_smoother_covs,  # Cov[X_t | y_{1:T}, S_{t}=j], shape (n_cont_states, n_cont_states, n_discrete_states)
-            smoother_discrete_state_prob,  # Pr(S_t = j | y_{1:T}), shape (n_discrete_states,),  M_{t | T}(j)
-        )
+        # 4-5 (only with return_overall): collapse to the overall Gaussian.
+        if return_overall:
+            # 4. Collapse to single mean and covariance (n_states -> 1)
+            (
+                overall_smoother_mean,  # E[X_t | y_{1:T}], shape (n_cont_states,), x_{t|T}
+                overall_smoother_covs,  # Cov[X_t | y_{1:T}], shape (n_cont_states, n_cont_states)
+            ) = collapse_gaussian_mixture(
+                state_cond_smoother_means,  # E[X_t | y_{1:T}, S_{t}=j], shape (n_cont_states, n_discrete_states)
+                state_cond_smoother_covs,  # Cov[X_t | y_{1:T}, S_{t}=j], shape (n_cont_states, n_cont_states, n_discrete_states)
+                smoother_discrete_state_prob,  # Pr(S_t = j | y_{1:T}), shape (n_discrete_states,),  M_{t | T}(j)
+            )
 
-        # 5. Collapse lag-one cross covariance. _kalman_smoother_update returns
-        # Cov(x_t, x_{t+1}), so keep x_t as the first argument throughout the
-        # mixture collapses.
-        next_pair_cond_smoother_mean = jnp.broadcast_to(
-            next_state_cond_smoother_mean[:, None, :],
-            pair_cond_smoother_mean.shape,
-        )
+            # 5. Collapse lag-one cross covariance. _kalman_smoother_update returns
+            # Cov(x_t, x_{t+1}), so keep x_t as the first argument throughout the
+            # mixture collapses.
+            next_pair_cond_smoother_mean = jnp.broadcast_to(
+                next_state_cond_smoother_mean[:, None, :],
+                pair_cond_smoother_mean.shape,
+            )
 
-        (
-            smoother_mean_t_cond_Stplus1,  # E[X_t | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t | T}
-            state_cond_smoother_mean_tplus1,  # E[X_{t+1} | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t+1 | T}
-            state_cond_smoother_cross_cov,  # Cov(X_t, X_{t+1} | y_{1:T}, S_{t+1}=k), shape (n_cont_states, n_cont_states, n_discrete_states), V^k_{t, t+1 | T}:
-        ) = collapse_cross_gaussian_mixture_across_states(
-            pair_cond_smoother_mean,  # E[X_t | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_discrete_states, n_discrete_states), x^{(j)k}_{t | T}
-            # GPB1 approximation: E[X_{t+1} | y, S_{t+1}=k],
-            # broadcast over S_t=j.
-            next_pair_cond_smoother_mean,
-            pair_cond_smoother_cross_covs,  # Cov(X_t, X_{t+1} | y_{1:T}, S_t=j, S_{t+1}=k), shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states), V^{j(k)}_{t,t+1 | T}
-            smoother_backward_cond_prob,  # Pr(S_t=j | S_{t+1}=k, y_{1:T}), shape (n_discrete_states, n_discrete_states), U^{j | k}_t
-        )
+            (
+                smoother_mean_t_cond_Stplus1,  # E[X_t | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t | T}
+                state_cond_smoother_mean_tplus1,  # E[X_{t+1} | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t+1 | T}
+                state_cond_smoother_cross_cov,  # Cov(X_t, X_{t+1} | y_{1:T}, S_{t+1}=k), shape (n_cont_states, n_cont_states, n_discrete_states), V^k_{t, t+1 | T}:
+            ) = collapse_cross_gaussian_mixture_across_states(
+                pair_cond_smoother_mean,  # E[X_t | y_{1:T}, S_t=j, S_{t+1}=k], shape (n_cont_states, n_discrete_states, n_discrete_states), x^{(j)k}_{t | T}
+                # GPB1 approximation: E[X_{t+1} | y, S_{t+1}=k],
+                # broadcast over S_t=j.
+                next_pair_cond_smoother_mean,
+                pair_cond_smoother_cross_covs,  # Cov(X_t, X_{t+1} | y_{1:T}, S_t=j, S_{t+1}=k), shape (n_cont_states, n_cont_states, n_discrete_states, n_discrete_states), V^{j(k)}_{t,t+1 | T}
+                smoother_backward_cond_prob,  # Pr(S_t=j | S_{t+1}=k, y_{1:T}), shape (n_discrete_states, n_discrete_states), U^{j | k}_t
+            )
 
-        # Cross collapse to a single Gaussian
-        # overall_smoother_cross_cov, shape (n_cont_states, n_cont_states)
-        _, _, overall_smoother_cross_cov = collapse_gaussian_mixture_cross_covariance(
-            smoother_mean_t_cond_Stplus1,  # E[X_t | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t | T}
-            state_cond_smoother_mean_tplus1,  # E[X_{t+1} | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t+1 | T}
-            state_cond_smoother_cross_cov,  # V^k_{t, t+1 | T}: state-conditional smoother cross covariance
-            next_smoother_discrete_prob,  # Pr(S_{t+1} = k | y_{1:T}), M_{t+1 | T}(k)
-        )
+            # Cross collapse to a single Gaussian
+            # overall_smoother_cross_cov, shape (n_cont_states, n_cont_states)
+            _, _, overall_smoother_cross_cov = (
+                collapse_gaussian_mixture_cross_covariance(
+                    smoother_mean_t_cond_Stplus1,  # E[X_t | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t | T}
+                    state_cond_smoother_mean_tplus1,  # E[X_{t+1} | y_{1:T}, S_{t+1}=k], shape (n_cont_states, n_discrete_states), x^{()k}_{t+1 | T}
+                    state_cond_smoother_cross_cov,  # V^k_{t, t+1 | T}: state-conditional smoother cross covariance
+                    next_smoother_discrete_prob,  # Pr(S_{t+1} = k | y_{1:T}), M_{t+1 | T}(k)
+                )
+            )
 
         # Stabilize smoother_discrete_state_prob in the carry only,
         # so it is consistent when used as next_smoother_discrete_prob
@@ -1688,21 +1855,26 @@ def switching_kalman_smoother(
             smoother_discrete_state_prob
         )
 
+        # Per-time outputs (n_time entries; the terminal one is the filter)
+        # and per-transition outputs (n_time - 1 entries).
+        per_time: tuple[jax.Array, ...] = (
+            smoother_discrete_state_prob,
+            state_cond_smoother_means,
+            state_cond_smoother_covs,
+        )
+        per_transition: tuple[jax.Array, ...] = (
+            joint_smoother_discrete_prob,
+            pair_cond_smoother_cross_covs,
+            pair_cond_smoother_mean,  # E[X_t | y_{1:T}, S_t=j, S_{t+1}=k]
+        )
+        if return_overall:
+            per_time += (overall_smoother_mean, overall_smoother_covs)
+            per_transition += (overall_smoother_cross_cov,)
         return (
             state_cond_smoother_means,
             state_cond_smoother_covs,
             stabilized_smoother_prob,
-        ), (
-            overall_smoother_mean,
-            overall_smoother_covs,
-            smoother_discrete_state_prob,
-            joint_smoother_discrete_prob,
-            overall_smoother_cross_cov,
-            state_cond_smoother_means,
-            state_cond_smoother_covs,
-            pair_cond_smoother_cross_covs,
-            pair_cond_smoother_mean,  # E[X_t | y_{1:T}, S_t=j, S_{t+1}=k]
-        )
+        ), (per_time, per_transition)
 
     init_carry = (
         filter_mean[-1],  # shape (n_cont_states, n_discrete_states)
@@ -1710,64 +1882,41 @@ def switching_kalman_smoother(
         filter_discrete_state_prob[-1],  # shape (n_discrete_states,)
     )
 
-    (
-        _,
-        (
-            overall_smoother_mean,
-            overall_smoother_covs,
-            smoother_discrete_state_prob,
-            smoother_joint_discrete_state_prob,
-            overall_smoother_cross_cov,
-            state_cond_smoother_means,
-            state_cond_smoother_covs,
-            pair_cond_smoother_cross_covs,
-            pair_cond_smoother_means,
-        ),
-    ) = jax.lax.scan(
+    # Terminal step (appended to the per-time outputs): smoother == filter.
+    # Guard the terminal mean, since the per-step _guard_smoother_mean does not
+    # cover it: a finite-but-unrepresentable terminal mean must fail loud like
+    # the interior, not pass straight through.
+    last_filter_mean = _guard_smoother_mean(filter_mean[-1], "GPB1")
+    terminal: tuple[jax.Array, ...] = (
+        filter_discrete_state_prob[-1],
+        last_filter_mean,
+        filter_cov[-1],
+    )
+    if return_overall:
+        terminal += collapse_gaussian_mixture(
+            last_filter_mean, filter_cov[-1], filter_discrete_state_prob[-1]
+        )
+
+    _, per_time, per_transition = _scan_with_boundary(
         _step,
         init_carry,
-        (
-            filter_mean[:-1],
-            filter_cov[:-1],
-            filter_discrete_state_prob[:-1],
-        ),
+        (filter_mean, filter_cov, filter_discrete_state_prob),
+        (0, 0, 0),
+        filter_mean.shape[0] - 1,
+        terminal,
         reverse=True,
     )
-
-    # Guard the terminal mean (appended outside the scan, so the per-step
-    # _guard_smoother_mean does not cover it): a finite-but-unrepresentable
-    # terminal mean must fail loud like the interior, not pass straight through.
-    last_filter_mean = _guard_smoother_mean(filter_mean[-1], "GPB1")
-    last_smoother_mean, last_smoother_cov = collapse_gaussian_mixture(
-        last_filter_mean, filter_cov[-1], filter_discrete_state_prob[-1]
+    stats = SwitchingSmootherEMStats(
+        smoother_discrete_state_prob=per_time[0],
+        smoother_joint_discrete_state_prob=per_transition[0],
+        state_cond_smoother_means=per_time[1],
+        state_cond_smoother_covs=per_time[2],
+        pair_cond_smoother_cross_covs=per_transition[1],
+        pair_cond_smoother_means=per_transition[2],
     )
-    overall_smoother_mean = jnp.concatenate(
-        [overall_smoother_mean, last_smoother_mean[None]], axis=0
-    )
-    overall_smoother_covs = jnp.concatenate(
-        [overall_smoother_covs, last_smoother_cov[None]], axis=0
-    )
-    smoother_discrete_state_prob = jnp.concatenate(
-        [smoother_discrete_state_prob, filter_discrete_state_prob[-1][None]], axis=0
-    )
-    state_cond_smoother_means = jnp.concatenate(
-        [state_cond_smoother_means, last_filter_mean[None]], axis=0
-    )
-    state_cond_smoother_covs = jnp.concatenate(
-        [state_cond_smoother_covs, filter_cov[-1][None]], axis=0
-    )
-
-    return SwitchingSmootherResult(
-        overall_smoother_mean=overall_smoother_mean,
-        overall_smoother_cov=overall_smoother_covs,
-        smoother_discrete_state_prob=smoother_discrete_state_prob,
-        smoother_joint_discrete_state_prob=smoother_joint_discrete_state_prob,
-        overall_smoother_cross_cov=overall_smoother_cross_cov,
-        state_cond_smoother_means=state_cond_smoother_means,
-        state_cond_smoother_covs=state_cond_smoother_covs,
-        pair_cond_smoother_cross_covs=pair_cond_smoother_cross_covs,
-        pair_cond_smoother_means=pair_cond_smoother_means,
-    )
+    if not return_overall:
+        return stats, None
+    return stats, (per_time[3], per_time[4], per_transition[3])
 
 
 @typed_jit
@@ -1850,19 +1999,7 @@ def switching_kalman_smoother_gpb2(
         args: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
     ) -> tuple[
         tuple[jax.Array, jax.Array, jax.Array],
-        tuple[
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-            jax.Array,
-        ],
+        tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]],
     ]:
         (
             next_pair_cond_smoother_mean,  # E[x_{t+1} | S_t=j, S_{t+1}=k], (L, Sj, Sk)
@@ -2047,23 +2184,28 @@ def switching_kalman_smoother_gpb2(
             pair_smoother_prob_prev.reshape(-1)
         ).reshape(pair_smoother_prob_prev.shape)
 
-        return (
-            carry_pair_cond_mean,  # E[x_t | S_{t-1}=i, S_t=j] — next carry
-            carry_pair_cond_cov,
-            stabilized_pair_smoother_prob,
-        ), (
+        # Per-time outputs (n_time entries; the terminal one is the filter)
+        # and per-transition outputs (n_time - 1 entries).
+        per_time = (
             overall_smoother_mean,
             overall_smoother_covs,
             smoother_discrete_state_prob,
-            joint_smoother_discrete_prob,
-            overall_smoother_cross_cov,
             state_cond_smoother_means,
             state_cond_smoother_covs,
+        )
+        per_transition = (
+            joint_smoother_discrete_prob,
+            overall_smoother_cross_cov,
             pair_cond_smoother_cross_covs,
             mstep_pair_cond_means,  # E[x_t | S_t=j, S_{t+1}=k]
             mstep_pair_cond_covs,  # Cov[x_t | S_t=j, S_{t+1}=k]
             mstep_next_pair_cond_means,  # E[x_{t+1} | S_t=j, S_{t+1}=k]
         )
+        return (
+            carry_pair_cond_mean,  # E[x_t | S_{t-1}=i, S_t=j] — next carry
+            carry_pair_cond_cov,
+            stabilized_pair_smoother_prob,
+        ), (per_time, per_transition)
 
     # Initialize carry from the last timestep, where smoother == filter (no
     # future data). The pair-conditional filter at T-1 is exactly
@@ -2074,56 +2216,51 @@ def switching_kalman_smoother_gpb2(
         pair_cond_filter_prob[-1],
     )
 
-    (
-        _,
-        (
-            overall_smoother_mean,
-            overall_smoother_covs,
-            smoother_discrete_state_prob,
-            smoother_joint_discrete_state_prob,
-            overall_smoother_cross_cov,
-            state_cond_smoother_means,
-            state_cond_smoother_covs,
-            pair_cond_smoother_cross_covs,
-            pair_cond_smoother_means,
-            pair_cond_smoother_covs_mstep,
-            next_pair_cond_smoother_means,
-        ),
-    ) = jax.lax.scan(
-        _step,
-        init_carry,
-        (
-            pair_cond_filter_mean[:-1],
-            pair_cond_filter_cov[:-1],
-            filter_discrete_state_prob[:-1],
-            pair_cond_filter_prob[:-1],
-        ),
-        reverse=True,
-    )
-
-    # Append last timestep (same as GPB1). Guard the terminal mean too, since
-    # the per-step _guard_smoother_mean does not cover this appended value.
+    # Terminal step (same as GPB1): smoother == filter. Guard the terminal mean
+    # too, since the per-step _guard_smoother_mean does not cover it.
     last_filter_mean = _guard_smoother_mean(filter_mean[-1], "GPB2")
     last_overall_mean, last_overall_cov = collapse_gaussian_mixture(
         last_filter_mean,
         filter_cov[-1],
         filter_discrete_state_prob[-1],
     )
-    overall_smoother_mean = jnp.concatenate(
-        [overall_smoother_mean, last_overall_mean[None]], axis=0
+    terminal = (
+        last_overall_mean,
+        last_overall_cov,
+        filter_discrete_state_prob[-1],
+        last_filter_mean,
+        filter_cov[-1],
     )
-    overall_smoother_covs = jnp.concatenate(
-        [overall_smoother_covs, last_overall_cov[None]], axis=0
+
+    _, per_time, per_transition = _scan_with_boundary(
+        _step,
+        init_carry,
+        (
+            pair_cond_filter_mean,
+            pair_cond_filter_cov,
+            filter_discrete_state_prob,
+            pair_cond_filter_prob,
+        ),
+        (0, 0, 0, 0),
+        filter_mean.shape[0] - 1,
+        terminal,
+        reverse=True,
     )
-    smoother_discrete_state_prob = jnp.concatenate(
-        [smoother_discrete_state_prob, filter_discrete_state_prob[-1][None]], axis=0
-    )
-    state_cond_smoother_means = jnp.concatenate(
-        [state_cond_smoother_means, last_filter_mean[None]], axis=0
-    )
-    state_cond_smoother_covs = jnp.concatenate(
-        [state_cond_smoother_covs, filter_cov[-1][None]], axis=0
-    )
+    (
+        overall_smoother_mean,
+        overall_smoother_covs,
+        smoother_discrete_state_prob,
+        state_cond_smoother_means,
+        state_cond_smoother_covs,
+    ) = per_time
+    (
+        smoother_joint_discrete_state_prob,
+        overall_smoother_cross_cov,
+        pair_cond_smoother_cross_covs,
+        pair_cond_smoother_means,
+        pair_cond_smoother_covs_mstep,
+        next_pair_cond_smoother_means,
+    ) = per_transition
 
     return SwitchingSmootherGPB2Result(
         overall_smoother_mean=overall_smoother_mean,

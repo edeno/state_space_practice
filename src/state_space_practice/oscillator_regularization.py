@@ -198,18 +198,29 @@ def edge_l1_penalty(
     return jnp.sum(jnp.sqrt(c**2 + eps_arr) - jnp.sqrt(eps_arr))
 
 
-def _build_area_pair_masks(area_labels: Array, n_areas: int) -> Array:
-    """Build boolean masks for all area pairs.
+def _area_block_sum_sq(coupling: Array, area_labels: Array, n_areas: int) -> Array:
+    """Sum of squared coupling within every area-pair block, per state.
+
+    With the one-hot assignment ``M[a, i] = (area_labels[i] == a)`` this is
+    ``M @ coupling**2 @ M.T`` -- ``O(n_areas * n_osc)`` extra memory, not the
+    ``(n_areas, n_areas, n_osc, n_osc)`` pair masks of a direct einsum.
+
+    Parameters
+    ----------
+    coupling : Array, shape (n_states, n_osc, n_osc)
+    area_labels : Array, shape (n_osc,)
+    n_areas : int
+        Static number of area rows; labels ``>= n_areas`` are dropped.
 
     Returns
     -------
-    Array, shape (n_areas, n_areas, n_osc, n_osc)
-        masks[a, b, i, j] is True iff area_labels[i]==a and area_labels[j]==b.
+    Array, shape (n_states, n_areas, n_areas)
+        ``out[s, a, b] = sum over i in area a, j in area b of coupling[s, i, j]**2``.
     """
-    areas = jnp.arange(n_areas)
-    mask_rows = area_labels[None, :] == areas[:, None]  # (n_areas, n_osc)
-    # (n_areas, 1, n_osc, 1) * (1, n_areas, 1, n_osc) -> (n_areas, n_areas, n_osc, n_osc)
-    return mask_rows[:, None, :, None] * mask_rows[None, :, None, :]
+    assignment = (area_labels[None, :] == jnp.arange(n_areas)[:, None]).astype(
+        coupling.dtype
+    )  # (n_areas, n_osc)
+    return assignment @ coupling**2 @ assignment.T
 
 
 def area_group_penalty(
@@ -236,15 +247,14 @@ def area_group_penalty(
     """
     c = _mask_diagonal(_as_coupling(coupling), exclude_diagonal)
     labels = _area_labels_for_penalty(area_labels, n_osc=c.shape[-1])
-    # Use n_osc as a static upper bound so this scalar penalty remains
-    # jit-compatible when area_labels is a dynamic JAX argument. Valid labels
-    # are still checked host-side when values are available; unused area rows
-    # contribute exactly zero because the smooth norm is zero-centered.
-    n_areas = c.shape[-1]
-    masks = _build_area_pair_masks(labels, n_areas)
     eps_arr = _validate_eps(eps).astype(c.dtype)
-    # (n_states, n_areas, n_areas): sum c^2 within each area block per state
-    block_sq = jnp.einsum("sij,abij->sab", c**2, masks.astype(c.dtype))
+    # (n_states, n_areas, n_areas): sum c^2 within each area block per state.
+    # Use n_osc as a static upper bound on n_areas so this scalar penalty
+    # remains jit-compatible when area_labels is a dynamic JAX argument. Valid
+    # labels are still checked host-side when values are available; unused
+    # area rows contribute exactly zero because the smooth norm is
+    # zero-centered.
+    block_sq = _area_block_sum_sq(c, labels, n_areas=c.shape[-1])
     return jnp.sum(jnp.sqrt(block_sq + eps_arr) - jnp.sqrt(eps_arr))
 
 
@@ -273,11 +283,10 @@ def state_shared_area_penalty(
     """
     c = _mask_diagonal(_as_coupling(coupling), exclude_diagonal)
     labels = _area_labels_for_penalty(area_labels, n_osc=c.shape[-1])
-    n_areas = c.shape[-1]
-    masks = _build_area_pair_masks(labels, n_areas)
     eps_arr = _validate_eps(eps).astype(c.dtype)
-    # Sum c^2 within each area block per state: (n_states, n_areas, n_areas)
-    block_sq = jnp.einsum("sij,abij->sab", c**2, masks.astype(c.dtype))
+    # Sum c^2 within each area block per state: (n_states, n_areas, n_areas),
+    # with n_osc as the static upper bound on n_areas (see area_group_penalty).
+    block_sq = _area_block_sum_sq(c, labels, n_areas=c.shape[-1])
     # Sum across states, then sqrt for group penalty
     return jnp.sum(jnp.sqrt(jnp.sum(block_sq, axis=0) + eps_arr) - jnp.sqrt(eps_arr))
 
@@ -312,10 +321,8 @@ def get_area_coupling_summary(
     labels = _validate_area_labels(area_labels, n_osc=c.shape[-1])
     n_areas = int(np.asarray(labels).max()) + 1
 
-    masks = _build_area_pair_masks(labels, n_areas)
     # (n_states, n_areas, n_areas)
-    block_sq = jnp.einsum("sij,abij->sab", c**2, masks.astype(c.dtype))
-    block_norms = jnp.sqrt(block_sq)
+    block_norms = jnp.sqrt(_area_block_sum_sq(c, labels, n_areas))
 
     within_mask = jnp.eye(n_areas, dtype=bool)
     within_area_norm = jnp.sum(block_norms * within_mask[None, :, :], axis=(-2, -1))

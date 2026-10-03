@@ -19,6 +19,14 @@ from state_space_practice.oscillator_models import (
 from state_space_practice.oscillator_utils import (
     construct_common_oscillator_transition_matrix,
 )
+from state_space_practice.simulate.scenarios import (
+    simulate_cnm_scenario,
+    simulate_dim_scenario,
+)
+from state_space_practice.tests.model_state import (
+    assert_snapshots_equal,
+    snapshot_model_state,
+)
 
 # Enable 64-bit precision for numerical stability
 jax.config.update("jax_enable_x64", True)
@@ -3831,3 +3839,118 @@ def test_em_restore_unsets_outputs_missing_from_snapshot(make_model):
 
     assert not hasattr(model, "smoother_discrete_state_prob")
     np.testing.assert_array_equal(model.init_mean, snapshot.values["init_mean"])
+
+
+# ============================================================================
+# Refitting restarts from the constructor's initial parameters
+# ============================================================================
+
+_REFIT_KEY = jax.random.key(0)
+# Constructor parameters that seed initialization; fitting overwrites some.
+_REFIT_INIT_ATTRS = (
+    "freqs",
+    "damping_coef",
+    "process_variance",
+    "phase_difference",
+    "coupling_strength",
+)
+
+
+def _refit_case(kind: str):
+    """A model factory and observations from the ``kind`` scenario."""
+    simulate = simulate_cnm_scenario if kind == "CNM" else simulate_dim_scenario
+    scenario = simulate(n_time=100, seed=42)
+    p = scenario["params"]
+    cls = CorrelatedNoiseModel if kind == "CNM" else DirectedInfluenceModel
+    kwargs = {"use_reparameterized_mstep": True} if kind == "DIM-reparam" else {}
+
+    def make():
+        return cls(
+            n_oscillators=p["n_oscillators"],
+            n_discrete_states=p["n_discrete_states"],
+            sampling_freq=p["sampling_freq"],
+            freqs=p["freqs"],
+            damping_coef=p["damping"],
+            process_variance=p["process_variance"],
+            measurement_variance=p["measurement_variance"],
+            phase_difference=p["phase_difference"],
+            coupling_strength=p["coupling_strength"],
+            **kwargs,
+        )
+
+    return make, jnp.asarray(scenario["obs"])
+
+
+def _run_fitter(model, method: str, observations, **kwargs) -> list[float]:
+    if method == "fit":
+        return model.fit(observations, key=_REFIT_KEY, max_iter=3, **kwargs)
+    return model.fit_sgd(observations, key=_REFIT_KEY, num_steps=5, **kwargs)
+
+
+def _init_params(model) -> dict:
+    return {name: np.asarray(getattr(model, name)) for name in _REFIT_INIT_ATTRS}
+
+
+def _assert_same_fit(refit_model, fresh_model) -> None:
+    """Every attribute of the fresh fit is bit-identical on the refit model.
+
+    Bookkeeping an earlier ``fit_sgd`` leaves behind (the SGD sequence length,
+    which ``fit`` does not use) is not compared.
+    """
+    fresh = snapshot_model_state(fresh_model)
+    refit = snapshot_model_state(refit_model)
+    keys = [k for k in fresh if k != "_sgd_n_time"]
+    assert_snapshots_equal({k: refit[k] for k in keys}, {k: fresh[k] for k in keys})
+
+
+@pytest.mark.slow
+class TestRefitRestartsFromConstructorParameters:
+    """``fit`` / ``fit_sgd`` start from the constructor's parameters every call.
+
+    Fitting overwrites public parameters that seed initialization (CNM: noise
+    variance, coupling and phase; DIM: frequency, damping, coupling and
+    phase), so a repeat fit must not read them back: it reproduces a fresh
+    model. ``skip_init=True`` is the explicit warm start.
+    """
+
+    @pytest.mark.parametrize("kind", ["CNM", "DIM", "DIM-reparam"])
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            ("fit", "fit"),
+            ("fit_sgd", "fit_sgd"),
+            ("fit", "fit_sgd"),
+            ("fit_sgd", "fit"),
+        ],
+    )
+    def test_repeat_fit_reproduces_fresh_model(self, kind, first, second) -> None:
+        make, observations = _refit_case(kind)
+        fresh = make()
+        fresh_history = _run_fitter(fresh, second, observations)
+
+        model = make()
+        constructed = _init_params(model)
+        _run_fitter(model, first, observations)
+        # Guard: the first fit moved parameters that seed initialization.
+        fitted = _init_params(model)
+        assert any(not np.array_equal(constructed[k], fitted[k]) for k in fitted)
+
+        history = _run_fitter(model, second, observations)
+
+        assert history == fresh_history
+        _assert_same_fit(model, fresh)
+
+    @pytest.mark.parametrize("kind", ["CNM", "DIM", "DIM-reparam"])
+    @pytest.mark.parametrize("method", ["fit", "fit_sgd"])
+    def test_skip_init_continues_from_fitted_parameters(self, kind, method) -> None:
+        make, observations = _refit_case(kind)
+        model = make()
+        fresh_history = _run_fitter(model, method, observations)
+        ll_at_fitted = float(model._e_step(observations))
+
+        history = _run_fitter(model, method, observations, skip_init=True)
+
+        # The resumed fit starts at the fitted parameters (initialization was
+        # not rerun), not where a fresh fit starts.
+        np.testing.assert_allclose(history[0], ll_at_fitted, rtol=1e-8)
+        assert history[0] != fresh_history[0]

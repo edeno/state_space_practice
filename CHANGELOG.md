@@ -97,6 +97,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `construct_common_oscillator_transition_matrix_stack`,
   `construct_correlated_noise_process_covariance_stack` and
   `extract_correlated_noise_params_from_covariance_stack`.
+- **`seed=` on `simulate_eden_brown_2004_jump` /
+  `simulate_eden_brown_2004_linear`** for a reproducible spike realization
+  without building a generator. The default (`rng=None, seed=None`) is
+  unchanged and nondeterministic; passing both `rng` and `seed` raises
+  `ValueError`.
 
 ### Testing
 
@@ -157,17 +162,221 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **Refitting an oscillator model restarts from the constructor's
+  parameters**: `fit` (and the Gaussian models' `fit_sgd`) on
+  `CorrelatedNoiseModel`, `DirectedInfluenceModel`,
+  `CorrelatedNoisePointProcessModel` and `DirectedInfluencePointProcessModel`
+  rebuilt the initial transition matrix / process covariance from the public
+  `freqs`, `damping_coef`, `process_variance`, `phase_difference` and
+  `coupling_strength`, which the previous fit had overwritten with its
+  estimates (and DIM / DIM-PP kept the reparameterized M-step's warm-start
+  cache), so a second call silently warm-started and its log-likelihoods
+  depended on call history (20 nats apart within 4 EM iterations on a
+  200-sample DIM scenario). The
+  constructor values are now recorded and reinstated at initialization (the
+  oscillator models, Gaussian and point-process, share
+  `ConstructorParametersMixin`), so a repeat fit with the same data and key
+  is bit-identical to a fresh model's. Warm-starting from the current fit is
+  explicit: `skip_init=True`. Setting a public parameter such as
+  `model.freqs` after construction no longer changes where a non-`skip_init`
+  fit starts. A first fit on a fresh model is bit-identical to before. The
+  point-process models' `fit_sgd` is unchanged: it initializes only a model
+  that has no parameters yet and otherwise continues from the current ones.
+- **Point-process filter gradients keep one carry per time step**: the
+  per-time-step function of the dense filter (`PointProcessModel.fit_sgd`)
+  and of the block-diagonal forward core (`PlaceFieldModel.fit_sgd`) is
+  rematerialized under reverse-mode AD (`jax.checkpoint`), so the gradient
+  of the marginal log-likelihood keeps only each step's input mean and
+  covariance instead of every Fisher iteration's Cholesky factors and solves
+  (~20 covariance-sized arrays per step). Compiled temp of the gradient at
+  T=5000: block-diagonal, 10 neurons x 20 basis functions, 3.07 GB -> 169 MB;
+  dense, d=20, 10 neurons, 393 MB -> 17 MB. Step time: dense -19%
+  (0.377 -> 0.304 s), block-diagonal +13% (1.61-1.66 -> 1.84-1.88 s; the
+  backward pass recomputes each step once). End to end, 20 `fit_sgd` steps
+  at T=5000: `PlaceFieldModel` (10 neurons x 25 basis functions) peak RSS
+  5.4 GB -> 1.5 GB, wall time unchanged within noise (~115 s);
+  `PointProcessModel` (d=20) 950 MB -> 560 MB, 12-16 s -> 9-12 s. Forward
+  outputs are bit-identical; gradients agree to round-off (relative
+  difference <= 3e-11), and the fitted parameters after 20 Adam steps to
+  1e-9 relative.
+- **DIM / DIM-PP standard-EM projection is compiled**:
+  `project_transition_matrix_stack` projects every state's oscillator blocks
+  in one jit-compiled call (only the `eigvals` spectral clamp stays on the
+  host), and the generalized-EM check of the projected transition matrix
+  computes the transition sufficient statistics once and scores the new and
+  previous matrices in one compiled call (it ran eagerly, twice). The
+  projection step of `DirectedInfluenceModel` and
+  `DirectedInfluencePointProcessModel` drops from 17-27 ms to 1.5-3 ms per EM
+  iteration (30-66% of an iteration at T=200, 16-29% at T=2000). Outputs and
+  log-likelihood sequences are bit-identical.
+- **Point-process smoothers write their backward-pass outputs in place**:
+  the dense smoother now reuses `kalman.rts_backward_scan` (its private copy
+  is removed) and the block-diagonal backward pass carries its output
+  buffers, so no full-size temporary copies are made (T=5000, d=50: backward
+  temp 102 MB -> 0.2 MB; block-diagonal smoother core 504 MB -> 160 MB).
+  Outputs and gradients are bit-identical.
+- **Block-diagonal point-process forward pass writes its outputs in place**:
+  one time scan runs every neuron's step (vmapped inside it) and writes the
+  filtered moments into per-neuron buffers, instead of a vmap of per-neuron
+  scans whose stacked outputs were transposed to the per-neuron layout (a
+  full-size copy). Compiled temp at T=5000, 10 neurons, 20 basis functions:
+  forward and smoother cores 160 MB -> 0.2 MB. Outputs and gradients are
+  bit-identical; runtime is unchanged.
+- **Typed PRNG keys internally**: default and seed-derived keys use
+  `jax.random.key` (JAX's recommended typed keys) instead of the legacy
+  `jax.random.PRNGKey`, which JAX plans to deprecate. Both encode the same
+  stream, so results are unchanged, and every `key=` argument still accepts
+  either kind. `HamiltonianModelBase.key` is now a typed key.
+- **`DirectedInfluencePointProcessModel.fit_sgd(connectivity_penalty=...)`
+  penalizes the effective coupling**: the stability-scaled coupling that
+  enters the transition matrix, as `DirectedInfluenceModel` already did; it
+  penalized the raw `coupling_strength` before. Penalized DIM-PP SGD fits
+  change whenever the stability scale is active (< 1).
+- **Smith trial-to-trial comparisons are exact**
+  (`compute_trial_comparison_matrix`, `compare_two_trials` and the
+  `SmithLearningModel` methods `get_trial_comparison_matrix`,
+  `compare_trials`, `find_first_significant_improvement`,
+  `plot_trial_comparison_matrix`): ``P(x_i > x_j | y_{1:T}) =
+  Phi((m_i - m_j) / sd(x_i - x_j))`` under the joint smoothed posterior,
+  replacing the 10k-sample Monte Carlo estimate. The matrix built an
+  ``(n_samples, T, T)`` comparison array: peak RSS 1.0 GB at T = 100 and
+  14 GB at T = 400, now ~10 MB above baseline at both (and 0.1 s instead of
+  0.9-4.9 s for the first call). Values move by Monte Carlo noise only (at
+  most 0.017 vs the old estimate at T = 30-50, |z| <= 3.6 over ~2000
+  entries) and no longer depend on a PRNG key (the now-dead `key`,
+  `n_samples`, `compare_probability` and `prob_correct_by_chance` arguments
+  are removed; see Removed).
+- **Smith learning-curve summaries and the criterion trial are exact**
+  (`calculate_probability_confidence_limits`,
+  `calculate_latent_state_percentiles` and the `SmithLearningModel` methods
+  `get_learning_curve`, `get_latent_state_percentiles`,
+  `find_criterion_trial`, `plot_learning_curve`, `plot_summary`, `summary`):
+  percentiles are the Gaussian quantiles ``m_k + s_k z_q`` (through the
+  sigmoid for the probability curve; quantiles commute with the increasing
+  link) and ``P(p_k > p_chance) = Phi(m_k / s_k)``, replacing 10k-sample
+  Monte Carlo estimates. `find_criterion_trial` thresholded the noisy
+  estimate, so on 7 of 20 simulated 60-trial sessions the criterion trial
+  changed (by one trial) with the PRNG key; it is now deterministic. Values
+  move by Monte Carlo noise only (at most 0.017 in probability, 0.036 in
+  the latent state over 10 keys on a fitted session); percentiles 0 and 100
+  are now the exact limits. The now-dead `key` and `n_samples` arguments are
+  removed (see Removed).
 - **`covariate_choice_smoother` uses `kalman.rts_backward_scan_with_predictions`**
   (jitted; about 10x faster per call -- the previous un-jitted RTS pass
   re-traced on every EM iteration). Its gain solve is the shared, retrying one, so smoothed values
   and fitted parameters can move at round-off level (~1e-9 relative after 200
   EM iterations).
+- **`kalman.parallel_kalman_smoother`, `switching_kalman.switching_kalman_viterbi`
+  and the plug-in branch of `switching_point_process.update_spike_glm_params`
+  run a jitted core** (input validation stays eager). Previously they ran op
+  by op: the parallel smoother compiled ~490 programs on its first call at a
+  new shape (5-7 s at T=20k; now ~1 s) and ran 52 ms vs 36 ms per call after;
+  Viterbi re-traced its scans on every call (3 compiles, ~240 ms vs 8 ms at
+  T=2000, K=2); the plug-in GLM M-step re-traced its scan on every call
+  (~190 ms vs 52 ms at T=5000, 10 neurons). Viterbi paths and the GLM M-step
+  are bit-identical; the parallel smoother can differ from the op-by-op
+  version at round-off level (XLA fuses the jitted graph; max 4e-16 absolute
+  at T=500).
+- **GPB1 E-steps no longer materialize outputs they discard**: the switching
+  oscillator models (`oscillator_models`) and the switching point-process
+  models (`SwitchingSpikeOscillatorModel` and the COM/CNM/DIM point-process
+  models) with `smoother_type="gpb1"` (the default) now run filter/smoother
+  variants that skip the pair-conditional filter trajectories (only GPB2 reads
+  them) and the overall collapsed smoother moments. At T=20k, 8 latent dims,
+  3 states the Gaussian filter's compiled output drops from 134 to 33 MB
+  (temporaries 103 to 30 MB), the E-step's peak RSS growth from 448 to 302 MB
+  (Gaussian) and 393 to 178 MB (point process), and E-step time by 25-30%.
+  E-step outputs are bit-identical; the public `switching_kalman_filter`,
+  `switching_kalman_smoother` and `switching_point_process_filter` are
+  unchanged.
+- **Filters and smoothers no longer copy their stacked outputs or inputs**:
+  `kalman.rts_backward_scan`, `rts_backward_scan_with_predictions`, the
+  switching Kalman filter, both switching smoothers (GPB1/GPB2) and the
+  switching point-process filter handled one time step outside their scan
+  and joined it with `jnp.concatenate` (a full copy of every stacked output),
+  and scanned over sliced inputs (`x[1:]`, `x[:-1]`, another copy). They now
+  write into loop-carried output buffers and index the inputs in the loop
+  (`kalman._scan_with_boundary`). Compiled temporaries drop to ~0: e.g.
+  `rts_backward_scan` 110 MB -> 0 at T=200k, d=8;
+  `rts_backward_scan_with_predictions` 220 MB -> 0; at T=20k, 8 latent dims,
+  3 states the switching filter 103 MB -> 0, GPB2 smoother 131 MB -> 0.
+  Outputs are bit-identical; runtime and gradient memory are unchanged.
+- **Faster second-order and mixture spike-GLM M-steps**: each Armijo trial
+  of the Newton line search recomputed the `O(T L^2)` (mixture:
+  `O(T L^2 S)`) quadratic forms `w' P_t w`; the trial loss is now evaluated
+  from per-time terms expanded as polynomials in the step size, computed once
+  per direction, so each trial costs `O(T)` (`O(T S)`). At T=20k, 8 latent
+  dims, 30 neurons: second-order M-step 437 -> 382 ms, mixture 1746 ->
+  1163 ms. Trial losses change only by floating-point reassociation (they
+  match the direct loss to 1e-12 relative), so an Armijo decision can flip
+  only at round-off level: fitted EM log-likelihoods of DIM-PP, COM-PP and
+  `SwitchingSpikeOscillatorModel` move by at most 6e-9 relative over 8-10
+  iterations.
 - **The choice models skip the duplicate final E-step after convergence**
   (`MultinomialChoiceModel`, `CovariateChoiceModel`, `SwitchingChoiceModel`).
-- **`PlaceFieldModel.predict_rate_map` uses an optimized einsum** (large
-  speedups at moderate grid sizes).
+- **`PlaceFieldModel` posterior rate maps are computed by a jitted JAX
+  kernel** in bounded-memory, fixed-size time chunks (`predict_rate_map`,
+  `predict_center`, `drift_summary`, and
+  `PlaceFieldRateMaps.from_place_field_model`). NumPy's einsum fell back to a
+  naive contraction path at realistic grid sizes: one 50x50-grid map over
+  2000 time bins with 49 basis functions took ~25 s and now takes ~0.2 s.
+  Results agree to ~2e-15 relative.
+- **The point-process Fisher-scoring line search stops at the first accepted
+  step size** (a `lax.while_loop`) instead of always evaluating all 10 trial
+  step sizes, so an accepted full step costs one objective evaluation instead
+  of ten. Results and reverse-mode gradients are bit-identical; on typical
+  data the dense `stochastic_point_process_filter` and the switching
+  point-process filter run about 40% faster and the block-diagonal path
+  10-25% faster.
+- **The Laplace updates reuse the last Fisher step's posterior-precision
+  Cholesky factor** (`_point_process_laplace_update`, `glm_laplace_update`)
+  instead of factoring the same matrix again after the line search.
+  Bit-identical results; roughly another 10-20% off the dense and
+  block-diagonal filters and their gradients.
 - **Eager `utils.debug_print_if` calls no longer compile a `jit(cond)` each
   time.**
+- **The DIM / DIM-PP standard-EM projection helpers are jitted**:
+  `oscillator_utils.extract_dim_params_from_matrix(_stack)`,
+  `construct_stable_directed_influence_transition_stack` and
+  `compute_directed_influence_stability_scale` compile once per shape
+  (`n_oscillators` static; `sampling_freq` / `max_spectral_radius` traced) and
+  the rebuild evaluates the host spectral-radius callback once instead of
+  twice. Per call they drop from 3-9 ms eager to 0.04-0.17 ms, cutting the
+  M-step projection from ~33 ms to ~15 ms per EM iteration independent of T.
+  XLA fusion moves outputs at round-off (~1e-15 relative per call; ~1e-9
+  relative in DIM-PP parameters after 12 EM iterations).
+- **The CNM / CNM-PP parameter sync is vectorized and jitted**:
+  `oscillator_utils.extract_correlated_noise_params_from_covariance(_stack)`
+  reduces all oscillator blocks in one pass instead of an O(n_osc²) Python
+  loop of `.at[].set` updates (3 / 22 / 91 ms -> 0.01 / 0.02 / 0.06 ms per
+  call at n_osc = 2 / 6 / 12; CNM standard-EM iterations at n_osc = 12 go from
+  ~180-250 ms to ~40-50 ms). Variance and phase are bit-identical; coupling
+  strength moves by at most 1 ulp, which the CNM-PP Laplace-EKF carries to
+  ~1e-9 relative in fitted parameters after 8 EM iterations.
+- **Area connectivity penalties no longer build `(n_osc)⁴` masks**:
+  `oscillator_regularization.area_group_penalty`,
+  `state_shared_area_penalty` and `get_area_coupling_summary` sum squared
+  coupling per area pair as `M @ c**2 @ M.T` with a one-hot area assignment
+  `M`. At n_osc = 100 the jitted value-and-gradient scratch memory drops from
+  1.6 GB to 0.24 MB (81 ms -> ~2 ms); values and gradients match the previous
+  implementation to <= 7e-16 relative.
+- **`TemporalRateGP.fit_sgd` / `infer_log_rate` gradients use the implicit
+  derivative at the converged mode** -- one exact (unfloored) Newton step
+  there, which stays correct when the `min_weight` Fisher-weight floor binds
+  -- instead of differentiating all `n_iter` iterations, so gradient memory
+  no longer grows with `n_iter`: at the default 25 iterations the compiled `value_and_grad`
+  temporaries drop from 184 MB to 13 MB at 10^4 bins and from 1.8 GB to
+  129 MB at 10^5 bins, and a gradient evaluation is ~3x faster. Forward
+  results are bit-identical; gradients match the unrolled ones to ~1e-14
+  relative once the iteration has converged, so SGD trajectories move at
+  round-off level.
+- **`temporal_rate_gp.infer_log_rate` / `infer_log_rate_batch` are jitted**
+  (input validation stays eager): every call used to re-compile its Newton
+  scan, so a repeat call with same-shaped inputs, including new
+  hyperparameter values, now compiles nothing (~3.5x faster per call at 2000
+  bins: 0.42 -> 0.12 s single, 0.52 -> 0.17 s for 3 trains). The fused
+  program moves results at round-off level (log-rates ~1e-15, evidence
+  ~1e-15 relative), which also reaches `TemporalRateGP`'s fitted posterior.
 - **Reading a fitted attribute before fitting raises `NotFittedError`**
   instead of returning `None` (or a bare `AttributeError`). Fitted outputs of
   every model (smoothed/filtered states, posteriors, log likelihoods,
@@ -418,9 +627,79 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`simulate.simulate_switching_kalman.simulate_challenging_states`**: unused.
 - **`point_process_kalman.smoothed_initial_transition_moments`**: an alias of
   `kalman.smooth_initial_state_with_cross_cov`; call that instead.
+- **Smith learning model Monte Carlo arguments** (the posterior summaries are
+  exact, so these no longer had any effect): `key` and `n_samples` from
+  `calculate_probability_confidence_limits`,
+  `calculate_latent_state_percentiles`, `compute_trial_comparison_matrix`,
+  `compare_two_trials` and the `SmithLearningModel` methods
+  `get_learning_curve`, `get_latent_state_percentiles`,
+  `find_criterion_trial`, `plot_learning_curve`, `plot_summary`,
+  `compare_trials`, `get_trial_comparison_matrix`,
+  `find_first_significant_improvement`, `plot_trial_comparison_matrix`; and
+  `compare_probability` (from all six trial-comparison functions/methods:
+  `compute_trial_comparison_matrix`, `compare_two_trials`, `compare_trials`,
+  `get_trial_comparison_matrix`, `find_first_significant_improvement`,
+  `plot_trial_comparison_matrix`) and `prob_correct_by_chance` (from
+  `compute_trial_comparison_matrix`, `compare_two_trials`), which could not
+  change a comparison because the sigmoid link is strictly increasing. Drop them from calls; `key` was the
+  leading positional argument, so positional calls shift by one (e.g.
+  `model.find_criterion_trial(key)` -> `model.find_criterion_trial()`,
+  `compare_two_trials(key, mode, var, gain, i, j)` ->
+  `compare_two_trials(mode, var, gain, i, j)`). Results are unchanged
+  (bit-identical).
+- **`SmithLearningModel.summary(key=...)`**: replaced by
+  `include_criterion: bool = True`. The criterion trial is now reported by
+  default (it used to need a PRNG key), and the null-model comparison appears
+  whenever `n_correct_responses` is given (it used to also need `key`).
+  `summary(key=k)` -> `summary()`; `summary()` (no criterion) ->
+  `summary(include_criterion=False)`.
 
 ### Fixed
 
+- **Hamiltonian `fit_sgd` gradient memory no longer scales with the MLP
+  size**: the EKF predict steps inside the Hamiltonian filter and smoother
+  scans (`run_ekf_filter` / `run_ekf_smoother` and the switching
+  predict-and-collapse step) run under `jax.checkpoint`, so reverse mode
+  recomputes the leapfrog Jacobian instead of storing the MLP's
+  second-derivative residuals at every time step. For `hidden_dims=[32, 32]`,
+  peak memory of a 20,000-step `SwitchingHamiltonianJointModel.fit_sgd`
+  (3 states) drops from ~10 GB to ~1.1 GB, and `HamiltonianLFPModel.fit_sgd`
+  from ~1.7 GB to ~0.7 GB (5.6 GB to 0.8 GB at 100,000 steps), with no
+  slowdown. Filter and smoother outputs are bit-identical; gradients agree
+  to round-off.
+- **`SmithLearningModel.fit_sgd` compiled its SGD step twice per call**: the
+  `init_learning_state` parameter was a weakly typed scalar
+  (`jnp.array(python_float)`) that the first optimizer update made strong,
+  forcing a retrace. The parameters are now built with an explicit dtype,
+  so the step is traced once (first `fit_sgd` on 100 trials 2.4-2.5 s ->
+  1.5-1.6 s); fitted values are bit-identical.
+- **Smith filter log posterior no longer saturates to `-inf`**: the
+  per-trial objective used `binom.logpmf(p=sigmoid(mu + x))`, which is
+  `-inf` with NaN gradient and Hessian once `sigmoid` rounds to 1 on a trial
+  with an error (`mu + x >~ 37`) or to 0 on a trial with a success. It now
+  uses the `log_sigmoid` form shared with `smith_laplace_log_likelihood`
+  (mathematically identical). In the normal range values change by at most
+  1.5e-11 relative (the old form's rounding of `1 - sigmoid` near
+  `|mu + x| = 16`; the new form is within 4e-16 of an exact reference);
+  filter outputs and EM fits move by <= 1.4e-14.
+- **`PositionDecoder` KDE log-rates stay correct far from the encoding
+  grid**: the KDE kernel is normalized in log space (softmax). Beyond ~12
+  bandwidths from every grid bin the linear normalization (`+ 1e-30`) collapsed
+  the weights to 0, so the rate fell back to the baseline and the gradient
+  with respect to position vanished. Values in the normal range are unchanged
+  (to ~1e-15).
+- **Importing `simulate.simulate_switching_kalman` no longer reseeds the
+  global NumPy RNG** (it ran `np.random.seed(0)` at import), and
+  `simdata_settings` / `simulate_model` no longer draw the initial state from
+  the global RNG, so consecutive `simulate_model()` calls return the same
+  data. New `init_seed` (initial state, default 0 -- the value the old
+  import-time seeding gave on a first call) and `simulate_model(noise_seed=14)`
+  (the existing noise seed) arguments; `None` makes either part
+  nondeterministic.
+- **`kalman.parallel_kalman_smoother` accepts float32 inputs under x64**: the
+  terminal scan element was built with a default-dtype `jnp.zeros` (float64
+  when `jax_enable_x64` is on), so float32 inputs raised `TypeError` from
+  `lax.concatenate`. It now takes the dtype of the other elements.
 - **A failed fit no longer leaves stale or non-finite results that look
   fitted**: when a fit raises `NonFiniteLikelihoodError` (its starting
   parameters give a non-finite log-likelihood), it first clears every fit
@@ -471,6 +750,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   built a new transform each time, so equal parameter specs compared unequal;
   it now returns one transform per cap. Results of every other model are
   bit-identical.
+- **`TemporalRateGP.fit_sgd` compiles its SGD step once per fit**: the initial
+  hyperparameters were weak-typed (built from Python floats) and the first
+  optimizer update returned them strong-typed, so the second step re-traced
+  and re-compiled the step (~1.5 s extra per fit at 2000 bins). They are now
+  built with an explicit float dtype; results are bit-identical.
 - **A rejected `fit_sgd` call no longer changes the model**: model-specific
   setup (data binding, initialization, warm start, recorded lengths) ran in
   each model's `fit_sgd` override before the shared settings checks, so e.g.

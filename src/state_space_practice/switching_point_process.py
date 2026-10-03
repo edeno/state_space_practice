@@ -104,7 +104,9 @@ from state_space_practice.em_driver import (
 )
 from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.fitted_state import FittedAttribute
+from state_space_practice.kalman import _scan_with_boundary
 from state_space_practice.oscillator_utils import (
+    ConstructorParametersMixin,
     _matrix_to_oscillator_blocks,
     _oscillator_blocks_to_matrix,
     construct_common_oscillator_process_covariance,
@@ -126,14 +128,15 @@ from state_space_practice.sgd_fitting import (
     SGDParamSpec,
 )
 from state_space_practice.switching_kalman import (
+    SwitchingFilterGPB1Result,
     SwitchingFilterResult,
     _first_timestep_discrete_update,
     _normalize_initial_discrete_prob,
+    _switching_kalman_smoother_em_stats,
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture_per_discrete_state,
     minimum_state_occupancy,
     switching_kalman_maximization_step,
-    switching_kalman_smoother,
     switching_kalman_smoother_gpb2,
     warn_low_occupancy_states,
 )
@@ -1017,6 +1020,7 @@ def _armijo_line_search(
     beta: float = 0.5,
     c: float = 1e-4,
     max_iter: int = 20,
+    loss_along: Callable[[Array], Array] | None = None,
 ) -> Array:
     """Backtracking line search with Armijo condition.
 
@@ -1042,6 +1046,11 @@ def _armijo_line_search(
         Armijo constant for sufficient decrease condition.
     max_iter : int, default=20
         Maximum number of backtracking iterations.
+    loss_along : Callable[[Array], Array] | None, optional
+        ``alpha -> loss_fn(params - alpha * delta)``, when the caller can
+        evaluate it more cheaply than ``loss_fn`` (e.g. from per-time terms
+        precomputed once for this ``delta``). Used for the trial losses in
+        place of ``loss_fn``.
 
     Returns
     -------
@@ -1063,8 +1072,11 @@ def _armijo_line_search(
         # Under tracing loss_fn is evaluated every iteration; once a step is
         # found, `where` selects the cached current_loss (it does not skip the
         # call), which makes subsequent iterations inert.
-        new_params_trial = params - alpha * delta
-        new_loss = jnp.where(found, current_loss, loss_fn(new_params_trial))
+        if loss_along is None:
+            trial_loss = loss_fn(params - alpha * delta)
+        else:
+            trial_loss = loss_along(alpha)
+        new_loss = jnp.where(found, current_loss, trial_loss)
 
         # Armijo condition: new_loss <= current_loss - c * alpha * directional_derivative
         sufficient_decrease = found | (
@@ -1111,6 +1123,7 @@ def _descent_step(
     current_loss: Array,
     beta: float = 0.5,
     max_iter: int = 20,
+    line_loss: Callable[[Array], Callable[[Array], Array]] | None = None,
 ) -> tuple[Array, Array]:
     """Armijo step along ``delta``, falling back to the gradient direction.
 
@@ -1118,6 +1131,10 @@ def _descent_step(
     direction corrupted by an ill-conditioned Hessian), the Armijo search
     along it can only return ``alpha = 0`` -- a silent no-op update. The
     steepest-descent direction ``g`` is used instead.
+
+    ``line_loss``, if given, maps the search direction ``d`` to
+    ``alpha -> loss_fn(params - alpha * d)`` (see
+    :func:`_armijo_line_search`'s ``loss_along``).
 
     Returns
     -------
@@ -1144,6 +1161,7 @@ def _descent_step(
         current_loss,
         beta=beta,
         max_iter=max_iter,
+        loss_along=None if line_loss is None else line_loss(direction),
     )
     return params - alpha * direction, fell_back
 
@@ -1625,9 +1643,49 @@ def _single_neuron_glm_step_second_order(
             loss += 0.5 * baseline_prior_l2 * b_trial**2
         return loss
 
+    def line_loss(direction: Array) -> Callable[[Array], Array]:
+        # loss_fn(params - alpha * direction) with its O(T L^2) per-time terms
+        # expanded as polynomials in alpha (computed once per direction), so
+        # each line-search trial costs O(T):
+        #   m_t.w(alpha) = m_t.w - alpha m_t.d
+        #   w(alpha)' P_t w(alpha) = w'P_t w - alpha (d'P_t w + w'P_t d)
+        #                            + alpha^2 d'P_t d
+        d_b, d_w = direction[0], direction[1:]
+        mean_d = smoother_mean @ d_w  # (T,)
+        quad_lin = 0.5 * (
+            Pw @ d_w + jnp.einsum("tij,i,j->t", smoother_cov, w, d_w)
+        )  # (T,)
+        quad_sq = 0.5 * jnp.einsum("tij,i,j->t", smoother_cov, d_w, d_w)  # (T,)
+
+        def loss_along(alpha: Array) -> Array:
+            b_trial = b - alpha * d_b
+            w_trial = w - alpha * d_w
+            eta_lin_trial = eta_lin - alpha * mean_d
+            quad_trial = quad - alpha * quad_lin + alpha**2 * quad_sq
+            eta_trial = b_trial + eta_lin_trial + quad_trial
+            mu_trial = jnp.exp(_exp_safe_clip(eta_trial)) * dt
+            loss = jnp.sum(
+                time_weights_val * (mu_trial - y_n * (b_trial + eta_lin_trial))
+            )
+            loss += 0.5 * weight_l2 * jnp.dot(w_trial, w_trial)
+            if baseline_prior is not None:
+                loss += 0.5 * baseline_prior_l2 * (b_trial - bp) ** 2
+            else:
+                loss += 0.5 * baseline_prior_l2 * b_trial**2
+            return loss
+
+        return loss_along
+
     current_loss = loss_fn(params)
     new_params, fell_back = _descent_step(
-        params, delta, grad, loss_fn, current_loss, beta=0.5, max_iter=10
+        params,
+        delta,
+        grad,
+        loss_fn,
+        current_loss,
+        beta=0.5,
+        max_iter=10,
+        line_loss=line_loss,
     )
     new_baseline = new_params[0]
     new_weights = new_params[1:]
@@ -1726,9 +1784,44 @@ def _single_neuron_glm_step_second_order_mixture(
         loss += 0.5 * baseline_prior_l2 * (b_trial - bp) ** 2
         return loss
 
+    def line_loss(direction: Array) -> Callable[[Array], Array]:
+        # loss_fn(params - alpha * direction) with its O(T L^2 S) per-(time,
+        # state) terms expanded as polynomials in alpha (see the second-order
+        # step), so each line-search trial costs O(T S).
+        d_b, d_w = direction[0], direction[1:]
+        mean_d = jnp.einsum("tls,l->ts", state_cond_smoother_mean, d_w)
+        quad_lin = 0.5 * (
+            jnp.einsum("tls,l->ts", cov_w, d_w)
+            + jnp.einsum("tlks,l,k->ts", state_cond_smoother_cov, w, d_w)
+        )
+        quad_sq = 0.5 * jnp.einsum("tlks,l,k->ts", state_cond_smoother_cov, d_w, d_w)
+
+        def loss_along(alpha: Array) -> Array:
+            b_trial = b - alpha * d_b
+            w_trial = w - alpha * d_w
+            eta_lin_trial = eta_lin - alpha * mean_d
+            quad_trial = quad - alpha * quad_lin + alpha**2 * quad_sq
+            eta_trial = b_trial + eta_lin_trial + quad_trial
+            mu_trial = jnp.exp(_exp_safe_clip(eta_trial)) * dt
+            loss = jnp.sum(
+                state_weights * (mu_trial - y_n[:, None] * (b_trial + eta_lin_trial))
+            )
+            loss += 0.5 * weight_l2 * jnp.dot(w_trial, w_trial)
+            loss += 0.5 * baseline_prior_l2 * (b_trial - bp) ** 2
+            return loss
+
+        return loss_along
+
     current_loss = loss_fn(params)
     new_params, fell_back = _descent_step(
-        params, delta, grad, loss_fn, current_loss, beta=0.5, max_iter=10
+        params,
+        delta,
+        grad,
+        loss_fn,
+        current_loss,
+        beta=0.5,
+        max_iter=10,
+        line_loss=line_loss,
     )
     return new_params[0], new_params[1:], fell_back
 
@@ -1783,6 +1876,50 @@ def _second_order_newton_iterations(
         new_baselines, new_weights, fell_back = jax.vmap(
             update_neuron, in_axes=(0, 0, 1, 0)
         )(baselines, weights, spikes, baseline_prior)
+        return (
+            _cast_like_carry(new_baselines, new_weights, baselines, weights),
+            jnp.sum(fell_back),
+        )
+
+    (final_baselines, final_weights), n_fallbacks = jax.lax.scan(
+        iterate_all_neurons, (baselines, weights), None, length=max_iter
+    )
+    return final_baselines, final_weights, jnp.sum(n_fallbacks)
+
+
+@functools.partial(typed_jit, static_argnames=("max_iter",))
+def _plug_in_newton_iterations(
+    baselines: Array,
+    weights: Array,
+    spikes: Array,
+    smoother_mean: Array,
+    dt: float,
+    time_weights: Array,
+    weight_l2: float,
+    max_iter: int,
+) -> tuple[Array, Array, Array]:
+    """``max_iter`` plug-in Newton steps for every neuron in one jitted scan.
+
+    The plug-in branch of :func:`update_spike_glm_params` (the per-neuron
+    step uses ``smoother_mean`` as a fixed design matrix). Jitting it keeps
+    repeated M-steps with the same shapes from re-tracing the scan. The third
+    output counts the neuron-iterations whose Newton direction fell back to
+    the gradient.
+    """
+
+    def iterate_all_neurons(
+        carry: tuple[Array, Array], _: None
+    ) -> tuple[tuple[Array, Array], Array]:
+        baselines, weights = carry
+
+        def update_neuron(b: Array, w: Array, y_n: Array) -> tuple[Array, Array, Array]:
+            return _single_neuron_glm_step(
+                b, w, y_n, smoother_mean, dt, time_weights, weight_l2
+            )
+
+        new_baselines, new_weights, fell_back = jax.vmap(
+            update_neuron, in_axes=(0, 0, 1)
+        )(baselines, weights, spikes)
         return (
             _cast_like_carry(new_baselines, new_weights, baselines, weights),
             jnp.sum(fell_back),
@@ -2011,34 +2148,19 @@ def update_spike_glm_params(
             max_iter=max_iter,
         )
     else:
-        # Run Newton iterations for all neurons (plug-in)
-        # vmap directly over neuron-axis data.
-        def iterate_all_neurons(
-            carry: tuple[Array, Array], _: None
-        ) -> tuple[tuple[Array, Array], Array]:
-            baselines, weights = carry
-
-            def update_neuron(
-                b: Array, w: Array, y_n: Array
-            ) -> tuple[Array, Array, Array]:
-                return _single_neuron_glm_step(
-                    b, w, y_n, smoother_mean, dt, time_weights, weight_l2
-                )
-
-            new_baselines, new_weights, fell_back = jax.vmap(
-                update_neuron, in_axes=(0, 0, 1)
-            )(baselines, weights, spikes)
-
-            return (
-                _cast_like_carry(new_baselines, new_weights, baselines, weights),
-                jnp.sum(fell_back),
-            )
-
-        (final_baselines, final_weights), n_fallbacks = jax.lax.scan(
-            iterate_all_neurons, (baselines, weights), None, length=max_iter
+        # Plug-in Newton iterations for all neurons: one jitted scan.
+        final_baselines, final_weights, n_fallbacks = _plug_in_newton_iterations(
+            baselines,
+            weights,
+            spikes,
+            smoother_mean,
+            dt,
+            time_weights,
+            weight_l2,
+            max_iter=max_iter,
         )
 
-    _warn_newton_fallbacks(jnp.sum(n_fallbacks), "update_spike_glm_params")
+    _warn_newton_fallbacks(n_fallbacks, "update_spike_glm_params")
     return SpikeObsParams(baseline=final_baselines, weights=final_weights)
 
 
@@ -2249,6 +2371,105 @@ def _switching_point_process_filter_jit(
     [2] Murphy, K.P. (1998). Switching Kalman Filters.
     [3] Shumway, R.H., and Stoffer, D.S. (1991). Dynamic Linear Models With Switching.
     """
+    filtered, pair_cond = _switching_point_process_filter_core(
+        init_state_cond_mean,
+        init_state_cond_cov,
+        init_discrete_state_prob,
+        spikes,
+        discrete_transition_matrix,
+        continuous_transition_matrix,
+        process_cov,
+        dt,
+        log_intensity_func,
+        spike_params,
+        include_laplace_normalization,
+        max_newton_iter,
+        line_search_beta,
+        return_pair_cond=True,
+    )
+    assert pair_cond is not None  # requested above
+    return SwitchingFilterResult(
+        state_cond_filter_mean=filtered.state_cond_filter_mean,
+        state_cond_filter_cov=filtered.state_cond_filter_cov,
+        filter_discrete_state_prob=filtered.filter_discrete_state_prob,
+        pair_cond_filter_mean=pair_cond[0],
+        pair_cond_filter_cov=pair_cond[1],
+        pair_cond_filter_prob=pair_cond[2],
+        marginal_log_likelihood=filtered.marginal_log_likelihood,
+    )
+
+
+@functools.partial(
+    typed_jit,
+    static_argnames=[
+        "log_intensity_func",
+        "include_laplace_normalization",
+        "max_newton_iter",
+    ],
+)
+def _switching_point_process_filter_gpb1_jit(
+    init_state_cond_mean: Array,
+    init_state_cond_cov: Array,
+    init_discrete_state_prob: Array,
+    spikes: Array,
+    discrete_transition_matrix: Array,
+    continuous_transition_matrix: Array,
+    process_cov: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
+    include_laplace_normalization: bool = True,
+    max_newton_iter: int = 3,
+    line_search_beta: float = 0.5,
+) -> SwitchingFilterGPB1Result:
+    """:func:`_switching_point_process_filter_jit` without pair-conditional outputs.
+
+    For GPB1 E-steps, which never read the ``(n_time, ..., K, K)``
+    pair-conditional trajectories; the returned fields are identical to the
+    matching fields of the full filter.
+    """
+    filtered, _ = _switching_point_process_filter_core(
+        init_state_cond_mean,
+        init_state_cond_cov,
+        init_discrete_state_prob,
+        spikes,
+        discrete_transition_matrix,
+        continuous_transition_matrix,
+        process_cov,
+        dt,
+        log_intensity_func,
+        spike_params,
+        include_laplace_normalization,
+        max_newton_iter,
+        line_search_beta,
+        return_pair_cond=False,
+    )
+    return filtered
+
+
+def _switching_point_process_filter_core(
+    init_state_cond_mean: Array,
+    init_state_cond_cov: Array,
+    init_discrete_state_prob: Array,
+    spikes: Array,
+    discrete_transition_matrix: Array,
+    continuous_transition_matrix: Array,
+    process_cov: Array,
+    dt: float,
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
+    include_laplace_normalization: bool,
+    max_newton_iter: int,
+    line_search_beta: float,
+    return_pair_cond: bool,
+) -> tuple[SwitchingFilterGPB1Result, tuple[Array, Array, Array] | None]:
+    """Traced switching point-process filter shared by the jitted entry points.
+
+    Returns the state-conditional outputs and, when ``return_pair_cond``
+    (a Python bool, fixed at trace time) is True, the pair-conditional
+    ``(mean, cov, prob)`` trajectories; otherwise None, and the scan never
+    emits them. See :func:`_switching_point_process_filter_jit`.
+    """
     # Input validation: ensure spikes is 2D (n_time, n_neurons)
     spikes = jnp.asarray(spikes)
     if spikes.ndim == 1:
@@ -2272,7 +2493,7 @@ def _switching_point_process_filter_jit(
         y_t: Array,
     ) -> tuple[
         tuple[Array, Array, Array, Array, Array, Array],
-        tuple[Array, Array, Array, Array, Array, Array],
+        tuple[tuple[Array, ...], tuple[()]],
     ]:
         """One step of the switching point-process filter.
 
@@ -2315,8 +2536,9 @@ def _switching_point_process_filter_jit(
                 Posterior state-conditional covariances.
             filter_discrete_prob : Array, shape (n_discrete_states,)
                 Posterior discrete state probabilities.
-            pair_cond_filter_mean : Array, shape (n_latent, n_discrete_states, n_discrete_states)
-                Pair-conditional filter means for smoother.
+            pair_cond_filter_mean, pair_cond_filter_cov, pair_cond_filter_prob
+                Pair-conditional mean, covariance and probability (only
+                when ``return_pair_cond``).
         """
         (
             prev_state_cond_filter_mean,
@@ -2380,6 +2602,17 @@ def _switching_point_process_filter_jit(
             )
         )
 
+        outputs: tuple[Array, ...] = (
+            state_cond_filter_mean,
+            state_cond_filter_cov,
+            filter_discrete_prob,
+        )
+        if return_pair_cond:
+            outputs += (
+                pair_cond_filter_mean,
+                pair_cond_filter_cov,
+                pair_cond_filter_prob,
+            )
         return (
             state_cond_filter_mean,
             state_cond_filter_cov,
@@ -2387,14 +2620,7 @@ def _switching_point_process_filter_jit(
             marginal_log_likelihood,
             next_support,
             n_failed_bins,
-        ), (
-            state_cond_filter_mean,
-            state_cond_filter_cov,
-            filter_discrete_prob,
-            pair_cond_filter_mean,
-            pair_cond_filter_cov,
-            pair_cond_filter_prob,
-        )
+        ), (outputs, ())
 
     # Handle first timestep with x₁ convention: update-only (no dynamics prediction)
     # init_state_cond_mean represents p(x₁ | S₁), the prior for the first observation
@@ -2426,19 +2652,24 @@ def _switching_point_process_filter_jit(
     # (e.g. +inf) that the sanitizer clamps to 0 would be marked reachable and
     # resurrected to ~1e-10 at the next step. Threaded through the scan.
     first_support = _normalize_initial_discrete_prob(init_discrete_state_prob) > 0.0
-    # Run predict-then-update for t=2,...,T
-    # jax.lax.scan handles empty inputs (spikes[1:] when n_time=1) gracefully
+    first_outputs: tuple[Array, ...] = (
+        first_state_cond_mean,
+        first_state_cond_cov,
+        first_discrete_prob,
+    )
+    if return_pair_cond:
+        first_outputs += (
+            first_pair_cond_mean,
+            first_pair_cond_cov,
+            first_pair_cond_prob,
+        )
+    # Run predict-then-update for t=2,...,T (an empty scan when n_time=1); the
+    # first timestep's outputs fill index 0 of the stacked outputs.
     (
         (_, _, _, marginal_log_likelihood, _, n_failed_bins),
-        (
-            rest_state_cond_filter_mean,
-            rest_state_cond_filter_cov,
-            rest_filter_discrete_state_prob,
-            rest_pair_cond_filter_mean,
-            rest_pair_cond_filter_cov,
-            rest_pair_cond_filter_prob,
-        ),
-    ) = jax.lax.scan(
+        outputs,
+        _,
+    ) = _scan_with_boundary(
         _step,
         (
             first_state_cond_mean,
@@ -2448,7 +2679,10 @@ def _switching_point_process_filter_jit(
             first_support,
             jnp.any(first_n_failed > 0).astype(jnp.int32),
         ),
-        spikes[1:],
+        spikes,
+        1,
+        spikes.shape[0] - 1,
+        first_outputs,
     )
     _warn_line_search_failures(
         n_failed_bins,
@@ -2457,35 +2691,15 @@ def _switching_point_process_filter_jit(
         "switching_point_process_filter",
     )
 
-    # Prepend first timestep results
-    state_cond_filter_mean = jnp.concatenate(
-        [first_state_cond_mean[None, ...], rest_state_cond_filter_mean], axis=0
-    )
-    state_cond_filter_cov = jnp.concatenate(
-        [first_state_cond_cov[None, ...], rest_state_cond_filter_cov], axis=0
-    )
-    filter_discrete_state_prob = jnp.concatenate(
-        [first_discrete_prob[None, ...], rest_filter_discrete_state_prob], axis=0
-    )
-    pair_cond_filter_mean = jnp.concatenate(
-        [first_pair_cond_mean[None, ...], rest_pair_cond_filter_mean], axis=0
-    )
-    pair_cond_filter_cov = jnp.concatenate(
-        [first_pair_cond_cov[None, ...], rest_pair_cond_filter_cov], axis=0
-    )
-    pair_cond_filter_prob = jnp.concatenate(
-        [first_pair_cond_prob[None, ...], rest_pair_cond_filter_prob], axis=0
-    )
-
-    return SwitchingFilterResult(
-        state_cond_filter_mean=state_cond_filter_mean,
-        state_cond_filter_cov=state_cond_filter_cov,
-        filter_discrete_state_prob=filter_discrete_state_prob,
-        pair_cond_filter_mean=pair_cond_filter_mean,
-        pair_cond_filter_cov=pair_cond_filter_cov,
-        pair_cond_filter_prob=pair_cond_filter_prob,
+    filtered = SwitchingFilterGPB1Result(
+        state_cond_filter_mean=outputs[0],
+        state_cond_filter_cov=outputs[1],
+        filter_discrete_state_prob=outputs[2],
         marginal_log_likelihood=marginal_log_likelihood,
     )
+    if not return_pair_cond:
+        return filtered, None
+    return filtered, (outputs[3], outputs[4], outputs[5])
 
 
 def switching_point_process_filter(
@@ -2527,24 +2741,17 @@ def switching_point_process_filter(
         NamedTuple of the seven filter outputs (see
         ``_switching_point_process_filter_jit`` for shapes).
     """
-    init_state_cond_mean = jnp.asarray(init_state_cond_mean)
-    init_state_cond_cov = jnp.asarray(init_state_cond_cov)
-    init_discrete_state_prob = jnp.asarray(init_discrete_state_prob)
-    spikes = jnp.asarray(spikes)
-    discrete_transition_matrix = jnp.asarray(discrete_transition_matrix)
-    continuous_transition_matrix = jnp.asarray(continuous_transition_matrix)
-    process_cov = jnp.asarray(process_cov)
-    _validate_discrete_state_transitions(
-        discrete_transition_matrix, init_discrete_state_prob, dt
-    )
     return _switching_point_process_filter_jit(
-        init_state_cond_mean,
-        init_state_cond_cov,
-        init_discrete_state_prob,
-        spikes,
-        discrete_transition_matrix,
-        continuous_transition_matrix,
-        process_cov,
+        *_validated_filter_arrays(
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            spikes,
+            discrete_transition_matrix,
+            continuous_transition_matrix,
+            process_cov,
+            dt,
+        ),
         dt,
         log_intensity_func,
         spike_params,
@@ -2554,7 +2761,77 @@ def switching_point_process_filter(
     )
 
 
-class SwitchingPointProcessBase(ABC, SGDFittableMixin):
+def _switching_point_process_filter_gpb1(
+    init_state_cond_mean: ArrayLike,
+    init_state_cond_cov: ArrayLike,
+    init_discrete_state_prob: ArrayLike,
+    spikes: ArrayLike,
+    discrete_transition_matrix: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    dt: float,
+    log_intensity_func: Callable[[Array, SpikeObsParams], Array],
+    spike_params: SpikeObsParams,
+    max_newton_iter: int = 3,
+    line_search_beta: float = 0.5,
+) -> SwitchingFilterGPB1Result:
+    """:func:`switching_point_process_filter` without pair-conditional outputs.
+
+    Same eager validation, then the jitted filter variant that does not
+    materialize the pair-conditional trajectories (GPB1 E-steps never read
+    them).
+    """
+    return _switching_point_process_filter_gpb1_jit(
+        *_validated_filter_arrays(
+            init_state_cond_mean,
+            init_state_cond_cov,
+            init_discrete_state_prob,
+            spikes,
+            discrete_transition_matrix,
+            continuous_transition_matrix,
+            process_cov,
+            dt,
+        ),
+        dt,
+        log_intensity_func,
+        spike_params,
+        max_newton_iter=max_newton_iter,
+        line_search_beta=line_search_beta,
+    )
+
+
+def _validated_filter_arrays(
+    init_state_cond_mean: ArrayLike,
+    init_state_cond_cov: ArrayLike,
+    init_discrete_state_prob: ArrayLike,
+    spikes: ArrayLike,
+    discrete_transition_matrix: ArrayLike,
+    continuous_transition_matrix: ArrayLike,
+    process_cov: ArrayLike,
+    dt: float,
+) -> tuple[Array, Array, Array, Array, Array, Array, Array]:
+    """Convert the filter's array inputs and validate the discrete-state ones.
+
+    Runs ``_validate_discrete_state_transitions`` eagerly (it is skipped for
+    traced inputs); see :func:`switching_point_process_filter`.
+    """
+    init_discrete_state_prob = jnp.asarray(init_discrete_state_prob)
+    discrete_transition_matrix = jnp.asarray(discrete_transition_matrix)
+    _validate_discrete_state_transitions(
+        discrete_transition_matrix, init_discrete_state_prob, dt
+    )
+    return (
+        jnp.asarray(init_state_cond_mean),
+        jnp.asarray(init_state_cond_cov),
+        init_discrete_state_prob,
+        jnp.asarray(spikes),
+        discrete_transition_matrix,
+        jnp.asarray(continuous_transition_matrix),
+        jnp.asarray(process_cov),
+    )
+
+
+class SwitchingPointProcessBase(ConstructorParametersMixin, ABC, SGDFittableMixin):
     """Shared EM and SGD machinery for switching point-process oscillator models.
 
     :class:`SwitchingSpikeOscillatorModel` (this module) and the structured
@@ -2819,7 +3096,12 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         - Continuous transition matrix / process covariance: model specific
         - Spike baseline: zero (corresponding to 1 Hz baseline rate)
         - Spike weights: small random values (scaled by 0.1)
+
+        Models with intrinsic oscillator parameters start from their
+        constructor values, not the ones an earlier fit left behind (see
+        ``ConstructorParametersMixin``).
         """
+        self._restore_constructor_parameters()
         k1, k2 = jax.random.split(key)
         self._initialize_discrete_state_prob()
         self._initialize_discrete_transition_matrix()
@@ -3022,40 +3304,26 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         # single module-level object (not a per-call closure): the jitted filter
         # core takes it as a static jit argument cached by identity, so reusing
         # the same object avoids recompiling the filter on every EM iteration.
-        (
-            state_cond_filter_mean,
-            state_cond_filter_cov,
-            filter_discrete_state_prob,
-            pair_cond_filter_mean,
-            pair_cond_filter_cov,
-            pair_cond_filter_prob,
-            marginal_log_likelihood,
-        ) = switching_point_process_filter(
-            init_state_cond_mean=self.init_mean,
-            init_state_cond_cov=self.init_cov,
-            init_discrete_state_prob=self.init_discrete_state_prob,
-            spikes=spikes,
-            discrete_transition_matrix=self.discrete_transition_matrix,
-            continuous_transition_matrix=self.continuous_transition_matrix,
-            process_cov=self.process_cov,
-            dt=self.dt,
-            log_intensity_func=_linear_log_intensity,
-            spike_params=self.spike_params,
-            max_newton_iter=self.max_newton_iter,
-            line_search_beta=self.line_search_beta,
-        )
+        filter_args: dict[str, Any] = {
+            "init_state_cond_mean": self.init_mean,
+            "init_state_cond_cov": self.init_cov,
+            "init_discrete_state_prob": self.init_discrete_state_prob,
+            "spikes": spikes,
+            "discrete_transition_matrix": self.discrete_transition_matrix,
+            "continuous_transition_matrix": self.continuous_transition_matrix,
+            "process_cov": self.process_cov,
+            "dt": self.dt,
+            "log_intensity_func": _linear_log_intensity,
+            "spike_params": self.spike_params,
+            "max_newton_iter": self.max_newton_iter,
+            "line_search_beta": self.line_search_beta,
+        }
 
         # Run the switching Kalman smoother (observation-model agnostic)
         # The smoother operates on Gaussian posteriors regardless of observation model
-        smoother_args = {
-            "filter_mean": state_cond_filter_mean,
-            "filter_cov": state_cond_filter_cov,
-            "filter_discrete_state_prob": filter_discrete_state_prob,
-            "process_cov": self.process_cov,
-            "continuous_transition_matrix": self.continuous_transition_matrix,
-        }
-
         if self.smoother_type == "gpb2":
+            filtered = switching_point_process_filter(**filter_args)
+            marginal_log_likelihood = filtered.marginal_log_likelihood
             (
                 _,
                 _,
@@ -3069,24 +3337,34 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
                 pair_cond_smoother_covs,
                 next_pair_cond_smoother_means,
             ) = switching_kalman_smoother_gpb2(
-                **smoother_args,
-                pair_cond_filter_mean=pair_cond_filter_mean,
-                pair_cond_filter_cov=pair_cond_filter_cov,
-                pair_cond_filter_prob=pair_cond_filter_prob,
+                filter_mean=filtered.state_cond_filter_mean,
+                filter_cov=filtered.state_cond_filter_cov,
+                filter_discrete_state_prob=filtered.filter_discrete_state_prob,
+                pair_cond_filter_mean=filtered.pair_cond_filter_mean,
+                pair_cond_filter_cov=filtered.pair_cond_filter_cov,
+                pair_cond_filter_prob=filtered.pair_cond_filter_prob,
+                process_cov=self.process_cov,
+                continuous_transition_matrix=self.continuous_transition_matrix,
             )
         else:
+            # GPB1 reads neither the pair-conditional filter trajectories nor
+            # the overall (collapsed) smoother moments, so the filter/smoother
+            # variants that do not materialize them are used.
+            gpb1_filtered = _switching_point_process_filter_gpb1(**filter_args)
+            marginal_log_likelihood = gpb1_filtered.marginal_log_likelihood
             (
-                _,
-                _,
                 smoother_discrete_state_prob,
                 smoother_joint_discrete_state_prob,
-                _,
                 state_cond_smoother_means,
                 state_cond_smoother_covs,
                 pair_cond_smoother_cross_covs,
                 pair_cond_smoother_means,
-            ) = switching_kalman_smoother(
-                **smoother_args,
+            ) = _switching_kalman_smoother_em_stats(
+                filter_mean=gpb1_filtered.state_cond_filter_mean,
+                filter_cov=gpb1_filtered.state_cond_filter_cov,
+                filter_discrete_state_prob=gpb1_filtered.filter_discrete_state_prob,
+                process_cov=self.process_cov,
+                continuous_transition_matrix=self.continuous_transition_matrix,
                 discrete_state_transition_matrix=self.discrete_transition_matrix,
             )
             pair_cond_smoother_covs = None
@@ -3420,6 +3698,11 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
 
+        Unlike ``fit``, ``fit_sgd`` initializes the parameters (from the
+        constructor's initial parameters, as ``fit`` does) only when the
+        model has none yet; a later call continues from the current
+        parameters, including those of an earlier ``fit``.
+
         Parameters
         ----------
         spikes : ArrayLike, shape (n_time, n_neurons)
@@ -3576,9 +3859,10 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         # Optimize the *same* filter approximation the E-step/finalize evaluate:
         # pass max_newton_iter and line_search_beta so a model configured with
         # multi-step Laplace does not train against the 1-step LL and then report
-        # a different multi-step LL. Note: with max_newton_iter > 1 the SGD loss
-        # differentiates through the backtracking scan's jnp.where selections, so
-        # the gradient is valid but piecewise-constant in the step size.
+        # a different multi-step LL. Note: with max_newton_iter > 1 the accepted
+        # line-search step size is gradient-stopped (the backtracking loop only
+        # selects it), so the gradient is valid but piecewise-constant in the
+        # step size.
         result = switching_point_process_filter(
             init_state_cond_mean=m0,
             init_state_cond_cov=P0,
@@ -4013,7 +4297,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
             approximate, so small LL decreases are expected. Only roll back
             and stop when the relative decrease exceeds this threshold.
         key : Array | None, optional
-            JAX random key for parameter initialization. If None, uses PRNGKey(0).
+            JAX random key for parameter initialization. If None, uses ``jax.random.key(0)``.
         skip_init : bool, default=False
             If True, skip parameter initialization and use existing parameters.
             This allows custom initialization before calling fit().
@@ -4075,8 +4359,8 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
         ...     sampling_freq=100.0,
         ...     dt=0.01,
         ... )
-        >>> spikes = jax.random.poisson(jax.random.PRNGKey(0), 0.5, (100, 10))
-        >>> log_likelihoods = model.fit(spikes, max_iter=20, key=jax.random.PRNGKey(42))
+        >>> spikes = jax.random.poisson(jax.random.key(0), 0.5, (100, 10))
+        >>> log_likelihoods = model.fit(spikes, max_iter=20, key=jax.random.key(42))
         >>> 0 < len(log_likelihoods) <= 21  # <= max_iter, plus at most one final-E-step LL
         True
         """
@@ -4084,7 +4368,7 @@ class SwitchingSpikeOscillatorModel(SwitchingPointProcessBase):
 
         # Set default random key if not provided
         if key is None:
-            key = jax.random.PRNGKey(0)
+            key = jax.random.key(0)
 
         # Initialize parameters (unless skip_init is True for custom initialization)
         if not skip_init:

@@ -1467,7 +1467,7 @@ def simulate_switching_choice_data(
     """
     S = n_discrete_states
     k_free = n_options - 1
-    key = jax.random.PRNGKey(seed)
+    key = jax.random.key(seed)
 
     if process_noises is None:
         if S > 2:

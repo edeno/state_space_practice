@@ -7,6 +7,9 @@ module, covering helper functions, core vmapped functions, and integration
 tests comparing SKF to KF and verifying SKF behavior.
 """
 
+import contextlib
+from collections.abc import Callable, Iterator
+
 import jax
 
 # Enable 64-bit precision for tests that require it.
@@ -32,6 +35,8 @@ from state_space_practice.switching_kalman import (
     _kalman_smoother_update_per_discrete_state_pair,
     _optimize_dim_joint_core,
     _optimize_dim_single_core,
+    _switching_kalman_filter_gpb1,
+    _switching_kalman_smoother_em_stats,
     _update_discrete_state_probabilities,
     _update_smoother_discrete_probabilities,
     collapse_gaussian_mixture,
@@ -55,6 +60,30 @@ from state_space_practice.switching_kalman import (
 from state_space_practice.utils import divide_safe as _divide_safe
 from state_space_practice.utils import safe_log as _safe_log
 from state_space_practice.utils import spectral_radius as _spectral_radius
+
+# JAX lowers every newly traced computation to MLIR (even when a persistent
+# compilation cache then skips the backend compile), so counting lowerings
+# and backend compiles detects re-tracing.
+_COMPILE_EVENTS = (
+    "/jax/core/compile/jaxpr_to_mlir_module_duration",
+    "/jax/core/compile/backend_compile_duration",
+)
+
+
+@contextlib.contextmanager
+def _count_compiles() -> Iterator[Callable[[], int]]:
+    """Count JAX lowerings/compiles inside the block; yields a getter."""
+    count = 0
+
+    def listener(event: str, duration: float, **kwargs: object) -> None:
+        nonlocal count
+        count += event in _COMPILE_EVENTS
+
+    jax.monitoring.register_event_duration_secs_listener(listener)
+    try:
+        yield lambda: count
+    finally:
+        jax.monitoring.unregister_event_duration_listener(listener)
 
 
 def kalman_maximization_step_x1_prior(*args):
@@ -1028,6 +1057,30 @@ def test_switching_kalman_filter_accepts_numpy_inputs(simple_skf_model: tuple) -
     assert len(numpy_outputs) == len(jax_outputs)
     for from_numpy, from_jax in zip(numpy_outputs, jax_outputs, strict=True):
         np.testing.assert_array_equal(from_numpy, from_jax)
+
+
+def test_gpb1_variants_match_public_filter_and_smoother(
+    simple_skf_model: tuple,
+) -> None:
+    """The GPB1 E-step variants skip outputs but change none they return."""
+    init_mean, init_cov, init_prob, obs, Z, A, Q, H, R = simple_skf_model
+    full = switching_kalman_filter(*simple_skf_model)
+    gpb1 = _switching_kalman_filter_gpb1(*simple_skf_model)
+    for name in gpb1._fields:
+        np.testing.assert_array_equal(getattr(gpb1, name), getattr(full, name))
+
+    smoother_args = (
+        full.state_cond_filter_mean,
+        full.state_cond_filter_cov,
+        full.filter_discrete_state_prob,
+        Q,
+        A,
+        Z,
+    )
+    full_smooth = switching_kalman_smoother(*smoother_args)
+    stats = _switching_kalman_smoother_em_stats(*smoother_args)
+    for name in stats._fields:
+        np.testing.assert_array_equal(getattr(stats, name), getattr(full_smooth, name))
 
 
 def test_switching_result_fields_name_the_right_outputs(
@@ -7104,6 +7157,23 @@ def test_viterbi_handles_one_timestep(simple_skf_model: tuple) -> None:
     )
     assert states.shape == (1,)
     assert int(states[0]) == int(jnp.argmax(filter_result[2][0]))
+
+
+def test_viterbi_repeat_call_does_not_recompile(simple_skf_model: tuple) -> None:
+    """A second Viterbi call with the same shapes reuses the compiled core."""
+    init_mean, init_cov, init_prob, obs, Z, A, Q, H, R = simple_skf_model
+    reversed_obs = obs[::-1]
+    first = switching_kalman_viterbi(init_mean, init_cov, init_prob, obs, Z, A, Q, H, R)
+    with _count_compiles() as n_compiles:
+        second = switching_kalman_viterbi(
+            init_mean, init_cov, init_prob, reversed_obs, Z, A, Q, H, R
+        )
+        again = switching_kalman_viterbi(
+            init_mean, init_cov, init_prob, obs, Z, A, Q, H, R
+        )
+    assert n_compiles() == 0
+    np.testing.assert_array_equal(again, first)
+    assert not np.array_equal(second, first)  # new data reached the cached core
 
 
 def test_viterbi_preserves_structural_zero_transitions() -> None:

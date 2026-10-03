@@ -1,6 +1,8 @@
 # ruff: noqa: E402
 
+import contextlib
 import warnings
+from collections.abc import Callable, Iterator
 
 import jax
 
@@ -19,6 +21,7 @@ from state_space_practice.kalman import (
     InitialStatePrior,
     _gain_solve,
     _kalman_smoother_update,
+    _scan_with_boundary,
     joseph_form_update,
     kalman_filter,
     kalman_maximization_step,
@@ -28,6 +31,7 @@ from state_space_practice.kalman import (
     parallel_kalman_smoother,
     process_cov_residual_form,
     psd_solve,
+    rts_backward_scan,
     smooth_initial_state,
     smooth_initial_state_with_cross_cov,
     standard_kalman_gain,
@@ -44,6 +48,31 @@ from state_space_practice.tests.conftest import (
 # The x_1-prior M-step (initial_state_prior=None) is deprecated; tests of its
 # formulas assert the deprecation warning.
 LEGACY_PRIOR = r"initial_state_prior=None"
+
+# JAX lowers every newly traced computation to MLIR (even when a persistent
+# compilation cache then skips the backend compile), so counting lowerings
+# and backend compiles detects re-tracing.
+_COMPILE_EVENTS = (
+    "/jax/core/compile/jaxpr_to_mlir_module_duration",
+    "/jax/core/compile/backend_compile_duration",
+)
+
+
+@contextlib.contextmanager
+def _count_compiles() -> Iterator[Callable[[], int]]:
+    """Count JAX lowerings/compiles inside the block; yields a getter."""
+    count = 0
+
+    def listener(event: str, duration: float, **kwargs: object) -> None:
+        nonlocal count
+        count += event in _COMPILE_EVENTS
+
+    jax.monitoring.register_event_duration_secs_listener(listener)
+    try:
+        yield lambda: count
+    finally:
+        jax.monitoring.unregister_event_duration_listener(listener)
+
 
 # --- Unit Tests ---
 
@@ -1769,6 +1798,68 @@ class TestKalmanNumericalStability:
 # --- Parallel Kalman Smoother Tests ---
 
 
+class TestScanWithBoundary:
+    """The boundary-entry scan equals scan + concatenate, without the copies."""
+
+    @staticmethod
+    def _step(
+        carry: Array, x: tuple[Array, Array]
+    ) -> tuple[Array, tuple[tuple[Array, Array], Array]]:
+        a, b = x
+        new = 0.5 * carry + a * b
+        return new, ((new, jnp.outer(new, a)), carry @ b)
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    @pytest.mark.parametrize("n_time", [1, 2, 7])
+    def test_matches_scan_and_concatenate(self, reverse: bool, n_time: int) -> None:
+        k_a, k_b = random.split(random.PRNGKey(0))
+        a = random.normal(k_a, (n_time, 3))
+        b = random.normal(k_b, (n_time, 3))
+        init = jnp.ones(3)
+        # float32 boundary: concatenate promotes to the step's float64.
+        boundary = (jnp.full(3, 7.0, jnp.float32), jnp.full((3, 3), -1.0))
+        # Forward: step i reads a[i + 1], b[i]; reverse: a[i], b[i + 1].
+        starts = (0, 1) if reverse else (1, 0)
+        length = n_time - 1
+
+        carry, ys, zs = _scan_with_boundary(
+            self._step, init, (a, b), starts, length, boundary, reverse=reverse
+        )
+
+        ref_carry, ((y0, y1), ref_zs) = jax.lax.scan(
+            self._step,
+            init,
+            (a[starts[0] : starts[0] + length], b[starts[1] : starts[1] + length]),
+            reverse=reverse,
+        )
+        parts = [(y0, y1), tuple(v[None] for v in boundary)]
+        if not reverse:
+            parts = parts[::-1]
+        ref_ys = tuple(jnp.concatenate([parts[0][i], parts[1][i]]) for i in range(2))
+        np.testing.assert_array_equal(carry, ref_carry)
+        np.testing.assert_array_equal(zs, ref_zs)
+        for out, ref in zip(ys, ref_ys, strict=True):
+            assert out.dtype == ref.dtype == jnp.float64
+            assert out.shape == ref.shape == (n_time, *out.shape[1:])
+            np.testing.assert_array_equal(out, ref)
+
+    def test_rts_backward_scan_needs_no_full_size_temporaries(self) -> None:
+        """The RTS pass writes its outputs in place (no concatenate/slice copies)."""
+        T, D = 2000, 4
+        spec = jax.ShapeDtypeStruct
+        compiled = rts_backward_scan.lower(
+            spec((T, D), jnp.float64),
+            spec((T, D, D), jnp.float64),
+            spec((D, D), jnp.float64),
+            spec((D, D), jnp.float64),
+        ).compile()
+        memory = compiled.memory_analysis()
+        if memory is None:
+            pytest.skip("backend reports no memory analysis")
+        # Copying the stacked covariances alone would need T*D*D*8 = 256 kB.
+        assert memory.temp_size_in_bytes < 0.1 * T * D * D * 8
+
+
 class TestParallelKalmanSmoother:
     """Tests for the parallel RTS smoother via associative scan."""
 
@@ -1943,6 +2034,52 @@ class TestParallelKalmanSmoother:
         np.testing.assert_allclose(par_mean, seq_mean, atol=1e-8)
         np.testing.assert_allclose(par_cov, seq_cov, atol=1e-8)
         np.testing.assert_allclose(par_cross, seq_cross, atol=1e-8)
+
+    def test_float32_inputs_match_sequential_smoother(self) -> None:
+        """float32 inputs run under x64 and match the sequential RTS pass."""
+        T, D = 50, 3
+        k_mean, k_cov = random.split(random.PRNGKey(0))
+        filt_mean = random.normal(k_mean, (T, D)).astype(jnp.float32)
+        factors = random.normal(k_cov, (T, D, D))
+        filt_cov = (
+            jnp.einsum("tij,tkj->tik", factors, factors) + 0.5 * jnp.eye(D)
+        ).astype(jnp.float32)
+        A = (0.9 * jnp.eye(D)).astype(jnp.float32)
+        Q = (0.1 * jnp.eye(D)).astype(jnp.float32)
+        assert jax.config.jax_enable_x64  # the mixed-default-dtype setting
+
+        par = parallel_kalman_smoother(filt_mean, filt_cov, A, Q)
+        seq = rts_backward_scan(filt_mean, filt_cov, A, Q)
+
+        for par_out, seq_out in zip(par, seq):
+            assert par_out.dtype == jnp.float32
+            # float32 round-off of a log-depth vs a sequential recursion on
+            # O(1) values; a dtype or algebra bug gives O(1) differences.
+            np.testing.assert_allclose(par_out, seq_out, rtol=1e-4, atol=1e-4)
+
+    def test_compiles_once_per_shape(self) -> None:
+        """New shapes compile one jitted core; a repeat call compiles nothing.
+
+        Run op by op, the associative scan compiled one program per primitive
+        and tree level (100+ even at T=37); jitted, a new shape costs the core
+        plus the few eager finite checks.
+        """
+        T, D = 41, 3
+        filt_mean = random.normal(random.PRNGKey(0), (T, D))
+        filt_cov = jnp.broadcast_to(0.5 * jnp.eye(D), (T, D, D))
+        A, Q = 0.9 * jnp.eye(D), 0.1 * jnp.eye(D)
+
+        shifted_mean = filt_mean + 1.0
+        with _count_compiles() as n_compiles:
+            first = parallel_kalman_smoother(filt_mean, filt_cov, A, Q)
+        assert n_compiles() <= 20
+        with _count_compiles() as n_compiles:
+            second = parallel_kalman_smoother(shifted_mean, filt_cov, A, Q)
+        assert n_compiles() == 0
+        # Same compiled function on new values: the mean shifts, covariances
+        # (independent of the means) are unchanged.
+        assert not np.allclose(first[0], second[0])
+        np.testing.assert_array_equal(first[1], second[1])
 
     def test_rejects_bad_time_varying_parameter_shapes(self) -> None:
         T, D = 5, 2

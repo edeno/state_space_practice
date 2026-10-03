@@ -306,15 +306,46 @@ def _log_posterior_objective(
     log_posterior : Array, shape ()
         Scalar log posterior of the state estimate
     """
-    prob_success = jax.nn.sigmoid(bias + learning_state)
-    log_likelihood = jax.scipy.stats.binom.logpmf(
-        k=n_correct_in_trial, n=max_possible_correct, p=prob_success
+    log_likelihood = _binomial_logit_logpmf(
+        n_correct_in_trial, max_possible_correct, jnp.asarray(bias) + learning_state
     )
     log_prior = jax.scipy.stats.norm.logpdf(
         x=learning_state, loc=learning_state_prev, scale=jnp.sqrt(variance_prev)
     )
 
     return jnp.squeeze(log_likelihood + log_prior)
+
+
+def _binomial_logit_logpmf(
+    n_correct: ArrayLike, n_attempts: ArrayLike, logit: ArrayLike
+) -> Array:
+    """``log Binomial(n_correct; n_attempts, sigmoid(logit))``, elementwise.
+
+    Written with ``log_sigmoid`` rather than ``log(sigmoid(.))``: it stays
+    finite (with finite derivatives) where ``sigmoid(logit)`` rounds to 0 or
+    1, e.g. an error trial at ``logit >~ 37``.
+
+    Parameters
+    ----------
+    n_correct, n_attempts, logit : ArrayLike, broadcastable shapes
+
+    Returns
+    -------
+    Array, the broadcast shape
+    """
+    y = jnp.asarray(n_correct)
+    n = jnp.asarray(n_attempts)
+    eta = jnp.asarray(logit)
+    log_binom_coef = (
+        jax.scipy.special.gammaln(n + 1.0)
+        - jax.scipy.special.gammaln(y + 1.0)
+        - jax.scipy.special.gammaln(n - y + 1.0)
+    )
+    return (
+        log_binom_coef
+        + y * jax.nn.log_sigmoid(eta)
+        + (n - y) * jax.nn.log_sigmoid(-eta)
+    )
 
 
 def smith_laplace_log_likelihood(
@@ -367,19 +398,9 @@ def smith_laplace_log_likelihood(
     -------
     log_likelihood_terms : Array, shape (n_trials,)
     """
-    y = jnp.asarray(n_correct_responses)
-    n = jnp.asarray(max_possible_correct)
     mode = jnp.asarray(filtered_mode)
-    eta = mu + mode
-    log_binom_coef = (
-        jax.scipy.special.gammaln(n + 1.0)
-        - jax.scipy.special.gammaln(y + 1.0)
-        - jax.scipy.special.gammaln(n - y + 1.0)
-    )
-    log_lik_at_mode = (
-        log_binom_coef
-        + y * jax.nn.log_sigmoid(eta)
-        + (n - y) * jax.nn.log_sigmoid(-eta)
+    log_lik_at_mode = _binomial_logit_logpmf(
+        n_correct_responses, max_possible_correct, mu + mode
     )
     pred_var = jnp.asarray(one_step_variance)
     return (
@@ -793,24 +814,24 @@ def maximization_step(
 
 
 def calculate_probability_confidence_limits(
-    key: Array,
     smoothed_learning_state_mode: ArrayLike,
     smoothed_learning_state_variance: ArrayLike,
     prob_correct_by_chance: float,
-    n_samples: int = 10000,
     percentiles: ArrayLike | None = None,
     return_prob_above_chance: bool = False,
 ) -> tuple[Array, Array | None]:
-    """Calculates confidence limits for the probability of a correct response.
+    r"""Calculates confidence limits for the probability of a correct response.
 
-    This is achieved by sampling from the smoothed posterior distribution of
-    the learning state for each trial and transforming these samples through
-    the sigmoid link function.
+    The smoothed posterior of the learning state is ``x_k ~ N(m_k, s_k^2)``
+    (``s_k^2`` floored at ``1e-9``) and ``p_k = sigmoid(mu + x_k)`` with
+    ``sigmoid(mu)`` the chance level. The sigmoid is strictly increasing, so
+    the ``q``-th percentile of ``p_k`` is ``sigmoid(mu + m_k + s_k z_q)``
+    (``z_q`` the standard normal quantile) and
+    ``P(p_k > p_chance) = P(x_k > 0) = Phi(m_k / s_k)``. Both are computed
+    exactly (no sampling).
 
     Parameters
     ----------
-    key : Array
-        JAX PRNG key for random number generation.
     smoothed_learning_state_mode : ArrayLike, shape (n_trials,)
         Smoothed learning state means (x_{k|T}).
     smoothed_learning_state_variance : ArrayLike, shape (n_trials,)
@@ -820,11 +841,10 @@ def calculate_probability_confidence_limits(
         bias term (mu) in the sigmoid function: p_k = sigmoid(mu + x_k).
         If ``return_prob_above_chance`` is True, also used as the threshold
         for computing prob_above_chance.
-    n_samples : int, optional
-        Number of Monte Carlo samples to draw per trial. Default is 10000.
     percentiles : ArrayLike, optional
         Array of percentiles to compute (e.g., jnp.array([5, 50, 95])).
-        If None, defaults to jnp.array([5.0, 50.0, 95.0]).
+        If None, defaults to jnp.array([5.0, 50.0, 95.0]). Percentiles 0 and
+        100 give the exact limits 0 and 1.
     return_prob_above_chance : bool, optional
         If True, computes the certainty (prob_above_chance) that the true probability
         of a correct response is greater than the chance level. Default is False.
@@ -839,50 +859,39 @@ def calculate_probability_confidence_limits(
         Returned if return_prob_above_chance is True.
     """
     mu_bias = math.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
-    smoothed_learning_state_mode = jnp.asarray(smoothed_learning_state_mode)
-    smoothed_learning_state_variance = jnp.asarray(smoothed_learning_state_variance)
+    mode = jnp.asarray(smoothed_learning_state_mode)
+    std_dev = _smoothed_std_dev(smoothed_learning_state_variance)
+    latent_percentiles = _gaussian_percentiles(mode, std_dev, percentiles)
+    probability_percentiles = jax.nn.sigmoid(mu_bias + latent_percentiles)
+    if not return_prob_above_chance:
+        return probability_percentiles, None
+    return probability_percentiles, jax.scipy.special.ndtr(mode / std_dev)
+
+
+def _smoothed_std_dev(smoothed_learning_state_variance: ArrayLike) -> Array:
+    """Posterior standard deviation, variance floored at ``1e-9``, shape (n_trials,)."""
+    return jnp.sqrt(jnp.maximum(jnp.asarray(smoothed_learning_state_variance), 1e-9))
+
+
+def _gaussian_percentiles(
+    mean: Array, std_dev: Array, percentiles: ArrayLike | None
+) -> Array:
+    """Percentiles of ``N(mean, std_dev^2)`` per trial.
+
+    Parameters
+    ----------
+    mean, std_dev : Array, shape (n_trials,)
+    percentiles : ArrayLike, shape (n_percentiles,) or scalar, or None
+        Percentiles in [0, 100]; None means ``[5, 50, 95]``.
+
+    Returns
+    -------
+    Array, shape (n_percentiles, n_trials), or (n_trials,) for a scalar
+    """
     if percentiles is None:
         percentiles = jnp.array([5.0, 50.0, 95.0])
-
-    n_trials = smoothed_learning_state_mode.shape[0]
-
-    epsilon = 1e-9
-    smoothed_std_dev = jnp.sqrt(jnp.maximum(smoothed_learning_state_variance, epsilon))
-
-    # Function to process a single trial
-    def process_trial(
-        key_trial: Array, mode_k: Array, std_dev_k: Array
-    ) -> tuple[Array, Array | None]:
-        # Generate samples from the Gaussian posterior of the learning state x_k
-        # latent_state_samples will have shape (n_samples,)
-        latent_state_samples = mode_k + std_dev_k * jax.random.normal(
-            key_trial, shape=(n_samples,)
-        )
-
-        # Transform samples to probability of correct response
-        # prob_samples will have shape (n_samples,)
-        prob_samples = jax.nn.sigmoid(mu_bias + latent_state_samples)
-
-        # Calculate requested percentiles for this trial
-        trial_percentiles = jnp.percentile(prob_samples, percentiles)
-
-        # Calculate prob_above_chance if requested
-        if return_prob_above_chance:
-            trial_prob_above_chance = jnp.mean(prob_samples > prob_correct_by_chance)
-            return trial_percentiles, trial_prob_above_chance
-        else:
-            return trial_percentiles, None  # Or jnp.nan if a consistent shape is needed
-
-    # Generate per-trial PRNG keys
-    trial_keys = jax.random.split(key, n_trials)
-    probability_percentiles = jax.vmap(process_trial)(
-        trial_keys, smoothed_learning_state_mode, smoothed_std_dev
-    )
-
-    if return_prob_above_chance:
-        return probability_percentiles[0].T, probability_percentiles[1]
-    else:
-        return probability_percentiles[0].T, None
+    z = jax.scipy.special.ndtri(jnp.asarray(percentiles) / 100.0)
+    return mean + std_dev * z[..., None]
 
 
 def find_min_consecutive_successes(
@@ -1159,96 +1168,62 @@ def compute_cross_covariance_matrix(
     return upper_tri + upper_tri.T - jnp.diag(jnp.diag(upper_tri))
 
 
-def _sample_trial_states(
-    key: Array,
-    mean: Array,
-    cov: Array,
-    n_samples: int,
-    compare_probability: bool,
-    prob_correct_by_chance: float | None,
-) -> Array:
-    """Draw joint Gaussian samples of learning states for trial comparisons.
+def _prob_difference_positive(mean_diff: Array, diff_variance: Array) -> Array:
+    """``P(D > 0)`` for ``D ~ N(mean_diff, diff_variance)``, elementwise.
 
-    Samples ``N(mean, cov)`` through an eigendecomposition of ``cov`` (negative
-    eigenvalues clipped to zero) and, if ``compare_probability``, maps them to
-    probability space with ``sigmoid(mu + x)``.
+    A non-positive variance (a deterministic difference, up to round-off)
+    gives the indicator ``mean_diff > 0``.
 
     Parameters
     ----------
-    key : Array
-        JAX PRNG key.
-    mean : Array, shape (n_compared,)
-        Smoothed learning-state modes of the compared trials.
-    cov : Array, shape (n_compared, n_compared)
-        Joint posterior covariance of the compared trials.
-    n_samples : int
-        Number of Monte Carlo samples.
-    compare_probability : bool
-        If True, return sigmoid-transformed samples.
-    prob_correct_by_chance : float or None
-        Chance-level probability setting the bias ``mu``; required when
-        ``compare_probability`` is True.
+    mean_diff : Array, shape (...)
+    diff_variance : Array, shape (...)
 
     Returns
     -------
-    samples : Array, shape (n_samples, n_compared)
-
-    Raises
-    ------
-    ValueError
-        If ``compare_probability`` is True and ``prob_correct_by_chance`` is
-        None.
+    prob : Array, shape (...)
     """
-    # Eigendecomposition for numerical stability
-    eigenvalues, eigenvectors = jnp.linalg.eigh(cov)
-    eigenvalues = jnp.maximum(eigenvalues, 0.0)  # Ensure non-negative
-    sqrt_cov = eigenvectors @ jnp.diag(jnp.sqrt(eigenvalues))
-
-    z = jax.random.normal(key, shape=(n_samples, mean.shape[0]))
-    samples: Array = mean + z @ sqrt_cov.T
-
-    if compare_probability:
-        if prob_correct_by_chance is None:
-            raise ValueError(
-                "prob_correct_by_chance is required when compare_probability=True"
-            )
-        mu_bias = math.log(prob_correct_by_chance / (1 - prob_correct_by_chance))
-        samples = jax.nn.sigmoid(mu_bias + samples)
-    return samples
+    degenerate = diff_variance <= 0.0
+    sd = jnp.sqrt(jnp.where(degenerate, 1.0, diff_variance))
+    return jnp.where(
+        degenerate,
+        (mean_diff > 0.0).astype(sd.dtype),
+        jax.scipy.special.ndtr(mean_diff / sd),
+    )
 
 
 def compute_trial_comparison_matrix(
-    key: Array,
     smoothed_learning_state_mode: ArrayLike,
     smoothed_learning_state_variance: ArrayLike,
     smoother_gain: ArrayLike,
-    n_samples: int = 10000,
-    compare_probability: bool = False,
-    prob_correct_by_chance: float | None = None,
 ) -> Array:
-    """Compute pairwise comparison matrix for all trials (vectorized).
+    r"""Compute pairwise comparison matrix for all trials (vectorized).
 
     Computes P(x_i > x_j | y_{1:T}) for all pairs of trials i < j.
     This implements the full trialtotrial.m functionality using vectorized
     JAX operations for efficiency.
 
+    Under the Gaussian smoothed posterior, ``x_i - x_j`` is Gaussian with mean
+    ``m_i - m_j`` and variance ``P_i + P_j - 2 C_ij`` (``C`` from
+    :func:`compute_cross_covariance_matrix`), so
+
+    .. math::
+
+        P(x_i > x_j | y_{1:T}) = \Phi\left(
+            \frac{m_i - m_j}{\sqrt{P_i + P_j - 2 C_{ij}}}\right),
+
+    computed exactly (no sampling) in ``O(n_trials^2)`` memory. The sigmoid
+    link is strictly increasing, so this is also the probability-space
+    comparison ``P(p_i > p_j | y_{1:T})``.
+
     Parameters
     ----------
-    key : Array
-        JAX PRNG key for Monte Carlo sampling.
     smoothed_learning_state_mode : jnp.ndarray, shape (n_trials,)
         Smoothed learning state modes (x_{k|T}).
     smoothed_learning_state_variance : jnp.ndarray, shape (n_trials,)
         Smoothed learning state variances (P_{k|T}).
     smoother_gain : jnp.ndarray, shape (n_trials - 1,)
         Smoother gain values (A_k).
-    n_samples : int, optional
-        Number of Monte Carlo samples per comparison. Default is 10000.
-    compare_probability : bool, optional
-        If True, compare in probability space. Default is False.
-    prob_correct_by_chance : Optional[float], optional
-        Probability of correct response by chance. Required if compare_probability=True.
-        Used to compute the bias term for sigmoid transformation.
 
     Returns
     -------
@@ -1256,32 +1231,30 @@ def compute_trial_comparison_matrix(
         Upper triangular matrix where entry [i, j] (i < j) contains
         P(x_i > x_j | y_{1:T}). Diagonal is 0.5, lower triangle is NaN.
     """
-    mode = jnp.asarray(smoothed_learning_state_mode)
+    return _exact_comparison_matrix(
+        jnp.asarray(smoothed_learning_state_mode),
+        jnp.asarray(smoothed_learning_state_variance),
+        jnp.asarray(smoother_gain),
+    )
+
+
+@typed_jit
+def _exact_comparison_matrix(
+    mode: Array, smoothed_variance: Array, smoother_gain: Array
+) -> Array:
+    """Exact ``P(x_i > x_j | y_{1:T})`` matrix; see
+    :func:`compute_trial_comparison_matrix` (same arguments and layout)."""
     n_trials = mode.shape[0]
 
-    # Compute full cross-covariance matrix
-    cross_cov_matrix = compute_cross_covariance_matrix(
-        smoothed_learning_state_variance, smoother_gain
+    # Full posterior covariance across trials, shape (n_trials, n_trials)
+    cross_cov_matrix = compute_cross_covariance_matrix(smoothed_variance, smoother_gain)
+    marginal_var = jnp.diag(cross_cov_matrix)
+    diff_variance = (
+        marginal_var[:, None] + marginal_var[None, :] - 2.0 * cross_cov_matrix
     )
-
-    # Joint samples for all trials at once: shape (n_samples, n_trials)
-    samples = _sample_trial_states(
-        key,
-        mode,
-        cross_cov_matrix,
-        n_samples,
-        compare_probability,
-        prob_correct_by_chance,
+    comparison_matrix = _prob_difference_positive(
+        mode[:, None] - mode[None, :], diff_variance
     )
-
-    # Compute P(x_i > x_j) for all pairs using broadcasting
-    # samples[:, :, None] has shape (n_samples, n_trials, 1)
-    # samples[:, None, :] has shape (n_samples, 1, n_trials)
-    # comparison has shape (n_samples, n_trials, n_trials)
-    comparison = samples[:, :, None] > samples[:, None, :]
-
-    # Mean over samples gives P(x_i > x_j)
-    comparison_matrix = jnp.mean(comparison, axis=0)
 
     # Set diagonal to 0.5 and lower triangle to NaN
     comparison_matrix = jnp.where(
@@ -1297,29 +1270,27 @@ def compute_trial_comparison_matrix(
 
 
 def compare_two_trials(
-    key: Array,
     smoothed_learning_state_mode: ArrayLike,
     smoothed_learning_state_variance: ArrayLike,
     smoother_gain: ArrayLike,
     trial1: int,
     trial2: int,
-    n_samples: int = 10000,
-    compare_probability: bool = False,
-    prob_correct_by_chance: float | None = None,
 ) -> float:
     """Compute the probability that learning state at trial1 > trial2.
 
     This implements the trial-to-trial comparison from trialtotrial.m,
-    computing P(x_{trial1} > x_{trial2} | y_{1:T}) or optionally
-    P(p_{trial1} > p_{trial2} | y_{1:T}) for probability space.
+    computing P(x_{trial1} > x_{trial2} | y_{1:T}), which equals the
+    probability-space comparison P(p_{trial1} > p_{trial2} | y_{1:T}) (the
+    sigmoid link is strictly increasing). It is
+    ``Phi((m_1 - m_2) / sd(x_1 - x_2))`` under the joint Gaussian smoothed
+    posterior, computed exactly; this is entry ``[trial1, trial2]`` of
+    :func:`compute_trial_comparison_matrix`.
 
     For comparing many pairs, use compute_trial_comparison_matrix() instead
     which is more efficient due to vectorization.
 
     Parameters
     ----------
-    key : Array
-        JAX PRNG key for Monte Carlo sampling.
     smoothed_learning_state_mode : jnp.ndarray, shape (n_trials,)
         Smoothed learning state modes (x_{k|T}).
     smoothed_learning_state_variance : jnp.ndarray, shape (n_trials,)
@@ -1329,42 +1300,29 @@ def compare_two_trials(
     trial1 : int
         First trial index (0-based).
     trial2 : int
-        Second trial index (0-based). Must be different from trial1.
-    n_samples : int, optional
-        Number of Monte Carlo samples. Default is 10000.
-    compare_probability : bool, optional
-        If True, compare in probability space (sigmoid-transformed).
-        If False, compare raw latent states. Default is False.
-    prob_correct_by_chance : Optional[float], optional
-        Probability of correct response by chance. Required if compare_probability=True.
-        Used to compute the bias term for sigmoid transformation.
+        Second trial index (0-based). Equal indices return 0.5.
 
     Returns
     -------
     posterior_probability : float
-        Bayesian posterior probability P(x_{trial1} > x_{trial2} | y_{1:T}),
-        or in probability space if requested. This is NOT a frequentist p-value.
+        Bayesian posterior probability P(x_{trial1} > x_{trial2} | y_{1:T}).
+        This is NOT a frequentist p-value.
         Values > 0.5 indicate trial1 has higher learning state than trial2.
         Values near 0.95 or 0.05 indicate statistically significant differences.
     """
     if trial1 == trial2:
         return 0.5  # Same trial, no difference
 
-    # Sample from 2x2 marginal; avoids O(n² × n_samples) full comparison matrix
     cross_cov_matrix = compute_cross_covariance_matrix(
         smoothed_learning_state_variance, smoother_gain
     )
-    indices = jnp.array([trial1, trial2])
     mode = jnp.asarray(smoothed_learning_state_mode)
-    mean_2 = mode[indices]
-    cov_2 = cross_cov_matrix[jnp.ix_(indices, indices)]
-
-    # Sample from bivariate normal: shape (n_samples, 2)
-    samples = _sample_trial_states(
-        key, mean_2, cov_2, n_samples, compare_probability, prob_correct_by_chance
+    diff_variance = (
+        cross_cov_matrix[trial1, trial1]
+        + cross_cov_matrix[trial2, trial2]
+        - 2.0 * cross_cov_matrix[trial1, trial2]
     )
-
-    return float(jnp.mean(samples[:, 0] > samples[:, 1]))
+    return float(_prob_difference_positive(mode[trial1] - mode[trial2], diff_variance))
 
 
 def find_first_significant_trial(
@@ -1407,27 +1365,22 @@ def find_first_significant_trial(
 
 
 def calculate_latent_state_percentiles(
-    key: Array,
     smoothed_learning_state_mode: ArrayLike,  # shape: (n_trials,)
     smoothed_learning_state_variance: ArrayLike,  # shape: (n_trials,)
-    n_samples: int = 10000,
     percentiles: ArrayLike | None = None,
 ) -> Array:
     """Calculates confidence percentiles for the smoothed latent state.
 
-    Samples from the smoothed posterior distribution of the learning state
-    N(x_k|T, P_k|T) for each trial.
+    The exact percentiles ``m_k + s_k z_q`` of the smoothed posterior
+    ``N(x_{k|T}, P_{k|T})`` of each trial (``z_q`` the standard normal
+    quantile, ``s_k^2 = max(P_{k|T}, 1e-9)``); no sampling.
 
     Parameters
     ----------
-    key : Array
-        JAX PRNG key for random number generation.
     smoothed_learning_state_mode : jnp.ndarray, shape (n_trials,)
         Smoothed learning state means (x_{k|T}).
     smoothed_learning_state_variance : jnp.ndarray, shape (n_trials,)
         Smoothed learning state variances (P_{k|T}).
-    n_samples : int, optional
-        Number of Monte Carlo samples to draw per trial. Default is 10000.
     percentiles : jnp.ndarray, optional
         Array of percentiles to compute (e.g., jnp.array([5, 50, 95])).
         If None, defaults to jnp.array([5.0, 50.0, 95.0]).
@@ -1437,31 +1390,11 @@ def calculate_latent_state_percentiles(
     latent_state_percentiles : jnp.ndarray, shape (n_percentiles, n_trials)
         The computed percentile values for the latent state for each trial.
     """
-    if percentiles is None:
-        percentiles = jnp.array([5.0, 50.0, 95.0])
-
-    smoothed_learning_state_mode_arr = jnp.asarray(smoothed_learning_state_mode)
-    smoothed_learning_state_variance_arr = jnp.asarray(smoothed_learning_state_variance)
-    n_trials = smoothed_learning_state_mode_arr.shape[0]
-    epsilon = 1e-9  # For numerical stability if variance is tiny
-    smoothed_std_dev = jnp.sqrt(
-        jnp.maximum(smoothed_learning_state_variance_arr, epsilon)
+    return _gaussian_percentiles(
+        jnp.asarray(smoothed_learning_state_mode),
+        _smoothed_std_dev(smoothed_learning_state_variance),
+        percentiles,
     )
-
-    def process_trial_state(key_trial: Array, mode_k: Array, std_dev_k: Array) -> Array:
-        latent_state_samples = mode_k + std_dev_k * jax.random.normal(
-            key_trial, shape=(n_samples,)
-        )
-        return jnp.percentile(latent_state_samples, percentiles)
-
-    trial_keys = jax.random.split(key, n_trials)
-    # Use vmap for efficient per-trial processing
-    # mapped_results will have shape (n_trials, n_percentiles)
-    mapped_results: Array = jax.vmap(process_trial_state)(
-        trial_keys, smoothed_learning_state_mode_arr, smoothed_std_dev
-    )
-    # Transpose to get (n_percentiles, n_trials)
-    return mapped_results.T
 
 
 VALID_INIT_METHODS = frozenset(
@@ -1486,9 +1419,8 @@ class SmithLearningModel(SGDFittableMixin):
 
         model = SmithLearningModel(sigma_epsilon=0.22)
         log_likelihoods = model.fit(outcomes)
-        key = jax.random.PRNGKey(0)
-        prob_percentiles, _ = model.get_learning_curve(key)
-        fig, ax = model.plot_learning_curve(key, observed_n_correct=outcomes)
+        prob_percentiles, _ = model.get_learning_curve()
+        fig, ax = model.plot_learning_curve(observed_n_correct=outcomes)
 
     Attributes
     ----------
@@ -2046,8 +1978,11 @@ class SmithLearningModel(SGDFittableMixin):
         params: SGDParams = {}
         spec: SGDParamSpec = {}
 
+        # An explicit dtype makes the leaves strongly typed. A weakly typed
+        # leaf (jnp.array of a Python float) turns strong after the first
+        # optimizer update, which retraces and recompiles the SGD step.
         # Process noise is always learnable
-        params["sigma_epsilon"] = jnp.array(self.sigma_epsilon)
+        params["sigma_epsilon"] = jnp.asarray(self.sigma_epsilon, dtype=float)
         spec["sigma_epsilon"] = POSITIVE
 
         # Initial state params depend on initial_state_method
@@ -2055,9 +1990,13 @@ class SmithLearningModel(SGDFittableMixin):
             "reestimate_initial_from_data",
             "user_provided",
         ):
-            params["init_learning_state"] = jnp.array(self.init_learning_state)
+            params["init_learning_state"] = jnp.asarray(
+                self.init_learning_state, dtype=float
+            )
             spec["init_learning_state"] = UNCONSTRAINED
-            params["init_learning_variance"] = jnp.array(self.init_learning_variance)
+            params["init_learning_variance"] = jnp.asarray(
+                self.init_learning_variance, dtype=float
+            )
             spec["init_learning_variance"] = POSITIVE
         # For other methods, init state is data-driven or fixed — freeze it.
 
@@ -2111,24 +2050,18 @@ class SmithLearningModel(SGDFittableMixin):
 
     def get_learning_curve(
         self,
-        key: Array,
-        n_samples: int = 10000,
         percentiles: ArrayLike | None = None,
         return_prob_above_chance: bool = False,
     ) -> tuple[jax.Array, jax.Array | None]:
         """
         Calculates the smoothed learning curve (probability of correct response)
-        and its confidence limits.
+        and its confidence limits (exact posterior summaries; see
+        :func:`calculate_probability_confidence_limits`).
 
         Must be called after `fit`.
 
         Parameters
         ----------
-        key : Array
-            JAX PRNG key for random number generation (for sampling).
-        n_samples : int, optional
-            Number of Monte Carlo samples to draw per trial for confidence limits.
-            Default is 10000.
         percentiles : ArrayLike, optional
             Array of percentiles to compute for the probability (e.g., jnp.array([5, 50, 95])).
             If None, defaults to jnp.array([5.0, 50.0, 95.0]).
@@ -2154,32 +2087,25 @@ class SmithLearningModel(SGDFittableMixin):
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         return calculate_probability_confidence_limits(
-            key=key,
             smoothed_learning_state_mode=self.smoothed_learning_state_mode,
             smoothed_learning_state_variance=self.smoothed_learning_state_variance,
             prob_correct_by_chance=self.prob_correct_by_chance,
-            n_samples=n_samples,
             percentiles=percentiles,
             return_prob_above_chance=return_prob_above_chance,
         )
 
     def get_latent_state_percentiles(
         self,
-        key: Array,
-        n_samples: int = 10000,
         percentiles: ArrayLike | None = None,
     ) -> jax.Array:
         """
-        Calculates confidence percentiles for the smoothed latent learning state x_k|T.
+        Calculates confidence percentiles for the smoothed latent learning state x_k|T
+        (exact; see :func:`calculate_latent_state_percentiles`).
 
         Must be called after `fit`.
 
         Parameters
         ----------
-        key : Array
-            JAX PRNG key for random number generation.
-        n_samples : int, optional
-            Number of Monte Carlo samples per trial. Default is 10000.
         percentiles : ArrayLike, optional
             Percentiles to compute (e.g., jnp.array([5, 50, 95])).
             Defaults to [5.0, 50.0, 95.0].
@@ -2198,10 +2124,8 @@ class SmithLearningModel(SGDFittableMixin):
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         return calculate_latent_state_percentiles(
-            key=key,
             smoothed_learning_state_mode=self.smoothed_learning_state_mode,
             smoothed_learning_state_variance=self.smoothed_learning_state_variance,
-            n_samples=n_samples,
             percentiles=percentiles,
         )
 
@@ -2359,9 +2283,7 @@ class SmithLearningModel(SGDFittableMixin):
 
     def find_criterion_trial(
         self,
-        key: Array,
         alpha: float = 0.05,
-        n_samples: int = 10000,
     ) -> int | None:
         """Determines the first trial where learning is reliably above chance.
 
@@ -2369,17 +2291,14 @@ class SmithLearningModel(SGDFittableMixin):
         such that P(p_k > p_chance | y_{1:T}) >= 1 - alpha for all
         subsequent trials k' >= k. This is computed directly from the
         ``prob_above_chance`` posterior probability, not from percentile
-        thresholds.
+        thresholds; that probability is exact,
+        ``Phi(x_{k|T} / sqrt(P_{k|T}))``.
 
         Parameters
         ----------
-        key : Array
-            JAX PRNGKey for Monte Carlo sampling.
         alpha : float, optional
             Significance level. The criterion requires
             P(p_k > p_chance) >= 1 - alpha. Default is 0.05.
-        n_samples : int, optional
-            Number of Monte Carlo samples. Default is 10000.
 
         Returns
         -------
@@ -2397,7 +2316,7 @@ class SmithLearningModel(SGDFittableMixin):
         Examples
         --------
         >>> model.fit(outcomes)
-        >>> criterion = model.find_criterion_trial(jax.random.PRNGKey(0))
+        >>> criterion = model.find_criterion_trial()
         >>> if criterion is not None:
         ...     print(f"Learning established at trial {criterion}")
         """
@@ -2405,11 +2324,7 @@ class SmithLearningModel(SGDFittableMixin):
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
         # Compute P(p_k > p_chance | y_{1:T}) for each trial
-        _, prob_above_chance = self.get_learning_curve(
-            key=key,
-            n_samples=n_samples,
-            return_prob_above_chance=True,
-        )
+        _, prob_above_chance = self.get_learning_curve(return_prob_above_chance=True)
         assert prob_above_chance is not None
 
         threshold = 1.0 - alpha
@@ -2448,12 +2363,10 @@ class SmithLearningModel(SGDFittableMixin):
 
     def plot_learning_curve(
         self,
-        key: Array,
         plot_type: str = "probability",
         observed_n_correct: ArrayLike | None = None,
         observed_max_possible: ArrayLike | None = None,
         confidence_bounds: tuple[float, float] = (5.0, 95.0),
-        n_samples: int = 10000,
         title: str | None = None,
         xlabel: str = "Trial",
         ylabel_override: str | None = None,
@@ -2466,10 +2379,6 @@ class SmithLearningModel(SGDFittableMixin):
 
         Parameters
         ----------
-        key : Array
-            JAX PRNG key for random number generation, required for computing
-            confidence intervals if they haven't been implicitly computed by
-            prior calls that populate necessary attributes.
         plot_type : str, optional
             Type of plot to generate. Options are:
             - "probability": Plots the probability of a correct response (default).
@@ -2487,9 +2396,6 @@ class SmithLearningModel(SGDFittableMixin):
             Tuple of two floats representing the lower and upper percentile bounds
             for the confidence interval (e.g., (5.0, 95.0) for a 90% CI).
             Default is (5.0, 95.0).
-        n_samples : int, optional
-            Number of Monte Carlo samples used to compute confidence intervals.
-            Default is 10000.
         title : Optional[str], optional
             Custom title for the plot. If None, a default title is generated.
             Default is None.
@@ -2532,8 +2438,6 @@ class SmithLearningModel(SGDFittableMixin):
 
         if plot_type == "probability":
             prob_percentiles, _ = self.get_learning_curve(
-                key=key,
-                n_samples=n_samples,
                 percentiles=plot_percentiles,
                 return_prob_above_chance=False,
             )
@@ -2556,7 +2460,7 @@ class SmithLearningModel(SGDFittableMixin):
             )
         elif plot_type == "latent_state":
             state_percentiles = self.get_latent_state_percentiles(
-                key=key, n_samples=n_samples, percentiles=plot_percentiles
+                percentiles=plot_percentiles
             )
             lower_ci = state_percentiles[0, :]
             median_curve = state_percentiles[1, :]
@@ -2663,33 +2567,25 @@ class SmithLearningModel(SGDFittableMixin):
 
     def compare_trials(
         self,
-        key: Array,
         trial1: int,
         trial2: int,
-        n_samples: int = 10000,
-        compare_probability: bool = False,
     ) -> float:
         """Compare two trials to determine if learning state differs.
 
         Computes P(x_{trial1} > x_{trial2} | y_{1:T}), the probability that
         the learning state at trial1 is greater than at trial2, given all
-        observed data.
+        observed data (exact; see :func:`compare_two_trials`). The sigmoid
+        link is strictly increasing, so this is also the probability-space
+        comparison P(p_{trial1} > p_{trial2} | y_{1:T}).
 
         Must be called after `fit`.
 
         Parameters
         ----------
-        key : Array
-            JAX PRNG key for Monte Carlo sampling.
         trial1 : int
             First trial index (0-based).
         trial2 : int
             Second trial index (0-based).
-        n_samples : int, optional
-            Number of Monte Carlo samples. Default is 10000.
-        compare_probability : bool, optional
-            If True, compare in probability space (sigmoid-transformed).
-            If False, compare raw latent states. Default is False.
 
         Returns
         -------
@@ -2717,41 +2613,22 @@ class SmithLearningModel(SGDFittableMixin):
                 f"Got trial1={trial1}, trial2={trial2}."
             )
 
-        prob_chance = self.prob_correct_by_chance if compare_probability else None
-
         return compare_two_trials(
-            key=key,
             smoothed_learning_state_mode=self.smoothed_learning_state_mode,
             smoothed_learning_state_variance=self.smoothed_learning_state_variance,
             smoother_gain=self.smoother_gain,
             trial1=trial1,
             trial2=trial2,
-            n_samples=n_samples,
-            compare_probability=compare_probability,
-            prob_correct_by_chance=prob_chance,
         )
 
-    def get_trial_comparison_matrix(
-        self,
-        key: Array,
-        n_samples: int = 10000,
-        compare_probability: bool = False,
-    ) -> Array:
+    def get_trial_comparison_matrix(self) -> Array:
         """Compute pairwise comparison matrix for all trials.
 
-        For all pairs of trials i < j, computes P(x_i > x_j | y_{1:T}).
+        For all pairs of trials i < j, computes P(x_i > x_j | y_{1:T})
+        (exact; see :func:`compute_trial_comparison_matrix`).
         This implements the trialtotrial.m functionality from the MATLAB code.
 
         Must be called after `fit`.
-
-        Parameters
-        ----------
-        key : Array
-            JAX PRNG key for Monte Carlo sampling.
-        n_samples : int, optional
-            Number of Monte Carlo samples per comparison. Default is 10000.
-        compare_probability : bool, optional
-            If True, compare in probability space. Default is False.
 
         Returns
         -------
@@ -2768,8 +2645,7 @@ class SmithLearningModel(SGDFittableMixin):
         --------
         >>> model = SmithLearningModel()
         >>> model.fit(responses)
-        >>> key = jax.random.PRNGKey(0)
-        >>> matrix = model.get_trial_comparison_matrix(key)
+        >>> matrix = model.get_trial_comparison_matrix()
         >>> # Check if trial 10 is significantly higher than trial 0
         >>> p_val = matrix[0, 10]
         >>> if p_val < 0.025:
@@ -2778,25 +2654,16 @@ class SmithLearningModel(SGDFittableMixin):
         if not self.is_fitted:
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
-        prob_chance = self.prob_correct_by_chance if compare_probability else None
-
         return compute_trial_comparison_matrix(
-            key=key,
             smoothed_learning_state_mode=self.smoothed_learning_state_mode,
             smoothed_learning_state_variance=self.smoothed_learning_state_variance,
             smoother_gain=self.smoother_gain,
-            n_samples=n_samples,
-            compare_probability=compare_probability,
-            prob_correct_by_chance=prob_chance,
         )
 
     def find_first_significant_improvement(
         self,
-        key: Array,
         reference_trial: int = 0,
         significance_level: float = 0.05,
-        n_samples: int = 10000,
-        compare_probability: bool = False,
     ) -> int | None:
         """Find the first trial with significantly higher learning than reference.
 
@@ -2808,16 +2675,10 @@ class SmithLearningModel(SGDFittableMixin):
 
         Parameters
         ----------
-        key : Array
-            JAX PRNG key for Monte Carlo sampling.
         reference_trial : int, optional
             The reference trial to compare against. Default is 0 (first trial).
         significance_level : float, optional
             Two-tailed significance threshold. Default is 0.05.
-        n_samples : int, optional
-            Number of Monte Carlo samples per comparison. Default is 10000.
-        compare_probability : bool, optional
-            If True, compare in probability space. Default is False.
 
         Returns
         -------
@@ -2838,11 +2699,7 @@ class SmithLearningModel(SGDFittableMixin):
         if not self.is_fitted:
             raise NotFittedError("Model has not been fitted. Run .fit() method first.")
 
-        comparison_matrix = self.get_trial_comparison_matrix(
-            key=key,
-            n_samples=n_samples,
-            compare_probability=compare_probability,
-        )
+        comparison_matrix = self.get_trial_comparison_matrix()
 
         return find_first_significant_trial(
             comparison_matrix=comparison_matrix,
@@ -2954,18 +2811,19 @@ class SmithLearningModel(SGDFittableMixin):
 
     def summary(
         self,
-        key: Array | None = None,
+        include_criterion: bool = True,
         n_correct_responses: ArrayLike | None = None,
     ) -> str:
         """Return a text summary of the fitted model.
 
         Parameters
         ----------
-        key : Array, optional
-            JAX PRNG key. If provided, computes the criterion trial.
+        include_criterion : bool, optional
+            If True, reports the criterion trial from
+            :meth:`find_criterion_trial` (default ``alpha``). Default is True.
         n_correct_responses : ArrayLike, optional
-            Observed data. If provided along with ``key``, includes a null
-            model comparison.
+            Observed data. If provided, includes a null model comparison
+            (:meth:`compare_to_null`).
 
         Returns
         -------
@@ -2995,14 +2853,14 @@ class SmithLearningModel(SGDFittableMixin):
             f"  N trials:               {self._n_trials_}",
         ]
 
-        if key is not None:
-            criterion = self.find_criterion_trial(key)
+        if include_criterion:
+            criterion = self.find_criterion_trial()
             if criterion is not None:
                 lines.append(f"  Criterion trial:        {criterion}")
             else:
                 lines.append("  Criterion trial:        not met")
 
-        if key is not None and n_correct_responses is not None:
+        if n_correct_responses is not None:
             comparison = self.compare_to_null(n_correct_responses)
             lines.extend(
                 [
@@ -3019,9 +2877,6 @@ class SmithLearningModel(SGDFittableMixin):
 
     def plot_trial_comparison_matrix(
         self,
-        key: Array,
-        n_samples: int = 10000,
-        compare_probability: bool = False,
         significance_level: float = 0.05,
         title: str | None = None,
         cmap: str = "bone",
@@ -3036,12 +2891,6 @@ class SmithLearningModel(SGDFittableMixin):
 
         Parameters
         ----------
-        key : Array
-            JAX PRNG key for Monte Carlo sampling.
-        n_samples : int, optional
-            Number of Monte Carlo samples per comparison. Default is 10000.
-        compare_probability : bool, optional
-            If True, compare in probability space. Default is False.
         significance_level : float, optional
             Two-tailed significance threshold. Default is 0.05.
         title : Optional[str], optional
@@ -3066,11 +2915,7 @@ class SmithLearningModel(SGDFittableMixin):
 
         import matplotlib.pyplot as plt
 
-        comparison_matrix = self.get_trial_comparison_matrix(
-            key=key,
-            n_samples=n_samples,
-            compare_probability=compare_probability,
-        )
+        comparison_matrix = self.get_trial_comparison_matrix()
 
         n_trials = comparison_matrix.shape[0]
         fig, ax = plt.subplots(figsize=(8, 8), constrained_layout=True)
@@ -3201,9 +3046,7 @@ class SmithLearningModel(SGDFittableMixin):
 
     def plot_summary(
         self,
-        key: Array,
         observed_n_correct: ArrayLike | None = None,
-        n_samples: int = 10000,
     ) -> tuple[Figure, np.ndarray]:
         """Multi-panel diagnostic figure summarizing the fitted model.
 
@@ -3217,13 +3060,8 @@ class SmithLearningModel(SGDFittableMixin):
 
         Parameters
         ----------
-        key : Array
-            JAX PRNG key for Monte Carlo sampling.
         observed_n_correct : ArrayLike, shape (n_trials,), optional
             Observed correct responses to overlay on the learning curve.
-        n_samples : int, optional
-            Number of Monte Carlo samples for confidence intervals.
-            Default is 10000.
 
         Returns
         -------
@@ -3250,12 +3088,7 @@ class SmithLearningModel(SGDFittableMixin):
 
         # --- Panel 1: Learning curve (probability) ---
         ax = axes[0]
-        key1, key2 = jax.random.split(key)
-        prob_percentiles, _ = self.get_learning_curve(
-            key=key1,
-            n_samples=n_samples,
-            percentiles=plot_percentiles,
-        )
+        prob_percentiles, _ = self.get_learning_curve(percentiles=plot_percentiles)
         ax.plot(
             trials_axis,
             prob_percentiles[1],
@@ -3293,7 +3126,7 @@ class SmithLearningModel(SGDFittableMixin):
                 )
 
         # Mark criterion trial
-        criterion = self.find_criterion_trial(key1, n_samples=n_samples)
+        criterion = self.find_criterion_trial()
         if criterion is not None and criterion > 0:
             ax.axvline(
                 criterion,
@@ -3313,9 +3146,7 @@ class SmithLearningModel(SGDFittableMixin):
         # --- Panel 2: Latent state ---
         ax = axes[1]
         state_percentiles = self.get_latent_state_percentiles(
-            key=key2,
-            n_samples=n_samples,
-            percentiles=plot_percentiles,
+            percentiles=plot_percentiles
         )
         ax.plot(
             trials_axis,

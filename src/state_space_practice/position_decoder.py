@@ -736,16 +736,16 @@ def _kde_log_rate(
     xy = position[:2]
     diff = encoding_positions - xy[None, :]  # (n_bins, 2)
     dist_sq = jnp.sum(diff**2, axis=1)  # (n_bins,)
-    kernel_unnorm = jnp.exp(-0.5 * dist_sq / sigma2)  # (n_bins,)
 
     # Normalize the kernel so weights sum to 1. This makes the
     # kernel-weighted occupancy sum comparable in units (seconds) to
     # ``occupancy_tau``, matching the scale-wise behavior of the
     # Gaussian-smoothed rate-map construction in from_spike_position_data
     # (which uses ``scipy.ndimage.gaussian_filter``, itself a normalized
-    # weighted average).
-    kernel_sum = jnp.sum(kernel_unnorm) + 1e-30
-    kernel = kernel_unnorm / kernel_sum
+    # weighted average). Normalizing in log space (softmax) keeps the
+    # weights -- and their gradient -- exact far from every bin, where each
+    # unnormalized ``exp(-0.5 d^2 / sigma^2)`` underflows to 0.
+    kernel = jax.nn.softmax(-0.5 * dist_sq / sigma2)  # (n_bins,)
 
     occ_kernel = jnp.sum(occ_weights * kernel)  # "seconds" (weighted-avg occ per bin)
     spike_kernels = (
