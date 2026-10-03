@@ -1730,6 +1730,24 @@ class TestKalmanNumericalStability:
         gradient = jax.grad(loss)(jnp.asarray(1.0, dtype=cov.dtype))
         np.testing.assert_allclose(gradient, -jnp.sum(expected), rtol=1e-6)
 
+    def test_numerically_singular_innovation_cov_fails_loud(self) -> None:
+        """A rank-1 prediction (A = 0, Q = 11^T) plus R = 1e-20 I gives an
+        innovation covariance that does not factor in float64. The gain solve
+        is stabilised, so the posterior stays finite, but the likelihood is
+        deliberately non-finite so EM rolls back or raises rather than
+        accepting the likelihood of a regularised model."""
+        means, covs, log_likelihood = kalman_filter(
+            jnp.zeros(2),
+            jnp.eye(2),
+            jnp.ones((5, 2)),
+            jnp.zeros((2, 2)),
+            jnp.ones((2, 2)),
+            jnp.eye(2),
+            1e-20 * jnp.eye(2),
+        )
+        assert jnp.all(jnp.isfinite(means)) and jnp.all(jnp.isfinite(covs))
+        assert not jnp.isfinite(log_likelihood)
+
     @pytest.mark.parametrize("int_dtype", [jnp.int32, jnp.int64])
     def test_gain_solve_integer_singular_cov_float32_rhs(self, int_dtype) -> None:
         """An integer cov is stabilised at the precision of the float32 solve.

@@ -495,6 +495,11 @@ def kalman_measurement_update(
     # Evaluated on the unboosted innovation covariance (the stabilised solve
     # above adds a tiny diagonal shift); keeping the two separate matches the
     # established likelihood values that the EM convergence checks depend on.
+    # An innovation covariance that does not factor (numerically singular, e.g.
+    # a rank-deficient H P H^T with negligible R) gives a non-finite likelihood
+    # on purpose, although the stabilised gain keeps the posterior finite: EM's
+    # non-finite check then rolls back or raises instead of accepting the
+    # likelihood of a silently regularised model.
     marginal_log_likelihood = jnp.asarray(
         jax.scipy.stats.multivariate_normal.logpdf(x=obs, mean=obs_mean, cov=obs_cov)
     )
