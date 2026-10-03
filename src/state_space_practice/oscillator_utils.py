@@ -7,6 +7,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.typing import ArrayLike
 
 from state_space_practice.exceptions import StateSpaceWarning
@@ -1360,6 +1361,34 @@ def construct_stable_directed_influence_transition_stack(
     return transition_stack
 
 
+@typed_jit
+def _project_coupled_transition_matrix_stack(
+    transition_matrices: jax.Array,
+) -> jax.Array:
+    """Block-wise scaled-rotation projection of every state, in one executable.
+
+    The structural half of :func:`project_transition_matrix_stack` (the
+    spectral clamp runs on the host). Unrolled over the static discrete-state
+    axis rather than vmapped, so each state's non-finite fallback message
+    stays conditional on that state alone, as in the per-state eager call.
+
+    Parameters
+    ----------
+    transition_matrices : jax.Array, shape (n_latent, n_latent, n_discrete_states)
+
+    Returns
+    -------
+    jax.Array, shape (n_latent, n_latent, n_discrete_states)
+    """
+    return jnp.stack(
+        [
+            project_coupled_transition_matrix(transition_matrices[..., j])
+            for j in range(transition_matrices.shape[-1])
+        ],
+        axis=-1,
+    )
+
+
 def project_transition_matrix_stack(
     transition_matrices: ArrayLike, max_spectral_radius: float = 0.99
 ) -> jax.Array:
@@ -1374,8 +1403,10 @@ def project_transition_matrix_stack(
     coupled) oscillators only the offending oscillator block is rescaled, so a
     single unstable rhythm does not damp every other rhythm; for fully coupled
     oscillators it is the uniform scale. The clamp logs a warning (``logging``)
-    reporting the radius and scale whenever it engages. It is computed on host
-    (``eigvals`` has no accelerator lowering), so this runs eagerly.
+    reporting the radius and scale whenever it engages. The block projection
+    of the whole stack is one jit-compiled call; the clamp is computed on host
+    (``eigvals`` has no accelerator lowering), so this function itself cannot
+    be traced.
 
     Parameters
     ----------
@@ -1390,15 +1421,17 @@ def project_transition_matrix_stack(
     -------
     jax.Array, shape (2 * n_oscillators, 2 * n_oscillators, n_discrete_states)
     """
-    transition_matrices = jnp.asarray(transition_matrices)
+    projected = np.asarray(
+        _project_coupled_transition_matrix_stack(jnp.asarray(transition_matrices))
+    )
     return jnp.stack(
         [
             stabilize_transition_matrix(
-                project_coupled_transition_matrix(transition_matrices[..., j]),
+                projected[..., j],
                 max_spectral_radius=max_spectral_radius,
                 block_size=2,
             )
-            for j in range(transition_matrices.shape[-1])
+            for j in range(projected.shape[-1])
         ],
         axis=-1,
     )

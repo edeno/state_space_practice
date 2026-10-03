@@ -19,6 +19,7 @@ from state_space_practice.oscillator_utils import (
     _extract_scale_and_angle,
     _get_rotation_matrix,
     _get_scaling_factor,
+    _project_coupled_transition_matrix_stack,
     _project_to_closest_rotation,
     _scatter_block_diagonal,
     canonicalize_correlated_noise_pair_parameters,
@@ -1210,6 +1211,77 @@ def test_dim_standard_em_sync_compiles_nothing_after_warm_up() -> None:
             jax.block_until_ready(host.continuous_transition_matrix)
 
     assert compiles == []
+
+
+@pytest.mark.parametrize("case", ["within_bound", "clamp_engaged", "non_finite"])
+def test_project_transition_matrix_stack_is_bit_identical_to_eager_per_state(
+    case: str,
+) -> None:
+    """The jitted block projection + host clamp reproduces the eager per-state
+    projection exactly, including when the clamp engages and on the
+    damped-identity fallback for a non-finite block."""
+    bound = 0.9
+    stable = construct_common_oscillator_transition_matrix(
+        freqs=jnp.array([8.0, 12.0]),
+        damping_coef=jnp.array([0.8, 0.7]),
+        sampling_freq=100.0,
+    )
+    noise = 0.05 * jax.random.normal(jax.random.PRNGKey(3), (4, 4, 3))
+    raw = stable[..., None] + noise
+    if case == "clamp_engaged":
+        raw = 1.5 * raw
+    elif case == "non_finite":
+        raw = raw.at[0, 3, 1].set(jnp.nan)
+
+    expected = jnp.stack(
+        [
+            stabilize_transition_matrix(
+                project_coupled_transition_matrix(raw[..., j]),
+                max_spectral_radius=bound,
+                block_size=2,
+            )
+            for j in range(raw.shape[-1])
+        ],
+        axis=-1,
+    )
+    # Guard: each case exercises the path it names.
+    radii = [
+        _spectral_radius(project_coupled_transition_matrix(raw[..., j]))
+        for j in range(3)
+    ]
+    if case == "clamp_engaged":
+        assert min(radii) > bound
+    elif case == "within_bound":
+        assert max(radii) < bound
+    else:
+        np.testing.assert_array_equal(expected[0:2, 2:4, 1], 0.5 * np.eye(2))
+
+    np.testing.assert_array_equal(
+        project_transition_matrix_stack(raw, max_spectral_radius=bound), expected
+    )
+
+
+@pytest.mark.parametrize("helper", ["_project_coupled_transition_matrix_stack"])
+def test_dim_projection_helpers_compile_once_and_never_retrace(helper: str) -> None:
+    """The standard-EM block projection is one jitted executable: the first
+    call on a fresh shape compiles at most one, and new values (later EM
+    iterations) compile nothing."""
+    n_osc, n_states = 5, 3
+    n_latent = 2 * n_osc
+    calls = []
+    for seed in range(4):
+        rng = np.random.default_rng(seed)
+        A = jnp.asarray(rng.normal(size=(n_latent, n_latent, n_states)))
+        calls.append(functools.partial(_project_coupled_transition_matrix_stack, A))
+
+    with _count_backend_compiles() as first:
+        jax.block_until_ready(calls[0]())
+    with _count_backend_compiles() as later:
+        for call in calls[1:]:
+            jax.block_until_ready(call())
+
+    assert len(first) <= 1
+    assert later == []
 
 
 # CNM covariance projection: closed-form PSD shrink factor vs. bisection
