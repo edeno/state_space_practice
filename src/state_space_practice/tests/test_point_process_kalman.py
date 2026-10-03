@@ -4273,8 +4273,9 @@ class TestBlockDiagonalCovarianceContainer:
                 jax.jit(lambda x: x)(cov)
 
 
-class TestSmootherBackwardPassMemory:
-    """The smoothers' backward passes write their outputs in place.
+class TestScanOutputMemory:
+    """The block forward pass and the smoothers' backward passes write their
+    outputs in place.
 
     A backward scan whose stacked outputs are concatenated with the terminal
     step, or that scans over sliced inputs, holds a second full-size copy of
@@ -4322,6 +4323,28 @@ class TestSmootherBackwardPassMemory:
         )
         # One copy of the smoothed covariances is T*d*d*8 = 256 kB.
         assert temp < 0.1 * T * d * d * 8
+
+    def test_block_forward_needs_no_full_size_temporaries(self) -> None:
+        T, n_neurons, nb = self.n_time, 3, 4
+        spec = jax.ShapeDtypeStruct
+        temp = self._temp_bytes(
+            lambda *args: _block_diagonal_forward_core(
+                *args,
+                0.02,
+                include_laplace_normalization=True,
+                max_log_count=20.0,
+                max_newton_iter=3,
+            ),
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((n_neurons, nb), jnp.float64),
+            spec((n_neurons, nb, nb), jnp.float64),
+            spec((T, nb), jnp.float64),
+            spec((T, n_neurons), jnp.float64),
+        )
+        # The filtered moments are outputs, not temps. One copy of the
+        # per-neuron filtered covariances is n_neurons*T*nb*nb*8 = 768 kB.
+        assert temp < 0.1 * n_neurons * T * nb * nb * 8
 
     def test_block_smoother_backward_adds_no_full_size_temporaries(self) -> None:
         T, n_neurons, nb = self.n_time, 3, 4

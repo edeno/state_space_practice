@@ -2101,9 +2101,10 @@ def _block_diagonal_forward_core(
 
     Takes the array fields of a :class:`BlockDiagonalStructure` explicitly,
     so its Python-int fields never become traced, and the option flags as
-    static arguments. Each neuron's scan uses its own ``A_blocks[j]`` and
-    ``Q_blocks[j]`` (vmapped alongside its initial state and spikes). The vmapped ``lax.scan`` is therefore traced and
-    compiled once per (shapes, dtypes, options) and reused across calls --
+    static arguments. One ``lax.scan`` over time runs every neuron's step
+    (vmapped over neurons), each with its own ``A_blocks[j]`` and
+    ``Q_blocks[j]``, initial state and spikes. The scan is therefore traced
+    and compiled once per (shapes, dtypes, options) and reused across calls --
     every EM iteration of ``PlaceFieldModel.fit`` -- instead of being
     re-traced on each call. ``dt`` and ``max_log_count`` are ordinary
     (traced) scalars, so changing their values does not recompile.
@@ -2173,29 +2174,49 @@ def _block_diagonal_forward_core(
             (post_mean, post_cov),
         )
 
-    def _run_one_neuron(
-        A_j: Array,
-        Q_j: Array,
-        init_mean_j: Array,
-        init_cov_j: Array,
-        spikes_j: Array,
-    ) -> tuple[Array, Array, Array, Array]:
-        init_carry = (
-            init_mean_j,
-            init_cov_j,
-            jnp.array(0.0, dtype=init_mean_j.dtype),
-            jnp.zeros((), dtype=jnp.int32),
-        )
-        (_, _, ll_j, n_failed_j), (means_j, covs_j) = jax.lax.scan(
-            functools.partial(_step_one_neuron, A_j, Q_j),
-            init_carry,
-            (Z_base, spikes_j),
-        )
-        return means_j, covs_j, ll_j, n_failed_j
+    # Scan over time with the per-neuron step vmapped inside it, writing the
+    # filtered moments into neuron-major buffers carried through the scan
+    # (updated in place). Stacking them as scan outputs would lay them out
+    # time-major, and the transpose to the per-neuron layout is a full-size
+    # copy.
+    n_neurons = init_means_per_neuron.shape[0]
+    n_time = Z_base.shape[0]
+    step_all = jax.vmap(_step_one_neuron, in_axes=(0, 0, 0, (None, 0)))
 
-    return jax.vmap(_run_one_neuron, in_axes=(0, 0, 0, 0, 1))(
-        A_blocks, Q_blocks, init_means_per_neuron, init_covs_per_neuron, spike_indicator
+    def _step_all_neurons(
+        carry: tuple[tuple[Array, Array, Array, Array], Array, Array, Array],
+        args: tuple[Array, Array],
+    ) -> tuple[tuple[tuple[Array, Array, Array, Array], Array, Array, Array], None]:
+        neuron_carry, means_buffer, covs_buffer, t = carry
+        neuron_carry, (post_means, post_covs) = step_all(
+            A_blocks, Q_blocks, neuron_carry, args
+        )
+        # The step is still traced when n_time == 0 (a zero-length scan),
+        # where the buffers are empty and there is nothing to write.
+        if n_time > 0:
+            means_buffer = jax.lax.dynamic_update_index_in_dim(
+                means_buffer, post_means, t, axis=1
+            )
+            covs_buffer = jax.lax.dynamic_update_index_in_dim(
+                covs_buffer, post_covs, t, axis=1
+            )
+        return (neuron_carry, means_buffer, covs_buffer, t + 1), None
+
+    init_carry = (
+        (
+            init_means_per_neuron,
+            init_covs_per_neuron,
+            jnp.zeros((n_neurons,), dtype),
+            jnp.zeros((n_neurons,), dtype=jnp.int32),
+        ),
+        jnp.zeros((n_neurons, n_time, *init_means_per_neuron.shape[1:]), dtype),
+        jnp.zeros((n_neurons, n_time, *init_covs_per_neuron.shape[1:]), dtype),
+        jnp.asarray(0),
     )
+    ((_, _, lls_per_neuron, n_failed_per_neuron), means, covs, _), _ = jax.lax.scan(
+        _step_all_neurons, init_carry, (Z_base, spike_indicator)
+    )
+    return means, covs, lls_per_neuron, n_failed_per_neuron
 
 
 def _run_forward_block_diagonal(

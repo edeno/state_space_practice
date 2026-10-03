@@ -168,6 +168,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   buffers, so no full-size temporary copies are made (T=5000, d=50: backward
   temp 102 MB -> 0.2 MB; block-diagonal smoother core 504 MB -> 160 MB).
   Outputs and gradients are bit-identical.
+- **Block-diagonal point-process forward pass writes its outputs in place**:
+  one time scan runs every neuron's step (vmapped inside it) and writes the
+  filtered moments into per-neuron buffers, instead of a vmap of per-neuron
+  scans whose stacked outputs were transposed to the per-neuron layout (a
+  full-size copy). Compiled temp at T=5000, 10 neurons, 20 basis functions:
+  forward and smoother cores 160 MB -> 0.2 MB. Outputs and gradients are
+  bit-identical; runtime is unchanged.
 - **Typed PRNG keys internally**: default and seed-derived keys use
   `jax.random.key` (JAX's recommended typed keys) instead of the legacy
   `jax.random.PRNGKey`, which JAX plans to deprecate. Both encode the same
