@@ -635,9 +635,13 @@ def _forward_pass(
         obs_offset_t = _compute_obs_offset(obs_dm_t)
 
         # Every state is reachable after a (softmax) transition, so a zero here
-        # is underflow, not a structural zero: floor it.
+        # is underflow, not a structural zero: lift it to the smallest normal
+        # float, leaving every representable positive belief at its true value.
         posterior, log_norm = _update(
-            jnp.log(jnp.maximum(predicted, 1e-30)), choice_t, reward_t, obs_offset_t
+            jnp.log(jnp.maximum(predicted, jnp.finfo(predicted.dtype).tiny)),
+            choice_t,
+            reward_t,
+            obs_offset_t,
         )
         return (posterior, accum_ll + log_norm), (posterior, predicted, trans)
 
@@ -825,7 +829,10 @@ def _contingency_belief_smoother_jit(
         filter_t, predicted_tp1, trans_tp1 = step_data
         # beta_next = P(s_{t+1} | data) / P(s_{t+1} | data_{1:t})
         # smoothed_t = filter_t * sum_j T(i→j) * beta_next[j] / predicted[j]
-        ratio = beta_next / jnp.maximum(predicted_tp1, 1e-30)
+        # Same floor as the forward pass, so the ratio matches its posterior.
+        ratio = beta_next / jnp.maximum(
+            predicted_tp1, jnp.finfo(predicted_tp1.dtype).tiny
+        )
         beta_t = filter_t * (trans_tp1 @ ratio)
         # Normalize for stability
         beta_t = beta_t / jnp.maximum(beta_t.sum(), 1e-30)
@@ -857,7 +864,9 @@ def _contingency_belief_smoother_jit(
         # NOT the smoothed marginal (which conditions on future data too); using
         # the smoothed marginal breaks the marginalization identity
         # sum_j P(s_t=i, s_{t+1}=j) = P(s_t=i | data).
-        ratio = smooth_tp1 / jnp.maximum(predicted_tp1, 1e-30)
+        ratio = smooth_tp1 / jnp.maximum(
+            predicted_tp1, jnp.finfo(predicted_tp1.dtype).tiny
+        )
         joint = filter_t[:, None] * trans_tp1 * ratio[None, :]
         # Normalize
         return joint / jnp.maximum(joint.sum(), 1e-30)

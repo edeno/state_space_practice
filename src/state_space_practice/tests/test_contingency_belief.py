@@ -290,6 +290,52 @@ class TestStructuralZeroPrior:
         assert jnp.isfinite(jax.grad(log_likelihood)(5.0))
 
 
+class TestTinyPredictedBelief:
+    """A reachable state with a tiny (sub-1e-30) predicted belief keeps its true
+    value: P(0 -> 1) ~ 1e-40, then a choice that favours state 1 by exp(200).
+    """
+
+    @pytest.fixture
+    def inputs(self):
+        return {
+            "choices": jnp.array([0, 1]),
+            "rewards": jnp.array([0, 0]),
+            "n_states": 2,
+            "n_options": 2,
+            "reward_probs": jnp.full((2, 2), 0.5),
+            "state_values": jnp.array([[1.0, -1.0], [-1.0, 1.0]]),
+            "inverse_temperature": 100.0,
+            # Centered softmax, reference state last: P(i -> 1) = 1 / (1 + e^92).
+            "transition_logits": jnp.array([[92.0], [92.0]]),
+            "init_state_prob": jnp.array([1.0, 0.0]),
+        }
+
+    def test_filter_likelihood_uses_true_predicted_belief(self, inputs):
+        trans = np.asarray(transition_logits_to_matrix(inputs["transition_logits"]))
+        assert trans[0, 1] < 1e-39  # guard: below any 1e-30 floor
+        log_choice_1 = np.array([-200.0, 0.0]) - np.log1p(np.exp(-200.0))
+        # Trial 0: posterior is exactly [1, 0]. Trial 1: predicted = trans[0].
+        expected_ll = (
+            2 * np.log(0.5)
+            - np.log1p(np.exp(-200.0))
+            + np.logaddexp(*(np.log(trans[0]) + log_choice_1))
+        )
+        result = contingency_belief_filter(**inputs)
+        np.testing.assert_allclose(result.log_likelihood, expected_ll, rtol=1e-12)
+
+    def test_smoother_pairwise_marginalizes_to_smoothed(self, inputs):
+        result = contingency_belief_smoother(**inputs)
+        # Column sums are P(s_1 = j); the s_1 = 0 entry is ~e^-108, so compare
+        # relatively (no atol) to catch a mis-scaled backward ratio.
+        np.testing.assert_allclose(
+            result.pairwise_state_prob[0].sum(axis=0),
+            result.smoothed_state_prob[1],
+            rtol=1e-10,
+            atol=0,
+        )
+        assert result.smoothed_state_prob[1, 0] > 0  # guard: not underflowed
+
+
 class TestContingencyBeliefSmoother:
     @pytest.fixture
     def block_data(self):
