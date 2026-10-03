@@ -55,6 +55,7 @@ from state_space_practice.em_driver import (
 from state_space_practice.exceptions import NotFittedError
 from state_space_practice.fitted_state import FittedAttribute, is_set
 from state_space_practice.oscillator_utils import (
+    ConstructorParametersMixin,
     DirectedInfluenceDynamicsMixin,
     canonicalize_correlated_noise_pair_parameters,
     compute_directed_influence_stability_scale,
@@ -367,7 +368,9 @@ class OscillatorParameterBase:
             )
 
 
-class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
+class BaseModel(
+    ConstructorParametersMixin, OscillatorParameterBase, ABC, SGDFittableMixin
+):
     """EM-fitting layer for the switching oscillator models.
 
     Adds to :class:`OscillatorParameterBase` everything the
@@ -888,11 +891,16 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
     def _initialize_parameters(self, key: Array) -> None:
         """Initializes all model parameters by calling specific methods.
 
+        Starts from the constructor's values of the intrinsic parameters, not
+        the ones an earlier fit left behind (see
+        ``ConstructorParametersMixin``).
+
         Parameters
         ----------
         key : Array
             JAX random number generator key.
         """
+        self._restore_constructor_parameters()
         k1, k2 = jax.random.split(key)
         self._initialize_discrete_state_prob()
         self._initialize_discrete_transition_matrix()
@@ -1099,6 +1107,12 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         Iteratively performs E-steps and M-steps until convergence or
         the maximum number of iterations is reached.
 
+        Every call starts from the initial parameters given to the
+        constructor, not from an earlier fit's estimates (which can overwrite
+        public parameters such as ``coupling_strength``): a repeat fit with
+        the same data and ``key`` reproduces a fresh model's fit. Pass
+        ``skip_init=True`` to continue from the current parameters instead.
+
         Parameters
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
@@ -1110,9 +1124,9 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         tol : float, optional
             Convergence tolerance for log-likelihood, by default 1e-4.
         skip_init : bool, default=False
-            If True, skip initialization and warm start (use existing
-            parameters). Useful for resuming fitting or providing
-            custom initial parameters.
+            If True, skip initialization and warm start and continue from the
+            current parameters (e.g. resume an earlier fit, or start from
+            custom parameters set on the model).
 
         Returns
         -------
@@ -1171,6 +1185,11 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
 
+        Like ``fit``, every call starts from the initial parameters given to
+        the constructor, so a repeat call with the same data and ``key``
+        reproduces a fresh model's fit. Pass ``skip_init=True`` to continue
+        from the current parameters instead.
+
         Parameters
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
@@ -1187,7 +1206,8 @@ class BaseModel(OscillatorParameterBase, ABC, SGDFittableMixin):
         convergence_tol : float or None
             If set, stop early when |ΔLL| < tol for 5 consecutive steps.
         skip_init : bool, default=False
-            If True, skip initialization and warm start.
+            If True, skip initialization and warm start and continue from the
+            current parameters.
 
         Returns
         -------
@@ -1352,6 +1372,8 @@ class CommonOscillatorModel(BaseModel):
         self.update_continuous_transition_matrix = False
         self.update_process_cov = False
         self.update_measurement_matrix = True
+
+        self._record_constructor_parameters("freqs", "damping_coef", "process_variance")
 
     def _initialize_measurement_matrix(self, key: Array | None = None) -> None:
         """Initializes H with small random values, varying across discrete states."""
@@ -1597,6 +1619,14 @@ class CorrelatedNoiseModel(BaseModel):
         self.update_continuous_transition_matrix = False
         self.update_measurement_matrix = False  # H is fixed in CNM
         self.update_process_cov = True
+
+        self._record_constructor_parameters(
+            "freqs",
+            "damping_coef",
+            "process_variance",
+            "phase_difference",
+            "coupling_strength",
+        )
 
     def _initialize_measurement_matrix(self, key: Array | None = None) -> None:
         """Initializes H as block-diagonal [1, 0], constant across states."""
@@ -1941,6 +1971,14 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         self.max_spectral_radius = max_spectral_radius
         self.max_damping = max_damping
 
+        self._record_constructor_parameters(
+            "freqs",
+            "damping_coef",
+            "process_variance",
+            "phase_difference",
+            "coupling_strength",
+        )
+
     def _initialize_measurement_matrix(self, key: Array | None = None) -> None:
         """Initializes H with [1/sqrt(2), 1/sqrt(2)] blocks, constant across states."""
         measurement_matrix = construct_directed_influence_measurement_matrix(
@@ -2137,6 +2175,11 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         ``coupling_strength`` are left at their intrinsic values -- reconstruct
         ``A`` by re-applying :meth:`_effective_dim_scale`.
 
+        Every call starts from the initial parameters given to the
+        constructor, not from an earlier fit's estimates, so a repeat call
+        with the same data and ``key`` reproduces a fresh model's fit. Pass
+        ``skip_init=True`` to continue from the current parameters instead.
+
         Parameters
         ----------
         observations : ArrayLike, shape (n_time, n_sources)
@@ -2148,7 +2191,8 @@ class DirectedInfluenceModel(DirectedInfluenceDynamicsMixin, BaseModel):
         verbose : bool
         convergence_tol : float or None
         skip_init : bool, default=False
-            If True, skip initialization and warm start.
+            If True, skip initialization and warm start and continue from the
+            current parameters.
         connectivity_penalty : OscillatorPenaltyConfig or None
             If provided, adds structured sparsity penalties on
             coupling_strength during SGD optimization.

@@ -106,6 +106,7 @@ from state_space_practice.exceptions import StateSpaceWarning
 from state_space_practice.fitted_state import FittedAttribute
 from state_space_practice.kalman import _scan_with_boundary
 from state_space_practice.oscillator_utils import (
+    ConstructorParametersMixin,
     _matrix_to_oscillator_blocks,
     _oscillator_blocks_to_matrix,
     construct_common_oscillator_process_covariance,
@@ -2830,7 +2831,7 @@ def _validated_filter_arrays(
     )
 
 
-class SwitchingPointProcessBase(ABC, SGDFittableMixin):
+class SwitchingPointProcessBase(ConstructorParametersMixin, ABC, SGDFittableMixin):
     """Shared EM and SGD machinery for switching point-process oscillator models.
 
     :class:`SwitchingSpikeOscillatorModel` (this module) and the structured
@@ -3095,7 +3096,12 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         - Continuous transition matrix / process covariance: model specific
         - Spike baseline: zero (corresponding to 1 Hz baseline rate)
         - Spike weights: small random values (scaled by 0.1)
+
+        Models with intrinsic oscillator parameters start from their
+        constructor values, not the ones an earlier fit left behind (see
+        ``ConstructorParametersMixin``).
         """
+        self._restore_constructor_parameters()
         k1, k2 = jax.random.split(key)
         self._initialize_discrete_state_prob()
         self._initialize_discrete_transition_matrix()
@@ -3691,6 +3697,11 @@ class SwitchingPointProcessBase(ABC, SGDFittableMixin):
         convergence_tol: float | None = None,
     ) -> list[float]:
         """Fit by minimizing negative marginal LL via gradient descent.
+
+        Unlike ``fit``, ``fit_sgd`` initializes the parameters (from the
+        constructor's initial parameters, as ``fit`` does) only when the
+        model has none yet; a later call continues from the current
+        parameters, including those of an earlier ``fit``.
 
         Parameters
         ----------

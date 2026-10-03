@@ -162,6 +162,26 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed — behavior (may affect existing callers)
 
+- **Refitting an oscillator model restarts from the constructor's
+  parameters**: `fit` (and the Gaussian models' `fit_sgd`) on
+  `CorrelatedNoiseModel`, `DirectedInfluenceModel`,
+  `CorrelatedNoisePointProcessModel` and `DirectedInfluencePointProcessModel`
+  rebuilt the initial transition matrix / process covariance from the public
+  `freqs`, `damping_coef`, `process_variance`, `phase_difference` and
+  `coupling_strength`, which the previous fit had overwritten with its
+  estimates (and DIM / DIM-PP kept the reparameterized M-step's warm-start
+  cache), so a second call silently warm-started and its log-likelihoods
+  depended on call history (20 nats apart within 4 EM iterations on a
+  200-sample DIM scenario). The
+  constructor values are now recorded and reinstated at initialization (the
+  oscillator models, Gaussian and point-process, share
+  `ConstructorParametersMixin`), so a repeat fit with the same data and key
+  is bit-identical to a fresh model's. Warm-starting from the current fit is
+  explicit: `skip_init=True`. Setting a public parameter such as
+  `model.freqs` after construction no longer changes where a non-`skip_init`
+  fit starts. A first fit on a fresh model is bit-identical to before. The
+  point-process models' `fit_sgd` is unchanged: it initializes only a model
+  that has no parameters yet and otherwise continues from the current ones.
 - **DIM / DIM-PP standard-EM projection is compiled**:
   `project_transition_matrix_stack` projects every state's oscillator blocks
   in one jit-compiled call (only the `eigvals` spectral clamp stays on the

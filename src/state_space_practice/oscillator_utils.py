@@ -1617,6 +1617,40 @@ def _dim_transition_objectives(
     )
 
 
+class ConstructorParametersMixin:
+    """Start every initialization from the parameters given at construction.
+
+    Fitting overwrites public parameters that also seed initialization (e.g.
+    the M-step re-estimates a directed influence model's ``freqs`` and
+    ``coupling_strength`` from which the initial transition matrix is built).
+    Reading them back would make a repeat ``fit`` silently warm-start from the
+    previous fit. So the host records their constructor values once, at the
+    end of ``__init__`` (:meth:`_record_constructor_parameters`), and its
+    ``_initialize_parameters`` reinstates them first
+    (:meth:`_restore_constructor_parameters`): a repeat fit reproduces a fresh
+    model, and the public parameters agree with the freshly initialized
+    matrices. Warm-starting from the current fit stays explicit
+    (``skip_init=True``, which skips initialization).
+    """
+
+    # (name, value) pairs; empty for a host that records nothing.
+    _constructor_parameters: tuple[tuple[str, jax.Array], ...] = ()
+
+    def _record_constructor_parameters(self, *names: str) -> None:
+        """Record the current values of ``names`` as the initialization seed.
+
+        The values are immutable JAX arrays, so references suffice.
+        """
+        self._constructor_parameters = tuple(
+            (name, getattr(self, name)) for name in names
+        )
+
+    def _restore_constructor_parameters(self) -> None:
+        """Reinstate the recorded constructor values of the public parameters."""
+        for name, value in self._constructor_parameters:
+            setattr(self, name, value)
+
+
 class DirectedInfluenceDynamicsMixin:
     """Transition-matrix machinery shared by the directed influence models.
 
@@ -1674,8 +1708,12 @@ class DirectedInfluenceDynamicsMixin:
         """Build the per-state A from the intrinsic params via the stability scale.
 
         The initial matrices therefore already honor ``max_spectral_radius``
-        before the first E-step runs.
+        before the first E-step runs. The joint-optimizer warm-start cache is
+        dropped, so the first reparameterized M-step after initialization
+        starts from the intrinsic params, as on a fresh model, rather than
+        from an earlier fit's solution.
         """
+        self._current_osc_params = None
         self._rebuild_stable_transition_matrix()
 
     def _effective_dim_scale(self) -> jax.Array:

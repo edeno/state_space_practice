@@ -532,6 +532,12 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
     ) -> list[float]:
         """Fit the model to spike data using EM.
 
+        Every call starts from the initial parameters given to the
+        constructor, not from an earlier fit's estimates (which can overwrite
+        public parameters such as ``coupling_strength``): a repeat fit with
+        the same data and ``key`` reproduces a fresh model's fit. Pass
+        ``skip_init=True`` to continue from the current parameters instead.
+
         Parameters
         ----------
         spikes : ArrayLike, shape (n_time, n_neurons)
@@ -543,7 +549,9 @@ class BaseSwitchingPointProcessModel(SwitchingPointProcessBase):
         key : Array | None, optional
             JAX random key for initialization. Defaults to ``jax.random.key(0)``.
         skip_init : bool, default=False
-            If True, skip initialization (use existing parameters).
+            If True, skip initialization and warm start and continue from the
+            current parameters (e.g. resume an earlier ``fit`` or
+            ``fit_sgd``).
         n_restarts : int, default=1
             Number of random restarts. Each restart uses a different random
             key. The run with the best final log-likelihood is kept.
@@ -777,6 +785,7 @@ class CommonOscillatorPointProcessModel(BaseSwitchingPointProcessModel):
         self.freqs = freqs
         self.damping_coef = damping_coef
         self.process_variance = process_variance
+        self._record_constructor_parameters("freqs", "damping_coef", "process_variance")
 
     def _initialize_continuous_transition_matrix(self) -> None:
         """A is constant across states: uncoupled oscillators."""
@@ -975,6 +984,13 @@ class CorrelatedNoisePointProcessModel(BaseSwitchingPointProcessModel):
         self.phase_difference = phase_difference
         self.coupling_strength = coupling_strength
         self.use_reparameterized_mstep = use_reparameterized_mstep
+        self._record_constructor_parameters(
+            "freqs",
+            "damping_coef",
+            "process_variance",
+            "phase_difference",
+            "coupling_strength",
+        )
 
     def _initialize_continuous_transition_matrix(self) -> None:
         """A is constant across states: uncoupled oscillators."""
@@ -1307,6 +1323,14 @@ class DirectedInfluencePointProcessModel(
         self.max_spectral_radius = max_spectral_radius
         self.max_damping = max_damping
 
+        self._record_constructor_parameters(
+            "freqs",
+            "damping_coef",
+            "process_variance",
+            "phase_difference",
+            "coupling_strength",
+        )
+
     def _initialize_process_covariance(self) -> None:
         """Q is constant across states: block-diagonal from process_variance."""
         process_cov = construct_common_oscillator_process_covariance(
@@ -1451,6 +1475,11 @@ class DirectedInfluencePointProcessModel(
         (and optionally spike params, discrete transition, init params).
         Frequencies (``freqs``) and damping (``damping_coef``) are held fixed
         (not trained).
+
+        Parameters are initialized (from the constructor's initial
+        parameters, as ``fit`` does) only when the model has none yet; a later
+        call continues from the current parameters, including those of an
+        earlier ``fit``.
 
         Parameters
         ----------
