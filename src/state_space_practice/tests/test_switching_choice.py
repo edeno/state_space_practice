@@ -1136,14 +1136,14 @@ class TestSwitchingChoiceValidation:
 class TestSwitchingChoiceMStepExactness:
     """The EM M-step maximises its (GPB1-approximate) expected objective.
 
-    With ``joint[t, i, s] = P(s_t=i, s_{t+1}=s | y)`` and the smoother's
-    state-conditional moments, the process-noise objective of state ``s`` is
+    With ``joint[t, i, s] = P(s_t=i, s_{t+1}=s | y)``, the smoother's
+    state-conditional moments ``m_{t,s}``, ``P_{t,s}``, pair-conditional means
+    ``m_t(i, s) = E[x_t | s_t=i, s_{t+1}=s]`` and cross-covariances
+    ``C_t(i, s)``, the process-noise objective of state ``s`` is
 
-        Q_s(q) = -sum_t w_t(s) [ k/2 log q + e_t(s) / (2 q) ],
-        w_t(s) = sum_i joint[t, i, s],
-        e_t(s) = ||m_{t+1,s} - a_s m_{t,s} - b_{t+1}||^2 + tr P_{t+1,s}
-                 + a_s^2 tr P_{t,s} - 2 a_s tr C_t(s),
-        C_t(s) = sum_i joint[t, i, s] C_t(i, s) / w_t(s),
+        Q_s(q) = -sum_t sum_i joint[t, i, s] [ k/2 log q + e_t(i, s) / (2 q) ],
+        e_t(i, s) = ||m_{t+1,s} - a_s m_t(i, s) - b_{t+1}||^2 + tr P_{t+1,s}
+                    + a_s^2 tr P_{t,i} - 2 a_s tr C_t(i, s),
 
     and the transition objective is ``sum_t sum_ij joint[t,i,j] log Z_ij``.
     Both are written out here with explicit loops; the returned parameters
@@ -1177,22 +1177,50 @@ class TestSwitchingChoiceMStepExactness:
         means = np.asarray(smooth[5])
         covs = np.asarray(smooth[6])
         cross = np.asarray(smooth[7])
+        pair_means = np.asarray(smooth[8])
         b = np.asarray(data.covariates) @ np.asarray(model.input_gain_).T
         a = float(model.decays_[s])
         k = means.shape[1]
         total = 0.0
         for t in range(joint.shape[0]):
-            w = joint[t, :, s].sum()
-            C = sum(joint[t, i, s] * cross[t, :, :, i, s] for i in range(2)) / w
-            r = means[t + 1, :, s] - a * means[t, :, s] - b[t + 1]
-            e = (
-                r @ r
-                + np.trace(covs[t + 1, :, :, s])
-                + a**2 * np.trace(covs[t, :, :, s])
-                - 2 * a * np.trace(C)
-            )
-            total -= w * (0.5 * k * np.log(q) + e / (2 * q))
+            for i in range(joint.shape[1]):
+                r = means[t + 1, :, s] - a * pair_means[t, :, i, s] - b[t + 1]
+                e = (
+                    r @ r
+                    + np.trace(covs[t + 1, :, :, s])
+                    + a**2 * np.trace(covs[t, :, :, i])
+                    - 2 * a * np.trace(cross[t, :, :, i, s])
+                )
+                total -= joint[t, i, s] * (0.5 * k * np.log(q) + e / (2 * q))
         return total
+
+    def test_process_noise_averages_over_source_states(self):
+        """A certain 0 -> 1 switch with no movement gives Q_1 = tr P_1 + tr P_0.
+
+        State 1's moments at t=0 are conditioned on a zero-probability event
+        (here a mean of 0, far from the actual x_0 = 10); the M-step must use
+        the moments of x_0 given the transition (S_0=0, S_1=1) instead.
+        """
+        from state_space_practice.switching_kalman import SwitchingSmootherResult
+
+        means = jnp.array([[[10.0, 0.0]], [[0.0, 10.0]]])  # (T, K-1, S)
+        covs = jnp.full((2, 1, 1, 2), 0.1)
+        result = SwitchingSmootherResult(
+            overall_smoother_mean=jnp.array([[10.0], [10.0]]),
+            overall_smoother_cov=jnp.full((2, 1, 1), 0.1),
+            smoother_discrete_state_prob=jnp.array([[1.0, 0.0], [0.0, 1.0]]),
+            smoother_joint_discrete_state_prob=jnp.array([[[0.0, 1.0], [0.0, 0.0]]]),
+            overall_smoother_cross_cov=jnp.zeros((1, 1, 1)),
+            state_cond_smoother_means=means,
+            state_cond_smoother_covs=covs,
+            pair_cond_smoother_cross_covs=jnp.zeros((1, 1, 1, 2, 2)),
+            pair_cond_smoother_means=jnp.full((1, 1, 2, 2), 10.0),
+        )
+        model = SwitchingChoiceModel(
+            n_options=2, n_discrete_states=2, init_decays=[1.0, 1.0]
+        )
+        model._m_step(result)
+        np.testing.assert_allclose(model.process_noises_[1], 0.2, rtol=1e-12)
 
     def test_process_noise_per_state_is_stationary(self, em_inputs):
         model, data, filt, smooth = em_inputs
