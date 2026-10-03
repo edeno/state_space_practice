@@ -61,7 +61,9 @@ from state_space_practice.switching_kalman import (
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture,
     collapse_gaussian_mixture_per_discrete_state,
+    minimum_state_occupancy,
     switching_kalman_smoother,
+    warn_low_occupancy_states,
 )
 from state_space_practice.utils import (
     typed_jit,
@@ -1260,9 +1262,24 @@ class SwitchingChoiceModel(SGDFittableMixin):
             + decays**2 * trace_covs[:-1, :, None]
         )  # (T-1, S_prev, S)
 
-        w_sum = jnp.maximum(joint.sum(axis=(0, 1)), eps)  # (S,)
-        q_hat = jnp.einsum("tis,tis->s", joint, mean_sq + cov_trace) / (w_sum * k_free)
-        self.process_noises_ = jnp.maximum(q_hat, 1e-6)
+        occupancy = joint.sum(axis=(0, 1))  # (S,) expected transitions into s
+        q_hat = jnp.einsum("tis,tis->s", joint, mean_sq + cov_trace) / (
+            jnp.maximum(occupancy, eps) * k_free
+        )
+        # A state with too few expected transitions has an unidentified Q:
+        # keep its previous value (and warn), as the other switching M-steps do.
+        min_occupancy = minimum_state_occupancy(k_free)
+        warn_low_occupancy_states(
+            occupancy,
+            min_occupancy,
+            "SwitchingChoiceModel M-step",
+            "their process noise kept its previous value",
+        )
+        self.process_noises_ = jnp.where(
+            occupancy >= min_occupancy,
+            jnp.maximum(q_hat, 1e-6),
+            self.process_noises_,
+        )
 
         # Transition matrix from smoother joint
         trans_counts = joint.sum(axis=0)  # (S, S)
