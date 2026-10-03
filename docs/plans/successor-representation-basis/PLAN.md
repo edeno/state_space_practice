@@ -31,14 +31,14 @@ Therefore the validation is restated to what is actually testable: a positive co
 
 ## Decisions (recorded defaults; what breaks them)
 
-- **D1 — argument order.** `estimate_transition_matrix(env, times, trajectory, *, ...)`, matching `bin_occupancy` / `graph_design_matrix` (`graph_place_field.py:328-335`, `:379-384`). `times` is required, not optional, because `Environment.bin_sequence` requires monotone `times` (neurospatial `environment/trajectory.py:494`). Deviates from the requested `(env, positions, times?)`.
-- **D2 — self-transitions do not count.** The chain is over consecutive *distinct* bins (`dedup=True` semantics), implemented by collapsing the module's own `_bin_ids` (`dedup=False`, `graph_place_field.py:305-325`) so a single bin-lookup path is shared with `graph_design_matrix` / `bin_occupancy` / `bin_spike_counts`. Justification: (i) `gamma` then has a sampling-rate-invariant meaning (horizon in bin hops), so one default grid serves 50 Hz and 250 Hz data; (ii) dwell time is already the Poisson exposure (`bin_occupancy`) and would otherwise enter the model twice; (iii) the unvisited-row fallback and the exact-property reference walk are diagonal-free, so estimator and references share one form. Upstream `Environment.transitions` (`trajectory.py:787`, `_empirical_transitions` at `:965`) always counts self-transitions from `dedup=False` ids and has no gap handling, smoothing or symmetrised variant — that is why it is not called. *Breaks if* the discrete-time SR with dwell (Stachenfeld's `gamma` per time step) is wanted; see Open Question 2.
+- **D1 — argument order.** `estimate_transition_matrix(env, times, trajectory, *, ...)`, matching `bin_occupancy` / `graph_design_matrix` (`graph_place_field.py:336-343`, `:387-392`). `times` is required, not optional, because `Environment.bin_sequence` requires monotone `times` (neurospatial `environment/trajectory.py:494`). Deviates from the requested `(env, positions, times?)`.
+- **D2 — self-transitions do not count.** The chain is over consecutive *distinct* bins (`dedup=True` semantics), implemented by collapsing the module's own `_bin_ids` (`dedup=False`, `graph_place_field.py:313-333`) so a single bin-lookup path is shared with `graph_design_matrix` / `bin_occupancy` / `bin_spike_counts`. Justification: (i) `gamma` then has a sampling-rate-invariant meaning (horizon in bin hops), so one default grid serves 50 Hz and 250 Hz data; (ii) dwell time is already the Poisson exposure (`bin_occupancy`) and would otherwise enter the model twice; (iii) the unvisited-row fallback and the exact-property reference walk are diagonal-free, so estimator and references share one form. Upstream `Environment.transitions` (`trajectory.py:787`, `_empirical_transitions` at `:965`) always counts self-transitions from `dedup=False` ids and has no gap handling, smoothing or symmetrised variant — that is why it is not called. *Breaks if* the discrete-time SR with dwell (Stachenfeld's `gamma` per time step) is wanted; see Open Question 2.
 - **D3 — non-adjacent moves are dropped** (tracking jumps, or bins smaller than one sample's displacement); when they exceed 5% of moves a `StateSpaceWarning` (`exceptions.py:14`) is emitted naming the likely cause. Out-of-bounds samples (`-1`) and time gaps `> max_gap` break the chain (no pair straddles them). Zero usable moves raises `ValueError`.
 - **D4 — smoothing.** `counts + smoothing_alpha * A` with `A` the boolean adjacency of `env.connectivity` (pseudo-count on every graph edge, default `0.5`), then row-normalise. For `alpha > 0` an unvisited row is therefore automatically uniform over its neighbours; for `alpha = 0` that fallback is explicit. A degree-0 (isolated) bin is absorbing (`T_ii = 1`). Non-adjacent pairs stay exactly zero.
 - **D5 — `symmetrize=True`** adds `counts + countsᵀ` before smoothing: the direction-free control arm required by the finding above.
 - **D6 — basis = leading `rank` left singular vectors of `M`,** computed per connected component from the SVD of `B = I - gamma T_c`: `M_c = B^-1 = V Σ^-1 Uᵀ`, so the left singular vectors of `M_c` are the right singular vectors of `B` with singular values `1/σ_B`. No inverse and no solve for the basis. `successor_representation` (returns `M` itself, for fields and diagnostics) uses `scipy.linalg.solve(B, I)`. Why singular vectors rather than eigenvectors: for non-symmetric `T` the eigenvectors of `M` are complex and non-orthogonal; the SVD gives a real orthonormal basis whose rank-`k` span is the least-squares-optimal subspace for the columns `M(:, j)` — Stachenfeld's predicted place fields.
-- **D7 — the `eigvals` field holds Laplacian-equivalent penalties** `λ̃_j = (σ_1/σ_j − 1)(1 − gamma)/(gamma·eps)` with `eps = 1 / max_i L_ii` and `σ_1` the global largest singular value; non-negative, ascending, zero for the leading mode. Under the lazy symmetric walk `T = I − eps L`, `σ_j = 1/((1−gamma) + gamma·eps·λ_j)`, so `λ̃_j = λ_j` exactly (prototype: `1e-16`). This keeps `spectral_shape(basis.eigvals, …)` (`graph_place_field.py:272-302`) meaningful for an SR basis and gives the exact-property test a second, scalar identity to assert.
-- **D8 — `rank >= n_components` is enforced by reusing `_resolve_rank`** (`graph_place_field.py:142-173`; raises, never clamps); `gamma` must satisfy `0 < gamma < 1` (`gamma = 0` makes `M = I` and the SVD order arbitrary).
+- **D7 — the `eigvals` field holds Laplacian-equivalent penalties** `λ̃_j = (σ_1/σ_j − 1)(1 − gamma)/(gamma·eps)` with `eps = 1 / max_i L_ii` and `σ_1` the global largest singular value; non-negative, ascending, zero for the leading mode. Under the lazy symmetric walk `T = I − eps L`, `σ_j = 1/((1−gamma) + gamma·eps·λ_j)`, so `λ̃_j = λ_j` exactly (prototype: `1e-16`). This keeps `spectral_shape(basis.eigvals, …)` (`graph_place_field.py:280-310`) meaningful for an SR basis and gives the exact-property test a second, scalar identity to assert.
+- **D8 — `rank >= n_components` is enforced by reusing `_resolve_rank`** (`graph_place_field.py:150-181`; raises, never clamps); `gamma` must satisfy `0 < gamma < 1` (`gamma = 0` makes `M = I` and the SVD order arbitrary).
 - **D9 — `SuccessorBasis` is a new `NamedTuple`; `GraphBasis` is untouched.** A module alias `SpatialBasis = GraphBasis | SuccessorBasis` widens the *annotations* of `_check_basis_matches_env`, `graph_design_matrix` and `bin_spike_counts` (runtime behaviour unchanged). `kind = "successor"` is a field of `SuccessorBasis`; consumers distinguish the two with `isinstance`. Rejected: adding `kind` with a default to `GraphBasis` (changes the class; the hard rule keeps it bit-identical).
 - **D10 — no caching on `env` for SR bases** (`T` and `gamma` change per call). Dense per-component SVD is `O(n³)`: ~1 s at 1000 bins, ~10 s at 2500 bins. `select_gamma_by_held_out_ll` performs `n_folds × n_gammas` builds (35 by default); a sparse `svds` path is a later optimisation, not part of this plan.
 - **D11 — the comparison model is a static, ridge-penalised Poisson GLM on per-bin sufficient statistics** (`counts (n_bins, n_neurons)` from `bin_spike_counts`, `occupancy (n_bins,)` from `bin_occupancy`), fitted by precision-space Newton with step halving. It is deterministic, has no EM/drift hyperparameters, and equals the per-time static Poisson fit up to constants (the per-bin counts and exposures are sufficient statistics). The ridge is isotropic (`1e-3`) and identical for both bases, so the comparison is about the *subspace*, not the prior. Held-out LL is the per-bin Poisson log-likelihood including `−log n_i!` (a constant across bases; kept so values are interpretable). *Breaks if* the prior is part of the question — then compare with the spectral penalty on `eigvals` (Open Question 4).
@@ -48,23 +48,23 @@ Therefore the validation is restated to what is actually testable: a positive co
 
 ## Dependencies
 
-- **Cross-plan.** `docs/plans/multi-map-place-fields/` consumes any spatial basis through the per-time design matrix. This plan keeps `graph_design_matrix`'s contract identical (`Z[t] = basis.eigvecs[bin_id(t)]`, zero row + `valid=False` out of bounds; `graph_place_field.py:336-376`); only the `basis` annotation widens to `SpatialBasis`. The local drifting-graph-GP plan (`.claude/docs/plans/drifting-graph-gp-place-field/`, gitignored) plans a per-bin static estimator in its phase 1; `fit_penalized_poisson_field` here accepts a per-coefficient penalty vector with zeros allowed for exactly that reason, so phase 1 should wrap it rather than add a parallel solver.
+- **Cross-plan.** `docs/plans/multi-map-place-fields/` consumes any spatial basis through the per-time design matrix. This plan keeps `graph_design_matrix`'s contract identical (`Z[t] = basis.eigvecs[bin_id(t)]`, zero row + `valid=False` out of bounds; `graph_place_field.py:344-384`); only the `basis` annotation widens to `SpatialBasis`. The local drifting-graph-GP plan (`.claude/docs/plans/drifting-graph-gp-place-field/`, gitignored) plans a per-bin static estimator in its phase 1; `fit_penalized_poisson_field` here accepts a per-coefficient penalty vector with zeros allowed for exactly that reason, so phase 1 should wrap it rather than add a parallel solver.
 - **neurospatial.** Importable in this checkout's `.venv` as an *editable* install of `/Users/edeno/Documents/GitHub/neurospatial` at commit `2522021fe2e7`, while `uv.lock` / `pyproject.toml:167-171` pin the git commit `e81dec62…` (both report version 0.8.0). Every neurospatial API this plan uses is already used by the shipped module or its tests (`bin_sequence`, `connectivity`, `get_differential_operator`, `n_bins`, `bin_sizes`, `bin_centers`, `from_samples`, `make_w_maze`); tests use `env.connectivity.neighbors` (networkx) rather than `env.neighbors` to avoid a new upstream surface. The executor should confirm the install source with `uv run --no-sync python -c "import neurospatial, inspect; print(inspect.getsourcefile(neurospatial))"` and expect the ring fixture's bin count to be a property of the installed version (never hard-code `48`).
 - **Real data.** `data/` (gitignored) is absent in this checkout; the script is written against the loader signature used by `scripts/position_decoding_demo.py:22-36` and cannot be run here.
 
 ## Inputs to read first
 
 - [src/state_space_practice/graph_place_field.py:1-27](../../../src/state_space_practice/graph_place_field.py) — module docstring: active-bin convention and the distance-weighted Laplacian choice; extend it (Task 1).
-- [graph_place_field.py:58-92](../../../src/state_space_practice/graph_place_field.py) — `GraphBasis` fields; `SuccessorBasis` mirrors the first six in order.
-- [graph_place_field.py:95-116](../../../src/state_space_practice/graph_place_field.py) — `_distance_weighted_laplacian`, `_laplacian_key`, `_env_key`: reused for `env_key`, components and `eps`.
-- [graph_place_field.py:119-139](../../../src/state_space_practice/graph_place_field.py) — `_check_basis_matches_env`: the only fields consumers read are `eigvecs.shape[0]` and `env_key`; error strings at `:128-132` and `:135-139` name `build_graph_basis` (Task 6 generalises them).
-- [graph_place_field.py:142-173](../../../src/state_space_practice/graph_place_field.py) — `_resolve_rank` (reuse with `sigma=None`).
-- [graph_place_field.py:176-202](../../../src/state_space_practice/graph_place_field.py) — `_full_eigensystem`: the per-component decompose-pad-sort pattern to mirror.
-- [graph_place_field.py:205-269](../../../src/state_space_practice/graph_place_field.py) — `build_graph_basis` (untouched): read-only arrays, `np.array(env.bin_sizes)` copy at `:258`.
-- [graph_place_field.py:305-325](../../../src/state_space_practice/graph_place_field.py) — `_bin_ids` (`dedup=False`, `outside_value=-1` at `:322-324`); the transition estimator collapses these ids.
-- [graph_place_field.py:328-376](../../../src/state_space_practice/graph_place_field.py) — `graph_design_matrix`: contract to preserve; annotation at `:330`, check at `:370`, row lookup `:373-375`.
-- [graph_place_field.py:379-460](../../../src/state_space_practice/graph_place_field.py) — `bin_occupancy`, `bin_spike_counts` (annotation `:420`, check `:446`): the per-bin sufficient statistics the comparison consumes.
-- [src/state_space_practice/tests/test_graph_place_field.py:29-49](../../../src/state_space_practice/tests/test_graph_place_field.py) — fixtures `small_grid_env`, `w_maze_env`, `two_component_env`; `:53-63` how tests obtain `L = D @ D.T`; `:102-109` component-locality pattern; `:113-125` design-row alignment pattern; `:211-220` mismatched-env pattern.
+- [graph_place_field.py:59-93](../../../src/state_space_practice/graph_place_field.py) — `GraphBasis` fields; `SuccessorBasis` mirrors the first six in order.
+- [graph_place_field.py:96-124](../../../src/state_space_practice/graph_place_field.py) — `_distance_weighted_laplacian`, `_laplacian_key`, `_env_key`: reused for `env_key`, components and `eps`.
+- [graph_place_field.py:127-147](../../../src/state_space_practice/graph_place_field.py) — `_check_basis_matches_env`: the only fields consumers read are `eigvecs.shape[0]` and `env_key`; error strings at `:136-140` and `:143-147` name `build_graph_basis` (Task 6 generalises them).
+- [graph_place_field.py:150-181](../../../src/state_space_practice/graph_place_field.py) — `_resolve_rank` (reuse with `sigma=None`).
+- [graph_place_field.py:184-210](../../../src/state_space_practice/graph_place_field.py) — `_full_eigensystem`: the per-component decompose-pad-sort pattern to mirror.
+- [graph_place_field.py:213-277](../../../src/state_space_practice/graph_place_field.py) — `build_graph_basis` (untouched): read-only arrays, `np.array(env.bin_sizes)` copy at `:266`.
+- [graph_place_field.py:313-333](../../../src/state_space_practice/graph_place_field.py) — `_bin_ids` (`dedup=False`, `outside_value=-1` at `:330-332`); the transition estimator collapses these ids.
+- [graph_place_field.py:336-384](../../../src/state_space_practice/graph_place_field.py) — `graph_design_matrix`: contract to preserve; annotation at `:338`, check at `:378`, row lookup `:381-383`.
+- [graph_place_field.py:387-468](../../../src/state_space_practice/graph_place_field.py) — `bin_occupancy`, `bin_spike_counts` (annotation `:428`, check `:454`): the per-bin sufficient statistics the comparison consumes.
+- [src/state_space_practice/tests/test_graph_place_field.py:30-50](../../../src/state_space_practice/tests/test_graph_place_field.py) — fixtures `small_grid_env`, `w_maze_env`, `two_component_env`; `:54-64` how tests obtain `L = D @ D.T`; `:103-110` component-locality pattern; `:114-126` design-row alignment pattern; `:245-254` mismatched-env pattern.
 - [src/state_space_practice/exceptions.py:14](../../../src/state_space_practice/exceptions.py) — `StateSpaceWarning`.
 - [src/state_space_practice/point_process_kalman.py:1467-1484](../../../src/state_space_practice/point_process_kalman.py) — `stochastic_point_process_filter` signature (returns `(filtered_mean, filtered_cov, marginal_ll)`); `:523` `log_conditional_intensity`. Used by the downstream smoke test only.
 - [src/state_space_practice/place_field_model.py:1886-1980](../../../src/state_space_practice/place_field_model.py) — `score`: held-out LL for the spline model is the filter's marginal LL on new data with `evaluate_basis(position, basis_info)` (`:1957-1959`); it is bound to the patsy spline (`_build_spline_basis_matrix` `:567-592`), which is why this plan evaluates held-out LL with its own static fit rather than through `PlaceFieldModel`. `:652-659` `_fit_stationary_glm` is the private per-time Newton GLM whose *shape* the per-bin fit mirrors.
@@ -80,7 +80,7 @@ All library code goes in `src/state_space_practice/graph_place_field.py`; tests 
 
 ### Task 1 — `SuccessorBasis`, `SpatialBasis`, module docstring, exports
 
-Add after `GraphBasis` (`graph_place_field.py:92`):
+Add after `GraphBasis` (`graph_place_field.py:93`):
 
 ```python
 class SuccessorBasis(NamedTuple):
@@ -125,7 +125,7 @@ class SuccessorBasis(NamedTuple):
     component_labels: NDArray[np.int_]
     bin_sizes: NDArray[np.float64]
     n_components: int
-    env_key: tuple[int, int, float]
+    env_key: tuple[int, int, str]
     kind: str
     gamma: float
     singular_values: NDArray[np.float64]
@@ -691,8 +691,8 @@ def select_gamma_by_held_out_ll(
 
 ### Task 6 — widen the consumers' annotations (runtime unchanged)
 
-- `_check_basis_matches_env(env, basis: SpatialBasis)` (`graph_place_field.py:119`), `graph_design_matrix(..., basis: SpatialBasis, ...)` (`:330`) and `bin_spike_counts(..., basis: SpatialBasis)` (`:420`). Update the two docstring `basis : GraphBasis` lines (`:347`, `:436-439`) to `GraphBasis or SuccessorBasis`.
-- Generalise the two error strings at `:128-132` and `:135-139` from "Rebuild it with build_graph_basis(env)." to "Rebuild it from this environment (build_graph_basis or build_successor_basis)." — the existing tests match only `"different"` (`test_graph_place_field.py:217, 219`).
+- `_check_basis_matches_env(env, basis: SpatialBasis)` (`graph_place_field.py:127`), `graph_design_matrix(..., basis: SpatialBasis, ...)` (`:338`) and `bin_spike_counts(..., basis: SpatialBasis)` (`:428`). Update the two docstring `basis : GraphBasis` lines (`:355`, `:444-447`) to `GraphBasis or SuccessorBasis`.
+- Generalise the two error strings at `:136-140` and `:143-147` from "Rebuild it with build_graph_basis(env)." to "Rebuild it from this environment (build_graph_basis or build_successor_basis)." — the existing tests match only `"different"` (`test_graph_place_field.py:251, 253`).
 - No behavioural change to `build_graph_basis`; `test_basis_cache_rank_safe` and `test_read_only_outputs` must stay green untouched.
 
 ### Task 7 — tests (`tests/test_graph_place_field.py`)
@@ -882,7 +882,7 @@ def test_successor_design_matrix_drives_the_laplace_ekf_filter(ring_env):
 
 (The prototype's per-neuron filter LL differences between SR and Laplacian were −26 … +16 nats, too noisy to assert a direction there; the shuffled-design control is the assertion that can fail.)
 
-The remaining tests in the validation slice are short, single-purpose and follow the patterns at `test_graph_place_field.py:102-125` and `:211-258`; their asserted behaviour is fully specified in the table.
+The remaining tests in the validation slice are short, single-purpose and follow the patterns at `test_graph_place_field.py:103-126` and `:245-292`; their asserted behaviour is fully specified in the table.
 
 ### Task 8 — `scripts/successor_basis_comparison.py` (real data)
 
@@ -1091,7 +1091,7 @@ All in `src/state_space_practice/tests/test_graph_place_field.py`; `slow` marked
 
 ## Fixtures
 
-- Reuse the module-scoped `small_grid_env` (25 bins), `w_maze_env` and `two_component_env` at `test_graph_place_field.py:29-49`.
+- Reuse the module-scoped `small_grid_env` (25 bins), `w_maze_env` and `two_component_env` at `test_graph_place_field.py:30-50`.
 - New module-scoped `ring_env` (Task 7): deterministic (`linspace`, no RNG) annular band from `Environment.from_samples` on a circle of radius 30 with 5 cm bins; one component, degrees 2–4 in the installed neurospatial (48 bins there — never hard-coded).
 - Trajectories and spikes are synthesised in-test by the helpers in Task 7 with explicit `np.random.default_rng` seeds; the 1200 s "policy" trajectory defines the generating `T`, a separate 600 s trajectory generates the fitted data. No checked-in data.
 - Real data only in `scripts/successor_basis_comparison.py` via the gitignored `data/` loaders (absent here).
