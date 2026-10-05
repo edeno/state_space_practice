@@ -427,6 +427,29 @@ def _bayes_update(
     return log_joint - log_norm, log_norm
 
 
+def _logsumexp_preserving_zeros(log_values: Array, axis: int) -> Array:
+    """Sum log probabilities with zero gradients for all-``-inf`` slices.
+
+    Replace impossible slices before reducing: masking only the result still
+    lets the undefined derivative of ``logsumexp([-inf, ...])`` produce NaN.
+    NaN and positive infinity are not structural zeros and still propagate.
+    """
+    impossible = jnp.all(jnp.isneginf(log_values), axis=axis, keepdims=True)
+    safe_values = jnp.where(impossible, 0.0, log_values)
+    log_sum = jax.nn.logsumexp(safe_values, axis=axis, keepdims=True)
+    return jnp.squeeze(jnp.where(impossible, -jnp.inf, log_sum), axis=axis)
+
+
+def _log_smoothing_ratio(log_smoothed: Array, log_predicted: Array) -> Array:
+    """Log smoothing ratio, with zero mass for unreachable destinations."""
+    impossible = jnp.isneginf(log_predicted)
+    # Both probabilities are zero for an unreachable state. Replace both
+    # operands before subtraction to avoid -inf - -inf in values and gradients.
+    safe_smoothed = jnp.where(impossible, 0.0, log_smoothed)
+    safe_predicted = jnp.where(impossible, 0.0, log_predicted)
+    return jnp.where(impossible, -jnp.inf, safe_smoothed - safe_predicted)
+
+
 def _prepare_inputs(
     choices: ArrayLike,
     rewards: ArrayLike,
@@ -505,7 +528,8 @@ def contingency_belief_filter(
     inverse_temperature : float
         Softmax temperature for choice policy.
     transition_logits : ArrayLike or None, shape (n_states, n_states - 1)
-        Baseline transition logits (centered softmax).
+        Baseline transition logits (centered softmax). A ``-inf`` logit
+        forbids the corresponding transition.
     transition_covariates : ArrayLike or None, shape (n_trials, d_h)
         Time-varying transition covariates.
     transition_weights : ArrayLike or None, shape (n_states, n_states - 1, d_h)
@@ -630,7 +654,9 @@ def _forward_pass(
 
         logits = transition_logits + jnp.einsum("ijk,k->ij", transition_weights, h_t)
         log_trans = centered_log_softmax(logits)
-        log_predicted = jax.nn.logsumexp(log_prev_belief[:, None] + log_trans, axis=0)
+        log_predicted = _logsumexp_preserving_zeros(
+            log_prev_belief[:, None] + log_trans, axis=0
+        )
         obs_offset_t = _compute_obs_offset(obs_dm_t)
 
         # Keep both transition and posterior probabilities in log space:
@@ -835,10 +861,10 @@ def _contingency_belief_smoother_jit(
     ) -> tuple[Array, Array]:
         log_filter_t, log_predicted_tp1, log_trans_tp1 = step_data
         # P(s_t | data) = filter_t * sum_j T[i,j] * smooth_tp1[j] / predicted_tp1[j].
-        # Finite softmax logits make every predicted state reachable; perform
-        # the ratio and sum in log space to avoid division by underflowed mass.
-        log_ratio = log_smooth_next - log_predicted_tp1
-        log_smooth_t = log_filter_t + jax.nn.logsumexp(
+        # Work in log space for tiny reachable mass; structurally unreachable
+        # destinations contribute zero without evaluating -inf - -inf.
+        log_ratio = _log_smoothing_ratio(log_smooth_next, log_predicted_tp1)
+        log_smooth_t = log_filter_t + _logsumexp_preserving_zeros(
             log_trans_tp1 + log_ratio[None, :], axis=1
         )
         log_smooth_t = log_smooth_t - jax.nn.logsumexp(log_smooth_t)
@@ -870,7 +896,7 @@ def _contingency_belief_smoother_jit(
         # NOT the smoothed marginal (which conditions on future data too); using
         # the smoothed marginal breaks the marginalization identity
         # sum_j P(s_t=i, s_{t+1}=j) = P(s_t=i | data).
-        log_ratio = log_smooth_tp1 - log_predicted_tp1
+        log_ratio = _log_smoothing_ratio(log_smooth_tp1, log_predicted_tp1)
         log_joint = log_filter_t[:, None] + log_trans_tp1 + log_ratio[None, :]
         return jnp.exp(log_joint - jax.nn.logsumexp(log_joint))
 

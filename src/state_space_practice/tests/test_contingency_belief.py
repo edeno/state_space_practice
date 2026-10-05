@@ -423,6 +423,91 @@ class TestUnderflowedBeliefs:
         np.testing.assert_allclose(likelihood_grad, -0.5, rtol=1e-10)
 
 
+class TestUnreachableStates:
+    @pytest.fixture
+    def inputs(self):
+        return {
+            "choices": jnp.array([0, 1, 0, 1]),
+            "rewards": jnp.zeros(4, dtype=jnp.int32),
+            "n_states": 2,
+            "n_options": 2,
+            "reward_probs": jnp.full((2, 2), 0.5),
+            "state_values": jnp.array([[1.0, -1.0], [-1.0, 1.0]]),
+            "transition_logits": jnp.full((2, 1), -jnp.inf),
+        }
+
+    def test_smoother_preserves_forbidden_states_and_pairwise_marginals(self, inputs):
+        beta = 0.5
+        p = 1 / (1 + np.exp(-2 * beta))
+        # Both source states transition to state 1 with probability one. Future
+        # observations cannot change the posterior at t=0, which is [p, 1-p].
+        result = contingency_belief_smoother(**inputs, inverse_temperature=beta)
+        expected_smoothed = np.array([[p, 1 - p], [0, 1], [0, 1], [0, 1]])
+        expected_pairwise = np.array(
+            [[[0, p], [0, 1 - p]], [[0, 0], [0, 1]], [[0, 0], [0, 1]]]
+        )
+        expected_ll = 5 * np.log(0.5) + 2 * np.log(p) + np.log1p(-p)
+        np.testing.assert_allclose(result.smoothed_state_prob, expected_smoothed)
+        np.testing.assert_allclose(result.pairwise_state_prob, expected_pairwise)
+        np.testing.assert_allclose(result.log_likelihood, expected_ll, rtol=1e-12)
+        np.testing.assert_allclose(
+            result.pairwise_state_prob.sum(axis=2), expected_smoothed[:-1]
+        )
+        np.testing.assert_allclose(
+            result.pairwise_state_prob.sum(axis=1), expected_smoothed[1:]
+        )
+
+    @pytest.mark.parametrize(
+        "inference", [contingency_belief_filter, contingency_belief_smoother]
+    )
+    def test_likelihood_gradient_ignores_unreachable_states(self, inputs, inference):
+        beta = 0.5
+        p = 1 / (1 + np.exp(-2 * beta))
+        grad = jax.grad(
+            lambda value: inference(**inputs, inverse_temperature=value).log_likelihood
+        )(beta)
+        # After t=0, choices [1, 0, 1] under state 1 have probabilities [p, 1-p, p].
+        np.testing.assert_allclose(grad, 4 * (1 - p) - 2 * p, rtol=1e-12)
+
+    def test_pairwise_gradient_matches_initial_choice_posterior(self, inputs):
+        beta = 0.5
+        p = 1 / (1 + np.exp(-2 * beta))
+        grad = jax.grad(
+            lambda value: contingency_belief_smoother(
+                **inputs, inverse_temperature=value
+            ).pairwise_state_prob[0, 0, 1]
+        )(beta)
+        np.testing.assert_allclose(grad, 2 * p * (1 - p), rtol=1e-12)
+
+    def test_state_can_become_unreachable_after_losing_its_sources(self):
+        def evaluate(logit):
+            return contingency_belief_smoother(
+                choices=jnp.array([0, 1, 0, 1]),
+                rewards=jnp.zeros(4, dtype=jnp.int32),
+                n_states=3,
+                n_options=2,
+                reward_probs=jnp.full((3, 2), 0.5),
+                state_values=jnp.zeros((3, 2)),
+                init_state_prob=jnp.array([0.5, 0.5, 0.0]),
+                transition_logits=jnp.array(
+                    [[-jnp.inf, logit], [-jnp.inf, -jnp.inf], [-jnp.inf, -jnp.inf]]
+                ),
+            )
+
+        # State 1 is reachable only from state 0, which disappears after t=0.
+        expected = np.array([[0.5, 0.5, 0], [0, 0.25, 0.75], [0, 0, 1], [0, 0, 1]])
+        result = evaluate(0.0)
+        np.testing.assert_allclose(result.smoothed_state_prob, expected)
+        np.testing.assert_allclose(
+            result.pairwise_state_prob.sum(axis=2), expected[:-1]
+        )
+        np.testing.assert_allclose(result.pairwise_state_prob.sum(axis=1), expected[1:])
+        np.testing.assert_allclose(result.log_likelihood, 8 * np.log(0.5), rtol=1e-12)
+        # P(s_1=1) = P(s_0=0) * sigmoid(logit), derivative 0.5 * 0.25 at zero.
+        grad = jax.grad(lambda x: evaluate(x).smoothed_state_prob[1, 1])(0.0)
+        np.testing.assert_allclose(grad, 0.125, rtol=1e-12)
+
+
 class TestContingencyBeliefSmoother:
     @pytest.fixture
     def block_data(self):
