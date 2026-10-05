@@ -414,7 +414,7 @@ def _bayes_update(
 ) -> tuple[Array, Array]:
     """Bayes update: log prior belief -> posterior given one trial's observations.
 
-    Returns the normalized posterior and the log-normalizer (the trial's
+    Returns the normalized log posterior and the log-normalizer (the trial's
     marginal log-likelihood contribution). Shared by the filter and the
     smoother's forward pass.
     """
@@ -424,7 +424,7 @@ def _bayes_update(
     )
     log_joint = log_prior + reward_ll + choice_ll
     log_norm = jax.nn.logsumexp(log_joint)
-    return jnp.exp(log_joint - log_norm), log_norm
+    return log_joint - log_norm, log_norm
 
 
 def _prepare_inputs(
@@ -570,14 +570,14 @@ def _forward_pass(
 
     Returns
     -------
-    filter_beliefs : Array, shape (n_trials, n_states)
-        Filtered posterior ``P(s_t | a_{1:t}, r_{1:t})``.
-    predicted_beliefs : Array, shape (n_trials, n_states)
-        One-step prediction ``P(s_t | a_{1:t-1}, r_{1:t-1})``; row 0 is
-        ``init_state_prob`` (no transition is applied before trial 0).
-    trans_matrices : Array, shape (n_trials, n_states, n_states)
-        Transition matrix into trial ``t``; row 0 is the baseline matrix and
-        is not used by the backward pass.
+    log_filter_beliefs : Array, shape (n_trials, n_states)
+        Log filtered posterior ``P(s_t | a_{1:t}, r_{1:t})``.
+    log_predicted_beliefs : Array, shape (n_trials, n_states)
+        Log one-step prediction ``P(s_t | a_{1:t-1}, r_{1:t-1})``; row 0 is
+        ``log(init_state_prob)`` (no transition is applied before trial 0).
+    log_trans_matrices : Array, shape (n_trials, n_states, n_states)
+        Log transition matrix into trial ``t``; row 0 is the baseline matrix
+        and is not used by the backward pass.
     log_likelihood : Array, shape ()
         Marginal log-likelihood of all trials.
     """
@@ -625,39 +625,42 @@ def _forward_pass(
     def _step(
         carry: tuple[Array, Array], trial_data: tuple[Array, Array, Array, Array]
     ) -> tuple[tuple[Array, Array], tuple[Array, Array, Array]]:
-        prev_belief, accum_ll = carry
+        log_prev_belief, accum_ll = carry
         choice_t, reward_t, h_t, obs_dm_t = trial_data
 
-        trans = compute_input_output_transition_matrix(
-            transition_logits, transition_weights, h_t
-        )
-        predicted = trans.T @ prev_belief
+        logits = transition_logits + jnp.einsum("ijk,k->ij", transition_weights, h_t)
+        log_trans = centered_log_softmax(logits)
+        log_predicted = jax.nn.logsumexp(log_prev_belief[:, None] + log_trans, axis=0)
         obs_offset_t = _compute_obs_offset(obs_dm_t)
 
-        # Every state is reachable after a (softmax) transition, so a zero here
-        # is underflow, not a structural zero: lift it to the smallest normal
-        # float, leaving every representable positive belief at its true value.
-        posterior, log_norm = _update(
-            jnp.log(jnp.maximum(predicted, jnp.finfo(predicted.dtype).tiny)),
+        # Keep both transition and posterior probabilities in log space:
+        # a probability that underflows now may become likely after new data.
+        log_posterior, log_norm = _update(
+            log_predicted,
             choice_t,
             reward_t,
             obs_offset_t,
         )
-        return (posterior, accum_ll + log_norm), (posterior, predicted, trans)
+        return (log_posterior, accum_ll + log_norm), (
+            log_posterior,
+            log_predicted,
+            log_trans,
+        )
 
     # t=0: use init_state_prob directly as prior (no transition applied)
     obs_offset_0 = _compute_obs_offset(obs_design_matrix[0])
     # A zero in init_state_prob is structural: the state is impossible at t=0
     # and keeps zero posterior mass (a floor would let a strong enough
     # likelihood revive it).
-    posterior_0, log_norm_0 = _update(
-        zero_preserving_log(init_state_prob), choices[0], rewards[0], obs_offset_0
+    log_init_state_prob = zero_preserving_log(init_state_prob)
+    log_posterior_0, log_norm_0 = _update(
+        log_init_state_prob, choices[0], rewards[0], obs_offset_0
     )
     # Dummy transition for t=0 (not used by backward pass)
-    dummy_trans = centered_softmax(transition_logits)
+    log_dummy_trans = centered_log_softmax(transition_logits)
 
     # t=1:T: scan with transitions
-    init_carry = (posterior_0, log_norm_0)
+    init_carry = (log_posterior_0, log_norm_0)
     remaining_inputs = (
         choices[1:],
         rewards[1:],
@@ -669,10 +672,12 @@ def _forward_pass(
     )
 
     # Concatenate t=0 with t=1:T
-    filter_beliefs = jnp.concatenate([posterior_0[None], filt_rest], axis=0)
-    predicted_beliefs = jnp.concatenate([init_state_prob[None], pred_rest], axis=0)
-    trans_matrices = jnp.concatenate([dummy_trans[None], trans_rest], axis=0)
-    return filter_beliefs, predicted_beliefs, trans_matrices, total_ll
+    log_filter_beliefs = jnp.concatenate([log_posterior_0[None], filt_rest], axis=0)
+    log_predicted_beliefs = jnp.concatenate(
+        [log_init_state_prob[None], pred_rest], axis=0
+    )
+    log_trans_matrices = jnp.concatenate([log_dummy_trans[None], trans_rest], axis=0)
+    return log_filter_beliefs, log_predicted_beliefs, log_trans_matrices, total_ll
 
 
 @functools.partial(typed_jit, static_argnames=["n_states", "n_options"])
@@ -691,7 +696,7 @@ def _contingency_belief_filter_jit(
     obs_design_matrix: Array | None = None,
     obs_weights: Array | None = None,
 ) -> ContingencyBeliefResult:
-    posteriors, _, _, total_ll = _forward_pass(
+    log_posteriors, _, _, total_ll = _forward_pass(
         choices,
         rewards,
         n_states,
@@ -707,7 +712,7 @@ def _contingency_belief_filter_jit(
         obs_weights,
     )
     return ContingencyBeliefResult(
-        state_posterior=posteriors,
+        state_posterior=jnp.exp(log_posteriors),
         log_likelihood=total_ll,
     )
 
@@ -806,57 +811,58 @@ def _contingency_belief_smoother_jit(
     obs_weights: Array | None = None,
 ) -> _SmootherOutputs:
     # Forward pass
-    filter_beliefs, predicted_beliefs, trans_matrices, total_ll = _forward_pass(
-        choices,
-        rewards,
-        n_states,
-        n_options,
-        reward_probs,
-        state_values,
-        inverse_temperature,
-        transition_logits,
-        transition_covariates,
-        transition_weights,
-        init_state_prob,
-        obs_design_matrix,
-        obs_weights,
+    log_filter_beliefs, log_predicted_beliefs, log_trans_matrices, total_ll = (
+        _forward_pass(
+            choices,
+            rewards,
+            n_states,
+            n_options,
+            reward_probs,
+            state_values,
+            inverse_temperature,
+            transition_logits,
+            transition_covariates,
+            transition_weights,
+            init_state_prob,
+            obs_design_matrix,
+            obs_weights,
+        )
     )
 
     # --- Backward pass ---
     def _backward_step(
-        beta_next: Array, step_data: tuple[Array, Array, Array]
+        log_smooth_next: Array, step_data: tuple[Array, Array, Array]
     ) -> tuple[Array, Array]:
-        filter_t, predicted_tp1, trans_tp1 = step_data
-        # beta_next = P(s_{t+1} | data) / P(s_{t+1} | data_{1:t})
-        # smoothed_t = filter_t * sum_j T(i→j) * beta_next[j] / predicted[j]
-        # Same floor as the forward pass, so the ratio matches its posterior.
-        ratio = beta_next / jnp.maximum(
-            predicted_tp1, jnp.finfo(predicted_tp1.dtype).tiny
+        log_filter_t, log_predicted_tp1, log_trans_tp1 = step_data
+        # P(s_t | data) = filter_t * sum_j T[i,j] * smooth_tp1[j] / predicted_tp1[j].
+        # Finite softmax logits make every predicted state reachable; perform
+        # the ratio and sum in log space to avoid division by underflowed mass.
+        log_ratio = log_smooth_next - log_predicted_tp1
+        log_smooth_t = log_filter_t + jax.nn.logsumexp(
+            log_trans_tp1 + log_ratio[None, :], axis=1
         )
-        beta_t = filter_t * (trans_tp1 @ ratio)
-        # Normalize for stability
-        beta_t = beta_t / jnp.maximum(beta_t.sum(), 1e-30)
-        return beta_t, beta_t
+        log_smooth_t = log_smooth_t - jax.nn.logsumexp(log_smooth_t)
+        return log_smooth_t, log_smooth_t
 
     # Backward scan: from T-1 down to 0
     # step_data for backward step t uses filter[t], predicted[t+1], trans[t+1]
     backward_inputs = (
-        filter_beliefs[:-1],  # filter[0:T-1]
-        predicted_beliefs[1:],  # predicted[1:T]
-        trans_matrices[1:],  # trans[1:T]
+        log_filter_beliefs[:-1],  # filter[0:T-1]
+        log_predicted_beliefs[1:],  # predicted[1:T]
+        log_trans_matrices[1:],  # trans[1:T]
     )
     _, smoothed_interior = jax.lax.scan(
         _backward_step,
-        filter_beliefs[-1],  # init: last filter belief = smoothed belief
+        log_filter_beliefs[-1],  # init: last filter belief = smoothed belief
         backward_inputs,
         reverse=True,
     )
     # Concatenate: smoothed[0:T-1] from backward + filter[-1] as last
-    smoothed = jnp.concatenate([smoothed_interior, filter_beliefs[-1:]], axis=0)
+    log_smoothed = jnp.concatenate([smoothed_interior, log_filter_beliefs[-1:]], axis=0)
 
     # --- Pairwise state probabilities P(s_t=i, s_{t+1}=j | data) ---
     def _pairwise(step_data: tuple[Array, Array, Array, Array]) -> Array:
-        filter_t, predicted_tp1, trans_tp1, smooth_tp1 = step_data
+        log_filter_t, log_predicted_tp1, log_trans_tp1, log_smooth_tp1 = step_data
         # Two-slice HMM identity:
         #   P(s_t=i, s_{t+1}=j | data)
         #     = P(s_t=i | y_{1:t}) * T[i,j] * P(s_{t+1}=j | data) / P(s_{t+1}=j | y_{1:t})
@@ -864,26 +870,23 @@ def _contingency_belief_smoother_jit(
         # NOT the smoothed marginal (which conditions on future data too); using
         # the smoothed marginal breaks the marginalization identity
         # sum_j P(s_t=i, s_{t+1}=j) = P(s_t=i | data).
-        ratio = smooth_tp1 / jnp.maximum(
-            predicted_tp1, jnp.finfo(predicted_tp1.dtype).tiny
-        )
-        joint = filter_t[:, None] * trans_tp1 * ratio[None, :]
-        # Normalize
-        return joint / jnp.maximum(joint.sum(), 1e-30)
+        log_ratio = log_smooth_tp1 - log_predicted_tp1
+        log_joint = log_filter_t[:, None] + log_trans_tp1 + log_ratio[None, :]
+        return jnp.exp(log_joint - jax.nn.logsumexp(log_joint))
 
     pairwise_inputs = (
-        filter_beliefs[:-1],
-        predicted_beliefs[1:],
-        trans_matrices[1:],
-        smoothed[1:],
+        log_filter_beliefs[:-1],
+        log_predicted_beliefs[1:],
+        log_trans_matrices[1:],
+        log_smoothed[1:],
     )
     pairwise = jax.vmap(_pairwise)(pairwise_inputs)
 
     return _SmootherOutputs(
-        smoothed_state_prob=smoothed,
+        smoothed_state_prob=jnp.exp(log_smoothed),
         pairwise_state_prob=pairwise,
         log_likelihood=total_ll,
-        filtered_state_prob=filter_beliefs,
+        filtered_state_prob=jnp.exp(log_filter_beliefs),
     )
 
 

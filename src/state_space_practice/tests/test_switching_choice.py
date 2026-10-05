@@ -581,6 +581,22 @@ class TestSwitchingChoiceModel:
         model.fit(choices, max_iter=3)
         assert model.is_fitted
 
+    def test_single_trial_fit_preserves_dynamics_and_can_continue_with_sgd(self):
+        model = SwitchingChoiceModel(n_options=2, n_discrete_states=2)
+        previous_q = np.asarray(model.process_noises_).copy()
+        previous_transition = np.asarray(model.discrete_transition_matrix_).copy()
+
+        model.fit(jnp.array([0]), max_iter=3)
+
+        assert model.converged_
+        np.testing.assert_array_equal(model.process_noises_, previous_q)
+        np.testing.assert_array_equal(
+            model.discrete_transition_matrix_, previous_transition
+        )
+        np.testing.assert_allclose(model.discrete_transition_matrix_.sum(axis=1), 1.0)
+        likelihoods = model.fit_sgd(jnp.array([0]), num_steps=1)
+        assert np.all(np.isfinite(likelihoods))
+
     @pytest.mark.parametrize(
         "attr",
         [
@@ -1249,6 +1265,86 @@ class TestSwitchingChoiceMStepExactness:
         assert "discrete state(s) [0]" in caplog.text
         # Guard: the occupied state was re-estimated.
         np.testing.assert_allclose(model.process_noises_[1], 0.2, rtol=1e-12)
+
+    @pytest.mark.parametrize("occupancy", [1.0, 0.5, 1e-12])
+    def test_positive_occupancy_updates_scalar_noise_and_normalizes_transition_rows(
+        self, occupancy
+    ):
+        # State 0 has all outgoing evidence and state 1 has none. Q_1 has
+        # fractional incoming evidence, but its optimum is still 0.2.
+        smooth = self._single_transition_result([[1 - occupancy, occupancy], [0, 0]])
+        model = SwitchingChoiceModel(
+            n_options=2,
+            n_discrete_states=2,
+            init_decays=[1.0, 1.0],
+            init_process_noises=[0.3, 0.05],
+        )
+        previous_row = np.asarray(model.discrete_transition_matrix_[1]).copy()
+
+        model._m_step(smooth)
+
+        expected_q0 = 0.3 if occupancy == 1 else 0.2
+        np.testing.assert_allclose(
+            model.process_noises_, [expected_q0, 0.2], rtol=1e-12
+        )
+        np.testing.assert_allclose(
+            model.discrete_transition_matrix_[0], [1 - occupancy, occupancy], rtol=1e-12
+        )
+        np.testing.assert_array_equal(
+            model.discrete_transition_matrix_[1], previous_row
+        )
+        np.testing.assert_allclose(model.discrete_transition_matrix_.sum(axis=1), 1.0)
+
+    @classmethod
+    def _single_transition_result(cls, joint):
+        """Two-trial posterior with identical Gaussian moments in both states."""
+        joint = jnp.asarray(joint, dtype=float)
+        smooth = cls._certain_switch_result()
+        return smooth._replace(
+            overall_smoother_mean=smooth.overall_smoother_mean[:2],
+            overall_smoother_cov=smooth.overall_smoother_cov[:2],
+            smoother_discrete_state_prob=jnp.stack(
+                [joint.sum(axis=1), joint.sum(axis=0)]
+            ),
+            smoother_joint_discrete_state_prob=joint[None],
+            overall_smoother_cross_cov=smooth.overall_smoother_cross_cov[:1],
+            state_cond_smoother_means=jnp.full((2, 1, 2), 10.0),
+            state_cond_smoother_covs=smooth.state_cond_smoother_covs[:2],
+            pair_cond_smoother_means=smooth.pair_cond_smoother_means[:1],
+            pair_cond_smoother_cross_covs=smooth.pair_cond_smoother_cross_covs[:1],
+        )
+
+    def test_tiny_outgoing_count_produces_stochastic_row(self):
+        model = SwitchingChoiceModel(n_options=2, n_discrete_states=2)
+        smooth = self._single_transition_result([[0, 1e-12], [0, 1 - 1e-12]])
+
+        model._m_step(smooth)
+
+        np.testing.assert_allclose(model.discrete_transition_matrix_, [[0, 1], [0, 1]])
+
+    def test_two_trial_fit_reestimates_process_noise(self):
+        model = SwitchingChoiceModel(
+            n_options=2, n_discrete_states=1, init_process_noises=[0.5]
+        )
+        choices = jnp.array([0, 1])
+        smooth = model._run_smoother(model._run_filter(choices))
+        # There is one Gaussian transition with fixed unit decay. Its scalar
+        # variance optimum is E[(x_1-x_0)^2], without a regression sample gate.
+        mean_difference = (
+            smooth.state_cond_smoother_means[1, 0, 0]
+            - (smooth.pair_cond_smoother_means[0, 0, 0, 0])
+        )
+        expected_q = (
+            mean_difference**2
+            + smooth.state_cond_smoother_covs[1, 0, 0, 0]
+            + smooth.state_cond_smoother_covs[0, 0, 0, 0]
+            - 2 * smooth.pair_cond_smoother_cross_covs[0, 0, 0, 0, 0]
+        )
+        assert abs(float(expected_q) - 0.5) > 1e-3  # guard: an update is needed
+
+        model.fit(choices, max_iter=1)
+
+        np.testing.assert_allclose(model.process_noises_[0], expected_q, rtol=1e-12)
 
     def test_process_noise_per_state_is_stationary(self, em_inputs):
         model, data, filt, smooth = em_inputs

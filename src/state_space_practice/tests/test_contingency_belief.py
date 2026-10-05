@@ -336,6 +336,93 @@ class TestTinyPredictedBelief:
         assert result.smoothed_state_prob[1, 0] > 0  # guard: not underflowed
 
 
+class TestUnderflowedBeliefs:
+    @pytest.fixture
+    def inputs(self):
+        return {
+            "choices": jnp.array([0, 1]),
+            "rewards": jnp.zeros(2, dtype=jnp.int32),
+            "n_states": 2,
+            "n_options": 2,
+            "reward_probs": jnp.full((2, 2), 0.5),
+            "state_values": jnp.array([[1.0, -1.0], [-1.0, 1.0]]),
+            "init_state_prob": jnp.array([1.0, 0.0]),
+        }
+
+    @pytest.mark.parametrize("strength", [750.0, 1000.0])
+    def test_underflowed_transition_matches_exact_two_path_posterior(
+        self, inputs, strength
+    ):
+        # From the certain initial state there are exactly two possible paths.
+        # Compute their log weights without exponentiating the transition.
+        inputs = {
+            **inputs,
+            "inverse_temperature": strength,
+            "transition_logits": jnp.full((2, 1), strength),
+        }
+        trans = transition_logits_to_matrix(inputs["transition_logits"])
+        assert trans[0, 1] == 0.0  # guard: the probability underflows
+        log_trans = np.array(
+            [-np.logaddexp(0.0, -strength), -np.logaddexp(0.0, strength)]
+        )
+        choice_normalizer = np.logaddexp(0.0, -2 * strength)
+        log_weights = log_trans + np.array([-2 * strength, 0.0]) - choice_normalizer
+        log_norm = np.logaddexp.reduce(log_weights)
+        expected_last = np.exp(log_weights - log_norm)
+        expected_ll = 2 * np.log(0.5) - choice_normalizer + log_norm
+
+        filtered = contingency_belief_filter(**inputs)
+        smoothed = contingency_belief_smoother(**inputs)
+        np.testing.assert_allclose(filtered.log_likelihood, expected_ll, rtol=1e-12)
+        np.testing.assert_allclose(smoothed.log_likelihood, expected_ll, rtol=1e-12)
+        np.testing.assert_allclose(filtered.state_posterior[-1], expected_last)
+        np.testing.assert_allclose(
+            smoothed.smoothed_state_prob, [[1, 0], expected_last]
+        )
+        np.testing.assert_allclose(
+            smoothed.pairwise_state_prob[0], [expected_last, [0, 0]]
+        )
+
+    def test_underflowed_filtered_mass_can_recover(self, inputs):
+        # With near-deterministic persistence, all-switch-free paths dominate.
+        # State 1 has posterior exp(-1500) after choice 0, but becomes equally
+        # probable after choice 1. Keeping only the exponentiated posterior
+        # permanently loses that path.
+        inputs = {
+            **inputs,
+            "inverse_temperature": 750.0,
+            "transition_logits": jnp.array([[3000.0], [-3000.0]]),
+            "init_state_prob": jnp.array([0.5, 0.5]),
+        }
+        filtered = contingency_belief_filter(**inputs)
+        smoothed = contingency_belief_smoother(**inputs)
+        np.testing.assert_array_equal(filtered.state_posterior[0], [1.0, 0.0])
+        np.testing.assert_allclose(filtered.state_posterior[1], [0.5, 0.5])
+        np.testing.assert_allclose(smoothed.smoothed_state_prob, 0.5)
+        np.testing.assert_allclose(smoothed.pairwise_state_prob[0], 0.5 * np.eye(2))
+        np.testing.assert_allclose(filtered.log_likelihood, -1500 + 2 * np.log(0.5))
+
+    @pytest.mark.parametrize("strength", [500.0, 750.0])
+    def test_extreme_transition_gradients_match_balanced_path_derivatives(
+        self, inputs, strength
+    ):
+        # The two paths have equal weight at logit = 2 * beta. Their posterior
+        # derivative is -p(1-p) = -1/4; the LL derivative is -p = -1/2.
+        def evaluate(logit):
+            return contingency_belief_smoother(
+                **inputs,
+                inverse_temperature=strength / 2,
+                transition_logits=jnp.full((2, 1), logit),
+            )
+
+        posterior_grad = jax.grad(lambda x: evaluate(x).pairwise_state_prob[0, 0, 1])(
+            strength
+        )
+        likelihood_grad = jax.grad(lambda x: evaluate(x).log_likelihood)(strength)
+        np.testing.assert_allclose(posterior_grad, -0.25, rtol=1e-10)
+        np.testing.assert_allclose(likelihood_grad, -0.5, rtol=1e-10)
+
+
 class TestContingencyBeliefSmoother:
     @pytest.fixture
     def block_data(self):

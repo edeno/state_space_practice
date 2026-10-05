@@ -61,9 +61,7 @@ from state_space_practice.switching_kalman import (
     _update_discrete_state_probabilities,
     collapse_gaussian_mixture,
     collapse_gaussian_mixture_per_discrete_state,
-    minimum_state_occupancy,
     switching_kalman_smoother,
-    warn_low_occupancy_states,
 )
 from state_space_practice.utils import (
     typed_jit,
@@ -1039,6 +1037,8 @@ class SwitchingChoiceModel(SGDFittableMixin):
         EM updates per-state process_noises and discrete_transition_matrix.
         Per-state inverse_temperatures and decays are NOT updated (no
         closed-form M-step). Use fit_sgd() for full parameter learning.
+        A process noise or transition row with no expected transitions keeps
+        its previous value; with a single trial, all dynamics are preserved.
 
         Parameters
         ----------
@@ -1232,7 +1232,6 @@ class SwitchingChoiceModel(SGDFittableMixin):
         # Cov[x_t, x_{t+1} | S_t=i, S_{t+1}=s]: (T-1, K-1, K-1, S, S)
         pair_cross_covs = smoother_result.pair_cond_smoother_cross_covs
         k_free = self.n_options - 1
-        eps = 1e-10
 
         # Deterministic input: B @ u_t for each t
         if self.input_gain_ is not None and self._covariates is not None:
@@ -1263,20 +1262,24 @@ class SwitchingChoiceModel(SGDFittableMixin):
         )  # (T-1, S_prev, S)
 
         occupancy = joint.sum(axis=(0, 1))  # (S,) expected transitions into s
+        has_transitions = occupancy > 0
         q_hat = jnp.einsum("tis,tis->s", joint, mean_sq + cov_trace) / (
-            jnp.maximum(occupancy, eps) * k_free
+            jnp.where(has_transitions, occupancy, 1.0) * k_free
         )
-        # A state with too few expected transitions has an unidentified Q:
-        # keep its previous value (and warn), as the other switching M-steps do.
-        min_occupancy = minimum_state_occupancy(k_free)
-        warn_low_occupancy_states(
-            occupancy,
-            min_occupancy,
-            "SwitchingChoiceModel M-step",
-            "their process noise kept its previous value",
-        )
+        # Decay is fixed and Q = q I has only one free scalar: any positive
+        # expected transition count identifies its variance objective. Only
+        # states with zero expected transitions need to keep the previous Q.
+        unoccupied = [
+            s for s, count in enumerate(jax.device_get(occupancy)) if count == 0
+        ]
+        if unoccupied:
+            logger.warning(
+                "SwitchingChoiceModel M-step: discrete state(s) %s have no "
+                "expected transitions; their process noise kept its previous value.",
+                unoccupied,
+            )
         self.process_noises_ = jnp.where(
-            occupancy >= min_occupancy,
+            has_transitions,
             jnp.maximum(q_hat, 1e-6),
             self.process_noises_,
         )
@@ -1284,7 +1287,14 @@ class SwitchingChoiceModel(SGDFittableMixin):
         # Transition matrix from smoother joint
         trans_counts = joint.sum(axis=0)  # (S, S)
         row_sums = trans_counts.sum(axis=1, keepdims=True)
-        self.discrete_transition_matrix_ = trans_counts / jnp.maximum(row_sums, eps)
+        has_outgoing = row_sums > 0
+        # Empty source rows have a flat expected objective. Keep the previous
+        # stochastic row, and normalize every positive row by its actual count.
+        self.discrete_transition_matrix_ = jnp.where(
+            has_outgoing,
+            trans_counts / jnp.where(has_outgoing, row_sums, 1.0),
+            self.discrete_transition_matrix_,
+        )
 
     # --- SGDFittableMixin protocol ---
 
