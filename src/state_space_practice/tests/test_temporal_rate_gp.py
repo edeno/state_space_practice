@@ -26,6 +26,7 @@ from state_space_practice.temporal_rate_gp import (
     infer_log_rate_batch,
     poisson_log_rate_site,
 )
+from state_space_practice.tests.jax_monitoring_helpers import listen_to_jax_durations
 
 
 def _sample_matern32_latent(
@@ -315,9 +316,8 @@ def backend_compiles():
         if name == event:
             compiles.append(duration)
 
-    jax.monitoring.register_event_duration_secs_listener(listener)
-    yield compiles
-    jax.monitoring.unregister_event_duration_listener(listener)
+    with listen_to_jax_durations(listener):
+        yield compiles
 
 
 def test_repeat_inference_compiles_nothing(small_counts, backend_compiles):

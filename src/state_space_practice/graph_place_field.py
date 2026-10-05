@@ -326,8 +326,9 @@ def _bin_ids(
         trajectory = trajectory[:, None]
     # neurospatial types bin_sequence with a ``Self: EnvironmentProtocol`` bound
     # that mypy does not recognize the concrete Environment as satisfying; the
-    # call is valid at runtime.
-    ids = env.bin_sequence(  # type: ignore[misc]
+    # call is valid at runtime. The ignore is needed only when the optional
+    # neurospatial types are installed; minimal CI environments omit them.
+    ids = env.bin_sequence(  # type: ignore[misc, unused-ignore]
         np.asarray(times, dtype=float), trajectory, dedup=False, outside_value=-1
     )
     return np.asarray(ids, dtype=np.int_)

@@ -48,6 +48,7 @@ from state_space_practice.switching_kalman import (
     compute_transition_q_function,
     compute_transition_sufficient_stats,
 )
+from state_space_practice.tests.jax_monitoring_helpers import listen_to_jax_durations
 from state_space_practice.utils import stabilize_transition_matrix
 
 
@@ -1111,11 +1112,8 @@ def _count_backend_compiles() -> Iterator[list[str]]:
         if event == "/jax/core/compile/backend_compile_duration":
             compiles.append(event)
 
-    jax.monitoring.register_event_duration_secs_listener(listener)
-    try:
+    with listen_to_jax_durations(listener):
         yield compiles
-    finally:
-        jax.monitoring.unregister_event_duration_listener(listener)
 
 
 def _random_dim_inputs(seed: int, n_osc: int, n_states: int):

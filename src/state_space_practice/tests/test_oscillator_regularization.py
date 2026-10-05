@@ -8,7 +8,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.extend.core import jaxprs_in_params
+from jax.extend.core import ClosedJaxpr, Jaxpr
 
 from state_space_practice.oscillator_regularization import (
     OscillatorPenaltyConfig,
@@ -145,10 +145,17 @@ def _reference_block_sq(coupling, labels, exclude_diagonal):
 
 def _all_jaxpr_avals(jaxpr):
     """Every intermediate abstract value of a (closed) jaxpr, recursively."""
+    if isinstance(jaxpr, ClosedJaxpr):
+        jaxpr = jaxpr.jaxpr
     for eqn in jaxpr.eqns:
         yield from (v.aval for v in eqn.outvars)
-        for sub in jaxprs_in_params(eqn.params):
-            yield from _all_jaxpr_avals(sub)
+        # Jaxpr and ClosedJaxpr are available on the oldest supported JAX;
+        # jaxprs_in_params was added after the Python 3.10 / JAX 0.6.2 pin.
+        for value in eqn.params.values():
+            values = value if isinstance(value, (tuple, list)) else (value,)
+            for sub in values:
+                if isinstance(sub, (Jaxpr, ClosedJaxpr)):
+                    yield from _all_jaxpr_avals(sub)
 
 
 @pytest.fixture(scope="module")

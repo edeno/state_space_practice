@@ -44,6 +44,7 @@ from state_space_practice.tests.conftest import (
     positive_definite_matrices,
     to_jax,
 )
+from state_space_practice.tests.jax_monitoring_helpers import listen_to_jax_durations
 
 # The x_1-prior M-step (initial_state_prior=None) is deprecated; tests of its
 # formulas assert the deprecation warning.
@@ -67,11 +68,8 @@ def _count_compiles() -> Iterator[Callable[[], int]]:
         nonlocal count
         count += event in _COMPILE_EVENTS
 
-    jax.monitoring.register_event_duration_secs_listener(listener)
-    try:
+    with listen_to_jax_durations(listener):
         yield lambda: count
-    finally:
-        jax.monitoring.unregister_event_duration_listener(listener)
 
 
 # --- Unit Tests ---
