@@ -29,6 +29,7 @@ _detector`` MRF) feed *our* basis to both sides, so they are robust to this choi
 from __future__ import annotations
 
 import contextlib
+import hashlib
 from typing import TYPE_CHECKING, NamedTuple
 
 import networkx as nx
@@ -77,8 +78,8 @@ class GraphBasis(NamedTuple):
     n_components : int
         Number of connected components (= number of retained null modes).
     env_key : tuple
-        Identity fingerprint ``(n_bins, nnz, |L|-sum)`` of the environment's Laplacian
-        this basis was built from. Consumers (:func:`graph_design_matrix`,
+        Identity fingerprint ``(n_bins, nnz, sha256 hex digest of L's entries)`` of
+        the environment's Laplacian this basis was built from. Consumers (:func:`graph_design_matrix`,
         :func:`bin_spike_counts`) check it to refuse a basis built for a different
         (or since-refit) environment, which would otherwise return silently wrong
         design rows / counts.
@@ -89,7 +90,7 @@ class GraphBasis(NamedTuple):
     component_labels: NDArray[np.int_]
     bin_sizes: NDArray[np.float64]
     n_components: int
-    env_key: tuple[int, int, float]
+    env_key: tuple[int, int, str]
 
 
 def _distance_weighted_laplacian(env: Environment) -> sp.csr_matrix:
@@ -98,20 +99,27 @@ def _distance_weighted_laplacian(env: Environment) -> sp.csr_matrix:
     return (D @ D.T).tocsr()
 
 
-def _laplacian_key(laplacian: sp.spmatrix) -> tuple[int, int, float]:
-    """Cheap identity fingerprint of a Laplacian: ``(n_bins, nnz, |data|-sum)``.
+def _laplacian_key(laplacian: sp.spmatrix) -> tuple[int, int, str]:
+    """Identity fingerprint of a Laplacian: ``(n_bins, nnz, digest)``.
 
-    ``abs`` because a graph Laplacian's signed entries sum to ~0; the absolute-value
-    sum distinguishes different edge weightings at the same sparsity pattern.
+    ``digest`` hashes the canonical CSR arrays (shape, row pointers, column indices,
+    values), so changing any entry changes the key. A summary statistic is not
+    enough: reweighting edges can leave the size, sparsity and total weight intact.
     """
-    return (
-        int(laplacian.shape[0]),
-        int(laplacian.nnz),
-        float(np.round(np.abs(laplacian.data).sum(), 6)),
-    )
+    csr = sp.csr_matrix(laplacian, dtype=np.float64, copy=True)
+    csr.sum_duplicates()  # canonical form: sorted indices, no duplicate entries
+    digest = hashlib.sha256()
+    for arr in (
+        np.asarray(csr.shape, dtype=np.int64),
+        csr.indptr.astype(np.int64),
+        csr.indices.astype(np.int64),
+        csr.data,
+    ):
+        digest.update(np.ascontiguousarray(arr).tobytes())
+    return int(csr.shape[0]), int(csr.nnz), digest.hexdigest()
 
 
-def _env_key(env: Environment) -> tuple[int, int, float]:
+def _env_key(env: Environment) -> tuple[int, int, str]:
     """Fingerprint of ``env``'s current distance-weighted Laplacian."""
     return _laplacian_key(_distance_weighted_laplacian(env))
 
@@ -239,8 +247,8 @@ def build_graph_basis(
     laplacian = _distance_weighted_laplacian(env)
     n_components, labels = connected_components(laplacian, directed=False)
 
-    # Cache the full sorted eigensystem keyed by the Laplacian's identity (shape + nnz +
-    # data checksum); a cached full basis serves any smaller rank by slicing.
+    # Cache the full sorted eigensystem keyed by the Laplacian's identity (a hash of
+    # all its entries); a cached full basis serves any smaller rank by slicing.
     cache = getattr(env, _CACHE_ATTR, None)
     key = _laplacian_key(laplacian)
     if cache is None or cache.get("key") != key:
@@ -318,8 +326,9 @@ def _bin_ids(
         trajectory = trajectory[:, None]
     # neurospatial types bin_sequence with a ``Self: EnvironmentProtocol`` bound
     # that mypy does not recognize the concrete Environment as satisfying; the
-    # call is valid at runtime.
-    ids = env.bin_sequence(  # type: ignore[misc]
+    # call is valid at runtime. The ignore is needed only when the optional
+    # neurospatial types are installed; minimal CI environments omit them.
+    ids = env.bin_sequence(  # type: ignore[misc, unused-ignore]
         np.asarray(times, dtype=float), trajectory, dedup=False, outside_value=-1
     )
     return np.asarray(ids, dtype=np.int_)

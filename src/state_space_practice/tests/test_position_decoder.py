@@ -1558,36 +1558,50 @@ class TestAdaptiveInflation:
             atol=1e-10,
         )
 
-    def test_inflation_increases_covariance(self, rate_maps_and_data):
-        """With inflation enabled, filter covariances should be >= baseline."""
-        rm, spikes, position, dt = rate_maps_and_data
-        init_pos = jnp.array(position[0])
+    def test_inflation_increases_covariance(self):
+        """A controlled innovation inflates the prior and posterior covariance.
 
-        result_base = position_decoder_filter(
-            spikes=spikes,
+        Over a long nonlinear trajectory, inflation also moves the observation
+        modes and may trigger a legitimate divergence warning. Use one bin and
+        weak, log-linear rate gradients to isolate covariance inflation.
+        """
+        edges = np.linspace(-20.0, 20.0, 41)
+        xx, yy = np.meshgrid(edges, edges)
+        gradient = 0.05
+        rm = PlaceFieldRateMaps(
+            rate_maps=10.0 * np.exp(gradient * np.stack([xx, -xx, yy, -yy])),
+            x_edges=edges,
+            y_edges=edges,
+        )
+        cfg = AdaptiveInflationConfig(gain=0.1, max_alpha=2.0)
+        kwargs = dict(
+            spikes=np.array([[2.0, 0.0, 0.0, 0.0]]),
             rate_maps=rm,
-            dt=dt,
-            q_pos=50.0,
+            dt=0.01,
+            q_pos=0.0,
             include_velocity=False,
-            init_position=init_pos,
+            init_position=jnp.zeros(2),
+            init_cov=jnp.eye(2),
         )
-        result_infl = position_decoder_filter(
-            spikes=spikes,
-            rate_maps=rm,
-            dt=dt,
-            q_pos=50.0,
-            include_velocity=False,
-            init_position=init_pos,
-            adaptive_inflation=AdaptiveInflationConfig(gain=1.0, max_alpha=5.0),
+        result_base, _, pred_base = _position_decoder_filter_with_predictions(**kwargs)
+        result_infl, _, pred_infl = _position_decoder_filter_with_predictions(
+            **kwargs, adaptive_inflation=cfg
         )
-        # Mean trace of covariance should be >= baseline
-        base_trace = np.mean(
-            np.trace(np.array(result_base.position_cov), axis1=1, axis2=2)
+
+        # At the origin every expected count is 0.1, score = (2g, 0), and
+        # Fisher = 2 * 0.1 * g^2 I. With identity dynamics and Q=0 the predicted
+        # covariance must therefore be alpha I, with this analytical alpha.
+        score_sq = (2 * gradient) ** 2
+        fisher_diag = 2 * 0.1 * gradient**2
+        innovation_size = score_sq / (fisher_diag + cfg.epsilon) / 2
+        alpha = 1 + cfg.gain * (innovation_size - 1)
+        assert 1.5 < alpha < cfg.max_alpha  # guard: active, unsaturated inflation
+        np.testing.assert_allclose(pred_base[0], np.eye(2), rtol=1e-12)
+        np.testing.assert_allclose(pred_infl[0], alpha * np.eye(2), rtol=1e-10)
+        covariance_increase = np.asarray(result_infl.position_cov[0]) - np.asarray(
+            result_base.position_cov[0]
         )
-        infl_trace = np.mean(
-            np.trace(np.array(result_infl.position_cov), axis1=1, axis2=2)
-        )
-        assert infl_trace >= base_trace
+        assert np.all(np.linalg.eigvalsh(covariance_increase) > 1e-3)
 
     def test_capped_inflation_bounds_covariance_growth(self, rate_maps_and_data):
         """The per-step cap ``max_alpha`` bounds the covariance inflation.

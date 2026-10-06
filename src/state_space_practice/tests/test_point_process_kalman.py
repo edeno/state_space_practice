@@ -4446,7 +4446,11 @@ class TestGradientMemory:
         carry_bytes = n_neurons * (nb * nb + nb) * 8
         # Guard: reverse mode must keep the carry, so the bound is not vacuous.
         assert per_step >= 0.5 * carry_bytes
-        assert per_step < 3 * carry_bytes, (per_step, carry_bytes)
+        # Compiler layouts can add a small per-step overhead (5200 bytes on
+        # JAX 0.6.2/macOS vs 5184 for three carries). The 64-byte allowance is
+        # smaller than a single nb x nb covariance and keeps the budget well
+        # below the unrematerialized Fisher iterations' residuals.
+        assert per_step < 3 * carry_bytes + 64, (per_step, carry_bytes)
 
     def test_dense_filter(self) -> None:
         d, n_obs = 8, 3
@@ -4487,7 +4491,8 @@ class TestGradientMemory:
         carry_bytes = (d * d + d) * 8
         # Guard: reverse mode must keep the carry, so the bound is not vacuous.
         assert per_step >= 0.5 * carry_bytes
-        assert per_step < 3 * carry_bytes, (per_step, carry_bytes)
+        # Keep the same small bookkeeping allowance across XLA versions.
+        assert per_step < 3 * carry_bytes + 64, (per_step, carry_bytes)
 
 
 # ============================================================================

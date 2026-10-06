@@ -9,6 +9,7 @@ wrong Laplacian weighting, off-by-component null modes) called out in the plan.
 import networkx as nx
 import numpy as np
 import pytest
+import scipy.sparse as sp
 
 neurospatial = pytest.importorskip("neurospatial")
 from neurospatial import Environment  # noqa: E402
@@ -206,6 +207,39 @@ def test_basis_cache_invalidates_on_laplacian_change(monkeypatch):
 
     assert basis0.env_key != basis1.env_key
     assert not np.allclose(basis0.eigvals, basis1.eigvals)
+
+
+def test_basis_cache_distinguishes_same_size_reweighting(monkeypatch):
+    """Moving weight between edges changes the Laplacian without changing its size,
+    sparsity or total absolute weight; the basis must still be rebuilt and the old
+    basis refused."""
+    pos = np.random.default_rng(7).uniform(0, 20, (400, 2))
+    env = Environment.from_samples(pos, bin_size=5.0)
+    basis0 = build_graph_basis(env)
+
+    d_original = env.get_differential_operator().tocsc()
+    # Edge e contributes (sum_i |D_ie|)^2 to sum |L|; rescale two edges with equal
+    # contributions by sqrt(1.5) and sqrt(0.5) so that sum is unchanged.
+    contribution = np.asarray(abs(d_original).sum(axis=0)).ravel() ** 2
+    e1, e2 = np.flatnonzero(np.isclose(contribution, contribution[0], rtol=0))[:2]
+    scale = np.ones(d_original.shape[1])
+    scale[[e1, e2]] = np.sqrt([1.5, 0.5])
+    d_reweighted = d_original @ sp.diags(scale)
+    monkeypatch.setattr(env, "get_differential_operator", lambda: d_reweighted)
+
+    lap0 = (d_original @ d_original.T).tocsr()
+    lap1 = (d_reweighted @ d_reweighted.T).tocsr()
+    # Guard: invisible to a (n_bins, nnz, |L|-sum) fingerprint, yet a different L.
+    assert lap0.nnz == lap1.nnz
+    np.testing.assert_allclose(abs(lap0).sum(), abs(lap1).sum(), rtol=1e-12)
+    assert abs(lap0 - lap1).max() > 0.1
+
+    basis1 = build_graph_basis(env)
+    assert not np.allclose(basis0.eigvals, basis1.eigvals)
+    times = np.array([0.0, 0.1])
+    traj = np.vstack([env.bin_centers[0], env.bin_centers[0]])
+    with pytest.raises(ValueError, match="different"):
+        graph_design_matrix(env, basis0, times, traj)
 
 
 def test_consumers_reject_mismatched_env(small_grid_env, two_component_env):

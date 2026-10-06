@@ -44,6 +44,7 @@ from state_space_practice.tests.conftest import (
     positive_definite_matrices,
     to_jax,
 )
+from state_space_practice.tests.jax_monitoring_helpers import listen_to_jax_durations
 
 # The x_1-prior M-step (initial_state_prior=None) is deprecated; tests of its
 # formulas assert the deprecation warning.
@@ -67,11 +68,8 @@ def _count_compiles() -> Iterator[Callable[[], int]]:
         nonlocal count
         count += event in _COMPILE_EVENTS
 
-    jax.monitoring.register_event_duration_secs_listener(listener)
-    try:
+    with listen_to_jax_durations(listener):
         yield lambda: count
-    finally:
-        jax.monitoring.unregister_event_duration_listener(listener)
 
 
 # --- Unit Tests ---
@@ -1729,6 +1727,24 @@ class TestKalmanNumericalStability:
         # d/ds sum((s cov)^{-1} rhs) at s = 1 is -sum(cov^{-1} rhs).
         gradient = jax.grad(loss)(jnp.asarray(1.0, dtype=cov.dtype))
         np.testing.assert_allclose(gradient, -jnp.sum(expected), rtol=1e-6)
+
+    def test_numerically_singular_innovation_cov_fails_loud(self) -> None:
+        """A rank-1 prediction (A = 0, Q = 11^T) plus R = 1e-20 I gives an
+        innovation covariance that does not factor in float64. The gain solve
+        is stabilised, so the posterior stays finite, but the likelihood is
+        deliberately non-finite so EM rolls back or raises rather than
+        accepting the likelihood of a regularised model."""
+        means, covs, log_likelihood = kalman_filter(
+            jnp.zeros(2),
+            jnp.eye(2),
+            jnp.ones((5, 2)),
+            jnp.zeros((2, 2)),
+            jnp.ones((2, 2)),
+            jnp.eye(2),
+            1e-20 * jnp.eye(2),
+        )
+        assert jnp.all(jnp.isfinite(means)) and jnp.all(jnp.isfinite(covs))
+        assert not jnp.isfinite(log_likelihood)
 
     @pytest.mark.parametrize("int_dtype", [jnp.int32, jnp.int64])
     def test_gain_solve_integer_singular_cov_float32_rhs(self, int_dtype) -> None:

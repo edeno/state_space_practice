@@ -1037,6 +1037,8 @@ class SwitchingChoiceModel(SGDFittableMixin):
         EM updates per-state process_noises and discrete_transition_matrix.
         Per-state inverse_temperatures and decays are NOT updated (no
         closed-form M-step). Use fit_sgd() for full parameter learning.
+        A process noise or transition row with no expected transitions keeps
+        its previous value; with a single trial, all dynamics are preserved.
 
         Parameters
         ----------
@@ -1214,7 +1216,7 @@ class SwitchingChoiceModel(SGDFittableMixin):
 
         Uses smoother quantities throughout (approximate EM via GPB1/IMM):
         - smoother_joint_discrete_state_prob for transition matrix
-        - state_cond_smoother_means/covs + cross-covs for Q
+        - state- and pair-conditional smoother moments for Q
 
         Note: does NOT delegate to switching_kalman_maximization_step
         because the choice model uses scalar per-state parameters
@@ -1225,11 +1227,11 @@ class SwitchingChoiceModel(SGDFittableMixin):
         joint = smoother_result.smoother_joint_discrete_state_prob  # (T-1, S, S)
         smoother_means = smoother_result.state_cond_smoother_means  # (T, K-1, S)
         smoother_covs = smoother_result.state_cond_smoother_covs  # (T, K-1, K-1, S)
-        # (T-1, K-1, K-1, S, S)
+        # E[x_t | S_t=i, S_{t+1}=s]: (T-1, K-1, S, S)
+        pair_means = smoother_result.pair_cond_smoother_means
+        # Cov[x_t, x_{t+1} | S_t=i, S_{t+1}=s]: (T-1, K-1, K-1, S, S)
         pair_cross_covs = smoother_result.pair_cond_smoother_cross_covs
-        S = self.n_discrete_states
         k_free = self.n_options - 1
-        eps = 1e-10
 
         # Deterministic input: B @ u_t for each t
         if self.input_gain_ is not None and self._covariates is not None:
@@ -1237,56 +1239,62 @@ class SwitchingChoiceModel(SGDFittableMixin):
         else:
             Bu = jnp.zeros((smoother_means.shape[0], k_free))
 
-        # Per-state process noise: E[||x_t - A_s x_{t-1} - B u_t||^2 | y_{1:T}]
-        # weighted by P(S_t=s | y_{1:T}).
-        #
-        # The correct weight for Q_s aggregates over ALL previous states:
-        #   w_t = sum_i P(S_{t-1}=i, S_t=s | y_{1:T})
-        # and the cross-covariance terms must similarly aggregate over
-        # (i, s) pairs.  See switching_kalman_maximization_step for the
-        # reference implementation using full sufficient statistics.
-        for s in range(S):
-            # Weight: sum over previous states i of joint P(S_{t-1}=i, S_t=s)
-            w = joint[:, :, s].sum(axis=1)  # (T-1,): sum_i P(S_{t-1}=i, S_t=s)
-            w_sum = jnp.maximum(jnp.sum(w), eps)
-            decay_s = self.decays_[s]
+        # Per-state process noise: the expected squared transition residual
+        # E[||x_{t+1} - a_s x_t - B u_{t+1}||^2] over transitions into s,
+        # averaged over the source state i with weight
+        # P(S_t=i, S_{t+1}=s | y_{1:T}). Each (i, s) term uses the moments of
+        # x_t given that transition, not given S_t=s, which differ whenever
+        # the chain switches. GPB1 approximations, as in
+        # compute_transition_sufficient_stats: E[x_{t+1} | i, s] and
+        # Cov[x_{t+1} | i, s] are taken at S_{t+1}=s, Cov[x_t | i, s] at S_t=i.
+        decays = self.decays_  # (S,), broadcast over the destination axis
+        mean_resid = (
+            smoother_means[1:, :, None, :] - decays * pair_means - Bu[1:, :, None, None]
+        )  # (T-1, K-1, S_prev, S)
+        mean_sq = jnp.sum(mean_resid**2, axis=1)  # (T-1, S_prev, S)
 
-            # Mean residual: E[x_t|S_t=s] - decay_s * E[x_{t-1}|S_t=s] - B u_t
-            # For the previous-state mean, marginalize over S_{t-1} using
-            # the backward conditional P(S_{t-1}=i | S_t=s, y_{1:T}).
-            # As an approximation consistent with the GPB1 collapsed means,
-            # we use the state-conditional smoother mean at s directly.
-            mean_resid = (
-                smoother_means[1:, :, s] - decay_s * smoother_means[:-1, :, s] - Bu[1:]
+        trace_covs = jnp.trace(smoother_covs, axis1=1, axis2=2)  # (T, S)
+        trace_cross = jnp.trace(pair_cross_covs, axis1=1, axis2=2)  # (T-1, S, S)
+        cov_trace = (
+            trace_covs[1:, None, :]
+            - 2 * decays * trace_cross
+            + decays**2 * trace_covs[:-1, :, None]
+        )  # (T-1, S_prev, S)
+
+        occupancy = joint.sum(axis=(0, 1))  # (S,) expected transitions into s
+        has_transitions = occupancy > 0
+        q_hat = jnp.einsum("tis,tis->s", joint, mean_sq + cov_trace) / (
+            jnp.where(has_transitions, occupancy, 1.0) * k_free
+        )
+        # Decay is fixed and Q = q I has only one free scalar: any positive
+        # expected transition count identifies its variance objective. Only
+        # states with zero expected transitions need to keep the previous Q.
+        unoccupied = [
+            s for s, count in enumerate(jax.device_get(occupancy)) if count == 0
+        ]
+        if unoccupied:
+            logger.warning(
+                "SwitchingChoiceModel M-step: discrete state(s) %s have no "
+                "expected transitions; their process noise kept its previous value.",
+                unoccupied,
             )
-
-            # Covariance correction: aggregate cross-covs over all (i, s) pairs
-            P_t = smoother_covs[1:, :, :, s]  # (T-1, K-1, K-1)
-            P_tm1 = smoother_covs[:-1, :, :, s]  # (T-1, K-1, K-1)
-            # Sum cross-cov over previous states: sum_i joint(i,s) * C(i,s)
-            # pair_cross_covs shape: (T-1, K-1, K-1, S_prev, S_curr)
-            C_t_weighted = jnp.einsum(
-                "ti,tabi->tab", joint[:, :, s], pair_cross_covs[:, :, :, :, s]
-            )  # (T-1, K-1, K-1)
-            # Normalize to get expected cross-cov
-            C_t = C_t_weighted / jnp.maximum(w[:, None, None], eps)
-
-            cov_trace = (
-                jnp.trace(P_t, axis1=1, axis2=2)
-                - 2 * decay_s * jnp.trace(C_t, axis1=1, axis2=2)
-                + decay_s**2 * jnp.trace(P_tm1, axis1=1, axis2=2)
-            )  # (T-1,)
-
-            mean_sq = jnp.sum(mean_resid**2, axis=1)  # (T-1,)
-            q_hat = jnp.sum(w * (mean_sq + cov_trace)) / (w_sum * k_free)
-            self.process_noises_ = self.process_noises_.at[s].set(
-                jnp.maximum(q_hat, 1e-6)
-            )
+        self.process_noises_ = jnp.where(
+            has_transitions,
+            jnp.maximum(q_hat, 1e-6),
+            self.process_noises_,
+        )
 
         # Transition matrix from smoother joint
         trans_counts = joint.sum(axis=0)  # (S, S)
         row_sums = trans_counts.sum(axis=1, keepdims=True)
-        self.discrete_transition_matrix_ = trans_counts / jnp.maximum(row_sums, eps)
+        has_outgoing = row_sums > 0
+        # Empty source rows have a flat expected objective. Keep the previous
+        # stochastic row, and normalize every positive row by its actual count.
+        self.discrete_transition_matrix_ = jnp.where(
+            has_outgoing,
+            trans_counts / jnp.where(has_outgoing, row_sums, 1.0),
+            self.discrete_transition_matrix_,
+        )
 
     # --- SGDFittableMixin protocol ---
 

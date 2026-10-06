@@ -15,6 +15,7 @@ from jax import Array
 from jax.typing import ArrayLike
 
 from state_space_practice.switching_point_process import SpikeObsParams
+from state_space_practice.tests.jax_monitoring_helpers import listen_to_jax_durations
 
 # Enable 64-bit precision for numerical stability
 jax.config.update("jax_enable_x64", True)
@@ -38,11 +39,8 @@ def _count_compiles() -> Iterator[Callable[[], int]]:
         nonlocal count
         count += event in _COMPILE_EVENTS
 
-    jax.monitoring.register_event_duration_secs_listener(listener)
-    try:
+    with listen_to_jax_durations(listener):
         yield lambda: count
-    finally:
-        jax.monitoring.unregister_event_duration_listener(listener)
 
 
 def linear_log_intensity(state: Array, params: SpikeObsParams) -> Array:

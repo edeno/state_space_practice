@@ -57,6 +57,7 @@ from state_space_practice.switching_kalman import (
     switching_kalman_viterbi,
     weighted_sum_of_outer_products,
 )
+from state_space_practice.tests.jax_monitoring_helpers import listen_to_jax_durations
 from state_space_practice.utils import divide_safe as _divide_safe
 from state_space_practice.utils import safe_log as _safe_log
 from state_space_practice.utils import spectral_radius as _spectral_radius
@@ -79,11 +80,8 @@ def _count_compiles() -> Iterator[Callable[[], int]]:
         nonlocal count
         count += event in _COMPILE_EVENTS
 
-    jax.monitoring.register_event_duration_secs_listener(listener)
-    try:
+    with listen_to_jax_durations(listener):
         yield lambda: count
-    finally:
-        jax.monitoring.unregister_event_duration_listener(listener)
 
 
 def kalman_maximization_step_x1_prior(*args):

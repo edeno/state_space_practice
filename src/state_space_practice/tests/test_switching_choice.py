@@ -581,6 +581,22 @@ class TestSwitchingChoiceModel:
         model.fit(choices, max_iter=3)
         assert model.is_fitted
 
+    def test_single_trial_fit_preserves_dynamics_and_can_continue_with_sgd(self):
+        model = SwitchingChoiceModel(n_options=2, n_discrete_states=2)
+        previous_q = np.asarray(model.process_noises_).copy()
+        previous_transition = np.asarray(model.discrete_transition_matrix_).copy()
+
+        model.fit(jnp.array([0]), max_iter=3)
+
+        assert model.converged_
+        np.testing.assert_array_equal(model.process_noises_, previous_q)
+        np.testing.assert_array_equal(
+            model.discrete_transition_matrix_, previous_transition
+        )
+        np.testing.assert_allclose(model.discrete_transition_matrix_.sum(axis=1), 1.0)
+        likelihoods = model.fit_sgd(jnp.array([0]), num_steps=1)
+        assert np.all(np.isfinite(likelihoods))
+
     @pytest.mark.parametrize(
         "attr",
         [
@@ -1136,14 +1152,14 @@ class TestSwitchingChoiceValidation:
 class TestSwitchingChoiceMStepExactness:
     """The EM M-step maximises its (GPB1-approximate) expected objective.
 
-    With ``joint[t, i, s] = P(s_t=i, s_{t+1}=s | y)`` and the smoother's
-    state-conditional moments, the process-noise objective of state ``s`` is
+    With ``joint[t, i, s] = P(s_t=i, s_{t+1}=s | y)``, the smoother's
+    state-conditional moments ``m_{t,s}``, ``P_{t,s}``, pair-conditional means
+    ``m_t(i, s) = E[x_t | s_t=i, s_{t+1}=s]`` and cross-covariances
+    ``C_t(i, s)``, the process-noise objective of state ``s`` is
 
-        Q_s(q) = -sum_t w_t(s) [ k/2 log q + e_t(s) / (2 q) ],
-        w_t(s) = sum_i joint[t, i, s],
-        e_t(s) = ||m_{t+1,s} - a_s m_{t,s} - b_{t+1}||^2 + tr P_{t+1,s}
-                 + a_s^2 tr P_{t,s} - 2 a_s tr C_t(s),
-        C_t(s) = sum_i joint[t, i, s] C_t(i, s) / w_t(s),
+        Q_s(q) = -sum_t sum_i joint[t, i, s] [ k/2 log q + e_t(i, s) / (2 q) ],
+        e_t(i, s) = ||m_{t+1,s} - a_s m_t(i, s) - b_{t+1}||^2 + tr P_{t+1,s}
+                    + a_s^2 tr P_{t,i} - 2 a_s tr C_t(i, s),
 
     and the transition objective is ``sum_t sum_ij joint[t,i,j] log Z_ij``.
     Both are written out here with explicit loops; the returned parameters
@@ -1177,22 +1193,158 @@ class TestSwitchingChoiceMStepExactness:
         means = np.asarray(smooth[5])
         covs = np.asarray(smooth[6])
         cross = np.asarray(smooth[7])
+        pair_means = np.asarray(smooth[8])
         b = np.asarray(data.covariates) @ np.asarray(model.input_gain_).T
         a = float(model.decays_[s])
         k = means.shape[1]
         total = 0.0
         for t in range(joint.shape[0]):
-            w = joint[t, :, s].sum()
-            C = sum(joint[t, i, s] * cross[t, :, :, i, s] for i in range(2)) / w
-            r = means[t + 1, :, s] - a * means[t, :, s] - b[t + 1]
-            e = (
-                r @ r
-                + np.trace(covs[t + 1, :, :, s])
-                + a**2 * np.trace(covs[t, :, :, s])
-                - 2 * a * np.trace(C)
-            )
-            total -= w * (0.5 * k * np.log(q) + e / (2 * q))
+            for i in range(joint.shape[1]):
+                r = means[t + 1, :, s] - a * pair_means[t, :, i, s] - b[t + 1]
+                e = (
+                    r @ r
+                    + np.trace(covs[t + 1, :, :, s])
+                    + a**2 * np.trace(covs[t, :, :, i])
+                    - 2 * a * np.trace(cross[t, :, :, i, s])
+                )
+                total -= joint[t, i, s] * (0.5 * k * np.log(q) + e / (2 * q))
         return total
+
+    @staticmethod
+    def _certain_switch_result():
+        """Smoother output for the certain path 0 -> 1 -> 1 with x_t = 10 throughout.
+
+        State-conditional moments for a state of zero probability (state 1 at
+        t=0, state 0 at t=1, 2) are arbitrary; here their means are 0.
+        """
+        from state_space_practice.switching_kalman import SwitchingSmootherResult
+
+        means = jnp.array([[[10.0, 0.0]], [[0.0, 10.0]], [[0.0, 10.0]]])  # (T, K-1, S)
+        return SwitchingSmootherResult(
+            overall_smoother_mean=jnp.full((3, 1), 10.0),
+            overall_smoother_cov=jnp.full((3, 1, 1), 0.1),
+            smoother_discrete_state_prob=jnp.array(
+                [[1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]
+            ),
+            smoother_joint_discrete_state_prob=jnp.array(
+                [[[0.0, 1.0], [0.0, 0.0]], [[0.0, 0.0], [0.0, 1.0]]]
+            ),
+            overall_smoother_cross_cov=jnp.zeros((2, 1, 1)),
+            state_cond_smoother_means=means,
+            state_cond_smoother_covs=jnp.full((3, 1, 1, 2), 0.1),
+            pair_cond_smoother_cross_covs=jnp.zeros((2, 1, 1, 2, 2)),
+            # E[x_t | S_t=i, S_{t+1}=s]: the actual x_t on every transition.
+            pair_cond_smoother_means=jnp.full((2, 1, 2, 2), 10.0),
+        )
+
+    def test_process_noise_averages_over_source_states(self):
+        """No movement gives Q_1 = tr P_{t+1} + tr P_t = 0.2 on both transitions.
+
+        The 0 -> 1 transition must use the moments of x_0 given (S_0=0, S_1=1),
+        not state 1's arbitrary t=0 moments (mean 0, far from x_0 = 10).
+        """
+        model = SwitchingChoiceModel(
+            n_options=2, n_discrete_states=2, init_decays=[1.0, 1.0]
+        )
+        model._m_step(self._certain_switch_result())
+        np.testing.assert_allclose(model.process_noises_[1], 0.2, rtol=1e-12)
+
+    def test_unoccupied_state_keeps_process_noise(self, caplog):
+        """No expected transitions into state 0: its Q is unidentified, so it
+        keeps its previous value (with a logged warning) instead of collapsing
+        to the floor."""
+        model = SwitchingChoiceModel(
+            n_options=2,
+            n_discrete_states=2,
+            init_decays=[1.0, 1.0],
+            init_process_noises=[0.3, 0.05],
+        )
+        with caplog.at_level("WARNING", logger="state_space_practice"):
+            model._m_step(self._certain_switch_result())
+        np.testing.assert_array_equal(model.process_noises_[0], 0.3)
+        assert "discrete state(s) [0]" in caplog.text
+        # Guard: the occupied state was re-estimated.
+        np.testing.assert_allclose(model.process_noises_[1], 0.2, rtol=1e-12)
+
+    @pytest.mark.parametrize("occupancy", [1.0, 0.5, 1e-12])
+    def test_positive_occupancy_updates_scalar_noise_and_normalizes_transition_rows(
+        self, occupancy
+    ):
+        # State 0 has all outgoing evidence and state 1 has none. Q_1 has
+        # fractional incoming evidence, but its optimum is still 0.2.
+        smooth = self._single_transition_result([[1 - occupancy, occupancy], [0, 0]])
+        model = SwitchingChoiceModel(
+            n_options=2,
+            n_discrete_states=2,
+            init_decays=[1.0, 1.0],
+            init_process_noises=[0.3, 0.05],
+        )
+        previous_row = np.asarray(model.discrete_transition_matrix_[1]).copy()
+
+        model._m_step(smooth)
+
+        expected_q0 = 0.3 if occupancy == 1 else 0.2
+        np.testing.assert_allclose(
+            model.process_noises_, [expected_q0, 0.2], rtol=1e-12
+        )
+        np.testing.assert_allclose(
+            model.discrete_transition_matrix_[0], [1 - occupancy, occupancy], rtol=1e-12
+        )
+        np.testing.assert_array_equal(
+            model.discrete_transition_matrix_[1], previous_row
+        )
+        np.testing.assert_allclose(model.discrete_transition_matrix_.sum(axis=1), 1.0)
+
+    @classmethod
+    def _single_transition_result(cls, joint):
+        """Two-trial posterior with identical Gaussian moments in both states."""
+        joint = jnp.asarray(joint, dtype=float)
+        smooth = cls._certain_switch_result()
+        return smooth._replace(
+            overall_smoother_mean=smooth.overall_smoother_mean[:2],
+            overall_smoother_cov=smooth.overall_smoother_cov[:2],
+            smoother_discrete_state_prob=jnp.stack(
+                [joint.sum(axis=1), joint.sum(axis=0)]
+            ),
+            smoother_joint_discrete_state_prob=joint[None],
+            overall_smoother_cross_cov=smooth.overall_smoother_cross_cov[:1],
+            state_cond_smoother_means=jnp.full((2, 1, 2), 10.0),
+            state_cond_smoother_covs=smooth.state_cond_smoother_covs[:2],
+            pair_cond_smoother_means=smooth.pair_cond_smoother_means[:1],
+            pair_cond_smoother_cross_covs=smooth.pair_cond_smoother_cross_covs[:1],
+        )
+
+    def test_tiny_outgoing_count_produces_stochastic_row(self):
+        model = SwitchingChoiceModel(n_options=2, n_discrete_states=2)
+        smooth = self._single_transition_result([[0, 1e-12], [0, 1 - 1e-12]])
+
+        model._m_step(smooth)
+
+        np.testing.assert_allclose(model.discrete_transition_matrix_, [[0, 1], [0, 1]])
+
+    def test_two_trial_fit_reestimates_process_noise(self):
+        model = SwitchingChoiceModel(
+            n_options=2, n_discrete_states=1, init_process_noises=[0.5]
+        )
+        choices = jnp.array([0, 1])
+        smooth = model._run_smoother(model._run_filter(choices))
+        # There is one Gaussian transition with fixed unit decay. Its scalar
+        # variance optimum is E[(x_1-x_0)^2], without a regression sample gate.
+        mean_difference = (
+            smooth.state_cond_smoother_means[1, 0, 0]
+            - (smooth.pair_cond_smoother_means[0, 0, 0, 0])
+        )
+        expected_q = (
+            mean_difference**2
+            + smooth.state_cond_smoother_covs[1, 0, 0, 0]
+            + smooth.state_cond_smoother_covs[0, 0, 0, 0]
+            - 2 * smooth.pair_cond_smoother_cross_covs[0, 0, 0, 0, 0]
+        )
+        assert abs(float(expected_q) - 0.5) > 1e-3  # guard: an update is needed
+
+        model.fit(choices, max_iter=1)
+
+        np.testing.assert_allclose(model.process_noises_[0], expected_q, rtol=1e-12)
 
     def test_process_noise_per_state_is_stationary(self, em_inputs):
         model, data, filt, smooth = em_inputs
